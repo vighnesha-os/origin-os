@@ -58,6 +58,9 @@ commands:
               boot-random, boot-identity and boot-console
   boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
               cleared on the bridge too and opened again above the device its driver attached
+  boot-reserved  the kernel boot with firmware-reserved memory (RMRRs, IVMDs) a TEST ONLY UEFI
+              application plants in QEMU's tables (both IOMMUs): the NVMe controller's domain
+              identity-maps what the kernel may trust, and the rest is refused by name
   boot-legacy-free  the kernel boot on a machine with no 8254 and no 8042: the timers
               calibrate against the ACPI PM timer, and the proofs that need those devices
               say they cannot run
@@ -176,6 +179,9 @@ environment:
                                       machine)
   ORIGIN_QEMU_BRIDGE                  on: the NIC behind a PCIe root port (the boot-bridge
                                       machine)
+  ORIGIN_QEMU_RESERVED                on: a TEST ONLY UEFI application plants firmware-reserved
+                                      memory (RMRRs or IVMDs) in QEMU's tables before the
+                                      loader starts (the boot-reserved machine)
   ORIGIN_QEMU_ACCEL                   tcg (default) or kvm: run on a real x86-64 processor (needs
                                       an x86-64 host with /dev/kvm); the devices and firmware
                                       stay QEMU's
@@ -194,6 +200,10 @@ environment:
 const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const LOADER_PACKAGE: &str = "origin-boot-uefi";
 const LOADER_BIN: &str = "origin-boot";
+/// TEST ONLY: the UEFI application that plants firmware-reserved memory in QEMU's ACPI tables
+/// before the loader starts (`ORIGIN_QEMU_RESERVED`; TASKS item 40).
+const RESERVED_PACKAGE: &str = "origin-test-reserved-memory";
+const RESERVED_BIN: &str = "origin-test-reserved";
 const VERSION_PACKAGE: &str = "origin-version";
 const ONBF_FORMAT_PACKAGE: &str = "onbf-format";
 const CRYPTO_PACKAGE: &str = "origin-crypto";
@@ -415,6 +425,70 @@ fn check_iommu(iommu: &Iommu) -> Result {
 /// Whether the NIC sits behind a PCIe root port (`ORIGIN_QEMU_BRIDGE=on`, `boot-bridge`).
 fn qemu_bridge() -> bool {
     env::var("ORIGIN_QEMU_BRIDGE").as_deref() == Ok("on")
+}
+
+/// Whether a TEST ONLY application plants firmware-reserved memory in QEMU's tables before the
+/// loader starts (`ORIGIN_QEMU_RESERVED=on`, `boot-reserved`).
+fn qemu_reserved() -> bool {
+    env::var("ORIGIN_QEMU_RESERVED").as_deref() == Ok("on")
+}
+
+/// The device the planted ranges name and no driver attaches: 00:1f.6, absent on QEMU's q35.
+const ABSENT_DEVICE: u16 = 0x1F << 3 | 6;
+
+/// The regions planted for the `boot-reserved` machine (TASKS item 40; research ledger
+/// `docs/research/2026-11-12-reserved-memory-identity-maps.md` §6), for the IOMMU QEMU
+/// emulates. Under VT-d: an RMRR of two reserved pages for the NVMe controller (00:02.0), and
+/// two the kernel must refuse, for a device that does not exist: one in RAM the kernel will
+/// own, one in the interrupt range. Under AMD-Vi, IVMDs for the controller: one read and
+/// write, one read only, and one never to be mapped; one for every device, as an exclusion
+/// range; and one in RAM, refused.
+fn reserved_regions(amd: bool) -> Vec<origin_test_reserved_memory::Region> {
+    use origin_test_reserved_memory::{Placement, Region, Table};
+    const NVME: u16 = 2 << 3;
+    let rmrr = |placement, device, pages| Region {
+        table: Table::Dmar,
+        ivmd_kind: 0,
+        flags: 0,
+        placement,
+        device,
+        last_device: 0,
+        pages,
+    };
+    let ivmd = |kind, flags, placement, device, last_device| Region {
+        table: Table::Ivrs,
+        ivmd_kind: kind,
+        flags,
+        placement,
+        device,
+        last_device,
+        pages: 1,
+    };
+    if amd {
+        vec![
+            ivmd(0x21, 0b0111, Placement::Reserved, NVME, 0),
+            ivmd(0x21, 0b0011, Placement::Reserved, NVME, 0),
+            ivmd(0x20, 0b1000, Placement::Reserved, 0, 0),
+            ivmd(0x22, 0b0000, Placement::Reserved, NVME, 3 << 3),
+            ivmd(0x21, 0b0111, Placement::LoaderData, ABSENT_DEVICE, 0),
+            // A writable range whose page lacks the test fill: the proof must not write it (M2).
+            ivmd(0x21, 0b0111, Placement::ReservedOther, NVME, 0),
+            // A writable range over the IVRS copy itself, which the kernel holds (M1).
+            ivmd(0x21, 0b0111, Placement::Table, ABSENT_DEVICE, 0),
+            // Never mapped for any device of any IOMMU (ADR-0007 Amendment 2, R6).
+            ivmd(0x20, 0b0000, Placement::Reserved, 0, 0),
+        ]
+    } else {
+        vec![
+            rmrr(Placement::Reserved, NVME, 2),
+            rmrr(Placement::LoaderData, ABSENT_DEVICE, 1),
+            rmrr(Placement::Fixed(0xFEE0_0000), ABSENT_DEVICE, 1),
+            // A writable range whose page lacks the test fill: the proof must not write it (M2).
+            rmrr(Placement::ReservedOther, NVME, 1),
+            // A writable range over the DMAR copy itself, which the kernel holds (M1).
+            rmrr(Placement::Table, ABSENT_DEVICE, 1),
+        ]
+    }
 }
 
 /// Processors QEMU emulates: `ORIGIN_QEMU_SMP` (1–64), or 2.
@@ -725,6 +799,9 @@ fn boot_scenario() -> Scenario {
     }
     if qemu_bridge() {
         bridge_markers(&mut scenario);
+    }
+    if qemu_reserved() {
+        reserved_markers(&mut scenario, qemu_iommu() == Iommu::Amd);
     }
     if qemu_machine_lacks("pit") {
         no_pit_markers(&mut scenario);
@@ -1096,6 +1173,237 @@ fn number_before(text: &str, word: &str) -> Option<u64> {
     let head = text.get(..text.find(word)?)?;
     let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
     head.get(head.len() - digits..)?.parse().ok()
+}
+
+/// What the kernel says when no firmware-reserved range is identity-mapped for the NVMe
+/// controller: QEMU's own tables name none.
+const NO_RESERVED_LINE: &str = "origin-kernel: IOMMU: reserved memory: none is identity-mapped for the NVMe controller (0 range(s) named by the firmware, 0 refused), so the proofs through it did not run";
+
+/// The `boot-reserved` machine (`ORIGIN_QEMU_RESERVED=on`; TASKS item 40): the TEST ONLY
+/// application plants [`reserved_regions`] before the loader starts, says where, and the kernel
+/// reports each range it was given, with its verdict, and proves each page identity-mapped for
+/// the NVMe controller. Which page is where depends on the firmware's allocations, so the
+/// proof's lines are counted by [`check_reserved_boot`], not ordered here.
+fn reserved_markers(scenario: &mut Scenario, amd: bool) {
+    let fixture: Vec<String> = if amd {
+        vec![
+            "origin-test-reserved: TEST ONLY: planting reserved memory in the firmware's tables",
+            "origin-test-reserved: IVMD type 0x21 flags 0b0111 0x",
+            "(reserved pages) for DeviceID 0x0010",
+            "origin-test-reserved: IVMD type 0x21 flags 0b0011 0x",
+            "(reserved pages) for DeviceID 0x0010",
+            "origin-test-reserved: IVMD type 0x20 flags 0b1000 0x",
+            "(reserved pages) for DeviceID 0x0000",
+            "origin-test-reserved: IVMD type 0x22 flags 0b0000 0x",
+            "(reserved pages) for DeviceID 0x0010",
+            "origin-test-reserved: IVMD type 0x21 flags 0b0111 0x",
+            "(loader-data pages) for DeviceID 0x00fe",
+            "origin-test-reserved: IVMD type 0x21 flags 0b0111 0x",
+            "(reserved pages without the test fill) for DeviceID 0x0010",
+            "origin-test-reserved: IVMD type 0x21 flags 0b0111 0x",
+            "(the table's own pages) for DeviceID 0x00fe",
+            "origin-test-reserved: IVMD type 0x20 flags 0b0000 0x",
+            "(reserved pages) for DeviceID 0x0000",
+            "origin-test-reserved: the XSDT now names IVRS at 0x",
+            "origin-test-reserved: starting the loader",
+        ]
+    } else {
+        vec![
+            "origin-test-reserved: TEST ONLY: planting reserved memory in the firmware's tables",
+            "origin-test-reserved: RMRR 0x",
+            "(reserved pages) for 00:02.0",
+            "origin-test-reserved: RMRR 0x",
+            "(loader-data pages) for 00:1f.6",
+            "origin-test-reserved: RMRR 0xfee00000-0xfee00fff (a fixed address) for 00:1f.6",
+            "origin-test-reserved: RMRR 0x",
+            "(reserved pages without the test fill) for 00:02.0",
+            "origin-test-reserved: RMRR 0x",
+            "(the table's own pages) for 00:1f.6",
+            "origin-test-reserved: the XSDT now names DMAR at 0x",
+            "origin-test-reserved: starting the loader",
+        ]
+    }
+    .into_iter()
+    .map(String::from)
+    .collect();
+    scenario.markers.splice(0..0, fixture);
+    let mapped = "in the domain of each device it names that a driver attaches";
+    let refused_ram = "): refused (the memory map does not call 0x";
+    let refused_lent =
+        "): refused (it is writable and overlaps the firmware table the kernel holds at 0x";
+    let (after, kernel): (&str, Vec<String>) = if amd {
+        (
+            "origin-kernel: IOMMU: IVRS revision 1, IVinfo 0x2801 (EFR support true, 40-bit physical and 0-bit virtual addresses, pre-boot DMA protection false); 1 IOMMU(s) in 2 IVHD(s), 8 memory definition(s)",
+            vec![
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                ", flags 0b0111; for DeviceID 0x0010 (00:02.0) in segment 0): identity-mapped, read and write, ".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                ", flags 0b0011; for DeviceID 0x0010 (00:02.0) in segment 0): identity-mapped, read only, ".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                " (IVMD type 0x20 at offset 0x".into(),
+                format!(", flags 0b1000; every device of the IOMMU at 0xfed80000): identity-mapped, read and write, {mapped}"),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                ", flags 0b0000; for DeviceIDs 0x0010-0x0018 in segment 0): never mapped for the devices it names".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!(", flags 0b0111; for DeviceID 0x00fe (00:1f.6) in segment 0{refused_ram}"),
+                " reserved or EFI runtime memory), so the devices it names cannot be attached".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                ", flags 0b0111; for DeviceID 0x0010 (00:02.0) in segment 0): identity-mapped, read and write, ".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!(", flags 0b0111; for DeviceID 0x00fe (00:1f.6) in segment 0{refused_lent}"),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                " (IVMD type 0x20 at offset 0x".into(),
+                ", flags 0b0000; every device in the system, on every IOMMU): never mapped for the devices it names".into(),
+            ],
+        )
+    } else {
+        (
+            "every device's DMA faults until its driver attaches it; 0 stale fault(s) cleared",
+            vec![
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!("; for 00:02.0): identity-mapped, read and write, {mapped}"),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!("; for 00:1f.6{refused_ram}"),
+                " reserved or EFI runtime memory), so the devices it names cannot be attached".into(),
+                "origin-kernel: IOMMU: reserved memory 0xfee00000-0xfee00fff (RMRR at offset 0x".into(),
+                "; for 00:1f.6): refused (it overlaps the interrupt range), so the devices it names cannot be attached".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!("; for 00:02.0): identity-mapped, read and write, {mapped}"),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!("; for 00:1f.6{refused_lent}"),
+            ],
+        )
+    };
+    if amd {
+        let old = "origin-kernel: IOMMU: IVRS revision 1, IVinfo 0x2801 (EFR support true, 40-bit physical and 0-bit virtual addresses, pre-boot DMA protection false); 1 IOMMU(s) in 2 IVHD(s), 0 memory definition(s)";
+        match scenario.markers.iter().position(|m| m == old) {
+            Some(i) => scenario.markers[i] = after.into(),
+            None => scenario
+                .markers
+                .push(format!("xtask: the marker {old:?} is missing")),
+        }
+    }
+    match scenario.markers.iter().position(|m| m == after) {
+        Some(i) => {
+            scenario.markers.splice(i + 1..i + 1, kernel);
+        }
+        None => scenario
+            .markers
+            .push(format!("xtask: the marker {after:?} is missing")),
+    }
+    match scenario.markers.iter().position(|m| m == NO_RESERVED_LINE) {
+        Some(i) => {
+            scenario.markers[i] = "origin-kernel: IOMMU: reserved memory proof: page 0x".into()
+        }
+        None => scenario
+            .markers
+            .push(format!("xtask: the marker {NO_RESERVED_LINE:?} is missing")),
+    }
+    scenario.check = Some(check_reserved_boot);
+}
+
+/// The `boot-reserved` machine's whole-log check, after the kernel boot's: every range the
+/// application planted reached the kernel at the same addresses (the kernel read the table
+/// the firmware gave), and the proof's lines are the ones [`reserved_regions`] calls for.
+fn check_reserved_boot(done: &Completed) -> Result {
+    check_kernel_boot(done)?;
+    let amd = qemu_iommu() == Iommu::Amd;
+    let planted: Vec<&str> = done
+        .serial
+        .lines()
+        .filter_map(|l| l.strip_prefix("origin-test-reserved: "))
+        .filter_map(|l| {
+            l.split_whitespace()
+                .find(|t| t.starts_with("0x") && t.contains('-'))
+        })
+        .collect();
+    let want = reserved_regions(amd).len();
+    if planted.len() != want {
+        return Err(format!(
+            "the application reported {} planted ranges, not {want}",
+            planted.len()
+        ));
+    }
+    for span in &planted {
+        let line = format!("origin-kernel: IOMMU: reserved memory {span} (");
+        if !done.serial.contains(&line) {
+            return Err(format!(
+                "the kernel did not report the planted range {span}"
+            ));
+        }
+    }
+    // The range over the table copy is refused for the copy the kernel holds, at its address
+    // (M1): the one the application put in the XSDT.
+    let copy = done
+        .serial
+        .lines()
+        .find_map(|l| l.strip_prefix("origin-test-reserved: the XSDT now names "))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .ok_or("the application did not say where its table copy is")?;
+    let held = format!("overlaps the firmware table the kernel holds at {copy})");
+    if !done.serial.contains(&held) {
+        return Err(format!(
+            "the kernel did not refuse the range over the table copy at {copy} as a table it holds"
+        ));
+    }
+    let proofs: Vec<&str> = done
+        .serial
+        .lines()
+        .filter(|l| l.contains("origin-kernel: IOMMU: reserved memory proof: page 0x"))
+        .collect();
+    let count = |access: &str, write: &str, fill: &str, others: &str| {
+        proofs
+            .iter()
+            .filter(|l| {
+                l.contains(&format!("({access}, as the firmware's bits give: true) in the NVMe controller's domain maps to itself: true; the controller's write of LBA 2048 into it {write}: true; its read of it to LBA 24576 carried what the page holds: true; {fill}; other domains: {others}; consistent true"))
+            })
+            .count()
+    };
+    let landed = "landed there";
+    let filled = "the page held the test step's fill";
+    let alone = "00:03.0 does not map it at any address";
+    // The page without the test fill: written by nothing, and left as it was (M2).
+    let left = |count: &dyn Fn(&str, &str, &str, &str) -> usize| {
+        count(
+            "read and write",
+            "was not run, as the page does not hold the test step's fill",
+            "the page is unchanged: true",
+            alone,
+        )
+    };
+    let (expected, found) = if amd {
+        (
+            [1, 1, 1, 1],
+            [
+                count("read and write", landed, filled, alone),
+                count("read only", "was blocked and recorded", filled, alone),
+                count(
+                    "read and write",
+                    landed,
+                    filled,
+                    "00:03.0 maps it too, as the firmware names it",
+                ),
+                left(&count),
+            ],
+        )
+    } else {
+        (
+            [2, 0, 0, 1],
+            [
+                count("read and write", landed, filled, alone),
+                0,
+                0,
+                left(&count),
+            ],
+        )
+    };
+    if found != expected || proofs.len() != expected.iter().sum::<usize>() {
+        return Err(format!(
+            "the reserved-memory proof's lines: {found:?} of the kinds expected {expected:?}, {} in all",
+            proofs.len()
+        ));
+    }
+    Ok(())
 }
 
 /// The `boot-bridge` machine (`ORIGIN_QEMU_BRIDGE=on`): the NIC at 01:00.0 behind a PCIe root
@@ -1734,6 +2042,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: IOMMU: domains: 00:02.0 domain 1 (".into(),
             " 00:03.0 domain 2 (".into(),
             "no other function has a context entry, so its DMA faults; IOVAs from 0x40000000; faults recorded before the proofs: 0; consistent true".into(),
+            // Firmware-reserved memory (ADR-0007 questions 4 and 8): QEMU's tables name none,
+            // so nothing is proved here; the boot-reserved machine plants some.
+            NO_RESERVED_LINE.into(),
             // The PIT's IRQ0 again, now through interrupt remapping (CLAUDE.md §24, §32;
             // ADR-0007 I8): the I/O APIC's entry in remappable format names an IRTE that
             // sends vector 0x41 to the target CPU (another than the boot processor when there
@@ -1817,16 +2128,19 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         ])
         .collect(),
         failures: boot_failures(),
-        check: Some(|done| {
-            console_lines_intact(&done.serial, self::machine().cpus() as usize)?;
-            long_lines_whole(&done.serial)?;
-            unwaited_lines_whole(&done.serial)?;
-            check_screen(done)
-        }),
+        check: Some(check_kernel_boot),
         stderr: vec![],
         capture: Capture::Com1AndScreen,
         qemu_args: None,
     }
+}
+
+/// The kernel boot's whole-log checks: every line whole, and the screen.
+fn check_kernel_boot(done: &Completed) -> Result {
+    console_lines_intact(&done.serial, self::machine().cpus() as usize)?;
+    long_lines_whole(&done.serial)?;
+    unwaited_lines_whole(&done.serial)?;
+    check_screen(done)
 }
 
 /// Output that fails any kernel boot the moment it appears.
@@ -2720,6 +3034,7 @@ fn main() -> ExitCode {
         ["boot-x2apic"] => in_turn("boot-x2apic", boot_x2apic),
         ["boot-console"] => in_turn("boot-console", boot_console),
         ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
+        ["boot-reserved"] => in_turn("boot-reserved", boot_reserved),
         ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
         ["boot-random"] => in_turn("boot-random", boot_random),
         ["boot-identity"] => in_turn("boot-identity", boot_identity),
@@ -2793,6 +3108,7 @@ fn boot_matrix() -> Result {
     }
     boot_x2apic()?;
     boot_bridge()?;
+    boot_reserved()?;
     boot_legacy_free()?;
     boot_random()?;
     boot_identity()?;
@@ -2804,7 +3120,7 @@ fn boot_matrix() -> Result {
         "xtask: boot-matrix: the kernel stacks' region was at {boots} distinct bases in {boots} kernel boots, read through QEMU's monitor; none is printed"
     );
     println!(
-        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, the two machines without the random-number instructions, the two CPU identities, and the console machines)"
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the reserved-memory machines, the legacy-free machine, the two machines without the random-number instructions, the two CPU identities, and the console machines)"
     );
     Ok(())
 }
@@ -3078,6 +3394,30 @@ fn boot_console() -> Result {
         chosen.len(),
         scenarios.len()
     );
+    Ok(())
+}
+
+/// Runs `boot-test`'s kernel boot in a child process under each IOMMU with firmware-reserved
+/// memory planted in QEMU's tables by the TEST ONLY application (`ORIGIN_QEMU_RESERVED=on`;
+/// TASKS item 40; ADR-0007 questions 4 and 8): the kernel identity-maps what it may trust for
+/// the NVMe controller, refuses the rest by name, and proves the maps by DMA.
+fn boot_reserved() -> Result {
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    for iommu in ["intel", "amd"] {
+        println!("xtask: boot-reserved: the {iommu} IOMMU, firmware-reserved memory planted");
+        let status = boot_test_child(&exe)
+            .env("ORIGIN_QEMU_IOMMU", iommu)
+            .env("ORIGIN_QEMU_RESERVED", "on")
+            .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
+            .status()
+            .map_err(|e| format!("cannot run boot-test: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "boot-test with reserved memory planted and the {iommu} IOMMU failed ({status})"
+            ));
+        }
+    }
+    println!("xtask: boot-reserved passed (both IOMMUs, firmware-reserved memory planted)");
     Ok(())
 }
 
@@ -3408,8 +3748,31 @@ fn check() -> Result {
             "-D",
             "warnings",
         ],
+        // TEST ONLY: the application that plants firmware-reserved memory, on the host (its
+        // library and tests) and on its real target.
+        &[
+            "clippy",
+            "--package",
+            RESERVED_PACKAGE,
+            "--lib",
+            "--tests",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[
+            "clippy",
+            "--package",
+            RESERVED_PACKAGE,
+            "--target",
+            UEFI_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ],
         &["test", "--package", "xtask"],
         &["test", "--package", LOADER_PACKAGE, "--lib"],
+        &["test", "--package", RESERVED_PACKAGE, "--lib"],
         &["test", "--package", VERSION_PACKAGE],
         &["test", "--package", PACK_PACKAGE],
         &["test", "--package", SIGN_PACKAGE],
@@ -4304,6 +4667,37 @@ fn build_loader(loader: Loader) -> Result<PathBuf> {
     build_loader_in(Some(loader.feature()), None)
 }
 
+/// Builds the TEST ONLY application that plants firmware-reserved memory, and returns the path
+/// of its `.efi`. It takes the loader's flags: it builds the loader's library too, and with other
+/// flags each build would rebuild that library over the other's.
+fn build_reserved_fixture() -> Result<PathBuf> {
+    let mut build = cargo();
+    build.args([
+        "build",
+        "--package",
+        RESERVED_PACKAGE,
+        "--bin",
+        RESERVED_BIN,
+        "--target",
+        UEFI_TARGET,
+        "--release",
+    ]);
+    build.args(toolchain::image_config()?);
+    run_step(&mut build)?;
+    let efi = target_dir()
+        .join(UEFI_TARGET)
+        .join("release")
+        .join(format!("{RESERVED_BIN}.efi"));
+    if efi.is_file() {
+        Ok(efi)
+    } else {
+        Err(format!(
+            "cargo reported success but {} does not exist",
+            efi.display()
+        ))
+    }
+}
+
 /// Builds the EFI application with `feature`, or with none, into `target`, or into Cargo's own
 /// target directory, and returns the path of `origin-boot.efi`. With no feature the trust
 /// store is empty: the loader a release builds, until Origin has keys of its own.
@@ -4700,11 +5094,27 @@ fn stage(kernel: &[u8], loader: Loader) -> Result<Staged> {
     // The removable-media default boot path for x64 (UEFI 2.11 §3.5.1.1).
     let boot_dir = esp.join("EFI").join("BOOT");
     fs::create_dir_all(&boot_dir).map_err(|e| format!("{}: {e}", boot_dir.display()))?;
-    fs::copy(&efi, boot_dir.join("BOOTX64.EFI"))
-        .map_err(|e| format!("copy {}: {e}", efi.display()))?;
     // Where the loader looks for the Framekernel (ADR-0002 B1).
     let origin_dir = esp.join("EFI").join("ORIGIN");
     fs::create_dir_all(&origin_dir).map_err(|e| format!("{}: {e}", origin_dir.display()))?;
+    if qemu_reserved() {
+        // TEST ONLY (TASKS item 40): the application that plants firmware-reserved memory
+        // starts first, and starts the unchanged loader from \EFI\ORIGIN\LOADER.EFI.
+        let fixture = build_reserved_fixture()?;
+        fs::copy(&fixture, boot_dir.join("BOOTX64.EFI"))
+            .map_err(|e| format!("copy {}: {e}", fixture.display()))?;
+        fs::copy(&efi, origin_dir.join("LOADER.EFI"))
+            .map_err(|e| format!("copy {}: {e}", efi.display()))?;
+        let regions = reserved_regions(qemu_iommu() == Iommu::Amd);
+        let mut config = vec![0u8; 1024];
+        let len = origin_test_reserved_memory::encode(&regions, &mut config)
+            .ok_or("too many reserved regions")?;
+        fs::write(origin_dir.join("RESERVED.CFG"), &config[..len])
+            .map_err(|e| format!("write RESERVED.CFG: {e}"))?;
+    } else {
+        fs::copy(&efi, boot_dir.join("BOOTX64.EFI"))
+            .map_err(|e| format!("copy {}: {e}", efi.display()))?;
+    }
     fs::write(origin_dir.join("KERNEL.ONBF"), kernel)
         .map_err(|e| format!("write KERNEL.ONBF: {e}"))?;
     // A fresh NVRAM copy for every boot, so no run inherits variables from an earlier one.
@@ -5543,6 +5953,29 @@ mod gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TASKS item 40's review, M2: the kernel writes into a planted reserved page only where it
+    /// finds the fill the TEST ONLY application puts there, so the two copies must agree.
+    #[test]
+    fn the_fixtures_fill_is_the_one_the_kernel_recognises() {
+        for page in [0x1000, 0x1FB3_1000, 0x7A00_0000, 0xFF_FFFF_F000] {
+            let planted: Vec<u8> = (0..framekernel::testfill::PAGE as u64)
+                .map(|o| origin_test_reserved_memory::fill_byte(page, o))
+                .collect();
+            assert!(
+                framekernel::testfill::holds_fill(page, &planted),
+                "{page:#x}"
+            );
+            // What the application puts in its pages without the fill is not the fill.
+            let other: Vec<u8> = (0..framekernel::testfill::PAGE as u64)
+                .map(|o| origin_test_reserved_memory::fill_byte(page + 0x10_0000, o))
+                .collect();
+            assert!(
+                !framekernel::testfill::holds_fill(page, &other),
+                "{page:#x}"
+            );
+        }
+    }
 
     /// ADR-0004 Amendment 2, A6.3: a boot log names no address in the stack window, PML4 slots
     /// 384–447, in any case and anywhere in a line; its edges and the windows beside it are fine.
