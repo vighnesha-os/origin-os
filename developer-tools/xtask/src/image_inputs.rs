@@ -456,6 +456,11 @@ fn clean_arguments(
             directory.display()
         ));
     }
+    if directory.as_os_str().is_empty() {
+        return Err(format!(
+            "no target directory is named for a `cargo clean` of {packages:?} for {target}: an empty `--target-dir` is not the directory the file was built into"
+        ));
+    }
     let mut arguments: Vec<std::ffi::OsString> =
         ["clean", "--quiet", "--release", "--target", target]
             .into_iter()
@@ -486,8 +491,24 @@ fn remove_linked(path: &Path) -> Result {
             path.display()
         )
     })?;
-    let arguments = clean_arguments(directory, target, &linked_packages(target))?;
-    crate::run_step(crate::cargo().args(arguments))
+    let packages = linked_packages(target);
+    let arguments = clean_arguments(directory, target, &packages)?;
+    crate::run_step(crate::cargo().args(arguments))?;
+    if path.exists() {
+        return Err(still_there(path, target, &packages));
+    }
+    Ok(())
+}
+
+/// What to say when `cargo clean` of `packages` left `path` where it was: none of them links
+/// that file. Said instead of the later "removed and linked again, and still does", which would
+/// be untrue of a file that was never removed (TASKS item 52's review, finding 4).
+fn still_there(path: &Path, target: &str, packages: &[&str]) -> String {
+    format!(
+        "{} is still there after `cargo clean` of {} for {target}: none of those packages links it, so it cannot be linked again this way. Name the package that links it among those `linked_packages` gives for {target} (TASKS item 50)",
+        path.display(),
+        packages.join(", ")
+    )
 }
 
 /// [`build_with_the_fixed_line`] over the three things it does to a file, so that a test can
@@ -885,8 +906,9 @@ mod tests {
         // gate's: it alone is linked again.
         let (result, builds, _) = run(&[(&kernel, &fresh), (&program, &old)], true);
         assert_eq!((result, builds), (Ok(vec![program.clone()]), 2));
-        // What Cargo is asked to build again for a stale file: everything of that file's
-        // target in that file's target directory. A path of another shape names neither.
+        // Where a stale file was built: its target directory and its target. Cargo is then
+        // asked to build again the packages that link a file for that target (below). A path
+        // of another shape, or of a target no ELF image is linked for, names neither.
         assert_eq!(
             built_into(Path::new("/t/x86_64-unknown-none/release/framekernel")),
             Some((Path::new("/t"), "x86_64-unknown-none"))
@@ -916,6 +938,29 @@ mod tests {
         let refused = clean_arguments(Path::new("/t"), KERNEL_TARGET, &[])
             .expect_err("a clean with no package");
         assert!(refused.contains("no package is named"), "{refused}");
+        // A relative path with no directory in front gives an empty target directory, and an
+        // empty `--target-dir` is refused too.
+        let (directory, target) =
+            built_into(Path::new("x86_64-unknown-none/release/framekernel")).expect("its shape");
+        assert_eq!((directory, target), (Path::new(""), KERNEL_TARGET));
+        let refused = clean_arguments(directory, target, &[KERNEL_PACKAGE])
+            .expect_err("a clean with no target directory");
+        assert!(
+            refused.contains("no target directory is named"),
+            "{refused}"
+        );
+        // A file the clean did not remove is said to be still there, with the packages that
+        // were cleaned, not said to have been removed.
+        let message = still_there(
+            Path::new("/t/x86_64-unknown-linux-gnu/release/liborigin_core.so"),
+            ring3::USERSPACE_TARGET,
+            &["first-program"],
+        );
+        assert!(
+            message
+                .contains("liborigin_core.so is still there after `cargo clean` of first-program"),
+            "{message}"
+        );
         let words = |target: &str, packages: &[&str]| -> Vec<String> {
             clean_arguments(Path::new("/t"), target, packages)
                 .expect("packages were named")
