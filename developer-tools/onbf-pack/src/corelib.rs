@@ -14,15 +14,32 @@
 //! nothing to relocate (L2). So [`describe`] refuses:
 //!
 //! - any relocation, and any import;
-//! - a writable segment that is anything but the linker's own dynamic table: one with other
-//!   bytes, and one of zero-filled memory with no byte in the file, which is what a
-//!   `static mut` makes;
+//! - a writable segment that is anything but the linker's own dynamic table with zero fill to
+//!   the end of its page: one with other bytes, one of zero-filled memory with no byte in the
+//!   file (which is what a `static mut` makes), one whose memory runs past the table's page,
+//!   and a table with an entry after its `DT_NULL`;
 //! - a number of read-execute segments other than one;
 //! - an export the generator's list does not name, a listed export that is missing, and an
 //!   export that is not a public function inside the code;
 //! - a stub whose bytes hold anything but exactly one `syscall` instruction's two bytes, and
 //!   that pair of bytes anywhere else in the code, at any alignment;
 //! - a byte of the code that belongs to no stub and is not the linker's padding.
+//!
+//! **How L2's "no writable data" is read here** (the coordinating session's reading of
+//! 2026-11-13, as the session that drafted L2, answering the independent review's finding F3):
+//! L2 speaks of the image the kernel maps, and the linked file is linker output. What the
+//! kernel maps is the one read-execute segment's bytes and nothing else. Of the file itself
+//! this module still refuses every writable segment but the linker's own table, as above, so
+//! that nothing in the file is writable data a later reader could come to map.
+//!
+//! What `describe` does not look at, each harmless for the build's own output and recorded so
+//! that nobody takes it for a check (the same review, F14): the read-only segments of the
+//! library, which never reach the kernel; `DT_FLAGS`, `DF_TEXTREL` with it, since any
+//! relocation at all is refused; symbols past the count the file's own `DT_HASH` gives; and
+//! the instructions inside a stub, beyond counting the two bytes of `syscall`: a stub with
+//! one `syscall` and any other code passes here, and `cargo xtask core-gate` is what reads
+//! instructions. It walks every stub for every byte of the code, which is quadratic and fine
+//! for a page of stubs.
 //!
 //! The pair of bytes is `0F 05` (Intel SDM Volume 2, `SYSCALL`; AMD APM Volume 3, `SYSCALL`).
 //! Counting the pair, and not decoded instructions, is the stricter rule: it also refuses a
@@ -137,6 +154,9 @@ pub enum CoreError {
     /// bytes or only zero-filled memory: `origin.core` has no writable data (L2). The value is
     /// the segment's RVA.
     WritableData(u64),
+    /// An entry of the dynamic table follows its `DT_NULL`: bytes the reader did not read, in
+    /// the one writable segment the image may have.
+    TableEnd,
     /// The image does not have exactly one read-execute segment; the value is how many.
     CodeSegments(usize),
     /// The image exports a symbol the list does not name.
@@ -176,6 +196,9 @@ impl fmt::Display for CoreError {
             Self::WritableData(rva) => write!(
                 f,
                 "the writable segment at {rva:#x} is more than the linker's dynamic table, in bytes or in zero-filled memory; `origin.core` has no writable data (ADR-0011 L2)"
+            ),
+            Self::TableEnd => f.write_str(
+                "an entry of the dynamic table follows its DT_NULL; every byte of `origin.core`'s one writable segment must be a table entry that was read (ADR-0011 L2)",
             ),
             Self::CodeSegments(n) => write!(
                 f,
@@ -371,22 +394,26 @@ pub fn describe(file: &[u8], listing: &Listing) -> Result<CoreLib, CoreError> {
     if bound != 0 {
         return Err(CoreError::Relocations(bound));
     }
-    // No writable data: the one writable segment the image may have is the linker's dynamic
-    // table, which it writes for itself and nothing reads at run time. Its file bytes are the
-    // table's and no others, and it maps nothing past them but the zero padding of
-    // read-only-after-relocation memory. Any other writable segment is refused, a segment of
-    // zero-filled memory with no byte in the file among them: that is what a `static mut`
-    // looks like.
+    // No writable data (L2, as the module text reads it): the one writable segment the image
+    // may have is the linker's dynamic table, which it writes for itself and nothing reads at
+    // run time. Its file bytes are the table's and no others, and it maps nothing past them
+    // but zero fill to the end of the table's last page. Any other writable segment is
+    // refused, a segment of zero-filled memory with no byte in the file among them: that is
+    // what a `static mut` looks like. And every entry of the table was read: nothing follows
+    // its `DT_NULL`.
     for s in &parsed.segments {
         if s.permissions != Permissions::ReadWrite {
             continue;
         }
         let page = 0x1000;
         let is_table = parsed.dynamic_table == Some((s.file_offset, s.file_size))
-            && (s.relro || s.mapped_size <= s.file_size.div_ceil(page).saturating_mul(page));
+            && s.mapped_size <= s.file_size.div_ceil(page).saturating_mul(page);
         if !is_table {
             return Err(CoreError::WritableData(s.vaddr));
         }
+    }
+    if !parsed.dynamic_null_last {
+        return Err(CoreError::TableEnd);
     }
     let mut code_segments = parsed
         .segments

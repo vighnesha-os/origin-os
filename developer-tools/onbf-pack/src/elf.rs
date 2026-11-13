@@ -300,6 +300,10 @@ pub struct Elf {
     /// `PT_DYNAMIC`'s place in the file: its offset and its size. The table is the linker's
     /// own record, read here and by nothing at run time.
     pub dynamic_table: Option<(u64, u64)>,
+    /// Whether the table's first `DT_NULL` is its last entry, so that every entry of
+    /// `PT_DYNAMIC` was read. `true` for an image with no table. The reader stops at the first
+    /// `DT_NULL`, as a loader would; a caller that must know nothing follows it asks here.
+    pub dynamic_null_last: bool,
 }
 
 impl Elf {
@@ -422,6 +426,8 @@ pub enum ElfError {
     UnknownDynamicTag(u64),
     /// `DT_NEEDED`, in an image that may link no library.
     Needed,
+    /// A program leaves a symbol to the library it imports from and has no `DT_NEEDED` at all.
+    NeededMissing,
     /// A `DT_NEEDED` that does not name the one library the program may import from, or a
     /// second one.
     NeededOther,
@@ -578,6 +584,9 @@ impl fmt::Display for ElfError {
                 "dynamic tag {t:#x} is outside the contract (ONBF §6.1.2)"
             ),
             E::Needed => f.write_str("DT_NEEDED: this image may link no library"),
+            E::NeededMissing => f.write_str(
+                "an undefined symbol of the library a program imports from, and no DT_NEEDED that names that library",
+            ),
             E::NeededOther => f.write_str(
                 "DT_NEEDED names something other than the one library this program may import from, or appears twice",
             ),
@@ -778,6 +787,7 @@ pub fn parse_linked(file: &[u8], linking: Linking<'_>) -> Result<Elf, ElfError> 
         exports: dynamic.exports,
         soname: dynamic.soname,
         dynamic_table,
+        dynamic_null_last: dynamic_table.is_none() || dynamic.null_last,
     })
 }
 
@@ -1022,6 +1032,8 @@ struct Dynamic {
     imports: Vec<Import>,
     exports: Vec<Export>,
     soname: Option<String>,
+    /// The table's first `DT_NULL` is its last entry.
+    null_last: bool,
 }
 
 /// Reads the dynamic table as `linking` says, and returns the validated, merged relocation
@@ -1044,7 +1056,9 @@ fn read_dynamic(
     let mut needed: Vec<u64> = Vec::new();
     let mut soname: Option<u64> = None;
     let mut terminated = false;
-    for raw in table.as_chunks::<DYN_SIZE>().0 {
+    let entries = table.as_chunks::<DYN_SIZE>().0;
+    let mut null_last = false;
+    for (index, raw) in entries.iter().enumerate() {
         let d = Fields {
             bytes: raw,
             what: "dynamic table",
@@ -1054,6 +1068,7 @@ fn read_dynamic(
         match tag {
             dt::NULL => {
                 terminated = true;
+                null_last = index.checked_add(1) == Some(entries.len());
                 break;
             }
             dt::NEEDED => match linking {
@@ -1106,6 +1121,7 @@ fn read_dynamic(
         }
     };
     let mut exports = Vec::new();
+    let mut undefined = false;
     // Entry 0 is the reserved null symbol, which is undefined by definition.
     for (index, symbol) in (0u64..).zip(&table).skip(1) {
         let nameless = ElfError::SymbolName { index };
@@ -1114,6 +1130,7 @@ fn read_dynamic(
                 if !exports.contains(&names.at(symbol.name).ok_or(nameless)?) {
                     return Err(ElfError::UndefinedSymbol { index });
                 }
+                undefined = true;
             }
             (true, _, _) => return Err(ElfError::UndefinedSymbol { index }),
             (false, Linking::Library, Some(names)) => exports.push(Export {
@@ -1140,6 +1157,10 @@ fn read_dynamic(
     };
     if let (Linking::Importing { library, .. }, Some(names)) = (linking, &names) {
         match needed.as_slice() {
+            // A program that leaves a symbol to the library must say it needs the library:
+            // with no `DT_NEEDED` nothing in the file says where those symbols come from
+            // (the review of 2026-11-13, finding F17 b).
+            [] if undefined => return Err(ElfError::NeededMissing),
             [] => {}
             [at] => {
                 let named = u32::try_from(*at).ok().and_then(|at| names.at(at));
@@ -1168,6 +1189,7 @@ fn read_dynamic(
         imports,
         exports,
         soname,
+        null_last,
     })
 }
 

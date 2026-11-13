@@ -2,7 +2,9 @@
 //! to L7). A library made by hand converts, to the same files twice; and each thing that would
 //! make it more than the listed stubs, or less, is refused, one fixture each.
 
-use super::elf_writer::{Load, R, RELATIVE, RW, RX, Sym, TestElf, symbol_tables};
+use super::elf_writer::{
+    Load, PT_DYNAMIC, PT_LOAD, R, RELATIVE, RW, RX, RawElf, Sym, TestElf, symbol_tables,
+};
 use crate::corelib::{CoreError, LIBRARY, Listing, describe};
 use crate::elf::ElfError;
 
@@ -243,6 +245,98 @@ fn a_syscall_or_any_other_byte_outside_every_stub_is_refused() {
     let mut padded = Library::good();
     padded.code.extend_from_slice(&[0xCC; 8]);
     assert!(describe(&padded.bytes(), &listing()).is_ok());
+}
+
+#[test]
+fn a_syscall_across_two_adjacent_stubs_is_refused() {
+    // The first stub ends in `0F` and the second starts with `05`, with no padding between
+    // them. Each holds its own pair once, and the pair across their boundary is in neither
+    // (the review of 2026-11-13, finding F6 a).
+    let mut across = Library {
+        code: Vec::new(),
+        symbols: Vec::new(),
+        soname: Some(LIBRARY),
+    };
+    across.push("origin_kernel_b", &[0xB8, 0, 0, 0, 0, 0x0F, 0x05, 0x0F]);
+    across.push("origin_kernel_c", &[0x05, 0x0F, 0x05, 0xC3]);
+    across.push("origin_kernel_a", &stub(2));
+    assert_eq!(across.code[7..9], [0x0F, 0x05]);
+    refuses(&across, CoreError::StraySyscall(7));
+}
+
+/// [`Library::good`] with its dynamic table in a writable segment of its own, which is where
+/// the linker really puts it, changed by `edit`. Returns the file and that segment's address.
+fn with_writable_table(edit: impl FnOnce(&mut RawElf, usize, usize)) -> (Vec<u8>, u64) {
+    let mut raw = Library::good().elf().raw();
+    let load = raw
+        .phdrs
+        .iter()
+        .rposition(|p| p.p_type == PT_LOAD)
+        .expect("the table's segment");
+    let table = raw
+        .phdrs
+        .iter()
+        .position(|p| p.p_type == PT_DYNAMIC)
+        .expect("the table");
+    // The fixture's writer puts nothing else in that segment: it is the table exactly.
+    assert_eq!(
+        (raw.phdrs[load].offset, raw.phdrs[load].filesz),
+        (raw.phdrs[table].offset, raw.phdrs[table].filesz)
+    );
+    raw.phdrs[load].flags = RW;
+    edit(&mut raw, load, table);
+    let vaddr = raw.phdrs[load].vaddr;
+    (raw.bytes(), vaddr)
+}
+
+#[test]
+fn the_one_writable_segment_is_the_dynamic_table_and_zero_fill_to_the_end_of_its_page() {
+    // The table alone, writable: what every really linked library has.
+    let (alone, _) = with_writable_table(|_, _, _| {});
+    assert!(describe(&alone, &listing()).is_ok());
+    // With zero-filled memory after it to the end of its page: the linker's padding.
+    let (padded, _) = with_writable_table(|raw, load, _| raw.phdrs[load].memsz = 0x1000);
+    assert!(describe(&padded, &listing()).is_ok());
+    // Memory that runs past the table's page is writable memory of its own.
+    let (past, at) = with_writable_table(|raw, load, _| raw.phdrs[load].memsz = 0x1001);
+    assert_eq!(
+        describe(&past, &listing()),
+        Err(CoreError::WritableData(at))
+    );
+    // The table and eight more bytes: initialised data beside it (finding F6 b).
+    let (more, at) = with_writable_table(|raw, load, _| {
+        let end = raw.phdrs[load].offset + raw.phdrs[load].filesz;
+        raw.put(end, &[1; 8]);
+        raw.phdrs[load].filesz += 8;
+        raw.phdrs[load].memsz += 8;
+    });
+    assert_eq!(
+        describe(&more, &listing()),
+        Err(CoreError::WritableData(at))
+    );
+}
+
+#[test]
+fn nothing_follows_the_dynamic_tables_null() {
+    // One more entry after `DT_NULL`, inside `PT_DYNAMIC`: bytes a reader that stops at the
+    // null never sees (finding F3). `DT_FLAGS` is a tag the reader takes, so nothing else
+    // refuses the file.
+    let (after, _) = with_writable_table(|raw, load, table| {
+        let end = raw.phdrs[table].offset + raw.phdrs[table].filesz;
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&30u64.to_le_bytes());
+        entry.extend_from_slice(&8u64.to_le_bytes());
+        raw.put(end, &entry);
+        for header in [load, table] {
+            raw.phdrs[header].filesz += 16;
+            raw.phdrs[header].memsz += 16;
+        }
+    });
+    assert_eq!(describe(&after, &listing()), Err(CoreError::TableEnd));
+    // The same entry before the null is read, and the library converts.
+    let mut before = Library::good().elf();
+    before.dynamic.push((30, 8));
+    assert!(describe(&before.bytes(), &listing()).is_ok());
 }
 
 #[test]

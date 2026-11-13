@@ -26,6 +26,11 @@ const fn glob_dat(index: u64) -> u64 {
 /// slot for each in its RELRO page at 0x3000, a relative relocation beside them, and a
 /// `DT_NEEDED` that names the library. Its tables are at 0x5000.
 fn program(edit: impl FnOnce(&mut Vec<Sym>, &mut TestElf)) -> Vec<u8> {
+    program_needing(true, edit)
+}
+
+/// The same program, with a `DT_NEEDED` for the library unless `needed` is false.
+fn program_needing(needed: bool, edit: impl FnOnce(&mut Vec<Sym>, &mut TestElf)) -> Vec<u8> {
     let mut symbols = vec![
         Sym::undefined("origin_kernel_b"),
         Sym::undefined("origin_kernel_a"),
@@ -47,7 +52,7 @@ fn program(edit: impl FnOnce(&mut Vec<Sym>, &mut TestElf)) -> Vec<u8> {
             tag.1 = at[tag.1 as usize];
         }
     }
-    if !elf.dynamic.iter().any(|&(tag, _)| tag == 1) {
+    if needed && !elf.dynamic.iter().any(|&(tag, _)| tag == 1) {
         tags.push((1, at[0]));
     }
     elf.dynamic.extend(tags);
@@ -150,6 +155,24 @@ fn only_the_declared_library_may_be_needed() {
         parse_linked(&named, importing()),
         Err(ElfError::UnknownDynamicTag(14))
     );
+}
+
+#[test]
+fn a_program_that_leaves_symbols_to_the_library_must_need_it() {
+    // The library's symbols undefined, and no `DT_NEEDED` at all: nothing in the file says
+    // where they come from (the review of 2026-11-13, finding F17 b).
+    let unneeded = program_needing(false, |_, _| {});
+    assert_eq!(
+        parse_linked(&unneeded, importing()),
+        Err(ElfError::NeededMissing)
+    );
+    // A program with no undefined symbol and no import needs nothing, and reads.
+    let alone = program_needing(false, |symbols, elf| {
+        symbols.clear();
+        elf.rela.truncate(1);
+    });
+    let elf = parse_linked(&alone, importing()).expect("it reads");
+    assert!(elf.imports.is_empty());
 }
 
 #[test]
