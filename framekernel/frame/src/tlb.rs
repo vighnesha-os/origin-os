@@ -18,9 +18,12 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use origin_sync::shootdown::{Completed, Request, Scope, Shootdown, Stalled, TlbHardware};
+use origin_sync::shootdown::{
+    Asked, Completed, Record, Records, Request, Scope, Shootdown, Stalled, TlbHardware,
+};
 
-use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
+use crate::cpu::{self, CpuIndex, rdtsc};
+use crate::percpu::PerCpu;
 use crate::timer::X2Apic;
 
 /// The shootdown interrupt's vector: a fixed IPI, above every device vector in use.
@@ -34,12 +37,38 @@ const MIN_TSC_HZ: u64 = 1_000_000_000;
 /// ICR level bit: assert (the only meaningful level for fixed IPIs).
 const ICR_ASSERT: u32 = 1 << 14;
 
+/// Each processor's part in the shootdown protocol, each on a cache line of its own (ADR-0008
+/// Amendment 1, D1).
+pub(crate) static RECORDS: PerCpu<Record> = PerCpu::new(Record::new(), Record::new);
+/// The initiator's mark for each processor.
+pub(crate) static ASKED: PerCpu<Asked> = PerCpu::new(Asked::new(), Asked::new);
+
+/// The protocol's per-processor storage: [`RECORDS`] and [`ASKED`], sized together at discovery.
+struct Tables;
+
+impl Records for Tables {
+    /// Every processor that has either: one with a record and no mark makes a request that must
+    /// reach it a stall, never a skip (`origin_sync::shootdown`).
+    fn count(&self) -> usize {
+        RECORDS.indexes().max(ASKED.indexes())
+    }
+
+    fn record(&self, cpu: usize) -> Option<&Record> {
+        RECORDS.get(cpu)
+    }
+
+    fn asked(&self, cpu: usize) -> Option<&Asked> {
+        ASKED.get(cpu)
+    }
+}
+
 /// The machine's shootdown state.
-static SHOOTDOWN: Shootdown<MAX_CPUS> = Shootdown::new();
+static SHOOTDOWN: Shootdown<Tables> = Shootdown::new(Tables);
 /// TSC cycles the last completed shootdown took, for the boot report.
 pub static LAST_CYCLES: AtomicU64 = AtomicU64::new(0);
 /// Each CPU index whose processor turned on global pages.
-pub static GLOBAL_PAGES: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+pub static GLOBAL_PAGES: PerCpu<AtomicBool> =
+    PerCpu::new(AtomicBool::new(false), || AtomicBool::new(false));
 
 /// What the protocol asks of the processor it runs on.
 struct Hardware;
@@ -154,7 +183,8 @@ pub fn service() {
 }
 
 /// How many shootdown interrupts each processor has taken.
-static INTERRUPTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+pub(crate) static INTERRUPTS: PerCpu<AtomicU64> =
+    PerCpu::new(AtomicU64::new(0), || AtomicU64::new(0));
 
 /// The shootdown interrupt.
 pub(crate) fn interrupted() {

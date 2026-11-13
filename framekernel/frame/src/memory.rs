@@ -137,6 +137,17 @@ pub fn allocate_frame() -> Option<OwnedFrame> {
     })
 }
 
+/// A run of `count` contiguous free frames, 4 KiB-aligned, given up for ever: page tables for
+/// the kernel stacks' region as it grows (`vm::grow_stack_region`; ADR-0008 Amendment 1, D3).
+/// Nothing frees them; their address is never made an [`OwnedFrame`]. `None` if no run that long
+/// is free, or `count` is 0.
+pub(crate) fn allocate_table_run(count: u64) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+    without_interrupts(|| MEMORY.lock().as_mut()?.frames.allocate_run(count, 1))
+}
+
 /// Zeroes a frame nothing else holds.
 pub(crate) fn zero_frame(frame: &OwnedFrame) {
     let p = ptr::with_exposed_provenance_mut::<u8>(frame.virt());

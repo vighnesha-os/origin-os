@@ -194,6 +194,8 @@ mod memory_object;
 #[cfg(target_os = "none")]
 mod pcie;
 #[cfg(target_os = "none")]
+mod percpu;
+#[cfg(target_os = "none")]
 mod port;
 #[cfg(target_os = "none")]
 mod process;

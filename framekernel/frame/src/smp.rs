@@ -57,8 +57,9 @@ use origin_paging::{Access, PAGE};
 
 use crate::acpi::{self, Processor};
 use crate::apstart::{Handshake, Outcome, Refusal};
-use crate::cpu::{self, CpuIndex, CpuTables, MAX_CPUS, rdtsc};
+use crate::cpu::{self, CpuIndex, CpuTables, rdtsc};
 use crate::cpumap::CpuMap;
+use crate::percpu::{PerCpu, Sizing};
 use crate::stack::GuardedStack;
 use crate::timer::{ApicRead, X2Apic};
 use crate::topology::CpuTopology;
@@ -192,7 +193,7 @@ const LACKS_BASELINE: u64 = 2;
 /// The processors online, by CPU index, the boot processor first.
 #[derive(Debug)]
 pub struct Online {
-    cpus: [CpuIndex; MAX_CPUS],
+    cpus: Vec<CpuIndex>,
     count: usize,
     /// Every processor the MADT marks enabled is online: none can still be running
     /// firmware code.
@@ -202,17 +203,15 @@ pub struct Online {
 impl Online {
     fn one() -> Self {
         Self {
-            cpus: [CpuIndex::BOOT; MAX_CPUS],
+            cpus: alloc::vec![CpuIndex::BOOT],
             count: 1,
             complete: false,
         }
     }
 
     fn add(&mut self, index: CpuIndex) {
-        if let Some(slot) = self.cpus.get_mut(self.count) {
-            *slot = index;
-            self.count += 1;
-        }
+        self.cpus.push(index);
+        self.count = self.cpus.len();
     }
 
     /// Whether every enabled processor came online.
@@ -233,7 +232,16 @@ impl Online {
 
 /// Brings up every enabled AP the MADT lists. Returns the processors online, the boot
 /// processor included.
-pub fn start(com1: &mut dyn Write, ap_main: fn(&X2Apic) -> !) -> Online {
+///
+/// Between reading the MADT and sending the first INIT it sizes every per-CPU table for the
+/// indexes the MADT gave (ADR-0008 Amendment 1, D1): the framework's
+/// ([`crate::percpu::size_per_cpu`]), then the kernel's, through `size_kernel`, its crate's one
+/// sizing function. No AP whose index a table does not hold is started.
+pub fn start(
+    com1: &mut dyn Write,
+    ap_main: fn(&X2Apic) -> !,
+    size_kernel: fn(&mut Sizing),
+) -> Online {
     let mut online = Online::one();
     // Read here, never taken from a caller: the delays below are what lets a processor settle
     // before the data page is rewritten, and the memory map says where the trampoline may go.
@@ -287,14 +295,19 @@ pub fn start(com1: &mut dyn Write, ap_main: fn(&X2Apic) -> !) -> Online {
             return online;
         }
     };
+    let capable = if map.online_capable() > 0 {
+        alloc::format!(", {} online-capable", map.online_capable())
+    } else {
+        alloc::string::String::new()
+    };
     let _ = write!(
         com1,
-        "origin-kernel: ACPI MADT: {} processors, {} enabled (largest APIC ID listed {}); CPU index 0 for the boot processor (APIC ID {bsp})",
+        "origin-kernel: ACPI MADT: {} processors, {} enabled{capable} (largest APIC ID listed {}); CPU index 0 for the boot processor (APIC ID {bsp})",
         map.listed(),
         map.enabled(),
         map.highest().unwrap_or(bsp),
     );
-    match map.indexed() {
+    match map.started() {
         1 => {}
         2 => {
             let _ = write!(com1, ", 1 for the other enabled processor");
@@ -310,11 +323,12 @@ pub fn start(com1: &mut dyn Write, ap_main: fn(&X2Apic) -> !) -> Online {
     if !map.boot_listed() {
         let _ = write!(com1, "; the MADT does not list the boot processor");
     }
-    if map.unindexed() > 0 {
+    if map.reserved() > 0 {
         let _ = write!(
             com1,
-            "; {} enabled processors beyond the kernel's {MAX_CPUS} CPU indexes stay in firmware",
-            map.unindexed()
+            ", {}-{} reserved for the online-capable ones",
+            map.started(),
+            map.indexed() - 1
         );
     }
     if map.invalid() > 0 {
@@ -325,12 +339,27 @@ pub fn start(com1: &mut dyn Write, ap_main: fn(&X2Apic) -> !) -> Online {
         );
     }
     let _ = writeln!(com1);
+    // ADR-0008 Amendment 1, D1 and D3: every per-CPU table holds every index before any AP is
+    // sent INIT; the count is the fewest any table could hold, and the kernel stacks' region's
+    // room; the processors past it stay in firmware, counted.
+    let mut sizing = Sizing::new(map.indexed());
+    crate::percpu::size_per_cpu(&mut sizing);
+    size_kernel(&mut sizing);
+    let room = crate::stack::grow(sizing.reached);
+    let count = sizing.reached.min(room).max(1);
+    let fixed = cpu::fix_count(count);
+    report_bounds(com1, &map, &sizing, room, count, fixed);
+    if !fixed {
+        return online;
+    }
     // Every AP's APIC ID is on record before any AP starts: each checks its own.
     for (i, apic_id) in map.iter().skip(1) {
         if let Some(index) = CpuIndex::new(i) {
             cpu::assign(index, apic_id);
         }
     }
+    // The processors to start: the enabled ones the tables and the region hold.
+    let to_start = map.started().min(count);
     let identity = match prepare(regions) {
         Ok(identity) => identity,
         Err(why) => {
@@ -341,12 +370,17 @@ pub fn start(com1: &mut dyn Write, ap_main: fn(&X2Apic) -> !) -> Online {
     // Every start-up below relies on parking an AP that misses its handshake: the drill
     // proves that first, on the first AP. If INIT did not stop it, no AP is started.
     let mut parks = true;
-    if let Some((i, apic_id)) = map.iter().nth(1)
+    if to_start > 1
+        && let Some((i, apic_id)) = map.iter().nth(1)
         && let Some(index) = CpuIndex::new(i)
     {
         parks = drill_and_report(com1, &lapic, index, apic_id, tsc_hz);
     }
-    for (i, apic_id) in map.iter().skip(1).filter(|_| parks) {
+    // ADR-0008 Amendment 1, D8: one at a time, through one data page (C7); the total is
+    // printed.
+    let started_at = rdtsc();
+    let mut no_memory = 0;
+    for (i, apic_id) in map.iter().take(to_start).skip(1).filter(|_| parks) {
         let Some(index) = CpuIndex::new(i) else {
             continue;
         };
@@ -358,7 +392,14 @@ pub fn start(com1: &mut dyn Write, ap_main: fn(&X2Apic) -> !) -> Online {
                     "origin-kernel: CPU {index} (APIC ID {apic_id}) online after {micros} us: own GDT, TSS and IDT, x2APIC",
                 );
             }
-            Err(why) => {
+            Err(NotStarted::Memory(why)) => {
+                no_memory += 1;
+                let _ = writeln!(
+                    com1,
+                    "origin-kernel: CPU {index} (APIC ID {apic_id}): {why}: never sent INIT, stays in firmware: AP start-up failed"
+                );
+            }
+            Err(NotStarted::Failed(why)) => {
                 let _ = writeln!(
                     com1,
                     "origin-kernel: CPU {index} (APIC ID {apic_id}): {why}: AP start-up failed"
@@ -366,6 +407,7 @@ pub fn start(com1: &mut dyn Write, ap_main: fn(&X2Apic) -> !) -> Online {
             }
         }
     }
+    let start_micros = rdtsc().wrapping_sub(started_at) / (tsc_hz / 1_000_000).max(1);
     // The identity mappings go: the lower half belongs to user space (ADR-0004 H1).
     let [code, data] = identity;
     if let Err(e) = code.unmap().and_then(|_| data.unmap()) {
@@ -374,7 +416,10 @@ pub fn start(com1: &mut dyn Write, ap_main: fn(&X2Apic) -> !) -> Online {
             "origin-kernel: trampoline mappings not removed: {e:?}: AP start-up failed"
         );
     }
-    online.complete = online.count == map.indexed() && map.covers_enabled();
+    online.complete = online.count == map.started()
+        && count >= map.started()
+        && map.covers_enabled()
+        && sizing.again == 0;
     let leftover = vm::is_mapped(TRAMPOLINE) || vm::is_mapped(TRAMPOLINE_DATA);
     let _ = writeln!(
         com1,
@@ -383,6 +428,13 @@ pub fn start(com1: &mut dyn Write, ap_main: fn(&X2Apic) -> !) -> Online {
         map.enabled(),
         !leftover,
         if leftover { ": AP start-up failed" } else { "" }
+    );
+    let tried = to_start.saturating_sub(1);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: SMP: application processors started one at a time (ADR-0008 C7, Amendment 1 D8): {tried} in {} ms, {} us each on average; {no_memory} never sent INIT for want of memory",
+        start_micros / 1000,
+        start_micros.checked_div(tried as u64).unwrap_or(0),
     );
     // Each processor's interrupt stacks end at a guard page that faults, and each put its own
     // control state where the kernel's rules need it.
@@ -414,14 +466,64 @@ pub fn start(com1: &mut dyn Write, ap_main: fn(&X2Apic) -> !) -> Online {
     online
 }
 
+/// The kernel stacks' region's room, in processors, when its address space is the bound: its
+/// reserve over the 32 slots each processor's share is (ADR-0008 Amendment 1, D3).
+pub const REGION_ROOM: usize = crate::stack::MAX_PROCESSORS;
+
+/// Prints ADR-0008 Amendment 1, D3's line: the indexes given, the bytes each costs, and each
+/// bound that held a processor back.
+fn report_bounds(
+    com1: &mut dyn Write,
+    map: &CpuMap,
+    sizing: &Sizing,
+    room: usize,
+    count: usize,
+    fixed: bool,
+) {
+    let by_memory = map.indexed().saturating_sub(sizing.reached);
+    let by_region = sizing.reached.saturating_sub(room.max(1));
+    let _ = write!(
+        com1,
+        "origin-kernel: CPU indexes: {} given at discovery ({} to start, {} reserved for online-capable processors); {} per-CPU tables hold {count} each, {} bytes per index, allocated once{}; kernel stacks' region: room for {room} processors, at most {REGION_ROOM} in its reserved address space; x2APIC IDs are 32-bit, {} with the broadcast ID refused; held back: ",
+        map.indexed(),
+        map.started(),
+        map.reserved(),
+        sizing.tables,
+        sizing.bytes_per_index,
+        if sizing.again > 0 {
+            alloc::format!(", {} sized twice", sizing.again)
+        } else {
+            alloc::string::String::new()
+        },
+        map.invalid(),
+    );
+    match (by_memory, by_region) {
+        (0, 0) => {
+            let _ = write!(com1, "none");
+        }
+        _ => {
+            let _ = write!(
+                com1,
+                "{by_memory} for want of memory for their tables, {by_region} by the kernel stacks' region: indexes {count} and up stay in firmware"
+            );
+        }
+    }
+    if !fixed || sizing.again > 0 {
+        let _ = write!(com1, ": per-CPU sizing failed");
+    }
+    let _ = writeln!(com1);
+}
+
 /// Whether [`start`] has begun.
 static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// What each processor read from CPUID about its own topology, by CPU index (CLAUDE.md §24,
 /// §27; ADR-0008 C2). A hybrid part's leaves can differ between logical processors, so each
 /// processor writes its own slot on itself ([`record_topology`]), before it reports online.
-static TOPOLOGY: [crate::sync::SpinLock<Option<CpuTopology>>; MAX_CPUS] =
-    [const { crate::sync::SpinLock::new(None) }; MAX_CPUS];
+pub(crate) static TOPOLOGY: PerCpu<crate::sync::SpinLock<Option<CpuTopology>>> =
+    PerCpu::new(crate::sync::SpinLock::new(None), || {
+        crate::sync::SpinLock::new(None)
+    });
 
 /// Reads this processor's topology from CPUID and records it under its CPU index. The
 /// boot processor and every AP call this once, on themselves.
@@ -457,7 +559,7 @@ fn probe_guards(guards: &[u64]) -> Result<u64, &'static str> {
 /// An application processor's four interrupt stacks (#DF, NMI, #MC, #DB), in the stack region
 /// (ADR-0004 Amendment 1, A2): the unmapped space below each is its guard, so none is cut out
 /// of the direct map. Proves that the page below each faults.
-fn interrupt_stacks() -> Result<([GuardedStack; 4], u64), &'static str> {
+fn interrupt_stacks() -> Result<([GuardedStack; 4], u64), NotStarted> {
     let made = [(); 4].map(|()| GuardedStack::new(cpu::IST_STACK_SIZE));
     let [
         Some(double_fault),
@@ -466,11 +568,21 @@ fn interrupt_stacks() -> Result<([GuardedStack; 4], u64), &'static str> {
         Some(debug),
     ] = made
     else {
-        return Err("no memory for the interrupt stacks");
+        return Err(NotStarted::Memory("no memory for the interrupt stacks"));
     };
     let stacks = [double_fault, nmi, machine_check, debug];
-    let proven = probe_guards(&stacks.each_ref().map(GuardedStack::guard_addr))?;
+    let proven = probe_guards(&stacks.each_ref().map(GuardedStack::guard_addr))
+        .map_err(NotStarted::Failed)?;
     Ok((stacks, proven))
+}
+
+/// Why an application processor did not come online.
+enum NotStarted {
+    /// The memory for its stacks or its generator could not be had: it was never sent INIT,
+    /// and stays in firmware (ADR-0008 Amendment 1, D3).
+    Memory(&'static str),
+    /// It was started and did not join, so it was parked, or a check before INIT failed.
+    Failed(&'static str),
 }
 
 /// RSDP → XSDT → MADT → the processors it lists → their CPU indexes, the boot processor
@@ -644,9 +756,10 @@ fn start_one(
     apic_id: u32,
     tsc_hz: u64,
     main: fn(&X2Apic) -> !,
-) -> Result<u64, &'static str> {
+) -> Result<u64, NotStarted> {
     let (interrupt_stacks, guards) = interrupt_stacks()?;
-    let stack = GuardedStack::new(AP_STACK_BYTES).ok_or("no memory for the AP stack")?;
+    let stack = GuardedStack::new(AP_STACK_BYTES)
+        .ok_or(NotStarted::Memory("no memory for the AP stack"))?;
     // SAFETY: an all-zero `CpuTables` is valid (integers only); `init_ap` writes it before
     // the processor uses it.
     let tables = Box::into_raw(unsafe { Box::<CpuTables>::new_zeroed().assume_init() });
@@ -654,7 +767,9 @@ fn start_one(
     // processor that starts it, so that it finds both when it starts its generator
     // (`random::start_this_processor`), which allocates nothing.
     if !crate::random::prepare(index) {
-        return Err("no memory for its random-number generator");
+        return Err(NotStarted::Memory(
+            "no memory for its random-number generator",
+        ));
     }
     let stack_top = stack.top();
     let interrupt_tops = interrupt_stacks.each_ref().map(GuardedStack::top);
@@ -695,7 +810,7 @@ fn start_one(
     // SAFETY: the AP is not online: its start-up was settled without it joining, so it
     // never reaches `sched::run_ap` (`ap_entry`).
     unsafe { park(lapic, apic_id, tsc_hz) };
-    Err(match outcome {
+    Err(NotStarted::Failed(match outcome {
         Outcome::Abandoned => "no answer within 200 ms; parked by INIT",
         Outcome::Refused(Refusal::NoX2Apic) => match start.lacks.load(Ordering::Acquire) {
             LACKS_SMEP_SMAP => "no SMEP or no SMAP; parked by INIT",
@@ -705,7 +820,7 @@ fn start_one(
         Outcome::Refused(Refusal::NotMine) | Outcome::Answered(_) => {
             "a different processor answered; parked by INIT"
         }
-    })
+    }))
 }
 
 /// Counted by the processor in the park drill while it runs.

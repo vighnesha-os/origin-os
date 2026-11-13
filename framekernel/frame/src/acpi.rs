@@ -19,6 +19,11 @@ pub const HEADER_LENGTH: usize = 36;
 pub const HEADER_REVISION: usize = 8;
 /// Offset of the first MADT interrupt controller structure.
 const MADT_ENTRIES: usize = 44;
+/// The first MADT revision whose Local APIC flags define bit 1, Online Capable: ACPI 6.3 (ECR
+/// 1948), MADT revision 5. Below it the bit is reserved, and is not read (ADR-0008 Amendment 1,
+/// D2; read from ACPI 6.5's release sources, research ledger
+/// `docs/research/2026-11-13-any-processor-count.md`).
+pub const MADT_ONLINE_CAPABLE_REVISION: u8 = 5;
 /// Offset of the first SRAT resource-affinity structure (36-byte header + 12 reserved).
 const SRAT_ENTRIES: usize = 48;
 
@@ -231,7 +236,9 @@ pub struct Processor {
     pub uid: u32,
     /// Usable now (flags bit 0).
     pub enabled: bool,
-    /// Can be brought online later (flags bit 1); meaningless when `enabled`.
+    /// Can be enabled while the system runs: flags bit 1 with bit 0 clear, read only from MADT
+    /// revision [`MADT_ONLINE_CAPABLE_REVISION`] on. Never set together with `enabled`, where
+    /// the bit is reserved.
     pub online_capable: bool,
 }
 
@@ -239,6 +246,10 @@ pub struct Processor {
 /// processor listed twice (as type 0 and type 9) is kept once. Other structure types are
 /// skipped.
 pub fn madt_processors(madt: &[u8], out: &mut [Processor]) -> Result<usize, AcpiError> {
+    let reads_online_capable = madt
+        .get(HEADER_REVISION)
+        .is_some_and(|&revision| revision >= MADT_ONLINE_CAPABLE_REVISION);
+    let online_capable = |flags: u32| reads_online_capable && flags & 1 == 0 && flags & 2 != 0;
     let mut count = 0;
     let mut at = MADT_ENTRIES;
     while at < madt.len() {
@@ -254,14 +265,14 @@ pub fn madt_processors(madt: &[u8], out: &mut [Processor]) -> Result<usize, Acpi
                 apic_id: u32::from(entry.get(3).copied().unwrap_or(0)),
                 uid: u32::from(entry.get(2).copied().unwrap_or(0)),
                 enabled: flags & 1 != 0,
-                online_capable: flags & 2 != 0,
+                online_capable: online_capable(flags),
             }),
             (9, 16..) => match (u32_at(entry, 4), u32_at(entry, 8), u32_at(entry, 12)) {
                 (Some(id), Some(flags), Some(uid)) => Some(Processor {
                     apic_id: id,
                     uid,
                     enabled: flags & 1 != 0,
-                    online_capable: flags & 2 != 0,
+                    online_capable: online_capable(flags),
                 }),
                 _ => None,
             },
@@ -560,13 +571,21 @@ mod tests {
         b
     }
 
+    /// A MADT of revision 6, ACPI 6.5's.
     fn madt(entries: &[&[u8]]) -> Vec<u8> {
+        madt_of(6, entries)
+    }
+
+    fn madt_of(revision: u8, entries: &[&[u8]]) -> Vec<u8> {
         let mut body = vec![0u8; 8]; // local APIC address, flags
         body[..4].copy_from_slice(&0xFEE0_0000u32.to_le_bytes());
         for e in entries {
             body.extend_from_slice(e);
         }
-        table(b"APIC", &body)
+        let mut t = table(b"APIC", &body);
+        t[HEADER_REVISION] = revision;
+        fix_checksum(&mut t, 9);
+        t
     }
 
     fn lapic(uid: u8, id: u8, flags: u32) -> Vec<u8> {
@@ -664,6 +683,27 @@ mod tests {
             madt_processors(&m, &mut small),
             Err(AcpiError::TooManyProcessors)
         );
+    }
+
+    /// ADR-0008 Amendment 1, D2: Online Capable is read from MADT revision 5 on, and only with
+    /// Enabled clear; below revision 5, and beside Enabled, the bit is reserved.
+    #[test]
+    fn online_capable_is_read_from_madt_revision_5_and_only_without_enabled() {
+        let entries: [&[u8]; 4] = [
+            &lapic(0, 0, 1),
+            &lapic(1, 1, 0b11),    // enabled: bit 1 reserved
+            &lapic(2, 2, 0b10),    // online capable
+            &x2apic(400, 0b10, 9), // online capable, above 255
+        ];
+        for (revision, read) in [(1, false), (4, false), (5, true), (6, true), (255, true)] {
+            let m = madt_of(revision, &entries);
+            assert_eq!(check_table(&m, b"APIC"), Ok(()));
+            let mut out = [Processor::default(); 4];
+            assert_eq!(madt_processors(&m, &mut out), Ok(4));
+            let capable: Vec<_> = out.iter().map(|p| p.online_capable).collect();
+            assert_eq!(capable, [false, false, read, read], "revision {revision}");
+            assert!(out[1].enabled && !out[2].enabled && !out[3].enabled);
+        }
     }
 
     #[test]

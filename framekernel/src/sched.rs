@@ -23,10 +23,11 @@ use crate::bootproof::{Proof, Tally};
 use crate::runqueue::{QueueError, RunQueue, per_mille, share_near_weight};
 
 use crate::console::Console;
-use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
+use crate::cpu::{self, CpuIndex, rdtsc};
 use crate::process::UserContext;
 use crate::timer::{self, X2Apic};
 use origin_frame::objref::ObjectRef;
+use origin_frame::percpu::PerCpu;
 use origin_frame::stack::{FpuArea, GuardedStack, ThreadStart};
 use origin_frame::sync::SpinLock;
 use origin_frame::trap::Switch;
@@ -34,9 +35,14 @@ use origin_frame::trap::Switch;
 /// Each kernel thread's stack.
 pub(crate) const THREAD_STACK: usize = 16 * 1024;
 
-static QUEUES: [SpinLock<RunQueue>; MAX_CPUS] =
-    [const { SpinLock::new(RunQueue::new()) }; MAX_CPUS];
-static ACTIVE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+/// Each processor's run queue, by CPU index (ADR-0008 Amendment 1, D1: sized at discovery).
+pub(crate) static QUEUES: PerCpu<SpinLock<RunQueue>> =
+    PerCpu::new(SpinLock::new(RunQueue::new()), || {
+        SpinLock::new(RunQueue::new())
+    });
+/// Each processor whose scheduler runs.
+pub(crate) static ACTIVE: PerCpu<AtomicBool> =
+    PerCpu::new(AtomicBool::new(false), || AtomicBool::new(false));
 /// Set by the boot processor once every AP's threads are queued.
 static GO: AtomicBool = AtomicBool::new(false);
 
@@ -127,7 +133,7 @@ struct Zombie {
 
 /// Per CPU: each slot's stack, and the stacks of threads that exited and await
 /// [`reap`]. Locked after the run queue, always with interrupts disabled.
-struct Threads {
+pub(crate) struct Threads {
     stacks: [Option<GuardedStack>; crate::runqueue::CAPACITY],
     /// Exited threads awaiting [`reap`].
     zombies: [Option<Zombie>; crate::runqueue::CAPACITY],
@@ -137,14 +143,23 @@ struct Threads {
     user: [Option<ObjectRef<UserContext>>; crate::runqueue::CAPACITY],
 }
 
-static THREADS: [SpinLock<Threads>; MAX_CPUS] = [const {
-    SpinLock::new(Threads {
-        stacks: [const { None }; crate::runqueue::CAPACITY],
-        zombies: [const { None }; crate::runqueue::CAPACITY],
-        fpu: [const { None }; crate::runqueue::CAPACITY],
-        user: [const { None }; crate::runqueue::CAPACITY],
-    })
-}; MAX_CPUS];
+impl Threads {
+    /// No thread.
+    const fn new() -> Self {
+        Self {
+            stacks: [const { None }; crate::runqueue::CAPACITY],
+            zombies: [const { None }; crate::runqueue::CAPACITY],
+            fpu: [const { None }; crate::runqueue::CAPACITY],
+            user: [const { None }; crate::runqueue::CAPACITY],
+        }
+    }
+}
+
+/// Each processor's threads, by CPU index.
+pub(crate) static THREADS: PerCpu<SpinLock<Threads>> =
+    PerCpu::new(SpinLock::new(Threads::new()), || {
+        SpinLock::new(Threads::new())
+    });
 
 /// Times a processor picked a thread whose state was not complete (never, if the queue
 /// lock is held as it must be; the boot proof requires 0).
@@ -157,7 +172,7 @@ pub(crate) fn unready_switches() -> u64 {
 
 /// Threads that exited on each processor and await [`reap`], so a processor can tell cheaply
 /// that it has none.
-static ZOMBIES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+pub(crate) static ZOMBIES: PerCpu<AtomicU64> = PerCpu::new(AtomicU64::new(0), || AtomicU64::new(0));
 
 /// Exited threads that await [`reap`] on any processor: for a proof that needs every stack
 /// given back before it counts them (`stacks`).
@@ -521,9 +536,21 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
 /// the TSC shorter than [`RUNNING_STEP`], like [`weighted_worker`]. Time, not iterations: on a
 /// processor sharing a physical core, or an emulated one, how many iterations a slice holds
 /// varies with what else is running, whatever the scheduler did.
-static PROGRESS: [AtomicU64; 2 * MAX_CPUS] = [const { AtomicU64::new(0) }; 2 * MAX_CPUS];
-/// The CPU index each worker last ran on, plus one (0: never ran).
-static RAN_ON: [AtomicU64; 2 * MAX_CPUS] = [const { AtomicU64::new(0) }; 2 * MAX_CPUS];
+/// Two workers for each processor, worker `slot` the `slot % 2`nd of the `slot / 2`th.
+pub(crate) static PROGRESS: PerCpu<[AtomicU64; 2]> =
+    PerCpu::new([const { AtomicU64::new(0) }; 2], || {
+        [const { AtomicU64::new(0) }; 2]
+    });
+/// The CPU index each worker last ran on, plus one (0: never ran), as [`PROGRESS`].
+pub(crate) static RAN_ON: PerCpu<[AtomicU64; 2]> =
+    PerCpu::new([const { AtomicU64::new(0) }; 2], || {
+        [const { AtomicU64::new(0) }; 2]
+    });
+
+/// Worker `slot`'s entry of `table` ([`PROGRESS`] or [`RAN_ON`]).
+fn worker_entry(table: &PerCpu<[AtomicU64; 2]>, slot: usize) -> Option<&AtomicU64> {
+    table.get(slot / 2)?.get(slot % 2)
+}
 /// Tells the workers to stop counting.
 static STOP: AtomicBool = AtomicBool::new(false);
 /// Workers that have stopped and exited.
@@ -539,7 +566,7 @@ extern "sysv64" fn worker(slot: u64) -> ! {
         let now = rdtsc();
         let step = now.wrapping_sub(last);
         last = now;
-        if let (Some(p), Some(r)) = (PROGRESS.get(slot), RAN_ON.get(slot)) {
+        if let (Some(p), Some(r)) = (worker_entry(&PROGRESS, slot), worker_entry(&RAN_ON, slot)) {
             if step < limit {
                 p.fetch_add(step, Ordering::Relaxed);
             }
@@ -1084,12 +1111,14 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         cpu::idle_disabling();
     }
     let elapsed_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
-    let mut switches_at_stop = [0u64; MAX_CPUS];
-    for (slot, &id) in switches_at_stop.iter_mut().zip(cpus) {
-        *slot = QUEUES
-            .get(id.get())
-            .map_or(0, |q| without_interrupts(|| q.lock().switches()));
-    }
+    let switches_at_stop: alloc::vec::Vec<u64> = cpus
+        .iter()
+        .map(|id| {
+            QUEUES
+                .get(id.get())
+                .map_or(0, |q| without_interrupts(|| q.lock().switches()))
+        })
+        .collect();
     STOP.store(true, Ordering::Relaxed);
     // Every worker now exits; the boot flow yields so the boot processor's workers run.
     yield_until(
@@ -1108,8 +1137,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     for (i, &id) in cpus.iter().enumerate() {
         let switches = switches_at_stop.get(i).copied().unwrap_or(0);
         let (a, b) = (2 * i, 2 * i + 1);
-        let count = |w: usize| PROGRESS.get(w).map_or(0, |p| p.load(Ordering::Relaxed));
-        let place = |w: usize| RAN_ON.get(w).map_or(0, |r| r.load(Ordering::Relaxed));
+        let count = |w: usize| worker_entry(&PROGRESS, w).map_or(0, |p| p.load(Ordering::Relaxed));
+        let place = |w: usize| worker_entry(&RAN_ON, w).map_or(0, |r| r.load(Ordering::Relaxed));
         let right_cpu = place(a) == id.get() as u64 + 1 && place(b) == id.get() as u64 + 1;
         // Both workers ran, with comparable shares (within a factor of two).
         let (lo, hi) = (count(a).min(count(b)), count(a).max(count(b)));

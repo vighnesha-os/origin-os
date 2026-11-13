@@ -22,13 +22,14 @@
 
 use core::arch::{asm, naked_asm};
 use core::ptr;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::apic::{SPURIOUS_VECTOR, TIMER_VECTOR, X2APIC_EOI};
 use crate::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
     TSS, TSS_SIZE,
 };
+use crate::percpu::PerCpu;
 use crate::trap::Switch;
 
 /// Size of each interrupt stack (#DF, NMI, #MC, #DB).
@@ -344,9 +345,29 @@ unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex, interrupt_stacks:
     init_speculation();
 }
 
-/// Processors the kernel indexes: every per-CPU array, the CPU-local areas included, has
-/// this many slots (`framekernel::cpumap`).
-pub use crate::limits::MAX_CPUS;
+/// The processor indexes the kernel has: 1, the boot processor's, until the processors are
+/// discovered, and then the number every per-CPU table holds, fixed once (ADR-0008 Amendment 1,
+/// D1 and D5). No count is compiled in.
+static COUNT: AtomicUsize = AtomicUsize::new(1);
+
+/// The processor indexes the kernel has: indexes `0..count()` name a slot in every per-CPU
+/// table. 1 until the processors are discovered.
+#[inline]
+pub fn count() -> usize {
+    COUNT.load(Ordering::Acquire)
+}
+
+/// Fixes [`count`] at `indexes`, once, after every per-CPU table holds that many and before any
+/// application processor starts (`smp`). `false`, and nothing changed, if it was fixed already
+/// or `indexes` is 0.
+pub(crate) fn fix_count(indexes: usize) -> bool {
+    static FIXED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if indexes == 0 || FIXED.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    COUNT.store(indexes, Ordering::Release);
+    true
+}
 /// IA32_GS_BASE: the base of GS in 64-bit mode.
 const GS_BASE: u32 = 0xC000_0101;
 /// IA32_KERNEL_GS_BASE: what `swapgs` exchanges with the base of GS.
@@ -363,13 +384,10 @@ impl CpuIndex {
     /// The boot processor.
     pub const BOOT: Self = Self(0);
 
-    /// Index `index`, if an array has that slot (below [`MAX_CPUS`]).
-    pub const fn new(index: usize) -> Option<Self> {
-        if index < MAX_CPUS {
-            Some(Self(index))
-        } else {
-            None
-        }
+    /// Index `index`, if the per-CPU tables have that slot (below [`count`], fixed at
+    /// discovery).
+    pub fn new(index: usize) -> Option<Self> {
+        (index < count()).then_some(Self(index))
     }
 
     /// The array slot.
@@ -412,7 +430,8 @@ impl core::fmt::Display for Named {
 const UNASSIGNED: u32 = crate::limits::BROADCAST;
 /// Each CPU index's x2APIC ID, or [`UNASSIGNED`]. Written once per index, before that
 /// processor runs any kernel code that reads it.
-static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(UNASSIGNED) }; MAX_CPUS];
+pub(crate) static APIC_IDS: PerCpu<AtomicU32> =
+    PerCpu::new(AtomicU32::new(UNASSIGNED), || AtomicU32::new(UNASSIGNED));
 
 /// Records that the processor with CPU index `index` has x2APIC ID `apic_id`. The boot
 /// processor records itself in [`init`]; `smp` records every other processor at discovery,
@@ -426,7 +445,7 @@ pub(crate) fn assign(index: CpuIndex, apic_id: u32) {
 /// One processor's CPU-local area, reached through GS. A cache line each, so processors
 /// never share one.
 #[repr(C, align(64))]
-struct CpuLocal {
+pub(crate) struct CpuLocal {
     /// This processor's CPU index (offset 0, read by [`this_cpu`]).
     id: AtomicU64,
     /// Address of this processor's TSS (offset 8, used by [`set_kernel_stack`]).
@@ -442,16 +461,23 @@ struct CpuLocal {
     probe_address: AtomicU64,
 }
 
-static CPU_LOCAL: [CpuLocal; MAX_CPUS] = [const {
-    CpuLocal {
-        id: AtomicU64::new(0),
-        tss: AtomicU64::new(0),
-        kernel_stack: AtomicU64::new(0),
-        user_rsp: AtomicU64::new(0),
-        probe_rip: AtomicU64::new(0),
-        probe_address: AtomicU64::new(0),
+impl CpuLocal {
+    /// An area no processor uses yet.
+    pub(crate) const fn new() -> Self {
+        Self {
+            id: AtomicU64::new(0),
+            tss: AtomicU64::new(0),
+            kernel_stack: AtomicU64::new(0),
+            user_rsp: AtomicU64::new(0),
+            probe_rip: AtomicU64::new(0),
+            probe_address: AtomicU64::new(0),
+        }
     }
-}; MAX_CPUS];
+}
+
+/// Each CPU index's CPU-local area. The boot processor's is in the kernel's image; the others'
+/// are on the heap from discovery on, and never move, so GS's base stays valid.
+pub(crate) static CPU_LOCAL: PerCpu<CpuLocal> = PerCpu::new(CpuLocal::new(), CpuLocal::new);
 /// The area of a processor that has no CPU index (its APIC ID is not the one assigned to
 /// the index it was given): its index reads as `u64::MAX`, which names no array slot, so it
 /// never schedules.
@@ -594,8 +620,10 @@ fn cpu_state_holds() -> bool {
 }
 
 /// Each CPU index whose processor passed [`cpu_state_holds`] on itself.
-static CPU_STATE_HOLDS: [core::sync::atomic::AtomicBool; MAX_CPUS] =
-    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_CPUS];
+pub(crate) static CPU_STATE_HOLDS: PerCpu<core::sync::atomic::AtomicBool> =
+    PerCpu::new(core::sync::atomic::AtomicBool::new(false), || {
+        core::sync::atomic::AtomicBool::new(false)
+    });
 
 /// Records whether this processor's control state holds, after `enable_simd`. The boot
 /// processor and every AP do it on themselves; an AP before its handshake, which orders the
@@ -708,13 +736,15 @@ pub fn clear_kernel_stack() {
 
 /// How many thread frames one processor can have saved at once: the run queue's capacity
 /// (`RunQueue` holds 16 contexts) and some.
-const SAVED_FRAME_SLOTS: usize = 32;
+pub(crate) const SAVED_FRAME_SLOTS: usize = 32;
 /// Each processor's saved thread frames: addresses the trap entry saved (a thread preempted,
 /// yielding, sleeping or blocked) or a new thread's first frame. Only these are ever
 /// resumed, so a wrong answer from the scheduler above cannot make the trap entry load anything
 /// else. 0 is an empty slot.
-static SAVED_FRAMES: [[AtomicU64; SAVED_FRAME_SLOTS]; MAX_CPUS] =
-    [const { [const { AtomicU64::new(0) }; SAVED_FRAME_SLOTS] }; MAX_CPUS];
+pub(crate) static SAVED_FRAMES: PerCpu<[AtomicU64; SAVED_FRAME_SLOTS]> =
+    PerCpu::new([const { AtomicU64::new(0) }; SAVED_FRAME_SLOTS], || {
+        [const { AtomicU64::new(0) }; SAVED_FRAME_SLOTS]
+    });
 
 /// Records `frame` as a saved frame of processor `cpu`: a thread's first frame, or one the
 /// trap entry saved. `false` if the table is full (it cannot be: see the slot count).
@@ -1871,8 +1901,10 @@ pub unsafe fn probe_execute(target: u64) -> Probe {
 /// IA32_PAT.
 const IA32_PAT: u32 = 0x277;
 /// Each CPU index whose processor's PAT holds the two memory types the page tables use.
-static PAT_READY: [core::sync::atomic::AtomicBool; MAX_CPUS] =
-    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_CPUS];
+pub(crate) static PAT_READY: PerCpu<core::sync::atomic::AtomicBool> =
+    PerCpu::new(core::sync::atomic::AtomicBool::new(false), || {
+        core::sync::atomic::AtomicBool::new(false)
+    });
 
 /// Checks that this processor's PAT has entry 0 write-back (06h) and entry 3 uncached
 /// (00h), the memory types `paging::Cache` selects (Intel SDM Vol. 3A §11.12.2,

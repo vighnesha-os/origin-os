@@ -207,7 +207,9 @@ use crate::floor::MonotonicFloor;
 use crate::ports::{self, Kind, Packet, Port, Reservation, Source, Storage, TakeError};
 use crate::refcount::RefCount;
 use crate::runqueue::RunQueue;
-use crate::shootdown::{Confirmation, Request, Rounds, Scope, Shootdown, Stalled, TlbHardware};
+use crate::shootdown::{
+    Confirmation, Held, Request, Rounds, Scope, Shootdown, Stalled, TlbHardware,
+};
 use crate::slots::Slots;
 use crate::wait::{Scheduler, TimedOut, WaitQueue};
 use crate::{RwLock, SpinLock};
@@ -1455,7 +1457,8 @@ fn floor_racing_readers_end_at_the_largest_reading() {
 
 // ---------------------------------------------------------------- TLB shootdown
 
-/// Processors in a shootdown model.
+/// Processors in a shootdown model's machine: the most a model has. The protocol's own count is
+/// its storage's, known only at run time ([`TlbWorld::sized`]).
 const SHOOT_CPUS: usize = 3;
 /// The one page the shootdown models care about.
 const THE_PAGE: u64 = 0x40_0000;
@@ -1478,7 +1481,7 @@ const PATIENCE: u64 = 64;
 
 /// The machine of a shootdown model: a page table entry and each processor's TLB.
 struct TlbWorld {
-    shootdown: Shootdown<SHOOT_CPUS>,
+    shootdown: Shootdown<Held>,
     /// Whether each processor holds a translation of [`THE_PAGE`].
     tlb: [AtomicBool; SHOOT_CPUS],
     /// The shootdown interrupt.
@@ -1566,8 +1569,22 @@ impl TlbWorld {
 
     /// A world in which sending processor `bystander` an interrupt fails the model.
     fn with_bystander(bystander: Option<usize>) -> Arc<Self> {
+        Self::built(SHOOT_CPUS, bystander)
+    }
+
+    /// A world whose protocol keeps records for `count` processors, a number it learns only at
+    /// run time (ADR-0008 Amendment 1, D1): at most [`SHOOT_CPUS`].
+    fn sized(count: usize) -> Arc<Self> {
+        Self::built(count, None)
+    }
+
+    fn built(count: usize, bystander: Option<usize>) -> Arc<Self> {
+        assert!(
+            count <= SHOOT_CPUS,
+            "the model's machine has {SHOOT_CPUS} processors"
+        );
         Arc::new(Self {
-            shootdown: Shootdown::new(),
+            shootdown: Shootdown::new(Held::new(count)),
             tlb: core::array::from_fn(|_| AtomicBool::new(false)),
             kick: core::array::from_fn(|_| Notify::new()),
             stop: AtomicBool::new(false),
@@ -1634,6 +1651,33 @@ impl TlbCpu {
             .shootdown
             .shoot(self, Request::page(THE_PAGE), scope)
             .expect(NO_ANSWER);
+    }
+}
+
+/// With the number of processors known only at run time, 2 and then 3, the last of them, which
+/// holds the translation, has dropped it when `shoot` returns (ADR-0008 Amendment 1, D7). The
+/// controls `shootdown_records_one_short` and `shootdown_wait_stops_one_short` fail it.
+#[test]
+fn shootdown_reaches_the_last_processor_whatever_the_count() {
+    for count in [2, 3] {
+        check(
+            "shootdown_reaches_the_last_processor_whatever_the_count",
+            preempted(3, SPINS),
+            preempted(4, SPINS),
+            move || {
+                let count = core::hint::black_box(count);
+                let world = TlbWorld::sized(count);
+                let last = count - 1;
+                let (near, far) = (tlb_cpu(&world, 0), tlb_cpu(&world, last));
+                world.shootdown.mark_online(&near);
+                world.shootdown.mark_online(&far);
+                world.tlb[last].store(true, Relaxed);
+                let serving = far.serving();
+                near.take_the_page_away(Scope::Kernel);
+                assert!(!far.holds(), "{STALE}");
+                world.finish(vec![serving]);
+            },
+        );
     }
 }
 

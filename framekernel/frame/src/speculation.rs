@@ -27,8 +27,8 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cpuident::{self, Maker, Signature};
-use crate::limits::MAX_CPUS;
 use crate::nospec::Form;
+use crate::percpu::PerCpu;
 
 /// `IA32_SPEC_CTRL` bit 0: with enhanced IBRS, set once and left.
 pub const IBRS: u64 = 1 << 0;
@@ -380,7 +380,7 @@ const RECORDED: u64 = 1 << 62;
 const HELD: u64 = 1 << 61;
 
 /// Each processor's plan, as [`Plan::to_bits`], with [`HELD`]. 0: nothing recorded.
-static RECORDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+pub(crate) static RECORDS: PerCpu<AtomicU64> = PerCpu::new(AtomicU64::new(0), || AtomicU64::new(0));
 
 /// Records what processor `cpu` decided and whether its registers read back that way. Each
 /// processor does it on itself, once, as it starts.
@@ -475,7 +475,8 @@ impl Default for Ledger {
     }
 }
 
-static LEDGERS: [Ledger; MAX_CPUS] = [const { Ledger::new() }; MAX_CPUS];
+/// Each processor's ledger of process changes.
+pub(crate) static LEDGERS: PerCpu<Ledger> = PerCpu::new(Ledger::new(), Ledger::new);
 
 /// [`Ledger::enters`] for processor `cpu`, with what that processor recorded about IBPB.
 /// False for a processor that recorded nothing: it has not said the command exists.
@@ -728,14 +729,14 @@ mod tests {
             assert_eq!(Plan::from_bits(plan.to_bits()), plan, "{plan}");
         }
         // The top of the processor table, which no other test uses.
-        let cpu = MAX_CPUS - 1;
+        let cpu = sized_tables() - 1;
         assert_eq!(recorded(cpu), None);
         record(cpu, plans[0], true);
         assert_eq!(recorded(cpu), Some((plans[0], true)));
         record(cpu, plans[3], false);
         assert_eq!(recorded(cpu), Some((plans[3], false)));
-        assert_eq!(recorded(MAX_CPUS), None);
-        record(MAX_CPUS, plans[0], true);
+        assert_eq!(recorded(cpu + 1), None, "past the table");
+        record(cpu + 1, plans[0], true);
     }
 
     #[test]
@@ -776,13 +777,31 @@ mod tests {
             }
         );
         // A processor that recorded nothing has not said it has the command.
-        let cpu = MAX_CPUS - 2;
+        let cpu = sized_tables() - 2;
         assert!(!enters(cpu, 1));
         assert_eq!(count(cpu).barriers, 0);
         record(cpu, Plan::decide(&amd_model_51h()), true);
         assert!(enters(cpu, 2));
         assert!(!enters(cpu, 2));
         assert_eq!(count(cpu).barriers, 1);
-        assert_eq!(count(MAX_CPUS), Count::default());
+        assert_eq!(count(cpu + 2), Count::default(), "past the table");
+    }
+
+    /// This module's tables sized for a test machine of 64 processors, once for every test
+    /// (ADR-0008 Amendment 1, D5: host tests keep small fixed machines of their own). Returns 64.
+    fn sized_tables() -> usize {
+        const TEST_MACHINE: usize = 64;
+        // Once for every test: a table is sized once, and a second sizing that ran beside the
+        // first would see it sized before its slice is published.
+        static SIZED: std::sync::Once = std::sync::Once::new();
+        SIZED.call_once(|| {
+            let _ = RECORDS.size(TEST_MACHINE);
+            let _ = LEDGERS.size(TEST_MACHINE);
+        });
+        assert_eq!(
+            (RECORDS.indexes(), LEDGERS.indexes()),
+            (TEST_MACHINE, TEST_MACHINE)
+        );
+        TEST_MACHINE
     }
 }

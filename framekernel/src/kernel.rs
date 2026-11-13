@@ -278,7 +278,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // can be taken once, and only before the generator's start overwrites it with the seed.
         let stack_value = prove_stack_value(&mut com1, info.boot_seed != 0);
         report_random_start(&mut com1, origin_frame::random::start_boot());
-        let online = smp::start(&mut com1, sched::run_ap);
+        let online = smp::start(&mut com1, sched::run_ap, crate::percpu::size_per_cpu);
         proofs.record(Proof::Processors, online.complete());
         // What each processor put in its own control registers, which ring 3 relies on.
         let held = cpu::cpu_states_holding(online.cpus()) == online.cpus().len();
@@ -302,7 +302,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         }
         // Every boot step, and the two that bring up hardware for good, run once: a repeat
         // changes nothing (`smp::start` would otherwise reset running processors).
-        let again = smp::start(&mut com1, sched::run_ap);
+        let again = smp::start(&mut com1, sched::run_ap, crate::percpu::size_per_cpu);
         let once = again.cpus().len() == 1
             && !again.complete()
             && early.reclaim_loader_memory(&online).is_none()
