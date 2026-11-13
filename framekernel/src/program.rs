@@ -341,8 +341,8 @@ include!(concat!(env!("ORIGIN_CARRIED_PROGRAMS"), "/pin_program.rs"));
 
 /// What the first program is given (ADR-0005 G6), each kind deliberately: its three start
 /// handles, room for the one message it writes, and the developer calls, since it reports to its
-/// boot proof; no channels of its own, memory objects, mappings, events or ports; and eight
-/// pages of stack.
+/// boot proof; no channels of its own, memory objects, mappings, events or ports; the one thread
+/// its launch starts; and eight pages of stack.
 #[cfg(target_os = "none")]
 pub(crate) const FIRST_PROGRAM_RUN: crate::launch::ProgramLimits = crate::launch::ProgramLimits {
     limits: crate::process::Limits {
@@ -352,6 +352,7 @@ pub(crate) const FIRST_PROGRAM_RUN: crate::launch::ProgramLimits = crate::launch
         debug_calls: true,
         memory: crate::process::MemoryLimits::NONE,
         objects: crate::quota::ObjectLimits::NONE,
+        threads: 1,
     },
     stack_pages: 8,
 };

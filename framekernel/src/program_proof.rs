@@ -96,6 +96,8 @@ const CREATOR: Limits = Limits {
     debug_calls: false,
     memory: MemoryLimits::NONE,
     objects: ObjectLimits::NONE,
+    // It never runs (ADR-0005 G5, G6).
+    threads: 0,
 };
 
 /// What one launch showed.

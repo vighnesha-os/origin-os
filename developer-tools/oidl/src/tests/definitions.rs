@@ -640,3 +640,61 @@ fn a_syscall_number_whose_load_would_hold_a_syscall_is_the_one_refused() {
         .is_ok()
     );
 }
+
+/// Every handle a type can carry, walking into structs, arrays and vectors.
+fn handles_in(ty: &crate::model::Type, found: &mut Vec<crate::model::HandleType>) {
+    use crate::model::Type;
+    match ty {
+        Type::Handle(handle) => found.push(handle.clone()),
+        Type::Struct(structure) => {
+            for field in &structure.fields {
+                handles_in(&field.ty, found);
+            }
+        }
+        Type::Array(inner, _) | Type::Vector(inner, _) => handles_in(inner, found),
+        Type::Bool | Type::Int(_) | Type::Enum(_) | Type::Bits(_) | Type::String(_) => {}
+    }
+}
+
+/// Row O2 of the system-call threat model is closed for step 4 by absence (decision item 206;
+/// ADR-0005 Amendment 8, G2): no call of `origin.kernel` creates a thread or a process. A call
+/// that hands back a handle to a process or a thread, anywhere in its results, would reopen it,
+/// and this test fails then. So does any other result that is a handle of any type, which could
+/// name a new process or thread, besides `handle_duplicate`'s, which names an object its caller
+/// already holds a handle to.
+#[test]
+fn no_kernel_call_returns_a_new_process_or_thread() {
+    let comp = compile(&good_inputs(), Some(VERSIONS)).expect("valid");
+    let kernel = comp
+        .libraries
+        .iter()
+        .find(|library| library.name == "origin.kernel")
+        .expect("origin.kernel");
+    let mut methods = 0;
+    for interface in &kernel.interfaces {
+        for method in &interface.methods {
+            methods += 1;
+            let mut found = Vec::new();
+            for result in &method.returns {
+                handles_in(&result.ty, &mut found);
+            }
+            for handle in found {
+                let object = handle.object.as_deref();
+                assert!(
+                    object != Some("process") && object != Some("thread"),
+                    "{} returns a {:?} handle: row O2 reopens (ADR-0005 G2)",
+                    method.name,
+                    object
+                );
+                assert!(
+                    object.is_some() || method.name == "handle_duplicate",
+                    "{} returns a handle of any type, which could be a new process or thread",
+                    method.name
+                );
+            }
+        }
+    }
+    // The definition the threat model's row cites: its twenty calls at `user-abi` 0.7.
+    assert_eq!(methods, 20);
+    assert_eq!((kernel.version.major, kernel.version.minor), (0, 7));
+}

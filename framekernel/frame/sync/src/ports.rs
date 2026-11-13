@@ -586,6 +586,20 @@ impl<K: Kernel> core::fmt::Debug for Reservation<K> {
 }
 
 impl<K: Kernel> Reservation<K> {
+    /// The size and alignment of each allocation one binding makes: its storage and its ticket,
+    /// each in a [`Node`] of its own. The kernel-wide bound counts each binding by them, with
+    /// its slots in a port's index ([`Port::INDEX_SLOT`]; ADR-0005 G5).
+    pub const ALLOCATIONS: [(usize, usize); 2] = [
+        (
+            core::mem::size_of::<[Store<K>; 1]>(),
+            core::mem::align_of::<[Store<K>; 1]>(),
+        ),
+        (
+            core::mem::size_of::<[Ticket<K>; 1]>(),
+            core::mem::align_of::<[Ticket<K>; 1]>(),
+        ),
+    ];
+
     /// What one binding to `port` needs, carrying `payload`: its storage, and room in the port's
     /// index. If the heap has no room it returns [`NoMemory`], drops `payload`, and changes
     /// nothing else. For a port that has closed it makes no room: the bind will be refused.
@@ -718,6 +732,17 @@ impl<K: Kernel> Default for Port<K> {
 }
 
 impl<K: Kernel> Port<K> {
+    /// The size and alignment of one slot of a port's index (row K7 of the system-call threat
+    /// model; ADR-0005 G5 asks that it be measured).
+    pub const INDEX_SLOT: (usize, usize) = (
+        core::mem::size_of::<Slot<K>>(),
+        core::mem::align_of::<Slot<K>>(),
+    );
+
+    /// The fewest slots a port's index has once it has grown at all. Each growth then takes it to
+    /// at least twice its capacity, as a `Vec` grows.
+    pub const FIRST_INDEX_SLOTS: usize = FIRST_SLOTS;
+
     /// An open port with nothing queued and nothing armed.
     #[cfg(not(all(test, loom)))]
     pub const fn new() -> Self {
