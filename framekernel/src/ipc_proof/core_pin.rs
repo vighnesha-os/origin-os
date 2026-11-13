@@ -28,7 +28,8 @@
 //!   call are `invalid_args`;
 //! - **the proof processes** keep their range (L8): a call from outside it is refused with a
 //!   status, and a number no method has answers `not_supported`;
-//! - everything it made is gone afterwards.
+//! - everything it made is gone afterwards, and `origin.core`'s frames still hold the image
+//!   word for word.
 //!
 //! It also prints what one call through `origin.core` costs, which nothing judges.
 //!
@@ -447,16 +448,22 @@ pub(crate) fn prove_core_pin(
     sched::yield_until(same, tsc_hz, 2);
     let back = same();
     // No process is left to map it: its frames are executable through no mapping, and still
-    // writable through none.
+    // writable through none. And after everything above, the hostile runs among it, they hold
+    // the image word for word as it was written at boot (the review's finding F1).
     let unmapped = core_image::mappings() == Some((0, 0));
+    let intact = core_image::intact();
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let _ = writeln!(
         com1,
-        "origin-kernel: core: every process it launched and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}); origin.core's own frames stay, mapped by no process: {unmapped}{}",
-        if back && unmapped { "" } else { FAILED }
+        "origin-kernel: core: every process it launched and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}); origin.core's own frames stay, mapped by no process: {unmapped}, and still hold the image word for word as it was written at boot: {intact}{}",
+        if back && unmapped && intact {
+            ""
+        } else {
+            FAILED
+        }
     );
-    ok && back && unmapped
+    ok && back && unmapped && intact
 }
 
 /// Every call, and the hostile calls, through `origin.core`.

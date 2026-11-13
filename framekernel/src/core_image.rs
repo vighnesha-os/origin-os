@@ -16,11 +16,23 @@
 //! # One set of frames (L2)
 //!
 //! At boot, before any process exists, [`install`] takes one frame for each page of the image,
-//! writes the code into them, and keeps them here. That is the only time they are written: this
-//! module keeps the frames to itself and hands out no way to reach them but the mapping of them,
-//! read-execute, into a process's space. The framework counts each frame's executable mappings
-//! and refuses a writable mapping of a frame that is executable anywhere
-//! (`origin_frame::aliases`), so no process can come to write them either.
+//! writes the image into them, reads every word back, and keeps them here. What a frame holds
+//! is [`image_word`]: the code, and after it the linker's own padding, `int3`, to the end of
+//! the page, so that no byte after the last stub is anything a processor would run on from
+//! (the review of 2026-11-13, findings F1 and F11).
+//!
+//! That is the only time they are written. This module keeps the frames to itself: no
+//! `SharedFrame` leaves it. It hands out the mapping of them, read-execute, into a process's
+//! space, and three readers for the boot proof, which give numbers and a yes or no: a page's
+//! physical address, the count of mappings, and whether the frames still hold the image
+//! ([`intact`]). The framework counts each frame's executable mappings and refuses a writable
+//! mapping of a frame that is executable anywhere (`origin_frame::aliases`), so no process can
+//! come to write them either.
+//!
+//! What the framework does not refuse is a write by the kernel itself through a `SharedFrame`
+//! it holds: each address space that maps the image holds one. That nothing does so is held
+//! by reading, and shown after the fact by [`intact`] at the end of the boot proof; a rule in
+//! the framework is TASKS item 51 (the same review, finding F7).
 #![forbid(unsafe_code)]
 
 use origin_syscalls::origin_kernel::kernel::server::{Pins, RELEASE_FINGERPRINT};
@@ -50,7 +62,8 @@ pub struct CoreImage {
     /// The bytes its code maps, a whole number of pages. The image's base is where the first
     /// of them goes in a process.
     pub span: u64,
-    /// Its code: the stubs, and the linker's padding between them. The rest of `span` is zero.
+    /// Its code: the stubs, and the linker's padding between them. The rest of `span` is the
+    /// same padding, as the linker's file has it ([`image_word`]).
     pub code: &'static [u8],
     /// Its exports, strictly ascending by name. An import names one by its place here.
     pub exports: &'static [CoreExport],
@@ -151,6 +164,28 @@ pub const fn check(image: &CoreImage) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// What the linker fills the space between and after functions with: `int3`.
+pub const PADDING: u8 = 0xCC;
+
+/// The 8 bytes of `image` at offset `at` of its span, as a little-endian word: its code where
+/// there is code, and the linker's padding after it to the end of the span. What each word of
+/// the kernel's frames must hold.
+#[must_use]
+pub const fn image_word(image: &CoreImage, at: usize) -> u64 {
+    let mut bytes = [PADDING; 8];
+    let mut i = 0;
+    while i < 8 {
+        // `at + i` cannot wrap for an offset inside a span of at most 1 MiB.
+        if let Some(index) = at.checked_add(i)
+            && index < image.code.len()
+        {
+            bytes[i] = image.code[index];
+        }
+        i += 1;
+    }
+    u64::from_le_bytes(bytes)
+}
+
 // The description `onbf-pack corelib` wrote for this build (`cargo xtask` names its directory in
 // ORIGIN_CARRIED_PROGRAMS, with the carried programs' descriptions).
 #[cfg(target_os = "none")]
@@ -179,7 +214,7 @@ pub(crate) fn image() -> &'static CoreImage {
 }
 
 #[cfg(target_os = "none")]
-pub(crate) use shared::{frame, install, map_into, mappings};
+pub(crate) use shared::{frame, install, intact, map_into, mappings};
 
 /// The one set of frames, and the only code that touches them.
 #[cfg(target_os = "none")]
@@ -191,7 +226,10 @@ mod shared {
     use origin_frame::userspace::{ChangeError, SharedFrame, UserSpace};
     use origin_paging::{Access, MapError};
 
-    use super::{ORIGIN_CORE, PAGE};
+    use super::{ORIGIN_CORE, PAGE, image_word};
+
+    /// Words in a page.
+    const WORDS: usize = PAGE as usize / 8;
 
     /// `origin.core`'s frames, one a page, in order: made by [`install`], and never written
     /// after it returns.
@@ -202,18 +240,22 @@ mod shared {
     pub(crate) enum InstallError {
         /// No frame, or no kernel memory for their record.
         NoMemory,
+        /// A word read back from a frame is not the word written there: the frames do not
+        /// hold the image.
+        ReadBack,
         /// It is already installed: the frames are written once.
         Twice,
     }
 
-    /// Takes one frame for each page of `origin.core` and writes its code into them: once, at
-    /// boot, before any process exists and so before any mapping of them does. Returns how
-    /// many frames it took.
+    /// Takes one frame for each page of `origin.core`, writes the image into them and reads
+    /// every word back: once, at boot, before any process exists and so before any mapping of
+    /// them does. Returns how many frames it took.
     ///
     /// # Errors
     ///
-    /// [`InstallError::NoMemory`], with every frame it took given back; [`InstallError::Twice`]
-    /// on a second call, which changes nothing.
+    /// [`InstallError::NoMemory`] and [`InstallError::ReadBack`], with every frame it took
+    /// given back and nothing kept, so that no process can then be launched;
+    /// [`InstallError::Twice`] on a second call, which changes nothing.
     pub(crate) fn install() -> Result<usize, InstallError> {
         if FRAMES.get().is_some() {
             return Err(InstallError::Twice);
@@ -223,29 +265,42 @@ mod shared {
         frames
             .try_reserve_exact(pages)
             .map_err(|_| InstallError::NoMemory)?;
-        // A fresh frame is zero, as the span past the code must be.
-        for chunk in 0..pages {
+        for page in 0..pages {
             let frame = SharedFrame::new().ok_or(InstallError::NoMemory)?;
-            let page = ORIGIN_CORE
-                .code
-                .chunks(PAGE as usize)
-                .nth(chunk)
-                .unwrap_or(&[]);
-            for (word, bytes) in page.chunks(8).enumerate() {
-                let mut value = [0u8; 8];
-                if let Some(low) = value.get_mut(..bytes.len()) {
-                    low.copy_from_slice(bytes);
-                }
-                if !frame.write_u64(word * 8, u64::from_le_bytes(value)) {
+            // Every word of the page: the code, then the linker's padding to its end.
+            for word in 0..WORDS {
+                let value = image_word(&ORIGIN_CORE, page * PAGE as usize + word * 8);
+                if !frame.write_u64(word * 8, value) {
                     return Err(InstallError::NoMemory);
                 }
             }
             frames.push(frame);
         }
+        // Read back before anything can map them: what is kept is what was meant.
+        if !holds_image(&frames) {
+            return Err(InstallError::ReadBack);
+        }
         FRAMES
             .set(frames)
             .map(|()| pages)
             .map_err(|_| InstallError::Twice)
+    }
+
+    /// Whether every word of `frames` is the image's word there.
+    fn holds_image(frames: &[SharedFrame]) -> bool {
+        frames.iter().enumerate().all(|(page, frame)| {
+            (0..WORDS).all(|word| {
+                frame.read_u64(word * 8)
+                    == Some(image_word(&ORIGIN_CORE, page * PAGE as usize + word * 8))
+            })
+        })
+    }
+
+    /// Whether `origin.core`'s frames hold the image, word for word, as [`install`] wrote it:
+    /// for the boot proof's last clause. `false` if it was never installed.
+    #[must_use]
+    pub(crate) fn intact() -> bool {
+        FRAMES.get().is_some_and(|frames| holds_image(frames))
     }
 
     /// Maps `origin.core` into `space` at `base`: every page, or none, each read-execute, each

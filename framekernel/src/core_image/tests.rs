@@ -187,3 +187,52 @@ fn stubs_generated_from_another_definition_are_refused() {
         Err(CoreError::Release)
     );
 }
+
+/// An image whose code is `bytes`, for [`image_word`] alone.
+fn image_of(bytes: &'static [u8]) -> CoreImage {
+    CoreImage {
+        span: PAGE,
+        code: bytes,
+        exports: &[],
+        pins: pins(),
+        release: RELEASE_FINGERPRINT,
+    }
+}
+
+#[test]
+fn a_word_of_the_image_is_its_code_then_the_linkers_padding() {
+    // Thirteen bytes of code: the first word is code, the second five bytes of code and three
+    // of padding, and every word after it padding alone.
+    let image = image_of(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(
+        image_word(&image, 0),
+        u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8])
+    );
+    assert_eq!(
+        image_word(&image, 8),
+        u64::from_le_bytes([9, 10, 11, 12, 13, 0xCC, 0xCC, 0xCC])
+    );
+    let padding = u64::from_le_bytes([PADDING; 8]);
+    assert_eq!(image_word(&image, 16), padding);
+    assert_eq!(image_word(&image, PAGE as usize - 8), padding);
+    // An offset that would wrap is padding, not a panic.
+    assert_eq!(image_word(&image, usize::MAX - 3), padding);
+}
+
+#[test]
+fn a_whole_page_of_the_image_has_no_byte_after_its_code_but_padding() {
+    // What the frames hold, laid out as the install writes it: no zero byte follows the last
+    // stub, which two of would be an instruction of their own (the review's finding F11).
+    let image = image_of(code());
+    let mut page = Vec::new();
+    for word in 0..PAGE as usize / 8 {
+        page.extend_from_slice(&image_word(&image, word * 8).to_le_bytes());
+    }
+    let length = image.code.len();
+    assert_eq!(&page[..length], image.code);
+    assert!(page[length..].iter().all(|&byte| byte == PADDING));
+    assert_eq!(page.len(), PAGE as usize);
+    // The two bytes of `syscall` are where the code has them and nowhere after it.
+    let pairs = |bytes: &[u8]| bytes.windows(2).filter(|pair| *pair == SYSCALL).count();
+    assert_eq!(pairs(&page), pairs(image.code));
+}

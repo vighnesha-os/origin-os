@@ -1620,12 +1620,14 @@ fn init_paging(com1: &mut Console, early: &mut Early) -> bool {
     early.load_kernel_tables(com1, tables)
 }
 
-/// Proves the heap with real `alloc` collections: a large vector (a frame run), thousands
-/// of boxes (slabs), a B-tree map and a string, with their contents checked; then that
-/// dropping them all returns the heap and the frame allocator exactly to where they were.
 /// Writes `origin.core` into its frames, once, and says what it took: every process that is
-/// pinned per call maps these same frames, read-execute, and nothing writes them again. If it
-/// cannot be done no such process can be launched, and the boot says so.
+/// pinned per call maps these same frames, read-execute, and nothing writes them again. The
+/// install is judged by what it returns, which includes its own read-back of every word. The
+/// fall in free frames is printed as a figure and judges nothing: the frames' records are on
+/// the kernel heap, which may take a frame of its own, and the other processors are already
+/// running. If it cannot be done no process can be launched: the line fails the boot test, and
+/// the boot proofs that launch a program, and the last clause of "origin.core and the call
+/// pin", fail the boot itself.
 fn install_origin_core(com1: &mut Console) {
     let image = crate::core_image::image();
     let free = || memory::stats().map(|(_, frames)| frames);
@@ -1638,14 +1640,9 @@ fn install_origin_core(com1: &mut Console) {
     let _ = match installed {
         Ok(frames) => writeln!(
             com1,
-            "origin-kernel: origin.core: {} bytes of code, the stubs of {} calls and nothing else, written once into {frames} frames that every process pinned per call maps read-execute; the free frames fell by {took}{}",
+            "origin-kernel: origin.core: {} bytes of code, the stubs of {} calls and nothing else, written once into {frames} frames and read back as written, the rest of each page the linker's int3; every process pinned per call maps them read-execute (free frames fell by {took}, a figure)",
             image.code.len(),
             image.exports.len(),
-            if took == frames as u64 {
-                ""
-            } else {
-                ": origin.core failed"
-            }
         ),
         Err(e) => writeln!(
             com1,
@@ -1654,6 +1651,9 @@ fn install_origin_core(com1: &mut Console) {
     };
 }
 
+/// Proves the heap with real `alloc` collections: a large vector (a frame run), thousands
+/// of boxes (slabs), a B-tree map and a string, with their contents checked; then that
+/// dropping them all returns the heap and the frame allocator exactly to where they were.
 fn prove_heap(com1: &mut Console) -> bool {
     use alloc::boxed::Box;
     use alloc::collections::BTreeMap;

@@ -1483,7 +1483,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // `origin.core` into its one set of frames, before any process exists (task S4-2;
             // ADR-0011 L2).
             "origin-kernel: origin.core: ".into(),
-            " bytes of code, the stubs of 20 calls and nothing else, written once into 1 frames that every process pinned per call maps read-execute; the free frames fell by 1".into(),
+            " bytes of code, the stubs of 20 calls and nothing else, written once into 1 frames and read back as written, the rest of each page the linker's int3; every process pinned per call maps them read-execute (free frames fell by ".into(),
             // The guard is in the kernel stacks' region, whose addresses the boot never prints
             // (ADR-0004 Amendment 2, A6.3).
             "origin-kernel: page protection: the first thread's stack guard page faulted (#PF error 0x0)".into(),
@@ -1868,6 +1868,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": start failed",
         ": rust program failed",
         ": origin.core failed",
+        "origin.core could not be written",
         ": entry flags failed",
         ": directory failed",
         ": memory failed",
@@ -2423,7 +2424,7 @@ fn core_pin_markers() -> Vec<String> {
         " spaces and writable in none: true, each at a base of its own: true".into(),
         "origin-kernel: core: narrow parameters: through its stub, a call whose 32-bit parameter has bits set above it, in the second, third and fourth registers, is the same call with them clear, 4 calls: true; the same registers in a direct call by a proof process are each INVALID_ARGS: true".into(),
         "origin-kernel: core: every process it launched and all they held are gone: heap ".into(),
-        "; origin.core's own frames stay, mapped by no process: true".into(),
+        "; origin.core's own frames stay, mapped by no process: true, and still hold the image word for word as it was written at boot: true".into(),
         "origin-kernel: entry flags: a program's first instruction pushed RFLAGS, ".into(),
         ", and found 0x202 and 0x202: the direction flag and the six status flags clear and interrupts on: true".into(),
     ]
