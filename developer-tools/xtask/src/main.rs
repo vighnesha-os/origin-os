@@ -176,6 +176,9 @@ environment:
                                       label contains one of these comma-separated strings
   ORIGIN_QEMU_SMP                     processors QEMU emulates, 1 or more (q35 takes up
                                       to 4096; default 2)
+  ORIGIN_QEMU_NVME_PAIRS              the I/O queue pairs QEMU's NVMe controller allocates
+                                      (default 64; at least 2): 2 is the control for a
+                                      controller with no pair past the driver's two
   ORIGIN_QEMU_TOPOLOGY                x2apic: the boot-x2apic machine; sparse: 67
                                       processors, 64 in package 0 and three at APIC IDs 256,
                                       300 and 412; many: two packages of 144 cores, 288
@@ -577,15 +580,65 @@ impl Accel {
     }
 }
 
+/// What the per-processor NVMe proof must print on this configuration: every processor given a
+/// queue proven, or, where the controller gives none past the driver's two, "not proven".
+fn nvme_per_cpu_markers(machine: &Machine, cpus: u32) -> Vec<String> {
+    nvme_per_cpu_markers_for(machine, cpus, qemu_nvme_pairs())
+}
+
+/// [`nvme_per_cpu_markers`] for a controller that allocates `pairs` I/O queue pairs.
+fn nvme_per_cpu_markers_for(machine: &Machine, cpus: u32, pairs: u32) -> Vec<String> {
+    let queued = nvme_queued_for(cpus, pairs);
+    let pairs = (2 + cpus).min(pairs);
+    if queued == 0 {
+        return vec![format!(
+            "origin-kernel: NVMe: per-CPU queues: not proven: the controller allocated {pairs} I/O queue pairs and has {QEMU_NVME_VECTORS} MSI-X vectors, 2 for the driver"
+        )];
+    }
+    std::iter::once(format!(
+        "origin-kernel: NVMe: per-CPU queues: {queued} of {cpus} processors have an I/O queue pair and MSI-X vector of their own, {} have none (the controller allocated {pairs} I/O queue pairs, 2 for the driver, and has {QEMU_NVME_VECTORS} MSI-X vectors, 2 for the driver)",
+        cpus - queued
+    ))
+    .chain((0..queued).map(|index| {
+        format!(
+            "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, ",
+            machine.named(index)
+        )
+    }))
+    .chain([format!(
+        "origin-kernel: NVMe: per-CPU queues: {queued} threads at once, one per CPU, each with its own queue pair and MSI-X vector: {} reads, {1} of {1} blocks match",
+        32 * queued,
+        256 * queued
+    )])
+    .collect()
+}
+
 /// I/O queue pairs QEMU 11.1's NVMe controller allocates (its `max_ioqpairs`), and its MSI-X
 /// vectors (`msix_qsize`): the driver keeps two pairs and two vectors, and every other
 /// processor past what is left has no queue of its own (ADR-0008 Amendment 1, D6).
 const QEMU_NVME_PAIRS: u32 = 64;
 const QEMU_NVME_VECTORS: u32 = 65;
 
+/// The I/O queue pairs this boot's NVMe controller allocates: QEMU's default, or
+/// `ORIGIN_QEMU_NVME_PAIRS` (at least 2), which limits its `max_ioqpairs` for the control that
+/// shows a controller with none past the driver's two (the coordinating session's ruling of
+/// 2026-11-14).
+fn qemu_nvme_pairs() -> u32 {
+    env::var("ORIGIN_QEMU_NVME_PAIRS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 2)
+        .unwrap_or(QEMU_NVME_PAIRS)
+}
+
 /// The processors that get an NVMe queue of their own on QEMU's controller: the first this many.
 fn nvme_queued(cpus: u32) -> u32 {
-    cpus.min(QEMU_NVME_PAIRS - 2).min(QEMU_NVME_VECTORS - 2)
+    nvme_queued_for(cpus, qemu_nvme_pairs())
+}
+
+/// [`nvme_queued`] for a controller that allocates `pairs` I/O queue pairs.
+fn nvme_queued_for(cpus: u32, pairs: u32) -> u32 {
+    cpus.min(pairs.saturating_sub(2)).min(QEMU_NVME_VECTORS - 2)
 }
 
 /// The per-CPU tables the kernel sizes at discovery, the framework's and the kernel crate's
@@ -2166,25 +2219,10 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // Per-CPU queues: every CPU at once through its own queue pair and vector, the
             // vector's destination its APIC ID.
         ])
-        // ADR-0008 Amendment 1, D6: a queue of its own while the controller has one left.
-        .chain([format!(
-            "origin-kernel: NVMe: per-CPU queues: {} of {cpus} processors have an I/O queue pair and MSI-X vector of their own, {} have none (the controller allocated {} I/O queue pairs, 2 for the driver, and has {QEMU_NVME_VECTORS} MSI-X vectors, 2 for the driver)",
-            nvme_queued(cpus),
-            cpus - nvme_queued(cpus),
-            (2 + cpus).min(QEMU_NVME_PAIRS)
-        )])
-        .chain((0..nvme_queued(cpus)).map(|index| {
-            format!(
-                "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, ",
-                machine.named(index)
-            )
-        }))
-        .chain([format!(
-            "origin-kernel: NVMe: per-CPU queues: {0} threads at once, one per CPU, each with its own queue pair and MSI-X vector: {1} reads, {2} of {2} blocks match",
-            nvme_queued(cpus),
-            32 * nvme_queued(cpus),
-            256 * nvme_queued(cpus)
-        )])
+        // ADR-0008 Amendment 1, D6: a queue of its own while the controller has one left. The
+        // proof is demanded on every configuration that gives one; only a controller limited to
+        // the driver's two pairs (`ORIGIN_QEMU_NVME_PAIRS=2`) is expected to say "not proven".
+        .chain(nvme_per_cpu_markers(machine, cpus))
         // Processors above APIC ID 255: NVMe interrupts reach them live through IRTEs.
         .chain(x2apic_markers(machine))
         .chain([
@@ -5518,7 +5556,17 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         // The NVMe controller and its test disk (CLAUDE.md §33).
         .arg("-drive")
         .arg(qemu_path_arg("if=none,id=nvme0,format=raw,file=", &s.nvme)?)
-        .args(["-device", "nvme,serial=ORIGIN0001,drive=nvme0"]);
+        .args([
+            "-device",
+            &if qemu_nvme_pairs() == QEMU_NVME_PAIRS {
+                "nvme,serial=ORIGIN0001,drive=nvme0".to_string()
+            } else {
+                format!(
+                    "nvme,serial=ORIGIN0001,drive=nvme0,max_ioqpairs={}",
+                    qemu_nvme_pairs()
+                )
+            },
+        ]);
     // A PCIe root port for the NIC (threat T4): clearing bus mastering stops its forwarding too,
     // and the driver must open it again above the device it attached (`boot-bridge`).
     let nic_bus = if qemu_bridge() {
@@ -6332,6 +6380,63 @@ mod gate_tests {
         assert_eq!(functions.len(), 1);
         assert_eq!(functions[0].0, "_foo");
         assert_eq!(functions[0].1.len(), 4, "everything up to .cfi_endproc");
+    }
+}
+
+#[cfg(test)]
+mod nvme_marker_tests {
+    use super::{Geometry, Machine, QEMU_NVME_PAIRS, nvme_per_cpu_markers_for};
+
+    fn dense(cpus: u32) -> Machine {
+        Machine {
+            smp: cpus.to_string(),
+            devices: Vec::new(),
+            apic_ids: (0..cpus).collect(),
+            listed: cpus,
+            highest: cpus - 1,
+            geometry: Geometry {
+                packages: 1,
+                dies: 1,
+                modules: 1,
+                cores: cpus,
+                threads: 1,
+            },
+        }
+    }
+
+    /// The coordinating session's ruling of 2026-11-14: on the gate's own configurations, which
+    /// give queues, the proven lines are demanded and "not proven" is never enough; only a
+    /// controller limited to the driver's two pairs is expected to say "not proven".
+    #[test]
+    fn the_gate_demands_the_proof_wherever_the_controller_gives_queues() {
+        for cpus in [1, 2, 3, 4, 65, 67] {
+            let m = dense(cpus);
+            let markers = nvme_per_cpu_markers_for(&m, cpus, QEMU_NVME_PAIRS);
+            assert!(
+                markers.iter().all(|l| !l.contains("not proven")),
+                "{cpus} processors"
+            );
+            assert!(
+                markers
+                    .last()
+                    .is_some_and(|l| l.contains("threads at once, one per CPU")),
+                "{cpus} processors: the summary is demanded"
+            );
+        }
+        let limited = nvme_per_cpu_markers_for(&dense(2), 2, 2);
+        assert_eq!(
+            limited,
+            [
+                "origin-kernel: NVMe: per-CPU queues: not proven: the controller allocated 2 I/O queue pairs and has 65 MSI-X vectors, 2 for the driver"
+            ]
+        );
+        // Three pairs give one processor a queue: proven again.
+        let three = nvme_per_cpu_markers_for(&dense(2), 2, 3);
+        assert!(
+            three
+                .first()
+                .is_some_and(|l| l.contains("1 of 2 processors"))
+        );
     }
 }
 

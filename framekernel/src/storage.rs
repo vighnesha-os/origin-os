@@ -1357,6 +1357,17 @@ fn prove_per_cpu(com1: &mut Console, online: &[CpuIndex], tsc_hz: u64) -> bool {
             return false;
         }
     };
+    // A valid controller with no pair or no vector past the driver's two gives no processor a
+    // queue of its own: not proven, and nothing wrong (the coordinating session's ruling of
+    // 2026-11-14, as `irq::prove` treats an 8254 that does not count). Anything else that gives
+    // none is a fault in `setup_cpu_queues`.
+    if given == 0 && (pairs <= 2 || vectors <= 2) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: NVMe: per-CPU queues: not proven: the controller allocated {pairs} I/O queue pairs and has {vectors} MSI-X vectors, 2 for the driver"
+        );
+        return true;
+    }
     // ADR-0008 Amendment 1, D6: the processors with a queue of their own are proven; the rest
     // are counted. Sharing queues is the block layer's (M5).
     let without = online.len() - given;
