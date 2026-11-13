@@ -14,7 +14,9 @@
 //! nothing to relocate (L2). So [`describe`] refuses:
 //!
 //! - any relocation, and any import;
-//! - a writable segment that holds anything but the linker's own dynamic table;
+//! - a writable segment that is anything but the linker's own dynamic table: one with other
+//!   bytes, and one of zero-filled memory with no byte in the file, which is what a
+//!   `static mut` makes;
 //! - a number of read-execute segments other than one;
 //! - an export the generator's list does not name, a listed export that is missing, and an
 //!   export that is not a public function inside the code;
@@ -131,8 +133,9 @@ pub enum CoreError {
     /// The image has relocations or imports; the value is how many. `origin.core` has nothing
     /// to relocate (L2).
     Relocations(usize),
-    /// A writable segment holds bytes that are not the linker's dynamic table: `origin.core`
-    /// has no writable data (L2). The value is the segment's RVA.
+    /// A writable segment is not the linker's dynamic table and nothing more, whether it holds
+    /// bytes or only zero-filled memory: `origin.core` has no writable data (L2). The value is
+    /// the segment's RVA.
     WritableData(u64),
     /// The image does not have exactly one read-execute segment; the value is how many.
     CodeSegments(usize),
@@ -172,7 +175,7 @@ impl fmt::Display for CoreError {
             ),
             Self::WritableData(rva) => write!(
                 f,
-                "the writable segment at {rva:#x} holds more than the linker's dynamic table; `origin.core` has no writable data (ADR-0011 L2)"
+                "the writable segment at {rva:#x} is more than the linker's dynamic table, in bytes or in zero-filled memory; `origin.core` has no writable data (ADR-0011 L2)"
             ),
             Self::CodeSegments(n) => write!(
                 f,
@@ -368,11 +371,20 @@ pub fn describe(file: &[u8], listing: &Listing) -> Result<CoreLib, CoreError> {
     if bound != 0 {
         return Err(CoreError::Relocations(bound));
     }
-    // No writable data: the one thing a writable segment may hold is the dynamic table, which
-    // the linker writes for itself and nothing reads at run time.
+    // No writable data: the one writable segment the image may have is the linker's dynamic
+    // table, which it writes for itself and nothing reads at run time. Its file bytes are the
+    // table's and no others, and it maps nothing past them but the zero padding of
+    // read-only-after-relocation memory. Any other writable segment is refused, a segment of
+    // zero-filled memory with no byte in the file among them: that is what a `static mut`
+    // looks like.
     for s in &parsed.segments {
-        let is_table = parsed.dynamic_table == Some((s.file_offset, s.file_size));
-        if s.permissions == Permissions::ReadWrite && s.file_size != 0 && !is_table {
+        if s.permissions != Permissions::ReadWrite {
+            continue;
+        }
+        let page = 0x1000;
+        let is_table = parsed.dynamic_table == Some((s.file_offset, s.file_size))
+            && (s.relro || s.mapped_size <= s.file_size.div_ceil(page).saturating_mul(page));
+        if !is_table {
             return Err(CoreError::WritableData(s.vaddr));
         }
     }

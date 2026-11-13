@@ -261,12 +261,16 @@ fn anything_to_relocate_and_any_writable_data_is_refused() {
         describe(&relocated.bytes(), &listing()),
         Err(CoreError::Relocations(1))
     );
-    // Zero-filled writable memory with no bytes in the file is the linker's RELRO padding.
-    let mut padding = Library::good().elf();
-    padding
+    // Zero-filled writable memory with no byte in the file: what a `static mut` that starts
+    // at zero makes. It is writable data all the same.
+    let mut zeroed = Library::good().elf();
+    zeroed
         .loads
         .push(Load::new(RW, 0x3000, Vec::new()).mem(0x1000));
-    assert!(describe(&padding.bytes(), &listing()).is_ok());
+    assert_eq!(
+        describe(&zeroed.bytes(), &listing()),
+        Err(CoreError::WritableData(0x3000))
+    );
 }
 
 #[test]

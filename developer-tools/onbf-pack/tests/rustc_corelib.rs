@@ -55,6 +55,11 @@ const WRITABLE: &str = r#"
 #[unsafe(no_mangle)]
 pub static mut ORIGIN_KERNEL_STATE: u64 = 7;
 "#;
+/// The same that starts at zero: the linker gives it zero-filled memory and no byte in the file.
+const ZEROED: &str = r#"
+#[unsafe(no_mangle)]
+pub static mut ORIGIN_KERNEL_STATE: u64 = 0;
+"#;
 
 const PROGRAM: &str = r#"
 #![no_std]
@@ -255,6 +260,16 @@ fn a_library_that_is_more_than_its_listed_stubs_is_refused() {
         ),
         "{:?}",
         describe(&writable, &stubs_listing())
+    );
+    // The same for writable data that starts at zero, which has no byte in the file at all.
+    let zeroed = fs::read(library(&dir, &format!("{STUBS}{ZEROED}"))).unwrap();
+    assert!(
+        matches!(
+            describe(&zeroed, &stubs_listing()),
+            Err(CoreError::WritableData(_))
+        ),
+        "{:?}",
+        describe(&zeroed, &stubs_listing())
     );
     // A listed stub the library lacks.
     let good = fs::read(library(&dir, STUBS)).unwrap();
