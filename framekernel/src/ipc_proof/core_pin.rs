@@ -158,7 +158,7 @@ fn on_hostile_pages(loaded: &LoadedProgram, program: &Carried) -> bool {
 /// A launch whose random places fell on the hostile memory script's fixed pages is loaded once
 /// more, and the first is dropped: that script expects those pages free, and a correct kernel
 /// would otherwise fail its run through the stubs about once in 10^8 boots (the independent
-/// review of 2026-11-13, finding K7). Two such falls in a row, about once in 10^17, still fail.
+/// review of 2026-11-13, finding K7). Two such falls in a row, about 3 in 10^17, still fail.
 pub(super) fn scripted(creator: &Process, limits: Limits) -> Option<Scripted> {
     let run = ProgramLimits {
         limits: Limits {
@@ -838,7 +838,8 @@ fn prove_image(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64
     // Three processes, loaded and never started, two with the pin program and one with the
     // first: one set of frames, at a base of each process's own. A process whose random base
     // equals one drawn before it is loaded once more before anything is judged (finding K7):
-    // a correct kernel then fails "each at a base of its own" only on two such draws in a row.
+    // a correct kernel then fails "each at a base of its own" only on two such draws in a row,
+    // about 3 in 10^19 boots, where it was about 7 in 10^10.
     let (mut shared, mut apart, mut write_refused) = (false, false, false);
     let mut executors = 0;
     let core_of = |s: &Scripted| s.pinned.as_ref().map(|p| p.core);
