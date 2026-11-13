@@ -4517,7 +4517,8 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - `ffb4cbf` an import carries its export's name; each pin must lie in its own method's stub (K6).
   - `5016b63` `onbf-pack corelib`'s writable segment judged by where it ends (K13).
   - `825f03c` the carried-program gate counts a prefixed `syscall`, with a test on a really linked program (K9).
-  - `dfacaae` the residual figures in the proof's comments. **It is the last commit that changes code.**
+  - `dfacaae` the residual figures in the proof's comments.
+  - `56c0dc0`, after the coordinating session read the answers: the process's wrapper renamed `Process::write_page`, and the names gate lets the framework's raw `write_frame` be named only in `process.rs` and `aspace.rs`; the pin rule refuses any memory operand indexed by a register, two registers added among them. **It is the last commit that changes code.**
   - the records: ADR-0013's row, controls CP-11 to CP-13 and K8's note; the threat model's C1, C9, C13 and the Z9 list; the contract's differences; STATUS; the matrix rows; this entry; and the report's resolutions.
 - **Decisions:** none of the owner's. The coordinating session ruled on the review's five questions (the kernel's write path now and the framework's rule in TASKS item 51; a redraw and a stated residual under R1(b); a gate for range processes; the contract kept with its differences extended; the value out of the harness's marker) and on K2, K4, K6, K9, K10, K12, K13 and S7.
 - **Documents read for these answers:** none new. The instruction forms, flag bits and the longest instruction are as the entry above records them from Intel SDM 253665-093 and 325383-093 and AMD APM 24592 r3.25 and 24594 r3.39.
