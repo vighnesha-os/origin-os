@@ -2498,19 +2498,22 @@ fn kernel_bound_markers(generator: bool) -> Vec<String> {
         " KiB: true; it cannot be sized again: true".into(),
         "origin-kernel: kernel bound: with all of the root but ".into(),
         " bytes held by a process that never runs, one byte short of what a launch of the first program pays, ".into(),
-        " bytes: true; the launch is refused with LIMIT: true; nothing was made, the root, the heap in use, the free frames, the next process ID and the kernel stacks as they were: true".into(),
+        " bytes: true; the launch is refused with LIMIT: true; nothing is left of it, the root, the heap in use, the free frames, the next process ID and the kernel stacks as they were: true".into(),
         "origin-kernel: kernel bound: with the holder gone the root has room again: true; a process with the program's limits takes their figure, ".into(),
         " bytes, to the byte and gives it back when dropped: true; the program launched and run to its end pays ".into(),
     ];
     markers.push(if generator {
-        " bytes until it is gone, then gives everything back: true".into()
+        " bytes, each page it maps paid for, until it is gone, then gives everything back: true".into()
     } else {
-        " bytes until it is gone, then gives everything back: not run, no generator".into()
+        " bytes, each page it maps paid for, until it is gone, then gives everything back: not run, no generator".into()
     });
     markers.extend([
         "origin-kernel: kernel bound: a process whose channel outlives it keeps its ".into(),
         " bytes out of the root after the process object is dropped: true; they come back when the channel goes: true".into(),
-        "origin-kernel: kernel bound: a process given no threads cannot start one: true; the refusal took nothing: true".into(),
+        "origin-kernel: kernel bound: a process given no threads cannot start one: true; nothing is left of the refusal: true".into(),
+        "origin-kernel: kernel bound: a process given one thread starts it: true; while it waits a second start is refused: true; nothing is left of the refusal: true; the first ends when let go: true".into(),
+        "origin-kernel: kernel bound: a memory object another process made, mapped in one whose last thread has ended and is not yet reaped, keeps its maker's ".into(),
+        " bytes out while the space that maps it stands: true; they come back when the last reap frees that space, before TERMINATED: true".into(),
         "origin-kernel: kernel bound: after this proof the root is back at its size: true; the most of it the proofs before this one had paid out at once was ".into(),
     ]);
     markers
