@@ -10,8 +10,13 @@ publish.workspace = true
 origin-boot-info = { path = "../../boot/info" }
 origin-paging = { path = "../paging" }
 origin-abi = { path = "../../runtime/abi" }
-origin-random.workspace = true
 origin-sync = { path = "sync" }
+
+# Used by `random`, which exists only in the kernel's build (`#[cfg(target_os = "none")]` in
+# `src/lib.rs`). Named for that build alone, so that a host build does not carry a dependency
+# it never uses (Cargo's `unused_dependencies`, since Cargo 1.100.0).
+[target.'cfg(target_os = "none")'.dependencies]
+origin-random.workspace = true
 
 [lints]
 workspace = true
