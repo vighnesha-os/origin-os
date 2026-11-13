@@ -4724,7 +4724,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - *Loom:* `cargo xtask loom`, 54 models and 79 controls caught, `ports_two_reservations_race_for_a_bound_of_one` and its control `reserve_ignores_the_port_s_bound` among them.
   - *Boot:* the kernel boot on `5629cbb` ended "degraded: 66 of 67 proofs passed; failed: speculation controls", with the new clause and every S3-6 and S4-2 proof passing.
   - *Negative controls:* KB-11 to KB-14 in ADR-0013, on an export of `5629cbb`, each failing where aimed.
-  - *Gates:* GATES57
+  - *Gates,* on `1253fee` (code as at `5e5ead9`, the last commit that changes code), under Rust 1.100.0, in one turn of the machine, a clean tree before and after: `cargo xtask check` passed in 432 s (1,832 tests passed, the 54 Loom models among them, none failed, 27 ignored; 79 Loom controls caught; every gate, the cost gate with 38 ledger rows and the provenance gate with 26 crates among them); `cargo xtask boot-test` passed 11 of 11 in 165 s; `cargo xtask boot-matrix` passed 124 scenarios with none failed in 2,947 s, each of its 21 kernel boots with a generator ending "66 of 67 proofs passed; failed: speculation controls" (decision item 154) and the one without ending "59 of 61 proofs passed; 6 did not run".
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-13, on the coordinating session's contract and rulings. Original code.
 - **Review:** none yet; the coordinating session arranges an independent review.
 - **Licensing:** MIT OR Apache-2.0.
