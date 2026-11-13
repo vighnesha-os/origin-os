@@ -1718,9 +1718,12 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
             crate::cpu::DEVICE_VECTOR,
             apic(target),
         ));
-        // Only the entries the table has: a table too short for one per processor
-        // (`setup_cpu_queues` refused it) leaves `nvme_routes` short, and the proof fails.
-        let per_cpu = usize::from(capability.entries).saturating_sub(2);
+        // The entries `setup_cpu_queues` programmed: one for each processor given a queue while
+        // the controller had pairs and vectors left (ADR-0008 Amendment 1, D6), never more than
+        // the table has.
+        let per_cpu = usize::from(capability.entries)
+            .saturating_sub(2)
+            .min(QUEUED.load(Ordering::Relaxed));
         for (k, &cpu) in cpus.iter().enumerate().take(per_cpu) {
             let entry = 2 + k as u64;
             routes.push((

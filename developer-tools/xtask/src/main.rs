@@ -801,6 +801,12 @@ fn boot_scenario() -> Scenario {
     }
     if Accel::from_env() == Ok(Accel::Kvm) {
         kvm_markers(&mut scenario, qemu_iommu() != Iommu::Amd);
+    } else if oversubscribed() {
+        // As under KVM: the processors share the host's cores, so the even-shares line may not
+        // come, and an uneven share within `KVM_FAIR_SHARE_FACTOR` is let pass.
+        scenario
+            .markers
+            .retain(|m| !m.starts_with(EVEN_SHARES_LINE));
     }
     if qemu_bridge() {
         bridge_markers(&mut scenario);
@@ -1098,6 +1104,17 @@ fn is_unfilled_tx_ring(line: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether this boot runs on QEMU's software processor with more guest processors than the host
+/// has threads (ADR-0008 Amendment 1, D7: the 65- and 288-processor machines on the development
+/// Mac's 10). Each guest processor is a host thread, so they share the host's cores as a KVM
+/// runner's virtual processors share physical ones, and the scheduler proof's two workers on
+/// one guest processor get unequal amounts done for the same reason. Such a boot is held to
+/// what [`is_uneven_fair_share`] lets pass under KVM, and to nothing looser.
+fn oversubscribed() -> bool {
+    let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    Accel::from_env() == Ok(Accel::Tcg) && machine().cpus() as usize > host
 }
 
 /// How unequal two workers' counts [`is_uneven_fair_share`] lets pass: the larger under this
@@ -5247,25 +5264,55 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
             deadline,
         )
     } else {
+        let oversubscribed = oversubscribed();
+        // The verdict on the output so far: a failure in a complete line, or every marker in
+        // order, or `None` while neither.
+        let judge = |raw: &[u8]| -> Option<Result> {
+            let text = serial::clean(raw);
+            // Failures are matched in complete lines only, so a failing line reaches the log
+            // in full (its details follow the marker) before QEMU is stopped.
+            let complete = text
+                .get(..text.rfind('\n').map_or(0, |i| i + 1))
+                .unwrap_or("");
+            let judged = accel.judged(complete);
+            // The same allowance for a software processor's boot that has more processors
+            // than the host has threads (`oversubscribed`).
+            let judged = if oversubscribed {
+                Cow::Owned(
+                    judged
+                        .lines()
+                        .filter(|l| !is_uneven_fair_share(l))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            } else {
+                judged
+            };
+            if let Some(m) = scenario.failures.iter().find(|m| judged.contains(**m)) {
+                return Some(Err(format!("the serial output contains {m:?}")));
+            }
+            serial::contains_in_order(&text, &markers).then_some(Ok(()))
+        };
         loop {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(chunk) => {
                     raw.extend_from_slice(&chunk);
-                    let text = serial::clean(&raw);
-                    // Failures are matched in complete lines only, so a failing line reaches
-                    // the log in full (its details follow the marker) before QEMU is stopped.
-                    let complete = text
-                        .get(..text.rfind('\n').map_or(0, |i| i + 1))
-                        .unwrap_or("");
-                    let judged = accel.judged(complete);
-                    if let Some(m) = scenario.failures.iter().find(|m| judged.contains(**m)) {
-                        break Err(format!("the serial output contains {m:?}"));
+                    // Judged only once a line has ended: QEMU hands the serial port's output
+                    // over a few bytes at a time, and judging the whole log for each chunk is
+                    // quadratic in its length. A 65-processor log took 48 minutes to judge
+                    // that way, its kernel 65 s to print it (ADR-0008 Amendment 1, D7). The
+                    // output is judged once more at the end, whatever its last line.
+                    if !chunk.contains(&b'\n') {
+                        continue;
                     }
-                    if serial::contains_in_order(&text, &markers) {
-                        break Ok(());
+                    if let Some(verdict) = judge(&raw) {
+                        break verdict;
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    if let Some(verdict) = judge(&raw) {
+                        break verdict;
+                    }
                     let text = serial::clean(&raw);
                     let missing = serial::first_missing(&text, &markers).unwrap_or("(none)");
                     break Err(format!(
@@ -5274,6 +5321,9 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
                     ));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    if let Some(verdict) = judge(&raw) {
+                        break verdict;
+                    }
                     break Err("QEMU exited before the loader output was complete".into());
                 }
             }
