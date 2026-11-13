@@ -303,6 +303,24 @@ fn the_one_writable_segment_is_the_dynamic_table_and_zero_fill_to_the_end_of_its
         describe(&past, &listing()),
         Err(CoreError::WritableData(at))
     );
+    // A table that starts mid-page could carry zero fill into the next page and pass a rule on
+    // its size; the rule is on its end, and the reader refuses such a segment first (finding
+    // K13).
+    let (mid, _) = with_writable_table(|raw, load, table| {
+        for header in [load, table] {
+            raw.phdrs[header].vaddr += 0x10;
+            raw.phdrs[header].offset += 0x10;
+        }
+        raw.phdrs[load].memsz += 0x1000;
+    });
+    assert!(
+        matches!(
+            describe(&mid, &listing()),
+            Err(CoreError::Elf(ElfError::SegmentAlignment { .. }))
+        ),
+        "{:?}",
+        describe(&mid, &listing())
+    );
     // The table and eight more bytes: initialised data beside it (finding F6 b).
     let (more, at) = with_writable_table(|raw, load, _| {
         let end = raw.phdrs[load].offset + raw.phdrs[load].filesz;

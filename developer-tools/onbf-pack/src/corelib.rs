@@ -405,9 +405,15 @@ pub fn describe(file: &[u8], listing: &Listing) -> Result<CoreLib, CoreError> {
         if s.permissions != Permissions::ReadWrite {
             continue;
         }
-        let page = 0x1000;
+        // Judged by where the memory ends, not by its size (the independent review of
+        // 2026-11-13, finding K13): no further than the end of the page that holds the table's
+        // last byte. The reader refuses a segment that does not start on a page, so today the
+        // two forms agree; this one does not rest on that.
+        let page: u64 = 0x1000;
+        let table_end = s.vaddr.saturating_add(s.file_size);
+        let page_end = table_end.div_ceil(page).saturating_mul(page);
         let is_table = parsed.dynamic_table == Some((s.file_offset, s.file_size))
-            && s.mapped_size <= s.file_size.div_ceil(page).saturating_mul(page);
+            && s.vaddr.saturating_add(s.mapped_size) <= page_end;
         if !is_table {
             return Err(CoreError::WritableData(s.vaddr));
         }
