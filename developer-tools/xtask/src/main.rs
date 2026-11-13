@@ -73,8 +73,10 @@ commands:
               at APIC IDs 256 and 412, above what 8-bit APIC IDs reach (the MADT lists
               150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
               one without
+  boot-sparse boot-test on 67 processors in two packages, three at APIC IDs 256, 300 and
+              412 (ADR-0008 D7, decision item 294; part of boot-matrix)
   boot-many   boot-test on 288 processors in two packages, APIC IDs 0-143 and 256-399,
-              under QEMU's software processor (ADR-0008 Amendment 1, D7)
+              under QEMU's software processor: measured and recorded, outside the gate
   boot-listed boot-test with 2 processors enabled of the 4096 the MADT lists
               (ADR-0008 Amendment 1, D7)
   boot-console the kernel's console on machines without a 16550 at 0x3F8 (ADR-0010): a UART
@@ -171,11 +173,12 @@ environment:
                                       label contains one of these comma-separated strings
   ORIGIN_QEMU_SMP                     processors QEMU emulates, 1 or more (q35 takes up
                                       to 4096; default 2)
-  ORIGIN_QEMU_TOPOLOGY                x2apic: the boot-x2apic machine; many: two packages
-                                      of 144 cores, 288 processors with APIC IDs 0-143 and
-                                      256-399; listed: 2 processors of 4096 the MADT lists
-                                      (ORIGIN_QEMU_SMP is then ignored; ADR-0008 Amendment
-                                      1, D7)
+  ORIGIN_QEMU_TOPOLOGY                x2apic: the boot-x2apic machine; sparse: 67
+                                      processors, 64 in package 0 and three at APIC IDs 256,
+                                      300 and 412; many: two packages of 144 cores, 288
+                                      processors with APIC IDs 0-143 and 256-399; listed: 2
+                                      processors of 4096 the MADT lists (ORIGIN_QEMU_SMP is
+                                      then ignored; ADR-0008 Amendment 1, D7)
   ORIGIN_QEMU_CPU                     the QEMU CPU model (default max), e.g. max,-avx2 or
                                       max,vendor=GenuineIntel (which exposes leaf 1Fh on
                                       the boot-x2apic machine)
@@ -515,8 +518,13 @@ fn nvme_queued(cpus: u32) -> u32 {
 /// (ADR-0008 Amendment 1, D1; `per_cpu` checks that each is sized).
 const PER_CPU_TABLES: u32 = 27;
 
-/// The cores of each package of the large sparse machine (`ORIGIN_QEMU_TOPOLOGY=many`).
+/// The cores of each package of the 288-processor run (`ORIGIN_QEMU_TOPOLOGY=many`, outside the
+/// gate since decision item 294).
 const MANY_CORES: u32 = 144;
+/// The cores of each package of the gate's large sparse machine (`ORIGIN_QEMU_TOPOLOGY=sparse`,
+/// decision item 294), and the processors QEMU starts in package 0.
+const SPARSE_CORES: u32 = 157;
+const SPARSE_PRESENT: u32 = 64;
 /// The processors the discovery machine's MADT lists (`ORIGIN_QEMU_TOPOLOGY=listed`): the most
 /// q35 takes, as QEMU 11.1.3 says on 2026-11-13.
 const LISTED: u32 = 4096;
@@ -632,6 +640,39 @@ fn machine() -> Machine {
                 cores: 5,
                 threads: 1,
             },
+        };
+    }
+    if std::env::var("ORIGIN_QEMU_TOPOLOGY").as_deref() == Ok("sparse") {
+        // ADR-0008 Amendment 1, D7 as decision item 294 has it: the gate's large machine. Two
+        // packages of 157 single-thread cores (8 bits of core ID, so package 1 starts at APIC ID
+        // 256), 314 possible; the 64 processors of package 0 that QEMU starts, and three
+        // cold-plugged in package 1 at cores 0, 44 and 156: APIC IDs 256, 300 and 412. 67
+        // processors, three above 255, none a power of two.
+        let model = qemu_cpu_model();
+        let base = model.split(',').next().unwrap_or("max");
+        let geometry = Geometry {
+            packages: 2,
+            dies: 1,
+            modules: 1,
+            cores: SPARSE_CORES,
+            threads: 1,
+        };
+        let plugged = [0, 44, 156];
+        let mut apic_ids: Vec<u32> = (0..SPARSE_PRESENT).collect();
+        apic_ids.extend(plugged.iter().map(|core| 256 + core));
+        return Machine {
+            smp: format!(
+                "{SPARSE_PRESENT},maxcpus={},sockets=2,cores={SPARSE_CORES},threads=1",
+                2 * SPARSE_CORES
+            ),
+            devices: plugged
+                .iter()
+                .map(|core| format!("{base}-x86_64-cpu,socket-id=1,core-id={core},thread-id=0"))
+                .collect(),
+            listed: 2 * SPARSE_CORES,
+            highest: 256 + SPARSE_CORES - 1,
+            apic_ids,
+            geometry,
         };
     }
     if std::env::var("ORIGIN_QEMU_TOPOLOGY").as_deref() == Ok("many") {
@@ -2845,6 +2886,7 @@ fn main() -> ExitCode {
         ["boot-test"] => in_turn("boot-test", boot_test),
         ["boot-matrix"] => in_turn("boot-matrix", boot_matrix),
         ["boot-x2apic"] => in_turn("boot-x2apic", boot_x2apic),
+        ["boot-sparse"] => in_turn("boot-sparse", boot_sparse),
         ["boot-many"] => in_turn("boot-many", boot_many),
         ["boot-listed"] => in_turn("boot-listed", boot_listed),
         ["boot-console"] => in_turn("boot-console", boot_console),
@@ -2935,14 +2977,15 @@ fn boot_matrix() -> Result {
     boot_random()?;
     boot_identity()?;
     boot_console()?;
-    // The large sparse machine (`boot-many`, 288 processors) is not in the gate: on the
-    // development Mac QEMU disturbs the guest's timing at 288 processors before any AP starts,
-    // and its timing proofs fail at random (the coordinating session decides what replaces it).
+    // ADR-0008 D7 as decision item 294 has it: the large sparse machine of 67 processors, and
+    // the discovery machine. The 288-processor run (`boot-many`) is outside the gate: on the
+    // development Mac QEMU disturbs the guest's timing at 288 processors before any AP starts.
     if any_count {
+        boot_sparse()?;
         boot_listed()?;
     } else {
         println!(
-            "xtask: boot-matrix: the machines of ADR-0008 Amendment 1, D7 (3 and 65 processors, the discovery machine) are not run in CI until each one's time has been measured and accepted (set ORIGIN_BOOT_MATRIX_ANY_COUNT=on to run them)"
+            "xtask: boot-matrix: the machines of ADR-0008 Amendment 1, D7 (3 and 65 processors, the 67-processor sparse machine, the discovery machine) are not run in CI until each one's time has been measured and accepted (set ORIGIN_BOOT_MATRIX_ANY_COUNT=on to run them)"
         );
     }
     // ADR-0004 Amendment 2, A6.4: the boots placed the kernel stacks' region apart.
@@ -2959,7 +3002,7 @@ fn boot_matrix() -> Result {
             "1, 2 and 4"
         },
         if any_count {
-            ", the discovery machine"
+            ", the 67-processor sparse machine, the discovery machine"
         } else {
             ""
         }
@@ -2990,9 +3033,42 @@ fn timeout_for(cpus: u32) -> u64 {
     DEFAULT_BOOT_TEST_TIMEOUT.as_secs() + 2 * u64::from(cpus.saturating_sub(4))
 }
 
-/// `boot-test` on the large sparse machine (ADR-0008 Amendment 1, D7): two packages of 144
-/// cores, 288 processors, APIC IDs 0-143 and 256-399, Intel VT-d with interrupt remapping, under
-/// QEMU's software processor only (a KVM runner has 4 host processors).
+/// `boot-test` on the gate's large sparse machine (ADR-0008 D7 as decision item 294 has it): 67
+/// processors in two packages, three at APIC IDs 256, 300 and 412, Intel VT-d with interrupt
+/// remapping, under QEMU's software processor only (a KVM runner has 4 host processors).
+fn boot_sparse() -> Result {
+    if Accel::from_env()? == Accel::Kvm {
+        println!(
+            "xtask: boot-sparse: not run under KVM: the 67-processor sparse machine runs under QEMU's software processor only (ADR-0008 D7)"
+        );
+        return Ok(());
+    }
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    let cpus = SPARSE_PRESENT + 3;
+    println!(
+        "xtask: boot-sparse: {cpus} processors in two packages, APIC IDs 0-{} and 256, 300 and 412 of {} possible",
+        SPARSE_PRESENT - 1,
+        2 * SPARSE_CORES
+    );
+    let status = boot_test_child(&exe)
+        .env("ORIGIN_QEMU_TOPOLOGY", "sparse")
+        .env("ORIGIN_QEMU_IOMMU", "intel")
+        .env("ORIGIN_BOOT_TEST_TIMEOUT", timeout_for(cpus).to_string())
+        .status()
+        .map_err(|e| format!("cannot run boot-test: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "boot-test on the 67-processor sparse machine failed ({status})"
+        ));
+    }
+    println!("xtask: boot-sparse passed ({cpus} processors online, three above APIC ID 255)");
+    Ok(())
+}
+
+/// `boot-test` on 288 processors in two packages of 144 cores, APIC IDs 0-143 and 256-399,
+/// Intel VT-d with interrupt remapping, under QEMU's software processor only: a run measured and
+/// recorded outside the gate (decision item 294), since QEMU disturbs the guest's timing at this
+/// count on the development Mac.
 fn boot_many() -> Result {
     if Accel::from_env()? == Accel::Kvm {
         println!(
