@@ -94,6 +94,16 @@ undocumented_unsafe_blocks = "deny"
 missing_safety_doc = "deny"
 multiple_unsafe_ops_per_block = "deny"
 
+[workspace.lints.cargo]
+# Cargo's own lints as errors (TASKS item 52; its review, finding 1). `-D warnings` reaches the
+# compiler and Clippy only, so a warning of Cargo's would otherwise fail no gate. The group
+# `default` holds every lint Cargo turns on by default: on Cargo 1.100.0 the seven that warn
+# (`unused_dependencies`, `unused_workspace_dependencies`, `unused_workspace_package_fields`,
+# `missing_lints_inheritance`, `unknown_lints`, `redundant_homepage`,
+# `blanket_hint_mostly_unused`) and the two that already deny. A lint a later Cargo adds to
+# the group is then an error at the upgrade that brings it (CLAUDE.md §15), not a line in a log.
+default = { level = "deny", priority = -1 }
+
 [profile.release]
 # One codegen unit: deterministic output (CLAUDE.md §75) and the same code shape that
 # docs/toolchain/VERIFICATION.md exercised for the §10 regressions.
