@@ -41,5 +41,21 @@ for target in x86_64-unknown-none x86_64-unknown-uefi x86_64-unknown-linux-gnu; 
   fi
 done
 
-cpu=$(sed -n 's/^Model name: *//p' <<<"$(lscpu)")
-echo "$cpu, $(nproc) processors, Linux $(uname -r), $compiler" | tee -a "$GITHUB_STEP_SUMMARY"
+# Linux and macOS name their processor and count their processors with different tools. The
+# line for a Linux machine reads as it always has.
+system=$(uname -s)
+case $system in
+  Linux)
+    cpu=$(sed -n 's/^Model name: *//p' <<<"$(lscpu)")
+    processors=$(nproc)
+    ;;
+  Darwin)
+    cpu=$(sysctl -n machdep.cpu.brand_string)
+    processors=$(sysctl -n hw.ncpu)
+    ;;
+  *)
+    echo "::error::install-rust.sh cannot describe a $system machine" >&2
+    exit 1
+    ;;
+esac
+echo "$cpu, $processors processors, $system $(uname -r), $compiler" | tee -a "$GITHUB_STEP_SUMMARY"

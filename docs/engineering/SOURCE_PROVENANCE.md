@@ -3549,6 +3549,29 @@ A fourth addition to the entry above, from another session and on a branch of it
   - No human has reviewed it.
 - **Licensing:** MIT OR Apache-2.0.
 
+## CI compares the images across two kinds of host on every run (TASKS item 46; CLAUDE.md §75, §60, §80; decision item 275; 2026-11-13)
+
+- **What:** a job, `images-on-macos`, in `.github/workflows/ci.yml`: on GitHub's standard macOS runner (`macos-26`), after the Linux `check` job, it runs the reproducible-build gate, keeps the gate's files, fetches the Linux job's kept files of the same run and compares the two with `cargo xtask reproducible-compare`. A difference, a file on one side only, or a missing artifact fails the job. `.github/ci/install-rust.sh` describes the machine by `uname -s` (`lscpu` and `nproc` on Linux as before, `sysctl` on macOS). No code of `xtask` and nothing that is built changed.
+- **The trial,** in draft pull request 26, closed and never merged (ledger §18):
+  - Run 43341445989 (`7001b44`: this branch at `6ef3023` with `main` `c05797c` merged in, the same tree): every job passed. The macOS job (131613843125) found all 22 files, eleven from each build, the same bytes as the Linux job's, in 2 min 0 s; the digests are the development Mac's.
+  - Run 43355957632 (`6b83691`, the negative control, on a trial branch alone: the loader takes in `RUNNER_OS`): `check` passed; the macOS job's own gate passed and its comparison failed (131661454789), naming the three loaders in both builds and nothing else. Both hosts' loader digests were built on the Mac beforehand and came out.
+  - *Where it differs from the contract:* against `main`, and the control on a deleted trial branch in place of a commit and a revert here; both by the coordinating session's word.
+  - *Two errors of mine on the way,* each caught before it cost a result: the control's first form did nothing (the linker dropped a value nothing read), and I had said no gate reads history (the document gate does; it was run on both commits).
+- **Unit tests:** none new: the job runs two commands that have their own (TASKS items 44 and 45).
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-13. Original; a workflow file and a shell script.
+- **Architecture decisions:** decision item 275 (the owner, 2026-11-13). CLAUDE.md §75, §60; §80 (no spending: a standard runner, free for a public repository); §8 (the job builds with exactly the pinned compiler). No ADR: not an ABI or format decision (§84).
+- **Specifications:** GitHub's documentation, read on 2026-11-13: "GitHub-hosted runners reference" and "GitHub Actions billing" (standard runners are free for public repositories; `macos-26` is a standard Apple-processor label), and the runner images' list. Quoted in the task's contract.
+- **Dependencies:** none new. Two actions the workflows already pin by commit: `actions/upload-artifact` (v7.0.2) and `actions/download-artifact` (v8.0.2).
+- **Toolchain:** Rust 1.99.1 (`58cf8f9c3`, 2026-10-13), stable, in both runs. The job has not run under another compiler.
+- **Test evidence:** the two runs above. `cargo xtask check` passes on `6ef3023` on the development Mac: 1,694 host tests, 0 failed, 27 ignored. No boot on the Mac: nothing that is built changed.
+- **Not proven, and limits:**
+  - Two kinds of host, both GitHub's: x86-64 Linux and arm64 macOS. The macOS runner is the same kind of host as the development machine, so there is no third kind.
+  - Development commits and unsigned images. No release candidate, and nobody outside the project rebuilds anything.
+  - One passing run and one failing run, each as intended. How often the macOS runner fails for reasons of its own is not known.
+  - Under Rust 1.100.0 the job has not run; that is TASKS item 52's CI evidence, and the rows S60-03, S60-11, S75-06 and S75-07 are left for it.
+  - No human has reviewed it.
+- **Licensing:** MIT OR Apache-2.0.
+
 ## Heavy xtask runs take turns across every checkout on one machine (2026-11-10)
 
 - **What:** `developer-tools/xtask/src/turns.rs` and its use in `main.rs`, on `claude/xtask-turns`. Each worktree builds into its own target directory, so two sessions' builds and QEMU boots overlapped; at a host load of 70 on a 10-core Mac the clock, timer and preemption proofs failed under TCG with nothing wrong in the kernel, and reruns waited hours. Now `check`, `build`, every boot command, `run` and `loom` hold an exclusive lock on `origin-xtask-turn.lock` in the repository's common git directory (`git rev-parse --git-common-dir`), which every worktree shares; outside a git checkout, in the target directory.
