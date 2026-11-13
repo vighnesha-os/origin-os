@@ -53,7 +53,7 @@ lines=$(jq -r '
 
 while IFS='|' read -r label seconds conclusion; do
   [ -n "$label" ] || continue
-  if [[ ! "$label" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  if [[ ! "$label" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$label" = . ] || [ "$label" = .. ]; then
     echo "::warning title=Boot step durations::a job label that cannot name a file was skipped"
     continue
   fi
