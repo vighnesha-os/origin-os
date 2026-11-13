@@ -59,6 +59,16 @@ const MAP_SLACK: usize = 32;
 const PAGE: usize = 4096;
 const DEVELOPER_MODE: bool = cfg!(feature = "developer-mode");
 
+/// TRIAL ONLY, TASKS item 46, never to be merged: something of the build host compiled into
+/// the loader on purpose. GitHub sets `RUNNER_OS` to the kind of host a job runs on. Both
+/// builds on one host get the same value, and it is no path and no linker's line, so that
+/// host's own reproducible-build gate passes; a build on another kind of host is other
+/// bytes. The comparison across the two hosts must fail on it.
+static BUILT_ON: &str = match option_env!("RUNNER_OS") {
+    Some(kind) => kind,
+    None => "",
+};
+
 /// Image entry point; the `x86_64-unknown-uefi` target links it as the PE entry.
 ///
 /// # Safety
@@ -96,6 +106,8 @@ fn report_firmware(st: &SystemTable, out: &mut ConOut) -> core::fmt::Result {
     // validated system table (UEFI 2.11 §4.3); the copy is bounded by `vendor.len()`.
     let n = unsafe { uefi::copy_char16_string(st.firmware_vendor, &mut vendor) };
     let vendor = vendor.get(..n).unwrap_or(&[]);
+    // TRIAL ONLY: read, so that the linker keeps it. It is not printed.
+    core::hint::black_box(BUILT_ON);
     // The release identity is generated from origin-version.toml (CLAUDE.md §62).
     writeln!(
         out,
