@@ -3158,7 +3158,7 @@ fn target_dir() -> PathBuf {
     env::var_os("CARGO_TARGET_DIR").map_or_else(|| repo_root().join("target"), PathBuf::from)
 }
 
-/// `cargo`, as the toolchain that runs this xtask (rust-toolchain.toml pins 1.99.1).
+/// `cargo`, as the toolchain that runs this xtask (the one rust-toolchain.toml pins).
 fn cargo() -> Command {
     let mut c = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     c.current_dir(repo_root());

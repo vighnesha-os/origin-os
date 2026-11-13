@@ -1,5 +1,5 @@
 //! A reference-counted kernel object with a fallible constructor (`Arc::try_new` is unstable on
-//! Rust 1.99.1): the kernel must report an allocation failure, not stop.
+//! Rust 1.100.0): the kernel must report an allocation failure, not stop.
 
 use alloc::alloc::{Layout, alloc, dealloc};
 use core::ops::Deref;
@@ -9,7 +9,7 @@ use origin_sync::refcount::RefCount;
 
 /// A counted reference to a kernel object, created with [`ObjectRef::try_new`], which
 /// reports an allocation failure instead of stopping the kernel the way `Arc::new` would
-/// (`Arc::try_new` is unstable on Rust 1.99.1).
+/// (`Arc::try_new` is unstable on Rust 1.100.0).
 #[derive(Debug)]
 pub struct ObjectRef<T> {
     inner: NonNull<Counted<T>>,

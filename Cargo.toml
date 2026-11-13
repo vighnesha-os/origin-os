@@ -63,7 +63,7 @@ default-members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 publish = false
 # No `version` here or in any member, on purpose: the release identity lives only in
 # `origin-version.toml` and reaches code through the generated `origin-version` crate

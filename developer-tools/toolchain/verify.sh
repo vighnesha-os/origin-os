@@ -19,7 +19,7 @@
 
 set -u
 
-EXPECTED="1.99.1"
+EXPECTED="1.100.0"
 TARGETS="x86_64-unknown-none x86_64-unknown-uefi x86_64-unknown-linux-gnu"
 COMPONENTS="rustfmt clippy rust-src llvm-tools"
 
