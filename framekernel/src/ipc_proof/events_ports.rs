@@ -254,13 +254,16 @@ fn started(
     Some((process, steps, packets))
 }
 
-/// The limits of a process given `events`, `ports` and `bindings`.
-fn objects(events: usize, ports: usize, bindings: usize) -> Limits {
+/// The limits of a process given `events`, `ports` and `bindings`, each port it creates bounded
+/// at `bindings_per_port` (ADR-0005 Amendment 10, I1): at each call, the most bindings its script,
+/// or another process's, arms on any one of its ports at once.
+fn objects(events: usize, ports: usize, bindings: usize, bindings_per_port: usize) -> Limits {
     Limits {
         objects: ObjectLimits {
             events,
             ports,
             bindings,
+            bindings_per_port,
         },
         ..LIMITS
     }
@@ -540,7 +543,7 @@ fn run_rules(
         packets: false,
         rest: false,
     };
-    let Some(mut e) = Program::new(objects(3, 2, 4)) else {
+    let Some(mut e) = Program::new(objects(3, 2, 4, 4)) else {
         return failed;
     };
     let starts = build(&mut e.written);
@@ -649,7 +652,7 @@ fn canceled_wait(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u
         );
         false
     };
-    let Some(mut image) = Image::new(objects(0, 1, 0), proof_programs::script()) else {
+    let Some(mut image) = Image::new(objects(0, 1, 0, 0), proof_programs::script()) else {
         return set_up(com1);
     };
     let Ok(port) = port::create(&image.process.account) else {
@@ -712,8 +715,9 @@ fn canceled_wait(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u
 /// `canceled` packets, still charged to it until the holder reads them.
 fn binder_exits(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let (Some(mut holder), Some(mut binder)) = (
-        Program::new(objects(2, 1, 0)),
-        Program::new(objects(0, 0, 2)),
+        // The binder arms two bindings on the holder's port.
+        Program::new(objects(2, 1, 0, 2)),
+        Program::new(objects(0, 0, 2, 0)),
     ) else {
         return false;
     };
@@ -793,8 +797,9 @@ const ROUNDS: u64 = 30;
 fn round_trips(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
     let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let (Some(mut w), Some(mut s)) = (
-        Program::new(objects(2, 2, 2)),
-        Program::new(objects(0, 0, 2)),
+        // One binding armed at a time on each of the first's two ports.
+        Program::new(objects(2, 2, 2, 1)),
+        Program::new(objects(0, 0, 2, 0)),
     ) else {
         return false;
     };
@@ -859,7 +864,7 @@ fn round_trips(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64
 /// bind and its delivery cost (QEMU figures, no budget).
 fn kernel_costs(com1: &mut Console) -> bool {
     const TIMES: u64 = 1000;
-    let Some(image) = Image::new(objects(1, 1, 1), proof_programs::script()) else {
+    let Some(image) = Image::new(objects(1, 1, 1, 1), proof_programs::script()) else {
         return false;
     };
     let Some(process) = image.finish() else {
@@ -968,7 +973,7 @@ pub(crate) fn prove_user_clock(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -
         );
         false
     };
-    let Some(mut k) = Program::new(objects(1, 0, 0)) else {
+    let Some(mut k) = Program::new(objects(1, 0, 0, 0)) else {
         return fail(com1);
     };
     let Ok(never) = Event::create(&k.image.process.account) else {
