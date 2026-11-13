@@ -15,6 +15,7 @@ mod image;
 mod image_inputs;
 mod interfaces;
 mod lex;
+mod listed_names;
 mod loom;
 mod mnemonics;
 mod progress;
@@ -89,6 +90,9 @@ commands:
   unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction, on the
               `preserves_flags` option of assembly blocks, and on RDRAND and RDSEED, which
               only the kernel's generator and the loader's may run (part of check; quick)
+  names-gate  only the gate on two names only listed files may use: the proof-process
+              constructors in the kernel (ADR-0011 L8) and the call numbers in ring 3
+              (CLAUDE.md §42); part of check
   cfg-lint    only the CLAUDE.md §11 lint: no Origin code outside developer-tools/ asks
               whether its target is Linux or Unix (part of check; quick)
   document-gate only the gate on documents and archives: none is tracked, or left in this
@@ -2631,6 +2635,7 @@ fn main() -> ExitCode {
     {
         ["check"] => in_turn("check", check),
         ["unsafe-gate"] => unsafety::gate(),
+        ["names-gate"] => listed_names::gate(),
         ["document-gate"] => documents::gate(),
         ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
@@ -3494,6 +3499,8 @@ fn check() -> Result {
     roadmap::gate()?;
     progress::gate()?;
     unsafety::gate()?;
+    // Who may make a proof process, and which ring-3 files may name the call numbers.
+    listed_names::gate()?;
     interfaces::gate()?;
     image_inputs::version_gate()?;
     image_inputs::graph_gate()?;

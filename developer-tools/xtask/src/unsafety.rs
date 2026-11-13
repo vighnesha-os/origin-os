@@ -163,7 +163,7 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
 /// The crates that run in ring 3 (CLAUDE.md §11; tasks S4-1 and S4-2): `origin.core`, the
 /// runtime and the bodies of its `mem*` functions, the generated client, and the kernel's Rust
 /// proof programs.
-const RING3_CRATES: &[&str] = &[
+pub(crate) const RING3_CRATES: &[&str] = &[
     "runtime/core",
     "runtime/kernel-client",
     "runtime/rt",
