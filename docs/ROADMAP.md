@@ -285,7 +285,7 @@ Given elsewhere by item 262: networking in the runtime (S44-08) to M10, with the
 | S84-13 | Host-testable native-format parsers |
 | A11-N13 | The SDK's rules enforced by gates, one of which reads first-party manifests (moved from M0 by item 269) |
 
-**Two more rows placed here: proposed, not accepted.** Decision items 272 and 273 (2026-11-13) added them to the matrix after item 269 was answered. They stand beside the rows they extend: A05-H1 states what a thread finds at its entry, as A05-B2's neighbours do for a call, and A11-L13 is one more rule for the stubs of A11-L6. Task S4-2 (TASKS item 47) placed them when its branch first held both the roadmap and the two rows, so that `cargo xtask roadmap-gate` passes; the owner has not answered on the placement.
+**Two more rows placed here: accepted (item 276).** Decision items 272 and 273 (2026-11-13) added them to the matrix after item 269 was answered. They stand beside the rows they extend: A05-H1 states what a thread finds at its entry, as A05-B2's neighbours do for a call, and A11-L13 is one more rule for the stubs of A11-L6. Task S4-2 (TASKS item 47) placed them when its branch first held both the roadmap and the two rows, so that `cargo xtask roadmap-gate` passes; the owner accepted the placement on 2026-11-13. Like item 269's rows, they are in no exit test.
 
 | Rows | Subject |
 |---|---|
