@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-14, each item with the recommended answer ("Accept all seven", decision sheet items 301 to 307; CLAUDE.md §18). Nothing in it is built beyond the static tables the kernel already parses at boot (`framekernel/frame/src/acpi.rs`, `dmar.rs`, `ivrs.rs`). Tasks A and B of A6 are TASKS items 62 and 63 |
+| Status | **Accepted** by the owner on 2026-11-14, each item with the recommended answer ("Accept all seven", decision sheet items 301 to 307; CLAUDE.md §18). Nothing in it is built beyond the static tables the kernel already parses at boot (`framekernel/frame/src/acpi.rs`, `dmar.rs`, `ivrs.rs`). Tasks A and B of A6 are TASKS items 62 and 63. **Amendment 1 (below): Accepted** by the owner on 2026-11-14 (item 309): the answers to `_OSI` and `_REV`; not built |
 | Decides | What "implement ACPI 6.6 in full and completely", the owner's request of 2026-11-14, means for Origin; where the firmware's AML runs; how the interpreter is built and tested; the sources it may be written from; the order of work; and what may be claimed without a machine in the declared scope |
 | Requires | CLAUDE.md P0, P1, P5, P8; §1 (roles 7, 8, 15, 54 and 64; "Discover and report capabilities truthfully", "Deny by default", "Qualify the declared environment"); §3, §4, §5, §13, §16, §17, §19, §24, §31, §49, §58, §67, §69, §72 to §74; rules 14, 26 and 30 |
 | Performance cost | A1, A4 to A7: none, by construction. A2 and A3: unmeasured, owed, in cost ledger row CL41 |
@@ -83,3 +83,19 @@ The service's SDK interfaces; the `_OSI` policy; the Driver SDK; the path into a
 5. An original AML encoder for test definition blocks, rather than a third-party compiler (A5)? **Yes (item 305).**
 6. The order of work A to H (A6)? **Yes (item 306).**
 7. What may be claimed without a machine in scope (A7)? **Yes (item 307).**
+
+## Amendment 1 (Accepted, 2026-11-14): the answers the interpreter gives to `_OSI` and `_REV`
+
+**Status: Accepted by the owner on 2026-11-14 ("Accept 309", decision sheet item 309). Not built: TASKS item 63 builds it in its step B2.** It answers T5 of the threat model above, which left the answer Origin gives to firmware asking which operating system runs as a policy to decide with task B.
+
+**Why.** Deployed firmware asks `_OSI` which interfaces the operating system supports and changes what it does on the answer, and the firmware of platforms in Origin's declared scope is validated against Windows. Microsoft publishes the strings Windows answers True to (Microsoft Learn, "How to identify the Windows version in ACPI by using _OSI", last updated 2024-09-11, read 2026-11-14; TASKS item 63's research ledger, source M1). ACPI 6.6 §5.7 defines `_REV` for an interpreter with 64-bit integers.
+
+**Decision.** `_OSI` answers Ones for each Windows string on Microsoft's published list, and Zero for every other string: other operating systems' names, `Linux` among them, unknown strings, and each feature-group string of ACPI 6.6 until the task that builds that feature adds it, so that no answer claims a capability Origin does not have (CLAUDE.md §1). `_REV` is 2. The answers are one table in the interpreter's source, and a change to it is a decision for the owner. `_OS` is not decided here: it stays the provisional "Origin OS" until TASKS item 64's reading answers what deployed firmware expects of it (gap G10), and then comes to the owner as its own item.
+
+**Alternatives that were put.** Answering only the feature-group strings, which firmware validated against Windows does not ask; answering Origin's own name, which no firmware knows, so it would take paths no one tested; answering `Linux` too, which some firmware treats as a reason to change behaviour.
+
+**Performance cost (ADR-0018 V3).** None, by construction: a lookup in a fixed table when firmware calls `_OSI`.
+
+**Trade-offs.** Firmware takes the paths it takes for Windows, which are the ones its vendor tested; where those paths need an interface Origin lacks, the feature-group strings stay Zero and the device is reported as not supported. A string Microsoft adds later is added here by a decision, not by itself.
+
+**Migration consequences.** None: no ABI or format.
