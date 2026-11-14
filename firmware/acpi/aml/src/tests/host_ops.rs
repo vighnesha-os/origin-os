@@ -1297,3 +1297,23 @@ fn a_method_that_returns_holding_a_mutex_is_stopped_at_its_return() {
     assert!(i.held.is_empty());
     assert_eq!(int(&mut i, "NEST"), 1);
 }
+
+#[test]
+fn a_reserved_region_space_is_refused() {
+    // The review of B2, B2-11: Table 5.221 reserves spaces 0x0C to 0x7E; an OEM space (0x80 on)
+    // is the host's to judge.
+    for (space, refused) in [(0x0Cu8, true), (0x40, true), (0x7E, true), (0x80, false)] {
+        let mut i = loaded(&[
+            op_region("RS", space, zero(), byte(4)),
+            field("RS", BYTE, &[Fe::Named("V", 8)]),
+            m("RD", &[ret(nm("V"))]),
+        ]);
+        if refused {
+            assert_eq!(fails(&mut i, "RD"), ErrorKind::Range, "{space:#x}");
+            assert!(i.host().seen.is_empty());
+        } else {
+            assert_eq!(int(&mut i, "RD"), 0);
+            assert_eq!(i.host().seen.len(), 1);
+        }
+    }
+}

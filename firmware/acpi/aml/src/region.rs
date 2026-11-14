@@ -114,6 +114,12 @@ impl<H: Host> Interpreter<H> {
             Object::Region(r) => *r,
             _ => return err(ErrorKind::WrongObject),
         };
+        // Spaces 0x0C to 0x7E are reserved (Table 5.221): nothing is defined to be there, so no
+        // access to one reaches the host (the review of B2, B2-11). 0x7F (FFixedHW) and the OEM
+        // spaces from 0x80 are the host's to judge.
+        if (0x0C..=0x7E).contains(&r.space) {
+            return err(ErrorKind::Range);
+        }
         // Its function is found before the access starts (`pci.rs`); one not yet found here is
         // asked for the same way.
         if r.space == Space::PCI_CONFIG.0 && r.pci.is_none() {
