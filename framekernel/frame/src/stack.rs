@@ -86,27 +86,50 @@ fn room_in(size: u64) -> usize {
     layout::stack_region_room(size) as usize
 }
 
+/// What [`grow`] reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Growth {
+    /// How many processors the region has room for: the floor's 64 if the tables or the slots
+    /// could not be had, and at most [`MAX_PROCESSORS`].
+    pub room: usize,
+    /// Whether it stayed short for want of memory: the run of frames for its page tables or the
+    /// storage for its slots (review finding F12 of 2026-11-14).
+    pub short_of_memory: bool,
+}
+
 /// Grows the region for `processors` indexed processors (ADR-0008 Amendment 1, D3), once, on the
-/// boot processor after the MADT is read and before any application processor starts: the page
-/// tables for what lies past the floor, from frames taken now, then the slots. Returns how many
-/// processors the region then has room for: the floor's 64 if the tables or the slots could not
-/// be had, and at most [`MAX_PROCESSORS`].
-pub(crate) fn grow(processors: usize) -> usize {
+/// boot processor after the MADT is read, before the per-CPU tables are sized for its room and
+/// before any application processor starts: the page tables for what lies past the floor, from
+/// one run of frames taken now, then the slots.
+pub(crate) fn grow(processors: usize) -> Growth {
     let size = size_for(processors);
     let floor = room_in(STACK_REGION_SIZE);
+    let short = |short_of_memory| Growth {
+        room: floor,
+        short_of_memory,
+    };
     if size <= STACK_REGION_SIZE || region_size() != STACK_REGION_SIZE {
-        return room_in(region_size()).max(floor);
+        return Growth {
+            room: room_in(region_size()).max(floor),
+            short_of_memory: false,
+        };
     }
     let base = region().base;
-    if crate::vm::grow_stack_region(base, STACK_REGION_SIZE, size).is_err() {
-        return floor;
+    match crate::vm::grow_stack_region(base, STACK_REGION_SIZE, size) {
+        Ok(()) => {}
+        Err(origin_paging::MapError::OutOfMemory) => return short(true),
+        Err(_) => return short(false),
     }
     match without_interrupts(|| REGION.grow((size / SLOT) as usize)) {
         Ok(slots) if slots as u64 * SLOT == size => {
             REGION_SIZE.store(size, Ordering::Release);
-            room_in(size)
+            Growth {
+                room: room_in(size),
+                short_of_memory: false,
+            }
         }
-        _ => floor,
+        Err(origin_sync::slots::Grow::NoMemory) => short(true),
+        _ => short(false),
     }
 }
 

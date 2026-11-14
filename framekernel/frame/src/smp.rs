@@ -340,15 +340,17 @@ pub fn start(
     }
     let _ = writeln!(com1);
     // ADR-0008 Amendment 1, D1 and D3: every per-CPU table holds every index before any AP is
-    // sent INIT; the count is the fewest any table could hold, and the kernel stacks' region's
-    // room; the processors past it stay in firmware, counted.
-    let mut sizing = Sizing::new(map.indexed());
+    // sent INIT. The kernel stacks' region grows first, and the tables are sized for its room,
+    // so no table takes memory for a processor the region cannot hold (review finding F8 of
+    // 2026-11-14); the count is the fewest any table could hold. The processors past it stay in
+    // firmware, counted.
+    let growth = crate::stack::grow(map.indexed());
+    let mut sizing = Sizing::new(map.indexed().min(growth.room));
     crate::percpu::size_per_cpu(&mut sizing);
     size_kernel(&mut sizing);
-    let room = crate::stack::grow(sizing.reached);
-    let count = sizing.reached.min(room).max(1);
+    let count = sizing.reached.max(1);
     let fixed = cpu::fix_count(count);
-    report_bounds(com1, &map, &sizing, room, count, fixed);
+    report_bounds(com1, &map, &sizing, growth, count, fixed);
     if !fixed {
         return online;
     }
@@ -476,12 +478,14 @@ fn report_bounds(
     com1: &mut dyn Write,
     map: &CpuMap,
     sizing: &Sizing,
-    room: usize,
+    growth: crate::stack::Growth,
     count: usize,
     fixed: bool,
 ) {
-    let by_memory = map.indexed().saturating_sub(sizing.reached);
-    let by_region = sizing.reached.saturating_sub(room.max(1));
+    let room = growth.room;
+    // The region's room first: the tables are sized for no more (`start`).
+    let by_region = map.indexed().saturating_sub(room.max(1));
+    let by_memory = map.indexed().min(room).saturating_sub(sizing.reached);
     let _ = write!(
         com1,
         "origin-kernel: CPU indexes: {} given at discovery ({} to start, {} reserved for online-capable processors); {} per-CPU tables hold {count} each, {} bytes per index, allocated once{}; kernel stacks' region: room for {room} processors, at most {REGION_ROOM} in its reserved address space; x2APIC IDs are 32-bit, {} with the broadcast ID refused; held back: ",
@@ -504,7 +508,14 @@ fn report_bounds(
         _ => {
             let _ = write!(
                 com1,
-                "{by_memory} for want of memory for their tables, {by_region} by the kernel stacks' region: indexes {count} and up stay in firmware"
+                "{by_memory} for want of memory for their tables, {by_region} {}: indexes {count} and up stay in firmware",
+                // A region that could not grow for want of frames or slots holds them back for
+                // want of memory, not by its reserve (review finding F12 of 2026-11-14).
+                if growth.short_of_memory {
+                    "for want of memory for the kernel stacks' region's page tables or slots"
+                } else {
+                    "by the kernel stacks' region"
+                }
             );
         }
     }
@@ -758,12 +769,24 @@ fn start_one(
     tsc_hz: u64,
     main: fn(&X2Apic) -> !,
 ) -> Result<u64, NotStarted> {
+    // Every allocation here fails as `NotStarted::Memory`, and what was taken before it is freed
+    // as it returns, so a processor short of memory stays in firmware, counted (ADR-0008
+    // Amendment 1, D3; review finding F8 of 2026-11-14).
     let (interrupt_stacks, guards) = interrupt_stacks()?;
     let stack = GuardedStack::new(AP_STACK_BYTES)
         .ok_or(NotStarted::Memory("no memory for the AP stack"))?;
-    // SAFETY: an all-zero `CpuTables` is valid (integers only); `init_ap` writes it before
-    // the processor uses it.
-    let tables = Box::into_raw(unsafe { Box::<CpuTables>::new_zeroed().assume_init() });
+    // Its own GDT and TSS, which `init_ap` writes before the processor uses them.
+    let tables =
+        try_box(CpuTables::ZERO).ok_or(NotStarted::Memory("no memory for its GDT and TSS"))?;
+    let mut start = try_box(ApStart {
+        handshake: Handshake::new(),
+        tables: ptr::null_mut(),
+        interrupt_stacks: interrupt_stacks.each_ref().map(GuardedStack::top),
+        index,
+        main,
+        lacks: AtomicU64::new(0),
+    })
+    .ok_or(NotStarted::Memory("no memory for its start-up record"))?;
     // Its random-number generator's stack and seed area (ADR-0016): made here, by the
     // processor that starts it, so that it finds both when it starts its generator
     // (`random::start_this_processor`), which allocates nothing.
@@ -773,19 +796,13 @@ fn start_one(
         ));
     }
     let stack_top = stack.top();
-    let interrupt_tops = interrupt_stacks.each_ref().map(GuardedStack::top);
     // Kept for ever: the AP runs on the first (its idle context) and takes its #DF, NMI, #MC
-    // and #DB on the others.
+    // and #DB on the others; its tables and its start-up record too.
     core::mem::forget(stack);
     core::mem::forget(interrupt_stacks);
-    let start: &'static ApStart = Box::leak(Box::new(ApStart {
-        handshake: Handshake::new(),
-        tables,
-        interrupt_stacks: interrupt_tops,
-        index,
-        main,
-        lacks: AtomicU64::new(0),
-    }));
+    start[0].tables = Box::into_raw(tables).cast::<CpuTables>();
+    let start: &'static mut [ApStart; 1] = Box::leak(start);
+    let start: &'static ApStart = &start[0];
     poke(STACK, stack_top);
     poke(ENTRY, (ap_entry as *const ()).addr() as u64);
     poke(ARG, ptr::from_ref(start).addr() as u64);
@@ -825,6 +842,17 @@ fn start_one(
             "no TLB shootdown record for its CPU index; parked by INIT"
         }
     }))
+}
+
+/// `value` on the heap, or `None` if the heap cannot hold it (review finding F8 of 2026-11-14).
+/// `Box::try_new` is not stable on Rust 1.100.0: a one-element vector reserved with
+/// `try_reserve_exact`, whose capacity is then its length, so boxing it allocates nothing more,
+/// becomes a one-element array.
+fn try_box<T>(value: T) -> Option<Box<[T; 1]>> {
+    let mut one = Vec::new();
+    one.try_reserve_exact(1).ok()?;
+    one.push(value);
+    one.into_boxed_slice().try_into().ok()
 }
 
 /// Counted by the processor in the park drill while it runs.

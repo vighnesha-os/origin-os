@@ -91,6 +91,14 @@ pub struct CpuTables {
     tss: TssImage,
 }
 
+impl CpuTables {
+    /// All zero, as an AP's tables are before `init_ap` writes them: integers only, so valid.
+    pub const ZERO: Self = Self {
+        gdt: Gdt([0; GDT_ENTRIES]),
+        tss: TssImage([0; 26]),
+    };
+}
+
 impl core::fmt::Debug for CpuTables {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CpuTables").finish_non_exhaustive()
