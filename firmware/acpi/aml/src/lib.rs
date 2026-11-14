@@ -158,6 +158,9 @@ pub struct Interpreter<H: Host> {
     pending: Option<object::NodeId>,
     /// How many `Resolve` frames are on the stack.
     resolving: u32,
+    /// How many holds of the Global Lock the running evaluation has: the host holds it for all
+    /// of them (`sync.rs`).
+    global_depth: u32,
     run: RunCounts,
     /// The frame count below which the running evaluation does not reach.
     base: usize,

@@ -85,7 +85,7 @@ impl<H: Host> Interpreter<H> {
             };
             if h.global {
                 // Nothing to do on failure: the evaluation is over either way.
-                let _ = self.host.release_global_lock();
+                let _ = self.give_global();
             }
         }
         if self.held.is_empty() && self.held.capacity() > 0 {
@@ -158,7 +158,7 @@ impl<H: Host> Interpreter<H> {
         // index.
         self.held.retain(|h| h.mutex != Some(r));
         if m.global {
-            self.host.release_global_lock().map_err(ErrorKind::Host)?;
+            self.give_global()?;
         }
         Ok(())
     }
@@ -173,15 +173,26 @@ impl<H: Host> Interpreter<H> {
         }
     }
 
-    /// Asks the host for the Global Lock, waiting `timeout_ms` (`FOREVER`: for ever), but never
-    /// past the time left nor for 0xFFFF (the review of B1, F9). `false` if the wait asked for
-    /// timed out; a wait cut to the time left that times out ends the evaluation instead.
+    /// Takes the Global Lock, waiting `timeout_ms` (`FOREVER`: for ever), but never past the
+    /// time left nor for 0xFFFF (the review of B1, F9). `false` if the wait asked for timed out; a
+    /// wait cut to the time left that times out ends the evaluation instead.
+    ///
+    /// The evaluation's own holds are counted: the host is asked only for the first, since the
+    /// firmware's lock is not recursive (§5.2.10.1), and `Acquire (\_GL)` around a `Lock` field,
+    /// or `Lock` fields inside one another, never wait on themselves (the review of B2, B2-5).
     fn take_global(&mut self, timeout_ms: u64) -> Result<bool> {
+        if self.global_depth > 0 {
+            self.global_depth = self.global_depth.saturating_add(1);
+            return Ok(true);
+        }
         let left_ms = self.time_for_host()? / 10_000;
         let cut = timeout_ms >= FOREVER || timeout_ms > left_ms;
         let t = if cut { left_ms } else { timeout_ms }.min(LONGEST);
         match self.host.acquire_global_lock(u16::try_from(t).unwrap_or(0)) {
-            Ok(true) => Ok(true),
+            Ok(true) => {
+                self.global_depth = 1;
+                Ok(true)
+            }
             Ok(false) if cut => err(ErrorKind::Limit(Limit::Time)),
             Ok(false) => Ok(false),
             Err(e) => err(ErrorKind::Host(e)),
@@ -216,9 +227,24 @@ impl<H: Host> Interpreter<H> {
     }
 
     pub(crate) fn unlock_global(&mut self) -> Result<()> {
-        self.host
-            .release_global_lock()
-            .map_err(|e| Error::from(ErrorKind::Host(e)))
+        self.give_global()
+    }
+
+    /// Gives back one of the evaluation's holds of the Global Lock: the last goes to the host.
+    fn give_global(&mut self) -> Result<()> {
+        match self.global_depth {
+            0 => err(ErrorKind::NotOwned),
+            1 => {
+                self.global_depth = 0;
+                self.host
+                    .release_global_lock()
+                    .map_err(|e| Error::from(ErrorKind::Host(e)))
+            }
+            n => {
+                self.global_depth = n.saturating_sub(1);
+                Ok(())
+            }
+        }
     }
 
     fn event_of(&self, v: Val) -> Result<ObjRef> {

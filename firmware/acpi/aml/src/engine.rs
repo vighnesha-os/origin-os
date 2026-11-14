@@ -218,6 +218,7 @@ impl<H: Host> Interpreter<H> {
             nested: 0,
             pending: None,
             resolving: 0,
+            global_depth: 0,
             run: crate::RunCounts::default(),
             base: 0,
             result: Val::None,

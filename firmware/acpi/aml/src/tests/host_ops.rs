@@ -1108,3 +1108,34 @@ fn gpio_fields_give_the_host_their_pins() {
         ]
     );
 }
+
+#[test]
+fn the_global_lock_is_asked_for_once_however_often_the_evaluation_takes_it() {
+    // The review of B2, B2-5. The model host's lock is not recursive: a second acquisition while
+    // it is held times out, as a literal FACS lock would.
+    let mut i = loaded(&[
+        op_region("MEM", 0, dword(0x2000), byte(8)),
+        field(
+            "MEM",
+            BYTE | 0x10,
+            &[Fe::Named("LK", 8), Fe::Named("IDX", 8), Fe::Named("DAT", 8)],
+        ),
+        // An index field with the Lock rule over index and data registers that have it too.
+        index_field("IDX", "DAT", BYTE | 0x10, &[Fe::Named("REG", 8)]),
+        m(
+            "BOTH",
+            &[
+                store(acquire(nm("\\_GL"), 0xFFFF), local(0)),
+                store(nm("LK"), local(1)),
+                release(nm("\\_GL")),
+                ret(local(0)),
+            ],
+        ),
+        m("NEST", &[ret(nm("REG"))]),
+    ]);
+    assert_eq!(int(&mut i, "BOTH"), 0);
+    assert_eq!(int(&mut i, "NEST"), 0);
+    // Once for each evaluation, and given back each time.
+    assert_eq!((i.host().global_taken, i.host().global_held), (2, 0));
+    assert_eq!(i.global_depth, 0);
+}

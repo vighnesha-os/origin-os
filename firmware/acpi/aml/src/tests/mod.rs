@@ -204,7 +204,9 @@ impl Host for TestHost {
     fn acquire_global_lock(&mut self, timeout_ms: u16) -> Result<bool, HostError> {
         assert_ne!(timeout_ms, 0xFFFF, "the Global Lock asked for with no end");
         self.lock_waits.push(timeout_ms);
-        if self.global_times_out {
+        // The firmware's lock is not recursive (§5.2.10.1): asked for again while held, it is
+        // waited for until the wait ends.
+        if self.global_times_out || self.global_held > 0 {
             return Ok(false);
         }
         self.global_held += 1;
