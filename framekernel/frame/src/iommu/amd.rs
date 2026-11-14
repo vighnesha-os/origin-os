@@ -50,10 +50,15 @@ use crate::amdvi::{
 use crate::bitmap::Bitmap;
 use crate::ivrs::{self, Ivrs, Special};
 use crate::pci::Address;
+use crate::reserved::{self, Reserved, Span};
 use crate::sync::SpinLock;
 use crate::vtd::{Access, IovaWindow};
+use origin_boot_info::MemoryRegion;
 
-use super::{Domain, DomainInfo, Fault, FaultKind, PAGE, Page, Regs, Route, Tables, poll};
+use super::{
+    Domain, DomainInfo, Fault, FaultKind, PAGE, Page, Regs, ReservedRange, Route, Source, Tables,
+    poll,
+};
 
 /// Each ring (command buffer, event log) is one page: 2^8 entries of 16 bytes.
 const RING_ORDER: u8 = 8;
@@ -155,7 +160,7 @@ struct Unit {
 }
 
 /// One device's domain.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct DomainState {
     unit: usize,
     id: u16,
@@ -169,6 +174,12 @@ struct DomainState {
     mapped_ever: u64,
     /// Table pages (the top one included).
     tables: u64,
+    /// The IVMD spans identity-mapped for it, never unmapped, which the window keeps clear of.
+    identity: Vec<(Span, Access)>,
+    /// The IVMD spans never to be mapped for it (IR = IW = 0).
+    never: Vec<Span>,
+    /// The judged IVMDs its spans come from, for the proofs.
+    sources: Vec<ReservedRange>,
 }
 
 /// One device's interrupt remapping table.
@@ -184,6 +195,8 @@ struct AmdVi {
     units: Vec<Unit>,
     domains: Vec<DomainState>,
     interrupts: Vec<InterruptTable>,
+    /// Every IVMD, in table order, as bring-up judged it.
+    reserved: Vec<ReservedRange>,
 }
 
 static AMD: SpinLock<Option<AmdVi>> = SpinLock::new(None);
@@ -593,7 +606,12 @@ fn bring_up(u: &ivrs::Unit<'static>, p: Probe, wide: bool) -> Result<Brought, &'
 
 /// Brings up every IOMMU the IVRS (`table`, checked by `firmware::acpi_table`) names.
 /// Returns `false` only for a failure.
-pub(super) fn init(com1: &mut dyn Write, table: &'static [u8]) -> bool {
+pub(super) fn init(
+    com1: &mut dyn Write,
+    table: &'static [u8],
+    memory_map: &'static [MemoryRegion],
+    registers: Option<&[(u64, u64)]>,
+) -> bool {
     let ivrs = match ivrs::parse(table) {
         Ok(r) => r,
         Err(e) => {
@@ -626,20 +644,63 @@ pub(super) fn init(com1: &mut dyn Write, table: &'static [u8]) -> bool {
         );
         return false;
     }
-    for m in ivrs.memory() {
-        // Identity maps and exclusion ranges are not implemented yet (ADR-0007): a device an
-        // IVMD names is refused at `attach`, so its DMA stays blocked rather than unchecked.
-        let _ = writeln!(
-            com1,
-            "origin-kernel: IOMMU: memory definition {:#x}+{:#x} (type {:#x}, unity {}, read {}, write {}, exclusion {}): not mapped yet, so the devices it names cannot be attached",
-            m.start,
-            m.length,
-            m.kind,
-            m.unity(),
-            m.read(),
-            m.write(),
-            m.exclusion()
-        );
+    // Every IVMD, judged once (48882 §5.2.2.2; ledger R3–R5): an identity map with its
+    // permissions (an exclusion range read and write: the exclusion registers are never
+    // used), or a never-map range, for the devices it names that a driver attaches. Host
+    // tables reach 48 bits; the platform's physical addresses may reach fewer.
+    let width = match ivrs.physical_bits() {
+        0 => 48,
+        bits => bits.min(48),
+    };
+    // The IVRS and every other table read so far are lent as references: a writable range over
+    // any of them is refused (threat T26).
+    let lent = crate::vm::lent_ranges();
+    let against = super::Against {
+        memory_map,
+        registers,
+        lent: &lent,
+    };
+    let mut reserved: Vec<ReservedRange> = ivrs
+        .memory()
+        .map(|m| {
+            super::judge(
+                m.offset,
+                Source::Ivmd {
+                    kind: m.kind,
+                    flags: m.flags,
+                },
+                reserved::from_ivmd(&m),
+                width,
+                against,
+                true,
+            )
+        })
+        .collect();
+    super::note_writable(&mut reserved);
+    for (r, m) in reserved.iter().zip(ivrs.memory()) {
+        let devices = match m.kind {
+            // A never-map range for every peripheral keeps its pages from every device, on
+            // every IOMMU (ADR-0007 Amendment 2, R6).
+            ivrs::kind::IVMD_ALL if m.never_mapped() => {
+                alloc::string::String::from("every device in the system, on every IOMMU")
+            }
+            ivrs::kind::IVMD_ALL => {
+                alloc::format!("every device of the IOMMU at {:#x}", m.unit_base)
+            }
+            ivrs::kind::IVMD_DEVICE => alloc::format!(
+                "for DeviceID {:#06x} ({}) in segment {}",
+                m.device_id,
+                address(m.device_id),
+                m.segment
+            ),
+            _ => alloc::format!(
+                "for DeviceIDs {:#06x}-{:#06x} in segment {}",
+                m.device_id,
+                m.last_device_id,
+                m.segment
+            ),
+        };
+        super::report_range(com1, r, &devices);
     }
     // Every IOMMU is probed before any is enabled: all of them must read IRTEs of one size
     // (§2.2.5.2), so 128-bit entries with x2APIC destinations are used only if every one can.
@@ -763,6 +824,7 @@ pub(super) fn init(com1: &mut dyn Write, table: &'static [u8]) -> bool {
             units: running,
             domains: Vec::new(),
             interrupts: Vec::new(),
+            reserved,
         });
     });
     ACTIVE.store(true, Ordering::Release);
@@ -816,42 +878,100 @@ impl AmdVi {
         Ok(self.interrupts.len() - 1)
     }
 
+    /// The IVMDs that apply to the function at `at`, on unit `ui`, whose requests carry
+    /// `requester` (ledger R5): all must have passed bring-up's checks.
+    fn ranges_for(
+        &self,
+        ui: usize,
+        at: Address,
+        requester: u16,
+    ) -> Result<(Vec<Reserved>, Vec<ReservedRange>), &'static str> {
+        let base = self.units.get(ui).ok_or("no unit")?.base;
+        let mut ranges = Vec::new();
+        let mut sources = Vec::new();
+        for m in self.ivrs.memory_for(base, 0, device_id(at), requester) {
+            let judged = self
+                .reserved
+                .iter()
+                .find(|j| j.offset == m.offset)
+                .ok_or("its memory definitions were not judged")?;
+            if judged.verdict.is_err() {
+                return Err(
+                    "the firmware names a memory range for it (IVMD) that the kernel does not trust (see the IOMMU's boot report)",
+                );
+            }
+            ranges.extend(judged.range);
+            sources.push(*judged);
+        }
+        Ok((ranges, sources))
+    }
+
     fn attach(&mut self, at: Address) -> Result<Domain, &'static str> {
         let (ui, c) = self.resolve(at)?;
         let requester = c.requester;
+        let (ranges, sources) = self.ranges_for(ui, at, requester)?;
+        let identity = reserved::merge(&ranges).map_err(
+            |_| "its memory definitions ask for a page to be both mapped and never mapped",
+        )?;
+        reserved::bounded(&identity).map_err(|_| {
+            "its memory definitions hold more pages than the kernel identity-maps for one device"
+        })?;
+        let never = reserved::never_mapped(&ranges);
         if let Some(i) = self
             .domains
             .iter()
             .position(|d| d.unit == ui && d.requester == requester)
         {
+            // A device that shares its requester (an alias) with one attached before shares
+            // its domain, which must already hold everything this one's ranges ask.
+            let d = self.domains.get(i).ok_or("no such domain")?;
+            if !reserved::includes(&d.identity, &identity)
+                || never.iter().any(|n| !d.never.contains(n))
+            {
+                return Err(
+                    "it shares its requester with a device attached without its memory definitions",
+                );
+            }
             return Ok(Domain(i));
-        }
-        let base = self.units.get(ui).ok_or("no unit")?.base;
-        let id = device_id(at);
-        if self
-            .ivrs
-            .memory()
-            .any(|m| m.unit_base == base && (m.covers(0, id) || m.covers(0, requester)))
-        {
-            return Err(
-                "it needs a memory range identity-mapped or excluded (IVMD), which is not implemented",
-            );
         }
         self.interrupt_table(ui, requester)?;
         let unit = self.units.get_mut(ui).ok_or("no unit")?;
         let domain =
             u16::try_from(unit.next_domain).map_err(|_| "its IOMMU has no free domain ID")?;
-        // Consumed before any entry names it: an attach that fails below may have left the
-        // device table entry naming it, and that domain ID must never go to another device.
-        unit.next_domain += 1;
         let top = Page::new(true).ok_or("no memory for a page table")?;
-        let mut dte = Dte::decode(unit.dte(requester))
-            .ok_or("its device table entry is not this kernel's")?;
+        // The identity maps before the entry translates, so the device never sees its domain
+        // without them (ledger R1), each with the IVMD's own permissions (R4). Until the device
+        // table entry is written nothing the IOMMU reads names these tables, so a failure gives
+        // every page back (review L4).
+        let mut tables = Tables::new(true);
+        let fail = |tables: Tables, why: &'static str| {
+            tables.give_back();
+            top.give_back();
+            Err(why)
+        };
+        for &(span, access) in &identity {
+            let mut page = span.base;
+            while page < span.end {
+                if amdvi::map(&mut tables, top.phys, LEVELS, page, page, access).is_err() {
+                    return fail(tables, "a reserved page could not be identity-mapped");
+                }
+                page += PAGE;
+            }
+        }
+        let made = tables.count();
+        let Some(mut dte) = Dte::decode(unit.dte(requester)) else {
+            return fail(tables, "its device table entry is not this kernel's");
+        };
         dte.domain = domain;
         dte.dma = Dma::Translated {
             root: top.phys,
             levels: LEVELS,
         };
+        // The pages are the domain's from here on: the entry names them.
+        drop(tables);
+        // Consumed before the entry names it: an attach that fails below may have left the
+        // device table entry naming it, and that domain ID must never go to another device.
+        unit.next_domain += 1;
         unit.set_dte(requester, dte)?;
         unit.submit(&[
             Command::InvalidateDevice { device: requester },
@@ -870,25 +990,30 @@ impl AmdVi {
             window: IovaWindow::new(amdvi::IOVA_BASE, amdvi::IOVA_END),
             mapped: 0,
             mapped_ever: 0,
-            tables: 1,
+            tables: 1 + made,
+            identity,
+            never,
+            sources,
         });
         Ok(Domain(self.domains.len() - 1))
     }
 
     fn map(&mut self, d: Domain, phys: u64) -> Result<u64, &'static str> {
         let dom = self.domains.get_mut(d.0).ok_or("no such domain")?;
+        // An IVMD with IR = IW = 0: never mapped into this device's address space (R4).
+        if !reserved::may_map(&dom.never, phys) {
+            return Err("the firmware forbids mapping this page for the device (IVMD)");
+        }
         let unit = self.units.get_mut(dom.unit).ok_or("no unit")?;
+        let holes = super::holes(&dom.identity);
         let iova = dom
             .window
-            .alloc(1)
+            .alloc_skipping(1, &holes)
             .ok_or("the domain's IOVA window is full")?;
-        let mut tables = Tables {
-            coherent: true,
-            made: 0,
-        };
+        let mut tables = Tables::new(true);
         amdvi::map(&mut tables, dom.top, LEVELS, iova, phys, Access::READ_WRITE)
             .map_err(|_| "the page could not be mapped")?;
-        dom.tables += tables.made;
+        dom.tables += tables.count();
         dom.mapped += 1;
         dom.mapped_ever += 1;
         if unit.capability.not_present_cached {
@@ -896,7 +1021,7 @@ impl AmdVi {
             // table page made a directory entry present too, and only an invalidation with
             // PDE set covers directory entries (§2.4.3): then the whole domain's, as the one
             // with a range wide enough under every new entry.
-            let pages = if tables.made > 0 {
+            let pages = if tables.count() > 0 {
                 Pages::All
             } else {
                 Pages::One
@@ -914,11 +1039,11 @@ impl AmdVi {
 
     fn unmap(&mut self, d: Domain, iova: u64) -> Result<u64, &'static str> {
         let dom = self.domains.get_mut(d.0).ok_or("no such domain")?;
+        if !reserved::may_unmap(&dom.identity, iova) {
+            return Err("an identity-mapped reserved page is never unmapped");
+        }
         let unit = self.units.get_mut(dom.unit).ok_or("no unit")?;
-        let mut tables = Tables {
-            coherent: true,
-            made: 0,
-        };
+        let mut tables = Tables::new(true);
         let phys = amdvi::unmap(&mut tables, dom.top, LEVELS, iova)
             .map_err(|_| "the page was not mapped")?;
         dom.mapped -= 1;
@@ -1129,11 +1254,18 @@ pub(super) fn translate(d: Domain, iova: u64) -> Option<(u64, Access)> {
     crate::cpu::without_interrupts(|| {
         let g = AMD.lock();
         let dom = g.as_ref()?.domains.get(d.0)?;
-        let mut tables = Tables {
-            coherent: true,
-            made: 0,
-        };
+        let mut tables = Tables::new(true);
         amdvi::translate(&mut tables, dom.top, LEVELS, iova)
+    })
+}
+
+/// The first IOVA at which domain `d`'s tables reach physical page `phys`, walking every entry.
+pub(super) fn maps_physical(d: Domain, phys: u64) -> Option<u64> {
+    crate::cpu::without_interrupts(|| {
+        let g = AMD.lock();
+        let dom = g.as_ref()?.domains.get(d.0)?;
+        let mut tables = Tables::new(true);
+        amdvi::find_physical(&mut tables, dom.top, LEVELS, phys)
     })
 }
 
@@ -1198,12 +1330,15 @@ pub(super) fn domains() -> (Vec<DomainInfo>, usize) {
         let list = s
             .domains
             .iter()
-            .map(|d| DomainInfo {
+            .enumerate()
+            .map(|(i, d)| DomainInfo {
+                domain: Domain(i),
                 at: d.at,
                 id: d.id,
                 mapped: d.mapped,
                 mapped_ever: d.mapped_ever,
                 tables: d.tables,
+                identity_pages: super::identity_pages(&d.identity),
             })
             .collect();
         let irtes = s
@@ -1212,6 +1347,38 @@ pub(super) fn domains() -> (Vec<DomainInfo>, usize) {
             .map(|t| t.used.len() - t.used.free())
             .sum();
         (list, irtes)
+    })
+}
+
+/// Every IVMD and what bring-up made of it.
+pub(super) fn reserved_ranges() -> Vec<ReservedRange> {
+    crate::cpu::without_interrupts(|| {
+        AMD.lock()
+            .as_ref()
+            .map(|s| s.reserved.clone())
+            .unwrap_or_default()
+    })
+}
+
+/// The judged IVMDs domain `d` was attached with.
+pub(super) fn domain_ranges(d: Domain) -> Vec<ReservedRange> {
+    crate::cpu::without_interrupts(|| {
+        AMD.lock()
+            .as_ref()
+            .and_then(|s| s.domains.get(d.0))
+            .map(|dom| dom.sources.clone())
+            .unwrap_or_default()
+    })
+}
+
+/// The IVMD spans identity-mapped in domain `d`.
+pub(super) fn identity_spans(d: Domain) -> Vec<(Span, Access)> {
+    crate::cpu::without_interrupts(|| {
+        AMD.lock()
+            .as_ref()
+            .and_then(|s| s.domains.get(d.0))
+            .map(|dom| dom.identity.clone())
+            .unwrap_or_default()
     })
 }
 

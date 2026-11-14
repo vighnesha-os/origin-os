@@ -261,9 +261,21 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // compatibility-format I/O APIC proof above, which interrupt remapping would block.
         // It runs whether or not the bus-master quiesce succeeded: confining a device that kept
         // mastering the bus is exactly what a failed quiesce leaves to it.
+        // Firmware-reserved ranges are identity-mapped only clear of every platform register
+        // range (ADR-0007 questions 4 and 8): listed here, or `None` if they cannot be, and
+        // then no range is trusted.
+        let registers = quiesced
+            .as_ref()
+            .and_then(|q| pcie::reserved_ranges(&mut com1, q, info.acpi_rsdp));
         proofs.record(
             Proof::Iommu,
-            iommu::init(&mut com1, info.acpi_rsdp, pcie::read_config32),
+            iommu::init(
+                &mut com1,
+                info.acpi_rsdp,
+                pcie::read_config32,
+                regions,
+                registers.as_deref(),
+            ),
         );
         if iommu::translating() {
             let _ = writeln!(
@@ -311,7 +323,13 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             && !early.start_heap(&mut com1)
             && !early.prove_user_isolation(&mut com1)
             && early.enable_simd() == xcr0
-            && !iommu::init(&mut com1, info.acpi_rsdp, pcie::read_config32);
+            && !iommu::init(
+                &mut com1,
+                info.acpi_rsdp,
+                pcie::read_config32,
+                regions,
+                None,
+            );
         let _ = writeln!(
             com1,
             "origin-kernel: boot steps: out of turn refused {out_of_turn}; a second run refused {once}{}",
@@ -360,8 +378,19 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         stop_if_refused(&mut com1, proofs);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
         if let Some(q) = quiesced.as_mut()
-            && let Some(reserved) = pcie::reserved_ranges(&mut com1, q, info.acpi_rsdp)
-            && pcie::init(&mut com1, q, online.cpus(), regions, &reserved)
+            && let Some(mut reserved) = pcie::reserved_ranges(&mut com1, q, info.acpi_rsdp)
+            && {
+                // No BAR where a device's DMA reaches untranslated: every accepted identity
+                // range is reserved too (TASKS item 40's review, L3).
+                let judged = iommu::reserved_ranges();
+                reserved.extend(origin_frame::reserved::identity_ranges(
+                    judged
+                        .iter()
+                        .filter(|r| r.verdict.is_ok())
+                        .filter_map(|r| r.range.as_ref()),
+                ));
+                pcie::init(&mut com1, q, online.cpus(), regions, &reserved)
+            }
         {
             proofs.record(Proof::Pcie, true);
             // Anything that turned bus mastering back on is stopped again before any driver

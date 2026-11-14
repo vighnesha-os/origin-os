@@ -255,7 +255,7 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 
 | Rows | Subject |
 |---|---|
-| A07-R1 to A07-R5 | Identity maps for firmware-reserved memory (ADR-0007 Amendment 1) |
+| A07-R1 to A07-R6 | Identity maps for firmware-reserved memory (ADR-0007 Amendments 1 and 2) |
 
 ## M6. Native runtime
 

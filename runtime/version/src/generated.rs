@@ -21,7 +21,7 @@ pub const ONBF_FORMAT_MINOR: u16 = 0;
 /// Boot-info ABI major version (`[compatibility] boot-info`).
 pub const BOOT_INFO_MAJOR: u16 = 0;
 /// Boot-info ABI minor version (`[compatibility] boot-info`).
-pub const BOOT_INFO_MINOR: u16 = 6;
+pub const BOOT_INFO_MINOR: u16 = 7;
 /// Origin userspace ABI major version (`[compatibility] user-abi`, ADR-0005 P12).
 pub const USER_ABI_MAJOR: u16 = 0;
 /// Origin userspace ABI minor version (`[compatibility] user-abi`).

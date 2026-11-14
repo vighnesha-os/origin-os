@@ -65,8 +65,13 @@ pub const fn kind_of(uefi_type: u32) -> RegionKind {
         14 => RegionKind::Persistent,
         memory_type::OS_BOOT_INFO => RegionKind::BootInfo,
         memory_type::OS_KERNEL_STACK => RegionKind::KernelStack,
-        // Reserved (0), PalCode (13), Unaccepted (15), unknown and other OEM/OS values.
-        _ => RegionKind::Reserved,
+        // `EfiReservedMemoryType` alone (boot info 0.7, decision item 293).
+        0 => RegionKind::Reserved,
+        // `EfiUnacceptedMemoryType`: RAM, once accepted.
+        15 => RegionKind::Unaccepted,
+        // PalCode (13), the OEM and the other OS types, and every type this loader does not
+        // know: firmware memory the kernel never uses, and never one an RMRR or IVMD may name.
+        _ => RegionKind::FirmwareOther,
     }
 }
 
@@ -326,8 +331,47 @@ mod tests {
     fn every_uefi_type_has_a_kind() {
         assert_eq!(kind_of(7), RegionKind::Usable);
         assert_eq!(kind_of(10), RegionKind::AcpiNvs);
-        assert_eq!(kind_of(15), RegionKind::Reserved); // unaccepted memory
-        assert_eq!(kind_of(0x7000_0000), RegionKind::Reserved);
+        // Boot info 0.7 (decision item 293): type 0 alone is `Reserved`.
+        assert_eq!(kind_of(0), RegionKind::Reserved);
+        assert_eq!(kind_of(5), RegionKind::RuntimeCode);
+        assert_eq!(kind_of(6), RegionKind::RuntimeData);
+        assert_eq!(kind_of(15), RegionKind::Unaccepted);
+        for other in [
+            13,          // PalCode
+            16,          // the first type UEFI 2.11 does not define
+            0x6FFF_FFFF, // the last below the OEM types
+            0x7000_0000, // the OEM types
+            0x7FFF_FFFF,
+            0x8000_0000, // the OS types, Origin's own two apart
+            0x8000_0001,
+            0x8000_0004,
+            u32::MAX,
+        ] {
+            assert_eq!(kind_of(other), RegionKind::FirmwareOther, "{other:#x}");
+        }
+        // Every type UEFI 2.11 §7.2 defines, in order.
+        use RegionKind::*;
+        let defined = [
+            Reserved,
+            LoaderReclaimable,
+            LoaderReclaimable,
+            LoaderReclaimable,
+            LoaderReclaimable,
+            RuntimeCode,
+            RuntimeData,
+            Usable,
+            Unusable,
+            AcpiReclaimable,
+            AcpiNvs,
+            Mmio,
+            Mmio,
+            FirmwareOther,
+            Persistent,
+            Unaccepted,
+        ];
+        for (t, kind) in defined.into_iter().enumerate() {
+            assert_eq!(kind_of(t as u32), kind, "type {t}");
+        }
         assert_eq!(kind_of(1), RegionKind::LoaderReclaimable); // LoaderCode, incl. the kernel image before carving
         assert_eq!(kind_of(memory_type::OS_BOOT_INFO), RegionKind::BootInfo);
         assert_eq!(
