@@ -411,11 +411,10 @@ impl<H: Host> Interpreter<H> {
         }
         if self.budget.used() > self.gc_threshold {
             self.collect_garbage();
+            // The next collection comes when half the room left after this one is used, so
+            // garbage never fills the limit while live data is large.
             let used = self.budget.used();
-            self.gc_threshold = used
-                .saturating_mul(2)
-                .max(self.budget.limit() / 2)
-                .min(self.budget.limit());
+            self.gc_threshold = used.saturating_add(self.budget.limit().saturating_sub(used) / 2);
         }
         Ok(())
     }

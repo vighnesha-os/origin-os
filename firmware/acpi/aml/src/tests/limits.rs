@@ -189,3 +189,31 @@ fn a_name_made_twice_in_a_loop_is_refused_and_removed() {
     assert_eq!(e.kind, ErrorKind::Duplicate);
     assert_eq!(i.node_count(), nodes);
 }
+
+#[test]
+fn garbage_is_collected_before_it_fills_the_limit_while_live_data_is_large() {
+    // 600 KiB of a 1 MiB limit is live; each iteration leaves about 16 KiB behind.
+    let mut i = interp_with(IntegerWidth::Bits64, small());
+    load(
+        &mut i,
+        &[
+            name("BIG", buffer(dword(600 * 1024), &[])),
+            method(
+                "CHRN",
+                0,
+                &[
+                    store(zero(), local(1)),
+                    store(buffer(word(4096), &[]), local(2)),
+                    while_(
+                        logic(0x95, local(1), word(900)),
+                        &[concat(local(2), local(2), local(0)), increment(local(1))],
+                    ),
+                    ret(local(1)),
+                ],
+            ),
+        ],
+    )
+    .unwrap();
+    assert_eq!(i.evaluate("CHRN", &[]).unwrap(), Some(Value::Integer(900)));
+    assert!(i.memory_peak() <= small().memory_bytes);
+}
