@@ -331,7 +331,8 @@ pub(crate) enum Fault {
     LooseMemoryLimit,
     /// A buffer field may end a byte past its buffer (`exec.rs`, `create_field`).
     WeakFieldBound,
-    /// The Global Lock is kept when an evaluation ends holding it (`sync.rs`, `release_held`).
+    /// The Global Lock is kept when an evaluation ends holding it (`sync.rs`, `release_held`, and
+    /// the backstop in `engine.rs`, `end_evaluation`).
     KeepGlobalLock,
 }
 

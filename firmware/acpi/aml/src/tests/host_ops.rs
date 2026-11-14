@@ -1155,3 +1155,32 @@ fn a_walk_cut_off_by_an_error_is_counted_out() {
         }
     });
 }
+
+#[test]
+fn a_mutex_a_method_run_by_export_keeps_is_released_at_the_end() {
+    // The review of B2, B2-6. `PK` returns a package naming a field of `D1`, whose region's
+    // function is found only when the package is exported, by running `_ADR`, which takes `MX`
+    // (sync level 5) and keeps it.
+    let mut i = pci_device(
+        &[acquire(nm("\\MX"), 0xFFFF), ret(dword(0x0001_0000))],
+        &[
+            mutex("MX", 5),
+            mutex("LO", 1),
+            method("PK", 0, &[ret(package(1, &[nm("\\_SB.PCI0.D1.F1")]))]),
+            method(
+                "LOW",
+                0,
+                &[acquire(nm("\\LO"), 0xFFFF), release(nm("\\LO")), ret(one())],
+            ),
+        ],
+    );
+    // Reported, and released: a mutex of a lower level can be taken afterwards.
+    assert_eq!(fails(&mut i, "PK"), ErrorKind::MutexHeld);
+    assert!(i.held.is_empty());
+    assert_eq!(int(&mut i, "LOW"), 1);
+    // The function was found and kept: the next export reads the field with nothing held.
+    assert_eq!(
+        i.evaluate("PK", &[]).unwrap(),
+        Some(Value::Package(vec![Value::Integer(0)]))
+    );
+}

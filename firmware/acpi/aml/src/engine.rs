@@ -401,6 +401,20 @@ impl<H: Host> Interpreter<H> {
     /// give their memory back.
     pub(crate) fn end_evaluation(&mut self) {
         self.result = Val::None;
+        // At the top level nothing may stay held: the paths above release and report; this only
+        // makes sure no hold, the Global Lock's least, outlives the evaluation whatever path
+        // ended it (the review of B2, B2-6).
+        if self.calls.is_empty() {
+            self.release_held(0);
+            #[cfg(test)]
+            let planted = crate::tests::planted(crate::tests::Fault::KeepGlobalLock);
+            #[cfg(not(test))]
+            let planted = false;
+            if self.global_depth > 0 && !planted {
+                self.global_depth = 0;
+                let _ = self.host.release_global_lock();
+            }
+        }
         self.collect_garbage();
         if self.frames.is_empty() {
             mem::release(core::mem::take(&mut self.frames), &mut self.budget);

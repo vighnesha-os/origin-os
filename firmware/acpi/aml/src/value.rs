@@ -147,7 +147,22 @@ impl<H: Host> Interpreter<H> {
             // Every mutex is released before an evaluation ends (§19.6.89); one still held is
             // released now and reported (G2, strict until the reading session answers).
             Ok(_) if self.release_held(marks.held) => Err(Error::new(ErrorKind::MutexHeld)),
-            Ok(v) => self.export(v),
+            Ok(v) => {
+                // `export` may run methods (a PCI_Config region's `_ADR`, through
+                // `with_address`): what they take is inside the evaluation's marks, released and
+                // reported the same way, and a failed export is undone like any failure (the
+                // review of B2, B2-6).
+                let r = self.export(v);
+                let kept = self.release_held(marks.held);
+                match r {
+                    Err(e) => {
+                        self.abort(marks);
+                        Err(e)
+                    }
+                    Ok(_) if kept => Err(Error::new(ErrorKind::MutexHeld)),
+                    ok => ok,
+                }
+            }
             Err(e) => {
                 self.abort(marks);
                 Err(e)
