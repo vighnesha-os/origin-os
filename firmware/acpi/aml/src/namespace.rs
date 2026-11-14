@@ -340,6 +340,10 @@ impl Namespace {
         if path.root() {
             return Ok(Self::root());
         }
+        // Each parent prefix was a byte parsed, and is a scope gone up: a unit of work each (the
+        // review of B1, A1).
+        self.work
+            .set(self.work.get().saturating_add(u64::from(path.parents())));
         let mut cur = scope;
         for _ in 0..path.parents() {
             cur = self.parent(cur).ok_or(ErrorKind::NotFound)?;

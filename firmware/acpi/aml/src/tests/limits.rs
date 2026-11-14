@@ -361,3 +361,66 @@ fn a_vector_near_the_limit_grows_once_to_what_is_left_then_is_refused() {
     assert_eq!(v.len(), 1250);
     assert!(budget.used() <= 10_000);
 }
+
+#[test]
+fn a_store_into_a_large_buffer_is_charged_for_every_byte_it_writes() {
+    // The review of B1, A1: a 60 MiB named buffer, and straight-line stores of one byte into it,
+    // each of which writes all 60 MiB. Each is charged before it runs, so the step limit ends it,
+    // and with no step limit the clock does, a store's work after its time.
+    let stores: Vec<B> = (0..3_000).map(|_| store(one(), nm("BIGB"))).collect();
+    let body = [
+        name("BIGB", buffer(dword(0x3C0_0000), &[])),
+        method("M0", 0, &stores),
+    ];
+    for (what, limits, want) in [
+        ("service limits", Limits::SERVICE, Limit::Steps),
+        (
+            "a 1 s time limit and no step limit",
+            Limits {
+                steps: u64::MAX,
+                time_100ns: 10_000_000,
+                ..Limits::SERVICE
+            },
+            Limit::Time,
+        ),
+    ] {
+        let mut i = interp_with(IntegerWidth::Bits64, limits);
+        load(&mut i, &body).unwrap();
+        let start = std::time::Instant::now();
+        i.host_mut().real_clock = Some(start);
+        let e = i.evaluate("M0", &[]).unwrap_err();
+        let took = start.elapsed();
+        assert_eq!(e.kind, ErrorKind::Limit(want), "{what}");
+        assert!(
+            u128::from(limits.time_100ns) * 125 >= took.as_nanos(),
+            "{what}: {took:?} well past its time limit"
+        );
+        eprintln!(
+            "60 MiB buffer, 3,000 stores, {what}: {:?} after {took:?}",
+            e.kind
+        );
+    }
+}
+
+#[test]
+fn a_long_parent_prefix_is_charged_for_its_length() {
+    // The review of B1, A1: `CondRefOf` of a name with 60,000 parent prefixes never fails, so an
+    // endless loop of it parses 60,000 bytes a pass. Charged a unit a prefix, it meets the step
+    // limit after some 1,600 passes, not the loop limit after a million.
+    let far = format!("{}X", "^".repeat(60_000));
+    let body = [method(
+        "M0",
+        0,
+        &[while_(one(), &[cond_ref_of(nm(&far), local(0))])],
+    )];
+    let mut i = interp_with(IntegerWidth::Bits64, Limits::SERVICE);
+    load(&mut i, &body).unwrap();
+    let start = std::time::Instant::now();
+    let e = i.evaluate("M0", &[]).unwrap_err();
+    let took = start.elapsed();
+    assert_eq!(e.kind, ErrorKind::Limit(Limit::Steps));
+    eprintln!(
+        "60,000 parent prefixes in a loop: {:?} after {took:?}",
+        e.kind
+    );
+}

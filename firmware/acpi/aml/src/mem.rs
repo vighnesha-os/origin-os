@@ -24,7 +24,8 @@ pub(crate) struct Budget {
     used: usize,
     limit: usize,
     peak: usize,
-    /// Every byte ever charged: the engine counts a step for each 64, as work done.
+    /// Every byte ever charged, and every byte a reallocation moved: the engine counts a step for
+    /// each 64, as work done.
     charged: u64,
 }
 
@@ -85,6 +86,13 @@ impl Budget {
         Ok(())
     }
 
+    /// Counts `bytes` moved (a reallocation's copy) as work, with what is allocated.
+    fn note_moved(&mut self, bytes: usize) {
+        self.charged = self
+            .charged
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+
     fn credit(&mut self, bytes: usize) {
         self.used = self.used.saturating_sub(bytes);
     }
@@ -124,6 +132,9 @@ pub(crate) fn reserve<T>(v: &mut Vec<T>, additional: usize, budget: &mut Budget)
         return Err(memory());
     }
     budget.charge(bytes_for::<T>(target.saturating_sub(have))?)?;
+    // Growing a vector that holds something copies it: that is work, counted with what is
+    // allocated (the review of B1, A1).
+    budget.note_moved(bytes_for::<T>(v.len()).unwrap_or(usize::MAX));
     if v.try_reserve_exact(target.saturating_sub(v.len())).is_err() {
         budget.credit(bytes_for::<T>(target.saturating_sub(have)).unwrap_or(0));
         return Err(memory());

@@ -382,13 +382,29 @@ impl<H: Host> Interpreter<H> {
             (Mode::Store, Target::Buf) => {
                 // G11, strict until the reading session answers: a named buffer keeps its length.
                 let bytes = self.buffer_of(v)?;
-                if let Ok(Object::Buffer(b)) = self.heap.get_mut(obj) {
-                    for (k, d) in b.iter_mut().enumerate() {
-                        *d = bytes.get(k).copied().unwrap_or(0);
+                // Every byte of the target is written, whatever the source's size: charged
+                // before, a unit each 64 (the review of B1, A1).
+                let len = match self.heap.get(obj) {
+                    Ok(Object::Buffer(b)) => b.len(),
+                    _ => 0,
+                };
+                let r = self.charge(
+                    u64::try_from(len / 64)
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1),
+                );
+                if r.is_ok()
+                    && let Ok(Object::Buffer(b)) = self.heap.get_mut(obj)
+                {
+                    for (d, s) in b.iter_mut().zip(&bytes) {
+                        *d = *s;
+                    }
+                    if let Some(rest) = b.get_mut(bytes.len()..) {
+                        rest.fill(0);
                     }
                 }
                 mem::release(bytes, &mut self.budget);
-                Ok(None)
+                r.map(|()| None)
             }
             (Mode::Store, Target::Pkg) => match self.data(v)? {
                 crate::convert::Data::Other(t) if t == crate::object::types::PACKAGE => {
@@ -437,10 +453,16 @@ impl<H: Host> Interpreter<H> {
             Val::Int(i) => mem::copy_bytes(&i.to_le_bytes(), &mut self.budget)?,
             other => self.buffer_of(other)?,
         };
-        let r = match self.heap.get_mut(f.source)? {
-            Object::Buffer(b) | Object::String(b) => set_bits(b, f.bit_offset, f.bit_len, &bytes),
-            _ => err(ErrorKind::Type),
-        };
+        // The field's bytes are written one by one: charged before, a unit each 64 (the review
+        // of B1, A1).
+        let r = self
+            .charge((f.bit_len / 8 / 64).saturating_add(1))
+            .and_then(|()| match self.heap.get_mut(f.source)? {
+                Object::Buffer(b) | Object::String(b) => {
+                    set_bits(b, f.bit_offset, f.bit_len, &bytes)
+                }
+                _ => err(ErrorKind::Type),
+            });
         mem::release(bytes, &mut self.budget);
         r
     }

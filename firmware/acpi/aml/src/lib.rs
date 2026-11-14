@@ -125,6 +125,8 @@ struct RunCounts {
     started: u64,
     /// The budget's `charged` when the work done was last counted.
     charged_seen: u64,
+    /// Units counted since the clock was last read.
+    since_clock: u64,
 }
 
 /// An AML interpreter: one namespace, its tables and its host.
@@ -137,6 +139,9 @@ pub struct Interpreter<H: Host> {
     ns: Namespace,
     tables: Vec<Table>,
     frames: Vec<Frame>,
+    /// For each frame, the scope names resolve in and the end of the innermost package around
+    /// it, so that neither needs a scan of the frames (the review of B1, A1).
+    ctx: Vec<engine::Ctx>,
     calls: Vec<CallFrame>,
     owners: Vec<OwnerCtx>,
     cur: Cursor,

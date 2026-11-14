@@ -109,6 +109,18 @@ pub(crate) enum Frame {
     Call,
 }
 
+/// The units of work between two readings of the clock.
+const CLOCK_UNITS: u64 = 1_024;
+
+/// What a frame sees around it: the scope names resolve in (the innermost block's) and the end of
+/// the innermost block or package (`None`: the table's end). Kept beside each frame, made from the
+/// one below when the frame is pushed: a frame's own scope and end never change once pushed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Ctx {
+    scope: NodeId,
+    end: Option<u32>,
+}
+
 /// A method activation.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CallFrame {
@@ -195,6 +207,7 @@ impl<H: Host> Interpreter<H> {
             ns,
             tables: Vec::new(),
             frames: Vec::new(),
+            ctx: Vec::new(),
             calls: Vec::new(),
             owners: Vec::new(),
             cur: Cursor { table: 0, pc: 0 },
@@ -386,6 +399,7 @@ impl<H: Host> Interpreter<H> {
         self.collect_garbage();
         if self.frames.is_empty() {
             mem::release(core::mem::take(&mut self.frames), &mut self.budget);
+            mem::release(core::mem::take(&mut self.ctx), &mut self.budget);
         }
         if self.calls.is_empty() {
             mem::release(core::mem::take(&mut self.calls), &mut self.budget);
@@ -407,6 +421,7 @@ impl<H: Host> Interpreter<H> {
         }
         n = n
             .saturating_add(self.frames.capacity().saturating_mul(size_of::<Frame>()))
+            .saturating_add(self.ctx.capacity().saturating_mul(size_of::<Ctx>()))
             .saturating_add(self.calls.capacity().saturating_mul(size_of::<CallFrame>()))
             .saturating_add(self.owners.capacity().saturating_mul(size_of::<OwnerCtx>()))
             .saturating_add(
@@ -436,7 +451,7 @@ impl<H: Host> Interpreter<H> {
     /// Pops frames, activations and creators above the given marks; the names those creators
     /// made are removed.
     pub(crate) fn unwind(&mut self, frames: usize, calls: usize, owners: usize) {
-        self.frames.truncate(frames);
+        self.truncate_frames(frames);
         for _ in calls..self.calls.len() {
             self.trace(&Trace::Leave);
         }
@@ -516,7 +531,40 @@ impl<H: Host> Interpreter<H> {
     }
 
     pub(crate) fn push_frame(&mut self, f: Frame) -> Result<()> {
-        mem::push(&mut self.frames, f, &mut self.budget)
+        let below = self.ctx.last().copied().unwrap_or(Ctx {
+            scope: Namespace::root(),
+            end: None,
+        });
+        let here = match &f {
+            Frame::Block { end, scope, .. } => Ctx {
+                scope: *scope,
+                end: Some(*end),
+            },
+            Frame::Op(o) if o.end != 0 => Ctx {
+                scope: below.scope,
+                end: Some(o.end),
+            },
+            _ => below,
+        };
+        // Room for both first, so that the two stacks never differ in length.
+        mem::reserve(&mut self.ctx, 1, &mut self.budget)?;
+        mem::push(&mut self.frames, f, &mut self.budget)?;
+        mem::push(&mut self.ctx, here, &mut self.budget)
+    }
+
+    /// Pops the top frame, with what it saw.
+    pub(crate) fn pop_frame(&mut self) -> Option<Frame> {
+        let f = self.frames.pop();
+        if f.is_some() {
+            self.ctx.pop();
+        }
+        f
+    }
+
+    /// Pops frames down to `n`.
+    pub(crate) fn truncate_frames(&mut self, n: usize) {
+        self.frames.truncate(n);
+        self.ctx.truncate(n);
     }
 
     /// Runs until the frames are back to `base`.
@@ -540,7 +588,6 @@ impl<H: Host> Interpreter<H> {
     /// One step: an opcode, with the work done since the last count (the review of B1, F1).
     fn tick(&mut self) -> Result<()> {
         self.charge(1)?;
-        self.charge_pending()?;
         if self.nested == 0 && self.budget.used() > self.gc_threshold {
             let slots = u64::try_from(self.heap.slot_count()).unwrap_or(u64::MAX);
             self.collect_garbage();
@@ -555,29 +602,33 @@ impl<H: Host> Interpreter<H> {
         Ok(())
     }
 
-    /// Counts `units` of work against the step limit, and reads the clock each time the count
-    /// passes a multiple of 1,024: so the time limit holds inside long operations, not only
-    /// between steps (the review of B1, F1).
+    /// Counts `units` of work against the step limit, with the work done since the last count:
+    /// each sibling compared in the namespace, and a unit for each 64 bytes allocated or moved
+    /// (what is copied, converted or filled is allocated first; a reallocation counts what it
+    /// copies). The clock is read whenever 1,024 units have been counted since it was last read,
+    /// so that between two readings there is at most that much work and the operation being
+    /// charged, itself charged before it runs where it is large (the review of B1, F1 and A1).
     pub(crate) fn charge(&mut self, units: u64) -> Result<()> {
-        let before = self.run.steps;
-        self.run.steps = before.saturating_add(units);
+        let compared = self.ns.take_work();
+        let charged = self.budget.charged();
+        let bytes = charged.saturating_sub(self.run.charged_seen);
+        self.run.charged_seen = charged;
+        let all = units.saturating_add(compared).saturating_add(bytes / 64);
+        self.run.steps = self.run.steps.saturating_add(all);
         if self.run.steps > self.config.limits.steps {
             return err(ErrorKind::Limit(Limit::Steps));
         }
-        if before >> 10 != self.run.steps >> 10 {
+        self.run.since_clock = self.run.since_clock.saturating_add(all);
+        if self.run.since_clock >= CLOCK_UNITS {
+            self.run.since_clock = 0;
             self.check_time()?;
         }
         Ok(())
     }
 
-    /// Counts the work done since the last count: each sibling compared in the namespace, and a
-    /// unit for each 64 bytes allocated (what is copied, converted or filled is allocated first).
+    /// Counts the work done since the last count (see [`Interpreter::charge`]).
     pub(crate) fn charge_pending(&mut self) -> Result<()> {
-        let compared = self.ns.take_work();
-        let charged = self.budget.charged();
-        let bytes = charged.saturating_sub(self.run.charged_seen);
-        self.run.charged_seen = charged;
-        self.charge(compared.saturating_add(bytes / 64))
+        self.charge(0)
     }
 
     pub(crate) fn check_time(&mut self) -> Result<()> {
@@ -612,12 +663,12 @@ impl<H: Host> Interpreter<H> {
                 if f.phase == 0 && f.n < f.arity {
                     self.operand(&f)
                 } else if f.phase == 2 {
-                    self.frames.pop();
+                    self.pop_frame();
                     self.place_element(f)
                 } else if f.phase == 1 || matches!(f.op, Op::Package | Op::VarPackage) {
                     self.package_step(f)
                 } else {
-                    self.frames.pop();
+                    self.pop_frame();
                     self.complete(f).map_err(|mut e| {
                         if e.at.is_none() {
                             e.at = Some(At {
@@ -677,24 +728,15 @@ impl<H: Host> Interpreter<H> {
 
     /// The end of the innermost construct being decoded: a block's or a package's.
     pub(crate) fn enclosing_end(&self) -> u32 {
-        for f in self.frames.iter().rev() {
-            match f {
-                Frame::Block { end, .. } => return *end,
-                Frame::Op(o) if o.end != 0 => return o.end,
-                _ => {}
-            }
+        match self.ctx.last() {
+            Some(Ctx { end: Some(end), .. }) => *end,
+            _ => u32::try_from(self.aml().len()).unwrap_or(u32::MAX),
         }
-        u32::try_from(self.aml().len()).unwrap_or(u32::MAX)
     }
 
     /// The scope names are resolved in and created under: the innermost block's.
     pub(crate) fn scope(&self) -> NodeId {
-        for f in self.frames.iter().rev() {
-            if let Frame::Block { scope, .. } = f {
-                return *scope;
-            }
-        }
-        Namespace::root()
+        self.ctx.last().map_or(Namespace::root(), |c| c.scope)
     }
 
     /// The node an alias object names, for the namespace's lookups.
@@ -1095,7 +1137,7 @@ impl<H: Host> Interpreter<H> {
         if self.cur.pc > f.end {
             return err(ErrorKind::PackageLength);
         }
-        self.frames.pop();
+        self.pop_frame();
         #[cfg(test)]
         self.note_ran(f.at);
         match f.arg(6) {
@@ -1166,7 +1208,7 @@ impl<H: Host> Interpreter<H> {
     fn end_block(&mut self) -> Result<()> {
         let Some(Frame::Block {
             kind, end, pred, ..
-        }) = self.frames.pop()
+        }) = self.pop_frame()
         else {
             return err(ErrorKind::Grammar);
         };
@@ -1283,7 +1325,7 @@ impl<H: Host> Interpreter<H> {
                     pred,
                     ..
                 }) => {
-                    self.frames.pop();
+                    self.pop_frame();
                     if again {
                         return self.repeat_while(end, pred);
                     }
@@ -1294,7 +1336,7 @@ impl<H: Host> Interpreter<H> {
                     kind: BlockKind::If | BlockKind::Else,
                     ..
                 }) if self.frames.len() > self.base => {
-                    self.frames.pop();
+                    self.pop_frame();
                 }
                 _ => return err(ErrorKind::NotInLoop),
             }
@@ -1381,7 +1423,7 @@ impl<H: Host> Interpreter<H> {
     /// Returns from the innermost method with `v` (a copy is made by `Return`).
     pub(crate) fn finish_call(&mut self, v: Val) -> Result<()> {
         loop {
-            match self.frames.pop() {
+            match self.pop_frame() {
                 Some(Frame::Call) => break,
                 Some(_) => {}
                 None => return err(ErrorKind::Grammar),
