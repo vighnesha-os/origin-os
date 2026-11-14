@@ -315,8 +315,13 @@ impl<H: Host> Interpreter<H> {
                 Ok(index)
             }
             Err(e) => {
+                // The table's identity stays; its bytes go (the review of B1, F7). Its methods
+                // already fail `TableFailed`, and a name kept in a package pointing into it now
+                // fails `Truncated`.
                 if let Some(t) = self.tables.get_mut(us(index)) {
                     t.failed = true;
+                    let aml = core::mem::take(&mut t.aml);
+                    mem::release(aml, &mut self.budget);
                 }
                 self.abort(base);
                 self.end_evaluation();
