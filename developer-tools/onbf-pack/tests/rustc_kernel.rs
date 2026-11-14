@@ -567,3 +567,248 @@ fn command_line() {
         .collect();
     assert!(leftovers.is_empty());
 }
+
+// ------------------------------------------------- the binary's key files (ADR-0011 Am. 4, T1)
+
+/// Runs the binary with `args` and returns its exit code, standard output and standard error.
+fn run(args: &[&std::ffi::OsStr]) -> (Option<i32>, String, String) {
+    let out = onbf_pack().args(args).output().unwrap();
+    (
+        out.status.code(),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+/// `keygen` into `dir`, under the names `<name>.key`, `<name>.ed25519` and `<name>.mldsa87`.
+fn keygen(dir: &Path, name: &str, seed: Option<&str>) -> (Option<i32>, String, String) {
+    let paths = [
+        dir.join(format!("{name}.key")),
+        dir.join(format!("{name}.ed25519")),
+        dir.join(format!("{name}.mldsa87")),
+    ];
+    keygen_at(&paths, seed)
+}
+
+fn keygen_at(paths: &[PathBuf; 3], seed: Option<&str>) -> (Option<i32>, String, String) {
+    let mut args: Vec<&std::ffi::OsStr> = vec![
+        "keygen".as_ref(),
+        "--key".as_ref(),
+        paths[0].as_os_str(),
+        "--public-ed25519".as_ref(),
+        paths[1].as_os_str(),
+        "--public-mldsa".as_ref(),
+        paths[2].as_os_str(),
+    ];
+    if let Some(seed) = seed {
+        args.extend([
+            std::ffi::OsStr::new("--insecure-test-seed"),
+            std::ffi::OsStr::new(seed),
+        ]);
+    }
+    run(&args)
+}
+
+/// `sign` of `input` with the key file `key`, into `output`.
+fn sign_with(input: &Path, key: &Path, output: &Path) -> (Option<i32>, String, String) {
+    run(&[
+        "sign".as_ref(),
+        "--input".as_ref(),
+        input.as_os_str(),
+        "--output".as_ref(),
+        output.as_os_str(),
+        "--key".as_ref(),
+        key.as_os_str(),
+        "--signing-time".as_ref(),
+        "1794000000".as_ref(),
+    ])
+}
+
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// The key files are the command line's (ADR-0011 Amendment 4, T1): it writes them, mode 0600
+/// for the private key and 0644 for the public ones, never over an existing path and all or
+/// none; it reads a key file only if it is no symbolic link, a regular file and owner-only (no
+/// group or other permission bit); and
+/// what it signs with such a key verifies under the public keys it wrote. These are the file
+/// tests that `HostKey::load` and `generate_keys` had in the library before T1
+/// (`src/tests/sign.rs`), run through the binary.
+#[test]
+fn command_line_keys() {
+    use onbf_format::signature::Role;
+    use onbf_verify::{PublicKey, TrustedKey, key_id, verify_krn_block};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("cli-keys");
+    let elf = compile(&dir, "kernel", KERNEL_LINK_FLAGS);
+    let unsigned = dir.0.join("kernel.onbf");
+    fs::write(
+        &unsigned,
+        krn::pack(&elf, &options(toolchain_of(&pinned_rustc())))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+
+    // A fresh key from the system's generator: the modes, and an end-to-end signature that
+    // verifies under the public keys the command wrote.
+    let (code, stdout, stderr) = keygen(&dir.0, "fresh", None);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.starts_with("onbf-pack: wrote key pair: key ID "),
+        "{stdout}"
+    );
+    let key = dir.0.join("fresh.key");
+    assert_eq!(fs::read(&key).unwrap().len(), 104);
+    assert_eq!(&fs::read(&key).unwrap()[..8], b"ONBFKEY1");
+    assert_eq!(mode(&key), 0o600);
+    assert_eq!(mode(&dir.0.join("fresh.ed25519")), 0o644);
+    assert_eq!(mode(&dir.0.join("fresh.mldsa87")), 0o644);
+    let ed25519: [u8; 32] = fs::read(dir.0.join("fresh.ed25519"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let mldsa = fs::read(dir.0.join("fresh.mldsa87")).unwrap();
+    let public = PublicKey {
+        ed25519: &ed25519,
+        mldsa: &mldsa,
+    };
+    let id: String = key_id(&public).iter().map(|b| format!("{b:02x}")).collect();
+    assert!(stdout.ends_with(&format!("key ID {id}\n")), "{stdout}");
+    let signed = dir.0.join("signed.onbf");
+    let (code, stdout, stderr) = sign_with(&unsigned, &key, &signed);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.starts_with("onbf-pack: signed KRN ")
+            && stdout.contains(" in the role origin-kernel, key ID ")
+            && !stdout.contains("TEST KEY"),
+        "{stdout}"
+    );
+    let bytes = fs::read(&signed).unwrap();
+    let image = Image::parse(&bytes, ParseOptions::default()).unwrap();
+    let store = [TrustedKey {
+        role: Role::Kernel,
+        key: public,
+    }];
+    assert_eq!(
+        verify_krn_block(
+            image.signature_block().unwrap(),
+            &store,
+            &image.header().content_digest
+        ),
+        Ok(key_id(&store[0].key))
+    );
+
+    // A test seed: the key file says so, and its public halves are the ones committed in
+    // `boot/uefi/trust` (from `test_keys_come_from_their_seed_only`).
+    let label = "TEST-ONLY origin-kernel key 1: the test trust store holds it";
+    let (code, stdout, stderr) = keygen(&dir.0, "trusted", Some(label));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.starts_with("onbf-pack: wrote key pair (TEST KEY): key ID "),
+        "{stdout}"
+    );
+    let committed = manifest_dir().join("../../boot/uefi/trust");
+    for (written, name) in [
+        ("trusted.ed25519", "TEST-ONLY-origin-kernel.ed25519"),
+        ("trusted.mldsa87", "TEST-ONLY-origin-kernel.mldsa87"),
+    ] {
+        assert_eq!(
+            fs::read(dir.0.join(written)).unwrap(),
+            fs::read(committed.join(name)).unwrap()
+        );
+    }
+    let test_key = dir.0.join("trusted.key");
+    assert_eq!(&fs::read(&test_key).unwrap()[..8], b"ONBFTKEY");
+    assert_eq!(mode(&test_key), 0o600);
+    let (code, stdout, stderr) = sign_with(&unsigned, &test_key, &dir.0.join("test.onbf"));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains(" with a TEST KEY, key ID "), "{stdout}");
+
+    // keygen never overwrites anything (from `keygen_refuses_to_overwrite_anything`): an
+    // existing file in each of the three positions is left alone, and nothing new is left.
+    let existing = fs::read(&key).unwrap();
+    for position in 0..3 {
+        let mut paths = [
+            dir.0.join("new.key"),
+            dir.0.join("new.ed25519"),
+            dir.0.join("new.mldsa87"),
+        ];
+        paths[position] = key.clone();
+        let (code, _, stderr) = keygen_at(&paths, None);
+        assert_eq!(code, Some(1), "position {position}");
+        assert!(
+            stderr.contains(&format!("{} already exists", key.display())),
+            "{stderr}"
+        );
+        assert_eq!(fs::read(&key).unwrap(), existing);
+        for path in &paths {
+            assert!(*path == key || !path.exists(), "{}", path.display());
+        }
+    }
+    // The same new path twice: the second write is refused and the first removed, so the
+    // private key can never be replaced by a public key.
+    let same = dir.0.join("same.key");
+    let (code, _, stderr) = keygen_at(
+        &[same.clone(), same.clone(), dir.0.join("same.mldsa87")],
+        None,
+    );
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("already exists"), "{stderr}");
+    assert!(!same.exists() && !dir.0.join("same.mldsa87").exists());
+
+    // The key file's refusals as a file (from `a_damaged_or_foreign_key_file_is_refused` and
+    // `a_symbolic_link_to_a_key_file_is_refused`). Nothing is written for any of them.
+    let out = dir.0.join("refused.onbf");
+    let refused = |key: &Path, why: &str| {
+        let (code, stdout, stderr) = sign_with(&unsigned, key, &out);
+        assert_eq!(code, Some(1), "{why}: {stdout}");
+        assert!(stderr.contains(why), "{why}: {stderr}");
+        assert!(!out.exists(), "{why}");
+    };
+    // Missing.
+    refused(&dir.0.join("missing.key"), "cannot read");
+    // A symbolic link, even to a key file that is accepted itself: opened with O_NOFOLLOW.
+    let link = dir.0.join("link.key");
+    std::os::unix::fs::symlink(&key, &link).unwrap();
+    refused(&link, "cannot read");
+    // Not a regular file.
+    refused(&dir.0, "not a regular file");
+    // Readable by others.
+    let open = dir.0.join("open.key");
+    fs::copy(&key, &open).unwrap();
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o644)).unwrap();
+    refused(
+        &open,
+        "a key file must be readable or writable by its owner only (for example 0600)",
+    );
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o640)).unwrap();
+    refused(
+        &open,
+        "a key file must be readable or writable by its owner only (for example 0600)",
+    );
+    // Its bytes, refused by the library, named with the file.
+    let damaged = dir.0.join("damaged.key");
+    let mut bytes = existing.clone();
+    bytes[30] ^= 1;
+    fs::write(&damaged, &bytes).unwrap();
+    fs::set_permissions(&damaged, fs::Permissions::from_mode(0o600)).unwrap();
+    refused(
+        &damaged,
+        &format!(
+            "{}: damaged: its keys do not match its key ID",
+            damaged.display()
+        ),
+    );
+    // The output may not be the key file: signing replaces the output through a rename.
+    let (code, _, stderr) = sign_with(&unsigned, &key, &key);
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("is the key file"), "{stderr}");
+    assert_eq!(fs::read(&key).unwrap(), existing);
+    // The key file itself still loads.
+    let (code, _, stderr) = sign_with(&unsigned, &key, &out);
+    assert_eq!(code, Some(0), "{stderr}");
+}

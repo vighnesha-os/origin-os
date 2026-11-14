@@ -1,8 +1,8 @@
 //! The userspace build of CLAUDE.md §11, `origin.core`, and the programs the kernel carries
 //! (task S4-1, TASKS item 41, and task S4-2, TASKS item 47; ADR-0011 Amendment 2, L1 to L6).
 //!
-//! - [`generate`] writes the code for `origin.kernel` (`oidl generate`, full mode) under the
-//!   target directory: the client and its imports for `runtime/kernel-client` to include, and
+//! - [`generate`] writes the code for `origin.kernel` (the `oidl` library's full output, what
+//!   `oidl generate` writes with no mode) under the target directory: the client and its imports for `runtime/kernel-client` to include, and
 //!   the stubs, with the list of what they export, for `runtime/core`. Nothing generated is
 //!   committed, so no committed crate holds a shim.
 //! - Every ring-3 build names `--target x86_64-unknown-linux-gnu` and passes
@@ -24,12 +24,20 @@
 //!
 //! Generated files are rewritten only when their bytes change, so a build that changed nothing
 //! leaves the stubs crate and the kernel as they were.
+//!
+//! The generator and the describing run in process, through the `oidl` and `onbf-pack`
+//! libraries (ADR-0011 Amendment 4, T1): `xtask` starts no first-party program. What each
+//! wrote and printed as a program is what it writes and prints here.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{OIDL_PACKAGE, PACK_PACKAGE, Result, cargo, read_file, run_step, target_dir};
+use oidl::codegen::{self, Output};
+use onbf_pack::{carried, corelib};
+
+use crate::{Result, cargo, read_file, run_step, target_dir};
 
 /// The triple Origin's userspace uses as a code generator only (§11).
 pub(crate) const USERSPACE_TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -177,19 +185,26 @@ fn one_interface(files: &[PathBuf]) -> Result {
     ))
 }
 
-/// Copies every file under `from` into `to` that is not already there with the same bytes, and
-/// removes every file under `to` that `from` does not hold, but for those named in `keep`.
-fn mirror(from: &Path, to: &Path, keep: &[&str]) -> Result {
-    let wanted = files_under(from)?;
+/// Writes into `to` every generated file under `prefix` that is not already there with the same
+/// bytes, and removes every file under `to` that the generator did not write there, but for
+/// those named in `keep`.
+fn mirror(files: &[codegen::Generated], prefix: &str, to: &Path, keep: &[&str]) -> Result {
+    let wanted: Vec<(PathBuf, &str)> = files
+        .iter()
+        .filter_map(|file| {
+            let relative = file.path.strip_prefix(prefix)?;
+            Some((PathBuf::from(relative), file.text.as_str()))
+        })
+        .collect();
     if wanted.is_empty() {
         return Err(format!(
-            "oidl wrote nothing under {}: nothing to build",
-            from.display()
+            "oidl generated nothing under {prefix}: nothing to build"
         ));
     }
-    for relative in &wanted {
-        write_if_changed(&to.join(relative), &read_file(&from.join(relative))?)?;
+    for (relative, text) in &wanted {
+        write_if_changed(&to.join(relative), text.as_bytes())?;
     }
+    let wanted: Vec<PathBuf> = wanted.into_iter().map(|(relative, _)| relative).collect();
     for relative in files_under(to)? {
         if !keep.iter().any(|kept| relative == Path::new(kept)) && !wanted.contains(&relative) {
             let gone = to.join(&relative);
@@ -199,33 +214,19 @@ fn mirror(from: &Path, to: &Path, keep: &[&str]) -> Result {
     Ok(())
 }
 
-/// Generates `origin.kernel`'s code into a scratch directory, copies each file that changed
-/// into place, and writes the `modules.rs` that `runtime/kernel-client` includes. Returns where
-/// the client's tree and the stubs' tree are.
+/// Generates `origin.kernel`'s code in memory, writes each file that changed into place, and
+/// writes the `modules.rs` that `runtime/kernel-client` includes. Returns where the client's
+/// tree and the stubs' tree are.
 pub(crate) fn generate(target: Option<&Path>) -> Result<Generated> {
-    let staging = ring3_dir(target).join("oidl-staging");
-    if staging.exists() {
-        fs::remove_dir_all(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
-    }
-    let mut oidl = cargo();
-    oidl.args([
-        "run",
-        "--quiet",
-        "--package",
-        OIDL_PACKAGE,
-        "--",
-        "generate",
-    ])
-    .arg("--out")
-    .arg(&staging)
-    .args(["--versions", "origin-version.toml", KERNEL_DEFINITION]);
-    run_step(&mut oidl)?;
+    let compilation = crate::interfaces::compile(&[KERNEL_DEFINITION])?;
+    let files = codegen::generate_output(&compilation, &Output::Everything)
+        .map_err(|e| format!("oidl generate: {e}"))?;
     let generated = Generated {
         client: ring3_dir(target).join("oidl"),
         core: ring3_dir(target).join("oidl-core"),
     };
-    mirror(&staging.join("rust"), &generated.client, &["modules.rs"])?;
-    mirror(&staging.join("core"), &generated.core, &[])?;
+    mirror(&files, "rust/", &generated.client, &["modules.rs"])?;
+    mirror(&files, "core/", &generated.core, &[])?;
     one_interface(&files_under(&generated.core)?)?;
     for needed in [generated.exports(), generated.stubs()] {
         if !needed.is_file() {
@@ -330,24 +331,7 @@ fn origin_core(generated: &Generated, target: Option<&Path>) -> Result {
             linked.display()
         ));
     }
-    let mut describe = cargo();
-    describe
-        .args([
-            "run",
-            "--quiet",
-            "--release",
-            "--package",
-            PACK_PACKAGE,
-            "--",
-        ])
-        .args(["corelib", "--variable", CARRIED_ENV])
-        .arg("--input")
-        .arg(&linked)
-        .arg("--exports")
-        .arg(generated.exports())
-        .arg("--out")
-        .arg(carried_dir(target));
-    run_step(&mut describe)?;
+    describe_core(&linked, &generated.exports(), &carried_dir(target))?;
     // Where each program's link looks for it: see [`CORE_LINK`].
     write_if_changed(&crate::repo_root().join(CORE_LINK), &read_file(&linked)?)
 }
@@ -392,26 +376,102 @@ pub(crate) fn programs(target: Option<&Path>) -> Result<PathBuf> {
                 elf.display()
             ));
         }
-        let mut describe = cargo();
-        describe
-            .args([
-                "run",
-                "--quiet",
-                "--release",
-                "--package",
-                PACK_PACKAGE,
-                "--",
-            ])
-            .args(["carried", "--name", program.name, "--variable", CARRIED_ENV])
-            .arg("--input")
-            .arg(&elf)
-            .arg("--core-exports")
-            .arg(generated.exports())
-            .arg("--out")
-            .arg(&out);
-        run_step(&mut describe)?;
+        describe_program(&elf, program.name, &generated.exports(), &out)?;
     }
     Ok(out)
+}
+
+/// The generator's list of `origin.core`'s exports, read from `path`. `onbf-pack`'s command line
+/// has the same function: keep the two in step (finding F10).
+fn read_listing(path: &Path) -> Result<corelib::Listing> {
+    let list = String::from_utf8(read_file(path)?)
+        .map_err(|_| format!("onbf-pack: {} is not UTF-8", path.display()))?;
+    corelib::Listing::parse(&list).map_err(|e| format!("onbf-pack: {}: {e}", path.display()))
+}
+
+/// Writes `files`, a description of `name` that begins with `first_line`, into `out`, and
+/// removes what an earlier description left that this one does not have: what
+/// `onbf_pack::carried::update` says, from the files it owns read here (S4-1's review, finding
+/// F9: only this tool's own files of `name` may go). Returns how many files were written.
+///
+/// `onbf-pack`'s command line has the same function (`developer-tools/onbf-pack/src/main.rs`,
+/// `write_description`), and so the same host part: keep the two in step (the review of
+/// 2026-11-14, finding F10).
+fn write_description(
+    out: &Path,
+    name: &str,
+    first_line: &str,
+    files: &[carried::File],
+) -> Result<usize> {
+    fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    // Only the files the description owns are read (`carried::owned`); one that cannot be read
+    // is an error before anything is written (the review of 2026-11-14, finding F7).
+    let mut present = BTreeMap::new();
+    for entry in fs::read_dir(out).map_err(|e| format!("{}: {e}", out.display()))? {
+        let entry = entry.map_err(|e| format!("{}: {e}", out.display()))?;
+        // A name that is not UTF-8 is not one the description writes.
+        let Ok(file) = entry.file_name().into_string() else {
+            continue;
+        };
+        if carried::owned(name, files, &file) {
+            present.insert(file, read_file(&entry.path())?);
+        }
+    }
+    let update = carried::update(name, first_line, files, &present)
+        .map_err(|e| format!("onbf-pack: {}: {e}", out.display()))?;
+    for (file, bytes) in &update.write {
+        crate::write_atomically(&out.join(file), bytes)?;
+    }
+    for file in &update.remove {
+        let gone = out.join(file);
+        fs::remove_file(&gone).map_err(|e| format!("{}: {e}", gone.display()))?;
+    }
+    Ok(update.write.len())
+}
+
+/// Describes `origin.core`, linked at `linked`, against the generator's list of its exports, into
+/// `out`, in process: what `onbf-pack corelib --variable ORIGIN_CARRIED_PROGRAMS` did.
+fn describe_core(linked: &Path, exports: &Path, out: &Path) -> Result {
+    let listing = read_listing(exports)?;
+    let core = corelib::describe(&read_file(linked)?, &listing)
+        .map_err(|e| format!("onbf-pack: {}: {e}", linked.display()))?;
+    let files = core
+        .rust(CARRIED_ENV)
+        .map_err(|e| format!("onbf-pack: {e}"))?;
+    let written = write_description(out, corelib::NAME, &corelib::generated_line(), &files)?;
+    println!(
+        "onbf-pack: described {} in {}: {} bytes of code in {} pages, {} exports, one `syscall` each, {} files ({written} written)",
+        corelib::LIBRARY,
+        out.display(),
+        core.code.len(),
+        core.span / 4096,
+        core.exports.len(),
+        files.len()
+    );
+    Ok(())
+}
+
+/// Describes the program `name`, linked at `elf` against `origin.core`, into `out`, in process:
+/// what `onbf-pack carried --name <name> --variable ORIGIN_CARRIED_PROGRAMS --core-exports
+/// <exports>` did.
+fn describe_program(elf: &Path, name: &str, exports: &Path, out: &Path) -> Result {
+    let bytes = read_file(elf)?;
+    let listing = read_listing(exports)?;
+    let carried = carried::describe_program(&bytes, Some(&listing))
+        .map_err(|e| format!("onbf-pack: {}: {e}", elf.display()))?;
+    let files = carried
+        .rust(name, CARRIED_ENV)
+        .map_err(|e| format!("onbf-pack: {e}"))?;
+    let written = write_description(out, name, &carried::generated_line(name), &files)?;
+    println!(
+        "onbf-pack: described {name} in {}: {} segments, {} relocations, {} imports, {} files ({written} written)",
+        out.display(),
+        carried.segments.len(),
+        carried.relocations.len(),
+        carried.imports.len(),
+        files.len()
+    );
+    Ok(())
 }
 
 /// Gives `command`, a build or clippy of the kernel for its own target, the carried programs:

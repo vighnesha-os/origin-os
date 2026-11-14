@@ -12,6 +12,7 @@ mod costs;
 mod disk;
 mod documents;
 mod expected_warning;
+mod host_tools;
 mod image;
 mod image_inputs;
 mod interfaces;
@@ -103,6 +104,15 @@ commands:
               branch's history, outside a short allowlist (part of check; quick)
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
+  host-tools-gate only the gate on the host tools (ADR-0011 Amendment 4, T1): xtask starts no
+              first-party program, by name, by `cargo run` or by a Cargo alias that runs
+              one, but those decision items 300 and 310 allow (itself for boot-matrix's
+              scenarios, each also run alone, and the command a person gives exclusive),
+              and a test starting the program it tests; the libraries of
+              onbf-pack, onbf-sign and oidl reach nothing of the host by the forms it
+              reads and depend only on the crates it lists; their command lines name no
+              crate but their library and std; with planted negative controls (part of
+              check; quick)
   requirements-gate only the gate on the requirements matrix under docs/requirements/: a row
               for every statement of CLAUDE.md and every decision of an accepted ADR, each
               true to the tree; prints the coverage figure (part of check; CLAUDE.md §1;
@@ -3007,6 +3017,7 @@ fn main() -> ExitCode {
         ["document-gate"] => documents::gate(),
         ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
+        ["host-tools-gate"] => host_tools::gate(),
         ["requirements-gate"] => requirements::gate(),
         ["provenance-gate"] => provenance::gate(),
         ["roadmap-gate"] => roadmap::gate(),
@@ -3930,6 +3941,9 @@ fn check() -> Result {
     // Who may make a proof process, and which ring-3 files may name the call numbers.
     listed_names::gate()?;
     interfaces::gate()?;
+    // The host tools are libraries first: xtask starts none of them, and they reach nothing of
+    // the host (ADR-0011 Amendment 4, T1).
+    host_tools::gate()?;
     image_inputs::version_gate()?;
     image_inputs::graph_gate()?;
     manifest_version_lint()?;
@@ -4783,8 +4797,8 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
-/// Converts the kernel ELF into the KRN image with `onbf-pack`, which verifies its output
-/// before writing it.
+/// Converts the kernel ELF into the KRN image with `onbf-pack`'s library, which verifies its
+/// output before returning it.
 fn pack_kernel(elf: &Path) -> Result<PathBuf> {
     pack_kernel_to(elf, &target_dir().join("xtask").join(KERNEL_IMAGE))
 }
@@ -4792,29 +4806,67 @@ fn pack_kernel(elf: &Path) -> Result<PathBuf> {
 /// The file name of the converted kernel, under a target directory's `xtask/`.
 const KERNEL_IMAGE: &str = "KERNEL.ONBF";
 
-/// [`pack_kernel`] into `out`: the one command that makes the image the loader starts, for
-/// the boots and for the reproducible-build gate alike.
+/// [`pack_kernel`] into `out`: the one function that makes the image the loader starts, for
+/// the boots and for the reproducible-build gate alike. It calls `onbf_pack::krn::pack` in
+/// process, with what `onbf-pack krn --input <elf> --output <out>` used: no CPU features beyond
+/// the baseline, no flags, and the toolchain `rustc -vV` reports from the repository's root
+/// (ADR-0011 Amendment 4, T1). The image is written through a rename, so it is never partial.
 fn pack_kernel_to(elf: &Path, out: &Path) -> Result<PathBuf> {
     if let Some(dir) = out.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    let (Some(input), Some(output)) = (elf.to_str(), out.to_str()) else {
-        return Err("kernel paths are not UTF-8".into());
-    };
-    run_step(cargo().args([
-        "run",
-        "--quiet",
-        "--release",
-        "--package",
-        PACK_PACKAGE,
-        "--",
-        "krn",
-        "--input",
-        input,
-        "--output",
-        output,
-    ]))?;
+    let packed = onbf_pack::krn::pack(
+        &read_file(elf)?,
+        &onbf_pack::KrnOptions {
+            cpu_features: 0,
+            flags: String::new(),
+            toolchain: toolchain::toolchain()?.krn.clone(),
+        },
+    )
+    .map_err(|e| format!("onbf-pack: {}: {e}", elf.display()))?;
+    write_atomically(out, &packed.bytes)?;
+    println!(
+        "onbf-pack: wrote KRN {}: {} sections, {} segments, {} relocations, {} bytes",
+        out.display(),
+        packed.sections,
+        packed.segments,
+        packed.relocations,
+        packed.bytes.len()
+    );
     Ok(out.to_path_buf())
+}
+
+/// Writes `bytes` to a temporary file beside `path`, syncs it and renames it into place, so that
+/// `path` never holds a partial file. The temporary file is made new (`create_new`): a stale one
+/// of this name is removed first, and a link planted at its name is removed, never followed (the
+/// review of 2026-11-14, finding F9).
+///
+/// `onbf-pack`'s command line has the same function (`developer-tools/onbf-pack/src/main.rs`,
+/// `write_atomically`), as it has `OsRandom`: keep the two in step (finding F10).
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result {
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{}: no file name", path.display()))?;
+    let mut temporary = std::ffi::OsString::from(".");
+    temporary.push(name);
+    temporary.push(format!(".xtask-{}.tmp", std::process::id()));
+    let temporary = path.with_file_name(temporary);
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", temporary.display())),
+    }
+    let written = fs::File::create_new(&temporary)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temporary, path));
+    if let Err(e) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    Ok(())
 }
 
 /// A copy of `krn` with one byte flipped in the middle of the first SEGMENT's content.
@@ -4838,62 +4890,30 @@ fn tampered(krn: &[u8]) -> Result<Vec<u8>> {
 
 // ------------------------------------------------------------------ signing, for the boot tests
 
-/// The text the test keys are derived from (`onbf-pack keygen --insecure-test-seed`). This is
-/// the only "private" input they have, and it is public, so they are test keys by
-/// construction and must never sign anything real (CLAUDE.md §59).
+/// The text the test keys are derived from (`onbf_pack::HostKey::from_test_seed`, the key
+/// `onbf-pack keygen --insecure-test-seed` derives). This is the only "private" input they have,
+/// and it is public, so they are test keys by construction and must never sign anything real
+/// (CLAUDE.md §59).
 const TEST_KEY_TRUSTED: &str = "TEST-ONLY origin-kernel key 1: the test trust store holds it";
 const TEST_KEY_UNTRUSTED: &str = "TEST-ONLY origin-kernel key 2: no trust store holds it";
 /// The test statements' claimed signing time. Informational (ONBF §7.6), and fixed: a build
 /// reads no clock (ONBF-R9).
 const TEST_SIGNING_TIME: &str = "1794000000";
 
-/// A test key's files, under `target/xtask/test-keys/` (never in the repository).
-struct TestKey {
-    key: PathBuf,
-    public_ed25519: PathBuf,
-    public_mldsa: PathBuf,
-}
+/// The operating system's random number generator, which `onbf_pack` signs with: ML-DSA's
+/// hedge comes from the caller (ADR-0011 Amendment 4, T1). A failure stops the signing.
+/// `onbf-pack`'s command line has the same `OsRandom`: keep the two in step (the review of
+/// 2026-11-14, finding F10).
+struct OsRandom;
 
-/// Runs `onbf-pack` with these arguments.
-fn onbf_pack(args: &[&std::ffi::OsStr]) -> Result {
-    run_step(
-        cargo()
-            .args([
-                "run",
-                "--quiet",
-                "--release",
-                "--package",
-                PACK_PACKAGE,
-                "--",
-            ])
-            .args(args),
-    )
-}
-
-/// Creates the test key derived from `seed` in a fresh directory `name`.
-fn make_test_key(name: &str, seed: &str) -> Result<TestKey> {
-    let dir = target_dir().join("xtask").join("test-keys").join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+impl onbf_pack::Random for OsRandom {
+    fn fill(&mut self, out: &mut [u8]) -> std::result::Result<(), onbf_pack::RandomError> {
+        fs::File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(out))
+            .map_err(|e| {
+                onbf_pack::RandomError(format!("the system random number generator failed: {e}"))
+            })
     }
-    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let key = TestKey {
-        key: dir.join("origin-kernel.key"),
-        public_ed25519: dir.join("ed25519.pub"),
-        public_mldsa: dir.join("mldsa87.pub"),
-    };
-    onbf_pack(&[
-        "keygen".as_ref(),
-        "--insecure-test-seed".as_ref(),
-        seed.as_ref(),
-        "--key".as_ref(),
-        key.key.as_os_str(),
-        "--public-ed25519".as_ref(),
-        key.public_ed25519.as_os_str(),
-        "--public-mldsa".as_ref(),
-        key.public_mldsa.as_os_str(),
-    ])?;
-    Ok(key)
 }
 
 /// `path`'s contents, or an error naming it.
@@ -4901,18 +4921,21 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Derives the two test keys, and checks that the trusted one is the public key the loader
-/// has compiled in: a stale copy in `boot/uefi/trust` would otherwise show up as a boot
-/// failure with no explanation.
-fn test_keys() -> Result<(TestKey, TestKey)> {
-    let trusted = make_test_key("trusted", TEST_KEY_TRUSTED)?;
-    let untrusted = make_test_key("untrusted", TEST_KEY_UNTRUSTED)?;
+/// The two test keys, derived in memory from their public text (`onbf_pack::sign`, as
+/// `onbf-pack keygen --insecure-test-seed` derives them), and a check that the trusted one is
+/// the public key the loader has compiled in: a stale copy in `boot/uefi/trust` would otherwise
+/// show up as a boot failure with no explanation. No key file is written.
+fn test_keys() -> Result<(onbf_pack::HostKey, onbf_pack::HostKey)> {
+    use onbf_pack::Signer as _;
+    let trusted = onbf_pack::HostKey::from_test_seed(TEST_KEY_TRUSTED, Box::new(OsRandom));
+    let untrusted = onbf_pack::HostKey::from_test_seed(TEST_KEY_UNTRUSTED, Box::new(OsRandom));
     let committed = repo_root().join("boot").join("uefi").join("trust");
-    for (name, generated) in [
-        ("TEST-ONLY-origin-kernel.ed25519", &trusted.public_ed25519),
-        ("TEST-ONLY-origin-kernel.mldsa87", &trusted.public_mldsa),
+    let public = trusted.public_keys();
+    for (name, derived) in [
+        ("TEST-ONLY-origin-kernel.ed25519", &public.ed25519[..]),
+        ("TEST-ONLY-origin-kernel.mldsa87", &public.mldsa87[..]),
     ] {
-        if read_file(&committed.join(name))? != read_file(generated)? {
+        if read_file(&committed.join(name))? != derived {
             return Err(format!(
                 "boot/uefi/trust/{name} is not the public half of the test key derived from \
                  {TEST_KEY_TRUSTED:?}; regenerate it with `onbf-pack keygen`, as \
@@ -4923,22 +4946,36 @@ fn test_keys() -> Result<(TestKey, TestKey)> {
     Ok((trusted, untrusted))
 }
 
-/// Signs the unsigned KRN image `input` with `key`, into `target/xtask/<output>`, and returns
-/// the signed bytes.
-fn sign_kernel(input: &Path, key: &TestKey, output: &str) -> Result<Vec<u8>> {
+/// Signs the unsigned KRN image `input` with `key` in process (`onbf_pack::sign::sign_krn`,
+/// which checks the result with the loader's code), writes it to `target/xtask/<output>`, and
+/// returns the signed bytes.
+fn sign_kernel(input: &Path, key: &onbf_pack::HostKey, output: &str) -> Result<Vec<u8>> {
+    use onbf_pack::Signer as _;
     let out = target_dir().join("xtask").join(output);
-    onbf_pack(&[
-        "sign".as_ref(),
-        "--input".as_ref(),
-        input.as_os_str(),
-        "--output".as_ref(),
-        out.as_os_str(),
-        "--key".as_ref(),
-        key.key.as_os_str(),
-        "--signing-time".as_ref(),
-        TEST_SIGNING_TIME.as_ref(),
-    ])?;
-    read_file(&out)
+    let signing_time = TEST_SIGNING_TIME
+        .parse()
+        .map_err(|_| format!("the test signing time {TEST_SIGNING_TIME:?} is not a number"))?;
+    let signed = onbf_pack::sign::sign_krn(
+        &read_file(input)?,
+        key,
+        &onbf_pack::SignOptions {
+            claimed_signing_time: signing_time,
+        },
+    )
+    .map_err(|e| format!("onbf-pack: signing {}: {e}", input.display()))?;
+    write_atomically(&out, &signed)?;
+    println!(
+        "onbf-pack: signed KRN {} in the role origin-kernel{}, key ID {}: {} bytes",
+        out.display(),
+        if key.is_test_key() {
+            " with a TEST KEY"
+        } else {
+            ""
+        },
+        onbf_pack::sign::hex(&key.public_keys().key_id()),
+        signed.len()
+    );
+    Ok(signed)
 }
 
 /// Where a part of a signed image lies in it.
@@ -5953,6 +5990,33 @@ mod gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The temporary file `write_atomically` writes is made new: a link planted at its name is
+    /// removed, never followed, and a stale file there is replaced (the review of 2026-11-14,
+    /// finding F9). `onbf-pack`'s command line has the same test.
+    #[test]
+    fn writing_atomically_follows_no_link_at_the_temporary_name() {
+        let dir = target_dir()
+            .join("xtask")
+            .join("gate-tests")
+            .join("write-atomically");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let outside = dir.join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        let path = dir.join("out.bin");
+        let temporary = dir.join(format!(".out.bin.xtask-{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&outside, &temporary).unwrap();
+        write_atomically(&path, b"image").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"image");
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        assert!(fs::symlink_metadata(&temporary).is_err());
+        fs::write(&temporary, b"stale").unwrap();
+        write_atomically(&path, b"again").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"again");
+        assert!(fs::symlink_metadata(&temporary).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// TASKS item 40's review, M2: the kernel writes into a planted reserved page only where it
     /// finds the fill the TEST ONLY application puts there, so the two copies must agree.
