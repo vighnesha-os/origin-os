@@ -883,6 +883,37 @@ fn an_adr_that_reads_its_own_region_is_refused_not_recursed() {
         assert_eq!(fails(&mut i, "RD"), ErrorKind::AddressCycle);
         assert_eq!(fails(&mut i, "\\_SB.PCI0.D1.F1"), ErrorKind::AddressCycle);
         assert!(i.host().seen.is_empty(), "nothing reached the host");
+        assert_eq!(i.resolving, 0);
+    });
+    // The review of B2's Addendum 2, N2-1: an `_ADR` that is itself a field of the region it
+    // names. The walk's own step is put back to find that region's function, and must meet the
+    // walk already under way: `AddressCycle`, not a walk pushed again each round until a limit.
+    on_small_stack(|| {
+        let mut i = super::interp_with(IntegerWidth::Bits64, Limits::BOOT_PROOF);
+        load(
+            &mut i,
+            &[scope(
+                "\\_SB",
+                &[device(
+                    "PCI0",
+                    &[
+                        name("_HID", dword(0x080A_D041)),
+                        name("_BBN", zero()),
+                        device(
+                            "D1",
+                            &[
+                                op_region("R1", 2, zero(), byte(8)),
+                                field("R1", DWORD, &[Fe::Named("_ADR", 32), Fe::Named("F1", 8)]),
+                            ],
+                        ),
+                    ],
+                )],
+            )],
+        )
+        .expect("the block loads");
+        assert_eq!(fails(&mut i, "\\_SB.PCI0.D1.F1"), ErrorKind::AddressCycle);
+        assert!(i.host().seen.is_empty(), "nothing reached the host");
+        assert_eq!(i.resolving, 0);
     });
 }
 

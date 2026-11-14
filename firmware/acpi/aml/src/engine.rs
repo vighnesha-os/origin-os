@@ -551,8 +551,16 @@ impl<H: Host> Interpreter<H> {
         };
         // Room for both first, so that the two stacks never differ in length.
         mem::reserve(&mut self.ctx, 1, &mut self.budget)?;
+        let resolve = matches!(f, Frame::Resolve(_));
         mem::push(&mut self.frames, f, &mut self.budget)?;
-        mem::push(&mut self.ctx, here, &mut self.budget)
+        mem::push(&mut self.ctx, here, &mut self.budget)?;
+        // Counted where every frame is pushed, a step put back with a `Resolve` on top among
+        // them, as `pop_frame` and `truncate_frames` count them out (the review of B2's Addendum
+        // 2, N2-1).
+        if resolve {
+            self.resolving = self.resolving.saturating_add(1);
+        }
+        Ok(())
     }
 
     /// Pops the top frame, with what it saw.

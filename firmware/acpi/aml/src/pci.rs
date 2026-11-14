@@ -185,9 +185,7 @@ impl<H: Host> Interpreter<H> {
             segment: 0,
             bus: 0,
             got: None,
-        }))?;
-        self.resolving = self.resolving.saturating_add(1);
-        Ok(())
+        }))
     }
 
     /// Pops a finished walk (`pop_frame` counts it out).
