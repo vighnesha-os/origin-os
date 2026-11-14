@@ -18,17 +18,22 @@
 //!   tree on each run.
 //! - **`xtask` naming itself** (`current_exe`) outside the functions [`SELF_RUNS`] lists.
 //!
-//! Two starts are allowed, and named here:
+//! Two cases T1 allows, each by **decision item 300** (accepted by the owner on 2026-11-14;
+//! T1's added note in ADR-0011 Amendment 4), named here:
 //!
-//! - **`xtask` re-running itself**: each boot command in [`SELF_RUNS`] starts `xtask boot-test`
-//!   from `std::env::current_exe()` in a child of its own (`boot_test_child`), so that each child
-//!   has its own `ORIGIN_QEMU_*` environment; and the turn lock's own test starts its test binary
-//!   to hold the lock and be killed. T1's text says `xtask` "starts no first-party program", so
-//!   this rests on **decision item 300**, put to the owner on 2026-11-14 with the case below. If
-//!   the owner refuses it, the boot commands run their scenarios in process instead.
-//! - **`exclusive`'s command** (`turns::exclusive`): it runs whatever a person names on its
-//!   command line, in the machine's turn. That is the person's choice, not `xtask`'s, and its
-//!   argument is their text, so neither rule above meets it. Decision item 300 covers it too.
+//! - **`cargo xtask exclusive` running the command a person gives it** (`turns::exclusive`), in
+//!   the machine's turn: that person's choice, not `xtask`'s. Its argument is their text, so
+//!   neither rule above meets it.
+//! - **`boot-matrix` re-running `xtask` for each scenario**: it starts `xtask boot-test` from
+//!   `std::env::current_exe()` in a child of its own (`boot_test_child`), so that each child has
+//!   its scenario's `ORIGIN_QEMU_*` settings in its environment. The places are the functions
+//!   [`SELF_RUNS`] lists: `boot_matrix` and the six machines it runs as steps of its own, each
+//!   also a command of its own. Allowed until TASKS item 61 runs the scenarios in one process
+//!   with their settings passed as typed values, after TASKS items 58 and 59.
+//!
+//! One more place is listed, outside T1 and outside item 300: the turn lock's own test starts its
+//! test binary to hold the lock and be killed. It is test code, run by `cargo test` and never by
+//! `xtask`; it is listed so that the rule reads every file of `xtask` with no exception unnamed.
 //!
 //! **G2: the three libraries reach nothing of the host.** Over the library sources of
 //! `onbf-pack`, `onbf-sign` and `oidl` (`src/**/*.rs`, but not `src/main.rs`, `src/tests.rs`,
@@ -79,10 +84,11 @@ pub(crate) struct Hit {
 const RUN_WORDS: &[&str] = &["run", "r"];
 
 /// The places `xtask` may name itself (`current_exe`), by file under `developer-tools/xtask/`
-/// and function: each boot command that re-runs `xtask boot-test` in a child with its own
-/// environment, and the turn lock's test. Decision item 300 (put to the owner on 2026-11-14).
-/// A place not listed is refused, and a listed one that no longer names itself is a stale
-/// allowance, refused too.
+/// and function: `boot_matrix` and the six machines it runs as steps of its own, each of which
+/// re-runs `xtask boot-test` in a child with its scenario's environment (decision item 300,
+/// accepted 2026-11-14, until TASKS item 61); and the turn lock's test, which is test code (see
+/// the module documentation). A place not listed is refused, and a listed one that no longer
+/// names itself is a stale allowance, refused too.
 pub(crate) const SELF_RUNS: &[(&str, &str)] = &[
     ("src/main.rs", "boot_matrix"),
     ("src/main.rs", "boot_reserved"),
@@ -296,7 +302,7 @@ pub(crate) fn program_hits(
                 hit(
                     token,
                     format!(
-                        "`current_exe` in {}: `xtask` re-runs itself only in the functions host_tools::SELF_RUNS lists (decision item 300)",
+                        "`current_exe` in {}: `xtask` re-runs itself only in the functions host_tools::SELF_RUNS lists (decision item 300: `boot-matrix`'s scenarios)",
                         place.map_or("no function".to_string(), |f| format!("`{f}`"))
                     ),
                 );
@@ -723,7 +729,7 @@ pub(crate) fn gate() -> Result {
         ));
     }
     println!(
-        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs and re-runs itself only in the {} places decision item 300 lists; the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host; {caught} planted controls caught",
+        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs and re-runs itself only in the {} places host_tools::SELF_RUNS lists (decision item 300); the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host; {caught} planted controls caught",
         xtask.len(),
         programs.len(),
         SELF_RUNS.len(),
