@@ -17,7 +17,8 @@
 //! - **GeneralPurposeIO and PCC**: one host transfer of the field's bytes.
 //! - **PCI_Config regions** name their function: the segment and bus of the PCI root bridge above
 //!   them (`_SEG`, `_BBN`), a bridge's secondary bus read for each bridge between, and the
-//!   function's `_ADR`, found at the first access and kept.
+//!   function's `_ADR`, found before the first access by frames on the engine's stack (`pci.rs`)
+//!   and kept.
 //! - A field with the `Lock` rule takes the Global Lock around its access.
 //!
 //! Whether the region may be touched at all is the host's decision (ADR-0019 A2; `host.rs`).
@@ -26,7 +27,7 @@ use alloc::vec::Vec;
 
 use crate::Interpreter;
 use crate::error::{Error, ErrorKind, Result, err};
-use crate::host::{BufferAccess, Host, HostError, PciAddress, RegionAccess, Space, Trace};
+use crate::host::{BufferAccess, Host, RegionAccess, Space, Trace};
 use crate::mem;
 use crate::name::Seg;
 use crate::object::{Connection, FieldKind, FieldUnit, NodeId, Object, Region, Val};
@@ -34,9 +35,6 @@ use crate::store::{get_bits, set_bits};
 
 /// The deepest chain of field units one access goes through.
 pub(crate) const FIELD_DEPTH: u32 = 8;
-
-/// `PNP0A03` and `PNP0A08` as EISA IDs: a PCI and a PCI Express root bridge.
-const ROOT_BRIDGES: [u64; 2] = [0x030A_D041, 0x080A_D041];
 
 /// How a field's space is reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,27 +114,28 @@ impl<H: Host> Interpreter<H> {
             Object::Region(r) => *r,
             _ => return err(ErrorKind::WrongObject),
         };
-        if r.space == 2 && r.pci.is_none() {
-            let pci = self.pci_address(node)?;
-            if let Object::Region(stored) = self.heap.get_mut(obj)? {
-                stored.pci = Some(pci);
-            }
-            return Ok(Region {
-                pci: Some(pci),
-                ..r
-            });
+        // Its function is found before the access starts (`pci.rs`); one not yet found here is
+        // asked for the same way.
+        if r.space == Space::PCI_CONFIG.0 && r.pci.is_none() {
+            return Err(self.need_address(node));
         }
         Ok(r)
     }
 
     /// A field unit's value (§19.3.5.7: an integer if it fits one, else a buffer).
     pub(crate) fn read_field(&mut self, node: NodeId) -> Result<Val> {
+        if let Some(r) = self.unresolved(node)? {
+            return Err(self.need_address(r));
+        }
         self.field_at(node, None, 0)
     }
 
     /// Writes `v` to a field unit. For a buffer-protocol field, the buffer the host returned,
     /// which is `Store`'s result (§19.6.132).
     pub(crate) fn write_field(&mut self, node: NodeId, v: Val) -> Result<Option<Val>> {
+        if let Some(r) = self.unresolved(node)? {
+            return Err(self.need_address(r));
+        }
         self.write_value(node, v, 0)
     }
 
@@ -601,131 +600,5 @@ impl<H: Host> Interpreter<H> {
             return Ok(Val::None);
         }
         self.field_value(f.bit_len, data)
-    }
-
-    // --- PCI_Config: which function --------------------------------------------------------
-
-    /// `seg`'s value under `node`, run if a method; `None` if absent.
-    fn child_value(&mut self, node: NodeId, seg: Seg) -> Result<Option<Val>> {
-        match self.ns.child(node, seg) {
-            Some(c) => Ok(Some(self.value_of(c)?)),
-            None => Ok(None),
-        }
-    }
-
-    fn child_int(&mut self, node: NodeId, seg: Seg) -> Result<Option<u64>> {
-        match self.child_value(node, seg)? {
-            Some(v) => Ok(Some(self.int_of(v)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Whether an ID names a PCI root bridge: an EISA ID or its string, or a package of them
-    /// (`_CID`), one level deep.
-    fn names_root_bridge(&self, v: Val) -> bool {
-        let one = |x: Val| match x {
-            Val::Int(i) => ROOT_BRIDGES.contains(&i),
-            Val::Obj(r) => match self.heap.get(r) {
-                Ok(Object::String(s)) => s.as_slice() == b"PNP0A03" || s.as_slice() == b"PNP0A08",
-                Ok(Object::Integer(i)) => ROOT_BRIDGES.contains(i),
-                _ => false,
-            },
-            _ => false,
-        };
-        match v {
-            Val::Obj(r) => match self.heap.get(r) {
-                Ok(Object::Package(e)) => e.iter().any(|&x| one(x)),
-                _ => one(v),
-            },
-            _ => one(v),
-        }
-    }
-
-    fn is_root_bridge(&mut self, node: NodeId) -> Result<bool> {
-        for seg in [*b"_HID", *b"_CID"] {
-            if let Some(v) = self.child_value(node, seg)?
-                && self.names_root_bridge(v)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// The function a PCI_Config region declared in `region`'s scope names.
-    fn pci_address(&mut self, region: NodeId) -> Result<PciAddress> {
-        let device = self.ns.parent(region).ok_or(ErrorKind::NotFound)?;
-        let mut chain: Vec<NodeId> = Vec::new();
-        let result = self.pci_walk(device, &mut chain);
-        mem::release(chain, &mut self.budget);
-        result
-    }
-
-    fn pci_walk(&mut self, device: NodeId, chain: &mut Vec<NodeId>) -> Result<PciAddress> {
-        let mut n = device;
-        let mut root = None;
-        loop {
-            if self.is_root_bridge(n)? {
-                root = Some(n);
-                break;
-            }
-            mem::push(chain, n, &mut self.budget)?;
-            match self.ns.parent(n) {
-                Some(p) if p.index != 0 => n = p,
-                _ => break,
-            }
-        }
-        let (segment, mut bus) = match root {
-            Some(r) => (
-                self.child_int(r, *b"_SEG")?.unwrap_or(0),
-                self.child_int(r, *b"_BBN")?.unwrap_or(0),
-            ),
-            None => (0, 0),
-        };
-        let target = if chain.is_empty() {
-            root.unwrap_or(device)
-        } else {
-            device
-        };
-        let adr = self.child_int(target, *b"_ADR")?.unwrap_or(0);
-        let segment = u16::try_from(segment & 0xFFFF).unwrap_or(0);
-        // Down from the root: each bridge between it and the function gives the next bus. With no
-        // root bridge above, there are no bridges to read.
-        let bridges = if root.is_some() {
-            chain.len().saturating_sub(1)
-        } else {
-            0
-        };
-        for k in (1..=bridges).rev() {
-            let Some(&bridge) = chain.get(k) else { break };
-            let badr = self.child_int(bridge, *b"_ADR")?.unwrap_or(0);
-            let here = PciAddress {
-                segment,
-                bus: u8::try_from(bus & 0xFF).unwrap_or(0),
-                device: u8::try_from((badr >> 16) & 0xFF).unwrap_or(0),
-                function: u8::try_from(badr & 0xFF).unwrap_or(0),
-            };
-            let access = RegionAccess {
-                space: Space::PCI_CONFIG,
-                address: 0x19,
-                width: 8,
-                pci: Some(here),
-                region: &[],
-                time_left_100ns: self.time_for_host()?,
-            };
-            let got = self.host.read(&access);
-            self.trace(&Trace::Read(&access, got));
-            bus = got.map_err(|cause: HostError| ErrorKind::Region {
-                space: 2,
-                address: 0x19,
-                cause,
-            })? & 0xFF;
-        }
-        Ok(PciAddress {
-            segment,
-            bus: u8::try_from(bus & 0xFF).unwrap_or(0),
-            device: u8::try_from((adr >> 16) & 0xFF).unwrap_or(0),
-            function: u8::try_from(adr & 0xFF).unwrap_or(0),
-        })
     }
 }

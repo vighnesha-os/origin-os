@@ -119,6 +119,13 @@ pub enum ErrorKind {
     Path,
     /// The method belongs to a table whose load failed and was rolled back.
     TableFailed,
+    /// Finding a PCI_Config region's function needed an access to that same region, through
+    /// `_ADR` or the like (the review of B2, B2-1): refused, never a recursion.
+    AddressCycle,
+    /// Internal: a PCI_Config region's function must be found before the access that wanted it.
+    /// The engine puts the step back and finds it; never returned by the API.
+    #[doc(hidden)]
+    Pending,
 }
 
 impl Error {

@@ -107,6 +107,8 @@ pub(crate) enum Frame {
     },
     Op(OpFrame),
     Call,
+    /// A PCI_Config region's function being found (`pci.rs`).
+    Resolve(crate::pci::Resolve),
 }
 
 /// The units of work between two readings of the clock.
@@ -214,6 +216,8 @@ impl<H: Host> Interpreter<H> {
             serial: 0,
             held: Vec::new(),
             nested: 0,
+            pending: None,
+            resolving: 0,
             run: crate::RunCounts::default(),
             base: 0,
             result: Val::None,
@@ -471,42 +475,6 @@ impl<H: Host> Interpreter<H> {
         }
     }
 
-    /// Runs the method `node` with `args` inside the evaluation in progress, and returns its
-    /// value (`Val::None` if it returned none). Used where an operator needs a method's answer
-    /// at once: a PCI_Config region's `_ADR`, `_BBN`, `_SEG`, `_HID`. The collector does not run
-    /// until the outermost evaluation is back between steps, since the operator calling this
-    /// holds values outside the frames.
-    pub(crate) fn call_nested(&mut self, node: NodeId, args: [Val; 7]) -> Result<Val> {
-        let marks = (self.frames.len(), self.calls.len(), self.owners.len());
-        let (base, result, cur, depth) = (self.base, self.result, self.cur, self.run.depth);
-        self.nested = self.nested.saturating_add(1);
-        self.base = self.frames.len();
-        self.result = Val::None;
-        let outcome = self
-            .begin_call(node, args)
-            .and_then(|()| self.run_frames(marks.0));
-        let value = self.result;
-        if outcome.is_err() {
-            self.unwind(marks.0, marks.1, marks.2);
-        }
-        self.nested = self.nested.saturating_sub(1);
-        self.base = base;
-        self.result = result;
-        self.cur = cur;
-        self.run.depth = depth;
-        outcome.map(|()| value)
-    }
-
-    /// A named object's value, a method's run for its answer: what `_ADR` and the like give.
-    pub(crate) fn value_of(&mut self, node: NodeId) -> Result<Val> {
-        let obj = self.ns.obj(node)?;
-        if matches!(self.heap.get(obj)?, Object::Method(_)) {
-            self.call_nested(node, [Val::None; 7])
-        } else {
-            self.read_node(node)
-        }
-    }
-
     pub(crate) fn push_owner(&mut self, owner: Owner) -> Result<()> {
         mem::push(
             &mut self.owners,
@@ -649,6 +617,31 @@ impl<H: Host> Interpreter<H> {
         let Some(top) = self.frames.last().copied() else {
             return Ok(());
         };
+        let before = (
+            self.frames.len(),
+            self.calls.len(),
+            self.owners.len(),
+            self.cur,
+            self.run.depth,
+        );
+        match self.step_on(top) {
+            // An access wants a PCI_Config region's function first (`pci.rs`). Nothing the step
+            // did reached the host: it is put back as it was, the function is found by frames
+            // above it, and then it runs again (the review of B2, B2-1).
+            Err(e) if e.kind == ErrorKind::Pending => {
+                let region = self.pending.take().ok_or(ErrorKind::Grammar)?;
+                let (frames, calls, owners, cur, depth) = before;
+                self.unwind(frames.saturating_sub(1), calls, owners);
+                self.push_frame(top)?;
+                self.cur = cur;
+                self.run.depth = depth;
+                self.start_resolve(region)
+            }
+            other => other,
+        }
+    }
+
+    fn step_on(&mut self, top: Frame) -> Result<()> {
         match top {
             Frame::Block { end, .. } => {
                 if self.cur.pc == end {
@@ -682,6 +675,7 @@ impl<H: Host> Interpreter<H> {
             }
             // A call frame is never on top: its method's block is above it until it returns.
             Frame::Call => err(ErrorKind::Grammar),
+            Frame::Resolve(r) => self.resolve_step(r),
         }
     }
 
@@ -834,6 +828,16 @@ impl<H: Host> Interpreter<H> {
             }
             return Ok(());
         }
+        // A method run for a PCI_Config region's function hands its value to the walk.
+        if let Some(Frame::Resolve(r)) = self.frames.last_mut() {
+            return match operand {
+                Operand::Val(v) => {
+                    r.got = Some(v);
+                    Ok(())
+                }
+                _ => err(ErrorKind::Grammar),
+            };
+        }
         let Some(Frame::Op(f)) = self.frames.last_mut() else {
             return Ok(());
         };
@@ -867,7 +871,8 @@ impl<H: Host> Interpreter<H> {
 
     /// Whether the frame on top waits for a value (rather than being a block).
     fn top_wants_value(&self) -> bool {
-        self.frames.len() > self.base && matches!(self.frames.last(), Some(Frame::Op(_)))
+        self.frames.len() > self.base
+            && matches!(self.frames.last(), Some(Frame::Op(_) | Frame::Resolve(_)))
     }
 
     /// Decodes one term at the cursor for `want`.
@@ -1630,14 +1635,24 @@ impl<H: Host> Interpreter<H> {
             ok &= self.heap.mark(Val::Obj(r), &mut self.budget);
         }
         for f in &self.frames {
-            if let Frame::Op(f) = f {
-                for a in f.args {
-                    ok &= match a {
-                        Operand::Val(v) => self.heap.mark(v, &mut self.budget),
-                        Operand::Loc(Loc::Ref(t)) => self.heap.mark(Val::Ref(t), &mut self.budget),
-                        _ => true,
-                    };
+            match f {
+                Frame::Op(f) => {
+                    for a in f.args {
+                        ok &= match a {
+                            Operand::Val(v) => self.heap.mark(v, &mut self.budget),
+                            Operand::Loc(Loc::Ref(t)) => {
+                                self.heap.mark(Val::Ref(t), &mut self.budget)
+                            }
+                            _ => true,
+                        };
+                    }
                 }
+                Frame::Resolve(r) => {
+                    if let Some(v) = r.got {
+                        ok &= self.heap.mark(v, &mut self.budget);
+                    }
+                }
+                _ => {}
             }
         }
         for c in &self.calls {

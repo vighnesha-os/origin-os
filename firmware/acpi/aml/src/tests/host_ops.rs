@@ -829,3 +829,89 @@ fn a_tracing_host_hears_loads_calls_accesses_and_limits() {
         ]
     );
 }
+
+// --- A PCI_Config region's function, found by frames (the review of B2, B2-1) ------------------
+
+/// The stack the tests below run on: far smaller than a test thread's 2 MiB. What they run must
+/// not need more however deep the firmware's calls go.
+const SMALL_STACK: usize = 192 << 10;
+
+fn on_small_stack(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(SMALL_STACK)
+        .spawn(f)
+        .expect("a thread")
+        .join()
+        .expect("the test ran to its end on the small stack");
+}
+
+/// `\_SB.PCI0` (a root bridge, bus 0) and below it `D1`, with a PCI_Config region and the field
+/// `F1` in it; `adr` is `D1`'s `_ADR` method's body, `more` anything else at the root.
+fn pci_device(adr: &[B], more: &[B]) -> Interp {
+    let mut body = vec![scope(
+        "\\_SB",
+        &[device(
+            "PCI0",
+            &[
+                name("_HID", dword(0x080A_D041)),
+                name("_BBN", zero()),
+                device(
+                    "D1",
+                    &[
+                        method("_ADR", 0, adr),
+                        op_region("R1", 2, zero(), byte(4)),
+                        field("R1", BYTE, &[Fe::Named("F1", 8)]),
+                    ],
+                ),
+            ],
+        )],
+    )];
+    body.extend_from_slice(more);
+    let mut i = super::interp_with(IntegerWidth::Bits64, Limits::BOOT_PROOF);
+    load(&mut i, &body).expect("the block loads");
+    i
+}
+
+#[test]
+fn an_adr_that_reads_its_own_region_is_refused_not_recursed() {
+    on_small_stack(|| {
+        let mut i = pci_device(
+            &[ret(nm("\\_SB.PCI0.D1.F1"))],
+            &[method("RD", 0, &[ret(nm("\\_SB.PCI0.D1.F1"))])],
+        );
+        // From a method (the frames' path) and from the field's own name (the API's).
+        assert_eq!(fails(&mut i, "RD"), ErrorKind::AddressCycle);
+        assert_eq!(fails(&mut i, "\\_SB.PCI0.D1.F1"), ErrorKind::AddressCycle);
+        assert!(i.host().seen.is_empty(), "nothing reached the host");
+    });
+}
+
+#[test]
+fn an_adr_thirty_calls_deep_runs_on_the_frames() {
+    on_small_stack(|| {
+        // `_ADR` calls L00, which calls L01, … L29, which gives device 3, function 0.
+        let mut more = vec![];
+        for k in 0..30 {
+            let body = if k == 29 {
+                vec![ret(dword(0x0003_0000))]
+            } else {
+                vec![ret(call(&format!("\\L{:02}", k + 1), &[]))]
+            };
+            more.push(method(&format!("\\L{k:02}"), 0, &body));
+        }
+        more.push(method("RD", 0, &[ret(nm("\\_SB.PCI0.D1.F1"))]));
+        let mut i = pci_device(&[ret(call("\\L00", &[]))], &more);
+        i.host_mut().memory.insert((2, Some((0, 0, 3, 0)), 0), 0x86);
+        assert_eq!(int(&mut i, "RD"), 0x86);
+        let last = i.host().seen.last().cloned().unwrap();
+        assert_eq!(
+            last.pci,
+            Some(PciAddress {
+                segment: 0,
+                bus: 0,
+                device: 3,
+                function: 0
+            })
+        );
+    });
+}

@@ -173,7 +173,7 @@ impl<H: Host> Interpreter<H> {
             if !args.is_empty() {
                 return err(ErrorKind::Type);
             }
-            return self.read_node(node);
+            return self.with_address(|s| s.read_node(node));
         };
         // The number of arguments is fixed by the method's declaration (§5.5.2.1).
         if args.len() != argc {
@@ -274,7 +274,7 @@ impl<H: Host> Interpreter<H> {
     pub(crate) fn export(&mut self, v: Val) -> Result<Option<Value>> {
         let v = match v {
             Val::None => return Ok(None),
-            other => self.settle(other)?,
+            other => self.with_address(|s| s.settle(other))?,
         };
         let mut room = Budget::new(self.budget.limit().saturating_sub(self.budget.used()));
         let Val::Obj(top) = v else {
@@ -319,7 +319,7 @@ impl<H: Host> Interpreter<H> {
             self.charge(1)?;
             let e = match e {
                 Val::None => Val::None,
-                other => self.settle(other)?,
+                other => self.with_address(|s| s.settle(other))?,
             };
             self.charge_pending()?;
             let nested = match e {

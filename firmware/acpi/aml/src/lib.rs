@@ -64,6 +64,7 @@ mod namespace;
 mod object;
 mod op;
 mod osi;
+mod pci;
 mod probe;
 mod region;
 mod store;
@@ -148,8 +149,13 @@ pub struct Interpreter<H: Host> {
     serial: u64,
     /// The mutexes the running evaluation holds, in the order taken (`sync.rs`).
     held: Vec<sync::Held>,
-    /// How deep `call_nested` is: the collector runs only at 0.
+    /// How deep the runs of frames for a PCI_Config region outside the frames go (`pci.rs`,
+    /// `with_address`): the collector runs only at 0.
     nested: u32,
+    /// The region whose function an access is waiting for (`pci.rs`).
+    pending: Option<object::NodeId>,
+    /// How many `Resolve` frames are on the stack.
+    resolving: u32,
     run: RunCounts,
     /// The frame count below which the running evaluation does not reach.
     base: usize,

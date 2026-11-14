@@ -168,6 +168,11 @@ impl Namespace {
     }
 
     /// Sibling comparisons made since the last call: the engine charges them as steps.
+    /// Counts `n` units of work done on the namespace by its caller.
+    pub(crate) fn note_work(&self, n: u64) {
+        self.work.set(self.work.get().saturating_add(n));
+    }
+
     pub(crate) fn take_work(&self) -> u64 {
         self.work.replace(0)
     }
