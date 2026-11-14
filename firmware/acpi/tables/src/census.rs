@@ -31,7 +31,15 @@ impl Seen<'_> {
 /// How many distinct structure types a summary counts one by one; the rest are counted together.
 const KINDS: usize = 24;
 
-/// What a parsed table held: its structures, counted by type.
+/// How many of a table's reported faults a summary keeps; the rest are only counted.
+pub const NOTED: usize = 4;
+
+/// What a parsed table held: its structures, counted by type, and what it reported.
+///
+/// A structure or field that breaks a rule of §5.2 but does not stop the walk (its length still
+/// locates what follows) is *reported*: counted here, its first [`NOTED`] faults kept, and not
+/// used. Only a fault that stops the walk, or that leaves the table unusable as a whole, refuses
+/// the table (the independent review's F3 and F5, and the coordinating session's rulings).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Summary {
     structures: u32,
@@ -39,6 +47,8 @@ pub struct Summary {
     kinds: [(u16, u32); KINDS],
     distinct: usize,
     others: u32,
+    reported: u32,
+    notes: [Option<Error>; NOTED],
 }
 
 impl Summary {
@@ -49,7 +59,28 @@ impl Summary {
             kinds: [(0, 0); KINDS],
             distinct: 0,
             others: 0,
+            reported: 0,
+            notes: [None; NOTED],
         }
+    }
+
+    /// Records a reported fault.
+    pub(crate) fn report(&mut self, fault: Error) {
+        if let Some(slot) = self.notes.iter_mut().find(|n| n.is_none()) {
+            *slot = Some(fault);
+        }
+        self.reported = self.reported.saturating_add(1);
+    }
+
+    /// How many faults the table reported.
+    #[must_use]
+    pub const fn reported(&self) -> u32 {
+        self.reported
+    }
+
+    /// The first reported faults, up to [`NOTED`].
+    pub fn notes(&self) -> impl Iterator<Item = Error> + '_ {
+        self.notes.iter().flatten().copied()
     }
 
     /// Counts one structure of type `kind`.
@@ -129,6 +160,17 @@ impl<'v, 'a> Tally<'v, 'a> {
         (self.visit)(Seen { at, kind, bytes });
     }
 
+    /// A structure that breaks a rule but does not stop the walk: reported and not used, its bytes
+    /// still shown to the visitor.
+    pub(crate) fn reported(&mut self, fault: Error, at: usize, bytes: &'a [u8]) {
+        self.summary.report(fault);
+        (self.visit)(Seen {
+            at,
+            kind: Seen::BYTES,
+            bytes,
+        });
+    }
+
     /// A run of bytes handed on, at `at`.
     pub(crate) fn bytes(&mut self, at: usize, bytes: &'a [u8]) {
         (self.visit)(Seen {
@@ -141,6 +183,10 @@ impl<'v, 'a> Tally<'v, 'a> {
 
 /// Whose a table is, and what the census did with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one census is returned per table and read at once; the crate has no heap to box it in"
+)]
 pub enum Class {
     /// A table of ACPI 6.6 §5.2 this crate parses: every structure in it checked.
     Checked(Summary),

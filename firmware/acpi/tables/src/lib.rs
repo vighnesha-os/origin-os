@@ -60,10 +60,12 @@
 //!   fixed hardware, no PM1a event or control block, `PM1_EVT_LEN` below 4, `PM1_CNT_LEN` below
 //!   2, a PM2 block of length 0, a PM timer not 4 bytes long, an odd GPE block length, a GPE block
 //!   outside system I/O and memory, a month alarm without a day alarm.
-//! - MADT: an interrupt override for a bus other than ISA; the reserved polarity or trigger
-//!   encoding (binary 10); a local APIC input other than LINT0 and LINT1; a wakeup mailbox not
-//!   4 KiB-aligned; a second address override; two I/O APICs at one address or interrupt base;
-//!   more than 256 I/O APICs.
+//! - MADT, each **reported**, and the structure not used, while the walk goes on (the review's
+//!   F5): a structure too short for its type; an interrupt override for a bus other than ISA; the
+//!   reserved polarity or trigger encoding (binary 10); a local APIC input other than LINT0 and
+//!   LINT1; a wakeup mailbox not 4 KiB-aligned; a second address override; an I/O APIC at an
+//!   address or interrupt base an earlier one has; I/O APICs past the 256th. Refused: only a
+//!   length that cannot locate the next structure.
 //! - SRAT: a memory range that wraps past the top of the address space.
 //! - ECDT: a register outside system I/O and memory; a namespace path that is empty, not
 //!   NUL-terminated or holds a character no path can.

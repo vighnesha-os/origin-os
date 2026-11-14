@@ -2277,7 +2277,8 @@ fn acpi_markers() -> Vec<String> {
             "checked",
             "origin-kernel: acpi: the RSDT's and XSDT's OEM table IDs are the FADT's: true",
             " tables: ",
-            " refused, ",
+            // Every QEMU machine here gives tables that break no rule the census reports.
+            " refused, 0 reported, ",
             "; consistent true",
         ]
         .map(String::from),

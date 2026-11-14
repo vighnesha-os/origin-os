@@ -29,6 +29,7 @@ struct Counts {
     tables: u32,
     checked: u32,
     refused: u32,
+    reported: u32,
     other: u32,
     unreadable: u32,
 }
@@ -65,8 +66,9 @@ fn report(
     );
     match result {
         Ok(class) => {
-            if matches!(class, Class::Checked(_)) {
+            if let Class::Checked(s) = class {
                 counts.checked = counts.checked.saturating_add(1);
+                counts.reported = counts.reported.saturating_add(s.reported());
             } else {
                 counts.other = counts.other.saturating_add(1);
             }
@@ -205,10 +207,11 @@ pub(crate) fn prove(com1: &mut Console, rsdp_addr: u64) -> bool {
     let micros = crate::time::monotonic_nanos().saturating_sub(started) / 1000;
     let _ = writeln!(
         com1,
-        "{LINE}{} tables: {} checked, {} refused, {} another specification's or area's, {} not readable; FADT {}, DSDT {}, FACS {}; {} us; consistent {}{}",
+        "{LINE}{} tables: {} checked, {} refused, {} reported, {} another specification's or area's, {} not readable; FADT {}, DSDT {}, FACS {}; {} us; consistent {}{}",
         counts.tables,
         counts.checked,
         counts.refused,
+        counts.reported,
         counts.other,
         counts.unreadable,
         fadt.is_some(),

@@ -6,11 +6,16 @@
 //! address override (5), the processor local x2APIC (9), the local x2APIC NMI (10) and the
 //! multiprocessor wakeup structure (16), whose mailbox is located and never touched. The
 //! structures for Itanium (6 to 8), Arm (11 to 15), LoongArch (17 to 23) and RISC-V (24 to 27)
-//! are walked by their length and listed, not decoded (ADR-0019 A1); so are types 28 and above,
-//! which ACPI 6.6 leaves to OEMs.
+//! are walked by their length and listed, not decoded (ADR-0019 A1); so are types 0x1C to 0x7F,
+//! which Table 5.21 reserves for OEM use, and 0x80 and above, which it does not list (the review's
+//! F16).
 //!
 //! A structure longer than its type's layout is accepted and its extra bytes ignored (§5.2.2:
-//! layouts grow by appending); a shorter one is refused.
+//! layouts grow by appending). **Verdicts are per structure** (the review's F5 and the coordinating
+//! session's ruling): a structure that is too short for its type, or whose contents break a rule
+//! §5.2.12 places on firmware, is reported and not used, and the walk goes on, so the processors
+//! and I/O APICs listed after it are kept. Only a length that cannot locate the next structure
+//! stops the walk, and so refuses the table.
 
 use crate::census::Tally;
 use crate::error::{Error, ErrorKind};
@@ -217,93 +222,101 @@ impl<'a> Madt<'a> {
         &self.table
     }
 
-    /// Every structure, in the table's order, each decoded and checked; the walk ends at the first
-    /// refusal.
+    /// Every structure, in the table's order, each decoded and checked. A structure whose contents
+    /// break a rule comes back as `Err` and the walk goes on past it; a length that cannot locate
+    /// the next structure comes back as `Err` and ends the walk (the review's F5, F15).
     pub fn entries(&self) -> impl Iterator<Item = Result<Entry<'a>, Error>> + 'a {
         let b = self.table.reader();
-        let run = b.rest(ENTRIES);
         let signature = b.table();
-        let mut walk = run.map(|run| Walk::new(run, Shape::BYTE_BYTE));
-        let mut failed = None;
-        if let Err(e) = &walk {
-            failed = Some(*e);
-        }
+        let mut walk = b.rest(ENTRIES).map(|run| Walk::new(run, Shape::BYTE_BYTE));
         let mut done = false;
         core::iter::from_fn(move || {
             if done {
                 return None;
             }
-            if let Some(e) = failed.take() {
-                done = true;
-                return Some(Err(e));
-            }
-            let item = walk.as_mut().ok()?.next()?;
-            let entry = item.and_then(|raw| decode(&raw, signature));
-            done = entry.is_err();
-            Some(entry)
+            let item = match walk.as_mut() {
+                Ok(w) => w.next()?,
+                Err(e) => Err(*e),
+            };
+            Some(match item {
+                Ok(raw) => decode(&raw, signature),
+                Err(e) => {
+                    done = true;
+                    Err(e)
+                }
+            })
         })
     }
 
-    /// Every local APIC's physical address: the override's if there is one, else the header's.
+    /// Every local APIC's physical address: the first address override's if there is one, else
+    /// the header's. A second override is reported by the census and not used (§5.2.12.8 allows
+    /// one).
     pub fn local_apic_base(&self) -> Result<u64, Error> {
-        let mut base = u64::from(self.local_apic_address);
-        for entry in self.entries() {
-            if let Entry::LocalApicAddressOverride { address } = entry? {
-                base = address;
+        let signature = self.table.signature();
+        for raw in Walk::new(self.table.reader().rest(ENTRIES)?, Shape::BYTE_BYTE) {
+            if let Ok(Entry::LocalApicAddressOverride { address }) = decode(&raw?, signature) {
+                return Ok(address);
             }
         }
-        Ok(base)
+        Ok(u64::from(self.local_apic_address))
     }
 
-    /// Checks the whole table: every structure, and what holds between them. At most one local
-    /// APIC address override (§5.2.12.8); no two I/O APICs at one address (§5.2.12.3); no two I/O
-    /// APICs with one global system interrupt base, which would give them the same input
-    /// (§5.2.13: each input is one I/O APIC's alone); and at most [`MAX_IO_APICS`], as many as
-    /// 8-bit I/O APIC IDs can tell apart, which also bounds the work of the checks between them.
+    /// Checks the whole table: every structure, and what holds between them. Reported, each
+    /// structure on its own: one too short for its type or whose contents break a rule
+    /// ([`decode`]); a second local APIC address override (§5.2.12.8 allows one); an I/O APIC at an
+    /// address or interrupt base an earlier one has (§5.2.12.3, §5.2.13: each input is one I/O
+    /// APIC's alone); an I/O APIC past [`MAX_IO_APICS`], as many as 8-bit I/O APIC IDs can tell
+    /// apart, which also bounds the work of the checks between them. Refused: a walk error.
     pub(crate) fn census(&self, tally: &mut Tally<'_, 'a>) -> Result<(), Error> {
         let walk = Walk::new(self.table.reader().rest(ENTRIES)?, Shape::BYTE_BYTE);
         let signature = self.table.signature();
-        let inconsistent = |at, field| Error::new(signature, at, ErrorKind::Inconsistent { field });
+        let fault = |at, kind| Error::new(signature, at, kind);
         let mut overrides = 0u32;
         let mut io_apics = [(0u32, 0u32); MAX_IO_APICS];
         let mut count = 0usize;
         for raw in walk {
             let raw = raw?;
-            let entry = decode(&raw, signature)?;
-            tally.structure(raw.kind, raw.at, raw.bytes);
-            match entry {
+            let entry = match decode(&raw, signature) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tally.reported(e, raw.at, raw.bytes);
+                    continue;
+                }
+            };
+            let refused = match entry {
                 Entry::LocalApicAddressOverride { .. } => {
                     overrides = overrides.saturating_add(1);
-                    if overrides > 1 {
-                        return Err(inconsistent(raw.at, "a second local APIC address override"));
-                    }
+                    (overrides > 1).then_some(ErrorKind::Inconsistent {
+                        field: "a second local APIC address override",
+                    })
                 }
                 Entry::IoApic {
                     address, gsi_base, ..
                 } => {
                     let seen = io_apics.get(..count).unwrap_or(&[]);
                     if seen.iter().any(|&(a, _)| a == address) {
-                        return Err(inconsistent(raw.at, "I/O APIC address"));
+                        Some(ErrorKind::Inconsistent {
+                            field: "I/O APIC address",
+                        })
+                    } else if seen.iter().any(|&(_, g)| g == gsi_base) {
+                        Some(ErrorKind::Inconsistent {
+                            field: "I/O APIC global system interrupt base",
+                        })
+                    } else if let Some(slot) = io_apics.get_mut(count) {
+                        *slot = (address, gsi_base);
+                        count = count.saturating_add(1);
+                        None
+                    } else {
+                        Some(ErrorKind::Value {
+                            field: "more I/O APICs than 8-bit IDs tell apart",
+                        })
                     }
-                    if seen.iter().any(|&(_, g)| g == gsi_base) {
-                        return Err(inconsistent(
-                            raw.at,
-                            "I/O APIC global system interrupt base",
-                        ));
-                    }
-                    let slot = io_apics.get_mut(count).ok_or_else(|| {
-                        Error::new(
-                            signature,
-                            raw.at,
-                            ErrorKind::Value {
-                                field: "more I/O APICs than 8-bit IDs tell apart",
-                            },
-                        )
-                    })?;
-                    *slot = (address, gsi_base);
-                    count = count.saturating_add(1);
                 }
-                _ => {}
+                _ => None,
+            };
+            match refused {
+                Some(kind) => tally.reported(fault(raw.at, kind), raw.at, raw.bytes),
+                None => tally.structure(raw.kind, raw.at, raw.bytes),
             }
         }
         Ok(())
@@ -312,19 +325,6 @@ impl<'a> Madt<'a> {
 
 /// The most I/O APICs a MADT may list: as many as 8-bit I/O APIC IDs tell apart.
 pub const MAX_IO_APICS: usize = 256;
-
-/// Whether any two of `ranges`, each an I/O APIC's interrupt base and its number of inputs (which
-/// the I/O APIC's own registers give, not the MADT), share an interrupt (§5.2.13).
-#[must_use]
-pub fn gsi_ranges_overlap(ranges: &[(u32, u32)]) -> bool {
-    ranges.iter().enumerate().any(|(i, &(base, count))| {
-        let end = u64::from(base).saturating_add(u64::from(count));
-        ranges.iter().skip(i.saturating_add(1)).any(|&(b, c)| {
-            let e = u64::from(b).saturating_add(u64::from(c));
-            u64::from(base) < e && u64::from(b) < end && count != 0 && c != 0
-        })
-    })
-}
 
 /// Decodes one structure.
 fn decode<'a>(raw: &Raw<'a>, signature: crate::Signature) -> Result<Entry<'a>, Error> {
@@ -595,26 +595,42 @@ pub(crate) mod tests {
         assert!(!ProcessorFlags::from_bits(0b10).ignored());
     }
 
+    /// What the census refuses a MADT of `entries` for: only a walk error.
     fn refusal(entries: &[&[u8]]) -> Error {
         census::check(&madt(entries)).unwrap_err()
     }
 
+    /// The census's summary of a MADT of `entries`, which it must accept.
+    fn summary(entries: &[&[u8]]) -> census::Summary {
+        match census::check(&madt(entries)).unwrap().class {
+            census::Class::Checked(s) => s,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The one fault the census reported, and kept, for a MADT of `entries`.
+    fn reported(entries: &[&[u8]]) -> Error {
+        let s = summary(entries);
+        assert_eq!(s.reported(), 1, "{s:?}");
+        s.notes().next().unwrap()
+    }
+
     #[test]
-    fn reserved_and_impossible_values_are_refused_by_name() {
+    fn reserved_and_impossible_values_are_reported_by_name() {
         // Polarity 10 and trigger 10 are reserved.
-        let e = refusal(&[&iso(0, 2, 0b10)]);
+        let e = reported(&[&iso(0, 2, 0b10)]);
         assert_eq!((e.at, e.kind), (52, ErrorKind::Value { field: "Flags" }));
         assert!(matches!(
-            refusal(&[&iso(0, 2, 0b1000)]).kind,
+            reported(&[&iso(0, 2, 0b1000)]).kind,
             ErrorKind::Value { .. }
         ));
         // Only ISA can be overridden.
         let mut pci = iso(0, 2, 0);
         pci[2] = 1;
-        assert_eq!(refusal(&[&pci]).kind, ErrorKind::Value { field: "Bus" });
+        assert_eq!(reported(&[&pci]).kind, ErrorKind::Value { field: "Bus" });
         // LINT2 does not exist.
         assert_eq!(
-            refusal(&[&[4, 6, 0, 0, 0, 2]]).kind,
+            reported(&[&[4, 6, 0, 0, 0, 2]]).kind,
             ErrorKind::Value { field: "LINT#" }
         );
         // A mailbox inside a page.
@@ -622,7 +638,7 @@ pub(crate) mod tests {
         wakeup.extend_from_slice(&0x7FF0_0008u64.to_le_bytes());
         wakeup.extend_from_slice(&0u64.to_le_bytes());
         assert_eq!(
-            refusal(&[&wakeup]).kind,
+            reported(&[&wakeup]).kind,
             ErrorKind::Value {
                 field: "MailBoxAddress"
             }
@@ -644,7 +660,8 @@ pub(crate) mod tests {
         ] {
             let mut short = vec![kind, min - 1];
             short.resize(usize::from(min - 1), 0);
-            let e = refusal(&[&short]);
+            let e = reported(&[&short]);
+            assert_eq!(summary(&[&short]).structures(), 0);
             assert_eq!(
                 e,
                 Error::new(
@@ -685,14 +702,14 @@ pub(crate) mod tests {
         let mut ovr = vec![5, 12, 0, 0];
         ovr.extend_from_slice(&0xFEE0_0000u64.to_le_bytes());
         assert_eq!(
-            refusal(&[&ovr, &ovr]).kind,
+            reported(&[&ovr, &ovr]).kind,
             ErrorKind::Inconsistent {
                 field: "a second local APIC address override"
             }
         );
         let a = ioapic(1, 0xFEC0_0000, 0);
         let same_address = ioapic(2, 0xFEC0_0000, 24);
-        let e = refusal(&[&a, &lapic(0, 0, 1), &same_address]);
+        let e = reported(&[&a, &lapic(0, 0, 1), &same_address]);
         assert_eq!(
             (e.at, e.kind),
             (
@@ -704,34 +721,68 @@ pub(crate) mod tests {
         );
         let same_base = ioapic(2, 0xFEC0_1000, 0);
         assert_eq!(
-            refusal(&[&a, &same_base]).kind,
+            reported(&[&a, &same_base]).kind,
             ErrorKind::Inconsistent {
                 field: "I/O APIC global system interrupt base"
             }
         );
-        assert!(census::check(&madt(&[&a, &ioapic(2, 0xFEC0_1000, 24)])).is_ok());
+        assert_eq!(summary(&[&a, &ioapic(2, 0xFEC0_1000, 24)]).reported(), 0);
         let many: Vec<Vec<u8>> = (0..=MAX_IO_APICS as u32)
             .map(|i| ioapic(0, 0xFEC0_0000 + i * 0x1000, i * 24))
             .collect();
         let refs: Vec<&[u8]> = many.iter().map(Vec::as_slice).collect();
+        assert_eq!(summary(&refs[..MAX_IO_APICS]).reported(), 0);
         assert_eq!(
-            census::check(&madt(&refs[..MAX_IO_APICS])).map(|_| ()),
-            Ok(())
-        );
-        assert_eq!(
-            refusal(&refs).kind,
+            reported(&refs).kind,
             ErrorKind::Value {
                 field: "more I/O APICs than 8-bit IDs tell apart"
             }
         );
     }
 
+    /// The review's F5, and the coordinating session's ruling: processors and I/O APICs listed
+    /// after a bad NMI, override or wakeup structure are kept, by `entries` and by the census.
     #[test]
-    fn interrupt_ranges_overlap_only_when_they_share_an_input() {
-        assert!(!gsi_ranges_overlap(&[(0, 24), (24, 24)]));
-        assert!(gsi_ranges_overlap(&[(0, 24), (23, 24)]));
-        assert!(gsi_ranges_overlap(&[(48, 8), (0, 24), (50, 1)]));
-        assert!(!gsi_ranges_overlap(&[(0, 0), (0, 24)]));
-        assert!(!gsi_ranges_overlap(&[(u32::MAX, u32::MAX), (0, 24)]));
+    fn processors_after_a_bad_structure_are_kept() {
+        let bad_nmi: &[u8] = &[4, 6, 0xFF, 0, 0, 2]; // LINT2
+        let mut bad_override = iso(0, 2, 0);
+        bad_override[2] = 1; // bus 1
+        let mut bad_wakeup = vec![16, 16, 0, 0, 0, 0, 0, 0];
+        bad_wakeup.extend_from_slice(&0x7FF0_0008u64.to_le_bytes()); // inside a page
+        for bad in [bad_nmi, &bad_override, &bad_wakeup] {
+            let tail = [
+                x2apic(0, 1, 0),
+                x2apic(1, 1, 1),
+                lapic(2, 2, 1),
+                ioapic(1, 0xFEC0_0000, 0),
+            ];
+            let mut all: Vec<&[u8]> = vec![bad];
+            all.extend(tail.iter().map(Vec::as_slice));
+            let t = madt(&all);
+            let m = Madt::parse(&t).unwrap();
+            let got: Vec<_> = m.entries().collect();
+            assert_eq!(got.len(), 5, "{got:?}");
+            assert!(got[0].is_err());
+            assert!(matches!(
+                got[1],
+                Ok(Entry::LocalX2Apic { x2apic_id: 0, .. })
+            ));
+            assert!(matches!(
+                got[2],
+                Ok(Entry::LocalX2Apic { x2apic_id: 1, .. })
+            ));
+            assert!(matches!(got[3], Ok(Entry::LocalApic { apic_id: 2, .. })));
+            assert!(matches!(got[4], Ok(Entry::IoApic { id: 1, .. })));
+            let s = summary(&all);
+            assert_eq!(s.reported(), 1);
+            assert_eq!(s.structures(), 4);
+            assert_eq!(s.kinds().collect::<Vec<_>>(), [(9, 2), (0, 1), (1, 1)]);
+        }
+        // A walk error after the processors ends the walk there, and refuses the table.
+        let t = madt(&[&x2apic(0, 1, 0), &[0x80, 0]]);
+        let got: Vec<_> = Madt::parse(&t).unwrap().entries().collect();
+        assert_eq!(got.len(), 2);
+        assert!(got[0].is_ok() && got[1].is_err());
+        assert!(census::check(&t).is_err());
     }
 }

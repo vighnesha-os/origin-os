@@ -111,6 +111,30 @@ impl fmt::Display for Counted {
     }
 }
 
+/// What a checked table reported and did not use (the review's F3 and F5): nothing, or `; N
+/// reported, at 0x..: rule, ...`, the first few by where and which rule.
+#[derive(Debug)]
+pub struct Noted(pub Summary);
+
+impl fmt::Display for Noted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = &self.0;
+        if s.reported() == 0 {
+            return Ok(());
+        }
+        write!(f, "; {} reported", s.reported())?;
+        let mut shown = 0u32;
+        for e in s.notes() {
+            write!(f, ", at {:#x}: {}", e.at, Kind(e.kind))?;
+            shown = shown.saturating_add(1);
+        }
+        if s.reported() > shown {
+            write!(f, ", and {} more", s.reported().saturating_sub(shown))?;
+        }
+        Ok(())
+    }
+}
+
 /// Whose a table is, and what the census did with it.
 #[derive(Debug)]
 pub struct Whose(pub Class);
@@ -118,8 +142,10 @@ pub struct Whose(pub Class);
 impl fmt::Display for Whose {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Class::Checked(s) if s.structures() == 0 && s.entries() == 0 => f.write_str("checked"),
-            Class::Checked(s) => write!(f, "checked: {}", Counted(s)),
+            Class::Checked(s) if s.structures() == 0 && s.entries() == 0 => {
+                write!(f, "checked{}", Noted(s))
+            }
+            Class::Checked(s) => write!(f, "checked: {}{}", Counted(s), Noted(s)),
             Class::OtherArea(what) => write!(f, "{what}: header checked, not parsed here"),
             Class::OtherSpecification(what) => {
                 write!(f, "{what}, another specification's: header checked")
@@ -194,6 +220,23 @@ mod tests {
         assert_eq!(
             line(&table(b"APIC", &[0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0])),
             "refused at 0x2c: structure type 128 with length 0"
+        );
+        // A structure that breaks a rule is reported and not used; the table is still checked.
+        let mut nmi = vec![0u8; 8];
+        nmi.extend_from_slice(&[4, 6, 0xFF, 0, 0, 2, 0, 8, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(
+            line(&table(b"APIC", &nmi)),
+            "checked: 1 structures (0x1); 1 reported, at 0x31: LINT# holds a value it may not"
+        );
+        let mut many = vec![0u8; 8];
+        for _ in 0..6 {
+            many.extend_from_slice(&[4, 6, 0xFF, 0, 0, 2]);
+        }
+        assert_eq!(
+            line(&table(b"APIC", &many)),
+            "checked; 6 reported, at 0x31: LINT# holds a value it may not, at 0x37: LINT# holds a \
+             value it may not, at 0x3d: LINT# holds a value it may not, at 0x43: LINT# holds a \
+             value it may not, and 2 more"
         );
         assert_eq!(format!("{}", Sig(Signature::new(b"A\x07\xffZ"))), "A??Z");
         assert_eq!(format!("{}", Ascii(b"BOCHS ")), "BOCHS ");
