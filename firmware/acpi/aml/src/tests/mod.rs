@@ -4,6 +4,8 @@
 mod encode;
 mod limits;
 mod namespace;
+mod qemu;
+mod random;
 mod semantics;
 mod tables_standin;
 
