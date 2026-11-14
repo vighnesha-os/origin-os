@@ -34,8 +34,22 @@ use crate::acpi_text::{Ascii, Refused, Sig, Whose};
 const LINE: &str = "origin-kernel: acpi: ";
 
 /// The most bytes the census copies of a firmware structure that changes after boot: the FACS
-/// (64 bytes in every version ACPI 6.6 gives) and the FPDT's tables, which hold a few records.
-const COPY_MAX: usize = 64 * 1024;
+/// (64 bytes in every version ACPI 6.6 gives) and the FPDT's tables, whose length is the space the
+/// firmware set aside, which may be far more than their records (§5.2.24.8; the review's addendum,
+/// N2). A larger one is "too large to judge", never "not readable".
+const COPY_MAX: usize = 1 << 20;
+
+/// The longest header a copied structure has: an MBPT's 24 bytes.
+const COPY_HEADER_MAX: usize = 24;
+
+/// Why a structure was not copied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Uncopied {
+    /// Its memory could not be read, or no memory could be had for the copy (N6).
+    Unreadable(&'static str),
+    /// It declares more than [`COPY_MAX`] bytes (N2).
+    TooLarge(usize),
+}
 
 /// Where the census reads the firmware's memory.
 pub trait Firmware {
@@ -90,6 +104,8 @@ pub struct Findings {
     pub other: u32,
     /// Tables that could not be read.
     pub unreadable: u32,
+    /// Structures copied rather than lent that declare more than the census copies (N2).
+    pub too_large: u32,
     /// XSDT entries that were zero, which name no table (the review's F8).
     pub null_entries: u32,
     /// XSDT entries that could not be read: each might have been any table.
@@ -193,24 +209,30 @@ fn read_table(fw: &mut impl Firmware, addr: u64) -> Result<(&'static [u8], Heade
 
 /// Copies the structure at `addr`, whose length is the `u32` at offset 4 of its first `header`
 /// bytes, with volatile reads and without lending it (the review's F2). The copy is read again
-/// whole, so what is checked is one consistent snapshot of the length it declares.
-fn copy_structure(
-    fw: &mut impl Firmware,
-    addr: u64,
-    header: usize,
-) -> Result<Vec<u8>, &'static str> {
-    let mut head = vec![0u8; header.max(8)];
-    fw.copy(addr, &mut head)?;
+/// whole, so what is checked is one consistent snapshot of the length it declares. Its buffer is
+/// allocated fallibly: no memory is "not readable: no memory", never the kernel's allocation-error
+/// path (N6).
+fn copy_structure(fw: &mut impl Firmware, addr: u64, header: usize) -> Result<Vec<u8>, Uncopied> {
+    let mut head = [0u8; COPY_HEADER_MAX];
+    let head = head
+        .get_mut(..header.clamp(8, COPY_HEADER_MAX))
+        .ok_or(Uncopied::Unreadable(
+            "a header longer than the census copies",
+        ))?;
+    fw.copy(addr, head).map_err(Uncopied::Unreadable)?;
     let length = head
         .get(4..8)
         .and_then(|b| <[u8; 4]>::try_from(b).ok())
         .map_or(0, u32::from_le_bytes);
     let length = usize::try_from(length).unwrap_or(usize::MAX).max(header);
     if length > COPY_MAX {
-        return Err("longer than the census copies");
+        return Err(Uncopied::TooLarge(length));
     }
-    let mut all = vec![0u8; length];
-    fw.copy(addr, &mut all)?;
+    let mut all = Vec::new();
+    all.try_reserve_exact(length)
+        .map_err(|_| Uncopied::Unreadable("no memory"))?;
+    all.resize(length, 0);
+    fw.copy(addr, &mut all).map_err(Uncopied::Unreadable)?;
     Ok(all)
 }
 
@@ -368,7 +390,7 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
     let micros = fw.now().saturating_sub(started) / 1000;
     let _ = writeln!(
         out,
-        "{LINE}{} tables: {} checked, {} refused, {} reported, {} of them where the kernel relies on it, {} with only their headers checked, {} not readable, {} null XSDT entries; FADT {}, DSDT {}, FACS {}; {} us; consistent {}{}",
+        "{LINE}{} tables: {} checked, {} refused, {} reported, {} of them where the kernel relies on it, {} with only their headers checked, {} not readable, {} too large to judge, {} null XSDT entries; FADT {}, DSDT {}, FACS {}; {} us; consistent {}{}",
         found.tables,
         found.checked,
         found.refused,
@@ -376,6 +398,7 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
         found.relied,
         found.other,
         found.unreadable,
+        found.too_large,
         found.null_entries,
         found.fadt,
         found.dsdt,
@@ -407,9 +430,14 @@ fn check_facs(
     let read = copy_structure(fw, addr, 8);
     found.tables = found.tables.saturating_add(1);
     match read.as_deref().map(Facs::parse) {
-        Err(why) => {
+        Err(Uncopied::Unreadable(why)) => {
             found.unreadable = found.unreadable.saturating_add(1);
             let _ = writeln!(out, "{LINE}the FACS: not readable: {why}");
+            false
+        }
+        Err(Uncopied::TooLarge(length)) => {
+            found.too_large = found.too_large.saturating_add(1);
+            let _ = writeln!(out, "{LINE}the FACS: {length} bytes, too large to judge");
             false
         }
         Ok(Ok(facs)) => {
@@ -451,8 +479,14 @@ fn performance_tables(
         let name = Ascii(kind.signature());
         let bytes = match copy_structure(fw, addr, kind.header_len()) {
             Ok(bytes) => bytes,
-            Err(why) => {
+            Err(Uncopied::Unreadable(why)) => {
                 let _ = writeln!(out, "{LINE}{name}: not readable: {why}");
+                continue;
+            }
+            Err(Uncopied::TooLarge(length)) => {
+                found.tables = found.tables.saturating_add(1);
+                found.too_large = found.too_large.saturating_add(1);
+                let _ = writeln!(out, "{LINE}{name}: {length} bytes, too large to judge");
                 continue;
             }
         };
@@ -524,7 +558,7 @@ mod tests {
     impl Machine {
         fn new() -> Self {
             let mut m = Self {
-                memory: vec![0u8; 0x8000],
+                memory: vec![0u8; 0x8000 + (256 << 10)],
                 entries: vec![FADT],
                 fadt: Vec::new(),
             };
@@ -636,8 +670,8 @@ mod tests {
         assert!(
             last_line(&out).ends_with(
                 "4 tables: 4 checked, 0 refused, 0 reported, 0 of them where the kernel relies on \
-                 it, 0 with only their headers checked, 0 not readable, 0 null XSDT entries; FADT \
-                 true, DSDT true, FACS true; 0 us; consistent true"
+                 it, 0 with only their headers checked, 0 not readable, 0 too large to judge, 0 null \
+                 XSDT entries; FADT true, DSDT true, FACS true; 0 us; consistent true"
             ),
             "{out}"
         );
@@ -919,5 +953,44 @@ mod tests {
         let (ok, out, _) = m.run();
         assert!(ok, "{out}");
         assert!(last_line(&out).contains("1 reported, 0 of them where the kernel relies on it"));
+    }
+
+    /// The review's addendum, N2: an FBPT whose length (the space the firmware set aside) is past
+    /// 64 KiB is copied and judged up to 1 MiB; past that it is "too large to judge", never "not
+    /// readable", and fails nothing.
+    #[test]
+    fn a_large_performance_table_is_judged_or_named_too_large() {
+        let pointer = |address: u64| {
+            let mut r = vec![0u8, 0, 16, 1, 0, 0, 0, 0];
+            r.extend_from_slice(&address.to_le_bytes());
+            r
+        };
+        let fbpt = |length: u32| {
+            let mut t = b"FBPT".to_vec();
+            t.extend_from_slice(&length.to_le_bytes());
+            t.extend_from_slice(&[2, 0, 48, 2]);
+            t.extend_from_slice(&[0; 44]);
+            t
+        };
+        let run = |length: u32| {
+            let mut m = Machine::new();
+            m.put(FPDT, &table(b"FPDT", 1, &pointer(FBPT)));
+            m.put(FBPT, &fbpt(length));
+            m.entries.push(FPDT);
+            m.run()
+        };
+        let (ok, out, _) = run(200 << 10);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains("FBPT, 204800 bytes: checked: 1 records"),
+            "{out}"
+        );
+        let (ok, out, _) = run(2 << 20);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains("FBPT: 2097152 bytes, too large to judge"),
+            "{out}"
+        );
+        assert!(last_line(&out).contains(", 1 too large to judge,"), "{out}");
     }
 }
