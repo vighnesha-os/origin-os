@@ -151,6 +151,8 @@ What the tables show:
 - **G10.** What deployed firmware in scope expects `\_OS` to return.
 - **G11.** A `Store` of a buffer into a named buffer of another length: whether the target keeps its length (as Table 19.7 says for integer and string sources) or takes the source's.
 - **G12.** What `^` means in a method's body. §19.6.85 makes a method a scope of its own ("Method opens a name scope"), so `^X` from a method in `Device (D1)` would be `D1.X`; whether deployed firmware is written expecting that, or expecting `^` to leave the device.
+- **G13.** Whether deployed firmware has string literals with bytes above 0x7F (§20.2.3 allows 0x01–0x7F), for example a vendor name with an accented letter or a trademark sign, and what deployed interpreters do with one. Refusing it fails the whole table (raised by the review of B1, F11).
+- **G14.** Whether deployed firmware has a `Package` or `VarPackage` with more elements than its count (§19.6.102 makes it an ASL compile-time error, which says nothing of AML a compiler did not check), and what deployed interpreters do: refuse, keep the first elements, or grow the package. Found while fixing the review's F4: the randomized test's generator wrote such packages.
 
 **The strict choices, each "strict until the reading session answers"** (the contract, `t63-contract.md` §4):
 
@@ -167,6 +169,8 @@ What the tables show:
 | G9 | A shift by the width or more gives 0; `Multiply` keeps the low bits |
 | G11 | A named buffer keeps its length on every store |
 | G12 | A method is a scope of its own: `^` from its body is the device or scope it is in |
+| G13 | A string byte above 0x7F is a `Grammar` error, and the table fails |
+| G14 | A package with more elements than its count is a `Range` error |
 
 
 **Inconsistencies in the ACPI 6.6 text found while reading** (for the errata check of Q1; each is resolved by a choice the contract names)

@@ -943,7 +943,8 @@ impl<H: Host> Interpreter<H> {
                 .iter()
                 .position(|&c| c == 0)
                 .ok_or(ErrorKind::Truncated)?;
-            // §20.2.3: characters are 0x01–0x7F.
+            // §20.2.3: characters are 0x01–0x7F. One above fails the whole table (G13, strict
+            // until the reading session answers).
             (len, rest.iter().take(len).any(|&c| c > 0x7F))
         };
         if bad {
@@ -1129,7 +1130,8 @@ impl<H: Host> Interpreter<H> {
         let i = usize::try_from(index).map_err(|_| ErrorKind::Range)?;
         match self.heap.get_mut(pkg)? {
             Object::Package(elems) => {
-                // More elements than the count: a compile-time error by §19.6.102.
+                // More elements than the count: a compile-time error by §19.6.102 (G14, strict
+                // until the reading session answers).
                 let slot = elems.get_mut(i).ok_or(ErrorKind::Range)?;
                 *slot = v;
             }
