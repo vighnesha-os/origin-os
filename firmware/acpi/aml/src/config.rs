@@ -27,12 +27,20 @@ impl Limits {
         steps: 100_000_000,
     };
 
-    /// The kernel boot proof's (step B3).
+    /// The kernel boot proof's (step B3). Memory was 4 MiB until the coordinating session's
+    /// ruling of 2026-11-14 raised it to 32 MiB: a real platform's DSDT can be as large as QEMU's
+    /// for its machine whose MADT lists 4,096 processors, and the proof should judge such a table,
+    /// not refuse it. That DSDT (496,594 bytes) stopped loading at 4 MiB; with the limit raised it
+    /// loaded and passed, the interpreter holding at most 11,897,534 bytes in 32,516 nodes, its
+    /// load taking 231 ms and its walk 118 ms of their 1 s each (QEMU 11.1.3's software
+    /// processor, 2026-11-14). 32 MiB is about 2.7 times that peak and half the service's. A
+    /// kernel heap that cannot give it fails cleanly: every allocation is fallible (`mem.rs`),
+    /// and one the heap refuses is the memory limit.
     pub const BOOT_PROOF: Self = Self {
         loop_iterations: 100_000,
         time_100ns: 10_000_000,
         call_depth: 32,
-        memory_bytes: 4 << 20,
+        memory_bytes: 32 << 20,
         steps: 10_000_000,
     };
 }
