@@ -4835,6 +4835,8 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
     - the pool's second run;
     - the gate's own tests, each with inputs that must fail.
   - Loom: `shootdown_reaches_the_last_processor_whatever_the_count` at 2 and 3, failed by `shootdown_records_one_short` and `shootdown_wait_stops_one_short`.
+  - Gates on `15b08fd`, one turn of the machine, a clean tree: `check` passed in 436 s (1,901 host tests, 56 Loom models, 83 controls); `boot-test` 11 of 11 in 51 s; `boot-matrix` in 1,081 s, with 3 and 65 processors under each IOMMU, the 67-processor sparse machine and the discovery machine.
+  - Controls AC-1 to AC-7 (ADR-0013): the six edits each failed where aimed; the 2-pair NVMe configuration passed as "not proven".
   - Boots under QEMU's software processor on the development Mac:
     - `boot-test` with 2 processors passes, 11 of 11;
     - the kernel boot passes at 3 processors (Intel VT-d 126 s before the checker's fix; AMD-Vi 12.8 s after it), at 65 processors (Intel VT-d 70.4 s, AMD-Vi 70.1 s) and on the discovery machine (117 s);

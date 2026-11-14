@@ -474,7 +474,7 @@
 
 40. **Identity maps for firmware-reserved memory: VT-d RMRRs and AMD-Vi IVMDs (ADR-0007 questions 4 and 8; decision items 8, 12 and 229; TASKS item 11's IVMD semantics and placement). Started 2026-11-12 on `claude/rmrr-ivmd-maps`, from `land/s4` at `5871257`; not merged.** The owner's deadline: they land before real hardware, and rental B's tool waits for them. Today a device a reserved range names is refused at attach (I11, A9), which fails closed but leaves USB controllers and integrated graphics without a driver on real machines (threat T14). Research ledger `docs/research/2026-11-12-reserved-memory-identity-maps.md`; five shapes the ADR leaves open (R1–R5) were put to the coordinating session on 2026-11-12 with recommendations; it numbered them decision items 247 to 251 and put them to the owner, who accepted all five as recommended on 2026-11-13 (ADR-0007 Amendment 1, matrix rows A07-R1 to A07-R5). On 2026-11-13 the branch merged `main` (`803755c`, Rust 1.100.0, then `6368f02`) and those records, and `check`, `boot-test`, `boot-matrix` and `boot-reserved` passed again under Rust 1.100.0 (provenance entry). An independent AI review the same day found two Medium and seven Low points (`docs/engineering/REVIEW_T40_2026-11-13.md`); all are answered there, with decision items 291 to 293 built (a never-map type-20h IVMD for every device; the similarity check in place of §3's split; boot info 0.7). No person has reviewed the code. Its contract is under "Task contracts".
 
-58. **Any processor count: per-processor state sized at discovery, and no `MAX_CPUS` (decision items 283 to 290; ADR-0008 Amendment 1, D1 to D8). Assigned by the coordinating session on 2026-11-13; on `claude/any-cpu-count`; its contract is under "Task contracts". Not built.** The owner's words of 2026-11-13: "number of processors cores should be depend on availability itself, think this OS may run on any processor, that processor cores can be any number, how can you fix that in code?" It replaces ADR-0008 C6 and decision item 14's "keep 64 for now". It does not land before ACPI 6.6's MADT section has been read.
+58. **Any processor count: per-processor state sized at discovery, and no `MAX_CPUS` (decision items 283 to 290; ADR-0008 Amendment 1, D1 to D8). Assigned by the coordinating session on 2026-11-13; on `claude/any-cpu-count`; its contract and result are under "Task contracts". Built, with `check`, `boot-test` and `boot-matrix` passed on `15b08fd`; not landed, not pushed, not yet reviewed.** The owner's words of 2026-11-13: "number of processors cores should be depend on availability itself, think this OS may run on any processor, that processor cores can be any number, how can you fix that in code?" It replaces ADR-0008 C6 and decision item 14's "keep 64 for now". ACPI 6.6's MADT section was read on 2026-11-13: nothing in it changes a row.
 
 ## Waiting on the owner
 
@@ -1395,3 +1395,53 @@ Assigned by the coordinating session on 2026-11-13, after the owner accepted dec
 | Required tests | **Host:** `percpu`: the boot slot before sizing, at the same address after; one sizing, and a second refused; a lookup past the length is `None`; a sizing that cannot get its memory leaves the table as it was and reports the count it reached. `cpumap` at 1, 3, 64, 65, 300, 1,000 and more than 4,096 processors with sparse x2APIC IDs above 255: enabled processors first in table order, online-capable next, nothing for the rest; a duplicate indexed once; the broadcast ID refused; Online Capable ignored below MADT revision 5; a 4,096-entry table with 2 enabled; the randomized invariant test extended past 64. `acpi`: the revision gate on bit 1. `shootdown` with run-time counts of 1, 3, 65 and 300. `slots` grown at run time. `layout`: the region's reserve, its bases inside the window, the count of placements. The region's size, `max(256 MiB, 32 slots × count)`, and its bound of 262,144. Each gate's own tests, with an input that must fail it. **Loom:** the shootdown models at 2 and 3 processors with the count known at run time, and two negative controls that must fail: a record table one short, and an initiator that does not wait for a processor it asked. **Boot (`boot-matrix`, D7):** machines with 3 and 65 processors under each IOMMU. The large sparse machine: two packages, 288 processors, APIC IDs above 255, Intel VT-d with interrupt remapping, QEMU's software processor only. The discovery machine: `-smp 2,maxcpus=4096`. `boot-x2apic` and the 1, 2 and 4 machines unchanged. On each machine every enabled processor comes online and the boot line of D3 is checked. **Controls (ADR-0013, planted by a script on an exported copy, each must fail its scenario):** a `PerCpu` static left out of its crate's sizing function (the gate refuses the build); the count fixed one short (the last enabled processor stays in firmware, named; the boot test fails); the shootdown's scan stopping one short of the count (the TLB proof fails on the 3 and 65 machines); the region not grown (the 288 machine runs out of slots, and the APs past it are reported); `MAX_CPUS` put back (the D5 gate refuses it); NVMe queues given past the controller's vectors (refused). **Measured on the development Mac (D7's condition):** each new machine's boot time, and its share of CI's real-CPU boot job estimated from it. That job's 180-minute limit is stated against the EPYC 7763, where `boot-matrix` takes about 96 minutes. |
 | Actual deliverables | The code and its tests, the gates and the machines; the research ledger; ADR-0008 Amendment 1's "As built" note; matrix rows A08-D1 to A08-D8 and any row this touches; `docs/STATUS.md`; the provenance entry; the threat-model rows this touches; B19's per-processor line; this contract's result. Not pushed: the final commit goes to the coordinating session for the keeper and the batch. |
 | Acceptance conditions | The kernel brings every enabled processor online on every machine above, whatever the count. `cargo fmt --all --check`, `cargo xtask progress` and the requirements, provenance, roadmap, progress and document gates pass, then `cargo xtask check`, `boot-test` and `boot-matrix`, each under `cargo xtask exclusive -- …`, on the batch's head merged in. Every control fails as it should. D7's condition: each new machine's boot is measured on the Mac and its share of CI's real-CPU job stated before it is made required there; none is made required in CI if that job would not stay well inside 180 minutes on the EPYC 7763. **The task does not land until ACPI 6.6's MADT section is read and the ledger records any difference from 6.5**; a difference that changes a row goes to the coordinating session first. Landing is through the batch (pull request 27), after an independent review, which this privileged code needs: no person and no independent session has read it before then. Nothing here is claimed of a physical machine (§74). |
+
+**Result (2026-11-14).** Built on `claude/any-cpu-count`; final code commit `15b08fd`, the records after it. Not pushed, and no independent review yet: this is privileged kernel code and needs one before the keeper takes it.
+
+- **Commits:**
+  - `3d2e0b8` the code;
+  - `1f13eb2`, `16cf7a3`, `1600931`, `f573761`, `7bc4b0c`, `7d136ad` and `15b08fd` the fixes and the rulings;
+  - `0f2ebde` and `ea90890` cost-ledger rows CL40, CL38 and CL39;
+  - `8f164d1` the research ledger;
+  - `d7bacd3`, `abef034` and the records commit after this result: the records;
+  - `81f4fd9`, `68cb97f` and `e012d47` the batch merged (S4-3, TASKS 57, TASKS 40), and `6101738` decision item 294.
+- **The kernel, by D row:**
+  - **D1:** `PerCpu` publishes through `SetOnce`, so it needs no `unsafe`, and 27 tables use it (5,062 bytes an index).
+  - **D2:** Online Capable is read from MADT revision 5 on.
+  - **D3:** the "CPU indexes" line; the stack region's reserve, with its tables made from a second pool run.
+  - **D4:** budget B19's line.
+  - **D5:** `percpu-gate`.
+  - **D6:** NVMe queues while pairs and vectors last.
+  - **D7:** the machines below.
+  - **D8:** the start-up total printed.
+- **Changed outside the per-processor tables:**
+  1. **The boot checker judges the serial log once a line has ended, not every few bytes** (`16cf7a3`). That had been quadratic in the log's length. A 65-processor log took 48 minutes to judge, while its kernel takes about 60 s. A kernel boot of 1 to 4 processors fell from about 126 s to 12–14 s on the Mac, most of it the checker's. `boot-matrix` with every new machine now takes 1,081 s, so CI's boot jobs should shrink too, which is not yet measured there.
+  2. **The concurrent console proof's budget grows with the count** (`f573761`): 5 s and 10 ms for each line, where a fixed 5 s assumed a count.
+  3. **The IOMMU proof's NVMe routes** are the entries `setup_cpu_queues` programmed.
+  4. **On oversubscribed software-processor boots an uneven fair share passes when both workers ran** (`7bc4b0c`, the coordinating session's ruling, recorded in ADR-0013): fairness is not shown on those machines.
+  5. **A controller with no NVMe pair or vector past the driver's two is "not proven"** (`7d136ad`, the coordinating session's ruling), with the proof still demanded on every gate configuration.
+  6. The Loom control `slot_taken_while_it_is_reclaimed` follows `Slots::take`'s text.
+- **One deviation from security invariant (9):** `unsafe` is not only in `percpu.rs`, which has none. There is one new block in `vm::grow_stack_region`, in `vm.rs`, a file already on the unsafe gate's list. It makes the second table run's slice of `Table`s over frames the allocator gave up, as `early` does for the first, with its `SAFETY:` argument. The independent review should read it.
+- **Gates on `15b08fd`, one turn of the machine, a clean tree:**
+  - `cargo xtask check` passed in 436 s: 1,901 host tests, none failed; Loom ran 56 models and caught 83 controls.
+  - `boot-test` passed 11 of 11 in 51 s.
+  - `boot-matrix` passed in 1,081 s.
+  - The quick gates passed before them: `fmt`, `progress` and every document gate.
+- **Controls:** AC-1 to AC-6 each failed where aimed, and the AC-7 positive control passed (ADR-0013). The two new Loom controls were caught.
+- **The machines (D7), kernel boot under QEMU's software processor on the development Mac (10 threads):**
+
+  | Machine | Kernel boot |
+  |---|---|
+  | 1 to 4 processors | 12–14 s each |
+  | 3 processors | 13.0 s (VT-d), 12.9 s (AMD-Vi) |
+  | 65 processors | 74.5 s (VT-d), 74.8 s (AMD-Vi) |
+  | 67-processor sparse machine (APIC IDs 256, 300 and 412) | 72.3 s |
+  | Discovery machine (2 of 4,096 listed) | 13.4 s |
+
+  The new machines add about 400 s of the Mac's 1,081 s `boot-matrix`, about 37 %; the 67-processor machine alone about 9 %.
+- **D7's CI condition:** CI's own times are not measured here, so none of the new machines is required in CI. On a 4-thread runner the 65- and 67-processor machines would be 16 times oversubscribed, where the Mac is 6.5 times, and slower than on the Mac by a factor this branch cannot state. The 288-processor run (`boot-many`) is outside the gate, with its evidence in ADR-0008's "As built".
+- **Not shown:** anything under KVM, in CI or on a physical machine (§74). Online-capable processors under any boot: QEMU never sets the flag, so it is host-tested only. A machine short of memory for its tables: host-tested.
+- **Open, for other tasks:**
+  - a processor first seen through ACPI's namespace has no reserved index (the hot-plug task; research ledger, gap 6);
+  - parallel start-up (D8): 64 APs take about 1.8 s under QEMU, and 287 took 16.5 s;
+  - the "CPU indexes" line names only memory and the stacks' region as what holds a processor back, which is all that can today (AC-3).

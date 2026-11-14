@@ -402,6 +402,20 @@ Each boot failed (`cargo xtask boot-test` exit 1), and every file was restored. 
 
 **Host and gates (the merged tree):** `framekernel::bootproof`'s unit tests pin the table and the exact text of both lines. `cargo xtask check` passes (1111 host tests, 0 failed, 7 ignored; the unsafe gate, with no `unsafe` outside the framework; 29 Loom models and 39 negative controls); `cargo xtask boot-test` passes under Intel and under `ORIGIN_QEMU_IOMMU=amd` (11 of 11 each); `cargo xtask boot-matrix` passes (both IOMMUs at 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, the console machines). All 18 full boots in `boot-matrix`, and the boot-test boots under each IOMMU, ended `boot verdict: 50 of 50 proofs passed`. An earlier `boot-matrix` run, before the merge, stopped at the developer-mode scenario with no serial output for 120 s; it did not recur on any later run.
 
+**Controls of any processor count (ADR-0008 Amendment 1, D1 to D8; TASKS item 58; 2026-11-14 01:17 to 01:32 UTC, QEMU 11.1.3 TCG, Intel VT-d):** temporary edits to an export of `15b08fd`, run in one turn of the machine by a script that applied each one, ran the gate or the `kernel boot` scenario alone, and put the file back.
+
+| # | Edit | Result |
+|---|---|---|
+| AC-1 | `tlb::ASKED` left out of the framework's `size_per_cpu` | `cargo xtask percpu-gate` refused the build: `` `tlb::ASKED` is a PerCpu table that `size_per_cpu` in framekernel/frame/src/percpu.rs does not size `` |
+| AC-2 | `MAX_CPUS` put back in `limits.rs` | `percpu-gate` refused it: `names MAX_CPUS: no processor count is compiled in (D5)` |
+| AC-3 | The count fixed one short of what the tables and the region hold (`smp::start`), 3 processors | `27 per-CPU tables hold 2 each`, `SMP: 2 of 3 enabled processors online`, `boot verdict: degraded: 65 of 67 proofs passed; failed: application processors (fewer processors), …`. The boot test failed on its first missing marker. The line said `held back: none`: it names memory and the stacks' region, and the count comes from nothing else, so this edit makes a shortfall the line cannot attribute |
+| AC-4 | The shootdown's scan stopping one short of the count (`Shootdown::shoot`), 3 processors | `TLB: 2 other processors cached 3 pages; …, 3 of their 6 reads faulted and 3 saw a stale translation: TLB failed`, the Refuse proof |
+| AC-5 | The kernel stacks' region not grown (`stack::grow`), 65 processors | `27 per-CPU tables hold 64 each`, `held back: 0 for want of memory for their tables, 1 by the kernel stacks' region`, `SMP: 64 of 65`; the verdict lists `application processors (fewer processors)` |
+| AC-6 | NVMe queues given past the pairs the controller allocated (`setup_cpu_queues` ignores `pairs`), 65 processors | `NVMe: per-CPU queues: a per-processor queue was refused: NVMe failed` |
+| AC-7 | **A planted configuration, the positive control the coordinating session asked for** (2026-11-14): QEMU's NVMe limited to 2 I/O queue pairs (`ORIGIN_QEMU_NVME_PAIRS=2`), 2 processors, on `7d136ad` | `asked for 4 I/O queue pairs, allocated 2 … 0 for the processors' own`, `per-CPU queues: not proven: the controller allocated 2 I/O queue pairs and has 65 MSI-X vectors, 2 for the driver`, interrupt remapping `3 of 3 (NVMe 1, virtio-net 2)`. The kernel boot passed in 13.2 s, and the verdict is unchanged (`degraded: 66 of 67; failed: speculation controls`) |
+
+Each of AC-1 to AC-6 failed where it was aimed, and AC-7 passed as it should. The Loom models' two new controls, `shootdown_records_one_short` and `shootdown_wait_stops_one_short`, are `cargo xtask loom`'s, caught in `check` on `15b08fd` (56 models, 83 controls).
+
 ## Alternatives
 
 | Alternative | For | Against |

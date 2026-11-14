@@ -23,6 +23,12 @@ On `claude/any-cpu-count`, from the fourth batch (`land/s4-part2`) with S4-3 mer
 - the discovery machine: 2 enabled of the 4,096 the MADT lists;
 - one boot that brought 288 processors online: `cargo xtask boot-many`, outside the gate.
 
+**Gates on `15b08fd`:**
+- `check`: 1,901 host tests passed, 56 Loom models, 83 controls caught.
+- `boot-test`: 11 of 11.
+- `boot-matrix`: 1,081 s.
+- Controls: AC-1 to AC-6 failed where aimed, and AC-7 passed (ADR-0013).
+
 **Not shown:** anything under KVM or on a real processor. CI has not built this. The new machines run in CI only once measured and accepted (D7).
 
 **Open:**
