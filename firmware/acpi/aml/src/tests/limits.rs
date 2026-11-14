@@ -119,6 +119,47 @@ fn huge_buffers_and_packages_are_refused_before_they_are_made() {
     assert!(i.memory_peak() <= small().memory_bytes);
 }
 
+/// A limit larger than the heap can give (the coordinating session's ruling on step B3's limit,
+/// 2026-11-14): an allocation the allocator itself refuses, not the budget, ends the evaluation
+/// with the memory limit, leaves no count, peak or work behind, and the interpreter goes on. The
+/// buffer asked for is nearly 8 EiB, which no address space here can hold, so the host's
+/// allocator returns null as the kernel heap does when it has no frames.
+#[test]
+fn an_allocation_the_heap_refuses_is_the_memory_limit_and_leaves_nothing_behind() {
+    let limits = Limits {
+        memory_bytes: usize::MAX,
+        ..small()
+    };
+    let mut i = interp_with(IntegerWidth::Bits64, limits);
+    load(
+        &mut i,
+        &[
+            method("HUGE", 0, &[ret(buffer(qword(0x7FFF_FFFF_FFFF_0000), &[]))]),
+            method("SMAL", 0, &[ret(buffer(byte(4), &[1, 2, 3, 4]))]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        i.evaluate("SMAL", &[]).unwrap(),
+        Some(Value::Buffer(vec![1, 2, 3, 4]))
+    );
+    let peak = i.memory_peak();
+    assert_eq!(limit_of(i.evaluate("HUGE", &[])), Limit::Memory);
+    // The evaluation's own frames may raise the peak a little; the refused bytes may not.
+    assert!(
+        i.memory_peak() < peak + 4096,
+        "the refused bytes were never held: peak {}",
+        i.memory_peak()
+    );
+    let peak = i.memory_peak();
+    // The step limit is small's: had the refused bytes been counted as work, this would stop.
+    assert_eq!(
+        i.evaluate("SMAL", &[]).unwrap(),
+        Some(Value::Buffer(vec![1, 2, 3, 4]))
+    );
+    assert!(i.memory_peak() < peak + 4096);
+}
+
 #[test]
 fn the_step_limit_stops_straight_line_code() {
     let limits = Limits {
