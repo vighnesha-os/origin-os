@@ -586,20 +586,24 @@ fn nvme_per_cpu_markers(machine: &Machine, cpus: u32) -> Vec<String> {
     nvme_per_cpu_markers_for(machine, cpus, qemu_nvme_pairs())
 }
 
-/// [`nvme_per_cpu_markers`] for a controller that allocates `pairs` I/O queue pairs.
+/// [`nvme_per_cpu_markers`] for a controller that allocates `pairs` I/O queue pairs. The kernel
+/// judges on the controller's own numbers and prints each (review finding F5 of 2026-11-14):
+/// QEMU 11.1's controller allocates its `max_ioqpairs` whatever is asked.
 fn nvme_per_cpu_markers_for(machine: &Machine, cpus: u32, pairs: u32) -> Vec<String> {
     let queued = nvme_queued_for(cpus, pairs);
-    let pairs = (2 + cpus).min(pairs);
+    let numbers = format!(
+        "the controller allocated {pairs} submission and {pairs} completion queues, has {QEMU_NVME_VECTORS} MSI-X vectors, and BAR 0 holds the doorbells of {QEMU_NVME_BAR_QUEUES} I/O queues; the driver keeps 2 of each"
+    );
     if queued == 0 {
         return vec![format!(
-            "origin-kernel: NVMe: per-CPU queues: not proven: the controller allocated {pairs} I/O queue pairs and has {QEMU_NVME_VECTORS} MSI-X vectors, 2 for the driver"
+            "origin-kernel: NVMe: per-CPU queues: not proven: {numbers}"
         )];
     }
     std::iter::once(format!(
-        "origin-kernel: NVMe: per-CPU queues: {queued} of {cpus} processors have an I/O queue pair and MSI-X vector of their own, {} have none (the controller allocated {pairs} I/O queue pairs, 2 for the driver, and has {QEMU_NVME_VECTORS} MSI-X vectors, 2 for the driver)",
+        "origin-kernel: NVMe: per-CPU queues: {queued} of {cpus} processors have an I/O queue pair and MSI-X vector of their own, {} have none ({numbers}): {queued} expected, {queued} filled",
         cpus - queued
     ))
-    .chain((0..queued).map(|index| {
+    .chain(queue_order(machine).into_iter().take(queued as usize).map(|index| {
         format!(
             "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, ",
             machine.named(index)
@@ -618,6 +622,27 @@ fn nvme_per_cpu_markers_for(machine: &Machine, cpus: u32, pairs: u32) -> Vec<Str
 /// processor past what is left has no queue of its own (ADR-0008 Amendment 1, D6).
 const QEMU_NVME_PAIRS: u32 = 64;
 const QEMU_NVME_VECTORS: u32 = 65;
+/// The highest I/O queue id whose doorbells QEMU 11.1's controller's BAR 0 holds: 16 KiB with
+/// doorbell stride 4, so queue 1535's completion doorbell is the last dword (`nvme::doorbell_queues`).
+const QEMU_NVME_BAR_QUEUES: u32 = 1535;
+
+/// The CPU indexes in the order the kernel gives them NVMe queues of their own: every processor
+/// whose APIC ID is above 255 first, then the rest in table order (`storage::queue_order`;
+/// ADR-0008 Amendment 1, D6; review finding F1 of 2026-11-14). The first [`nvme_queued`] of
+/// them get one, MSI-X entry `2 + k` for the `k`th.
+fn queue_order(machine: &Machine) -> Vec<u32> {
+    let wide = |index: &u32| {
+        machine
+            .apic_ids
+            .get(*index as usize)
+            .is_some_and(|&id| id > 0xFF)
+    };
+    let all = 0..machine.cpus();
+    all.clone()
+        .filter(wide)
+        .chain(all.filter(|index| !wide(index)))
+        .collect()
+}
 
 /// The I/O queue pairs this boot's NVMe controller allocates: QEMU's default, or
 /// `ORIGIN_QEMU_NVME_PAIRS` (at least 2), which limits its `max_ioqpairs` for the control that
@@ -1682,15 +1707,21 @@ fn bridge_markers(scenario: &mut Scenario) {
     }
 }
 
-/// What the kernel reports about its processors' x2APIC IDs: for each one above 255, its
-/// interrupts reach it through an IRTE holding its full ID (NVMe MSI-X entry `2 + index`)
-/// and wake its threads; with none, that there is nothing to prove.
+/// What the kernel reports about its processors' x2APIC IDs: for each one above 255 with an
+/// NVMe queue of its own, its interrupts reach it through an IRTE holding its full ID (MSI-X
+/// entry `2 + k`, `k` its place in [`queue_order`], which puts them first: review finding F1 of
+/// 2026-11-14) and wake its threads; with none above 255, that there is nothing to prove.
 fn x2apic_markers(machine: &Machine) -> Vec<String> {
     let queued = nvme_queued(machine.cpus());
     let all_wide = machine.apic_ids.iter().filter(|&&id| id > 0xFF).count();
-    let wide: Vec<(u32, u32)> = (0..queued)
-        .zip(machine.apic_ids.iter().copied())
-        .filter(|&(_, id)| id > 0xFF)
+    let wide: Vec<(u32, u32, u32)> = queue_order(machine)
+        .into_iter()
+        .take(queued as usize)
+        .zip(0..)
+        .filter_map(|(index, k)| {
+            let id = machine.apic_ids.get(index as usize).copied()?;
+            (id > 0xFF).then_some((k, index, id))
+        })
         .collect();
     if wide.is_empty() && all_wide > 0 {
         // ADR-0008 Amendment 1, D6: none of them has an NVMe queue of its own.
@@ -1705,12 +1736,12 @@ fn x2apic_markers(machine: &Machine) -> Vec<String> {
         )];
     }
     wide.into_iter()
-        .flat_map(|(index, id)| {
+        .flat_map(|(k, index, id)| {
             [
                 format!(
                     "origin-kernel: x2APIC: {} is above 255, which a compatibility-format MSI address cannot carry (refused true); its NVMe MSI-X entry {} holds only remappable handle ",
                     machine.named(index),
-                    2 + index
+                    2 + k
                 ),
                 format!(
                     ", whose IRTE sends vector 0x40 to destination {id} after checking source ID 0x0010: true; "
@@ -6385,7 +6416,34 @@ mod gate_tests {
 
 #[cfg(test)]
 mod nvme_marker_tests {
-    use super::{Geometry, Machine, QEMU_NVME_PAIRS, nvme_per_cpu_markers_for};
+    use super::{
+        Geometry, Machine, QEMU_NVME_PAIRS, nvme_per_cpu_markers_for, queue_order, x2apic_markers,
+    };
+
+    /// Review finding F1 of 2026-11-14: on the gate's large sparse machine the three processors
+    /// above APIC ID 255 get the first queues, so interrupts through remapping to them are
+    /// proven there, never "nothing to prove".
+    #[test]
+    fn the_processors_above_255_get_the_first_queues() {
+        let mut m = dense(67);
+        m.apic_ids = (0..64).chain([256, 300, 412]).collect();
+        assert_eq!(queue_order(&m)[..4], [64, 65, 66, 0]);
+        let x2apic = x2apic_markers(&m);
+        assert!(x2apic.iter().all(|l| !l.contains("nothing to prove")));
+        for (k, (index, id)) in [(64, 256), (65, 300), (66, 412)].into_iter().enumerate() {
+            assert!(
+                x2apic.iter().any(|l| l
+                    .contains(&format!("CPU {index} (APIC ID {id}) is above 255"))
+                    && l.contains(&format!("MSI-X entry {} holds", 2 + k))),
+                "CPU {index}"
+            );
+        }
+        let nvme = nvme_per_cpu_markers_for(&m, 67, QEMU_NVME_PAIRS);
+        assert!(nvme[1].starts_with("origin-kernel: NVMe: CPU 64 (APIC ID 256): "));
+        assert!(nvme[4].starts_with("origin-kernel: NVMe: CPU 0 (APIC ID 0): "));
+        // A machine with no processor above 255 keeps table order.
+        assert_eq!(queue_order(&dense(3)), [0, 1, 2]);
+    }
 
     fn dense(cpus: u32) -> Machine {
         Machine {
@@ -6427,7 +6485,7 @@ mod nvme_marker_tests {
         assert_eq!(
             limited,
             [
-                "origin-kernel: NVMe: per-CPU queues: not proven: the controller allocated 2 I/O queue pairs and has 65 MSI-X vectors, 2 for the driver"
+                "origin-kernel: NVMe: per-CPU queues: not proven: the controller allocated 2 submission and 2 completion queues, has 65 MSI-X vectors, and BAR 0 holds the doorbells of 1535 I/O queues; the driver keeps 2 of each"
             ]
         );
         // Three pairs give one processor a queue: proven again.
