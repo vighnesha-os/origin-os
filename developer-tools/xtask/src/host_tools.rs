@@ -43,7 +43,12 @@
 //!   runs one on its own, since each re-runs `xtask` the same way, until TASKS item 61. **By
 //!   decision item 311** (accepted by the owner on 2026-11-14, "Accept 311"; T1's third note in
 //!   ADR-0011 Amendment 4), the same allowance covers the three that TASKS item 58 added
-//!   (`boot_sparse`, `boot_many`, `boot_listed`): nine scenario commands in all. And a
+//!   (`boot_sparse`, `boot_many`, `boot_listed`): nine scenario commands in all. **By decision
+//!   item 312** (accepted by the owner on 2026-11-14, "Accept 312"; T1's fourth note in ADR-0011
+//!   Amendment 4), the general form: until TASKS item 61, any scenario command of `boot-matrix`'s
+//!   that re-runs `xtask` the same way is allowed, each still named in [`SELF_RUNS`] under its
+//!   own constant citing the item; the first is `boot_acpi`, the ACPI machine TASKS item 62
+//!   added: ten scenario commands in all. And a
 //!   test that starts a first-party program to test that same program is outside T1: the turn
 //!   lock's own test (`turns::tests::the_lock_goes_with_the_process_however_it_ends`) starts its
 //!   test binary to hold the lock and be killed. It stays listed in [`SELF_RUNS`], so that every
@@ -189,12 +194,17 @@ pub(crate) struct Known {
 /// Item 300's words: `boot-matrix` re-running `xtask` for each scenario.
 const ITEM_300: &str = "decision item 300: `boot-matrix` re-runs `xtask` for each scenario";
 /// The first six scenario commands `boot-matrix` runs as steps, also when run alone (the
-/// review's finding F6; decision item 310). With [`ITEM_311_MACHINE`]'s three, nine in all.
+/// review's finding F6; decision item 310). With [`ITEM_311_MACHINE`]'s three, nine in all, and
+/// [`ITEM_312_MACHINE`]'s since.
 const ITEM_310_MACHINE: &str = "decision item 310: a scenario command of `boot-matrix`'s, also when run on its own, until TASKS item 61";
 /// The three scenario commands TASKS item 58 added (`boot-sparse`, `boot-many`, `boot-listed`),
 /// which re-run `xtask` as the six do (decision item 311, ADR-0011 Amendment 4, T1's third
 /// note).
 const ITEM_311_MACHINE: &str = "decision item 311: a scenario command of `boot-matrix`'s that TASKS item 58 added, also when run on its own, until TASKS item 61";
+/// A scenario command of `boot-matrix`'s added after item 311, which re-runs `xtask` as the nine
+/// do: the general form of decision item 312, until TASKS item 61 (ADR-0011 Amendment 4, T1's
+/// fourth note). The first is `boot-acpi` (TASKS item 62).
+const ITEM_312_MACHINE: &str = "decision item 312 (ADR-0011 Amendment 4, T1's fourth note): a scenario command of `boot-matrix`'s that re-runs `xtask` the same way, also when run on its own, until TASKS item 61";
 /// The turn lock's own test (finding F6; decision item 310).
 const ITEM_310_TEST: &str = "decision item 310: a test starting the program it tests, outside T1";
 
@@ -213,6 +223,7 @@ pub(crate) const SELF_RUNS: &[(&str, &str, &str)] = &[
     ("src/main.rs", "boot_sparse", ITEM_311_MACHINE),
     ("src/main.rs", "boot_many", ITEM_311_MACHINE),
     ("src/main.rs", "boot_listed", ITEM_311_MACHINE),
+    ("src/main.rs", "boot_acpi", ITEM_312_MACHINE),
     (
         "src/turns.rs",
         "the_lock_goes_with_the_process_however_it_ends",

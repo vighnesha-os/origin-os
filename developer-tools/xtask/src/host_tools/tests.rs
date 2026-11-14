@@ -194,12 +194,14 @@ fn xtask_names_itself_only_where_the_list_allows() {
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert!(hits[0].what.contains("`boot_matrix`") && hits[0].what.contains("300"));
     // Each listed place names its authority: item 300 for `boot_matrix`, item 311 for the three
-    // scenario commands TASKS item 58 added, item 310 for the rest (the review of 2026-11-14,
-    // finding F6; all three accepted by the owner).
+    // scenario commands TASKS item 58 added, item 312 for those added since (`boot_acpi`, TASKS
+    // item 62), item 310 for the rest (the review of 2026-11-14, finding F6; all four accepted by
+    // the owner).
     for (file, function, why) in SELF_RUNS {
         let expected = match *function {
             "boot_matrix" => "decision item 300",
             "boot_sparse" | "boot_many" | "boot_listed" => "decision item 311",
+            "boot_acpi" => "decision item 312 (ADR-0011 Amendment 4, T1's fourth note)",
             _ => "decision item 310",
         };
         assert!(why.contains(expected), "{file} {function}: {why}");
