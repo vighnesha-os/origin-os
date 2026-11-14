@@ -545,7 +545,7 @@ pub(crate) mod tests {
             ],
             &[characteristics(0x41), characteristics(0x41)],
         );
-        let m = Mpst::parse(&t).unwrap_or_else(|e| panic!("{e}"));
+        let m = Mpst::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(m.channel, 4);
         let nodes: Vec<_> = m.nodes().map(Result::unwrap).collect();
         assert_eq!(nodes.len(), 2);
@@ -647,7 +647,7 @@ pub(crate) mod tests {
                 dev(0xFF, 0, 0, &[0xAB; 20]),
             ],
         );
-        let p = Pmtt::parse(&t).unwrap_or_else(|e| panic!("{e}"));
+        let p = Pmtt::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
         let mut seen = Vec::new();
         p.walk(&mut |n| seen.push((n.depth, n.device))).unwrap();
         assert_eq!(seen.len(), 4);

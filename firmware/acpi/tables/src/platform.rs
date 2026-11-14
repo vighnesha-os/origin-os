@@ -75,8 +75,9 @@ impl<'a> Ecdt<'a> {
             .position(|&c| c == 0)
             .ok_or_else(|| b.error(65, ErrorKind::Value { field: "EC_ID" }))?;
         let id = tail.get(..end).unwrap_or(&[]);
-        let path_char =
-            |c: &u8| c.is_ascii_uppercase() || c.is_ascii_digit() || b"_.\\^".contains(c);
+        let path_char = |c: &u8| {
+            c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, b'_' | b'.' | b'\\' | b'^')
+        };
         if id.is_empty() || !id.iter().all(path_char) {
             return Err(b.error(65, ErrorKind::Value { field: "EC_ID" }));
         }

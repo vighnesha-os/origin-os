@@ -573,7 +573,7 @@ pub(crate) mod tests {
             capabilities(1, 0b111),
             s(0x99, &[]),
         ]);
-        let n = Nfit::parse(&t).unwrap_or_else(|e| panic!("{e}"));
+        let n = Nfit::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
         let all: Vec<_> = n.entries().map(|e| e.unwrap().1).collect();
         assert!(
             matches!(all[0], NfitEntry::SpaRange { index: 1, cookie: Some(0xC00C), range_type, .. } if range_type == range_type::PERSISTENT_MEMORY)

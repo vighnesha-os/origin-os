@@ -287,7 +287,7 @@ pub(crate) mod tests {
             cache(0x0040_1111, 1, &[0x10, 0x11]),
             s(9, &[]),
         ]);
-        let h = Hmat::parse(&t).unwrap_or_else(|e| panic!("{e}"));
+        let h = Hmat::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
         let all: Vec<_> = h.entries().map(Result::unwrap).collect();
         assert_eq!(
             all[0],

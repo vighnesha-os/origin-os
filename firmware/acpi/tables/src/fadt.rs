@@ -678,7 +678,7 @@ pub(crate) mod tests {
         let mut t = fadt();
         t.truncate(MIN_LEN);
         seal(&mut t);
-        let f = Fadt::parse(&t).unwrap_or_else(|e| panic!("{e}"));
+        let f = Fadt::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(
             (f.x_dsdt, f.reset_reg, f.sleep_control_reg),
             (None, None, None)
@@ -787,7 +787,7 @@ pub(crate) mod tests {
             put(t, 244, &gas(0, 8, 0, 1, 0xFED8_0000));
             put(t, 256, &gas(0, 8, 0, 1, 0xFED8_0004));
         });
-        let f = Fadt::parse(&t).unwrap_or_else(|e| panic!("{e}"));
+        let f = Fadt::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(f.facs_address(), None);
         assert_eq!(f.sleep_status_reg.unwrap().address, 0xFED8_0004);
     }

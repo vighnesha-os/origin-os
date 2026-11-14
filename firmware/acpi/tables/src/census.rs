@@ -8,8 +8,6 @@
 //! (ADR-0019 A1), the OEM's, or a signature no document named here defines. What those documents
 //! define is "not supported" until a task reads them.
 
-use core::fmt;
-
 use crate::error::{Error, Signature};
 use crate::header::{self, Header, Table};
 
@@ -88,6 +86,17 @@ impl Summary {
         self.structures
     }
 
+    /// Each type met and how many of it, in the order first met.
+    pub fn kinds(&self) -> impl Iterator<Item = (u16, u32)> + '_ {
+        self.kinds.iter().take(self.distinct).copied()
+    }
+
+    /// How many structures had a type past the ones counted one by one.
+    #[must_use]
+    pub const fn others(&self) -> u32 {
+        self.others
+    }
+
     /// How many structures of type `kind` it held.
     #[must_use]
     pub fn of_kind(&self, kind: u16) -> u32 {
@@ -97,35 +106,6 @@ impl Summary {
             .iter()
             .find(|(k, _)| *k == kind)
             .map_or(0, |(_, n)| *n)
-    }
-}
-
-impl fmt::Display for Summary {
-    /// `N structures (type×count, ...)`, types in the order first met; or `N entries`; or nothing
-    /// for a table with neither.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.entries != 0 {
-            write!(f, "{} entries", self.entries)?;
-            if self.structures == 0 {
-                return Ok(());
-            }
-            f.write_str(", ")?;
-        }
-        if self.structures == 0 {
-            return Ok(());
-        }
-        write!(f, "{} structures", self.structures)?;
-        f.write_str(" (")?;
-        for (i, (kind, n)) in self.kinds.iter().take(self.distinct).enumerate() {
-            if i != 0 {
-                f.write_str(", ")?;
-            }
-            write!(f, "{kind}x{n}")?;
-        }
-        if self.others != 0 {
-            write!(f, ", {} more", self.others)?;
-        }
-        f.write_str(")")
     }
 }
 
@@ -174,24 +154,6 @@ pub enum Class {
     Oem,
     /// A signature none of those documents defines; its header checked.
     Unknown,
-}
-
-impl fmt::Display for Class {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Checked(summary) if summary.structures == 0 && summary.entries == 0 => {
-                f.write_str("checked")
-            }
-            Self::Checked(summary) => write!(f, "checked: {summary}"),
-            Self::OtherArea(what) => write!(f, "{what}: header checked, not parsed here"),
-            Self::OtherSpecification(what) => {
-                write!(f, "{what}, another specification's: header checked")
-            }
-            Self::NotX86(what) => write!(f, "{what}: not for x86-64, header checked"),
-            Self::Oem => f.write_str("an OEM's table: header checked"),
-            Self::Unknown => f.write_str("a signature not known here: header checked"),
-        }
-    }
 }
 
 /// One table's result.
@@ -407,18 +369,31 @@ mod tests {
     #[test]
     fn every_signature_is_accounted_for() {
         for (sig, expect) in [
-            (b"BERT", "area G"),
-            (b"PCCT", "area H"),
-            (b"GTDT", "not for x86-64"),
-            (b"DMAR", "VT-d"),
-            (b"WAET", "emulated devices"),
-            (b"OEMB", "OEM"),
-            (b"ZZZZ", "not known"),
+            (
+                b"BERT",
+                Class::OtherArea("ACPI 6.6 §18.3.1, APEI (ADR-0019 area G)"),
+            ),
+            (
+                b"PCCT",
+                Class::OtherArea("ACPI 6.6 §14.1, the PCC (ADR-0019 area H)"),
+            ),
+            (
+                b"GTDT",
+                Class::NotX86("ACPI 6.6 §5.2.25, Arm's generic timers"),
+            ),
+            (
+                b"DMAR",
+                Class::OtherSpecification("Intel VT-d's DMA remapping table"),
+            ),
+            (
+                b"WAET",
+                Class::OtherSpecification("Microsoft's emulated devices table"),
+            ),
+            (b"OEMB", Class::Oem),
+            (b"ZZZZ", Class::Unknown),
         ] {
             let t = table(sig, 1, &[]);
-            let census = check(&t).unwrap();
-            let line = format!("{}", census.class);
-            assert!(line.contains(expect), "{line}");
+            assert_eq!(check(&t).unwrap().class, expect, "{sig:?}");
         }
         assert_eq!(OTHER_SPECIFICATIONS.len(), OTHER_NAMES.len());
         for s in OTHER_SPECIFICATIONS {
@@ -435,25 +410,16 @@ mod tests {
         assert_eq!(s.structures(), 4);
         assert_eq!(s.of_kind(0), 2);
         assert_eq!(s.of_kind(5), 0);
-        assert_eq!(format!("{s}"), "4 structures (0x2, 1x1, 9x1)");
+        assert_eq!(s.kinds().collect::<Vec<_>>(), [(0, 2), (1, 1), (9, 1)]);
         let mut many = Summary::new();
         for kind in 0..30u16 {
             many.count(kind);
         }
-        assert_eq!(format!("{many}").matches("x1").count(), KINDS);
-        assert!(format!("{many}").ends_with(", 6 more)"));
+        assert_eq!(many.kinds().count(), KINDS);
+        assert_eq!(many.others(), 6);
         let mut entries = Summary::new();
         entries.entry();
         entries.entry();
-        assert_eq!(format!("{}", Class::Checked(entries)), "checked: 2 entries");
-        assert_eq!(format!("{}", Class::Checked(Summary::new())), "checked");
-        assert_eq!(
-            format!("{}", Class::Checked(s)),
-            "checked: 4 structures (0x2, 1x1, 9x1)"
-        );
-        assert_eq!(
-            format!("{}", Class::OtherSpecification("the IA-PC HPET table")),
-            "the IA-PC HPET table, another specification's: header checked"
-        );
+        assert_eq!((entries.entries(), entries.structures()), (2, 0));
     }
 }

@@ -260,7 +260,7 @@ pub(crate) mod tests {
         let mut vmmio = vec![4, 0, 16, 0, 0, 0, 0, 0];
         vmmio.extend_from_slice(&0xFEC0_0000u64.to_le_bytes());
         let t = viot(48, 4, &[pci_iommu(), pci_range(48, 0, 0xFF), mmio, vmmio]);
-        let v = Viot::parse(&t).unwrap_or_else(|e| panic!("{e}"));
+        let v = Viot::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
         let all: Vec<_> = v.nodes().map(|n| n.unwrap().1).collect();
         assert_eq!(
             all[0],

@@ -334,7 +334,7 @@ pub(crate) mod tests {
             ],
             Some(&[9, 9]),
         );
-        let n = Nhlt::parse(&t).unwrap_or_else(|e| panic!("{e}"));
+        let n = Nhlt::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(n.oed_config, Some(&[9, 9][..]));
         let eps: Vec<_> = n.endpoints().map(Result::unwrap).collect();
         assert_eq!(

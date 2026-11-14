@@ -59,8 +59,8 @@ fn checked(table: &[u8]) -> Result<census::Census, crate::Error> {
     // A refusal names a place in the table; only a field the table ends before can be past it.
     if let Err(e) = &result {
         match e.kind {
-            crate::ErrorKind::Truncated { need } => assert!(e.at < need.max(1), "{e}"),
-            _ => assert!(e.at <= table.len(), "a refusal past the table: {e}"),
+            crate::ErrorKind::Truncated { need } => assert!(e.at < need.max(1), "{e:?}"),
+            _ => assert!(e.at <= table.len(), "a refusal past the table: {e:?}"),
         }
     }
     result
@@ -71,7 +71,7 @@ fn every_sample_is_checked_whole() {
     let all = samples();
     assert!(all.len() >= 30, "{} samples", all.len());
     for t in &all {
-        let c = checked(t).unwrap_or_else(|e| panic!("{e}"));
+        let c = checked(t).unwrap_or_else(|e| panic!("{e:?}"));
         assert!(
             matches!(c.class, Class::Checked(_)),
             "{:?}",

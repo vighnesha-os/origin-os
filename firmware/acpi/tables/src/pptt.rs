@@ -351,7 +351,7 @@ pub(crate) mod tests {
     #[test]
     fn follows_every_reference() {
         let t = topology();
-        let p = Pptt::parse(&t).unwrap_or_else(|e| panic!("{e}"));
+        let p = Pptt::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(p.len(), 6);
         assert!(matches!(p.at(88), Some(PpttEntry::Node { parent: 36, .. })));
         assert!(matches!(

@@ -560,7 +560,7 @@ pub(crate) mod tests {
             ]
             .concat(),
         );
-        let p = Phat::parse(&t).unwrap_or_else(|e| panic!("{e}"));
+        let p = Phat::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
         let all: Vec<_> = p.records().map(Result::unwrap).collect();
         assert!(matches!(all[0], PhatRecord::Versions(v) if v.len() == 28));
         assert!(matches!(

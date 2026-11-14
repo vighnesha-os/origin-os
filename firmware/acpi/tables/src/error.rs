@@ -20,25 +20,28 @@ impl Signature {
     }
 }
 
-impl fmt::Display for Signature {
-    /// Printable ASCII as itself, anything else as `?`: a signature is firmware data, and a
-    /// console line must not carry control characters from it.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for &b in &self.0 {
-            let c = if b.is_ascii_graphic() || b == b' ' {
-                char::from(b)
+impl Signature {
+    /// The signature as text: printable ASCII as itself, anything else as `?`, so that a console
+    /// line never carries control characters from firmware.
+    pub fn printable(self) -> [u8; 4] {
+        self.0.map(|b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                b
             } else {
-                '?'
-            };
-            fmt::Write::write_char(f, c)?;
-        }
-        Ok(())
+                b'?'
+            }
+        })
     }
 }
 
 impl fmt::Debug for Signature {
+    /// Only `Formatter::write_str` and `str::from_utf8`, which return rather than panic: the
+    /// crate's release object holds no other formatting (the no-panic check).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "\"{self}\"")
+        let text = self.printable();
+        f.write_str("\"")?;
+        f.write_str(core::str::from_utf8(&text).unwrap_or("????"))?;
+        f.write_str("\"")
     }
 }
 
@@ -119,35 +122,5 @@ impl Error {
     #[must_use]
     pub const fn new(table: Signature, at: usize, kind: ErrorKind) -> Self {
         Self { table, at, kind }
-    }
-}
-
-impl fmt::Display for ErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::Signature { found } => write!(f, "signature {found} where another was expected"),
-            Self::Length {
-                declared,
-                available,
-            } => write!(f, "length {declared} with {available} bytes given"),
-            Self::Revision(r) => write!(f, "revision {r}, whose layout is not ACPI 6.6's"),
-            Self::TooShort { need } => write!(f, "too short for its revision: needs {need} bytes"),
-            Self::Checksum => f.write_str("checksum"),
-            Self::Truncated { need } => write!(f, "runs past the end, to {need:#x}"),
-            Self::Structure { kind, length } => {
-                write!(f, "structure type {kind} with length {length}")
-            }
-            Self::Offset { field } => write!(f, "{field} points outside its table"),
-            Self::Value { field } => write!(f, "{field} holds a value it may not"),
-            Self::Inconsistent { field } => write!(f, "{field} disagrees with another field"),
-            Self::Reference { field } => write!(f, "{field} names no structure of its kind"),
-            Self::Cycle => f.write_str("its parents form a cycle"),
-        }
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} at {:#x}: {}", self.table, self.at, self.kind)
     }
 }

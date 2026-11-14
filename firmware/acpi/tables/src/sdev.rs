@@ -75,7 +75,9 @@ fn span<'a>(b: &Bytes<'a>, at: usize, field: &'static str) -> Result<&'a [u8], E
 /// Refused: one that is empty or does not end in its NUL.
 fn string<'a>(b: &Bytes<'a>, at: usize, field: &'static str) -> Result<&'a [u8], Error> {
     match span(b, at, field)?.split_last() {
-        Some((0, text)) if !text.is_empty() && !text.contains(&0) => Ok(text),
+        // No NUL before the last byte. Written as a scan, not `contains`, whose memchr the
+        // no-panic check does not allow.
+        Some((0, text)) if !text.is_empty() && text.iter().all(|&c| c != 0) => Ok(text),
         _ => Err(b.error(at, ErrorKind::Value { field })),
     }
 }
@@ -324,7 +326,7 @@ pub(crate) mod tests {
             1,
             &[namespace(b"\\_SB.I2C0", &comps), pcie(&[0x12, 0, 2, 1])].concat(),
         );
-        let s = Sdev::parse(&t).unwrap_or_else(|e| panic!("{e}"));
+        let s = Sdev::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
         let all: Vec<_> = s.devices().map(Result::unwrap).collect();
         assert!(matches!(
             all[0],

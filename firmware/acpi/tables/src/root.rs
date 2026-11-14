@@ -50,10 +50,13 @@ impl<'a> Root<'a> {
             .bytes()
             .get(HEADER_LEN..)
             .unwrap_or(&[])
-            .chunks_exact(width)
+            // 4 or 8; `max` lets the compiler see it is never 0, so no panic path is built.
+            .chunks_exact(width.max(1))
             .map(|c| {
                 let mut v = [0u8; 8];
-                v.get_mut(..c.len()).unwrap_or(&mut []).copy_from_slice(c);
+                for (to, from) in v.iter_mut().zip(c) {
+                    *to = *from;
+                }
                 u64::from_le_bytes(v)
             })
     }

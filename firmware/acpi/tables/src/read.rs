@@ -96,9 +96,7 @@ impl<'a> Bytes<'a> {
 
     /// `N` bytes at `at`.
     pub(crate) fn array<const N: usize>(&self, at: usize) -> Result<[u8; N], Error> {
-        let mut out = [0u8; N];
-        out.copy_from_slice(self.get(at, N)?);
-        Ok(out)
+        <[u8; N]>::try_from(self.get(at, N)?).map_err(|_| self.truncated(at, N))
     }
 
     /// The byte at `at`.
@@ -171,7 +169,7 @@ impl<'a> Bytes<'a> {
 
 /// A GUID as its 16 bytes are stored (ACPI 6.6 §5.2.4: the first three fields little-endian),
 /// compared byte for byte.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Guid(pub [u8; 16]);
 
 impl Guid {
@@ -185,20 +183,6 @@ impl Guid {
             a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], d[0], d[1], d[2], d[3], d[4], d[5],
             d[6], d[7],
         ])
-    }
-}
-
-impl core::fmt::Debug for Guid {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let g = &self.0;
-        let a = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
-        let b = u16::from_le_bytes([g[4], g[5]]);
-        let c = u16::from_le_bytes([g[6], g[7]]);
-        write!(f, "{a:08x}-{b:04x}-{c:04x}-{:02x}{:02x}-", g[8], g[9])?;
-        for byte in &g[10..] {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
     }
 }
 
@@ -245,14 +229,20 @@ mod tests {
     }
 
     #[test]
-    fn guids_print_in_their_usual_form() {
+    fn guids_are_stored_as_acpi_stores_them() {
         let g = Guid::from_fields(
             0x6619_4C2D,
             0x2E83,
             0x4B8F,
             [0x9D, 0x3E, 0x1B, 0x4E, 0x8A, 0x7C, 0x0D, 0x22],
         );
-        assert_eq!(format!("{g:?}"), "66194c2d-2e83-4b8f-9d3e-1b4e8a7c0d22");
-        assert_eq!(g.0[0], 0x2D, "the first field is stored little-endian");
+        assert_eq!(
+            g.0,
+            [
+                0x2D, 0x4C, 0x19, 0x66, 0x83, 0x2E, 0x8F, 0x4B, 0x9D, 0x3E, 0x1B, 0x4E, 0x8A, 0x7C,
+                0x0D, 0x22
+            ],
+            "the first three fields are stored little-endian"
+        );
     }
 }

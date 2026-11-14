@@ -8,7 +8,7 @@
 //! kernel does depends on these results yet: the tables it already uses are read where they always
 //! were (`acpi.rs`).
 
-use core::fmt::{self, Write};
+use core::fmt::Write;
 
 use origin_acpi_tables::boot::{Fpdt, FpdtRecord, PerformanceKind, PerformanceTable};
 use origin_acpi_tables::census::{self, Class};
@@ -17,6 +17,7 @@ use origin_acpi_tables::fadt::Fadt;
 use origin_acpi_tables::header::{HEADER_LEN, Header};
 use origin_acpi_tables::{Error, Signature};
 
+use crate::acpi_text::{Ascii, Refused, Sig, Whose};
 use crate::console::Console;
 
 /// Where every line of the census starts.
@@ -30,32 +31,6 @@ struct Counts {
     refused: u32,
     other: u32,
     unreadable: u32,
-}
-
-/// Text from firmware bytes: printable ASCII as itself, anything else as `?`.
-struct Ascii<'a>(&'a [u8]);
-
-impl fmt::Display for Ascii<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for &b in self.0 {
-            let c = if b.is_ascii_graphic() || b == b' ' {
-                char::from(b)
-            } else {
-                '?'
-            };
-            f.write_char(c)?;
-        }
-        Ok(())
-    }
-}
-
-/// A refusal, as a census line gives it.
-struct Refused(Error);
-
-impl fmt::Display for Refused {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "refused at {:#x}: {}", self.0.at, self.0.kind)
-    }
 }
 
 /// Reads the table whose header is at `addr`: the header first, then as many bytes as it says, up
@@ -83,7 +58,7 @@ fn report(
     let _ = write!(
         com1,
         "{LINE}{} rev {}, {} bytes, OEM \"{}\": ",
-        header.signature,
+        Sig(header.signature),
         header.revision,
         header.length,
         Ascii(&header.oem_id)
@@ -95,7 +70,7 @@ fn report(
             } else {
                 counts.other = counts.other.saturating_add(1);
             }
-            let _ = writeln!(com1, "{class}");
+            let _ = writeln!(com1, "{}", Whose(class));
             true
         }
         Err(e) => {
