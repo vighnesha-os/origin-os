@@ -171,6 +171,8 @@ pub mod virtqueue;
 // The kernel proper, for its own target only: the boot flow and the services, on the
 // framework's typed interfaces.
 #[cfg(target_os = "none")]
+mod acpi_census;
+#[cfg(target_os = "none")]
 mod aspace;
 #[cfg(target_os = "none")]
 mod block;

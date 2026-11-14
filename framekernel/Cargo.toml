@@ -23,6 +23,9 @@ bench = false
 
 [dependencies]
 origin-abi = { path = "../runtime/abi" }
+# ACPI 6.6's system description tables, checked whole by the boot's census of them (ADR-0019 A6,
+# area A; TASKS item 62).
+origin-acpi-tables.workspace = true
 origin-boot-info.workspace = true
 # The service directory's generated client and stub: the directory boot proof makes its ring-3
 # programs' messages with them (ipc_proof/directory.rs).

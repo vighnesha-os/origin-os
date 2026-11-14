@@ -225,6 +225,8 @@ const SIGN_PACKAGE: &str = "onbf-sign";
 const OIDL_PACKAGE: &str = "oidl";
 const FREESTANDING_LIBS: &[&str] = &[
     BOOT_INFO_PACKAGE,
+    // ACPI 6.6's tables (ADR-0019 A6, area A): the kernel's census of them.
+    "origin-acpi-tables",
     ONBF_FORMAT_PACKAGE,
     MERKLE_PACKAGE,
     CRYPTO_PACKAGE,
@@ -1798,6 +1800,12 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // off-diagonal >= 10.
             "origin-kernel: slit: ".into(),
             "; consistent true".into(),
+            // Every ACPI table the firmware gives, checked whole (ADR-0019 A6, area A; TASKS
+            // item 62).
+            "origin-kernel: acpi: ".into(),
+            " tables: ".into(),
+            " refused, ".into(),
+            "; consistent true".into(),
             // The random-number generator (ADR-0016): every processor has one, requests are
             // answered with values that differ, and its stack holds only zeros after a request.
             "origin-kernel: random: processor 0: ".into(),
@@ -2188,6 +2196,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": CPU baseline failed",
         ": numa failed",
         ": slit failed",
+        ": acpi tables failed",
         ": random failed",
         "origin-kernel: random: no generator",
         "with prediction resistance: WRONG",

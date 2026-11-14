@@ -16,6 +16,7 @@ name = "framekernel"
 version = "0.0.0"
 dependencies = [
  "origin-abi",
+ "origin-acpi-tables",
  "origin-boot-info",
  "origin-directory",
  "origin-frame",
