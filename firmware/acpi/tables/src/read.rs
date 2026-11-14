@@ -154,19 +154,18 @@ impl<'a> Bytes<'a> {
     }
 
     /// A run of `count` items of `size` bytes each, starting at `at`, which must fit: for an
-    /// array whose offset and count come from the firmware. `field` names the count.
+    /// array whose offset and count come from the firmware. A refusal names `field`, the count or
+    /// offset that does not fit, at its own offset `field_at`.
     pub(crate) fn array_of(
         &self,
         at: usize,
         count: usize,
         size: usize,
-        field: &'static str,
+        (field, field_at): (&'static str, usize),
     ) -> Result<Self, Error> {
-        let len = count
-            .checked_mul(size)
-            .ok_or_else(|| self.error(at, ErrorKind::Offset { field }))?;
-        self.sub(at, len)
-            .map_err(|_| self.error(at, ErrorKind::Offset { field }))
+        let refuse = || self.error(field_at, ErrorKind::Offset { field });
+        let len = count.checked_mul(size).ok_or_else(refuse)?;
+        self.sub(at, len).map_err(|_| refuse())
     }
 }
 
@@ -216,18 +215,6 @@ pub fn sums_to_zero(bytes: &[u8]) -> bool {
     bytes.iter().fold(0u8, |sum, &b| sum.wrapping_add(b)) == 0
 }
 
-/// `a + b`, or a refusal at `at` naming `field` if it overflows.
-pub(crate) fn add(b: &Bytes<'_>, x: usize, y: usize, field: &'static str) -> Result<usize, Error> {
-    x.checked_add(y)
-        .ok_or_else(|| b.error(x, ErrorKind::Offset { field }))
-}
-
-/// A firmware `u32` or `u64` as an offset or count; on every host Origin builds for `usize` is 64
-/// bits, so this only fails on a value past what any table can hold.
-pub(crate) fn index(value: u64) -> Option<usize> {
-    usize::try_from(value).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,8 +239,9 @@ mod tests {
         assert_eq!(s.u8(0), Ok(5));
         assert_eq!(s.u8(3).unwrap_err().at, 7, "offsets stay the table's");
         assert_eq!(b.opt_u32(6), None);
-        assert!(b.array_of(1, usize::MAX, 2, "count").is_err());
-        assert_eq!(b.array_of(1, 4, 2, "count").unwrap().len(), 8);
+        assert!(b.array_of(1, usize::MAX, 2, ("count", 0)).is_err());
+        assert_eq!(b.array_of(1, 4, 2, ("count", 0)).unwrap().len(), 8);
+        assert_eq!(b.array_of(1, 5, 2, ("count", 3)).unwrap_err().at, 3);
     }
 
     #[test]

@@ -154,6 +154,91 @@ impl<'a> Iterator for Walk<'a> {
 
 impl core::iter::FusedIterator for Walk<'_> {}
 
+/// How many places an [`Index`] remembers.
+const CHECKPOINTS: usize = 64;
+
+/// A way to find the structure that starts at a given offset, for tables whose structures refer to
+/// one another by offset, without allocating: it remembers where every so many structures start,
+/// and walks from the nearest of those. A lookup walks at most about `count / 64` structures.
+#[derive(Clone, Debug)]
+pub(crate) struct Index<'a> {
+    run: Bytes<'a>,
+    shape: Shape,
+    checkpoints: [usize; CHECKPOINTS],
+    used: usize,
+    count: usize,
+}
+
+impl<'a> Index<'a> {
+    /// Walks `run` (every structure must be well formed) and indexes it. Refused: more than `max`
+    /// structures, which bounds the work every lookup can cost.
+    pub(crate) fn build(
+        run: Bytes<'a>,
+        shape: Shape,
+        max: usize,
+        field: &'static str,
+    ) -> Result<Self, Error> {
+        let mut count = 0usize;
+        for raw in Walk::new(run, shape) {
+            let raw = raw?;
+            count = count.saturating_add(1);
+            if count > max {
+                return Err(Error::new(run.table(), raw.at, ErrorKind::Value { field }));
+            }
+        }
+        let stride = count.div_ceil(CHECKPOINTS).max(1);
+        let mut checkpoints = [0usize; CHECKPOINTS];
+        let mut used = 0usize;
+        let mut at = 0usize;
+        for (i, raw) in Walk::new(run, shape).enumerate() {
+            let raw = raw?;
+            if i.checked_rem(stride) == Some(0)
+                && let Some(slot) = checkpoints.get_mut(used)
+            {
+                *slot = at;
+                used = used.saturating_add(1);
+            }
+            at = at.saturating_add(raw.bytes.len());
+        }
+        Ok(Self {
+            run,
+            shape,
+            checkpoints,
+            used,
+            count,
+        })
+    }
+
+    /// How many structures there are.
+    pub(crate) const fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The structure that starts at `offset` from the table's first byte, if one does.
+    pub(crate) fn at(&self, offset: usize) -> Option<Raw<'a>> {
+        let local = offset.checked_sub(self.run.base())?;
+        let from = self
+            .checkpoints
+            .get(..self.used)?
+            .iter()
+            .copied()
+            .filter(|&c| c <= local)
+            .max()?;
+        let mut walk = Walk::new(self.run.rest(from).ok()?, self.shape);
+        let mut at = from;
+        loop {
+            let raw = walk.next()?.ok()?;
+            if at == local {
+                return Some(raw);
+            }
+            at = at.saturating_add(raw.bytes.len());
+            if at > local {
+                return None;
+            }
+        }
+    }
+}
+
 /// A structure's bytes as a reader that keeps its offsets in the table, after checking it holds
 /// at least `min` bytes (the fixed part its type defines).
 pub(crate) fn body<'a>(

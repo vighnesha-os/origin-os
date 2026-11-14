@@ -345,6 +345,23 @@ fn parse<'a>(table: &Table<'a>, tally: &mut Tally<'_, 'a>) -> Result<bool, Error
         b"NHLT" => crate::nhlt::Nhlt::parse(bytes)?.census(tally)?,
         b"SDEV" => crate::sdev::Sdev::parse(bytes)?.census(tally)?,
         b"HMAT" => crate::hmat::Hmat::parse(bytes)?.census(tally)?,
+        b"PPTT" => crate::pptt::Pptt::parse(bytes)?.census(tally)?,
+        b"VIOT" => crate::viot::Viot::parse(bytes)?.census(tally)?,
+        b"PHAT" => crate::records::Phat::parse(bytes)?.census(tally)?,
+        b"MISC" => crate::records::Misc::parse(bytes)?.census(tally)?,
+        b"PDTT" => {
+            for _ in crate::records::Pdtt::parse(bytes)?.triggers() {
+                tally.summary.count(0);
+            }
+        }
+        b"CCEL" => {
+            crate::records::Ccel::parse(bytes)?;
+        }
+        b"SVKL" => {
+            for _ in crate::records::Svkl::parse(bytes)?.keys() {
+                tally.summary.count(0);
+            }
+        }
         b"RSDT" | b"XSDT" => {
             for _ in crate::root::Root::parse(bytes)?.entries() {
                 tally.summary.count(0);

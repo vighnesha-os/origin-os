@@ -255,6 +255,19 @@ pub(crate) mod tests {
     use crate::census;
     use crate::testing::table;
 
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        let mut pci = [0u8; 16];
+        pci[2] = 0x3A;
+        vec![srat(&[
+            &lapic(1, 7),
+            &memory(1, 0x1_0000_0000, 0x4000_0000, 0b1011),
+            &x2apic(2, 300),
+            &generic(5, 1, 3, pci),
+            &generic(6, 0, 4, [0x41; 16]),
+        ])]
+    }
+
     pub(crate) fn srat(entries: &[&[u8]]) -> Vec<u8> {
         let mut body = vec![0u8; 12];
         body[0] = 1;

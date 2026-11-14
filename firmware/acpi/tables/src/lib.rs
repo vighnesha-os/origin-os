@@ -38,13 +38,18 @@ pub mod memory;
 pub mod nfit;
 pub mod nhlt;
 pub mod platform;
+pub mod pptt;
 pub mod ras;
 mod read;
+pub mod records;
 pub mod root;
 pub mod sdev;
 pub mod srat;
+pub mod viot;
 mod walk;
 
+#[cfg(test)]
+mod hostile;
 #[cfg(test)]
 mod testing;
 

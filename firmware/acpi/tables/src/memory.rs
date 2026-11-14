@@ -104,7 +104,7 @@ impl<'a> Mpst<'a> {
             characteristics_at,
             usize::from(characteristics_count),
             CHARACTERISTICS,
-            "Memory Power State Characteristics Count",
+            ("Memory Power State Characteristics Count", at),
         )?;
         let mpst = Self {
             table,
@@ -205,7 +205,7 @@ fn node<'a>(b: &Bytes<'a>, at: usize) -> Result<PowerNode<'a>, Error> {
     let states = usize::try_from(n.u32(24)?).unwrap_or(usize::MAX);
     let components = usize::try_from(n.u32(28)?).unwrap_or(usize::MAX);
     let states_bytes = n
-        .array_of(32, states, 2, "Number of Power States")
+        .array_of(32, states, 2, ("Number of Power States", 24))
         .map_err(structure)?;
     let components_at = 32usize.saturating_add(states_bytes.len());
     let components_bytes = n
@@ -213,7 +213,7 @@ fn node<'a>(b: &Bytes<'a>, at: usize) -> Result<PowerNode<'a>, Error> {
             components_at,
             components,
             2,
-            "Number of Physical Components",
+            ("Number of Physical Components", 28),
         )
         .map_err(structure)?;
     let base = n.u64(8)?;
@@ -467,10 +467,32 @@ fn device<'a>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::census;
     use crate::testing::table;
+
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        vec![
+            mpst(
+                &[
+                    node_bytes(1, &[(0, 0), (1, 1)], &[7]),
+                    node_bytes(2, &[(0, 0)], &[]),
+                ],
+                &[characteristics(0x41), characteristics(0x41)],
+            ),
+            pmtt(
+                1,
+                &[
+                    dev(0, 0b11, 1, &[1, 0, 0, 0]),
+                    dev(1, 0b10, 2, &[0, 0, 0, 0]),
+                    dev(2, 0b10, 0, &[0x10, 0, 0, 0]),
+                    dev(0xFF, 0, 0, &[0xAB; 20]),
+                ],
+            ),
+        ]
+    }
 
     fn node_bytes(id: u16, states: &[(u8, u8)], components: &[u16]) -> Vec<u8> {
         let len = 32 + 2 * states.len() + 2 * components.len();

@@ -60,9 +60,18 @@ impl<'a> DefinitionBlock<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::testing::table;
+
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        vec![
+            table(b"DSDT", 2, &[0x10, 0x20, 0x30]),
+            table(b"SSDT", 1, &[0x5B, 0x82]),
+            table(b"PSDT", 1, &[]),
+        ]
+    }
 
     #[test]
     fn the_aml_is_handed_on_unread() {

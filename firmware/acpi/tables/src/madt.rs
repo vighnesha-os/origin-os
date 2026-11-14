@@ -436,6 +436,11 @@ pub(crate) mod tests {
     use crate::census;
     use crate::testing::table;
 
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        vec![full()]
+    }
+
     pub(crate) fn madt(entries: &[&[u8]]) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&0xFEE0_0000u32.to_le_bytes());

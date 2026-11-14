@@ -77,9 +77,20 @@ impl<'a> Root<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::testing::table;
+
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x1000u64.to_le_bytes());
+        body.extend_from_slice(&0x2000u64.to_le_bytes());
+        vec![
+            table(b"XSDT", 1, &body),
+            table(b"RSDT", 1, &[0, 0x10, 0, 0, 0, 0x20, 0, 0]),
+        ]
+    }
 
     #[test]
     fn lists_entries_of_either_width() {

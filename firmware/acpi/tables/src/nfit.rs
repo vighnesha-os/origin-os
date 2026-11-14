@@ -389,7 +389,7 @@ fn decode<'a>(raw: &Raw<'a>, signature: Signature) -> Result<NfitEntry<'a>, Erro
                 index: b.u16(4)?,
                 line_size: b.u32(12)?,
                 lines: b
-                    .array_of(16, count, 4, "Number of Lines Described")?
+                    .array_of(16, count, 4, ("Number of Lines Described", 8))?
                     .bytes(),
             }
         }
@@ -426,7 +426,7 @@ fn decode<'a>(raw: &Raw<'a>, signature: Signature) -> Result<NfitEntry<'a>, Erro
             NfitEntry::FlushHint {
                 device_handle: b.u32(4)?,
                 addresses: b
-                    .array_of(16, count, 8, "Number of Flush Hint Addresses")?
+                    .array_of(16, count, 8, ("Number of Flush Hint Addresses", 8))?
                     .bytes(),
             }
         }
@@ -461,6 +461,19 @@ pub(crate) mod tests {
     use super::*;
     use crate::census;
     use crate::testing::table;
+
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        vec![nfit(&[
+            spa(1, 0x1_0000_0000, 0x4000_0000),
+            control(1, 0, false),
+            control(2, 4, true),
+            interleave(1, 2),
+            mapping(0x1234, 0, 1, 1, 1, 2),
+            window(2, 4),
+            capabilities(1, 0b11),
+        ])]
+    }
 
     fn s(kind: u16, body: &[u8]) -> Vec<u8> {
         let mut e = kind.to_le_bytes().to_vec();

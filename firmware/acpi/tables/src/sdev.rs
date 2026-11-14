@@ -255,9 +255,19 @@ impl<'a> Sdev<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::testing::table;
+
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        let comps = identification(b"INTC1043");
+        vec![table(
+            b"SDEV",
+            1,
+            &[namespace(b"\\_SB.I2C0", &comps), pcie(&[0x12, 0, 2, 1])].concat(),
+        )]
+    }
 
     fn identification(hid: &[u8]) -> Vec<u8> {
         let mut c = vec![0, 0, 0, 0];

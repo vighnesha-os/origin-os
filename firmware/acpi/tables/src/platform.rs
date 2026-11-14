@@ -324,9 +324,26 @@ impl<'a> Msct<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::testing::{gas, table};
+
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        let mut sbst = Vec::new();
+        for v in [5000u32, 2000, 500] {
+            sbst.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut cpep = vec![0u8; 8];
+        cpep.extend_from_slice(&[0, 8, 3, 0, 100, 0, 0, 0]);
+        vec![
+            table(b"SBST", 1, &sbst),
+            ecdt(gas(1, 8, 0, 1, 0x66), b"\\_SB.PCI0.LPCB.EC0\0"),
+            slit(2, &[10, 21, 21, 10]),
+            table(b"CPEP", 1, &cpep),
+            msct(56, 3, &[(0, 1), (2, 3)]),
+        ]
+    }
 
     #[test]
     fn sbst_reads_its_levels() {

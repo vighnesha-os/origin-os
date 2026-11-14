@@ -599,6 +599,11 @@ pub(crate) mod tests {
     use super::*;
     use crate::testing::{gas, put, seal, table};
 
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        vec![fadt()]
+    }
+
     /// A full ACPI 6.6 FADT, 276 bytes, as a QEMU-like platform with fixed hardware gives it.
     pub(crate) fn fadt() -> Vec<u8> {
         let mut t = table(b"FACP", 6, &[0u8; 240]);

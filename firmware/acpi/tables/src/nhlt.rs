@@ -252,10 +252,24 @@ impl<'a> Nhlt<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::census;
     use crate::testing::table;
+
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        vec![nhlt(
+            &[
+                endpoint_bytes(
+                    &[wave(2, 32, 24, 8, &[1, 2, 3]), wave(4, 16, 16, 8, &[])],
+                    None,
+                ),
+                endpoint_bytes(&[], Some(1)),
+            ],
+            Some(&[9, 9]),
+        )]
+    }
 
     fn wave(channels: u16, bits: u16, valid: u16, align: u16, config: &[u8]) -> Vec<u8> {
         let mut w = 0xFFFEu16.to_le_bytes().to_vec();

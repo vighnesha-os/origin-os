@@ -285,7 +285,7 @@ impl<'a> Ras2<'a> {
         let b = table.reader();
         b.require(40)?;
         let count = b.u16(38)?;
-        b.array_of(40, usize::from(count), 8, "Number of PCC descriptors")?;
+        b.array_of(40, usize::from(count), 8, ("Number of PCC descriptors", 38))?;
         Ok(Self { table, count })
     }
 
@@ -366,9 +366,19 @@ impl<'a> Ras2Channel<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::testing::table;
+
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        let mut rasf = [0u8; 12];
+        rasf[0] = 7;
+        vec![
+            table(b"RASF", 1, &rasf),
+            ras2(&[[3, 0, 0, 0, 1, 0, 0, 0], [4, 0, 0, 0x80, 2, 0, 0, 0]], 2),
+        ]
+    }
 
     #[test]
     fn rasf_names_its_channel() {

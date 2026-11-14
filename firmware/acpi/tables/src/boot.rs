@@ -389,9 +389,27 @@ impl<'a> PerformanceTable<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::testing::table;
+
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        let mut bgrt = vec![1, 0, 0b101, 0];
+        bgrt.extend_from_slice(&0x7E00_0000u64.to_le_bytes());
+        bgrt.extend_from_slice(&[0; 8]);
+        let mut delta = 3u16.to_le_bytes().to_vec();
+        delta.extend_from_slice(&[24, 1, 0, 0, 0, 0]);
+        delta.extend_from_slice(&[1; 16]);
+        vec![
+            table(b"BGRT", 1, &bgrt),
+            table(
+                b"FPDT",
+                1,
+                &[pointer(0, 0x7F00_0000), pointer(1, 0x7F01_0000), delta].concat(),
+            ),
+        ]
+    }
 
     #[test]
     fn bgrt_decodes() {

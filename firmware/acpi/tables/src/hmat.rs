@@ -111,9 +111,10 @@ fn decode<'a>(raw: &Raw<'a>, signature: Signature) -> Result<HmatEntry<'a>, Erro
             let b = body(raw, signature, 32)?;
             let s = usize::try_from(b.u32(12)?).unwrap_or(usize::MAX);
             let t = usize::try_from(b.u32(16)?).unwrap_or(usize::MAX);
-            let initiators = b.array_of(32, s, 4, "Number of Initiator Proximity Domains")?;
+            let initiators = b.array_of(32, s, 4, ("Number of Initiator Proximity Domains", 12))?;
             let targets_at = 32usize.saturating_add(initiators.len());
-            let targets = b.array_of(targets_at, t, 4, "Number of Target Proximity Domains")?;
+            let targets =
+                b.array_of(targets_at, t, 4, ("Number of Target Proximity Domains", 16))?;
             let entries_at = targets_at.saturating_add(targets.len());
             let cells = s.checked_mul(t).ok_or_else(|| {
                 b.error(
@@ -123,7 +124,7 @@ fn decode<'a>(raw: &Raw<'a>, signature: Signature) -> Result<HmatEntry<'a>, Erro
                     },
                 )
             })?;
-            let entries = b.array_of(entries_at, cells, 2, "Entry")?;
+            let entries = b.array_of(entries_at, cells, 2, ("Entry", 12))?;
             let entry_base_unit = b.u64(24)?;
             if entry_base_unit == 0 {
                 return Err(b.error(
@@ -162,7 +163,9 @@ fn decode<'a>(raw: &Raw<'a>, signature: Signature) -> Result<HmatEntry<'a>, Erro
                 size: b.u64(16)?,
                 attributes,
                 address_mode,
-                smbios_handles: b.array_of(32, n, 2, "Number of SMBIOS handles")?.bytes(),
+                smbios_handles: b
+                    .array_of(32, n, 2, ("Number of SMBIOS handles", 30))?
+                    .bytes(),
             }
         }
         _ => HmatEntry::Reserved(*raw),
@@ -211,10 +214,19 @@ impl<'a> Hmat<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::census;
     use crate::testing::table;
+
+    /// Valid tables, for the hostile-table tests.
+    pub(crate) fn samples() -> Vec<Vec<u8>> {
+        vec![hmat(&[
+            domain(Some(0), 1),
+            locality(&[0, 1], &[0, 1, 2], &[10, 20, 0xFFFF, 30, 40, 50], 1000),
+            cache(0x0040_1111, 1, &[0x10, 0x11]),
+        ])]
+    }
 
     fn s(kind: u16, body: &[u8]) -> Vec<u8> {
         let mut e = kind.to_le_bytes().to_vec();
