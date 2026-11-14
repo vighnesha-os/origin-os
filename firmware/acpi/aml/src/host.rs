@@ -112,6 +112,12 @@ pub struct BufferAccess<'a> {
     pub length: u8,
     /// The bytes of the field's `Connection` resource, if it has one.
     pub connection: Option<&'a [u8]>,
+    /// Where the field starts, in bits from its `Connection` (from the region's start if it has
+    /// none). For GeneralPurposeIO, the index of the first of the connection's pins the field
+    /// covers (§5.5.2.4.6.1).
+    pub bit_offset: u64,
+    /// The field's length in bits: for GeneralPurposeIO, how many pins.
+    pub bit_length: u64,
     /// The region's path, for diagnostics.
     pub region: &'a [[u8; 4]],
     /// The time the evaluation has left, in 100 ns units: the host must not wait longer.

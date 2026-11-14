@@ -1115,7 +1115,10 @@ impl<H: Host> Interpreter<H> {
             lock: flags & 0x10 != 0,
             update: (flags >> 5) & 3,
             connection: Connection::None,
+            conn_bit_offset: 0,
         };
+        // Where the last `Connection` was, in bits from the region's start.
+        let mut conn_at: u64 = 0;
         while self.cur.pc < f.end {
             // Each entry is work, and so is finding its name among its siblings: a list of
             // hundreds of thousands of names is cut off by the limits inside this one step.
@@ -1164,11 +1167,13 @@ impl<H: Host> Interpreter<H> {
                 0x02 => {
                     self.cur.pc = next;
                     unit.connection = self.connection(f.end)?;
+                    conn_at = unit.bit_offset;
                 }
                 _ => {
                     let (bits, after) =
                         self.pkg_length(at.checked_add(4).ok_or(ErrorKind::Truncated)?)?;
                     unit.bit_len = u64::from(bits);
+                    unit.conn_bit_offset = unit.bit_offset.saturating_sub(conn_at);
                     let obj = self.heap.alloc(Object::FieldUnit(unit), &mut self.budget)?;
                     let field_name = AmlName {
                         root: false,

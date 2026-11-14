@@ -128,6 +128,10 @@ pub(crate) struct FieldUnit {
     /// The update rule: 0 Preserve, 1 WriteAsOnes, 2 WriteAsZeros.
     pub(crate) update: u8,
     pub(crate) connection: Connection,
+    /// Where the field starts, in bits from its `Connection` (from the region's start if it has
+    /// none): which of the connection's pins a GeneralPurposeIO field's first bit is
+    /// (§5.5.2.4.6.1; the review of B2, B2-4).
+    pub(crate) conn_bit_offset: u64,
 }
 
 /// A buffer field (`Create…Field`), over a buffer or a string object.

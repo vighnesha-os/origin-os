@@ -523,6 +523,8 @@ impl<H: Host> Interpreter<H> {
                     attribute: f.attrib,
                     length: f.access_len,
                     connection: conn.as_deref(),
+                    bit_offset: f.conn_bit_offset,
+                    bit_length: f.bit_len,
                     region: &region_path,
                     time_left_100ns,
                 };
@@ -580,6 +582,8 @@ impl<H: Host> Interpreter<H> {
                     attribute: f.attrib,
                     length: f.access_len,
                     connection: conn.as_deref(),
+                    bit_offset: f.conn_bit_offset,
+                    bit_length: f.bit_len,
                     region: &region_path,
                     time_left_100ns,
                 };

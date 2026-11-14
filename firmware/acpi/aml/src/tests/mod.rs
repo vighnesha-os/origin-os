@@ -92,6 +92,8 @@ pub(crate) struct BufferSeen {
     pub(crate) attribute: u8,
     pub(crate) length: u8,
     pub(crate) connection: Option<Vec<u8>>,
+    pub(crate) bit_offset: u64,
+    pub(crate) bit_length: u64,
     pub(crate) sent: Vec<u8>,
 }
 
@@ -184,6 +186,8 @@ impl Host for TestHost {
             attribute: a.attribute,
             length: a.length,
             connection: a.connection.map(<[u8]>::to_vec),
+            bit_offset: a.bit_offset,
+            bit_length: a.bit_length,
             sent: data.to_vec(),
         };
         let n = self.answer.len().min(data.len());

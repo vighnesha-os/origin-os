@@ -1057,3 +1057,54 @@ fn protocol_and_pin_fields_past_their_region_are_refused() {
     assert_eq!(fails(&mut i, "RG"), ErrorKind::Range);
     assert!(i.host().transfers.is_empty());
 }
+
+#[test]
+fn gpio_fields_give_the_host_their_pins() {
+    // The review of B2, B2-4: two fields after one `Connection` (§5.5.2.4.6.1) are the
+    // connection's first pin and its next two; both start in byte 0 of the region, so only the
+    // bit offset and length tell them apart. A second `Connection` starts the count again.
+    let mut i = loaded(&[
+        name("CON", buffer(byte(3), &[0x8C, 1, 2])),
+        name("CO2", buffer(byte(3), &[0x8C, 3, 4])),
+        op_region("GIO", 8, zero(), byte(4)),
+        field(
+            "GIO",
+            BYTE,
+            &[
+                Fe::ConnectName("CON"),
+                Fe::Named("A", 1),
+                Fe::Named("B", 2),
+                Fe::ConnectName("CO2"),
+                Fe::Named("C", 4),
+            ],
+        ),
+        m("WA", &[store(one(), nm("A"))]),
+        m("WB", &[store(byte(3), nm("B"))]),
+        m("RC", &[ret(nm("C"))]),
+    ]);
+    i.evaluate("WA", &[]).unwrap();
+    i.evaluate("WB", &[]).unwrap();
+    i.evaluate("RC", &[]).unwrap();
+    let got: Vec<_> = i
+        .host()
+        .transfers
+        .iter()
+        .map(|(s, _)| {
+            (
+                s.address,
+                s.bit_offset,
+                s.bit_length,
+                s.write,
+                s.connection.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (0, 0, 1, true, Some(vec![0x8C, 1, 2])),
+            (0, 1, 2, true, Some(vec![0x8C, 1, 2])),
+            (0, 0, 4, false, Some(vec![0x8C, 3, 4])),
+        ]
+    );
+}
