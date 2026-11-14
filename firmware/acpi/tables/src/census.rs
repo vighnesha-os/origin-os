@@ -331,6 +331,16 @@ fn parse<'a>(table: &Table<'a>, tally: &mut Tally<'_, 'a>) -> Result<bool, Error
         }
         b"CPEP" => crate::platform::Cpep::parse(bytes)?.census(tally)?,
         b"MSCT" => crate::platform::Msct::parse(bytes)?.census(tally)?,
+        b"RASF" => {
+            crate::ras::Rasf::parse(bytes)?;
+        }
+        b"RAS2" => crate::ras::Ras2::parse(bytes)?.census(tally)?,
+        b"MPST" => crate::memory::Mpst::parse(bytes)?.census(tally)?,
+        b"PMTT" => crate::memory::Pmtt::parse(bytes)?.census(tally)?,
+        b"BGRT" => {
+            crate::boot::Bgrt::parse(bytes)?;
+        }
+        b"FPDT" => crate::boot::Fpdt::parse(bytes)?.census(tally)?,
         b"RSDT" | b"XSDT" => {
             for _ in crate::root::Root::parse(bytes)?.entries() {
                 tally.summary.count(0);

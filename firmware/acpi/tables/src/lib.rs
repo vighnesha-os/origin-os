@@ -24,6 +24,7 @@
     )
 )]
 
+pub mod boot;
 pub mod census;
 pub mod definition;
 mod error;
@@ -32,7 +33,9 @@ pub mod fadt;
 pub mod gas;
 pub mod header;
 pub mod madt;
+pub mod memory;
 pub mod platform;
+pub mod ras;
 mod read;
 pub mod root;
 pub mod srat;

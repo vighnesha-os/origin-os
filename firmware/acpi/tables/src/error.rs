@@ -68,6 +68,8 @@ pub enum ErrorKind {
         /// The bytes the caller gave.
         available: usize,
     },
+    /// The table's revision is one whose layout ACPI 6.6 no longer gives, so it cannot be read.
+    Revision(u8),
     /// The table is shorter than the fields its revision defines.
     TooShort {
         /// The length those fields need.
@@ -128,6 +130,7 @@ impl fmt::Display for ErrorKind {
                 declared,
                 available,
             } => write!(f, "length {declared} with {available} bytes given"),
+            Self::Revision(r) => write!(f, "revision {r}, whose layout is not ACPI 6.6's"),
             Self::TooShort { need } => write!(f, "too short for its revision: needs {need} bytes"),
             Self::Checksum => f.write_str("checksum"),
             Self::Truncated { need } => write!(f, "runs past the end, to {need:#x}"),
