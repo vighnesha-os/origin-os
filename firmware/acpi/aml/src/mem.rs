@@ -103,8 +103,10 @@ fn bytes_for<T>(count: usize) -> Result<usize> {
     count.checked_mul(size_of::<T>()).ok_or_else(memory)
 }
 
-/// Makes room in `v` for `additional` more elements: the capacity doubles (at least 4), or grows
-/// to exactly what is needed when doubling would pass the limit.
+/// Makes room in `v` for `additional` more elements: the capacity doubles (at least 4); when
+/// doubling would pass the limit it grows once to all the limit allows, and when even that is
+/// short of what is needed it is refused. It never grows by what is asked alone, so a vector near
+/// the limit is not copied whole for each element pushed (the review of B1, F1).
 pub(crate) fn reserve<T>(v: &mut Vec<T>, additional: usize, budget: &mut Budget) -> Result<()> {
     let need = v.len().checked_add(additional).ok_or_else(memory)?;
     let have = v.capacity();
@@ -112,15 +114,16 @@ pub(crate) fn reserve<T>(v: &mut Vec<T>, additional: usize, budget: &mut Budget)
         return Ok(());
     }
     let doubled = have.saturating_mul(2).max(4).max(need);
-    let target = if budget
-        .charge(bytes_for::<T>(doubled.saturating_sub(have))?)
-        .is_ok()
-    {
-        doubled
-    } else {
-        budget.charge(bytes_for::<T>(need.saturating_sub(have))?)?;
-        need
-    };
+    let room = budget
+        .limit
+        .saturating_sub(budget.used)
+        .checked_div(size_of::<T>())
+        .unwrap_or(usize::MAX);
+    let target = doubled.min(have.saturating_add(room));
+    if target < need {
+        return Err(memory());
+    }
+    budget.charge(bytes_for::<T>(target.saturating_sub(have))?)?;
     if v.try_reserve_exact(target.saturating_sub(v.len())).is_err() {
         budget.credit(bytes_for::<T>(target.saturating_sub(have)).unwrap_or(0));
         return Err(memory());

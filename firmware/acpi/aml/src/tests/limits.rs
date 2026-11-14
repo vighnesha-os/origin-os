@@ -338,3 +338,26 @@ fn a_field_of_300000_names_ends_within_its_limits() {
         assert_eq!(*first.get_or_insert(e), e);
     }
 }
+
+#[test]
+fn a_vector_near_the_limit_grows_once_to_what_is_left_then_is_refused() {
+    // The review of B1, F1 (growth): never by one element, so a vector at the limit is not
+    // copied whole for each element pushed.
+    use crate::mem::{self, Budget};
+    let mut budget = Budget::new(10_000);
+    let mut v: Vec<u64> = Vec::new();
+    let mut capacities = vec![];
+    while mem::push(&mut v, 7, &mut budget).is_ok() {
+        if capacities.last() != Some(&v.capacity()) {
+            capacities.push(v.capacity());
+        }
+    }
+    // 4, 8, … 1,024 by doubling, then once to the 1,250 that 10,000 bytes hold; then refused.
+    assert_eq!(
+        capacities,
+        [4, 8, 16, 32, 64, 128, 256, 512, 1024, 1250],
+        "the capacities a vector of u64 took under a 10,000-byte limit"
+    );
+    assert_eq!(v.len(), 1250);
+    assert!(budget.used() <= 10_000);
+}
