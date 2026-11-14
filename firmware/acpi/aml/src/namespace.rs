@@ -1,8 +1,11 @@
 //! The namespace (ACPI 6.6 §5.3): a tree of named nodes, each holding an object.
 //!
-//! Nodes live in an arena, linked to their parent, first and last child and next sibling, and
-//! named by handles with a generation. Removing a subtree allocates nothing: it removes a leaf at a
-//! time, and freed slots are chained through their sibling link. Each node's creator (a table being
+//! Nodes live in an arena, linked to their parent, first and last child and both siblings, and
+//! named by handles with a generation. Removing a subtree allocates nothing and is linear in its
+//! size: a walk down to a leaf, which is unlinked in constant time, then on from its parent; freed
+//! slots are chained through their sibling link. Finding a child compares names one sibling at a
+//! time, and every comparison is counted ([`Namespace::take_work`]) so that the engine charges it
+//! to the step limit (the review of B1, F1). Each node's creator (a table being
 //! loaded, or a method activation) keeps a list of the handles it made, so a failed load or a
 //! returning method removes exactly what it created; a handle whose node has already gone is
 //! skipped by its generation.
@@ -34,6 +37,7 @@ struct Node {
     first: u32,
     last: u32,
     next: u32,
+    prev: u32,
     obj: ObjRef,
     owner: Owner,
 }
@@ -44,6 +48,8 @@ pub(crate) struct Namespace {
     nodes: Vec<Node>,
     free: u32,
     live: usize,
+    /// Sibling comparisons since the engine last took the count.
+    work: core::cell::Cell<u64>,
 }
 
 fn index(i: u32) -> usize {
@@ -67,6 +73,7 @@ impl Namespace {
                 first: NONE,
                 last: NONE,
                 next: NONE,
+                prev: NONE,
                 obj: root_obj,
                 owner: Owner::Builtin,
             },
@@ -76,6 +83,7 @@ impl Namespace {
             nodes,
             free: NONE,
             live: 1,
+            work: core::cell::Cell::new(0),
         })
     }
 
@@ -148,10 +156,16 @@ impl Namespace {
         self.id(s)
     }
 
-    /// The child of `parent` named `seg`.
+    /// Sibling comparisons made since the last call: the engine charges them as steps.
+    pub(crate) fn take_work(&self) -> u64 {
+        self.work.replace(0)
+    }
+
+    /// The child of `parent` named `seg`. Each sibling compared counts as work.
     pub(crate) fn child(&self, parent: NodeId, seg: Seg) -> Option<NodeId> {
         let mut c = self.node(parent).ok()?.first;
         while let Some(n) = self.at(c) {
+            self.work.set(self.work.get().saturating_add(1));
             if n.name == seg {
                 return Some(NodeId {
                     index: c,
@@ -192,6 +206,7 @@ impl Namespace {
             first: NONE,
             last: NONE,
             next: NONE,
+            prev: NONE,
             obj,
             owner,
         };
@@ -215,6 +230,9 @@ impl Namespace {
         let last = self.nodes.get(index(parent.index)).map_or(NONE, |p| p.last);
         if let Some(prev) = self.nodes.get_mut(index(last)).filter(|n| n.live) {
             prev.next = i;
+            if let Some(me) = self.nodes.get_mut(index(i)) {
+                me.prev = last;
+            }
         } else if let Some(p) = self.nodes.get_mut(index(parent.index)) {
             p.first = i;
         }
@@ -231,51 +249,42 @@ impl Namespace {
         Ok(id)
     }
 
-    /// Removes `id` and everything below it. Allocates nothing.
+    /// Removes `id` and everything below it. Allocates nothing, and takes time linear in the
+    /// subtree: each move either goes down to a first child or unlinks a leaf and goes back up to
+    /// its parent.
     pub(crate) fn remove(&mut self, id: NodeId) {
         if self.node(id).is_err() || id.index == 0 {
             return;
         }
+        let mut cur = id.index;
         loop {
-            // Find a leaf: the first child's first child … from `id`.
-            let mut leaf = id.index;
-            while let Some(c) = self
-                .at(leaf)
-                .map(|n| n.first)
-                .filter(|&c| self.at(c).is_some())
-            {
-                leaf = c;
+            let first = self.at(cur).map_or(NONE, |n| n.first);
+            if self.at(first).is_some() {
+                cur = first;
+                continue;
             }
-            self.unlink(leaf);
-            if leaf == id.index {
+            let parent = self.at(cur).map_or(NONE, |n| n.parent);
+            self.unlink(cur);
+            if cur == id.index {
                 return;
             }
+            cur = parent;
         }
     }
 
-    /// Unlinks the childless node `i` from its parent and frees it.
+    /// Unlinks the childless node `i` from its parent and frees it, in constant time.
     fn unlink(&mut self, i: u32) {
-        let Some(parent) = self.at(i).map(|n| n.parent) else {
+        let Some((parent, prev, next)) = self.at(i).map(|n| (n.parent, n.prev, n.next)) else {
             return;
         };
-        let next = self.at(i).map_or(NONE, |n| n.next);
-        // Find the predecessor among the siblings.
-        let mut prev = NONE;
-        let mut c = self.at(parent).map_or(NONE, |p| p.first);
-        while c != NONE && c != i {
-            prev = c;
-            c = self.at(c).map_or(NONE, |n| n.next);
-        }
-        if prev == NONE {
-            if let Some(p) = self.nodes.get_mut(index(parent)) {
-                p.first = next;
-            }
-        } else if let Some(p) = self.nodes.get_mut(index(prev)) {
+        if let Some(p) = self.nodes.get_mut(index(prev)).filter(|n| n.live) {
             p.next = next;
+        } else if let Some(p) = self.nodes.get_mut(index(parent)) {
+            p.first = next;
         }
-        if let Some(p) = self.nodes.get_mut(index(parent))
-            && p.last == i
-        {
+        if let Some(n) = self.nodes.get_mut(index(next)).filter(|n| n.live) {
+            n.prev = prev;
+        } else if let Some(p) = self.nodes.get_mut(index(parent)) {
             p.last = prev;
         }
         let free = self.free;
@@ -284,6 +293,7 @@ impl Namespace {
             n.generation = n.generation.wrapping_add(1);
             n.first = NONE;
             n.last = NONE;
+            n.prev = NONE;
             n.next = free;
             self.free = i;
             self.live = self.live.saturating_sub(1);

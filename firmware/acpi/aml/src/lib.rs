@@ -114,6 +114,8 @@ struct RunCounts {
     loops: u64,
     depth: u32,
     started: u64,
+    /// The budget's `charged` when the work done was last counted.
+    charged_seen: u64,
 }
 
 /// An AML interpreter: one namespace, its tables and its host.

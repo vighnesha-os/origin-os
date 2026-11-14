@@ -971,6 +971,7 @@ impl<H: Host> Interpreter<H> {
         let start = self.int(f, 5)?;
         let start = usize::try_from(start).unwrap_or(usize::MAX);
         for k in start..n {
+            self.charge(1)?;
             let e = match self.heap.get(pkg)? {
                 Object::Package(v) => v.get(k).copied().unwrap_or(Val::None),
                 _ => Val::None,
@@ -1108,6 +1109,10 @@ impl<H: Host> Interpreter<H> {
             connection: Connection::None,
         };
         while self.cur.pc < f.end {
+            // Each entry is work, and so is finding its name among its siblings: a list of
+            // hundreds of thousands of names is cut off by the limits inside this one step.
+            self.charge(1)?;
+            self.charge_pending()?;
             let at = self.cur.pc;
             let next = at.checked_add(1).ok_or(ErrorKind::Truncated)?;
             match self.byte(at)? {

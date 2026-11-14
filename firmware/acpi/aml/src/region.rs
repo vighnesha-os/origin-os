@@ -273,11 +273,10 @@ impl<H: Host> Interpreter<H> {
         let mut result = Ok(());
         let mut u = first;
         while u <= last && result.is_ok() {
-            if u.saturating_sub(first) & 0x3FF == 0x3FF {
-                result = self.check_time();
-                if result.is_err() {
-                    break;
-                }
+            // Each unit is a host access: work, counted, with the clock read as it mounts.
+            result = self.charge(1);
+            if result.is_err() {
+                break;
             }
             result = self.one_unit(
                 f,

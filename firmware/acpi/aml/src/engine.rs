@@ -340,8 +340,10 @@ impl<H: Host> Interpreter<H> {
     pub(crate) fn begin_evaluation(&mut self) -> Result<usize> {
         self.run = crate::RunCounts {
             started: self.host.now_100ns(),
+            charged_seen: self.budget.charged(),
             ..crate::RunCounts::default()
         };
+        let _ = self.ns.take_work();
         self.result = Val::None;
         self.base = self.frames.len();
         Ok(self.base)
@@ -490,23 +492,47 @@ impl<H: Host> Interpreter<H> {
         }
     }
 
+    /// One step: an opcode, with the work done since the last count (the review of B1, F1).
     fn tick(&mut self) -> Result<()> {
-        let limits = self.config.limits;
-        self.run.steps = self.run.steps.saturating_add(1);
-        if self.run.steps > limits.steps {
-            return err(ErrorKind::Limit(Limit::Steps));
-        }
-        if self.run.steps & 0x3FF == 0 {
-            self.check_time()?;
-        }
+        self.charge(1)?;
+        self.charge_pending()?;
         if self.nested == 0 && self.budget.used() > self.gc_threshold {
+            let slots = u64::try_from(self.heap.slot_count()).unwrap_or(u64::MAX);
             self.collect_garbage();
-            // The next collection comes when half the room left after this one is used, so
-            // garbage never fills the limit while live data is large.
+            // The next collection comes when half the room left after this one is used, and
+            // never before 64 KiB more is: collections are spaced, never one a step.
             let used = self.budget.used();
-            self.gc_threshold = used.saturating_add(self.budget.limit().saturating_sub(used) / 2);
+            let gap = (self.budget.limit().saturating_sub(used) / 2).max(64 << 10);
+            self.gc_threshold = used.saturating_add(gap).min(self.budget.limit());
+            // A collection reads every slot: it is work, counted like any other.
+            self.charge(slots / 8)?;
         }
         Ok(())
+    }
+
+    /// Counts `units` of work against the step limit, and reads the clock each time the count
+    /// passes a multiple of 1,024: so the time limit holds inside long operations, not only
+    /// between steps (the review of B1, F1).
+    pub(crate) fn charge(&mut self, units: u64) -> Result<()> {
+        let before = self.run.steps;
+        self.run.steps = before.saturating_add(units);
+        if self.run.steps > self.config.limits.steps {
+            return err(ErrorKind::Limit(Limit::Steps));
+        }
+        if before >> 10 != self.run.steps >> 10 {
+            self.check_time()?;
+        }
+        Ok(())
+    }
+
+    /// Counts the work done since the last count: each sibling compared in the namespace, and a
+    /// unit for each 64 bytes allocated (what is copied, converted or filled is allocated first).
+    pub(crate) fn charge_pending(&mut self) -> Result<()> {
+        let compared = self.ns.take_work();
+        let charged = self.budget.charged();
+        let bytes = charged.saturating_sub(self.run.charged_seen);
+        self.run.charged_seen = charged;
+        self.charge(compared.saturating_add(bytes / 64))
     }
 
     pub(crate) fn check_time(&mut self) -> Result<()> {

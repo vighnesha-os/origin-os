@@ -39,6 +39,8 @@ pub(crate) struct Seen {
 pub(crate) struct TestHost {
     pub(crate) clock: u64,
     pub(crate) tick: u64,
+    /// Read the wall clock instead of the fake one, from this instant.
+    pub(crate) real_clock: Option<std::time::Instant>,
     pub(crate) refuse: bool,
     pub(crate) memory: BTreeMap<Cell, u8>,
     pub(crate) seen: Vec<Seen>,
@@ -78,6 +80,9 @@ fn key(a: &RegionAccess<'_>, k: u64) -> Cell {
 
 impl Host for TestHost {
     fn now_100ns(&mut self) -> u64 {
+        if let Some(t0) = self.real_clock {
+            return u64::try_from(t0.elapsed().as_nanos() / 100).unwrap_or(u64::MAX);
+        }
         self.clock = self.clock.saturating_add(self.tick);
         self.clock
     }

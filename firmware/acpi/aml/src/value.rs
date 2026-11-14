@@ -311,10 +311,14 @@ impl<H: Host> Interpreter<H> {
                 continue;
             };
             level.next = k.saturating_add(1);
+            // Each element exported is work under the evaluation's limits, its name's lookup and
+            // its bytes included (the review of B1, F1).
+            self.charge(1)?;
             let e = match e {
                 Val::None => Val::None,
                 other => self.settle(other)?,
             };
+            self.charge_pending()?;
             let nested = match e {
                 Val::Obj(r) => matches!(self.heap.get(r)?, Object::Package(_)).then_some(r),
                 _ => None,
@@ -375,8 +379,15 @@ impl<H: Host> Interpreter<H> {
             Val::Ref(_) => return err(ErrorKind::Type),
             Val::Obj(r) => match self.heap.get(r)? {
                 Object::Integer(i) => Value::Integer(*i),
-                Object::String(s) => Value::String(mem::copy_bytes(s, room)?),
-                Object::Buffer(b) => Value::Buffer(mem::copy_bytes(b, room)?),
+                Object::String(s) | Object::Buffer(s) => {
+                    let len = u64::try_from(s.len()).unwrap_or(u64::MAX);
+                    self.charge(len / 64)?;
+                    match self.heap.get(r)? {
+                        Object::String(s) => Value::String(mem::copy_bytes(s, room)?),
+                        Object::Buffer(b) => Value::Buffer(mem::copy_bytes(b, room)?),
+                        _ => return err(ErrorKind::Stale),
+                    }
+                }
                 Object::Scope { node, .. } => Value::Reference(crate::Node(*node)),
                 Object::Method(m) => Value::Reference(crate::Node(m.node)),
                 _ => return err(ErrorKind::Type),

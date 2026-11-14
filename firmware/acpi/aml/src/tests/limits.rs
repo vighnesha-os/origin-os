@@ -262,3 +262,79 @@ fn a_memory_limit_hit_while_copying_leaves_the_count_where_it_was() {
         "memory-limit copies: {over} bytes over-counted in 30 runs, given back by the recount"
     );
 }
+
+/// The review of B1's F1 case: one `Field` of 300,000 names in one scope, then a term that fails.
+fn wide_field() -> Vec<B> {
+    const LEAD: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const REST: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut list = Vec::with_capacity(300_000);
+    let mut k = 0usize;
+    'all: for &a in LEAD {
+        for &b in REST {
+            for &c in REST {
+                for &d in REST {
+                    list.push(Fe::Seg([a, b, c, d], 1));
+                    k += 1;
+                    if k == 300_000 {
+                        break 'all;
+                    }
+                }
+            }
+        }
+    }
+    vec![
+        op_region("WIDE", 0, zero(), dword(300_000 / 8 + 1)),
+        field("WIDE", 1, &list),
+        scope("\\MISS", &[]),
+    ]
+}
+
+#[test]
+fn a_field_of_300000_names_ends_within_its_limits() {
+    let body = wide_field();
+    let t = table(b"SSDT", 2, &body);
+    let (block, _) = super::tables_standin::block(&t).unwrap();
+    // The service's limits, on the wall clock.
+    for (what, limits) in [
+        ("service limits", Limits::SERVICE),
+        (
+            "a 2 s time limit and no step limit",
+            Limits {
+                steps: u64::MAX,
+                time_100ns: 20_000_000,
+                ..Limits::SERVICE
+            },
+        ),
+    ] {
+        let mut i = interp_with(IntegerWidth::Bits64, limits);
+        let nodes = i.node_count();
+        let start = std::time::Instant::now();
+        i.host_mut().real_clock = Some(start);
+        let e = i.load(block).unwrap_err();
+        let took = start.elapsed();
+        assert!(
+            matches!(e.kind, ErrorKind::Limit(Limit::Steps | Limit::Time)),
+            "{what}: {e:?}"
+        );
+        // The limit is read each 1,024 units of work, and the rollback that follows is linear in
+        // what was made: the load ends within a quarter more than its limit.
+        assert!(
+            u128::from(limits.time_100ns) * 125 >= took.as_nanos(),
+            "{what}: {took:?} well past its time limit"
+        );
+        assert_eq!(i.node_count(), nodes, "{what}: rolled back");
+        eprintln!("300,000-name field, {what}: {:?} after {took:?}", e.kind);
+    }
+    // A step limit: deterministic.
+    let limits = Limits {
+        steps: 1_000_000,
+        ..Limits::SERVICE
+    };
+    let mut first = None;
+    for _ in 0..2 {
+        let mut i = interp_with(IntegerWidth::Bits64, limits);
+        let e = i.load(block).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Limit(Limit::Steps));
+        assert_eq!(*first.get_or_insert(e), e);
+    }
+}

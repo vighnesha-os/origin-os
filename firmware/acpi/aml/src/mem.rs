@@ -24,6 +24,8 @@ pub(crate) struct Budget {
     used: usize,
     limit: usize,
     peak: usize,
+    /// Every byte ever charged: the engine counts a step for each 64, as work done.
+    charged: u64,
 }
 
 const fn memory() -> Error {
@@ -36,6 +38,7 @@ impl Budget {
             used: 0,
             limit,
             peak: 0,
+            charged: 0,
         }
     }
 
@@ -51,6 +54,11 @@ impl Budget {
         self.limit
     }
 
+    /// Every byte ever charged.
+    pub(crate) const fn charged(&self) -> u64 {
+        self.charged
+    }
+
     /// Charges `bytes`, or refuses them if the limit would be passed.
     fn charge(&mut self, bytes: usize) -> Result<()> {
         let used = self.used.checked_add(bytes).ok_or_else(memory)?;
@@ -61,6 +69,9 @@ impl Budget {
         if used > self.peak {
             self.peak = used;
         }
+        self.charged = self
+            .charged
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
         Ok(())
     }
 

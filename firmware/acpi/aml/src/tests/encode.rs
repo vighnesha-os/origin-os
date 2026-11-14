@@ -275,6 +275,8 @@ pub(crate) fn data_region(path: &str, sig: B, oem: B, table: B) -> B {
 pub(crate) enum Fe {
     /// A named field of `bits`.
     Named(&'static str, u32),
+    /// A named field given by its segment, for generated lists.
+    Seg([u8; 4], u32),
     /// Bits skipped (`Offset` compiles to this).
     Reserved(u32),
     /// `AccessAs (type, attribute)`.
@@ -293,6 +295,10 @@ fn field_list(list: &[Fe]) -> B {
         match e {
             Fe::Named(n, bits) => {
                 out.extend(seg(n));
+                out.extend(bitlen(*bits));
+            }
+            Fe::Seg(s, bits) => {
+                out.extend(s);
                 out.extend(bitlen(*bits));
             }
             Fe::Reserved(bits) => {

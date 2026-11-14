@@ -359,6 +359,11 @@ impl Heap {
         self.live
     }
 
+    /// Slots, free or not: what a collection reads.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
     /// The bytes the heap holds, counted as `mem.rs` charges them: its two vectors' capacities
     /// and every object's payload.
     pub(crate) fn bytes(&self) -> usize {

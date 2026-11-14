@@ -5,8 +5,8 @@
 //!   functioning), then its `_INI` if it is present, then its children if it is present or
 //!   functioning. A failing `_STA` or `_INI` is reported, and the walk goes on with the next
 //!   sibling, skipping what is below the device.
-//! - [`Interpreter::connect_space`] runs `_REG (space, 1)` (or `0` on a disconnect) in each scope
-//!   that declares a region of that space. SystemMemory and SystemIO are always available and get
+//! - [`Interpreter::connect_space`] runs `_REG (space, 1)` (or `0` on a disconnect) once in each
+//!   scope that declares a region of that space, each scope in its node slot's order. SystemMemory and SystemIO are always available and get
 //!   none, nor do PCI_Config regions declared in a scope with a `_BBN` (a root bus), as §6.5.4
 //!   says.
 //!
@@ -208,6 +208,9 @@ impl<H: Host> Interpreter<H> {
                 }
             }
         }
+        // Each scope once, without a search per region: sorted, then repeats dropped, in place.
+        out.sort_unstable_by_key(|n| n.index);
+        out.dedup();
         Ok(())
     }
 }
