@@ -10,16 +10,21 @@
 //! output depends on exactly its inputs (CLAUDE.md §75). `--library` picks one of them: for
 //! `generate`, the channel library whose bindings crate is written; for `fingerprint`, the one
 //! library printed, and checked against or recorded in the lock.
+//!
+//! A thin client of the `oidl` library (ADR-0011 Amendment 4, T1): it reads its arguments and
+//! files, calls the library, and writes and prints what the library returns. It decides nothing
+//! the library does not: what each mode writes is `codegen::generate_output`, the narrowing to
+//! one library `Compilation::only`, and the lock an update writes `fingerprint::updated_lock`.
 #![forbid(unsafe_code)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use oidl::corpus;
-use oidl::fingerprint::{self, LockFinding};
+use oidl::codegen::{self, Output};
+use oidl::fingerprint;
 use oidl::model::Compilation;
-use oidl::{Input, codegen, compile};
+use oidl::{Input, compile};
 
 const USAGE: &str = "usage:
   oidl check [--versions FILE] FILE...
@@ -70,15 +75,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<(String, Options), S
 /// The compilation narrowed to the library `--library` names, for printing and the lock: the
 /// others were given only so that it compiles.
 fn selected(compilation: &Compilation, options: &Options) -> Result<Compilation, String> {
-    let Some(name) = &options.library else {
-        return Ok(compilation.clone());
-    };
-    let mut only = compilation.clone();
-    only.libraries.retain(|library| &library.name == name);
-    if only.libraries.is_empty() {
-        return Err(format!("{name} is not among the definitions given"));
+    match &options.library {
+        None => Ok(compilation.clone()),
+        Some(name) => compilation.only(name),
     }
-    Ok(only)
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, String> {
@@ -117,37 +117,18 @@ fn write_file(out: &Path, relative: &str, text: &str) -> Result<(), String> {
 fn generate(options: &Options) -> Result<(), String> {
     let compilation = load(options)?;
     let out = options.out.as_ref().ok_or("generate needs --out DIR")?;
-    let mut count = 0usize;
-    let one_crate = if options.server_only {
-        Some(codegen::generate_server(&compilation))
+    let output = if options.server_only {
+        Output::ServerOnly
     } else if let Some(name) = &options.library {
-        Some(codegen::generate_library(&compilation, name)?)
+        Output::Library(name.clone())
     } else {
-        None
+        Output::Everything
     };
-    if let Some(files) = one_crate {
-        for file in files {
-            write_file(out, &file.path, &file.text)?;
-            count = count.saturating_add(1);
-        }
-        println!("oidl: {count} files written to {}", out.display());
-        return Ok(());
-    }
-    for file in codegen::generate(&compilation) {
+    let files = codegen::generate_output(&compilation, &output)?;
+    for file in &files {
         write_file(out, &file.path, &file.text)?;
-        count = count.saturating_add(1);
     }
-    for library in &compilation.libraries {
-        write_file(
-            out,
-            &format!("abi/{}.fingerprint", library.name),
-            &fingerprint::fingerprint_file(library),
-        )?;
-        let text = corpus::corpus_for(library);
-        write_file(out, &format!("corpus/{}.corpus", library.name), &text)?;
-        count = count.saturating_add(2);
-    }
-    println!("oidl: {count} files written to {}", out.display());
+    println!("oidl: {} files written to {}", files.len(), out.display());
     Ok(())
 }
 
@@ -172,43 +153,22 @@ fn fingerprint_command(options: &Options) -> Result<bool, String> {
     };
     let report = fingerprint::check_lock(&compilation, &recorded);
     for finding in &report.errors {
-        eprintln!("oidl: error: {}", describe_finding(finding));
+        eprintln!("oidl: error: {finding}");
     }
     for finding in &report.warnings {
-        eprintln!(
-            "oidl: warning (major 0 promises nothing): {}",
-            describe_finding(finding)
-        );
+        eprintln!("oidl: warning (major 0 promises nothing): {finding}");
     }
     for finding in &report.unrecorded {
-        eprintln!("oidl: not recorded yet: {}", describe_finding(finding));
+        eprintln!("oidl: not recorded yet: {finding}");
     }
     if options.update {
-        if !report.errors.is_empty() {
-            return Err(
-                "refusing to update a lock whose recorded fingerprints changed".to_string(),
-            );
-        }
-        fs::write(lock_path, fingerprint::render_lock(&compilation))
-            .map_err(|e| format!("{}: {e}", lock_path.display()))?;
+        let lock = fingerprint::updated_lock(&compilation, &recorded).map_err(|_| {
+            "refusing to update a lock whose recorded fingerprints changed".to_string()
+        })?;
+        fs::write(lock_path, lock).map_err(|e| format!("{}: {e}", lock_path.display()))?;
         return Ok(true);
     }
     Ok(report.errors.is_empty())
-}
-
-fn describe_finding(finding: &LockFinding) -> String {
-    match finding {
-        LockFinding::Changed { library, version } => {
-            format!("{library} {version}: the recorded fingerprint changed")
-        }
-        LockFinding::Gone { library, version } => {
-            format!("{library} {version}: a recorded version is gone")
-        }
-        LockFinding::Unrecorded { library, version } => {
-            format!("{library} {version}: no recorded fingerprint")
-        }
-        LockFinding::Malformed { line } => format!("the lock file's line {line} is malformed"),
-    }
 }
 
 fn run() -> Result<bool, String> {

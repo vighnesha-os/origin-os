@@ -12,6 +12,13 @@
 //! Generation is deterministic: the same input bytes give the same output, with no timestamps,
 //! paths or other environment input (CLAUDE.md §75).
 //!
+//! **The library reaches nothing of the host** (ADR-0011 Amendment 4, T1). It reads and writes
+//! no file, runs no program and prints nothing: its caller hands it each definition's text and
+//! name and the versions file's text ([`compile`]), and writes what it returns
+//! ([`codegen::generate_output`], [`fingerprint::fingerprint_file`],
+//! [`fingerprint::updated_lock`]). Its callers are the command line (`src/main.rs`), a thin
+//! client, and `xtask`, which calls it in process. `cargo xtask host-tools-gate` holds the rule.
+//!
 //! The owner accepted the format on 2026-11-09 (`docs/spec/OIDL.md` §19, CLAUDE.md §84). Generated
 //! code is written to a directory the caller names; no Origin OS component uses it yet.
 #![forbid(unsafe_code)]
