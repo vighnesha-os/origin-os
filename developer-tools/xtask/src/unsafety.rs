@@ -18,11 +18,12 @@
 //! character literals, whatever it heads: a block, an `unsafe fn`, an `unsafe impl`, an
 //! `unsafe extern` or an attribute such as `#[unsafe(no_mangle)]`.
 //!
-//! Ring 3 has a list of its own ([`RING3_UNSAFE_FILES`], task S4-1): in the ring-3 crates
+//! Ring 3 has a list of its own ([`RING3_UNSAFE_FILES`], tasks S4-1 and S4-2): in the ring-3 crates
 //! ([`RING3_CRATES`]) only the listed files may hold `unsafe`, each for a reason, and the crate
-//! roots that can deny it do ([`RING3_ROOTS`]). `runtime/kernel-stubs` commits no generated
-//! code: the shims it includes (`abi.rs` and `core_stubs.rs`, OIDL §11's named shims) are the
-//! generator's output under the target directory, written at each build.
+//! roots that can deny it do ([`RING3_ROOTS`]). `runtime/kernel-client` and `runtime/core`
+//! commit no generated code: the shims they include (the client's imports in `abi.rs`, and
+//! `origin.core`'s stubs, OIDL §11's two named shims) are the generator's output under the
+//! target directory, written at each build.
 //!
 //! The gate ends with two on the assembly inside those sites: what a block promises the
 //! compiler about the flags (`asmflags`, CLAUDE.md §13), and where the processor's two
@@ -159,13 +160,16 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The crates that run in ring 3 (CLAUDE.md §11; task S4-1): the runtime and the bodies of its
-/// `mem*` functions, today's generated stubs, and the kernel's Rust proof programs.
-const RING3_CRATES: &[&str] = &[
-    "runtime/kernel-stubs",
+/// The crates that run in ring 3 (CLAUDE.md §11; tasks S4-1 and S4-2): `origin.core`, the
+/// runtime and the bodies of its `mem*` functions, the generated client, and the kernel's Rust
+/// proof programs.
+pub(crate) const RING3_CRATES: &[&str] = &[
+    "runtime/core",
+    "runtime/kernel-client",
     "runtime/rt",
     "runtime/rt-mem",
     "tests/kernel/first-program",
+    "tests/kernel/pin-program",
 ];
 
 /// The ring-3 files that may hold `unsafe`, and what each needs it for. A file comes onto this list
@@ -191,13 +195,24 @@ const RING3_UNSAFE_FILES: &[(&str, &str)] = &[
         "tests/kernel/first-program/src/faults.rs",
         "the proof's deliberate faults: a write to its own code, a jump into its own data and a write to its relocated read-only data",
     ),
+    (
+        "tests/kernel/pin-program/src/calls.rs",
+        "each entry point of `origin.core` declared with six whole registers, so that the pin proof's scripts can pass a stub any register values, hostile ones among them",
+    ),
+    (
+        "tests/kernel/pin-program/src/raw.rs",
+        "the pin proof's script and scratch memory at the kernel's fixed addresses; its entry, which reads RFLAGS first; and the two calls the pin must stop: its one `syscall` of its own, and a jump into a stub",
+    ),
 ];
 
 /// The ring-3 crate roots, each of which denies `unsafe`; only the modules of listed files allow
-/// it. (`runtime/kernel-stubs` cannot: it includes the generated shims.)
+/// it. (`runtime/core` and `runtime/kernel-client` cannot: each includes generated shims, the
+/// stubs and the client's imports, which are not committed and so are not read here. Their own
+/// committed files hold no `unsafe`, which this gate checks like any other file's.)
 const RING3_ROOTS: &[&str] = &[
     "runtime/rt/src/lib.rs",
     "tests/kernel/first-program/src/main.rs",
+    "tests/kernel/pin-program/src/main.rs",
 ];
 /// What each of [`RING3_ROOTS`] carries.
 const DENY: &str = "#![deny(unsafe_code)]";
@@ -296,7 +311,7 @@ pub(crate) fn gate() -> Result {
     let problems = ring3_problems(&ring3);
     if !problems.is_empty() {
         return Err(format!(
-            "`unsafe` in ring 3 is for the files the gate lists (RING3_UNSAFE_FILES in developer-tools/xtask/src/unsafety.rs; task S4-1):\n  {}",
+            "`unsafe` in ring 3 is for the files the gate lists (RING3_UNSAFE_FILES in developer-tools/xtask/src/unsafety.rs; tasks S4-1 and S4-2):\n  {}",
             problems.join("\n  ")
         ));
     }

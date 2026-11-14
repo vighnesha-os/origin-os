@@ -209,13 +209,20 @@ jobs:
         run: cargo --locked xtask boot-test
 
   # Which vendors and models this run's real-CPU boots ran on, in one table on the run's summary
-  # page, with a notice on the pull request. A record only: it never fails the run.
+  # page, with a notice on the pull request, and how long each job's boot-matrix step took beside
+  # its processor (TASKS item 53): the time follows the processor far more than any change. A
+  # record only: it never fails the run, and no time is held to anything.
   processors:
     name: processors tested on
     needs: boot-real-cpu
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # This job's block replaces the workflow's: `contents: read` again, and `actions: read` to
+    # read this run's own job list. Nothing writes.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -225,5 +232,9 @@ jobs:
           pattern: processor-*
           path: processor
           merge-multiple: true
+      - name: How long each real-CPU job's boot-matrix step took
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/ci/boot-step-durations.sh "$RUNNER_TEMP/boot-step"
       - name: Processor coverage
-        run: bash .github/ci/processor-coverage.sh processor
+        run: bash .github/ci/processor-coverage.sh processor "$RUNNER_TEMP/boot-step"

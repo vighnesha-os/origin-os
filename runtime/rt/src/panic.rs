@@ -3,7 +3,7 @@
 
 use core::panic::PanicInfo;
 
-use origin_kernel_stubs::origin_kernel::kernel::client;
+use origin_kernel_client::origin_kernel::kernel::client;
 
 /// The exit code of a thread that panicked. The message is not written anywhere: a program has
 /// no console, and the location would carry its source paths.

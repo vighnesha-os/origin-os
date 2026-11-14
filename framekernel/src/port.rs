@@ -30,7 +30,7 @@ use origin_abi::{Error, Handle};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::ports::{
-    self, Bound, NoMemory, Packet, Port, Refused, Request, Reservation, Source, TakeError,
+    self, Bound, Packet, Port, Refused, Request, Reservation, Source, TakeError, Unreserved,
 };
 
 use crate::cpu::without_interrupts;
@@ -134,6 +134,11 @@ impl PortHandle {
     pub(crate) fn memory(&self) -> PortRef {
         PortRef(self.0.clone())
     }
+
+    /// How many bindings are armed for the port: for the boot proof of its bound (I1).
+    pub(crate) fn armed(&self) -> usize {
+        self.0.port.armed(&KernelThreads)
+    }
 }
 
 /// `port_create` (F17): a new port charged to `account`, and its one handle. [`Error::Limit`]
@@ -142,7 +147,9 @@ impl PortHandle {
 pub(crate) fn create(account: &ObjectRef<Account>) -> Result<PortHandle, Error> {
     account.objects().ports.charge()?;
     let port = KernelPort {
-        port: Port::new(),
+        // Bounded by its creator's `bindings_per_port` (ADR-0005 Amendment 10, I1): the creator's
+        // figure pays for the index at that bound.
+        port: Port::bounded(account.objects().bindings_per_port),
         open: AtomicU32::new(1),
         account: account.clone(),
     };
@@ -179,8 +186,16 @@ fn port_and_object(
 /// decoder has refused an empty mask and undeclared signals.
 ///
 /// The first failure wins: the port's handle, then the object's; an object that raises no
-/// signals ([`Error::BadHandle`], as `wait_one` answers); the quota ([`Error::Limit`]); the
-/// memory ([`Error::NoMemory`], with the charge given back). A handle closed by another thread
+/// signals ([`Error::BadHandle`], as `wait_one` answers); the quota ([`Error::Limit`]): the
+/// binder's own `bindings`, then the port's bound, its creator's `bindings_per_port` (ADR-0005
+/// Amendment 10, I1); the memory ([`Error::NoMemory`], with the charge given back). Under a race
+/// a bind can be refused at the port's bound while fewer are armed, because another bind is in
+/// flight; a retry after that one completes or fails can succeed. By the same reading, a port
+/// full of bindings armed refuses a bind whose signals already meet its mask, though it would
+/// queue its packet at once and arm nothing: its reservation holds a place in the port's index
+/// from before the signals are read, under the source's lock, at the bind, which is what keeps a
+/// raise between a look and the bind from being missed (row K7; the independent review of
+/// TASKS 57, finding T3). A handle closed by another thread
 /// during the call, either of the two, is [`Error::BadHandle`], and nothing stays bound.
 pub(crate) fn bind(
     table: &SpinLock<HandleTable<Object>>,
@@ -194,9 +209,16 @@ pub(crate) fn bind(
     let (port_ref, source) = port_and_object(table, port, object)?;
     let source = source.ok_or(Error::BadHandle)?;
     let binding = Binding::charge(account)?;
-    // On failure the binding is dropped, which gives the charge back.
-    let reservation = Reservation::<Ports>::try_new(&KernelThreads, &port_ref, binding)
-        .map_err(|NoMemory| Error::NoMemory)?;
+    // On failure the binding is dropped, which gives the charge back. A port with as many
+    // bindings armed and reserved as its creator's `bindings_per_port` allows refuses before
+    // anything is allocated: `limit`, after the binder's own quota and before the memory (I1).
+    let reservation =
+        Reservation::<Ports>::try_new(&KernelThreads, &port_ref, binding).map_err(|refused| {
+            match refused {
+                Unreserved::Full => Error::Limit,
+                Unreserved::NoMemory => Error::NoMemory,
+            }
+        })?;
     let request = Request {
         owner: Owner {
             process,

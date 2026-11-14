@@ -4,8 +4,10 @@
 
 mod carried;
 mod convert;
+mod corelib;
 mod elf_writer;
 mod encodings;
+mod imports;
 mod reject;
 mod sign;
 

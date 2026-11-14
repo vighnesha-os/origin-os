@@ -1,0 +1,272 @@
+//! Host tests of `core_image`: what a description must hold before the kernel is built with it.
+
+use super::*;
+use origin_syscalls::origin_kernel::kernel::server::{CALLS, number};
+
+/// Twenty stubs of eight bytes each, call `n`'s at `8 * n`: `mov eax, n`, `syscall`, `ret`.
+fn code() -> &'static [u8] {
+    let mut bytes = Vec::new();
+    for call in CALLS {
+        bytes.push(0xB8);
+        bytes.extend_from_slice(&(call.number as u32).to_le_bytes());
+        bytes.extend_from_slice(&[0x0F, 0x05, 0xC3]);
+    }
+    bytes.leak()
+}
+
+/// The pin of call `n` in [`code`]: five bytes into its stub.
+const fn at(n: u64) -> u64 {
+    8 * n + 5
+}
+
+fn pins() -> Pins {
+    Pins {
+        thread_exit: at(number::THREAD_EXIT),
+        debug_report: at(number::DEBUG_REPORT),
+        debug_write: at(number::DEBUG_WRITE),
+        handle_close: at(number::HANDLE_CLOSE),
+        handle_duplicate: at(number::HANDLE_DUPLICATE),
+        channel_create: at(number::CHANNEL_CREATE),
+        channel_write: at(number::CHANNEL_WRITE),
+        channel_read: at(number::CHANNEL_READ),
+        wait_one: at(number::WAIT_ONE),
+        event_create: at(number::EVENT_CREATE),
+        object_signal: at(number::OBJECT_SIGNAL),
+        memory_object_create: at(number::MEMORY_OBJECT_CREATE),
+        memory_map: at(number::MEMORY_MAP),
+        memory_unmap: at(number::MEMORY_UNMAP),
+        memory_protect: at(number::MEMORY_PROTECT),
+        port_create: at(number::PORT_CREATE),
+        object_wait_async: at(number::OBJECT_WAIT_ASYNC),
+        port_wait: at(number::PORT_WAIT),
+        port_cancel: at(number::PORT_CANCEL),
+        clock_read: at(number::CLOCK_READ),
+    }
+}
+
+/// Every call's export, `origin_kernel_<method>` at its stub's first byte, ascending by name.
+fn exports() -> &'static [CoreExport] {
+    let mut exports: Vec<CoreExport> = CALLS
+        .iter()
+        .map(|call| CoreExport {
+            name: format!("origin_kernel_{}", call.name).leak(),
+            offset: 8 * call.number,
+            since: (0, 0),
+        })
+        .collect();
+    exports.sort_by(|a, b| a.name.cmp(b.name));
+    exports.leak()
+}
+
+fn image() -> CoreImage {
+    CoreImage {
+        span: PAGE,
+        code: code(),
+        exports: exports(),
+        pins: pins(),
+        release: RELEASE_FINGERPRINT,
+    }
+}
+
+#[test]
+fn a_description_of_stubs_passes() {
+    assert_eq!(check(&image()), Ok(()));
+    assert_eq!(pins().each().len(), CALLS.len());
+    // Every pin is its own call's `syscall`, which follows the load of that call's number.
+    for (number, offset) in pins().each() {
+        let stub = &code()[offset as usize - 5..];
+        assert_eq!(stub[0], 0xB8);
+        assert_eq!(
+            u64::from(u32::from_le_bytes(stub[1..5].try_into().unwrap())),
+            number
+        );
+        assert_eq!(stub[5..7], SYSCALL);
+    }
+}
+
+#[test]
+fn the_span_is_whole_pages_that_hold_the_code() {
+    for span in [0, PAGE - 1, PAGE + 8, MAX_SPAN + PAGE] {
+        assert_eq!(check(&CoreImage { span, ..image() }), Err(CoreError::Span));
+    }
+    assert_eq!(
+        check(&CoreImage {
+            span: MAX_SPAN,
+            ..image()
+        }),
+        Ok(())
+    );
+    assert_eq!(
+        check(&CoreImage {
+            code: &[],
+            ..image()
+        }),
+        Err(CoreError::Span)
+    );
+    let long: &'static [u8] = vec![0xCC; PAGE as usize + 1].leak();
+    assert_eq!(
+        check(&CoreImage {
+            code: long,
+            ..image()
+        }),
+        Err(CoreError::Span)
+    );
+}
+
+#[test]
+fn the_exports_ascend_by_name_inside_the_code() {
+    let with = |exports: &'static [CoreExport]| check(&CoreImage { exports, ..image() });
+    assert_eq!(with(exports()), Ok(()));
+    // With no export, no pin has a stub to lie in.
+    assert_eq!(with(&[]), Err(CoreError::Pin));
+    let outside: &'static [CoreExport] = vec![CoreExport {
+        name: "origin_kernel_x",
+        offset: code().len() as u64,
+        since: (0, 0),
+    }]
+    .leak();
+    assert_eq!(with(outside), Err(CoreError::Export));
+    let reversed: &'static [CoreExport] = vec![exports()[1], exports()[0]].leak();
+    assert_eq!(with(reversed), Err(CoreError::Export));
+    let twice: &'static [CoreExport] = vec![exports()[0], exports()[0]].leak();
+    assert_eq!(with(twice), Err(CoreError::Export));
+    // A name that is another's beginning sorts first.
+    assert!(before("origin_kernel_port", "origin_kernel_port_wait"));
+    assert!(!before("origin_kernel_port_wait", "origin_kernel_port"));
+    assert!(!before("same", "same"));
+    assert!(before("a", "b") && !before("b", "a"));
+}
+
+#[test]
+fn every_pin_is_a_syscall_of_the_code_and_no_two_calls_share_one() {
+    let with = |edit: fn(&mut Pins)| {
+        let mut pins = pins();
+        edit(&mut pins);
+        check(&CoreImage { pins, ..image() })
+    };
+    // One byte off, either way; the stub's first byte; past the code; the code's last byte.
+    assert_eq!(with(|p| p.channel_write += 1), Err(CoreError::Pin));
+    assert_eq!(with(|p| p.channel_write -= 1), Err(CoreError::Pin));
+    assert_eq!(with(|p| p.thread_exit = 0), Err(CoreError::Pin));
+    assert_eq!(with(|p| p.clock_read = 1 << 40), Err(CoreError::Pin));
+    assert_eq!(with(|p| p.clock_read = 8 * 20 - 1), Err(CoreError::Pin));
+    assert_eq!(with(|p| p.clock_read = u64::MAX), Err(CoreError::Pin));
+    // Another call's `syscall`: a real one, and still refused.
+    assert_eq!(with(|p| p.memory_map = p.memory_unmap), Err(CoreError::Pin));
+    assert_eq!(
+        with(|p| p.debug_report = p.thread_exit),
+        Err(CoreError::Pin)
+    );
+    // Code in which a stub lost its `syscall`.
+    let mut broken = code().to_vec();
+    broken[at(number::WAIT_ONE) as usize] = 0x90;
+    assert_eq!(
+        check(&CoreImage {
+            code: broken.leak(),
+            ..image()
+        }),
+        Err(CoreError::Pin)
+    );
+}
+
+#[test]
+fn stubs_generated_from_another_definition_are_refused() {
+    let mut release = RELEASE_FINGERPRINT;
+    release[31] ^= 1;
+    assert_eq!(
+        check(&CoreImage { release, ..image() }),
+        Err(CoreError::Release)
+    );
+    assert_eq!(
+        check(&CoreImage {
+            release: [0; 32],
+            ..image()
+        }),
+        Err(CoreError::Release)
+    );
+}
+
+/// An image whose code is `bytes`, for [`image_word`] alone.
+fn image_of(bytes: &'static [u8]) -> CoreImage {
+    CoreImage {
+        span: PAGE,
+        code: bytes,
+        exports: &[],
+        pins: pins(),
+        release: RELEASE_FINGERPRINT,
+    }
+}
+
+#[test]
+fn a_word_of_the_image_is_its_code_then_the_linkers_padding() {
+    // Thirteen bytes of code: the first word is code, the second five bytes of code and three
+    // of padding, and every word after it padding alone.
+    let image = image_of(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(
+        image_word(&image, 0),
+        u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8])
+    );
+    assert_eq!(
+        image_word(&image, 8),
+        u64::from_le_bytes([9, 10, 11, 12, 13, 0xCC, 0xCC, 0xCC])
+    );
+    let padding = u64::from_le_bytes([PADDING; 8]);
+    assert_eq!(image_word(&image, 16), padding);
+    assert_eq!(image_word(&image, PAGE as usize - 8), padding);
+    // An offset that would wrap is padding, not a panic.
+    assert_eq!(image_word(&image, usize::MAX - 3), padding);
+}
+
+#[test]
+fn a_whole_page_of_the_image_has_no_byte_after_its_code_but_padding() {
+    // What the frames hold, laid out as the install writes it: no zero byte follows the last
+    // stub, which two of would be an instruction of their own (the review's finding F11).
+    let image = image_of(code());
+    let mut page = Vec::new();
+    for word in 0..PAGE as usize / 8 {
+        page.extend_from_slice(&image_word(&image, word * 8).to_le_bytes());
+    }
+    let length = image.code.len();
+    assert_eq!(&page[..length], image.code);
+    assert!(page[length..].iter().all(|&byte| byte == PADDING));
+    assert_eq!(page.len(), PAGE as usize);
+    // The two bytes of `syscall` are where the code has them and nowhere after it.
+    let pairs = |bytes: &[u8]| bytes.windows(2).filter(|pair| *pair == SYSCALL).count();
+    assert_eq!(pairs(&page), pairs(image.code));
+}
+
+#[test]
+fn every_pin_lies_in_its_own_methods_stub() {
+    let with = |edit: fn(&mut Pins)| {
+        let mut pins = pins();
+        edit(&mut pins);
+        check(&CoreImage { pins, ..image() })
+    };
+    // Two calls' pins swapped: each is a real `syscall`, no two share one, and each lies in
+    // the other's stub. Only the stub rule sees it (finding K6).
+    assert_eq!(
+        with(|p| core::mem::swap(&mut p.memory_map, &mut p.memory_unmap)),
+        Err(CoreError::Pin)
+    );
+    // A call whose export is missing has no stub for its pin.
+    let without: &'static [CoreExport] = exports()
+        .iter()
+        .copied()
+        .filter(|e| e.name != "origin_kernel_clock_read")
+        .collect::<Vec<_>>()
+        .leak();
+    assert_eq!(
+        check(&CoreImage {
+            exports: without,
+            ..image()
+        }),
+        Err(CoreError::Pin)
+    );
+    // The names match whole: a prefix of a method's name, or the name without the library's
+    // prefix, is no method's.
+    assert!(names_method("origin_kernel_port_wait", "port_wait"));
+    assert!(!names_method("origin_kernel_port", "port_wait"));
+    assert!(!names_method("origin_kernel_port_wait", "port"));
+    assert!(!names_method("port_wait", "port_wait"));
+    assert!(!names_method("origin_kerneL_port_wait", "port_wait"));
+}

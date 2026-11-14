@@ -1,8 +1,9 @@
 //! The launch path (ADR-0005 P6, amendments C1 and C4–C6; ADR-0011 N14 step 3, task S3-3): the
 //! one way the kernel starts a process with a start record.
 //!
-//! A creator makes the child with [`Process::child_of`], so the child acts for the creator's
-//! principal and for no other; maps its image; has [`place`] put the start record's pages at a
+//! A creator makes the child with [`Process::proof_child_of`] (the boot proofs) or
+//! [`Process::pinned_child_of`] (a program), so the child acts for the creator's principal and
+//! for no other; maps its image; has [`place`] put the start record's pages at a
 //! random address, read-only; then [`start`] gives the child its own process and first thread
 //! and what the creator passes (BOOTSTRAP and DIRECTORY channel ends), writes the record from
 //! what the child's table then holds, and starts the first thread with RDI holding the
@@ -11,14 +12,22 @@
 //! A launch that fails after the child holds anything closes the child's table: the child's
 //! handle to itself would otherwise keep a process that never ran alive for ever.
 //!
-//! A program the kernel carries in its image (ADR-0011 Amendment 2, L1; task S4-1) is launched
-//! in two steps around those two. [`load_program`] makes the child with its system calls pinned
-//! to the program's one read-execute segment (ADR-0005 A6), places the program at a random base,
-//! maps each page with its final permissions and writes it, relocations applied, through its
-//! frame, then maps a stack at another random place with an unmapped page on either side.
-//! Nothing is ever writable and executable, and RELRO pages are read-only to the program from
-//! the start. [`start_program`] then places the start record and starts the first thread at the
-//! entry, as [`place`] and [`start`] do for any child.
+//! The creator pays for its child out of its own before the child is made (ADR-0005 G5; task
+//! S4-3): in step 4 the creator is the kernel, and its own is the root. The payment is the
+//! figure of the child's limits and the pages the launch maps for it, its image, its stack and
+//! its start record; it comes back when the child's account goes.
+//!
+//! A program the kernel carries in its image (ADR-0011 Amendment 2, L1 to L3 and L7; tasks S4-1
+//! and S4-2) is launched in two steps around those two. [`load_program`] makes the child pinned
+//! per call (ADR-0005 B2): it maps `origin.core` into it at a random place, read-execute, on the
+//! one set of frames every process shares, which records that place as where the child's calls
+//! must come from. It then places the program at another random base, maps each page with its
+//! final permissions and writes it through its frame, relocations applied and each import slot
+//! holding the address of its export in the child's `origin.core`; and maps a stack at a third
+//! random place with an unmapped page on either side. Nothing is ever writable and executable,
+//! and RELRO pages, the import slots among them, are read-only to the program from the start.
+//! [`start_program`] then places the start record and starts the first thread at the entry, as
+//! [`place`] and [`start`] do for any child.
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
@@ -28,12 +37,13 @@ use origin_abi::{Error, Handle, rights};
 use origin_frame::objref::ObjectRef;
 use origin_frame::userspace::{ChangeError, UserFrame};
 
+use crate::core_image;
 use crate::cpu::{CpuIndex, without_interrupts};
 use crate::handles::{Need, Typed};
 use crate::ipc::{ChannelEnd, Object};
 use crate::paging::{Access, MapError, PAGE};
 use crate::process::{Limits, Process, ThreadObject};
-use crate::program::{self, Carried, SegmentAccess};
+use crate::program::{self, Carried, CoreAt, SegmentAccess};
 
 /// Start records go at a random page in `[RECORD_LOW, RECORD_HIGH)`: the upper part of the user
 /// half (ADR-0004 H1), clear of the low addresses programs are placed at.
@@ -147,7 +157,10 @@ pub(crate) fn start(
 ) -> Result<Launched, Error> {
     let process = ObjectRef::try_new(child).map_err(|_| Error::NoMemory)?;
     let thread = ObjectRef::try_new(ThreadObject::new()).map_err(|_| Error::NoMemory)?;
+    // Once the record is written nothing more is mapped for the child: what was paid ahead for
+    // pages it did not use goes back to the root (G5; ruling (d)).
     match hand_over(&process, &thread, &placed, given)
+        .inspect(|()| process.settle_launch())
         .and_then(|()| started(&process, &thread, &placed, cpu, entry, stack_top))
     {
         Ok(()) => Ok(Launched {
@@ -224,7 +237,7 @@ fn hand_over(
         return Err(Error::InvalidArgs);
     }
     for (frame, chunk) in placed.frames.iter().zip(bytes.chunks(PAGE as usize)) {
-        if !process.write_frame(*frame, 0, chunk) {
+        if !process.write_page(*frame, 0, chunk) {
             return Err(Error::NoMemory);
         }
     }
@@ -265,6 +278,8 @@ pub(crate) struct ProgramLimits {
 pub(crate) struct LoadedProgram {
     /// The child, which nothing else holds yet.
     pub(crate) process: Process,
+    /// Where `origin.core` starts in the child: the base its calls are pinned to.
+    pub(crate) core: u64,
     /// Where the program starts: each offset in its description is from here.
     pub(crate) base: u64,
     /// Its entry point's address.
@@ -289,36 +304,45 @@ fn random() -> Result<u64, Error> {
     origin_frame::random::next_u64().map_err(|_| Error::NotSupported)
 }
 
-/// Makes `creator`'s child for `program`, under `run`'s limits, with its system calls accepted
-/// from its read-execute segment alone (ADR-0005 A6), and maps the program at a random base and
-/// a stack at another random place. Every page is mapped once, with its final permissions, and
-/// written through its frame: read-execute for code, read-only for read-only data and for RELRO
-/// once its relocations are in, read-write and never executable for data.
+/// Makes `creator`'s child for `program`, under `run`'s limits, pinned per call (ADR-0005 B2),
+/// and maps `origin.core`, the program and a stack into it, each at a random place of its own.
+/// `origin.core` is mapped read-execute on the frames every process shares, and its place is
+/// recorded as where the child's calls must come from (ADR-0011 L2, L7). Every page of the
+/// program is mapped once, with its final permissions, and written through its frame:
+/// read-execute for code, read-only for read-only data and for RELRO once its relocations and
+/// its imports are in (L3), read-write and never executable for data.
+///
+/// The root pays for the child before it is made (ADR-0005 G5): its limits' figure, and the pages
+/// this launch maps for it ([`launch_ahead`]).
 ///
 /// `INVALID_ARGS`, before anything is made, for a description that breaks [`program::check`]'s
-/// rules or a stack of no pages or of more than [`program::MAX_STACK_PAGES`]; `NOT_SUPPORTED`
-/// without a random-number generator; `NO_MEMORY` without frames; `LIMIT` if no free place is
-/// found, or when the image and stack need more page tables than one space may have. That last
-/// is found part-way through mapping, not estimated first: a program or stack spread over more
-/// than about 40 MiB is refused after much of it is mapped (S4-1's review, finding F4, kept as a
-/// limit; the boot proof shows such a refusal gives everything back). On every error the child,
-/// and every frame and table it was given, is dropped.
+/// rules or a stack of no pages or of more than [`program::MAX_STACK_PAGES`]; `LIMIT`, with
+/// nothing made, if the root cannot pay for the child in full; `NOT_SUPPORTED`
+/// without a random-number generator; `NO_MEMORY` without frames, or if `origin.core` was never
+/// written into its frames; `LIMIT` if no free place is found, or when the image and stack need
+/// more page tables than one space may have. That last is found part-way through mapping, not
+/// estimated first: a program or stack spread over more than about 40 MiB is refused after much
+/// of it is mapped (S4-1's review, finding F4, kept as a limit; the boot proof shows such a
+/// refusal gives everything back). On every error the child, and every frame and table it was
+/// given, is dropped, and its mappings of `origin.core`'s frames with it.
 pub(crate) fn load_program(
     creator: &Process,
     program: &Carried,
     run: &ProgramLimits,
 ) -> Result<LoadedProgram, Error> {
-    program::check(program).map_err(|_| Error::InvalidArgs)?;
+    let image = core_image::image();
+    program::check(program, image).map_err(|_| Error::InvalidArgs)?;
     if run.stack_pages == 0 || run.stack_pages > program::MAX_STACK_PAGES {
         return Err(Error::InvalidArgs);
     }
-    let base = program::random_base(program.span / PAGE, random()?).ok_or(Error::Limit)?;
-    let code = program::code_range(program, base).ok_or(Error::InvalidArgs)?;
-    let mut child = Process::child_of(creator, run.limits, code).ok_or(Error::NoMemory)?;
-    map_image(&mut child, program, base)?;
+    let ahead = launch_ahead(program, run).ok_or(Error::Limit)?;
+    let mut child = Process::pinned_child_of(creator, run.limits, ahead)?;
+    let core = place_core(&mut child, image.span / PAGE)?;
+    let base = place_image(&mut child, program, CoreAt { base: core, image })?;
     let (stack, stack_top) = place_stack(&mut child, run.stack_pages)?;
     Ok(LoadedProgram {
         process: child,
+        core,
         base,
         entry: base + program.entry,
         stack,
@@ -326,8 +350,70 @@ pub(crate) fn load_program(
     })
 }
 
-/// Maps every page of `program` at `base` into `child`, relocations applied.
-fn map_image(child: &mut Process, program: &Carried, base: u64) -> Result<(), Error> {
+/// What the root pays ahead, besides the figure of `run`'s limits, for the pages a launch of
+/// `program` maps for its child (G5; the coordinating session's ruling (d)): `origin.core`'s
+/// pages at their share of the page records, and on frames of the child's own the program's
+/// pages, its stack and its start record at the largest a record can be. What the record does
+/// not use goes back once it is written ([`start`]). `None` on overflow.
+pub(crate) fn launch_ahead(program: &Carried, run: &ProgramLimits) -> Option<u64> {
+    let costs = crate::process::costs()?;
+    let core = core_image::image().span / PAGE;
+    let image = program.segments.iter().try_fold(0u64, |pages, segment| {
+        pages.checked_add(segment.size / PAGE)
+    })?;
+    let record = (start::MAX_SIZE as u64).div_ceil(PAGE);
+    let own = image.checked_add(run.stack_pages)?.checked_add(record)?;
+    own.checked_mul(costs.page)?
+        .checked_add(core.checked_mul(costs.shared_page)?)
+}
+
+/// What a launch of `program` under `run` takes out of the root before its child is made: the
+/// figure of its limits and [`launch_ahead`]. `None` on overflow.
+pub(crate) fn launch_payment(program: &Carried, run: &ProgramLimits) -> Option<u64> {
+    let figure = run.limits.figure(&crate::process::costs()?)?;
+    figure.checked_add(launch_ahead(program, run)?)
+}
+
+/// Maps `origin.core`, `pages` pages of it, into `child` at a random place in the programs'
+/// region, which nothing else of the child uses yet, and returns that place: the base the
+/// child's calls are pinned to from now on.
+fn place_core(child: &mut Process, pages: u64) -> Result<u64, Error> {
+    for _ in 0..PLACEMENT_TRIES {
+        let place = program::random_base(pages, random()?).ok_or(Error::Limit)?;
+        if (0..pages).any(|k| child.is_mapped(place + k * PAGE)) {
+            continue;
+        }
+        child.map_core(place)?;
+        return Ok(place);
+    }
+    Err(Error::Limit)
+}
+
+/// Maps `program` into `child` at a random base whose whole span is free, its imports bound to
+/// `core`, and returns the base.
+fn place_image(child: &mut Process, program: &Carried, core: CoreAt<'_>) -> Result<u64, Error> {
+    let pages = program.span / PAGE;
+    for _ in 0..PLACEMENT_TRIES {
+        let base = program::random_base(pages, random()?).ok_or(Error::Limit)?;
+        // Clear of `origin.core`, the one thing mapped so far: a page of the span that no
+        // segment holds must stay unmapped too.
+        if (0..pages).any(|k| child.is_mapped(base + k * PAGE)) {
+            continue;
+        }
+        map_image(child, program, base, core)?;
+        return Ok(base);
+    }
+    Err(Error::Limit)
+}
+
+/// Maps every page of `program` at `base` into `child`, relocations applied and imports bound
+/// to `core`.
+fn map_image(
+    child: &mut Process,
+    program: &Carried,
+    base: u64,
+    core: CoreAt<'_>,
+) -> Result<(), Error> {
     let mut page = Vec::new();
     page.try_reserve_exact(PAGE as usize)
         .map_err(|_| Error::NoMemory)?;
@@ -339,13 +425,13 @@ fn map_image(child: &mut Process, program: &Carried, base: u64) -> Result<(), Er
             SegmentAccess::ReadWrite => Access::ReadWrite,
         };
         for k in 0..segment.size / PAGE {
-            program::fill_page(program, index, k, base, &mut page)
+            program::fill_page(program, index, k, base, core, &mut page)
                 .map_err(|_| Error::InvalidArgs)?;
             let frame = child
                 .map_page(base + segment.rva + k * PAGE, access)
                 .map_err(map_refused)?;
             // A fresh frame is zero: only a page with bytes is written.
-            if page.iter().any(|&b| b != 0) && !child.write_frame(frame, 0, &page) {
+            if page.iter().any(|&b| b != 0) && !child.write_page(frame, 0, &page) {
                 return Err(Error::NoMemory);
             }
         }

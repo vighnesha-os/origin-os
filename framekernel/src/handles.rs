@@ -96,6 +96,17 @@ fn join(index: usize, generation: u64) -> Handle {
 }
 
 impl<T> HandleTable<T> {
+    /// The size and alignment of an element of each of the table's two growing lists: its slots,
+    /// and the free list of their indexes. The kernel-wide bound counts both at the table's
+    /// limit (ADR-0005 G5).
+    pub const ELEMENTS: [(usize, usize); 2] = [
+        (
+            core::mem::size_of::<Slot<T>>(),
+            core::mem::align_of::<Slot<T>>(),
+        ),
+        (core::mem::size_of::<u32>(), core::mem::align_of::<u32>()),
+    ];
+
     /// An empty table that holds at most `limit` handles (the process's quota, P11).
     pub fn new(limit: usize) -> Self {
         Self {

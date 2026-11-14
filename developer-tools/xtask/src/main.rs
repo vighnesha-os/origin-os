@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 
 mod asmflags;
+mod corestubs;
+mod costs;
 mod disk;
 mod documents;
 mod expected_warning;
@@ -14,6 +16,7 @@ mod image;
 mod image_inputs;
 mod interfaces;
 mod lex;
+mod listed_names;
 mod loom;
 mod mnemonics;
 mod progress;
@@ -55,6 +58,9 @@ commands:
               boot-random, boot-identity and boot-console
   boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
               cleared on the bridge too and opened again above the device its driver attached
+  boot-reserved  the kernel boot with firmware-reserved memory (RMRRs, IVMDs) a TEST ONLY UEFI
+              application plants in QEMU's tables (both IOMMUs): the NVMe controller's domain
+              identity-maps what the kernel may trust, and the rest is refused by name
   boot-legacy-free  the kernel boot on a machine with no 8254 and no 8042: the timers
               calibrate against the ACPI PM timer, and the proofs that need those devices
               say they cannot run
@@ -88,6 +94,9 @@ commands:
   unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction, on the
               `preserves_flags` option of assembly blocks, and on RDRAND and RDSEED, which
               only the kernel's generator and the loader's may run (part of check; quick)
+  names-gate  only the gate on two names only listed files may use: the proof-process
+              constructors in the kernel (ADR-0011 L8) and the call numbers in ring 3
+              (CLAUDE.md §42); part of check
   cfg-lint    only the CLAUDE.md §11 lint: no Origin code outside developer-tools/ asks
               whether its target is Linux or Unix (part of check; quick)
   document-gate only the gate on documents and archives: none is tracked, or left in this
@@ -111,6 +120,10 @@ commands:
               a row's state changes (TASKS item 43; quick)
   progress-gate only the gate on docs/PROGRESS.md: the committed page is the one the
               tree generates, byte for byte (part of check; quick)
+  cost-gate   only the gate on the cost ledger in docs/engineering/PERFORMANCE_BUDGETS.md:
+              each row's decision and figure, the list of ADR-0001 to ADR-0017, and a
+              Performance cost statement in every ADR or amendment accepted after
+              ADR-0018 (part of check; ADR-0018 V8; quick)
   regenerate rewrites the kernel's generated system-call crate from sdk/interfaces
   version     writes runtime/version/src/generated.rs, the release's constants, from
               origin-version.toml (CLAUDE.md §62)
@@ -123,6 +136,13 @@ commands:
               only the check the reproducible-build gate makes of each ELF it builds, on
               files named here: `.comment` holds the line .cargo/config.toml fixes for the
               linker, and not the linker's own, which differs between kinds of host
+  core-gate   only the gates on `origin.core` as it was linked and on the programs the kernel
+              carries: the image's functions are the stubs of origin.kernel's methods and
+              nothing else; each is the extension of its own narrow parameters, the load of
+              its own number and one `syscall`; the offsets the kernel accepts each call
+              from are that image's; and no carried program holds a `syscall` instruction,
+              but a proof program its stated one (part of check; ADR-0005 B2, ADR-0011 L6,
+              L8 and L13)
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
               and no jump table, in the code this build compiled. Builds the kernel first, or
@@ -159,6 +179,9 @@ environment:
                                       machine)
   ORIGIN_QEMU_BRIDGE                  on: the NIC behind a PCIe root port (the boot-bridge
                                       machine)
+  ORIGIN_QEMU_RESERVED                on: a TEST ONLY UEFI application plants firmware-reserved
+                                      memory (RMRRs or IVMDs) in QEMU's tables before the
+                                      loader starts (the boot-reserved machine)
   ORIGIN_QEMU_ACCEL                   tcg (default) or kvm: run on a real x86-64 processor (needs
                                       an x86-64 host with /dev/kvm); the devices and firmware
                                       stay QEMU's
@@ -177,6 +200,10 @@ environment:
 const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const LOADER_PACKAGE: &str = "origin-boot-uefi";
 const LOADER_BIN: &str = "origin-boot";
+/// TEST ONLY: the UEFI application that plants firmware-reserved memory in QEMU's ACPI tables
+/// before the loader starts (`ORIGIN_QEMU_RESERVED`; TASKS item 40).
+const RESERVED_PACKAGE: &str = "origin-test-reserved-memory";
+const RESERVED_BIN: &str = "origin-test-reserved";
 const VERSION_PACKAGE: &str = "origin-version";
 const ONBF_FORMAT_PACKAGE: &str = "onbf-format";
 const CRYPTO_PACKAGE: &str = "origin-crypto";
@@ -398,6 +425,70 @@ fn check_iommu(iommu: &Iommu) -> Result {
 /// Whether the NIC sits behind a PCIe root port (`ORIGIN_QEMU_BRIDGE=on`, `boot-bridge`).
 fn qemu_bridge() -> bool {
     env::var("ORIGIN_QEMU_BRIDGE").as_deref() == Ok("on")
+}
+
+/// Whether a TEST ONLY application plants firmware-reserved memory in QEMU's tables before the
+/// loader starts (`ORIGIN_QEMU_RESERVED=on`, `boot-reserved`).
+fn qemu_reserved() -> bool {
+    env::var("ORIGIN_QEMU_RESERVED").as_deref() == Ok("on")
+}
+
+/// The device the planted ranges name and no driver attaches: 00:1f.6, absent on QEMU's q35.
+const ABSENT_DEVICE: u16 = 0x1F << 3 | 6;
+
+/// The regions planted for the `boot-reserved` machine (TASKS item 40; research ledger
+/// `docs/research/2026-11-12-reserved-memory-identity-maps.md` §6), for the IOMMU QEMU
+/// emulates. Under VT-d: an RMRR of two reserved pages for the NVMe controller (00:02.0), and
+/// two the kernel must refuse, for a device that does not exist: one in RAM the kernel will
+/// own, one in the interrupt range. Under AMD-Vi, IVMDs for the controller: one read and
+/// write, one read only, and one never to be mapped; one for every device, as an exclusion
+/// range; and one in RAM, refused.
+fn reserved_regions(amd: bool) -> Vec<origin_test_reserved_memory::Region> {
+    use origin_test_reserved_memory::{Placement, Region, Table};
+    const NVME: u16 = 2 << 3;
+    let rmrr = |placement, device, pages| Region {
+        table: Table::Dmar,
+        ivmd_kind: 0,
+        flags: 0,
+        placement,
+        device,
+        last_device: 0,
+        pages,
+    };
+    let ivmd = |kind, flags, placement, device, last_device| Region {
+        table: Table::Ivrs,
+        ivmd_kind: kind,
+        flags,
+        placement,
+        device,
+        last_device,
+        pages: 1,
+    };
+    if amd {
+        vec![
+            ivmd(0x21, 0b0111, Placement::Reserved, NVME, 0),
+            ivmd(0x21, 0b0011, Placement::Reserved, NVME, 0),
+            ivmd(0x20, 0b1000, Placement::Reserved, 0, 0),
+            ivmd(0x22, 0b0000, Placement::Reserved, NVME, 3 << 3),
+            ivmd(0x21, 0b0111, Placement::LoaderData, ABSENT_DEVICE, 0),
+            // A writable range whose page lacks the test fill: the proof must not write it (M2).
+            ivmd(0x21, 0b0111, Placement::ReservedOther, NVME, 0),
+            // A writable range over the IVRS copy itself, which the kernel holds (M1).
+            ivmd(0x21, 0b0111, Placement::Table, ABSENT_DEVICE, 0),
+            // Never mapped for any device of any IOMMU (ADR-0007 Amendment 2, R6).
+            ivmd(0x20, 0b0000, Placement::Reserved, 0, 0),
+        ]
+    } else {
+        vec![
+            rmrr(Placement::Reserved, NVME, 2),
+            rmrr(Placement::LoaderData, ABSENT_DEVICE, 1),
+            rmrr(Placement::Fixed(0xFEE0_0000), ABSENT_DEVICE, 1),
+            // A writable range whose page lacks the test fill: the proof must not write it (M2).
+            rmrr(Placement::ReservedOther, NVME, 1),
+            // A writable range over the DMAR copy itself, which the kernel holds (M1).
+            rmrr(Placement::Table, ABSENT_DEVICE, 1),
+        ]
+    }
 }
 
 /// Processors QEMU emulates: `ORIGIN_QEMU_SMP` (1–64), or 2.
@@ -709,6 +800,9 @@ fn boot_scenario() -> Scenario {
     if qemu_bridge() {
         bridge_markers(&mut scenario);
     }
+    if qemu_reserved() {
+        reserved_markers(&mut scenario, qemu_iommu() == Iommu::Amd);
+    }
     if qemu_machine_lacks("pit") {
         no_pit_markers(&mut scenario);
     }
@@ -770,16 +864,25 @@ fn no_generator_markers(scenario: &mut Scenario) {
         "origin-kernel: random: no generator: known-answer test passed; on the boot processor RDSEED is absent and RDRAND is absent. Nothing will be launched and nothing placed at a random address (ADR-0016 R8)".into(),
         "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND absent (0 draws passed); its generator NOT seeded".into(),
         "origin-kernel: random: no generator, so no request is answered; consistent false: random failed".into(),
-        "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, Rust-program, service-directory and memory-object proofs did not run".into(),
+        // The root is sized whatever the generator (ADR-0005 G5).
+        "origin-kernel: kernel bound: the root holds ".into(),
+        " KiB kept for the kernel's own use; a second sizing is refused and changes nothing: true".into(),
+        "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, Rust-program, origin.core, entry-flags, service-directory and memory-object proofs did not run".into(),
         "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: true; the loader handed over no random value: true, and the region is at its fixed base: true".into(),
+    ];
+    // The bound's proof refuses a launch before any place is drawn, so it runs here too; only
+    // the run of the program to its end is left out (ADR-0005 G5).
+    scenario.markers.extend(kernel_bound_markers(false));
+    scenario.markers.extend([
         // The network asks for no lease: a transaction ID must not be guessable.
         "; DHCP lease 0.0.0.0 (".into(),
-        "; no random value for a transaction ID or port; consistent false: virtio-net failed".into(),
+        "; no random value for a transaction ID or port; consistent false: virtio-net failed"
+            .into(),
         "origin-kernel: boot verdict: degraded: ".into(),
-        "; 4 did not run; failed: ".into(),
+        "; 6 did not run; failed: ".into(),
         "random-number generator (no randomness)".into(),
         HALT_LINE.into(),
-    ];
+    ]);
     // What this machine is expected to say is not a failure here.
     scenario.failures.retain(|failure| {
         ![
@@ -1070,6 +1173,237 @@ fn number_before(text: &str, word: &str) -> Option<u64> {
     let head = text.get(..text.find(word)?)?;
     let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
     head.get(head.len() - digits..)?.parse().ok()
+}
+
+/// What the kernel says when no firmware-reserved range is identity-mapped for the NVMe
+/// controller: QEMU's own tables name none.
+const NO_RESERVED_LINE: &str = "origin-kernel: IOMMU: reserved memory: none is identity-mapped for the NVMe controller (0 range(s) named by the firmware, 0 refused), so the proofs through it did not run";
+
+/// The `boot-reserved` machine (`ORIGIN_QEMU_RESERVED=on`; TASKS item 40): the TEST ONLY
+/// application plants [`reserved_regions`] before the loader starts, says where, and the kernel
+/// reports each range it was given, with its verdict, and proves each page identity-mapped for
+/// the NVMe controller. Which page is where depends on the firmware's allocations, so the
+/// proof's lines are counted by [`check_reserved_boot`], not ordered here.
+fn reserved_markers(scenario: &mut Scenario, amd: bool) {
+    let fixture: Vec<String> = if amd {
+        vec![
+            "origin-test-reserved: TEST ONLY: planting reserved memory in the firmware's tables",
+            "origin-test-reserved: IVMD type 0x21 flags 0b0111 0x",
+            "(reserved pages) for DeviceID 0x0010",
+            "origin-test-reserved: IVMD type 0x21 flags 0b0011 0x",
+            "(reserved pages) for DeviceID 0x0010",
+            "origin-test-reserved: IVMD type 0x20 flags 0b1000 0x",
+            "(reserved pages) for DeviceID 0x0000",
+            "origin-test-reserved: IVMD type 0x22 flags 0b0000 0x",
+            "(reserved pages) for DeviceID 0x0010",
+            "origin-test-reserved: IVMD type 0x21 flags 0b0111 0x",
+            "(loader-data pages) for DeviceID 0x00fe",
+            "origin-test-reserved: IVMD type 0x21 flags 0b0111 0x",
+            "(reserved pages without the test fill) for DeviceID 0x0010",
+            "origin-test-reserved: IVMD type 0x21 flags 0b0111 0x",
+            "(the table's own pages) for DeviceID 0x00fe",
+            "origin-test-reserved: IVMD type 0x20 flags 0b0000 0x",
+            "(reserved pages) for DeviceID 0x0000",
+            "origin-test-reserved: the XSDT now names IVRS at 0x",
+            "origin-test-reserved: starting the loader",
+        ]
+    } else {
+        vec![
+            "origin-test-reserved: TEST ONLY: planting reserved memory in the firmware's tables",
+            "origin-test-reserved: RMRR 0x",
+            "(reserved pages) for 00:02.0",
+            "origin-test-reserved: RMRR 0x",
+            "(loader-data pages) for 00:1f.6",
+            "origin-test-reserved: RMRR 0xfee00000-0xfee00fff (a fixed address) for 00:1f.6",
+            "origin-test-reserved: RMRR 0x",
+            "(reserved pages without the test fill) for 00:02.0",
+            "origin-test-reserved: RMRR 0x",
+            "(the table's own pages) for 00:1f.6",
+            "origin-test-reserved: the XSDT now names DMAR at 0x",
+            "origin-test-reserved: starting the loader",
+        ]
+    }
+    .into_iter()
+    .map(String::from)
+    .collect();
+    scenario.markers.splice(0..0, fixture);
+    let mapped = "in the domain of each device it names that a driver attaches";
+    let refused_ram = "): refused (the memory map does not call 0x";
+    let refused_lent =
+        "): refused (it is writable and overlaps the firmware table the kernel holds at 0x";
+    let (after, kernel): (&str, Vec<String>) = if amd {
+        (
+            "origin-kernel: IOMMU: IVRS revision 1, IVinfo 0x2801 (EFR support true, 40-bit physical and 0-bit virtual addresses, pre-boot DMA protection false); 1 IOMMU(s) in 2 IVHD(s), 8 memory definition(s)",
+            vec![
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                ", flags 0b0111; for DeviceID 0x0010 (00:02.0) in segment 0): identity-mapped, read and write, ".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                ", flags 0b0011; for DeviceID 0x0010 (00:02.0) in segment 0): identity-mapped, read only, ".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                " (IVMD type 0x20 at offset 0x".into(),
+                format!(", flags 0b1000; every device of the IOMMU at 0xfed80000): identity-mapped, read and write, {mapped}"),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                ", flags 0b0000; for DeviceIDs 0x0010-0x0018 in segment 0): never mapped for the devices it names".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!(", flags 0b0111; for DeviceID 0x00fe (00:1f.6) in segment 0{refused_ram}"),
+                " reserved or EFI runtime memory), so the devices it names cannot be attached".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                ", flags 0b0111; for DeviceID 0x0010 (00:02.0) in segment 0): identity-mapped, read and write, ".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!(", flags 0b0111; for DeviceID 0x00fe (00:1f.6) in segment 0{refused_lent}"),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                " (IVMD type 0x20 at offset 0x".into(),
+                ", flags 0b0000; every device in the system, on every IOMMU): never mapped for the devices it names".into(),
+            ],
+        )
+    } else {
+        (
+            "every device's DMA faults until its driver attaches it; 0 stale fault(s) cleared",
+            vec![
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!("; for 00:02.0): identity-mapped, read and write, {mapped}"),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!("; for 00:1f.6{refused_ram}"),
+                " reserved or EFI runtime memory), so the devices it names cannot be attached".into(),
+                "origin-kernel: IOMMU: reserved memory 0xfee00000-0xfee00fff (RMRR at offset 0x".into(),
+                "; for 00:1f.6): refused (it overlaps the interrupt range), so the devices it names cannot be attached".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!("; for 00:02.0): identity-mapped, read and write, {mapped}"),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!("; for 00:1f.6{refused_lent}"),
+            ],
+        )
+    };
+    if amd {
+        let old = "origin-kernel: IOMMU: IVRS revision 1, IVinfo 0x2801 (EFR support true, 40-bit physical and 0-bit virtual addresses, pre-boot DMA protection false); 1 IOMMU(s) in 2 IVHD(s), 0 memory definition(s)";
+        match scenario.markers.iter().position(|m| m == old) {
+            Some(i) => scenario.markers[i] = after.into(),
+            None => scenario
+                .markers
+                .push(format!("xtask: the marker {old:?} is missing")),
+        }
+    }
+    match scenario.markers.iter().position(|m| m == after) {
+        Some(i) => {
+            scenario.markers.splice(i + 1..i + 1, kernel);
+        }
+        None => scenario
+            .markers
+            .push(format!("xtask: the marker {after:?} is missing")),
+    }
+    match scenario.markers.iter().position(|m| m == NO_RESERVED_LINE) {
+        Some(i) => {
+            scenario.markers[i] = "origin-kernel: IOMMU: reserved memory proof: page 0x".into()
+        }
+        None => scenario
+            .markers
+            .push(format!("xtask: the marker {NO_RESERVED_LINE:?} is missing")),
+    }
+    scenario.check = Some(check_reserved_boot);
+}
+
+/// The `boot-reserved` machine's whole-log check, after the kernel boot's: every range the
+/// application planted reached the kernel at the same addresses (the kernel read the table
+/// the firmware gave), and the proof's lines are the ones [`reserved_regions`] calls for.
+fn check_reserved_boot(done: &Completed) -> Result {
+    check_kernel_boot(done)?;
+    let amd = qemu_iommu() == Iommu::Amd;
+    let planted: Vec<&str> = done
+        .serial
+        .lines()
+        .filter_map(|l| l.strip_prefix("origin-test-reserved: "))
+        .filter_map(|l| {
+            l.split_whitespace()
+                .find(|t| t.starts_with("0x") && t.contains('-'))
+        })
+        .collect();
+    let want = reserved_regions(amd).len();
+    if planted.len() != want {
+        return Err(format!(
+            "the application reported {} planted ranges, not {want}",
+            planted.len()
+        ));
+    }
+    for span in &planted {
+        let line = format!("origin-kernel: IOMMU: reserved memory {span} (");
+        if !done.serial.contains(&line) {
+            return Err(format!(
+                "the kernel did not report the planted range {span}"
+            ));
+        }
+    }
+    // The range over the table copy is refused for the copy the kernel holds, at its address
+    // (M1): the one the application put in the XSDT.
+    let copy = done
+        .serial
+        .lines()
+        .find_map(|l| l.strip_prefix("origin-test-reserved: the XSDT now names "))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .ok_or("the application did not say where its table copy is")?;
+    let held = format!("overlaps the firmware table the kernel holds at {copy})");
+    if !done.serial.contains(&held) {
+        return Err(format!(
+            "the kernel did not refuse the range over the table copy at {copy} as a table it holds"
+        ));
+    }
+    let proofs: Vec<&str> = done
+        .serial
+        .lines()
+        .filter(|l| l.contains("origin-kernel: IOMMU: reserved memory proof: page 0x"))
+        .collect();
+    let count = |access: &str, write: &str, fill: &str, others: &str| {
+        proofs
+            .iter()
+            .filter(|l| {
+                l.contains(&format!("({access}, as the firmware's bits give: true) in the NVMe controller's domain maps to itself: true; the controller's write of LBA 2048 into it {write}: true; its read of it to LBA 24576 carried what the page holds: true; {fill}; other domains: {others}; consistent true"))
+            })
+            .count()
+    };
+    let landed = "landed there";
+    let filled = "the page held the test step's fill";
+    let alone = "00:03.0 does not map it at any address";
+    // The page without the test fill: written by nothing, and left as it was (M2).
+    let left = |count: &dyn Fn(&str, &str, &str, &str) -> usize| {
+        count(
+            "read and write",
+            "was not run, as the page does not hold the test step's fill",
+            "the page is unchanged: true",
+            alone,
+        )
+    };
+    let (expected, found) = if amd {
+        (
+            [1, 1, 1, 1],
+            [
+                count("read and write", landed, filled, alone),
+                count("read only", "was blocked and recorded", filled, alone),
+                count(
+                    "read and write",
+                    landed,
+                    filled,
+                    "00:03.0 maps it too, as the firmware names it",
+                ),
+                left(&count),
+            ],
+        )
+    } else {
+        (
+            [2, 0, 0, 1],
+            [
+                count("read and write", landed, filled, alone),
+                0,
+                0,
+                left(&count),
+            ],
+        )
+    };
+    if found != expected || proofs.len() != expected.iter().sum::<usize>() {
+        return Err(format!(
+            "the reserved-memory proof's lines: {found:?} of the kinds expected {expected:?}, {} in all",
+            proofs.len()
+        ));
+    }
+    Ok(())
 }
 
 /// The `boot-bridge` machine (`ORIGIN_QEMU_BRIDGE=on`): the NIC at 01:00.0 behind a PCIe root
@@ -1472,6 +1806,14 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: random: cost: a 64-byte request ".into(),
             "; only zeros on it after a request: true".into(),
             "origin-kernel: random: every processor has a generator true; consistent true".into(),
+            // `origin.core` into its one set of frames, before any process exists (task S4-2;
+            // ADR-0011 L2).
+            "origin-kernel: origin.core: ".into(),
+            " bytes of code, the stubs of 20 calls and nothing else, written once into 1 frames and read back as written, the rest of each page the linker's int3; every process pinned per call maps them read-execute (free frames fell by ".into(),
+            // The kernel's root, sized once before the first process (ADR-0005 G5; task S4-3).
+            "origin-kernel: kernel bound: the root holds ".into(),
+            " KiB of free frames less a reserve of ".into(),
+            " KiB kept for the kernel's own use; a second sizing is refused and changes nothing: true".into(),
             // The guard is in the kernel stacks' region, whose addresses the boot never prints
             // (ADR-0004 Amendment 2, A6.3).
             "origin-kernel: page protection: the first thread's stack guard page faulted (#PF error 0x0)".into(),
@@ -1551,12 +1893,16 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(identity_markers())
         .chain(launch_markers())
         .chain(rust_program_markers())
+        .chain(core_pin_markers())
         .chain(directory_markers())
         .chain(memory_markers())
         .chain(events_ports_markers())
         .chain(stack_markers(machine))
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
+        ])
+        .chain(kernel_bound_markers(true))
+        .chain([
             // ADR-0017 Z3: the scheduler noted each change of process, with one barrier for
             // each where the processor has IBPB and none where it has not.
             "origin-kernel: ibpb: ".into(),
@@ -1696,6 +2042,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: IOMMU: domains: 00:02.0 domain 1 (".into(),
             " 00:03.0 domain 2 (".into(),
             "no other function has a context entry, so its DMA faults; IOVAs from 0x40000000; faults recorded before the proofs: 0; consistent true".into(),
+            // Firmware-reserved memory (ADR-0007 questions 4 and 8): QEMU's tables name none,
+            // so nothing is proved here; the boot-reserved machine plants some.
+            NO_RESERVED_LINE.into(),
             // The PIT's IRQ0 again, now through interrupt remapping (CLAUDE.md §24, §32;
             // ADR-0007 I8): the I/O APIC's entry in remappable format names an IRTE that
             // sends vector 0x41 to the target CPU (another than the boot processor when there
@@ -1779,16 +2128,19 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         ])
         .collect(),
         failures: boot_failures(),
-        check: Some(|done| {
-            console_lines_intact(&done.serial, self::machine().cpus() as usize)?;
-            long_lines_whole(&done.serial)?;
-            unwaited_lines_whole(&done.serial)?;
-            check_screen(done)
-        }),
+        check: Some(check_kernel_boot),
         stderr: vec![],
         capture: Capture::Com1AndScreen,
         qemu_args: None,
     }
+}
+
+/// The kernel boot's whole-log checks: every line whole, and the screen.
+fn check_kernel_boot(done: &Completed) -> Result {
+    console_lines_intact(&done.serial, self::machine().cpus() as usize)?;
+    long_lines_whole(&done.serial)?;
+    unwaited_lines_whole(&done.serial)?;
+    check_screen(done)
 }
 
 /// Output that fails any kernel boot the moment it appears.
@@ -1854,10 +2206,14 @@ fn boot_failures() -> Vec<&'static str> {
         ": ipc failed",
         ": start failed",
         ": rust program failed",
+        ": origin.core failed",
+        "origin.core could not be written",
+        ": entry flags failed",
         ": directory failed",
         ": memory failed",
         ": events and ports failed",
         ": user clock failed",
+        ": kernel bound failed",
         ": console failed",
         ": TLB failed",
         ": address spaces failed",
@@ -2390,6 +2746,32 @@ fn rust_program_markers() -> Vec<String> {
     ]
 }
 
+/// `origin.core` and the per-call pin, and the flags at a thread's entry (task S4-2; ADR-0005 B2,
+/// G1, H1; ADR-0011 L2, L3, L6 to L8, L13; `ipc_proof::prove_core_pin` and `prove_entry_flags`):
+/// the kernel writes `origin.core` into its frames once, and the second program it carries, a
+/// script interpreter in Rust, makes every call through it and is stopped where it must be.
+fn core_pin_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: core: the binding: before its thread starts, each of pin_program's ".into(),
+        " import slots holds the address of its export in its own origin.core, on a page it cannot write: true; and each of first_program's ".into(),
+        "origin-kernel: core: a Rust program made every one of origin.kernel's 20 calls through origin.core: 20 calls of its script, each reported through debug_report, each with the status it must give, then thread_exit: true".into(),
+        "origin-kernel: core: the hostile scripts of \"IPC and handles\", made through the stubs, gave call for call the statuses they give directly, and each process exited by itself: ".into(),
+        " IPC calls (the one call number no method has is left out: no stub can ask it): true; 49 memory calls: true".into(),
+        "origin-kernel: core: one call through origin.core, as it is pinned: ".into(),
+        "origin-kernel: core: the per-call pin: a syscall in the program's own code stopped the thread, its ending naming call 1 and the address the program reported for that instruction: true; a jump to debug_report's syscall with channel_create's number stopped it, naming call 5 and the stub's address: true; a number no stub has, 9999, stopped it there too: true; and debug_report's own number with bit 32 set, 0x100000001, there too: true".into(),
+        "origin-kernel: core: the kernel's proof processes keep their range: a call from outside it was refused with a status and the process went on to its own fault: true; a call number no method has answered NOT_SUPPORTED: true".into(),
+        "origin-kernel: core: origin.core in a process: a write to its page faulted there: true; memory_unmap and memory_protect of its range, a fixed memory_map over it, and a fixed memory_map of two pages from one page below it each answered INVALID_ARGS, and calls through it went on: true; its 1 pages were still mapped read-execute on the same frames afterwards: true; three processes, two of the pin program and one of the first, hold it on one set of frames, executable in ".into(),
+        " spaces and writable in none: true, each at a base of its own: true; the kernel's own write path into a process's pages refused a page of it: true".into(),
+        "origin-kernel: core: narrow parameters: through its stub, a call whose 32-bit parameter has bits set above it, in the second, third and fourth registers, is the same call with them clear, 4 calls: true; the same registers in a direct call by a proof process are each INVALID_ARGS: true".into(),
+        "origin-kernel: core: every process it launched and all they held are gone: heap ".into(),
+        "; origin.core's own frames stay, mapped by no process: true, and still hold the image word for word as it was written at boot: true".into(),
+        "origin-kernel: entry flags: a program's first instruction pushed RFLAGS, ".into(),
+        // Not the register's value: ADR-0005 H1 promises eight bits of it and no more, and the
+        // kernel's proof judges those (the review of 2026-11-13, finding K11).
+        ": the direction flag and the six status flags clear and interrupts on: true".into(),
+    ]
+}
+
 /// The service directory proof (ADR-0005 C11, C12; ADR-0011 N9; `ipc_proof::prove_directory`).
 fn directory_markers() -> Vec<String> {
     vec![
@@ -2418,6 +2800,38 @@ fn events_ports_markers() -> Vec<String> {
         "origin-kernel: clock: 30 reads from ring 3 never went back: true; each lies between the kernel's readings before and after: true; a wait to a deadline on the same clock ended after it: true; a bad out pointer is fault: true; one read every ".into(),
         " ns (QEMU, through the script interpreter)".into(),
     ]
+}
+
+/// The kernel-wide bound's proof (ADR-0005 G5; task S4-3; `ipc_proof::prove_kernel_bound`).
+/// `generator`: whether the boot has a random-number generator, which the run of the program
+/// to its end needs to place it.
+fn kernel_bound_markers(generator: bool) -> Vec<String> {
+    let mut markers: Vec<String> = vec![
+        "origin-kernel: kernel bound: costs as this build measures them, in bytes: a process ".into(),
+        "origin-kernel: kernel bound: after every earlier proof the root is back at its size, ".into(),
+        " KiB: true; it cannot be sized again: true".into(),
+        "origin-kernel: kernel bound: with all of the root but ".into(),
+        " bytes held by a process that never runs, one byte short of what a launch of the first program pays, ".into(),
+        " bytes: true; the launch is refused with LIMIT: true; nothing is left of it, the root, the heap in use, the free frames, the next process ID and the kernel stacks as they were: true".into(),
+        "origin-kernel: kernel bound: with the holder gone the root has room again: true; a process with the program's limits takes their figure, ".into(),
+        " bytes, to the byte and gives it back when dropped: true; the program launched and run to its end pays ".into(),
+    ];
+    markers.push(if generator {
+        " bytes, each page it maps paid for, until it is gone, then gives everything back: true".into()
+    } else {
+        " bytes, each page it maps paid for, until it is gone, then gives everything back: not run, no generator".into()
+    });
+    markers.extend([
+        "origin-kernel: kernel bound: a process whose channel outlives it keeps its ".into(),
+        " bytes out of the root after the process object is dropped: true; they come back when the channel goes: true".into(),
+        "origin-kernel: kernel bound: a process given no threads cannot start one: true; nothing is left of the refusal: true".into(),
+        "origin-kernel: kernel bound: a process given one thread starts it: true; while it waits a second start is refused: true; nothing is left of the refusal: true; the first ends when let go: true".into(),
+        "origin-kernel: kernel bound: a memory object another process made, mapped in one whose last thread has ended and is not yet reaped, keeps its maker's ".into(),
+        " bytes out while the space that maps it stands: true; they come back when the last reap frees that space, before TERMINATED: true".into(),
+        "origin-kernel: kernel bound: a port whose creator was given two bindings at once takes two from another process: true; a third is refused with LIMIT: true; nothing is left of it, the binder's charge and the port's armed count with the rest: true; once one fires it takes another: true; a port whose creator was given none refuses the first: true; the first creator paid beyond the second its port's index at two, to the byte: true".into(),
+        "origin-kernel: kernel bound: after this proof the root is back at its size: true; the most of it the proofs before this one had paid out at once was ".into(),
+    ]);
+    markers
 }
 
 /// The memory-object proof (ADR-0005 P7, P11, C6-C8; `ipc_proof::prove_memory`).
@@ -2589,6 +3003,7 @@ fn main() -> ExitCode {
     {
         ["check"] => in_turn("check", check),
         ["unsafe-gate"] => unsafety::gate(),
+        ["names-gate"] => listed_names::gate(),
         ["document-gate"] => documents::gate(),
         ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
@@ -2597,6 +3012,7 @@ fn main() -> ExitCode {
         ["roadmap-gate"] => roadmap::gate(),
         ["progress"] => progress::write(),
         ["progress-gate"] => progress::gate(),
+        ["cost-gate"] => costs::gate(),
         ["regenerate"] => interfaces::regenerate(),
         ["version"] => image_inputs::write_version_file(),
         ["version-gate"] => image_inputs::version_gate(),
@@ -2604,6 +3020,7 @@ fn main() -> ExitCode {
         ["linker-text-gate", files @ ..] => image_inputs::linker_text_gate(files),
         ["reproducible-compare", directory] => reproducible::compare(Path::new(directory)),
         ["image-gate"] => in_turn("image-gate", image::build_and_gate),
+        ["core-gate"] => in_turn("core-gate", corestubs::gate),
         ["image-gate", elf] => image::gate(Path::new(elf)),
         ["build"] => in_turn("build", || {
             build_loader(Loader::Developer).and_then(|loader| {
@@ -2617,6 +3034,7 @@ fn main() -> ExitCode {
         ["boot-x2apic"] => in_turn("boot-x2apic", boot_x2apic),
         ["boot-console"] => in_turn("boot-console", boot_console),
         ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
+        ["boot-reserved"] => in_turn("boot-reserved", boot_reserved),
         ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
         ["boot-random"] => in_turn("boot-random", boot_random),
         ["boot-identity"] => in_turn("boot-identity", boot_identity),
@@ -2690,6 +3108,7 @@ fn boot_matrix() -> Result {
     }
     boot_x2apic()?;
     boot_bridge()?;
+    boot_reserved()?;
     boot_legacy_free()?;
     boot_random()?;
     boot_identity()?;
@@ -2701,7 +3120,7 @@ fn boot_matrix() -> Result {
         "xtask: boot-matrix: the kernel stacks' region was at {boots} distinct bases in {boots} kernel boots, read through QEMU's monitor; none is printed"
     );
     println!(
-        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, the two machines without the random-number instructions, the two CPU identities, and the console machines)"
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the reserved-memory machines, the legacy-free machine, the two machines without the random-number instructions, the two CPU identities, and the console machines)"
     );
     Ok(())
 }
@@ -2975,6 +3394,30 @@ fn boot_console() -> Result {
         chosen.len(),
         scenarios.len()
     );
+    Ok(())
+}
+
+/// Runs `boot-test`'s kernel boot in a child process under each IOMMU with firmware-reserved
+/// memory planted in QEMU's tables by the TEST ONLY application (`ORIGIN_QEMU_RESERVED=on`;
+/// TASKS item 40; ADR-0007 questions 4 and 8): the kernel identity-maps what it may trust for
+/// the NVMe controller, refuses the rest by name, and proves the maps by DMA.
+fn boot_reserved() -> Result {
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    for iommu in ["intel", "amd"] {
+        println!("xtask: boot-reserved: the {iommu} IOMMU, firmware-reserved memory planted");
+        let status = boot_test_child(&exe)
+            .env("ORIGIN_QEMU_IOMMU", iommu)
+            .env("ORIGIN_QEMU_RESERVED", "on")
+            .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
+            .status()
+            .map_err(|e| format!("cannot run boot-test: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "boot-test with reserved memory planted and the {iommu} IOMMU failed ({status})"
+            ));
+        }
+    }
+    println!("xtask: boot-reserved passed (both IOMMUs, firmware-reserved memory planted)");
     Ok(())
 }
 
@@ -3305,8 +3748,31 @@ fn check() -> Result {
             "-D",
             "warnings",
         ],
+        // TEST ONLY: the application that plants firmware-reserved memory, on the host (its
+        // library and tests) and on its real target.
+        &[
+            "clippy",
+            "--package",
+            RESERVED_PACKAGE,
+            "--lib",
+            "--tests",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[
+            "clippy",
+            "--package",
+            RESERVED_PACKAGE,
+            "--target",
+            UEFI_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ],
         &["test", "--package", "xtask"],
         &["test", "--package", LOADER_PACKAGE, "--lib"],
+        &["test", "--package", RESERVED_PACKAGE, "--lib"],
         &["test", "--package", VERSION_PACKAGE],
         &["test", "--package", PACK_PACKAGE],
         &["test", "--package", SIGN_PACKAGE],
@@ -3448,6 +3914,9 @@ fn check() -> Result {
         build_loader(loader)?;
     }
     image::gate(&build_kernel()?)?;
+    // `origin.core` as that build linked it, against the definition and the kernel's table;
+    // and no `syscall` in a program the kernel carries.
+    corestubs::gate()?;
     no_panic_check()?;
     dependency_check()?;
     linux_cfg_lint()?;
@@ -3456,7 +3925,10 @@ fn check() -> Result {
     provenance::gate()?;
     roadmap::gate()?;
     progress::gate()?;
+    costs::gate()?;
     unsafety::gate()?;
+    // Who may make a proof process, and which ring-3 files may name the call numbers.
+    listed_names::gate()?;
     interfaces::gate()?;
     image_inputs::version_gate()?;
     image_inputs::graph_gate()?;
@@ -4195,6 +4667,37 @@ fn build_loader(loader: Loader) -> Result<PathBuf> {
     build_loader_in(Some(loader.feature()), None)
 }
 
+/// Builds the TEST ONLY application that plants firmware-reserved memory, and returns the path
+/// of its `.efi`. It takes the loader's flags: it builds the loader's library too, and with other
+/// flags each build would rebuild that library over the other's.
+fn build_reserved_fixture() -> Result<PathBuf> {
+    let mut build = cargo();
+    build.args([
+        "build",
+        "--package",
+        RESERVED_PACKAGE,
+        "--bin",
+        RESERVED_BIN,
+        "--target",
+        UEFI_TARGET,
+        "--release",
+    ]);
+    build.args(toolchain::image_config()?);
+    run_step(&mut build)?;
+    let efi = target_dir()
+        .join(UEFI_TARGET)
+        .join("release")
+        .join(format!("{RESERVED_BIN}.efi"));
+    if efi.is_file() {
+        Ok(efi)
+    } else {
+        Err(format!(
+            "cargo reported success but {} does not exist",
+            efi.display()
+        ))
+    }
+}
+
 /// Builds the EFI application with `feature`, or with none, into `target`, or into Cargo's own
 /// target directory, and returns the path of `origin-boot.efi`. With no feature the trust
 /// store is empty: the loader a release builds, until Origin has keys of its own.
@@ -4265,7 +4768,11 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
     let build = ring3::with_programs(&mut build, target)?;
     // A kernel linked before `.cargo/config.toml` fixed the linker's line is linked again:
     // Cargo does not do that by itself (TASKS item 44).
-    image_inputs::build_with_the_fixed_line(std::slice::from_ref(&elf), || run_step(build))?;
+    let output = image_inputs::Linked {
+        path: elf.clone(),
+        package: KERNEL_PACKAGE,
+    };
+    image_inputs::build_with_the_fixed_line(std::slice::from_ref(&output), || run_step(build))?;
     if elf.is_file() {
         Ok(elf)
     } else {
@@ -4587,11 +5094,27 @@ fn stage(kernel: &[u8], loader: Loader) -> Result<Staged> {
     // The removable-media default boot path for x64 (UEFI 2.11 §3.5.1.1).
     let boot_dir = esp.join("EFI").join("BOOT");
     fs::create_dir_all(&boot_dir).map_err(|e| format!("{}: {e}", boot_dir.display()))?;
-    fs::copy(&efi, boot_dir.join("BOOTX64.EFI"))
-        .map_err(|e| format!("copy {}: {e}", efi.display()))?;
     // Where the loader looks for the Framekernel (ADR-0002 B1).
     let origin_dir = esp.join("EFI").join("ORIGIN");
     fs::create_dir_all(&origin_dir).map_err(|e| format!("{}: {e}", origin_dir.display()))?;
+    if qemu_reserved() {
+        // TEST ONLY (TASKS item 40): the application that plants firmware-reserved memory
+        // starts first, and starts the unchanged loader from \EFI\ORIGIN\LOADER.EFI.
+        let fixture = build_reserved_fixture()?;
+        fs::copy(&fixture, boot_dir.join("BOOTX64.EFI"))
+            .map_err(|e| format!("copy {}: {e}", fixture.display()))?;
+        fs::copy(&efi, origin_dir.join("LOADER.EFI"))
+            .map_err(|e| format!("copy {}: {e}", efi.display()))?;
+        let regions = reserved_regions(qemu_iommu() == Iommu::Amd);
+        let mut config = vec![0u8; 1024];
+        let len = origin_test_reserved_memory::encode(&regions, &mut config)
+            .ok_or("too many reserved regions")?;
+        fs::write(origin_dir.join("RESERVED.CFG"), &config[..len])
+            .map_err(|e| format!("write RESERVED.CFG: {e}"))?;
+    } else {
+        fs::copy(&efi, boot_dir.join("BOOTX64.EFI"))
+            .map_err(|e| format!("copy {}: {e}", efi.display()))?;
+    }
     fs::write(origin_dir.join("KERNEL.ONBF"), kernel)
         .map_err(|e| format!("write KERNEL.ONBF: {e}"))?;
     // A fresh NVRAM copy for every boot, so no run inherits variables from an earlier one.
@@ -5430,6 +5953,29 @@ mod gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TASKS item 40's review, M2: the kernel writes into a planted reserved page only where it
+    /// finds the fill the TEST ONLY application puts there, so the two copies must agree.
+    #[test]
+    fn the_fixtures_fill_is_the_one_the_kernel_recognises() {
+        for page in [0x1000, 0x1FB3_1000, 0x7A00_0000, 0xFF_FFFF_F000] {
+            let planted: Vec<u8> = (0..framekernel::testfill::PAGE as u64)
+                .map(|o| origin_test_reserved_memory::fill_byte(page, o))
+                .collect();
+            assert!(
+                framekernel::testfill::holds_fill(page, &planted),
+                "{page:#x}"
+            );
+            // What the application puts in its pages without the fill is not the fill.
+            let other: Vec<u8> = (0..framekernel::testfill::PAGE as u64)
+                .map(|o| origin_test_reserved_memory::fill_byte(page + 0x10_0000, o))
+                .collect();
+            assert!(
+                !framekernel::testfill::holds_fill(page, &other),
+                "{page:#x}"
+            );
+        }
+    }
 
     /// ADR-0004 Amendment 2, A6.3: a boot log names no address in the stack window, PML4 slots
     /// 384–447, in any case and anywhere in a line; its edges and the windows beside it are fine.

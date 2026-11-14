@@ -1,0 +1,29 @@
+[package]
+name = "pin-program"
+description = "The program of the boot proofs \"origin.core and the call pin\" and \"the flags at a thread's entry\": a script interpreter in Rust that makes every call through origin.core, and the calls the pin must stop (task S4-2; ADR-0011 L6 to L8, L13; ADR-0005 B2, G1, H1)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Built only for the userspace triple, with `.cargo/userspace.toml`, by `cargo xtask`; never a
+# default member. Linked against `origin.core`, with an entry of its own
+# (`origin_pin_entry`, which reads RFLAGS before anything else runs). `onbf-pack carried` then
+# describes its linker output for the kernel, which compiles the description in
+# (`framekernel/src/program.rs`).
+#
+# It is one of the kernel's proof programs: the gate on carried programs knows it by name, with
+# the one `syscall` instruction it holds on purpose (`src/raw.rs`).
+[[bin]]
+name = "pin-program"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+origin-abi = { path = "../../../runtime/abi" }
+origin-kernel-client = { path = "../../../runtime/kernel-client" }
+origin-rt = { path = "../../../runtime/rt" }
+
+[lints]
+workspace = true

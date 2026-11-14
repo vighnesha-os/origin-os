@@ -1768,8 +1768,17 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
     for d in &domains {
         let _ = write!(
             com1,
-            " {} domain {} ({} pages mapped, {} ever, {} table pages);",
-            d.at, d.id, d.mapped, d.mapped_ever, d.tables
+            " {} domain {} ({} pages mapped, {} ever, {} table pages{});",
+            d.at,
+            d.id,
+            d.mapped,
+            d.mapped_ever,
+            d.tables,
+            if d.identity_pages == 0 {
+                alloc::string::String::new()
+            } else {
+                alloc::format!(", {} reserved pages identity-mapped", d.identity_pages)
+            }
         );
     }
     let quiet = !attached_fault && !lost_before;
@@ -1782,5 +1791,219 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
         if lost_before { " (some lost)" } else { "" },
         if quiet { "" } else { ": IOMMU failed" }
     );
-    translated && blocked && remapped && blocked_irq && quiet
+    let reserved = prove_reserved(com1, domain, at);
+    translated && blocked && remapped && blocked_irq && quiet && reserved
+}
+
+/// The page of scratch blocks the reserved-memory proof writes: in the data partition, apart
+/// from every other proof's.
+const RESERVED_LBA: u64 = 24_576;
+
+/// A copy of the firmware memory page at `phys`, read with volatile reads (a device may write
+/// it), or `None` if the memory map does not call it the firmware's.
+fn firmware_page(phys: u64) -> Option<[u8; PAGE as usize]> {
+    let mut out = [0u8; PAGE as usize];
+    origin_frame::vm::read_firmware(PhysAddr::new(phys), &mut out).ok()?;
+    Some(out)
+}
+
+/// The DMA faults recorded since the last call that came from source ID `sid` and name
+/// `address` (or, where the IOMMU records none, address 0).
+fn faults_at(sid: u16, address: u64) -> Option<crate::iommu::Fault> {
+    let (faults, _) = crate::iommu::take_faults();
+    let address_ok = |a: u64| a == address || (a == 0 && !crate::iommu::fault_address_required());
+    faults
+        .into_iter()
+        .find(|f| f.source_id == sid && !f.interrupt && address_ok(f.address))
+}
+
+/// Pages of each identity span the reserved-memory proof drives DMA through.
+const RESERVED_PROOF_PAGES: u64 = 4;
+
+/// The access the firmware's own bits give a range, worked out apart from
+/// `reserved::from_ivmd`, so the proof catches a decoding that gets them wrong (TASKS item 40's
+/// review, I4): an RMRR is read and write (VT-d §3.16); an IVMD's ExclusionRange (bit 3) is
+/// read and write, otherwise IR (bit 1) and IW (bit 2) as they are (48882 Table 113).
+fn flags_access(source: crate::iommu::Source) -> origin_frame::vtd::Access {
+    use origin_frame::vtd::Access;
+    match source {
+        crate::iommu::Source::Rmrr => Access::READ_WRITE,
+        crate::iommu::Source::Ivmd { flags, .. } if flags & 0b1000 != 0 => Access::READ_WRITE,
+        crate::iommu::Source::Ivmd { flags, .. } => Access {
+            read: flags & 0b0010 != 0,
+            write: flags & 0b0100 != 0,
+        },
+    }
+}
+
+/// ADR-0007 questions 4 and 8 (TASKS item 40): firmware-reserved memory the NVMe controller's
+/// domain identity-maps is reached at its own physical address, with exactly the access the
+/// firmware gave, and by no device the firmware did not name. For each page of each identity
+/// span (the first [`RESERVED_PROOF_PAGES`] of a longer one):
+/// - the domain's tables map it to itself, with the access the firmware's own bits give
+///   ([`flags_access`]);
+/// - the controller's write into it (a read of the pattern blocks at LBA 2048) lands there,
+///   or, without write access, is blocked and recorded. Only into a page that holds the TEST
+///   ONLY firmware step's fill ([`crate::testfill`]): a boot proof never writes memory a real
+///   machine's firmware keeps for its own use (TASKS item 40's review, M2), so elsewhere the
+///   write is not run, and the page must be as it was when the proof is done;
+/// - its read of it (a write to the scratch blocks, read back through an ordinary DMA page)
+///   gives what the page holds, or, without read access, is blocked and recorded;
+/// - every other domain reaches the page, at any address, only if the firmware names it for
+///   that device too, and then at the page's own address (review L5).
+///
+/// With no identity span (QEMU's own tables have no RMRR or IVMD), it says so and proves
+/// nothing.
+fn prove_reserved(com1: &mut Console, domain: crate::iommu::Domain, at: pci::Address) -> bool {
+    let spans = crate::iommu::identity_spans(domain);
+    let ranges = crate::iommu::reserved_ranges();
+    let refused = ranges.iter().filter(|r| r.verdict.is_err()).count();
+    if spans.is_empty() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: reserved memory: none is identity-mapped for the NVMe controller ({} range(s) named by the firmware, {refused} refused), so the proofs through it did not run",
+            ranges.len()
+        );
+        return true;
+    }
+    let sid = crate::iommu::source_id(at);
+    let (domains, _) = crate::iommu::domains();
+    let sources = crate::iommu::domain_ranges(domain);
+    let Some(plain) = dma_page() else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: reserved memory: no memory for a probe page: IOMMU failed"
+        );
+        return false;
+    };
+    let mut expected = [0u8; PAGE as usize];
+    for (k, block) in expected.chunks_mut(512).enumerate() {
+        pattern(PROBE_LBA + k as u64, block);
+    }
+    let _ = crate::iommu::take_faults();
+    let mut all = true;
+    let pages = spans.iter().flat_map(|&(span, access)| {
+        (0..(span.len() / PAGE).min(RESERVED_PROOF_PAGES))
+            .map(move |k| (span.base + k * PAGE, access))
+    });
+    for (page, access) in pages {
+        let walked = crate::iommu::translate(domain, origin_frame::addr::Iova::new(page));
+        let identity = walked == Some((page, access));
+        // The access the firmware's bits give, from every range that names the device here.
+        let flagged = sources
+            .iter()
+            .filter(|r| {
+                r.verdict.is_ok()
+                    && r.range.is_some_and(|x| {
+                        x.span.contains(page)
+                            && matches!(x.use_, origin_frame::reserved::Use::Identity(_))
+                    })
+            })
+            .map(|r| flags_access(r.source))
+            .reduce(|a, b| origin_frame::vtd::Access {
+                read: a.read || b.read,
+                write: a.write || b.write,
+            });
+        let as_flagged = flagged == Some(access);
+        let before = firmware_page(page);
+        let filled = before
+            .as_ref()
+            .is_some_and(|b| crate::testfill::holds_fill(page, b));
+        // The controller writes into the page (the pattern blocks read from the disk), and only
+        // into a page the test step filled (M2).
+        let write_leg = filled;
+        let (write_words, write_ok, after) = if write_leg {
+            let wrote = transfer_status(false, PROBE_LBA, page, 8).ok();
+            let after = firmware_page(page);
+            let write_fault = faults_at(sid, page);
+            let ok = if access.write {
+                wrote.is_some_and(|s| s.ok()) && after == Some(expected) && write_fault.is_none()
+            } else {
+                before.is_some() && after == before && write_fault.is_some()
+            };
+            let words = if access.write {
+                "landed there"
+            } else {
+                "was blocked and recorded"
+            };
+            (words, ok, after)
+        } else {
+            (
+                "was not run, as the page does not hold the test step's fill",
+                true,
+                before,
+            )
+        };
+        // The controller reads the page: written to the scratch blocks (zeroed first through
+        // an ordinary DMA page), then read back through that page.
+        plain.fill(&[0u8; PAGE as usize]);
+        let zeroed = transfer_status(true, RESERVED_LBA, plain.bus().raw(), 8)
+            .ok()
+            .is_some_and(|s| s.ok());
+        let sent = transfer_status(true, RESERVED_LBA, page, 8).ok();
+        let read_fault = faults_at(sid, page);
+        plain.fill(&[CANARY; PAGE as usize]);
+        let back = transfer_status(false, RESERVED_LBA, plain.bus().raw(), 8)
+            .ok()
+            .is_some_and(|s| s.ok());
+        let disk = plain.to_bytes();
+        let read_ok = zeroed
+            && back
+            && if access.read {
+                sent.is_some_and(|s| s.ok()) && Some(disk) == after && read_fault.is_none()
+            } else {
+                disk == [0u8; PAGE as usize] && read_fault.is_some()
+            };
+        // A page without the fill is as it was: the proof wrote nothing into it.
+        let untouched = filled || (before.is_some() && firmware_page(page) == before);
+        // No other domain reaches the page, at any address, unless the firmware names it for
+        // that device too; then it maps it to itself.
+        let mut others = alloc::string::String::new();
+        let mut others_ok = true;
+        for d in domains.iter().filter(|d| d.at != at) {
+            let named = crate::iommu::identity_spans(d.domain)
+                .iter()
+                .any(|(s, _)| s.contains(page));
+            let reached = crate::iommu::maps_physical(d.domain, page);
+            let fine = if named {
+                crate::iommu::translate(d.domain, origin_frame::addr::Iova::new(page))
+                    .is_some_and(|(p, _)| p == page)
+            } else {
+                reached.is_none()
+            };
+            others_ok &= fine;
+            let _ = write!(
+                others,
+                "{}{} {}",
+                if others.is_empty() { "" } else { ", " },
+                d.at,
+                match (named, reached) {
+                    (true, _) =>
+                        alloc::string::String::from("maps it too, as the firmware names it"),
+                    (false, None) => alloc::string::String::from("does not map it at any address"),
+                    (false, Some(iova)) => alloc::format!("maps it at {iova:#x}, unnamed"),
+                }
+            );
+        }
+        let ok = identity && as_flagged && write_ok && read_ok && untouched && others_ok;
+        all &= ok;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: reserved memory proof: page {page:#x} ({}, as the firmware's bits give: {as_flagged}) in the NVMe controller's domain maps to itself: {identity}; the controller's write of LBA {PROBE_LBA} into it {write_words}: {write_ok}; its read of it to LBA {RESERVED_LBA} {}: {read_ok}; {}; other domains: {}; consistent {ok}{}",
+            crate::iommu::access_words(access),
+            if access.read {
+                "carried what the page holds"
+            } else {
+                "was blocked and recorded"
+            },
+            if filled {
+                alloc::string::String::from("the page held the test step's fill")
+            } else {
+                alloc::format!("the page is unchanged: {untouched}")
+            },
+            if others.is_empty() { "none" } else { &others },
+            if ok { "" } else { ": IOMMU failed" }
+        );
+    }
+    all
 }

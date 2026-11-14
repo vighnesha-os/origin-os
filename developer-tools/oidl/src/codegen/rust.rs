@@ -1,6 +1,7 @@
 //! The Rust generator (`docs/spec/OIDL.md` §11). Generated code is `no_std`, allocates nothing,
-//! obeys the project's no-panic lints and holds no `unsafe` outside `abi.rs` and `core_stubs.rs`
-//! (ADR-0011 S7).
+//! obeys the project's no-panic lints and holds no `unsafe` outside the two named shims
+//! (ADR-0011 S7): `abi.rs`, a `syscall` client's imports, and the stubs under `core/`, which are
+//! `origin.core`'s entry points and a tree of their own (ADR-0011 Amendment 2, L4 to L6).
 
 use super::{Generated, Text};
 use crate::layout::{self, InlineKind};
@@ -987,6 +988,7 @@ fn gen_sys_server(g: &Gen<'_>, interface: &Interface) -> String {
     }
     t.line("];");
     t.blank();
+    gen_sys_pin(g, &mut t, interface);
     for method in &interface.methods {
         gen_method_error(g, &mut t, method);
     }
@@ -1124,6 +1126,78 @@ fn gen_sys_server(g: &Gen<'_>, interface: &Interface) -> String {
     t.finish()
 }
 
+/// The kernel's side of the per-call pin (ADR-0005 B2; ADR-0011 Amendment 2, L7): the release
+/// fingerprint that ties this dispatcher to an `origin.core` generated from the same definition,
+/// the place of each call's `syscall` instruction as the build reads it from the linked image,
+/// and the check itself, a `match` whose arms compare, like `dispatch`'s.
+fn gen_sys_pin(g: &Gen<'_>, t: &mut Text, interface: &Interface) {
+    let release = release_fingerprint(g.lib);
+    t.line("/// The release fingerprint of the definition this was generated from: its description with");
+    t.line("/// the call numbers in it (§13). An `origin.core` generated from the same definition carries");
+    t.line("/// the same one, and the kernel is built only against that one (ADR-0011 L7).");
+    t.line("pub const RELEASE_FINGERPRINT: [u8; 32] = [");
+    for row in release.chunks(8) {
+        let bytes: Vec<String> = row.iter().map(|b| format!("{b:#04x},")).collect();
+        t.line(format!("    {}", bytes.join(" ")));
+    }
+    t.line("];");
+    t.blank();
+    t.line(
+        "/// Where `origin.core` holds each call's one `syscall` instruction: its offset from the",
+    );
+    t.line(
+        "/// image's base, a field a call. The build fills it from the linked image (ADR-0011 L7).",
+    );
+    t.line("#[derive(Clone, Copy, Debug, PartialEq, Eq)]");
+    t.open("pub struct Pins {");
+    for method in &interface.methods {
+        t.line(format!("/// `{}`.", method.name));
+        t.line(format!("pub {}: u64,", method.name));
+    }
+    t.shut("}");
+    t.blank();
+    t.open("impl Pins {");
+    t.line(
+        "/// Every call's number with the offset of its `syscall` instruction, in number order.",
+    );
+    t.line("#[must_use]");
+    t.open(format!(
+        "pub const fn each(&self) -> [(u64, u64); {}] {{",
+        interface.methods.len()
+    ));
+    t.open("[");
+    for method in &interface.methods {
+        t.line(format!(
+            "(number::{}, self.{}),",
+            shouty(&method.name),
+            method.name
+        ));
+    }
+    t.shut("]");
+    t.shut("}");
+    t.shut("}");
+    t.blank();
+    t.line("/// Whether call `oidl_number` may be made by the `syscall` instruction at `oidl_offset` from");
+    t.line("/// `origin.core`'s base: only by its own (ADR-0005 B2). A number with no stub may be made from");
+    t.line(
+        "/// nowhere. Comparisons alone, with no table indexed by the number (ADR-0017 Z9, Z10).",
+    );
+    t.line("#[must_use]");
+    t.open("pub const fn pinned(oidl_pins: &Pins, oidl_number: u64, oidl_offset: u64) -> bool {");
+    t.open("match oidl_number {");
+    for method in &interface.methods {
+        t.line(format!(
+            "number::{} => oidl_offset == oidl_pins.{},",
+            shouty(&method.name),
+            method.name
+        ));
+    }
+    t.line("_ => false,");
+    t.shut("}");
+    t.shut("}");
+    t.blank();
+}
+
 /// The Rust type of a parameter of the safe client.
 fn client_ty(g: &Gen<'_>, p: &Param) -> String {
     match &p.ty {
@@ -1201,49 +1275,41 @@ fn record_size(elem: &Type) -> Option<u64> {
     }
 }
 
-/// One abi-level parameter: `(name, Rust type, conversion to u64 for the stub)`.
-fn abi_params(g: &Gen<'_>, method: &Method) -> Vec<(String, String, &'static str)> {
+/// One abi-level parameter of a C entry point: `(name, Rust type)`, in the order of §10.
+fn abi_params(g: &Gen<'_>, method: &Method) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for param in &method.params {
         let n = param.name.clone();
         match &param.ty {
-            Type::Struct(_) => out.push((n, "*const u8".to_string(), "ptr")),
-            Type::Array(elem, _) => out.push((n, format!("*const {}", abi_element(elem)), "ptr")),
+            Type::Struct(_) => out.push((n, "*const u8".to_string())),
+            Type::Array(elem, _) => out.push((n, format!("*const {}", abi_element(elem)))),
             Type::Vector(elem, _) => {
-                out.push((n.clone(), format!("*const {}", abi_element(elem)), "ptr"));
-                out.push((format!("{n}_count"), "u64".to_string(), "u"));
+                out.push((n.clone(), format!("*const {}", abi_element(elem))));
+                out.push((format!("{n}_count"), "u64".to_string()));
             }
             Type::String(_) => {
-                out.push((n.clone(), "*const u8".to_string(), "ptr"));
-                out.push((format!("{n}_count"), "u64".to_string(), "u"));
+                out.push((n.clone(), "*const u8".to_string()));
+                out.push((format!("{n}_count"), "u64".to_string()));
             }
-            scalar => {
-                let ty = abi_scalar(g, scalar);
-                let conv = match scalar {
-                    Type::Int(int) if int.signed() => "s",
-                    Type::Enum(e) if e.repr.signed() => "s",
-                    _ => "u",
-                };
-                out.push((n, ty, conv));
-            }
+            scalar => out.push((n, abi_scalar(g, scalar))),
         }
     }
     for result in &method.returns {
         let n = result.name.clone();
         match &result.ty {
-            Type::Struct(_) => out.push((n, "*mut u8".to_string(), "ptr")),
-            Type::Array(elem, _) => out.push((n, format!("*mut {}", abi_element(elem)), "ptr")),
+            Type::Struct(_) => out.push((n, "*mut u8".to_string())),
+            Type::Array(elem, _) => out.push((n, format!("*mut {}", abi_element(elem)))),
             Type::Vector(elem, _) => {
-                out.push((n.clone(), format!("*mut {}", abi_element(elem)), "ptr"));
-                out.push((format!("{n}_capacity"), "u64".to_string(), "u"));
+                out.push((n.clone(), format!("*mut {}", abi_element(elem))));
+                out.push((format!("{n}_capacity"), "u64".to_string()));
             }
             Type::String(_) => {
-                out.push((n.clone(), "*mut u8".to_string(), "ptr"));
-                out.push((format!("{n}_capacity"), "u64".to_string(), "u"));
+                out.push((n.clone(), "*mut u8".to_string()));
+                out.push((format!("{n}_capacity"), "u64".to_string()));
             }
             scalar => {
                 let ty = abi_scalar(g, scalar);
-                out.push((n, format!("*mut {ty}"), "ptr"));
+                out.push((n, format!("*mut {ty}")));
             }
         }
     }
@@ -1263,7 +1329,7 @@ fn gen_sys_abi(g: &Gen<'_>, interface: &Interface) -> String {
     for method in &interface.methods {
         let params: Vec<String> = abi_params(g, method)
             .into_iter()
-            .map(|(n, ty, _)| format!("{n}: {ty}"))
+            .map(|(n, ty)| format!("{n}: {ty}"))
             .collect();
         if method.never {
             t.line(format!(
@@ -1849,15 +1915,136 @@ fn sys_client_result_value(g: &Gen<'_>, r: &Param, checked: bool) -> String {
     }
 }
 
+/// How a stub brings one register of the C call to what the kernel's decoding reads (§10;
+/// ADR-0011 Amendment 3, L13). The pinned psABI leaves the bits of an argument register beyond
+/// the parameter's type unspecified, and the kernel judges the whole register, so the stub,
+/// where the C call is consumed, extends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Widen {
+    /// The value fills its register: a 64-bit integer, a handle, a pointer or a count.
+    Whole,
+    /// An unsigned value of this many bits: the rest of the register is cleared.
+    Zero(u32),
+    /// A signed value of this many bits: its sign fills the rest of the register.
+    Sign(u32),
+}
+
+/// What [`Widen`] a value of the integer type `int` needs.
+fn widen_int(int: crate::model::Int) -> Widen {
+    let bits = u32::try_from(int.size().saturating_mul(8)).unwrap_or(64);
+    match (int.is_64(), int.signed()) {
+        (true, _) => Widen::Whole,
+        (false, true) => Widen::Sign(bits),
+        (false, false) => Widen::Zero(bits),
+    }
+}
+
+/// Each register a method's C entry point takes, in the order of §10: parameters first, then
+/// results, a vector or string as its pointer and then its count. A `bool` is one byte of 0 or 1
+/// (CLAUDE.md §10); an enum or a bits type is its underlying integer, extended as that integer
+/// is, which is how the kernel's decoder reads its register; a result is a pointer.
+pub fn stub_registers(method: &Method) -> Vec<Widen> {
+    let mut out = Vec::new();
+    for param in &method.params {
+        match &param.ty {
+            Type::Vector(..) | Type::String(_) => out.extend([Widen::Whole, Widen::Whole]),
+            Type::Struct(_) | Type::Array(..) => out.push(Widen::Whole),
+            Type::Bool => out.push(Widen::Zero(8)),
+            Type::Int(int) => out.push(widen_int(*int)),
+            Type::Enum(e) => out.push(widen_int(e.repr)),
+            Type::Bits(b) => out.push(widen_int(b.repr)),
+            Type::Handle(_) => out.push(if layout::HANDLE_BITS >= 64 {
+                Widen::Whole
+            } else {
+                Widen::Zero(layout::HANDLE_BITS)
+            }),
+        }
+    }
+    for result in &method.returns {
+        match &result.ty {
+            Type::Vector(..) | Type::String(_) => out.extend([Widen::Whole, Widen::Whole]),
+            _ => out.push(Widen::Whole),
+        }
+    }
+    out
+}
+
+/// The C calling convention's six argument registers, each by its 64-, 32-, 16- and 8-bit name.
+const C_REGISTERS: [[&str; 4]; 6] = [
+    ["rdi", "edi", "di", "dil"],
+    ["rsi", "esi", "si", "sil"],
+    ["rdx", "edx", "dx", "dl"],
+    ["rcx", "ecx", "cx", "cl"],
+    ["r8", "r8d", "r8w", "r8b"],
+    ["r9", "r9d", "r9w", "r9b"],
+];
+
+/// Which of the six is the fourth: a C caller passes it in RCX, which `syscall` overwrites, and
+/// the kernel takes it in R10 (ADR-0005 P4).
+const FOURTH: usize = 3;
+
+/// The instruction a stub needs for register `index` of the C call, if any, in Intel syntax:
+/// its extension in place, or, for the fourth, its move to R10, extended on the way where it is
+/// narrow.
+fn stub_register_instruction(index: usize, widen: Widen) -> Option<String> {
+    let [whole, double, word, byte] = *C_REGISTERS.get(index)?;
+    let (to_whole, to_double) = if index == FOURTH {
+        ("r10", "r10d")
+    } else {
+        (whole, double)
+    };
+    match widen {
+        Widen::Whole => (index == FOURTH).then(|| format!("mov {to_whole}, {whole}")),
+        // Writing a 32-bit register clears the upper half of the 64-bit one.
+        Widen::Zero(32) => Some(format!("mov {to_double}, {double}")),
+        Widen::Zero(16) => Some(format!("movzx {to_double}, {word}")),
+        Widen::Zero(8) => Some(format!("movzx {to_double}, {byte}")),
+        Widen::Sign(32) => Some(format!("movsxd {to_whole}, {double}")),
+        Widen::Sign(16) => Some(format!("movsx {to_whole}, {word}")),
+        Widen::Sign(8) => Some(format!("movsx {to_whole}, {byte}")),
+        // No integer type has another width (`Int::size`).
+        Widen::Zero(_) | Widen::Sign(_) => None,
+    }
+}
+
+/// The whole of a method's stub, one instruction a line, in Intel syntax (§10): the extension of
+/// each narrow parameter in register order, the fourth argument's move among them at its place;
+/// the load of the method's own number; the one `syscall`; and the return, or `ud2` after a call
+/// that never returns.
+pub fn stub_instructions(method: &Method) -> Vec<String> {
+    let mut out: Vec<String> = stub_registers(method)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, widen)| stub_register_instruction(index, widen))
+        .collect();
+    out.push(format!("mov eax, {}", method.ordinal));
+    out.push("syscall".to_string());
+    out.push(if method.never { "ud2" } else { "ret" }.to_string());
+    out
+}
+
+/// The path, under `core/`, of the file that holds one interface's stubs.
+fn core_stubs_path(lib: &Library, interface: &Interface) -> String {
+    format!("core/{}/{}.rs", module(&lib.name), interface.name)
+}
+
 fn gen_sys_core_stubs(g: &Gen<'_>, interface: &Interface) -> String {
     let mut t = Text::default();
     let prefix = g.c_prefix();
+    // Line comments, not inner documentation: `origin.core`'s crate includes this file whole.
+    t.line(format!(
+        "// `origin.core`'s entry points for `{}`'s `{}` interface: the named shim (ADR-0011 S7).",
+        g.lib.name, interface.name
+    ));
+    t.line("//");
     t.line(
-        "//! The named shim: `origin.core`'s entry points, one `syscall` instruction per number",
+        "// One naked function a call, emitted once, with one `syscall` instruction each, so that",
     );
-    t.line("//! (ADR-0005 B2, ADR-0011 N5). `x86_64` only.");
+    t.line("// the kernel can accept each call number from its own address alone (ADR-0005 B2;");
+    t.line("// ADR-0011 N5 and L6). Before its `syscall` a stub holds only the extension of each");
+    t.line("// parameter narrower than 64 bits to its whole register (L13), the fourth argument's move");
+    t.line("// from RCX to R10 (ADR-0005 P4), and the load of its own number. `x86_64` only.");
     t.blank();
-    let registers = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
     for method in &interface.methods {
         let params = abi_params(g, method);
         t.doc(&method.doc);
@@ -1865,64 +2052,107 @@ fn gen_sys_core_stubs(g: &Gen<'_>, interface: &Interface) -> String {
         t.line("/// # Safety");
         t.line("///");
         t.line("/// Each pointer must be valid for the count passed with it, for the duration of the call.");
+        t.line(
+            "// SAFETY: the body is the system-call entry of ADR-0005 P4 and keeps the C calling",
+        );
+        t.line(
+            "// convention and this signature. It changes only registers a C function may change:",
+        );
+        t.line("// its own argument registers, RCX and R11 (which `syscall` itself overwrites, in every");
+        t.line("// stub), R10 and RAX. It touches no memory and no stack, and");
+        if method.never {
+            t.line("// never returns: the kernel ends the thread, and `ud2` stops it if that ever failed.");
+        } else {
+            t.line("// returns with the kernel's status in RAX. No instruction of the stub changes a flag;");
+            t.line("// what RFLAGS hold on return is the kernel's return path's, and a C caller may not");
+            t.line("// rely on the status flags across any call.");
+        }
+        t.line("#[unsafe(naked)]");
         t.line("#[unsafe(no_mangle)]");
-        let list: Vec<String> = params
-            .iter()
-            .map(|(n, ty, _)| format!("{n}: {ty}"))
-            .collect();
+        let list: Vec<String> = params.iter().map(|(n, ty)| format!("{n}: {ty}")).collect();
         let result = if method.never { "!" } else { "i64" };
         t.open(format!(
             "pub unsafe extern \"C\" fn {prefix}_{}({}) -> {result} {{",
             method.name,
             list.join(", ")
         ));
-        let mut asm_args = Vec::new();
-        for (register, (name, _, conversion)) in registers.iter().zip(&params) {
-            let value = match *conversion {
-                "ptr" => format!("{name}.expose_provenance() as u64"),
-                "s" => format!("i64::from({name}) as u64"),
-                _ => format!("u64::from({name})"),
-            };
-            t.line(format!("let oidl_{name}: u64 = {value};"));
-            asm_args.push(format!("in(\"{register}\") oidl_{name}"));
+        t.open("core::arch::naked_asm!(");
+        for instruction in stub_instructions(method) {
+            t.line(format!("\"{instruction}\","));
         }
-        if method.never {
-            t.line(
-                "// SAFETY: this is the system-call entry of ADR-0005 P4: the number in RAX, the",
-            );
-            t.line("// arguments in its registers. The call does not return.");
-            let mut asm = vec![
-                "\"syscall\"".to_string(),
-                format!("in(\"rax\") {}_i64", method.ordinal),
-            ];
-            asm.extend(asm_args);
-            asm.push("options(noreturn, nostack)".to_string());
-            t.line(format!("unsafe {{ core::arch::asm!({}) }}", asm.join(", ")));
-        } else {
-            t.line("let oidl_status: i64;");
-            t.line(
-                "// SAFETY: this is the system-call entry of ADR-0005 P4: the number in RAX, the",
-            );
-            t.line("// arguments in its registers, RCX and R11 clobbered, every other register");
-            t.line("// preserved. The kernel checks each pointer against the caller's own tables.");
-            let mut asm = vec![
-                "\"syscall\"".to_string(),
-                format!("inlateout(\"rax\") {}_i64 => oidl_status", method.ordinal),
-            ];
-            asm.extend(asm_args);
-            asm.push("lateout(\"rcx\") _".to_string());
-            asm.push("lateout(\"r11\") _".to_string());
-            asm.push("options(nostack)".to_string());
-            t.line(format!(
-                "unsafe {{ core::arch::asm!({}); }}",
-                asm.join(", ")
-            ));
-            t.line("oidl_status");
-        }
+        t.shut(")");
         t.shut("}");
         t.blank();
     }
     t.finish()
+}
+
+/// `core/lib.rs`: the stubs as a crate of their own, each interface's file a module.
+fn gen_core_root(comp: &Compilation) -> String {
+    let mut t = Text::default();
+    t.line(
+        "//! `origin.core`'s entry points, generated from the `syscall` definitions: the stubs and",
+    );
+    t.line("//! nothing else (ADR-0011 Amendment 2, L4 and L5). `docs/spec/OIDL.md` §10, §11.");
+    t.line("//!");
+    t.line("#![no_std]");
+    t.line("#![deny(unsafe_op_in_unsafe_fn)]");
+    for lib in &comp.libraries {
+        if lib.transport != Transport::Syscall {
+            continue;
+        }
+        let m = module(&lib.name);
+        for interface in &lib.interfaces {
+            t.blank();
+            t.line("#[rustfmt::skip]");
+            t.line(format!("#[path = \"{m}/{}.rs\"]", interface.name));
+            t.line(format!("pub mod {m}_{};", interface.name));
+        }
+    }
+    t.finish()
+}
+
+/// The first line of `core/<library>.exports`, less the library's name.
+pub const EXPORTS_FORMAT: &str = "oidl-core-exports 1";
+
+/// `core/<library>.exports`: what `origin.core` exports for one `syscall` library, for the tool
+/// that describes the linked image to the kernel. After the format line, the release fingerprint
+/// of the definition (§13), then one line a method, in number order: its number, its C symbol,
+/// its name, and the version it arrived in (ADR-0011 L5).
+fn gen_core_exports(lib: &Library) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "# {EXPORTS_FORMAT} {}", lib.name);
+    let _ = writeln!(
+        out,
+        "release sha256:{}",
+        crate::fingerprint::hex(&release_fingerprint(lib))
+    );
+    let prefix = module(&lib.name);
+    // In number order across every interface of the library, as the comment above and the
+    // reader of this list (`onbf-pack corelib`) both say: a library's numbers are one space.
+    let mut methods: Vec<&Method> = lib
+        .interfaces
+        .iter()
+        .flat_map(|interface| &interface.methods)
+        .collect();
+    methods.sort_by_key(|method| method.ordinal);
+    for method in methods {
+        let _ = writeln!(
+            out,
+            "{} {prefix}_{} {} {}",
+            method.ordinal, method.name, method.name, method.since
+        );
+    }
+    out
+}
+
+/// The release fingerprint of `lib` at its current minor (§13): its description with the call
+/// numbers in it.
+fn release_fingerprint(lib: &Library) -> [u8; 32] {
+    crate::fingerprint::fingerprints(lib)
+        .last()
+        .map_or([0; 32], |print| print.release)
 }
 
 // --- Channel transport -------------------------------------------------------------------
@@ -2852,8 +3082,6 @@ fn gen_library(comp: &Compilation, lib: &Library, side: Side, files: &mut Vec<Ge
             match lib.transport {
                 Transport::Syscall => {
                     module_text.line("mod abi;");
-                    module_text.line("#[cfg(target_arch = \"x86_64\")]");
-                    module_text.line("pub mod core_stubs;");
                     files.push(Generated {
                         path: format!("{dir}/client.rs"),
                         text: format!("{HEADER}{}", gen_sys_client(&g, interface)),
@@ -2862,8 +3090,10 @@ fn gen_library(comp: &Compilation, lib: &Library, side: Side, files: &mut Vec<Ge
                         path: format!("{dir}/abi.rs"),
                         text: format!("{HEADER}{}", gen_sys_abi(&g, interface)),
                     });
+                    // The entry points the imports name are `origin.core`'s, in a tree of
+                    // their own: a program links none of them (ADR-0011 L3, L6).
                     files.push(Generated {
-                        path: format!("{dir}/core_stubs.rs"),
+                        path: core_stubs_path(lib, interface),
                         text: format!("{HEADER}{}", gen_sys_core_stubs(&g, interface)),
                     });
                 }
@@ -3084,6 +3314,22 @@ pub fn generate(comp: &Compilation) -> Vec<Generated> {
         path: "rust/bin/corpus_check.rs".to_string(),
         text: format!("{HEADER}{}", gen_corpus_check(comp)),
     });
+    let mut stubs = false;
+    for lib in &comp.libraries {
+        if lib.transport == Transport::Syscall {
+            stubs = true;
+            files.push(Generated {
+                path: format!("core/{}.exports", module(&lib.name)),
+                text: gen_core_exports(lib),
+            });
+        }
+    }
+    if stubs {
+        files.push(Generated {
+            path: "core/lib.rs".to_string(),
+            text: format!("{HEADER}{}", gen_core_root(comp)),
+        });
+    }
     files
 }
 
