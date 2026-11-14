@@ -7,12 +7,18 @@
 //! not the library, decides what may be touched (ADR-0019 A2). Until the user-mode ACPI service
 //! exists, the kernel's boot proof will be its host (step B3); the tests are its host today.
 //!
-//! **Hostile input.** A definition block is untrusted (ADR-0019 T1). The library has no `unsafe`,
-//! never panics (every index and every sum is checked), and never recurses in Rust: the engine
-//! keeps its own stack of frames on the heap, so a block's nesting cannot exhaust the caller's
-//! stack. Every evaluation runs under the [`Limits`]: loop iterations, time, call depth, memory and
-//! steps. When one is reached the evaluation stops, every name it created is removed, and the
-//! error says which limit and where. A table whose load fails is rolled back whole.
+//! **Hostile input.** A definition block is untrusted (ADR-0019 T1). The library has no `unsafe`
+//! and never recurses in Rust: the engine keeps its own stack of frames on the heap, so a block's
+//! nesting cannot exhaust the caller's stack. It is written not to panic: the lints below refuse
+//! indexing, unchecked arithmetic, `unwrap`, `expect` and the panicking macros; the one panicking
+//! slice method it uses is given equal lengths by construction; and `cargo xtask check`'s no-panic
+//! check reads the release object, which holds the whole interpreter through [`no_panic_probe`]
+//! (the review of B1, F3). Every evaluation runs under the [`Limits`]: loop iterations, time,
+//! call depth, memory and steps, a step being an opcode or a unit of the work between opcodes
+//! (name comparisons, field-list entries, bytes copied, the collector's slots: the review of B1,
+//! F1). No host call may wait past the time left (see [`Host`]). When a limit is reached the
+//! evaluation stops, every name it created is removed, and the error says which limit and where.
+//! A table whose load fails is rolled back whole.
 //!
 //! **Memory.** Objects live in an arena named by handles with generations, collected by a
 //! mark-and-sweep collector at safe points between steps; every allocation goes through `mem.rs`,
