@@ -2654,8 +2654,9 @@ pub(crate) fn prove_objects(
     let settled_after = sched::settle(tsc_hz);
     sched::yield_until(same, tsc_hz, 2);
     let back = same() && settled_before.is_ok() && settled_after.is_ok();
-    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    // After the counts are read, so that the words' own allocation is not in them.
+    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let _ = writeln!(
         com1,
@@ -2899,8 +2900,9 @@ pub(crate) fn prove_identity(
     let settled_after = sched::settle(tsc_hz);
     sched::yield_until(same, tsc_hz, 2);
     let back = same() && settled_before.is_ok() && settled_after.is_ok();
-    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    // After the counts are read, so that the words' own allocation is not in them.
+    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let _ = writeln!(
         com1,
@@ -3196,8 +3198,9 @@ pub(crate) fn prove_launch(
     let settled_after = sched::settle(tsc_hz);
     sched::yield_until(same, tsc_hz, 2);
     let back = same() && settled_before.is_ok() && settled_after.is_ok();
-    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    // After the counts are read, so that the words' own allocation is not in them.
+    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let _ = writeln!(
         com1,
@@ -3236,9 +3239,10 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     let settled_after = sched::settle(tsc_hz);
     sched::yield_until(same, tsc_hz, 2);
     let back = same() && settled_before.is_ok() && settled_after.is_ok();
-    let unsettled = sched::not_settled(settled_before, settled_after);
     let elapsed = time::monotonic_nanos().wrapping_sub(started) / 1_000_000;
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    // After the counts are read, so that the words' own allocation is not in them.
+    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     // Every thread's state was complete before it could be picked (`sched::spawn_with`).
     let unready = sched::unready_switches();

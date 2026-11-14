@@ -1304,8 +1304,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     let settled_after = settle(tsc_hz);
     yield_until(back, tsc_hz, 2);
     let reaped = back() && settled_before.is_ok() && settled_after.is_ok();
-    let unsettled = not_settled(settled_before, settled_after);
     let now = crate::memory::stats().map_or(0, |(h, _)| h.bytes_in_use);
+    // After the counts are read, so that the words' own allocation is not in them.
+    let unsettled = not_settled(settled_before, settled_after);
     proofs.record(Proof::ThreadsReaped, reaped);
     let _ = writeln!(
         com1,

@@ -487,13 +487,14 @@ pub(crate) fn prove_core_pin(
     let settled_after = sched::settle(tsc_hz);
     sched::yield_until(same, tsc_hz, 2);
     let back = same() && settled_before.is_ok() && settled_after.is_ok();
-    let unsettled = sched::not_settled(settled_before, settled_after);
     // No process is left to map it: its frames are executable through no mapping, and still
     // writable through none. And after everything above, the hostile runs among it, they hold
     // the image word for word as it was written at boot (the review's finding F1).
     let unmapped = core_image::mappings() == Some((0, 0));
     let intact = core_image::intact();
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    // After the counts are read, so that the words' own allocation is not in them.
+    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let _ = writeln!(
         com1,
