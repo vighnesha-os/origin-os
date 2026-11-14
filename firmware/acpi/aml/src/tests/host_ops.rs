@@ -915,3 +915,111 @@ fn an_adr_thirty_calls_deep_runs_on_the_frames() {
         );
     });
 }
+
+#[test]
+fn the_pci_walk_follows_devices_not_the_scopes_around_a_region() {
+    // The review of B2, B2-2. `\_SB.PCI0` (a root bridge, bus 0) › `RP01` (a bridge at device
+    // 0x1C, its secondary bus 5) › `PXSX` (device 0), with PCI_Config regions declared in a method
+    // of `PXSX`, in a power resource of `RP01` and in a thermal zone inside `PXSX`; and `NADR`, a
+    // device with no `_ADR`.
+    let pxsx = device(
+        "PXSX",
+        &[
+            name("_ADR", zero()),
+            method(
+                "WAKE",
+                0,
+                &[
+                    op_region("PCFG", 2, byte(0x44), byte(4)),
+                    field("PCFG", DWORD, &[Fe::Named("PMEC", 32)]),
+                    store(word(0x8000), nm("PMEC")),
+                ],
+            ),
+            thermal_zone(
+                "TZ1",
+                &[
+                    op_region("TCFG", 2, byte(0x60), byte(4)),
+                    field("TCFG", DWORD, &[Fe::Named("TMP", 32)]),
+                    method("RD", 0, &[ret(nm("TMP"))]),
+                ],
+            ),
+        ],
+    );
+    let rp01 = device(
+        "RP01",
+        &[
+            name("_ADR", dword(0x001C_0000)),
+            power_resource(
+                "PXP",
+                0,
+                0,
+                &[
+                    op_region("PCFG", 2, byte(0x50), byte(4)),
+                    field("PCFG", DWORD, &[Fe::Named("PWR", 32)]),
+                    method("_ON", 0, &[store(one(), nm("PWR"))]),
+                ],
+            ),
+            pxsx,
+        ],
+    );
+    let nadr = device(
+        "NADR",
+        &[
+            op_region("NCFG", 2, zero(), byte(4)),
+            field("NCFG", BYTE, &[Fe::Named("NV", 8)]),
+            method("RD", 0, &[ret(nm("NV"))]),
+        ],
+    );
+    let mut i = loaded(&[scope(
+        "\\_SB",
+        &[device(
+            "PCI0",
+            &[
+                name("_HID", dword(0x080A_D041)),
+                name("_BBN", zero()),
+                rp01,
+                nadr,
+            ],
+        )],
+    )]);
+    i.host_mut()
+        .memory
+        .insert((2, Some((0, 0, 0x1C, 0)), 0x19), 5);
+    let at = |segment, bus, device, function| {
+        Some(PciAddress {
+            segment,
+            bus,
+            device,
+            function,
+        })
+    };
+    // A method of PXSX: PXSX's function, below RP01. The bridge read is RP01's alone.
+    i.evaluate("\\_SB.PCI0.RP01.PXSX.WAKE", &[]).unwrap();
+    let seen = std::mem::take(&mut i.host_mut().seen);
+    let bridge_reads: Vec<_> = seen.iter().filter(|s| s.address == 0x19).collect();
+    assert_eq!(bridge_reads.len(), 1);
+    assert_eq!(bridge_reads[0].pci, at(0, 0, 0x1C, 0));
+    let last = seen.last().unwrap();
+    assert_eq!(
+        (last.write, last.address, last.pci),
+        (true, 0x44, at(0, 5, 0, 0))
+    );
+    // A power resource of RP01: RP01's function, on the root bridge's bus.
+    i.evaluate("\\_SB.PCI0.RP01.PXP._ON", &[]).unwrap();
+    let last = i.host().seen.last().cloned().unwrap();
+    assert_eq!(
+        (last.write, last.address, last.pci),
+        (true, 0x50, at(0, 0, 0x1C, 0))
+    );
+    // A thermal zone inside PXSX: PXSX's function.
+    int(&mut i, "\\_SB.PCI0.RP01.PXSX.TZ1.RD");
+    let last = i.host().seen.last().cloned().unwrap();
+    assert_eq!(
+        (last.write, last.address, last.pci),
+        (false, 0x60, at(0, 5, 0, 0))
+    );
+    // A device with no `_ADR`: refused, never function 0, and nothing sent.
+    let before = i.host().seen.len();
+    assert_eq!(fails(&mut i, "\\_SB.PCI0.NADR.RD"), ErrorKind::NotFound);
+    assert_eq!(i.host().seen.len(), before);
+}

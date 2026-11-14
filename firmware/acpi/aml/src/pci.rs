@@ -13,13 +13,22 @@
 //!
 //! A walk that needs the same region's access again (an `_ADR` that reads a field of the region
 //! it names) is [`ErrorKind::AddressCycle`], never a recursion.
+//!
+//! **The walk follows devices** (the review of B2, B2-2). The function is the nearest `Device`
+//! above the region: a region declared in a method, a power resource or a thermal zone names the
+//! device around it. Going up from that device, each `Device` is asked whether it is a root bridge
+//! (`_HID` or `_CID` PNP0A03 or PNP0A08); other scopes are passed over. Going down from the root
+//! bridge, each `Device` between it and the function with an `_ADR` is a bridge, whose secondary
+//! bus is read; a device with none is passed over. The function's own `_ADR` is required: a
+//! device with none is [`ErrorKind::NotFound`], never function 0. With no root bridge above, the
+//! segment and bus are 0 and there are no bridges.
 
 use crate::Interpreter;
 use crate::engine::Frame;
 use crate::error::{Error, ErrorKind, Result, err};
 use crate::host::{Host, HostError, PciAddress, RegionAccess, Space, Trace};
 use crate::name::Seg;
-use crate::object::{FieldKind, NodeId, Object, Val};
+use crate::object::{FieldKind, NodeId, Object, ScopeKind, Val};
 use crate::region::FIELD_DEPTH;
 
 /// `PNP0A03` and `PNP0A08` as EISA IDs: a PCI and a PCI Express root bridge.
@@ -127,7 +136,8 @@ impl<H: Host> Interpreter<H> {
                 return err(ErrorKind::AddressCycle);
             }
         }
-        let device = self.ns.parent(region).ok_or(ErrorKind::NotFound)?;
+        let scope = self.ns.parent(region).ok_or(ErrorKind::NotFound)?;
+        let device = self.device_from(scope).ok_or(ErrorKind::NotFound)?;
         self.push_frame(Frame::Resolve(Resolve {
             region,
             device,
@@ -161,14 +171,46 @@ impl<H: Host> Interpreter<H> {
         self.read_node(c).map(Asked::Value)
     }
 
-    /// The next node below `from` on the way down to the device: the device itself last.
+    fn is_pci_device(&self, n: NodeId) -> bool {
+        self.ns
+            .obj(n)
+            .ok()
+            .and_then(|o| self.heap.get(o).ok())
+            .is_some_and(|o| {
+                matches!(
+                    o,
+                    Object::Scope {
+                        kind: ScopeKind::Device,
+                        ..
+                    }
+                )
+            })
+    }
+
+    /// `n` if it is a `Device`, else the nearest `Device` above it; `None` at the root.
+    fn device_from(&self, n: NodeId) -> Option<NodeId> {
+        let mut n = n;
+        loop {
+            if self.is_pci_device(n) {
+                return Some(n);
+            }
+            self.ns.note_work(1);
+            n = self.ns.parent(n)?;
+        }
+    }
+
+    /// The next `Device` below `from` on the way down to the device: the device itself last.
     fn next_down(&self, from: NodeId, device: NodeId) -> Result<NodeId> {
         let mut n = device;
+        let mut topmost = device;
         loop {
             let p = self.ns.parent(n).ok_or(ErrorKind::NotFound)?;
             self.ns.note_work(1);
             if p == from {
-                return Ok(n);
+                return Ok(topmost);
+            }
+            if self.is_pci_device(p) {
+                topmost = p;
             }
             n = p;
         }
@@ -226,8 +268,8 @@ impl<H: Host> Interpreter<H> {
                 } else if r.phase == Phase::Hid {
                     r.phase = Phase::Cid;
                 } else {
-                    match self.ns.parent(r.at) {
-                        Some(p) if p.index != 0 => {
+                    match self.ns.parent(r.at).and_then(|p| self.device_from(p)) {
+                        Some(p) => {
                             r.at = p;
                             r.asked = p;
                             r.phase = Phase::Hid;
@@ -256,11 +298,13 @@ impl<H: Host> Interpreter<H> {
                 self.after_bridge(&mut r, root)?;
             }
             Phase::BridgeAdr => {
-                let badr = match answer {
-                    Some(v) => self.int_of(v)?,
-                    None => 0,
-                };
                 let bridge = r.asked;
+                // A device between with no `_ADR` is not a bridge: passed over.
+                let Some(v) = answer else {
+                    self.after_bridge(&mut r, bridge)?;
+                    return self.put_resolve(r);
+                };
+                let badr = self.int_of(v)?;
                 let here = PciAddress {
                     segment: u16::try_from(r.segment).unwrap_or(0),
                     bus: u8::try_from(r.bus).unwrap_or(0),
@@ -285,10 +329,8 @@ impl<H: Host> Interpreter<H> {
                 self.after_bridge(&mut r, bridge)?;
             }
             Phase::DeviceAdr => {
-                let adr = match answer {
-                    Some(v) => self.int_of(v)?,
-                    None => 0,
-                };
+                // Required: a function the firmware did not name is never taken for function 0.
+                let adr = self.int_of(answer.ok_or(ErrorKind::NotFound)?)?;
                 let pci = PciAddress {
                     segment: u16::try_from(r.segment).unwrap_or(0),
                     bus: u8::try_from(r.bus).unwrap_or(0),
