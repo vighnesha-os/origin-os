@@ -149,6 +149,29 @@ const LIBRARIES: &[&str] = &[
     "developer-tools/oidl",
 ];
 
+/// Each library's dependencies, as its manifest may name them (the review of 2026-11-14, finding
+/// F11): first-party crates only, each a `no_std` library that ships in the loader or the kernel,
+/// or `onbf-sign`, which G2 reads itself. A library that gains any other, in its normal, build or
+/// target-specific dependencies, is refused until this list says why it may.
+const LIBRARY_DEPENDENCIES: &[(&str, &[&str])] = &[
+    (
+        "developer-tools/onbf-pack",
+        &[
+            "onbf-format",
+            "onbf-merkle",
+            "onbf-sign",
+            "onbf-verify",
+            "origin-crypto",
+            "origin-version",
+        ],
+    ),
+    ("developer-tools/onbf-sign", &["origin-crypto"]),
+    ("developer-tools/oidl", &["origin-crypto"]),
+];
+
+/// The crates every command line may name besides its own library.
+const COMMAND_LINE_CRATES: &[&str] = &["std", "core", "alloc"];
+
 /// The modules of `std` that reach the host.
 /// `std::path` among them: `Path::exists`, `is_file`, `metadata`, `read_dir` and
 /// `canonicalize` read the file system (the review of 2026-11-14, finding F4).
@@ -720,6 +743,115 @@ pub(crate) fn library_hits(source: &str) -> Vec<Hit> {
     hits
 }
 
+/// What kind of table `table` is, for [`library_dependencies`]: `Some(None)` for a table of
+/// dependencies that reach the library's code (`dependencies`, `build-dependencies`, and either
+/// under `target.<key>.`), `Some(Some(name))` for a table of one such dependency
+/// (`[dependencies.<name>]`), and `None` for anything else, development dependencies included.
+fn dependency_table(table: &str) -> Option<Option<String>> {
+    if table.contains("dev-dependencies") {
+        return None;
+    }
+    let at = table.find("dependencies")?;
+    let before = table.get(..at)?;
+    let reaches = before.is_empty()
+        || before == "build-"
+        || (before.starts_with("target.")
+            && (before.ends_with('.') || before.ends_with(".build-")));
+    if !reaches {
+        return None;
+    }
+    let after = table.get(at + "dependencies".len()..)?;
+    if after.is_empty() {
+        return Some(None);
+    }
+    after
+        .strip_prefix('.')
+        .map(|name| Some(name.trim_matches('"').to_string()))
+}
+
+/// The dependencies a manifest names in the tables that reach its library's code:
+/// `[dependencies]` and `[build-dependencies]`, their `target.<key>.` forms, `[dependencies.<name>]`
+/// tables, and top-level `dependencies.<name>` keys. Development dependencies, which only its
+/// tests see, are not among them.
+pub(crate) fn library_dependencies(text: &str) -> BTreeSet<String> {
+    let name = |key: &str| {
+        key.split('.')
+            .next()
+            .unwrap_or(key)
+            .trim()
+            .trim_matches('"')
+            .to_string()
+    };
+    let mut names = BTreeSet::new();
+    let mut table = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            table = line.trim_matches(['[', ']']).trim().to_string();
+            if let Some(Some(dependency)) = dependency_table(&table) {
+                names.insert(dependency);
+            }
+            continue;
+        }
+        let Some((key, _)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if table.is_empty() {
+            if let Some(Some(dependency)) = dependency_table(key) {
+                names.insert(name(&dependency));
+            }
+        } else if dependency_table(&table) == Some(None) {
+            names.insert(name(key));
+        }
+    }
+    names
+}
+
+/// G3's refusals in a command line's `main.rs` (the review of 2026-11-14, finding F5): an
+/// identifier that names a first-party crate other than its own library `own`, from `crates`,
+/// and an `extern crate` of anything but `std`, `core`, `alloc` and `own`. So the command line
+/// reaches no code but its library's and the standard library's. That it holds no logic of its
+/// own is review's to see, not this gate's.
+pub(crate) fn command_line_hits(source: &str, own: &str, crates: &BTreeSet<String>) -> Vec<Hit> {
+    let tokens = lex::tokens(source);
+    let allowed = |name: &str| COMMAND_LINE_CRATES.contains(&name) || name == own;
+    let mut hits = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        let named =
+            if token.kind == Kind::Ident && crates.contains(token.text) && !allowed(token.text) {
+                Some(token.text)
+            } else if token.is_ident("crate")
+                && i > 0
+                && tokens.get(i - 1).is_some_and(|t| t.is_ident("extern"))
+            {
+                tokens
+                    .get(i + 1)
+                    // A first-party crate is the identifier rule's, on its own token.
+                    .filter(|t| {
+                        matches!(t.kind, Kind::Ident | Kind::RawIdent)
+                            && !allowed(t.text)
+                            && !crates.contains(t.text)
+                    })
+                    .map(|t| t.text)
+            } else {
+                None
+            };
+        if let Some(name) = named {
+            hits.push(Hit {
+                line: lex::line_of(source, token.start),
+                what: format!(
+                    "`{name}`: a command line names no crate but `std`, `core`, `alloc` and its own library `{own}`; what it needs of another, its library offers (ADR-0011 Amendment 4, T1)"
+                ),
+            });
+        }
+    }
+    hits
+}
+
 /// Whether `relative`, a path under a library's directory, is library source G2 reads.
 fn is_library_source(relative: &Path) -> bool {
     let Ok(rest) = relative.strip_prefix("src") else {
@@ -767,6 +899,77 @@ fn first_party_programs(root: &Path) -> Result<BTreeSet<String>> {
         return Err("host-tools gate: no package found in the tree's manifests".into());
     }
     Ok(names)
+}
+
+/// Each tool's command line, if it has one: its directory, its library's crate name, its
+/// `src/main.rs`, and the crates G3 refuses it (every first-party crate's name, and its own
+/// dependencies', as identifiers, but its own library's).
+pub(crate) struct CommandLine {
+    pub(crate) directory: &'static str,
+    pub(crate) own: String,
+    pub(crate) main: String,
+    pub(crate) crates: BTreeSet<String>,
+}
+
+/// The command lines of the three tools that have one.
+fn command_lines(root: &Path, known: &Known) -> Result<Vec<CommandLine>> {
+    let mut lines = Vec::new();
+    for library in LIBRARIES {
+        let main = root.join(library).join("src").join("main.rs");
+        if !main.is_file() {
+            continue;
+        }
+        let manifest = String::from_utf8(read_file(&root.join(library).join("Cargo.toml"))?)
+            .map_err(|_| format!("{library}/Cargo.toml: not UTF-8"))?;
+        let own = library
+            .rsplit('/')
+            .next()
+            .unwrap_or(library)
+            .replace('-', "_");
+        let crates = known
+            .programs
+            .iter()
+            .chain(&library_dependencies(&manifest))
+            .map(|name| name.replace('-', "_"))
+            .collect();
+        lines.push(CommandLine {
+            directory: library,
+            own,
+            main: String::from_utf8(read_file(&main)?)
+                .map_err(|_| format!("{}: not UTF-8", main.display()))?,
+            crates,
+        });
+    }
+    Ok(lines)
+}
+
+/// The dependencies each library's manifest names beyond [`LIBRARY_DEPENDENCIES`]'s.
+fn unknown_dependencies(root: &Path) -> Result<Vec<String>> {
+    let mut problems = Vec::new();
+    for library in LIBRARIES {
+        let manifest = String::from_utf8(read_file(&root.join(library).join("Cargo.toml"))?)
+            .map_err(|_| format!("{library}/Cargo.toml: not UTF-8"))?;
+        problems.extend(extra_dependencies(library, &manifest));
+    }
+    Ok(problems)
+}
+
+/// The dependencies `manifest`, `library`'s, names that [`LIBRARY_DEPENDENCIES`] does not give
+/// it, each as a refusal.
+pub(crate) fn extra_dependencies(library: &str, manifest: &str) -> Vec<String> {
+    let allowed: &[&str] = LIBRARY_DEPENDENCIES
+        .iter()
+        .find(|(dir, _)| *dir == library)
+        .map_or(&[], |(_, deps)| deps);
+    library_dependencies(manifest)
+        .into_iter()
+        .filter(|dependency| !allowed.contains(&dependency.as_str()))
+        .map(|dependency| {
+            format!(
+                "{library}/Cargo.toml: the library depends on `{dependency}`, which host_tools::LIBRARY_DEPENDENCIES does not list: G2 reads only the library's own sources (the review of 2026-11-14, finding F11)"
+            )
+        })
+        .collect()
 }
 
 /// `xtask`'s source files: each path under `developer-tools/xtask/`, and its text.
@@ -859,6 +1062,21 @@ fn planted_control_alias() -> Result {
 }
 "#;
 
+/// What `onbf-pack`'s command line called before T1 (the review of 2026-11-14, finding F5):
+/// planted by the controls.
+const PLANTED_KEY_ID: &str = r#"
+fn planted_control_key_id(keys: &onbf_pack::sign::PublicKeys) -> [u8; 32] {
+    onbf_verify::key_id(&onbf_verify::PublicKey {
+        ed25519: &keys.ed25519,
+        mldsa: &keys.mldsa87,
+    })
+}
+"#;
+
+/// A dependency planted in `onbf-sign`'s manifest, in place of its `[dependencies]` line (the
+/// review of 2026-11-14, finding F11).
+const PLANTED_DEPENDENCY: &str = "[dependencies]\nonbf-pack = { path = \"../onbf-pack\" }\n";
+
 /// What `onbf-sign` held before T1: planted by the controls.
 const PLANTED_OS_RANDOM: &str = r#"
 pub fn os_random(out: &mut [u8]) -> std::io::Result<()> {
@@ -904,6 +1122,8 @@ fn controls(
     consts: &BTreeMap<String, String>,
     known: &Known,
     sign_lib: &str,
+    pack_line: Option<&CommandLine>,
+    sign_manifest: &str,
 ) -> std::result::Result<usize, Vec<String>> {
     let mut missed = Vec::new();
     for (planted, needle, name) in [
@@ -951,8 +1171,26 @@ fn controls(
             missed.push(format!("{name} in developer-tools/onbf-sign/src/lib.rs"));
         }
     }
+    // G3: the old command line's call of another crate (finding F5).
+    match pack_line {
+        Some(line) => {
+            let real = command_line_hits(&line.main, &line.own, &line.crates).len();
+            let planted = format!("{}\n{PLANTED_KEY_ID}", line.main);
+            let hits = command_line_hits(&planted, &line.own, &line.crates);
+            if hits.len() <= real || !hits.iter().any(|h| h.what.contains("`onbf_verify`")) {
+                missed.push("onbf_verify::key_id in developer-tools/onbf-pack/src/main.rs".into());
+            }
+        }
+        None => missed.push("developer-tools/onbf-pack/src/main.rs is not read".into()),
+    }
+    // The libraries' dependencies (finding F11).
+    let planted = sign_manifest.replacen("[dependencies]\n", PLANTED_DEPENDENCY, 1);
+    let extra = extra_dependencies("developer-tools/onbf-sign", &planted);
+    if planted == sign_manifest || !extra.iter().any(|p| p.contains("`onbf-pack`")) {
+        missed.push("a dependency in developer-tools/onbf-sign/Cargo.toml".into());
+    }
     if missed.is_empty() {
-        Ok(4 + library_controls.len())
+        Ok(6 + library_controls.len())
     } else {
         Err(missed)
     }
@@ -992,6 +1230,20 @@ pub(crate) fn gate() -> Result {
             problems.push(format!("{file}:{}: {}", hit.line, hit.what));
         }
     }
+    let lines = command_lines(&root, &known)?;
+    for line in &lines {
+        for hit in command_line_hits(&line.main, &line.own, &line.crates) {
+            problems.push(format!(
+                "{}/src/main.rs:{}: {}",
+                line.directory, hit.line, hit.what
+            ));
+        }
+    }
+    problems.extend(unknown_dependencies(&root)?);
+    let sign_manifest = String::from_utf8(read_file(
+        &root.join("developer-tools/onbf-sign/Cargo.toml"),
+    )?)
+    .map_err(|_| "developer-tools/onbf-sign/Cargo.toml: not UTF-8".to_string())?;
     let main = xtask
         .iter()
         .find(|(file, _)| file == "src/main.rs")
@@ -1002,7 +1254,10 @@ pub(crate) fn gate() -> Result {
         .find(|(file, _)| file == "developer-tools/onbf-sign/src/lib.rs")
         .map(|(_, text)| text.as_str())
         .ok_or("developer-tools/onbf-sign/src/lib.rs is missing")?;
-    let caught = match controls(main, &consts, &known, sign_lib) {
+    let pack_line = lines
+        .iter()
+        .find(|line| line.directory == "developer-tools/onbf-pack");
+    let caught = match controls(main, &consts, &known, sign_lib, pack_line, &sign_manifest) {
         Ok(caught) => caught,
         Err(missed) => {
             problems.push(format!(
@@ -1019,12 +1274,13 @@ pub(crate) fn gate() -> Result {
         ));
     }
     println!(
-        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs, by name or through `run` and the {} Cargo aliases that run one, and re-runs itself only in the {} places host_tools::SELF_RUNS lists; the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host by the forms the gate reads; {caught} planted controls caught",
+        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs, by name or through `run` and the {} Cargo aliases that run one, and re-runs itself only in the {} places host_tools::SELF_RUNS lists; the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host by the forms the gate reads, and depend on nothing but the crates it lists; their {} command lines name no crate but their own library and the standard library's; {caught} planted controls caught",
         xtask.len(),
         known.programs.len(),
         known.runs.len() - RUN_WORDS.len(),
         SELF_RUNS.len(),
-        libraries.len()
+        libraries.len(),
+        lines.len()
     );
     Ok(())
 }

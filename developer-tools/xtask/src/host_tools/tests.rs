@@ -52,6 +52,14 @@ fn the_real_tree_passes() {
 #[test]
 fn the_gate_s_own_controls_are_caught() {
     let (sources, consts, programs) = real();
+    let root = repo_root();
+    let pack_line = command_lines(&root, &programs)
+        .unwrap()
+        .into_iter()
+        .find(|line| line.directory == "developer-tools/onbf-pack");
+    let sign_manifest =
+        String::from_utf8(read_file(&root.join("developer-tools/onbf-sign/Cargo.toml")).unwrap())
+            .unwrap();
     let sign_lib = library_sources(&repo_root())
         .unwrap()
         .into_iter()
@@ -63,9 +71,11 @@ fn the_gate_s_own_controls_are_caught() {
             text_of_file(&sources, "src/main.rs"),
             &consts,
             &programs,
-            &sign_lib
+            &sign_lib,
+            pack_line.as_ref(),
+            &sign_manifest
         ),
-        Ok(8)
+        Ok(10)
     );
     // A control is missed when the rule it tests is gone: with no first-party programs, the
     // path control finds nothing to name.
@@ -74,7 +84,21 @@ fn the_gate_s_own_controls_are_caught() {
             text_of_file(&sources, "src/main.rs"),
             &consts,
             &Known::default(),
-            &sign_lib
+            &sign_lib,
+            pack_line.as_ref(),
+            &sign_manifest
+        )
+        .is_err()
+    );
+    // And with no command line read, G3's control is missed.
+    assert!(
+        controls(
+            text_of_file(&sources, "src/main.rs"),
+            &consts,
+            &programs,
+            &sign_lib,
+            None,
+            &sign_manifest
         )
         .is_err()
     );
@@ -474,4 +498,110 @@ fn cargo_s_aliases_are_cargo_run() {
         hits[0].what.contains("`cargo run` of `onbf-pack`"),
         "{hits:?}"
     );
+}
+
+/// The dependencies that reach a library's code, read from its manifest as Cargo reads them;
+/// development dependencies are not among them.
+#[test]
+fn a_library_s_dependencies_are_read_from_every_table_that_reaches_it() {
+    let manifest = "[package]\nname = \"x\"\n\n[dependencies]\norigin-crypto.workspace = true\nonbf-format = { path = \"../f\" }\n\"quoted\" = \"1\"\n\n[build-dependencies]\nbuilder = \"1\"\n\n[target.'cfg(unix)'.dependencies]\nunix-only = \"1\"\n\n[target.x86_64-apple-darwin.build-dependencies]\nmac-build = \"1\"\n\n[dependencies.tabled]\npath = \"../t\"\n\n[dev-dependencies]\ntest-only = \"1\"\n\n[target.'cfg(unix)'.dev-dependencies]\nunix-test = \"1\"\n\n[lints]\nworkspace = true\n";
+    let found: Vec<String> = library_dependencies(manifest).into_iter().collect();
+    assert_eq!(
+        found,
+        [
+            "builder",
+            "mac-build",
+            "onbf-format",
+            "origin-crypto",
+            "quoted",
+            "tabled",
+            "unix-only"
+        ]
+    );
+    assert_eq!(
+        library_dependencies("dependencies.top = { path = \"../t\" }\n[package]\nname = \"x\"\n"),
+        BTreeSet::from(["top".to_string()])
+    );
+}
+
+/// Each library's manifest names only the dependencies `LIBRARY_DEPENDENCIES` gives it (the
+/// review of 2026-11-14, finding F11), and one more is refused.
+#[test]
+fn a_library_depends_only_on_the_crates_the_gate_lists() {
+    let root = repo_root();
+    for (library, _) in LIBRARY_DEPENDENCIES {
+        let manifest =
+            String::from_utf8(read_file(&root.join(library).join("Cargo.toml")).unwrap()).unwrap();
+        assert_eq!(
+            extra_dependencies(library, &manifest),
+            Vec::<String>::new(),
+            "{library}"
+        );
+        for planted in [
+            "[dependencies]\nonbf-pack = { path = \"../onbf-pack\" }\n",
+            "[build-dependencies]\nhelper = { path = \"../helper\" }\n",
+            "[target.'cfg(unix)'.dependencies]\nhelper = \"1\"\n",
+        ] {
+            let extra = extra_dependencies(library, &format!("{manifest}\n{planted}"));
+            assert_eq!(extra.len(), 1, "{library}: {planted}: {extra:?}");
+        }
+    }
+}
+
+/// A command line names no crate but `std`, `core`, `alloc` and its own library (the review of
+/// 2026-11-14, finding F5).
+#[test]
+fn a_command_line_names_no_crate_but_its_library_and_std() {
+    let (_, _, known) = real();
+    let lines = command_lines(&repo_root(), &known).unwrap();
+    let directories: Vec<&str> = lines.iter().map(|line| line.directory).collect();
+    assert_eq!(
+        directories,
+        ["developer-tools/onbf-pack", "developer-tools/oidl"]
+    );
+    for line in &lines {
+        assert_eq!(
+            command_line_hits(&line.main, &line.own, &line.crates),
+            [],
+            "{}",
+            line.directory
+        );
+        for (planted, crate_named) in [
+            ("fn a() { let _ = onbf_verify::key_id; }", "onbf_verify"),
+            ("use origin_crypto::Sha256;", "origin_crypto"),
+            ("extern crate onbf_format;", "onbf_format"),
+            (
+                "extern crate somewhere_else as elsewhere;",
+                "somewhere_else",
+            ),
+            ("fn b() { let _ = ::onbf_sign::wipe; }", "onbf_sign"),
+            ("fn c() { let _ = xtask::run; }", "xtask"),
+        ] {
+            let hits = command_line_hits(
+                &format!("{}\n{planted}", line.main),
+                &line.own,
+                &line.crates,
+            );
+            assert_eq!(hits.len(), 1, "{}: {planted}: {hits:?}", line.directory);
+            assert!(
+                hits[0].what.contains(&format!("`{crate_named}`")),
+                "{hits:?}"
+            );
+        }
+        for allowed in [
+            "extern crate std;",
+            "extern crate alloc;",
+            "use core::fmt;",
+            "fn d() { let _ = std::fs::read(\"x\"); }",
+        ] {
+            let text = format!("{}\n{allowed}", line.main);
+            assert_eq!(
+                command_line_hits(&text, &line.own, &line.crates),
+                [],
+                "{allowed}"
+            );
+        }
+        let own = format!("{}\nfn e() {{ let _ = {}::VERSION; }}", line.main, line.own);
+        assert_eq!(command_line_hits(&own, &line.own, &line.crates), []);
+    }
 }
