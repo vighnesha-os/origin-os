@@ -994,20 +994,26 @@ fn corpus() -> Vec<Case> {
     ]
 }
 
-fn run_corpus() {
+/// Runs every case; returns what ran in the cases whose checks passed (all of them, or the test
+/// has already failed).
+fn run_corpus() -> std::collections::BTreeSet<u16> {
+    let mut covered = std::collections::BTreeSet::new();
     for c in corpus() {
+        let _ = super::take_ran();
         let mut i = interp(c.width);
         if let Err(e) = load(&mut i, &c.body) {
             panic!("{}: load failed: {e:?}", c.name);
         }
         (c.check)(&mut i);
+        covered.extend(super::take_ran());
     }
+    covered
 }
 
 #[test]
 fn every_case_holds() {
     let _ = super::take_drift();
-    run_corpus();
+    let _ = run_corpus();
     // The budget's count never under-states what is held.
     assert_eq!(super::take_drift().1, 0);
 }
@@ -1034,7 +1040,7 @@ fn table_20_2() -> Vec<u16> {
 #[test]
 fn every_opcode_is_emitted_and_checked() {
     let _ = take_emitted();
-    run_corpus();
+    let ran = run_corpus();
     let emitted = take_emitted();
     let missing: Vec<String> = table_20_2()
         .into_iter()
@@ -1042,6 +1048,14 @@ fn every_opcode_is_emitted_and_checked() {
         .map(|c| format!("{c:#x}"))
         .collect();
     assert!(missing.is_empty(), "opcodes no case emits: {missing:?}");
+    // Emitted is not enough (the review of B1, F6): each must have run, decoded and completed,
+    // in a case whose every check passed, so its result or its expected error was asserted.
+    let unrun: Vec<String> = table_20_2()
+        .into_iter()
+        .filter(|c| !ran.contains(c))
+        .map(|c| format!("{c:#x}"))
+        .collect();
+    assert!(unrun.is_empty(), "opcodes no checked case runs: {unrun:?}");
 }
 
 #[test]

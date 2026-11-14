@@ -188,6 +188,24 @@ impl Host for TestHost {
 }
 
 thread_local! {
+    /// The opcodes, name prefixes, locals and arguments the engine has run on this thread.
+    static RAN: std::cell::RefCell<std::collections::BTreeSet<u16>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// Called by the engine: `code` was run (decoded and, for an operator, completed).
+pub(crate) fn ran(code: u16) {
+    RAN.with(|r| {
+        r.borrow_mut().insert(code);
+    });
+}
+
+/// What has run on this thread, and starts afresh.
+pub(crate) fn take_ran() -> std::collections::BTreeSet<u16> {
+    RAN.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+thread_local! {
     /// What the budget's count and a fresh count of what is held differed by, summed over every
     /// evaluation this thread ended: (over-stated, under-stated).
     static DRIFT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };

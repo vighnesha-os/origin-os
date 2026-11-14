@@ -110,13 +110,21 @@ pub(crate) fn parse(aml: &[u8], at: u32) -> Result<(AmlName, u32)> {
     let mut parents: u32 = 0;
     let next = |p: u32| p.checked_add(1).ok_or(ErrorKind::Truncated);
     if byte(aml, pos)? == ROOT {
+        #[cfg(test)]
+        crate::tests::ran(u16::from(ROOT));
         root = true;
         pos = next(pos)?;
     } else {
         while byte(aml, pos)? == PARENT {
+            #[cfg(test)]
+            crate::tests::ran(u16::from(PARENT));
             parents = parents.checked_add(1).ok_or(ErrorKind::Name)?;
             pos = next(pos)?;
         }
+    }
+    #[cfg(test)]
+    if let Ok(p @ (DUAL | MULTI)) = byte(aml, pos) {
+        crate::tests::ran(u16::from(p));
     }
     let (count, first) = match byte(aml, pos)? {
         0x00 => (0, next(pos)?),

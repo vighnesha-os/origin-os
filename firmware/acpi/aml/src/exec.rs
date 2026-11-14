@@ -96,6 +96,8 @@ impl<H: Host> Interpreter<H> {
 
     /// Runs the operator of the operand frame `f`, whose operands are all in.
     pub(crate) fn complete(&mut self, f: OpFrame) -> Result<()> {
+        #[cfg(test)]
+        self.note_ran(f.at);
         let bits = u64::from(self.width.bits());
         match f.op {
             // --- Names and named objects -------------------------------------------------------

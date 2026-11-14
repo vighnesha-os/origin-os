@@ -787,6 +787,8 @@ impl<H: Host> Interpreter<H> {
         let next = add(at, 1)?;
         match b {
             0x60..=0x67 => {
+                #[cfg(test)]
+                crate::tests::ran(u16::from(b));
                 self.cur.pc = next;
                 let i = b.wrapping_sub(0x60);
                 return match want {
@@ -800,6 +802,8 @@ impl<H: Host> Interpreter<H> {
                 };
             }
             0x68..=0x6E => {
+                #[cfg(test)]
+                crate::tests::ran(u16::from(b));
                 self.cur.pc = next;
                 let i = b.wrapping_sub(0x68);
                 return match want {
@@ -830,6 +834,8 @@ impl<H: Host> Interpreter<H> {
             _ => None,
         };
         if let Some((v, len)) = constant {
+            #[cfg(test)]
+            self.note_ran(at);
             self.cur.pc = add(at, len)?;
             return match want {
                 Want::Statement => Ok(()),
@@ -837,6 +843,8 @@ impl<H: Host> Interpreter<H> {
             };
         }
         if b == 0x0D {
+            #[cfg(test)]
+            crate::tests::ran(0x0D);
             return self.decode_string(want, next);
         }
         if b == 0x5B && self.byte(next).ok() == Some(0x31) {
@@ -980,6 +988,8 @@ impl<H: Host> Interpreter<H> {
             if kind == Kind::Simple {
                 return err(ErrorKind::Grammar);
             }
+            #[cfg(test)]
+            crate::tests::ran(0x5B31);
             self.cur.pc = add(at, 2)?;
             return self.give(Operand::Loc(Loc::Debug));
         }
@@ -1037,6 +1047,8 @@ impl<H: Host> Interpreter<H> {
             return err(ErrorKind::PackageLength);
         }
         self.frames.pop();
+        #[cfg(test)]
+        self.note_ran(f.at);
         match f.arg(6) {
             Operand::Val(v) => self.give_val(v),
             _ => err(ErrorKind::Grammar),
@@ -1127,6 +1139,8 @@ impl<H: Host> Interpreter<H> {
         if pc >= self.enclosing_end() || self.byte(pc)? != ELSE {
             return Ok(());
         }
+        #[cfg(test)]
+        crate::tests::ran(u16::from(ELSE));
         let after_op = add(pc, 1)?;
         let (len, body) = self.pkg_length(after_op)?;
         let end = add(after_op, len)?;
@@ -1493,6 +1507,19 @@ impl<H: Host> Interpreter<H> {
             })?
             .ok_or(ErrorKind::NotFound)?;
         self.ns.unalias(n, |o| Self::alias_target(heap, o))
+    }
+
+    /// Notes the opcode at `at` as run, for the coverage test.
+    #[cfg(test)]
+    pub(crate) fn note_ran(&self, at: u32) {
+        let b = self.byte(at).unwrap_or(0);
+        let second = self.byte(at.saturating_add(1)).unwrap_or(0);
+        let code = match (b, second) {
+            (0x5B, s) => 0x5B00 | u16::from(s),
+            (0x92, s @ 0x93..=0x95) => 0x9200 | u16::from(s),
+            (b, _) => u16::from(b),
+        };
+        crate::tests::ran(code);
     }
 
     // --- The collector -----------------------------------------------------------------------
