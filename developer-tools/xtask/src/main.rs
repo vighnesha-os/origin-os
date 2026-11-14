@@ -4833,7 +4833,12 @@ fn pack_kernel_to(elf: &Path, out: &Path) -> Result<PathBuf> {
 }
 
 /// Writes `bytes` to a temporary file beside `path`, syncs it and renames it into place, so that
-/// `path` never holds a partial file.
+/// `path` never holds a partial file. The temporary file is made new (`create_new`): a stale one
+/// of this name is removed first, and a link planted at its name is removed, never followed (the
+/// review of 2026-11-14, finding F9).
+///
+/// `onbf-pack`'s command line has the same function (`developer-tools/onbf-pack/src/main.rs`,
+/// `write_atomically`), as it has `OsRandom`: keep the two in step (finding F10).
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result {
     let name = path
         .file_name()
@@ -4842,7 +4847,12 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result {
     temporary.push(name);
     temporary.push(format!(".xtask-{}.tmp", std::process::id()));
     let temporary = path.with_file_name(temporary);
-    let written = fs::File::create(&temporary)
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", temporary.display())),
+    }
+    let written = fs::File::create_new(&temporary)
         .and_then(|mut file| {
             file.write_all(bytes)?;
             file.sync_all()
@@ -4888,6 +4898,8 @@ const TEST_SIGNING_TIME: &str = "1794000000";
 
 /// The operating system's random number generator, which `onbf_pack` signs with: ML-DSA's
 /// hedge comes from the caller (ADR-0011 Amendment 4, T1). A failure stops the signing.
+/// `onbf-pack`'s command line has the same `OsRandom`: keep the two in step (the review of
+/// 2026-11-14, finding F10).
 struct OsRandom;
 
 impl onbf_pack::Random for OsRandom {
@@ -5974,6 +5986,33 @@ mod gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The temporary file `write_atomically` writes is made new: a link planted at its name is
+    /// removed, never followed, and a stale file there is replaced (the review of 2026-11-14,
+    /// finding F9). `onbf-pack`'s command line has the same test.
+    #[test]
+    fn writing_atomically_follows_no_link_at_the_temporary_name() {
+        let dir = target_dir()
+            .join("xtask")
+            .join("gate-tests")
+            .join("write-atomically");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let outside = dir.join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        let path = dir.join("out.bin");
+        let temporary = dir.join(format!(".out.bin.xtask-{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&outside, &temporary).unwrap();
+        write_atomically(&path, b"image").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"image");
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        assert!(fs::symlink_metadata(&temporary).is_err());
+        fs::write(&temporary, b"stale").unwrap();
+        write_atomically(&path, b"again").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"again");
+        assert!(fs::symlink_metadata(&temporary).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// TASKS item 40's review, M2: the kernel writes into a planted reserved page only where it
     /// finds the fill the TEST ONLY application puts there, so the two copies must agree.

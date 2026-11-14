@@ -381,7 +381,8 @@ pub(crate) fn programs(target: Option<&Path>) -> Result<PathBuf> {
     Ok(out)
 }
 
-/// The generator's list of `origin.core`'s exports, read from `path`.
+/// The generator's list of `origin.core`'s exports, read from `path`. `onbf-pack`'s command line
+/// has the same function: keep the two in step (finding F10).
 fn read_listing(path: &Path) -> Result<corelib::Listing> {
     let list = String::from_utf8(read_file(path)?)
         .map_err(|_| format!("onbf-pack: {} is not UTF-8", path.display()))?;
@@ -390,9 +391,12 @@ fn read_listing(path: &Path) -> Result<corelib::Listing> {
 
 /// Writes `files`, a description of `name` that begins with `first_line`, into `out`, and
 /// removes what an earlier description left that this one does not have: what
-/// `onbf_pack::carried::update` says, from what is read here of the directory (S4-1's review,
-/// finding F9: only this tool's own files of `name` may go). Returns how many files were
-/// written.
+/// `onbf_pack::carried::update` says, from the files it owns read here (S4-1's review, finding
+/// F9: only this tool's own files of `name` may go). Returns how many files were written.
+///
+/// `onbf-pack`'s command line has the same function (`developer-tools/onbf-pack/src/main.rs`,
+/// `write_description`), and so the same host part: keep the two in step (the review of
+/// 2026-11-14, finding F10).
 fn write_description(
     out: &Path,
     name: &str,
@@ -400,6 +404,8 @@ fn write_description(
     files: &[carried::File],
 ) -> Result<usize> {
     fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    // Only the files the description owns are read (`carried::owned`); one that cannot be read
+    // is an error before anything is written (the review of 2026-11-14, finding F7).
     let mut present = BTreeMap::new();
     for entry in fs::read_dir(out).map_err(|e| format!("{}: {e}", out.display()))? {
         let entry = entry.map_err(|e| format!("{}: {e}", out.display()))?;
@@ -407,9 +413,8 @@ fn write_description(
         let Ok(file) = entry.file_name().into_string() else {
             continue;
         };
-        let path = entry.path();
-        if path.is_file() {
-            present.insert(file, read_file(&path)?);
+        if carried::owned(name, files, &file) {
+            present.insert(file, read_file(&entry.path())?);
         }
     }
     let update = carried::update(name, first_line, files, &present)

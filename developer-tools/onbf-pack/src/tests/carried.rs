@@ -451,3 +451,29 @@ fn update_refuses_a_name_that_is_not_a_plain_file_name() {
         .is_ok()
     );
 }
+
+/// The files a caller reads for `update`: the description's own (`<name>.` and anything after
+/// it) and the files it writes, and no other (the review of 2026-11-14, finding F7).
+#[test]
+fn update_s_caller_reads_only_the_files_the_description_owns() {
+    let files: Vec<File> = vec![
+        ("first.rs".into(), Vec::new()),
+        ("first.0.bin".into(), Vec::new()),
+        ("other.bin".into(), Vec::new()),
+    ];
+    for (file, owned) in [
+        ("first.rs", true),
+        ("first.0.bin", true),
+        ("first.9.bin", true),
+        ("first.rs.bak", true),
+        ("first.txt", true),
+        ("other.bin", true),
+        ("firsts.0.bin", false),
+        ("first", false),
+        ("second.rs", false),
+        ("notes.txt", false),
+        (".first.rs.onbf-pack-1.tmp", false),
+    ] {
+        assert_eq!(carried::owned("first", &files, file), owned, "{file}");
+    }
+}

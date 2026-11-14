@@ -188,3 +188,90 @@ fn a_program_with_no_start_is_refused() {
         Err(CarriedError::Elf(ElfError::EntryNotExecutable(0)))
     );
 }
+
+// ---------------------------------------------- the command line's output directory (finding F7)
+
+/// Runs `onbf-pack carried` on `elf` for the program `probe`, into `out`.
+fn carried_into(elf: &Path, out: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_onbf-pack"))
+        .args(["carried", "--name", "probe", "--variable", "ORIGIN_PROBE"])
+        .arg("--input")
+        .arg(elf)
+        .arg("--out")
+        .arg(out)
+        .output()
+        .unwrap()
+}
+
+fn mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// `carried` reads only the files its description owns in `--out` (`carried::owned`): a file it
+/// does not own is never read, even one it could not read, and one it owns but cannot read stops
+/// it before anything is written (the review of 2026-11-14, finding F7). A stale segment file of
+/// its own goes; a second run writes nothing.
+#[test]
+fn the_command_line_reads_only_the_files_its_description_owns() {
+    let dir = std::env::temp_dir().join(format!("onbf-pack-carried-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let elf = dir.join("probe.elf");
+    fs::write(&elf, compile("owned", &[])).unwrap();
+
+    // Someone else's file that cannot be read, beside the output: never opened.
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let foreign = out.join("notes.txt");
+    fs::write(&foreign, b"not ours").unwrap();
+    mode(&foreign, 0o000);
+    let run = carried_into(&elf, &out);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(out.join("probe.rs").is_file());
+    let stdout = String::from_utf8(run.stdout).unwrap();
+    assert!(
+        stdout.contains("files (") && !stdout.contains("(0 written)"),
+        "{stdout}"
+    );
+
+    // A stale segment file of its own is removed; a second run writes nothing.
+    fs::write(out.join("probe.9.bin"), b"stale").unwrap();
+    let run = carried_into(&elf, &out);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(!out.join("probe.9.bin").exists());
+    assert!(
+        String::from_utf8(run.stdout)
+            .unwrap()
+            .contains("(0 written)")
+    );
+
+    // A file it owns that cannot be read: refused, and nothing written.
+    let fresh = dir.join("fresh");
+    fs::create_dir_all(&fresh).unwrap();
+    let unreadable = fresh.join("probe.9.bin");
+    fs::write(&unreadable, b"stale").unwrap();
+    mode(&unreadable, 0o000);
+    let run = carried_into(&elf, &fresh);
+    assert_eq!(run.status.code(), Some(1));
+    let stderr = String::from_utf8(run.stderr).unwrap();
+    assert!(
+        stderr.contains("cannot read") && stderr.contains("probe.9.bin"),
+        "{stderr}"
+    );
+    assert!(!fresh.join("probe.rs").exists(), "nothing is written");
+
+    mode(&foreign, 0o600);
+    mode(&unreadable, 0o600);
+    let _ = fs::remove_dir_all(&dir);
+}

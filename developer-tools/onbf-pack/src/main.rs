@@ -233,7 +233,14 @@ fn toolchain(options: &mut Options) -> Result<Toolchain, Failure> {
     })
 }
 
-/// Writes `bytes` to a temporary file next to `path`, syncs it, and renames it into place.
+/// Writes `bytes` to a temporary file next to `path`, syncs it, and renames it into place. The
+/// temporary file is made new (`create_new`): a stale one of this name is removed first, and a
+/// link planted at its name is removed, never followed (the review of 2026-11-14, finding F9).
+///
+/// `xtask` has the same function (`developer-tools/xtask/src/main.rs`, `write_atomically`), and
+/// the same `OsRandom`, `read_listing` and `write_description` (`src/main.rs`, `src/ring3.rs`):
+/// the host's part, which `onbf_pack` leaves to each caller. Keep the copies in step (finding
+/// F10).
 fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let name = path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "the output has no file name")
@@ -242,6 +249,11 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     temp_name.push(name);
     temp_name.push(format!(".onbf-pack-{}.tmp", process::id()));
     let temp = path.with_file_name(temp_name);
+    match fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let result = File::create_new(&temp)
         .and_then(|mut f| {
             f.write_all(bytes)?;
@@ -371,6 +383,8 @@ fn write_description(
 ) -> Result<usize, Failure> {
     fs::create_dir_all(out)
         .map_err(|e| conversion(format!("cannot create {}: {e}", out.display())))?;
+    // Only the files the description owns are read (`carried::owned`); one that cannot be read
+    // is an error before anything is written (the review of 2026-11-14, finding F7).
     let mut present = BTreeMap::new();
     let entries =
         fs::read_dir(out).map_err(|e| conversion(format!("cannot read {}: {e}", out.display())))?;
@@ -380,14 +394,13 @@ fn write_description(
         let Ok(file) = entry.file_name().into_string() else {
             continue;
         };
-        let path = entry.path();
-        if path.is_file() {
-            present.insert(
-                file,
-                fs::read(&path)
-                    .map_err(|e| conversion(format!("cannot read {}: {e}", path.display())))?,
-            );
+        if !carried::owned(name, files, &file) {
+            continue;
         }
+        let path = entry.path();
+        let bytes = fs::read(&path)
+            .map_err(|e| conversion(format!("cannot read {}: {e}", path.display())))?;
+        present.insert(file, bytes);
     }
     let update = carried::update(name, first_line, files, &present)
         .map_err(|e| conversion(format!("{}: {e}", out.display())))?;
@@ -571,4 +584,33 @@ fn keygen(mut options: Options) -> Result<String, Failure> {
         if seed.is_some() { " (TEST KEY)" } else { "" },
         sign::hex(&new.public.key_id())
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The temporary file `write_atomically` writes is made new: a link planted at its name is
+    /// removed, never followed, and a stale file there is replaced (the review of 2026-11-14,
+    /// finding F9). `xtask` has the same test.
+    #[test]
+    fn writing_atomically_follows_no_link_at_the_temporary_name() {
+        let dir = std::env::temp_dir().join(format!("onbf-pack-atomic-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let outside = dir.join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        let path = dir.join("out.bin");
+        let temporary = dir.join(format!(".out.bin.onbf-pack-{}.tmp", process::id()));
+        std::os::unix::fs::symlink(&outside, &temporary).unwrap();
+        write_atomically(&path, b"image").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"image");
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        assert!(fs::symlink_metadata(&temporary).is_err());
+        fs::write(&temporary, b"stale").unwrap();
+        write_atomically(&path, b"again").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"again");
+        assert!(fs::symlink_metadata(&temporary).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -417,6 +417,17 @@ pub struct Update<'a> {
     pub remove: Vec<String>,
 }
 
+/// Whether the caller of [`update`] reads `file` from the output directory: a file of `name`'s
+/// descriptions (`<name>.` and anything after it), or one of `files`. These, and no other file,
+/// are what [`update`] decides about, so a caller reads only these; an owned file it cannot read
+/// is an error before anything is written (the review of 2026-11-14, finding F7).
+#[must_use]
+pub fn owned(name: &str, files: &[File], file: &str) -> bool {
+    file.strip_prefix(name)
+        .is_some_and(|rest| rest.starts_with('.'))
+        || files.iter().any(|(written, _)| written == file)
+}
+
 /// Whether `file` names one file inside a directory and nothing else.
 fn is_plain_file_name(file: &str) -> bool {
     !file.is_empty()
@@ -427,7 +438,7 @@ fn is_plain_file_name(file: &str) -> bool {
 
 /// What to write and remove in an output directory before it holds `files`, a description of
 /// `name` whose first line is `first_line` (as for [`stale`]). `present` is what the caller read
-/// of the directory: every regular file in it whose name is UTF-8, with its bytes. A file whose
+/// of the directory: each file whose name is UTF-8 and [`owned`], with its bytes. A file whose
 /// bytes are already there is not written again, so a build that changed nothing leaves the
 /// kernel's inputs as they were. Every name returned is a plain file name, checked here, so the
 /// caller writes and removes what it is given without judging it.
