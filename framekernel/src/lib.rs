@@ -109,6 +109,8 @@
 
 extern crate alloc;
 
+pub mod acpi_census;
+pub mod acpi_text;
 pub mod base64;
 pub mod blockcache;
 pub mod bootproof;

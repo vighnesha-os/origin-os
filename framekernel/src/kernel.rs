@@ -355,6 +355,11 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         proofs.record(Proof::Numa, numa);
         // Inter-node distances from the ACPI SLIT (CLAUDE.md §27, §28).
         proofs.record(Proof::NumaDistances, prove_slit(&mut com1, info.acpi_rsdp));
+        // Every ACPI table the firmware gives, checked whole (ADR-0019 A6, area A; TASKS item 62).
+        proofs.record(
+            Proof::AcpiTables,
+            crate::acpi_census::prove(&mut com1, info.acpi_rsdp),
+        );
         // The random-number generator on every processor (CLAUDE.md §59; ADR-0016). If the
         // proof fails, randomness is withheld from here on (ADR-0013 R2, Amendment 1): nothing
         // is launched and nothing is placed at a random address.

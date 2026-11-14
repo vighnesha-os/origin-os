@@ -600,7 +600,9 @@ fn platform_ranges(rsdp: u64) -> Result<Vec<(u64, u64)>, &'static str> {
     ranges.push((pci::LAPIC_BASE, pci::LAPIC_SPAN));
     if let Some(madt) = crate::iommu::acpi_table_if_listed(rsdp, b"APIC")? {
         let mut ioapics = [IoApic::default(); 128];
-        let n = acpi::madt_ioapics(madt, &mut ioapics)
+        // Every I/O APIC the MADT lists, repeats included: its registers are there whichever of
+        // two alike routing uses (the review's Addendum 2, A2-L2).
+        let n = acpi::madt_ioapic_pages(madt, &mut ioapics)
             .map_err(|_| "the MADT's I/O APICs cannot be read")?;
         ranges.extend(
             ioapics

@@ -629,7 +629,10 @@ pub fn read_firmware(addr: PhysAddr, out: &mut [u8]) -> Result<(), MapError> {
 }
 
 /// A readable copy of what the firmware put at physical `[addr, addr + len)` (ACPI tables):
-/// `&'static` because firmware tables do not change after boot. Refused for anything but the
+/// `&'static` because the tables it is used for do not change after boot. Those are the RSDP and
+/// the system description tables with a header (`firmware::bytes` lists them); never the FACS or
+/// the FPDT's FBPT and S3PT, which the firmware writes after boot and [`read_firmware`] copies
+/// instead (ACPI 6.6 §5.2.10.1, §5.2.24.8, §5.2.24.10). Refused for anything but the
 /// firmware's own data: a range that overlaps memory the kernel owns or will own (`Usable`,
 /// the heap, the kernel's image, the loader's memory), which safe code must not be able to
 /// read as a `&'static [u8]` while something writes it.
@@ -649,7 +652,8 @@ pub fn firmware_bytes(addr: PhysAddr, len: u64) -> Result<&'static [u8], MapErro
     let virt = map_firmware(raw, len)?;
     // SAFETY: `[raw, raw + len)` is firmware data (checked above), mapped readable at its
     // direct-map address `virt` (just ensured), not wrapping (checked), and the firmware does
-    // not change its tables after boot; `u8` has no alignment or validity requirement.
+    // not change the tables this is used for after boot (the doc above, and `firmware::bytes`,
+    // name them); `u8` has no alignment or validity requirement.
     Ok(unsafe {
         core::slice::from_raw_parts(
             core::ptr::with_exposed_provenance::<u8>(virt as usize),

@@ -45,6 +45,8 @@ const KERNEL_ROOT: &str = "framekernel";
 /// the UEFI loader and host tools, N12's listed exceptions).
 const KERNEL_LEAVES: &[&str] = &[
     "boot/info",
+    // ACPI 6.6's system description tables, parsed (ADR-0019 A6, area A; TASKS item 62).
+    "firmware/acpi/tables",
     "runtime/abi",
     "runtime/version",
     "sdk/directory",
@@ -228,6 +230,7 @@ const ABOVE_UNSAFE_FILES: &[&str] = &["framekernel/frame/src/lib.rs"];
 /// are the leaves below it, and everything that is the kernel proper sits above it.
 const LAYERS: &[(&str, &[&str])] = &[
     ("origin-version", &[]),
+    ("origin-acpi-tables", &[]),
     ("origin-boot-info", &["origin-version"]),
     ("origin-abi", &["origin-version"]),
     ("origin-sync", &[]),
@@ -241,6 +244,7 @@ const LAYERS: &[(&str, &[&str])] = &[
         "origin-frame",
         &[
             "origin-abi",
+            "origin-acpi-tables",
             "origin-boot-info",
             "origin-crypto",
             "origin-paging",
@@ -253,6 +257,7 @@ const LAYERS: &[(&str, &[&str])] = &[
         "framekernel",
         &[
             "origin-abi",
+            "origin-acpi-tables",
             "origin-boot-info",
             "origin-crypto",
             "origin-frame",
