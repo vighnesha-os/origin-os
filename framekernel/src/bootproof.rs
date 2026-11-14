@@ -370,7 +370,7 @@ mod tests {
         assert!(!tally.must_stop());
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 61 of 62 proofs passed; 6 did not run; failed: random-number generator (no randomness)\n"
+            "origin-kernel: boot verdict: degraded: 62 of 63 proofs passed; 6 did not run; failed: random-number generator (no randomness)\n"
         );
     }
 
@@ -421,7 +421,7 @@ mod tests {
     fn the_verdict_of_a_clean_boot_is_exact() {
         assert_eq!(
             verdict(passed_all()),
-            "origin-kernel: boot verdict: 68 of 68 proofs passed\n"
+            "origin-kernel: boot verdict: 69 of 69 proofs passed\n"
         );
     }
 
@@ -433,7 +433,7 @@ mod tests {
         tally.record(Proof::Nvme, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 65 of 68 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
+            "origin-kernel: boot verdict: degraded: 66 of 69 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
         );
     }
 
@@ -444,7 +444,7 @@ mod tests {
         tally.record(Proof::PageTables, true);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 66 did not run\n"
+            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 67 did not run\n"
         );
     }
 
@@ -455,7 +455,7 @@ mod tests {
         tally.record(Proof::Raster, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 67 of 68 proofs passed; failed: rasterizer\n"
+            "origin-kernel: boot verdict: degraded: 68 of 69 proofs passed; failed: rasterizer\n"
         );
     }
 
