@@ -412,15 +412,21 @@ fn a_store_into_a_large_buffer_is_charged_for_every_byte_it_writes() {
 #[test]
 fn a_long_parent_prefix_is_charged_for_its_length() {
     // The review of B1, A1: `CondRefOf` of a name with 60,000 parent prefixes never fails, so an
-    // endless loop of it parses 60,000 bytes a pass. Charged a unit a prefix, it meets the step
-    // limit after some 1,600 passes, not the loop limit after a million.
+    // endless loop of it parses 60,000 bytes a pass. Charged a unit a prefix, it meets a step
+    // limit of ten million after some 160 passes, not the loop limit after a million.
     let far = format!("{}X", "^".repeat(60_000));
     let body = [method(
         "M0",
         0,
         &[while_(one(), &[cond_ref_of(nm(&far), local(0))])],
     )];
-    let mut i = interp_with(IntegerWidth::Bits64, Limits::SERVICE);
+    let mut i = interp_with(
+        IntegerWidth::Bits64,
+        Limits {
+            steps: 10_000_000,
+            ..Limits::SERVICE
+        },
+    );
     load(&mut i, &body).unwrap();
     let start = std::time::Instant::now();
     let e = i.evaluate("M0", &[]).unwrap_err();
