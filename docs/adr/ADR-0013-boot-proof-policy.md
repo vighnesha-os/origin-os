@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-09, as proposed, with the recommended answer to each of the five questions below (decision sheet item 55). The owner's answer was "Accept both" to one question covering ADR-0012 and this ADR, relayed by the session that asked it. It decides what a machine does when the kernel's own checks fail (CLAUDE.md §18), and is not an ABI or format decision (§84). Everything below is built and boot-tested under QEMU, except what Migration says is left for later; the follow-ups F1 to F6 this inventory found are fixed. Nothing here has shipped, and nothing has run on physical hardware (§74). **Amendment 1 (below): Accepted** by the owner on 2026-11-10 (item 113); not built. |
+| Status | **Accepted** by the owner on 2026-11-09, as proposed, with the recommended answer to each of the five questions below (decision sheet item 55). The owner's answer was "Accept both" to one question covering ADR-0012 and this ADR, relayed by the session that asked it. It decides what a machine does when the kernel's own checks fail (CLAUDE.md §18), and is not an ABI or format decision (§84). Everything below is built and boot-tested under QEMU, except what Migration says is left for later; the follow-ups F1 to F6 this inventory found are fixed. Nothing here has shipped, and nothing has run on physical hardware (§74). **Amendment 1 (below): Accepted** by the owner on 2026-11-10 (item 113); not built. **Amendment 2 (below): Accepted** by the owner on 2026-11-14 (item 308); built by TASKS item 58, not yet in a batch. |
 | Requires | CLAUDE.md P0, P8, §13 (explicit panic handling), §18, §19 (early diagnostics), §20 (boot-failure detection), §24–§26, §28–§31, §58, §59, §65, §68, §69 (safe mode, boot recovery), §74, rules 14, 16, 30, 34, 35, 40 |
 | Code | `framekernel/src/bootproof.rs` (the policy table and the tally), `framekernel/src/kernel.rs` (`kernel_main`), `framekernel/src/{sched,wait,time,irq,i8042,storage,pcie,console,stacks}.rs`, `framekernel/frame/src/{timer,early,port,acpi,apic}.rs`, `developer-tools/xtask/src/main.rs` |
 | Evidence | `docs/research/2026-11-09-boot-proof-failures.md`; `docs/engineering/SOURCE_PROVENANCE.md`, "What a failed boot proof means" |
@@ -480,3 +480,19 @@ Each consumer refuses when a draw fails. None of them sees what the proof checks
 **Trade-offs.** A machine whose source fails its health tests starts no program until it has a seed. That is the point (P0).
 
 **Migration consequences.** `framekernel::bootproof`'s table, its host test and this inventory change together. No ABI or format changes.
+
+## Amendment 2 (Accepted, 2026-11-14): an uneven fair share on the oversubscribed software-processor machines is reported, not failed
+
+**Status: Accepted by the owner on 2026-11-14 ("Accept 308", decision sheet item 308). Built by TASKS item 58 on its own branch, not yet in a batch.** The independent review of TASKS item 58 (finding F9, `docs/engineering/REVIEW_T58_2026-11-14.md` on that task's branch) found that the task's allowance, given by the coordinating session's ruling, changed R8 with no owner item, and that it depended on the host.
+
+**Why.** ADR-0008 D7 (items 289 and 294) puts machines of 65 and 67 processors into `boot-matrix`, and one of 288 into `cargo xtask boot-many`, all under QEMU's software processor. On the development Mac, with 10 threads, the guest's processors far outnumber the host's. The scheduler's fairness proof, a Report-class proof, measured uneven shares of 2.0 to 2.8 times in six of seven such boots and 10 times in one, with nothing wrong in the kernel that the boot could show. Under R8 `cargo xtask` fails a boot on every `: X failed` line, so those machines could not be a gate that passes reliably.
+
+**Decision.** On the 65-, 67- and 288-processor machines of ADR-0008 D7, named, `cargo xtask` does not fail a boot on the fair-share line when both workers ran; it reports the share. The allowance is keyed to those machines, never to the host's thread count. On every other machine, those of 1 to 4 processors included, R8 stands on any host: the 2× bound holds and the line fails the boot. Preemption stays a Refuse proof everywhere, so a worker that never ran still ends the boot.
+
+**Alternatives that were put.** Dropping the fairness proof on those machines; or taking them out of the gate, which leaves ADR-0008 D7's large machine untested.
+
+**Performance cost (ADR-0018 V3).** None, by construction: it changes what the build host's test tool accepts, and nothing that ships.
+
+**Trade-offs.** A fairness regression that shows only on a large machine is reported there and not failed; the small machines still fail on it.
+
+**Migration consequences.** None: no ABI or format changes, and the kernel's verdict is unchanged.

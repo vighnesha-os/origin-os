@@ -177,6 +177,7 @@ M3-6 needs the prerequisites in "Before a first boot on a machine in scope".
 | A04-H5, A04-A2 to A04-A6 | TLB efficiency and PCIDs; the kernel stacks' region and its random base |
 | A08-C1 to A08-C7 | The CPU index (ADR-0008) |
 | A08-D1 to A08-D8 | Any processor count (ADR-0008 Amendment 1, items 283 to 290; placed by the coordinating session under item 264's rule, in no exit test) |
+| A13-Am2 | The fair share reported, not failed, on the oversubscribed software-processor machines (ADR-0013 Amendment 2, item 308; placed by the coordinating session under item 264's rule, in no exit test) |
 | A09-H4, A09-H5 | The first machines, one hybrid and one with SMT, as M3-6 asks; what to check before buying |
 | S13-05 | Explicit memory ordering |
 | S18-03, S18-04 | ADRs for the scheduler and for locking (TASKS item 27) |
@@ -256,6 +257,13 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 | Rows | Subject |
 |---|---|
 | A07-R1 to A07-R6 | Identity maps for firmware-reserved memory (ADR-0007 Amendments 1 and 2) |
+
+**Three more rows placed here (items 302, 303 and 305, 2026-11-14).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none. The ACPI service needs the Driver SDK, whose ADR M5 holds, and its devices' resources and interrupt routing are M5's (ADR-0019 A6, area D). The interpreter library and its encoder start before M5 and are placed with the service they serve. ADR-0019's other rows are rules.
+
+| Rows | Subject |
+|---|---|
+| A19-A2, A19-A3, A19-A5 | The firmware's AML in a user-mode service; the interpreter as a library first, with a read-only boot proof on QEMU's tables; an original AML encoder for its tests (ADR-0019) |
+| A19-Am1 | The interpreter's answers to `_OSI` and `_REV` (ADR-0019 Amendment 1, item 309) |
 
 ## M6. Native runtime
 
