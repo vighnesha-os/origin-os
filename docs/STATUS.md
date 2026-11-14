@@ -29,6 +29,8 @@ On `claude/any-cpu-count`, from the fourth batch (`land/s4-part2`) with S4-3 mer
 - `boot-matrix`: 1,081 s.
 - Controls: AC-1 to AC-6 failed where aimed, and AC-7 passed (ADR-0013).
 
+**Gates on `efbcb6a`, after the review's fixes:** `check` passed in 436 s (1,913 host tests, 0 failed; Loom 56 models, 83 controls caught); `boot-test` 11 of 11 in 53 s; `boot-matrix` passed in 1,070 s; `boot-sparse` alone first, in 133 s. Controls AC-8 and AC-9 (the review's F1 and F2) failed where aimed, AC-3 still fails, and AC-7 passes (ADR-0013). No reviewer has read the fixes.
+
 **Not shown:** anything under KVM or on a real processor. CI has not built this. The new machines run in CI only once measured and accepted (D7). A machine short of memory for its tables: only the search for the largest count that fits is host-tested, with a stand-in for the heap.
 
 **Open:**

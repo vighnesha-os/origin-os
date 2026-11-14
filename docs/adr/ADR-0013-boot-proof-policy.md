@@ -416,6 +416,17 @@ Each boot failed (`cargo xtask boot-test` exit 1), and every file was restored. 
 
 Each of AC-1 to AC-6 failed where it was aimed, and AC-7 passed as it should. The Loom models' two new controls, `shootdown_records_one_short` and `shootdown_wait_stops_one_short`, are `cargo xtask loom`'s, caught in `check` on `15b08fd` (56 models, 83 controls).
 
+**Controls of the independent review's fixes (TASKS item 58, `docs/engineering/REVIEW_T58_2026-11-14.md`; 2026-11-14 03:42 to 03:50 UTC, QEMU 11.1.3 TCG, Intel VT-d):** temporary edits to an export of `efbcb6a`, run in the same turn of the machine as the gates on it, by the same kind of script.
+
+| # | Edit | Result |
+|---|---|---|
+| AC-8 | The NVMe queues back in plain table order (`storage::queue_order`'s sort removed), on the 67-processor sparse machine (`boot-sparse`): review finding F1 | `62 of 67 processors have an I/O queue pair and MSI-X vector of their own, … 62 expected, 62 filled`, then `x2APIC: 3 online processors have an APIC ID above 255 and no NVMe queue of their own …: nothing to prove through NVMe`. `boot-sparse` failed on its first missing marker, `NVMe: CPU 64 (APIC ID 256): 32 reads through its own queue pair, …` |
+| AC-9 | `timer::X2APIC_READY` left out of the framework's `size_per_cpu`, 2 processors, the kernel boot alone, so no gate ran: F2's run-time half | `26 per-CPU tables hold 2 each`, then on the boot processor, after the park drill: `panic: panicked at framekernel/frame/src/percpu.rs:114:9:` and `per-CPU table origin_frame::timer::X2APIC_READY holds 1 indexes, not processor index 1 of the 2 the kernel has: it was not sized (ADR-0008 Amendment 1, D1)`. The boot test stops QEMU at the panic's first line, so the message line was read from a run of the same edit under `cargo xtask run` at 04:06 UTC |
+| AC-3 | Run again on the new sizing code: the count fixed one short (`let count = sizing.reached.max(1)` made one less), 3 processors | `27 per-CPU tables hold 2 each`, `SMP: 2 of 3 enabled processors online`, `held back: none` as before; the boot test failed on its first missing marker |
+| AC-7 | Run again with F5's line: QEMU's NVMe limited to 2 I/O queue pairs, 2 processors | `per-CPU queues: not proven: the controller allocated 2 submission and 2 completion queues, has 65 MSI-X vectors, and BAR 0 holds the doorbells of 1535 I/O queues; the driver keeps 2 of each`; the kernel boot passed, verdict `degraded: 66 of 67 proofs passed; failed: speculation controls` |
+
+AC-8, AC-9 and AC-3 failed where they were aimed, and AC-7 passed. F2's four host controls (an alias, a `PerCpu` inside another type or a `const`, a mention other than the sizing call, a wrong name) are `percpu-gate`'s tests, run in `check` on `efbcb6a`.
+
 ## Alternatives
 
 | Alternative | For | Against |
