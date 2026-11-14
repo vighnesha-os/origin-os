@@ -356,8 +356,8 @@ fn test_keys_come_from_their_seed_only() {
 }
 
 /// The library's half of the key file's refusals: bytes that are not a key file, or a damaged
-/// one. The file-system half (missing, a symbolic link, not a regular file, mode other than
-/// 0600) is the command line's, tested in `tests/rustc_kernel.rs`.
+/// one. The file-system half (missing, a symbolic link, not a regular file, a group or other
+/// permission bit) is the command line's, tested in `tests/rustc_kernel.rs`.
 #[test]
 fn a_damaged_or_foreign_key_file_is_refused() {
     let good = new_test_key("a label").key_file.as_bytes().to_vec();

@@ -8,8 +8,9 @@
 //!
 //! Nothing here reaches the host (ADR-0011 Amendment 4, T1): a key file comes in and goes out
 //! as bytes, and fresh randomness comes from the caller through [`Random`]. The command line
-//! reads and writes the files, with their checks (no symbolic link, a regular file, mode
-//! 0600, never overwriting), and fills [`Random`] from the operating system's generator; so
+//! reads and writes the files, with their checks (no symbolic link, a regular file, owner-only
+//! on reading; 0600, never overwriting, on writing), and fills [`Random`] from the operating
+//! system's generator; so
 //! does `xtask`, which derives its test keys in memory.
 //!
 //! Signing the statement is the one step of a build that is not reproducible: ML-DSA signing
@@ -75,8 +76,10 @@ impl fmt::Display for RandomError {
 ///
 /// It fails closed. A [`fill`](Random::fill) that returns an error stops what asked for it,
 /// and so does one that returns success with its 32 bytes all zero: a generator gives that
-/// once in 2^256, and a `fill` that wrote nothing gives it every time. Nothing is generated or
-/// signed with bytes that were not filled.
+/// once in 2^256, and a `fill` that wrote nothing gives it every time. So nothing is generated
+/// or signed with a buffer left untouched. A `fill` that writes only part of the buffer and
+/// reports success is not caught: filling every byte is the trait's contract, which both
+/// `Random`s in the tree keep with `read_exact`.
 pub trait Random {
     /// Fills every byte of `out`, or fails.
     ///
@@ -251,8 +254,8 @@ impl HostKey {
 
     /// The key whose file is `bytes`, as [`new_key`] or [`new_test_key`] made it; it signs with
     /// ML-DSA's hedge from `random`. A damaged or foreign file is refused. Where the bytes came
-    /// from, and whether that file was safe to read (no symbolic link, a regular file, mode
-    /// 0600), is the caller's to check: the command line does.
+    /// from, and whether that file was safe to read (no symbolic link, a regular file,
+    /// owner-only), is the caller's to check: the command line does.
     ///
     /// # Errors
     ///

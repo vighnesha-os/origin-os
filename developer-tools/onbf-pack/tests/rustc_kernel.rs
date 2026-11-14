@@ -631,7 +631,8 @@ fn mode(path: &Path) -> u32 {
 
 /// The key files are the command line's (ADR-0011 Amendment 4, T1): it writes them, mode 0600
 /// for the private key and 0644 for the public ones, never over an existing path and all or
-/// none; it reads a key file only if it is no symbolic link, a regular file and mode 0600; and
+/// none; it reads a key file only if it is no symbolic link, a regular file and owner-only (no
+/// group or other permission bit); and
 /// what it signs with such a key verifies under the public keys it wrote. These are the file
 /// tests that `HostKey::load` and `generate_keys` had in the library before T1
 /// (`src/tests/sign.rs`), run through the binary.

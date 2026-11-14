@@ -6,9 +6,11 @@
 //! and files, calls the library, and writes what the library returns. What it does of its own
 //! is the host's part, which the library leaves to its caller: running `rustc -vV` when a
 //! toolchain value is not given, reading the operating system's random generator, checking a
-//! key file as it reads it (no symbolic link, a regular file, mode 0600) and writing new key
-//! files (never over an existing path, all or none), listing an output directory, and writing
-//! files atomically. It calls nothing but `onbf_pack` and `std`.
+//! key file as it reads it (no symbolic link, a regular file, owner-only: no group or other
+//! permission bit) and writing new key files (0600 and 0644, never over an existing path, all or
+//! none), listing an output directory, and writing files atomically. It names no crate but
+//! `onbf_pack` and `std` (`cargo xtask host-tools-gate`'s G3); that it holds no logic of its own
+//! is review's to see.
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -467,9 +469,11 @@ fn wipe(bytes: &mut [u8]) {
 }
 
 /// Loads the key in the key file at `path`, refusing a symbolic link, anything but a regular
-/// file, and one that anyone but its owner can read: like an SSH private key, it must be mode
-/// 0600. Opened once and checked on that handle, so that what is read is exactly what was
-/// checked; the library then refuses a damaged or foreign file.
+/// file, and one that anyone but its owner can read or write: like an SSH private key, it must
+/// be owner-only, with no group or other permission bit (0600 as `keygen` writes it; 0400 and
+/// 0700 pass too, and the message says "0600", as it always has). Opened once and checked on
+/// that handle, so that what is read is exactly what was checked; the library then refuses a
+/// damaged or foreign file.
 fn load_key(path: &Path) -> Result<HostKey, Failure> {
     let cannot_read = |e| conversion(format!("cannot read {}: {e}", path.display()));
     let refused = |why: &str| conversion(format!("{}: {why}", path.display()));

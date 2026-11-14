@@ -30,7 +30,10 @@
 //! ([`Toolchain::from_rustc_verbose_version`]), randomness ([`sign::Random`]), and the contents
 //! of files. Its two callers are the command line (`src/main.rs`), a thin client that does the
 //! reading and writing and calls nothing this library does not offer, and `xtask`, which calls
-//! it in process. `cargo xtask host-tools-gate` holds the rule.
+//! it in process. `cargo xtask host-tools-gate` holds the rule for the forms it reads, which its
+//! doc comment lists with what it cannot see; it also holds this crate's dependencies to a
+//! listed set, and the command line to naming no crate but this one and `std`. That the command
+//! line holds no logic of its own is review's to see.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     not(test),

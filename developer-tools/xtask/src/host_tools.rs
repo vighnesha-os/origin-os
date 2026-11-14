@@ -1,47 +1,61 @@
 //! `cargo xtask host-tools-gate`: the host tools are libraries first (ADR-0011 Amendment 4, T1;
-//! decision item 295; TASKS item 60). Part of `check`. Two halves, both read with xtask's lexer
-//! (`lex.rs`), so comments and the text inside string literals are not code.
+//! decision items 295 and 300; TASKS item 60). Part of `check`. Three halves and a check of
+//! manifests, read with xtask's lexer (`lex.rs`), so comments and the text inside string
+//! literals are not code. Its rules were tightened after the independent review of 2026-11-14
+//! (`docs/engineering/REVIEW_T60_2026-11-14.md`, findings F1 to F5, F8, F11 and F12).
 //!
 //! **G1: `xtask` starts no first-party program.** It calls `onbf-pack`'s and `oidl`'s libraries
 //! (and `onbf-sign`'s through `onbf_pack::sign`); the programs it starts are outside ones:
 //! Cargo, `rustc`, Git, `llvm-objdump`, `nm`, QEMU. Over every `.rs` file of
 //! `developer-tools/xtask/`, its tests included, the gate refuses:
 //!
-//! - **Cargo's `run`**: a string literal `run`, or Cargo's alias `r`, or a literal whose first
-//!   word is one of them, inside the parentheses of an `.arg(…)` or `.args(…)` call, written
-//!   there or through a `const NAME: … = "…";` defined in `xtask`. Cargo runs only a local
-//!   package's binary, so that is every `cargo run` of a first-party program, whatever the
-//!   package. It also refuses `run` given to an outside program; none takes it today.
+//! - **Cargo's `run`, by any name the repository gives it**: a string literal whose first word
+//!   is `run`, Cargo's built-in alias `r`, or an alias of the repository's Cargo configuration
+//!   that runs a program (every file in a `.cargo` directory of the tree, `[alias]` and
+//!   `alias.<name>` keys, followed alias to alias: today `xtask`), inside the parentheses of an
+//!   `.arg(…)` or `.args(…)` call, written there or through a `const NAME: … = "…";` defined in
+//!   `xtask`. An alias's name that is the value of an option taking one (`--package xtask`) is
+//!   not refused, and the alias `xtask` is allowed where `xtask` may re-run itself
+//!   ([`SELF_RUNS`]). A literal beginning `CARGO_ALIAS_` is refused anywhere. It also refuses
+//!   `run` given to an outside program; none takes it today.
 //! - **A first-party program by name or path**: inside the parentheses of `Command::new(…)`, a
 //!   literal (or such a `const`) that is the name of a workspace package or of a `[[bin]]`
 //!   target, alone or as a path's last component. The names are read from every manifest in the
 //!   tree on each run.
 //! - **`xtask` naming itself** (`current_exe`) outside the functions [`SELF_RUNS`] lists.
 //!
-//! Two cases T1 allows, each by **decision item 300** (accepted by the owner on 2026-11-14;
-//! T1's added note in ADR-0011 Amendment 4), named here:
+//! What it allows, each named here and in [`SELF_RUNS`] with its authority:
 //!
-//! - **`cargo xtask exclusive` running the command a person gives it** (`turns::exclusive`), in
-//!   the machine's turn: that person's choice, not `xtask`'s. Its argument is their text, so
-//!   neither rule above meets it.
-//! - **`boot-matrix` re-running `xtask` for each scenario**: it starts `xtask boot-test` from
-//!   `std::env::current_exe()` in a child of its own (`boot_test_child`), so that each child has
-//!   its scenario's `ORIGIN_QEMU_*` settings in its environment. The places are the functions
-//!   [`SELF_RUNS`] lists: `boot_matrix` and the six machines it runs as steps of its own, each
-//!   also a command of its own. Allowed until TASKS item 61 runs the scenarios in one process
-//!   with their settings passed as typed values, after TASKS items 58 and 59.
+//! - **By decision item 300** (accepted by the owner on 2026-11-14; T1's added note in
+//!   ADR-0011 Amendment 4): `cargo xtask exclusive` running the command a person gives it
+//!   (`turns::exclusive`), that person's choice and not `xtask`'s, whose argument is their text
+//!   so neither rule meets it; and `boot-matrix` re-running `xtask` for each scenario
+//!   (`boot_matrix`, through `boot_test_child`, with each scenario's `ORIGIN_QEMU_*` settings in
+//!   its child's environment), until TASKS item 61 runs the scenarios in one process with typed
+//!   settings, after TASKS items 58 and 59.
+//! - **Pending decision item 310** (put to the owner on 2026-11-14, recommended "allow"; the
+//!   review's finding F6): the six machines `boot-matrix` runs as steps of its own
+//!   (`boot_x2apic`, `boot_bridge`, `boot_reserved`, `boot_legacy_free`, `boot_random`,
+//!   `boot_identity`) re-run `xtask` the same way when each is run alone as a command of its
+//!   own, which item 300's words do not name; and the turn lock's own test
+//!   (`turns::tests::the_lock_goes_with_the_process_however_it_ends`) starts its test binary to
+//!   hold the lock and be killed: test code, run by `cargo test`, never by `xtask`.
+//! - **Outside G1, a reading that is part of item 310** (finding F12): Cargo's subcommands other
+//!   than `run` (`xtask check` runs `cargo test --package onbf-pack`, and `onbf-pack`'s and
+//!   `oidl`'s integration tests start the binary they test), and the build scripts Cargo runs,
+//!   are Cargo's own work, not `xtask` starting a first-party program.
 //!
-//! One more place is listed, outside T1 and outside item 300: the turn lock's own test starts its
-//! test binary to hold the lock and be killed. It is test code, run by `cargo test` and never by
-//! `xtask`; it is listed so that the rule reads every file of `xtask` with no exception unnamed.
+//! **G2: the three libraries reach nothing of the host, by the forms it reads.** Over the
+//! library sources of `onbf-pack`, `onbf-sign` and `oidl` (`src/**/*.rs`, but not
+//! `src/main.rs`, `src/tests.rs`, `src/tests/` or an item under `#[cfg(test)]`, which ends at
+//! its `;` or `,`, with its block, or before the bracket that closes its list: so a test-only
+//! field, variant or match arm hides nothing after it), the gate refuses:
 //!
-//! **G2: the three libraries reach nothing of the host.** Over the library sources of
-//! `onbf-pack`, `onbf-sign` and `oidl` (`src/**/*.rs`, but not `src/main.rs`, `src/tests.rs`,
-//! `src/tests/` or an item under `#[cfg(test)]`), the gate refuses:
-//!
-//! - a path through `std::fs`, `std::process`, `std::env`, `std::net`, `std::os` or
-//!   `std::time`, written out (`::std::` too) or as a name in a `use std::{…}` group;
-//! - `std::io::stdin`, `stdout` and `stderr`, the same ways;
+//! - a path through `std::fs`, `std::process`, `std::env`, `std::net`, `std::os`, `std::time`
+//!   or `std::path` (whose `Path` reads the file system), written out (`::std::` too) or as a
+//!   name in a `use std::{…}` group;
+//! - the identifiers `stdin`, `stdout` and `stderr`, wherever they stand, so a stream reached
+//!   through `use std::io::{self, …}` or a renamed import is caught too;
 //! - a glob import from `std` (`use std::*`, `use std::fs::*`, `use std::io::*`);
 //! - a string literal that begins `/dev/`;
 //! - `print!`, `println!`, `eprint!`, `eprintln!` and `dbg!`: a library returns what it has to
@@ -50,20 +64,49 @@
 //! Compile-time inclusion (`include_str!` of the generator's templates) is not run-time host
 //! access, and passes.
 //!
-//! **Negative controls.** Every run, before it reports, the gate checks planted copies of real
-//! files ([`controls`]): `xtask`'s `main.rs` with the `cargo run --release --package onbf-pack`
-//! that `xtask` ran before T1 put back, the same file with a `Command::new` of `oidl`'s binary
-//! and with a `current_exe` outside the list, and `onbf-sign`'s `lib.rs` with the `os_random`
-//! it had before T1. Each must be refused, or the gate fails. The host tests plant every
-//! refused form.
+//! **The libraries' dependencies.** Each library's manifest may name, in its normal, build and
+//! target-specific dependencies, only the crates [`LIBRARY_DEPENDENCIES`] lists for it:
+//! first-party `no_std` crates that ship in the loader or the kernel, and `onbf-sign`, which G2
+//! reads itself. G2 reads the libraries' own sources only, so this keeps what they depend on in
+//! view.
 //!
-//! **What it cannot see.** It reads tokens, not data flow. An argument list or a program's path
-//! built in a variable somewhere else and handed to `.args(…)` or `Command::new(…)` is not
-//! seen, and neither is a `const` of another type or one defined outside `xtask`. A library
-//! that reaches the host through a crate it depends on is not seen either: `onbf-pack` depends
-//! only on first-party crates, and `onbf-format`, `onbf-merkle`, `onbf-verify`, `origin-crypto`
-//! and `origin-version` are `no_std` libraries that ship in the loader or the kernel. Review
-//! covers what the gate does not (`docs/engineering/SOURCE_PROVENANCE.md`, TASKS item 60).
+//! **G3: each command line names no crate but its library's and the standard library's.** In
+//! `onbf-pack`'s and `oidl`'s `src/main.rs`, an identifier that names a first-party crate or one
+//! of the tool's dependencies, other than its own library, and an `extern crate` of anything but
+//! `std`, `core`, `alloc` and the library, is refused. That a command line holds no logic of its
+//! own, and reads, calls and writes only, is review's to see, not this gate's.
+//!
+//! **Negative controls.** Every run, before it reports, the gate checks planted copies of real
+//! files ([`controls`]), each of which must be refused or the gate fails: in `xtask`'s `main.rs`,
+//! the `cargo run --release --package onbf-pack` that `xtask` ran before T1, a `Command::new` of
+//! `oidl`'s binary, a `current_exe` outside the list, and `cargo().args(["xtask", "boot-test"])`
+//! outside it; in `onbf-sign`'s `lib.rs`, the `os_random` it had before T1, a test-only field
+//! with host access after it, a stream through `std::io` and a `Path::is_file`; in
+//! `onbf-pack`'s `main.rs`, the `onbf_verify::key_id` call it had before T1; in `onbf-sign`'s
+//! manifest, a dependency on `onbf-pack`. The host tests plant every refused form.
+//!
+//! **What it cannot see** (the review's findings F8 and F12, and before them):
+//!
+//! - It reads tokens, not data flow. An argument list or a program's path built in a variable
+//!   somewhere else and handed to `.args(…)` or `Command::new(…)` is not seen; nor a `static` or a
+//!   `const` of another type, one defined outside `xtask`, or one of two `const`s with one name
+//!   in two files (the last read wins); nor `Command::arg(&mut c, "run")` or a turbofish
+//!   (`.args::<_, &str>([…])`) or `use std::process::Command as Cmd; Cmd::new(…)`.
+//! - `xtask` naming itself other than by `current_exe` (`env::args_os().next()`,
+//!   `/proc/self/exe`).
+//! - A binary found by Cargo as `src/bin/<name>.rs`, or a manifest `name` line with a comment
+//!   after it (none in the tree).
+//! - Raw identifiers (`r#std::fs`, `r#current_exe`, `Command::r#new`, `r#println!`), which the
+//!   lexer keeps apart from identifiers; `extern crate std as host;` and `use std as s;`; and a
+//!   string literal holding an escape the lexer does not decode (a `\` line continuation), which
+//!   is skipped, not refused.
+//! - A Cargo alias defined in the environment `xtask` inherits (`CARGO_ALIAS_<NAME>`) or in a
+//!   Cargo configuration outside the repository (a parent directory, Cargo's home), which Cargo
+//!   reads and a lexical gate does not.
+//! - A library that reaches the host through a crate it depends on: the dependencies are held
+//!   to [`LIBRARY_DEPENDENCIES`], whose crates are read by their own gates, not this one.
+//!
+//! Review covers what the gate does not (`docs/engineering/SOURCE_PROVENANCE.md`, TASKS item 60).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -122,25 +165,40 @@ pub(crate) struct Known {
     pub(crate) runs: BTreeMap<String, Option<String>>,
 }
 
+/// Item 300's words: `boot-matrix` re-running `xtask` for each scenario.
+const ITEM_300: &str = "decision item 300: `boot-matrix` re-runs `xtask` for each scenario";
+/// The six machines `boot-matrix` runs as steps, when run alone (the review's finding F6).
+const ITEM_310_MACHINE: &str =
+    "pending decision item 310: a machine `boot-matrix` runs, run alone as a command of its own";
+/// The turn lock's own test (finding F6).
+const ITEM_310_TEST: &str =
+    "pending decision item 310: test code, run by `cargo test`, starting its own test binary";
+
 /// The places `xtask` may name itself (`current_exe`), by file under `developer-tools/xtask/`
-/// and function: `boot_matrix` and the six machines it runs as steps of its own, each of which
-/// re-runs `xtask boot-test` in a child with its scenario's environment (decision item 300,
-/// accepted 2026-11-14, until TASKS item 61); and the turn lock's test, which is test code (see
-/// the module documentation). A place not listed is refused, and a listed one that no longer
-/// names itself is a stale allowance, refused too.
-pub(crate) const SELF_RUNS: &[(&str, &str)] = &[
-    ("src/main.rs", "boot_matrix"),
-    ("src/main.rs", "boot_reserved"),
-    ("src/main.rs", "boot_legacy_free"),
-    ("src/main.rs", "boot_random"),
-    ("src/main.rs", "boot_identity"),
-    ("src/main.rs", "boot_bridge"),
-    ("src/main.rs", "boot_x2apic"),
+/// and function, each with its authority (the module documentation says more). A place not
+/// listed is refused, and a listed one that no longer names itself is a stale allowance, refused
+/// too.
+pub(crate) const SELF_RUNS: &[(&str, &str, &str)] = &[
+    ("src/main.rs", "boot_matrix", ITEM_300),
+    ("src/main.rs", "boot_reserved", ITEM_310_MACHINE),
+    ("src/main.rs", "boot_legacy_free", ITEM_310_MACHINE),
+    ("src/main.rs", "boot_random", ITEM_310_MACHINE),
+    ("src/main.rs", "boot_identity", ITEM_310_MACHINE),
+    ("src/main.rs", "boot_bridge", ITEM_310_MACHINE),
+    ("src/main.rs", "boot_x2apic", ITEM_310_MACHINE),
     (
         "src/turns.rs",
         "the_lock_goes_with_the_process_however_it_ends",
+        ITEM_310_TEST,
     ),
 ];
+
+/// Whether `function` of `file` is a place [`SELF_RUNS`] lists.
+fn self_run(file: &str, function: &str) -> bool {
+    SELF_RUNS
+        .iter()
+        .any(|(f, name, _)| *f == file && *name == function)
+}
 
 /// The three host tools whose libraries G2 reads, by directory.
 const LIBRARIES: &[&str] = &[
@@ -488,8 +546,8 @@ pub(crate) fn program_hits(
                     continue;
                 };
                 let place = enclosing(&spans, i);
-                let self_run = runs.as_deref() == Some("xtask")
-                    && place.is_some_and(|f| SELF_RUNS.iter().any(|r| r.0 == file && r.1 == f));
+                let self_run =
+                    runs.as_deref() == Some("xtask") && place.is_some_and(|f| self_run(file, f));
                 if !self_run {
                     hit(
                         t,
@@ -535,12 +593,12 @@ pub(crate) fn program_hits(
         // `xtask` naming itself.
         if token.is_ident("current_exe") {
             let place = enclosing(&spans, i);
-            let listed = place.is_some_and(|f| SELF_RUNS.contains(&(file, f)));
+            let listed = place.is_some_and(|f| self_run(file, f));
             if !listed {
                 hit(
                     token,
                     format!(
-                        "`current_exe` in {}: `xtask` re-runs itself only in the functions host_tools::SELF_RUNS lists (decision item 300: `boot-matrix`'s scenarios)",
+                        "`current_exe` in {}: `xtask` re-runs itself only in the functions host_tools::SELF_RUNS lists, by decision item 300 or, pending, item 310",
                         place.map_or("no function".to_string(), |f| format!("`{f}`"))
                     ),
                 );
@@ -562,8 +620,8 @@ fn stale_self_runs(file: &str, source: &str) -> Vec<&'static str> {
         .collect();
     SELF_RUNS
         .iter()
-        .filter(|(f, function)| *f == file && !naming.contains(function))
-        .map(|(_, function)| *function)
+        .filter(|(f, function, _)| *f == file && !naming.contains(function))
+        .map(|(_, function, _)| *function)
         .collect()
 }
 
@@ -1217,7 +1275,7 @@ pub(crate) fn gate() -> Result {
             ));
         }
     }
-    for (file, _) in SELF_RUNS {
+    for (file, _, _) in SELF_RUNS {
         if !xtask.iter().any(|(f, _)| f == file) {
             problems.push(format!(
                 "host_tools::SELF_RUNS names developer-tools/xtask/{file}, which does not exist"
@@ -1274,7 +1332,7 @@ pub(crate) fn gate() -> Result {
         ));
     }
     println!(
-        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs, by name or through `run` and the {} Cargo aliases that run one, and re-runs itself only in the {} places host_tools::SELF_RUNS lists; the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host by the forms the gate reads, and depend on nothing but the crates it lists; their {} command lines name no crate but their own library and the standard library's; {caught} planted controls caught",
+        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs, by name or through `run` and the {} Cargo aliases that run one, and re-runs itself only in the {} places host_tools::SELF_RUNS lists (1 by decision item 300, the rest pending item 310); the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host by the forms the gate reads, and depend on nothing but the crates it lists; their {} command lines name no crate but their own library and the standard library's; {caught} planted controls caught",
         xtask.len(),
         known.programs.len(),
         known.runs.len() - RUN_WORDS.len(),

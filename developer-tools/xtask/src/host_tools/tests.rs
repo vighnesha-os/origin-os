@@ -193,6 +193,16 @@ fn xtask_names_itself_only_where_the_list_allows() {
     let hits = program_hits("src/image.rs", listed, &consts, &programs);
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert!(hits[0].what.contains("`boot_matrix`") && hits[0].what.contains("300"));
+    // Each listed place names its authority: item 300 for `boot_matrix`, pending item 310 for the
+    // rest (the review of 2026-11-14, finding F6).
+    for (file, function, why) in SELF_RUNS {
+        let expected = if *function == "boot_matrix" {
+            "item 300"
+        } else {
+            "pending decision item 310"
+        };
+        assert!(why.contains(expected), "{file} {function}: {why}");
+    }
     let hits = planted_in_main("fn again() { Command::new(std::env::current_exe().unwrap()); }");
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert!(hits[0].what.contains("`again`"), "{hits:?}");
@@ -207,8 +217,8 @@ fn xtask_names_itself_only_where_the_list_allows() {
         stale_self_runs("src/main.rs", "fn boot_matrix() {}"),
         SELF_RUNS
             .iter()
-            .filter(|(file, _)| *file == "src/main.rs")
-            .map(|(_, function)| *function)
+            .filter(|(file, _, _)| *file == "src/main.rs")
+            .map(|(_, function, _)| *function)
             .collect::<Vec<_>>()
     );
 }

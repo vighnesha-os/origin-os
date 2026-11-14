@@ -17,7 +17,10 @@
 //! name and the versions file's text ([`compile`]), and writes what it returns
 //! ([`codegen::generate_output`], [`fingerprint::fingerprint_file`],
 //! [`fingerprint::updated_lock`]). Its callers are the command line (`src/main.rs`), a thin
-//! client, and `xtask`, which calls it in process. `cargo xtask host-tools-gate` holds the rule.
+//! client, and `xtask`, which calls it in process. `cargo xtask host-tools-gate` holds the rule for
+//! the forms it reads, which its doc comment lists with what it cannot see; it also holds this
+//! crate's dependencies to a listed set, and the command line to naming no crate but this one
+//! and `std`.
 //!
 //! The owner accepted the format on 2026-11-09 (`docs/spec/OIDL.md` §19, CLAUDE.md §84). Generated
 //! code is written to a directory the caller names; no Origin OS component uses it yet.

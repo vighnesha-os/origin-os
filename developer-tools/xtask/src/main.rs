@@ -105,10 +105,14 @@ commands:
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
   host-tools-gate only the gate on the host tools (ADR-0011 Amendment 4, T1): xtask starts no
-              first-party program but the two decision item 300 allows (itself, for
-              boot-matrix's scenarios, and the command a person gives exclusive), and the
-              libraries of onbf-pack, onbf-sign and oidl reach nothing of the host; with
-              planted negative controls (part of check; quick)
+              first-party program, by name, by `cargo run` or by a Cargo alias that runs
+              one, but those decision item 300 allows (itself for boot-matrix's
+              scenarios, and the command a person gives exclusive) and, pending item 310,
+              the boot machines run alone and the turn lock's test; the libraries of
+              onbf-pack, onbf-sign and oidl reach nothing of the host by the forms it
+              reads and depend only on the crates it lists; their command lines name no
+              crate but their library and std; with planted negative controls (part of
+              check; quick)
   requirements-gate only the gate on the requirements matrix under docs/requirements/: a row
               for every statement of CLAUDE.md and every decision of an accepted ADR, each
               true to the tree; prints the coverage figure (part of check; CLAUDE.md §1;

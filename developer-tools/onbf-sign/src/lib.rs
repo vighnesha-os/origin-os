@@ -11,7 +11,8 @@
 //!
 //! It reaches nothing of the host: every seed and ML-DSA's per-signature randomness `rnd` are
 //! arguments, which its caller fills (ADR-0011 Amendment 4, T1; `cargo xtask host-tools-gate`
-//! holds it). On the build host that caller is `onbf-pack`'s command line or `xtask`, each
+//! holds it for the forms it reads, and holds this crate's dependencies to `origin-crypto`). On
+//! the build host that caller is `onbf-pack`'s command line or `xtask`, each
 //! reading the operating system's generator itself.
 //!
 //! Hashing reuses `origin-crypto`'s SHA-512, SHAKE128 and SHAKE256, whose state updates have no
