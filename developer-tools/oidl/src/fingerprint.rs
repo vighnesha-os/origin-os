@@ -6,7 +6,7 @@
 //! has its own digest, which never changes once recorded: additions show up as a new minor,
 //! and anything else shows up as a changed one.
 
-use core::fmt::Write as _;
+use core::fmt::{self, Write as _};
 use std::collections::BTreeSet;
 
 use origin_crypto::Sha256;
@@ -476,6 +476,23 @@ pub enum LockFinding {
     },
 }
 
+impl fmt::Display for LockFinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Changed { library, version } => {
+                write!(f, "{library} {version}: the recorded fingerprint changed")
+            }
+            Self::Gone { library, version } => {
+                write!(f, "{library} {version}: a recorded version is gone")
+            }
+            Self::Unrecorded { library, version } => {
+                write!(f, "{library} {version}: no recorded fingerprint")
+            }
+            Self::Malformed { line } => write!(f, "the lock file's line {line} is malformed"),
+        }
+    }
+}
+
 /// The result of comparing a lock file against the definitions.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LockReport {
@@ -600,6 +617,23 @@ pub fn check_lock(comp: &Compilation, lock: &str) -> LockReport {
         }
     }
     report
+}
+
+/// The lock `recorded` becomes when the definitions' fingerprints are recorded in it (`oidl
+/// fingerprint --update`; §13): [`render_lock`], unless a recorded fingerprint changed. `recorded`
+/// is the lock's text, empty when there is none yet.
+///
+/// # Errors
+///
+/// The comparison ([`check_lock`]) when it holds an error: such a lock is never updated, since
+/// re-recording a changed ABI is a decision, not a refresh.
+pub fn updated_lock(comp: &Compilation, recorded: &str) -> Result<String, LockReport> {
+    let report = check_lock(comp, recorded);
+    if report.errors.is_empty() {
+        Ok(render_lock(comp))
+    } else {
+        Err(report)
+    }
 }
 
 /// The lock file text for the definitions. Records every current minor.

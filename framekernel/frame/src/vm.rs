@@ -11,7 +11,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use origin_paging::layout::{DIRECT_MAP_WINDOW, DIRECT_MAP_WINDOW_SIZE, STACK_REGION_SIZE};
+use origin_paging::layout::{self, DIRECT_MAP_WINDOW, DIRECT_MAP_WINDOW_SIZE};
 use origin_paging::{
     Access, AddressSpace, Attributes, LARGE_PAGE, LeafCensus, LeafSizes, MapError, PAGE, TablePool,
     Translation, kernel_half_is_complete, same_kernel_half,
@@ -280,7 +280,46 @@ fn in_stack_region(virt: u64, pages: usize) -> bool {
         .and_then(|bytes| virt.checked_add(bytes));
     virt.is_multiple_of(PAGE)
         && virt >= base
-        && end.is_some_and(|end| end <= base + STACK_REGION_SIZE)
+        && end.is_some_and(|end| end <= base + crate::stack::region_size())
+}
+
+/// Makes the page tables for the kernel stacks' region from `base + from` to `base + to`
+/// (ADR-0008 Amendment 1, D3): from a run of frames taken now and kept for ever, added to the
+/// kernel's table pool as its second run. Once, by `stack::grow`, on the boot processor before
+/// any application processor starts.
+///
+/// No shootdown: the entries it fills were not present, and no processor caches a translation
+/// from an entry whose P flag is 0 (Intel SDM Vol. 3A §4.10.4.3). The kernel half's PML4 entries
+/// were all made at boot (ADR-0004 H2), so every address space sees the new tables.
+pub(crate) fn grow_stack_region(base: u64, from: u64, to: u64) -> Result<(), MapError> {
+    let bytes = to.checked_sub(from).ok_or(MapError::Overflow)?;
+    let start = base.checked_add(from).ok_or(MapError::Overflow)?;
+    // As many as a run of this size can need, wherever it lies.
+    let count = layout::stack_region_tables(bytes);
+    let run = crate::memory::allocate_table_run(count).ok_or(MapError::OutOfMemory)?;
+    // SAFETY: `allocate_table_run` handed over `count` frames from `run`, 4 KiB-aligned, that the
+    // frame allocator never hands out again and nothing else refers to; the direct map holds
+    // them. `Table` is 4 KiB of `AtomicU64`, valid for any bits, and every access through the
+    // shared slice is atomic, as for the pool `early` made. The slice lives for the rest of the
+    // kernel's run.
+    let tables = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::with_exposed_provenance::<origin_paging::Table>(
+                crate::phys::to_virt(run) as usize
+            ),
+            count as usize,
+        )
+    };
+    crate::cpu::without_interrupts(|| {
+        let mut guard = KERNEL_SPACE.lock();
+        let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
+        if !k.tables.extend(tables, run) {
+            return Err(MapError::OutOfMemory);
+        }
+        k.space
+            .reserve_tables(&mut k.tables, start, bytes)
+            .map(|_| ())
+    })
 }
 
 /// Maps `frames` at consecutive pages from `virt` in the kernel stacks' region (`stack`):

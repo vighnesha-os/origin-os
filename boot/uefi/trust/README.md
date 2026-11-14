@@ -19,9 +19,11 @@ safe failure, until Origin's own root and kernel keys exist. A build that holds 
 cannot be built with a non-zero build number (`origin-version.toml`), which release
 engineering sets, so a released loader cannot hold them.
 
-No private key is stored in this repository. `cargo xtask boot-test` derives the private key
-into `target/xtask/test-keys/` from the text `TEST_KEY_TRUSTED` in
-`developer-tools/xtask/src/main.rs`, and checks that the public half matches these files.
+No private key is stored in this repository, and none is written to disk by the boot tests.
+`cargo xtask boot-test` derives the private key in memory, with `onbf-pack`'s library, from the
+text `TEST_KEY_TRUSTED` in `developer-tools/xtask/src/main.rs`, signs with it in memory, and
+checks that its public half matches these files (ADR-0011 Amendment 4, T1; TASKS item 60, which
+ended the key file it wrote under `target/xtask/test-keys/`).
 
 To regenerate these files after changing that text, remove them and any old key file (`keygen`
 never overwrites anything), and run this from the repository root:

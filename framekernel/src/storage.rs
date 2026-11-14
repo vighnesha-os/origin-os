@@ -53,9 +53,10 @@ use origin_frame::dma::DmaPage;
 use origin_frame::mmio::MmioRegion;
 use origin_frame::sync::SpinLock;
 
-use crate::cpu::{CpuIndex, MAX_CPUS};
+use crate::cpu::CpuIndex;
 use crate::dma::DeviceDma;
 use crate::wait::WaitQueue;
+use origin_frame::percpu::PerCpu;
 
 use crate::console::Console;
 
@@ -115,6 +116,15 @@ struct Nvme {
     admin: QueuePair,
     io: Option<QueuePair>,
     irq: Option<QueuePair>,
+    /// I/O queue pairs the controller allocated and the driver may create, ids `1..=pairs`:
+    /// pair 1 polled, pair 2 for the interrupt proof, and one each from 3 for as many
+    /// processors as there are left (ADR-0008 Amendment 1, D6).
+    pairs: u16,
+    /// The controller's own numbers, which bound the per-processor queues and judge "not
+    /// proven" (review finding F5 of 2026-11-14): the submission and completion queues it
+    /// allocated, and the highest I/O queue id whose doorbells BAR 0 holds.
+    allocated: (u32, u32),
+    bar_queues: u16,
 }
 
 impl Nvme {
@@ -315,18 +325,40 @@ struct Driver {
     test_disk: bool,
     /// The MSI-X table's virtual address and the capability, once set up.
     msix: Option<(MmioRegion, pci::Msix)>,
+    /// The processors whose per-processor MSI-X entry `2 + k` [`setup_cpu_queues`] wrote, in
+    /// that order, each recorded as it is written, so the IOMMU proof checks every entry
+    /// programmed, a queue later refused or not (review finding F4 of 2026-11-14).
+    entries: Vec<CpuIndex>,
 }
 
 static DRIVER: SpinLock<Option<Driver>> = SpinLock::new(None);
 /// Per processor (by CPU index): woken by the completion interrupts routed there.
-static IO_WAIT: [WaitQueue; MAX_CPUS] = [const { WaitQueue::new() }; MAX_CPUS];
+pub(crate) static IO_WAIT: PerCpu<WaitQueue> = PerCpu::new(
+    "framekernel::storage::IO_WAIT",
+    WaitQueue::new(),
+    WaitQueue::new,
+);
 /// Per processor: completion interrupts taken there.
-static CPU_INTERRUPTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+pub(crate) static CPU_INTERRUPTS: PerCpu<AtomicU64> = PerCpu::new(
+    "framekernel::storage::CPU_INTERRUPTS",
+    AtomicU64::new(0),
+    || AtomicU64::new(0),
+);
 /// Per processor: completion interrupts taken there that found a thread waiting on its
 /// queue and woke it.
-static CPU_WAKES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+pub(crate) static CPU_WAKES: PerCpu<AtomicU64> =
+    PerCpu::new("framekernel::storage::CPU_WAKES", AtomicU64::new(0), || {
+        AtomicU64::new(0)
+    });
 /// Per processor: how often threads there blocked waiting for a completion.
-static CPU_BLOCKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+pub(crate) static CPU_BLOCKS: PerCpu<AtomicU64> = PerCpu::new(
+    "framekernel::storage::CPU_BLOCKS",
+    AtomicU64::new(0),
+    || AtomicU64::new(0),
+);
+/// The processors given an I/O queue of their own: the first this many in [`queue_order`]
+/// (ADR-0008 Amendment 1, D6).
+static QUEUED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 /// The CPU index the last completion interrupt arrived on, plus one (0: none yet).
 static INTERRUPT_CPU: AtomicU64 = AtomicU64::new(0);
@@ -387,6 +419,7 @@ pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
                     namespace,
                     test_disk,
                     msix: None,
+                    entries: Vec::new(),
                 });
             });
             (ok, test_disk)
@@ -403,8 +436,9 @@ pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
         return polled;
     }
     let interrupts = polled && prove_interrupts(com1, cpus, tsc_hz);
-    let per_cpu = interrupts && prove_per_cpu(com1, cpus, tsc_hz);
-    let x2apic = per_cpu && prove_x2apic(com1, cpus);
+    let (order, left_out) = queue_order(cpus);
+    let per_cpu = interrupts && prove_per_cpu(com1, &order, &left_out, tsc_hz);
+    let x2apic = per_cpu && prove_x2apic(com1, cpus, &order);
     x2apic && crate::block::prove(com1)
 }
 
@@ -529,15 +563,22 @@ fn bind(
         admin: new_queue(dma, 0, ADMIN_ENTRIES).ok_or("no memory for the admin queues")?,
         io: None,
         irq: None,
+        pairs: 0,
+        allocated: (0, 0),
+        bar_queues: 0,
     };
     c.cap = Capabilities::decode(c.read64(register::CAP));
+    c.bar_queues = nvme::doorbell_queues(c.cap.doorbell_stride, bar.size);
     // CAP is the device's word. Before the first command and its first doorbell: every
     // doorbell the driver will ring lies inside BAR 0 (the admin queues', queue pairs 1
-    // (polled), 2 (one interrupt) and one per processor).
-    let wanted = u16::try_from(2 + cpus).map_err(|_| "too many processors")?;
-    if !nvme::doorbells_fit(wanted, c.cap.doorbell_stride, bar.size) {
-        return Err("the queues' doorbells lie outside BAR 0");
-    }
+    // (polled), 2 (one interrupt) and one per processor while there is room: ADR-0008
+    // Amendment 1, D6). The processors past what BAR 0, the controller or its MSI-X vectors
+    // hold get no queue of their own.
+    let asked = u16::try_from(cpus.saturating_add(2)).unwrap_or(u16::MAX);
+    let wanted = (2..=asked)
+        .rev()
+        .find(|&q| nvme::doorbells_fit(q, c.cap.doorbell_stride, bar.size))
+        .ok_or("the queues' doorbells lie outside BAR 0")?;
     let (major, minor, tertiary) = nvme::version(c.read32(register::VS));
     let _ = writeln!(
         com1,
@@ -637,12 +678,15 @@ fn bind(
         })
         .map_err(failed)?;
     let (sqs, cqs) = nvme::allocated_queues(granted.result);
-    if !granted.status.ok() || sqs < u32::from(wanted) || cqs < u32::from(wanted) {
+    if !granted.status.ok() || sqs < 2 || cqs < 2 {
         return Err("the controller allocated too few I/O queues");
     }
+    c.allocated = (sqs, cqs);
+    c.pairs = u16::try_from(sqs.min(cqs)).unwrap_or(u16::MAX).min(wanted);
     let _ = writeln!(
         com1,
-        "origin-kernel: NVMe: asked for {wanted} I/O queue pairs, allocated {sqs} submission and {cqs} completion queues"
+        "origin-kernel: NVMe: asked for {wanted} I/O queue pairs, allocated {sqs} submission and {cqs} completion queues: {} for the processors' own",
+        c.pairs - 2
     );
     let io = new_queue(dma, 1, IO_ENTRIES).ok_or("no memory for the I/O queues")?;
     let (cq_bus, sq_bus) = (io.cq.bus().raw(), io.sq.bus().raw());
@@ -1119,31 +1163,68 @@ fn prove_io(
 
 /// One processor's own I/O queue pair, with its controller's doorbell addresses and a data
 /// page: only threads on that processor use it, so it never waits on another's lock.
-struct CpuQueue {
+pub(crate) struct CpuQueue {
     qp: QueuePair,
     page: DmaPage,
     regs: MmioRegion,
     stride: u64,
 }
 
-static CPU_QUEUES: [SpinLock<Option<CpuQueue>>; MAX_CPUS] =
-    [const { SpinLock::new(None) }; MAX_CPUS];
+pub(crate) static CPU_QUEUES: PerCpu<SpinLock<Option<CpuQueue>>> = PerCpu::new(
+    "framekernel::storage::CPU_QUEUES",
+    SpinLock::new(None),
+    || SpinLock::new(None),
+);
 
 /// Reads each processor's thread makes, of 8 blocks each.
 const CPU_READS: u64 = 32;
 /// Per processor: reads done, blocks matched, and whether its write read back (each plus
 /// one once set).
-static CPU_RESULT: [[AtomicU64; 3]; MAX_CPUS] =
-    [const { [const { AtomicU64::new(0) }; 3] }; MAX_CPUS];
+pub(crate) static CPU_RESULT: PerCpu<[AtomicU64; 3]> = PerCpu::new(
+    "framekernel::storage::CPU_RESULT",
+    [const { AtomicU64::new(0) }; 3],
+    || [const { AtomicU64::new(0) }; 3],
+);
 
-/// For each online processor `k` (by position in `cpus`): MSI-X entry `2 + k` sent to its
-/// APIC ID, and I/O queue pair `3 + k` completing to that entry.
-fn setup_cpu_queues(d: &mut Driver, cpus: &[CpuIndex]) -> Result<(), &'static str> {
-    let (table, msix) = d.msix.ok_or("MSI-X is not set up")?;
-    if usize::from(msix.entries) < 2 + cpus.len() {
-        return Err("too few MSI-X vectors for one per processor");
+/// The processors that may get I/O queues of their own, in the order they get them, and those
+/// left out because no MSI can reach them (`nvme::queue_order`): with interrupt remapping, the
+/// processors above APIC ID 255 first (review finding F1 of 2026-11-14); without it, those left
+/// out (review finding N1).
+fn queue_order(online: &[CpuIndex]) -> (Vec<CpuIndex>, Vec<CpuIndex>) {
+    nvme::queue_order(online, crate::iommu::remapping(), CpuIndex::apic_id)
+}
+
+/// The processors no MSI can reach, by name, for the per-processor line (review finding N1 of
+/// 2026-11-14): the first 16, then how many more. Empty when there are none.
+fn left_out_text(left_out: &[CpuIndex]) -> alloc::string::String {
+    let mut text = alloc::string::String::new();
+    if left_out.is_empty() {
+        return text;
     }
-    for (k, &cpu) in cpus.iter().enumerate() {
+    let _ = write!(
+        text,
+        "; {} left out, which no MSI reaches without interrupt remapping:",
+        left_out.len()
+    );
+    for (i, cpu) in left_out.iter().take(16).enumerate() {
+        let _ = write!(text, "{}{}", if i == 0 { " " } else { ", " }, cpu.named());
+    }
+    if left_out.len() > 16 {
+        let _ = write!(text, " and {} more", left_out.len() - 16);
+    }
+    text
+}
+
+/// For each processor `k` (by position in `cpus`, which is [`queue_order`]'s) while the
+/// controller has a queue pair and an MSI-X vector left (ADR-0008 Amendment 1, D6): MSI-X entry
+/// `2 + k` sent to its APIC ID, and I/O queue pair `3 + k` completing to that entry. Returns how
+/// many processors got one: the first that many of `cpus`.
+fn setup_cpu_queues(d: &mut Driver, cpus: &[CpuIndex]) -> Result<usize, &'static str> {
+    let (table, msix) = d.msix.ok_or("MSI-X is not set up")?;
+    let vectors = usize::from(msix.entries).saturating_sub(2);
+    let pairs = usize::from(d.nvme.pairs).saturating_sub(2);
+    let given = cpus.len().min(vectors).min(pairs);
+    for (k, &cpu) in cpus.iter().enumerate().take(given) {
         let vector = 2 + k as u16;
         let qid = 3 + k as u16;
         let apic_id = cpu.apic_id().ok_or("a processor has no APIC ID")?;
@@ -1159,6 +1240,7 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[CpuIndex]) -> Result<(), &'static st
         entry(1, (message.address >> 32) as u32);
         entry(2, message.data);
         entry(3, 0);
+        d.entries.push(cpu);
         let queue =
             new_queue(d.nvme.dma, qid, IO_ENTRIES).ok_or("no memory for a per-processor queue")?;
         let page = d
@@ -1192,8 +1274,9 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[CpuIndex]) -> Result<(), &'static st
                 stride: d.nvme.cap.doorbell_stride,
             });
         });
+        QUEUED.store(k + 1, Ordering::Relaxed);
     }
-    Ok(())
+    Ok(given)
 }
 
 /// One command on this processor's own queue: submitted under its lock, then waited for by
@@ -1316,20 +1399,88 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
     crate::sched::exit()
 }
 
-/// Every online processor reads and writes through its own queue pair and vector at the
-/// same time: every read must match, every write read back, and each processor's
-/// interrupts must have arrived on that processor.
-fn prove_per_cpu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
-    let setup = with_driver_out(|d| setup_cpu_queues(d, cpus)).unwrap_or(Err("no driver"));
-    if let Err(why) = setup {
+/// Every processor given a queue pair and vector of its own reads and writes through them at the
+/// same time: every read must match, every write read back, and each processor's interrupts
+/// must have arrived on that processor. `order` is every online processor an MSI can reach, in
+/// [`queue_order`]'s order, and `left_out` those it cannot (review finding N1). How many get a queue is judged on the controller's own numbers, and
+/// the slots actually filled are counted (review findings F3 and F5 of 2026-11-14).
+fn prove_per_cpu(
+    com1: &mut Console,
+    order: &[CpuIndex],
+    left_out: &[CpuIndex],
+    tsc_hz: u64,
+) -> bool {
+    let Some((setup, own)) = with_driver_out(|d| {
+        let own = (
+            d.nvme.allocated.0,
+            d.nvme.allocated.1,
+            d.msix.map_or(0, |(_, m)| u32::from(m.entries)),
+            d.nvme.bar_queues,
+        );
+        (setup_cpu_queues(d, order), own)
+    }) else {
         let _ = writeln!(
             com1,
-            "origin-kernel: NVMe: per-CPU queues: {why}: NVMe failed"
+            "origin-kernel: NVMe: per-CPU queues: no driver: NVMe failed"
         );
         return false;
+    };
+    let given = match setup {
+        Ok(given) => given,
+        Err(why) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: NVMe: per-CPU queues: {why}: NVMe failed"
+            );
+            return false;
+        }
+    };
+    let (sqs, cqs, vectors, bar_queues) = own;
+    let expected = nvme::per_cpu_queues(order.len(), vectors, sqs, cqs, bar_queues);
+    let filled = order
+        .iter()
+        .filter(|c| {
+            CPU_QUEUES
+                .get(c.get())
+                .is_some_and(|slot| crate::cpu::without_interrupts(|| slot.lock().is_some()))
+        })
+        .count();
+    let numbers = alloc::format!(
+        "the controller allocated {sqs} submission and {cqs} completion queues, has {vectors} MSI-X vectors, and BAR 0 holds the doorbells of {bar_queues} I/O queues; the driver keeps 2 of each"
+    );
+    // A valid controller with no pair, vector or doorbell past the driver's two gives no
+    // processor a queue of its own: not proven, and nothing wrong (the coordinating session's
+    // rulings of 2026-11-14, as `irq::prove` treats an 8254 that does not count).
+    // The processors no MSI can reach are counted and named, and left out of `expected` (N1).
+    let left = left_out_text(left_out);
+    if expected == 0 && given == 0 && filled == 0 {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: NVMe: per-CPU queues: not proven: {numbers}{left}"
+        );
+        return true;
     }
-    let before: [u64; MAX_CPUS] =
-        core::array::from_fn(|i| CPU_INTERRUPTS[i].load(Ordering::Relaxed));
+    // ADR-0008 Amendment 1, D6: the processors with a queue of their own are proven; the rest
+    // are counted. Sharing queues is the block layer's (M5).
+    let consistent = expected > 0 && given == expected && filled == expected;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: NVMe: per-CPU queues: {given} of {} processors have an I/O queue pair and MSI-X vector of their own, {} have none ({numbers}): {expected} expected, {filled} filled{left}{}",
+        order.len() + left_out.len(),
+        (order.len() + left_out.len()).saturating_sub(given),
+        if consistent { "" } else { ": NVMe failed" }
+    );
+    if !consistent {
+        return false;
+    }
+    let cpus = order.get(..given).unwrap_or(&[]);
+    let before: alloc::vec::Vec<u64> = (0..crate::cpu::count())
+        .map(|i| {
+            CPU_INTERRUPTS
+                .get(i)
+                .map_or(0, |n| n.load(Ordering::Relaxed))
+        })
+        .collect();
     let start = crate::cpu::rdtsc();
     for (k, &cpu) in cpus.iter().enumerate() {
         if crate::sched::spawn(cpu, cpu_io_thread, k as u64).is_err() {
@@ -1402,16 +1553,37 @@ fn prove_per_cpu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
 ///   nobody, and the thread would sleep until its deadline instead.
 ///
 /// With no such processor (APIC IDs 0-255) there is nothing beyond compatibility format to
-/// prove; that is reported, and passes.
-fn prove_x2apic(com1: &mut Console, cpus: &[CpuIndex]) -> bool {
+/// prove; that is reported, and passes. `cpus` is in [`queue_order`]'s order: with remapping the
+/// processors above 255 are the first to get queues (review finding F1 of 2026-11-14), and only a
+/// controller with none past the driver's leaves them unproven; without it they are left out, no
+/// MSI can reach them, and that is reported, and passes (review finding N1). `online` is every
+/// online processor.
+fn prove_x2apic(com1: &mut Console, online: &[CpuIndex], cpus: &[CpuIndex]) -> bool {
+    // Only the processors with an NVMe queue of their own can be proven through it (D6). Those
+    // above 255 are counted among every online processor, since without remapping they are not
+    // in `cpus` at all (review finding N1).
+    let queued = QUEUED.load(Ordering::Relaxed);
+    let all_wide = online
+        .iter()
+        .filter(|c| c.apic_id().is_some_and(|id| id > 0xFF))
+        .count();
     let wide: Vec<(usize, CpuIndex, u32)> = cpus
         .iter()
+        .take(queued)
         .enumerate()
         .filter_map(|(k, &c)| c.apic_id().map(|id| (k, c, id)))
         .filter(|&(_, _, id)| id > 0xFF)
         .collect();
+    let wide_without = all_wide - wide.len();
+    if wide.is_empty() && wide_without > 0 {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: x2APIC: {wide_without} online processors have an APIC ID above 255 and no NVMe queue of their own (ADR-0008 Amendment 1, D6): nothing to prove through NVMe"
+        );
+        return true;
+    }
     if wide.is_empty() {
-        let largest = cpus.iter().filter_map(|c| c.apic_id()).max().unwrap_or(0);
+        let largest = online.iter().filter_map(|c| c.apic_id()).max().unwrap_or(0);
         let _ = writeln!(
             com1,
             "origin-kernel: x2APIC: no online processor has an APIC ID above 255 (the largest is {largest}): nothing beyond compatibility-format MSI to prove"
@@ -1440,7 +1612,7 @@ fn prove_x2apic(com1: &mut Console, cpus: &[CpuIndex]) -> bool {
         let irte = vtd::interrupt_index(message);
         let c = cpu.get();
         let read =
-            |counts: &[AtomicU64; MAX_CPUS]| counts.get(c).map_or(0, |n| n.load(Ordering::Relaxed));
+            |counts: &PerCpu<AtomicU64>| counts.get(c).map_or(0, |n| n.load(Ordering::Relaxed));
         let (interrupts, blocks, wakes) =
             (read(&CPU_INTERRUPTS), read(&CPU_BLOCKS), read(&CPU_WAKES));
         let mine =
@@ -1537,11 +1709,12 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
                 d.msix,
                 d.page.bus().raw(),
                 d.test_disk,
+                d.entries.clone(),
             )
         })
     });
     let on = crate::iommu::translating();
-    let Some((dma, at, msix, irq_page, on_test_disk)) = driver else {
+    let Some((dma, at, msix, irq_page, on_test_disk, entries)) = driver else {
         let _ = writeln!(
             com1,
             "origin-kernel: IOMMU: no NVMe controller is bound, so the proofs through one did not run"
@@ -1656,10 +1829,11 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
             crate::cpu::DEVICE_VECTOR,
             apic(target),
         ));
-        // Only the entries the table has: a table too short for one per processor
-        // (`setup_cpu_queues` refused it) leaves `nvme_routes` short, and the proof fails.
+        // Every entry `setup_cpu_queues` wrote, each recorded as it was written, a queue later
+        // refused or not (ADR-0008 Amendment 1, D6; review finding F4 of 2026-11-14), never
+        // more than the table has.
         let per_cpu = usize::from(capability.entries).saturating_sub(2);
-        for (k, &cpu) in cpus.iter().enumerate().take(per_cpu) {
+        for (k, &cpu) in entries.iter().enumerate().take(per_cpu) {
             let entry = 2 + k as u64;
             routes.push((
                 at,
@@ -1684,7 +1858,7 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
     let released = wide_route.is_some_and(|r| crate::iommu::release_interrupt(at, r.index).is_ok());
     let (_, irtes) = crate::iommu::domains();
     let remapped = crate::iommu::remapping()
-        && nvme_routes == 1 + cpus.len()
+        && nvme_routes == 1 + entries.len()
         && routes.len() == nvme_routes + 2
         && through == routes.len()
         && refused

@@ -378,74 +378,190 @@ pub trait Rounds {
     fn lost(&mut self);
 }
 
-/// The shootdown state of a machine with up to `CPUS` processors.
-pub struct Shootdown<const CPUS: usize> {
+/// One processor's part in the protocol, on a cache line of its own (ADR-0008 Amendment 1, D1):
+/// the processor writes everything here but `online`, and no other processor's writes share the
+/// line.
+#[repr(align(64))]
+#[derive(Debug)]
+pub struct Record {
+    /// The last generation this processor served.
+    served: prim::AtomicU64,
+    /// Whether it takes requests.
+    online: prim::AtomicBool,
+    /// Its current address-space root (0 before its first switch).
+    loaded: prim::AtomicU64,
+    /// The root it is switching away from, while its switch is in flight (else 0).
+    leaving: prim::AtomicU64,
+    /// The root it is visiting, without leaving `loaded` (else 0): see [`Shootdown::visit`].
+    visiting: prim::AtomicU64,
+}
+
+impl Record {
+    /// Not online, nothing served and no space loaded.
+    #[cfg(not(all(test, loom)))]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            served: prim::AtomicU64::new(0),
+            online: prim::AtomicBool::new(false),
+            loaded: prim::AtomicU64::new(0),
+            leaving: prim::AtomicU64::new(0),
+            visiting: prim::AtomicU64::new(0),
+        }
+    }
+
+    /// Not online, nothing served and no space loaded. Loom's atomics cannot be built in a
+    /// `const`.
+    #[cfg(all(test, loom))]
+    pub fn new() -> Self {
+        Self {
+            served: prim::AtomicU64::new(0),
+            online: prim::AtomicBool::new(false),
+            loaded: prim::AtomicU64::new(0),
+            leaving: prim::AtomicU64::new(0),
+            visiting: prim::AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for Record {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The initiator's mark for one processor: whether the request in progress asked it. Only the
+/// processor holding the turn reads or writes a mark, and it clears every mark it set before it
+/// gives the turn up. The turn is the lock that orders one holder's marks before the next's, so a
+/// mark is a plain atomic even under Loom: it is no point the models need to interleave, and the
+/// turn itself is modelled.
+#[derive(Debug)]
+pub struct Asked(core::sync::atomic::AtomicBool);
+
+impl Asked {
+    /// Not asked.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(core::sync::atomic::AtomicBool::new(false))
+    }
+}
+
+impl Default for Asked {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Where a [`Shootdown`] keeps what it holds for each processor: storage for a number of
+/// processors fixed once, before any processor but the first is online (ADR-0008 Amendment 1,
+/// D1). The kernel's is sized when the processors are discovered; the tests' and the models'
+/// are vectors.
+pub trait Records {
+    /// How many processors there is storage for: indexes `0..count()`.
+    fn count(&self) -> usize;
+
+    /// Processor `cpu`'s record: `Some` for every `cpu` below [`Records::count`].
+    fn record(&self, cpu: usize) -> Option<&Record>;
+
+    /// Processor `cpu`'s mark: `Some` for every `cpu` below [`Records::count`].
+    fn asked(&self, cpu: usize) -> Option<&Asked>;
+}
+
+/// The shootdown state of a machine, its per-processor part in `S`.
+pub struct Shootdown<S> {
     /// Held by the processor whose request is in progress.
     turn: SpinLock<()>,
     /// The request in progress ([`Request::encode`]).
     request: prim::AtomicU64,
     /// The latest request's generation (the first is 1).
     generation: prim::AtomicU64,
-    /// The last generation each processor served.
-    served: [prim::AtomicU64; CPUS],
-    /// Which processors take requests.
-    online: [prim::AtomicBool; CPUS],
-    /// Each processor's current address-space root (0 before its first switch).
-    loaded: [prim::AtomicU64; CPUS],
-    /// The root a processor is switching away from, while its switch is in flight (else 0).
-    leaving: [prim::AtomicU64; CPUS],
-    /// The root a processor is visiting, without leaving `loaded` (else 0): see
-    /// [`Shootdown::visit`].
-    visiting: [prim::AtomicU64; CPUS],
+    /// Each processor's [`Record`] and [`Asked`] mark.
+    records: S,
 }
 
-impl<const CPUS: usize> core::fmt::Debug for Shootdown<CPUS> {
+impl<S> core::fmt::Debug for Shootdown<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Shootdown").finish_non_exhaustive()
     }
 }
 
-impl<const CPUS: usize> Shootdown<CPUS> {
-    /// No processor online, and no request made.
+impl<S> Shootdown<S> {
+    /// No processor online, and no request made, with each processor's state in `records`.
     #[cfg(not(all(test, loom)))]
     #[must_use]
-    pub const fn new() -> Self {
+    pub const fn new(records: S) -> Self {
         Self {
             turn: SpinLock::new(()),
             request: prim::AtomicU64::new(0),
             generation: prim::AtomicU64::new(0),
-            served: [const { prim::AtomicU64::new(0) }; CPUS],
-            online: [const { prim::AtomicBool::new(false) }; CPUS],
-            loaded: [const { prim::AtomicU64::new(0) }; CPUS],
-            leaving: [const { prim::AtomicU64::new(0) }; CPUS],
-            visiting: [const { prim::AtomicU64::new(0) }; CPUS],
+            records,
         }
     }
 
-    /// No processor online, and no request made. Loom's atomics cannot be built in a `const`.
+    /// No processor online, and no request made, with each processor's state in `records`.
+    /// Loom's atomics cannot be built in a `const`.
     #[cfg(all(test, loom))]
-    pub fn new() -> Self {
+    pub fn new(records: S) -> Self {
         Self {
             turn: SpinLock::new(()),
             request: prim::AtomicU64::new(0),
             generation: prim::AtomicU64::new(0),
-            served: core::array::from_fn(|_| prim::AtomicU64::new(0)),
-            online: core::array::from_fn(|_| prim::AtomicBool::new(false)),
-            loaded: core::array::from_fn(|_| prim::AtomicU64::new(0)),
-            leaving: core::array::from_fn(|_| prim::AtomicU64::new(0)),
-            visiting: core::array::from_fn(|_| prim::AtomicU64::new(0)),
+            records,
         }
+    }
+
+    /// Where each processor's state is.
+    pub const fn records(&self) -> &S {
+        &self.records
+    }
+}
+
+impl<S: Records> Shootdown<S> {
+    /// The last generation processor `id` served.
+    fn served(&self, id: usize) -> Option<&prim::AtomicU64> {
+        self.records.record(id).map(|r| &r.served)
+    }
+
+    /// Whether processor `id` takes requests.
+    fn online(&self, id: usize) -> Option<&prim::AtomicBool> {
+        self.records.record(id).map(|r| &r.online)
+    }
+
+    /// Processor `id`'s current root.
+    fn loaded(&self, id: usize) -> Option<&prim::AtomicU64> {
+        self.records.record(id).map(|r| &r.loaded)
+    }
+
+    /// The root processor `id` is leaving.
+    fn leaving(&self, id: usize) -> Option<&prim::AtomicU64> {
+        self.records.record(id).map(|r| &r.leaving)
+    }
+
+    /// The root processor `id` is visiting.
+    fn visiting(&self, id: usize) -> Option<&prim::AtomicU64> {
+        self.records.record(id).map(|r| &r.visiting)
+    }
+
+    /// Whether processor `id` has a record: only then can it be asked to flush.
+    pub fn has_record(&self, id: usize) -> bool {
+        self.records.record(id).is_some()
     }
 
     /// Makes this processor a target of later requests, then flushes its whole TLB, so it holds
     /// no translation older than the first request it is sent. In that order: a request whose
     /// initiator does not yet see this processor online was made before the flush.
-    pub fn mark_online(&self, hardware: &impl TlbHardware) {
-        if let Some(online) = self.online.get(hardware.this_cpu()) {
-            online.store(true, Ordering::Release);
-        }
+    ///
+    /// Returns whether it has a record. One that has none cannot be made a target, so it would
+    /// never be asked to flush and an address space could be freed under it: nothing is done,
+    /// and the caller must keep it out (review finding F6 of 2026-11-14).
+    pub fn mark_online(&self, hardware: &impl TlbHardware) -> bool {
+        let Some(online) = self.online(hardware.this_cpu()) else {
+            return false;
+        };
+        online.store(true, Ordering::Release);
         prim::fence(Ordering::SeqCst);
         hardware.invalidate(Request::Everything);
+        true
     }
 
     /// Moves this processor to the address space `to`, by running `load` (the CR3 write), and
@@ -473,15 +589,15 @@ impl<const CPUS: usize> Shootdown<CPUS> {
         if from == to {
             return;
         }
-        if let Some(leaving) = self.leaving.get(me) {
+        if let Some(leaving) = self.leaving(me) {
             leaving.store(from, Ordering::Release);
         }
-        if let Some(loaded) = self.loaded.get(me) {
+        if let Some(loaded) = self.loaded(me) {
             loaded.store(to, Ordering::Release);
         }
         prim::fence(Ordering::SeqCst);
         load();
-        if let Some(leaving) = self.leaving.get(me) {
+        if let Some(leaving) = self.leaving(me) {
             leaving.store(0, Ordering::Release);
         }
     }
@@ -508,7 +624,7 @@ impl<const CPUS: usize> Shootdown<CPUS> {
             if home == visiting {
                 return f();
             }
-            let slot = self.visiting.get(hardware.this_cpu());
+            let slot = self.visiting(hardware.this_cpu());
             if let Some(slot) = slot {
                 slot.store(visiting, Ordering::Release);
             }
@@ -529,22 +645,21 @@ impl<const CPUS: usize> Shootdown<CPUS> {
     ///
     /// [`switch_space`]: Self::switch_space
     fn holds(&self, id: usize, root: u64) -> bool {
-        self.loaded
-            .get(id)
+        self.loaded(id)
             .is_some_and(|loaded| loaded.load(Ordering::Acquire) == root)
             || self
-                .leaving
-                .get(id)
+                .leaving(id)
                 .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
             || self
-                .visiting
-                .get(id)
+                .visiting(id)
                 .is_some_and(|visiting| visiting.load(Ordering::Acquire) == root)
     }
 
     /// How many processors have the address space `root` loaded.
     pub fn processors_holding(&self, root: u64) -> u32 {
-        (0..CPUS).filter(|&id| self.holds(id, root)).count() as u32
+        (0..self.records.count())
+            .filter(|&id| self.holds(id, root))
+            .count() as u32
     }
 
     /// Serves the request in progress, if this processor has not yet. Called from the
@@ -553,7 +668,7 @@ impl<const CPUS: usize> Shootdown<CPUS> {
         // With interrupts off, so that the record below only ever goes forward: a request's
         // interrupt arriving between the comparison and the store would otherwise be overwritten.
         hardware.without_interrupts(|| {
-            let Some(served) = self.served.get(hardware.this_cpu()) else {
+            let Some(served) = self.served(hardware.this_cpu()) else {
                 return;
             };
             // Acquire: the request read below is the one this generation published (its
@@ -570,8 +685,7 @@ impl<const CPUS: usize> Shootdown<CPUS> {
 
     /// Whether processor `id` must answer a request for `scope` made now.
     fn must_answer(&self, id: usize, scope: Scope) -> bool {
-        self.online
-            .get(id)
+        self.online(id)
             .is_some_and(|online| online.load(Ordering::Acquire))
             && match scope {
                 Scope::Kernel => true,
@@ -607,18 +721,38 @@ impl<const CPUS: usize> Shootdown<CPUS> {
             // ruled out: a processor not yet online flushes after this, and one not yet in the
             // space walks its tables after this (`mark_online`, `switch_space`).
             prim::fence(Ordering::SeqCst);
-            let mut targets = [false; CPUS];
+            let count = self.records.count();
             let mut processors = 0;
-            for (id, target) in targets.iter_mut().enumerate() {
+            // A processor that must answer and has no mark could not be waited for: a stall,
+            // never a skip.
+            let mut stalled = None;
+            for id in 0..count {
                 if id != me && self.must_answer(id, scope) {
-                    *target = true;
+                    let Some(asked) = self.records.asked(id) else {
+                        stalled.get_or_insert(Stalled { cpu: id });
+                        continue;
+                    };
+                    asked.0.store(true, Ordering::Relaxed);
                     processors += 1;
                     hardware.send_ipi(id);
                 }
             }
+            // Every mark set above is cleared here, the processor that stalled and those after it
+            // included, so the next initiator starts with none.
             let patience = hardware.patience();
-            for (id, (&target, served)) in targets.iter().zip(&self.served).enumerate() {
-                if !target {
+            for target in 0..count {
+                let Some(asked) = self.records.asked(target) else {
+                    continue;
+                };
+                if !asked.0.load(Ordering::Relaxed) {
+                    continue;
+                }
+                asked.0.store(false, Ordering::Relaxed);
+                let Some(served) = self.served(target) else {
+                    stalled.get_or_insert(Stalled { cpu: target });
+                    continue;
+                };
+                if stalled.is_some() {
                     continue;
                 }
                 while served.load(Ordering::Acquire) < generation {
@@ -626,21 +760,25 @@ impl<const CPUS: usize> Shootdown<CPUS> {
                         // Looked at once more: this processor may have been the one away.
                         && served.load(Ordering::Acquire) < generation
                     {
-                        return Err(Stalled { cpu: id });
+                        stalled = Some(Stalled { cpu: target });
+                        break;
                     }
                     prim::spin_loop();
                 }
             }
             drop(turn);
-            Ok(Completed {
-                processors,
-                ticks: hardware.now().wrapping_sub(start),
-            })
+            match stalled {
+                Some(stall) => Err(stall),
+                None => Ok(Completed {
+                    processors,
+                    ticks: hardware.now().wrapping_sub(start),
+                }),
+            }
         })
     }
 }
 
-impl<const CPUS: usize> Shootdown<CPUS> {
+impl<S: Records> Shootdown<S> {
     /// The deferred free: `value` is what the caller has just taken out of the page tables
     /// (`request` and `scope` say which translations can still lead to it), and `release` gets it
     /// back only once no processor can reach it any more.
@@ -669,9 +807,43 @@ impl<const CPUS: usize> Shootdown<CPUS> {
     }
 }
 
-impl<const CPUS: usize> Default for Shootdown<CPUS> {
-    fn default() -> Self {
-        Self::new()
+/// Records in vectors, for the host tests and the Loom models: a machine whose number of
+/// processors is known only at run time.
+#[cfg(test)]
+pub(crate) struct Held {
+    records: alloc::vec::Vec<Record>,
+    asked: alloc::vec::Vec<Asked>,
+}
+
+#[cfg(test)]
+impl Held {
+    /// Storage for `count` processors, none online.
+    pub(crate) fn new(count: usize) -> Self {
+        Self::with_marks(count, count)
+    }
+
+    /// Storage for `count` processors with marks for only the first `marks`: storage that breaks
+    /// [`Records`]' contract, to show that a processor with no mark is a stall, never a skip.
+    pub(crate) fn with_marks(count: usize, marks: usize) -> Self {
+        Self {
+            records: (0..count).map(|_| Record::new()).collect(),
+            asked: (0..marks).map(|_| Asked::new()).collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Records for Held {
+    fn count(&self) -> usize {
+        self.records.len()
+    }
+
+    fn record(&self, cpu: usize) -> Option<&Record> {
+        self.records.get(cpu)
+    }
+
+    fn asked(&self, cpu: usize) -> Option<&Asked> {
+        self.asked.get(cpu)
     }
 }
 
@@ -742,12 +914,7 @@ mod tests {
     }
 
     /// Switches `cpu` to `to` through `shootdown`, the CR3 write running `during` too.
-    fn switch<const N: usize>(
-        shootdown: &Shootdown<N>,
-        cpu: &Cpu<'_>,
-        to: u64,
-        during: impl FnOnce(),
-    ) {
+    fn switch(shootdown: &Shootdown<Held>, cpu: &Cpu<'_>, to: u64, during: impl FnOnce()) {
         shootdown.switch_space(cpu, to, || {
             cpu.machine.cr3[cpu.id].store(to, Ordering::Relaxed);
             during();
@@ -826,10 +993,27 @@ mod tests {
         );
     }
 
+    /// Review finding F6 of 2026-11-14: a processor with no record is not made a target and
+    /// says so, so that it can be kept out.
+    #[test]
+    fn a_processor_with_no_record_cannot_come_online() {
+        let machine = Machine::default();
+        let shootdown = Shootdown::new(Held::new(2));
+        assert!(shootdown.has_record(1));
+        assert!(!shootdown.has_record(2));
+        assert!(shootdown.mark_online(&cpu(1, &machine)));
+        assert!(!shootdown.mark_online(&cpu(2, &machine)));
+        assert_eq!(
+            *machine.invalidated.lock().unwrap(),
+            [(1, Request::Everything)],
+            "the one without a record did nothing"
+        );
+    }
+
     #[test]
     fn with_no_other_processor_it_is_local_and_needs_nobody() {
         let machine = Machine::default();
-        let shootdown = Shootdown::<4>::new();
+        let shootdown = Shootdown::new(Held::new(4));
         shootdown.mark_online(&cpu(0, &machine));
         let done = shootdown
             .shoot(&cpu(0, &machine), Request::page(0x1000), Scope::Kernel)
@@ -847,7 +1031,7 @@ mod tests {
     #[test]
     fn a_processor_comes_online_before_its_first_flush() {
         struct Watching<'a> {
-            shootdown: &'a Shootdown<2>,
+            shootdown: &'a Shootdown<Held>,
             saw_online: &'a AtomicBool,
         }
         impl TlbHardware for Watching<'_> {
@@ -872,7 +1056,7 @@ mod tests {
                 0
             }
         }
-        let shootdown = Shootdown::<2>::new();
+        let shootdown = Shootdown::new(Held::new(2));
         let saw_online = AtomicBool::new(false);
         shootdown.mark_online(&Watching {
             shootdown: &shootdown,
@@ -884,7 +1068,7 @@ mod tests {
     #[test]
     fn every_online_processor_answers_and_the_rest_are_left_alone() {
         let machine = Machine::default();
-        let shootdown = Shootdown::<4>::new();
+        let shootdown = Shootdown::new(Held::new(4));
         for id in [0, 1, 2] {
             shootdown.mark_online(&cpu(id, &machine));
         }
@@ -924,7 +1108,7 @@ mod tests {
     fn a_processor_that_does_not_answer_is_named() {
         let machine = Machine::default();
         machine.ticking.store(true, Ordering::Relaxed);
-        let shootdown = Shootdown::<3>::new();
+        let shootdown = Shootdown::new(Held::new(3));
         shootdown.mark_online(&cpu(0, &machine));
         shootdown.mark_online(&cpu(2, &machine));
         let outcome = shootdown.shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Kernel);
@@ -940,7 +1124,7 @@ mod tests {
     fn initiators_never_wait_on_each_other() {
         const ROUNDS: u64 = 200;
         let machine = Machine::default();
-        let shootdown = Shootdown::<3>::new();
+        let shootdown = Shootdown::new(Held::new(3));
         for id in 0..3 {
             shootdown.mark_online(&cpu(id, &machine));
         }
@@ -972,7 +1156,7 @@ mod tests {
     #[test]
     fn a_switch_counts_as_holding_both_spaces_until_it_is_done() {
         let machine = Machine::default();
-        let shootdown = Shootdown::<3>::new();
+        let shootdown = Shootdown::new(Held::new(3));
         let (one, two) = (cpu(1, &machine), cpu(2, &machine));
         assert_eq!(shootdown.processors_holding(7), 0);
         switch(&shootdown, &one, 7, || {
@@ -999,7 +1183,7 @@ mod tests {
     #[test]
     fn a_visit_is_recorded_while_it_lasts_and_ends_where_it_began() {
         let machine = Machine::default();
-        let shootdown = Shootdown::<2>::new();
+        let shootdown = Shootdown::new(Held::new(2));
         let one = cpu(1, &machine);
         switch(&shootdown, &one, 7, || ());
         let load = |to: u64| machine.cr3[1].store(to, Ordering::Relaxed);
@@ -1038,7 +1222,7 @@ mod tests {
     #[test]
     fn a_switch_to_where_it_is_does_nothing() {
         let machine = Machine::default();
-        let shootdown = Shootdown::<2>::new();
+        let shootdown = Shootdown::new(Held::new(2));
         let one = cpu(1, &machine);
         switch(&shootdown, &one, 7, || ());
         let mut loaded_again = false;
@@ -1053,7 +1237,7 @@ mod tests {
     fn a_space_request_asks_only_the_processors_in_that_space() {
         const SPACE: u64 = 0x7000;
         let machine = Machine::default();
-        let shootdown = Shootdown::<4>::new();
+        let shootdown = Shootdown::new(Held::new(4));
         for id in 0..4 {
             shootdown.mark_online(&cpu(id, &machine));
         }
@@ -1094,7 +1278,7 @@ mod tests {
         const SPACE: u64 = 0x7000;
         let machine = Machine::default();
         machine.ticking.store(true, Ordering::Relaxed);
-        let shootdown = Shootdown::<2>::new();
+        let shootdown = Shootdown::new(Held::new(2));
         shootdown.mark_online(&cpu(0, &machine));
         shootdown.mark_online(&cpu(1, &machine));
         let one = cpu(1, &machine);
@@ -1121,7 +1305,7 @@ mod tests {
     fn a_space_request_never_interrupts_a_processor_that_is_not_online() {
         const SPACE: u64 = 0x7000;
         let machine = Machine::default();
-        let shootdown = Shootdown::<2>::new();
+        let shootdown = Shootdown::new(Held::new(2));
         shootdown.mark_online(&cpu(0, &machine));
         switch(&shootdown, &cpu(1, &machine), SPACE, || ());
         let done = shootdown
@@ -1145,7 +1329,7 @@ mod tests {
     #[test]
     fn a_retirement_releases_only_after_everyone_has_answered() {
         let machine = Machine::default();
-        let shootdown = Shootdown::<2>::new();
+        let shootdown = Shootdown::new(Held::new(2));
         shootdown.mark_online(&cpu(0, &machine));
         shootdown.mark_online(&cpu(1, &machine));
         let (released, dropped) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -1186,7 +1370,7 @@ mod tests {
     fn a_retirement_that_stalls_releases_nothing_and_leaks_the_value() {
         let machine = Machine::default();
         machine.ticking.store(true, Ordering::Relaxed);
-        let shootdown = Shootdown::<2>::new();
+        let shootdown = Shootdown::new(Held::new(2));
         shootdown.mark_online(&cpu(0, &machine));
         shootdown.mark_online(&cpu(1, &machine));
         let (released, dropped) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -1490,9 +1674,134 @@ mod tests {
         assert!(unconfirmed);
     }
 
+    /// Every processor `0..count` is online, and one thread answers for all of them but the
+    /// initiator, 0, until `shoot` returns; the outcome and every mark afterwards.
+    fn shoot_with_everyone_online(count: usize) -> (Result<Completed, Stalled>, Machine, bool) {
+        let machine = Machine::default();
+        let shootdown = Shootdown::new(Held::new(count));
+        for id in 0..count {
+            shootdown.mark_online(&cpu(id, &machine));
+        }
+        let stop = AtomicBool::new(false);
+        let done = thread::scope(|s| {
+            let (shootdown, machine, stop) = (&shootdown, &machine, &stop);
+            s.spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for id in 1..count {
+                        shootdown.service(&cpu(id, machine));
+                    }
+                    thread::yield_now();
+                }
+            });
+            let done = shootdown.shoot(&cpu(0, machine), Request::page(0x9000), Scope::Kernel);
+            stop.store(true, Ordering::Relaxed);
+            done
+        });
+        let marks_clear = (0..count).all(|id| {
+            !shootdown
+                .records()
+                .asked(id)
+                .unwrap()
+                .0
+                .load(Ordering::Relaxed)
+        });
+        (done, machine, marks_clear)
+    }
+
+    /// ADR-0008 Amendment 1, D1 and D7: the number of processors is the storage's, known only
+    /// at run time, and every one of them is asked, interrupted once and waited for.
+    #[test]
+    fn every_processor_answers_whatever_the_count() {
+        for count in [1, 3, 65, 300] {
+            let count = std::hint::black_box(count);
+            let (done, machine, marks_clear) = shoot_with_everyone_online(count);
+            let done = done.unwrap();
+            assert_eq!(done.processors as usize, count - 1, "{count} processors");
+            let ipis = machine.ipis.lock().unwrap();
+            assert_eq!(
+                *ipis,
+                (1..count).map(|id| (0, id)).collect::<Vec<_>>(),
+                "{count} processors: one interrupt each, in index order"
+            );
+            let invalidated = machine.invalidated.lock().unwrap();
+            for id in 0..count {
+                assert!(
+                    invalidated.contains(&(id, Request::page(0x9000))),
+                    "{count} processors: CPU {id}"
+                );
+            }
+            assert!(marks_clear, "{count} processors: a mark was left set");
+        }
+    }
+
+    /// A stall clears every mark the request set, the stalled processor's and those after it,
+    /// so the next request starts with none and asks again.
+    #[test]
+    fn a_stall_leaves_no_mark_behind() {
+        let machine = Machine::default();
+        machine.ticking.store(true, Ordering::Relaxed);
+        let shootdown = Shootdown::new(Held::new(5));
+        for id in [0, 2, 4] {
+            shootdown.mark_online(&cpu(id, &machine));
+        }
+        let outcome = shootdown.shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Kernel);
+        assert_eq!(outcome, Err(Stalled { cpu: 2 }));
+        for id in 0..5 {
+            let asked = shootdown.records().asked(id).unwrap();
+            assert!(!asked.0.load(Ordering::Relaxed), "CPU {id}'s mark");
+        }
+        let again = shootdown.shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Kernel);
+        assert_eq!(again, Err(Stalled { cpu: 2 }));
+        assert_eq!(
+            *machine.ipis.lock().unwrap(),
+            [(0, 2), (0, 4), (0, 2), (0, 4)]
+        );
+    }
+
+    /// A processor past the storage cannot come online and is never asked; a processor that
+    /// must answer and has no mark makes the request a stall, never a skip.
+    #[test]
+    fn storage_bounds_who_is_asked_and_a_missing_mark_is_a_stall() {
+        let machine = Machine::default();
+        let shootdown = Shootdown::new(Held::new(2));
+        shootdown.mark_online(&cpu(0, &machine));
+        shootdown.mark_online(&cpu(2, &machine));
+        assert!(!shootdown.must_answer(2, Scope::Kernel));
+        let done = shootdown
+            .shoot(&cpu(0, &machine), Request::page(0x1000), Scope::Kernel)
+            .unwrap();
+        assert_eq!(done.processors, 0);
+        assert!(machine.ipis.lock().unwrap().is_empty());
+
+        let machine = Machine::default();
+        let shootdown = Shootdown::new(Held::with_marks(3, 2));
+        for id in 0..3 {
+            shootdown.mark_online(&cpu(id, &machine));
+        }
+        let outcome = shootdown.shoot(&cpu(0, &machine), Request::page(0x1000), Scope::Kernel);
+        assert_eq!(outcome, Err(Stalled { cpu: 2 }));
+    }
+
     #[test]
     fn it_fits_a_kernel_static() {
-        static SHOOTDOWN: Shootdown<64> = Shootdown::new();
+        /// Records for a fixed machine, made in a `const` as the kernel's boot slots are.
+        struct Fixed([Record; 3], [Asked; 3]);
+        impl Records for Fixed {
+            fn count(&self) -> usize {
+                self.0.len()
+            }
+            fn record(&self, cpu: usize) -> Option<&Record> {
+                self.0.get(cpu)
+            }
+            fn asked(&self, cpu: usize) -> Option<&Asked> {
+                self.1.get(cpu)
+            }
+        }
+        static SHOOTDOWN: Shootdown<Fixed> = Shootdown::new(Fixed(
+            [const { Record::new() }; 3],
+            [const { Asked::new() }; 3],
+        ));
         assert_eq!(SHOOTDOWN.generation.load(Ordering::Relaxed), 0);
+        assert_eq!(SHOOTDOWN.records().count(), 3);
     }
 }
