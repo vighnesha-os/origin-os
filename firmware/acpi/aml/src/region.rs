@@ -15,10 +15,10 @@
 //!   one host transfer of the space's data buffer, with the field's access attribute and its
 //!   `Connection`; the result is the buffer the host filled.
 //! - **GeneralPurposeIO and PCC**: one host transfer of the field's bytes.
-//! - **PCI_Config regions** name their function: the segment and bus of the PCI root bridge above
-//!   them (`_SEG`, `_BBN`), a bridge's secondary bus read for each bridge between, and the
-//!   function's `_ADR`, found before the first access by frames on the engine's stack (`pci.rs`)
-//!   and kept.
+//! - **PCI_Config regions** name their function: the `_ADR` of the nearest `Device` above the
+//!   region, the segment and bus of the PCI root bridge above that (`_SEG`, `_BBN`), and a
+//!   bridge's secondary bus for each device with an `_ADR` between, found before the first access
+//!   by frames on the engine's stack (`pci.rs`) and kept.
 //! - A field with the `Lock` rule takes the Global Lock around its access.
 //!
 //! Whether the region may be touched at all is the host's decision (ADR-0019 A2; `host.rs`).
