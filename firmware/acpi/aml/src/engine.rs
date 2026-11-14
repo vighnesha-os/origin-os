@@ -408,7 +408,14 @@ impl<H: Host> Interpreter<H> {
         self.calls.truncate(calls);
         while self.owners.len() > owners {
             if let Some(ctx) = self.owners.pop() {
-                self.ns.remove_list(&ctx.created);
+                #[cfg(test)]
+                let planted = crate::tests::planted(crate::tests::Fault::SkipRollback)
+                    && matches!(ctx.owner, Owner::Table(_));
+                #[cfg(not(test))]
+                let planted = false;
+                if !planted {
+                    self.ns.remove_list(&ctx.created);
+                }
                 mem::release(ctx.created, &mut self.budget);
             }
         }
@@ -464,6 +471,8 @@ impl<H: Host> Interpreter<H> {
     /// Ends the newest creator: a method's names are removed (`remove`), a table's kept.
     pub(crate) fn pop_owner(&mut self, remove: bool) {
         if let Some(ctx) = self.owners.pop() {
+            #[cfg(test)]
+            let remove = remove && !crate::tests::planted(crate::tests::Fault::KeepDynamicNames);
             if remove {
                 self.ns.remove_list(&ctx.created);
             }
@@ -537,6 +546,10 @@ impl<H: Host> Interpreter<H> {
     }
 
     pub(crate) fn check_time(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if crate::tests::planted(crate::tests::Fault::NoTimeLimit) {
+            return Ok(());
+        }
         let now = self.host.now_100ns();
         if now.saturating_sub(self.run.started) > self.config.limits.time_100ns {
             return err(ErrorKind::Limit(Limit::Time));
@@ -1165,6 +1178,10 @@ impl<H: Host> Interpreter<H> {
     /// A `While`'s body ended (or `Continue`): evaluate its predicate again.
     fn repeat_while(&mut self, end: u32, pred: u32) -> Result<()> {
         self.run.loops = self.run.loops.saturating_add(1);
+        #[cfg(test)]
+        if crate::tests::planted(crate::tests::Fault::NoLoopLimit) {
+            self.run.loops = 0;
+        }
         if self.run.loops > self.config.limits.loop_iterations {
             return err(ErrorKind::Limit(Limit::Loops));
         }

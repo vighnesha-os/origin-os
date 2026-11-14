@@ -73,6 +73,11 @@ impl<H: Host> Interpreter<H> {
             {
                 m.depth = 0;
             }
+            #[cfg(test)]
+            let h = Held {
+                global: h.global && !crate::tests::planted(crate::tests::Fault::KeepGlobalLock),
+                ..h
+            };
             if h.global {
                 // Nothing to do on failure: the evaluation is over either way.
                 let _ = self.host.release_global_lock();

@@ -62,7 +62,17 @@ impl Budget {
     /// Charges `bytes`, or refuses them if the limit would be passed.
     fn charge(&mut self, bytes: usize) -> Result<()> {
         let used = self.used.checked_add(bytes).ok_or_else(memory)?;
-        if used > self.limit {
+        // Planted, the limit is checked at twice its value: weakened, not removed, so that a
+        // test planting it never asks the machine for more than twice the limit.
+        #[cfg(test)]
+        let used_checked = if crate::tests::planted(crate::tests::Fault::LooseMemoryLimit) {
+            used / 2
+        } else {
+            used
+        };
+        #[cfg(not(test))]
+        let used_checked = used;
+        if used_checked > self.limit {
             return Err(memory());
         }
         self.used = used;

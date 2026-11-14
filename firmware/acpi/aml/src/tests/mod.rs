@@ -193,11 +193,22 @@ thread_local! {
         const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
 }
 
+thread_local! {
+    /// How many operations the engine has run on this thread (each call of [`ran`]).
+    static OPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Called by the engine: `code` was run (decoded and, for an operator, completed).
 pub(crate) fn ran(code: u16) {
     RAN.with(|r| {
         r.borrow_mut().insert(code);
     });
+    OPS.with(|n| n.set(n.get().saturating_add(1)));
+}
+
+/// The operations run on this thread since the last call.
+pub(crate) fn take_ops() -> u64 {
+    OPS.with(|n| n.replace(0))
 }
 
 /// What has run on this thread, and starts afresh.
@@ -225,6 +236,40 @@ pub(crate) fn note_drift(counted: usize, held: usize) {
 /// The drift noted on this thread, and starts afresh.
 pub(crate) fn take_drift() -> (usize, usize) {
     DRIFT.with(|d| d.replace((0, 0)))
+}
+
+/// A check the library makes, weakened on purpose by a test (the contract's §7; the review of B1,
+/// F4). `random.rs`'s control test plants each in turn and requires the randomized tests to fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// A failed load keeps the names it made (`engine.rs`, `unwind`).
+    SkipRollback,
+    /// A method's dynamic names stay when it returns (`engine.rs`, `pop_owner`).
+    KeepDynamicNames,
+    /// No limit on a `While`'s iterations (`engine.rs`, `repeat_while`).
+    NoLoopLimit,
+    /// The clock never ends an evaluation (`engine.rs`, `check_time`).
+    NoTimeLimit,
+    /// The memory limit is checked at twice its value (`mem.rs`, `Budget::charge`).
+    LooseMemoryLimit,
+    /// A buffer field may end a byte past its buffer (`exec.rs`, `create_field`).
+    WeakFieldBound,
+    /// The Global Lock is kept when an evaluation ends holding it (`sync.rs`, `release_held`).
+    KeepGlobalLock,
+}
+
+thread_local! {
+    static FAULT: std::cell::Cell<Option<Fault>> = const { std::cell::Cell::new(None) };
+}
+
+/// Called at each check: whether this thread planted `f`.
+pub(crate) fn planted(f: Fault) -> bool {
+    FAULT.with(|c| c.get() == Some(f))
+}
+
+/// Plants `f` on this thread (or none).
+pub(crate) fn plant(f: Option<Fault>) {
+    FAULT.with(|c| c.set(f));
 }
 
 pub(crate) type Interp = Interpreter<TestHost>;

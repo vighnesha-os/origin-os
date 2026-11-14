@@ -1046,6 +1046,12 @@ impl<H: Host> Interpreter<H> {
             .ok()
             .and_then(|n| n.checked_mul(8))
             .ok_or(ErrorKind::Range)?;
+        #[cfg(test)]
+        let have = if crate::tests::planted(crate::tests::Fault::WeakFieldBound) {
+            have.saturating_add(8)
+        } else {
+            have
+        };
         if bit_offset.checked_add(bit_len).is_none_or(|end| end > have) {
             return err(ErrorKind::Range);
         }
