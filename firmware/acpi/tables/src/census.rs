@@ -317,6 +317,20 @@ fn parse<'a>(table: &Table<'a>, tally: &mut Tally<'_, 'a>) -> Result<bool, Error
             let block = crate::definition::DefinitionBlock::parse(bytes)?;
             tally.bytes(header::HEADER_LEN, block.aml());
         }
+        b"SRAT" => crate::srat::Srat::parse(bytes)?.census(tally)?,
+        b"SLIT" => {
+            let slit = crate::platform::Slit::parse(bytes)?;
+            let _ = slit.localities();
+        }
+        b"SBST" => {
+            crate::platform::Sbst::parse(bytes)?;
+        }
+        b"ECDT" => {
+            let ecdt = crate::platform::Ecdt::parse(bytes)?;
+            tally.bytes(65, ecdt.id);
+        }
+        b"CPEP" => crate::platform::Cpep::parse(bytes)?.census(tally)?,
+        b"MSCT" => crate::platform::Msct::parse(bytes)?.census(tally)?,
         b"RSDT" | b"XSDT" => {
             for _ in crate::root::Root::parse(bytes)?.entries() {
                 tally.summary.count(0);

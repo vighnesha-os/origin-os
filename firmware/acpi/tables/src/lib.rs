@@ -32,8 +32,10 @@ pub mod fadt;
 pub mod gas;
 pub mod header;
 pub mod madt;
+pub mod platform;
 mod read;
 pub mod root;
+pub mod srat;
 mod walk;
 
 #[cfg(test)]

@@ -777,9 +777,7 @@ pub(crate) mod tests {
             put(t, 112, &(1u32 << 20).to_le_bytes());
             put(t, 36, &[0; 4]);
             put(t, 132, &[0; 8]);
-            for at in 46..=108 {
-                t[at] = 0xFF;
-            }
+            t[46..=108].fill(0xFF);
             put(t, 148, &[0xFF; 96]);
             put(t, 244, &gas(0, 8, 0, 1, 0xFED8_0000));
             put(t, 256, &gas(0, 8, 0, 1, 0xFED8_0004));
