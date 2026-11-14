@@ -262,6 +262,17 @@ impl<H: Host> Interpreter<H> {
             .saturating_sub(1)
             .checked_div(ubits)
             .ok_or(ErrorKind::Range)?;
+        // Every unit inside the region before the first is touched: a write that straddles the
+        // region's end is refused whole, never written in part (the review of B2, B2-8).
+        if let Path::Region(r) = path {
+            let span = last
+                .checked_add(1)
+                .and_then(|n| n.checked_mul(w))
+                .ok_or(ErrorKind::Range)?;
+            if span > r.length {
+                return err(ErrorKind::Range);
+            }
+        }
         let region_path = self.path_of_region(&path)?;
         let mut buf = mem::zeroed(bytes, &mut self.budget)?;
         if let Some(src) = write {

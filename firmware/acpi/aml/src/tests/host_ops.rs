@@ -1233,3 +1233,16 @@ fn a_wide_namespace_is_walked_without_a_collection_per_device() {
     assert!(took.as_secs() < 2, "{took:?}");
     eprintln!("20,100 devices walked in {took:?}");
 }
+
+#[test]
+fn a_field_straddling_its_region_is_refused_before_any_access() {
+    // The review of B2, B2-8: a 16-bit field from byte 3 of a 4-byte region, in byte units: the
+    // second unit is outside, so neither is written.
+    let mut i = loaded(&[
+        op_region("IO", 1, word(0x80), byte(4)),
+        field("IO", BYTE, &[Fe::Reserved(24), Fe::Named("ST", 16)]),
+        m("W", &[store(word(0xBEEF), nm("ST"))]),
+    ]);
+    assert_eq!(fails(&mut i, "W"), ErrorKind::Range);
+    assert!(i.host().seen.is_empty(), "{:?}", i.host().seen);
+}
