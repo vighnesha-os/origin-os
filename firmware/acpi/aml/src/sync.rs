@@ -10,8 +10,11 @@
 //! reports one, and without one it is refused ([`ErrorKind::WouldBlock`]).
 //!
 //! **Sync levels** (G2, strict until the reading session answers): an acquisition below the
-//! current level, or a release at another level, is an error; an evaluation that ends holding a
-//! mutex has every one released and reports [`ErrorKind::MutexHeld`].
+//! current level, or a release at another level, is an error. A method that returns holding a
+//! mutex it took has it released, and its return fails with [`ErrorKind::MutexHeld`], so its
+//! caller does not go on (the review of B2, B2-10). What has no method to return from, load-time
+//! code, is released when its evaluation ends, which reports the same error; and nothing,
+//! whatever `export` ran, outlives an evaluation (B2-6).
 
 use alloc::vec::Vec;
 
@@ -59,6 +62,34 @@ impl<H: Host> Interpreter<H> {
             },
             &mut self.budget,
         )
+    }
+
+    /// A method returns: the mutexes it took and did not release are released, and whether there
+    /// were any is returned, for its return to fail with `MutexHeld` (G2's strict choice, at the
+    /// method's return and not only the evaluation's end: the review of B2, B2-10).
+    pub(crate) fn release_call_holds(&mut self, call: u64) -> bool {
+        let mut any = false;
+        let mut globals = 0u32;
+        for h in &self.held {
+            if let Some(r) = h.mutex
+                && h.call == call
+            {
+                any = true;
+                if let Ok(Object::Mutex(m)) = self.heap.get_mut(r) {
+                    m.depth = 0;
+                }
+                if h.global {
+                    globals = globals.saturating_add(1);
+                }
+            }
+        }
+        if any {
+            self.held.retain(|h| !(h.mutex.is_some() && h.call == call));
+            for _ in 0..globals {
+                let _ = self.give_global();
+            }
+        }
+        any
     }
 
     /// A serialized method returns: its implicit mutex goes.
@@ -127,7 +158,9 @@ impl<H: Host> Interpreter<H> {
             &mut self.held,
             Held {
                 mutex: Some(r),
-                call: 0,
+                // The method activation that took it, so that its return can tell (the review of
+                // B2, B2-10); 0 for load-time code.
+                call: self.calls.last().map_or(0, |c| c.serial),
                 sync: m.sync,
                 global: m.global,
             },

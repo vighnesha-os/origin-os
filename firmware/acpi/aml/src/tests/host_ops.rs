@@ -1174,15 +1174,14 @@ fn a_mutex_a_method_run_by_export_keeps_is_released_at_the_end() {
             ),
         ],
     );
-    // Reported, and released: a mutex of a lower level can be taken afterwards.
-    assert_eq!(fails(&mut i, "PK"), ErrorKind::MutexHeld);
-    assert!(i.held.is_empty());
-    assert_eq!(int(&mut i, "LOW"), 1);
-    // The function was found and kept: the next export reads the field with nothing held.
-    assert_eq!(
-        i.evaluate("PK", &[]).unwrap(),
-        Some(Value::Package(vec![Value::Integer(0)]))
-    );
+    // Reported, and released: a mutex of a lower level can be taken afterwards. Since B2-10 the
+    // `_ADR` is stopped at its own return, so the walk fails and the function stays unknown: the
+    // next export fails the same way, and again leaves nothing held.
+    for _ in 0..2 {
+        assert_eq!(fails(&mut i, "PK"), ErrorKind::MutexHeld);
+        assert!(i.held.is_empty());
+        assert_eq!(int(&mut i, "LOW"), 1);
+    }
 }
 
 // --- The initialization walk as a whole (the review of B2, B2-7) --------------------------------
@@ -1274,4 +1273,27 @@ fn an_adr_outside_a_device_and_function_is_refused() {
             function: 7
         })
     );
+}
+
+#[test]
+fn a_method_that_returns_holding_a_mutex_is_stopped_at_its_return() {
+    // The review of B2, B2-10: G2's strict choice applies at the method's return, so its caller
+    // does not go on using what the mutex guards.
+    let mut i = loaded(&[
+        mutex("MX", 3),
+        name("FLAG", zero()),
+        m("INNR", &[acquire(nm("MX"), 0xFFFF), ret(one())]),
+        m(
+            "OUTR",
+            &[store(call("INNR", &[]), local(0)), store(one(), nm("FLAG"))],
+        ),
+        m(
+            "NEST",
+            &[acquire(nm("MX"), 0xFFFF), release(nm("MX")), ret(one())],
+        ),
+    ]);
+    assert_eq!(fails(&mut i, "OUTR"), ErrorKind::MutexHeld);
+    assert_eq!(int(&mut i, "FLAG"), 0, "the caller went on");
+    assert!(i.held.is_empty());
+    assert_eq!(int(&mut i, "NEST"), 1);
 }

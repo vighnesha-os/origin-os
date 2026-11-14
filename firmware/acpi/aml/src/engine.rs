@@ -1494,9 +1494,13 @@ impl<H: Host> Interpreter<H> {
         if call.serialized {
             self.drop_implicit(call.serial);
         }
+        let kept = self.release_call_holds(call.serial);
         self.pop_owner(true);
         self.run.depth = self.run.depth.saturating_sub(1);
         self.cur = call.ret;
+        if kept {
+            return err(ErrorKind::MutexHeld);
+        }
         if v == Val::None {
             // G6, strict until the reading session answers: no value where one is needed is an
             // error; as a statement it is nothing.
