@@ -446,8 +446,10 @@ fn qemu_acpi() -> bool {
 /// A7): `nvdimm=on,hmat=on` go in through `ORIGIN_QEMU_MACHINE`; here, an NVDIMM in node 1 (the
 /// NFIT), a third node with no memory and no processor holding the NVMe controller as a generic
 /// initiator (SRAT type 5), every distance to it, and latencies, bandwidths and a memory-side
-/// cache for every initiator and target (the HMAT). It adds no PCI function, so the usual
-/// proofs' counts hold.
+/// cache for every processor's node and every node with memory (the HMAT). It adds no PCI
+/// function, so the usual proofs' counts hold. Checked against QEMU 11.1.3 with the guest paused
+/// before it was booted: QEMU refuses an `hmat-lb` initiator with no processor, and an
+/// `initiator` property naming the generic initiator's own node.
 fn acpi_machine_args(cpus: u32) -> Vec<String> {
     let mut args: Vec<String> = [
         "-object",
@@ -455,7 +457,7 @@ fn acpi_machine_args(cpus: u32) -> Vec<String> {
         "-device",
         "nvdimm,id=onvdimm0,memdev=onvdimm,node=1",
         "-numa",
-        "node,nodeid=2,initiator=2",
+        "node,nodeid=2",
         "-numa",
         "dist,src=0,dst=2,val=31",
         "-numa",
@@ -466,10 +468,11 @@ fn acpi_machine_args(cpus: u32) -> Vec<String> {
     .iter()
     .map(|a| (*a).to_string())
     .collect();
-    let initiators: &[u32] = if cpus >= 2 { &[0, 1, 2] } else { &[0, 2] };
+    // The HMAT's initiators are the nodes with a processor (QEMU refuses one without).
+    let initiators: &[u32] = if cpus >= 2 { &[0, 1] } else { &[0] };
     for &initiator in initiators {
         for target in [0u32, 1] {
-            let near = initiator == target || (initiator == 2 && target == 0);
+            let near = initiator == target;
             let (latency, bandwidth) = if near { (10, "10G") } else { (20, "5G") };
             args.push("-numa".into());
             args.push(format!(
@@ -489,14 +492,19 @@ fn acpi_machine_args(cpus: u32) -> Vec<String> {
     args
 }
 
-/// A `-numa node` value for node `id` with its 256M backend; on the ACPI machine, with the
-/// initiator nearest its memory, which the HMAT needs.
-fn numa_node(id: u32, initiator: u32) -> String {
+/// A `-numa node` value for node `id` with its 256M backend. On the ACPI machine the node also
+/// names its processor, if it has one, and the initiator nearest its memory, which the HMAT
+/// needs: QEMU spreads processors over the nodes itself only after it has read the HMAT's
+/// options, which refuse an initiator with no processor yet.
+fn numa_node(id: u32, cpus: u32) -> String {
     let node = format!("node,nodeid={id},memdev=onuma{id}");
-    if qemu_acpi() {
-        format!("{node},initiator={initiator}")
+    if !qemu_acpi() {
+        return node;
+    }
+    if id < cpus {
+        format!("{node},cpus={id},initiator={id}")
     } else {
-        node
+        format!("{node},initiator=0")
     }
 }
 
@@ -2220,35 +2228,46 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
 /// and OVMF give them on every machine here, in the XSDT's order: each table QEMU builds, named
 /// and checked (or, for another specification's, its header checked), the FADT's line, the DSDT
 /// and FACS it points to, and the census's verdict. OVMF's BGRT is not required: OVMF builds it
-/// only when it has drawn its logo. The ACPI machine's own tables are [`acpi_machine_markers`].
+/// only when it has drawn its logo. The ACPI machine (`boot-acpi`) adds its SRAT's generic
+/// initiator, its HMAT, its NVDIMM's SSDT and its NFIT, where its first boot (2026-11-14) showed
+/// QEMU lists them. The markers follow what the machines showed; they are not assumed.
 fn acpi_markers() -> Vec<String> {
+    let acpi = qemu_acpi();
     let checked = "checked";
     let other = "another specification's: header checked";
     let mut markers = Vec::new();
-    for (signature, outcome) in [
-        ("RSDT", "checked: "),
-        ("XSDT", "checked: "),
-        ("FACP", checked),
-        ("APIC", "checked: "),
-        ("HPET", other),
-        ("SRAT", "checked: "),
-    ] {
+    let mut table = |signature: &str, outcomes: &[&str]| {
         markers.push(format!("origin-kernel: acpi: {signature} rev "));
-        markers.push(outcome.to_string());
+        markers.extend(outcomes.iter().map(|o| (*o).to_string()));
+    };
+    table("RSDT", &["checked: "]);
+    table("XSDT", &["checked: "]);
+    table("FACP", &[checked]);
+    table("APIC", &["checked: "]);
+    table("HPET", &[other]);
+    // On the ACPI machine, its generic initiator (type 5) among the SRAT's structures.
+    table(
+        "SRAT",
+        if acpi {
+            &["checked: ", "5x1"]
+        } else {
+            &["checked: "]
+        },
+    );
+    table("SLIT", &[checked]);
+    if acpi {
+        // QEMU's HMAT: a memory domain, two matrices (latency and bandwidth) and a cache.
+        table("HMAT", &["checked: ", "0x", "1x2", "2x1"]);
     }
-    if qemu_acpi() {
-        markers.extend(acpi_machine_markers());
+    table("MCFG", &[other]);
+    // The AMD-Vi boot swaps it for the IVRS ([`amd_iommu_markers`]).
+    table("DMAR", &[other]);
+    if acpi {
+        // The NVDIMM's SSDT, and the NFIT: its SPA range, region mapping and control region.
+        table("SSDT", &[checked]);
+        table("NFIT", &["checked: ", "0x1", "1x1", "4x1"]);
     }
-    for (signature, outcome) in [
-        ("SLIT", checked),
-        ("MCFG", other),
-        // The AMD-Vi boot swaps it for the IVRS ([`amd_iommu_markers`]).
-        ("DMAR", other),
-        ("WAET", other),
-    ] {
-        markers.push(format!("origin-kernel: acpi: {signature} rev "));
-        markers.push(outcome.to_string());
-    }
+    table("WAET", &[other]);
     markers.extend(
         [
             "origin-kernel: acpi: FADT: ",
@@ -2264,12 +2283,6 @@ fn acpi_markers() -> Vec<String> {
         .map(String::from),
     );
     markers
-}
-
-/// The ACPI machine's tables beyond the usual ones (`ORIGIN_QEMU_ACPI=on`), written once the
-/// first boot showed where QEMU lists them.
-fn acpi_machine_markers() -> Vec<String> {
-    Vec::new()
 }
 
 /// The kernel boot's whole-log checks: every line whole, and the screen.
@@ -3249,6 +3262,7 @@ fn boot_matrix() -> Result {
     boot_bridge()?;
     boot_reserved()?;
     boot_legacy_free()?;
+    boot_acpi()?;
     boot_random()?;
     boot_identity()?;
     boot_console()?;
@@ -3259,7 +3273,7 @@ fn boot_matrix() -> Result {
         "xtask: boot-matrix: the kernel stacks' region was at {boots} distinct bases in {boots} kernel boots, read through QEMU's monitor; none is printed"
     );
     println!(
-        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the reserved-memory machines, the legacy-free machine, the two machines without the random-number instructions, the two CPU identities, and the console machines)"
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the reserved-memory machines, the legacy-free machine, the ACPI machine, the two machines without the random-number instructions, the two CPU identities, and the console machines)"
     );
     Ok(())
 }
@@ -5330,11 +5344,8 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         .args(["-object", "memory-backend-ram,id=onuma0,size=256M"])
         .args(["-object", "memory-backend-ram,id=onuma1,size=256M"])
         // With the ACPI machine's HMAT, each node names the initiator nearest its memory.
-        .args(["-numa", &numa_node(0, 0)])
-        .args([
-            "-numa",
-            &numa_node(1, if machine.cpus() >= 2 { 1 } else { 0 }),
-        ])
+        .args(["-numa", &numa_node(0, machine.cpus())])
+        .args(["-numa", &numa_node(1, machine.cpus())])
         // A cross-node distance so the ACPI SLIT is populated too (QEMU mirrors 1->0).
         .args(["-numa", "dist,src=0,dst=1,val=21"])
         .arg("-drive")
