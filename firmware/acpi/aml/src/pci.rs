@@ -34,6 +34,18 @@ use crate::region::FIELD_DEPTH;
 /// `PNP0A03` and `PNP0A08` as EISA IDs: a PCI and a PCI Express root bridge.
 const ROOT_BRIDGES: [u64; 2] = [0x030A_D041, 0x080A_D041];
 
+/// A PCI `_ADR`'s device (bits 31:16) and function (bits 15:0), each in range: device 0 to 31,
+/// function 0 to 7. Anything else, `0xFFFF` ("all functions") among it, names no one function
+/// and is refused (the review of B2, B2-9).
+fn device_function(adr: u64) -> Result<(u8, u8)> {
+    let device = u8::try_from((adr >> 16) & 0xFFFF).ok().filter(|d| *d <= 31);
+    let function = u8::try_from(adr & 0xFFFF).ok().filter(|f| *f <= 7);
+    match (device, function) {
+        (Some(d), Some(f)) if adr >> 32 == 0 => Ok((d, f)),
+        _ => err(ErrorKind::Range),
+    }
+}
+
 /// What the walk asks next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -303,12 +315,12 @@ impl<H: Host> Interpreter<H> {
                     self.after_bridge(&mut r, bridge)?;
                     return self.put_resolve(r);
                 };
-                let badr = self.int_of(v)?;
+                let (device, function) = device_function(self.int_of(v)?)?;
                 let here = PciAddress {
                     segment: u16::try_from(r.segment).unwrap_or(0),
                     bus: u8::try_from(r.bus).unwrap_or(0),
-                    device: u8::try_from((badr >> 16) & 0xFF).unwrap_or(0),
-                    function: u8::try_from(badr & 0xFF).unwrap_or(0),
+                    device,
+                    function,
                 };
                 // Its own request, never a region access with no region (the review of B2,
                 // B2-3).
@@ -324,11 +336,12 @@ impl<H: Host> Interpreter<H> {
             Phase::DeviceAdr => {
                 // Required: a function the firmware did not name is never taken for function 0.
                 let adr = self.int_of(answer.ok_or(ErrorKind::NotFound)?)?;
+                let (device, function) = device_function(adr)?;
                 let pci = PciAddress {
                     segment: u16::try_from(r.segment).unwrap_or(0),
                     bus: u8::try_from(r.bus).unwrap_or(0),
-                    device: u8::try_from((adr >> 16) & 0xFF).unwrap_or(0),
-                    function: u8::try_from(adr & 0xFF).unwrap_or(0),
+                    device,
+                    function,
                 };
                 let obj = self.ns.obj(r.region)?;
                 if let Object::Region(stored) = self.heap.get_mut(obj)? {

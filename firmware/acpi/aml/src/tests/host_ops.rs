@@ -1246,3 +1246,32 @@ fn a_field_straddling_its_region_is_refused_before_any_access() {
     assert_eq!(fails(&mut i, "W"), ErrorKind::Range);
     assert!(i.host().seen.is_empty(), "{:?}", i.host().seen);
 }
+
+#[test]
+fn an_adr_outside_a_device_and_function_is_refused() {
+    // The review of B2, B2-9: device 0 to 31, function 0 to 7; `0xFFFF` ("all functions") and a
+    // device of 32 name no one function.
+    for adr in [0x0001_FFFF_u32, 0x0020_0000, 0x0000_0008] {
+        let mut i = pci_device(
+            &[ret(dword(adr))],
+            &[method("RD", 0, &[ret(nm("\\_SB.PCI0.D1.F1"))])],
+        );
+        assert_eq!(fails(&mut i, "RD"), ErrorKind::Range, "{adr:#x}");
+        assert!(i.host().seen.is_empty());
+    }
+    let mut i = pci_device(
+        &[ret(dword(0x001F_0007))],
+        &[method("RD", 0, &[ret(nm("\\_SB.PCI0.D1.F1"))])],
+    );
+    assert_eq!(int(&mut i, "RD"), 0);
+    let last = i.host().seen.last().cloned().unwrap();
+    assert_eq!(
+        last.pci,
+        Some(PciAddress {
+            segment: 0,
+            bus: 0,
+            device: 31,
+            function: 7
+        })
+    );
+}
