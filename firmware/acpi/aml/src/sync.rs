@@ -75,6 +75,9 @@ impl<H: Host> Interpreter<H> {
     /// were any is returned, for its return to fail with `MutexHeld` (G2's strict choice, at the
     /// method's return and not only the evaluation's end: the review of B2, B2-10).
     pub(crate) fn release_call_holds(&mut self, call: u64) -> bool {
+        // A scan of the held list at every return: a unit an entry (the audit after N-soak-1;
+        // left out of `58583fb1` by mistake, as the review of B2's Addendum 2 found).
+        self.note_held_scan();
         let mut any = false;
         let mut globals = 0u32;
         for h in &self.held {
