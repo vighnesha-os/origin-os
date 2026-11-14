@@ -244,6 +244,7 @@ const LAYERS: &[(&str, &[&str])] = &[
         "origin-frame",
         &[
             "origin-abi",
+            "origin-acpi-tables",
             "origin-boot-info",
             "origin-crypto",
             "origin-paging",
