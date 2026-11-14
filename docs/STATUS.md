@@ -7,6 +7,39 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
 
+## Any processor count (ADR-0008 Amendment 1, D1 to D8; TASKS item 58; 2026-11-13 and 2026-11-14)
+
+On `claude/any-cpu-count`, from the fourth batch (`land/s4-part2`) with S4-3 merged; **not landed and not pushed. One AI reviewer has read it (`docs/engineering/REVIEW_T58_2026-11-14.md`: no High, two Medium, seven Low, five informational), and every finding is fixed or recorded on the branch; no person has reviewed it.** The owner asked on 2026-11-13 that the kernel use every processor a machine has, whatever the number.
+
+- **Sized at discovery.** Each of the kernel's 27 per-processor tables is a `PerCpu` (5,062 bytes an index): the boot processor's slot is in the image, and the rest are allocated once, after the MADT and before the first INIT. `cpu::count()` is then fixed. `MAX_CPUS` is gone, and `cargo xtask percpu-gate` keeps it and any array sized by a processor count out. A table missed fails closed: the kernel stops, naming it, and the gate refuses an alias of `PerCpu`, one held inside another type, and any mention of a table but its sizing call (review finding F2).
+- **The shootdown** keeps a record on its own cache line for each processor, behind a trait, and scans the indexed processors: fewer than 64 on a small machine.
+- **The kernel stacks' region** grows to 32 slots a processor inside a 1 TiB reserve (room for 262,144), and its base stays random.
+- **Online-capable processors** get reserved indexes, read from MADT revision 5 on. **NVMe** gives queues while the controller has them, to the processors above APIC ID 255 first (F1).
+- **One line** reports the indexes, the bytes and every bound that held a processor back. Start-up stays serial, and its total is printed.
+
+**What is shown, under QEMU's software processor on the development Mac only:**
+- the kernel boot at 1, 2, 3, 4 and 65 processors, under Intel VT-d and AMD-Vi: at 65, all online, 64 APs in about 2 s, and 62 with their own NVMe queue;
+- the 67-processor sparse machine, with APIC IDs 256, 300 and 412 above 255 (decision item 294). Since the review's F1 those three get NVMe queues first, and NVMe interrupts through remapping are proven to each of them there. Before it they got none, so no device interrupt reached an ID above 255 on that machine;
+- the discovery machine: 2 enabled of the 4,096 the MADT lists;
+- one boot that brought 288 processors online: `cargo xtask boot-many`, outside the gate.
+
+**Gates on `15b08fd`:**
+- `check`: 1,901 host tests passed, 56 Loom models, 83 controls caught.
+- `boot-test`: 11 of 11.
+- `boot-matrix`: 1,081 s.
+- Controls: AC-1 to AC-6 failed where aimed, and AC-7 passed (ADR-0013).
+
+**Gates on `efbcb6a`, after the review's fixes:** `check` passed in 436 s (1,913 host tests, 0 failed; Loom 56 models, 83 controls caught); `boot-test` 11 of 11 in 53 s; `boot-matrix` passed in 1,070 s; `boot-sparse` alone first, in 133 s. Controls AC-8 and AC-9 (the review's F1 and F2) failed where aimed, AC-3 still fails, and AC-7 passes (ADR-0013). The same reviewer read the fixes (its addendum: 13 fixed, F14 left as CL40) and found four more, N1 to N4, fixed or recorded since.
+
+**Gates on `173d85d`, after the addendum's fixes:** `check` passed in 425 s (1,915 host tests, 0 failed; Loom 56 models, 83 controls caught); `boot-test` 11 of 11 in 51 s; `boot-matrix` passed in 1,049 s. AC-10 (an AP with no shootdown record is parked, named) and AC-11 (without interrupt remapping the sparse machine keeps its storage, the three processors above 255 left out by name) show N2 and N1. No reviewer has read these last fixes.
+
+**Not shown:** anything under KVM or on a real processor. CI has not built this. The new machines run in CI only once measured and accepted (D7). A machine short of memory for its tables: only the search for the largest count that fits is host-tested, with a stand-in for the heap.
+
+**Open:**
+- **The 288-processor run stays outside `boot-matrix`** (decision item 294): QEMU disturbs its timing on this host. The 67-processor sparse machine is the gate's large machine instead.
+- **The hot-plug task's gap:** a processor first seen through ACPI's namespace has no reserved index.
+- The boot checks now judge the serial log once per line; a 65-processor log had taken 48 minutes to judge.
+
 ## A port's creator pays for its index (ADR-0005 Amendment 10, I1; decision item 282; TASKS item 57; 2026-11-13)
 
 On `claude/elegant-benz-1983ff`, from the fourth batch at `1b8688a` (task S4-3 merged) with `docs/decision-282` merged in; **not landed and not pushed. One AI reviewer has read it (`docs/engineering/REVIEW_TASKS57_2026-11-14.md`: no High, one Medium, six Low, five informational), and every finding is answered on the branch; no person has reviewed it.** No wire format, call number, status or C signature changes; `user-abi` stays 0.7.

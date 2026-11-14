@@ -30,7 +30,7 @@ use origin_frame::mmio::MmioRegion;
 use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
-use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
+use crate::cpu::{self, CpuIndex, rdtsc};
 use crate::iommu::{Detail, Fault, Recorded};
 use crate::timer;
 
@@ -97,7 +97,12 @@ const MASKED: u32 = 1 << 16;
 /// Interrupts taken on the I/O APIC's vector.
 static IOAPIC_IRQS: AtomicU64 = AtomicU64::new(0);
 /// Interrupts taken on the I/O APIC's vector, by the CPU index of the processor that took them.
-static IOAPIC_IRQS_ON: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+pub(crate) static IOAPIC_IRQS_ON: origin_frame::percpu::PerCpu<AtomicU64> =
+    origin_frame::percpu::PerCpu::new(
+        "framekernel::irq::IOAPIC_IRQS_ON",
+        AtomicU64::new(0),
+        || AtomicU64::new(0),
+    );
 
 /// How many I/O APIC-routed interrupts have been taken.
 fn ioapic_irqs() -> u64 {

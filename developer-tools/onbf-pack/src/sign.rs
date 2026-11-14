@@ -3,24 +3,28 @@
 //! `onbf-pack` builds the statement, the entry and the block itself, and then verifies the
 //! result with the code the boot loader runs. The two signatures come from a [`Signer`]:
 //! today [`HostKey`], which signs with the original Rust code of `onbf-sign` (the owner's
-//! decision of 2026-11-08). The private key is a 104-byte file that only this tool reads.
-//! Why, and what was rejected: `docs/research/2026-11-08-krn-signature-verification.md`.
+//! decision of 2026-11-08). The private key is a 104-byte file that only this tool's command
+//! line reads. Why, and what was rejected: `docs/research/2026-11-08-krn-signature-verification.md`.
+//!
+//! Nothing here reaches the host (ADR-0011 Amendment 4, T1): a key file comes in and goes out
+//! as bytes, and fresh randomness comes from the caller through [`Random`]. The command line
+//! reads and writes the files, with their checks (no symbolic link, a regular file, owner-only
+//! on reading; 0600, never overwriting, on writing), and fills [`Random`] from the operating
+//! system's generator; so
+//! does `xtask`, which derives its test keys in memory.
 //!
 //! Signing the statement is the one step of a build that is not reproducible: ML-DSA signing
 //! is hedged with fresh randomness (FIPS 204 §3.4), so its signature differs from run to run.
 //! The container, the content digest and the statement stay deterministic; the claimed signing
 //! time is an input, never the host's clock (ONBF-R9; errata V6).
 
+use core::cell::RefCell;
 use core::fmt;
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
 
 use onbf_format::signature::{self, Role, Suite};
 use onbf_format::{Image, ParseOptions, Profile, SMALL_ALIGN, ocbor};
-use onbf_sign::{ed25519, mldsa87, os_random, wipe};
+use onbf_sign::{ed25519, mldsa87, wipe};
 use onbf_verify::{KrnBlockError, PublicKey, TrustedKey, key_id, verify_krn_block};
 use origin_crypto::{MLDSA87_SIGNATURE_BYTES, Sha256, Sha512};
 
@@ -49,6 +53,54 @@ impl PublicKeys {
             mldsa: &self.mldsa87,
         }
     }
+
+    /// The key ID a trust store names this key by (ONBF §7.2).
+    #[must_use]
+    pub fn key_id(&self) -> [u8; 32] {
+        key_id(&self.as_public_key())
+    }
+}
+
+/// Why a [`Random`] gave no randomness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RandomError(pub String);
+
+impl fmt::Display for RandomError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Fresh randomness, which the caller supplies (ADR-0011 Amendment 4, T1): on the build host,
+/// the operating system's generator. This crate never reaches for it itself.
+///
+/// It fails closed. A [`fill`](Random::fill) that returns an error stops what asked for it,
+/// and so does one that returns success with its 32 bytes all zero: a generator gives that
+/// once in 2^256, and a `fill` that wrote nothing gives it every time. So nothing is generated
+/// or signed with a buffer left untouched. A `fill` that writes only part of the buffer and
+/// reports success is not caught: filling every byte is the trait's contract, which both
+/// `Random`s in the tree keep with `read_exact`.
+pub trait Random {
+    /// Fills every byte of `out`, or fails.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the source reports; the caller stops on it.
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), RandomError>;
+}
+
+/// Fills `out` from `random`, failing closed (see [`Random`]).
+fn fill(random: &mut dyn Random, out: &mut [u8; 32]) -> Result<(), SignError> {
+    out.fill(0);
+    random
+        .fill(out)
+        .map_err(|e| SignError::Random(e.to_string()))?;
+    if out.iter().all(|&b| b == 0) {
+        return Err(SignError::Random(
+            "it returned 32 zero bytes: nothing was filled".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Both signatures over one statement.
@@ -77,20 +129,13 @@ pub struct SignOptions {
     pub claimed_signing_time: u64,
 }
 
-/// Why an image could not be signed, or a key could not be made or read. Nothing is written
-/// on any error.
+/// Why an image could not be signed, or a key could not be made or read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignError {
-    /// A key file or public-key file already exists; `keygen` never overwrites anything.
-    KeyExists(PathBuf),
-    /// A key file is not what [`generate_keys`] wrote, or it is damaged.
-    KeyFile {
-        /// The file.
-        path: PathBuf,
-        /// What is wrong with it.
-        why: &'static str,
-    },
-    /// The operating system's random number generator failed.
+    /// A key file's bytes are not what [`new_key`] or [`new_test_key`] made, or are damaged;
+    /// the value says what is wrong. The caller names the file.
+    KeyFile(&'static str),
+    /// The caller's [`Random`] gave no randomness; nothing was generated or signed.
     Random(String),
     /// A signature has the wrong length.
     SignatureLength {
@@ -99,7 +144,7 @@ pub enum SignError {
         /// Its length.
         got: usize,
     },
-    /// A file could not be written or read.
+    /// The signed image could not be laid out, or ML-DSA refused to sign.
     Io(String),
     /// The input image is already signed.
     AlreadySigned,
@@ -124,9 +169,8 @@ pub enum SelfCheckError {
 impl fmt::Display for SignError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::KeyExists(path) => write!(f, "{} already exists", path.display()),
-            Self::KeyFile { path, why } => write!(f, "{}: {why}", path.display()),
-            Self::Random(why) => write!(f, "the system random number generator failed: {why}"),
+            Self::KeyFile(why) => f.write_str(why),
+            Self::Random(why) => write!(f, "no randomness: {why}"),
             Self::SignatureLength { algorithm, got } => {
                 write!(f, "{algorithm} signature of {got} bytes")
             }
@@ -149,16 +193,6 @@ pub fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// `O_NOFOLLOW` of the build host, which `std` does not name: opening a symbolic link fails.
-/// There is no value for any other host, so a build there stops here rather than following
-/// links.
-#[cfg(target_os = "macos")]
-const O_NOFOLLOW: i32 = 0x0100;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const O_NOFOLLOW: i32 = 0o400_000;
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const O_NOFOLLOW: i32 = 0o100_000;
-
 /// The first bytes of a key file holding a real key.
 const KEY_FILE_MAGIC: [u8; 8] = *b"ONBFKEY1";
 /// The first bytes of a key file holding a test key, derived from public text. The file says
@@ -166,15 +200,17 @@ const KEY_FILE_MAGIC: [u8; 8] = *b"ONBFKEY1";
 const TEST_KEY_FILE_MAGIC: [u8; 8] = *b"ONBFTKEY";
 /// magic ‖ Ed25519 seed ‖ ML-DSA seed ξ ‖ key ID: the key ID lets a damaged file be caught
 /// before anything is signed with it.
-const KEY_FILE_BYTES: usize = 8 + 32 + 32 + 32;
+pub const KEY_FILE_BYTES: usize = 8 + 32 + 32 + 32;
 
 /// An `origin-kernel` signing key on the build host: a development key. A release signing key
-/// belongs in an HSM (ONBF §7.2, CLAUDE.md §60).
+/// belongs in an HSM (ONBF §7.2, CLAUDE.md §60). It signs with ML-DSA's hedge from the
+/// caller's [`Random`].
 pub struct HostKey {
     ed25519_seed: Box<[u8; 32]>,
     mldsa: mldsa87::SigningKey,
     public: PublicKeys,
     is_test_key: bool,
+    random: RefCell<Box<dyn Random>>,
 }
 
 impl fmt::Debug for HostKey {
@@ -190,7 +226,12 @@ impl Drop for HostKey {
 }
 
 impl HostKey {
-    fn from_seeds(ed25519_seed: &[u8; 32], mldsa_seed: &[u8; 32], is_test_key: bool) -> Self {
+    fn from_seeds(
+        ed25519_seed: &[u8; 32],
+        mldsa_seed: &[u8; 32],
+        is_test_key: bool,
+        random: Box<dyn Random>,
+    ) -> Self {
         let mldsa = mldsa87::SigningKey::from_seed(mldsa_seed);
         let public = PublicKeys {
             ed25519: ed25519::public_key(ed25519_seed),
@@ -201,57 +242,33 @@ impl HostKey {
             mldsa,
             public,
             is_test_key,
+            random: RefCell::new(random),
         }
     }
 
     /// True if this key's file records it as derived from public text (a test key).
+    #[must_use]
     pub fn is_test_key(&self) -> bool {
         self.is_test_key
     }
 
-    /// Loads a key file written by [`generate_keys`], refusing a damaged or foreign one, a
-    /// symbolic link, and one that anyone but its owner can read: like an SSH private key, it
-    /// must be mode 0600. Opened once and checked on that handle, so that what is read is
-    /// exactly what was checked.
-    pub fn load(path: &Path) -> Result<Self, SignError> {
-        let cannot_read = |e| SignError::Io(format!("cannot read {}: {e}", path.display()));
-        let mut file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NOFOLLOW)
-            .open(path)
-            .map_err(cannot_read)?;
-        let metadata = file.metadata().map_err(cannot_read)?;
-        if !metadata.is_file() {
-            return Err(SignError::KeyFile {
-                path: path.to_path_buf(),
-                why: "not a regular file",
-            });
-        }
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(SignError::KeyFile {
-                path: path.to_path_buf(),
-                why: "readable by others: a key file must be mode 0600",
-            });
-        }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(cannot_read)?;
-        let result = Self::parse(&bytes).map_err(|why| SignError::KeyFile {
-            path: path.to_path_buf(),
-            why,
-        });
-        wipe(&mut bytes);
-        result
-    }
-
-    fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
+    /// The key whose file is `bytes`, as [`new_key`] or [`new_test_key`] made it; it signs with
+    /// ML-DSA's hedge from `random`. A damaged or foreign file is refused. Where the bytes came
+    /// from, and whether that file was safe to read (no symbolic link, a regular file,
+    /// owner-only), is the caller's to check: the command line does.
+    ///
+    /// # Errors
+    ///
+    /// [`SignError::KeyFile`], saying what is wrong.
+    pub fn from_key_file(bytes: &[u8], random: Box<dyn Random>) -> Result<Self, SignError> {
         if bytes.len() != KEY_FILE_BYTES {
-            return Err("not a key file: wrong length");
+            return Err(SignError::KeyFile("not a key file: wrong length"));
         }
         let (magic, rest) = bytes.split_at(8);
         let is_test_key = match magic {
             m if m == KEY_FILE_MAGIC => false,
             m if m == TEST_KEY_FILE_MAGIC => true,
-            _ => return Err("not a key file: bad magic"),
+            _ => return Err(SignError::KeyFile("not a key file: bad magic")),
         };
         let (ed25519_seed, rest) = rest.split_at(32);
         let (mldsa_seed, stored_id) = rest.split_at(32);
@@ -259,13 +276,26 @@ impl HostKey {
             <&[u8; 32]>::try_from(ed25519_seed),
             <&[u8; 32]>::try_from(mldsa_seed),
         ) else {
-            return Err("not a key file: wrong length");
+            return Err(SignError::KeyFile("not a key file: wrong length"));
         };
-        let key = Self::from_seeds(ed25519_seed, mldsa_seed, is_test_key);
-        if key_id(&key.public.as_public_key()) != stored_id {
-            return Err("damaged: its keys do not match its key ID");
+        let key = Self::from_seeds(ed25519_seed, mldsa_seed, is_test_key, random);
+        if key.public.key_id() != stored_id {
+            return Err(SignError::KeyFile(
+                "damaged: its keys do not match its key ID",
+            ));
         }
         Ok(key)
+    }
+
+    /// The test key [`new_test_key`] derives from `label`, without a file; it signs with
+    /// ML-DSA's hedge from `random`. A **test key by construction**: anyone can recompute it.
+    #[must_use]
+    pub fn from_test_seed(label: &str, random: Box<dyn Random>) -> Self {
+        let (mut ed25519_seed, mut mldsa_seed) = test_seeds(label);
+        let key = Self::from_seeds(&ed25519_seed, &mldsa_seed, true, random);
+        wipe(&mut ed25519_seed);
+        wipe(&mut mldsa_seed);
+        key
     }
 }
 
@@ -276,7 +306,11 @@ impl Signer for HostKey {
 
     fn sign(&self, statement: &[u8], context: &[u8]) -> Result<Signatures, SignError> {
         let mut rnd = [0u8; 32];
-        os_random(&mut rnd).map_err(|e| SignError::Random(e.to_string()))?;
+        let filled = fill(self.random.borrow_mut().as_mut(), &mut rnd);
+        if let Err(e) = filled {
+            wipe(&mut rnd);
+            return Err(e);
+        }
         let mldsa87 = self.mldsa.sign(statement, context, &rnd);
         wipe(&mut rnd);
         let mldsa87 = mldsa87.map_err(|e| SignError::Io(format!("ML-DSA: {e:?}")))?;
@@ -285,38 +319,6 @@ impl Signer for HostKey {
             mldsa87: mldsa87.to_vec(),
         })
     }
-}
-
-/// Writes a new file with `mode`, refusing to touch an existing path. If writing fails, the
-/// partial file is removed.
-fn write_new(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)?;
-    let result = file.write_all(bytes).and_then(|()| file.sync_all());
-    if result.is_err() {
-        let _ = fs::remove_file(path);
-    }
-    result
-}
-
-/// Writes every file or none: a later failure removes the files already created.
-fn write_all_new(files: &[(&Path, &[u8], u32)]) -> Result<(), SignError> {
-    for (done, &(path, bytes, mode)) in files.iter().enumerate() {
-        if let Err(e) = write_new(path, bytes, mode) {
-            for &(created, _, _) in files.iter().take(done) {
-                let _ = fs::remove_file(created);
-            }
-            return Err(if e.kind() == std::io::ErrorKind::AlreadyExists {
-                SignError::KeyExists(path.to_path_buf())
-            } else {
-                SignError::Io(format!("{}: {e}", path.display()))
-            });
-        }
-    }
-    Ok(())
 }
 
 /// A 32-byte seed from public text, separated by `domain`.
@@ -328,57 +330,97 @@ fn domain_seed(domain: &str, label: &str) -> [u8; 32] {
     h.finalize()
 }
 
-/// Where [`generate_keys`] writes a new key pair. None of these may exist.
-#[derive(Clone, Copy, Debug)]
-pub struct KeyPaths<'a> {
-    /// The private key (mode 0600).
-    pub key: &'a Path,
-    /// The raw Ed25519 public key, 32 bytes.
-    pub public_ed25519: &'a Path,
-    /// The raw ML-DSA-87 public key, 2,592 bytes.
-    pub public_mldsa87: &'a Path,
+/// The two seeds of the test key derived from `label`.
+fn test_seeds(label: &str) -> ([u8; 32], [u8; 32]) {
+    (
+        domain_seed("onbf-pack TEST-ONLY Ed25519 key", label),
+        domain_seed("onbf-pack TEST-ONLY ML-DSA-87 key", label),
+    )
 }
 
-/// Makes a key pair: the private key in a new file (mode 0600) and the raw public keys in two
-/// more, and returns the public keys. No file is ever overwritten: an existing path, in
-/// particular a private key given by mistake as a public-key path, is refused.
-///
-/// `test_seed` derives both keys from public text, so the result is a **test key by
-/// construction**: anyone can recompute it. It exists for boot tests and fixtures only; never
-/// give it to anything that holds a real key.
-pub fn generate_keys(
-    paths: &KeyPaths<'_>,
-    test_seed: Option<&str>,
-) -> Result<PublicKeys, SignError> {
-    let (mut ed25519_seed, mut mldsa_seed, magic) = match test_seed {
-        Some(label) => (
-            domain_seed("onbf-pack TEST-ONLY Ed25519 key", label),
-            domain_seed("onbf-pack TEST-ONLY ML-DSA-87 key", label),
-            TEST_KEY_FILE_MAGIC,
-        ),
-        None => {
-            let (mut ed25519_seed, mut mldsa_seed) = ([0u8; 32], [0u8; 32]);
-            os_random(&mut ed25519_seed).map_err(|e| SignError::Random(e.to_string()))?;
-            os_random(&mut mldsa_seed).map_err(|e| SignError::Random(e.to_string()))?;
-            (ed25519_seed, mldsa_seed, KEY_FILE_MAGIC)
-        }
+/// The bytes of a private key file, overwritten when dropped (best effort; see `onbf-sign`).
+pub struct KeyFile(Vec<u8>);
+
+impl KeyFile {
+    /// The [`KEY_FILE_BYTES`] bytes the caller writes, mode 0600.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for KeyFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("KeyFile(..)")
+    }
+}
+
+impl Drop for KeyFile {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+/// A new key pair, for the caller to write: the private key's file and the raw public keys.
+#[derive(Debug)]
+pub struct NewKey {
+    /// The private key file's bytes (mode 0600 when written).
+    pub key_file: KeyFile,
+    /// The raw public keys: the Ed25519 key, 32 bytes, and the ML-DSA-87 key, 2,592 bytes,
+    /// each written as a file of its own.
+    pub public: PublicKeys,
+    /// True if it was derived from public text ([`new_test_key`]).
+    pub is_test_key: bool,
+}
+
+/// The key file of the key with these seeds.
+fn key_from_seeds(ed25519_seed: &[u8; 32], mldsa_seed: &[u8; 32], is_test_key: bool) -> NewKey {
+    let mldsa = mldsa87::SigningKey::from_seed(mldsa_seed);
+    let public = PublicKeys {
+        ed25519: ed25519::public_key(ed25519_seed),
+        mldsa87: mldsa.public_key().to_vec(),
     };
-    let key = HostKey::from_seeds(&ed25519_seed, &mldsa_seed, test_seed.is_some());
     let mut file = Vec::with_capacity(KEY_FILE_BYTES);
-    file.extend_from_slice(&magic);
-    file.extend_from_slice(&ed25519_seed);
-    file.extend_from_slice(&mldsa_seed);
-    file.extend_from_slice(&key_id(&key.public.as_public_key()));
-    let written = write_all_new(&[
-        (paths.key, &file, 0o600),
-        (paths.public_ed25519, &key.public.ed25519, 0o644),
-        (paths.public_mldsa87, &key.public.mldsa87, 0o644),
-    ]);
-    wipe(&mut file);
+    file.extend_from_slice(if is_test_key {
+        &TEST_KEY_FILE_MAGIC
+    } else {
+        &KEY_FILE_MAGIC
+    });
+    file.extend_from_slice(ed25519_seed);
+    file.extend_from_slice(mldsa_seed);
+    file.extend_from_slice(&public.key_id());
+    NewKey {
+        key_file: KeyFile(file),
+        public,
+        is_test_key,
+    }
+}
+
+/// Makes a new key pair from the caller's randomness, for the caller to write: the private key
+/// file (mode 0600) and the raw public keys (CLAUDE.md §59).
+///
+/// # Errors
+///
+/// [`SignError::Random`] if `random` fails or fills nothing (see [`Random`]): no key is made.
+pub fn new_key(random: &mut dyn Random) -> Result<NewKey, SignError> {
+    let (mut ed25519_seed, mut mldsa_seed) = ([0u8; 32], [0u8; 32]);
+    let filled = fill(random, &mut ed25519_seed).and_then(|()| fill(random, &mut mldsa_seed));
+    let key = filled.map(|()| key_from_seeds(&ed25519_seed, &mldsa_seed, false));
     wipe(&mut ed25519_seed);
     wipe(&mut mldsa_seed);
-    written?;
-    Ok(key.public.clone())
+    key
+}
+
+/// The key pair derived from `label`, public text, so the result is a **test key by
+/// construction**: anyone can recompute it. Its file says so. It exists for boot tests and
+/// fixtures only; never give it to anything that holds a real key.
+#[must_use]
+pub fn new_test_key(label: &str) -> NewKey {
+    let (mut ed25519_seed, mut mldsa_seed) = test_seeds(label);
+    let key = key_from_seeds(&ed25519_seed, &mldsa_seed, true);
+    wipe(&mut ed25519_seed);
+    wipe(&mut mldsa_seed);
+    key
 }
 
 /// The statement (S3).

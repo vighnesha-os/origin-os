@@ -1549,10 +1549,25 @@ pub(crate) fn prove(
         }
         aps += 1;
     }
-    crate::sched::yield_until(|| PRINTERS_READY.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    // Every processor's lines go through the one console, so the time they take grows with the
+    // count (ADR-0008 Amendment 1, D3: no count is assumed): 5 s, and 10 ms for each line the
+    // processors print between them. Starting the printers takes 2 s, and 1 s more for each 64
+    // processors.
+    let lines = (cpus.len() as u64).saturating_mul(PROOF_LINES);
+    let to_start = 2 + cpus.len() as u64 / 64;
+    let to_print = 5 + lines.div_ceil(100);
+    crate::sched::yield_until(
+        || PRINTERS_READY.load(Ordering::Acquire) == aps,
+        tsc_hz,
+        to_start,
+    );
     PRINT_GO.store(true, Ordering::Release);
     print_lines(com1, bsp.get() as u64);
-    crate::sched::yield_until(|| PRINTERS_DONE.load(Ordering::Acquire) == aps, tsc_hz, 5);
+    crate::sched::yield_until(
+        || PRINTERS_DONE.load(Ordering::Acquire) == aps,
+        tsc_hz,
+        to_print,
+    );
     let printed = PRINTERS_DONE.load(Ordering::Acquire) == aps;
     let _ = writeln!(
         com1,

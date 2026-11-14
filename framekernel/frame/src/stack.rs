@@ -44,9 +44,12 @@ use crate::descriptors::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
 use crate::memory::{self, OwnedFrame};
 
 /// The address space each stack has: the stack at its top, unmapped space below.
-pub const SLOT: u64 = 128 * 1024;
-/// Stacks the region holds at once: 32 for each processor the kernel indexes.
-const SLOTS: usize = 32 * crate::limits::MAX_CPUS;
+pub const SLOT: u64 = layout::STACK_SLOT;
+/// Stacks the region holds at boot, its floor: 256 MiB of slots.
+const SLOTS: usize = (STACK_REGION_SIZE / SLOT) as usize;
+/// The most processors the region's reserved address space has room for (ADR-0008 Amendment 1,
+/// D3): 262,144.
+pub const MAX_PROCESSORS: usize = layout::STACK_REGION_MAX_PROCESSORS as usize;
 /// Freed stacks kept mapped for the next stack of their size.
 pub const IDLE: usize = 16;
 /// The largest stack: half its slot, so that at least as much unmapped space lies below it.
@@ -62,8 +65,73 @@ const _: () = assert!(
     "a stack's shootdown names its pages"
 );
 
-/// The region's slots.
+/// The region's slots: the floor's, and those [`grow`] adds.
 static REGION: Slots<SLOTS, IDLE> = Slots::new();
+/// The region's size in bytes: its floor until [`grow`] adds to it, once, before any
+/// application processor starts. Every address check reads it ([`region_size`]).
+static REGION_SIZE: AtomicU64 = AtomicU64::new(STACK_REGION_SIZE);
+
+/// The region's size in bytes, its floor until it grows.
+pub fn region_size() -> u64 {
+    REGION_SIZE.load(Ordering::Acquire)
+}
+
+/// The region's size for `processors` indexed processors (`layout::stack_region_size_for`).
+fn size_for(processors: usize) -> u64 {
+    layout::stack_region_size_for(processors as u64)
+}
+
+/// The processors a region of `size` bytes has room for (`layout::stack_region_room`).
+fn room_in(size: u64) -> usize {
+    layout::stack_region_room(size) as usize
+}
+
+/// What [`grow`] reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Growth {
+    /// How many processors the region has room for: the floor's 64 if the tables or the slots
+    /// could not be had, and at most [`MAX_PROCESSORS`].
+    pub room: usize,
+    /// Whether it stayed short for want of memory: the run of frames for its page tables or the
+    /// storage for its slots (review finding F12 of 2026-11-14).
+    pub short_of_memory: bool,
+}
+
+/// Grows the region for `processors` indexed processors (ADR-0008 Amendment 1, D3), once, on the
+/// boot processor after the MADT is read, before the per-CPU tables are sized for its room and
+/// before any application processor starts: the page tables for what lies past the floor, from
+/// one run of frames taken now, then the slots.
+pub(crate) fn grow(processors: usize) -> Growth {
+    let size = size_for(processors);
+    let floor = room_in(STACK_REGION_SIZE);
+    let short = |short_of_memory| Growth {
+        room: floor,
+        short_of_memory,
+    };
+    if size <= STACK_REGION_SIZE || region_size() != STACK_REGION_SIZE {
+        return Growth {
+            room: room_in(region_size()).max(floor),
+            short_of_memory: false,
+        };
+    }
+    let base = region().base;
+    match crate::vm::grow_stack_region(base, STACK_REGION_SIZE, size) {
+        Ok(()) => {}
+        Err(origin_paging::MapError::OutOfMemory) => return short(true),
+        Err(_) => return short(false),
+    }
+    match without_interrupts(|| REGION.grow((size / SLOT) as usize)) {
+        Ok(slots) if slots as u64 * SLOT == size => {
+            REGION_SIZE.store(size, Ordering::Release);
+            Growth {
+                room: room_in(size),
+                short_of_memory: false,
+            }
+        }
+        Err(origin_sync::slots::Grow::NoMemory) => short(true),
+        _ => short(false),
+    }
+}
 
 /// Where the kernel stacks' region is (ADR-0004 Amendment 2).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -151,7 +219,7 @@ fn stack_low(slot: usize, pages: u32) -> u64 {
 /// The slot holding `addr`, if `addr` is in the stack region.
 fn slot_of(addr: u64) -> Option<usize> {
     let base = region().base;
-    if addr < base || addr - base >= STACK_REGION_SIZE {
+    if addr < base || addr - base >= region_size() {
         return None;
     }
     Some(((addr - base) / SLOT) as usize)
