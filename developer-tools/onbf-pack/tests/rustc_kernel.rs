@@ -781,9 +781,15 @@ fn command_line_keys() {
     let open = dir.0.join("open.key");
     fs::copy(&key, &open).unwrap();
     fs::set_permissions(&open, fs::Permissions::from_mode(0o644)).unwrap();
-    refused(&open, "readable by others: a key file must be mode 0600");
+    refused(
+        &open,
+        "a key file must be readable or writable by its owner only (for example 0600)",
+    );
     fs::set_permissions(&open, fs::Permissions::from_mode(0o640)).unwrap();
-    refused(&open, "readable by others: a key file must be mode 0600");
+    refused(
+        &open,
+        "a key file must be readable or writable by its owner only (for example 0600)",
+    );
     // Its bytes, refused by the library, named with the file.
     let damaged = dir.0.join("damaged.key");
     let mut bytes = existing.clone();

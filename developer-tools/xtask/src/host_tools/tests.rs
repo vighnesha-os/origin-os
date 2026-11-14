@@ -75,7 +75,7 @@ fn the_gate_s_own_controls_are_caught() {
             pack_line.as_ref(),
             &sign_manifest
         ),
-        Ok(10)
+        Ok(11)
     );
     // A control is missed when the rule it tests is gone: with no first-party programs, the
     // path control finds nothing to name.
@@ -489,6 +489,41 @@ fn cargo_s_aliases_are_cargo_run() {
             r#"fn boot_matrix() { cargo().args(["xtask", "boot-test"]); }"#,
             false,
         ),
+        // The option before an alias takes its value only from the element before it, and an
+        // element that is not a literal is unknown (the review's addendum, finding N1).
+        (
+            r#"fn h(settings: &str) { cargo().args(["--config", &settings, "xtask", "boot-test"]); }"#,
+            true,
+        ),
+        (
+            r#"fn i(color: &str) { cargo().args(["--color", &color, "xtask", "boot-test"]); }"#,
+            true,
+        ),
+        (
+            r#"fn j(name: &str) { cargo().args(["--package", name, "xtask"]); }"#,
+            true,
+        ),
+        (
+            r#"fn k() { cargo().args(vec!["test", "--package", "xtask"]); }"#,
+            false,
+        ),
+        (
+            r#"fn l() { cargo().args(["test", "--package", "xtask"].iter()); }"#,
+            false,
+        ),
+        (
+            r#"fn m() { cargo().args(["test", "--package", "xtask", "--", "-q"]); }"#,
+            false,
+        ),
+        // An alias defined in the argument list itself (finding N2).
+        (
+            r#"fn n() { cargo().args(["--config", "alias.pack=\"run -p onbf-pack\"", "pack", "krn"]); }"#,
+            true,
+        ),
+        (
+            r#"fn o() { cargo().arg("--config=alias.pack=run").arg("pack"); }"#,
+            true,
+        ),
     ] {
         let hits = planted_in_main(planted);
         assert_eq!(hits.len(), usize::from(refused), "{planted}: {hits:?}");
@@ -615,4 +650,98 @@ fn a_command_line_names_no_crate_but_its_library_and_std() {
         let own = format!("{}\nfn e() {{ let _ = {}::VERSION; }}", line.main, line.own);
         assert_eq!(command_line_hits(&own, &line.own, &line.crates), []);
     }
+}
+
+/// The aliases come from the repository root's Cargo configuration and nothing else under it:
+/// another checkout's `.cargo` (the main checkout holds other sessions' worktrees), a file that
+/// is not UTF-8 there, or a non-configuration file in the root's `.cargo` changes nothing (the
+/// review's addendum, finding N3).
+#[test]
+fn aliases_are_read_from_the_root_s_configuration_alone() {
+    let root = crate::target_dir()
+        .join("xtask")
+        .join("gate-tests")
+        .join("root-aliases");
+    let _ = std::fs::remove_dir_all(&root);
+    for dir in [".cargo", "worktree/.cargo", "deep/a/.cargo"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::write(
+        root.join(".cargo/config.toml"),
+        "[alias]\nxtask = \"run --quiet --package xtask --\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join(".cargo/.DS_Store"), [0xFF, 0xFE, 0x00, 0x80]).unwrap();
+    std::fs::write(
+        root.join("worktree/.cargo/config.toml"),
+        "[alias]\nxtask = \"build\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("deep/a/.cargo/config.toml"),
+        [0xFF, 0xFE, 0x00, 0x80],
+    )
+    .unwrap();
+    let aliases = repository_aliases(&root).unwrap();
+    assert_eq!(aliases.len(), 1, "{aliases:?}");
+    assert_eq!(
+        run_aliases(&aliases).get("xtask"),
+        Some(&Some("xtask".to_string()))
+    );
+    // A root with no configuration has no aliases; one whose configuration is not UTF-8 fails.
+    std::fs::remove_file(root.join(".cargo/config.toml")).unwrap();
+    assert!(repository_aliases(&root).unwrap().is_empty());
+    std::fs::write(root.join(".cargo/config"), [0xFF, 0xFE]).unwrap();
+    assert!(repository_aliases(&root).is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The test-only-item scan before the fix for finding F1: an item ended only at a depth-0 `;` or
+/// with its block.
+fn scan_before_f1(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for i in 0..tokens.len() {
+        let attribute = ["#", "[", "cfg", "(", "test", ")", "]"];
+        let is_attribute = attribute
+            .iter()
+            .enumerate()
+            .all(|(k, text)| tokens.get(i + k).is_some_and(|t| t.text == *text));
+        if !is_attribute {
+            continue;
+        }
+        let mut depth = 0;
+        for (k, t) in tokens.iter().enumerate().skip(i + attribute.len()) {
+            if depth == 0 && t.is_punct(';') {
+                ranges.push((i, k));
+                break;
+            }
+            if depth == 0 && t.is_punct('{') {
+                if let Some(close) = lex::closing(tokens, k) {
+                    ranges.push((i, close));
+                }
+                break;
+            }
+            depth += lex::bracket(t).unwrap_or(0);
+        }
+    }
+    ranges
+}
+
+/// The per-run control for finding F1 is one the scan before the fix would miss: its `std::fs`
+/// lies inside the range that scan excluded, and outside every range the fixed scan excludes (the
+/// review's addendum, finding N4).
+#[test]
+fn the_test_field_control_is_missed_by_the_scan_before_the_fix() {
+    let tokens = lex::tokens(PLANTED_TEST_FIELD);
+    let fs = tokens
+        .iter()
+        .enumerate()
+        .position(|(k, t)| {
+            t.is_ident("fs") && k >= 3 && tokens.get(k - 3).is_some_and(|s| s.is_ident("std"))
+        })
+        .expect("the control names std::fs");
+    let inside = |ranges: &[(usize, usize)]| ranges.iter().any(|&(a, b)| a <= fs && fs <= b);
+    assert!(inside(&scan_before_f1(&tokens)), "the old scan hid it");
+    assert!(!inside(&test_items(&tokens)), "the fixed scan does not");
+    assert_eq!(library_hits(PLANTED_TEST_FIELD).len(), 1);
 }

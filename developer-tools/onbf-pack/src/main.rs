@@ -471,9 +471,9 @@ fn wipe(bytes: &mut [u8]) {
 /// Loads the key in the key file at `path`, refusing a symbolic link, anything but a regular
 /// file, and one that anyone but its owner can read or write: like an SSH private key, it must
 /// be owner-only, with no group or other permission bit (0600 as `keygen` writes it; 0400 and
-/// 0700 pass too, and the message says "0600", as it always has). Opened once and checked on
-/// that handle, so that what is read is exactly what was checked; the library then refuses a
-/// damaged or foreign file.
+/// 0700 pass too, and the message says what is checked, with 0600 as its example, since the
+/// review of 2026-11-14, finding F13). Opened once and checked on that handle, so that what is
+/// read is exactly what was checked; the library then refuses a damaged or foreign file.
 fn load_key(path: &Path) -> Result<HostKey, Failure> {
     let cannot_read = |e| conversion(format!("cannot read {}: {e}", path.display()));
     let refused = |why: &str| conversion(format!("{}: {why}", path.display()));
@@ -487,7 +487,9 @@ fn load_key(path: &Path) -> Result<HostKey, Failure> {
         return Err(refused("not a regular file"));
     }
     if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(refused("readable by others: a key file must be mode 0600"));
+        return Err(refused(
+            "a key file must be readable or writable by its owner only (for example 0600)",
+        ));
     }
     let mut bytes = Vec::new();
     let read = file.read_to_end(&mut bytes).map_err(cannot_read);

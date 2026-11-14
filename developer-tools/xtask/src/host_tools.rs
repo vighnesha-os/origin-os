@@ -2,22 +2,25 @@
 //! decision items 295 and 300; TASKS item 60). Part of `check`. Three halves and a check of
 //! manifests, read with xtask's lexer (`lex.rs`), so comments and the text inside string
 //! literals are not code. Its rules were tightened after the independent review of 2026-11-14
-//! (`docs/engineering/REVIEW_T60_2026-11-14.md`, findings F1 to F5, F8, F11 and F12).
+//! (`docs/engineering/REVIEW_T60_2026-11-14.md`, findings F1 to F5, F8, F11 and F12, and its
+//! addendum's N1 to N6).
 //!
 //! **G1: `xtask` starts no first-party program.** It calls `onbf-pack`'s and `oidl`'s libraries
 //! (and `onbf-sign`'s through `onbf_pack::sign`); the programs it starts are outside ones:
 //! Cargo, `rustc`, Git, `llvm-objdump`, `nm`, QEMU. Over every `.rs` file of
 //! `developer-tools/xtask/`, its tests included, the gate refuses:
 //!
-//! - **Cargo's `run`, by any name the repository gives it**: a string literal whose first word
-//!   is `run`, Cargo's built-in alias `r`, or an alias of the repository's Cargo configuration
-//!   that runs a program (every file in a `.cargo` directory of the tree, `[alias]` and
-//!   `alias.<name>` keys, followed alias to alias: today `xtask`), inside the parentheses of an
-//!   `.arg(…)` or `.args(…)` call, written there or through a `const NAME: … = "…";` defined in
-//!   `xtask`. An alias's name that is the value of an option taking one (`--package xtask`) is
-//!   not refused, and the alias `xtask` is allowed where `xtask` may re-run itself
-//!   ([`SELF_RUNS`]). A literal beginning `CARGO_ALIAS_` is refused anywhere. It also refuses
-//!   `run` given to an outside program; none takes it today.
+//! - **Cargo's `run`, and the aliases of the repository root's Cargo configuration that run a
+//!   program**: in the parentheses of an `.arg(…)` or `.args(…)` call, a string literal, or a
+//!   `const NAME: … = "…";` defined in `xtask`, whose first word is `run`, Cargo's built-in alias
+//!   `r`, or an alias of `<root>/.cargo/config.toml` or `<root>/.cargo/config` that runs a
+//!   program (`[alias]` and `alias.<name>` keys, followed alias to alias: today `xtask`). An
+//!   alias's name is not refused when it is a whole element of the list and the element before it
+//!   is a literal option that takes a value (`["test", "--package", "xtask"]`); an element that is
+//!   not a literal exempts nothing. The alias `xtask` is allowed where `xtask` may re-run itself
+//!   ([`SELF_RUNS`]). A literal there that defines an alias (`alias.…`, `--config=alias.…`) is
+//!   refused, and a literal beginning `CARGO_ALIAS_` is refused anywhere in `xtask`. It also
+//!   refuses `run` given to an outside program; none takes it today.
 //! - **A first-party program by name or path**: inside the parentheses of `Command::new(…)`, a
 //!   literal (or such a `const`) that is the name of a workspace package or of a `[[bin]]`
 //!   target, alone or as a path's last component. The names are read from every manifest in the
@@ -81,13 +84,15 @@
 //! **Negative controls.** Every run, before it reports, the gate checks planted copies of real
 //! files ([`controls`]), each of which must be refused or the gate fails: in `xtask`'s `main.rs`,
 //! the `cargo run --release --package onbf-pack` that `xtask` ran before T1, a `Command::new` of
-//! `oidl`'s binary, a `current_exe` outside the list, and `cargo().args(["xtask", "boot-test"])`
-//! outside it; in `onbf-sign`'s `lib.rs`, the `os_random` it had before T1, a test-only field
-//! with host access after it, a stream through `std::io` and a `Path::is_file`; in
-//! `onbf-pack`'s `main.rs`, the `onbf_verify::key_id` call it had before T1; in `onbf-sign`'s
+//! `oidl`'s binary, a `current_exe` outside the list, `cargo().args(["xtask", "boot-test"])`
+//! outside it, and the same after a `--config` whose value is a variable; in `onbf-sign`'s
+//! `lib.rs`, the `os_random` it had before T1, a test-only field with host access after it (which
+//! the scan before the fix for F1 would miss), a stream through `std::io` and a `Path::is_file`;
+//! in `onbf-pack`'s `main.rs`, the `onbf_verify::key_id` call it had before T1; in `onbf-sign`'s
 //! manifest, a dependency on `onbf-pack`. The host tests plant every refused form.
 //!
-//! **What it cannot see** (the review's findings F8 and F12, and before them):
+//! **What it cannot see** (the review's findings F8 and F12, its addendum's N2, N5 and N6, and
+//! before them):
 //!
 //! - It reads tokens, not data flow. An argument list or a program's path built in a variable
 //!   somewhere else and handed to `.args(…)` or `Command::new(…)` is not seen; nor a `static` or a
@@ -104,7 +109,18 @@
 //!   is skipped, not refused.
 //! - A Cargo alias defined in the environment `xtask` inherits (`CARGO_ALIAS_<NAME>`) or in a
 //!   Cargo configuration outside the repository (a parent directory, Cargo's home), which Cargo
-//!   reads and a lexical gate does not.
+//!   reads and a lexical gate does not; and an alias's name or definition, or a `CARGO_ALIAS_…`
+//!   name, built with `concat!`, `format!` or at run time, as this gate builds its own prefix
+//!   (the review's addendum, finding N2).
+//! - Controls that can fail with nothing broken, a false failure and never a false pass (finding
+//!   N5): the two alias controls need the root's configuration to keep `xtask` as an alias that
+//!   runs, and the manifest control needs `onbf-sign`'s manifest to hold the line `[dependencies]`
+//!   exactly, with nothing after it and Unix line endings.
+//! - False refusals, each failing closed (finding N6): a comma inside `<…>` ends a test-only item
+//!   early, so the rest of it is read as library code; G3 refuses a local identifier equal to a
+//!   crate's name (`first_program`, `origin_core`, `xtask`); `.arg("-p").arg("xtask")` is refused,
+//!   since an option's value is read within one argument list only; and an editor's backup with an
+//!   owned name (`<name>.rs~`) that cannot be read stops `carried`.
 //! - A library that reaches the host through a crate it depends on: the dependencies are held
 //!   to [`LIBRARY_DEPENDENCIES`], whose crates are read by their own gates, not this one.
 //!
@@ -400,29 +416,23 @@ pub(crate) fn aliases_in(text: &str) -> BTreeMap<String, Vec<String>> {
     aliases
 }
 
-/// Every alias of the repository's Cargo configuration: each file in a `.cargo` directory of the
-/// tree (not under `target/` or `.git/`).
-fn repository_aliases(root: &Path) -> Result<BTreeMap<String, Vec<String>>> {
+/// The Cargo configuration files of the repository's root that hold its aliases:
+/// `.cargo/config.toml` and `.cargo/config`, the files Cargo reads there when `xtask` runs it from
+/// the root. Nothing else under the root is read: the main checkout holds other sessions'
+/// worktrees, each with a `.cargo` of its own (the review's addendum, finding N3).
+const ALIAS_FILES: &[&str] = &[".cargo/config.toml", ".cargo/config"];
+
+/// The aliases of the repository root's Cargo configuration ([`ALIAS_FILES`]), each that exists.
+pub(crate) fn repository_aliases(root: &Path) -> Result<BTreeMap<String, Vec<String>>> {
     let mut aliases = BTreeMap::new();
-    let mut directories = vec![root.to_path_buf()];
-    while let Some(dir) = directories.pop() {
-        let entries = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let is_dir = entry
-                .file_type()
-                .map_err(|e| format!("{}: {e}", path.display()))?
-                .is_dir();
-            if is_dir && name != "target" && name != ".git" {
-                directories.push(path);
-            } else if !is_dir && dir.file_name().is_some_and(|d| d == ".cargo") {
-                let text = String::from_utf8(read_file(&path)?)
-                    .map_err(|_| format!("{}: not UTF-8", path.display()))?;
-                aliases.extend(aliases_in(&text));
-            }
+    for file in ALIAS_FILES {
+        let path = root.join(file);
+        if !path.is_file() {
+            continue;
         }
+        let text = String::from_utf8(read_file(&path)?)
+            .map_err(|_| format!("{}: not UTF-8", path.display()))?;
+        aliases.extend(aliases_in(&text));
     }
     Ok(aliases)
 }
@@ -445,6 +455,41 @@ fn names_program<'p>(text: &str, programs: &'p BTreeSet<String>) -> Option<&'p s
         .get(text)
         .or_else(|| programs.get(last))
         .map(String::as_str)
+}
+
+/// The elements of an argument list, given as the tokens `.arg(…)` or `.args(…)` holds: the ranges
+/// of `body`'s tokens between the commas of its list (the first `[…]` outside every other bracket,
+/// as in `[…]`, `&[…]` or `vec![…]`), or the whole of `body` when it holds no list. A token outside
+/// every element (after the list, as in `[…].iter()`) is in none.
+fn elements(body: &[Token<'_>]) -> Vec<(usize, usize)> {
+    let mut depth = 0;
+    let mut open = None;
+    for (k, token) in body.iter().enumerate() {
+        if depth == 0 && token.is_punct('[') {
+            open = Some(k);
+            break;
+        }
+        depth += lex::bracket(token).unwrap_or(0);
+    }
+    let Some(open) = open else {
+        return vec![(0, body.len())];
+    };
+    let close = lex::closing(body, open).unwrap_or(body.len());
+    let mut found = Vec::new();
+    let mut start = open + 1;
+    let mut depth = 0;
+    for (k, token) in body.iter().enumerate().take(close).skip(open + 1) {
+        if depth == 0 && token.is_punct(',') {
+            found.push((start, k));
+            start = k + 1;
+            continue;
+        }
+        depth += lex::bracket(token).unwrap_or(0);
+    }
+    if start < close {
+        found.push((start, close));
+    }
+    found
 }
 
 /// The tokens inside the parentheses that open at `open`, if they do.
@@ -520,16 +565,35 @@ pub(crate) fn program_hits(
                 .get(i + 1)
                 .is_some_and(|t| t.is_ident("arg") || t.is_ident("args"));
         if argument_list && let Some(body) = parenthesised(&tokens, i + 2) {
-            // The literal before the one being read, in this argument list.
-            let mut previous: Option<String> = None;
-            for t in body {
+            let elements = elements(body);
+            for (k, t) in body.iter().enumerate() {
                 let Some(text) = text_of(t, consts) else {
                     continue;
                 };
-                let after_value_option = previous
-                    .as_deref()
-                    .is_some_and(|p| VALUE_OPTIONS.contains(&p));
-                previous = Some(text.clone());
+                // An alias's name is an option's value only when it is a whole element of the
+                // list and the element before it is a literal option that takes a value; an
+                // element that is not a literal is unknown and exempts nothing (the review's
+                // addendum, finding N1).
+                let after_value_option = elements
+                    .iter()
+                    .position(|&(start, end)| start == k && end == k + 1)
+                    .and_then(|e| e.checked_sub(1))
+                    .and_then(|e| elements.get(e))
+                    .filter(|&&(start, end)| end == start + 1)
+                    .and_then(|&(start, _)| body.get(start))
+                    .and_then(|previous| text_of(previous, consts))
+                    .is_some_and(|previous| VALUE_OPTIONS.contains(&previous.as_str()));
+                // An alias defined in the argument list itself, as `--config`'s value (finding
+                // N2).
+                if text.starts_with("alias.") || text.starts_with("--config=alias.") {
+                    hit(
+                        t,
+                        format!(
+                            "`{text}` given to a command: an alias defined there can be `cargo run` of a first-party program (ADR-0011 Amendment 4, T1)"
+                        ),
+                    );
+                    continue;
+                }
                 if starts_run(&text) {
                     hit(
                         t,
@@ -1121,6 +1185,14 @@ fn planted_control_alias() -> Result {
 }
 "#;
 
+/// `xtask` run through Cargo's alias after an option whose value is not a literal (the review's
+/// addendum, finding N1): planted by the controls.
+const PLANTED_OPTION_VALUE: &str = r#"
+fn planted_control_settings(settings: &str) -> Result {
+    run_step(cargo().args(["--config", settings, "xtask", "boot-test"]))
+}
+"#;
+
 /// What `onbf-pack`'s command line called before T1 (the review of 2026-11-14, finding F5):
 /// planted by the controls.
 const PLANTED_KEY_ID: &str = r#"
@@ -1152,7 +1224,8 @@ pub struct PlantedControlProbe {
     pub probe: bool,
 }
 pub fn planted_control_read(path: &str) -> Vec<u8> {
-    std::fs::read(path).unwrap_or_default()
+    let bytes = std::fs::read(path).unwrap_or_default();
+    bytes
 }
 "#;
 
@@ -1197,6 +1270,11 @@ fn controls(
             PLANTED_ALIAS_RUN,
             "Cargo's alias `xtask` is `cargo run`",
             "`cargo xtask` outside SELF_RUNS",
+        ),
+        (
+            PLANTED_OPTION_VALUE,
+            "Cargo's alias `xtask` is `cargo run`",
+            "`cargo xtask` after an option whose value is not a literal",
         ),
     ] {
         let text = format!("{main}\n{planted}");
@@ -1249,7 +1327,7 @@ fn controls(
         missed.push("a dependency in developer-tools/onbf-sign/Cargo.toml".into());
     }
     if missed.is_empty() {
-        Ok(6 + library_controls.len())
+        Ok(7 + library_controls.len())
     } else {
         Err(missed)
     }
