@@ -418,6 +418,97 @@ impl Status {
     }
 }
 
+/// The driver's own deadline for a Flush, for an I/O command of any other kind, and for an
+/// admin command, in milliseconds. Base 2.4 sets no command timeout for a controller on PCIe
+/// (§3.9, p. 155): these are the driver's values (TASKS item 59, finding P1), to be revisited
+/// when Abort or a controller reset is built. A command past its deadline may still be live,
+/// so its queue is dead from then on; the deadlines are long so that a slow flush, on a
+/// loaded host or a drive with a large volatile cache, does not end a queue.
+pub const FLUSH_DEADLINE_MS: u64 = 30_000;
+pub const IO_DEADLINE_MS: u64 = 10_000;
+pub const ADMIN_DEADLINE_MS: u64 = 2_000;
+
+/// The deadline of a command with `opcode`, on an admin queue or an I/O queue. Opcodes are
+/// per command set: admin 00h is Delete I/O Submission Queue, not Flush.
+pub const fn deadline_ms(admin: bool, opcode: u8) -> u64 {
+    if admin {
+        ADMIN_DEADLINE_MS
+    } else if opcode == opcode::FLUSH {
+        FLUSH_DEADLINE_MS
+    } else {
+        IO_DEADLINE_MS
+    }
+}
+
+/// Why a command did not end in success, for the line that reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// It completed with this status, not success.
+    Status(Status),
+    /// No completion came within this many milliseconds, its deadline. The command may still
+    /// be live, so its queue is dead from then on.
+    NoCompletion { ms: u64 },
+    /// The next completion on its queue answered command `cid` of submission queue `sq_id`
+    /// instead: the controller's error. This command may still be live, so its queue is dead
+    /// from then on.
+    WrongCommand { cid: u16, sq_id: u16 },
+    /// Refused before it reached the device: another command was outstanding on its queue.
+    Busy,
+    /// Refused before it reached the device: its queue had lost an earlier command.
+    Dead,
+    /// Refused before it reached the device: its queue had no free slot.
+    Full,
+    /// Refused before it reached the device: its buffer would need a PRP list.
+    NeedsPrpList,
+    /// Refused: no controller or queue for it.
+    NoQueue,
+}
+
+impl Fault {
+    /// Whether the command may still be live in the device, so that its buffer must never be
+    /// used again.
+    pub const fn may_be_live(&self) -> bool {
+        matches!(self, Self::NoCompletion { .. } | Self::WrongCommand { .. })
+    }
+}
+
+impl core::fmt::Display for Fault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::Status(s) => write!(
+                f,
+                "completed with status type {} code {:#04x}{}",
+                s.kind,
+                s.code,
+                if s.final_ { " (do not retry)" } else { "" }
+            ),
+            Self::NoCompletion { ms } => write!(f, "no completion within {ms} ms"),
+            Self::WrongCommand { cid, sq_id } => write!(
+                f,
+                "a completion for command {cid} of submission queue {sq_id} came instead"
+            ),
+            Self::Busy => f.write_str("refused: another command was outstanding on its queue"),
+            Self::Dead => f.write_str("refused: its queue had lost an earlier command"),
+            Self::Full => f.write_str("refused: its queue was full"),
+            Self::NeedsPrpList => f.write_str("refused: its buffer would need a PRP list"),
+            Self::NoQueue => f.write_str("refused: no queue for it"),
+        }
+    }
+}
+
+/// A command's step in a proof and why it did not succeed: printed as "`step`: `fault`".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepFault {
+    pub step: &'static str,
+    pub fault: Fault,
+}
+
+impl core::fmt::Display for StepFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}: {}", self.step, self.fault)
+    }
+}
+
 /// Generic command status (SCT 0) 80h: LBA out of range (NVM Command Set 1.3 Figure 18,
 /// p. 25). Compare with [`Status::is`].
 pub const LBA_OUT_OF_RANGE: Status = Status {
@@ -1035,6 +1126,75 @@ mod tests {
         assert!(!status(0x80, 1, 1).is(&LBA_OUT_OF_RANGE), "another type");
         assert!(!status(0x81, 0, 1).is(&LBA_OUT_OF_RANGE), "another code");
         assert!(!status(0, 0, 0).is(&LBA_OUT_OF_RANGE));
+    }
+
+    /// P1: the driver's own deadlines, by queue and opcode.
+    #[test]
+    fn deadlines_by_command() {
+        assert_eq!(deadline_ms(false, opcode::FLUSH), 30_000);
+        assert_eq!(deadline_ms(false, opcode::READ), 10_000);
+        assert_eq!(deadline_ms(false, opcode::WRITE), 10_000);
+        assert_eq!(deadline_ms(true, 0x00), 2_000, "admin 00h is not Flush");
+        assert_eq!(deadline_ms(true, opcode::IDENTIFY), 2_000);
+        assert_eq!(deadline_ms(true, opcode::CREATE_IO_CQ), 2_000);
+        const { assert!(FLUSH_DEADLINE_MS >= IO_DEADLINE_MS && IO_DEADLINE_MS >= ADMIN_DEADLINE_MS) };
+    }
+
+    /// P1: each way a command can fail names itself, and says whether the command may still
+    /// be live.
+    #[test]
+    fn a_fault_names_itself() {
+        let name = |f: Fault| alloc::format!("{f}");
+        let lba = Completion::decode([0, 0, 0, (0x80 | 1 << 14) << 17]).status;
+        assert_eq!(
+            name(Fault::Status(lba)),
+            "completed with status type 0 code 0x80 (do not retry)"
+        );
+        let retry = Completion::decode([0, 0, 0, (0x06 | 2 << 8) << 17]).status;
+        assert_eq!(
+            name(Fault::Status(retry)),
+            "completed with status type 2 code 0x06"
+        );
+        assert_eq!(
+            name(Fault::NoCompletion { ms: 30_000 }),
+            "no completion within 30000 ms"
+        );
+        assert_eq!(
+            name(Fault::WrongCommand { cid: 7, sq_id: 3 }),
+            "a completion for command 7 of submission queue 3 came instead"
+        );
+        for (f, text) in [
+            (
+                Fault::Busy,
+                "refused: another command was outstanding on its queue",
+            ),
+            (
+                Fault::Dead,
+                "refused: its queue had lost an earlier command",
+            ),
+            (Fault::Full, "refused: its queue was full"),
+            (
+                Fault::NeedsPrpList,
+                "refused: its buffer would need a PRP list",
+            ),
+            (Fault::NoQueue, "refused: no queue for it"),
+        ] {
+            assert_eq!(name(f), text);
+            assert!(!f.may_be_live(), "{text}");
+        }
+        assert!(!Fault::Status(lba).may_be_live());
+        assert!(Fault::NoCompletion { ms: 1 }.may_be_live());
+        assert!(Fault::WrongCommand { cid: 0, sq_id: 0 }.may_be_live());
+        assert_eq!(
+            alloc::format!(
+                "{}",
+                StepFault {
+                    step: "its flush",
+                    fault: Fault::NoCompletion { ms: 30_000 }
+                }
+            ),
+            "its flush: no completion within 30000 ms"
+        );
     }
 
     /// L10: a completion answers a command only on that command's own submission queue.
