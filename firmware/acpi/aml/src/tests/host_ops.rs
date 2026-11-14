@@ -1505,3 +1505,92 @@ fn fields_of_no_bits_and_buffers_of_no_bytes_end_however_they_are_used() {
     }
     eprintln!("fields of no bits, buffers of no bytes: {outcomes:?}");
 }
+
+#[test]
+fn match_lets_through_what_is_not_a_conversion() {
+    // The review of B2's Addendum 2, N2-2: an element's read that needs a PCI function, meets a
+    // limit or is refused is not "does not match".
+    let mt = |name: &str| {
+        method(
+            "MT",
+            0,
+            &[ret(match_(
+                package(1, &[nm(name)]),
+                1,
+                byte(0x86),
+                0,
+                zero(),
+                zero(),
+            ))],
+        )
+    };
+    // A field whose PCI function is not yet known: found first, then read once, and matched.
+    let mut i = pci_device(&[ret(dword(0x0001_0000))], &[mt("\\_SB.PCI0.D1.F1")]);
+    i.host_mut().memory.insert((2, Some((0, 0, 1, 0)), 0), 0x86);
+    assert_eq!(int(&mut i, "MT"), 0);
+    assert_eq!(i.host().seen.iter().filter(|s| !s.write).count(), 1);
+    let io = |len: u32, bits: u32| {
+        vec![
+            op_region("IO", 1, word(0x80), dword(len)),
+            field("IO", BYTE, &[Fe::Named("P80", bits)]),
+        ]
+    };
+    let with = |limits: Limits, body: Vec<B>| {
+        let mut i = super::interp_with(IntegerWidth::Bits64, limits);
+        load(&mut i, &body).expect("the block loads");
+        i
+    };
+    // No time left when the element is read.
+    let mut body = io(1, 8);
+    body.push(method(
+        "MT",
+        0,
+        &[
+            sleep(word(1_000)),
+            ret(match_(
+                package(1, &[nm("P80")]),
+                1,
+                zero(),
+                0,
+                zero(),
+                zero(),
+            )),
+        ],
+    ));
+    let mut i = with(
+        Limits {
+            time_100ns: 10_000_000,
+            ..Limits::SERVICE
+        },
+        body,
+    );
+    assert_eq!(fails(&mut i, "MT"), ErrorKind::Limit(Limit::Time));
+    // The element's bytes do not fit the memory limit.
+    let mut body = io(0x2_0000, 0x10_0000);
+    body.push(mt("P80"));
+    let mut i = with(
+        Limits {
+            memory_bytes: 64 << 10,
+            ..Limits::SERVICE
+        },
+        body,
+    );
+    assert_eq!(fails(&mut i, "MT"), ErrorKind::Limit(Limit::Memory));
+    // The element's units pass the step limit.
+    let mut body = io(1024, 8 * 1024);
+    body.push(mt("P80"));
+    let mut i = with(
+        Limits {
+            steps: 500,
+            ..Limits::SERVICE
+        },
+        body,
+    );
+    assert_eq!(fails(&mut i, "MT"), ErrorKind::Limit(Limit::Steps));
+    // The host refuses the element's read.
+    let mut body = io(1, 8);
+    body.push(mt("P80"));
+    let mut i = with(Limits::SERVICE, body);
+    i.host_mut().refuse = true;
+    assert!(matches!(fails(&mut i, "MT"), ErrorKind::Region { .. }));
+}

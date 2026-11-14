@@ -963,8 +963,16 @@ impl<H: Host> Interpreter<H> {
 
     /// `Match` (§19.6.81): the first index from the start whose element satisfies both
     /// comparisons; elements that are not integers, strings or buffers, or will not convert, never
-    /// match.
+    /// match. Only such failures are "does not match": a limit, a host's refusal or anything else
+    /// ends the evaluation (the review of B2's Addendum 2, N2-2).
     fn match_package(&mut self, f: &OpFrame) -> Result<u64> {
+        /// A failure that only means the element does not convert, and so never matches.
+        fn no_match(e: &Error) -> bool {
+            matches!(
+                e.kind,
+                ErrorKind::Type | ErrorKind::Uninitialized | ErrorKind::NotFound
+            )
+        }
         let Val::Obj(pkg) = val(f, 0)? else {
             return err(ErrorKind::Type);
         };
@@ -976,13 +984,29 @@ impl<H: Host> Interpreter<H> {
         let objs = [val(f, 2)?, val(f, 4)?];
         let start = self.int(f, 5)?;
         let start = usize::try_from(start).unwrap_or(usize::MAX);
+        // Before any element is read: a field among them whose PCI function is not yet known
+        // asks for it now, so that the step put back for it has read nothing (B2-1).
         for k in start..n {
             self.charge(1)?;
             let e = match self.heap.get(pkg)? {
                 Object::Package(v) => v.get(k).copied().unwrap_or(Val::None),
                 _ => Val::None,
             };
-            let Ok(e) = self.element(e) else { continue };
+            if let Some(region) = self.unresolved_element(e)? {
+                return Err(self.need_address(region));
+            }
+        }
+        for k in start..n {
+            self.charge(1)?;
+            let e = match self.heap.get(pkg)? {
+                Object::Package(v) => v.get(k).copied().unwrap_or(Val::None),
+                _ => Val::None,
+            };
+            let e = match self.element(e) {
+                Ok(e) => e,
+                Err(e) if no_match(&e) => continue,
+                Err(e) => return Err(e),
+            };
             if !matches!(self.data(e), Ok(Data::Int | Data::Str | Data::Buf)) {
                 continue;
             }
@@ -998,7 +1022,8 @@ impl<H: Host> Interpreter<H> {
                             4 => o.is_ge(),
                             _ => o.is_gt(),
                         },
-                        Err(_) => false,
+                        Err(e) if no_match(&e) => false,
+                        Err(e) => return Err(e),
                     },
                     _ => return err(ErrorKind::Type),
                 };

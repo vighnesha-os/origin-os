@@ -127,6 +127,28 @@ impl<H: Host> Interpreter<H> {
         Ok(None)
     }
 
+    /// A package element naming a field unit whose reading would need a PCI function not yet
+    /// found: that region. For `Match`, which reads many elements in one step (N2-2).
+    pub(crate) fn unresolved_element(&mut self, e: Val) -> Result<Option<NodeId>> {
+        let Val::Obj(r) = e else { return Ok(None) };
+        let Object::NameElem(name) = *self.heap.get(r)? else {
+            return Ok(None);
+        };
+        // A name that resolves to nothing never matches; that is found when it is read.
+        let Ok(node) = self.resolve_elem(name) else {
+            return Ok(None);
+        };
+        let heap = &self.heap;
+        let Ok(node) = self.ns.unalias(node, |o| Self::alias_target(heap, o)) else {
+            return Ok(None);
+        };
+        if matches!(self.heap.get(self.ns.obj(node)?)?, Object::FieldUnit(_)) {
+            self.unresolved(node)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// For an operator that stores to more than one place (`Divide`): refuses, as an access
     /// would, before anything is stored, if storing to `loc` would need a PCI_Config region's
     /// function not yet found.
