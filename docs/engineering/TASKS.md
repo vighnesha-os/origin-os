@@ -1479,3 +1479,5 @@ The eight record corrections are in the records commit after these: this result,
 | N2 (Low) | `4762ebc` | The AP asks for its shootdown record first, by length, so F6's refusal can happen. The cause of the silent later panics is recorded under "Open" above |
 | N3 | `4762ebc` | The run-time check reads the count before the table, and returns the element if it is there by then |
 | N4 | the records commit after these | AC-8's row says what its failure shows and what rests on the host test |
+
+**Gates on `173d85d`** (one turn of the machine, a clean tree, 2026-11-14 06:11 to 06:36 UTC): `check` passed in 425 s (1,915 host tests, 0 failed; Loom 56 models, 83 controls caught); `boot-test` 11 of 11 in 51 s; `boot-matrix` passed in 1,049 s. The quick and document gates passed before them. **Controls** (ADR-0013): AC-10 (no record for index 2) parked that AP, counted and named, with nothing panicking; AC-11 booted the sparse machine without interrupt remapping, where `efbcb6a` withdrew storage and `173d85d` keeps it, with the three processors above 255 left out by name.

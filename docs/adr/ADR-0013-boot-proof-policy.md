@@ -425,7 +425,16 @@ Each of AC-1 to AC-6 failed where it was aimed, and AC-7 passed as it should. Th
 | AC-3 | Run again on the new sizing code: the count fixed one short (`let count = sizing.reached.max(1)` made one less), 3 processors | `27 per-CPU tables hold 2 each`, `SMP: 2 of 3 enabled processors online`, `held back: none` as before; the boot test failed on its first missing marker |
 | AC-7 | Run again with F5's line: QEMU's NVMe limited to 2 I/O queue pairs, 2 processors | `per-CPU queues: not proven: the controller allocated 2 submission and 2 completion queues, has 65 MSI-X vectors, and BAR 0 holds the doorbells of 1535 I/O queues; the driver keeps 2 of each`; the kernel boot passed, verdict `degraded: 66 of 67 proofs passed; failed: speculation controls` |
 
-AC-8, AC-9 and AC-3 failed where they were aimed, and AC-7 passed. F2's four host controls (an alias, a `PerCpu` inside another type or a `const`, a mention other than the sizing call, a wrong name) are `percpu-gate`'s tests, run in `check` on `efbcb6a`.
+AC-8, AC-9 and AC-3 failed where they were aimed, and AC-7 passed.
+
+**Controls of the addendum's fixes (2026-11-14 06:36 to 06:39 UTC, QEMU 11.1.3 TCG):** on exports of `173d85d` and, for AC-11's "before", of `efbcb6a`, in the same turn of the machine as the gates on `173d85d`.
+
+| # | Edit or configuration | Result |
+|---|---|---|
+| AC-10 | `tlb::has_record` made to answer no for index 2, 3 processors, the kernel boot alone: the addendum's finding N2 | `CPU 2 (APIC ID 2): no TLB shootdown record for its CPU index; parked by INIT: AP start-up failed`. The AP refused before any other per-processor lookup and was parked, counted and named; nothing panicked |
+| AC-11 | The 67-processor sparse machine with interrupt remapping off (`ORIGIN_QEMU_IOMMU=intel-iommu,intremap=off`), which QEMU accepts under its software processor, run under `cargo xtask run` and read to the boot verdict, since the boot test's markers expect remapping: N1 | **Before, on `efbcb6a`:** `NVMe: per-CPU queues: APIC IDs above 255 need interrupt remapping: NVMe failed`, and the verdict lists `NVMe (no storage)`. **After, on `173d85d`:** `62 of 67 processors have an I/O queue pair …: 62 expected, 62 filled; 3 left out, which no MSI reaches without interrupt remapping: CPU 64 (APIC ID 256), CPU 65 (APIC ID 300), CPU 66 (APIC ID 412)`, all 1,984 reads matched, the x2APIC line says nothing to prove through NVMe, and storage is kept. On both, the IOMMU proofs through NVMe fail, as they must without remapping, and the scheduler's fair share fails on the oversubscribed machine (Report) |
+
+AC-10 failed where it was aimed, and AC-11 shows the storage that F1 alone withdrew kept by N1's fix. F2's four host controls (an alias, a `PerCpu` inside another type or a `const`, a mention other than the sizing call, a wrong name) are `percpu-gate`'s tests, run in `check` on `efbcb6a`.
 
 ## Alternatives
 
