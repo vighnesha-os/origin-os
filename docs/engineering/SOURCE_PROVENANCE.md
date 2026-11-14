@@ -4885,6 +4885,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - `4a8f92f` `sched::settle` and its calls in eleven proofs; `kernel_bound`'s and `stacks`' local settles replaced;
   - `fe0aa30` `cargo xtask settle-gate` (`developer-tools/xtask/src/settle.rs`);
   - `08b2ef1` `settle` names stacks lost to a stalled shootdown (`framekernel/src/settled.rs`), on the coordinating session's ruling after TASKS item 59's 67-processor run lost three;
+  - `42dd54b` a proof's "not settled" words made after its counts are read (the coordinating session's note on T67-e's 256 heap bytes);
   - the records after them.
 - **Authoring agent:** TASKS item 58's Claude Code side session (Claude Opus 5.5), on the coordinating session's rulings.
 - **Specifications:** none outside the repository.
@@ -4894,11 +4895,12 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Dependencies:** none new; `core` and `alloc` in the kernel, `std` in `xtask`. Rust 1.100.0, the pin.
 - **Licensing:** MIT OR Apache-2.0 (the workspace's `license`).
 - **Firmware and data:** none.
-- **Review:** none by a person or an independent session; the coordinating session reads the diff before the keeper takes it.
+- **Review:** read by the coordinating session (AI), which accepted `6402192..08b2ef1` on 2026-11-14; no independent review, and no person has reviewed it.
 - **Tests:**
   - Host: `settled` (each part named, the growth of lost stacks rather than the total, where a line says the settle failed); `settle-gate`'s seven (both ends settled pass; none, one side only, another `settle` fail; a listed function passes, a stale listing fails; test code and comments not read; the checkout passes).
   - Gates on `08b2ef1`, one turn of the machine, a clean tree (2026-11-14 18:31 to 18:57 UTC): `check` passed in 426 s (2,051 host tests, 0 failed; Loom 56 models, 83 controls caught); `boot-test` 11 of 11 in 50 s; `boot-matrix` passed in 1,040 s. The quick gates, `settle-gate` among them, passed before them.
   - Planted boots T67-a to T67-e (ADR-0013), on an export of `08b2ef1`, the 65-processor VT-d kernel boot: each failed or passed as aimed.
+  - Gates on `42dd54b` (the words made after the counts): `check` 416 s (2,051 host tests), `boot-test` 11 of 11; `boot-matrix` failed once on the 65-processor machine's early clock proof under host load (TASKS item 66's class, before any settle) and passed when run again (1,035 s). T67-b passed again; T67-e, on the 4-processor machine, failed as aimed with the heap printed exact.
 
 ## TASKS item 62: ACPI 6.6's system description tables, parsed and checked (ADR-0019 A6, area A; decision items 301, 304, 306 and 307; 2026-11-14)
 
