@@ -7,6 +7,21 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
 
+## The NVMe driver against NVMe Base 2.4, NVM Command Set 1.3 and PCIe Transport 1.4 (TASKS item 59; 2026-11-14)
+
+On `claude/charming-joliot-0a23db`, with `land/batch-5` at `7436302` merged in; **not landed and not pushed. The check it answers was one AI reviewer's, and no reviewer has read the fixes yet; no person has reviewed either.** The owner supplied the three specifications CLAUDE.md §17 names on 2026-11-14 (`docs/research/2026-11-14-nvme-2-4-check.md`).
+
+- **H1, before any rented server:** a namespace whose format carries metadata, or with protection information on, was accepted, and its transfers would have gone outside their buffer. A planted boot showed the old driver binding one and passing its proof. The driver now walks the controller's active NVM namespaces, refuses each it cannot use by NSID and reason, and binds the first it can (ruling (f)).
+- **M2 to M5:** queues of 64 entries or what the controller allows; the namespaces from the active list, not NSID 1; CRTO's ready timeout where the controller reports ready modes; a controller still becoming ready waited for before its reset. **M1:** TASKS item 58's queues, and a controller with one I/O queue pair bound for polled I/O, its interrupt proofs "not proven" with the reason (ruling (a)).
+- **Low items:** nine fixed, among them MSI turned off before MSI-X for every driver; four recorded with their reasons.
+- **P1, from CI:** a per-processor write that did not read back on an EPYC 9V74 (pull request 38). Ruled out by reading: a missing barrier, and a second user of the queue. A missed 2 s deadline fits, most likely a flush, and so does an error status; the line could not say which. Every failure is now named, and the deadlines are the driver's own: Flush 30 s, other I/O 10 s, admin 2 s.
+
+**What is shown, under QEMU's software processor on the development Mac only:** host tests for each fix, 18 host controls, and the boot controls NV-1 to NV-16 in ADR-0013 (QEMU's NVMe with metadata, protection information, 4-entry queues, namespace 2 alone, one queue pair, a refused namespace before a usable one, and P1's flush given no time).
+
+**Gates on `6d064b1` (code as at `067aebd`):** `check` passed in 496 s (1,957 host tests, 0 failed; Loom 56 models, 83 controls caught); `boot-test` 11 of 11 in 53 s; `boot-matrix` failed once on the 67-processor machine's clock proof, before any NVMe code ran, and passed in full on its rerun in 1,029 s.
+
+**Not shown:** anything under KVM or on a physical drive; M4 and M5 beyond host tests. **Not done:** controller reset and recovery, Abort, shutdown, asynchronous events, health, power states, and support for metadata (rows S33-08, S33-09, S33-11 to S33-14).
+
 ## Any processor count (ADR-0008 Amendment 1, D1 to D8; TASKS item 58; 2026-11-13 and 2026-11-14)
 
 On `claude/any-cpu-count`, from the fourth batch (`land/s4-part2`) with S4-3 merged; **not landed and not pushed. One AI reviewer has read it (`docs/engineering/REVIEW_T58_2026-11-14.md`: no High, two Medium, seven Low, five informational), and every finding is fixed or recorded on the branch; no person has reviewed it.** The owner asked on 2026-11-13 that the kernel use every processor a machine has, whatever the number.
