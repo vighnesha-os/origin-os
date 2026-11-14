@@ -4,7 +4,7 @@ CLAUDE.md §1 makes 100% coverage of approved requirements the completion target
 
 | | |
 |---|---|
-| Directive revision | 7.8 |
+| Directive revision | 7.9 |
 | Version | The matrix is versioned with the repository: a commit's matrix is checked against that commit's directive, ADRs and tree. |
 | The figure | Printed by `cargo xtask requirements-gate`, and not written here, so it cannot go stale. |
 | Evidence so far | Host tests, QEMU, and guests under KVM in CI. Nothing has run on a physical machine (CLAUDE.md §74). |
@@ -98,7 +98,7 @@ A row quotes a statement. The directive's headings, its code blocks (§8's `rust
 
 | Part | Headings and code blocks |
 |---|---|
-| 00 | 4c0eb67ef376bf393296bbd8359ea95853b04b11a7ed4749b7494b0ff3d3c770 |
+| 00 | 8fb3e01751526add5d63d5d517a8f8621660dda3b500f24f7c4f076a9a244138 |
 | 01 | 9574396467ce88db554ffc3f9463d575fadd2d4a78e739c7e2f9c8ab2f8e252f |
 | 02 | 1da37825b5c4a35fe5f1408b44dc4a2e9e9f44412a1d2079addc78cfc43bb5cc |
 | 03 | 8db217ade4bd8371cae157a19d571cc0d9083f72209dff868794cb40b6c59e4c |
@@ -132,7 +132,7 @@ Two cells move the figure by themselves. A row marked `info` leaves the count, a
 | done | F-01 |
 | done | A15-D8, A18-V2, A18-V3, A18-V5, A18-V8 |
 | info | H-01, H-02, H-03, H-04, H-09, H-10 |
-| info | S1-01, S1-02, S1-07, S1-75, S1-102, S4-01, S4-02, S4-03, S4-04, S4-05, S4-06, S4-07, S4-08, S4-09, S4-10, S4-11, S4-12, S4-13, S4-14, S4-15, S5-02, S7-01, S12-03, S14-12, S17-24, S49-30, S63-07, S70-17, S71-12, S77-01, S79-01, S80-02, S82-18 |
+| info | S1-01, S1-02, S1-07, S1-75, S1-102, S4-01, S4-02, S4-03, S4-04, S4-05, S4-06, S4-07, S4-08, S4-09, S4-10, S4-11, S4-12, S4-13, S4-14, S4-15, S5-02, S7-01, S12-03, S14-12, S17-24, S49-30, S63-07, S71-12, S77-01, S79-01, S80-02, S82-18 |
 | info | P9-01 |
 | info | F-42 |
 | info | A03-K2, A05-F19, A05-G10, A06-F6, A09-H8, A11-N11, A12-C5, A12-C7, A13-R8, A16-Am2, A17-Z11 |
@@ -165,7 +165,7 @@ One line for each approved change to what the product covers (item 196): the dec
 | 82–87 | 2026-11-10 | Every device standard is reached through the SDK in three layers, with dangerous operations behind rights of their own. Thunderbolt is part of the USB4 interface, radio drivers wait for a legitimate source, and USB4, Thunderbolt, Wi-Fi and Bluetooth come at M10 on physical hardware (ADR-0015). | A15-*, S31-17, S31-18, S31-19, S35-14, S54-19, S54-20, S82-17 |
 | 88–90 | 2026-11-10 | The hardware scope narrows to Intel platforms of 2026 or later and AMD platforms of 2026 or later with Zen 5 or newer cores. Older machines are bench equipment. The kernel names the core generation and never refuses on it, which replaces ADR-0009 H2, and the installer's answer is decided at M9 (ADR-0009 Amendment 1). | A09-*, H-08, S24-18, S24-19, S24-20 |
 | 117 | 2026-11-10 | "Administration only through the GUI" becomes "the GUI is always enough, and nothing needs a terminal". Remote desktop must exist before the Server edition ships, and unattended installs apply a signed provisioning document (ADR-0014 Amendment 1). | A14-A*, S48-14, S48-15, S48-16, S48-18 |
-| 295–299 | 2026-11-14 | The whole operating system as SDK reaches the host tools and the layers above the kernel. The host tools become libraries that `xtask` calls, and the Developer SDK once Origin hosts its own builds; §49 gains Origin UI, Windows and display, Desktop shell, Settings, Time and Developer tools; the shell has no private interface; and a module shared between SDK domains gets a first-party interface (ADR-0011 Amendment 4). | A11-T1, A11-T2, A11-T3, A11-T4, A11-T5 |
+| 295–299 | 2026-11-14 | The whole operating system as SDK reaches the host tools and the layers above the kernel. The host tools become libraries that `xtask` calls, and the Developer SDK once Origin hosts its own builds; §49 gains Origin UI, Windows and display, Desktop shell, Settings, Time and Developer tools; the shell has no private interface; and a module shared between SDK domains gets a first-party interface (ADR-0011 Amendment 4; CLAUDE.md 7.9). | A11-T1, A11-T2, A11-T3, A11-T4, A11-T5, S49-32, S49-33, S49-34, S49-35, S49-36, S49-37, S49-38, S70-17 |
 
 ## What the gate checks, and what it does not
 
