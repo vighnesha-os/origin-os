@@ -155,7 +155,11 @@ impl<H: Host> Interpreter<H> {
             let chars = mem::copy_bytes(s, &mut self.budget)?;
             let mut out = Ok(None);
             for &c in &chars {
-                out = self.field_at(node, Some(&[c]), depth).map(|_| None);
+                // Each character is a write, work counted whatever the field's width.
+                out = self
+                    .charge(1)
+                    .and_then(|()| self.field_at(node, Some(&[c]), depth))
+                    .map(|_| None);
                 if out.is_err() {
                     break;
                 }
@@ -177,8 +181,13 @@ impl<H: Host> Interpreter<H> {
             // One write: an integer truncated, a buffer within the field zero-extended.
             self.field_at(node, Some(&data), depth)
                 .map(|r| protocol.then_some(r))
+        } else if f.bit_len == 0 {
+            // A field of no bits holds nothing: there are no pieces to write. Before, the loop
+            // below advanced by the field's width, 0, for ever (found by the soak of 2026-11-14).
+            Ok(None)
         } else {
-            // A buffer larger than the field is written in pieces, lower first (Table 19.7).
+            // A buffer larger than the field is written in pieces, lower first (Table 19.7), each
+            // a write counted as work.
             let mut r = Ok(None);
             let bits = u64::try_from(data.len()).unwrap_or(0).saturating_mul(8);
             let mut at: u64 = 0;
@@ -186,7 +195,9 @@ impl<H: Host> Interpreter<H> {
             while at < bits && r.is_ok() {
                 piece.fill(0);
                 let n = f.bit_len.min(bits.saturating_sub(at));
-                r = get_bits(&data, at, n, &mut piece)
+                r = self
+                    .charge(1)
+                    .and_then(|()| get_bits(&data, at, n, &mut piece))
                     .and_then(|()| self.field_at(node, Some(&piece), depth))
                     .map(|_| None);
                 at = at.saturating_add(f.bit_len);

@@ -920,6 +920,25 @@ fn adversarial_cases() {
             Setup::PLAIN,
             Expect::Eval(Err(ErrorKind::Range)),
         ),
+        // A field of no bits written with a buffer and a string larger than it: nothing to write.
+        // Found by the soak of 2026-11-14 (mutation seed 0x9cc4f803), where the piece-by-piece
+        // write advanced by the field's width, 0, for ever.
+        (
+            vec![
+                op_region("ZR", 1, word(0x80), byte(1)),
+                field("ZR", 1, &[Fe::Named("ZW", 0), Fe::Named("ZB", 8)]),
+                method(
+                    "M0",
+                    0,
+                    &[
+                        store(buffer(byte(4), &[1, 2, 3, 4]), nm("ZW")),
+                        store(string("abcd"), nm("ZW")),
+                    ],
+                ),
+            ],
+            Setup::PLAIN,
+            Expect::Eval(Ok(None)),
+        ),
         // An evaluation that ends holding the Global Lock fails, and the lock goes back.
         (
             vec![method("M0", 0, &[acquire(nm("\\_GL"), 0xFFFF), ret(one())])],
