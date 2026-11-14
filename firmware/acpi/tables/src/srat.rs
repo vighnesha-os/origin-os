@@ -141,6 +141,17 @@ impl<'a> Srat<'a> {
     /// comes back as `Err` and the walk goes on past it; a length that cannot locate the next
     /// structure comes back as `Err` and ends the walk (the review's F5, F15).
     pub fn entries(&self) -> impl Iterator<Item = Result<Affinity<'a>, Error>> + 'a {
+        self.verdicts()
+            .map(|item| item.and_then(|(_, verdict)| verdict))
+    }
+
+    /// Every structure with its verdict: `Ok((raw, Ok(affinity)))` for one that is used,
+    /// `Ok((raw, Err(fault)))` for one reported and not used, and `Err` for a walk error, which
+    /// ends it and refuses the table. A reader that must tell the two kinds of `Err` apart (the
+    /// kernel's) takes this rather than [`Srat::entries`].
+    pub fn verdicts(
+        &self,
+    ) -> impl Iterator<Item = Result<(Raw<'a>, Result<Affinity<'a>, Error>), Error>> + 'a {
         let signature = self.table.signature();
         let mut walk = self
             .table
@@ -157,7 +168,7 @@ impl<'a> Srat<'a> {
                 Err(e) => Err(*e),
             };
             Some(match item {
-                Ok(raw) => decode(&raw, signature),
+                Ok(raw) => Ok((raw, decode(&raw, signature))),
                 Err(e) => {
                     done = true;
                     Err(e)
@@ -169,9 +180,9 @@ impl<'a> Srat<'a> {
     /// Checks every structure: one that breaks a rule is reported and not used; a walk error
     /// refuses the table.
     pub(crate) fn census(&self, tally: &mut Tally<'_, 'a>) -> Result<(), Error> {
-        for raw in Walk::new(self.table.reader().rest(ENTRIES)?, Shape::BYTE_BYTE) {
-            let raw = raw?;
-            match decode(&raw, self.table.signature()) {
+        for item in self.verdicts() {
+            let (raw, verdict) = item?;
+            match verdict {
                 Ok(_) => tally.structure(raw.kind, raw.at, raw.bytes),
                 Err(e) => tally.reported(e, raw.at, raw.bytes),
             }

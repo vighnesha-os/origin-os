@@ -227,7 +227,7 @@ impl<'a> Madt<'a> {
     /// past it; a length that cannot locate the next structure comes back as `Err` and ends the
     /// walk (the review's F5, F15). The census reports exactly the structures this gives as `Err`.
     pub fn entries(&self) -> impl Iterator<Item = Result<Entry<'a>, Error>> + 'a {
-        self.judged()
+        self.verdicts()
             .map(|item| item.and_then(|(_, verdict)| verdict))
     }
 
@@ -235,7 +235,7 @@ impl<'a> Madt<'a> {
     /// the header's. A second override is reported by the census and not used (§5.2.12.8 allows
     /// one).
     pub fn local_apic_base(&self) -> Result<u64, Error> {
-        for entry in self.judged() {
+        for entry in self.verdicts() {
             if let (_, Ok(Entry::LocalApicAddressOverride { address })) = entry? {
                 return Ok(address);
             }
@@ -246,7 +246,7 @@ impl<'a> Madt<'a> {
     /// Checks the whole table: every structure, and what holds between them ([`Between`]). A
     /// structure that breaks a rule is reported and not used; a walk error refuses the table.
     pub(crate) fn census(&self, tally: &mut Tally<'_, 'a>) -> Result<(), Error> {
-        for item in self.judged() {
+        for item in self.verdicts() {
             let (raw, verdict) = item?;
             match verdict {
                 Ok(_) => tally.structure(raw.kind, raw.at, raw.bytes),
@@ -258,8 +258,10 @@ impl<'a> Madt<'a> {
 
     /// Every structure with its verdict: `Ok((raw, Ok(entry)))` for one that is used,
     /// `Ok((raw, Err(fault)))` for one reported and not used, and `Err` for a walk error, which
-    /// ends it.
-    fn judged(
+    /// ends it and refuses the table. A reader that must tell the two kinds of `Err` apart (the
+    /// kernel's, which refuses the table only for the second) takes this rather than
+    /// [`Madt::entries`].
+    pub fn verdicts(
         &self,
     ) -> impl Iterator<Item = Result<(Raw<'a>, Result<Entry<'a>, Error>), Error>> + 'a {
         let signature = self.table.signature();
