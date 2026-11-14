@@ -500,12 +500,16 @@ impl<'a> Fadt<'a> {
         Gas::read(&self.table.reader(), x).ok()
     }
 
-    /// Where `block` is and how long, or `None` if the platform has none or the block breaks a rule
-    /// ([`Field::Block`]): its `X_` form if that address is not zero, else its 32-bit field as a
-    /// system I/O port if that is not zero. For the two GPE blocks the `X_` form's width, offset
-    /// and access size are as read, and §5.2.9 tells the OS to ignore them.
+    /// Where `block` is and how long, or `None` if the platform has none, is hardware-reduced
+    /// (whose OS ignores these fields), or the block breaks a rule ([`Field::Block`]): its `X_`
+    /// form if that address is not zero, else its 32-bit field as a system I/O port if that is not
+    /// zero. For the two GPE blocks the `X_` form's width, offset and access size are as read, and
+    /// §5.2.9 tells the OS to ignore them.
     #[must_use]
     pub fn block(&self, block: Block) -> Option<Register> {
+        if self.flags.hw_reduced_acpi() {
+            return None;
+        }
         self.locate(block)
             .filter(|_| self.usable(Field::Block(block)))
     }
@@ -950,6 +954,9 @@ pub(crate) mod tests {
         let f = Fadt::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(f.facs_address(), None);
         assert_eq!(f.sleep_status_reg.unwrap().address, 0xFED8_0004);
+        assert_eq!(f.faults().count(), 0);
+        assert!(Block::ALL.iter().all(|&b| f.block(b).is_none()));
+        assert_eq!(f.month_alarm(), None);
     }
 
     #[test]
