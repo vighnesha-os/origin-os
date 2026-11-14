@@ -1458,7 +1458,7 @@ Assigned by the coordinating session on 2026-11-13, after the owner accepted dec
 | F6 | `7a3ad9e` | `mark_online` says whether a record exists; an AP with none refuses its start-up |
 | F7 | `7a3ad9e` | A table sized twice lowers the count to what it holds |
 | F8 | `690dcf0` | An AP's GDT, TSS and start-up record are allocated fallibly, freed on failure; the stacks' region grows before the tables are sized for its room. No `unsafe` added, one removed |
-| F9 | `963307c` | The fair-share allowance is keyed to three named machines, not the host; the change to ADR-0013 R8 is pending owner item 308 |
+| F9 | `963307c` | The fair-share allowance is keyed to three named machines, not the host; the owner accepted the change to ADR-0013 R8 as decision item 308 (ADR-0013 Amendment 2), with host tests that the host changes nothing (the commit after the records) |
 | F10 | the records commit after these | Matrix row A08-D5 names literals and struct fields among what the gate cannot see |
 | F11 | `8e54423` | A processor listed again keeps its most usable listing, and disagreements are counted on the "ACPI MADT" line |
 | F12 | `690dcf0` | A region that could not grow for want of memory says so on the "CPU indexes" line |

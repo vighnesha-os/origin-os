@@ -1307,16 +1307,25 @@ fn is_unfilled_tx_ring(line: &str) -> bool {
 /// `boot-matrix`'s 65-processor machine (`ORIGIN_QEMU_SMP=65`), the 67-processor sparse machine
 /// (`ORIGIN_QEMU_TOPOLOGY=sparse`) and the 288-processor run (`many`). Each guest processor is a
 /// host thread, so on those the two workers of one guest processor get the shares the host gives
-/// QEMU's threads. The machines are named, not found from the host's threads (review finding F9
-/// of 2026-11-14; ADR-0013, pending owner item 308): every other machine, those of 1 to 4
-/// processors and `boot-x2apic` among them, is held to a fair share on every host.
+/// QEMU's threads. The machines are named, never found from the host's threads (review finding
+/// F9 of 2026-11-14; decision item 308, ADR-0013 Amendment 2): every other machine, those of 1
+/// to 4 processors and `boot-x2apic` among them, is held to a fair share on every host.
 fn oversubscribed() -> bool {
     let topology = env::var("ORIGIN_QEMU_TOPOLOGY").ok();
-    Accel::from_env().is_ok_and(|accel| oversubscribed_for(accel, topology.as_deref(), qemu_cpus()))
+    let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    Accel::from_env()
+        .is_ok_and(|accel| oversubscribed_for(accel, topology.as_deref(), qemu_cpus(), host))
 }
 
-/// [`oversubscribed`] for an accelerator, `ORIGIN_QEMU_TOPOLOGY` and `ORIGIN_QEMU_SMP`.
-fn oversubscribed_for(accel: Accel, topology: Option<&str>, smp: u32) -> bool {
+/// [`oversubscribed`] for an accelerator, `ORIGIN_QEMU_TOPOLOGY`, `ORIGIN_QEMU_SMP` and the
+/// host's threads. Decision item 308 keeps the host's threads out of the answer: they are taken
+/// only so that the host tests can show that they change nothing.
+fn oversubscribed_for(
+    accel: Accel,
+    topology: Option<&str>,
+    smp: u32,
+    _host_threads: usize,
+) -> bool {
     accel == Accel::Tcg
         && match topology {
             Some("sparse" | "many") => true,
@@ -6512,27 +6521,47 @@ mod oversubscribed_tests {
 
     const UNEVEN: &str = "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted 720000 and 7273000, 27 context switches: scheduler failed";
 
-    /// Review finding F9 of 2026-11-14: the allowance is keyed to the machines, by name, never
-    /// to the host's threads.
+    /// Review finding F9 of 2026-11-14 and decision item 308 (ADR-0013 Amendment 2): the
+    /// allowance is keyed to the machines, by name, never to the host's threads.
     #[test]
     fn only_the_named_large_software_processor_machines_are_oversubscribed() {
-        assert!(oversubscribed_for(Accel::Tcg, None, 65));
-        assert!(oversubscribed_for(Accel::Tcg, Some("sparse"), 2));
-        assert!(oversubscribed_for(Accel::Tcg, Some("many"), 2));
-        for smp in [1, 2, 3, 4, 11, 64, 66] {
+        for host in [1, 2, 4, 10, 64, 256] {
+            assert!(oversubscribed_for(Accel::Tcg, None, 65, host), "{host}");
+            assert!(oversubscribed_for(Accel::Tcg, Some("sparse"), 2, host));
+            assert!(oversubscribed_for(Accel::Tcg, Some("many"), 2, host));
+            for smp in [1, 2, 3, 4, 11, 64, 66] {
+                assert!(
+                    !oversubscribed_for(Accel::Tcg, None, smp, host),
+                    "{smp} processors on {host} host threads"
+                );
+            }
+            for other in ["x2apic", "listed", ""] {
+                assert!(
+                    !oversubscribed_for(Accel::Tcg, Some(other), 65, host),
+                    "{other}"
+                );
+            }
             assert!(
-                !oversubscribed_for(Accel::Tcg, None, smp),
-                "{smp} processors"
+                !oversubscribed_for(Accel::Kvm, None, 65, host),
+                "KVM keeps its own allowance"
             );
+            assert!(!oversubscribed_for(Accel::Kvm, Some("sparse"), 2, host));
         }
-        for other in ["x2apic", "listed", ""] {
-            assert!(!oversubscribed_for(Accel::Tcg, Some(other), 65), "{other}");
+    }
+
+    /// The coordinating session's two cases for decision item 308: a 4-processor machine on a
+    /// 2-thread host is held to a fair share, which the host-keyed rule before review finding F9
+    /// would have waived; each named large machine on a 64-thread host is not.
+    #[test]
+    fn the_host_changes_nothing_either_way() {
+        let small = oversubscribed_for(Accel::Tcg, None, 4, 2);
+        assert!(!small);
+        assert!(!checker_forgives(UNEVEN, Accel::Tcg, small));
+        for (topology, smp) in [(None, 65), (Some("sparse"), 2), (Some("many"), 2)] {
+            let large = oversubscribed_for(Accel::Tcg, topology, smp, 64);
+            assert!(large, "{topology:?}");
+            assert!(checker_forgives(UNEVEN, Accel::Tcg, large), "{topology:?}");
         }
-        assert!(
-            !oversubscribed_for(Accel::Kvm, None, 65),
-            "KVM keeps its own allowance"
-        );
-        assert!(!oversubscribed_for(Accel::Kvm, Some("sparse"), 2));
     }
 
     /// The coordinating session's ruling of 2026-11-14: an uneven share passes on an
