@@ -177,6 +177,7 @@ M3-6 needs the prerequisites in "Before a first boot on a machine in scope".
 | A04-H5, A04-A2 to A04-A6 | TLB efficiency and PCIDs; the kernel stacks' region and its random base |
 | A08-C1 to A08-C7 | The CPU index (ADR-0008) |
 | A08-D1 to A08-D8 | Any processor count (ADR-0008 Amendment 1, items 283 to 290; placed by the coordinating session under item 264's rule, in no exit test) |
+| A13-Am2 | The fair share reported, not failed, on the oversubscribed software-processor machines (ADR-0013 Amendment 2, item 308; placed by the coordinating session under item 264's rule, in no exit test) |
 | A09-H4, A09-H5 | The first machines, one hybrid and one with SMT, as M3-6 asks; what to check before buying |
 | S13-05 | Explicit memory ordering |
 | S18-03, S18-04 | ADRs for the scheduler and for locking (TASKS item 27) |
