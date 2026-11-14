@@ -1012,3 +1012,56 @@ fn planted_faults_are_caught() {
         );
     }
 }
+
+/// Runs `f` on a thread of its own and fails if it has not ended within `secs` seconds: for the
+/// tests of inputs that once hung the interpreter, so that a return of the hang fails the test
+/// rather than holding the machine.
+fn ends_within(secs: u64, what: &str, f: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{what}: still running after {secs} s")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("{what}: failed"),
+    }
+}
+
+/// The block the mutation test made from seed `0x9cc4f803`, the case on which the soak of
+/// 2026-11-14 (seed `0x63400000`, case 391,171) hung: its bytes as they were, so that the case
+/// stays the same whatever the generator becomes. It stores a buffer to a field of no bits.
+const SOAK_HANG_0X9CC4F803: [&str; 14] = [
+    "084e305f5f0e70ca05ef307e9223084e315f5f0d6e31000842465f5f11070a100102030408504b5f5f121004",
+    "010d78005c4e305f5f5c44305f5f5b824a0a44305f5f085f4849440c41d00c0a1449094d335f5f0170120301",
+    "0160700e34a6ee2d188a1d00617011040a0501627011030a0063700eb2d19f39cced3c00647011050a020102",
+    "65700d610066700cb52e4a04670854305f5f0a02a24b049575670a24a02f1111930e2e1d4ca7720000001103",
+    "0a020908a35b217042445f5f46305f5f864e305f5f5c2e44305f5f4d335f5f68a1099f0854305f5f0a035b22",
+    "0bdc055b220b0000a4685b8052305f5f010b80000a085b811052305f5f0146305f5f0046315f5f085b810d52",
+    "305f5f1300204c4b5f5f205b861146305f5f46315f5f01000849585f5f0c5b014d585f5f035b0245565f5f8a",
+    "42465f5f0042445f5f065c4e305f5f5c4e325f5f1449054d305f5f007011030a0160700edda1d67a567d0200",
+    "617012020162700a0f6370120602010d700065700e15354bdad9490e00667011060a0301020367a3a4809eff",
+    "0d57696e646f77732032303232005b3046305f5f5b31144a044d315f5f017012020160700e68577f08060000",
+    "00617011040a0401637011030a0464700e528bc067c7000000657012020166700d5c4e300067a4939446305f",
+    "5f5b309d12030101681444064d325f5f0a700ea1b9d33ca28c640061700e67ad99d95dcae90362700cc1d4c0",
+    "04637011030a0464700e6586e35209000000657011050a00010266700efc817604b1d11e006775655b244556",
+    "5f5fa470120602010d7000697561a411067066690908",
+];
+
+#[test]
+fn the_soaks_hanging_case_ends() {
+    // N-soak-1 of the review of B2's Resolution.
+    let hex: String = SOAK_HANG_0X9CC4F803.concat();
+    let aml: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|k| u8::from_str_radix(&hex[k..k + 2], 16).unwrap())
+        .collect();
+    assert_eq!(aml.len(), 594);
+    let seed = 0x9cc4_f803;
+    ends_within(10, "seed 0x9cc4f803", move || {
+        run(&aml, IntegerWidth::Bits32, seed, Setup::of(seed));
+    });
+}
