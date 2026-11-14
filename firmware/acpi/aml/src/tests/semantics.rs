@@ -1042,6 +1042,14 @@ fn every_opcode_is_emitted_and_checked() {
 }
 
 #[test]
+fn a_stray_else_is_out_of_place() {
+    let mut i = interp(IntegerWidth::Bits64);
+    let e = load(&mut i, &[noop(), else_(&[noop()])]).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Grammar);
+    assert_eq!(e.at.map(|a| a.offset), Some(1));
+}
+
+#[test]
 fn reserved_opcodes_are_refused_with_their_place() {
     for bad in [
         &[0x02u8][..],

@@ -783,6 +783,11 @@ impl<H: Host> Interpreter<H> {
         if name::starts_name(b) {
             return self.decode_name(want, at);
         }
+        // An `Else` is only ever read after its `If` (`else_after`): met anywhere else it is out
+        // of place, not reserved (the review of B1, F12).
+        if b == ELSE {
+            return err(ErrorKind::Grammar);
+        }
         let info = op::decode(b, self.byte(next).ok()).ok_or(ErrorKind::Reserved {
             first: b,
             second: (b == 0x5B).then(|| self.byte(next).ok()).flatten(),
