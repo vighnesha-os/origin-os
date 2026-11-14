@@ -64,7 +64,7 @@ fn the_gate_s_own_controls_are_caught() {
             &programs,
             &sign_lib
         ),
-        Ok(4)
+        Ok(5)
     );
     // A control is missed when the rule it tests is gone: with no first-party programs, the
     // path control finds nothing to name.
@@ -314,4 +314,44 @@ fn which_files_are_library_source() {
     ] {
         assert_eq!(is_library_source(Path::new(path)), library, "{path}");
     }
+}
+
+/// A `#[cfg(test)]` on a field, a variant or a match arm ends at its comma, or before the bracket
+/// that closes its list, and hides nothing after it (the review of 2026-11-14, finding F1).
+#[test]
+fn a_test_only_field_variant_or_arm_hides_nothing_after_it() {
+    let after =
+        "pub fn read_key(p: &str) -> Vec<u8> { let b = std::fs::read(p).unwrap_or_default(); b }";
+    for (planted, what) in [
+        ("pub struct S { #[cfg(test)] pub probe: bool, }", "a field"),
+        (
+            "pub struct S { pub a: u8, #[cfg(test)] pub probe: bool }",
+            "a last field with no comma",
+        ),
+        ("pub enum E { A, #[cfg(test)] Probe, B }", "a variant"),
+        (
+            "pub enum E { A, #[cfg(test)] Probe }",
+            "a last variant with no comma",
+        ),
+        (
+            "pub fn m(x: u8) -> u8 { match x { #[cfg(test)] 9 => 1, _ => 0 } }",
+            "a match arm",
+        ),
+        (
+            "pub fn m(x: u8) -> u8 { match x { 1 => 2, #[cfg(test)] 9 => { 1 } _ => 0 } }",
+            "a match arm with a block",
+        ),
+        (
+            "pub fn f(#[cfg(test)] probe: u8, x: u8) -> u8 { x }",
+            "a parameter",
+        ),
+    ] {
+        let hits = planted_in_library(&format!("{planted}\n{after}"));
+        assert_eq!(hits.len(), 1, "{what}: {hits:?}");
+        assert!(hits[0].what.contains("std::fs::read"), "{what}: {hits:?}");
+    }
+    // The test-only code itself stays excluded: a test field whose type names `std::fs`.
+    let hits =
+        planted_in_library("pub struct S { #[cfg(test)] pub probe: std::fs::File, pub b: u8 }");
+    assert_eq!(hits, [], "{hits:?}");
 }

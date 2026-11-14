@@ -341,10 +341,14 @@ fn test_items(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
         if !is_attribute {
             continue;
         }
-        // The item ends at its first `;` outside brackets, or with the block it opens.
+        // The item ends at its first `;` or `,` outside brackets, or with the block it opens: an
+        // item, a struct's field, an enum's variant or a match arm. A closing bracket that takes
+        // the depth below where the item started ends it too, before that bracket: the item was
+        // the last of a list with no comma after it. Nothing past that point is excluded (the
+        // review of 2026-11-14, finding F1: a test-only field once hid the function after it).
         let mut depth = 0;
         for (k, t) in tokens.iter().enumerate().skip(i + attribute.len()) {
-            if depth == 0 && t.is_punct(';') {
+            if depth == 0 && (t.is_punct(';') || t.is_punct(',')) {
                 ranges.push((i, k));
                 break;
             }
@@ -355,6 +359,10 @@ fn test_items(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
                 break;
             }
             depth += lex::bracket(t).unwrap_or(0);
+            if depth < 0 {
+                ranges.push((i, k.saturating_sub(1)));
+                break;
+            }
         }
     }
     ranges
@@ -630,8 +638,20 @@ pub fn os_random(out: &mut [u8]) -> std::io::Result<()> {
 }
 "#;
 
+/// A test-only field, and host access in the function after it (the review of 2026-11-14,
+/// finding F1): planted by the controls.
+const PLANTED_TEST_FIELD: &str = r#"
+pub struct PlantedControlProbe {
+    #[cfg(test)]
+    pub probe: bool,
+}
+pub fn planted_control_read(path: &str) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_default()
+}
+"#;
+
 /// The gate's negative controls, on copies of real files with a fault planted in each: each
-/// must be refused. Returns what was caught, or the controls that were not.
+/// must be refused. Returns how many were caught, or the controls that were not.
 fn controls(
     main: &str,
     consts: &BTreeMap<String, String>,
@@ -655,14 +675,30 @@ fn controls(
             missed.push(format!("{name} in developer-tools/xtask/src/main.rs"));
         }
     }
-    let text = format!("{sign_lib}\n{PLANTED_OS_RANDOM}");
-    let hits = library_hits(&text);
-    let caught = |needle: &str| hits.iter().any(|h| h.what.contains(needle));
-    if !(caught("`std::fs::File::open`") && caught("`/dev/urandom`")) {
-        missed.push("os_random in developer-tools/onbf-sign/src/lib.rs".into());
+    let library_controls: &[(&str, &[&str], &str)] = &[
+        (
+            PLANTED_OS_RANDOM,
+            &["`std::fs::File::open`", "`/dev/urandom`"],
+            "os_random",
+        ),
+        (
+            PLANTED_TEST_FIELD,
+            &["`std::fs::read`"],
+            "host access after a test-only field",
+        ),
+    ];
+    let real = library_hits(sign_lib).len();
+    for (planted, needles, name) in library_controls {
+        let hits = library_hits(&format!("{sign_lib}\n{planted}"));
+        let caught = needles
+            .iter()
+            .all(|needle| hits.iter().any(|h| h.what.contains(needle)));
+        if !caught || hits.len() != real + needles.len() {
+            missed.push(format!("{name} in developer-tools/onbf-sign/src/lib.rs"));
+        }
     }
     if missed.is_empty() {
-        Ok(4)
+        Ok(3 + library_controls.len())
     } else {
         Err(missed)
     }
