@@ -20,6 +20,27 @@
 //!
 //! The dynamic symbol table is read only to refuse an undefined symbol (§6.1.2), its length
 //! taken from `DT_HASH`; no relocation may name a symbol, so nothing else in it is used.
+//!
+//! That is [`parse`], the reading of a static PIE. Two more readings exist since task S4-2
+//! (ADR-0011 Amendment 2, L2 and L3), each chosen by its caller with [`Linking`] and each as
+//! strict about everything else:
+//!
+//! - [`Linking::Library`], for `origin.core`: a shared object with a `DT_SONAME`, no entry point,
+//!   no dependency and nothing undefined. Its defined dynamic symbols are returned as exports.
+//! - [`Linking::Importing`], for a program linked against one named library: its one
+//!   `DT_NEEDED` names that library, each undefined symbol is one of the library's exports, and
+//!   an `R_X86_64_GLOB_DAT` relocation against one becomes an import slot, which the kernel's
+//!   launch path binds. `R_X86_64_JUMP_SLOT` is not read: the userspace build calls an import
+//!   through its own slot and writes no procedure linkage table, and `DT_JMPREL` and its
+//!   companions stay outside the contract, so an image that had one is refused by its tags.
+//!
+//! Further sources for those two, read on 2026-11-13 through a fetch tool that paraphrases: the
+//! gABI's dynamic section (`DT_NEEDED` 1 and `DT_SONAME` 14, each an offset into `DT_STRTAB`)
+//! and its symbol table (`Elf64_Sym`'s fields, `st_info`'s binding in the upper four bits and
+//! type in the lower, `st_other`'s visibility in the low two), at
+//! `sco.com/developers/gabi/latest`, which carries no date but its 1997 to 2015 copyright
+//! lines; and the x86-64 psABI's relocation table at commit `e1ce0983` (`R_X86_64_GLOB_DAT` 6
+//! and `R_X86_64_JUMP_SLOT` 7, both `S`; `R_X86_64_RELATIVE` 8, `B + A`).
 
 use core::fmt;
 
@@ -96,6 +117,8 @@ pub mod dt {
     pub const STRSZ: u64 = 10;
     /// Size of one symbol table entry.
     pub const SYMENT: u64 = 11;
+    /// The shared object's own name.
+    pub const SONAME: u64 = 14;
     /// Initialization function.
     pub const INIT: u64 = 12;
     /// Termination function.
@@ -141,11 +164,23 @@ const SYM_BYTES: usize = 24;
 const SYM_SHNDX_AT: usize = 6;
 /// `st_shndx` of a symbol the image does not define (gABI `SHN_UNDEF`).
 const SHN_UNDEF: u16 = 0;
+/// Where `st_name`, `st_info`, `st_other`, `st_value` and `st_size` are in an `Elf64_Sym`.
+const SYM_NAME_AT: usize = 0;
+const SYM_INFO_AT: usize = 4;
+const SYM_OTHER_AT: usize = 5;
+const SYM_VALUE_AT: usize = 8;
+const SYM_SIZE_AT: usize = 16;
+/// `ELF64_ST_BIND` of a global symbol, and `ELF64_ST_TYPE` of a function (gABI).
+const STB_GLOBAL: u8 = 1;
+const STT_FUNC: u8 = 2;
 const RELA_SIZE: u64 = 24;
 const RELA_BYTES: usize = 24;
 const RELR_SIZE: u64 = 8;
 /// `B + A`: the only relocation type a KRN image may carry (x86-64 psABI).
 pub const R_X86_64_RELATIVE: u32 = 8;
+/// `S`: the address of the symbol it names, for a slot of the global offset table (x86-64
+/// psABI). Read only for a program that imports from a named library ([`Linking::Importing`]).
+pub const R_X86_64_GLOB_DAT: u32 = 6;
 
 /// The permissions of a loadable segment. Exactly these three are accepted (ONBF §6.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,15 +235,75 @@ pub struct Relocation {
     pub addend: Option<u64>,
 }
 
+/// How an input's dynamic part is read: what it may need, and what it may leave undefined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Linking<'a> {
+    /// A static PIE: no library, no undefined symbol, and base-relative relocations only. The
+    /// KRN image, and a program that imports nothing.
+    Static,
+    /// A program linked against one Origin library (ONBF §6.1.2: an undefined symbol must be
+    /// "exported by a declared Origin library"). `DT_NEEDED` may name `library` and nothing
+    /// else; an undefined symbol must be one of `exports`; and an `R_X86_64_GLOB_DAT`
+    /// relocation against one is an import.
+    Importing {
+        /// The library's `DT_SONAME`.
+        library: &'a str,
+        /// The symbols it exports.
+        exports: &'a [&'a str],
+    },
+    /// A library with no dependency of its own: it has a `DT_SONAME` and no entry point, needs
+    /// nothing and leaves nothing undefined.
+    Library,
+}
+
+/// A slot the launch path binds: it takes the address of the export it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Import {
+    /// RVA of the 8-byte slot; 8-byte aligned, in the file-backed bytes of an RW segment.
+    pub slot: u64,
+    /// The symbol's name: one of the library's exports.
+    pub symbol: String,
+}
+
+/// A symbol a library's dynamic symbol table defines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Export {
+    /// Its name.
+    pub name: String,
+    /// `st_value`: its RVA.
+    pub value: u64,
+    /// `st_size`: its bytes.
+    pub size: u64,
+    /// Whether it is a function (`STT_FUNC`).
+    pub function: bool,
+    /// Whether it is a global symbol of default visibility: what another image may bind to.
+    pub public: bool,
+}
+
 /// A validated input image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Elf {
-    /// `e_entry`, inside the file-backed bytes of an RX segment.
+    /// `e_entry`: inside the file-backed bytes of an RX segment, or 0 for a library.
     pub entry: u64,
     /// Loadable segments, in ascending, non-overlapping page-rounded RVA order.
     pub segments: Vec<LoadSegment>,
     /// Relocation slots in strictly ascending order, from `DT_RELA` and `DT_RELR` merged.
     pub relocations: Vec<Relocation>,
+    /// Import slots in strictly ascending order, none of them a relocation slot. Empty unless
+    /// the input was read as [`Linking::Importing`].
+    pub imports: Vec<Import>,
+    /// The symbols the image defines, in the order of its dynamic symbol table. Empty unless
+    /// the input was read as [`Linking::Library`].
+    pub exports: Vec<Export>,
+    /// `DT_SONAME`. `None` unless the input was read as [`Linking::Library`].
+    pub soname: Option<String>,
+    /// `PT_DYNAMIC`'s place in the file: its offset and its size. The table is the linker's
+    /// own record, read here and by nothing at run time.
+    pub dynamic_table: Option<(u64, u64)>,
+    /// Whether the table's first `DT_NULL` is its last entry, so that every entry of
+    /// `PT_DYNAMIC` was read. `true` for an image with no table. The reader stops at the first
+    /// `DT_NULL`, as a loader would; a caller that must know nothing follows it asks here.
+    pub dynamic_null_last: bool,
 }
 
 impl Elf {
@@ -329,8 +424,17 @@ pub enum ElfError {
     DynamicTable(&'static str),
     /// A dynamic tag outside the contract (ONBF §6.1.2: "an unknown dynamic tag").
     UnknownDynamicTag(u64),
-    /// `DT_NEEDED`: a KRN image links no libraries.
+    /// `DT_NEEDED`, in an image that may link no library.
     Needed,
+    /// A program leaves a symbol to the library it imports from and has no `DT_NEEDED` at all.
+    NeededMissing,
+    /// A `DT_NEEDED` that does not name the one library the program may import from, or a
+    /// second one.
+    NeededOther,
+    /// `DT_SONAME` is missing from a library, appears twice, or does not name a string.
+    Soname(&'static str),
+    /// A library with an entry point: `e_entry` is not 0.
+    LibraryEntry(u64),
     /// `DT_INIT`, `DT_FINI` or an init/fini/preinit array: ABI v1 has no static
     /// constructors (ONBF §6.1.2, Appendix B 9).
     StaticConstructors(u64),
@@ -352,7 +456,8 @@ pub enum ElfError {
         /// Entries in `DT_RELA`.
         entries: u64,
     },
-    /// A relocation type other than `R_X86_64_RELATIVE`.
+    /// A relocation type other than `R_X86_64_RELATIVE`, or, for a program that imports from
+    /// a named library, `R_X86_64_GLOB_DAT`.
     UnsupportedRelocation {
         /// `r_offset`.
         slot: u64,
@@ -386,10 +491,30 @@ pub enum ElfError {
     /// `PT_LOAD`.
     SymbolTable(&'static str),
     /// A dynamic symbol the image does not define (ONBF §6.1.2: "an undefined symbol not
-    /// exported by a declared Origin library"; no library is declared yet).
+    /// exported by a declared Origin library"): no library is declared, or the declared one
+    /// does not export it.
     UndefinedSymbol {
         /// Its index in the dynamic symbol table.
         index: u64,
+    },
+    /// A symbol whose name is outside `DT_STRTAB`, has no terminator there, or is not UTF-8.
+    SymbolName {
+        /// Its index in the dynamic symbol table.
+        index: u64,
+    },
+    /// An `R_X86_64_GLOB_DAT` relocation that names no symbol, one past the table's end, or
+    /// one the image defines itself.
+    ImportSymbol {
+        /// `r_offset`.
+        slot: u64,
+        /// `ELF64_R_SYM(r_info)`.
+        symbol: u32,
+    },
+    /// An `R_X86_64_GLOB_DAT` relocation with an addend: its value is the symbol's address
+    /// alone.
+    ImportAddend {
+        /// `r_offset`.
+        slot: u64,
     },
 }
 
@@ -458,7 +583,15 @@ impl fmt::Display for ElfError {
                 f,
                 "dynamic tag {t:#x} is outside the contract (ONBF §6.1.2)"
             ),
-            E::Needed => f.write_str("DT_NEEDED: a KRN image links no libraries"),
+            E::Needed => f.write_str("DT_NEEDED: this image may link no library"),
+            E::NeededMissing => f.write_str(
+                "an undefined symbol of the library a program imports from, and no DT_NEEDED that names that library",
+            ),
+            E::NeededOther => f.write_str(
+                "DT_NEEDED names something other than the one library this program may import from, or appears twice",
+            ),
+            E::Soname(why) => write!(f, "DT_SONAME: {why}"),
+            E::LibraryEntry(e) => write!(f, "a library has no entry point, but e_entry is {e:#x}"),
             E::StaticConstructors(t) => write!(
                 f,
                 "dynamic tag {t:#x}: static constructors and destructors are not allowed (ONBF §6.1.2)"
@@ -474,7 +607,7 @@ impl fmt::Display for ElfError {
             ),
             E::UnsupportedRelocation { slot, r_type } => write!(
                 f,
-                "relocation type {r_type} at {slot:#x}; only R_X86_64_RELATIVE is allowed"
+                "relocation type {r_type} at {slot:#x}; only R_X86_64_RELATIVE is allowed, and R_X86_64_GLOB_DAT against an export of the library a program imports from"
             ),
             E::RelocationSymbol { slot, symbol } => {
                 write!(f, "R_X86_64_RELATIVE at {slot:#x} names symbol {symbol}")
@@ -499,8 +632,19 @@ impl fmt::Display for ElfError {
             E::SymbolTable(why) => write!(f, "dynamic symbol table: {why}"),
             E::UndefinedSymbol { index } => write!(
                 f,
-                "dynamic symbol {index} is undefined, and no Origin library is declared to export it (ONBF §6.1.2)"
+                "dynamic symbol {index} is undefined, and no declared Origin library exports it (ONBF §6.1.2)"
             ),
+            E::SymbolName { index } => write!(
+                f,
+                "dynamic symbol {index} has a name outside DT_STRTAB, unterminated, or not UTF-8"
+            ),
+            E::ImportSymbol { slot, symbol } => write!(
+                f,
+                "R_X86_64_GLOB_DAT at {slot:#x} names symbol {symbol}, which is not an undefined symbol of the table"
+            ),
+            E::ImportAddend { slot } => {
+                write!(f, "R_X86_64_GLOB_DAT at {slot:#x} has an addend")
+            }
         }
     }
 }
@@ -544,8 +688,14 @@ impl Fields<'_> {
     }
 }
 
-/// Validates `file` as an ELF64 x86-64 PIE under the KRN conversion contract.
+/// Validates `file` as an ELF64 x86-64 PIE under the KRN conversion contract: a static PIE
+/// ([`Linking::Static`]).
 pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
+    parse_linked(file, Linking::Static)
+}
+
+/// Validates `file` as [`parse`] does, with its dynamic part read as `linking` says.
+pub fn parse_linked(file: &[u8], linking: Linking<'_>) -> Result<Elf, ElfError> {
     let FileHeader {
         entry,
         phoff,
@@ -608,21 +758,36 @@ pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
     if let Some((start, size)) = relro {
         apply_relro(&mut segments, start, size)?;
     }
-    let in_text = segments
-        .iter()
-        .any(|s| s.permissions == Permissions::ReadExecute && s.file_backed(entry, 1));
-    if !in_text {
-        return Err(ElfError::EntryNotExecutable(entry));
+    if linking == Linking::Library {
+        if entry != 0 {
+            return Err(ElfError::LibraryEntry(entry));
+        }
+    } else {
+        let in_text = segments
+            .iter()
+            .any(|s| s.permissions == Permissions::ReadExecute && s.file_backed(entry, 1));
+        if !in_text {
+            return Err(ElfError::EntryNotExecutable(entry));
+        }
     }
 
-    let relocations = match dynamic {
-        Some((offset, size)) => read_dynamic(file, offset, size, &segments)?,
-        None => Vec::new(),
+    let dynamic_table = dynamic;
+    let dynamic = match dynamic {
+        Some((offset, size)) => read_dynamic(file, offset, size, &segments, linking)?,
+        None => Dynamic::default(),
     };
+    if linking == Linking::Library && dynamic.soname.is_none() {
+        return Err(ElfError::Soname("a library must have one"));
+    }
     Ok(Elf {
         entry,
         segments,
-        relocations,
+        relocations: dynamic.relocations,
+        imports: dynamic.imports,
+        exports: dynamic.exports,
+        soname: dynamic.soname,
+        dynamic_table,
+        dynamic_null_last: dynamic_table.is_none() || dynamic.null_last,
     })
 }
 
@@ -860,13 +1025,26 @@ impl RelocationTags {
     }
 }
 
-/// Reads the dynamic table and returns the validated, merged relocation slots.
+/// What the dynamic table gave.
+#[derive(Default)]
+struct Dynamic {
+    relocations: Vec<Relocation>,
+    imports: Vec<Import>,
+    exports: Vec<Export>,
+    soname: Option<String>,
+    /// The table's first `DT_NULL` is its last entry.
+    null_last: bool,
+}
+
+/// Reads the dynamic table as `linking` says, and returns the validated, merged relocation
+/// slots with what else that reading gives.
 fn read_dynamic(
     file: &[u8],
     offset: u64,
     size: u64,
     segments: &[LoadSegment],
-) -> Result<Vec<Relocation>, ElfError> {
+    linking: Linking<'_>,
+) -> Result<Dynamic, ElfError> {
     let table = range(file, offset, size).ok_or(ElfError::Truncated("dynamic table"))?;
     if table.len() % DYN_SIZE != 0 {
         return Err(ElfError::DynamicTable(
@@ -875,8 +1053,12 @@ fn read_dynamic(
     }
     let mut tags = RelocationTags::default();
     let mut symbols = SymbolTags::default();
+    let mut needed: Vec<u64> = Vec::new();
+    let mut soname: Option<u64> = None;
     let mut terminated = false;
-    for raw in table.as_chunks::<DYN_SIZE>().0 {
+    let entries = table.as_chunks::<DYN_SIZE>().0;
+    let mut null_last = false;
+    for (index, raw) in entries.iter().enumerate() {
         let d = Fields {
             bytes: raw,
             what: "dynamic table",
@@ -886,9 +1068,20 @@ fn read_dynamic(
         match tag {
             dt::NULL => {
                 terminated = true;
+                null_last = index.checked_add(1) == Some(entries.len());
                 break;
             }
-            dt::NEEDED => return Err(ElfError::Needed),
+            dt::NEEDED => match linking {
+                Linking::Importing { .. } => needed.push(value),
+                Linking::Static | Linking::Library => return Err(ElfError::Needed),
+            },
+            // Only a library has a name of its own; anywhere else the tag is outside the
+            // contract, as it was before a library could be read.
+            dt::SONAME if linking == Linking::Library => {
+                if soname.replace(value).is_some() {
+                    return Err(ElfError::Soname("it appears twice"));
+                }
+            }
             dt::INIT
             | dt::FINI
             | dt::INIT_ARRAY
@@ -904,11 +1097,15 @@ fn read_dynamic(
             | dt::RELR
             | dt::RELRSZ
             | dt::RELRENT => tags.set(tag, value)?,
-            // The symbol table is read only to refuse an undefined symbol, and DT_HASH only
-            // for the table's length: no relocation may name a symbol. The string table, the
-            // GNU hash table, DT_FLAGS, DT_FLAGS_1 and DT_DEBUG carry nothing an image needs.
-            dt::SYMTAB | dt::SYMENT | dt::HASH => symbols.set(tag, value)?,
-            dt::GNU_HASH | dt::STRTAB | dt::STRSZ | dt::FLAGS | dt::FLAGS_1 | dt::DEBUG => {}
+            // The symbol table is read to refuse an undefined symbol no declared library
+            // exports, and DT_HASH only for the table's length. The string table is read only
+            // where a name is needed: a library's exports and its own name, and a program's
+            // imports. The GNU hash table, DT_FLAGS, DT_FLAGS_1 and DT_DEBUG carry nothing an
+            // image needs.
+            dt::SYMTAB | dt::SYMENT | dt::HASH | dt::STRTAB | dt::STRSZ => {
+                symbols.set(tag, value)?;
+            }
+            dt::GNU_HASH | dt::FLAGS | dt::FLAGS_1 | dt::DEBUG => {}
             other => return Err(ElfError::UnknownDynamicTag(other)),
         }
     }
@@ -916,18 +1113,94 @@ fn read_dynamic(
         return Err(ElfError::DynamicTable("no DT_NULL terminator"));
     }
 
-    check_symbols(file, &symbols, segments)?;
-    let rela = read_rela(file, &tags, segments)?;
+    let table = read_symbols(file, &symbols, segments)?;
+    let names = match linking {
+        Linking::Static => None,
+        Linking::Importing { .. } | Linking::Library => {
+            Some(Names::read(file, &symbols, segments)?)
+        }
+    };
+    let mut exports = Vec::new();
+    let mut undefined = false;
+    // Entry 0 is the reserved null symbol, which is undefined by definition.
+    for (index, symbol) in (0u64..).zip(&table).skip(1) {
+        let nameless = ElfError::SymbolName { index };
+        match (symbol.shndx == SHN_UNDEF, linking, &names) {
+            (true, Linking::Importing { exports, .. }, Some(names)) => {
+                if !exports.contains(&names.at(symbol.name).ok_or(nameless)?) {
+                    return Err(ElfError::UndefinedSymbol { index });
+                }
+                undefined = true;
+            }
+            (true, _, _) => return Err(ElfError::UndefinedSymbol { index }),
+            (false, Linking::Library, Some(names)) => exports.push(Export {
+                name: names.at(symbol.name).ok_or(nameless)?.to_string(),
+                value: symbol.value,
+                size: symbol.size,
+                function: symbol.info & 0xF == STT_FUNC,
+                public: symbol.info >> 4 == STB_GLOBAL && symbol.other & 3 == 0,
+            }),
+            // What a program defines for others is not bound by anything.
+            (false, _, _) => {}
+        }
+    }
+    let soname = match (soname, &names) {
+        (Some(at), Some(names)) => Some(
+            u32::try_from(at)
+                .ok()
+                .and_then(|at| names.at(at))
+                .filter(|name| !name.is_empty())
+                .ok_or(ElfError::Soname("it does not name a string of DT_STRTAB"))?
+                .to_string(),
+        ),
+        _ => None,
+    };
+    if let (Linking::Importing { library, .. }, Some(names)) = (linking, &names) {
+        match needed.as_slice() {
+            // A program that leaves a symbol to the library must say it needs the library:
+            // with no `DT_NEEDED` nothing in the file says where those symbols come from
+            // (the review of 2026-11-13, finding F17 b).
+            [] if undefined => return Err(ElfError::NeededMissing),
+            [] => {}
+            [at] => {
+                let named = u32::try_from(*at).ok().and_then(|at| names.at(at));
+                if named != Some(library) {
+                    return Err(ElfError::NeededOther);
+                }
+            }
+            _ => return Err(ElfError::NeededOther),
+        }
+    }
+
+    let (rela, imports) = read_rela(file, &tags, segments, &table, names.as_ref(), linking)?;
     let relr = read_relr(file, &tags, segments)?;
-    merge(rela, relr)
+    let relocations = merge(rela, relr)?;
+    // An import slot takes its export's address and nothing else: it is no relocation slot.
+    for import in &imports {
+        if relocations
+            .binary_search_by_key(&import.slot, |r| r.slot)
+            .is_ok()
+        {
+            return Err(ElfError::RelocationConflict { slot: import.slot });
+        }
+    }
+    Ok(Dynamic {
+        relocations,
+        imports,
+        exports,
+        soname,
+        null_last,
+    })
 }
 
-/// The symbol-related dynamic tags, each at most once.
+/// The symbol- and string-related dynamic tags, each at most once.
 #[derive(Default)]
 struct SymbolTags {
     symtab: Option<u64>,
     syment: Option<u64>,
     hash: Option<u64>,
+    strtab: Option<u64>,
+    strsz: Option<u64>,
 }
 
 impl SymbolTags {
@@ -935,7 +1208,9 @@ impl SymbolTags {
         let field = match tag {
             dt::SYMTAB => &mut self.symtab,
             dt::SYMENT => &mut self.syment,
-            _ => &mut self.hash,
+            dt::HASH => &mut self.hash,
+            dt::STRTAB => &mut self.strtab,
+            _ => &mut self.strsz,
         };
         if field.replace(value).is_some() {
             return Err(ElfError::DuplicateDynamicTag(tag));
@@ -944,18 +1219,36 @@ impl SymbolTags {
     }
 }
 
-/// Refuses a dynamic symbol table that holds an undefined symbol (ONBF §6.1.2). Its length is
-/// `nchain`, the second word of `DT_HASH` (gABI: "the number of symbol table entries"); entry 0
-/// is the reserved null symbol, which is undefined by definition.
+/// One entry of the dynamic symbol table.
+#[derive(Clone, Copy)]
+struct Symbol {
+    /// `st_name`: where its name starts in `DT_STRTAB`.
+    name: u32,
+    /// `st_info`: its binding and type.
+    info: u8,
+    /// `st_other`: its visibility.
+    other: u8,
+    /// `st_shndx`: [`SHN_UNDEF`] if the image does not define it.
+    shndx: u16,
+    value: u64,
+    size: u64,
+}
+
+/// The dynamic symbol table's entries, the reserved first one included. Its length is `nchain`,
+/// the second word of `DT_HASH` (gABI: "the number of symbol table entries"). An image with no
+/// `DT_SYMTAB` has none.
 ///
 /// A limit (S4-1's review, finding F9): the length is the file's own word, so a file can
-/// understate it and an undefined symbol past it is not seen. Nothing could use one: every
-/// relocation the conversions accept is `R_X86_64_RELATIVE`, which names no symbol, and nothing
-/// binds a symbol until `origin.core` exists (task S4-2), so an unseen undefined symbol has no
-/// effect on the image.
-fn check_symbols(file: &[u8], tags: &SymbolTags, segments: &[LoadSegment]) -> Result<(), ElfError> {
+/// understate it and a symbol past it is not seen. Nothing can use one: a relocation that names
+/// a symbol must name one inside the table read here, and every other relocation the
+/// conversions accept is `R_X86_64_RELATIVE`, which names none.
+fn read_symbols(
+    file: &[u8],
+    tags: &SymbolTags,
+    segments: &[LoadSegment],
+) -> Result<Vec<Symbol>, ElfError> {
     let Some(symtab) = tags.symtab else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if tags.syment != Some(SYM_SIZE) {
         return Err(ElfError::SymbolTable("DT_SYMENT is not 24"));
@@ -975,17 +1268,50 @@ fn check_symbols(file: &[u8], tags: &SymbolTags, segments: &[LoadSegment]) -> Re
         .ok_or(ElfError::SymbolTable("too many symbols"))?;
     let table = table_bytes(file, segments, symtab, size, "DT_SYMTAB")
         .map_err(|_| ElfError::SymbolTable("DT_SYMTAB is outside the file-backed bytes"))?;
-    for (index, raw) in (0u64..).zip(table.as_chunks::<SYM_BYTES>().0).skip(1) {
-        let shndx = Fields {
+    let mut out = Vec::with_capacity(table.len() / SYM_BYTES);
+    for raw in table.as_chunks::<SYM_BYTES>().0 {
+        let s = Fields {
             bytes: raw,
             what: "DT_SYMTAB",
-        }
-        .u16(SYM_SHNDX_AT)?;
-        if shndx == SHN_UNDEF {
-            return Err(ElfError::UndefinedSymbol { index });
-        }
+        };
+        let [info] = s.array(SYM_INFO_AT)?;
+        let [other] = s.array(SYM_OTHER_AT)?;
+        out.push(Symbol {
+            name: s.u32(SYM_NAME_AT)?,
+            info,
+            other,
+            shndx: s.u16(SYM_SHNDX_AT)?,
+            value: s.u64(SYM_VALUE_AT)?,
+            size: s.u64(SYM_SIZE_AT)?,
+        });
     }
-    Ok(())
+    Ok(out)
+}
+
+/// The dynamic string table: `DT_STRSZ` bytes at `DT_STRTAB`.
+struct Names<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> Names<'a> {
+    fn read(file: &'a [u8], tags: &SymbolTags, segments: &[LoadSegment]) -> Result<Self, ElfError> {
+        let (Some(strtab), Some(strsz)) = (tags.strtab, tags.strsz) else {
+            return Err(ElfError::SymbolTable(
+                "DT_STRTAB and DT_STRSZ are needed to read a name",
+            ));
+        };
+        let bytes = table_bytes(file, segments, strtab, strsz, "DT_STRTAB")
+            .map_err(|_| ElfError::SymbolTable("DT_STRTAB is outside the file-backed bytes"))?;
+        Ok(Self { bytes })
+    }
+
+    /// The string that starts `at` bytes in: up to its terminator, which must be inside the
+    /// table, and UTF-8.
+    fn at(&self, at: u32) -> Option<&'a str> {
+        let rest = self.bytes.get(usize::try_from(at).ok()?..)?;
+        let end = rest.iter().position(|&b| b == 0)?;
+        core::str::from_utf8(rest.get(..end)?).ok()
+    }
 }
 
 /// The bytes of a relocation table at RVA `rva`, which must lie inside the file-backed
@@ -1030,18 +1356,26 @@ fn check_slot(slot: u64, segments: &[LoadSegment]) -> Result<(), ElfError> {
     Ok(())
 }
 
-/// The `DT_RELA` entries as `(slot, addend)`, sorted by slot, with exact duplicates removed.
+/// What the `DT_RELA` table gave: its relative entries as `(slot, addend)`, and its imports.
+type RelaEntries = (Vec<(u64, u64)>, Vec<Import>);
+
+/// The `DT_RELA` table's relative entries as `(slot, addend)`, sorted by slot, with exact
+/// duplicates removed; and, for a program read as [`Linking::Importing`], its
+/// `R_X86_64_GLOB_DAT` entries as import slots, strictly ascending.
 fn read_rela(
     file: &[u8],
     tags: &RelocationTags,
     segments: &[LoadSegment],
-) -> Result<Vec<(u64, u64)>, ElfError> {
+    symbols: &[Symbol],
+    names: Option<&Names<'_>>,
+    linking: Linking<'_>,
+) -> Result<RelaEntries, ElfError> {
     let (rva, size) = match (tags.rela, tags.relasz, tags.relaent) {
         (None, None, None) => {
             if tags.relacount.is_some() {
                 return Err(ElfError::RelocationTags("DT_RELACOUNT without DT_RELA"));
             }
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         (Some(rva), Some(size), Some(entry)) => {
             if entry != RELA_SIZE {
@@ -1074,6 +1408,7 @@ fn read_rela(
         return Err(ElfError::RelaCount { count, entries });
     }
     let mut out = Vec::new();
+    let mut imports: Vec<Import> = Vec::new();
     for raw in bytes.as_chunks::<RELA_BYTES>().0 {
         let r = Fields {
             bytes: raw,
@@ -1084,6 +1419,30 @@ fn read_rela(
         let addend = r.u64(16)?;
         let r_type = u32::try_from(info & 0xFFFF_FFFF).unwrap_or(u32::MAX);
         let symbol = u32::try_from(info >> 32).unwrap_or(u32::MAX);
+        if let (R_X86_64_GLOB_DAT, Linking::Importing { .. }, Some(names)) =
+            (r_type, linking, names)
+        {
+            // It names an undefined symbol of the table, which the pass over the table has
+            // already held to the library's exports; the reserved entry 0 is none.
+            let named = usize::try_from(symbol)
+                .ok()
+                .filter(|&index| index != 0)
+                .and_then(|index| symbols.get(index))
+                .filter(|s| s.shndx == SHN_UNDEF)
+                .ok_or(ElfError::ImportSymbol { slot, symbol })?;
+            if addend != 0 {
+                return Err(ElfError::ImportAddend { slot });
+            }
+            check_slot(slot, segments)?;
+            let name = names.at(named.name).ok_or(ElfError::SymbolName {
+                index: u64::from(symbol),
+            })?;
+            imports.push(Import {
+                slot,
+                symbol: name.to_string(),
+            });
+            continue;
+        }
         if r_type != R_X86_64_RELATIVE {
             return Err(ElfError::UnsupportedRelocation { slot, r_type });
         }
@@ -1104,7 +1463,16 @@ fn read_rela(
             return Err(ElfError::RelocationConflict { slot: *a });
         }
     }
-    Ok(out)
+    // One slot, one export: two imports at a slot would leave it to the order they are bound.
+    imports.sort_by_key(|import| import.slot);
+    for pair in imports.windows(2) {
+        if let [a, b] = pair
+            && a.slot == b.slot
+        {
+            return Err(ElfError::RelocationConflict { slot: a.slot });
+        }
+    }
+    Ok((out, imports))
 }
 
 /// The `DT_RELR` slots, strictly ascending.

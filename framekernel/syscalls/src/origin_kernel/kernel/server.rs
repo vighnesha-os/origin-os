@@ -95,6 +95,121 @@ pub const CALLS: [CallInfo; 20] = [
     CallInfo { number: 19, name: "clock_read", registers: 1, reserved: false },
 ];
 
+/// The release fingerprint of the definition this was generated from: its description with
+/// the call numbers in it (§13). An `origin.core` generated from the same definition carries
+/// the same one, and the kernel is built only against that one (ADR-0011 L7).
+pub const RELEASE_FINGERPRINT: [u8; 32] = [
+    0x29, 0xc7, 0xbd, 0x56, 0x8f, 0xd5, 0x33, 0x92,
+    0x2d, 0x65, 0x06, 0x9c, 0xad, 0x7a, 0x42, 0xf8,
+    0xe5, 0xeb, 0x53, 0x80, 0x4f, 0x6c, 0x8f, 0xbc,
+    0x2d, 0x53, 0x5c, 0xce, 0x2c, 0xa9, 0x02, 0xe4,
+];
+
+/// Where `origin.core` holds each call's one `syscall` instruction: its offset from the
+/// image's base, a field a call. The build fills it from the linked image (ADR-0011 L7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pins {
+    /// `thread_exit`.
+    pub thread_exit: u64,
+    /// `debug_report`.
+    pub debug_report: u64,
+    /// `debug_write`.
+    pub debug_write: u64,
+    /// `handle_close`.
+    pub handle_close: u64,
+    /// `handle_duplicate`.
+    pub handle_duplicate: u64,
+    /// `channel_create`.
+    pub channel_create: u64,
+    /// `channel_write`.
+    pub channel_write: u64,
+    /// `channel_read`.
+    pub channel_read: u64,
+    /// `wait_one`.
+    pub wait_one: u64,
+    /// `event_create`.
+    pub event_create: u64,
+    /// `object_signal`.
+    pub object_signal: u64,
+    /// `memory_object_create`.
+    pub memory_object_create: u64,
+    /// `memory_map`.
+    pub memory_map: u64,
+    /// `memory_unmap`.
+    pub memory_unmap: u64,
+    /// `memory_protect`.
+    pub memory_protect: u64,
+    /// `port_create`.
+    pub port_create: u64,
+    /// `object_wait_async`.
+    pub object_wait_async: u64,
+    /// `port_wait`.
+    pub port_wait: u64,
+    /// `port_cancel`.
+    pub port_cancel: u64,
+    /// `clock_read`.
+    pub clock_read: u64,
+}
+
+impl Pins {
+    /// Every call's number with the offset of its `syscall` instruction, in number order.
+    #[must_use]
+    pub const fn each(&self) -> [(u64, u64); 20] {
+        [
+            (number::THREAD_EXIT, self.thread_exit),
+            (number::DEBUG_REPORT, self.debug_report),
+            (number::DEBUG_WRITE, self.debug_write),
+            (number::HANDLE_CLOSE, self.handle_close),
+            (number::HANDLE_DUPLICATE, self.handle_duplicate),
+            (number::CHANNEL_CREATE, self.channel_create),
+            (number::CHANNEL_WRITE, self.channel_write),
+            (number::CHANNEL_READ, self.channel_read),
+            (number::WAIT_ONE, self.wait_one),
+            (number::EVENT_CREATE, self.event_create),
+            (number::OBJECT_SIGNAL, self.object_signal),
+            (number::MEMORY_OBJECT_CREATE, self.memory_object_create),
+            (number::MEMORY_MAP, self.memory_map),
+            (number::MEMORY_UNMAP, self.memory_unmap),
+            (number::MEMORY_PROTECT, self.memory_protect),
+            (number::PORT_CREATE, self.port_create),
+            (number::OBJECT_WAIT_ASYNC, self.object_wait_async),
+            (number::PORT_WAIT, self.port_wait),
+            (number::PORT_CANCEL, self.port_cancel),
+            (number::CLOCK_READ, self.clock_read),
+        ]
+    }
+}
+
+/// Whether call `oidl_number` may be made by the `syscall` instruction at `oidl_offset` from
+/// `origin.core`'s base: only by its own (ADR-0005 B2). A number with no stub may be made from
+/// nowhere. Comparisons alone, with no table indexed by the number (ADR-0017 Z9, Z10).
+#[must_use]
+pub const fn pinned(oidl_pins: &Pins, oidl_number: u64, oidl_offset: u64) -> bool {
+    match oidl_number {
+        number::THREAD_EXIT => oidl_offset == oidl_pins.thread_exit,
+        number::DEBUG_REPORT => oidl_offset == oidl_pins.debug_report,
+        number::DEBUG_WRITE => oidl_offset == oidl_pins.debug_write,
+        number::HANDLE_CLOSE => oidl_offset == oidl_pins.handle_close,
+        number::HANDLE_DUPLICATE => oidl_offset == oidl_pins.handle_duplicate,
+        number::CHANNEL_CREATE => oidl_offset == oidl_pins.channel_create,
+        number::CHANNEL_WRITE => oidl_offset == oidl_pins.channel_write,
+        number::CHANNEL_READ => oidl_offset == oidl_pins.channel_read,
+        number::WAIT_ONE => oidl_offset == oidl_pins.wait_one,
+        number::EVENT_CREATE => oidl_offset == oidl_pins.event_create,
+        number::OBJECT_SIGNAL => oidl_offset == oidl_pins.object_signal,
+        number::MEMORY_OBJECT_CREATE => oidl_offset == oidl_pins.memory_object_create,
+        number::MEMORY_MAP => oidl_offset == oidl_pins.memory_map,
+        number::MEMORY_UNMAP => oidl_offset == oidl_pins.memory_unmap,
+        number::MEMORY_PROTECT => oidl_offset == oidl_pins.memory_protect,
+        number::PORT_CREATE => oidl_offset == oidl_pins.port_create,
+        number::OBJECT_WAIT_ASYNC => oidl_offset == oidl_pins.object_wait_async,
+        number::PORT_WAIT => oidl_offset == oidl_pins.port_wait,
+        number::PORT_CANCEL => oidl_offset == oidl_pins.port_cancel,
+        number::CLOCK_READ => oidl_offset == oidl_pins.clock_read,
+        _ => false,
+    }
+}
+
 /// What `debug_report` can fail with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]

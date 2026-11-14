@@ -344,6 +344,8 @@ fn cases() -> Vec<(Code, Case)> {
         (BadOrdinal, Case::Sources(chan(&one("method m = 0 () errors() requires none;")))),
         (BadOrdinal, Case::Sources(chan(&one("method m = 2147483648 () errors() requires none;")))),
         (BadOrdinal, Case::Sources(sys(&one("method m = 65536 () errors() requires none;")))),
+        // 0x050F: its `mov eax, imm32` would hold the two bytes of `syscall` (§10).
+        (BadOrdinal, Case::Sources(sys(&one("method m = 1295 () errors() requires none;")))),
         (DuplicateParam, Case::Sources(chan(&one("method m = 1 (a: u32, a: u32) errors() requires none;")))),
         (DuplicateParam, Case::Sources(chan(&one("method m = 1 (a: u32) -> (a: u32) errors() requires none;")))),
         (MissingErrors, Case::Sources(sys(&one("method m = 1 () requires none;")))),
@@ -592,4 +594,107 @@ fn a_method_may_name_a_later_version_and_a_version_key_is_read() {
         .expect("echo");
     assert_eq!((echo.version.major, echo.version.minor), (1, 2));
     assert_eq!(echo.version_key, None);
+}
+
+/// The one `syscall` number below the limit whose load into EAX would hold the two bytes of
+/// `syscall` is 1295, and a `channel` ordinal of that value is no load into anything.
+#[test]
+fn a_syscall_number_whose_load_would_hold_a_syscall_is_the_one_refused() {
+    use crate::sema::{MAX_SYSCALL_NUMBER, number_holds_syscall};
+    let refused: Vec<u32> = (0..=MAX_SYSCALL_NUMBER as u32)
+        .filter(|&number| number_holds_syscall(number))
+        .collect();
+    assert_eq!(refused, [0x050F]);
+    // Above the limit the pair can sit in the higher bytes too: the rule is on the bytes.
+    assert!(number_holds_syscall(0x0005_0F00));
+    assert!(number_holds_syscall(0x050F_0000));
+    assert!(!number_holds_syscall(0x0F05));
+    assert!(!number_holds_syscall(0x0F00_0005));
+    // The definition is refused with the reason, and its neighbours are taken.
+    let inputs = |sources: Vec<(&'static str, String)>| -> Vec<Input> {
+        sources
+            .into_iter()
+            .map(|(file, text)| Input {
+                file: file.to_string(),
+                text: text.into_bytes(),
+            })
+            .collect()
+    };
+    let text = |number: u32| {
+        sys(&one(&format!(
+            "method m = {number} () errors() requires none;"
+        )))
+    };
+    let problem = compile(&inputs(text(1295)), None).expect_err("1295 is refused");
+    assert_eq!(problem.code, Code::BadOrdinal);
+    assert!(problem.message.contains("0F 05"), "{}", problem.message);
+    for number in [1294, 1296] {
+        assert!(compile(&inputs(text(number)), None).is_ok(), "{number}");
+    }
+    // A channel ordinal is not loaded into a register by any stub.
+    assert!(
+        compile(
+            &inputs(chan(&one("method m = 1295 () errors() requires none;"))),
+            None
+        )
+        .is_ok()
+    );
+}
+
+/// Every handle a type can carry, walking into structs, arrays and vectors.
+fn handles_in(ty: &crate::model::Type, found: &mut Vec<crate::model::HandleType>) {
+    use crate::model::Type;
+    match ty {
+        Type::Handle(handle) => found.push(handle.clone()),
+        Type::Struct(structure) => {
+            for field in &structure.fields {
+                handles_in(&field.ty, found);
+            }
+        }
+        Type::Array(inner, _) | Type::Vector(inner, _) => handles_in(inner, found),
+        Type::Bool | Type::Int(_) | Type::Enum(_) | Type::Bits(_) | Type::String(_) => {}
+    }
+}
+
+/// Row O2 of the system-call threat model is closed for step 4 by absence (decision item 206;
+/// ADR-0005 Amendment 8, G2): no call of `origin.kernel` creates a thread or a process. A call
+/// that hands back a handle to a process or a thread, anywhere in its results, would reopen it,
+/// and this test fails then. So does any other result that is a handle of any type, which could
+/// name a new process or thread, besides `handle_duplicate`'s, which names an object its caller
+/// already holds a handle to.
+#[test]
+fn no_kernel_call_returns_a_new_process_or_thread() {
+    let comp = compile(&good_inputs(), Some(VERSIONS)).expect("valid");
+    let kernel = comp
+        .libraries
+        .iter()
+        .find(|library| library.name == "origin.kernel")
+        .expect("origin.kernel");
+    let mut methods = 0;
+    for interface in &kernel.interfaces {
+        for method in &interface.methods {
+            methods += 1;
+            let mut found = Vec::new();
+            for result in &method.returns {
+                handles_in(&result.ty, &mut found);
+            }
+            for handle in found {
+                let object = handle.object.as_deref();
+                assert!(
+                    object != Some("process") && object != Some("thread"),
+                    "{} returns a {:?} handle: row O2 reopens (ADR-0005 G2)",
+                    method.name,
+                    object
+                );
+                assert!(
+                    object.is_some() || method.name == "handle_duplicate",
+                    "{} returns a handle of any type, which could be a new process or thread",
+                    method.name
+                );
+            }
+        }
+    }
+    // The definition the threat model's row cites: its twenty calls at `user-abi` 0.7.
+    assert_eq!(methods, 20);
+    assert_eq!((kernel.version.major, kernel.version.minor), (0, 7));
 }

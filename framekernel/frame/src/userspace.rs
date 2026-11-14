@@ -40,7 +40,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use origin_abi::Error;
-use origin_paging::{Access, AddressSpace, MapError, PAGE, Table, TableMemory, Translation};
+use origin_paging::{
+    Access, AddressSpace, ENTRIES, MapError, PAGE, Table, TableMemory, Translation,
+};
 use origin_sync::shootdown::{Confirmation, Cost, Request, Rounds, Stalled};
 use origin_sync::{SpinGuard, SpinLock};
 
@@ -48,11 +50,22 @@ use crate::addr::PhysAddr;
 use crate::aliases::{Aliases, Mode};
 use crate::memory::{self, OwnedFrame};
 use crate::objref::ObjectRef;
-use crate::tablebound::{self, Refusal};
+use crate::tablebound::{self, Refusal, RunRefusal};
 use crate::usercopy::{self, UserAccess, UserRange};
 
-/// Page-table frames one space may own (enough for a few scattered megabytes).
-const MAX_TABLES: usize = 32;
+/// Page-table frames one space may own (enough for a few scattered megabytes), its PML4
+/// included.
+pub const MAX_TABLES: usize = 32;
+
+/// The levels of tables a user address is translated through: the user half's address bits
+/// above a page's offset, as many to a level as a table has entries (four, on x86-64).
+const LEVELS: usize = ((usercopy::USER_END + PAGE).trailing_zeros() - PAGE.trailing_zeros())
+    .div_ceil(ENTRIES.trailing_zeros()) as usize;
+
+/// The most pages one space can map: of its [`MAX_TABLES`] tables, at least one at each level
+/// above the leaves is not a leaf, and each leaf maps [`ENTRIES`] pages. The kernel-wide bound
+/// counts a space's page records up to it (ADR-0005 G5).
+pub const MAX_USER_PAGES: usize = (MAX_TABLES - (LEVELS - 1)) * ENTRIES;
 
 /// How many spaces have given their memory back, for the proofs of when that happens.
 static SPACES_FREED: AtomicU64 = AtomicU64::new(0);
@@ -274,6 +287,18 @@ struct Mapping {
     frame: Frame,
 }
 
+/// The size and alignment of the record a space keeps for each page it maps, in each of its two
+/// tables of them: what it maps, and the room an unmap moves records into. The kernel-wide bound
+/// counts both tables at [`MAX_USER_PAGES`] (ADR-0005 G5).
+pub const PAGE_RECORD: (usize, usize) = (
+    core::mem::size_of::<Mapping>(),
+    core::mem::align_of::<Mapping>(),
+);
+
+/// The size and alignment of the one allocation [`SharedFrame::new`] makes besides its frame:
+/// what a memory object keeps for each of its pages (ADR-0005 G5).
+pub const SHARED_FRAME: (usize, usize) = ObjectRef::<SharedInner>::ALLOCATION;
+
 /// What a change to a space cost, for whoever pays for it (N14 step 3, S3-5b): each shootdown
 /// interrupted `interrupts` processors, between them, while they ran.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -398,21 +423,31 @@ impl State {
     /// and makes the room for their records and every page table they need, so that
     /// [`map_run`](Self::map_run) cannot fail for want of either. On a failure, what it made
     /// stays, unused: room in two vectors, and empty tables this space frees with the rest.
+    ///
+    /// A run whose records would pass [`MAX_USER_PAGES`] is refused as a limit before any room is
+    /// made for them (`tablebound::ready_records`): such a run could never be mapped, and room
+    /// made for it would stay in both tables, so that what a space holds would depend on the size
+    /// of an object another process made (task S4-3; ADR-0005 G5). A page already mapped is
+    /// still refused first, as before.
     fn prepare_run(&mut self, base: u64, end: u64, count: usize) -> Result<(), ChangeError> {
-        if let Some(mapped) = self
+        let overlap = self
             .mapped
             .get(self.position(base))
             .filter(|m| m.virt < end)
-        {
-            return Err(MapError::AlreadyMapped(mapped.virt).into());
-        }
-        let records = self
-            .mapped
-            .len()
-            .checked_add(count)
-            .ok_or(MapError::OutOfMemory)?;
-        if self.mapped.try_reserve(count).is_err() || self.spare.try_reserve(records).is_err() {
-            return Err(MapError::OutOfMemory.into());
+            .map(|m| m.virt);
+        match tablebound::ready_records(
+            overlap,
+            &mut self.mapped,
+            &mut self.spare,
+            count,
+            MAX_USER_PAGES,
+        ) {
+            Ok(()) => {}
+            Err(RunRefusal::AlreadyMapped(virt)) => {
+                return Err(MapError::AlreadyMapped(virt).into());
+            }
+            Err(RunRefusal::Limit) => return Err(ChangeError::Limit),
+            Err(RunRefusal::NoMemory) => return Err(MapError::OutOfMemory.into()),
         }
         self.tables.refused = None;
         match self

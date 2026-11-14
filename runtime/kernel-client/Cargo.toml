@@ -1,0 +1,21 @@
+[package]
+name = "origin-kernel-client"
+description = "The Rust bindings of origin.kernel for a program: the generated client and its imports, which the launch path binds to origin.core (tasks S4-1 and S4-2; ADR-0011 Amendment 2, L3)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Nothing generated is committed here. `cargo xtask` runs `oidl generate` (its full mode) on
+# `sdk/interfaces/origin.kernel.oidl` into the target directory at each ring-3 build, and
+# `src/lib.rs` includes the client's tree from there: the generator's runtime, origin.kernel's
+# types, its safe client, and `abi.rs`, the imports the client calls. So no committed crate holds
+# a shim (xtask's interface test), and the bindings are always the definition's.
+#
+# It holds no stub and no `syscall`: the entry points its imports name are `origin.core`'s
+# (`runtime/core`), which a program is linked against and the kernel's launch path binds. It was
+# `runtime/kernel-stubs` until task S4-2, when the stubs left it. Built only for the userspace
+# triple, with `.cargo/userspace.toml`; never a default member.
+
+[lints]
+workspace = true

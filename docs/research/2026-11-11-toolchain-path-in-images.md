@@ -796,3 +796,24 @@ Nothing while the system runs: no image changed. One more CI job on each push: a
 - **Whether the job and the command need a change for S4-2's three more kept files.** By reading they take whatever plain files both sides hold. No run has shown it.
 - **The development Mac under the control.** `RUNNER_OS` is not set there, so the Mac's loader would be a third set of bytes (`aa24890d…`, built for the record). The Mac's own gate passes for the reason each runner's does: both of its builds get the same value.
 - No person has reviewed the job.
+
+## 19. Item 50 (2026-11-13): `origin.core` in the relink step
+
+Task S4-2 made `origin.core` a shared library, `liborigin_core.so`, linked with the fixed linker line like each program, and no target directory holding a stale copy of it had been made on purpose. The contract is "50" under "Task contracts" in `TASKS.md`.
+
+**What was found** (at `793299a`, the batch `land/s4-part2` with S4-2): the relink step chose the packages to clean from the stale file's target, and `ring3::carried_packages()` already held `origin-core`. So a stale `liborigin_core.so` would have been cleaned together with every carried program, and a stale program together with `origin-core`: each was linked again, but by two lists kept in step, and with more rebuilt than was stale.
+
+**What was changed** (`be7980e`): each linked file is given with the package that links it, by the caller that builds it (`ring3::origin_core`: `origin-core`; `ring3::programs`: each program's own; the kernel's build: `framekernel`). The clean names that package alone, and the choice by target is gone. `image-graph-gate` names `origin-core` as the library the kernel carries.
+
+**The run** (the development Mac, Rust 1.100.0, `be7980e`, under the machine's turn, 12:07 to 12:16 UTC):
+
+| Step | What `xtask` did | Afterwards |
+|---|---|---|
+| The linker's text changed in `.cargo/config.toml` | Its note for `liborigin_core.so`, `first-program` and `pin-program`, and three cleans, one for each: `--package origin-core`, `--package first-program`, `--package pin-program` | Each linked again with the new text |
+| The text changed back | The same three notes and cleans | The library, the program and the kernel are the reproducible-build gate's bytes |
+| `liborigin_core.so` alone made stale: one byte of its linker line changed in every copy Cargo keeps (two: its own under `build/origin-core/<hash>/out/`, and the outer name) | Its note for `liborigin_core.so`, and one clean, `--package origin-core` | The library is the gate's bytes again; the program and the kernel were not touched |
+| Nothing stale | Nothing linked again | |
+
+The host's `release` directory was there after every step. **`cargo clean --package origin-core` removes the shared library under its outer name**: the check that the file is gone after the clean (TASKS item 52, `5a73299`) did not stop the build. Before this run that was by reading only.
+
+**No image changed.** `cargo xtask check` passed on `be7980e` (1,807 host tests, 0 failed, 27 ignored; no warning line). Its gate kept twenty files, and `cargo xtask reproducible-compare` against the files CI's `check` job kept for `793299a` (run 43421978012, job 131873933166, on Linux) found all 40, from both builds, the same bytes. So the change built no image differently, and no boot was run for it.

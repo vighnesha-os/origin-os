@@ -27,7 +27,12 @@ rustflags = [
     # The shape `onbf-pack carried` accepts (ONBF §6.1.2), the same as the kernel's
     # (`.cargo/config.toml`). These come after rustc's own arguments, and in lld the last of
     # two opposing `-z` options wins.
-    "-C", "link-arg=--entry=_start",
+    # No entry is named here. A program's is `_start`, the linker's own default, which
+    # `origin-rt` supplies; `onbf-pack carried` refuses a program whose entry is not in its code,
+    # so one linked without it does not get as far as the kernel. A flag here would also reach
+    # `origin.core`, a library with no entry at all, and the linker warns of an entry it cannot
+    # find; and since these flags come after a package's own on the compiler's command line, no
+    # image could then name another entry (task S4-2).
     # No PT_INTERP: nothing loads these images but the kernel's launch path.
     "-C", "link-arg=--no-dynamic-linker",
     # No text relocations: every relocation target is in a writable segment.

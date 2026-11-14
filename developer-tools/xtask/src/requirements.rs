@@ -574,9 +574,9 @@ fn directive(text: &str) -> Directive {
 
 /// One decision of an ADR.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Decision {
+pub(crate) struct Decision {
     /// Its identifier as a row's ID ends: `P3`, `D1`, `def4`, `Am1`.
-    id: String,
+    pub(crate) id: String,
     /// What a row quotes for it.
     title: String,
     /// The line it is on, from 1.
@@ -585,13 +585,13 @@ struct Decision {
 
 /// What the gate reads from one ADR.
 #[derive(Debug, PartialEq, Eq)]
-struct Adr {
-    number: u16,
+pub(crate) struct Adr {
+    pub(crate) number: u16,
     /// What its `# ADR-NNNN: Title` heading says after the colon.
     title: String,
     /// Whether its status is Accepted: only then are its decisions requirements.
-    accepted: bool,
-    decisions: Vec<Decision>,
+    pub(crate) accepted: bool,
+    pub(crate) decisions: Vec<Decision>,
 }
 
 /// Whether `text` is a decision's identifier: one capital letter and a number.
@@ -635,7 +635,7 @@ fn title_of(cell: &str) -> String {
 /// - a numbered item under "Approved defaults";
 /// - an amendment that holds none of these: it is one decision, quoted by its heading after the
 ///   colon.
-fn adr(text: &str) -> Option<Adr> {
+pub(crate) fn adr(text: &str) -> Option<Adr> {
     /// An amendment whose end has not been reached.
     struct Amendment {
         number: String,
