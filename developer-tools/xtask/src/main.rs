@@ -20,6 +20,7 @@ mod lex;
 mod listed_names;
 mod loom;
 mod mnemonics;
+mod per_cpu;
 mod progress;
 mod provenance;
 mod reproducible;
@@ -76,6 +77,12 @@ commands:
               at APIC IDs 256 and 412, above what 8-bit APIC IDs reach (the MADT lists
               150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
               one without
+  boot-sparse boot-test on 67 processors in two packages, three at APIC IDs 256, 300 and
+              412 (ADR-0008 D7, decision item 294; part of boot-matrix)
+  boot-many   boot-test on 288 processors in two packages, APIC IDs 0-143 and 256-399,
+              under QEMU's software processor: measured and recorded, outside the gate
+  boot-listed boot-test with 2 processors enabled of the 4096 the MADT lists
+              (ADR-0008 Amendment 1, D7)
   boot-console the kernel's console on machines without a 16550 at 0x3F8 (ADR-0010): a UART
               named by an ACPI SPCR table, a table that must be refused, no display, and no
               UART at all (with a framebuffer the only way to see the boot)
@@ -98,6 +105,9 @@ commands:
   names-gate  only the gate on two names only listed files may use: the proof-process
               constructors in the kernel (ADR-0011 L8) and the call numbers in ring 3
               (CLAUDE.md §42); part of check
+  percpu-gate only the gate on per-processor state (ADR-0008 Amendment 1, D1 and D5):
+              every PerCpu table sized by its crate's size_per_cpu, and no MAX_CPUS or
+              static array sized by a processor count (part of check; quick)
   cfg-lint    only the CLAUDE.md §11 lint: no Origin code outside developer-tools/ asks
               whether its target is Linux or Unix (part of check; quick)
   document-gate only the gate on documents and archives: none is tracked, or left in this
@@ -174,9 +184,17 @@ environment:
   ORIGIN_BOOT_TEST_TIMEOUT            boot-test timeout in seconds (default 120)
   ORIGIN_BOOT_TEST_ONLY               run only the boot-test or boot-console scenarios whose
                                       label contains one of these comma-separated strings
-  ORIGIN_QEMU_SMP                     processors QEMU emulates, 1-64 (default 2)
-  ORIGIN_QEMU_TOPOLOGY                x2apic: the boot-x2apic machine (ORIGIN_QEMU_SMP is
-                                      then ignored)
+  ORIGIN_QEMU_SMP                     processors QEMU emulates, 1 or more (q35 takes up
+                                      to 4096; default 2)
+  ORIGIN_QEMU_NVME_PAIRS              the I/O queue pairs QEMU's NVMe controller allocates
+                                      (default 64; at least 2): 2 is the control for a
+                                      controller with no pair past the driver's two
+  ORIGIN_QEMU_TOPOLOGY                x2apic: the boot-x2apic machine; sparse: 67
+                                      processors, 64 in package 0 and three at APIC IDs 256,
+                                      300 and 412; many: two packages of 144 cores, 288
+                                      processors with APIC IDs 0-143 and 256-399; listed: 2
+                                      processors of 4096 the MADT lists (ORIGIN_QEMU_SMP is
+                                      then ignored; ADR-0008 Amendment 1, D7)
   ORIGIN_QEMU_CPU                     the QEMU CPU model (default max), e.g. max,-avx2 or
                                       max,vendor=GenuineIntel (which exposes leaf 1Fh on
                                       the boot-x2apic machine)
@@ -501,12 +519,13 @@ fn reserved_regions(amd: bool) -> Vec<origin_test_reserved_memory::Region> {
     }
 }
 
-/// Processors QEMU emulates: `ORIGIN_QEMU_SMP` (1–64), or 2.
+/// Processors QEMU emulates: `ORIGIN_QEMU_SMP` (1 or more; no count is compiled into the kernel,
+/// ADR-0008 Amendment 1, D5, and QEMU refuses more than its machine takes), or 2.
 fn qemu_cpus() -> u32 {
     std::env::var("ORIGIN_QEMU_SMP")
         .ok()
         .and_then(|v| v.parse().ok())
-        .filter(|n| (1..=64).contains(n))
+        .filter(|&n| n >= 1)
         .unwrap_or(2)
 }
 
@@ -570,6 +589,107 @@ impl Accel {
             .collect()
     }
 }
+
+/// What the per-processor NVMe proof must print on this configuration: every processor given a
+/// queue proven, or, where the controller gives none past the driver's two, "not proven".
+fn nvme_per_cpu_markers(machine: &Machine, cpus: u32) -> Vec<String> {
+    nvme_per_cpu_markers_for(machine, cpus, qemu_nvme_pairs())
+}
+
+/// [`nvme_per_cpu_markers`] for a controller that allocates `pairs` I/O queue pairs. The kernel
+/// judges on the controller's own numbers and prints each (review finding F5 of 2026-11-14):
+/// QEMU 11.1's controller allocates its `max_ioqpairs` whatever is asked.
+fn nvme_per_cpu_markers_for(machine: &Machine, cpus: u32, pairs: u32) -> Vec<String> {
+    let queued = nvme_queued_for(cpus, pairs);
+    let numbers = format!(
+        "the controller allocated {pairs} submission and {pairs} completion queues, has {QEMU_NVME_VECTORS} MSI-X vectors, and BAR 0 holds the doorbells of {QEMU_NVME_BAR_QUEUES} I/O queues; the driver keeps 2 of each"
+    );
+    if queued == 0 {
+        return vec![format!(
+            "origin-kernel: NVMe: per-CPU queues: not proven: {numbers}"
+        )];
+    }
+    std::iter::once(format!(
+        "origin-kernel: NVMe: per-CPU queues: {queued} of {cpus} processors have an I/O queue pair and MSI-X vector of their own, {} have none ({numbers}): {queued} expected, {queued} filled",
+        cpus - queued
+    ))
+    .chain(queue_order(machine).into_iter().take(queued as usize).map(|index| {
+        format!(
+            "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, ",
+            machine.named(index)
+        )
+    }))
+    .chain([format!(
+        "origin-kernel: NVMe: per-CPU queues: {queued} threads at once, one per CPU, each with its own queue pair and MSI-X vector: {} reads, {1} of {1} blocks match",
+        32 * queued,
+        256 * queued
+    )])
+    .collect()
+}
+
+/// I/O queue pairs QEMU 11.1's NVMe controller allocates (its `max_ioqpairs`), and its MSI-X
+/// vectors (`msix_qsize`): the driver keeps two pairs and two vectors, and every other
+/// processor past what is left has no queue of its own (ADR-0008 Amendment 1, D6).
+const QEMU_NVME_PAIRS: u32 = 64;
+const QEMU_NVME_VECTORS: u32 = 65;
+/// The highest I/O queue id whose doorbells QEMU 11.1's controller's BAR 0 holds: 16 KiB with
+/// doorbell stride 4, so queue 1535's completion doorbell is the last dword (`nvme::doorbell_queues`).
+const QEMU_NVME_BAR_QUEUES: u32 = 1535;
+
+/// The CPU indexes in the order the kernel gives them NVMe queues of their own: every processor
+/// whose APIC ID is above 255 first, then the rest in table order (`storage::queue_order`;
+/// ADR-0008 Amendment 1, D6; review finding F1 of 2026-11-14). The first [`nvme_queued`] of
+/// them get one, MSI-X entry `2 + k` for the `k`th.
+fn queue_order(machine: &Machine) -> Vec<u32> {
+    let wide = |index: &u32| {
+        machine
+            .apic_ids
+            .get(*index as usize)
+            .is_some_and(|&id| id > 0xFF)
+    };
+    let all = 0..machine.cpus();
+    all.clone()
+        .filter(wide)
+        .chain(all.filter(|index| !wide(index)))
+        .collect()
+}
+
+/// The I/O queue pairs this boot's NVMe controller allocates: QEMU's default, or
+/// `ORIGIN_QEMU_NVME_PAIRS` (at least 2), which limits its `max_ioqpairs` for the control that
+/// shows a controller with none past the driver's two (the coordinating session's ruling of
+/// 2026-11-14).
+fn qemu_nvme_pairs() -> u32 {
+    env::var("ORIGIN_QEMU_NVME_PAIRS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 2)
+        .unwrap_or(QEMU_NVME_PAIRS)
+}
+
+/// The processors that get an NVMe queue of their own on QEMU's controller: the first this many.
+fn nvme_queued(cpus: u32) -> u32 {
+    nvme_queued_for(cpus, qemu_nvme_pairs())
+}
+
+/// [`nvme_queued`] for a controller that allocates `pairs` I/O queue pairs.
+fn nvme_queued_for(cpus: u32, pairs: u32) -> u32 {
+    cpus.min(pairs.saturating_sub(2)).min(QEMU_NVME_VECTORS - 2)
+}
+
+/// The per-CPU tables the kernel sizes at discovery, the framework's and the kernel crate's
+/// (ADR-0008 Amendment 1, D1; `per_cpu` checks that each is sized).
+const PER_CPU_TABLES: u32 = 27;
+
+/// The cores of each package of the 288-processor run (`ORIGIN_QEMU_TOPOLOGY=many`, outside the
+/// gate since decision item 294).
+const MANY_CORES: u32 = 144;
+/// The cores of each package of the gate's large sparse machine (`ORIGIN_QEMU_TOPOLOGY=sparse`,
+/// decision item 294), and the processors QEMU starts in package 0.
+const SPARSE_CORES: u32 = 157;
+const SPARSE_PRESENT: u32 = 64;
+/// The processors the discovery machine's MADT lists (`ORIGIN_QEMU_TOPOLOGY=listed`): the most
+/// q35 takes, as QEMU 11.1.3 says on 2026-11-13.
+const LISTED: u32 = 4096;
 
 /// The processors QEMU presents, and what the kernel must find.
 struct Machine {
@@ -684,6 +804,77 @@ fn machine() -> Machine {
             },
         };
     }
+    if std::env::var("ORIGIN_QEMU_TOPOLOGY").as_deref() == Ok("sparse") {
+        // ADR-0008 Amendment 1, D7 as decision item 294 has it: the gate's large machine. Two
+        // packages of 157 single-thread cores (8 bits of core ID, so package 1 starts at APIC ID
+        // 256), 314 possible; the 64 processors of package 0 that QEMU starts, and three
+        // cold-plugged in package 1 at cores 0, 44 and 156: APIC IDs 256, 300 and 412. 67
+        // processors, three above 255, none a power of two.
+        let model = qemu_cpu_model();
+        let base = model.split(',').next().unwrap_or("max");
+        let geometry = Geometry {
+            packages: 2,
+            dies: 1,
+            modules: 1,
+            cores: SPARSE_CORES,
+            threads: 1,
+        };
+        let plugged = [0, 44, 156];
+        let mut apic_ids: Vec<u32> = (0..SPARSE_PRESENT).collect();
+        apic_ids.extend(plugged.iter().map(|core| 256 + core));
+        return Machine {
+            smp: format!(
+                "{SPARSE_PRESENT},maxcpus={},sockets=2,cores={SPARSE_CORES},threads=1",
+                2 * SPARSE_CORES
+            ),
+            devices: plugged
+                .iter()
+                .map(|core| format!("{base}-x86_64-cpu,socket-id=1,core-id={core},thread-id=0"))
+                .collect(),
+            listed: 2 * SPARSE_CORES,
+            highest: 256 + SPARSE_CORES - 1,
+            apic_ids,
+            geometry,
+        };
+    }
+    if std::env::var("ORIGIN_QEMU_TOPOLOGY").as_deref() == Ok("many") {
+        // ADR-0008 Amendment 1, D7: the large sparse machine. 144 cores take 8 bits, so package
+        // 1 starts at APIC ID 256: 288 processors, half of them above 255, none a power of two.
+        let geometry = Geometry {
+            packages: 2,
+            dies: 1,
+            modules: 1,
+            cores: MANY_CORES,
+            threads: 1,
+        };
+        let apic_ids = geometry.ids();
+        return Machine {
+            smp: format!("{0},sockets=2,cores={MANY_CORES},threads=1", 2 * MANY_CORES),
+            devices: Vec::new(),
+            listed: apic_ids.len() as u32,
+            highest: apic_ids.iter().copied().max().unwrap_or(0),
+            apic_ids,
+            geometry,
+        };
+    }
+    if std::env::var("ORIGIN_QEMU_TOPOLOGY").as_deref() == Ok("listed") {
+        // ADR-0008 Amendment 1, D7: the discovery machine. The MADT lists every processor q35
+        // allows, 4096, in one package; two are present and enabled.
+        return Machine {
+            smp: format!("2,maxcpus={LISTED},sockets=1,cores={LISTED},threads=1"),
+            devices: Vec::new(),
+            apic_ids: vec![0, 1],
+            listed: LISTED,
+            highest: LISTED - 1,
+            geometry: Geometry {
+                packages: 1,
+                dies: 1,
+                modules: 1,
+                cores: LISTED,
+                threads: 1,
+            },
+        };
+    }
     let cpus = qemu_cpus();
     Machine {
         smp: cpus.to_string(),
@@ -773,11 +964,18 @@ fn topology_markers(machine: &Machine, leaf_1f: bool) -> Vec<String> {
 fn boot_scenario() -> Scenario {
     let machine = machine();
     let mut scenario = boot_scenario_markers(&machine);
-    // Each AP's start-up line comes after the MADT line, in index order.
+    // Each AP's start-up line comes after the MADT line and the per-CPU line that follows it
+    // (ADR-0008 Amendment 1, D3), in index order.
     if let Some(at) = scenario
         .markers
         .iter()
-        .position(|m| m.starts_with("origin-kernel: ACPI MADT: "))
+        .position(|m| m.starts_with("; kernel stacks' region: room for "))
+        .or_else(|| {
+            scenario
+                .markers
+                .iter()
+                .position(|m| m.starts_with("origin-kernel: ACPI MADT: "))
+        })
     {
         for index in (1..machine.cpus()).rev() {
             scenario.markers.insert(
@@ -806,6 +1004,12 @@ fn boot_scenario() -> Scenario {
     }
     if Accel::from_env() == Ok(Accel::Kvm) {
         kvm_markers(&mut scenario, qemu_iommu() != Iommu::Amd);
+    } else if oversubscribed() {
+        // The processors share the host's cores, so the even-shares line may not come, and an
+        // uneven share whose workers both ran is let pass (`oversubscribed_fair_share`).
+        scenario
+            .markers
+            .retain(|m| !m.starts_with(EVEN_SHARES_LINE));
     }
     if qemu_bridge() {
         bridge_markers(&mut scenario);
@@ -1106,6 +1310,63 @@ fn is_unfilled_tx_ring(line: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether this boot is one of the oversubscribed machines, named, whose scheduler proof's fair
+/// share is not judged ([`oversubscribed_fair_share`]): under QEMU's software processor,
+/// `boot-matrix`'s 65-processor machine (`ORIGIN_QEMU_SMP=65`), the 67-processor sparse machine
+/// (`ORIGIN_QEMU_TOPOLOGY=sparse`) and the 288-processor run (`many`). Each guest processor is a
+/// host thread, so on those the two workers of one guest processor get the shares the host gives
+/// QEMU's threads. The machines are named, never found from the host's threads (review finding
+/// F9 of 2026-11-14; decision item 308, ADR-0013 Amendment 2): every other machine, those of 1
+/// to 4 processors and `boot-x2apic` among them, is held to a fair share on every host.
+fn oversubscribed() -> bool {
+    let topology = env::var("ORIGIN_QEMU_TOPOLOGY").ok();
+    let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    Accel::from_env()
+        .is_ok_and(|accel| oversubscribed_for(accel, topology.as_deref(), qemu_cpus(), host))
+}
+
+/// [`oversubscribed`] for an accelerator, `ORIGIN_QEMU_TOPOLOGY`, `ORIGIN_QEMU_SMP` and the
+/// host's threads. Decision item 308 keeps the host's threads out of the answer: they are taken
+/// only so that the host tests can show that they change nothing.
+fn oversubscribed_for(
+    accel: Accel,
+    topology: Option<&str>,
+    smp: u32,
+    _host_threads: usize,
+) -> bool {
+    accel == Accel::Tcg
+        && match topology {
+            Some("sparse" | "many") => true,
+            Some(_) => false,
+            None => smp == 65,
+        }
+}
+
+/// The two workers' counts on a scheduler proof's line that an oversubscribed boot lets pass
+/// (the coordinating session's ruling of 2026-11-14, TASKS item 58; ADR-0013): the workers both
+/// ran, for enough rounds (at least 15 switches), whatever their shares. On such a boot the share
+/// measures how the host schedules QEMU's threads, not the kernel, so fairness is not shown
+/// there; preemption, which the two workers running and switching show, is still held.
+fn oversubscribed_fair_share(line: &str) -> Option<(u64, u64)> {
+    if !line.starts_with("origin-kernel: scheduler: CPU ")
+        || !line.ends_with(" context switches: scheduler failed")
+    {
+        return None;
+    }
+    let (_, counts) = line.split_once(" counted ")?;
+    let first = number_before(counts, " and ")?;
+    let second = number_before(counts, ", ")?;
+    let switches = number_before(counts, " context switches")?;
+    (first > 0 && second > 0 && switches >= 15).then_some((first, second))
+}
+
+/// Whether the checker lets `line` pass on a boot under `accel`: KVM's allowances, and on an
+/// oversubscribed boot an uneven fair share whose workers both ran.
+fn checker_forgives(line: &str, accel: Accel, oversubscribed: bool) -> bool {
+    (accel == Accel::Kvm && kvm_forgives(line))
+        || (oversubscribed && oversubscribed_fair_share(line).is_some())
 }
 
 /// How unequal two workers' counts [`is_uneven_fair_share`] lets pass: the larger under this
@@ -1473,14 +1734,28 @@ fn bridge_markers(scenario: &mut Scenario) {
     }
 }
 
-/// What the kernel reports about its processors' x2APIC IDs: for each one above 255, its
-/// interrupts reach it through an IRTE holding its full ID (NVMe MSI-X entry `2 + index`)
-/// and wake its threads; with none, that there is nothing to prove.
+/// What the kernel reports about its processors' x2APIC IDs: for each one above 255 with an
+/// NVMe queue of its own, its interrupts reach it through an IRTE holding its full ID (MSI-X
+/// entry `2 + k`, `k` its place in [`queue_order`], which puts them first: review finding F1 of
+/// 2026-11-14) and wake its threads; with none above 255, that there is nothing to prove.
 fn x2apic_markers(machine: &Machine) -> Vec<String> {
-    let wide: Vec<(u32, u32)> = (0..machine.cpus())
-        .zip(machine.apic_ids.iter().copied())
-        .filter(|&(_, id)| id > 0xFF)
+    let queued = nvme_queued(machine.cpus());
+    let all_wide = machine.apic_ids.iter().filter(|&&id| id > 0xFF).count();
+    let wide: Vec<(u32, u32, u32)> = queue_order(machine)
+        .into_iter()
+        .take(queued as usize)
+        .zip(0..)
+        .filter_map(|(index, k)| {
+            let id = machine.apic_ids.get(index as usize).copied()?;
+            (id > 0xFF).then_some((k, index, id))
+        })
         .collect();
+    if wide.is_empty() && all_wide > 0 {
+        // ADR-0008 Amendment 1, D6: none of them has an NVMe queue of its own.
+        return vec![format!(
+            "origin-kernel: x2APIC: {all_wide} online processors have an APIC ID above 255 and no NVMe queue of their own (ADR-0008 Amendment 1, D6): nothing to prove through NVMe"
+        )];
+    }
     if wide.is_empty() {
         let largest = machine.apic_ids.iter().copied().max().unwrap_or(0);
         return vec![format!(
@@ -1488,12 +1763,12 @@ fn x2apic_markers(machine: &Machine) -> Vec<String> {
         )];
     }
     wide.into_iter()
-        .flat_map(|(index, id)| {
+        .flat_map(|(k, index, id)| {
             [
                 format!(
                     "origin-kernel: x2APIC: {} is above 255, which a compatibility-format MSI address cannot carry (refused true); its NVMe MSI-X entry {} holds only remappable handle ",
                     machine.named(index),
-                    2 + index
+                    2 + k
                 ),
                 format!(
                     ", whose IRTE sends vector 0x40 to destination {id} after checking source ID 0x0010: true; "
@@ -1558,15 +1833,15 @@ fn amd_iommu_markers(scenario: &mut Scenario, machine: &Machine) {
         (
             format!(
                 "origin-kernel: IOMMU: interrupt remapping: {} of {} MSI-X entries (NVMe {}, virtio-net 2) hold only a remappable handle with data 0",
-                3 + cpus,
-                3 + cpus,
-                1 + cpus
+                3 + nvme_queued(cpus),
+                3 + nvme_queued(cpus),
+                1 + nvme_queued(cpus)
             ),
             vec![format!(
                 "origin-kernel: IOMMU: interrupt remapping: {} of {} MSI-X entries (NVMe {}, virtio-net 2) hold only an index into their device's own interrupt remapping table, whose IRTE holds the vector and the x2APIC destination",
-                3 + cpus,
-                3 + cpus,
-                1 + cpus
+                3 + nvme_queued(cpus),
+                3 + nvme_queued(cpus),
+                1 + nvme_queued(cpus)
             )],
         ),
         (
@@ -1760,9 +2035,24 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
                 "origin-kernel: ACPI MADT: {} processors, {cpus} enabled (largest APIC ID listed {})",
                 machine.listed, machine.highest
             ),
+            // ADR-0008 Amendment 1, D3: every per-CPU table holds every index, sized at
+            // discovery, the stacks' region has room, and nothing held a processor back.
+            format!(
+                "origin-kernel: CPU indexes: {cpus} given at discovery ({cpus} to start, 0 reserved for online-capable processors); {PER_CPU_TABLES} per-CPU tables hold {cpus} each, "
+            ),
+            format!(
+                "; kernel stacks' region: room for {} processors, at most 262144 in its reserved address space; x2APIC IDs are 32-bit, 0 with the broadcast ID refused; held back: none",
+                cpus.max(64)
+            ),
             format!(
                 "origin-kernel: SMP: {cpus} of {cpus} enabled processors online; trampoline identity pages removed true"
             ),
+            // D8: one at a time, and the total printed.
+            format!(
+                "origin-kernel: SMP: application processors started one at a time (ADR-0008 C7, Amendment 1 D8): {} in ",
+                cpus - 1
+            ),
+            "; 0 never sent INIT for want of memory".into(),
             // Every processor's interrupt stacks end at a guard page, and each processor set
             // its own control state (CLAUDE.md §24, §58).
             format!(
@@ -1987,18 +2277,10 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // Per-CPU queues: every CPU at once through its own queue pair and vector, the
             // vector's destination its APIC ID.
         ])
-        .chain((0..cpus).map(|index| {
-            format!(
-                "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, ",
-                machine.named(index)
-            )
-        }))
-        .chain([format!(
-            "origin-kernel: NVMe: per-CPU queues: {cpus} threads at once, one per CPU, each with its own queue pair and MSI-X vector: {} reads, {} of {} blocks match",
-            32 * cpus,
-            256 * cpus,
-            256 * cpus
-        )])
+        // ADR-0008 Amendment 1, D6: a queue of its own while the controller has one left. The
+        // proof is demanded on every configuration that gives one; only a controller limited to
+        // the driver's two pairs (`ORIGIN_QEMU_NVME_PAIRS=2`) is expected to say "not proven".
+        .chain(nvme_per_cpu_markers(machine, cpus))
         // Processors above APIC ID 255: NVMe interrupts reach them live through IRTEs.
         .chain(x2apic_markers(machine))
         .chain([
@@ -2041,9 +2323,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "reason 0x5 (write to a page not mapped writable); consistent true".into(),
             format!(
                 "origin-kernel: IOMMU: interrupt remapping: {} of {} MSI-X entries (NVMe {}, virtio-net 2) hold only a remappable handle with data 0",
-                3 + cpus,
-                3 + cpus,
-                1 + cpus
+                3 + nvme_queued(cpus),
+                3 + nvme_queued(cpus),
+                1 + nvme_queued(cpus)
             ),
             "APIC ID 300 accepted (its IRTE reads back destination 300), which compatibility format refuses: true; consistent true".into(),
             "origin-kernel: IOMMU: blocked interrupt: NVMe MSI-X vector 1 pointed at IRTE ".into(),
@@ -3014,6 +3296,7 @@ fn main() -> ExitCode {
         ["check"] => in_turn("check", check),
         ["unsafe-gate"] => unsafety::gate(),
         ["names-gate"] => listed_names::gate(),
+        ["percpu-gate"] => per_cpu::gate(),
         ["document-gate"] => documents::gate(),
         ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
@@ -3043,6 +3326,9 @@ fn main() -> ExitCode {
         ["boot-test"] => in_turn("boot-test", boot_test),
         ["boot-matrix"] => in_turn("boot-matrix", boot_matrix),
         ["boot-x2apic"] => in_turn("boot-x2apic", boot_x2apic),
+        ["boot-sparse"] => in_turn("boot-sparse", boot_sparse),
+        ["boot-many"] => in_turn("boot-many", boot_many),
+        ["boot-listed"] => in_turn("boot-listed", boot_listed),
         ["boot-console"] => in_turn("boot-console", boot_console),
         ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
         ["boot-reserved"] => in_turn("boot-reserved", boot_reserved),
@@ -3101,12 +3387,21 @@ fn boot_matrix() -> Result {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     fs::write(&bases, "").map_err(|e| format!("{}: {e}", bases.display()))?;
+    // ADR-0008 Amendment 1, D7: 3 and 65 processors too, and after the others the large sparse
+    // machine and the discovery machine, unless held out of CI (`any_count_machines`).
+    let any_count = any_count_machines();
+    let counts: &[u32] = if any_count {
+        &[1, 2, 3, 4, 65]
+    } else {
+        &[1, 2, 4]
+    };
     for iommu in ["intel", "amd"] {
-        for cpus in [1, 2, 4] {
+        for &cpus in counts {
             println!("xtask: boot-matrix: {iommu} IOMMU, {cpus} processor(s)");
             let status = boot_test_child(&exe)
                 .env("ORIGIN_QEMU_IOMMU", iommu)
                 .env("ORIGIN_QEMU_SMP", cpus.to_string())
+                .env("ORIGIN_BOOT_TEST_TIMEOUT", timeout_for(cpus).to_string())
                 .status()
                 .map_err(|e| format!("cannot run boot-test: {e}"))?;
             if !status.success() {
@@ -3124,6 +3419,17 @@ fn boot_matrix() -> Result {
     boot_random()?;
     boot_identity()?;
     boot_console()?;
+    // ADR-0008 D7 as decision item 294 has it: the large sparse machine of 67 processors, and
+    // the discovery machine. The 288-processor run (`boot-many`) is outside the gate: on the
+    // development Mac QEMU disturbs the guest's timing at 288 processors before any AP starts.
+    if any_count {
+        boot_sparse()?;
+        boot_listed()?;
+    } else {
+        println!(
+            "xtask: boot-matrix: the machines of ADR-0008 Amendment 1, D7 (3 and 65 processors, the 67-processor sparse machine, the discovery machine) are not run in CI until each one's time has been measured and accepted (set ORIGIN_BOOT_MATRIX_ANY_COUNT=on to run them)"
+        );
+    }
     // ADR-0004 Amendment 2, A6.4: the boots placed the kernel stacks' region apart.
     let recorded = fs::read_to_string(&bases).map_err(|e| format!("{}: {e}", bases.display()))?;
     let boots = distinct_stack_bases(&recorded)?;
@@ -3131,8 +3437,124 @@ fn boot_matrix() -> Result {
         "xtask: boot-matrix: the kernel stacks' region was at {boots} distinct bases in {boots} kernel boots, read through QEMU's monitor; none is printed"
     );
     println!(
-        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the reserved-memory machines, the legacy-free machine, the two machines without the random-number instructions, the two CPU identities, and the console machines)"
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with {} processors, the sparse machine, the bridge machine, the reserved-memory machines, the legacy-free machine, the two machines without the random-number instructions, the two CPU identities, the console machines{})",
+        if any_count {
+            "1, 2, 3, 4 and 65"
+        } else {
+            "1, 2 and 4"
+        },
+        if any_count {
+            ", the 67-processor sparse machine, the discovery machine"
+        } else {
+            ""
+        }
     );
+    Ok(())
+}
+
+/// Whether `boot-matrix` runs the machines of ADR-0008 Amendment 1, D7: always on a developer's
+/// machine; in CI (GitHub Actions) only with `ORIGIN_BOOT_MATRIX_ANY_COUNT=on`. D7's condition:
+/// none becomes required in CI until each one's boot has been measured on the development Mac,
+/// its share of the real-CPU job stated, and the coordinating session has accepted it.
+fn any_count_machines() -> bool {
+    env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
+        || env::var("ORIGIN_BOOT_MATRIX_ANY_COUNT").as_deref() == Ok("on")
+}
+
+/// A boot's timeout for `cpus` processors: the default, and two seconds more for each processor
+/// past four. A boot under QEMU's software processor starts each AP one at a time and runs every
+/// per-processor proof on each (ADR-0008 Amendment 1, D8), so it grows with the count. An
+/// `ORIGIN_BOOT_TEST_TIMEOUT` set by the caller is kept.
+fn timeout_for(cpus: u32) -> u64 {
+    if let Some(secs) = env::var("ORIGIN_BOOT_TEST_TIMEOUT")
+        .ok()
+        .and_then(|set| set.parse().ok())
+    {
+        return secs;
+    }
+    DEFAULT_BOOT_TEST_TIMEOUT.as_secs() + 2 * u64::from(cpus.saturating_sub(4))
+}
+
+/// `boot-test` on the gate's large sparse machine (ADR-0008 D7 as decision item 294 has it): 67
+/// processors in two packages, three at APIC IDs 256, 300 and 412, Intel VT-d with interrupt
+/// remapping, under QEMU's software processor only (a KVM runner has 4 host processors).
+fn boot_sparse() -> Result {
+    if Accel::from_env()? == Accel::Kvm {
+        println!(
+            "xtask: boot-sparse: not run under KVM: the 67-processor sparse machine runs under QEMU's software processor only (ADR-0008 D7)"
+        );
+        return Ok(());
+    }
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    let cpus = SPARSE_PRESENT + 3;
+    println!(
+        "xtask: boot-sparse: {cpus} processors in two packages, APIC IDs 0-{} and 256, 300 and 412 of {} possible",
+        SPARSE_PRESENT - 1,
+        2 * SPARSE_CORES
+    );
+    let status = boot_test_child(&exe)
+        .env("ORIGIN_QEMU_TOPOLOGY", "sparse")
+        .env("ORIGIN_QEMU_IOMMU", "intel")
+        .env("ORIGIN_BOOT_TEST_TIMEOUT", timeout_for(cpus).to_string())
+        .status()
+        .map_err(|e| format!("cannot run boot-test: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "boot-test on the 67-processor sparse machine failed ({status})"
+        ));
+    }
+    println!("xtask: boot-sparse passed ({cpus} processors online, three above APIC ID 255)");
+    Ok(())
+}
+
+/// `boot-test` on 288 processors in two packages of 144 cores, APIC IDs 0-143 and 256-399,
+/// Intel VT-d with interrupt remapping, under QEMU's software processor only: a run measured and
+/// recorded outside the gate (decision item 294), since QEMU disturbs the guest's timing at this
+/// count on the development Mac.
+fn boot_many() -> Result {
+    if Accel::from_env()? == Accel::Kvm {
+        println!(
+            "xtask: boot-many: not run under KVM: the large sparse machine runs under QEMU's software processor only (ADR-0008 Amendment 1, D7)"
+        );
+        return Ok(());
+    }
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    let cpus = 2 * MANY_CORES;
+    println!(
+        "xtask: boot-many: {cpus} processors in two packages, APIC IDs 0-{} and 256-{}",
+        MANY_CORES - 1,
+        255 + MANY_CORES
+    );
+    let status = boot_test_child(&exe)
+        .env("ORIGIN_QEMU_TOPOLOGY", "many")
+        .env("ORIGIN_QEMU_IOMMU", "intel")
+        .env("ORIGIN_BOOT_TEST_TIMEOUT", timeout_for(cpus).to_string())
+        .status()
+        .map_err(|e| format!("cannot run boot-test: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "boot-test on the large sparse machine failed ({status})"
+        ));
+    }
+    println!("xtask: boot-many passed ({cpus} processors online)");
+    Ok(())
+}
+
+/// `boot-test` on the discovery machine (ADR-0008 Amendment 1, D7): the MADT lists the 4096
+/// processors q35 allows, two of them enabled.
+fn boot_listed() -> Result {
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    println!("xtask: boot-listed: 2 processors enabled of {LISTED} the MADT lists");
+    let status = boot_test_child(&exe)
+        .env("ORIGIN_QEMU_TOPOLOGY", "listed")
+        .status()
+        .map_err(|e| format!("cannot run boot-test: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "boot-test on the discovery machine failed ({status})"
+        ));
+    }
+    println!("xtask: boot-listed passed (2 of {LISTED} listed processors online)");
     Ok(())
 }
 
@@ -3940,6 +4362,8 @@ fn check() -> Result {
     unsafety::gate()?;
     // Who may make a proof process, and which ring-3 files may name the call numbers.
     listed_names::gate()?;
+    // Every per-processor table sized at discovery; no processor count compiled in.
+    per_cpu::gate()?;
     interfaces::gate()?;
     // The host tools are libraries first: xtask starts none of them, and they reach nothing of
     // the host (ADR-0011 Amendment 4, T1).
@@ -5217,7 +5641,17 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         // The NVMe controller and its test disk (CLAUDE.md §33).
         .arg("-drive")
         .arg(qemu_path_arg("if=none,id=nvme0,format=raw,file=", &s.nvme)?)
-        .args(["-device", "nvme,serial=ORIGIN0001,drive=nvme0"]);
+        .args([
+            "-device",
+            &if qemu_nvme_pairs() == QEMU_NVME_PAIRS {
+                "nvme,serial=ORIGIN0001,drive=nvme0".to_string()
+            } else {
+                format!(
+                    "nvme,serial=ORIGIN0001,drive=nvme0,max_ioqpairs={}",
+                    qemu_nvme_pairs()
+                )
+            },
+        ]);
     // A PCIe root port for the NIC (threat T4): clearing bus mastering stops its forwarding too,
     // and the driver must open it again above the device it attached (`boot-bridge`).
     let nic_bus = if qemu_bridge() {
@@ -5481,25 +5915,52 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
             deadline,
         )
     } else {
+        let oversubscribed = oversubscribed();
+        // The verdict on the output so far: a failure in a complete line, or every marker in
+        // order, or `None` while neither.
+        let judge = |raw: &[u8]| -> Option<Result> {
+            let text = serial::clean(raw);
+            // Failures are matched in complete lines only, so a failing line reaches the log
+            // in full (its details follow the marker) before QEMU is stopped.
+            let complete = text
+                .get(..text.rfind('\n').map_or(0, |i| i + 1))
+                .unwrap_or("");
+            let judged = if oversubscribed {
+                Cow::Owned(
+                    complete
+                        .lines()
+                        .filter(|l| !checker_forgives(l, accel, true))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            } else {
+                accel.judged(complete)
+            };
+            if let Some(m) = scenario.failures.iter().find(|m| judged.contains(**m)) {
+                return Some(Err(format!("the serial output contains {m:?}")));
+            }
+            serial::contains_in_order(&text, &markers).then_some(Ok(()))
+        };
         loop {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(chunk) => {
                     raw.extend_from_slice(&chunk);
-                    let text = serial::clean(&raw);
-                    // Failures are matched in complete lines only, so a failing line reaches
-                    // the log in full (its details follow the marker) before QEMU is stopped.
-                    let complete = text
-                        .get(..text.rfind('\n').map_or(0, |i| i + 1))
-                        .unwrap_or("");
-                    let judged = accel.judged(complete);
-                    if let Some(m) = scenario.failures.iter().find(|m| judged.contains(**m)) {
-                        break Err(format!("the serial output contains {m:?}"));
+                    // Judged only once a line has ended: QEMU hands the serial port's output
+                    // over a few bytes at a time, and judging the whole log for each chunk is
+                    // quadratic in its length. A 65-processor log took 48 minutes to judge
+                    // that way, its kernel 65 s to print it (ADR-0008 Amendment 1, D7). The
+                    // output is judged once more at the end, whatever its last line.
+                    if !chunk.contains(&b'\n') {
+                        continue;
                     }
-                    if serial::contains_in_order(&text, &markers) {
-                        break Ok(());
+                    if let Some(verdict) = judge(&raw) {
+                        break verdict;
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    if let Some(verdict) = judge(&raw) {
+                        break verdict;
+                    }
                     let text = serial::clean(&raw);
                     let missing = serial::first_missing(&text, &markers).unwrap_or("(none)");
                     break Err(format!(
@@ -5508,6 +5969,9 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
                     ));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    if let Some(verdict) = judge(&raw) {
+                        break verdict;
+                    }
                     break Err("QEMU exited before the loader output was complete".into());
                 }
             }
@@ -5517,6 +5981,23 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
 
     // What the markers were found in, before any monitor output joins the stream.
     let text = serial::clean(&raw);
+    // Every fair share the checker let pass on an oversubscribed boot, said so.
+    if scenario.capture != Capture::Screen && oversubscribed() {
+        let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        for line in text.lines() {
+            if let Some((first, second)) = oversubscribed_fair_share(line) {
+                let cpu = line
+                    .strip_prefix("origin-kernel: scheduler: ")
+                    .and_then(|rest| rest.split_once(':'))
+                    .map_or("a processor", |(cpu, _)| cpu);
+                println!(
+                    "xtask: {}: forgave fairness on an oversubscribed machine, named (ADR-0013; {} guest processors on {host} host threads): {cpu}: the workers counted {first} and {second}; both ran",
+                    scenario.label,
+                    machine().cpus()
+                );
+            }
+        }
+    }
     let mut screen = None;
     if verdict.is_ok() && scenario.capture == Capture::Com1AndScreen {
         match stdin.as_mut() {
@@ -5984,6 +6465,178 @@ mod gate_tests {
         assert_eq!(functions.len(), 1);
         assert_eq!(functions[0].0, "_foo");
         assert_eq!(functions[0].1.len(), 4, "everything up to .cfi_endproc");
+    }
+}
+
+#[cfg(test)]
+mod nvme_marker_tests {
+    use super::{
+        Geometry, Machine, QEMU_NVME_PAIRS, nvme_per_cpu_markers_for, queue_order, x2apic_markers,
+    };
+
+    /// Review finding F1 of 2026-11-14: on the gate's large sparse machine the three processors
+    /// above APIC ID 255 get the first queues, so interrupts through remapping to them are
+    /// proven there, never "nothing to prove".
+    #[test]
+    fn the_processors_above_255_get_the_first_queues() {
+        let mut m = dense(67);
+        m.apic_ids = (0..64).chain([256, 300, 412]).collect();
+        assert_eq!(queue_order(&m)[..4], [64, 65, 66, 0]);
+        let x2apic = x2apic_markers(&m);
+        assert!(x2apic.iter().all(|l| !l.contains("nothing to prove")));
+        for (k, (index, id)) in [(64, 256), (65, 300), (66, 412)].into_iter().enumerate() {
+            assert!(
+                x2apic.iter().any(|l| l
+                    .contains(&format!("CPU {index} (APIC ID {id}) is above 255"))
+                    && l.contains(&format!("MSI-X entry {} holds", 2 + k))),
+                "CPU {index}"
+            );
+        }
+        let nvme = nvme_per_cpu_markers_for(&m, 67, QEMU_NVME_PAIRS);
+        assert!(nvme[1].starts_with("origin-kernel: NVMe: CPU 64 (APIC ID 256): "));
+        assert!(nvme[4].starts_with("origin-kernel: NVMe: CPU 0 (APIC ID 0): "));
+        // A machine with no processor above 255 keeps table order.
+        assert_eq!(queue_order(&dense(3)), [0, 1, 2]);
+    }
+
+    fn dense(cpus: u32) -> Machine {
+        Machine {
+            smp: cpus.to_string(),
+            devices: Vec::new(),
+            apic_ids: (0..cpus).collect(),
+            listed: cpus,
+            highest: cpus - 1,
+            geometry: Geometry {
+                packages: 1,
+                dies: 1,
+                modules: 1,
+                cores: cpus,
+                threads: 1,
+            },
+        }
+    }
+
+    /// The coordinating session's ruling of 2026-11-14: on the gate's own configurations, which
+    /// give queues, the proven lines are demanded and "not proven" is never enough; only a
+    /// controller limited to the driver's two pairs is expected to say "not proven".
+    #[test]
+    fn the_gate_demands_the_proof_wherever_the_controller_gives_queues() {
+        for cpus in [1, 2, 3, 4, 65, 67] {
+            let m = dense(cpus);
+            let markers = nvme_per_cpu_markers_for(&m, cpus, QEMU_NVME_PAIRS);
+            assert!(
+                markers.iter().all(|l| !l.contains("not proven")),
+                "{cpus} processors"
+            );
+            assert!(
+                markers
+                    .last()
+                    .is_some_and(|l| l.contains("threads at once, one per CPU")),
+                "{cpus} processors: the summary is demanded"
+            );
+        }
+        let limited = nvme_per_cpu_markers_for(&dense(2), 2, 2);
+        assert_eq!(
+            limited,
+            [
+                "origin-kernel: NVMe: per-CPU queues: not proven: the controller allocated 2 submission and 2 completion queues, has 65 MSI-X vectors, and BAR 0 holds the doorbells of 1535 I/O queues; the driver keeps 2 of each"
+            ]
+        );
+        // Three pairs give one processor a queue: proven again.
+        let three = nvme_per_cpu_markers_for(&dense(2), 2, 3);
+        assert!(
+            three
+                .first()
+                .is_some_and(|l| l.contains("1 of 2 processors"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod oversubscribed_tests {
+    use super::{Accel, checker_forgives, oversubscribed_fair_share, oversubscribed_for};
+
+    const UNEVEN: &str = "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted 720000 and 7273000, 27 context switches: scheduler failed";
+
+    /// Review finding F9 of 2026-11-14 and decision item 308 (ADR-0013 Amendment 2): the
+    /// allowance is keyed to the machines, by name, never to the host's threads.
+    #[test]
+    fn only_the_named_large_software_processor_machines_are_oversubscribed() {
+        for host in [1, 2, 4, 10, 64, 256] {
+            assert!(oversubscribed_for(Accel::Tcg, None, 65, host), "{host}");
+            assert!(oversubscribed_for(Accel::Tcg, Some("sparse"), 2, host));
+            assert!(oversubscribed_for(Accel::Tcg, Some("many"), 2, host));
+            for smp in [1, 2, 3, 4, 11, 64, 66] {
+                assert!(
+                    !oversubscribed_for(Accel::Tcg, None, smp, host),
+                    "{smp} processors on {host} host threads"
+                );
+            }
+            for other in ["x2apic", "listed", ""] {
+                assert!(
+                    !oversubscribed_for(Accel::Tcg, Some(other), 65, host),
+                    "{other}"
+                );
+            }
+            assert!(
+                !oversubscribed_for(Accel::Kvm, None, 65, host),
+                "KVM keeps its own allowance"
+            );
+            assert!(!oversubscribed_for(Accel::Kvm, Some("sparse"), 2, host));
+        }
+    }
+
+    /// The coordinating session's two cases for decision item 308: a 4-processor machine on a
+    /// 2-thread host is held to a fair share, which the host-keyed rule before review finding F9
+    /// would have waived; each named large machine on a 64-thread host is not.
+    #[test]
+    fn the_host_changes_nothing_either_way() {
+        let small = oversubscribed_for(Accel::Tcg, None, 4, 2);
+        assert!(!small);
+        assert!(!checker_forgives(UNEVEN, Accel::Tcg, small));
+        for (topology, smp) in [(None, 65), (Some("sparse"), 2), (Some("many"), 2)] {
+            let large = oversubscribed_for(Accel::Tcg, topology, smp, 64);
+            assert!(large, "{topology:?}");
+            assert!(checker_forgives(UNEVEN, Accel::Tcg, large), "{topology:?}");
+        }
+    }
+
+    /// The coordinating session's ruling of 2026-11-14: an uneven share passes on an
+    /// oversubscribed software-processor boot when both workers ran and the rounds hold, and
+    /// nowhere else.
+    #[test]
+    fn an_uneven_share_passes_only_on_an_oversubscribed_boot_with_both_workers_running() {
+        assert_eq!(
+            oversubscribed_fair_share(UNEVEN),
+            Some((720_000, 7_273_000))
+        );
+        assert!(
+            checker_forgives(UNEVEN, Accel::Tcg, true),
+            "oversubscribed: passes"
+        );
+        assert!(
+            !checker_forgives(UNEVEN, Accel::Tcg, false),
+            "the same share on a 4-processor machine fails"
+        );
+        assert!(
+            !checker_forgives(UNEVEN, Accel::Kvm, false),
+            "KVM's factor of four still holds"
+        );
+        let idle = UNEVEN.replace("counted 720000 and", "counted 0 and");
+        assert!(
+            !checker_forgives(&idle, Accel::Tcg, true),
+            "a worker never ran: fails"
+        );
+        let few = UNEVEN.replace("27 context switches", "12 context switches");
+        assert!(
+            !checker_forgives(&few, Accel::Tcg, true),
+            "too few rounds: fails"
+        );
+        let other = "origin-kernel: scheduler: workers did not exit: scheduler failed";
+        assert!(
+            !checker_forgives(other, Accel::Tcg, true),
+            "no other scheduler line"
+        );
     }
 }
 

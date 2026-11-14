@@ -2,7 +2,9 @@
 //! processor can still reach what was mapped there (CLAUDE.md §28; ADR-0004 Amendment 1, A2:
 //! the kernel stacks).
 //!
-//! The region is cut into `N` equal slots. A slot's holder maps what it needs at the top of the
+//! The region is cut into `N` equal slots, and may be given more once, at run time
+//! ([`Slots::grow`]; ADR-0008 Amendment 1, D3: the kernel stacks' region grows with the processors
+//! discovered). A slot's holder maps what it needs at the top of the
 //! slot and leaves the rest unmapped, so running off the bottom of what is mapped faults, and
 //! nothing below it belongs to anyone else. Mapping and unmapping are the caller's: this is the
 //! bookkeeping, generic over them so that the host tests and the Loom models (`models.rs`) run
@@ -30,6 +32,7 @@
 //! takes the lock with interrupts off.
 #![forbid(unsafe_code)]
 
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use crate::shootdown::{Completed, Stalled};
@@ -89,12 +92,25 @@ pub struct Counts {
     pub pages: u64,
 }
 
+/// Why [`Slots::grow`] added nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Grow {
+    /// The slots were grown once already: they are grown once.
+    Already,
+    /// The storage for the new slots could not be had.
+    NoMemory,
+}
+
 /// The bookkeeping, under the lock.
 struct Table<const N: usize, const IDLE: usize> {
     states: [State; N],
     /// The pages mapped at the top of each slot that is not Free: what a taker of an Idle slot
     /// gets, and what a reclaim unmaps.
     pages: [u32; N],
+    /// The states of the slots past the first `N`, added once by [`Slots::grow`].
+    more_states: Vec<State>,
+    /// Their pages, as `pages`.
+    more_pages: Vec<u32>,
     /// The Idle slots, most recently given back last.
     idle: [usize; IDLE],
     idle_count: usize,
@@ -125,6 +141,8 @@ impl<const N: usize, const IDLE: usize> Table<N, IDLE> {
         Self {
             states: [State::Free; N],
             pages: [0; N],
+            more_states: Vec::new(),
+            more_pages: Vec::new(),
             idle: [0; IDLE],
             idle_count: 0,
             first_free: 0,
@@ -139,18 +157,45 @@ impl<const N: usize, const IDLE: usize> Table<N, IDLE> {
         }
     }
 
+    /// How many slots there are: the first `N` and those [`Slots::grow`] added.
+    fn len(&self) -> usize {
+        N + self.more_states.len()
+    }
+
     fn state(&self, slot: usize) -> Option<State> {
-        self.states.get(slot).copied()
+        match slot.checked_sub(N) {
+            None => self.states.get(slot).copied(),
+            Some(past) => self.more_states.get(past).copied(),
+        }
     }
 
     fn set(&mut self, slot: usize, state: State) {
-        if let Some(s) = self.states.get_mut(slot) {
+        let s = match slot.checked_sub(N) {
+            None => self.states.get_mut(slot),
+            Some(past) => self.more_states.get_mut(past),
+        };
+        if let Some(s) = s {
             *s = state;
         }
     }
 
+    /// The pages recorded for `slot`, or `None` past the last.
+    fn page(&self, slot: usize) -> Option<u32> {
+        match slot.checked_sub(N) {
+            None => self.pages.get(slot).copied(),
+            Some(past) => self.more_pages.get(past).copied(),
+        }
+    }
+
+    fn page_mut(&mut self, slot: usize) -> Option<&mut u32> {
+        match slot.checked_sub(N) {
+            None => self.pages.get_mut(slot),
+            Some(past) => self.more_pages.get_mut(past),
+        }
+    }
+
     fn pages_of(&self, slot: usize) -> u32 {
-        self.pages.get(slot).copied().unwrap_or(0)
+        self.page(slot).unwrap_or(0)
     }
 
     /// Takes the most recently idled slot holding `pages` pages out of the idle list.
@@ -158,7 +203,7 @@ impl<const N: usize, const IDLE: usize> Table<N, IDLE> {
         let listed = self.idle.get(..self.idle_count)?;
         let at = listed
             .iter()
-            .rposition(|&slot| self.pages.get(slot) == Some(&pages))?;
+            .rposition(|&slot| self.page(slot) == Some(pages))?;
         let slot = *listed.get(at)?;
         // Close the gap: the order of the rest stays.
         let last = self.idle_count - 1;
@@ -172,7 +217,7 @@ impl<const N: usize, const IDLE: usize> Table<N, IDLE> {
     /// Makes `slot` Free again, after a reclaim.
     fn free(&mut self, slot: usize) {
         self.set(slot, State::Free);
-        if let Some(p) = self.pages.get_mut(slot) {
+        if let Some(p) = self.page_mut(slot) {
             *p = 0;
         }
         self.first_free = self.first_free.min(slot);
@@ -218,9 +263,9 @@ impl<const N: usize, const IDLE: usize> Slots<N, IDLE> {
             }
             None => {
                 let from = table.first_free;
-                let slot = (from..N).find(|&s| table.state(s) == Some(State::Free))?;
+                let slot = (from..table.len()).find(|&s| table.state(s) == Some(State::Free))?;
                 table.first_free = slot + 1;
-                if let Some(p) = table.pages.get_mut(slot) {
+                if let Some(p) = table.page_mut(slot) {
                     *p = pages;
                 }
                 table.counts.pages += u64::from(pages);
@@ -324,7 +369,7 @@ impl<const N: usize, const IDLE: usize> Slots<N, IDLE> {
         }
         let (slot, pages) = {
             let mut table = self.table.lock();
-            let slot = (0..N).find(|&s| table.state(s) == Some(State::Retired))?;
+            let slot = (0..table.len()).find(|&s| table.state(s) == Some(State::Retired))?;
             table.set(slot, State::Reclaiming);
             // Still counted as retired until it is Free or Lost, but no longer findable.
             table.findable -= 1;
@@ -347,6 +392,41 @@ impl<const N: usize, const IDLE: usize> Slots<N, IDLE> {
             table.counts.lost += 1;
         }
         Some(outcome)
+    }
+
+    /// Adds Free slots past the first `N`, once, so that there are `total` (ADR-0008 Amendment
+    /// 1, D3). Their storage is made before the lock is taken, so nothing is allocated under it.
+    /// Returns how many slots there are now: `N` if `total` is not more.
+    ///
+    /// # Errors
+    ///
+    /// [`Grow::Already`] if slots were added before, and [`Grow::NoMemory`] if the storage could
+    /// not be had. Nothing changes either way.
+    pub fn grow(&self, total: usize) -> Result<usize, Grow> {
+        let Some(extra) = total.checked_sub(N).filter(|&e| e > 0) else {
+            return Ok(N);
+        };
+        let mut states = Vec::new();
+        let mut pages = Vec::new();
+        states
+            .try_reserve_exact(extra)
+            .and_then(|()| pages.try_reserve_exact(extra))
+            .map_err(|_| Grow::NoMemory)?;
+        states.resize(extra, State::Free);
+        pages.resize(extra, 0);
+        let mut table = self.table.lock();
+        if !table.more_states.is_empty() {
+            drop(table);
+            return Err(Grow::Already);
+        }
+        table.more_states = states;
+        table.more_pages = pages;
+        Ok(table.len())
+    }
+
+    /// How many slots there are: `N`, and those [`Slots::grow`] added.
+    pub fn slot_count(&self) -> usize {
+        self.table.lock().len()
     }
 
     /// What slot `slot` is now, or `None` past the last.
@@ -393,6 +473,38 @@ mod tests {
             reclaimed += 1;
         }
         reclaimed
+    }
+
+    /// ADR-0008 Amendment 1, D3: slots added at run time are taken, given back, kept idle and
+    /// reclaimed like the first `N`; the table grows once, and asking for no more adds nothing.
+    #[test]
+    fn slots_added_at_run_time_are_like_the_first() {
+        let slots: Slots<2, 1> = Slots::new();
+        assert_eq!(slots.slot_count(), 2);
+        assert_eq!(slots.grow(1), Ok(2), "fewer than there are: nothing added");
+        assert_eq!(slots.grow(2), Ok(2));
+        assert_eq!(slots.grow(5), Ok(5));
+        assert_eq!(slots.grow(9), Err(Grow::Already), "grown once");
+        assert_eq!(slots.slot_count(), 5);
+        let taken: Vec<_> = (0..5).map(|_| slots.take(1).unwrap().slot).collect();
+        assert_eq!(taken, [0, 1, 2, 3, 4]);
+        assert!(slots.take(1).is_none(), "every slot is taken");
+        assert_eq!(slots.state(5), None, "nothing past the last");
+        assert_eq!(slots.give_back(4, true), Some(Given::Idle));
+        assert_eq!(slots.take(1).map(|t| (t.slot, t.mapped)), Some((4, true)));
+        assert_eq!(slots.give_back(3, false), Some(Given::Retired));
+        let mut unmapped = None;
+        let reclaimed = slots.reclaim(
+            |slot, pages| unmapped = Some((slot, pages)),
+            |_, _| done(),
+            |()| (),
+        );
+        assert!(matches!(reclaimed, Some(Ok(_))));
+        assert_eq!(unmapped, Some((3, 1)));
+        assert_eq!(slots.state(3), Some(State::Free));
+        assert_eq!(slots.take(2).map(|t| (t.slot, t.mapped)), Some((3, false)));
+        let counts = slots.counts();
+        assert_eq!((counts.live, counts.pages), (5, 6));
     }
 
     #[test]

@@ -56,31 +56,73 @@ pub const STACK_WINDOW_SIZE: u64 = 64 << PDPT_SHIFT;
 /// it, so a guard costs no frame and splits no page of the direct map. [`build`] maps nothing
 /// there.
 pub const STACK_REGION: u64 = STACK_WINDOW;
-/// The part of the stack window the region takes: 256 MiB, every page of it covered by page
-/// tables made at boot ([`STACK_REGION_TABLES`]).
+/// The part of the stack window the region takes at boot, its floor: 256 MiB, every page of it
+/// covered by page tables made at boot ([`STACK_REGION_TABLES`]). The region grows past it once,
+/// when the processors are discovered, up to [`STACK_REGION_RESERVE`] (ADR-0008 Amendment 1,
+/// D3).
 pub const STACK_REGION_SIZE: u64 = 256 << 20;
-/// The tables the stack region's leaves need, made once at boot
-/// (`AddressSpace::reserve_tables`): a page table per 2 MiB and a page directory per GiB it
-/// touches, which is one more than its size in GiB, because a region at 2 MiB alignment may
-/// cross a 1 GiB boundary (Amendment 2). Its PDPTs are the kernel half's
-/// ([`KERNEL_HALF_SLOTS`]).
-pub const STACK_REGION_TABLES: u64 =
-    STACK_REGION_SIZE / LARGE_PAGE + STACK_REGION_SIZE.div_ceil(1 << GIB_SHIFT) + 1;
-/// The bases a draw can give the stack region: every 2 MiB step with the whole region in its
+/// The address space the stack region may grow into, from its base (ADR-0008 Amendment 1, D3):
+/// 1 TiB. No table covers what lies past [`STACK_REGION_SIZE`] until the region grows; the base
+/// is drawn so that the whole reserve is in the window.
+pub const STACK_REGION_RESERVE: u64 = 1 << 40;
+/// The tables the leaves of a stack region of `size` bytes need (`AddressSpace::reserve_tables`):
+/// a page table per 2 MiB and a page directory per GiB it touches, which is one more than its
+/// size in GiB, because a region at 2 MiB alignment may cross a 1 GiB boundary (Amendment 2).
+/// Its PDPTs are the kernel half's ([`KERNEL_HALF_SLOTS`]).
+pub const fn stack_region_tables(size: u64) -> u64 {
+    size / LARGE_PAGE + size.div_ceil(1 << GIB_SHIFT) + 1
+}
+/// The tables the region's floor needs, made once at boot.
+pub const STACK_REGION_TABLES: u64 = stack_region_tables(STACK_REGION_SIZE);
+/// The address space each kernel stack has in the region: the stack at its top, unmapped space
+/// below (ADR-0004 Amendment 1, A2).
+pub const STACK_SLOT: u64 = 128 * 1024;
+/// Each indexed processor's share of the region once it grows (ADR-0008 Amendment 1, D3): 32
+/// slots. The floor is that share for 64 processors.
+pub const STACK_SLOTS_PER_PROCESSOR: u64 = 32;
+/// The most processors the region's reserved address space has room for at that share: 1 TiB of
+/// 128 KiB slots, 32 each, is 262,144 (D3).
+pub const STACK_REGION_MAX_PROCESSORS: u64 =
+    STACK_REGION_RESERVE / STACK_SLOT / STACK_SLOTS_PER_PROCESSOR;
+
+/// The region's size for `processors` indexed processors: its floor, or their share of slots if
+/// that is more, within its reserved address space (ADR-0008 Amendment 1, D3).
+pub const fn stack_region_size_for(processors: u64) -> u64 {
+    let processors = if processors < STACK_REGION_MAX_PROCESSORS {
+        processors
+    } else {
+        STACK_REGION_MAX_PROCESSORS
+    };
+    let share = processors * STACK_SLOTS_PER_PROCESSOR * STACK_SLOT;
+    if share > STACK_REGION_SIZE {
+        share
+    } else {
+        STACK_REGION_SIZE
+    }
+}
+
+/// The processors a stack region of `size` bytes has room for, at
+/// [`STACK_SLOTS_PER_PROCESSOR`] slots each.
+pub const fn stack_region_room(size: u64) -> u64 {
+    size / STACK_SLOT / STACK_SLOTS_PER_PROCESSOR
+}
+/// The bases a draw can give the stack region: every 2 MiB step with its whole reserve in its
 /// window but the window's start, which is the fixed base and so says that nothing was drawn.
-/// About 2^24 of them.
-pub const STACK_PLACEMENTS: u64 = (STACK_WINDOW_SIZE - STACK_REGION_SIZE) / LARGE_PAGE;
+/// About 2^23.95 of them (ADR-0008 Amendment 1, D3: 2^24 before the reserve).
+pub const STACK_PLACEMENTS: u64 = (STACK_WINDOW_SIZE - STACK_REGION_RESERVE) / LARGE_PAGE;
 const _: () = assert!(
     STACK_WINDOW == DIRECT_MAP_WINDOW + DIRECT_MAP_WINDOW_SIZE
         && STACK_WINDOW + STACK_WINDOW_SIZE == FRAMEBUFFER_WINDOW
         && STACK_REGION_SIZE.is_multiple_of(LARGE_PAGE)
-        && STACK_REGION_SIZE <= STACK_WINDOW_SIZE,
+        && STACK_REGION_RESERVE.is_multiple_of(LARGE_PAGE)
+        && STACK_REGION_SIZE <= STACK_REGION_RESERVE
+        && STACK_REGION_RESERVE < STACK_WINDOW_SIZE,
     "the stack window lies between the direct-map window and the MMIO window"
 );
 
 /// The stack region's base for `random`, the 64 random bits the loader hands over for it
-/// (ADR-0004 Amendment 2, A4 and A5.1): 2 MiB-aligned, with the whole region in the stack
-/// window, and never the fixed base.
+/// (ADR-0004 Amendment 2, A4 and A5.1): 2 MiB-aligned, with the region's whole reserve in the
+/// stack window, and never the fixed base.
 /// Not printed after boot (A6).
 pub const fn stack_region_base(random: u64) -> u64 {
     STACK_WINDOW + (1 + random % STACK_PLACEMENTS) * LARGE_PAGE
@@ -161,12 +203,12 @@ pub const fn tell(addr: u64, bases: &Bases) -> Told {
     }
 }
 
-/// Whether `base` is a base the stack region can have: 2 MiB-aligned, with the whole region in
-/// the stack window.
+/// Whether `base` is a base the stack region can have: 2 MiB-aligned, with the region's whole
+/// reserve in the stack window.
 pub const fn is_stack_region_base(base: u64) -> bool {
     base >= STACK_WINDOW
         && base.is_multiple_of(LARGE_PAGE)
-        && base - STACK_WINDOW <= STACK_WINDOW_SIZE - STACK_REGION_SIZE
+        && base - STACK_WINDOW <= STACK_WINDOW_SIZE - STACK_REGION_RESERVE
 }
 /// Tables the kernel half's top level can take (ADR-0004 H2): one for each of PML4 entries
 /// 256–511. [`AddressSpace::reserve_upper_half`] makes the ones [`build`] did not.
@@ -878,9 +920,15 @@ mod tests {
     #[test]
     fn stack_region_bases_stay_inside_their_window_and_aligned() {
         const { assert!(STACK_PLACEMENTS > 1 << 23 && STACK_PLACEMENTS < 1 << 24) };
+        // ADR-0008 Amendment 1, D3: 31 TiB of 2 MiB steps, 2^23.95, where 32 TiB less the
+        // 256 MiB floor gave 2^24 less 128.
+        assert_eq!(STACK_PLACEMENTS, 31 << 19);
         assert_eq!(stack_region_base(0), STACK_REGION + LARGE_PAGE);
         let last = stack_region_base(STACK_PLACEMENTS - 1);
-        assert_eq!(last + STACK_REGION_SIZE, STACK_WINDOW + STACK_WINDOW_SIZE);
+        assert_eq!(
+            last + STACK_REGION_RESERVE,
+            STACK_WINDOW + STACK_WINDOW_SIZE
+        );
         assert_eq!(
             stack_region_base(STACK_PLACEMENTS),
             stack_region_base(0),
@@ -905,7 +953,7 @@ mod tests {
             assert!(is_stack_region_base(base), "{random:#x} gave {base:#x}");
             assert_ne!(base, STACK_REGION, "a draw never gives the fixed base");
             assert!((384..448).contains(&((base >> 39) & 0x1FF)));
-            assert!(((base + STACK_REGION_SIZE - 1) >> 39) & 0x1FF < 448);
+            assert!(((base + STACK_REGION_RESERVE - 1) >> 39) & 0x1FF < 448);
             seen.insert(base);
         }
         assert!(seen.len() > 9_990, "the bases vary: {}", seen.len());
@@ -923,5 +971,45 @@ mod tests {
             "the region would cross into the MMIO window"
         );
         assert!(!is_stack_region_base(FRAMEBUFFER_WINDOW));
+    }
+
+    /// ADR-0008 Amendment 1, D3: the region keeps its floor up to 64 processors, grows by 4 MiB
+    /// for each past them, and stops at its reserve, room for 262,144.
+    #[test]
+    fn the_stack_region_grows_with_the_processors_up_to_its_reserve() {
+        assert_eq!(STACK_REGION_MAX_PROCESSORS, 262_144);
+        for (processors, size) in [
+            (0, STACK_REGION_SIZE),
+            (1, STACK_REGION_SIZE),
+            (64, STACK_REGION_SIZE),
+            (65, 65 << 22),
+            (288, 288 << 22),
+            (4096, 4096 << 22),
+            (262_144, STACK_REGION_RESERVE),
+            (262_145, STACK_REGION_RESERVE),
+            (u64::MAX, STACK_REGION_RESERVE),
+        ] {
+            assert_eq!(
+                stack_region_size_for(processors),
+                size,
+                "{processors} processors"
+            );
+            assert!(size.is_multiple_of(LARGE_PAGE));
+        }
+        assert_eq!(stack_region_room(STACK_REGION_SIZE), 64);
+        assert_eq!(stack_region_room(stack_region_size_for(288)), 288);
+        assert_eq!(stack_region_room(STACK_REGION_RESERVE), 262_144);
+    }
+
+    /// ADR-0008 Amendment 1, D3: the tables a region needs, at the floor and at the reserve.
+    #[test]
+    fn a_stack_region_needs_a_table_per_2_mib_and_a_directory_per_gib_it_touches() {
+        assert_eq!(STACK_REGION_TABLES, 128 + 2);
+        assert_eq!(stack_region_tables(0), 1);
+        assert_eq!(stack_region_tables(4 << 20), 2 + 1 + 1);
+        assert_eq!(
+            stack_region_tables(STACK_REGION_RESERVE),
+            (1 << 19) + 1024 + 1
+        );
     }
 }

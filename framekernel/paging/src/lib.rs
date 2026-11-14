@@ -215,17 +215,16 @@ pub trait TableMemory {
     fn table(&self, addr: u64) -> Option<&Table>;
 }
 
-/// Tables carved from one contiguous run of frames whose first frame is at physical `base`.
+/// One contiguous run of table frames whose first frame is at physical `base`.
 #[derive(Debug)]
-pub struct TablePool<'a> {
+struct Run<'a> {
     tables: &'a [Table],
     base: u64,
     used: usize,
 }
 
-impl<'a> TablePool<'a> {
-    /// A pool over `tables`, the frames at `base`, `base + PAGE`, and so on.
-    pub const fn new(tables: &'a [Table], base: u64) -> Self {
+impl<'a> Run<'a> {
+    const fn new(tables: &'a [Table], base: u64) -> Self {
         Self {
             tables,
             base,
@@ -233,18 +232,6 @@ impl<'a> TablePool<'a> {
         }
     }
 
-    /// Tables handed out so far.
-    pub const fn used(&self) -> usize {
-        self.used
-    }
-
-    /// Tables still free.
-    pub const fn remaining(&self) -> usize {
-        self.tables.len() - self.used
-    }
-}
-
-impl TableMemory for TablePool<'_> {
     fn allocate_table(&mut self) -> Option<u64> {
         let table = self.tables.get(self.used)?;
         for entry in table {
@@ -255,7 +242,7 @@ impl TableMemory for TablePool<'_> {
         Some(addr)
     }
 
-    fn table(&self, addr: u64) -> Option<&Table> {
+    fn table(&self, addr: u64) -> Option<&'a Table> {
         let offset = addr.checked_sub(self.base)?;
         if !offset.is_multiple_of(PAGE) {
             return None;
@@ -265,6 +252,75 @@ impl TableMemory for TablePool<'_> {
             return None;
         }
         self.tables.get(i)
+    }
+}
+
+/// Tables carved from one contiguous run of frames whose first frame is at physical `base`, and
+/// from a second run added once, later ([`TablePool::extend`]; ADR-0008 Amendment 1, D3: the
+/// kernel stacks' region grows when the processors are discovered).
+#[derive(Debug)]
+pub struct TablePool<'a> {
+    first: Run<'a>,
+    more: Option<Run<'a>>,
+}
+
+impl<'a> TablePool<'a> {
+    /// A pool over `tables`, the frames at `base`, `base + PAGE`, and so on.
+    pub const fn new(tables: &'a [Table], base: u64) -> Self {
+        Self {
+            first: Run::new(tables, base),
+            more: None,
+        }
+    }
+
+    /// Adds a second run of tables, the frames at `base`, `base + PAGE`, and so on, handed out
+    /// once the first run is used up. `false`, and nothing changed, if a second run was added
+    /// already, or if the run would overlap the first.
+    pub fn extend(&mut self, tables: &'a [Table], base: u64) -> bool {
+        let bytes = |run_len: usize| (run_len as u64).checked_mul(PAGE);
+        let (Some(first_bytes), Some(more_bytes)) =
+            (bytes(self.first.tables.len()), bytes(tables.len()))
+        else {
+            return false;
+        };
+        let apart = base
+            .checked_add(more_bytes)
+            .is_some_and(|end| end <= self.first.base)
+            || self
+                .first
+                .base
+                .checked_add(first_bytes)
+                .is_some_and(|end| end <= base);
+        if self.more.is_some() || !apart {
+            return false;
+        }
+        self.more = Some(Run::new(tables, base));
+        true
+    }
+
+    /// Tables handed out so far.
+    pub fn used(&self) -> usize {
+        self.first.used + self.more.as_ref().map_or(0, |run| run.used)
+    }
+
+    /// Tables still free.
+    pub fn remaining(&self) -> usize {
+        let free = |run: &Run<'_>| run.tables.len().saturating_sub(run.used);
+        free(&self.first) + self.more.as_ref().map_or(0, free)
+    }
+}
+
+impl TableMemory for TablePool<'_> {
+    fn allocate_table(&mut self) -> Option<u64> {
+        self.first
+            .allocate_table()
+            .or_else(|| self.more.as_mut()?.allocate_table())
+    }
+
+    fn table(&self, addr: u64) -> Option<&Table> {
+        self.first
+            .table(addr)
+            .or_else(|| self.more.as_ref()?.table(addr))
     }
 }
 
@@ -869,6 +925,45 @@ mod tests {
         assert_eq!(mem.allocate_table(), Some(ARENA_BASE + 2 * PAGE));
         assert_eq!(mem.allocate_table(), None);
         assert_eq!((mem.used(), mem.remaining()), (3, 0));
+    }
+
+    /// ADR-0008 Amendment 1, D3: a second run, added once and apart from the first, is handed
+    /// out after the first and found by address; the tables a region needs past the first run
+    /// come from it.
+    #[test]
+    fn a_pool_takes_a_second_run_once_and_uses_it_after_the_first() {
+        let tables = arena(4);
+        let more = arena(8);
+        let more_base = ARENA_BASE + 0x10_0000;
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        assert!(
+            !mem.extend(&more, ARENA_BASE + PAGE),
+            "a run overlapping the first"
+        );
+        assert!(mem.extend(&more, more_base));
+        assert!(!mem.extend(&more, more_base + 0x10_0000), "added once");
+        assert_eq!((mem.used(), mem.remaining()), (0, 12));
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        let region = 0xFFFF_C000_0020_0000;
+        let made = space
+            .reserve_tables(&mut mem, region, crate::layout::STACK_REGION_SIZE / 16)
+            .unwrap();
+        assert!(
+            made as usize > 3,
+            "more tables than the first run holds: {made}"
+        );
+        assert!(mem.used() > 4);
+        let last = more_base + (mem.used() as u64 - 5) * PAGE;
+        assert!(
+            mem.table(last).is_some(),
+            "the second run's last table is found"
+        );
+        assert!(mem.table(last + PAGE).is_none(), "not yet handed out");
+        let rw = kernel(Access::ReadWrite);
+        space.map(&mut mem, region, 0x5000, rw).unwrap();
+        space
+            .map(&mut mem, region + (15 << 20), 0x6000, rw)
+            .unwrap();
     }
 
     #[test]
