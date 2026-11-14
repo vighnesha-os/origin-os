@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use super::{TestHost, tables_standin};
-use crate::{Config, Interpreter, Limits, Value};
+use crate::{Config, ErrorKind, InitOutcome, Interpreter, Limits, Value};
 
 fn tables_in(dir: &Path) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
@@ -69,14 +69,55 @@ fn qemu_tables_load_and_answer() {
             Some(Value::Buffer(b)) => assert_eq!(b[b.len() - 2], 0x79, "an end tag"),
             other => panic!("_CRS: {other:?}"),
         }
+        // The walk the boot proof will make (step B3), with every region access refused.
+        i.host_mut().refuse = true;
+        let mut outcomes = Vec::new();
+        let walk = std::time::Instant::now();
+        i.initialize(&mut |n, o| outcomes.push((n, o)));
+        let walked = walk.elapsed();
+        let mut refused_by_space = [0usize; 3];
+        let (mut initialized, mut other) = (0usize, 0usize);
+        for (n, o) in &outcomes {
+            match o {
+                InitOutcome::StaFailed(e) => match e.kind {
+                    ErrorKind::Region {
+                        space,
+                        cause: crate::HostError::Refused,
+                        ..
+                    } if space < 3 => refused_by_space[usize::from(space)] += 1,
+                    k => panic!("{:?}: _STA failed with {k:?}", i.path_of(*n)),
+                },
+                InitOutcome::Initialized { .. } => initialized += 1,
+                _ => other += 1,
+            }
+        }
+        let hpet = i.lookup("\\_SB.HPET").unwrap().unwrap();
+        assert!(outcomes.iter().any(|(n, o)| *n == hpet
+            && matches!(o, InitOutcome::StaFailed(e) if matches!(e.kind, ErrorKind::Region { space: 0, .. }))));
+        let c000 = i.lookup("\\_SB.CPUS.C000").unwrap().unwrap();
+        assert!(outcomes.iter().any(|(n, o)| *n == c000
+            && matches!(o, InitOutcome::StaFailed(e) if matches!(e.kind, ErrorKind::Region { space: 1, .. }))));
+        let lnka = i.lookup("\\_SB.LNKA").unwrap().unwrap();
+        assert!(outcomes.iter().any(|(n, o)| *n == lnka
+            && matches!(o, InitOutcome::StaFailed(e) if matches!(e.kind, ErrorKind::Region { space: 2, .. }))));
+        assert_eq!(i.host().global_held, 0, "the Global Lock was given back");
         eprintln!(
-            "QEMU DSDT ({} bytes, revision {}): loaded in {:?}; {} nodes, {} objects, {} bytes held",
+            "QEMU DSDT ({} bytes, revision {}): loaded in {:?}; {} nodes, {} objects, {} bytes held; \
+             walk in {:?}: {} devices, {} initialized, _STA refused in SystemMemory {}, SystemIO {}, \
+             PCI_Config {}, {} other",
             dsdt.len(),
             dsdt[8],
             loaded,
             i.node_count(),
             i.object_count(),
-            i.memory_used()
+            i.memory_used(),
+            walked,
+            outcomes.len(),
+            initialized,
+            refused_by_space[0],
+            refused_by_space[1],
+            refused_by_space[2],
+            other
         );
     }
 }

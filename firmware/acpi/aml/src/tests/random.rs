@@ -77,7 +77,7 @@ impl Gen {
             };
         }
         let d = depth - 1;
-        match self.rng.below(24) {
+        match self.rng.below(30) {
             0 => add(self.expr(d), self.expr(d), self.target()),
             1 => bin(
                 0x72 + self.rng.below(14) as u8,
@@ -125,6 +125,15 @@ impl Gen {
             20 => un_ext(*self.rng.pick(&[0x28, 0x29]), self.expr(d), self.target()),
             21 => buffer(self.expr(d), &[9, 8]),
             22 => var_package(self.expr(d), &[one()]),
+            // Step B2: what reaches the host.
+            24 => acquire(
+                nm(self.rng.pick(&["MX", "\\_GL"])),
+                *self.rng.pick(&[0, 5, 0xFFFF]),
+            ),
+            25 => wait(nm("EV"), self.expr(d)),
+            26 => timer(),
+            27 => nm(self.rng.pick(&["F0", "F1", "IX", "LK"])),
+            28 => store(self.expr(d), nm(self.rng.pick(&["F0", "F1", "IX", "LK"]))),
             _ => bin(0x84, self.expr(d), self.expr(d), self.target()),
         }
     }
@@ -154,7 +163,7 @@ impl Gen {
 
     fn stmt(&mut self, depth: u32) -> B {
         let d = depth.saturating_sub(1);
-        match self.rng.below(if depth == 0 { 6 } else { 12 }) {
+        match self.rng.below(if depth == 0 { 6 } else { 18 }) {
             0 => store(self.expr(2), self.place()),
             1 => ret(self.expr(2)),
             2 => noop(),
@@ -180,6 +189,17 @@ impl Gen {
                 self.expr(1),
                 self.rng.pick(&["C0", "C1"]),
             ),
+            12 => release(nm(self.rng.pick(&["MX", "\\_GL"]))),
+            13 => {
+                if self.rng.chance(50) {
+                    signal(nm("EV"))
+                } else {
+                    reset(nm("EV"))
+                }
+            }
+            14 => sleep(byte(self.rng.below(4) as u8)),
+            15 => stall(self.expr(1)),
+            16 => notify(nm(self.rng.pick(&["D0", "N0"])), self.expr(1)),
             _ => device(self.rng.pick(&["DD0", "DD1"]), &[name("X", one())]),
         }
     }
@@ -217,7 +237,11 @@ impl Gen {
                 &[name("_HID", dword(0x0A0C_D041)), method("M3", 1, &m3)],
             ),
             op_region("R0", 1, word(0x80), byte(8)),
-            field("R0", 1, &[Fe::Named("F0", 8)]),
+            field("R0", 1, &[Fe::Named("F0", 8), Fe::Named("F1", 8)]),
+            field("R0", 0x13, &[Fe::Reserved(32), Fe::Named("LK", 32)]),
+            index_field("F0", "F1", 1, &[Fe::Reserved(8), Fe::Named("IX", 12)]),
+            mutex("MX", self.rng.below(16) as u8),
+            event("EV"),
             create_dword_field(nm("BF"), zero(), "BD"),
             alias("\\N0", "\\N2"),
         ];
@@ -323,6 +347,8 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64) -> u64 {
     let lim = limits();
     let mut i = interp_with(width, lim);
     i.host_mut().tick = 1;
+    // A third of the cases run against a host that refuses every region, as the boot proof's.
+    i.host_mut().refuse = seed.is_multiple_of(3);
     let before = snapshot(&i);
     let block = DefinitionBlock {
         signature: *b"SSDT",
@@ -348,6 +374,11 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64) -> u64 {
         }
     }
     assert!(i.memory_peak() <= lim.memory_bytes, "seed {seed:#x}");
+    assert_eq!(
+        i.host().global_held,
+        0,
+        "seed {seed:#x}: the Global Lock was kept"
+    );
     let after_load = i.node_count();
     let mut rng = Rng(seed ^ 0x5555);
     for (node, argc) in methods(&i) {
