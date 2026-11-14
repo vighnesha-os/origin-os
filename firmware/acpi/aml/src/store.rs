@@ -356,7 +356,15 @@ impl<H: Host> Interpreter<H> {
                 }
             }
             (Mode::Store, Target::Field(f)) => self.write_buffer_field(&f, v).map(|()| None),
-            (Mode::Copy, _) | (Mode::Store, Target::Replace) => {
+            // `CopyObject` gives the name a new object (the review of B1, F13): whatever held the
+            // old one (a buffer field over it, an `Index` reference, a caller's argument) keeps
+            // it, and the collector frees it when nothing does.
+            (Mode::Copy, _) => {
+                let o = self.copy_object(v)?;
+                let new = self.heap.alloc(o, &mut self.budget)?;
+                self.ns.set_obj(n, new).map(|()| None)
+            }
+            (Mode::Store, Target::Replace) => {
                 let o = self.copy_object(v)?;
                 self.heap.replace(obj, o, &mut self.budget).map(|()| None)
             }

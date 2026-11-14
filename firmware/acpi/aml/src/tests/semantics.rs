@@ -1059,6 +1059,36 @@ fn every_opcode_is_emitted_and_checked() {
 }
 
 #[test]
+fn copy_object_gives_the_name_a_new_object() {
+    // The review of B1, F13: a buffer field over the old buffer and an `Index` reference into it
+    // keep the old buffer; the name holds the new one.
+    let mut i = interp(IntegerWidth::Bits64);
+    load(
+        &mut i,
+        &[
+            name("BF", buffer(byte(4), &[1, 2, 3, 4])),
+            create_byte_field(nm("BF"), zero(), "B0"),
+            method(
+                "M0",
+                0,
+                &[
+                    store(index(nm("BF"), one(), none()), local(0)),
+                    copy_object(buffer(byte(1), &[9]), nm("BF")),
+                    ret(add(
+                        bin(0x77, nm("B0"), word(0x100), none()),
+                        deref_of(local(0)),
+                        none(),
+                    )),
+                ],
+            ),
+        ],
+    )
+    .unwrap();
+    assert_eq!(eval(&mut i, "M0").unwrap(), Some(Value::Integer(0x102)));
+    assert_eq!(eval(&mut i, "BF").unwrap(), Some(Value::Buffer(vec![9])));
+}
+
+#[test]
 fn a_stray_else_is_out_of_place() {
     let mut i = interp(IntegerWidth::Bits64);
     let e = load(&mut i, &[noop(), else_(&[noop()])]).unwrap_err();

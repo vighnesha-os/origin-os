@@ -133,6 +133,17 @@ impl Namespace {
         Ok(self.node(id)?.obj)
     }
 
+    /// Points `id` at another object: `CopyObject` to a name (the review of B1, F13).
+    pub(crate) fn set_obj(&mut self, id: NodeId, obj: ObjRef) -> Result<()> {
+        match self.nodes.get_mut(index(id.index)) {
+            Some(n) if n.live && n.generation == id.generation => {
+                n.obj = obj;
+                Ok(())
+            }
+            _ => err(ErrorKind::Stale),
+        }
+    }
+
     pub(crate) fn name(&self, id: NodeId) -> Result<Seg> {
         Ok(self.node(id)?.name)
     }
