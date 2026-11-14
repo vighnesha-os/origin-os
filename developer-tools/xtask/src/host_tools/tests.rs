@@ -7,12 +7,12 @@ use super::*;
 type Sources = Vec<(String, String)>;
 
 /// The real `xtask` sources, their constants, and the first-party programs.
-fn real() -> (Sources, BTreeMap<String, String>, BTreeSet<String>) {
+fn real() -> (Sources, BTreeMap<String, String>, Known) {
     let root = repo_root();
     let sources = xtask_sources(&root).expect("xtask's sources");
     let texts: Vec<&str> = sources.iter().map(|(_, text)| text.as_str()).collect();
     let consts = string_consts(&texts);
-    let programs = first_party_programs(&root).expect("the manifests");
+    let programs = known(&root).expect("the manifests and the Cargo configuration");
     (sources, consts, programs)
 }
 
@@ -37,8 +37,9 @@ fn planted_in_main(planted: &str) -> Vec<Hit> {
 #[test]
 fn the_real_tree_passes() {
     let (sources, consts, programs) = real();
-    assert!(programs.contains("onbf-pack") && programs.contains("oidl"));
-    assert!(programs.contains("xtask") && programs.contains("framekernel"));
+    assert!(programs.programs.contains("onbf-pack") && programs.programs.contains("oidl"));
+    assert!(programs.programs.contains("xtask") && programs.programs.contains("framekernel"));
+    assert_eq!(programs.runs.get("xtask"), Some(&Some("xtask".to_string())));
     for (file, text) in &sources {
         assert_eq!(program_hits(file, text, &consts, &programs), [], "{file}");
         assert!(stale_self_runs(file, text).is_empty(), "{file}");
@@ -64,7 +65,7 @@ fn the_gate_s_own_controls_are_caught() {
             &programs,
             &sign_lib
         ),
-        Ok(7)
+        Ok(8)
     );
     // A control is missed when the rule it tests is gone: with no first-party programs, the
     // path control finds nothing to name.
@@ -72,7 +73,7 @@ fn the_gate_s_own_controls_are_caught() {
         controls(
             text_of_file(&sources, "src/main.rs"),
             &consts,
-            &BTreeSet::new(),
+            &Known::default(),
             &sign_lib
         )
         .is_err()
@@ -380,4 +381,97 @@ fn a_test_only_field_variant_or_arm_hides_nothing_after_it() {
     let hits =
         planted_in_library("pub struct S { #[cfg(test)] pub probe: std::fs::File, pub b: u8 }");
     assert_eq!(hits, [], "{hits:?}");
+}
+
+/// Cargo's aliases, read as Cargo reads them: `[alias]` keys and dotted `alias.<name>` keys, a
+/// string split on white space or an array of strings, followed alias to alias.
+#[test]
+fn cargo_aliases_are_read_and_followed() {
+    let text = "[alias]\nxtask = \"run --quiet --package xtask --\"\n# pack = \"run\"\nb = \"build\"\nbig = [\n  \"run\",\n  \"--release\", \"-p\", \"onbf-pack\",\n]\nagain = \"xtask boot-test\"\nloop1 = \"loop2\"\nloop2 = \"loop1\"\n\n[target.x]\nrustflags = [\"-C\", \"x\"]\n";
+    let aliases = aliases_in(text);
+    assert_eq!(
+        aliases.get("xtask"),
+        Some(&vec![
+            "run".to_string(),
+            "--quiet".into(),
+            "--package".into(),
+            "xtask".into(),
+            "--".into()
+        ])
+    );
+    assert_eq!(aliases.get("big").map(Vec::len), Some(4));
+    assert!(!aliases.contains_key("pack") && !aliases.contains_key("rustflags"));
+    let runs = run_aliases(&aliases);
+    assert_eq!(runs.get("xtask"), Some(&Some("xtask".to_string())));
+    assert_eq!(runs.get("big"), Some(&Some("onbf-pack".to_string())));
+    assert_eq!(
+        runs.get("again"),
+        Some(&Some("xtask".to_string())),
+        "an alias of an alias"
+    );
+    assert!(
+        !runs.contains_key("b") && !runs.contains_key("loop1"),
+        "{runs:?}"
+    );
+    let dotted = aliases_in("alias.pack = \"run --package=onbf-pack --\"\n");
+    assert_eq!(
+        run_aliases(&dotted).get("pack"),
+        Some(&Some("onbf-pack".to_string()))
+    );
+}
+
+/// `cargo xtask` is `cargo run` under another name (the review of 2026-11-14, finding F2):
+/// refused outside `SELF_RUNS`, allowed in a listed function, and allowed as an option's value.
+#[test]
+fn cargo_s_aliases_are_cargo_run() {
+    for (planted, refused) in [
+        // The planted control, and its spellings.
+        (
+            r#"fn a() { run_step(cargo().args(["xtask", "boot-test"])); }"#,
+            true,
+        ),
+        (r#"fn b() { cargo().arg("xtask").arg("check"); }"#, true),
+        (
+            r#"fn c() { cargo().args(["--quiet", "xtask", "check"]); }"#,
+            true,
+        ),
+        (r#"fn d() { cargo().args(["xtask boot-test"]); }"#, true),
+        (
+            r#"fn e() { cargo().env("CARGO_ALIAS_PACK", "run --package onbf-pack --").arg("pack"); }"#,
+            true,
+        ),
+        // `xtask` as a package's name, the value of an option.
+        (
+            r#"fn f() { cargo().args(["test", "--package", "xtask"]); }"#,
+            false,
+        ),
+        (
+            r#"fn g() { cargo().args(["clippy", "-p", "xtask", "--all-targets"]); }"#,
+            false,
+        ),
+        // In a function `SELF_RUNS` lists: `xtask` re-running itself.
+        (
+            r#"fn boot_matrix() { cargo().args(["xtask", "boot-test"]); }"#,
+            false,
+        ),
+    ] {
+        let hits = planted_in_main(planted);
+        assert_eq!(hits.len(), usize::from(refused), "{planted}: {hits:?}");
+    }
+    // An alias that runs another package is refused even in a listed function.
+    let (_, consts, mut known) = real();
+    known
+        .runs
+        .insert("pack".into(), Some("onbf-pack".to_string()));
+    let hits = program_hits(
+        "src/main.rs",
+        r#"fn boot_matrix() { cargo().args(["pack", "krn"]); }"#,
+        &consts,
+        &known,
+    );
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(
+        hits[0].what.contains("`cargo run` of `onbf-pack`"),
+        "{hits:?}"
+    );
 }

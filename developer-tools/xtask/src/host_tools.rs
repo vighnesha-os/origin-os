@@ -80,8 +80,47 @@ pub(crate) struct Hit {
     pub(crate) what: String,
 }
 
-/// Cargo's subcommand that runs a package's binary, and its alias.
+/// Cargo's subcommand that runs a package's binary, and its built-in alias. The aliases the
+/// repository's Cargo configuration defines are added on each run ([`run_aliases`]).
 const RUN_WORDS: &[&str] = &["run", "r"];
+
+/// The prefix of the environment variables that define a Cargo alias for one command. Spelled in
+/// two pieces so that no literal of this file is itself refused.
+const ALIAS_VARIABLE: &str = concat!("CARGO_", "ALIAS_");
+
+/// The options of Cargo that take a value as the next argument: an alias's name after one of
+/// these is that value (`--package xtask`), not the alias.
+const VALUE_OPTIONS: &[&str] = &[
+    "--package",
+    "-p",
+    "--bin",
+    "--example",
+    "--test",
+    "--bench",
+    "--manifest-path",
+    "--target-dir",
+    "--target",
+    "--features",
+    "-F",
+    "--config",
+    "--profile",
+    "--message-format",
+    "--jobs",
+    "-j",
+    "--color",
+    "-Z",
+];
+
+/// What G1 knows of the tree: the first-party programs' names, and the words that make Cargo
+/// run a program, each with the package it runs when the words say (`None` for `run` itself).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Known {
+    /// Every workspace package's name and every `[[bin]]` target's.
+    pub(crate) programs: BTreeSet<String>,
+    /// `run`, `r`, and every alias of the repository's Cargo configuration whose expansion
+    /// runs a program, with the package it names.
+    pub(crate) runs: BTreeMap<String, Option<String>>,
+}
 
 /// The places `xtask` may name itself (`current_exe`), by file under `developer-tools/xtask/`
 /// and function: `boot_matrix` and the six machines it runs as steps of its own, each of which
@@ -178,11 +217,143 @@ fn text_of(token: &Token<'_>, consts: &BTreeMap<String, String>) -> Option<Strin
     })
 }
 
-/// Whether `text`'s first word is Cargo's `run` or its alias.
+/// Whether `text`'s first word is Cargo's `run` or its built-in alias.
 fn starts_run(text: &str) -> bool {
     text.split_whitespace()
         .next()
         .is_some_and(|word| RUN_WORDS.contains(&word))
+}
+
+/// The package an alias's expansion runs, if it names one.
+fn package_of(words: &[String]) -> Option<String> {
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        if word == "--package" || word == "-p" {
+            return words.next().cloned();
+        }
+        if let Some(name) = word.strip_prefix("--package=") {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Each alias of `aliases` (name to expansion) that makes Cargo run a program: its expansion
+/// begins with `run` or `r`, or with another alias that does (followed to a depth of 16). Each
+/// maps to the package its expansion names, if it names one.
+pub(crate) fn run_aliases(
+    aliases: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Option<String>> {
+    let mut runs = BTreeMap::new();
+    for name in aliases.keys() {
+        let mut words: Vec<String> = aliases.get(name).cloned().unwrap_or_default();
+        for _ in 0..16 {
+            let Some(first) = words.first().cloned() else {
+                break;
+            };
+            if RUN_WORDS.contains(&first.as_str()) {
+                runs.insert(name.clone(), package_of(&words));
+                break;
+            }
+            match aliases.get(&first) {
+                Some(expansion) if &first != name => {
+                    words.splice(0..1, expansion.iter().cloned());
+                }
+                _ => break,
+            }
+        }
+    }
+    runs
+}
+
+/// The aliases in one Cargo configuration file: `[alias]`'s keys and top-level `alias.<name>`
+/// keys, each with its expansion as a string (split on white space) or an array of strings.
+pub(crate) fn aliases_in(text: &str) -> BTreeMap<String, Vec<String>> {
+    let mut aliases = BTreeMap::new();
+    let mut table = String::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            table = line.trim_matches(['[', ']']).trim().to_string();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().trim_matches('"');
+        let name = match (table.as_str(), key.strip_prefix("alias.")) {
+            ("alias", _) => key,
+            ("", Some(name)) => name,
+            _ => continue,
+        };
+        let mut value = value.trim().to_string();
+        // An array may go on over several lines, to its closing bracket.
+        if value.starts_with('[') {
+            while !value.contains(']') {
+                let Some(more) = lines.next() else { break };
+                value.push(' ');
+                value.push_str(more.trim());
+            }
+        }
+        let quoted: Vec<String> = value
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        let words = if value.starts_with('[') {
+            quoted
+        } else {
+            quoted
+                .first()
+                .map(|text| text.split_whitespace().map(str::to_string).collect())
+                .unwrap_or_default()
+        };
+        aliases.insert(name.trim_matches('"').to_string(), words);
+    }
+    aliases
+}
+
+/// Every alias of the repository's Cargo configuration: each file in a `.cargo` directory of the
+/// tree (not under `target/` or `.git/`).
+fn repository_aliases(root: &Path) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut aliases = BTreeMap::new();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(dir) = directories.pop() {
+        let entries = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = entry
+                .file_type()
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .is_dir();
+            if is_dir && name != "target" && name != ".git" {
+                directories.push(path);
+            } else if !is_dir && dir.file_name().is_some_and(|d| d == ".cargo") {
+                let text = String::from_utf8(read_file(&path)?)
+                    .map_err(|_| format!("{}: not UTF-8", path.display()))?;
+                aliases.extend(aliases_in(&text));
+            }
+        }
+    }
+    Ok(aliases)
+}
+
+/// What G1 knows of the tree at `root`.
+fn known(root: &Path) -> Result<Known> {
+    let mut runs: BTreeMap<String, Option<String>> =
+        RUN_WORDS.iter().map(|w| ((*w).to_string(), None)).collect();
+    runs.extend(run_aliases(&repository_aliases(root)?));
+    Ok(Known {
+        programs: first_party_programs(root)?,
+        runs,
+    })
 }
 
 /// The first-party program `text` names, alone or as a path's last component.
@@ -248,8 +419,9 @@ pub(crate) fn program_hits(
     file: &str,
     source: &str,
     consts: &BTreeMap<String, String>,
-    programs: &BTreeSet<String>,
+    known: &Known,
 ) -> Vec<Hit> {
+    let programs = &known.programs;
     let tokens = lex::tokens(source);
     let spans = functions(&tokens);
     let mut hits = Vec::new();
@@ -266,18 +438,57 @@ pub(crate) fn program_hits(
                 .get(i + 1)
                 .is_some_and(|t| t.is_ident("arg") || t.is_ident("args"));
         if argument_list && let Some(body) = parenthesised(&tokens, i + 2) {
+            // The literal before the one being read, in this argument list.
+            let mut previous: Option<String> = None;
             for t in body {
-                if let Some(text) = text_of(t, consts)
-                    && starts_run(&text)
-                {
+                let Some(text) = text_of(t, consts) else {
+                    continue;
+                };
+                let after_value_option = previous
+                    .as_deref()
+                    .is_some_and(|p| VALUE_OPTIONS.contains(&p));
+                previous = Some(text.clone());
+                if starts_run(&text) {
                     hit(
                         t,
                         format!(
                             "`{text}` given to a command: `cargo run` starts a first-party program; call its library (ADR-0011 Amendment 4, T1)"
                         ),
                     );
+                    continue;
+                }
+                // An alias of the repository's Cargo configuration that is `cargo run` under
+                // another name (the review of 2026-11-14, finding F2), unless it is an option's
+                // value, or `xtask` re-running itself where `SELF_RUNS` allows that.
+                let first = text.split_whitespace().next().unwrap_or_default();
+                let Some(runs) = known.runs.get(first).filter(|_| !after_value_option) else {
+                    continue;
+                };
+                let place = enclosing(&spans, i);
+                let self_run = runs.as_deref() == Some("xtask")
+                    && place.is_some_and(|f| SELF_RUNS.iter().any(|r| r.0 == file && r.1 == f));
+                if !self_run {
+                    hit(
+                        t,
+                        format!(
+                            "`{text}` given to a command: Cargo's alias `{first}` is `cargo run`{}; call its library (ADR-0011 Amendment 4, T1)",
+                            runs.as_deref()
+                                .map_or(String::new(), |p| format!(" of `{p}`"))
+                        ),
+                    );
                 }
             }
+        }
+        // An alias defined for one command, in its environment (finding F2).
+        if let Some(text) = literal(token)
+            && text.starts_with(ALIAS_VARIABLE)
+        {
+            hit(
+                token,
+                format!(
+                    "`{text}`: an alias defined in a command's environment can be `cargo run` of a first-party program (ADR-0011 Amendment 4, T1)"
+                ),
+            );
         }
         // `Command::new(…)`.
         let new_command = token.is_ident("Command")
@@ -640,6 +851,14 @@ fn planted_control_again() -> Command {
 }
 "#;
 
+/// `xtask` run through Cargo's alias, from a function `SELF_RUNS` does not list (the review of
+/// 2026-11-14, finding F2): planted by the controls.
+const PLANTED_ALIAS_RUN: &str = r#"
+fn planted_control_alias() -> Result {
+    run_step(cargo().args(["xtask", "boot-test"]))
+}
+"#;
+
 /// What `onbf-sign` held before T1: planted by the controls.
 const PLANTED_OS_RANDOM: &str = r#"
 pub fn os_random(out: &mut [u8]) -> std::io::Result<()> {
@@ -683,7 +902,7 @@ pub fn planted_control_exists(path: &str) -> bool {
 fn controls(
     main: &str,
     consts: &BTreeMap<String, String>,
-    programs: &BTreeSet<String>,
+    known: &Known,
     sign_lib: &str,
 ) -> std::result::Result<usize, Vec<String>> {
     let mut missed = Vec::new();
@@ -695,10 +914,15 @@ fn controls(
             "`current_exe` in `planted_control_again`",
             "a self-run",
         ),
+        (
+            PLANTED_ALIAS_RUN,
+            "Cargo's alias `xtask` is `cargo run`",
+            "`cargo xtask` outside SELF_RUNS",
+        ),
     ] {
         let text = format!("{main}\n{planted}");
-        let hits = program_hits("src/main.rs", &text, consts, programs);
-        let real = program_hits("src/main.rs", main, consts, programs).len();
+        let hits = program_hits("src/main.rs", &text, consts, known);
+        let real = program_hits("src/main.rs", main, consts, known).len();
         if hits.len() != real + 1 || !hits.iter().any(|h| h.what.contains(needle)) {
             missed.push(format!("{name} in developer-tools/xtask/src/main.rs"));
         }
@@ -728,7 +952,7 @@ fn controls(
         }
     }
     if missed.is_empty() {
-        Ok(3 + library_controls.len())
+        Ok(4 + library_controls.len())
     } else {
         Err(missed)
     }
@@ -737,13 +961,13 @@ fn controls(
 /// The gate: see the module documentation.
 pub(crate) fn gate() -> Result {
     let root = repo_root();
-    let programs = first_party_programs(&root)?;
+    let known = known(&root)?;
     let xtask = xtask_sources(&root)?;
     let texts: Vec<&str> = xtask.iter().map(|(_, text)| text.as_str()).collect();
     let consts = string_consts(&texts);
     let mut problems = Vec::new();
     for (file, text) in &xtask {
-        for hit in program_hits(file, text, &consts, &programs) {
+        for hit in program_hits(file, text, &consts, &known) {
             problems.push(format!(
                 "developer-tools/xtask/{file}:{}: {}",
                 hit.line, hit.what
@@ -778,7 +1002,7 @@ pub(crate) fn gate() -> Result {
         .find(|(file, _)| file == "developer-tools/onbf-sign/src/lib.rs")
         .map(|(_, text)| text.as_str())
         .ok_or("developer-tools/onbf-sign/src/lib.rs is missing")?;
-    let caught = match controls(main, &consts, &programs, sign_lib) {
+    let caught = match controls(main, &consts, &known, sign_lib) {
         Ok(caught) => caught,
         Err(missed) => {
             problems.push(format!(
@@ -795,9 +1019,10 @@ pub(crate) fn gate() -> Result {
         ));
     }
     println!(
-        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs and re-runs itself only in the {} places host_tools::SELF_RUNS lists (decision item 300); the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host; {caught} planted controls caught",
+        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs, by name or through `run` and the {} Cargo aliases that run one, and re-runs itself only in the {} places host_tools::SELF_RUNS lists; the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host by the forms the gate reads; {caught} planted controls caught",
         xtask.len(),
-        programs.len(),
+        known.programs.len(),
+        known.runs.len() - RUN_WORDS.len(),
         SELF_RUNS.len(),
         libraries.len()
     );
