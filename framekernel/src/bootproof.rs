@@ -90,6 +90,7 @@ proofs! {
     Numa "NUMA affinities" => Report;
     NumaDistances "NUMA distances" => Report;
     AcpiTables "ACPI tables" => Report;
+    AmlInterpreter "AML interpreter" => Report;
     Random "random-number generator" => Withdraw("no randomness");
     // Threads, and what runs in ring 3.
     Preemption "preemption" => Refuse;
@@ -306,7 +307,7 @@ mod tests {
 
     #[test]
     fn the_table_has_one_row_per_proof_in_order() {
-        assert_eq!(Proof::ALL.len(), 68);
+        assert_eq!(Proof::ALL.len(), 69);
         for (i, &proof) in Proof::ALL.iter().enumerate() {
             assert_eq!(proof as usize, i, "{proof:?} is out of order");
             assert!(!proof.name().is_empty(), "{proof:?} has no name");

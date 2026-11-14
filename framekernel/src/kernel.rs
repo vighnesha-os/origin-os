@@ -360,6 +360,13 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             Proof::AcpiTables,
             crate::acpi_census::prove(&mut com1, info.acpi_rsdp),
         );
+        // The AML interpreter over the firmware's DSDT and SSDTs, against a host that refuses every
+        // access to hardware (ADR-0019 A3; TASKS item 63, step B3). It runs here, on the loader's
+        // stack with its guard page, before any thread exists.
+        proofs.record(
+            Proof::AmlInterpreter,
+            crate::aml_proof::prove(&mut com1, info.acpi_rsdp),
+        );
         // The random-number generator on every processor (CLAUDE.md §59; ADR-0016). If the
         // proof fails, randomness is withheld from here on (ADR-0013 R2, Amendment 1): nothing
         // is launched and nothing is placed at a random address.
