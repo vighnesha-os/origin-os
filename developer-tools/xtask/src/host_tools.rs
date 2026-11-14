@@ -33,17 +33,19 @@
 //!   (`boot_matrix`, through `boot_test_child`, with each scenario's `ORIGIN_QEMU_*` settings in
 //!   its child's environment), until TASKS item 61 runs the scenarios in one process with typed
 //!   settings, after TASKS items 58 and 59.
-//! - **Pending decision item 310** (put to the owner on 2026-11-14, recommended "allow"; the
-//!   review's finding F6): the six machines `boot-matrix` runs as steps of its own
-//!   (`boot_x2apic`, `boot_bridge`, `boot_reserved`, `boot_legacy_free`, `boot_random`,
-//!   `boot_identity`) re-run `xtask` the same way when each is run alone as a command of its
-//!   own, which item 300's words do not name; and the turn lock's own test
-//!   (`turns::tests::the_lock_goes_with_the_process_however_it_ends`) starts its test binary to
-//!   hold the lock and be killed: test code, run by `cargo test`, never by `xtask`.
-//! - **Outside G1, a reading that is part of item 310** (finding F12): Cargo's subcommands other
-//!   than `run` (`xtask check` runs `cargo test --package onbf-pack`, and `onbf-pack`'s and
-//!   `oidl`'s integration tests start the binary they test), and the build scripts Cargo runs,
-//!   are Cargo's own work, not `xtask` starting a first-party program.
+//! - **By decision item 310** (accepted by the owner on 2026-11-14, "Accept 310"; T1's second
+//!   note in ADR-0011 Amendment 4; the review's finding F6): item 300's allowance covers the six
+//!   scenario commands `boot-matrix` runs as steps of its own (`boot_x2apic`, `boot_bridge`,
+//!   `boot_reserved`, `boot_legacy_free`, `boot_random`, `boot_identity`), also when a person
+//!   runs one on its own, since each re-runs `xtask` the same way, until TASKS item 61. And a
+//!   test that starts a first-party program to test that same program is outside T1: the turn
+//!   lock's own test (`turns::tests::the_lock_goes_with_the_process_however_it_ends`) starts its
+//!   test binary to hold the lock and be killed. It stays listed in [`SELF_RUNS`], so that every
+//!   exception the gate allows is named.
+//! - **Outside G1, by decision item 310** (finding F12): Cargo's subcommands other than `run`
+//!   (`xtask check` runs `cargo test --package onbf-pack`, and `onbf-pack`'s and `oidl`'s
+//!   integration tests start the binary they test, which item 310 puts outside T1 too) and
+//!   first-party build scripts are outside programs here, as Cargo is.
 //!
 //! **G2: the three libraries reach nothing of the host, by the forms it reads.** Over the
 //! library sources of `onbf-pack`, `onbf-sign` and `oidl` (`src/**/*.rs`, but not
@@ -167,12 +169,11 @@ pub(crate) struct Known {
 
 /// Item 300's words: `boot-matrix` re-running `xtask` for each scenario.
 const ITEM_300: &str = "decision item 300: `boot-matrix` re-runs `xtask` for each scenario";
-/// The six machines `boot-matrix` runs as steps, when run alone (the review's finding F6).
-const ITEM_310_MACHINE: &str =
-    "pending decision item 310: a machine `boot-matrix` runs, run alone as a command of its own";
-/// The turn lock's own test (finding F6).
-const ITEM_310_TEST: &str =
-    "pending decision item 310: test code, run by `cargo test`, starting its own test binary";
+/// The six scenario commands `boot-matrix` runs as steps, also when run alone (the review's
+/// finding F6; decision item 310).
+const ITEM_310_MACHINE: &str = "decision item 310: a scenario command of `boot-matrix`'s, also when run on its own, until TASKS item 61";
+/// The turn lock's own test (finding F6; decision item 310).
+const ITEM_310_TEST: &str = "decision item 310: a test starting the program it tests, outside T1";
 
 /// The places `xtask` may name itself (`current_exe`), by file under `developer-tools/xtask/`
 /// and function, each with its authority (the module documentation says more). A place not
@@ -598,7 +599,7 @@ pub(crate) fn program_hits(
                 hit(
                     token,
                     format!(
-                        "`current_exe` in {}: `xtask` re-runs itself only in the functions host_tools::SELF_RUNS lists, by decision item 300 or, pending, item 310",
+                        "`current_exe` in {}: `xtask` re-runs itself only in the functions host_tools::SELF_RUNS lists, by decision items 300 and 310",
                         place.map_or("no function".to_string(), |f| format!("`{f}`"))
                     ),
                 );
@@ -1332,7 +1333,7 @@ pub(crate) fn gate() -> Result {
         ));
     }
     println!(
-        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs, by name or through `run` and the {} Cargo aliases that run one, and re-runs itself only in the {} places host_tools::SELF_RUNS lists (1 by decision item 300, the rest pending item 310); the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host by the forms the gate reads, and depend on nothing but the crates it lists; their {} command lines name no crate but their own library and the standard library's; {caught} planted controls caught",
+        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs, by name or through `run` and the {} Cargo aliases that run one, and re-runs itself only in the {} places host_tools::SELF_RUNS lists (1 by decision item 300, the rest by item 310); the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host by the forms the gate reads, and depend on nothing but the crates it lists; their {} command lines name no crate but their own library and the standard library's; {caught} planted controls caught",
         xtask.len(),
         known.programs.len(),
         known.runs.len() - RUN_WORDS.len(),
