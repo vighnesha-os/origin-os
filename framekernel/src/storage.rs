@@ -129,6 +129,10 @@ struct Nvme {
     ready: nvme::ReadyTimeouts,
     /// The namespace bound: the first usable of the controller's active NVM namespaces.
     nsid: u32,
+    /// The MSI-X table, once mapped: `bind` maps it when it finds MSI-X on, and
+    /// `setup_interrupts` uses the same region, since a table outside BAR 0 can be mapped only
+    /// once (the independent review's addendum, N1).
+    msix_table: Option<MmioRegion>,
 }
 
 impl Nvme {
@@ -768,6 +772,7 @@ fn bind(
         io_entries: 0,
         ready: nvme::ready_timeouts(&Capabilities::decode(0), 0),
         nsid: 0,
+        msix_table: None,
     };
     c.cap = Capabilities::decode(c.read64(register::CAP));
     c.bar_queues = nvme::doorbell_queues(c.cap.doorbell_stride, bar.size);
@@ -822,7 +827,14 @@ fn bind(
     // clearing EN while RDY is 0 has undefined results; one ready, or with fatal status, is
     // reset at once. Then bus mastering, then the admin queues, then enable.
     let cc = c.read32(register::CC);
-    match nvme::before_reset(cc, c.read32(register::CSTS)) {
+    let csts = c.read32(register::CSTS);
+    // An NVM subsystem shutdown, which no reset ends, is refused at once: the firmware may have
+    // set EN during it, and RDY then never rises (the independent review's addendum, N2).
+    if let Some(why) = nvme::shutdown_blocks_reset(csts) {
+        let _ = writeln!(com1, "origin-kernel: NVMe: {why}");
+        return Err("the controller is shut down");
+    }
+    match nvme::before_reset(cc, csts) {
         nvme::ResetStep::AwaitIdle => {}
         nvme::ResetStep::Clear => c.write32(register::CC, cc & !nvme::CC_ENABLE),
         nvme::ResetStep::AwaitReady => {
@@ -869,6 +881,7 @@ fn bind(
             for i in 0..u64::from(msix.entries) {
                 table.write32((i * pci::MSIX_ENTRY + 12) as usize, pci::MSIX_MASKED);
             }
+            c.msix_table = Some(table);
             let _ = writeln!(
                 com1,
                 "origin-kernel: NVMe: MSI-X was on when the driver bound: its function mask set {function} and its {} entries masked; INTMS not written",
@@ -1109,16 +1122,20 @@ impl ThreadRecord {
         }
     }
 
-    /// For a failing line, at `now`: the command still outstanding and how long it has
-    /// waited, else the first failure, else nothing.
+    /// For a failing line, at `now`: the first failure and the command still outstanding with
+    /// how long it has waited, each where there is one, the first failure first, since it is
+    /// the root cause (the independent review's addendum, N3).
     fn note(&self, now: u64) -> Option<alloc::string::String> {
-        match (self.current, self.failure) {
-            (Some((step, since)), _) => Some(alloc::format!(
+        let waiting = self.current.map(|(step, since)| {
+            alloc::format!(
                 "{step}: still waiting after {} ms",
                 now.saturating_sub(since) / 1_000_000
-            )),
-            (None, Some(f)) => Some(alloc::format!("{f}")),
-            (None, None) => None,
+            )
+        });
+        match (self.failure, waiting) {
+            (Some(f), Some(w)) => Some(alloc::format!("{f}; {w}")),
+            (Some(f), None) => Some(alloc::format!("{f}")),
+            (None, w) => w,
         }
     }
 }
@@ -1177,7 +1194,14 @@ fn setup_interrupts(
         return Ok(Err(why));
     }
     let msix = found.ok_or("no MSI-X capability")?;
-    let table = msix_table(&d.dev, d.nvme.regs, &msix)?;
+    let table = match d.nvme.msix_table {
+        Some(table) => table,
+        None => {
+            let table = msix_table(&d.dev, d.nvme.regs, &msix)?;
+            d.nvme.msix_table = Some(table);
+            table
+        }
+    };
     let message = crate::iommu::msi_message(d.dev.function.at, target, crate::cpu::DEVICE_VECTOR)?;
     let entry = |i: u64, word: u64, value: u32| {
         table.write32((i * pci::MSIX_ENTRY + 4 * word) as usize, value);

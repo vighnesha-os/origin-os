@@ -70,6 +70,19 @@ impl core::fmt::Display for ShutdownBlock {
     }
 }
 
+/// Whether a controller whose CSTS reads `csts` before its reset must be refused at once: an
+/// NVM subsystem shutdown in progress or complete (or a reserved SHST), which no Controller
+/// Level Reset ends (Base 2.4 Figure 42, p. 90). A controller the firmware enabled during one
+/// reads EN 1 and RDY 0, since enabling then has no effect, and would otherwise be waited for
+/// as one still becoming ready (the independent review's addendum, N2). A controller shutdown
+/// is left for after the reset, which may abort it.
+pub const fn shutdown_blocks_reset(csts: u32) -> Option<ShutdownBlock> {
+    match shutdown_blocks_enable(csts) {
+        Some(ShutdownBlock::ControllerInProgress) => None,
+        other => other,
+    }
+}
+
 /// Whether a controller whose CSTS reads `csts` after its reset may be enabled. A controller
 /// shutdown reported complete (ST 0, SHST 10b) does not block it: the enabling write clears
 /// CC.SHN with it, as Base 2.4 allows.
@@ -1199,6 +1212,27 @@ mod tests {
             shutdown_blocks_enable(csts(2, 1) | 0b11 | 0xFFFF_FF80),
             Some(ShutdownBlock::Subsystem { complete: true })
         );
+        // N2: before the reset, only what no reset ends.
+        assert_eq!(
+            shutdown_blocks_reset(csts(1, 1)),
+            Some(ShutdownBlock::Subsystem { complete: false })
+        );
+        assert_eq!(
+            shutdown_blocks_reset(csts(2, 1) | 1),
+            Some(ShutdownBlock::Subsystem { complete: true }),
+            "EN set during it: RDY reads 0 or 1"
+        );
+        assert_eq!(
+            shutdown_blocks_reset(csts(3, 0)),
+            Some(ShutdownBlock::Reserved)
+        );
+        assert_eq!(
+            shutdown_blocks_reset(csts(1, 0)),
+            None,
+            "a controller shutdown the reset may abort"
+        );
+        assert_eq!(shutdown_blocks_reset(csts(2, 0)), None);
+        assert_eq!(shutdown_blocks_reset(0), None);
         assert_eq!(
             alloc::format!("{}", ShutdownBlock::Subsystem { complete: true }),
             "an NVM subsystem shutdown is complete (CSTS.ST 1, SHST 10b): enabling has no effect until an NVM Subsystem Reset"
