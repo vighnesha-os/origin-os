@@ -129,12 +129,13 @@ What the tables show:
 
 ## 9. Open questions and named gaps
 
-**Questions for the coordinating session or the owner**
+**Questions, and the coordinating session's rulings of 2026-11-14**
 
-- **Q1. The errata.** uefi.org's bot check blocked the errata page (S2). Can the owner save today's ACPI 6.6 errata (or confirm none is published) as they did the specification?
-- **Q2. `Processor`.** QEMU 11.1.3 emits the opcode ACPI 6.6 reserves. Recommended: accept it with the layout ACPI 6.6 still leaves in its grammar (`ProcID`, `PblkAddr` and `PblkLen`, PDF 1137) and QEMU's bytes show: a package length, a name, a processor ID byte, a P_BLK address dword and a length byte, then a term list. It becomes an object of type 12, so QEMU's DSDT loads.
-- **Q3. QEMU's tables as test fixtures.** They are QEMU's output. Recommended: do not commit them; the host tests use encoder-made blocks, the boot proof reads QEMU's tables at boot, and an optional host test reads dumps from a directory named by an environment variable.
-- **Q4. `_OSI`, `_OS` and `_REV`** (ADR-0019 T5): a proposed policy is in the contract (`t63-contract.md`).
+- **Q1. The errata.** Not read: uefi.org answered 403 with a bot check (S2). The coordinating session has asked the owner to save today's errata page or confirm there is none. Until then this ledger records the errata as **not read**.
+- **Q2. `Processor`.** Ruled: accepted as an object of type 12, with the layout ACPI 6.6 still leaves in its grammar (`ProcID`, `PblkAddr` and `PblkLen`, PDF 1137) and QEMU's bytes show: a package length, a name, a processor ID byte, a P_BLK address dword and a length byte, then a term list. **This is a deliberate departure from 6.6's reserved code** (Table 20.2, PDF 1145), because deployed firmware and QEMU 11.1.3 use it and ADR-0019 A1 asks for what a platform can present.
+- **Q3. QEMU's tables as test fixtures.** Ruled: not committed. The host tests use encoder-made blocks; the boot proof (step B3) reads QEMU's tables at boot; an optional host test reads dumps from the directory `ORIGIN_AML_TABLES` names.
+- **Q4. `_OSI`, `_OS` and `_REV`** (ADR-0019 T5). Ruled: `_OSI` and `_REV` go to the owner as **decision item 309** as proposed (`Ones` for the 22 Windows strings of M1, `Zero` for everything else, `Linux` included; feature-group strings added only when built; `_REV` = 2), and `osi.rs` is built that way, marked "pending owner item 309". **`_OS` = "Origin OS" stays provisional** until the ACPICA reading session answers G10 with evidence.
+- **The gaps G1 to G12** go to a separate session (TASKS 64), which reads ACPICA under CLAUDE.md §3 and writes only `docs/research/2026-11-14-aml-gaps-acpica.md`. This session reads that ledger, never ACPICA. Until it answers, each strict choice below is marked in the code and here as "strict until the reading session answers"; an answer that changes one changes it with a test. Before the code leaves the batch for `main`, CLAUDE.md §6's similarity check runs against the ACPICA files that ledger cites (§3, item 121).
 
 **Gaps the specification leaves, which a separate session may answer from ACPICA under CLAUDE.md §3 and ADR-0019 A4**
 
@@ -147,6 +148,26 @@ What the tables show:
 - **G7.** `Stall` with an operand above 255, and `Sleep`/`Stall` with very large values: refused, clamped or honoured.
 - **G8.** Whether `Unload` (formerly 0x5B 0x2A, now reserved in Table 20.2) and the DDB handle still occur in deployed firmware, and what an interpreter should do on meeting them.
 - **G9.** `ShiftLeft`/`ShiftRight` by a count at or beyond the integer width, and `Multiply` overflow (§19.6.88 says undefined).
+- **G10.** What deployed firmware in scope expects `\_OS` to return.
+- **G11.** A `Store` of a buffer into a named buffer of another length: whether the target keeps its length (as Table 19.7 says for integer and string sources) or takes the source's.
+- **G12.** What `^` means in a method's body. §19.6.85 makes a method a scope of its own ("Method opens a name scope"), so `^X` from a method in `Device (D1)` would be `D1.X`; whether deployed firmware is written expecting that, or expecting `^` to leave the device.
+
+**The strict choices, each "strict until the reading session answers"** (the contract, `t63-contract.md` §4):
+
+| Gap | Choice |
+|---|---|
+| G1 | A name in an operand position that resolves to nothing is an error; a name that resolves to a method is a call taking the method's declared arguments |
+| G2 | Sync-level order enforced; a method that ends holding a mutex has it released and its evaluation reported as an error |
+| G3 | A duplicate name fails the whole load, which is rolled back |
+| G4 | Integer to string: the integer width's hexadecimal digits, upper case, no prefix; buffer to string (implicit): two upper-case digits a byte, separated by spaces; `ToHexString` of a buffer: the same digits separated by commas; `ToDecimalString` of a buffer: decimal values separated by commas; `ToInteger` of a string: all digits (decimal, or hexadecimal after `0x`), too large refused |
+| G5 | `AnyAcc` uses the narrowest naturally aligned width covering the field unit, else bytes |
+| G6 | A method that ends without `Return` gives no value; using it as an operand is an error |
+| G7 | `Stall` above 255 µs refused |
+| G8 | 0x5B 0x2A (`Unload`) refused as reserved |
+| G9 | A shift by the width or more gives 0; `Multiply` keeps the low bits |
+| G11 | A named buffer keeps its length on every store |
+| G12 | A method is a scope of its own: `^` from its body is the device or scope it is in |
+
 
 **Inconsistencies in the ACPI 6.6 text found while reading** (for the errata check of Q1; each is resolved by a choice the contract names)
 
@@ -168,4 +189,4 @@ What the tables show:
 
 ## 10. What this ledger does not decide
 
-The crate, the host interface, the object model, the limits and the `_OSI` policy: those are in the contract for TASKS item 63 (`t63-contract.md` in the coordination notes), for the coordinating session's rulings, and are recorded here once ruled.
+The crate, the host interface, the object model and the limits are in the contract for TASKS item 63 (`t63-contract.md` in the coordination notes), accepted by the coordinating session on 2026-11-14 with the rulings above; TASKS item 63's entry in `docs/engineering/TASKS.md` records them.
