@@ -16,8 +16,8 @@
 use alloc::vec::Vec;
 
 use crate::Interpreter;
-use crate::error::{Error, ErrorKind, Result, err};
-use crate::host::Host;
+use crate::error::{Error, ErrorKind, Limit, Result, err};
+use crate::host::{Host, Trace};
 use crate::mem;
 use crate::object::{NodeId, ObjRef, Object, ScopeKind, Val};
 
@@ -34,6 +34,9 @@ pub(crate) struct Held {
 
 /// `Acquire`'s and `Wait`'s "for ever".
 const FOREVER: u64 = 0xFFFF;
+
+/// The longest wait the host is ever asked for, in milliseconds: one below "for ever".
+const LONGEST: u64 = 0xFFFE;
 
 impl<H: Host> Interpreter<H> {
     /// The current sync level: the highest held.
@@ -112,13 +115,8 @@ impl<H: Host> Interpreter<H> {
             return err(ErrorKind::SyncLevel);
         }
         mem::reserve(&mut self.held, 1, &mut self.budget)?;
-        if m.global {
-            let t = u16::try_from(timeout.min(FOREVER)).unwrap_or(0xFFFF);
-            match self.host.acquire_global_lock(t) {
-                Ok(true) => {}
-                Ok(false) => return Ok(Val::Int(self.width.mask())),
-                Err(e) => return err(ErrorKind::Host(e)),
-            }
+        if m.global && !self.take_global(timeout)? {
+            return Ok(Val::Int(self.width.mask()));
         }
         if let Object::Mutex(m) = self.heap.get_mut(r)? {
             m.depth = 1;
@@ -163,12 +161,55 @@ impl<H: Host> Interpreter<H> {
         Ok(())
     }
 
-    /// Takes the Global Lock around a `Lock` field's access (§19.6.48), waiting for ever.
+    /// Takes the Global Lock around a `Lock` field's access (§19.6.48), waiting for ever: as
+    /// long as the time left allows.
     pub(crate) fn lock_global(&mut self) -> Result<()> {
-        match self.host.acquire_global_lock(0xFFFF) {
-            Ok(true) => Ok(()),
-            Ok(false) => err(ErrorKind::Host(crate::HostError::Timeout)),
+        if self.take_global(FOREVER)? {
+            Ok(())
+        } else {
+            err(ErrorKind::Limit(Limit::Time))
+        }
+    }
+
+    /// Asks the host for the Global Lock, waiting `timeout_ms` (`FOREVER`: for ever), but never
+    /// past the time left nor for 0xFFFF (the review of B1, F9). `false` if the wait asked for
+    /// timed out; a wait cut to the time left that times out ends the evaluation instead.
+    fn take_global(&mut self, timeout_ms: u64) -> Result<bool> {
+        let left_ms = self.time_for_host()? / 10_000;
+        let cut = timeout_ms >= FOREVER || timeout_ms > left_ms;
+        let t = if cut { left_ms } else { timeout_ms }.min(LONGEST);
+        match self.host.acquire_global_lock(u16::try_from(t).unwrap_or(0)) {
+            Ok(true) => Ok(true),
+            Ok(false) if cut => err(ErrorKind::Limit(Limit::Time)),
+            Ok(false) => Ok(false),
             Err(e) => err(ErrorKind::Host(e)),
+        }
+    }
+
+    /// The time the evaluation has left for a host call that may wait, in 100 ns units; with
+    /// none left, the evaluation ends.
+    pub(crate) fn time_for_host(&mut self) -> Result<u64> {
+        let used = self.host.now_100ns().saturating_sub(self.run.started);
+        match self.config.limits.time_100ns.checked_sub(used) {
+            Some(left) if left > 0 => Ok(left),
+            _ => err(ErrorKind::Limit(Limit::Time)),
+        }
+    }
+
+    /// Tells a tracing host of `event`.
+    pub(crate) fn trace(&mut self, event: &Trace<'_>) {
+        if self.host.tracing() {
+            self.host.trace(event);
+        }
+    }
+
+    /// Tells a tracing host that `node`'s method is entered: its path, written without
+    /// allocating.
+    pub(crate) fn trace_enter(&mut self, node: NodeId) {
+        if self.host.tracing() {
+            let mut buf = [[0u8; 4]; 32];
+            let path = self.ns.path_into(node, &mut buf).unwrap_or(&[]);
+            self.host.trace(&Trace::Enter(path));
         }
     }
 
@@ -239,7 +280,7 @@ impl<H: Host> Interpreter<H> {
         let now = self.host.now_100ns();
         let used = now.saturating_sub(self.run.started);
         if used.saturating_add(t) > self.config.limits.time_100ns {
-            return err(ErrorKind::Limit(crate::Limit::Time));
+            return err(ErrorKind::Limit(Limit::Time));
         }
         Ok(())
     }

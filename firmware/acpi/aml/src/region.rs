@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 
 use crate::Interpreter;
 use crate::error::{Error, ErrorKind, Result, err};
-use crate::host::{BufferAccess, Host, HostError, PciAddress, RegionAccess, Space};
+use crate::host::{BufferAccess, Host, HostError, PciAddress, RegionAccess, Space, Trace};
 use crate::mem;
 use crate::name::Seg;
 use crate::object::{Connection, FieldKind, FieldUnit, NodeId, Object, Region, Val};
@@ -369,8 +369,11 @@ impl<H: Host> Interpreter<H> {
     ) -> Result<u64> {
         match *path {
             Path::Region(r) => {
-                let access = self.access(&r, region_path, byte_off, w)?;
-                self.host.read(&access).map_err(|cause| {
+                let left = self.time_for_host()?;
+                let access = self.access(&r, region_path, byte_off, w, left)?;
+                let got = self.host.read(&access);
+                self.trace(&Trace::Read(&access, got));
+                got.map_err(|cause| {
                     Error::from(ErrorKind::Region {
                         space: r.space,
                         address: access.address,
@@ -402,8 +405,11 @@ impl<H: Host> Interpreter<H> {
     ) -> Result<()> {
         match *path {
             Path::Region(r) => {
-                let access = self.access(&r, region_path, byte_off, w)?;
-                self.host.write(&access, value).map_err(|cause| {
+                let left = self.time_for_host()?;
+                let access = self.access(&r, region_path, byte_off, w, left)?;
+                let got = self.host.write(&access, value);
+                self.trace(&Trace::Write(&access, value, got));
+                got.map_err(|cause| {
                     Error::from(ErrorKind::Region {
                         space: r.space,
                         address: access.address,
@@ -427,6 +433,7 @@ impl<H: Host> Interpreter<H> {
         region_path: &'a [Seg],
         byte_off: u64,
         w: u64,
+        time_left_100ns: u64,
     ) -> Result<RegionAccess<'a>> {
         let end = byte_off.checked_add(w).ok_or(ErrorKind::Range)?;
         if end > r.length {
@@ -439,6 +446,7 @@ impl<H: Host> Interpreter<H> {
             width: u8::try_from(w.saturating_mul(8)).unwrap_or(8),
             pci: r.pci,
             region: region_path,
+            time_left_100ns,
         })
     }
 
@@ -502,29 +510,39 @@ impl<H: Host> Interpreter<H> {
             .offset
             .checked_add(f.bit_offset / 8)
             .ok_or(ErrorKind::Range)?;
-        let access = BufferAccess {
-            space: Space(r.space),
-            address,
-            write: write.is_some(),
-            attribute: f.attrib,
-            length: f.access_len,
-            connection: conn.as_deref(),
-            region: &region_path,
+        let got = match self.time_for_host() {
+            Ok(time_left_100ns) => {
+                let access = BufferAccess {
+                    space: Space(r.space),
+                    address,
+                    write: write.is_some(),
+                    attribute: f.attrib,
+                    length: f.access_len,
+                    connection: conn.as_deref(),
+                    region: &region_path,
+                    time_left_100ns,
+                };
+                let got = self.host.transfer(&access, &mut data);
+                self.trace(&Trace::Transfer(&access, got));
+                got.map_err(|cause| {
+                    Error::from(ErrorKind::Region {
+                        space: r.space,
+                        address,
+                        cause,
+                    })
+                })
+            }
+            Err(e) => Err(e),
         };
-        let got = self.host.transfer(&access, &mut data);
         mem::release(region_path, &mut self.budget);
         if let Some(c) = conn {
             mem::release(c, &mut self.budget);
         }
         let filled = match got {
             Ok(n) => n.min(size),
-            Err(cause) => {
+            Err(e) => {
                 mem::release(data, &mut self.budget);
-                return err(ErrorKind::Region {
-                    space: r.space,
-                    address,
-                    cause,
-                });
+                return Err(e);
             }
         };
         data.truncate(filled);
@@ -546,27 +564,37 @@ impl<H: Host> Interpreter<H> {
             .offset
             .checked_add(f.bit_offset / 8)
             .ok_or(ErrorKind::Range)?;
-        let access = BufferAccess {
-            space: Space(r.space),
-            address,
-            write: write.is_some(),
-            attribute: f.attrib,
-            length: f.access_len,
-            connection: conn.as_deref(),
-            region: &region_path,
+        let got = match self.time_for_host() {
+            Ok(time_left_100ns) => {
+                let access = BufferAccess {
+                    space: Space(r.space),
+                    address,
+                    write: write.is_some(),
+                    attribute: f.attrib,
+                    length: f.access_len,
+                    connection: conn.as_deref(),
+                    region: &region_path,
+                    time_left_100ns,
+                };
+                let got = self.host.transfer(&access, &mut data);
+                self.trace(&Trace::Transfer(&access, got));
+                got.map_err(|cause| {
+                    Error::from(ErrorKind::Region {
+                        space: r.space,
+                        address,
+                        cause,
+                    })
+                })
+            }
+            Err(e) => Err(e),
         };
-        let got = self.host.transfer(&access, &mut data);
         mem::release(region_path, &mut self.budget);
         if let Some(c) = conn {
             mem::release(c, &mut self.budget);
         }
-        if let Err(cause) = got {
+        if let Err(e) = got {
             mem::release(data, &mut self.budget);
-            return err(ErrorKind::Region {
-                space: r.space,
-                address,
-                cause,
-            });
+            return Err(e);
         }
         if write.is_some() {
             mem::release(data, &mut self.budget);
@@ -683,16 +711,15 @@ impl<H: Host> Interpreter<H> {
                 width: 8,
                 pci: Some(here),
                 region: &[],
+                time_left_100ns: self.time_for_host()?,
             };
-            bus = self
-                .host
-                .read(&access)
-                .map_err(|cause: HostError| ErrorKind::Region {
-                    space: 2,
-                    address: 0x19,
-                    cause,
-                })?
-                & 0xFF;
+            let got = self.host.read(&access);
+            self.trace(&Trace::Read(&access, got));
+            bus = got.map_err(|cause: HostError| ErrorKind::Region {
+                space: 2,
+                address: 0x19,
+                cause,
+            })? & 0xFF;
         }
         Ok(PciAddress {
             segment,

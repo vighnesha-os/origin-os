@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use crate::config::DefinitionBlock;
 use crate::error::{At, Error, ErrorKind, Limit, Result, err};
-use crate::host::Host;
+use crate::host::{Host, Trace};
 use crate::mem;
 use crate::name::{self, AmlName, InTable};
 use crate::namespace::{Namespace, Owner};
@@ -293,6 +293,10 @@ impl<H: Host> Interpreter<H> {
             },
             &mut self.budget,
         )?;
+        self.trace(&Trace::Load {
+            signature: block.signature,
+            oem_table_id: block.oem_table_id,
+        });
         let base = self.begin_evaluation()?;
         let start = self.push_owner(Owner::Table(index));
         let outcome = start.and_then(|()| {
@@ -317,6 +321,7 @@ impl<H: Host> Interpreter<H> {
             Ok(()) => {
                 self.pop_owner(false);
                 self.end_evaluation();
+                self.trace(&Trace::Loaded(Ok(index)));
                 Ok(index)
             }
             Err(e) => {
@@ -330,8 +335,17 @@ impl<H: Host> Interpreter<H> {
                 }
                 self.abort(base);
                 self.end_evaluation();
+                self.trace_limit(&e);
+                self.trace(&Trace::Loaded(Err(e)));
                 Err(e)
             }
+        }
+    }
+
+    /// Tells a tracing host of the limit `e` reached, if it is one.
+    pub(crate) fn trace_limit(&mut self, e: &Error) {
+        if let ErrorKind::Limit(l) = e.kind {
+            self.trace(&Trace::Limit(l));
         }
     }
 
@@ -405,6 +419,9 @@ impl<H: Host> Interpreter<H> {
     /// made are removed.
     pub(crate) fn unwind(&mut self, frames: usize, calls: usize, owners: usize) {
         self.frames.truncate(frames);
+        for _ in calls..self.calls.len() {
+            self.trace(&Trace::Leave);
+        }
         self.calls.truncate(calls);
         while self.owners.len() > owners {
             if let Some(ctx) = self.owners.pop() {
@@ -1327,6 +1344,7 @@ impl<H: Host> Interpreter<H> {
         }
         self.push_frame(Frame::Call)?;
         mem::push(&mut self.calls, call, &mut self.budget)?;
+        self.trace_enter(node);
         self.push_owner(Owner::Call(self.serial))?;
         self.cur = Cursor {
             table: m.table,
@@ -1350,6 +1368,7 @@ impl<H: Host> Interpreter<H> {
             }
         }
         let call = self.calls.pop().ok_or(ErrorKind::Grammar)?;
+        self.trace(&Trace::Leave);
         if call.serialized {
             self.drop_implicit(call.serial);
         }

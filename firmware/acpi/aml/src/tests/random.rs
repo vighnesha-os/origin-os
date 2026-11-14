@@ -53,6 +53,8 @@ struct Setup {
     timed: bool,
     /// Ten million steps instead of 20,000, so that another limit is reached first.
     roomy: bool,
+    /// The host traces: what happens must not change (the review of B1, F9).
+    traced: bool,
 }
 
 impl Setup {
@@ -60,6 +62,7 @@ impl Setup {
         refuse: false,
         timed: false,
         roomy: false,
+        traced: false,
     };
     const TIMED: Self = Self {
         timed: true,
@@ -75,7 +78,7 @@ impl Setup {
         Self {
             refuse: seed.is_multiple_of(3),
             timed: seed % 3 == 1,
-            roomy: false,
+            ..Self::PLAIN
         }
     }
 
@@ -556,6 +559,9 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
     let mut i = interp_with(width, lim);
     i.host_mut().tick = if setup.timed { 50_000 } else { 1 };
     i.host_mut().refuse = setup.refuse;
+    if setup.traced {
+        i.host_mut().events = Some(Vec::new());
+    }
     let before = snapshot(&i);
     let block = DefinitionBlock {
         signature: *b"SSDT",
@@ -631,6 +637,17 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
         );
         evals.push(r.map_err(|e| e.kind));
     }
+    if let Some(events) = &i.host().events {
+        let enters = events
+            .iter()
+            .filter(|e| matches!(e, super::Event::Enter(_)))
+            .count();
+        let leaves = events.iter().filter(|e| **e == super::Event::Leave).count();
+        assert_eq!(
+            enters, leaves,
+            "seed {seed:#x}: a method entered and never left"
+        );
+    }
     Ran {
         digest,
         load,
@@ -666,7 +683,8 @@ fn generated(seed: u64) -> (Vec<u8>, IntegerWidth) {
     (g.table().concat(), width)
 }
 
-/// `n` grammar cases from the seed `start`; every 97th is run twice, for determinism.
+/// `n` grammar cases from the seed `start`; every 97th is run again with a tracing host, and
+/// must do the same: the same seed gives the same results, and tracing changes nothing.
 fn grammar_cases(start: u64, n: u64) {
     for k in 0..n {
         let seed = start.wrapping_add(k);
@@ -674,10 +692,14 @@ fn grammar_cases(start: u64, n: u64) {
         let setup = Setup::of(seed);
         let a = run(&aml, width, seed, setup);
         if k % 97 == 0 {
+            let traced = Setup {
+                traced: true,
+                ..setup
+            };
             assert_eq!(
                 a,
-                run(&aml, width, seed, setup),
-                "seed {seed:#x}: not deterministic"
+                run(&aml, width, seed, traced),
+                "seed {seed:#x}: not the same again, traced"
             );
         }
     }

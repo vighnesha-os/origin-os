@@ -56,6 +56,28 @@ pub(crate) struct TestHost {
     pub(crate) breakpoints: u32,
     pub(crate) debug: Vec<Vec<u8>>,
     pub(crate) tables: Vec<(TableKey, u64, Vec<u8>)>,
+    /// The timeouts the Global Lock was asked with (never 0xFFFF: asserted).
+    pub(crate) lock_waits: Vec<u16>,
+    /// The time left each region access was given (never 0: asserted).
+    pub(crate) time_left: Vec<u64>,
+    /// With `Some`, the host traces: each event it heard.
+    pub(crate) events: Option<Vec<Event>>,
+}
+
+/// A trace event, as the model host keeps it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Event {
+    Load([u8; 4]),
+    Loaded(Result<u32, crate::ErrorKind>),
+    Enter(Vec<[u8; 4]>),
+    Leave,
+    /// Address, outcome.
+    Read(u64, Result<u64, HostError>),
+    /// Address, value, outcome.
+    Write(u64, u64, Result<(), HostError>),
+    /// Address, outcome.
+    Transfer(u64, Result<usize, HostError>),
+    Limit(crate::Limit),
 }
 
 /// One buffer transfer the host saw.
@@ -68,6 +90,14 @@ pub(crate) struct BufferSeen {
     pub(crate) length: u8,
     pub(crate) connection: Option<Vec<u8>>,
     pub(crate) sent: Vec<u8>,
+}
+
+impl TestHost {
+    /// An access was given `left` of time: never none (the review of B1, F9).
+    fn given(&mut self, left: u64) {
+        assert!(left > 0, "a region access made with no time left");
+        self.time_left.push(left);
+    }
 }
 
 fn key(a: &RegionAccess<'_>, k: u64) -> Cell {
@@ -87,6 +117,7 @@ impl Host for TestHost {
         self.clock
     }
     fn read(&mut self, a: &RegionAccess<'_>) -> Result<u64, HostError> {
+        self.given(a.time_left_100ns);
         if self.refuse {
             self.refused += 1;
             return Err(HostError::Refused);
@@ -106,6 +137,7 @@ impl Host for TestHost {
         Ok(v)
     }
     fn write(&mut self, a: &RegionAccess<'_>, value: u64) -> Result<(), HostError> {
+        self.given(a.time_left_100ns);
         if self.refuse {
             self.refused += 1;
             return Err(HostError::Refused);
@@ -124,6 +156,7 @@ impl Host for TestHost {
         Ok(())
     }
     fn transfer(&mut self, a: &BufferAccess<'_>, data: &mut [u8]) -> Result<usize, HostError> {
+        self.given(a.time_left_100ns);
         if self.refuse {
             self.refused += 1;
             return Err(HostError::Refused);
@@ -148,7 +181,9 @@ impl Host for TestHost {
     fn stall_us(&mut self, us: u8) {
         self.clock = self.clock.saturating_add(u64::from(us) * 10);
     }
-    fn acquire_global_lock(&mut self, _: u16) -> Result<bool, HostError> {
+    fn acquire_global_lock(&mut self, timeout_ms: u16) -> Result<bool, HostError> {
+        assert_ne!(timeout_ms, 0xFFFF, "the Global Lock asked for with no end");
+        self.lock_waits.push(timeout_ms);
         if self.global_times_out {
             return Ok(false);
         }
@@ -172,6 +207,25 @@ impl Host for TestHost {
     }
     fn breakpoint(&mut self) {
         self.breakpoints += 1;
+    }
+    fn tracing(&self) -> bool {
+        self.events.is_some()
+    }
+    fn trace(&mut self, event: &crate::Trace<'_>) {
+        use crate::Trace;
+        let Some(events) = &mut self.events else {
+            return;
+        };
+        events.push(match *event {
+            Trace::Load { signature, .. } => Event::Load(signature),
+            Trace::Loaded(r) => Event::Loaded(r.map_err(|e| e.kind)),
+            Trace::Enter(path) => Event::Enter(path.to_vec()),
+            Trace::Leave => Event::Leave,
+            Trace::Read(a, r) => Event::Read(a.address, r),
+            Trace::Write(a, v, r) => Event::Write(a.address, v, r),
+            Trace::Transfer(a, r) => Event::Transfer(a.address, r),
+            Trace::Limit(l) => Event::Limit(l),
+        });
     }
     fn debug(&mut self, text: &[u8]) {
         self.debug.push(text.to_vec());

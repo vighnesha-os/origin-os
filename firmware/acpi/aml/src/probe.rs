@@ -7,10 +7,11 @@
 //! walk and the API. The check also requires this function's symbol, so that a change dropping it
 //! fails rather than passing having seen nothing. Nothing else calls it.
 
-use crate::host::{BufferAccess, Host, HostError, RegionAccess, TableKey};
+use crate::host::{BufferAccess, Host, HostError, RegionAccess, TableKey, Trace};
 use crate::{Config, DefinitionBlock, IntegerWidth, Interpreter, Limits, Space, Value};
 
-/// A host that refuses every request and keeps no time.
+/// A host that refuses every request and keeps no time. It traces, so that the tracing paths are
+/// in the object too, and drops what it hears.
 struct Refusing;
 
 impl Host for Refusing {
@@ -37,6 +38,10 @@ impl Host for Refusing {
     fn notify(&mut self, _: &[[u8; 4]], _: u64) {}
     fn fatal(&mut self, _: u8, _: u32, _: u64) {}
     fn debug(&mut self, _: &[u8]) {}
+    fn tracing(&self) -> bool {
+        true
+    }
+    fn trace(&mut self, _: &Trace<'_>) {}
     fn table(&mut self, _: &TableKey, _: &mut dyn FnMut(u64, &[u8])) -> Result<bool, HostError> {
         Err(HostError::Refused)
     }

@@ -12,8 +12,25 @@
 //! the library ends the host.
 //!
 //! Every call is synchronous and the interpreter runs one evaluation at a time (the contract's
-//! §8). In step B1 of TASKS item 63 only [`Host::now_100ns`] is called, for the time limit; the
-//! rest are called from step B2 on.
+//! §8). Every method of [`Host`] is called: the clock for the time limit and `Timer`; the region
+//! accesses, `Sleep`, `Stall`, the Global Lock, `Notify`, `Fatal`, `Debug` and `BreakPoint` by
+//! the operators that name them; [`Host::table`] by none yet (`Load` and `LoadTable` wait for
+//! `origin-acpi-tables`); [`Host::trace`] only when [`Host::tracing`] says so.
+//!
+//! **No call waits past the time limit** (the review of B1, F9). A call that may wait is given
+//! the time the evaluation has left, and the host must not wait longer:
+//!
+//! - [`Host::acquire_global_lock`]'s timeout is at most the time left, and never 0xFFFF ("for
+//!   ever"): a wait for ever, or longer than the time left, is cut to the time left (and to
+//!   65,534 ms), and a timeout of the cut wait ends the evaluation with [`crate::Limit::Time`];
+//! - [`Host::sleep_ms`] and [`Host::stall_us`] are charged against the time left before they
+//!   are called, and refused if it cannot hold them;
+//! - [`Host::read`], [`Host::write`] and [`Host::transfer`] carry `time_left_100ns`: a device
+//!   that has not answered by then is a [`HostError::Timeout`]. With no time left, none is made.
+//!
+//! **Tracing allocates nothing**, so that a host tracing the interpreter sees what one that does
+//! not would have done: method paths are written into a fixed buffer of 32 segments, and a deeper
+//! path is given as empty.
 
 /// An operation region address space (ACPI 6.6 Table 5.221).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -75,6 +92,8 @@ pub struct RegionAccess<'a> {
     pub pci: Option<PciAddress>,
     /// The region's path from the root, segment by segment, for diagnostics.
     pub region: &'a [[u8; 4]],
+    /// The time the evaluation has left, in 100 ns units: the host must not wait longer.
+    pub time_left_100ns: u64,
 }
 
 /// One transaction on a buffer-protocol region space (SMBus, IPMI, GenericSerialBus,
@@ -95,6 +114,8 @@ pub struct BufferAccess<'a> {
     pub connection: Option<&'a [u8]>,
     /// The region's path, for diagnostics.
     pub region: &'a [[u8; 4]],
+    /// The time the evaluation has left, in 100 ns units: the host must not wait longer.
+    pub time_left_100ns: u64,
 }
 
 /// What a host answers instead of doing a request.
@@ -122,14 +143,30 @@ pub struct TableKey {
     pub oem_table_id: [u8; 8],
 }
 
-/// What the interpreter tells a host that traces it.
+/// What the interpreter tells a host that traces it (the contract's §2): each table's load,
+/// each method entered and left, each region access with its outcome, each limit reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trace<'a> {
-    /// A method is entered: its path.
+    /// A table starts to load.
+    Load {
+        /// Its signature.
+        signature: [u8; 4],
+        /// Its OEM table ID.
+        oem_table_id: [u8; 8],
+    },
+    /// The table last started has loaded (its number), or failed.
+    Loaded(Result<u32, crate::Error>),
+    /// A method is entered: its path, or none if deeper than 32 segments.
     Enter(&'a [[u8; 4]]),
-    /// The method last entered returns.
+    /// The method last entered returns, or is left by an error.
     Leave,
-    /// A limit was reached.
+    /// A region read, and what the host answered.
+    Read(&'a RegionAccess<'a>, Result<u64, HostError>),
+    /// A region write of the value, and what the host answered.
+    Write(&'a RegionAccess<'a>, u64, Result<(), HostError>),
+    /// A buffer-protocol transaction, and what the host answered.
+    Transfer(&'a BufferAccess<'a>, Result<usize, HostError>),
+    /// A limit was reached: the load or evaluation ends with it.
     Limit(crate::Limit),
 }
 
@@ -157,14 +194,16 @@ pub trait Host {
     /// Whatever the host refuses or fails.
     fn transfer(&mut self, access: &BufferAccess<'_>, data: &mut [u8]) -> Result<usize, HostError>;
 
-    /// Yields for at least `ms` milliseconds (`Sleep`).
+    /// Yields for at least `ms` milliseconds (`Sleep`): no more than the time left, which was
+    /// charged first.
     fn sleep_ms(&mut self, ms: u64);
 
     /// Waits at least `us` microseconds without yielding (`Stall`).
     fn stall_us(&mut self, us: u8);
 
-    /// Takes the firmware-shared Global Lock (ACPI 6.6 §5.2.10.1), waiting up to `timeout_ms`
-    /// (0xFFFF: for ever). `Ok(false)` is a timeout.
+    /// Takes the firmware-shared Global Lock (ACPI 6.6 §5.2.10.1), waiting up to `timeout_ms`:
+    /// at most the time the evaluation has left, and never 0xFFFF (see the module's
+    /// documentation). `Ok(false)` is a timeout.
     ///
     /// # Errors
     /// Whatever the host refuses or fails.
@@ -187,6 +226,11 @@ pub trait Host {
 
     /// `BreakPoint`. Does nothing unless the host has a debugger.
     fn breakpoint(&mut self) {}
+
+    /// Whether this host traces the interpreter: [`Host::trace`] is called only if so.
+    fn tracing(&self) -> bool {
+        false
+    }
 
     /// An event for a host that traces the interpreter.
     fn trace(&mut self, _event: &Trace<'_>) {}

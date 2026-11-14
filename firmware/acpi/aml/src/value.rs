@@ -154,6 +154,9 @@ impl<H: Host> Interpreter<H> {
             }
         };
         self.end_evaluation();
+        if let Err(e) = &out {
+            self.trace_limit(e);
+        }
         out
     }
 

@@ -405,4 +405,24 @@ impl Namespace {
         }
         Ok(())
     }
+
+    /// `id`'s path written into `out`, allocating nothing (for a tracing host): the segments
+    /// used, or `None` if `id` is stale or deeper than `out`.
+    pub(crate) fn path_into<'o>(&self, id: NodeId, out: &'o mut [Seg]) -> Option<&'o [Seg]> {
+        let mut depth = 0usize;
+        let mut cur = self.node(id).ok()?;
+        let mut i = id.index;
+        while i != 0 {
+            depth = depth.checked_add(1)?;
+            i = cur.parent;
+            cur = self.at(i)?;
+        }
+        let used = out.get_mut(..depth)?;
+        let mut cur = self.node(id).ok()?;
+        for slot in used.iter_mut().rev() {
+            *slot = cur.name;
+            cur = self.at(cur.parent)?;
+        }
+        Some(used)
+    }
 }

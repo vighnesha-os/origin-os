@@ -184,8 +184,10 @@ fn a_lock_field_takes_the_global_lock_around_its_access() {
     int(&mut i, "R");
     assert_eq!(i.host().global_taken, 1);
     assert_eq!(i.host().global_held, 0);
+    // It waits for ever, cut to the time left: a timeout of that is the time limit (the review of
+    // B1, F9).
     i.host_mut().global_times_out = true;
-    assert_eq!(fails(&mut i, "R"), ErrorKind::Host(HostError::Timeout));
+    assert_eq!(fails(&mut i, "R"), ErrorKind::Limit(Limit::Time));
 }
 
 #[test]
@@ -677,4 +679,153 @@ fn reg_runs_where_regions_of_the_space_are_and_not_for_memory_or_io() {
         0
     );
     assert_eq!(int(&mut i, "CNT"), 1);
+}
+
+// --- The time left, and tracing (the review of B1, F9) -------------------------------------------
+
+#[test]
+fn waiting_calls_are_given_the_time_left_and_never_for_ever() {
+    let mut i = loaded(&[
+        op_region("MEM", 0, dword(0x2000), byte(4)),
+        field("MEM", DWORD | 0x10, &[Fe::Named("LK", 32)]),
+        m("R", &[ret(nm("LK"))]),
+        m(
+            "EVER",
+            &[
+                store(acquire(nm("\\_GL"), 0xFFFF), local(0)),
+                release(nm("\\_GL")),
+                ret(local(0)),
+            ],
+        ),
+        m(
+            "SOON",
+            &[
+                store(acquire(nm("\\_GL"), 5), local(0)),
+                release(nm("\\_GL")),
+                ret(local(0)),
+            ],
+        ),
+        m("TRY", &[ret(acquire(nm("\\_GL"), 5))]),
+        m(
+            "LATE",
+            &[
+                sleep(word(29_990)),
+                store(acquire(nm("\\_GL"), 100), local(0)),
+                release(nm("\\_GL")),
+                ret(local(0)),
+            ],
+        ),
+    ]);
+    // The service limits give 30 s, and the clock stands still but for `Sleep`.
+    assert_eq!(int(&mut i, "R"), 0);
+    assert_eq!(i.host().time_left, [300_000_000]);
+    assert_eq!(int(&mut i, "EVER"), 0);
+    assert_eq!(int(&mut i, "SOON"), 0);
+    assert_eq!(int(&mut i, "LATE"), 0);
+    // The Lock field's wait and `Acquire`'s "for ever" are cut to the 30 s left; 5 ms is asked
+    // as it is; 100 ms is cut to the 10 ms left after the sleep.
+    assert_eq!(i.host().lock_waits, [30_000, 30_000, 5, 10]);
+    // A wait that was cut and times out ends the evaluation; one asked as it is reports `Ones`.
+    i.host_mut().global_times_out = true;
+    assert_eq!(fails(&mut i, "EVER"), ErrorKind::Limit(Limit::Time));
+    assert_eq!(fails(&mut i, "LATE"), ErrorKind::Limit(Limit::Time));
+    assert_eq!(fails(&mut i, "R"), ErrorKind::Limit(Limit::Time));
+    assert_eq!(int(&mut i, "TRY"), u64::MAX);
+    assert_eq!(i.host().global_held, 0);
+}
+
+#[test]
+fn no_access_is_made_with_no_time_left() {
+    let mut i = interp_with(
+        IntegerWidth::Bits64,
+        Limits {
+            time_100ns: 10_000_000,
+            ..Limits::SERVICE
+        },
+    );
+    load(
+        &mut i,
+        &[
+            op_region("IO", 1, word(0x80), byte(1)),
+            field("IO", BYTE, &[Fe::Named("P80", 8)]),
+            // The whole second slept, then a read: refused before the host is asked.
+            m("ALL", &[sleep(word(1_000)), ret(nm("P80"))]),
+            m("LESS", &[sleep(word(999)), ret(nm("P80"))]),
+        ],
+    )
+    .expect("loads");
+    assert_eq!(fails(&mut i, "ALL"), ErrorKind::Limit(Limit::Time));
+    assert!(i.host().seen.is_empty());
+    assert_eq!(int(&mut i, "LESS"), 0);
+    // 1 ms left, in 100 ns units.
+    assert_eq!(i.host().time_left, [10_000]);
+}
+
+#[test]
+fn a_tracing_host_hears_loads_calls_accesses_and_limits() {
+    use super::Event;
+    let mut i = interp(IntegerWidth::Bits64);
+    i.host_mut().events = Some(Vec::new());
+    let mut nest = m("DEEP", &[ret(one())]);
+    for _ in 0..40 {
+        nest = device("A", &[nest]);
+    }
+    load(
+        &mut i,
+        &[
+            op_region("IO", 1, word(0x80), byte(1)),
+            field("IO", BYTE, &[Fe::Named("P80", 8)]),
+            m("OUT", &[store(byte(0x42), nm("P80")), ret(call("IN", &[]))]),
+            m("IN", &[ret(nm("P80"))]),
+            m("LOOP", &[ret(call("LOOP", &[]))]),
+            device("B", &[device("C", &[m("D", &[ret(one())])])]),
+            nest,
+        ],
+    )
+    .expect("loads");
+    let take = |i: &mut Interp| i.host_mut().events.replace(Vec::new()).unwrap();
+    assert_eq!(take(&mut i), [Event::Load(*b"SSDT"), Event::Loaded(Ok(0))]);
+    assert_eq!(int(&mut i, "OUT"), 0x42);
+    assert_eq!(
+        take(&mut i),
+        [
+            Event::Enter(vec![*b"OUT_"]),
+            Event::Write(0x80, 0x42, Ok(())),
+            Event::Enter(vec![*b"IN__"]),
+            Event::Read(0x80, Ok(0x42)),
+            Event::Leave,
+            Event::Leave,
+        ]
+    );
+    assert_eq!(int(&mut i, "\\B.C.D"), 1);
+    assert_eq!(
+        take(&mut i),
+        [
+            Event::Enter(vec![*b"B___", *b"C___", *b"D___"]),
+            Event::Leave
+        ]
+    );
+    // A path deeper than 32 segments is given as none.
+    let deep = (0..40).map(|_| "A").collect::<Vec<_>>().join(".");
+    assert_eq!(int(&mut i, &format!("\\{deep}.DEEP")), 1);
+    assert_eq!(take(&mut i), [Event::Enter(vec![]), Event::Leave]);
+    // Each activation an error unwinds is left, then the limit is told.
+    assert_eq!(fails(&mut i, "LOOP"), ErrorKind::Limit(Limit::Depth));
+    let ev = take(&mut i);
+    let enters = ev.iter().filter(|e| matches!(e, Event::Enter(_))).count();
+    let leaves = ev.iter().filter(|e| **e == Event::Leave).count();
+    assert_eq!((enters, leaves), (64, 64));
+    assert_eq!(ev.last(), Some(&Event::Limit(Limit::Depth)));
+    // A failed load is told.
+    assert_eq!(
+        load(&mut i, &[m("X", &[]), m("X", &[])]).unwrap_err().kind,
+        ErrorKind::Duplicate
+    );
+    assert_eq!(
+        take(&mut i),
+        [
+            Event::Load(*b"SSDT"),
+            Event::Loaded(Err(ErrorKind::Duplicate))
+        ]
+    );
 }
