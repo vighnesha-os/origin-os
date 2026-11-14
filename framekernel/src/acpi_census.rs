@@ -15,7 +15,6 @@
 //! memory, so that every branch of the verdict ([`Findings::consistent`]) is tested there (the
 //! review's F7).
 
-use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
