@@ -141,15 +141,15 @@ impl<H: Host> Interpreter<H> {
     /// # Errors
     /// As [`Interpreter::evaluate`].
     pub fn evaluate_node(&mut self, node: Node, args: &[Value]) -> Result<Option<Value>> {
-        let base = self.begin_evaluation()?;
-        let outcome = self.run_node(node.0, args, base);
+        let marks = self.begin_evaluation()?;
+        let outcome = self.run_node(node.0, args, marks.frames);
         let out = match outcome {
             // Every mutex is released before an evaluation ends (§19.6.89); one still held is
             // released now and reported (G2, strict until the reading session answers).
-            Ok(_) if self.release_held() => Err(Error::new(ErrorKind::MutexHeld)),
+            Ok(_) if self.release_held(marks.held) => Err(Error::new(ErrorKind::MutexHeld)),
             Ok(v) => self.export(v),
             Err(e) => {
-                self.abort(base);
+                self.abort(marks);
                 Err(e)
             }
         };

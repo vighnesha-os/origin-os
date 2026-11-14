@@ -67,10 +67,12 @@ impl<H: Host> Interpreter<H> {
         self.held.retain(|h| !(h.mutex.is_none() && h.call == call));
     }
 
-    /// Releases everything held (an evaluation ends or is aborted). Returns whether anything was.
-    pub(crate) fn release_held(&mut self) -> bool {
-        let any = !self.held.is_empty();
-        while let Some(h) = self.held.pop() {
+    /// Releases what was taken above the mark `above` (an evaluation ends or is aborted). Returns
+    /// whether anything was.
+    pub(crate) fn release_held(&mut self, above: usize) -> bool {
+        let any = self.held.len() > above;
+        while self.held.len() > above {
+            let Some(h) = self.held.pop() else { break };
             if let Some(r) = h.mutex
                 && let Ok(Object::Mutex(m)) = self.heap.get_mut(r)
             {
@@ -86,7 +88,7 @@ impl<H: Host> Interpreter<H> {
                 let _ = self.host.release_global_lock();
             }
         }
-        if self.held.capacity() > 0 {
+        if self.held.is_empty() && self.held.capacity() > 0 {
             mem::release(core::mem::take(&mut self.held), &mut self.budget);
         }
         any

@@ -120,6 +120,16 @@ pub(crate) struct CallFrame {
     pub(crate) serialized: bool,
 }
 
+/// Where an evaluation began: what [`Interpreter::abort`] goes back to, and no further (the
+/// review of B1, F14).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Marks {
+    pub(crate) frames: usize,
+    pub(crate) calls: usize,
+    pub(crate) owners: usize,
+    pub(crate) held: usize,
+}
+
 /// Who is creating names now, and what it has created.
 #[derive(Debug)]
 pub(crate) struct OwnerCtx {
@@ -297,7 +307,7 @@ impl<H: Host> Interpreter<H> {
             signature: block.signature,
             oem_table_id: block.oem_table_id,
         });
-        let base = self.begin_evaluation()?;
+        let marks = self.begin_evaluation()?;
         let start = self.push_owner(Owner::Table(index));
         let outcome = start.and_then(|()| {
             self.cur = Cursor {
@@ -310,9 +320,9 @@ impl<H: Host> Interpreter<H> {
                 scope: Namespace::root(),
                 pred: 0,
             })?;
-            self.run_frames(base)?;
+            self.run_frames(marks.frames)?;
             // Load-time code that ends holding a mutex fails the load (§19.6.89; G2).
-            if self.release_held() {
+            if self.release_held(marks.held) {
                 return err(ErrorKind::MutexHeld);
             }
             Ok(())
@@ -333,7 +343,7 @@ impl<H: Host> Interpreter<H> {
                     let aml = core::mem::take(&mut t.aml);
                     mem::release(aml, &mut self.budget);
                 }
-                self.abort(base);
+                self.abort(marks);
                 self.end_evaluation();
                 self.trace_limit(&e);
                 self.trace(&Trace::Loaded(Err(e)));
@@ -351,8 +361,8 @@ impl<H: Host> Interpreter<H> {
 
     // --- Evaluations -------------------------------------------------------------------------
 
-    /// Starts a top-level evaluation: its counts, and the frame base it runs above.
-    pub(crate) fn begin_evaluation(&mut self) -> Result<usize> {
+    /// Starts a top-level evaluation: its counts, and the marks it runs above.
+    pub(crate) fn begin_evaluation(&mut self) -> Result<Marks> {
         self.run = crate::RunCounts {
             started: self.host.now_100ns(),
             charged_seen: self.budget.charged(),
@@ -361,7 +371,12 @@ impl<H: Host> Interpreter<H> {
         let _ = self.ns.take_work();
         self.result = Val::None;
         self.base = self.frames.len();
-        Ok(self.base)
+        Ok(Marks {
+            frames: self.base,
+            calls: self.calls.len(),
+            owners: self.owners.len(),
+            held: self.held.len(),
+        })
     }
 
     /// Ends one: everything unreachable is collected, and the stacks, empty at the top level,
@@ -407,11 +422,14 @@ impl<H: Host> Interpreter<H> {
         self.budget.recount(n);
     }
 
-    /// Undoes everything above `base` after an error: frames, activations, and the names their
-    /// creators made (a table being loaded included: that is the rollback).
-    pub(crate) fn abort(&mut self, base: usize) {
-        self.unwind(base, 0, 0);
-        self.release_held();
+    /// Undoes everything above `marks` after an error: frames, activations, the names their
+    /// creators made (a table being loaded included: that is the rollback), and the mutexes taken.
+    /// What was there when the evaluation began stays, so that one evaluation inside another
+    /// would leave the outer one whole (the review of B1, F14). Today every evaluation is
+    /// top-level, and every mark is zero.
+    pub(crate) fn abort(&mut self, marks: Marks) {
+        self.unwind(marks.frames, marks.calls, marks.owners);
+        self.release_held(marks.held);
         self.result = Val::None;
     }
 

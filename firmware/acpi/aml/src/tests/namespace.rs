@@ -177,3 +177,52 @@ fn a_failed_table_gives_its_bytes_back() {
         i.memory_used()
     );
 }
+
+#[test]
+fn an_aborted_evaluation_leaves_what_was_there_before_it() {
+    // The review of B1, F14: an evaluation that fails undoes what it made and nothing that was
+    // there when it began. Every evaluation is top-level today; this stands in an outer one's
+    // creator, activation and held mutex by hand.
+    use crate::engine::CallFrame;
+    use crate::namespace::Owner;
+    use crate::object::Val;
+    use crate::sync::Held;
+    let mut i = interp(IntegerWidth::Bits64);
+    load(
+        &mut i,
+        &[method(
+            "BAD",
+            0,
+            &[name("X", one()), ret(divide(one(), zero(), none(), none()))],
+        )],
+    )
+    .unwrap();
+    let nodes = i.node_count();
+    i.push_owner(Owner::Call(7)).unwrap();
+    let outer = CallFrame {
+        serial: 7,
+        ret: i.cur,
+        locals: [Val::None; 8],
+        args: [Val::None; 7],
+        serialized: false,
+    };
+    crate::mem::push(&mut i.calls, outer, &mut i.budget).unwrap();
+    let held = Held {
+        mutex: None,
+        call: 7,
+        sync: 0,
+        global: false,
+    };
+    crate::mem::push(&mut i.held, held, &mut i.budget).unwrap();
+    assert_eq!(
+        i.evaluate("BAD", &[]).unwrap_err().kind,
+        ErrorKind::DivideByZero
+    );
+    assert_eq!((i.owners.len(), i.calls.len(), i.held.len()), (1, 1, 1));
+    assert_eq!(i.calls[0].serial, 7);
+    assert_eq!(
+        i.node_count(),
+        nodes,
+        "the failed evaluation's X is removed"
+    );
+}
