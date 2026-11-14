@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-08: questions 1–5 and 9 first, then questions 6, 7 and 8 (AMD-Vi) once AMD's manuals were confirmed byte-identical to the copies that were read. Question 10 (I12, bus mastering cleared at enumeration) on 2026-11-09. This is a kernel-internal security mechanism, not an ABI or format decision; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. **Amendment 1 (below): Accepted** by the owner on 2026-11-13 (items 247 to 251): identity maps for firmware-reserved memory, the shape questions 4 and 8 asked for before real hardware; built by TASKS item 40, not landed. |
+| Status | **Accepted** by the owner on 2026-11-08: questions 1–5 and 9 first, then questions 6, 7 and 8 (AMD-Vi) once AMD's manuals were confirmed byte-identical to the copies that were read. Question 10 (I12, bus mastering cleared at enumeration) on 2026-11-09. This is a kernel-internal security mechanism, not an ABI or format decision; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. **Amendment 1 (below): Accepted** by the owner on 2026-11-13 (items 247 to 251): identity maps for firmware-reserved memory, the shape questions 4 and 8 asked for before real hardware; built by TASKS item 40, not landed. **Amendment 2 (below): Accepted** by the owner on 2026-11-13 (item 291): a never-map type-20h IVMD applies to every device in the system; not built. |
 | Requires | CLAUDE.md §31 (DMA mapping, interrupt management, driver isolation), §32 (Intel VT-d, AMD IOMMU, interrupt remapping), §58 (DMA protection) |
 | Evidence | `docs/research/2026-11-08-vt-d-iommu.md` (VT-d Rev 5.20, D51397-019, 2026-05-14; what QEMU 11.1's `intel-iommu` emulates); `docs/research/2026-11-08-amd-vi-iommu.md` (AMD IOMMU specification 48882 Rev 3.11, April 2026; what QEMU 11.1's `amd-iommu` emulates and where it departs from the specification); the boot proofs and negative controls in `docs/engineering/SOURCE_PROVENANCE.md` ("Intel VT-d DMA and interrupt remapping"; "I/O APIC interrupts through VT-d interrupt remapping"; "AMD-Vi DMA and interrupt remapping"; "Bus mastering cleared at enumeration"); `docs/research/2026-11-08-bus-master-quiesce.md` for I12 |
 | Threat model | `docs/engineering/THREAT_MODEL_IOMMU.md` (CLAUDE.md §58) |
@@ -27,6 +27,7 @@ Each attached PCI function gets its own domain (domain ID from 1, never 0), seco
 *Alternatives:* one shared domain for all devices (simpler, but any device could reach any other's buffers); per-driver domains (equivalent while every driver binds one function).
 
 ### I4. IOVAs are not physical addresses
+*Amended 2026-11-13 by Amendment 1, R2: within a firmware-reserved range identity-mapped by R1, a device's bus address is the physical address.*
 Every domain allocates bus addresses from **[1 GiB, 2 GiB)**: below every PC platform's 32-bit MMIO hole (so not routed peer-to-peer before the IOMMU), clear of the interrupt range `0xFEEx_xxxx`, reachable by 32-bit DMA engines, and — in the 512 MiB QEMU test machine — not backed by RAM, so a DMA that bypassed translation would land nowhere (the boot proof shows the data arriving in a different physical page). Pages are mapped one 4 KiB page at a time, read/write, and only the driver's DMA pages are mapped.
 *Alternatives:* identity mapping (IOVA = physical; simpler, but a translation failure would be invisible and the device learns physical addresses); allocating anywhere in the 48-bit space (must then avoid MMIO windows known only from ACPI `_CRS`).
 
@@ -56,6 +57,7 @@ Fault events stay masked; the fault-recording registers are read and cleared by 
 A virtio device that offers `VIRTIO_F_ACCESS_PLATFORM` sits behind the IOMMU: the driver accepts the feature (QEMU refuses `FEATURES_OK` otherwise) and uses IOVAs. One that does not offer it uses physical addresses (virtio 1.1 §6) and is given them only where the IOMMU is not translating; behind a translating IOMMU it is refused (I12).
 
 ### I11. What is refused rather than half-done
+*Amended 2026-11-13 by Amendments 1 and 2: a device that an RMRR or IVMD names is attached with identity maps (R1 to R6) instead of refused, unless its range fails R3.*
 A DMAR that fails any check (`framekernel::dmar::parse`) leaves the IOMMU off and fails the boot proof loudly; the firmware's `DMA_REMAP_OPT_OUT` and `X2APIC_OPT_OUT` requests are reported and not honoured (Rev 5.20 §8.1; decision-sheet item 25); a unit the firmware left enabled is not taken over; a device named by a reserved memory region (RMRR) is refused at attach (identity-mapping RMRRs is not implemented yet), so its DMA stays blocked rather than unchecked; if one unit fails to come up, the units already running are turned off again so drivers are not left blocked with nobody to attach them.
 
 ### I12. Bus mastering is cleared at enumeration and set again only after a device is attached (added 2026-11-08; threat T4)
@@ -105,12 +107,14 @@ On first use a device gets its own 256-entry interrupt remapping table (IV, IntC
 Event interrupts stay off; `iommu::take_faults` drains the event log (restarting it after an overflow) and decodes by the specification. Both IOMMUs' faults reach callers as one neutral record (page not mapped, page denied, interrupt blocked, other), with the vendor's own record attached for the report. An I/O page fault counts as an interrupt only if I is set and its address is in the interrupt range — on hardware the two agree; QEMU 11.1 sets I on DMA faults too.
 
 ### A9. Refused rather than half-done (I11)
+*Amended 2026-11-13 by Amendments 1 and 2, as I11 is.*
 An IVRS that fails any check fails the boot proof loudly; an IOMMU the firmware left enabled is not taken over; a PCI segment other than 0 is refused; a device an IVMD names (unity maps, exclusion ranges) is refused at attach, as RMRR devices are, so its DMA stays blocked rather than unchecked; if one IOMMU fails to come up, the ones already running are turned off again.
 
 ### A10. What the QEMU proofs cannot show (CLAUDE.md §74)
 QEMU 11.1's `amd-iommu` translates emulated devices only with `dma-remap=on`, writes every event with address 0 (undefined behaviour in its event encoder, fixed only after 11.1), logs no interrupt-remapping fault and caches no IRTEs. The kernel follows the specification on each point. The AMD-Vi boot test pins QEMU's behaviour (address 0, no interrupt fault record, QEMU's own stderr line for the blocked interrupt), so a QEMU that changes is noticed; **hardware qualification must require the IOVA in the fault record and the interrupt fault event.**
 
 ## Consequences
+*Since Amendment 1 (2026-11-13), a device that firmware-reserved memory names is attached with identity maps instead of refused; its consequences are in the amendment.*
 
 - Drivers allocate DMA memory through `dma::DeviceDma` (attach once, then pages that come mapped) and program bus addresses, never physical ones; MSI-X entries are programmed through `iommu::msi_message`. Bus mastering is set only by `DeviceDma::enable_bus_master`, after attaching (I12).
 - The boot needs `-device intel-iommu,intremap=on,eim=on` and `iommu_platform=on` on virtio devices (xtask). With `ORIGIN_QEMU_IOMMU=amd` it boots instead with `-device AMDVI-PCI,id=iommupci0,addr=05.0 -device amd-iommu,pci-id=iommupci0,intremap=on,xtsup=on,dma-remap=on`; `boot-matrix` runs both IOMMUs at 1, 2 and 4 CPUs. Any other value of `ORIGIN_QEMU_IOMMU` must be an `intel-iommu` device, booted with the VT-d markers (negative controls such as `intel-iommu,intremap=off`).
@@ -120,6 +124,7 @@ QEMU 11.1's `amd-iommu` translates emulated devices only with `dma-remap=on`, wr
 - Not yet: scalable mode, RMRR identity maps, taking over a unit the firmware enabled (pre-boot DMA protection, `DMA_CTRL_PLATFORM_OPT_IN`), freeing IOVAs and table pages, large-page mappings, device-TLBs (ATS), a fault-event interrupt, hot-plug, and a live level-triggered I/O APIC pin (PCI INTx) with its EOI path.
 
 ## Trade-offs
+*Since Amendment 1 (2026-11-13), I4's rule that a device never learns a physical address has the exception R2 states; the amendment's trade-offs say what that costs.*
 
 - **One domain per device (I3):** the strongest isolation available here, at the cost of a set of translation tables per device.
 - **Strict, synchronous invalidation on unmap (I5):** it closes the window that deferred invalidation leaves open, at a cost on every unmap. That cost has not been measured (CLAUDE.md rule 21); no driver unmaps yet.
@@ -158,6 +163,24 @@ None on disk and none at any ABI: all of this is kernel-internal, and no persist
 **Migration consequences.** None for a program or a driver: nothing of the Driver ABI changes. ADR-0013 gains TASKS item 40's boot proof and controls when that task lands.
 
 **What stays unknown.** No machine in the declared scope has been seen with an RMRR or an IVMD. QEMU has neither, so TASKS item 40's boot test plants one in its tables (a test-only step). Rental A's server had an IVRS with no IVMD.
+
+## Amendment 2 (Accepted, 2026-11-13): a never-map type-20h IVMD applies to every device
+
+**Status: Accepted by the owner on 2026-11-13 with the recommended answer ("Accept all 3", decision sheet item 291; CLAUDE.md §18). Not built: TASKS item 40 builds it.** The independent review of TASKS item 40 (finding L6, 2026-11-13) read AMD's IOMMU specification 48882 Rev 3.11 against R5. §5.2.2 says each IVMD gives information related to the IVHD just before it, which R5 follows. §5.2.2.2 says a type-20h block's flags apply to all devices in a system, and that a type-20h range with IR and IW both clear keeps the range out of every device's address space. On a machine with more than one IOMMU, R5 as written would then leave the devices of the other IOMMUs free to reach a range the firmware said no device may reach.
+
+| # | Item | Decision | Refines |
+|---|---|---|---|
+| R6 | 291 | **A never-map type-20h IVMD applies to every device in the system.** A type-20h block with IR and IW both clear makes `map` refuse a frame inside its range for every device, on every IOMMU. A type-20h block that gives an identity map (R4) keeps R5: it covers the devices of the IOMMU described before it, which only refuses more. | R4, R5 |
+
+**Options that were put.** (a) As decided. (b) Keep R5 for every type-20h block: a never-map range would then hold only for one IOMMU's devices.
+
+**Performance cost (ADR-0018 V3).** Unmeasured, owed (cost ledger row CL39): at each `map` for a device of another IOMMU, the never-map ranges are checked, as R4 already checks them for the devices R5 names.
+
+**Trade-offs.** A frame inside such a range is refused to more devices. In return the firmware's "no device" means no device.
+
+**Migration consequences.** None for a driver: the Driver ABI does not change.
+
+**What stays unknown.** No machine in the declared scope has been seen with a type-20h IVMD; rental A's server had none.
 
 ## Questions for the owner (1–9 answered 2026-11-08; 10 open)
 
