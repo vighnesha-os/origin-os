@@ -9,7 +9,7 @@
 
 use core::hint::black_box;
 
-use crate::host::{BufferAccess, Host, HostError, RegionAccess, TableKey, Trace};
+use crate::host::{BridgeBus, BufferAccess, Host, HostError, RegionAccess, TableKey, Trace};
 use crate::{Config, DefinitionBlock, IntegerWidth, Interpreter, Limits, Space, Value};
 
 /// A host whose every answer is opaque to the compiler (`core::hint::black_box`): it refuses
@@ -28,6 +28,10 @@ impl Host for Opaque {
     }
     fn write(&mut self, a: &RegionAccess<'_>, v: u64) -> Result<(), HostError> {
         black_box((a, v));
+        black_box(Err(HostError::Refused))
+    }
+    fn bridge_bus(&mut self, b: &BridgeBus) -> Result<u8, HostError> {
+        black_box(b);
         black_box(Err(HostError::Refused))
     }
     fn transfer(&mut self, a: &BufferAccess<'_>, data: &mut [u8]) -> Result<usize, HostError> {

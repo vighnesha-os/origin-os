@@ -26,7 +26,7 @@
 use crate::Interpreter;
 use crate::engine::Frame;
 use crate::error::{Error, ErrorKind, Result, err};
-use crate::host::{Host, HostError, PciAddress, RegionAccess, Space, Trace};
+use crate::host::{BridgeBus, Host, PciAddress, Space, Trace};
 use crate::name::Seg;
 use crate::object::{FieldKind, NodeId, Object, ScopeKind, Val};
 use crate::region::FIELD_DEPTH;
@@ -311,21 +311,15 @@ impl<H: Host> Interpreter<H> {
                     device: u8::try_from((badr >> 16) & 0xFF).unwrap_or(0),
                     function: u8::try_from(badr & 0xFF).unwrap_or(0),
                 };
-                let access = RegionAccess {
-                    space: Space::PCI_CONFIG,
-                    address: 0x19,
-                    width: 8,
-                    pci: Some(here),
-                    region: &[],
+                // Its own request, never a region access with no region (the review of B2,
+                // B2-3).
+                let request = BridgeBus {
+                    bridge: here,
                     time_left_100ns: self.time_for_host()?,
                 };
-                let got = self.host.read(&access);
-                self.trace(&Trace::Read(&access, got));
-                r.bus = got.map_err(|cause: HostError| ErrorKind::Region {
-                    space: 2,
-                    address: 0x19,
-                    cause,
-                })? & 0xFF;
+                let got = self.host.bridge_bus(&request);
+                self.trace(&Trace::BridgeBus(&request, got));
+                r.bus = u64::from(got.map_err(ErrorKind::Host)?);
                 self.after_bridge(&mut r, bridge)?;
             }
             Phase::DeviceAdr => {

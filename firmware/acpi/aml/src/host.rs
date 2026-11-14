@@ -118,6 +118,19 @@ pub struct BufferAccess<'a> {
     pub time_left_100ns: u64,
 }
 
+/// A PCI bridge's secondary bus number: byte 0x19 of its configuration space (a type 1 header),
+/// which the library needs to name the function of a PCI_Config region below the bridge. Its own
+/// request, not a region access: no `OperationRegion` declares it, so a host that grants only
+/// what the firmware's regions name (ADR-0019 A2) allows this by its kind, or answers from its own
+/// enumeration of the bus (the review of B2, B2-3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BridgeBus {
+    /// The bridge, as its parent bus and its `_ADR` name it.
+    pub bridge: PciAddress,
+    /// The time the evaluation has left, in 100 ns units: the host must not wait longer.
+    pub time_left_100ns: u64,
+}
+
 /// What a host answers instead of doing a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostError {
@@ -166,6 +179,8 @@ pub enum Trace<'a> {
     Write(&'a RegionAccess<'a>, u64, Result<(), HostError>),
     /// A buffer-protocol transaction, and what the host answered.
     Transfer(&'a BufferAccess<'a>, Result<usize, HostError>),
+    /// A bridge's secondary bus asked for, and what the host answered.
+    BridgeBus(&'a BridgeBus, Result<u8, HostError>),
     /// A limit was reached: the load or evaluation ends with it.
     Limit(crate::Limit),
 }
@@ -186,6 +201,12 @@ pub trait Host {
     /// # Errors
     /// Whatever the host refuses or fails.
     fn write(&mut self, access: &RegionAccess<'_>, value: u64) -> Result<(), HostError>;
+
+    /// A PCI bridge's secondary bus number (see [`BridgeBus`]).
+    ///
+    /// # Errors
+    /// Whatever the host refuses or fails.
+    fn bridge_bus(&mut self, request: &BridgeBus) -> Result<u8, HostError>;
 
     /// Runs one buffer-protocol transaction: `data` holds the request and receives the answer.
     /// Returns how many bytes of `data` the answer fills.

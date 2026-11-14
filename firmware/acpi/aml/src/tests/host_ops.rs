@@ -995,10 +995,10 @@ fn the_pci_walk_follows_devices_not_the_scopes_around_a_region() {
     };
     // A method of PXSX: PXSX's function, below RP01. The bridge read is RP01's alone.
     i.evaluate("\\_SB.PCI0.RP01.PXSX.WAKE", &[]).unwrap();
+    // The bridge's bus asked for by its own request (B2-3), never as a region access.
+    assert_eq!(i.host().bridges, [at(0, 0, 0x1C, 0).unwrap()]);
+    assert!(i.host().seen.iter().all(|s| s.address != 0x19));
     let seen = std::mem::take(&mut i.host_mut().seen);
-    let bridge_reads: Vec<_> = seen.iter().filter(|s| s.address == 0x19).collect();
-    assert_eq!(bridge_reads.len(), 1);
-    assert_eq!(bridge_reads[0].pci, at(0, 0, 0x1C, 0));
     let last = seen.last().unwrap();
     assert_eq!(
         (last.write, last.address, last.pci),
@@ -1022,4 +1022,38 @@ fn the_pci_walk_follows_devices_not_the_scopes_around_a_region() {
     let before = i.host().seen.len();
     assert_eq!(fails(&mut i, "\\_SB.PCI0.NADR.RD"), ErrorKind::NotFound);
     assert_eq!(i.host().seen.len(), before);
+}
+
+#[test]
+fn protocol_and_pin_fields_past_their_region_are_refused() {
+    // The review of B2, B2-3: an SMBus region's length is its command space (§5.5.2.4.7); a field
+    // whose first byte is past it is refused before anything reaches the host.
+    let mut i = loaded(&[
+        name("CON", buffer(byte(3), &[0x8C, 1, 2])),
+        op_region("SMB", 4, zero(), byte(0x10)),
+        field(
+            "SMB",
+            0x05,
+            &[
+                Fe::Reserved(0x30 * 8),
+                Fe::Access(0x05, 0x08),
+                Fe::Named("CMD", 8),
+            ],
+        ),
+        op_region("GIO", 8, zero(), byte(1)),
+        field(
+            "GIO",
+            BYTE,
+            &[
+                Fe::ConnectName("CON"),
+                Fe::Reserved(16),
+                Fe::Named("PIN", 1),
+            ],
+        ),
+        m("RS", &[ret(nm("CMD"))]),
+        m("RG", &[ret(nm("PIN"))]),
+    ]);
+    assert_eq!(fails(&mut i, "RS"), ErrorKind::Range);
+    assert_eq!(fails(&mut i, "RG"), ErrorKind::Range);
+    assert!(i.host().transfers.is_empty());
 }

@@ -56,6 +56,8 @@ pub(crate) struct TestHost {
     pub(crate) breakpoints: u32,
     pub(crate) debug: Vec<Vec<u8>>,
     pub(crate) tables: Vec<(TableKey, u64, Vec<u8>)>,
+    /// The bridges whose secondary bus was asked for.
+    pub(crate) bridges: Vec<PciAddress>,
     /// The timeouts the Global Lock was asked with (never 0xFFFF: asserted).
     pub(crate) lock_waits: Vec<u16>,
     /// The time left each region access was given (never 0: asserted).
@@ -77,6 +79,7 @@ pub(crate) enum Event {
     Write(u64, u64, Result<(), HostError>),
     /// Address, outcome.
     Transfer(u64, Result<usize, HostError>),
+    BridgeBus(PciAddress, Result<u8, HostError>),
     Limit(crate::Limit),
 }
 
@@ -155,6 +158,19 @@ impl Host for TestHost {
         });
         Ok(())
     }
+    fn bridge_bus(&mut self, b: &crate::BridgeBus) -> Result<u8, HostError> {
+        self.given(b.time_left_100ns);
+        if self.refuse {
+            self.refused += 1;
+            return Err(HostError::Refused);
+        }
+        self.bridges.push(b.bridge);
+        let p = b.bridge;
+        Ok(*self
+            .memory
+            .get(&(2, Some((p.segment, p.bus, p.device, p.function)), 0x19))
+            .unwrap_or(&0))
+    }
     fn transfer(&mut self, a: &BufferAccess<'_>, data: &mut [u8]) -> Result<usize, HostError> {
         self.given(a.time_left_100ns);
         if self.refuse {
@@ -224,6 +240,7 @@ impl Host for TestHost {
             Trace::Read(a, r) => Event::Read(a.address, r),
             Trace::Write(a, v, r) => Event::Write(a.address, v, r),
             Trace::Transfer(a, r) => Event::Transfer(a.address, r),
+            Trace::BridgeBus(b, r) => Event::BridgeBus(b.bridge, r),
             Trace::Limit(l) => Event::Limit(l),
         });
     }

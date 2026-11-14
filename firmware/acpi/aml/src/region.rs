@@ -495,6 +495,11 @@ impl<H: Host> Interpreter<H> {
         write: Option<&[u8]>,
         size: usize,
     ) -> Result<Val> {
+        // The field must start inside its region: for SMBus and GenericSerialBus the region's
+        // length is the command space (§5.5.2.4.7; the review of B2, B2-3).
+        if f.bit_offset / 8 >= r.length {
+            return err(ErrorKind::Range);
+        }
         let own = usize::try_from(f.bit_len.div_ceil(8)).map_err(|_| ErrorKind::Range)?;
         let size = if size == 0 { own } else { size };
         let mut data = mem::zeroed(size, &mut self.budget)?;
@@ -550,6 +555,9 @@ impl<H: Host> Interpreter<H> {
 
     /// One transfer of a field's own bytes (GeneralPurposeIO, PCC).
     fn pins(&mut self, f: &FieldUnit, r: &Region, write: Option<&[u8]>) -> Result<Val> {
+        if f.bit_offset / 8 >= r.length {
+            return err(ErrorKind::Range);
+        }
         let bytes = usize::try_from(f.bit_len.div_ceil(8)).map_err(|_| ErrorKind::Range)?;
         let mut data = mem::zeroed(bytes, &mut self.budget)?;
         if let Some(src) = write {
