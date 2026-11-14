@@ -369,6 +369,8 @@ impl Namespace {
             let seg = path.seg(0)?;
             let mut cur = Some(scope);
             while let Some(s) = cur {
+                // A unit a scope searched, besides its siblings compared.
+                self.note_work(1);
                 if let Some(found) = self.child(s, seg) {
                     return Ok(Some(found));
                 }
@@ -416,6 +418,8 @@ impl Namespace {
         let mut cur = self.node(id)?;
         let mut i = id.index;
         while i != 0 {
+            // A unit a level gone up.
+            self.note_work(1);
             mem::push(out, cur.name, budget)?;
             i = cur.parent;
             cur = self.at(i).ok_or(ErrorKind::Stale)?;
@@ -433,6 +437,7 @@ impl Namespace {
         let mut cur = self.node(id).ok()?;
         let mut i = id.index;
         while i != 0 {
+            self.note_work(1);
             depth = depth.checked_add(1)?;
             i = cur.parent;
             cur = self.at(i)?;

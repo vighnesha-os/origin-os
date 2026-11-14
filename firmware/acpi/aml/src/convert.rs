@@ -278,6 +278,12 @@ impl<H: Host> Interpreter<H> {
         if digits.is_empty() {
             return err(ErrorKind::Type);
         }
+        // Leading zeros keep the loop going for the whole string: a unit for each 64 digits.
+        self.note_work(
+            u64::try_from(digits.len() / 64)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        );
         let mut x: u64 = 0;
         for &c in digits {
             let d = hex_value(c).filter(|&d| d < radix).ok_or(ErrorKind::Type)?;

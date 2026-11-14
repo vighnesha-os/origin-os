@@ -350,6 +350,24 @@ pub(crate) fn plant(f: Option<Fault>) {
     FAULT.with(|c| c.set(f));
 }
 
+/// Runs `f` on a thread of its own and fails if it has not ended within `secs` seconds: for the
+/// tests of inputs that once hung the interpreter, so that a return of the hang fails the test
+/// rather than holding the machine.
+pub(crate) fn ends_within(secs: u64, what: &str, f: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{what}: still running after {secs} s")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("{what}: failed"),
+    }
+}
+
 pub(crate) type Interp = Interpreter<TestHost>;
 
 /// An interpreter with the service's limits, for integers of `width`.

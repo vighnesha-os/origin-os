@@ -16,7 +16,12 @@
 //! (the review of B1, F3). Every evaluation runs under the [`Limits`]: loop iterations, time,
 //! call depth, memory and steps, a step being an opcode or a unit of the work between opcodes
 //! (name comparisons, field-list entries, bytes copied, the collector's slots: the review of B1,
-//! F1). No host call may wait past the time left (see [`Host`]). When a limit is reached the
+//! F1). **Every loop in the library is bounded by the limits** (the audit after N-soak-1, the
+//! soak's hang): it has a bound the code fixes (a constant, the integer width, the call-depth
+//! limit, the field chain's depth); or it walks an input that is counted as it goes, each pass a
+//! step, a unit charged per element, entry, unit, comparison or level, or a unit for each 64
+//! bytes charged before it runs or by the allocation that holds them; or it charges at least one
+//! unit per pass. No host call may wait past the time left (see [`Host`]). When a limit is reached the
 //! evaluation stops, every name it created is removed, and the error says which limit and where.
 //! A table whose load fails is rolled back whole.
 //!

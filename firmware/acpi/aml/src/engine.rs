@@ -612,17 +612,33 @@ impl<H: Host> Interpreter<H> {
     /// Collects if what is held has passed the threshold, and sets the next: when half the room
     /// left after this collection is used, and never before 64 KiB more is, so collections are
     /// spaced, never one a step nor one an evaluation (the review of B1, F1, and of B2, B2-7).
-    /// Returns the work done, a unit for each eight slots read, if it collected.
+    /// Returns the work done if it collected: a unit for each eight slots, each root, and each
+    /// object and package element marking read.
     fn collect_if_due(&mut self) -> Option<u64> {
         if self.budget.used() <= self.gc_threshold {
             return None;
         }
         let slots = u64::try_from(self.heap.slot_count()).unwrap_or(u64::MAX);
+        // Besides the slots, the collector reads every frame, activation and hold as roots, and
+        // the recount that follows every table and creator: a unit each.
+        let roots = [
+            self.frames.len(),
+            self.calls.len(),
+            self.held.len(),
+            self.tables.len(),
+            self.owners.len(),
+        ]
+        .iter()
+        .fold(0u64, |n, &k| {
+            n.saturating_add(u64::try_from(k).unwrap_or(u64::MAX))
+        });
         self.collect_garbage();
         let used = self.budget.used();
         let gap = (self.budget.limit().saturating_sub(used) / 2).max(64 << 10);
         self.gc_threshold = used.saturating_add(gap).min(self.budget.limit());
-        Some(slots / 8)
+        // Marking reads every element of every live package, however few the slots: a unit each.
+        let traced = self.heap.take_traced();
+        Some((slots / 8).saturating_add(roots).saturating_add(traced))
     }
 
     /// Counts `units` of work against the step limit, with the work done since the last count:
@@ -652,6 +668,12 @@ impl<H: Host> Interpreter<H> {
     /// Counts the work done since the last count (see [`Interpreter::charge`]).
     pub(crate) fn charge_pending(&mut self) -> Result<()> {
         self.charge(0)
+    }
+
+    /// Notes `n` units of work done where nothing can be charged at once (a `&self` method, or
+    /// a loop that must finish what it started): the next [`Interpreter::charge`] counts them.
+    pub(crate) fn note_work(&self, n: u64) {
+        self.ns.note_work(n);
     }
 
     pub(crate) fn check_time(&mut self) -> Result<()> {
@@ -1067,6 +1089,13 @@ impl<H: Host> Interpreter<H> {
             // until the reading session answers).
             (len, rest.iter().take(len).any(|&c| c > 0x7F))
         };
+        // The scan for the NUL read `len` bytes: work, counted a unit for each 64 and one more,
+        // whether or not the string is kept.
+        self.note_work(
+            u64::try_from(len / 64)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        );
         if bad {
             return err(ErrorKind::Grammar);
         }

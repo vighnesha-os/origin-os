@@ -266,7 +266,10 @@ impl<H: Host> Interpreter<H> {
         };
         match v {
             Val::Obj(r) => match self.heap.get(r) {
-                Ok(Object::Package(e)) => e.iter().any(|&x| one(x)),
+                Ok(Object::Package(e)) => {
+                    self.note_work(u64::try_from(e.len()).unwrap_or(u64::MAX));
+                    e.iter().any(|&x| one(x))
+                }
                 _ => one(v),
             },
             _ => one(v),

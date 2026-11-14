@@ -333,6 +333,9 @@ pub(crate) struct Heap {
     /// The collector's mark stack: its capacity is kept at least the number of slots.
     stack: Vec<u32>,
     live: usize,
+    /// What the last trace visited: each object taken from the stack, and each element of each
+    /// package read. Work, which the engine counts (the audit after N-soak-1).
+    traced: u64,
 }
 
 impl core::fmt::Debug for Heap {
@@ -355,6 +358,7 @@ impl Heap {
             free: NONE,
             stack: Vec::new(),
             live: 0,
+            traced: 0,
         }
     }
 
@@ -492,6 +496,11 @@ impl Heap {
     }
 
     /// Marks everything reachable from the marked roots. `false`: abandon the collection.
+    /// What the traces since the last call visited.
+    pub(crate) fn take_traced(&mut self) -> u64 {
+        core::mem::take(&mut self.traced)
+    }
+
     pub(crate) fn trace(&mut self, budget: &mut Budget) -> bool {
         enum Out {
             Elements(usize),
@@ -499,6 +508,7 @@ impl Heap {
             Nothing,
         }
         while let Some(i) = self.stack.pop() {
+            self.traced = self.traced.saturating_add(1);
             let out = match self.slots.get(index(i)).map(|s| &s.obj) {
                 Some(Object::Package(elems)) => Out::Elements(elems.len()),
                 Some(Object::Reference(t)) => Out::One(Val::Ref(*t)),
@@ -513,6 +523,9 @@ impl Heap {
             let ok = match out {
                 Out::Elements(n) => {
                     let mut ok = true;
+                    self.traced = self
+                        .traced
+                        .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
                     for k in 0..n {
                         let e = match self.slots.get(index(i)).map(|s| &s.obj) {
                             Some(Object::Package(v)) => v.get(k).copied().unwrap_or(Val::None),

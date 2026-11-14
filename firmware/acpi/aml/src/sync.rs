@@ -44,7 +44,14 @@ const LONGEST: u64 = 0xFFFE;
 impl<H: Host> Interpreter<H> {
     /// The current sync level: the highest held.
     fn sync_level(&self) -> u8 {
+        self.note_held_scan();
         self.held.iter().map(|h| h.sync).max().unwrap_or(0)
+    }
+
+    /// A scan of the held list: a unit of work an entry, so that no number of holds makes a
+    /// return or an acquisition free (the audit of the loops, after N-soak-1).
+    fn note_held_scan(&self) {
+        self.note_work(u64::try_from(self.held.len()).unwrap_or(u64::MAX));
     }
 
     /// A serialized method's implicit mutex, taken at its sync level.
@@ -95,6 +102,7 @@ impl<H: Host> Interpreter<H> {
     /// A serialized method returns: its implicit mutex goes.
     pub(crate) fn drop_implicit(&mut self, call: u64) {
         // One entry per activation: `retain` removes it without a panicking index.
+        self.note_held_scan();
         self.held.retain(|h| !(h.mutex.is_none() && h.call == call));
     }
 
@@ -189,6 +197,7 @@ impl<H: Host> Interpreter<H> {
         }
         // A mutex has one entry, its first acquisition: `retain` removes it without a panicking
         // index.
+        self.note_held_scan();
         self.held.retain(|h| h.mutex != Some(r));
         if m.global {
             self.give_global()?;

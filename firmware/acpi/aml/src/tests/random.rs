@@ -18,7 +18,7 @@
 //! the first seed, for longer soaks; `ORIGIN_AML_STATS` prints what each kind did.
 
 use super::encode::*;
-use super::{Fault, TestHost, interp_with, plant};
+use super::{Fault, TestHost, ends_within, interp_with, plant};
 use crate::object::Object;
 use crate::{DefinitionBlock, ErrorKind, IntegerWidth, Interpreter, Limit, Limits, Node, Value};
 
@@ -1010,24 +1010,6 @@ fn planted_faults_are_caught() {
             message.as_deref().is_some_and(|m| m.contains(by)),
             "{f:?} planted: expected a failure naming {by:?}, got {message:?}"
         );
-    }
-}
-
-/// Runs `f` on a thread of its own and fails if it has not ended within `secs` seconds: for the
-/// tests of inputs that once hung the interpreter, so that a return of the hang fails the test
-/// rather than holding the machine.
-fn ends_within(secs: u64, what: &str, f: impl FnOnce() + Send + 'static) {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        f();
-        let _ = tx.send(());
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
-        Ok(()) => {}
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            panic!("{what}: still running after {secs} s")
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("{what}: failed"),
     }
 }
 

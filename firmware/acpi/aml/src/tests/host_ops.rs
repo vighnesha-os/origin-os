@@ -1350,3 +1350,127 @@ fn divide_finds_both_targets_functions_before_its_first_store() {
         .collect();
     assert_eq!(writes, [(1, 0x80, 1), (2, 0, 3)]);
 }
+
+// --- Fields of no bits and buffers of no bytes, every way (N-soak-1, the audit of the loops) ----
+
+#[test]
+fn fields_of_no_bits_and_buffers_of_no_bytes_end_however_they_are_used() {
+    // After N-soak-1: a field of no bits, in each kind of field and space, and a buffer of no
+    // bytes, used in each way the grammar allows, must end within the limits: each method on a
+    // thread of its own, failing if it has not ended in 10 s.
+    let fields = vec![
+        op_region("IO", 1, word(0x80), byte(8)),
+        field(
+            "IO",
+            BYTE,
+            &[
+                Fe::Named("ZW", 0),
+                Fe::Named("IDX", 8),
+                Fe::Named("DAT", 8),
+                Fe::Named("BNK", 8),
+            ],
+        ),
+        field("IO", BYTE | 0x10, &[Fe::Named("ZL", 0)]),
+        index_field(
+            "IDX",
+            "DAT",
+            BYTE,
+            &[Fe::Named("ZI", 0), Fe::Named("I1", 8)],
+        ),
+        bank_field("IO", "BNK", byte(1), BYTE, &[Fe::Named("ZK", 0)]),
+        name("CON", buffer(byte(3), &[0x8C, 1, 2])),
+        op_region("SMB", 4, zero(), byte(0x10)),
+        field("SMB", 0x05, &[Fe::Access(0x05, 0x08), Fe::Named("ZS", 0)]),
+        op_region("GIO", 8, zero(), byte(4)),
+        field("GIO", BYTE, &[Fe::ConnectName("CON"), Fe::Named("ZG", 0)]),
+        name("E", buffer(zero(), &[])),
+    ];
+    let big = || buffer(byte(64), &[1, 2, 3]);
+    let mut methods: Vec<(&str, Vec<B>)> = vec![];
+    for f in ["ZW", "ZL", "ZI", "ZK", "ZS", "ZG"] {
+        methods.extend([
+            ("RD", vec![ret(nm(f))]),
+            ("SI", vec![store(word(0x1234), nm(f))]),
+            ("SB", vec![store(big(), nm(f))]),
+            ("SS", vec![store(string("abcdefgh"), nm(f))]),
+            ("SE", vec![store(buffer(zero(), &[]), nm(f))]),
+            ("SP", vec![store(package(1, &[one()]), nm(f))]),
+            ("CI", vec![copy_object(one(), nm(f))]),
+            ("CB", vec![copy_object(big(), nm(f))]),
+            ("IN", vec![increment(nm(f)), decrement(nm(f))]),
+            ("AD", vec![add(one(), byte(2), nm(f))]),
+            ("DV", vec![divide(byte(7), byte(2), nm(f), nm(f))]),
+            ("CT", vec![concat(string("ab"), string("cd"), nm(f))]),
+            ("TH", vec![un(0x98, nm(f), nm(f))]),
+            ("MD", vec![ret(mid(nm(f), zero(), byte(4), none()))]),
+            (
+                "RF",
+                vec![store(ref_of(nm(f)), local(0)), ret(deref_of(local(0)))],
+            ),
+            ("CR", vec![ret(cond_ref_of(nm(f), local(0)))]),
+            ("SZ", vec![ret(size_of(nm(f)))]),
+            ("OT", vec![ret(object_type(nm(f)))]),
+            ("IX", vec![ret(index(nm(f), zero(), none()))]),
+            ("CF", vec![create_byte_field(nm(f), zero(), "X")]),
+            (
+                "WL",
+                vec![
+                    store(zero(), local(0)),
+                    while_(
+                        logic(0x95, increment(local(0)), byte(200)),
+                        &[store(big(), nm(f)), store(string("abc"), nm(f))],
+                    ),
+                ],
+            ),
+            ("PK", vec![ret(package(1, &[nm(f)]))]),
+            ("NT", vec![notify(nm(f), zero())]),
+        ]);
+    }
+    // A buffer of no bytes, every way a buffer field can be made over it, and as an operand.
+    methods.extend([
+        ("F0", vec![create_field(big(), zero(), zero(), "X")]),
+        ("F1", vec![create_field(nm("E"), zero(), zero(), "X")]),
+        ("F2", vec![create_bit_field(nm("E"), zero(), "X")]),
+        ("F3", vec![create_byte_field(nm("E"), zero(), "X")]),
+        ("F4", vec![create_word_field(nm("E"), zero(), "X")]),
+        ("F5", vec![create_dword_field(nm("E"), zero(), "X")]),
+        ("F6", vec![create_qword_field(nm("E"), zero(), "X")]),
+        ("E1", vec![ret(concat(nm("E"), nm("E"), none()))]),
+        ("E2", vec![ret(mid(nm("E"), zero(), byte(10), none()))]),
+        ("E3", vec![ret(un(0x98, nm("E"), none()))]),
+        ("E4", vec![ret(index(nm("E"), zero(), none()))]),
+        ("E5", vec![ret(size_of(nm("E")))]),
+        ("E6", vec![store(nm("E"), nm("E")), ret(nm("E"))]),
+    ]);
+    let limits = Limits {
+        loop_iterations: 2_000,
+        steps: 20_000,
+        ..Limits::BOOT_PROOF
+    };
+    let mut outcomes = std::collections::BTreeMap::new();
+    for (k, (what, body)) in methods.into_iter().enumerate() {
+        let mut block = fields.clone();
+        block.push(method("M0", 0, &body));
+        let (tx, rx) = std::sync::mpsc::channel();
+        super::ends_within(10, &format!("case {k} ({what})"), move || {
+            let mut i = super::interp_with(IntegerWidth::Bits64, limits);
+            load(&mut i, &block).expect("the block loads");
+            let r = i.evaluate("M0", &[]);
+            // The charge that passes the limit is counted whole before it is refused: a count
+            // past the limit is always the step limit's end.
+            if i.run.steps > limits.steps {
+                assert!(
+                    matches!(&r, Err(e) if e.kind == ErrorKind::Limit(Limit::Steps)),
+                    "case {k}: {} steps and {r:?}",
+                    i.run.steps
+                );
+            }
+            let _ = tx.send(match r {
+                Ok(_) => "Ok".to_string(),
+                Err(e) => format!("{:?}", e.kind),
+            });
+        });
+        *outcomes.entry(rx.recv().unwrap()).or_insert(0) += 1;
+    }
+    eprintln!("fields of no bits, buffers of no bytes: {outcomes:?}");
+}
