@@ -1003,10 +1003,10 @@ const CONTROLS: &[Control] = &[
         name: "slot_taken_while_it_is_reclaimed",
         file: SLOTS,
         from: "                let from = table.first_free;
-                let slot = (from..N).find(|&s| table.state(s) == Some(State::Free))?;
+                let slot = (from..table.len()).find(|&s| table.state(s) == Some(State::Free))?;
 ",
         to: "                let from = 0;
-                let slot = (from..N)
+                let slot = (from..table.len())
                     .find(|&s| matches!(table.state(s), Some(State::Free | State::Reclaiming)))?;
 ",
         models: &[("slots_reclaimed_slot_is_taken_only_after_its_shootdown", STALE)],
