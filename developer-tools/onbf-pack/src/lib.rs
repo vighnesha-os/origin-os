@@ -9,6 +9,8 @@
 //!   outside it (§6.1.2 hard errors, ONBF-R11).
 //! - [`carried`] lays a ring-3 program out for the kernel's launch path, as Rust the kernel
 //!   compiles in (task S4-1; the note to ONBF §8.3).
+//! - [`corelib`] lays `origin.core` out for the kernel the same way, and refuses an image that
+//!   is anything but the generated system-call stubs (task S4-2; ADR-0011 L2 to L7).
 //! - [`relr`] encodes and decodes RELR relocations (§6.1).
 //! - [`ocbor`] writes canonical OCBOR-1 (§5).
 //! - [`krn`] builds the sections, lays out the container (errata C1–C4, C7, C10, C12,
@@ -35,6 +37,7 @@
 
 pub mod carried;
 mod container;
+pub mod corelib;
 pub mod elf;
 pub mod krn;
 pub mod ocbor;

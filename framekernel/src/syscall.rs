@@ -19,8 +19,22 @@
 //!   check and its use.
 //! - A call that would fail leaves the process and its objects as they were. Pointers are
 //!   checked before anything is consumed, so a bad out pointer does not lose a message.
-//! - Only a call from the process's system-call code range is accepted (P4, ONBF §6.1,
-//!   "syscall-origin pinning"). Until `origin.core` exists the creator names that range.
+//! - A call is accepted only from where its process may make it (P4, ONBF §6.1, "syscall-origin
+//!   pinning"), which is fixed when the process is made (ADR-0011 Amendment 2, L8):
+//!   - **A process pinned per call** (ADR-0005 B2), which is every process
+//!     `launch::load_program` makes for a program: each call number only from the address of that number's own
+//!     `syscall` instruction in `origin.core`. The check is `rip − 2 == base + offset(number)`:
+//!     the base is where `origin.core` was mapped into the process, recorded then, and the
+//!     offsets are the linked image's, read from it by the build (L7). It is the generated
+//!     `pinned`, a `match` on the number whose arms compare, like the dispatcher's, with no
+//!     table indexed by the number or by the address (ADR-0017 Z9, Z10); the return address is
+//!     compared and never dereferenced. The decision is `pin::judge`, host-tested, called
+//!     through `pin_verdict`, which the image gate reads as compiled. A call that fails it, a number no stub has among them,
+//!     gets no status: the thread stops as a faulting thread does, and its ending records the
+//!     number and the address (Amendment 8, G1). No correct program can make such a call: only
+//!     code outside `origin.core`, or a jump into a stub past the load of its number, can.
+//!   - **One of the kernel's own proof processes**: any `syscall` inside the range its creator
+//!     named (A6), and `access_denied` from outside it.
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
@@ -43,6 +57,7 @@ use crate::console::Console;
 use crate::event::{self, Event};
 use crate::mapping::Request;
 use crate::memory_object::{self, MemoryObject};
+use crate::pin::{self, CallOrigin, Verdict};
 use crate::process::{Account, Ending, UserContext};
 use crate::{cpu, ipc, port, sched, time};
 use origin_frame::objref::ObjectRef;
@@ -64,8 +79,10 @@ pub(crate) fn run(call: u64, args: [u64; 6], rip: u64) -> SyscallOutcome {
         // thread is the only safe thing: it can do nothing without one.
         return SyscallOutcome::ThreadExit;
     };
-    if !caller.process.may_call_from(rip) {
-        return SyscallOutcome::Status(oidl::Error::AccessDenied.raw());
+    match pin_verdict(caller.process.call_origin(), call, rip) {
+        Verdict::Accept => {}
+        Verdict::Deny => return SyscallOutcome::Status(oidl::Error::AccessDenied.raw()),
+        Verdict::Stop { address } => return refused(&caller, call, address),
     }
     cpu::enable_interrupts();
     let outcome = match server::dispatch(&*caller, call, args) {
@@ -79,6 +96,31 @@ pub(crate) fn run(call: u64, args: [u64; 6], rip: u64) -> SyscallOutcome {
     sched::reap();
     cpu::disable_interrupts();
     outcome
+}
+
+/// The pin's decision for this kernel's own `origin.core`: [`pin::judge`] with the offsets the
+/// kernel carries. Never inlined, so that the pin is one function of its own in the image, which
+/// `cargo xtask check`'s image gate reads: each offset the immediate of a comparison there, no
+/// indirect jump, no memory operand indexed by a register (the independent review of
+/// 2026-11-13, finding K4). The cost is one direct call and its return a system call.
+#[inline(never)]
+fn pin_verdict(origin: CallOrigin, number: u64, rip: u64) -> Verdict {
+    pin::judge(origin, &crate::core_image::image().pins, number, rip)
+}
+
+/// The per-call pin refused call `number`, made by the `syscall` instruction at `address`
+/// (ADR-0005 Amendment 8, G1): the calling thread ends as a faulting thread does, with that
+/// record, and nothing is returned to it. Interrupts are off on entry and on return, and on
+/// while its handles close, as for an exit.
+fn refused(caller: &UserContext, number: u64, address: u64) -> SyscallOutcome {
+    cpu::enable_interrupts();
+    caller
+        .process
+        .thread_ended(&caller.thread, Ending::Refused { number, address });
+    ipc::reap_closed();
+    sched::reap();
+    cpu::disable_interrupts();
+    SyscallOutcome::ThreadExit
 }
 
 /// A user fault ended the calling thread. Called with interrupts off, on a stack the fault

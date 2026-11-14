@@ -59,6 +59,16 @@ pub enum RegionKind {
     /// Memory that can be removed while the machine runs (UEFI 2.11
     /// `EFI_MEMORY_HOT_PLUGGABLE`): not used until the kernel can move its contents off it.
     HotPluggable = 15,
+    /// Unaccepted memory (UEFI type 15, `EfiUnacceptedMemoryType`; since 0.7): RAM the kernel
+    /// does not use until it can accept it. It counts as RAM where a device's BAR is checked,
+    /// and it is not firmware data (ADR-0002 B4; decision item 293).
+    Unaccepted = 16,
+    /// Firmware memory of a type the kernel never uses (since 0.7): UEFI type 13 (`EfiPalCode`),
+    /// the OEM types, the OS types other than Origin's own, and any type the loader does not
+    /// know. Treated as [`RegionKind::Reserved`] where BARs and firmware tables are checked, but
+    /// never accepted under an RMRR or an IVMD, which only type 0 and runtime memory may be
+    /// (ADR-0007 Amendment 1, R3; decision item 293).
+    FirmwareOther = 17,
 }
 
 impl RegionKind {
@@ -80,6 +90,8 @@ impl RegionKind {
             13 => Self::Persistent,
             14 => Self::SpecificPurpose,
             15 => Self::HotPluggable,
+            16 => Self::Unaccepted,
+            17 => Self::FirmwareOther,
             _ => return None,
         })
     }
@@ -255,8 +267,9 @@ impl Framebuffer {
 }
 
 /// Whether `[base, base + bytes)` touches a region that holds memory rather than device
-/// space: everything except [`RegionKind::Mmio`], [`RegionKind::Reserved`] and unknown kinds,
-/// which the contract treats as reserved. Firmware says nothing it hands the kernel about a
+/// space: everything except [`RegionKind::Mmio`], [`RegionKind::Reserved`],
+/// [`RegionKind::FirmwareOther`] and unknown kinds, which the contract treats as reserved.
+/// [`RegionKind::Unaccepted`] is RAM. Firmware says nothing it hands the kernel about a
 /// device, such as a framebuffer or a UART, may be drawn on or written to if this is true.
 pub fn overlaps_ram(regions: &[MemoryRegion], base: u64, bytes: u64) -> bool {
     let end = base.saturating_add(bytes);
@@ -264,7 +277,7 @@ pub fn overlaps_ram(regions: &[MemoryRegion], base: u64, bytes: u64) -> bool {
         let region_end = r.base.saturating_add(r.pages.saturating_mul(4096));
         let device = matches!(
             RegionKind::from_raw(r.kind),
-            None | Some(RegionKind::Reserved | RegionKind::Mmio)
+            None | Some(RegionKind::Reserved | RegionKind::Mmio | RegionKind::FirmwareOther)
         );
         !device && r.pages != 0 && r.base < end && base < region_end
     })
@@ -614,18 +627,45 @@ mod tests {
 
     #[test]
     fn region_kinds_round_trip() {
-        for raw in 1..=15 {
+        for raw in 1..=17 {
             assert_eq!(RegionKind::from_raw(raw).map(|k| k as u32), Some(raw));
         }
         assert_eq!(RegionKind::from_raw(14), Some(RegionKind::SpecificPurpose));
         assert_eq!(RegionKind::from_raw(15), Some(RegionKind::HotPluggable));
+        assert_eq!(RegionKind::from_raw(16), Some(RegionKind::Unaccepted));
+        assert_eq!(RegionKind::from_raw(17), Some(RegionKind::FirmwareOther));
         assert_eq!(RegionKind::from_raw(0), None);
-        assert_eq!(RegionKind::from_raw(16), None);
+        assert_eq!(RegionKind::from_raw(18), None);
+    }
+
+    /// Boot info 0.7 (decision item 293): firmware memory of another type is device space for
+    /// a BAR, as `Reserved` is; unaccepted memory is RAM.
+    #[test]
+    fn firmware_other_is_device_space_and_unaccepted_memory_is_ram() {
+        let one = |kind| {
+            [MemoryRegion {
+                base: 0x8000_0000,
+                pages: 0x10,
+                kind: kind as u32,
+                reserved: 0,
+            }]
+        };
+        assert!(!overlaps_ram(
+            &one(RegionKind::FirmwareOther),
+            0x8000_0000,
+            4096
+        ));
+        assert!(!overlaps_ram(&one(RegionKind::Reserved), 0x8000_0000, 4096));
+        assert!(overlaps_ram(
+            &one(RegionKind::Unaccepted),
+            0x8000_0000,
+            4096
+        ));
     }
 
     #[test]
     fn version_comes_from_origin_version_toml() {
-        assert_eq!(VERSION, (0, 6));
+        assert_eq!(VERSION, (0, 7));
     }
 
     #[test]

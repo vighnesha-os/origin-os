@@ -607,6 +607,12 @@ impl MemoryRange {
         self.flags & 8 != 0
     }
 
+    /// Whether the range must never be mapped (IR and IW clear, not an exclusion range, with
+    /// or without Unity: R4, and the review's I2).
+    pub fn never_mapped(&self) -> bool {
+        !self.read() && !self.write() && !self.exclusion()
+    }
+
     /// Whether the range applies to DeviceID `id` of `segment`.
     pub fn covers(&self, segment: u16, id: u16) -> bool {
         match self.kind {
@@ -743,6 +749,30 @@ impl<'a> Ivrs<'a> {
         self.blocks().filter_map(|b| match b {
             Block::Memory(m) => Some(m),
             _ => None,
+        })
+    }
+
+    /// The memory ranges that apply to a device of `segment` whose own DeviceID is `id` and
+    /// whose requests carry `requester` (its alias, or `id` itself), on the IOMMU whose
+    /// registers are at `unit_base` (ADR-0007 Amendment 1, R5, and Amendment 2, R6). An IVMD
+    /// for every peripheral (20h) that gives an identity map applies to the devices of the
+    /// IOMMU described just before it (48882 §5.2.2); one that keeps its range out of every
+    /// device's address space (IR and IW clear, no exclusion) applies to every device in the
+    /// system, on every IOMMU (§5.2.2.2; decision item 291). One for a DeviceID (21h) or a range
+    /// (22h) applies by its own segment and DeviceID, whichever IOMMU translates the device, and
+    /// whether it names the device's own DeviceID or the one its requests carry.
+    pub fn memory_for(
+        &self,
+        unit_base: u64,
+        segment: u16,
+        id: u16,
+        requester: u16,
+    ) -> impl Iterator<Item = MemoryRange> + 'a {
+        self.memory().filter(move |m| match m.kind {
+            kind::IVMD_ALL => {
+                m.never_mapped() || (m.unit_base == unit_base && m.unit_segment == segment)
+            }
+            _ => m.covers(segment, id) || m.covers(segment, requester),
         })
     }
 
@@ -955,7 +985,6 @@ fn check_entries(b: &[u8], from: usize, offset: usize, kind: u8) -> Result<bool,
 /// Checks the IVMD `b` of type `kind` at table offset `offset`.
 fn check_memory(b: &[u8], kind: u8, offset: usize) -> Result<(), IvrsError> {
     let bad = IvrsError::Memory(offset);
-    let flags = *b.get(1).ok_or(bad)?;
     let start = u64_at(b, 16).ok_or(bad)?;
     let length = u64_at(b, 24).ok_or(bad)?;
     if start.checked_add(length).is_none() {
@@ -964,10 +993,10 @@ fn check_memory(b: &[u8], kind: u8, offset: usize) -> Result<(), IvrsError> {
     if kind == kind::IVMD_RANGE && u16_at(b, 6).ok_or(bad)? < u16_at(b, 4).ok_or(bad)? {
         return Err(bad);
     }
-    // Unity without read or write access (outside an exclusion range) maps nothing.
-    if flags & 0b1111 == 0b0001 {
-        return Err(bad);
-    }
+    // Unity without read or write access (outside an exclusion range) is accepted: Table 113
+    // asks firmware for Unity clear there, and R4 reads "IR and IW both clear" as a range never
+    // mapped, whatever Unity says (`reserved::from_ivmd`; TASKS item 40's review, I2), rather
+    // than as a reason to withhold every driver.
     Ok(())
 }
 
@@ -1284,6 +1313,110 @@ mod tests {
         )
     }
 
+    /// Two IOMMUs in one segment, with IVMDs placed after the second (R5): a 21h naming a
+    /// device of the first still applies to it; the second's "all" range does not.
+    #[test]
+    fn a_device_range_applies_wherever_it_sits() {
+        let a = ivhd(
+            kind::IVHD,
+            0,
+            device_id(0, 0, 2),
+            0x40,
+            0xFEB8_0000,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &[e4(entry::SELECT, device_id(0, 3, 0), 0)],
+        );
+        let b = ivhd(
+            kind::IVHD,
+            0,
+            device_id(0x80, 0, 2),
+            0x40,
+            0xFEC0_0000,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &[e4(entry::SELECT, device_id(0x80, 1, 0), 0)],
+        );
+        let nvme = device_id(0, 3, 0);
+        let mine = ivmd(kind::IVMD_DEVICE, 0b0111, nvme, 0, 0, 0x7D00_0000, 0x1000);
+        let all_b = ivmd(kind::IVMD_ALL, 0b0011, 0, 0, 0, 0x7E00_0000, 0x1000);
+        let t = table(1, info::EFR_SUPPORTED, &[a, b, mine, all_b]);
+        let r = parse(&t).unwrap();
+        let (unit, c) = r.unit_for(0, nvme).unwrap();
+        assert_eq!(unit.base, 0xFEB8_0000);
+        let starts: Vec<u64> = r
+            .memory_for(unit.base, 0, nvme, c.requester)
+            .map(|m| m.start)
+            .collect();
+        assert_eq!(starts, alloc::vec![0x7D00_0000]);
+        let other = device_id(0x80, 1, 0);
+        let starts: Vec<u64> = r
+            .memory_for(0xFEC0_0000, 0, other, other)
+            .map(|m| m.start)
+            .collect();
+        assert_eq!(starts, alloc::vec![0x7E00_0000]);
+    }
+
+    #[test]
+    fn a_never_map_range_for_every_peripheral_applies_on_every_iommu() {
+        let unit = |base, bus, dev| {
+            ivhd(
+                kind::IVHD,
+                0,
+                device_id(bus, 0, 2),
+                0x40,
+                base,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &[e4(entry::SELECT, device_id(bus, dev, 0), 0)],
+            )
+        };
+        let (a, b) = (unit(0xFEB8_0000, 0, 3), unit(0xFEC0_0000, 0x80, 1));
+        // After A: an identity 20h (R5: A's devices only) and a never-map 20h (R6: everyone's),
+        // with Unity set as well as without it.
+        let identity = ivmd(kind::IVMD_ALL, 0b0011, 0, 0, 0, 0x7E00_0000, 0x1000);
+        let never = ivmd(kind::IVMD_ALL, 0b0000, 0, 0, 0, 0x7F00_0000, 0x1000);
+        let never_unity = ivmd(kind::IVMD_ALL, 0b0001, 0, 0, 0, 0x7F10_0000, 0x1000);
+        // An exclusion range with IR = IW = 0 is an identity map (R4), so it keeps R5.
+        let exclusion = ivmd(kind::IVMD_ALL, 0b1000, 0, 0, 0, 0x7F20_0000, 0x1000);
+        let t = table(
+            1,
+            info::EFR_SUPPORTED,
+            &[a, identity, never, never_unity, exclusion, b],
+        );
+        let r = parse(&t).unwrap();
+        let on_a = device_id(0, 3, 0);
+        let starts: Vec<u64> = r
+            .memory_for(0xFEB8_0000, 0, on_a, on_a)
+            .map(|m| m.start)
+            .collect();
+        assert_eq!(
+            starts,
+            alloc::vec![0x7E00_0000, 0x7F00_0000, 0x7F10_0000, 0x7F20_0000]
+        );
+        let on_b = device_id(0x80, 1, 0);
+        let starts: Vec<u64> = r
+            .memory_for(0xFEC0_0000, 0, on_b, on_b)
+            .map(|m| m.start)
+            .collect();
+        assert_eq!(starts, alloc::vec![0x7F00_0000, 0x7F10_0000]);
+        // And on an IOMMU of another segment too: "every device, on every IOMMU".
+        let starts: Vec<u64> = r
+            .memory_for(0xFED0_0000, 1, on_b, on_b)
+            .map(|m| m.start)
+            .collect();
+        assert_eq!(starts, alloc::vec![0x7F00_0000, 0x7F10_0000]);
+    }
+
     #[test]
     fn every_block_and_entry_type() {
         let t = platform();
@@ -1417,6 +1550,33 @@ mod tests {
         assert_eq!(m[2].unit_base, 0xFEC0_4000);
         assert!(m[2].covers(1, device_id(1, 0, 1)) && !m[2].covers(1, device_id(1, 0, 2)));
         assert!(!m[2].covers(0, device_id(1, 0, 0)));
+        // Which ranges apply to a device (R5): the "all" range of the IOMMU before it, and
+        // the ranges naming it or its alias, wherever they sit.
+        let starts = |unit, segment, id, requester| {
+            r.memory_for(unit, segment, id, requester)
+                .map(|m| m.start)
+                .collect::<Vec<_>>()
+        };
+        let usb = device_id(0, 0x13, 0);
+        assert_eq!(
+            starts(0xFEB8_0000, 0, usb, usb),
+            alloc::vec![0x7A00_0000, 0x7B00_0000]
+        );
+        let other = device_id(0, 0x13, 1);
+        assert_eq!(
+            starts(0xFEB8_0000, 0, other, other),
+            alloc::vec![0x7A00_0000]
+        );
+        // On IOMMU B the "all" range of A does not apply; the 22h range does, and an alias
+        // that the range names brings a device into it.
+        let gpu = device_id(1, 0, 1);
+        assert_eq!(starts(0xFEC0_4000, 1, gpu, gpu), alloc::vec![0x7C00_0000]);
+        let behind = device_id(1, 0, 4);
+        assert_eq!(starts(0xFEC0_4000, 1, behind, behind), alloc::vec![]);
+        assert_eq!(
+            starts(0xFEC0_4000, 1, behind, gpu),
+            alloc::vec![0x7C00_0000]
+        );
         assert_eq!(bdf(device_id(0x12, 0x1F, 7)), (0x12, 0x1F, 7));
     }
 
@@ -1675,7 +1835,6 @@ mod tests {
         let bad_ranges = [
             ok(kind::IVMD_ALL, 0b110, 0, 0, u64::MAX - 0xFFF, 0x2000),
             ok(kind::IVMD_RANGE, 0b110, 0x20, 0x1F, 0x1000, 0x1000),
-            ok(kind::IVMD_DEVICE, 0b001, 0x20, 0, 0x1000, 0x1000),
         ];
         for m in bad_ranges {
             let t = table(1, 0, &[first.clone(), m.clone()]);
@@ -1688,6 +1847,18 @@ mod tests {
                 &[
                     first.clone(),
                     ok(kind::IVMD_DEVICE, 0b1001, 0x20, 0, 0x1000, 0x1000)
+                ]
+            ))
+            .is_ok()
+        );
+        // Unity with IR = IW = 0: accepted here, and never mapped (review I2).
+        assert!(
+            parse(&table(
+                1,
+                0,
+                &[
+                    first.clone(),
+                    ok(kind::IVMD_DEVICE, 0b0001, 0x20, 0, 0x1000, 0x1000)
                 ]
             ))
             .is_ok()
@@ -1815,10 +1986,20 @@ mod tests {
                     m.kind != kind::IVMD_RANGE || m.device_id <= m.last_device_id,
                     "case {case}"
                 );
-                assert!(
-                    !(m.unity() && !m.read() && !m.write() && !m.exclusion()),
-                    "case {case}"
-                );
+                // Unity with IR = IW = 0 is accepted (review I2): `reserved::from_ivmd`
+                // makes it a range never mapped.
+                if m.unity() && !m.read() && !m.write() && !m.exclusion() {
+                    assert!(
+                        !matches!(
+                            crate::reserved::from_ivmd(&m),
+                            Ok(Some(crate::reserved::Reserved {
+                                use_: crate::reserved::Use::Identity(_),
+                                ..
+                            }))
+                        ),
+                        "case {case}"
+                    );
+                }
             }
             for id in [0u16, 0x10, 0xA0, 0x0100, 0x0213, 0x0507, 0xFFFF] {
                 let _ = r.unit_for(0, id);

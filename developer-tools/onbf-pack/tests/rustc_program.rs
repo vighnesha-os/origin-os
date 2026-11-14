@@ -75,11 +75,16 @@ fn pinned_rustc() -> PathBuf {
 
 /// Compiles [`PROGRAM`] with the userspace flags and `extra` and returns its ELF.
 fn compile(name: &str, extra: &[&str]) -> Vec<u8> {
+    compile_source(name, PROGRAM, extra)
+}
+
+/// Compiles `program` with the userspace flags and `extra` and returns its ELF.
+fn compile_source(name: &str, program: &str, extra: &[&str]) -> Vec<u8> {
     let dir = std::env::temp_dir().join(format!("onbf-pack-program-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let source = dir.join("program.rs");
-    fs::write(&source, PROGRAM).unwrap();
+    fs::write(&source, program).unwrap();
     let output = dir.join("program.elf");
     let mut cmd = Command::new(pinned_rustc());
     cmd.current_dir(&dir)
@@ -162,5 +167,24 @@ fn a_program_linked_with_a_writable_code_segment_is_refused() {
     assert_eq!(
         describe(&elf),
         Err(CarriedError::Elf(ElfError::WriteAndExecute { header: 0 }))
+    );
+}
+
+/// The userspace flags name no entry (task S4-2: they reach `origin.core` too, which has none),
+/// so a program's entry is the linker's default, `_start`. A program with no `_start` is linked
+/// all the same, with a warning and an entry of 0, and the description refuses it: the kernel
+/// never carries a program it could only start at address 0 (the review of 2026-11-13,
+/// finding F6 e).
+#[test]
+fn a_program_with_no_start_is_refused() {
+    let nameless = PROGRAM.replace(
+        "pub extern \"C\" fn _start()",
+        "pub extern \"C\" fn begin()",
+    );
+    assert_ne!(nameless, PROGRAM);
+    let elf = compile_source("nostart", &nameless, &[]);
+    assert_eq!(
+        describe(&elf).map(|_| ()),
+        Err(CarriedError::Elf(ElfError::EntryNotExecutable(0)))
     );
 }

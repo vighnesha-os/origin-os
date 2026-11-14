@@ -96,6 +96,8 @@ const CREATOR: Limits = Limits {
     debug_calls: false,
     memory: MemoryLimits::NONE,
     objects: ObjectLimits::NONE,
+    // It never runs (ADR-0005 G5, G6).
+    threads: 0,
 };
 
 /// What one launch showed.
@@ -287,7 +289,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     let before = memory::stats();
     let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let ok = {
-        let Some(creator) = Process::new(CREATOR, (0, 0), BOOT_PROOF_PRINCIPAL) else {
+        let Some(creator) = Process::proof(CREATOR, (0, 0), BOOT_PROOF_PRINCIPAL) else {
             return false;
         };
         // Refused before anything is made, and refused part-way through mapping: each takes

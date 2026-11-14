@@ -30,6 +30,8 @@
 //! - [`blockcache`]: the block cache's LRU index and write-back bookkeeping;
 //! - [`cache`]: the CPU cache hierarchy from CPUID leaf 04h;
 //! - [`channel`]: one channel's queues, limits and signals (ADR-0005 P8);
+//! - [`core_image`]: `origin.core` as the build laid it out, and the check the kernel's build
+//!   runs on it (task S4-2);
 //! - [`clock`]: monotonic-clock arithmetic (ticks to nanoseconds and back) and the CPUID
 //!   TSC rate;
 //! - [`cpumap`]: dense CPU indexes for the processors the MADT enables (per-CPU arrays are
@@ -62,6 +64,8 @@
 //! - [`originfs`]: a read-only OriginFS on-disk parser and image builder (ADR-0006,
 //!   Proposed; host-tested, not mounted by the kernel pending owner approval, §84);
 //! - [`tcp`]: TCP segments and a minimal connection state machine;
+//! - [`testfill`]: the fill the TEST ONLY firmware step plants in reserved pages, which the
+//!   reserved-memory proof writes into only where it finds it;
 //! - [`text`]: a streaming, error-locating UTF-8 decoder for the text engine;
 //! - [`tftp`]: a TFTP reader (RFC 1350): read requests, acknowledgements and a download
 //!   state machine;
@@ -110,6 +114,7 @@ pub mod blockcache;
 pub mod bootproof;
 pub mod cache;
 pub mod channel;
+pub mod core_image;
 pub mod deflate;
 pub mod dhcp;
 pub mod dns;
@@ -131,6 +136,7 @@ pub mod net;
 pub mod numa;
 pub mod nvme;
 pub mod originfs;
+pub mod pin;
 pub mod program;
 pub use origin_frame::{
     acpi, amdvi, apic, apstart, bitmap, boot, clock, cpumap, descriptors, dmar, features, frames,
@@ -149,6 +155,7 @@ pub mod semver;
 pub mod serial;
 pub mod spcr;
 pub mod tcp;
+pub mod testfill;
 #[cfg(test)]
 #[path = "../frame/src/testing.rs"]
 mod testing;
