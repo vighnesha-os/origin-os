@@ -37,6 +37,7 @@ const KINDS: usize = 24;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Summary {
     structures: u32,
+    entries: u32,
     kinds: [(u16, u32); KINDS],
     distinct: usize,
     others: u32,
@@ -46,6 +47,7 @@ impl Summary {
     pub(crate) const fn new() -> Self {
         Self {
             structures: 0,
+            entries: 0,
             kinds: [(0, 0); KINDS],
             distinct: 0,
             others: 0,
@@ -68,6 +70,18 @@ impl Summary {
         }
     }
 
+    /// Counts one entry of a table whose body is a list of plain values (the root tables'
+    /// addresses, the PDTT's triggers, the SVKL's keys), which have no type of their own.
+    pub(crate) fn entry(&mut self) {
+        self.entries = self.entries.saturating_add(1);
+    }
+
+    /// How many plain entries the table held.
+    #[must_use]
+    pub const fn entries(&self) -> u32 {
+        self.entries
+    }
+
     /// How many structures the table held.
     #[must_use]
     pub const fn structures(&self) -> u32 {
@@ -87,12 +101,20 @@ impl Summary {
 }
 
 impl fmt::Display for Summary {
-    /// `N structures (type×count, ...)`, types in the order first met.
+    /// `N structures (type×count, ...)`, types in the order first met; or `N entries`; or nothing
+    /// for a table with neither.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} structures", self.structures)?;
+        if self.entries != 0 {
+            write!(f, "{} entries", self.entries)?;
+            if self.structures == 0 {
+                return Ok(());
+            }
+            f.write_str(", ")?;
+        }
         if self.structures == 0 {
             return Ok(());
         }
+        write!(f, "{} structures", self.structures)?;
         f.write_str(" (")?;
         for (i, (kind, n)) in self.kinds.iter().take(self.distinct).enumerate() {
             if i != 0 {
@@ -157,9 +179,14 @@ pub enum Class {
 impl fmt::Display for Class {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Checked(summary) if summary.structures == 0 && summary.entries == 0 => {
+                f.write_str("checked")
+            }
             Self::Checked(summary) => write!(f, "checked: {summary}"),
             Self::OtherArea(what) => write!(f, "{what}: header checked, not parsed here"),
-            Self::OtherSpecification(what) => write!(f, "{what}'s table: header checked"),
+            Self::OtherSpecification(what) => {
+                write!(f, "{what}, another specification's: header checked")
+            }
             Self::NotX86(what) => write!(f, "{what}: not for x86-64, header checked"),
             Self::Oem => f.write_str("an OEM's table: header checked"),
             Self::Unknown => f.write_str("a signature not known here: header checked"),
@@ -351,7 +378,7 @@ fn parse<'a>(table: &Table<'a>, tally: &mut Tally<'_, 'a>) -> Result<bool, Error
         b"MISC" => crate::records::Misc::parse(bytes)?.census(tally)?,
         b"PDTT" => {
             for _ in crate::records::Pdtt::parse(bytes)?.triggers() {
-                tally.summary.count(0);
+                tally.summary.entry();
             }
         }
         b"CCEL" => {
@@ -359,12 +386,12 @@ fn parse<'a>(table: &Table<'a>, tally: &mut Tally<'_, 'a>) -> Result<bool, Error
         }
         b"SVKL" => {
             for _ in crate::records::Svkl::parse(bytes)?.keys() {
-                tally.summary.count(0);
+                tally.summary.entry();
             }
         }
         b"RSDT" | b"XSDT" => {
             for _ in crate::root::Root::parse(bytes)?.entries() {
-                tally.summary.count(0);
+                tally.summary.entry();
             }
         }
         _ => return Ok(false),
@@ -415,5 +442,18 @@ mod tests {
         }
         assert_eq!(format!("{many}").matches("x1").count(), KINDS);
         assert!(format!("{many}").ends_with(", 6 more)"));
+        let mut entries = Summary::new();
+        entries.entry();
+        entries.entry();
+        assert_eq!(format!("{}", Class::Checked(entries)), "checked: 2 entries");
+        assert_eq!(format!("{}", Class::Checked(Summary::new())), "checked");
+        assert_eq!(
+            format!("{}", Class::Checked(s)),
+            "checked: 4 structures (0x2, 1x1, 9x1)"
+        );
+        assert_eq!(
+            format!("{}", Class::OtherSpecification("the IA-PC HPET table")),
+            "the IA-PC HPET table, another specification's: header checked"
+        );
     }
 }

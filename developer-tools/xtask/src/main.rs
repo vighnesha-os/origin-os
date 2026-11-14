@@ -64,6 +64,9 @@ commands:
   boot-legacy-free  the kernel boot on a machine with no 8254 and no 8042: the timers
               calibrate against the ACPI PM timer, and the proofs that need those devices
               say they cannot run
+  boot-acpi   the kernel boot on a machine whose QEMU builds the ACPI tables the usual one
+              lacks: an NFIT for an NVDIMM, an HMAT and an SRAT with a generic initiator, each
+              checked by the kernel's census of its tables (TASKS item 62)
   boot-random the kernel boot on two processors that lack what the random-number generator is
               seeded from (ADR-0016): one with RDRAND and no RDSEED, which boots and says
               so; one with neither, which has no generator, launches nothing and still
@@ -182,6 +185,9 @@ environment:
   ORIGIN_QEMU_RESERVED                on: a TEST ONLY UEFI application plants firmware-reserved
                                       memory (RMRRs or IVMDs) in QEMU's tables before the
                                       loader starts (the boot-reserved machine)
+  ORIGIN_QEMU_ACPI                    on: QEMU builds an NFIT, an HMAT and an SRAT with a generic
+                                      initiator (the boot-acpi machine; needs
+                                      ORIGIN_QEMU_MACHINE=nvdimm=on,hmat=on)
   ORIGIN_QEMU_ACCEL                   tcg (default) or kvm: run on a real x86-64 processor (needs
                                       an x86-64 host with /dev/kvm); the devices and firmware
                                       stay QEMU's
@@ -427,6 +433,71 @@ fn check_iommu(iommu: &Iommu) -> Result {
 /// Whether the NIC sits behind a PCIe root port (`ORIGIN_QEMU_BRIDGE=on`, `boot-bridge`).
 fn qemu_bridge() -> bool {
     env::var("ORIGIN_QEMU_BRIDGE").as_deref() == Ok("on")
+}
+
+/// Whether QEMU builds the ACPI tables the usual machine lacks (`ORIGIN_QEMU_ACPI=on`,
+/// `boot-acpi`; TASKS item 62): an NFIT for an NVDIMM, an HMAT, and an SRAT with a generic
+/// initiator.
+fn qemu_acpi() -> bool {
+    env::var("ORIGIN_QEMU_ACPI").as_deref() == Ok("on")
+}
+
+/// The QEMU arguments of the `boot-acpi` machine beyond the usual ones (TASKS item 62; ADR-0019
+/// A7): `nvdimm=on,hmat=on` go in through `ORIGIN_QEMU_MACHINE`; here, an NVDIMM in node 1 (the
+/// NFIT), a third node with no memory and no processor holding the NVMe controller as a generic
+/// initiator (SRAT type 5), every distance to it, and latencies, bandwidths and a memory-side
+/// cache for every initiator and target (the HMAT). It adds no PCI function, so the usual
+/// proofs' counts hold.
+fn acpi_machine_args(cpus: u32) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-object",
+        "memory-backend-ram,id=onvdimm,size=128M",
+        "-device",
+        "nvdimm,id=onvdimm0,memdev=onvdimm,node=1",
+        "-numa",
+        "node,nodeid=2,initiator=2",
+        "-numa",
+        "dist,src=0,dst=2,val=31",
+        "-numa",
+        "dist,src=1,dst=2,val=31",
+        "-object",
+        "acpi-generic-initiator,id=ogi0,pci-dev=onvme,node=2",
+    ]
+    .iter()
+    .map(|a| (*a).to_string())
+    .collect();
+    let initiators: &[u32] = if cpus >= 2 { &[0, 1, 2] } else { &[0, 2] };
+    for &initiator in initiators {
+        for target in [0u32, 1] {
+            let near = initiator == target || (initiator == 2 && target == 0);
+            let (latency, bandwidth) = if near { (10, "10G") } else { (20, "5G") };
+            args.push("-numa".into());
+            args.push(format!(
+                "hmat-lb,initiator={initiator},target={target},hierarchy=memory,data-type=access-latency,latency={latency}"
+            ));
+            args.push("-numa".into());
+            args.push(format!(
+                "hmat-lb,initiator={initiator},target={target},hierarchy=memory,data-type=access-bandwidth,bandwidth={bandwidth}"
+            ));
+        }
+    }
+    args.push("-numa".into());
+    args.push(
+        "hmat-cache,node-id=0,size=8M,level=1,associativity=direct,policy=write-back,line=64"
+            .into(),
+    );
+    args
+}
+
+/// A `-numa node` value for node `id` with its 256M backend; on the ACPI machine, with the
+/// initiator nearest its memory, which the HMAT needs.
+fn numa_node(id: u32, initiator: u32) -> String {
+    let node = format!("node,nodeid={id},memdev=onuma{id}");
+    if qemu_acpi() {
+        format!("{node},initiator={initiator}")
+    } else {
+        node
+    }
 }
 
 /// Whether a TEST ONLY application plants firmware-reserved memory in QEMU's tables before the
@@ -1503,7 +1574,12 @@ fn x2apic_markers(machine: &Machine) -> Vec<String> {
 /// it logs no interrupt-remapping fault, which it reports on its stderr instead.
 fn amd_iommu_markers(scenario: &mut Scenario, machine: &Machine) {
     let cpus = machine.cpus();
-    let swaps: [(String, Vec<String>); 13] = [
+    let swaps: [(String, Vec<String>); 14] = [
+        // The ACPI census names the IOMMU's table (TASKS item 62).
+        (
+            "origin-kernel: acpi: DMAR rev ".into(),
+            vec!["origin-kernel: acpi: IVRS rev ".into()],
+        ),
         (
             "origin-kernel: PCIe: 00:02.0 1b36:0010 class 01:08:02 NVMe controller; BAR0 mem64 16 KiB at ".into(),
             vec![
@@ -1800,12 +1876,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // off-diagonal >= 10.
             "origin-kernel: slit: ".into(),
             "; consistent true".into(),
-            // Every ACPI table the firmware gives, checked whole (ADR-0019 A6, area A; TASKS
-            // item 62).
-            "origin-kernel: acpi: ".into(),
-            " tables: ".into(),
-            " refused, ".into(),
-            "; consistent true".into(),
+        ])
+        .chain(acpi_markers())
+        .chain([
             // The random-number generator (ADR-0016): every processor has one, requests are
             // answered with values that differ, and its stack holds only zeros after a request.
             "origin-kernel: random: processor 0: ".into(),
@@ -2141,6 +2214,62 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         capture: Capture::Com1AndScreen,
         qemu_args: None,
     }
+}
+
+/// The census of the firmware's ACPI tables (TASKS item 62; ADR-0019 A6, area A), as QEMU 11.1.3
+/// and OVMF give them on every machine here, in the XSDT's order: each table QEMU builds, named
+/// and checked (or, for another specification's, its header checked), the FADT's line, the DSDT
+/// and FACS it points to, and the census's verdict. OVMF's BGRT is not required: OVMF builds it
+/// only when it has drawn its logo. The ACPI machine's own tables are [`acpi_machine_markers`].
+fn acpi_markers() -> Vec<String> {
+    let checked = "checked";
+    let other = "another specification's: header checked";
+    let mut markers = Vec::new();
+    for (signature, outcome) in [
+        ("RSDT", "checked: "),
+        ("XSDT", "checked: "),
+        ("FACP", checked),
+        ("APIC", "checked: "),
+        ("HPET", other),
+        ("SRAT", "checked: "),
+    ] {
+        markers.push(format!("origin-kernel: acpi: {signature} rev "));
+        markers.push(outcome.to_string());
+    }
+    if qemu_acpi() {
+        markers.extend(acpi_machine_markers());
+    }
+    for (signature, outcome) in [
+        ("SLIT", checked),
+        ("MCFG", other),
+        // The AMD-Vi boot swaps it for the IVRS ([`amd_iommu_markers`]).
+        ("DMAR", other),
+        ("WAET", other),
+    ] {
+        markers.push(format!("origin-kernel: acpi: {signature} rev "));
+        markers.push(outcome.to_string());
+    }
+    markers.extend(
+        [
+            "origin-kernel: acpi: FADT: ",
+            "origin-kernel: acpi: DSDT rev ",
+            "checked",
+            "origin-kernel: acpi: FACS version ",
+            "checked",
+            "origin-kernel: acpi: the RSDT's and XSDT's OEM table IDs are the FADT's: true",
+            " tables: ",
+            " refused, ",
+            "; consistent true",
+        ]
+        .map(String::from),
+    );
+    markers
+}
+
+/// The ACPI machine's tables beyond the usual ones (`ORIGIN_QEMU_ACPI=on`), written once the
+/// first boot showed where QEMU lists them.
+fn acpi_machine_markers() -> Vec<String> {
+    Vec::new()
 }
 
 /// The kernel boot's whole-log checks: every line whole, and the screen.
@@ -3045,6 +3174,7 @@ fn main() -> ExitCode {
         ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
         ["boot-reserved"] => in_turn("boot-reserved", boot_reserved),
         ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
+        ["boot-acpi"] => in_turn("boot-acpi", boot_acpi),
         ["boot-random"] => in_turn("boot-random", boot_random),
         ["boot-identity"] => in_turn("boot-identity", boot_identity),
         ["run"] => in_turn("run", run),
@@ -3427,6 +3557,27 @@ fn boot_reserved() -> Result {
         }
     }
     println!("xtask: boot-reserved passed (both IOMMUs, firmware-reserved memory planted)");
+    Ok(())
+}
+
+/// Runs the kernel boot on the ACPI machine (`ORIGIN_QEMU_ACPI=on`; TASKS item 62; ADR-0019 A6
+/// area A, A7): two processors, and the tables QEMU builds that the usual machine lacks, an NFIT
+/// for an NVDIMM, an HMAT, and an SRAT with a generic initiator, each checked by the kernel's
+/// census of its ACPI tables.
+fn boot_acpi() -> Result {
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    println!("xtask: boot-acpi: QEMU's NFIT, HMAT and generic initiator");
+    let status = boot_test_child(&exe)
+        .env("ORIGIN_QEMU_ACPI", "on")
+        .env("ORIGIN_QEMU_MACHINE", "nvdimm=on,hmat=on")
+        .env("ORIGIN_QEMU_SMP", "2")
+        .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
+        .status()
+        .map_err(|e| format!("cannot run boot-test: {e}"))?;
+    if !status.success() {
+        return Err(format!("boot-test on the ACPI machine failed ({status})"));
+    }
+    println!("xtask: boot-acpi passed (QEMU's NFIT, HMAT and generic initiator, each checked)");
     Ok(())
 }
 
@@ -5159,7 +5310,14 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         .arg(qemu_machine_options(Accel::from_env()?.machine()))
         .arg("-cpu")
         .arg(qemu_cpu_model())
-        .args(["-m", "512M", "-smp"])
+        .arg("-m")
+        // The ACPI machine's NVDIMM sits in a slot above the 512M of RAM.
+        .arg(if qemu_acpi() {
+            "512M,slots=2,maxmem=1G"
+        } else {
+            "512M"
+        })
+        .arg("-smp")
         .arg(&machine.smp);
     for cpu in &machine.devices {
         c.args(["-device", cpu]);
@@ -5171,8 +5329,12 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         // whose packages go to one node each).
         .args(["-object", "memory-backend-ram,id=onuma0,size=256M"])
         .args(["-object", "memory-backend-ram,id=onuma1,size=256M"])
-        .args(["-numa", "node,nodeid=0,memdev=onuma0"])
-        .args(["-numa", "node,nodeid=1,memdev=onuma1"])
+        // With the ACPI machine's HMAT, each node names the initiator nearest its memory.
+        .args(["-numa", &numa_node(0, 0)])
+        .args([
+            "-numa",
+            &numa_node(1, if machine.cpus() >= 2 { 1 } else { 0 }),
+        ])
         // A cross-node distance so the ACPI SLIT is populated too (QEMU mirrors 1->0).
         .args(["-numa", "dist,src=0,dst=1,val=21"])
         .arg("-drive")
@@ -5189,7 +5351,18 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         // The NVMe controller and its test disk (CLAUDE.md §33).
         .arg("-drive")
         .arg(qemu_path_arg("if=none,id=nvme0,format=raw,file=", &s.nvme)?)
-        .args(["-device", "nvme,serial=ORIGIN0001,drive=nvme0"]);
+        .args([
+            "-device",
+            if qemu_acpi() {
+                // Named, so the ACPI machine's generic initiator can name it.
+                "nvme,serial=ORIGIN0001,drive=nvme0,id=onvme"
+            } else {
+                "nvme,serial=ORIGIN0001,drive=nvme0"
+            },
+        ]);
+    if qemu_acpi() {
+        c.args(acpi_machine_args(machine.cpus()));
+    }
     // A PCIe root port for the NIC (threat T4): clearing bus mastering stops its forwarding too,
     // and the driver must open it again above the device it attached (`boot-bridge`).
     let nic_bus = if qemu_bridge() {
