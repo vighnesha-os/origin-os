@@ -127,6 +127,8 @@ What the tables show:
 - **The first object is a `Scope`**, not a method (E9): `\DBUG` writes its argument as hexadecimal text, byte by byte, to a SystemIO region at port 0x402.
 - Named results a read-only boot proof can check without any region access: `\_S5_` is a package of four zeros; `\PICF` starts at zero and `\_PIC (1)` sets it; `\_SB.PCI0._HID` is an EISA ID integer; `\_SB.PCI0._CRS` and `\_SB.HPET._CRS` are names holding buffers. Evaluations that **must** hit a region and be refused: `\_SB.HPET._STA` (SystemMemory, after the Global Lock), each processor's `_STA` (through `\_SB.CPUS.CSTA`, SystemIO), each `\_SB.LNKx._STA` (PCI_Config).
 
+**What the tests can and cannot show** (the review of B1, F15). The encoder (`src/tests/encode.rs`) shares no code with the parser, but this session wrote both from one reading of chapter 20, so a misreading common to both passes every encoder-made test. QEMU's five DSDTs are the only tables the parser has met that it did not make, and they use only the opcodes listed above; the test that loads them is run by hand, not by `check`. ADR-0019 A3's "fuzzed" is met by the randomized test of the contract's §7 (blocks from the grammar, mutated blocks and adversarial blocks, with progress floors and planted-fault controls); there is no coverage-guided fuzzing. The outside checks still to come are TASKS item 64's reading (the gaps in §9) and step B3's boot proof, which is to dump the tables it reads and load them in that test.
+
 ## 9. Open questions and named gaps
 
 **Questions, and the coordinating session's rulings of 2026-11-14**
