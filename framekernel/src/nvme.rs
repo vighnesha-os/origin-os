@@ -519,6 +519,8 @@ pub enum Fault {
     /// instead: the controller's error. This command may still be live, so its queue is dead
     /// from then on.
     WrongCommand { cid: u16, sq_id: u16 },
+    /// Its queue died while it was outstanding, so it may still be live.
+    QueueDied,
     /// Refused before it reached the device: another command was outstanding on its queue.
     Busy,
     /// Refused before it reached the device: its queue had lost an earlier command.
@@ -535,7 +537,10 @@ impl Fault {
     /// Whether the command may still be live in the device, so that its buffer must never be
     /// used again.
     pub const fn may_be_live(&self) -> bool {
-        matches!(self, Self::NoCompletion { .. } | Self::WrongCommand { .. })
+        matches!(
+            self,
+            Self::NoCompletion { .. } | Self::WrongCommand { .. } | Self::QueueDied
+        )
     }
 }
 
@@ -554,6 +559,7 @@ impl core::fmt::Display for Fault {
                 f,
                 "a completion for command {cid} of submission queue {sq_id} came instead"
             ),
+            Self::QueueDied => f.write_str("its queue died while it was outstanding"),
             Self::Busy => f.write_str("refused: another command was outstanding on its queue"),
             Self::Dead => f.write_str("refused: its queue had lost an earlier command"),
             Self::Full => f.write_str("refused: its queue was full"),
@@ -1252,6 +1258,11 @@ mod tests {
         assert!(!Fault::Status(lba).may_be_live());
         assert!(Fault::NoCompletion { ms: 1 }.may_be_live());
         assert!(Fault::WrongCommand { cid: 0, sq_id: 0 }.may_be_live());
+        assert!(Fault::QueueDied.may_be_live());
+        assert_eq!(
+            name(Fault::QueueDied),
+            "its queue died while it was outstanding"
+        );
         assert_eq!(
             alloc::format!(
                 "{}",

@@ -2,23 +2,32 @@
 //! queues, namespace discovery, DMA, flushes), the boot proof of its block I/O, and the
 //! disk's GUID Partition Table, both copies checked (CLAUDE.md §39).
 //!
-//! A first-party kernel-mode driver (ADR-0001 D2). It binds to the first NVMe controller
-//! (class 01:08:02) that `pcie` listed:
+//! A first-party kernel-mode driver (ADR-0001 D2), checked against NVMe Base 2.4, the NVM
+//! Command Set 1.3 and NVMe over PCIe Transport 1.4 (`docs/research/2026-11-14-nvme-2-4-check.md`).
+//! It binds to the first NVMe controller (class 01:08:02) that `pcie` listed:
 //! 1. memory decoding on; BAR 0 mapped uncached; the controller attached to a domain;
-//! 2. the controller reset: CC.EN cleared and CSTS.RDY awaited within CAP.TO; only then is
-//!    bus mastering turned on (ADR-0007 I12: never before it is attached, and a controller
-//!    the firmware left running cannot act on the firmware's queues in between);
-//! 3. admin queues of 32 entries; CC.EN set (4 KiB pages, 64/16-byte entries); RDY awaited,
-//!    with the fatal-status bit checked;
-//! 4. Identify Controller and Identify Namespace 1;
-//! 5. I/O queue pair 1 (64 entries), polled;
+//! 2. the controller reset: one the firmware left enabled and not yet ready is waited for
+//!    first (clearing CC.EN while CSTS.RDY is 0 has undefined results), then CC.EN cleared
+//!    and CSTS.RDY awaited within CAP.TO; only then is bus mastering turned on (ADR-0007 I12:
+//!    never before it is attached, and a controller the firmware left running cannot act on
+//!    the firmware's queues in between);
+//! 3. admin queues of 32 entries; CC written with its configuration (4 KiB pages, 64/16-byte
+//!    entries), then again with EN set; RDY awaited within CRTO.CRWMT where the controller
+//!    reports ready modes and CAP.TO otherwise, with the fatal-status bit checked;
+//! 4. Identify Controller (only an I/O controller is bound), then the controller's active NVM
+//!    namespaces, walked in order: the first the driver can use is bound, and each one before
+//!    it is refused by name (metadata or protection information, which the driver does not
+//!    support, or a format it cannot use);
+//! 5. I/O queue pair 1, polled, of 64 entries or as many as the controller allows;
 //! 6. after the polled proofs, MSI-X: vector 1 is sent to one processor as
 //!    `cpu::DEVICE_VECTOR` (every other entry masked), and I/O queue pair 2 completes to
 //!    it. A thread there submits under the driver lock and then blocks on a wait queue
 //!    until the interrupt wakes it; its wait condition is the completion queue itself.
 //!    Then every processor gets a queue pair and vector of its own. A message's destination
 //!    is the processor's x2APIC ID (which may exceed 255: ADR-0008); per-CPU state here is
-//!    indexed by its CPU index.
+//!    indexed by its CPU index. A controller that allocated one I/O queue pair, or has fewer
+//!    than two MSI-X vectors, is bound for polled I/O alone, and the proofs through interrupts
+//!    say why they are not proven.
 //!
 //! DMA memory is zeroed heap pages (`dma::DeviceDma`). With the IOMMU translating, the
 //! controller is attached to a domain of its own before its first DMA, every page is mapped
@@ -29,9 +38,11 @@
 //! every doorbell. MSI-X entries are programmed through `iommu::msi_message`, so with
 //! interrupt remapping on they hold only remappable-format handles.
 //!
-//! A queue runs one command at a time. A command that never completes kills its queue (there
-//! is no abort or controller reset yet): every later command on it fails at once, its late
-//! completion is never taken, and the block layer keeps the command's page out of use.
+//! A queue runs one command at a time. A command that does not complete within the driver's
+//! own deadline (`nvme::deadline_ms`: Flush 30 s, other I/O 10 s, admin 2 s) kills its queue
+//! (there is no abort or controller reset yet): every later command on it fails at once, its
+//! late completion is never taken, and the block layer keeps the command's page out of use.
+//! Every failure is named (`nvme::Fault`).
 //!
 //! The boot proofs write only to the disk the boot test builds, named positively by
 //! `framekernel::blockcache::test_disk` (CLAUDE.md P0). Any other disk gets no write and no
@@ -62,15 +73,12 @@ use crate::console::Console;
 
 pub(crate) use crate::blockcache::test_disk::pattern;
 
-/// Entries in the admin queues and the I/O queues.
+/// Entries in the admin queues (AQA sizes them; MQES applies to the I/O queues alone).
 const ADMIN_ENTRIES: u16 = 32;
-const IO_ENTRIES: u16 = 64;
 /// The memory page size the driver configures.
 pub(crate) const PAGE: u64 = 4096;
-/// How long one command may take.
-const COMMAND_TIMEOUT_NS: u64 = 2_000_000_000;
-/// The namespace the proof uses.
-const NSID: u32 = 1;
+/// A ready wait longer than this is announced, and so is each such stretch of it.
+const LONG_WAIT_MS: u64 = 60_000;
 
 /// One submission and completion queue pair.
 struct QueuePair {
@@ -83,19 +91,8 @@ struct QueuePair {
     gate: QueueGate,
 }
 
-/// Why a command failed.
-#[derive(Clone, Copy, Debug)]
-enum Failure {
-    Full,
-    /// No completion in time: the command may still be live, so its queue is dead now.
-    Timeout,
-    /// A completion for another command, so this one may still be live: dead, too.
-    WrongCommand,
-    /// The queue is dead: refused without touching the device.
-    Dead,
-    /// Another command is outstanding on the queue: refused without touching the device.
-    Busy,
-}
+/// Why a command did not succeed: `nvme::Fault`, which names itself.
+use nvme::Fault;
 
 /// Which queue pair a command goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +122,12 @@ struct Nvme {
     /// allocated, and the highest I/O queue id whose doorbells BAR 0 holds.
     allocated: (u32, u32),
     bar_queues: u16,
+    /// Entries of each I/O queue: 64, or fewer if the controller allows fewer (M2).
+    io_entries: u16,
+    /// How long CSTS.RDY may take to change (CAP.TO, and CRTO where the controller has it).
+    ready: nvme::ReadyTimeouts,
+    /// The namespace bound: the first usable of the controller's active NVM namespaces.
+    nsid: u32,
 }
 
 impl Nvme {
@@ -146,19 +149,71 @@ impl Nvme {
         self.write32(offset + 4, (value >> 32) as u32);
     }
 
-    /// Waits for CSTS.RDY to become `ready`, up to CAP.TO; fails on controller fatal status.
-    fn wait_ready(&self, ready: bool) -> Result<(), &'static str> {
-        let deadline = crate::time::monotonic_nanos() + self.cap.timeout_ms.max(500) * 1_000_000;
+    /// Waits for CSTS.RDY to become `ready`: to rise within the enable timeout (CRTO.CRWMT
+    /// where the controller has it, CAP.TO otherwise), failing on controller fatal status, or
+    /// to fall within CAP.TO. A wait the controller states may take longer than a minute is
+    /// announced on `com1` before it starts, and again after every minute of it, so that a
+    /// long stall is seen (the coordinating session's ruling (d), 2026-11-14).
+    fn wait_ready(&self, com1: &mut Console, ready: bool) -> Result<(), &'static str> {
+        if self.await_csts(com1, ready, ready)? {
+            Ok(())
+        } else if ready {
+            Err("CSTS.RDY did not become 1 within its enable timeout")
+        } else {
+            Err("CSTS.RDY did not become 0 within CAP.TO")
+        }
+    }
+
+    /// Waits for CSTS.RDY to become `ready`, within the timeout of a rise (`ready`) or a fall.
+    /// Returns whether it came. While waiting for a rise, fatal status (CSTS.CFS) fails the wait
+    /// with `fatal_fails`, and without it ends the wait as if RDY had come.
+    fn await_csts(
+        &self,
+        com1: &mut Console,
+        ready: bool,
+        fatal_fails: bool,
+    ) -> Result<bool, &'static str> {
+        let ms = if ready {
+            self.ready.enable_ms
+        } else {
+            self.ready.disable_ms
+        };
+        let start = crate::time::monotonic_nanos();
+        let deadline = start + ms * 1_000_000;
+        let mut announced = 0;
+        if ms > LONG_WAIT_MS {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: NVMe: waiting up to {} s, as the controller states, for CSTS.RDY to become {}",
+                ms / 1000,
+                u8::from(ready)
+            );
+        }
         loop {
             let csts = self.read32(register::CSTS);
             if csts & nvme::CSTS_FATAL != 0 && ready {
-                return Err("controller fatal status");
+                if fatal_fails {
+                    return Err("controller fatal status");
+                }
+                return Ok(true);
             }
             if (csts & nvme::CSTS_READY != 0) == ready {
-                return Ok(());
+                return Ok(true);
             }
-            if crate::time::monotonic_nanos() > deadline {
-                return Err("CSTS.RDY did not change within CAP.TO");
+            let now = crate::time::monotonic_nanos();
+            if now > deadline {
+                return Ok(false);
+            }
+            let minutes = (now - start) / (LONG_WAIT_MS * 1_000_000);
+            if ms > LONG_WAIT_MS && minutes > announced {
+                announced = minutes;
+                let _ = writeln!(
+                    com1,
+                    "origin-kernel: NVMe: still waiting for CSTS.RDY to become {} after {} s of up to {} s",
+                    u8::from(ready),
+                    minutes * LONG_WAIT_MS / 1000,
+                    ms / 1000
+                );
             }
             core::hint::spin_loop();
         }
@@ -175,9 +230,9 @@ impl Nvme {
     /// Submits `make(cid)` to queue `q` and polls for its completion. A caller holds no lock
     /// (the wait lets interrupts in) and has the controller to itself; with the driver
     /// shared, use [`command`].
-    fn run(&mut self, q: Q, make: impl FnOnce(u16) -> Command) -> Result<Completion, Failure> {
-        let cid = self.submit(q, make)?;
-        let deadline = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
+    fn run(&mut self, q: Q, make: impl FnOnce(u16) -> Command) -> Result<Completion, Fault> {
+        let (cid, ms) = self.submit(q, make)?;
+        let deadline = crate::time::monotonic_nanos() + ms * 1_000_000;
         loop {
             // The clock first: whatever completed by this moment is found below, however
             // long this flow was away from the processor.
@@ -187,7 +242,7 @@ impl Nvme {
             }
             if late {
                 self.kill(q);
-                return Err(Failure::Timeout);
+                return Err(Fault::NoCompletion { ms });
             }
             between_polls();
         }
@@ -200,43 +255,47 @@ impl Nvme {
         }
     }
 
-    /// Writes `make(cid)` into queue `q` and rings its doorbell; returns the command ID.
-    fn submit(&mut self, q: Q, make: impl FnOnce(u16) -> Command) -> Result<u16, Failure> {
+    /// Writes `make(cid)` into queue `q` and rings its doorbell; returns the command ID and
+    /// the command's deadline in milliseconds.
+    fn submit(&mut self, q: Q, make: impl FnOnce(u16) -> Command) -> Result<(u16, u64), Fault> {
         let (regs, stride) = (self.regs, self.cap.doorbell_stride);
-        submit_on(self.queue(q).ok_or(Failure::Full)?, regs, stride, make)
+        submit_on(self.queue(q).ok_or(Fault::NoQueue)?, regs, stride, make)
     }
 
     /// Takes queue `q`'s next completion if it is there: the result for command `cid`, or
     /// `None` if nothing new has arrived.
-    fn poll(&mut self, q: Q, cid: u16) -> Option<Result<Completion, Failure>> {
+    fn poll(&mut self, q: Q, cid: u16) -> Option<Result<Completion, Fault>> {
         let (regs, stride) = (self.regs, self.cap.doorbell_stride);
         poll_on(self.queue(q)?, regs, stride, cid)
     }
 }
 
 /// Writes `make(cid)` into `qp` and rings its doorbell (the controller's registers at
-/// `regs`, doorbells `stride` bytes apart); returns the command ID.
+/// `regs`, doorbells `stride` bytes apart); returns the command ID and the command's deadline
+/// in milliseconds (`nvme::deadline_ms`: queue 0 is the admin queue).
 fn submit_on(
     qp: &mut QueuePair,
     regs: MmioRegion,
     stride: u64,
     make: impl FnOnce(u16) -> Command,
-) -> Result<u16, Failure> {
+) -> Result<(u16, u64), Fault> {
     {
         qp.gate.claim().map_err(|gate| {
             if gate.is_dead() {
-                Failure::Dead
+                Fault::Dead
             } else {
-                Failure::Busy
+                Fault::Busy
             }
         })?;
         let cid = qp.next_cid;
-        qp.next_cid = qp.next_cid.wrapping_add(1);
+        qp.next_cid = nvme::next_cid(qp.next_cid);
         let Some(slot) = qp.state.submit() else {
             qp.gate.release();
-            return Err(Failure::Full);
+            return Err(Fault::Full);
         };
-        for (i, word) in make(cid).to_words().iter().enumerate() {
+        let command = make(cid);
+        let ms = nvme::deadline_ms(qp.qid == 0, command.opcode);
+        for (i, word) in command.to_words().iter().enumerate() {
             qp.sq
                 .write32(usize::from(slot) * nvme::SQ_ENTRY + 4 * i, *word);
         }
@@ -246,7 +305,7 @@ fn submit_on(
             nvme::doorbell(qp.qid, false, stride) as usize,
             u32::from(qp.state.sq_tail()),
         );
-        Ok(cid)
+        Ok((cid, ms))
     }
 }
 
@@ -257,11 +316,11 @@ fn poll_on(
     regs: MmioRegion,
     stride: u64,
     cid: u16,
-) -> Option<Result<Completion, Failure>> {
+) -> Option<Result<Completion, Fault>> {
     {
         // The queue died with this command outstanding, so it may still be live.
         if qp.gate.is_dead() {
-            return Some(Err(Failure::Timeout));
+            return Some(Err(Fault::QueueDied));
         }
         let at = usize::from(qp.state.cq_head()) * nvme::CQ_ENTRY;
         // The phase is in the last dword: read it first, then the rest.
@@ -281,12 +340,17 @@ fn poll_on(
             nvme::doorbell(qp.qid, true, stride) as usize,
             u32::from(qp.state.cq_head()),
         );
-        Some(if c.cid == cid {
+        // Each submission queue has a completion queue of its own, so the entry must name both
+        // this queue and this command (Base 2.4 Figure 98).
+        Some(if c.answers(qp.qid, cid) {
             qp.gate.release();
             Ok(c)
         } else {
             qp.gate.kill();
-            Err(Failure::WrongCommand)
+            Err(Fault::WrongCommand {
+                cid: c.cid,
+                sq_id: c.sq_id,
+            })
         })
     }
 }
@@ -319,16 +383,49 @@ struct Driver {
     nvme: Nvme,
     dev: crate::pcie::Device,
     page: DmaPage,
-    /// Namespace 1.
+    /// The namespace bound (its ID is `nvme.nsid`).
     namespace: NamespaceInfo,
-    /// Namespace 1 is the boot test's disk: the only one the boot proofs may write to.
+    /// The namespace bound is the boot test's disk: the only one the boot proofs may write to.
     test_disk: bool,
+    /// Why the proofs through interrupts cannot be shown, when the controller's own numbers
+    /// say so (ruling (a) of 2026-11-14): it is bound for polled I/O alone.
+    no_interrupts: Option<NoInterrupts>,
     /// The MSI-X table's virtual address and the capability, once set up.
     msix: Option<(MmioRegion, pci::Msix)>,
     /// The processors whose per-processor MSI-X entry `2 + k` [`setup_cpu_queues`] wrote, in
     /// that order, each recorded as it is written, so the IOMMU proof checks every entry
     /// programmed, a queue later refused or not (review finding F4 of 2026-11-14).
     entries: Vec<CpuIndex>,
+}
+
+/// Why a controller has no interrupt queue, from its own numbers. Anything else that leaves
+/// it without one is a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoInterrupts {
+    /// It allocated this many I/O submission and completion queues, or BAR 0 holds the
+    /// doorbells of this few: one pair, the polled one.
+    OnePair { sqs: u32, cqs: u32, bar_queues: u16 },
+    /// Its MSI-X table has this many entries: the interrupt queue needs entry 1.
+    Vectors(u16),
+}
+
+impl core::fmt::Display for NoInterrupts {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::OnePair {
+                sqs,
+                cqs,
+                bar_queues,
+            } => write!(
+                f,
+                "the controller gave one I/O queue pair ({sqs} submission and {cqs} completion queues allocated, the doorbells of {bar_queues} I/O queues in BAR 0), the polled one, and an interrupt queue needs a second"
+            ),
+            Self::Vectors(n) => write!(
+                f,
+                "the controller has {n} MSI-X vectors, and an interrupt queue needs entry 1"
+            ),
+        }
+    }
 }
 
 static DRIVER: SpinLock<Option<Driver>> = SpinLock::new(None);
@@ -418,6 +515,7 @@ pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
                     page,
                     namespace,
                     test_disk,
+                    no_interrupts: None,
                     msix: None,
                     entries: Vec::new(),
                 });
@@ -436,13 +534,33 @@ pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
         return polled;
     }
     let interrupts = polled && prove_interrupts(com1, cpus, tsc_hz);
-    let (order, left_out) = queue_order(cpus);
-    let per_cpu = interrupts && prove_per_cpu(com1, &order, &left_out, tsc_hz);
-    let x2apic = per_cpu && prove_x2apic(com1, cpus, &order);
-    x2apic && crate::block::prove(com1)
+    // A controller whose own numbers leave no interrupt queue (ruling (a) of 2026-11-14): the
+    // proofs through interrupts are not proven, and say why; the polled ones still run.
+    let no_interrupts =
+        crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().and_then(|d| d.no_interrupts));
+    let (per_cpu, x2apic) = match no_interrupts {
+        Some(why) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: NVMe: per-CPU queues: not proven: {why}"
+            );
+            let _ = writeln!(
+                com1,
+                "origin-kernel: x2APIC: not proven through NVMe: {why}"
+            );
+            (interrupts, interrupts)
+        }
+        None => {
+            let (order, left_out) = queue_order(cpus);
+            let per_cpu = interrupts && prove_per_cpu(com1, &order, &left_out, tsc_hz);
+            (per_cpu, per_cpu && prove_x2apic(com1, cpus, &order))
+        }
+    };
+    per_cpu && x2apic && crate::block::prove(com1)
 }
 
-/// Device block size and block count of namespace 1, or `None` if no controller is bound.
+/// Device block size and block count of the namespace bound, or `None` if no controller is
+/// bound.
 pub(crate) fn geometry() -> Option<(u32, u64)> {
     crate::cpu::without_interrupts(|| {
         let g = DRIVER.lock();
@@ -451,7 +569,8 @@ pub(crate) fn geometry() -> Option<(u32, u64)> {
     })
 }
 
-/// Whether namespace 1 is the boot test's disk, the only one the boot proofs may write to.
+/// Whether the namespace bound is the boot test's disk, the only one the boot proofs may write
+/// to.
 pub(crate) fn on_test_disk() -> bool {
     crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().is_some_and(|d| d.test_disk))
 }
@@ -468,66 +587,133 @@ pub(crate) fn dma_page() -> Option<DmaPage> {
 /// from the boot flow. A [`Transfer::Stuck`] means the command may still be live: the page
 /// must not be reused.
 pub(crate) fn transfer(write: bool, lba: u64, bus: u64, blocks: u32) -> Transfer {
-    match transfer_status(write, lba, bus, blocks) {
-        Ok(status) if status.ok() => Transfer::Done,
-        Ok(_) | Err(Failure::Full | Failure::Dead | Failure::Busy) => Transfer::Failed,
-        Err(Failure::Timeout | Failure::WrongCommand) => Transfer::Stuck,
+    let fault = match transfer_status(write, lba, bus, blocks) {
+        Ok(status) if status.ok() => return Transfer::Done,
+        Ok(status) => Fault::Status(status),
+        Err(fault) => fault,
+    };
+    note_failure(if write { "a write" } else { "a read" }, fault);
+    if fault.may_be_live() {
+        Transfer::Stuck
+    } else {
+        Transfer::Failed
     }
 }
 
-/// As [`transfer`], returning the completion's status, or why there is none.
-fn transfer_status(write: bool, lba: u64, bus: u64, blocks: u32) -> Result<nvme::Status, Failure> {
-    let (block_size, _) = geometry().ok_or(Failure::Full)?;
-    let prps = nvme::prps(bus, u64::from(blocks) * u64::from(block_size), PAGE).unwrap_or((bus, 0));
+/// As [`transfer`], returning the completion's status, or why there is none. A transfer that
+/// two PRP entries cannot describe is refused before it is submitted (L7).
+fn transfer_status(write: bool, lba: u64, bus: u64, blocks: u32) -> Result<nvme::Status, Fault> {
+    let (nsid, block_size) = crate::cpu::without_interrupts(|| {
+        DRIVER
+            .lock()
+            .as_ref()
+            .map(|d| (d.nvme.nsid, d.namespace.block_size))
+    })
+    .ok_or(Fault::NoQueue)?;
+    let prps = nvme::prps(bus, u64::from(blocks) * u64::from(block_size), PAGE)
+        .ok_or(Fault::NeedsPrpList)?;
     command(Q::Polled, |cid| {
-        Command::transfer(write, cid, NSID, lba, blocks, prps)
+        Command::transfer(write, cid, nsid, lba, blocks, prps)
     })
     .map(|c| c.status)
 }
 
-/// Flushes namespace 1's write cache to media.
+/// Flushes the bound namespace's write cache to media.
 pub(crate) fn flush_device() -> bool {
-    command(Q::Polled, |cid| Command::flush(cid, NSID)).is_ok_and(|c| c.status.ok())
+    let Some(nsid) = crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().map(|d| d.nvme.nsid))
+    else {
+        note_failure("the flush", Fault::NoQueue);
+        return false;
+    };
+    let fault = match command(Q::Polled, |cid| Command::flush(cid, nsid)) {
+        Ok(c) if c.status.ok() => return true,
+        Ok(c) => Fault::Status(c.status),
+        Err(fault) => fault,
+    };
+    note_failure("the flush", fault);
+    false
+}
+
+/// What the polled queue's commands for the block layer and the IOMMU proofs did (finding P1
+/// of TASKS item 59): the latest failure, by step, and the longest any command took.
+struct PolledRecord {
+    failure: Option<nvme::StepFault>,
+    longest_us: u64,
+}
+
+static POLLED: SpinLock<PolledRecord> = SpinLock::new(PolledRecord {
+    failure: None,
+    longest_us: 0,
+});
+
+/// Records that the block layer's `step` failed with `fault`.
+fn note_failure(step: &'static str, fault: Fault) {
+    crate::cpu::without_interrupts(|| {
+        POLLED.lock().failure = Some(nvme::StepFault { step, fault });
+    });
+}
+
+/// For a failing block-cache line: the latest failure on the polled queue and the longest
+/// command it ran, or nothing if no command failed.
+pub(crate) fn failure_note() -> alloc::string::String {
+    let (failure, longest) = crate::cpu::without_interrupts(|| {
+        let r = POLLED.lock();
+        (r.failure, r.longest_us)
+    });
+    match failure {
+        Some(f) => alloc::format!(" ({f}; the longest command took {longest} us)"),
+        None => alloc::string::String::new(),
+    }
 }
 
 /// Runs one command on queue `q` of the bound controller: submitted under the driver lock,
 /// then waited for with the lock released (taken again only to look for the completion) and
 /// interrupts let in. Queues are shared, so a caller that finds another command outstanding
 /// waits its turn the same way, for as long as one command may take.
-fn command(q: Q, make: impl Fn(u16) -> Command) -> Result<Completion, Failure> {
-    let turn = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
-    let cid = loop {
+fn command(q: Q, make: impl Fn(u16) -> Command) -> Result<Completion, Fault> {
+    let start = crate::time::monotonic_nanos();
+    // Another command's turn may last as long as the longest deadline.
+    let turn = start + nvme::FLUSH_DEADLINE_MS * 1_000_000;
+    let (cid, ms) = loop {
         let submitted = crate::cpu::without_interrupts(|| match DRIVER.lock().as_mut() {
             Some(d) => d.nvme.submit(q, &make),
-            None => Err(Failure::Full),
+            None => Err(Fault::NoQueue),
         });
         match submitted {
-            Ok(cid) => break cid,
-            Err(Failure::Busy) if crate::time::monotonic_nanos() < turn => between_polls(),
-            Err(failure) => return Err(failure),
+            Ok(sent) => break sent,
+            Err(Fault::Busy) if crate::time::monotonic_nanos() < turn => between_polls(),
+            Err(fault) => return Err(fault),
         }
     };
-    let deadline = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
-    loop {
+    let deadline = crate::time::monotonic_nanos() + ms * 1_000_000;
+    let result = loop {
         // The clock first, as in `Nvme::run`.
         let late = crate::time::monotonic_nanos() > deadline;
         let done = crate::cpu::without_interrupts(|| {
             let mut g = DRIVER.lock();
             let Some(d) = g.as_mut() else {
-                return Some(Err(Failure::Timeout));
+                return Some(Err(Fault::QueueDied));
             };
             let done = d.nvme.poll(q, cid);
             if done.is_none() && late {
                 d.nvme.kill(q);
-                return Some(Err(Failure::Timeout));
+                return Some(Err(Fault::NoCompletion { ms }));
             }
             done
         });
         if let Some(done) = done {
-            return done;
+            break done;
         }
         between_polls();
+    };
+    if q == Q::Polled {
+        let us = (crate::time::monotonic_nanos() - start) / 1000;
+        crate::cpu::without_interrupts(|| {
+            let mut r = POLLED.lock();
+            r.longest_us = r.longest_us.max(us);
+        });
     }
+    result
 }
 
 /// Runs boot-flow set-up on the bound driver with no lock held: the driver is taken out of
@@ -538,6 +724,21 @@ fn with_driver_out<T>(f: impl FnOnce(&mut Driver) -> T) -> Option<T> {
     let result = f(&mut driver);
     crate::cpu::without_interrupts(|| *DRIVER.lock() = Some(driver));
     Some(result)
+}
+
+/// Prints why set-up stopped at `step`, a command that did not succeed, and gives the short
+/// reason `init` prints after it.
+fn failed_at(com1: &mut Console, step: &str, fault: Fault) -> &'static str {
+    let _ = writeln!(com1, "origin-kernel: NVMe: {step}: {fault}");
+    "a command during set-up did not succeed"
+}
+
+/// Whether MSI-X is already on for the function at `at`: the firmware may leave it on, and
+/// then INTMS must not be touched (Base 2.4 p. 85).
+fn msix_enabled(at: pci::Address) -> bool {
+    crate::pcie::msix(at)
+        .and_then(|m| crate::pcie::read_config32(at, m.capability))
+        .is_some_and(|dword| (dword >> 16) & pci::MSIX_ENABLE != 0)
 }
 
 fn bind(
@@ -566,23 +767,45 @@ fn bind(
         pairs: 0,
         allocated: (0, 0),
         bar_queues: 0,
+        io_entries: 0,
+        ready: nvme::ready_timeouts(&Capabilities::decode(0), 0),
+        nsid: 0,
     };
     c.cap = Capabilities::decode(c.read64(register::CAP));
     c.bar_queues = nvme::doorbell_queues(c.cap.doorbell_stride, bar.size);
+    // CRTO exists only on a controller that reports ready modes; on an older one offset 68h
+    // is reserved (Base 2.4 §3.5.4).
+    let crto = if c.cap.ready_modes != 0 {
+        c.read32(register::CRTO)
+    } else {
+        0
+    };
+    c.ready = nvme::ready_timeouts(&c.cap, crto);
     // CAP is the device's word. Before the first command and its first doorbell: every
     // doorbell the driver will ring lies inside BAR 0 (the admin queues', queue pairs 1
     // (polled), 2 (one interrupt) and one per processor while there is room: ADR-0008
     // Amendment 1, D6). The processors past what BAR 0, the controller or its MSI-X vectors
-    // hold get no queue of their own.
+    // hold get no queue of their own, and a controller with room for one pair is bound for
+    // polled I/O alone.
     let asked = u16::try_from(cpus.saturating_add(2)).unwrap_or(u16::MAX);
-    let wanted = (2..=asked)
+    let wanted = (1..=asked)
         .rev()
         .find(|&q| nvme::doorbells_fit(q, c.cap.doorbell_stride, bar.size))
         .ok_or("the queues' doorbells lie outside BAR 0")?;
-    let (major, minor, tertiary) = nvme::version(c.read32(register::VS));
+    let version = nvme::version(c.read32(register::VS));
+    let (major, minor, tertiary) = version;
+    let timeouts = if c.cap.ready_modes != 0 {
+        alloc::format!(
+            "CRTO.CRWMT {} ms, CAP.TO {} ms",
+            u64::from(crto & 0xFFFF) * 500,
+            c.cap.timeout_ms
+        )
+    } else {
+        alloc::string::String::from("CAP.TO; no ready modes, so no CRTO")
+    };
     let _ = writeln!(
         com1,
-        "origin-kernel: NVMe: {} {:04x}:{:04x}, NVMe {major}.{minor}.{tertiary}; BAR0 {} KiB at {:#x} mapped uncached; up to {} entries per queue, doorbell stride {}, ready timeout {} ms",
+        "origin-kernel: NVMe: {} {:04x}:{:04x}, NVMe {major}.{minor}.{tertiary}; BAR0 {} KiB at {:#x} mapped uncached; up to {} entries per queue, doorbell stride {}, ready timeout {} ms ({timeouts})",
         f.at,
         f.vendor,
         f.device,
@@ -590,20 +813,34 @@ fn bind(
         bar.address,
         c.cap.max_entries,
         c.cap.doorbell_stride,
-        c.cap.timeout_ms
+        c.ready.enable_ms
     );
     if !c.cap.nvm || c.cap.min_page_shift > 12 || c.cap.max_page_shift < 12 {
         return Err("no NVM command set or no 4 KiB pages");
     }
-    if c.cap.max_entries < u32::from(IO_ENTRIES) {
-        return Err("queues too small");
-    }
-    // Reset, then bus mastering, then the admin queues, then enable.
+    c.io_entries = nvme::io_queue_entries(&c.cap)
+        .ok_or("its queues hold one entry, below the smallest valid queue (MQES 0)")?;
+    // The reset (M5): a controller the firmware enabled is let become ready first, since
+    // clearing EN while RDY is 0 has undefined results; one ready, or with fatal status, is
+    // reset at once. Then bus mastering, then the admin queues, then enable.
     let cc = c.read32(register::CC);
-    if cc & 1 != 0 {
-        c.write32(register::CC, cc & !1);
+    match nvme::before_reset(cc, c.read32(register::CSTS)) {
+        nvme::ResetStep::AwaitIdle => {}
+        nvme::ResetStep::Clear => c.write32(register::CC, cc & !nvme::CC_ENABLE),
+        nvme::ResetStep::AwaitReady => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: NVMe: the firmware left the controller enabled and not yet ready: waiting for it before the reset"
+            );
+            if !c.await_csts(com1, true, false)? {
+                return Err(
+                    "the controller the firmware enabled did not become ready, and clearing CC.EN before it does has undefined results",
+                );
+            }
+            c.write32(register::CC, cc & !nvme::CC_ENABLE);
+        }
     }
-    c.wait_ready(false)?;
+    c.wait_ready(com1, false)?;
     let command = dma.enable_bus_master(f.at)?;
     let _ = writeln!(
         com1,
@@ -612,62 +849,62 @@ fn bind(
     c.write32(register::AQA, nvme::aqa(ADMIN_ENTRIES));
     c.write64(register::ASQ, c.admin.sq.bus().raw());
     c.write64(register::ACQ, c.admin.cq.bus().raw());
+    // Its configuration first, with EN 0, then EN (Base 2.4 §3.5.1 steps 3 to 5).
+    c.write32(register::CC, nvme::cc_config(12));
     c.write32(register::CC, nvme::cc_enable(12));
-    c.wait_ready(true)?;
-    // The driver polls: mask the controller's pin interrupt.
-    c.write32(register::INTMS, u32::MAX);
+    c.wait_ready(com1, true)?;
+    // The driver polls: mask the controller's pin and MSI interrupts, unless MSI-X is already
+    // on, when INTMS must not be touched (Base 2.4 p. 85).
+    if msix_enabled(f.at) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: NVMe: INTMS not written: MSI-X was already on when the driver bound"
+        );
+    } else {
+        c.write32(register::INTMS, u32::MAX);
+    }
 
     let data = dma.page().ok_or("no memory for a data page")?;
-    let failed = |e: Failure| -> &'static str {
-        match e {
-            Failure::Full => "queue full",
-            Failure::Timeout => "a command timed out",
-            Failure::WrongCommand => "a completion for another command",
-            Failure::Dead => "a command on a queue that lost an earlier one",
-            Failure::Busy => "a command on a queue with one outstanding",
-        }
-    };
     let id = c
         .run(Q::Admin, |cid| {
-            Command::identify(cid, 1, 0, data.bus().raw())
+            Command::identify(cid, nvme::cns::CONTROLLER, 0, data.bus().raw())
         })
-        .map_err(failed)?;
+        .map_err(|fault| failed_at(com1, "Identify Controller", fault))?;
     if !id.status.ok() {
-        return Err("Identify Controller failed");
+        return Err(failed_at(
+            com1,
+            "Identify Controller",
+            Fault::Status(id.status),
+        ));
     }
     let mut page = [0u8; 4096];
     page.copy_from_slice(&data.to_bytes());
     let info = nvme::identify_controller(&page);
     let _ = writeln!(
         com1,
-        "origin-kernel: NVMe: controller ready: model \"{}\", serial \"{}\", firmware \"{}\", {} namespaces, MDTS {}",
+        "origin-kernel: NVMe: controller ready: model \"{}\", serial \"{}\", firmware \"{}\", {} namespaces, MDTS {}, controller type {:#x} ({})",
         nvme::text(&info.model),
         nvme::text(&info.serial),
         nvme::text(&info.firmware),
         info.namespaces,
-        info.mdts
+        info.mdts,
+        info.controller_type,
+        nvme::controller_type_name(info.controller_type)
     );
-    let ns = c
-        .run(Q::Admin, |cid| {
-            Command::identify(cid, 0, NSID, data.bus().raw())
-        })
-        .map_err(failed)?;
-    page.copy_from_slice(&data.to_bytes());
-    let Some(namespace) = ns
-        .status
-        .ok()
-        .then(|| nvme::identify_namespace(&page))
-        .flatten()
-    else {
-        return Err("namespace 1 is not usable");
-    };
-    if !namespace.block_fits_page(PAGE) {
-        // A longer block needs a PRP list per block, and PRP1 alone would overrun the page.
-        return Err("namespace 1's blocks are larger than a page");
+    if !nvme::io_controller(info.controller_type, version) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: NVMe: controller type {:#x} ({}) from an NVMe {major}.{minor} controller: only an I/O controller has I/O queues, and 0h is reserved from 1.4 on",
+            info.controller_type,
+            nvme::controller_type_name(info.controller_type)
+        );
+        return Err("not an I/O controller");
     }
+    let (nsid, namespace, refused, cns) = choose_namespace(com1, &mut c, &data, &info, version)?;
+    c.nsid = nsid;
     let _ = writeln!(
         com1,
-        "origin-kernel: NVMe: namespace {NSID}: {} blocks of {} B ({} MiB)",
+        "origin-kernel: NVMe: namespace {nsid}: {} blocks of {} B ({} MiB); the first of the controller's active NVM namespaces this driver can use (Identify CNS {cns:02x}h), {refused} refused before it",
         namespace.blocks,
         namespace.block_size,
         (namespace.blocks * u64::from(namespace.block_size)) >> 20
@@ -676,46 +913,135 @@ fn bind(
         .run(Q::Admin, |cid| {
             Command::set_number_of_queues(cid, wanted, wanted)
         })
-        .map_err(failed)?;
-    let (sqs, cqs) = nvme::allocated_queues(granted.result);
-    if !granted.status.ok() || sqs < 2 || cqs < 2 {
-        return Err("the controller allocated too few I/O queues");
+        .map_err(|fault| failed_at(com1, "Set Features, Number of Queues", fault))?;
+    if !granted.status.ok() {
+        return Err(failed_at(
+            com1,
+            "Set Features, Number of Queues",
+            Fault::Status(granted.status),
+        ));
     }
+    // At least one pair of each: the counts are zero-based.
+    let (sqs, cqs) = nvme::allocated_queues(granted.result);
     c.allocated = (sqs, cqs);
     c.pairs = u16::try_from(sqs.min(cqs)).unwrap_or(u16::MAX).min(wanted);
     let _ = writeln!(
         com1,
-        "origin-kernel: NVMe: asked for {wanted} I/O queue pairs, allocated {sqs} submission and {cqs} completion queues: {} for the processors' own",
-        c.pairs - 2
+        "origin-kernel: NVMe: asked for {wanted} I/O queue pairs, allocated {sqs} submission and {cqs} completion queues: {} for the processors' own; I/O queues of {} entries",
+        c.pairs.saturating_sub(2),
+        c.io_entries
     );
-    let io = new_queue(dma, 1, IO_ENTRIES).ok_or("no memory for the I/O queues")?;
+    let entries = c.io_entries;
+    let io = new_queue(dma, 1, entries).ok_or("no memory for the I/O queues")?;
     let (cq_bus, sq_bus) = (io.cq.bus().raw(), io.sq.bus().raw());
     let created = c
         .run(Q::Admin, |cid| {
-            Command::create_io_cq(cid, 1, IO_ENTRIES, cq_bus)
+            Command::create_io_cq(cid, 1, entries, cq_bus)
         })
-        .map_err(failed)?;
+        .map_err(|fault| failed_at(com1, "Create I/O Completion Queue 1", fault))?;
     if !created.status.ok() {
-        return Err("Create I/O Completion Queue failed");
+        return Err(failed_at(
+            com1,
+            "Create I/O Completion Queue 1",
+            Fault::Status(created.status),
+        ));
     }
     let created = c
         .run(Q::Admin, |cid| {
-            Command::create_io_sq(cid, 1, IO_ENTRIES, 1, sq_bus)
+            Command::create_io_sq(cid, 1, entries, 1, sq_bus)
         })
-        .map_err(failed)?;
+        .map_err(|fault| failed_at(com1, "Create I/O Submission Queue 1", fault))?;
     if !created.status.ok() {
-        return Err("Create I/O Submission Queue failed");
+        return Err(failed_at(
+            com1,
+            "Create I/O Submission Queue 1",
+            Fault::Status(created.status),
+        ));
     }
     c.io = Some(io);
-    let on_test_disk = is_test_disk(&mut c, &data, namespace).map_err(failed)?;
-    let ok = prove_io(com1, &mut c, &data, namespace, on_test_disk).map_err(failed)?;
-    let gpt = prove_gpt(com1, &mut c, &data, namespace, on_test_disk).map_err(failed)?;
+    let on_test_disk = is_test_disk(&mut c, &data, namespace)
+        .map_err(|fault| failed_at(com1, "a read of the namespace", fault))?;
+    let ok = prove_io(com1, &mut c, &data, namespace, on_test_disk)
+        .map_err(|fault| failed_at(com1, "a command of the polled proofs", fault))?;
+    let gpt = prove_gpt(com1, &mut c, &data, namespace, on_test_disk)
+        .map_err(|fault| failed_at(com1, "a read of the GPT", fault))?;
     Ok((c, ok && gpt, namespace, on_test_disk))
 }
 
-/// Whether namespace 1 is the disk the boot test builds, the only one the boot proofs may
-/// write to (CLAUDE.md P0). Reads only, and nothing at all on a disk of any other geometry.
-fn is_test_disk(c: &mut Nvme, data: &DmaPage, ns: NamespaceInfo) -> Result<bool, Failure> {
+/// The first of the controller's active NVM namespaces the driver can use (M3; the
+/// coordinating session's ruling (f) of 2026-11-14), with how many were refused before it and
+/// the CNS that listed them. The list is Identify CNS 07h with CSI 0, which holds only NVM
+/// namespaces, or CNS 02h from an older controller (`nvme::active_list_cns`); it is walked in
+/// order, and each namespace refused is named with its NSID and reason. Origin supports the
+/// NVM Command Set alone: a zoned or key-value namespace is never listed. One list of 1,024 is
+/// walked.
+fn choose_namespace(
+    com1: &mut Console,
+    c: &mut Nvme,
+    data: &DmaPage,
+    info: &nvme::ControllerInfo,
+    version: (u16, u8, u8),
+) -> Result<(u32, NamespaceInfo, usize, u8), &'static str> {
+    let cns = nvme::active_list_cns(&c.cap, version);
+    let step = "Identify, the active namespace list";
+    let listed = c
+        .run(Q::Admin, |cid| {
+            Command::identify(cid, cns, 0, data.bus().raw())
+        })
+        .map_err(|fault| failed_at(com1, step, fault))?;
+    if !listed.status.ok() {
+        return Err(failed_at(com1, step, Fault::Status(listed.status)));
+    }
+    let mut list = [0u8; 4096];
+    list.copy_from_slice(&data.to_bytes());
+    let mut refused = 0;
+    for entry in nvme::active_namespaces(&list, info.namespaces) {
+        let nsid = match entry {
+            Ok(nsid) => nsid,
+            Err(bad) => {
+                let _ = writeln!(
+                    com1,
+                    "origin-kernel: NVMe: the active namespace list holds {bad:#x}, which is not a valid NSID above the one before it (NN {}): the walk stops there",
+                    info.namespaces
+                );
+                break;
+            }
+        };
+        let ns = c
+            .run(Q::Admin, |cid| {
+                Command::identify(cid, nvme::cns::NAMESPACE, nsid, data.bus().raw())
+            })
+            .map_err(|fault| failed_at(com1, "Identify Namespace", fault))?;
+        let why = if ns.status.ok() {
+            let mut page = [0u8; 4096];
+            page.copy_from_slice(&data.to_bytes());
+            match nvme::usable_namespace(&page) {
+                Ok(n) if n.block_fits_page(PAGE) => return Ok((nsid, n, refused, cns)),
+                Ok(n) => alloc::format!(
+                    "its blocks of {} B are larger than a page, and would need a PRP list each",
+                    n.block_size
+                ),
+                Err(why) => alloc::format!("{why}"),
+            }
+        } else {
+            alloc::format!("Identify Namespace {}", Fault::Status(ns.status))
+        };
+        refused += 1;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: NVMe: namespace {nsid}: {why}: not used"
+        );
+    }
+    let _ = writeln!(
+        com1,
+        "origin-kernel: NVMe: no active NVM namespace this driver can use ({refused} refused; the list from Identify CNS {cns:02x}h)"
+    );
+    Err("no usable NVM namespace")
+}
+
+/// Whether the namespace bound is the disk the boot test builds, the only one the boot proofs
+/// may write to (CLAUDE.md P0). Reads only, and nothing at all on a disk of any other geometry.
+fn is_test_disk(c: &mut Nvme, data: &DmaPage, ns: NamespaceInfo) -> Result<bool, Fault> {
     if !test_disk::geometry_matches(ns.blocks, ns.block_size) {
         return Ok(false);
     }
@@ -734,11 +1060,27 @@ static IRQ_RESULT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Programs MSI-X for I/O queue 2 (vector 1, sent to processor `target` at
 /// `cpu::DEVICE_VECTOR`, every other entry masked), turns MSI-X on, and creates the queue
-/// pair with interrupts. Returns the MSI-X capability.
-fn setup_interrupts(d: &mut Driver, target: u32) -> Result<pci::Msix, &'static str> {
+/// pair with interrupts. Returns the MSI-X capability, or why the controller's own numbers
+/// leave no interrupt queue (one I/O queue pair, or fewer than two MSI-X vectors), which is
+/// then recorded in `d`.
+fn setup_interrupts(
+    d: &mut Driver,
+    target: u32,
+) -> Result<Result<pci::Msix, NoInterrupts>, &'static str> {
+    if d.nvme.pairs < 2 {
+        let why = NoInterrupts::OnePair {
+            sqs: d.nvme.allocated.0,
+            cqs: d.nvme.allocated.1,
+            bar_queues: d.nvme.bar_queues,
+        };
+        d.no_interrupts = Some(why);
+        return Ok(Err(why));
+    }
     let msix = crate::pcie::msix(d.dev.function.at).ok_or("no MSI-X capability")?;
     if msix.entries < 2 {
-        return Err("fewer than two MSI-X vectors");
+        let why = NoInterrupts::Vectors(msix.entries);
+        d.no_interrupts = Some(why);
+        return Ok(Err(why));
     }
     let bar = d
         .dev
@@ -776,13 +1118,14 @@ fn setup_interrupts(d: &mut Driver, target: u32) -> Result<pci::Msix, &'static s
     if control & pci::MSIX_ENABLE == 0 || control & pci::MSIX_FUNCTION_MASK != 0 {
         return Err("MSI-X did not turn on");
     }
-    let queue = new_queue(d.nvme.dma, 2, IO_ENTRIES).ok_or("no memory for I/O queue 2")?;
+    let entries = d.nvme.io_entries;
+    let queue = new_queue(d.nvme.dma, 2, entries).ok_or("no memory for I/O queue 2")?;
     let (cq, sq) = (queue.cq.bus().raw(), queue.sq.bus().raw());
     let failed = |_| "creating I/O queue 2 failed";
     let made = d
         .nvme
         .run(Q::Admin, |cid| {
-            Command::create_io_cq_with_interrupts(cid, 2, IO_ENTRIES, 1, cq)
+            Command::create_io_cq_with_interrupts(cid, 2, entries, 1, cq)
         })
         .map_err(failed)?;
     if !made.status.ok() {
@@ -791,7 +1134,7 @@ fn setup_interrupts(d: &mut Driver, target: u32) -> Result<pci::Msix, &'static s
     let made = d
         .nvme
         .run(Q::Admin, |cid| {
-            Command::create_io_sq(cid, 2, IO_ENTRIES, 2, sq)
+            Command::create_io_sq(cid, 2, entries, 2, sq)
         })
         .map_err(failed)?;
     if !made.status.ok() {
@@ -799,7 +1142,7 @@ fn setup_interrupts(d: &mut Driver, target: u32) -> Result<pci::Msix, &'static s
     }
     d.nvme.irq = Some(queue);
     d.msix = Some((table, msix));
-    Ok(msix)
+    Ok(Ok(msix))
 }
 
 /// The interrupt-driven proof's thread: [`IRQ_READS`] reads through I/O queue 2, each
@@ -813,21 +1156,22 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
     let mut expected = [0u8; 512];
     for i in 0..IRQ_READS {
         let lba = 2048 + (i % 8) * 8;
-        let cid = crate::cpu::without_interrupts(|| {
+        let sent = crate::cpu::without_interrupts(|| {
             let mut g = DRIVER.lock();
             let d = g.as_mut()?;
             let prps = (d.page.bus().raw(), 0);
+            let nsid = d.nvme.nsid;
             d.nvme
                 .submit(Q::Interrupt, |cid| {
-                    Command::transfer(false, cid, NSID, lba, 8, prps)
+                    Command::transfer(false, cid, nsid, lba, 8, prps)
                 })
                 .ok()
         });
-        let Some(cid) = cid else {
+        let Some((cid, ms)) = sent else {
             break;
         };
         let done = core::cell::Cell::new(None);
-        let deadline = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
+        let deadline = crate::time::monotonic_nanos() + ms * 1_000_000;
         let Some(wait) = IO_WAIT.get(crate::cpu::this_cpu().get()) else {
             break;
         };
@@ -893,7 +1237,15 @@ fn prove_interrupts(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
     })
     .unwrap_or(Err("no driver"));
     let msix = match setup {
-        Ok(m) => m,
+        Ok(Ok(m)) => m,
+        // The controller's own numbers leave no interrupt queue (ruling (a) of 2026-11-14).
+        Ok(Err(why)) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: NVMe: interrupt-driven: not proven: {why}"
+            );
+            return true;
+        }
         Err(why) => {
             let _ = writeln!(com1, "origin-kernel: NVMe: MSI-X: {why}: NVMe failed");
             return false;
@@ -956,16 +1308,17 @@ fn read_blocks(
     ns: NamespaceInfo,
     lba: u64,
     out: &mut [u8],
-) -> Result<bool, Failure> {
+) -> Result<bool, Fault> {
     let bs = u64::from(ns.block_size);
     let per_page = (PAGE / bs).max(1);
     let mut done = 0u64;
+    let nsid = c.nsid;
     for chunk in out.chunks_mut(PAGE as usize) {
         let blocks = (chunk.len() as u64).div_ceil(bs).min(per_page);
-        let prps = nvme::prps(data.bus().raw(), blocks * bs, PAGE).unwrap_or((data.bus().raw(), 0));
+        let prps = nvme::prps(data.bus().raw(), blocks * bs, PAGE).ok_or(Fault::NeedsPrpList)?;
         let at = lba + done;
         let r = c.run(Q::Polled, |cid| {
-            Command::transfer(false, cid, NSID, at, blocks as u32, prps)
+            Command::transfer(false, cid, nsid, at, blocks as u32, prps)
         })?;
         if !r.status.ok() {
             return Ok(false);
@@ -987,7 +1340,7 @@ fn read_gpt_copy(
     ns: NamespaceInfo,
     lba: u64,
     parts: &mut [gpt::Partition],
-) -> Result<GptCopy, Failure> {
+) -> Result<GptCopy, Fault> {
     let mut block = alloc::vec![0u8; ns.block_size as usize];
     if !read_blocks(c, data, ns, lba, &mut block)? {
         return Ok(Err(gpt::GptError::Signature));
@@ -1025,7 +1378,7 @@ fn prove_gpt(
     data: &DmaPage,
     ns: NamespaceInfo,
     on_test_disk: bool,
-) -> Result<bool, Failure> {
+) -> Result<bool, Fault> {
     let empty = gpt::Partition {
         index: 0,
         kind: gpt::Guid::default(),
@@ -1090,7 +1443,7 @@ fn prove_io(
     data: &DmaPage,
     ns: NamespaceInfo,
     on_test_disk: bool,
-) -> Result<bool, Failure> {
+) -> Result<bool, Fault> {
     if !on_test_disk {
         let _ = writeln!(
             com1,
@@ -1099,11 +1452,12 @@ fn prove_io(
         return Ok(true);
     }
     let bs = u64::from(ns.block_size);
+    let nsid = c.nsid;
     let read = |c: &mut Nvme, lba: u64, blocks: u32| {
         let prps = nvme::prps(data.bus().raw(), u64::from(blocks) * bs, PAGE)
-            .unwrap_or((data.bus().raw(), 0));
+            .ok_or(Fault::NeedsPrpList)?;
         c.run(Q::Polled, |cid| {
-            Command::transfer(false, cid, NSID, lba, blocks, prps)
+            Command::transfer(false, cid, nsid, lba, blocks, prps)
         })
     };
     let mbr = read(c, 0, 1)?;
@@ -1137,22 +1491,39 @@ fn prove_io(
     data.fill(&block);
     let prps = (data.bus().raw(), 0);
     let wrote = c.run(Q::Polled, |cid| {
-        Command::transfer(true, cid, NSID, scratch, 1, prps)
+        Command::transfer(true, cid, nsid, scratch, 1, prps)
     })?;
-    let flushed = c.run(Q::Polled, |cid| Command::flush(cid, NSID))?;
+    let flushed = c.run(Q::Polled, |cid| Command::flush(cid, nsid))?;
     data.fill(&[0u8; 512]);
     let back = read(c, scratch, 1)?;
-    let round_trip = wrote.status.ok()
-        && flushed.status.ok()
-        && back.status.ok()
-        && data.to_bytes().get(0..512) == Some(&block[..]);
-    // A read past the end must fail with "LBA out of range", not succeed or hang.
+    let same = data.to_bytes().get(0..512) == Some(&block[..]);
+    let round_trip = wrote.status.ok() && flushed.status.ok() && back.status.ok() && same;
+    // Which step failed, if one did (finding P1 of TASKS item 59).
+    let failed_step = [
+        ("the write", wrote),
+        ("the flush", flushed),
+        ("the read", back),
+    ]
+    .into_iter()
+    .find(|(_, c)| !c.status.ok())
+    .map(|(step, c)| {
+        alloc::format!(
+            " ({})",
+            nvme::StepFault {
+                step,
+                fault: Fault::Status(c.status)
+            }
+        )
+    })
+    .unwrap_or_default();
+    // A read past the end must fail with "LBA out of range", not succeed or hang. DNR is not
+    // asked for: no status requires it (L5).
     let past = read(c, ns.blocks, 1)?;
-    let refused = past.status == nvme::LBA_OUT_OF_RANGE;
+    let refused = past.status.is(&nvme::LBA_OUT_OF_RANGE);
     let ok = round_trip && refused;
     let _ = writeln!(
         com1,
-        "origin-kernel: NVMe: wrote LBA {scratch}, flushed and read it back: match {round_trip}; a read at LBA {} (past the end) failed with status type {} code {:#x} (LBA out of range: {refused}){}",
+        "origin-kernel: NVMe: wrote LBA {scratch}, flushed and read it back: match {round_trip}{failed_step}; a read at LBA {} (past the end) failed with status type {} code {:#x} (LBA out of range: {refused}){}",
         ns.blocks,
         past.status.kind,
         past.status.code,
@@ -1161,13 +1532,18 @@ fn prove_io(
     Ok(reads_ok && ok)
 }
 
-/// One processor's own I/O queue pair, with its controller's doorbell addresses and a data
-/// page: only threads on that processor use it, so it never waits on another's lock.
+/// One processor's own I/O queue pair, with its controller's doorbell addresses, the namespace
+/// bound and a data page: only threads on that processor use it, so it never waits on
+/// another's lock. It also keeps what its commands did, for the proof's line (finding P1 of
+/// TASKS item 59): the first failure, by step, and the longest any command took.
 pub(crate) struct CpuQueue {
     qp: QueuePair,
     page: DmaPage,
     regs: MmioRegion,
     stride: u64,
+    nsid: u32,
+    failure: Option<nvme::StepFault>,
+    longest_us: u64,
 }
 
 pub(crate) static CPU_QUEUES: PerCpu<SpinLock<Option<CpuQueue>>> = PerCpu::new(
@@ -1241,8 +1617,9 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[CpuIndex]) -> Result<usize, &'static
         entry(2, message.data);
         entry(3, 0);
         d.entries.push(cpu);
+        let entries = d.nvme.io_entries;
         let queue =
-            new_queue(d.nvme.dma, qid, IO_ENTRIES).ok_or("no memory for a per-processor queue")?;
+            new_queue(d.nvme.dma, qid, entries).ok_or("no memory for a per-processor queue")?;
         let page = d
             .nvme
             .dma
@@ -1253,13 +1630,13 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[CpuIndex]) -> Result<usize, &'static
         let made = d
             .nvme
             .run(Q::Admin, |cid| {
-                Command::create_io_cq_with_interrupts(cid, qid, IO_ENTRIES, vector, cq)
+                Command::create_io_cq_with_interrupts(cid, qid, entries, vector, cq)
             })
             .map_err(failed)?;
         let made_sq = d
             .nvme
             .run(Q::Admin, |cid| {
-                Command::create_io_sq(cid, qid, IO_ENTRIES, qid, sq)
+                Command::create_io_sq(cid, qid, entries, qid, sq)
             })
             .map_err(failed)?;
         if !made.status.ok() || !made_sq.status.ok() {
@@ -1272,6 +1649,9 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[CpuIndex]) -> Result<usize, &'static
                 page,
                 regs: d.nvme.regs,
                 stride: d.nvme.cap.doorbell_stride,
+                nsid: d.nvme.nsid,
+                failure: None,
+                longest_us: 0,
             });
         });
         QUEUED.store(k + 1, Ordering::Relaxed);
@@ -1280,23 +1660,27 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[CpuIndex]) -> Result<usize, &'static
 }
 
 /// One command on this processor's own queue: submitted under its lock, then waited for by
-/// blocking until its interrupt (the wait's condition is the completion queue itself).
-/// Returns the page's contents for a read.
-fn cpu_command(me: usize, make: impl FnOnce(u16, u64) -> Command, out: &mut [u8; 4096]) -> bool {
+/// blocking until its interrupt (the wait's condition is the completion queue itself), within
+/// its deadline (`nvme::deadline_ms`). `make` is given the command ID, the page's bus address
+/// and the namespace bound. Copies the page out for a read; returns why it failed, if it did,
+/// and keeps the longest time any command took in the queue's record.
+fn cpu_command(
+    me: usize,
+    make: impl FnOnce(u16, u64, u32) -> Command,
+    out: &mut [u8; 4096],
+) -> Result<(), Fault> {
     let (Some(slot), Some(wait)) = (CPU_QUEUES.get(me), IO_WAIT.get(me)) else {
-        return false;
+        return Err(Fault::NoQueue);
     };
-    let cid = crate::cpu::without_interrupts(|| {
+    let start = crate::time::monotonic_nanos();
+    let (cid, ms) = crate::cpu::without_interrupts(|| {
         let mut g = slot.lock();
-        let q = g.as_mut()?;
-        let bus = q.page.bus().raw();
-        submit_on(&mut q.qp, q.regs, q.stride, |cid| make(cid, bus)).ok()
-    });
-    let Some(cid) = cid else {
-        return false;
-    };
+        let q = g.as_mut().ok_or(Fault::NoQueue)?;
+        let (bus, nsid) = (q.page.bus().raw(), q.nsid);
+        submit_on(&mut q.qp, q.regs, q.stride, |cid| make(cid, bus, nsid))
+    })?;
     let done = core::cell::Cell::new(None);
-    let deadline = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
+    let deadline = start + ms * 1_000_000;
     let waited = wait.wait_until_deadline(
         || {
             let r = slot
@@ -1312,24 +1696,42 @@ fn cpu_command(me: usize, make: impl FnOnce(u16, u64) -> Command, out: &mut [u8;
         deadline,
     );
     count_blocks(*waited.as_ref().unwrap_or(&0));
-    if !matches!(done.get(), Some(Ok(_))) {
-        // No completion for it, so it may still be live: the queue, and the page with it, is
-        // never used again.
+    let us = (crate::time::monotonic_nanos() - start) / 1000;
+    let result = match done.get() {
+        Some(Ok(c)) if c.status.ok() => Ok(()),
+        Some(Ok(c)) => Err(Fault::Status(c.status)),
+        Some(Err(fault)) => Err(fault),
+        None => Err(Fault::NoCompletion { ms }),
+    };
+    crate::cpu::without_interrupts(|| {
+        if let Some(q) = slot.lock().as_mut() {
+            q.longest_us = q.longest_us.max(us);
+            match result {
+                // It may still be live: the queue, and the page with it, is never used again.
+                Err(fault) if fault.may_be_live() => q.qp.gate.kill(),
+                Ok(()) => out.copy_from_slice(&q.page.to_bytes()),
+                Err(_) => {}
+            }
+        }
+    });
+    result
+}
+
+/// Records the first failure of this processor's thread, by step: `Ok` passes through.
+fn cpu_step(me: usize, step: &'static str, result: Result<(), Fault>) -> bool {
+    let Err(fault) = result else {
+        return true;
+    };
+    if let Some(slot) = CPU_QUEUES.get(me) {
         crate::cpu::without_interrupts(|| {
-            if let Some(q) = slot.lock().as_mut() {
-                q.qp.gate.kill();
+            if let Some(q) = slot.lock().as_mut()
+                && q.failure.is_none()
+            {
+                q.failure = Some(nvme::StepFault { step, fault });
             }
         });
     }
-    let ok = waited.is_ok() && matches!(done.get(), Some(Ok(c)) if c.status.ok());
-    if ok {
-        crate::cpu::without_interrupts(|| {
-            if let Some(q) = slot.lock().as_ref() {
-                out.copy_from_slice(&q.page.to_bytes());
-            }
-        });
-    }
-    ok
+    false
 }
 
 /// A processor's thread: [`CPU_READS`] reads of the pattern blocks through its own queue,
@@ -1341,11 +1743,12 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
     let mut expected = [0u8; 512];
     for i in 0..CPU_READS {
         let lba = 2048 + ((i + index) % 8) * 8;
-        if !cpu_command(
+        let read = cpu_command(
             me,
-            |cid, bus| Command::transfer(false, cid, NSID, lba, 8, (bus, 0)),
+            |cid, bus, nsid| Command::transfer(false, cid, nsid, lba, 8, (bus, 0)),
             &mut page,
-        ) {
+        );
+        if !cpu_step(me, "a pattern read", read) {
             break;
         }
         for k in 0..8u64 {
@@ -1370,12 +1773,20 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
                 .is_some()
         });
     let wrote = filled
-        && cpu_command(
+        && cpu_step(
             me,
-            |cid, bus| Command::transfer(true, cid, NSID, scratch, 1, (bus, 0)),
-            &mut page,
+            "its write",
+            cpu_command(
+                me,
+                |cid, bus, nsid| Command::transfer(true, cid, nsid, scratch, 1, (bus, 0)),
+                &mut page,
+            ),
         )
-        && cpu_command(me, |cid, _| Command::flush(cid, NSID), &mut page);
+        && cpu_step(
+            me,
+            "its flush",
+            cpu_command(me, |cid, _, nsid| Command::flush(cid, nsid), &mut page),
+        );
     crate::cpu::without_interrupts(|| {
         if let Some(q) = CPU_QUEUES
             .get(me)
@@ -1385,10 +1796,14 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
         }
     });
     let back = wrote
-        && cpu_command(
+        && cpu_step(
             me,
-            |cid, bus| Command::transfer(false, cid, NSID, scratch, 1, (bus, 0)),
-            &mut page,
+            "its read back",
+            cpu_command(
+                me,
+                |cid, bus, nsid| Command::transfer(false, cid, nsid, scratch, 1, (bus, 0)),
+                &mut page,
+            ),
         )
         && page.get(..512) == Some(&expected[..]);
     if let Some(r) = CPU_RESULT.get(me) {
@@ -1518,11 +1933,26 @@ fn prove_per_cpu(
         ok &= mine;
         reads += r;
         matched += m;
+        // What its commands did (finding P1 of TASKS item 59): the longest, and the first that
+        // failed, by step.
+        let (failure, longest) = CPU_QUEUES.get(c).map_or((None, 0), |slot| {
+            crate::cpu::without_interrupts(|| {
+                slot.lock()
+                    .as_ref()
+                    .map_or((None, 0), |q| (q.failure, q.longest_us))
+            })
+        });
+        let failure = match failure {
+            Some(f) => alloc::format!("; {f}"),
+            None if !back => alloc::string::String::from("; its read back did not match"),
+            None => alloc::string::String::new(),
+        };
         let _ = writeln!(
             com1,
-            "origin-kernel: NVMe: {}: {r} reads through its own queue pair, {m} of {} blocks match, its write read back {back}, {interrupts} interrupts on CPU {cpu}{}",
+            "origin-kernel: NVMe: {}: {r} reads through its own queue pair, {m} of {} blocks match, its write read back {back}, {interrupts} interrupts on CPU {cpu}, the longest command {longest} us{}{}",
             cpu.named(),
             8 * CPU_READS,
+            if mine { "" } else { &failure },
             if mine { "" } else { ": NVMe failed" }
         );
     }
@@ -1710,11 +2140,13 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
                 d.page.bus().raw(),
                 d.test_disk,
                 d.entries.clone(),
+                d.nvme.nsid,
+                d.no_interrupts,
             )
         })
     });
     let on = crate::iommu::translating();
-    let Some((dma, at, msix, irq_page, on_test_disk, entries)) = driver else {
+    let Some((dma, at, msix, irq_page, on_test_disk, entries, nsid, no_interrupts)) = driver else {
         let _ = writeln!(
             com1,
             "origin-kernel: IOMMU: no NVMe controller is bound, so the proofs through one did not run"
@@ -1857,8 +2289,15 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
     let wide_back = wide_route.map(|r| r.destination);
     let released = wide_route.is_some_and(|r| crate::iommu::release_interrupt(at, r.index).is_ok());
     let (_, irtes) = crate::iommu::domains();
+    // A controller whose own numbers leave no interrupt queue programs no NVMe entry (ruling
+    // (a) of 2026-11-14): its part is not proven, and the rest still is.
+    let nvme_expected = if no_interrupts.is_some() {
+        0
+    } else {
+        1 + entries.len()
+    };
     let remapped = crate::iommu::remapping()
-        && nvme_routes == 1 + entries.len()
+        && nvme_routes == nvme_expected
         && routes.len() == nvme_routes + 2
         && through == routes.len()
         && refused
@@ -1866,24 +2305,83 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
         && released;
     let _ = writeln!(
         com1,
-        "origin-kernel: IOMMU: interrupt remapping: {through} of {} MSI-X entries (NVMe {nvme_routes}, virtio-net {}) {}; {irtes} IRTEs in use; APIC ID {WIDE} accepted (its IRTE reads back destination {}), which compatibility format refuses: {refused}; consistent {remapped}{}",
+        "origin-kernel: IOMMU: interrupt remapping: {through} of {} MSI-X entries (NVMe {nvme_routes}, virtio-net {}) {}; {irtes} IRTEs in use; APIC ID {WIDE} accepted (its IRTE reads back destination {}), which compatibility format refuses: {refused}; consistent {remapped}{}{}",
         routes.len(),
         routes.len() - nvme_routes,
         crate::iommu::routing_words(),
         wide_back.map_or(alloc::string::String::from("none"), |d| alloc::format!(
             "{d}"
         )),
+        no_interrupts.map_or(alloc::string::String::new(), |why| alloc::format!(
+            "; NVMe's entries not proven: {why}"
+        )),
         if remapped { "" } else { ": IOMMU failed" }
     );
 
-    // 4. A blocked interrupt: vector 1 sent through a not-present IRTE.
-    let blocked_irq = match (msix, crate::iommu::reserve_blocked_interrupt(at)) {
+    // 4. A blocked interrupt: vector 1 sent through a not-present IRTE, unless the controller's
+    //    own numbers leave no interrupt queue (ruling (a) of 2026-11-14).
+    let blocked_irq = if let Some(why) = no_interrupts {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: blocked interrupt: not proven: {why}"
+        );
+        true
+    } else {
+        prove_blocked_interrupt(com1, at, sid, msix, irq_page, nsid, tsc_hz)
+    };
+
+    // The domains, and what was recorded before the proofs.
+    let (domains, _) = crate::iommu::domains();
+    let _ = write!(com1, "origin-kernel: IOMMU: domains:");
+    for d in &domains {
+        let _ = write!(
+            com1,
+            " {} domain {} ({} pages mapped, {} ever, {} table pages{});",
+            d.at,
+            d.id,
+            d.mapped,
+            d.mapped_ever,
+            d.tables,
+            if d.identity_pages == 0 {
+                alloc::string::String::new()
+            } else {
+                alloc::format!(", {} reserved pages identity-mapped", d.identity_pages)
+            }
+        );
+    }
+    let quiet = !attached_fault && !lost_before;
+    let _ = writeln!(
+        com1,
+        " {}; IOVAs from {:#x}; faults recorded before the proofs: {}{}; consistent {quiet}{}",
+        crate::iommu::default_deny_words(),
+        vtd::IOVA_BASE,
+        before.len(),
+        if lost_before { " (some lost)" } else { "" },
+        if quiet { "" } else { ": IOMMU failed" }
+    );
+    let reserved = prove_reserved(com1, domain, at);
+    translated && blocked && remapped && blocked_irq && quiet && reserved
+}
+
+/// [`prove_iommu`]'s blocked-interrupt clause: NVMe MSI-X vector 1 pointed at a not-present
+/// IRTE, a read on I/O queue 2 completes and raises no interrupt, and the IOMMU records the
+/// fault; vector 1 is restored afterwards.
+fn prove_blocked_interrupt(
+    com1: &mut Console,
+    at: pci::Address,
+    sid: u16,
+    msix: Option<(MmioRegion, pci::Msix)>,
+    irq_page: u64,
+    nsid: u32,
+    tsc_hz: u64,
+) -> bool {
+    match (msix, crate::iommu::reserve_blocked_interrupt(at)) {
         (Some((table, _)), Ok((message, index))) => {
             let saved = msix_message(table, 1);
             msix_point(table, 1, message);
             let before = INTERRUPTS.load(Ordering::Relaxed);
             let completed = command(Q::Interrupt, |cid| {
-                Command::transfer(false, cid, NSID, PROBE_LBA, 8, (irq_page, 0))
+                Command::transfer(false, cid, nsid, PROBE_LBA, 8, (irq_page, 0))
             })
             .ok();
             // Long enough for a message that was delivered to be taken.
@@ -1934,39 +2432,7 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
             );
             false
         }
-    };
-
-    // The domains, and what was recorded before the proofs.
-    let (domains, _) = crate::iommu::domains();
-    let _ = write!(com1, "origin-kernel: IOMMU: domains:");
-    for d in &domains {
-        let _ = write!(
-            com1,
-            " {} domain {} ({} pages mapped, {} ever, {} table pages{});",
-            d.at,
-            d.id,
-            d.mapped,
-            d.mapped_ever,
-            d.tables,
-            if d.identity_pages == 0 {
-                alloc::string::String::new()
-            } else {
-                alloc::format!(", {} reserved pages identity-mapped", d.identity_pages)
-            }
-        );
     }
-    let quiet = !attached_fault && !lost_before;
-    let _ = writeln!(
-        com1,
-        " {}; IOVAs from {:#x}; faults recorded before the proofs: {}{}; consistent {quiet}{}",
-        crate::iommu::default_deny_words(),
-        vtd::IOVA_BASE,
-        before.len(),
-        if lost_before { " (some lost)" } else { "" },
-        if quiet { "" } else { ": IOMMU failed" }
-    );
-    let reserved = prove_reserved(com1, domain, at);
-    translated && blocked && remapped && blocked_irq && quiet && reserved
 }
 
 /// The page of scratch blocks the reserved-memory proof writes: in the data partition, apart
