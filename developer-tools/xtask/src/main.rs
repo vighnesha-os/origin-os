@@ -1302,19 +1302,27 @@ fn is_unfilled_tx_ring(line: &str) -> bool {
     }
 }
 
-/// Whether this boot is oversubscribed: QEMU's software processor with more guest processors
-/// than the host has threads, the host's count read at run time (ADR-0008 Amendment 1, D7: the
-/// 65- and 67-processor machines on the development Mac's 10). Each guest processor is a host
-/// thread, so the scheduler proof's two workers on one guest processor get the shares the host
-/// gives QEMU's threads ([`oversubscribed_fair_share`]).
+/// Whether this boot is one of the oversubscribed machines, named, whose scheduler proof's fair
+/// share is not judged ([`oversubscribed_fair_share`]): under QEMU's software processor,
+/// `boot-matrix`'s 65-processor machine (`ORIGIN_QEMU_SMP=65`), the 67-processor sparse machine
+/// (`ORIGIN_QEMU_TOPOLOGY=sparse`) and the 288-processor run (`many`). Each guest processor is a
+/// host thread, so on those the two workers of one guest processor get the shares the host gives
+/// QEMU's threads. The machines are named, not found from the host's threads (review finding F9
+/// of 2026-11-14; ADR-0013, pending owner item 308): every other machine, those of 1 to 4
+/// processors and `boot-x2apic` among them, is held to a fair share on every host.
 fn oversubscribed() -> bool {
-    let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    Accel::from_env().is_ok_and(|accel| oversubscribed_for(accel, machine().cpus(), host))
+    let topology = env::var("ORIGIN_QEMU_TOPOLOGY").ok();
+    Accel::from_env().is_ok_and(|accel| oversubscribed_for(accel, topology.as_deref(), qemu_cpus()))
 }
 
-/// [`oversubscribed`] for an accelerator, a guest's processors and the host's threads.
-fn oversubscribed_for(accel: Accel, cpus: u32, host_threads: usize) -> bool {
-    accel == Accel::Tcg && cpus as usize > host_threads
+/// [`oversubscribed`] for an accelerator, `ORIGIN_QEMU_TOPOLOGY` and `ORIGIN_QEMU_SMP`.
+fn oversubscribed_for(accel: Accel, topology: Option<&str>, smp: u32) -> bool {
+    accel == Accel::Tcg
+        && match topology {
+            Some("sparse" | "many") => true,
+            Some(_) => false,
+            None => smp == 65,
+        }
 }
 
 /// The two workers' counts on a scheduler proof's line that an oversubscribed boot lets pass
@@ -5937,7 +5945,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
                     .and_then(|rest| rest.split_once(':'))
                     .map_or("a processor", |(cpu, _)| cpu);
                 println!(
-                    "xtask: {}: forgave fairness on an oversubscribed machine ({} guest processors on {host} host threads): {cpu}: the workers counted {first} and {second}; both ran",
+                    "xtask: {}: forgave fairness on an oversubscribed machine, named (ADR-0013; {} guest processors on {host} host threads): {cpu}: the workers counted {first} and {second}; both ran",
                     scenario.label,
                     machine().cpus()
                 );
@@ -6504,17 +6512,27 @@ mod oversubscribed_tests {
 
     const UNEVEN: &str = "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted 720000 and 7273000, 27 context switches: scheduler failed";
 
+    /// Review finding F9 of 2026-11-14: the allowance is keyed to the machines, by name, never
+    /// to the host's threads.
     #[test]
-    fn only_the_software_processor_with_more_guest_processors_than_host_threads_is_oversubscribed()
-    {
-        assert!(oversubscribed_for(Accel::Tcg, 65, 10));
-        assert!(oversubscribed_for(Accel::Tcg, 11, 10));
-        assert!(!oversubscribed_for(Accel::Tcg, 10, 10));
-        assert!(!oversubscribed_for(Accel::Tcg, 4, 10));
+    fn only_the_named_large_software_processor_machines_are_oversubscribed() {
+        assert!(oversubscribed_for(Accel::Tcg, None, 65));
+        assert!(oversubscribed_for(Accel::Tcg, Some("sparse"), 2));
+        assert!(oversubscribed_for(Accel::Tcg, Some("many"), 2));
+        for smp in [1, 2, 3, 4, 11, 64, 66] {
+            assert!(
+                !oversubscribed_for(Accel::Tcg, None, smp),
+                "{smp} processors"
+            );
+        }
+        for other in ["x2apic", "listed", ""] {
+            assert!(!oversubscribed_for(Accel::Tcg, Some(other), 65), "{other}");
+        }
         assert!(
-            !oversubscribed_for(Accel::Kvm, 65, 4),
+            !oversubscribed_for(Accel::Kvm, None, 65),
             "KVM keeps its own allowance"
         );
+        assert!(!oversubscribed_for(Accel::Kvm, Some("sparse"), 2));
     }
 
     /// The coordinating session's ruling of 2026-11-14: an uneven share passes on an
