@@ -205,6 +205,9 @@ pub enum Class {
     Oem,
     /// A signature none of those documents defines; its header checked.
     Unknown,
+    /// A §5.2 table in a layout ACPI 6.6 no longer gives (the PMTT's revision 1): its header
+    /// checked, not supported here (the review's F10).
+    Unsupported(&'static str),
 }
 
 /// One table's result.
@@ -326,6 +329,12 @@ const OTHER_NAMES: &[(&[u8; 4], &str)] = &[
 /// structure and every run of bytes a parser hands on.
 pub fn check_with<'a>(bytes: &'a [u8], visit: &mut dyn FnMut(Seen<'a>)) -> Result<Census, Error> {
     let table = header::check(bytes)?;
+    if let Some(what) = unsupported(&table) {
+        return Ok(Census {
+            header: *table.header(),
+            class: Class::Unsupported(what),
+        });
+    }
     let mut tally = Tally::new(visit);
     let parsed = parse(&table, &mut tally)?;
     let class = if parsed {
@@ -337,6 +346,16 @@ pub fn check_with<'a>(bytes: &'a [u8], visit: &mut dyn FnMut(Seen<'a>)) -> Resul
         header: *table.header(),
         class,
     })
+}
+
+/// A §5.2 table in a layout ACPI 6.6 no longer gives, named: such a table is not wrong, only
+/// unreadable here.
+fn unsupported(table: &Table<'_>) -> Option<&'static str> {
+    match &table.signature().0 {
+        // §5.2.22.12: revision 1 is deprecated since ACPI 6.4, and its layout is not given.
+        b"PMTT" if table.revision() < 2 => Some("the PMTT's revision 1, deprecated since ACPI 6.4"),
+        _ => None,
+    }
 }
 
 /// [`check_with`], with no visitor.

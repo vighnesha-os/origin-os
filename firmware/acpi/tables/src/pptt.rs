@@ -14,7 +14,9 @@ use crate::read::Bytes;
 use crate::walk::{Index, Raw, Shape, Walk, body};
 
 /// The most structures a PPTT may hold here, which bounds the work of checking its references; a
-/// two-socket machine of 2026 with a few hundred threads needs a few thousand.
+/// two-socket machine of 2026 with a few hundred threads needs a few thousand. The worst case at
+/// this bound is large: about 10⁹ walk steps by the independent review's estimate (its F18), for
+/// nodes of 255 bytes with 58 private resources each pointing at caches 8 deep.
 pub const MAX_STRUCTURES: usize = 8192;
 /// The deepest processor hierarchy followed (thread, core, cluster, die, package and a few more).
 pub const MAX_DEPTH: usize = 16;

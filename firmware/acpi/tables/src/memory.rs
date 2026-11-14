@@ -693,6 +693,11 @@ pub(crate) mod tests {
     fn pmtt_refuses_by_name() {
         let kind = |t: Vec<u8>| Pmtt::parse(&t).unwrap_err().kind;
         assert_eq!(kind(table(b"PMTT", 1, &[0; 4])), ErrorKind::Revision(1));
+        // The census names it instead of refusing it (the review's F10).
+        assert_eq!(
+            census::check(&table(b"PMTT", 1, &[0; 4])).unwrap().class,
+            census::Class::Unsupported("the PMTT's revision 1, deprecated since ACPI 6.4")
+        );
         assert!(matches!(
             kind(pmtt(1, &[dev(0, 1, 0, &[0; 3])])),
             ErrorKind::Structure { .. }

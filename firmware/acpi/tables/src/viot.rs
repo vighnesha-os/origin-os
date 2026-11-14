@@ -4,7 +4,7 @@
 use crate::census::Tally;
 use crate::error::{Error, ErrorKind, Signature};
 use crate::header::{self, Table};
-use crate::walk::{Index, Raw, Shape, body};
+use crate::walk::{Index, Raw, Shape, Walk, body};
 
 /// The most nodes a VIOT may hold here, which bounds the work of checking where each endpoint's
 /// output goes.
@@ -115,7 +115,7 @@ impl<'a> Viot<'a> {
                 },
             ));
         }
-        let run = b
+        let all = b
             .rest(if count == 0 { b.len() } else { offset })
             .map_err(|_| {
                 b.error(
@@ -125,6 +125,14 @@ impl<'a> Viot<'a> {
                     },
                 )
             })?;
+        // Only the counted nodes are indexed: bytes after them (padding, say) are not nodes, and
+        // the census hands them on as bytes (the review's F12). The walk to find their end takes
+        // at most `count` steps.
+        let mut end = 0usize;
+        for raw in Walk::new(all, Shape::BYTE_PAD_WORD).take(usize::from(count)) {
+            end = end.saturating_add(raw?.bytes.len());
+        }
+        let run = all.sub(0, end)?;
         let index = Index::build(
             run,
             Shape::BYTE_PAD_WORD,
@@ -191,7 +199,7 @@ impl<'a> Viot<'a> {
         let signature = self.table.signature();
         let run = self.table.reader().rest(self.offset).ok();
         run.into_iter()
-            .flat_map(|run| crate::walk::Walk::new(run, Shape::BYTE_PAD_WORD))
+            .flat_map(|run| Walk::new(run, Shape::BYTE_PAD_WORD))
             .take(usize::from(self.count))
             .map(move |raw| {
                 let raw = raw?;
@@ -201,10 +209,18 @@ impl<'a> Viot<'a> {
 
     pub(crate) fn census(&self, tally: &mut Tally<'_, 'a>) -> Result<(), Error> {
         let b = self.table.reader();
+        let mut end = self.offset;
         for node in self.nodes() {
             let (at, _) = node?;
             let len = usize::from(b.u16(at.saturating_add(2))?);
             tally.structure(u16::from(b.u8(at)?), at, b.get(at, len)?);
+            end = at.saturating_add(len);
+        }
+        if self.count != 0
+            && let Ok(rest) = b.rest(end)
+            && !rest.bytes().is_empty()
+        {
+            tally.bytes(end, rest.bytes());
         }
         Ok(())
     }
@@ -285,6 +301,15 @@ pub(crate) mod tests {
             matches!(census::check(&t).unwrap().class, census::Class::Checked(s) if s.structures() == 4)
         );
         assert!(Viot::parse(&viot(0, 0, &[])).is_ok());
+        // The review's F12: bytes after the counted nodes are not walked as nodes.
+        let mut padded = viot(48, 1, &[pci_iommu()]);
+        padded.extend_from_slice(&[0; 8]);
+        crate::testing::seal(&mut padded);
+        let v = Viot::parse(&padded).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(v.nodes().count(), 1);
+        assert!(
+            matches!(census::check(&padded).unwrap().class, census::Class::Checked(s) if s.structures() == 1)
+        );
     }
 
     #[test]

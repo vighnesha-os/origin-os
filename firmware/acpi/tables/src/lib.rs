@@ -77,14 +77,16 @@
 //!   memory affinity is accepted whatever its range (§5.2.16.2; the review's F4).
 //! - ECDT: a register outside system I/O and memory; a namespace path that is empty, not
 //!   NUL-terminated or holds a character no path can.
-//! - SLIT: a distance of 0 to 9 (reserved); a diagonal other than 10.
+//! - SLIT: no localities; a distance of 0 to 9 (reserved); a diagonal other than 10.
 //! - MSCT: domain ranges out of order or overlapping, a last domain below its first, a domain up
 //!   to the maximum that no range covers.
 //! - RAS2 channel: a version other than 0. RASF, RAS2 and MPST channels: the wrong signature.
 //! - MPST: a power state characteristics structure of a format other than 1; a power state index
 //!   that names nothing in an enabled node; an enabled node's range that wraps. A disabled node's
 //!   contents are ignored (Table 5.110; the review's F4).
-//! - PMTT: revision 1; a top-level aggregator below the top level.
+//! - PMTT: revision 1, which the census names as a layout ACPI 6.6 no longer gives (deprecated
+//!   since ACPI 6.4) instead of refusing it (the review's F10); a top-level aggregator below the
+//!   top level.
 //! - FPDT: no FBPT pointer; two pointers of one kind. FBPT and S3PT: their required records
 //!   missing or repeated.
 //! - NFIT: an interleave index of 0; the interleave index and ways pairs §5.2.26.3 forbids, in a
@@ -100,7 +102,8 @@
 //! - HMAT: an entry base unit of 0; extended-linear addressing on a cache not direct-mapped.
 //! - PPTT: a thread that is not a leaf; a leaf with children; a valid cache ID of 0.
 //! - VIOT: a node offset inside the fixed fields or not 8-byte aligned; a node not 8-byte aligned;
-//!   a PCI range whose end is below its start.
+//!   a PCI range whose end is below its start. Bytes after the counted nodes are not walked as
+//!   nodes; the census hands them on (the review's F12).
 //! - PDTT: no trigger. MISC: no entry. CCEL: a log area that wraps. SVKL: a key that wraps.
 //!
 //! # Where §5.2 defers
@@ -123,7 +126,18 @@
 //! walk steps whatever the table's length: the review's F1),
 //! [`pptt::MAX_STRUCTURES`] PPTT structures (its chains [`pptt::MAX_DEPTH`] and
 //! [`pptt::MAX_CACHE_LEVELS`] long), [`viot::MAX_NODES`] VIOT nodes, and PMTT devices nested
-//! [`memory::PMTT_MAX_DEPTH`] deep.
+//! [`memory::PMTT_MAX_DEPTH`] deep. The PPTT's bound holds but is large: at 8,192 structures,
+//! nodes with 58 private resources each pointing at caches 8 deep cost, by the independent
+//! review's estimate, about 10⁹ walk steps (its F18). Checking each cache chain once would cut
+//! that; it is not done yet. The NFIT's alone has a test that counts its steps.
+//!
+//! # Iterators
+//!
+//! A table's structure iterator (`entries`, `nodes`, `records`, `walk`) gives each structure
+//! whose contents break a rule as an `Err` item and goes on past it; it ends at the first error
+//! that leaves the next structure unlocated (a length too short for the type and length fields,
+//! or one that runs past the table). Each table's `parse`, or the census, has already judged every
+//! structure (the review's F15: the narrower contract, recorded rather than fused).
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 #![cfg_attr(

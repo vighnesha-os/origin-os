@@ -80,7 +80,8 @@ pub struct Findings {
     pub refused: u32,
     /// Structures or fields that broke a rule, reported and not used, in checked tables.
     pub reported: u32,
-    /// Tables of another specification or area, their headers checked.
+    /// Tables named and only their headers checked: another specification's or area's, for other
+    /// processors, an OEM's, unknown, or in a layout ACPI 6.6 no longer gives.
     pub other: u32,
     /// Tables that could not be read.
     pub unreadable: u32,
@@ -313,7 +314,7 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
     let micros = fw.now().saturating_sub(started) / 1000;
     let _ = writeln!(
         out,
-        "{LINE}{} tables: {} checked, {} refused, {} reported, {} another specification's or area's, {} not readable, {} null XSDT entries; FADT {}, DSDT {}, FACS {}; {} us; consistent {}{}",
+        "{LINE}{} tables: {} checked, {} refused, {} reported, {} with only their headers checked, {} not readable, {} null XSDT entries; FADT {}, DSDT {}, FACS {}; {} us; consistent {}{}",
         found.tables,
         found.checked,
         found.refused,
@@ -579,9 +580,9 @@ mod tests {
         assert!(ok, "{out}");
         assert!(
             last_line(&out).ends_with(
-                "4 tables: 4 checked, 0 refused, 0 reported, 0 another specification's or \
-                 area's, 0 not readable, 0 null XSDT entries; FADT true, DSDT true, FACS true; 0 \
-                 us; consistent true"
+                "4 tables: 4 checked, 0 refused, 0 reported, 0 with only their headers checked, 0 \
+                 not readable, 0 null XSDT entries; FADT true, DSDT true, FACS true; 0 us; \
+                 consistent true"
             ),
             "{out}"
         );

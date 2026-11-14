@@ -153,6 +153,12 @@ impl fmt::Display for Whose {
             Class::NotX86(what) => write!(f, "{what}: not for x86-64, header checked"),
             Class::Oem => f.write_str("an OEM's table: header checked"),
             Class::Unknown => f.write_str("a signature not known here: header checked"),
+            Class::Unsupported(what) => {
+                write!(
+                    f,
+                    "{what}, a layout ACPI 6.6 no longer gives: header checked, not supported"
+                )
+            }
         }
     }
 }
@@ -213,6 +219,11 @@ mod tests {
         assert_eq!(
             line(&table(b"Q\x01RS", &[])),
             "a signature not known here: header checked"
+        );
+        assert_eq!(
+            line(&table(b"PMTT", &[0; 4])),
+            "the PMTT's revision 1, deprecated since ACPI 6.4, a layout ACPI 6.6 no longer gives: \
+             header checked, not supported"
         );
         let mut bad = table(b"SBST", &[0; 12]);
         bad[40] ^= 1;

@@ -224,17 +224,36 @@ fn generate(
 fn generated_tables_never_escape() {
     let mut rng = Rng::new(0x484F_5354_494C_4521);
     let mut accepted = 0usize;
+    // Per signature: tables tried and accepted (the review's F13).
+    let mut by_signature = vec![(0usize, 0usize); GENERATED.len()];
     for case in 0..cases(40_000) {
-        let (sig, fixed, kinds, shape) = GENERATED[rng.below(GENERATED.len())];
+        let which = rng.below(GENERATED.len());
+        let (sig, fixed, kinds, shape) = GENERATED[which];
         let t = generate(&mut rng, sig, fixed, kinds, shape);
         let result = std::panic::catch_unwind(|| checked(&t))
             .unwrap_or_else(|_| panic!("case {case}: {t:02x?}"));
+        by_signature[which].0 += 1;
         if result.is_ok() {
             accepted += 1;
+            by_signature[which].1 += 1;
         }
     }
-    // The generator must reach the parsers' acceptance paths too, not only their refusals.
+    // The generator must reach the parsers' acceptance paths too, not only their refusals: in all,
+    // and for every signature it generates.
     assert!(accepted > cases(40_000) / 50, "{accepted} accepted");
+    // The floor is 5 % of each signature's tables, which every one but the MSCT clears (at the
+    // fixed seed, 2026-11-14: FPDT 7 %, the lowest, up to APIC 61 %). The MSCT's ordering and
+    // coverage rules leave a random one rarely valid (3 of 3,250), so its acceptance paths rest on
+    // its deterministic tests, and its floor is one.
+    for (i, &(tried, ok)) in by_signature.iter().enumerate() {
+        let sig = GENERATED[i].0;
+        let floor = if sig == b"MSCT" { 1 } else { tried / 20 };
+        assert!(
+            ok >= floor,
+            "{}: {ok} of {tried} accepted",
+            String::from_utf8_lossy(sig)
+        );
+    }
 }
 
 #[test]

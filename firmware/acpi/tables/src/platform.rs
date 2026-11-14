@@ -99,9 +99,11 @@ pub struct Slit<'a> {
 }
 
 impl<'a> Slit<'a> {
-    /// Checks the table: the matrix fits, every locality is 10 from itself, and no distance is one
-    /// of the values 0 to 9 that ACPI 6.6 reserves (255 means unreachable). Distances need not be
-    /// symmetric.
+    /// Checks the table: at least one locality, the matrix fits, every locality is 10 from itself,
+    /// and no distance is one of the values 0 to 9 that ACPI 6.6 reserves (255 means unreachable).
+    /// Distances need not be symmetric. A table of no localities describes nothing, and the
+    /// kernel's NUMA distances proof already fails on one (the coordinating session's ruling for
+    /// step 5).
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Error> {
         let b = header::check_signature(bytes, b"SLIT")?.reader();
         b.require(44)?;
@@ -114,12 +116,19 @@ impl<'a> Slit<'a> {
                 },
             )
         };
+        if count == 0 {
+            return Err(b.error(
+                36,
+                ErrorKind::Value {
+                    field: "Number of System Localities",
+                },
+            ));
+        }
         let localities = usize::try_from(count).map_err(|_| offset())?;
         let cells = localities.checked_mul(localities).ok_or_else(offset)?;
         let matrix = b.sub(44, cells).map_err(|_| offset())?;
         for (cell, &distance) in matrix.bytes().iter().enumerate() {
-            let diagonal =
-                localities != 0 && cell.checked_rem(localities.saturating_add(1)) == Some(0);
+            let diagonal = cell.checked_rem(localities.saturating_add(1)) == Some(0);
             if distance < 10 || (diagonal && distance != 10) {
                 return Err(matrix.error(cell, ErrorKind::Value { field: "Entry" }));
             }
@@ -428,7 +437,12 @@ pub(crate) mod tests {
                 "{n}"
             );
         }
-        assert_eq!(Slit::parse(&slit(0, &[])).unwrap().localities(), 0);
+        assert_eq!(
+            Slit::parse(&slit(0, &[])).unwrap_err().kind,
+            ErrorKind::Value {
+                field: "Number of System Localities"
+            }
+        );
     }
 
     #[test]
