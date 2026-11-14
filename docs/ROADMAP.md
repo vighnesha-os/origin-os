@@ -257,6 +257,12 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 |---|---|
 | A07-R1 to A07-R6 | Identity maps for firmware-reserved memory (ADR-0007 Amendments 1 and 2) |
 
+**Three more rows placed here (items 302, 303 and 305, 2026-11-14).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none. The ACPI service needs the Driver SDK, whose ADR M5 holds, and its devices' resources and interrupt routing are M5's (ADR-0019 A6, area D). The interpreter library and its encoder start before M5 and are placed with the service they serve. ADR-0019's other rows are rules.
+
+| Rows | Subject |
+|---|---|
+| A19-A2, A19-A3, A19-A5 | The firmware's AML in a user-mode service; the interpreter as a library first, with a read-only boot proof on QEMU's tables; an original AML encoder for its tests (ADR-0019) |
+
 ## M6. Native runtime
 
 **Accepted: decision item 262; `ONBF.md` §13 and §8.2 by item 267.** **State, 2026-11-12: not started on this tree.** In short: TASKS item 41 (task S4-1) builds the native Rust user runtime on its own branch; nothing of M6 is on this tree yet (matrix row S82-07).
