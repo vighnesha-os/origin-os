@@ -18,7 +18,7 @@ On `claude/charming-joliot-0a23db`, with `land/batch-5` at `7436302` merged in; 
 
 **What is shown, under QEMU's software processor on the development Mac only:** host tests for each fix, 18 host controls, and the boot controls NV-1 to NV-16 in ADR-0013 (QEMU's NVMe with metadata, protection information, 4-entry queues, namespace 2 alone, one queue pair, a refused namespace before a usable one, and P1's flush given no time).
 
-**Gates on `6d064b1` (code as at `067aebd`):** `check` passed in 496 s (1,957 host tests, 0 failed; Loom 56 models, 83 controls caught); `boot-test` 11 of 11 in 53 s; `boot-matrix` failed once on the 67-processor machine's clock proof, before any NVMe code ran, and passed in full on its rerun in 1,029 s.
+**Gates on `6d064b1` (code as at `067aebd`):** `check` passed in 496 s (1,957 host tests, 0 failed; Loom 56 models, 83 controls caught); `boot-test` 11 of 11 in 53 s; `boot-matrix` failed once on the 67-processor machine's clock proof, before any NVMe code ran, and passed in full on its rerun in 1,029 s. **Gates on `1c6569c` (code as at `645f3ce`, the last code change):** `check` passed in 404 s (1,957 host tests, 0 failed; Loom 56 models, 83 controls caught); `boot-test` 11 of 11 in 49 s; `boot-matrix` failed once on the 65-processor machine's IPC proof (a frame count), again before any NVMe code ran, and passed in full on its rerun in 1,051 s.
 
 **Not shown:** anything under KVM or on a physical drive; M4 and M5 beyond host tests. **Not done:** controller reset and recovery, Abort, shutdown, asynchronous events, health, power states, and support for metadata (rows S33-08, S33-09, S33-11 to S33-14).
 
