@@ -39,6 +39,52 @@ pub const CC_ENABLE: u32 = 1 << 0;
 /// CSTS.RDY and CSTS.CFS (controller fatal status).
 pub const CSTS_READY: u32 = 1 << 0;
 pub const CSTS_FATAL: u32 = 1 << 1;
+
+/// Why a controller cannot be enabled now: a shutdown CSTS still reports after the reset
+/// (Base 2.4 CC.EN, Figure 41, p. 89; CSTS.SHST and CSTS.ST, Figure 42, pp. 90–91).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownBlock {
+    /// An NVM subsystem shutdown is in progress, or complete: setting CC.EN then has no effect,
+    /// and only an NVM Subsystem Reset ends it.
+    Subsystem { complete: bool },
+    /// A controller shutdown is still in progress: the reset did not abort it.
+    ControllerInProgress,
+    /// SHST holds its reserved value, 11b.
+    Reserved,
+}
+
+impl core::fmt::Display for ShutdownBlock {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::Subsystem { complete } => write!(
+                f,
+                "an NVM subsystem shutdown is {} (CSTS.ST 1, SHST {}): enabling has no effect until an NVM Subsystem Reset",
+                if complete { "complete" } else { "in progress" },
+                if complete { "10b" } else { "01b" }
+            ),
+            Self::ControllerInProgress => f.write_str(
+                "a controller shutdown is still in progress after the reset (CSTS.ST 0, SHST 01b)",
+            ),
+            Self::Reserved => f.write_str("CSTS.SHST holds its reserved value, 11b"),
+        }
+    }
+}
+
+/// Whether a controller whose CSTS reads `csts` after its reset may be enabled. A controller
+/// shutdown reported complete (ST 0, SHST 10b) does not block it: the enabling write clears
+/// CC.SHN with it, as Base 2.4 allows.
+pub const fn shutdown_blocks_enable(csts: u32) -> Option<ShutdownBlock> {
+    let shst = (csts >> 2) & 0b11;
+    let subsystem = (csts >> 6) & 1 != 0;
+    match (shst, subsystem) {
+        (0, _) => None,
+        (1, true) => Some(ShutdownBlock::Subsystem { complete: false }),
+        (2, true) => Some(ShutdownBlock::Subsystem { complete: true }),
+        (1, false) => Some(ShutdownBlock::ControllerInProgress),
+        (2, false) => None,
+        _ => Some(ShutdownBlock::Reserved),
+    }
+}
 /// Bytes of a submission and of a completion queue entry (CC.IOSQES = 6, CC.IOCQES = 4).
 pub const SQ_ENTRY: usize = 64;
 pub const CQ_ENTRY: usize = 16;
@@ -495,6 +541,15 @@ pub const FLUSH_DEADLINE_MS: u64 = 30_000;
 pub const IO_DEADLINE_MS: u64 = 10_000;
 pub const ADMIN_DEADLINE_MS: u64 = 2_000;
 
+/// Seconds the boot flow waits for a proof thread whose longest command may take
+/// `deadline_ms`: longer than that deadline, by a margin, so a command that is slow but within
+/// its deadline reports its own end (the independent review of TASKS item 59, F1).
+pub const PROOF_WAIT_MARGIN_S: u64 = 10;
+
+pub const fn proof_wait_s(deadline_ms: u64) -> u64 {
+    deadline_ms.div_ceil(1000) + PROOF_WAIT_MARGIN_S
+}
+
 /// The deadline of a command with `opcode`, on an admin queue or an I/O queue. Opcodes are
 /// per command set: admin 00h is Delete I/O Submission Queue, not Flush.
 pub const fn deadline_ms(admin: bool, opcode: u8) -> u64 {
@@ -765,12 +820,73 @@ pub fn text(field: &[u8]) -> &str {
 /// mandatory from 1.1, lists every active namespace, and is sent to an older controller, which
 /// knows no other set (Base 2.4 §3.5.1 step 8, p. 132; Figure 336, p. 364; §5.2.14.2.2 and
 /// §5.2.14.2.7, pp. 413 and 416). A namespace of another set, such as a zoned one, is so never
-/// listed from a controller that has one.
-pub const fn active_list_cns(cap: &Capabilities, version: (u16, u8, u8)) -> u8 {
+/// listed from a controller that has one. A controller at 1.0 knows CNS 00h and 01h only (the
+/// CNS field was one bit then: p. 363): `None`, and the driver identifies NSID 1 directly, as
+/// it did before (the independent review of TASKS item 59, F3).
+pub const fn active_list_cns(cap: &Capabilities, version: (u16, u8, u8)) -> Option<u8> {
     if version.0 >= 2 || cap.io_command_sets {
-        cns::ACTIVE_NAMESPACES_OF_SET
+        Some(cns::ACTIVE_NAMESPACES_OF_SET)
+    } else if version.0 == 1 && version.1 >= 1 {
+        Some(cns::ACTIVE_NAMESPACES)
     } else {
-        cns::ACTIVE_NAMESPACES
+        None
+    }
+}
+
+/// Why a controller has no interrupt queue, from its own numbers (the coordinating session's
+/// ruling (a); the review's F5 and F12). Anything else that leaves it without one is a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoInterrupts {
+    /// It allocated one I/O queue pair: this many submission and completion queues.
+    OnePairAllocated { sqs: u32, cqs: u32 },
+    /// BAR 0 holds the doorbells of this few I/O queues: one.
+    OnePairDoorbells { bar_queues: u16 },
+    /// Its MSI-X table has this many entries; the interrupt queue needs entry 1.
+    Vectors(u16),
+    /// It has no MSI-X capability (MSI-X is optional to the controller: PCIe Transport 1.4,
+    /// Figure 42, p. 24).
+    NoMsix,
+}
+
+impl core::fmt::Display for NoInterrupts {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::OnePairAllocated { sqs, cqs } => write!(
+                f,
+                "the controller allocated one I/O queue pair ({sqs} submission and {cqs} completion queues), the polled one, and an interrupt queue needs a second"
+            ),
+            Self::OnePairDoorbells { bar_queues } => write!(
+                f,
+                "BAR 0 holds the doorbells of {bar_queues} I/O queue, the polled one's, and an interrupt queue needs a second"
+            ),
+            Self::Vectors(n) => write!(
+                f,
+                "the controller has {n} MSI-X vectors, and an interrupt queue needs entry 1"
+            ),
+            Self::NoMsix => f.write_str("the controller has no MSI-X capability"),
+        }
+    }
+}
+
+/// Whether a controller that allocated `sqs` and `cqs` I/O queues, whose BAR 0 holds the
+/// doorbells of `bar_queues` I/O queues, and whose MSI-X table has `msix` entries (`None`: no
+/// capability), can have the interrupt queue, pair 2 on MSI-X entry 1; or why not.
+pub const fn interrupt_queue(
+    sqs: u32,
+    cqs: u32,
+    bar_queues: u16,
+    msix: Option<u16>,
+) -> Result<(), NoInterrupts> {
+    if sqs < 2 || cqs < 2 {
+        Err(NoInterrupts::OnePairAllocated { sqs, cqs })
+    } else if bar_queues < 2 {
+        Err(NoInterrupts::OnePairDoorbells { bar_queues })
+    } else {
+        match msix {
+            None => Err(NoInterrupts::NoMsix),
+            Some(n) if n < 2 => Err(NoInterrupts::Vectors(n)),
+            Some(_) => Ok(()),
+        }
     }
 }
 
@@ -1052,6 +1168,87 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The review's F4: a shutdown still reported after the reset blocks enabling, by name; a
+    /// controller shutdown reported complete does not.
+    #[test]
+    fn a_controller_still_shut_down_is_not_enabled() {
+        let csts = |shst: u32, st: u32| (shst << 2) | (st << 6);
+        assert_eq!(shutdown_blocks_enable(0), None);
+        assert_eq!(shutdown_blocks_enable(csts(0, 1)), None, "ST alone");
+        assert_eq!(
+            shutdown_blocks_enable(csts(1, 1)),
+            Some(ShutdownBlock::Subsystem { complete: false })
+        );
+        assert_eq!(
+            shutdown_blocks_enable(csts(2, 1)),
+            Some(ShutdownBlock::Subsystem { complete: true })
+        );
+        assert_eq!(
+            shutdown_blocks_enable(csts(1, 0)),
+            Some(ShutdownBlock::ControllerInProgress)
+        );
+        assert_eq!(shutdown_blocks_enable(csts(2, 0)), None);
+        assert_eq!(
+            shutdown_blocks_enable(csts(3, 0)),
+            Some(ShutdownBlock::Reserved)
+        );
+        // RDY, CFS and the other bits do not change it.
+        assert_eq!(
+            shutdown_blocks_enable(csts(2, 1) | 0b11 | 0xFFFF_FF80),
+            Some(ShutdownBlock::Subsystem { complete: true })
+        );
+        assert_eq!(
+            alloc::format!("{}", ShutdownBlock::Subsystem { complete: true }),
+            "an NVM subsystem shutdown is complete (CSTS.ST 1, SHST 10b): enabling has no effect until an NVM Subsystem Reset"
+        );
+    }
+
+    /// Ruling (a), and the review's F5 and F12: the controller's own numbers say why there is
+    /// no interrupt queue, and name the limit that applied.
+    #[test]
+    fn why_a_controller_has_no_interrupt_queue() {
+        assert_eq!(interrupt_queue(64, 64, 1535, Some(65)), Ok(()));
+        assert_eq!(interrupt_queue(2, 2, 2, Some(2)), Ok(()), "the least");
+        assert_eq!(
+            interrupt_queue(1, 64, 1535, Some(65)),
+            Err(NoInterrupts::OnePairAllocated { sqs: 1, cqs: 64 })
+        );
+        assert_eq!(
+            interrupt_queue(64, 1, 1535, None),
+            Err(NoInterrupts::OnePairAllocated { sqs: 64, cqs: 1 }),
+            "the allocation is named first"
+        );
+        assert_eq!(
+            interrupt_queue(64, 64, 1, Some(65)),
+            Err(NoInterrupts::OnePairDoorbells { bar_queues: 1 })
+        );
+        assert_eq!(
+            interrupt_queue(64, 64, 1535, None),
+            Err(NoInterrupts::NoMsix)
+        );
+        assert_eq!(
+            interrupt_queue(64, 64, 1535, Some(1)),
+            Err(NoInterrupts::Vectors(1))
+        );
+        assert_eq!(
+            alloc::format!("{}", NoInterrupts::NoMsix),
+            "the controller has no MSI-X capability"
+        );
+        assert_eq!(
+            alloc::format!("{}", NoInterrupts::OnePairDoorbells { bar_queues: 1 }),
+            "BAR 0 holds the doorbells of 1 I/O queue, the polled one's, and an interrupt queue needs a second"
+        );
+    }
+
+    /// The review's F1: the boot flow waits past the longest deadline its threads can meet.
+    #[test]
+    fn the_boot_flow_outwaits_its_threads_deadlines() {
+        assert_eq!(proof_wait_s(FLUSH_DEADLINE_MS), 40);
+        assert_eq!(proof_wait_s(IO_DEADLINE_MS), 20);
+        assert_eq!(proof_wait_s(1), 11);
+        assert!(proof_wait_s(FLUSH_DEADLINE_MS) * 1000 > FLUSH_DEADLINE_MS);
     }
 
     /// L3: FFFFh is never a command identifier.
@@ -1368,12 +1565,14 @@ mod tests {
         // The Identify that lists them.
         let cap = |iocss: bool| Capabilities::decode(u64::from(iocss) << 43 | 1 << 37);
         for (version, iocss, cns) in [
-            ((1, 3, 0), false, cns::ACTIVE_NAMESPACES),
-            ((1, 4, 0), false, cns::ACTIVE_NAMESPACES),
-            ((1, 4, 0), true, cns::ACTIVE_NAMESPACES_OF_SET),
-            ((2, 0, 0), false, cns::ACTIVE_NAMESPACES_OF_SET),
-            ((2, 4, 0), false, cns::ACTIVE_NAMESPACES_OF_SET),
-            ((2, 4, 0), true, cns::ACTIVE_NAMESPACES_OF_SET),
+            ((1, 0, 0), false, None),
+            ((1, 1, 0), false, Some(cns::ACTIVE_NAMESPACES)),
+            ((1, 3, 0), false, Some(cns::ACTIVE_NAMESPACES)),
+            ((1, 4, 0), false, Some(cns::ACTIVE_NAMESPACES)),
+            ((1, 4, 0), true, Some(cns::ACTIVE_NAMESPACES_OF_SET)),
+            ((2, 0, 0), false, Some(cns::ACTIVE_NAMESPACES_OF_SET)),
+            ((2, 4, 0), false, Some(cns::ACTIVE_NAMESPACES_OF_SET)),
+            ((2, 4, 0), true, Some(cns::ACTIVE_NAMESPACES_OF_SET)),
         ] {
             assert_eq!(
                 active_list_cns(&cap(iocss), version),

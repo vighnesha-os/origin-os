@@ -817,6 +817,21 @@ pub(crate) fn enable_msix(at: Address, msix: &pci::Msix) -> Option<u32> {
     })
 }
 
+/// Sets the function's MSI-X Function Mask and leaves MSI-X Enable as it is, so that no vector
+/// of a table the firmware left on can fire until [`enable_msix`] clears the mask (the
+/// independent review of TASKS item 59, F6). Returns the message control word read back.
+pub(crate) fn mask_msix(at: Address, msix: &pci::Msix) -> Option<u32> {
+    crate::cpu::without_interrupts(|| {
+        let mut guard = ECAM.lock();
+        let space = guard.as_mut()?;
+        let dword = space.read32(at, msix.capability);
+        let control = (dword >> 16) | pci::MSIX_FUNCTION_MASK;
+        // The low half (ID and next pointer) is read-only.
+        space.write32(at, msix.capability, (control << 16) | (dword & 0xFFFF));
+        Some(space.read32(at, msix.capability) >> 16)
+    })
+}
+
 /// MSI Message Control's MSI Enable (bit 0) and Multiple Message Enable (bits 6:4).
 const MSI_ENABLE: u32 = 1;
 const MSI_MULTIPLE_ENABLE: u32 = 0b111 << 4;
