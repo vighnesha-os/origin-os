@@ -127,6 +127,31 @@ impl<H: Host> Interpreter<H> {
         Ok(None)
     }
 
+    /// For an operator that stores to more than one place (`Divide`): refuses, as an access
+    /// would, before anything is stored, if storing to `loc` would need a PCI_Config region's
+    /// function not yet found.
+    pub(crate) fn target_ready(&mut self, loc: crate::engine::Loc) -> Result<()> {
+        use crate::engine::Loc;
+        use crate::object::RefTarget;
+        let node = match loc {
+            Loc::Node(n) | Loc::Ref(RefTarget::Node(n)) => Some(n),
+            Loc::Arg(i) => match self.current_call()?.args.get(usize::from(i)) {
+                Some(Val::Ref(RefTarget::Node(n))) => Some(*n),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(n) = node else { return Ok(()) };
+        let heap = &self.heap;
+        let n = self.ns.unalias(n, |o| Self::alias_target(heap, o))?;
+        if matches!(self.heap.get(self.ns.obj(n)?)?, Object::FieldUnit(_))
+            && let Some(r) = self.unresolved(n)?
+        {
+            return Err(self.need_address(r));
+        }
+        Ok(())
+    }
+
     /// Asks for `region`'s function to be found before the access that wanted it: the error the
     /// step that wanted it ends with, put back by the engine.
     pub(crate) fn need_address(&mut self, region: NodeId) -> Error {

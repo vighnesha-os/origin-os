@@ -353,6 +353,10 @@ impl<H: Host> Interpreter<H> {
                 let b = self.int(&f, 1)?;
                 let q = a.checked_div(b).ok_or(ErrorKind::DivideByZero)?;
                 let r = a.checked_rem(b).ok_or(ErrorKind::DivideByZero)?;
+                // Two stores: both targets' PCI functions are found before the first, so that a
+                // step put back for the second never does the first twice (B2-1).
+                self.target_ready(loc(&f, 2)?)?;
+                self.target_ready(loc(&f, 3)?)?;
                 self.store(loc(&f, 2)?, Val::Int(r), Mode::Store)?;
                 self.int_result(&f, 3, q)
             }

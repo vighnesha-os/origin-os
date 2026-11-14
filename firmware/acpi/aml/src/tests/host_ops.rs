@@ -1317,3 +1317,36 @@ fn a_reserved_region_space_is_refused() {
         }
     }
 }
+
+#[test]
+fn divide_finds_both_targets_functions_before_its_first_store() {
+    // B2-1, follow-up: `Divide` stores twice. Its remainder goes to a port, its quotient to a
+    // field whose PCI function is not yet known: the step is put back for the second before the
+    // first is done, so the port is written once.
+    let mut i = pci_device(
+        &[ret(dword(0x0001_0000))],
+        &[
+            op_region("IO", 1, word(0x80), byte(1)),
+            field("IO", BYTE, &[Fe::Named("P80", 8)]),
+            method(
+                "DV",
+                0,
+                &[divide(
+                    byte(10),
+                    byte(3),
+                    nm("\\P80"),
+                    nm("\\_SB.PCI0.D1.F1"),
+                )],
+            ),
+        ],
+    );
+    i.evaluate("DV", &[]).unwrap();
+    let writes: Vec<_> = i
+        .host()
+        .seen
+        .iter()
+        .filter(|s| s.write)
+        .map(|s| (s.space, s.address, s.value))
+        .collect();
+    assert_eq!(writes, [(1, 0x80, 1), (2, 0, 3)]);
+}
