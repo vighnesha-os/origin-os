@@ -72,8 +72,13 @@ fn cpu(n: &str, uid: u8) -> B {
 
 /// What QEMU's DSDT holds that the proof reads: `\_S5_`, `\PICF` and `\_PIC`, the root bridge
 /// with its `_HID` and `_CRS`, an HPET whose `_STA` reads its registers under the Global Lock,
-/// four links and two processors; then `extra`.
+/// four links and two processors; then `extra`. Revision 1, as QEMU's: 32-bit integers.
 fn qemu_dsdt(extra: &[B]) -> Vec<u8> {
+    qemu_dsdt_of(1, extra)
+}
+
+/// As [`qemu_dsdt`], of `revision`.
+fn qemu_dsdt_of(revision: u8, extra: &[B]) -> Vec<u8> {
     let mut body = vec![
         name("\\_S5_", package(4, &[zero(), zero(), zero(), zero()])),
         name("PICF", zero()),
@@ -143,7 +148,7 @@ fn qemu_dsdt(extra: &[B]) -> Vec<u8> {
         ),
     ];
     body.extend_from_slice(extra);
-    table(b"DSDT", 1, &body)
+    table(b"DSDT", revision, &body)
 }
 
 /// A device below a PCI bridge with a PCI_Config region: naming its function needs the bridge's
@@ -756,6 +761,53 @@ fn a_walk_cut_off_by_its_bound_fails_the_proof() {
             && out.contains("Limit(Steps)"),
         "{out}"
     );
+}
+
+/// A memory limit the heap cannot give (the coordinating session's ruling on step B3's limit):
+/// with the limit at its largest, a table that names a buffer of nearly 8 EiB and a device whose
+/// `_STA` makes one are refused by the host's allocator, which returns null as the kernel heap
+/// does when it has no frames. Each is the memory limit, named on its line; the proof fails
+/// cleanly, says why, and gives the heap back.
+#[test]
+fn a_heap_too_small_for_the_limit_fails_the_proof_cleanly() {
+    let huge = || buffer(encode::qword(0x7FFF_FFFF_FFFF_0000), &[]);
+    let limits = Limits {
+        memory_bytes: usize::MAX,
+        ..Limits::BOOT_PROOF
+    };
+    // At load: the table is rolled back, and the rest of the proof runs.
+    let mut m = Machine::new(qemu_dsdt_of(2, &[]));
+    m.ssdts.push(table(b"SSDT", 2, &[name("BIGB", huge())]));
+    let (found, out) = m.run_with(BootHost::new(still), limits, &mut || Some(0));
+    assert_eq!(
+        found.failed,
+        Some("a definition block did not load"),
+        "{out}"
+    );
+    assert!(out.contains("load failed at table 1 offset "), "{out}");
+    assert!(out.contains("Limit(Memory); rolled back"), "{out}");
+    assert!(found.named && found.heap_back, "{out}");
+    // In the walk: the device fails with the memory limit, named.
+    let dsdt = qemu_dsdt_of(
+        2,
+        &[scope(
+            "\\_SB_",
+            &[device("BIGD", &[method("_STA", 0, &[ret(huge())])])],
+        )],
+    );
+    let (found, out) = Machine::new(dsdt).run_with(BootHost::new(still), limits, &mut || Some(0));
+    assert_eq!(
+        found.failed,
+        Some("a device failed other than by a refusal"),
+        "{out}"
+    );
+    assert!(
+        out.contains("walk: \\_SB_.BIGD failed other than by a refusal: at table 0 offset "),
+        "{out}"
+    );
+    assert!(out.contains(": Limit(Memory)"), "{out}");
+    // The refused bytes were never held: the peak printed is what the interpreter held.
+    assert!(found.peak < 1 << 20, "{out}");
 }
 
 #[test]

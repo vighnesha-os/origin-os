@@ -46,8 +46,8 @@ use origin_acpi_tables::fadt::Fadt;
 use origin_acpi_tables::header::{self, HEADER_LEN, Header};
 use origin_aml::{
     BridgeBus, BufferAccess, Config, DefinitionBlock, Error, ErrorKind, Host, HostError,
-    InitOutcome, IntegerWidth, Interpreter, Limits, Node, RegionAccess, Space, TableKey, Trace,
-    Value,
+    InitOutcome, IntegerWidth, Interpreter, Limit, Limits, Node, RegionAccess, Space, TableKey,
+    Trace, Value,
 };
 
 use crate::acpi_census::Firmware;
@@ -811,6 +811,24 @@ fn ends_with_end_tag(b: &[u8]) -> bool {
     false
 }
 
+/// One argument, allocated fallibly, as everything the proof allocates while the interpreter may
+/// hold up to its limit: `None` if the heap cannot give it (the coordinating session's ruling on
+/// step B3's limit).
+fn one_arg(value: Value) -> Option<Vec<Value>> {
+    let mut args = Vec::new();
+    args.try_reserve_exact(1).ok()?;
+    args.push(value);
+    Some(args)
+}
+
+/// One string argument, allocated fallibly.
+fn string_arg(text: &[u8]) -> Option<Vec<Value>> {
+    let mut s = Vec::new();
+    s.try_reserve_exact(text.len()).ok()?;
+    s.extend_from_slice(text);
+    one_arg(Value::String(s))
+}
+
 /// What came back, briefly, for a named result that was wrong.
 struct Got<'a>(&'a origin_aml::Result<Option<Value>>);
 
@@ -836,14 +854,14 @@ fn named_results<H: Host>(out: &mut impl Write, i: &mut Interpreter<H>) -> bool 
     struct Check {
         label: &'static str,
         path: &'static str,
-        args: fn() -> Vec<Value>,
+        args: fn() -> Option<Vec<Value>>,
         want: Want,
     }
     const fn check(label: &'static str, path: &'static str, want: Want) -> Check {
         Check {
             label,
             path,
-            args: Vec::new,
+            args: || Some(Vec::new()),
             want,
         }
     }
@@ -852,7 +870,7 @@ fn named_results<H: Host>(out: &mut impl Write, i: &mut Interpreter<H>) -> bool 
         check("\\_S5_", "\\_S5_", Want::FourZeros),
         check("\\PICF 0", "\\PICF", Want::Integer(0)),
         Check {
-            args: || alloc::vec![Value::Integer(1)],
+            args: || one_arg(Value::Integer(1)),
             ..check("\\_PIC (1)", "\\_PIC", Want::Nothing)
         },
         check("\\PICF 1", "\\PICF", Want::Integer(1)),
@@ -867,7 +885,7 @@ fn named_results<H: Host>(out: &mut impl Write, i: &mut Interpreter<H>) -> bool 
             Want::Template,
         ),
         Check {
-            args: || alloc::vec![Value::String(b"Windows 2022".to_vec())],
+            args: || string_arg(b"Windows 2022"),
             ..check(
                 "\\_OSI (\"Windows 2022\") Ones",
                 "\\_OSI",
@@ -875,7 +893,7 @@ fn named_results<H: Host>(out: &mut impl Write, i: &mut Interpreter<H>) -> bool 
             )
         },
         Check {
-            args: || alloc::vec![Value::String(b"Linux".to_vec())],
+            args: || string_arg(b"Linux"),
             ..check("\\_OSI (\"Linux\") Zero", "\\_OSI", Want::Integer(0))
         },
         check("\\_REV 2", "\\_REV", Want::Integer(origin_aml::REV)),
@@ -883,7 +901,14 @@ fn named_results<H: Host>(out: &mut impl Write, i: &mut Interpreter<H>) -> bool 
     let _ = write!(out, "{LINE}named results:");
     let mut all = true;
     for (k, c) in checks.iter().enumerate() {
-        let got = i.evaluate(c.path, &(c.args)());
+        // An argument the heap cannot give is the memory limit, as the interpreter's own are.
+        let got = (c.args)().map_or(
+            Err(Error {
+                kind: ErrorKind::Limit(Limit::Memory),
+                at: None,
+            }),
+            |args| i.evaluate(c.path, &args),
+        );
         let held = got.as_ref().is_ok_and(|v| c.want.holds(v));
         all &= held;
         let _ = write!(out, "{} {} {held}", if k == 0 { "" } else { ";" }, c.label);
