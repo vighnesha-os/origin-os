@@ -14,7 +14,7 @@
 use alloc::vec::Vec;
 
 use crate::config::DefinitionBlock;
-use crate::error::{At, ErrorKind, Limit, Result, err};
+use crate::error::{At, Error, ErrorKind, Limit, Result, err};
 use crate::host::Host;
 use crate::mem;
 use crate::name::{self, AmlName, InTable};
@@ -152,7 +152,8 @@ fn us(x: u32) -> usize {
 }
 
 fn add(a: u32, b: u32) -> Result<u32> {
-    a.checked_add(b).ok_or_else(|| ErrorKind::Truncated.into())
+    a.checked_add(b)
+        .ok_or_else(|| Error::from(ErrorKind::Truncated))
 }
 
 impl<H: Host> Interpreter<H> {
@@ -597,7 +598,7 @@ impl<H: Host> Interpreter<H> {
         self.aml()
             .get(us(at))
             .copied()
-            .ok_or_else(|| ErrorKind::Truncated.into())
+            .ok_or_else(|| Error::from(ErrorKind::Truncated))
     }
 
     fn le(&self, at: u32, bytes: u32) -> Result<u64> {
@@ -1340,7 +1341,7 @@ impl<H: Host> Interpreter<H> {
             .iter()
             .rev()
             .find(|c| c.serial == serial)
-            .ok_or_else(|| ErrorKind::Stale.into())
+            .ok_or_else(|| Error::from(ErrorKind::Stale))
     }
 
     pub(crate) fn call_frame_mut(&mut self, serial: u64) -> Result<&mut CallFrame> {
@@ -1348,11 +1349,13 @@ impl<H: Host> Interpreter<H> {
             .iter_mut()
             .rev()
             .find(|c| c.serial == serial)
-            .ok_or_else(|| ErrorKind::Stale.into())
+            .ok_or_else(|| Error::from(ErrorKind::Stale))
     }
 
     pub(crate) fn current_call(&self) -> Result<&CallFrame> {
-        self.calls.last().ok_or_else(|| ErrorKind::Grammar.into())
+        self.calls
+            .last()
+            .ok_or_else(|| Error::from(ErrorKind::Grammar))
     }
 
     /// Local `i` of the running method.
@@ -1361,7 +1364,7 @@ impl<H: Host> Interpreter<H> {
         c.locals
             .get(usize::from(i))
             .copied()
-            .ok_or_else(|| ErrorKind::Grammar.into())
+            .ok_or_else(|| Error::from(ErrorKind::Grammar))
     }
 
     /// Argument `i` of the running method; a reference in it is followed unless `raw`
@@ -1419,13 +1422,13 @@ impl<H: Host> Interpreter<H> {
                 .locals
                 .get(usize::from(slot))
                 .copied()
-                .ok_or_else(|| ErrorKind::Grammar.into()),
+                .ok_or_else(|| Error::from(ErrorKind::Grammar)),
             RefTarget::Arg { call, slot } => self
                 .call_frame(call)?
                 .args
                 .get(usize::from(slot))
                 .copied()
-                .ok_or_else(|| ErrorKind::Grammar.into()),
+                .ok_or_else(|| Error::from(ErrorKind::Grammar)),
             RefTarget::Elem { pkg, index } => {
                 let e = match self.heap.get(pkg)? {
                     Object::Package(v) => v

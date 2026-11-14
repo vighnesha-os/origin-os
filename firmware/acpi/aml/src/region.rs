@@ -25,7 +25,7 @@
 use alloc::vec::Vec;
 
 use crate::Interpreter;
-use crate::error::{ErrorKind, Result, err};
+use crate::error::{Error, ErrorKind, Result, err};
 use crate::host::{BufferAccess, Host, HostError, PciAddress, RegionAccess, Space};
 use crate::mem;
 use crate::name::Seg;
@@ -371,12 +371,11 @@ impl<H: Host> Interpreter<H> {
             Path::Region(r) => {
                 let access = self.access(&r, region_path, byte_off, w)?;
                 self.host.read(&access).map_err(|cause| {
-                    ErrorKind::Region {
+                    Error::from(ErrorKind::Region {
                         space: r.space,
                         address: access.address,
                         cause,
-                    }
-                    .into()
+                    })
                 })
             }
             Path::Index { index, data } => {
@@ -405,12 +404,11 @@ impl<H: Host> Interpreter<H> {
             Path::Region(r) => {
                 let access = self.access(&r, region_path, byte_off, w)?;
                 self.host.write(&access, value).map_err(|cause| {
-                    ErrorKind::Region {
+                    Error::from(ErrorKind::Region {
                         space: r.space,
                         address: access.address,
                         cause,
-                    }
-                    .into()
+                    })
                 })
             }
             Path::Index { index, data } => {

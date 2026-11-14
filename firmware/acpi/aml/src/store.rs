@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 
 use crate::Interpreter;
 use crate::engine::Loc;
-use crate::error::{ErrorKind, Result, err};
+use crate::error::{Error, ErrorKind, Result, err};
 use crate::host::Host;
 use crate::mem;
 use crate::object::{BufferField, NodeId, ObjRef, Object, RefTarget, Val};
@@ -25,7 +25,7 @@ pub(crate) enum Mode {
 }
 
 fn idx(i: u32) -> Result<usize> {
-    usize::try_from(i).map_err(|_| ErrorKind::Range.into())
+    usize::try_from(i).map_err(|_| Error::from(ErrorKind::Range))
 }
 
 /// Reads `len` bits of `src` from bit `off` into `out` (zeroed, at least `ceil(len / 8)` bytes).

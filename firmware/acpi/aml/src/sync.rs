@@ -16,7 +16,7 @@
 use alloc::vec::Vec;
 
 use crate::Interpreter;
-use crate::error::{ErrorKind, Result, err};
+use crate::error::{Error, ErrorKind, Result, err};
 use crate::host::Host;
 use crate::mem;
 use crate::object::{NodeId, ObjRef, Object, ScopeKind, Val};
@@ -170,7 +170,7 @@ impl<H: Host> Interpreter<H> {
     pub(crate) fn unlock_global(&mut self) -> Result<()> {
         self.host
             .release_global_lock()
-            .map_err(|e| ErrorKind::Host(e).into())
+            .map_err(|e| Error::from(ErrorKind::Host(e)))
     }
 
     fn event_of(&self, v: Val) -> Result<ObjRef> {

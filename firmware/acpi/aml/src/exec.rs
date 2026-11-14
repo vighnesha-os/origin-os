@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use crate::Interpreter;
 use crate::convert::Data;
 use crate::engine::{Frame, Loc, OpFrame, Operand};
-use crate::error::{ErrorKind, Feature, Result, err};
+use crate::error::{Error, ErrorKind, Feature, Result, err};
 use crate::host::Host;
 use crate::mem;
 use crate::name::{AmlName, TextName};
@@ -803,7 +803,7 @@ impl<H: Host> Interpreter<H> {
             Val::None => return err(ErrorKind::Uninitialized),
             _ => return err(ErrorKind::Type),
         };
-        u64::try_from(n).map_err(|_| ErrorKind::Range.into())
+        u64::try_from(n).map_err(|_| Error::from(ErrorKind::Range))
     }
 
     fn type_of(&mut self, l: Loc) -> Result<u64> {
@@ -905,7 +905,7 @@ impl<H: Host> Interpreter<H> {
         while let Some(&tag) = bytes.get(at) {
             if tag & 0x80 == 0 {
                 if tag >> 3 == 0x0F {
-                    return bytes.get(..at).ok_or_else(|| ErrorKind::Range.into());
+                    return bytes.get(..at).ok_or_else(|| Error::from(ErrorKind::Range));
                 }
                 at = at.saturating_add(1).saturating_add(usize::from(tag & 7));
             } else {
@@ -999,7 +999,7 @@ impl<H: Host> Interpreter<H> {
                 all &= ok;
             }
             if all {
-                return u64::try_from(k).map_err(|_| ErrorKind::Range.into());
+                return u64::try_from(k).map_err(|_| Error::from(ErrorKind::Range));
             }
         }
         Ok(self.ones())

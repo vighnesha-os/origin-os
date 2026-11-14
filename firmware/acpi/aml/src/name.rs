@@ -1,6 +1,6 @@
 //! Names: segments, AML name strings (ACPI 6.6 §20.2.2) and the text paths the API takes.
 
-use crate::error::{ErrorKind, Result, err};
+use crate::error::{Error, ErrorKind, Result, err};
 
 /// A name segment: four bytes, the first `A`–`Z` or `_`, the others also `0`–`9`.
 pub(crate) type Seg = [u8; 4];
@@ -85,7 +85,7 @@ fn byte(aml: &[u8], at: u32) -> Result<u8> {
     let i = usize::try_from(at).map_err(|_| ErrorKind::Truncated)?;
     aml.get(i)
         .copied()
-        .ok_or_else(|| ErrorKind::Truncated.into())
+        .ok_or_else(|| Error::from(ErrorKind::Truncated))
 }
 
 /// The segment at `at`, checked.
@@ -178,7 +178,7 @@ impl Segs for TextName {
         self.segs
             .get(i)
             .copied()
-            .ok_or_else(|| ErrorKind::Path.into())
+            .ok_or_else(|| Error::from(ErrorKind::Path))
     }
 }
 
