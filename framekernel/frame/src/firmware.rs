@@ -13,11 +13,29 @@ use crate::vm;
 /// Reads `len` bytes of firmware memory at physical `addr`, mapping it read-only first if
 /// the kernel does not map it. Refused unless the memory map says the range is the
 /// firmware's own (ACPI or reserved memory): the kernel never reads its own RAM this way.
+///
+/// Lent for the kernel's life, so only for what the firmware does not change after boot: the
+/// RSDP and the system description tables with a header that §5.2 lays out (the RSDT, XSDT,
+/// DSDT, SSDTs and every table they list). Never for the FACS, whose global lock firmware in SMM
+/// takes and releases (ACPI 6.6 §5.2.10.1), the FPDT's FBPT and S3PT, which the firmware
+/// rewrites on resume (§5.2.24.8, §5.2.24.10), or a channel's shared memory: [`copy`] reads
+/// those (the independent review of TASKS item 62, F2).
 pub fn bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
     if addr == 0 || addr.checked_add(len as u64).is_none() {
         return Err("bad table address");
     }
     vm::firmware_bytes(PhysAddr::new(addr), len as u64).map_err(|_| "cannot map an ACPI table")
+}
+
+/// Copies `out.len()` bytes of firmware memory at physical `addr` into `out`, with volatile
+/// reads, mapping it read-only first if the kernel does not map it, and lends nothing: for the
+/// firmware's structures that change after boot, which no reference may cover (see [`bytes`]).
+/// Refused as [`bytes`] is.
+pub fn copy(addr: u64, out: &mut [u8]) -> Result<(), &'static str> {
+    if addr == 0 || addr.checked_add(out.len() as u64).is_none() {
+        return Err("bad table address");
+    }
+    vm::read_firmware(PhysAddr::new(addr), out).map_err(|_| "cannot map an ACPI table")
 }
 
 /// The first valid table with signature `sig` that the XSDT lists, checked (signature,

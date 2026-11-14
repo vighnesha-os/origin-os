@@ -1,13 +1,18 @@
 //! The census of the firmware's ACPI tables at boot (ADR-0019 A6, area A; TASKS item 62; the
 //! "ACPI tables" proof, ADR-0013).
 //!
-//! Every table the XSDT lists, the RSDT, the XSDT itself, the FADT's DSDT and FACS, and the tables
-//! the FPDT points to are read through `firmware::bytes` (read-only, and only memory the memory
-//! map calls the firmware's) and checked whole by `origin-acpi-tables`. One line each says what
+//! Every table the XSDT lists, the RSDT, the XSDT itself and the FADT's DSDT are read through
+//! `firmware::bytes` (read-only, and only memory the memory map calls the firmware's), which
+//! lends them for the kernel's life: the firmware does not change them after boot. The FACS and
+//! the tables the FPDT points to, which it does change (the global lock; records rewritten on
+//! resume), are copied out with volatile reads through `firmware::copy` and never lent (the
+//! independent review's F2). Each is checked whole by `origin-acpi-tables`. One line each says what
 //! the table is and what was found; a last line counts them and gives the verdict. Nothing the
 //! kernel does depends on these results yet: the tables it already uses are read where they always
 //! were (`acpi.rs`).
 
+use alloc::vec;
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 use origin_acpi_tables::boot::{Fpdt, FpdtRecord, PerformanceKind, PerformanceTable};
@@ -46,6 +51,29 @@ fn read_table(addr: u64) -> Result<(&'static [u8], Header), &'static str> {
         .unwrap_or(HEADER_LEN)
         .max(HEADER_LEN);
     Ok((crate::firmware::bytes(addr, length)?, header))
+}
+
+/// The most bytes the census copies of a firmware structure that changes after boot: the FACS
+/// (64 bytes in every version ACPI 6.6 gives) and the FPDT's tables, which hold a few records.
+const COPY_MAX: usize = 64 * 1024;
+
+/// Copies the structure at `addr`, whose length is the `u32` at offset 4 of its first `header`
+/// bytes, with volatile reads and without lending it (the review's F2). The copy is read again
+/// whole, so what is checked is one consistent snapshot of the length it declares.
+fn copy_structure(addr: u64, header: usize) -> Result<Vec<u8>, &'static str> {
+    let mut head = vec![0u8; header.max(8)];
+    crate::firmware::copy(addr, &mut head)?;
+    let length = head
+        .get(4..8)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map_or(0, u32::from_le_bytes);
+    let length = usize::try_from(length).unwrap_or(usize::MAX).max(header);
+    if length > COPY_MAX {
+        return Err("longer than the census copies");
+    }
+    let mut all = vec![0u8; length];
+    crate::firmware::copy(addr, &mut all)?;
+    Ok(all)
 }
 
 /// Prints one table's line and counts it.
@@ -234,20 +262,11 @@ pub(crate) fn prove(com1: &mut Console, rsdp_addr: u64) -> bool {
     consistent
 }
 
-/// Reads and checks the FACS, which has no header: its first eight bytes give its length.
+/// Copies and checks the FACS, which has no header: its first eight bytes give its length.
 fn check_facs(com1: &mut Console, counts: &mut Counts, addr: u64) -> bool {
-    let read = crate::firmware::bytes(addr, 8).and_then(|head| {
-        let length = head
-            .get(4..8)
-            .and_then(|b| <[u8; 4]>::try_from(b).ok())
-            .map_or(0, u32::from_le_bytes);
-        if length > crate::acpi::MAX_TABLE_LENGTH {
-            return Err("longer than the kernel maps a table");
-        }
-        crate::firmware::bytes(addr, usize::try_from(length).unwrap_or(8).max(8))
-    });
+    let read = copy_structure(addr, 8);
     counts.tables = counts.tables.saturating_add(1);
-    match read.map(Facs::parse) {
+    match read.as_deref().map(Facs::parse) {
         Err(why) => {
             counts.unreadable = counts.unreadable.saturating_add(1);
             let _ = writeln!(com1, "{LINE}the FACS: not readable: {why}");
@@ -273,7 +292,7 @@ fn check_facs(com1: &mut Console, counts: &mut Counts, addr: u64) -> bool {
     }
 }
 
-/// The tables the FPDT points to: each read only if the memory map calls its memory the
+/// The tables the FPDT points to: each copied only if the memory map calls its memory the
 /// firmware's, and otherwise reported as not readable, which fails nothing.
 fn performance_tables(com1: &mut Console, counts: &mut Counts, fpdt: &'static [u8]) {
     let Ok(fpdt) = Fpdt::parse(fpdt) else { return };
@@ -285,20 +304,7 @@ fn performance_tables(com1: &mut Console, counts: &mut Counts, fpdt: &'static [u
             _ => continue,
         };
         let name = Ascii(kind.signature());
-        let read = crate::firmware::bytes(addr, kind.header_len()).and_then(|head| {
-            let length = head
-                .get(4..8)
-                .and_then(|b| <[u8; 4]>::try_from(b).ok())
-                .map_or(0, u32::from_le_bytes);
-            if length > crate::acpi::MAX_TABLE_LENGTH {
-                return Err("longer than the kernel maps a table");
-            }
-            crate::firmware::bytes(
-                addr,
-                usize::try_from(length).unwrap_or(0).max(kind.header_len()),
-            )
-        });
-        let bytes = match read {
+        let bytes = match copy_structure(addr, kind.header_len()) {
             Ok(bytes) => bytes,
             Err(why) => {
                 let _ = writeln!(com1, "{LINE}{name}: not readable: {why}");
@@ -306,7 +312,7 @@ fn performance_tables(com1: &mut Console, counts: &mut Counts, fpdt: &'static [u
             }
         };
         counts.tables = counts.tables.saturating_add(1);
-        match PerformanceTable::parse(bytes, kind) {
+        match PerformanceTable::parse(&bytes, kind) {
             Ok(t) => {
                 counts.checked = counts.checked.saturating_add(1);
                 let records = t.records().count();

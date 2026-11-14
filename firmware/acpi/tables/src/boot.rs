@@ -274,7 +274,8 @@ impl<'a> PerformanceTable<'a> {
     /// records. The length is the space the firmware set aside, so records end at the first byte
     /// from which the rest is zero. Refused besides: an FBPT without exactly one boot record
     /// (§5.2.24.8); an S3PT without exactly one resume record, or with more than one suspend record
-    /// (§5.2.24.10).
+    /// (§5.2.24.10). An S3PT whose records are all zero is accepted with none: §5.2.24.10 has the
+    /// firmware zero them at boot and fill them on the first resume (the review's F6).
     pub fn parse(bytes: &'a [u8], kind: PerformanceKind) -> Result<Self, Error> {
         let signature = Signature::new(kind.signature());
         let b = Bytes::new(bytes, signature);
@@ -294,7 +295,9 @@ impl<'a> PerformanceTable<'a> {
         }
         let table = Self { bytes: b, kind };
         let mut counts = [0u32; 3];
+        let mut records = 0u32;
         for record in table.records() {
+            records = records.saturating_add(1);
             if let Some(slot) = match record? {
                 EventRecord::S3Resume { .. } => counts.get_mut(0),
                 EventRecord::S3Suspend { .. } => counts.get_mut(1),
@@ -308,6 +311,8 @@ impl<'a> PerformanceTable<'a> {
         let refuse = |field| Err(b.error(kind.header_len(), ErrorKind::Value { field }));
         match kind {
             PerformanceKind::Fbpt if boot != 1 => refuse("the boot performance record"),
+            // No resume yet since boot: every record still zero.
+            PerformanceKind::S3pt if records == 0 => Ok(table),
             PerformanceKind::S3pt if resume != 1 => refuse("the S3 resume record"),
             PerformanceKind::S3pt if suspend > 1 => refuse("the S3 suspend record"),
             _ => Ok(table),
@@ -547,6 +552,24 @@ pub(crate) mod tests {
         s3.extend_from_slice(&[1, 0, 20, 1]);
         s3.extend_from_slice(&[0; 16]);
         assert!(PerformanceTable::parse(&s3, PerformanceKind::S3pt).is_ok());
+        // The review's F6: before the first resume, every record still zero, as §5.2.24.10 has
+        // the firmware leave them at boot.
+        let mut first_boot = b"S3PT".to_vec();
+        first_boot.extend_from_slice(&52u32.to_le_bytes());
+        first_boot.extend_from_slice(&[0; 44]);
+        let t = PerformanceTable::parse(&first_boot, PerformanceKind::S3pt).unwrap();
+        assert_eq!(t.records().count(), 0);
+        // A suspend record without a resume record is still refused.
+        let mut suspended = b"S3PT".to_vec();
+        suspended.extend_from_slice(&52u32.to_le_bytes());
+        suspended.extend_from_slice(&[1, 0, 20, 1]);
+        suspended.extend_from_slice(&[0; 40]);
+        assert!(matches!(
+            kind(suspended, PerformanceKind::S3pt),
+            ErrorKind::Value {
+                field: "the S3 resume record"
+            }
+        ));
         let mut garbage = fbpt(&[boot_record()], 8);
         let end = garbage.len() - 1;
         garbage[end] = 1;
