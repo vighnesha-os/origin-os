@@ -798,7 +798,7 @@ fn corpus() -> Vec<Case> {
             },
         ),
         case(
-            "regions and fields are declared, their access is step B2's",
+            "regions and fields, read and written through the host",
             vec![
                 op_region("OR0", 1, word(0x80), byte(4)),
                 field(
@@ -838,33 +838,52 @@ fn corpus() -> Vec<Case> {
                     ],
                 ),
                 name("CRS0", buffer(byte(2), &[0x79, 0])),
-                r("RD0", nm("IDX0")),
-                m("WR0", &[store(one(), nm("IF0"))]),
+                m("RD0", &[store(byte(0x5A), nm("DAT0")), ret(nm("DAT0"))]),
+                m("WR0", &[store(byte(0x3C), nm("IF0")), ret(nm("IF0"))]),
+                m("WB0", &[store(byte(0x77), nm("BF0")), ret(nm("BF0"))]),
+                r("SB", store(buffer(byte(2), &[1, 2]), nm("SB0"))),
                 r("FT", object_type(nm("BF0"))),
                 r("FT2", object_type(nm("SB1"))),
             ],
             |i| {
-                fails(i, "RD0", ErrorKind::NotSupported(Feature::RegionAccess));
-                fails(i, "WR0", ErrorKind::NotSupported(Feature::RegionAccess));
+                assert_eq!(int(i, "RD0"), 0x5A);
+                assert_eq!(int(i, "WR0"), 0x3C);
+                assert_eq!(int(i, "WB0"), 0x77);
+                i.host_mut().answer = vec![0, 2, 0xAA, 0xBB];
+                assert_eq!(val(i, "SB"), buf(&[0, 2, 0xAA, 0xBB]));
                 assert_eq!(int(i, "FT"), 5);
                 assert_eq!(int(i, "FT2"), 5);
             },
         ),
         case(
-            "what reaches the host is step B2's",
+            "what reaches the host",
             vec![
                 mutex("MX0", 0),
                 event("EV0"),
                 device("DN0", &[]),
                 external("\\EXT0", 8, 2),
-                m("H0", &[acquire(nm("MX0"), 0xFFFF)]),
+                m(
+                    "H0",
+                    &[
+                        store(acquire(nm("MX0"), 0xFFFF), local(0)),
+                        release(nm("MX0")),
+                        ret(local(0)),
+                    ],
+                ),
                 m("H1", &[release(nm("MX0"))]),
-                m("H2", &[signal(nm("EV0"))]),
-                m("H3", &[wait(nm("EV0"), one())]),
-                m("H4", &[reset(nm("EV0"))]),
-                m("H5", &[sleep(one())]),
-                m("H6", &[stall(one())]),
-                m("H7", &[notify(nm("DN0"), byte(0x80))]),
+                m("H2", &[signal(nm("EV0")), ret(wait(nm("EV0"), zero()))]),
+                m("H3", &[ret(wait(nm("EV0"), one()))]),
+                m(
+                    "H4",
+                    &[
+                        signal(nm("EV0")),
+                        reset(nm("EV0")),
+                        ret(wait(nm("EV0"), one())),
+                    ],
+                ),
+                m("H5", &[sleep(byte(2)), ret(one())]),
+                m("H6", &[stall(byte(255)), ret(one())]),
+                m("H7", &[notify(nm("DN0"), byte(0x80)), ret(one())]),
                 m("H8", &[fatal(1, 2, byte(3))]),
                 r("H9", timer()),
                 m("HA", &[load_op("MX0", none())]),
@@ -884,27 +903,43 @@ fn corpus() -> Vec<Case> {
                     &[data_region("DRG0", string("DSDT"), string(""), string(""))],
                 ),
                 m("HD", &[store(string("hello"), debug()), ret(one())]),
+                m("HE", &[breakpoint(), ret(one())]),
             ],
             |i| {
                 use Feature as F;
-                fails(i, "H0", ErrorKind::NotSupported(F::Mutex));
-                fails(i, "H1", ErrorKind::NotSupported(F::Mutex));
-                fails(i, "H2", ErrorKind::NotSupported(F::Event));
-                fails(i, "H3", ErrorKind::NotSupported(F::Event));
-                fails(i, "H4", ErrorKind::NotSupported(F::Event));
-                fails(i, "H5", ErrorKind::NotSupported(F::Sleep));
-                fails(i, "H6", ErrorKind::NotSupported(F::Stall));
-                fails(i, "H7", ErrorKind::NotSupported(F::Notify));
-                fails(i, "H8", ErrorKind::NotSupported(F::Fatal));
-                fails(i, "H9", ErrorKind::NotSupported(F::Timer));
+                assert_eq!(int(i, "H0"), 0);
+                fails(i, "H1", ErrorKind::NotOwned);
+                assert_eq!(int(i, "H2"), 0);
+                assert_eq!(int(i, "H3"), u64::MAX);
+                assert_eq!(int(i, "H4"), u64::MAX);
+                let before = i.host().clock;
+                assert_eq!(int(i, "H5"), 1);
+                assert!(i.host().clock >= before + 20_000);
+                assert_eq!(int(i, "H6"), 1);
+                assert_eq!(int(i, "H7"), 1);
+                assert_eq!(i.host().notified.last().map(|n| n.1), Some(0x80));
+                fails(
+                    i,
+                    "H8",
+                    ErrorKind::Fatal {
+                        kind: 1,
+                        code: 2,
+                        arg: 3,
+                    },
+                );
+                assert_eq!(i.host().fatals, vec![(1, 2, 3)]);
+                let t = int(i, "H9");
+                assert!(t > 0 && t <= i.host().clock);
                 fails(i, "HA", ErrorKind::NotSupported(F::Load));
                 fails(i, "HB", ErrorKind::NotSupported(F::LoadTable));
-                fails(i, "HC", ErrorKind::NotSupported(F::DataTableRegion));
+                fails(i, "HC", ErrorKind::NotFound);
                 assert_eq!(int(i, "HD"), 1);
                 assert_eq!(
                     i.host().debug.last().map(Vec::as_slice),
                     Some(&b"hello"[..])
                 );
+                assert_eq!(int(i, "HE"), 1);
+                assert_eq!(i.host().breakpoints, 1);
                 assert!(i.lookup("\\EXT0").unwrap().is_none());
             },
         ),

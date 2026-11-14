@@ -41,34 +41,15 @@ pub enum Limit {
     Nesting,
 }
 
-/// What the interpreter met in a definition block and did not run, because it is built in step B2
-/// of TASKS item 63 (it reaches the host). Each answers `NotSupported` until then.
+/// What the interpreter met in a definition block and does not run yet. `Load` and `LoadTable`
+/// check the header of a table read at run time with `origin-acpi-tables` (TASKS 62), which
+/// reaches this crate only through the batch; until it does they answer `NotSupported`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Feature {
-    /// Reading or writing a field unit of an operation region.
-    RegionAccess,
-    /// `Acquire`, `Release`, and serialized methods' implicit mutex.
-    Mutex,
-    /// `Wait`, `Signal`, `Reset`.
-    Event,
-    /// `Sleep`.
-    Sleep,
-    /// `Stall`.
-    Stall,
-    /// `Timer`.
-    Timer,
-    /// `Notify`.
-    Notify,
-    /// `Fatal`.
-    Fatal,
-    /// A store to the `Debug` object.
-    Debug,
     /// `Load`.
     Load,
     /// `LoadTable`.
     LoadTable,
-    /// `DataTableRegion`.
-    DataTableRegion,
 }
 
 /// What went wrong.
@@ -111,8 +92,29 @@ pub enum ErrorKind {
     Limit(Limit),
     /// A construct this step of TASKS item 63 does not run yet.
     NotSupported(Feature),
-    /// The host refused or failed a request.
+    /// The host refused or failed a request that is not a region access (the Global Lock, a
+    /// table).
     Host(HostError),
+    /// The host refused or failed an access to an operation region: its space, the address, and
+    /// why.
+    Region {
+        space: u8,
+        address: u64,
+        cause: HostError,
+    },
+    /// A mutex acquired below the current sync level, or released at another (ACPI 6.6
+    /// §19.6.89). G2, strict until the reading session answers.
+    SyncLevel,
+    /// `Release` of a mutex this evaluation does not hold (§19.6.117).
+    NotOwned,
+    /// The evaluation ended holding a mutex (§19.6.89): it was released, and this is reported.
+    /// G2, strict until the reading session answers.
+    MutexHeld,
+    /// A wait that only another evaluation could end (`Wait` with no timeout on an event with no
+    /// signal pending): the interpreter runs one evaluation at a time, so it would never end.
+    WouldBlock,
+    /// `Fatal` (§19.6.47): the firmware's report, also given to the host.
+    Fatal { kind: u8, code: u32, arg: u64 },
     /// A path given to the API that is not one.
     Path,
     /// The method belongs to a table whose load failed and was rolled back.

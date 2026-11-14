@@ -186,10 +186,11 @@ impl<H: Host> Interpreter<H> {
                     offset,
                     length,
                     node,
+                    pci: None,
                 });
                 Ok(())
             }
-            Op::DataRegion => err(ErrorKind::NotSupported(Feature::DataTableRegion)),
+            Op::DataRegion => self.data_region(&f),
             Op::Field | Op::IndexField | Op::BankField => self.field(&f),
             Op::CreateField
             | Op::CreateBitField
@@ -281,8 +282,8 @@ impl<H: Host> Interpreter<H> {
             // --- Stores -------------------------------------------------------------------------
             Op::Store => {
                 let v = val(&f, 0)?;
-                self.store(loc(&f, 1)?, v, Mode::Store)?;
-                self.give_val(v)
+                let r = self.store(loc(&f, 1)?, v, Mode::Store)?;
+                self.give_val(r.unwrap_or(v))
             }
             Op::CopyObject => {
                 let v = val(&f, 0)?;
@@ -565,7 +566,7 @@ impl<H: Host> Interpreter<H> {
             }
             Op::Break => self.leave_loop(false),
             Op::Continue => self.leave_loop(true),
-            Op::Noop | Op::BreakPoint => Ok(()),
+            Op::Noop => Ok(()),
             Op::Return => {
                 if self.calls.is_empty() {
                     return err(ErrorKind::Grammar);
@@ -581,16 +582,59 @@ impl<H: Host> Interpreter<H> {
                 self.begin_call(f.node, args)
             }
 
-            // --- Step B2: these reach the host ----------------------------------------------------
+            // --- What reaches the host -------------------------------------------------------------
             Op::Load => err(ErrorKind::NotSupported(Feature::Load)),
             Op::LoadTable => err(ErrorKind::NotSupported(Feature::LoadTable)),
-            Op::Stall => err(ErrorKind::NotSupported(Feature::Stall)),
-            Op::Sleep => err(ErrorKind::NotSupported(Feature::Sleep)),
-            Op::Acquire | Op::Release => err(ErrorKind::NotSupported(Feature::Mutex)),
-            Op::Signal | Op::Wait | Op::Reset => err(ErrorKind::NotSupported(Feature::Event)),
-            Op::Fatal => err(ErrorKind::NotSupported(Feature::Fatal)),
-            Op::Timer => err(ErrorKind::NotSupported(Feature::Timer)),
-            Op::Notify => err(ErrorKind::NotSupported(Feature::Notify)),
+            Op::Stall => {
+                let us = self.int(&f, 0)?;
+                self.stall(us)
+            }
+            Op::Sleep => {
+                let ms = self.int(&f, 0)?;
+                self.sleep(ms)
+            }
+            Op::Acquire => {
+                let m = self.object_at(loc(&f, 0)?)?;
+                let v = self.acquire(m, raw(&f, 1)?)?;
+                self.give_val(v)
+            }
+            Op::Release => {
+                let m = self.object_at(loc(&f, 0)?)?;
+                self.release(m)
+            }
+            Op::Signal => {
+                let e = self.object_at(loc(&f, 0)?)?;
+                self.signal(e)
+            }
+            Op::Reset => {
+                let e = self.object_at(loc(&f, 0)?)?;
+                self.reset(e)
+            }
+            Op::Wait => {
+                let e = self.object_at(loc(&f, 0)?)?;
+                let timeout = self.int(&f, 1)?;
+                let v = self.wait(e, timeout)?;
+                self.give_val(v)
+            }
+            Op::Fatal => {
+                let kind = low_byte(raw(&f, 0)?);
+                let code = u32::try_from(raw(&f, 1)?).unwrap_or(0);
+                let arg = self.int(&f, 2)?;
+                self.fatal(kind, code, arg)
+            }
+            Op::Timer => {
+                let v = self.timer();
+                self.give_val(v)
+            }
+            Op::Notify => {
+                let node = self.node_at(loc(&f, 0)?)?;
+                let value = self.int(&f, 1)?;
+                self.notify(node, value)
+            }
+            Op::BreakPoint => {
+                self.host.breakpoint();
+                Ok(())
+            }
         }
     }
 
@@ -612,6 +656,84 @@ impl<H: Host> Interpreter<H> {
             Loc::Missing => err(ErrorKind::NotFound),
             Loc::Null | Loc::Debug => err(ErrorKind::Type),
         }
+    }
+
+    /// The object a place names, as a value: a named object itself (a mutex, an event, a
+    /// device), or what a local or argument holds.
+    fn object_at(&mut self, l: Loc) -> Result<Val> {
+        match l {
+            Loc::Node(n) => Ok(Val::Obj(self.ns.obj(n)?)),
+            Loc::Ref(RefTarget::Node(n)) => Ok(Val::Obj(self.ns.obj(n)?)),
+            other => {
+                let v = self.read_loc(other)?;
+                match v {
+                    Val::Ref(RefTarget::Node(n)) => Ok(Val::Obj(self.ns.obj(n)?)),
+                    v => Ok(v),
+                }
+            }
+        }
+    }
+
+    /// The node a place names (`Notify`'s operand): a name, or a device passed in a local or an
+    /// argument.
+    fn node_at(&mut self, l: Loc) -> Result<NodeId> {
+        let v = self.object_at(l)?;
+        match v {
+            Val::Obj(r) => match self.heap.get(r)? {
+                Object::Scope { node, .. } => Ok(*node),
+                _ => err(ErrorKind::Type),
+            },
+            _ => err(ErrorKind::Type),
+        }
+    }
+
+    /// `DataTableRegion` (§19.6.25): a SystemMemory region over the table the XSDT lists under the
+    /// signature, OEM ID and OEM table ID.
+    fn data_region(&mut self, f: &OpFrame) -> Result<()> {
+        let mut key = crate::host::TableKey {
+            signature: [0; 4],
+            oem_id: [0; 6],
+            oem_table_id: [0; 8],
+        };
+        for (i, out) in [
+            &mut key.signature[..],
+            &mut key.oem_id[..],
+            &mut key.oem_table_id[..],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let s = self.string_of(val(f, i.saturating_add(1))?)?;
+            let fits = s.len() <= out.len();
+            for (d, c) in out.iter_mut().zip(&s) {
+                *d = *c;
+            }
+            mem::release(s, &mut self.budget);
+            if !fits {
+                return err(ErrorKind::Range);
+            }
+        }
+        let mut found = None;
+        let present = self
+            .host
+            .table(&key, &mut |address, bytes| {
+                found = Some((address, u64::try_from(bytes.len()).unwrap_or(0)));
+            })
+            .map_err(ErrorKind::Host)?;
+        let (offset, length) = match found {
+            Some(t) if present => t,
+            _ => return err(ErrorKind::NotFound),
+        };
+        let obj = self.heap.alloc(Object::Uninitialized, &mut self.budget)?;
+        let node = self.create(name(f, 0)?, obj)?;
+        *self.heap.get_mut(obj)? = Object::Region(Region {
+            space: 0,
+            offset,
+            length,
+            node,
+            pci: None,
+        });
+        Ok(())
     }
 
     /// What a place holds, as an operand.

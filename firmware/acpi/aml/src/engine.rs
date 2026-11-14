@@ -14,7 +14,7 @@
 use alloc::vec::Vec;
 
 use crate::config::DefinitionBlock;
-use crate::error::{At, ErrorKind, Feature, Limit, Result, err};
+use crate::error::{At, ErrorKind, Limit, Result, err};
 use crate::host::Host;
 use crate::mem;
 use crate::name::{self, AmlName, InTable};
@@ -114,6 +114,8 @@ pub(crate) struct CallFrame {
     pub(crate) ret: Cursor,
     pub(crate) locals: [Val; 8],
     pub(crate) args: [Val; 7],
+    /// A serialized method: its implicit mutex is held while it runs (§19.6.85).
+    pub(crate) serialized: bool,
 }
 
 /// Who is creating names now, and what it has created.
@@ -184,6 +186,8 @@ impl<H: Host> Interpreter<H> {
             owners: Vec::new(),
             cur: Cursor { table: 0, pc: 0 },
             serial: 0,
+            held: Vec::new(),
+            nested: 0,
             run: crate::RunCounts::default(),
             base: 0,
             result: Val::None,
@@ -297,7 +301,12 @@ impl<H: Host> Interpreter<H> {
                 scope: Namespace::root(),
                 pred: 0,
             })?;
-            self.run_frames(base)
+            self.run_frames(base)?;
+            // Load-time code that ends holding a mutex fails the load (§19.6.89; G2).
+            if self.release_held() {
+                return err(ErrorKind::MutexHeld);
+            }
+            Ok(())
         });
         match outcome {
             Ok(()) => {
@@ -348,13 +357,58 @@ impl<H: Host> Interpreter<H> {
     /// Undoes everything above `base` after an error: frames, activations, and the names their
     /// creators made (a table being loaded included: that is the rollback).
     pub(crate) fn abort(&mut self, base: usize) {
-        self.frames.truncate(base);
-        self.calls.clear();
-        while let Some(ctx) = self.owners.pop() {
-            self.ns.remove_list(&ctx.created);
-            mem::release(ctx.created, &mut self.budget);
-        }
+        self.unwind(base, 0, 0);
+        self.release_held();
         self.result = Val::None;
+    }
+
+    /// Pops frames, activations and creators above the given marks; the names those creators
+    /// made are removed.
+    pub(crate) fn unwind(&mut self, frames: usize, calls: usize, owners: usize) {
+        self.frames.truncate(frames);
+        self.calls.truncate(calls);
+        while self.owners.len() > owners {
+            if let Some(ctx) = self.owners.pop() {
+                self.ns.remove_list(&ctx.created);
+                mem::release(ctx.created, &mut self.budget);
+            }
+        }
+    }
+
+    /// Runs the method `node` with `args` inside the evaluation in progress, and returns its
+    /// value (`Val::None` if it returned none). Used where an operator needs a method's answer
+    /// at once: a PCI_Config region's `_ADR`, `_BBN`, `_SEG`, `_HID`. The collector does not run
+    /// until the outermost evaluation is back between steps, since the operator calling this
+    /// holds values outside the frames.
+    pub(crate) fn call_nested(&mut self, node: NodeId, args: [Val; 7]) -> Result<Val> {
+        let marks = (self.frames.len(), self.calls.len(), self.owners.len());
+        let (base, result, cur, depth) = (self.base, self.result, self.cur, self.run.depth);
+        self.nested = self.nested.saturating_add(1);
+        self.base = self.frames.len();
+        self.result = Val::None;
+        let outcome = self
+            .begin_call(node, args)
+            .and_then(|()| self.run_frames(marks.0));
+        let value = self.result;
+        if outcome.is_err() {
+            self.unwind(marks.0, marks.1, marks.2);
+        }
+        self.nested = self.nested.saturating_sub(1);
+        self.base = base;
+        self.result = result;
+        self.cur = cur;
+        self.run.depth = depth;
+        outcome.map(|()| value)
+    }
+
+    /// A named object's value, a method's run for its answer: what `_ADR` and the like give.
+    pub(crate) fn value_of(&mut self, node: NodeId) -> Result<Val> {
+        let obj = self.ns.obj(node)?;
+        if matches!(self.heap.get(obj)?, Object::Method(_)) {
+            self.call_nested(node, [Val::None; 7])
+        } else {
+            self.read_node(node)
+        }
     }
 
     pub(crate) fn push_owner(&mut self, owner: Owner) -> Result<()> {
@@ -409,7 +463,7 @@ impl<H: Host> Interpreter<H> {
         if self.run.steps & 0x3FF == 0 {
             self.check_time()?;
         }
-        if self.budget.used() > self.gc_threshold {
+        if self.nested == 0 && self.budget.used() > self.gc_threshold {
             self.collect_garbage();
             // The next collection comes when half the room left after this one is used, so
             // garbage never fills the limit while live data is large.
@@ -1158,14 +1212,20 @@ impl<H: Host> Interpreter<H> {
         }
         self.check_time()?;
         self.serial = self.serial.wrapping_add(1);
+        let serialized = m.flags & 8 != 0;
         let call = CallFrame {
             serial: self.serial,
             ret: self.cur,
             locals: [Val::None; 8],
             args,
+            serialized,
         };
-        // The implicit mutex of a serialized method (§19.6.85) is taken from step B2 on; with one
-        // evaluation at a time and no blocking until then, nothing can contend for it.
+        // A serialized method holds its implicit mutex at its sync level while it runs
+        // (§19.6.85). With one evaluation at a time nothing else can hold it; the sync level is
+        // checked as for `Acquire`.
+        if serialized {
+            self.hold_implicit(self.serial, m.flags >> 4)?;
+        }
         self.push_frame(Frame::Call)?;
         mem::push(&mut self.calls, call, &mut self.budget)?;
         self.push_owner(Owner::Call(self.serial))?;
@@ -1191,6 +1251,9 @@ impl<H: Host> Interpreter<H> {
             }
         }
         let call = self.calls.pop().ok_or(ErrorKind::Grammar)?;
+        if call.serialized {
+            self.drop_implicit(call.serial);
+        }
         self.pop_owner(true);
         self.run.depth = self.run.depth.saturating_sub(1);
         self.cur = call.ret;
@@ -1264,7 +1327,7 @@ impl<H: Host> Interpreter<H> {
                 let f = *f;
                 return self.read_buffer_field(&f);
             }
-            Object::FieldUnit(_) => return err(ErrorKind::NotSupported(Feature::RegionAccess)),
+            Object::FieldUnit(_) => return self.read_field(node),
             Object::Alias(n) => {
                 let n = *n;
                 let heap = &self.heap;
@@ -1388,6 +1451,11 @@ impl<H: Host> Interpreter<H> {
             }
         }
         ok &= self.heap.mark(self.result, &mut self.budget);
+        for h in &self.held {
+            if let Some(r) = h.mutex {
+                ok &= self.heap.mark(Val::Obj(r), &mut self.budget);
+            }
+        }
         if ok && self.heap.trace(&mut self.budget) {
             self.heap.sweep(&mut self.budget);
         } else {

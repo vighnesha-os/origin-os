@@ -1,7 +1,8 @@
-//! The tests: a host that refuses every region and keeps a fake clock, the encoder, and the
+//! The tests: a host that models region memory and keeps a fake clock, the encoder, and the
 //! test-only stand-in for `origin-acpi-tables`.
 
 mod encode;
+mod host_ops;
 mod limits;
 mod namespace;
 mod qemu;
@@ -9,19 +10,70 @@ mod random;
 mod semantics;
 mod tables_standin;
 
+use std::collections::BTreeMap;
+
 use crate::{
-    BufferAccess, Config, Host, HostError, IntegerWidth, Interpreter, Limits, RegionAccess,
-    TableKey, Value,
+    BufferAccess, Config, Host, HostError, IntegerWidth, Interpreter, Limits, PciAddress,
+    RegionAccess, TableKey, Value,
 };
 
-/// A host that refuses every region access and records what it is told. Its clock moves by
-/// `tick` every time it is read, so the time limit is reached by any loop that runs long enough.
+/// A byte of a region space: the space, the PCI function (segment, bus, device, function) for
+/// PCI_Config, and the address.
+pub(crate) type Cell = (u8, Option<(u16, u8, u8, u8)>, u64);
+
+/// One access the host saw: read or write, space, address, width, value, the PCI function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Seen {
+    pub(crate) write: bool,
+    pub(crate) space: u8,
+    pub(crate) address: u64,
+    pub(crate) width: u8,
+    pub(crate) value: u64,
+    pub(crate) pci: Option<PciAddress>,
+}
+
+/// A host that models every byte-addressed region as memory (zero until written), records what
+/// it is asked and told, and keeps a fake clock that moves by `tick` each time it is read. With
+/// `refuse` set it refuses every region access, as the kernel's boot proof will.
 #[derive(Debug, Default)]
 pub(crate) struct TestHost {
     pub(crate) clock: u64,
     pub(crate) tick: u64,
-    pub(crate) debug: Vec<Vec<u8>>,
+    pub(crate) refuse: bool,
+    pub(crate) memory: BTreeMap<Cell, u8>,
+    pub(crate) seen: Vec<Seen>,
     pub(crate) refused: usize,
+    /// What a buffer transfer answers: the bytes it fills, in order.
+    pub(crate) transfers: Vec<(BufferSeen, Vec<u8>)>,
+    pub(crate) answer: Vec<u8>,
+    pub(crate) global_held: u32,
+    pub(crate) global_taken: u32,
+    pub(crate) global_times_out: bool,
+    pub(crate) notified: Vec<(Vec<[u8; 4]>, u64)>,
+    pub(crate) fatals: Vec<(u8, u32, u64)>,
+    pub(crate) breakpoints: u32,
+    pub(crate) debug: Vec<Vec<u8>>,
+    pub(crate) tables: Vec<(TableKey, u64, Vec<u8>)>,
+}
+
+/// One buffer transfer the host saw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BufferSeen {
+    pub(crate) space: u8,
+    pub(crate) address: u64,
+    pub(crate) write: bool,
+    pub(crate) attribute: u8,
+    pub(crate) length: u8,
+    pub(crate) connection: Option<Vec<u8>>,
+    pub(crate) sent: Vec<u8>,
+}
+
+fn key(a: &RegionAccess<'_>, k: u64) -> Cell {
+    (
+        a.space.0,
+        a.pci.map(|p| (p.segment, p.bus, p.device, p.function)),
+        a.address.wrapping_add(k),
+    )
 }
 
 impl Host for TestHost {
@@ -29,17 +81,61 @@ impl Host for TestHost {
         self.clock = self.clock.saturating_add(self.tick);
         self.clock
     }
-    fn read(&mut self, _: &RegionAccess<'_>) -> Result<u64, HostError> {
-        self.refused += 1;
-        Err(HostError::Refused)
+    fn read(&mut self, a: &RegionAccess<'_>) -> Result<u64, HostError> {
+        if self.refuse {
+            self.refused += 1;
+            return Err(HostError::Refused);
+        }
+        let mut v = 0u64;
+        for k in (0..u64::from(a.width / 8)).rev() {
+            v = (v << 8) | u64::from(*self.memory.get(&key(a, k)).unwrap_or(&0));
+        }
+        self.seen.push(Seen {
+            write: false,
+            space: a.space.0,
+            address: a.address,
+            width: a.width,
+            value: v,
+            pci: a.pci,
+        });
+        Ok(v)
     }
-    fn write(&mut self, _: &RegionAccess<'_>, _: u64) -> Result<(), HostError> {
-        self.refused += 1;
-        Err(HostError::Refused)
+    fn write(&mut self, a: &RegionAccess<'_>, value: u64) -> Result<(), HostError> {
+        if self.refuse {
+            self.refused += 1;
+            return Err(HostError::Refused);
+        }
+        for k in 0..u64::from(a.width / 8) {
+            self.memory.insert(key(a, k), (value >> (8 * k)) as u8);
+        }
+        self.seen.push(Seen {
+            write: true,
+            space: a.space.0,
+            address: a.address,
+            width: a.width,
+            value,
+            pci: a.pci,
+        });
+        Ok(())
     }
-    fn transfer(&mut self, _: &BufferAccess<'_>, _: &mut [u8]) -> Result<usize, HostError> {
-        self.refused += 1;
-        Err(HostError::Refused)
+    fn transfer(&mut self, a: &BufferAccess<'_>, data: &mut [u8]) -> Result<usize, HostError> {
+        if self.refuse {
+            self.refused += 1;
+            return Err(HostError::Refused);
+        }
+        let seen = BufferSeen {
+            space: a.space.0,
+            address: a.address,
+            write: a.write,
+            attribute: a.attribute,
+            length: a.length,
+            connection: a.connection.map(<[u8]>::to_vec),
+            sent: data.to_vec(),
+        };
+        let n = self.answer.len().min(data.len());
+        data[..n].copy_from_slice(&self.answer[..n]);
+        self.transfers.push((seen, self.answer.clone()));
+        Ok(n)
     }
     fn sleep_ms(&mut self, ms: u64) {
         self.clock = self.clock.saturating_add(ms.saturating_mul(10_000));
@@ -48,18 +144,41 @@ impl Host for TestHost {
         self.clock = self.clock.saturating_add(u64::from(us) * 10);
     }
     fn acquire_global_lock(&mut self, _: u16) -> Result<bool, HostError> {
+        if self.global_times_out {
+            return Ok(false);
+        }
+        self.global_held += 1;
+        self.global_taken += 1;
         Ok(true)
     }
     fn release_global_lock(&mut self) -> Result<(), HostError> {
+        assert!(
+            self.global_held > 0,
+            "the Global Lock released without being held"
+        );
+        self.global_held -= 1;
         Ok(())
     }
-    fn notify(&mut self, _: &[[u8; 4]], _: u64) {}
-    fn fatal(&mut self, _: u8, _: u32, _: u64) {}
+    fn notify(&mut self, node: &[[u8; 4]], value: u64) {
+        self.notified.push((node.to_vec(), value));
+    }
+    fn fatal(&mut self, kind: u8, code: u32, arg: u64) {
+        self.fatals.push((kind, code, arg));
+    }
+    fn breakpoint(&mut self) {
+        self.breakpoints += 1;
+    }
     fn debug(&mut self, text: &[u8]) {
         self.debug.push(text.to_vec());
     }
-    fn table(&mut self, _: &TableKey, _: &mut dyn FnMut(u64, &[u8])) -> Result<bool, HostError> {
-        Ok(false)
+    fn table(&mut self, k: &TableKey, out: &mut dyn FnMut(u64, &[u8])) -> Result<bool, HostError> {
+        match self.tables.iter().find(|(t, _, _)| t == k) {
+            Some((_, address, bytes)) => {
+                out(*address, bytes);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 }
 

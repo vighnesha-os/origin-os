@@ -18,11 +18,11 @@
 //! mark-and-sweep collector at safe points between steps; every allocation goes through `mem.rs`,
 //! which charges it to the memory limit before it is made.
 //!
-//! **What this step builds** (B1 of TASKS item 63): the whole parser, the namespace, and every
-//! operator that does not reach the host. Operation region field units, mutexes and events,
-//! `Sleep`, `Stall`, `Timer`, `Notify`, `Fatal`, `Load`, `LoadTable` and `DataTableRegion` are
-//! parsed and their objects created, and answer [`ErrorKind::NotSupported`] when run, until step
-//! B2.
+//! **What is built** (steps B1 and B2 of TASKS item 63): the whole parser, the namespace, every
+//! operator, field units over every region space through the host, mutexes and the Global Lock,
+//! events, the device initialization walk ([`Interpreter::initialize`]) and `_REG`
+//! ([`Interpreter::connect_space`]). `Load` and `LoadTable` answer
+//! [`ErrorKind::NotSupported`] until `origin-acpi-tables` checks the tables they read.
 //!
 //! Sources: ACPI 6.6 and Microsoft's `_OSI` documentation only, paraphrased
 //! (`docs/research/2026-11-14-aml-interpreter.md`). No other interpreter's source was read.
@@ -51,13 +51,16 @@ mod engine;
 mod error;
 mod exec;
 mod host;
+mod init;
 mod mem;
 mod name;
 mod namespace;
 mod object;
 mod op;
 mod osi;
+mod region;
 mod store;
+mod sync;
 mod value;
 
 #[cfg(test)]
@@ -66,6 +69,7 @@ mod tests;
 pub use config::{Config, DefinitionBlock, IntegerWidth, Limits};
 pub use error::{At, Error, ErrorKind, Feature, Limit, Result};
 pub use host::{BufferAccess, Host, HostError, PciAddress, RegionAccess, Space, TableKey, Trace};
+pub use init::InitOutcome;
 pub use osi::{OS_NAME, OSI_STRINGS, REV};
 pub use value::{Node, Value};
 
@@ -126,6 +130,10 @@ pub struct Interpreter<H: Host> {
     owners: Vec<OwnerCtx>,
     cur: Cursor,
     serial: u64,
+    /// The mutexes the running evaluation holds, in the order taken (`sync.rs`).
+    held: Vec<sync::Held>,
+    /// How deep `call_nested` is: the collector runs only at 0.
+    nested: u32,
     run: RunCounts,
     /// The frame count below which the running evaluation does not reach.
     base: usize,

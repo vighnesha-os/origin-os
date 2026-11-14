@@ -79,6 +79,8 @@ pub(crate) struct Region {
     pub(crate) offset: u64,
     pub(crate) length: u64,
     pub(crate) node: NodeId,
+    /// A PCI_Config region's function, found at its first access (`region.rs`).
+    pub(crate) pci: Option<crate::host::PciAddress>,
 }
 
 /// Where a field unit's bits are.

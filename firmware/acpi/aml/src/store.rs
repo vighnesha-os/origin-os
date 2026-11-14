@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 
 use crate::Interpreter;
 use crate::engine::Loc;
-use crate::error::{ErrorKind, Feature, Result, err};
+use crate::error::{ErrorKind, Result, err};
 use crate::host::Host;
 use crate::mem;
 use crate::object::{BufferField, NodeId, ObjRef, Object, RefTarget, Val};
@@ -205,11 +205,12 @@ impl<H: Host> Interpreter<H> {
         }
     }
 
-    /// Stores `v` in `loc`.
-    pub(crate) fn store(&mut self, loc: Loc, v: Val, mode: Mode) -> Result<()> {
+    /// Stores `v` in `loc`. `Some` is what `Store` gives instead of `v`: the buffer a
+    /// buffer-protocol field's host returned (§19.6.132).
+    pub(crate) fn store(&mut self, loc: Loc, v: Val, mode: Mode) -> Result<Option<Val>> {
         match loc {
-            Loc::Null => Ok(()),
-            Loc::Debug => self.debug(v),
+            Loc::Null => Ok(None),
+            Loc::Debug => self.debug(v).map(|()| None),
             Loc::Missing => err(ErrorKind::NotFound),
             Loc::Local(i) => {
                 let c = self.copy_val(v)?;
@@ -218,7 +219,7 @@ impl<H: Host> Interpreter<H> {
                     .locals
                     .get_mut(usize::from(i))
                     .ok_or(ErrorKind::Grammar)? = c;
-                Ok(())
+                Ok(None)
             }
             Loc::Arg(i) => {
                 let cur = self.current_call()?.args.get(usize::from(i)).copied();
@@ -231,7 +232,7 @@ impl<H: Host> Interpreter<H> {
                             .args
                             .get_mut(usize::from(i))
                             .ok_or(ErrorKind::Grammar)? = c;
-                        Ok(())
+                        Ok(None)
                     }
                     None => err(ErrorKind::Grammar),
                 }
@@ -241,7 +242,7 @@ impl<H: Host> Interpreter<H> {
         }
     }
 
-    fn store_ref(&mut self, t: RefTarget, v: Val, mode: Mode) -> Result<()> {
+    fn store_ref(&mut self, t: RefTarget, v: Val, mode: Mode) -> Result<Option<Val>> {
         match t {
             RefTarget::Node(n) => self.store_node(n, v, mode),
             RefTarget::Local { call, slot } => {
@@ -251,7 +252,7 @@ impl<H: Host> Interpreter<H> {
                     .locals
                     .get_mut(usize::from(slot))
                     .ok_or(ErrorKind::Grammar)? = c;
-                Ok(())
+                Ok(None)
             }
             RefTarget::Arg { call, slot } => {
                 let c = self.copy_val(v)?;
@@ -260,14 +261,14 @@ impl<H: Host> Interpreter<H> {
                     .args
                     .get_mut(usize::from(slot))
                     .ok_or(ErrorKind::Grammar)? = c;
-                Ok(())
+                Ok(None)
             }
             RefTarget::Elem { pkg, index } => {
                 let c = self.copy_val(v)?;
                 match self.heap.get_mut(pkg)? {
                     Object::Package(elems) => {
                         *elems.get_mut(idx(index)?).ok_or(ErrorKind::Range)? = c;
-                        Ok(())
+                        Ok(None)
                     }
                     _ => err(ErrorKind::Type),
                 }
@@ -288,7 +289,7 @@ impl<H: Host> Interpreter<H> {
                 match self.heap.get_mut(obj)? {
                     Object::Buffer(b) | Object::String(b) => {
                         *b.get_mut(idx(index)?).ok_or(ErrorKind::Range)? = byte;
-                        Ok(())
+                        Ok(None)
                     }
                     _ => err(ErrorKind::Type),
                 }
@@ -297,7 +298,7 @@ impl<H: Host> Interpreter<H> {
     }
 
     /// Stores `v` in the named object `n` (Table 19.14).
-    pub(crate) fn store_node(&mut self, n: NodeId, v: Val, mode: Mode) -> Result<()> {
+    pub(crate) fn store_node(&mut self, n: NodeId, v: Val, mode: Mode) -> Result<Option<Val>> {
         let obj = self.ns.obj(n)?;
         enum Target {
             Int,
@@ -319,29 +320,35 @@ impl<H: Host> Interpreter<H> {
             _ => return err(ErrorKind::Type),
         };
         match (mode, target) {
-            (_, Target::Region) => err(ErrorKind::NotSupported(Feature::RegionAccess)),
+            (Mode::Copy, Target::Region) => match self.data(v)? {
+                crate::convert::Data::Int | crate::convert::Data::Buf => self.write_field(n, v),
+                _ => err(ErrorKind::Type),
+            },
+            (Mode::Store, Target::Region) => self.write_field(n, v),
             (Mode::Copy, Target::Field(f)) => {
                 // `CopyObject` to a field takes an integer or a buffer only (Table 19.8).
                 match self.data(v)? {
                     crate::convert::Data::Int | crate::convert::Data::Buf => {
-                        self.write_buffer_field(&f, v)
+                        self.write_buffer_field(&f, v).map(|()| None)
                     }
                     _ => err(ErrorKind::Type),
                 }
             }
-            (Mode::Store, Target::Field(f)) => self.write_buffer_field(&f, v),
+            (Mode::Store, Target::Field(f)) => self.write_buffer_field(&f, v).map(|()| None),
             (Mode::Copy, _) | (Mode::Store, Target::Replace) => {
                 let o = self.copy_object(v)?;
-                self.heap.replace(obj, o, &mut self.budget)
+                self.heap.replace(obj, o, &mut self.budget).map(|()| None)
             }
             (Mode::Store, Target::Int) => {
                 let i = self.int_of(v)?;
                 *self.heap.get_mut(obj)? = Object::Integer(i);
-                Ok(())
+                Ok(None)
             }
             (Mode::Store, Target::Str) => {
                 let s = self.string_of(v)?;
-                self.heap.replace(obj, Object::String(s), &mut self.budget)
+                self.heap
+                    .replace(obj, Object::String(s), &mut self.budget)
+                    .map(|()| None)
             }
             (Mode::Store, Target::Buf) => {
                 // G11, strict until the reading session answers: a named buffer keeps its length.
@@ -352,12 +359,12 @@ impl<H: Host> Interpreter<H> {
                     }
                 }
                 mem::release(bytes, &mut self.budget);
-                Ok(())
+                Ok(None)
             }
             (Mode::Store, Target::Pkg) => match self.data(v)? {
                 crate::convert::Data::Other(t) if t == crate::object::types::PACKAGE => {
                     let o = self.copy_object(v)?;
-                    self.heap.replace(obj, o, &mut self.budget)
+                    self.heap.replace(obj, o, &mut self.budget).map(|()| None)
                 }
                 _ => err(ErrorKind::Type),
             },

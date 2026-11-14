@@ -144,6 +144,9 @@ impl<H: Host> Interpreter<H> {
         let base = self.begin_evaluation()?;
         let outcome = self.run_node(node.0, args, base);
         let out = match outcome {
+            // Every mutex is released before an evaluation ends (§19.6.89); one still held is
+            // released now and reported (G2, strict until the reading session answers).
+            Ok(_) if self.release_held() => Err(Error::new(ErrorKind::MutexHeld)),
             Ok(v) => self.export(v),
             Err(e) => {
                 self.abort(base);
