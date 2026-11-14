@@ -635,7 +635,9 @@ pub(crate) fn flush_device() -> bool {
 }
 
 /// What the polled queue's commands for the block layer and the IOMMU proofs did (finding P1
-/// of TASKS item 59): the latest failure, by step, and the longest any command took.
+/// of TASKS item 59): the first failure, by step, and the longest any command took. The first
+/// is kept because a command past its deadline kills the queue, and every later one is then
+/// refused for that reason alone.
 struct PolledRecord {
     failure: Option<nvme::StepFault>,
     longest_us: u64,
@@ -646,14 +648,18 @@ static POLLED: SpinLock<PolledRecord> = SpinLock::new(PolledRecord {
     longest_us: 0,
 });
 
-/// Records that the block layer's `step` failed with `fault`.
+/// Records that the block layer's `step` failed with `fault`, unless an earlier failure is
+/// already recorded.
 fn note_failure(step: &'static str, fault: Fault) {
     crate::cpu::without_interrupts(|| {
-        POLLED.lock().failure = Some(nvme::StepFault { step, fault });
+        let mut r = POLLED.lock();
+        if r.failure.is_none() {
+            r.failure = Some(nvme::StepFault { step, fault });
+        }
     });
 }
 
-/// For a failing block-cache line: the latest failure on the polled queue and the longest
+/// For a failing block-cache line: the first failure on the polled queue and the longest
 /// command it ran, or nothing if no command failed.
 pub(crate) fn failure_note() -> alloc::string::String {
     let (failure, longest) = crate::cpu::without_interrupts(|| {
@@ -661,7 +667,9 @@ pub(crate) fn failure_note() -> alloc::string::String {
         (r.failure, r.longest_us)
     });
     match failure {
-        Some(f) => alloc::format!(" ({f}; the longest command took {longest} us)"),
+        Some(f) => alloc::format!(
+            " (the first failure on I/O queue 1: {f}; the longest command took {longest} us)"
+        ),
         None => alloc::string::String::new(),
     }
 }
