@@ -26,6 +26,9 @@ pub enum Refusal {
     NoX2Apic,
     /// It is not the processor its CPU index was assigned to (ADR-0008 C4).
     NotMine,
+    /// Its CPU index has no record in the TLB shootdown, so it would never be asked to flush
+    /// (review finding F6 of 2026-11-14): a per-CPU table was not sized for it.
+    NoRecord,
 }
 
 /// How one AP's start-up was settled.
@@ -42,6 +45,7 @@ pub enum Outcome {
 // The word's encodings. 0 is undecided and an answer is its ID + 1 (1 to 2^32); the others
 // are above 2^32, so no x2APIC ID can be read as one of them.
 const UNDECIDED: u64 = 0;
+const NO_RECORD: u64 = u64::MAX - 3;
 const NO_X2APIC: u64 = u64::MAX - 2;
 const NOT_MINE: u64 = u64::MAX - 1;
 const ABANDONED: u64 = u64::MAX;
@@ -52,6 +56,7 @@ impl Outcome {
             Self::Answered(id) => id as u64 + 1,
             Self::Refused(Refusal::NoX2Apic) => NO_X2APIC,
             Self::Refused(Refusal::NotMine) => NOT_MINE,
+            Self::Refused(Refusal::NoRecord) => NO_RECORD,
             Self::Abandoned => ABANDONED,
         }
     }
@@ -64,6 +69,7 @@ impl Outcome {
             UNDECIDED => None,
             NO_X2APIC => Some(Self::Refused(Refusal::NoX2Apic)),
             NOT_MINE => Some(Self::Refused(Refusal::NotMine)),
+            NO_RECORD => Some(Self::Refused(Refusal::NoRecord)),
             ABANDONED => Some(Self::Abandoned),
             answer => {
                 Some(u32::try_from(answer.wrapping_sub(1)).map_or(Self::Abandoned, Self::Answered))
@@ -173,7 +179,7 @@ mod tests {
 
     #[test]
     fn a_refusal_settles_the_start_up_like_an_answer() {
-        for why in [Refusal::NoX2Apic, Refusal::NotMine] {
+        for why in [Refusal::NoX2Apic, Refusal::NotMine, Refusal::NoRecord] {
             let h = Handshake::new();
             assert!(h.refuse(why));
             assert!(!h.answer(3));
@@ -196,6 +202,7 @@ mod tests {
         let others = [
             Outcome::Refused(Refusal::NoX2Apic),
             Outcome::Refused(Refusal::NotMine),
+            Outcome::Refused(Refusal::NoRecord),
             Outcome::Abandoned,
         ];
         let edges = [
@@ -226,7 +233,7 @@ mod tests {
 
     #[test]
     fn a_word_no_outcome_encodes_never_reads_as_an_answer() {
-        for word in [(1 << 32) + 1, 1 << 40, u64::MAX - 3] {
+        for word in [(1 << 32) + 1, 1 << 40, u64::MAX - 4] {
             assert_eq!(Outcome::decode(word), Some(Outcome::Abandoned), "{word:#x}");
         }
     }

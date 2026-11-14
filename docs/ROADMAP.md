@@ -177,6 +177,7 @@ M3-6 needs the prerequisites in "Before a first boot on a machine in scope".
 | A04-H5, A04-A2 to A04-A6 | TLB efficiency and PCIDs; the kernel stacks' region and its random base |
 | A08-C1 to A08-C7 | The CPU index (ADR-0008) |
 | A08-D1 to A08-D8 | Any processor count (ADR-0008 Amendment 1, items 283 to 290; placed by the coordinating session under item 264's rule, in no exit test) |
+| A13-Am2 | The fair share reported, not failed, on the oversubscribed software-processor machines (ADR-0013 Amendment 2, item 308; placed by the coordinating session under item 264's rule, in no exit test) |
 | A09-H4, A09-H5 | The first machines, one hybrid and one with SMT, as M3-6 asks; what to check before buying |
 | S13-05 | Explicit memory ordering |
 | S18-03, S18-04 | ADRs for the scheduler and for locking (TASKS item 27) |
@@ -257,6 +258,13 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 |---|---|
 | A07-R1 to A07-R6 | Identity maps for firmware-reserved memory (ADR-0007 Amendments 1 and 2) |
 
+**Three more rows placed here (items 302, 303 and 305, 2026-11-14).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none. The ACPI service needs the Driver SDK, whose ADR M5 holds, and its devices' resources and interrupt routing are M5's (ADR-0019 A6, area D). The interpreter library and its encoder start before M5 and are placed with the service they serve. ADR-0019's other rows are rules.
+
+| Rows | Subject |
+|---|---|
+| A19-A2, A19-A3, A19-A5 | The firmware's AML in a user-mode service; the interpreter as a library first, with a read-only boot proof on QEMU's tables; an original AML encoder for its tests (ADR-0019) |
+| A19-Am1 | The interpreter's answers to `_OSI` and `_REV` (ADR-0019 Amendment 1, item 309) |
+
 ## M6. Native runtime
 
 **Accepted: decision item 262; `ONBF.md` §13 and §8.2 by item 267.** **State, 2026-11-12: not started on this tree.** In short: TASKS item 41 (task S4-1) builds the native Rust user runtime on its own branch; nothing of M6 is on this tree yet (matrix row S82-07).
@@ -305,6 +313,13 @@ Given elsewhere by item 262: networking in the runtime (S44-08) to M10, with the
 | A05-H1 | At a thread's entry the direction flag and the six status flags are clear and interrupts are on (ADR-0005 Amendment 9) |
 | A11-L13 | Each generated stub extends every parameter narrower than 64 bits to its whole register (ADR-0011 Amendment 3) |
 
+**Four more rows placed here (items 295, 296 and 299, 2026-11-14).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none.
+
+| Rows | Subject |
+|---|---|
+| A11-T1, S70-17 | The host tools as libraries that `xtask` calls, beside the tools that build `.ose` (ADR-0011 Amendment 4; CLAUDE.md 7.9 §70) |
+| A11-T5, S49-38 | First-party interfaces for modules shared between SDK domains, and the loader's refusal of them to other programs (ADR-0011 Amendment 4; CLAUDE.md 7.9 §49) |
+
 ## M7. Native packaging
 
 **Proposed, by the rule of item 256; `ONBF.md` §13 by item 267.** **State, 2026-11-12: not started; groundwork only, below.**
@@ -334,6 +349,12 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 | S70-02 to S70-04, S70-11, S70-12 | Tools to package `.oapp`, create `.osi`, sign `.od`, validate packages, verify drivers |
 | S71-08, S71-11 | Installer packaging and deployment guides |
 
+**Two more rows placed here (items 296 and 297, 2026-11-14).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none.
+
+| Rows | Subject |
+|---|---|
+| A11-T2, S49-37 | The packing and signing libraries as the Developer tools SDK, once Origin hosts its own builds (ADR-0011 Amendment 4; CLAUDE.md 7.9 §49) |
+
 ## M8. Native graphics
 
 **Proposed, by the rule of item 256.** **State, 2026-11-12: not started; groundwork only: a software rasterizer, an in-memory file tree and text codecs (matrix row S82-09).**
@@ -362,6 +383,13 @@ These tests need a keyboard and a pointer: ADR-0014 S3 has the GUI take input fr
 | S70-13 | UI inspection |
 | S71-04, S71-07 | UI component documentation and graphics examples |
 | S72-14, S72-15 | GUI and accessibility testing |
+
+**Four more rows placed here (item 297, 2026-11-14).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none. Settings and Time are first needed by M9, and are placed there.
+
+| Rows | Subject |
+|---|---|
+| A11-T3 | Six SDK areas for §49: Origin UI, Windows and display, Desktop shell, Settings, Time and Developer tools (ADR-0011 Amendment 4) |
+| S49-32 to S49-34 | The SDK for Origin UI, windows and display, and the desktop shell (CLAUDE.md 7.9 §49) |
 
 ## M9. Installable operating system
 
@@ -393,6 +421,12 @@ The installer needs a USB keyboard on a real machine, and USB and HID are placed
 | S58-12, S58-15, S58-17 | Filesystem permissions, encryption, credential protection |
 | S68-06 | Time zones |
 | S70-16 | Developer tools never a hidden backend of the GUI's administration |
+
+**Two more rows placed here (item 297, 2026-11-14).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none.
+
+| Rows | Subject |
+|---|---|
+| S49-35, S49-36 | The SDK for settings and time (CLAUDE.md 7.9 §49) |
 
 ## M10. Connectivity and laptop support
 

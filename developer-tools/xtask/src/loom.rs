@@ -741,6 +741,31 @@ const CONTROLS: &[Control] = &[
         models: &[("shootdown_reaches_an_online_processor", STALE)],
     },
     Control {
+        // The protocol's storage one processor short of the machine (ADR-0008 Amendment 1, D1
+        // and D7): the last processor cannot come online in it, is never asked, and keeps its
+        // translation.
+        name: "shootdown_records_one_short",
+        file: MODELS,
+        from: "            shootdown: Shootdown::new(Held::new(count)),\n",
+        to: "            shootdown: Shootdown::new(Held::new(count - 1)),\n",
+        models: &[(
+            "shootdown_reaches_the_last_processor_whatever_the_count",
+            STALE,
+        )],
+    },
+    Control {
+        // The initiator asks every processor that must answer but waits for all but the last
+        // index (ADR-0008 Amendment 1, D7).
+        name: "shootdown_wait_stops_one_short",
+        file: SHOOTDOWN,
+        from: "            for target in 0..count {\n",
+        to: "            for target in 0..count.saturating_sub(1) {\n",
+        models: &[(
+            "shootdown_reaches_the_last_processor_whatever_the_count",
+            STALE,
+        )],
+    },
+    Control {
         // The target answers without doing what it was asked.
         name: "shootdown_answer_without_invalidating",
         file: SHOOTDOWN,
@@ -797,8 +822,8 @@ const CONTROLS: &[Control] = &[
         // The initiator reads who is online without ordering that after its change.
         name: "shootdown_no_fence_before_reading_the_online_set",
         file: SHOOTDOWN,
-        from: "            prim::fence(Ordering::SeqCst);\n            let mut targets = [false; CPUS];\n",
-        to: "            let mut targets = [false; CPUS];\n",
+        from: "            prim::fence(Ordering::SeqCst);\n            let count = self.records.count();\n",
+        to: "            let count = self.records.count();\n",
         models: &[
             ("shootdown_and_a_processor_coming_online", STALE),
             ("shootdown_and_a_processor_entering_the_space", STALE),
@@ -826,8 +851,7 @@ const CONTROLS: &[Control] = &[
         name: "a_processor_leaving_is_not_counted",
         file: SHOOTDOWN,
         from: "            || self
-                .leaving
-                .get(id)
+                .leaving(id)
                 .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
 ",
         to: "",
@@ -839,20 +863,16 @@ const CONTROLS: &[Control] = &[
         // `loaded` and not yet in `leaving` (review finding 7).
         name: "holds_reads_leaving_first",
         file: SHOOTDOWN,
-        from: "        self.loaded
-            .get(id)
+        from: "        self.loaded(id)
             .is_some_and(|loaded| loaded.load(Ordering::Acquire) == root)
             || self
-                .leaving
-                .get(id)
+                .leaving(id)
                 .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
 ",
-        to: "        self.leaving
-            .get(id)
+        to: "        self.leaving(id)
             .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
             || self
-                .loaded
-                .get(id)
+                .loaded(id)
                 .is_some_and(|loaded| loaded.load(Ordering::Acquire) == root)
 ",
         models: &[("shootdown_and_a_processor_leaving_the_space", STALE)],
@@ -861,8 +881,8 @@ const CONTROLS: &[Control] = &[
         // The old root is forgotten before the CR3 write, not after it.
         name: "the_old_root_forgotten_before_the_switch",
         file: SHOOTDOWN,
-        from: "        prim::fence(Ordering::SeqCst);\n        load();\n        if let Some(leaving) = self.leaving.get(me) {\n            leaving.store(0, Ordering::Release);\n        }\n",
-        to: "        prim::fence(Ordering::SeqCst);\n        if let Some(leaving) = self.leaving.get(me) {\n            leaving.store(0, Ordering::Release);\n        }\n        load();\n",
+        from: "        prim::fence(Ordering::SeqCst);\n        load();\n        if let Some(leaving) = self.leaving(me) {\n            leaving.store(0, Ordering::Release);\n        }\n",
+        to: "        prim::fence(Ordering::SeqCst);\n        if let Some(leaving) = self.leaving(me) {\n            leaving.store(0, Ordering::Release);\n        }\n        load();\n",
         models: &[("shootdown_and_a_processor_leaving_the_space", STALE)],
     },
     Control {
@@ -983,10 +1003,10 @@ const CONTROLS: &[Control] = &[
         name: "slot_taken_while_it_is_reclaimed",
         file: SLOTS,
         from: "                let from = table.first_free;
-                let slot = (from..N).find(|&s| table.state(s) == Some(State::Free))?;
+                let slot = (from..table.len()).find(|&s| table.state(s) == Some(State::Free))?;
 ",
         to: "                let from = 0;
-                let slot = (from..N)
+                let slot = (from..table.len())
                     .find(|&s| matches!(table.state(s), Some(State::Free | State::Reclaiming)))?;
 ",
         models: &[("slots_reclaimed_slot_is_taken_only_after_its_shootdown", STALE)],

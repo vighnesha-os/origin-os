@@ -20,14 +20,13 @@ origin-boot-info.workspace = true
 # in QEMU's ACPI tables (`ORIGIN_QEMU_RESERVED`, TASKS item 40).
 origin-test-reserved-memory = { path = "../../tests/emulator/reserved-memory" }
 
-# For the gate on `origin.core` (task S4-2): the definition's front end, so that what each stub
-# must be is worked out here from the definition and not taken from the generator's output.
+# The host tools, called in process: `xtask` starts no first-party program (ADR-0011 Amendment 4,
+# T1; `cargo xtask host-tools-gate`). `oidl` generates the interface code and records its locks,
+# and its front end lets the gate on `origin.core` (task S4-2) work out what each stub must be
+# from the definition, not from the generator's output. `onbf-pack` converts the kernel, lays
+# out `origin.core` and the carried programs, and signs the boot tests' images; `xtask` reaches
+# `onbf-sign` only through it (`onbf_pack::sign`).
 oidl = { path = "../oidl" }
-
-# For one test of the gate on `origin.core` (task S4-2; the review of 2026-11-13, finding F5): a
-# really linked image with a planted fault is described as the build describes it, and the
-# gate must refuse it.
-[dev-dependencies]
 onbf-pack = { path = "../onbf-pack" }
 
 [lints]
