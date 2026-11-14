@@ -43,6 +43,66 @@ impl Rng {
     }
 }
 
+// --- The watchdog (after N-soak-1) -------------------------------------------------------------
+//
+// A soak that hangs must not hold the shared machine: the first randomized test to start starts
+// a watchdog thread, and if the tests have not ended within `ORIGIN_AML_WATCHDOG_SECS` seconds
+// (default 1,200, twenty minutes), it prints the case each kind was on, its seed and its index,
+// and ends the process failing. The 2,000 cases of each kind `cargo test` runs take seconds.
+
+const GRAMMAR: usize = 0;
+const MUTATION: usize = 1;
+const ADVERSARIAL: usize = 2;
+const KINDS: [&str; 3] = ["grammar", "mutation", "adversarial"];
+
+static ON_SEED: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(u64::MAX) }; 3];
+static ON_INDEX: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(u64::MAX) }; 3];
+static WATCHDOG: std::sync::Once = std::sync::Once::new();
+
+fn watchdog_secs() -> u64 {
+    std::env::var("ORIGIN_AML_WATCHDOG_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_200)
+}
+
+/// Notes the case a kind is starting, and starts the watchdog if it is not running.
+fn watch(kind: usize, seed: u64, index: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    ON_SEED[kind].store(seed, Relaxed);
+    ON_INDEX[kind].store(index, Relaxed);
+    WATCHDOG.call_once(|| {
+        let bound = std::time::Duration::from_secs(watchdog_secs());
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            while started.elapsed() < bound {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            // Straight to the process's stderr: a thread a test spawns inherits the harness's
+            // capture of `eprintln!`, which is never shown when the process exits.
+            use std::io::Write;
+            let mut out = std::io::stderr().lock();
+            let _ = writeln!(
+                out,
+                "\nrandomized-test watchdog: still running after {} s; the cases each kind was on:",
+                bound.as_secs()
+            );
+            for (k, what) in KINDS.iter().enumerate() {
+                let (seed, index) = (ON_SEED[k].load(Relaxed), ON_INDEX[k].load(Relaxed));
+                let _ = if index == u64::MAX {
+                    writeln!(out, "  {what}: not started")
+                } else {
+                    writeln!(out, "  {what}: seed {seed:#x}, index {index}")
+                };
+            }
+            let _ = out.flush();
+            std::process::exit(101);
+        });
+    });
+}
+
 /// How one case runs.
 #[derive(Clone, Copy, Debug)]
 struct Setup {
@@ -688,6 +748,7 @@ fn generated(seed: u64) -> (Vec<u8>, IntegerWidth) {
 fn grammar_cases(start: u64, n: u64) {
     for k in 0..n {
         let seed = start.wrapping_add(k);
+        watch(GRAMMAR, seed, k);
         let (aml, width) = generated(seed);
         let setup = Setup::of(seed);
         let a = run(&aml, width, seed, setup);
@@ -743,6 +804,7 @@ fn mutate(rng: &mut Rng, aml: &mut Vec<u8>) {
 fn mutation_cases(start: u64, n: u64) {
     for k in 0..n {
         let seed = start.wrapping_add(k);
+        watch(MUTATION, seed, k);
         let (mut aml, width) = generated(seed);
         let mut rng = Rng(seed);
         mutate(&mut rng, &mut aml);
@@ -947,6 +1009,7 @@ fn adversarial_cases() {
         ),
     ];
     for (k, (body, setup, expect)) in cases.iter().enumerate() {
+        watch(ADVERSARIAL, k as u64, k as u64);
         let aml = body.concat();
         for width in [IntegerWidth::Bits64, IntegerWidth::Bits32] {
             let r = run(&aml, width, k as u64, *setup);
