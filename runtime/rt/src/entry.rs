@@ -4,7 +4,7 @@
 use core::arch::naked_asm;
 
 use origin_abi::start::{self, StartRecord};
-use origin_kernel_stubs::origin_kernel::kernel::client;
+use origin_kernel_client::origin_kernel::kernel::client;
 
 /// The exit code of a program whose start record did not decode. The kernel writes every record
 /// itself, so a correct kernel never gives one.
@@ -28,18 +28,18 @@ unsafe extern "Rust" {
 }
 
 /// Where the kernel starts the first thread: RDI holds the start record's address, RSP the top
-/// of its stack, and every other register is zero (P6). The direction flag is cleared first:
-/// the kernel starts a thread with it clear (RFLAGS `0x202`), but P6 does not say so, and the
-/// psABI's promise that it is clear at every call, which the `mem*` functions keep and rely on,
-/// starts here (S4-1's review, finding F7). The psABI says RSP is 16-byte aligned here; the
-/// stack is aligned again rather than trusted, RBP is cleared so a backtrace ends here, and
-/// [`run`] is called with RDI untouched, as its first argument. `run` never returns; `ud2`
-/// stops the thread if it ever did.
+/// of its stack, and every other register is zero (P6). The direction flag is clear: the kernel
+/// starts every thread so (ADR-0005 Amendment 9, H1, which the boot proof "the flags at a
+/// thread's entry" holds), and the psABI's promise that it is clear at every call, which the
+/// `mem*` functions keep and rely on, starts from there. Until H1 was decided this entry
+/// cleared it itself (S4-1's review, finding F7). RSP is 16-byte aligned here; the stack is
+/// aligned again rather than trusted, RBP is cleared so a backtrace ends here, and [`run`] is
+/// called with RDI untouched, as its first argument. `run` never returns; `ud2` stops the
+/// thread if it ever did.
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
     naked_asm!(
-        "cld",
         "xor ebp, ebp",
         "and rsp, -16",
         "call {run}",

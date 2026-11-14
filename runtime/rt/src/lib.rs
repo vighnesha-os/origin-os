@@ -12,8 +12,15 @@
 //! The runtime ends a thread with three codes of its own: [`PANIC_EXIT`] (`u64::MAX`),
 //! [`BAD_RECORD_EXIT`] (`u64::MAX - 1`) and [`UNWIND_EXIT`] (`u64::MAX - 2`). They share the space
 //! of the codes a program's `main` returns: a program that returns one of them cannot be told
-//! from the runtime's ending by its code alone (S4-1's review, finding F11). The kernel's proof
-//! program never does; whether the ABI reserves them is for `origin.core` (task S4-2).
+//! from the runtime's ending by its code alone (S4-1's review, finding F11). They are this
+//! runtime's own convention and nothing may depend on them: `origin.core` reserves no exit code
+//! at major 0, and `thread_exit`'s code is the program's, the whole `u64` (ADR-0011 Amendment 3,
+//! L14). How a process's end is reported, an exit apart from a panic and from a fault, is
+//! decided with ADR-0005 P10's crash record.
+//!
+//! The runtime reaches the kernel as every program does: through `origin.core`, by the imports
+//! of `origin-kernel-client`, which the launch path binds (ADR-0011 Amendment 2, L3). It holds
+//! no stub and no `syscall`.
 //!
 //! No allocator, no thread-local storage and nothing that reads the environment (ADR-0005 E2).
 //! `unsafe` is only in `entry.rs` and `mem.rs`, the two files `cargo xtask check`'s gate lists for

@@ -449,6 +449,43 @@ pub fn translate(
     None
 }
 
+/// The first IOVA (lowest) whose leaf maps the 4 KiB physical page at `phys`, walking every
+/// present entry of the `levels`-deep tables rooted at `root`; `None` if no leaf names it. A
+/// large page is skipped: `map` never makes one, and `translate` reaches none. For the proofs,
+/// which must show that a domain reaches a page at no IOVA at all, not only at one (TASKS item
+/// 40's review, L5).
+pub fn find_physical(mem: &mut impl TableMemory, root: u64, levels: u8, phys: u64) -> Option<u64> {
+    fn walk<M: TableMemory>(
+        mem: &mut M,
+        table: u64,
+        level: u8,
+        base: u64,
+        phys: u64,
+    ) -> Option<u64> {
+        for i in 0..ENTRIES {
+            let e = mem.read(table, i);
+            if !present(e) {
+                continue;
+            }
+            let iova = base | (i as u64) << (12 + 9 * u32::from(level - 1));
+            if level == 1 {
+                if e & ADDRESS == phys & ADDRESS {
+                    return Some(iova);
+                }
+            } else if e & (1 << 7) == 0
+                && let Some(found) = walk(mem, e & ADDRESS, level - 1, iova, phys)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    if !(3..=5).contains(&levels) {
+        return None;
+    }
+    walk(mem, root, levels, 0, phys)
+}
+
 /// How an IRTE checks who sent an interrupt (the SVT and SQ fields).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceCheck {
@@ -898,6 +935,32 @@ impl IovaWindow {
         Some(at)
     }
 
+    /// As [`IovaWindow::alloc`], but the pages handed out never touch any of `holes`
+    /// (`(base, end)`, end exclusive): a domain's identity-mapped reserved ranges, which VT-d
+    /// §3.16 keeps apart from the addresses the OS gives the device. The window moves past a
+    /// hole it meets; a hole's pages are never handed out.
+    pub fn alloc_skipping(&mut self, pages: u64, holes: &[(u64, u64)]) -> Option<u64> {
+        let bytes = pages.checked_mul(PAGE)?;
+        if pages == 0 {
+            return None;
+        }
+        loop {
+            let at = self.next;
+            let end = at.checked_add(bytes)?;
+            if end > self.end {
+                return None;
+            }
+            match holes.iter().find(|&&(b, e)| b < end && at < e) {
+                // Past the hole, rounded up to a page; strictly forward, so this ends.
+                Some(&(_, e)) => self.next = e.checked_add(PAGE - 1)? & !(PAGE - 1),
+                None => {
+                    self.next = end;
+                    return Some(at);
+                }
+            }
+        }
+    }
+
     /// Whether `iova` was handed out by this window.
     pub fn issued(&self, iova: u64, base: u64) -> bool {
         (base..self.next).contains(&iova)
@@ -1031,6 +1094,50 @@ mod tests {
         assert_eq!(ContextEntry::decode([0xABC_D000, 2]), None, "not present");
         assert_eq!(ContextEntry::decode([0xABC_D009, 2]), None, "pass-through");
         assert_eq!(ContextEntry::decode([0xABC_D001, 7]), None, "AW 7");
+    }
+
+    #[test]
+    fn a_physical_page_is_found_at_whatever_iova_maps_it() {
+        let (mut m, root) = Memory::new(64);
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), None);
+        // Mapped at two IOVAs far apart: the lower is found.
+        let high = IOVA_BASE + 0x3456_7000;
+        map(&mut m, root, 4, high, 0x7_5000, Access::READ_WRITE, false).unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), Some(high));
+        map(
+            &mut m,
+            root,
+            4,
+            0x7_5000,
+            0x7_5000,
+            Access::READ_WRITE,
+            false,
+        )
+        .unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), Some(0x7_5000));
+        // A neighbouring page is not this one, and an unmapped page is found nowhere.
+        map(
+            &mut m,
+            root,
+            4,
+            IOVA_BASE,
+            0x7_6000,
+            Access::READ_WRITE,
+            false,
+        )
+        .unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_4000), None);
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_6000), Some(IOVA_BASE));
+        unmap(&mut m, root, 4, 0x7_5000).unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), Some(high));
+        unmap(&mut m, root, 4, high).unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), None);
+        // Five levels reach IOVAs above 2^48, and the walk finds them there too.
+        let (mut m, root) = Memory::new(64);
+        let top = 1u64 << 52;
+        map(&mut m, root, 5, top, 0x9_9000, Access::READ_WRITE, false).unwrap();
+        assert_eq!(find_physical(&mut m, root, 5, 0x9_9000), Some(top));
+        assert_eq!(find_physical(&mut m, root, 2, 0x9_9000), None);
     }
 
     #[test]
@@ -1579,5 +1686,56 @@ mod tests {
         assert_eq!(w.alloc(1), Some(IOVA_BASE + 3 * PAGE));
         assert_eq!(w.alloc(1), None);
         assert_eq!(IovaWindow::new(0, u64::MAX).alloc(u64::MAX), None);
+    }
+
+    #[test]
+    fn the_window_skips_identity_mapped_pages() {
+        let holes = [
+            (IOVA_BASE + PAGE, IOVA_BASE + 3 * PAGE),
+            (IOVA_BASE + 4 * PAGE, IOVA_BASE + 5 * PAGE),
+        ];
+        let mut w = IovaWindow::new(IOVA_BASE, IOVA_BASE + 8 * PAGE);
+        assert_eq!(w.alloc_skipping(1, &holes), Some(IOVA_BASE));
+        // Two pages would touch the first hole: the window moves past it.
+        assert_eq!(w.alloc_skipping(1, &holes), Some(IOVA_BASE + 3 * PAGE));
+        assert_eq!(w.alloc_skipping(2, &holes), Some(IOVA_BASE + 5 * PAGE));
+        assert_eq!(w.alloc_skipping(1, &holes), Some(IOVA_BASE + 7 * PAGE));
+        assert_eq!(w.alloc_skipping(1, &holes), None);
+        // A hole that ends mid-page, and one covering the whole window.
+        let mut w = IovaWindow::new(IOVA_BASE, IOVA_END);
+        assert_eq!(
+            w.alloc_skipping(1, &[(IOVA_BASE, IOVA_BASE + 10)]),
+            Some(IOVA_BASE + PAGE)
+        );
+        let mut w = IovaWindow::new(IOVA_BASE, IOVA_END);
+        assert_eq!(w.alloc_skipping(1, &[(0, u64::MAX)]), None);
+        assert_eq!(w.alloc_skipping(0, &[]), None);
+    }
+
+    /// Whatever the holes, no page handed out touches one, and pages are never handed out
+    /// twice.
+    #[test]
+    fn no_page_handed_out_touches_a_hole() {
+        let mut rng = crate::testing::Rng::new(0x1D_E7);
+        for _ in 0..500 {
+            let holes: Vec<(u64, u64)> = (0..rng.below(4))
+                .map(|_| {
+                    let b = IOVA_BASE + rng.below(64) as u64 * PAGE;
+                    (b, b + (1 + rng.below(8) as u64) * PAGE)
+                })
+                .collect();
+            let mut w = IovaWindow::new(IOVA_BASE, IOVA_BASE + 64 * PAGE);
+            let mut last = 0;
+            loop {
+                let pages = 1 + rng.below(3) as u64;
+                let Some(at) = w.alloc_skipping(pages, &holes) else {
+                    break;
+                };
+                let end = at + pages * PAGE;
+                assert!(at >= last && end <= IOVA_BASE + 64 * PAGE);
+                assert!(holes.iter().all(|&(b, e)| end <= b || e <= at));
+                last = end;
+            }
+        }
     }
 }

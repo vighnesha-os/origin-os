@@ -2,6 +2,8 @@
 
 The raw figures behind the trend columns of [PERFORMANCE_BUDGETS.md](PERFORMANCE_BUDGETS.md) (decision item 115; ADR-0018 V6; TASKS item 26). **They claim nothing.** No figure here is from a declared machine (CLAUDE.md §53, §74).
 
+How long a CI boot job takes depends on the runner's processor, from 48 to 96 minutes for the same boots: see [PERFORMANCE_TRENDS_2026-11-13_ci-boot-step.md](PERFORMANCE_TRENDS_2026-11-13_ci-boot-step.md) before reading a slow run as a regression.
+
 ## Where they ran
 
 | | |

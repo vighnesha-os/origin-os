@@ -1852,6 +1852,36 @@ mod tests {
         assert_eq!(one(LAPIC_BASE + LAPIC_SPAN, 4096), (None, true));
         assert_eq!(one(LAPIC_BASE - 4096, 4096), (None, true));
 
+        // A BAR inside a firmware-reserved range a device's domain identity-maps is refused as
+        // reserved; beside it, and under a range never mapped, it is kept (review L3).
+        let ranges = [
+            crate::reserved::Reserved {
+                span: crate::reserved::Span {
+                    base: 0x8000_0000,
+                    end: 0x8001_0000,
+                },
+                use_: crate::reserved::Use::Identity(crate::vtd::Access::READ_WRITE),
+            },
+            crate::reserved::Reserved {
+                span: crate::reserved::Span {
+                    base: 0x8004_0000,
+                    end: 0x8005_0000,
+                },
+                use_: crate::reserved::Use::NeverMap,
+            },
+        ];
+        let mut with_identity = reserved.to_vec();
+        with_identity.extend(crate::reserved::identity_ranges(&ranges));
+        let in_span = |address, size| {
+            let mut devices = [with_bars(f, &[memory_bar(0, address, size)])];
+            let seen = refusals(&mut devices, &map, &with_identity);
+            (seen.first().map(|s| s.2), devices[0].bars[0].is_some())
+        };
+        assert_eq!(in_span(0x8000_0000, 4096), (Some(Reserved), false));
+        assert_eq!(in_span(0x8000_F000, 4096), (Some(Reserved), false));
+        assert_eq!(in_span(0x8001_0000, 4096), (None, true));
+        assert_eq!(in_span(0x8004_0000, 4096), (None, true));
+
         // Two BARs that overlap are both refused, whichever came first and wherever they
         // are: the same function, or two functions; a third inside them is refused too.
         let g = at(0, 5, 0);

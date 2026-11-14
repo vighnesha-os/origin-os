@@ -261,9 +261,21 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // compatibility-format I/O APIC proof above, which interrupt remapping would block.
         // It runs whether or not the bus-master quiesce succeeded: confining a device that kept
         // mastering the bus is exactly what a failed quiesce leaves to it.
+        // Firmware-reserved ranges are identity-mapped only clear of every platform register
+        // range (ADR-0007 questions 4 and 8): listed here, or `None` if they cannot be, and
+        // then no range is trusted.
+        let registers = quiesced
+            .as_ref()
+            .and_then(|q| pcie::reserved_ranges(&mut com1, q, info.acpi_rsdp));
         proofs.record(
             Proof::Iommu,
-            iommu::init(&mut com1, info.acpi_rsdp, pcie::read_config32),
+            iommu::init(
+                &mut com1,
+                info.acpi_rsdp,
+                pcie::read_config32,
+                regions,
+                registers.as_deref(),
+            ),
         );
         if iommu::translating() {
             let _ = writeln!(
@@ -311,7 +323,13 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             && !early.start_heap(&mut com1)
             && !early.prove_user_isolation(&mut com1)
             && early.enable_simd() == xcr0
-            && !iommu::init(&mut com1, info.acpi_rsdp, pcie::read_config32);
+            && !iommu::init(
+                &mut com1,
+                info.acpi_rsdp,
+                pcie::read_config32,
+                regions,
+                None,
+            );
         let _ = writeln!(
             com1,
             "origin-kernel: boot steps: out of turn refused {out_of_turn}; a second run refused {once}{}",
@@ -345,6 +363,12 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             origin_frame::random::withhold();
         }
         proofs.record(Proof::Random, random);
+        // `origin.core` into its one set of frames, before any process exists (ADR-0011
+        // Amendment 2, L2; task S4-2).
+        install_origin_core(&mut com1);
+        // The kernel's root, out of which every process is paid for (ADR-0005 G5; task S4-3):
+        // sized once, from the frames free now, before the first process exists.
+        size_root(&mut com1);
         // M3, second step: preemptive kernel threads on every online processor. Its proofs
         // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
         // use only the kernel's fixed programs, and the operator sees every result.
@@ -354,8 +378,19 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         stop_if_refused(&mut com1, proofs);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
         if let Some(q) = quiesced.as_mut()
-            && let Some(reserved) = pcie::reserved_ranges(&mut com1, q, info.acpi_rsdp)
-            && pcie::init(&mut com1, q, online.cpus(), regions, &reserved)
+            && let Some(mut reserved) = pcie::reserved_ranges(&mut com1, q, info.acpi_rsdp)
+            && {
+                // No BAR where a device's DMA reaches untranslated: every accepted identity
+                // range is reserved too (TASKS item 40's review, L3).
+                let judged = iommu::reserved_ranges();
+                reserved.extend(origin_frame::reserved::identity_ranges(
+                    judged
+                        .iter()
+                        .filter(|r| r.verdict.is_ok())
+                        .filter_map(|r| r.range.as_ref()),
+                ));
+                pcie::init(&mut com1, q, online.cpus(), regions, &reserved)
+            }
         {
             proofs.record(Proof::Pcie, true);
             // Anything that turned bus mastering back on is stopped again before any driver
@@ -1615,6 +1650,63 @@ fn init_paging(com1: &mut Console, early: &mut Early) -> bool {
         console::withdraw_framebuffer(com1);
     }
     early.load_kernel_tables(com1, tables)
+}
+
+/// Writes `origin.core` into its frames, once, and says what it took: every process that is
+/// pinned per call maps these same frames, read-execute, and nothing writes them again. The
+/// install is judged by what it returns, which includes its own read-back of every word. The
+/// fall in free frames is printed as a figure and judges nothing: the frames' records are on
+/// the kernel heap, which may take a frame of its own, and the other processors are already
+/// running. If it cannot be done no process can be launched: the line fails the boot test, and
+/// the boot proofs that launch a program, and the last clause of "origin.core and the call
+/// pin", fail the boot itself.
+fn install_origin_core(com1: &mut Console) {
+    let image = crate::core_image::image();
+    let free = || memory::stats().map(|(_, frames)| frames);
+    let before = free();
+    let installed = crate::core_image::install();
+    let took = match (before, free()) {
+        (Some(before), Some(after)) => before.saturating_sub(after),
+        _ => 0,
+    };
+    let _ = match installed {
+        Ok(frames) => writeln!(
+            com1,
+            "origin-kernel: origin.core: {} bytes of code, the stubs of {} calls and nothing else, written once into {frames} frames and read back as written, the rest of each page the linker's int3; every process pinned per call maps them read-execute (free frames fell by {took}, a figure)",
+            image.code.len(),
+            image.exports.len(),
+        ),
+        Err(e) => writeln!(
+            com1,
+            "origin-kernel: origin.core could not be written into its frames ({e:?}): origin.core failed"
+        ),
+    };
+}
+
+/// Sizes the kernel's root once, from the bytes the free frames hold now, less the kernel's
+/// reserve (ADR-0005 G5; `process::size_root`), prints both, and shows that a second sizing is
+/// refused and changes nothing. Until it is sized the root pays for nothing, so a process made
+/// before this is refused; the boot proofs' processes all come after it.
+fn size_root(com1: &mut Console) {
+    let free = memory::stats().map_or(0, |(_, frames)| frames.saturating_mul(memory::FRAME));
+    let _ = match crate::process::size_root(free) {
+        Some((root, reserve)) => {
+            let again = crate::process::size_root(free.saturating_mul(2)).is_none()
+                && crate::process::ROOT.size() == root
+                && crate::process::ROOT.left() == root;
+            writeln!(
+                com1,
+                "origin-kernel: kernel bound: the root holds {} KiB: {} KiB of free frames less a reserve of {} KiB kept for the kernel's own use; a second sizing is refused and changes nothing: {again}",
+                root >> 10,
+                free >> 10,
+                reserve >> 10,
+            )
+        }
+        None => writeln!(
+            com1,
+            "origin-kernel: kernel bound: the root was sized before the boot sized it: kernel bound failed"
+        ),
+    };
 }
 
 /// Proves the heap with real `alloc` collections: a large vector (a frame run), thousands

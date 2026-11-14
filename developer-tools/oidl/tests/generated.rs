@@ -236,7 +236,10 @@ fn unsafe_appears_only_in_the_named_shims() {
         if !path.ends_with(".rs") || path.ends_with("corpus_check.rs") {
             continue;
         }
-        let is_shim = path.ends_with("/abi.rs") || path.ends_with("/core_stubs.rs");
+        // The two named shims (§11): a `syscall` client's imports, and `origin.core`'s stubs,
+        // which are a tree of their own. That tree's root declares them and holds no code.
+        let is_stubs_root = path == "core/lib.rs";
+        let is_shim = path.ends_with("/abi.rs") || (path.starts_with("core/") && !is_stubs_root);
         // Documentation mentions `unsafe`, code does not.
         let code: String = text
             .lines()
@@ -256,6 +259,7 @@ fn unsafe_appears_only_in_the_named_shims() {
             assert!(
                 text.contains("#![forbid(unsafe_code)]")
                     || path == "rust/lib.rs"
+                    || is_stubs_root
                     || path.ends_with("/mod.rs"),
                 "{path}: must forbid unsafe"
             );
@@ -277,7 +281,7 @@ fn the_server_side_is_the_same_code_without_the_client_or_the_shims() {
     for file in &server {
         let name = file.path.rsplit('/').next().expect("a name");
         assert!(
-            !["client.rs", "abi.rs", "core_stubs.rs"].contains(&name),
+            !["client.rs", "abi.rs"].contains(&name) && !file.path.starts_with("core/"),
             "{}",
             file.path
         );
@@ -362,7 +366,7 @@ fn a_library_crate_is_its_server_and_client_and_the_types_it_uses() {
     for file in &files {
         let name = file.path.rsplit('/').next().expect("a name");
         assert!(
-            !["abi.rs", "core_stubs.rs"].contains(&name),
+            name != "abi.rs" && !file.path.starts_with("core/"),
             "{}",
             file.path
         );
@@ -931,19 +935,11 @@ fn the_fixture_api_round_trips_and_the_server_refuses_what_it_must() {
     assert!(out.contains("all checks passed"), "{out}");
 }
 
-/// A copy of the shared tree without `core_stubs`: `syscall_api.rs` defines the C entry points
-/// itself, a mock kernel, and the real ones must not be linked in on an x86-64 host.
+/// A copy of the shared tree. `syscall_api.rs` defines the C entry points itself, a mock kernel;
+/// the real ones are `origin.core`'s, under `core/`, and the client's crate under `rust/` holds
+/// none of them, so nothing has to be taken out for an x86-64 host.
 fn syscall_api_files() -> BTreeMap<String, String> {
-    let mut files = tree().files.clone();
-    for (path, text) in &mut files {
-        if path.ends_with("/mod.rs") {
-            *text = text.replace(
-                "#[cfg(target_arch = \"x86_64\")]\npub mod core_stubs;\n",
-                "",
-            );
-        }
-    }
-    files
+    tree().files.clone()
 }
 
 /// The negative control of `syscall_api.rs`'s checks that a handle reaches the kernel whole
@@ -1010,10 +1006,24 @@ fn the_syscall_outputs_decode_exactly_and_the_client_works_through_the_c_abi() {
     assert!(out.contains("all checks passed"), "{out}");
 }
 
-#[test]
-fn each_system_call_stub_has_exactly_one_syscall_instruction_and_its_own_number() {
-    let tree = tree();
-    let object = tree.dir.join("stubs.o");
+/// The toolchain's `llvm-objdump`, for the host this test runs on.
+fn objdump() -> PathBuf {
+    let out = Command::new(rustc()).arg("-vV").output().expect("rustc");
+    let host = String::from_utf8(out.stdout)
+        .expect("utf8")
+        .lines()
+        .find_map(|l| l.strip_prefix("host: ").map(str::to_string))
+        .expect("host");
+    sysroot()
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin/llvm-objdump")
+}
+
+/// Compiles the stubs' crate, `core/lib.rs` under `dir`, for the userspace triple with its
+/// flags, and returns its disassembly in Intel syntax.
+fn stubs_listing(dir: &Path) -> String {
+    let object = dir.join("stubs.o");
     let mut cmd = Command::new(rustc());
     cmd.args([
         "--edition",
@@ -1021,7 +1031,7 @@ fn each_system_call_stub_has_exactly_one_syscall_instruction_and_its_own_number(
         "--crate-type",
         "rlib",
         "--crate-name",
-        "oidl_generated",
+        "origin_core_stubs",
     ])
     .args(["--target", "x86_64-unknown-linux-gnu"])
     .args([
@@ -1032,57 +1042,390 @@ fn each_system_call_stub_has_exactly_one_syscall_instruction_and_its_own_number(
         "-C",
         "codegen-units=1",
     ])
+    .args(["-D", "warnings"])
     .arg("--emit=obj")
     .arg("-o")
     .arg(&object)
-    .arg(tree.dir.join("rust/lib.rs"))
-    .current_dir(&tree.dir);
+    .arg(dir.join("core/lib.rs"))
+    .current_dir(dir);
     run_ok(cmd, "compile the stubs");
-    let host = {
-        let out = Command::new(rustc()).arg("-vV").output().expect("rustc");
-        String::from_utf8(out.stdout)
-            .expect("utf8")
-            .lines()
-            .find_map(|l| l.strip_prefix("host: ").map(str::to_string))
-            .expect("host")
-    };
-    let objdump = sysroot()
-        .join("lib/rustlib")
-        .join(host)
-        .join("bin/llvm-objdump");
-    let mut cmd = Command::new(objdump);
-    cmd.args(["-d", "--no-show-raw-insn"]).arg(&object);
-    let listing = run_ok(cmd, "llvm-objdump");
+    let mut cmd = Command::new(objdump());
+    cmd.args(["-d", "-z", "--no-show-raw-insn", "--x86-asm-syntax=intel"])
+        .arg(&object);
+    run_ok(cmd, "llvm-objdump")
+}
+
+/// The instructions of the function `symbol` in `listing`, each as the generator spells it: one
+/// space after the mnemonic.
+fn listed(listing: &str, symbol: &str) -> Vec<String> {
+    let header = format!("<{symbol}>:\n");
+    let start = listing
+        .find(&header)
+        .unwrap_or_else(|| panic!("no symbol {symbol} in the object:\n{listing}"));
+    listing[start + header.len()..]
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (_, instruction) = line.split_once(':').expect("an address, then a colon");
+            instruction.trim().replace('\t', " ")
+        })
+        .collect()
+}
+
+/// How `llvm-objdump` prints the load of call number `number`.
+fn number_load(number: u32) -> String {
+    format!("mov eax, {number:#x}")
+}
+
+/// Each stub, as it was assembled, is what §10 says and nothing more: the extension of each of
+/// its own narrow parameters, the fourth argument's move, the load of its own number, one
+/// `syscall`, and the return (ADR-0005 B2; ADR-0011 L6 and L13).
+#[test]
+fn each_stub_is_its_extensions_its_own_number_one_syscall_and_the_return() {
+    let tree = tree();
+    let listing = stubs_listing(&tree.dir);
+    let comp = compilation();
+    let mut checked = 0;
+    for library in &comp.libraries {
+        if library.transport != oidl::model::Transport::Syscall {
+            continue;
+        }
+        let prefix = library.name.replace('.', "_");
+        for method in library.interfaces.iter().flat_map(|i| &i.methods) {
+            let symbol = format!("{prefix}_{}", method.name);
+            let got = listed(&listing, &symbol);
+            let mut wanted = codegen::rust::stub_instructions(method);
+            let load = wanted.len() - 3;
+            assert_eq!(wanted[load], format!("mov eax, {}", method.ordinal));
+            wanted[load] = number_load(method.ordinal);
+            assert_eq!(got, wanted, "{symbol}");
+            // And by itself, whatever the generator's own list says.
+            assert_eq!(
+                got.iter().filter(|i| i.as_str() == "syscall").count(),
+                1,
+                "{symbol}: exactly one syscall instruction"
+            );
+            let at = got.iter().position(|i| i == "syscall").expect("a syscall");
+            assert_eq!(got[at - 1], number_load(method.ordinal), "{symbol}");
+            assert_eq!(
+                got[at + 1..],
+                [if method.never { "ud2" } else { "ret" }],
+                "{symbol}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 30, "{checked} stubs");
+    // The fixture's `scalars`: a byte, a signed 16-bit value, 32 bits, 64 bits in the fourth
+    // register, a boolean and a signed 32-bit enumeration (L13).
+    assert_eq!(
+        listed(&listing, "origin_fixture_calls_scalars"),
+        [
+            "movzx edi, dil",
+            "movsx rsi, si",
+            "mov edx, edx",
+            "mov r10, rcx",
+            "movzx r8d, r8b",
+            "movsxd r9, r9d",
+            "mov eax, 0x1",
+            "syscall",
+            "ret",
+        ]
+    );
+}
+
+/// A definition whose methods take six parameters of one narrow type each: every type in every
+/// register.
+fn widen_definition() -> String {
+    let mut text = String::from(
+        "/// Fixture: narrow parameters.\nlibrary origin.fixture.widen;\ntransport syscall;\nversion 1.0;\nuse origin.kernel;\n\
+         /// Flags.\nbits flags: u16 {\n    /// A bit.\n    one = 0;\n}\n\
+         /// A choice.\nenum choice: u8 {\n    /// One.\n    one = 1;\n}\n\
+         /// A signed choice, with a member below zero.\nenum sign: i8 {\n    /// Below.\n    minus = -1;\n    /// None.\n    none = 0;\n}\n\
+         /// A wider signed choice.\nenum wide_sign: i16 {\n    /// Below.\n    low = -300;\n}\n\
+         /// The widest narrow signed choice.\nenum far_sign: i32 {\n    /// Below.\n    far = -70000;\n}\n\
+         /// Calls.\ninterface widen {\n",
+    );
+    for (number, ty) in [
+        "u8",
+        "u16",
+        "u32",
+        "i8",
+        "i16",
+        "i32",
+        "bool",
+        "flags",
+        "choice",
+        "u64",
+        "sign",
+        "wide_sign",
+        "far_sign",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let params: Vec<String> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|name| format!("        /// One.\n        {name}: {ty},\n"))
+            .collect();
+        text.push_str(&format!(
+            "    /// Six of `{ty}`.\n    method six_{ty} = {} (\n{}    ) errors(invalid_args) requires none;\n",
+            number + 1,
+            params.concat()
+        ));
+    }
+    text.push_str("}\n");
+    text
+}
+
+/// L13, for each narrow type in each of the six registers, as the assembler wrote it: zero for an
+/// unsigned integer, a boolean and a bits type; the sign for a signed integer; an enumeration as
+/// its underlying integer, zero where that is unsigned and the sign where it is signed (decision
+/// item 277: an enumeration over `i8`, `i16` and `i32`, each with a member below zero, is
+/// sign-extended); the fourth argument through R10. The table is written out here by hand,
+/// apart from the generator's own.
+///
+/// What this shows is the instruction each stub holds, as assembled. That the kernel's decoder
+/// takes a member below zero only when its register is sign-extended is read from the decoder's
+/// generator and is not run here.
+#[test]
+fn a_stub_extends_each_narrow_type_in_each_register() {
+    let inputs = vec![
+        Input {
+            file: "origin.kernel.oidl".to_string(),
+            text: KERNEL.as_bytes().to_vec(),
+        },
+        Input {
+            file: "widen.oidl".to_string(),
+            text: widen_definition().into_bytes(),
+        },
+    ];
+    let comp = compile(&inputs, Some(VERSIONS)).expect("the fixture is valid");
+    let dir = scratch("widen");
+    write_tree(&dir, &all_files(&comp));
+    let listing = stubs_listing(&dir);
+    let byte = [
+        "movzx edi, dil",
+        "movzx esi, sil",
+        "movzx edx, dl",
+        "movzx r10d, cl",
+        "movzx r8d, r8b",
+        "movzx r9d, r9b",
+    ];
+    let word = [
+        "movzx edi, di",
+        "movzx esi, si",
+        "movzx edx, dx",
+        "movzx r10d, cx",
+        "movzx r8d, r8w",
+        "movzx r9d, r9w",
+    ];
+    let double = [
+        "mov edi, edi",
+        "mov esi, esi",
+        "mov edx, edx",
+        "mov r10d, ecx",
+        "mov r8d, r8d",
+        "mov r9d, r9d",
+    ];
+    let signed_byte = [
+        "movsx rdi, dil",
+        "movsx rsi, sil",
+        "movsx rdx, dl",
+        "movsx r10, cl",
+        "movsx r8, r8b",
+        "movsx r9, r9b",
+    ];
+    let signed_word = [
+        "movsx rdi, di",
+        "movsx rsi, si",
+        "movsx rdx, dx",
+        "movsx r10, cx",
+        "movsx r8, r8w",
+        "movsx r9, r9w",
+    ];
+    let signed_double = [
+        "movsxd rdi, edi",
+        "movsxd rsi, esi",
+        "movsxd rdx, edx",
+        "movsxd r10, ecx",
+        "movsxd r8, r8d",
+        "movsxd r9, r9d",
+    ];
+    let cases: [(&str, &[&str]); 13] = [
+        ("u8", &byte),
+        ("u16", &word),
+        ("u32", &double),
+        ("i8", &signed_byte),
+        ("i16", &signed_word),
+        ("i32", &signed_double),
+        ("bool", &byte),
+        ("flags", &word),
+        ("choice", &byte),
+        // A value that fills its register is passed as it is: only the fourth moves.
+        ("u64", &["mov r10, rcx"]),
+        // An enumeration over a signed integer, each with a member below zero: the sign.
+        ("sign", &signed_byte),
+        ("wide_sign", &signed_word),
+        ("far_sign", &signed_double),
+    ];
+    for (number, (ty, extensions)) in cases.iter().enumerate() {
+        let mut wanted: Vec<String> = extensions.iter().map(|i| i.to_string()).collect();
+        wanted.push(number_load(number as u32 + 1));
+        wanted.push("syscall".to_string());
+        wanted.push("ret".to_string());
+        assert_eq!(
+            listed(&listing, &format!("origin_fixture_widen_six_{ty}")),
+            wanted,
+            "six parameters of {ty}"
+        );
+    }
+}
+
+/// The client's crate holds no stub: a program that links it holds no `syscall` of its own, and
+/// reaches the kernel through `origin.core`'s entry points alone (ADR-0011 L3, L6).
+#[test]
+fn the_clients_tree_holds_no_stub() {
+    let tree = tree();
+    let mut checked = 0;
+    for (path, text) in &tree.files {
+        if !path.starts_with("rust/") {
+            continue;
+        }
+        assert!(
+            !text.contains("asm!") && !text.contains("naked"),
+            "{path}: assembly in the client's tree"
+        );
+        checked += 1;
+    }
+    assert!(checked > 10, "{checked} files");
+    let stubs = &tree.files["core/origin_kernel/kernel.rs"];
+    assert_eq!(
+        stubs.matches("\"syscall\",").count(),
+        compilation()
+            .libraries
+            .iter()
+            .find(|l| l.name == "origin.kernel")
+            .expect("kernel")
+            .interfaces[0]
+            .methods
+            .len(),
+        "one `syscall` a method in the stubs' file"
+    );
+}
+
+/// The list of `origin.core`'s exports names every method once, with its number, its C symbol and
+/// the version it arrived in, under the definition's release fingerprint (ADR-0011 L5, L7).
+#[test]
+fn the_list_of_exports_names_every_method_with_its_number_and_version() {
+    let tree = tree();
     let comp = compilation();
     let kernel = comp
         .libraries
         .iter()
         .find(|l| l.name == "origin.kernel")
         .expect("kernel");
-    for method in &kernel.interfaces[0].methods {
-        let symbol = format!("<origin_kernel_{}>:", method.name);
-        let start = listing
-            .find(&symbol)
-            .unwrap_or_else(|| panic!("no symbol {symbol} in the object"));
-        let body = &listing[start + symbol.len()..];
-        let end = body.find("\n\n").unwrap_or(body.len());
-        let body = &body[..end];
+    let list = &tree.files["core/origin_kernel.exports"];
+    let mut lines = list.lines();
+    assert_eq!(
+        lines.next(),
+        Some(format!("# {} origin.kernel", codegen::rust::EXPORTS_FORMAT).as_str())
+    );
+    let release = fingerprint::fingerprints(kernel)
+        .last()
+        .expect("a minor")
+        .release;
+    assert_eq!(
+        lines.next(),
+        Some(format!("release sha256:{}", fingerprint::hex(&release)).as_str())
+    );
+    let methods = &kernel.interfaces[0].methods;
+    let rest: Vec<&str> = lines.collect();
+    assert_eq!(rest.len(), methods.len());
+    for (line, method) in rest.iter().zip(methods) {
         assert_eq!(
-            body.matches("syscall").count(),
-            1,
-            "{symbol}: exactly one syscall instruction (ADR-0005 B2):\n{body}"
-        );
-        let loads_number = if method.ordinal == 0 {
-            body.contains("xorl\t%eax, %eax") || body.contains("xor\t%eax, %eax")
-        } else {
-            body.contains(&format!("$0x{:x}, %eax", method.ordinal))
-        };
-        assert!(
-            loads_number,
-            "{symbol}: loads {} into RAX:\n{body}",
-            method.ordinal
+            *line,
+            format!(
+                "{} origin_kernel_{} {} {}.{}",
+                method.ordinal, method.name, method.name, method.since.major, method.since.minor
+            )
         );
     }
+    // Calls that arrived with a later minor say so: the memory calls came with 0.5.
+    assert!(
+        rest.contains(&"12 origin_kernel_memory_map memory_map 0.5"),
+        "{list}"
+    );
+    // The same fingerprint is in the kernel's side, so the two can be compared at build time.
+    let server = &tree.files["rust/origin_kernel/kernel/server.rs"];
+    let bytes: Vec<String> = release.iter().map(|b| format!("{b:#04x},")).collect();
+    for row in bytes.chunks(8) {
+        assert!(server.contains(&row.join(" ")), "{}", row.join(" "));
+    }
+}
+
+/// The kernel's pin, run on the host: every call is accepted at its own offset and at no other
+/// call's, and a number with no stub nowhere (ADR-0005 B2; ADR-0011 L7).
+#[test]
+fn the_pin_accepts_each_number_at_its_own_offset_alone() {
+    let tree = tree();
+    let comp = compilation();
+    let kernel = comp
+        .libraries
+        .iter()
+        .find(|l| l.name == "origin.kernel")
+        .expect("kernel");
+    let methods = &kernel.interfaces[0].methods;
+    let fields: Vec<String> = methods
+        .iter()
+        .enumerate()
+        .map(|(i, m)| format!("        {}: {},\n", m.name, 0x40 + 0x10 * i))
+        .collect();
+    let numbers: Vec<String> = methods.iter().map(|m| m.ordinal.to_string()).collect();
+    let source = format!(
+        r#"use oidl_generated::origin_kernel::kernel::server::{{Pins, pinned}};
+
+fn main() {{
+    let pins = Pins {{
+{}    }};
+    let numbers: [u64; {count}] = [{}];
+    let each = pins.each();
+    assert_eq!(each.len(), numbers.len());
+    for (i, &(number, offset)) in each.iter().enumerate() {{
+        assert_eq!(number, numbers[i]);
+        assert_eq!(offset, 0x40 + 0x10 * i as u64);
+        for &(other, there) in &each {{
+            assert_eq!(pinned(&pins, number, there), other == number, "{{number}} at {{there:#x}}");
+        }}
+        // Not one byte before or after, nor at the image's base.
+        assert!(!pinned(&pins, number, offset - 1) && !pinned(&pins, number, offset + 1));
+        assert!(!pinned(&pins, number, 0) && !pinned(&pins, number, u64::MAX));
+    }}
+    // A number with no stub is accepted nowhere, an existing stub's place included.
+    for unknown in [{count}u64, 9999, 1 << 32, u64::MAX] {{
+        assert!(!numbers.contains(&unknown));
+        for &(_, offset) in &each {{
+            assert!(!pinned(&pins, unknown, offset), "{{unknown}} at {{offset:#x}}");
+        }}
+    }}
+    println!("all checks passed");
+}}
+"#,
+        fields.concat(),
+        numbers.join(", "),
+        count = methods.len(),
+    );
+    let dir = scratch("pin");
+    let program = dir.join("pin_check.rs");
+    fs::write(&program, source).expect("write the program");
+    let out = run_program(
+        &tree.dir,
+        &tree.rlib,
+        &program,
+        "pin_check",
+        &["-D", "warnings"],
+    );
+    assert!(out.contains("all checks passed"), "{out}");
 }
 
 fn map_of(output: &str) -> BTreeMap<String, String> {

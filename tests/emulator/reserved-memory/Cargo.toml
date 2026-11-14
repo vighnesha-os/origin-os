@@ -1,0 +1,28 @@
+[package]
+name = "origin-test-reserved-memory"
+description = "TEST ONLY, never shipped: a UEFI application that plants firmware-reserved memory (RMRRs, IVMDs) in QEMU's ACPI tables and starts Origin's loader, for the boot test (TASKS item 40)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The configuration format, the structures and the table edits, unit-tested on the host.
+[lib]
+path = "src/lib.rs"
+
+# The EFI application. Build it only for x86_64-unknown-uefi (`cargo xtask boot-matrix`).
+[[bin]]
+name = "origin-test-reserved"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+origin-boot-uefi = { path = "../../../boot/uefi" }
+
+# The tests parse what the application would plant with the kernel's own parsers.
+[dev-dependencies]
+origin-frame = { path = "../../../framekernel/frame" }
+
+[lints]
+workspace = true

@@ -3,7 +3,24 @@
 //! files.
 
 use super::elf_writer::{Load, Phdr, R, RELATIVE, RW, RX, TestElf, text};
-use crate::carried::{Access, CarriedError, describe, stale};
+use crate::carried::{self, Access, CarriedError, File, describe};
+
+/// [`carried::stale`] for the program `first`, whose descriptions begin with the line
+/// `onbf-pack carried` writes for it.
+fn stale(
+    name: &str,
+    files: &[File],
+    present: &[String],
+    description: Option<&[u8]>,
+) -> Result<Vec<String>, CarriedError> {
+    carried::stale(
+        name,
+        &carried::generated_line(name),
+        files,
+        present,
+        description,
+    )
+}
 use crate::elf::{ElfError, Permissions, SlotProblem};
 
 /// The baseline program: text at 0x1000 (the entry), read-only data at 0x2000, writable data at

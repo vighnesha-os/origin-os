@@ -28,13 +28,31 @@
 //! in the kernel has none of them to work with. No boot proof can see that from inside, so the
 //! gate reads the entry stub and fails if one of those instructions has gone ([`ENTRY`]).
 //!
+//! **And the per-call pin** (ADR-0005 B2; ADR-0011 L7; ADR-0017 Z9; task S4-2). The kernel
+//! accepts each call number of a pinned process only from its own offset of `origin.core`, and
+//! the decision is one function the kernel never inlines, [`PIN_FUNCTION`]. A `match` on the
+//! number written as comparisons is what the source says; whether the compiler kept it so is
+//! what the image says, so the gate reads that function ([`pin_problems`], the independent review
+//! of 2026-11-13, finding K4): one register is compared with each of the offsets the kernel
+//! carries for `origin.core`, every one of them as an immediate; the function has no indirect
+//! jump; and no memory operand indexed by a register stands before its first call, so no table
+//! is read at an index. A compiler that turned the `match` into a table of constants, or into a
+//! jump table, fails it.
+//!
 //! It reads a listing, so it sees what a linear disassembly sees. It is a check that two
-//! options and one stub still do their work, not a proof about every byte of the image.
+//! options, one stub and one function still do their work, not a proof about every byte of the
+//! image.
 
 use std::path::Path;
 use std::process::Command;
 
-use crate::{Result, build_kernel, llvm_tool};
+use std::collections::BTreeMap;
+
+use crate::{Result, build_kernel, corestubs, llvm_tool, read_file, ring3};
+
+/// The function that holds the per-call pin: `pin::judge` for the kernel's own `origin.core`,
+/// never inlined (`framekernel/src/syscall.rs`).
+const PIN_FUNCTION: &str = "framekernel::syscall::pin_verdict";
 
 /// The crates the toolchain ships already compiled.
 const PREBUILT_CRATES: &[&str] = &["core", "alloc", "compiler_builtins"];
@@ -455,6 +473,134 @@ fn verdict(findings: &Findings) -> Result<Vec<String>> {
     Ok(lines)
 }
 
+/// `cmp R, IMM` with a register as its first operand: the register's name and the immediate.
+fn compare_immediate(instruction: &str) -> Option<(&str, u64)> {
+    let (register, immediate) = instruction.strip_prefix("cmp ")?.split_once(", ")?;
+    if register.is_empty() || !register.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let value = match immediate.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok()?,
+        None => immediate.parse().ok()?,
+    };
+    Some((register, value))
+}
+
+/// Whether an instruction has a memory operand indexed by a register: a register times a
+/// scale (`[rax + 8*rcx]`), or two registers added (`[rax + rcx]`, a byte table read at an
+/// index). One register and a displacement (`[rdi + 0x8]`), or `rip` and a displacement, is
+/// not.
+fn indexed(instruction: &str) -> bool {
+    instruction.split('[').skip(1).any(|memory| {
+        let inside = memory.split(']').next().unwrap_or("");
+        let registers = inside
+            .split(['+', '-'])
+            .map(str::trim)
+            .map(|term| term.rsplit('*').next().unwrap_or(term))
+            .filter(|term| {
+                term.starts_with(|c: char| c.is_ascii_lowercase())
+                    && !term.starts_with("0x")
+                    && term.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+            .count();
+        inside.contains('*') || registers >= 2
+    })
+}
+
+/// What is wrong with [`PIN_FUNCTION`] in `listing`, against `pins`, the offset of each call's
+/// `syscall` in `origin.core` as the kernel carries them.
+///
+/// - The function is in the image under that name, with instructions.
+/// - One register is compared with every offset, each as an immediate (`cmp R, 0x45`). One and
+///   the same register, so that an offset that happens to equal a call number, which the same
+///   function also compares, does not pass for it.
+/// - No indirect jump.
+/// - No memory operand indexed by a register (a register times a scale, or two registers added)
+///   before its first call (or anywhere, if it makes none).
+pub(crate) fn pin_problems(listing: &str, pins: &BTreeMap<String, u64>) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut instructions: Vec<String> = Vec::new();
+    let mut inside = false;
+    let mut seen = false;
+    for line in listing.lines() {
+        match classify(line) {
+            Line::Function(name) => {
+                inside = name == PIN_FUNCTION;
+                seen |= inside;
+            }
+            Line::Section => inside = false,
+            Line::Instruction(_, text) if inside => instructions.push(text),
+            Line::Instruction(..) | Line::Other => {}
+        }
+    }
+    if !seen || instructions.is_empty() {
+        problems.push(format!(
+            "`{PIN_FUNCTION}` is not in the image with any instruction: was it inlined or renamed? The gate cannot read the pin"
+        ));
+        return problems;
+    }
+    if pins.is_empty() {
+        problems
+            .push("the kernel carries no offset of `origin.core`: nothing to look for".to_string());
+    }
+    let mut compared: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    for instruction in &instructions {
+        if let Some((register, value)) = compare_immediate(instruction) {
+            compared.entry(register).or_default().push(value);
+        }
+    }
+    let covers = |values: &Vec<u64>| pins.values().all(|pin| values.contains(pin));
+    if !compared.values().any(covers) {
+        let missing: Vec<String> = pins
+            .iter()
+            .filter(|(_, pin)| !compared.values().any(|values| values.contains(pin)))
+            .map(|(method, pin)| format!("{method} at {pin:#x}"))
+            .collect();
+        problems.push(format!(
+            "no one register of `{PIN_FUNCTION}` is compared with every offset of `origin.core` as an immediate; offsets compared nowhere: {}. Has the compiler turned the pin's `match` into something else?",
+            if missing.is_empty() {
+                "none, but they are spread over registers".to_string()
+            } else {
+                missing.join(", ")
+            }
+        ));
+    }
+    for instruction in &instructions {
+        if indirect_jump(instruction).is_some() {
+            problems.push(format!(
+                "`{PIN_FUNCTION}` has an indirect jump: `{instruction}`"
+            ));
+        }
+    }
+    for instruction in instructions.iter().take_while(|i| mnemonic(i) != "call") {
+        if indexed(instruction) {
+            problems.push(format!(
+                "`{PIN_FUNCTION}` reads memory at an index before its first call: `{instruction}`"
+            ));
+        }
+    }
+    problems
+}
+
+/// Holds [`PIN_FUNCTION`] in `listing` to [`pin_problems`]'s rule, against the description of
+/// `origin.core` the kernel was built with (the default target directory's). Returns the line
+/// it prints.
+fn pin_gate(listing: &str) -> Result<String> {
+    let description = ring3::carried_dir(None).join(format!("{}.rs", ring3::CORE_NAME));
+    let table = corestubs::read_table(&String::from_utf8_lossy(&read_file(&description)?))?;
+    let problems = pin_problems(listing, &table.pins);
+    if !problems.is_empty() {
+        return Err(format!(
+            "the kernel's per-call pin is not comparisons alone (ADR-0017 Z9; ADR-0011 L7):\n  {}",
+            problems.join("\n  ")
+        ));
+    }
+    Ok(format!(
+        "xtask: image gate: the per-call pin, `{PIN_FUNCTION}`: one register compared with each of origin.core's {} offsets as an immediate, no indirect jump, and no memory read at an index (ADR-0017 Z9; ADR-0011 L7)",
+        table.pins.len()
+    ))
+}
+
 /// Disassembles `elf` and holds it to the rule.
 pub(crate) fn gate(elf: &Path) -> Result {
     let objdump = llvm_tool("llvm-objdump")?;
@@ -481,6 +627,7 @@ pub(crate) fn gate(elf: &Path) -> Result {
     for line in verdict(&read(&listing))? {
         println!("{line}");
     }
+    println!("{}", pin_gate(&listing)?);
     Ok(())
 }
 
@@ -869,5 +1016,146 @@ mod tests {
         assert_eq!(register_add("add rax, rcx"), Some(("rax", "rcx")));
         assert_eq!(register_add("add rax, 8"), None);
         assert_eq!(register_add("add rsp, 0x10"), None);
+    }
+
+    // ------------------------------------------------------------ the per-call pin (K4)
+
+    /// The offsets of three calls, as a description holds them.
+    fn three_pins() -> BTreeMap<String, u64> {
+        [
+            ("channel_create", 0x5),
+            ("handle_close", 0x45),
+            ("clock_read", 0x25),
+        ]
+        .into_iter()
+        .map(|(m, o)| (m.to_string(), o))
+        .collect()
+    }
+
+    /// The pin as the compiler wrote it at task S4-2: compares on the number in RSI, and on the
+    /// offset in RCX with each pin as an immediate.
+    fn pin_function(body: &[&str]) -> String {
+        listing(&[
+            ("framekernel::syscall::run", &["push rbp", "ret", "int3"]),
+            (PIN_FUNCTION, body),
+            ("framekernel::syscall::refused", &["ret", "int3"]),
+        ])
+    }
+
+    const COMPARES: &[&str] = &[
+        "push rbp",
+        "mov rbp, rsp",
+        "cmp dword ptr [rdi], 0x1",
+        "add rdx, -0x2",
+        "cmp byte ptr [rdi + 0x8], 0x0",
+        "mov rcx, rdx",
+        "sub rcx, qword ptr [rdi + 0x10]",
+        "cmp rsi, 0x3",
+        "cmp rcx, 0x45",
+        "cmp rsi, 0x5",
+        "cmp rcx, 0x5",
+        "cmp rsi, 0x13",
+        "cmp rcx, 0x25",
+        "xor eax, eax",
+        "pop rbp",
+        "ret",
+        "int3",
+    ];
+
+    #[test]
+    fn a_pin_of_comparisons_passes() {
+        assert_eq!(
+            pin_problems(&pin_function(COMPARES), &three_pins()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_pin_that_is_not_comparisons_on_one_register_fails() {
+        // An offset compared nowhere: a table of constants loaded at the number.
+        let mut table: Vec<&str> = COMPARES
+            .iter()
+            .copied()
+            .filter(|i| *i != "cmp rcx, 0x45")
+            .collect();
+        table.insert(8, "lea rax, [rip + 0x1234]");
+        table.insert(9, "cmp rcx, qword ptr [rax + 8*rsi]");
+        let problems = pin_problems(&pin_function(&table), &three_pins());
+        assert!(
+            problems.iter().any(|p| p.contains("handle_close at 0x45")),
+            "{problems:#?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("reads memory at an index")),
+            "{problems:#?}"
+        );
+        // A byte table read at an index: two registers added, and no scale (the coordinating
+        // session's tightening of K4).
+        let mut bytes = COMPARES.to_vec();
+        bytes.insert(7, "movzx eax, byte ptr [rax + rcx]");
+        let problems = pin_problems(&pin_function(&bytes), &three_pins());
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("reads memory at an index")),
+            "{problems:#?}"
+        );
+        // One register and a displacement, and `rip` and a displacement, are not an index.
+        for single in [
+            "mov rax, qword ptr [rdi + 0x10]",
+            "mov rax, qword ptr [rip + 0x95204]",
+            "cmp rax, qword ptr [rdi - 0x8]",
+            "cmp dword ptr [rdi], 0x1",
+        ] {
+            assert!(!indexed(single), "{single}");
+        }
+        assert!(indexed("mov rax, qword ptr [rax + 8*rcx]"));
+        assert!(indexed("movzx eax, byte ptr [rcx + rax + 0x10]"));
+        // The offsets spread over two registers: `cmp rsi, 0x5`, the number's compare, does not
+        // stand in for the offset's.
+        let spread: Vec<&str> = COMPARES
+            .iter()
+            .copied()
+            .filter(|i| *i != "cmp rcx, 0x5")
+            .collect();
+        let problems = pin_problems(&pin_function(&spread), &three_pins());
+        assert!(
+            problems.iter().any(|p| p.contains("no one register")),
+            "{problems:#?}"
+        );
+        // A jump table.
+        let mut jumps = COMPARES.to_vec();
+        jumps.insert(7, "jmp rax");
+        let problems = pin_problems(&pin_function(&jumps), &three_pins());
+        assert!(
+            problems.iter().any(|p| p.contains("indirect jump")),
+            "{problems:#?}"
+        );
+    }
+
+    #[test]
+    fn an_index_after_the_first_call_is_not_the_pins() {
+        let mut later = COMPARES.to_vec();
+        later.insert(15, "call 0xa0000 <framekernel::syscall::refused>");
+        later.insert(16, "mov rax, qword ptr [rcx + 8*rdx]");
+        assert_eq!(
+            pin_problems(&pin_function(&later), &three_pins()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_pin_that_is_not_in_the_image_fails() {
+        let gone = listing(&[(
+            "framekernel::syscall::run",
+            &["cmp rcx, 0x45", "ret", "int3"],
+        )]);
+        let problems = pin_problems(&gone, &three_pins());
+        assert!(
+            problems.len() == 1 && problems[0].contains("inlined or renamed"),
+            "{problems:#?}"
+        );
     }
 }

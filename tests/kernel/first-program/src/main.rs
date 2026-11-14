@@ -2,7 +2,11 @@
 //! that the kernel carries in its image, launches at a random base and judges
 //! (`framekernel/src/program_proof.rs`).
 //!
-//! It links today's generated stubs for `origin.kernel` into itself and runs under ADR-0005 A6.
+//! It reaches the kernel through `origin.core` alone, like every program that is not one of the
+//! kernel's assembly proof programs (task S4-2; L3): it is linked against that library, holds
+//! no `syscall` of its own, and each of its calls goes through an import slot the launch path
+//! bound.
+//!
 //! Its first argument says what to do (ADR-0005 E2: the arguments are bytes for the program
 //! alone). In every mode it first reports, with `debug_report`, what it found: the start
 //! record's address, where its entry runs, and its record's header and entries ([`report`]).
@@ -28,8 +32,8 @@ mod relocated;
 use core::hint::black_box;
 
 use origin_abi::start::role;
-use origin_kernel_stubs::oidl_rt::Handle;
-use origin_kernel_stubs::origin_kernel::kernel::client;
+use origin_kernel_client::oidl_rt::Handle;
+use origin_kernel_client::origin_kernel::kernel::client;
 use origin_rt::Start;
 
 origin_rt::main!(main);
