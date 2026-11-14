@@ -89,14 +89,13 @@ impl<T> PerCpu<T> {
     /// was not sized (review finding F2 of 2026-11-14).
     #[inline]
     pub fn get(&self, index: usize) -> Option<&T> {
-        let found = match index.checked_sub(1) {
-            None => return Some(&self.boot),
-            Some(past) => self.rest.get().and_then(|rest| rest.get(past)),
-        };
-        if found.is_none() {
-            self.not_held(index);
+        match index.checked_sub(1) {
+            None => Some(&self.boot),
+            Some(past) => match self.rest.get().and_then(|rest| rest.get(past)) {
+                Some(element) => Some(element),
+                None => self.not_held(index, past),
+            },
         }
-        found
     }
 
     /// The table's name.
@@ -104,19 +103,35 @@ impl<T> PerCpu<T> {
         self.name
     }
 
+    /// Whether the table holds `index`: a length check, which never panics, for a caller that
+    /// must ask before it looks (review finding N2 of 2026-11-14).
+    #[inline]
+    pub fn holds(&self, index: usize) -> bool {
+        index < self.indexes()
+    }
+
     /// Called only when [`PerCpu::get`] finds no element. An index the kernel has that the table
     /// does not hold means the table was never sized: running on would drop that processor's
     /// state, or, for the shootdown's records, leave it out of every flush.
+    ///
+    /// The count first, then the table again (review finding N3 of 2026-11-14). The count is fixed
+    /// (Release) only after every table it covers is published, so a count read with Acquire
+    /// brings those tables with it: a lookup that raced the sizing and found the table unpublished
+    /// finds it here, published, and gets its element. In the other order a lookup could see the
+    /// count fixed and the table not yet, and stop the kernel for nothing. No other processor runs
+    /// between sizing and fixing the count today; sizing while processors run (hot-plug) would.
     #[cold]
     #[inline(never)]
-    fn not_held(&self, index: usize) {
+    fn not_held(&self, index: usize, past: usize) -> Option<&T> {
         let count = required();
+        let found = self.rest.get().and_then(|rest| rest.get(past));
         assert!(
-            index >= count,
+            found.is_some() || index >= count,
             "per-CPU table {} holds {} indexes, not processor index {index} of the {count} the kernel has: it was not sized (ADR-0008 Amendment 1, D1)",
             self.name,
             self.indexes()
         );
+        found
     }
 
     /// The indexes the table holds: 1 until it is sized, never 0.
@@ -463,6 +478,27 @@ mod tests {
         assert_eq!(missed.get(5), None);
         set_required(1);
         assert_eq!(missed.get(1), None, "before the count is fixed: absent");
+    }
+
+    /// Review finding N2 of 2026-11-14: `holds` asks without looking, so it never panics where a
+    /// lookup of the same index would, and it agrees with what a lookup finds.
+    #[test]
+    fn holds_is_a_length_check_that_never_panics() {
+        set_required(5);
+        let unsized_table = PerCpu::new("tests::UNSIZED", 0u8, || 1);
+        assert!(unsized_table.holds(0));
+        for index in 1..8 {
+            assert!(!unsized_table.holds(index), "{index}");
+        }
+        let sized = PerCpu::new("tests::HOLDS", 0u8, || 1);
+        assert_eq!(sized.size(3), Ok(3));
+        for index in 0..8 {
+            assert_eq!(sized.holds(index), index < 3, "{index}");
+            if !(3..5).contains(&index) {
+                assert_eq!(sized.get(index).is_some(), sized.holds(index), "{index}");
+            }
+        }
+        set_required(1);
     }
 
     /// Review finding F7 of 2026-11-14: a table sized before, with fewer indexes, lowers what

@@ -156,9 +156,11 @@ pub fn mark_online() -> bool {
 }
 
 /// Whether processor `index` has a record in the shootdown, so it can be asked to flush. An AP
-/// without one refuses its start-up (`smp::ap_entry`; review finding F6 of 2026-11-14).
+/// without one refuses its start-up (`smp::ap_entry`; review finding F6 of 2026-11-14). A length
+/// check that cannot panic, unlike a lookup of an index the tables were not sized for (review
+/// finding N2): the AP asks this before any other per-processor lookup.
 pub fn has_record(index: CpuIndex) -> bool {
-    SHOOTDOWN.has_record(index.get())
+    RECORDS.holds(index.get()) && ASKED.holds(index.get())
 }
 
 /// Runs `load` (the CR3 write) as this processor's move to address space `to`, with the record

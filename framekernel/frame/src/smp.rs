@@ -971,6 +971,15 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // SAFETY: the boot processor leaked `start` for this AP (`start_one`), so it is valid
     // for ever and shared only through its handshake and the tables pointer.
     let start = unsafe { &*start };
+    // Its record in the TLB shootdown, before any other per-processor lookup: without one it
+    // would never be asked to flush, and an address space could be freed under it. Every table
+    // is sized before any AP starts, so this holds unless a table was missed; then it refuses,
+    // and the boot processor parks it, counts it and names it (review findings F6 and N2 of
+    // 2026-11-14). `has_record` is a length check: it cannot panic where a lookup would.
+    if !crate::tlb::has_record(start.index) {
+        let _ = start.handshake.refuse(Refusal::NoRecord);
+        cpu::halt();
+    }
     // SAFETY: once per AP (each gets its own `start`), CPL 0, interrupts disabled (the
     // trampoline ran `cli`), after `cpu::init` on the boot processor; the tables are this
     // AP's alone, and so is `start.index` (the boot processor gives each index once). The
@@ -1016,14 +1025,6 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
         // Not the processor this index was given to: refuse, and do nothing more (no
         // timer, no scheduler; interrupts stay disabled) until the boot processor parks it.
         let _ = start.handshake.refuse(Refusal::NotMine);
-        cpu::halt();
-    }
-    // Its record in the TLB shootdown: without one it would never be asked to flush, and an
-    // address space could be freed under it. Every table is sized before any AP starts, so this
-    // holds unless a table was missed; then it refuses and stays out (review finding F6 of
-    // 2026-11-14).
-    if !crate::tlb::has_record(start.index) {
-        let _ = start.handshake.refuse(Refusal::NoRecord);
         cpu::halt();
     }
     // This processor's topology, read on itself: its leaves are its own (CLAUDE.md §24, §27).
