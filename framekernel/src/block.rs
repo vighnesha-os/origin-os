@@ -196,7 +196,11 @@ pub(crate) fn prove(com1: &mut Console) -> bool {
         "origin-kernel: block cache: {SLOTS} pages ({} B blocks, {ppb} per page): {matched} of {blocks} blocks matched the pattern; {cold_reads} device reads cold, re-reading {SLOTS} resident pages did {} more ({hits} hits, {misses} misses){}",
         b.block_size,
         b.reads - cold_reads,
-        if reads_ok { "" } else { ": block cache failed" }
+        if reads_ok {
+            alloc::string::String::new()
+        } else {
+            alloc::format!("{}: block cache failed", crate::storage::failure_note())
+        }
     );
 
     // A fifth page evicts the least-recently-used one (all clean: no write-back).
@@ -222,9 +226,9 @@ pub(crate) fn prove(com1: &mut Console) -> bool {
         "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: {evict_ok}); wrote LBA {scratch}, flushed ({} device writes), evicted and read back changed: {read_back}{}",
         b.writes - writes_before_flush,
         if write_ok && evict_ok {
-            ""
+            alloc::string::String::new()
         } else {
-            ": block cache failed"
+            alloc::format!("{}: block cache failed", crate::storage::failure_note())
         }
     );
     reads_ok && evict_ok && write_ok

@@ -23,7 +23,7 @@
 
 **Gaps.**
 - No standard defines a native filesystem's on-disk format. "Authoritative specification" here means the device's durability contract.
-- The Flush command's text is in the NVMe Base Specification, which was not read. N1 was read for durability, torn writes and FUA; its errata were not reviewed.
+- The Flush command's text is in the NVMe Base Specification, which was not read when this ledger was written. Base 2.4 §7.2 (PDF p. 593) was read on 2026-11-14 (`docs/research/2026-11-14-nvme-2-4-check.md`): a flush covers the commands completed before it was submitted, and succeeds with no volatile write cache. N1 was read for durability, torn writes and FUA; its errata were not reviewed.
 - L1, L2 and N1 were read in their own text. L3–L7 were read only at the level of abstracts and summaries.
 - Log-structured designs (LFS, F2FS) were not assessed.
 
