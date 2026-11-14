@@ -288,18 +288,25 @@ pub fn start(
     let bsp_guards = unsafe { cpu::protect_interrupt_stacks() }
         .and_then(|guards| probe_guards(&guards))
         .map(|proven| INTERRUPT_STACK_GUARDS.store(proven, Ordering::Relaxed));
-    let map = match discover(info.acpi_rsdp, bsp) {
-        Ok(map) => map,
+    let (map, disagreeing) = match discover(info.acpi_rsdp, bsp) {
+        Ok(found) => found,
         Err(e) => {
             let _ = writeln!(com1, "origin-kernel: ACPI processor discovery failed: {e}");
             return online;
         }
     };
-    let capable = if map.online_capable() > 0 {
+    let mut capable = if map.online_capable() > 0 {
         alloc::format!(", {} online-capable", map.online_capable())
     } else {
         alloc::string::String::new()
     };
+    // Review finding F11 of 2026-11-14: a processor listed again with other flags is counted,
+    // and its most usable listing kept.
+    if disagreeing > 0 {
+        capable.push_str(&alloc::format!(
+            ", {disagreeing} listed again with other flags (the most usable listing kept)"
+        ));
+    }
     let _ = write!(
         com1,
         "origin-kernel: ACPI MADT: {} processors, {} enabled{capable} (largest APIC ID listed {}); CPU index 0 for the boot processor (APIC ID {bsp})",
@@ -601,14 +608,16 @@ enum NotStarted {
 /// (APIC ID `bsp`) first. The MADT lists every processor the platform may ever have, enabled
 /// or not (QEMU lists all of `maxcpus`, up to 4096 on q35), so the list is sized from the
 /// table, on the heap: each processor structure is at least 8 bytes long.
-fn discover(rsdp_addr: u64, bsp: u32) -> Result<CpuMap, &'static str> {
-    let listed = madt_listing(rsdp_addr)?;
-    Ok(CpuMap::new(bsp, &listed))
+fn discover(rsdp_addr: u64, bsp: u32) -> Result<(CpuMap, usize), &'static str> {
+    let (listed, disagreeing) = madt_listing(rsdp_addr)?;
+    Ok((CpuMap::new(bsp, &listed), disagreeing))
 }
 
 /// Every processor the MADT lists, enabled or not. The list is sized from the table, on the
 /// heap: each processor structure is at least 8 bytes long.
-fn madt_listing(rsdp_addr: u64) -> Result<Vec<Processor>, &'static str> {
+/// Also returns how many listings of an APIC ID listed before disagree with it on its flags
+/// (`acpi::madt_processors_counted`).
+fn madt_listing(rsdp_addr: u64) -> Result<(Vec<Processor>, usize), &'static str> {
     let madt = crate::firmware::acpi_table(rsdp_addr, b"APIC").map_err(|e| {
         if e == "table not listed in the XSDT" {
             "no MADT"
@@ -617,15 +626,20 @@ fn madt_listing(rsdp_addr: u64) -> Result<Vec<Processor>, &'static str> {
         }
     })?;
     let mut listed = alloc::vec![Processor::default(); madt.len() / 8];
-    let count = acpi::madt_processors(madt, &mut listed).map_err(|_| "invalid MADT")?;
+    let (count, disagreeing) =
+        acpi::madt_processors_counted(madt, &mut listed).map_err(|_| "invalid MADT")?;
     listed.truncate(count);
-    Ok(listed)
+    Ok((listed, disagreeing))
 }
 
 /// The x2APIC ID of every processor the MADT lists, enabled or not: the topology proof
 /// checks the CPUID layout against them (CLAUDE.md §24, §27).
 pub fn listed_apic_ids(rsdp_addr: u64) -> Result<Vec<u32>, &'static str> {
-    Ok(madt_listing(rsdp_addr)?.iter().map(|p| p.apic_id).collect())
+    Ok(madt_listing(rsdp_addr)?
+        .0
+        .iter()
+        .map(|p| p.apic_id)
+        .collect())
 }
 
 /// Writes `value` at `offset` in the trampoline data page.

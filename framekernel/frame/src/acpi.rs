@@ -246,6 +246,27 @@ pub struct Processor {
 /// processor listed twice (as type 0 and type 9) is kept once. Other structure types are
 /// skipped.
 pub fn madt_processors(madt: &[u8], out: &mut [Processor]) -> Result<usize, AcpiError> {
+    madt_processors_counted(madt, out).map(|(count, _)| count)
+}
+
+/// How usable a listing says its processor is: enabled now, then online-capable, then neither.
+fn usable(p: &Processor) -> u8 {
+    if p.enabled {
+        2
+    } else {
+        u8::from(p.online_capable)
+    }
+}
+
+/// [`madt_processors`], and how many later listings of an APIC ID already listed disagree with
+/// the first on whether it is enabled or online-capable. Of such listings the most usable is kept:
+/// an enabled one over the others, an online-capable one over a disabled one (review finding F11
+/// of 2026-11-14). Listings that agree are kept once, as before.
+pub fn madt_processors_counted(
+    madt: &[u8],
+    out: &mut [Processor],
+) -> Result<(usize, usize), AcpiError> {
+    let mut disagreeing = 0;
     let reads_online_capable = madt
         .get(HEADER_REVISION)
         .is_some_and(|&revision| revision >= MADT_ONLINE_CAPABLE_REVISION);
@@ -281,16 +302,26 @@ pub fn madt_processors(madt: &[u8], out: &mut [Processor]) -> Result<usize, Acpi
         };
         if let Some(p) = processor {
             let known = out
-                .get(..count)
-                .is_some_and(|seen| seen.iter().any(|q| q.apic_id == p.apic_id));
-            if !known {
-                *out.get_mut(count).ok_or(AcpiError::TooManyProcessors)? = p;
-                count += 1;
+                .get_mut(..count)
+                .and_then(|seen| seen.iter_mut().find(|q| q.apic_id == p.apic_id));
+            match known {
+                Some(q) => {
+                    if (q.enabled, q.online_capable) != (p.enabled, p.online_capable) {
+                        disagreeing += 1;
+                        if usable(&p) > usable(q) {
+                            *q = p;
+                        }
+                    }
+                }
+                None => {
+                    *out.get_mut(count).ok_or(AcpiError::TooManyProcessors)? = p;
+                    count += 1;
+                }
             }
         }
         at += usize::from(len);
     }
-    Ok(count)
+    Ok((count, disagreeing))
 }
 
 /// An I/O APIC the MADT lists (structure type 1).
@@ -683,6 +714,40 @@ mod tests {
             madt_processors(&m, &mut small),
             Err(AcpiError::TooManyProcessors)
         );
+    }
+
+    /// Review finding F11 of 2026-11-14: an APIC ID listed again with other flags keeps its most
+    /// usable listing (enabled, then online-capable), and each such listing is counted; repeats
+    /// that agree are not.
+    #[test]
+    fn a_processor_listed_again_keeps_its_most_usable_listing() {
+        let m = madt(&[
+            &lapic(4, 4, 0b10),  // online-capable first
+            &x2apic(4, 1, 9),    // then enabled: kept
+            &lapic(5, 5, 1),     // enabled first
+            &x2apic(5, 0, 8),    // then neither: counted, not kept
+            &lapic(6, 6, 0),     // neither
+            &x2apic(6, 0b10, 7), // then online-capable: kept
+            &lapic(7, 7, 1),
+            &x2apic(7, 7, 1), // agrees: not counted
+        ]);
+        let mut out = [Processor::default(); 8];
+        let (n, disagreeing) = madt_processors_counted(&m, &mut out).unwrap();
+        assert_eq!((n, disagreeing), (4, 3));
+        let kept: Vec<_> = out[..n]
+            .iter()
+            .map(|p| (p.apic_id, p.enabled, p.online_capable, p.uid))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (4, true, false, 9),
+                (5, true, false, 5),
+                (6, false, true, 7),
+                (7, true, false, 7)
+            ]
+        );
+        assert_eq!(madt_processors(&m, &mut out), Ok(4));
     }
 
     /// ADR-0008 Amendment 1, D2: Online Capable is read from MADT revision 5 on, and only with
