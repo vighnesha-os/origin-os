@@ -6,6 +6,7 @@
 //! `.cargo/config.toml`: `cargo xtask <command>`.
 #![forbid(unsafe_code)]
 
+mod amlalloc;
 mod asmflags;
 mod corestubs;
 mod costs;
@@ -108,6 +109,9 @@ commands:
   names-gate  only the gate on two names only listed files may use: the proof-process
               constructors in the kernel (ADR-0011 L8) and the call numbers in ring 3
               (CLAUDE.md §42); part of check
+  aml-alloc-gate only the gate on the AML interpreter's allocations: only its mem.rs may
+              allocate or grow a collection, and a planted push is caught (part of check;
+              quick)
   percpu-gate only the gate on per-processor state (ADR-0008 Amendment 1, D1 and D5):
               every PerCpu table sized by its crate's size_per_cpu, and no MAX_CPUS or
               static array sized by a processor count (part of check; quick)
@@ -273,7 +277,9 @@ const FREESTANDING_LIBS: &[&str] = &[
     "origin-directory",
 ];
 /// The services' `no_std` logic, which programs will run in ring 3 and the host tests until then.
-const SERVICE_LIBS: &[&str] = &["origin-directory-service"];
+const SERVICE_LIBS: &[&str] = &["origin-directory-service", AML_PACKAGE];
+/// The AML interpreter (ADR-0019 A3; TASKS item 63): a service's logic, `no_std` with `alloc`.
+const AML_PACKAGE: &str = "origin-aml";
 const QEMU: &str = "qemu-system-x86_64";
 /// Where the emulated RTC starts (UTC), so the boot test can check the wall clock the
 /// kernel reads from it: BCD decoding, the FADT century register and the calendar.
@@ -3448,6 +3454,7 @@ fn main() -> ExitCode {
         ["check"] => in_turn("check", check),
         ["unsafe-gate"] => unsafety::gate(),
         ["names-gate"] => listed_names::gate(),
+        ["aml-alloc-gate"] => amlalloc::gate(),
         ["percpu-gate"] => per_cpu::gate(),
         ["document-gate"] => documents::gate(),
         ["cfg-lint"] => linux_cfg_lint(),
@@ -4537,6 +4544,8 @@ fn check() -> Result {
     unsafety::gate()?;
     // Who may make a proof process, and which ring-3 files may name the call numbers.
     listed_names::gate()?;
+    // Only the AML interpreter's `mem.rs` may allocate (TASKS item 63).
+    amlalloc::gate()?;
     // Every per-processor table sized at discovery; no processor count compiled in.
     per_cpu::gate()?;
     interfaces::gate()?;
@@ -4755,6 +4764,30 @@ const NO_PANIC_ALLOWED_PARTS: &[&str] = &[
     "4core3str8converts9from_utf8",
 ];
 
+/// What the AML interpreter's object (`origin-aml`, TASKS item 63) may reference beyond
+/// [`NO_PANIC_ALLOWED`], matched by length-prefixed parts of the mangled name, for this crate
+/// alone:
+/// - the allocator's entry points (`__rust_alloc`, `__rust_dealloc`, `__rust_realloc`,
+///   `__rust_alloc_zeroed` and the shim marker), and not its error handler;
+/// - `alloc::raw_vec::handle_error`, which is unreachable: every growth in the crate follows a
+///   successful `try_reserve_exact` (`amlalloc.rs` says why it is still in the object);
+/// - `core::fmt`'s builders and integer formatting, which `Debug` impls call and which return an
+///   error rather than panic.
+const NO_PANIC_AML_PARTS: &[&str] = &[
+    "12___rust_alloc",
+    "14___rust_dealloc",
+    "14___rust_realloc",
+    "19___rust_alloc_zeroed",
+    "35___rust_no_alloc_shim_is_unstable_v2",
+    "5alloc7raw_vec12handle_error",
+    "4core3fmt8builders",
+    "9Formatter12debug_struct",
+    "4core3fmt3num",
+];
+
+/// What `origin-aml`'s object must define: the concrete instantiation and the engine's loop.
+const NO_PANIC_AML_REQUIRED: &[&str] = &["14no_panic_probe", "10run_frames"];
+
 /// Freestanding libraries whose object rightly holds no symbols at all: every item in them is
 /// generic, so nothing is compiled until a user instantiates it, and the no-panic check has
 /// nothing of theirs to read. Listed by name so that nothing else can pass having shown nothing.
@@ -4843,6 +4876,41 @@ fn no_panic_check() -> Result {
             undefined.len()
         );
     }
+    // The AML interpreter, with `alloc` (ADR-0019 A3): its own allowance, nothing else. Its
+    // interpreter is generic over its host, so the object holds the engine only through
+    // `no_panic_probe`, a concrete instantiation; the check requires it and the engine's loop in
+    // the object, so that losing them fails here (the review of TASKS 63's B1, F3).
+    let obj = build_kernel_object(AML_PACKAGE, &out_dir)?;
+    let undefined = nm_symbols(&nm, &obj, "-u")?;
+    let own = nm_symbols(&nm, &obj, "--defined-only")?;
+    require_symbols(AML_PACKAGE, &obj, own.len() + undefined.len())?;
+    for needed in NO_PANIC_AML_REQUIRED {
+        if !own.iter().any(|s| s.contains(needed)) {
+            return Err(format!(
+                "{AML_PACKAGE}: the release object defines no symbol containing `{needed}`: the no-panic check would not see the interpreter"
+            ));
+        }
+    }
+    let bad: Vec<&str> = undefined
+        .iter()
+        .map(String::as_str)
+        .filter(|s| {
+            !NO_PANIC_ALLOWED.contains(s)
+                && !NO_PANIC_ALLOWED_PARTS.iter().any(|p| s.contains(p))
+                && !NO_PANIC_AML_PARTS.iter().any(|p| s.contains(p))
+        })
+        .collect();
+    if !bad.is_empty() {
+        return Err(format!(
+            "{AML_PACKAGE}: the release object for {KERNEL_TARGET} references symbols outside its no-panic allowance:\n  {}",
+            bad.join("\n  ")
+        ));
+    }
+    println!(
+        "xtask: no-panic check: {AML_PACKAGE} ({KERNEL_TARGET}, release, the interpreter instantiated by `no_panic_probe`: {} symbols of its own) references {} external symbols, all within its allowance (allocator entry points, an unreachable `handle_error`, `core::fmt`)",
+        own.len(),
+        undefined.len()
+    );
     Ok(())
 }
 

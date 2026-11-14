@@ -88,6 +88,10 @@ name = "origin-acpi-tables"
 version = "0.0.0"
 
 [[package]]
+name = "origin-aml"
+version = "0.0.0"
+
+[[package]]
 name = "origin-boot-info"
 version = "0.0.0"
 dependencies = [
