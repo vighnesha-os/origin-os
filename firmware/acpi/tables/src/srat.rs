@@ -4,6 +4,13 @@
 //! local x2APIC affinity (2), the generic initiator affinity (5) and the generic port affinity (6).
 //! The GICC, GIC ITS and RINTC affinities (3, 4, 7) are walked and listed, not decoded
 //! (ADR-0019 A1); so are types 8 and above, which ACPI 6.6 does not define.
+//!
+//! **Verdicts are per structure**, as the MADT's (the review's F4 and F5, and the coordinating
+//! session's ruling): a structure too short for its type, or an enabled memory range that wraps
+//! past the top of the address space, is reported and not used, and the walk goes on. A disabled
+//! memory affinity structure is accepted whatever its range: §5.2.16.2 tells the OS to ignore
+//! its contents, so that firmware can carry placeholders. Only a length that cannot locate the
+//! next structure stops the walk, and so refuses the table.
 
 use crate::census::Tally;
 use crate::error::{Error, ErrorKind};
@@ -130,32 +137,44 @@ impl<'a> Srat<'a> {
         &self.table
     }
 
-    /// Every structure in order, decoded and checked; the walk ends at the first refusal.
+    /// Every structure in order, decoded and checked. A structure whose contents break a rule
+    /// comes back as `Err` and the walk goes on past it; a length that cannot locate the next
+    /// structure comes back as `Err` and ends the walk (the review's F5, F15).
     pub fn entries(&self) -> impl Iterator<Item = Result<Affinity<'a>, Error>> + 'a {
         let signature = self.table.signature();
         let mut walk = self
             .table
             .reader()
             .rest(ENTRIES)
-            .ok()
             .map(|run| Walk::new(run, Shape::BYTE_BYTE));
         let mut done = false;
         core::iter::from_fn(move || {
             if done {
                 return None;
             }
-            let item = walk.as_mut()?.next()?;
-            let entry = item.and_then(|raw| decode(&raw, signature));
-            done = entry.is_err();
-            Some(entry)
+            let item = match walk.as_mut() {
+                Ok(w) => w.next()?,
+                Err(e) => Err(*e),
+            };
+            Some(match item {
+                Ok(raw) => decode(&raw, signature),
+                Err(e) => {
+                    done = true;
+                    Err(e)
+                }
+            })
         })
     }
 
+    /// Checks every structure: one that breaks a rule is reported and not used; a walk error
+    /// refuses the table.
     pub(crate) fn census(&self, tally: &mut Tally<'_, 'a>) -> Result<(), Error> {
         for raw in Walk::new(self.table.reader().rest(ENTRIES)?, Shape::BYTE_BYTE) {
             let raw = raw?;
-            decode(&raw, self.table.signature())?;
-            tally.structure(raw.kind, raw.at, raw.bytes);
+            match decode(&raw, self.table.signature()) {
+                Ok(_) => tally.structure(raw.kind, raw.at, raw.bytes),
+                Err(e) => tally.reported(e, raw.at, raw.bytes),
+            }
         }
         Ok(())
     }
@@ -198,16 +217,18 @@ fn decode<'a>(raw: &Raw<'a>, signature: crate::Signature) -> Result<Affinity<'a>
             let b = body(raw, signature, 40)?;
             let base = b.u64(8)?;
             let length = b.u64(16)?;
-            if base.checked_add(length).is_none() {
-                // A range that wraps past the top of the address space names no memory.
+            let flags = b.u32(28)?;
+            let enabled = flags & 1 != 0;
+            if enabled && base.checked_add(length).is_none() {
+                // A range that wraps past the top of the address space names no memory. A
+                // disabled structure's contents are ignored (§5.2.16.2, the review's F4).
                 return Err(b.error(16, ErrorKind::Value { field: "Length" }));
             }
-            let flags = b.u32(28)?;
             Affinity::Memory {
                 proximity_domain: b.u32(2)?,
                 base,
                 length,
-                enabled: flags & 1 != 0,
+                enabled,
                 hot_pluggable: flags & 2 != 0,
                 non_volatile: flags & 4 != 0,
                 specific_purpose: flags & 8 != 0,
@@ -391,10 +412,20 @@ pub(crate) mod tests {
         assert!(matches!(c.class, census::Class::Checked(s) if s.structures() == 6));
     }
 
+    /// The census's summary of `t`, which it must accept.
+    fn summary(t: &[u8]) -> census::Summary {
+        match census::check(t).unwrap().class {
+            census::Class::Checked(s) => s,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
-    fn malformed_structures_are_refused() {
+    fn malformed_structures_are_reported_and_not_used() {
         let wraps = srat(&[&memory(0, u64::MAX - 1, 2, 1)]);
-        let e = census::check(&wraps).unwrap_err();
+        let s = summary(&wraps);
+        assert_eq!((s.reported(), s.structures()), (1, 0));
+        let e = s.notes().next().unwrap();
         assert_eq!(
             (e.at, e.kind),
             (48 + 16, ErrorKind::Value { field: "Length" })
@@ -402,14 +433,14 @@ pub(crate) mod tests {
         for (kind, min) in [(0u8, 16u8), (1, 40), (2, 24), (5, 32), (6, 32)] {
             let mut short = vec![kind, min - 1];
             short.resize(usize::from(min - 1), 0);
+            let s = summary(&srat(&[&short]));
             assert!(
-                matches!(
-                    census::check(&srat(&[&short])).unwrap_err().kind,
-                    ErrorKind::Structure { .. }
-                ),
+                matches!(s.notes().next().unwrap().kind, ErrorKind::Structure { .. }),
                 "type {kind}"
             );
         }
+        // A walk error still refuses the table.
+        assert!(census::check(&srat(&[&lapic(0, 1), &[9, 0]])).is_err());
         let mut reserved_handle = generic(5, 9, 0, [0; 16]);
         reserved_handle[24] = 1;
         let t = srat(&[&reserved_handle]);
@@ -423,6 +454,44 @@ pub(crate) mod tests {
         assert!(matches!(
             Srat::parse(&table(b"SRAT", 3, &[0; 11])).unwrap_err().kind,
             ErrorKind::TooShort { .. }
+        ));
+    }
+
+    /// The review's F4: a disabled memory affinity structure is accepted whatever its range, and
+    /// the processors and memory after a bad structure are kept (F5).
+    #[test]
+    fn a_disabled_placeholder_is_ignored_and_what_follows_is_kept() {
+        let placeholder = memory(0, 0xFFFF_FFFF_0000_0000, 0x1_0000_0000_0000, 0);
+        let t = srat(&[&placeholder, &lapic(0, 1)]);
+        assert_eq!(summary(&t).reported(), 0);
+        let all: Vec<_> = Srat::parse(&t).unwrap().entries().collect();
+        assert!(matches!(
+            all[0],
+            Ok(Affinity::Memory { enabled: false, .. })
+        ));
+        let mut short_lapic = vec![0u8, 15];
+        short_lapic.resize(15, 0);
+        let bad = srat(&[
+            &memory(0, u64::MAX - 1, 2, 1),
+            &short_lapic,
+            &x2apic(1, 300),
+            &memory(1, 0x1_0000_0000, 0x4000_0000, 1),
+        ]);
+        let s = summary(&bad);
+        assert_eq!((s.reported(), s.structures()), (2, 2));
+        let all: Vec<_> = Srat::parse(&bad).unwrap().entries().collect();
+        assert_eq!(all.len(), 4);
+        assert!(all[0].is_err() && all[1].is_err());
+        assert!(matches!(
+            all[2],
+            Ok(Affinity::X2Apic { x2apic_id: 300, .. })
+        ));
+        assert!(matches!(
+            all[3],
+            Ok(Affinity::Memory {
+                proximity_domain: 1,
+                ..
+            })
         ));
     }
 }

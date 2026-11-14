@@ -66,7 +66,9 @@
 //!   LINT1; a wakeup mailbox not 4 KiB-aligned; a second address override; an I/O APIC at an
 //!   address or interrupt base an earlier one has; I/O APICs past the 256th. Refused: only a
 //!   length that cannot locate the next structure.
-//! - SRAT: a memory range that wraps past the top of the address space.
+//! - SRAT, each **reported**, and the structure not used, as the MADT's: a structure too short for
+//!   its type; an enabled memory range that wraps past the top of the address space. A disabled
+//!   memory affinity is accepted whatever its range (§5.2.16.2; the review's F4).
 //! - ECDT: a register outside system I/O and memory; a namespace path that is empty, not
 //!   NUL-terminated or holds a character no path can.
 //! - SLIT: a distance of 0 to 9 (reserved); a diagonal other than 10.
@@ -74,7 +76,8 @@
 //!   to the maximum that no range covers.
 //! - RAS2 channel: a version other than 0. RASF, RAS2 and MPST channels: the wrong signature.
 //! - MPST: a power state characteristics structure of a format other than 1; a power state index
-//!   that names nothing; a node range that wraps.
+//!   that names nothing in an enabled node; an enabled node's range that wraps. A disabled node's
+//!   contents are ignored (Table 5.110; the review's F4).
 //! - PMTT: revision 1; a top-level aggregator below the top level.
 //! - FPDT: no FBPT pointer; two pointers of one kind. FBPT and S3PT: their required records
 //!   missing or repeated.

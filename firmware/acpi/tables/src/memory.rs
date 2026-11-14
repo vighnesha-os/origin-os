@@ -82,10 +82,12 @@ pub struct Mpst<'a> {
 
 impl<'a> Mpst<'a> {
     /// Checks the table. Refused: a node whose length does not hold its two lists, or that runs
-    /// past the table; a range that wraps past the top of the address space; characteristics that
-    /// do not fit; a characteristics structure of a format other than 1 (§5.2.22.6: the only one
-    /// whose layout is known, so its stride cannot be trusted otherwise); and a power state whose
-    /// index names no characteristics.
+    /// past the table; an enabled node whose range wraps past the top of the address space;
+    /// characteristics that do not fit; a characteristics structure of a format other than 1
+    /// (§5.2.22.6: the only one whose layout is known, so its stride cannot be trusted otherwise);
+    /// and an enabled node's power state whose index names no characteristics. A disabled node's
+    /// contents are ignored, as Table 5.110 tells the OS (the review's F4); its lengths are still
+    /// checked, since they locate the next node.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Error> {
         let table = header::check_signature(bytes, b"MPST")?;
         let b = table.reader();
@@ -118,6 +120,9 @@ impl<'a> Mpst<'a> {
         }
         for node in mpst.nodes() {
             let node = node?;
+            if !node.enabled {
+                continue;
+            }
             for (i, (_, index)) in node.power_states().enumerate() {
                 if u16::from(index) >= characteristics_count {
                     let at = node
@@ -218,7 +223,8 @@ fn node<'a>(b: &Bytes<'a>, at: usize) -> Result<PowerNode<'a>, Error> {
         .map_err(structure)?;
     let base = n.u64(8)?;
     let range = n.u64(16)?;
-    if base.checked_add(range).is_none() {
+    let flag = n.u8(0)?;
+    if flag & 1 != 0 && base.checked_add(range).is_none() {
         return Err(n.error(
             16,
             ErrorKind::Value {
@@ -226,7 +232,6 @@ fn node<'a>(b: &Bytes<'a>, at: usize) -> Result<PowerNode<'a>, Error> {
             },
         ));
     }
-    let flag = n.u8(0)?;
     Ok(PowerNode {
         at,
         enabled: flag & 1 != 0,
@@ -597,6 +602,26 @@ pub(crate) mod tests {
         let mut wraps = node_bytes(1, &[], &[]);
         wraps[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(matches!(kind(mpst(&[wraps], &[])), ErrorKind::Value { .. }));
+        // The review's F4: a disabled node's range and power state indexes are ignored; its
+        // lengths, which locate the next node, are not.
+        let mut placeholder = node_bytes(1, &[(1, 9)], &[]);
+        placeholder[0] = 0;
+        placeholder[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        let t = mpst(
+            &[placeholder.clone(), node_bytes(2, &[(0, 0)], &[])],
+            &[characteristics(0x41)],
+        );
+        let nodes: Vec<_> = Mpst::parse(&t)
+            .unwrap()
+            .nodes()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!((nodes[0].enabled, nodes[1].id), (false, 2));
+        placeholder[4] = 33;
+        assert!(matches!(
+            kind(mpst(&[placeholder], &[characteristics(0x41)])),
+            ErrorKind::Structure { .. }
+        ));
         let mut t = mpst(&[], &[characteristics(0x41)]);
         t.truncate(t.len() - 1);
         crate::testing::seal(&mut t);
