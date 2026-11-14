@@ -459,6 +459,8 @@ pub(crate) fn prove_core_pin(
     bsp: CpuIndex,
     tsc_hz: u64,
 ) -> bool {
+    // Settled first, so that only this proof moves the counts (TASKS item 67).
+    let settled_before = sched::settle(tsc_hz);
     let before = memory::stats();
     let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let ok = {
@@ -482,8 +484,10 @@ pub(crate) fn prove_core_pin(
             == before.map(|(h, f)| (h.bytes_in_use, f))
     };
     ipc::reap_closed();
+    let settled_after = sched::settle(tsc_hz);
     sched::yield_until(same, tsc_hz, 2);
-    let back = same();
+    let back = same() && settled_before.is_ok() && settled_after.is_ok();
+    let unsettled = sched::not_settled(settled_before, settled_after);
     // No process is left to map it: its frames are executable through no mapping, and still
     // writable through none. And after everything above, the hostile runs among it, they hold
     // the image word for word as it was written at boot (the review's finding F1).
@@ -493,7 +497,7 @@ pub(crate) fn prove_core_pin(
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let _ = writeln!(
         com1,
-        "origin-kernel: core: every process it launched and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}); origin.core's own frames stay, mapped by no process: {unmapped}, and still hold the image word for word as it was written at boot: {intact}{}",
+        "origin-kernel: core: every process it launched and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}); origin.core's own frames stay, mapped by no process: {unmapped}, and still hold the image word for word as it was written at boot: {intact}{unsettled}{}",
         if back && unmapped && intact {
             ""
         } else {

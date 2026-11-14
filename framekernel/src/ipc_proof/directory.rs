@@ -799,6 +799,8 @@ pub(crate) fn prove_directory(
     bsp: CpuIndex,
     tsc_hz: u64,
 ) -> bool {
+    // Settled first, so that only this proof moves the counts (TASKS item 67).
+    let settled_before = sched::settle(tsc_hz);
     let before = memory::stats();
     let ok = exchange(com1, cpus, bsp, tsc_hz);
     let same = || {
@@ -806,13 +808,15 @@ pub(crate) fn prove_directory(
             == before.map(|(h, f)| (h.bytes_in_use, f))
     };
     ipc::reap_closed();
+    let settled_after = sched::settle(tsc_hz);
     sched::yield_until(same, tsc_hz, 2);
-    let back = same();
+    let back = same() && settled_before.is_ok() && settled_after.is_ok();
+    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let _ = writeln!(
         com1,
-        "origin-kernel: directory: the directory, the service, the client and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
+        "origin-kernel: directory: the directory, the service, the client and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){unsettled}{}",
         verdict(back)
     );
     ok && back

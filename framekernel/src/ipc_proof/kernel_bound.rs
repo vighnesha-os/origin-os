@@ -114,18 +114,6 @@ fn snapshot() -> Option<Snapshot> {
     })
 }
 
-/// Settles the machine before a clause compares global counts (the independent review of task
-/// S4-3, finding B10): waits until every exited thread has been reaped on its own processor,
-/// then reclaims every retired kernel stack from here, which waits for every processor. After
-/// that no other processor's reap has anything to free while the clause looks. `false` if a
-/// thread was still unreaped after two seconds, or a stack is still retired.
-fn settle(tsc_hz: u64) -> bool {
-    sched::yield_until(|| sched::zombies() == 0, tsc_hz, 2);
-    let reaped = sched::zombies() == 0;
-    origin_frame::stack::reclaim();
-    reaped && origin_frame::stack::counts().retired == 0
-}
-
 fn verdict(ok: bool) -> &'static str {
     if ok { "" } else { ": kernel bound failed" }
 }
@@ -260,7 +248,9 @@ fn refusal(
         return false;
     };
     let short = ROOT.left() == launch - 1;
-    let settled = settle(tsc_hz);
+    // Settled before a clause compares global counts (the independent review of task S4-3,
+    // finding B10; `sched::settle`, TASKS item 67).
+    let settled = sched::settle(tsc_hz).is_ok();
     let before = snapshot();
     let refused = launch::load_program(creator, &FIRST_PROGRAM, &FIRST_PROGRAM_RUN).err()
         == Some(Error::Limit);
@@ -409,7 +399,9 @@ fn threads_counted(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         );
         return false;
     };
-    let settled = settle(tsc_hz);
+    // Settled before a clause compares global counts (the independent review of task S4-3,
+    // finding B10; `sched::settle`, TASKS item 67).
+    let settled = sched::settle(tsc_hz).is_ok();
     let before = snapshot();
     let refused = Process::start_thread(&process, bsp, 0x1000, 0x2000, 0).is_err();
     let nothing = settled && before.is_some() && before == snapshot();
@@ -462,7 +454,9 @@ fn one_thread_at_a_time(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool 
         5,
     );
     let waits = process.waiting.load(core::sync::atomic::Ordering::Acquire) == 1;
-    let settled = settle(tsc_hz);
+    // Settled before a clause compares global counts (the independent review of task S4-3,
+    // finding B10; `sched::settle`, TASKS item 67).
+    let settled = sched::settle(tsc_hz).is_ok();
     let before = snapshot();
     let second = Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err();
     let nothing = settled && before.is_some() && before == snapshot();
@@ -600,7 +594,7 @@ fn ports_bounded_by_their_creators(com1: &mut Console, tsc_hz: u64) -> bool {
         ..holder(0)
     };
     // With the root whole, nothing else pays or is repaid while the two are made.
-    let whole = settle(tsc_hz);
+    let whole = sched::settle(tsc_hz).is_ok();
     let index = process::costs()
         .and_then(|c| crate::quota::port_index(2, c.index_slot, c.index_first))
         .unwrap_or(0);
@@ -654,7 +648,9 @@ fn ports_bounded_by_their_creators(com1: &mut Console, tsc_hz: u64) -> bool {
     let event = |k: usize| handles.get(k).copied().unwrap_or(0);
     let two_armed = bind(at_two, event(0), 1).is_ok() && bind(at_two, event(1), 2).is_ok();
     let armed_two = watch.armed() == 2;
-    let settled = settle(tsc_hz);
+    // Settled before a clause compares global counts (the independent review of task S4-3,
+    // finding B10; `sched::settle`, TASKS item 67).
+    let settled = sched::settle(tsc_hz).is_ok();
     let held = binder.account.objects().bindings.held();
     let before = snapshot();
     let third = bind(at_two, event(2), 3) == Err(Error::Limit);

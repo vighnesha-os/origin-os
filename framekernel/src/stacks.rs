@@ -172,21 +172,14 @@ fn reclaimed(tsc_hz: u64) {
     crate::sched::yield_until(|| stack::counts().retired == 0, tsc_hz, 2);
 }
 
-/// Every exited thread's stack given back, on every processor, then nothing kept for reuse,
-/// retired or being reclaimed: so the counts that follow change only with what the proof does.
-fn settle(tsc_hz: u64) {
-    crate::sched::reap();
-    crate::sched::yield_until(|| crate::sched::zombies() == 0, tsc_hz, 2);
-    stack::trim();
-    reclaimed(tsc_hz);
-}
-
 /// Proves the region; see the module documentation. Returns whether every part held.
 pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
-    // What the region holds when the proof begins.
-    settle(tsc_hz);
+    // What the region holds when the proof begins, settled (`sched::settle`, TASKS item 67): every
+    // exited thread's stack given back, nothing kept for reuse, retired or being reclaimed, so the
+    // counts that follow change only with what the proof does.
+    let settled_before = crate::sched::settle(tsc_hz);
     let before = stack::counts();
-    let mut ok = true;
+    let mut ok = settled_before.is_ok();
 
     // Where the region is, said without its base.
     ok &= placed_at_random(com1);
@@ -255,13 +248,14 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     ok &= cost(com1, tsc_hz);
 
     // Nothing leaks: the reader's stack is reaped on its own processor, then all is reclaimed.
-    settle(tsc_hz);
+    let settled_after = crate::sched::settle(tsc_hz);
     let after = stack::counts();
-    let clean = after == before;
+    let clean = after == before && settled_after.is_ok();
     ok &= clean;
     let _ = write!(
         com1,
-        "origin-kernel: kernel stacks: every stack the proof made is given back: {after:?}, as before: {clean}"
+        "origin-kernel: kernel stacks: every stack the proof made is given back: {after:?}, as before: {clean}{}",
+        crate::sched::not_settled(settled_before, settled_after)
     );
     if !clean {
         let _ = write!(com1, " ({before:?} before): kernel stacks failed");

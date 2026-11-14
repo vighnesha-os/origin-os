@@ -199,6 +199,64 @@ pub(crate) fn reap() -> usize {
     freed
 }
 
+/// What [`settle`] could not settle in its wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Unsettled {
+    /// Exited threads still awaiting [`reap`] on their own processors.
+    pub(crate) zombies: u64,
+    /// Kernel stacks still retired or being reclaimed.
+    pub(crate) retired: usize,
+}
+
+impl core::fmt::Display for Unsettled {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} exited threads unreaped and {} kernel stacks retired",
+            self.zombies, self.retired
+        )
+    }
+}
+
+/// Settles the machine before a proof reads the whole machine's heap or free frames to compare
+/// them (TASKS item 67): every exited thread reaped on its own processor, every stack kept for
+/// reuse retired (`stack::trim`), and every retired stack reclaimed (`stack::reclaim`, one
+/// shootdown each, which waits for every processor). Each of those moves the counts on its own
+/// schedule: on the 65-processor machine the stacks that earlier proofs' threads left were still
+/// being reclaimed, one shootdown at a time, when the IPC proof took its first count, so the
+/// count rose during the proof; and a cache of kept stacks that refills during a proof lowers it.
+/// Settled at both reads, the counts change only with what the proof does. Waits up to 2 s for
+/// each part; `Err` names what was still pending.
+pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
+    reap();
+    yield_until(|| zombies() == 0, tsc_hz, 2);
+    origin_frame::stack::trim();
+    origin_frame::stack::reclaim();
+    yield_until(|| origin_frame::stack::counts().retired == 0, tsc_hz, 2);
+    let pending = Unsettled {
+        zombies: zombies(),
+        retired: origin_frame::stack::counts().retired,
+    };
+    if pending.zombies == 0 && pending.retired == 0 {
+        Ok(())
+    } else {
+        Err(pending)
+    }
+}
+
+/// What a proof's count line adds when a [`settle`] around its counts failed: nothing when both
+/// held, otherwise "not settled", where and what.
+pub(crate) fn not_settled(
+    before: Result<(), Unsettled>,
+    after: Result<(), Unsettled>,
+) -> alloc::string::String {
+    match (before, after) {
+        (Ok(()), Ok(())) => alloc::string::String::new(),
+        (Err(e), _) => alloc::format!("; not settled before its first count: {e}"),
+        (Ok(()), Err(e)) => alloc::format!("; not settled before its compare: {e}"),
+    }
+}
+
 /// [`reap`]'s own processor's exited threads.
 fn reap_zombies() -> usize {
     let Some(threads) = THREADS.get(this_cpu()) else {
@@ -1045,6 +1103,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     for &id in cpus {
         init_cpu_fpu(id);
     }
+    // Settled first, so that only these proofs move the counts (TASKS item 67).
+    let settled_before = settle(tsc_hz);
     let heap_before = crate::memory::stats().map(|(h, _)| h.bytes_in_use);
     // The stacks the processors hold for good: their own and their interrupt stacks.
     let stacks_before = origin_frame::stack::counts().live;
@@ -1276,13 +1336,15 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before
             && stacks() == stacks_before
     };
+    let settled_after = settle(tsc_hz);
     yield_until(back, tsc_hz, 2);
-    let reaped = back();
+    let reaped = back() && settled_before.is_ok() && settled_after.is_ok();
+    let unsettled = not_settled(settled_before, settled_after);
     let now = crate::memory::stats().map_or(0, |(h, _)| h.bytes_in_use);
     proofs.record(Proof::ThreadsReaped, reaped);
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap {} KiB, {} KiB before the first spawn; {} stacks held, {stacks_before} before the first spawn{}",
+        "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap {} KiB, {} KiB before the first spawn; {} stacks held, {stacks_before} before the first spawn{unsettled}{}",
         now >> 10,
         heap_before.unwrap_or(0) >> 10,
         stacks(),
