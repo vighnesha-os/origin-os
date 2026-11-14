@@ -193,13 +193,14 @@ fn xtask_names_itself_only_where_the_list_allows() {
     let hits = program_hits("src/image.rs", listed, &consts, &programs);
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert!(hits[0].what.contains("`boot_matrix`") && hits[0].what.contains("300"));
-    // Each listed place names its authority: item 300 for `boot_matrix`, item 310 for the rest
-    // (the review of 2026-11-14, finding F6; both accepted by the owner).
+    // Each listed place names its authority: item 300 for `boot_matrix`, item 311 for the three
+    // scenario commands TASKS item 58 added, item 310 for the rest (the review of 2026-11-14,
+    // finding F6; all three accepted by the owner).
     for (file, function, why) in SELF_RUNS {
-        let expected = if *function == "boot_matrix" {
-            "decision item 300"
-        } else {
-            "decision item 310"
+        let expected = match *function {
+            "boot_matrix" => "decision item 300",
+            "boot_sparse" | "boot_many" | "boot_listed" => "decision item 311",
+            _ => "decision item 310",
         };
         assert!(why.contains(expected), "{file} {function}: {why}");
         assert!(!why.contains("pending"), "{file} {function}: {why}");
