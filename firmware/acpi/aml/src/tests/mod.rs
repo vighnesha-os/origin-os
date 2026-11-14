@@ -2,6 +2,8 @@
 //! test-only stand-in for `origin-acpi-tables`.
 
 mod encode;
+mod limits;
+mod namespace;
 mod semantics;
 mod tables_standin;
 
