@@ -199,24 +199,7 @@ pub(crate) fn reap() -> usize {
     freed
 }
 
-/// What [`settle`] could not settle in its wait.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Unsettled {
-    /// Exited threads still awaiting [`reap`] on their own processors.
-    pub(crate) zombies: u64,
-    /// Kernel stacks still retired or being reclaimed.
-    pub(crate) retired: usize,
-}
-
-impl core::fmt::Display for Unsettled {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "{} exited threads unreaped and {} kernel stacks retired",
-            self.zombies, self.retired
-        )
-    }
-}
+pub(crate) use crate::settled::{Unsettled, not_settled};
 
 /// Settles the machine before a proof reads the whole machine's heap or free frames to compare
 /// them (TASKS item 67): every exited thread reaped on its own processor, every stack kept for
@@ -226,35 +209,17 @@ impl core::fmt::Display for Unsettled {
 /// being reclaimed, one shootdown at a time, when the IPC proof took its first count, so the
 /// count rose during the proof; and a cache of kept stacks that refills during a proof lowers it.
 /// Settled at both reads, the counts change only with what the proof does. Waits up to 2 s for
-/// each part; `Err` names what was still pending.
+/// each part; `Err` names what was still pending, and any stack lost to a stalled shootdown while
+/// it ran (`settled`: safe by design, 4 frames each).
 pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
+    let lost_before = origin_frame::stack::counts().lost;
     reap();
     yield_until(|| zombies() == 0, tsc_hz, 2);
     origin_frame::stack::trim();
     origin_frame::stack::reclaim();
     yield_until(|| origin_frame::stack::counts().retired == 0, tsc_hz, 2);
-    let pending = Unsettled {
-        zombies: zombies(),
-        retired: origin_frame::stack::counts().retired,
-    };
-    if pending.zombies == 0 && pending.retired == 0 {
-        Ok(())
-    } else {
-        Err(pending)
-    }
-}
-
-/// What a proof's count line adds when a [`settle`] around its counts failed: nothing when both
-/// held, otherwise "not settled", where and what.
-pub(crate) fn not_settled(
-    before: Result<(), Unsettled>,
-    after: Result<(), Unsettled>,
-) -> alloc::string::String {
-    match (before, after) {
-        (Ok(()), Ok(())) => alloc::string::String::new(),
-        (Err(e), _) => alloc::format!("; not settled before its first count: {e}"),
-        (Ok(()), Err(e)) => alloc::format!("; not settled before its compare: {e}"),
-    }
+    let counts = origin_frame::stack::counts();
+    crate::settled::judge(zombies(), counts.retired, lost_before, counts.lost)
 }
 
 /// [`reap`]'s own processor's exited threads.
