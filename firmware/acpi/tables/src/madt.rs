@@ -264,6 +264,24 @@ impl<'a> Madt<'a> {
     pub fn verdicts(
         &self,
     ) -> impl Iterator<Item = Result<(Raw<'a>, Result<Entry<'a>, Error>), Error>> + 'a {
+        self.walk(true)
+    }
+
+    /// Every structure decoded by its own rules alone, without the rules between structures
+    /// ([`Between`]): for a reader that needs every structure of a kind the firmware lists, such
+    /// as the register page of every I/O APIC, whichever of two alike interrupt routing uses (the
+    /// review's Addendum 2, A2-L2). A walk error ends it, as in [`Madt::verdicts`].
+    pub fn alone(
+        &self,
+    ) -> impl Iterator<Item = Result<(Raw<'a>, Result<Entry<'a>, Error>), Error>> + 'a {
+        self.walk(false)
+    }
+
+    /// The walk of [`Madt::verdicts`], with the rules between structures or without them.
+    fn walk(
+        &self,
+        between_too: bool,
+    ) -> impl Iterator<Item = Result<(Raw<'a>, Result<Entry<'a>, Error>), Error>> + 'a {
         let signature = self.table.signature();
         let mut walk = self
             .table
@@ -282,11 +300,12 @@ impl<'a> Madt<'a> {
             };
             Some(match item {
                 Ok(raw) => {
-                    let verdict =
-                        decode(&raw, signature).and_then(|entry| match between.judge(&entry) {
+                    let verdict = decode(&raw, signature).and_then(|entry| {
+                        match between_too.then(|| between.judge(&entry)).flatten() {
                             Some(kind) => Err(Error::new(signature, raw.at, kind)),
                             None => Ok(entry),
-                        });
+                        }
+                    });
                     Ok((raw, verdict))
                 }
                 Err(e) => {
@@ -353,6 +372,24 @@ impl Between {
             _ => None,
         }
     }
+}
+
+/// The redirect an interrupt source override still gives when its only fault is a reserved
+/// polarity or trigger encoding (§5.2.12.5): its ISA source IRQ and its global system interrupt,
+/// with the bus's default polarity and trigger standing for its mode. Such a structure is reported,
+/// as before; a reader that routes interrupts keeps its redirect rather than send the IRQ to its
+/// own number (the review's Addendum 2, A2-L3). `None` for any other structure or fault: another
+/// type, a bus other than ISA's, a structure too short for its fields.
+#[must_use]
+pub fn override_redirect(raw: &Raw<'_>, fault: &Error) -> Option<(u8, u32)> {
+    if raw.kind != 2 || fault.kind != (ErrorKind::Value { field: "Flags" }) {
+        return None;
+    }
+    let b = body(raw, fault.table, 10).ok()?;
+    if b.u8(2).ok()? != 0 {
+        return None;
+    }
+    Some((b.u8(3).ok()?, b.u32(4).ok()?))
 }
 
 /// The most I/O APICs a MADT may list: as many as 8-bit I/O APIC IDs tell apart.
@@ -839,5 +876,33 @@ pub(crate) mod tests {
         assert_eq!(got.len(), 2);
         assert!(got[0].is_ok() && got[1].is_err());
         assert!(census::check(&t).is_err());
+    }
+
+    /// The review's Addendum 2: `alone` gives every I/O APIC by its own rules (A2-L2), and an
+    /// override whose only fault is its reserved mode still names its redirect (A2-L3).
+    #[test]
+    fn alone_and_the_redirect_of_a_reserved_mode() {
+        let t = madt(&[&ioapic(1, 0xFEC0_0000, 0), &ioapic(2, 0xFEC0_1000, 0)]);
+        let m = Madt::parse(&t).unwrap();
+        assert_eq!(m.entries().filter(Result::is_ok).count(), 1);
+        assert_eq!(m.alone().filter(|v| matches!(v, Ok((_, Ok(_))))).count(), 2);
+        let reserved = iso(0, 2, 0b10);
+        let mut pci = iso(0, 2, 0b10);
+        pci[2] = 1;
+        let mut short = iso(0, 2, 0b10);
+        short[1] = 9;
+        short.truncate(9);
+        let t = madt(&[&reserved, &pci, &short, &iso(9, 9, 0x000D)]);
+        let m = Madt::parse(&t).unwrap();
+        let redirects: Vec<_> = m
+            .verdicts()
+            .map(|v| {
+                let (raw, verdict) = v.unwrap();
+                verdict
+                    .err()
+                    .and_then(|fault| override_redirect(&raw, &fault))
+            })
+            .collect();
+        assert_eq!(redirects, [Some((0, 2)), None, None, None]);
     }
 }

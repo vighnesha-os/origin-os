@@ -49,39 +49,17 @@ pub fn copy(addr: u64, out: &mut [u8]) -> Result<(), &'static str> {
     vm::read_firmware(PhysAddr::new(addr), out).map_err(|_| "cannot map an ACPI table")
 }
 
-/// The first valid table with signature `sig` that the XSDT lists, checked (signature,
-/// length, checksum): RSDP → XSDT → table. One bad entry does not hide the entries after it;
-/// the error is why the last table with this signature was refused, if there was one. An
-/// entry that could not be read at all might have been this table, so a search that finds
-/// nothing then says so, and does not claim the table is absent. A null entry names nothing.
+/// The first valid table with signature `sig` that the XSDT lists, checked (signature, length,
+/// checksum): RSDP → XSDT → table ([`acpi::find_table`]). Each entry's header is compared by copy
+/// and only the table asked for is lent, so an XSDT that names the FACS or a performance table,
+/// which [`bytes`] never lends, still lets an absent table read as [`acpi::NOT_LISTED`] (the
+/// review's Addendum 2, A2-L1). An entry that could not be read might have been this table, so a
+/// search that finds nothing then says so. A null entry names nothing.
 pub fn acpi_table(rsdp_addr: u64, sig: &[u8; 4]) -> Result<&'static [u8], &'static str> {
     let rsdp =
         acpi::parse_rsdp(bytes(rsdp_addr, acpi::RSDP_LENGTH)?).map_err(|_| "invalid RSDP")?;
-    let table = |addr: u64, sig: &[u8; 4]| -> Result<&'static [u8], &'static str> {
-        let header = bytes(addr, acpi::HEADER_LENGTH)?;
-        let len = acpi::table_length(header).map_err(|_| "invalid table length")?;
-        let all = bytes(addr, len as usize)?;
-        acpi::check_table(all, sig).map_err(|_| "invalid table")?;
-        Ok(all)
-    };
-    let xsdt = table(rsdp.xsdt, b"XSDT")?;
-    let (mut refused, mut unreadable) = (None, false);
-    for addr in acpi::xsdt_entries(xsdt).filter(|&addr| addr != 0) {
-        // An entry the kernel cannot read says nothing about the entries after it.
-        let Ok(header) = bytes(addr, acpi::HEADER_LENGTH) else {
-            unreadable = true;
-            continue;
-        };
-        if acpi::signature(header) == Some(*sig) {
-            match table(addr, sig) {
-                Ok(all) => return Ok(all),
-                Err(why) => refused = Some(why),
-            }
-        }
-    }
-    Err(refused.unwrap_or(if unreadable {
-        "an XSDT entry could not be read"
-    } else {
-        "table not listed in the XSDT"
-    }))
+    let mut copy_header = |addr: u64, out: &mut [u8]| copy(addr, out);
+    let mut lend = |addr: u64, len: usize| bytes(addr, len);
+    let xsdt = acpi::lend_table(rsdp.xsdt, b"XSDT", &mut copy_header, &mut lend)?;
+    acpi::find_table(xsdt, sig, &mut copy_header, &mut lend)
 }

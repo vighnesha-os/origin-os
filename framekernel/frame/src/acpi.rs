@@ -19,7 +19,7 @@
 #![forbid(unsafe_code)]
 
 use origin_acpi_tables::ErrorKind;
-use origin_acpi_tables::madt::{Entry, Madt, Polarity, Trigger};
+use origin_acpi_tables::madt::{Entry, Madt, Polarity, Trigger, override_redirect};
 use origin_acpi_tables::srat::{Affinity, Srat};
 
 /// Bytes of an ACPI 2.0+ RSDP that are checksummed and parsed.
@@ -187,6 +187,77 @@ pub fn xsdt_entries(xsdt: &[u8]) -> impl Iterator<Item = u64> + '_ {
         .0
         .iter()
         .map(|c| u64::from_le_bytes(*c))
+}
+
+/// What [`find_table`] gives when the XSDT lists no table with the signature asked for.
+pub const NOT_LISTED: &str = "table not listed in the XSDT";
+/// What [`find_table`] gives when nothing with the signature asked for was found but an entry
+/// could not be read, which might have been it.
+pub const ENTRY_UNREADABLE: &str = "an XSDT entry could not be read";
+
+/// Reads the table at `addr`, which must have signature `sig`: its header by copy (`copy`), then
+/// the whole table lent (`lend`) and checked ([`check_table`]).
+pub fn lend_table<'t>(
+    addr: u64,
+    sig: &[u8; 4],
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+    lend: &mut impl FnMut(u64, usize) -> Result<&'t [u8], &'static str>,
+) -> Result<&'t [u8], &'static str> {
+    let mut header = [0u8; HEADER_LENGTH];
+    copy(addr, &mut header)?;
+    whole_table(addr, sig, &header, lend)
+}
+
+/// The whole table at `addr` whose header is `header`, lent and checked.
+fn whole_table<'t>(
+    addr: u64,
+    sig: &[u8; 4],
+    header: &[u8],
+    lend: &mut impl FnMut(u64, usize) -> Result<&'t [u8], &'static str>,
+) -> Result<&'t [u8], &'static str> {
+    let len = table_length(header).map_err(|_| "invalid table length")?;
+    let all = lend(addr, len as usize)?;
+    check_table(all, sig).map_err(|_| "invalid table")?;
+    Ok(all)
+}
+
+/// The first valid table with signature `sig` that a checked XSDT lists: each entry's header
+/// compared by copy (`copy`), and only a table whose signature is `sig` lent (`lend`) and checked.
+/// One bad entry does not hide the entries after it; the error is why the last table with this
+/// signature was refused, if there was one. An entry whose header could not be copied might have
+/// been this table, so a search that finds nothing then says so ([`ENTRY_UNREADABLE`]) rather
+/// than [`NOT_LISTED`]. A null entry names nothing.
+///
+/// No header is lent to be compared (the review's Addendum 2, A2-L1): so an entry naming a
+/// structure the firmware changes after boot (the FACS, an FBPT, an S3PT, an MBPT), which may
+/// never be lent, is compared like any other and is simply not the table asked for, and an absent
+/// table stays [`NOT_LISTED`] on such a machine.
+pub fn find_table<'t>(
+    xsdt: &[u8],
+    sig: &[u8; 4],
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+    lend: &mut impl FnMut(u64, usize) -> Result<&'t [u8], &'static str>,
+) -> Result<&'t [u8], &'static str> {
+    let (mut refused, mut unreadable) = (None, false);
+    for addr in xsdt_entries(xsdt).filter(|&addr| addr != 0) {
+        let mut header = [0u8; HEADER_LENGTH];
+        // An entry the kernel cannot read says nothing about the entries after it.
+        if copy(addr, &mut header).is_err() {
+            unreadable = true;
+            continue;
+        }
+        if signature(&header) == Some(*sig) {
+            match whole_table(addr, sig, &header, lend) {
+                Ok(all) => return Ok(all),
+                Err(why) => refused = Some(why),
+            }
+        }
+    }
+    Err(refused.unwrap_or(if unreadable {
+        ENTRY_UNREADABLE
+    } else {
+        NOT_LISTED
+    }))
 }
 
 /// What the kernel reads from the FADT (signature `"FACP"`).
@@ -383,20 +454,64 @@ pub fn madt_ioapics(madt: &[u8], out: &mut [IoApic]) -> Result<usize, AcpiError>
     })
 }
 
+/// Lists every I/O APIC structure the MADT gives that its own rules allow, repeats included: for
+/// the platform register pages no PCIe BAR may cover (`pcie::platform_ranges`), which are there
+/// whichever of two alike [`madt_ioapics`] keeps for routing (the review's Addendum 2, A2-L2).
+/// Returns how many.
+pub fn madt_ioapic_pages(madt: &[u8], out: &mut [IoApic]) -> Result<usize, AcpiError> {
+    let table = Madt::parse(madt).map_err(|e| refused(madt, e, AcpiError::MadtEntry))?;
+    let mut count = 0;
+    for item in table.alone() {
+        let (_, verdict) = item.map_err(|e| refused(madt, e, AcpiError::MadtEntry))?;
+        if let Ok(Entry::IoApic {
+            id,
+            address,
+            gsi_base,
+        }) = verdict
+        {
+            *out.get_mut(count).ok_or(AcpiError::TooManyProcessors)? = IoApic {
+                id,
+                address,
+                gsi_base,
+            };
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// Lists the interrupt source overrides into `out`; returns how many. Only an override of an ISA
-/// interrupt (bus 0) with a polarity and trigger mode ACPI 6.6 defines is listed: §5.2.12.5 gives
-/// overrides for ISA alone, and the reserved encoding (binary 10) names no mode. **Since step 5 of
-/// TASKS item 62 an override for another bus is not listed**, so [`gsi_for_irq`] no longer maps an
-/// ISA IRQ through it; before, any override with a matching source was taken, whatever its bus.
+/// interrupt (bus 0) is listed: §5.2.12.5 gives overrides for ISA alone. **Since step 5 of TASKS
+/// item 62 an override for another bus is not listed**, so [`gsi_for_irq`] no longer maps an ISA
+/// IRQ through it; before, any override with a matching source was taken, whatever its bus. An
+/// override whose only fault is the reserved polarity or trigger encoding (binary 10) keeps its
+/// redirect, as the kernel took it before, with flags 0, the bus's defaults, standing for its mode
+/// (the review's Addendum 2, A2-L3): dropping it would send the IRQ to its own number (IRQ 0 to
+/// interrupt 0, not 2), where only its mode is in doubt. The census reports that fault.
 pub fn madt_overrides(madt: &[u8], out: &mut [SourceOverride]) -> Result<usize, AcpiError> {
-    madt_list(madt, out, |entry| match entry {
-        Entry::SourceOverride { source, gsi, flags } => Some(SourceOverride {
-            source_irq: source,
-            gsi,
-            flags: inti_bits(flags),
-        }),
-        _ => None,
-    })
+    let table = Madt::parse(madt).map_err(|e| refused(madt, e, AcpiError::MadtEntry))?;
+    let mut count = 0;
+    for item in table.verdicts() {
+        let (raw, verdict) = item.map_err(|e| refused(madt, e, AcpiError::MadtEntry))?;
+        let listed = match verdict {
+            Ok(Entry::SourceOverride { source, gsi, flags }) => Some(SourceOverride {
+                source_irq: source,
+                gsi,
+                flags: inti_bits(flags),
+            }),
+            Ok(_) => None,
+            Err(fault) => override_redirect(&raw, &fault).map(|(source, gsi)| SourceOverride {
+                source_irq: source,
+                gsi,
+                flags: 0,
+            }),
+        };
+        if let Some(o) = listed {
+            *out.get_mut(count).ok_or(AcpiError::TooManyProcessors)? = o;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// The MPS INTI flags' bits for a decoded mode (§5.2.12.5): polarity in bits 0 and 1, trigger
@@ -1002,28 +1117,112 @@ mod tests {
     }
 
     /// The behaviour change of step 5 (the coordinating session's ruling): an interrupt source
-    /// override for a bus other than ISA's, or with the reserved polarity or trigger encoding, is
-    /// not listed, so `gsi_for_irq` no longer maps an ISA IRQ through it. Before step 5 an override
-    /// for bus 1, source 9, sent IRQ 9 to its GSI.
+    /// override for a bus other than ISA's is not listed, so `gsi_for_irq` no longer maps an ISA IRQ
+    /// through it. Before step 5 an override for bus 1, source 9, sent IRQ 9 to its GSI. One whose
+    /// only fault is the reserved polarity or trigger encoding keeps its redirect, its mode the
+    /// bus's defaults (the review's Addendum 2, A2-L3): IRQ 0 still reaches interrupt 2.
     #[test]
-    fn an_override_for_another_bus_or_a_reserved_mode_is_not_taken() {
+    fn an_override_for_another_bus_is_not_taken_and_a_reserved_mode_keeps_its_redirect() {
         let mut pci = iso(9, 20, 0x000D);
         pci[2] = 1;
-        let reserved = iso(1, 21, 0b10); // polarity 10
-        let m = madt(&[&lapic(0, 0, 1), &iso(0, 2, 0), &pci, &reserved]);
+        let reserved_polarity = iso(0, 2, 0b10);
+        let reserved_trigger = iso(1, 21, 0b1000);
+        let m = madt(&[&lapic(0, 0, 1), &pci, &reserved_polarity, &reserved_trigger]);
         let mut over = [SourceOverride::default(); 4];
-        assert_eq!(madt_overrides(&m, &mut over), Ok(1));
-        assert_eq!(gsi_for_irq(0, &over[..1]), (2, 0));
+        assert_eq!(madt_overrides(&m, &mut over), Ok(2));
         assert_eq!(
-            gsi_for_irq(9, &over[..1]),
+            gsi_for_irq(0, &over[..2]),
+            (2, 0),
+            "IRQ 0 keeps its redirect"
+        );
+        assert_eq!(gsi_for_irq(1, &over[..2]), (21, 0));
+        assert_eq!(
+            gsi_for_irq(9, &over[..2]),
             (9, 0),
             "bus 1's override is not ISA's"
         );
-        assert_eq!(gsi_for_irq(1, &over[..1]), (1, 0));
         // The flags kept are the defined bits, as the MPS INTI encoding gives them.
         let m = madt(&[&iso(9, 9, 0xFF0D)]);
         assert_eq!(madt_overrides(&m, &mut over), Ok(1));
         assert_eq!(over[0].flags, 0x000D);
+    }
+
+    /// The review's Addendum 2, A2-L2: PCIe's platform ranges keep the register page of every I/O
+    /// APIC the MADT lists, repeats included, while routing takes the first of two alike.
+    #[test]
+    fn every_listed_ioapic_page_stays_reserved() {
+        let m = madt(&[
+            &ioapic(1, 0xFEC0_0000, 0),
+            &ioapic(2, 0xFEC0_1000, 0),  // an earlier one's interrupt base
+            &ioapic(3, 0xFEC0_0000, 48), // an earlier one's address
+            &[1u8, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0][..], // too short to name a page
+        ]);
+        let mut ios = [IoApic::default(); 8];
+        assert_eq!(madt_ioapics(&m, &mut ios), Ok(1));
+        assert_eq!(madt_ioapic_pages(&m, &mut ios), Ok(3));
+        assert_eq!(
+            ios[..3].iter().map(|io| io.address).collect::<Vec<_>>(),
+            [0xFEC0_0000, 0xFEC0_1000, 0xFEC0_0000]
+        );
+    }
+
+    /// The review's Addendum 2, A2-L1: `find_table` compares each XSDT entry's header by copy and
+    /// lends only the table asked for, so an XSDT that names the FACS (which `firmware::bytes` never
+    /// lends) still lets an absent IVRS read as not listed, which is what keeps PCIe's reserved
+    /// ranges (`iommu::acpi_table_if_listed` gives `None` for it, and `register_ranges` goes on).
+    #[test]
+    fn an_xsdt_naming_the_facs_still_finds_and_misses_tables_as_before() {
+        let mut facs = vec![0u8; 64];
+        facs[..4].copy_from_slice(b"FACS");
+        facs[4..8].copy_from_slice(&64u32.to_le_bytes());
+        let dmar = table(b"DMAR", &[0u8; 12]);
+        let memory: Vec<(u64, Vec<u8>)> = vec![(0x1000, facs), (0x2000, dmar.clone())];
+        let mut entries = Vec::new();
+        for addr in [0x1000u64, 0x2000] {
+            entries.extend_from_slice(&addr.to_le_bytes());
+        }
+        let xsdt = table(b"XSDT", &entries);
+        let memory: &'static [(u64, Vec<u8>)] = Vec::leak(memory);
+        let find = |sig: &[u8; 4], with: &[u8]| {
+            let mut lent = Vec::new();
+            let mut copy = |addr: u64, out: &mut [u8]| {
+                let (_, bytes) = memory
+                    .iter()
+                    .find(|(a, _)| *a == addr)
+                    .ok_or("not mapped")?;
+                out.copy_from_slice(bytes.get(..out.len()).ok_or("short")?);
+                Ok(())
+            };
+            let mut lend = |addr: u64, len: usize| -> Result<&'static [u8], &'static str> {
+                lent.push(addr);
+                let (_, bytes) = memory
+                    .iter()
+                    .find(|(a, _)| *a == addr)
+                    .ok_or("not mapped")?;
+                let bytes = bytes.get(..len).ok_or("short")?;
+                // As `firmware::bytes`: never the structures the firmware changes after boot.
+                if origin_acpi_tables::CHANGES_AFTER_BOOT
+                    .iter()
+                    .any(|c| bytes.get(..4) == Some(&c[..]))
+                {
+                    return Err("the firmware changes it after boot");
+                }
+                Ok(bytes)
+            };
+            let found = find_table(with, sig, &mut copy, &mut lend);
+            (found, lent)
+        };
+        let (found, lent) = find(b"IVRS", &xsdt);
+        assert_eq!(found, Err(NOT_LISTED));
+        assert!(lent.is_empty(), "{lent:x?}");
+        let (found, lent) = find(b"DMAR", &xsdt);
+        assert_eq!(found, Ok(&dmar[..]));
+        assert_eq!(lent, [0x2000]);
+        // An entry that cannot be read still makes an absent table "could not be read".
+        let mut entries = 0x9000u64.to_le_bytes().to_vec();
+        entries.extend_from_slice(&0x2000u64.to_le_bytes());
+        let (found, _) = find(b"IVRS", &table(b"XSDT", &entries));
+        assert_eq!(found, Err(ENTRY_UNREADABLE));
     }
 
     /// A second I/O APIC at an address or interrupt base an earlier one has is not listed (the
@@ -1369,7 +1568,8 @@ mod tests {
     /// mutated bytes, and an undersized output buffer is an error, never a panic. Since step 5 of
     /// TASKS item 62 the walk applies `origin-acpi-tables`' rules on its own: a structure too short
     /// for its type is not listed; an I/O APIC at an address or base an earlier one has is not; an
-    /// override is listed only for bus 0 with a defined polarity and trigger mode.
+    /// override is listed only for bus 0, with flags 0 when its mode is the reserved encoding
+    /// (A2-L3).
     #[test]
     fn mutated_madts_match_an_independent_walk() {
         use crate::testing::{Rng, mutate};
@@ -1450,17 +1650,17 @@ mod tests {
             let found = madt_overrides(&m, &mut overrides);
             if let Ok(n) = found {
                 let flags_at = |at: usize| u16::from_le_bytes([m[at + 8], m[at + 9]]);
+                // Listed: every bus-0 override; one with a reserved mode with flags 0 (A2-L3).
                 let expected: Vec<usize> = of_kind(2, 10)
                     .into_iter()
-                    .filter(|&at| {
-                        let f = flags_at(at);
-                        m[at + 2] == 0 && f & 0b11 != 0b10 && (f >> 2) & 0b11 != 0b10
-                    })
+                    .filter(|&at| m[at + 2] == 0)
                     .collect();
                 assert_eq!(n, expected.len(), "case {case}");
                 for (o, &at) in overrides[..n].iter().zip(&expected) {
                     assert_eq!((o.source_irq, o.gsi), (m[at + 3], le32(&m[at + 4..])));
-                    assert_eq!(o.flags, flags_at(at) & 0xF, "case {case}");
+                    let f = flags_at(at);
+                    let defined = f & 0b11 != 0b10 && (f >> 2) & 0b11 != 0b10;
+                    assert_eq!(o.flags, if defined { f & 0xF } else { 0 }, "case {case}");
                 }
                 // The lookup answers from the list, or with the identity mapping.
                 for irq in [0u8, 1, 9, 255] {

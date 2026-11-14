@@ -436,7 +436,7 @@ pub fn access_words(a: Access) -> &'static str {
 
 /// What `firmware::acpi_table` says when the XSDT does not list a table: the one failure that
 /// means the table is really absent, not unreadable.
-const NOT_LISTED: &str = "table not listed in the XSDT";
+const NOT_LISTED: &str = crate::acpi::NOT_LISTED;
 
 /// The table with signature `sig`, or `None` if the firmware does not list one: unlike
 /// `firmware::acpi_table`, this tells an absent table from one that cannot be read.
