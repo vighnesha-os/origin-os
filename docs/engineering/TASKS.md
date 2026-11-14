@@ -1435,6 +1435,8 @@ Then `a5c1741`, which cites item 310 as accepted (no rule changes). Gates after 
 
 Nothing that boots changes, so `boot-test` and `boot-matrix` were not run again, as ruled. The quick gates and `cargo xtask check` run on the commit after `9c78319`, which fills in that hash and changes records only; their results are in the hand-over to the coordinating session.
 
+**Landing in the fifth batch (2026-11-14), and decision item 311.** Merged into `land/batch-5` at `4fef1a2`, then TASKS item 58 at `d285703`. The two merged without a textual conflict, but `cargo xtask check` failed on the result: TASKS 58's three new scenario commands of `boot-matrix` (`boot_sparse`, `boot_many`, `boot_listed`) re-run `xtask` through `current_exe`, which this task's `host-tools-gate` refuses outside `SELF_RUNS`, and decision item 310 names its six commands one by one. Six of the gate's tests failed on the real tree. The coordinating session put it to the owner as decision item 311 (ADR-0011 Amendment 4, T1's third note), and the owner accepted it the same day ("Accept 311"): item 310's allowance also covers those three, until TASKS item 61. `bc119cc` (the batch's keeper) lists them in `SELF_RUNS` under an authority of their own, `ITEM_311_MACHINE`, names item 311 and the nine commands in the module's documentation, and makes the test that each listed place names its authority expect item 311 for those three. `host_tools`'s 19 tests pass, and the gate allows 11 places.
+
 
 ### 58. Any processor count: per-processor state sized at discovery, and no `MAX_CPUS`
 
