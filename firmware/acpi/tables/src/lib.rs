@@ -50,16 +50,22 @@
 //! field comes back typed (a `Reserved(n)` arm) and is refused only where acting on it would be
 //! wrong. A structure type a table reserves is walked by its length and returned. A table or
 //! structure longer than the layout known here is accepted and its tail ignored (§5.2.2); one
-//! shorter than its revision's fields is refused. Every refusal of a value, table by table:
+//! shorter than its revision's fields is refused. Every rule on a value, table by table: it
+//! refuses the table unless marked **reported**, when it marks only that structure or field
+//! unusable, and the census counts it ([`census::Summary::reported`]):
 //!
 //! - Generic address structures the OS accesses: a reserved address space; a reserved access
-//!   size.
-//! - FADT: no DSDT; no FACS on a platform that is not hardware-reduced; a FACS not 64-byte
-//!   aligned; a reset register (when its flag says it is used) or sleep register that is not 8
-//!   bits at bit 0 in system I/O, system memory or bus 0's configuration space; on a platform with
-//!   fixed hardware, no PM1a event or control block, `PM1_EVT_LEN` below 4, `PM1_CNT_LEN` below
-//!   2, a PM2 block of length 0, a PM timer not 4 bytes long, an odd GPE block length, a GPE block
-//!   outside system I/O and memory, a month alarm without a day alarm.
+//!   size in system memory, system I/O or PCI configuration space (elsewhere the space defines
+//!   the field: the review's F11).
+//! - FADT, refused: no DSDT. Each of the rest **reported**, and that field not used, while the
+//!   rest of the table is (the review's F3; `fadt::Field`): no FACS on a platform that is not
+//!   hardware-reduced; a FACS not 64-byte aligned; a reset register (when its flag says it is
+//!   used) or sleep register that is not 8 bits at bit 0 in system I/O, system memory or bus 0's
+//!   configuration space; on a platform with fixed hardware, no PM1a event or control block,
+//!   `PM1_EVT_LEN` below 4, `PM1_CNT_LEN` below 2, a PM2 block of length 0, a PM timer not 4
+//!   bytes long, an odd GPE block length, a GPE block outside system I/O and memory (its width,
+//!   offset and access size are not judged: §5.2.9 tells the OS to ignore them), a month alarm
+//!   without a day alarm.
 //! - MADT, each **reported**, and the structure not used, while the walk goes on (the review's
 //!   F5): a structure too short for its type; an interrupt override for a bus other than ISA; the
 //!   reserved polarity or trigger encoding (binary 10); a local APIC input other than LINT0 and

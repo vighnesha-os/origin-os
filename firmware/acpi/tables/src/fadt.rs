@@ -10,6 +10,13 @@
 //!
 //! With `HW_REDUCED_ACPI` set, ACPI 6.6 tells the OS to ignore the fields at offsets 46 to 108 and
 //! 148 to 232 and nine of the flags; none of them is checked then.
+//!
+//! **Verdicts are per register** (the review's F3, and the coordinating session's ruling). The
+//! table is refused only for its header, a length below ACPI 1.0's, and a missing DSDT. Every
+//! other rule judges one [`Field`]: a field that breaks one is named by [`Fadt::faults`], and its
+//! accessor ([`Fadt::facs_address`], [`Fadt::reset`], [`Fadt::sleep_control`],
+//! [`Fadt::sleep_status`], [`Fadt::block`], [`Fadt::month_alarm`]) returns `None`, while the rest
+//! of the table stays usable. The public fields hold the values as read, judged or not.
 
 use crate::error::{Error, ErrorKind};
 use crate::gas::{AccessSize, AddressSpace, Gas};
@@ -303,6 +310,46 @@ impl Block {
     }
 }
 
+/// A field the FADT judges on its own (the review's F3): when it breaks a rule, it is named among
+/// [`Fadt::faults`] and not used, and the rest of the table is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Field {
+    /// `FIRMWARE_CTRL` and `X_FIRMWARE_CTRL`: a FACS is given unless the platform is
+    /// hardware-reduced, and is 64-byte aligned.
+    Facs,
+    /// `RESET_REG`, when the flags say it is supported: 8 bits at bit 0 in system I/O, system
+    /// memory or bus 0's configuration space.
+    Reset,
+    /// `SLEEP_CONTROL_REG`, when given: as the reset register.
+    SleepControl,
+    /// `SLEEP_STATUS_REG`, when given: as the reset register.
+    SleepStatus,
+    /// A fixed hardware block: its `X_` register and its length (ignored on a hardware-reduced
+    /// platform).
+    Block(Block),
+    /// `MON_ALRM`: a month alarm needs a day alarm (ignored on a hardware-reduced platform).
+    MonthAlarm,
+}
+
+impl Field {
+    /// Every field, in the order [`Fadt::faults`] names them.
+    pub const ALL: [Self; 13] = [
+        Self::Facs,
+        Self::Reset,
+        Self::SleepControl,
+        Self::SleepStatus,
+        Self::Block(Block::Pm1aEvent),
+        Self::Block(Block::Pm1bEvent),
+        Self::Block(Block::Pm1aControl),
+        Self::Block(Block::Pm1bControl),
+        Self::Block(Block::Pm2Control),
+        Self::Block(Block::PmTimer),
+        Self::Block(Block::Gpe0),
+        Self::Block(Block::Gpe1),
+        Self::MonthAlarm,
+    ];
+}
+
 /// A fixed hardware register block: where it is and how many bytes it decodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Register {
@@ -421,7 +468,9 @@ impl<'a> Fadt<'a> {
             sleep_status_reg: Gas::read(&b, 256).ok(),
             hypervisor_vendor: b.array(268).ok(),
         };
-        fadt.check(&b)?;
+        // The DSDT is always required: the one rule of the table's contents that refuses it.
+        fadt.dsdt_address()
+            .ok_or_else(|| b.error(40, ErrorKind::Value { field: "DSDT" }))?;
         Ok(fadt)
     }
 
@@ -431,10 +480,11 @@ impl<'a> Fadt<'a> {
         &self.table
     }
 
-    /// The FACS's address: `X_FIRMWARE_CTRL` if it is not zero, else `FIRMWARE_CTRL`, else none.
+    /// The FACS's address: `X_FIRMWARE_CTRL` if it is not zero, else `FIRMWARE_CTRL`, else none;
+    /// none too if it is not 64-byte aligned ([`Field::Facs`]).
     #[must_use]
     pub fn facs_address(&self) -> Option<u64> {
-        prefer(self.x_firmware_ctrl, self.firmware_ctrl)
+        prefer(self.x_firmware_ctrl, self.firmware_ctrl).filter(|_| self.usable(Field::Facs))
     }
 
     /// The DSDT's address: `X_DSDT` if it is not zero, else `DSDT`, else none.
@@ -450,10 +500,18 @@ impl<'a> Fadt<'a> {
         Gas::read(&self.table.reader(), x).ok()
     }
 
-    /// Where `block` is and how long, or `None` if the platform has none: its `X_` form if that
-    /// address is not zero, else its 32-bit field as a system I/O port if that is not zero.
+    /// Where `block` is and how long, or `None` if the platform has none or the block breaks a rule
+    /// ([`Field::Block`]): its `X_` form if that address is not zero, else its 32-bit field as a
+    /// system I/O port if that is not zero. For the two GPE blocks the `X_` form's width, offset
+    /// and access size are as read, and §5.2.9 tells the OS to ignore them.
     #[must_use]
     pub fn block(&self, block: Block) -> Option<Register> {
+        self.locate(block)
+            .filter(|_| self.usable(Field::Block(block)))
+    }
+
+    /// Where `block` is and how long, judged or not.
+    fn locate(&self, block: Block) -> Option<Register> {
         let b = self.table.reader();
         let (legacy, _, _) = block.fields();
         let length = b.u8(block.length_at()).ok()?;
@@ -473,97 +531,132 @@ impl<'a> Fadt<'a> {
         })
     }
 
-    /// The reset register and the value to write, if the flags say it can be used.
+    /// The reset register and the value to write, if the flags say it can be used and it keeps
+    /// its rules ([`Field::Reset`]).
     #[must_use]
     pub fn reset(&self) -> Option<(Gas, u8)> {
-        if !self.flags.reset_reg_sup() {
+        if !self.flags.reset_reg_sup() || !self.usable(Field::Reset) {
             return None;
         }
         Some((self.reset_reg?, self.reset_value?))
     }
 
-    fn check(&self, b: &Bytes<'_>) -> Result<(), Error> {
-        let value = |at: usize, field: &'static str| b.error(at, ErrorKind::Value { field });
-        // The DSDT is always required.
-        self.dsdt_address().ok_or_else(|| value(40, "DSDT"))?;
-        // The FACS is optional if and only if the platform is hardware-reduced.
-        let reduced = self.flags.hw_reduced_acpi();
-        match self.facs_address() {
-            None if !reduced => return Err(value(36, "FIRMWARE_CTRL")),
-            Some(address) if address & 63 != 0 => {
-                let at = if self.x_firmware_ctrl.is_some_and(|x| x != 0) {
-                    132
-                } else {
-                    36
-                };
-                return Err(value(at, "FIRMWARE_CTRL: the FACS is 64-byte aligned"));
-            }
-            _ => {}
-        }
-        // A table that ends before the reset register is ACPI 1.0's, where the flag's bit was
-        // reserved, and is ignored (§5.2.1.1).
-        if let (true, Some(reset)) = (self.flags.reset_reg_sup(), self.reset_reg) {
-            check_byte_register(b, 116, &reset, "RESET_REG")?;
-        }
-        for (at, reg, name) in [
-            (244, self.sleep_control_reg, "SLEEP_CONTROL_REG"),
-            (256, self.sleep_status_reg, "SLEEP_STATUS_REG"),
-        ] {
-            if let Some(reg) = reg.filter(|r| !r.is_null()) {
-                check_byte_register(b, at, &reg, name)?;
-            }
-        }
-        if reduced {
-            return Ok(());
-        }
-        self.check_fixed_hardware(b)
+    /// The sleep control register, if given and it keeps its rules ([`Field::SleepControl`]).
+    #[must_use]
+    pub fn sleep_control(&self) -> Option<Gas> {
+        self.sleep_control_reg
+            .filter(|r| !r.is_null() && self.usable(Field::SleepControl))
     }
 
-    /// The rules on the fixed hardware fields, which a hardware-reduced platform's OS ignores.
-    fn check_fixed_hardware(&self, b: &Bytes<'_>) -> Result<(), Error> {
+    /// The sleep status register, if given and it keeps its rules ([`Field::SleepStatus`]).
+    #[must_use]
+    pub fn sleep_status(&self) -> Option<Gas> {
+        self.sleep_status_reg
+            .filter(|r| !r.is_null() && self.usable(Field::SleepStatus))
+    }
+
+    /// The RTC CMOS index of the month alarm, if there is one with a day alarm beside it
+    /// ([`Field::MonthAlarm`]) and the platform is not hardware-reduced.
+    #[must_use]
+    pub fn month_alarm(&self) -> Option<u8> {
+        (self.mon_alrm != 0 && !self.flags.hw_reduced_acpi() && self.usable(Field::MonthAlarm))
+            .then_some(self.mon_alrm)
+    }
+
+    /// Whether `field` keeps its rules.
+    #[must_use]
+    pub fn usable(&self, field: Field) -> bool {
+        self.verdict(field).is_ok()
+    }
+
+    /// Every field that breaks a rule, in [`Field::ALL`]'s order: each named by its offset and the
+    /// rule. None of them refuses the table.
+    pub fn faults(&self) -> impl Iterator<Item = Error> + '_ {
+        Field::ALL.into_iter().filter_map(|f| self.verdict(f).err())
+    }
+
+    /// Judges one field.
+    fn verdict(&self, field: Field) -> Result<(), Error> {
+        let b = self.table.reader();
         let value = |at: usize, field: &'static str| b.error(at, ErrorKind::Value { field });
-        for block in Block::ALL {
-            let (legacy, x, name) = block.fields();
-            if let Some(gas) = self.x_block(block).filter(|g| !g.is_null()) {
-                gas.check_register(b, x, name)?;
-                if matches!(block, Block::Gpe0 | Block::Gpe1)
-                    && !matches!(
+        let reduced = self.flags.hw_reduced_acpi();
+        match field {
+            // The FACS is optional if and only if the platform is hardware-reduced.
+            Field::Facs => match prefer(self.x_firmware_ctrl, self.firmware_ctrl) {
+                None if !reduced => Err(value(36, "FIRMWARE_CTRL")),
+                Some(address) if address & 63 != 0 => {
+                    let at = if self.x_firmware_ctrl.is_some_and(|x| x != 0) {
+                        132
+                    } else {
+                        36
+                    };
+                    Err(value(at, "FIRMWARE_CTRL: the FACS is 64-byte aligned"))
+                }
+                _ => Ok(()),
+            },
+            // A table that ends before the reset register is ACPI 1.0's, where the flag's bit was
+            // reserved, and is ignored (§5.2.1.1).
+            Field::Reset => match (self.flags.reset_reg_sup(), self.reset_reg) {
+                (true, Some(reset)) => check_byte_register(&b, 116, &reset, "RESET_REG"),
+                _ => Ok(()),
+            },
+            Field::SleepControl => match self.sleep_control_reg.filter(|r| !r.is_null()) {
+                Some(reg) => check_byte_register(&b, 244, &reg, "SLEEP_CONTROL_REG"),
+                None => Ok(()),
+            },
+            Field::SleepStatus => match self.sleep_status_reg.filter(|r| !r.is_null()) {
+                Some(reg) => check_byte_register(&b, 256, &reg, "SLEEP_STATUS_REG"),
+                None => Ok(()),
+            },
+            // The fixed hardware fields, which a hardware-reduced platform's OS ignores.
+            Field::Block(_) | Field::MonthAlarm if reduced => Ok(()),
+            Field::Block(block) => self.block_verdict(&b, block),
+            Field::MonthAlarm if self.mon_alrm != 0 && self.day_alrm == 0 => {
+                Err(b.error(106, ErrorKind::Inconsistent { field: "DAY_ALRM" }))
+            }
+            Field::MonthAlarm => Ok(()),
+        }
+    }
+
+    /// The rules on one fixed hardware block, on a platform that is not hardware-reduced.
+    fn block_verdict(&self, b: &Bytes<'_>, block: Block) -> Result<(), Error> {
+        let value = |at: usize, field: &'static str| b.error(at, ErrorKind::Value { field });
+        let (legacy, x, name) = block.fields();
+        if let Some(gas) = self.x_block(block).filter(|g| !g.is_null()) {
+            match block {
+                // §5.2.9: the OS ignores the X_ GPE blocks' width, offset and access size (the
+                // review's F3); their space is system I/O or memory.
+                Block::Gpe0 | Block::Gpe1 => {
+                    if !matches!(
                         gas.space,
                         AddressSpace::SystemIo | AddressSpace::SystemMemory
-                    )
-                {
-                    return Err(value(x, name));
+                    ) {
+                        return Err(value(x, name));
+                    }
                 }
-            }
-            let present = self.block(block);
-            let length_at = block.length_at();
-            let length = b.u8(length_at)?;
-            match block {
-                // Required on a platform with fixed hardware, and at least 4 and 2 bytes long.
-                Block::Pm1aEvent | Block::Pm1aControl if present.is_none() => {
-                    return Err(value(legacy, name));
-                }
-                Block::Pm1aEvent if length < 4 => return Err(value(length_at, "PM1_EVT_LEN")),
-                Block::Pm1aControl if length < 2 => return Err(value(length_at, "PM1_CNT_LEN")),
-                Block::Pm2Control if present.is_some() && length == 0 => {
-                    return Err(value(length_at, "PM2_CNT_LEN"));
-                }
-                // A PM timer is exactly 4 bytes.
-                Block::PmTimer if present.is_some() && length != 4 => {
-                    return Err(value(length_at, "PM_TMR_LEN"));
-                }
-                // A GPE block is a status half and an enable half.
-                Block::Gpe0 | Block::Gpe1 if length & 1 != 0 => {
-                    return Err(value(length_at, "GPEx_BLK_LEN"));
-                }
-                _ => {}
+                _ => gas.check_register(b, x, name)?,
             }
         }
-        // A month alarm needs a day alarm.
-        if self.mon_alrm != 0 && self.day_alrm == 0 {
-            return Err(b.error(106, ErrorKind::Inconsistent { field: "DAY_ALRM" }));
+        let present = self.locate(block).is_some();
+        let length_at = block.length_at();
+        let length = b.u8(length_at)?;
+        match block {
+            // Required on a platform with fixed hardware, and at least 4 and 2 bytes long; the
+            // length fields are shared by the a and b blocks.
+            Block::Pm1aEvent | Block::Pm1aControl if !present => Err(value(legacy, name)),
+            Block::Pm1aEvent | Block::Pm1bEvent if present && length < 4 => {
+                Err(value(length_at, "PM1_EVT_LEN"))
+            }
+            Block::Pm1aControl | Block::Pm1bControl if present && length < 2 => {
+                Err(value(length_at, "PM1_CNT_LEN"))
+            }
+            Block::Pm2Control if present && length == 0 => Err(value(length_at, "PM2_CNT_LEN")),
+            // A PM timer is exactly 4 bytes.
+            Block::PmTimer if present && length != 4 => Err(value(length_at, "PM_TMR_LEN")),
+            // A GPE block is a status half and an enable half.
+            Block::Gpe0 | Block::Gpe1 if length & 1 != 0 => Err(value(length_at, "GPEx_BLK_LEN")),
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -714,66 +807,133 @@ pub(crate) mod tests {
         assert_eq!(Fadt::parse(&t).unwrap().dsdt_address(), Some(0x7FFD_0000));
     }
 
-    fn refused(edit: impl FnOnce(&mut Vec<u8>)) -> (usize, ErrorKind) {
-        let e = Fadt::parse(&edited(edit)).unwrap_err();
-        (e.at, e.kind)
+    /// The one field an edit makes break a rule, and how it is named; the table is still accepted.
+    fn fault(edit: impl FnOnce(&mut Vec<u8>)) -> (usize, ErrorKind) {
+        let t = edited(edit);
+        let f = Fadt::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
+        let faults: Vec<_> = f.faults().collect();
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        (faults[0].at, faults[0].kind)
     }
 
     #[test]
-    fn each_rule_is_refused_by_name() {
+    fn each_rule_is_named_and_only_a_missing_dsdt_refuses() {
         let v = |field| ErrorKind::Value { field };
+        let t = edited(|t| {
+            put(t, 40, &[0; 4]);
+            put(t, 140, &[0; 8]);
+        });
+        let e = Fadt::parse(&t).unwrap_err();
+        assert_eq!((e.at, e.kind), (40, v("DSDT")));
         assert_eq!(
-            refused(|t| {
-                put(t, 40, &[0; 4]);
-                put(t, 140, &[0; 8]);
-            }),
-            (40, v("DSDT"))
-        );
-        assert_eq!(
-            refused(|t| {
+            fault(|t| {
                 put(t, 36, &[0; 4]);
                 put(t, 132, &[0; 8]);
             }),
             (36, v("FIRMWARE_CTRL"))
         );
         assert_eq!(
-            refused(|t| put(t, 132, &0x7FFE_0010u64.to_le_bytes())),
+            fault(|t| put(t, 132, &0x7FFE_0010u64.to_le_bytes())),
             (132, v("FIRMWARE_CTRL: the FACS is 64-byte aligned"))
         );
-        assert_eq!(refused(|t| t[116 + 1] = 16), (116, v("RESET_REG")));
-        assert_eq!(refused(|t| t[116] = 3), (116, v("RESET_REG")));
+        assert_eq!(fault(|t| t[116 + 1] = 16), (116, v("RESET_REG")));
+        assert_eq!(fault(|t| t[116] = 3), (116, v("RESET_REG")));
         assert_eq!(
-            refused(|t| put(t, 116, &gas(2, 8, 0, 0, 1 << 48))),
+            fault(|t| put(t, 116, &gas(2, 8, 0, 0, 1 << 48))),
             (116, v("RESET_REG"))
         );
-        assert_eq!(refused(|t| t[116 + 3] = 9), (116, v("RESET_REG")));
+        assert_eq!(fault(|t| t[116 + 3] = 9), (116, v("RESET_REG")));
         assert_eq!(
-            refused(|t| put(t, 244, &gas(3, 8, 0, 0, 0x62))),
+            fault(|t| put(t, 244, &gas(3, 8, 0, 0, 0x62))),
             (244, v("SLEEP_CONTROL_REG"))
         );
         assert_eq!(
-            refused(|t| {
+            fault(|t| {
                 put(t, 56, &[0; 4]);
                 put(t, 148, &[0; 12]);
             }),
             (56, v("PM1a_EVT_BLK"))
         );
-        assert_eq!(refused(|t| t[88] = 3), (88, v("PM1_EVT_LEN")));
-        assert_eq!(refused(|t| t[89] = 1), (89, v("PM1_CNT_LEN")));
-        assert_eq!(refused(|t| t[91] = 3), (91, v("PM_TMR_LEN")));
-        assert_eq!(refused(|t| t[92] = 15), (92, v("GPEx_BLK_LEN")));
+        assert_eq!(fault(|t| t[88] = 3), (88, v("PM1_EVT_LEN")));
+        assert_eq!(fault(|t| t[89] = 1), (89, v("PM1_CNT_LEN")));
+        assert_eq!(fault(|t| t[91] = 3), (91, v("PM_TMR_LEN")));
+        assert_eq!(fault(|t| t[92] = 15), (92, v("GPEx_BLK_LEN")));
         assert_eq!(
-            refused(|t| put(t, 220, &gas(3, 8, 0, 0, 0x62))),
+            fault(|t| put(t, 220, &gas(3, 8, 0, 0, 0x62))),
             (220, v("GPE0_BLK"))
         );
         assert_eq!(
-            refused(|t| put(t, 72, &0x650u32.to_le_bytes())),
+            fault(|t| put(t, 72, &0x650u32.to_le_bytes())),
             (90, v("PM2_CNT_LEN"))
         );
         assert_eq!(
-            refused(|t| t[107] = 0x0A),
+            fault(|t| t[107] = 0x0A),
             (106, ErrorKind::Inconsistent { field: "DAY_ALRM" })
         );
+    }
+
+    /// The review's F3: a field that breaks a rule is not used, and the rest of the table is.
+    #[test]
+    fn a_bad_register_costs_only_itself() {
+        // A reset register 16 bits wide.
+        let f = edited(|t| t[116 + 1] = 16);
+        let f = Fadt::parse(&f).unwrap();
+        assert!(!f.usable(Field::Reset) && f.reset().is_none());
+        assert_eq!(f.dsdt_address(), Some(0x7FFD_0000));
+        assert_eq!(f.facs_address(), Some(0x7FFE_0000));
+        assert_eq!(f.block(Block::PmTimer).map(|r| r.length), Some(4));
+        assert_eq!(f.century, 0x32);
+        // A FACS not 64-byte aligned: no FACS, and the DSDT and blocks kept.
+        let t = edited(|t| put(t, 132, &0x7FFE_0010u64.to_le_bytes()));
+        let f = Fadt::parse(&t).unwrap();
+        assert_eq!(f.facs_address(), None);
+        assert!(f.reset().is_some() && f.block(Block::Pm1aEvent).is_some());
+        // A PM timer of 3 bytes: no timer, the other blocks kept.
+        let t = edited(|t| t[91] = 3);
+        let f = Fadt::parse(&t).unwrap();
+        assert_eq!(f.block(Block::PmTimer), None);
+        assert!(f.block(Block::Pm1aEvent).is_some() && f.block(Block::Gpe0).is_some());
+        // A month alarm without a day alarm: no month alarm.
+        let t = edited(|t| t[107] = 0x0A);
+        assert_eq!(Fadt::parse(&t).unwrap().month_alarm(), None);
+        let t = edited(|t| {
+            t[106] = 0x0D;
+            t[107] = 0x0A;
+        });
+        assert_eq!(Fadt::parse(&t).unwrap().month_alarm(), Some(0x0A));
+        // A sleep register of the wrong shape: that register only.
+        let t = edited(|t| {
+            put(t, 244, &gas(1, 16, 0, 1, 0x700));
+            put(t, 256, &gas(1, 8, 0, 1, 0x701));
+        });
+        let f = Fadt::parse(&t).unwrap();
+        assert_eq!(f.sleep_control(), None);
+        assert_eq!(f.sleep_status().map(|g| g.address), Some(0x701));
+        // §5.2.9: the X_ GPE blocks' access size is ignored, so a reserved one is no fault.
+        let t = edited(|t| put(t, 220, &gas(1, 128, 0, 7, 0x620)));
+        let f = Fadt::parse(&t).unwrap();
+        assert_eq!(f.faults().count(), 0);
+        assert_eq!(f.block(Block::Gpe0).map(|r| r.length), Some(16));
+        // Every rule broken at once: each named, and the table still accepted.
+        let t = edited(|t| {
+            put(t, 132, &0x7FFE_0010u64.to_le_bytes());
+            t[116 + 1] = 16;
+            put(t, 244, &gas(3, 8, 0, 0, 0x62));
+            put(t, 256, &gas(3, 8, 0, 0, 0x62));
+            t[88] = 3;
+            t[89] = 1;
+            t[91] = 3;
+            t[92] = 15;
+            t[107] = 0x0A;
+        });
+        let f = Fadt::parse(&t).unwrap();
+        assert_eq!(
+            f.faults().count(),
+            9,
+            "{:?}",
+            f.faults().collect::<Vec<_>>()
+        );
+        assert_eq!(f.dsdt_address(), Some(0x7FFD_0000));
     }
 
     #[test]

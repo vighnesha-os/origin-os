@@ -171,6 +171,11 @@ impl<'v, 'a> Tally<'v, 'a> {
         });
     }
 
+    /// A fault of a field that leaves the rest of the table usable (the review's F3).
+    pub(crate) fn fault(&mut self, fault: Error) {
+        self.summary.report(fault);
+    }
+
     /// A run of bytes handed on, at `at`.
     pub(crate) fn bytes(&mut self, at: usize, bytes: &'a [u8]) {
         (self.visit)(Seen {
@@ -346,7 +351,9 @@ fn parse<'a>(table: &Table<'a>, tally: &mut Tally<'_, 'a>) -> Result<bool, Error
     match &table.signature().0 {
         b"APIC" => crate::madt::Madt::parse(bytes)?.census(tally)?,
         b"FACP" => {
-            crate::fadt::Fadt::parse(bytes)?;
+            for fault in crate::fadt::Fadt::parse(bytes)?.faults() {
+                tally.fault(fault);
+            }
         }
         b"DSDT" | b"SSDT" | b"PSDT" => {
             let block = crate::definition::DefinitionBlock::parse(bytes)?;

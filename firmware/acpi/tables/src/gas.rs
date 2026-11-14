@@ -164,7 +164,10 @@ impl Gas {
     /// access's).
     ///
     /// Refused here, as reserved values an OS would act on (crate documentation, "Refusals"): a
-    /// reserved address space and a reserved access size.
+    /// reserved address space; and a reserved access size in system memory, system I/O or PCI
+    /// configuration space, the spaces Table 5.1's access sizes are defined for. Elsewhere the
+    /// space's own definition says what the field means (Table 5.2: functional fixed hardware's
+    /// are the processor manufacturer's), so it is not judged here (the review's F11).
     pub(crate) fn check_register(
         &self,
         b: &Bytes<'_>,
@@ -175,7 +178,11 @@ impl Gas {
         if matches!(self.space, AddressSpace::Reserved(_)) {
             return Err(refuse());
         }
-        if matches!(self.access, AccessSize::Reserved(_)) {
+        if matches!(
+            self.space,
+            AddressSpace::SystemMemory | AddressSpace::SystemIo | AddressSpace::PciConfig
+        ) && matches!(self.access, AccessSize::Reserved(_))
+        {
             return Err(refuse());
         }
         Ok(())
@@ -224,6 +231,10 @@ mod tests {
         assert!(b(gas(0, 64, 0, 4, 0x1000)).is_ok());
         assert!(b(gas(0x0C, 8, 0, 1, 1)).is_err());
         assert!(b(gas(1, 8, 0, 5, 1)).is_err());
+        assert!(b(gas(2, 8, 0, 5, 1)).is_err());
+        // The review's F11: elsewhere the space's own definition says what the field means.
+        assert!(b(gas(0x7F, 8, 0, 5, 1)).is_ok());
+        assert!(b(gas(3, 8, 0, 9, 1)).is_ok());
         assert!(
             b(gas(1, 128, 0, 0, 0x620)).is_ok(),
             "a GPE block is wider than one access"
