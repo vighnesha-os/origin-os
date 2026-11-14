@@ -415,7 +415,13 @@ impl<H: Host> Interpreter<H> {
                 let _ = self.host.release_global_lock();
             }
         }
-        self.collect_garbage();
+        // Collected when due, as between steps, not after every evaluation: an evaluation that
+        // reads one name must not cost a pass over the whole heap (the review of B2, B2-7). The
+        // work is added to the evaluation's count, which the initialization walk sums.
+        let collected = self.collect_if_due();
+        if let Some(work) = collected {
+            self.run.steps = self.run.steps.saturating_add(work);
+        }
         if self.frames.is_empty() {
             mem::release(core::mem::take(&mut self.frames), &mut self.budget);
             mem::release(core::mem::take(&mut self.ctx), &mut self.budget);
@@ -426,6 +432,20 @@ impl<H: Host> Interpreter<H> {
         if self.owners.is_empty() {
             mem::release(core::mem::take(&mut self.owners), &mut self.budget);
         }
+        // The count is made afresh with each collection, which reads the heap anyway: a charge a
+        // failure path left uncredited (the review of B1, F2) raises the count, which brings the
+        // next collection, and its recount, nearer. Not after every evaluation, for the same
+        // reason as the collection.
+        if collected.is_some() {
+            self.recount();
+        }
+    }
+
+    /// The collection and recount that would come when due, now: for tests that measure what
+    /// is held.
+    #[cfg(test)]
+    pub(crate) fn settle_memory(&mut self) {
+        self.collect_garbage();
         self.recount();
     }
 
@@ -581,18 +601,28 @@ impl<H: Host> Interpreter<H> {
     /// One step: an opcode, with the work done since the last count (the review of B1, F1).
     fn tick(&mut self) -> Result<()> {
         self.charge(1)?;
-        if self.nested == 0 && self.budget.used() > self.gc_threshold {
-            let slots = u64::try_from(self.heap.slot_count()).unwrap_or(u64::MAX);
-            self.collect_garbage();
-            // The next collection comes when half the room left after this one is used, and
-            // never before 64 KiB more is: collections are spaced, never one a step.
-            let used = self.budget.used();
-            let gap = (self.budget.limit().saturating_sub(used) / 2).max(64 << 10);
-            self.gc_threshold = used.saturating_add(gap).min(self.budget.limit());
-            // A collection reads every slot: it is work, counted like any other.
-            self.charge(slots / 8)?;
+        if self.nested == 0
+            && let Some(work) = self.collect_if_due()
+        {
+            self.charge(work)?;
         }
         Ok(())
+    }
+
+    /// Collects if what is held has passed the threshold, and sets the next: when half the room
+    /// left after this collection is used, and never before 64 KiB more is, so collections are
+    /// spaced, never one a step nor one an evaluation (the review of B1, F1, and of B2, B2-7).
+    /// Returns the work done, a unit for each eight slots read, if it collected.
+    fn collect_if_due(&mut self) -> Option<u64> {
+        if self.budget.used() <= self.gc_threshold {
+            return None;
+        }
+        let slots = u64::try_from(self.heap.slot_count()).unwrap_or(u64::MAX);
+        self.collect_garbage();
+        let used = self.budget.used();
+        let gap = (self.budget.limit().saturating_sub(used) / 2).max(64 << 10);
+        self.gc_threshold = used.saturating_add(gap).min(self.budget.limit());
+        Some(slots / 8)
     }
 
     /// Counts `units` of work against the step limit, with the work done since the last count:

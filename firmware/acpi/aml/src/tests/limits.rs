@@ -92,11 +92,14 @@ fn doubling_a_buffer_stops_at_the_memory_limit_and_the_memory_comes_back() {
     let before = i.memory_used();
     assert_eq!(limit_of(i.evaluate("GROW", &[])), Limit::Memory);
     assert!(i.memory_peak() <= small().memory_bytes);
+    // Collected when due (the review of B2, B2-7): measured after that collection.
+    i.settle_memory();
     let after = i.memory_used();
     // What stays is the arena's slot table, which keeps its size for reuse; the buffers are gone,
     // and a second run holds no more than the first.
     assert!(after < before + 16 * 1024, "{before} then {after}");
     assert_eq!(limit_of(i.evaluate("GROW", &[])), Limit::Memory);
+    i.settle_memory();
     assert_eq!(i.memory_used(), after);
 }
 
@@ -250,10 +253,14 @@ fn a_memory_limit_hit_while_copying_leaves_the_count_where_it_was() {
     // The first run grows the arena's slot table, which keeps its size for reuse; every later
     // run must end where the first did.
     assert_eq!(limit_of(i.evaluate("KEEP", &[])), Limit::Memory);
+    i.settle_memory();
     let base = i.memory_used();
     let _ = super::take_drift();
     for _ in 0..30 {
+        // Collected and counted afresh when due (the review of B2, B2-7): each run is measured
+        // after that collection, which must find the count where the first run's was.
         assert_eq!(limit_of(i.evaluate("KEEP", &[])), Limit::Memory);
+        i.settle_memory();
         assert_eq!(i.memory_used(), base);
     }
     let (over, under) = super::take_drift();

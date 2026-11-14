@@ -164,11 +164,18 @@ fn a_failed_table_gives_its_bytes_back() {
         .collect();
     let mut failing = big.clone();
     failing.push(scope("\\MISS", &[]));
-    load(&mut i, &failing).unwrap_err();
+    // Collections are spaced (the review of B2, B2-7), so the failed tables' objects are garbage
+    // until one is due, and the heap's slot table, which keeps its size for reuse, grows to hold
+    // them: twenty failures first, so that it has, and each measure after the collection.
+    for _ in 0..20 {
+        load(&mut i, &failing).unwrap_err();
+    }
+    i.settle_memory();
     let before = i.memory_used();
     for _ in 0..20 {
         load(&mut i, &failing).unwrap_err();
     }
+    i.settle_memory();
     // Twenty failed tables of about 16 KB each hold their identities only.
     assert!(
         i.memory_used() < before + 20 * 256,

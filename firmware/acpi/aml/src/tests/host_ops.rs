@@ -595,7 +595,7 @@ fn the_initialization_walk_follows_table_6_67() {
         name("FKI", zero()),
     ]);
     let mut seen = Vec::new();
-    i.initialize(&mut |n, o| seen.push((n, o)));
+    i.initialize(&mut |n, o| seen.push((n, o))).unwrap();
     let ran = |i: &mut Interp, n: &str| int(i, n) == 1;
     assert!(ran(&mut i, "SBI") && ran(&mut i, "ONI") && ran(&mut i, "KDI"));
     assert!(!ran(&mut i, "OFI") && !ran(&mut i, "OKI"));
@@ -1183,4 +1183,53 @@ fn a_mutex_a_method_run_by_export_keeps_is_released_at_the_end() {
         i.evaluate("PK", &[]).unwrap(),
         Some(Value::Package(vec![Value::Integer(0)]))
     );
+}
+
+// --- The initialization walk as a whole (the review of B2, B2-7) --------------------------------
+
+#[test]
+fn the_initialization_walk_is_bounded_as_a_whole() {
+    // 200 devices whose `_STA` each sleeps 10 ms: each alone is well within the boot proof's one
+    // second, the walk is not. It stops near one second and says so.
+    let devices: Vec<B> = (0..200)
+        .map(|k| {
+            device(
+                &format!("D{k:03}"),
+                &[method("_STA", 0, &[sleep(byte(10)), ret(byte(0x0F))])],
+            )
+        })
+        .collect();
+    let mut i = super::interp_with(IntegerWidth::Bits64, Limits::BOOT_PROOF);
+    load(&mut i, &[scope("\\_SB", &devices)]).unwrap();
+    let mut reported = 0usize;
+    let e = i
+        .initialize(&mut |_, _| reported += 1)
+        .expect_err("the walk is cut off");
+    assert_eq!(e.kind, ErrorKind::Limit(Limit::Time));
+    assert!((95..=101).contains(&reported), "{reported} devices reached");
+}
+
+#[test]
+fn a_wide_namespace_is_walked_without_a_collection_per_device() {
+    // 20,000 devices in 100 scopes, each `_STA` a plain name: each is an evaluation that
+    // allocates nothing, and must not cost a pass over the whole heap.
+    let scopes: Vec<B> = (0..100)
+        .map(|s| {
+            let devices: Vec<B> = (0..200)
+                .map(|k| device(&format!("D{k:03}"), &[name("_STA", byte(0x0F))]))
+                .collect();
+            device(&format!("\\S{s:03}"), &devices)
+        })
+        .collect();
+    let mut i = super::interp(IntegerWidth::Bits64);
+    load(&mut i, &scopes).unwrap();
+    let start = std::time::Instant::now();
+    let mut reported = 0usize;
+    i.initialize(&mut |_, _| reported += 1).unwrap();
+    let took = start.elapsed();
+    assert_eq!(reported, 20_100);
+    // About a millisecond (release build); with a collection and a recount after each
+    // evaluation, as before, 5.4 s. The bound is far from both.
+    assert!(took.as_secs() < 2, "{took:?}");
+    eprintln!("20,100 devices walked in {took:?}");
 }

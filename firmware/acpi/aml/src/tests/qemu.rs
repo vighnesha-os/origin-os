@@ -89,7 +89,7 @@ fn qemu_tables_load_and_answer() {
         i.host_mut().refuse = true;
         let mut outcomes = Vec::new();
         let walk = std::time::Instant::now();
-        i.initialize(&mut |n, o| outcomes.push((n, o)));
+        i.initialize(&mut |n, o| outcomes.push((n, o))).unwrap();
         let walked = walk.elapsed();
         let mut refused_by_space = [0usize; 3];
         let (mut initialized, mut other) = (0usize, 0usize);

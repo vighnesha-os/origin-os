@@ -95,7 +95,7 @@ pub fn no_panic_probe(aml: &[u8], path: &str, args: &[Value]) -> usize {
         n = n.saturating_add(usize::from(i.evaluate_node(node, args).is_ok()));
         n = n.saturating_add(i.path_of(node).map_or(0, |p| p.len()));
     }
-    i.initialize(&mut |_, _| n = n.saturating_add(1));
+    let _ = i.initialize(&mut |_, _| n = n.saturating_add(1));
     let _ = i.connect_space(Space::EMBEDDED_CONTROL, true, &mut |_, _| {});
     n.saturating_add(i.memory_used())
 }
