@@ -1,22 +1,22 @@
 //! `\_OSI`, `\_OS` and `\_REV` (ACPI 6.6 §5.7.2 to §5.7.4; ADR-0019 T5).
 //!
-//! **Pending owner item 309.** The policy the contract's §6 proposes, built as proposed until the
-//! owner answers: `\_OSI` answers `Ones` for the Windows strings Microsoft lists (its page "How to
-//! identify the Windows version in ACPI by using _OSI", last updated 2024-09-11), because Windows
-//! answers True for every earlier version and firmware in Origin's scope is validated against it;
-//! `Zero` for everything else, `Linux` and the other vendors' strings included, and for each
-//! ACPI-defined feature-group string of Table 5.248 until the task that builds that feature adds
-//! it. `\_REV` is 2, the only value §5.7.4 allows an interpreter with 64-bit integers.
+//! **ADR-0019 Amendment 1, decision item 309** (accepted by the owner on 2026-11-14): `\_OSI`
+//! answers `Ones` for each Windows string Microsoft publishes (its page "How to identify the
+//! Windows version in ACPI by using _OSI", last updated 2024-09-11), because Windows answers True
+//! for every earlier version and firmware in Origin's scope is validated against it; `Zero` for
+//! everything else, `Linux` and the other operating systems' strings included, unknown strings,
+//! and each ACPI-defined feature-group string of Table 5.248 until the task that builds that
+//! feature adds it. `\_REV` is 2. This is the one table of answers; a change to it is the owner's.
 //!
-//! **`\_OS` is provisional**: "Origin OS", the truthful name, until the ACPICA reading session
-//! (TASKS 64) answers G10 with evidence of what deployed firmware expects.
+//! **`\_OS` is provisional**: "Origin OS", the truthful name, until TASKS item 64 answers G10 with
+//! evidence of what deployed firmware expects, and the owner decides it as an item of its own.
 
 use crate::Interpreter;
 use crate::error::{ErrorKind, Result, err};
 use crate::host::Host;
 use crate::object::{Object, Val};
 
-/// The strings `\_OSI` answers `Ones` to. Pending owner item 309.
+/// The strings `\_OSI` answers `Ones` to (ADR-0019 Amendment 1, decision item 309).
 pub const OSI_STRINGS: &[&[u8]] = &[
     b"Windows 2000",
     b"Windows 2001",
@@ -42,10 +42,10 @@ pub const OSI_STRINGS: &[&[u8]] = &[
     b"Windows 2022",
 ];
 
-/// `\_OS`. Provisional until G10 is answered.
+/// `\_OS`. Provisional until G10 is answered and the owner decides it.
 pub const OS_NAME: &[u8] = b"Origin OS";
 
-/// `\_REV`. Pending owner item 309.
+/// `\_REV` (ADR-0019 Amendment 1, decision item 309).
 pub const REV: u64 = 2;
 
 impl<H: Host> Interpreter<H> {
