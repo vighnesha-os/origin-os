@@ -473,6 +473,17 @@ NV-1 and NV-2 show H1 at boot, NV-3 to NV-5 the driver before M2, M3 and M1's re
 
 NV-17 and NV-18 show the one-pair and one-entry cases named, NV-19 and NV-20 the waiting step and the interrupt-driven thread's cause named, and NV-21 the table masked at bind. Their host controls, planted in `nvme.rs` and undone by script: CNS 02h sent to a controller at 1.0 (`active_namespace_lists`), an NVM subsystem shutdown reported complete not refused (`a_controller_still_shut_down_is_not_enabled`), no MSI-X capability taken for an interrupt queue and BAR 0's doorbells not looked at (`why_a_controller_has_no_interrupt_queue`), and the boot flow waiting no longer than the deadline (`the_boot_flow_outwaits_its_threads_deadlines`); each failed only that test.
 
+**Controls of the answers to the review's addendum (N1 to N3; 2026-11-14, QEMU 11.1.3 TCG, Intel VT-d, 2 processors, the kernel boot alone):** NV-22 on an export of `753452a`, NV-23 to NV-25 on an export of `c9ed045`, in the same turn of the machine as the gates on `c9ed045`. QEMU's `msix-exclusive-bar=on` moves the NVMe MSI-X table from BAR 0 to a BAR of its own (`BAR0 mem64 8 KiB …; BAR4 mem32 4 KiB`), so xtask's marker for the 16 KiB BAR 0 fails in NV-23 and NV-24 while the kernel's verdict passes.
+
+| # | Edit or configuration | Result |
+|---|---|---|
+| NV-22 | Before (`753452a`): the table in BAR 4 (`msix-exclusive-bar=on`) and MSI-X turned on before the driver binds: the addendum's N1 | `MSI-X was on when the driver bound: its function mask set true and its 65 entries masked; INTMS not written`, then `MSI-X: cannot map the MSI-X table: NVMe failed`: the table mapped twice, and the second mapping refused |
+| NV-23 | After (`c9ed045`): the same | The same masking line, `MSI-X: 65 vectors, table in BAR4 at offset 0x0; …`, every NVMe proof passed, `66 of 67 proofs passed; failed: speculation controls` |
+| NV-24 | After: the table in BAR 4, MSI-X off at bind | `table in BAR4 at offset 0x0`, every NVMe proof passed, `66 of 67 proofs passed` |
+| NV-25 | After: a processor's first read past the disk's end, then its flush noticed only after the boot flow's wait: N3 | `CPU 0 (APIC ID 0): 0 reads through its own queue pair, …, the longest command 540 us; a pattern read: completed with status type 0 code 0x80 (do not retry); its flush: still waiting after 39999 ms: NVMe failed`: the first failure and the step outstanding, both named |
+
+N2 has a host test and its control R-N2 (a subsystem shutdown left for after the reset, which fails `a_controller_still_shut_down_is_not_enabled`); QEMU cannot be left in an NVM subsystem shutdown.
+
 ## Alternatives
 
 | Alternative | For | Against |
