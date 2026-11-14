@@ -22,8 +22,10 @@ use core::fmt::Write;
 use origin_acpi_tables::boot::{Fpdt, FpdtRecord, PerformanceKind, PerformanceTable};
 use origin_acpi_tables::census::{self, Class};
 use origin_acpi_tables::facs::Facs;
-use origin_acpi_tables::fadt::{Block, Fadt};
+use origin_acpi_tables::fadt::{Block, Fadt, Field};
 use origin_acpi_tables::header::{HEADER_LEN, Header};
+use origin_acpi_tables::madt::Madt;
+use origin_acpi_tables::srat::Srat;
 use origin_acpi_tables::{Error, Signature};
 
 use crate::acpi_text::{Ascii, Refused, Sig, Whose};
@@ -80,6 +82,9 @@ pub struct Findings {
     pub refused: u32,
     /// Structures or fields that broke a rule, reported and not used, in checked tables.
     pub reported: u32,
+    /// Of those, the ones in structures and fields the kernel relies on ([`relied_on`]): each
+    /// fails the verdict, though its table is not refused (the review's addendum, N1).
+    pub relied: u32,
     /// Tables named and only their headers checked: another specification's or area's, for other
     /// processors, an OEM's, unknown, or in a layout ACPI 6.6 no longer gives.
     pub other: u32,
@@ -100,15 +105,21 @@ pub struct Findings {
 }
 
 impl Findings {
-    /// The verdict: no table refused, every table the XSDT lists read, a FADT, a DSDT, and a FACS
-    /// unless the platform is hardware-reduced. Not counted against it: a reported fault (the
-    /// coordinating session's ruling: reported, never refused), a null XSDT entry, which names no
-    /// table, and a table the FPDT points to that cannot be read, which nothing needs.
+    /// The verdict: no table refused, every table the XSDT lists read, no fault in a structure or
+    /// field the kernel relies on (N1), a FADT, a DSDT, and a FACS unless the platform is
+    /// hardware-reduced. Not counted against it: a fault reported in a structure or field nothing
+    /// in the kernel uses, so that ordinary firmware bugs in unused tables do not mark a machine
+    /// degraded (the coordinating session's ruling on N1); a null XSDT entry, which names no
+    /// table; and a table the FPDT points to that cannot be read or is too large to judge, which
+    /// nothing needs.
     #[must_use]
     pub const fn consistent(&self) -> bool {
-        self.refused == 0 && self.unreadable_entries == 0 && self.fadt && self.dsdt && {
-            self.facs || self.reduced
-        }
+        self.refused == 0
+            && self.unreadable_entries == 0
+            && self.relied == 0
+            && self.fadt
+            && self.dsdt
+            && (self.facs || self.reduced)
     }
 
     /// Counts one table's result.
@@ -123,6 +134,47 @@ impl Findings {
             Err(_) => self.refused = self.refused.saturating_add(1),
         }
     }
+}
+
+/// How many of a checked table's reported faults are in structures the kernel relies on (the
+/// review's addendum, N1, and the coordinating session's ruling): the MADT's processors, I/O APICs
+/// and interrupt source overrides (types 0, 1, 2 and 9), which `smp` and `irq` read; the SRAT's
+/// processor and memory affinities (types 0, 1 and 2), which the NUMA map reads. The FADT's are
+/// counted where the census reads it ([`relied_on_fadt`]).
+pub fn relied_on(table: &[u8]) -> u32 {
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    match table.get(..4) {
+        Some(b"APIC") => Madt::parse(table).map_or(0, |m| {
+            count(
+                m.verdicts()
+                    .filter(|v| matches!(v, Ok((raw, Err(_))) if matches!(raw.kind, 0 | 1 | 2 | 9)))
+                    .count(),
+            )
+        }),
+        Some(b"SRAT") => Srat::parse(table).map_or(0, |s| {
+            count(
+                s.verdicts()
+                    .filter(|v| matches!(v, Ok((raw, Err(_))) if matches!(raw.kind, 0..=2)))
+                    .count(),
+            )
+        }),
+        _ => 0,
+    }
+}
+
+/// The FADT's fields the kernel relies on that break a rule (N1): its FACS pointer, its PM1a
+/// event and control blocks and PM timer, and its reset register. The census reports every
+/// faulty field on the FADT's line; these also fail the verdict.
+pub fn relied_on_fadt(fadt: &Fadt<'_>) -> u32 {
+    let fields = [
+        Field::Facs,
+        Field::Block(Block::Pm1aEvent),
+        Field::Block(Block::Pm1aControl),
+        Field::Block(Block::PmTimer),
+        Field::Reset,
+    ];
+    let faulty = fields.iter().filter(|&&f| !fadt.usable(f)).count();
+    u32::try_from(faulty).unwrap_or(u32::MAX)
 }
 
 /// Reads the table whose header is at `addr`: the header first, then as many bytes as it says, up
@@ -266,6 +318,7 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
         }
         let before = found.unreadable;
         if let Some(bytes) = census_at(out, fw, &mut found, "an XSDT entry", addr, None) {
+            found.relied = found.relied.saturating_add(relied_on(bytes));
             match bytes.get(..4) {
                 Some(b"FACP") if fadt.is_none() => fadt = Some(bytes),
                 Some(b"FPDT") if fpdt.is_none() => fpdt = Some(bytes),
@@ -280,6 +333,7 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
     found.fadt = fadt.is_some();
     if let Some(fadt) = &fadt {
         found.reduced = fadt.flags.hw_reduced_acpi();
+        found.relied = found.relied.saturating_add(relied_on_fadt(fadt));
         let _ = writeln!(
             out,
             "{LINE}FADT: profile {:?}, SCI {}, hardware-reduced {}, reset register {}, PM timer {}",
@@ -314,11 +368,12 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
     let micros = fw.now().saturating_sub(started) / 1000;
     let _ = writeln!(
         out,
-        "{LINE}{} tables: {} checked, {} refused, {} reported, {} with only their headers checked, {} not readable, {} null XSDT entries; FADT {}, DSDT {}, FACS {}; {} us; consistent {}{}",
+        "{LINE}{} tables: {} checked, {} refused, {} reported, {} of them where the kernel relies on it, {} with only their headers checked, {} not readable, {} null XSDT entries; FADT {}, DSDT {}, FACS {}; {} us; consistent {}{}",
         found.tables,
         found.checked,
         found.refused,
         found.reported,
+        found.relied,
         found.other,
         found.unreadable,
         found.null_entries,
@@ -580,9 +635,9 @@ mod tests {
         assert!(ok, "{out}");
         assert!(
             last_line(&out).ends_with(
-                "4 tables: 4 checked, 0 refused, 0 reported, 0 with only their headers checked, 0 \
-                 not readable, 0 null XSDT entries; FADT true, DSDT true, FACS true; 0 us; \
-                 consistent true"
+                "4 tables: 4 checked, 0 refused, 0 reported, 0 of them where the kernel relies on \
+                 it, 0 with only their headers checked, 0 not readable, 0 null XSDT entries; FADT \
+                 true, DSDT true, FACS true; 0 us; consistent true"
             ),
             "{out}"
         );
@@ -769,5 +824,100 @@ mod tests {
             }
             .consistent()
         );
+    }
+
+    /// A MADT with a local APIC address and `entries`.
+    fn madt(entries: &[&[u8]]) -> Vec<u8> {
+        let mut body = 0xFEE0_0000u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&[0; 4]);
+        for e in entries {
+            body.extend_from_slice(e);
+        }
+        table(b"APIC", 5, &body)
+    }
+
+    /// The review's addendum, N1: a fault in a structure the kernel relies on fails the verdict,
+    /// though the table is not refused; one in a structure it does not use is only reported.
+    #[test]
+    fn a_fault_where_the_kernel_relies_fails_the_verdict() {
+        let lapic: &[u8] = &[0, 8, 0, 0, 1, 0, 0, 0];
+        let short_lapic: &[u8] = &[0, 7, 1, 1, 1, 0, 0];
+        let bad_nmi: &[u8] = &[4, 6, 0xFF, 0, 0, 2];
+        let run = |table: Vec<u8>| {
+            let mut m = Machine::new();
+            m.put(OEM, &table);
+            m.entries.push(OEM);
+            m.run()
+        };
+        let (ok, out, _) = run(madt(&[lapic, bad_nmi]));
+        assert!(ok, "{out}");
+        assert!(
+            last_line(&out).contains("1 reported, 0 of them where the kernel relies on it"),
+            "{out}"
+        );
+        let (ok, out, _) = run(madt(&[lapic, short_lapic]));
+        assert!(!ok, "{out}");
+        assert!(out.contains(
+            "APIC rev 5, 59 bytes, OEM \"ORIGIN\": checked: 1 structures (0x1); 1 reported"
+        ));
+        assert!(
+            last_line(&out)
+                .contains("0 refused, 1 reported, 1 of them where the kernel relies on it"),
+            "{out}"
+        );
+        assert!(last_line(&out).ends_with("consistent false: acpi tables failed"));
+        // A second I/O APIC at one address is a fault in a structure the kernel reads.
+        let ioapic = |id: u8, base: u32| {
+            let mut e = vec![1u8, 12, id, 0];
+            e.extend_from_slice(&0xFEC0_0000u32.to_le_bytes());
+            e.extend_from_slice(&base.to_le_bytes());
+            e
+        };
+        let (ok, _, _) = run(madt(&[lapic, &ioapic(1, 0), &ioapic(2, 24)]));
+        assert!(!ok);
+        // The SRAT: a memory range that wraps, enabled, fails it; disabled, it is ignored.
+        let memory = |flags: u32| {
+            let mut e = vec![1u8, 40, 0, 0, 0, 0, 0, 0];
+            e.extend_from_slice(&(u64::MAX - 1).to_le_bytes());
+            e.extend_from_slice(&2u64.to_le_bytes());
+            e.extend_from_slice(&[0; 4]);
+            e.extend_from_slice(&flags.to_le_bytes());
+            e.extend_from_slice(&[0; 8]);
+            e
+        };
+        let srat = |e: Vec<u8>| {
+            let mut body = vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            body.extend_from_slice(&e);
+            table(b"SRAT", 3, &body)
+        };
+        assert!(!run(srat(memory(1))).0);
+        assert!(run(srat(memory(0))).0);
+    }
+
+    /// N1 for the FADT: a reset register the flags say is used, of the wrong shape, fails the
+    /// verdict; a sleep register of the wrong shape, which the kernel does not use, does not.
+    #[test]
+    fn a_fadt_field_the_kernel_relies_on_fails_the_verdict() {
+        let gas = |space: u8, width: u8| {
+            let mut g = vec![space, width, 0, 1];
+            g.extend_from_slice(&0xCF9u64.to_le_bytes());
+            g
+        };
+        let mut m = Machine::new();
+        m.fadt(|f| {
+            f[112..116].copy_from_slice(&(1u32 | 1 << 10).to_le_bytes());
+            f[116..128].copy_from_slice(&gas(1, 16));
+        });
+        let (ok, out, _) = m.run();
+        assert!(!ok, "{out}");
+        assert!(
+            out.contains("1 reported, at 0x74: RESET_REG holds a value it may not"),
+            "{out}"
+        );
+        let mut m = Machine::new();
+        m.fadt(|f| f[244..256].copy_from_slice(&gas(1, 16)));
+        let (ok, out, _) = m.run();
+        assert!(ok, "{out}");
+        assert!(last_line(&out).contains("1 reported, 0 of them where the kernel relies on it"));
     }
 }
