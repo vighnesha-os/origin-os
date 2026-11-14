@@ -1396,7 +1396,7 @@ Assigned by the coordinating session on 2026-11-13, after the owner accepted dec
 | Actual deliverables | The code and its tests, the gates and the machines; the research ledger; ADR-0008 Amendment 1's "As built" note; matrix rows A08-D1 to A08-D8 and any row this touches; `docs/STATUS.md`; the provenance entry; the threat-model rows this touches; B19's per-processor line; this contract's result. Not pushed: the final commit goes to the coordinating session for the keeper and the batch. |
 | Acceptance conditions | The kernel brings every enabled processor online on every machine above, whatever the count. `cargo fmt --all --check`, `cargo xtask progress` and the requirements, provenance, roadmap, progress and document gates pass, then `cargo xtask check`, `boot-test` and `boot-matrix`, each under `cargo xtask exclusive -- …`, on the batch's head merged in. Every control fails as it should. D7's condition: each new machine's boot is measured on the Mac and its share of CI's real-CPU job stated before it is made required there; none is made required in CI if that job would not stay well inside 180 minutes on the EPYC 7763. **The task does not land until ACPI 6.6's MADT section is read and the ledger records any difference from 6.5**; a difference that changes a row goes to the coordinating session first. Landing is through the batch (pull request 27), after an independent review, which this privileged code needs: no person and no independent session has read it before then. Nothing here is claimed of a physical machine (§74). |
 
-**Result (2026-11-14).** Built on `claude/any-cpu-count`; final code commit `15b08fd`, the records after it. Not pushed, and no independent review yet: this is privileged kernel code and needs one before the keeper takes it.
+**Result (2026-11-14).** Built on `claude/any-cpu-count`; final code commit `15b08fd`, the records after it. Not pushed. The independent review and its fixes follow this result ("Review (2026-11-14)").
 
 - **Commits:**
   - `3d2e0b8` the code;
@@ -1416,12 +1416,12 @@ Assigned by the coordinating session on 2026-11-13, after the owner accepted dec
   - **D8:** the start-up total printed.
 - **Changed outside the per-processor tables:**
   1. **The boot checker judges the serial log once a line has ended, not every few bytes** (`16cf7a3`). That had been quadratic in the log's length. A 65-processor log took 48 minutes to judge, while its kernel takes about 60 s. A kernel boot of 1 to 4 processors fell from about 126 s to 12–14 s on the Mac, most of it the checker's. `boot-matrix` with every new machine now takes 1,081 s, so CI's boot jobs should shrink too, which is not yet measured there.
-  2. **The concurrent console proof's budget grows with the count** (`f573761`): 5 s and 10 ms for each line, where a fixed 5 s assumed a count.
+  2. **The concurrent console proof's budget grows with the count** (`f573761`): 5 s and 10 ms for each line, where a fixed 5 s assumed a count. It grew for small machines too: 6 s at 1 to 4 processors, and 18 s at 64. It is a liveness timeout, since whole lines are what is proven, so a slower console now passes (review finding F13).
   3. **The IOMMU proof's NVMe routes** are the entries `setup_cpu_queues` programmed.
   4. **On oversubscribed software-processor boots an uneven fair share passes when both workers ran** (`7bc4b0c`, the coordinating session's ruling, recorded in ADR-0013): fairness is not shown on those machines.
   5. **A controller with no NVMe pair or vector past the driver's two is "not proven"** (`7d136ad`, the coordinating session's ruling), with the proof still demanded on every gate configuration.
   6. The Loom control `slot_taken_while_it_is_reclaimed` follows `Slots::take`'s text.
-- **One deviation from security invariant (9):** `unsafe` is not only in `percpu.rs`, which has none. There is one new block in `vm::grow_stack_region`, in `vm.rs`, a file already on the unsafe gate's list. It makes the second table run's slice of `Table`s over frames the allocator gave up, as `early` does for the first, with its `SAFETY:` argument. The independent review should read it.
+- **One deviation from security invariant (9):** `unsafe` is not only in `percpu.rs`, which has none. There is one new block in `vm::grow_stack_region`, in `vm.rs`, a file already on the unsafe gate's list. It makes the second table run's slice of `Table`s over frames the allocator gave up, as `early` does for the first, with its `SAFETY:` argument. The independent review read it and found its argument holds. The review's fix for F8 removed another block, `Box::new_zeroed().assume_init()` in `smp::start_one`.
 - **Gates on `15b08fd`, one turn of the machine, a clean tree:**
   - `cargo xtask check` passed in 436 s: 1,901 host tests, none failed; Loom ran 56 models and caught 83 controls.
   - `boot-test` passed 11 of 11 in 51 s.
@@ -1440,8 +1440,29 @@ Assigned by the coordinating session on 2026-11-13, after the owner accepted dec
 
   The new machines add about 400 s of the Mac's 1,081 s `boot-matrix`, about 37 %; the 67-processor machine alone about 9 %.
 - **D7's CI condition:** CI's own times are not measured here, so none of the new machines is required in CI. On a 4-thread runner the 65- and 67-processor machines would be 16 times oversubscribed, where the Mac is 6.5 times, and slower than on the Mac by a factor this branch cannot state. The 288-processor run (`boot-many`) is outside the gate, with its evidence in ADR-0008's "As built".
-- **Not shown:** anything under KVM, in CI or on a physical machine (§74). Online-capable processors under any boot: QEMU never sets the flag, so it is host-tested only. A machine short of memory for its tables: host-tested.
+- **Not shown:** anything under KVM, in CI or on a physical machine (§74). Online-capable processors under any boot: QEMU never sets the flag, so it is host-tested only. A machine short of memory for its tables: only the search for the largest count that fits is host-tested, with a stand-in for the heap; nothing tests a heap that fails, the count falling with it, or the "held back" line under a shortage (the review's first record correction).
 - **Open, for other tasks:**
   - a processor first seen through ACPI's namespace has no reserved index (the hot-plug task; research ledger, gap 6);
   - parallel start-up (D8): 64 APs take about 1.8 s under QEMU, and 287 took 16.5 s;
   - the "CPU indexes" line names only memory and the stacks' region as what holds a processor back, which is all that can today (AC-3).
+
+**Review (2026-11-14).** One AI reviewer, started by the coordinating session, read `e6fd12c..0c8e34e` read-only, before it read the hand-over: `docs/engineering/REVIEW_T58_2026-11-14.md`. It found no High, two Medium, seven Low and five informational findings, and eight places where a record said more than the code or the tests show. It confirmed that the new `unsafe` block's argument holds, that every per-processor lookup is bounds-checked, that no ring-3 path reaches a processor index, and that the MADT parsing matches ACPI 6.6's tables. No person has reviewed this code. The coordinating session's rulings, as built:
+
+| Finding | Commit | What changed |
+|---|---|---|
+| F1 (Medium) | `334a084` | The processors above APIC ID 255 get NVMe queues first, so `boot-sparse` proves interrupts through remapping to IDs 256, 300 and 412; its checker requires those lines |
+| F2 (Medium) | `7a3ad9e` | Every `PerCpu` names itself, and a lookup that finds no element below `cpu::count()` stops the kernel, naming the table. `percpu-gate` refuses aliases, a `PerCpu` inside another type or a `const`, and any mention other than `sizing.table(&crate::…)`, with one host control each |
+| F3 | `334a084` | The per-processor NVMe proof counts the queue slots filled against the controller's own numbers |
+| F4 | `334a084` | The IOMMU proof checks every MSI-X entry written, a queue later refused or not |
+| F5 | `334a084` | "Not proven" is judged on the controller's own queues, MSI-X table and BAR, each printed |
+| F6 | `7a3ad9e` | `mark_online` says whether a record exists; an AP with none refuses its start-up |
+| F7 | `7a3ad9e` | A table sized twice lowers the count to what it holds |
+| F8 | `690dcf0` | An AP's GDT, TSS and start-up record are allocated fallibly, freed on failure; the stacks' region grows before the tables are sized for its room. No `unsafe` added, one removed |
+| F9 | `963307c` | The fair-share allowance is keyed to three named machines, not the host; the change to ADR-0013 R8 is pending owner item 308 |
+| F10 | the records commit after these | Matrix row A08-D5 names literals and struct fields among what the gate cannot see |
+| F11 | `8e54423` | A processor listed again keeps its most usable listing, and disagreements are counted on the "ACPI MADT" line |
+| F12 | `690dcf0` | A region that could not grow for want of memory says so on the "CPU indexes" line |
+| F13 | the records commit after these | The console budget's growth on small machines, recorded above |
+| F14 | none | Stays CL40, owed |
+
+The eight record corrections are in the records commit after these: this result, STATUS, ADR-0008's "As built" rows D1, D3 and D6, ADR-0013's oversubscribed entry, threat row T43, matrix row A08-D1, and the hand-over note in the notes folder.

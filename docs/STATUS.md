@@ -9,17 +9,17 @@
 
 ## Any processor count (ADR-0008 Amendment 1, D1 to D8; TASKS item 58; 2026-11-13 and 2026-11-14)
 
-On `claude/any-cpu-count`, from the fourth batch (`land/s4-part2`) with S4-3 merged; **not landed and not pushed, and not reviewed by a person or an independent session.** The owner asked on 2026-11-13 that the kernel use every processor a machine has, whatever the number.
+On `claude/any-cpu-count`, from the fourth batch (`land/s4-part2`) with S4-3 merged; **not landed and not pushed. One AI reviewer has read it (`docs/engineering/REVIEW_T58_2026-11-14.md`: no High, two Medium, seven Low, five informational), and every finding is fixed or recorded on the branch; no person has reviewed it.** The owner asked on 2026-11-13 that the kernel use every processor a machine has, whatever the number.
 
-- **Sized at discovery.** Each of the kernel's 27 per-processor tables is a `PerCpu` (5,062 bytes an index): the boot processor's slot is in the image, and the rest are allocated once, after the MADT and before the first INIT. `cpu::count()` is then fixed. `MAX_CPUS` is gone, and `cargo xtask percpu-gate` keeps it and any array sized by a processor count out.
+- **Sized at discovery.** Each of the kernel's 27 per-processor tables is a `PerCpu` (5,062 bytes an index): the boot processor's slot is in the image, and the rest are allocated once, after the MADT and before the first INIT. `cpu::count()` is then fixed. `MAX_CPUS` is gone, and `cargo xtask percpu-gate` keeps it and any array sized by a processor count out. A table missed fails closed: the kernel stops, naming it, and the gate refuses an alias of `PerCpu`, one held inside another type, and any mention of a table but its sizing call (review finding F2).
 - **The shootdown** keeps a record on its own cache line for each processor, behind a trait, and scans the indexed processors: fewer than 64 on a small machine.
 - **The kernel stacks' region** grows to 32 slots a processor inside a 1 TiB reserve (room for 262,144), and its base stays random.
-- **Online-capable processors** get reserved indexes, read from MADT revision 5 on. **NVMe** gives queues while the controller has them.
+- **Online-capable processors** get reserved indexes, read from MADT revision 5 on. **NVMe** gives queues while the controller has them, to the processors above APIC ID 255 first (F1).
 - **One line** reports the indexes, the bytes and every bound that held a processor back. Start-up stays serial, and its total is printed.
 
 **What is shown, under QEMU's software processor on the development Mac only:**
 - the kernel boot at 1, 2, 3, 4 and 65 processors, under Intel VT-d and AMD-Vi: at 65, all online, 64 APs in about 2 s, and 62 with their own NVMe queue;
-- the 67-processor sparse machine, with APIC IDs 256, 300 and 412 above 255 (decision item 294);
+- the 67-processor sparse machine, with APIC IDs 256, 300 and 412 above 255 (decision item 294). Since the review's F1 those three get NVMe queues first, and NVMe interrupts through remapping are proven to each of them there. Before it they got none, so no device interrupt reached an ID above 255 on that machine;
 - the discovery machine: 2 enabled of the 4,096 the MADT lists;
 - one boot that brought 288 processors online: `cargo xtask boot-many`, outside the gate.
 
@@ -29,7 +29,7 @@ On `claude/any-cpu-count`, from the fourth batch (`land/s4-part2`) with S4-3 mer
 - `boot-matrix`: 1,081 s.
 - Controls: AC-1 to AC-6 failed where aimed, and AC-7 passed (ADR-0013).
 
-**Not shown:** anything under KVM or on a real processor. CI has not built this. The new machines run in CI only once measured and accepted (D7).
+**Not shown:** anything under KVM or on a real processor. CI has not built this. The new machines run in CI only once measured and accepted (D7). A machine short of memory for its tables: only the search for the largest count that fits is host-tested, with a stand-in for the heap.
 
 **Open:**
 - **The 288-processor run stays outside `boot-matrix`** (decision item 294): QEMU disturbs its timing on this host. The 67-processor sparse machine is the gate's large machine instead.
