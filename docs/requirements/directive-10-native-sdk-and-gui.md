@@ -47,11 +47,18 @@ One row for each statement of CLAUDE.md in §48 to §53. The columns and their r
 | S49-23 | Implement typed SDKs for: Localization. | build | both/hw | 19 | not-started | - | - | - | - | none | - | - |
 | S49-24 | Implement typed SDKs for: Compute. | build | both/hw | 19 | not-started | - | - | - | - | none | - | - |
 | S49-25 | Implement typed SDKs for: Diagnostics. | build | both/hw | 19 | not-started | - | - | - | - | none | - | - |
+| S49-32 | Implement typed SDKs for: Origin UI. | build | both/hw | 19 | not-started | - | - | - | - | none | - | 297 |
+| S49-33 | Implement typed SDKs for: Windows and display. | build | both/hw | 19 | not-started | - | - | - | - | none | - | 297 |
+| S49-34 | Implement typed SDKs for: Desktop shell. | build | both/hw | 19 | not-started | - | - | - | - | none | - | 297 |
+| S49-35 | Implement typed SDKs for: Settings. | build | both/hw | 19 | not-started | - | - | - | - | none | - | 297 |
+| S49-36 | Implement typed SDKs for: Time. | build | both/hw | 19 | not-started | - | - | - | - | none | - | 297 |
+| S49-37 | Implement typed SDKs for: Developer tools. | build | both/hw | 19 | not-started | - | - | - | - | none | - | 297 |
 | S49-26 | Implement typed SDKs for: Remote administration. | build | both/hw | 19 | not-started | - | - | - | - | none | - | 81 |
 | S49-27 | Implement typed SDKs for: Service management. | build | both/hw | 19 | not-started | - | - | - | - | none | - | 81 |
 | S49-28 | Implement typed SDKs for: Hardware health. | build | both/hw | 19 | not-started | - | - | - | - | none | - | 81 |
 | S49-29 | Implement typed SDKs for: Remote desktop. | build | both/hw | 19 | not-started | - | - | - | - | none | - | 81 |
 | S49-30 | The last four serve Origin Server first (ADR-0014 S7). Device technologies follow §31's three layers (ADR-0015). | info | - | 19 | - | - | - | - | - | none | - | - |
+| S49-38 | A module that several of these SDKs use, and that programs outside the release do not, has a first-party interface with no promise across releases (ADR-0011 Amendment 4). | build | both/hw | 19 | not-started | - | - | - | - | none | - | 299 |
 | S49-31 | Support stable versioned APIs and a C-compatible ABI. | build | both/hw | 19 | partial | developer-tools/oidl, sdk/interfaces | Every SDK interface is versioned, has a generated C header, and keeps its ABI across a major version. | file:developer-tools/oidl/tests/generated.rs, xtask:interface-gate | host | none | The interface language versions each interface and generates a C header, which its tests compile. No SDK library is built from one. | - |
 | S50-01 | Build: Native windows. | build | both/hw | 20 | not-started | - | - | - | - | none | - | - |
 | S50-02 | Build: Controls. | build | both/hw | 20 | not-started | - | - | - | - | none | - | - |
