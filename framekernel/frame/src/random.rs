@@ -152,7 +152,8 @@ const _: () = assert!(seed::EXTRA_LEN as u64 == origin_boot_info::BOOT_SEED_LEN)
 /// Every processor's generator (R7: one slot for each processor index; the boot processor's in
 /// the kernel's image, the others' allocated once at discovery and never freed, as R7 foresaw:
 /// ADR-0008 Amendment 1, D1).
-pub(crate) static SLOTS: PerCpu<Slot> = PerCpu::new(Slot::new(), Slot::new);
+pub(crate) static SLOTS: PerCpu<Slot> =
+    PerCpu::new("origin_frame::random::SLOTS", Slot::new(), Slot::new);
 /// The root (R7): behind a lock that is held for one step and never across a draw.
 static ROOT: SpinLock<Root> = SpinLock::new(Root::new());
 /// There is a root: requests can be answered.

@@ -430,8 +430,11 @@ impl core::fmt::Display for Named {
 const UNASSIGNED: u32 = crate::limits::BROADCAST;
 /// Each CPU index's x2APIC ID, or [`UNASSIGNED`]. Written once per index, before that
 /// processor runs any kernel code that reads it.
-pub(crate) static APIC_IDS: PerCpu<AtomicU32> =
-    PerCpu::new(AtomicU32::new(UNASSIGNED), || AtomicU32::new(UNASSIGNED));
+pub(crate) static APIC_IDS: PerCpu<AtomicU32> = PerCpu::new(
+    "origin_frame::cpu::APIC_IDS",
+    AtomicU32::new(UNASSIGNED),
+    || AtomicU32::new(UNASSIGNED),
+);
 
 /// Records that the processor with CPU index `index` has x2APIC ID `apic_id`. The boot
 /// processor records itself in [`init`]; `smp` records every other processor at discovery,
@@ -477,7 +480,11 @@ impl CpuLocal {
 
 /// Each CPU index's CPU-local area. The boot processor's is in the kernel's image; the others'
 /// are on the heap from discovery on, and never move, so GS's base stays valid.
-pub(crate) static CPU_LOCAL: PerCpu<CpuLocal> = PerCpu::new(CpuLocal::new(), CpuLocal::new);
+pub(crate) static CPU_LOCAL: PerCpu<CpuLocal> = PerCpu::new(
+    "origin_frame::cpu::CPU_LOCAL",
+    CpuLocal::new(),
+    CpuLocal::new,
+);
 /// The area of a processor that has no CPU index (its APIC ID is not the one assigned to
 /// the index it was given): its index reads as `u64::MAX`, which names no array slot, so it
 /// never schedules.
@@ -620,10 +627,11 @@ fn cpu_state_holds() -> bool {
 }
 
 /// Each CPU index whose processor passed [`cpu_state_holds`] on itself.
-pub(crate) static CPU_STATE_HOLDS: PerCpu<core::sync::atomic::AtomicBool> =
-    PerCpu::new(core::sync::atomic::AtomicBool::new(false), || {
-        core::sync::atomic::AtomicBool::new(false)
-    });
+pub(crate) static CPU_STATE_HOLDS: PerCpu<core::sync::atomic::AtomicBool> = PerCpu::new(
+    "origin_frame::cpu::CPU_STATE_HOLDS",
+    core::sync::atomic::AtomicBool::new(false),
+    || core::sync::atomic::AtomicBool::new(false),
+);
 
 /// Records whether this processor's control state holds, after `enable_simd`. The boot
 /// processor and every AP do it on themselves; an AP before its handshake, which orders the
@@ -741,10 +749,11 @@ pub(crate) const SAVED_FRAME_SLOTS: usize = 32;
 /// yielding, sleeping or blocked) or a new thread's first frame. Only these are ever
 /// resumed, so a wrong answer from the scheduler above cannot make the trap entry load anything
 /// else. 0 is an empty slot.
-pub(crate) static SAVED_FRAMES: PerCpu<[AtomicU64; SAVED_FRAME_SLOTS]> =
-    PerCpu::new([const { AtomicU64::new(0) }; SAVED_FRAME_SLOTS], || {
-        [const { AtomicU64::new(0) }; SAVED_FRAME_SLOTS]
-    });
+pub(crate) static SAVED_FRAMES: PerCpu<[AtomicU64; SAVED_FRAME_SLOTS]> = PerCpu::new(
+    "origin_frame::cpu::SAVED_FRAMES",
+    [const { AtomicU64::new(0) }; SAVED_FRAME_SLOTS],
+    || [const { AtomicU64::new(0) }; SAVED_FRAME_SLOTS],
+);
 
 /// Records `frame` as a saved frame of processor `cpu`: a thread's first frame, or one the
 /// trap entry saved. `false` if the table is full (it cannot be: see the slot count).
@@ -1901,10 +1910,11 @@ pub unsafe fn probe_execute(target: u64) -> Probe {
 /// IA32_PAT.
 const IA32_PAT: u32 = 0x277;
 /// Each CPU index whose processor's PAT holds the two memory types the page tables use.
-pub(crate) static PAT_READY: PerCpu<core::sync::atomic::AtomicBool> =
-    PerCpu::new(core::sync::atomic::AtomicBool::new(false), || {
-        core::sync::atomic::AtomicBool::new(false)
-    });
+pub(crate) static PAT_READY: PerCpu<core::sync::atomic::AtomicBool> = PerCpu::new(
+    "origin_frame::cpu::PAT_READY",
+    core::sync::atomic::AtomicBool::new(false),
+    || core::sync::atomic::AtomicBool::new(false),
+);
 
 /// Checks that this processor's PAT has entry 0 write-back (06h) and entry 3 uncached
 /// (00h), the memory types `paging::Cache` selects (Intel SDM Vol. 3A §11.12.2,

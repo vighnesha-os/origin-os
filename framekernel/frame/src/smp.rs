@@ -520,10 +520,11 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 /// What each processor read from CPUID about its own topology, by CPU index (CLAUDE.md §24,
 /// §27; ADR-0008 C2). A hybrid part's leaves can differ between logical processors, so each
 /// processor writes its own slot on itself ([`record_topology`]), before it reports online.
-pub(crate) static TOPOLOGY: PerCpu<crate::sync::SpinLock<Option<CpuTopology>>> =
-    PerCpu::new(crate::sync::SpinLock::new(None), || {
-        crate::sync::SpinLock::new(None)
-    });
+pub(crate) static TOPOLOGY: PerCpu<crate::sync::SpinLock<Option<CpuTopology>>> = PerCpu::new(
+    "origin_frame::smp::TOPOLOGY",
+    crate::sync::SpinLock::new(None),
+    || crate::sync::SpinLock::new(None),
+);
 
 /// Reads this processor's topology from CPUID and records it under its CPU index. The
 /// boot processor and every AP call this once, on themselves.
@@ -820,6 +821,9 @@ fn start_one(
         Outcome::Refused(Refusal::NotMine) | Outcome::Answered(_) => {
             "a different processor answered; parked by INIT"
         }
+        Outcome::Refused(Refusal::NoRecord) => {
+            "no TLB shootdown record for its CPU index; parked by INIT"
+        }
     }))
 }
 
@@ -970,6 +974,14 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
         // Not the processor this index was given to: refuse, and do nothing more (no
         // timer, no scheduler; interrupts stay disabled) until the boot processor parks it.
         let _ = start.handshake.refuse(Refusal::NotMine);
+        cpu::halt();
+    }
+    // Its record in the TLB shootdown: without one it would never be asked to flush, and an
+    // address space could be freed under it. Every table is sized before any AP starts, so this
+    // holds unless a table was missed; then it refuses and stays out (review finding F6 of
+    // 2026-11-14).
+    if !crate::tlb::has_record(start.index) {
+        let _ = start.handshake.refuse(Refusal::NoRecord);
         cpu::halt();
     }
     // This processor's topology, read on itself: its leaves are its own (CLAUDE.md §24, §27).

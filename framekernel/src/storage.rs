@@ -333,18 +333,30 @@ struct Driver {
 
 static DRIVER: SpinLock<Option<Driver>> = SpinLock::new(None);
 /// Per processor (by CPU index): woken by the completion interrupts routed there.
-pub(crate) static IO_WAIT: PerCpu<WaitQueue> = PerCpu::new(WaitQueue::new(), WaitQueue::new);
+pub(crate) static IO_WAIT: PerCpu<WaitQueue> = PerCpu::new(
+    "framekernel::storage::IO_WAIT",
+    WaitQueue::new(),
+    WaitQueue::new,
+);
 /// Per processor: completion interrupts taken there.
-pub(crate) static CPU_INTERRUPTS: PerCpu<AtomicU64> =
-    PerCpu::new(AtomicU64::new(0), || AtomicU64::new(0));
+pub(crate) static CPU_INTERRUPTS: PerCpu<AtomicU64> = PerCpu::new(
+    "framekernel::storage::CPU_INTERRUPTS",
+    AtomicU64::new(0),
+    || AtomicU64::new(0),
+);
 /// Per processor: completion interrupts taken there that found a thread waiting on its
 /// queue and woke it.
 pub(crate) static CPU_WAKES: PerCpu<AtomicU64> =
-    PerCpu::new(AtomicU64::new(0), || AtomicU64::new(0));
+    PerCpu::new("framekernel::storage::CPU_WAKES", AtomicU64::new(0), || {
+        AtomicU64::new(0)
+    });
 /// Per processor: how often threads there blocked waiting for a completion.
-pub(crate) static CPU_BLOCKS: PerCpu<AtomicU64> =
-    PerCpu::new(AtomicU64::new(0), || AtomicU64::new(0));
-/// The processors given an I/O queue of their own, the first this many of those online
+pub(crate) static CPU_BLOCKS: PerCpu<AtomicU64> = PerCpu::new(
+    "framekernel::storage::CPU_BLOCKS",
+    AtomicU64::new(0),
+    || AtomicU64::new(0),
+);
+/// The processors given an I/O queue of their own: the first this many in [`queue_order`]
 /// (ADR-0008 Amendment 1, D6).
 static QUEUED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
@@ -1158,17 +1170,21 @@ pub(crate) struct CpuQueue {
     stride: u64,
 }
 
-pub(crate) static CPU_QUEUES: PerCpu<SpinLock<Option<CpuQueue>>> =
-    PerCpu::new(SpinLock::new(None), || SpinLock::new(None));
+pub(crate) static CPU_QUEUES: PerCpu<SpinLock<Option<CpuQueue>>> = PerCpu::new(
+    "framekernel::storage::CPU_QUEUES",
+    SpinLock::new(None),
+    || SpinLock::new(None),
+);
 
 /// Reads each processor's thread makes, of 8 blocks each.
 const CPU_READS: u64 = 32;
 /// Per processor: reads done, blocks matched, and whether its write read back (each plus
 /// one once set).
-pub(crate) static CPU_RESULT: PerCpu<[AtomicU64; 3]> =
-    PerCpu::new([const { AtomicU64::new(0) }; 3], || {
-        [const { AtomicU64::new(0) }; 3]
-    });
+pub(crate) static CPU_RESULT: PerCpu<[AtomicU64; 3]> = PerCpu::new(
+    "framekernel::storage::CPU_RESULT",
+    [const { AtomicU64::new(0) }; 3],
+    || [const { AtomicU64::new(0) }; 3],
+);
 
 /// The order processors get I/O queues of their own when the controller has fewer than there
 /// are processors (ADR-0008 Amendment 1, D6, which leaves the order open; review finding F1 of

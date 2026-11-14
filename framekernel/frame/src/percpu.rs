@@ -12,7 +12,14 @@
 //!   published once and never resized, moved or freed.
 //!
 //! Every table of a crate is sized in that crate's one sizing function (`size_per_cpu`), called
-//! once, and `cargo xtask check` refuses a `PerCpu` static that function does not name.
+//! once, as `sizing.table(&crate::…)`, and `cargo xtask check` refuses a `PerCpu` static that
+//! function does not name, a type alias of `PerCpu`, and a `PerCpu` held inside another type.
+//!
+//! What the gate cannot see, the run time refuses (review finding F2 of 2026-11-14): once the
+//! processor count is fixed, every table holds every index below it, so a lookup that finds no
+//! element for an index below [`crate::cpu::count`] means a table was never sized, and the
+//! kernel stops, naming the table, rather than run on with that processor's state dropped. The
+//! check is on the path that finds nothing, never on a lookup that finds its element.
 //!
 //! A table that cannot get its memory is sized for as many indexes as the heap allows, and says
 //! how many ([`Sizing`]); the processors past the fewest any table holds stay in firmware
@@ -30,6 +37,9 @@ use crate::once::SetOnce;
 /// A table with one `T` for each processor index: the boot processor's in the kernel's image,
 /// the others' on the heap once sized.
 pub struct PerCpu<T: 'static> {
+    /// The table's name, `<crate>::<module>::<STATIC>`, which the gate checks against where it
+    /// is defined: what the kernel names if a lookup finds the table unsized.
+    name: &'static str,
     /// Index 0's element, the boot processor's.
     boot: T,
     /// A new element, as `boot` was before the boot processor used it: what sizing gives every
@@ -44,6 +54,7 @@ pub struct PerCpu<T: 'static> {
 impl<T> core::fmt::Debug for PerCpu<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PerCpu")
+            .field("name", &self.name)
             .field("indexes", &self.indexes())
             .finish_non_exhaustive()
     }
@@ -57,10 +68,12 @@ pub enum SizeError {
 }
 
 impl<T> PerCpu<T> {
-    /// A table holding the boot processor's element, `boot`, alone; [`PerCpu::size`] gives each
-    /// other index `fresh()`, which makes what `boot` is.
-    pub const fn new(boot: T, fresh: fn() -> T) -> Self {
+    /// A table named `name` (`<crate>::<module>::<STATIC>`) holding the boot processor's element,
+    /// `boot`, alone; [`PerCpu::size`] gives each other index `fresh()`, which makes what `boot`
+    /// is.
+    pub const fn new(name: &'static str, boot: T, fresh: fn() -> T) -> Self {
         Self {
+            name,
             boot,
             fresh,
             rest: SetOnce::new(),
@@ -68,13 +81,42 @@ impl<T> PerCpu<T> {
         }
     }
 
-    /// Processor `index`'s element, or `None` past the indexes the table holds.
+    /// Processor `index`'s element, or `None` past the indexes the kernel has.
+    ///
+    /// # Panics
+    ///
+    /// If the table does not hold `index` although `index` is below [`crate::cpu::count`]: it
+    /// was not sized (review finding F2 of 2026-11-14).
     #[inline]
     pub fn get(&self, index: usize) -> Option<&T> {
-        match index.checked_sub(1) {
-            None => Some(&self.boot),
-            Some(past) => self.rest.get()?.get(past),
+        let found = match index.checked_sub(1) {
+            None => return Some(&self.boot),
+            Some(past) => self.rest.get().and_then(|rest| rest.get(past)),
+        };
+        if found.is_none() {
+            self.not_held(index);
         }
+        found
+    }
+
+    /// The table's name.
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Called only when [`PerCpu::get`] finds no element. An index the kernel has that the table
+    /// does not hold means the table was never sized: running on would drop that processor's
+    /// state, or, for the shootdown's records, leave it out of every flush.
+    #[cold]
+    #[inline(never)]
+    fn not_held(&self, index: usize) {
+        let count = required();
+        assert!(
+            index >= count,
+            "per-CPU table {} holds {} indexes, not processor index {index} of the {count} the kernel has: it was not sized (ADR-0008 Amendment 1, D1)",
+            self.name,
+            self.indexes()
+        );
     }
 
     /// The indexes the table holds: 1 until it is sized, never 0.
@@ -143,6 +185,25 @@ impl<T> PerCpu<T> {
     }
 }
 
+/// The indexes every table must hold: [`crate::cpu::count`], fixed once every table is sized and
+/// before any application processor starts, so 1 while tables are sized.
+#[cfg(target_os = "none")]
+fn required() -> usize {
+    crate::cpu::count()
+}
+
+/// Host builds have no processors: a host test sets the count it needs, on its own thread.
+#[cfg(all(not(target_os = "none"), test))]
+fn required() -> usize {
+    tests::REQUIRED.with(core::cell::Cell::get)
+}
+
+/// Host builds outside tests have the boot processor alone.
+#[cfg(all(not(target_os = "none"), not(test)))]
+fn required() -> usize {
+    1
+}
+
 /// The largest `n` in `0..=wanted` for which `fits(n)` holds, given that `fits` holds for every
 /// `n` below one it holds for, and for 0. `wanted` itself is tried first, so a heap with room for
 /// it is asked once.
@@ -199,7 +260,12 @@ impl Sizing {
                 self.bytes_per_index += PerCpu::<T>::element_bytes();
                 self.tables += 1;
             }
-            Err(SizeError::Already) => self.again += 1,
+            // A table sized before holds what it holds: the count may not pass it (review
+            // finding F7 of 2026-11-14).
+            Err(SizeError::Already) => {
+                self.reached = self.reached.min(table.indexes());
+                self.again += 1;
+            }
         }
     }
 }
@@ -231,11 +297,22 @@ mod tests {
     use super::*;
     use core::sync::atomic::AtomicU64;
 
+    std::thread_local! {
+        /// The processor count `required` reports on this test thread.
+        pub(super) static REQUIRED: core::cell::Cell<usize> = const { core::cell::Cell::new(1) };
+    }
+
+    fn set_required(count: usize) {
+        REQUIRED.with(|r| r.set(count));
+    }
+
     #[test]
     fn before_sizing_the_boot_slot_alone_and_it_never_moves() {
-        let table = Box::leak(Box::new(PerCpu::new(AtomicU64::new(7), || {
-            AtomicU64::new(0)
-        })));
+        let table = Box::leak(Box::new(PerCpu::new(
+            "tests::LEAKED",
+            AtomicU64::new(7),
+            || AtomicU64::new(0),
+        )));
         assert_eq!(table.indexes(), 1);
         assert!(!table.is_sized());
         let boot = table.get(0).unwrap() as *const AtomicU64;
@@ -255,13 +332,13 @@ mod tests {
 
     #[test]
     fn a_table_is_sized_once_with_fresh_elements() {
-        let table = PerCpu::new(0u8, || 5);
+        let table = PerCpu::new("tests::TABLE", 0u8, || 5);
         assert_eq!(table.size(3), Ok(3));
         assert_eq!(table.get(2), Some(&5), "a fresh element");
         assert_eq!(table.size(9), Err(SizeError::Already));
         assert_eq!(table.size_with(9, |_| 2), Err(SizeError::Already));
         assert_eq!(table.indexes(), 3);
-        let single = PerCpu::new(0u8, || 0);
+        let single = PerCpu::new("tests::SINGLE", 0u8, || 0);
         assert_eq!(single.size(1), Ok(1));
         assert!(single.is_sized());
         assert_eq!(
@@ -269,7 +346,7 @@ mod tests {
             Err(SizeError::Already),
             "even one index is a sizing"
         );
-        let none = PerCpu::new(0u8, || 0);
+        let none = PerCpu::new("tests::NONE", 0u8, || 0);
         assert_eq!(
             none.size(0),
             Ok(1),
@@ -281,7 +358,7 @@ mod tests {
     #[test]
     fn tables_hold_any_count() {
         for count in [1, 2, 3, 64, 65, 300, 1000, 4097, 70_000] {
-            let table = PerCpu::new(0u32, || 0);
+            let table = PerCpu::new("tests::ANY", 0u32, || 0);
             assert_eq!(table.size_with(count, |i| i as u32), Ok(count), "{count}");
             assert_eq!(table.indexes(), count);
             assert_eq!(table.get(count - 1).copied(), Some(count as u32 - 1));
@@ -309,8 +386,8 @@ mod tests {
 
     #[test]
     fn sizing_reaches_the_fewest_any_table_holds_and_counts_every_table() {
-        static A: PerCpu<u64> = PerCpu::new(0, || 1);
-        static B: PerCpu<[u8; 3]> = PerCpu::new([0; 3], || [1; 3]);
+        static A: PerCpu<u64> = PerCpu::new("tests::A", 0, || 1);
+        static B: PerCpu<[u8; 3]> = PerCpu::new("tests::B", [0; 3], || [1; 3]);
         let mut sizing = Sizing::new(5);
         sizing.table(&A);
         sizing.table(&B);
@@ -335,9 +412,10 @@ mod tests {
 
     #[test]
     fn lookups_from_many_threads_see_whole_elements() {
-        static T: PerCpu<[AtomicU64; 4]> = PerCpu::new([const { AtomicU64::new(0) }; 4], || {
-            [const { AtomicU64::new(0) }; 4]
-        });
+        static T: PerCpu<[AtomicU64; 4]> =
+            PerCpu::new("tests::T", [const { AtomicU64::new(0) }; 4], || {
+                [const { AtomicU64::new(0) }; 4]
+            });
         std::thread::scope(|s| {
             let readers: Vec<_> = (0..4)
                 .map(|_| {
@@ -359,5 +437,44 @@ mod tests {
                 assert_eq!(r.join().unwrap(), 4 * 63);
             }
         });
+    }
+    /// Review finding F2 of 2026-11-14: an index the kernel has that a table does not hold
+    /// stops the kernel, naming the table; an index past the count is only absent.
+    #[test]
+    fn an_unsized_table_fails_closed_naming_itself() {
+        set_required(5);
+        let sized = PerCpu::new("tests::SIZED", 0u8, || 1);
+        assert_eq!(sized.size(5), Ok(5));
+        assert_eq!(sized.get(4), Some(&1));
+        assert_eq!(sized.get(5), None, "past the count: absent, no panic");
+        let missed = PerCpu::new("origin_frame::tlb::MISSED", 0u8, || 1);
+        assert_eq!(missed.get(0), Some(&0), "the boot slot is always there");
+        let caught =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| missed.get(1).copied()));
+        let message = caught
+            .expect_err("index 1 of 5 in an unsized table")
+            .downcast::<String>()
+            .map(|m| *m)
+            .unwrap_or_default();
+        assert!(
+            message.contains("per-CPU table origin_frame::tlb::MISSED holds 1 indexes, not processor index 1 of the 5"),
+            "{message}"
+        );
+        assert_eq!(missed.get(5), None);
+        set_required(1);
+        assert_eq!(missed.get(1), None, "before the count is fixed: absent");
+    }
+
+    /// Review finding F7 of 2026-11-14: a table sized before, with fewer indexes, lowers what
+    /// sizing reached.
+    #[test]
+    fn a_table_sized_before_bounds_what_sizing_reached() {
+        static EARLY: PerCpu<u8> = PerCpu::new("tests::EARLY", 0, || 0);
+        static LATER: PerCpu<u8> = PerCpu::new("tests::LATER", 0, || 0);
+        assert_eq!(EARLY.size(3), Ok(3));
+        let mut sizing = Sizing::new(8);
+        sizing.table(&LATER);
+        sizing.table(&EARLY);
+        assert_eq!((sizing.reached, sizing.tables, sizing.again), (3, 1, 1));
     }
 }

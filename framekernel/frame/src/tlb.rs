@@ -39,9 +39,11 @@ const ICR_ASSERT: u32 = 1 << 14;
 
 /// Each processor's part in the shootdown protocol, each on a cache line of its own (ADR-0008
 /// Amendment 1, D1).
-pub(crate) static RECORDS: PerCpu<Record> = PerCpu::new(Record::new(), Record::new);
+pub(crate) static RECORDS: PerCpu<Record> =
+    PerCpu::new("origin_frame::tlb::RECORDS", Record::new(), Record::new);
 /// The initiator's mark for each processor.
-pub(crate) static ASKED: PerCpu<Asked> = PerCpu::new(Asked::new(), Asked::new);
+pub(crate) static ASKED: PerCpu<Asked> =
+    PerCpu::new("origin_frame::tlb::ASKED", Asked::new(), Asked::new);
 
 /// The protocol's per-processor storage: [`RECORDS`] and [`ASKED`], sized together at discovery.
 struct Tables;
@@ -67,8 +69,11 @@ static SHOOTDOWN: Shootdown<Tables> = Shootdown::new(Tables);
 /// TSC cycles the last completed shootdown took, for the boot report.
 pub static LAST_CYCLES: AtomicU64 = AtomicU64::new(0);
 /// Each CPU index whose processor turned on global pages.
-pub static GLOBAL_PAGES: PerCpu<AtomicBool> =
-    PerCpu::new(AtomicBool::new(false), || AtomicBool::new(false));
+pub static GLOBAL_PAGES: PerCpu<AtomicBool> = PerCpu::new(
+    "origin_frame::tlb::GLOBAL_PAGES",
+    AtomicBool::new(false),
+    || AtomicBool::new(false),
+);
 
 /// What the protocol asks of the processor it runs on.
 struct Hardware;
@@ -144,9 +149,16 @@ pub unsafe fn enable_global_pages() -> bool {
     on
 }
 
-/// Makes this processor a shootdown target, then flushes its whole TLB.
-pub fn mark_online() {
-    SHOOTDOWN.mark_online(&Hardware);
+/// Makes this processor a shootdown target, then flushes its whole TLB. Returns whether it has a
+/// record; one that has none is not made a target and must stay out (review finding F6).
+pub fn mark_online() -> bool {
+    SHOOTDOWN.mark_online(&Hardware)
+}
+
+/// Whether processor `index` has a record in the shootdown, so it can be asked to flush. An AP
+/// without one refuses its start-up (`smp::ap_entry`; review finding F6 of 2026-11-14).
+pub fn has_record(index: CpuIndex) -> bool {
+    SHOOTDOWN.has_record(index.get())
 }
 
 /// Runs `load` (the CR3 write) as this processor's move to address space `to`, with the record
@@ -184,7 +196,9 @@ pub fn service() {
 
 /// How many shootdown interrupts each processor has taken.
 pub(crate) static INTERRUPTS: PerCpu<AtomicU64> =
-    PerCpu::new(AtomicU64::new(0), || AtomicU64::new(0));
+    PerCpu::new("origin_frame::tlb::INTERRUPTS", AtomicU64::new(0), || {
+        AtomicU64::new(0)
+    });
 
 /// The shootdown interrupt.
 pub(crate) fn interrupted() {

@@ -173,9 +173,11 @@ const ICR_ASSERT: u32 = 1 << 14;
 
 /// Each CPU index whose local APIC [`X2Apic::enable`] switched to x2APIC mode.
 pub(crate) static X2APIC_READY: crate::percpu::PerCpu<core::sync::atomic::AtomicBool> =
-    crate::percpu::PerCpu::new(core::sync::atomic::AtomicBool::new(false), || {
-        core::sync::atomic::AtomicBool::new(false)
-    });
+    crate::percpu::PerCpu::new(
+        "origin_frame::timer::X2APIC_READY",
+        core::sync::atomic::AtomicBool::new(false),
+        || core::sync::atomic::AtomicBool::new(false),
+    );
 
 /// Sends the reschedule IPI to the processor with APIC ID `apic_id`: its handler acknowledges
 /// and switches through that processor's own run queue. Nothing happens if this processor's

@@ -380,7 +380,11 @@ const RECORDED: u64 = 1 << 62;
 const HELD: u64 = 1 << 61;
 
 /// Each processor's plan, as [`Plan::to_bits`], with [`HELD`]. 0: nothing recorded.
-pub(crate) static RECORDS: PerCpu<AtomicU64> = PerCpu::new(AtomicU64::new(0), || AtomicU64::new(0));
+pub(crate) static RECORDS: PerCpu<AtomicU64> = PerCpu::new(
+    "origin_frame::speculation::RECORDS",
+    AtomicU64::new(0),
+    || AtomicU64::new(0),
+);
 
 /// Records what processor `cpu` decided and whether its registers read back that way. Each
 /// processor does it on itself, once, as it starts.
@@ -476,7 +480,11 @@ impl Default for Ledger {
 }
 
 /// Each processor's ledger of process changes.
-pub(crate) static LEDGERS: PerCpu<Ledger> = PerCpu::new(Ledger::new(), Ledger::new);
+pub(crate) static LEDGERS: PerCpu<Ledger> = PerCpu::new(
+    "origin_frame::speculation::LEDGERS",
+    Ledger::new(),
+    Ledger::new,
+);
 
 /// [`Ledger::enters`] for processor `cpu`, with what that processor recorded about IBPB.
 /// False for a processor that recorded nothing: it has not said the command exists.

@@ -542,15 +542,26 @@ impl<S: Records> Shootdown<S> {
         self.records.record(id).map(|r| &r.visiting)
     }
 
+    /// Whether processor `id` has a record: only then can it be asked to flush.
+    pub fn has_record(&self, id: usize) -> bool {
+        self.records.record(id).is_some()
+    }
+
     /// Makes this processor a target of later requests, then flushes its whole TLB, so it holds
     /// no translation older than the first request it is sent. In that order: a request whose
     /// initiator does not yet see this processor online was made before the flush.
-    pub fn mark_online(&self, hardware: &impl TlbHardware) {
-        if let Some(online) = self.online(hardware.this_cpu()) {
-            online.store(true, Ordering::Release);
-        }
+    ///
+    /// Returns whether it has a record. One that has none cannot be made a target, so it would
+    /// never be asked to flush and an address space could be freed under it: nothing is done,
+    /// and the caller must keep it out (review finding F6 of 2026-11-14).
+    pub fn mark_online(&self, hardware: &impl TlbHardware) -> bool {
+        let Some(online) = self.online(hardware.this_cpu()) else {
+            return false;
+        };
+        online.store(true, Ordering::Release);
         prim::fence(Ordering::SeqCst);
         hardware.invalidate(Request::Everything);
+        true
     }
 
     /// Moves this processor to the address space `to`, by running `load` (the CR3 write), and
@@ -979,6 +990,23 @@ mod tests {
         assert_eq!(
             Request::covering(0x7FFF_FFFF_F000, 0x7FFF_FFFF_FFFF),
             Request::page(0x7FFF_FFFF_F000)
+        );
+    }
+
+    /// Review finding F6 of 2026-11-14: a processor with no record is not made a target and
+    /// says so, so that it can be kept out.
+    #[test]
+    fn a_processor_with_no_record_cannot_come_online() {
+        let machine = Machine::default();
+        let shootdown = Shootdown::new(Held::new(2));
+        assert!(shootdown.has_record(1));
+        assert!(!shootdown.has_record(2));
+        assert!(shootdown.mark_online(&cpu(1, &machine)));
+        assert!(!shootdown.mark_online(&cpu(2, &machine)));
+        assert_eq!(
+            *machine.invalidated.lock().unwrap(),
+            [(1, Request::Everything)],
+            "the one without a record did nothing"
         );
     }
 

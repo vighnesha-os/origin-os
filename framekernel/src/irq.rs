@@ -98,7 +98,11 @@ const MASKED: u32 = 1 << 16;
 static IOAPIC_IRQS: AtomicU64 = AtomicU64::new(0);
 /// Interrupts taken on the I/O APIC's vector, by the CPU index of the processor that took them.
 pub(crate) static IOAPIC_IRQS_ON: origin_frame::percpu::PerCpu<AtomicU64> =
-    origin_frame::percpu::PerCpu::new(AtomicU64::new(0), || AtomicU64::new(0));
+    origin_frame::percpu::PerCpu::new(
+        "framekernel::irq::IOAPIC_IRQS_ON",
+        AtomicU64::new(0),
+        || AtomicU64::new(0),
+    );
 
 /// How many I/O APIC-routed interrupts have been taken.
 fn ioapic_irqs() -> u64 {

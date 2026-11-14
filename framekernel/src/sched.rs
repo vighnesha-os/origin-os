@@ -36,13 +36,16 @@ use origin_frame::trap::Switch;
 pub(crate) const THREAD_STACK: usize = 16 * 1024;
 
 /// Each processor's run queue, by CPU index (ADR-0008 Amendment 1, D1: sized at discovery).
-pub(crate) static QUEUES: PerCpu<SpinLock<RunQueue>> =
-    PerCpu::new(SpinLock::new(RunQueue::new()), || {
-        SpinLock::new(RunQueue::new())
-    });
+pub(crate) static QUEUES: PerCpu<SpinLock<RunQueue>> = PerCpu::new(
+    "framekernel::sched::QUEUES",
+    SpinLock::new(RunQueue::new()),
+    || SpinLock::new(RunQueue::new()),
+);
 /// Each processor whose scheduler runs.
 pub(crate) static ACTIVE: PerCpu<AtomicBool> =
-    PerCpu::new(AtomicBool::new(false), || AtomicBool::new(false));
+    PerCpu::new("framekernel::sched::ACTIVE", AtomicBool::new(false), || {
+        AtomicBool::new(false)
+    });
 /// Set by the boot processor once every AP's threads are queued.
 static GO: AtomicBool = AtomicBool::new(false);
 
@@ -156,10 +159,11 @@ impl Threads {
 }
 
 /// Each processor's threads, by CPU index.
-pub(crate) static THREADS: PerCpu<SpinLock<Threads>> =
-    PerCpu::new(SpinLock::new(Threads::new()), || {
-        SpinLock::new(Threads::new())
-    });
+pub(crate) static THREADS: PerCpu<SpinLock<Threads>> = PerCpu::new(
+    "framekernel::sched::THREADS",
+    SpinLock::new(Threads::new()),
+    || SpinLock::new(Threads::new()),
+);
 
 /// Times a processor picked a thread whose state was not complete (never, if the queue
 /// lock is held as it must be; the boot proof requires 0).
@@ -172,7 +176,10 @@ pub(crate) fn unready_switches() -> u64 {
 
 /// Threads that exited on each processor and await [`reap`], so a processor can tell cheaply
 /// that it has none.
-pub(crate) static ZOMBIES: PerCpu<AtomicU64> = PerCpu::new(AtomicU64::new(0), || AtomicU64::new(0));
+pub(crate) static ZOMBIES: PerCpu<AtomicU64> =
+    PerCpu::new("framekernel::sched::ZOMBIES", AtomicU64::new(0), || {
+        AtomicU64::new(0)
+    });
 
 /// Exited threads that await [`reap`] on any processor: for a proof that needs every stack
 /// given back before it counts them (`stacks`).
@@ -515,7 +522,11 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
     }
     // The boot processor split large pages and unmapped guard pages while this processor
     // waited: from now on it is sent every shootdown, and it drops every older translation.
-    crate::tlb::mark_online();
+    // Without a record it could not be sent one: it stays out, interrupts off (review finding
+    // F6 of 2026-11-14; `smp::ap_entry` refuses its start-up before this).
+    if !crate::tlb::mark_online() {
+        crate::cpu::halt();
+    }
     // This flow is the processor's idle context: it runs only when no thread is ready.
     if let Some(queue) = QUEUES.get(this_cpu()) {
         without_interrupts(|| queue.lock().set_idle(true));
@@ -537,15 +548,17 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
 /// processor sharing a physical core, or an emulated one, how many iterations a slice holds
 /// varies with what else is running, whatever the scheduler did.
 /// Two workers for each processor, worker `slot` the `slot % 2`nd of the `slot / 2`th.
-pub(crate) static PROGRESS: PerCpu<[AtomicU64; 2]> =
-    PerCpu::new([const { AtomicU64::new(0) }; 2], || {
-        [const { AtomicU64::new(0) }; 2]
-    });
+pub(crate) static PROGRESS: PerCpu<[AtomicU64; 2]> = PerCpu::new(
+    "framekernel::sched::PROGRESS",
+    [const { AtomicU64::new(0) }; 2],
+    || [const { AtomicU64::new(0) }; 2],
+);
 /// The CPU index each worker last ran on, plus one (0: never ran), as [`PROGRESS`].
-pub(crate) static RAN_ON: PerCpu<[AtomicU64; 2]> =
-    PerCpu::new([const { AtomicU64::new(0) }; 2], || {
-        [const { AtomicU64::new(0) }; 2]
-    });
+pub(crate) static RAN_ON: PerCpu<[AtomicU64; 2]> = PerCpu::new(
+    "framekernel::sched::RAN_ON",
+    [const { AtomicU64::new(0) }; 2],
+    || [const { AtomicU64::new(0) }; 2],
+);
 
 /// Worker `slot`'s entry of `table` ([`PROGRESS`] or [`RAN_ON`]).
 fn worker_entry(table: &PerCpu<[AtomicU64; 2]>, slot: usize) -> Option<&AtomicU64> {
@@ -1064,7 +1077,15 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     if let Some(active) = ACTIVE.get(bsp.get()) {
         active.store(true, Ordering::Release);
     }
-    crate::tlb::mark_online();
+    // Index 0's record is in the kernel's image, so this holds (review finding F6).
+    if !crate::tlb::mark_online() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: the boot processor has no TLB shootdown record: scheduler failed"
+        );
+        proofs.record(Proof::Preemption, false);
+        return;
+    }
     timer::start_periodic(&lapic);
     // The first thread's guard page must be unmapped. It is in the kernel stacks' region, so
     // these lines name neither it nor anything else there (ADR-0004 Amendment 2, A6.3).
