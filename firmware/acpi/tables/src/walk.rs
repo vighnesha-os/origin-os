@@ -146,6 +146,8 @@ impl<'a> Iterator for Walk<'a> {
         if self.done || self.at >= self.run.len() {
             return None;
         }
+        #[cfg(test)]
+        steps::add();
         let item = self.step();
         self.done = item.is_err();
         Some(item)
@@ -153,6 +155,26 @@ impl<'a> Iterator for Walk<'a> {
 }
 
 impl core::iter::FusedIterator for Walk<'_> {}
+
+/// How many structures this thread's walks have stepped over, for the tests that bound a table's
+/// work (the review's F1 and F13).
+#[cfg(test)]
+pub(crate) mod steps {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static STEPS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn add() {
+        STEPS.with(|s| s.set(s.get() + 1));
+    }
+
+    /// The steps since the last call, and starts the count again.
+    pub(crate) fn take() -> u64 {
+        STEPS.with(|s| s.replace(0))
+    }
+}
 
 /// How many places an [`Index`] remembers.
 const CHECKPOINTS: usize = 64;

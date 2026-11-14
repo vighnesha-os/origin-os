@@ -19,6 +19,13 @@ const ENTRIES: usize = 40;
 /// each NVDIMM, and a machine has tens of them.
 pub const MAX_STRUCTURES: usize = 1024;
 
+/// The most walk steps [`Nfit::parse`] takes, whatever the table's length (the review's F1). The
+/// structures are counted first, so a table with more than [`MAX_STRUCTURES`] is refused after
+/// `MAX_STRUCTURES + 1` steps, before any check between structures; then each structure is
+/// stepped to once and its checks walk the table at most four times (a region mapping's SPA range,
+/// control region, interleave and region ID), each walk at most `MAX_STRUCTURES` steps.
+pub const MAX_STEPS: usize = (MAX_STRUCTURES + 1) + MAX_STRUCTURES * (1 + 4 * MAX_STRUCTURES);
+
 /// The address range types §5.2.26.2 names, by GUID.
 pub mod range_type {
     use crate::read::Guid;
@@ -189,15 +196,17 @@ impl<'a> Nfit<'a> {
     /// structure's own length: a range that wraps; two ranges, interleaves or control regions with
     /// one index; an interleave index of 0; a region mapping whose SPA range, control region or
     /// interleave index names nothing of that kind, or whose interleave index and ways are a pair
-    /// §5.2.26.3 does not allow; two regions with one ID on one NVDIMM; a control region with
+    /// §5.2.26.3 does not allow (checked only when it names an SPA range); two regions with one ID on one NVDIMM; a control region with
     /// windows that is not 80 bytes; a block data window whose control region is not there or has
     /// a different number of windows; a capability that needs another the platform lacks.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Error> {
         let table = header::check_signature(bytes, b"NFIT")?;
         table.reader().require(ENTRIES)?;
         let nfit = Self { table };
+        // Count first, so that the checks between structures run only on a table of at most
+        // MAX_STRUCTURES (the review's F1; MAX_STEPS).
         for (i, entry) in nfit.entries().enumerate() {
-            let (at, entry) = entry?;
+            let (at, _) = entry?;
             if i >= MAX_STRUCTURES {
                 return Err(Error::new(
                     table.signature(),
@@ -207,6 +216,9 @@ impl<'a> Nfit<'a> {
                     },
                 ));
             }
+        }
+        for (i, entry) in nfit.entries().enumerate() {
+            let (at, entry) = entry?;
             nfit.check_references(i, at, &entry)?;
         }
         Ok(nfit)
@@ -292,7 +304,9 @@ impl<'a> Nfit<'a> {
                 if !self.any(i, |e| matches!(e, NfitEntry::ControlRegion { index: x, .. } if *x == control_index))? {
                     return fail(reference("NVDIMM Control Region Structure Index"));
                 }
-                if interleave_index != 0 {
+                // With no SPA range, §5.2.26.3 says the interleave fields are not valid and are
+                // ignored (the review's F9).
+                if spa_index != 0 && interleave_index != 0 {
                     if interleave_ways < 2 {
                         return fail(ErrorKind::Value {
                             field: "Interleave Ways",
@@ -686,5 +700,63 @@ pub(crate) mod tests {
         let many = vec![s(0x99, &[]); MAX_STRUCTURES + 1];
         assert!(Nfit::parse(&nfit(&many[..MAX_STRUCTURES])).is_ok());
         assert!(matches!(refusal(&many), ErrorKind::Value { .. }));
+    }
+
+    /// The review's F1: a hostile NFIT of the kernel's largest table length is refused within
+    /// `MAX_STRUCTURES + 1` walk steps, and the costliest table of `MAX_STRUCTURES` that is
+    /// accepted takes no more than [`MAX_STEPS`].
+    #[test]
+    fn the_work_is_bounded_whatever_the_length() {
+        const KERNEL_MAX_TABLE: usize = 16 << 20;
+        let mut body = vec![0u8; 4];
+        for h in 0..1023u32 {
+            body.extend_from_slice(&mapping(h, 0, 1, 1, 0, 0));
+        }
+        let tail = [spa(1, 0x1_0000_0000, 0x1000), control(1, 0, false)].concat();
+        let reserved = (KERNEL_MAX_TABLE - 36 - body.len() - tail.len()) / 4;
+        body.extend(std::iter::repeat_n(s(8, &[]), reserved).flatten());
+        body.extend_from_slice(&tail);
+        let t = table(b"NFIT", 1, &body);
+        assert!(t.len() <= KERNEL_MAX_TABLE && t.len() > KERNEL_MAX_TABLE - 4);
+        crate::walk::steps::take();
+        assert!(matches!(
+            Nfit::parse(&t).unwrap_err().kind,
+            ErrorKind::Value {
+                field: "more structures than the NFIT's checks take"
+            }
+        ));
+        let steps = crate::walk::steps::take();
+        assert!(steps <= MAX_STRUCTURES as u64 + 1, "{steps}");
+
+        // The costliest accepted table: every structure but the last three a region mapping
+        // whose SPA range, control region and interleave come last, and no two alike.
+        let mut worst: Vec<Vec<u8>> = (0..u32::try_from(MAX_STRUCTURES - 3).unwrap())
+            .map(|h| mapping(h, 0, 1, 1, 1, 2))
+            .collect();
+        worst.extend([spa(1, 0, 0x1000), control(1, 0, false), interleave(1, 2)]);
+        let t = nfit(&worst);
+        crate::walk::steps::take();
+        Nfit::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
+        let steps = crate::walk::steps::take();
+        assert!(steps <= MAX_STEPS as u64, "{steps} > {MAX_STEPS}");
+        assert!(
+            steps > 3 * (MAX_STRUCTURES * MAX_STRUCTURES) as u64,
+            "{steps}"
+        );
+    }
+
+    /// The review's F9: with no SPA range, a region mapping's interleave fields are ignored.
+    #[test]
+    fn interleave_fields_without_a_range_are_ignored() {
+        let t = nfit(&[mapping(1, 0, 0, 1, 7, 1), control(1, 0, false)]);
+        assert!(Nfit::parse(&t).is_ok());
+        assert!(matches!(
+            refusal(&[
+                mapping(1, 0, 1, 1, 7, 1),
+                spa(1, 0, 0x1000),
+                control(1, 0, false)
+            ]),
+            ErrorKind::Value { .. }
+        ));
     }
 }

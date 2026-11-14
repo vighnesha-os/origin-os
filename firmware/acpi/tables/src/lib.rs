@@ -81,7 +81,8 @@
 //! - PMTT: revision 1; a top-level aggregator below the top level.
 //! - FPDT: no FBPT pointer; two pointers of one kind. FBPT and S3PT: their required records
 //!   missing or repeated.
-//! - NFIT: an interleave index of 0; the interleave index and ways pairs §5.2.26.3 forbids; a
+//! - NFIT: an interleave index of 0; the interleave index and ways pairs §5.2.26.3 forbids, in a
+//!   region mapping that names an SPA range (without one, §5.2.26.3 says they are ignored); a
 //!   block data window naming control region 0; the capability bit 0 without bit 1; a range that
 //!   wraps.
 //! - NHLT: a format that is not `WAVEFORMATEXTENSIBLE` (tag 0xFFFE, extension 22); a container
@@ -111,7 +112,9 @@
 //! # Bounds on work
 //!
 //! Checks between structures are bounded so that no table, however hostile, costs unbounded
-//! time: at most [`madt::MAX_IO_APICS`] I/O APICs, [`nfit::MAX_STRUCTURES`] NFIT structures,
+//! time: at most [`madt::MAX_IO_APICS`] I/O APICs, [`nfit::MAX_STRUCTURES`] NFIT structures
+//! (counted before any check between them, so that a parse takes at most [`nfit::MAX_STEPS`]
+//! walk steps whatever the table's length: the review's F1),
 //! [`pptt::MAX_STRUCTURES`] PPTT structures (its chains [`pptt::MAX_DEPTH`] and
 //! [`pptt::MAX_CACHE_LEVELS`] long), [`viot::MAX_NODES`] VIOT nodes, and PMTT devices nested
 //! [`memory::PMTT_MAX_DEPTH`] deep.
