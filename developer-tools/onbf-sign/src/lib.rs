@@ -9,6 +9,11 @@
 //! - [`ed25519`]: key generation and signing (RFC 8032 §5.1.5, §5.1.6).
 //! - [`mldsa87`]: ML-DSA-87 key generation and signing (FIPS 204 Algorithms 2, 6, 7).
 //!
+//! It reaches nothing of the host: every seed and ML-DSA's per-signature randomness `rnd` are
+//! arguments, which its caller fills (ADR-0011 Amendment 4, T1; `cargo xtask host-tools-gate`
+//! holds it). On the build host that caller is `onbf-pack`'s command line or `xtask`, each
+//! reading the operating system's generator itself.
+//!
 //! Hashing reuses `origin-crypto`'s SHA-512, SHAKE128 and SHAKE256, whose state updates have no
 //! data-dependent branches or table lookups (see that crate's documentation). Everything else
 //! is written here and shares no arithmetic with the verifiers, so a signature made by this
@@ -81,10 +86,4 @@ pub fn wipe_words(words: &mut [u32]) {
 pub fn wipe_u64(words: &mut [u64]) {
     words.fill(0);
     core::hint::black_box(&*words);
-}
-
-/// Fills `out` from the operating system's random number generator.
-pub fn os_random(out: &mut [u8]) -> std::io::Result<()> {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom")?.read_exact(out)
 }

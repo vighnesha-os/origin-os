@@ -1,17 +1,26 @@
 //! `onbf-pack` command line (CLAUDE.md §70). Exit status: 0 on success, 1 on a conversion
 //! error, 2 on a usage error. Nothing is written unless the whole conversion succeeds; the
 //! output appears through a rename, so it is never partial.
+//!
+//! A thin client of the `onbf_pack` library (ADR-0011 Amendment 4, T1): it reads its arguments
+//! and files, calls the library, and writes what the library returns. What it does of its own
+//! is the host's part, which the library leaves to its caller: running `rustc -vV` when a
+//! toolchain value is not given, reading the operating system's random generator, checking a
+//! key file as it reads it (no symbolic link, a regular file, mode 0600) and writing new key
+//! files (never over an existing path, all or none), listing an output directory, and writing
+//! files atomically. It calls nothing but `onbf_pack` and `std`.
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{self, ExitCode};
+use std::process::{self, Command, ExitCode};
 
-use onbf_pack::sign::{self, HostKey, KeyPaths, SignOptions, Signer};
-use onbf_pack::{KrnOptions, Toolchain, carried, corelib, krn};
+use onbf_pack::sign::{self, HostKey, SignOptions, Signer};
+use onbf_pack::{KrnOptions, Random, RandomError, Toolchain, carried, corelib, krn};
 
 const USAGE: &str = "\
 usage: onbf-pack krn --input <kernel.elf> --output <kernel.onbf> [options]
@@ -188,6 +197,20 @@ fn parse_options(
     Ok(Some(options))
 }
 
+/// Runs `rustc -vV` in the current directory, so that rustup picks the toolchain
+/// `rust-toolchain.toml` pins, and reads its text with the library.
+fn rustc_toolchain() -> Result<Toolchain, Failure> {
+    let out = Command::new("rustc").arg("-vV").output().map_err(|e| {
+        conversion(format!(
+            "cannot run `rustc -vV` ({e}); pass --rustc-version, --rustc-commit and --llvm-version"
+        ))
+    })?;
+    if !out.status.success() {
+        return Err(conversion(format!("`rustc -vV` failed ({})", out.status)));
+    }
+    Toolchain::from_rustc_verbose_version(&String::from_utf8_lossy(&out.stdout)).map_err(conversion)
+}
+
 /// The toolchain fields: explicit values first, the rest from `rustc -vV`.
 fn toolchain(options: &mut Options) -> Result<Toolchain, Failure> {
     let given = (
@@ -202,7 +225,7 @@ fn toolchain(options: &mut Options) -> Result<Toolchain, Failure> {
             llvm,
         });
     }
-    let detected = Toolchain::from_rustc().map_err(|e| Failure::Conversion(e.to_string()))?;
+    let detected = rustc_toolchain()?;
     Ok(Toolchain {
         rustc: given.0.unwrap_or(detected.rustc),
         rustc_commit: given.1.unwrap_or(detected.rustc_commit),
@@ -310,17 +333,11 @@ fn describe_carried(mut options: Options) -> Result<String, Failure> {
         .ok_or_else(|| Failure::Usage("--variable is required".into()))?;
     let exports = options.take("--core-exports").map(PathBuf::from);
     let elf = read_input(&input)?;
-    let carried = match &exports {
-        None => carried::describe(&elf),
-        Some(exports) => {
-            let list = String::from_utf8(read_input(exports)?)
-                .map_err(|_| conversion(format!("{} is not UTF-8", exports.display())))?;
-            let listing = corelib::Listing::parse(&list)
-                .map_err(|e| conversion(format!("{}: {e}", exports.display())))?;
-            carried::describe_importing(&elf, &listing)
-        }
-    }
-    .map_err(conversion)?;
+    let listing = match &exports {
+        None => None,
+        Some(exports) => Some(read_listing(exports)?),
+    };
+    let carried = carried::describe_program(&elf, listing.as_ref()).map_err(conversion)?;
     let files = carried.rust(&name, &variable).map_err(conversion)?;
     let written = write_description(&out, &name, &carried::generated_line(&name), &files)?;
     Ok(format!(
@@ -333,11 +350,19 @@ fn describe_carried(mut options: Options) -> Result<String, Failure> {
     ))
 }
 
+/// The generator's list of `origin.core`'s exports, read from `path`.
+fn read_listing(path: &Path) -> Result<corelib::Listing, Failure> {
+    let list = String::from_utf8(read_input(path)?)
+        .map_err(|_| conversion(format!("{} is not UTF-8", path.display())))?;
+    corelib::Listing::parse(&list).map_err(|e| conversion(format!("{}: {e}", path.display())))
+}
+
 /// Writes `files`, a description of `name`, into `out`, and removes what an earlier
-/// description of it left that this one no longer has. What may go is decided before anything
-/// is written: only files this tool wrote for `name`, in a directory whose `<name>.rs` begins
-/// with `first_line` (`carried::stale`; S4-1's review, finding F9). A file whose bytes are
-/// already there is left untouched. Returns how many files were written.
+/// description of it left that this one no longer has. The library decides both from what is
+/// read here of the directory (`carried::update`): only files this tool wrote for `name`, in a
+/// directory whose `<name>.rs` begins with `first_line`, may go (S4-1's review, finding F9),
+/// and a file whose bytes are already there is left untouched. Returns how many files were
+/// written.
 fn write_description(
     out: &Path,
     name: &str,
@@ -346,33 +371,34 @@ fn write_description(
 ) -> Result<usize, Failure> {
     fs::create_dir_all(out)
         .map_err(|e| conversion(format!("cannot create {}: {e}", out.display())))?;
-    let mut present = Vec::new();
+    let mut present = BTreeMap::new();
     let entries =
         fs::read_dir(out).map_err(|e| conversion(format!("cannot read {}: {e}", out.display())))?;
     for entry in entries {
         let entry = entry.map_err(|e| conversion(format!("{}: {e}", out.display())))?;
         // A name that is not UTF-8 is not one this tool writes.
-        if let Ok(file) = entry.file_name().into_string() {
-            present.push(file);
-        }
-    }
-    let description = fs::read(out.join(format!("{name}.rs"))).ok();
-    let stale = carried::stale(name, first_line, files, &present, description.as_deref())
-        .map_err(|e| conversion(format!("{}: {e}", out.display())))?;
-    let mut written = 0;
-    for (file, bytes) in files {
-        let path = out.join(file);
-        if fs::read(&path).is_ok_and(|old| old == *bytes) {
+        let Ok(file) = entry.file_name().into_string() else {
             continue;
+        };
+        let path = entry.path();
+        if path.is_file() {
+            present.insert(
+                file,
+                fs::read(&path)
+                    .map_err(|e| conversion(format!("cannot read {}: {e}", path.display())))?,
+            );
         }
-        write_output(&path, bytes)?;
-        written += 1;
     }
-    for file in &stale {
+    let update = carried::update(name, first_line, files, &present)
+        .map_err(|e| conversion(format!("{}: {e}", out.display())))?;
+    for (file, bytes) in &update.write {
+        write_output(&out.join(file), bytes)?;
+    }
+    for file in &update.remove {
         fs::remove_file(out.join(file))
             .map_err(|e| conversion(format!("cannot remove {file}: {e}")))?;
     }
-    Ok(written)
+    Ok(update.write.len())
 }
 
 fn describe_corelib(mut options: Options) -> Result<String, Failure> {
@@ -382,10 +408,7 @@ fn describe_corelib(mut options: Options) -> Result<String, Failure> {
     let variable = options
         .text("--variable")?
         .ok_or_else(|| Failure::Usage("--variable is required".into()))?;
-    let list = String::from_utf8(read_input(&exports)?)
-        .map_err(|_| conversion(format!("{} is not UTF-8", exports.display())))?;
-    let listing = corelib::Listing::parse(&list)
-        .map_err(|e| conversion(format!("{}: {e}", exports.display())))?;
+    let listing = read_listing(&exports)?;
     let elf = read_input(&input)?;
     let core = corelib::describe(&elf, &listing).map_err(conversion)?;
     let files = core.rust(&variable).map_err(conversion)?;
@@ -399,6 +422,96 @@ fn describe_corelib(mut options: Options) -> Result<String, Failure> {
         core.exports.len(),
         files.len()
     ))
+}
+
+/// The operating system's random number generator: what the library signs and makes keys
+/// with, from its caller.
+struct OsRandom;
+
+impl Random for OsRandom {
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), RandomError> {
+        File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(out))
+            .map_err(|e| RandomError(format!("the system random number generator failed: {e}")))
+    }
+}
+
+/// `O_NOFOLLOW` of the build host, which `std` does not name: opening a symbolic link fails.
+/// There is no value for any other host, so a build there stops here rather than following
+/// links.
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_NOFOLLOW: i32 = 0o400_000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_NOFOLLOW: i32 = 0o100_000;
+
+/// Overwrites `bytes` with zeros, best effort: the compiler is not promised to keep the writes
+/// (the library's `KeyFile` does the same).
+fn wipe(bytes: &mut [u8]) {
+    bytes.fill(0);
+    std::hint::black_box(&*bytes);
+}
+
+/// Loads the key in the key file at `path`, refusing a symbolic link, anything but a regular
+/// file, and one that anyone but its owner can read: like an SSH private key, it must be mode
+/// 0600. Opened once and checked on that handle, so that what is read is exactly what was
+/// checked; the library then refuses a damaged or foreign file.
+fn load_key(path: &Path) -> Result<HostKey, Failure> {
+    let cannot_read = |e| conversion(format!("cannot read {}: {e}", path.display()));
+    let refused = |why: &str| conversion(format!("{}: {why}", path.display()));
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(cannot_read)?;
+    let metadata = file.metadata().map_err(cannot_read)?;
+    if !metadata.is_file() {
+        return Err(refused("not a regular file"));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(refused("readable by others: a key file must be mode 0600"));
+    }
+    let mut bytes = Vec::new();
+    let read = file.read_to_end(&mut bytes).map_err(cannot_read);
+    let key = read.and_then(|_| {
+        HostKey::from_key_file(&bytes, Box::new(OsRandom)).map_err(|e| refused(&e.to_string()))
+    });
+    wipe(&mut bytes);
+    key
+}
+
+/// Writes a new file with `mode`, refusing to touch an existing path. If writing fails, the
+/// partial file is removed.
+fn write_new(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)?;
+    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+/// Writes every file or none: a later failure removes the files already created. An existing
+/// path, in particular a private key given by mistake as a public-key path, is refused.
+fn write_all_new(files: &[(&Path, &[u8], u32)]) -> Result<(), Failure> {
+    for (done, &(path, bytes, mode)) in files.iter().enumerate() {
+        if let Err(e) = write_new(path, bytes, mode) {
+            for &(created, _, _) in files.iter().take(done) {
+                let _ = fs::remove_file(created);
+            }
+            return Err(conversion(if e.kind() == io::ErrorKind::AlreadyExists {
+                format!("{} already exists", path.display())
+            } else {
+                format!("{}: {e}", path.display())
+            }));
+        }
+    }
+    Ok(())
 }
 
 fn sign_krn(mut options: Options) -> Result<String, Failure> {
@@ -416,7 +529,7 @@ fn sign_krn(mut options: Options) -> Result<String, Failure> {
         )));
     }
     let image = read_input(&input)?;
-    let signer = HostKey::load(&key).map_err(conversion)?;
+    let signer = load_key(&key)?;
     let signed = sign::sign_krn(
         &image,
         &signer,
@@ -434,10 +547,7 @@ fn sign_krn(mut options: Options) -> Result<String, Failure> {
         } else {
             ""
         },
-        sign::hex(&onbf_verify::key_id(&onbf_verify::PublicKey {
-            ed25519: &signer.public_keys().ed25519,
-            mldsa: &signer.public_keys().mldsa87,
-        })),
+        sign::hex(&signer.public_keys().key_id()),
         signed.len()
     ))
 }
@@ -447,21 +557,18 @@ fn keygen(mut options: Options) -> Result<String, Failure> {
     let public_ed25519 = PathBuf::from(options.require("--public-ed25519")?);
     let public_mldsa = PathBuf::from(options.require("--public-mldsa")?);
     let seed = options.text("--insecure-test-seed")?;
-    let keys = sign::generate_keys(
-        &KeyPaths {
-            key: &key,
-            public_ed25519: &public_ed25519,
-            public_mldsa87: &public_mldsa,
-        },
-        seed.as_deref(),
-    )
-    .map_err(conversion)?;
+    let new = match &seed {
+        Some(label) => sign::new_test_key(label),
+        None => sign::new_key(&mut OsRandom).map_err(conversion)?,
+    };
+    write_all_new(&[
+        (&key, new.key_file.as_bytes(), 0o600),
+        (&public_ed25519, &new.public.ed25519, 0o644),
+        (&public_mldsa, &new.public.mldsa87, 0o644),
+    ])?;
     Ok(format!(
         "onbf-pack: wrote key pair{}: key ID {}",
         if seed.is_some() { " (TEST KEY)" } else { "" },
-        sign::hex(&onbf_verify::key_id(&onbf_verify::PublicKey {
-            ed25519: &keys.ed25519,
-            mldsa: &keys.mldsa87,
-        }))
+        sign::hex(&new.public.key_id())
     ))
 }

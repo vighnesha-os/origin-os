@@ -22,6 +22,15 @@
 //! Packing is deterministic: the same ELF bytes and options always give the same image,
 //! with no timestamps, host paths or other environment input (ONBF-R9, CLAUDE.md §75).
 //! Signing is not, because ML-DSA signing is hedged with fresh randomness; the statement is.
+//!
+//! **The library reaches nothing of the host** (ADR-0011 Amendment 4, T1). It reads and writes
+//! no file, runs no program, reads no environment variable, clock or device, and prints
+//! nothing: it takes bytes and text from its caller and returns values. What it needs of the
+//! host comes from the caller: the toolchain's identity as `rustc -vV` prints it
+//! ([`Toolchain::from_rustc_verbose_version`]), randomness ([`sign::Random`]), and the contents
+//! of files. Its two callers are the command line (`src/main.rs`), a thin client that does the
+//! reading and writing and calls nothing this library does not offer, and `xtask`, which calls
+//! it in process. `cargo xtask host-tools-gate` holds the rule.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     not(test),
@@ -50,7 +59,7 @@ use core::fmt;
 pub use elf::ElfError;
 pub use krn::{KrnOptions, Packed, VerifyError};
 pub use relr::RelrError;
-pub use sign::{HostKey, SignError, SignOptions, Signer};
+pub use sign::{HostKey, NewKey, Random, RandomError, SignError, SignOptions, Signer};
 pub use toolchain::{Toolchain, ToolchainError};
 
 /// Why the container could not be laid out.

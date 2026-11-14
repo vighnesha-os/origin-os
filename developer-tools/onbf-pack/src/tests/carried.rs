@@ -338,3 +338,116 @@ fn a_directory_this_tool_did_not_write_to_is_refused() {
         Ok(vec![])
     );
 }
+
+/// What `update` is given for a directory: each regular file's name and bytes.
+fn read_directory(files: &[(&str, &[u8])]) -> std::collections::BTreeMap<String, Vec<u8>> {
+    files
+        .iter()
+        .map(|(name, bytes)| ((*name).to_string(), bytes.to_vec()))
+        .collect()
+}
+
+/// `update` says what to write and what to remove, from what the caller read; the caller
+/// judges nothing (ADR-0011 Amendment 4, T1).
+#[test]
+fn update_writes_what_changed_and_removes_what_is_stale() {
+    let carried = describe(&program().bytes()).unwrap();
+    let files = carried.rust("first", "ORIGIN_CARRIED").unwrap();
+    let line = carried::generated_line("first");
+    let names = |update: &carried::Update<'_>| -> Vec<String> {
+        update.write.iter().map(|(name, _)| name.clone()).collect()
+    };
+    let all: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+
+    // An empty directory: everything is written, nothing removed.
+    let update = carried::update("first", &line, &files, &read_directory(&[])).unwrap();
+    assert_eq!(names(&update), all);
+    assert!(update.remove.is_empty());
+
+    // The same description already there: nothing to write or remove.
+    let mut present: std::collections::BTreeMap<String, Vec<u8>> = files.iter().cloned().collect();
+    let update = carried::update("first", &line, &files, &present).unwrap();
+    assert!(
+        update.write.is_empty() && update.remove.is_empty(),
+        "{update:?}"
+    );
+
+    // One file changed, a stale segment and someone else's file: the changed one is written,
+    // the stale one removed, the other left.
+    present.insert(all[1].clone(), b"older bytes".to_vec());
+    present.insert("first.9.bin".into(), b"stale".to_vec());
+    present.insert("notes.txt".into(), b"not ours".to_vec());
+    let update = carried::update("first", &line, &files, &present).unwrap();
+    assert_eq!(names(&update), [all[1].clone()]);
+    assert_eq!(update.remove, ["first.9.bin"]);
+
+    // A directory this tool did not write to is refused, as `stale` refuses it.
+    let foreign = read_directory(&[("first.rs", b"fn main() {}\n")]);
+    assert_eq!(
+        carried::update("first", &line, &files, &foreign),
+        Err(CarriedError::Foreign("first.rs".into()))
+    );
+}
+
+/// Every name `update` hands its caller to write or remove is a plain file name: the caller
+/// writes and removes it without judging it (the coordinating session's ruling of 2026-11-14).
+#[test]
+fn update_refuses_a_name_that_is_not_a_plain_file_name() {
+    let bytes = b"x".to_vec();
+    for bad in [
+        "",
+        ".",
+        "..",
+        "a/b",
+        "../first.rs",
+        "/etc/x",
+        "a\\b",
+        "x\0y",
+        "first/",
+    ] {
+        let files: Vec<File> = vec![
+            (
+                "first.rs".into(),
+                carried::generated_line("first").into_bytes(),
+            ),
+            (bad.to_string(), bytes.clone()),
+        ];
+        assert_eq!(
+            carried::update(
+                "first",
+                &carried::generated_line("first"),
+                &files,
+                &read_directory(&[])
+            ),
+            Err(CarriedError::FileName(bad.into())),
+            "{bad:?}"
+        );
+    }
+    // A stale name: a program named with a separator, whose earlier description is there.
+    let name = "a/b";
+    let line = carried::generated_line(name);
+    let present = read_directory(&[("a/b.rs", line.as_bytes()), ("a/b.3.bin", b"old")]);
+    let files: Vec<File> = vec![("plain.rs".into(), line.clone().into_bytes())];
+    assert_eq!(
+        carried::update(name, &line, &files, &present),
+        Err(CarriedError::FileName("a/b.3.bin".into()))
+    );
+    // Plain names pass, dots and all.
+    let files: Vec<File> = vec![
+        (
+            "first.rs".into(),
+            carried::generated_line("first").into_bytes(),
+        ),
+        ("first.0.bin".into(), bytes.clone()),
+        ("..first".into(), bytes),
+    ];
+    assert!(
+        carried::update(
+            "first",
+            &carried::generated_line("first"),
+            &files,
+            &read_directory(&[])
+        )
+        .is_ok()
+    );
+}

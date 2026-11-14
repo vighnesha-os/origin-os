@@ -31,9 +31,13 @@
 //! remapping reached the ring-3 build (S4-1's review, finding F5).
 //!
 //! [`stale`] keeps the output directory safe: the files it removes are only this tool's own,
-//! from an earlier description of the same program (finding F9).
+//! from an earlier description of the same program (finding F9). [`update`] says, from what the
+//! caller read of the directory, which files to write and which to remove, so that the caller
+//! decides nothing about it: it reads and writes the directory, and this module touches no file
+//! (ADR-0011 Amendment 4, T1).
 
 use core::fmt;
+use std::collections::BTreeMap;
 
 use origin_crypto::Sha256;
 
@@ -135,6 +139,9 @@ pub enum CarriedError {
     /// The output directory holds a file of a description's names that this tool did not write
     /// for this program: [`stale`] refuses to replace or remove it.
     Foreign(String),
+    /// A name [`update`] would have its caller write or remove is not a plain file name: it is
+    /// empty, `.` or `..`, or holds `/`, `\` or a NUL byte.
+    FileName(String),
 }
 
 impl fmt::Display for CarriedError {
@@ -162,6 +169,10 @@ impl fmt::Display for CarriedError {
                 f,
                 "{file} is not part of a description `onbf-pack carried` wrote for this program: nothing replaced or removed (is --out right?)"
             ),
+            Self::FileName(file) => write!(
+                f,
+                "{file:?} is not a plain file name: nothing written or removed"
+            ),
         }
     }
 }
@@ -171,6 +182,20 @@ impl std::error::Error for CarriedError {}
 impl From<ElfError> for CarriedError {
     fn from(e: ElfError) -> Self {
         Self::Elf(e)
+    }
+}
+
+/// Reads `file`, a program's `rust-lld` output, and lays it out for the kernel: with
+/// [`describe_importing`] when it was linked against `origin.core`, whose exports `listing`
+/// names, and with [`describe`] when `listing` is `None`.
+///
+/// # Errors
+///
+/// As [`describe`] or [`describe_importing`].
+pub fn describe_program(file: &[u8], listing: Option<&Listing>) -> Result<Carried, CarriedError> {
+    match listing {
+        None => describe(file),
+        Some(listing) => describe_importing(file, listing),
     }
 }
 
@@ -379,6 +404,60 @@ pub fn stale(
         .filter(|f| f.ends_with(".bin") && !files.iter().any(|(written, _)| written == *f))
         .cloned()
         .collect())
+}
+
+/// What a caller does to an output directory so that it holds `files`, a description of
+/// `name`, and nothing stale of an earlier one ([`update`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Update<'a> {
+    /// The files whose bytes the directory does not hold yet, in the order of `files`: each is
+    /// written under its name, replacing what is there.
+    pub write: Vec<&'a File>,
+    /// The stale files, by name: each is removed.
+    pub remove: Vec<String>,
+}
+
+/// Whether `file` names one file inside a directory and nothing else.
+fn is_plain_file_name(file: &str) -> bool {
+    !file.is_empty()
+        && file != "."
+        && file != ".."
+        && !file.bytes().any(|b| matches!(b, b'/' | b'\\' | 0))
+}
+
+/// What to write and remove in an output directory before it holds `files`, a description of
+/// `name` whose first line is `first_line` (as for [`stale`]). `present` is what the caller read
+/// of the directory: every regular file in it whose name is UTF-8, with its bytes. A file whose
+/// bytes are already there is not written again, so a build that changed nothing leaves the
+/// kernel's inputs as they were. Every name returned is a plain file name, checked here, so the
+/// caller writes and removes what it is given without judging it.
+///
+/// # Errors
+///
+/// [`CarriedError::Foreign`], as [`stale`] gives it: nothing may be written or removed.
+/// [`CarriedError::FileName`] if a name in `files` or a stale one is not a plain file name.
+pub fn update<'a>(
+    name: &str,
+    first_line: &str,
+    files: &'a [File],
+    present: &BTreeMap<String, Vec<u8>>,
+) -> Result<Update<'a>, CarriedError> {
+    let names: Vec<String> = present.keys().cloned().collect();
+    let description = present.get(&format!("{name}.rs")).map(Vec::as_slice);
+    let remove = stale(name, first_line, files, &names, description)?;
+    let write: Vec<&File> = files
+        .iter()
+        .filter(|(file, bytes)| present.get(file) != Some(bytes))
+        .collect();
+    if let Some(bad) = files
+        .iter()
+        .map(|(file, _)| file)
+        .chain(&remove)
+        .find(|file| !is_plain_file_name(file))
+    {
+        return Err(CarriedError::FileName(bad.clone()));
+    }
+    Ok(Update { write, remove })
 }
 
 fn is_name(name: &str, first: fn(u8) -> bool, rest: fn(u8) -> bool) -> bool {

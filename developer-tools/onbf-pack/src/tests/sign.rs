@@ -1,11 +1,14 @@
 //! Signing: the encoder against the independent Python one, the block's placement, the
-//! self-check, the host key file, and (when an OpenSSL with ML-DSA is installed) OpenSSL
-//! verifying what this tool signed.
+//! self-check, the host key file's bytes, randomness that fails closed, and (when an OpenSSL
+//! with ML-DSA is installed) OpenSSL verifying what this tool signed. The key file's checks as a
+//! file (a symbolic link, not a regular file, its mode, never overwriting) are the command
+//! line's, and its tests are in `tests/rustc_kernel.rs` (ADR-0011 Amendment 4, T1).
 
+use std::cell::Cell;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 
 use onbf_format::signature::{Role, SignatureBlock};
 use onbf_format::{Image, ParseOptions};
@@ -17,8 +20,8 @@ use super::options;
 use crate::krn;
 use crate::sign::testing::{attach_block, block_bytes, statement_bytes};
 use crate::sign::{
-    HostKey, KeyPaths, PublicKeys, SelfCheckError, SignError, SignOptions, Signatures, Signer,
-    generate_keys, sign_krn,
+    HostKey, KEY_FILE_BYTES, NewKey, PublicKeys, Random, RandomError, SelfCheckError, SignError,
+    SignOptions, Signatures, Signer, new_key, new_test_key, sign_krn,
 };
 
 const OPTIONS: SignOptions = SignOptions {
@@ -210,43 +213,57 @@ fn store(keys: &PublicKeys) -> [TrustedKey<'_>; 1] {
     }]
 }
 
-/// The file paths for a key named `name` in `dir`.
-struct OwnedPaths {
-    key: PathBuf,
-    public_ed25519: PathBuf,
-    public_mldsa87: PathBuf,
-}
+/// A `Random` from a counter run through SHA-256: different bytes each call, and never all
+/// zero. Not a generator: what the tests need is fresh, filled bytes, not secret ones.
+struct Counter(u64);
 
-impl OwnedPaths {
-    fn new(dir: &Path, name: &str) -> Self {
-        Self {
-            key: dir.join(format!("{name}.key")),
-            public_ed25519: dir.join(format!("{name}.ed25519")),
-            public_mldsa87: dir.join(format!("{name}.mldsa87")),
+impl Random for Counter {
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), RandomError> {
+        for chunk in out.chunks_mut(32) {
+            self.0 += 1;
+            let block = origin_crypto::Sha256::digest(&self.0.to_le_bytes());
+            chunk.copy_from_slice(&block[..chunk.len()]);
         }
-    }
-
-    fn paths(&self) -> KeyPaths<'_> {
-        KeyPaths {
-            key: &self.key,
-            public_ed25519: &self.public_ed25519,
-            public_mldsa87: &self.public_mldsa87,
-        }
+        Ok(())
     }
 }
 
-fn generate(dir: &Path, name: &str, seed: Option<&str>) -> (OwnedPaths, PublicKeys) {
-    let paths = OwnedPaths::new(dir, name);
-    let keys = generate_keys(&paths.paths(), seed).unwrap();
-    (paths, keys)
+/// A `Random` that fails, counting how often it was asked.
+struct Failing(Rc<Cell<usize>>);
+
+impl Random for Failing {
+    fn fill(&mut self, _out: &mut [u8]) -> Result<(), RandomError> {
+        self.0.set(self.0.get() + 1);
+        Err(RandomError("the test's generator is broken".into()))
+    }
+}
+
+/// A `Random` that reports success and writes nothing.
+struct Lazy;
+
+impl Random for Lazy {
+    fn fill(&mut self, _out: &mut [u8]) -> Result<(), RandomError> {
+        Ok(())
+    }
+}
+
+/// A fresh key from the counter `seed`, and its signer.
+fn fresh(seed: u64) -> (NewKey, HostKey) {
+    let new = new_key(&mut Counter(seed)).unwrap();
+    let signer =
+        HostKey::from_key_file(new.key_file.as_bytes(), Box::new(Counter(seed + 1000))).unwrap();
+    (new, signer)
 }
 
 #[test]
 fn host_key_signatures_verify_end_to_end() {
-    let dir = TempDir::new("end-to-end");
-    let (paths, keys) = generate(&dir.0, "fresh", None);
-    let signer = HostKey::load(&paths.key).unwrap();
+    let (new, signer) = fresh(1);
+    let keys = new.public.clone();
+    assert!(!new.is_test_key && !signer.is_test_key());
     assert_eq!(signer.public_keys(), &keys);
+    assert_eq!(new.key_file.as_bytes().len(), KEY_FILE_BYTES);
+    assert_eq!(&new.key_file.as_bytes()[..8], b"ONBFKEY1");
+    assert_eq!(keys.key_id(), key_id(&store(&keys)[0].key));
 
     let image = unsigned_image();
     let signed = sign_krn(&image, &signer, &OPTIONS).unwrap();
@@ -281,99 +298,71 @@ fn host_key_signatures_verify_end_to_end() {
     );
 
     // Another key's signature does not verify under this one.
-    let (other_paths, other) = generate(&dir.0, "other", None);
-    let signer2 = HostKey::load(&other_paths.key).unwrap();
+    let (other, signer2) = fresh(2);
     let other_signed = sign_krn(&image, &signer2, &OPTIONS).unwrap();
     let parsed = Image::parse(&other_signed, ParseOptions::default()).unwrap();
     assert_eq!(
         verify_krn_block(parsed.signature_block().unwrap(), &store, &digest),
         Err(KrnBlockError::UntrustedKey)
     );
-    assert_ne!(other.ed25519, keys.ed25519);
+    assert_ne!(other.public.ed25519, keys.ed25519);
 }
 
 /// A seed gives the same keys every time, and a different seed different ones. The boot
 /// test's trusted key is the one whose public half is committed in `boot/uefi/trust`: it
-/// was made by OpenSSL from the same seeds, so this also shows the two agree.
+/// was made by OpenSSL from the same seeds, so this also shows the two agree. The key file
+/// says it holds a test key, and the signer made without a file is the same key.
 #[test]
 fn test_keys_come_from_their_seed_only() {
-    let dir = TempDir::new("seeded");
-    let (_, first) = generate(&dir.0, "a", Some("a label"));
-    let (_, again) = generate(&dir.0, "b", Some("a label"));
-    let (_, other) = generate(&dir.0, "c", Some("another label"));
-    assert_eq!(first, again);
-    assert_ne!(first.ed25519, other.ed25519);
-    assert_ne!(first.mldsa87, other.mldsa87);
+    let first = new_test_key("a label");
+    let again = new_test_key("a label");
+    let other = new_test_key("another label");
+    assert_eq!(first.public, again.public);
+    assert_eq!(first.key_file.as_bytes(), again.key_file.as_bytes());
+    assert_ne!(first.public.ed25519, other.public.ed25519);
+    assert_ne!(first.public.mldsa87, other.public.mldsa87);
+    assert!(first.is_test_key);
+    assert_eq!(&first.key_file.as_bytes()[..8], b"ONBFTKEY");
 
-    let (paths, trusted) = generate(
-        &dir.0,
-        "trusted",
-        Some("TEST-ONLY origin-kernel key 1: the test trust store holds it"),
-    );
+    let label = "TEST-ONLY origin-kernel key 1: the test trust store holds it";
+    let trusted = new_test_key(label);
     let committed = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../boot/uefi/trust");
     let read = |name: &str| fs::read(committed.join(name)).unwrap();
     assert_eq!(
-        trusted.ed25519.as_slice(),
-        read("TEST-ONLY-origin-kernel.ed25519")
-    );
-    assert_eq!(trusted.mldsa87, read("TEST-ONLY-origin-kernel.mldsa87"));
-    assert_eq!(
-        fs::read(&paths.public_ed25519).unwrap(),
+        trusted.public.ed25519.as_slice(),
         read("TEST-ONLY-origin-kernel.ed25519")
     );
     assert_eq!(
-        fs::read(&paths.public_mldsa87).unwrap(),
+        trusted.public.mldsa87,
         read("TEST-ONLY-origin-kernel.mldsa87")
     );
+
+    let from_file =
+        HostKey::from_key_file(trusted.key_file.as_bytes(), Box::new(Counter(5))).unwrap();
+    let derived = HostKey::from_test_seed(label, Box::new(Counter(6)));
+    assert!(from_file.is_test_key() && derived.is_test_key());
+    assert_eq!(from_file.public_keys(), &trusted.public);
+    assert_eq!(derived.public_keys(), &trusted.public);
+    let signed = sign_krn(&unsigned_image(), &derived, &OPTIONS).unwrap();
+    let parsed = Image::parse(&signed, ParseOptions::default()).unwrap();
     assert_eq!(
-        fs::metadata(&paths.key).unwrap().permissions().mode() & 0o777,
-        0o600
+        verify_krn_block(
+            parsed.signature_block().unwrap(),
+            &store(&trusted.public),
+            &parsed.header().content_digest
+        ),
+        Ok(trusted.public.key_id())
     );
 }
 
-#[test]
-fn keygen_refuses_to_overwrite_anything() {
-    let dir = TempDir::new("refusals");
-    let (existing, _) = generate(&dir.0, "k", None);
-    // An existing file in each of the three positions is left alone.
-    for position in 0..3 {
-        let mut paths = OwnedPaths::new(&dir.0, "new");
-        let target = match position {
-            0 => &mut paths.key,
-            1 => &mut paths.public_ed25519,
-            _ => &mut paths.public_mldsa87,
-        };
-        *target = existing.key.clone();
-        assert_eq!(
-            generate_keys(&paths.paths(), None),
-            Err(SignError::KeyExists(existing.key.clone())),
-            "position {position}"
-        );
-        assert!(!OwnedPaths::new(&dir.0, "new").key.exists());
-    }
-    // The same new path twice: the second write is refused and the first is removed, so the
-    // private key can never be replaced by a public key.
-    let mut paths = OwnedPaths::new(&dir.0, "same");
-    paths.public_ed25519 = paths.key.clone();
-    assert_eq!(
-        generate_keys(&paths.paths(), None),
-        Err(SignError::KeyExists(paths.key.clone()))
-    );
-    assert!(!paths.key.exists());
-}
-
+/// The library's half of the key file's refusals: bytes that are not a key file, or a damaged
+/// one. The file-system half (missing, a symbolic link, not a regular file, mode other than
+/// 0600) is the command line's, tested in `tests/rustc_kernel.rs`.
 #[test]
 fn a_damaged_or_foreign_key_file_is_refused() {
-    let dir = TempDir::new("key-files");
-    let (paths, _) = generate(&dir.0, "k", Some("a label"));
-    let good = fs::read(&paths.key).unwrap();
+    let good = new_test_key("a label").key_file.as_bytes().to_vec();
     assert_eq!(good.len(), 104);
-    let load_with = |bytes: &[u8]| {
-        fs::remove_file(&paths.key).unwrap();
-        fs::write(&paths.key, bytes).unwrap();
-        fs::set_permissions(&paths.key, fs::Permissions::from_mode(0o600)).unwrap();
-        HostKey::load(&paths.key).map(|_| ())
-    };
+    let load_with = |bytes: &[u8]| HostKey::from_key_file(bytes, Box::new(Counter(9))).map(|_| ());
     let flipped = |at: usize| {
         let mut bytes = good.clone();
         bytes[at] ^= 1;
@@ -385,6 +374,8 @@ fn a_damaged_or_foreign_key_file_is_refused() {
     assert!(load_with(&real_key).is_ok());
     for (bytes, why) in [
         (good[..103].to_vec(), "not a key file: wrong length"),
+        ([&good[..], &[0]].concat(), "not a key file: wrong length"),
+        (Vec::new(), "not a key file: wrong length"),
         (
             [&b"NOTAKEY1"[..], &good[8..]].concat(),
             "not a key file: bad magic",
@@ -392,53 +383,49 @@ fn a_damaged_or_foreign_key_file_is_refused() {
         (flipped(30), "damaged: its keys do not match its key ID"),
         (flipped(103), "damaged: its keys do not match its key ID"),
     ] {
-        assert_eq!(
-            load_with(&bytes),
-            Err(SignError::KeyFile {
-                path: paths.key.clone(),
-                why,
-            })
-        );
+        assert_eq!(load_with(&bytes), Err(SignError::KeyFile(why)));
     }
     assert!(load_with(&good).is_ok());
-    assert!(matches!(
-        HostKey::load(&dir.0.join("missing.key")),
-        Err(SignError::Io(_))
-    ));
-    // A key file others can read is refused, like an SSH private key.
-    fs::set_permissions(&paths.key, fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(
-        HostKey::load(&paths.key).map(|_| ()),
-        Err(SignError::KeyFile {
-            path: paths.key.clone(),
-            why: "readable by others: a key file must be mode 0600",
-        })
-    );
 }
 
-/// The key file is opened once with `O_NOFOLLOW`, and only that open file is checked and read:
-/// a symbolic link is never followed, even to a key file that would be accepted itself.
+/// Randomness fails closed (ADR-0011 Amendment 4, T1; the coordinating session's ruling of
+/// 2026-11-14): a `Random` that fails, or that reports success and fills nothing, stops key
+/// generation and signing, and nothing is made or signed.
 #[test]
-fn a_symbolic_link_to_a_key_file_is_refused() {
-    let dir = TempDir::new("symlink");
-    let (paths, _) = generate(&dir.0, "symlink", Some("symlink test"));
-    assert!(HostKey::load(&paths.key).is_ok(), "the file itself loads");
-
-    let link = dir.0.join("link.key");
-    std::os::unix::fs::symlink(&paths.key, &link).unwrap();
-    let refused = HostKey::load(&link).map(|_| ());
+fn randomness_that_fails_stops_keygen_and_signing() {
+    let asked = Rc::new(Cell::new(0));
+    let refused = new_key(&mut Failing(asked.clone())).map(|_| ());
     assert!(
-        matches!(&refused, Err(SignError::Io(why)) if why.contains("cannot read")),
+        matches!(&refused, Err(SignError::Random(why)) if why.contains("broken")),
         "{refused:?}"
     );
-    // A directory is refused too, by the check on the open handle.
-    assert_eq!(
-        HostKey::load(&dir.0).map(|_| ()),
-        Err(SignError::KeyFile {
-            path: dir.0.clone(),
-            why: "not a regular file",
-        })
+    assert_eq!(asked.get(), 1, "it stops at the first failure");
+    let refused = new_key(&mut Lazy).map(|_| ());
+    assert!(
+        matches!(&refused, Err(SignError::Random(why)) if why.contains("zero")),
+        "{refused:?}"
     );
+
+    let key = new_test_key("a label");
+    let image = unsigned_image();
+    let asked = Rc::new(Cell::new(0));
+    let failing =
+        HostKey::from_key_file(key.key_file.as_bytes(), Box::new(Failing(asked.clone()))).unwrap();
+    let refused = sign_krn(&image, &failing, &OPTIONS);
+    assert!(
+        matches!(&refused, Err(SignError::Random(why)) if why.contains("broken")),
+        "{refused:?}"
+    );
+    assert_eq!(asked.get(), 1);
+    let lazy = HostKey::from_test_seed("a label", Box::new(Lazy));
+    let refused = sign_krn(&image, &lazy, &OPTIONS);
+    assert!(
+        matches!(&refused, Err(SignError::Random(why)) if why.contains("zero")),
+        "{refused:?}"
+    );
+    // The same key with randomness that works signs.
+    let working = HostKey::from_test_seed("a label", Box::new(Counter(3)));
+    assert!(sign_krn(&image, &working, &OPTIONS).is_ok());
 }
 
 // ---------------------------------------------------------------- OpenSSL, as an outside check
@@ -503,8 +490,8 @@ fn openssl_accepts(
 fn openssl_accepts_these_signatures() {
     let Some(openssl) = openssl() else { return };
     let dir = TempDir::new("openssl-check");
-    let (paths, keys) = generate(&dir.0, "k", Some("an OpenSSL cross-check"));
-    let signer = HostKey::load(&paths.key).unwrap();
+    let keys = new_test_key("an OpenSSL cross-check").public;
+    let signer = HostKey::from_test_seed("an OpenSSL cross-check", Box::new(Counter(7)));
     let signed = sign_krn(&unsigned_image(), &signer, &OPTIONS).unwrap();
     let parsed = Image::parse(&signed, ParseOptions::default()).unwrap();
     let blocks = SignatureBlock::parse(parsed.signature_block().unwrap()).unwrap();
