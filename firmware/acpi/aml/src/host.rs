@@ -14,8 +14,9 @@
 //! Every call is synchronous and the interpreter runs one evaluation at a time (the contract's
 //! §8). Every method of [`Host`] is called: the clock for the time limit and `Timer`; the region
 //! accesses, `Sleep`, `Stall`, the Global Lock, `Notify`, `Fatal`, `Debug` and `BreakPoint` by
-//! the operators that name them; [`Host::table`] by none yet (`Load` and `LoadTable` wait for
-//! `origin-acpi-tables`); [`Host::trace`] only when [`Host::tracing`] says so.
+//! the operators that name them; [`Host::bridge_bus`] by the walk that names a PCI_Config
+//! region's function; [`Host::table`] by `DataTableRegion` (and, when `origin-acpi-tables`
+//! arrives, by `LoadTable`); [`Host::trace`] only when [`Host::tracing`] says so.
 //!
 //! **No call waits past the time limit** (the review of B1, F9). A call that may wait is given
 //! the time the evaluation has left, and the host must not wait longer:
@@ -25,8 +26,17 @@
 //!   65,534 ms), and a timeout of the cut wait ends the evaluation with [`crate::Limit::Time`];
 //! - [`Host::sleep_ms`] and [`Host::stall_us`] are charged against the time left before they
 //!   are called, and refused if it cannot hold them;
-//! - [`Host::read`], [`Host::write`] and [`Host::transfer`] carry `time_left_100ns`: a device
-//!   that has not answered by then is a [`HostError::Timeout`]. With no time left, none is made.
+//! - [`Host::read`], [`Host::write`], [`Host::transfer`] and [`Host::bridge_bus`] carry
+//!   `time_left_100ns`: a device that has not answered by then is a [`HostError::Timeout`]. With
+//!   no time left, none is made.
+//!
+//! **The other calls return at once** (the review of B2, B2-12): [`Host::now_100ns`],
+//! [`Host::release_global_lock`], [`Host::notify`], [`Host::fatal`], [`Host::debug`],
+//! [`Host::breakpoint`], [`Host::trace`] and [`Host::table`] are given no time because they must
+//! not wait: a host queues a notification, records a report or a trace, and stops in no debugger,
+//! rather than block the evaluation. `table` copies a table the host already holds, from the XSDT
+//! it read at boot; it hands the bytes because `LoadTable` will need them, though
+//! `DataTableRegion` keeps only the address and the length.
 //!
 //! **Tracing allocates nothing**, so that a host tracing the interpreter sees what one that does
 //! not would have done: method paths are written into a fixed buffer of 32 segments, and a deeper
@@ -242,16 +252,18 @@ pub trait Host {
     /// Whatever the host refuses or fails.
     fn release_global_lock(&mut self) -> Result<(), HostError>;
 
-    /// `Notify (node, value)`: `node` is the device, processor or thermal zone's path.
+    /// `Notify (node, value)`: `node` is the device, processor or thermal zone's path. Returns
+    /// at once: the host queues it.
     fn notify(&mut self, node: &[[u8; 4]], value: u64);
 
-    /// `Fatal (kind, code, arg)`: a report (see the module's documentation).
+    /// `Fatal (kind, code, arg)`: a report (see the module's documentation). Returns at once.
     fn fatal(&mut self, kind: u8, code: u32, arg: u64);
 
-    /// A store to the `Debug` object, as text.
+    /// A store to the `Debug` object, as text. Returns at once.
     fn debug(&mut self, text: &[u8]);
 
-    /// `BreakPoint`. Does nothing unless the host has a debugger.
+    /// `BreakPoint`. Does nothing unless the host has a debugger, and returns at once even then:
+    /// the evaluation is never stopped in one.
     fn breakpoint(&mut self) {}
 
     /// Whether this host traces the interpreter: [`Host::trace`] is called only if so.
@@ -259,11 +271,11 @@ pub trait Host {
         false
     }
 
-    /// An event for a host that traces the interpreter.
+    /// An event for a host that traces the interpreter. Returns at once.
     fn trace(&mut self, _event: &Trace<'_>) {}
 
     /// The table the XSDT lists under `key`: its physical address and a copy of its bytes, or
-    /// `None`.
+    /// `None`. Returns at once: the host already holds the table.
     ///
     /// # Errors
     /// Whatever the host refuses or fails.
