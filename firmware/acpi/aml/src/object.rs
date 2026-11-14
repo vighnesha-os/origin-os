@@ -21,11 +21,13 @@ pub(crate) struct ObjRef {
     pub(crate) generation: u32,
 }
 
-/// A handle to a namespace node.
+/// A handle to a namespace node. Its generation is 64 bits: a node slot reused for ever never
+/// brings an old handle back (the independent review of B1, F8). An object handle's 32 bits
+/// suffice, since the collector traces every holder of one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NodeId {
     pub(crate) index: u32,
-    pub(crate) generation: u32,
+    pub(crate) generation: u64,
 }
 
 /// A value as the interpreter moves it: in a local, an argument, a package element, an operand.

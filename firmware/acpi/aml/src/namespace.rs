@@ -28,7 +28,7 @@ pub(crate) enum Owner {
 #[derive(Debug)]
 struct Node {
     name: Seg,
-    generation: u32,
+    generation: u64,
     live: bool,
     parent: u32,
     first: u32,
