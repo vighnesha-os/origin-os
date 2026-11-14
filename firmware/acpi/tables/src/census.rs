@@ -341,6 +341,10 @@ fn parse<'a>(table: &Table<'a>, tally: &mut Tally<'_, 'a>) -> Result<bool, Error
             crate::boot::Bgrt::parse(bytes)?;
         }
         b"FPDT" => crate::boot::Fpdt::parse(bytes)?.census(tally)?,
+        b"NFIT" => crate::nfit::Nfit::parse(bytes)?.census(tally)?,
+        b"NHLT" => crate::nhlt::Nhlt::parse(bytes)?.census(tally)?,
+        b"SDEV" => crate::sdev::Sdev::parse(bytes)?.census(tally)?,
+        b"HMAT" => crate::hmat::Hmat::parse(bytes)?.census(tally)?,
         b"RSDT" | b"XSDT" => {
             for _ in crate::root::Root::parse(bytes)?.entries() {
                 tally.summary.count(0);

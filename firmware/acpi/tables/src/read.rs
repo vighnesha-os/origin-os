@@ -6,7 +6,7 @@ use crate::error::{Error, ErrorKind, Signature};
 
 /// A run of a table's bytes, and where it starts in the table, so a refusal inside a nested
 /// structure still names its offset from the table's first byte.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Bytes<'a> {
     bytes: &'a [u8],
     table: Signature,

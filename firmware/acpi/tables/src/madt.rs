@@ -258,11 +258,15 @@ impl<'a> Madt<'a> {
     /// Checks the whole table: every structure, and what holds between them. At most one local
     /// APIC address override (§5.2.12.8); no two I/O APICs at one address (§5.2.12.3); no two I/O
     /// APICs with one global system interrupt base, which would give them the same input
-    /// (§5.2.13: each input is one I/O APIC's alone).
+    /// (§5.2.13: each input is one I/O APIC's alone); and at most [`MAX_IO_APICS`], as many as
+    /// 8-bit I/O APIC IDs can tell apart, which also bounds the work of the checks between them.
     pub(crate) fn census(&self, tally: &mut Tally<'_, 'a>) -> Result<(), Error> {
         let walk = Walk::new(self.table.reader().rest(ENTRIES)?, Shape::BYTE_BYTE);
         let signature = self.table.signature();
+        let inconsistent = |at, field| Error::new(signature, at, ErrorKind::Inconsistent { field });
         let mut overrides = 0u32;
+        let mut io_apics = [(0u32, 0u32); MAX_IO_APICS];
+        let mut count = 0usize;
         for raw in walk {
             let raw = raw?;
             let entry = decode(&raw, signature)?;
@@ -271,55 +275,43 @@ impl<'a> Madt<'a> {
                 Entry::LocalApicAddressOverride { .. } => {
                     overrides = overrides.saturating_add(1);
                     if overrides > 1 {
-                        return Err(Error::new(
-                            signature,
-                            raw.at,
-                            ErrorKind::Inconsistent {
-                                field: "a second local APIC address override",
-                            },
-                        ));
+                        return Err(inconsistent(raw.at, "a second local APIC address override"));
                     }
                 }
                 Entry::IoApic {
                     address, gsi_base, ..
-                } => self.io_apic_unique(raw.at, address, gsi_base)?,
+                } => {
+                    let seen = io_apics.get(..count).unwrap_or(&[]);
+                    if seen.iter().any(|&(a, _)| a == address) {
+                        return Err(inconsistent(raw.at, "I/O APIC address"));
+                    }
+                    if seen.iter().any(|&(_, g)| g == gsi_base) {
+                        return Err(inconsistent(
+                            raw.at,
+                            "I/O APIC global system interrupt base",
+                        ));
+                    }
+                    let slot = io_apics.get_mut(count).ok_or_else(|| {
+                        Error::new(
+                            signature,
+                            raw.at,
+                            ErrorKind::Value {
+                                field: "more I/O APICs than 8-bit IDs tell apart",
+                            },
+                        )
+                    })?;
+                    *slot = (address, gsi_base);
+                    count = count.saturating_add(1);
+                }
                 _ => {}
             }
         }
         Ok(())
     }
-
-    /// Refuses an I/O APIC at `at` whose address or interrupt base an earlier one has.
-    fn io_apic_unique(&self, at: usize, address: u32, gsi_base: u32) -> Result<(), Error> {
-        let walk = Walk::new(self.table.reader().rest(ENTRIES)?, Shape::BYTE_BYTE);
-        for raw in walk {
-            let raw = raw?;
-            if raw.at >= at {
-                break;
-            }
-            if let Entry::IoApic {
-                address: a,
-                gsi_base: g,
-                ..
-            } = decode(&raw, self.table.signature())?
-            {
-                let field = if a == address {
-                    "I/O APIC address"
-                } else if g == gsi_base {
-                    "I/O APIC global system interrupt base"
-                } else {
-                    continue;
-                };
-                return Err(Error::new(
-                    self.table.signature(),
-                    at,
-                    ErrorKind::Inconsistent { field },
-                ));
-            }
-        }
-        Ok(())
-    }
 }
+
+/// The most I/O APICs a MADT may list: as many as 8-bit I/O APIC IDs tell apart.
+pub const MAX_IO_APICS: usize = 256;
 
 /// Whether any two of `ranges`, each an I/O APIC's interrupt base and its number of inputs (which
 /// the I/O APIC's own registers give, not the MADT), share an interrupt (§5.2.13).
@@ -713,6 +705,20 @@ pub(crate) mod tests {
             }
         );
         assert!(census::check(&madt(&[&a, &ioapic(2, 0xFEC0_1000, 24)])).is_ok());
+        let many: Vec<Vec<u8>> = (0..=MAX_IO_APICS as u32)
+            .map(|i| ioapic(0, 0xFEC0_0000 + i * 0x1000, i * 24))
+            .collect();
+        let refs: Vec<&[u8]> = many.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            census::check(&madt(&refs[..MAX_IO_APICS])).map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(
+            refusal(&refs).kind,
+            ErrorKind::Value {
+                field: "more I/O APICs than 8-bit IDs tell apart"
+            }
+        );
     }
 
     #[test]

@@ -32,12 +32,16 @@ pub mod facs;
 pub mod fadt;
 pub mod gas;
 pub mod header;
+pub mod hmat;
 pub mod madt;
 pub mod memory;
+pub mod nfit;
+pub mod nhlt;
 pub mod platform;
 pub mod ras;
 mod read;
 pub mod root;
+pub mod sdev;
 pub mod srat;
 mod walk;
 
