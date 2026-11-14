@@ -7,6 +7,17 @@
 //! kernel or a program owns. A refusal comes back as [`HostError::Refused`] and ends the
 //! evaluation with that error, reported with the space and address.
 //!
+//! **Two requests are of no region the firmware declared, and a host must decide them knowingly**
+//! (the review of B2's Addendum 2, for step B3's host):
+//!
+//! - [`Host::bridge_bus`] reads a PCI bridge's secondary bus number (its configuration byte
+//!   0x19), which the library needs to name the function of a PCI_Config region below the bridge.
+//!   No `OperationRegion` names it: the host allows it by its kind, or answers from its own
+//!   enumeration of the bus, or refuses it, and then every PCI_Config region below a bridge fails.
+//! - A `DataTableRegion` is a SystemMemory region at the address the host's own [`Host::table`]
+//!   answer gave: the host told the library where the table is, and is then asked to read there.
+//!   It should grant exactly the table it named, and nothing beyond its length.
+//!
 //! **`Fatal` is a report.** [`Host::fatal`] tells the host what the firmware said; the library
 //! then ends the evaluation with an error, and it is for the host to decide what to do. Nothing in
 //! the library ends the host.
