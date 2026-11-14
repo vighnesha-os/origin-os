@@ -26,7 +26,7 @@ use origin_acpi_tables::fadt::{Block, Fadt, Field};
 use origin_acpi_tables::header::{HEADER_LEN, Header};
 use origin_acpi_tables::madt::Madt;
 use origin_acpi_tables::srat::Srat;
-use origin_acpi_tables::{Error, Signature};
+use origin_acpi_tables::{CHANGES_AFTER_BOOT, Error, Signature};
 
 use crate::acpi_text::{Ascii, Refused, Sig, Whose};
 
@@ -193,18 +193,46 @@ pub fn relied_on_fadt(fadt: &Fadt<'_>) -> u32 {
     u32::try_from(faulty).unwrap_or(u32::MAX)
 }
 
-/// Reads the table whose header is at `addr`: the header first, then as many bytes as it says, up
-/// to the most the kernel maps. `Err` if the memory cannot be read.
-fn read_table(fw: &mut impl Firmware, addr: u64) -> Result<(&'static [u8], Header), &'static str> {
-    let first = fw.lend(addr, HEADER_LEN)?;
-    let header = Header::read(first).map_err(|_| "a short header")?;
+/// A table as the census read it: lent, or copied because the firmware changes it after boot.
+enum Read {
+    /// Lent for the kernel's life (`firmware::bytes`): a table the firmware does not change.
+    Lent(&'static [u8]),
+    /// Copied, never lent: a structure [`CHANGES_AFTER_BOOT`] names, wherever it was named
+    /// from (the review's addendum, N3).
+    Copied(Vec<u8>),
+}
+
+/// Reads the table whose header is at `addr`: the header first, by copy, then, if its signature
+/// is not one of [`CHANGES_AFTER_BOOT`], as many bytes as it says, lent, up to the most the kernel
+/// maps; if it is, the whole structure copied and never lent (N3). `Err` if the memory cannot be
+/// read.
+fn read_table(fw: &mut impl Firmware, addr: u64) -> Result<(Read, Header), Uncopied> {
+    let mut first = [0u8; HEADER_LEN];
+    fw.copy(addr, &mut first).map_err(Uncopied::Unreadable)?;
+    let header = Header::read(&first).map_err(|_| Uncopied::Unreadable("a short header"))?;
+    if CHANGES_AFTER_BOOT.iter().any(|s| header.signature.is(s)) {
+        return Ok((Read::Copied(copy_structure(fw, addr, 8)?), header));
+    }
     if header.length > crate::acpi::MAX_TABLE_LENGTH {
-        return Err("longer than the kernel maps a table");
+        return Err(Uncopied::Unreadable("longer than the kernel maps a table"));
     }
     let length = usize::try_from(header.length)
         .unwrap_or(HEADER_LEN)
         .max(HEADER_LEN);
-    Ok((fw.lend(addr, length)?, header))
+    let lent = fw.lend(addr, length).map_err(Uncopied::Unreadable)?;
+    Ok((Read::Lent(lent), header))
+}
+
+/// Checks a copied structure as what its signature says it is: the FACS, or one of the FPDT's
+/// tables.
+fn check_changing(copy: &[u8], signature: Signature) -> Result<(), Error> {
+    let kind = match &signature.0 {
+        b"FACS" => return Facs::parse(copy).map(|_| ()),
+        b"FBPT" => PerformanceKind::Fbpt,
+        b"S3PT" => PerformanceKind::S3pt,
+        _ => PerformanceKind::Mbpt,
+    };
+    PerformanceTable::parse(copy, kind).map(|_| ())
 }
 
 /// Copies the structure at `addr`, whose length is the `u32` at offset 4 of its first `header`
@@ -274,24 +302,59 @@ fn census_at(
     addr: u64,
     expected: Option<&[u8; 4]>,
 ) -> Option<&'static [u8]> {
-    let (bytes, header) = match read_table(fw, addr) {
+    let (read, header) = match read_table(fw, addr) {
         Ok(read) => read,
-        Err(why) => {
+        Err(Uncopied::Unreadable(why)) => {
             found.tables = found.tables.saturating_add(1);
             found.unreadable = found.unreadable.saturating_add(1);
             let _ = writeln!(out, "{LINE}{what}: not readable: {why}");
             return None;
         }
+        Err(Uncopied::TooLarge(length)) => {
+            found.tables = found.tables.saturating_add(1);
+            found.too_large = found.too_large.saturating_add(1);
+            let _ = writeln!(out, "{LINE}{what}: {length} bytes, too large to judge");
+            return None;
+        }
     };
-    let result = match expected {
-        Some(sig) if !header.signature.is(sig) => Err(Error::new(
+    let misnamed = expected.filter(|sig| !header.signature.is(sig)).map(|sig| {
+        Error::new(
             Signature::new(sig),
             0,
             origin_acpi_tables::ErrorKind::Signature {
                 found: header.signature,
             },
-        )),
-        _ => census::check(bytes).map(|c| c.class),
+        )
+    });
+    let bytes = match read {
+        Read::Lent(bytes) => bytes,
+        Read::Copied(copy) => {
+            // A structure the firmware changes after boot, named here as a table (N3): copied,
+            // never lent, and judged as what it is.
+            found.tables = found.tables.saturating_add(1);
+            let result = misnamed.map_or_else(|| check_changing(&copy, header.signature), Err);
+            let _ = write!(
+                out,
+                "{LINE}{what}: {}, {} bytes, copied, never lent: ",
+                Sig(header.signature),
+                copy.len()
+            );
+            match result {
+                Ok(()) => {
+                    found.checked = found.checked.saturating_add(1);
+                    let _ = writeln!(out, "checked");
+                }
+                Err(e) => {
+                    found.refused = found.refused.saturating_add(1);
+                    let _ = writeln!(out, "{}", Refused(e));
+                }
+            }
+            return None;
+        }
+    };
+    let result = match misnamed {
+        Some(e) => Err(e),
+        None => census::check(bytes).map(|c| c.class),
     };
     report(out, found, &header, result).then_some(bytes)
 }
@@ -648,7 +711,15 @@ mod tests {
     impl Firmware for Memory {
         fn lend(&mut self, addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
             self.lent.push(addr);
-            self.range(addr, len)
+            let bytes = self.range(addr, len)?;
+            // As `firmware::bytes` refuses them (N3).
+            if bytes
+                .get(..4)
+                .is_some_and(|s| CHANGES_AFTER_BOOT.iter().any(|c| s == *c))
+            {
+                return Err("the firmware changes it after boot: copy it, never lend it");
+            }
+            Ok(bytes)
         }
         fn copy(&mut self, addr: u64, out: &mut [u8]) -> Result<(), &'static str> {
             out.copy_from_slice(self.range(addr, out.len())?);
@@ -992,5 +1063,36 @@ mod tests {
             "{out}"
         );
         assert!(last_line(&out).contains(", 1 too large to judge,"), "{out}");
+    }
+
+    /// The review's addendum, N3: a structure the firmware changes after boot is copied and never
+    /// lent, wherever it is named from: an XSDT entry that names the FACS gets it judged as a FACS;
+    /// a DSDT pointer that names it gets a refusal, without lending it.
+    #[test]
+    fn a_changing_structure_is_never_lent_wherever_it_is_named() {
+        let mut m = Machine::new();
+        m.entries.push(FACS);
+        let (ok, out, lent) = m.run();
+        assert!(ok, "{out}");
+        assert!(
+            out.contains("an XSDT entry: FACS, 64 bytes, copied, never lent: checked"),
+            "{out}"
+        );
+        assert!(!lent.contains(&FACS), "{lent:x?}");
+        let mut m = Machine::new();
+        m.fadt(|f| {
+            f[40..44].copy_from_slice(&u32::try_from(FACS).unwrap().to_le_bytes());
+            f[140..148].copy_from_slice(&FACS.to_le_bytes());
+        });
+        let (ok, out, lent) = m.run();
+        assert!(!ok);
+        assert!(
+            out.contains(
+                "the DSDT: FACS, 64 bytes, copied, never lent: refused at 0x0: signature FACS \
+                 where another was expected"
+            ),
+            "{out}"
+        );
+        assert!(!lent.contains(&FACS), "{lent:x?}");
     }
 }

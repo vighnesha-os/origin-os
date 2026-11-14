@@ -20,9 +20,20 @@ use crate::vm;
 /// takes and releases (ACPI 6.6 §5.2.10.1), the FPDT's FBPT and S3PT, which the firmware
 /// rewrites on resume (§5.2.24.8, §5.2.24.10), or a channel's shared memory: [`copy`] reads
 /// those (the independent review of TASKS item 62, F2).
+///
+/// The rule is enforced, not only written (the review's addendum, N3): before lending, the first
+/// four bytes are copied and compared with `origin_acpi_tables::CHANGES_AFTER_BOOT`, and a range
+/// that starts with one of those signatures is refused, wherever it was named from. Its reader
+/// copies it instead.
 pub fn bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
     if addr == 0 || addr.checked_add(len as u64).is_none() {
         return Err("bad table address");
+    }
+    if let Some(mut signature) = (len >= 4).then_some([0u8; 4]) {
+        copy(addr, &mut signature)?;
+        if origin_acpi_tables::CHANGES_AFTER_BOOT.contains(&&signature) {
+            return Err("the firmware changes it after boot: copy it, never lend it");
+        }
     }
     vm::firmware_bytes(PhysAddr::new(addr), len as u64).map_err(|_| "cannot map an ACPI table")
 }

@@ -184,6 +184,12 @@ mod hostile;
 #[cfg(test)]
 mod testing;
 
+/// The signatures of the firmware's structures that change after boot, which a reader must copy
+/// and never hold by reference, wherever it finds them named (the independent review's addendum,
+/// N3): the FACS, whose global lock firmware in SMM takes and releases (§5.2.10.1), and the
+/// FPDT's FBPT, S3PT and MBPT, which the firmware rewrites on resume (§5.2.24.8, §5.2.24.10).
+pub const CHANGES_AFTER_BOOT: [&[u8; 4]; 4] = [b"FACS", b"FBPT", b"S3PT", b"MBPT"];
+
 pub use error::{Error, ErrorKind, Signature};
 pub use read::{Guid, sums_to_zero};
 pub use walk::Raw;
