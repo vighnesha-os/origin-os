@@ -4172,6 +4172,9 @@ const NO_PANIC_AML_PARTS: &[&str] = &[
     "4core3fmt3num",
 ];
 
+/// What `origin-aml`'s object must define: the concrete instantiation and the engine's loop.
+const NO_PANIC_AML_REQUIRED: &[&str] = &["14no_panic_probe", "10run_frames"];
+
 /// Freestanding libraries whose object rightly holds no symbols at all: every item in them is
 /// generic, so nothing is compiled until a user instantiates it, and the no-panic check has
 /// nothing of theirs to read. Listed by name so that nothing else can pass having shown nothing.
@@ -4260,11 +4263,21 @@ fn no_panic_check() -> Result {
             undefined.len()
         );
     }
-    // The AML interpreter, with `alloc` (ADR-0019 A3): its own allowance, nothing else.
+    // The AML interpreter, with `alloc` (ADR-0019 A3): its own allowance, nothing else. Its
+    // interpreter is generic over its host, so the object holds the engine only through
+    // `no_panic_probe`, a concrete instantiation; the check requires it and the engine's loop in
+    // the object, so that losing them fails here (the review of TASKS 63's B1, F3).
     let obj = build_kernel_object(AML_PACKAGE, &out_dir)?;
     let undefined = nm_symbols(&nm, &obj, "-u")?;
     let own = nm_symbols(&nm, &obj, "--defined-only")?;
     require_symbols(AML_PACKAGE, &obj, own.len() + undefined.len())?;
+    for needed in NO_PANIC_AML_REQUIRED {
+        if !own.iter().any(|s| s.contains(needed)) {
+            return Err(format!(
+                "{AML_PACKAGE}: the release object defines no symbol containing `{needed}`: the no-panic check would not see the interpreter"
+            ));
+        }
+    }
     let bad: Vec<&str> = undefined
         .iter()
         .map(String::as_str)
@@ -4281,7 +4294,8 @@ fn no_panic_check() -> Result {
         ));
     }
     println!(
-        "xtask: no-panic check: {AML_PACKAGE} ({KERNEL_TARGET}, release) references {} external symbols, all within its allowance (allocator entry points, an unreachable `handle_error`, `core::fmt`)",
+        "xtask: no-panic check: {AML_PACKAGE} ({KERNEL_TARGET}, release, the interpreter instantiated by `no_panic_probe`: {} symbols of its own) references {} external symbols, all within its allowance (allocator entry points, an unreachable `handle_error`, `core::fmt`)",
+        own.len(),
         undefined.len()
     );
     Ok(())

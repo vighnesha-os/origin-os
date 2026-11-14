@@ -58,6 +58,7 @@ mod namespace;
 mod object;
 mod op;
 mod osi;
+mod probe;
 mod region;
 mod store;
 mod sync;
@@ -71,6 +72,8 @@ pub use error::{At, Error, ErrorKind, Feature, Limit, Result};
 pub use host::{BufferAccess, Host, HostError, PciAddress, RegionAccess, Space, TableKey, Trace};
 pub use init::InitOutcome;
 pub use osi::{OS_NAME, OSI_STRINGS, REV};
+#[doc(hidden)]
+pub use probe::no_panic_probe;
 pub use value::{Node, Value};
 
 use alloc::vec::Vec;

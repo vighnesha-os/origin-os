@@ -6,7 +6,7 @@
 //!   functioning. A failing `_STA` or `_INI` is reported, and the walk goes on with the next
 //!   sibling, skipping what is below the device.
 //! - [`Interpreter::connect_space`] runs `_REG (space, 1)` (or `0` on a disconnect) once in each
-//!   scope that declares a region of that space, each scope in its node slot's order. SystemMemory and SystemIO are always available and get
+//!   scope that declares a region of that space, scopes in definition order. SystemMemory and SystemIO are always available and get
 //!   none, nor do PCI_Config regions declared in a scope with a `_BBN` (a root bus), as §6.5.4
 //!   says.
 //!
@@ -181,36 +181,40 @@ impl<H: Host> Interpreter<H> {
 
     /// The scopes that declare a region of `space`, each once, in definition order.
     fn region_scopes(&mut self, space: Space, out: &mut Vec<NodeId>) -> Result<()> {
+        // Each node is a candidate scope once, in definition order, and each child is looked at
+        // once as a possible region of the space: linear, and no scope listed twice.
         let root = crate::namespace::Namespace::root();
-        let mut next = self.ns.first_child(root);
+        let mut next = Some(root);
         while let Some(cur) = next {
-            let is_region = matches!(
-                self.ns.obj(cur).ok().and_then(|o| self.heap.get(o).ok()),
-                Some(Object::Region(r)) if r.space == space.0
-            );
-            if is_region && let Some(scope) = self.ns.parent(cur) {
-                let root_bus =
-                    space == Space::PCI_CONFIG && self.ns.child(scope, *b"_BBN").is_some();
-                if !root_bus && !out.contains(&scope) {
-                    mem::push(out, scope, &mut self.budget)?;
+            let mut child = self.ns.first_child(cur);
+            let mut declares = false;
+            while let Some(c) = child {
+                if matches!(
+                    self.ns.obj(c).ok().and_then(|o| self.heap.get(o).ok()),
+                    Some(Object::Region(r)) if r.space == space.0
+                ) {
+                    declares = true;
+                    break;
                 }
+                child = self.ns.next_sibling(c);
+            }
+            let root_bus = space == Space::PCI_CONFIG && self.ns.child(cur, *b"_BBN").is_some();
+            if declares && !root_bus {
+                mem::push(out, cur, &mut self.budget)?;
             }
             next = self.ns.first_child(cur);
             let mut up = cur;
-            while next.is_none() {
+            while next.is_none() && up != root {
                 if let Some(s) = self.ns.next_sibling(up) {
                     next = Some(s);
                     break;
                 }
                 match self.ns.parent(up) {
-                    Some(p) if p != root => up = p,
-                    _ => break,
+                    Some(p) => up = p,
+                    None => break,
                 }
             }
         }
-        // Each scope once, without a search per region: sorted, then repeats dropped, in place.
-        out.sort_unstable_by_key(|n| n.index);
-        out.dedup();
         Ok(())
     }
 }

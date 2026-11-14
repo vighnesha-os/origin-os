@@ -60,13 +60,8 @@ impl<H: Host> Interpreter<H> {
 
     /// A serialized method returns: its implicit mutex goes.
     pub(crate) fn drop_implicit(&mut self, call: u64) {
-        if let Some(i) = self
-            .held
-            .iter()
-            .rposition(|h| h.mutex.is_none() && h.call == call)
-        {
-            self.held.remove(i);
-        }
+        // One entry per activation: `retain` removes it without a panicking index.
+        self.held.retain(|h| !(h.mutex.is_none() && h.call == call));
     }
 
     /// Releases everything held (an evaluation ends or is aborted). Returns whether anything was.
@@ -154,9 +149,9 @@ impl<H: Host> Interpreter<H> {
         if let Object::Mutex(m) = self.heap.get_mut(r)? {
             m.depth = 0;
         }
-        if let Some(i) = self.held.iter().rposition(|h| h.mutex == Some(r)) {
-            self.held.remove(i);
-        }
+        // A mutex has one entry, its first acquisition: `retain` removes it without a panicking
+        // index.
+        self.held.retain(|h| h.mutex != Some(r));
         if m.global {
             self.host.release_global_lock().map_err(ErrorKind::Host)?;
         }
