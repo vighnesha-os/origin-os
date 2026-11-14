@@ -93,8 +93,10 @@ pub(crate) enum BlockKind {
     While,
 }
 
-/// A frame.
+/// A frame. Kept unboxed on purpose: the frames live in one vector that `mem.rs` grows, and a box
+/// per operand frame would be an allocation the allocation discipline does not allow.
 #[derive(Clone, Copy, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Frame {
     Block {
         kind: BlockKind,
