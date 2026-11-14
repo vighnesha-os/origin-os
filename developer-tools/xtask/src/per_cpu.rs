@@ -205,7 +205,7 @@ fn module_path(dir: &str, rel: &str) -> Option<String> {
 
 /// Token ranges `[start, end)` that only tests compile: an item after `#[cfg(test)]` or a
 /// `#[cfg(all(test, …))]` (not `not(test)`), through its closing brace.
-fn test_ranges(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
+pub(crate) fn test_ranges(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
@@ -244,7 +244,7 @@ fn test_ranges(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
 }
 
 /// Whether token `i` lies in one of `ranges`.
-fn in_ranges(ranges: &[(usize, usize)], i: usize) -> bool {
+pub(crate) fn in_ranges(ranges: &[(usize, usize)], i: usize) -> bool {
     ranges.iter().any(|&(a, b)| (a..b).contains(&i))
 }
 
