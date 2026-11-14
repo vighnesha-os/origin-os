@@ -33,7 +33,7 @@ One row for each statement of CLAUDE.md in §39 to §41. The columns and their r
 | S40-16 | Implement or select an independently authored, standards-informed filesystem design with: Power-loss recovery. | build | both/hw | 11 | not-started | - | - | - | - | none | - | - |
 | S40-17 | Do not declare a filesystem production-ready without extensive corruption and recovery testing. | rule | both/hw | 11 | not-started | - | - | - | - | none | - | - |
 | S41-01 | Define the semantics of: Durable writes. | build | both/hw | 11 | not-started | - | - | - | - | none | - | - |
-| S41-02 | Define the semantics of: Flush operations. | build | both/hw | 11 | not-started | - | - | - | - | none | - | - |
+| S41-02 | Define the semantics of: Flush operations. | build | both/hw | 11 | not-started | - | - | - | - | none | Base 2.4 §7.2 (p. 593) was read on 2026-11-14 (`docs/research/2026-11-14-nvme-2-4-check.md`): a flush covers the commands completed before it was submitted, and succeeds with no volatile write cache. | - |
 | S41-03 | Define the semantics of: Directory updates. | build | both/hw | 11 | not-started | - | - | - | - | none | - | - |
 | S41-04 | Define the semantics of: Rename atomicity. | build | both/hw | 11 | not-started | - | - | - | - | none | - | - |
 | S41-05 | Define the semantics of: Metadata ordering. | build | both/hw | 11 | not-started | - | - | - | - | none | - | - |
