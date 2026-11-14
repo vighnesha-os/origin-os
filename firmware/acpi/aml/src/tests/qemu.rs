@@ -1,15 +1,21 @@
 //! QEMU's own tables, when a directory of them is given (the coordinating session's ruling of
 //! 2026-11-14: they are QEMU's output and stay out of the repository). `ORIGIN_AML_TABLES` names
-//! a directory searched for files whose first four bytes are `DSDT` or `SSDT`; each DSDT is loaded
-//! with the SSDTs beside it, and the named results the boot proof will check (step B3) are checked
-//! here. Without the variable the test does nothing and says so.
+//! a directory searched for files whose first four bytes are `DSDT` or `SSDT`; each DSDT is loaded,
+//! then the SSDTs in its own directory, and the named results the boot proof will check (step B3)
+//! are checked. Without the variable the test does nothing and says so.
+//!
+//! This is the only check of the parser against tables it did not make (the review of B1, F10 and
+//! F15), and `check` does not run it: it is run by hand, and its runs are recorded in the
+//! provenance entry. The five dumps of QEMU 11.1.3 read so far hold no SSDT. Step B3's boot proof
+//! is to dump the tables it reads and run this test on them.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{TestHost, tables_standin};
 use crate::{Config, ErrorKind, InitOutcome, Interpreter, Limits, Value};
 
-fn tables_in(dir: &Path) -> Vec<Vec<u8>> {
+/// Every DSDT and SSDT under `dir`, with the directory it is in.
+fn tables_in(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -24,7 +30,7 @@ fn tables_in(dir: &Path) -> Vec<Vec<u8>> {
             } else if let Ok(bytes) = std::fs::read(&p)
                 && (bytes.starts_with(b"DSDT") || bytes.starts_with(b"SSDT"))
             {
-                out.push(bytes);
+                out.push((d.clone(), bytes));
             }
         }
     }
@@ -38,9 +44,10 @@ fn qemu_tables_load_and_answer() {
         return;
     };
     let tables = tables_in(Path::new(&dir));
-    let dsdts: Vec<&Vec<u8>> = tables.iter().filter(|t| t.starts_with(b"DSDT")).collect();
+    let dsdts: Vec<&(PathBuf, Vec<u8>)> =
+        tables.iter().filter(|t| t.1.starts_with(b"DSDT")).collect();
     assert!(!dsdts.is_empty(), "no DSDT under {dir:?}");
-    for dsdt in dsdts {
+    for (here, dsdt) in dsdts {
         let (block, width) = tables_standin::block(dsdt).expect("QEMU's DSDT is well-formed");
         let start = std::time::Instant::now();
         let mut i = Interpreter::new(
@@ -52,6 +59,15 @@ fn qemu_tables_load_and_answer() {
         )
         .unwrap();
         i.load(block).expect("QEMU's DSDT loads");
+        let mut ssdts = 0usize;
+        for (_, ssdt) in tables
+            .iter()
+            .filter(|(d, t)| d == here && t.starts_with(b"SSDT"))
+        {
+            let (block, _) = tables_standin::block(ssdt).expect("QEMU's SSDT is well-formed");
+            i.load(block).expect("QEMU's SSDT loads");
+            ssdts += 1;
+        }
         let loaded = start.elapsed();
         assert_eq!(
             i.evaluate("\\_S5_", &[]).unwrap(),
@@ -102,11 +118,12 @@ fn qemu_tables_load_and_answer() {
             && matches!(o, InitOutcome::StaFailed(e) if matches!(e.kind, ErrorKind::Region { space: 2, .. }))));
         assert_eq!(i.host().global_held, 0, "the Global Lock was given back");
         eprintln!(
-            "QEMU DSDT ({} bytes, revision {}): loaded in {:?}; {} nodes, {} objects, {} bytes held; \
+            "QEMU DSDT ({} bytes, revision {}) and {} SSDTs: loaded in {:?}; {} nodes, {} objects, {} bytes held; \
              walk in {:?}: {} devices, {} initialized, _STA refused in SystemMemory {}, SystemIO {}, \
              PCI_Config {}, {} other",
             dsdt.len(),
             dsdt[8],
+            ssdts,
             loaded,
             i.node_count(),
             i.object_count(),
