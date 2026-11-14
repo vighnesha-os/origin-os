@@ -436,9 +436,9 @@ pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
         return polled;
     }
     let interrupts = polled && prove_interrupts(com1, cpus, tsc_hz);
-    let order = queue_order(cpus);
-    let per_cpu = interrupts && prove_per_cpu(com1, &order, tsc_hz);
-    let x2apic = per_cpu && prove_x2apic(com1, &order);
+    let (order, left_out) = queue_order(cpus);
+    let per_cpu = interrupts && prove_per_cpu(com1, &order, &left_out, tsc_hz);
+    let x2apic = per_cpu && prove_x2apic(com1, cpus, &order);
     x2apic && crate::block::prove(com1)
 }
 
@@ -1186,15 +1186,33 @@ pub(crate) static CPU_RESULT: PerCpu<[AtomicU64; 3]> = PerCpu::new(
     || [const { AtomicU64::new(0) }; 3],
 );
 
-/// The order processors get I/O queues of their own when the controller has fewer than there
-/// are processors (ADR-0008 Amendment 1, D6, which leaves the order open; review finding F1 of
-/// 2026-11-14): every processor whose APIC ID is above 255 first, so that interrupts through
-/// remapping to them are proven wherever any processor has a queue, then the rest in table
-/// order.
-fn queue_order(online: &[CpuIndex]) -> Vec<CpuIndex> {
-    let mut order = online.to_vec();
-    order.sort_by_key(|c| !c.apic_id().is_some_and(|id| id > 0xFF));
-    order
+/// The processors that may get I/O queues of their own, in the order they get them, and those
+/// left out because no MSI can reach them (`nvme::queue_order`): with interrupt remapping, the
+/// processors above APIC ID 255 first (review finding F1 of 2026-11-14); without it, those left
+/// out (review finding N1).
+fn queue_order(online: &[CpuIndex]) -> (Vec<CpuIndex>, Vec<CpuIndex>) {
+    nvme::queue_order(online, crate::iommu::remapping(), CpuIndex::apic_id)
+}
+
+/// The processors no MSI can reach, by name, for the per-processor line (review finding N1 of
+/// 2026-11-14): the first 16, then how many more. Empty when there are none.
+fn left_out_text(left_out: &[CpuIndex]) -> alloc::string::String {
+    let mut text = alloc::string::String::new();
+    if left_out.is_empty() {
+        return text;
+    }
+    let _ = write!(
+        text,
+        "; {} left out, which no MSI reaches without interrupt remapping:",
+        left_out.len()
+    );
+    for (i, cpu) in left_out.iter().take(16).enumerate() {
+        let _ = write!(text, "{}{}", if i == 0 { " " } else { ", " }, cpu.named());
+    }
+    if left_out.len() > 16 {
+        let _ = write!(text, " and {} more", left_out.len() - 16);
+    }
+    text
 }
 
 /// For each processor `k` (by position in `cpus`, which is [`queue_order`]'s) while the
@@ -1383,10 +1401,15 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
 
 /// Every processor given a queue pair and vector of its own reads and writes through them at the
 /// same time: every read must match, every write read back, and each processor's interrupts
-/// must have arrived on that processor. `order` is every online processor, in
-/// [`queue_order`]'s order. How many get a queue is judged on the controller's own numbers, and
+/// must have arrived on that processor. `order` is every online processor an MSI can reach, in
+/// [`queue_order`]'s order, and `left_out` those it cannot (review finding N1). How many get a queue is judged on the controller's own numbers, and
 /// the slots actually filled are counted (review findings F3 and F5 of 2026-11-14).
-fn prove_per_cpu(com1: &mut Console, order: &[CpuIndex], tsc_hz: u64) -> bool {
+fn prove_per_cpu(
+    com1: &mut Console,
+    order: &[CpuIndex],
+    left_out: &[CpuIndex],
+    tsc_hz: u64,
+) -> bool {
     let Some((setup, own)) = with_driver_out(|d| {
         let own = (
             d.nvme.allocated.0,
@@ -1428,10 +1451,12 @@ fn prove_per_cpu(com1: &mut Console, order: &[CpuIndex], tsc_hz: u64) -> bool {
     // A valid controller with no pair, vector or doorbell past the driver's two gives no
     // processor a queue of its own: not proven, and nothing wrong (the coordinating session's
     // rulings of 2026-11-14, as `irq::prove` treats an 8254 that does not count).
+    // The processors no MSI can reach are counted and named, and left out of `expected` (N1).
+    let left = left_out_text(left_out);
     if expected == 0 && given == 0 && filled == 0 {
         let _ = writeln!(
             com1,
-            "origin-kernel: NVMe: per-CPU queues: not proven: {numbers}"
+            "origin-kernel: NVMe: per-CPU queues: not proven: {numbers}{left}"
         );
         return true;
     }
@@ -1440,9 +1465,9 @@ fn prove_per_cpu(com1: &mut Console, order: &[CpuIndex], tsc_hz: u64) -> bool {
     let consistent = expected > 0 && given == expected && filled == expected;
     let _ = writeln!(
         com1,
-        "origin-kernel: NVMe: per-CPU queues: {given} of {} processors have an I/O queue pair and MSI-X vector of their own, {} have none ({numbers}): {expected} expected, {filled} filled{}",
-        order.len(),
-        order.len().saturating_sub(given),
+        "origin-kernel: NVMe: per-CPU queues: {given} of {} processors have an I/O queue pair and MSI-X vector of their own, {} have none ({numbers}): {expected} expected, {filled} filled{left}{}",
+        order.len() + left_out.len(),
+        (order.len() + left_out.len()).saturating_sub(given),
         if consistent { "" } else { ": NVMe failed" }
     );
     if !consistent {
@@ -1528,15 +1553,18 @@ fn prove_per_cpu(com1: &mut Console, order: &[CpuIndex], tsc_hz: u64) -> bool {
 ///   nobody, and the thread would sleep until its deadline instead.
 ///
 /// With no such processor (APIC IDs 0-255) there is nothing beyond compatibility format to
-/// prove; that is reported, and passes. `cpus` is in [`queue_order`]'s order, so the processors
-/// above 255 are the first to get queues (review finding F1 of 2026-11-14), and only a controller
-/// with none past the driver's leaves them unproven.
-fn prove_x2apic(com1: &mut Console, cpus: &[CpuIndex]) -> bool {
-    // Only the processors with an NVMe queue of their own can be proven through it (D6).
+/// prove; that is reported, and passes. `cpus` is in [`queue_order`]'s order: with remapping the
+/// processors above 255 are the first to get queues (review finding F1 of 2026-11-14), and only a
+/// controller with none past the driver's leaves them unproven; without it they are left out, no
+/// MSI can reach them, and that is reported, and passes (review finding N1). `online` is every
+/// online processor.
+fn prove_x2apic(com1: &mut Console, online: &[CpuIndex], cpus: &[CpuIndex]) -> bool {
+    // Only the processors with an NVMe queue of their own can be proven through it (D6). Those
+    // above 255 are counted among every online processor, since without remapping they are not
+    // in `cpus` at all (review finding N1).
     let queued = QUEUED.load(Ordering::Relaxed);
-    let wide_without = cpus
+    let all_wide = online
         .iter()
-        .skip(queued)
         .filter(|c| c.apic_id().is_some_and(|id| id > 0xFF))
         .count();
     let wide: Vec<(usize, CpuIndex, u32)> = cpus
@@ -1546,6 +1574,7 @@ fn prove_x2apic(com1: &mut Console, cpus: &[CpuIndex]) -> bool {
         .filter_map(|(k, &c)| c.apic_id().map(|id| (k, c, id)))
         .filter(|&(_, _, id)| id > 0xFF)
         .collect();
+    let wide_without = all_wide - wide.len();
     if wide.is_empty() && wide_without > 0 {
         let _ = writeln!(
             com1,
@@ -1554,7 +1583,7 @@ fn prove_x2apic(com1: &mut Console, cpus: &[CpuIndex]) -> bool {
         return true;
     }
     if wide.is_empty() {
-        let largest = cpus.iter().filter_map(|c| c.apic_id()).max().unwrap_or(0);
+        let largest = online.iter().filter_map(|c| c.apic_id()).max().unwrap_or(0);
         let _ = writeln!(
             com1,
             "origin-kernel: x2APIC: no online processor has an APIC ID above 255 (the largest is {largest}): nothing beyond compatibility-format MSI to prove"

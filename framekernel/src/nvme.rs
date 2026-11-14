@@ -117,6 +117,35 @@ pub const fn doorbell_queues(stride: u64, bar_size: u64) -> u16 {
     }
 }
 
+/// The processors that may get an I/O queue of their own, in the order they get them, and those
+/// left out (ADR-0008 Amendment 1, D6, which leaves the order open). `apic` gives a processor's
+/// APIC ID.
+///
+/// - **With interrupt remapping**, every processor whose APIC ID is above 255 comes first, so that
+///   interrupts through remapping to them are proven wherever any processor has a queue (review
+///   finding F1 of 2026-11-14), then the rest in table order. None is left out.
+/// - **Without it**, an MSI is in compatibility format, which carries 8 bits of APIC ID
+///   (`pci::msi_address`): a processor it cannot reach gets no queue and is left out, and the rest
+///   keep table order (review finding N1). Before N1, such a processor first in the order made
+///   the driver's set-up fail, and storage was withdrawn.
+///
+/// A processor with no APIC ID is left out either way.
+pub fn queue_order<T: Copy>(
+    cpus: &[T],
+    remapping: bool,
+    apic: impl Fn(T) -> Option<u32>,
+) -> (alloc::vec::Vec<T>, alloc::vec::Vec<T>) {
+    let reachable =
+        |cpu: T| apic(cpu).is_some_and(|id| remapping || crate::pci::msi_address(id).is_some());
+    let (mut order, left_out): (alloc::vec::Vec<T>, alloc::vec::Vec<T>) =
+        cpus.iter().copied().partition(|&cpu| reachable(cpu));
+    if remapping {
+        // Stable: table order within each group.
+        order.sort_by_key(|&cpu| !apic(cpu).is_some_and(|id| id > 0xFF));
+    }
+    (order, left_out)
+}
+
 /// The processors that get an I/O queue pair and an MSI-X vector of their own (ADR-0008
 /// Amendment 1, D6), from the controller's own numbers, never the driver's (review findings F3
 /// and F5 of 2026-11-14): `online` processors, `vectors` in its MSI-X table, `sqs` submission
@@ -902,6 +931,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Review findings F1 and N1 of 2026-11-14: with interrupt remapping the processors above
+    /// APIC ID 255 come first and none is left out; without it they are left out, the rest keep
+    /// table order, and a processor with no APIC ID is left out either way.
+    #[test]
+    fn queues_go_above_255_first_only_with_remapping() {
+        // The sparse machine's shape: indexes 0 to 4 at IDs 0 to 4, then 256, 300 and 412.
+        let ids = [0, 1, 2, 3, 4, 256, 300, 412];
+        let apic = |i: usize| ids.get(i).copied();
+        let cpus: alloc::vec::Vec<usize> = (0..ids.len()).collect();
+        let (order, left_out) = queue_order(&cpus, true, apic);
+        assert_eq!(order, [5, 6, 7, 0, 1, 2, 3, 4]);
+        assert!(left_out.is_empty());
+        let (order, left_out) = queue_order(&cpus, false, apic);
+        assert_eq!(order, [0, 1, 2, 3, 4]);
+        assert_eq!(left_out, [5, 6, 7]);
+        // The per-processor count is then taken over the processors that remain.
+        let bar = doorbell_queues(4, 16 << 10);
+        assert_eq!(per_cpu_queues(order.len(), 65, 64, 64, bar), 5);
+        // APIC ID 255 is the last a compatibility-format MSI reaches.
+        let edge = [255, 256];
+        let (order, left_out) = queue_order(&[0, 1], false, |i: usize| edge.get(i).copied());
+        assert_eq!((order, left_out), (alloc::vec![0], alloc::vec![1]));
+        // No APIC ID: left out, with remapping or without.
+        for remapping in [true, false] {
+            let (order, left_out) =
+                queue_order(&[0, 1], remapping, |i: usize| (i == 0).then_some(7));
+            assert_eq!((order, left_out), (alloc::vec![0], alloc::vec![1]));
+        }
+        // A machine with every ID at or below 255 is the same either way.
+        let dense: alloc::vec::Vec<usize> = (0..4).collect();
+        let small = |i: usize| Some(i as u32);
+        assert_eq!(
+            queue_order(&dense, true, small),
+            queue_order(&dense, false, small)
+        );
     }
 
     /// Each of the controller's own numbers bounds the per-processor queues by itself, and two of
