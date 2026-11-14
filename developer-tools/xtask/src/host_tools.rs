@@ -111,9 +111,13 @@ const LIBRARIES: &[&str] = &[
 ];
 
 /// The modules of `std` that reach the host.
-const HOST_MODULES: &[&str] = &["fs", "process", "env", "net", "os", "time"];
+/// `std::path` among them: `Path::exists`, `is_file`, `metadata`, `read_dir` and
+/// `canonicalize` read the file system (the review of 2026-11-14, finding F4).
+const HOST_MODULES: &[&str] = &["fs", "process", "env", "net", "os", "time", "path"];
 
-/// The standard streams, in `std::io`.
+/// The standard streams, in `std::io`: refused as identifiers wherever they stand in a library,
+/// so `use std::io::{self, Write}` and then `io::stderr()`, or `use std::io as sio` and then
+/// `sio::stdout()`, are caught (the review of 2026-11-14, finding F3).
 const STREAMS: &[&str] = &["stdin", "stdout", "stderr"];
 
 /// The macros that print.
@@ -457,9 +461,6 @@ pub(crate) fn library_hits(source: &str) -> Vec<Hit> {
                     [module, ..] if HOST_MODULES.contains(module) => {
                         Some(format!("`{shown}`: `std::{module}` reaches the host"))
                     }
-                    ["io", stream, ..] if STREAMS.contains(stream) => Some(format!(
-                        "`{shown}`: a library does not use the standard streams"
-                    )),
                     _ if path.contains(&"*") => Some(format!(
                         "`{shown}`: a glob import from `std` can bring the host in unnamed"
                     )),
@@ -480,6 +481,15 @@ pub(crate) fn library_hits(source: &str) -> Vec<Hit> {
                 token,
                 format!(
                     "`{text}`: a device of the host; take its bytes from the caller (ADR-0011 Amendment 4, T1)"
+                ),
+            );
+        }
+        if token.kind == Kind::Ident && STREAMS.contains(&token.text) {
+            hit(
+                token,
+                format!(
+                    "`{}`: the standard streams reach the host; a library returns what it has to say (ADR-0011 Amendment 4, T1)",
+                    token.text
                 ),
             );
         }
@@ -650,6 +660,24 @@ pub fn planted_control_read(path: &str) -> Vec<u8> {
 }
 "#;
 
+/// A standard stream reached through `std::io` imported as a module (the review of 2026-11-14,
+/// finding F3): planted by the controls.
+const PLANTED_STREAM: &str = r#"
+use std::io::{self, Write};
+pub fn planted_control_say(text: &str) {
+    let _ = writeln!(io::stderr(), "{text}");
+}
+"#;
+
+/// The file system reached through `std::path` (the review of 2026-11-14, finding F4): planted by
+/// the controls.
+const PLANTED_PATH: &str = r#"
+use std::path::Path;
+pub fn planted_control_exists(path: &str) -> bool {
+    Path::new(path).is_file()
+}
+"#;
+
 /// The gate's negative controls, on copies of real files with a fault planted in each: each
 /// must be refused. Returns how many were caught, or the controls that were not.
 fn controls(
@@ -686,6 +714,8 @@ fn controls(
             &["`std::fs::read`"],
             "host access after a test-only field",
         ),
+        (PLANTED_STREAM, &["`stderr`"], "a stream through `std::io`"),
+        (PLANTED_PATH, &["`std::path::Path`"], "`std::path`"),
     ];
     let real = library_hits(sign_lib).len();
     for (planted, needles, name) in library_controls {

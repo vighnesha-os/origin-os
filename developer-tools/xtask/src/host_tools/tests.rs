@@ -64,7 +64,7 @@ fn the_gate_s_own_controls_are_caught() {
             &programs,
             &sign_lib
         ),
-        Ok(5)
+        Ok(7)
     );
     // A control is missed when the rule it tests is gone: with no first-party programs, the
     // path control finds nothing to name.
@@ -236,9 +236,35 @@ fn host_access_in_a_library_is_caught_however_it_is_spelled() {
         ),
         ("use std::fs as files;", "std::fs"),
         // The standard streams.
-        ("use std::io::{self, stdout};", "std::io::stdout"),
-        ("fn e() { let _ = std::io::stderr(); }", "std::io::stderr"),
-        ("use std::io::stdin;", "std::io::stdin"),
+        ("use std::io::{self, stdout};", "`stdout`"),
+        ("fn e() { let _ = std::io::stderr(); }", "`stderr`"),
+        ("use std::io::stdin;", "`stdin`"),
+        // Through `std::io` imported as a module or renamed (finding F3).
+        (
+            "use std::io::{self, Write};\nfn e() { let _ = writeln!(io::stderr(), \"x\"); }",
+            "`stderr`",
+        ),
+        (
+            "use std::io as sio;\nfn o() { let _ = sio::stdout(); }",
+            "`stdout`",
+        ),
+        (
+            "use std::io::stdin as input;\nfn i() { let _ = input(); }",
+            "`stdin`",
+        ),
+        // `std::path` reaches the file system (finding F4).
+        (
+            "use std::path::Path;\nfn x(p: &str) -> bool { Path::new(p).is_file() }",
+            "`std::path::Path`",
+        ),
+        (
+            "fn y(p: &str) -> bool { ::std::path::Path::new(p).exists() }",
+            "`std::path::Path::new`",
+        ),
+        (
+            "use std::{collections::BTreeMap, path::PathBuf};",
+            "`std::path::PathBuf`",
+        ),
         // Globs.
         ("use std::*;", "std::*"),
         ("use std::io::*;", "std::io::*"),
