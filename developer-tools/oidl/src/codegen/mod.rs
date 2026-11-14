@@ -5,6 +5,8 @@ pub mod c;
 pub mod doc;
 pub mod rust;
 
+use crate::corpus;
+use crate::fingerprint;
 use crate::model::Compilation;
 
 /// One generated file.
@@ -72,6 +74,45 @@ impl Text {
     pub(crate) fn finish(self) -> String {
         self.text
     }
+}
+
+/// What [`generate_output`] writes (`docs/spec/OIDL.md` §11).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Output {
+    /// Everything: what [`generate`] writes, and for each library its ABI fingerprint,
+    /// `abi/<library>.fingerprint`, and its hostile-message corpus, `corpus/<library>.corpus`.
+    Everything,
+    /// The server side alone ([`generate_server`]).
+    ServerOnly,
+    /// One `channel` library's bindings crate ([`generate_library`]).
+    Library(String),
+}
+
+/// The files of `output` for `comp`, sorted by path: what `oidl generate` writes, in the mode
+/// its arguments name. The caller writes them; nothing here touches a file (ADR-0011
+/// Amendment 4, T1).
+///
+/// # Errors
+///
+/// As [`generate_library`], for an unknown or `syscall` library.
+pub fn generate_output(comp: &Compilation, output: &Output) -> Result<Vec<Generated>, String> {
+    let mut files = match output {
+        Output::ServerOnly => return Ok(generate_server(comp)),
+        Output::Library(name) => return generate_library(comp, name),
+        Output::Everything => generate(comp),
+    };
+    for library in &comp.libraries {
+        files.push(Generated {
+            path: format!("abi/{}.fingerprint", library.name),
+            text: fingerprint::fingerprint_file(library),
+        });
+        files.push(Generated {
+            path: format!("corpus/{}.corpus", library.name),
+            text: corpus::corpus_for(library),
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
 }
 
 /// Everything the generators write, sorted by path.

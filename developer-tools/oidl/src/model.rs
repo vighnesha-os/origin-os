@@ -433,3 +433,20 @@ pub struct Compilation {
     /// `max_message_handles`, if declared.
     pub max_message_handles: Option<u64>,
 }
+
+impl Compilation {
+    /// The compilation narrowed to the library `name`, for printing its fingerprints and for its
+    /// lock: the other libraries were given only so that it compiles.
+    ///
+    /// # Errors
+    ///
+    /// If `name` is not among the libraries given.
+    pub fn only(&self, name: &str) -> Result<Self, String> {
+        let mut only = self.clone();
+        only.libraries.retain(|library| library.name == name);
+        if only.libraries.is_empty() {
+            return Err(format!("{name} is not among the definitions given"));
+        }
+        Ok(only)
+    }
+}

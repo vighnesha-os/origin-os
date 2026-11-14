@@ -3,20 +3,27 @@
 //!
 //! - **Fresh.** The crate's committed source is byte for byte what the generator writes from its
 //!   definitions and `origin-version.toml`: no file missing, none added, none changed.
-//! - **Recorded.** Its lock holds its library's fingerprints: re-recording the lock into a scratch
-//!   copy changes nothing. A definition's ABI therefore cannot change without the lock changing
+//! - **Recorded.** Its lock holds its library's fingerprints: re-recording it, in memory,
+//!   changes nothing. A definition's ABI therefore cannot change without the lock changing
 //!   in the same commit, where a reviewer sees it, even at major 0, where `oidl` itself only
 //!   warns (§9).
 //!
 //! `cargo xtask regenerate` rewrites every crate's source. It never touches a lock: re-recording an
 //! ABI is a decision, and the gate names the command for it.
+//!
+//! The generator runs in process, through the `oidl` library, as the ring-3 build's does
+//! (ADR-0011 Amendment 4, T1): `xtask` starts no first-party program. Each definition is named
+//! by its path from the repository's root, as the command line was given it, so whatever the
+//! generator writes of its source's name is the same.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
-use crate::{OIDL_PACKAGE, Result, cargo, collect_files, read_file, repo_root, target_dir};
+use oidl::codegen::{self, Output};
+use oidl::model::Compilation;
+
+use crate::{OIDL_PACKAGE, Result, collect_files, read_file, repo_root};
 
 /// Where `version compatibility "..."` is read from.
 const VERSIONS: &str = "origin-version.toml";
@@ -28,11 +35,30 @@ struct Generated {
     /// The definitions given to the generator: the library's, and every library it uses.
     definitions: &'static [&'static str],
     /// What kind of crate (`docs/spec/OIDL.md` §11).
-    mode: &'static [&'static str],
+    mode: Mode,
     /// Its source: nothing here is written by hand.
     committed: &'static str,
     /// The library's recorded fingerprints.
     lock: &'static str,
+}
+
+/// What kind of crate the generator writes (`docs/spec/OIDL.md` §11): `oidl generate`'s
+/// `--server-only` or `--library <name>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// The server side alone.
+    ServerOnly,
+    /// One `channel` library's bindings.
+    Library(&'static str),
+}
+
+impl Mode {
+    fn output(self) -> Output {
+        match self {
+            Self::ServerOnly => Output::ServerOnly,
+            Self::Library(name) => Output::Library(name.to_string()),
+        }
+    }
 }
 
 /// Every generated crate.
@@ -41,7 +67,7 @@ const CRATES: &[Generated] = &[
     Generated {
         library: "origin.kernel",
         definitions: &["sdk/interfaces/origin.kernel.oidl"],
-        mode: &["--server-only"],
+        mode: Mode::ServerOnly,
         committed: "framekernel/syscalls/src",
         lock: "sdk/interfaces/origin.kernel.lock",
     },
@@ -52,7 +78,7 @@ const CRATES: &[Generated] = &[
             "sdk/interfaces/origin.kernel.oidl",
             "sdk/interfaces/origin.directory.oidl",
         ],
-        mode: &["--library", "origin.directory"],
+        mode: Mode::Library("origin.directory"),
         committed: "sdk/directory/src",
         lock: "sdk/interfaces/origin.directory.lock",
     },
@@ -63,9 +89,8 @@ type Tree = BTreeMap<String, Vec<u8>>;
 
 /// Both gates on every crate: see the module documentation.
 pub(crate) fn gate() -> Result {
-    for (index, krate) in CRATES.iter().enumerate() {
-        let scratch = scratch(index)?;
-        let generated = generate(krate, &scratch)?;
+    for krate in CRATES {
+        let generated = generate(krate)?;
         let committed = read_tree(&repo_root().join(krate.committed))?;
         let stale = differences(&committed, &generated);
         if !stale.is_empty() {
@@ -76,7 +101,7 @@ pub(crate) fn gate() -> Result {
                 stale.join("\n  ")
             ));
         }
-        recorded(krate, &scratch)?;
+        recorded(krate)?;
         println!(
             "xtask: interface gates: {} is the generator's output, byte for byte ({} files), and {} records {}",
             krate.committed,
@@ -89,11 +114,11 @@ pub(crate) fn gate() -> Result {
 }
 
 /// Rewrites every crate's source from its definitions, and removes what the generator no longer
-/// writes. The generator runs first, into a scratch directory, because the workspace does not
-/// load without each crate's `lib.rs`.
+/// writes. The whole crate is generated before anything is written, because the workspace does
+/// not load without each crate's `lib.rs`.
 pub(crate) fn regenerate() -> Result {
-    for (index, krate) in CRATES.iter().enumerate() {
-        let generated = generate(krate, &scratch(index)?)?;
+    for krate in CRATES {
+        let generated = generate(krate)?;
         let target = repo_root().join(krate.committed);
         for path in read_tree(&target)?
             .keys()
@@ -119,58 +144,36 @@ pub(crate) fn regenerate() -> Result {
     Ok(())
 }
 
-/// An empty scratch directory for crate `index`.
-fn scratch(index: usize) -> Result<PathBuf> {
-    let dir = target_dir()
-        .join("xtask")
-        .join("interfaces")
-        .join(index.to_string());
-    if dir.exists() {
-        fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+/// The definitions, each read from the repository's root and named by the path given, compiled
+/// with the `oidl` library against `origin-version.toml`: what `oidl ... --versions
+/// origin-version.toml <definitions>` compiled, run from the root.
+pub(crate) fn compile(definitions: &[&str]) -> Result<Compilation> {
+    let root = repo_root();
+    let mut inputs = Vec::new();
+    for definition in definitions {
+        inputs.push(oidl::Input {
+            file: (*definition).to_string(),
+            text: read_file(&root.join(definition))?,
+        });
     }
-    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    Ok(dir)
+    let versions = String::from_utf8(read_file(&root.join(VERSIONS))?)
+        .map_err(|_| format!("{VERSIONS}: not UTF-8"))?;
+    oidl::compile(&inputs, Some(&versions)).map_err(|e| format!("oidl: {e}"))
 }
 
-/// `oidl`, built from this workspace.
-fn oidl() -> Command {
-    let mut command = cargo();
-    command.args(["run", "--quiet", "--package", OIDL_PACKAGE, "--"]);
-    command
-}
-
-/// Runs `command`, keeping its output for the error message.
-fn run_quietly(mut command: Command, what: &str) -> Result {
-    let out = command
-        .output()
-        .map_err(|e| format!("cannot run {what}: {e}"))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    Err(format!(
-        "{what} failed ({}):\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr).trim()
-    ))
-}
-
-/// `krate` as the generator writes it, under `scratch`.
-fn generate(krate: &Generated, scratch: &Path) -> Result<Tree> {
-    let out = scratch.join("generated");
-    let mut command = oidl();
-    command
-        .arg("generate")
-        .args(krate.mode)
-        .arg("--out")
-        .arg(&out)
-        .args(["--versions", VERSIONS])
-        .args(krate.definitions);
-    run_quietly(command, "oidl generate")?;
-    let tree = read_tree(&out)?;
+/// `krate` as the generator writes it: the `oidl` library in process, what `oidl generate
+/// <mode> --versions origin-version.toml <definitions>` wrote.
+fn generate(krate: &Generated) -> Result<Tree> {
+    let compilation = compile(krate.definitions)?;
+    let tree: Tree = codegen::generate_output(&compilation, &krate.mode.output())
+        .map_err(|e| format!("oidl generate: {e}"))?
+        .into_iter()
+        .map(|file| (file.path, file.text.into_bytes()))
+        .collect();
     if tree.is_empty() {
         return Err(format!(
-            "oidl wrote nothing under {}: nothing was checked",
-            out.display()
+            "oidl generated nothing for {}: nothing was checked",
+            krate.committed
         ));
     }
     Ok(tree)
@@ -236,28 +239,36 @@ fn record_command(krate: &Generated) -> String {
     )
 }
 
-/// Fails unless re-recording `krate`'s lock leaves it as it is.
-fn recorded(krate: &Generated, scratch: &Path) -> Result {
-    let recorded = read_file(&repo_root().join(krate.lock))?;
-    let copy = scratch.join("recorded.lock");
-    fs::write(&copy, &recorded).map_err(|e| format!("{}: {e}", copy.display()))?;
-    let mut command = oidl();
-    command
-        .args(["fingerprint", "--library", krate.library])
-        .args(["--versions", VERSIONS, "--lock"])
-        .arg(&copy)
-        .arg("--update")
-        .args(krate.definitions);
-    run_quietly(command, "oidl fingerprint")?;
-    if read_file(&copy)? != recorded {
-        return Err(format!(
-            "the ABI of {} is not the one {} records (ADR-0011 N13). If the change is meant, record it in the same commit, citing the decision: {}",
+/// Fails unless re-recording `krate`'s lock leaves it as it is: the lock `oidl fingerprint
+/// --library <library> --update` would write (`oidl::fingerprint::updated_lock`) is its text,
+/// byte for byte.
+fn recorded(krate: &Generated) -> Result {
+    let lock = repo_root().join(krate.lock);
+    let recorded =
+        String::from_utf8(read_file(&lock)?).map_err(|_| format!("{}: not UTF-8", krate.lock))?;
+    let library = compile(krate.definitions)?.only(krate.library)?;
+    let refused = |why: String| {
+        format!(
+            "the ABI of {} is not the one {} records (ADR-0011 N13): {why}. If the change is meant, record it in the same commit, citing the decision: {}",
             krate.library,
             krate.lock,
             record_command(krate)
-        ));
+        )
+    };
+    match oidl::fingerprint::updated_lock(&library, &recorded) {
+        Err(report) => Err(refused(
+            report
+                .errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        )),
+        Ok(text) if text != recorded => {
+            Err(refused("re-recording it changes the lock".to_string()))
+        }
+        Ok(_) => Ok(()),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -318,7 +329,7 @@ mod tests {
                 "{:?}",
                 committed.keys()
             );
-            let server_only = krate.mode.contains(&"--server-only");
+            let server_only = krate.mode == Mode::ServerOnly;
             for shim in ["abi.rs", "core_stubs.rs", "client.rs"] {
                 if shim == "client.rs" && !server_only {
                     continue;

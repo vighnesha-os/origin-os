@@ -1,10 +1,10 @@
 # ORIGIN OS — DEFINITIVE PRODUCTION ENGINEERING DIRECTIVE
-## Version 7.8 — Original-Source, Rust 1.100.0, Research-Verified Operating System
+## Version 7.9 — Original-Source, Rust 1.100.0, Research-Verified Operating System
 
 **Product:** Origin OS, in two editions of one release: Origin Desktop and Origin Server  
 **Kernel:** Framekernel  
 **Research baseline:** November 7, 2026  
-**Revision:** 7.8, 2026-11-13. The mandatory compiler is Rust 1.100.0 stable, in place of 1.99.1, by the owner's instruction and through §15 (decision sheet items 278 and 279). Revision 7.7 (2026-11-13) made §17 name the revision of the System V x86-64 psABI and what Origin takes from it (item 271). Revision 7.6 (2026-11-11) made §77 point to the roles of §1, in place of 26 engineering agents of its own (item 189). Revision 7.5 (2026-11-11) replaced the first sentence of §1 with the owner's text for the roles: the lead roles, 100% coverage of approved requirements as the completion target, measured against a versioned requirements matrix, 67 specialist roles with their responsibilities, and 25 engineering requirements that apply to every role. It is the owner's third text of that day, improved by Claude where the owner said "You decide"; the decision sheet lists every change (items 165 and 168). Revision 7.4 (2026-11-10) added the decisions of the design review (`docs/engineering/DESIGN_REVIEW_2026-11-10.md`, decision sheet items 106–123): how the SDK-only rule is enforced and what the server's GUI rule means (§48), security rules for the GUI (§52), a system threat model (§58), one kernel random-number generator (§59), three more rules for reference code (§3), build rules for the kernel (§13, §14), provisional performance budgets (§53), and how the records themselves land (§6, §79, §82). It also carried two answers on the kernel's random-number generator, accepted the same day with ADR-0016 (items 149 and 151): the standards it is pinned to (§17) and what its health tests are (§59). Revision 7.3 (2026-11-10) added the Server edition (`docs/adr/ADR-0014-server-edition.md`), every device standard through the SDK (`docs/adr/ADR-0015-device-standards-sdk.md`), Origin-owned Secure Boot keys as the default (ADR-0002 Amendment 1), rules for the public repository, a stricter hardware scope with the core generation named at boot (ADR-0009 Amendment 1), and Linux and other open-source code as a reference only, kept apart from the code, recorded and read at today's version (§3, §6) (decision sheet items 71–97). Revision 7.2 (2026-11-09) amended §48 and §70 to match ADR-0011, the native SDK (item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.7 is kept at `docs/engineering/CLAUDE-v7.7.md`, v7.6 at `docs/engineering/CLAUDE-v7.6.md`, v7.5 at `docs/engineering/CLAUDE-v7.5.md`, v7.4 at `docs/engineering/CLAUDE-v7.4.md`, v7.3 at `docs/engineering/CLAUDE-v7.3.md`, v7.2 at `docs/engineering/CLAUDE-v7.2.md`, v7.1 at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
+**Revision:** 7.9, 2026-11-14. §49 gains six SDK areas, and §70 says the host tools are libraries first and become the Developer tools SDK (decision items 295 to 297; ADR-0011 Amendment 4). Revision 7.8 (2026-11-13) made the mandatory compiler Rust 1.100.0 stable, in place of 1.99.1, by the owner's instruction and through §15 (decision sheet items 278 and 279). Revision 7.7 (2026-11-13) made §17 name the revision of the System V x86-64 psABI and what Origin takes from it (item 271). Revision 7.6 (2026-11-11) made §77 point to the roles of §1, in place of 26 engineering agents of its own (item 189). Revision 7.5 (2026-11-11) replaced the first sentence of §1 with the owner's text for the roles: the lead roles, 100% coverage of approved requirements as the completion target, measured against a versioned requirements matrix, 67 specialist roles with their responsibilities, and 25 engineering requirements that apply to every role. It is the owner's third text of that day, improved by Claude where the owner said "You decide"; the decision sheet lists every change (items 165 and 168). Revision 7.4 (2026-11-10) added the decisions of the design review (`docs/engineering/DESIGN_REVIEW_2026-11-10.md`, decision sheet items 106–123): how the SDK-only rule is enforced and what the server's GUI rule means (§48), security rules for the GUI (§52), a system threat model (§58), one kernel random-number generator (§59), three more rules for reference code (§3), build rules for the kernel (§13, §14), provisional performance budgets (§53), and how the records themselves land (§6, §79, §82). It also carried two answers on the kernel's random-number generator, accepted the same day with ADR-0016 (items 149 and 151): the standards it is pinned to (§17) and what its health tests are (§59). Revision 7.3 (2026-11-10) added the Server edition (`docs/adr/ADR-0014-server-edition.md`), every device standard through the SDK (`docs/adr/ADR-0015-device-standards-sdk.md`), Origin-owned Secure Boot keys as the default (ADR-0002 Amendment 1), rules for the public repository, a stricter hardware scope with the core generation named at boot (ADR-0009 Amendment 1), and Linux and other open-source code as a reference only, kept apart from the code, recorded and read at today's version (§3, §6) (decision sheet items 71–97). Revision 7.2 (2026-11-09) amended §48 and §70 to match ADR-0011, the native SDK (item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.8 is kept at `docs/engineering/CLAUDE-v7.8.md`, v7.7 at `docs/engineering/CLAUDE-v7.7.md`, v7.6 at `docs/engineering/CLAUDE-v7.6.md`, v7.5 at `docs/engineering/CLAUDE-v7.5.md`, v7.4 at `docs/engineering/CLAUDE-v7.4.md`, v7.3 at `docs/engineering/CLAUDE-v7.3.md`, v7.2 at `docs/engineering/CLAUDE-v7.2.md`, v7.1 at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
 **Mandatory compiler:** Rust 1.100.0 stable  
 **Rust edition:** 2024  
 **Processor architecture:** x86-64 exclusively: 64-bit long mode only. No 32-bit or x32 code, and no Windows `.exe` or `.msi` compatibility.  
@@ -1351,12 +1351,20 @@ Implement typed SDKs for:
 - Localization.
 - Compute.
 - Diagnostics.
+- Origin UI.
+- Windows and display.
+- Desktop shell.
+- Settings.
+- Time.
+- Developer tools.
 - Remote administration.
 - Service management.
 - Hardware health.
 - Remote desktop.
 
 The last four serve Origin Server first (ADR-0014 S7). Device technologies follow §31's three layers (ADR-0015).
+
+A module that several of these SDKs use, and that programs outside the release do not, has a first-party interface with no promise across releases (ADR-0011 Amendment 4).
 
 Support stable versioned APIs and a C-compatible ABI.
 
@@ -1827,7 +1835,7 @@ Developer command-line tools are permitted. On Origin OS they are SDK clients li
 
 They must not become mandatory hidden backends for ordinary graphical OS administration.
 
-Host tools that run on macOS or Linux are outside §48 until Origin hosts its own builds (ADR-0011 N12).
+Host tools that run on macOS or Linux are outside §48 until Origin hosts its own builds (ADR-0011 N12). Each is a library first: its command line is a thin client, and the build tool calls the library and starts no first-party program. When Origin hosts its own builds, those libraries become the Developer tools SDK (§49; ADR-0011 Amendment 4).
 
 ## 71. Native application development
 

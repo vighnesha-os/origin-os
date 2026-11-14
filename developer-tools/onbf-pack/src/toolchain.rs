@@ -1,12 +1,14 @@
 //! Build provenance for the manifest's `toolchain` map (key 2; CLAUDE.md §60).
 //!
-//! By default the values come from `rustc -vV`, run in the current directory, so rustup
-//! selects the toolchain that `rust-toolchain.toml` pins for the repository. Each value can
-//! be given explicitly instead, which is what reproducible release builds should do: the
-//! packer then records exactly what the build system states, independent of the host.
+//! The values come from the caller: the text `rustc -vV` prints, which the caller runs and
+//! hands to [`Toolchain::from_rustc_verbose_version`], or each value stated explicitly. This
+//! library runs no program (ADR-0011 Amendment 4, T1). The command line runs `rustc -vV` in
+//! the current directory when a value is not given, so rustup selects the toolchain that
+//! `rust-toolchain.toml` pins; `xtask` runs it once from the repository's root. Reproducible
+//! release builds should state each value: the packer then records exactly what the build
+//! system states, independent of the host.
 
 use core::fmt;
-use std::process::Command;
 
 /// The three text fields of the KRN `toolchain` map.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,14 +21,10 @@ pub struct Toolchain {
     pub llvm: String,
 }
 
-/// Why the toolchain description could not be obtained or is invalid.
+/// Why the toolchain description is incomplete or invalid.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolchainError {
-    /// `rustc -vV` could not be run.
-    Run(String),
-    /// `rustc -vV` exited unsuccessfully.
-    Failed(String),
-    /// `rustc -vV` printed no line for this field.
+    /// `rustc -vV`'s text has no line for this field.
     Missing(&'static str),
     /// A field breaks the KRN manifest rules (errata R4): `rustc` and `llvm` must be
     /// non-empty printable ASCII, and `rustc_commit` exactly 40 lowercase hex digits.
@@ -41,11 +39,6 @@ pub enum ToolchainError {
 impl fmt::Display for ToolchainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Run(e) => write!(
-                f,
-                "cannot run `rustc -vV` ({e}); pass --rustc-version, --rustc-commit and --llvm-version"
-            ),
-            Self::Failed(status) => write!(f, "`rustc -vV` failed ({status})"),
             Self::Missing(line) => write!(f, "`rustc -vV` printed no `{line}` line"),
             Self::Invalid { field, value } => {
                 let rule = if *field == "rustc_commit" {
@@ -106,17 +99,5 @@ impl Toolchain {
         };
         toolchain.validate()?;
         Ok(toolchain)
-    }
-
-    /// Runs `rustc -vV` from the current directory and reads it.
-    pub fn from_rustc() -> Result<Self, ToolchainError> {
-        let out = Command::new("rustc")
-            .arg("-vV")
-            .output()
-            .map_err(|e| ToolchainError::Run(e.to_string()))?;
-        if !out.status.success() {
-            return Err(ToolchainError::Failed(out.status.to_string()));
-        }
-        Self::from_rustc_verbose_version(&String::from_utf8_lossy(&out.stdout))
     }
 }

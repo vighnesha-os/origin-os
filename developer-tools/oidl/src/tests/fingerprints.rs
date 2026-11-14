@@ -534,3 +534,108 @@ fn a_planted_handle_width_changes_every_digest() {
         }
     }
 }
+
+/// `updated_lock` is what `fingerprint --update` writes (ADR-0011 Amendment 4, T1, which moved
+/// it out of the command line): the rendered lock when nothing recorded changed, a new minor
+/// and no lock at all included; refused, with the comparison, when a recorded one changed.
+#[test]
+fn an_updated_lock_records_new_minors_and_refuses_a_changed_one() {
+    let comp = comp_at("1.0", METHOD);
+    let lock = render_lock(&comp);
+    assert_eq!(fingerprint::updated_lock(&comp, ""), Ok(lock.clone()));
+    assert_eq!(fingerprint::updated_lock(&comp, &lock), Ok(lock.clone()));
+    let newer = comp_at("1.1", METHOD);
+    assert_eq!(
+        fingerprint::updated_lock(&newer, &lock),
+        Ok(render_lock(&newer))
+    );
+    let changed = comp_at("1.0", OTHER);
+    let refused = fingerprint::updated_lock(&changed, &lock).unwrap_err();
+    assert_eq!(refused, check_lock(&changed, &lock));
+    assert_eq!(refused.errors.len(), 1);
+    // At major 0 a change is only a warning, so the lock is re-recorded.
+    let zero = comp_at("0.1", METHOD);
+    let zero_changed = comp_at("0.1", OTHER);
+    assert_eq!(
+        fingerprint::updated_lock(&zero_changed, &render_lock(&zero)),
+        Ok(render_lock(&zero_changed))
+    );
+}
+
+/// Each finding reads as the command line has always printed it.
+#[test]
+fn a_lock_finding_reads_as_the_command_line_prints_it() {
+    let version = Version { major: 1, minor: 2 };
+    let library = "test.gate".to_string();
+    for (finding, text) in [
+        (
+            LockFinding::Changed {
+                library: library.clone(),
+                version,
+            },
+            "test.gate 1.2: the recorded fingerprint changed",
+        ),
+        (
+            LockFinding::Gone {
+                library: library.clone(),
+                version,
+            },
+            "test.gate 1.2: a recorded version is gone",
+        ),
+        (
+            LockFinding::Unrecorded { library, version },
+            "test.gate 1.2: no recorded fingerprint",
+        ),
+        (
+            LockFinding::Malformed { line: 7 },
+            "the lock file's line 7 is malformed",
+        ),
+    ] {
+        assert_eq!(finding.to_string(), text);
+    }
+}
+
+/// `Compilation::only` keeps the one library asked for, and refuses one not given.
+#[test]
+fn only_keeps_the_library_asked_for() {
+    let comp = shipped();
+    let only = comp.only("origin.directory").unwrap();
+    assert_eq!(only.libraries.len(), 1);
+    assert_eq!(only.libraries[0].name, "origin.directory");
+    assert_eq!(
+        comp.only("origin.nothing"),
+        Err("origin.nothing is not among the definitions given".to_string())
+    );
+}
+
+/// `generate_output(Everything)` is the generators' files with each library's fingerprint and
+/// corpus beside them, sorted by path; the two narrower outputs are their generators' own.
+#[test]
+fn every_output_is_its_generators_files() {
+    use crate::codegen::{self, Output};
+    let comp = shipped();
+    let everything = codegen::generate_output(&comp, &Output::Everything).unwrap();
+    let mut expected = codegen::generate(&comp);
+    for library in &comp.libraries {
+        expected.push(codegen::Generated {
+            path: format!("abi/{}.fingerprint", library.name),
+            text: fingerprint::fingerprint_file(library),
+        });
+        expected.push(codegen::Generated {
+            path: format!("corpus/{}.corpus", library.name),
+            text: crate::corpus::corpus_for(library),
+        });
+    }
+    expected.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(everything, expected);
+    assert!(everything.windows(2).all(|w| w[0].path < w[1].path));
+    assert_eq!(
+        codegen::generate_output(&comp, &Output::ServerOnly).unwrap(),
+        codegen::generate_server(&comp)
+    );
+    assert_eq!(
+        codegen::generate_output(&comp, &Output::Library("origin.directory".into())).unwrap(),
+        codegen::generate_library(&comp, "origin.directory").unwrap()
+    );
+    assert!(codegen::generate_output(&comp, &Output::Library("origin.kernel".into())).is_err());
+}
