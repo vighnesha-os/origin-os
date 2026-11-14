@@ -66,6 +66,7 @@ ML-DSA signing is hedged with fresh randomness from `/dev/urandom` (FIPS 204 §3
 The boot tests must sign with something, and the loader must trust it. A development key must never pass for a release key, so:
 - `onbf-pack keygen --insecure-test-seed <text>` derives the key from public text; anyone can recompute it.
 - No private key is stored in the repository. `cargo xtask boot-test` derives the private keys into `target/xtask/test-keys/` (one key file, mode 0600, read only by `onbf-pack`).
+  - *Correction of 2026-11-14 (TASKS item 60; ADR-0011 Amendment 4, T1):* `xtask` now derives both test keys in memory with `onbf-pack`'s library and signs in process; it writes no key file, and `target/xtask/test-keys/` is no longer made. Key files are written and read only by `onbf-pack`'s command line, which keeps the checks above.
 - The repository holds only the public halves, in `boot/uefi/trust/`, named `TEST-ONLY-…`, with a README. `xtask` checks them against the derived key before it boots anything.
 - Only a loader built with `test-trust-store` (or `developer-mode`, which includes it) compiles them in, and it prints a warning on every boot. A build without the feature trusts nothing and refuses every kernel.
 - "Must never ship" is enforced, not only stated: a loader holding the test key does not compile with a non-zero build number (`origin-version.toml`), which release engineering sets for a released build.
