@@ -273,10 +273,12 @@ impl<H: Host> Interpreter<H> {
     /// # Errors
     /// Whatever the term list does wrong, with where; a limit reached.
     pub fn load(&mut self, block: DefinitionBlock<'_>) -> Result<u32> {
-        let aml = mem::copy_bytes(block.aml, &mut self.budget)?;
         let index =
             u32::try_from(self.tables.len()).map_err(|_| ErrorKind::Limit(Limit::Memory))?;
-        let end = u32::try_from(aml.len()).map_err(|_| ErrorKind::Truncated)?;
+        let end = u32::try_from(block.aml.len()).map_err(|_| ErrorKind::Truncated)?;
+        mem::reserve(&mut self.tables, 1, &mut self.budget)?;
+        let aml = mem::copy_bytes(block.aml, &mut self.budget)?;
+        // Cannot fail: the room was reserved before the copy (the review of B1, F2).
         mem::push(
             &mut self.tables,
             Table {
@@ -357,6 +359,33 @@ impl<H: Host> Interpreter<H> {
         if self.owners.is_empty() {
             mem::release(core::mem::take(&mut self.owners), &mut self.budget);
         }
+        self.recount();
+    }
+
+    /// Counts afresh every byte the interpreter holds and sets the budget to it: what was
+    /// charged and not credited on a failure path is given back (the review of B1, F2).
+    pub(crate) fn recount(&mut self) {
+        use core::mem::size_of;
+        let mut n = self.heap.bytes().saturating_add(self.ns.bytes());
+        n = n.saturating_add(self.tables.capacity().saturating_mul(size_of::<Table>()));
+        for t in &self.tables {
+            n = n.saturating_add(t.aml.capacity());
+        }
+        n = n
+            .saturating_add(self.frames.capacity().saturating_mul(size_of::<Frame>()))
+            .saturating_add(self.calls.capacity().saturating_mul(size_of::<CallFrame>()))
+            .saturating_add(self.owners.capacity().saturating_mul(size_of::<OwnerCtx>()))
+            .saturating_add(
+                self.held
+                    .capacity()
+                    .saturating_mul(size_of::<crate::sync::Held>()),
+            );
+        for o in &self.owners {
+            n = n.saturating_add(o.created.capacity().saturating_mul(size_of::<NodeId>()));
+        }
+        #[cfg(test)]
+        crate::tests::note_drift(self.budget.used(), n);
+        self.budget.recount(n);
     }
 
     /// Undoes everything above `base` after an error: frames, activations, and the names their

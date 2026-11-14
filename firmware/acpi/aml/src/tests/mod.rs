@@ -182,6 +182,28 @@ impl Host for TestHost {
     }
 }
 
+thread_local! {
+    /// What the budget's count and a fresh count of what is held differed by, summed over every
+    /// evaluation this thread ended: (over-stated, under-stated).
+    static DRIFT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Called by `recount`: notes how far the incremental count had drifted.
+pub(crate) fn note_drift(counted: usize, held: usize) {
+    DRIFT.with(|d| {
+        let (over, under) = d.get();
+        d.set((
+            over + counted.saturating_sub(held),
+            under + held.saturating_sub(counted),
+        ));
+    });
+}
+
+/// The drift noted on this thread, and starts afresh.
+pub(crate) fn take_drift() -> (usize, usize) {
+    DRIFT.with(|d| d.replace((0, 0)))
+}
+
 pub(crate) type Interp = Interpreter<TestHost>;
 
 /// An interpreter with the service's limits, for integers of `width`.

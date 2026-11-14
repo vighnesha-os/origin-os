@@ -91,6 +91,13 @@ impl Namespace {
         self.live
     }
 
+    /// The bytes the namespace holds, as `mem.rs` charges them.
+    pub(crate) fn bytes(&self) -> usize {
+        self.nodes
+            .capacity()
+            .saturating_mul(core::mem::size_of::<Node>())
+    }
+
     fn node(&self, id: NodeId) -> Result<&Node> {
         match self.nodes.get(index(id.index)) {
             Some(n) if n.live && n.generation == id.generation => Ok(n),

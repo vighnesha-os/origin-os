@@ -485,7 +485,10 @@ impl<H: Host> Interpreter<H> {
                     Data::Int => {
                         let i = self.int_of(source)?;
                         let mut out = Vec::new();
-                        self.int_decimal(i, &mut out)?;
+                        if let Err(e) = self.int_decimal(i, &mut out) {
+                            mem::release(out, &mut self.budget);
+                            return Err(e);
+                        }
                         out
                     }
                     Data::Str => self.string_of(source)?,
@@ -505,7 +508,10 @@ impl<H: Host> Interpreter<H> {
                             }
                         }
                         mem::release(b, &mut self.budget);
-                        r?;
+                        if let Err(e) = r {
+                            mem::release(out, &mut self.budget);
+                            return Err(e);
+                        }
                         out
                     }
                     Data::Other(_) => return err(ErrorKind::Type),

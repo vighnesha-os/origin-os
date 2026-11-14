@@ -67,6 +67,15 @@ impl Budget {
     fn credit(&mut self, bytes: usize) {
         self.used = self.used.saturating_sub(bytes);
     }
+
+    /// Sets the count to what is held, counted afresh by the caller. Called when an evaluation
+    /// ends, so that a charge a failure path did not credit is never kept (the review of B1, F2).
+    pub(crate) fn recount(&mut self, held: usize) {
+        self.used = held;
+        if held > self.peak {
+            self.peak = held;
+        }
+    }
 }
 
 fn bytes_for<T>(count: usize) -> Result<usize> {

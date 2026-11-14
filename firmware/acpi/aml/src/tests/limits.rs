@@ -217,3 +217,48 @@ fn garbage_is_collected_before_it_fills_the_limit_while_live_data_is_large() {
     assert_eq!(i.evaluate("CHRN", &[]).unwrap(), Some(Value::Integer(900)));
     assert!(i.memory_peak() <= small().memory_bytes);
 }
+
+#[test]
+fn a_memory_limit_hit_while_copying_leaves_the_count_where_it_was() {
+    // A named package of 2,000 strings, copied until the limit is hit inside the copy.
+    let strings: Vec<B> = (0..200)
+        .map(|_| string("0123456789abcdef0123456789abcdef"))
+        .collect();
+    let mut i = interp_with(IntegerWidth::Bits64, small());
+    load(
+        &mut i,
+        &[
+            name("PKG", package(200, &strings)),
+            method(
+                "KEEP",
+                0,
+                &[
+                    store(var_package(word(4000), &[]), local(0)),
+                    store(zero(), local(7)),
+                    while_(
+                        one(),
+                        &[
+                            store(nm("PKG"), index(local(0), local(7), none())),
+                            increment(local(7)),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+    .unwrap();
+    // The first run grows the arena's slot table, which keeps its size for reuse; every later
+    // run must end where the first did.
+    assert_eq!(limit_of(i.evaluate("KEEP", &[])), Limit::Memory);
+    let base = i.memory_used();
+    let _ = super::take_drift();
+    for _ in 0..30 {
+        assert_eq!(limit_of(i.evaluate("KEEP", &[])), Limit::Memory);
+        assert_eq!(i.memory_used(), base);
+    }
+    let (over, under) = super::take_drift();
+    assert_eq!(under, 0);
+    eprintln!(
+        "memory-limit copies: {over} bytes over-counted in 30 runs, given back by the recount"
+    );
+}

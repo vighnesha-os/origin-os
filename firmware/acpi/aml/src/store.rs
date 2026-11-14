@@ -131,8 +131,16 @@ impl<H: Host> Interpreter<H> {
             }
             while let Some((from, to)) = work.pop() {
                 let elems = self.shallow_elements(from)?;
+                let mut queued = Ok(());
                 for &e in &elems {
-                    self.queue_nested(e, &mut work)?;
+                    queued = self.queue_nested(e, &mut work);
+                    if queued.is_err() {
+                        break;
+                    }
+                }
+                if let Err(e) = queued {
+                    mem::release(elems, &mut self.budget);
+                    return Err(e);
                 }
                 self.heap
                     .replace(to, Object::Package(elems), &mut self.budget)?;
@@ -158,27 +166,40 @@ impl<H: Host> Interpreter<H> {
         };
         let mut out = mem::with_capacity(n, &mut self.budget)?;
         for k in 0..n {
-            let e = match self.heap.get(src)? {
-                Object::Package(v) => v.get(k).copied().unwrap_or(Val::None),
-                _ => Val::None,
-            };
-            let copied = match e {
-                Val::Obj(r) => match self.heap.get(r)? {
-                    Object::String(_) | Object::Buffer(_) | Object::Integer(_) => {
-                        let o = self.copy_object(e)?;
-                        Val::Obj(self.heap.alloc(o, &mut self.budget)?)
-                    }
-                    Object::Package(_) => {
-                        // A placeholder that records its source; `copy_package` fills it.
-                        Val::Obj(self.heap.alloc(Object::Placeholder(r), &mut self.budget)?)
-                    }
-                    _ => e,
-                },
-                other => other,
-            };
-            mem::push(&mut out, copied, &mut self.budget)?;
+            match self.shallow_element(src, k) {
+                // `out` was made with room for every element: this push cannot fail.
+                Ok(copied) => mem::push(&mut out, copied, &mut self.budget)?,
+                Err(e) => {
+                    // What was copied so far is unreachable, and the collector takes it; the
+                    // vector's bytes are credited here (the review of B1, F2).
+                    mem::release(out, &mut self.budget);
+                    return Err(e);
+                }
+            }
         }
         Ok(out)
+    }
+
+    /// A copy of element `k` of the package `src`, as `shallow_elements` makes it.
+    fn shallow_element(&mut self, src: ObjRef, k: usize) -> Result<Val> {
+        let e = match self.heap.get(src)? {
+            Object::Package(v) => v.get(k).copied().unwrap_or(Val::None),
+            _ => Val::None,
+        };
+        Ok(match e {
+            Val::Obj(r) => match self.heap.get(r)? {
+                Object::String(_) | Object::Buffer(_) | Object::Integer(_) => {
+                    let o = self.copy_object(e)?;
+                    Val::Obj(self.heap.alloc(o, &mut self.budget)?)
+                }
+                Object::Package(_) => {
+                    // A placeholder that records its source; `copy_package` fills it.
+                    Val::Obj(self.heap.alloc(Object::Placeholder(r), &mut self.budget)?)
+                }
+                _ => e,
+            },
+            other => other,
+        })
     }
 
     fn queue_nested(&mut self, e: Val, work: &mut Vec<(ObjRef, ObjRef)>) -> Result<()> {
@@ -353,7 +374,7 @@ impl<H: Host> Interpreter<H> {
             (Mode::Store, Target::Buf) => {
                 // G11, strict until the reading session answers: a named buffer keeps its length.
                 let bytes = self.buffer_of(v)?;
-                if let Object::Buffer(b) = self.heap.get_mut(obj)? {
+                if let Ok(Object::Buffer(b)) = self.heap.get_mut(obj) {
                     for (k, d) in b.iter_mut().enumerate() {
                         *d = bytes.get(k).copied().unwrap_or(0);
                     }

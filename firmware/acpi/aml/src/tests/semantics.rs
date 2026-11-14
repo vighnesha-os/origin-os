@@ -1006,7 +1006,10 @@ fn run_corpus() {
 
 #[test]
 fn every_case_holds() {
+    let _ = super::take_drift();
     run_corpus();
+    // The budget's count never under-states what is held.
+    assert_eq!(super::take_drift().1, 0);
 }
 
 /// Every opcode, name prefix, local and argument of Table 20.2.

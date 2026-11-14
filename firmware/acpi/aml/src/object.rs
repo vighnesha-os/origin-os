@@ -297,6 +297,15 @@ impl Object {
     }
 }
 
+/// The bytes an object's payload holds.
+pub(crate) fn payload_bytes(obj: &Object) -> usize {
+    match obj {
+        Object::String(v) | Object::Buffer(v) => v.capacity(),
+        Object::Package(v) => v.capacity().saturating_mul(core::mem::size_of::<Val>()),
+        _ => 0,
+    }
+}
+
 /// Frees an object's payload, crediting its bytes.
 pub(crate) fn release_object(obj: Object, budget: &mut Budget) {
     match obj {
@@ -350,6 +359,20 @@ impl Heap {
         self.live
     }
 
+    /// The bytes the heap holds, counted as `mem.rs` charges them: its two vectors' capacities
+    /// and every object's payload.
+    pub(crate) fn bytes(&self) -> usize {
+        let mut n = self
+            .slots
+            .capacity()
+            .saturating_mul(core::mem::size_of::<Slot>())
+            .saturating_add(self.stack.capacity().saturating_mul(4));
+        for s in &self.slots {
+            n = n.saturating_add(payload_bytes(&s.obj));
+        }
+        n
+    }
+
     /// Stores `obj`, whose payload its maker has charged. On failure the payload is released.
     pub(crate) fn alloc(&mut self, obj: Object, budget: &mut Budget) -> Result<ObjRef> {
         if self.free != NONE {
@@ -375,7 +398,10 @@ impl Heap {
             }
         };
         let room = self.slots.len().saturating_add(1);
-        if let Err(e) = mem::reserve(&mut self.stack, room, budget) {
+        if let Err(e) = mem::reserve(&mut self.stack, room, budget)
+            .and_then(|()| mem::reserve(&mut self.slots, 1, budget))
+        {
+            // Nothing moved: the payload is credited back (the review of B1, F2).
             release_object(obj, budget);
             return Err(e);
         }
@@ -385,8 +411,7 @@ impl Heap {
             next_free: NONE,
             obj,
         };
-        // `mem::push` only fails before it moves the slot in; on failure its payload is lost
-        // without being credited, which over-states the memory held and never under-states it.
+        // Cannot fail: the room was reserved above.
         mem::push(&mut self.slots, slot, budget)?;
         self.live = self.live.saturating_add(1);
         Ok(ObjRef {

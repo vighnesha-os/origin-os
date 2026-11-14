@@ -159,7 +159,9 @@ fn a_failed_table_gives_its_bytes_back() {
     let mut i = interp(IntegerWidth::Bits64);
     load(&mut i, &[name("\\A", one())]).unwrap();
     // A second failure first, so that the table list has reached its capacity.
-    let big: Vec<B> = (0..2_000).map(|k| name(&format!("\\N{:03X}", k % 4096), one())).collect();
+    let big: Vec<B> = (0..2_000)
+        .map(|k| name(&format!("\\N{:03X}", k % 4096), one()))
+        .collect();
     let mut failing = big.clone();
     failing.push(scope("\\MISS", &[]));
     load(&mut i, &failing).unwrap_err();
@@ -168,6 +170,10 @@ fn a_failed_table_gives_its_bytes_back() {
         load(&mut i, &failing).unwrap_err();
     }
     // Twenty failed tables of about 16 KB each hold their identities only.
-    assert!(i.memory_used() < before + 20 * 256, "{} then {}", before, i.memory_used());
+    assert!(
+        i.memory_used() < before + 20 * 256,
+        "{} then {}",
+        before,
+        i.memory_used()
+    );
 }
-
