@@ -12,6 +12,7 @@ mod costs;
 mod disk;
 mod documents;
 mod expected_warning;
+mod host_tools;
 mod image;
 mod image_inputs;
 mod interfaces;
@@ -103,6 +104,10 @@ commands:
               branch's history, outside a short allowlist (part of check; quick)
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
+  host-tools-gate only the gate on the host tools (ADR-0011 Amendment 4, T1): xtask starts no
+              first-party program, re-running itself only where decision item 300 allows,
+              and the libraries of onbf-pack, onbf-sign and oidl reach nothing of the host;
+              with planted negative controls (part of check; quick)
   requirements-gate only the gate on the requirements matrix under docs/requirements/: a row
               for every statement of CLAUDE.md and every decision of an accepted ADR, each
               true to the tree; prints the coverage figure (part of check; CLAUDE.md §1;
@@ -3007,6 +3012,7 @@ fn main() -> ExitCode {
         ["document-gate"] => documents::gate(),
         ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
+        ["host-tools-gate"] => host_tools::gate(),
         ["requirements-gate"] => requirements::gate(),
         ["provenance-gate"] => provenance::gate(),
         ["roadmap-gate"] => roadmap::gate(),
@@ -3930,6 +3936,9 @@ fn check() -> Result {
     // Who may make a proof process, and which ring-3 files may name the call numbers.
     listed_names::gate()?;
     interfaces::gate()?;
+    // The host tools are libraries first: xtask starts none of them, and they reach nothing of
+    // the host (ADR-0011 Amendment 4, T1).
+    host_tools::gate()?;
     image_inputs::version_gate()?;
     image_inputs::graph_gate()?;
     manifest_version_lint()?;
