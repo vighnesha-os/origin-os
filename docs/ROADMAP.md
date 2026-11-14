@@ -305,6 +305,13 @@ Given elsewhere by item 262: networking in the runtime (S44-08) to M10, with the
 | A05-H1 | At a thread's entry the direction flag and the six status flags are clear and interrupts are on (ADR-0005 Amendment 9) |
 | A11-L13 | Each generated stub extends every parameter narrower than 64 bits to its whole register (ADR-0011 Amendment 3) |
 
+**Four more rows placed here (items 295, 296 and 299, 2026-11-14).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none.
+
+| Rows | Subject |
+|---|---|
+| A11-T1, S70-17 | The host tools as libraries that `xtask` calls, beside the tools that build `.ose` (ADR-0011 Amendment 4; CLAUDE.md 7.9 §70) |
+| A11-T5, S49-38 | First-party interfaces for modules shared between SDK domains, and the loader's refusal of them to other programs (ADR-0011 Amendment 4; CLAUDE.md 7.9 §49) |
+
 ## M7. Native packaging
 
 **Proposed, by the rule of item 256; `ONBF.md` §13 by item 267.** **State, 2026-11-12: not started; groundwork only, below.**
@@ -334,6 +341,12 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 | S70-02 to S70-04, S70-11, S70-12 | Tools to package `.oapp`, create `.osi`, sign `.od`, validate packages, verify drivers |
 | S71-08, S71-11 | Installer packaging and deployment guides |
 
+**Two more rows placed here (items 296 and 297, 2026-11-14).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none.
+
+| Rows | Subject |
+|---|---|
+| A11-T2, S49-37 | The packing and signing libraries as the Developer tools SDK, once Origin hosts its own builds (ADR-0011 Amendment 4; CLAUDE.md 7.9 §49) |
+
 ## M8. Native graphics
 
 **Proposed, by the rule of item 256.** **State, 2026-11-12: not started; groundwork only: a software rasterizer, an in-memory file tree and text codecs (matrix row S82-09).**
@@ -362,6 +375,13 @@ These tests need a keyboard and a pointer: ADR-0014 S3 has the GUI take input fr
 | S70-13 | UI inspection |
 | S71-04, S71-07 | UI component documentation and graphics examples |
 | S72-14, S72-15 | GUI and accessibility testing |
+
+**Four more rows placed here (item 297, 2026-11-14).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none. Settings and Time are first needed by M9, and are placed there.
+
+| Rows | Subject |
+|---|---|
+| A11-T3 | Six SDK areas for §49: Origin UI, Windows and display, Desktop shell, Settings, Time and Developer tools (ADR-0011 Amendment 4) |
+| S49-32 to S49-34 | The SDK for Origin UI, windows and display, and the desktop shell (CLAUDE.md 7.9 §49) |
 
 ## M9. Installable operating system
 
@@ -393,6 +413,12 @@ The installer needs a USB keyboard on a real machine, and USB and HID are placed
 | S58-12, S58-15, S58-17 | Filesystem permissions, encryption, credential protection |
 | S68-06 | Time zones |
 | S70-16 | Developer tools never a hidden backend of the GUI's administration |
+
+**Two more rows placed here (item 297, 2026-11-14).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none.
+
+| Rows | Subject |
+|---|---|
+| S49-35, S49-36 | The SDK for settings and time (CLAUDE.md 7.9 §49) |
 
 ## M10. Connectivity and laptop support
 

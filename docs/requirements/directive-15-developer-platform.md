@@ -20,7 +20,7 @@ One row for each statement of CLAUDE.md in §70 and §71. The columns and their 
 | S70-14 | Create native developer tools for: Conformance testing. | build | both/hw | 37 | not-started | - | - | - | - | none | - | - |
 | S70-15 | Developer command-line tools are permitted. On Origin OS they are SDK clients like any other program (§48). | rule | both/hw | 37 | not-started | - | - | - | - | none | - | 39 |
 | S70-16 | They must not become mandatory hidden backends for ordinary graphical OS administration. | build | both/hw | 37 | not-started | - | - | - | - | none | - | - |
-| S70-17 | Host tools that run on macOS or Linux are outside §48 until Origin hosts its own builds (ADR-0011 N12). | info | - | 37 | - | - | - | - | - | none | - | - |
+| S70-17 | Host tools that run on macOS or Linux are outside §48 until Origin hosts its own builds (ADR-0011 N12). Each is a library first: its command line is a thin client, and the build tool calls the library and starts no first-party program. When Origin hosts its own builds, those libraries become the Developer tools SDK (§49; ADR-0011 Amendment 4). | build | eng/host | 37 | not-started | - | - | - | - | none | - | 295, 296 |
 | S71-01 | Provide: Origin SDK headers/bindings. | build | both/hw | 37 | not-started | - | - | - | - | none | - | - |
 | S71-02 | Provide: Rust application templates. | build | both/hw | 37 | not-started | - | - | - | - | none | - | - |
 | S71-03 | Provide: Stable API documentation. | build | both/hw | 37 | not-started | - | - | - | - | none | - | - |
