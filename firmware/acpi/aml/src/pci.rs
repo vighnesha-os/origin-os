@@ -153,10 +153,9 @@ impl<H: Host> Interpreter<H> {
         Ok(())
     }
 
-    /// Pops a finished walk.
+    /// Pops a finished walk (`pop_frame` counts it out).
     fn end_resolve(&mut self) {
         self.pop_frame();
-        self.resolving = self.resolving.saturating_sub(1);
     }
 
     /// Asks `node` for `seg`: absent, a value, or a method started above the frame.

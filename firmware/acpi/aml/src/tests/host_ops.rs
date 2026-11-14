@@ -1139,3 +1139,19 @@ fn the_global_lock_is_asked_for_once_however_often_the_evaluation_takes_it() {
     assert_eq!((i.host().global_taken, i.host().global_held), (2, 0));
     assert_eq!(i.global_depth, 0);
 }
+
+#[test]
+fn a_walk_cut_off_by_an_error_is_counted_out() {
+    // The count of `Resolve` frames follows their removal by an error, so that a later walk for
+    // a region still meets the check for a walk already under way.
+    on_small_stack(|| {
+        let mut i = pci_device(
+            &[ret(nm("\\_SB.PCI0.D1.F1"))],
+            &[method("RD", 0, &[ret(nm("\\_SB.PCI0.D1.F1"))])],
+        );
+        for _ in 0..3 {
+            assert_eq!(fails(&mut i, "RD"), ErrorKind::AddressCycle);
+            assert_eq!(i.resolving, 0);
+        }
+    });
+}

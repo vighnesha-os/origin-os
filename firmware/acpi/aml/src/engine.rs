@@ -527,11 +527,21 @@ impl<H: Host> Interpreter<H> {
         if f.is_some() {
             self.ctx.pop();
         }
+        if matches!(f, Some(Frame::Resolve(_))) {
+            self.resolving = self.resolving.saturating_sub(1);
+        }
         f
     }
 
-    /// Pops frames down to `n`.
+    /// Pops frames down to `n`. The `Resolve` frames among them are counted out, so that the
+    /// count stays true when an error unwinds them (`pci.rs`).
     pub(crate) fn truncate_frames(&mut self, n: usize) {
+        let gone = self.frames.get(n..).map_or(0, |f| {
+            f.iter().filter(|f| matches!(f, Frame::Resolve(_))).count()
+        });
+        self.resolving = self
+            .resolving
+            .saturating_sub(u32::try_from(gone).unwrap_or(u32::MAX));
         self.frames.truncate(n);
         self.ctx.truncate(n);
     }
