@@ -71,6 +71,18 @@ const GROWERS: &[&str] = &[
     "join",
     "repeat",
     "with_capacity",
+    // The review of B1's addendum (A3): `splice` grows; the stable sorts allocate a scratch
+    // buffer; on a slice the ASCII case conversions return a `Vec`; `alloc::fmt::format` is
+    // `format!` by name; `into_owned` makes a `Vec` of a borrowed `Cow`.
+    "splice",
+    "sort",
+    "sort_by",
+    "sort_by_key",
+    "sort_by_cached_key",
+    "to_ascii_uppercase",
+    "to_ascii_lowercase",
+    "format",
+    "into_owned",
 ];
 
 /// Types whose every use allocates, or that the crate has no business with: refused wherever
@@ -287,6 +299,40 @@ mod tests {
             ("fn f() { let _ = Rc::new(1); }", "`Rc`"),
             ("fn f() { let _ = Arc::new(1); }", "`Arc`"),
             ("fn f(q: &mut VecDeque<u8>) { q.len(); }", "`VecDeque`"),
+            // The forms the addendum to that review (A3) found the second let through.
+            (
+                "fn f(v: &mut Vec<u8>) { v.splice(0..0, [1, 2]); }",
+                "`splice`",
+            ),
+            ("fn f(v: &mut [u8]) { v.sort(); }", "`sort`"),
+            (
+                "fn f(v: &mut [u8]) { v.sort_by(|a, b| a.cmp(b)); }",
+                "`sort_by`",
+            ),
+            (
+                "fn f(v: &mut [u8]) { v.sort_by_key(|a| *a); }",
+                "`sort_by_key`",
+            ),
+            (
+                "fn f(v: &mut [u8]) { v.sort_by_cached_key(|a| *a); }",
+                "`sort_by_cached_key`",
+            ),
+            (
+                "fn f(v: &[u8]) -> Vec<u8> { v.to_ascii_uppercase() }",
+                "`to_ascii_uppercase`",
+            ),
+            (
+                "fn f(v: &[u8]) -> Vec<u8> { v.to_ascii_lowercase() }",
+                "`to_ascii_lowercase`",
+            ),
+            (
+                "fn f(a: core::fmt::Arguments<'_>) -> String { alloc::fmt::format(a) }",
+                "`format`",
+            ),
+            (
+                "fn f(c: Cow<'_, [u8]>) -> Vec<u8> { c.into_owned() }",
+                "`into_owned`",
+            ),
         ] {
             let found = findings(src);
             assert!(found.iter().any(|f| f.contains(what)), "{src}: {found:?}");
@@ -305,6 +351,10 @@ mod tests {
             "fn f(v: &mut Vec<u8>) { mem::push(v, 1, b).ok(); mem::reserve(v, 1, b).ok(); }",
             "fn f(x: u8) -> u32 { u32::from(x) }",
             "fn f(k: K) -> E { E::from(k) }",
+            // Their relatives that allocate nothing.
+            "fn f(v: &mut [u8]) { v.sort_unstable(); v.sort_unstable_by_key(|a| *a); }",
+            "fn f(v: &mut [u8]) { v.make_ascii_uppercase(); v.make_ascii_lowercase(); }",
+            "fn f(f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { f.write_str(\"x\") }",
         ] {
             assert!(findings(src).is_empty(), "{src}: {:?}", findings(src));
         }
