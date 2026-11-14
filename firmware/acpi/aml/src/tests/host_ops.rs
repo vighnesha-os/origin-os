@@ -1594,3 +1594,32 @@ fn match_lets_through_what_is_not_a_conversion() {
     i.host_mut().refuse = true;
     assert!(matches!(fails(&mut i, "MT"), ErrorKind::Region { .. }));
 }
+
+#[test]
+fn a_pci_region_with_no_root_bridge_above_is_refused() {
+    // The review of B2's Addendum 2, N2-3: `\_SB.PCI0` names itself no root bridge (neither
+    // PNP0A03 nor PNP0A08), so the function of a region below it cannot be named: refused, and
+    // nothing sent, never taken to be on segment 0, bus 0.
+    let mut i = loaded(&[scope(
+        "\\_SB",
+        &[device(
+            "PCI0",
+            &[
+                name("_HID", string("ACPI0001")),
+                name("_BBN", zero()),
+                device(
+                    "D1",
+                    &[
+                        name("_ADR", dword(0x0003_0000)),
+                        op_region("R1", 2, zero(), byte(4)),
+                        field("R1", BYTE, &[Fe::Named("F1", 8)]),
+                        method("RD", 0, &[ret(nm("F1"))]),
+                    ],
+                ),
+            ],
+        )],
+    )]);
+    assert_eq!(fails(&mut i, "\\_SB.PCI0.D1.RD"), ErrorKind::NotFound);
+    assert!(i.host().seen.is_empty());
+    assert!(i.host().bridges.is_empty());
+}

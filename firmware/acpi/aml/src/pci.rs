@@ -20,8 +20,8 @@
 //! (`_HID` or `_CID` PNP0A03 or PNP0A08); other scopes are passed over. Going down from the root
 //! bridge, each `Device` between it and the function with an `_ADR` is a bridge, whose secondary
 //! bus is read; a device with none is passed over. The function's own `_ADR` is required: a
-//! device with none is [`ErrorKind::NotFound`], never function 0. With no root bridge above, the
-//! segment and bus are 0 and there are no bridges.
+//! device with none is [`ErrorKind::NotFound`], never function 0. So is a region with no root
+//! bridge recognized above it: it is never taken to be on segment 0, bus 0 (N2-3).
 
 use crate::Interpreter;
 use crate::engine::Frame;
@@ -333,11 +333,10 @@ impl<H: Host> Interpreter<H> {
                             r.asked = p;
                             r.phase = Phase::Hid;
                         }
-                        // No root bridge above: segment 0, bus 0, no bridges.
-                        _ => {
-                            r.phase = Phase::DeviceAdr;
-                            r.asked = r.device;
-                        }
+                        // No root bridge recognized above: the function cannot be named. It is
+                        // refused, never taken to be on segment 0, bus 0, where it may be
+                        // another function (the review of B2's Addendum 2, N2-3).
+                        _ => return err(ErrorKind::NotFound),
                     }
                 }
             }
