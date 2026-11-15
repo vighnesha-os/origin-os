@@ -6303,6 +6303,8 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
         return Err(first);
     };
     let _ = fs::rename(&log, &first_log);
+    // The first run's verdict names its log by the path the second run is about to write.
+    let first = first.replace(&log.display().to_string(), &first_log.display().to_string());
     println!(
         "xtask: {}: the first run stopped only because a proof's settle lost {lost} kernel stacks to a stalled shootdown, with nothing failed before it, on an oversubscribed machine, named ({} guest processors; ADR-0013 Amendment 3, part (b), decision item 314): running it once more on the same machine. The first run: {first}; its line: {line}; its serial log: {}",
         scenario.label,
