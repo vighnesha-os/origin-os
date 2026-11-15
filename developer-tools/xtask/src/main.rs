@@ -30,6 +30,7 @@ mod ring3;
 mod roadmap;
 mod screen;
 mod serial;
+mod settle;
 mod targetcfg;
 mod toolchain;
 mod turns;
@@ -112,6 +113,8 @@ commands:
   aml-alloc-gate only the gate on the AML interpreter's allocations: only its mem.rs may
               allocate or grow a collection, and a planted push is caught (part of check;
               quick)
+  settle-gate only the gate on boot proofs that compare the machine's counts: each
+              settles first (TASKS item 67; part of check; quick)
   percpu-gate only the gate on per-processor state (ADR-0008 Amendment 1, D1 and D5):
               every PerCpu table sized by its crate's size_per_cpu, and no MAX_CPUS or
               static array sized by a processor count (part of check; quick)
@@ -3495,6 +3498,7 @@ fn main() -> ExitCode {
         ["names-gate"] => listed_names::gate(),
         ["aml-alloc-gate"] => amlalloc::gate(),
         ["percpu-gate"] => per_cpu::gate(),
+        ["settle-gate"] => settle::gate(),
         ["document-gate"] => documents::gate(),
         ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
@@ -4597,6 +4601,8 @@ fn check() -> Result {
     amlalloc::gate()?;
     // Every per-processor table sized at discovery; no processor count compiled in.
     per_cpu::gate()?;
+    // Every boot proof that compares the machine's counts settles it first (TASKS item 67).
+    settle::gate()?;
     interfaces::gate()?;
     // The host tools are libraries first: xtask starts none of them, and they reach nothing of
     // the host (ADR-0011 Amendment 4, T1).

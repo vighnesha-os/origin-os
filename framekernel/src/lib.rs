@@ -211,6 +211,7 @@ mod process;
 mod program_proof;
 #[cfg(target_os = "none")]
 mod sched;
+pub mod settled;
 #[cfg(target_os = "none")]
 mod stacks;
 #[cfg(target_os = "none")]

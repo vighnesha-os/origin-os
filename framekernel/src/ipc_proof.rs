@@ -2635,6 +2635,8 @@ pub(crate) fn prove_objects(
     bsp: CpuIndex,
     tsc_hz: u64,
 ) -> bool {
+    // Settled first, so that only this proof moves the counts (TASKS item 67).
+    let settled_before = sched::settle(tsc_hz);
     let before = memory::stats();
     let mut ok = true;
     // First, while no other address space is being freed: it counts them.
@@ -2649,13 +2651,16 @@ pub(crate) fn prove_objects(
             == before.map(|(h, f)| (h.bytes_in_use, f))
     };
     ipc::reap_closed();
+    let settled_after = sched::settle(tsc_hz);
     sched::yield_until(same, tsc_hz, 2);
-    let back = same();
+    let back = same() && settled_before.is_ok() && settled_after.is_ok();
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    // After the counts are read, so that the words' own allocation is not in them.
+    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let _ = writeln!(
         com1,
-        "origin-kernel: ipc: every process and thread object and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
+        "origin-kernel: ipc: every process and thread object and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){unsettled}{}",
         if back { "" } else { ": ipc failed" }
     );
     ok && back
@@ -2883,6 +2888,8 @@ pub(crate) fn prove_identity(
     bsp: CpuIndex,
     tsc_hz: u64,
 ) -> bool {
+    // Settled first, so that only this proof moves the counts (TASKS item 67).
+    let settled_before = sched::settle(tsc_hz);
     let before = memory::stats();
     let ok = writer_identity(com1, cpus, bsp, tsc_hz);
     let same = || {
@@ -2890,13 +2897,16 @@ pub(crate) fn prove_identity(
             == before.map(|(h, f)| (h.bytes_in_use, f))
     };
     ipc::reap_closed();
+    let settled_after = sched::settle(tsc_hz);
     sched::yield_until(same, tsc_hz, 2);
-    let back = same();
+    let back = same() && settled_before.is_ok() && settled_after.is_ok();
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    // After the counts are read, so that the words' own allocation is not in them.
+    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let _ = writeln!(
         com1,
-        "origin-kernel: ipc: the identity proof's processes and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
+        "origin-kernel: ipc: the identity proof's processes and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){unsettled}{}",
         if back { "" } else { ": ipc failed" }
     );
     ok && back
@@ -3137,6 +3147,8 @@ pub(crate) fn prove_launch(
     bsp: CpuIndex,
     tsc_hz: u64,
 ) -> bool {
+    // Settled first, so that only this proof moves the counts (TASKS item 67).
+    let settled_before = sched::settle(tsc_hz);
     let before = memory::stats();
     let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let ok = {
@@ -3183,13 +3195,16 @@ pub(crate) fn prove_launch(
             == before.map(|(h, f)| (h.bytes_in_use, f))
     };
     ipc::reap_closed();
+    let settled_after = sched::settle(tsc_hz);
     sched::yield_until(same, tsc_hz, 2);
-    let back = same();
+    let back = same() && settled_before.is_ok() && settled_after.is_ok();
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    // After the counts are read, so that the words' own allocation is not in them.
+    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let _ = writeln!(
         com1,
-        "origin-kernel: start: every launched process and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
+        "origin-kernel: start: every launched process and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){unsettled}{}",
         if back { "" } else { ": start failed" }
     );
     ok && back
@@ -3198,6 +3213,8 @@ pub(crate) fn prove_launch(
 /// Runs every proof and checks nothing leaked. Called from the boot flow with every
 /// scheduler running.
 pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    // Settled first, so that only this proof moves the counts (TASKS item 67).
+    let settled_before = sched::settle(tsc_hz);
     let before = memory::stats();
     let started = time::monotonic_nanos();
     let mut ok = true;
@@ -3219,16 +3236,19 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
             == before.map(|(h, f)| (h.bytes_in_use, f))
     };
     ipc::reap_closed();
+    let settled_after = sched::settle(tsc_hz);
     sched::yield_until(same, tsc_hz, 2);
-    let back = same();
+    let back = same() && settled_before.is_ok() && settled_after.is_ok();
     let elapsed = time::monotonic_nanos().wrapping_sub(started) / 1_000_000;
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    // After the counts are read, so that the words' own allocation is not in them.
+    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     // Every thread's state was complete before it could be picked (`sched::spawn_with`).
     let unready = sched::unready_switches();
     let _ = writeln!(
         com1,
-        "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}), {elapsed} ms for the whole proof; threads run before their state existed: {unready}{}",
+        "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}), {elapsed} ms for the whole proof; threads run before their state existed: {unready}{unsettled}{}",
         if back && unready == 0 {
             ""
         } else {
