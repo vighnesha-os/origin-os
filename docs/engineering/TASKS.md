@@ -1452,6 +1452,21 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
   - B3-4, B3-8, B3-11 and B3-12 recorded or corrected (`206faf64`).
 - **B3-10, a departure from the contract:** §4 asked the host to record each refused access's space, address, width and PCI function. `Recorder` counts refusals by space only; the first failing device's line carries its address. Per-access records are not built.
 - **N-soak-2, found by the soak while answering:** a tracing host made the interpreter count more work (`Namespace::path_into`), so a traced run read the clock at other times. Fixed in `8792b8f6`, with a test and its controls.
+- **The gates on `0a3e1cb7`, B3's final evidence** (the answers' last commit that changes code is `2abb5c04`; `206faf64` and `0a3e1cb7` are records), under Rust 1.100.0 on the development Mac, in one turn of the machine (2026-11-15, 03:24 to 03:55 UTC), the tree clean before and after:
+  - **The boot controls first,** AML-1 to AML-5, each caught (ADR-0013, "The controls again, after the review of B3").
+  - **The soak inside the turn** (seed `0x63900000`, 1,000,000 cases of each kind, 50 s): passed. Grammar cases: 97% loaded, 23% returning a value, 22 kinds of error. Mutation cases: 13% and 19%, 36 kinds. The adversarial blocks ran as written.
+  - **`cargo xtask check` passed:** 2,210 tests, none failed, 28 ignored; Loom, 56 models and 83 controls. Its gates:
+    - the no-panic check, reading `origin-aml`'s object: 185 symbols of its own, 16 external, all allowed;
+    - the allocation gate on the library and on the proof, each plant caught;
+    - the `unsafe` gate, scanning 286 kernel source files;
+    - the settle gate: 19 readers, 11 settled, 8 listed;
+    - provenance: 29 crates.
+  - **`cargo xtask boot-test`:** 11 of 11.
+  - **`cargo xtask boot-matrix`:** passed, 193 scenarios with none failed.
+    - **The proof** ran and passed on each of its 31 kernel boots; none printed `aml failed` or the not-QEMU line. The ACPI machine loaded its NVDIMM's SSDT as table 1.
+    - **The boot verdicts:** 27 are `68 of 69`, failing speculation controls (decision item 154). The three oversubscribed machines (65 or 67 guest processors over 10 host threads) also fail scheduler fairness, excused by name (ADR-0013 Amendment 2). The machine without the random-number instructions is as before.
+    - **The largest tables,** the discovery machine's 496,558 bytes of AML: loaded in 230 ms, 4,132 devices walked in 122 ms, the interpreter holding at most 11,897,534 bytes in 32,516 nodes.
+    - **The stack:** on every boot the deepest host call was 47,599 bytes above the boot stack's guard page; on the default machine it was 5,808 bytes below the proof's entry.
 
 
 ### 60. The host tools are libraries first (ADR-0011 Amendment 4, T1)
