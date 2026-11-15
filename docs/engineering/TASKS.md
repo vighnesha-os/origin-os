@@ -489,7 +489,15 @@
 
 68. **A framework function that runs a closure on a painted, guarded stack and returns the depth it used (ADR-0019 A3; TASKS item 63's step B3, question 3). Numbered by the coordinating session on 2026-11-14; not assigned.** New `unsafe` in the framework, with its own review. It measures the AML interpreter's stack use in the kernel's own build, where today a release-mode host test on a 32 KiB thread is the proxy.
 
-69. **Item 313 in `xtask`'s checker (ADR-0013 Amendment 3). Numbered by the coordinating session on 2026-11-15; to be assigned.** On the 65-, 67- and 288-processor software-processor machines, named, the checker reports kernel stacks lost to a stalled shootdown with their count and does not fail the boot on them: the stacks proof's `lost` above zero, and a proof that failed only with TASKS item 67's "not settled …: N kernel stacks lost to a stalled shootdown". Nothing else is forgiven. Host tests, and planted controls showing a stalled shootdown forgiven on a named machine and failed on a 4-processor one, and a stall to timeout still failed.
+69. **Items 313 and 314 in `xtask` (ADR-0013 Amendment 3). Numbered by the coordinating session on 2026-11-15, and assigned to TASKS item 58's session on `claude/t69-lost-stacks`, from `land/batch-6` at `f933e415`.** Two parts, on the 65-, 67- and 288-processor software-processor machines only, named:
+- **(a) Reported, not failed.** On a boot that ran whole, the checker reports the stacks proof's `lost` count above zero, with the count and the machine, and does not fail the boot on it.
+- **(b) Run once more.** A boot the kernel stopped because a Refuse proof failed only with TASKS item 67's "not settled …: N kernel stacks lost to a stalled shootdown", with nothing failed before it, is run once more on the same machine. The gate passes only if the second run passes whole, and both runs are reported.
+
+Nothing else is forgiven or run again, and nothing in the kernel changes. Host tests, and planted controls showing:
+- a loss forgiven on a named machine, and failed on a 4-processor machine and under KVM;
+- a stall to timeout still failed;
+- a halted boot run once more only on a named machine, and only when the "not settled" line names lost stacks alone;
+- a second run that stops the same way failing the gate.
 59. **The NVMe driver against NVMe Base 2.4, NVM Command Set 1.3 and PCIe Transport 1.4: the check's findings fixed, and the check landed as a research ledger (CLAUDE.md §17, §33). Assigned by the coordinating session on 2026-11-14, on `claude/charming-joliot-0a23db` from `land/s4-part2` at `694a37c`. Its contract, the rulings and its result are under "Task contracts". Built on 2026-11-14, with `land/batch-5` (TASKS items 40, 58 and 60) merged in; gated under QEMU; not landed and not pushed; an independent review is to come.** The check (one AI reviewer, no person, 2026-11-14) found one High defect: a namespace formatted with metadata or protection information was accepted, and its transfers would have gone outside their buffer. H1 is fixed, as it had to be before any boot on a rented server.
 
 ## Waiting on the owner
