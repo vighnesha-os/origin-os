@@ -1440,6 +1440,20 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
 - **Not covered by B3:** `Load` and `LoadTable` (B4); `_REG`; anything that grants a region, so no access to hardware through AML has been made; the ACPI service (A2); any physical machine.
 
 
+**Step B3 after the sixth batch and the independent review (2026-11-15).**
+- **The sixth batch.** On the coordinating session's word, the branch merged `land/batch-6` at `f933e415` (`main` `a3c31a0` with TASKS 67) as `027ad754`. TASKS 67's settle gate found the proof reading `memory::stats` without `sched::settle`, and it is listed with its reason (`2a288d19`): it runs before the first thread, the other processors idle, and compares the heap's bytes only.
+- **The review.** `docs/engineering/REVIEW_T63_B3_2026-11-15.md` (one AI reviewer, on `f31956ff..39ae56e6`) found 0 High, 3 Medium, 5 Low and 4 Informational. Every finding is answered on the coordinating session's rulings, and its Resolution names each commit:
+  - B3-1, one bound for the whole proof and a processor test that runs nothing (`573116ee`, `19c336f6`);
+  - B3-2, the proof only on QEMU's own tables, recognized by the DSDT's checked OEM ID and OEM table ID, elsewhere one line and a pass (`19c336f6`);
+  - B3-3, the `unsafe` gate scans `origin-aml`, and its two lists cannot drift (`7cd79022`);
+  - B3-5, each verdict branch first in a test (`19c336f6`);
+  - B3-6, the proof under the allocation gate (`19c336f6`, `2abb5c04`);
+  - B3-7, the room above the guard page printed (`19c336f6`);
+  - B3-4, B3-8, B3-11 and B3-12 recorded or corrected (`206faf64`).
+- **B3-10, a departure from the contract:** §4 asked the host to record each refused access's space, address, width and PCI function. `Recorder` counts refusals by space only; the first failing device's line carries its address. Per-access records are not built.
+- **N-soak-2, found by the soak while answering:** a tracing host made the interpreter count more work (`Namespace::path_into`), so a traced run read the clock at other times. Fixed in `8792b8f6`, with a test and its controls.
+
+
 ### 60. The host tools are libraries first (ADR-0011 Amendment 4, T1)
 
 Sent by the coordinating session on 2026-11-14. The contract below was sent to it before any code (the shared notes' `t60-contract.md`), and it accepted it the same day with the rulings that follow.

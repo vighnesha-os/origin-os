@@ -4888,6 +4888,19 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 
 **What it does not show.** Nothing on a machine, and nothing that grants a region: no access to hardware through AML has been made. `Load` and `LoadTable` are not run (step B4). The depth it prints is how far below the proof's entry the deepest host call was made, a lower bound, not a measurement of the stack (TASKS item 68's). The named results and required refusals are QEMU's; a real machine's firmware may differ, and the proof is Report.
 
+## TASKS item 63: the answers to the review of step B3 (2026-11-15)
+
+**What it answers.** The independent review of step B3 (`docs/engineering/REVIEW_T63_B3_2026-11-15.md`: one AI reviewer started by the coordinating session; 0 High, 3 Medium, 5 Low, 4 Informational), on the coordinating session's rulings, after the sixth batch was merged in (`027ad754`). The Resolution names each commit. It also answers N-soak-2, which the soak found while answering (`8792b8f6`).
+
+**How it was written.** By the session that wrote B1 to B3, from the review, its rulings and ACPI 6.6 as before. `Interpreter::plain` follows aliases with the namespace's own bounded `unalias`; `steps_done` sums each evaluation's count in `end_evaluation`. No other interpreter's or operating system's source was read.
+
+**Test evidence.**
+- Host tests: the `plain` and tracing tests in `origin-aml`; in the kernel, a test for each new branch and each branch first (B3-5), the not-QEMU line and its escaping (B3-2), the alias `_HID`, the SSDT listed twice and the whole bound (B3-1, each with its control), the room printed (B3-7); xtask's test of the two lists (B3-3).
+- Planted controls of both gates (B3-3, B3-6).
+- Boot controls AML-1 to AML-5 in ADR-0013, and the gates on the final tip, in TASKS item 63.
+
+**What it does not show.** The proof still runs only under QEMU, and nowhere grants a region. The depth and the room are samples at host calls, not a measurement. A heap that refuses an allocation is shown on the host by an allocation of nearly 8 EiB, not by a kernel heap that has run out.
+
 ## TASKS item 60: the host tools are libraries first (ADR-0011 Amendment 4, T1; decision item 295; 2026-11-14)
 
 - **What:** `onbf-pack`, `onbf-sign` and `oidl` each offer everything they do as a typed Rust library that reaches nothing of the host; each command line is a thin client of its library; `xtask` calls the libraries in process and starts none of their programs; and `cargo xtask host-tools-gate`, in `check`, holds all three by the forms it reads (what it cannot see is in its doc comment and below). Whether a command line holds logic of its own is review's to see: the gate checks only which crates it names. The contract, the coordinating session's rulings of 2026-11-14 and the result are in `docs/engineering/TASKS.md`, item 60.
