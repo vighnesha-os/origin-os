@@ -18,8 +18,15 @@
 //! appends without that path in its code (`push_within_capacity` is unstable), so the symbol stays
 //! in the object though it is unreachable.
 //!
+//! **The kernel's boot proof** (`framekernel/src/aml_proof.rs`, TASKS item 63's step B3) is held to
+//! the same rules, for the same reason: while the interpreter may hold up to its memory limit of
+//! the kernel heap, nothing the proof grows may fail inside `alloc` (the coordinating session's
+//! ruling on B3's limit, condition 2; the review of B3, B3-6). Its one file that may grow a
+//! collection is `aml_proof/fallible.rs`, whose `fallible::push` and kin are its `mem::push`; its
+//! tests are exempt.
+//!
 //! It reads tokens (`lex`), so a name in a comment or a string does not count. Every run also
-//! checks a planted copy of a real file, and fails if the plant is not caught.
+//! checks a planted copy of a real file, in each of the two, and fails if the plant is not caught.
 
 use std::collections::BTreeMap;
 
@@ -34,6 +41,10 @@ const MEM: &str = "firmware/acpi/aml/src/mem.rs";
 const TESTS: &str = "firmware/acpi/aml/src/tests";
 /// The file a negative control is planted in, each run.
 const PLANT_IN: &str = "firmware/acpi/aml/src/engine.rs";
+/// The kernel's boot proof of the interpreter, held to the same rules (B3-6).
+const PROOF: &str = "framekernel/src/aml_proof.rs";
+/// The proof's one file that may grow a collection, as `mem.rs` is the library's.
+const PROOF_GROWS: &str = "framekernel/src/aml_proof/fallible.rs";
 
 /// Names of methods and functions that allocate or grow a collection. Refused wherever they are
 /// named, as a method (`.push(`) or by path (`Vec::push(&mut v, …)`), unless the path is `mem.rs`'s
@@ -107,6 +118,12 @@ const MACROS: &[&str] = &["vec", "format"];
 
 /// What `text` does that only `mem.rs` may: each finding with its line.
 pub(crate) fn findings(text: &str) -> Vec<String> {
+    findings_beside(text, "mem")
+}
+
+/// What `text` does that only the module `own` may: each finding with its line. A growing method
+/// named by `own`'s path (`mem::push`, `fallible::push`) is that module's, and allowed.
+fn findings_beside(text: &str, own: &str) -> Vec<String> {
     let tokens = lex::tokens(text);
     let mut out = Vec::new();
     let at = |t: &Token<'_>| lex::line_of(text, t.start);
@@ -159,7 +176,7 @@ pub(crate) fn findings(text: &str) -> Vec<String> {
         // A growing method, called or named by path, but `mem::push` and its kin. A definition
         // (`fn push`) is not a call.
         if GROWERS.contains(&t.text)
-            && !after_path(i, "mem")
+            && !after_path(i, own)
             && !prev.is_some_and(|p| p.is_ident("fn"))
             && next.is_some_and(|n| n.is_punct('(') || n.is_punct(':'))
         {
@@ -235,6 +252,44 @@ pub(crate) fn gate() -> Result {
     println!(
         "xtask: allocation gate: {} library files of origin-aml allocate only through {MEM}; its planted `push` was caught",
         files.len() - 1
+    );
+    proof_gate()
+}
+
+/// The same rules on the kernel's boot proof of the interpreter, whose one file that may grow a
+/// collection is [`PROOF_GROWS`] (B3-6), with its own planted control.
+fn proof_gate() -> Result {
+    let root = repo_root();
+    let read = |path: &str| {
+        std::fs::read_to_string(root.join(path))
+            .map_err(|e| format!("allocation gate: {path}: {e}"))
+    };
+    let text = read(PROOF)?;
+    // The file that may grow must exist and do so, or the gate is looking in the wrong place.
+    if !read(PROOF_GROWS)?.contains("try_reserve") {
+        return Err(format!(
+            "allocation gate: {PROOF_GROWS} reserves nothing: the gate's files are wrong"
+        ));
+    }
+    let planted = format!("{text}\nfn planted(v: &mut alloc::vec::Vec<u8>) {{ v.push(1); }}\n");
+    if findings_beside(&planted, "fallible").len() != findings_beside(&text, "fallible").len() + 1 {
+        return Err(format!(
+            "allocation gate: its negative control (a `push` planted in {PROOF}) was not caught"
+        ));
+    }
+    let problems: Vec<String> = findings_beside(&text, "fallible")
+        .into_iter()
+        .map(|f| format!("{PROOF}: {f}"))
+        .collect();
+    if !problems.is_empty() {
+        return Err(format!(
+            "allocation gate (developer-tools/xtask/src/amlalloc.rs): the boot proof allocates only through {PROOF_GROWS} ({} found):\n  {}",
+            problems.len(),
+            problems.join("\n  ")
+        ));
+    }
+    println!(
+        "xtask: allocation gate: the kernel's boot proof of the interpreter ({PROOF}) allocates only through {PROOF_GROWS}; its planted `push` was caught"
     );
     Ok(())
 }
