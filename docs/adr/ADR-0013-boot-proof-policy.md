@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-09, as proposed, with the recommended answer to each of the five questions below (decision sheet item 55). The owner's answer was "Accept both" to one question covering ADR-0012 and this ADR, relayed by the session that asked it. It decides what a machine does when the kernel's own checks fail (CLAUDE.md §18), and is not an ABI or format decision (§84). Everything below is built and boot-tested under QEMU, except what Migration says is left for later; the follow-ups F1 to F6 this inventory found are fixed. Nothing here has shipped, and nothing has run on physical hardware (§74). **Amendment 1 (below): Accepted** by the owner on 2026-11-10 (item 113); not built. **Amendment 2 (below): Accepted** by the owner on 2026-11-14 (item 308); built by TASKS item 58, not yet in a batch. |
+| Status | **Accepted** by the owner on 2026-11-09, as proposed, with the recommended answer to each of the five questions below (decision sheet item 55). The owner's answer was "Accept both" to one question covering ADR-0012 and this ADR, relayed by the session that asked it. It decides what a machine does when the kernel's own checks fail (CLAUDE.md §18), and is not an ABI or format decision (§84). Everything below is built and boot-tested under QEMU, except what Migration says is left for later; the follow-ups F1 to F6 this inventory found are fixed. Nothing here has shipped, and nothing has run on physical hardware (§74). **Amendment 1 (below): Accepted** by the owner on 2026-11-10 (item 113); not built. **Amendment 2 (below): Accepted** by the owner on 2026-11-14 (item 308); built by TASKS item 58, on `main` since 2026-11-15 (pull request 39). **Amendment 3 (below): Accepted** by the owner on 2026-11-15 (item 313); not built. |
 | Requires | CLAUDE.md P0, P8, §13 (explicit panic handling), §18, §19 (early diagnostics), §20 (boot-failure detection), §24–§26, §28–§31, §58, §59, §65, §68, §69 (safe mode, boot recovery), §74, rules 14, 16, 30, 34, 35, 40 |
 | Code | `framekernel/src/bootproof.rs` (the policy table and the tally), `framekernel/src/kernel.rs` (`kernel_main`), `framekernel/src/{sched,wait,time,irq,i8042,storage,pcie,console,stacks}.rs`, `framekernel/frame/src/{timer,early,port,acpi,apic}.rs`, `developer-tools/xtask/src/main.rs` |
 | Evidence | `docs/research/2026-11-09-boot-proof-failures.md`; `docs/engineering/SOURCE_PROVENANCE.md`, "What a failed boot proof means" |
@@ -606,5 +606,21 @@ Each consumer refuses when a draw fails. None of them sees what the proof checks
 **Performance cost (ADR-0018 V3).** None, by construction: it changes what the build host's test tool accepts, and nothing that ships.
 
 **Trade-offs.** A fairness regression that shows only on a large machine is reported there and not failed; the small machines still fail on it.
+
+**Migration consequences.** None: no ABI or format changes, and the kernel's verdict is unchanged.
+
+## Amendment 3 (Accepted, 2026-11-15): a kernel stack lost to a stalled shootdown on the oversubscribed software-processor machines is reported, not failed
+
+**Status: Accepted by the owner on 2026-11-15 ("Accept 313", decision sheet item 313). Not built.** It holds until TASKS item 66 decides a lasting rule from measured figures.
+
+**Why.** When a retired kernel stack is reclaimed, the reclaim's shootdown waits at most its patience, 1 s, for every processor to answer. If one does not, the slot and its 4 frames are withheld for good, because a stale translation may remain: safe by design, and a cost in memory, not in correctness. On the 65- and 67-processor machines of ADR-0008 D7, which run 65 or 67 guest processors on the development Mac's 10 threads under QEMU's software processor, a guest processor left unscheduled for over a second produces exactly that. On 2026-11-14 TASKS item 59's `boot-matrix` failed three times that way, before any of its own code ran (one to three slots lost, on the 67-processor machine and on both 65-processor machines), and passed on other runs of the same build. Under R8 `cargo xtask` fails a boot on the stacks proof's `lost: 0` and on every `: X failed` line, so those machines could not be a gate that passes reliably. TASKS item 67 (the settle before whole-machine count compares) names such a loss in the kernel's own proofs as "N kernel stacks lost to a stalled shootdown".
+
+**Decision.** On the 65-, 67- and 288-processor software-processor machines of ADR-0008 D7, named, `cargo xtask` reports the kernel stacks lost to a stalled shootdown, with their count, and does not fail the boot on them: the stacks proof's `lost` count above zero, and a proof that failed only with "not settled …: N kernel stacks lost to a stalled shootdown". Nothing else is forgiven: a stall or timeout, a stack lost any other way, a frame or heap mismatch without that cause. On every other machine, those of 1 to 4 processors included and any physical machine, R8 stands: a lost stack fails the boot. The allowance is keyed to the machine, never to the host's thread count.
+
+**Alternatives that were put.** Keeping it a failure and rerunning until a run passes, at about an hour of the shared machine for each failed run.
+
+**Performance cost (ADR-0018 V3).** None, by construction: it changes what the build host's test tool accepts, and nothing that ships.
+
+**Trade-offs.** A defect that loses stacks only on a large machine would be reported there and not failed; the small machines still fail on it, and TASKS item 66 decides with figures.
 
 **Migration consequences.** None: no ABI or format changes, and the kernel's verdict is unchanged.
