@@ -1100,6 +1100,9 @@ fn boot_scenario() -> Scenario {
         scenario
             .markers
             .retain(|m| !m.starts_with(EVEN_SHARES_LINE));
+        // A kernel stack lost to a stalled shootdown before the stacks proof is reported, not
+        // failed (ADR-0013 Amendment 3, part (a); `stacks_lost`, and the summary after the boot).
+        allow_lost_stacks(&mut scenario.markers);
     }
     if qemu_bridge() {
         bridge_markers(&mut scenario);
@@ -1450,6 +1453,14 @@ fn oversubscribed_fair_share(line: &str) -> Option<(u64, u64)> {
     let second = number_before(counts, ", ")?;
     let switches = number_before(counts, " context switches")?;
     (first > 0 && second > 0 && switches >= 15).then_some((first, second))
+}
+
+/// What `xtask` prints for kernel stacks lost to a stalled shootdown that it let pass on a named
+/// oversubscribed machine (ADR-0013 Amendment 3, part (a)): reported, never hidden.
+fn forgave_lost_stacks(label: &str, lost: u64, cpus: u32) -> String {
+    format!(
+        "xtask: {label}: forgave {lost} kernel stacks lost to a stalled shootdown on an oversubscribed machine, named ({cpus} guest processors; ADR-0013 Amendment 3, decision item 313): each withholds its slot and its 4 frames for good, and a machine of 1 to 4 processors would fail on it"
+    )
 }
 
 /// Whether the checker lets `line` pass on a boot under `accel`: KVM's allowances, and on an
@@ -2709,6 +2720,174 @@ const HALT_LINE: &str = "origin-kernel: M1 entry complete; halting";
 
 /// How the line starts that the scheduler proof prints when every worker's share was even.
 const EVEN_SHARES_LINE: &str = "origin-kernel: preemptive multitasking: ";
+
+/// The stacks proof's last line, as far as its live count (`stacks::prove`), and the parts the
+/// checker requires after it: nothing kept for reuse, retired or lost, and every count as before.
+const STACKS_GIVEN_BACK: &str =
+    "origin-kernel: kernel stacks: every stack the proof made is given back: Counts { live: ";
+const STACKS_NONE_LOST: &str = ", idle: 0, retired: 0, lost: 0, pages: ";
+const STACKS_AS_BEFORE: &str = " }, as before: true";
+/// On the named oversubscribed machines, any count of stacks lost (ADR-0013 Amendment 3).
+const STACKS_ANY_LOST: &str = ", idle: 0, retired: 0, lost: ";
+
+/// The kernel stacks the stacks proof's last line reports lost to a stalled shootdown, when the
+/// line is that line and the proof held (`, as before: true`): a stalled reclaim withholds its
+/// slot and its frames for good, and is the only way a stack is counted lost there. `None` for
+/// any other line. On the named oversubscribed machines a count above zero is reported, not
+/// failed (ADR-0013 Amendment 3, part (a), decision item 313); elsewhere `lost: 0` is a marker.
+/// The named oversubscribed machines' markers: the stacks proof's line may report any count of
+/// stacks lost, and nothing else of it changes (ADR-0013 Amendment 3, part (a)).
+fn allow_lost_stacks(markers: &mut [String]) {
+    for m in markers {
+        if m == STACKS_NONE_LOST {
+            *m = STACKS_ANY_LOST.into();
+        }
+    }
+}
+
+/// The lines on which a Refuse proof that settles prints its counts and, if a settle failed, the
+/// settle's words (`sched::not_settled`): each begins with one of these. The scheduler's own check
+/// of reaped threads carries them too, but it is a Report proof and stops no boot, so it is not
+/// here (ADR-0013 Amendment 3, part (b)). A line whose words change is no longer recognised, and
+/// its boot is not run again: this fails closed.
+const REFUSE_COUNT_LINES: &[&str] = &[
+    "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: ",
+    "origin-kernel: ipc: every process and thread object and all they held are gone: ",
+    "origin-kernel: ipc: the identity proof's processes and all they held are gone: ",
+    "origin-kernel: start: every launched process and all they held are gone: ",
+    "origin-kernel: rust program: every launched process and all they held are gone: ",
+    "origin-kernel: core: every process it launched and all they held are gone: ",
+    "origin-kernel: memory: every process, object and mapping of the proof is gone: ",
+    "origin-kernel: directory: the directory, the service, the client and all they held are gone: ",
+    "origin-kernel: ports: every process, event, port, binding and packet of the proof is gone: ",
+    "origin-kernel: address spaces: every process and frame of these proofs is gone: ",
+    STACKS_GIVEN_BACK,
+];
+
+/// The most pages a kernel stack holds (`stack::MAX_STACK`, 64 KiB): the most frames one lost
+/// stack can withhold.
+const MAX_STACK_PAGES: u64 = 16;
+
+/// The kernel stacks a settle lost, and the line, when the first line of `text` that fails
+/// (`failures`, past the lines `forgiven` lets pass) is a Refuse proof's count line that failed
+/// only because a settle lost those stacks to a stalled shootdown (`lost_stacks_only`), and
+/// nothing went wrong before it: every one of the scenario's `markers` up to that proof's own was
+/// found, in order, by the end of its line. The checker fails a boot on a failing line at once but
+/// on a missing marker only at the end, so without this a line lost or changed before the proof
+/// would be run again rather than failed.
+fn stopped_by_lost_stacks(
+    text: &str,
+    failures: &[&'static str],
+    markers: &[&str],
+    forgiven: impl Fn(&str) -> bool,
+) -> Option<(u64, String)> {
+    let line = text
+        .lines()
+        .filter(|l| !forgiven(l))
+        .find(|l| failures.iter().any(|m| l.contains(m)))?;
+    let lost = lost_stacks_only(line)?;
+    // `line` is a slice of `text`, so its end is found from where it starts.
+    let end = (line.as_ptr() as usize - text.as_ptr() as usize) + line.len();
+    let prefix = REFUSE_COUNT_LINES.iter().find(|p| line.starts_with(**p))?;
+    let own = markers
+        .iter()
+        .position(|m| m.starts_with(prefix) && line.contains(m))?;
+    serial::contains_in_order(text.get(..end)?, markers.get(..=own)?)
+        .then(|| (lost, line.to_string()))
+}
+
+/// How many kernel stacks a Refuse proof's count line says its settle lost, when that is the only
+/// thing wrong in it (ADR-0013 Amendment 3, part (b)): the settle's words name lost stacks and
+/// nothing else, the heap is where it was, the free frames are lower by no more than those stacks'
+/// pages (a stack lost in the settle before the compare withholds its frames), and the line's other
+/// clauses held. `None` otherwise: a stall or timeout, an unreaped thread or a retired stack, a
+/// heap or frame mismatch with another cause, or any other line.
+fn lost_stacks_only(line: &str) -> Option<u64> {
+    if !REFUSE_COUNT_LINES.iter().any(|p| line.starts_with(p)) || !line.ends_with(" failed") {
+        return None;
+    }
+    let (counts, words) = line.split_once("; not settled before its ")?;
+    if words.contains("; not settled before its ") {
+        return None;
+    }
+    let words = words
+        .strip_prefix("first count: ")
+        .or_else(|| words.strip_prefix("compare: "))?;
+    let (count, after) = words.split_once(" kernel stacks lost to a stalled shootdown")?;
+    // "1 exited threads unreaped, 2" is no count: something besides lost stacks was pending.
+    let lost: u64 = count.parse().ok()?;
+    if lost == 0 || !(after.starts_with(": ") || after.starts_with(" (")) {
+        return None;
+    }
+    // The heap, and the free frames.
+    if let Some((now, before)) = number_and_was(counts, "heap ", " bytes (was ")
+        && now != before
+    {
+        return None;
+    }
+    if let Some((now, before)) = number_and_was(counts, ", ", " free frames (was ")
+        && (now > before || before - now > lost * MAX_STACK_PAGES)
+    {
+        return None;
+    }
+    // The other clauses some of these lines carry.
+    let held = [
+        "threads run before their state existed: 0",
+        "mapped by no process: true",
+        "as it was written at boot: true",
+    ];
+    for (clause, _) in held.iter().filter_map(|h| h.rsplit_once(": ")) {
+        if let Some((_, rest)) = counts.split_once(&format!("{clause}: ")) {
+            let value = rest.split([';', ',', ' ']).next().unwrap_or("");
+            if !held.contains(&format!("{clause}: {value}").as_str()) {
+                return None;
+            }
+        }
+    }
+    // The stacks proof: its counts differ, if at all, only by the stacks lost and their pages.
+    if line.starts_with(STACKS_GIVEN_BACK) && counts.ends_with("as before: false") {
+        let (_, before) = after.split_once(" (")?;
+        let before = before.strip_suffix(" before): kernel stacks failed")?;
+        let now = counts.strip_prefix(
+            "origin-kernel: kernel stacks: every stack the proof made is given back: ",
+        )?;
+        let now = now.strip_suffix(", as before: false")?;
+        let fields = |c: &str| -> Option<[u64; 4]> {
+            let c = c.strip_prefix("Counts { ")?.strip_suffix(" }")?;
+            let mut out = [0; 4];
+            for (slot, name) in out
+                .iter_mut()
+                .zip(["live: ", "idle: ", "retired: ", "lost: "])
+            {
+                *slot = c.split_once(name)?.1.split(',').next()?.parse().ok()?;
+            }
+            Some(out)
+        };
+        let (now, before) = (fields(now)?, fields(before)?);
+        if now[..3] != before[..3] || now[3] != before[3] + lost {
+            return None;
+        }
+    }
+    Some(lost)
+}
+
+/// In `text`, the number after `lead` and the one after `was` up to `)`: `heap 10 bytes (was 12)`.
+fn number_and_was(text: &str, lead: &str, was: &str) -> Option<(u64, u64)> {
+    let (head, rest) = text.split_once(was)?;
+    let now = head.rsplit_once(lead)?.1.parse().ok()?;
+    let before = rest.split_once(')')?.0.parse().ok()?;
+    Some((now, before))
+}
+
+fn stacks_lost(line: &str) -> Option<u64> {
+    let rest = line.strip_prefix(STACKS_GIVEN_BACK)?;
+    if !rest.ends_with(STACKS_AS_BEFORE) {
+        return None;
+    }
+    let (_, after) = rest.split_once(", idle: 0, retired: 0, lost: ")?;
+    let (count, _) = after.split_once(", pages: ")?;
+    count.parse().ok()
+}
 /// How every I/O APIC proof ends a line that failed.
 const IOAPIC_FAILED: &str = ": I/O APIC failed";
 /// How every clock proof ends a line that failed.
@@ -3085,9 +3264,9 @@ fn stack_markers(machine: &Machine) -> Vec<String> {
         ),
         "origin-kernel: kernel stacks: 64 stacks of 16384 bytes made and freed: all made true; making one took ".into(),
         " (QEMU, no budget)".into(),
-        "origin-kernel: kernel stacks: every stack the proof made is given back: Counts { live: ".into(),
-        ", idle: 0, retired: 0, lost: 0, pages: ".into(),
-        " }, as before: true".into(),
+        STACKS_GIVEN_BACK.into(),
+        STACKS_NONE_LOST.into(),
+        STACKS_AS_BEFORE.into(),
     ]
 }
 
@@ -6093,8 +6272,77 @@ fn select_scenarios<'a>(
     Ok(chosen)
 }
 
-/// Boots `kernel` once and checks its output against `scenario`.
+/// Boots `kernel` and checks its output against `scenario`. On a named oversubscribed machine, a
+/// boot that stopped only because a Refuse proof's settle lost kernel stacks to a stalled
+/// shootdown, with nothing failed before it, is booted once more, and passes only if that second
+/// run passes whole (ADR-0013 Amendment 3, part (b); decision item 314). Both runs are reported.
+/// Once more only: a second run that stops the same way fails. Everything here runs in the turn
+/// this process already holds, and starts no other program than QEMU.
 fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
+    let log = scenario_log(scenario);
+    let first_log = log.with_extension("first-run.log");
+    // So that only this run's log can be read for a second run, and no earlier run's first log
+    // is left beside a run that needed none.
+    let _ = fs::remove_file(&log);
+    let _ = fs::remove_file(&first_log);
+    let Err(first) = run_scenario_once(scenario, kernel) else {
+        return Ok(());
+    };
+    let stopped = |log: &Path| -> Option<(u64, String)> {
+        if !oversubscribed() || scenario.capture == Capture::Screen {
+            return None;
+        }
+        let accel = Accel::from_env().ok()?;
+        let text = fs::read_to_string(log).ok()?;
+        let markers: Vec<&str> = scenario.markers.iter().map(String::as_str).collect();
+        stopped_by_lost_stacks(&text, &scenario.failures, &markers, |l| {
+            checker_forgives(l, accel, true)
+        })
+    };
+    let Some((lost, line)) = stopped(&log) else {
+        return Err(first);
+    };
+    let _ = fs::rename(&log, &first_log);
+    // The first run's verdict names its log by the path the second run is about to write.
+    let first = first.replace(&log.display().to_string(), &first_log.display().to_string());
+    println!(
+        "xtask: {}: the first run stopped only because a proof's settle lost {lost} kernel stacks to a stalled shootdown, with nothing failed before it, on an oversubscribed machine, named ({} guest processors; ADR-0013 Amendment 3, part (b), decision item 314): running it once more on the same machine. The first run: {first}; its line: {line}; its serial log: {}",
+        scenario.label,
+        machine().cpus(),
+        first_log.display()
+    );
+    match run_scenario_once(scenario, kernel) {
+        Ok(()) => {
+            println!(
+                "xtask: {}: passed on its second run; the first stopped with {lost} kernel stacks lost to a stalled shootdown (ADR-0013 Amendment 3, part (b)); its serial log: {}",
+                scenario.label,
+                first_log.display()
+            );
+            Ok(())
+        }
+        Err(second) => Err(format!(
+            "{second}; this was its second run, the first having stopped with {lost} kernel stacks lost to a stalled shootdown (ADR-0013 Amendment 3, part (b)){}: the gate fails",
+            if stopped(&log).is_some() {
+                ", and the second stopped the same way"
+            } else {
+                ""
+            }
+        )),
+    }
+}
+
+/// Where a scenario's serial log is written.
+fn scenario_log(scenario: &Scenario) -> PathBuf {
+    target_dir().join("xtask").join(format!(
+        "boot-test-{}.log",
+        scenario
+            .label
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+    ))
+}
+
+/// Boots `kernel` once and checks its output against `scenario`.
+fn run_scenario_once(scenario: &Scenario, kernel: &[u8]) -> Result {
     let staged = stage(kernel, scenario.loader)?;
     let timeout = boot_test_timeout()?;
     let accel = Accel::from_env()?;
@@ -6256,6 +6504,13 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
                     machine().cpus()
                 );
             }
+            // ADR-0013 Amendment 3, part (a): every stack lost to a stalled shootdown, said so.
+            if let Some(lost) = stacks_lost(line).filter(|&n| n > 0) {
+                println!(
+                    "{}",
+                    forgave_lost_stacks(scenario.label, lost, machine().cpus())
+                );
+            }
         }
     }
     let mut screen = None;
@@ -6321,12 +6576,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
                 None => Ok(()),
             },
         );
-    let log = work.join(format!(
-        "boot-test-{}.log",
-        scenario
-            .label
-            .replace(|c: char| !c.is_ascii_alphanumeric(), "-")
-    ));
+    let log = scenario_log(scenario);
     fs::write(&log, &text).map_err(|e| format!("{}: {e}", log.display()))?;
 
     match verdict {
@@ -6809,6 +7059,212 @@ mod nvme_marker_tests {
                 .first()
                 .is_some_and(|l| l.contains("1 of 2 processors"))
         );
+    }
+}
+
+#[cfg(test)]
+mod lost_stacks_tests {
+    use super::{
+        STACKS_ANY_LOST, STACKS_AS_BEFORE, STACKS_GIVEN_BACK, STACKS_NONE_LOST, allow_lost_stacks,
+        forgave_lost_stacks, stacks_lost,
+    };
+
+    fn line(lost: &str, held: &str) -> String {
+        format!(
+            "{STACKS_GIVEN_BACK}398, idle: 0, retired: 0, lost: {lost}, pages: 2247 }}, as before: {held}"
+        )
+    }
+
+    /// ADR-0013 Amendment 3, part (a): the count is read from the stacks proof's last line, and
+    /// only from it, and only when the proof held.
+    #[test]
+    fn the_stacks_lines_lost_count_is_read() {
+        assert_eq!(stacks_lost(&line("3", "true")), Some(3));
+        assert_eq!(stacks_lost(&line("0", "true")), Some(0));
+        assert_eq!(stacks_lost(&line("3", "false")), None, "the proof failed");
+        assert_eq!(stacks_lost(&line("three", "true")), None, "not a count");
+        assert_eq!(
+            stacks_lost(&format!(
+                "{} (Counts {{ live: 1 }} before): kernel stacks failed",
+                line("1", "false")
+            )),
+            None
+        );
+        assert_eq!(
+            stacks_lost(
+                "origin-kernel: kernel stacks: 64 stacks of 16384 bytes made and freed: all made true"
+            ),
+            None
+        );
+    }
+
+    /// Off the named machines `lost: 0` is required; on them any count passes the markers, and
+    /// nothing else of the line is loosened.
+    #[test]
+    fn only_the_named_machines_accept_a_lost_count() {
+        let lost = line("3", "true");
+        assert!(
+            !lost.contains(STACKS_NONE_LOST),
+            "strict: a lost stack fails"
+        );
+        assert!(lost.contains(STACKS_ANY_LOST) && lost.contains(STACKS_AS_BEFORE));
+        let mut markers = vec![
+            STACKS_GIVEN_BACK.to_string(),
+            STACKS_NONE_LOST.to_string(),
+            STACKS_AS_BEFORE.to_string(),
+        ];
+        allow_lost_stacks(&mut markers);
+        assert_eq!(
+            markers,
+            [STACKS_GIVEN_BACK, STACKS_ANY_LOST, STACKS_AS_BEFORE]
+        );
+        assert!(markers.iter().all(|m| lost.contains(m.as_str())));
+        // A line where something is retired or kept still fails the loose markers.
+        let retired = lost.replace("retired: 0", "retired: 2");
+        assert!(!markers.iter().all(|m| retired.contains(m.as_str())));
+        let failed = line("3", "false");
+        assert!(!markers.iter().all(|m| failed.contains(m.as_str())));
+    }
+
+    #[test]
+    fn a_forgiven_loss_is_said_with_its_count_and_machine() {
+        let said = forgave_lost_stacks("kernel boot", 3, 65);
+        assert!(said.starts_with(
+            "xtask: kernel boot: forgave 3 kernel stacks lost to a stalled shootdown"
+        ));
+        assert!(said.contains("65 guest processors") && said.contains("ADR-0013 Amendment 3"));
+    }
+}
+
+#[cfg(test)]
+mod rerun_tests {
+    use super::{STACKS_GIVEN_BACK, lost_stacks_only, stopped_by_lost_stacks};
+
+    const IPC: &str = "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap 75712 bytes (was 75712), 128105 free frames (was 128105), 337 ms for the whole proof; threads run before their state existed: 0";
+    const LOST: &str = "; not settled before its first count: 1 kernel stacks lost to a stalled shootdown: ipc failed";
+    const TLB: &str =
+        "origin-kernel: TLB: 64 other processors cached 1 page; none saw a stale translation";
+    /// A scenario's markers, in the kernel's order: the boot, the TLB proof, the IPC proof's own.
+    const MARKERS: [&str; 3] = [
+        "origin-kernel: boot",
+        "origin-kernel: TLB: ",
+        "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap ",
+    ];
+
+    /// ADR-0013 Amendment 3, part (b): T67-e's line, a Refuse proof failed only by its settle's
+    /// lost stack, qualifies; so does one that lost it in the settle before the compare, with the
+    /// stack's frames withheld.
+    #[test]
+    fn a_refuse_proof_failed_only_by_lost_stacks_qualifies() {
+        assert_eq!(lost_stacks_only(&format!("{IPC}{LOST}")), Some(1));
+        let at_compare = IPC.replace("128105 free frames", "128101 free frames")
+            + "; not settled before its compare: 2 kernel stacks lost to a stalled shootdown: ipc failed";
+        assert_eq!(lost_stacks_only(&at_compare), Some(2));
+        let stacks = format!(
+            "{STACKS_GIVEN_BACK}386, idle: 0, retired: 0, lost: 1, pages: 2175 }}, as before: false; not settled before its compare: 1 kernel stacks lost to a stalled shootdown (Counts {{ live: 386, idle: 0, retired: 0, lost: 0, pages: 2179 }} before): kernel stacks failed"
+        );
+        assert_eq!(lost_stacks_only(&stacks), Some(1));
+    }
+
+    /// Nothing else qualifies (the amendment's "nothing else is forgiven or run again").
+    #[test]
+    fn nothing_else_qualifies() {
+        let cases = [
+            // Something besides lost stacks was pending.
+            format!("{IPC}; not settled before its first count: 1 exited threads unreaped, 1 kernel stacks lost to a stalled shootdown: ipc failed"),
+            format!("{IPC}; not settled before its compare: 2 kernel stacks retired: ipc failed"),
+            // A heap mismatch, which a lost stack cannot cause.
+            format!("{}{LOST}", IPC.replace("heap 75712 bytes", "heap 75968 bytes")),
+            // More free frames than before, or more fewer than the lost stacks hold.
+            format!("{}{LOST}", IPC.replace("128105 free frames", "128109 free frames")),
+            format!("{}{LOST}", IPC.replace("128105 free frames", "128080 free frames")),
+            // Another clause failed on the same line.
+            format!("{}{LOST}", IPC.replace("state existed: 0", "state existed: 3")),
+            // Not a lost-stacks failure at all.
+            format!("{}: ipc failed", IPC.replace("128105 free frames", "128104 free frames")),
+            // The scheduler's own check is a Report proof: it stops no boot.
+            "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap 878 KiB, 878 KiB before the first spawn; 386 stacks held, 386 before the first spawn; not settled before its compare: 1 kernel stacks lost to a stalled shootdown: scheduler failed".to_string(),
+            // A stall that panicked, and a timeout.
+            "origin-kernel: panic: panicked at framekernel/frame/src/tlb.rs:240:31:".to_string(),
+            "origin-kernel: scheduler: CPU 31: workers 62 and 63 counted 20130000 and 5730000, 13 context switches: scheduler failed".to_string(),
+        ];
+        for line in &cases {
+            assert_eq!(lost_stacks_only(line), None, "{line}");
+        }
+        // The stacks proof with another count changed besides the lost stack.
+        let retired = format!(
+            "{STACKS_GIVEN_BACK}386, idle: 0, retired: 1, lost: 1, pages: 2175 }}, as before: false; not settled before its compare: 1 kernel stacks lost to a stalled shootdown (Counts {{ live: 386, idle: 0, retired: 0, lost: 0, pages: 2179 }} before): kernel stacks failed"
+        );
+        assert_eq!(lost_stacks_only(&retired), None);
+    }
+
+    /// Only the first failing line counts: an earlier failure in the same boot means no re-run.
+    #[test]
+    fn only_the_first_failure_decides() {
+        let failures = [": ipc failed", ": scheduler failed", ": TLB failed"];
+        let markers = MARKERS;
+        let none_forgiven = |_: &str| false;
+        let alone = format!("origin-kernel: boot\n{TLB}\n{IPC}{LOST}\n");
+        assert_eq!(
+            stopped_by_lost_stacks(&alone, &failures, &markers, none_forgiven).map(|(n, _)| n),
+            Some(1)
+        );
+        let earlier = format!(
+            "origin-kernel: boot\norigin-kernel: TLB: 2 other processors cached 3 pages; 3 saw a stale translation: TLB failed\n{IPC}{LOST}\n"
+        );
+        assert_eq!(
+            stopped_by_lost_stacks(&earlier, &failures, &markers, none_forgiven),
+            None
+        );
+        // A line the checker lets pass (an uneven share on a named machine) does not count.
+        let fair = "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted 7 and 25, 21 context switches: scheduler failed";
+        let forgiven_fair = |l: &str| l == fair;
+        let after_forgiven = format!("origin-kernel: boot\n{TLB}\n{fair}\n{IPC}{LOST}\n");
+        assert_eq!(
+            stopped_by_lost_stacks(&after_forgiven, &failures, &markers, forgiven_fair)
+                .map(|(n, _)| n),
+            Some(1)
+        );
+        assert_eq!(
+            stopped_by_lost_stacks(&after_forgiven, &failures, &markers, none_forgiven),
+            None
+        );
+    }
+
+    /// A marker before the proof's own that was never printed (a line lost or changed): the
+    /// checker would fail it only at the end, so it must not be run again.
+    #[test]
+    fn a_missing_earlier_marker_means_no_rerun() {
+        let failures = [": ipc failed"];
+        let markers = MARKERS;
+        let none_forgiven = |_: &str| false;
+        let whole = format!("origin-kernel: boot\n{TLB}\n{IPC}{LOST}\n");
+        assert!(stopped_by_lost_stacks(&whole, &failures, &markers, none_forgiven).is_some());
+        // The TLB proof's line missing, or out of order.
+        let missing = format!("origin-kernel: boot\n{IPC}{LOST}\n");
+        assert_eq!(
+            stopped_by_lost_stacks(&missing, &failures, &markers, none_forgiven),
+            None
+        );
+        let late = format!("origin-kernel: boot\n{IPC}{LOST}\n{TLB}\n");
+        assert_eq!(
+            stopped_by_lost_stacks(&late, &failures, &markers, none_forgiven),
+            None
+        );
+        // A scenario with no marker for the proof's own line: refused, not guessed.
+        let without_own = ["origin-kernel: boot", "origin-kernel: TLB: "];
+        assert_eq!(
+            stopped_by_lost_stacks(&whole, &failures, &without_own, none_forgiven),
+            None
+        );
+        // Markers after the proof's own are the second run's to find, not this one's.
+        let with_later = [
+            "origin-kernel: boot",
+            "origin-kernel: TLB: ",
+            "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap ",
+            "origin-kernel: ipc: every process and thread object and all they held are gone: heap ",
+        ];
+        assert!(stopped_by_lost_stacks(&whole, &failures, &with_later, none_forgiven).is_some());
     }
 }
 
