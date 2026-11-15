@@ -6267,8 +6267,11 @@ fn select_scenarios<'a>(
 /// this process already holds, and starts no other program than QEMU.
 fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     let log = scenario_log(scenario);
-    // So that only this run's log can be read for a second run.
+    let first_log = log.with_extension("first-run.log");
+    // So that only this run's log can be read for a second run, and no earlier run's first log
+    // is left beside a run that needed none.
     let _ = fs::remove_file(&log);
+    let _ = fs::remove_file(&first_log);
     let Err(first) = run_scenario_once(scenario, kernel) else {
         return Ok(());
     };
@@ -6285,7 +6288,6 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     let Some((lost, line)) = stopped(&log) else {
         return Err(first);
     };
-    let first_log = log.with_extension("first-run.log");
     let _ = fs::rename(&log, &first_log);
     println!(
         "xtask: {}: the first run stopped only because a proof's settle lost {lost} kernel stacks to a stalled shootdown, with nothing failed before it, on an oversubscribed machine, named ({} guest processors; ADR-0013 Amendment 3, part (b), decision item 314): running it once more on the same machine. The first run: {first}; its line: {line}; its serial log: {}",
