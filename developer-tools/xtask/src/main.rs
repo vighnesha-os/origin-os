@@ -2770,17 +2770,30 @@ const MAX_STACK_PAGES: u64 = 16;
 
 /// The kernel stacks a settle lost, and the line, when the first line of `text` that fails
 /// (`failures`, past the lines `forgiven` lets pass) is a Refuse proof's count line that failed
-/// only because a settle lost those stacks to a stalled shootdown (`lost_stacks_only`).
+/// only because a settle lost those stacks to a stalled shootdown (`lost_stacks_only`), and
+/// nothing went wrong before it: every one of the scenario's `markers` up to that proof's own was
+/// found, in order, by the end of its line. The checker fails a boot on a failing line at once but
+/// on a missing marker only at the end, so without this a line lost or changed before the proof
+/// would be run again rather than failed.
 fn stopped_by_lost_stacks(
     text: &str,
     failures: &[&'static str],
+    markers: &[&str],
     forgiven: impl Fn(&str) -> bool,
 ) -> Option<(u64, String)> {
     let line = text
         .lines()
         .filter(|l| !forgiven(l))
         .find(|l| failures.iter().any(|m| l.contains(m)))?;
-    lost_stacks_only(line).map(|lost| (lost, line.to_string()))
+    let lost = lost_stacks_only(line)?;
+    // `line` is a slice of `text`, so its end is found from where it starts.
+    let end = (line.as_ptr() as usize - text.as_ptr() as usize) + line.len();
+    let prefix = REFUSE_COUNT_LINES.iter().find(|p| line.starts_with(**p))?;
+    let own = markers
+        .iter()
+        .position(|m| m.starts_with(prefix) && line.contains(m))?;
+    serial::contains_in_order(text.get(..end)?, markers.get(..=own)?)
+        .then(|| (lost, line.to_string()))
 }
 
 /// How many kernel stacks a Refuse proof's count line says its settle lost, when that is the only
@@ -6281,7 +6294,8 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
         }
         let accel = Accel::from_env().ok()?;
         let text = fs::read_to_string(log).ok()?;
-        stopped_by_lost_stacks(&text, &scenario.failures, |l| {
+        let markers: Vec<&str> = scenario.markers.iter().map(String::as_str).collect();
+        stopped_by_lost_stacks(&text, &scenario.failures, &markers, |l| {
             checker_forgives(l, accel, true)
         })
     };
@@ -7126,6 +7140,14 @@ mod rerun_tests {
 
     const IPC: &str = "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap 75712 bytes (was 75712), 128105 free frames (was 128105), 337 ms for the whole proof; threads run before their state existed: 0";
     const LOST: &str = "; not settled before its first count: 1 kernel stacks lost to a stalled shootdown: ipc failed";
+    const TLB: &str =
+        "origin-kernel: TLB: 64 other processors cached 1 page; none saw a stale translation";
+    /// A scenario's markers, in the kernel's order: the boot, the TLB proof, the IPC proof's own.
+    const MARKERS: [&str; 3] = [
+        "origin-kernel: boot",
+        "origin-kernel: TLB: ",
+        "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap ",
+    ];
 
     /// ADR-0013 Amendment 3, part (b): T67-e's line, a Refuse proof failed only by its settle's
     /// lost stack, qualifies; so does one that lost it in the settle before the compare, with the
@@ -7178,31 +7200,69 @@ mod rerun_tests {
     #[test]
     fn only_the_first_failure_decides() {
         let failures = [": ipc failed", ": scheduler failed", ": TLB failed"];
+        let markers = MARKERS;
         let none_forgiven = |_: &str| false;
-        let alone = format!("origin-kernel: boot\n{IPC}{LOST}\n");
+        let alone = format!("origin-kernel: boot\n{TLB}\n{IPC}{LOST}\n");
         assert_eq!(
-            stopped_by_lost_stacks(&alone, &failures, none_forgiven).map(|(n, _)| n),
+            stopped_by_lost_stacks(&alone, &failures, &markers, none_forgiven).map(|(n, _)| n),
             Some(1)
         );
         let earlier = format!(
-            "origin-kernel: TLB: 2 other processors cached 3 pages; 3 saw a stale translation: TLB failed\n{IPC}{LOST}\n"
+            "origin-kernel: boot\norigin-kernel: TLB: 2 other processors cached 3 pages; 3 saw a stale translation: TLB failed\n{IPC}{LOST}\n"
         );
         assert_eq!(
-            stopped_by_lost_stacks(&earlier, &failures, none_forgiven),
+            stopped_by_lost_stacks(&earlier, &failures, &markers, none_forgiven),
             None
         );
         // A line the checker lets pass (an uneven share on a named machine) does not count.
         let fair = "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted 7 and 25, 21 context switches: scheduler failed";
         let forgiven_fair = |l: &str| l == fair;
-        let after_forgiven = format!("{fair}\n{IPC}{LOST}\n");
+        let after_forgiven = format!("origin-kernel: boot\n{TLB}\n{fair}\n{IPC}{LOST}\n");
         assert_eq!(
-            stopped_by_lost_stacks(&after_forgiven, &failures, forgiven_fair).map(|(n, _)| n),
+            stopped_by_lost_stacks(&after_forgiven, &failures, &markers, forgiven_fair)
+                .map(|(n, _)| n),
             Some(1)
         );
         assert_eq!(
-            stopped_by_lost_stacks(&after_forgiven, &failures, none_forgiven),
+            stopped_by_lost_stacks(&after_forgiven, &failures, &markers, none_forgiven),
             None
         );
+    }
+
+    /// A marker before the proof's own that was never printed (a line lost or changed): the
+    /// checker would fail it only at the end, so it must not be run again.
+    #[test]
+    fn a_missing_earlier_marker_means_no_rerun() {
+        let failures = [": ipc failed"];
+        let markers = MARKERS;
+        let none_forgiven = |_: &str| false;
+        let whole = format!("origin-kernel: boot\n{TLB}\n{IPC}{LOST}\n");
+        assert!(stopped_by_lost_stacks(&whole, &failures, &markers, none_forgiven).is_some());
+        // The TLB proof's line missing, or out of order.
+        let missing = format!("origin-kernel: boot\n{IPC}{LOST}\n");
+        assert_eq!(
+            stopped_by_lost_stacks(&missing, &failures, &markers, none_forgiven),
+            None
+        );
+        let late = format!("origin-kernel: boot\n{IPC}{LOST}\n{TLB}\n");
+        assert_eq!(
+            stopped_by_lost_stacks(&late, &failures, &markers, none_forgiven),
+            None
+        );
+        // A scenario with no marker for the proof's own line: refused, not guessed.
+        let without_own = ["origin-kernel: boot", "origin-kernel: TLB: "];
+        assert_eq!(
+            stopped_by_lost_stacks(&whole, &failures, &without_own, none_forgiven),
+            None
+        );
+        // Markers after the proof's own are the second run's to find, not this one's.
+        let with_later = [
+            "origin-kernel: boot",
+            "origin-kernel: TLB: ",
+            "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap ",
+            "origin-kernel: ipc: every process and thread object and all they held are gone: heap ",
+        ];
+        assert!(stopped_by_lost_stacks(&whole, &failures, &with_later, none_forgiven).is_some());
     }
 }
 
