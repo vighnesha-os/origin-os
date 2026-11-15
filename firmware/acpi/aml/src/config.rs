@@ -33,9 +33,14 @@ impl Limits {
     /// not refuse it. That DSDT (496,594 bytes) stopped loading at 4 MiB; with the limit raised it
     /// loaded and passed, the interpreter holding at most 11,897,534 bytes in 32,516 nodes, its
     /// load taking 231 ms and its walk 118 ms of their 1 s each (QEMU 11.1.3's software
-    /// processor, 2026-11-14). 32 MiB is about 2.7 times that peak and half the service's. A
+    /// processor, 2026-11-14). 32 MiB is about 2.8 times that peak and half the service's. A
     /// kernel heap that cannot give it fails cleanly: every allocation is fallible (`mem.rs`),
-    /// and one the heap refuses is the memory limit.
+    /// and one the heap refuses is the memory limit. The limit counts the bytes requested, not
+    /// what the heap gives (the review of B3, B3-4): the kernel heap rounds small blocks up to a
+    /// power of two from a slab table of 4 MiB in all, gives anything larger whole contiguous
+    /// frames, and a growing vector briefly holds its old and new copies. So the proof can stop
+    /// at `Limit(Memory)` below 32 MiB, cleanly, on a table rich in small objects once the slab
+    /// table fills, and can take up to about twice its limit from the frame allocator.
     pub const BOOT_PROOF: Self = Self {
         loop_iterations: 100_000,
         time_100ns: 10_000_000,
