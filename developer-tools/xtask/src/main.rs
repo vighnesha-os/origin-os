@@ -1100,6 +1100,9 @@ fn boot_scenario() -> Scenario {
         scenario
             .markers
             .retain(|m| !m.starts_with(EVEN_SHARES_LINE));
+        // A kernel stack lost to a stalled shootdown before the stacks proof is reported, not
+        // failed (ADR-0013 Amendment 3, part (a); `stacks_lost`, and the summary after the boot).
+        allow_lost_stacks(&mut scenario.markers);
     }
     if qemu_bridge() {
         bridge_markers(&mut scenario);
@@ -1450,6 +1453,14 @@ fn oversubscribed_fair_share(line: &str) -> Option<(u64, u64)> {
     let second = number_before(counts, ", ")?;
     let switches = number_before(counts, " context switches")?;
     (first > 0 && second > 0 && switches >= 15).then_some((first, second))
+}
+
+/// What `xtask` prints for kernel stacks lost to a stalled shootdown that it let pass on a named
+/// oversubscribed machine (ADR-0013 Amendment 3, part (a)): reported, never hidden.
+fn forgave_lost_stacks(label: &str, lost: u64, cpus: u32) -> String {
+    format!(
+        "xtask: {label}: forgave {lost} kernel stacks lost to a stalled shootdown on an oversubscribed machine, named ({cpus} guest processors; ADR-0013 Amendment 3, decision item 313): each withholds its slot and its 4 frames for good, and a machine of 1 to 4 processors would fail on it"
+    )
 }
 
 /// Whether the checker lets `line` pass on a boot under `accel`: KVM's allowances, and on an
@@ -2709,6 +2720,40 @@ const HALT_LINE: &str = "origin-kernel: M1 entry complete; halting";
 
 /// How the line starts that the scheduler proof prints when every worker's share was even.
 const EVEN_SHARES_LINE: &str = "origin-kernel: preemptive multitasking: ";
+
+/// The stacks proof's last line, as far as its live count (`stacks::prove`), and the parts the
+/// checker requires after it: nothing kept for reuse, retired or lost, and every count as before.
+const STACKS_GIVEN_BACK: &str =
+    "origin-kernel: kernel stacks: every stack the proof made is given back: Counts { live: ";
+const STACKS_NONE_LOST: &str = ", idle: 0, retired: 0, lost: 0, pages: ";
+const STACKS_AS_BEFORE: &str = " }, as before: true";
+/// On the named oversubscribed machines, any count of stacks lost (ADR-0013 Amendment 3).
+const STACKS_ANY_LOST: &str = ", idle: 0, retired: 0, lost: ";
+
+/// The kernel stacks the stacks proof's last line reports lost to a stalled shootdown, when the
+/// line is that line and the proof held (`, as before: true`): a stalled reclaim withholds its
+/// slot and its frames for good, and is the only way a stack is counted lost there. `None` for
+/// any other line. On the named oversubscribed machines a count above zero is reported, not
+/// failed (ADR-0013 Amendment 3, part (a), decision item 313); elsewhere `lost: 0` is a marker.
+/// The named oversubscribed machines' markers: the stacks proof's line may report any count of
+/// stacks lost, and nothing else of it changes (ADR-0013 Amendment 3, part (a)).
+fn allow_lost_stacks(markers: &mut [String]) {
+    for m in markers {
+        if m == STACKS_NONE_LOST {
+            *m = STACKS_ANY_LOST.into();
+        }
+    }
+}
+
+fn stacks_lost(line: &str) -> Option<u64> {
+    let rest = line.strip_prefix(STACKS_GIVEN_BACK)?;
+    if !rest.ends_with(STACKS_AS_BEFORE) {
+        return None;
+    }
+    let (_, after) = rest.split_once(", idle: 0, retired: 0, lost: ")?;
+    let (count, _) = after.split_once(", pages: ")?;
+    count.parse().ok()
+}
 /// How every I/O APIC proof ends a line that failed.
 const IOAPIC_FAILED: &str = ": I/O APIC failed";
 /// How every clock proof ends a line that failed.
@@ -3085,9 +3130,9 @@ fn stack_markers(machine: &Machine) -> Vec<String> {
         ),
         "origin-kernel: kernel stacks: 64 stacks of 16384 bytes made and freed: all made true; making one took ".into(),
         " (QEMU, no budget)".into(),
-        "origin-kernel: kernel stacks: every stack the proof made is given back: Counts { live: ".into(),
-        ", idle: 0, retired: 0, lost: 0, pages: ".into(),
-        " }, as before: true".into(),
+        STACKS_GIVEN_BACK.into(),
+        STACKS_NONE_LOST.into(),
+        STACKS_AS_BEFORE.into(),
     ]
 }
 
@@ -6256,6 +6301,13 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
                     machine().cpus()
                 );
             }
+            // ADR-0013 Amendment 3, part (a): every stack lost to a stalled shootdown, said so.
+            if let Some(lost) = stacks_lost(line).filter(|&n| n > 0) {
+                println!(
+                    "{}",
+                    forgave_lost_stacks(&scenario.label, lost, machine().cpus())
+                );
+            }
         }
     }
     let mut screen = None;
@@ -6809,6 +6861,80 @@ mod nvme_marker_tests {
                 .first()
                 .is_some_and(|l| l.contains("1 of 2 processors"))
         );
+    }
+}
+
+#[cfg(test)]
+mod lost_stacks_tests {
+    use super::{
+        STACKS_ANY_LOST, STACKS_AS_BEFORE, STACKS_GIVEN_BACK, STACKS_NONE_LOST, allow_lost_stacks,
+        forgave_lost_stacks, stacks_lost,
+    };
+
+    fn line(lost: &str, held: &str) -> String {
+        format!(
+            "{STACKS_GIVEN_BACK}398, idle: 0, retired: 0, lost: {lost}, pages: 2247 }}, as before: {held}"
+        )
+    }
+
+    /// ADR-0013 Amendment 3, part (a): the count is read from the stacks proof's last line, and
+    /// only from it, and only when the proof held.
+    #[test]
+    fn the_stacks_lines_lost_count_is_read() {
+        assert_eq!(stacks_lost(&line("3", "true")), Some(3));
+        assert_eq!(stacks_lost(&line("0", "true")), Some(0));
+        assert_eq!(stacks_lost(&line("3", "false")), None, "the proof failed");
+        assert_eq!(stacks_lost(&line("three", "true")), None, "not a count");
+        assert_eq!(
+            stacks_lost(&format!(
+                "{} (Counts {{ live: 1 }} before): kernel stacks failed",
+                line("1", "false")
+            )),
+            None
+        );
+        assert_eq!(
+            stacks_lost(
+                "origin-kernel: kernel stacks: 64 stacks of 16384 bytes made and freed: all made true"
+            ),
+            None
+        );
+    }
+
+    /// Off the named machines `lost: 0` is required; on them any count passes the markers, and
+    /// nothing else of the line is loosened.
+    #[test]
+    fn only_the_named_machines_accept_a_lost_count() {
+        let lost = line("3", "true");
+        assert!(
+            !lost.contains(STACKS_NONE_LOST),
+            "strict: a lost stack fails"
+        );
+        assert!(lost.contains(STACKS_ANY_LOST) && lost.contains(STACKS_AS_BEFORE));
+        let mut markers = vec![
+            STACKS_GIVEN_BACK.to_string(),
+            STACKS_NONE_LOST.to_string(),
+            STACKS_AS_BEFORE.to_string(),
+        ];
+        allow_lost_stacks(&mut markers);
+        assert_eq!(
+            markers,
+            [STACKS_GIVEN_BACK, STACKS_ANY_LOST, STACKS_AS_BEFORE]
+        );
+        assert!(markers.iter().all(|m| lost.contains(m.as_str())));
+        // A line where something is retired or kept still fails the loose markers.
+        let retired = lost.replace("retired: 0", "retired: 2");
+        assert!(!markers.iter().all(|m| retired.contains(m.as_str())));
+        let failed = line("3", "false");
+        assert!(!markers.iter().all(|m| failed.contains(m.as_str())));
+    }
+
+    #[test]
+    fn a_forgiven_loss_is_said_with_its_count_and_machine() {
+        let said = forgave_lost_stacks("kernel boot", 3, 65);
+        assert!(said.starts_with(
+            "xtask: kernel boot: forgave 3 kernel stacks lost to a stalled shootdown"
+        ));
+        assert!(said.contains("65 guest processors") && said.contains("ADR-0013 Amendment 3"));
     }
 }
 
