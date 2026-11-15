@@ -1,13 +1,20 @@
 //! The boot proof of the AML interpreter (ADR-0019 A3; TASKS item 63, step B3; the "AML
 //! interpreter" proof, ADR-0013).
 //!
-//! The firmware's DSDT, then every SSDT and PSDT the XSDT lists, in its order, are loaded into
-//! `origin-aml` against [`BootHost`]: a host that refuses every operation-region access, every
-//! bridge's bus number and every table, grants the Global Lock without touching the FACS, keeps
-//! the monotonic clock, and returns at once from every wait and report. So AML run at boot reads
-//! and writes nothing. Each table's header, length and checksum are checked by
-//! `origin-acpi-tables` first, as the census of the tables checks them (`acpi_census`); a table
-//! that fails is not loaded, and the proof fails.
+//! **QEMU's tables only.** ADR-0019 A3 gives this proof "QEMU's own DSDT and SSDTs", and A2 gives
+//! every other platform's AML to the user-mode ACPI service. So the proof first reads the DSDT's
+//! header, checked by `origin-acpi-tables`, and runs only if its OEM ID and OEM table ID are
+//! QEMU's ([`QEMU_DSDT`]). On any other firmware it prints one line, with the IDs escaped
+//! ([`Escaped`]), runs no AML and passes, as ADR-0013 R6 counts a proof whose subject is absent
+//! (the coordinating session's ruling on the review of B3, B3-2).
+//!
+//! On QEMU's tables, the DSDT, then every SSDT and PSDT the XSDT lists, in its order and each
+//! address once, are loaded into `origin-aml` against [`BootHost`]: a host that refuses every
+//! operation-region access, every bridge's bus number and every table, grants the Global Lock
+//! without touching the FACS, keeps the monotonic clock, and returns at once from every wait and
+//! report. So AML run at boot reads and writes nothing. Each table's header, length and checksum
+//! are checked by `origin-acpi-tables` first, as the census of the tables checks them
+//! (`acpi_census`); a table that fails is not loaded, and the proof fails.
 //!
 //! Then the proof reads named results QEMU's tables give without hardware, walks the namespace's
 //! `_STA` and `_INI` ([`origin_aml::Interpreter::initialize`]), and checks that every device that
@@ -15,12 +22,21 @@
 //! SystemIO or PCI_Config refused, or a bridge's bus number refused. The refusals QEMU's tables
 //! must cause are required: the HPET's `_STA` in SystemMemory (where an HPET is declared), each
 //! processor's in SystemIO, each PCI interrupt link's (`\_SB.LNKx`) in PCI_Config. Counts are
-//! printed, not judged: they follow the machine's processors.
+//! printed, not judged: they follow the machine's processors. Which devices are processors is read
+//! without running anything ([`origin_aml::Interpreter::plain`]): a `_HID` that is not a string
+//! after its aliases (a method, a field unit, a buffer field, a package) is not read.
+//!
+//! **Bounded as a whole.** Each evaluation is bounded by the limits, and the walk as a whole. The
+//! proof as a whole is bounded too, at [`WHOLE`] times one evaluation's time and steps, checked
+//! before each XSDT entry, each named result, the walk and each classification (the review of B3,
+//! B3-1). So it ends within that bound and one more evaluation, and cannot hold the boot longer.
 //!
 //! The verdict rests on what the host answered, not on what it says of itself: [`Recorder`]
 //! wraps whatever host the proof is given and counts every answer, so a host that granted
 //! anything fails the proof. Last, the interpreter is dropped, and the kernel heap must hold
-//! what it held before the proof, to the byte.
+//! what it held before the proof, to the byte. That check holds because nothing else allocates
+//! while the proof runs: it runs before the first thread, with the other processors idle and
+//! interrupt handlers allocating nothing. Moved after `sched::prove`, it would not hold.
 //!
 //! **The Global Lock** is granted without the FACS for this proof only: it is the only one asking
 //! at boot, before the ACPI event model (ADR-0019 A6, area C) exists, and the lock's real path is
@@ -29,14 +45,14 @@
 //!
 //! **The stack.** At boot the proof runs on the loader's stack of 64 KiB, with an unmapped guard
 //! page below it that the page-protection proof shows faulting, so an overflow faults rather
-//! than corrupts. The interpreter keeps its own frames on the heap and never recurses in Rust;
-//! its Rust depth is fixed by its code. The proof reports how far below its own entry the
-//! deepest host call was made: a lower bound on the depth it used, not a measurement of it
-//! (painting the stack is TASKS item 68's).
+//! than corrupts. The interpreter keeps its frames on the heap; its Rust depth is fixed by its
+//! code (the index-field chain recurses, to a depth the chain's limit fixes). The proof reports
+//! how far below its own entry the deepest host call was made, and how far above the guard page:
+//! samples taken at host calls, so the depth is a lower bound on what the proof used and the room
+//! an upper bound on what was left, not measurements (painting the stack is TASKS item 68's).
 //!
-//! Nothing the kernel does depends on the verdict (Report, ADR-0013): a real machine's firmware
-//! may do what QEMU's does not. `Load` and `LoadTable` are not run (step B4), and nothing grants
-//! a region.
+//! Nothing the kernel does depends on the verdict (Report, ADR-0013). `Load` and `LoadTable` are
+//! not run (step B4), and nothing grants a region.
 
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
@@ -46,8 +62,8 @@ use origin_acpi_tables::fadt::Fadt;
 use origin_acpi_tables::header::{self, HEADER_LEN, Header};
 use origin_aml::{
     BridgeBus, BufferAccess, Config, DefinitionBlock, Error, ErrorKind, Host, HostError,
-    InitOutcome, IntegerWidth, Interpreter, Limit, Limits, Node, RegionAccess, Space, TableKey,
-    Trace, Value,
+    InitOutcome, IntegerWidth, Interpreter, Limit, Limits, Node, Plain, RegionAccess, Space,
+    TableKey, Trace, Value,
 };
 
 use crate::acpi_census::Firmware;
@@ -56,8 +72,7 @@ use crate::acpi_text::{Ascii, Refused, Sig};
 /// Where every line of the proof starts.
 pub const LINE: &str = "origin-kernel: aml: ";
 
-/// The object type of a method and of a processor (ACPI 6.6 Table 19.36).
-const METHOD: u64 = 8;
+/// The object type of a processor (ACPI 6.6 Table 19.36).
 const PROCESSOR: u64 = 12;
 
 /// A processor device's `_HID` (ACPI 6.6 §8.4).
@@ -83,9 +98,11 @@ impl Firmware for Boot {
     }
 }
 
-/// The proof at boot, over the kernel's firmware memory and heap, with the boot's limits.
+/// The proof at boot, over the kernel's firmware memory and heap, with the boot's limits;
+/// `stack_floor` is the lowest address of the stack it runs on, the loader's, above its guard
+/// page.
 #[cfg(target_os = "none")]
-pub(crate) fn prove(com1: &mut crate::console::Console, rsdp_addr: u64) -> bool {
+pub(crate) fn prove(com1: &mut crate::console::Console, rsdp_addr: u64, stack_floor: u64) -> bool {
     let mut heap = || crate::memory::stats().map(|(h, _)| h.bytes_in_use);
     run(
         com1,
@@ -94,6 +111,7 @@ pub(crate) fn prove(com1: &mut crate::console::Console, rsdp_addr: u64) -> bool 
         BootHost::new(crate::time::monotonic_nanos),
         Limits::BOOT_PROOF,
         &mut heap,
+        usize::try_from(stack_floor).ok(),
     )
     .passed()
 }
@@ -442,6 +460,9 @@ impl Walked {
 /// What the proof found.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Findings {
+    /// The DSDT is not QEMU's, so the proof ran nothing and passed (ADR-0013 R6's convention for
+    /// an absent subject; the review of B3, B3-2).
+    pub not_run: bool,
     /// Definition blocks loaded.
     pub tables: u32,
     /// Bytes of AML in them.
@@ -456,12 +477,15 @@ pub struct Findings {
     pub walk_ns: u64,
     /// What the host was asked and answered.
     pub seen: Seen,
-    /// The most bytes the interpreter held, and its nodes at the end.
+    /// The most bytes the interpreter held.
     pub peak: usize,
     /// Nodes in the namespace at the end.
     pub nodes: usize,
     /// How far below the proof's entry the deepest host call was made, in bytes.
     pub depth: usize,
+    /// How far above the stack's lowest byte (above its guard page) that call was made, where the
+    /// caller knows the stack.
+    pub room: Option<usize>,
     /// The kernel heap held what it held before.
     pub heap_back: bool,
     /// Why the proof failed: the first reason found, or `None` if it passed.
@@ -483,10 +507,77 @@ impl Findings {
     }
 }
 
+/// QEMU's DSDT, as its header names it: the OEM ID and OEM table ID that every machine `boot-test`
+/// and `boot-matrix` boot showed in the proof's first boots (QEMU 11.1.3 with OVMF, 2026-11-14:
+/// `aml: DSDT rev 1, ... OEM "BOCHS ", "BXPC    "`, the discovery machine's 496,594-byte DSDT
+/// included; TASKS item 63's B3 paragraph). The proof runs only on these tables: ADR-0019 A3 and
+/// decision item 303 give it QEMU's own DSDT and SSDTs, and A2 gives every other platform's AML to
+/// the user-mode service (the coordinating session's ruling on the review of B3, B3-2).
+pub const QEMU_DSDT: ([u8; 6], [u8; 8]) = (*b"BOCHS ", *b"BXPC    ");
+
+/// How many times one evaluation's time and steps the whole proof may take (the review of B3,
+/// B3-1). The bound is checked before each XSDT entry, each named result, the walk and each
+/// classification, so the proof ends within it and one more evaluation, which the limits bound on
+/// its own (the walk as a whole): with the boot's limits, 3 s and 30,000,000 steps, then at most
+/// one more second and 10,000,000 steps.
+pub const WHOLE: u64 = 3;
+
+/// The proof's bound over everything it runs, from [`run`]'s start.
+#[derive(Clone, Copy, Debug)]
+struct Bound {
+    started_ns: u64,
+    time_ns: u64,
+    steps: u64,
+}
+
+impl Bound {
+    fn of(limits: &Limits, now_ns: u64) -> Self {
+        Self {
+            started_ns: now_ns,
+            time_ns: limits.time_100ns.saturating_mul(100).saturating_mul(WHOLE),
+            steps: limits.steps.saturating_mul(WHOLE),
+        }
+    }
+
+    /// Whether the proof has passed its bound at `now_ns`, `steps` counted so far.
+    const fn passed(&self, now_ns: u64, steps: u64) -> bool {
+        now_ns.saturating_sub(self.started_ns) > self.time_ns || steps > self.steps
+    }
+}
+
+/// Whether the proof has passed its bound before `what`; if so, it says so and fails, once.
+fn cut_off(
+    out: &mut impl Write,
+    fw: &impl Firmware,
+    bound: &Bound,
+    steps: u64,
+    what: &str,
+    found: &mut Findings,
+) -> bool {
+    if !bound.passed(fw.now(), steps) {
+        return false;
+    }
+    if found.failed != Some(CUT_OFF) {
+        let _ = writeln!(
+            out,
+            "{LINE}cut off by the proof's bound ({} us, {} steps) before {what}",
+            bound.time_ns / 1000,
+            bound.steps
+        );
+    }
+    found.fail(CUT_OFF);
+    true
+}
+
+/// The reason a proof past its bound gives.
+const CUT_OFF: &str = "the proof was cut off by its bound";
+
 /// The proof: the definition blocks from the RSDP at `rsdp_addr` through `fw`, loaded and run
-/// against `host` (wrapped in a [`Recorder`]) under `limits`; `heap` reads the kernel heap's
-/// bytes in use, before the proof and after the interpreter is dropped. Prints a line for each
-/// table, the named results, the walk, the host's answers and the verdict.
+/// against `host` (wrapped in a [`Recorder`]) under `limits`, if they are QEMU's; `heap` reads the
+/// kernel heap's bytes in use, before the proof and after the interpreter is dropped;
+/// `stack_floor`, where the caller knows it, is the lowest address of the stack the proof runs on,
+/// just above its guard page. Prints a line for each table, the named results, the walk, the
+/// host's answers and the verdict; on tables that are not QEMU's, one line, and runs nothing.
 pub fn run<H: Host>(
     out: &mut impl Write,
     fw: &mut impl Firmware,
@@ -494,21 +585,30 @@ pub fn run<H: Host>(
     host: H,
     limits: Limits,
     heap: &mut dyn FnMut() -> Option<u64>,
+    stack_floor: Option<usize>,
 ) -> Findings {
     let entry = stack_mark();
     let before = heap();
     let mut found = Findings::default();
     interpret(out, fw, rsdp_addr, host, limits, &mut found);
+    if found.not_run {
+        return found;
+    }
     found.depth = found.seen.lowest.map_or(0, |l| entry.saturating_sub(l));
+    found.room = found
+        .seen
+        .lowest
+        .zip(stack_floor)
+        .map(|(l, floor)| l.saturating_sub(floor));
     let after = heap();
     found.heap_back = before.is_some() && before == after;
     if !found.heap_back {
         found.fail("the kernel heap did not return to what it held before the proof");
     }
     let seen = &found.seen;
-    let _ = writeln!(
+    let _ = write!(
         out,
-        "{LINE}the host: refused SystemMemory {}, SystemIO {}, PCI_Config {}, other spaces {}, bridges {}, tables {}; answered otherwise {}; Global Lock taken {}, given back {}, refused or failed {}; waits {}, reports {}; the deepest host call {} bytes below the proof's entry; the interpreter's peak {} bytes of {}, {} nodes",
+        "{LINE}the host: refused SystemMemory {}, SystemIO {}, PCI_Config {}, other spaces {}, bridges {}, tables {}; answered otherwise {}; Global Lock taken {}, given back {}, refused or failed {}; waits {}, reports {}; the deepest host call {} bytes below the proof's entry",
         seen.refused[0],
         seen.refused[1],
         seen.refused[2],
@@ -522,9 +622,14 @@ pub fn run<H: Host>(
         seen.waits,
         seen.reports,
         found.depth,
-        found.peak,
-        limits.memory_bytes,
-        found.nodes,
+    );
+    if let Some(room) = found.room {
+        let _ = write!(out, " and {room} bytes above the stack's guard page");
+    }
+    let _ = writeln!(
+        out,
+        " (sampled at host calls: the depth a lower bound, the room an upper one); the interpreter's peak {} bytes of {}, {} nodes",
+        found.peak, limits.memory_bytes, found.nodes,
     );
     let _ = writeln!(
         out,
@@ -558,6 +663,24 @@ impl fmt::Display for Verdict {
     }
 }
 
+/// Bytes a table gives, printed so that they cannot forge a line or a marker: printable ASCII as
+/// it is, but `"` and `\`, and every other byte, as `\xNN` (the review of B3, B3-2).
+#[derive(Clone, Copy, Debug)]
+pub struct Escaped<'a>(pub &'a [u8]);
+
+impl fmt::Display for Escaped<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for &b in self.0 {
+            if (0x20..=0x7E).contains(&b) && b != b'"' && b != b'\\' {
+                f.write_char(char::from(b))?;
+            } else {
+                write!(f, "\\x{b:02x}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Lends the table at `addr` if the header read by copy names one of `want`: `Ok(None)` if it
 /// names another (which is not lent: it may be a structure the firmware changes after boot).
 fn lend_if(
@@ -580,13 +703,21 @@ fn lend_if(
     Ok(Some((fw.lend(addr, length)?, header)))
 }
 
-/// The DSDT's address, from the first FADT the XSDT at `rsdp_addr` lists, and the XSDT.
-fn find_dsdt(fw: &mut impl Firmware, rsdp_addr: u64) -> Result<(&'static [u8], u64), &'static str> {
+/// The DSDT's address, from the first FADT the XSDT at `rsdp_addr` lists, and the XSDT. The
+/// search stops at the proof's time bound.
+fn find_dsdt(
+    fw: &mut impl Firmware,
+    rsdp_addr: u64,
+    bound: &Bound,
+) -> Result<(&'static [u8], u64), &'static str> {
     let rsdp = fw.lend(rsdp_addr, crate::acpi::RSDP_LENGTH)?;
     let rsdp = crate::acpi::parse_rsdp(rsdp).map_err(|_| "the RSDP is invalid")?;
     let (xsdt, _) = lend_if(fw, rsdp.xsdt, &[b"XSDT"])?.ok_or("the XSDT is not one")?;
     header::check_signature(xsdt, b"XSDT").map_err(|_| "the XSDT is refused")?;
     for addr in crate::acpi::xsdt_entries(xsdt).filter(|&a| a != 0) {
+        if bound.passed(fw.now(), 0) {
+            return Err("the proof's bound passed while the XSDT was searched for a FADT");
+        }
         if let Ok(Some((fadt, _))) = lend_if(fw, addr, &[b"FACP"]) {
             let fadt = Fadt::parse(fadt).map_err(|_| "the FADT is refused")?;
             return Ok((xsdt, fadt.dsdt_address().ok_or("the FADT names no DSDT")?));
@@ -596,7 +727,7 @@ fn find_dsdt(fw: &mut impl Firmware, rsdp_addr: u64) -> Result<(&'static [u8], u
 }
 
 /// Loads the tables, checks the named results and walks the namespace, recording what was found
-/// in `found`. The interpreter is dropped before it returns.
+/// in `found`, if the DSDT is QEMU's. The interpreter is dropped before it returns.
 fn interpret<H: Host>(
     out: &mut impl Write,
     fw: &mut impl Firmware,
@@ -605,7 +736,8 @@ fn interpret<H: Host>(
     limits: Limits,
     found: &mut Findings,
 ) {
-    let (xsdt, dsdt_addr) = match find_dsdt(fw, rsdp_addr) {
+    let bound = Bound::of(&limits, fw.now());
+    let (xsdt, dsdt_addr) = match find_dsdt(fw, rsdp_addr, &bound) {
         Ok(found) => found,
         Err(why) => {
             let _ = writeln!(out, "{LINE}no DSDT: {why}");
@@ -628,6 +760,18 @@ fn interpret<H: Host>(
         found.fail("no DSDT");
         return;
     };
+    // Only QEMU's own tables (B3-2): read from the header `Checked::parse` has checked.
+    let h = dsdt.table().header();
+    if (h.oem_id, h.oem_table_id) != QEMU_DSDT {
+        let _ = writeln!(
+            out,
+            "{LINE}the DSDT's OEM ID \"{}\" and OEM table ID \"{}\" are not QEMU's: the proof runs only on QEMU's own tables (ADR-0019 A3) and ran no AML; passed",
+            Escaped(&h.oem_id),
+            Escaped(&h.oem_table_id)
+        );
+        found.not_run = true;
+        return;
+    }
     let width = IntegerWidth::from_dsdt_revision(dsdt.table().revision());
     let mut i = match Interpreter::new(Recorder::new(host), Config { limits }, width) {
         Ok(i) => i,
@@ -638,9 +782,21 @@ fn interpret<H: Host>(
         }
     };
     load(out, fw, &mut i, dsdt, found);
-    for addr in crate::acpi::xsdt_entries(xsdt).filter(|&a| a != 0) {
+    let entries = crate::acpi::xsdt_entries(xsdt).enumerate();
+    for (k, addr) in entries.filter(|&(_, a)| a != 0) {
+        if cut_off(out, fw, &bound, i.steps_done(), "an XSDT entry", found) {
+            break;
+        }
         match lend_if(fw, addr, &[b"SSDT", b"PSDT"]) {
             Ok(None) => {}
+            // Each table once (B3-1): an XSDT may list one twice, and a second load of it would
+            // run its table-level code again.
+            Ok(Some(_)) if crate::acpi::xsdt_entries(xsdt).take(k).any(|a| a == addr) => {
+                let _ = writeln!(
+                    out,
+                    "{LINE}XSDT entry {k} names the table at {addr:#x} again: loaded once"
+                );
+            }
             Ok(Some((bytes, header))) => match checked(out, "an XSDT entry", bytes, &header) {
                 Some(block) => load(out, fw, &mut i, block, found),
                 None => found.fail("a definition block was refused"),
@@ -652,14 +808,23 @@ fn interpret<H: Host>(
             }
         }
     }
-    found.named = named_results(out, &mut i);
+    found.named = named_results(out, fw, &bound, &mut i, found);
     if !found.named {
         found.fail("a named result was not as QEMU's tables give it");
     }
-    walk(out, fw, &mut i, found);
+    let walk = walk(out, fw, &bound, &mut i, found);
     found.seen = *i.host().seen();
     found.peak = i.memory_peak();
     found.nodes = i.node_count();
+    found.walked = walk.walked;
+    // The reasons in an order that lets each come first (the review of B3, B3-5): the walk's
+    // bound and its record, then what the host answered, then the devices.
+    if walk.cut {
+        found.fail("the walk was cut off by its bound");
+    }
+    if !walk.kept {
+        found.fail("no memory to keep what the walk reached");
+    }
     let seen = found.seen;
     if seen.answered != 0 {
         found.fail("the host answered a request for hardware other than by refusing it");
@@ -669,6 +834,19 @@ fn interpret<H: Host>(
     }
     if seen.lock_other != 0 || seen.lock_taken != seen.lock_given_back {
         found.fail("the Global Lock was not given back as often as it was granted");
+    }
+    let w = walk.walked;
+    if w.failed != 0 {
+        found.fail("a device failed other than by a refusal");
+    }
+    if w.hpet == Some(false) {
+        found.fail("the HPET's _STA was not refused in SystemMemory");
+    }
+    if !w.processors_as_required() {
+        found.fail("not every processor's _STA was refused in SystemIO, or there was none");
+    }
+    if !w.links_as_required() {
+        found.fail("not every LNKx _STA was refused in PCI_Config, or there was none");
     }
 }
 
@@ -811,24 +989,6 @@ fn ends_with_end_tag(b: &[u8]) -> bool {
     false
 }
 
-/// One argument, allocated fallibly, as everything the proof allocates while the interpreter may
-/// hold up to its limit: `None` if the heap cannot give it (the coordinating session's ruling on
-/// step B3's limit).
-fn one_arg(value: Value) -> Option<Vec<Value>> {
-    let mut args = Vec::new();
-    args.try_reserve_exact(1).ok()?;
-    args.push(value);
-    Some(args)
-}
-
-/// One string argument, allocated fallibly.
-fn string_arg(text: &[u8]) -> Option<Vec<Value>> {
-    let mut s = Vec::new();
-    s.try_reserve_exact(text.len()).ok()?;
-    s.extend_from_slice(text);
-    one_arg(Value::String(s))
-}
-
 /// What came back, briefly, for a named result that was wrong.
 struct Got<'a>(&'a origin_aml::Result<Option<Value>>);
 
@@ -848,8 +1008,15 @@ impl fmt::Display for Got<'_> {
 }
 
 /// Evaluates the named results QEMU's tables give without hardware (the contract of step B3,
-/// §4), in order, and prints them on one line. Returns whether every one is as expected.
-fn named_results<H: Host>(out: &mut impl Write, i: &mut Interpreter<H>) -> bool {
+/// §4), in order, and prints them on one line, each after a check of the proof's bound. Returns
+/// whether every one is as expected.
+fn named_results<H: Host>(
+    out: &mut impl Write,
+    fw: &impl Firmware,
+    bound: &Bound,
+    i: &mut Interpreter<H>,
+    found: &mut Findings,
+) -> bool {
     /// One named result: how it is printed, the path evaluated, its arguments, what it must be.
     struct Check {
         label: &'static str,
@@ -870,7 +1037,7 @@ fn named_results<H: Host>(out: &mut impl Write, i: &mut Interpreter<H>) -> bool 
         check("\\_S5_", "\\_S5_", Want::FourZeros),
         check("\\PICF 0", "\\PICF", Want::Integer(0)),
         Check {
-            args: || one_arg(Value::Integer(1)),
+            args: || fallible::one_arg(Value::Integer(1)),
             ..check("\\_PIC (1)", "\\_PIC", Want::Nothing)
         },
         check("\\PICF 1", "\\PICF", Want::Integer(1)),
@@ -885,7 +1052,7 @@ fn named_results<H: Host>(out: &mut impl Write, i: &mut Interpreter<H>) -> bool 
             Want::Template,
         ),
         Check {
-            args: || string_arg(b"Windows 2022"),
+            args: || fallible::string_arg(b"Windows 2022"),
             ..check(
                 "\\_OSI (\"Windows 2022\") Ones",
                 "\\_OSI",
@@ -893,7 +1060,7 @@ fn named_results<H: Host>(out: &mut impl Write, i: &mut Interpreter<H>) -> bool 
             )
         },
         Check {
-            args: || string_arg(b"Linux"),
+            args: || fallible::string_arg(b"Linux"),
             ..check("\\_OSI (\"Linux\") Zero", "\\_OSI", Want::Integer(0))
         },
         check("\\_REV 2", "\\_REV", Want::Integer(origin_aml::REV)),
@@ -901,6 +1068,11 @@ fn named_results<H: Host>(out: &mut impl Write, i: &mut Interpreter<H>) -> bool 
     let _ = write!(out, "{LINE}named results:");
     let mut all = true;
     for (k, c) in checks.iter().enumerate() {
+        if bound.passed(fw.now(), i.steps_done()) {
+            let _ = writeln!(out, "; cut off by the proof's bound before {}", c.label);
+            found.fail(CUT_OFF);
+            return false;
+        }
         // An argument the heap cannot give is the memory limit, as the interpreter's own are.
         let got = (c.args)().map_or(
             Err(Error {
@@ -923,6 +1095,12 @@ fn named_results<H: Host>(out: &mut impl Write, i: &mut Interpreter<H>) -> bool 
 /// The failures the proof allows (the contract of step B3, §4): an access to SystemMemory,
 /// SystemIO or PCI_Config refused, or, where the host refused a bridge's bus number and no
 /// table, a refusal from the host that is not a region's.
+///
+/// The second rule is global, since the error does not say which request it answers (the
+/// review of B3, B3-9). The interpreter has four sources of `Host(_)`: a bridge's bus number, a
+/// table, and the Global Lock's acquire and release. It is sound because the proof fails on the
+/// other three on their own: any table asked for (`Seen::tables`), and any lock answer but a grant
+/// or a release (`Seen::lock_other`).
 fn allowed(e: &Error, seen: &Seen) -> bool {
     match e.kind {
         ErrorKind::Region {
@@ -951,17 +1129,18 @@ const fn sta_refused_in(outcome: &InitOutcome) -> Option<u8> {
     }
 }
 
-/// Whether `node` is a processor: a `Processor` object, or a device whose `_HID` is a data
-/// object holding `ACPI0007`. A `_HID` that is a method is not run.
-fn is_processor<H: Host>(i: &mut Interpreter<H>, node: Node) -> bool {
+/// Whether `node` is a processor: a `Processor` object, or a device whose `_HID`, after its
+/// aliases, is a string `ACPI0007`. Nothing is run and the host is not asked (the review of B3,
+/// B3-1): a `_HID` that is a method, a field unit, a buffer field, a package or an alias to any of
+/// them is not read, and the device is not a processor.
+fn is_processor<H: Host>(i: &Interpreter<H>, node: Node) -> bool {
     if i.object_type(node).is_ok_and(|t| t == PROCESSOR) {
         return true;
     }
     let mut child = i.first_child(node);
     while let Some(c) = child {
         if i.name_of(c).is_ok_and(|n| n == *b"_HID") {
-            return i.object_type(c).is_ok_and(|t| t != METHOD)
-                && matches!(i.evaluate_node(c, &[]), Ok(Some(Value::String(s))) if s == PROCESSOR_HID);
+            return matches!(i.plain(c), Ok(Some(Plain::String(s))) if s == PROCESSOR_HID);
         }
         child = i.next_sibling(c);
     }
@@ -973,23 +1152,37 @@ fn is_link<H: Host>(i: &Interpreter<H>, node: Node, sb: Option<Node>) -> bool {
     sb.is_some() && i.parent(node) == sb && i.name_of(node).is_ok_and(|n| n.starts_with(b"LNK"))
 }
 
-/// Walks the namespace's `_STA` and `_INI`, and judges what each device reached.
+/// What the walk gave the verdict.
+struct Walk {
+    walked: Walked,
+    /// The walk was cut off by its bound.
+    cut: bool,
+    /// Every outcome was kept.
+    kept: bool,
+}
+
+/// Walks the namespace's `_STA` and `_INI`, classifies what each device reached, and prints it.
 fn walk<H: Host>(
     out: &mut impl Write,
     fw: &mut impl Firmware,
+    bound: &Bound,
     i: &mut Interpreter<Recorder<H>>,
     found: &mut Findings,
-) {
+) -> Walk {
     let mut outcomes: Vec<(Node, InitOutcome)> = Vec::new();
     let (mut devices, mut kept) = (0u32, true);
+    let mut result = Walk {
+        walked: Walked::default(),
+        cut: false,
+        kept: true,
+    };
+    if cut_off(out, fw, bound, i.steps_done(), "the walk", found) {
+        return result;
+    }
     let started = fw.now();
     let walked = i.initialize(&mut |node, outcome| {
         devices = devices.saturating_add(1);
-        if outcomes.try_reserve(1).is_ok() {
-            outcomes.push((node, outcome));
-        } else {
-            kept = false;
-        }
+        kept &= fallible::keep(&mut outcomes, (node, outcome));
     });
     found.walk_ns = fw.now().saturating_sub(started);
     let mut w = Walked {
@@ -998,11 +1191,9 @@ fn walk<H: Host>(
     };
     if let Err(e) = walked {
         let _ = writeln!(out, "{LINE}walk: cut off by its bound: {}", Failure(e));
-        found.fail("the walk was cut off by its bound");
+        result.cut = true;
     }
-    if !kept {
-        found.fail("no memory to keep what the walk reached");
-    }
+    result.kept = kept;
     let seen = *i.host().seen();
     let hpet = i
         .lookup("\\_SB.HPET")
@@ -1012,6 +1203,9 @@ fn walk<H: Host>(
     let sb = i.lookup("\\_SB").ok().flatten();
     let mut first_failure = None;
     for &(node, outcome) in &outcomes {
+        if cut_off(out, fw, bound, i.steps_done(), "a classification", found) {
+            break;
+        }
         let error = match outcome {
             InitOutcome::Initialized { .. } => {
                 w.initialized = w.initialized.saturating_add(1);
@@ -1073,7 +1267,6 @@ fn walk<H: Host>(
             }
         }
         let _ = writeln!(out, " failed other than by a refusal: {}", Failure(e));
-        found.fail("a device failed other than by a refusal");
     }
     let _ = writeln!(
         out,
@@ -1095,17 +1288,11 @@ fn walk<H: Host>(
         w.links,
         w.links_as_required(),
     );
-    if w.hpet == Some(false) {
-        found.fail("the HPET's _STA was not refused in SystemMemory");
-    }
-    if !w.processors_as_required() {
-        found.fail("not every processor's _STA was refused in SystemIO, or there was none");
-    }
-    if !w.links_as_required() {
-        found.fail("not every LNKx _STA was refused in PCI_Config, or there was none");
-    }
-    found.walked = w;
+    result.walked = w;
+    result
 }
+
+mod fallible;
 
 #[cfg(test)]
 mod tests;

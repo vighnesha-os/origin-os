@@ -148,7 +148,18 @@ fn qemu_dsdt_of(revision: u8, extra: &[B]) -> Vec<u8> {
         ),
     ];
     body.extend_from_slice(extra);
-    table(b"DSDT", revision, &body)
+    qemu_ids(table(b"DSDT", revision, &body))
+}
+
+/// `t` with QEMU's OEM ID and OEM table ID ([`QEMU_DSDT`]), sealed again: the proof runs only on
+/// QEMU's tables (B3-2).
+fn qemu_ids(mut t: Vec<u8>) -> Vec<u8> {
+    t[10..16].copy_from_slice(&QEMU_DSDT.0);
+    t[16..24].copy_from_slice(&QEMU_DSDT.1);
+    t[9] = 0;
+    let sum = t.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+    t[9] = 0u8.wrapping_sub(sum);
+    t
 }
 
 /// A device below a PCI bridge with a PCI_Config region: naming its function needs the bridge's
@@ -248,6 +259,8 @@ struct Machine {
     dsdt_at: u64,
     /// More XSDT entries, listed after the SSDTs.
     entries: Vec<u64>,
+    /// The stack's lowest address, if the test knows it.
+    stack_floor: Option<usize>,
 }
 
 impl Machine {
@@ -257,6 +270,7 @@ impl Machine {
             ssdts: Vec::new(),
             dsdt_at: DSDT,
             entries: Vec::new(),
+            stack_floor: None,
         }
     }
 
@@ -267,7 +281,7 @@ impl Machine {
         limits: Limits,
         heap: &mut dyn FnMut() -> Option<u64>,
     ) -> (Findings, String) {
-        let mut memory = vec![0u8; usize::try_from(SSDT - BASE).unwrap() + 4 * 0x8000];
+        let mut memory = vec![0u8; usize::try_from(SSDT - BASE).unwrap() + 8 * 0x8000];
         let mut put = |addr: u64, bytes: &[u8]| {
             let at = usize::try_from(addr - BASE).unwrap();
             memory[at..at + bytes.len()].copy_from_slice(bytes);
@@ -302,7 +316,15 @@ impl Machine {
             bytes: Vec::leak(memory),
         };
         let mut out = String::new();
-        let found = run(&mut out, &mut fw, RSDP, host, limits, heap);
+        let found = run(
+            &mut out,
+            &mut fw,
+            RSDP,
+            host,
+            limits,
+            heap,
+            self.stack_floor,
+        );
         (found, out)
     }
 
@@ -350,6 +372,8 @@ struct Changed {
     grant_memory: bool,
     /// Fails every release of the Global Lock.
     fail_release: bool,
+    /// Answers every bridge's secondary bus number with 1 instead of refusing it.
+    grant_bridge: bool,
 }
 
 impl Changed {
@@ -358,6 +382,7 @@ impl Changed {
             boot: BootHost::new(still),
             grant_memory: false,
             fail_release: false,
+            grant_bridge: false,
         }
     }
 }
@@ -376,6 +401,9 @@ impl Host for Changed {
         self.boot.write(access, value)
     }
     fn bridge_bus(&mut self, request: &BridgeBus) -> Result<u8, HostError> {
+        if self.grant_bridge {
+            return Ok(1);
+        }
         self.boot.bridge_bus(request)
     }
     fn transfer(&mut self, access: &BufferAccess<'_>, data: &mut [u8]) -> Result<usize, HostError> {
@@ -431,7 +459,7 @@ fn a_qemu_shaped_machine_passes() {
     assert!(found.passed(), "{out}");
     assert!(
         out.contains("origin-kernel: aml: DSDT rev 1, ")
-            && out.contains("OEM \"ORIGIN\", \"AMLTEST \": loaded as table 0"),
+            && out.contains("OEM \"BOCHS \", \"BXPC    \": loaded as table 0"),
         "{out}"
     );
     assert!(out.contains("origin-kernel: aml: SSDT rev 1, "), "{out}");
@@ -649,11 +677,12 @@ fn a_host_that_grants_a_region_fails_the_proof() {
         Machine::new(qemu_dsdt(&[])).run_with(host, Limits::BOOT_PROOF, &mut || Some(0));
     assert!(!found.passed(), "{out}");
     assert_eq!(found.seen.answered, 1, "{out}");
-    // The HPET's `_STA` read its register: the required refusal is missing.
+    // The HPET's `_STA` read its register, so its required refusal is missing too; but the
+    // recorder's own count comes first, as the design rests on it (B3-5).
     assert_eq!(found.walked.hpet, Some(false), "{out}");
     assert_eq!(
         found.failed,
-        Some("the HPET's _STA was not refused in SystemMemory"),
+        Some("the host answered a request for hardware other than by refusing it"),
         "{out}"
     );
     assert!(out.contains("answered otherwise 1;"), "{out}");
@@ -697,7 +726,7 @@ fn a_device_that_fails_other_than_by_a_refusal_fails_the_proof() {
 #[test]
 fn the_required_refusals_must_be_there() {
     // No links, no processors: QEMU's tables always have both.
-    let dsdt = table(
+    let dsdt = qemu_ids(table(
         b"DSDT",
         1,
         &[
@@ -705,7 +734,7 @@ fn the_required_refusals_must_be_there() {
             name("PICF", zero()),
             method("_PIC", 1, &[store(arg(0), nm("PICF"))]),
         ],
-    );
+    ));
     let (found, out) = Machine::new(dsdt).run();
     assert!(!found.passed(), "{out}");
     assert_eq!((found.walked.processors, found.walked.links), (0, 0));
@@ -837,6 +866,290 @@ fn a_heap_that_did_not_come_back_fails_the_proof() {
         &mut || None,
     );
     assert!(!found.heap_back);
+}
+
+// --- B3-2: QEMU's tables only -----------------------------------------------------------------
+
+/// Firmware that is not QEMU's: one line, its IDs escaped, no AML run, and a pass (ADR-0013 R6's
+/// convention for an absent subject). The AML here would fail to load if it ran.
+#[test]
+fn tables_that_are_not_qemus_run_nothing_and_pass() {
+    let dsdt = table(b"DSDT", 2, &[vec![0xFF, 0xFF, 0xFF]]);
+    let (found, out) = Machine::new(dsdt).run();
+    assert!(found.passed() && found.not_run, "{out}");
+    assert_eq!(found.tables, 0);
+    assert_eq!(found.seen, Seen::default(), "the host was never asked");
+    assert_eq!(
+        out,
+        "origin-kernel: aml: the DSDT's OEM ID \"ORIGIN\" and OEM table ID \"AMLTEST \" are not QEMU's: the proof runs only on QEMU's own tables (ADR-0019 A3) and ran no AML; passed\n"
+    );
+    // The IDs come from firmware: anything but plain printable ASCII is escaped, so that they
+    // cannot forge a line, a quote or a marker.
+    let mut dsdt = table(b"DSDT", 2, &[]);
+    dsdt[10..16].copy_from_slice(&[0x01, b'"', b'\\', b'A', 0xFF, b'\n']);
+    dsdt[16..24].copy_from_slice(b"BXPC    ");
+    dsdt[9] = 0;
+    dsdt[9] = 0u8.wrapping_sub(dsdt.iter().fold(0u8, |s, &b| s.wrapping_add(b)));
+    let (found, out) = Machine::new(dsdt).run();
+    assert!(found.not_run && found.passed(), "{out}");
+    assert!(
+        out.contains("OEM ID \"\\x01\\x22\\x5cA\\xff\\x0a\" and OEM table ID \"BXPC    \""),
+        "{out}"
+    );
+    assert_eq!(out.lines().count(), 1, "{out}");
+}
+
+/// The ID is read from the header `origin-acpi-tables` checked: QEMU's IDs on a DSDT whose
+/// checksum is wrong are not trusted, and the proof fails as for any refused DSDT.
+#[test]
+fn the_id_is_read_only_from_a_checked_header() {
+    let mut dsdt = qemu_dsdt(&[]);
+    dsdt[9] ^= 1;
+    let (found, out) = Machine::new(dsdt).run();
+    assert!(!found.not_run, "{out}");
+    assert_eq!(found.failed, Some("no DSDT"), "{out}");
+}
+
+// --- B3-1: the whole proof bounded, nothing run to classify, each table once --------------------
+
+/// A device whose `_HID` is an alias of a method is not read: the method never runs (it would
+/// store to `Debug`, which the recorder counts), and the device is not a processor.
+#[test]
+fn an_alias_hid_runs_nothing_and_is_not_a_processor() {
+    let dsdt = qemu_dsdt(&[
+        method(
+            "\\SLOW",
+            0,
+            &[
+                store(string("ran"), encode::debug()),
+                ret(string("ACPI0007")),
+            ],
+        ),
+        scope(
+            "\\_SB_",
+            &[
+                device("ALS0", &[alias("\\SLOW", "_HID")]),
+                device("ALS1", &[alias("\\SLOW", "_HID")]),
+            ],
+        ),
+    ]);
+    let (found, out) = Machine::new(dsdt).run();
+    assert!(found.passed(), "{out}");
+    assert_eq!(found.seen.reports, 0, "a `_HID` method ran: {out}");
+    assert_eq!(found.walked.processors, 2, "{out}");
+}
+
+/// An XSDT that lists one SSDT twice: it is loaded once, and said so.
+#[test]
+fn an_ssdt_listed_twice_is_loaded_once() {
+    let mut m = Machine::new(qemu_dsdt(&[]));
+    m.ssdts.push(table(b"SSDT", 1, &[name("XTRA", one())]));
+    m.entries.push(SSDT);
+    let (found, out) = m.run();
+    assert!(found.passed(), "{out}");
+    assert_eq!(found.tables, 2, "{out}");
+    assert!(
+        out.contains(
+            "origin-kernel: aml: XSDT entry 2 names the table at 0x7f010000 again: loaded once"
+        ),
+        "{out}"
+    );
+}
+
+/// A proof run past its whole bound fails with that reason: each SSDT's table-level code fits one
+/// evaluation's steps, and together they pass [`WHOLE`] times them.
+#[test]
+fn a_proof_past_its_whole_bound_fails_with_that_reason() {
+    let limits = Limits {
+        steps: 20_000,
+        ..Limits::BOOT_PROOF
+    };
+    let mut m = Machine::new(qemu_dsdt(&[]));
+    for k in 0..8 {
+        let counter = alloc::format!("CNT{k}");
+        m.ssdts.push(table(
+            b"SSDT",
+            1,
+            &[
+                name(&counter, zero()),
+                while_(
+                    logic(0x95, nm(&counter), encode::int(300)),
+                    &[increment(nm(&counter))],
+                ),
+            ],
+        ));
+    }
+    let (found, out) = m.run_with(BootHost::new(still), limits, &mut || Some(0));
+    assert_eq!(
+        found.failed,
+        Some("the proof was cut off by its bound"),
+        "{out}"
+    );
+    assert!(
+        out.contains("origin-kernel: aml: cut off by the proof's bound (3000000 us, 60000 steps) before an XSDT entry"),
+        "{out}"
+    );
+    assert!(found.tables < 9, "{out}");
+    assert!(
+        !out.contains("load failed"),
+        "each table fit one evaluation: {out}"
+    );
+}
+
+// --- B3-5: each branch of the verdict, first ----------------------------------------------------
+
+/// The recorder's own check: a host that answers a bridge's bus number, though every region access
+/// is still refused, fails the proof with that reason first.
+#[test]
+fn a_host_that_answers_a_bridge_fails_the_proof_with_that_reason_first() {
+    let host = Changed {
+        grant_bridge: true,
+        ..Changed::new()
+    };
+    let (found, out) = Machine::new(qemu_dsdt(&[below_a_bridge()])).run_with(
+        host,
+        Limits::BOOT_PROOF,
+        &mut || Some(0),
+    );
+    assert_eq!(
+        found.failed,
+        Some("the host answered a request for hardware other than by refusing it"),
+        "{out}"
+    );
+    assert_eq!((found.seen.answered, found.seen.bridges), (1, 0), "{out}");
+}
+
+/// A `DataTableRegion` in a device's `_STA` asks the host for a table.
+#[test]
+fn a_table_asked_for_fails_the_proof_with_that_reason_first() {
+    let dsdt = qemu_dsdt(&[scope(
+        "\\_SB_",
+        &[device(
+            "TBL0",
+            &[method(
+                "_STA",
+                0,
+                &[
+                    encode::data_region("DTR0", string("OEM1"), string(""), string("")),
+                    ret(byte(0x0F)),
+                ],
+            )],
+        )],
+    )]);
+    let (found, out) = Machine::new(dsdt).run();
+    assert_eq!(found.failed, Some("the AML asked for a table"), "{out}");
+    assert_eq!(found.seen.tables, 1, "{out}");
+}
+
+/// Processors as required, and one link whose `_STA` answers without hardware.
+#[test]
+fn a_link_not_refused_fails_the_proof_with_that_reason_first() {
+    let dsdt = qemu_dsdt(&[scope(
+        "\\_SB_",
+        &[device("LNKE", &[method("_STA", 0, &[ret(byte(0x0B))])])],
+    )]);
+    let (found, out) = Machine::new(dsdt).run();
+    assert_eq!(
+        found.failed,
+        Some("not every LNKx _STA was refused in PCI_Config, or there was none"),
+        "{out}"
+    );
+    assert_eq!((found.walked.links, found.walked.links_refused), (5, 4));
+}
+
+/// A limit too small for the interpreter's predefined objects.
+#[test]
+fn an_interpreter_that_cannot_be_made_fails_the_proof() {
+    let limits = Limits {
+        memory_bytes: 64,
+        ..Limits::BOOT_PROOF
+    };
+    let (found, out) =
+        Machine::new(qemu_dsdt(&[])).run_with(BootHost::new(still), limits, &mut || Some(0));
+    assert_eq!(
+        found.failed,
+        Some("the interpreter could not be made"),
+        "{out}"
+    );
+    assert!(
+        out.contains("origin-kernel: aml: no interpreter: Limit(Memory)"),
+        "{out}"
+    );
+}
+
+/// The walk's outcomes not kept, as with a heap that has no room left.
+#[test]
+fn outcomes_that_cannot_be_kept_fail_the_proof() {
+    fallible::REFUSE_KEEP.with(|r| r.set(true));
+    let (found, out) = Machine::new(qemu_dsdt(&[])).run();
+    fallible::REFUSE_KEEP.with(|r| r.set(false));
+    assert_eq!(
+        found.failed,
+        Some("no memory to keep what the walk reached"),
+        "{out}"
+    );
+}
+
+/// The FADT's DSDT pointer names a table that is not a DSDT.
+#[test]
+fn a_dsdt_pointer_to_another_table_fails_the_proof() {
+    let (found, out) = Machine::new(table(b"SSDT", 1, &[])).run();
+    assert_eq!(found.failed, Some("no DSDT"), "{out}");
+    assert!(
+        out.contains("origin-kernel: aml: the DSDT: not one"),
+        "{out}"
+    );
+}
+
+/// `_INI` refused is allowed and counted; `_INI` failing otherwise fails the proof.
+#[test]
+fn an_ini_refused_is_allowed_and_one_that_fails_otherwise_is_not() {
+    let ini = |body: B| {
+        qemu_dsdt(&[scope(
+            "\\_SB_",
+            &[device("INI0", &[method("_INI", 0, &[body])])],
+        )])
+    };
+    let (found, out) = Machine::new(ini(store(nm("\\_SB_.CPEN"), encode::local(0)))).run();
+    assert!(found.passed(), "{out}");
+    assert_eq!(found.walked.ini_refused, 1, "{out}");
+    let (found, out) = Machine::new(ini(encode::divide(
+        one(),
+        zero(),
+        encode::none(),
+        encode::none(),
+    )))
+    .run();
+    assert_eq!(
+        found.failed,
+        Some("a device failed other than by a refusal"),
+        "{out}"
+    );
+    assert!(
+        out.contains("walk: \\_SB_.INI0 failed other than by a refusal: at table 0 offset "),
+        "{out}"
+    );
+    assert!(out.contains(": DivideByZero"), "{out}");
+}
+
+// --- B3-7: the room above the guard page ---------------------------------------------------------
+
+/// Where the caller gives the stack's floor, the room above it at the deepest host call is printed
+/// beside the depth.
+#[test]
+fn the_room_above_the_guard_page_is_printed_where_the_stack_is_known() {
+    let mut m = Machine::new(qemu_dsdt(&[]));
+    let here = stack_mark();
+    m.stack_floor = Some(here.saturating_sub(1 << 20));
+    let (found, out) = m.run();
+    let room = found.room.expect("a floor was given");
+    assert!(room > 0 && room < 1 << 20, "{out}");
+    assert!(
+        out.contains(&alloc::format!(
+            "bytes below the proof's entry and {room} bytes above the stack's guard page (sampled at host calls: the depth a lower bound, the room an upper one)"
+        )),
+        "{out}"
+    );
 }
 
 #[test]
