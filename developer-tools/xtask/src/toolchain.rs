@@ -37,6 +37,10 @@ pub(crate) struct Toolchain {
     /// The commit the compiler was built from, 40 hexadecimal digits: the one the repository
     /// pins in [`PINNED_COMMIT`], which the compiler in use must report too.
     pub(crate) commit: String,
+    /// What the kernel image's manifest records of the toolchain (its `toolchain` map, ONBF
+    /// §6.5), read by `onbf_pack` from the same `rustc -vV` text: the packer takes it from its
+    /// caller and runs no program itself (ADR-0011 Amendment 4, T1).
+    pub(crate) krn: onbf_pack::Toolchain,
 }
 
 /// The one place the pinned compiler's commit is written (TASKS item 22a). The toolchain
@@ -155,7 +159,10 @@ fn ask_rustc() -> Result<Toolchain> {
     if sysroot.is_empty() {
         return Err("`rustc --print sysroot` printed nothing".into());
     }
-    let (host, reported) = parse_version(&rustc(&["-vV"])?)?;
+    let report = rustc(&["-vV"])?;
+    let (host, reported) = parse_version(&report)?;
+    let krn = onbf_pack::Toolchain::from_rustc_verbose_version(&report)
+        .map_err(|e| format!("`rustc -vV`, as the kernel image's manifest records it: {e}"))?;
     let pin = repo_root().join(PINNED_COMMIT);
     let text =
         String::from_utf8(read_file(&pin)?).map_err(|_| format!("{PINNED_COMMIT} is not UTF-8"))?;
@@ -164,6 +171,7 @@ fn ask_rustc() -> Result<Toolchain> {
         sysroot: PathBuf::from(sysroot),
         host,
         commit,
+        krn,
     })
 }
 

@@ -83,13 +83,28 @@ mod tests {
         }
     }
 
-    /// A SLIT table body (no checksum needed — `parse_slit` assumes a checked table): a
-    /// 44-byte header area, the u64 locality count at offset 36, then the matrix.
+    /// A whole SLIT: its header with length and checksum set, the u64 locality count at offset
+    /// 36, then the matrix (`parse_slit` checks the header itself since step 5 of TASKS item 62).
     fn slit_bytes(n: u64, matrix: &[u8]) -> Vec<u8> {
         let mut b = alloc::vec![0u8; 44];
+        b[..4].copy_from_slice(b"SLIT");
+        b[8] = 1;
         b[36..44].copy_from_slice(&n.to_le_bytes());
         b.extend_from_slice(matrix);
+        seal(&mut b);
         b
+    }
+
+    /// Sets a table's length field to its bytes and its checksum.
+    fn seal(b: &mut [u8]) {
+        if b.len() < 36 {
+            return;
+        }
+        let len = u32::try_from(b.len()).unwrap();
+        b[4..8].copy_from_slice(&len.to_le_bytes());
+        b[9] = 0;
+        let sum = b.iter().fold(0u8, |s, &x| s.wrapping_add(x));
+        b[9] = 0u8.wrapping_sub(sum);
     }
 
     #[test]
@@ -164,11 +179,12 @@ mod tests {
         }
         let bytes = slit_bytes(N as u64, &matrix);
         assert!(self_is_nearest(&parse_slit(&bytes).unwrap()));
-        // Locality 299 says locality 5 is closer than itself.
+        // Locality 299 says locality 5 is closer than itself: since step 5 of TASKS item 62 the
+        // parser refuses the distance (below 10), so no such SLIT reaches the map.
         let mut broken = matrix.clone();
         broken[299 * N + 5] = 5;
         let bytes = slit_bytes(N as u64, &broken);
-        assert!(!self_is_nearest(&parse_slit(&bytes).unwrap()));
+        assert!(parse_slit(&bytes).is_err());
     }
 
     /// The locality map stays sound over mutated SLIT bytes and arbitrary affinity lists: the
@@ -188,6 +204,9 @@ mod tests {
         for case in 0..crate::testing::cases(8000) {
             let mut t = base.clone();
             mutate(&mut t, &mut rng);
+            if case % 3 != 0 {
+                seal(&mut t);
+            }
             if let Ok(slit) = parse_slit(&t) {
                 maps += 1;
                 let n = slit.localities();
@@ -252,11 +271,14 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_slit_is_not_self_nearest() {
-        // Node 0 claims a remote node (1) is closer to it than itself: self-nearest fails.
+    fn a_broken_slit_is_refused() {
+        // Node 0 claims a remote node (1) is closer to it than itself, with 20 on its diagonal:
+        // since step 5 of TASKS item 62 the parser refuses it (the diagonal is 10), where before
+        // it reached `self_is_nearest`, which said false.
         let m = [20, 10, 10, 10, 10, 10, 10, 10, 10];
         let bytes = slit_bytes(3, &m);
-        let slit = parse_slit(&bytes).unwrap();
-        assert!(!self_is_nearest(&slit));
+        assert!(parse_slit(&bytes).is_err());
+        let m = [10, 20, 20, 20, 10, 20, 20, 20, 10];
+        assert!(self_is_nearest(&parse_slit(&slit_bytes(3, &m)).unwrap()));
     }
 }

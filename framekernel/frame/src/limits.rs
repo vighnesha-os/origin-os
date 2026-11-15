@@ -1,8 +1,6 @@
-//! Sizes of the kernel's fixed per-CPU tables, and the one reserved APIC ID.
+//! The one reserved APIC ID. No processor count is compiled into the kernel (ADR-0008 Amendment 1,
+//! D5): per-processor tables are sized when the processors are discovered (`percpu`).
 #![forbid(unsafe_code)]
-
-/// Processors the kernel indexes: every per-CPU array has this many slots.
-pub const MAX_CPUS: usize = 64;
 
 /// The x2APIC broadcast destination in physical mode (all ones): an IPI to it reaches every
 /// processor, so it is never one processor's ID.

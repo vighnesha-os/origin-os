@@ -290,7 +290,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // can be taken once, and only before the generator's start overwrites it with the seed.
         let stack_value = prove_stack_value(&mut com1, info.boot_seed != 0);
         report_random_start(&mut com1, origin_frame::random::start_boot());
-        let online = smp::start(&mut com1, sched::run_ap);
+        let online = smp::start(&mut com1, sched::run_ap, crate::percpu::size_per_cpu);
         proofs.record(Proof::Processors, online.complete());
         // What each processor put in its own control registers, which ring 3 relies on.
         let held = cpu::cpu_states_holding(online.cpus()) == online.cpus().len();
@@ -314,7 +314,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         }
         // Every boot step, and the two that bring up hardware for good, run once: a repeat
         // changes nothing (`smp::start` would otherwise reset running processors).
-        let again = smp::start(&mut com1, sched::run_ap);
+        let again = smp::start(&mut com1, sched::run_ap, crate::percpu::size_per_cpu);
         let once = again.cpus().len() == 1
             && !again.complete()
             && early.reclaim_loader_memory(&online).is_none()
@@ -355,6 +355,11 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         proofs.record(Proof::Numa, numa);
         // Inter-node distances from the ACPI SLIT (CLAUDE.md §27, §28).
         proofs.record(Proof::NumaDistances, prove_slit(&mut com1, info.acpi_rsdp));
+        // Every ACPI table the firmware gives, checked whole (ADR-0019 A6, area A; TASKS item 62).
+        proofs.record(
+            Proof::AcpiTables,
+            crate::acpi_census::prove(&mut com1, info.acpi_rsdp),
+        );
         // The random-number generator on every processor (CLAUDE.md §59; ADR-0016). If the
         // proof fails, randomness is withheld from here on (ADR-0013 R2, Amendment 1): nothing
         // is launched and nothing is placed at a random address.

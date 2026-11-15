@@ -9,7 +9,18 @@
 //! Firmware tables are untrusted input. Every function here parses a byte slice the caller
 //! copied or mapped, checks signatures, lengths and checksums before using a field, never
 //! panics, and needs no `unsafe`.
+//!
+//! The MADT's, SRAT's and SLIT's readers, and the length and checksum half of
+//! [`check_table`], are `origin-acpi-tables`'s (TASKS item 62, step 5; ADR-0019 A6): one parser
+//! of those tables in the tree. A structure that breaks a rule of ACPI 6.6 but whose length
+//! still locates the next is not used, and the processors, I/O APICs and affinities around it
+//! are (the coordinating session's ruling of 2026-11-14: reported, never refused; the census
+//! reports it). Only a length that cannot locate the next structure refuses the table.
 #![forbid(unsafe_code)]
+
+use origin_acpi_tables::ErrorKind;
+use origin_acpi_tables::madt::{Entry, Madt, Polarity, Trigger, override_redirect};
+use origin_acpi_tables::srat::{Affinity, Srat};
 
 /// Bytes of an ACPI 2.0+ RSDP that are checksummed and parsed.
 pub const RSDP_LENGTH: usize = 36;
@@ -18,8 +29,15 @@ pub const HEADER_LENGTH: usize = 36;
 /// Offset of a table header's revision byte.
 pub const HEADER_REVISION: usize = 8;
 /// Offset of the first MADT interrupt controller structure.
+#[cfg(test)]
 const MADT_ENTRIES: usize = 44;
+/// The first MADT revision whose Local APIC flags define bit 1, Online Capable: ACPI 6.3 (ECR
+/// 1948), MADT revision 5; ACPI 6.6's MADT is revision 7 (§5.2.12, §5.2.12.2). Below it the bit is
+/// reserved, and is not read (ADR-0008 Amendment 1, D2; research ledger
+/// `docs/research/2026-11-13-any-processor-count.md`, §3a).
+pub const MADT_ONLINE_CAPABLE_REVISION: u8 = 5;
 /// Offset of the first SRAT resource-affinity structure (36-byte header + 12 reserved).
+#[cfg(test)]
 const SRAT_ENTRIES: usize = 48;
 
 /// Why a table was refused.
@@ -128,21 +146,37 @@ pub fn signature(header: &[u8]) -> Option<[u8; 4]> {
     Some(s)
 }
 
-/// Checks a whole table: `expected` signature, a length equal to `table.len()`, and its
-/// checksum.
+/// Checks a whole table: `expected` signature, a length within [`MAX_TABLE_LENGTH`] and equal to
+/// `table.len()`, and its checksum. The length and checksum rules are `origin-acpi-tables`'s
+/// (`header::check`), so the tree holds one implementation of them.
 pub fn check_table(table: &[u8], expected: &[u8; 4]) -> Result<(), AcpiError> {
     let sig = signature(table).ok_or(AcpiError::Length(0))?;
     if &sig != expected {
         return Err(AcpiError::Signature(sig));
     }
     let length = table_length(table)?;
-    if length as usize != table.len() {
-        return Err(AcpiError::Length(length));
+    origin_acpi_tables::header::check(table)
+        .map(|_| ())
+        .map_err(|e| match e.kind {
+            ErrorKind::Checksum => AcpiError::Checksum(sig),
+            _ => AcpiError::Length(length),
+        })
+}
+
+/// What a refusal by `origin-acpi-tables` is, in this module's words: a header's signature, length
+/// or checksum as [`check_table`] gives them; anything else at its offset, through `entry` (a
+/// walk error, which leaves the next structure unlocated).
+fn refused(table: &[u8], e: origin_acpi_tables::Error, entry: fn(usize) -> AcpiError) -> AcpiError {
+    let length = || u32::try_from(table.len()).unwrap_or(u32::MAX);
+    match e.kind {
+        ErrorKind::Signature { found } => AcpiError::Signature(found.0),
+        ErrorKind::Length { declared, .. } => {
+            AcpiError::Length(u32::try_from(declared).unwrap_or(u32::MAX))
+        }
+        ErrorKind::TooShort { .. } => AcpiError::Length(length()),
+        ErrorKind::Checksum => AcpiError::Checksum(e.table.0),
+        _ => entry(e.at),
     }
-    if !sums_to_zero(table) {
-        return Err(AcpiError::Checksum(sig));
-    }
-    Ok(())
 }
 
 /// The table addresses in a checked XSDT.
@@ -153,6 +187,77 @@ pub fn xsdt_entries(xsdt: &[u8]) -> impl Iterator<Item = u64> + '_ {
         .0
         .iter()
         .map(|c| u64::from_le_bytes(*c))
+}
+
+/// What [`find_table`] gives when the XSDT lists no table with the signature asked for.
+pub const NOT_LISTED: &str = "table not listed in the XSDT";
+/// What [`find_table`] gives when nothing with the signature asked for was found but an entry
+/// could not be read, which might have been it.
+pub const ENTRY_UNREADABLE: &str = "an XSDT entry could not be read";
+
+/// Reads the table at `addr`, which must have signature `sig`: its header by copy (`copy`), then
+/// the whole table lent (`lend`) and checked ([`check_table`]).
+pub fn lend_table<'t>(
+    addr: u64,
+    sig: &[u8; 4],
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+    lend: &mut impl FnMut(u64, usize) -> Result<&'t [u8], &'static str>,
+) -> Result<&'t [u8], &'static str> {
+    let mut header = [0u8; HEADER_LENGTH];
+    copy(addr, &mut header)?;
+    whole_table(addr, sig, &header, lend)
+}
+
+/// The whole table at `addr` whose header is `header`, lent and checked.
+fn whole_table<'t>(
+    addr: u64,
+    sig: &[u8; 4],
+    header: &[u8],
+    lend: &mut impl FnMut(u64, usize) -> Result<&'t [u8], &'static str>,
+) -> Result<&'t [u8], &'static str> {
+    let len = table_length(header).map_err(|_| "invalid table length")?;
+    let all = lend(addr, len as usize)?;
+    check_table(all, sig).map_err(|_| "invalid table")?;
+    Ok(all)
+}
+
+/// The first valid table with signature `sig` that a checked XSDT lists: each entry's header
+/// compared by copy (`copy`), and only a table whose signature is `sig` lent (`lend`) and checked.
+/// One bad entry does not hide the entries after it; the error is why the last table with this
+/// signature was refused, if there was one. An entry whose header could not be copied might have
+/// been this table, so a search that finds nothing then says so ([`ENTRY_UNREADABLE`]) rather
+/// than [`NOT_LISTED`]. A null entry names nothing.
+///
+/// No header is lent to be compared (the review's Addendum 2, A2-L1): so an entry naming a
+/// structure the firmware changes after boot (the FACS, an FBPT, an S3PT, an MBPT), which may
+/// never be lent, is compared like any other and is simply not the table asked for, and an absent
+/// table stays [`NOT_LISTED`] on such a machine.
+pub fn find_table<'t>(
+    xsdt: &[u8],
+    sig: &[u8; 4],
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+    lend: &mut impl FnMut(u64, usize) -> Result<&'t [u8], &'static str>,
+) -> Result<&'t [u8], &'static str> {
+    let (mut refused, mut unreadable) = (None, false);
+    for addr in xsdt_entries(xsdt).filter(|&addr| addr != 0) {
+        let mut header = [0u8; HEADER_LENGTH];
+        // An entry the kernel cannot read says nothing about the entries after it.
+        if copy(addr, &mut header).is_err() {
+            unreadable = true;
+            continue;
+        }
+        if signature(&header) == Some(*sig) {
+            match whole_table(addr, sig, &header, lend) {
+                Ok(all) => return Ok(all),
+                Err(why) => refused = Some(why),
+            }
+        }
+    }
+    Err(refused.unwrap_or(if unreadable {
+        ENTRY_UNREADABLE
+    } else {
+        NOT_LISTED
+    }))
 }
 
 /// What the kernel reads from the FADT (signature `"FACP"`).
@@ -231,7 +336,9 @@ pub struct Processor {
     pub uid: u32,
     /// Usable now (flags bit 0).
     pub enabled: bool,
-    /// Can be brought online later (flags bit 1); meaningless when `enabled`.
+    /// Can be enabled while the system runs: flags bit 1 with bit 0 clear, read only from MADT
+    /// revision [`MADT_ONLINE_CAPABLE_REVISION`] on. Never set together with `enabled`, where
+    /// the bit is reserved.
     pub online_capable: bool,
 }
 
@@ -239,47 +346,75 @@ pub struct Processor {
 /// processor listed twice (as type 0 and type 9) is kept once. Other structure types are
 /// skipped.
 pub fn madt_processors(madt: &[u8], out: &mut [Processor]) -> Result<usize, AcpiError> {
+    madt_processors_counted(madt, out).map(|(count, _)| count)
+}
+
+/// How usable a listing says its processor is: enabled now, then online-capable, then neither.
+fn usable(p: &Processor) -> u8 {
+    if p.enabled {
+        2
+    } else {
+        u8::from(p.online_capable)
+    }
+}
+
+/// [`madt_processors`], and how many later listings of an APIC ID already listed disagree with
+/// the first on whether it is enabled or online-capable. Of such listings the most usable is kept:
+/// an enabled one over the others, an online-capable one over a disabled one (review finding F11
+/// of 2026-11-14). Listings that agree are kept once, as before.
+pub fn madt_processors_counted(
+    madt: &[u8],
+    out: &mut [Processor],
+) -> Result<(usize, usize), AcpiError> {
+    let table = Madt::parse(madt).map_err(|e| refused(madt, e, AcpiError::MadtEntry))?;
+    let mut disagreeing = 0;
+    let reads_online_capable = table.table().revision() >= MADT_ONLINE_CAPABLE_REVISION;
     let mut count = 0;
-    let mut at = MADT_ENTRIES;
-    while at < madt.len() {
-        let (Some(&kind), Some(&len)) = (madt.get(at), madt.get(at + 1)) else {
-            return Err(AcpiError::MadtEntry(at));
-        };
-        let entry = madt
-            .get(at..at + usize::from(len))
-            .filter(|_| len >= 2)
-            .ok_or(AcpiError::MadtEntry(at))?;
-        let processor = match (kind, len) {
-            (0, 8..) => u32_at(entry, 4).map(|flags| Processor {
-                apic_id: u32::from(entry.get(3).copied().unwrap_or(0)),
-                uid: u32::from(entry.get(2).copied().unwrap_or(0)),
-                enabled: flags & 1 != 0,
-                online_capable: flags & 2 != 0,
-            }),
-            (9, 16..) => match (u32_at(entry, 4), u32_at(entry, 8), u32_at(entry, 12)) {
-                (Some(id), Some(flags), Some(uid)) => Some(Processor {
-                    apic_id: id,
-                    uid,
-                    enabled: flags & 1 != 0,
-                    online_capable: flags & 2 != 0,
-                }),
-                _ => None,
+    for item in table.verdicts() {
+        let (_, verdict) = item.map_err(|e| refused(madt, e, AcpiError::MadtEntry))?;
+        let p = match verdict {
+            Ok(Entry::LocalApic {
+                uid,
+                apic_id,
+                flags,
+            }) => Processor {
+                apic_id: u32::from(apic_id),
+                uid: u32::from(uid),
+                enabled: flags.enabled,
+                online_capable: reads_online_capable && flags.online_capable,
             },
-            (0 | 9, _) => return Err(AcpiError::MadtEntry(at)),
-            _ => None,
+            Ok(Entry::LocalX2Apic {
+                x2apic_id,
+                flags,
+                uid,
+            }) => Processor {
+                apic_id: x2apic_id,
+                uid,
+                enabled: flags.enabled,
+                online_capable: reads_online_capable && flags.online_capable,
+            },
+            // Another kind, or a structure that breaks a rule: not a processor this lists.
+            _ => continue,
         };
-        if let Some(p) = processor {
-            let known = out
-                .get(..count)
-                .is_some_and(|seen| seen.iter().any(|q| q.apic_id == p.apic_id));
-            if !known {
+        let known = out
+            .get_mut(..count)
+            .and_then(|seen| seen.iter_mut().find(|q| q.apic_id == p.apic_id));
+        match known {
+            Some(q) => {
+                if (q.enabled, q.online_capable) != (p.enabled, p.online_capable) {
+                    disagreeing += 1;
+                    if usable(&p) > usable(q) {
+                        *q = p;
+                    }
+                }
+            }
+            None => {
                 *out.get_mut(count).ok_or(AcpiError::TooManyProcessors)? = p;
                 count += 1;
             }
         }
-        at += usize::from(len);
     }
-    Ok(count)
+    Ok((count, disagreeing))
 }
 
 /// An I/O APIC the MADT lists (structure type 1).
@@ -301,51 +436,103 @@ pub struct SourceOverride {
     pub flags: u16,
 }
 
-/// Lists the I/O APICs in a checked MADT into `out`; returns how many.
+/// Lists the I/O APICs in a checked MADT into `out`; returns how many. An I/O APIC at an address
+/// or interrupt base an earlier one has, or past the 256th, is not listed (`origin-acpi-tables`'
+/// rules between the MADT's structures; the census reports it).
 pub fn madt_ioapics(madt: &[u8], out: &mut [IoApic]) -> Result<usize, AcpiError> {
-    madt_scan(
-        madt,
-        |kind, entry, count, out: &mut [IoApic]| {
-            if kind == 1 && entry.len() >= 12 {
-                let ioapic = IoApic {
-                    id: entry.get(2).copied().unwrap_or(0),
-                    address: u32_at(entry, 4).unwrap_or(0),
-                    gsi_base: u32_at(entry, 8).unwrap_or(0),
-                };
-                *out.get_mut(count).ok_or(AcpiError::TooManyProcessors)? = ioapic;
-                return Ok(true);
-            }
-            Ok(false)
-        },
-        out,
-    )
+    madt_list(madt, out, |entry| match entry {
+        Entry::IoApic {
+            id,
+            address,
+            gsi_base,
+        } => Some(IoApic {
+            id,
+            address,
+            gsi_base,
+        }),
+        _ => None,
+    })
 }
 
-/// Lists the interrupt source overrides into `out`; returns how many.
+/// Lists every I/O APIC structure the MADT gives that its own rules allow, repeats included: for
+/// the platform register pages no PCIe BAR may cover (`pcie::platform_ranges`), which are there
+/// whichever of two alike [`madt_ioapics`] keeps for routing (the review's Addendum 2, A2-L2).
+/// Returns how many.
+pub fn madt_ioapic_pages(madt: &[u8], out: &mut [IoApic]) -> Result<usize, AcpiError> {
+    let table = Madt::parse(madt).map_err(|e| refused(madt, e, AcpiError::MadtEntry))?;
+    let mut count = 0;
+    for item in table.alone() {
+        let (_, verdict) = item.map_err(|e| refused(madt, e, AcpiError::MadtEntry))?;
+        if let Ok(Entry::IoApic {
+            id,
+            address,
+            gsi_base,
+        }) = verdict
+        {
+            *out.get_mut(count).ok_or(AcpiError::TooManyProcessors)? = IoApic {
+                id,
+                address,
+                gsi_base,
+            };
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Lists the interrupt source overrides into `out`; returns how many. Only an override of an ISA
+/// interrupt (bus 0) is listed: §5.2.12.5 gives overrides for ISA alone. **Since step 5 of TASKS
+/// item 62 an override for another bus is not listed**, so [`gsi_for_irq`] no longer maps an ISA
+/// IRQ through it; before, any override with a matching source was taken, whatever its bus. An
+/// override whose only fault is the reserved polarity or trigger encoding (binary 10) keeps its
+/// redirect, as the kernel took it before, with flags 0, the bus's defaults, standing for its mode
+/// (the review's Addendum 2, A2-L3): dropping it would send the IRQ to its own number (IRQ 0 to
+/// interrupt 0, not 2), where only its mode is in doubt. The census reports that fault.
 pub fn madt_overrides(madt: &[u8], out: &mut [SourceOverride]) -> Result<usize, AcpiError> {
-    madt_scan(
-        madt,
-        |kind, entry, count, out: &mut [SourceOverride]| {
-            if kind == 2 && entry.len() >= 10 {
-                let iso = SourceOverride {
-                    source_irq: entry.get(3).copied().unwrap_or(0),
-                    gsi: u32_at(entry, 4).unwrap_or(0),
-                    flags: u16::from_le_bytes([
-                        entry.get(8).copied().unwrap_or(0),
-                        entry.get(9).copied().unwrap_or(0),
-                    ]),
-                };
-                *out.get_mut(count).ok_or(AcpiError::TooManyProcessors)? = iso;
-                return Ok(true);
-            }
-            Ok(false)
-        },
-        out,
-    )
+    let table = Madt::parse(madt).map_err(|e| refused(madt, e, AcpiError::MadtEntry))?;
+    let mut count = 0;
+    for item in table.verdicts() {
+        let (raw, verdict) = item.map_err(|e| refused(madt, e, AcpiError::MadtEntry))?;
+        let listed = match verdict {
+            Ok(Entry::SourceOverride { source, gsi, flags }) => Some(SourceOverride {
+                source_irq: source,
+                gsi,
+                flags: inti_bits(flags),
+            }),
+            Ok(_) => None,
+            Err(fault) => override_redirect(&raw, &fault).map(|(source, gsi)| SourceOverride {
+                source_irq: source,
+                gsi,
+                flags: 0,
+            }),
+        };
+        if let Some(o) = listed {
+            *out.get_mut(count).ok_or(AcpiError::TooManyProcessors)? = o;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// The MPS INTI flags' bits for a decoded mode (§5.2.12.5): polarity in bits 0 and 1, trigger
+/// mode in bits 2 and 3.
+fn inti_bits(flags: origin_acpi_tables::madt::Inti) -> u16 {
+    let polarity = match flags.polarity {
+        Polarity::BusDefault => 0b00,
+        Polarity::ActiveHigh => 0b01,
+        Polarity::ActiveLow => 0b11,
+    };
+    let trigger = match flags.trigger {
+        Trigger::BusDefault => 0b00,
+        Trigger::Edge => 0b01,
+        Trigger::Level => 0b11,
+    };
+    polarity | trigger << 2
 }
 
 /// The global system interrupt and flags a legacy ISA `irq` maps to: the matching override,
-/// else the identity mapping with default (active-high, edge) flags.
+/// else the identity mapping with default (active-high, edge) flags. `overrides` are ISA's alone,
+/// as [`madt_overrides`] lists them.
 pub fn gsi_for_irq(irq: u8, overrides: &[SourceOverride]) -> (u32, u16) {
     overrides
         .iter()
@@ -353,27 +540,21 @@ pub fn gsi_for_irq(irq: u8, overrides: &[SourceOverride]) -> (u32, u16) {
         .map_or((u32::from(irq), 0), |o| (o.gsi, o.flags))
 }
 
-/// Walks a checked MADT, calling `f(kind, entry, count_so_far, out)` for each structure;
-/// `f` returns whether it recorded an entry. Returns how many were recorded.
-fn madt_scan<T>(
+/// Lists into `out` what `pick` takes from a checked MADT's structures that keep their rules;
+/// returns how many. A walk error refuses the table.
+fn madt_list<T>(
     madt: &[u8],
-    mut f: impl FnMut(u8, &[u8], usize, &mut [T]) -> Result<bool, AcpiError>,
     out: &mut [T],
+    mut pick: impl FnMut(Entry<'_>) -> Option<T>,
 ) -> Result<usize, AcpiError> {
+    let table = Madt::parse(madt).map_err(|e| refused(madt, e, AcpiError::MadtEntry))?;
     let mut count = 0;
-    let mut at = MADT_ENTRIES;
-    while at < madt.len() {
-        let (Some(&kind), Some(&len)) = (madt.get(at), madt.get(at + 1)) else {
-            return Err(AcpiError::MadtEntry(at));
-        };
-        let entry = madt
-            .get(at..at + usize::from(len))
-            .filter(|_| len >= 2)
-            .ok_or(AcpiError::MadtEntry(at))?;
-        if f(kind, entry, count, out)? {
+    for item in table.verdicts() {
+        let (_, verdict) = item.map_err(|e| refused(madt, e, AcpiError::MadtEntry))?;
+        if let Some(value) = verdict.ok().and_then(&mut pick) {
+            *out.get_mut(count).ok_or(AcpiError::TooManyProcessors)? = value;
             count += 1;
         }
-        at += usize::from(len);
     }
     Ok(count)
 }
@@ -404,127 +585,90 @@ pub struct MemoryAffinity {
     pub non_volatile: bool,
 }
 
-/// The 32-bit proximity domain of a type-0 structure: byte 2 is the low 8 bits, bytes 9..12
-/// the high 24 (ACPI 6.6 §5.2.16.1). The caller guarantees `entry.len() >= 16`.
-fn proximity_type0(entry: &[u8]) -> u32 {
-    let lo = u32::from(entry.get(2).copied().unwrap_or(0));
-    let hi = u32::from(entry.get(9).copied().unwrap_or(0))
-        | u32::from(entry.get(10).copied().unwrap_or(0)) << 8
-        | u32::from(entry.get(11).copied().unwrap_or(0)) << 16;
-    lo | (hi << 8)
+/// Lists into `out` what `pick` takes from a checked SRAT's structures that keep their rules;
+/// returns how many. A walk error refuses the table.
+fn srat_list<T>(
+    srat: &[u8],
+    out: &mut [T],
+    mut pick: impl FnMut(Affinity<'_>) -> Option<T>,
+) -> Result<usize, AcpiError> {
+    let table = Srat::parse(srat).map_err(|e| refused(srat, e, AcpiError::SratEntry))?;
+    let mut count = 0;
+    for item in table.verdicts() {
+        let (_, verdict) = item.map_err(|e| refused(srat, e, AcpiError::SratEntry))?;
+        if let Some(value) = verdict.ok().and_then(&mut pick) {
+            *out.get_mut(count).ok_or(AcpiError::TooManyEntries)? = value;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// Lists the processor affinities in a checked SRAT (`check_table(b"SRAT")` already passed)
-/// into `out`, handling type 0 (local APIC) and type 2 (x2APIC); returns how many. Other
-/// structure types are skipped. A known type with a length below its minimum is refused.
+/// into `out`, from type 0 (local APIC) and type 2 (x2APIC); returns how many. Other structure
+/// types, and a structure too short for its type, are not listed.
 pub fn srat_cpu_affinities(srat: &[u8], out: &mut [CpuAffinity]) -> Result<usize, AcpiError> {
-    let mut count = 0;
-    let mut at = SRAT_ENTRIES;
-    while at < srat.len() {
-        let (Some(&kind), Some(&len)) = (srat.get(at), srat.get(at + 1)) else {
-            return Err(AcpiError::SratEntry(at));
-        };
-        let entry = srat
-            .get(at..at + usize::from(len))
-            .filter(|_| len >= 2)
-            .ok_or(AcpiError::SratEntry(at))?;
-        let affinity = match (kind, len) {
-            (0, 16..) => Some(CpuAffinity {
-                apic_id: u32::from(entry.get(3).copied().unwrap_or(0)),
-                proximity_domain: proximity_type0(entry),
-                enabled: u32_at(entry, 4).unwrap_or(0) & 1 != 0,
-            }),
-            (2, 24..) => Some(CpuAffinity {
-                apic_id: u32_at(entry, 8).unwrap_or(0),
-                proximity_domain: u32_at(entry, 4).unwrap_or(0),
-                enabled: u32_at(entry, 12).unwrap_or(0) & 1 != 0,
-            }),
-            (0 | 2, _) => return Err(AcpiError::SratEntry(at)),
-            _ => None,
-        };
-        if let Some(a) = affinity {
-            *out.get_mut(count).ok_or(AcpiError::TooManyEntries)? = a;
-            count += 1;
-        }
-        at += usize::from(len);
-    }
-    Ok(count)
+    srat_list(srat, out, |affinity| match affinity {
+        Affinity::LocalApic {
+            proximity_domain,
+            apic_id,
+            enabled,
+            ..
+        } => Some(CpuAffinity {
+            apic_id: u32::from(apic_id),
+            proximity_domain,
+            enabled,
+        }),
+        Affinity::X2Apic {
+            proximity_domain,
+            x2apic_id,
+            enabled,
+            ..
+        } => Some(CpuAffinity {
+            apic_id: x2apic_id,
+            proximity_domain,
+            enabled,
+        }),
+        _ => None,
+    })
 }
 
-/// Lists the memory affinities in a checked SRAT (type 1) into `out`; returns how many.
+/// Lists the memory affinities in a checked SRAT (type 1) into `out`; returns how many. An
+/// enabled range that wraps past the top of the address space, and a structure too short for its
+/// type, are not listed; a disabled range is listed whatever it holds (§5.2.16.2 tells the OS to
+/// ignore its contents, and its `enabled` says so).
 pub fn srat_memory_affinities(srat: &[u8], out: &mut [MemoryAffinity]) -> Result<usize, AcpiError> {
-    let mut count = 0;
-    let mut at = SRAT_ENTRIES;
-    while at < srat.len() {
-        let (Some(&kind), Some(&len)) = (srat.get(at), srat.get(at + 1)) else {
-            return Err(AcpiError::SratEntry(at));
-        };
-        let entry = srat
-            .get(at..at + usize::from(len))
-            .filter(|_| len >= 2)
-            .ok_or(AcpiError::SratEntry(at))?;
-        if kind == 1 {
-            if len < 40 {
-                return Err(AcpiError::SratEntry(at));
-            }
-            let base = u64::from(u32_at(entry, 8).unwrap_or(0))
-                | u64::from(u32_at(entry, 12).unwrap_or(0)) << 32;
-            let length = u64::from(u32_at(entry, 16).unwrap_or(0))
-                | u64::from(u32_at(entry, 20).unwrap_or(0)) << 32;
-            let flags = u32_at(entry, 28).unwrap_or(0);
-            *out.get_mut(count).ok_or(AcpiError::TooManyEntries)? = MemoryAffinity {
-                proximity_domain: u32_at(entry, 2).unwrap_or(0),
-                base,
-                length,
-                enabled: flags & 1 != 0,
-                hot_pluggable: flags & 2 != 0,
-                non_volatile: flags & 4 != 0,
-            };
-            count += 1;
-        }
-        at += usize::from(len);
-    }
-    Ok(count)
+    srat_list(srat, out, |affinity| match affinity {
+        Affinity::Memory {
+            proximity_domain,
+            base,
+            length,
+            enabled,
+            hot_pluggable,
+            non_volatile,
+            ..
+        } => Some(MemoryAffinity {
+            proximity_domain,
+            base,
+            length,
+            enabled,
+            hot_pluggable,
+            non_volatile,
+        }),
+        _ => None,
+    })
 }
 
 /// A checked SLIT (ACPI 6.6 §5.2.17): the locality count and the row-major N×N matrix of
-/// relative distances. The diagonal is the normalized local distance 10; 255 means
-/// unreachable.
-#[derive(Clone, Copy, Debug)]
-pub struct Slit<'a> {
-    localities: usize,
-    matrix: &'a [u8],
-}
+/// relative distances, `origin-acpi-tables`' own.
+pub use origin_acpi_tables::platform::Slit;
 
-impl Slit<'_> {
-    /// The number of system localities (proximity domains).
-    pub fn localities(&self) -> usize {
-        self.localities
-    }
-
-    /// The relative distance from locality `i` to locality `j`, or `None` if either index
-    /// is out of range.
-    pub fn distance(&self, i: usize, j: usize) -> Option<u8> {
-        (i < self.localities && j < self.localities)
-            .then(|| self.matrix.get(i * self.localities + j).copied())
-            .flatten()
-    }
-}
-
-/// Parses a checked SLIT (`check_table(b"SLIT")` already passed): the u64 locality count at
-/// offset 36 and the following N×N distance matrix, both of which must fit in the table.
+/// Parses a checked SLIT (`check_table(b"SLIT")` already passed) with `origin-acpi-tables`:
+/// refused besides a matrix that does not fit, since step 5 of TASKS item 62, no localities, a
+/// diagonal other than 10 and a distance of 0 to 9, which the NUMA distances proof failed on
+/// before (the coordinating session's ruling: no change in effect).
 pub fn parse_slit(table: &[u8]) -> Result<Slit<'_>, AcpiError> {
-    let n = usize::try_from(u64_at(table, 36).ok_or(AcpiError::Length(0))?)
-        .map_err(|_| AcpiError::Length(0))?;
-    let cells = n.checked_mul(n).ok_or(AcpiError::Length(0))?;
-    let end = 44usize.checked_add(cells).ok_or(AcpiError::Length(0))?;
-    let matrix = table
-        .get(44..end)
-        .ok_or(AcpiError::Length(table.len() as u32))?;
-    Ok(Slit {
-        localities: n,
-        matrix,
-    })
+    Slit::parse(table).map_err(|e| refused(table, e, |_| AcpiError::Length(0)))
 }
 
 #[cfg(test)]
@@ -560,13 +704,21 @@ mod tests {
         b
     }
 
+    /// A MADT of revision 6, ACPI 6.5's.
     fn madt(entries: &[&[u8]]) -> Vec<u8> {
+        madt_of(6, entries)
+    }
+
+    fn madt_of(revision: u8, entries: &[&[u8]]) -> Vec<u8> {
         let mut body = vec![0u8; 8]; // local APIC address, flags
         body[..4].copy_from_slice(&0xFEE0_0000u32.to_le_bytes());
         for e in entries {
             body.extend_from_slice(e);
         }
-        table(b"APIC", &body)
+        let mut t = table(b"APIC", &body);
+        t[HEADER_REVISION] = revision;
+        fix_checksum(&mut t, 9);
+        t
     }
 
     fn lapic(uid: u8, id: u8, flags: u32) -> Vec<u8> {
@@ -664,6 +816,61 @@ mod tests {
             madt_processors(&m, &mut small),
             Err(AcpiError::TooManyProcessors)
         );
+    }
+
+    /// Review finding F11 of 2026-11-14: an APIC ID listed again with other flags keeps its most
+    /// usable listing (enabled, then online-capable), and each such listing is counted; repeats
+    /// that agree are not.
+    #[test]
+    fn a_processor_listed_again_keeps_its_most_usable_listing() {
+        let m = madt(&[
+            &lapic(4, 4, 0b10),  // online-capable first
+            &x2apic(4, 1, 9),    // then enabled: kept
+            &lapic(5, 5, 1),     // enabled first
+            &x2apic(5, 0, 8),    // then neither: counted, not kept
+            &lapic(6, 6, 0),     // neither
+            &x2apic(6, 0b10, 7), // then online-capable: kept
+            &lapic(7, 7, 1),
+            &x2apic(7, 7, 1), // agrees: not counted
+        ]);
+        let mut out = [Processor::default(); 8];
+        let (n, disagreeing) = madt_processors_counted(&m, &mut out).unwrap();
+        assert_eq!((n, disagreeing), (4, 3));
+        let kept: Vec<_> = out[..n]
+            .iter()
+            .map(|p| (p.apic_id, p.enabled, p.online_capable, p.uid))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (4, true, false, 9),
+                (5, true, false, 5),
+                (6, false, true, 7),
+                (7, true, false, 7)
+            ]
+        );
+        assert_eq!(madt_processors(&m, &mut out), Ok(4));
+    }
+
+    /// ADR-0008 Amendment 1, D2: Online Capable is read from MADT revision 5 on, and only with
+    /// Enabled clear; below revision 5, and beside Enabled, the bit is reserved.
+    #[test]
+    fn online_capable_is_read_from_madt_revision_5_and_only_without_enabled() {
+        let entries: [&[u8]; 4] = [
+            &lapic(0, 0, 1),
+            &lapic(1, 1, 0b11),    // enabled: bit 1 reserved
+            &lapic(2, 2, 0b10),    // online capable
+            &x2apic(400, 0b10, 9), // online capable, above 255
+        ];
+        for (revision, read) in [(1, false), (4, false), (5, true), (6, true), (255, true)] {
+            let m = madt_of(revision, &entries);
+            assert_eq!(check_table(&m, b"APIC"), Ok(()));
+            let mut out = [Processor::default(); 4];
+            assert_eq!(madt_processors(&m, &mut out), Ok(4));
+            let capable: Vec<_> = out.iter().map(|p| p.online_capable).collect();
+            assert_eq!(capable, [false, false, read, read], "revision {revision}");
+            assert!(out[1].enabled && !out[2].enabled && !out[3].enabled);
+        }
     }
 
     #[test]
@@ -834,14 +1041,15 @@ mod tests {
         );
     }
 
+    /// Since step 5 of TASKS item 62 the MADT is read by `origin-acpi-tables`: a length that cannot
+    /// locate the next structure refuses the table; a processor structure too short for its type
+    /// is not listed, and the processors around it are.
     #[test]
-    fn malformed_madt_structures_are_refused() {
+    fn malformed_madt_structures() {
         for bad in [
-            vec![0u8, 0],                                // length 0
-            vec![0u8, 1],                                // length 1
-            vec![0u8, 6, 0, 0, 0, 0], // a type-0 structure too short for its flags
-            vec![9u8, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], // a type-9 structure too short
-            vec![0u8, 200, 0, 0],     // runs past the table
+            vec![0u8, 0],         // length 0
+            vec![0u8, 1],         // length 1
+            vec![0u8, 200, 0, 0], // runs past the table
         ] {
             let m = madt(&[&lapic(0, 0, 1), &bad]);
             let mut out = [Processor::default(); 4];
@@ -851,11 +1059,185 @@ mod tests {
                 "{bad:?}"
             );
         }
-        // A lone trailing byte cannot hold a structure header.
+        // A lone trailing byte cannot hold a structure header: refused where its length byte would
+        // be.
         let mut m = madt(&[&lapic(0, 0, 1)]);
         m.push(0);
+        reseal(&mut m);
         let mut out = [Processor::default(); 4];
-        assert_eq!(madt_processors(&m, &mut out), Err(AcpiError::MadtEntry(52)));
+        assert_eq!(madt_processors(&m, &mut out), Err(AcpiError::MadtEntry(53)));
+        // Too short for its type: not listed, and the processors after it are (before step 5,
+        // either refused the whole list).
+        for short in [
+            vec![0u8, 6, 0, 0, 0, 0], // a type-0 structure too short for its flags
+            vec![9u8, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], // a type-9 structure too short
+        ] {
+            let m = madt(&[&lapic(0, 0, 1), &short, &x2apic(300, 1, 7)]);
+            let mut out = [Processor::default(); 4];
+            assert_eq!(madt_processors(&m, &mut out), Ok(2), "{short:?}");
+            assert_eq!((out[0].apic_id, out[1].apic_id), (0, 300));
+        }
+        // A table that is not a whole MADT is refused as `check_table` would refuse it.
+        let mut m = madt(&[&lapic(0, 0, 1)]);
+        m[20] ^= 1;
+        assert_eq!(
+            madt_processors(&m, &mut out),
+            Err(AcpiError::Checksum(*b"APIC"))
+        );
+    }
+
+    /// Step 5's test (the coordinating session's ruling of 2026-11-14): on the kernel's own path,
+    /// `madt_processors_counted` as `smp` calls it, a bad NMI, override or wakeup structure before
+    /// the processors leaves every processor listed.
+    #[test]
+    fn a_bad_structure_leaves_the_processor_list_intact() {
+        let bad_nmi: &[u8] = &[4, 6, 0xFF, 0, 0, 2]; // LINT2
+        let mut bad_override = iso(9, 20, 0x000D);
+        bad_override[2] = 1; // bus 1
+        let mut bad_wakeup = vec![16u8, 16, 0, 0, 0, 0, 0, 0];
+        bad_wakeup.extend_from_slice(&0x7FF0_0008u64.to_le_bytes()); // inside a page
+        for bad in [bad_nmi, &bad_override, &bad_wakeup] {
+            let m = madt(&[
+                bad,
+                &lapic(0, 0, 1),
+                &x2apic(300, 1, 7),
+                &x2apic(301, 1, 8),
+                &ioapic(2, 0xFEC0_0000, 0),
+            ]);
+            assert_eq!(check_table(&m, b"APIC"), Ok(()));
+            let mut out = [Processor::default(); 8];
+            assert_eq!(madt_processors_counted(&m, &mut out), Ok((3, 0)), "{bad:?}");
+            assert_eq!(
+                out[..3].iter().map(|p| p.apic_id).collect::<Vec<_>>(),
+                [0, 300, 301]
+            );
+            let mut ios = [IoApic::default(); 4];
+            assert_eq!(madt_ioapics(&m, &mut ios), Ok(1), "{bad:?}");
+        }
+    }
+
+    /// The behaviour change of step 5 (the coordinating session's ruling): an interrupt source
+    /// override for a bus other than ISA's is not listed, so `gsi_for_irq` no longer maps an ISA IRQ
+    /// through it. Before step 5 an override for bus 1, source 9, sent IRQ 9 to its GSI. One whose
+    /// only fault is the reserved polarity or trigger encoding keeps its redirect, its mode the
+    /// bus's defaults (the review's Addendum 2, A2-L3): IRQ 0 still reaches interrupt 2.
+    #[test]
+    fn an_override_for_another_bus_is_not_taken_and_a_reserved_mode_keeps_its_redirect() {
+        let mut pci = iso(9, 20, 0x000D);
+        pci[2] = 1;
+        let reserved_polarity = iso(0, 2, 0b10);
+        let reserved_trigger = iso(1, 21, 0b1000);
+        let m = madt(&[&lapic(0, 0, 1), &pci, &reserved_polarity, &reserved_trigger]);
+        let mut over = [SourceOverride::default(); 4];
+        assert_eq!(madt_overrides(&m, &mut over), Ok(2));
+        assert_eq!(
+            gsi_for_irq(0, &over[..2]),
+            (2, 0),
+            "IRQ 0 keeps its redirect"
+        );
+        assert_eq!(gsi_for_irq(1, &over[..2]), (21, 0));
+        assert_eq!(
+            gsi_for_irq(9, &over[..2]),
+            (9, 0),
+            "bus 1's override is not ISA's"
+        );
+        // The flags kept are the defined bits, as the MPS INTI encoding gives them.
+        let m = madt(&[&iso(9, 9, 0xFF0D)]);
+        assert_eq!(madt_overrides(&m, &mut over), Ok(1));
+        assert_eq!(over[0].flags, 0x000D);
+    }
+
+    /// The review's Addendum 2, A2-L2: PCIe's platform ranges keep the register page of every I/O
+    /// APIC the MADT lists, repeats included, while routing takes the first of two alike.
+    #[test]
+    fn every_listed_ioapic_page_stays_reserved() {
+        let m = madt(&[
+            &ioapic(1, 0xFEC0_0000, 0),
+            &ioapic(2, 0xFEC0_1000, 0),  // an earlier one's interrupt base
+            &ioapic(3, 0xFEC0_0000, 48), // an earlier one's address
+            &[1u8, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0][..], // too short to name a page
+        ]);
+        let mut ios = [IoApic::default(); 8];
+        assert_eq!(madt_ioapics(&m, &mut ios), Ok(1));
+        assert_eq!(madt_ioapic_pages(&m, &mut ios), Ok(3));
+        assert_eq!(
+            ios[..3].iter().map(|io| io.address).collect::<Vec<_>>(),
+            [0xFEC0_0000, 0xFEC0_1000, 0xFEC0_0000]
+        );
+    }
+
+    /// The review's Addendum 2, A2-L1: `find_table` compares each XSDT entry's header by copy and
+    /// lends only the table asked for, so an XSDT that names the FACS (which `firmware::bytes` never
+    /// lends) still lets an absent IVRS read as not listed, which is what keeps PCIe's reserved
+    /// ranges (`iommu::acpi_table_if_listed` gives `None` for it, and `register_ranges` goes on).
+    #[test]
+    fn an_xsdt_naming_the_facs_still_finds_and_misses_tables_as_before() {
+        let mut facs = vec![0u8; 64];
+        facs[..4].copy_from_slice(b"FACS");
+        facs[4..8].copy_from_slice(&64u32.to_le_bytes());
+        let dmar = table(b"DMAR", &[0u8; 12]);
+        let memory: Vec<(u64, Vec<u8>)> = vec![(0x1000, facs), (0x2000, dmar.clone())];
+        let mut entries = Vec::new();
+        for addr in [0x1000u64, 0x2000] {
+            entries.extend_from_slice(&addr.to_le_bytes());
+        }
+        let xsdt = table(b"XSDT", &entries);
+        let memory: &'static [(u64, Vec<u8>)] = Vec::leak(memory);
+        let find = |sig: &[u8; 4], with: &[u8]| {
+            let mut lent = Vec::new();
+            let mut copy = |addr: u64, out: &mut [u8]| {
+                let (_, bytes) = memory
+                    .iter()
+                    .find(|(a, _)| *a == addr)
+                    .ok_or("not mapped")?;
+                out.copy_from_slice(bytes.get(..out.len()).ok_or("short")?);
+                Ok(())
+            };
+            let mut lend = |addr: u64, len: usize| -> Result<&'static [u8], &'static str> {
+                lent.push(addr);
+                let (_, bytes) = memory
+                    .iter()
+                    .find(|(a, _)| *a == addr)
+                    .ok_or("not mapped")?;
+                let bytes = bytes.get(..len).ok_or("short")?;
+                // As `firmware::bytes`: never the structures the firmware changes after boot.
+                if origin_acpi_tables::CHANGES_AFTER_BOOT
+                    .iter()
+                    .any(|c| bytes.get(..4) == Some(&c[..]))
+                {
+                    return Err("the firmware changes it after boot");
+                }
+                Ok(bytes)
+            };
+            let found = find_table(with, sig, &mut copy, &mut lend);
+            (found, lent)
+        };
+        let (found, lent) = find(b"IVRS", &xsdt);
+        assert_eq!(found, Err(NOT_LISTED));
+        assert!(lent.is_empty(), "{lent:x?}");
+        let (found, lent) = find(b"DMAR", &xsdt);
+        assert_eq!(found, Ok(&dmar[..]));
+        assert_eq!(lent, [0x2000]);
+        // An entry that cannot be read still makes an absent table "could not be read".
+        let mut entries = 0x9000u64.to_le_bytes().to_vec();
+        entries.extend_from_slice(&0x2000u64.to_le_bytes());
+        let (found, _) = find(b"IVRS", &table(b"XSDT", &entries));
+        assert_eq!(found, Err(ENTRY_UNREADABLE));
+    }
+
+    /// A second I/O APIC at an address or interrupt base an earlier one has is not listed (the
+    /// first is), since step 5.
+    #[test]
+    fn a_repeated_ioapic_is_listed_once() {
+        let m = madt(&[
+            &ioapic(1, 0xFEC0_0000, 0),
+            &ioapic(2, 0xFEC0_0000, 24),
+            &ioapic(3, 0xFEC0_1000, 0),
+            &ioapic(4, 0xFEC0_2000, 48),
+        ]);
+        let mut ios = [IoApic::default(); 4];
+        assert_eq!(madt_ioapics(&m, &mut ios), Ok(2));
+        assert_eq!((ios[0].id, ios[1].id), (1, 4));
     }
 
     /// Builds an SRAT body: 12 reserved bytes (the first dword is 1 for back-compat) then
@@ -979,13 +1361,16 @@ mod tests {
 
     #[test]
     fn srat_rejects_malformed_and_overflow() {
-        // A type-0 structure too short for its fixed 16 bytes is refused at its offset.
-        let s = srat(&[&cpu0(0, 0, true), &[0u8, 8, 0, 0, 0, 0, 0, 0][..]]);
+        // A type-0 structure too short for its fixed 16 bytes is not listed, and those around it
+        // are (since step 5 of TASKS item 62; before, it refused the list).
+        let s = srat(&[
+            &cpu0(0, 0, true),
+            &[0u8, 8, 0, 0, 0, 0, 0, 0][..],
+            &cpu2(300, 1, true),
+        ]);
         let mut cpus = [CpuAffinity::default(); 8];
-        assert_eq!(
-            srat_cpu_affinities(&s, &mut cpus),
-            Err(AcpiError::SratEntry(SRAT_ENTRIES + 16))
-        );
+        assert_eq!(srat_cpu_affinities(&s, &mut cpus), Ok(2));
+        assert_eq!((cpus[0].apic_id, cpus[1].apic_id), (0, 300));
 
         // A structure whose length runs past the table.
         let s = srat(&[&[0u8, 200, 0, 0][..]]);
@@ -1002,12 +1387,23 @@ mod tests {
             Err(AcpiError::TooManyEntries)
         );
 
-        // A type-1 memory structure below 40 bytes is refused.
-        let s = srat(&[&[1u8, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]]);
+        // A type-1 memory structure below 40 bytes is not listed; nor is an enabled range that
+        // wraps; a disabled one is, whatever it holds (§5.2.16.2).
+        let s = srat(&[
+            &[1u8, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..],
+            &mem(0, u64::MAX - 1, 2, 1),
+            &mem(1, u64::MAX - 1, 2, 0),
+            &mem(2, 0x1_0000_0000, 0x1000, 1),
+        ]);
         let mut mems = [MemoryAffinity::default(); 4];
+        assert_eq!(srat_memory_affinities(&s, &mut mems), Ok(2));
         assert_eq!(
-            srat_memory_affinities(&s, &mut mems),
-            Err(AcpiError::SratEntry(SRAT_ENTRIES))
+            (
+                mems[0].proximity_domain,
+                mems[0].enabled,
+                mems[1].proximity_domain
+            ),
+            (1, false, 2)
         );
     }
 
@@ -1169,7 +1565,11 @@ mod tests {
     }
 
     /// The table-level checks and every MADT list agree with an independent walk of the same
-    /// mutated bytes, and an undersized output buffer is an error, never a panic.
+    /// mutated bytes, and an undersized output buffer is an error, never a panic. Since step 5 of
+    /// TASKS item 62 the walk applies `origin-acpi-tables`' rules on its own: a structure too short
+    /// for its type is not listed; an I/O APIC at an address or base an earlier one has is not; an
+    /// override is listed only for bus 0, with flags 0 when its mode is the reserved encoding
+    /// (A2-L3).
     #[test]
     fn mutated_madts_match_an_independent_walk() {
         use crate::testing::{Rng, mutate};
@@ -1200,7 +1600,10 @@ mod tests {
                 assert!(sums_to_zero(&m) && m[..4] == *b"APIC", "case {case}");
                 assert_eq!(le32(&m[4..]) as usize, m.len(), "case {case}");
             }
-            let walked = walk(&m, MADT_ENTRIES);
+            // The readers check the header themselves, as `check_table` does, and need the
+            // fixed fields.
+            let whole = check_table(&m, b"APIC").is_ok() && m.len() >= MADT_ENTRIES;
+            let walked = walk(&m, MADT_ENTRIES).filter(|_| whole);
             let of_kind = |kind: u8, min: usize| -> Vec<usize> {
                 walked
                     .iter()
@@ -1214,7 +1617,18 @@ mod tests {
             match madt_ioapics(&m, &mut ios) {
                 Ok(n) => {
                     assert!(walked.is_some(), "case {case}");
-                    let expected = of_kind(1, 12);
+                    let mut kept: Vec<(u32, u32)> = Vec::new();
+                    let expected: Vec<usize> = of_kind(1, 12)
+                        .into_iter()
+                        .filter(|&at| {
+                            let (address, base) = (le32(&m[at + 4..]), le32(&m[at + 8..]));
+                            let new = kept.iter().all(|&(a, b)| a != address && b != base);
+                            if new {
+                                kept.push((address, base));
+                            }
+                            new
+                        })
+                        .collect();
                     assert_eq!(n, expected.len(), "case {case}");
                     for (io, &at) in ios[..n].iter().zip(&expected) {
                         assert_eq!(io.id, m[at + 2], "case {case}");
@@ -1223,17 +1637,30 @@ mod tests {
                     }
                     listed += 1;
                 }
-                Err(AcpiError::MadtEntry(_)) => assert!(walked.is_none(), "case {case}"),
+                Err(AcpiError::MadtEntry(_)) => {
+                    assert!(whole && walked.is_none(), "case {case}");
+                }
+                Err(AcpiError::Signature(_) | AcpiError::Length(_) | AcpiError::Checksum(_)) => {
+                    assert!(!whole, "case {case}");
+                }
                 Err(e) => panic!("case {case}: {e:?}"),
             }
 
             let mut overrides = [SourceOverride::default(); 8];
             let found = madt_overrides(&m, &mut overrides);
             if let Ok(n) = found {
-                let expected = of_kind(2, 10);
+                let flags_at = |at: usize| u16::from_le_bytes([m[at + 8], m[at + 9]]);
+                // Listed: every bus-0 override; one with a reserved mode with flags 0 (A2-L3).
+                let expected: Vec<usize> = of_kind(2, 10)
+                    .into_iter()
+                    .filter(|&at| m[at + 2] == 0)
+                    .collect();
                 assert_eq!(n, expected.len(), "case {case}");
                 for (o, &at) in overrides[..n].iter().zip(&expected) {
                     assert_eq!((o.source_irq, o.gsi), (m[at + 3], le32(&m[at + 4..])));
+                    let f = flags_at(at);
+                    let defined = f & 0b11 != 0b10 && (f >> 2) & 0b11 != 0b10;
+                    assert_eq!(o.flags, if defined { f & 0xF } else { 0 }, "case {case}");
                 }
                 // The lookup answers from the list, or with the identity mapping.
                 for irq in [0u8, 1, 9, 255] {
@@ -1249,7 +1676,7 @@ mod tests {
             if let Ok(n) = madt_processors(&m, &mut cpus) {
                 let mut ids = Vec::new();
                 for &(at, kind, len) in walked.iter().flatten() {
-                    // A processor structure too short for its fields fails the whole list.
+                    // A processor structure too short for its fields is not listed.
                     let id = match (kind, len) {
                         (0, 8..) => u32::from(m[at + 3]),
                         (9, 16..) => le32(&m[at + 4..]),
@@ -1276,7 +1703,9 @@ mod tests {
             let _ = madt_processors(&m, &mut no_cpus);
         }
         assert!(
-            checked > 2000 && listed > 2000 && overflowed > 0,
+            // A third of the cases are left unsealed, and since step 5 the readers check the header
+            // themselves, so those are refused before any list: about 1,800 of 8,000 are listed.
+            checked > 2000 && listed > 1500 && overflowed > 0,
             "{checked} checked, {listed} listed, {overflowed} overflowed"
         );
     }
@@ -1400,10 +1829,19 @@ mod tests {
             let mut mems = [MemoryAffinity::default(); 8];
             if let Ok(n) = srat_memory_affinities(&s, &mut mems) {
                 mems_ok += 1;
+                // Listed: type 1 at least 40 bytes long, unless enabled with a range that wraps.
                 let expected: Vec<_> = walked
                     .iter()
                     .flatten()
-                    .filter(|&&(_, k, _)| k == 1)
+                    .filter(|&&(at, k, len)| {
+                        let wraps = || {
+                            let base = u64::from_le_bytes(s[at + 8..at + 16].try_into().unwrap());
+                            let length =
+                                u64::from_le_bytes(s[at + 16..at + 24].try_into().unwrap());
+                            base.checked_add(length).is_none()
+                        };
+                        k == 1 && len >= 40 && !(le32(&s[at + 28..]) & 1 != 0 && wraps())
+                    })
                     .collect();
                 assert_eq!(n, expected.len(), "case {case}");
                 for (m, &&(at, _, len)) in mems[..n].iter().zip(&expected) {
@@ -1426,6 +1864,12 @@ mod tests {
             if let Ok(table) = parse_slit(&t) {
                 slits_ok += 1;
                 let n = table.localities();
+                // Since step 5: at least one locality, 10 on the diagonal, none below 10.
+                assert!(n >= 1, "case {case}");
+                for i in 0..n.min(8) {
+                    assert_eq!(table.distance(i, i), Some(10), "case {case}");
+                }
+                assert!(t[44..44 + n * n].iter().all(|&d| d >= 10), "case {case}");
                 assert!(44 + n * n <= t.len(), "case {case}: {n} localities");
                 assert_eq!(n as u64, u64::from_le_bytes(t[36..44].try_into().unwrap()));
                 for i in 0..n.min(8) {

@@ -16,6 +16,7 @@ name = "framekernel"
 version = "0.0.0"
 dependencies = [
  "origin-abi",
+ "origin-acpi-tables",
  "origin-boot-info",
  "origin-directory",
  "origin-frame",
@@ -83,6 +84,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-acpi-tables"
+version = "0.0.0"
+
+[[package]]
+name = "origin-aml"
+version = "0.0.0"
+
+[[package]]
 name = "origin-boot-info"
 version = "0.0.0"
 dependencies = [
@@ -127,6 +136,7 @@ name = "origin-frame"
 version = "0.0.0"
 dependencies = [
  "origin-abi",
+ "origin-acpi-tables",
  "origin-boot-info",
  "origin-paging",
  "origin-random",

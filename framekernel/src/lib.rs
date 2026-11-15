@@ -109,6 +109,8 @@
 
 extern crate alloc;
 
+pub mod acpi_census;
+pub mod acpi_text;
 pub mod base64;
 pub mod blockcache;
 pub mod bootproof;
@@ -196,6 +198,8 @@ mod launch;
 mod memory_object;
 #[cfg(target_os = "none")]
 mod pcie;
+#[cfg(target_os = "none")]
+mod percpu;
 #[cfg(target_os = "none")]
 mod port;
 #[cfg(target_os = "none")]

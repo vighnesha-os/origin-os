@@ -1,0 +1,10 @@
+[package]
+name = "origin-acpi-tables"
+description = "Origin OS: the system description tables of ACPI 6.6 §5.2 for x86-64, parsed and checked as untrusted input (ADR-0019 A6, area A)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
