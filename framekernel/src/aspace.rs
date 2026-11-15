@@ -795,6 +795,8 @@ pub(crate) fn prove_kernel_half(com1: &mut Console) -> bool {
 /// and freed only after the shootdown, and shootdowns that reach only the processors that need
 /// them (CLAUDE.md §28; S3-5a). Runs with every scheduler running, and leaves nothing behind.
 pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    // Settled first, so that only this proof moves the counts (TASKS item 67).
+    let settled_before = sched::settle(tsc_hz);
     let before = memory::stats().map(|(h, f)| (h.bytes_in_use, f));
     let mut others = cpus.iter().copied().filter(|&c| c != bsp);
     let far = others.next().unwrap_or(bsp);
@@ -812,13 +814,16 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     ok &= the_loop_interrupts_only_the_space(com1, cpus, bsp, far, tsc_hz);
     // Each processor reaps what its own threads left, on its own time.
     let same = || memory::stats().map(|(h, f)| (h.bytes_in_use, f)) == before;
+    let settled_after = sched::settle(tsc_hz);
     sched::yield_until(same, tsc_hz, WAIT_SECONDS);
-    let back = same();
+    let back = same() && settled_before.is_ok() && settled_after.is_ok();
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    // After the counts are read, so that the words' own allocation is not in them.
+    let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_before, frames_before) = before.unwrap_or((0, 0));
     let _ = writeln!(
         com1,
-        "origin-kernel: address spaces: every process and frame of these proofs is gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
+        "origin-kernel: address spaces: every process and frame of these proofs is gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){unsettled}{}",
         verdict(back)
     );
     ok && back
