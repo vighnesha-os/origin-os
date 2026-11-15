@@ -3,7 +3,55 @@
 
 use super::encode::*;
 use super::{interp, load, tables_standin};
-use crate::{ErrorKind, IntegerWidth, Value};
+use crate::{ErrorKind, IntegerWidth, Plain, Value};
+
+/// `plain` reads an integer or a string, through an alias, and nothing else, running nothing and
+/// asking the host nothing (the review of B3, B3-1: the boot proof's `_HID` reads).
+#[test]
+fn plain_reads_data_through_an_alias_and_runs_nothing() {
+    let mut i = interp(IntegerWidth::Bits64);
+    load(
+        &mut i,
+        &[
+            name("HIDS", string("ACPI0007")),
+            name("HIDI", dword(0x0301_D041)),
+            alias("HIDS", "ALS1"),
+            method(
+                "SLOW",
+                0,
+                &[store(string("ran"), debug()), ret(string("ACPI0007"))],
+            ),
+            alias("SLOW", "ALS2"),
+            op_region("RGN0", 1, word(0x0300), byte(4)),
+            field("RGN0", 0x01, &[Fe::Named("FLD0", 8)]),
+            alias("FLD0", "ALS3"),
+            name("PKG0", package(1, &[string("ACPI0007")])),
+            name("BUF0", buffer(byte(2), &[1, 2])),
+        ],
+    )
+    .unwrap();
+    let plain = |i: &crate::Interpreter<super::TestHost>, path: &str| {
+        let node = i.lookup(path).unwrap().unwrap();
+        i.plain(node).unwrap().map(|p| match p {
+            Plain::Integer(v) => Value::Integer(v),
+            Plain::String(s) => Value::String(s.to_vec()),
+        })
+    };
+    assert_eq!(
+        plain(&i, "\\HIDS"),
+        Some(Value::String(b"ACPI0007".to_vec()))
+    );
+    assert_eq!(plain(&i, "\\HIDI"), Some(Value::Integer(0x0301_D041)));
+    assert_eq!(
+        plain(&i, "\\ALS1"),
+        Some(Value::String(b"ACPI0007".to_vec()))
+    );
+    for path in ["\\SLOW", "\\ALS2", "\\FLD0", "\\ALS3", "\\PKG0", "\\BUF0"] {
+        assert_eq!(plain(&i, path), None, "{path}");
+    }
+    assert!(i.host().debug.is_empty(), "a method ran");
+    assert!(i.host().seen.is_empty(), "the host was asked");
+}
 
 #[test]
 fn a_failed_load_is_rolled_back_whole() {

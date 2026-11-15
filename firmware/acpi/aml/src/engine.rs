@@ -223,6 +223,7 @@ impl<H: Host> Interpreter<H> {
             base: 0,
             result: Val::None,
             gc_threshold: 0,
+            steps_done: 0,
         };
         me.gc_threshold = me.budget.limit() / 2;
         me.predefine()?;
@@ -422,6 +423,7 @@ impl<H: Host> Interpreter<H> {
         if let Some(work) = collected {
             self.run.steps = self.run.steps.saturating_add(work);
         }
+        self.steps_done = self.steps_done.saturating_add(self.run.steps);
         if self.frames.is_empty() {
             mem::release(core::mem::take(&mut self.frames), &mut self.budget);
             mem::release(core::mem::take(&mut self.ctx), &mut self.budget);
