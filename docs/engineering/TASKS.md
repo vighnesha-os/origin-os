@@ -484,6 +484,20 @@
 
 65. **The boot checker keeps a kernel panic's message in the log (found by TASKS item 58, 2026-11-14). Open: not started; after TASKS items 58 and 60 land, which both change the checker.** The checker stops QEMU at a panic's first line (`panicked at file:line:col:`), so no `boot-test` log holds the message on the lines after it; TASKS item 58 read its control AC-9's panic message only through `cargo xtask run`. Done means: after a panic's first line the checker reads on, for a bounded time or until the kernel's halt, and the log keeps the message; a planted panic shows it (CLAUDE.md §1, "Protect diagnostic data"; §69).
 
+
+66. **Timing proofs that fail on a busy host (found on 2026-11-14: the wait-queue timed wait, the RTC second and the scheduler's rounds on the oversubscribed machines). Proposed by the coordinating session as a session of its own; not started.** List every timing-sensitive boot proof, measure how close each runs to its bound under QEMU's software processor on an idle and a loaded host, and propose a principled rule for each (a bound derived from what the boot measured, a retry with the worst case reported, or an allowance named for the software processor), keeping each real-machine bound. Also: report every stalled shootdown where it happens (the processor that did not answer, the wait, a running count), and decide with figures what `lost: 0` means on the named oversubscribed machines, which item 313 allows to report, not fail, until then. Any change to ADR-0013's accepted text comes to the owner first.
+
+68. **A framework function that runs a closure on a painted, guarded stack and returns the depth it used (ADR-0019 A3; TASKS item 63's step B3, question 3). Numbered by the coordinating session on 2026-11-14; not assigned.** New `unsafe` in the framework, with its own review. It measures the AML interpreter's stack use in the kernel's own build, where today a release-mode host test on a 32 KiB thread is the proxy.
+
+69. **Items 313 and 314 in `xtask` (ADR-0013 Amendment 3). Numbered by the coordinating session on 2026-11-15, and assigned to TASKS item 58's session on `claude/t69-lost-stacks`, from `land/batch-6` at `f933e415`.** Two parts, on the 65-, 67- and 288-processor software-processor machines only, named:
+- **(a) Reported, not failed.** On a boot that ran whole, the checker reports the stacks proof's `lost` count above zero, with the count and the machine, and does not fail the boot on it.
+- **(b) Run once more.** A boot the kernel stopped because a Refuse proof failed only with TASKS item 67's "not settled …: N kernel stacks lost to a stalled shootdown", with nothing failed before it, is run once more on the same machine. The gate passes only if the second run passes whole, and both runs are reported.
+
+Nothing else is forgiven or run again, and nothing in the kernel changes. Host tests, and planted controls showing:
+- a loss forgiven on a named machine, and failed on a 4-processor machine and under KVM;
+- a stall to timeout still failed;
+- a halted boot run once more only on a named machine, and only when the "not settled" line names lost stacks alone;
+- a second run that stops the same way failing the gate.
 59. **The NVMe driver against NVMe Base 2.4, NVM Command Set 1.3 and PCIe Transport 1.4: the check's findings fixed, and the check landed as a research ledger (CLAUDE.md §17, §33). Assigned by the coordinating session on 2026-11-14, on `claude/charming-joliot-0a23db` from `land/s4-part2` at `694a37c`. Its contract, the rulings and its result are under "Task contracts". Built on 2026-11-14, with `land/batch-5` (TASKS items 40, 58 and 60) merged in; gated under QEMU; not landed and not pushed; an independent review is to come.** The check (one AI reviewer, no person, 2026-11-14) found one High defect: a namespace formatted with metadata or protection information was accepted, and its transfers would have gone outside their buffer. H1 is fixed, as it had to be before any boot on a rented server.
 
 ## Waiting on the owner
