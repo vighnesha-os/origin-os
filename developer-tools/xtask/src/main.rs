@@ -6305,7 +6305,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
             if let Some(lost) = stacks_lost(line).filter(|&n| n > 0) {
                 println!(
                     "{}",
-                    forgave_lost_stacks(&scenario.label, lost, machine().cpus())
+                    forgave_lost_stacks(scenario.label, lost, machine().cpus())
                 );
             }
         }
