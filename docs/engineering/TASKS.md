@@ -1589,6 +1589,24 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
   - The soak's table `XH`, and locals in `XA`'s load-time code.
 - **B4-14** `573a34a9`: `PF` among the soak's `LoadTable` parameter paths.
 - **B4-15:** the ledger's figure corrected to near 1.4 million, with the arithmetic.
+- **The gates on `54d32c70`** (the code as at `573a34a9`; Rust 1.100.0 on the development Mac; the tree clean before and after each run). The quick gates passed first. One turn of the machine, 2026-11-18, 19:17 to 19:33 UTC:
+  - **Boot controls AML-1 to AML-6:** each caught. The baseline loaded 8,521 bytes in 9.0 ms and walked 38 devices in 4.5 ms.
+  - **Soak** (seed `0x63c00000`, 1,000,000 cases of each kind, 84 s): passed.
+    - Grammar: 93%, 24%, 33%, 22 kinds; an evaluation's load completed in 11% of cases and failed in 17%.
+    - Mutation: 14%, 22%, 31%, 32 kinds.
+    - The 34 adversarial blocks as written.
+  - **In release:** load tests 63 (1 ignored) and proof tests 40.
+  - **`check` passed:** 2,297 tests passed, none failed, 29 ignored; Loom 56/83; the no-panic check at 196 symbols of its own and 18 external.
+  - **`boot-test`:** 11 of 11.
+  - **`boot-matrix` failed on its first run, on the 65-processor Intel machine (19:30 to 19:32 UTC).**
+    - The scheduler proof's line for guest processor 8 showed both workers running but only 12 context switches. The excuse for the named oversubscribed machines needs 15 (ADR-0013 Amendment 2), so the line failed the boot.
+    - The host was loaded from outside: its load average was 8.2 on 10 threads, with nothing of this session's running and a Chrome renderer alone at about 80% of a core.
+    - Nothing in B4 touches the scheduler. It is the host-load exposure of the oversubscribed machines (TASKS item 66).
+  - **`boot-matrix` run again on the same tree, alone, in a turn of its own (19:33 to 19:51 UTC, the host's load average 7.2 at the start and 7.7 at the end):** passed, 193 scenarios with none failed.
+    - The proof passed on all 31 kernel boots, with no `aml failed`, no not-QEMU line, and no "changed between two reads".
+    - Verdicts as before.
+    - The discovery machine: 265 ms to load, 136 ms to walk, at most 11,897,534 bytes.
+    - The least room above the guard page: 47,151 bytes.
 
 
 ### 60. The host tools are libraries first (ADR-0011 Amendment 4, T1)
