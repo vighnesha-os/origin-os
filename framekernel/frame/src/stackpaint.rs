@@ -5,6 +5,7 @@
 //! A stack is painted with [`PAINT`] in every 8-byte word before the closure runs. Afterwards the
 //! lowest word that no longer holds it is the deepest the closure (or anything that ran on its
 //! stack) wrote, and the depth is the distance from the stack's top down to that word.
+#![forbid(unsafe_code)]
 
 /// The pattern written over every word of a measured stack. It is neither a canonical address
 /// (its bits 63 to 47 are not all equal, so no pointer the kernel keeps is ever this value) nor a
