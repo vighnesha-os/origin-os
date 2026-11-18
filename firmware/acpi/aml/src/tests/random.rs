@@ -433,7 +433,9 @@ impl Gen {
                 string("ORIGIN"),
                 string(self.rng.pick(&["AMLTEST", "AMLTEST", "OTHER"])),
                 string(self.rng.pick(&["", "\\D0", "D0", "\\NOPE"])),
-                string(self.rng.pick(&["", "QG1", "\\N0", "NONE"])),
+                // `PF` reaches the parameter's own step through a PCI function walk (the review
+                // of B4's addendum, B4-14).
+                string(self.rng.pick(&["", "QG1", "\\N0", "NONE", PF])),
                 self.expr(d),
             ]),
             _ => bin(0x84, self.expr(d), self.expr(d), self.target()),
