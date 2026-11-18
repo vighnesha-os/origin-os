@@ -703,27 +703,42 @@ fn lend_if(
     Ok(Some((fw.lend(addr, length)?, header)))
 }
 
+/// Why [`find_dsdt`] found no DSDT.
+enum NoDsdt {
+    /// The proof's bound passed while the XSDT was searched for a FADT: the proof fails with the
+    /// bound's own reason (the review of B3's addendum, B3-14).
+    Cut,
+    /// Anything else, said.
+    Because(&'static str),
+}
+
+impl From<&'static str> for NoDsdt {
+    fn from(why: &'static str) -> Self {
+        Self::Because(why)
+    }
+}
+
 /// The DSDT's address, from the first FADT the XSDT at `rsdp_addr` lists, and the XSDT. The
 /// search stops at the proof's time bound.
 fn find_dsdt(
     fw: &mut impl Firmware,
     rsdp_addr: u64,
     bound: &Bound,
-) -> Result<(&'static [u8], u64), &'static str> {
+) -> Result<(&'static [u8], u64), NoDsdt> {
     let rsdp = fw.lend(rsdp_addr, crate::acpi::RSDP_LENGTH)?;
     let rsdp = crate::acpi::parse_rsdp(rsdp).map_err(|_| "the RSDP is invalid")?;
     let (xsdt, _) = lend_if(fw, rsdp.xsdt, &[b"XSDT"])?.ok_or("the XSDT is not one")?;
     header::check_signature(xsdt, b"XSDT").map_err(|_| "the XSDT is refused")?;
     for addr in crate::acpi::xsdt_entries(xsdt).filter(|&a| a != 0) {
         if bound.passed(fw.now(), 0) {
-            return Err("the proof's bound passed while the XSDT was searched for a FADT");
+            return Err(NoDsdt::Cut);
         }
         if let Ok(Some((fadt, _))) = lend_if(fw, addr, &[b"FACP"]) {
             let fadt = Fadt::parse(fadt).map_err(|_| "the FADT is refused")?;
             return Ok((xsdt, fadt.dsdt_address().ok_or("the FADT names no DSDT")?));
         }
     }
-    Err("the XSDT lists no FADT")
+    Err(NoDsdt::Because("the XSDT lists no FADT"))
 }
 
 /// Loads the tables, checks the named results and walks the namespace, recording what was found
@@ -739,7 +754,17 @@ fn interpret<H: Host>(
     let bound = Bound::of(&limits, fw.now());
     let (xsdt, dsdt_addr) = match find_dsdt(fw, rsdp_addr, &bound) {
         Ok(found) => found,
-        Err(why) => {
+        Err(NoDsdt::Cut) => {
+            let _ = writeln!(
+                out,
+                "{LINE}cut off by the proof's bound ({} us, {} steps) before the XSDT's search for a FADT ended",
+                bound.time_ns / 1000,
+                bound.steps
+            );
+            found.fail(CUT_OFF);
+            return;
+        }
+        Err(NoDsdt::Because(why)) => {
             let _ = writeln!(out, "{LINE}no DSDT: {why}");
             found.fail("no DSDT");
             return;
@@ -1062,11 +1087,6 @@ fn named_results<H: Host>(
             "\\_SB.PCI0._HID",
             Want::Integer(PCIE_ROOT_BRIDGE),
         ),
-        check(
-            "\\_SB.PCI0._CRS a template",
-            "\\_SB.PCI0._CRS",
-            Want::Template,
-        ),
         Check {
             args: || fallible::string_arg(b"Windows 2022"),
             ..check(
@@ -1080,6 +1100,14 @@ fn named_results<H: Host>(
             ..check("\\_OSI (\"Linux\") Zero", "\\_OSI", Want::Integer(0))
         },
         check("\\_REV 2", "\\_REV", Want::Integer(origin_aml::REV)),
+        // Last, so that a test can make the last result costly: QEMU's `_CRS` is a name, but a
+        // table may make it a method (the review of B3's addendum, B3-14, the check before the
+        // walk).
+        check(
+            "\\_SB.PCI0._CRS a template",
+            "\\_SB.PCI0._CRS",
+            Want::Template,
+        ),
     ];
     let _ = write!(out, "{LINE}named results:");
     let mut all = true;
