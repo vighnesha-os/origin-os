@@ -515,6 +515,69 @@ fn a_limit_inside_nested_loads_is_traced_for_each_table() {
     );
 }
 
+/// Every allocation a nested load makes refused in turn: the memory limit swept, 16 bytes at a
+/// time, from what the block holds once loaded to past what the evaluation needs, with the load
+/// made from 0 to 11 calls deep so that the frame stack grows at each of its pushes. Each time the
+/// evaluation either loads the table or ends at `Limit(Memory)`; a tracing host hears a `Loaded`
+/// for every `Load`; and no name of a failed table is left.
+#[test]
+fn every_memory_refusal_in_a_load_leaves_the_trace_balanced_and_no_name() {
+    let body = [
+        name("TB", buffer_of(&qa())),
+        method(
+            "REC",
+            1,
+            &[
+                if_(
+                    logic(0x94, arg(0), zero()),
+                    &[ret(call("REC", &[bin(0x74, arg(0), one(), none())]))],
+                ),
+                ret(load_op("TB", none())),
+            ],
+        ),
+    ];
+    let run = |memory_bytes: usize, depth: u64| {
+        let limits = Limits {
+            memory_bytes,
+            ..Limits::SERVICE
+        };
+        let mut i = interp_with(IntegerWidth::Bits64, limits);
+        load(&mut i, &body).ok()?;
+        let held = i.memory_used();
+        i.host_mut().events = Some(Vec::new());
+        let r = i
+            .evaluate("REC", &[Value::Integer(depth)])
+            .map_err(|e| e.kind);
+        let events = i.host_mut().events.take().unwrap();
+        let count = |f: fn(&Event) -> bool| events.iter().filter(|e| f(e)).count();
+        let (loads, ended) = (
+            count(|e| matches!(e, Event::Load(_))),
+            count(|e| matches!(e, Event::Loaded(_))),
+        );
+        Some((r, loads, ended, named(&i, b"QA"), held, i.memory_peak()))
+    };
+    let mut refused = 0;
+    for depth in 0..12 {
+        let (r, _, _, _, held, peak) = run(1 << 20, depth).unwrap();
+        assert_eq!(r, Ok(Some(Value::Integer(u64::MAX))));
+        for limit in (held..peak + 64).step_by(16) {
+            let Some((r, loads, ended, names, _, _)) = run(limit, depth) else {
+                continue;
+            };
+            assert_eq!(loads, ended, "depth {depth}, limit {limit}: {r:?}");
+            match r {
+                Ok(Some(Value::Integer(u64::MAX))) => assert_eq!(names, 3),
+                Err(ErrorKind::Limit(Limit::Memory)) => {
+                    assert_eq!(names, 0, "depth {depth}, limit {limit}");
+                    refused += 1;
+                }
+                other => panic!("depth {depth}, limit {limit}: {other:?}"),
+            }
+        }
+    }
+    assert!(refused > 0);
+}
+
 // --- `LoadTable` -------------------------------------------------------------------------------
 
 const KEY: (&[u8; 4], &[u8; 6], &[u8; 8]) = (b"OEMT", b"ORIGIN", b"AMLTEST\0");

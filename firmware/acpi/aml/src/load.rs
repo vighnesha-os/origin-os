@@ -307,10 +307,6 @@ impl<H: Host> Interpreter<H> {
             },
             &mut self.budget,
         )?;
-        self.trace(&Trace::Load {
-            signature: h.signature.0,
-            oem_table_id: h.oem_table_id,
-        });
         let args = if f.op == Op::Load {
             [f.arg(1), Operand::Empty]
         } else {
@@ -328,11 +324,17 @@ impl<H: Host> Interpreter<H> {
             root,
         };
         // Only the memory limit can stop what follows, and then the evaluation ends: once the
-        // `Loading` frame is pushed, `abort` fails the table with it; before, it is failed here.
+        // `Loading` frame is pushed, `abort` fails the table with it and tells a tracing host so;
+        // before, it is failed here, and the host was told nothing of it. (Today that push always
+        // has room: the operator's own frame was popped just before it.)
         if let Err(e) = self.push_frame(Frame::Loading(loading)) {
             self.fail_table(index);
             return Err(e);
         }
+        self.trace(&Trace::Load {
+            signature: h.signature.0,
+            oem_table_id: h.oem_table_id,
+        });
         self.push_owner(Owner::Table(index))?;
         self.run.depth = depth;
         self.cur = Cursor {
