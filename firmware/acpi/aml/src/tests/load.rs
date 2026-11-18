@@ -361,6 +361,29 @@ fn a_completed_load_stays_when_its_evaluation_fails_later() {
 }
 
 #[test]
+fn a_table_a_failed_block_loaded_stays() {
+    // Q8 for a block's own load: its load-time code loaded `TB`, then failed; the block is rolled
+    // back, and `TB`, whose load completed, stays.
+    let mut i = interp(IntegerWidth::Bits64);
+    let before = i.node_count();
+    let r = load(
+        &mut i,
+        &[
+            name("TB", buffer_of(&qa())),
+            load_op("\\TB", none()),
+            store(nm("\\NOPE"), debug()),
+        ],
+    );
+    assert_eq!(r.map_err(|e| e.kind), Err(ErrorKind::NotFound));
+    assert!(!exists(&i, "\\TB"), "the block is rolled back");
+    assert_eq!(get(&mut i, "\\QAM"), 7);
+    assert_eq!(i.node_count(), before + 3);
+    let last = (i.table_count() - 1) as u32;
+    assert!(!i.table(last).unwrap().failed);
+    assert!(i.table(last - 1).unwrap().failed);
+}
+
+#[test]
 fn a_limit_inside_a_loaded_table_ends_the_evaluation_and_rolls_it_back() {
     let limits = Limits {
         loop_iterations: 100,

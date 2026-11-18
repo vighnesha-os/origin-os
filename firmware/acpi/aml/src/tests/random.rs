@@ -644,6 +644,27 @@ fn audit(i: &Interpreter<TestHost>, from: usize) -> Audit {
     a
 }
 
+/// The paths of the names that tables numbered from `from` on made and still own, their loads
+/// complete.
+fn completed_from(i: &Interpreter<TestHost>, from: usize) -> Vec<Vec<[u8; 4]>> {
+    let mut out = Vec::new();
+    let mut stack = vec![i.root()];
+    while let Some(n) = stack.pop() {
+        if let Ok(Owner::Table(t)) = i.ns.owner(n.0)
+            && t as usize >= from
+            && i.table(t).is_some_and(|t| !t.failed)
+        {
+            out.push(i.path_of(n).unwrap());
+        }
+        let mut c = i.first_child(n);
+        while let Some(k) = c {
+            stack.push(k);
+            c = i.next_sibling(k);
+        }
+    }
+    out
+}
+
 /// Requires that no table loaded whose checksum is bad or that is not signed `SSDT`.
 fn no_bad_table(i: &Interpreter<TestHost>, seed: u64) {
     for t in 0..i.table_count() as u32 {
@@ -874,6 +895,7 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
         .tables
         .push((load_table_key(), 0x9000, listed().to_vec()));
     let before = snapshot(&i);
+    let first_table = i.table_count();
     let block = DefinitionBlock {
         signature: *b"SSDT",
         oem_id: *b"ORIGIN",
@@ -891,9 +913,13 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
         Err(e) => {
             note_error(&e);
             mix(2 + e.at.map_or(0, |a| u64::from(a.offset)));
+            // A table the block's load-time code loaded, and whose load completed, stays (B4's
+            // contract, Q8); nothing else of the failed block may.
+            let kept = completed_from(&i, first_table + 1);
+            let mut now = snapshot(&i);
+            now.retain(|p| !kept.contains(p));
             assert_eq!(
-                snapshot(&i),
-                before,
+                now, before,
                 "seed {seed:#x}: a failed load left names behind"
             );
             Err(e.kind)
@@ -1336,6 +1362,18 @@ fn adversarial_cases() {
             loading("XG", 81, &[]),
             Setup::PLAIN,
             Expect::Eval(Ok(Some(Value::Integer(82)))),
+        ),
+        // A block whose own load-time code completes a load and then fails: the block is rolled
+        // back, and the table it loaded stays (Q8), which `run`'s check allows by name.
+        (
+            {
+                let mut body = loadables(&[]);
+                body.push(load_op("\\XA", none()));
+                body.push(store(nm("\\NOPE"), debug()));
+                body
+            },
+            Setup::PLAIN,
+            Expect::Load(ErrorKind::NotFound),
         ),
         (
             vec![
