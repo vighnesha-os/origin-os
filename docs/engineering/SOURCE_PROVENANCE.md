@@ -4924,6 +4924,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - `tests/load.rs`: each source, each failure giving Zero with nothing left, a limit inside a loaded table, a table loading itself, a failed load inside a load, the trace, and `LoadTable`'s cases;
   - nested loads 1,200 calls deep on a 32 KiB thread in release and 256 KiB in debug, with a control at a depth limit of 1,000;
   - a limit inside nested loads traced for each table, and a sweep that refuses each allocation of a nested load in turn, the trace balanced and no name left every time;
+  - a table loaded by a block that then fails, staying (Q8; N-soak-3, found by the soak);
   - the coverage corpus loading a buffer and a listed table;
   - `DataTableRegion`'s five refused copies;
   - B4-0's tests in the kernel and in xtask.

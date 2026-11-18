@@ -195,7 +195,7 @@ What the tables show:
   - **Q4.** True is Ones at the integer width.
   - **Q6.** `LoadTable` of a `DSDT` or `SSDT` key gives Zero without asking the host (§19.6.78's note).
   - **Q7.** A table loaded twice fails at its first duplicate name (as G3).
-  - **Q8.** A completed load stays if its evaluation fails later.
+  - **Q8.** A completed load stays if its evaluation fails later, a block's own load among them: a table its load-time code loaded stays when the block is rolled back (found by the soak, N-soak-3).
   - G17 and G18, above.
 - **What the library leaves to its host.**
   - Whether a region is in reserved or NVS memory: a host decides every region access (ADR-0019 A2).
