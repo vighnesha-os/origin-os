@@ -1556,6 +1556,119 @@ fn the_engines_frames_stay_280_bytes() {
     assert_eq!(core::mem::size_of::<crate::engine::Frame>(), 280);
 }
 
+// --- Locals and arguments at a loaded table's table level (the review's addendum, B4-13) -------
+
+/// `CL` calls `LD (RefOf (\\GLB))`; `LD` sets `Local0` to 5, loads `TB` holding `body` (its
+/// value into `\\RES`) and returns `Local0`. Returns the interpreter after `CL` has run, its
+/// result, and the trace's `Loaded` events.
+fn caller_case(body: &[B]) -> (Interp, Result<Option<Value>, ErrorKind>, Vec<Event>) {
+    let mut i = loaded(
+        IntegerWidth::Bits64,
+        &[
+            name("TB", buffer_of(&ssdt(body))),
+            name("GLB", byte(0x11)),
+            name("RES", int(3)),
+            name("X", zero()),
+            method(
+                "LD",
+                1,
+                &[
+                    store(int(5), local(0)),
+                    store(load_op("TB", none()), nm("\\RES")),
+                    ret(local(0)),
+                ],
+            ),
+            m("CL", &[ret(call("LD", &[ref_of(nm("\\GLB"))]))]),
+        ],
+    );
+    i.host_mut().events = Some(Vec::new());
+    let r = i.evaluate("CL", &[]).map_err(|e| e.kind);
+    let ended = i
+        .host_mut()
+        .events
+        .take()
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Loaded(_)))
+        .collect();
+    (i, r, ended)
+}
+
+/// The load failed `Grammar` with Zero, rolled back, and the caller's local, its argument's
+/// target and `\\X` are as they were.
+#[track_caller]
+fn refused_at_table_level(body: &[B]) {
+    let (mut i, r, ended) = caller_case(body);
+    assert_eq!(
+        r,
+        Ok(Some(Value::Integer(5))),
+        "the caller's Local0 untouched"
+    );
+    assert_eq!(ended, vec![Event::Loaded(Err(ErrorKind::Grammar))]);
+    assert_eq!(get(&mut i, "\\RES"), 0, "Zero");
+    assert_eq!(get(&mut i, "\\GLB"), 0x11, "nothing written through Arg0");
+    assert_eq!(get(&mut i, "\\X"), 0);
+    assert_eq!(named(&i, b"QL"), 0, "rolled back");
+    at_rest(&i);
+}
+
+#[test]
+fn n5_a_loaded_tables_table_level_cannot_use_its_callers_locals_or_arguments() {
+    // The addendum's N5: before B4-13, `LD` returned 0x99 and `\\GLB` became 0x77.
+    refused_at_table_level(&[
+        name("QL0", one()),
+        store(byte(0x99), local(0)),
+        store(byte(0x77), arg(0)),
+    ]);
+    // The same block loaded by the host fails `Grammar` too: there is no method at all.
+    let mut i = interp(IntegerWidth::Bits64);
+    assert_eq!(
+        load(&mut i, &[store(byte(0x99), local(0))]).map_err(|e| e.kind),
+        Err(ErrorKind::Grammar)
+    );
+}
+
+#[test]
+fn a_local_read_at_a_loaded_tables_table_level_is_refused() {
+    refused_at_table_level(&[name("QL0", one()), store(local(0), nm("\\X"))]);
+}
+
+#[test]
+fn a_local_stored_at_a_loaded_tables_table_level_is_refused() {
+    refused_at_table_level(&[name("QL0", one()), store(byte(0x99), local(0))]);
+}
+
+#[test]
+fn ref_of_a_local_at_a_loaded_tables_table_level_is_refused() {
+    refused_at_table_level(&[name("QL0", one()), store(ref_of(local(0)), nm("\\X"))]);
+}
+
+#[test]
+fn an_argument_holding_a_reference_at_a_loaded_tables_table_level_is_refused() {
+    refused_at_table_level(&[name("QL0", one()), store(byte(0x77), arg(0))]);
+}
+
+#[test]
+fn a_local_as_loads_own_target_at_a_loaded_tables_table_level_is_refused() {
+    refused_at_table_level(&[name("QL0", one()), load_op("\\TB", local(0))]);
+}
+
+#[test]
+fn a_method_a_loaded_table_calls_keeps_its_own_locals() {
+    // The refusal is the table level's alone: a method called from it is an activation of its
+    // own, with locals of its own.
+    let (mut i, r, ended) = caller_case(&[
+        m("QLM", &[store(int(3), local(0)), ret(local(0))]),
+        store(call("QLM", &[]), nm("\\X")),
+    ]);
+    assert_eq!(r, Ok(Some(Value::Integer(5))));
+    assert_eq!(ended.len(), 1);
+    assert!(matches!(ended[0], Event::Loaded(Ok(_))));
+    assert_eq!(get(&mut i, "\\X"), 3);
+    assert_eq!(get(&mut i, "\\RES"), u64::MAX);
+    at_rest(&i);
+}
+
 // --- The planted faults ------------------------------------------------------------------------
 
 /// A fault planted, or none, and the tests it must fail (or pass).
@@ -1565,7 +1678,7 @@ type Planted = (Option<Fault>, &'static [fn()]);
 /// pass. The randomized test's control plants them as well (`random.rs`).
 #[test]
 fn planted_faults_are_caught_by_the_load_tests() {
-    let tests: [Planted; 6] = [
+    let tests: [Planted; 7] = [
         (
             None,
             &[
@@ -1581,6 +1694,12 @@ fn planted_faults_are_caught_by_the_load_tests() {
                 r8_load_tables_parameter_needing_its_pci_function_ends_once,
                 r9_a_failing_term_list_gives_zero_into_a_pci_target,
                 r10_a_region_source_is_read_once_when_the_target_needs_its_pci_function,
+                n5_a_loaded_tables_table_level_cannot_use_its_callers_locals_or_arguments,
+                a_local_read_at_a_loaded_tables_table_level_is_refused,
+                a_local_stored_at_a_loaded_tables_table_level_is_refused,
+                ref_of_a_local_at_a_loaded_tables_table_level_is_refused,
+                an_argument_holding_a_reference_at_a_loaded_tables_table_level_is_refused,
+                a_local_as_loads_own_target_at_a_loaded_tables_table_level_is_refused,
             ],
         ),
         (
@@ -1604,6 +1723,17 @@ fn planted_faults_are_caught_by_the_load_tests() {
         (
             Some(Fault::AllowDuplicate),
             &[a_table_loaded_twice_fails_at_its_first_duplicate],
+        ),
+        (
+            Some(Fault::AllowLoadLocals),
+            &[
+                n5_a_loaded_tables_table_level_cannot_use_its_callers_locals_or_arguments,
+                a_local_read_at_a_loaded_tables_table_level_is_refused,
+                a_local_stored_at_a_loaded_tables_table_level_is_refused,
+                ref_of_a_local_at_a_loaded_tables_table_level_is_refused,
+                an_argument_holding_a_reference_at_a_loaded_tables_table_level_is_refused,
+                a_local_as_loads_own_target_at_a_loaded_tables_table_level_is_refused,
+            ],
         ),
         (
             Some(Fault::SkipLoadReadiness),

@@ -364,6 +364,9 @@ pub(crate) enum Fault {
     AllowDuplicate,
     /// A load's stores are not made ready before it changes anything (`load.rs`, `load_ready`).
     SkipLoadReadiness,
+    /// A run-time-loaded table's table-level code may name its caller's locals and arguments
+    /// (`load.rs`, `at_loaded_table_level`).
+    AllowLoadLocals,
 }
 
 thread_local! {

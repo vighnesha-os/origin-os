@@ -71,6 +71,21 @@ pub(crate) struct Loading {
     depth: u32,
     /// `LoadTable`'s root path, the base of its parameter path.
     root: NodeId,
+    /// The activations mark of the table being loaded around this one, or `usize::MAX`: what
+    /// [`Interpreter::at_loaded_table_level`] goes back to when this load ends (B4-13).
+    outer_calls: usize,
+}
+
+impl Loading {
+    /// The activations there were when this load began: its table level's.
+    pub(crate) const fn calls_mark(&self) -> usize {
+        self.calls
+    }
+
+    /// The same mark for the load around this one, or `usize::MAX`.
+    pub(crate) const fn outer_calls(&self) -> usize {
+        self.outer_calls
+    }
 }
 
 /// `LoadTable`'s parameter, stored by a step of its own once the load has ended (the review of
@@ -357,6 +372,7 @@ impl<H: Host> Interpreter<H> {
             held: self.held.len(),
             depth: self.run.depth,
             root,
+            outer_calls: self.load_calls,
         };
         // Only the memory limit can stop what follows, and then the evaluation ends: once the
         // `Loading` frame is pushed, `abort` fails the table with it and tells a tracing host so;
@@ -470,23 +486,31 @@ impl<H: Host> Interpreter<H> {
         }
     }
 
-    /// Whether a `Return` would leave a table being loaded: the nearest of a method's call and a
-    /// [`Loading`] frame is the load's. Its table-level code has no method to return from, and
-    /// returning from the method around the `Load` would skip the load's end; it is `Grammar`, as
-    /// a `Return` outside any method is.
+    /// Whether the code running is the table level of a table being loaded: the nearest of a
+    /// method's call and a [`Loading`] frame is the load's, which is so exactly while there are as
+    /// many activations as when that load began. A method called from it, or a function walk's,
+    /// has one more.
+    fn table_level_of_a_load(&self) -> bool {
+        self.load_calls == self.calls.len()
+    }
+
+    /// Whether a `Return` would leave a table being loaded: its table-level code has no method to
+    /// return from, and returning from the method around the `Load` would skip the load's end; it
+    /// is `Grammar`, as a `Return` outside any method is.
     pub(crate) fn return_crosses_load(&self) -> bool {
-        if self.loading == 0 {
+        self.table_level_of_a_load()
+    }
+
+    /// Whether `LocalX` and `ArgX` are refused here: at a loaded table's table level they would
+    /// be the method's that ran `Load`, which the table has no right to read or write (the
+    /// review of B4's addendum, B4-13). The same block loaded by the host has no method and fails
+    /// `Grammar` at them too. A test may plant their admission (`AllowLoadLocals`).
+    pub(crate) fn at_loaded_table_level(&self) -> bool {
+        #[cfg(test)]
+        if crate::tests::planted(crate::tests::Fault::AllowLoadLocals) {
             return false;
         }
-        let nearest = self
-            .frames
-            .iter()
-            .rev()
-            .position(|f| matches!(f, Frame::Call | Frame::Loading(_)));
-        self.note_work(u64::try_from(nearest.unwrap_or(0)).unwrap_or(u64::MAX));
-        nearest
-            .and_then(|k| self.frames.iter().rev().nth(k))
-            .is_some_and(|f| matches!(f, Frame::Loading(_)))
+        self.table_level_of_a_load()
     }
 
     /// The nearest load an error `e` inside the evaluation above `base` fails: the top

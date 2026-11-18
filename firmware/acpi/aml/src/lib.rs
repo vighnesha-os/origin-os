@@ -165,6 +165,10 @@ pub struct Interpreter<H: Host> {
     pending: Option<object::NodeId>,
     /// How many `Loading` frames are on the stack (`load.rs`).
     loading: u32,
+    /// The activations there were when the innermost table being loaded began: while there are
+    /// as many, the code running is that table's table level (`load.rs`), or `usize::MAX` when
+    /// no table is being loaded (the review of B4's addendum, B4-13).
+    load_calls: usize,
     /// How many `Resolve` frames are on the stack.
     resolving: u32,
     /// How many holds of the Global Lock the running evaluation has: the host holds it for all

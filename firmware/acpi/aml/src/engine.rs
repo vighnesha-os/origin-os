@@ -224,6 +224,7 @@ impl<H: Host> Interpreter<H> {
             pending: None,
             resolving: 0,
             loading: 0,
+            load_calls: usize::MAX,
             global_depth: 0,
             run: crate::RunCounts::default(),
             base: 0,
@@ -569,11 +570,15 @@ impl<H: Host> Interpreter<H> {
         // Room for both first, so that the two stacks never differ in length.
         mem::reserve(&mut self.ctx, 1, &mut self.budget)?;
         let resolve = matches!(f, Frame::Resolve(_));
-        let loading = matches!(f, Frame::Loading(_));
+        let loading = match &f {
+            Frame::Loading(l) => Some(l.calls_mark()),
+            _ => None,
+        };
         mem::push(&mut self.frames, f, &mut self.budget)?;
         mem::push(&mut self.ctx, here, &mut self.budget)?;
-        if loading {
+        if let Some(calls) = loading {
             self.loading = self.loading.saturating_add(1);
+            self.load_calls = calls;
         }
         // Counted where every frame is pushed, a step put back with a `Resolve` on top among
         // them, as `pop_frame` and `truncate_frames` count them out (the review of B2's Addendum
@@ -593,8 +598,9 @@ impl<H: Host> Interpreter<H> {
         if matches!(f, Some(Frame::Resolve(_))) {
             self.resolving = self.resolving.saturating_sub(1);
         }
-        if matches!(f, Some(Frame::Loading(_))) {
+        if let Some(Frame::Loading(l)) = &f {
             self.loading = self.loading.saturating_sub(1);
+            self.load_calls = l.outer_calls();
         }
         f
     }
@@ -614,6 +620,14 @@ impl<H: Host> Interpreter<H> {
         self.loading = self
             .loading
             .saturating_sub(u32::try_from(loads).unwrap_or(u32::MAX));
+        // The lowest load popped was inside whichever is innermost now.
+        if let Some(Frame::Loading(l)) = self
+            .frames
+            .get(n..)
+            .and_then(|f| f.iter().find(|f| matches!(f, Frame::Loading(_))))
+        {
+            self.load_calls = l.outer_calls();
+        }
         self.frames.truncate(n);
         self.ctx.truncate(n);
     }
@@ -1006,6 +1020,9 @@ impl<H: Host> Interpreter<H> {
         let b = self.byte(at)?;
         let next = add(at, 1)?;
         match b {
+            // A table loaded at run time has no locals or arguments of its own at its table level:
+            // those are the method's that ran `Load` (the review of B4's addendum, B4-13).
+            0x60..=0x6E if self.at_loaded_table_level() => return err(ErrorKind::Grammar),
             0x60..=0x67 => {
                 #[cfg(test)]
                 crate::tests::ran(u16::from(b));

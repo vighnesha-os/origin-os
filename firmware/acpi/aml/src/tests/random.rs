@@ -9,8 +9,9 @@
 //!
 //! **`Load` and `LoadTable`** (step B4): each block holds buffers of tables to load, each table's
 //! names under a prefix of its own, and its methods and load-time code load them, inside nested
-//! calls and inside other loads. Some fail midway, some reach a limit, one loads itself, and two
-//! must never load (a bad checksum, a signature not `SSDT`). After the block's load and after each
+//! calls and inside other loads. Some fail midway, some reach a limit, one loads itself, two must
+//! never load (a bad checksum, a signature not `SSDT`), and one names its caller's `Local0` at its
+//! table level, which fails its load (the review of B4's addendum, B4-13). After the block's load and after each
 //! evaluation the namespace is audited: no name of a failed table, none of an ended evaluation,
 //! and no more names than the tables loaded meanwhile made; and the engine's stacks are at rest,
 //! with no region left pending. Every block has a PCI_Config field whose function is found only
@@ -183,7 +184,7 @@ const METHODS: &[(&str, u8)] = &[("M0", 0), ("M1", 1), ("M2", 2), ("\\D0.M3", 1)
 /// What `Load` is given: the buffers [`loadables`] makes, and objects that hold no table (an
 /// integer, a SystemIO region, a field in it).
 const LOADS: &[&str] = &[
-    "XA", "XB", "XC", "XD", "XE", "XF", "XG", "\\XA", "N0", "R0", "F0", PF,
+    "XA", "XB", "XC", "XD", "XE", "XF", "XG", "XH", "\\XA", "N0", "R0", "F0", PF,
 ];
 
 /// `\_SB.PCI0`, a root bridge on bus 0, and below it `DP` (device 3, function 0) with a
@@ -234,7 +235,8 @@ fn with_table_id(mut t: Vec<u8>, id: &[u8; 8]) -> Vec<u8> {
 /// under a prefix of its own: `XA` loads (with `extra`, load-time code the generator adds); `XB`
 /// fails midway; `XC` has a bad checksum; `XD` loads `XB` and then `XA` inside its own load; `XE`
 /// reaches the loop limit midway; `XF` loads itself after its first name, which fails, and goes
-/// on; `XG` is signed `OEMX`.
+/// on; `XG` is signed `OEMX`; `XH` writes `Local0` at its table level, which is refused, so its
+/// load fails (B4-13).
 fn loadables(extra: &[B]) -> Vec<B> {
     let mut qa = vec![
         name("QA0", int(1)),
@@ -294,6 +296,18 @@ fn loadables(extra: &[B]) -> Vec<B> {
         (
             "XG",
             with_table_id(table(b"OEMX", 2, &[name("QH0", one())]), NOT_SSDT),
+        ),
+        (
+            "XH",
+            table(
+                b"SSDT",
+                2,
+                &[
+                    name("QJ0", one()),
+                    store(byte(9), local(0)),
+                    name("QJ1", one()),
+                ],
+            ),
         ),
     ];
     tables.iter().map(|(n, t)| name(n, buffer_of(t))).collect()
@@ -590,6 +604,14 @@ impl Gen {
             let pred = self.expr(1);
             extra.push(if_(pred, &[name("QA2", one())]));
         }
+        // Sometimes a local or an argument at `XA`'s table level, which fails its load (B4-13).
+        if self.rng.chance(10) {
+            extra.push(if self.rng.chance(50) {
+                store(local(self.rng.below(8) as u8), debug())
+            } else {
+                store(int(1), arg(self.rng.below(7) as u8))
+            });
+        }
         body.extend(loadables(&extra));
         if self.rng.chance(15) {
             // A load inside this block's own load.
@@ -874,8 +896,9 @@ struct Floors {
     run_loads: u64,
 }
 
-/// The default seeds give 93%, 23%, 34% and 20 kinds, with every limit reached; an evaluation's
-/// load completed in 13% of cases and failed in 15% (step B4; before it, 98%, 22%, 31% and 19).
+/// The default seeds give 94%, 23%, 34% and 20 kinds, with every limit reached; an evaluation's
+/// load completed in 11% of cases and failed in 17% (step B4 and its review's addendum; before
+/// B4, 98%, 22%, 31% and 19).
 const GRAMMAR_FLOORS: Floors = Floors {
     loaded: 90,
     values: 15,
@@ -890,9 +913,9 @@ const GRAMMAR_FLOORS: Floors = Floors {
     run_loads: 8,
 };
 
-/// The default seeds give 15%, 20%, 32% and 23 kinds; an evaluation's load completed in 1% of
-/// cases and failed in 2%, too few for a floor: the grammar's cases hold that one (step B4; before
-/// it, 13%, 21%, 28% and 21).
+/// The default seeds give 14%, 23%, 31% and 23 kinds; an evaluation's load completed in 1% of
+/// cases and failed in 2%, too few for a floor: the grammar's cases hold that one (step B4 and its
+/// review's addendum; before B4, 13%, 21%, 28% and 21).
 const MUTATION_FLOORS: Floors = Floors {
     loaded: 8,
     values: 12,
@@ -1426,6 +1449,25 @@ fn adversarial_cases() {
             Setup::PLAIN,
             Expect::Eval(Ok(Some(Value::Integer(82)))),
         ),
+        // B4-13: a table whose table level writes `Local0` fails to load, and the caller's
+        // `Local0` keeps 1: 121 returned.
+        (
+            {
+                let mut body = loadables(&[]);
+                body.push(method(
+                    "M0",
+                    0,
+                    &[
+                        store(int(1), local(0)),
+                        store(load_op("XH", none()), debug()),
+                        ret(add(local(0), int(120), none())),
+                    ],
+                ));
+                body
+            },
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(121)))),
+        ),
         // B4-1: `Load`'s result into a field whose PCI function is found only then, for a table
         // that loads and for one that fails midway.
         (
@@ -1568,6 +1610,10 @@ fn planted_faults_are_caught() {
         (
             Fault::SkipLoadReadiness,
             "written for Eval(Ok(Some(Integer(101))))",
+        ),
+        (
+            Fault::AllowLoadLocals,
+            "written for Eval(Ok(Some(Integer(121))))",
         ),
     ];
     for (f, by) in faults {
