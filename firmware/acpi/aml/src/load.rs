@@ -13,15 +13,19 @@
 //! **Every store a load makes is ready before anything changes** (the review of B4, B4-1).
 //! `Load`'s target, and `LoadTable`'s parameter, may be a field of a PCI_Config region whose
 //! function is not yet found, and a store there asks for it (`Pending`) and is put back. So, as
-//! `Divide` does, each is made ready first: `Load`'s target before its source is read, and
-//! `LoadTable`'s parameter before the load's end pops anything. A `Pending` that still reaches
-//! either end's store is the interpreter's own error (`Grammar`), never a retry.
+//! `Divide` does, each is made ready first. `Load`'s target is made ready before its source is
+//! read. `LoadTable`'s parameter is stored by a step of its own, a [`Parameter`] frame pushed
+//! once the load has ended (the review's addendum, B4-12): it finds the node, makes it ready and
+//! stores, so that a `Pending` puts that step back alone, and any failure there, a limit
+//! included, comes after the table was added and leaves it loaded (§19.6.78). A `Pending` that
+//! still reaches a load's store is the interpreter's own error (`Grammar`), never a retry.
 //!
 //! **A load that fails other than by a limit** (a check, a duplicate name, any error in its term
 //! list) is rolled back whole, names and bytes, and its operator gives Zero; the evaluation goes on
 //! ([`Interpreter::fail_load_at`], from `run_frames`). A limit or a `Fatal` ends the evaluation,
-//! as everywhere, and the table is rolled back with it (`Fatal`: B4-2). **A load that completes stays**, even if the evaluation
-//! around it fails later: AML has no transactions (B4's contract, Q8).
+//! as everywhere, and the table is rolled back with it (`Fatal`: B4-2). **A load that completes
+//! stays**, even if the evaluation around it fails later: AML has no transactions (B4's contract,
+//! Q8).
 //!
 //! **Strict choices**, each recorded in the research ledger (§9):
 //! - `Load` takes a block signed `SSDT` only, as §19.6.77 says the block "should" be (Q2);
@@ -66,6 +70,17 @@ pub(crate) struct Loading {
     held: usize,
     depth: u32,
     /// `LoadTable`'s root path, the base of its parameter path.
+    root: NodeId,
+}
+
+/// `LoadTable`'s parameter, stored by a step of its own once the load has ended (the review of
+/// B4's addendum, B4-12): `ParameterPath` and `ParameterData`, and the root path the first is taken
+/// under.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Parameter {
+    /// `ParameterPath` and `ParameterData`.
+    pub(crate) args: [Operand; 2],
+    /// `LoadTable`'s root path.
     root: NodeId,
 }
 
@@ -369,24 +384,12 @@ impl<H: Host> Interpreter<H> {
         })
     }
 
-    /// The table's block has ended: its names stay, the operator gets True, and `LoadTable`'s
-    /// parameter is stored. Load-time code that ends holding a mutex fails the load instead, as a
-    /// table's load at the top level does (§19.6.89; G2).
-    ///
-    /// `LoadTable`'s parameter is found, and made ready, before anything here changes: a step put
-    /// back for its PCI function then runs this end again from the same state (B4-1). A lookup
-    /// that fails is still raised only after the load has ended, so that the table stays and the
-    /// error is not the load's (§19.6.78).
+    /// The table's block has ended: its names stay, and the operator gets True. Load-time code
+    /// that ends holding a mutex fails the load instead, as a table's load at the top level does
+    /// (§19.6.89; G2). Nothing here can be put back: `Load`'s target was made ready at the
+    /// operator (B4-1), and `LoadTable`'s parameter is a step of its own, pushed here once the
+    /// load has ended (B4-12).
     pub(crate) fn finish_load(&mut self, l: Loading) -> Result<()> {
-        let completes = self.held.len() <= l.held;
-        let parameter = if l.op == Op::LoadTable && completes {
-            self.parameter_node(&l)
-        } else {
-            Ok(None)
-        };
-        if let Ok(Some(node)) = parameter {
-            self.load_ready(Loc::Node(node))?;
-        }
         self.pop_frame();
         if self.release_held(l.held) {
             let at = self.frames.len();
@@ -396,30 +399,51 @@ impl<H: Host> Interpreter<H> {
         self.run.depth = l.depth;
         self.cur = l.ret;
         self.trace(&Trace::Loaded(Ok(l.table)));
-        if let Some(node) = parameter? {
-            let [_, data] = l.args;
+        if l.op == Op::LoadTable {
+            // The table is in the namespace: whatever the parameter's store meets now, a limit
+            // included, is not the load's (§19.6.78; the ruling on the review's point 6).
+            return self.push_frame(Frame::Parameter(Parameter {
+                args: l.args,
+                root: l.root,
+            }));
+        }
+        let [target, _] = l.args;
+        self.load_result(l.op, target, true)
+    }
+
+    /// `LoadTable`'s parameter, the step a [`Parameter`] frame takes once the load has ended:
+    /// `ParameterData` stored into the object `ParameterPath` names, then the operator's True
+    /// given. The node is found and made ready before anything changes, so that a `Pending` puts
+    /// this step back with nothing done (`pci.rs`); an object that does not exist is an error, and
+    /// the table stays loaded (B4-12).
+    pub(crate) fn store_parameter(&mut self, p: Parameter) -> Result<()> {
+        let [path, data] = p.args;
+        let node = self.parameter_node(path, p.root)?;
+        if let Some(node) = node {
+            self.load_ready(Loc::Node(node))?;
+        }
+        self.pop_frame();
+        if let Some(node) = node {
             let Operand::Val(data) = data else {
                 return err(ErrorKind::Grammar);
             };
             let stored = self.store(Loc::Node(node), data, Mode::Store);
             self.no_retry(stored)?;
         }
-        let [target, _] = l.args;
-        self.load_result(l.op, target, true)
+        self.load_result(Op::LoadTable, Operand::Empty, true)
     }
 
     /// The object `LoadTable`'s `ParameterPath` names, if it is not empty: as written if it
-    /// begins with `\` or `^`, else under the root path. An object that does not exist is an
-    /// error.
-    fn parameter_node(&mut self, l: &Loading) -> Result<Option<NodeId>> {
-        let [path, _] = l.args;
+    /// begins with `\` or `^`, else under the root path `root`. An object that does not exist is
+    /// an error.
+    fn parameter_node(&mut self, path: Operand, root: NodeId) -> Result<Option<NodeId>> {
         let Some(path) = self.path_operand(path)? else {
             return Ok(None);
         };
         let node = if path.root() || path.parents() > 0 {
             self.lookup_from(self.scope(), &path)?
         } else {
-            self.lookup_exact(l.root, &path)?
+            self.lookup_exact(root, &path)?
         };
         Ok(Some(node))
     }

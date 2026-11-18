@@ -112,6 +112,8 @@ pub(crate) enum Frame {
     /// A table being loaded by `Load` or `LoadTable`, below its table block until that ends
     /// (`load.rs`).
     Loading(crate::load::Loading),
+    /// `LoadTable`'s parameter, stored once its table has loaded (`load.rs`).
+    Parameter(crate::load::Parameter),
 }
 
 /// The units of work between two readings of the clock.
@@ -797,6 +799,8 @@ impl<H: Host> Interpreter<H> {
             Frame::Resolve(r) => self.resolve_step(r),
             // A loaded table's block has ended: the load is complete (`load.rs`).
             Frame::Loading(l) => self.finish_load(l),
+            // `LoadTable`'s parameter, after its table has loaded (`load.rs`).
+            Frame::Parameter(p) => self.store_parameter(p),
         }
     }
 
@@ -1784,9 +1788,11 @@ impl<H: Host> Interpreter<H> {
                         ok &= self.heap.mark(v, &mut self.budget);
                     }
                 }
-                // The operator a load completes keeps its operands: `LoadTable`'s parameter.
-                Frame::Loading(l) => {
-                    for a in l.args {
+                // The operator a load completes keeps its operands: `LoadTable`'s parameter,
+                // until the step that stores it.
+                Frame::Loading(crate::load::Loading { args, .. })
+                | Frame::Parameter(crate::load::Parameter { args, .. }) => {
+                    for a in *args {
                         ok &= match a {
                             Operand::Val(v) => self.heap.mark(v, &mut self.budget),
                             Operand::Loc(Loc::Ref(t)) => {

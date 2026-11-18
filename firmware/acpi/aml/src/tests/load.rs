@@ -1374,6 +1374,188 @@ fn a_pending_at_a_loads_end_fails_closed() {
     at_rest(&k);
 }
 
+// --- `LoadTable`'s parameter, a step of its own after the load (the review's addendum, B4-12) ---
+
+/// A method `LT`: `LoadTable` of [`KEY`] storing 0x42 into `param` (its value given to `Debug`),
+/// then 0x55 into `\\AFT`, then `Return (77)`; with `more` at the root. The host lists the table,
+/// `F1` is preset and a trace started. The store into `\\AFT` is what a failed parameter must
+/// stop.
+fn parameter_case(param: &str, more: &[B], limits: Limits) -> Interp {
+    let mut body = vec![
+        pci_bridge(),
+        name("AFT", zero()),
+        method(
+            "LT",
+            0,
+            &[
+                store(
+                    load_table([
+                        string("OEMT"),
+                        string("ORIGIN"),
+                        string("AMLTEST"),
+                        string(""),
+                        string(param),
+                        int(0x42),
+                    ]),
+                    debug(),
+                ),
+                store(byte(0x55), nm("\\AFT")),
+                ret(byte(77)),
+            ],
+        ),
+    ];
+    body.extend_from_slice(more);
+    let mut i = interp_with(IntegerWidth::Bits64, limits);
+    load(&mut i, &body).expect("the block loads");
+    host_table(&mut i, KEY, qf());
+    preset_f1(&mut i);
+    i.host_mut().events = Some(Vec::new());
+    i
+}
+
+/// Runs `LT` and requires: its error `kind` (or `None` for success), the load traced as ended
+/// once and completed, the table kept with its two names, `\AFT` untouched when it failed, and
+/// the stacks at rest.
+#[track_caller]
+fn parameter_fails_after_the_load(i: &mut Interp, kind: Option<ErrorKind>) {
+    let first = i.table_count() as u32;
+    let r = i.evaluate("LT", &[]).map_err(|e| e.kind);
+    match kind {
+        Some(k) => assert_eq!(r, Err(k)),
+        None => assert_eq!(r, Ok(Some(Value::Integer(77)))),
+    }
+    assert_eq!(
+        loads_traced(i),
+        vec![Event::Load(*b"OEMT"), Event::Loaded(Ok(first))],
+        "one load, completed"
+    );
+    assert!(!i.table(first).unwrap().failed, "the table stays");
+    assert_eq!(named(i, b"QF"), 2);
+    if kind.is_some() {
+        assert_eq!(get(i, "\\AFT"), 0, "nothing ran after the failed store");
+    }
+    at_rest(i);
+}
+
+#[test]
+fn n1_a_parameter_in_a_pci_region_under_no_device_fails_after_the_load() {
+    // The region's function cannot be named: no device above it. Before B4-12 the walk's failure
+    // rolled the completed table back with Zero and `LT` went on.
+    let mut i = parameter_case(
+        "\\NF",
+        &[
+            op_region("NR", 2, zero(), byte(4)),
+            field("NR", 1, &[Fe::Named("NF", 8)]),
+        ],
+        Limits::SERVICE,
+    );
+    parameter_fails_after_the_load(&mut i, Some(ErrorKind::NotFound));
+}
+
+#[test]
+fn n1b_a_parameter_under_a_device_with_no_adr_fails_after_the_load() {
+    let mut i = parameter_case(
+        "\\_SB.PCI0.NA.NF",
+        &[scope(
+            "\\_SB.PCI0",
+            &[device(
+                "NA",
+                &[
+                    op_region("NR", 2, zero(), byte(4)),
+                    field("NR", 1, &[Fe::Named("NF", 8)]),
+                ],
+            )],
+        )],
+        Limits::SERVICE,
+    );
+    let first = i.table_count() as u32;
+    let r = i.evaluate("LT", &[]).map_err(|e| e.kind);
+    assert!(r.is_err() && r != Err(ErrorKind::Pending), "{r:?}");
+    assert_eq!(
+        loads_traced(&mut i),
+        vec![Event::Load(*b"OEMT"), Event::Loaded(Ok(first))]
+    );
+    assert!(!i.table(first).unwrap().failed);
+    assert_eq!(named(&i, b"QF"), 2);
+    assert_eq!(get(&mut i, "\\AFT"), 0);
+    at_rest(&i);
+}
+
+#[test]
+fn n1c_a_parameter_the_host_refuses_to_write_fails_after_the_load() {
+    let mut i = parameter_case(
+        "\\IOF",
+        &[
+            op_region("IOR", 1, word(0x80), byte(1)),
+            field("IOR", 1, &[Fe::Named("IOF", 8)]),
+        ],
+        Limits::SERVICE,
+    );
+    i.host_mut().refuse = true;
+    let first = i.table_count() as u32;
+    let r = i.evaluate("LT", &[]).map_err(|e| e.kind);
+    assert!(
+        matches!(r, Err(ErrorKind::Region { .. })),
+        "the host's refusal: {r:?}"
+    );
+    assert_eq!(
+        loads_traced(&mut i),
+        vec![Event::Load(*b"OEMT"), Event::Loaded(Ok(first))]
+    );
+    assert!(!i.table(first).unwrap().failed);
+    assert_eq!(named(&i, b"QF"), 2);
+    at_rest(&i);
+}
+
+#[test]
+fn n1d_a_parameter_that_names_nothing_fails_after_the_load() {
+    // The ruled case of the hand-over's point 6, kept.
+    let mut i = parameter_case("\\NONE", &[], Limits::SERVICE);
+    parameter_fails_after_the_load(&mut i, Some(ErrorKind::NotFound));
+}
+
+#[test]
+fn n4_a_limit_in_the_parameters_function_walk_comes_after_the_load() {
+    // `_ADR` loops to the loop limit while the parameter's PCI function is found: the evaluation
+    // ends, and the table, already added, stays.
+    let limits = Limits {
+        loop_iterations: 100,
+        ..Limits::SERVICE
+    };
+    let mut i = parameter_case(
+        "\\_SB.PCI0.NL.NF",
+        &[scope(
+            "\\_SB.PCI0",
+            &[device(
+                "NL",
+                &[
+                    method("_ADR", 0, &[while_(one(), &[noop()]), ret(zero())]),
+                    op_region("NR", 2, zero(), byte(4)),
+                    field("NR", 1, &[Fe::Named("NF", 8)]),
+                ],
+            )],
+        )],
+        limits,
+    );
+    parameter_fails_after_the_load(&mut i, Some(ErrorKind::Limit(Limit::Loops)));
+}
+
+#[test]
+fn a_parameter_needing_its_pci_function_is_stored_by_its_own_step() {
+    // R8's case again, through the step: the store put back once, and stored; the method goes on.
+    let mut i = parameter_case(F1, &[], Limits::SERVICE);
+    parameter_fails_after_the_load(&mut i, None);
+    assert_eq!(f1(&i), 0x42);
+    assert_eq!(get(&mut i, "\\AFT"), 0x55);
+}
+
+/// The engine's frames stay 280 bytes with `Loading` and `Parameter` among them (B4's frame
+/// size, kept since `Loading` was cut to what the load's end needs).
+#[test]
+fn the_engines_frames_stay_280_bytes() {
+    assert_eq!(core::mem::size_of::<crate::engine::Frame>(), 280);
+}
+
 // --- The planted faults ------------------------------------------------------------------------
 
 /// A fault planted, or none, and the tests it must fail (or pass).
