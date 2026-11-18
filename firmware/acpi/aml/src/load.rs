@@ -19,8 +19,8 @@
 //!
 //! **A load that fails other than by a limit** (a check, a duplicate name, any error in its term
 //! list) is rolled back whole, names and bytes, and its operator gives Zero; the evaluation goes on
-//! ([`Interpreter::fail_load_at`], from `run_frames`). A limit ends the evaluation, as everywhere,
-//! and the table is rolled back with it. **A load that completes stays**, even if the evaluation
+//! ([`Interpreter::fail_load_at`], from `run_frames`). A limit or a `Fatal` ends the evaluation,
+//! as everywhere, and the table is rolled back with it (`Fatal`: B4-2). **A load that completes stays**, even if the evaluation
 //! around it fails later: AML has no transactions (B4's contract, Q8).
 //!
 //! **Strict choices**, each recorded in the research ledger (§9):
@@ -458,9 +458,17 @@ impl<H: Host> Interpreter<H> {
     }
 
     /// The nearest load an error `e` inside the evaluation above `base` fails: the top
-    /// [`Loading`] frame, unless `e` is a limit, which ends the evaluation whatever it was in.
+    /// [`Loading`] frame, unless `e` is a limit or a `Fatal`, which end the evaluation whatever
+    /// it was in. `Fatal` asks the OS to log the error and shut down (§19.6.47), so no more
+    /// firmware code runs in that evaluation, a loaded table's included (the coordinating
+    /// session's ruling on the review of B4, B4-2, clarifying Q3).
     pub(crate) fn failing_load(&self, base: usize, e: &Error) -> Option<usize> {
-        if self.loading == 0 || matches!(e.kind, ErrorKind::Limit(_) | ErrorKind::Pending) {
+        if self.loading == 0
+            || matches!(
+                e.kind,
+                ErrorKind::Limit(_) | ErrorKind::Pending | ErrorKind::Fatal { .. }
+            )
+        {
             return None;
         }
         let at = self

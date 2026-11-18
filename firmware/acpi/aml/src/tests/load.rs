@@ -327,6 +327,56 @@ fn a_return_in_a_loaded_table_fails_its_load() {
 }
 
 #[test]
+fn r5_a_fatal_inside_a_loaded_table_ends_the_evaluation() {
+    // The review of B4, B4-2: §19.6.47 asks the OS to log and shut down, so no more firmware
+    // code runs after a `Fatal`, inside a loaded table as in a method. The table is rolled back
+    // and traced as `abort` does for a limit.
+    let fatal_at_load = ssdt(&[name("QF0", one()), fatal(1, 2, byte(3))]);
+    let mut i = loaded(
+        IntegerWidth::Bits64,
+        &[
+            name("TB", buffer_of(&fatal_at_load)),
+            name("RES", int(5)),
+            name("AFT", zero()),
+            m(
+                "LD",
+                &[
+                    load_op("TB", nm("RES")),
+                    store(byte(0x55), nm("AFT")),
+                    ret(byte(77)),
+                ],
+            ),
+        ],
+    );
+    let (nodes, first) = (i.node_count(), i.table_count() as u32);
+    i.host_mut().events = Some(Vec::new());
+    let fatal = ErrorKind::Fatal {
+        kind: 1,
+        code: 2,
+        arg: 3,
+    };
+    assert_eq!(fails(&mut i, "LD"), fatal);
+    let events: Vec<Event> = i
+        .host_mut()
+        .events
+        .take()
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Load(_) | Event::Loaded(_)))
+        .collect();
+    assert_eq!(
+        events,
+        vec![Event::Load(*b"SSDT"), Event::Loaded(Err(fatal))]
+    );
+    assert_eq!(i.host().fatals, vec![(1, 2, 3)], "the host was told");
+    assert_eq!(get(&mut i, "AFT"), 0, "nothing ran after it");
+    assert_eq!(get(&mut i, "RES"), 5, "no result stored");
+    assert_eq!(i.node_count(), nodes);
+    assert!(i.table(first).unwrap().failed);
+    assert!(i.frames.is_empty() && i.owners.is_empty() && i.loading == 0);
+}
+
+#[test]
 fn a_table_loaded_twice_fails_at_its_first_duplicate() {
     // Q7.
     let mut i = loaded(
