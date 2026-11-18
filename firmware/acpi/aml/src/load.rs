@@ -122,7 +122,7 @@ impl<H: Host> Interpreter<H> {
         #[cfg(test)]
         let checked = checked.or_else(|| {
             crate::tests::planted(crate::tests::Fault::LoadUnchecked)
-                .then(|| unchecked_span(&bytes))
+                .then(|| crate::tests::unchecked_span(&bytes))
                 .flatten()
         });
         let started = match checked {
@@ -495,20 +495,4 @@ impl<H: Host> Interpreter<H> {
         }
         self.give_val(v)
     }
-}
-
-/// The span a planted fault loads without its checks (the tests' `LoadUnchecked`): the declared
-/// length within the bytes, whatever its checksum and signature.
-#[cfg(test)]
-fn unchecked_span(bytes: &[u8]) -> Option<tables::Table<'_>> {
-    let mut copy = bytes.to_vec();
-    let h = Header::read(&copy).ok()?;
-    let len = usize::try_from(h.length).ok()?;
-    copy.truncate(len);
-    // Fix the checksum on a copy, so that the check passes: what is planted is its absence.
-    copy[9] = 0;
-    let sum = copy.iter().fold(0u8, |s, &b| s.wrapping_add(b));
-    copy[9] = 0u8.wrapping_sub(sum);
-    let leaked: &'static [u8] = Vec::leak(copy);
-    tables::check(leaked).ok()
 }

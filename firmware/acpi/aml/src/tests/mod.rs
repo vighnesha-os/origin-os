@@ -373,6 +373,21 @@ pub(crate) fn planted(f: Fault) -> bool {
     FAULT.with(|c| c.get() == Some(f))
 }
 
+/// The span the planted fault `LoadUnchecked` loads without its checks (`load.rs`): the declared
+/// length within the bytes, whatever their checksum and signature. Here, not in `load.rs`, so
+/// that the library's files hold no allocation outside `mem.rs` (the allocation gate).
+pub(crate) fn unchecked_span(bytes: &[u8]) -> Option<origin_acpi_tables::header::Table<'static>> {
+    use origin_acpi_tables::header::{Header, check};
+    let h = Header::read(bytes).ok()?;
+    let mut copy = bytes.get(..usize::try_from(h.length).ok()?)?.to_vec();
+    // The checksum made right on a copy, so that the check passes: what is planted is its
+    // absence.
+    copy[9] = 0;
+    let sum = copy.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+    copy[9] = 0u8.wrapping_sub(sum);
+    check(Vec::leak(copy)).ok()
+}
+
 /// Plants `f` on this thread (or none).
 pub(crate) fn plant(f: Option<Fault>) {
     FAULT.with(|c| c.set(f));
