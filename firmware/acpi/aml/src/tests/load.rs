@@ -377,6 +377,45 @@ fn r5_a_fatal_inside_a_loaded_table_ends_the_evaluation() {
 }
 
 #[test]
+fn break_and_continue_in_a_loaded_table_stop_at_its_block() {
+    // The hand-over's point 2, agreed by the review: `leave_loop` meets the table's block and
+    // answers `NotInLoop`, so the load fails with Zero and its names go; the method's own loop
+    // around the `Load` is not left, and runs all its passes.
+    for stray in [brk(), cont()] {
+        let t = ssdt(&[name("QA0", one()), stray]);
+        let mut i = loaded(
+            IntegerWidth::Bits64,
+            &[
+                name("TB", buffer_of(&t)),
+                name("CNT", zero()),
+                m(
+                    "LD",
+                    &[
+                        while_(
+                            logic(0x95, nm("CNT"), byte(3)),
+                            &[increment(nm("CNT")), store(load_op("TB", none()), local(0))],
+                        ),
+                        ret(nm("CNT")),
+                    ],
+                ),
+            ],
+        );
+        i.host_mut().events = Some(Vec::new());
+        assert_eq!(get(&mut i, "LD"), 3, "the method's loop ran all its passes");
+        let ended: Vec<Event> = i
+            .host_mut()
+            .events
+            .take()
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(e, Event::Loaded(_)))
+            .collect();
+        assert_eq!(ended, vec![Event::Loaded(Err(ErrorKind::NotInLoop)); 3]);
+        assert_eq!(named(&i, b"QA"), 0);
+    }
+}
+
+#[test]
 fn a_table_loaded_twice_fails_at_its_first_duplicate() {
     // Q7.
     let mut i = loaded(
@@ -1403,5 +1442,42 @@ fn planted_faults_are_caught_by_the_load_tests() {
             plant(None);
             assert_eq!(failed, f.is_some(), "{f:?}: case {case:?}");
         }
+    }
+}
+
+// --- CL41's indicative figure ------------------------------------------------------------------
+
+/// The harness behind CL41's indicative figure for the check a table passes before `Load` or
+/// `LoadTable` runs it (`origin-acpi-tables`' header, length and checksum; the review of B4's
+/// records): tables of 36 bytes to 496,594 (the discovery machine's DSDT), each checked in a
+/// loop of about 200 MB, seven times, the median printed. Run by hand, in release:
+/// `cargo test --release -p origin-aml --lib tests::load::cl41_table_check_cost -- --ignored
+/// --nocapture`.
+#[test]
+#[ignore = "a measurement, run by hand in release for CL41"]
+fn cl41_table_check_cost() {
+    for len in [36usize, 1024, 8_557, 65_536, 496_594] {
+        let t = ssdt(&[vec![0xA3u8; len - 36]]);
+        assert_eq!(t.len(), len);
+        let rounds = (200_000_000 / len).max(20);
+        let mut times = Vec::new();
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            for _ in 0..rounds {
+                let r =
+                    origin_acpi_tables::header::check_signature(std::hint::black_box(&t), b"SSDT");
+                std::hint::black_box(r.is_ok());
+            }
+            times.push(start.elapsed().as_nanos() as f64 / rounds as f64);
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "CL41: {len} bytes: median {:.1} ns (min {:.1}, max {:.1}; {:.3} ns a byte), {rounds} \
+             checks a run, 7 runs",
+            times[3],
+            times[0],
+            times[6],
+            times[3] / len as f64
+        );
     }
 }
