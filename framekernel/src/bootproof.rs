@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn the_table_has_one_row_per_proof_in_order() {
-        assert_eq!(Proof::ALL.len(), 69);
+        assert_eq!(Proof::ALL.len(), 71);
         for (i, &proof) in Proof::ALL.iter().enumerate() {
             assert_eq!(proof as usize, i, "{proof:?} is out of order");
             assert!(!proof.name().is_empty(), "{proof:?} has no name");
