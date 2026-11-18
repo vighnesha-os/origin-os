@@ -184,7 +184,7 @@ impl<H: Host> Interpreter<H> {
                 let kept = self.release_held(marks.held);
                 match r {
                     Err(e) => {
-                        self.abort(marks);
+                        self.abort(marks, &e);
                         Err(e)
                     }
                     Ok(_) if kept => Err(Error::new(ErrorKind::MutexHeld)),
@@ -192,14 +192,11 @@ impl<H: Host> Interpreter<H> {
                 }
             }
             Err(e) => {
-                self.abort(marks);
+                self.abort(marks, &e);
                 Err(e)
             }
         };
         self.end_evaluation();
-        if let Err(e) = &out {
-            self.trace_limit(e);
-        }
         out
     }
 

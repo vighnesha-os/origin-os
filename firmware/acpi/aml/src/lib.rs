@@ -29,11 +29,12 @@
 //! mark-and-sweep collector at safe points between steps; every allocation goes through `mem.rs`,
 //! which charges it to the memory limit before it is made.
 //!
-//! **What is built** (steps B1 and B2 of TASKS item 63): the whole parser, the namespace, every
-//! operator, field units over every region space through the host, mutexes and the Global Lock,
-//! events, the device initialization walk ([`Interpreter::initialize`]) and `_REG`
-//! ([`Interpreter::connect_space`]). `Load` and `LoadTable` answer
-//! [`ErrorKind::NotSupported`] until `origin-acpi-tables` checks the tables they read.
+//! **What is built** (steps B1, B2 and B4 of TASKS item 63): the whole parser, the namespace,
+//! every operator, field units over every region space through the host, mutexes and the Global
+//! Lock, events, the device initialization walk ([`Interpreter::initialize`]) and `_REG`
+//! ([`Interpreter::connect_space`]). `Load` and `LoadTable` load a table while an evaluation
+//! runs, on the engine's frame stack, after `origin-acpi-tables` has checked it (`load.rs`).
+//! `Unload` is refused (G8).
 //!
 //! Sources: ACPI 6.6 and Microsoft's `_OSI` documentation only, paraphrased
 //! (`docs/research/2026-11-14-aml-interpreter.md`). No other interpreter's source was read.
@@ -63,6 +64,7 @@ mod error;
 mod exec;
 mod host;
 mod init;
+mod load;
 mod mem;
 mod name;
 mod namespace;
@@ -80,7 +82,7 @@ mod value;
 mod tests;
 
 pub use config::{Config, DefinitionBlock, IntegerWidth, Limits};
-pub use error::{At, Error, ErrorKind, Feature, Limit, Result};
+pub use error::{At, Error, ErrorKind, Limit, Result};
 pub use host::{
     BridgeBus, BufferAccess, Host, HostError, PciAddress, RegionAccess, Space, TableKey, Trace,
 };
@@ -161,6 +163,12 @@ pub struct Interpreter<H: Host> {
     nested: u32,
     /// The region whose function an access is waiting for (`pci.rs`).
     pending: Option<object::NodeId>,
+    /// How many `Loading` frames are on the stack (`load.rs`).
+    loading: u32,
+    /// The activations there were when the innermost table being loaded began: while there are
+    /// as many, the code running is that table's table level (`load.rs`), or `usize::MAX` when
+    /// no table is being loaded (the review of B4's addendum, B4-13).
+    load_calls: usize,
     /// How many `Resolve` frames are on the stack.
     resolving: u32,
     /// How many holds of the Global Lock the running evaluation has: the host holds it for all

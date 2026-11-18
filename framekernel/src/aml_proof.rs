@@ -572,6 +572,10 @@ fn cut_off(
 /// The reason a proof past its bound gives.
 const CUT_OFF: &str = "the proof was cut off by its bound";
 
+/// The reason a proof gives when the DSDT's checked read is not the one whose IDs were judged
+/// (the review of B4, B4-9).
+const CHANGED: &str = "the DSDT changed between two reads";
+
 /// The proof: the definition blocks from the RSDP at `rsdp_addr` through `fw`, loaded and run
 /// against `host` (wrapped in a [`Recorder`]) under `limits`, if they are QEMU's; `heap` reads the
 /// kernel heap's bytes in use, before the proof and after the interpreter is dropped;
@@ -703,27 +707,42 @@ fn lend_if(
     Ok(Some((fw.lend(addr, length)?, header)))
 }
 
+/// Why [`find_dsdt`] found no DSDT.
+enum NoDsdt {
+    /// The proof's bound passed while the XSDT was searched for a FADT: the proof fails with the
+    /// bound's own reason (the review of B3's addendum, B3-14).
+    Cut,
+    /// Anything else, said.
+    Because(&'static str),
+}
+
+impl From<&'static str> for NoDsdt {
+    fn from(why: &'static str) -> Self {
+        Self::Because(why)
+    }
+}
+
 /// The DSDT's address, from the first FADT the XSDT at `rsdp_addr` lists, and the XSDT. The
 /// search stops at the proof's time bound.
 fn find_dsdt(
     fw: &mut impl Firmware,
     rsdp_addr: u64,
     bound: &Bound,
-) -> Result<(&'static [u8], u64), &'static str> {
+) -> Result<(&'static [u8], u64), NoDsdt> {
     let rsdp = fw.lend(rsdp_addr, crate::acpi::RSDP_LENGTH)?;
     let rsdp = crate::acpi::parse_rsdp(rsdp).map_err(|_| "the RSDP is invalid")?;
     let (xsdt, _) = lend_if(fw, rsdp.xsdt, &[b"XSDT"])?.ok_or("the XSDT is not one")?;
     header::check_signature(xsdt, b"XSDT").map_err(|_| "the XSDT is refused")?;
     for addr in crate::acpi::xsdt_entries(xsdt).filter(|&a| a != 0) {
         if bound.passed(fw.now(), 0) {
-            return Err("the proof's bound passed while the XSDT was searched for a FADT");
+            return Err(NoDsdt::Cut);
         }
         if let Ok(Some((fadt, _))) = lend_if(fw, addr, &[b"FACP"]) {
             let fadt = Fadt::parse(fadt).map_err(|_| "the FADT is refused")?;
             return Ok((xsdt, fadt.dsdt_address().ok_or("the FADT names no DSDT")?));
         }
     }
-    Err("the XSDT lists no FADT")
+    Err(NoDsdt::Because("the XSDT lists no FADT"))
 }
 
 /// Loads the tables, checks the named results and walks the namespace, recording what was found
@@ -739,12 +758,50 @@ fn interpret<H: Host>(
     let bound = Bound::of(&limits, fw.now());
     let (xsdt, dsdt_addr) = match find_dsdt(fw, rsdp_addr, &bound) {
         Ok(found) => found,
-        Err(why) => {
+        Err(NoDsdt::Cut) => {
+            let _ = writeln!(
+                out,
+                "{LINE}cut off by the proof's bound ({} us, {} steps) before the XSDT's search for a FADT ended",
+                bound.time_ns / 1000,
+                bound.steps
+            );
+            found.fail(CUT_OFF);
+            return;
+        }
+        Err(NoDsdt::Because(why)) => {
             let _ = writeln!(out, "{LINE}no DSDT: {why}");
             found.fail("no DSDT");
             return;
         }
     };
+    // Only QEMU's own tables (B3-2), judged by the IDs in the header as copied, before any
+    // checksum (the review of B3's addendum, B3-13): trusting unchecked IDs to decide not to run
+    // is the safe direction, and only QEMU's IDs then need the table checked whole. A header that
+    // cannot be copied tells nobody whose tables these are, and fails as before (Q1 of B4's
+    // contract).
+    let mut first = [0u8; HEADER_LEN];
+    let copied = fw
+        .copy(dsdt_addr, &mut first)
+        .ok()
+        .and_then(|()| Header::read(&first).ok());
+    let Some(ids) = copied else {
+        let _ = writeln!(
+            out,
+            "{LINE}the DSDT: not readable: its header cannot be copied"
+        );
+        found.fail("no DSDT");
+        return;
+    };
+    if (ids.oem_id, ids.oem_table_id) != QEMU_DSDT {
+        let _ = writeln!(
+            out,
+            "{LINE}the DSDT's OEM ID \"{}\" and OEM table ID \"{}\" are not QEMU's: the proof runs only on QEMU's own tables (ADR-0019 A3) and ran no AML; passed",
+            Escaped(&ids.oem_id),
+            Escaped(&ids.oem_table_id)
+        );
+        found.not_run = true;
+        return;
+    }
     let dsdt = match lend_if(fw, dsdt_addr, &[b"DSDT"]) {
         Ok(Some((bytes, header))) => checked(out, "the DSDT", bytes, &header),
         Ok(None) => {
@@ -760,16 +817,18 @@ fn interpret<H: Host>(
         found.fail("no DSDT");
         return;
     };
-    // Only QEMU's own tables (B3-2): read from the header `Checked::parse` has checked.
+    // The IDs that decided to run were read from one copy of the header, and the table that is
+    // checked and run is another read: its IDs must be QEMU's too, or the rule "only QEMU's
+    // tables run" would rest on bytes the AML did not come from (the review of B4, B4-9).
     let h = dsdt.table().header();
     if (h.oem_id, h.oem_table_id) != QEMU_DSDT {
         let _ = writeln!(
             out,
-            "{LINE}the DSDT's OEM ID \"{}\" and OEM table ID \"{}\" are not QEMU's: the proof runs only on QEMU's own tables (ADR-0019 A3) and ran no AML; passed",
+            "{LINE}the DSDT changed between two reads: the checked table's OEM ID \"{}\" and OEM table ID \"{}\" are not QEMU's, though its first header's were",
             Escaped(&h.oem_id),
             Escaped(&h.oem_table_id)
         );
-        found.not_run = true;
+        found.fail(CHANGED);
         return;
     }
     let width = IntegerWidth::from_dsdt_revision(dsdt.table().revision());
@@ -1046,11 +1105,6 @@ fn named_results<H: Host>(
             "\\_SB.PCI0._HID",
             Want::Integer(PCIE_ROOT_BRIDGE),
         ),
-        check(
-            "\\_SB.PCI0._CRS a template",
-            "\\_SB.PCI0._CRS",
-            Want::Template,
-        ),
         Check {
             args: || fallible::string_arg(b"Windows 2022"),
             ..check(
@@ -1064,6 +1118,14 @@ fn named_results<H: Host>(
             ..check("\\_OSI (\"Linux\") Zero", "\\_OSI", Want::Integer(0))
         },
         check("\\_REV 2", "\\_REV", Want::Integer(origin_aml::REV)),
+        // Last, so that a test can make the last result costly: QEMU's `_CRS` is a name, but a
+        // table may make it a method (the review of B3's addendum, B3-14, the check before the
+        // walk).
+        check(
+            "\\_SB.PCI0._CRS a template",
+            "\\_SB.PCI0._CRS",
+            Want::Template,
+        ),
     ];
     let _ = write!(out, "{LINE}named results:");
     let mut all = true;

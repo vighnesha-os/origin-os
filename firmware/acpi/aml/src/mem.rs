@@ -60,20 +60,23 @@ impl Budget {
         self.charged
     }
 
+    /// The limit as the checks apply it. Planted, it is twice its value, in [`Budget::charge`] and
+    /// in [`reserve`]'s room alike: weakened, not removed, so that a test planting it never asks
+    /// the machine for more than twice the limit; and weakened in both, so that whether the
+    /// control is caught does not hang on which of the two refuses first (B4: the frame stack's
+    /// elements changing size once moved the refusal from one to the other).
+    fn applied_limit(&self) -> usize {
+        #[cfg(test)]
+        if crate::tests::planted(crate::tests::Fault::LooseMemoryLimit) {
+            return self.limit.saturating_mul(2);
+        }
+        self.limit
+    }
+
     /// Charges `bytes`, or refuses them if the limit would be passed.
     fn charge(&mut self, bytes: usize) -> Result<()> {
         let used = self.used.checked_add(bytes).ok_or_else(memory)?;
-        // Planted, the limit is checked at twice its value: weakened, not removed, so that a
-        // test planting it never asks the machine for more than twice the limit.
-        #[cfg(test)]
-        let used_checked = if crate::tests::planted(crate::tests::Fault::LooseMemoryLimit) {
-            used / 2
-        } else {
-            used
-        };
-        #[cfg(not(test))]
-        let used_checked = used;
-        if used_checked > self.limit {
+        if used > self.applied_limit() {
             return Err(memory());
         }
         self.used = used;
@@ -137,7 +140,7 @@ pub(crate) fn reserve<T>(v: &mut Vec<T>, additional: usize, budget: &mut Budget)
     }
     let doubled = have.saturating_mul(2).max(4).max(need);
     let room = budget
-        .limit
+        .applied_limit()
         .saturating_sub(budget.used)
         .checked_div(size_of::<T>())
         .unwrap_or(usize::MAX);

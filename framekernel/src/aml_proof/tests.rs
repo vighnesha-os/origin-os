@@ -79,10 +79,18 @@ fn qemu_dsdt(extra: &[B]) -> Vec<u8> {
 
 /// As [`qemu_dsdt`], of `revision`.
 fn qemu_dsdt_of(revision: u8, extra: &[B]) -> Vec<u8> {
+    qemu_dsdt_with(revision, &[], name("_CRS", buffer(byte(18), &CRS)), extra)
+}
+
+/// As [`qemu_dsdt_of`], with `pic_more` run in `\_PIC` after its store, and `crs` in place of the
+/// root bridge's `_CRS` name: for the tests that make a named result costly (B3-14).
+fn qemu_dsdt_with(revision: u8, pic_more: &[B], crs: B, extra: &[B]) -> Vec<u8> {
+    let mut pic = vec![store(arg(0), nm("PICF"))];
+    pic.extend_from_slice(pic_more);
     let mut body = vec![
         name("\\_S5_", package(4, &[zero(), zero(), zero(), zero()])),
         name("PICF", zero()),
-        method("_PIC", 1, &[store(arg(0), nm("PICF"))]),
+        method("_PIC", 1, &pic),
         scope(
             "\\_SB_",
             &[
@@ -91,7 +99,7 @@ fn qemu_dsdt_of(revision: u8, extra: &[B]) -> Vec<u8> {
                     &[
                         name("_HID", dword(0x080A_D041)),
                         name("_ADR", zero()),
-                        name("_CRS", buffer(byte(18), &CRS)),
+                        crs,
                         device(
                             "SF8_",
                             &[
@@ -261,6 +269,10 @@ struct Machine {
     entries: Vec<u64>,
     /// The stack's lowest address, if the test knows it.
     stack_floor: Option<usize>,
+    /// How far the firmware's clock moves at each reading, in nanoseconds (B3-14's time half).
+    tick: u64,
+    /// What a copy of the DSDT's header reads, where it differs from the table lent (B4-9).
+    dsdt_header_copy: Option<Vec<u8>>,
 }
 
 impl Machine {
@@ -271,6 +283,8 @@ impl Machine {
             dsdt_at: DSDT,
             entries: Vec::new(),
             stack_floor: None,
+            tick: 0,
+            dsdt_header_copy: None,
         }
     }
 
@@ -314,6 +328,9 @@ impl Machine {
         put(RSDP, &rsdp);
         let mut fw = Memory {
             bytes: Vec::leak(memory),
+            clock: core::cell::Cell::new(0),
+            tick: self.tick,
+            header_copy: self.dsdt_header_copy.clone().map(|h| (self.dsdt_at, h)),
         };
         let mut out = String::new();
         let found = run(
@@ -334,9 +351,14 @@ impl Machine {
     }
 }
 
-/// Firmware memory at [`BASE`].
+/// Firmware memory at [`BASE`], and a clock that moves by `tick` at each reading.
 struct Memory {
     bytes: &'static [u8],
+    clock: core::cell::Cell<u64>,
+    tick: u64,
+    /// A header that a copy at this address reads in place of memory's: firmware memory that
+    /// changed between the proof's reads (B4-9).
+    header_copy: Option<(u64, Vec<u8>)>,
 }
 
 impl Memory {
@@ -356,11 +378,20 @@ impl Firmware for Memory {
         self.range(addr, len)
     }
     fn copy(&mut self, addr: u64, out: &mut [u8]) -> Result<(), &'static str> {
+        if let Some((at, header)) = &self.header_copy
+            && *at == addr
+            && let Some(h) = header.get(..out.len())
+        {
+            out.copy_from_slice(h);
+            return Ok(());
+        }
         out.copy_from_slice(self.range(addr, out.len())?);
         Ok(())
     }
     fn now(&self) -> u64 {
-        0
+        let now = self.clock.get();
+        self.clock.set(now + self.tick);
+        now
     }
 }
 
@@ -466,7 +497,7 @@ fn a_qemu_shaped_machine_passes() {
     assert!(out.contains(": loaded as table 1"), "{out}");
     assert!(
         out.contains(
-            "origin-kernel: aml: named results: \\_S5_ true; \\PICF 0 true; \\_PIC (1) true; \\PICF 1 true; \\_SB.PCI0._HID PNP0A08 true; \\_SB.PCI0._CRS a template true; \\_OSI (\"Windows 2022\") Ones true; \\_OSI (\"Linux\") Zero true; \\_REV 2 true; all true"
+            "origin-kernel: aml: named results: \\_S5_ true; \\PICF 0 true; \\_PIC (1) true; \\PICF 1 true; \\_SB.PCI0._HID PNP0A08 true; \\_OSI (\"Windows 2022\") Ones true; \\_OSI (\"Linux\") Zero true; \\_REV 2 true; \\_SB.PCI0._CRS a template true; all true"
         ),
         "{out}"
     );
@@ -899,10 +930,62 @@ fn tables_that_are_not_qemus_run_nothing_and_pass() {
     assert_eq!(out.lines().count(), 1, "{out}");
 }
 
-/// The ID is read from the header `origin-acpi-tables` checked: QEMU's IDs on a DSDT whose
-/// checksum is wrong are not trusted, and the proof fails as for any refused DSDT.
+/// B3-13: the IDs decide before any checksum. Other IDs on a DSDT whose checksum is wrong: the
+/// proof does not run, and passes; the census, which checks every table, reports the checksum.
 #[test]
-fn the_id_is_read_only_from_a_checked_header() {
+fn other_ids_with_a_bad_checksum_are_not_run() {
+    let mut dsdt = table(b"DSDT", 2, &[name("XTRA", one())]);
+    dsdt[9] ^= 1;
+    let (found, out) = Machine::new(dsdt).run();
+    assert!(found.not_run && found.passed(), "{out}");
+    assert!(out.contains("are not QEMU's"), "{out}");
+}
+
+/// QEMU's IDs on a DSDT whose header cannot be read past its first bytes: as before, the proof
+/// cannot tell whose tables these are and fails (Q1 of B4's contract).
+#[test]
+fn a_dsdt_whose_header_cannot_be_copied_fails_the_proof() {
+    let mut m = Machine::new(qemu_dsdt(&[]));
+    m.dsdt_at = LOW;
+    let (found, out) = m.run();
+    assert_eq!(found.failed, Some("no DSDT"), "{out}");
+    assert!(
+        out.contains("origin-kernel: aml: the DSDT: not readable: its header cannot be copied"),
+        "{out}"
+    );
+}
+
+/// B4-9: the header the IDs were judged on says QEMU, the table lent and checked does not (its
+/// table ID changed, its checksum sound): firmware memory that changed between the two reads.
+/// The proof fails with a reason of its own, first, and runs no AML.
+#[test]
+fn a_dsdt_that_changes_between_two_reads_fails_the_proof() {
+    let qemu = qemu_dsdt(&[]);
+    let mut other = qemu.clone();
+    other[16..24].copy_from_slice(b"OTHERFW ");
+    other[9] = 0;
+    other[9] = 0u8.wrapping_sub(other.iter().fold(0u8, |s, &b| s.wrapping_add(b)));
+    let mut m = Machine::new(other);
+    m.dsdt_header_copy = Some(qemu[..36].to_vec());
+    let (found, out) = m.run();
+    assert_eq!(
+        found.failed,
+        Some("the DSDT changed between two reads"),
+        "{out}"
+    );
+    assert!(!found.not_run, "{out}");
+    assert!(
+        out.contains("the checked table's OEM ID \"BOCHS \" and OEM table ID \"OTHERFW \""),
+        "{out}"
+    );
+    assert!(!out.contains("loaded as table"), "no AML ran: {out}");
+}
+
+/// QEMU's IDs on a DSDT whose checksum is wrong: the IDs say the tables are QEMU's, so the whole
+/// table must pass `origin-acpi-tables`' check before any of it runs, and here it does not: the
+/// proof fails as for any refused DSDT (B3-13 keeps this; the review of B4, B4-7).
+#[test]
+fn qemus_ids_with_a_bad_checksum_fail_no_dsdt() {
     let mut dsdt = qemu_dsdt(&[]);
     dsdt[9] ^= 1;
     let (found, out) = Machine::new(dsdt).run();
@@ -994,6 +1077,189 @@ fn a_proof_past_its_whole_bound_fails_with_that_reason() {
         !out.contains("load failed"),
         "each table fit one evaluation: {out}"
     );
+}
+
+// --- B3-14: each check of the proof's bound first, and its time half ------------------------------
+
+/// The step limit of the bound tests: the whole proof's bound is [`WHOLE`] times it.
+const L: u64 = 100_000;
+
+fn bound_limits() -> Limits {
+    Limits {
+        steps: L,
+        ..Limits::BOOT_PROOF
+    }
+}
+
+/// An SSDT whose table-level code calls a method of its own that counts to `n` in a local, which
+/// allocates nothing, so that its cost grows linearly with `n` (`k` names the method).
+fn loading_ssdt(k: usize, n: u64) -> Vec<u8> {
+    let method_name = alloc::format!("\\CNT{k}");
+    table(
+        b"SSDT",
+        1,
+        &[
+            method(&method_name, 0, &counting(n)),
+            call(&method_name, &[]),
+        ],
+    )
+}
+
+/// A method body that counts to `n` in `Local0`.
+fn counting(n: u64) -> Vec<B> {
+    vec![
+        store(zero(), local(0)),
+        while_(
+            logic(0x95, local(0), encode::int(n)),
+            &[increment(local(0))],
+        ),
+    ]
+}
+
+/// The steps one iteration of [`loading_ssdt`]'s loop and of [`counting`]'s costs, measured with
+/// the interpreter itself (rounded up), so that the tests below put each cost where they mean to.
+fn per_iteration() -> (u64, u64) {
+    let fresh = || {
+        Interpreter::new(
+            BootHost::new(still),
+            Config {
+                limits: bound_limits(),
+            },
+            IntegerWidth::Bits32,
+        )
+        .unwrap()
+    };
+    let load = |i: &mut Interpreter<BootHost>, t: &[u8]| {
+        let c = Checked::parse(t).unwrap();
+        let h = c.table().header();
+        i.load(DefinitionBlock {
+            signature: h.signature.0,
+            oem_id: h.oem_id,
+            oem_table_id: h.oem_table_id,
+            aml: c.aml(),
+        })
+        .unwrap();
+    };
+    let table_steps = |n| {
+        let mut i = fresh();
+        load(&mut i, &loading_ssdt(0, n));
+        i.steps_done()
+    };
+    let method_steps = |n| {
+        let mut i = fresh();
+        load(
+            &mut i,
+            &table(b"SSDT", 1, &[method("CNTM", 0, &counting(n))]),
+        );
+        let before = i.steps_done();
+        i.evaluate("\\CNTM", &[]).unwrap();
+        i.steps_done() - before
+    };
+    (
+        (table_steps(1000) - table_steps(0)).div_ceil(1000),
+        (method_steps(1000) - method_steps(0)).div_ceil(1000),
+    )
+}
+
+/// QEMU's tables with three SSDTs that each load at nine tenths of the step limit, so that the
+/// loads stay within the whole bound (three times it) and half the limit more passes it.
+fn three_loads(dsdt: Vec<u8>, per_table: u64) -> Machine {
+    let mut m = Machine::new(dsdt);
+    for k in 0..3 {
+        m.ssdts.push(loading_ssdt(k, 9 * L / 10 / per_table));
+    }
+    m
+}
+
+/// The bound passed during `\_PIC`: the check before the next named result sees it first.
+#[test]
+fn the_bound_passed_in_a_named_result_is_seen_before_the_next() {
+    let (per_table, per_method) = per_iteration();
+    let dsdt = qemu_dsdt_with(
+        1,
+        &counting(L / 2 / per_method),
+        name("_CRS", buffer(byte(18), &CRS)),
+        &[],
+    );
+    let (found, out) =
+        three_loads(dsdt, per_table)
+            .run_with(BootHost::new(still), bound_limits(), &mut || Some(0));
+    assert_eq!(found.failed, Some(CUT_OFF), "{out}");
+    assert!(
+        out.contains("\\_PIC (1) true; cut off by the proof's bound before \\PICF 1"),
+        "{out}"
+    );
+    assert_eq!(found.tables, 4, "{out}");
+}
+
+/// The bound passed during the last named result (a `_CRS` method): the check before the walk
+/// sees it first.
+#[test]
+fn the_bound_passed_in_the_last_named_result_is_seen_before_the_walk() {
+    let (per_table, per_method) = per_iteration();
+    let mut crs = counting(L / 2 / per_method);
+    crs.push(ret(buffer(byte(18), &CRS)));
+    let dsdt = qemu_dsdt_with(1, &[], method("_CRS", 0, &crs), &[]);
+    let (found, out) =
+        three_loads(dsdt, per_table)
+            .run_with(BootHost::new(still), bound_limits(), &mut || Some(0));
+    assert_eq!(found.failed, Some(CUT_OFF), "{out}");
+    assert!(
+        out.contains("\\_SB.PCI0._CRS a template true; all true"),
+        "{out}"
+    );
+    assert!(
+        out.contains("origin-kernel: aml: cut off by the proof's bound (3000000 us, 300000 steps) before the walk"),
+        "{out}"
+    );
+}
+
+/// The bound passed during the walk (a device's `_STA`, within the walk's own bound): the check
+/// before the first classification sees it.
+#[test]
+fn the_bound_passed_in_the_walk_is_seen_before_a_classification() {
+    let (per_table, per_method) = per_iteration();
+    let mut sta = counting(L / 2 / per_method);
+    sta.push(ret(byte(0x0F)));
+    let dsdt = qemu_dsdt(&[scope(
+        "\\_SB_",
+        &[device("SLW0", &[method("_STA", 0, &sta)])],
+    )]);
+    let (found, out) =
+        three_loads(dsdt, per_table)
+            .run_with(BootHost::new(still), bound_limits(), &mut || Some(0));
+    assert_eq!(found.failed, Some(CUT_OFF), "{out}");
+    assert!(
+        out.contains("origin-kernel: aml: cut off by the proof's bound (3000000 us, 300000 steps) before a classification"),
+        "{out}"
+    );
+    assert!(!out.contains("before the walk"), "{out}");
+}
+
+/// The bound's time half: a firmware clock that moves four seconds at each reading passes it at
+/// the FADT search's first check, which fails with the bound's own reason.
+#[test]
+fn the_bound_passed_in_the_fadt_search_fails_with_its_own_reason() {
+    let mut m = Machine::new(qemu_dsdt(&[]));
+    m.tick = 4_000_000_000;
+    let (found, out) = m.run();
+    assert_eq!(found.failed, Some(CUT_OFF), "{out}");
+    assert!(
+        out.contains("origin-kernel: aml: cut off by the proof's bound (3000000 us, 30000000 steps) before the XSDT's search for a FADT ended"),
+        "{out}"
+    );
+    assert!(!out.contains("no DSDT"), "{out}");
+}
+
+/// The bound's time half at a later check: a clock that moves 0.4 s a reading, the steps far from
+/// their half.
+#[test]
+fn the_bounds_time_half_cuts_the_proof() {
+    let mut m = Machine::new(qemu_dsdt(&[]));
+    m.tick = 400_000_000;
+    let (found, out) = m.run();
+    assert_eq!(found.failed, Some(CUT_OFF), "{out}");
+    assert!(out.contains("cut off by the proof's bound"), "{out}");
 }
 
 // --- B3-5: each branch of the verdict, first ----------------------------------------------------
@@ -1093,7 +1359,8 @@ fn outcomes_that_cannot_be_kept_fail_the_proof() {
 /// The FADT's DSDT pointer names a table that is not a DSDT.
 #[test]
 fn a_dsdt_pointer_to_another_table_fails_the_proof() {
-    let (found, out) = Machine::new(table(b"SSDT", 1, &[])).run();
+    // With QEMU's IDs, so that it is judged as QEMU's DSDT (B3-13).
+    let (found, out) = Machine::new(qemu_ids(table(b"SSDT", 1, &[]))).run();
     assert_eq!(found.failed, Some("no DSDT"), "{out}");
     assert!(
         out.contains("origin-kernel: aml: the DSDT: not one"),

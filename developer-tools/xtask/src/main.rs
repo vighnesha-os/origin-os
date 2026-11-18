@@ -2533,7 +2533,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: M1 entry complete; halting".into(),
         ])
         .collect(),
-        failures: boot_failures(),
+        failures: qemu_boot_failures(),
         check: Some(check_kernel_boot),
         stderr: vec![],
         capture: Capture::Com1AndScreen,
@@ -2644,7 +2644,21 @@ fn check_kernel_boot(done: &Completed) -> Result {
     check_screen(done)
 }
 
-/// Output that fails any kernel boot the moment it appears.
+/// What fails a kernel boot under QEMU alone, and never a physical machine's (the review of TASKS 63's
+/// B3 addendum, B3-18): on QEMU's tables the AML proof must run, so its line saying the tables are
+/// not QEMU's ends the boot at once, not at the boot test's timeout on a missing marker. On a
+/// physical machine that line is the right result, so a checker of a physical boot takes
+/// [`boot_failures`] alone, never this list.
+const QEMU_ONLY_FAILURES: &[&str] = &["are not QEMU's: the proof runs only"];
+
+/// [`boot_failures`] and [`QEMU_ONLY_FAILURES`]: what xtask's QEMU scenarios fail on.
+fn qemu_boot_failures() -> Vec<&'static str> {
+    let mut failures = boot_failures();
+    failures.extend_from_slice(QEMU_ONLY_FAILURES);
+    failures
+}
+
+/// Output that fails any kernel boot the moment it appears, under QEMU or on a machine.
 fn boot_failures() -> Vec<&'static str> {
     vec![
         "origin-boot: panic:",
@@ -4006,7 +4020,7 @@ fn console_scenario(
         label,
         loader: Loader::Verifying,
         markers,
-        failures: boot_failures(),
+        failures: qemu_boot_failures(),
         check,
         stderr: vec![],
         capture,
@@ -4744,6 +4758,16 @@ fn check() -> Result {
         "--lib",
         "aml_proof::",
     ]))?;
+    // The same for the interpreter's nested loads: a load 1,200 calls deep on a 32 KiB thread,
+    // release only (TASKS item 63, step B4; the review of B4, B4-6).
+    run_step(cargo().args([
+        "test",
+        "--release",
+        "--package",
+        AML_PACKAGE,
+        "--lib",
+        "tests::load::nested_loads",
+    ]))?;
     // The loader in developer mode too (the boot test's variant).
     for loader in [Loader::Developer, Loader::Verifying] {
         run_step(cargo().args([
@@ -5019,6 +5043,15 @@ const NO_PANIC_AML_PARTS: &[&str] = &[
     "4core3fmt3num",
 ];
 
+/// The one library whose symbols `origin-aml`'s object may reference (TASKS item 63, B4's
+/// contract, Q11): `origin-acpi-tables`, which checks every table `Load`, `LoadTable` and
+/// `DataTableRegion` read. Two conditions make the allowance sound, and the check holds both:
+/// - only the symbols that library's own object defines are allowed, not those of any other
+///   freestanding library, nor anything that library itself references;
+/// - that library passes its own no-panic check, in the same run and before this allowance is
+///   used, so that what it defines is free of panic paths.
+const NO_PANIC_AML_LIBRARY: &str = "origin-acpi-tables";
+
 /// What `origin-aml`'s object must define: the concrete instantiation and the engine's loop.
 const NO_PANIC_AML_REQUIRED: &[&str] = &["14no_panic_probe", "10run_frames"];
 
@@ -5076,10 +5109,15 @@ fn no_panic_check() -> Result {
     }
     let mut defined = std::collections::HashSet::new();
     let mut referenced = Vec::new();
+    // What `origin-acpi-tables`' own object defines: all `origin-aml` may use of it (Q11).
+    let mut aml_library = std::collections::HashSet::new();
     for (package, obj) in &objects {
         let own = nm_symbols(&nm, obj, "--defined-only")?;
         let undefined = nm_symbols(&nm, obj, "-u")?;
         require_symbols(package, obj, own.len() + undefined.len())?;
+        if *package == NO_PANIC_AML_LIBRARY {
+            aml_library.extend(own.iter().cloned());
+        }
         if own.is_empty() && undefined.is_empty() {
             println!(
                 "xtask: no-panic check: {package} ({KERNEL_TARGET}, release) is all generic: no symbols of its own to check"
@@ -5111,6 +5149,12 @@ fn no_panic_check() -> Result {
             undefined.len()
         );
     }
+    // The library `origin-aml` may use passed above, or this run has already failed.
+    if !referenced.iter().any(|(p, _)| **p == NO_PANIC_AML_LIBRARY) {
+        return Err(format!(
+            "no-panic check: {NO_PANIC_AML_LIBRARY} was not checked, so {AML_PACKAGE} may not use it"
+        ));
+    }
     // The AML interpreter, with `alloc` (ADR-0019 A3): its own allowance, nothing else. Its
     // interpreter is generic over its host, so the object holds the engine only through
     // `no_panic_probe`, a concrete instantiation; the check requires it and the engine's loop in
@@ -5133,8 +5177,13 @@ fn no_panic_check() -> Result {
             !NO_PANIC_ALLOWED.contains(s)
                 && !NO_PANIC_ALLOWED_PARTS.iter().any(|p| s.contains(p))
                 && !NO_PANIC_AML_PARTS.iter().any(|p| s.contains(p))
+                && !aml_library.contains(*s)
         })
         .collect();
+    let from_library = undefined
+        .iter()
+        .filter(|s| aml_library.contains(*s))
+        .count();
     if !bad.is_empty() {
         return Err(format!(
             "{AML_PACKAGE}: the release object for {KERNEL_TARGET} references symbols outside its no-panic allowance:\n  {}",
@@ -5142,7 +5191,7 @@ fn no_panic_check() -> Result {
         ));
     }
     println!(
-        "xtask: no-panic check: {AML_PACKAGE} ({KERNEL_TARGET}, release, the interpreter instantiated by `no_panic_probe`: {} symbols of its own) references {} external symbols, all within its allowance (allocator entry points, an unreachable `handle_error`, `core::fmt`)",
+        "xtask: no-panic check: {AML_PACKAGE} ({KERNEL_TARGET}, release, the interpreter instantiated by `no_panic_probe`: {} symbols of its own) references {} external symbols, all within its allowance (allocator entry points, an unreachable `handle_error`, `core::fmt`, and {from_library} that {NO_PANIC_AML_LIBRARY}'s own object defines, which passed its check above)",
         own.len(),
         undefined.len()
     );
@@ -7927,6 +7976,22 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
         assert_eq!(number_before("a b", " b"), None);
         assert_eq!(number_before("a 1x b", " b"), None);
         assert_eq!(number_before("a 12", " b"), None);
+    }
+
+    /// B3-18: the not-QEMU line fails the QEMU scenarios, and a physical boot's list stays
+    /// without it. The phrase is the AML proof's own (`aml_proof.rs`).
+    #[test]
+    fn the_not_qemu_line_fails_qemu_boots_only() {
+        let line = "origin-kernel: aml: the DSDT's OEM ID \"OEMID \" and OEM table ID \"TABLEID \" are not QEMU's: the proof runs only on QEMU's own tables (ADR-0019 A3) and ran no AML; passed";
+        assert!(qemu_boot_failures().iter().any(|f| line.contains(f)));
+        assert!(!boot_failures().iter().any(|f| line.contains(f)));
+        let proof = fs::read_to_string(repo_root().join("framekernel/src/aml_proof.rs")).unwrap();
+        for phrase in QEMU_ONLY_FAILURES {
+            assert!(
+                proof.contains(phrase),
+                "{phrase}: not the proof's own words"
+            );
+        }
     }
 
     #[test]

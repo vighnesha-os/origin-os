@@ -480,7 +480,7 @@
 
 61. **`boot-matrix` runs its scenarios in one process, each scenario's QEMU settings passed as typed values rather than through the environment (ADR-0011 Amendment 4, T1's notes; decision items 300 and 310 to 312). Open: not started; after TASKS items 58 and 59 land, since both add settings to the same code.** Today `boot-matrix` and its nine scenario commands (`boot-x2apic`, `boot-bridge`, `boot-reserved`, `boot-legacy-free`, `boot-random`, `boot-identity`, and TASKS item 58's `boot-sparse`, `boot-many` and `boot-listed`) re-run `xtask` through `current_exe()` with `ORIGIN_QEMU_*` variables set, which items 300, 310 and 311 allow until this task, as item 312 allows any scenario command added since, `boot-acpi` (TASKS item 62) among them. Done means: no such re-run is left, `host-tools-gate`'s `SELF_RUNS` (TASKS item 60) keeps only `exclusive`'s command and the tests that start a binary to test it, and every scenario prints the markers it prints today.
 
-64. **ACPICA read for the AML interpreter's gaps G1 to G12 (ADR-0019 A4; TASKS item 63's research ledger, §9, at `3b9f199`). Proposed by the coordinating session on 2026-11-14 as a session of its own; not started.** A session that writes no Origin code reads today's ACPICA release through GitHub's web pages, under its BSD licence option, for those gaps alone, and writes the facts, in Origin's words, into a ledger of its own, `docs/research/2026-11-14-aml-gaps-acpica.md`, with each file, its release and the date read. TASKS item 63 reads that ledger and never ACPICA (CLAUDE.md §3). G10, what deployed firmware expects of `_OS`, then comes to the owner as its own item.
+64. **ACPICA read for the AML interpreter's gaps G1 to G19 (ADR-0019 A4; TASKS item 63's research ledger, §9, as step B4 left it). Proposed by the coordinating session on 2026-11-14 as a session of its own; not started.** A session that writes no Origin code reads today's ACPICA release through GitHub's web pages, under its BSD licence option, for those gaps alone, and writes the facts, in Origin's words, into a ledger of its own, `docs/research/2026-11-14-aml-gaps-acpica.md`, with each file, its release and the date read. G13 to G16 came from the reviews of B1 and B2, G17 and G18 from step B4, and G19 from its review. TASKS item 63 reads that ledger and never ACPICA (CLAUDE.md §3). G10, what deployed firmware expects of `_OS`, then comes to the owner as its own item.
 
 65. **The boot checker keeps a kernel panic's message in the log (found by TASKS item 58, 2026-11-14). Open: not started; after TASKS items 58 and 60 land, which both change the checker.** The checker stops QEMU at a panic's first line (`panicked at file:line:col:`), so no `boot-test` log holds the message on the lines after it; TASKS item 58 read its control AC-9's panic message only through `cargo xtask run`. Done means: after a panic's first line the checker reads on, for a bounded time or until the kernel's halt, and the log keeps the message; a planted panic shows it (CLAUDE.md §1, "Protect diagnostic data"; §69).
 
@@ -1481,6 +1481,132 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
     - **The boot verdicts:** 27 are `68 of 69`, failing speculation controls (decision item 154). The three oversubscribed machines (65 or 67 guest processors over 10 host threads) also fail scheduler fairness, excused by name (ADR-0013 Amendment 2). The machine without the random-number instructions is as before.
     - **The largest tables,** the discovery machine's 496,558 bytes of AML: loaded in 230 ms, 4,132 devices walked in 122 ms, the interpreter holding at most 11,897,534 bytes in 32,516 nodes.
     - **The stack:** on every boot the deepest host call was 47,599 bytes above the boot stack's guard page; on the default machine it was 5,808 bytes below the proof's entry.
+
+**Step B4 (2026-11-18): B3's four Lows, then `Load` and `LoadTable`, on branch `claude/aml-load`, cut from `land/batch-6` at `553bf6ef`** after the keeper merged B3 into it (`17df8543`).
+- **The contract.** `t63-b4-contract.md` in the coordination notes, accepted by the coordinating session on 2026-11-18 with Q1 to Q12 as recommended. Its conditions:
+  - Q1: a DSDT whose header cannot be read, or a FADT naming none, still fails "no DSDT".
+  - Q2, Q6 and Q9: recorded in the ledger as strict choices or gaps, with their sections and pages, and G17 added to the gaps TASKS item 64 reads.
+  - Q5: a region is read only within its declared span, checked whole before the first access; at boot `BootHost` refuses it.
+  - Q11: only the symbols `origin-acpi-tables`' own object defines, while that crate passes its own check.
+  - No Rust recursion in a nested load, shown on a fixed native stack.
+  - The soak's grammar loads inside nested evaluations, with loads that fail midway, and checks that no name of a failed table is left.
+  - CL41 gains the table check's cost on the host, marked indicative.
+  - One review of the whole step, B4-0 read first (Q10).
+- **B4-0, a commit each:**
+  - B3-13 `44cddba5`: the DSDT's IDs judged from its copied header, before its checksum.
+  - B3-14 `b293aee6`: each of the bound's checks first in a test, its time half with a clock that moves, and the FADT search's own reason.
+  - B3-15 `593b6cb4`: the drift check counts every crate the allowed lists name.
+  - B3-18 `4c2ef795`: the not-QEMU line fails xtask's QEMU scenarios only.
+- **B4-1:**
+  - `bfbc229a`: the planted loose memory limit loosens `reserve`'s room as well, so the control does not hang on which check refuses first.
+  - `3d0490b8`: xtask: `origin-aml`'s layer and its no-panic allowance (Q11).
+  - `741efc9b`: `Load` and `LoadTable` (`load.rs`). The engine holds a load in a `Loading` frame below the table's block, and `run_frames` hands a non-limit error inside a loading table to that load. The stand-in for table headers gives way to `origin-acpi-tables`. The tests, the randomized grammar and four planted faults come with it.
+  - `741cc7d0`: `DataTableRegion` checks the host's copy (the review of B2, B2-14).
+  - `aa601a1c`: the allocation gate found the plant's copy in `load.rs`, under `#[cfg(test)]`, and it moved to the tests.
+  - `6facbd77`, found reading the code while the first gate run went: a limit that ended an evaluation in the middle of a load gave a tracing host `Load` and never `Loaded`. `abort` now tells each table being loaded failed, after the limit.
+  - `f42c80b9`: a sweep refuses each allocation of a nested load in turn, which also catches the gap `6facbd77` closed. `Load` is now traced after its frame is pushed, a branch unreachable today.
+  - `e6b08bc9`, **N-soak-3**, found by the soak on `c1f3b244` (seed `0x63a00000`; grammar case `0x63a00749`, mutation case `0x9c5f16e6`). A block's load-time code completed a load, then the block failed. The loaded table stayed, as Q8 rules, but the test's check required the namespace exactly as before the block. The check now allows the names of completed tables loaded meanwhile, by name. A fixed adversarial block and a load test hold the case. The library is unchanged.
+- **The strict choices** are the ledger's §9: Q2 (`Load` takes an SSDT only), Q3, Q4 (True is Ones), Q6 (no `DSDT` or `SSDT` key for `LoadTable`), Q7, Q8, G17 (no `_INI` or `_REG` after a run-time load) and G18 (an ID matches through NUL or space padding).
+- **Found while building:**
+  - A first `Loading` frame holding the whole operand frame made every frame on the engine's stack 336 bytes in place of 280. It now keeps two operands, 128 bytes, and the frames are 280 again.
+  - The larger frame had also moved one adversarial block's memory refusal from the budget's charge to `reserve`'s room, where the planted loose limit did not reach, and the control went uncaught (`bfbc229a`).
+- **The gates on `a1b7e390`, B4's final evidence.**
+  - **Conditions:** the library as at `f42c80b9`, the tests as at `e6b08bc9`; Rust 1.100.0 on the development Mac; one turn of the machine, 2026-11-18, 17:09 to 17:39 UTC; the tree clean before and after. The quick gates passed first.
+  - **The boot controls,** AML-1 to AML-6: each caught (ADR-0013, "The controls at step B4"). AML-5 and AML-6 failed at once on the not-QEMU line.
+  - **The soak inside the turn** (seed `0x63a00000`, 1,000,000 cases of each kind, 77 s): passed.
+    - Grammar: 93% loaded, 24% returning a value, 33% running 32 operations, 22 kinds of error; an evaluation's load completed in 13% of cases and failed in 16%.
+    - Mutation: 15%, 22%, 30%, 34 kinds; loads 1% and 2%.
+    - The 31 adversarial blocks ran as written.
+    - It ran once before, on `c1f3b244`, and found N-soak-3.
+  - **In release:** `origin-aml`'s load tests (37, the nested loads on a 32 KiB thread among them) and the kernel's proof tests (39, the proof on a 32 KiB thread among them).
+  - **`cargo xtask check` passed:** 2,267 tests passed, none failed, 28 ignored; Loom, 56 models and 83 controls. Among its gates:
+    - the no-panic check: `origin-aml`'s object, 196 symbols of its own and 18 external, 3 of them `origin-acpi-tables`' own, which passed its check first (Q11);
+    - the allocation gate on the library and the proof, each plant caught;
+    - the `unsafe` gate, scanning 287 kernel source files;
+    - provenance: 29 crates.
+  - **`cargo xtask boot-test`:** 11 of 11.
+  - **`cargo xtask boot-matrix`:** passed, 193 scenarios with none failed.
+    - The proof passed on each of its 31 kernel boots, with no `aml failed` and no not-QEMU line.
+    - Verdicts: 27 at `68 of 69` (speculation controls, decision item 154), the three oversubscribed machines also failing fairness (excused by name, ADR-0013 Amendment 2), and the machine without the random-number instructions as before.
+    - The discovery machine: 496,558 bytes of AML loaded in 244 ms and 4,132 devices walked in 121 ms, the interpreter holding at most 11,897,534 bytes in 32,516 nodes.
+    - The stack: the least room above the guard page on any boot was 47,103 bytes.
+- **Not covered by B4:**
+  - a boot that runs either operator (QEMU's tables use neither);
+  - `Unload` (G8);
+  - `_INI` and `_REG` for what a run-time load adds (G17, the ACPI service's);
+  - a SystemMemory region as `Load`'s source in the soak's grammar (semantic tests only; a PCI_Config field is among its sources since the review);
+  - the ACPI service's long-lived interpreter needs failed run-time loads' table slots reclaimed, with a generation so that a stale method's `TableFailed` still holds (the review of B4, B4-5: each keeps 48 bytes, charged, so a long run ends cleanly at `Limit(Memory)`);
+  - any physical machine.
+
+**Answers to the review of B4 (2026-11-18).**
+- **The review:** `docs/engineering/REVIEW_T63_B4_2026-11-18.md`, one AI reviewer started by the coordinating session, on `ac0bbc3b`. It found 0 High, 1 Medium, 6 Low and 4 Informational, and was copied in at `585a7c1d`. Every finding is answered on the coordinating session's rulings, each fix in a commit of its own; the review's Resolution names them.
+- **B4-1 (Medium)** `a427ef35`: every store a load makes is ready before anything changes.
+  - `Load`'s target is ready before the source is read; `LoadTable`'s parameter before the load's end pops anything.
+  - A `Pending` that still reaches either end's store fails closed (`Grammar`).
+  - Tests R1, R2, R3, R8, R9 and R10, each asserting the trace, the node count and the stacks at rest; all six failed on `ac0bbc3b`'s `load.rs`.
+  - A fail-closed test, and a planted fault, `SkipLoadReadiness`.
+  - The soak's grammar has a PCI_Config field among its targets and sources, and the run requires the stacks at rest after every load and evaluation.
+- **B4-2** `37d6b677`: a `Fatal` ends the evaluation wherever it is raised (Q3 clarified), with R5.
+- **B4-3** `e4e94553`: R4 and R4b as tests of the ruled behaviour; the block case is `e6b08bc9`'s test.
+- **B4-4** `b8eb98ce`: a root path that is not a scope object is `WrongObject`, with R6.
+- **B4-5:** accepted and recorded (the ledger, and "Not covered" above).
+- **B4-6** `accf940e`: `check` runs the nested-load stack test in release, at 32 KiB.
+- **B4-7** `635ff54a`: the stale comment moved back, the old test renamed `qemus_ids_with_a_bad_checksum_fail_no_dsdt`.
+- **B4-8** `92f9ddf1`: `DataTableRegion`'s check charged `bytes.len() / 64` units.
+- **B4-9** `b5a0a0b7`: the proof compares the checked DSDT's IDs with QEMU's too, and fails "the DSDT changed between two reads", with a host test where that reason comes first.
+- **B4-10:** recorded in ADR-0013's row.
+- **B4-11** `2eea5569`: `Host::table` says it calls `out` at most once.
+- **The records' findings** `f6e1b18c`: CL41's harness kept as an `#[ignore]`d test, and tests for `Break` and `Continue` in a loaded table (the hand-over's point 2). The ledger has point 7, G19 and the corrected sentence of the contract's §6. TASKS item 64 now names G1 to G19 (`67472a84`).
+- **N-soak-4** `30af5f8d`, found by the soak before these gates (seed `0x63b00000`, mutation case `0x9c51c871`). A mutation made the bad-checksum table's bytes sum to zero, and the sound table loaded legitimately. The check that such tables never load now holds only for blocks that were not mutated. Tests only; the library is unchanged.
+- **The gates on `dad56c18`, the answers' final evidence.**
+  - **Conditions:** the code as at `30af5f8d`; Rust 1.100.0 on the development Mac; one turn of the machine, 2026-11-18, 18:25 to 18:55 UTC; the tree clean before and after. The quick gates passed first.
+  - **The boot controls AML-1 to AML-6:** each caught as before (ADR-0013, "The controls at step B4"). The baseline loaded 8,521 bytes in 9.3 ms and walked 38 devices in 4.5 ms.
+  - **The soak inside the turn** (seed `0x63b00000`, 1,000,000 cases of each kind, 77 s): passed.
+    - Grammar: 93% loaded, 24% returning a value, 33% running 32 operations, 22 kinds of error; an evaluation's load completed in 12% of cases and failed in 15%.
+    - Mutation: 14%, 22%, 30%, 33 kinds.
+    - The 33 adversarial blocks ran as written.
+    - It ran twice before: once finding N-soak-4, then passing.
+  - **In release:** `origin-aml`'s load tests (49, 1 ignored: CL41's harness) and the kernel's proof tests (40).
+  - **`cargo xtask check` passed:** 2,283 tests passed, none failed, 29 ignored; Loom, 56 models and 83 controls. Its gates:
+    - the release run of `tests::load::nested_loads` (B4-6);
+    - the no-panic check: `origin-aml`, 197 symbols of its own and 18 external, 3 of them `origin-acpi-tables`' own;
+    - the allocation gate's plants caught;
+    - the `unsafe` gate, 287 kernel files;
+    - provenance: 29 crates.
+  - **`cargo xtask boot-test`:** 11 of 11.
+  - **`cargo xtask boot-matrix`:** 193 scenarios, none failed.
+    - The proof passed on all 31 kernel boots, with no `aml failed`, no not-QEMU line and no "changed between two reads".
+    - Verdicts as before.
+    - The discovery machine: 496,558 bytes loaded in 278 ms and 4,132 devices walked in 136 ms, at most 11,897,534 bytes.
+    - The least room above the guard page: 47,119 bytes.
+
+**Answers to the review's addendum (2026-11-19).**
+- **The addendum:** the same reviewer read the answers at `1a3580f2` (code `30af5f8d`) and closed B4-1, B4-2 and B4-9, finding every other Status true. It was appended to the review at `774d2e66`. It found two new Lows and two Informational; each fix is a commit of its own, and the review's addendum Resolution names them.
+- **B4-12** `1430becf`: `LoadTable`'s parameter is stored by a step of its own, a `Parameter` frame pushed once the load has ended. A failed PCI function walk, or a limit in it, now comes after the table was added, and the table stays. Tests: N1, N1b, N1c, N1d, N4, and R8's case through the step.
+- **B4-13** `2c33f1bd`: `LocalX` and `ArgX` are `Grammar` at a loaded table's table level. The engine's `load_calls` mark is checked in `decode`, where every one is named.
+  - Tests: N5, and a read, a store, `RefOf`, an argument holding a reference, `Load`'s own target, and a method keeping its own locals.
+  - The planted fault `AllowLoadLocals`, caught.
+  - The soak's table `XH`, and locals in `XA`'s load-time code.
+- **B4-14** `573a34a9`: `PF` among the soak's `LoadTable` parameter paths.
+- **B4-15:** the ledger's figure corrected to near 1.4 million, with the arithmetic.
+- **The gates on `54d32c70`** (the code as at `573a34a9`; Rust 1.100.0 on the development Mac; the tree clean before and after each run). The quick gates passed first. One turn of the machine, 2026-11-18, 19:17 to 19:33 UTC:
+  - **Boot controls AML-1 to AML-6:** each caught. The baseline loaded 8,521 bytes in 9.0 ms and walked 38 devices in 4.5 ms.
+  - **Soak** (seed `0x63c00000`, 1,000,000 cases of each kind, 84 s): passed.
+    - Grammar: 93%, 24%, 33%, 22 kinds; an evaluation's load completed in 11% of cases and failed in 17%.
+    - Mutation: 14%, 22%, 31%, 32 kinds.
+    - The 34 adversarial blocks as written.
+  - **In release:** load tests 63 (1 ignored) and proof tests 40.
+  - **`check` passed:** 2,297 tests passed, none failed, 29 ignored; Loom 56/83; the no-panic check at 196 symbols of its own and 18 external.
+  - **`boot-test`:** 11 of 11.
+  - **`boot-matrix` failed on its first run, on the 65-processor Intel machine (19:30 to 19:32 UTC).**
+    - The scheduler proof's line for guest processor 8 showed both workers running but only 12 context switches. The excuse for the named oversubscribed machines needs 15 (ADR-0013 Amendment 2), so the line failed the boot.
+    - The host was loaded from outside: its load average was 8.2 on 10 threads, with nothing of this session's running and a Chrome renderer alone at about 80% of a core.
+    - Nothing in B4 touches the scheduler. It is the host-load exposure of the oversubscribed machines (TASKS item 66).
+  - **`boot-matrix` run again on the same tree, alone, in a turn of its own (19:33 to 19:51 UTC, the host's load average 7.2 at the start and 7.7 at the end):** passed, 193 scenarios with none failed.
+    - The proof passed on all 31 kernel boots, with no `aml failed`, no not-QEMU line, and no "changed between two reads".
+    - Verdicts as before.
+    - The discovery machine: 265 ms to load, 136 ms to walk, at most 11,897,534 bytes.
+    - The least room above the guard page: 47,151 bytes.
 
 
 ### 60. The host tools are libraries first (ADR-0011 Amendment 4, T1)

@@ -6,10 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-# `no_std` with `alloc`, and without `unsafe` (ADR-0019 A3). No dependency yet: the table
-# headers will come from `origin-acpi-tables` (TASKS 62) once that crate is on this branch; until
-# then the tests build definition blocks with a stand-in (`src/tests/tables_standin.rs`).
+# `no_std` with `alloc`, and without `unsafe` (ADR-0019 A3). One dependency, in the workspace:
+# `origin-acpi-tables` (TASKS 62), which checks every table `Load`, `LoadTable` and
+# `DataTableRegion` are handed before a byte of it is used (TASKS item 63, step B4).
 [dependencies]
+origin-acpi-tables.workspace = true
 
 [lints]
 workspace = true

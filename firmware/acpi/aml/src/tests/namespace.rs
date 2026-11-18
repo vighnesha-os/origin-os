@@ -2,7 +2,7 @@
 //! nodes.
 
 use super::encode::*;
-use super::{interp, load, tables_standin};
+use super::{block, interp, load};
 use crate::{ErrorKind, IntegerWidth, Plain, Value};
 
 /// `plain` reads an integer or a string, through an alias, and nothing else, running nothing and
@@ -191,15 +191,18 @@ fn walking_the_namespace_follows_definition_order() {
 }
 
 #[test]
-fn the_stand_in_refuses_bad_headers() {
+fn the_tables_crate_refuses_bad_headers() {
     let t = table(b"SSDT", 2, &[name("X", one())]);
     let mut short = t.clone();
     short.truncate(20);
-    assert!(tables_standin::block(&short).is_err());
+    assert!(block(&short).is_err());
     let mut bad = t.clone();
     bad[40] ^= 1;
-    assert!(tables_standin::block(&bad).is_err());
-    assert!(tables_standin::block(&t).is_ok());
+    assert!(block(&bad).is_err());
+    let mut other = t.clone();
+    other[0..4].copy_from_slice(b"OEMX");
+    assert!(block(&other).is_err(), "not a definition block's signature");
+    assert!(block(&t).is_ok());
 }
 
 #[test]

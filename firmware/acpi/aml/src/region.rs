@@ -26,7 +26,7 @@
 use alloc::vec::Vec;
 
 use crate::Interpreter;
-use crate::error::{Error, ErrorKind, Result, err};
+use crate::error::{Error, ErrorKind, Limit, Result, err};
 use crate::host::{BufferAccess, Host, RegionAccess, Space, Trace};
 use crate::mem;
 use crate::name::Seg;
@@ -475,6 +475,49 @@ impl<H: Host> Interpreter<H> {
             region: region_path,
             time_left_100ns,
         })
+    }
+
+    /// The whole of a SystemMemory region, read through the host for `Load` (§19.6.77; B4's
+    /// contract, Q5, as ruled with B2-3's and B2-8's rules): only within the region as declared,
+    /// its span checked whole before the first access (it must lie in the address space, and the
+    /// memory limit must hold it), then in the widest naturally aligned accesses, each a unit of
+    /// work.
+    pub(crate) fn region_bytes(&mut self, r: &Region) -> Result<Vec<u8>> {
+        r.offset.checked_add(r.length).ok_or(ErrorKind::Range)?;
+        let len = usize::try_from(r.length).map_err(|_| ErrorKind::Limit(Limit::Memory))?;
+        let mut out = mem::with_capacity(len, &mut self.budget)?;
+        let path = Path::Region(*r);
+        let region_path = self.path_of_region(&path)?;
+        let mut off: u64 = 0;
+        let read = loop {
+            if off >= r.length {
+                break Ok(());
+            }
+            let address = r.offset.saturating_add(off);
+            let left = r.length.saturating_sub(off);
+            let w = [8u64, 4, 2, 1]
+                .into_iter()
+                .find(|&w| w <= left && address.is_multiple_of(w))
+                .unwrap_or(1);
+            let step = self.charge(1).and_then(|()| {
+                let x = self.unit_read(&path, &region_path, off, w, 0)?;
+                let bytes = x.to_le_bytes();
+                let part = bytes.get(..usize::try_from(w).unwrap_or(1)).unwrap_or(&[]);
+                mem::extend_bytes(&mut out, part, &mut self.budget)
+            });
+            if let Err(e) = step {
+                break Err(e);
+            }
+            off = off.saturating_add(w);
+        };
+        mem::release(region_path, &mut self.budget);
+        match read {
+            Ok(()) => Ok(out),
+            Err(e) => {
+                mem::release(out, &mut self.budget);
+                Err(e)
+            }
+        }
     }
 
     fn path_of_region(&mut self, path: &Path) -> Result<Vec<Seg>> {

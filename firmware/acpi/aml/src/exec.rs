@@ -6,8 +6,8 @@ use alloc::vec::Vec;
 use crate::Interpreter;
 use crate::convert::Data;
 use crate::engine::{Frame, Loc, OpFrame, Operand};
-use crate::error::{Error, ErrorKind, Feature, Result, err};
-use crate::host::Host;
+use crate::error::{Error, ErrorKind, Result, err};
+use crate::host::{Host, HostError};
 use crate::mem;
 use crate::name::{AmlName, TextName};
 use crate::object::{
@@ -580,7 +580,7 @@ impl<H: Host> Interpreter<H> {
             Op::Continue => self.leave_loop(true),
             Op::Noop => Ok(()),
             Op::Return => {
-                if self.calls.is_empty() {
+                if self.calls.is_empty() || self.return_crosses_load() {
                     return err(ErrorKind::Grammar);
                 }
                 let v = self.copy_val(val(&f, 0)?)?;
@@ -595,8 +595,8 @@ impl<H: Host> Interpreter<H> {
             }
 
             // --- What reaches the host -------------------------------------------------------------
-            Op::Load => err(ErrorKind::NotSupported(Feature::Load)),
-            Op::LoadTable => err(ErrorKind::NotSupported(Feature::LoadTable)),
+            Op::Load => self.exec_load(&f),
+            Op::LoadTable => self.exec_load_table(&f),
             Op::Stall => {
                 let us = self.int(&f, 0)?;
                 self.stall(us)
@@ -725,15 +725,27 @@ impl<H: Host> Interpreter<H> {
                 return err(ErrorKind::Range);
             }
         }
+        // The host's copy is checked before its address and length are taken (the review of B2,
+        // B2-14): a copy that is not a sound table under the key gives the region nothing.
         let mut found = None;
         let present = self
             .host
             .table(&key, &mut |address, bytes| {
-                found = Some((address, u64::try_from(bytes.len()).unwrap_or(0)));
+                found = Some((
+                    address,
+                    u64::try_from(bytes.len()).unwrap_or(0),
+                    crate::load::answers(&key, bytes),
+                ));
             })
             .map_err(ErrorKind::Host)?;
+        // The check read the whole copy: work, charged as a copy of that size is (B1's F1 rule;
+        // the review of B4, B4-8).
+        if let Some((_, length, _)) = found {
+            self.charge(length / 64)?;
+        }
         let (offset, length) = match found {
-            Some(t) if present => t,
+            Some((address, length, true)) if present => (address, length),
+            Some((_, _, false)) if present => return err(ErrorKind::Host(HostError::Failed)),
             _ => return err(ErrorKind::NotFound),
         };
         let obj = self.heap.alloc(Object::Uninitialized, &mut self.budget)?;
