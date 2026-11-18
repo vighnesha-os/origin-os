@@ -544,6 +544,19 @@ These ran on the first code. AML-3's first reason was then the HPET's; since the
 
 The verdict's branches are host tests too (`framekernel/src/aml_proof/tests.rs`), each first in a test of its own; the bound's later checks and its time half since B4's start (B3-14, above).
 
+**The controls at step B4 (TASKS item 63; 2026-11-18, 17:09 to 17:11 UTC, the same machine and way, one turn, at `a1b7e390`):** the same script, with AML-6, B4's new control for B3-13.
+- **The baseline passed:** `1 tables, 8521 bytes of AML loaded in 9667 us; 38 devices walked in 4946 us, 11 refusals ...; named results true; heap back true; passed`. The deepest host call was 6,272 bytes below the proof's entry and 47,103 above the guard page.
+- **Each edited boot failed** (`boot-test` exit 1), each in about 20 seconds, and every file was restored byte for byte. The tree was clean before and after.
+
+| # | Edit | What caught it |
+|---|---|---|
+| AML-1 | As above | `aml: the DSDT: DSDT rev 1, 8557 bytes: refused at 0x9: checksum`, then `... named results false; heap back false; aml failed: no DSDT` |
+| AML-2 | As above | `\_REV 2 false (the integer 0x2); all false`, then `... aml failed: a named result was not as QEMU's tables give it` |
+| AML-3 | As above | `the host: refused SystemMemory 0, ...; answered otherwise 2; ...`, then `... aml failed: the host answered a request for hardware other than by refusing it` |
+| AML-4 | As above | `...; named results true; heap back false; aml failed: the kernel heap did not return to what it held before the proof` |
+| AML-5 | As above | **Now caught at once** (B3-18): xtask's failure `the serial output contains "are not QEMU's: the proof runs only"`, after the kernel's `aml: the DSDT's OEM ID "BOCHS " and OEM table ID "BXPC    " are not QEMU's: ... ran no AML; passed`. Before B3-18 it waited for the 120 s timeout |
+| AML-6 | **New (B3-13):** the DSDT's header as copied has its checksum byte broken and its OEM table ID changed (`OTHERFW `) | The proof judged the IDs without the checksum and ran no AML: `aml: the DSDT's OEM ID "BOCHS " and OEM table ID "OTHERFW " are not QEMU's: ... ran no AML; passed`. As a QEMU boot it then failed at once on that line (B3-18). The host test `other_ids_with_a_bad_checksum_are_not_run` holds the same case, the checksum broken across the whole table |
+
 ## Alternatives
 
 | Alternative | For | Against |

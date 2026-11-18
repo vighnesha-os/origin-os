@@ -1510,6 +1510,26 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
 - **Found while building:**
   - A first `Loading` frame holding the whole operand frame made every frame on the engine's stack 336 bytes in place of 280. It now keeps two operands, 128 bytes, and the frames are 280 again.
   - The larger frame had also moved one adversarial block's memory refusal from the budget's charge to `reserve`'s room, where the planted loose limit did not reach, and the control went uncaught (`bfbc229a`).
+- **The gates on `a1b7e390`, B4's final evidence.**
+  - **Conditions:** the library as at `f42c80b9`, the tests as at `e6b08bc9`; Rust 1.100.0 on the development Mac; one turn of the machine, 2026-11-18, 17:09 to 17:39 UTC; the tree clean before and after. The quick gates passed first.
+  - **The boot controls,** AML-1 to AML-6: each caught (ADR-0013, "The controls at step B4"). AML-5 and AML-6 failed at once on the not-QEMU line.
+  - **The soak inside the turn** (seed `0x63a00000`, 1,000,000 cases of each kind, 77 s): passed.
+    - Grammar: 93% loaded, 24% returning a value, 33% running 32 operations, 22 kinds of error; an evaluation's load completed in 13% of cases and failed in 16%.
+    - Mutation: 15%, 22%, 30%, 34 kinds; loads 1% and 2%.
+    - The 31 adversarial blocks ran as written.
+    - It ran once before, on `c1f3b244`, and found N-soak-3.
+  - **In release:** `origin-aml`'s load tests (37, the nested loads on a 32 KiB thread among them) and the kernel's proof tests (39, the proof on a 32 KiB thread among them).
+  - **`cargo xtask check` passed:** 2,267 tests passed, none failed, 28 ignored; Loom, 56 models and 83 controls. Among its gates:
+    - the no-panic check: `origin-aml`'s object, 196 symbols of its own and 18 external, 3 of them `origin-acpi-tables`' own, which passed its check first (Q11);
+    - the allocation gate on the library and the proof, each plant caught;
+    - the `unsafe` gate, scanning 287 kernel source files;
+    - provenance: 29 crates.
+  - **`cargo xtask boot-test`:** 11 of 11.
+  - **`cargo xtask boot-matrix`:** passed, 193 scenarios with none failed.
+    - The proof passed on each of its 31 kernel boots, with no `aml failed` and no not-QEMU line.
+    - Verdicts: 27 at `68 of 69` (speculation controls, decision item 154), the three oversubscribed machines also failing fairness (excused by name, ADR-0013 Amendment 2), and the machine without the random-number instructions as before.
+    - The discovery machine: 496,558 bytes of AML loaded in 244 ms and 4,132 devices walked in 121 ms, the interpreter holding at most 11,897,534 bytes in 32,516 nodes.
+    - The stack: the least room above the guard page on any boot was 47,103 bytes.
 - **Not covered by B4:**
   - a boot that runs either operator (QEMU's tables use neither);
   - `Unload` (G8);
