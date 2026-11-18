@@ -901,6 +901,31 @@ fn tables_that_are_not_qemus_run_nothing_and_pass() {
 
 /// The ID is read from the header `origin-acpi-tables` checked: QEMU's IDs on a DSDT whose
 /// checksum is wrong are not trusted, and the proof fails as for any refused DSDT.
+/// B3-13: the IDs decide before any checksum. Other IDs on a DSDT whose checksum is wrong: the
+/// proof does not run, and passes; the census, which checks every table, reports the checksum.
+#[test]
+fn other_ids_with_a_bad_checksum_are_not_run() {
+    let mut dsdt = table(b"DSDT", 2, &[name("XTRA", one())]);
+    dsdt[9] ^= 1;
+    let (found, out) = Machine::new(dsdt).run();
+    assert!(found.not_run && found.passed(), "{out}");
+    assert!(out.contains("are not QEMU's"), "{out}");
+}
+
+/// QEMU's IDs on a DSDT whose header cannot be read past its first bytes: as before, the proof
+/// cannot tell whose tables these are and fails (Q1 of B4's contract).
+#[test]
+fn a_dsdt_whose_header_cannot_be_copied_fails_the_proof() {
+    let mut m = Machine::new(qemu_dsdt(&[]));
+    m.dsdt_at = LOW;
+    let (found, out) = m.run();
+    assert_eq!(found.failed, Some("no DSDT"), "{out}");
+    assert!(
+        out.contains("origin-kernel: aml: the DSDT: not readable: its header cannot be copied"),
+        "{out}"
+    );
+}
+
 #[test]
 fn the_id_is_read_only_from_a_checked_header() {
     let mut dsdt = qemu_dsdt(&[]);
@@ -1093,7 +1118,8 @@ fn outcomes_that_cannot_be_kept_fail_the_proof() {
 /// The FADT's DSDT pointer names a table that is not a DSDT.
 #[test]
 fn a_dsdt_pointer_to_another_table_fails_the_proof() {
-    let (found, out) = Machine::new(table(b"SSDT", 1, &[])).run();
+    // With QEMU's IDs, so that it is judged as QEMU's DSDT (B3-13).
+    let (found, out) = Machine::new(qemu_ids(table(b"SSDT", 1, &[]))).run();
     assert_eq!(found.failed, Some("no DSDT"), "{out}");
     assert!(
         out.contains("origin-kernel: aml: the DSDT: not one"),

@@ -745,6 +745,34 @@ fn interpret<H: Host>(
             return;
         }
     };
+    // Only QEMU's own tables (B3-2), judged by the IDs in the header as copied, before any
+    // checksum (the review of B3's addendum, B3-13): trusting unchecked IDs to decide not to run
+    // is the safe direction, and only QEMU's IDs then need the table checked whole. A header that
+    // cannot be copied tells nobody whose tables these are, and fails as before (Q1 of B4's
+    // contract).
+    let mut first = [0u8; HEADER_LEN];
+    let copied = fw
+        .copy(dsdt_addr, &mut first)
+        .ok()
+        .and_then(|()| Header::read(&first).ok());
+    let Some(ids) = copied else {
+        let _ = writeln!(
+            out,
+            "{LINE}the DSDT: not readable: its header cannot be copied"
+        );
+        found.fail("no DSDT");
+        return;
+    };
+    if (ids.oem_id, ids.oem_table_id) != QEMU_DSDT {
+        let _ = writeln!(
+            out,
+            "{LINE}the DSDT's OEM ID \"{}\" and OEM table ID \"{}\" are not QEMU's: the proof runs only on QEMU's own tables (ADR-0019 A3) and ran no AML; passed",
+            Escaped(&ids.oem_id),
+            Escaped(&ids.oem_table_id)
+        );
+        found.not_run = true;
+        return;
+    }
     let dsdt = match lend_if(fw, dsdt_addr, &[b"DSDT"]) {
         Ok(Some((bytes, header))) => checked(out, "the DSDT", bytes, &header),
         Ok(None) => {
@@ -760,18 +788,6 @@ fn interpret<H: Host>(
         found.fail("no DSDT");
         return;
     };
-    // Only QEMU's own tables (B3-2): read from the header `Checked::parse` has checked.
-    let h = dsdt.table().header();
-    if (h.oem_id, h.oem_table_id) != QEMU_DSDT {
-        let _ = writeln!(
-            out,
-            "{LINE}the DSDT's OEM ID \"{}\" and OEM table ID \"{}\" are not QEMU's: the proof runs only on QEMU's own tables (ADR-0019 A3) and ran no AML; passed",
-            Escaped(&h.oem_id),
-            Escaped(&h.oem_table_id)
-        );
-        found.not_run = true;
-        return;
-    }
     let width = IntegerWidth::from_dsdt_revision(dsdt.table().revision());
     let mut i = match Interpreter::new(Recorder::new(host), Config { limits }, width) {
         Ok(i) => i,
