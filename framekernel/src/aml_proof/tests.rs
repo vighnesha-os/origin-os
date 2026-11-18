@@ -916,8 +916,6 @@ fn tables_that_are_not_qemus_run_nothing_and_pass() {
     assert_eq!(out.lines().count(), 1, "{out}");
 }
 
-/// The ID is read from the header `origin-acpi-tables` checked: QEMU's IDs on a DSDT whose
-/// checksum is wrong are not trusted, and the proof fails as for any refused DSDT.
 /// B3-13: the IDs decide before any checksum. Other IDs on a DSDT whose checksum is wrong: the
 /// proof does not run, and passes; the census, which checks every table, reports the checksum.
 #[test]
@@ -943,8 +941,11 @@ fn a_dsdt_whose_header_cannot_be_copied_fails_the_proof() {
     );
 }
 
+/// QEMU's IDs on a DSDT whose checksum is wrong: the IDs say the tables are QEMU's, so the whole
+/// table must pass `origin-acpi-tables`' check before any of it runs, and here it does not: the
+/// proof fails as for any refused DSDT (B3-13 keeps this; the review of B4, B4-7).
 #[test]
-fn the_id_is_read_only_from_a_checked_header() {
+fn qemus_ids_with_a_bad_checksum_fail_no_dsdt() {
     let mut dsdt = qemu_dsdt(&[]);
     dsdt[9] ^= 1;
     let (found, out) = Machine::new(dsdt).run();
