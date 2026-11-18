@@ -1534,8 +1534,29 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
   - a boot that runs either operator (QEMU's tables use neither);
   - `Unload` (G8);
   - `_INI` and `_REG` for what a run-time load adds (G17, the ACPI service's);
-  - a region or field as `Load`'s source in the soak's grammar (semantic tests only);
+  - a SystemMemory region as `Load`'s source in the soak's grammar (semantic tests only; a PCI_Config field is among its sources since the review);
+  - the ACPI service's long-lived interpreter needs failed run-time loads' table slots reclaimed, with a generation so that a stale method's `TableFailed` still holds (the review of B4, B4-5: each keeps 48 bytes, charged, so a long run ends cleanly at `Limit(Memory)`);
   - any physical machine.
+
+**Answers to the review of B4 (2026-11-18).**
+- **The review:** `docs/engineering/REVIEW_T63_B4_2026-11-18.md`, one AI reviewer started by the coordinating session, on `ac0bbc3b`. It found 0 High, 1 Medium, 6 Low and 4 Informational, and was copied in at `585a7c1d`. Every finding is answered on the coordinating session's rulings, each fix in a commit of its own; the review's Resolution names them.
+- **B4-1 (Medium)** `a427ef35`: every store a load makes is ready before anything changes.
+  - `Load`'s target is ready before the source is read; `LoadTable`'s parameter before the load's end pops anything.
+  - A `Pending` that still reaches either end's store fails closed (`Grammar`).
+  - Tests R1, R2, R3, R8, R9 and R10, each asserting the trace, the node count and the stacks at rest; all six failed on `ac0bbc3b`'s `load.rs`.
+  - A fail-closed test, and a planted fault, `SkipLoadReadiness`.
+  - The soak's grammar has a PCI_Config field among its targets and sources, and the run requires the stacks at rest after every load and evaluation.
+- **B4-2** `37d6b677`: a `Fatal` ends the evaluation wherever it is raised (Q3 clarified), with R5.
+- **B4-3** `e4e94553`: R4 and R4b as tests of the ruled behaviour; the block case is `e6b08bc9`'s test.
+- **B4-4** `b8eb98ce`: a root path that is not a scope object is `WrongObject`, with R6.
+- **B4-5:** accepted and recorded (the ledger, and "Not covered" above).
+- **B4-6** `accf940e`: `check` runs the nested-load stack test in release, at 32 KiB.
+- **B4-7** `635ff54a`: the stale comment moved back, the old test renamed `qemus_ids_with_a_bad_checksum_fail_no_dsdt`.
+- **B4-8** `92f9ddf1`: `DataTableRegion`'s check charged `bytes.len() / 64` units.
+- **B4-9** `b5a0a0b7`: the proof compares the checked DSDT's IDs with QEMU's too, and fails "the DSDT changed between two reads", with a host test where that reason comes first.
+- **B4-10:** recorded in ADR-0013's row.
+- **B4-11** `2eea5569`: `Host::table` says it calls `out` at most once.
+- **The records' findings** `f6e1b18c`: CL41's harness kept as an `#[ignore]`d test, and tests for `Break` and `Continue` in a loaded table (the hand-over's point 2). The ledger has point 7, G19 and the corrected sentence of the contract's §6. TASKS item 64 now names G1 to G19.
 
 
 ### 60. The host tools are libraries first (ADR-0011 Amendment 4, T1)
