@@ -1556,7 +1556,8 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
 - **B4-9** `b5a0a0b7`: the proof compares the checked DSDT's IDs with QEMU's too, and fails "the DSDT changed between two reads", with a host test where that reason comes first.
 - **B4-10:** recorded in ADR-0013's row.
 - **B4-11** `2eea5569`: `Host::table` says it calls `out` at most once.
-- **The records' findings** `f6e1b18c`: CL41's harness kept as an `#[ignore]`d test, and tests for `Break` and `Continue` in a loaded table (the hand-over's point 2). The ledger has point 7, G19 and the corrected sentence of the contract's §6. TASKS item 64 now names G1 to G19.
+- **The records' findings** `f6e1b18c`: CL41's harness kept as an `#[ignore]`d test, and tests for `Break` and `Continue` in a loaded table (the hand-over's point 2). The ledger has point 7, G19 and the corrected sentence of the contract's §6. TASKS item 64 now names G1 to G19 (`67472a84`).
+- **N-soak-4** `30af5f8d`, found by the soak before these gates (seed `0x63b00000`, mutation case `0x9c51c871`). A mutation made the bad-checksum table's bytes sum to zero, and the sound table loaded legitimately. The check that such tables never load now holds only for blocks that were not mutated. Tests only; the library is unchanged.
 
 
 ### 60. The host tools are libraries first (ADR-0011 Amendment 4, T1)

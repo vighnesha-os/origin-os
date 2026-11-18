@@ -4945,6 +4945,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - B4-7 to B4-9: the kernel proof's renamed test, `DataTableRegion`'s charge, and the proof's second comparison of the IDs with its test.
 - The records' findings: `Break` and `Continue` in a loaded table, and CL41's harness, `cl41_table_check_cost`.
 - Each fix's control was run by hand and caught; each commit says how.
+- N-soak-4, found by the soak: a mutated block's tables are no longer judged by their IDs (tests only).
 
 **What it does not show.**
 - No boot runs `Load` or `LoadTable`: QEMU's tables use neither, and the proof's host refuses `table`.
