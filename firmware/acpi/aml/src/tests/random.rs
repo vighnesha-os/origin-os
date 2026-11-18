@@ -983,6 +983,18 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
             enters, leaves,
             "seed {seed:#x}: a method entered and never left"
         );
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, super::Event::Load(_)))
+            .count();
+        let ended = events
+            .iter()
+            .filter(|e| matches!(e, super::Event::Loaded(_)))
+            .count();
+        assert_eq!(
+            started, ended,
+            "seed {seed:#x}: a table started loading and was never said to end"
+        );
     }
     Ran {
         digest,

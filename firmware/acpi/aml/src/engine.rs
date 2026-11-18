@@ -366,9 +366,8 @@ impl<H: Host> Interpreter<H> {
                     let aml = core::mem::take(&mut t.aml);
                     mem::release(aml, &mut self.budget);
                 }
-                self.abort(marks);
+                self.abort(marks, &e);
                 self.end_evaluation();
-                self.trace_limit(&e);
                 self.trace(&Trace::Loaded(Err(e)));
                 Err(e)
             }
@@ -487,13 +486,20 @@ impl<H: Host> Interpreter<H> {
     /// What was there when the evaluation began stays, so that one evaluation inside another
     /// would leave the outer one whole (the review of B1, F14). Today every evaluation is
     /// top-level, and every mark is zero.
-    pub(crate) fn abort(&mut self, marks: Marks) {
-        // A table `Load` or `LoadTable` was loading when a limit ended the evaluation is failed
-        // like any other: its names go with its creator below, its bytes here (`load.rs`).
-        self.fail_tables_loading(marks.frames);
+    ///
+    /// A tracing host is told, in this order: each activation the unwind leaves; the limit, if
+    /// `e` is one; then a failed `Loaded` for each table `Load` or `LoadTable` was loading, so that
+    /// no `Load` goes without its `Loaded`. Those tables fail like any other: their names go with
+    /// their creators in the unwind, their bytes in `fail_tables_loading` (`load.rs`).
+    pub(crate) fn abort(&mut self, marks: Marks, e: &Error) {
+        let tables = self.fail_tables_loading(marks.frames);
         self.unwind(marks.frames, marks.calls, marks.owners);
         self.release_held(marks.held);
         self.result = Val::None;
+        self.trace_limit(e);
+        for _ in 0..tables {
+            self.trace(&Trace::Loaded(Err(*e)));
+        }
     }
 
     /// Pops frames, activations and creators above the given marks; the names those creators

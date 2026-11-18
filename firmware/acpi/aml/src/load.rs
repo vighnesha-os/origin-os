@@ -467,18 +467,22 @@ impl<H: Host> Interpreter<H> {
     }
 
     /// Fails every table a [`Loading`] frame above `frames` was loading, when an evaluation is
-    /// aborted (`abort`): their names go with their creators there.
-    pub(crate) fn fail_tables_loading(&mut self, frames: usize) {
+    /// aborted (`abort`), and says how many: their names go with their creators there, and
+    /// `abort` tells a tracing host each failed. One pass over the frames, as the unwind's own.
+    pub(crate) fn fail_tables_loading(&mut self, frames: usize) -> usize {
         if self.loading == 0 {
-            return;
+            return 0;
         }
+        let mut failed = 0usize;
         let mut k = frames;
         while let Some(f) = self.frames.get(k).copied() {
             if let Frame::Loading(l) = f {
                 self.fail_table(l.table);
+                failed = failed.saturating_add(1);
             }
             k = k.saturating_add(1);
         }
+        failed
     }
 
     /// The operator's value: True (Ones) if the table loaded, else Zero; `Load` also stores it in

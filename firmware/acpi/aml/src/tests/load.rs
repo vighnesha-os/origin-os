@@ -454,6 +454,67 @@ fn a_load_is_traced() {
     );
 }
 
+#[test]
+fn a_limit_inside_nested_loads_is_traced_for_each_table() {
+    // A tracing host is told of the limit, then of each table being loaded, innermost first, as
+    // it is told of a failed load anywhere: no `Load` without its `Loaded`.
+    let limits = Limits {
+        loop_iterations: 100,
+        ..Limits::SERVICE
+    };
+    let spin = ssdt(&[name("QB0", one()), while_(one(), &[noop()])]);
+    let outer = ssdt(&[name("QA0", one()), load_op("\\TI", none())]);
+    let body = [
+        name("TI", buffer_of(&spin)),
+        name("TO", buffer_of(&outer)),
+        m("LD", &[ret(load_op("TO", none()))]),
+    ];
+    let loads = |events: Vec<Event>| -> Vec<Event> {
+        events
+            .into_iter()
+            .filter(|e| matches!(e, Event::Load(_) | Event::Loaded(_) | Event::Limit(_)))
+            .collect()
+    };
+    let failed = Event::Loaded(Err(ErrorKind::Limit(Limit::Loops)));
+    // In an evaluation.
+    let mut i = interp_with(IntegerWidth::Bits64, limits);
+    load(&mut i, &body).unwrap();
+    i.host_mut().events = Some(Vec::new());
+    assert_eq!(fails(&mut i, "LD"), ErrorKind::Limit(Limit::Loops));
+    assert_eq!(
+        loads(i.host_mut().events.take().unwrap()),
+        vec![
+            Event::Load(*b"SSDT"),
+            Event::Load(*b"SSDT"),
+            Event::Limit(Limit::Loops),
+            failed.clone(),
+            failed.clone(),
+        ]
+    );
+    assert_eq!(named(&i, b"Q"), 0);
+    // In a block's own load: its table is told last.
+    let mut j = interp_with(IntegerWidth::Bits64, limits);
+    j.host_mut().events = Some(Vec::new());
+    let mut top = body.to_vec();
+    top.push(load_op("\\TO", none()));
+    assert_eq!(
+        load(&mut j, &top).map_err(|e| e.kind),
+        Err(ErrorKind::Limit(Limit::Loops))
+    );
+    assert_eq!(
+        loads(j.host_mut().events.take().unwrap()),
+        vec![
+            Event::Load(*b"SSDT"),
+            Event::Load(*b"SSDT"),
+            Event::Load(*b"SSDT"),
+            Event::Limit(Limit::Loops),
+            failed.clone(),
+            failed.clone(),
+            failed,
+        ]
+    );
+}
+
 // --- `LoadTable` -------------------------------------------------------------------------------
 
 const KEY: (&[u8; 4], &[u8; 6], &[u8; 8]) = (b"OEMT", b"ORIGIN", b"AMLTEST\0");
