@@ -341,7 +341,8 @@ fn a_data_table_region_reads_the_table_the_host_names() {
             oem_table_id: *b"AMLTEST\0",
         },
         0x7000,
-        vec![0; 64],
+        // A sound table of 64 bytes: the copy is checked before its address is taken (B2-14).
+        table(b"OEMX", 2, &[vec![0; 28]]),
     ));
     load(
         &mut i,
@@ -357,6 +358,77 @@ fn a_data_table_region_reads_the_table_the_host_names() {
     .unwrap();
     i.host_mut().memory.insert((0, None, 0x700A), 0x42);
     assert_eq!(int(&mut i, "RD"), 0x42);
+}
+
+/// The review of B2, B2-14 (built in B4): a copy that is not a sound table under the key gives
+/// the region nothing, and nothing is read.
+#[test]
+fn a_data_table_region_is_refused_on_a_copy_that_fails_its_check() {
+    let sound = table(b"OEMX", 2, &[vec![0; 28]]);
+    let resum = |mut t: Vec<u8>| {
+        t[9] = 0;
+        let sum = t.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+        t[9] = 0u8.wrapping_sub(sum);
+        t
+    };
+    let cases: [(&str, Vec<u8>); 5] = [
+        ("a bad checksum", {
+            let mut t = sound.clone();
+            t[40] ^= 1;
+            t
+        }),
+        ("a length not the copy's", {
+            let mut t = sound.clone();
+            t[4] = 63;
+            resum(t)
+        }),
+        ("a short header", sound[..30].to_vec()),
+        (
+            "another signature",
+            resum({
+                let mut t = sound.clone();
+                t[3] = b'Y';
+                t
+            }),
+        ),
+        (
+            "other IDs",
+            resum({
+                let mut t = sound.clone();
+                t[10] = b'X';
+                t
+            }),
+        ),
+    ];
+    for (what, bytes) in cases {
+        let mut i = interp(IntegerWidth::Bits64);
+        i.host_mut().tables.push((
+            TableKey {
+                signature: *b"OEMX",
+                oem_id: *b"ORIGIN",
+                oem_table_id: *b"AMLTEST\0",
+            },
+            0x7000,
+            bytes,
+        ));
+        load(
+            &mut i,
+            &[m(
+                "RD",
+                &[
+                    data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST")),
+                    ret(one()),
+                ],
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            i.evaluate("RD", &[]).map_err(|e| e.kind),
+            Err(ErrorKind::Host(HostError::Failed)),
+            "{what}"
+        );
+        assert!(i.host().seen.is_empty(), "{what}");
+    }
 }
 
 #[test]

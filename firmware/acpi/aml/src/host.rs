@@ -47,10 +47,10 @@
 //! not wait: a host queues a notification, records a report or a trace, and stops in no debugger,
 //! rather than block the evaluation. `table` copies a table the host already holds, from the XSDT
 //! it read at boot: `LoadTable` loads the bytes, and `DataTableRegion` keeps only the address and
-//! the length. **The library checks the copy before `LoadTable` loads it** (B4), with
-//! `origin-acpi-tables`: a header whose length is the copy's, a checksum, and the key's signature
-//! and IDs. A copy that fails gives `LoadTable` Zero. `LoadTable` never asks for a `DSDT` or an
-//! `SSDT`.
+//! the length. **The library checks the copy before it uses either** (B4; the review of B2,
+//! B2-14), with `origin-acpi-tables`: a header whose length is the copy's, a checksum, and the
+//! key's signature and IDs. A copy that fails gives `LoadTable` Zero and `DataTableRegion` a
+//! [`HostError::Failed`]. `LoadTable` never asks for a `DSDT` or an `SSDT`.
 //!
 //! **Tracing allocates nothing**, so that a host tracing the interpreter sees what one that does
 //! not would have done: method paths are written into a fixed buffer of 32 segments, and a deeper

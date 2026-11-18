@@ -89,7 +89,8 @@ fn checked_span<'a>(bytes: &'a [u8], want: &[u8; 4]) -> Option<tables::Table<'a>
 }
 
 /// Whether `bytes`, a host's copy of the table under `key`, is that table, sound: a header, a
-/// length exactly the copy's, a checksum, and the key's signature and IDs.
+/// length exactly the copy's, a checksum, and the key's signature and IDs. For `LoadTable` and
+/// `DataTableRegion` (the review of B2, B2-14).
 pub(crate) fn answers(key: &TableKey, bytes: &[u8]) -> bool {
     tables::check(bytes).is_ok_and(|t| {
         let h = t.header();

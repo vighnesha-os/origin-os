@@ -7,7 +7,7 @@ use crate::Interpreter;
 use crate::convert::Data;
 use crate::engine::{Frame, Loc, OpFrame, Operand};
 use crate::error::{Error, ErrorKind, Result, err};
-use crate::host::Host;
+use crate::host::{Host, HostError};
 use crate::mem;
 use crate::name::{AmlName, TextName};
 use crate::object::{
@@ -725,15 +725,22 @@ impl<H: Host> Interpreter<H> {
                 return err(ErrorKind::Range);
             }
         }
+        // The host's copy is checked before its address and length are taken (the review of B2,
+        // B2-14): a copy that is not a sound table under the key gives the region nothing.
         let mut found = None;
         let present = self
             .host
             .table(&key, &mut |address, bytes| {
-                found = Some((address, u64::try_from(bytes.len()).unwrap_or(0)));
+                found = Some((
+                    address,
+                    u64::try_from(bytes.len()).unwrap_or(0),
+                    crate::load::answers(&key, bytes),
+                ));
             })
             .map_err(ErrorKind::Host)?;
         let (offset, length) = match found {
-            Some(t) if present => t,
+            Some((address, length, true)) if present => (address, length),
+            Some((_, _, false)) if present => return err(ErrorKind::Host(HostError::Failed)),
             _ => return err(ErrorKind::NotFound),
         };
         let obj = self.heap.alloc(Object::Uninitialized, &mut self.budget)?;
