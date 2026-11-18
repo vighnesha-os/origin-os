@@ -683,7 +683,7 @@ fn stale_self_runs(file: &str, source: &str) -> Vec<&'static str> {
 }
 
 /// The token indices of `tokens` inside an item under `#[cfg(test)]`, as ranges.
-pub(crate) fn test_items(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
+fn test_items(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     for i in 0..tokens.len() {
         let attribute = ["#", "[", "cfg", "(", "test", ")", "]"];
@@ -1171,7 +1171,9 @@ fn planted_control_again() -> Command {
 
 /// A scenario command of `boot-matrix`'s as it was before TASKS item 61: `boot_x2apic`,
 /// re-running `xtask boot-test` with each machine's settings in its child's environment. Planted
-/// by the controls: no scenario command is listed since TASKS item 61.
+/// by the controls: no scenario command is listed since TASKS item 61, and this control is the
+/// proof that decision item 312's general form ("any scenario command that re-runs `xtask` the
+/// same way") is closed with it.
 const PLANTED_SCENARIO_RERUN: &str = r#"
 fn boot_x2apic() -> Result {
     let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;

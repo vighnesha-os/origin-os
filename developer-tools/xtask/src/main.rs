@@ -192,12 +192,17 @@ environment:
                                       process runs inside it instead of waiting for it
   ORIGIN_LOOM_DEEP                    if set, the Loom models search to their deeper bounds
                                       (a long run; the default search is part of check)
-  ORIGIN_OVMF_CODE, ORIGIN_OVMF_VARS  firmware code image and NVRAM template
+  The ORIGIN_OVMF_, ORIGIN_BOOT_ and ORIGIN_QEMU_ variables below are read once, when a boot
+  command (boot-test, boot-console, run, boot-matrix or one of its scenario commands) starts.
+  An empty value is an unset one, and a value a variable does not take is refused. boot-matrix
+  and its scenario commands set each machine's own over them in this process, and give none of
+  them to another (TASKS item 61).
+  ORIGIN_OVMF_CODE, ORIGIN_OVMF_VARS  firmware code image and NVRAM template, both or neither
                                       (default: the EDK2 files installed next to QEMU)
-  The ORIGIN_BOOT_TEST_ and ORIGIN_QEMU_ variables below are read once, when a boot command
-  (boot-test, boot-console, run, boot-matrix or one of its scenario commands) starts, and a
-  value one does not take is refused; boot-matrix and its scenario commands set each machine's
-  own over them in this process, and give none of them to another (TASKS item 61).
+  ORIGIN_BOOT_MATRIX_ANY_COUNT        on or off: in CI (GITHUB_ACTIONS=true), whether
+                                      boot-matrix runs the 3- and 65-processor machines, the
+                                      67-processor sparse machine and the discovery machine;
+                                      elsewhere they always run
   ORIGIN_BOOT_TEST_TIMEOUT            boot-test timeout in seconds (default 120)
   ORIGIN_BOOT_TEST_ONLY               run only the boot-test or boot-console scenarios whose
                                       label contains one of these comma-separated strings
@@ -211,8 +216,8 @@ environment:
                                       300 and 412; many: two packages of 144 cores, 288
                                       processors with APIC IDs 0-143 and 256-399; listed: 2
                                       processors of 4096 the MADT lists (ORIGIN_QEMU_SMP is
-                                      then ignored; ADR-0008 Amendment 1, D7); unset or empty:
-                                      the plain machine of ORIGIN_QEMU_SMP processors
+                                      refused with any of them; ADR-0008 Amendment 1, D7);
+                                      unset: the plain machine of ORIGIN_QEMU_SMP processors
   ORIGIN_QEMU_CPU                     the QEMU CPU model (default max), e.g. max,-avx2 or
                                       max,vendor=GenuineIntel (which exposes leaf 1Fh on
                                       the boot-x2apic machine)
@@ -410,30 +415,6 @@ impl Iommu {
     }
 }
 
-/// What an `ORIGIN_QEMU_IOMMU` value selects: `intel` (the default), `amd`, or an
-/// `intel-iommu` `-device` value; anything else is refused by [`check_iommu`].
-fn parse_iommu(value: Option<&str>) -> Iommu {
-    match value {
-        None | Some("" | "intel") => Iommu::Intel,
-        Some("amd") => Iommu::Amd,
-        Some(other) => Iommu::Device(other.into()),
-    }
-}
-
-/// Refuses an `ORIGIN_QEMU_IOMMU` the boot test cannot check, rather than booting another
-/// IOMMU: a raw `-device` value is booted with the VT-d markers, so it must be an
-/// `intel-iommu` ([`Settings::from_env`]).
-fn check_iommu(iommu: &Iommu) -> Result {
-    match iommu {
-        Iommu::Device(device) if device != "intel-iommu" && !device.starts_with("intel-iommu,") => {
-            Err(format!(
-                "ORIGIN_QEMU_IOMMU must be intel, amd or an intel-iommu -device value, not {device:?}"
-            ))
-        }
-        _ => Ok(()),
-    }
-}
-
 /// The QEMU arguments of the `boot-acpi` machine beyond the usual ones (TASKS item 62; ADR-0019
 /// A7): `nvdimm=on,hmat=on` go in through `ORIGIN_QEMU_MACHINE`; here, an NVDIMM in node 1 (the
 /// NFIT), a third node with no memory and no processor holding the NVMe controller as a generic
@@ -568,18 +549,6 @@ enum Accel {
 }
 
 impl Accel {
-    /// The accelerator a value of `ORIGIN_QEMU_ACCEL` names: unset, empty or `tcg` is TCG.
-    fn named(value: Option<&str>) -> Result<Accel> {
-        match value.filter(|v| !v.is_empty()) {
-            None | Some("tcg") => Ok(Accel::Tcg),
-            Some("kvm") => Ok(Accel::Kvm),
-            Some(other) => Err(format!(
-                "{} must be tcg or kvm, not {other:?}",
-                settings::ACCEL
-            )),
-        }
-    }
-
     /// The `-machine` value. Interrupt remapping needs the I/O APIC in QEMU, not in the host
     /// kernel, hence the split irqchip.
     fn machine(self) -> &'static str {
@@ -788,99 +757,105 @@ impl Machine {
 /// die 2, module 3, core 4 (APIC ID 412): its die, module and core are all non-zero, so a
 /// decoder that confuses them shows (docs/research/2026-11-08-cpu-topology-leaf-1fh.md).
 fn machine(settings: &Settings) -> Machine {
-    if settings.topology == Topology::X2apic {
-        // The cold-plugged processors are of the boot processor's model: QEMU names their
-        // type after the model (`max` -> `max-x86_64-cpu`) and applies `-cpu`'s features.
-        let base = settings.cpu.split(',').next().unwrap_or("max");
-        return Machine {
-            smp: "1,maxcpus=150,sockets=2,dies=3,modules=5,cores=5,threads=1".into(),
-            devices: vec![
-                format!("{base}-x86_64-cpu,socket-id=1,die-id=0,module-id=0,core-id=0,thread-id=0"),
-                format!("{base}-x86_64-cpu,socket-id=1,die-id=2,module-id=3,core-id=4,thread-id=0"),
-            ],
-            apic_ids: vec![0, 256, 412],
-            listed: 150,
-            highest: 420,
-            geometry: Geometry {
+    let cpus = match settings.topology {
+        Topology::Plain(cpus) => cpus,
+        Topology::X2apic => {
+            // The cold-plugged processors are of the boot processor's model: QEMU names their
+            // type after the model (`max` -> `max-x86_64-cpu`) and applies `-cpu`'s features.
+            let base = settings.cpu.split(',').next().unwrap_or("max");
+            return Machine {
+                smp: "1,maxcpus=150,sockets=2,dies=3,modules=5,cores=5,threads=1".into(),
+                devices: vec![
+                    format!(
+                        "{base}-x86_64-cpu,socket-id=1,die-id=0,module-id=0,core-id=0,thread-id=0"
+                    ),
+                    format!(
+                        "{base}-x86_64-cpu,socket-id=1,die-id=2,module-id=3,core-id=4,thread-id=0"
+                    ),
+                ],
+                apic_ids: vec![0, 256, 412],
+                listed: 150,
+                highest: 420,
+                geometry: Geometry {
+                    packages: 2,
+                    dies: 3,
+                    modules: 5,
+                    cores: 5,
+                    threads: 1,
+                },
+            };
+        }
+        Topology::Sparse => {
+            // ADR-0008 Amendment 1, D7 as decision item 294 has it: the gate's large machine. Two
+            // packages of 157 single-thread cores (8 bits of core ID, so package 1 starts at APIC ID
+            // 256), 314 possible; the 64 processors of package 0 that QEMU starts, and three
+            // cold-plugged in package 1 at cores 0, 44 and 156: APIC IDs 256, 300 and 412. 67
+            // processors, three above 255, none a power of two.
+            let base = settings.cpu.split(',').next().unwrap_or("max");
+            let geometry = Geometry {
                 packages: 2,
-                dies: 3,
-                modules: 5,
-                cores: 5,
-                threads: 1,
-            },
-        };
-    }
-    if settings.topology == Topology::Sparse {
-        // ADR-0008 Amendment 1, D7 as decision item 294 has it: the gate's large machine. Two
-        // packages of 157 single-thread cores (8 bits of core ID, so package 1 starts at APIC ID
-        // 256), 314 possible; the 64 processors of package 0 that QEMU starts, and three
-        // cold-plugged in package 1 at cores 0, 44 and 156: APIC IDs 256, 300 and 412. 67
-        // processors, three above 255, none a power of two.
-        let base = settings.cpu.split(',').next().unwrap_or("max");
-        let geometry = Geometry {
-            packages: 2,
-            dies: 1,
-            modules: 1,
-            cores: SPARSE_CORES,
-            threads: 1,
-        };
-        let plugged = [0, 44, 156];
-        let mut apic_ids: Vec<u32> = (0..SPARSE_PRESENT).collect();
-        apic_ids.extend(plugged.iter().map(|core| 256 + core));
-        return Machine {
-            smp: format!(
-                "{SPARSE_PRESENT},maxcpus={},sockets=2,cores={SPARSE_CORES},threads=1",
-                2 * SPARSE_CORES
-            ),
-            devices: plugged
-                .iter()
-                .map(|core| format!("{base}-x86_64-cpu,socket-id=1,core-id={core},thread-id=0"))
-                .collect(),
-            listed: 2 * SPARSE_CORES,
-            highest: 256 + SPARSE_CORES - 1,
-            apic_ids,
-            geometry,
-        };
-    }
-    if settings.topology == Topology::Many {
-        // ADR-0008 Amendment 1, D7: the large sparse machine. 144 cores take 8 bits, so package
-        // 1 starts at APIC ID 256: 288 processors, half of them above 255, none a power of two.
-        let geometry = Geometry {
-            packages: 2,
-            dies: 1,
-            modules: 1,
-            cores: MANY_CORES,
-            threads: 1,
-        };
-        let apic_ids = geometry.ids();
-        return Machine {
-            smp: format!("{0},sockets=2,cores={MANY_CORES},threads=1", 2 * MANY_CORES),
-            devices: Vec::new(),
-            listed: apic_ids.len() as u32,
-            highest: apic_ids.iter().copied().max().unwrap_or(0),
-            apic_ids,
-            geometry,
-        };
-    }
-    if settings.topology == Topology::Listed {
-        // ADR-0008 Amendment 1, D7: the discovery machine. The MADT lists every processor q35
-        // allows, 4096, in one package; two are present and enabled.
-        return Machine {
-            smp: format!("2,maxcpus={LISTED},sockets=1,cores={LISTED},threads=1"),
-            devices: Vec::new(),
-            apic_ids: vec![0, 1],
-            listed: LISTED,
-            highest: LISTED - 1,
-            geometry: Geometry {
-                packages: 1,
                 dies: 1,
                 modules: 1,
-                cores: LISTED,
+                cores: SPARSE_CORES,
                 threads: 1,
-            },
-        };
-    }
-    let cpus = settings.smp;
+            };
+            let plugged = [0, 44, 156];
+            let mut apic_ids: Vec<u32> = (0..SPARSE_PRESENT).collect();
+            apic_ids.extend(plugged.iter().map(|core| 256 + core));
+            return Machine {
+                smp: format!(
+                    "{SPARSE_PRESENT},maxcpus={},sockets=2,cores={SPARSE_CORES},threads=1",
+                    2 * SPARSE_CORES
+                ),
+                devices: plugged
+                    .iter()
+                    .map(|core| format!("{base}-x86_64-cpu,socket-id=1,core-id={core},thread-id=0"))
+                    .collect(),
+                listed: 2 * SPARSE_CORES,
+                highest: 256 + SPARSE_CORES - 1,
+                apic_ids,
+                geometry,
+            };
+        }
+        Topology::Many => {
+            // ADR-0008 Amendment 1, D7: the large sparse machine. 144 cores take 8 bits, so package
+            // 1 starts at APIC ID 256: 288 processors, half of them above 255, none a power of two.
+            let geometry = Geometry {
+                packages: 2,
+                dies: 1,
+                modules: 1,
+                cores: MANY_CORES,
+                threads: 1,
+            };
+            let apic_ids = geometry.ids();
+            return Machine {
+                smp: format!("{0},sockets=2,cores={MANY_CORES},threads=1", 2 * MANY_CORES),
+                devices: Vec::new(),
+                listed: apic_ids.len() as u32,
+                highest: apic_ids.iter().copied().max().unwrap_or(0),
+                apic_ids,
+                geometry,
+            };
+        }
+        Topology::Listed => {
+            // ADR-0008 Amendment 1, D7: the discovery machine. The MADT lists every processor q35
+            // allows, 4096, in one package; two are present and enabled.
+            return Machine {
+                smp: format!("2,maxcpus={LISTED},sockets=1,cores={LISTED},threads=1"),
+                devices: Vec::new(),
+                apic_ids: vec![0, 1],
+                listed: LISTED,
+                highest: LISTED - 1,
+                geometry: Geometry {
+                    packages: 1,
+                    dies: 1,
+                    modules: 1,
+                    cores: LISTED,
+                    threads: 1,
+                },
+            };
+        }
+    };
     Machine {
         smp: cpus.to_string(),
         devices: Vec::new(),
@@ -1332,19 +1307,18 @@ fn is_unfilled_tx_ring(line: &str) -> bool {
 /// TASKS item 61 the machine is the boot's typed settings, not the environment.
 fn oversubscribed(settings: &Settings) -> bool {
     let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    oversubscribed_for(settings.accel, settings.topology, settings.smp, host)
+    oversubscribed_for(settings.accel, settings.topology, host)
 }
 
-/// [`oversubscribed`] for an accelerator, a topology, the plain machine's processor count and
-/// the host's threads. Decision item 308 keeps the host's threads out of the answer: they are
-/// taken only so that the host tests can show that they change nothing.
-fn oversubscribed_for(accel: Accel, topology: Topology, smp: u32, _host_threads: usize) -> bool {
+/// [`oversubscribed`] for an accelerator, a topology (the plain machine's with its processor
+/// count) and the host's threads. Decision item 308 keeps the host's threads out of the answer:
+/// they are taken only so that the host tests can show that they change nothing.
+fn oversubscribed_for(accel: Accel, topology: Topology, _host_threads: usize) -> bool {
     accel == Accel::Tcg
-        && match topology {
-            Topology::Sparse | Topology::Many => true,
-            Topology::X2apic | Topology::Listed => false,
-            Topology::Plain => smp == 65,
-        }
+        && matches!(
+            topology,
+            Topology::Sparse | Topology::Many | Topology::Plain(65)
+        )
 }
 
 /// The two workers' counts on a scheduler proof's line that an oversubscribed boot lets pass
@@ -3725,8 +3699,9 @@ fn boot_matrix(base: &Settings) -> Result {
     }
     fs::write(&bases, "").map_err(|e| format!("{}: {e}", bases.display()))?;
     // ADR-0008 Amendment 1, D7: 3 and 65 processors too, and after the others the large sparse
-    // machine and the discovery machine, unless held out of CI (`any_count_machines`).
-    let any_count = any_count_machines();
+    // machine and the discovery machine, unless held out of CI
+    // (`Settings::runs_any_count_machines`).
+    let any_count = base.runs_any_count_machines();
     let counts: &[u32] = if any_count {
         &[1, 2, 3, 4, 65]
     } else {
@@ -3787,7 +3762,7 @@ fn matrix_runs(base: &Settings, counts: &[u32]) -> Vec<MachineRun> {
                 said: format!("xtask: boot-matrix: {name} IOMMU, {cpus} processor(s)"),
                 settings: Settings {
                     iommu: iommu.clone(),
-                    smp: cpus,
+                    topology: Topology::Plain(cpus),
                     timeout: Some(timeout_for(base, cpus)),
                     ..base.clone()
                 },
@@ -3796,15 +3771,6 @@ fn matrix_runs(base: &Settings, counts: &[u32]) -> Vec<MachineRun> {
         }
     }
     runs
-}
-
-/// Whether `boot-matrix` runs the machines of ADR-0008 Amendment 1, D7: always on a developer's
-/// machine; in CI (GitHub Actions) only with `ORIGIN_BOOT_MATRIX_ANY_COUNT=on`. D7's condition:
-/// none becomes required in CI until each one's boot has been measured on the development Mac,
-/// its share of the real-CPU job stated, and the coordinating session has accepted it.
-fn any_count_machines() -> bool {
-    env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
-        || env::var("ORIGIN_BOOT_MATRIX_ANY_COUNT").as_deref() == Ok("on")
 }
 
 /// A boot's timeout for `cpus` processors: the default, and two seconds more for each processor
@@ -4224,7 +4190,7 @@ fn acpi_runs(base: &Settings) -> Vec<MachineRun> {
         settings: Settings {
             acpi: true,
             machine: "nvdimm=on,hmat=on".into(),
-            smp: 2,
+            topology: Topology::Plain(2),
             only: KERNEL_BOOT.into(),
             ..base.clone()
         },
@@ -6002,13 +5968,12 @@ struct Staged {
     nvme: PathBuf,
 }
 
-fn find_firmware() -> Result<Firmware> {
-    let (code, vars) = match (
-        env::var_os("ORIGIN_OVMF_CODE"),
-        env::var_os("ORIGIN_OVMF_VARS"),
-    ) {
-        (Some(code), Some(vars)) => (PathBuf::from(code), PathBuf::from(vars)),
-        (None, None) => {
+/// The firmware a boot uses: the two files `settings` name (`ORIGIN_OVMF_CODE` and
+/// `ORIGIN_OVMF_VARS`, read with the other settings), or EDK2's beside QEMU.
+fn find_firmware(settings: &Settings) -> Result<Firmware> {
+    let (code, vars) = match &settings.ovmf {
+        Some((code, vars)) => (code.clone(), vars.clone()),
+        None => {
             // Homebrew (and a QEMU source install) keep EDK2 firmware in <prefix>/share/qemu,
             // beside bin/. The x86_64 descriptor there (firmware/60-edk2-x86_64.json) pairs
             // edk2-x86_64-code.fd with the edk2-i386-vars.fd NVRAM template.
@@ -6024,7 +5989,6 @@ fn find_firmware() -> Result<Firmware> {
                 share.join("edk2-i386-vars.fd"),
             )
         }
-        _ => return Err("set both ORIGIN_OVMF_CODE and ORIGIN_OVMF_VARS, or neither".into()),
     };
     for p in [&code, &vars] {
         if !p.is_file() {
@@ -6051,7 +6015,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 /// and a fresh NVRAM copy for one boot on the machine `settings` describe.
 fn stage(kernel: &[u8], loader: Loader, settings: &Settings) -> Result<Staged> {
     let efi = build_loader(loader)?;
-    let firmware = find_firmware()?;
+    let firmware = find_firmware(settings)?;
     let work = target_dir().join("xtask");
     let esp = work.join("esp");
     if esp.exists() {
@@ -6334,7 +6298,7 @@ fn select_scenarios<'a>(
         .collect();
     if chosen.is_empty() {
         return Err(format!(
-            "ORIGIN_BOOT_TEST_ONLY={only:?} matches none of the {} scenarios",
+            "the scenario filter {only:?} (ORIGIN_BOOT_TEST_ONLY) matches none of the {} scenarios",
             scenarios.len()
         ));
     }
@@ -7361,30 +7325,27 @@ mod oversubscribed_tests {
     fn only_the_named_large_software_processor_machines_are_oversubscribed() {
         for host in [1, 2, 4, 10, 64, 256] {
             assert!(
-                oversubscribed_for(Accel::Tcg, Topology::Plain, 65, host),
+                oversubscribed_for(Accel::Tcg, Topology::Plain(65), host),
                 "{host}"
             );
-            assert!(oversubscribed_for(Accel::Tcg, Topology::Sparse, 2, host));
-            assert!(oversubscribed_for(Accel::Tcg, Topology::Many, 2, host));
+            assert!(oversubscribed_for(Accel::Tcg, Topology::Sparse, host));
+            assert!(oversubscribed_for(Accel::Tcg, Topology::Many, host));
             for smp in [1, 2, 3, 4, 11, 64, 66] {
                 assert!(
-                    !oversubscribed_for(Accel::Tcg, Topology::Plain, smp, host),
+                    !oversubscribed_for(Accel::Tcg, Topology::Plain(smp), host),
                     "{smp} processors on {host} host threads"
                 );
             }
-            // `ORIGIN_QEMU_SMP` is not read on these machines; an empty `ORIGIN_QEMU_TOPOLOGY`
-            // is the plain machine since TASKS item 61, and no longer a topology of its own.
+            // The named machines fix their own processors (a count set with one is refused
+            // since TASKS item 61); an empty `ORIGIN_QEMU_TOPOLOGY` is the plain machine.
             for other in [Topology::X2apic, Topology::Listed] {
-                assert!(
-                    !oversubscribed_for(Accel::Tcg, other, 65, host),
-                    "{other:?}"
-                );
+                assert!(!oversubscribed_for(Accel::Tcg, other, host), "{other:?}");
             }
             assert!(
-                !oversubscribed_for(Accel::Kvm, Topology::Plain, 65, host),
+                !oversubscribed_for(Accel::Kvm, Topology::Plain(65), host),
                 "KVM keeps its own allowance"
             );
-            assert!(!oversubscribed_for(Accel::Kvm, Topology::Sparse, 2, host));
+            assert!(!oversubscribed_for(Accel::Kvm, Topology::Sparse, host));
         }
     }
 
@@ -7430,15 +7391,11 @@ mod oversubscribed_tests {
     /// would have waived; each named large machine on a 64-thread host is not.
     #[test]
     fn the_host_changes_nothing_either_way() {
-        let small = oversubscribed_for(Accel::Tcg, Topology::Plain, 4, 2);
+        let small = oversubscribed_for(Accel::Tcg, Topology::Plain(4), 2);
         assert!(!small);
         assert!(!checker_forgives(UNEVEN, Accel::Tcg, small));
-        for (topology, smp) in [
-            (Topology::Plain, 65),
-            (Topology::Sparse, 2),
-            (Topology::Many, 2),
-        ] {
-            let large = oversubscribed_for(Accel::Tcg, topology, smp, 64);
+        for topology in [Topology::Plain(65), Topology::Sparse, Topology::Many] {
+            let large = oversubscribed_for(Accel::Tcg, topology, 64);
             assert!(large, "{topology:?}");
             assert!(checker_forgives(UNEVEN, Accel::Tcg, large), "{topology:?}");
         }
@@ -7765,26 +7722,16 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
         assert!(remapped[0].contains("not under AMD-Vi yet"));
     }
 
-    /// `ORIGIN_QEMU_IOMMU` selects a preset, or passes an `intel-iommu` device through (the
-    /// CPU-index work's negative control X2 boots `intel-iommu,intremap=off`); any other
-    /// device is refused rather than booted against the VT-d markers.
+    /// The QEMU options each IOMMU adds (what `ORIGIN_QEMU_IOMMU` selects is read in
+    /// `settings.rs`, and tested there).
     #[test]
-    fn the_iommu_variable_takes_presets_and_intel_iommu_devices() {
-        assert_eq!(parse_iommu(None), Iommu::Intel);
-        assert_eq!(parse_iommu(Some("")), Iommu::Intel);
-        assert_eq!(parse_iommu(Some("intel")), Iommu::Intel);
-        assert_eq!(parse_iommu(Some("amd")), Iommu::Amd);
+    fn each_iommu_adds_its_devices() {
         assert_eq!(
             Iommu::Intel.device_args(),
             ["-device", "intel-iommu,intremap=on,eim=on"]
         );
-        let off = parse_iommu(Some("intel-iommu,intremap=off"));
-        assert_eq!(off, Iommu::Device("intel-iommu,intremap=off".into()));
+        let off = Iommu::Device("intel-iommu,intremap=off".into());
         assert_eq!(off.device_args(), ["-device", "intel-iommu,intremap=off"]);
-        assert_eq!(check_iommu(&off), Ok(()));
-        assert_eq!(check_iommu(&Iommu::Amd), Ok(()));
-        assert!(check_iommu(&parse_iommu(Some("virtio-iommu-pci"))).is_err());
-        assert!(check_iommu(&parse_iommu(Some("intel-iommu-x"))).is_err());
     }
 
     /// The expected topology lines, computed from the `-smp` fields alone: what QEMU's
@@ -7878,13 +7825,10 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
         assert!(sparse.geometry.has_extended_levels());
     }
 
+    /// Each accelerator's `-machine` value (which `ORIGIN_QEMU_ACCEL` selects is read in
+    /// `settings.rs`, and tested there).
     #[test]
-    fn the_accelerator_is_tcg_unless_kvm_is_asked_for() {
-        assert_eq!(Accel::named(None), Ok(Accel::Tcg));
-        assert_eq!(Accel::named(Some("")), Ok(Accel::Tcg));
-        assert_eq!(Accel::named(Some("tcg")), Ok(Accel::Tcg));
-        assert_eq!(Accel::named(Some("kvm")), Ok(Accel::Kvm));
-        assert!(Accel::named(Some("hvf")).is_err());
+    fn each_accelerator_has_its_machine() {
         assert_eq!(Accel::Tcg.machine(), "q35");
         assert_eq!(Accel::Kvm.machine(), "q35,accel=kvm,kernel-irqchip=split");
     }
