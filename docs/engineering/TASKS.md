@@ -1503,6 +1503,8 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
   - `741efc9b`: `Load` and `LoadTable` (`load.rs`). The engine holds a load in a `Loading` frame below the table's block, and `run_frames` hands a non-limit error inside a loading table to that load. The stand-in for table headers gives way to `origin-acpi-tables`. The tests, the randomized grammar and four planted faults come with it.
   - `741cc7d0`: `DataTableRegion` checks the host's copy (the review of B2, B2-14).
   - `aa601a1c`: the allocation gate found the plant's copy in `load.rs`, under `#[cfg(test)]`, and it moved to the tests.
+  - `6facbd77`, found reading the code while the first gate run went: a limit that ended an evaluation in the middle of a load gave a tracing host `Load` and never `Loaded`. `abort` now tells each table being loaded failed, after the limit.
+  - `f42c80b9`: a sweep refuses each allocation of a nested load in turn, which also catches the gap `6facbd77` closed. `Load` is now traced after its frame is pushed, a branch unreachable today.
 - **The strict choices** are the ledger's §9: Q2 (`Load` takes an SSDT only), Q3, Q4 (True is Ones), Q6 (no `DSDT` or `SSDT` key for `LoadTable`), Q7, Q8, G17 (no `_INI` or `_REG` after a run-time load) and G18 (an ID matches through NUL or space padding).
 - **Found while building:**
   - A first `Loading` frame holding the whole operand frame made every frame on the engine's stack 336 bytes in place of 280. It now keeps two operands, 128 bytes, and the frames are 280 again.
