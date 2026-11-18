@@ -1482,6 +1482,38 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
     - **The largest tables,** the discovery machine's 496,558 bytes of AML: loaded in 230 ms, 4,132 devices walked in 122 ms, the interpreter holding at most 11,897,534 bytes in 32,516 nodes.
     - **The stack:** on every boot the deepest host call was 47,599 bytes above the boot stack's guard page; on the default machine it was 5,808 bytes below the proof's entry.
 
+**Step B4 (2026-11-18): B3's four Lows, then `Load` and `LoadTable`, on branch `claude/aml-load`, cut from `land/batch-6` at `553bf6ef`** after the keeper merged B3 into it (`17df8543`).
+- **The contract.** `t63-b4-contract.md` in the coordination notes, accepted by the coordinating session on 2026-11-18 with Q1 to Q12 as recommended. Its conditions:
+  - Q1: a DSDT whose header cannot be read, or a FADT naming none, still fails "no DSDT".
+  - Q2, Q6 and Q9: recorded in the ledger as strict choices or gaps, with their sections and pages, and G17 added to the gaps TASKS item 64 reads.
+  - Q5: a region is read only within its declared span, checked whole before the first access; at boot `BootHost` refuses it.
+  - Q11: only the symbols `origin-acpi-tables`' own object defines, while that crate passes its own check.
+  - No Rust recursion in a nested load, shown on a fixed native stack.
+  - The soak's grammar loads inside nested evaluations, with loads that fail midway, and checks that no name of a failed table is left.
+  - CL41 gains the table check's cost on the host, marked indicative.
+  - One review of the whole step, B4-0 read first (Q10).
+- **B4-0, a commit each:**
+  - B3-13 `44cddba5`: the DSDT's IDs judged from its copied header, before its checksum.
+  - B3-14 `b293aee6`: each of the bound's checks first in a test, its time half with a clock that moves, and the FADT search's own reason.
+  - B3-15 `593b6cb4`: the drift check counts every crate the allowed lists name.
+  - B3-18 `4c2ef795`: the not-QEMU line fails xtask's QEMU scenarios only.
+- **B4-1:**
+  - `bfbc229a`: the planted loose memory limit loosens `reserve`'s room as well, so the control does not hang on which check refuses first.
+  - `3d0490b8`: xtask: `origin-aml`'s layer and its no-panic allowance (Q11).
+  - `741efc9b`: `Load` and `LoadTable` (`load.rs`). The engine holds a load in a `Loading` frame below the table's block, and `run_frames` hands a non-limit error inside a loading table to that load. The stand-in for table headers gives way to `origin-acpi-tables`. The tests, the randomized grammar and four planted faults come with it.
+  - `741cc7d0`: `DataTableRegion` checks the host's copy (the review of B2, B2-14).
+  - `aa601a1c`: the allocation gate found the plant's copy in `load.rs`, under `#[cfg(test)]`, and it moved to the tests.
+- **The strict choices** are the ledger's §9: Q2 (`Load` takes an SSDT only), Q3, Q4 (True is Ones), Q6 (no `DSDT` or `SSDT` key for `LoadTable`), Q7, Q8, G17 (no `_INI` or `_REG` after a run-time load) and G18 (an ID matches through NUL or space padding).
+- **Found while building:**
+  - A first `Loading` frame holding the whole operand frame made every frame on the engine's stack 336 bytes in place of 280. It now keeps two operands, 128 bytes, and the frames are 280 again.
+  - The larger frame had also moved one adversarial block's memory refusal from the budget's charge to `reserve`'s room, where the planted loose limit did not reach, and the control went uncaught (`bfbc229a`).
+- **Not covered by B4:**
+  - a boot that runs either operator (QEMU's tables use neither);
+  - `Unload` (G8);
+  - `_INI` and `_REG` for what a run-time load adds (G17, the ACPI service's);
+  - a region or field as `Load`'s source in the soak's grammar (semantic tests only);
+  - any physical machine.
+
 
 ### 60. The host tools are libraries first (ADR-0011 Amendment 4, T1)
 

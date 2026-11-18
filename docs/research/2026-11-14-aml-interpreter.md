@@ -138,7 +138,7 @@ What the tables show:
 - **Q2. `Processor`.** Ruled: accepted as an object of type 12, with the layout ACPI 6.6 still leaves in its grammar (`ProcID`, `PblkAddr` and `PblkLen`, PDF 1137) and QEMU's bytes show: a package length, a name, a processor ID byte, a P_BLK address dword and a length byte, then a term list. **This is a deliberate departure from 6.6's reserved code** (Table 20.2, PDF 1145), because deployed firmware and QEMU 11.1.3 use it and ADR-0019 A1 asks for what a platform can present.
 - **Q3. QEMU's tables as test fixtures.** Ruled: not committed. The host tests use encoder-made blocks; the boot proof (step B3) reads QEMU's tables at boot; an optional host test reads dumps from the directory `ORIGIN_AML_TABLES` names.
 - **Q4. `_OSI`, `_OS` and `_REV`** (ADR-0019 T5). **Decided: ADR-0019 Amendment 1, decision item 309**, accepted by the owner on 2026-11-14 ("Accept 309"): `Ones` for the 22 Windows strings of M1, `Zero` for everything else, `Linux` included; feature-group strings added only when built; `_REV` = 2; one table, a change to which is the owner's. **`_OS` = "Origin OS" stays provisional** until the ACPICA reading session answers G10 with evidence, and then goes to the owner as an item of its own.
-- **The gaps G1 to G12** go to a separate session (TASKS 64), which reads ACPICA under CLAUDE.md §3 and writes only `docs/research/2026-11-14-aml-gaps-acpica.md`. This session reads that ledger, never ACPICA. Until it answers, each strict choice below is marked in the code and here as "strict until the reading session answers"; an answer that changes one changes it with a test. Before the code leaves the batch for `main`, CLAUDE.md §6's similarity check runs against the ACPICA files that ledger cites (§3, item 121).
+- **The gaps G1 to G12, and G13 to G18 added since** (G13 to G16 by the reviews of B1 and B2, G17 and G18 by step B4), go to a separate session (TASKS 64), which reads ACPICA under CLAUDE.md §3 and writes only `docs/research/2026-11-14-aml-gaps-acpica.md`. This session reads that ledger, never ACPICA. Until it answers, each strict choice below is marked in the code and here as "strict until the reading session answers"; an answer that changes one changes it with a test. Before the code leaves the batch for `main`, CLAUDE.md §6's similarity check runs against the ACPICA files that ledger cites (§3, item 121).
 
 **Gaps the specification leaves, which a separate session may answer from ACPICA under CLAUDE.md §3 and ADR-0019 A4**
 
@@ -158,6 +158,8 @@ What the tables show:
 - **G14.** Whether deployed firmware has a `Package` or `VarPackage` with more elements than its count (§19.6.102 makes it an ASL compile-time error, which says nothing of AML a compiler did not check), and what deployed interpreters do: refuse, keep the first elements, or grow the package. Found while fixing the review's F4: the randomized test's generator wrote such packages.
 - **G15.** A string stored to a field unit: whether it is written a character at a time, each zero-extended to the field (the literal reading of Table 19.7, so `Store ("ABCD", F32)` leaves the field `0x44`), or its bytes laid into the field as a buffer's would be (raised by the review of B2, B2-13).
 - **G16.** A field whose access width is wider than its region (a `DWordAcc` field of 8 bits in a 3-byte region): whether deployed interpreters narrow the access to fit, or refuse it (raised by the review of B2, B2-8).
+- **G17.** After `Load` or `LoadTable` adds a table at run time, whether deployed operating systems run `_INI` for its devices and `_REG` for its operation regions, and when (B4's contract, Q9). §19.6.77 and §19.6.78 (PDF 1070, 1071) say only that the new block's control methods are not run while it loads. The library runs neither: that is for the ACPI service (ADR-0019 A2) to decide.
+- **G18.** How `LoadTable`'s strings are compared with a table's fixed-length ID fields. §19.6.78 (PDF 1071) makes the comparisons case-sensitive and a string longer than its field an error, but says nothing of a shorter string: whether the table's field must then hold NUL, spaces or anything after it. Tables pad their IDs with spaces as a rule (QEMU's `"BXPC    "`).
 
 **The strict choices, each "strict until the reading session answers"** (the contract, `t63-contract.md` §4):
 
@@ -178,6 +180,28 @@ What the tables show:
 | G14 | A package with more elements than its count is a `Range` error |
 | G15 | A string is written to a field a character at a time, each zero-extended |
 | G16 | A unit of the field's access width that passes the region's end is refused (`Range`); no access is narrowed |
+| G17 | Neither `_INI` nor `_REG` runs for what `Load` or `LoadTable` adds; the library leaves both to the ACPI service |
+| G18 | A string matches a field when the field holds its characters, then only NUL or space to its end |
+
+**`Load` and `LoadTable`: what step B4 built, and its strict choices** (S1 §19.6.77 and §19.6.78, PDF 1070 and 1071, read again on 2026-11-18; B4's contract, accepted with its twelve questions as recommended the same day). Paraphrased:
+
+- **What the text asks.**
+  - `Load` takes an operation region in SystemMemory, a field of one, or a buffer, holding a definition block wholly inside it. The OS reads the table into memory, verifies its checksum and loads it into the namespace, by default at the root. Its Boolean result, zero for failure, goes to the optional target and is the operator's value too.
+  - `LoadTable` searches the XSDT by signature, OEM ID and OEM table ID, case-sensitively. A string longer than 4, 6 or 8 characters is a run-time error. The root path is evaluated by the usual scoping rules from the current scope; when none is given the root is meant (the extracted text loses its backslash, as it does in the next paragraph's "backslash" character). After the table is added, `ParameterData` is stored into `ParameterPathString`: taken as written after a backslash or caret, else under the root path. If that object does not exist, a run-time error results.
+  - For both: the table is in memory marked reserved or NVS, the load is synchronous, and none of the new block's control methods runs while it loads. The note that the OS loads the DSDT and every SSDT itself, so tables meant for `LoadTable` are signed otherwise, is §19.6.78's.
+- **Strict choices** (each marked so in `load.rs`):
+  - **Q2.** `Load` takes a block signed `SSDT` only (§19.6.77's "should"). Another signature gives Zero.
+  - **Q3.** A failed check, or a term list that fails other than by a limit, rolls the table back whole and gives Zero. A limit ends the evaluation, and the table goes with it.
+  - **Q4.** True is Ones at the integer width.
+  - **Q6.** `LoadTable` of a `DSDT` or `SSDT` key gives Zero without asking the host (§19.6.78's note).
+  - **Q7.** A table loaded twice fails at its first duplicate name (as G3).
+  - **Q8.** A completed load stays if its evaluation fails later.
+  - G17 and G18, above.
+- **What the library leaves to its host.**
+  - Whether a region is in reserved or NVS memory: a host decides every region access (ADR-0019 A2).
+  - The text's optional check of a database for a newer revision of the same table: not done.
+- **How a region is read** (Q5). The whole span is checked first: it must lie in the address space, and the memory limit must hold it. Then it is read through the host in the widest naturally aligned accesses, each a unit of work, only within the region as declared.
+- **Cost** (B4's contract): the check of a table before it loads is `origin-acpi-tables`', counted in CL41 as an indicative host figure.
 
 
 **Inconsistencies in the ACPI 6.6 text found while reading** (for the errata check of Q1; each is resolved by a choice the contract names)
