@@ -4758,6 +4758,16 @@ fn check() -> Result {
         "--lib",
         "aml_proof::",
     ]))?;
+    // The same for the interpreter's nested loads: a load 1,200 calls deep on a 32 KiB thread,
+    // release only (TASKS item 63, step B4; the review of B4, B4-6).
+    run_step(cargo().args([
+        "test",
+        "--release",
+        "--package",
+        AML_PACKAGE,
+        "--lib",
+        "tests::load::nested_loads",
+    ]))?;
     // The loader in developer mode too (the boot test's variant).
     for loader in [Loader::Developer, Loader::Verifying] {
         run_step(cargo().args([
