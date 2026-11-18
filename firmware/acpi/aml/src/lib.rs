@@ -88,7 +88,7 @@ pub use init::InitOutcome;
 pub use osi::{OS_NAME, OSI_STRINGS, REV};
 #[doc(hidden)]
 pub use probe::no_panic_probe;
-pub use value::{Node, Value};
+pub use value::{Node, Plain, Value};
 
 use alloc::vec::Vec;
 
@@ -167,6 +167,8 @@ pub struct Interpreter<H: Host> {
     /// of them (`sync.rs`).
     global_depth: u32,
     run: RunCounts,
+    /// Steps counted by every evaluation so far, loads included ([`Interpreter::steps_done`]).
+    steps_done: u64,
     /// The frame count below which the running evaluation does not reach.
     base: usize,
     /// The value the running evaluation ended with.
@@ -220,6 +222,13 @@ impl<H: Host> Interpreter<H> {
     /// Objects alive in the arena.
     pub const fn object_count(&self) -> usize {
         self.heap.live()
+    }
+
+    /// Steps counted by every top-level evaluation so far, loads and the initialization walk's
+    /// included: for a caller that bounds several evaluations together, as the kernel's boot proof
+    /// does (the review of B3, B3-1). Each evaluation is still bounded by the limits on its own.
+    pub const fn steps_done(&self) -> u64 {
+        self.steps_done
     }
 
     /// Tables loaded or attempted, failed ones included.

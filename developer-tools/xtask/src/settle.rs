@@ -64,6 +64,11 @@ const EXEMPT: &[(&str, &str, &str)] = &[
         "snapshot",
         "reads the counts for clauses that call `sched::settle` just before it",
     ),
+    (
+        "framekernel/src/aml_proof.rs",
+        "prove",
+        "runs on the loader's stack before the first thread exists, the other processors started and idle: nothing reaps, retires a stack or allocates while it runs, so the heap moves with the proof alone; it compares the heap's bytes only, not the free frames (TASKS item 63, step B3, and the coordinating session's ruling on its heap check)",
+    ),
 ];
 
 /// Runs the gate on the checkout.

@@ -268,6 +268,9 @@ const FREESTANDING_LIBS: &[&str] = &[
     BOOT_INFO_PACKAGE,
     // ACPI 6.6's tables (ADR-0019 A6, area A): the kernel's census of them.
     "origin-acpi-tables",
+    // The AML interpreter (ADR-0019 A3), which the kernel's boot proof runs (TASKS item 63, step
+    // B3). Its no-panic check is its own (`no_panic_check`), with `alloc`.
+    AML_PACKAGE,
     ONBF_FORMAT_PACKAGE,
     MERKLE_PACKAGE,
     CRYPTO_PACKAGE,
@@ -280,8 +283,9 @@ const FREESTANDING_LIBS: &[&str] = &[
     "origin-directory",
 ];
 /// The services' `no_std` logic, which programs will run in ring 3 and the host tests until then.
-const SERVICE_LIBS: &[&str] = &["origin-directory-service", AML_PACKAGE];
-/// The AML interpreter (ADR-0019 A3; TASKS item 63): a service's logic, `no_std` with `alloc`.
+const SERVICE_LIBS: &[&str] = &["origin-directory-service"];
+/// The AML interpreter (ADR-0019 A3; TASKS item 63): `no_std` with `alloc`, in the kernel since
+/// its boot proof (step B3), and the ACPI service's logic when that exists.
 const AML_PACKAGE: &str = "origin-aml";
 const QEMU: &str = "qemu-system-x86_64";
 /// Where the emulated RTC starts (UTC), so the boot test can check the wall clock the
@@ -2206,6 +2210,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "; consistent true".into(),
         ])
         .chain(acpi_markers())
+        .chain(aml_markers())
         .chain([
             // The random-number generator (ADR-0016): every processor has one, requests are
             // answered with values that differ, and its stack holds only zeros after a request.
@@ -2598,6 +2603,39 @@ fn acpi_markers() -> Vec<String> {
     markers
 }
 
+/// The boot proof of the AML interpreter (TASKS item 63, step B3; ADR-0019 A3), as QEMU 11.1.3's
+/// tables give it on every machine here: the DSDT loaded (and on the ACPI machine, its NVDIMM's
+/// SSDT after it), every named result as expected, every device that failed refused in the ways
+/// the proof allows, the HPET's, the processors' and the links' refusals there, the host having
+/// answered nothing but refusals and given the Global Lock back, and the heap back.
+fn aml_markers() -> Vec<String> {
+    let mut markers: Vec<String> = vec![
+        "origin-kernel: aml: DSDT rev ".into(),
+        ": loaded as table 0".into(),
+    ];
+    if qemu_acpi() {
+        markers.push("origin-kernel: aml: SSDT rev ".into());
+        markers.push(": loaded as table 1".into());
+    }
+    markers.extend(
+        [
+            "origin-kernel: aml: named results: ",
+            "; all true",
+            "origin-kernel: aml: walk: ",
+            " 0 failed otherwise; HPET's _STA refused in SystemMemory true; ",
+            " processors, each _STA refused in SystemIO true; ",
+            " links (LNKx), each _STA refused in PCI_Config true",
+            "origin-kernel: aml: the host: ",
+            "; answered otherwise 0; Global Lock taken ",
+            "origin-kernel: aml: ",
+            " bytes of AML loaded in ",
+            "; named results true; heap back true; passed",
+        ]
+        .map(String::from),
+    );
+    markers
+}
+
 /// The kernel boot's whole-log checks: every line whole, and the screen.
 fn check_kernel_boot(done: &Completed) -> Result {
     console_lines_intact(&done.serial, self::machine().cpus() as usize)?;
@@ -2652,6 +2690,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": numa failed",
         ": slit failed",
         ": acpi tables failed",
+        "; aml failed",
         ": random failed",
         "origin-kernel: random: no generator",
         "with prediction resistance: WRONG",
@@ -4695,6 +4734,16 @@ fn check() -> Result {
         None,
     )?)?;
     run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--lib"]))?;
+    // The AML interpreter's boot proof on a 32 KiB stack: release only, the stack's proxy (TASKS
+    // item 63, step B3, ruling Q3 (a)).
+    run_step(cargo().args([
+        "test",
+        "--release",
+        "--package",
+        KERNEL_PACKAGE,
+        "--lib",
+        "aml_proof::",
+    ]))?;
     // The loader in developer mode too (the boot test's variant).
     for loader in [Loader::Developer, Loader::Verifying] {
         run_step(cargo().args([
@@ -5021,7 +5070,8 @@ fn no_panic_check() -> Result {
     let out_dir = target_dir().join("xtask").join("no-panic");
     fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
     let mut objects = Vec::new();
-    for &package in FREESTANDING_LIBS {
+    // The AML interpreter is checked below, against an allowance of its own.
+    for &package in FREESTANDING_LIBS.iter().filter(|&&p| p != AML_PACKAGE) {
         objects.push((package, build_kernel_object(package, &out_dir)?));
     }
     let mut defined = std::collections::HashSet::new();

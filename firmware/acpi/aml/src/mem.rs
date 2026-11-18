@@ -97,6 +97,20 @@ impl Budget {
         self.used = self.used.saturating_sub(bytes);
     }
 
+    /// The peak and the work count before a charge, for [`Budget::refused`].
+    const fn mark(&self) -> (usize, u64) {
+        (self.peak, self.charged)
+    }
+
+    /// Takes back `bytes` charged for an allocation the allocator then refused (a heap too
+    /// small for the limit: the coordinating session's ruling on step B3's limit, 2026-11-14).
+    /// They were never held and nothing was moved, so the count, the peak and the work done
+    /// return to what `mark` kept.
+    fn refused(&mut self, bytes: usize, mark: (usize, u64)) {
+        self.credit(bytes);
+        (self.peak, self.charged) = mark;
+    }
+
     /// Sets the count to what is held, counted afresh by the caller. Called when an evaluation
     /// ends, so that a charge a failure path did not credit is never kept (the review of B1, F2).
     pub(crate) fn recount(&mut self, held: usize) {
@@ -131,12 +145,16 @@ pub(crate) fn reserve<T>(v: &mut Vec<T>, additional: usize, budget: &mut Budget)
     if target < need {
         return Err(memory());
     }
+    let mark = budget.mark();
     budget.charge(bytes_for::<T>(target.saturating_sub(have))?)?;
     // Growing a vector that holds something copies it: that is work, counted with what is
     // allocated (the review of B1, A1).
     budget.note_moved(bytes_for::<T>(v.len()).unwrap_or(usize::MAX));
     if v.try_reserve_exact(target.saturating_sub(v.len())).is_err() {
-        budget.credit(bytes_for::<T>(target.saturating_sub(have)).unwrap_or(0));
+        budget.refused(
+            bytes_for::<T>(target.saturating_sub(have)).unwrap_or(0),
+            mark,
+        );
         return Err(memory());
     }
     // `try_reserve_exact` gives exactly the capacity asked for an element type with a size; a
@@ -159,9 +177,10 @@ pub(crate) fn push<T>(v: &mut Vec<T>, x: T, budget: &mut Budget) -> Result<()> {
 pub(crate) fn with_capacity<T>(count: usize, budget: &mut Budget) -> Result<Vec<T>> {
     let mut v = Vec::new();
     if count > 0 {
+        let mark = budget.mark();
         budget.charge(bytes_for::<T>(count)?)?;
         if v.try_reserve_exact(count).is_err() {
-            budget.credit(bytes_for::<T>(count).unwrap_or(0));
+            budget.refused(bytes_for::<T>(count).unwrap_or(0), mark);
             return Err(memory());
         }
         let got = v.capacity();

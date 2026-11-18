@@ -431,14 +431,20 @@ impl Namespace {
     }
 
     /// `id`'s path written into `out`, allocating nothing (for a tracing host): the segments
-    /// used, or `None` if `id` is stale or deeper than `out`.
+    /// used, or `None` if `id` is stale or deeper than `out`. The walk up stops once it is deeper
+    /// than `out`, a bound the caller fixes (32 segments for a trace), so it counts no work: a host
+    /// that traces must make the interpreter count exactly what one that does not would. It
+    /// counted a unit a level until N-soak-2 (the soak of 2026-11-15, grammar seed `0x6388aba2`),
+    /// where a traced run read the clock at other times and `Timer` answered otherwise.
     pub(crate) fn path_into<'o>(&self, id: NodeId, out: &'o mut [Seg]) -> Option<&'o [Seg]> {
         let mut depth = 0usize;
         let mut cur = self.node(id).ok()?;
         let mut i = id.index;
         while i != 0 {
-            self.note_work(1);
             depth = depth.checked_add(1)?;
+            if depth > out.len() {
+                return None;
+            }
             i = cur.parent;
             cur = self.at(i)?;
         }

@@ -119,6 +119,78 @@ fn huge_buffers_and_packages_are_refused_before_they_are_made() {
     assert!(i.memory_peak() <= small().memory_bytes);
 }
 
+/// A limit larger than the heap can give (the coordinating session's ruling on step B3's limit,
+/// 2026-11-14): an allocation the allocator itself refuses, not the budget, ends the evaluation
+/// with the memory limit, leaves no count, peak or work behind, and the interpreter goes on. The
+/// buffer asked for is nearly 8 EiB, which no address space here can hold, so the host's
+/// allocator returns null as the kernel heap does when it has no frames.
+#[test]
+fn an_allocation_the_heap_refuses_is_the_memory_limit_and_leaves_nothing_behind() {
+    let limits = Limits {
+        memory_bytes: usize::MAX,
+        ..small()
+    };
+    let mut i = interp_with(IntegerWidth::Bits64, limits);
+    load(
+        &mut i,
+        &[
+            method("HUGE", 0, &[ret(buffer(qword(0x7FFF_FFFF_FFFF_0000), &[]))]),
+            method("SMAL", 0, &[ret(buffer(byte(4), &[1, 2, 3, 4]))]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        i.evaluate("SMAL", &[]).unwrap(),
+        Some(Value::Buffer(vec![1, 2, 3, 4]))
+    );
+    let peak = i.memory_peak();
+    assert_eq!(limit_of(i.evaluate("HUGE", &[])), Limit::Memory);
+    // The evaluation's own frames may raise the peak a little; the refused bytes may not.
+    assert!(
+        i.memory_peak() < peak + 4096,
+        "the refused bytes were never held: peak {}",
+        i.memory_peak()
+    );
+    let peak = i.memory_peak();
+    // The step limit is small's: had the refused bytes been counted as work, this would stop.
+    assert_eq!(
+        i.evaluate("SMAL", &[]).unwrap(),
+        Some(Value::Buffer(vec![1, 2, 3, 4]))
+    );
+    assert!(i.memory_peak() < peak + 4096);
+}
+
+/// N-soak-2 (the soak of 2026-11-15, grammar seed `0x6388aba2`, timed): a tracing host made the
+/// interpreter count more work, a unit for each level of the path that each method entered walked
+/// for its trace, so the clock was read at other times and `Timer` answered otherwise (1,250,000
+/// against 1,300,000). A host that traces must change no count: here a method 21 levels deep, run
+/// ten times, counts the same steps either way. Also: `steps_done` counts every evaluation.
+#[test]
+fn a_tracing_host_changes_no_count() {
+    let mut body = vec![method("MTHD", 0, &[ret(one())])];
+    for k in (0..20).rev() {
+        body = vec![device(&format!("D{k:03}"), &body)];
+    }
+    let path: String = (0..20).map(|k| format!(".D{k:03}")).collect::<String>() + ".MTHD";
+    let path = format!("\\{}", &path[1..]);
+    let steps = |traced: bool| {
+        let mut i = interp_with(IntegerWidth::Bits64, small());
+        if traced {
+            i.host_mut().events = Some(Vec::new());
+        }
+        load(&mut i, &body).unwrap();
+        let before = i.steps_done();
+        assert!(before > 0, "the load's steps are counted");
+        for _ in 0..10 {
+            assert_eq!(i.evaluate(&path, &[]).unwrap(), Some(Value::Integer(1)));
+        }
+        i.steps_done() - before
+    };
+    let plain = steps(false);
+    assert!(plain >= 10, "each evaluation's steps are counted: {plain}");
+    assert_eq!(steps(true), plain, "tracing changed the count");
+}
+
 #[test]
 fn the_step_limit_stops_straight_line_code() {
     let limits = Limits {

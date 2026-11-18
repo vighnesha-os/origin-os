@@ -17,6 +17,7 @@ version = "0.0.0"
 dependencies = [
  "origin-abi",
  "origin-acpi-tables",
+ "origin-aml",
  "origin-boot-info",
  "origin-directory",
  "origin-frame",
