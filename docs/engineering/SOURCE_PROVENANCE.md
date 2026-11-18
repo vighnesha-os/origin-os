@@ -4946,6 +4946,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - The records' findings: `Break` and `Continue` in a loaded table, and CL41's harness, `cl41_table_check_cost`.
 - Each fix's control was run by hand and caught; each commit says how.
 - N-soak-4, found by the soak: a mutated block's tables are no longer judged by their IDs (tests only).
+- The review's addendum: B4-12 (`LoadTable`'s parameter stored by a step of its own; N1, N1b, N1c, N1d, N4), B4-13 (locals and arguments refused at a loaded table's table level; N5 and five more, the planted fault `AllowLoadLocals`, the soak's `XH`), B4-14 (the soak's parameter through `PF`). Each control was run by hand on the library as before the fix, and caught.
 
 **What it does not show.**
 - No boot runs `Load` or `LoadTable`: QEMU's tables use neither, and the proof's host refuses `table`.

@@ -1580,6 +1580,16 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
     - The discovery machine: 496,558 bytes loaded in 278 ms and 4,132 devices walked in 136 ms, at most 11,897,534 bytes.
     - The least room above the guard page: 47,119 bytes.
 
+**Answers to the review's addendum (2026-11-19).**
+- **The addendum:** the same reviewer read the answers at `1a3580f2` (code `30af5f8d`) and closed B4-1, B4-2 and B4-9, finding every other Status true. It was appended to the review at `774d2e66`. It found two new Lows and two Informational; each fix is a commit of its own, and the review's addendum Resolution names them.
+- **B4-12** `1430becf`: `LoadTable`'s parameter is stored by a step of its own, a `Parameter` frame pushed once the load has ended. A failed PCI function walk, or a limit in it, now comes after the table was added, and the table stays. Tests: N1, N1b, N1c, N1d, N4, and R8's case through the step.
+- **B4-13** `2c33f1bd`: `LocalX` and `ArgX` are `Grammar` at a loaded table's table level. The engine's `load_calls` mark is checked in `decode`, where every one is named.
+  - Tests: N5, and a read, a store, `RefOf`, an argument holding a reference, `Load`'s own target, and a method keeping its own locals.
+  - The planted fault `AllowLoadLocals`, caught.
+  - The soak's table `XH`, and locals in `XA`'s load-time code.
+- **B4-14** `573a34a9`: `PF` among the soak's `LoadTable` parameter paths.
+- **B4-15:** the ledger's figure corrected to near 1.4 million, with the arithmetic.
+
 
 ### 60. The host tools are libraries first (ADR-0011 Amendment 4, T1)
 
