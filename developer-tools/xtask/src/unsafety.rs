@@ -234,8 +234,9 @@ const ABOVE_UNSAFE_FILES: &[&str] = &["framekernel/frame/src/lib.rs"];
 const LAYERS: &[(&str, &[&str])] = &[
     ("origin-version", &[]),
     ("origin-acpi-tables", &[]),
-    // The AML interpreter, which the kernel's boot proof runs (TASKS item 63, step B3).
-    ("origin-aml", &[]),
+    // The AML interpreter, which the kernel's boot proof runs (TASKS item 63, step B3). It checks
+    // every table `Load`, `LoadTable` and `DataTableRegion` read with `origin-acpi-tables` (B4).
+    ("origin-aml", &["origin-acpi-tables"]),
     ("origin-boot-info", &["origin-version"]),
     ("origin-abi", &["origin-version"]),
     ("origin-sync", &[]),

@@ -5033,6 +5033,15 @@ const NO_PANIC_AML_PARTS: &[&str] = &[
     "4core3fmt3num",
 ];
 
+/// The one library whose symbols `origin-aml`'s object may reference (TASKS item 63, B4's
+/// contract, Q11): `origin-acpi-tables`, which checks every table `Load`, `LoadTable` and
+/// `DataTableRegion` read. Two conditions make the allowance sound, and the check holds both:
+/// - only the symbols that library's own object defines are allowed, not those of any other
+///   freestanding library, nor anything that library itself references;
+/// - that library passes its own no-panic check, in the same run and before this allowance is
+///   used, so that what it defines is free of panic paths.
+const NO_PANIC_AML_LIBRARY: &str = "origin-acpi-tables";
+
 /// What `origin-aml`'s object must define: the concrete instantiation and the engine's loop.
 const NO_PANIC_AML_REQUIRED: &[&str] = &["14no_panic_probe", "10run_frames"];
 
@@ -5090,10 +5099,15 @@ fn no_panic_check() -> Result {
     }
     let mut defined = std::collections::HashSet::new();
     let mut referenced = Vec::new();
+    // What `origin-acpi-tables`' own object defines: all `origin-aml` may use of it (Q11).
+    let mut aml_library = std::collections::HashSet::new();
     for (package, obj) in &objects {
         let own = nm_symbols(&nm, obj, "--defined-only")?;
         let undefined = nm_symbols(&nm, obj, "-u")?;
         require_symbols(package, obj, own.len() + undefined.len())?;
+        if *package == NO_PANIC_AML_LIBRARY {
+            aml_library.extend(own.iter().cloned());
+        }
         if own.is_empty() && undefined.is_empty() {
             println!(
                 "xtask: no-panic check: {package} ({KERNEL_TARGET}, release) is all generic: no symbols of its own to check"
@@ -5125,6 +5139,12 @@ fn no_panic_check() -> Result {
             undefined.len()
         );
     }
+    // The library `origin-aml` may use passed above, or this run has already failed.
+    if !referenced.iter().any(|(p, _)| **p == NO_PANIC_AML_LIBRARY) {
+        return Err(format!(
+            "no-panic check: {NO_PANIC_AML_LIBRARY} was not checked, so {AML_PACKAGE} may not use it"
+        ));
+    }
     // The AML interpreter, with `alloc` (ADR-0019 A3): its own allowance, nothing else. Its
     // interpreter is generic over its host, so the object holds the engine only through
     // `no_panic_probe`, a concrete instantiation; the check requires it and the engine's loop in
@@ -5147,8 +5167,13 @@ fn no_panic_check() -> Result {
             !NO_PANIC_ALLOWED.contains(s)
                 && !NO_PANIC_ALLOWED_PARTS.iter().any(|p| s.contains(p))
                 && !NO_PANIC_AML_PARTS.iter().any(|p| s.contains(p))
+                && !aml_library.contains(*s)
         })
         .collect();
+    let from_library = undefined
+        .iter()
+        .filter(|s| aml_library.contains(*s))
+        .count();
     if !bad.is_empty() {
         return Err(format!(
             "{AML_PACKAGE}: the release object for {KERNEL_TARGET} references symbols outside its no-panic allowance:\n  {}",
@@ -5156,7 +5181,7 @@ fn no_panic_check() -> Result {
         ));
     }
     println!(
-        "xtask: no-panic check: {AML_PACKAGE} ({KERNEL_TARGET}, release, the interpreter instantiated by `no_panic_probe`: {} symbols of its own) references {} external symbols, all within its allowance (allocator entry points, an unreachable `handle_error`, `core::fmt`)",
+        "xtask: no-panic check: {AML_PACKAGE} ({KERNEL_TARGET}, release, the interpreter instantiated by `no_panic_probe`: {} symbols of its own) references {} external symbols, all within its allowance (allocator entry points, an unreachable `handle_error`, `core::fmt`, and {from_library} that {NO_PANIC_AML_LIBRARY}'s own object defines, which passed its check above)",
         own.len(),
         undefined.len()
     );
