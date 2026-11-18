@@ -288,11 +288,15 @@ pub trait Host {
     /// An event for a host that traces the interpreter. Returns at once.
     fn trace(&mut self, _event: &Trace<'_>) {}
 
-    /// The table the XSDT lists under `key`: its physical address and a copy of its bytes, or
-    /// `None`. Returns at once: the host already holds the table. The key's IDs are padded with
-    /// NUL, a table's own with spaces as a rule: the library compares an ID up to the key's first
-    /// NUL and lets the table's rest be NUL or space (G18), and a host should find the table the
-    /// same way.
+    /// The table the XSDT lists under `key`: its physical address and a copy of its bytes, given
+    /// to `out`, which the host calls at most once; or `false`, and `out` not called. Returns at
+    /// once: the host already holds the table. A host that called `out` twice would leave the
+    /// first copy charged and unreleased until the evaluation's recount (the review of B4,
+    /// B4-11).
+    ///
+    /// The key's IDs are padded with NUL, a table's own with spaces as a rule: the library
+    /// compares an ID up to the key's first NUL and lets the table's rest be NUL or space (G18),
+    /// and a host should find the table the same way.
     ///
     /// # Errors
     /// Whatever the host refuses or fails.
