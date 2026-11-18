@@ -1217,6 +1217,11 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     proofs.record(Proof::Weights, prove_weights(com1, cpus, bsp, tsc_hz));
     proofs.record(Proof::SimdState, prove_simd(com1, bsp, tsc_hz));
     proofs.record(Proof::ThreadLifecycle, prove_lifecycle(com1, bsp, tsc_hz));
+    // The framework's measured stack in a thread switched out on it (TASKS item 68).
+    proofs.record(
+        Proof::MeasuredStackThread,
+        crate::measured_stack::prove_in_thread(com1, bsp),
+    );
     proofs.record(Proof::SpawnRefusal, prove_spawn_refused(com1, bsp, tsc_hz));
     proofs.record(Proof::UserIsolation, crate::user::prove(com1, bsp, tsc_hz));
     let consistent = crate::time::prove_consistent(com1, cpus, bsp, tsc_hz);

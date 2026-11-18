@@ -1,0 +1,298 @@
+//! The boot proofs of the framework's measured stack, `origin_frame::stack::with_measured_stack`
+//! (TASKS item 68; ADR-0013, both Report: nothing the kernel does uses a measured depth yet).
+//!
+//! Both run one recursion of known shape on a measured stack: each level writes an array of
+//! [`PAD`] words, keeps it across the next level and adds it up after, and the deepest level
+//! samples the stack in a leaf that is never inlined ([`mark`]): the address of the one word
+//! that leaf writes below its saved frame pointer.
+//!
+//! - **At boot** ([`prove_at_boot`], before the AML proof, in the boot flow with interrupts off):
+//!   at [`SHALLOW`] and [`DEEP`] levels, the depth measured must equal the depth sampled, to the byte
+//!   (the coordinating session's ruling, Q7). Nothing runs below the sample: the leaf calls
+//!   nothing, no interrupt comes, and the kernel's target uses no red zone, so nothing is written
+//!   below the stack pointer. A call with an empty closure gives what a call costs.
+//! - **In a thread** ([`prove_in_thread`], in `sched::prove`): a kernel thread on the boot
+//!   processor runs the recursion at [`THREAD_LEVELS`] levels, and at the deepest, after its
+//!   sample, yields until the boot flow has had a turn. Meanwhile the boot flow asks the framework
+//!   whether the thread's own stack is in use (`stack::slot_in_use`), which it must be: the
+//!   thread's saved frame is on the measured stack, and only the measured call's record of the
+//!   stack it left keeps the thread's own stack from being freed (ruling A1). The depth must be at
+//!   least [`TRAP_MARGIN`] bytes below the sample: the yield's trap frame, 22 words, is written
+//!   below the yielding call, and the sample's word is at most 32 bytes below that call. Its
+//!   bounds count yields, not time, so a loaded host cannot fail it (TASKS item 66).
+//!
+//! Neither runs inside another proof's comparison of stack slots or frames: the one at boot runs
+//! before any proof that compares them, and the one in a thread runs between the thread-lifecycle
+//! and refused-spawn proofs, reaps its thread before it ends, and leaves only stacks kept for
+//! reuse, which every later comparing proof settles first (TASKS item 67). No address in the stack
+//! region is printed (ADR-0004 Amendment 2, A6): only depths and sizes.
+#![forbid(unsafe_code)]
+
+use core::fmt::Write;
+use core::hint::black_box;
+use core::ptr;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use origin_frame::once::SetOnce;
+use origin_frame::stack::{self, Measured, StackSlot};
+
+use crate::console::Console;
+use crate::cpu::{self, CpuIndex, rdtsc};
+
+/// The measured stack's size: a kernel thread's.
+const STACK: usize = 16 * 1024;
+/// Words each level of the recursion writes and keeps across the next.
+const PAD: usize = 16;
+/// The two depths of the proof at boot.
+const SHALLOW: u32 = 8;
+const DEEP: u32 = 64;
+/// The depth of the proof in a thread.
+const THREAD_LEVELS: u32 = 32;
+/// How far below the sample the proof in a thread must have been written: the yield's trap
+/// frame (22 words, 176 bytes) less the 32 bytes the sampling leaf can reach below the call it
+/// shares with the yield, with room to spare.
+const TRAP_MARGIN: usize = 128;
+/// The most the thread yields at its deepest level, waiting for the boot flow's turn.
+const THREAD_YIELDS: u64 = 1_000;
+/// The most turns the boot flow gives the thread before it gives up.
+const BOOT_TURNS: u64 = 100_000;
+
+/// The address of the one word this leaf writes below its saved frame pointer: the deepest word
+/// written at the deepest level of the recursion.
+#[inline(never)]
+fn mark() -> usize {
+    let here = 0u64;
+    ptr::from_ref(black_box(&here)).addr()
+}
+
+/// What the recursion found: the sum of every level's words, and the sample at its deepest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Found {
+    sum: u64,
+    sampled: usize,
+}
+
+/// One level of the recursion: writes [`PAD`] words, goes `n` levels deeper, then adds its words
+/// to what came back. At the bottom it samples the stack and calls `at_deepest`, if given.
+#[inline(never)]
+fn level(n: u32, at_deepest: Option<&mut dyn FnMut()>) -> Found {
+    let mut pad = [0u64; PAD];
+    for (i, word) in pad.iter_mut().enumerate() {
+        *word = black_box(u64::from(n) << 8 | i as u64);
+    }
+    black_box(&mut pad);
+    let below = if n == 0 {
+        let sampled = mark();
+        if let Some(at_deepest) = at_deepest {
+            at_deepest();
+        }
+        Found { sum: 0, sampled }
+    } else {
+        level(n - 1, at_deepest)
+    };
+    let mine = black_box(&pad)
+        .iter()
+        .fold(0u64, |sum, word| sum.wrapping_add(*word));
+    Found {
+        sum: below.sum.wrapping_add(mine),
+        sampled: below.sampled,
+    }
+}
+
+/// The sum [`level`] must return for `levels` levels below the first.
+fn expected_sum(levels: u32) -> u64 {
+    (0..=u64::from(levels))
+        .flat_map(|n| (0..PAD as u64).map(move |i| n << 8 | i))
+        .fold(0, u64::wrapping_add)
+}
+
+/// The sampled depth: from the top of the stack the sample is on down to it. `None` if the
+/// sample is not in the stack region.
+fn sampled_depth(sampled: usize) -> Option<usize> {
+    let top = stack::slot_top(sampled as u64)?;
+    usize::try_from(top.checked_sub(sampled as u64)?).ok()
+}
+
+/// The proof at boot (see the module docs): the boot flow, with interrupts off, before any
+/// thread exists.
+pub(crate) fn prove_at_boot(com1: &mut Console, tsc_hz: u64) -> bool {
+    let began = rdtsc();
+    let empty = stack::with_measured_stack(STACK, || ());
+    let call_ticks = rdtsc().wrapping_sub(began);
+    let Some(empty) = empty else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: measured stack: no stack of {STACK} bytes could be had: measured stack failed"
+        );
+        return false;
+    };
+    let _ = write!(
+        com1,
+        "origin-kernel: measured stack: at boot, on {STACK} bytes: "
+    );
+    let mut ok = true;
+    let (mut shallow, mut deep) = (0usize, 0usize);
+    for (levels, measured) in [(SHALLOW, &mut shallow), (DEEP, &mut deep)] {
+        let Some(Measured {
+            value: found,
+            depth,
+            size,
+        }) = stack::with_measured_stack(STACK, || level(levels, None))
+        else {
+            let _ = writeln!(com1, "no stack for {levels} levels: measured stack failed");
+            return false;
+        };
+        let sampled = sampled_depth(found.sampled);
+        let right = found.sum == expected_sum(levels);
+        let exact = sampled == Some(depth) && depth < size;
+        ok &= right && exact;
+        *measured = depth;
+        let _ = write!(
+            com1,
+            "{levels} levels: {depth} bytes measured, {} sampled, value right {right}; ",
+            sampled.unwrap_or(0)
+        );
+    }
+    let _ = writeln!(
+        com1,
+        "{} bytes a level; an empty closure {} bytes deep, the call {} us; {}",
+        deep.saturating_sub(shallow) / (DEEP - SHALLOW) as usize,
+        empty.depth,
+        call_ticks.saturating_mul(1_000_000) / tsc_hz.max(1),
+        if ok {
+            "passed"
+        } else {
+            "measured stack failed"
+        }
+    );
+    ok
+}
+
+/// The thread's own stack's slot, for the boot flow's question.
+static OWN_SLOT: SetOnce<StackSlot> = SetOnce::new();
+/// The thread sits at its deepest level, yielding.
+static AT_DEPTH: AtomicBool = AtomicBool::new(false);
+/// The boot flow's turns while it waits.
+static TURNS: AtomicU64 = AtomicU64::new(0);
+/// The boot flow asked about the thread's own stack while the thread sat at its deepest level,
+/// and what the framework answered.
+static ASKED: AtomicBool = AtomicBool::new(false);
+static IN_USE: AtomicBool = AtomicBool::new(false);
+/// What the thread found: whether the boot flow had a turn across its yields, how many yields
+/// that took, the measured and sampled depths, the stack's size, and whether the value was right.
+static SWITCHED: AtomicBool = AtomicBool::new(false);
+static YIELDS: AtomicU64 = AtomicU64::new(0);
+static DEPTH: AtomicU64 = AtomicU64::new(0);
+static SAMPLED: AtomicU64 = AtomicU64::new(0);
+static SIZE: AtomicU64 = AtomicU64::new(0);
+static RIGHT: AtomicBool = AtomicBool::new(false);
+/// The thread has stored what it found, or found no stack.
+static DONE: AtomicBool = AtomicBool::new(false);
+static MEASURED: AtomicBool = AtomicBool::new(false);
+
+/// The thread of [`prove_in_thread`].
+extern "sysv64" fn worker(_: u64) -> ! {
+    let here = 0u64;
+    if let Some(own) = stack::slot_holding(ptr::from_ref(black_box(&here)).addr() as u64) {
+        let _ = OWN_SLOT.set(own);
+    }
+    let (mut switched, mut yields) = (false, 0u64);
+    let mut at_deepest = || {
+        let before = TURNS.load(Ordering::Acquire);
+        AT_DEPTH.store(true, Ordering::Release);
+        while yields < THREAD_YIELDS {
+            crate::sched::yield_now();
+            yields += 1;
+            if TURNS.load(Ordering::Acquire) != before {
+                switched = true;
+                break;
+            }
+        }
+        AT_DEPTH.store(false, Ordering::Release);
+    };
+    let measured =
+        stack::with_measured_stack(STACK, || level(THREAD_LEVELS, Some(&mut at_deepest)));
+    if let Some(Measured {
+        value: found,
+        depth,
+        size,
+    }) = measured
+    {
+        DEPTH.store(depth as u64, Ordering::Relaxed);
+        SAMPLED.store(
+            sampled_depth(found.sampled).map_or(0, |s| s as u64),
+            Ordering::Relaxed,
+        );
+        SIZE.store(size as u64, Ordering::Relaxed);
+        RIGHT.store(found.sum == expected_sum(THREAD_LEVELS), Ordering::Relaxed);
+        MEASURED.store(true, Ordering::Relaxed);
+    }
+    SWITCHED.store(switched, Ordering::Relaxed);
+    YIELDS.store(yields, Ordering::Relaxed);
+    DONE.store(true, Ordering::Release);
+    crate::sched::exit()
+}
+
+/// The threads alive on processor `cpu`, the boot flow among them.
+fn live(cpu: CpuIndex) -> usize {
+    crate::sched::QUEUES
+        .get(cpu.get())
+        .map_or(0, |q| cpu::without_interrupts(|| q.lock().live()))
+}
+
+/// The proof in a thread (see the module docs), from the boot flow on processor `bsp` once its
+/// scheduler runs.
+pub(crate) fn prove_in_thread(com1: &mut Console, bsp: CpuIndex) -> bool {
+    if live(bsp) != 1 || crate::sched::spawn(bsp, worker, 0).is_err() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: measured stack: cannot start its thread: measured stack failed"
+        );
+        return false;
+    }
+    let mut turns = 0u64;
+    while turns < BOOT_TURNS && !(DONE.load(Ordering::Acquire) && live(bsp) == 1) {
+        if AT_DEPTH.load(Ordering::Acquire)
+            && !ASKED.load(Ordering::Relaxed)
+            && let Some(own) = OWN_SLOT.get()
+        {
+            IN_USE.store(stack::slot_in_use(*own), Ordering::Relaxed);
+            ASKED.store(true, Ordering::Relaxed);
+        }
+        TURNS.fetch_add(1, Ordering::Release);
+        crate::sched::yield_now();
+        turns += 1;
+    }
+    // The thread's stack and FPU area, given back here rather than in a later proof's window.
+    crate::sched::reap();
+    let ended = DONE.load(Ordering::Acquire) && live(bsp) == 1;
+    let measured = MEASURED.load(Ordering::Relaxed);
+    let (depth, sampled, size) = (
+        DEPTH.load(Ordering::Relaxed) as usize,
+        SAMPLED.load(Ordering::Relaxed) as usize,
+        SIZE.load(Ordering::Relaxed) as usize,
+    );
+    let right = RIGHT.load(Ordering::Relaxed);
+    let switched = SWITCHED.load(Ordering::Relaxed);
+    let in_use = ASKED.load(Ordering::Relaxed) && IN_USE.load(Ordering::Relaxed);
+    let below = depth.saturating_sub(sampled);
+    let ok = ended
+        && measured
+        && right
+        && switched
+        && in_use
+        && sampled != 0
+        && below >= TRAP_MARGIN
+        && depth < size;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: measured stack: in a thread, {THREAD_LEVELS} levels and a yield at the deepest: {depth} bytes measured, {sampled} sampled, {below} below the sample; switched away and back {switched} after {} yields; its own stack in use meanwhile {in_use}; value right {right}; ended {ended}; {}",
+        YIELDS.load(Ordering::Relaxed),
+        if ok {
+            "passed"
+        } else {
+            "measured stack failed"
+        }
+    );
+    ok
+}

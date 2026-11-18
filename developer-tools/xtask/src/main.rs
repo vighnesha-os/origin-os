@@ -2210,6 +2210,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "; consistent true".into(),
         ])
         .chain(acpi_markers())
+        .chain(measured_stack_markers())
         .chain(aml_markers())
         .chain([
             // The random-number generator (ADR-0016): every processor has one, requests are
@@ -2244,6 +2245,11 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: scheduler: 3 SIMD threads kept their XMM state across ".into(),
             " corruptions".into(),
             "origin-kernel: scheduler: yield alternated ".into(),
+            // The framework's measured stack in a thread that yields on it (TASKS item 68): the
+            // boot flow ran meanwhile, and the thread's own stack stayed in use (ruling A1).
+            "origin-kernel: measured stack: in a thread, 32 levels and a yield at the deepest: ".into(),
+            "; switched away and back true after ".into(),
+            " yields; its own stack in use meanwhile true; value right true; ended true; passed".into(),
             // A thread is created whole or not at all.
             "origin-kernel: scheduler: spawns refused for want of an FPU area (Err(Full)) and on a full queue (Err(Full)) give back".into(),
             // M4 groundwork: ring 3, the one DPL-3 gate, and crash isolation.
@@ -2603,6 +2609,21 @@ fn acpi_markers() -> Vec<String> {
     markers
 }
 
+/// The boot proof of the framework's measured stack at boot (TASKS item 68), before the AML proof:
+/// a known recursion's depth at 8 and 64 levels, measured and sampled; the kernel prints "passed"
+/// only when the two are equal to the byte at both.
+fn measured_stack_markers() -> Vec<String> {
+    [
+        "origin-kernel: measured stack: at boot, on 16384 bytes: 8 levels: ",
+        " sampled, value right true; 64 levels: ",
+        " sampled, value right true; ",
+        " bytes a level; an empty closure ",
+        " us; passed",
+    ]
+    .map(String::from)
+    .into()
+}
+
 /// The boot proof of the AML interpreter (TASKS item 63, step B3; ADR-0019 A3), as QEMU 11.1.3's
 /// tables give it on every machine here: the DSDT loaded (and on the ACPI machine, its NVDIMM's
 /// SSDT after it), every named result as expected, every device that failed refused in the ways
@@ -2705,6 +2726,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": slit failed",
         ": acpi tables failed",
         "; aml failed",
+        "measured stack failed",
         ": random failed",
         "origin-kernel: random: no generator",
         "with prediction resistance: WRONG",
