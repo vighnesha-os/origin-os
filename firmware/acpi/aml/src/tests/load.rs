@@ -433,6 +433,77 @@ fn a_table_a_failed_block_loaded_stays() {
     assert!(i.table(last - 1).unwrap().failed);
 }
 
+/// Whether `path` names a node, a path through a missing parent naming none.
+fn present(i: &Interp, path: &str) -> bool {
+    i.lookup(path).ok().flatten().is_some()
+}
+
+#[test]
+fn r4_a_completed_tables_names_under_a_failing_outer_tables_object_go_with_it() {
+    // The review of B4, B4-3, as the coordinating session ruled: a load that completed stays,
+    // and a name cannot outlive its parent. The inner table puts `QIX` under the outer table's
+    // `\QOD`; when the outer load fails, `\QOD` goes with its subtree, and the inner table is
+    // not marked failed. Its alias of `\QOD` is then stale, and its method finds nothing.
+    let inner = ssdt(&[
+        name("\\QOD.QIX", one()),
+        name("QI0", one()),
+        alias("\\QOD", "\\QAL"),
+        m("QIM", &[ret(nm("\\QOD.QIX"))]),
+    ]);
+    let outer = ssdt(&[
+        device("\\QOD", &[]),
+        load_op("\\TI", none()),
+        store(nm("\\NOPE"), debug()),
+    ]);
+    let mut i = loaded(
+        IntegerWidth::Bits64,
+        &[
+            name("TI", buffer_of(&inner)),
+            name("TO", buffer_of(&outer)),
+            m("LD", &[ret(load_op("TO", none()))]),
+        ],
+    );
+    let first = i.table_count() as u32;
+    assert_eq!(get(&mut i, "LD"), 0, "the outer load failed");
+    assert!(i.table(first).unwrap().failed);
+    assert!(
+        !i.table(first + 1).unwrap().failed,
+        "the inner one completed"
+    );
+    assert!(!present(&i, "\\QOD") && !present(&i, "\\QOD.QIX"));
+    assert!(present(&i, "\\QI0") && present(&i, "\\QIM"));
+    assert_eq!(
+        i.evaluate("\\QAL", &[]).map_err(|e| e.kind),
+        Err(ErrorKind::Stale)
+    );
+    assert_eq!(fails(&mut i, "\\QIM"), ErrorKind::NotFound);
+    // A new `\QOD` is another object: the alias stays stale.
+    load(&mut i, &[device("\\QOD", &[name("NEW", one())])]).unwrap();
+    assert_eq!(
+        i.evaluate("\\QAL", &[]).map_err(|e| e.kind),
+        Err(ErrorKind::Stale)
+    );
+}
+
+#[test]
+fn r4b_a_completed_tables_names_under_a_methods_temporary_object_go_with_it() {
+    // The same on the ordinary path: a method makes `\TMPD`, a table it loads puts `QIX` under
+    // it; the load completes and gives True, and `\TMPD.QIX` goes when the method returns.
+    let inner = ssdt(&[scope("\\TMPD", &[name("QIX", one())]), name("QI0", one())]);
+    let mut i = loaded(
+        IntegerWidth::Bits64,
+        &[
+            name("TB", buffer_of(&inner)),
+            m("LM", &[device("\\TMPD", &[]), ret(load_op("TB", none()))]),
+        ],
+    );
+    let first = i.table_count() as u32;
+    assert_eq!(get(&mut i, "LM"), u64::MAX);
+    assert!(!i.table(first).unwrap().failed);
+    assert!(present(&i, "\\QI0"));
+    assert!(!present(&i, "\\TMPD") && !present(&i, "\\TMPD.QIX"));
+}
+
 #[test]
 fn a_limit_inside_a_loaded_table_ends_the_evaluation_and_rolls_it_back() {
     let limits = Limits {
