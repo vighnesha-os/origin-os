@@ -30,6 +30,7 @@ mod ring3;
 mod roadmap;
 mod screen;
 mod serial;
+mod settings;
 mod settle;
 mod targetcfg;
 mod toolchain;
@@ -45,6 +46,8 @@ use std::process::{ChildStdin, Command, ExitCode, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use settings::{Settings, Topology};
 
 const USAGE: &str = "\
 usage: cargo xtask <command>
@@ -191,6 +194,10 @@ environment:
                                       (a long run; the default search is part of check)
   ORIGIN_OVMF_CODE, ORIGIN_OVMF_VARS  firmware code image and NVRAM template
                                       (default: the EDK2 files installed next to QEMU)
+  The ORIGIN_BOOT_TEST_ and ORIGIN_QEMU_ variables below are read once, when a boot command
+  (boot-test, boot-console, run, boot-matrix or one of its scenario commands) starts, and a
+  value one does not take is refused; boot-matrix and its scenario commands set each machine's
+  own over them in this process, and give none of them to another (TASKS item 61).
   ORIGIN_BOOT_TEST_TIMEOUT            boot-test timeout in seconds (default 120)
   ORIGIN_BOOT_TEST_ONLY               run only the boot-test or boot-console scenarios whose
                                       label contains one of these comma-separated strings
@@ -204,7 +211,8 @@ environment:
                                       300 and 412; many: two packages of 144 cores, 288
                                       processors with APIC IDs 0-143 and 256-399; listed: 2
                                       processors of 4096 the MADT lists (ORIGIN_QEMU_SMP is
-                                      then ignored; ADR-0008 Amendment 1, D7)
+                                      then ignored; ADR-0008 Amendment 1, D7); unset or empty:
+                                      the plain machine of ORIGIN_QEMU_SMP processors
   ORIGIN_QEMU_CPU                     the QEMU CPU model (default max), e.g. max,-avx2 or
                                       max,vendor=GenuineIntel (which exposes leaf 1Fh on
                                       the boot-x2apic machine)
@@ -216,13 +224,13 @@ environment:
                                       machine with no 8254 and no 8042 (the boot-legacy-free
                                       machine)
   ORIGIN_QEMU_BRIDGE                  on: the NIC behind a PCIe root port (the boot-bridge
-                                      machine)
+                                      machine); off or unset: not
   ORIGIN_QEMU_RESERVED                on: a TEST ONLY UEFI application plants firmware-reserved
                                       memory (RMRRs or IVMDs) in QEMU's tables before the
-                                      loader starts (the boot-reserved machine)
+                                      loader starts (the boot-reserved machine); off or unset: not
   ORIGIN_QEMU_ACPI                    on: QEMU builds an NFIT, an HMAT and an SRAT with a generic
                                       initiator (the boot-acpi machine; needs
-                                      ORIGIN_QEMU_MACHINE=nvdimm=on,hmat=on)
+                                      ORIGIN_QEMU_MACHINE=nvdimm=on,hmat=on); off or unset: not
   ORIGIN_QEMU_ACCEL                   tcg (default) or kvm: run on a real x86-64 processor (needs
                                       an x86-64 host with /dev/kvm); the devices and firmware
                                       stay QEMU's
@@ -325,7 +333,7 @@ struct Scenario {
     /// Output that fails the scenario as soon as it appears.
     failures: Vec<&'static str>,
     /// A check of the whole boot once every marker has appeared.
-    check: Option<fn(&Completed) -> Result>,
+    check: Option<Check>,
     /// Text QEMU itself must have printed on its stderr by then (what its device models
     /// report about the guest).
     stderr: Vec<&'static str>,
@@ -338,6 +346,9 @@ struct Scenario {
 
 /// A function that stages a scenario's files and returns its extra QEMU arguments.
 type QemuArgs = fn(&Path) -> Result<Vec<String>>;
+
+/// A check of a whole boot, given the settings it booted with.
+type Check = fn(&Completed, &Settings) -> Result;
 
 /// How a scenario's QEMU is wired for output (the devices are `qemu_command`'s).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -363,45 +374,8 @@ struct Completed {
     com1: Option<String>,
 }
 
-/// The good path: the loader verifies and enters the kernel, and the kernel reports on
-/// COM1. The banners are built from the same generated constants as the binaries, so the
-/// test also checks that the release identity reached both.
-/// QEMU's machine option: `base` (what the accelerator needs), with what
-/// `ORIGIN_QEMU_MACHINE` adds (for example `pit=off,i8042=off` for a machine with no 8254 or
-/// 8042).
-fn qemu_machine_options(base: &str) -> String {
-    match env::var("ORIGIN_QEMU_MACHINE") {
-        Ok(extra) if !extra.is_empty() => format!("{base},{extra}"),
-        _ => base.to_string(),
-    }
-}
-
-/// Whether `ORIGIN_QEMU_MACHINE` turns `device` off (`device=off`).
-fn qemu_machine_lacks(device: &str) -> bool {
-    let off = format!("{device}=off");
-    env::var("ORIGIN_QEMU_MACHINE").is_ok_and(|extra| extra.split(',').any(|o| o == off))
-}
-
-/// Whether `ORIGIN_QEMU_CPU` takes `feature` away from the processor (`-feature` or
-/// `feature=off`).
-fn qemu_cpu_lacks(feature: &str) -> bool {
-    let (minus, off) = (format!("-{feature}"), format!("{feature}=off"));
-    qemu_cpu_model()
-        .split(',')
-        .any(|option| option == minus || option == off)
-}
-
-/// The QEMU CPU model: `ORIGIN_QEMU_CPU` (for example `max,-avx2` to boot a CPU below the
-/// x86-64-v3 baseline), or `max`.
-fn qemu_cpu_model() -> String {
-    std::env::var("ORIGIN_QEMU_CPU")
-        .ok()
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| "max".into())
-}
-
-/// The IOMMU QEMU emulates (`ORIGIN_QEMU_IOMMU`): Intel VT-d or AMD-Vi, or a raw
-/// `intel-iommu` device for negative controls.
+/// The IOMMU QEMU emulates (`ORIGIN_QEMU_IOMMU`, [`Settings::iommu`]): Intel VT-d or AMD-Vi,
+/// or a raw `intel-iommu` device for negative controls.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Iommu {
     Intel,
@@ -436,13 +410,8 @@ impl Iommu {
     }
 }
 
-/// `ORIGIN_QEMU_IOMMU`: `intel` (the default), `amd`, or an `intel-iommu` `-device` value;
-/// anything else is refused by [`check_environment`].
-fn qemu_iommu() -> Iommu {
-    parse_iommu(env::var("ORIGIN_QEMU_IOMMU").ok().as_deref())
-}
-
-/// What an `ORIGIN_QEMU_IOMMU` value selects.
+/// What an `ORIGIN_QEMU_IOMMU` value selects: `intel` (the default), `amd`, or an
+/// `intel-iommu` `-device` value; anything else is refused by [`check_iommu`].
 fn parse_iommu(value: Option<&str>) -> Iommu {
     match value {
         None | Some("" | "intel") => Iommu::Intel,
@@ -453,13 +422,7 @@ fn parse_iommu(value: Option<&str>) -> Iommu {
 
 /// Refuses an `ORIGIN_QEMU_IOMMU` the boot test cannot check, rather than booting another
 /// IOMMU: a raw `-device` value is booted with the VT-d markers, so it must be an
-/// `intel-iommu`.
-fn check_environment() -> Result {
-    Accel::from_env()?;
-    check_iommu(&qemu_iommu())
-}
-
-/// [`check_environment`]'s rule for the IOMMU.
+/// `intel-iommu` ([`Settings::from_env`]).
 fn check_iommu(iommu: &Iommu) -> Result {
     match iommu {
         Iommu::Device(device) if device != "intel-iommu" && !device.starts_with("intel-iommu,") => {
@@ -469,18 +432,6 @@ fn check_iommu(iommu: &Iommu) -> Result {
         }
         _ => Ok(()),
     }
-}
-
-/// Whether the NIC sits behind a PCIe root port (`ORIGIN_QEMU_BRIDGE=on`, `boot-bridge`).
-fn qemu_bridge() -> bool {
-    env::var("ORIGIN_QEMU_BRIDGE").as_deref() == Ok("on")
-}
-
-/// Whether QEMU builds the ACPI tables the usual machine lacks (`ORIGIN_QEMU_ACPI=on`,
-/// `boot-acpi`; TASKS item 62): an NFIT for an NVDIMM, an HMAT, and an SRAT with a generic
-/// initiator.
-fn qemu_acpi() -> bool {
-    env::var("ORIGIN_QEMU_ACPI").as_deref() == Ok("on")
 }
 
 /// The QEMU arguments of the `boot-acpi` machine beyond the usual ones (TASKS item 62; ADR-0019
@@ -537,9 +488,9 @@ fn acpi_machine_args(cpus: u32) -> Vec<String> {
 /// names its processor, if it has one, and the initiator nearest its memory, which the HMAT
 /// needs: QEMU spreads processors over the nodes itself only after it has read the HMAT's
 /// options, which refuse an initiator with no processor yet.
-fn numa_node(id: u32, cpus: u32) -> String {
+fn numa_node(id: u32, cpus: u32, acpi: bool) -> String {
     let node = format!("node,nodeid={id},memdev=onuma{id}");
-    if !qemu_acpi() {
+    if !acpi {
         return node;
     }
     if id < cpus {
@@ -547,12 +498,6 @@ fn numa_node(id: u32, cpus: u32) -> String {
     } else {
         format!("{node},initiator=0")
     }
-}
-
-/// Whether a TEST ONLY application plants firmware-reserved memory in QEMU's tables before the
-/// loader starts (`ORIGIN_QEMU_RESERVED=on`, `boot-reserved`).
-fn qemu_reserved() -> bool {
-    env::var("ORIGIN_QEMU_RESERVED").as_deref() == Ok("on")
 }
 
 /// The device the planted ranges name and no driver attaches: 00:1f.6, absent on QEMU's q35.
@@ -613,16 +558,6 @@ fn reserved_regions(amd: bool) -> Vec<origin_test_reserved_memory::Region> {
     }
 }
 
-/// Processors QEMU emulates: `ORIGIN_QEMU_SMP` (1 or more; no count is compiled into the kernel,
-/// ADR-0008 Amendment 1, D5, and QEMU refuses more than its machine takes), or 2.
-fn qemu_cpus() -> u32 {
-    std::env::var("ORIGIN_QEMU_SMP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(2)
-}
-
 /// How QEMU runs the guest's instructions (`ORIGIN_QEMU_ACCEL`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Accel {
@@ -639,13 +574,10 @@ impl Accel {
             None | Some("tcg") => Ok(Accel::Tcg),
             Some("kvm") => Ok(Accel::Kvm),
             Some(other) => Err(format!(
-                "ORIGIN_QEMU_ACCEL must be tcg or kvm, not {other:?}"
+                "{} must be tcg or kvm, not {other:?}",
+                settings::ACCEL
             )),
         }
-    }
-
-    fn from_env() -> Result<Accel> {
-        Accel::named(env::var("ORIGIN_QEMU_ACCEL").ok().as_deref())
     }
 
     /// The `-machine` value. Interrupt remapping needs the I/O APIC in QEMU, not in the host
@@ -684,14 +616,9 @@ impl Accel {
     }
 }
 
-/// What the per-processor NVMe proof must print on this configuration: every processor given a
-/// queue proven, or, where the controller gives none past the driver's two, "not proven".
-fn nvme_per_cpu_markers(machine: &Machine, cpus: u32) -> Vec<String> {
-    nvme_per_cpu_markers_for(machine, cpus, qemu_nvme_pairs())
-}
-
-/// [`nvme_per_cpu_markers`] for a controller that allocates `pairs` I/O queue pairs. The kernel
-/// judges on the controller's own numbers and prints each (review finding F5 of 2026-11-14):
+/// What the per-processor NVMe proof must print on this configuration, for a controller that
+/// allocates `pairs` I/O queue pairs: every processor given a queue proven, or, where the
+/// controller gives none past the driver's two, "not proven". The kernel judges on the controller's own numbers and prints each (review finding F5 of 2026-11-14):
 /// QEMU 11.1's controller allocates its `max_ioqpairs` whatever is asked.
 fn nvme_per_cpu_markers_for(machine: &Machine, cpus: u32, pairs: u32) -> Vec<String> {
     let queued = nvme_queued_for(cpus, pairs);
@@ -748,24 +675,10 @@ fn queue_order(machine: &Machine) -> Vec<u32> {
         .collect()
 }
 
-/// The I/O queue pairs this boot's NVMe controller allocates: QEMU's default, or
-/// `ORIGIN_QEMU_NVME_PAIRS` (at least 2), which limits its `max_ioqpairs` for the control that
-/// shows a controller with none past the driver's two (the coordinating session's ruling of
-/// 2026-11-14).
-fn qemu_nvme_pairs() -> u32 {
-    env::var("ORIGIN_QEMU_NVME_PAIRS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n >= 2)
-        .unwrap_or(QEMU_NVME_PAIRS)
-}
-
-/// The processors that get an NVMe queue of their own on QEMU's controller: the first this many.
-fn nvme_queued(cpus: u32) -> u32 {
-    nvme_queued_for(cpus, qemu_nvme_pairs())
-}
-
-/// [`nvme_queued`] for a controller that allocates `pairs` I/O queue pairs.
+/// The processors that get an NVMe queue of their own on a controller that allocates `pairs` I/O
+/// queue pairs (QEMU's default, or `ORIGIN_QEMU_NVME_PAIRS`, at least 2, which limits its
+/// `max_ioqpairs` for the control that shows a controller with none past the driver's two: the
+/// coordinating session's ruling of 2026-11-14): the first this many.
 fn nvme_queued_for(cpus: u32, pairs: u32) -> u32 {
     cpus.min(pairs.saturating_sub(2)).min(QEMU_NVME_VECTORS - 2)
 }
@@ -874,12 +787,11 @@ impl Machine {
 /// package 1 (APIC ID 256, docs/research/2026-11-08-x2apic-above-255.md) and one at package 1,
 /// die 2, module 3, core 4 (APIC ID 412): its die, module and core are all non-zero, so a
 /// decoder that confuses them shows (docs/research/2026-11-08-cpu-topology-leaf-1fh.md).
-fn machine() -> Machine {
-    if std::env::var("ORIGIN_QEMU_TOPOLOGY").as_deref() == Ok("x2apic") {
+fn machine(settings: &Settings) -> Machine {
+    if settings.topology == Topology::X2apic {
         // The cold-plugged processors are of the boot processor's model: QEMU names their
         // type after the model (`max` -> `max-x86_64-cpu`) and applies `-cpu`'s features.
-        let model = qemu_cpu_model();
-        let base = model.split(',').next().unwrap_or("max");
+        let base = settings.cpu.split(',').next().unwrap_or("max");
         return Machine {
             smp: "1,maxcpus=150,sockets=2,dies=3,modules=5,cores=5,threads=1".into(),
             devices: vec![
@@ -898,14 +810,13 @@ fn machine() -> Machine {
             },
         };
     }
-    if std::env::var("ORIGIN_QEMU_TOPOLOGY").as_deref() == Ok("sparse") {
+    if settings.topology == Topology::Sparse {
         // ADR-0008 Amendment 1, D7 as decision item 294 has it: the gate's large machine. Two
         // packages of 157 single-thread cores (8 bits of core ID, so package 1 starts at APIC ID
         // 256), 314 possible; the 64 processors of package 0 that QEMU starts, and three
         // cold-plugged in package 1 at cores 0, 44 and 156: APIC IDs 256, 300 and 412. 67
         // processors, three above 255, none a power of two.
-        let model = qemu_cpu_model();
-        let base = model.split(',').next().unwrap_or("max");
+        let base = settings.cpu.split(',').next().unwrap_or("max");
         let geometry = Geometry {
             packages: 2,
             dies: 1,
@@ -931,7 +842,7 @@ fn machine() -> Machine {
             geometry,
         };
     }
-    if std::env::var("ORIGIN_QEMU_TOPOLOGY").as_deref() == Ok("many") {
+    if settings.topology == Topology::Many {
         // ADR-0008 Amendment 1, D7: the large sparse machine. 144 cores take 8 bits, so package
         // 1 starts at APIC ID 256: 288 processors, half of them above 255, none a power of two.
         let geometry = Geometry {
@@ -951,7 +862,7 @@ fn machine() -> Machine {
             geometry,
         };
     }
-    if std::env::var("ORIGIN_QEMU_TOPOLOGY").as_deref() == Ok("listed") {
+    if settings.topology == Topology::Listed {
         // ADR-0008 Amendment 1, D7: the discovery machine. The MADT lists every processor q35
         // allows, 4096, in one package; two are present and enabled.
         return Machine {
@@ -969,7 +880,7 @@ fn machine() -> Machine {
             },
         };
     }
-    let cpus = qemu_cpus();
+    let cpus = settings.smp;
     Machine {
         smp: cpus.to_string(),
         devices: Vec::new(),
@@ -1055,9 +966,10 @@ fn topology_markers(machine: &Machine, leaf_1f: bool) -> Vec<String> {
     markers
 }
 
-fn boot_scenario() -> Scenario {
-    let machine = machine();
-    let mut scenario = boot_scenario_markers(&machine);
+/// The kernel boot on the machine `settings` describe, with its markers for that machine.
+fn boot_scenario(settings: &Settings) -> Scenario {
+    let machine = machine(settings);
+    let mut scenario = boot_scenario_markers(&machine, settings);
     // Each AP's start-up line comes after the MADT line and the per-CPU line that follows it
     // (ADR-0008 Amendment 1, D3), in index order.
     if let Some(at) = scenario
@@ -1093,12 +1005,12 @@ fn boot_scenario() -> Scenario {
             );
         }
     }
-    if qemu_iommu() == Iommu::Amd {
-        amd_iommu_markers(&mut scenario, &machine);
+    if settings.iommu == Iommu::Amd {
+        amd_iommu_markers(&mut scenario, &machine, settings);
     }
-    if Accel::from_env() == Ok(Accel::Kvm) {
-        kvm_markers(&mut scenario, qemu_iommu() != Iommu::Amd);
-    } else if oversubscribed() {
+    if settings.accel == Accel::Kvm {
+        kvm_markers(&mut scenario, settings.iommu != Iommu::Amd);
+    } else if oversubscribed(settings) {
         // The processors share the host's cores, so the even-shares line may not come, and an
         // uneven share whose workers both ran is let pass (`oversubscribed_fair_share`).
         scenario
@@ -1108,24 +1020,24 @@ fn boot_scenario() -> Scenario {
         // failed (ADR-0013 Amendment 3, part (a); `stacks_lost`, and the summary after the boot).
         allow_lost_stacks(&mut scenario.markers);
     }
-    if qemu_bridge() {
-        bridge_markers(&mut scenario);
+    if settings.bridge {
+        bridge_markers(&mut scenario, settings);
     }
-    if qemu_reserved() {
-        reserved_markers(&mut scenario, qemu_iommu() == Iommu::Amd);
+    if settings.reserved {
+        reserved_markers(&mut scenario, settings.iommu == Iommu::Amd);
     }
-    if qemu_machine_lacks("pit") {
+    if settings.machine_lacks("pit") {
         no_pit_markers(&mut scenario);
     }
-    if qemu_machine_lacks("i8042") {
+    if settings.machine_lacks("i8042") {
         no_i8042_markers(&mut scenario);
     }
-    match (qemu_cpu_lacks("rdseed"), qemu_cpu_lacks("rdrand")) {
+    match (settings.cpu_lacks("rdseed"), settings.cpu_lacks("rdrand")) {
         (true, false) => rdrand_only_markers(&mut scenario),
         (true, true) => no_generator_markers(&mut scenario),
         _ => {}
     }
-    cpu_identity_marker(&mut scenario);
+    cpu_identity_marker(&mut scenario, settings);
     scenario
 }
 
@@ -1416,28 +1328,22 @@ fn is_unfilled_tx_ring(line: &str) -> bool {
 /// host thread, so on those the two workers of one guest processor get the shares the host gives
 /// QEMU's threads. The machines are named, never found from the host's threads (review finding
 /// F9 of 2026-11-14; decision item 308, ADR-0013 Amendment 2): every other machine, those of 1
-/// to 4 processors and `boot-x2apic` among them, is held to a fair share on every host.
-fn oversubscribed() -> bool {
-    let topology = env::var("ORIGIN_QEMU_TOPOLOGY").ok();
+/// to 4 processors and `boot-x2apic` among them, is held to a fair share on every host. Since
+/// TASKS item 61 the machine is the boot's typed settings, not the environment.
+fn oversubscribed(settings: &Settings) -> bool {
     let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    Accel::from_env()
-        .is_ok_and(|accel| oversubscribed_for(accel, topology.as_deref(), qemu_cpus(), host))
+    oversubscribed_for(settings.accel, settings.topology, settings.smp, host)
 }
 
-/// [`oversubscribed`] for an accelerator, `ORIGIN_QEMU_TOPOLOGY`, `ORIGIN_QEMU_SMP` and the
-/// host's threads. Decision item 308 keeps the host's threads out of the answer: they are taken
-/// only so that the host tests can show that they change nothing.
-fn oversubscribed_for(
-    accel: Accel,
-    topology: Option<&str>,
-    smp: u32,
-    _host_threads: usize,
-) -> bool {
+/// [`oversubscribed`] for an accelerator, a topology, the plain machine's processor count and
+/// the host's threads. Decision item 308 keeps the host's threads out of the answer: they are
+/// taken only so that the host tests can show that they change nothing.
+fn oversubscribed_for(accel: Accel, topology: Topology, smp: u32, _host_threads: usize) -> bool {
     accel == Accel::Tcg
         && match topology {
-            Some("sparse" | "many") => true,
-            Some(_) => false,
-            None => smp == 65,
+            Topology::Sparse | Topology::Many => true,
+            Topology::X2apic | Topology::Listed => false,
+            Topology::Plain => smp == 65,
         }
 }
 
@@ -1681,9 +1587,9 @@ fn reserved_markers(scenario: &mut Scenario, amd: bool) {
 /// The `boot-reserved` machine's whole-log check, after the kernel boot's: every range the
 /// application planted reached the kernel at the same addresses (the kernel read the table
 /// the firmware gave), and the proof's lines are the ones [`reserved_regions`] calls for.
-fn check_reserved_boot(done: &Completed) -> Result {
-    check_kernel_boot(done)?;
-    let amd = qemu_iommu() == Iommu::Amd;
+fn check_reserved_boot(done: &Completed, settings: &Settings) -> Result {
+    check_kernel_boot(done, settings)?;
+    let amd = settings.iommu == Iommu::Amd;
     let planted: Vec<&str> = done
         .serial
         .lines()
@@ -1784,8 +1690,8 @@ fn check_reserved_boot(done: &Completed) -> Result {
 
 /// The `boot-bridge` machine (`ORIGIN_QEMU_BRIDGE=on`): the NIC at 01:00.0 behind a PCIe root
 /// port at 00:04.0, one more function than the default machine.
-fn bridge_markers(scenario: &mut Scenario) {
-    let amd = qemu_iommu() == Iommu::Amd;
+fn bridge_markers(scenario: &mut Scenario, settings: &Settings) {
+    let amd = settings.iommu == Iommu::Amd;
     let count = if amd { 9 } else { 8 };
     let swaps: [(&str, String); 6] = [
         (
@@ -1843,8 +1749,8 @@ fn bridge_markers(scenario: &mut Scenario) {
 /// NVMe queue of its own, its interrupts reach it through an IRTE holding its full ID (MSI-X
 /// entry `2 + k`, `k` its place in [`queue_order`], which puts them first: review finding F1 of
 /// 2026-11-14) and wake its threads; with none above 255, that there is nothing to prove.
-fn x2apic_markers(machine: &Machine) -> Vec<String> {
-    let queued = nvme_queued(machine.cpus());
+fn x2apic_markers(machine: &Machine, settings: &Settings) -> Vec<String> {
+    let queued = nvme_queued_for(machine.cpus(), settings.nvme_pairs);
     let all_wide = machine.apic_ids.iter().filter(|&&id| id > 0xFF).count();
     let wide: Vec<(u32, u32, u32)> = queue_order(machine)
         .into_iter()
@@ -1889,8 +1795,9 @@ fn x2apic_markers(machine: &Machine) -> Vec<String> {
 /// other marker is the same. Two lines pin what QEMU 11.1's `amd-iommu` does not do (research
 /// ledger `docs/research/2026-11-08-amd-vi-iommu.md` §2.5): its events carry address 0, and
 /// it logs no interrupt-remapping fault, which it reports on its stderr instead.
-fn amd_iommu_markers(scenario: &mut Scenario, machine: &Machine) {
+fn amd_iommu_markers(scenario: &mut Scenario, machine: &Machine, settings: &Settings) {
     let cpus = machine.cpus();
+    let queued = nvme_queued_for(cpus, settings.nvme_pairs);
     let swaps: [(String, Vec<String>); 14] = [
         // The ACPI census names the IOMMU's table (TASKS item 62).
         (
@@ -1943,15 +1850,15 @@ fn amd_iommu_markers(scenario: &mut Scenario, machine: &Machine) {
         (
             format!(
                 "origin-kernel: IOMMU: interrupt remapping: {} of {} MSI-X entries (NVMe {}, virtio-net 2) hold only a remappable handle with data 0",
-                3 + nvme_queued(cpus),
-                3 + nvme_queued(cpus),
-                1 + nvme_queued(cpus)
+                3 + queued,
+                3 + queued,
+                1 + queued
             ),
             vec![format!(
                 "origin-kernel: IOMMU: interrupt remapping: {} of {} MSI-X entries (NVMe {}, virtio-net 2) hold only an index into their device's own interrupt remapping table, whose IRTE holds the vector and the x2APIC destination",
-                3 + nvme_queued(cpus),
-                3 + nvme_queued(cpus),
-                1 + nvme_queued(cpus)
+                3 + queued,
+                3 + queued,
+                1 + queued
             )],
         ),
         (
@@ -2012,9 +1919,10 @@ fn amd_iommu_markers(scenario: &mut Scenario, machine: &Machine) {
         .push("failed to remap interrupt from devid 0x10");
 }
 
-fn boot_scenario_markers(machine: &Machine) -> Scenario {
+fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
     use origin_version::{BUILD, PRODUCT, VERSION};
     let cpus = machine.cpus();
+    let queued = nvme_queued_for(cpus, settings.nvme_pairs);
     // The processor the interrupt-driven NVMe and virtio-net threads run on: the first
     // one after the boot processor, if any.
     let target = machine.named(cpus.min(2) - 1);
@@ -2194,8 +2102,8 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             machine,
             machine.geometry.has_extended_levels()
                 && guest_is_intel(
-                    &qemu_cpu_model(),
-                    Accel::from_env().unwrap_or(Accel::Tcg),
+                    &settings.cpu,
+                    settings.accel,
                     host_is_intel(),
                 ),
         ))
@@ -2209,8 +2117,8 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: slit: ".into(),
             "; consistent true".into(),
         ])
-        .chain(acpi_markers())
-        .chain(aml_markers())
+        .chain(acpi_markers(settings.acpi))
+        .chain(aml_markers(settings.acpi))
         .chain([
             // The random-number generator (ADR-0016): every processor has one, requests are
             // answered with values that differ, and its stack holds only zeros after a request.
@@ -2394,9 +2302,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         // ADR-0008 Amendment 1, D6: a queue of its own while the controller has one left. The
         // proof is demanded on every configuration that gives one; only a controller limited to
         // the driver's two pairs (`ORIGIN_QEMU_NVME_PAIRS=2`) is expected to say "not proven".
-        .chain(nvme_per_cpu_markers(machine, cpus))
+        .chain(nvme_per_cpu_markers_for(machine, cpus, settings.nvme_pairs))
         // Processors above APIC ID 255: NVMe interrupts reach them live through IRTEs.
-        .chain(x2apic_markers(machine))
+        .chain(x2apic_markers(machine, settings))
         .chain([
             // The block cache over NVMe: cold misses fetch, re-reads hit, eviction and
             // write-back work (CLAUDE.md §39).
@@ -2437,9 +2345,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "reason 0x5 (write to a page not mapped writable); consistent true".into(),
             format!(
                 "origin-kernel: IOMMU: interrupt remapping: {} of {} MSI-X entries (NVMe {}, virtio-net 2) hold only a remappable handle with data 0",
-                3 + nvme_queued(cpus),
-                3 + nvme_queued(cpus),
-                1 + nvme_queued(cpus)
+                3 + queued,
+                3 + queued,
+                1 + queued
             ),
             "APIC ID 300 accepted (its IRTE reads back destination 300), which compatibility format refuses: true; consistent true".into(),
             "origin-kernel: IOMMU: blocked interrupt: NVMe MSI-X vector 1 pointed at IRTE ".into(),
@@ -2548,8 +2456,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
 /// only when it has drawn its logo. The ACPI machine (`boot-acpi`) adds its SRAT's generic
 /// initiator, its HMAT, its NVDIMM's SSDT and its NFIT, where its first boot (2026-11-14) showed
 /// QEMU lists them. The markers follow what the machines showed; they are not assumed.
-fn acpi_markers() -> Vec<String> {
-    let acpi = qemu_acpi();
+fn acpi_markers(acpi: bool) -> Vec<String> {
     let checked = "checked";
     let other = "another specification's: header checked";
     let mut markers = Vec::new();
@@ -2608,12 +2515,12 @@ fn acpi_markers() -> Vec<String> {
 /// SSDT after it), every named result as expected, every device that failed refused in the ways
 /// the proof allows, the HPET's, the processors' and the links' refusals there, the host having
 /// answered nothing but refusals and given the Global Lock back, and the heap back.
-fn aml_markers() -> Vec<String> {
+fn aml_markers(acpi: bool) -> Vec<String> {
     let mut markers: Vec<String> = vec![
         "origin-kernel: aml: DSDT rev ".into(),
         ": loaded as table 0".into(),
     ];
-    if qemu_acpi() {
+    if acpi {
         markers.push("origin-kernel: aml: SSDT rev ".into());
         markers.push(": loaded as table 1".into());
     }
@@ -2637,8 +2544,8 @@ fn aml_markers() -> Vec<String> {
 }
 
 /// The kernel boot's whole-log checks: every line whole, and the screen.
-fn check_kernel_boot(done: &Completed) -> Result {
-    console_lines_intact(&done.serial, self::machine().cpus() as usize)?;
+fn check_kernel_boot(done: &Completed, settings: &Settings) -> Result {
+    console_lines_intact(&done.serial, machine(settings).cpus() as usize)?;
     long_lines_whole(&done.serial)?;
     unwaited_lines_whole(&done.serial)?;
     check_screen(done)
@@ -3718,20 +3625,20 @@ fn main() -> ExitCode {
                 Ok(())
             })
         }),
-        ["boot-test"] => in_turn("boot-test", boot_test),
-        ["boot-matrix"] => in_turn("boot-matrix", boot_matrix),
-        ["boot-x2apic"] => in_turn("boot-x2apic", boot_x2apic),
-        ["boot-sparse"] => in_turn("boot-sparse", boot_sparse),
-        ["boot-many"] => in_turn("boot-many", boot_many),
-        ["boot-listed"] => in_turn("boot-listed", boot_listed),
-        ["boot-console"] => in_turn("boot-console", boot_console),
-        ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
-        ["boot-reserved"] => in_turn("boot-reserved", boot_reserved),
-        ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
-        ["boot-acpi"] => in_turn("boot-acpi", boot_acpi),
-        ["boot-random"] => in_turn("boot-random", boot_random),
-        ["boot-identity"] => in_turn("boot-identity", boot_identity),
-        ["run"] => in_turn("run", run),
+        ["boot-test"] => in_turn_with_settings("boot-test", boot_test),
+        ["boot-matrix"] => in_turn_with_settings("boot-matrix", boot_matrix),
+        ["boot-x2apic"] => in_turn_with_settings("boot-x2apic", boot_x2apic),
+        ["boot-sparse"] => in_turn_with_settings("boot-sparse", boot_sparse),
+        ["boot-many"] => in_turn_with_settings("boot-many", boot_many),
+        ["boot-listed"] => in_turn_with_settings("boot-listed", boot_listed),
+        ["boot-console"] => in_turn_with_settings("boot-console", boot_console),
+        ["boot-bridge"] => in_turn_with_settings("boot-bridge", boot_bridge),
+        ["boot-reserved"] => in_turn_with_settings("boot-reserved", boot_reserved),
+        ["boot-legacy-free"] => in_turn_with_settings("boot-legacy-free", boot_legacy_free),
+        ["boot-acpi"] => in_turn_with_settings("boot-acpi", boot_acpi),
+        ["boot-random"] => in_turn_with_settings("boot-random", boot_random),
+        ["boot-identity"] => in_turn_with_settings("boot-identity", boot_identity),
+        ["run"] => in_turn_with_settings("run", run),
         ["loom"] => in_turn("loom", loom::run),
         ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
         ["exclusive", "--", command @ ..] => {
@@ -3765,19 +3672,53 @@ fn in_turn(command: &str, run: impl FnOnce() -> Result) -> Result {
     run()
 }
 
-/// `xtask boot-test`, as a child process inside this run's turn on the machine.
-fn boot_test_child(exe: &Path) -> Command {
-    let mut command = Command::new(exe);
-    command.arg("boot-test");
-    turns::pass(&mut command);
-    command
+/// [`in_turn`] for a command that boots: the person's settings are read from the environment
+/// once, here, and refused before the turn is taken if a value is not one they take; `run` gets
+/// them as a typed value (TASKS item 61).
+fn in_turn_with_settings(command: &str, run: impl FnOnce(&Settings) -> Result) -> Result {
+    let settings = Settings::from_env()?;
+    in_turn(command, || run(&settings))
 }
 
-/// Runs `boot-test` in a child process for each IOMMU and processor count, so each gets its
-/// own `ORIGIN_QEMU_IOMMU` and `ORIGIN_QEMU_SMP` (the environment of this process is never
-/// changed), and then [`boot_x2apic`] (the owner's decision on ADR-0008, question 3).
-fn boot_matrix() -> Result {
-    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+/// One machine `boot-matrix` or one of its scenario commands boots `boot-test` on: the line said
+/// before it, the machine's settings, and the words its failure begins with. Each command's
+/// machines are made from the person's settings by a function of its own, which starts nothing,
+/// so the host tests compare each machine with the environment `boot-matrix` gave its child
+/// before TASKS item 61.
+#[derive(Debug)]
+struct MachineRun {
+    said: String,
+    settings: Settings,
+    failed: String,
+}
+
+/// Runs `boot-test` in this process on each machine of `runs`, in order, and stops at the first
+/// that fails. Nothing here starts `xtask` again (ADR-0011 Amendment 4, T1; TASKS item 61).
+fn boot_machines(runs: Vec<MachineRun>) -> Result {
+    for run in runs {
+        boot_machine(&run)?;
+    }
+    Ok(())
+}
+
+/// [`boot_machines`] for one machine.
+fn boot_machine(run: &MachineRun) -> Result {
+    println!("{}", run.said);
+    boot_test(&run.settings).map_err(|e| format!("{} failed: {e}", run.failed))
+}
+
+/// The two IOMMUs the machines boot under, with the names `boot-matrix` prints for them.
+fn iommus() -> [(&'static str, Iommu); 2] {
+    [("intel", Iommu::Intel), ("amd", Iommu::Amd)]
+}
+
+/// The label of `boot-test`'s kernel boot, the only scenario most machines run.
+const KERNEL_BOOT: &str = "kernel boot";
+
+/// Runs `boot-test` in this process for each IOMMU and processor count, each with its own
+/// settings made from the person's (`base`, which is never changed), and then [`boot_x2apic`] and
+/// the other scenario commands (the owner's decision on ADR-0008, question 3).
+fn boot_matrix(base: &Settings) -> Result {
     let bases = stack_bases_file();
     if let Some(dir) = bases.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -3791,37 +3732,24 @@ fn boot_matrix() -> Result {
     } else {
         &[1, 2, 4]
     };
-    for iommu in ["intel", "amd"] {
-        for &cpus in counts {
-            println!("xtask: boot-matrix: {iommu} IOMMU, {cpus} processor(s)");
-            let status = boot_test_child(&exe)
-                .env("ORIGIN_QEMU_IOMMU", iommu)
-                .env("ORIGIN_QEMU_SMP", cpus.to_string())
-                .env("ORIGIN_BOOT_TEST_TIMEOUT", timeout_for(cpus).to_string())
-                .status()
-                .map_err(|e| format!("cannot run boot-test: {e}"))?;
-            if !status.success() {
-                return Err(format!(
-                    "boot-test with the {iommu} IOMMU and {cpus} processor(s) failed ({status})"
-                ));
-            }
-            check_stack_bases_so_far(&bases)?;
-        }
+    for run in matrix_runs(base, counts) {
+        boot_machine(&run)?;
+        check_stack_bases_so_far(&bases)?;
     }
-    boot_x2apic()?;
-    boot_bridge()?;
-    boot_reserved()?;
-    boot_legacy_free()?;
-    boot_acpi()?;
-    boot_random()?;
-    boot_identity()?;
-    boot_console()?;
+    boot_x2apic(base)?;
+    boot_bridge(base)?;
+    boot_reserved(base)?;
+    boot_legacy_free(base)?;
+    boot_acpi(base)?;
+    boot_random(base)?;
+    boot_identity(base)?;
+    boot_console(base)?;
     // ADR-0008 D7 as decision item 294 has it: the large sparse machine of 67 processors, and
     // the discovery machine. The 288-processor run (`boot-many`) is outside the gate: on the
     // development Mac QEMU disturbs the guest's timing at 288 processors before any AP starts.
     if any_count {
-        boot_sparse()?;
-        boot_listed()?;
+        boot_sparse(base)?;
+        boot_listed(base)?;
     } else {
         println!(
             "xtask: boot-matrix: the machines of ADR-0008 Amendment 1, D7 (3 and 65 processors, the 67-processor sparse machine, the discovery machine) are not run in CI until each one's time has been measured and accepted (set ORIGIN_BOOT_MATRIX_ANY_COUNT=on to run them)"
@@ -3849,6 +3777,27 @@ fn boot_matrix() -> Result {
     Ok(())
 }
 
+/// `boot-matrix`'s first machines: each IOMMU with each of `counts` processors, each with its
+/// timeout ([`timeout_for`]).
+fn matrix_runs(base: &Settings, counts: &[u32]) -> Vec<MachineRun> {
+    let mut runs = Vec::new();
+    for (name, iommu) in iommus() {
+        for &cpus in counts {
+            runs.push(MachineRun {
+                said: format!("xtask: boot-matrix: {name} IOMMU, {cpus} processor(s)"),
+                settings: Settings {
+                    iommu: iommu.clone(),
+                    smp: cpus,
+                    timeout: Some(timeout_for(base, cpus)),
+                    ..base.clone()
+                },
+                failed: format!("boot-test with the {name} IOMMU and {cpus} processor(s)"),
+            });
+        }
+    }
+    runs
+}
+
 /// Whether `boot-matrix` runs the machines of ADR-0008 Amendment 1, D7: always on a developer's
 /// machine; in CI (GitHub Actions) only with `ORIGIN_BOOT_MATRIX_ANY_COUNT=on`. D7's condition:
 /// none becomes required in CI until each one's boot has been measured on the development Mac,
@@ -3860,99 +3809,103 @@ fn any_count_machines() -> bool {
 
 /// A boot's timeout for `cpus` processors: the default, and two seconds more for each processor
 /// past four. A boot under QEMU's software processor starts each AP one at a time and runs every
-/// per-processor proof on each (ADR-0008 Amendment 1, D8), so it grows with the count. An
-/// `ORIGIN_BOOT_TEST_TIMEOUT` set by the caller is kept.
-fn timeout_for(cpus: u32) -> u64 {
-    if let Some(secs) = env::var("ORIGIN_BOOT_TEST_TIMEOUT")
-        .ok()
-        .and_then(|set| set.parse().ok())
-    {
-        return secs;
-    }
-    DEFAULT_BOOT_TEST_TIMEOUT.as_secs() + 2 * u64::from(cpus.saturating_sub(4))
+/// per-processor proof on each (ADR-0008 Amendment 1, D8), so it grows with the count. A timeout
+/// the person set (`ORIGIN_BOOT_TEST_TIMEOUT`, in `base`) is kept.
+fn timeout_for(base: &Settings, cpus: u32) -> Duration {
+    base.timeout.unwrap_or_else(|| {
+        DEFAULT_BOOT_TEST_TIMEOUT + Duration::from_secs(2 * u64::from(cpus.saturating_sub(4)))
+    })
 }
 
 /// `boot-test` on the gate's large sparse machine (ADR-0008 D7 as decision item 294 has it): 67
 /// processors in two packages, three at APIC IDs 256, 300 and 412, Intel VT-d with interrupt
 /// remapping, under QEMU's software processor only (a KVM runner has 4 host processors).
-fn boot_sparse() -> Result {
-    if Accel::from_env()? == Accel::Kvm {
+fn boot_sparse(base: &Settings) -> Result {
+    if base.accel == Accel::Kvm {
         println!(
             "xtask: boot-sparse: not run under KVM: the 67-processor sparse machine runs under QEMU's software processor only (ADR-0008 D7)"
         );
         return Ok(());
     }
-    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
     let cpus = SPARSE_PRESENT + 3;
-    println!(
-        "xtask: boot-sparse: {cpus} processors in two packages, APIC IDs 0-{} and 256, 300 and 412 of {} possible",
-        SPARSE_PRESENT - 1,
-        2 * SPARSE_CORES
-    );
-    let status = boot_test_child(&exe)
-        .env("ORIGIN_QEMU_TOPOLOGY", "sparse")
-        .env("ORIGIN_QEMU_IOMMU", "intel")
-        .env("ORIGIN_BOOT_TEST_TIMEOUT", timeout_for(cpus).to_string())
-        .status()
-        .map_err(|e| format!("cannot run boot-test: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "boot-test on the 67-processor sparse machine failed ({status})"
-        ));
-    }
+    boot_machines(sparse_runs(base))?;
     println!("xtask: boot-sparse passed ({cpus} processors online, three above APIC ID 255)");
     Ok(())
+}
+
+/// [`boot_sparse`]'s machine.
+fn sparse_runs(base: &Settings) -> Vec<MachineRun> {
+    let cpus = SPARSE_PRESENT + 3;
+    vec![MachineRun {
+        said: format!(
+            "xtask: boot-sparse: {cpus} processors in two packages, APIC IDs 0-{} and 256, 300 and 412 of {} possible",
+            SPARSE_PRESENT - 1,
+            2 * SPARSE_CORES
+        ),
+        settings: Settings {
+            topology: Topology::Sparse,
+            iommu: Iommu::Intel,
+            timeout: Some(timeout_for(base, cpus)),
+            ..base.clone()
+        },
+        failed: "boot-test on the 67-processor sparse machine".into(),
+    }]
 }
 
 /// `boot-test` on 288 processors in two packages of 144 cores, APIC IDs 0-143 and 256-399,
 /// Intel VT-d with interrupt remapping, under QEMU's software processor only: a run measured and
 /// recorded outside the gate (decision item 294), since QEMU disturbs the guest's timing at this
 /// count on the development Mac.
-fn boot_many() -> Result {
-    if Accel::from_env()? == Accel::Kvm {
+fn boot_many(base: &Settings) -> Result {
+    if base.accel == Accel::Kvm {
         println!(
             "xtask: boot-many: not run under KVM: the large sparse machine runs under QEMU's software processor only (ADR-0008 Amendment 1, D7)"
         );
         return Ok(());
     }
-    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
     let cpus = 2 * MANY_CORES;
-    println!(
-        "xtask: boot-many: {cpus} processors in two packages, APIC IDs 0-{} and 256-{}",
-        MANY_CORES - 1,
-        255 + MANY_CORES
-    );
-    let status = boot_test_child(&exe)
-        .env("ORIGIN_QEMU_TOPOLOGY", "many")
-        .env("ORIGIN_QEMU_IOMMU", "intel")
-        .env("ORIGIN_BOOT_TEST_TIMEOUT", timeout_for(cpus).to_string())
-        .status()
-        .map_err(|e| format!("cannot run boot-test: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "boot-test on the large sparse machine failed ({status})"
-        ));
-    }
+    boot_machines(many_runs(base))?;
     println!("xtask: boot-many passed ({cpus} processors online)");
     Ok(())
 }
 
+/// [`boot_many`]'s machine.
+fn many_runs(base: &Settings) -> Vec<MachineRun> {
+    let cpus = 2 * MANY_CORES;
+    vec![MachineRun {
+        said: format!(
+            "xtask: boot-many: {cpus} processors in two packages, APIC IDs 0-{} and 256-{}",
+            MANY_CORES - 1,
+            255 + MANY_CORES
+        ),
+        settings: Settings {
+            topology: Topology::Many,
+            iommu: Iommu::Intel,
+            timeout: Some(timeout_for(base, cpus)),
+            ..base.clone()
+        },
+        failed: "boot-test on the large sparse machine".into(),
+    }]
+}
+
 /// `boot-test` on the discovery machine (ADR-0008 Amendment 1, D7): the MADT lists the 4096
 /// processors q35 allows, two of them enabled.
-fn boot_listed() -> Result {
-    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
-    println!("xtask: boot-listed: 2 processors enabled of {LISTED} the MADT lists");
-    let status = boot_test_child(&exe)
-        .env("ORIGIN_QEMU_TOPOLOGY", "listed")
-        .status()
-        .map_err(|e| format!("cannot run boot-test: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "boot-test on the discovery machine failed ({status})"
-        ));
-    }
+fn boot_listed(base: &Settings) -> Result {
+    boot_machines(listed_runs(base))?;
     println!("xtask: boot-listed passed (2 of {LISTED} listed processors online)");
     Ok(())
+}
+
+/// [`boot_listed`]'s machine.
+fn listed_runs(base: &Settings) -> Vec<MachineRun> {
+    vec![MachineRun {
+        said: format!("xtask: boot-listed: 2 processors enabled of {LISTED} the MADT lists"),
+        settings: Settings {
+            topology: Topology::Listed,
+            ..base.clone()
+        },
+        failed: "boot-test on the discovery machine".into(),
+    }]
 }
 
 /// The I/O port of the UART the SPCR proof's table names: COM2's, where there is no COM1.
@@ -4014,7 +3967,7 @@ fn console_scenario(
     capture: Capture,
     markers: Vec<String>,
     qemu_args: Option<QemuArgs>,
-    check: Option<fn(&Completed) -> Result>,
+    check: Option<Check>,
 ) -> Scenario {
     Scenario {
         label,
@@ -4060,7 +4013,7 @@ const MOVED_LINE: &str = "origin-kernel: console: the ACPI SPCR (revision 2, int
 
 /// Once the firmware has named a better UART, the fallback is not used: COM1 holds the move
 /// line as its last kernel line, and has never heard of anything after it.
-fn check_com1_stopped_at_the_move(done: &Completed) -> Result {
+fn check_com1_stopped_at_the_move(done: &Completed, _settings: &Settings) -> Result {
     let com1 = done.com1.as_deref().ok_or("no COM1 log")?;
     let text = serial::clean(com1.as_bytes());
     let kernel_lines: Vec<&str> = text
@@ -4203,10 +4156,9 @@ fn console_scenarios() -> Vec<Scenario> {
     ]
 }
 
-/// The console scenarios (`boot-console`), each a whole boot. `ORIGIN_BOOT_TEST_ONLY` selects
-/// by label, as for `boot-test`.
-fn boot_console() -> Result {
-    check_environment()?;
+/// The console scenarios (`boot-console`), each a whole boot on the machine `settings` describe.
+/// Its filter (`ORIGIN_BOOT_TEST_ONLY`) selects by label, as for `boot-test`.
+fn boot_console(settings: &Settings) -> Result {
     let krn_path = pack_kernel(&build_kernel()?)?;
     let (trusted, _) = test_keys()?;
     let signed = sign_kernel(&krn_path, &trusted, "KERNEL.signed.ONBF")?;
@@ -4214,10 +4166,9 @@ fn boot_console() -> Result {
         .into_iter()
         .map(|scenario| (scenario, signed.clone()))
         .collect();
-    let only = env::var("ORIGIN_BOOT_TEST_ONLY").unwrap_or_default();
-    let chosen = select_scenarios(&scenarios, &only)?;
+    let chosen = select_scenarios(&scenarios, &settings.only)?;
     for (scenario, kernel) in &chosen {
-        run_scenario(scenario, kernel)?;
+        run_scenario(scenario, kernel, settings)?;
     }
     println!(
         "xtask: boot-console passed ({} of {} scenarios: the UART the SPCR names, COM1 named, refused tables, a UART that takes no bytes, one that stops taking them, no display, no UART)",
@@ -4227,94 +4178,108 @@ fn boot_console() -> Result {
     Ok(())
 }
 
-/// Runs `boot-test`'s kernel boot in a child process under each IOMMU with firmware-reserved
+/// Runs `boot-test`'s kernel boot in this process under each IOMMU with firmware-reserved
 /// memory planted in QEMU's tables by the TEST ONLY application (`ORIGIN_QEMU_RESERVED=on`;
 /// TASKS item 40; ADR-0007 questions 4 and 8): the kernel identity-maps what it may trust for
 /// the NVMe controller, refuses the rest by name, and proves the maps by DMA.
-fn boot_reserved() -> Result {
-    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
-    for iommu in ["intel", "amd"] {
-        println!("xtask: boot-reserved: the {iommu} IOMMU, firmware-reserved memory planted");
-        let status = boot_test_child(&exe)
-            .env("ORIGIN_QEMU_IOMMU", iommu)
-            .env("ORIGIN_QEMU_RESERVED", "on")
-            .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
-            .status()
-            .map_err(|e| format!("cannot run boot-test: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "boot-test with reserved memory planted and the {iommu} IOMMU failed ({status})"
-            ));
-        }
-    }
+fn boot_reserved(base: &Settings) -> Result {
+    boot_machines(reserved_runs(base))?;
     println!("xtask: boot-reserved passed (both IOMMUs, firmware-reserved memory planted)");
     Ok(())
+}
+
+/// [`boot_reserved`]'s machines.
+fn reserved_runs(base: &Settings) -> Vec<MachineRun> {
+    iommus()
+        .into_iter()
+        .map(|(name, iommu)| MachineRun {
+            said: format!(
+                "xtask: boot-reserved: the {name} IOMMU, firmware-reserved memory planted"
+            ),
+            settings: Settings {
+                iommu,
+                reserved: true,
+                only: KERNEL_BOOT.into(),
+                ..base.clone()
+            },
+            failed: format!("boot-test with reserved memory planted and the {name} IOMMU"),
+        })
+        .collect()
 }
 
 /// Runs the kernel boot on the ACPI machine (`ORIGIN_QEMU_ACPI=on`; TASKS item 62; ADR-0019 A6
 /// area A, A7): two processors, and the tables QEMU builds that the usual machine lacks, an NFIT
 /// for an NVDIMM, an HMAT, and an SRAT with a generic initiator, each checked by the kernel's
 /// census of its ACPI tables.
-fn boot_acpi() -> Result {
-    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
-    println!("xtask: boot-acpi: QEMU's NFIT, HMAT and generic initiator");
-    let status = boot_test_child(&exe)
-        .env("ORIGIN_QEMU_ACPI", "on")
-        .env("ORIGIN_QEMU_MACHINE", "nvdimm=on,hmat=on")
-        .env("ORIGIN_QEMU_SMP", "2")
-        .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
-        .status()
-        .map_err(|e| format!("cannot run boot-test: {e}"))?;
-    if !status.success() {
-        return Err(format!("boot-test on the ACPI machine failed ({status})"));
-    }
+fn boot_acpi(base: &Settings) -> Result {
+    boot_machines(acpi_runs(base))?;
     println!("xtask: boot-acpi passed (QEMU's NFIT, HMAT and generic initiator, each checked)");
     Ok(())
 }
 
+/// [`boot_acpi`]'s machine.
+fn acpi_runs(base: &Settings) -> Vec<MachineRun> {
+    vec![MachineRun {
+        said: "xtask: boot-acpi: QEMU's NFIT, HMAT and generic initiator".into(),
+        settings: Settings {
+            acpi: true,
+            machine: "nvdimm=on,hmat=on".into(),
+            smp: 2,
+            only: KERNEL_BOOT.into(),
+            ..base.clone()
+        },
+        failed: "boot-test on the ACPI machine".into(),
+    }]
+}
+
 /// Runs the kernel boot on a machine with no 8254 and no 8042 (ADR-0013 F2, F3), the
 /// legacy-free shape of the machines Origin targets.
-fn boot_legacy_free() -> Result {
-    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
-    println!("xtask: boot-legacy-free: no 8254 and no 8042");
-    let status = boot_test_child(&exe)
-        .env("ORIGIN_QEMU_MACHINE", "pit=off,i8042=off")
-        .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
-        .status()
-        .map_err(|e| format!("cannot run boot-test: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "boot-test with no 8254 and no 8042 failed ({status})"
-        ));
-    }
+fn boot_legacy_free(base: &Settings) -> Result {
+    boot_machines(legacy_free_runs(base))?;
     println!("xtask: boot-legacy-free passed (no 8254, no 8042)");
     Ok(())
+}
+
+/// [`boot_legacy_free`]'s machine.
+fn legacy_free_runs(base: &Settings) -> Vec<MachineRun> {
+    vec![MachineRun {
+        said: "xtask: boot-legacy-free: no 8254 and no 8042".into(),
+        settings: Settings {
+            machine: "pit=off,i8042=off".into(),
+            only: KERNEL_BOOT.into(),
+            ..base.clone()
+        },
+        failed: "boot-test with no 8254 and no 8042".into(),
+    }]
 }
 
 /// Runs the kernel boot on two processors that lack the instructions the random-number
 /// generator is seeded from (ADR-0016 R3, R8): one with RDRAND and no RDSEED, which boots and
 /// says what its generator's strength rests on; and one with neither, which has no generator,
 /// launches nothing, and still reaches its verdict.
-fn boot_random() -> Result {
-    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
-    for (model, what) in [
-        ("max,-rdseed", "RDRAND and no RDSEED"),
-        ("max,-rdseed,-rdrand", "neither RDSEED nor RDRAND"),
-    ] {
-        println!("xtask: boot-random: a processor with {what} (-cpu {model})");
-        let status = boot_test_child(&exe)
-            .env("ORIGIN_QEMU_CPU", model)
-            .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
-            .status()
-            .map_err(|e| format!("cannot run boot-test: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "boot-test on a processor with {what} failed ({status})"
-            ));
-        }
-    }
+fn boot_random(base: &Settings) -> Result {
+    boot_machines(random_runs(base))?;
     println!("xtask: boot-random passed (RDRAND alone; neither instruction)");
     Ok(())
+}
+
+/// [`boot_random`]'s machines.
+fn random_runs(base: &Settings) -> Vec<MachineRun> {
+    [
+        ("max,-rdseed", "RDRAND and no RDSEED"),
+        ("max,-rdseed,-rdrand", "neither RDSEED nor RDRAND"),
+    ]
+    .into_iter()
+    .map(|(model, what)| MachineRun {
+        said: format!("xtask: boot-random: a processor with {what} (-cpu {model})"),
+        settings: Settings {
+            cpu: model.into(),
+            only: KERNEL_BOOT.into(),
+            ..base.clone()
+        },
+        failed: format!("boot-test on a processor with {what}"),
+    })
+    .collect()
 }
 
 /// The processors `boot-identity` has QEMU report (ADR-0009 A2; TASKS item 16): the `-cpu`
@@ -4340,9 +4305,11 @@ const CPU_IDENTITIES: [(&str, &str, &str); 2] = [
 /// whole line in place of the line's start. The rest of the boot is held to every other
 /// marker, its verdict and the halt line among them: the kernel never refuses a machine for
 /// its identity (A2).
-fn cpu_identity_marker(scenario: &mut Scenario) {
-    let model = qemu_cpu_model();
-    if let Some((_, _, line)) = CPU_IDENTITIES.iter().find(|(cpu, _, _)| *cpu == model) {
+fn cpu_identity_marker(scenario: &mut Scenario, settings: &Settings) {
+    if let Some((_, _, line)) = CPU_IDENTITIES
+        .iter()
+        .find(|(cpu, _, _)| *cpu == settings.cpu)
+    {
         swap_marker(
             scenario,
             "origin-kernel: CPU identity: ",
@@ -4356,85 +4323,96 @@ fn cpu_identity_marker(scenario: &mut Scenario) {
 /// can boot an in-scope and an out-of-scope identity"). Under KVM a guest's vendor is not
 /// changed: those boots run on QEMU's software processor only, and the KVM jobs' own boots
 /// print the real processor's line.
-fn boot_identity() -> Result {
-    if Accel::from_env()? == Accel::Kvm {
+fn boot_identity(base: &Settings) -> Result {
+    if base.accel == Accel::Kvm {
         println!(
             "xtask: boot-identity: not run under KVM, where the guest's vendor stays the host's; QEMU's software processor runs it"
         );
         return Ok(());
     }
-    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
-    for (model, what, _) in CPU_IDENTITIES {
-        println!("xtask: boot-identity: {what} (-cpu {model})");
-        let status = boot_test_child(&exe)
-            .env("ORIGIN_QEMU_CPU", model)
-            .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
-            .status()
-            .map_err(|e| format!("cannot run boot-test: {e}"))?;
-        if !status.success() {
-            return Err(format!("boot-test as {what} failed ({status})"));
-        }
-    }
+    boot_machines(identity_runs(base))?;
     println!(
         "xtask: boot-identity passed (a Panther Lake in the declared scope; a Zen 4 EPYC outside it)"
     );
     Ok(())
 }
 
-/// Runs `boot-test` in a child process with the NIC behind a PCIe root port
+/// [`boot_identity`]'s machines.
+fn identity_runs(base: &Settings) -> Vec<MachineRun> {
+    CPU_IDENTITIES
+        .iter()
+        .map(|(model, what, _)| MachineRun {
+            said: format!("xtask: boot-identity: {what} (-cpu {model})"),
+            settings: Settings {
+                cpu: (*model).into(),
+                only: KERNEL_BOOT.into(),
+                ..base.clone()
+            },
+            failed: format!("boot-test as {what}"),
+        })
+        .collect()
+}
+
+/// Runs `boot-test` in this process with the NIC behind a PCIe root port
 /// (`ORIGIN_QEMU_BRIDGE=on`), under each IOMMU: bus mastering must be cleared on the bridge at
 /// the quiesce and opened again above the device its driver attached (ADR-0007 I12). QEMU
 /// itself ignores a bridge's Bus Master Enable, so this proves the kernel's path logic and the
 /// read-backs, not the bridge's effect on traffic (the research ledger says so).
-fn boot_bridge() -> Result {
-    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
-    for iommu in ["intel", "amd"] {
-        println!("xtask: boot-bridge: the {iommu} IOMMU, the NIC behind a PCIe root port");
-        let status = boot_test_child(&exe)
-            .env("ORIGIN_QEMU_IOMMU", iommu)
-            .env("ORIGIN_QEMU_BRIDGE", "on")
-            .status()
-            .map_err(|e| format!("cannot run boot-test: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "boot-test with the NIC behind a bridge and the {iommu} IOMMU failed ({status})"
-            ));
-        }
-    }
+fn boot_bridge(base: &Settings) -> Result {
+    boot_machines(bridge_runs(base))?;
     println!("xtask: boot-bridge passed (both IOMMUs, the NIC behind a PCIe root port)");
     Ok(())
 }
 
-/// Runs `boot-test` in a child process on the sparse machine (`ORIGIN_QEMU_TOPOLOGY=x2apic`,
-/// see `machine`): processors at APIC IDs 256 and 412 must come online, run threads, and
-/// take the NVMe interrupts routed to them through interrupt remapping.
+/// [`boot_bridge`]'s machines.
+fn bridge_runs(base: &Settings) -> Vec<MachineRun> {
+    iommus()
+        .into_iter()
+        .map(|(name, iommu)| MachineRun {
+            said: format!("xtask: boot-bridge: the {name} IOMMU, the NIC behind a PCIe root port"),
+            settings: Settings {
+                iommu,
+                bridge: true,
+                ..base.clone()
+            },
+            failed: format!("boot-test with the NIC behind a bridge and the {name} IOMMU"),
+        })
+        .collect()
+}
+
+/// Runs `boot-test` in this process on the sparse machine (`ORIGIN_QEMU_TOPOLOGY=x2apic`, see
+/// `machine`): processors at APIC IDs 256 and 412 must come online, run threads, and take the
+/// NVMe interrupts routed to them through interrupt remapping.
 ///
 /// Twice, because the two models tell the kernel different things about one machine. On an
 /// Intel-vendor model QEMU raises the CPUID maximum to 1Fh, so the proof sees dies and modules.
 /// On `max` (AMD vendor), the maximum stays 0Dh and only leaf 0Bh remains, so the die and
 /// module fields read as part of the core
 /// (docs/research/2026-11-08-cpu-topology-leaf-1fh.md).
-fn boot_x2apic() -> Result {
-    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
-    for (model, leaf) in [("max,vendor=GenuineIntel", "leaf 1Fh"), ("max", "leaf 0Bh")] {
-        println!(
-            "xtask: boot-x2apic: processors at APIC IDs 0, 256 and 412 of 150 possible, -cpu {model} ({leaf})"
-        );
-        let status = boot_test_child(&exe)
-            .env("ORIGIN_QEMU_TOPOLOGY", "x2apic")
-            .env("ORIGIN_QEMU_CPU", model)
-            .status()
-            .map_err(|e| format!("cannot run boot-test: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "boot-test on the sparse machine with -cpu {model} failed ({status})"
-            ));
-        }
-    }
+fn boot_x2apic(base: &Settings) -> Result {
+    boot_machines(x2apic_runs(base))?;
     println!(
         "xtask: boot-x2apic passed (processors at APIC IDs 256 and 412, under leaves 1Fh and 0Bh)"
     );
     Ok(())
+}
+
+/// [`boot_x2apic`]'s machines.
+fn x2apic_runs(base: &Settings) -> Vec<MachineRun> {
+    [("max,vendor=GenuineIntel", "leaf 1Fh"), ("max", "leaf 0Bh")]
+        .into_iter()
+        .map(|(model, leaf)| MachineRun {
+            said: format!(
+                "xtask: boot-x2apic: processors at APIC IDs 0, 256 and 412 of 150 possible, -cpu {model} ({leaf})"
+            ),
+            settings: Settings {
+                topology: Topology::X2apic,
+                cpu: model.into(),
+                ..base.clone()
+            },
+            failed: format!("boot-test on the sparse machine with -cpu {model}"),
+        })
+        .collect()
 }
 
 // ------------------------------------------------------------------ paths and commands
@@ -6070,8 +6048,8 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Builds the `loader` variant and lays out a fresh ESP, holding `kernel` as the KRN image,
-/// and a fresh NVRAM copy for one boot.
-fn stage(kernel: &[u8], loader: Loader) -> Result<Staged> {
+/// and a fresh NVRAM copy for one boot on the machine `settings` describe.
+fn stage(kernel: &[u8], loader: Loader, settings: &Settings) -> Result<Staged> {
     let efi = build_loader(loader)?;
     let firmware = find_firmware()?;
     let work = target_dir().join("xtask");
@@ -6085,7 +6063,7 @@ fn stage(kernel: &[u8], loader: Loader) -> Result<Staged> {
     // Where the loader looks for the Framekernel (ADR-0002 B1).
     let origin_dir = esp.join("EFI").join("ORIGIN");
     fs::create_dir_all(&origin_dir).map_err(|e| format!("{}: {e}", origin_dir.display()))?;
-    if qemu_reserved() {
+    if settings.reserved {
         // TEST ONLY (TASKS item 40): the application that plants firmware-reserved memory
         // starts first, and starts the unchanged loader from \EFI\ORIGIN\LOADER.EFI.
         let fixture = build_reserved_fixture()?;
@@ -6093,7 +6071,7 @@ fn stage(kernel: &[u8], loader: Loader) -> Result<Staged> {
             .map_err(|e| format!("copy {}: {e}", fixture.display()))?;
         fs::copy(&efi, origin_dir.join("LOADER.EFI"))
             .map_err(|e| format!("copy {}: {e}", efi.display()))?;
-        let regions = reserved_regions(qemu_iommu() == Iommu::Amd);
+        let regions = reserved_regions(settings.iommu == Iommu::Amd);
         let mut config = vec![0u8; 1024];
         let len = origin_test_reserved_memory::encode(&regions, &mut config)
             .ok_or("too many reserved regions")?;
@@ -6131,16 +6109,16 @@ fn qemu_path_arg(options: &str, path: &Path) -> Result<String> {
 
 /// The machine every boot uses: q35 (the only machine type the Secure Boot firmware
 /// supports), x86-64 with every feature TCG can emulate, and no network or display.
-fn qemu_command(s: &Staged) -> Result<Command> {
-    let machine = machine();
+fn qemu_command(s: &Staged, settings: &Settings) -> Result<Command> {
+    let machine = machine(settings);
     let mut c = Command::new(QEMU);
     c.arg("-machine")
-        .arg(qemu_machine_options(Accel::from_env()?.machine()))
+        .arg(settings.machine_options(settings.accel.machine()))
         .arg("-cpu")
-        .arg(qemu_cpu_model())
+        .arg(&settings.cpu)
         .arg("-m")
         // The ACPI machine's NVDIMM sits in a slot above the 512M of RAM.
-        .arg(if qemu_acpi() {
+        .arg(if settings.acpi {
             "512M,slots=2,maxmem=1G"
         } else {
             "512M"
@@ -6158,8 +6136,8 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         .args(["-object", "memory-backend-ram,id=onuma0,size=256M"])
         .args(["-object", "memory-backend-ram,id=onuma1,size=256M"])
         // With the ACPI machine's HMAT, each node names the initiator nearest its memory.
-        .args(["-numa", &numa_node(0, machine.cpus())])
-        .args(["-numa", &numa_node(1, machine.cpus())])
+        .args(["-numa", &numa_node(0, machine.cpus(), settings.acpi)])
+        .args(["-numa", &numa_node(1, machine.cpus(), settings.acpi)])
         // A cross-node distance so the ACPI SLIT is populated too (QEMU mirrors 1->0).
         .args(["-numa", "dist,src=0,dst=1,val=21"])
         .arg("-drive")
@@ -6172,27 +6150,27 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         .arg("-drive")
         .arg(qemu_path_arg("format=raw,file=fat:rw:", &s.esp)?)
         // The IOMMU (CLAUDE.md §32, §58; ADR-0007), before the PCI devices it translates.
-        .args(qemu_iommu().device_args())
+        .args(settings.iommu.device_args())
         // The NVMe controller and its test disk (CLAUDE.md §33).
         .arg("-drive")
         .arg(qemu_path_arg("if=none,id=nvme0,format=raw,file=", &s.nvme)?)
         .args(["-device", &{
             let mut device = "nvme,serial=ORIGIN0001,drive=nvme0".to_string();
-            if qemu_nvme_pairs() != QEMU_NVME_PAIRS {
-                device.push_str(&format!(",max_ioqpairs={}", qemu_nvme_pairs()));
+            if settings.nvme_pairs != QEMU_NVME_PAIRS {
+                device.push_str(&format!(",max_ioqpairs={}", settings.nvme_pairs));
             }
-            if qemu_acpi() {
+            if settings.acpi {
                 // Named, so the ACPI machine's generic initiator can name it.
                 device.push_str(",id=onvme");
             }
             device
         }]);
-    if qemu_acpi() {
+    if settings.acpi {
         c.args(acpi_machine_args(machine.cpus()));
     }
     // A PCIe root port for the NIC (threat T4): clearing bus mastering stops its forwarding too,
     // and the driver must open it again above the device it attached (`boot-bridge`).
-    let nic_bus = if qemu_bridge() {
+    let nic_bus = if settings.bridge {
         c.args([
             "-device",
             "pcie-root-port,id=rp0,chassis=1,slot=1,bus=pcie.0,addr=04.0",
@@ -6220,7 +6198,7 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         .arg("-rtc")
         .arg(format!("base={RTC_BASE}"));
     // Opt-in diagnostics: every interrupt and CPU reset, for debugging a triple fault.
-    if env::var_os("ORIGIN_QEMU_DEBUG").is_some() {
+    if settings.debug {
         let log = target_dir().join("xtask").join("qemu-debug.log");
         c.arg("-d")
             .arg("int,cpu_reset,guest_errors")
@@ -6230,18 +6208,9 @@ fn qemu_command(s: &Staged) -> Result<Command> {
     Ok(c)
 }
 
-fn boot_test_timeout() -> Result<Duration> {
-    match env::var("ORIGIN_BOOT_TEST_TIMEOUT") {
-        Ok(v) => v
-            .parse::<u64>()
-            .map(Duration::from_secs)
-            .map_err(|_| format!("ORIGIN_BOOT_TEST_TIMEOUT must be whole seconds, got {v:?}")),
-        Err(_) => Ok(DEFAULT_BOOT_TEST_TIMEOUT),
-    }
-}
-
-/// Every boot `boot-test` runs, with the kernel image each one boots.
-fn boot_test_scenarios(unsigned: &Path) -> Result<Vec<(Scenario, Vec<u8>)>> {
+/// Every boot `boot-test` runs on the machine `settings` describe, with the kernel image each
+/// one boots.
+fn boot_test_scenarios(unsigned: &Path, settings: &Settings) -> Result<Vec<(Scenario, Vec<u8>)>> {
     let krn = read_file(unsigned)?;
     let (trusted, untrusted) = test_keys()?;
     let signed = sign_kernel(unsigned, &trusted, "KERNEL.signed.ONBF")?;
@@ -6251,7 +6220,7 @@ fn boot_test_scenarios(unsigned: &Path) -> Result<Vec<(Scenario, Vec<u8>)>> {
     let refuse = refusal_scenario;
     Ok(vec![
         // The real boot: developer mode off, a signed kernel, every kernel proof.
-        (boot_scenario(), signed.clone()),
+        (boot_scenario(settings), signed.clone()),
         // Developer mode still boots an unsigned kernel, and still verifies what it can.
         (developer_scenario(), krn.clone()),
         (tamper_scenario(), tampered(&krn)?),
@@ -6334,14 +6303,15 @@ fn boot_test_scenarios(unsigned: &Path) -> Result<Vec<(Scenario, Vec<u8>)>> {
     ])
 }
 
-fn boot_test() -> Result {
-    check_environment()?;
+/// `boot-test` on the machine `settings` describe: every scenario, or those its filter names.
+/// `boot-matrix` and its scenario commands call it in process for each of their machines (TASKS
+/// item 61).
+fn boot_test(settings: &Settings) -> Result {
     let krn_path = pack_kernel(&build_kernel()?)?;
-    let scenarios = boot_test_scenarios(&krn_path)?;
-    let only = env::var("ORIGIN_BOOT_TEST_ONLY").unwrap_or_default();
-    let chosen = select_scenarios(&scenarios, &only)?;
+    let scenarios = boot_test_scenarios(&krn_path, settings)?;
+    let chosen = select_scenarios(&scenarios, &settings.only)?;
     for (scenario, kernel) in &chosen {
-        run_scenario(scenario, kernel)?;
+        run_scenario(scenario, kernel, settings)?;
     }
     println!(
         "xtask: boot-test passed ({} of {} scenarios)",
@@ -6376,22 +6346,24 @@ fn select_scenarios<'a>(
 /// shootdown, with nothing failed before it, is booted once more, and passes only if that second
 /// run passes whole (ADR-0013 Amendment 3, part (b); decision item 314). Both runs are reported.
 /// Once more only: a second run that stops the same way fails. Everything here runs in the turn
-/// this process already holds, and starts no other program than QEMU.
-fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
+/// this process already holds, and starts no other program than QEMU. Whether the machine is
+/// one of the named ones is read from `settings`, the machine's own typed settings (TASKS item
+/// 61), and the second run boots with the same.
+fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Result {
     let log = scenario_log(scenario);
     let first_log = log.with_extension("first-run.log");
     // So that only this run's log can be read for a second run, and no earlier run's first log
     // is left beside a run that needed none.
     let _ = fs::remove_file(&log);
     let _ = fs::remove_file(&first_log);
-    let Err(first) = run_scenario_once(scenario, kernel) else {
+    let Err(first) = run_scenario_once(scenario, kernel, settings) else {
         return Ok(());
     };
     let stopped = |log: &Path| -> Option<(u64, String)> {
-        if !oversubscribed() || scenario.capture == Capture::Screen {
+        if !oversubscribed(settings) || scenario.capture == Capture::Screen {
             return None;
         }
-        let accel = Accel::from_env().ok()?;
+        let accel = settings.accel;
         let text = fs::read_to_string(log).ok()?;
         let markers: Vec<&str> = scenario.markers.iter().map(String::as_str).collect();
         stopped_by_lost_stacks(&text, &scenario.failures, &markers, |l| {
@@ -6407,10 +6379,10 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     println!(
         "xtask: {}: the first run stopped only because a proof's settle lost {lost} kernel stacks to a stalled shootdown, with nothing failed before it, on an oversubscribed machine, named ({} guest processors; ADR-0013 Amendment 3, part (b), decision item 314): running it once more on the same machine. The first run: {first}; its line: {line}; its serial log: {}",
         scenario.label,
-        machine().cpus(),
+        machine(settings).cpus(),
         first_log.display()
     );
-    match run_scenario_once(scenario, kernel) {
+    match run_scenario_once(scenario, kernel, settings) {
         Ok(()) => {
             println!(
                 "xtask: {}: passed on its second run; the first stopped with {lost} kernel stacks lost to a stalled shootdown (ADR-0013 Amendment 3, part (b)); its serial log: {}",
@@ -6440,13 +6412,14 @@ fn scenario_log(scenario: &Scenario) -> PathBuf {
     ))
 }
 
-/// Boots `kernel` once and checks its output against `scenario`.
-fn run_scenario_once(scenario: &Scenario, kernel: &[u8]) -> Result {
-    let staged = stage(kernel, scenario.loader)?;
-    let timeout = boot_test_timeout()?;
-    let accel = Accel::from_env()?;
+/// Boots `kernel` once on the machine `settings` describe and checks its output against
+/// `scenario`.
+fn run_scenario_once(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Result {
+    let staged = stage(kernel, scenario.loader, settings)?;
+    let timeout = settings.boot_timeout();
+    let accel = settings.accel;
     let work = target_dir().join("xtask");
-    let mut cmd = qemu_command(&staged)?;
+    let mut cmd = qemu_command(&staged, settings)?;
     if let Some(args) = scenario.qemu_args {
         cmd.args(args(&work)?);
     }
@@ -6522,7 +6495,7 @@ fn run_scenario_once(scenario: &Scenario, kernel: &[u8]) -> Result {
             deadline,
         )
     } else {
-        let oversubscribed = oversubscribed();
+        let oversubscribed = oversubscribed(settings);
         // The verdict on the output so far: a failure in a complete line, or every marker in
         // order, or `None` while neither.
         let judge = |raw: &[u8]| -> Option<Result> {
@@ -6589,7 +6562,7 @@ fn run_scenario_once(scenario: &Scenario, kernel: &[u8]) -> Result {
     // What the markers were found in, before any monitor output joins the stream.
     let text = serial::clean(&raw);
     // Every fair share the checker let pass on an oversubscribed boot, said so.
-    if scenario.capture != Capture::Screen && oversubscribed() {
+    if scenario.capture != Capture::Screen && oversubscribed(settings) {
         let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         for line in text.lines() {
             if let Some((first, second)) = oversubscribed_fair_share(line) {
@@ -6600,14 +6573,14 @@ fn run_scenario_once(scenario: &Scenario, kernel: &[u8]) -> Result {
                 println!(
                     "xtask: {}: forgave fairness on an oversubscribed machine, named (ADR-0013; {} guest processors on {host} host threads): {cpu}: the workers counted {first} and {second}; both ran",
                     scenario.label,
-                    machine().cpus()
+                    machine(settings).cpus()
                 );
             }
             // ADR-0013 Amendment 3, part (a): every stack lost to a stalled shootdown, said so.
             if let Some(lost) = stacks_lost(line).filter(|&n| n > 0) {
                 println!(
                     "{}",
-                    forgave_lost_stacks(scenario.label, lost, machine().cpus())
+                    forgave_lost_stacks(scenario.label, lost, machine(settings).cpus())
                 );
             }
         }
@@ -6668,7 +6641,11 @@ fn run_scenario_once(scenario: &Scenario, kernel: &[u8]) -> Result {
             )),
             None => Ok(()),
         })
-        .and_then(|()| scenario.check.map_or(Ok(()), |check| check(&done)))
+        .and_then(|()| {
+            scenario
+                .check
+                .map_or(Ok(()), |check| check(&done, settings))
+        })
         .and_then(
             |()| match scenario.stderr.iter().find(|m| !qemu_stderr.contains(**m)) {
                 Some(m) => Err(format!("QEMU's stderr lacks {m:?}")),
@@ -6767,12 +6744,13 @@ fn wait_for_screen(
     ))
 }
 
-fn run() -> Result {
-    check_environment()?;
+/// `run`: the developer-mode kernel under QEMU, interactively, on the machine `settings`
+/// describe.
+fn run(settings: &Settings) -> Result {
     let krn_path = pack_kernel(&build_kernel()?)?;
     let krn = fs::read(&krn_path).map_err(|e| format!("{}: {e}", krn_path.display()))?;
-    let staged = stage(&krn, Loader::Developer)?;
-    let mut cmd = qemu_command(&staged)?;
+    let staged = stage(&krn, Loader::Developer, settings)?;
+    let mut cmd = qemu_command(&staged, settings)?;
     cmd.args(["-serial", "mon:stdio"]);
     println!("xtask: starting {QEMU}; Ctrl-A X quits, Ctrl-A C switches to the QEMU monitor");
     let status = cmd
@@ -7080,7 +7058,8 @@ mod gate_tests {
 #[cfg(test)]
 mod nvme_marker_tests {
     use super::{
-        Geometry, Machine, QEMU_NVME_PAIRS, nvme_per_cpu_markers_for, queue_order, x2apic_markers,
+        Geometry, Machine, QEMU_NVME_PAIRS, Settings, nvme_per_cpu_markers_for, queue_order,
+        x2apic_markers,
     };
 
     /// Review finding F1 of 2026-11-14: on the gate's large sparse machine the three processors
@@ -7091,7 +7070,7 @@ mod nvme_marker_tests {
         let mut m = dense(67);
         m.apic_ids = (0..64).chain([256, 300, 412]).collect();
         assert_eq!(queue_order(&m)[..4], [64, 65, 66, 0]);
-        let x2apic = x2apic_markers(&m);
+        let x2apic = x2apic_markers(&m, &Settings::default());
         assert!(x2apic.iter().all(|l| !l.contains("nothing to prove")));
         for (k, (index, id)) in [(64, 256), (65, 300), (66, 412)].into_iter().enumerate() {
             assert!(
@@ -7369,7 +7348,10 @@ mod rerun_tests {
 
 #[cfg(test)]
 mod oversubscribed_tests {
-    use super::{Accel, checker_forgives, oversubscribed_fair_share, oversubscribed_for};
+    use super::{
+        Accel, Settings, Topology, checker_forgives, oversubscribed, oversubscribed_fair_share,
+        oversubscribed_for,
+    };
 
     const UNEVEN: &str = "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted 720000 and 7273000, 27 context switches: scheduler failed";
 
@@ -7378,26 +7360,68 @@ mod oversubscribed_tests {
     #[test]
     fn only_the_named_large_software_processor_machines_are_oversubscribed() {
         for host in [1, 2, 4, 10, 64, 256] {
-            assert!(oversubscribed_for(Accel::Tcg, None, 65, host), "{host}");
-            assert!(oversubscribed_for(Accel::Tcg, Some("sparse"), 2, host));
-            assert!(oversubscribed_for(Accel::Tcg, Some("many"), 2, host));
+            assert!(
+                oversubscribed_for(Accel::Tcg, Topology::Plain, 65, host),
+                "{host}"
+            );
+            assert!(oversubscribed_for(Accel::Tcg, Topology::Sparse, 2, host));
+            assert!(oversubscribed_for(Accel::Tcg, Topology::Many, 2, host));
             for smp in [1, 2, 3, 4, 11, 64, 66] {
                 assert!(
-                    !oversubscribed_for(Accel::Tcg, None, smp, host),
+                    !oversubscribed_for(Accel::Tcg, Topology::Plain, smp, host),
                     "{smp} processors on {host} host threads"
                 );
             }
-            for other in ["x2apic", "listed", ""] {
+            // `ORIGIN_QEMU_SMP` is not read on these machines; an empty `ORIGIN_QEMU_TOPOLOGY`
+            // is the plain machine since TASKS item 61, and no longer a topology of its own.
+            for other in [Topology::X2apic, Topology::Listed] {
                 assert!(
-                    !oversubscribed_for(Accel::Tcg, Some(other), 65, host),
-                    "{other}"
+                    !oversubscribed_for(Accel::Tcg, other, 65, host),
+                    "{other:?}"
                 );
             }
             assert!(
-                !oversubscribed_for(Accel::Kvm, None, 65, host),
+                !oversubscribed_for(Accel::Kvm, Topology::Plain, 65, host),
                 "KVM keeps its own allowance"
             );
-            assert!(!oversubscribed_for(Accel::Kvm, Some("sparse"), 2, host));
+            assert!(!oversubscribed_for(Accel::Kvm, Topology::Sparse, 2, host));
+        }
+    }
+
+    /// TASKS item 61: the boot's own typed settings name the machine, as the environment did.
+    /// The settings `boot-matrix` makes for its 65-processor machines, and those of
+    /// `boot-sparse` and `boot-many`, are oversubscribed under QEMU's software processor; no
+    /// other machine it boots is, and none under KVM.
+    #[test]
+    fn the_typed_settings_name_the_same_machines() {
+        let tcg = Settings::default();
+        let kvm = Settings {
+            accel: Accel::Kvm,
+            ..Settings::default()
+        };
+        for base in [&tcg, &kvm] {
+            let named = |runs: Vec<super::MachineRun>| -> Vec<bool> {
+                runs.iter().map(|r| oversubscribed(&r.settings)).collect()
+            };
+            let on_tcg = base.accel == Accel::Tcg;
+            assert_eq!(
+                named(super::matrix_runs(base, &[1, 2, 3, 4, 65])),
+                [false, false, false, false, on_tcg].repeat(2)
+            );
+            assert_eq!(named(super::sparse_runs(base)), [on_tcg]);
+            assert_eq!(named(super::many_runs(base)), [on_tcg]);
+            for runs in [
+                super::x2apic_runs(base),
+                super::bridge_runs(base),
+                super::reserved_runs(base),
+                super::legacy_free_runs(base),
+                super::acpi_runs(base),
+                super::random_runs(base),
+                super::identity_runs(base),
+                super::listed_runs(base),
+            ] {
+                assert!(named(runs).iter().all(|o| !o));
+            }
         }
     }
 
@@ -7406,10 +7430,14 @@ mod oversubscribed_tests {
     /// would have waived; each named large machine on a 64-thread host is not.
     #[test]
     fn the_host_changes_nothing_either_way() {
-        let small = oversubscribed_for(Accel::Tcg, None, 4, 2);
+        let small = oversubscribed_for(Accel::Tcg, Topology::Plain, 4, 2);
         assert!(!small);
         assert!(!checker_forgives(UNEVEN, Accel::Tcg, small));
-        for (topology, smp) in [(None, 65), (Some("sparse"), 2), (Some("many"), 2)] {
+        for (topology, smp) in [
+            (Topology::Plain, 65),
+            (Topology::Sparse, 2),
+            (Topology::Many, 2),
+        ] {
             let large = oversubscribed_for(Accel::Tcg, topology, smp, 64);
             assert!(large, "{topology:?}");
             assert!(checker_forgives(UNEVEN, Accel::Tcg, large), "{topology:?}");
@@ -7698,9 +7726,10 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
     /// Every VT-d marker the AMD-Vi boot swaps exists, so none is silently left in place.
     #[test]
     fn the_amd_markers_replace_every_vt_d_one() {
-        let m = machine();
-        let mut s = boot_scenario_markers(&m);
-        amd_iommu_markers(&mut s, &m);
+        let settings = Settings::default();
+        let m = machine(&settings);
+        let mut s = boot_scenario_markers(&m, &settings);
+        amd_iommu_markers(&mut s, &m, &settings);
         assert!(
             !s.markers
                 .iter()
@@ -8021,8 +8050,9 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
     /// not what TCG prints, so the boot that proves the steps cannot be mistaken for this one.
     #[test]
     fn the_kvm_markers_replace_the_two_pin_steps() {
-        let m = machine();
-        let mut s = boot_scenario_markers(&m);
+        let settings = Settings::default();
+        let m = machine(&settings);
+        let mut s = boot_scenario_markers(&m, &settings);
         let (before, target) = (s.markers.clone(), m.named(m.cpus().min(2) - 1));
         kvm_pin_markers(&mut s);
         assert!(
@@ -8053,8 +8083,9 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
     /// so its own is gone and the rest of the list still matches that boot's order.
     #[test]
     fn kvm_does_not_ask_the_unfilled_ring_line_to_be_consistent() {
-        let m = machine();
-        let mut s = boot_scenario_markers(&m);
+        let settings = Settings::default();
+        let m = machine(&settings);
+        let mut s = boot_scenario_markers(&m, &settings);
         kvm_markers(&mut s, true);
         let at = s
             .markers
@@ -8071,7 +8102,7 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
         assert!(serial::contains_in_order(&boot, &window));
 
         // A list that has changed shape is reported, not silently accepted.
-        let mut other = boot_scenario_markers(&m);
+        let mut other = boot_scenario_markers(&m, &settings);
         let tx = other
             .markers
             .iter()
@@ -8089,8 +8120,9 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
     /// only when no processor's shares were uneven.
     #[test]
     fn kvm_does_not_wait_for_the_even_shares_line() {
-        let m = machine();
-        let plain = boot_scenario_markers(&m);
+        let settings = Settings::default();
+        let m = machine(&settings);
+        let plain = boot_scenario_markers(&m, &settings);
         assert!(
             plain
                 .markers
@@ -8101,9 +8133,9 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
         assert!(plain.markers.iter().any(|m| m == per_cpu));
 
         for vt_d in [true, false] {
-            let mut s = boot_scenario_markers(&m);
+            let mut s = boot_scenario_markers(&m, &settings);
             if !vt_d {
-                amd_iommu_markers(&mut s, &m);
+                amd_iommu_markers(&mut s, &m, &settings);
             }
             kvm_markers(&mut s, vt_d);
             assert!(!s.markers.iter().any(|m| m.starts_with(EVEN_SHARES_LINE)));
@@ -8115,9 +8147,10 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
     /// A marker list without the proof's lines is reported, not silently left alone.
     #[test]
     fn the_kvm_markers_say_so_when_the_vt_d_lines_are_gone() {
-        let m = machine();
-        let mut s = boot_scenario_markers(&m);
-        amd_iommu_markers(&mut s, &m);
+        let settings = Settings::default();
+        let m = machine(&settings);
+        let mut s = boot_scenario_markers(&m, &settings);
+        amd_iommu_markers(&mut s, &m, &settings);
         kvm_pin_markers(&mut s);
         assert!(
             s.markers
