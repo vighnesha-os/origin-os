@@ -5,7 +5,14 @@
 //! Each case checks that the interpreter returns (it never panics or hangs), that its memory
 //! never passes the limit, that a failed load leaves the namespace as it was, that an evaluation
 //! leaves no dynamic name behind, that no Global Lock is kept, and that the same seed gives the
-//! same results. A third of the cases run against a host that refuses every region, and a third
+//! same results.
+//!
+//! **`Load` and `LoadTable`** (step B4): each block holds buffers of tables to load, each table's
+//! names under a prefix of its own, and its methods and load-time code load them, inside nested
+//! calls and inside other loads. Some fail midway, some reach a limit, one loads itself, and two
+//! must never load (a bad checksum, a signature not `SSDT`). After the block's load and after each
+//! evaluation the namespace is audited: no name of a failed table, none of an ended evaluation,
+//! and no more names than the tables loaded meanwhile made. A third of the cases run against a host that refuses every region, and a third
 //! under a time limit of one second with a clock that moves 5 ms each time it is read.
 //!
 //! The tests also require progress (the review of B1, F4): a share of the grammar's blocks must
@@ -19,8 +26,11 @@
 
 use super::encode::*;
 use super::{Fault, TestHost, ends_within, interp_with, plant};
+use crate::namespace::Owner;
 use crate::object::Object;
-use crate::{DefinitionBlock, ErrorKind, IntegerWidth, Interpreter, Limit, Limits, Node, Value};
+use crate::{
+    DefinitionBlock, ErrorKind, IntegerWidth, Interpreter, Limit, Limits, Node, TableKey, Value,
+};
 
 struct Rng(u64);
 
@@ -161,6 +171,125 @@ const NAMES: &[&str] = &[
 /// Names a store writes.
 const PLACES: &[&str] = &["N0", "N1", "BF", "PK", "BD", "F0", "LK", "N3"];
 const METHODS: &[(&str, u8)] = &[("M0", 0), ("M1", 1), ("M2", 2), ("\\D0.M3", 1)];
+/// What `Load` is given: the buffers [`loadables`] makes, and objects that hold no table (an
+/// integer, a SystemIO region, a field in it).
+const LOADS: &[&str] = &[
+    "XA", "XB", "XC", "XD", "XE", "XF", "XG", "\\XA", "N0", "R0", "F0",
+];
+
+/// The table IDs of the two tables that must never load.
+const BAD_SUM: &[u8; 8] = b"BADSUM  ";
+const NOT_SSDT: &[u8; 8] = b"NOTSSDT ";
+
+fn buffer_of(bytes: &[u8]) -> B {
+    buffer(dword(bytes.len() as u32), bytes)
+}
+
+/// `t` with its checksum made right.
+fn resum(mut t: Vec<u8>) -> Vec<u8> {
+    t[9] = 0;
+    let sum = t.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+    t[9] = 0u8.wrapping_sub(sum);
+    t
+}
+
+fn with_table_id(mut t: Vec<u8>, id: &[u8; 8]) -> Vec<u8> {
+    t[16..24].copy_from_slice(id);
+    resum(t)
+}
+
+/// The buffers the grammar's `Load`s read, each an SSDT unless said otherwise, each table's names
+/// under a prefix of its own: `XA` loads (with `extra`, load-time code the generator adds); `XB`
+/// fails midway; `XC` has a bad checksum; `XD` loads `XB` and then `XA` inside its own load; `XE`
+/// reaches the loop limit midway; `XF` loads itself after its first name, which fails, and goes
+/// on; `XG` is signed `OEMX`.
+fn loadables(extra: &[B]) -> Vec<B> {
+    let mut qa = vec![
+        name("QA0", int(1)),
+        name("QA1", string("a")),
+        method("QAM", 0, &[ret(nm("\\N0"))]),
+    ];
+    qa.extend_from_slice(extra);
+    let tables = [
+        ("XA", table(b"SSDT", 2, &qa)),
+        (
+            "XB",
+            table(
+                b"SSDT",
+                2,
+                &[
+                    name("QB0", one()),
+                    device("QBD", &[name("QBX", one())]),
+                    store(nm("\\NOPE"), debug()),
+                    name("QB1", one()),
+                ],
+            ),
+        ),
+        ("XC", {
+            let mut t = with_table_id(table(b"SSDT", 2, &[name("QC0", one())]), BAD_SUM);
+            t[9] ^= 0x55;
+            t
+        }),
+        (
+            "XD",
+            table(
+                b"SSDT",
+                2,
+                &[
+                    name("QD0", one()),
+                    load_op("\\XB", none()),
+                    load_op("\\XA", none()),
+                    name("QD1", one()),
+                ],
+            ),
+        ),
+        (
+            "XE",
+            table(b"SSDT", 2, &[name("QE0", one()), while_(one(), &[noop()])]),
+        ),
+        (
+            "XF",
+            table(
+                b"SSDT",
+                2,
+                &[
+                    name("QF0", one()),
+                    load_op("\\XF", none()),
+                    name("QF1", one()),
+                ],
+            ),
+        ),
+        (
+            "XG",
+            with_table_id(table(b"OEMX", 2, &[name("QH0", one())]), NOT_SSDT),
+        ),
+    ];
+    tables.iter().map(|(n, t)| name(n, buffer_of(t))).collect()
+}
+
+/// The table the test host lists for `LoadTable`: names under the prefix `QG`.
+fn listed() -> &'static [u8] {
+    static T: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        table(
+            b"OEMT",
+            2,
+            &[
+                name("QG0", int(1)),
+                name("QG1", int(2)),
+                method("QGM", 0, &[ret(one())]),
+            ],
+        )
+    })
+}
+
+fn load_table_key() -> TableKey {
+    TableKey {
+        signature: *b"OEMT",
+        oem_id: *b"ORIGIN",
+        oem_table_id: *b"AMLTEST\0",
+    }
+}
 
 struct Gen {
     rng: Rng,
@@ -191,7 +320,7 @@ impl Gen {
             };
         }
         let d = depth - 1;
-        match self.rng.below(30) {
+        match self.rng.below(32) {
             0 => add(self.expr(d), self.expr(d), self.target()),
             // Add, Concatenate, Subtract, Multiply, the shifts, And, NAnd, Or, NOr, XOr, Mod.
             1 => bin(
@@ -251,6 +380,16 @@ impl Gen {
             26 => timer(),
             27 => nm(self.rng.pick(&["F0", "F1", "IX", "LK"])),
             28 => store(self.expr(d), nm(self.rng.pick(&["F0", "F1", "IX", "LK"]))),
+            // Step B4: tables loaded while an evaluation runs.
+            23 => load_op(self.rng.pick(LOADS), self.target()),
+            30 => load_table([
+                string(self.rng.pick(&["OEMT", "OEMT", "SSDT", "OEMU"])),
+                string("ORIGIN"),
+                string(self.rng.pick(&["AMLTEST", "AMLTEST", "OTHER"])),
+                string(self.rng.pick(&["", "\\D0", "D0", "\\NOPE"])),
+                string(self.rng.pick(&["", "QG1", "\\N0", "NONE"])),
+                self.expr(d),
+            ]),
             _ => bin(0x84, self.expr(d), self.expr(d), self.target()),
         }
     }
@@ -313,6 +452,8 @@ impl Gen {
                 self.expr(1),
                 self.rng.pick(&["C0", "C1"]),
             ),
+            // Step B4: a table loaded as a statement, its value kept or not.
+            11 => load_op(self.rng.pick(LOADS), self.target()),
             12 => release(nm(self.rng.pick(&["MX", "\\_GL"]))),
             13 => {
                 if self.rng.chance(50) {
@@ -406,6 +547,21 @@ impl Gen {
             };
             body.push(if_(pred, &[device("\\D1", &[])]));
         }
+        // The tables to load. `XA`'s load-time code calls a method of this block, which may
+        // load in turn, or takes any expression, which may fail midway.
+        let mut extra = Vec::new();
+        if self.rng.chance(30) {
+            extra.push(store(call("\\M0", &[]), debug()));
+        }
+        if self.rng.chance(20) {
+            let pred = self.expr(1);
+            extra.push(if_(pred, &[name("QA2", one())]));
+        }
+        body.extend(loadables(&extra));
+        if self.rng.chance(15) {
+            // A load inside this block's own load.
+            body.push(load_op(self.rng.pick(LOADS), none()));
+        }
         body
     }
 }
@@ -452,6 +608,73 @@ fn snapshot(i: &Interpreter<TestHost>) -> Vec<Vec<[u8; 4]>> {
     out
 }
 
+/// What the namespace holds, by creator: names of tables whose load failed, names of evaluations,
+/// and names of tables numbered from `from` on that loaded.
+struct Audit {
+    failed: Option<(u32, Vec<[u8; 4]>)>,
+    dynamic: usize,
+    loaded_from: usize,
+}
+
+fn audit(i: &Interpreter<TestHost>, from: usize) -> Audit {
+    let mut a = Audit {
+        failed: None,
+        dynamic: 0,
+        loaded_from: 0,
+    };
+    let mut stack = vec![i.root()];
+    while let Some(n) = stack.pop() {
+        match i.ns.owner(n.0) {
+            Ok(Owner::Table(t)) => {
+                if i.table(t).is_some_and(|t| t.failed) {
+                    a.failed.get_or_insert((t, i.path_of(n).unwrap()));
+                } else if t as usize >= from {
+                    a.loaded_from += 1;
+                }
+            }
+            Ok(Owner::Call(_)) => a.dynamic += 1,
+            _ => {}
+        }
+        let mut c = i.first_child(n);
+        while let Some(k) = c {
+            stack.push(k);
+            c = i.next_sibling(k);
+        }
+    }
+    a
+}
+
+/// Requires that no table loaded whose checksum is bad or that is not signed `SSDT`.
+fn no_bad_table(i: &Interpreter<TestHost>, seed: u64) {
+    for t in 0..i.table_count() as u32 {
+        let info = i.table(t).unwrap();
+        if info.failed {
+            continue;
+        }
+        assert!(
+            info.oem_table_id != *BAD_SUM,
+            "seed {seed:#x}: table {t} loaded though its checksum is bad"
+        );
+        assert!(
+            info.oem_table_id != *NOT_SSDT,
+            "seed {seed:#x}: table {t} loaded though it is not signed SSDT"
+        );
+    }
+}
+
+/// Requires no name of a failed table.
+#[track_caller]
+fn no_failed_names(a: &Audit, seed: u64) {
+    if let Some((t, path)) = &a.failed {
+        panic!(
+            "seed {seed:#x}: a failed load left names behind: a name of failed table {t}, {:?}",
+            path.iter()
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 fn random_args(rng: &mut Rng, argc: u8) -> Vec<Value> {
     (0..argc)
         .map(|_| match rng.below(4) {
@@ -473,6 +696,9 @@ struct Stats {
     /// Evaluations that ran at least [`DEEP`] operations.
     deep: u64,
     errors: std::collections::BTreeMap<String, u64>,
+    /// Cases in which an evaluation's `Load` or `LoadTable` completed, and in which one failed.
+    run_loaded: u64,
+    run_failed: u64,
 }
 
 /// The operations an evaluation must complete (opcodes, names, locals, constants) to count as
@@ -484,7 +710,8 @@ impl Stats {
         if std::env::var_os("ORIGIN_AML_STATS").is_some() {
             eprintln!(
                 "{what}: {} cases, {} loaded ({}%), {} evaluations, {} returned a value ({}%), \
-                 {} ran {DEEP} operations or more ({}%); {} kinds of error: {:?}",
+                 {} ran {DEEP} operations or more ({}%); an evaluation's load completed in {}% \
+                 of cases and failed in {}%; {} kinds of error: {:?}",
                 self.cases,
                 self.loaded,
                 percent(self.loaded, self.cases),
@@ -493,6 +720,8 @@ impl Stats {
                 percent(self.values, self.evaluations),
                 self.deep,
                 percent(self.deep, self.evaluations),
+                percent(self.run_loaded, self.cases),
+                percent(self.run_failed, self.cases),
                 self.errors.len(),
                 self.errors
             );
@@ -507,6 +736,7 @@ impl Stats {
             deep,
             kinds,
             seen,
+            run_loads,
         } = floors;
         if self.cases < 500 {
             return;
@@ -537,6 +767,17 @@ impl Stats {
                 self.errors
             );
         }
+        let runs = (
+            percent(self.run_loaded, self.cases),
+            percent(self.run_failed, self.cases),
+        );
+        assert!(
+            runs.0 >= run_loads && runs.1 >= run_loads,
+            "{what}: an evaluation's load completed in {}% of cases and failed in {}%: below the \
+             floor {run_loads}%",
+            runs.0,
+            runs.1
+        );
     }
 }
 
@@ -551,9 +792,12 @@ struct Floors {
     kinds: usize,
     /// Errors that must be among them.
     seen: &'static [&'static str],
+    /// Per cent of cases in which an evaluation's load completed, and in which one failed.
+    run_loads: u64,
 }
 
-/// The default seeds give 98%, 22%, 31% and 19 kinds, with every limit but `Loops` reached.
+/// The default seeds give 93%, 23%, 34% and 20 kinds, with every limit reached; an evaluation's
+/// load completed in 13% of cases and failed in 15% (step B4; before it, 98%, 22%, 31% and 19).
 const GRAMMAR_FLOORS: Floors = Floors {
     loaded: 90,
     values: 15,
@@ -565,15 +809,19 @@ const GRAMMAR_FLOORS: Floors = Floors {
         "Limit(Depth)",
         "Region(Refused)",
     ],
+    run_loads: 8,
 };
 
-/// The default seeds give 13%, 21%, 28% and 21 kinds.
+/// The default seeds give 15%, 20%, 32% and 23 kinds; an evaluation's load completed in 1% of
+/// cases and failed in 2%, too few for a floor: the grammar's cases hold that one (step B4; before
+/// it, 13%, 21%, 28% and 21).
 const MUTATION_FLOORS: Floors = Floors {
     loaded: 8,
     values: 12,
     deep: 18,
     kinds: 15,
     seen: &["Grammar", "PackageLength", "Truncated", "Reserved"],
+    run_loads: 0,
 };
 
 fn percent(n: u64, of: u64) -> u64 {
@@ -622,6 +870,9 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
     if setup.traced {
         i.host_mut().events = Some(Vec::new());
     }
+    i.host_mut()
+        .tables
+        .push((load_table_key(), 0x9000, listed().to_vec()));
     let before = snapshot(&i);
     let block = DefinitionBlock {
         signature: *b"SSDT",
@@ -657,7 +908,11 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
         0,
         "seed {seed:#x}: the Global Lock was kept"
     );
+    // The block's own load may have loaded tables inside it: none failed may leave a name.
+    no_failed_names(&audit(&i, 0), seed);
+    no_bad_table(&i, seed);
     let after_load = i.node_count();
+    let tables_after_load = i.table_count();
     let mut rng = Rng(seed ^ 0x5555);
     let mut evals = Vec::new();
     for (node, argc) in methods(&i) {
@@ -681,11 +936,19 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
             Ok(None) => 4,
             Err(e) => 5 + e.at.map_or(0, |a| u64::from(a.offset)),
         });
+        // What the evaluation's loads made stays (B4's contract, Q8); nothing else may.
+        let a = audit(&i, tables_after_load);
+        no_failed_names(&a, seed);
         assert_eq!(
-            i.node_count(),
-            after_load,
+            a.dynamic, 0,
             "seed {seed:#x}: an evaluation left names behind"
         );
+        assert_eq!(
+            i.node_count(),
+            after_load + a.loaded_from,
+            "seed {seed:#x}: an evaluation left names behind"
+        );
+        no_bad_table(&i, seed);
         assert!(
             i.memory_peak() <= lim.memory_bytes,
             "seed {seed:#x}: memory passed the limit"
@@ -697,6 +960,19 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
         );
         evals.push(r.map_err(|e| e.kind));
     }
+    let run_time = tables_after_load..i.table_count();
+    let failed = run_time
+        .clone()
+        .filter(|&t| i.table(t as u32).unwrap().failed)
+        .count();
+    note(|s| {
+        if failed < run_time.len() {
+            s.run_loaded += 1;
+        }
+        if failed > 0 {
+            s.run_failed += 1;
+        }
+    });
     if let Some(events) = &i.host().events {
         let enters = events
             .iter()
@@ -1007,6 +1283,73 @@ fn adversarial_cases() {
             Setup::PLAIN,
             Expect::Eval(Err(ErrorKind::MutexHeld)),
         ),
+        // Step B4: what each of `loadables`' tables gives a `Load`, its value read through an
+        // `If` (True is Ones at either width): the first number for True, the second for Zero.
+        (
+            loading("XA", 11, &[]),
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(11)))),
+        ),
+        (
+            loading("XB", 21, &[]),
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(22)))),
+        ),
+        (
+            loading("XC", 31, &[]),
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(32)))),
+        ),
+        (
+            loading("XA", 41, &[load_op("XA", none())]),
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(42)))),
+        ),
+        (
+            loading("XD", 51, &[]),
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(51)))),
+        ),
+        (
+            loading("XE", 61, &[]),
+            Setup::ROOMY,
+            Expect::Eval(Err(ErrorKind::Limit(Limit::Loops))),
+        ),
+        (
+            loading("XF", 71, &[]),
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(71)))),
+        ),
+        (
+            loading("XG", 81, &[]),
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(82)))),
+        ),
+        (
+            vec![
+                method(
+                    "M0",
+                    0,
+                    &[
+                        if_(
+                            load_table([
+                                string("OEMT"),
+                                string("ORIGIN"),
+                                string("AMLTEST"),
+                                string("\\D0"),
+                                string("QG1"),
+                                int(9),
+                            ]),
+                            &[ret(nm("\\D0.QG1"))],
+                        ),
+                        ret(int(92)),
+                    ],
+                ),
+                device("D0", &[]),
+            ],
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(9)))),
+        ),
     ];
     for (k, (body, setup, expect)) in cases.iter().enumerate() {
         watch(ADVERSARIAL, k as u64, k as u64);
@@ -1029,6 +1372,17 @@ fn adversarial_cases() {
 fn adversarial_blocks() {
     adversarial_cases();
     take_stats().print("adversarial");
+}
+
+/// A block of [`loadables`] and a method `M0` that runs `first`, then loads `what` and returns
+/// `n` if its value is True, `n + 1` if Zero.
+fn loading(what: &str, n: u64, first: &[B]) -> Vec<B> {
+    let mut body = loadables(&[]);
+    let mut m0 = first.to_vec();
+    m0.push(if_(load_op(what, none()), &[ret(int(n))]));
+    m0.push(ret(int(n + 1)));
+    body.push(method("M0", 0, &m0));
+    body
 }
 
 fn cat2(a: B, b: B) -> B {
@@ -1066,6 +1420,13 @@ fn planted_faults_are_caught() {
         (Fault::LooseMemoryLimit, "memory passed the limit"),
         (Fault::WeakFieldBound, "Err(Range)"),
         (Fault::KeepGlobalLock, "the Global Lock was kept"),
+        (Fault::LoadUnchecked, "loaded though"),
+        (Fault::KeepFailedLoad, "a name of failed table"),
+        (
+            Fault::InvertLoadResult,
+            "written for Eval(Ok(Some(Integer(11))))",
+        ),
+        (Fault::AllowDuplicate, "Duplicate"),
     ];
     for (f, by) in faults {
         let message = outcome(Some(f));

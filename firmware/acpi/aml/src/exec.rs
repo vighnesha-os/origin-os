@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use crate::Interpreter;
 use crate::convert::Data;
 use crate::engine::{Frame, Loc, OpFrame, Operand};
-use crate::error::{Error, ErrorKind, Feature, Result, err};
+use crate::error::{Error, ErrorKind, Result, err};
 use crate::host::Host;
 use crate::mem;
 use crate::name::{AmlName, TextName};
@@ -580,7 +580,7 @@ impl<H: Host> Interpreter<H> {
             Op::Continue => self.leave_loop(true),
             Op::Noop => Ok(()),
             Op::Return => {
-                if self.calls.is_empty() {
+                if self.calls.is_empty() || self.return_crosses_load() {
                     return err(ErrorKind::Grammar);
                 }
                 let v = self.copy_val(val(&f, 0)?)?;
@@ -595,8 +595,8 @@ impl<H: Host> Interpreter<H> {
             }
 
             // --- What reaches the host -------------------------------------------------------------
-            Op::Load => err(ErrorKind::NotSupported(Feature::Load)),
-            Op::LoadTable => err(ErrorKind::NotSupported(Feature::LoadTable)),
+            Op::Load => self.exec_load(&f),
+            Op::LoadTable => self.exec_load_table(&f),
             Op::Stall => {
                 let us = self.int(&f, 0)?;
                 self.stall(us)

@@ -372,7 +372,7 @@ fn wide_field() -> Vec<B> {
 fn a_field_of_300000_names_ends_within_its_limits() {
     let body = wide_field();
     let t = table(b"SSDT", 2, &body);
-    let (block, _) = super::tables_standin::block(&t).unwrap();
+    let (block, _) = super::block(&t).unwrap();
     // The service's limits, on the wall clock.
     for (what, limits) in [
         ("service limits", Limits::SERVICE),

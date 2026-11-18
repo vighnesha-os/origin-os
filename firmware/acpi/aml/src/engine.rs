@@ -109,6 +109,9 @@ pub(crate) enum Frame {
     Call,
     /// A PCI_Config region's function being found (`pci.rs`).
     Resolve(crate::pci::Resolve),
+    /// A table being loaded by `Load` or `LoadTable`, below its table block until that ends
+    /// (`load.rs`).
+    Loading(crate::load::Loading),
 }
 
 /// The units of work between two readings of the clock.
@@ -218,6 +221,7 @@ impl<H: Host> Interpreter<H> {
             nested: 0,
             pending: None,
             resolving: 0,
+            loading: 0,
             global_depth: 0,
             run: crate::RunCounts::default(),
             base: 0,
@@ -484,6 +488,9 @@ impl<H: Host> Interpreter<H> {
     /// would leave the outer one whole (the review of B1, F14). Today every evaluation is
     /// top-level, and every mark is zero.
     pub(crate) fn abort(&mut self, marks: Marks) {
+        // A table `Load` or `LoadTable` was loading when a limit ended the evaluation is failed
+        // like any other: its names go with its creator below, its bytes here (`load.rs`).
+        self.fail_tables_loading(marks.frames);
         self.unwind(marks.frames, marks.calls, marks.owners);
         self.release_held(marks.held);
         self.result = Val::None;
@@ -554,8 +561,12 @@ impl<H: Host> Interpreter<H> {
         // Room for both first, so that the two stacks never differ in length.
         mem::reserve(&mut self.ctx, 1, &mut self.budget)?;
         let resolve = matches!(f, Frame::Resolve(_));
+        let loading = matches!(f, Frame::Loading(_));
         mem::push(&mut self.frames, f, &mut self.budget)?;
         mem::push(&mut self.ctx, here, &mut self.budget)?;
+        if loading {
+            self.loading = self.loading.saturating_add(1);
+        }
         // Counted where every frame is pushed, a step put back with a `Resolve` on top among
         // them, as `pop_frame` and `truncate_frames` count them out (the review of B2's Addendum
         // 2, N2-1).
@@ -574,36 +585,51 @@ impl<H: Host> Interpreter<H> {
         if matches!(f, Some(Frame::Resolve(_))) {
             self.resolving = self.resolving.saturating_sub(1);
         }
+        if matches!(f, Some(Frame::Loading(_))) {
+            self.loading = self.loading.saturating_sub(1);
+        }
         f
     }
 
     /// Pops frames down to `n`. The `Resolve` frames among them are counted out, so that the
     /// count stays true when an error unwinds them (`pci.rs`).
     pub(crate) fn truncate_frames(&mut self, n: usize) {
-        let gone = self.frames.get(n..).map_or(0, |f| {
-            f.iter().filter(|f| matches!(f, Frame::Resolve(_))).count()
+        let (gone, loads) = self.frames.get(n..).map_or((0, 0), |f| {
+            (
+                f.iter().filter(|f| matches!(f, Frame::Resolve(_))).count(),
+                f.iter().filter(|f| matches!(f, Frame::Loading(_))).count(),
+            )
         });
         self.resolving = self
             .resolving
             .saturating_sub(u32::try_from(gone).unwrap_or(u32::MAX));
+        self.loading = self
+            .loading
+            .saturating_sub(u32::try_from(loads).unwrap_or(u32::MAX));
         self.frames.truncate(n);
         self.ctx.truncate(n);
     }
 
-    /// Runs until the frames are back to `base`.
+    /// Runs until the frames are back to `base`. An error inside a table that `Load` or
+    /// `LoadTable` is loading, other than a limit, fails that load alone: it is rolled back and its
+    /// operator gives Zero, and the evaluation goes on (`load.rs`; B4's contract, Q3).
     pub(crate) fn run_frames(&mut self, base: usize) -> Result<()> {
         loop {
             if self.frames.len() <= base {
                 return Ok(());
             }
-            if let Err(mut e) = self.step() {
+            let mut failure = self.step().err();
+            while let Some(mut e) = failure.take() {
                 if e.at.is_none() {
                     e.at = Some(At {
                         table: self.cur.table,
                         offset: self.cur.pc,
                     });
                 }
-                return Err(e);
+                match self.failing_load(base, &e) {
+                    Some(at) => failure = self.fail_load_at(at, e).err(),
+                    None => return Err(e),
+                }
             }
         }
     }
@@ -763,6 +789,8 @@ impl<H: Host> Interpreter<H> {
             // A call frame is never on top: its method's block is above it until it returns.
             Frame::Call => err(ErrorKind::Grammar),
             Frame::Resolve(r) => self.resolve_step(r),
+            // A loaded table's block has ended: the load is complete (`load.rs`).
+            Frame::Loading(l) => self.finish_load(l),
         }
     }
 
@@ -1748,6 +1776,18 @@ impl<H: Host> Interpreter<H> {
                 Frame::Resolve(r) => {
                     if let Some(v) = r.got {
                         ok &= self.heap.mark(v, &mut self.budget);
+                    }
+                }
+                // The operator a load completes keeps its operands: `LoadTable`'s parameter.
+                Frame::Loading(l) => {
+                    for a in l.args {
+                        ok &= match a {
+                            Operand::Val(v) => self.heap.mark(v, &mut self.budget),
+                            Operand::Loc(Loc::Ref(t)) => {
+                                self.heap.mark(Val::Ref(t), &mut self.budget)
+                            }
+                            _ => true,
+                        };
                     }
                 }
                 _ => {}

@@ -209,7 +209,11 @@ impl Namespace {
         budget: &mut Budget,
     ) -> Result<NodeId> {
         self.node(parent)?;
-        if self.child(parent, seg).is_some() {
+        #[cfg(test)]
+        let allowed = crate::tests::planted(crate::tests::Fault::AllowDuplicate);
+        #[cfg(not(test))]
+        let allowed = false;
+        if self.child(parent, seg).is_some() && !allowed {
             return err(ErrorKind::Duplicate);
         }
         // Room on the list first, so a node never exists that its creator cannot remove.

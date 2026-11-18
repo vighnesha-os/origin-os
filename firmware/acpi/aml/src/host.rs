@@ -26,8 +26,8 @@
 //! §8). Every method of [`Host`] is called: the clock for the time limit and `Timer`; the region
 //! accesses, `Sleep`, `Stall`, the Global Lock, `Notify`, `Fatal`, `Debug` and `BreakPoint` by
 //! the operators that name them; [`Host::bridge_bus`] by the walk that names a PCI_Config
-//! region's function; [`Host::table`] by `DataTableRegion` (and, when `origin-acpi-tables`
-//! arrives, by `LoadTable`); [`Host::trace`] only when [`Host::tracing`] says so.
+//! region's function; [`Host::table`] by `DataTableRegion` and `LoadTable`; [`Host::trace`] only
+//! when [`Host::tracing`] says so.
 //!
 //! **No call waits past the time limit** (the review of B1, F9). A call that may wait is given
 //! the time the evaluation has left, and the host must not wait longer:
@@ -46,8 +46,11 @@
 //! [`Host::breakpoint`], [`Host::trace`] and [`Host::table`] are given no time because they must
 //! not wait: a host queues a notification, records a report or a trace, and stops in no debugger,
 //! rather than block the evaluation. `table` copies a table the host already holds, from the XSDT
-//! it read at boot; it hands the bytes because `LoadTable` will need them, though
-//! `DataTableRegion` keeps only the address and the length.
+//! it read at boot: `LoadTable` loads the bytes, and `DataTableRegion` keeps only the address and
+//! the length. **The library checks the copy before `LoadTable` loads it** (B4), with
+//! `origin-acpi-tables`: a header whose length is the copy's, a checksum, and the key's signature
+//! and IDs. A copy that fails gives `LoadTable` Zero. `LoadTable` never asks for a `DSDT` or an
+//! `SSDT`.
 //!
 //! **Tracing allocates nothing**, so that a host tracing the interpreter sees what one that does
 //! not would have done: method paths are written into a fixed buffer of 32 segments, and a deeper
@@ -286,7 +289,10 @@ pub trait Host {
     fn trace(&mut self, _event: &Trace<'_>) {}
 
     /// The table the XSDT lists under `key`: its physical address and a copy of its bytes, or
-    /// `None`. Returns at once: the host already holds the table.
+    /// `None`. Returns at once: the host already holds the table. The key's IDs are padded with
+    /// NUL, a table's own with spaces as a rule: the library compares an ID up to the key's first
+    /// NUL and lets the table's rest be NUL or space (G18), and a host should find the table the
+    /// same way.
     ///
     /// # Errors
     /// Whatever the host refuses or fails.

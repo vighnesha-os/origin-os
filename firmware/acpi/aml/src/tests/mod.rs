@@ -1,21 +1,40 @@
 //! The tests: a host that models region memory and keeps a fake clock, the encoder, and the
-//! test-only stand-in for `origin-acpi-tables`.
+//! tables checked by `origin-acpi-tables`, as the interpreter's callers check them.
 
 mod encode;
 mod host_ops;
 mod limits;
+mod load;
 mod namespace;
 mod qemu;
 mod random;
 mod semantics;
-mod tables_standin;
 
 use std::collections::BTreeMap;
 
 use crate::{
-    BufferAccess, Config, Host, HostError, IntegerWidth, Interpreter, Limits, PciAddress,
-    RegionAccess, TableKey, Value,
+    BufferAccess, Config, DefinitionBlock, Host, HostError, IntegerWidth, Interpreter, Limits,
+    PciAddress, RegionAccess, TableKey, Value,
 };
+
+/// A definition block checked by `origin-acpi-tables` (its header, length and checksum, and a
+/// signature of `DSDT`, `SSDT` or `PSDT`), and the integer width its revision would set were it
+/// the DSDT: what the interpreter's callers hand it (B4's contract; B1's ruling (1)).
+pub(crate) fn block(
+    table: &[u8],
+) -> Result<(DefinitionBlock<'_>, IntegerWidth), origin_acpi_tables::Error> {
+    let checked = origin_acpi_tables::definition::DefinitionBlock::parse(table)?;
+    let h = checked.table().header();
+    Ok((
+        DefinitionBlock {
+            signature: h.signature.0,
+            oem_id: h.oem_id,
+            oem_table_id: h.oem_table_id,
+            aml: checked.aml(),
+        },
+        IntegerWidth::from_dsdt_revision(checked.table().revision()),
+    ))
+}
 
 /// A byte of a region space: the space, the PCI function (segment, bus, device, function) for
 /// PCI_Config, and the address.
@@ -334,6 +353,15 @@ pub(crate) enum Fault {
     /// The Global Lock is kept when an evaluation ends holding it (`sync.rs`, `release_held`, and
     /// the backstop in `engine.rs`, `end_evaluation`).
     KeepGlobalLock,
+    /// `Load` runs a block whose checksum or signature is wrong (`load.rs`, `exec_load`).
+    LoadUnchecked,
+    /// A load that fails inside an evaluation keeps the names it made (`load.rs`, `fail_load`).
+    KeepFailedLoad,
+    /// `Load` and `LoadTable` give True for a table that did not load, and Zero for one that did
+    /// (`load.rs`, `load_result`).
+    InvertLoadResult,
+    /// A name may be made twice in one scope (`namespace.rs`, `create`).
+    AllowDuplicate,
 }
 
 thread_local! {
@@ -382,7 +410,7 @@ pub(crate) fn interp_with(width: IntegerWidth, limits: Limits) -> Interp {
 /// Loads `body` as an SSDT of revision 2 into `i`.
 pub(crate) fn load(i: &mut Interp, body: &[encode::B]) -> crate::Result<u32> {
     let t = encode::table(b"SSDT", 2, body);
-    let (block, _) = tables_standin::block(&t).expect("encoder tables are well-formed");
+    let (block, _) = self::block(&t).expect("encoder tables are well-formed");
     i.load(block)
 }
 
