@@ -127,6 +127,9 @@ struct Setup {
     roomy: bool,
     /// The host traces: what happens must not change (the review of B1, F9).
     traced: bool,
+    /// The block was mutated: a table its buffers hold may have changed, a bad checksum made good
+    /// among them, so the tables that must never load are not judged by their IDs (N-soak-4).
+    mutated: bool,
 }
 
 impl Setup {
@@ -135,6 +138,7 @@ impl Setup {
         timed: false,
         roomy: false,
         traced: false,
+        mutated: false,
     };
     const TIMED: Self = Self {
         timed: true,
@@ -694,8 +698,12 @@ fn completed_from(i: &Interpreter<TestHost>, from: usize) -> Vec<Vec<[u8; 4]>> {
     out
 }
 
-/// Requires that no table loaded whose checksum is bad or that is not signed `SSDT`.
-fn no_bad_table(i: &Interpreter<TestHost>, seed: u64) {
+/// Requires that no table loaded whose checksum is bad or that is not signed `SSDT`, judged by the
+/// IDs [`loadables`] gives them; not for a mutated block, whose bytes may have made one sound.
+fn no_bad_table(i: &Interpreter<TestHost>, seed: u64, setup: Setup) {
+    if setup.mutated {
+        return;
+    }
     for t in 0..i.table_count() as u32 {
         let info = i.table(t).unwrap();
         if info.failed {
@@ -986,7 +994,7 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
     // The block's own load may have loaded tables inside it: none failed may leave a name.
     no_failed_names(&audit(&i, 0), seed);
     at_rest(&i, seed);
-    no_bad_table(&i, seed);
+    no_bad_table(&i, seed, setup);
     let after_load = i.node_count();
     let tables_after_load = i.table_count();
     let mut rng = Rng(seed ^ 0x5555);
@@ -1025,7 +1033,7 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
             after_load + a.loaded_from,
             "seed {seed:#x}: an evaluation left names behind"
         );
-        no_bad_table(&i, seed);
+        no_bad_table(&i, seed, setup);
         assert!(
             i.memory_peak() <= lim.memory_bytes,
             "seed {seed:#x}: memory passed the limit"
@@ -1173,7 +1181,11 @@ fn mutation_cases(start: u64, n: u64) {
         let (mut aml, width) = generated(seed);
         let mut rng = Rng(seed);
         mutate(&mut rng, &mut aml);
-        run(&aml, width, seed, Setup::of(seed));
+        let setup = Setup {
+            mutated: true,
+            ..Setup::of(seed)
+        };
+        run(&aml, width, seed, setup);
     }
 }
 
