@@ -12,7 +12,9 @@
 //! calls and inside other loads. Some fail midway, some reach a limit, one loads itself, and two
 //! must never load (a bad checksum, a signature not `SSDT`). After the block's load and after each
 //! evaluation the namespace is audited: no name of a failed table, none of an ended evaluation,
-//! and no more names than the tables loaded meanwhile made. A third of the cases run against a host that refuses every region, and a third
+//! and no more names than the tables loaded meanwhile made; and the engine's stacks are at rest,
+//! with no region left pending. Every block has a PCI_Config field whose function is found only
+//! when first needed, among the stores' targets and `Load`'s sources (the review of B4, B4-1). A third of the cases run against a host that refuses every region, and a third
 //! under a time limit of one second with a clock that moves 5 ms each time it is read.
 //!
 //! The tests also require progress (the review of B1, F4): a share of the grammar's blocks must
@@ -168,14 +170,40 @@ impl Setup {
 const NAMES: &[&str] = &[
     "N0", "N1", "N2", "BF", "PK", "BD", "D0", "D1", "M0", "F0", "T0", "N3",
 ];
-/// Names a store writes.
-const PLACES: &[&str] = &["N0", "N1", "BF", "PK", "BD", "F0", "LK", "N3"];
+/// Names a store writes. `PF` is a PCI_Config field whose function is found only when first
+/// needed, so a store there, `Load`'s target among them, is put back once (the review of B4,
+/// B4-1).
+const PLACES: &[&str] = &["N0", "N1", "BF", "PK", "BD", "F0", "LK", "N3", PF];
+const PF: &str = "\\_SB.PCI0.DP.PF";
 const METHODS: &[(&str, u8)] = &[("M0", 0), ("M1", 1), ("M2", 2), ("\\D0.M3", 1)];
 /// What `Load` is given: the buffers [`loadables`] makes, and objects that hold no table (an
 /// integer, a SystemIO region, a field in it).
 const LOADS: &[&str] = &[
-    "XA", "XB", "XC", "XD", "XE", "XF", "XG", "\\XA", "N0", "R0", "F0",
+    "XA", "XB", "XC", "XD", "XE", "XF", "XG", "\\XA", "N0", "R0", "F0", PF,
 ];
+
+/// `\_SB.PCI0`, a root bridge on bus 0, and below it `DP` (device 3, function 0) with a
+/// PCI_Config region and the byte field `PF`.
+fn pci() -> B {
+    scope(
+        "\\_SB",
+        &[device(
+            "PCI0",
+            &[
+                name("_HID", dword(0x080A_D041)),
+                name("_BBN", zero()),
+                device(
+                    "DP",
+                    &[
+                        name("_ADR", dword(0x0003_0000)),
+                        op_region("PR", 2, zero(), byte(4)),
+                        field("PR", 1, &[Fe::Named("PF", 8)]),
+                    ],
+                ),
+            ],
+        )],
+    )
+}
 
 /// The table IDs of the two tables that must never load.
 const BAD_SUM: &[u8; 8] = b"BADSUM  ";
@@ -524,6 +552,7 @@ impl Gen {
                 &[name("_HID", dword(0x0A0C_D041)), method("M3", 1, &m3)],
             ),
             op_region("R0", 1, word(0x80), byte(8)),
+            pci(),
             field("R0", 1, &[Fe::Named("F0", 8), Fe::Named("F1", 8)]),
             field("R0", 0x13, &[Fe::Reserved(32), Fe::Named("LK", 32)]),
             index_field("F0", "F1", 1, &[Fe::Reserved(8), Fe::Named("IX", 12)]),
@@ -681,6 +710,26 @@ fn no_bad_table(i: &Interpreter<TestHost>, seed: u64) {
             "seed {seed:#x}: table {t} loaded though it is not signed SSDT"
         );
     }
+}
+
+/// Requires the engine's stacks at rest between evaluations: no frame, activation, creator or
+/// load left, and no region left pending (the review of B4, B4-1).
+#[track_caller]
+fn at_rest(i: &Interpreter<TestHost>, seed: u64) {
+    assert!(
+        i.frames.is_empty()
+            && i.calls.is_empty()
+            && i.owners.is_empty()
+            && i.loading == 0
+            && i.pending.is_none(),
+        "seed {seed:#x}: the engine's stacks were not at rest: {} frames, {} activations, {} \
+         creators, {} loads, pending {:?}",
+        i.frames.len(),
+        i.calls.len(),
+        i.owners.len(),
+        i.loading,
+        i.pending
+    );
 }
 
 /// Requires no name of a failed table.
@@ -936,6 +985,7 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
     );
     // The block's own load may have loaded tables inside it: none failed may leave a name.
     no_failed_names(&audit(&i, 0), seed);
+    at_rest(&i, seed);
     no_bad_table(&i, seed);
     let after_load = i.node_count();
     let tables_after_load = i.table_count();
@@ -965,6 +1015,7 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
         // What the evaluation's loads made stays (B4's contract, Q8); nothing else may.
         let a = audit(&i, tables_after_load);
         no_failed_names(&a, seed);
+        at_rest(&i, seed);
         assert_eq!(
             a.dynamic, 0,
             "seed {seed:#x}: an evaluation left names behind"
@@ -1363,6 +1414,18 @@ fn adversarial_cases() {
             Setup::PLAIN,
             Expect::Eval(Ok(Some(Value::Integer(82)))),
         ),
+        // B4-1: `Load`'s result into a field whose PCI function is found only then, for a table
+        // that loads and for one that fails midway.
+        (
+            loading_into_pf("XA", 101),
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(101)))),
+        ),
+        (
+            loading_into_pf("XB", 111),
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(112)))),
+        ),
         // A block whose own load-time code completes a load and then fails: the block is rolled
         // back, and the table it loaded stays (Q8), which `run`'s check allows by name.
         (
@@ -1424,6 +1487,19 @@ fn adversarial_blocks() {
     take_stats().print("adversarial");
 }
 
+/// As [`loading`], with `Load`'s result stored in the PCI_Config field `PF`, whose function is
+/// found only then (B4-1).
+fn loading_into_pf(what: &str, n: u64) -> Vec<B> {
+    let mut body = loadables(&[]);
+    body.push(pci());
+    body.push(method(
+        "M0",
+        0,
+        &[if_(load_op(what, nm(PF)), &[ret(int(n))]), ret(int(n + 1))],
+    ));
+    body
+}
+
 /// A block of [`loadables`] and a method `M0` that runs `first`, then loads `what` and returns
 /// `n` if its value is True, `n + 1` if Zero.
 fn loading(what: &str, n: u64, first: &[B]) -> Vec<B> {
@@ -1477,6 +1553,10 @@ fn planted_faults_are_caught() {
             "written for Eval(Ok(Some(Integer(11))))",
         ),
         (Fault::AllowDuplicate, "Duplicate"),
+        (
+            Fault::SkipLoadReadiness,
+            "written for Eval(Ok(Some(Integer(101))))",
+        ),
     ];
     for (f, by) in faults {
         let message = outcome(Some(f));

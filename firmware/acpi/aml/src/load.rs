@@ -10,6 +10,13 @@
 //! block ends ([`Interpreter::finish_load`]); nothing recurses in Rust. Each load is one level of
 //! the call-depth limit, so a table that loads itself is bounded as a recursion would be.
 //!
+//! **Every store a load makes is ready before anything changes** (the review of B4, B4-1).
+//! `Load`'s target, and `LoadTable`'s parameter, may be a field of a PCI_Config region whose
+//! function is not yet found, and a store there asks for it (`Pending`) and is put back. So, as
+//! `Divide` does, each is made ready first: `Load`'s target before its source is read, and
+//! `LoadTable`'s parameter before the load's end pops anything. A `Pending` that still reaches
+//! either end's store is the interpreter's own error (`Grammar`), never a retry.
+//!
 //! **A load that fails other than by a limit** (a check, a duplicate name, any error in its term
 //! list) is rolled back whole, names and bytes, and its operator gives Zero; the evaluation goes on
 //! ([`Interpreter::fail_load_at`], from `run_frames`). A limit ends the evaluation, as everywhere,
@@ -116,6 +123,11 @@ impl<H: Host> Interpreter<H> {
     /// whole through the host, or a field unit read as a buffer; the block in it must be an SSDT
     /// wholly inside it. A check that fails gives Zero.
     pub(crate) fn exec_load(&mut self, f: &OpFrame) -> Result<()> {
+        // The target first: a step put back for its PCI function has read and changed nothing,
+        // and every later store into it, the failed check's Zero included, is ready (B4-1).
+        if let Operand::Loc(target) = f.arg(1) {
+            self.load_ready(target)?;
+        }
         let node = self.resolve(name(f, 0)?)?.ok_or(ErrorKind::NotFound)?;
         let bytes = self.load_source(node)?;
         let checked = checked_span(&bytes, b"SSDT");
@@ -352,7 +364,21 @@ impl<H: Host> Interpreter<H> {
     /// The table's block has ended: its names stay, the operator gets True, and `LoadTable`'s
     /// parameter is stored. Load-time code that ends holding a mutex fails the load instead, as a
     /// table's load at the top level does (§19.6.89; G2).
+    ///
+    /// `LoadTable`'s parameter is found, and made ready, before anything here changes: a step put
+    /// back for its PCI function then runs this end again from the same state (B4-1). A lookup
+    /// that fails is still raised only after the load has ended, so that the table stays and the
+    /// error is not the load's (§19.6.78).
     pub(crate) fn finish_load(&mut self, l: Loading) -> Result<()> {
+        let completes = self.held.len() <= l.held;
+        let parameter = if l.op == Op::LoadTable && completes {
+            self.parameter_node(&l)
+        } else {
+            Ok(None)
+        };
+        if let Ok(Some(node)) = parameter {
+            self.load_ready(Loc::Node(node))?;
+        }
         self.pop_frame();
         if self.release_held(l.held) {
             let at = self.frames.len();
@@ -362,30 +388,54 @@ impl<H: Host> Interpreter<H> {
         self.run.depth = l.depth;
         self.cur = l.ret;
         self.trace(&Trace::Loaded(Ok(l.table)));
-        if l.op == Op::LoadTable {
-            self.store_parameter(&l)?;
+        if let Some(node) = parameter? {
+            let [_, data] = l.args;
+            let Operand::Val(data) = data else {
+                return err(ErrorKind::Grammar);
+            };
+            let stored = self.store(Loc::Node(node), data, Mode::Store);
+            self.no_retry(stored)?;
         }
         let [target, _] = l.args;
         self.load_result(l.op, target, true)
     }
 
-    /// `LoadTable`'s parameter, after the table is in the namespace: `ParameterData` stored into
-    /// the object `ParameterPath` names, as written if it begins with `\` or `^`, else under the
-    /// root path. An object that does not exist is an error; the table stays loaded.
-    fn store_parameter(&mut self, l: &Loading) -> Result<()> {
-        let [path, data] = l.args;
+    /// The object `LoadTable`'s `ParameterPath` names, if it is not empty: as written if it
+    /// begins with `\` or `^`, else under the root path. An object that does not exist is an
+    /// error.
+    fn parameter_node(&mut self, l: &Loading) -> Result<Option<NodeId>> {
+        let [path, _] = l.args;
         let Some(path) = self.path_operand(path)? else {
-            return Ok(());
+            return Ok(None);
         };
         let node = if path.root() || path.parents() > 0 {
             self.lookup_from(self.scope(), &path)?
         } else {
             self.lookup_exact(l.root, &path)?
         };
-        let Operand::Val(data) = data else {
-            return err(ErrorKind::Grammar);
-        };
-        self.store(Loc::Node(node), data, Mode::Store).map(|_| ())
+        Ok(Some(node))
+    }
+
+    /// Makes a store into `target` ready: its PCI function found first if it needs one, by a
+    /// step put back (`pci.rs`). A test may plant its absence (`SkipLoadReadiness`).
+    fn load_ready(&mut self, target: Loc) -> Result<()> {
+        #[cfg(test)]
+        if crate::tests::planted(crate::tests::Fault::SkipLoadReadiness) {
+            return Ok(());
+        }
+        self.target_ready(target)
+    }
+
+    /// A store at a load's end that still asks to be put back: the interpreter's own error, never
+    /// a retry, since that end has already changed what a put-back step cannot undo (B4-1).
+    fn no_retry<T>(&mut self, r: Result<T>) -> Result<T> {
+        match r {
+            Err(e) if e.kind == ErrorKind::Pending => {
+                self.pending = None;
+                err(ErrorKind::Grammar)
+            }
+            other => other,
+        }
     }
 
     /// Whether a `Return` would leave a table being loaded: the nearest of a method's call and a
@@ -497,7 +547,8 @@ impl<H: Host> Interpreter<H> {
             let Operand::Loc(l) = target else {
                 return err(ErrorKind::Grammar);
             };
-            self.store(l, v, Mode::Store)?;
+            let stored = self.store(l, v, Mode::Store);
+            self.no_retry(stored)?;
         }
         self.give_val(v)
     }

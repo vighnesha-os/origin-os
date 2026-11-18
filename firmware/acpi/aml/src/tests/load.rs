@@ -886,6 +886,301 @@ fn nested_loads_run_on_a_fixed_native_stack() {
     assert_eq!(left, 0, "both tables rolled back");
 }
 
+// --- The end of a load, ready before it changes anything (the review of B4, B4-1) ------------
+
+/// The byte field the next tests store into: a PCI_Config field whose function is found only when
+/// it is first needed, so that a store there is put back once (`Pending`).
+const F1: &str = "\\_SB.PCI0.D1.F1";
+
+/// `\_SB.PCI0`, a root bridge on bus 0, and below it `D1` (device 3, function 0) with a
+/// PCI_Config region and the byte field `F1`.
+fn pci_bridge() -> B {
+    scope(
+        "\\_SB",
+        &[device(
+            "PCI0",
+            &[
+                name("_HID", dword(0x080A_D041)),
+                name("_BBN", zero()),
+                device(
+                    "D1",
+                    &[
+                        name("_ADR", dword(0x0003_0000)),
+                        op_region("R1", 2, zero(), byte(4)),
+                        field("R1", 1, &[Fe::Named("F1", 8)]),
+                    ],
+                ),
+            ],
+        )],
+    )
+}
+
+/// `F1`'s byte as the host holds it, preset to 0x5A so that a store is seen.
+fn f1(i: &Interp) -> u8 {
+    i.host()
+        .memory
+        .get(&(2, Some((0, 0, 3, 0)), 0))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn preset_f1(i: &mut Interp) {
+    i.host_mut().memory.insert((2, Some((0, 0, 3, 0)), 0), 0x5A);
+}
+
+/// A block with the bridge, `TB` and `more`, loaded, `F1` preset and a trace started.
+fn with_pci(more: &[B]) -> Interp {
+    let mut body = vec![pci_bridge(), name("TB", buffer_of(&qa()))];
+    body.extend_from_slice(more);
+    let mut i = loaded(IntegerWidth::Bits64, &body);
+    preset_f1(&mut i);
+    i.host_mut().events = Some(Vec::new());
+    i
+}
+
+/// The trace's `Load` and `Loaded` events since it started.
+fn loads_traced(i: &mut Interp) -> Vec<Event> {
+    i.host_mut()
+        .events
+        .take()
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Load(_) | Event::Loaded(_)))
+        .collect()
+}
+
+/// Nothing is left on the engine's stacks: frames, activations, creators, a pending region, a
+/// load.
+#[track_caller]
+fn at_rest(i: &Interp) {
+    assert_eq!(
+        (i.frames.len(), i.calls.len(), i.owners.len(), i.loading),
+        (0, 0, 0, 0),
+        "frames, activations, creators, loads"
+    );
+    assert!(i.pending.is_none(), "a region left pending");
+}
+
+const LD_INTO_F1: fn() -> B = || {
+    method(
+        "LD",
+        0,
+        &[name("TMP0", one()), load_op("\\TB", nm(F1)), ret(one())],
+    )
+};
+
+#[test]
+fn r1_a_load_whose_target_needs_its_pci_function_ends_once() {
+    let mut i = with_pci(&[LD_INTO_F1()]);
+    let (nodes, first) = (i.node_count(), i.table_count() as u32);
+    assert_eq!(get(&mut i, "LD"), 1);
+    assert_eq!(
+        loads_traced(&mut i),
+        vec![Event::Load(*b"SSDT"), Event::Loaded(Ok(first))]
+    );
+    assert_eq!(
+        i.node_count(),
+        nodes + 3,
+        "the table's three names, and no TMP0"
+    );
+    assert!(!exists(&i, "\\LD.TMP0"));
+    assert_eq!(f1(&i), 0xFF, "True stored");
+    at_rest(&i);
+}
+
+#[test]
+fn r2_the_same_load_from_a_blocks_own_load_time_code() {
+    let mut i = interp(IntegerWidth::Bits64);
+    preset_f1(&mut i);
+    i.host_mut().events = Some(Vec::new());
+    load(
+        &mut i,
+        &[
+            pci_bridge(),
+            name("TB", buffer_of(&qa())),
+            LD_INTO_F1(),
+            name("BEF", one()),
+            store(call("\\LD", &[]), debug()),
+            name("AFT", one()),
+        ],
+    )
+    .expect("the block loads");
+    assert_eq!(
+        loads_traced(&mut i),
+        vec![
+            Event::Load(*b"SSDT"),
+            Event::Load(*b"SSDT"),
+            Event::Loaded(Ok(1)),
+            Event::Loaded(Ok(0)),
+        ]
+    );
+    for p in ["\\BEF", "\\AFT", "\\TB", "\\LD", "\\_SB.PCI0", "\\QA0"] {
+        assert!(exists(&i, p), "{p}");
+    }
+    assert!(!exists(&i, "\\LD.TMP0"));
+    assert_eq!(f1(&i), 0xFF);
+    at_rest(&i);
+}
+
+#[test]
+fn r3_a_table_ending_with_a_mutex_held_gives_zero_into_a_pci_target() {
+    let held = ssdt(&[name("QM0", one()), acquire(nm("\\MX"), 0xFFFF)]);
+    let mut i = with_pci(&[
+        mutex("MX", 0),
+        name("TM", buffer_of(&held)),
+        method("LD", 0, &[name("TMP0", one()), ret(load_op("TM", nm(F1)))]),
+    ]);
+    let (nodes, first) = (i.node_count(), i.table_count() as u32);
+    assert_eq!(get(&mut i, "LD"), 0);
+    assert_eq!(
+        loads_traced(&mut i),
+        vec![
+            Event::Load(*b"SSDT"),
+            Event::Loaded(Err(ErrorKind::MutexHeld))
+        ]
+    );
+    assert_eq!(i.node_count(), nodes);
+    assert!(!exists(&i, "\\QM0"));
+    assert!(i.table(first).unwrap().failed);
+    assert_eq!(f1(&i), 0, "Zero stored");
+    at_rest(&i);
+}
+
+#[test]
+fn r8_load_tables_parameter_needing_its_pci_function_ends_once() {
+    let mut i = with_pci(&[method(
+        "LT",
+        0,
+        &[
+            name("TMP0", one()),
+            load_table_of("OEMT", "ORIGIN", "AMLTEST", "", F1, int(0x42)),
+        ],
+    )]);
+    host_table(&mut i, KEY, qf());
+    let (nodes, first) = (i.node_count(), i.table_count() as u32);
+    assert_eq!(get(&mut i, "LT"), u64::MAX);
+    assert_eq!(
+        loads_traced(&mut i),
+        vec![Event::Load(*b"OEMT"), Event::Loaded(Ok(first))]
+    );
+    assert_eq!(f1(&i), 0x42, "the parameter stored");
+    assert_eq!(i.node_count(), nodes + 2);
+    assert!(!exists(&i, "\\LT.TMP0"));
+    at_rest(&i);
+}
+
+#[test]
+fn r9_a_failing_term_list_gives_zero_into_a_pci_target() {
+    let midway = ssdt(&[name("QB0", one()), store(nm("\\NOPE"), debug())]);
+    let mut i = with_pci(&[
+        name("TF", buffer_of(&midway)),
+        method("LD", 0, &[ret(load_op("TF", nm(F1)))]),
+    ]);
+    let nodes = i.node_count();
+    assert_eq!(
+        i.evaluate("LD", &[]).map_err(|e| e.kind),
+        Ok(Some(Value::Integer(0)))
+    );
+    assert_eq!(
+        loads_traced(&mut i),
+        vec![
+            Event::Load(*b"SSDT"),
+            Event::Loaded(Err(ErrorKind::NotFound))
+        ]
+    );
+    assert_eq!(i.node_count(), nodes);
+    assert_eq!(named(&i, b"QB"), 0);
+    assert_eq!(f1(&i), 0);
+    at_rest(&i);
+}
+
+#[test]
+fn r10_a_region_source_is_read_once_when_the_target_needs_its_pci_function() {
+    let mut t = qa();
+    t[42] ^= 1;
+    let len = t.len() as u32;
+    let mut i = with_pci(&[
+        op_region("RG", 0, dword(0x5_0000), dword(len)),
+        method("LD", 0, &[ret(load_op("RG", nm(F1)))]),
+    ]);
+    in_memory(&mut i, 0x5_0000, &t);
+    i.host_mut().seen.clear();
+    assert_eq!(get(&mut i, "LD"), 0, "a bad checksum gives Zero");
+    let read: u64 = i
+        .host()
+        .seen
+        .iter()
+        .filter(|s| s.space == 0 && !s.write)
+        .map(|s| u64::from(s.width) / 8)
+        .sum();
+    assert_eq!(read, u64::from(len), "the region read once, whole");
+    assert_eq!(f1(&i), 0);
+    at_rest(&i);
+}
+
+/// Fail closed: with the readiness checks planted away, a `Pending` reaches each end's store.
+/// It is `Grammar`, never a retry: one `Loaded`, the creator stack whole, nothing pending, and
+/// `F1` untouched.
+#[test]
+fn a_pending_at_a_loads_end_fails_closed() {
+    plant(Some(Fault::SkipLoadReadiness));
+    // `Load`'s result into its target, after a completed load: the table stays.
+    let mut i = with_pci(&[LD_INTO_F1()]);
+    let (nodes, first) = (i.node_count(), i.table_count() as u32);
+    let r1 = i.evaluate("LD", &[]).map_err(|e| e.kind);
+    let r1_loads = loads_traced(&mut i);
+    let r1_state = (i.node_count(), exists(&i, "\\LD.TMP0"), f1(&i));
+    let r1_rest = (i.frames.len(), i.owners.len(), i.pending.is_none());
+    // `fail_load`'s Zero into its target.
+    let midway = ssdt(&[name("QB0", one()), store(nm("\\NOPE"), debug())]);
+    let mut j = with_pci(&[
+        name("TF", buffer_of(&midway)),
+        method("LD", 0, &[ret(load_op("TF", nm(F1)))]),
+    ]);
+    let r9 = j.evaluate("LD", &[]).map_err(|e| e.kind);
+    let r9_loads = loads_traced(&mut j);
+    // `LoadTable`'s parameter.
+    let mut k = with_pci(&[method(
+        "LT",
+        0,
+        &[load_table_of(
+            "OEMT",
+            "ORIGIN",
+            "AMLTEST",
+            "",
+            F1,
+            int(0x42),
+        )],
+    )]);
+    host_table(&mut k, KEY, qf());
+    let r8 = k.evaluate("LT", &[]).map_err(|e| e.kind);
+    let r8_loads = loads_traced(&mut k).len();
+    plant(None);
+
+    assert_eq!(r1, Err(ErrorKind::Grammar));
+    assert_eq!(
+        r1_loads,
+        vec![Event::Load(*b"SSDT"), Event::Loaded(Ok(first))]
+    );
+    assert_eq!(
+        r1_state,
+        (nodes + 3, false, 0x5A),
+        "the completed table stays"
+    );
+    assert_eq!(r1_rest, (0, 0, true));
+    at_rest(&i);
+    assert_eq!(r9, Err(ErrorKind::Grammar));
+    assert_eq!(r9_loads.len(), 2);
+    assert_eq!(named(&j, b"QB"), 0);
+    assert_eq!(f1(&j), 0x5A);
+    at_rest(&j);
+    assert_eq!(r8, Err(ErrorKind::Grammar));
+    assert_eq!(r8_loads, 2);
+    assert_eq!(named(&k, b"QF"), 2, "the table stays");
+    assert_eq!(f1(&k), 0x5A);
+    at_rest(&k);
+}
+
 // --- The planted faults ------------------------------------------------------------------------
 
 /// A fault planted, or none, and the tests it must fail (or pass).
@@ -895,7 +1190,7 @@ type Planted = (Option<Fault>, &'static [fn()]);
 /// pass. The randomized test's control plants them as well (`random.rs`).
 #[test]
 fn planted_faults_are_caught_by_the_load_tests() {
-    let tests: [Planted; 5] = [
+    let tests: [Planted; 6] = [
         (
             None,
             &[
@@ -905,6 +1200,12 @@ fn planted_faults_are_caught_by_the_load_tests() {
                 a_load_that_fails_inside_a_load_leaves_the_outer_one_whole,
                 a_buffer_loads_its_names_stay_and_the_target_holds_true,
                 a_table_loaded_twice_fails_at_its_first_duplicate,
+                r1_a_load_whose_target_needs_its_pci_function_ends_once,
+                r2_the_same_load_from_a_blocks_own_load_time_code,
+                r3_a_table_ending_with_a_mutex_held_gives_zero_into_a_pci_target,
+                r8_load_tables_parameter_needing_its_pci_function_ends_once,
+                r9_a_failing_term_list_gives_zero_into_a_pci_target,
+                r10_a_region_source_is_read_once_when_the_target_needs_its_pci_function,
             ],
         ),
         (
@@ -928,6 +1229,17 @@ fn planted_faults_are_caught_by_the_load_tests() {
         (
             Some(Fault::AllowDuplicate),
             &[a_table_loaded_twice_fails_at_its_first_duplicate],
+        ),
+        (
+            Some(Fault::SkipLoadReadiness),
+            &[
+                r1_a_load_whose_target_needs_its_pci_function_ends_once,
+                r2_the_same_load_from_a_blocks_own_load_time_code,
+                r3_a_table_ending_with_a_mutex_held_gives_zero_into_a_pci_target,
+                r8_load_tables_parameter_needing_its_pci_function_ends_once,
+                r9_a_failing_term_list_gives_zero_into_a_pci_target,
+                r10_a_region_source_is_read_once_when_the_target_needs_its_pci_function,
+            ],
         ),
     ];
     for (f, cases) in tests {

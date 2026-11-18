@@ -362,6 +362,8 @@ pub(crate) enum Fault {
     InvertLoadResult,
     /// A name may be made twice in one scope (`namespace.rs`, `create`).
     AllowDuplicate,
+    /// A load's stores are not made ready before it changes anything (`load.rs`, `load_ready`).
+    SkipLoadReadiness,
 }
 
 thread_local! {
