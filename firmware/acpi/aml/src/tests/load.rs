@@ -856,6 +856,39 @@ fn a_root_path_that_names_nothing_is_an_error() {
 }
 
 #[test]
+fn r6_a_root_path_that_is_not_a_scope_object_is_refused() {
+    // The review of B4, B4-4: as `Scope` refuses it (`WrongObject`), and nothing is loaded.
+    let mut i = loaded(
+        IntegerWidth::Bits64,
+        &[
+            name("NI", int(1)),
+            m(
+                "L1",
+                &[load_table_of(
+                    "OEMT",
+                    "ORIGIN",
+                    "AMLTEST",
+                    "\\NI",
+                    "",
+                    zero(),
+                )],
+            ),
+            m("L2", &[scope("\\NI", &[name("QF0", one())])]),
+        ],
+    );
+    host_table(&mut i, KEY, qf());
+    let tables = i.table_count();
+    assert_eq!(fails(&mut i, "L1"), ErrorKind::WrongObject);
+    assert_eq!(
+        fails(&mut i, "L2"),
+        ErrorKind::WrongObject,
+        "as `Scope` does"
+    );
+    assert_eq!(i.table_count(), tables, "nothing loaded");
+    assert_eq!(named(&i, b"QF"), 0);
+}
+
+#[test]
 fn load_table_of_a_dsdt_or_ssdt_key_gives_zero() {
     // Q6: even when the host would answer.
     for sig in ["DSDT", "SSDT"] {

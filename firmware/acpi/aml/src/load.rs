@@ -198,10 +198,18 @@ impl<H: Host> Interpreter<H> {
             }
         }
         // The root path first: a path that names nothing is an error, whether or not the table
-        // is there.
+        // is there. It must name a scope object, as `Scope`'s does: the root, a predefined scope,
+        // a device, processor, thermal zone or power resource (§19.6.122; the review of B4, B4-4,
+        // a strict choice the ledger records).
         let root = match self.path_operand(f.arg(3))? {
             None => Namespace::root(),
-            Some(p) => self.lookup_from(self.scope(), &p)?,
+            Some(p) => {
+                let node = self.lookup_from(self.scope(), &p)?;
+                if !matches!(self.heap.get(self.ns.obj(node)?)?, Object::Scope { .. }) {
+                    return err(ErrorKind::WrongObject);
+                }
+                node
+            }
         };
         if key.signature == *b"DSDT" || key.signature == *b"SSDT" {
             return self.load_result(Op::LoadTable, Operand::Empty, false);
