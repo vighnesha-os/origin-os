@@ -271,6 +271,8 @@ struct Machine {
     stack_floor: Option<usize>,
     /// How far the firmware's clock moves at each reading, in nanoseconds (B3-14's time half).
     tick: u64,
+    /// What a copy of the DSDT's header reads, where it differs from the table lent (B4-9).
+    dsdt_header_copy: Option<Vec<u8>>,
 }
 
 impl Machine {
@@ -282,6 +284,7 @@ impl Machine {
             entries: Vec::new(),
             stack_floor: None,
             tick: 0,
+            dsdt_header_copy: None,
         }
     }
 
@@ -327,6 +330,7 @@ impl Machine {
             bytes: Vec::leak(memory),
             clock: core::cell::Cell::new(0),
             tick: self.tick,
+            header_copy: self.dsdt_header_copy.clone().map(|h| (self.dsdt_at, h)),
         };
         let mut out = String::new();
         let found = run(
@@ -352,6 +356,9 @@ struct Memory {
     bytes: &'static [u8],
     clock: core::cell::Cell<u64>,
     tick: u64,
+    /// A header that a copy at this address reads in place of memory's: firmware memory that
+    /// changed between the proof's reads (B4-9).
+    header_copy: Option<(u64, Vec<u8>)>,
 }
 
 impl Memory {
@@ -371,6 +378,13 @@ impl Firmware for Memory {
         self.range(addr, len)
     }
     fn copy(&mut self, addr: u64, out: &mut [u8]) -> Result<(), &'static str> {
+        if let Some((at, header)) = &self.header_copy
+            && *at == addr
+            && let Some(h) = header.get(..out.len())
+        {
+            out.copy_from_slice(h);
+            return Ok(());
+        }
         out.copy_from_slice(self.range(addr, out.len())?);
         Ok(())
     }
@@ -939,6 +953,32 @@ fn a_dsdt_whose_header_cannot_be_copied_fails_the_proof() {
         out.contains("origin-kernel: aml: the DSDT: not readable: its header cannot be copied"),
         "{out}"
     );
+}
+
+/// B4-9: the header the IDs were judged on says QEMU, the table lent and checked does not (its
+/// table ID changed, its checksum sound): firmware memory that changed between the two reads.
+/// The proof fails with a reason of its own, first, and runs no AML.
+#[test]
+fn a_dsdt_that_changes_between_two_reads_fails_the_proof() {
+    let qemu = qemu_dsdt(&[]);
+    let mut other = qemu.clone();
+    other[16..24].copy_from_slice(b"OTHERFW ");
+    other[9] = 0;
+    other[9] = 0u8.wrapping_sub(other.iter().fold(0u8, |s, &b| s.wrapping_add(b)));
+    let mut m = Machine::new(other);
+    m.dsdt_header_copy = Some(qemu[..36].to_vec());
+    let (found, out) = m.run();
+    assert_eq!(
+        found.failed,
+        Some("the DSDT changed between two reads"),
+        "{out}"
+    );
+    assert!(!found.not_run, "{out}");
+    assert!(
+        out.contains("the checked table's OEM ID \"BOCHS \" and OEM table ID \"OTHERFW \""),
+        "{out}"
+    );
+    assert!(!out.contains("loaded as table"), "no AML ran: {out}");
 }
 
 /// QEMU's IDs on a DSDT whose checksum is wrong: the IDs say the tables are QEMU's, so the whole

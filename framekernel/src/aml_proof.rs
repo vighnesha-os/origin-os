@@ -572,6 +572,10 @@ fn cut_off(
 /// The reason a proof past its bound gives.
 const CUT_OFF: &str = "the proof was cut off by its bound";
 
+/// The reason a proof gives when the DSDT's checked read is not the one whose IDs were judged
+/// (the review of B4, B4-9).
+const CHANGED: &str = "the DSDT changed between two reads";
+
 /// The proof: the definition blocks from the RSDP at `rsdp_addr` through `fw`, loaded and run
 /// against `host` (wrapped in a [`Recorder`]) under `limits`, if they are QEMU's; `heap` reads the
 /// kernel heap's bytes in use, before the proof and after the interpreter is dropped;
@@ -813,6 +817,20 @@ fn interpret<H: Host>(
         found.fail("no DSDT");
         return;
     };
+    // The IDs that decided to run were read from one copy of the header, and the table that is
+    // checked and run is another read: its IDs must be QEMU's too, or the rule "only QEMU's
+    // tables run" would rest on bytes the AML did not come from (the review of B4, B4-9).
+    let h = dsdt.table().header();
+    if (h.oem_id, h.oem_table_id) != QEMU_DSDT {
+        let _ = writeln!(
+            out,
+            "{LINE}the DSDT changed between two reads: the checked table's OEM ID \"{}\" and OEM table ID \"{}\" are not QEMU's, though its first header's were",
+            Escaped(&h.oem_id),
+            Escaped(&h.oem_table_id)
+        );
+        found.fail(CHANGED);
+        return;
+    }
     let width = IntegerWidth::from_dsdt_revision(dsdt.table().revision());
     let mut i = match Interpreter::new(Recorder::new(host), Config { limits }, width) {
         Ok(i) => i,
