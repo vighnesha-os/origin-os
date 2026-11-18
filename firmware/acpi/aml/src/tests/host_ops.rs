@@ -360,6 +360,43 @@ fn a_data_table_region_reads_the_table_the_host_names() {
     assert_eq!(int(&mut i, "RD"), 0x42);
 }
 
+/// The review of B4, B4-8: the check of the host's copy reads all of it, and is charged as work,
+/// a unit for each 64 bytes, as a copy of that size is.
+#[test]
+fn a_data_table_regions_check_is_counted_as_work() {
+    let steps = |body_bytes: usize| {
+        let mut i = interp(IntegerWidth::Bits64);
+        i.host_mut().tables.push((
+            TableKey {
+                signature: *b"OEMX",
+                oem_id: *b"ORIGIN",
+                oem_table_id: *b"AMLTEST\0",
+            },
+            0x7000,
+            table(b"OEMX", 2, &[vec![0; body_bytes]]),
+        ));
+        load(
+            &mut i,
+            &[m(
+                "RD",
+                &[
+                    data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST")),
+                    ret(one()),
+                ],
+            )],
+        )
+        .unwrap();
+        let before = i.steps_done();
+        assert_eq!(int(&mut i, "RD"), 1);
+        i.steps_done() - before
+    };
+    let (small, large) = (steps(28), steps(65_536 - 36));
+    assert!(
+        large >= small + 1_000,
+        "a 64 KiB table's check counted {large} steps, a 64-byte one's {small}"
+    );
+}
+
 /// The review of B2, B2-14 (built in B4): a copy that is not a sound table under the key gives
 /// the region nothing, and nothing is read.
 #[test]

@@ -738,6 +738,11 @@ impl<H: Host> Interpreter<H> {
                 ));
             })
             .map_err(ErrorKind::Host)?;
+        // The check read the whole copy: work, charged as a copy of that size is (B1's F1 rule;
+        // the review of B4, B4-8).
+        if let Some((_, length, _)) = found {
+            self.charge(length / 64)?;
+        }
         let (offset, length) = match found {
             Some((address, length, true)) if present => (address, length),
             Some((_, _, false)) if present => return err(ErrorKind::Host(HostError::Failed)),
