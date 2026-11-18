@@ -557,6 +557,8 @@ The verdict's branches are host tests too (`framekernel/src/aml_proof/tests.rs`)
 | AML-5 | As above | **Now caught at once** (B3-18): xtask's failure `the serial output contains "are not QEMU's: the proof runs only"`, after the kernel's `aml: the DSDT's OEM ID "BOCHS " and OEM table ID "BXPC    " are not QEMU's: ... ran no AML; passed`. Before B3-18 it waited for the 120 s timeout |
 | AML-6 | **New (B3-13):** the DSDT's header as copied has its checksum byte broken and its OEM table ID changed (`OTHERFW `) | The proof judged the IDs without the checksum and ran no AML: `aml: the DSDT's OEM ID "BOCHS " and OEM table ID "OTHERFW " are not QEMU's: ... ran no AML; passed`. As a QEMU boot it then failed at once on that line (B3-18). The host test `other_ids_with_a_bad_checksum_are_not_run` holds the same case, the checksum broken across the whole table |
 
+**Again on the answers to the review of B4** (2026-11-18, 18:25 to 18:27 UTC, one turn, at `dad56c18`): the same six controls, each caught the same way, and every file restored byte for byte. The baseline passed: `1 tables, 8521 bytes of AML loaded in 9286 us; 38 devices walked in 4539 us`, the deepest host call 6,224 bytes below the proof's entry and 47,119 above the guard page. B4-9's new failure, "the DSDT changed between two reads", is a host test only: no boot control plants it.
+
 ## Alternatives
 
 | Alternative | For | Against |

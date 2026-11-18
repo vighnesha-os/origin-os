@@ -1558,6 +1558,27 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
 - **B4-11** `2eea5569`: `Host::table` says it calls `out` at most once.
 - **The records' findings** `f6e1b18c`: CL41's harness kept as an `#[ignore]`d test, and tests for `Break` and `Continue` in a loaded table (the hand-over's point 2). The ledger has point 7, G19 and the corrected sentence of the contract's §6. TASKS item 64 now names G1 to G19 (`67472a84`).
 - **N-soak-4** `30af5f8d`, found by the soak before these gates (seed `0x63b00000`, mutation case `0x9c51c871`). A mutation made the bad-checksum table's bytes sum to zero, and the sound table loaded legitimately. The check that such tables never load now holds only for blocks that were not mutated. Tests only; the library is unchanged.
+- **The gates on `dad56c18`, the answers' final evidence.**
+  - **Conditions:** the code as at `30af5f8d`; Rust 1.100.0 on the development Mac; one turn of the machine, 2026-11-18, 18:25 to 18:55 UTC; the tree clean before and after. The quick gates passed first.
+  - **The boot controls AML-1 to AML-6:** each caught as before (ADR-0013, "The controls at step B4"). The baseline loaded 8,521 bytes in 9.3 ms and walked 38 devices in 4.5 ms.
+  - **The soak inside the turn** (seed `0x63b00000`, 1,000,000 cases of each kind, 77 s): passed.
+    - Grammar: 93% loaded, 24% returning a value, 33% running 32 operations, 22 kinds of error; an evaluation's load completed in 12% of cases and failed in 15%.
+    - Mutation: 14%, 22%, 30%, 33 kinds.
+    - The 33 adversarial blocks ran as written.
+    - It ran twice before: once finding N-soak-4, then passing.
+  - **In release:** `origin-aml`'s load tests (49, 1 ignored: CL41's harness) and the kernel's proof tests (40).
+  - **`cargo xtask check` passed:** 2,283 tests passed, none failed, 29 ignored; Loom, 56 models and 83 controls. Its gates:
+    - the release run of `tests::load::nested_loads` (B4-6);
+    - the no-panic check: `origin-aml`, 197 symbols of its own and 18 external, 3 of them `origin-acpi-tables`' own;
+    - the allocation gate's plants caught;
+    - the `unsafe` gate, 287 kernel files;
+    - provenance: 29 crates.
+  - **`cargo xtask boot-test`:** 11 of 11.
+  - **`cargo xtask boot-matrix`:** 193 scenarios, none failed.
+    - The proof passed on all 31 kernel boots, with no `aml failed`, no not-QEMU line and no "changed between two reads".
+    - Verdicts as before.
+    - The discovery machine: 496,558 bytes loaded in 278 ms and 4,132 devices walked in 136 ms, at most 11,897,534 bytes.
+    - The least room above the guard page: 47,119 bytes.
 
 
 ### 60. The host tools are libraries first (ADR-0011 Amendment 4, T1)
