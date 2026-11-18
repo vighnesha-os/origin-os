@@ -648,21 +648,41 @@ fn leaf_problems(root: &Path) -> Result<Vec<String>> {
     for dir in KERNEL_LEAVES {
         leaves.insert(package_name(&root.join(dir).join("Cargo.toml"))?);
     }
-    Ok(leaf_problems_of(&kernel, &leaves))
+    Ok(leaf_problems_of(LAYERS, &kernel, &leaves))
 }
 
-/// [`leaf_problems`] on the packages under [`KERNEL_ROOT`] and the listed leaves' packages.
-fn leaf_problems_of(kernel: &BTreeSet<String>, leaves: &BTreeSet<String>) -> Vec<String> {
+/// [`leaf_problems`] on a layering table, the packages under [`KERNEL_ROOT`] and the listed
+/// leaves' packages. Every crate the table names counts, as a row or in any row's allowed list (the
+/// review of TASKS 63's B3 addendum, B3-15): a crate named only in an allowed list is linked into
+/// the kernel as surely as one with a row, so it must have a row of its own, and be under
+/// [`KERNEL_ROOT`] or a listed leaf.
+fn leaf_problems_of(
+    layers: &[(&str, &[&str])],
+    kernel: &BTreeSet<String>,
+    leaves: &BTreeSet<String>,
+) -> Vec<String> {
     let mut problems = Vec::new();
-    for (name, _) in LAYERS {
-        if !kernel.contains(*name) && !leaves.contains(*name) {
+    let mut named = BTreeSet::new();
+    for (row, allowed) in layers {
+        named.insert(*row);
+        for name in *allowed {
+            named.insert(*name);
+            if !layers.iter().any(|(n, _)| n == name) {
+                problems.push(format!(
+                    "{name} is allowed for {row} and has no row of its own in LAYERS: say where it sits"
+                ));
+            }
+        }
+    }
+    for name in named {
+        if !kernel.contains(name) && !leaves.contains(name) {
             problems.push(format!(
                 "{name} is in LAYERS, outside {KERNEL_ROOT}, and its directory is not in KERNEL_LEAVES: the gate would not scan it"
             ));
         }
     }
     for name in leaves {
-        if !LAYERS.iter().any(|(n, _)| n == name) {
+        if !layers.iter().any(|(n, _)| n == name) {
             problems.push(format!(
                 "{name}'s directory is in KERNEL_LEAVES, and LAYERS does not name it"
             ));
@@ -793,7 +813,7 @@ mod tests {
         }
         let mut short = leaves.clone();
         assert!(short.remove("origin-aml"));
-        let problems = leaf_problems_of(&kernel, &short);
+        let problems = leaf_problems_of(LAYERS, &kernel, &short);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
             problems[0].starts_with("origin-aml is in LAYERS"),
@@ -801,10 +821,27 @@ mod tests {
         );
         let mut extra = leaves;
         extra.insert("origin-not-the-kernels".to_string());
-        let problems = leaf_problems_of(&kernel, &extra);
+        let problems = leaf_problems_of(LAYERS, &kernel, &extra);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
             problems[0].contains("LAYERS does not name it"),
+            "{problems:?}"
+        );
+        // B3-15: a crate named only in an allowed list, with no row and no listed directory, is
+        // caught twice: no row of its own, and not scanned.
+        let planted: &[(&str, &[&str])] = &[
+            ("framekernel", &["origin-frame", "origin-planted"]),
+            ("origin-frame", &[]),
+        ];
+        let kernel: BTreeSet<String> = ["framekernel", "origin-frame"].map(String::from).into();
+        let problems = leaf_problems_of(planted, &kernel, &BTreeSet::new());
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems[0].starts_with("origin-planted is allowed for framekernel and has no row"),
+            "{problems:?}"
+        );
+        assert!(
+            problems[1].starts_with("origin-planted is in LAYERS, outside framekernel"),
             "{problems:?}"
         );
     }
