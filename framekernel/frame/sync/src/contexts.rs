@@ -45,11 +45,17 @@
 //! # Who calls what
 //!
 //! - [`Contexts::publish`]: any processor, for a thread it is placing on this one.
-//! - [`Contexts::switch`] and [`Contexts::retire_ended`]: this processor only. `switch` runs with
-//!   interrupts off, from the trap entry. `retire_ended` may also be called by code this
-//!   processor runs with interrupts on, as a stack's drop does: it takes `ended` by an atomic
-//!   swap, so a `switch` that interrupts it, which also retires, cannot retire the same context
-//!   twice or lose a later exit's record. Every write of `ended` is a swap, a read-modify-write,
+//! - [`Contexts::switch`] and [`Contexts::retire_ended`]: this processor only, and **with
+//!   interrupts off**. `switch` runs from the trap entry; a stack's drop, which may run with
+//!   interrupts on, wraps its retirement in `cpu::without_interrupts` (the review of TASKS item
+//!   70, T70-1, answering the coordinating session's ruling (c)). The condition matters: a
+//!   retirement interrupted between its take of `ended` and its clear of the home leaves the
+//!   ended context in no record that will retire it, so a reap in that gap finds its stack still
+//!   covered and leaks it (safe, but lost), and the table could then hold more ended contexts
+//!   than its capacity counts. The host test
+//!   `a_retirement_interrupted_between_its_take_and_its_clear_leaves_the_stack_covered` shows
+//!   that gap on this code.
+//! - `ended` is taken by an atomic swap, and every write of it is a swap, a read-modify-write,
 //!   never a plain store, so all of them lie in one order. With the exit's record written by a
 //!   plain store, Loom found an execution of model L5 in which two later swaps read the value
 //!   before it, and that exit's home was never retired. As far as this module's author reads the
@@ -73,7 +79,8 @@
 //! [`SLOTS`] is 32. A processor holds at most one context per run-queue slot, the boot or idle
 //! flow's included: the kernel's run queue has 16 (`runqueue::CAPACITY`, which the kernel checks
 //! against [`SLOTS`] at compile time). It also holds at most one context that has ended and is not
-//! yet retired, since each `switch` retires the previous one before an exit records another. That
+//! yet retired, since each `switch` retires the previous one before an exit records another, and
+//! every retirement runs with interrupts off, so none is caught half-done (T70-1). That
 //! is 17 of 32. If a table were ever full, [`Contexts::publish`] returns `false`, and the kernel
 //! refuses the spawn. A boot flow's first switch-out that found no slot would be refused by
 //! [`Contexts::switch`] with [`Refused::Full`], and the trap entry halts.
@@ -257,6 +264,8 @@ impl Contexts {
     /// interrupts on: the exit's own `switch` records the context as ended, and the trap entry
     /// then loads the next frame with nothing in between that calls this. Every later call runs
     /// on another context's stack. `running_on` checks it all the same.
+    ///
+    /// Call it with interrupts off (the module documentation, "Who calls what").
     pub fn retire_ended(&self, running_on: impl Fn(u64) -> bool) -> Result<(), Refused> {
         let ended = self.ended.swap(NONE, AcqRel);
         let Some(slot) = self.slots.get(ended) else {
@@ -545,5 +554,47 @@ mod tests {
         let table = Contexts::new();
         assert!(table.publish(0xffff_c000_0001_ff40));
         assert_eq!(format!("{table:?}"), "Contexts");
+    }
+
+    /// The review of TASKS item 70, T70-1, its experiment (a): a retirement interrupted between
+    /// its take of `ended` and its clear of the home. `running_on` runs in that gap and stands for
+    /// the interrupt: a `switch` there finds nothing to retire, and a reaper there finds the ended
+    /// stack still covered, so it would leak it. Safe, but lost: why every caller runs the
+    /// retirement with interrupts off.
+    #[test]
+    fn a_retirement_interrupted_between_its_take_and_its_clear_leaves_the_stack_covered() {
+        let table = Contexts::new();
+        for n in 1..=3 {
+            assert!(table.publish(first_frame(n)));
+        }
+        assert_eq!(
+            table.switch(0x9000, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        assert_eq!(
+            table.switch(0x100, first_frame(2), true, not_on_it),
+            Ok(first_frame(2))
+        );
+        let seen_in_the_gap = core::cell::Cell::new(None);
+        let outcome = table.retire_ended(|_| {
+            // The interrupt: a switch whose own retirement finds `ended` already taken.
+            assert_eq!(
+                table.switch(first_frame(2) - 8, first_frame(3), false, not_on_it),
+                Ok(first_frame(3))
+            );
+            // A reaper here would find stack 1, ended and no longer recorded as ended, in use.
+            seen_in_the_gap.set(Some(covered(&table, 1)));
+            false
+        });
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            seen_in_the_gap.get(),
+            Some(true),
+            "covered, so a drop would leak it"
+        );
+        assert!(
+            !covered(&table, 1),
+            "retired once the interrupted call finishes"
+        );
     }
 }

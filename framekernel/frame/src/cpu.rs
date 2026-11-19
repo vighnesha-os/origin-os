@@ -832,12 +832,14 @@ fn resume(here: u64, next: u64, exiting: bool) -> u64 {
 /// It first retires this processor's own ended context, if any: this processor has left that
 /// stack, since any code it runs after the exit's switch runs on another context's stack
 /// (`Contexts::retire_ended`). So a stack reaped here before this processor's next switch is
-/// given back, not leaked.
+/// given back, not leaked. The retirement runs with interrupts off, as the table asks: a switch
+/// that interrupted it between its take and its clear would leave the ended stack in no record
+/// that retires it, and a reap then would leak it (the review of TASKS item 70, T70-1).
 pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
     let used = |value: u64| value >= start && value < end;
     if tables_ready()
         && let Some(table) = CONTEXTS.get(this_cpu().get())
-        && table.retire_ended(running_on) == Err(Refused::StillOnIt)
+        && without_interrupts(|| table.retire_ended(running_on)) == Err(Refused::StillOnIt)
     {
         panic!("an ended thread's stack was to be retired while this processor still ran on it");
     }
