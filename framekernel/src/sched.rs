@@ -208,16 +208,20 @@ pub(crate) use crate::settled::{Unsettled, not_settled};
 /// schedule: on the 65-processor machine the stacks that earlier proofs' threads left were still
 /// being reclaimed, one shootdown at a time, when the IPC proof took its first count, so the
 /// count rose during the proof; and a cache of kept stacks that refills during a proof lowers it.
-/// Settled at both reads, the counts change only with what the proof does. Waits up to 2 s for
-/// each part; `Err` names what was still pending, and any stack lost to a stalled shootdown while
-/// it ran (`settled`: safe by design, 4 frames each).
+/// Settled at both reads, the counts change only with what the proof does. Waits up to
+/// [`OTHERS_PATIENCE`] seconds for each part; `Err` names what was still pending, and any
+/// stack lost to a stalled shootdown while it ran (`settled`: safe by design, 4 frames each).
 pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
     let lost_before = origin_frame::stack::counts().lost;
     reap();
-    yield_until(|| zombies() == 0, tsc_hz, 2);
+    yield_until(|| zombies() == 0, tsc_hz, OTHERS_PATIENCE);
     origin_frame::stack::trim();
     origin_frame::stack::reclaim();
-    yield_until(|| origin_frame::stack::counts().retired == 0, tsc_hz, 2);
+    yield_until(
+        || origin_frame::stack::counts().retired == 0,
+        tsc_hz,
+        OTHERS_PATIENCE,
+    );
     let counts = origin_frame::stack::counts();
     crate::settled::judge(zombies(), counts.retired, lost_before, counts.lost)
 }
@@ -684,6 +688,14 @@ extern "sysv64" fn quitter(_: u64) -> ! {
     FINISHED.fetch_add(1, Ordering::Relaxed);
     exit()
 }
+
+/// How long, in seconds, a Refuse proof waits for what only a thread on another processor can
+/// do: a prober running, an exited thread reaped, a retired stack reclaimed. A budget, not a
+/// bound (ADR-0013 R1(b)): each wait ends as soon as its condition holds, which on a real
+/// machine is within microseconds, and its verdict does not change. Under QEMU's software
+/// processor a 65-processor machine with a little outside load left one processor's prober
+/// unrun past the 2 s this was before TASKS item 66.
+pub(crate) const OTHERS_PATIENCE: u64 = 10;
 
 /// Yields until `done()` or `seconds` pass.
 ///
@@ -1170,7 +1182,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     yield_until(
         || EXITED.load(Ordering::Relaxed) == workers as u64,
         tsc_hz,
-        2,
+        OTHERS_PATIENCE,
     );
     let mut ok = EXITED.load(Ordering::Relaxed) == workers as u64;
     if !ok {
