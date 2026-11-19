@@ -512,13 +512,19 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
     let mut stamps = [0u64; PROOF_TICKS as usize];
     let mut attempts = 0;
     let mut stalled_gap = 0;
-    let (run, taken) = loop {
+    let (run, taken, lasted) = loop {
         attempts += 1;
-        let (start, taken) = take_ticks(&lapic, count, tsc_hz, &mut stamps);
+        let (start, taken, end) = take_ticks(&lapic, count, tsc_hz, &mut stamps);
         let seen = stamps.get(..taken).unwrap_or(&[]);
         let run = apic::judge_ticks(start, seen, PROOF_TICKS as usize, period);
         if run.verdict != TickVerdict::Stalled || attempts == PROOF_ATTEMPTS {
-            break (run, taken);
+            // A short run lasted until its limit, not until its last interrupt.
+            let lasted = if (taken as u64) < PROOF_TICKS {
+                end.wrapping_sub(start)
+            } else {
+                run.elapsed
+            };
+            break (run, taken, lasted);
         }
         stalled_gap = stalled_gap.max(run.longest_gap);
     };
@@ -530,17 +536,15 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
         None
     };
     if run.verdict != TickVerdict::InBounds {
-        let _ = write!(
+        // Under the console's 160-byte line (the review's T66-R7).
+        let _ = writeln!(
             com1,
-            "origin-kernel: {taken} interrupts in {} us, expected {PROOF_TICKS} in {expected} us (median gap {} us, longest {} us, run {attempts} of {PROOF_ATTEMPTS}",
-            micros(run.elapsed),
+            "origin-kernel: {taken} ticks in {} us, not {PROOF_TICKS} in {expected} (median gap {} us, longest {} us, run {attempts} of {PROOF_ATTEMPTS}{}): APIC timer is wrong",
+            micros(lasted),
             micros(run.median_gap),
-            micros(run.longest_gap)
+            micros(run.longest_gap),
+            if repeated.is_some() { ", stalled" } else { "" }
         );
-        if repeated.is_some() {
-            let _ = write!(com1, ", after a stalled run");
-        }
-        let _ = writeln!(com1, "): APIC timer is wrong");
         return None;
     }
     let _ = write!(
@@ -569,8 +573,11 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
 /// Runs the APIC timer periodically with `count` and stamps each interrupt with the TSC at the
 /// poll that saw it, until `stamps` is full or two seconds pass, polling with interrupt windows
 /// (never halting, so a lost interrupt cannot hang the check). Returns the TSC at the start and
-/// how many interrupts were stamped. The timer is stopped again.
-fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> (u64, usize) {
+/// how many interrupts were stamped, and the TSC at the end. The timer is stopped again.
+fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> (u64, usize, u64) {
+    // An expiry a stopped run left pending is taken here, before the count starts, so that a
+    // repeated run cannot begin one interrupt ahead (the review's T66-R6).
+    cpu::interrupt_window();
     let before = cpu::ticks();
     let start = rdtsc();
     let limit = tsc_hz.saturating_mul(2); // two seconds
@@ -593,8 +600,9 @@ fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> (u
         }
         core::hint::spin_loop();
     }
+    let end = rdtsc();
     lapic.stop_timer();
-    (start, seen)
+    (start, seen, end)
 }
 
 /// One PIT channel-2 one-shot of `pit` input clocks, with the APIC timer counting down and

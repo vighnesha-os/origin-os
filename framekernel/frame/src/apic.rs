@@ -242,18 +242,21 @@ impl CalibrationWindow {
 /// stamped with the TSC at the poll that saw each, judged against the programmed period.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TickVerdict {
-    /// All of them came, within 95 % to 150 % of their nominal time.
+    /// All of them came, within 95 % to 150 % of their nominal time, and the median gap between
+    /// them is within 95 % to 150 % of the period.
     InBounds,
-    /// All of them came in under 95 % of their nominal time: the rate is wrong. A stall can
-    /// only make interrupts later, so this fails at once.
+    /// All of them came in under 95 % of their nominal time, or the median gap is under 95 % of
+    /// the period: the rate is wrong. A stall can only make interrupts later, and widens a few
+    /// gaps without narrowing the median, so this fails at once, whatever a stall did to the
+    /// total (the review's T66-R5).
     TooFast,
     /// Too slow, or too few, but the median gap between interrupts is within 95 % to 150 % of
     /// the period and some gap is two periods or more: expiries were merged while the
     /// processor was away (a virtual processor the host left unscheduled, or an SMI). The run
     /// says nothing about the rate and may be measured again.
     Stalled,
-    /// Too slow or too few, with nothing to show a stall: the rate is wrong, or the
-    /// interrupts do not come.
+    /// Too slow or too few, with nothing to show a stall, or a median gap over 150 % of the
+    /// period: the rate is wrong, or the interrupts do not come.
     Wrong,
 }
 
@@ -276,13 +279,19 @@ pub const MAX_TICK_STAMPS: usize = 64;
 /// the TSC at which each interrupt was seen (in order, at most [`MAX_TICK_STAMPS`] are used), the
 /// run wanted `wanted` of them, and the programmed period is `period` TSC ticks.
 ///
-/// The median gap decides the rate when the run is slow: a stall widens a few gaps and leaves
-/// the median where it was, and a wrong rate moves every gap. So a slow run can earn a repeat
-/// only with its median in bounds and a gap of two periods or more, and it never passes.
+/// It checks exactly this, in order: too fast, if all `wanted` came in under 95 % of their
+/// nominal time or the median gap is under 95 % of the period; wrong, if the median gap is over
+/// 150 %; in bounds, if all `wanted` came within 150 % of their nominal time; stalled, if some
+/// gap is two periods or more; else wrong. A stall widens a few gaps and leaves the median where
+/// it was, and a wrong rate moves every gap: so a slow run earns a repeat only with its median in
+/// bounds and a gap of two periods or more, and never passes, and a fast rate fails even where a
+/// stall made the total look right. Only the first `wanted` stamps are judged.
 #[must_use]
 pub fn judge_ticks(start: u64, stamps: &[u64], wanted: usize, period: u64) -> TickRun {
+    // The first `wanted` only: the run is judged against their nominal time (the review's
+    // T66-R4).
     let stamps = stamps
-        .get(..stamps.len().min(MAX_TICK_STAMPS))
+        .get(..stamps.len().min(wanted).min(MAX_TICK_STAMPS))
         .unwrap_or(&[]);
     let mut gaps = [0u64; MAX_TICK_STAMPS];
     let mut previous = start;
@@ -296,16 +305,17 @@ pub fn judge_ticks(start: u64, stamps: &[u64], wanted: usize, period: u64) -> Ti
     let median_gap = gaps.get(gaps.len() / 2).copied().unwrap_or(0);
     let elapsed = stamps.last().map_or(0, |&last| last.saturating_sub(start));
     let nominal = period.saturating_mul(wanted as u64);
+    let median_fast = median_gap < period / 100 * 95;
+    let median_slow = median_gap > period / 2 * 3;
     let verdict = if wanted == 0 || period == 0 || stamps.is_empty() {
         TickVerdict::Wrong
-    } else if stamps.len() >= wanted && elapsed < nominal / 100 * 95 {
+    } else if (stamps.len() >= wanted && elapsed < nominal / 100 * 95) || median_fast {
         TickVerdict::TooFast
+    } else if median_slow {
+        TickVerdict::Wrong
     } else if stamps.len() >= wanted && elapsed <= nominal / 2 * 3 {
         TickVerdict::InBounds
-    } else if median_gap >= period / 100 * 95
-        && median_gap <= period / 2 * 3
-        && longest_gap >= period.saturating_mul(2)
-    {
+    } else if longest_gap >= period.saturating_mul(2) {
         TickVerdict::Stalled
     } else {
         TickVerdict::Wrong
@@ -426,6 +436,41 @@ mod tests {
         // Too few, evenly spaced, no stall: the interrupts are slow or stop.
         let few = judge_ticks(0, &stamps(20, PERIOD, 20, 0), WANTED, PERIOD);
         assert_eq!(few.verdict, TickVerdict::Wrong);
+    }
+
+    #[test]
+    fn more_stamps_than_wanted_are_judged_on_the_first_wanted() {
+        // The review's T66-R4: 64 stamps at 75 % of the period, 50 wanted. Judged on all 64 the
+        // total looked in bounds; on the first 50 it is too fast.
+        let run = judge_ticks(0, &stamps(64, PERIOD * 3 / 4, 64, 0), WANTED, PERIOD);
+        assert_eq!(run.verdict, TickVerdict::TooFast);
+        assert_eq!(run.elapsed, 50 * PERIOD * 3 / 4);
+        // 64 at the period: in bounds, on the first 50.
+        let run = judge_ticks(0, &stamps(64, PERIOD, 64, 0), WANTED, PERIOD);
+        assert_eq!(
+            (run.verdict, run.elapsed),
+            (TickVerdict::InBounds, 50 * PERIOD)
+        );
+    }
+
+    #[test]
+    fn a_fast_tick_masked_by_a_stall_fails_on_its_median() {
+        // The review's T66-R5: twice the programmed rate with a 300 ms stall, whose total
+        // (550 ms) looks in bounds.
+        let run = judge_ticks(
+            0,
+            &stamps(WANTED, PERIOD / 2, 10, 300_000_000),
+            WANTED,
+            PERIOD,
+        );
+        assert_eq!(run.elapsed, 550_000_000);
+        assert_eq!(run.verdict, TickVerdict::TooFast);
+        // A slow median with a total in bounds is wrong too: 25 gaps of 1.6 periods.
+        let mut s = stamps(25, PERIOD / 2, 25, 0);
+        let last = *s.last().unwrap();
+        s.extend((1..=25).map(|i| last + i * PERIOD * 16 / 10));
+        let run = judge_ticks(0, &s, WANTED, PERIOD);
+        assert_eq!(run.verdict, TickVerdict::Wrong);
     }
 
     #[test]
