@@ -1067,12 +1067,23 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     ok
 }
 
+/// The preemption window, in each processor's own timer ticks: what 500 ms holds at 100 Hz.
+const WINDOW_TICKS: u64 = 50;
+/// How long the preemption window may last, in seconds, while some processor has not yet
+/// taken its [`WINDOW_TICKS`]: a budget, not a bound (ADR-0013 R1(b)). On a real machine the
+/// ticks take 500 ms. Under QEMU's software processor a virtual processor the host leaves
+/// unscheduled misses ticks (QEMU merges a periodic timer's expiries it was away for), and on
+/// the 65-processor machine a 500 ms window of the host's time held only 12 to 14 switches on
+/// one processor (TASKS item 66).
+const WINDOW_BUDGET_SECONDS: u64 = 10;
+
 /// Proves preemptive multitasking on every online processor: two non-yielding workers per
-/// processor run for 500 ms while the boot flow (itself one of the boot processor's
-/// contexts) waits. On each processor, both workers must have run there, with shares
-/// within a factor of two, over at least five full rounds of context switches. Then the
-/// rest of the thread proofs; each result goes into `proofs`, and `kernel_main` decides
-/// what they mean (ADR-0013). Fairness counts loop iterations, which a processor sharing a
+/// processor run while the boot flow (itself one of the boot processor's contexts) waits,
+/// until every processor has taken [`WINDOW_TICKS`] of its own timer ticks (500 ms on a real
+/// machine), within [`WINDOW_BUDGET_SECONDS`]. On each processor, both workers must have run
+/// there, with shares within a factor of two, over at least five full rounds of context
+/// switches. Then the rest of the thread proofs; each result goes into `proofs`, and
+/// `kernel_main` decides what they mean (ADR-0013). Fairness counts loop iterations, which a processor sharing a
 /// physical core skews with nothing wrong, so it is a separate result from preemption.
 pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: &mut Tally) {
     // Give every online processor's boot/idle context an FPU area before the baseline is
@@ -1159,16 +1170,38 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         }
     }
     let workers = 2 * cpus.len();
+    // The window: until every processor has taken 50 of its own ticks, so each of its three
+    // contexts (the boot or idle flow and two workers) is preempted and resumed many times
+    // whatever the host did with its virtual processor (TASKS item 66).
+    let ticks_before: alloc::vec::Vec<u64> =
+        cpus.iter().map(|id| queue_ticks_of(id.get())).collect();
+    let short_of_ticks = || {
+        cpus.iter()
+            .zip(&ticks_before)
+            .position(|(id, &before)| queue_ticks_of(id.get()).wrapping_sub(before) < WINDOW_TICKS)
+    };
     let start = rdtsc();
-    // A fixed window: 500 ms at 100 Hz is 50 ticks per processor, so each of its three
-    // contexts (the boot or idle flow and two workers) is preempted and resumed many times.
-    let window = tsc_hz / 2;
-    while rdtsc().wrapping_sub(start) < window {
+    let budget = tsc_hz.saturating_mul(WINDOW_BUDGET_SECONDS);
+    while short_of_ticks().is_some() && rdtsc().wrapping_sub(start) < budget {
         // Interrupts on only while halted: the timer may switch to a worker here, and this
         // flow resumes after `hlt` when its turn comes round again.
         cpu::idle_disabling();
     }
     let elapsed_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
+    // The window's length, judged by nothing: the rounds below are the verdict. A processor
+    // still short of its ticks at the budget is named; its own line then shows its switches.
+    let short = short_of_ticks().and_then(|i| cpus.get(i));
+    drop(ticks_before);
+    let _ = match short {
+        None => writeln!(
+            com1,
+            "origin-kernel: scheduler: the preemption window lasted {elapsed_ms} ms, until every processor had taken {WINDOW_TICKS} of its own ticks"
+        ),
+        Some(id) => writeln!(
+            com1,
+            "origin-kernel: scheduler: the preemption window reached its {WINDOW_BUDGET_SECONDS} s budget with CPU {id} short of {WINDOW_TICKS} of its own ticks"
+        ),
+    };
     let switches_at_stop: alloc::vec::Vec<u64> = cpus
         .iter()
         .map(|id| {
