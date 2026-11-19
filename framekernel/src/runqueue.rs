@@ -93,6 +93,67 @@ pub const fn judge_round_trips(mean_micros: u64, away_per_mille: u64) -> RoundTr
     }
 }
 
+/// The timed-wait boot proof's bounds (`wait::prove_timed`), in milliseconds: an unsignalled
+/// wait of [`TIMED_SHORT_MS`] must time out no earlier than its deadline and within
+/// [`TIMED_SHORT_LATE_MS`] of it; a wait of 2000 ms signalled early must return within
+/// [`TIMED_LONG_LIMIT_MS`].
+pub const TIMED_SHORT_MS: u64 = 50;
+pub const TIMED_SHORT_LATE_MS: u64 = 30;
+pub const TIMED_LONG_LIMIT_MS: u64 = 500;
+
+/// Ticks a waiter's processor may lose over its wait before the wait's lateness says nothing
+/// about the kernel: the weighted-share proof's threshold (`sched::TICKS_LOST_TO_A_STALL`). A
+/// timed wait sleeps whole ticks of its own processor (`sched::block_until`), so a late wait is
+/// a processor that lost ticks; losing three in a 50 ms wait needs its interrupts held off, or
+/// its virtual processor away, for 30 ms.
+pub const TIMED_TICKS_LOST: u64 = 3;
+
+/// One timed waiter's run, as the waiter measured it on its own processor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimedWait {
+    /// Milliseconds from its start to its return.
+    pub waited_ms: u64,
+    /// Its processor's timer ticks over the same time.
+    pub ticks: u64,
+}
+
+impl TimedWait {
+    /// The ticks its processor did not take over its wait, at `hz` ticks a second.
+    pub const fn ticks_lost(self, hz: u64) -> u64 {
+        (self.waited_ms * hz / 1000).saturating_sub(self.ticks)
+    }
+}
+
+/// Judges one run of the timed-wait proof's timing half (TASKS item 66). Only a run inside the
+/// bounds passes. A run that ended early fails. A run that is late passes nothing: it is
+/// measured again only if each late waiter shows a disturbance it cannot have made itself (its
+/// processor lost [`TIMED_TICKS_LOST`] ticks over its wait; or, for the signalled wait, whose
+/// lateness the boot flow's signal also decides, the boot flow went without a turn for
+/// [`DISTURBED_PER_MILLE`] of the run). Otherwise it fails at once.
+pub const fn judge_timed_waits(
+    short: TimedWait,
+    long: TimedWait,
+    away_per_mille: u64,
+    hz: u64,
+) -> RoundTrips {
+    if short.waited_ms < TIMED_SHORT_MS {
+        return RoundTrips::Fail;
+    }
+    let short_ok = short.waited_ms <= TIMED_SHORT_MS + TIMED_SHORT_LATE_MS;
+    let long_ok = long.waited_ms < TIMED_LONG_LIMIT_MS;
+    if short_ok && long_ok {
+        return RoundTrips::Pass;
+    }
+    let short_excused = short_ok || short.ticks_lost(hz) >= TIMED_TICKS_LOST;
+    let long_excused =
+        long_ok || long.ticks_lost(hz) >= TIMED_TICKS_LOST || away_per_mille >= DISTURBED_PER_MILLE;
+    if short_excused && long_excused {
+        RoundTrips::Repeat
+    } else {
+        RoundTrips::Fail
+    }
+}
+
 /// Why a request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueError {
@@ -448,6 +509,129 @@ impl RunQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wait of `waited_ms` on a processor that took `ticks` ticks over it.
+    const fn wait(waited_ms: u64, ticks: u64) -> TimedWait {
+        TimedWait { waited_ms, ticks }
+    }
+
+    const HZ: u64 = 100;
+
+    #[test]
+    fn a_timed_wait_in_bounds_passes_and_its_edges_hold() {
+        let long = wait(18, 1);
+        assert_eq!(
+            judge_timed_waits(wait(59, 5), long, 0, HZ),
+            RoundTrips::Pass
+        );
+        assert_eq!(
+            judge_timed_waits(wait(50, 5), long, 0, HZ),
+            RoundTrips::Pass
+        );
+        assert_eq!(
+            judge_timed_waits(wait(80, 8), long, 0, HZ),
+            RoundTrips::Pass
+        );
+        assert_eq!(
+            judge_timed_waits(wait(60, 6), wait(499, 49), 0, HZ),
+            RoundTrips::Pass
+        );
+        // Early is a fault a stall cannot make: it fails whatever the ticks.
+        assert_eq!(
+            judge_timed_waits(wait(49, 0), long, 1000, HZ),
+            RoundTrips::Fail
+        );
+    }
+
+    #[test]
+    fn a_late_wait_with_its_ticks_there_fails_at_once() {
+        // 81 ms with 8 ticks taken: none lost, so the kernel overslept.
+        assert_eq!(
+            judge_timed_waits(wait(81, 8), wait(18, 1), 0, HZ),
+            RoundTrips::Fail
+        );
+        assert_eq!(
+            judge_timed_waits(wait(122, 11), wait(18, 1), 0, HZ),
+            RoundTrips::Fail
+        );
+        // Two ticks lost is not enough to excuse it.
+        assert_eq!(
+            judge_timed_waits(wait(100, 8), wait(18, 1), 0, HZ),
+            RoundTrips::Fail
+        );
+        // The boot flow's absence excuses only the signalled wait, not the unsignalled one.
+        assert_eq!(
+            judge_timed_waits(wait(122, 11), wait(18, 1), 1000, HZ),
+            RoundTrips::Fail
+        );
+        // The signalled wait late with its ticks there and the boot flow present fails.
+        assert_eq!(
+            judge_timed_waits(wait(59, 5), wait(600, 60), 0, HZ),
+            RoundTrips::Fail
+        );
+    }
+
+    #[test]
+    fn a_late_wait_whose_processor_lost_ticks_is_measured_again() {
+        // The 122 ms of 2026-11-14 as a stall: 5 ticks in 122 ms, 7 lost.
+        assert_eq!(wait(122, 5).ticks_lost(HZ), 7);
+        assert_eq!(
+            judge_timed_waits(wait(122, 5), wait(18, 1), 0, HZ),
+            RoundTrips::Repeat
+        );
+        assert_eq!(
+            judge_timed_waits(wait(81, 5), wait(18, 1), 0, HZ),
+            RoundTrips::Repeat
+        );
+        // The signalled wait late: its processor's lost ticks, or the boot flow away.
+        assert_eq!(
+            judge_timed_waits(wait(59, 5), wait(600, 20), 0, HZ),
+            RoundTrips::Repeat
+        );
+        assert_eq!(
+            judge_timed_waits(wait(59, 5), wait(600, 60), DISTURBED_PER_MILLE, HZ),
+            RoundTrips::Repeat
+        );
+        // Both late, both excused.
+        assert_eq!(
+            judge_timed_waits(wait(150, 5), wait(700, 10), 0, HZ),
+            RoundTrips::Repeat
+        );
+        // Both late, one excused: fails.
+        assert_eq!(
+            judge_timed_waits(wait(150, 5), wait(700, 70), 0, HZ),
+            RoundTrips::Fail
+        );
+    }
+
+    #[test]
+    fn over_a_grid_only_a_wait_in_bounds_passes() {
+        for short in (0..300).step_by(7) {
+            for short_ticks in 0..30 {
+                for long in [5, 20, 499, 500, 900] {
+                    for long_ticks in [0, 1, 40, 90] {
+                        for away in [0, 99, 100, 900] {
+                            let verdict = judge_timed_waits(
+                                wait(short, short_ticks),
+                                wait(long, long_ticks),
+                                away,
+                                HZ,
+                            );
+                            let in_bounds = (50..=80).contains(&short) && long < 500;
+                            assert_eq!(
+                                verdict == RoundTrips::Pass,
+                                in_bounds,
+                                "{short} ms/{short_ticks}, {long} ms/{long_ticks}, {away}"
+                            );
+                            if short < 50 {
+                                assert_eq!(verdict, RoundTrips::Fail);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_lone_context_keeps_running() {

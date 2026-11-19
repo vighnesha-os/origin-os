@@ -428,7 +428,7 @@ pub(crate) fn current_user() -> Option<ObjectRef<UserContext>> {
 }
 
 /// This CPU's tick count, as its run queue sees it.
-fn queue_ticks() -> u64 {
+pub(crate) fn queue_ticks() -> u64 {
     queue_ticks_of(this_cpu())
 }
 

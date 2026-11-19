@@ -24,7 +24,10 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bootproof::{Proof, Tally};
-use crate::runqueue::{RoundTrips, judge_round_trips, per_mille};
+use crate::runqueue::{
+    RoundTrips, TIMED_LONG_LIMIT_MS, TIMED_SHORT_LATE_MS, TimedWait, judge_round_trips,
+    judge_timed_waits, per_mille,
+};
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::wait::{self, TimedOut};
 
@@ -230,11 +233,18 @@ static SOON_SET: AtomicBool = AtomicBool::new(false);
 /// Each timed waiter's result: milliseconds waited, plus 1 if it timed out, times 2
 /// (0: not finished).
 static TIMED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-const SHORT_MS: u64 = 50;
+/// Each timed waiter's processor's timer ticks over its wait, stored before [`TIMED`].
+static TIMED_TICKS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+const SHORT_MS: u64 = crate::runqueue::TIMED_SHORT_MS;
 const LONG_MS: u64 = 2000;
+/// Runs [`prove_timed`] may make: another only after a late run that shows a disturbance
+/// (`runqueue::judge_timed_waits`), each against the same bounds. A generous budget costs
+/// nothing where it is not used: an undisturbed boot pays for one run (TASKS item 66).
+const TIMED_ATTEMPTS: u32 = 8;
 
 extern "sysv64" fn timed_waiter(which: u64) -> ! {
     let start = crate::time::monotonic_nanos();
+    let ticks_at_start = sched::queue_ticks();
     let (queue, flag, ms) = if which == 0 {
         (&NEVER, &NEVER_SET, SHORT_MS)
     } else {
@@ -242,6 +252,10 @@ extern "sysv64" fn timed_waiter(which: u64) -> ! {
     };
     let result = queue.wait_until_deadline(|| flag.load(Ordering::Acquire), start + ms * 1_000_000);
     let waited = (crate::time::monotonic_nanos() - start) / 1_000_000;
+    let ticks = sched::queue_ticks().wrapping_sub(ticks_at_start);
+    if let Some(slot) = TIMED_TICKS.get(which as usize) {
+        slot.store(ticks, Ordering::Relaxed);
+    }
     if let Some(slot) = TIMED.get(which as usize) {
         slot.store(
             2 * waited + u64::from(result.is_err()) + 2,
@@ -252,51 +266,117 @@ extern "sysv64" fn timed_waiter(which: u64) -> ! {
     sched::exit()
 }
 
-/// A timed wait that nobody ends must time out at its deadline (within two ticks), and one
-/// that is signalled first must return then, long before its deadline.
-fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> Results {
-    let before = FINISHED.load(Ordering::Acquire);
-    let spawned = [
-        sched::spawn(far, timed_waiter, 0),
-        sched::spawn(far, timed_waiter, 1),
-    ];
-    if spawned.iter().any(Result::is_err) {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: wait queues: cannot spawn: wait queues failed"
-        );
-        return Results::FAILED;
+/// One run of the timed waits, as the waiters and the boot flow measured it.
+struct TimedRun {
+    /// Each waiter's result as [`TIMED`] holds it (0: not finished).
+    short: u64,
+    long: u64,
+    /// Each waiter's wait, with its processor's ticks.
+    short_wait: TimedWait,
+    long_wait: TimedWait,
+    /// How much of the run the boot flow went without a turn, in parts per thousand.
+    away: u64,
+}
+
+/// Starts the two timed waiters on `far`, signals the second after about 20 ms, and waits
+/// for both, at most [`sched::OTHERS_PATIENCE`] seconds; `None` if one could not be spawned.
+fn run_timed(far: CpuIndex, tsc_hz: u64) -> Option<TimedRun> {
+    for slot in TIMED.iter().chain(&TIMED_TICKS) {
+        slot.store(0, Ordering::Relaxed);
     }
+    SOON_SET.store(false, Ordering::Release);
+    let before = FINISHED.load(Ordering::Acquire);
+    sched::spawn(far, timed_waiter, 0).ok()?;
+    sched::spawn(far, timed_waiter, 1).ok()?;
+    let start = rdtsc();
     // Signal the second waiter after about 20 ms.
-    sched::yield_until(|| false, tsc_hz / 50, 1);
+    let mut away = sched::yield_until_away(|| false, tsc_hz / 50, 1);
     SOON_SET.store(true, Ordering::Release);
     SOON.wake_one();
-    sched::yield_until(|| FINISHED.load(Ordering::Acquire) == before + 2, tsc_hz, 4);
+    away += sched::yield_until_away(
+        || FINISHED.load(Ordering::Acquire) == before + 2,
+        tsc_hz,
+        sched::OTHERS_PATIENCE,
+    );
+    let elapsed = rdtsc().wrapping_sub(start);
     let read = |i: usize| TIMED.get(i).map_or(0, |t| t.load(Ordering::Acquire));
+    let wait_of = |result: u64, i: usize| TimedWait {
+        waited_ms: result.saturating_sub(2) / 2,
+        ticks: TIMED_TICKS.get(i).map_or(0, |t| t.load(Ordering::Relaxed)),
+    };
     let (short, long) = (read(0), read(1));
-    let finished = short != 0 && long != 0;
-    let (short_ms, short_timed_out) = (short.saturating_sub(2) / 2, short & 1 == 1);
-    let (long_ms, long_timed_out) = (long.saturating_sub(2) / 2, long & 1 == 1);
-    let correct = finished && short_timed_out && !long_timed_out;
-    let timely =
-        finished && (SHORT_MS..=SHORT_MS + 30).contains(&short_ms) && long_ms < LONG_MS / 4;
+    Some(TimedRun {
+        short,
+        long,
+        short_wait: wait_of(short, 0),
+        long_wait: wait_of(long, 1),
+        away: per_mille(away, elapsed),
+    })
+}
+
+/// A timed wait that nobody ends must time out at its deadline (within two ticks), and one
+/// that is signalled first must return then, long before its deadline.
+///
+/// A timed wait sleeps whole ticks of its own processor (`sched::block_until`). Under QEMU's
+/// software processor a virtual processor the host leaves unscheduled misses ticks, and the
+/// wait is late by as much: such a run says nothing about the kernel, and is measured again,
+/// at most [`TIMED_ATTEMPTS`] runs in all, each against the same bounds
+/// (`runqueue::judge_timed_waits`). A late run whose processor took its ticks fails at once,
+/// and so does an early one. Whether each wait timed out as it must is judged on every run.
+fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> Results {
+    let hz = crate::timer::HZ;
+    let mut attempts = 0;
+    let (run, correct, timely) = loop {
+        attempts += 1;
+        let Some(run) = run_timed(far, tsc_hz) else {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: wait queues: cannot spawn: wait queues failed"
+            );
+            return Results::FAILED;
+        };
+        let finished = run.short != 0 && run.long != 0;
+        let correct = finished && run.short & 1 == 1 && run.long & 1 == 0;
+        let verdict = if finished {
+            judge_timed_waits(run.short_wait, run.long_wait, run.away, hz)
+        } else {
+            RoundTrips::Fail
+        };
+        if !correct || verdict != RoundTrips::Repeat || attempts == TIMED_ATTEMPTS {
+            break (run, correct, verdict == RoundTrips::Pass);
+        }
+    };
     let ok = correct && timely;
-    if finished {
+    if run.short != 0 && run.long != 0 {
+        let (s, l) = (run.short_wait, run.long_wait);
         let _ = writeln!(
             com1,
-            "origin-kernel: wait queues: an unsignalled {SHORT_MS} ms timed wait timed out {short_timed_out} after {short_ms} ms; a {LONG_MS} ms timed wait signalled early returned in {long_ms} ms, timed out {long_timed_out}{}",
+            "origin-kernel: wait queues: an unsignalled {SHORT_MS} ms timed wait timed out {} after {} ms; a {LONG_MS} ms timed wait signalled early returned in {} ms, timed out {}; their processor lost {} and {} ticks (bounds {SHORT_MS} to {} ms and under {TIMED_LONG_LIMIT_MS} ms), run {attempts} of {TIMED_ATTEMPTS}{}{}",
+            run.short & 1 == 1,
+            s.waited_ms,
+            l.waited_ms,
+            run.long & 1 == 1,
+            s.ticks_lost(hz),
+            l.ticks_lost(hz),
+            SHORT_MS + TIMED_SHORT_LATE_MS,
+            if attempts > 1 {
+                " (after a stalled run)"
+            } else {
+                ""
+            },
             if ok { "" } else { ": wait queues failed" }
         );
     } else {
         let _ = writeln!(
             com1,
-            "origin-kernel: wait queues: timed waits did not return within 4 s (the {SHORT_MS} ms one {}, the {LONG_MS} ms one {}): wait queues failed",
-            if short == 0 {
+            "origin-kernel: wait queues: timed waits did not return within {} s (the {SHORT_MS} ms one {}, the {LONG_MS} ms one {}): wait queues failed",
+            sched::OTHERS_PATIENCE,
+            if run.short == 0 {
                 "still waiting"
             } else {
                 "returned"
             },
-            if long == 0 {
+            if run.long == 0 {
                 "still waiting"
             } else {
                 "returned"
