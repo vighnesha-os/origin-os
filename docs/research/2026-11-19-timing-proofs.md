@@ -74,7 +74,18 @@ Twenty boots of the usual series on `0df830a8`, 2026-11-19 16:11 to 16:32 UTC, i
 
   The logs are in `t66-evidence/answers2-rounds.tar.gz` (rounds `ev8` and `ev9`, with the window diagnostic's patch) and `t66-evidence/r13-diagnostic.tar.gz` (`ev7`), in the coordination notes.
 - **The margin is thin, and it is the machines' own speed.** The latest 15th switch on a passing idle run of the large machines was 259 to 491 ms, against the 500 ms bound: 65 or 67 guest processors, all running the proof's workers at once, on the development Mac's 10 threads. It is not a defect, and nothing under KVM or on a physical machine is expected near it. There, as ruled, any repeat is a finding for qualification review.
-- **The budget** (the coordinating session's ruling of 2026-11-19): the window may run 8 times, not 4, as the timed waits may; the longest episode seen covered 4 runs, about 15 to 20 s. The 500 ms bound and the rule are unchanged: a run is measured again only for a late 15th switch with a gap of two periods, never passed, and only after its correctness clauses held. If the gates still fail the window at 8, at their own load, the figures go back to the coordinating session.
+- **The budget, first 8 runs** (the coordinating session's ruling of 2026-11-19): the longest episode then seen covered 4 runs, about 15 to 20 s.
+- **Then a budget of time** (its ruling of 2026-11-20). On `734d36bb` the gates' `boot-matrix` failed the 67-processor machine's window stalled in all 8 runs, with gaps of 251 to 686 ms and 15th switches at 526 to 999 ms, while its tick proof passed at run 1. Over 46 boots of the large machines on the final rule (`ev8`, `ev9`, `ev11` and that `boot-matrix`), at idle or the gates' own load:
+
+  | Window runs a boot needed | Boots |
+  |---|---|
+  | 1 | 41 |
+  | 2 to 4, then passed | 2 (`ev8` intel-65.2, `ev11` sparse-67.3) |
+  | failed at 4 (the budget then) | 1 (`ev8` intel-65.1) |
+  | failed at 8 | 1 (the gates' `boot-matrix`, the 67-processor machine) |
+
+  An episode outlasting 8 runs came once in about 46 boots, in the gate itself, so a count was not enough. The window now repeats within 120 s of wall time from the first run's start, at most 32 runs, each after a 2 s pause with every processor idle so that an episode can pass. The 500 ms bound and the rule are unchanged: a run is measured again only for a late 15th switch with a gap of two periods, never passed, and only after its correctness clauses held. The cost is up to about 120 s more boot time on a stalled large software-processor machine, and nothing on an unstalled one; xtask's boot timeout for those machines, 242 and 246 s, leaves room. If a gate still fails at 120 s, the next step is the owner's: a re-run of the whole boot on the named machines, as decision item 314 did for lost stacks.
+- **The idle round on `734d36bb`** (`ev11`, 10 large boots, host load average 21 to 30): all passed; nine needed 1 run of the window and one 4. Every tick proof passed at run 1, its period 996,186 to 1,003,551 ppm of nominal, from 1 to 14 pairs. Logs: `t66-evidence/final-gates-734d36bb.tar.gz`.
 - **At ten busy loops** both large machines were refused, as before TASKS item 66: the 65-processor machine at the window, the 67-processor machine at the tick proof, slow in all 4 runs (1,093 to 1,262 ms for 50) with its count's period in bounds.
 - **Extended waits were said:** the preemption workers' exit up to 3,959 ms at load 3 and 11,313 ms at load 10.
 

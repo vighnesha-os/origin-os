@@ -5389,7 +5389,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
     - `runqueue.rs`: R3's four timed-wait tests restored (T66-R12); `TickWatch::switches_from`, `at_switches` and `note_switches`, and `RunQueue::note_switches`: the 15th context switch stamped (T66-R15).
     - `sched.rs`: `with_queue` stamps the switches (T66-R15); `RUN`, `worker_arg`, `workers_on`, `run_correct`, and `EXITED` per run: every run judged on correctness first, a repeat only after every worker exited (T66-R11); `timer_read_back` against the timed registers (T66-R14).
     - `wait.rs`: every timed-wait run past 4 s says so (T66-R16).
-    - `sched.rs`: `PREEMPTION_ATTEMPTS` 8, as ruled after the evidence of the stalls' episodes.
+    - `sched.rs`: `PREEMPTION_ATTEMPTS` 8, as ruled after the evidence of the stalls' episodes; since `7e959146` a budget of time instead, `runqueue::window_again` (120 s from the first run's start, at most 32 runs, a 2 s idle pause between runs), after an episode outlasted 8 runs in the gates' `boot-matrix`.
 - **Why:** the addendum review found that a stalled preemption run was repeated without its correctness clauses (R11), that R3's tests had been deleted (R12), that a fast tick masked by recurring stalls passed the tick proof (R13), that "as timed" was rebuilt rather than read (R14), that the rounds clause stamped ticks, not switches (R15), and that one extension went unsaid (R16).
 - **Specifications:** the Intel SDM, Volume 3A's chapter on the APIC (the current count register, read as calibration reads it), as `apic.rs` already cites it. None new.
 - **Architecture:** ADR-0013 R1, R3 and R8 (unchanged); Amendments 2 and 3 (unchanged; item 316).
