@@ -608,10 +608,22 @@ impl<H: Host> Interpreter<H> {
             let kept = core::mem::take(&mut ctx.created);
             mem::release(kept, &mut self.budget);
         }
-        self.unwind(at, l.calls, l.owners);
         // What the table's code took goes with the table, each release reported: the evaluation
-        // goes on, so this is an end other than its own (G2; the review of B5, B5-R9).
-        self.release_reported(l.held);
+        // goes on, so this is an end other than its own (G2; the review of B5, B5-R9). Before the
+        // unwind, which removes the table's names, so that a mutex or a method the table declared
+        // is named in its report (the review of B5's answers, B5-R12). Planted
+        // (`ReleaseAfterUnwind`), after it.
+        #[cfg(test)]
+        let late = crate::tests::planted(crate::tests::Fault::ReleaseAfterUnwind);
+        #[cfg(not(test))]
+        let late = false;
+        if !late {
+            self.release_reported(l.held);
+        }
+        self.unwind(at, l.calls, l.owners);
+        if late {
+            self.release_reported(l.held);
+        }
         self.pending = None;
         self.run.depth = l.depth;
         self.fail_table(l.table);

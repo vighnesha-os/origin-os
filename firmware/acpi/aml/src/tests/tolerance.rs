@@ -623,13 +623,45 @@ fn a_failed_runtime_load_reports_what_it_releases() {
 }
 
 #[test]
+fn a_failed_runtime_loads_own_mutex_is_reported_by_name() {
+    // The review of B5's answers, B5-R12 (its probe Q4): a run-time table declares `\TMX` and a
+    // method `\TK` that takes it, calls `TK` from its table level, and then fails whole (a
+    // reserved opcode). The release is reported before the table's names are removed, so the
+    // report names both the mutex and the method that took it.
+    let bad = ssdt(&[
+        mutex("TMX", 0),
+        method("TK", 0, &[acquire(nm("\\TMX"), 0xFFFF)]),
+        nm("TK"),
+        vec![0x02],
+    ]);
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            name("TB", buffer_of(&bad)),
+            method("LD", 0, &[ret(load_op("TB", zero()))]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(int(&mut i, "LD"), 0);
+    assert_eq!(
+        told(&mut i),
+        vec![Told::Released(vec![*b"TMX_"], vec![*b"TK__"])]
+    );
+    assert!(i.held.is_empty());
+    assert!(i.table(1).unwrap().failed);
+    assert!(!exists(&i, "\\TMX") && !exists(&i, "\\TK"));
+}
+
+#[test]
 fn planted_faults_are_caught_by_the_release_tests() {
-    let tests: [Control; 2] = [
+    let tests: [Control; 3] = [
         (
             None,
             &[
                 a_mutex_a_method_declared_is_held_past_its_names,
                 a_failed_runtime_load_reports_what_it_releases,
+                a_failed_runtime_loads_own_mutex_is_reported_by_name,
             ],
         ),
         (
@@ -637,7 +669,12 @@ fn planted_faults_are_caught_by_the_release_tests() {
             &[
                 a_mutex_a_method_declared_is_held_past_its_names,
                 a_failed_runtime_load_reports_what_it_releases,
+                a_failed_runtime_loads_own_mutex_is_reported_by_name,
             ],
+        ),
+        (
+            Some(Fault::ReleaseAfterUnwind),
+            &[a_failed_runtime_loads_own_mutex_is_reported_by_name],
         ),
     ];
     for (f, cases) in tests {
@@ -1149,6 +1186,7 @@ fn every_tolerance_test_fails_without_its_reports() {
         a_place_naming_a_method_in_a_body_does_not_run_past_it,
         a_mutex_a_method_declared_is_held_past_its_names,
         a_failed_runtime_load_reports_what_it_releases,
+        a_failed_runtime_loads_own_mutex_is_reported_by_name,
         a_skip_whose_work_list_reaches_the_memory_limit_fails_the_table_whole,
         unbound_element_is_empty_and_reported,
         initialize_binds_first,

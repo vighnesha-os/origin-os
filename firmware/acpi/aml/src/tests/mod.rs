@@ -489,6 +489,9 @@ pub(crate) enum Fault {
     MarkAbandoned,
     /// A failed run-time load leaves its names unbound (`load.rs`, `fail_load`).
     NoFailedPass,
+    /// A failed run-time load reports its releases after its names are removed, as before the
+    /// review of B5's answers, B5-R12 (`load.rs`, `fail_load`).
+    ReleaseAfterUnwind,
     /// A string byte above 0x7F fails the table, as before step B5 (`engine.rs`,
     /// `decode_string`).
     RefuseHighBytes,
