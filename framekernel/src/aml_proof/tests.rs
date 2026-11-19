@@ -661,6 +661,29 @@ fn an_xsdt_entry_that_cannot_be_read_fails_the_proof() {
 }
 
 #[test]
+fn a_tolerance_on_qemus_tables_fails_the_proof() {
+    // TASKS item 63, step B5 (Q9): `XTRA` twice, the second a duplicate the load abandons and
+    // reports; the table loads, and the report fails the proof, printed.
+    let mut m = Machine::new(qemu_dsdt(&[]));
+    m.ssdts.push(table(
+        b"SSDT",
+        1,
+        &[name("XTRA", one()), name("XTRA", one())],
+    ));
+    let (found, out) = m.run();
+    assert_eq!(
+        found.failed,
+        Some("a tolerance was reported on QEMU's own tables"),
+        "{out}"
+    );
+    assert!(
+        out.contains("tolerated 1 time(s); the first: a statement abandoned at table 1 offset 0x6 (Duplicate)"),
+        "{out}"
+    );
+    assert_eq!(found.tables, 2, "{out}");
+}
+
+#[test]
 fn a_definition_block_that_does_not_load_fails_the_proof() {
     let mut m = Machine::new(qemu_dsdt(&[]));
     // A reserved opcode after `XTRA`: the parser cannot step past it, and the table is rolled
