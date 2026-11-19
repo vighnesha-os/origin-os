@@ -207,7 +207,7 @@ What the tables show:
 
 Its grammar's failing load-time statements gain failing `If` and `While` predicates, an unterminated string with a byte above 0x7F inside a scope, a package with extra elements, one of them a package of names, and a place naming a method that takes an argument (B5-R1). `SkipCallsInPlaces` and `SilentRelease` join its planted faults. Every host test of a tolerance fails with `NoReport` planted, each in a run of its own (B5's contract §4).
 
-**G15, ruled again** (the hand-over's point 1; the coordinating session's rulings of 2026-11-19). ACPI 6.6 Table 19.7 (PDF pages 1007 and 1009, read again that day), in Origin's words:
+**G15, ruled again** (the hand-over's point 1; the coordinating session's rulings of 2026-11-19). ACPI 6.6 Table 19.7 (the Buffer row on PDF page 1008, printed 937, and the String row on PDF page 1010, printed 939, pages counted from 1 as §5 counts them; read again that day, the pages corrected by the review of B5's answers, B5-R13), in Origin's words:
 - **Buffer to Field Unit:** the whole buffer goes into the field. A buffer with more bits than the field is split into field-sized pieces, each written to the field in turn, the lowest first. A piece, or a whole buffer, shorter than the field is zero-extended first.
 - **String to Field Unit:** each character goes to the field in turn, from the first. A field narrower than 8 bits loses each character's upper bits; a wider one has the bits above it zeroed.
 
@@ -221,7 +221,7 @@ Ledger 64 §3 G15 says ACPICA writes a string's bytes as one buffer, cut to the 
 
 **Two stated limits** (raised with the coordinating session and ruled the same day: kept as built). Origin differs from ACPICA only where the data is longer than the field in whole bytes, which is exactly where `Pieces` reports, so every departure from the deployed interpreter shows on real firmware. Following the bit rule into fields that are not whole bytes would add a second difference, a silent one: a one-byte buffer into a 1-bit control field would make eight hardware writes, keeping the last bit, where ACPICA makes one. Nothing on record says firmware relies on that, and it is a hazard to hardware of its own.
 - **Into a field that is not a whole number of bytes,** Origin departs from the letter of Table 19.7's Buffer row ("larger in bits") and matches ACPICA's cut, unless the data is longer in whole bytes. The step this makes: one byte into a 4-bit field is one write, cut; two bytes make four pieces.
-- **Strings follow buffers,** so the String row holds exactly only for fields of 8 bits. Into a narrower field a one-character string is one write, its upper bits lost, as that row says; `"AB"` into a 4-bit field is four writes where the row gives two.
+- **Strings follow buffers,** so the String row holds exactly only for fields of 8 bits. Into a narrower field a one-character string is one write, its upper bits lost, as that row says; `"AB"` into a 4-bit field is four writes where the row gives two. Into a wider field a string that fits departs from the row too (found by the review of B5's answers, B5-R13): `"AB"` into a 16-bit field is one write, 0x4241, where the row gives two, a character each, leaving 0x0042.
 - **A `Pieces` report seen on real firmware is a finding,** and this choice is revisited with that evidence.
 
 **`Load` and `LoadTable`: what step B4 built, and its strict choices** (S1 §19.6.77 and §19.6.78, PDF 1070 and 1071, read again on 2026-11-18; B4's contract, accepted with its twelve questions as recommended the same day). Paraphrased:
