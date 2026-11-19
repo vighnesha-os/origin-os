@@ -213,8 +213,8 @@ pub fn relied_on(table: &[u8]) -> u32 {
 
 /// The firmware's structures that change after boot, as the kernel's first table lookup located
 /// them and recorded them as never lent (TASKS item 71): each with its range, inclusive, what the
-/// registry could not keep or found lent before, and why not all were located. Its gaps are
-/// counted in [`Findings::guard_gaps`].
+/// registry could not keep or found lent before, and why not all were located, naming the first
+/// structure passed over. Its gaps are counted in [`Findings::guard_gaps`].
 struct NeverLent<'c>(&'c ChangingRanges, Never);
 
 impl core::fmt::Display for NeverLent<'_> {
@@ -245,6 +245,14 @@ impl core::fmt::Display for NeverLent<'_> {
         }
         if let Some(why) = self.0.unlocated {
             write!(f, "; not all located: {why}")?;
+        }
+        if let Some((kind, base, end)) = self.0.passed_over {
+            write!(
+                f,
+                " ({} {base:#x}-{:#x} not recorded)",
+                kind.name(),
+                end.saturating_sub(1)
+            )?;
         }
         Ok(())
     }
@@ -1042,8 +1050,9 @@ mod tests {
     }
 
     /// The review of TASKS item 71, T71-1 (b): each gap in what the first lookup recorded fails
-    /// the verdict, though nothing else does: a range lent before that overlaps the FACS, and no
-    /// room left in the registry for it.
+    /// the verdict, though nothing else does: a range lent before that overlaps the FACS; no room
+    /// left in the registry for it; and a structure passed over (T71-2), here an FBPT whose length
+    /// would cover a table the kernel lends.
     #[test]
     fn a_gap_in_what_was_located_fails_the_census() {
         let mut m = Machine::new();
@@ -1072,6 +1081,34 @@ mod tests {
         let (ok, out, _) = m.run();
         assert!(!ok, "{out}");
         assert!(out.contains("0 kept, 1 not kept for want of room"), "{out}");
+        assert!(
+            last_line(&out).contains(", 1 gaps in locating it;"),
+            "{out}"
+        );
+
+        let pointer = |address: u64| {
+            let mut r = vec![0u8, 0, 16, 1, 0, 0, 0, 0];
+            r.extend_from_slice(&address.to_le_bytes());
+            r
+        };
+        let mut m = Machine::new();
+        let mut fbpt = b"FBPT".to_vec();
+        fbpt.extend_from_slice(&0x1100u32.to_le_bytes());
+        fbpt.extend_from_slice(&[2, 0, 48, 2]);
+        fbpt.extend_from_slice(&[0; 44]);
+        m.put(FPDT, &table(b"FPDT", 1, &pointer(FBPT)));
+        m.put(FBPT, &fbpt);
+        m.put(OEM, &table(b"OEMX", 1, &[]));
+        m.entries.extend([FPDT, OEM]);
+        let (ok, out, _) = m.run();
+        assert!(!ok, "{out}");
+        assert!(
+            out.contains(
+                "not all located: a structure the firmware changes overlaps a table the kernel \
+                 lends (FBPT 0x7f005000-0x7f0060ff not recorded)"
+            ),
+            "{out}"
+        );
         assert!(
             last_line(&out).contains(", 1 gaps in locating it;"),
             "{out}"

@@ -709,6 +709,16 @@ pub fn facs_pointers(bytes: &[u8]) -> [u64; 2] {
     [b.u64(132).unwrap_or(0), u64::from(b.u32(36).unwrap_or(0))]
 }
 
+/// Both of a FADT's pointers to the DSDT, `X_DSDT` and `DSDT`, read as [`facs_pointers`] reads
+/// the FACS's: for the reader that locates the structures the firmware changes, which must not
+/// record one over the DSDT the kernel lends (the review of TASKS item 71, T71-2), and chooses as
+/// [`Fadt::dsdt_address`] does.
+#[must_use]
+pub fn dsdt_pointers(bytes: &[u8]) -> [u64; 2] {
+    let b = Bytes::new(bytes, crate::Signature::new(b"FACP"));
+    [b.u64(140).unwrap_or(0), u64::from(b.u32(40).unwrap_or(0))]
+}
+
 /// The 64-bit value if present and not zero, else the 32-bit one if not zero.
 fn prefer(wide: Option<u64>, narrow: u32) -> Option<u64> {
     wide.filter(|&w| w != 0)
@@ -1078,5 +1088,10 @@ pub(crate) mod tests {
         assert_eq!(facs_pointers(&t[..39]), [0, 0]);
         let t = edited(|t| put(t, 132, &0x7F00_0040u64.to_le_bytes()));
         assert_eq!(facs_pointers(&t), [0x7F00_0040, 0x7FFE_0000]);
+        // The DSDT's two pointers, the same way (T71-2).
+        let t = fadt();
+        assert_eq!(dsdt_pointers(&t), [0x7FFD_0000, 0x7FFD_0000]);
+        assert_eq!(dsdt_pointers(&t[..147]), [0, 0x7FFD_0000]);
+        assert_eq!(dsdt_pointers(&t[..43]), [0, 0]);
     }
 }
