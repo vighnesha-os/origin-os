@@ -133,7 +133,9 @@ pub struct Findings {
     pub lendable_changing: u32,
     /// Gaps in what the kernel's first lookup located and recorded as never lent: a structure
     /// not located or passed over, one the registry had no room for, and a range lent before one
-    /// of them (the review of TASKS item 71, T71-1). Any fails the verdict.
+    /// of them (the review of TASKS item 71, T71-1); and each structure recorded that meets a
+    /// table the kernel lends, over its minimum or cut short at it (the addendum review, T71-9).
+    /// Any fails the verdict.
     pub guard_gaps: u32,
     /// XSDT entries that were zero, which name no table (the review's F8).
     pub null_entries: u32,
@@ -212,9 +214,10 @@ pub fn relied_on(table: &[u8]) -> u32 {
 }
 
 /// The firmware's structures that change after boot, as the kernel's first table lookup located
-/// them and recorded them as never lent (TASKS item 71): each with its range, inclusive, what the
-/// registry could not keep or found lent before, and why not all were located, naming the first
-/// structure passed over. Its gaps are counted in [`Findings::guard_gaps`].
+/// them and recorded them as never lent (TASKS item 71): each with its range, inclusive, and the
+/// tables the kernel lends that it meets (the addendum review, T71-9); what the registry could
+/// not keep or found lent before; and why not all were located, naming the first structure passed
+/// over. Its gaps are counted in [`Findings::guard_gaps`].
 struct NeverLent<'c>(&'c ChangingRanges, Never);
 
 impl core::fmt::Display for NeverLent<'_> {
@@ -223,7 +226,9 @@ impl core::fmt::Display for NeverLent<'_> {
         if self.0.ranges().is_empty() {
             f.write_str(" none named")?;
         }
-        for (i, &(kind, base, end)) in self.0.ranges().iter().enumerate() {
+        for (i, (&(kind, base, end), met)) in
+            self.0.ranges().iter().zip(self.0.overlaps()).enumerate()
+        {
             let sep = if i == 0 { " " } else { ", " };
             write!(
                 f,
@@ -231,6 +236,25 @@ impl core::fmt::Display for NeverLent<'_> {
                 kind.name(),
                 end.saturating_sub(1)
             )?;
+            if met.tables != 0 {
+                write!(
+                    f,
+                    " (declared to {:#x}, over {} lent tables",
+                    met.declared_end.saturating_sub(1),
+                    met.tables
+                )?;
+                if let Some((b, e)) = met.over_minimum {
+                    write!(
+                        f,
+                        "; its least under {b:#x}-{:#x}, never lent",
+                        e.saturating_sub(1)
+                    )?;
+                }
+                if let Some((b, e)) = met.trimmed_at {
+                    write!(f, "; cut at {b:#x}-{:#x}, lent", e.saturating_sub(1))?;
+                }
+                f.write_str(")")?;
+            }
         }
         write!(f, "; {} kept", self.1.recorded)?;
         if self.1.untracked != 0 {
@@ -568,6 +592,7 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
     let changing = fw.changing();
     if let Some((located, kept)) = &changing {
         found.guard_gaps = u32::from(located.unlocated.is_some())
+            .saturating_add(u32::try_from(located.met()).unwrap_or(u32::MAX))
             .saturating_add(u32::try_from(kept.untracked).unwrap_or(u32::MAX))
             .saturating_add(u32::from(kept.already_lent.is_some()));
     }
@@ -1051,8 +1076,8 @@ mod tests {
 
     /// The review of TASKS item 71, T71-1 (b): each gap in what the first lookup recorded fails
     /// the verdict, though nothing else does: a range lent before that overlaps the FACS; no room
-    /// left in the registry for it; and a structure passed over (T71-2), here an FBPT whose length
-    /// would cover a table the kernel lends.
+    /// left in the registry for it; and a structure that meets a table the kernel lends, here an
+    /// FBPT whose length would cover one, recorded up to it (the addendum review, T71-9).
     #[test]
     fn a_gap_in_what_was_located_fails_the_census() {
         let mut m = Machine::new();
@@ -1100,17 +1125,57 @@ mod tests {
         m.put(FBPT, &fbpt);
         m.put(OEM, &table(b"OEMX", 1, &[]));
         m.entries.extend([FPDT, OEM]);
-        let (ok, out, _) = m.run();
+        let (ok, out, lent) = m.run();
         assert!(!ok, "{out}");
         assert!(
             out.contains(
-                "not all located: a structure the firmware changes overlaps a table the kernel \
-                 lends (FBPT 0x7f005000-0x7f0060ff not recorded)"
+                "FBPT 0x7f005000-0x7f005fff (declared to 0x7f0060ff, over 1 lent tables; cut at \
+                 0x7f006000-0x7f006023, lent); 2 kept; a lend over each refused: true"
+            ),
+            "{out}"
+        );
+        assert!(lent.contains(&OEM), "{lent:x?}");
+        assert!(
+            last_line(&out).contains(", 1 gaps in locating it;"),
+            "{out}"
+        );
+    }
+
+    /// The addendum review of TASKS item 71, T71-9 and its probe P4: a listed table whose
+    /// declared length runs over the FACS, from 0x80 bytes before it. The FACS is recorded at its
+    /// 64 bytes and the table reported; the census's lend of that table is refused and named, no
+    /// lend over the FACS is made, and the verdict fails.
+    #[test]
+    fn a_table_over_the_facs_is_refused_and_fails_the_census() {
+        let mut m = Machine::new();
+        // The table holds the FACS's bytes, and its checksum counts them: a valid table.
+        let mut oem = table(b"OEMX", 1, &[0u8; 0x100 - 36]);
+        let at = usize::try_from(FACS - BASE).unwrap();
+        oem[0x80..0xC0].copy_from_slice(&m.memory[at..at + 64]);
+        seal(&mut oem);
+        m.put(FACS - 0x80, &oem);
+        m.entries.push(FACS - 0x80);
+        let (ok, out, lent) = m.run();
+        assert!(!ok, "{out}");
+        assert!(
+            out.contains(
+                "FACS 0x7f003000-0x7f00303f (declared to 0x7f00303f, over 1 lent tables; its \
+                 least under 0x7f002f80-0x7f00307f, never lent); 1 kept; a lend over each \
+                 refused: true"
             ),
             "{out}"
         );
         assert!(
-            last_line(&out).contains(", 1 gaps in locating it;"),
+            out.contains("an XSDT entry: not readable: refused by the lending registry"),
+            "{out}"
+        );
+        assert!(!lent.contains(&(FACS - 0x80)), "{lent:x?}");
+        assert!(
+            lent.iter().all(|&a| !(FACS - 0x80..FACS + 64).contains(&a)),
+            "{lent:x?}"
+        );
+        assert!(
+            last_line(&out).contains(", 1 not readable,") && last_line(&out).contains(", 1 gaps"),
             "{out}"
         );
     }

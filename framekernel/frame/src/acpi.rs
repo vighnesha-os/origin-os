@@ -249,6 +249,35 @@ impl Changing {
             Self::Mbpt => "MBPT",
         }
     }
+
+    /// The least it can be, by its fixed part, which is guarded whatever overlaps it (the
+    /// addendum review of TASKS item 71, T71-9): a FACS is 64 bytes or more (§5.2.10, Table
+    /// 5.13); an FBPT's and an S3PT's header is their signature and length, 8 bytes (§5.2.24.8
+    /// and §5.2.24.10, Tables 5.129 and 5.131); an MBPT's header adds a controller ID and a
+    /// timestamp domain ID, 24 bytes (§5.2.24.11, Table 5.134).
+    pub const fn minimum(self) -> u64 {
+        match self {
+            Self::Facs => 64,
+            Self::Mbpt => 24,
+            Self::Fbpt | Self::S3pt => 8,
+        }
+    }
+}
+
+/// The tables the kernel lends that a recorded structure meets (the addendum review of TASKS
+/// item 71, T71-9): each is reported, and any fails the census.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Overlaps {
+    /// The structure's end as its length field declares it, at least its minimum.
+    pub declared_end: u64,
+    /// The first lent table that overlaps the structure's minimum ([`Changing::minimum`]). The
+    /// minimum stays guarded, so that table cannot be lent.
+    pub over_minimum: Option<(u64, u64)>,
+    /// The lent table, starting inside the declared extent beyond the minimum, at whose start
+    /// the recorded range ends. That table stays lendable.
+    pub trimmed_at: Option<(u64, u64)>,
+    /// How many lent tables overlap the declared extent.
+    pub tables: u32,
 }
 
 /// The most structures [`changing_ranges`] keeps, which is the most the rule it follows allows:
@@ -276,6 +305,7 @@ const CHANGING_FPDT_MAX: usize = 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChangingRanges {
     ranges: [(Changing, u64, u64); CHANGING_MAX],
+    overlaps: [Overlaps; CHANGING_MAX],
     count: usize,
     /// Why not every such structure the tables name was located and recorded, if one was not:
     /// part of the tables could not be read, or a structure was passed over ([`Self::passed_over`]).
@@ -284,7 +314,9 @@ pub struct ChangingRanges {
     /// reason found is kept.
     pub unlocated: Option<&'static str>,
     /// The first structure found and not recorded, with the range it would have had: its pointer
-    /// names no structure of its kind, or it overlaps a table the kernel lends (T71-2).
+    /// names no structure of its kind (T71-2), or its minimum runs past the address space. A
+    /// structure that overlaps a table the kernel lends is recorded, never passed over
+    /// ([`Self::overlaps`]; the addendum review, T71-9).
     pub passed_over: Option<(Changing, u64, u64)>,
 }
 
@@ -292,6 +324,12 @@ impl ChangingRanges {
     const fn new() -> Self {
         Self {
             ranges: [(Changing::Facs, 0, 0); CHANGING_MAX],
+            overlaps: [Overlaps {
+                declared_end: 0,
+                over_minimum: None,
+                trimmed_at: None,
+                tables: 0,
+            }; CHANGING_MAX],
             count: 0,
             unlocated: None,
             passed_over: None,
@@ -301,6 +339,25 @@ impl ChangingRanges {
     /// Each structure found, with its range `[base, end)`.
     pub fn ranges(&self) -> &[(Changing, u64, u64)] {
         self.ranges.get(..self.count).unwrap_or(&[])
+    }
+
+    /// What each recorded structure met among the tables the kernel lends, in the order of
+    /// [`Self::ranges`] (the addendum review of TASKS item 71, T71-9).
+    pub fn overlaps(&self) -> &[Overlaps] {
+        self.overlaps.get(..self.count).unwrap_or(&[])
+    }
+
+    /// How many recorded structures meet a table the kernel lends: each is reported, and fails
+    /// the census (T71-9).
+    pub fn met(&self) -> usize {
+        self.overlaps().iter().filter(|o| o.tables != 0).count()
+    }
+
+    /// Whether a structure of `kind` at `base` is recorded already.
+    fn has(&self, kind: Changing, base: u64) -> bool {
+        self.ranges()
+            .iter()
+            .any(|&(k, b, _)| k == kind && b == base)
     }
 
     /// Notes why not everything was located, unless a reason is already noted.
@@ -314,21 +371,18 @@ impl ChangingRanges {
         self.passed_over = self.passed_over.or(Some(range));
     }
 
-    fn push(&mut self, (kind, base, end): (Changing, u64, u64)) {
-        if self
-            .ranges()
-            .iter()
-            .any(|&(k, b, e)| k == kind && b == base && e == end)
-        {
-            return;
-        }
-        match self.ranges.get_mut(self.count) {
-            Some(slot) => {
-                *slot = (kind, base, end);
+    fn push(&mut self, range: (Changing, u64, u64), overlaps: Overlaps) {
+        match (
+            self.ranges.get_mut(self.count),
+            self.overlaps.get_mut(self.count),
+        ) {
+            (Some(slot), Some(met)) => {
+                *slot = range;
+                *met = overlaps;
                 self.count += 1;
             }
             // Not reached: CHANGING_MAX is the most the rule above allows. Kept to fail closed.
-            None => self.note("more structures the firmware changes than expected"),
+            _ => self.note("more structures the firmware changes than expected"),
         }
     }
 }
@@ -378,6 +432,105 @@ fn lendable_extent(
         .map(|(b, e, _)| (b, e))
 }
 
+/// The tables the kernel lends, as a structure the firmware changes must be weighed against
+/// (T71-2, T71-9): the RSDP, the RSDT, the XSDT, the DSDT the first valid FADT names, and each
+/// table the XSDT lists that is not itself such a structure. The RSDT's entries are never
+/// followed, so never lent.
+#[derive(Clone, Copy)]
+struct Lent {
+    rsdp: u64,
+    rsdt: u64,
+    xsdt: u64,
+    dsdt: u64,
+    entries: usize,
+}
+
+impl Lent {
+    /// Calls `each` with the extent of every table the kernel lends, read by copy.
+    fn each(
+        self,
+        copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+        mut each: impl FnMut(u64, u64),
+    ) {
+        if let Some(end) = self.rsdp.checked_add(RSDP_LENGTH as u64) {
+            each(self.rsdp, end);
+        }
+        for table in [self.rsdt, self.xsdt, self.dsdt] {
+            if table != 0
+                && let Some((b, e)) = lendable_extent(table, copy)
+            {
+                each(b, e);
+            }
+        }
+        for i in 0..self.entries {
+            if let Some((b, e)) = xsdt_entry(self.xsdt, i, copy)
+                .filter(|&a| a != 0)
+                .and_then(|a| lendable_extent(a, copy))
+            {
+                each(b, e);
+            }
+        }
+    }
+}
+
+/// Records the structure of `kind` that a pointer names at `base`, if it is one (T71-2, T71-9).
+/// It must begin with its kind's signature: if not, it is passed over and reported, unless
+/// `ignored` (the FACS field §5.2.9 says to ignore, where a stale value is no fault). One that
+/// does is guarded, never dropped: always its minimum ([`Changing::minimum`]), whatever overlaps
+/// it; then the rest of the extent its length field declares, up to the first table the kernel
+/// lends ([`Lent`]) that starts beyond the minimum. Every lent table it meets is recorded beside
+/// it ([`Overlaps`]). One that cannot be read is not recorded.
+fn place(
+    found: &mut ChangingRanges,
+    (kind, base): (Changing, u64),
+    ignored: bool,
+    lent: Lent,
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+) {
+    let mut head = [0u8; 8];
+    if copy(base, &mut head).is_err() {
+        return;
+    }
+    let minimum = kind.minimum();
+    let Some(minimum_end) = base.checked_add(minimum) else {
+        found.pass_over(
+            (kind, base, u64::MAX),
+            "a structure the firmware changes runs past the address space",
+        );
+        return;
+    };
+    if head.get(..4) != Some(kind.name().as_bytes()) {
+        if !ignored {
+            found.pass_over(
+                (kind, base, minimum_end),
+                "a pointer to a structure the firmware changes names something else",
+            );
+        }
+        return;
+    }
+    if found.has(kind, base) {
+        return;
+    }
+    let declared_end = base.saturating_add(length_field(&head).max(minimum));
+    let mut overlaps = Overlaps {
+        declared_end,
+        ..Overlaps::default()
+    };
+    let mut end = declared_end;
+    lent.each(copy, |b, e| {
+        if b < declared_end && base < e {
+            overlaps.tables = overlaps.tables.saturating_add(1);
+            if b < minimum_end {
+                overlaps.over_minimum = overlaps.over_minimum.or(Some((b, e)));
+            } else if b < end {
+                end = b;
+                overlaps.trimmed_at = Some((b, e));
+            }
+        }
+    });
+    found.push((kind, base, end), overlaps);
+}
+
 /// Locates the firmware's structures that change after boot, as the tables at `rsdp_addr` name
 /// them (TASKS item 71), by the rule the kernel's lookups follow (the review of TASKS item 71,
 /// T71-1): only the first valid FADT and the first valid FPDT the XSDT lists count. From that
@@ -385,15 +538,20 @@ fn lendable_extent(
 /// and a second FACS if the ignored field names one, which §5.2.9 forbids; from that FPDT, the
 /// first FBPT, S3PT and MBPT pointer records. Those ranges are recorded first, the FACS first.
 ///
-/// Each target is checked before it is recorded (T71-2): it must begin with its kind's signature
-/// (`FACS`, `FBPT`, `S3PT`, `MBPT`), and its range, as long as its length field says and at least
-/// its kind's minimum, must not overlap a table the kernel lends: the RSDP, the RSDT, the XSDT,
-/// each table the XSDT lists that is not itself such a structure, and the DSDT that FADT names. A
-/// target that fails either is not recorded, and is reported ([`ChangingRanges::passed_over`]):
-/// a pointer the kernel does not act on blocks no table lookup. The ignored FACS field's target is
-/// passed over without a report when it names no FACS: a stale value there is no fault. A target
-/// that cannot be read is not recorded and not reported: `firmware::bytes` cannot lend what
-/// `firmware::copy` cannot read, by the same rule of the memory map.
+/// Each target must begin with its kind's signature (`FACS`, `FBPT`, `S3PT`, `MBPT`; T71-2). One
+/// that does not is not recorded, and is reported ([`ChangingRanges::passed_over`]), so a pointer
+/// the kernel does not act on blocks no table lookup; the ignored FACS field's target is passed
+/// over without a report, as a stale value there is no fault. One that does is guarded, never
+/// dropped (the addendum review of TASKS item 71, T71-9): always its kind's minimum
+/// ([`Changing::minimum`]), whatever overlaps it, so a table the kernel lends that overlaps the
+/// minimum cannot be lent; and the rest of the extent its length field declares, up to the first
+/// table the kernel lends that starts beyond the minimum, which stays lendable. Every table it
+/// meets is reported ([`ChangingRanges::overlaps`]). The tables the kernel lends are the RSDP,
+/// the RSDT, the XSDT, each table the XSDT lists that is not itself such a structure, and the
+/// DSDT that FADT names. So a table listed at an address inside a structure's declared extent,
+/// beyond its minimum, is lent, and reported: a stated limit. A target that cannot be read is
+/// not recorded and not reported: `firmware::bytes` and `firmware::copy` refuse the same memory
+/// by the memory map, and the census fails if it reads one there.
 ///
 /// Every byte is read by copy (`copy`), into the stack: this takes no lend, so it can neither
 /// lend a range before the ones it finds are recorded nor recurse into a table lookup, and it
@@ -528,76 +686,18 @@ pub fn changing_ranges(
         }
     }
 
-    // Each candidate's range, if its target begins with its kind's signature.
-    let mut ranges: [Option<(Changing, u64, u64)>; CHANGING_MAX] = [None; CHANGING_MAX];
-    for (i, (candidate, range)) in candidates.iter().zip(ranges.iter_mut()).enumerate() {
-        let Some((kind, base)) = *candidate else {
-            continue;
-        };
-        // The least each is: a FACS 64 bytes (§5.2.10), an MBPT's header 24, the others' 8.
-        let min = match kind {
-            Changing::Facs => 64,
-            Changing::Mbpt => 24,
-            Changing::Fbpt | Changing::S3pt => 8,
-        };
-        let mut head = [0u8; 8];
-        if copy(base, &mut head).is_err() {
-            continue;
+    let lent = Lent {
+        rsdp: rsdp_addr,
+        rsdt: u32_at(&rsdp, 16).map_or(0, u64::from),
+        xsdt,
+        dsdt,
+        entries,
+    };
+    for (i, candidate) in candidates.into_iter().enumerate() {
+        if let Some(target) = candidate {
+            // Index 1 is the FACS field §5.2.9 says to ignore.
+            place(&mut found, target, i == 1, lent, copy);
         }
-        let length = length_field(&head).max(min);
-        let Some(end) = base.checked_add(length) else {
-            found.pass_over(
-                (kind, base, u64::MAX),
-                "a structure the firmware changes runs past the address space",
-            );
-            continue;
-        };
-        if head.get(..4) != Some(kind.name().as_bytes()) {
-            // The ignored FIRMWARE_CTRL naming something else is no fault (§5.2.9).
-            if i != 1 {
-                found.pass_over(
-                    (kind, base, base.saturating_add(min)),
-                    "a pointer to a structure the firmware changes names something else",
-                );
-            }
-            continue;
-        }
-        *range = Some((kind, base, end));
-    }
-
-    // No range over a table the kernel lends.
-    if ranges.iter().any(Option::is_some) {
-        let mut lent = |extent: Option<(u64, u64)>, ranges: &mut [Option<(Changing, u64, u64)>]| {
-            let Some((b, e)) = extent else { return };
-            for range in ranges.iter_mut() {
-                if let Some(r @ (_, base, end)) = *range
-                    && base < e
-                    && b < end
-                {
-                    found.pass_over(
-                        r,
-                        "a structure the firmware changes overlaps a table the kernel lends",
-                    );
-                    *range = None;
-                }
-            }
-        };
-        let rsdp_end = rsdp_addr.checked_add(RSDP_LENGTH as u64);
-        lent(rsdp_end.map(|end| (rsdp_addr, end)), &mut ranges);
-        let rsdt = u32_at(&rsdp, 16).map_or(0, u64::from);
-        for table in [rsdt, xsdt, dsdt] {
-            if table != 0 {
-                lent(lendable_extent(table, copy), &mut ranges);
-            }
-        }
-        for i in 0..entries {
-            if let Some(addr) = xsdt_entry(xsdt, i, copy).filter(|&a| a != 0) {
-                lent(lendable_extent(addr, copy), &mut ranges);
-            }
-        }
-    }
-    for range in ranges.into_iter().flatten() {
-        found.push(range);
     }
     found
 }
@@ -2520,22 +2620,27 @@ mod tests {
             found.ranges()[0],
             (Changing::Facs, BASE + 0x2000, BASE + 0x2800)
         );
-        // ...and passed over, and reported, when it would cover one (T71-2): here the FPDT.
+        assert_eq!(found.met(), 0);
+        // ...and, when it would cover one, still recorded, cut at the first such table that
+        // starts beyond its 64 bytes, here the FPDT, and reported, with the MADT it also covers
+        // (the addendum review of TASKS item 71, T71-9: trimmed, never dropped).
         big[0x2004..0x2008].copy_from_slice(&u32::MAX.to_le_bytes());
         let found = changing_ranges(rsdp_at, &mut copy_from(&big));
+        assert_eq!((found.unlocated, found.passed_over), (None, None));
         assert_eq!(
-            found.passed_over,
-            Some((
-                Changing::Facs,
-                BASE + 0x2000,
-                BASE + 0x2000 + u64::from(u32::MAX)
-            ))
+            found.ranges()[0],
+            (Changing::Facs, BASE + 0x2000, BASE + 0x3000)
         );
         assert_eq!(
-            found.unlocated,
-            Some("a structure the firmware changes overlaps a table the kernel lends")
+            found.overlaps()[0],
+            Overlaps {
+                declared_end: BASE + 0x2000 + u64::from(u32::MAX),
+                over_minimum: None,
+                trimmed_at: Some((BASE + 0x3000, BASE + 0x3000 + 36 + 32)),
+                tables: 2,
+            }
         );
-        assert!(found.ranges().iter().all(|&(k, ..)| k != Changing::Facs));
+        assert_eq!(found.met(), 1);
         // A FADT whose checksum fails is not the one the kernel's lookups take: none is located,
         // and nothing more is said, as the census refuses that FADT itself.
         let mut bad = mem.clone();
@@ -2690,8 +2795,9 @@ mod tests {
     }
 
     /// The review of TASKS item 71, T71-2 and its probe P2: a pointer that names no structure of
-    /// its kind, or one whose range would cover a table the kernel lends, is reported and not
-    /// recorded, so it blocks no table lookup: the MADT, MCFG, SPCR and FADT stay readable.
+    /// its kind is reported and not recorded, and one whose declared length would cover the
+    /// tables the kernel lends is recorded only up to the first of them (the addendum review,
+    /// T71-9), so neither blocks a table lookup: the MADT, MCFG, SPCR and FADT stay readable.
     #[test]
     fn a_pointer_that_names_no_structure_blocks_no_lookup() {
         use crate::reserved::Lending;
@@ -2712,7 +2818,7 @@ mod tests {
         ];
         let mem = machine_of(&entries, &[(BASE + 0x80, changing_at(b"FBPT", 0x8000))]);
         let found = changing_ranges(BASE, &mut copy_from(&mem));
-        assert_eq!(found.ranges(), &[]);
+        assert_eq!(found.ranges(), &[(Changing::Fbpt, BASE + 0x80, XSDT_AT)]);
         assert_eq!(
             found.passed_over,
             Some((Changing::Facs, XSDT_AT, XSDT_AT + 64))
@@ -2721,20 +2827,21 @@ mod tests {
             found.unlocated,
             Some("a pointer to a structure the firmware changes names something else")
         );
-        // The FBPT alone: passed over for the tables it would cover.
+        // The FBPT alone: recorded up to the XSDT, the first table it would cover, and that
+        // reported, with the other five it would cover (the FADT, FPDT, MADT, MCFG and SPCR).
         let mut fbpt_only = entries.to_vec();
         fbpt_only[0].1 = fadt_naming(0, 0);
         fbpt_only[1].1 = fpdt_of(&[(0, BASE + 0x80)]);
         let fbpt_only = machine_of(&fbpt_only, &[(BASE + 0x80, changing_at(b"FBPT", 0x8000))]);
         let fbpt = changing_ranges(BASE, &mut copy_from(&fbpt_only));
+        assert_eq!((fbpt.unlocated, fbpt.passed_over), (None, None));
+        assert_eq!(fbpt.ranges(), &[(Changing::Fbpt, BASE + 0x80, XSDT_AT)]);
+        let met = fbpt.overlaps()[0];
         assert_eq!(
-            fbpt.passed_over,
-            Some((Changing::Fbpt, BASE + 0x80, BASE + 0x8080))
+            (met.declared_end, met.over_minimum, met.tables),
+            (BASE + 0x8080, None, 6)
         );
-        assert_eq!(
-            fbpt.unlocated,
-            Some("a structure the firmware changes overlaps a table the kernel lends")
-        );
+        assert_eq!(met.trimmed_at.map(|(b, _)| b), Some(XSDT_AT));
         // Through the kernel's lookup, every table stays readable.
         let mem: &'static [u8] = Vec::leak(mem);
         let registry = RefCell::new(Lending::new());
@@ -2757,6 +2864,153 @@ mod tests {
             let t = lookup(BASE, sig, &mut located, &mut record, &mut copy, &mut lend);
             assert_eq!(t.map(|t| &t[..4]), Ok(&sig[..]), "{sig:?}");
         }
+    }
+
+    /// A table lookup's result, for [`lookups_over`].
+    type Looked = Result<&'static [u8], &'static str>;
+    /// The lending registry [`lookups_over`] shares with its caller.
+    type Shared = std::rc::Rc<std::cell::RefCell<crate::reserved::Lending>>;
+
+    /// A lookup through a registry that holds what [`changing_ranges`] found at `mem`'s RSDP, as
+    /// the kernel's first lookup records it; and the registry, to test lends against.
+    fn lookups_over(mem: Vec<u8>) -> (impl FnMut(&[u8; 4]) -> Looked, Shared) {
+        use crate::reserved::Lending;
+        use std::{cell::RefCell, rc::Rc};
+        let mem: &'static [u8] = Vec::leak(mem);
+        let registry = Rc::new(RefCell::new(Lending::new()));
+        let reg = Rc::clone(&registry);
+        let lookup_in = move |sig: &[u8; 4]| {
+            let mut located = || reg.borrow().located();
+            let mut record = |found: &ChangingRanges| {
+                let ranges: Vec<(u64, u64)> =
+                    found.ranges().iter().map(|&(_, b, e)| (b, e)).collect();
+                reg.borrow_mut().never_lend(&ranges);
+            };
+            let mut lend = |addr: u64, len: usize| -> Result<&'static [u8], &'static str> {
+                let at = (addr - BASE) as usize;
+                let bytes = mem.get(at..at + len).ok_or("not firmware memory")?;
+                if reg.borrow_mut().lend(addr, addr + len as u64) {
+                    Ok(bytes)
+                } else {
+                    Err("refused")
+                }
+            };
+            lookup(
+                BASE,
+                sig,
+                &mut located,
+                &mut record,
+                &mut copy_from(mem),
+                &mut lend,
+            )
+        };
+        (lookup_in, registry)
+    }
+
+    /// The addendum review of TASKS item 71, T71-9 and its probe P4: a listed table, valid, whose
+    /// declared extent runs over a genuine FACS, from 0x80 bytes before it for 0x100. The FACS is
+    /// recorded at its 64 bytes and the table reported; a lookup of that table is refused, and no
+    /// lend over the FACS is made, while every other table stays readable.
+    #[test]
+    fn a_table_over_a_structure_is_refused_and_the_structure_kept() {
+        const FACS_AT: u64 = BASE + 0x3000;
+        const OEM_AT: u64 = FACS_AT - 0x80;
+        let mut facs = changing_at(b"FACS", 64);
+        facs.resize(64, 0);
+        // The table holds the FACS's bytes, and its checksum counts them: a valid table.
+        let mut oem = table(b"OEMX", &[0u8; 0x100 - 36]);
+        oem[0x80..0xC0].copy_from_slice(&facs);
+        reseal(&mut oem);
+        assert!(check_table(&oem, b"OEMX").is_ok());
+        let entries = [
+            (BASE + 0x1000, fadt_naming(FACS_AT, 0)),
+            (BASE + 0x2000, madt(&[&lapic(0, 0, 1)])),
+            (OEM_AT, oem),
+        ];
+        let mem = machine_of(&entries, &[(FACS_AT, facs)]);
+        let found = changing_ranges(BASE, &mut copy_from(&mem));
+        assert_eq!((found.unlocated, found.passed_over), (None, None));
+        assert_eq!(found.ranges(), &[(Changing::Facs, FACS_AT, FACS_AT + 64)]);
+        assert_eq!(
+            found.overlaps(),
+            &[Overlaps {
+                declared_end: FACS_AT + 64,
+                over_minimum: Some((OEM_AT, OEM_AT + 0x100)),
+                trimmed_at: None,
+                tables: 1,
+            }]
+        );
+        assert_eq!(found.met(), 1);
+        let (mut lookup_in, registry) = lookups_over(mem);
+        assert_eq!(lookup_in(b"OEMX"), Err("refused"));
+        for sig in [b"APIC", b"FACP"] {
+            assert_eq!(lookup_in(sig).map(|t| &t[..4]), Ok(&sig[..]), "{sig:?}");
+        }
+        let registry = registry.borrow();
+        assert!(registry.guards(FACS_AT + 32, FACS_AT + 40));
+        assert!(
+            registry
+                .lent()
+                .iter()
+                .all(|&(b, e)| e <= FACS_AT || FACS_AT + 64 <= b),
+            "{:x?}",
+            registry.lent()
+        );
+    }
+
+    /// The addendum review of TASKS item 71, T71-9: a structure whose declared length runs over
+    /// tables listed beyond its minimum is guarded up to the first of them, which, with the
+    /// table after it, stays readable and is reported; a table over its minimum is refused, and
+    /// reported first.
+    #[test]
+    fn a_structure_is_trimmed_at_a_table_beyond_its_minimum() {
+        const FACS_AT: u64 = BASE + 0x3000;
+        const NEAR: u64 = FACS_AT + 0x100;
+        const FAR: u64 = FACS_AT + 0x200;
+        let entries = [
+            (BASE + 0x1000, fadt_naming(FACS_AT, 0)),
+            (FAR, table(b"OEMB", &[])),
+            (NEAR, table(b"OEMA", &[])),
+        ];
+        let mut facs = changing_at(b"FACS", 0x400);
+        facs.resize(64, 0);
+        let mem = machine_of(&entries, &[(FACS_AT, facs.clone())]);
+        let found = changing_ranges(BASE, &mut copy_from(&mem));
+        assert_eq!((found.unlocated, found.passed_over), (None, None));
+        assert_eq!(found.ranges(), &[(Changing::Facs, FACS_AT, NEAR)]);
+        assert_eq!(
+            found.overlaps(),
+            &[Overlaps {
+                declared_end: FACS_AT + 0x400,
+                over_minimum: None,
+                trimmed_at: Some((NEAR, NEAR + 36)),
+                tables: 2,
+            }]
+        );
+        let (mut lookup_in, registry) = lookups_over(mem);
+        for sig in [b"OEMA", b"OEMB"] {
+            assert_eq!(lookup_in(sig).map(|t| &t[..4]), Ok(&sig[..]), "{sig:?}");
+        }
+        // What lies between the minimum and the cut stays guarded.
+        assert!(registry.borrow().guards(FACS_AT + 0x80, FACS_AT + 0x88));
+        // A third table over the minimum: refused, and reported as well as the cut.
+        let mut over = entries.to_vec();
+        over.push((FACS_AT - 0x10, table(b"OEMC", &[])));
+        let mem = machine_of(&over, &[(FACS_AT, facs)]);
+        let found = changing_ranges(BASE, &mut copy_from(&mem));
+        assert_eq!(found.ranges(), &[(Changing::Facs, FACS_AT, NEAR)]);
+        let met = found.overlaps()[0];
+        assert_eq!(
+            (met.over_minimum, met.trimmed_at, met.tables),
+            (
+                Some((FACS_AT - 0x10, FACS_AT + 0x14)),
+                Some((NEAR, NEAR + 36)),
+                3
+            )
+        );
+        let (mut lookup_in, _) = lookups_over(mem);
+        assert_eq!(lookup_in(b"OEMC"), Err("refused"));
+        assert_eq!(lookup_in(b"OEMA").map(|t| &t[..4]), Ok(&b"OEMA"[..]));
     }
 
     /// TASKS item 71, ruling addition 2: the first lookup locates and records the changing
