@@ -786,11 +786,18 @@ pub(crate) fn yield_until(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) {
 /// tell which. So the result is only a hint: it may earn a repeat of a measurement, never
 /// a more lenient verdict.
 pub(crate) fn yield_until_away(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) -> u64 {
+    yield_until_away_for(done, tsc_hz, tsc_hz.saturating_mul(seconds))
+}
+
+/// As [`yield_until_away`], for at most `duration` TSC ticks: a step of the loop counts as away
+/// from [`RUNNING_STEP_MICROS`] of the real rate `tsc_hz`, whatever the duration (the review's
+/// T66-R2: a short wait passed as a rate of its own made 60 µs count as away).
+pub(crate) fn yield_until_away_for(done: impl Fn() -> bool, tsc_hz: u64, duration: u64) -> u64 {
     let limit = (tsc_hz / 1_000_000).max(1) * RUNNING_STEP_MICROS;
     let start = rdtsc();
     let mut last = start;
     let mut away = 0;
-    while !done() && rdtsc().wrapping_sub(start) < tsc_hz.saturating_mul(seconds) {
+    while !done() && rdtsc().wrapping_sub(start) < duration {
         yield_now();
         cpu::interrupt_window();
         reap();

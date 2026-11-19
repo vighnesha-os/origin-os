@@ -24,10 +24,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bootproof::{Proof, Tally};
-use crate::runqueue::{
-    RoundTrips, TIMED_LONG_LIMIT_MS, TIMED_SHORT_LATE_MS, TimedWait, judge_round_trips,
-    judge_timed_waits, per_mille,
-};
+use crate::runqueue::{RoundTrips, TimedWait, judge_round_trips, judge_timed_waits, per_mille};
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::wait::{self, TimedOut};
 
@@ -274,8 +271,12 @@ struct TimedRun {
     /// Each waiter's wait, with its processor's ticks.
     short_wait: TimedWait,
     long_wait: TimedWait,
-    /// How much of the run the boot flow went without a turn, in parts per thousand.
+    /// How much of the run the boot flow went without a turn, in parts per thousand; 0 on one
+    /// processor, where the waiters share the boot flow's processor and make the reading
+    /// themselves (as the ping-pong).
     away: u64,
+    /// How long the boot flow waited for both waiters after the signal, in milliseconds.
+    waited_ms: u64,
 }
 
 /// Starts the two timed waiters on `far`, signals the second after about 20 ms, and waits
@@ -290,15 +291,18 @@ fn run_timed(far: CpuIndex, tsc_hz: u64) -> Option<TimedRun> {
     sched::spawn(far, timed_waiter, 1).ok()?;
     let start = rdtsc();
     // Signal the second waiter after about 20 ms.
-    let mut away = sched::yield_until_away(|| false, tsc_hz / 50, 1);
+    let mut away = sched::yield_until_away_for(|| false, tsc_hz, tsc_hz / 50);
     SOON_SET.store(true, Ordering::Release);
     SOON.wake_one();
+    let signalled = rdtsc();
     away += sched::yield_until_away(
         || FINISHED.load(Ordering::Acquire) == before + 2,
         tsc_hz,
         sched::OTHERS_PATIENCE,
     );
-    let elapsed = rdtsc().wrapping_sub(start);
+    let now = rdtsc();
+    let elapsed = now.wrapping_sub(start);
+    let waited_ms = now.wrapping_sub(signalled) / (tsc_hz / 1000).max(1);
     let read = |i: usize| TIMED.get(i).map_or(0, |t| t.load(Ordering::Acquire));
     let wait_of = |result: u64, i: usize| TimedWait {
         waited_ms: result.saturating_sub(2) / 2,
@@ -310,7 +314,13 @@ fn run_timed(far: CpuIndex, tsc_hz: u64) -> Option<TimedRun> {
         long,
         short_wait: wait_of(short, 0),
         long_wait: wait_of(long, 1),
-        away: per_mille(away, elapsed),
+        // The boot flow runs on the processor this runs on.
+        away: if far == cpu::this_cpu() {
+            0
+        } else {
+            per_mille(away, elapsed)
+        },
+        waited_ms,
     })
 }
 
@@ -347,18 +357,32 @@ fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> Results {
         }
     };
     let ok = correct && timely;
-    if run.short != 0 && run.long != 0 {
-        let (s, l) = (run.short_wait, run.long_wait);
+    if run.waited_ms > 4000 {
+        // Past the 4 s this wait had before TASKS item 66 (the review's T66-R3).
         let _ = writeln!(
             com1,
-            "origin-kernel: wait queues: an unsignalled {SHORT_MS} ms timed wait timed out {} after {} ms; a {LONG_MS} ms timed wait signalled early returned in {} ms, timed out {}; their processor lost {} and {} ticks (bounds {SHORT_MS} to {} ms and under {TIMED_LONG_LIMIT_MS} ms), run {attempts} of {TIMED_ATTEMPTS}{}{}",
+            "origin-kernel: waited {} ms for the timed waiters to return, past the former 4000 ms",
+            run.waited_ms
+        );
+    }
+    if run.short != 0 && run.long != 0 {
+        let (s, l) = (run.short_wait, run.long_wait);
+        // The line as it was before TASKS item 66, then its judgement on a line of its own, each
+        // under the console's 160-byte split as far as they can be (the review's T66-R7).
+        let _ = writeln!(
+            com1,
+            "origin-kernel: wait queues: an unsignalled {SHORT_MS} ms timed wait timed out {} after {} ms; a {LONG_MS} ms timed wait signalled early returned in {} ms, timed out {}",
             run.short & 1 == 1,
             s.waited_ms,
             l.waited_ms,
             run.long & 1 == 1,
+        );
+        let _ = writeln!(
+            com1,
+            "origin-kernel: wait queues: timed waits: ticks lost {} and {}, boot flow away {} per mille, run {attempts} of {TIMED_ATTEMPTS}{}{}",
             s.ticks_lost(hz),
             l.ticks_lost(hz),
-            SHORT_MS + TIMED_SHORT_LATE_MS,
+            run.away,
             if attempts > 1 {
                 " (after a stalled run)"
             } else {
