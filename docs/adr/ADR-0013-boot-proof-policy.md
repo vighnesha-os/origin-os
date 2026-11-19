@@ -621,7 +621,7 @@ Each proof can see its own disturbance, from its own processor's ticks or its ow
   - every wait on another processor listed above.
 - **Already so before TASKS item 66:** the ping-pong, the timer queue and the weights.
 
-**Controls of TASKS item 66 (2026-11-19, QEMU 11.1.3 TCG, Intel VT-d, the kernel boot alone, 2 processors unless stated):** temporary edits to the committed tree at `66f47442`, each booted once and the file put back with `git checkout`, compared with `HEAD` after each (10:32 to 10:35 and 11:27 to 11:36 UTC).
+**Controls of TASKS item 66 (2026-11-19, QEMU 11.1.3 TCG, Intel VT-d, the kernel boot alone, 2 processors unless stated):** temporary edits to the committed tree at `66f47442`, each booted once and the file put back with `git checkout`, compared with `HEAD` after each (10:32 to 10:35 and 11:27 to 11:36 UTC). The preemption proof's seven, T66-8 to T66-10 and T66-20 to T66-20c, ran again at `875b8c07`, after the run queue's read-back became plain values (12:15 to 12:18 UTC), and are given as they ran there.
 
 | # | Edit | Result |
 |---|---|---|
@@ -632,10 +632,10 @@ Each proof can see its own disturbance, from its own processor's ticks or its ow
 | T66-5 | `sched::block_until` sleeps 4 ticks too many: a deadline missed with the ticks there | `timed out true after 91 ms`, then `ticks lost 0 and 0, boot flow away 0 per mille, run 1 of 8: wait timing failed`: at once |
 | T66-6 | The unsignalled waiter's processor holds interrupts off for 100 ms before its first wait | `… run 2 of 8 (after a stalled run)`: repeated, then passed |
 | T66-7 | The same before every wait | `timed out true after 100 ms`, then `ticks lost 9 and 0, …, run 8 of 8 (after a stalled run): wait timing failed` |
-| T66-8 | CPU 1's two workers spawned with weights 1024 and 1: its ticks come and it barely switches | `CPU 1: workers 2 and 3 counted 486860000 and 11048000, 3 context switches: scheduler failed` |
-| T66-9 | CPU 1's first worker holds interrupts off for 400 ms as it starts | `window of 901 ms, run 1 of 4: CPU 1's 15th tick at 540 ms, longest gap 401 ms: stalled, run again`, then `window of 504 ms, run 2 of 4: every timer as timed, every 15th tick within 500 ms (after a stalled run)`: repeated, then passed |
-| T66-9b | The same in every run | Runs 1 to 3 stalled, then `window of 900 ms, run 4 of 4: CPU 1's 15th tick at 537 ms, longest gap 400 ms: stalled in every run: scheduler failed` |
-| T66-10 | CPU 1's timer never started | `waited 10000 ms for the preemption workers' exit, past the former 2000 ms, in vain`, then `window of 10025 ms, run 1 of 4: CPU 1 took 0 of 50 ticks in the window: scheduler failed` |
+| T66-8 | CPU 1's two workers spawned with weights 1024 and 1: its ticks come and it barely switches | `CPU 1: workers 2 and 3 counted 487878000 and 9933000, 3 context switches: scheduler failed` |
+| T66-9 | CPU 1's first worker holds interrupts off for 400 ms as it starts | `window of 902 ms, run 1 of 4: CPU 1's 15th tick at 540 ms, longest gap 401 ms: stalled, run again`, then `window of 506 ms, run 2 of 4: every timer as timed, every 15th tick within 500 ms (after a stalled run)`: repeated, then passed |
+| T66-9b | The same in every run | Runs 1 to 3 stalled, then `window of 898 ms, run 4 of 4: CPU 1's 15th tick at 528 ms, longest gap 400 ms: stalled in every run: scheduler failed` |
+| T66-10 | CPU 1's timer never started | `waited 10000 ms for the preemption workers' exit, past the former 2000 ms, in vain`, then `window of 10027 ms, run 1 of 4: CPU 1 took 0 of 50 ticks in the window: scheduler failed` |
 | T66-11 | The tick proof's initial count doubled: the tick half as fast | `50 ticks in 1005200 us, not 50 in 500000 (median gap 20015 us, longest 25063 us, least ten 195249 us, run 1 of 4): APIC timer is wrong`: at once, on the median |
 | T66-12 | Interrupts off for 300 ms after the 5th interrupt of the first run | `run 1 of 4 disturbed (50 ticks in 783 ms, longest gap 300 ms, least ten gaps 91 ms), measured again`, then `50 interrupts at 100 Hz in 502 ms (initial count 625855, least ten gaps 97 ms), run 2 of 4` |
 | T66-13 | The same in every run | Runs 1 to 3 measured again, then `50 ticks in 792938 us, … (median gap 10041 us, longest 300013 us, least ten 97861 us, run 4 of 4): APIC timer is wrong` |
@@ -645,8 +645,8 @@ Each proof can see its own disturbance, from its own processor's ticks or its ow
 | T66-17 | The TLB prober on CPU 1 never probes | `waited 10000 ms for the TLB proof's threads to probe their pages, past the former 2000 ms, in vain`, then `0 of their 3 reads faulted and 0 saw a stale translation: TLB failed` |
 | T66-18 | The TLB prober on CPU 1 held back 3 s | `waited 2999 ms for the TLB proof's threads to probe their pages, past the former 2000 ms`, and the boot passed, where the 2 s wait would have failed |
 | T66-19 | The 21st kernel-page shootdown (a stack's reclaim) waits 1 s and reports a stall of the next processor, as T67-e did (4 processors) | `stalled shootdown: CPU 3 waited 1000 ms for CPU 0 (stall 1 of this boot); 1 kernel stacks withheld, with their frames`, then the IPC proof's `not settled before its compare: 1 kernel stacks lost to a stalled shootdown: ipc failed`, as before |
-| T66-20 | CPU 1's timer divided by 128, not 16, in `start_periodic` | `window of 93 ms, run 1 of 4: CPU 1's timer divide configuration is 0xa, not 0x3 as timed: scheduler failed`: at once |
-| T66-20b | CPU 1's initial count eight times the one timed | `CPU 1's timer initial count is 0x4c67f0, not 0x98cfe as timed: scheduler failed`: at once |
+| T66-20 | CPU 1's timer divided by 128, not 16, in `start_periodic` | `window of 88 ms, run 1 of 4: CPU 1's timer divide configuration is 0xa, not 0x3 as timed: scheduler failed`: at once |
+| T66-20b | CPU 1's initial count eight times the one timed | `CPU 1's timer initial count is 0x4c5a40, not 0x98b48 as timed: scheduler failed`: at once |
 | T66-20c | CPU 1's timer left in one-shot mode | `CPU 1's timer LVT entry is 0x20, not 0x20020 as timed: scheduler failed`: at once |
 | T66-21 | The signalled wait never woken, so it returns at its 2 s deadline with every tick there | `a 2000 ms timed wait signalled early returned in 2002 ms`, then `ticks lost 0 and 0, boot flow away 0 per mille, run 1 of 8: wait timing failed`: at once |
 | T66-22 | The tick at twice the rate, with a 300 ms stall at the 10th interrupt of the first run, whose total (542 ms) then looks right | `run 1 of 4 disturbed (50 ticks in 542 ms, longest gap 300 ms, least ten gaps 44 ms), measured again`, then `50 ticks in 251546 us, … (median gap 5017 us, longest 6355 us, least ten 48988 us, run 2 of 4): APIC timer is wrong`: by its total |

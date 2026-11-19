@@ -2284,7 +2284,7 @@ Recorded, not changed: the memory proof's two one-second budgets (TASKS item 74)
     - CL20's per-run bounds;
     - "no real-machine bound changed", qualified for the preemption proof.
 
-**Result after the review (2026-11-19): built under QEMU; not landed and not pushed. The same reviewer is to read the answers.** The rules and evidence are in ADR-0013's "Timing proofs that judge the kernel", in the research ledger `docs/research/2026-11-19-timing-proofs.md`, and in `SOURCE_PROVENANCE.md`, "TASKS item 66: the review's answers".
+**Result after the review (2026-11-19): built and gated under QEMU; not landed and not pushed. The same reviewer is to read the answers.** The rules and evidence are in ADR-0013's "Timing proofs that judge the kernel", in the research ledger `docs/research/2026-11-19-timing-proofs.md`, and in `SOURCE_PROVENANCE.md`, "TASKS item 66: the review's answers".
 - **Commits after `c0f0d02a`:**
   - `a9c96bb9`: T66-R3, R7, R8 and R9.
   - `6d9f0aa3`: T66-R2.
@@ -2294,7 +2294,19 @@ Recorded, not changed: the memory proof's two one-second budgets (TASKS item 74)
   - `90ee371b`: `main` at `2d0187c0` (pull request 41) merged in, as ruled, with no conflict.
   - `4dc3bff6`: T66-R5's second answer, since replaced; a misprogrammed timer named first.
   - `66f47442`: T66-R5's answer now.
-  - Then these records; the gates' result follows them.
-- **Controls:** all 26, T66-1 to T66-22b, on `66f47442` (ADR-0013's table). Each fault failed where aimed; of the disturbances short of their budget, T66-6, 9 and 12 were repeated and then passed, and T66-1, 2, 15 and 18 passed in the disturbed run itself.
+  - `da213e8b`: the records.
+  - `875b8c07`: the run queue keeps the timer's read-back as plain values (`runqueue::ReadBack`, the comparison in `sched::timer_read_back`). `origin-sync`'s Loom models compile `runqueue.rs` by path and cannot see `origin-frame`, so `4c856ce3`'s import broke `cargo clippy --all-targets`; the first `check` on `da213e8b` failed there, the per-crate builds after each change having missed it.
+  - Then the result.
+- **Controls:** all 26, T66-1 to T66-22b, on `66f47442`, and the preemption proof's seven again on `875b8c07` (ADR-0013's table). Each fault failed where aimed; of the disturbances short of their budget, T66-6, 9 and 12 were repeated and then passed, and T66-1, 2, 15 and 18 passed in the disturbed run itself.
 - **Evidence** (`66f47442`, 20 boots in one turn, 10:34 to 10:56 UTC): no refusal and no repeat idle, at three busy loops on the 65-processor machine or at twenty on the small machines; at ten busy loops both large machines were refused at the tick proof, as before TASKS item 66. The least span of ten tick gaps of a correct timer was 89 to 98 ms in every run, against the 85 ms that triggers a repeat.
+- **The gates, in one turn, in the ruled order, on `875b8c07`** (`main` at `2d0187c0` merged in; a clean tree before and after; 2026-11-19 12:18 to 12:45 UTC, right after the seven controls):
+  - `cargo xtask check` passed in 492 s: 2,334 host tests passed, 0 failed, 29 ignored; Loom 56 models, 83 controls caught.
+  - `cargo xtask boot-test` passed, 11 of 11, in 53 s.
+  - `cargo xtask boot-matrix` passed on its first run, in 1,064 s, the kernel stacks' region at 23 distinct bases in 23 kernel boots.
+- **The large machines in that first `boot-matrix`:**
+  - the 65-processor Intel machine discarded 11 calibration windows, ticked 50 in 507 ms (least ten gaps 93 ms), its RTC second lasted 1,001,135 ± 2,159 µs, and its preemption window 917 ms;
+  - the 65-processor AMD machine discarded 23, ticked 50 in 502 ms (94 ms), its second lasted 998,371 ± 2,760 µs, and its window 1,099 ms;
+  - the 67-processor machine discarded 7, ticked 50 in 507 ms (93 ms), its second lasted 1,004,027 ± 4,226 µs, and its window 1,419 ms.
+
+  All three seconds were confirmed. In every kernel boot of the matrix no proof was repeated, no wait went past its former bound, no shootdown stalled, and every stacks count read `lost: 0`.
 - **Not shown:** anything under KVM, in CI or on a physical machine. The intermediate commits were not each built on their own; the final tree was. No person has reviewed it.
