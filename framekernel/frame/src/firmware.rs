@@ -92,6 +92,9 @@ pub fn copy(addr: u64, out: &mut [u8]) -> Result<(), &'static str> {
 /// firmware table, and reading them could have effects (TASKS item 71, the review's F14).
 const MMIO: &str = "the memory map calls it MMIO, which holds no table";
 
+// The registry keeps every structure the locator can find (the review of TASKS item 71, T71-1).
+const _: () = assert!(acpi::CHANGING_MAX <= crate::reserved::NEVER_SLOTS);
+
 /// What [`acpi_table`]'s first call located as the firmware's structures that change after boot,
 /// and what the lending registry did with them: for the ACPI census to report.
 static CHANGING: SetOnce<(acpi::ChangingRanges, crate::reserved::Never)> = SetOnce::new();
