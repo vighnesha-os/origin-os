@@ -3209,7 +3209,23 @@ fn stack_markers(machine: &Machine) -> Vec<String> {
     let interrupt_stacks = 4 * (cpus - 1);
     // The processor that caches the freed stack: the first after the boot processor, if any.
     let reader = machine.named(cpus.min(2) - 1);
-    vec![
+    // TASKS item 70: the switch windows, asked about from the boot processor while the first
+    // processor after it holds the thread; not asked with one processor.
+    let windows = if cpus > 1 {
+        vec![
+            format!(
+                "origin-kernel: kernel stacks: a thread's own stack, asked about from {} while {reader} switched it out (that processor's kernel-stack record moved, the thread's frame not yet saved): in use: true (held ",
+                machine.named(0)
+            ),
+            " us); while it ended: in use: true (held ".into(),
+            " us); given back by its processor's reap, not leaked: true (".into(),
+        ]
+    } else {
+        vec![
+            "origin-kernel: kernel stacks: a thread's own stack in its switch windows: not asked, with one processor".into(),
+        ]
+    };
+    let mut markers = vec![
         // ADR-0004 Amendment 2: every machine here has RDSEED or RDRAND, so the loader hands
         // over a random value and the region's base is drawn from it (A5.1). The line names
         // neither the base nor the value (A6). The machine with neither instruction has its
@@ -3222,12 +3238,16 @@ fn stack_markers(machine: &Machine) -> Vec<String> {
         format!(
             "origin-kernel: kernel stacks: a stack's 4 pages read on {reader}, then the stack freed and reclaimed: 4 of 4 reads there faulted and 0 saw the old pages; its slot, the one its last byte was in: true, free again: true"
         ),
+    ];
+    markers.extend(windows);
+    markers.extend([
         "origin-kernel: kernel stacks: 64 stacks of 16384 bytes made and freed: all made true; making one took ".into(),
         " (QEMU, no budget)".into(),
         STACKS_GIVEN_BACK.into(),
         STACKS_NONE_LOST.into(),
         STACKS_AS_BEFORE.into(),
-    ]
+    ]);
+    markers
 }
 
 fn ipc_markers(boot: String, far: String) -> Vec<String> {

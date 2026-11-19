@@ -294,7 +294,7 @@ pub(crate) fn size_per_cpu(sizing: &mut Sizing) {
     sizing.table(&crate::cpu::APIC_IDS);
     sizing.table(&crate::cpu::CPU_LOCAL);
     sizing.table(&crate::cpu::CPU_STATE_HOLDS);
-    sizing.table(&crate::cpu::SAVED_FRAMES);
+    sizing.table(&crate::cpu::CONTEXTS);
     sizing.table(&crate::cpu::PAT_READY);
     sizing.table(&crate::random::SLOTS);
     sizing.table(&crate::smp::TOPOLOGY);

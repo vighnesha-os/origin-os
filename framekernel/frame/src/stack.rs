@@ -26,27 +26,26 @@
 //! [`reclaim`], once a TLB shootdown has reached every processor. The scheduler reclaims where it
 //! reaps exited threads.
 //!
-//! A stack's drop decides from records whether a processor may still be using it. A thread's
-//! stack has its top in the TSS of the processor running the thread (`cpu::set_kernel_stack`),
-//! and a suspended thread has a saved frame on its stack that the trap entry recorded
-//! (`cpu::record_saved_frame`). A thread running a closure on a measured stack
-//! ([`with_measured_stack`]) has its saved frame there, not on its own stack, so each such call
-//! also records the stack pointer of the stack it left, for as long as the closure runs: one
-//! record for each call, nested ones included, in one table for every processor, since the thread
-//! can move (TASKS item 68, the coordinating session's ruling A1). A stack in any of these is
-//! leaked rather than freed, which is the safe failure for a safe caller that drops one too early.
+//! A stack's drop decides from records whether a processor may still be using it
+//! (`cpu::stack_in_use`):
+//! - **The caller's own stack pointer.**
+//! - **Each processor's kernel-stack record** (`cpu::set_kernel_stack`): the stack an interrupt
+//!   from ring 3 would land on.
+//! - **Each processor's table of contexts** (`cpu::CONTEXTS`, `origin_sync::contexts`). Every
+//!   thread published to a processor has its home there, an address in its own stack, from its
+//!   publication ([`GuardedStack::publish_first_frame`]) until it has ended and its processor has
+//!   left the stack. A suspended context's saved frame is there too, which also covers a stack it
+//!   is suspended on that is not its own, such as a measured stack ([`with_measured_stack`]).
 //!
-//! The records do not cover every stack a processor runs on:
-//! - **An open gap: a thread being switched out.** Between the scheduler's hook moving the
-//!   processor's kernel-stack record to the next thread (`follow_thread`) and the trap entry
-//!   recording the outgoing frame (`cpu::resume`), the processor still runs on the outgoing
-//!   thread's stack, and no record holds it. A caller on another processor that dropped that
-//!   stack in the window would have it given back under the processor. No caller does so today:
-//!   a thread's stack is freed only where it is reaped, on its own processor, after it ended.
-//!   Closing the window is TASKS item 70 (the review of TASKS item 68, T68-2).
-//! - **Stacks held by their user:** the interrupt stacks, the generator's stacks, and a measured
-//!   stack while its closure runs on it are in no record. That is safe because only their holder
-//!   can drop them, and none does while running on them (T68-3).
+//! No switch writes a home. So a thread's own stack stays covered while it runs, while it is
+//! suspended, while it runs a measured closure, and in the windows of a switch and of its exit,
+//! however a processor's reads of the records interleave with switches (TASKS item 70; the review
+//! of TASKS item 68, T68-2). A stack in any record is leaked rather than freed, which is the safe
+//! failure for a safe caller that drops one too early.
+//!
+//! **Stacks held by their user** are in no record: the interrupt stacks, the generator's stacks,
+//! and a measured stack while its closure runs on it. That is safe because only their holder can
+//! drop them, and none does while running on them (T68-3).
 //!
 //! # Measuring a closure's stack
 //!
@@ -278,7 +277,8 @@ pub fn slot_top(addr: u64) -> Option<u64> {
 }
 
 /// A kernel stack in the stack region, with unmapped space below it. Owned; given back on drop.
-#[derive(Debug)]
+/// Its `Debug` names its slot and size, not its first frame, which is an address in the region
+/// (ADR-0004 Amendment 2, A6; TASKS item 70, Q8).
 pub struct GuardedStack {
     /// Its slot in the stack region.
     slot: usize,
@@ -286,6 +286,15 @@ pub struct GuardedStack {
     bytes: usize,
     /// The first frame built on this stack, not yet published to a processor.
     first_frame: Option<u64>,
+}
+
+impl core::fmt::Debug for GuardedStack {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GuardedStack")
+            .field("slot", &self.slot)
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GuardedStack {
@@ -395,7 +404,7 @@ impl GuardedStack {
     pub fn publish_first_frame(&mut self, cpu: CpuIndex) -> bool {
         self.first_frame
             .take()
-            .is_some_and(|frame| cpu::record_saved_frame(cpu, frame))
+            .is_some_and(|frame| cpu::publish_context(cpu, frame))
     }
 
     /// The stack's memory: the running thread's stack, or one being built. Only the framework
@@ -415,9 +424,9 @@ impl Drop for GuardedStack {
     fn drop(&mut self) {
         let top = self.top();
         // Leak rather than give back memory a processor could still run on (see the module docs).
-        // This and `slot_in_use` must decide through the same `in_use`: the boot proof in a thread
-        // asks `slot_in_use`, and its control MS-7 shows that this drop reads the same table
-        // (TASKS item 68, the review's T68-1).
+        // This and `slot_in_use` must decide through the same `in_use`: the boot proofs ask
+        // `slot_in_use` (TASKS items 68 and 70), and the kernel stacks proof's W3 shows that this
+        // drop gives back a stack the records no longer hold.
         if in_use(top - self.bytes as u64, top) {
             without_interrupts(|| REGION.leak(self.slot));
             return;
@@ -519,17 +528,16 @@ pub fn counts() -> Counts {
     without_interrupts(|| REGION.counts())
 }
 
-/// Whether a processor may be using the stack `[low, top)`: what `cpu::stack_in_use` knows (a
-/// processor's stack pointer, a processor's kernel-stack record, a saved frame), or a measured
-/// call's record of the stack it left (see the module docs). Only a stack in none of them is
-/// given back.
+/// Whether a processor may be using the stack `[low, top)`: whether one of the records of the
+/// module docs holds it (`cpu::stack_in_use`). Only a stack in none of them is given back.
 fn in_use(low: u64, top: u64) -> bool {
-    cpu::stack_in_use(low, top, top) || left_on(low, top)
+    cpu::stack_in_use(low, top, top)
 }
 
 /// What a stack's drop would decide, from the records, about the stack in slot `slot`: whether
-/// one of them holds it (see the module docs). For a proof that a thread's own stack stays held
-/// while the thread is switched out on a measured stack (TASKS item 68, A1). It is not a test of
+/// one of them holds it (see the module docs). For proofs that a thread's own stack stays held
+/// while the thread is switched out on a measured stack (TASKS item 68, A1), and in the windows of
+/// its switch-out and its exit (TASKS item 70). It is not a test of
 /// whether a processor runs on the slot: a stack held by its user, such as a measured stack while
 /// its closure runs, is in no record and answers `false` (T68-3). It names no address.
 pub fn slot_in_use(slot: StackSlot) -> bool {
@@ -542,52 +550,6 @@ pub fn slot_in_use(slot: StackSlot) -> bool {
 /// It names no address.
 pub fn slot_state(slot: StackSlot) -> Option<State> {
     without_interrupts(|| REGION.state(slot.0))
-}
-
-/// The most measured calls that may run at once, on every processor together; a call past it is
-/// refused, before it takes a stack, and its closure does not run. A record is given back when its
-/// call returns, so a thread that ends inside a measured closure never gives its record back (nor
-/// one for each call it was nested in): each such record counts against these 64 for the rest of
-/// the boot (the review of TASKS item 68, T68-9).
-pub const MEASURED_CALLS: usize = 64;
-
-/// For each measured call running, the stack pointer of the stack it left; 0 is a free entry.
-/// One table for every processor: the thread that made the call may move (A1).
-static LEFT: [AtomicU64; MEASURED_CALLS] = [const { AtomicU64::new(0) }; MEASURED_CALLS];
-
-/// Whether a measured call's record lies in `[low, top)`.
-fn left_on(low: u64, top: u64) -> bool {
-    LEFT.iter().any(|entry| {
-        let at = entry.load(Ordering::Acquire);
-        at != 0 && at >= low && at < top
-    })
-}
-
-/// A record in [`LEFT`], taken for one measured call and given back when it is dropped.
-struct Left {
-    index: usize,
-}
-
-impl Left {
-    /// Records `rsp`, the stack pointer of the stack a measured call is leaving; `None` if the
-    /// table is full.
-    fn record(rsp: u64) -> Option<Self> {
-        LEFT.iter()
-            .position(|entry| {
-                entry
-                    .compare_exchange(0, rsp, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            })
-            .map(|index| Self { index })
-    }
-}
-
-impl Drop for Left {
-    fn drop(&mut self) {
-        if let Some(entry) = LEFT.get(self.index) {
-            entry.store(0, Ordering::Release);
-        }
-    }
 }
 
 /// What [`with_measured_stack`] gives back.
@@ -604,8 +566,8 @@ pub struct Measured<R> {
 
 /// Runs `f` on a stack of its own of `bytes` bytes (rounded up to whole pages), and returns its
 /// value with how deep `f` went on that stack. `None` if no stack can be had (`bytes` is 0 or
-/// more than [`MAX_STACK`], every slot is taken, there are no frames, or [`MEASURED_CALLS`] calls
-/// are already running), and then `f` has not run.
+/// more than [`MAX_STACK`], every slot is taken, or there are no frames), and then `f` has not
+/// run.
 ///
 /// The stack is a [`GuardedStack`], with the unmapped space below it that every kernel stack
 /// has: an access past its lowest byte faults, and a push there is a double fault, which the
@@ -639,24 +601,22 @@ pub struct Measured<R> {
 /// - in the boot flow on the boot processor, before any thread exists;
 /// - in the kernel code of any thread, with interrupts on or off: the thread may be switched
 ///   out while `f` runs and resumed on this stack, on another processor if the scheduler ever
-///   moves it (today's does not). The stack the call left stays in use meanwhile (the module
-///   docs), so dropping that thread's own stack leaks it rather than freeing it.
+///   moves it (today's does not). The thread's own stack stays in use meanwhile, by its home in
+///   its processor's table of contexts (the module docs; TASKS item 70, which replaced the table
+///   of stacks left that TASKS item 68's ruling A1 added), so dropping it leaks it rather than
+///   freeing it.
 ///
 /// Not in an interrupt or exception handler or on an interrupt stack, not with a spin lock held
 /// (it maps pages and takes the region's slot table, as [`GuardedStack::new`] does), and not
 /// before the stack region and the frame allocator exist. Calls may nest. `f` must return: a
-/// thread that ends inside it leaks the stack, the record of the stack it left and that stack
-/// itself, which is safe. A backtrace captured inside `f` stops at this stack's top: the walk
+/// thread that ends inside it leaks this stack, which is safe. Its own stack is given back once
+/// it is reaped, since the thread and its processor have left it. A backtrace captured inside `f` stops at this stack's top: the walk
 /// reads no further than the top of the slot it starts in (`cpu::capture_backtrace`), so it never
 /// reaches the caller's frames.
 ///
 /// The stack's contents are not wiped when it is given back: like any kernel stack, it is zeroed
 /// before its next holder gets it.
 pub fn with_measured_stack<R>(bytes: usize, f: impl FnOnce() -> R) -> Option<Measured<R>> {
-    // The record of the stack this call leaves (A1), taken first, so a full table refuses the call
-    // before any stack is taken (T68-9): any address on the caller's stack, which stays live until
-    // this returns, is a record of it. It is given back only after the switch back.
-    let left = Left::record(stack_pointer())?;
     let stack = GuardedStack::new(bytes)?;
     let size = stack.bytes();
     let words = size / 8;
@@ -674,11 +634,12 @@ pub fn with_measured_stack<R>(bytes: usize, f: impl FnOnce() -> R) -> Option<Mea
             value = Some(f());
         }
     };
-    // SAFETY: `stack` is held by this call until after the scan below, nothing runs on it (it was
-    // taken and painted here, and this code is not on it), and the stack this call leaves is
-    // recorded in `LEFT` until `left` is dropped.
+    // SAFETY: `stack` is held by this call until after the scan below, and nothing runs on it (it
+    // was taken and painted here, and this code is not on it). The stack this call leaves stays
+    // in use while `run` runs: it is a thread's own stack, which its home keeps in use (the module
+    // docs), or a stack held by its user (an outer measured stack, or a boot flow's stack, which
+    // nothing gives back).
     unsafe { run_on(&stack, &mut run) };
-    drop(left);
     let depth = stackpaint::depth(words, |word| {
         // SAFETY: as for the paint: inside the stack, which is still held. `f` has returned and
         // the stack pointer is this call's again, so nothing runs on the stack any more; an
@@ -687,15 +648,6 @@ pub fn with_measured_stack<R>(bytes: usize, f: impl FnOnce() -> R) -> Option<Mea
     });
     drop(stack);
     value.map(|value| Measured { value, depth, size })
-}
-
-/// The stack pointer where this is called.
-#[inline(always)]
-fn stack_pointer() -> u64 {
-    let rsp: u64;
-    // SAFETY: reads the stack pointer; no memory, no stack, flags preserved.
-    unsafe { asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
-    rsp
 }
 
 /// What [`run_on`] calls on the other stack.
@@ -716,8 +668,8 @@ extern "sysv64" fn enter(call: *mut Call<'_>) {
 /// # Safety
 ///
 /// Nothing runs on `stack`, and nothing will but `run` and the interrupt and exception handlers
-/// taken while it runs, until this returns: the caller holds `stack` and is not on it. If the
-/// thread can be switched out while `run` runs, the stack it is leaving is recorded in `LEFT`.
+/// taken while it runs, until this returns: the caller holds `stack` and is not on it. The stack
+/// the caller is leaving stays in use while `run` runs, as [`with_measured_stack`] says.
 unsafe fn run_on(stack: &GuardedStack, run: &mut dyn FnMut()) {
     let mut call = Call { run };
     let top = stack.top();
