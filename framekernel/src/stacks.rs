@@ -425,23 +425,27 @@ fn cost(com1: &mut Console, tsc_hz: u64) -> bool {
 
 // ---------------------------------------------------------------- the switch windows
 
-/// How long the boot flow waits, yielding, for the held thread to say it is ready, and the thread
-/// waits for its word: seconds, since the thread may first have to be scheduled, and neither
-/// side has interrupts off while it waits (ADR-0013 R1(b)).
-const READY_SECONDS: u64 = 5;
-/// The most either side spins with interrupts off: the held processor for the answer, and the
-/// boot flow for the hold. Below the TLB shootdown's one-second patience (`tlb.rs`,
-/// `WAIT_SECONDS`), with margin, so that a shootdown another processor sends meanwhile is
-/// answered in time; a clause that misses it says its processor never reached the window (the
-/// review of TASKS item 70, T70-5). The longest hold seen in `boot-matrix` was 112 µs.
+/// The budget of every wait in the switch windows made with interrupts on, each a wait for a
+/// step another processor takes: the boot flow's for the held thread to be ready, for its
+/// processor to be held, and for its processor's reap, and the thread's for the boot flow's word.
+/// Seconds, since the other processor may first have to be scheduled (ADR-0013 R1(b); the
+/// addendum to the review of TASKS item 70, T70-8). TASKS item 66's R7 gives such waits one
+/// budget, `sched::OTHERS_PATIENCE`, when the two meet.
+const WINDOW_WAIT_SECONDS: u64 = 5;
+/// The most the held processor spins with interrupts off for the boot flow's answer: below the
+/// TLB shootdown's one-second patience (`tlb.rs`, `WAIT_SECONDS`), with margin, so that a
+/// shootdown another processor sends meanwhile is answered in time (the review of TASKS item 70,
+/// T70-5). A hold that reaches it gives up and fails the clause. Only this wait is capped: the
+/// boot flow answers microseconds after it sees the hold, and its own wait for the hold takes
+/// interrupts (T70-8). The longest hold seen in `boot-matrix` was 154 µs.
 const HOLD_MILLIS: u64 = 500;
 
 /// The handshake between the boot flow and the held thread:
 /// - `READY`: the thread is about to switch away;
-/// - `GO`: the boot flow now spins, and will answer at once, without yielding, reaping or sending
-///   an interrupt;
+/// - `GO`: the boot flow now waits for the hold, and will answer at once, without yielding,
+///   reaping or sending an interrupt;
 /// - `HELD`: the thread's processor is held in the window, taken from `GO` by a compare-and-swap,
-///   so a processor is held only while the boot flow spins for it;
+///   so a processor is held only while the boot flow waits for it;
 /// - `ANSWERED`: the boot flow has asked, and the processor may go on;
 /// - `GAVE_UP`: the boot flow stopped waiting, taken from `GO` the same way, so no processor is
 ///   held after it.
@@ -478,6 +482,21 @@ fn spin_until(done: impl Fn() -> bool, budget: u64) -> bool {
     true
 }
 
+/// As [`spin_until`], with an interrupt window between polls ([`cpu::interrupt_window`]), so the
+/// caller answers shootdowns and takes its ticks while it waits. Still takes no lock, sends
+/// nothing, and neither yields nor reaps.
+fn wait_until(done: impl Fn() -> bool, budget: u64) -> bool {
+    let start = rdtsc();
+    while !done() {
+        if rdtsc().wrapping_sub(start) >= budget {
+            return false;
+        }
+        cpu::interrupt_window();
+        core::hint::spin_loop();
+    }
+    true
+}
+
 /// The held thread, on another processor: it records its own stack's slot, then twice tells the
 /// boot flow it is about to switch away, waits for its word, and switches: first by sleeping
 /// for a tick, then by ending. Each switch is held in its window by [`hold_in_window`]. A
@@ -494,7 +513,7 @@ extern "sysv64" fn windowed(_: u64) -> ! {
         WINDOW_STAGE.store(READY, Ordering::Release);
         spin_until(
             || WINDOW_STAGE.load(Ordering::Acquire) != READY,
-            tsc_hz.saturating_mul(READY_SECONDS),
+            tsc_hz.saturating_mul(WINDOW_WAIT_SECONDS),
         );
     };
     ready();
@@ -568,15 +587,18 @@ struct Window {
 
 /// One window, from the boot flow: waits for the held thread to be ready, gives the word, waits
 /// for its processor to be held, and asks the framework about the thread's stack. From the word
-/// to the answer nothing here yields, reaps, reclaims or sends an interrupt, so nothing waits for
-/// the held processor, which does not answer interrupts; and this side spins, interrupts off, for
-/// at most [`HOLD_MILLIS`].
+/// to the answer nothing here yields, reaps, reclaims or sends an interrupt, so nothing here
+/// waits for the held processor, which does not answer interrupts. Until the processor is held,
+/// this side takes interrupts between polls, for at most [`WINDOW_WAIT_SECONDS`], so a host
+/// stall of a second fails nothing (ADR-0013 R1(b); T70-8). Once it is held, this side asks and
+/// answers with interrupts off, in microseconds; only the held processor's own hold is capped,
+/// at [`HOLD_MILLIS`].
 fn ask_in_window(tsc_hz: u64) -> Window {
     let start = rdtsc();
     crate::sched::yield_until(
         || WINDOW_STAGE.load(Ordering::Acquire) == READY,
         tsc_hz,
-        READY_SECONDS,
+        WINDOW_WAIT_SECONDS,
     );
     let ready_wait = rdtsc().wrapping_sub(start);
     let window = |asked, held_wait| Window {
@@ -589,9 +611,9 @@ fn ask_in_window(tsc_hz: u64) -> Window {
     }
     WINDOW_STAGE.store(GO, Ordering::Release);
     let go = rdtsc();
-    let held = spin_until(
+    let held = wait_until(
         || WINDOW_STAGE.load(Ordering::Acquire) == HELD,
-        ticks_in(HOLD_MILLIS, tsc_hz),
+        tsc_hz.saturating_mul(WINDOW_WAIT_SECONDS),
     ) || WINDOW_STAGE
         .compare_exchange(GO, GAVE_UP, Ordering::AcqRel, Ordering::Acquire)
         .is_err_and(|stage| stage == HELD);
@@ -643,7 +665,7 @@ fn switch_windows(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: 
     let ended = ask_in_window(tsc_hz);
     let slot = WINDOW_SLOT.get().copied();
     let reaped = |slot: StackSlot| stack::slot_state(slot) != Some(State::Live);
-    crate::sched::yield_until(|| slot.is_some_and(reaped), tsc_hz, READY_SECONDS);
+    crate::sched::yield_until(|| slot.is_some_and(reaped), tsc_hz, WINDOW_WAIT_SECONDS);
     let state = slot.and_then(stack::slot_state);
     let (given_back, how) = match state {
         _ if !room => (false, "not judged: no room was kept for it"),

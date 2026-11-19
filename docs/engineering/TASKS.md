@@ -2308,7 +2308,7 @@ Assigned by the coordinating session on 2026-11-19, from the independent review 
   - Every write of `ended` is now a swap, which costs one `xchg` per thread that ends. L5 passes in 9 executions.
 - **Q5, ruling (d):**
   - The clauses are in `stacks::prove`. The thread's first switch is a one-tick sleep held in `sched::on_sleep`, not a yield held in `on_yield`, as the contract had it. A yield on this run queue switches only to another ready thread, and the idle context runs only when none is: W-0's first boot showed it, with no window held.
-  - A hold starts only by a compare-and-swap from the boot flow's word, so a processor is held only while the boot flow spins for it. Between the word and the answer the boot flow neither yields, nor reaps, nor sends an interrupt.
+  - A hold starts only by a compare-and-swap from the boot flow's word, so a processor is held only while the boot flow waits for it. Between the word and the answer the boot flow neither yields, nor reaps, nor sends an interrupt; since the addendum to the review (T70-8) it takes interrupts until the hold begins.
   - W3 judges the slot's state after the processor's reap, with room in the cache of kept stacks checked first. A `Lost` state is then the drop's own leak, never a reclaim's.
 - **Ruling (e), the budget:** 5 s each way. The longest holds in the gates' `boot-matrix` were 112 µs (switch-out) and 72 µs (exit), both on the 65-processor AMD-Vi machine; on every other machine they were 63 to 87 µs and 0 to 61 µs. On the 1-processor machines the clauses say they were not asked.
 - **Q6:** W-0 failed as the evidence it was meant to be: `in use: false` in both windows, boot refused. W-1, W-3, W-4 and P-1 each failed as aimed.
