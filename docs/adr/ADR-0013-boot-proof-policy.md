@@ -95,14 +95,14 @@ It claims only what was recorded. "Passed" means the proof found nothing wrong: 
 | Page tables (`init_paging`) | No NX, tables not built, kernel left at a low alias, or a W^X or guard probe did not fault | No | Everything |
 | Frame allocator (`prove_frames`) | RAM does not hold data, or the allocator's bookkeeping is wrong | No | Heap |
 | Heap (`prove_heap`) | Contents wrong or a leak | No | Everything after it |
-| APIC timer (`timer::init`) | No x2APIC, or no calibration source worked (the 8254, then the ACPI PM timer, then CPUID 15h's TSC rate), or the tick rate is wrong: no preemption, clock or timeouts. Refused under R1(a): nothing can run without a tick | **Only with no working source at all**, since F3 | Everything |
+| APIC timer (`timer::init`) | No x2APIC, or no calibration source worked (the 8254, then the ACPI PM timer, then CPUID 15h's TSC rate), or the tick rate is wrong: no preemption, clock or timeouts. Refused under R1(a): nothing can run without a tick | **Only with no working source at all**, since F3. *(2026-11-19, TASKS item 66: and under QEMU's software processor a host that leaves the processor unscheduled, whose timer's expiries QEMU then merges: on the 65- and 67-processor machines at a host load of about 40 the 50 interrupts took 1,027 and 1,070 ms. Such a run, told by its median gap, is measured again, up to 4 runs; a calibration window spoiled the same way, up to 1,024 times. See "Timing proofs that judge the kernel" below)* | Everything |
 | NMI stack (`prove_nmi_ist`, split) | An NMI ran somewhere other than its own stack, IST2: a kernel that would take an NMI on a user-chosen stack (ADR-0003) | No: it is decided by where the frame landed, once one arrived | Every NMI |
 | Per-processor control state (`smp::start`) | A processor allows ring 3 RDPMC or FSGSBASE, leaves SYSENTER or a debug breakpoint armed, or will not raise #MC or #MF | No: register reads | Ring 3 |
 | Boot steps run once (`kernel_main`) | A boot step ran out of turn or a second time when the framework's guards should have refused it: the heap, the allocator or running processors reset under the kernel | No: the guards are one flag each, with no measurement | Everything after them |
-| Preemption (`sched::prove`, split) | A processor's two workers did not both run there, or switched fewer than 15 times, or a thread stack's guard did not fault | Only with the tick already broken: passes at any load seen | Everything |
+| Preemption (`sched::prove`, split) | A processor's two workers did not both run there, or switched fewer than 15 times, or a thread stack's guard did not fault | Only with the tick already broken: passes at any load seen. *(2026-11-19, TASKS item 66: not so on the 65-processor machine, where a 500 ms window of the host's time held 12 to 14 switches on one processor in five boots, two of them with load from outside the turn. Since then the window ends when every processor has taken 50 of its own ticks, 500 ms on a real machine, within 10 s, so only a tick that does not come fails it)* | Everything |
 | SIMD state (`prove_simd`) | One thread saw another's registers | No: a corruption count | Every thread |
 | Ring-3 isolation (`user::prove`) | A user program read kernel memory or ran a privileged instruction, or two processes shared an address space | No | Ring 3 |
-| TLB shootdown (`tlb::prove`) | A processor kept a stale translation after an unmap | No | Every unmap |
+| TLB shootdown (`tlb::prove`) | A processor kept a stale translation after an unmap | No. *(2026-11-19, TASKS item 66: its wait for the probers on the other processors was 2 s, which one starved processor outran once on the 65-processor machine with three busy loops on the host, no stale read seen; it is now `sched::OTHERS_PATIENCE`, 10 s, as are `sched::settle`'s waits and the 2 s waits of the kernel-wide bound and the Rust program)* | Every unmap |
 | Wait queues (`wait::prove`, split) | Items lost or reordered, or a thread never woke | No | IPC, drivers |
 | IPC and handles (`ipc_proof::prove`) | A handle or quota check let a hostile call through, or a call produced a status its definition does not declare. This one result also covers a leak check | No | Ring 3 |
 | Process and thread objects (`ipc_proof::prove_objects`) | A handle of the wrong type or with too few rights was accepted, a process's memory outlived its last thread, `TERMINATED` came before the memory went or did not come, a process ID was reused, or a wait on a process handle was not cancelled. This one result also covers a leak check | No: a failure is a wrong status or a count, and every wait in it has a deadline far above any load seen | Ring 3 |
@@ -141,7 +141,7 @@ Apart from the SMEP proof's stale translation above (Intel, fixed on the CI bran
 | Backtrace (`prove_backtrace`) | Panic reports lose frames | No, but nothing rests on it |
 | Bus transactions settled (`pcie::settle`) | A device has a request outstanding after 100 ms; its reads return to it alone (T4) | Yes |
 | NMI delivery (`prove_nmi_ist`, split) | An NMI sent to this processor did not arrive within a second. Says nothing about the stack, so the stack proof then did not run | Yes: it is what the rule R1(b) calls being a different machine, where the delivery itself has not been shown |
-| Clock sources (`time::init`) | The RTC, HPET or PM timer disagrees with the TSC, or the wall clock is unreadable. Nothing uses HPET or the PM timer, and the monotonic clock is published either way | Yes: firmware values, PIT gating |
+| Clock sources (`time::init`) | The RTC, HPET or PM timer disagrees with the TSC, or the wall clock is unreadable. Nothing uses HPET or the PM timer, and the monotonic clock is published either way | Yes: firmware values, PIT gating. *(2026-11-19, TASKS item 66: and, under QEMU's software processor, a calibration window spoiled by the host, kept when no window of 32 was clean: every refuted RTC second recorded from 2026-11-14 to 2026-11-19. The windows now go to 1,024 and the RTC second to 5.2 s)* |
 | The clock as ring 3 reads it (`ipc_proof::prove_user_clock`, added by task S3-6) | A reading of `clock_read` from ring 3 was less than the one before it, or outside what the kernel read before the process started and after it ended; a wait until a deadline taken on the same clock ended before it; or a bad out pointer was not `fault` (ADR-0005 C13, Amendment 7 F10). Nothing relies on `clock_read` yet, and the monotonic clock under it has its own proof | No: the floor (ADR-0012) keeps every reading at or above the last on any processor, and the window is the kernel's own readings around the process. Its figure, one read's interval through the script interpreter, is judged by nothing |
 | I/O APIC routing (`irq::prove`) | The PIT's IRQ0 did not arrive through the I/O APIC, with the 8254 counting. A machine whose 8254 does not count reports that it cannot prove this and passes (F3) | Only with the 8254 counting and something else wrong |
 | CPU topology, NUMA affinities, NUMA distances | Firmware and CPUID disagree. The scheduler uses none of it yet | Yes: firmware tables |
@@ -152,10 +152,10 @@ Apart from the SMEP proof's stale translation above (Intel, fixed on the CI bran
 | Scheduler weights | Shares off under load | **Seen** failing under load (1 boot in 30, all cores loaded) |
 | Thread lifecycle, refused spawns, thread reaping | Accounting or a leak; a yield or sleep out of bounds | Yes: timing bounds. A leak is a bug, not a safety failure |
 | Measured stack in a thread (`measured_stack::prove_in_thread`, added by TASKS item 68) | A kernel thread running the recursion on a measured stack, and yielding at its deepest level, did not come back with its value; or the boot flow did not run while the thread sat on the measured stack; or the thread's own stack was not in use meanwhile, which would let a safe caller's early drop free it under the thread (the ruling A1); or the depth was less than 128 bytes below the sample, so the yield's trap frame was not counted; or, once the thread was reaped, its own stack was not given back (its slot `Lost`), which a measured call's record left behind would cause (T68-1). It runs just after "thread reaping" has closed with a settle (T68-5), so the reaped stack is kept for reuse and no shootdown touches it: a lost slot there is a leak, never a stalled shootdown. Its bounds count yields, not time. Nothing the kernel does uses a measured depth yet | No: no timing bound, and no shootdown on its stack |
-| TSC consistency (`prove_consistent`) | Counters disagree. The clock does not rest on this (ADR-0012 C2, C4) | **Seen**: 16 ticks on an EPYC 9V45 |
+| TSC consistency (`prove_consistent`) | Counters disagree. The clock does not rest on this (ADR-0012 C2, C4) | **Seen**: 16 ticks on an EPYC 9V45. *(Its 100 handoffs, and the monotonic clock's, may take 5 s since TASKS item 66, not 500 ms)* |
 | Concurrent console, and the console's interrupt and screen sections | A processor's lines did not all print, or a line sent or drawn in sections did not behave: diagnostics, nothing rests on them | Yes |
 | Monotonic clock (`prove_monotonic`) | The clock's own contract (ADR-0012 C1) did not hold, or its in-boot control did not catch a skew. Report because it also needs processors to interleave, and nothing P0 rests on the clock's order today | Yes: interleaving |
-| Wait timing | Round-trip or wake-up latency out of bounds | Yes |
+| Wait timing | Round-trip or wake-up latency out of bounds | Yes. *(2026-11-19, TASKS item 66: a timed wait sleeps whole ticks of its own processor, so a late one is a processor that lost ticks; such a run is measured again, up to 8 runs, against the same bounds, and a late run with its ticks there fails at once. A late or early run's line now ends `wait timing failed`, this row's own word, and `wait queues failed` is kept for the Refuse half (TASKS item 66, Q4))* |
 | IOMMU proofs through NVMe (`storage::prove_iommu`) | Translation or blocking did not behave. Skipped on a disk that is not the boot test's, and on a machine with no NVMe controller, which is reported and passes (F4) | Not on a machine that merely lacks the controller, since F4 |
 | Remapped I/O APIC (`irq::prove_remapped`) | Interrupt remapping of the PIT's pin. Skipped on a machine whose 8254 does not count, which is reported and passes (F3) | **Seen**: KVM's split irqchip fails both IRTE steps every boot |
 | Bus mastering after the drivers (`pcie::prove_bus_mastering`) | A function has the wrong bus-master state. On a platform with no IOMMU there are no domains to compare, and it says so and passes (F5). Still a Report: nothing yet depends on it | Not on a machine that merely has no IOMMU, since F5 |
@@ -588,6 +588,74 @@ The verdict's branches are host tests too (`framekernel/src/aml_proof/tests.rs`)
 | MS-6 | As above | R1 passed; R2: `... its own stack in use meanwhile false; ...; its own stack given back after the reap true (kept for reuse); measured stack failed` |
 | MS-7 | **New (T68-1):** `Left::drop` emptied (`stack.rs`), so every measured call's record stays behind | R1 passed (its three stale records point into the loader's stack and hold nothing); R2: `... its own stack in use meanwhile true; ...; its own stack given back after the reap false (lost); measured stack failed`. The thread's stale record kept its stack in use at the reap, so the drop leaked it: the drop reads the table |
 
+**Timing proofs that judge the kernel, not the host's load (TASKS item 66, 2026-11-19).** Under QEMU's software processor the boots' timing failures since 2026-11-14 came from time the guest did not get, not from the kernel. Three causes:
+- **Spoiled calibration windows.** On the 65- and 67-processor machines about 98 % of the calibration's 10 ms windows are spoiled. With all 32 spoiled, the least disturbed window was kept, up to 2.9 % off, and the RTC second then refuted it: every refuted second in the records.
+- **Merged ticks.** QEMU merges a periodic timer's expiries while the virtual processor is away. The timed waits, the preemption rounds and the tick proof count those ticks.
+- **Late threads on other processors.** A 2 s wait can end before a starved processor runs its thread.
+
+Each proof can see its own disturbance, from its own processor's ticks or its own brackets. So each now follows the rule the ping-pong, the timer queue and the weights already followed: evidence of a disturbance buys a repeat against the same bound, never a looser verdict; a run over the bound without that evidence fails at once; the budget is bounded, and the line says which run decided. The changes:
+- **Calibration:** up to 1,024 windows instead of 32 (APIC timer, Refuse).
+- **The APIC timer's rate:** the first 50 interrupts, judged by their median gap, with up to 4 runs (Refuse).
+- **The RTC second:** decided within 5.2 s instead of 3.2 s (Clock sources, Report).
+- **The timed waits:** a late run whose processor lost ticks is run again, up to 8 runs (Wait timing, Report).
+- **The preemption window:** it ends when every processor has taken 50 of its own ticks, within 10 s (Preemption, Refuse).
+- **The clock proofs' handoffs:** 5 s instead of 500 ms (TSC consistency and the monotonic clock, Report).
+- **Waits on other processors:** a Refuse proof's 2 s wait for a thread there is 10 s (`sched::OTHERS_PATIENCE`), and so is the clock proofs' wait for their turn-takers.
+- **Stalled shootdowns:** each is recorded, and the reaper prints a line where a stack is lost.
+
+No real-machine bound and no proof's class changed. R8 and Amendments 2 and 3 are untouched. The evidence (33 boots of the `kernel boot` scenario in the machine's turn, idle and with planted busy loops) is in `TASKS.md`, entry 66's contract.
+
+**On a machine without a hypervisor, a repeat is a finding** (the coordinating session's ruling, 2026-11-19).
+- **What each repeat looks like.** It is always said on its line: `run R of N (after a stalled run)` on the APIC timer's and the timed waits' lines, `N disturbed windows discarded` on the calibration's, and the length of the preemption window on its own line.
+- **What it means there.** On physical hardware no host deschedules the processor, so such a line means an SMI, a firmware stall or a kernel that held interrupts off. It is a finding for qualification review (CLAUDE.md §74), not a silent pass.
+- **Proofs that can now pass a run so disturbed:**
+  - the APIC timer's rate (Refuse; the next run);
+  - the calibration (by later windows);
+  - the RTC second (by later edges);
+  - the timed waits (the next run);
+  - the preemption window (by waiting for its ticks);
+  - the clock proofs' handoffs;
+  - every Refuse proof's wait on another processor.
+- **Already so before TASKS item 66:** the ping-pong, the timer queue and the weights.
+
+**Controls of TASKS item 66 (2026-11-19, QEMU 11.1.3 TCG, Intel VT-d, the kernel boot alone, 2 processors unless stated):** temporary edits to the committed tree at `fff57502`, each booted once and the file put back with `git checkout`, compared with `HEAD` after each. T66-5 and T66-7 ran again at `d906221d`, after the timing half's failures took their own word, and are given as they ran there.
+
+| # | Edit | Result |
+|---|---|---|
+| T66-1 | The calibration's first 40 windows forced dirty | `TSC 999 MHz (40 disturbed windows discarded)`: the 41st was kept, and the boot passed |
+| T66-2 | Every calibration window forced dirty | `(1024 disturbed windows discarded)`: the least disturbed was kept, the RTC second confirmed it, and the boot passed |
+| T66-3 | The RTC second measured against a rate 2 % too high | `one RTC second lasted 1000029 us on the calibrated TSC (+/- 4 us, over 1 s): clock failed`: refuted |
+| T66-4 | The RTC's seconds register read as 0, so no update is ever seen | `the RTC did not complete two updates in 5.2 s: clock failed` |
+| T66-5 | `sched::block_until` sleeps 4 ticks too many: a deadline missed with the ticks there | `timed out true after 89 ms … their processor lost 0 and 0 ticks …, run 1 of 8: wait timing failed`: at once |
+| T66-6 | The unsignalled waiter's processor holds interrupts off for 100 ms before its first wait | `… after 50 ms …, run 2 of 8 (after a stalled run)`: repeated, then passed |
+| T66-7 | The same before every wait | `… after 100 ms …; their processor lost 9 and 0 ticks …, run 8 of 8 (after a stalled run): wait timing failed` |
+| T66-8 | CPU 1's two workers spawned with weights 1024 and 1: its ticks come and it barely switches | `CPU 1: workers 2 and 3 counted 487747000 and 12311000, 3 context switches: scheduler failed` |
+| T66-9 | CPU 1's first worker holds interrupts off for 400 ms as it starts | `preemptive multitasking: 4 non-yielding threads on 2 CPUs all ran, in 900 ms`: the window waited for CPU 1's ticks, and the boot passed |
+| T66-10 | CPU 1's timer never started | `the preemption window reached its 10 s budget with CPU 1 short of 50 of its own ticks`, then `workers did not exit: scheduler failed` |
+| T66-11 | The proof's initial count doubled: the tick half as fast | `50 interrupts in 1005984 us, expected 50 in 500000 us (median gap 18117 us, longest 29154 us, run 1 of 4): APIC timer is wrong`: at once, on the median |
+| T66-12 | Interrupts off for 300 ms after the 5th interrupt of the first run | `APIC timer: 50 interrupts at 100 Hz in 503 ms (initial count 625043), run 2 of 4 (after a stalled run: a gap of 300 ms)` |
+| T66-13 | The same in every run | `50 interrupts in 793085 us, … (median gap 10320 us, longest 300011 us, run 4 of 4, after a stalled run): APIC timer is wrong` |
+| T66-14 | CPU 1's first TSC reading in the consistency run taken 10 ms back | `TSC consistent across 2 processors: 22794 ordered readings, 19486 handoffs between processors, 1 backwards (worst 9945000 ticks): clock failed`. A first try with a step of 1,000 ticks (1 µs) did not land behind the other processor's reading and the boot passed; it was run again with 10 ms |
+| T66-15 | The boot processor joins the consistency run 600 ms late (the old cap was 500 ms) | `TSC consistent across 2 processors: 56095 ordered readings, 101 handoffs between processors, 0 backwards`: passed |
+| T66-16 | The other processor takes no turns in the consistency run | `TSC consistent across 2 processors: 821823 ordered readings, 0 handoffs between processors, 0 backwards (worst 0 ticks): clock failed`, at the 5 s budget |
+| T66-17 | The TLB prober on CPU 1 never probes | `0 of their 3 reads faulted and 0 saw a stale translation: TLB failed`, after the 10 s wait |
+| T66-18 | The TLB prober on CPU 1 held back 3 s | `3 of their 3 reads faulted and 0 saw a stale translation`: passed, where the 2 s wait would have failed |
+| T66-19 | The 21st kernel-page shootdown (a stack's reclaim) waits 1 s and reports a stall of the next processor, as T67-e did (4 processors) | `TLB: a shootdown from CPU 1 waited 1000 ms for CPU 2, which did not answer (stall 1 of this boot); 1 kernel stacks withheld for good, with their frames`, then the IPC proof's `not settled before its compare: 1 kernel stacks lost to a stalled shootdown: ipc failed`, as before. A first try named the asking processor as the one that did not answer, and was run again |
+
+Each fault failed where aimed (T66-3, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17), and each disturbance short of the budget was repeated and passed (T66-1, 2, 6, 9, 12, 15, 18). The files were the same as `HEAD` after each. Nothing here ran under KVM or on a physical machine.
+
+**After the change** (the same evidence boots on `d906221d`, 2026-11-19 05:32 to 05:54 UTC, 20 boots in one turn).
+- **Calibration:** on the 10 idle boots of the 65- and 67-processor machines, a clean window came after 1 to 53 spoiled ones. One boot needed more than 32, and two of three at three busy loops did; each would have kept a disturbed window before.
+- **No refutation:** no RTC second was refuted, the largest disagreement being 2,464 µs.
+- **Preemption:** the fewest switches on a processor rose from 17 to 52, because the window lasted 585 to 1,190 ms until every processor had its ticks.
+- **The timed wait:** it ended after 50 to 69 ms.
+- **Failures, each under planted load:**
+  - At three busy loops, one boot of the 65-processor machine failed `clock: turn-takers did not start`: the clock proofs' own 2 s wait for their turn-takers, given `sched::OTHERS_PATIENCE` in `5352f06c` as a result.
+  - At ten busy loops, the 65-processor machine's tick proof stayed stalled through its 4 runs and was refused (`run 4 of 4, after a stalled run`).
+  - At ten busy loops, the 67-processor machine passed it at run 4 and then failed `workers did not exit` after 10 s, its cause not established from one boot.
+
+  Before TASKS item 66 both of those machines stopped at the tick proof's first run. Ten busy loops are outside load that the machine's turn exists to prevent; there the proofs measure the host, and say so by failing.
+
 ## Alternatives
 
 | Alternative | For | Against |
@@ -693,7 +761,7 @@ Each consumer refuses when a draw fails. None of them sees what the proof checks
 
 ## Amendment 3 (Accepted, 2026-11-15): a kernel stack lost to a stalled shootdown on the oversubscribed software-processor machines is reported, not failed, or its boot is run once more
 
-**Status: Accepted by the owner on 2026-11-15 ("Accept 313", decision sheet item 313). Its second part was replaced the same day, before the amendment reached `main` ("Accept 314 (re-run)", item 314). Built by TASKS item 69 under QEMU, not yet on `main`.** It holds until TASKS item 66 decides a lasting rule from measured figures.
+**Status: Accepted by the owner on 2026-11-15 ("Accept 313", decision sheet item 313). Its second part was replaced the same day, before the amendment reached `main` ("Accept 314 (re-run)", item 314). Built by TASKS item 69 under QEMU, not yet on `main`.** It holds until TASKS item 66 decides a lasting rule from measured figures. *(2026-11-19: TASKS item 66's figures: no stack lost on its own since 2026-11-14, in this task's 14 large-machine boots that ran whole or in the batch's notes. Its proposal, put to the owner as decision item 316: keep this amendment until a stalled reclaim is retried rather than lost (TASKS item 73), then end it, so that `lost: 0` holds on every machine again. Since TASKS item 66 each stall is recorded and the reaper names the processors where a stack is lost)*
 
 **Why.** When a retired kernel stack is reclaimed, the reclaim's shootdown waits at most its patience, 1 s, for every processor to answer. If one does not, the slot and its 4 frames are withheld for good, because a stale translation may remain: safe by design, and a cost in memory, not in correctness. On the 65- and 67-processor machines of ADR-0008 D7, which run 65 or 67 guest processors on the development Mac's 10 threads under QEMU's software processor, a guest processor left unscheduled for over a second produces exactly that. On 2026-11-14 TASKS item 59's `boot-matrix` failed three times that way, before any of its own code ran (one to three slots lost, on the 67-processor machine and on both 65-processor machines), and passed on other runs of the same build. Under R8 `cargo xtask` fails a boot on the stacks proof's `lost: 0` and on every `: X failed` line, so those machines could not be a gate that passes reliably. TASKS item 67 (the settle before whole-machine count compares) names such a loss in the kernel's own proofs as "N kernel stacks lost to a stalled shootdown".
 
