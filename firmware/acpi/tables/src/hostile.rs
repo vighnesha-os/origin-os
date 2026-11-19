@@ -319,7 +319,10 @@ fn tables_without_a_header_never_escape() {
 
 /// A large table of `sample`'s signature: its fixed part once, then its structures repeated
 /// `copies` times, the counts VIOT and PMTT keep set to match. The repeats' references point into
-/// the first copy, so the parsers' acceptance paths and lookups run on every structure.
+/// the first copy, so the parsers' acceptance paths and lookups run on every structure. Two
+/// tables' rules between structures would refuse a plain repeat at its first copy, so the copies
+/// are made to keep them: the MSCT's domain ranges are moved up past the first copy's, and the
+/// FPDT's later copies take a reserved record type (4), which allows any number.
 fn replicate(sample: &[u8], fixed: usize, copies: usize) -> (Vec<u8>, usize) {
     let body = &sample[36..];
     let (head, structures) = body.split_at(fixed);
@@ -333,6 +336,48 @@ fn replicate(sample: &[u8], fixed: usize, copies: usize) -> (Vec<u8>, usize) {
         &[head, &structures.repeat(copies)].concat(),
     );
     let n = per * copies;
+    let first = 36 + head.len();
+    let width = structures.len();
+    for k in 1..copies {
+        let at = first + k * width;
+        match &sample[..4] {
+            // Every copy's ranges above the last one's, so they ascend without a gap.
+            b"MSCT" => {
+                // Each structure's length is its second byte; its range's low and high at 2 and 6.
+                let starts = |base: usize| {
+                    let mut r = base;
+                    let mut v = Vec::new();
+                    while r + 10 <= base + width && t[r + 1] >= 10 {
+                        v.push(r);
+                        r += usize::from(t[r + 1]);
+                    }
+                    v
+                };
+                let u32_at =
+                    |t: &[u8], f: usize| u32::from_le_bytes(t[f..f + 4].try_into().unwrap());
+                let stride = starts(first)
+                    .iter()
+                    .map(|&r| u32_at(&t, r + 6))
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                for r in starts(at) {
+                    for f in [r + 2, r + 6] {
+                        let v = u32_at(&t, f) + k as u32 * stride;
+                        put(&mut t, f, 4, u64::from(v));
+                    }
+                }
+            }
+            b"FPDT" => {
+                let mut r = at;
+                while r + 3 <= at + width {
+                    put(&mut t, r, 2, 4);
+                    r += usize::from(t[r + 2]).max(1);
+                }
+            }
+            _ => {}
+        }
+    }
     match &sample[..4] {
         b"VIOT" => put(&mut t, 36, 2, n as u64),
         b"PMTT" => put(
