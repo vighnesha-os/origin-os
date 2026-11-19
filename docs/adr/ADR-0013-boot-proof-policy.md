@@ -561,6 +561,19 @@ The verdict's branches are host tests too (`framekernel/src/aml_proof/tests.rs`)
 
 **Again on the answers to the review of B4** (2026-11-18, 18:25 to 18:27 UTC, one turn, at `dad56c18`): the same six controls, each caught the same way, and every file restored byte for byte. The baseline passed: `1 tables, 8521 bytes of AML loaded in 9286 us; 38 devices walked in 4539 us`, the deepest host call 6,224 bytes below the proof's entry and 47,119 above the guard page. B4-9's new failure, "the DSDT changed between two reads", is a host test only: no boot control plants it.
 
+**Controls of the measured stack (TASKS item 68; 2026-11-19, 00:15 to 00:18 UTC, QEMU 11.1.3 TCG with OVMF, Intel VT-d, 2 processors):** temporary edits on `claude/t68-measured-stack` at `831f7ee8`, run in the same turn of the machine as `boot-matrix` on it (`cargo xtask exclusive`), by a script that made a baseline boot of the same code, then applied each edit, ran the `kernel boot` scenario once (`ORIGIN_BOOT_TEST_ONLY="kernel boot"`), put the file back and compared it byte for byte. The tree was clean before and after. Numbered apart from every series above.
+- **The baseline passed:** `measured stack: at boot, on 16384 bytes: 8 levels: 1648 bytes measured, 1648 sampled, value right true; 64 levels: 11504 bytes measured, 11504 sampled, value right true; 176 bytes a level; an empty closure 16 bytes deep, the call 669 us; passed`, and `measured stack: in a thread, 32 levels and a yield at the deepest: 6392 bytes measured, 5872 sampled, 520 below the sample; switched away and back true after 1 yields; its own stack in use meanwhile true; value right true; ended true; passed`.
+- **Each edited boot failed** (`boot-test` exit 1), MS-1 to MS-4 and MS-6 on xtask's failure word `measured stack failed`, MS-5 on `(#DF double fault)`; every file was restored byte for byte.
+
+| # | Edit | What caught it |
+|---|---|---|
+| MS-1 | The paint skipped (`stack.rs`: the write of `PAINT` in `with_measured_stack` removed) | Every word of a fresh stack is zero, so the lowest is "changed": `8 levels: 16384 bytes measured, 1648 sampled ...; 64 levels: 16384 bytes measured, 11504 sampled ...; an empty closure 16384 bytes deep ...; measured stack failed` |
+| MS-2 | The scan one word off (`stackpaint::depth` counts from the word above the lowest changed one) | `8 levels: 1640 bytes measured, 1648 sampled ...; 64 levels: 11496 bytes measured, 11504 sampled ...; measured stack failed`: 8 bytes short at both |
+| MS-3 | The scan stops at the first painted word from the top (a hole the deepest frame reserved and never wrote) | `8 levels: 200 bytes measured, 1648 sampled ...; 64 levels: 200 bytes measured, 11504 sampled ...; measured stack failed`: the first frame's unwritten word ends it |
+| MS-4 | R2's yield removed (`measured_stack.rs`: the thread waits at its deepest level without yielding) | R1 passed; R2: `5872 bytes measured, 5872 sampled, 0 below the sample; switched away and back false after 1000 yields; its own stack in use meanwhile false; ...; measured stack failed`. The boot flow never ran while the thread sat on the measured stack, so it never asked |
+| MS-5 | R1 asked for 200 levels where the 16 KiB stack holds about 90 (`DEEP` 64 to 200) | The recursion wrote into the unmapped page below the stack: `exception 8 (#DF double fault) at rip image +0x8b1ec, error code 0x0`, in `measured_stack::level`'s stores, and the kernel halted. An overflow faults; it writes nothing past the stack |
+| MS-6 | Ruling A1's record removed (`stack.rs`: no `Left::record` before the switch) | R1 passed; R2: `6392 bytes measured, 5872 sampled, 520 below the sample; switched away and back true after 1 yields; its own stack in use meanwhile false; ...; measured stack failed`. Without the record, nothing kept the switched-out thread's own stack in use |
+
 ## Alternatives
 
 | Alternative | For | Against |
