@@ -1660,6 +1660,10 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
   - B5-R14 `83c76eb8`: `Suppressed` counts the stores in pieces apart from the tolerances;
   - the nit `d852444a`; the records, the addendum's Status column and its Resolution in the commit after it.
   - **Host tests** under the machine's turn lock on the tree those commits make (2026-11-19, 13:38 UTC): `origin-aml`'s 215 passed and 1 ignored, the kernel proof's 43 passed, formatting and both crates' Clippy clean. The same reviewer reads the B5-R10/R11 change and the rest briefly; the full gates then run once, on the final tip.
+- **The second addendum** (`docs/engineering/REVIEW_T63_B5_addendum2_2026-11-19.md`, copied in at `022f3c0f`; the same reviewer's short read, no person): B5-R10 to B5-R14 and the nit closed, the four requirements holding by probe; new, 1 Low and 1 Informational, ruled by the coordinating session the same day:
+  - B5-R15 `b028c14b`: a failed table keeps its bytes while a name it put in a package is listed, so a pass binds a name that names something rather than reporting it empty; the fix read by the coordinating session alone;
+  - B5-R16: recorded beside CL41, the pass's charge counting garbage not yet collected; with the records, the second addendum's Status column and its Resolution, in the commit after `b028c14b`.
+  - **Host tests** under the machine's turn lock on the tree of `b028c14b` (2026-11-19, 15:13 UTC): `origin-aml`'s 216 passed and 1 ignored, the kernel proof's 43 passed, formatting and both crates' Clippy clean. The full gates then run once, on the final tip.
 - **Not covered:** the similarity check owed before B5's code reaches `main` (decision item 121; a session that writes no code, with the owner's permission and sign-off); `_INI` and `_REG` after a run-time load (G17, the ACPI service's); no boot runs a run-time load; real firmware run only outside the repository (TASKS item 72's harness; item 232).
 
 
