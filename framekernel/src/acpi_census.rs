@@ -63,6 +63,9 @@ pub trait Firmware {
     /// structures that change after boot, asked without lending (`firmware::guards`; the review
     /// of TASKS item 71, T71-7). A reader that cannot ask (the AML proof's, which runs no
     /// census) says it would not refuse, so a census run through it fails rather than passes.
+    /// It is a test of the guard, never a precondition to lend: that default is fail-closed only
+    /// because the census counts "not refused" as a failure, and a caller that lent on `false`
+    /// would be fail-open (the addendum review of TASKS item 71, its caution on decision 2).
     fn guards(&mut self, _addr: u64, _len: usize) -> bool {
         false
     }
