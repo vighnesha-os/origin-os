@@ -502,7 +502,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 67. **Every boot proof that compares whole-machine heap or frame counts settles the machine first (found by TASKS item 58's investigation of TASKS item 59's `boot-matrix` failure, 2026-11-14). Assigned by the coordinating session on 2026-11-14, on `claude/ipc-free-frames` from `land/batch-5` at `6402192`; its contract is under "Task contracts".** On the 65-processor VT-d machine the IPC proof once ended with 60 more free frames than it began, the heap exact: kernel stacks that the console and TLB proofs' threads left, retired and reclaimed one shootdown at a time, were given back during it. The count also drifts the other way when the idle stack cache refills. Done means: one `sched::settle` (reap, no zombies, the idle cache trimmed, every retired stack reclaimed) before the first read and before the compare in every such proof, a gate that a new one cannot leave it out, three planted boots under ADR-0013, and the cost stated (ADR-0018 V3).
 
-70. **The switch-out window in the stack records, and `resume`'s printed address; from the review of TASKS 68, T68-2. Numbered and assigned by the coordinating session on 2026-11-19 (card `task_c66f9ef9`); on `claude/sweet-wilbur-674acb` from `land/batch-6` at `0ed7bfb9`. Built and gated on 2026-11-19; not reviewed, not landed, not pushed. Its contract, the rulings and the result are under "Task contracts".** A kernel stack is given back only if no record says a processor may use it (`stack.rs`, "Giving a stack back"; ADR-0011 N6). On a switch the scheduler's hook moves the processor's kernel-stack record before `resume` records the outgoing frame, so for a moment the stack the processor still runs on is in no record; an ending thread's stack is in none from the hook until its processor leaves it. `resume`'s refusal of an unknown frame prints the frame's address, which lies in the stack region (ADR-0004 Amendment 2, A6). Done means: every thread's own stack covered by a record no switch moves, shown by Loom models and by boot clauses that stop a processor inside each window and ask from another, with planted controls; the refusal prints no address.
+70. **The switch-out window in the stack records, and `resume`'s printed address; from the review of TASKS 68, T68-2. Numbered and assigned by the coordinating session on 2026-11-19 (card `task_c66f9ef9`); on `claude/sweet-wilbur-674acb` from `land/batch-6` at `0ed7bfb9`, with `main` at `2d0187c0` merged in. Built and gated on 2026-11-19; reviewed independently the same day (`REVIEW_T70_2026-11-19.md`: no High, 1 Medium, 6 Low, all answered); not landed, not pushed. Its contract, the rulings and the result are under "Task contracts".** A kernel stack is given back only if no record says a processor may use it (`stack.rs`, "Giving a stack back"; ADR-0011 N6). On a switch the scheduler's hook moves the processor's kernel-stack record before `resume` records the outgoing frame, so for a moment the stack the processor still runs on is in no record; an ending thread's stack is in none from the hook until its processor leaves it. `resume`'s refusal of an unknown frame prints the frame's address, which lies in the stack region (ADR-0004 Amendment 2, A6). Done means: every thread's own stack covered by a record no switch moves, shown by Loom models and by boot clauses that stop a processor inside each window and ask from another, with planted controls; the refusal prints no address.
 
 72. **What the firmware does with each answer to `_OS` (decision item 315; ADR-0019 A4 and Amendment 1). Numbered by the coordinating session on 2026-11-19, on the owner's word ("Test both answers first"), and given to TASKS item 63's session.** ACPICA answers "Microsoft Windows NT" (TASKS item 64's ledger, G10), ACPI 6.6 §5.7.3 suggests a name that differs per operating-system release, and Microsoft's `_OSI` page says nothing of `_OS`. The experiment loads the DSDT and SSDTs of the server rented on 2026-11-12 into `origin-aml` on the development Mac, in a scratch copy, and runs the start-up sequence once with each answer, under two stubbed hosts (every region read 0, and all ones). It reports every named value, device status, region write and failure that differs, and what reads each. The tables stay private (decision item 232) and nothing is committed from them. Its report comes to the coordinating session, which puts item 315 to the owner again.
 
@@ -2333,3 +2333,39 @@ Assigned by the coordinating session on 2026-11-19, from the independent review 
   - the table's `Debug` writes its name alone;
   - every write of `ended` is a swap.
 - **Not shown:** anything under KVM, in CI or on a physical machine; the switch-in interleaving and the stack the scheduler never named, which no safe pause can hold a reader inside, so they rest on Q2's argument and L2. No independent review yet (Q12), and no person has reviewed the code.
+
+**Answers to the review (2026-11-19).** `REVIEW_T70_2026-11-19.md` (one AI reviewer: no High, 1 Medium, 6 Low), answered on the coordinating session's rulings. Each fix is a commit of its own, but T70-4 and T70-5 share one, since the same trim and reclaim serves both. Then `main` at `2d0187c0` was merged in (`50ec0efb`), with one conflict, in this list, kept both ways. The last commit that changes code is `50ec0efb`.
+- **T70-1 (Medium), `a42700ae`.**
+  - `stack_in_use` retires this processor's ended context inside `without_interrupts`. Ruling (c) is now answered "interrupts off": the Result's "an atomic swap, not with interrupts off" is superseded.
+  - The capacity count now states that condition.
+  - The reviewer's experiment (a) is a host test, `a_retirement_interrupted_between_its_take_and_its_clear_leaves_the_stack_covered`.
+  - No Loom model fits: the fix lies in the caller's interrupt state, which Loom cannot express. L5 already runs two retirers as threads, which over-approximates the processor.
+- **T70-6 (Low), `a2bb4146`.** A refused retirement puts its record back by a compare-and-swap from empty, with a host test.
+- **T70-2 (Low), `103ae0fd`.**
+  - `retire_ended` reads `ended` first and swaps only when it is set, so a `resume` that switches nothing executes no locked instruction.
+  - The Result's cost sentence is corrected: an exit costs two `xchg`, its record and its retirement. A switch adds none.
+- **T70-3 (Low), `352ee282`.**
+  - `contexts.rs` now says C++20 does not need the exit's record to be a swap. A read-modify-write reads the last value in the modification order, and a value sequenced after a store reads it or a later one.
+  - It says Loom 0.7.2's L5 failure with a plain store is a false alarm, which the reviewer reproduced, and that the swap is kept for Loom's sake.
+  - It adds the rule: a Loom failure on a location written by plain stores and read-modify-writes gets that check before the code changes for it.
+- **T70-7 (Low, folded in), `927e699d`.**
+  - `reap_zombies` lowers `ZOMBIES` only after the FPU area, the stack and the address space are dropped. So a `settle` that sees no zombie knows the stack is in the cache of kept stacks before it trims.
+  - This is the explanation of the directory proof's four frames on `ab25746a`. The code that does it predates this task.
+- **T70-4 and T70-5 (Low), `4775d00c`.**
+  - The clauses begin with `stack::trim` and a reclaim of every retired stack. The thread's stack then has room in the cache, and no reclaim's shootdown is under way while a processor is held.
+  - W3 without room now fails as "not judged".
+  - The two spins made with interrupts off stop at 500 ms, below the TLB shootdown's one-second patience. The waits with interrupts on keep 5 s.
+  - The line gives the boot flow's waits for readiness and for the hold. The 106 µs exit hold of `12e48e93`'s first `boot-matrix` is now recorded in ADR-0013.
+  - **W-5** is a new control that reaches W3 and fails it (ADR-0013). W-2, as the reviewer found, is caught earlier by the IPC proof.
+- **The controls again** at `50ec0efb` (08:17 to 08:20 UTC): W-1 to W-5 and P-1 each failed as aimed, and every file was put back byte for byte.
+- **Gates on `50ec0efb`**, in one turn of the machine (08:16 to 08:48 UTC), under Rust 1.100.0, the tree clean:
+  - the context table's 13 host tests and the 14 quick gates;
+  - `cargo xtask check` passed: 2,335 host tests, 0 failed, 29 ignored; Loom's 61 models passed and its 89 controls were caught, C1 to C6 by the models they aim at;
+  - `boot-test` 11 of 11;
+  - `boot-matrix` passed on its first run: 23 kernel boots and 30 window boots.
+- **Ruling (e), per machine:** on every machine with a second processor, both windows answered `in use: true`.
+  - The longest holds were 154 µs (switch-out, the 2-of-4096 listed machine) and 46 µs (exit).
+  - The boot flow waited at most 10.9 and 14.8 ms for readiness, and 179 and 113 µs for the hold.
+  - The cap is 500 ms.
+- **The open item is closed in reasoning, not by recurrence.** T70-7's path gives the logged symptom exactly: four frames, the heap exact, both settles passing. The fix removes it.
+

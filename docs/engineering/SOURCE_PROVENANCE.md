@@ -5210,3 +5210,25 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - **Before that, on `ab25746a`:**
     - `check` failed on `origin-sync`'s no-panic check (the table's first `Debug`), which `12e48e93` fixed.
     - `boot-matrix` failed twice: once on the 65-processor AMD-Vi clock proof (964733 µs), and once on `boot-x2apic`'s `-cpu max (leaf 0Bh)` machine, where the directory proof ended four frames short with both of its settles passing (`126933 free frames (was 126937)`). The latter is not explained. `boot-x2apic` six times on an export of `12e48e93` and six on one of `0ed7bfb9` (07:02 to 07:18 UTC) all passed, every directory count exact in the 24 boots: it has not recurred on the fix in 12 boots of that scenario.
+
+### TASKS item 70: the answers to its review (2026-11-19)
+
+- **What:** the answers to `REVIEW_T70_2026-11-19.md` (one AI reviewer, no High, 1 Medium, 6 Low), on the coordinating session's rulings:
+  - `a42700ae`: T70-1, the retirement in `stack_in_use` with interrupts off, and a host test of the gap;
+  - `a2bb4146`: T70-6, a put-back by compare-and-swap, with a host test;
+  - `103ae0fd`: T70-2, a load before the swap;
+  - `352ee282`: T70-3, the C++20 argument in `contexts.rs`;
+  - `927e699d`: T70-7, `reap_zombies` lowers its count last;
+  - `4775d00c`: T70-4 and T70-5, the clauses' trim and reclaim, W3 failing without room, the 500 ms cap, and the boot flow's waits;
+  - `50ec0efb`: `main` at `2d0187c0` merged in.
+- **New:** no `unsafe`, no dependency. `contexts.rs` has 13 host tests.
+- **Specifications:** the C++20 rules the reviewer cited, as `core::sync::atomic` defers to them: [intro.races] write-read coherence and [atomics.order] read-modify-write atomicity. `tlb.rs`'s one-second shootdown patience.
+- **Review:** the review above, by an AI reviewer independent of the author and of the coordinating session. The answers are to be read by the same reviewer. No person has reviewed the code.
+- **Tests:**
+  - **Controls:** W-1 to W-5 and P-1 at `50ec0efb` (ADR-0013, "The controls again, after the review of TASKS item 70"). W-5 is new and fails W3.
+  - **Gates on `50ec0efb`**, in one turn (08:16 to 08:48 UTC):
+    - the 14 quick gates;
+    - `check` (2,335 host tests, 0 failed, 29 ignored; Loom 61 models, 89 controls caught);
+    - `boot-test` 11 of 11;
+    - `boot-matrix` passed on its first run (23 kernel boots, 30 window boots, holds at most 154 µs and 46 µs).
+
