@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-14, each item with the recommended answer ("Accept all seven", decision sheet items 301 to 307; CLAUDE.md §18). Nothing in it is built beyond the static tables the kernel already parses at boot (`framekernel/frame/src/acpi.rs`, `dmar.rs`, `ivrs.rs`). Tasks A and B of A6 are TASKS items 62 and 63. **Amendment 1 (below): Accepted** by the owner on 2026-11-14 (item 309): the answers to `_OSI` and `_REV`; built by TASKS item 63 in its step B1 |
+| Status | **Accepted** by the owner on 2026-11-14, each item with the recommended answer ("Accept all seven", decision sheet items 301 to 307; CLAUDE.md §18). Nothing in it is built beyond the static tables the kernel already parses at boot (`framekernel/frame/src/acpi.rs`, `dmar.rs`, `ivrs.rs`). Tasks A and B of A6 are TASKS items 62 and 63. **Amendment 1 (below): Accepted** by the owner on 2026-11-14 (item 309): the answers to `_OSI` and `_REV`; built by TASKS item 63 in its step B1. **Amendment 2 (below): Accepted** by the owner on 2026-11-19 (item 315): the answer to `_OS`, "Origin OS"; built as the provisional value by TASKS item 63 in its step B1 |
 | Decides | What "implement ACPI 6.6 in full and completely", the owner's request of 2026-11-14, means for Origin; where the firmware's AML runs; how the interpreter is built and tested; the sources it may be written from; the order of work; and what may be claimed without a machine in the declared scope |
 | Requires | CLAUDE.md P0, P1, P5, P8; §1 (roles 7, 8, 15, 54 and 64; "Discover and report capabilities truthfully", "Deny by default", "Qualify the declared environment"); §3, §4, §5, §13, §16, §17, §19, §24, §31, §49, §58, §67, §69, §72 to §74; rules 14, 26 and 30 |
 | Performance cost | A1, A4 to A7: none, by construction. A2 and A3: unmeasured, owed, in cost ledger row CL41 |
@@ -90,7 +90,7 @@ The service's SDK interfaces; the `_OSI` policy; the Driver SDK; the path into a
 
 **Why.** Deployed firmware asks `_OSI` which interfaces the operating system supports and changes what it does on the answer, and the firmware of platforms in Origin's declared scope is validated against Windows. Microsoft publishes the strings Windows answers True to (Microsoft Learn, "How to identify the Windows version in ACPI by using _OSI", last updated 2024-09-11, read 2026-11-14; TASKS item 63's research ledger, source M1). ACPI 6.6 §5.7 defines `_REV` for an interpreter with 64-bit integers.
 
-**Decision.** `_OSI` answers Ones for each Windows string on Microsoft's published list, and Zero for every other string: other operating systems' names, `Linux` among them, unknown strings, and each feature-group string of ACPI 6.6 until the task that builds that feature adds it, so that no answer claims a capability Origin does not have (CLAUDE.md §1). `_REV` is 2. The answers are one table in the interpreter's source, and a change to it is a decision for the owner. `_OS` is not decided here: it stays the provisional "Origin OS" until TASKS item 64's reading answers what deployed firmware expects of it (gap G10), and then comes to the owner as its own item.
+**Decision.** `_OSI` answers Ones for each Windows string on Microsoft's published list, and Zero for every other string: other operating systems' names, `Linux` among them, unknown strings, and each feature-group string of ACPI 6.6 until the task that builds that feature adds it, so that no answer claims a capability Origin does not have (CLAUDE.md §1). `_REV` is 2. The answers are one table in the interpreter's source, and a change to it is a decision for the owner. `_OS` is not decided here: it stays the provisional "Origin OS" until TASKS item 64's reading answers what deployed firmware expects of it (gap G10), and then comes to the owner as its own item. *(Added 2026-11-19: decided by Amendment 2, item 315.)*
 
 **Alternatives that were put.** Answering only the feature-group strings, which firmware validated against Windows does not ask; answering Origin's own name, which no firmware knows, so it would take paths no one tested; answering `Linux` too, which some firmware treats as a reason to change behaviour.
 
@@ -99,3 +99,22 @@ The service's SDK interfaces; the `_OSI` policy; the Driver SDK; the path into a
 **Trade-offs.** Firmware takes the paths it takes for Windows, which are the ones its vendor tested; where those paths need an interface Origin lacks, the feature-group strings stay Zero and the device is reported as not supported. A string Microsoft adds later is added here by a decision, not by itself.
 
 **Migration consequences.** None: no ABI or format.
+
+## Amendment 2 (Accepted, 2026-11-19): the answer the interpreter gives to `_OS`
+
+**Status: Accepted by the owner on 2026-11-19 ("Use Origin's own name", decision sheet item 315). Built: it is the value TASKS item 63 gave `_OS` provisionally in its step B1 (`firmware/acpi/aml/src/osi.rs`), checked by the interpreter's host tests. Host tests only: not yet run in the kernel or on a machine.** It answers what Amendment 1 left open.
+
+**Why.** ACPI 6.6 §5.7.3 defines `_OS` as a string that names the operating system, and says that a well-made implementation answers differently for each operating system, so that firmware can tell them apart. ACPICA answers "Microsoft Windows NT" by default and has since 2004, because, its maintainers write, much deployed firmware compares `_OS` with that string and some asks `_OSI` only when it matches (TASKS item 64's ledger, `docs/research/2026-11-14-aml-gaps-acpica.md`, G10). They name no machine and count none, and Microsoft's `_OSI` page, which A4 ranks before ACPICA, says nothing of `_OS`. TASKS item 72 measured what one deployed firmware does with each answer. On the server rented on 2026-11-12 (decision items 224 to 236), the interpreter loaded its DSDT and nine SSDTs on the development Mac and ran the start-up sequence with each answer, under two stubbed hosts. Apart from `_OS` itself, the runs were identical: every named value, the status of each of 151 devices and processors, every region read and write, and every failure. The firmware reads `_OS` in two methods, and only on the branch taken when `_OSI` is missing; Amendment 1 defines `_OSI`, so that branch never runs. The tables stay private (decision item 232).
+
+**Decision.** `_OS` is the String "Origin OS", the operating system's own name. It is one constant in the interpreter's source, beside `_OSI`'s table, and a change to it is a decision for the owner. A name that changes with each release of Origin is not adopted: nothing yet needs it.
+
+**Alternatives that were put.** "Microsoft Windows NT", ACPICA's answer, which guards against firmware that reads `_OS` without asking for `_OSI` first, or asks `_OSI` only when `_OS` names Windows NT; and Windows' name by default, with a boot setting that reports Origin's name for diagnosis.
+
+**Evidence and its limits.** One board and one firmware build, with stubbed hardware values on a Mac, no SMM and no ACPI service. A control that compared the two stubs found the differences it should, so the method sees differences where there are some. Firmware that reads `_OS` without the `_OSI` guard would take a branch its vendor did not test with Windows. This run says nothing about such firmware, and without machines in scope, nothing can yet count it.
+
+**Performance cost (ADR-0018 V3).** None, by construction: a constant string, read when firmware evaluates `_OS`.
+
+**Trade-offs.** Origin tells firmware the truth about which operating system runs, as CLAUDE.md §1 asks of every capability it reports, and the one firmware measured does not care. Firmware that compares `_OS` with Windows' name, without `_OSI`, will treat Origin as an operating system it does not know. If physical machines in scope show that, the answer comes back to the owner with that evidence.
+
+**Migration consequences.** None: no ABI or format.
+
