@@ -204,9 +204,10 @@ Ledger 64 §3 G15 says ACPICA writes a string's bytes as one buffer, cut to the 
 - **The bound.** Each piece is a region access counted as work against the evaluation's limits. A 256 KiB buffer into a 1-bit field ends at the step limit (`a_long_buffer_into_a_one_bit_field_ends_at_a_limit`).
 - **The report.** `Pieces` is told once a store, before its first piece, within the bound of 64. The kernel's AML proof counts it apart from the tolerances and fails on one, with its own reason.
 
-**Two limits of this reading, raised with the coordinating session** (2026-11-19, not built):
-- **B2's comparison is in bytes, the Buffer row's in bits.** Data with no more bytes than the field holds is one write, cut to the field's bits, even when it has more bits than a field that is not a whole number of bytes. One byte into a 4-bit field is one write, where the row would make two pieces.
-- **Into a field narrower than 8 bits,** a one-character string is one write, its upper bits lost, as the String row says. A longer string goes in pieces of the field's bits, not one write a character: `"AB"` into a 4-bit field is four writes where the String row gives two.
+**Two stated limits** (raised with the coordinating session and ruled the same day: kept as built). Origin differs from ACPICA only where the data is longer than the field in whole bytes, which is exactly where `Pieces` reports, so every departure from the deployed interpreter shows on real firmware. Following the bit rule into fields that are not whole bytes would add a second difference, a silent one: a one-byte buffer into a 1-bit control field would make eight hardware writes, keeping the last bit, where ACPICA makes one. Nothing on record says firmware relies on that, and it is a hazard to hardware of its own.
+- **Into a field that is not a whole number of bytes,** Origin departs from the letter of Table 19.7's Buffer row ("larger in bits") and matches ACPICA's cut, unless the data is longer in whole bytes. The step this makes: one byte into a 4-bit field is one write, cut; two bytes make four pieces.
+- **Strings follow buffers,** so the String row holds exactly only for fields of 8 bits. Into a narrower field a one-character string is one write, its upper bits lost, as that row says; `"AB"` into a 4-bit field is four writes where the row gives two.
+- **A `Pieces` report seen on real firmware is a finding,** and this choice is revisited with that evidence.
 
 **`Load` and `LoadTable`: what step B4 built, and its strict choices** (S1 §19.6.77 and §19.6.78, PDF 1070 and 1071, read again on 2026-11-18; B4's contract, accepted with its twelve questions as recommended the same day). Paraphrased:
 

@@ -477,7 +477,8 @@ fn a_skip_whose_work_list_reaches_the_memory_limit_fails_the_table_whole() {
     // statement nested deep enough that its list cannot be held fails the table whole, as a limit,
     // and leaves nothing held. `Store (Add (UNDF, Add (UNDF, … , Zero), Zero), X)`: the decoder
     // fails at the first `UNDF`, two levels down; the skip steps over all 20,000 levels, a level
-    // of the work list each, more than 256 KiB can hold.
+    // of the work list each. A level is 24 bytes, so the list needs about 480 KiB: a 256 KiB limit
+    // cannot hold it, where 1 MiB, tried first, held it whole and the table loaded.
     let mut e = add(nm("UNDF"), zero(), zero());
     for _ in 0..20_000 {
         e = add(nm("UNDF"), e, zero());
