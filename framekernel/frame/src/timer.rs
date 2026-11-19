@@ -42,9 +42,6 @@ const PROOF_TICKS: u64 = 50;
 /// ([`apic::TickVerdict::Stalled`]), each against the same bounds. Each run is at most 2 s, so
 /// a boot pays for more only while disturbed (TASKS item 66).
 const PROOF_ATTEMPTS: u32 = 4;
-/// A pair of count reads is clean when its two brackets together are within this share of its
-/// interval: 1 % (the addendum review's T66-R13).
-const PERIOD_SHARE: u64 = 100;
 /// Calibration window.
 const CALIBRATION_MICROS: u64 = 10_000;
 /// APIC timer divisor during calibration and afterwards.
@@ -731,46 +728,10 @@ fn read_count(lapic: &X2Apic) -> apic::CountRead {
     }
 }
 
-/// Measures the running periodic timer's period from its count, reloaded with `initial`, in
-/// pairs of reads within one period (the addendum review's T66-R13): from one read until a fifth
-/// of the `nominal` period has passed, or to the read before the next reload if that comes
-/// first. A pair is read again if its brackets together are wider than 1/[`PERIOD_SHARE`] of
-/// its interval, if it is shorter than a twentieth of the nominal period, or if two of its reads
-/// are further apart than a hundredth of it, time in which a reload could pass unseen. The
-/// first clean pair, and how many pairs were tried; `None` after [`apic::PERIOD_PAIRS`].
+/// Measures the running periodic timer's period from its count, reloaded with `initial`
+/// ([`apic::sample_period`], which judges the reads).
 fn sample_period(lapic: &X2Apic, initial: u64, nominal: u64) -> (Option<apic::PeriodSample>, u32) {
-    let target = nominal / 5;
-    let least = nominal / 20;
-    let gap = nominal / 100;
-    let twice_middle = |r: &apic::CountRead| r.before.wrapping_add(r.after);
-    let mut tried = 0;
-    let mut first = read_count(lapic);
-    let mut prev = first;
-    while tried < apic::PERIOD_PAIRS {
-        let next = read_count(lapic);
-        if next.before.wrapping_sub(prev.after) > gap {
-            // Away between two reads for long enough that a reload could have passed unseen.
-            tried += 1;
-            first = next;
-            prev = next;
-            continue;
-        }
-        let reloaded = next.count > prev.count;
-        let last = if reloaded { prev } else { next };
-        let span = twice_middle(&last).wrapping_sub(twice_middle(&first)) / 2;
-        if reloaded || span >= target {
-            tried += 1;
-            if span >= least
-                && let Some(sample) = apic::PeriodSample::from_reads(initial, first, last)
-                && sample.clean(PERIOD_SHARE)
-            {
-                return (Some(sample), tried);
-            }
-            first = next;
-        }
-        prev = next;
-    }
-    (None, tried)
+    apic::sample_period(initial, nominal, || read_count(lapic))
 }
 
 /// One PIT channel-2 one-shot of `pit` input clocks, with the APIC timer counting down and
