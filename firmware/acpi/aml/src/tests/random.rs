@@ -623,17 +623,36 @@ impl Gen {
         if self.rng.chance(20) {
             // Step B5: load-time statements that fail alone, abandoned and reported: an unresolved
             // name, a call of a method defined further on (a plain name, its arguments' bytes
-            // then statements), a duplicate, and a scope over nothing.
-            body.push(match self.rng.below(4) {
+            // then statements), a duplicate, and a scope over nothing. The review of B5, B5-R4:
+            // failing `If` and `While` predicates, an unterminated string with a byte above 0x7F
+            // (inside a scope, where it ends), a package with extra elements, one of them a
+            // package of names; and B5-R1: a place naming a method that takes an argument.
+            body.push(match self.rng.below(9) {
                 0 => store(nm("\\NOPE"), debug()),
                 1 => {
                     late = true;
                     call("\\LATE", &[one(), byte(2)])
                 }
                 2 => name("N0", one()),
-                _ => scope("\\NOPE", &[name("QZ", one())]),
+                3 => scope("\\NOPE", &[name("QZ", one())]),
+                4 => if_else(nm("\\NOPE"), &[name("QF", one())], &[name("QG", one())]),
+                5 => while_(nm("\\NOPE"), &[noop()]),
+                6 => {
+                    let mut s = string("ab");
+                    s.pop();
+                    s.insert(2, 0x80);
+                    scope("\\_SB", &[name("SU", s)])
+                }
+                7 => name(
+                    "PX",
+                    package(1, &[one(), nm("\\N0"), package(1, &[nm("\\NOPE")])]),
+                ),
+                _ => store(nm("\\NOPE"), nm("\\D0.M3")),
             });
         }
+        // The statement after any abandoned one is made (B5-R1: the skip stops at the
+        // statement's end); the soak's audit looks for it whenever the block loads.
+        body.push(SENTINEL.to_vec());
         for (n, argc) in METHODS.iter().take(3) {
             let flags = *argc | if self.rng.chance(20) { 8 } else { 0 };
             let b = self.body(*argc);
@@ -659,6 +678,11 @@ impl Gen {
             let pred = self.expr(1);
             extra.push(if_(pred, &[name("QA2", one())]));
         }
+        // A duplicate across blocks: `XA` names what this block made, abandoned alone (G3; the
+        // review of B5, B5-R4).
+        if self.rng.chance(20) {
+            extra.push(name("\\N1", one()));
+        }
         // Sometimes a local or an argument at `XA`'s table level, which fails its load (B4-13).
         if self.rng.chance(10) {
             extra.push(if self.rng.chance(50) {
@@ -678,6 +702,9 @@ impl Gen {
         body
     }
 }
+
+/// `Name (QS, One)`, made after the grammar's failing load-time statement (B5-R1).
+const SENTINEL: &[u8] = &[0x08, b'Q', b'S', b'_', b'_', 0x01];
 
 /// A package of up to two elements, its count the same or one more (more elements than the
 /// count is refused, §19.6.102, and the mutated blocks reach that).
@@ -820,11 +847,17 @@ fn at_rest(i: &Interpreter<TestHost>, seed: u64) {
     );
 }
 
-/// Requires no name of a failed table.
+/// One evaluation's reports (step B5), and B5's contract §4.9's audits 1 and 3 (the review of
+/// B5, B5-R4):
+/// - at most `REPORTS`, then one `Suppressed`, and none `Suppressed` before the bound;
+/// - each table's `Abandoned` reports are no more than its count of abandoned statements, and a
+///   top-level load that failed after abandoning one failed whole, for a kind of its own: an
+///   abandoned statement never fails its table;
+/// - when the evaluation `ended` well and nothing was suppressed, every mutex its end, or a
+///   failed load in it, released other than by `Release` was reported.
 #[track_caller]
-/// One evaluation's reports (step B5): at most `REPORTS`, then one `Suppressed`, and none
-/// `Suppressed` before the bound.
-fn reports_bounded(i: &mut Interpreter<TestHost>, seed: u64) {
+fn reports_bounded(i: &mut Interpreter<TestHost>, seed: u64, ended: Result<(), ErrorKind>) {
+    use super::Told;
     let t = super::told(i);
     let bound = crate::REPORTS as usize;
     assert!(
@@ -834,9 +867,75 @@ fn reports_bounded(i: &mut Interpreter<TestHost>, seed: u64) {
     );
     for (k, r) in t.iter().enumerate() {
         assert_eq!(
-            matches!(r, super::Told::Suppressed(_)),
+            matches!(r, Told::Suppressed(_)),
             k == bound,
             "seed {seed:#x}: a report out of place: {r:?}"
+        );
+    }
+    let mut abandoned: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+    for r in &t {
+        if let Told::Abandoned { table, .. } = r {
+            *abandoned.entry(*table).or_default() += 1;
+        }
+    }
+    for (&table, &n) in &abandoned {
+        let info = i.table(table).expect("a table reported");
+        assert!(
+            info.abandoned >= n,
+            "seed {seed:#x}: table {table} counts {} abandoned, {n} reported",
+            info.abandoned
+        );
+    }
+    let suppressed = t.iter().any(|r| matches!(r, Told::Suppressed(_)));
+    if ended.is_ok() && !suppressed {
+        let told = t.iter().filter(|r| matches!(r, Told::Released(..))).count() as u64;
+        assert_eq!(
+            told, i.run.ended_holds,
+            "seed {seed:#x}: a mutex released at an end was not reported"
+        );
+    }
+}
+
+/// A top-level load that failed after abandoning a statement failed whole, for a kind of its own
+/// (B5's contract §4.9, audit 1).
+fn failed_whole(i: &Interpreter<TestHost>, seed: u64, table: u32, kind: ErrorKind) {
+    let info = i.table(table).expect("the block's table");
+    if info.abandoned > 0 {
+        assert!(
+            crate::tolerate::whole_table(kind),
+            "seed {seed:#x}: a table failed with {kind:?} after abandoning {} statement(s)",
+            info.abandoned
+        );
+    }
+}
+
+/// Every host access lies within its region (B5's contract §4.9, audit 5; the review of B5,
+/// B5-R4). An access to a region no longer in the namespace, a method's own, is not judged.
+fn within_regions(i: &mut Interpreter<TestHost>, seed: u64) {
+    let Some(log) = i.host_mut().accesses.as_mut().map(core::mem::take) else {
+        return;
+    };
+    for (path, address, bytes) in log {
+        let name: Vec<String> = path
+            .iter()
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        let name = name.join(".");
+        let Ok(Some(node)) = i.lookup(&format!("\\{name}")) else {
+            continue;
+        };
+        let Ok(obj) = i.ns.obj(node.0) else {
+            continue;
+        };
+        let Ok(Object::Region(r)) = i.heap.get(obj) else {
+            continue;
+        };
+        let end = address.checked_add(bytes);
+        assert!(
+            address >= r.offset && end.is_some_and(|e| e <= r.offset.saturating_add(r.length)),
+            "seed {seed:#x}: an access at {address:#x}, {bytes} byte(s), outside its region \\{name} ({:#x}, {} bytes)",
+            r.offset,
+            r.length
         );
     }
 }
@@ -1061,6 +1160,7 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
     if setup.traced {
         i.host_mut().events = Some(Vec::new());
     }
+    i.host_mut().accesses = Some(Vec::new());
     i.host_mut()
         .tables
         .push((load_table_key(), 0x9000, listed().to_vec()));
@@ -1104,18 +1204,29 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
         0,
         "seed {seed:#x}: the Global Lock was kept"
     );
-    reports_bounded(&mut i, seed);
-    // The names load-time code put in packages are bound once (step B5), leaving none deferred.
-    match i.bind_deferred() {
-        Ok(_)
-        | Err(crate::Error {
-            kind: ErrorKind::Limit(_),
-            ..
-        }) => {}
-        Err(e) => panic!("seed {seed:#x}: binding failed: {e:?}"),
+    reports_bounded(&mut i, seed, load);
+    if let Err(kind) = load {
+        failed_whole(&i, seed, first_table as u32, kind);
     }
+    within_regions(&mut i, seed);
+    // The statement after the grammar's failing load-time statement is made (B5-R1).
+    if load.is_ok() && !setup.mutated && aml.windows(SENTINEL.len()).any(|w| w == SENTINEL) {
+        assert!(
+            matches!(i.lookup("\\QS"), Ok(Some(_))),
+            "seed {seed:#x}: the statement after an abandoned one was not made"
+        );
+    }
+    // The names load-time code put in packages are bound once (step B5), leaving none deferred.
+    let bound = match i.bind_deferred() {
+        Ok(_) => Ok(()),
+        Err(crate::Error {
+            kind: ErrorKind::Limit(l),
+            ..
+        }) => Err(ErrorKind::Limit(l)),
+        Err(e) => panic!("seed {seed:#x}: binding failed: {e:?}"),
+    };
     no_deferred(&i, seed);
-    reports_bounded(&mut i, seed);
+    reports_bounded(&mut i, seed, bound);
     // The block's own load may have loaded tables inside it: none failed may leave a name.
     no_failed_names(&audit(&i, 0), seed);
     at_rest(&i, seed);
@@ -1145,7 +1256,8 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
             Ok(None) => 4,
             Err(e) => 5 + e.at.map_or(0, |a| u64::from(a.offset)),
         });
-        reports_bounded(&mut i, seed);
+        reports_bounded(&mut i, seed, r.as_ref().map(|_| ()).map_err(|e| e.kind));
+        within_regions(&mut i, seed);
         // What the evaluation's loads made stays (B4's contract, Q8); nothing else may.
         let a = audit(&i, tables_after_load);
         no_failed_names(&a, seed);
@@ -1799,6 +1911,15 @@ fn planted_faults_are_caught() {
             "written for Eval(Ok(Some(Integer(133))))",
         ),
         (Fault::OldTexts, "written for Eval(Ok(Some(Integer(134))))"),
+        // The review of B5, B5-R1 and B5-R4: the audits that see them.
+        (
+            Fault::SkipCallsInPlaces,
+            "the statement after an abandoned one was not made",
+        ),
+        (
+            Fault::SilentRelease,
+            "a mutex released at an end was not reported",
+        ),
     ];
     for (f, by) in faults {
         let message = outcome(Some(f));

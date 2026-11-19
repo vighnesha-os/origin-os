@@ -86,7 +86,14 @@ pub(crate) struct TestHost {
     pub(crate) events: Option<Vec<Event>>,
     /// Every report, in order (step B5).
     pub(crate) told: Vec<Told>,
+    /// When set, every region access and transfer: the region's path, the address and the bytes
+    /// spanned, for the soak's audit that each lies within its region (B5's contract §4.9, audit
+    /// 5; the review of B5, B5-R4).
+    pub(crate) accesses: Option<Vec<Access>>,
 }
+
+/// One access the test host logged: the region's path, the address, and the bytes spanned.
+pub(crate) type Access = (Vec<[u8; 4]>, u64, u64);
 
 /// A report, as the model host keeps it (step B5).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +117,18 @@ pub(crate) enum Told {
     Released(Vec<[u8; 4]>, Vec<[u8; 4]>),
     Pieces(Vec<[u8; 4]>, u64),
     Suppressed(u64),
+}
+
+/// Each case fails with `NoReport` planted, in a run of its own: a test of a tolerance asserts
+/// its reports (B5's contract §4; the review of B5, B5-R4).
+#[track_caller]
+pub(crate) fn fails_without_reports(cases: &[fn()]) {
+    for case in cases {
+        plant(Some(Fault::NoReport));
+        let failed = std::panic::catch_unwind(case).is_err();
+        plant(None);
+        assert!(failed, "{case:?} passed with every report dropped");
+    }
 }
 
 /// The reports since the last call, taken.
@@ -149,6 +168,13 @@ pub(crate) struct BufferSeen {
 }
 
 impl TestHost {
+    /// An access to `region` at `address`, `bytes` long, kept for the soak's audit when it asks.
+    fn note_access(&mut self, region: &[[u8; 4]], address: u64, bytes: u64) {
+        if let Some(log) = &mut self.accesses {
+            log.push((region.to_vec(), address, bytes));
+        }
+    }
+
     /// An access was given `left` of time: never none (the review of B1, F9).
     fn given(&mut self, left: u64) {
         assert!(left > 0, "a region access made with no time left");
@@ -174,6 +200,7 @@ impl Host for TestHost {
     }
     fn read(&mut self, a: &RegionAccess<'_>) -> Result<u64, HostError> {
         self.given(a.time_left_100ns);
+        self.note_access(a.region, a.address, u64::from(a.width / 8));
         if self.refuse {
             self.refused += 1;
             return Err(HostError::Refused);
@@ -194,6 +221,7 @@ impl Host for TestHost {
     }
     fn write(&mut self, a: &RegionAccess<'_>, value: u64) -> Result<(), HostError> {
         self.given(a.time_left_100ns);
+        self.note_access(a.region, a.address, u64::from(a.width / 8));
         if self.refuse {
             self.refused += 1;
             return Err(HostError::Refused);
@@ -226,6 +254,10 @@ impl Host for TestHost {
     }
     fn transfer(&mut self, a: &BufferAccess<'_>, data: &mut [u8]) -> Result<usize, HostError> {
         self.given(a.time_left_100ns);
+        // An Embedded Controller transfer spans its bytes; another space's address is a command
+        // or a register, one byte of its region's space.
+        let span = if a.space.0 == 3 { data.len() } else { 1 };
+        self.note_access(a.region, a.address, span as u64);
         if self.refuse {
             self.refused += 1;
             return Err(HostError::Refused);

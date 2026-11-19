@@ -141,6 +141,10 @@ impl<H: Host> Interpreter<H> {
         let any = self.held.len() > above;
         while self.held.len() > above {
             let Some(h) = self.held.pop() else { break };
+            #[cfg(test)]
+            if h.mutex.is_some() {
+                self.run.ended_holds = self.run.ended_holds.saturating_add(1);
+            }
             if let Some(r) = h.mutex
                 && let Ok(Object::Mutex(m)) = self.heap.get_mut(r)
             {

@@ -970,6 +970,46 @@ fn method_packages_resolve_when_read() {
 // --- The controls ----------------------------------------------------------------------------
 
 #[test]
+fn every_tolerance_test_fails_without_its_reports() {
+    super::fails_without_reports(&[
+        unresolved_name_abandons_its_statement,
+        forward_call_bytes_after_the_name_load_as_statements,
+        operand_failure_skips_the_whole_statement,
+        failed_scope_opener_skips_its_body,
+        failed_predicate_skips_if_and_else,
+        failed_predicate_skips_the_while_on_its_third_pass,
+        statement_in_a_body_fails_alone,
+        method_error_abandons_its_calling_statement,
+        duplicate_keeps_the_first_object,
+        scope_over_an_integer_stays_refused,
+        abandon_and_skip_are_bounded,
+        already_loaded_is_refused,
+        loaded_table_with_abandoned_statements_gives_true,
+        a_boot_tables_local_abandons_its_statement,
+        a_place_naming_a_method_is_skipped_as_a_name,
+        a_place_naming_a_method_before_a_device_keeps_the_device,
+        a_place_naming_a_method_in_a_body_does_not_run_past_it,
+        a_mutex_a_method_declared_is_held_past_its_names,
+        a_failed_runtime_load_reports_what_it_releases,
+        a_skip_whose_work_list_reaches_the_memory_limit_fails_the_table_whole,
+        unbound_element_is_empty_and_reported,
+        initialize_binds_first,
+        runtime_load_binds_its_own,
+        a_runtime_loads_pass_binds_only_its_own,
+        a_limit_in_a_runtime_loads_pass_fails_the_table,
+        names_nothing_can_read_are_never_bound_whether_or_not_the_collector_ran,
+        high_bytes_accepted_and_reported,
+        unterminated_string_ends_at_its_range,
+        unterminated_string_in_a_package,
+        extra_elements_dropped_and_reported,
+        long_stall_reported,
+        strings_go_to_a_field_as_a_buffer_of_their_bytes,
+        ec_pieces_are_one_transfer_each,
+        a_long_buffer_into_a_one_bit_field_ends_at_a_limit,
+    ]);
+}
+
+#[test]
 fn planted_faults_are_caught_by_the_tolerance_tests() {
     let tests: [Control; 7] = [
         (

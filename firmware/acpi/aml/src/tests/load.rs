@@ -1909,3 +1909,15 @@ fn cl41_table_check_cost() {
         );
     }
 }
+
+#[test]
+fn every_load_tolerance_test_fails_without_its_reports() {
+    // B5's contract §4 (the review of B5, B5-R4): `NoReport` planted, one run each.
+    super::fails_without_reports(&[
+        break_and_continue_in_a_loaded_table_stop_at_its_block,
+        a_table_loaded_twice_fails_at_its_first_duplicate,
+        a_table_that_loads_itself_is_bounded_by_the_call_depth,
+        r3_a_table_ending_with_a_mutex_held_gives_true_into_a_pci_target,
+        n5_a_loaded_tables_table_level_cannot_use_its_callers_locals_or_arguments,
+    ]);
+}

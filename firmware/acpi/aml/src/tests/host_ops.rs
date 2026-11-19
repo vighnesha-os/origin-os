@@ -1612,6 +1612,18 @@ fn planted_faults_are_caught_by_the_g2_tests() {
 }
 
 #[test]
+fn every_g2_and_piece_test_fails_without_its_reports() {
+    // B5's contract §4 (the review of B5, B5-R4): `NoReport` planted, one run each.
+    super::fails_without_reports(&[
+        strings_and_long_buffers_are_written_in_pieces,
+        mutexes_nest_keep_their_sync_levels_and_are_never_left_held,
+        a_mutex_a_method_run_by_export_keeps_is_released_and_reported_at_the_end,
+        a_method_that_returns_holding_a_mutex_keeps_it_until_the_evaluation_ends,
+        a_mutex_load_time_code_keeps_is_released_and_reported_as_the_load_ends,
+    ]);
+}
+
+#[test]
 fn a_reserved_region_space_is_refused() {
     // The review of B2, B2-11: Table 5.221 reserves spaces 0x0C to 0x7E; an OEM space (0x80 on)
     // is the host's to judge.

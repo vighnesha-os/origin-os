@@ -310,3 +310,12 @@ fn an_aborted_evaluation_leaves_what_was_there_before_it() {
         "the failed evaluation's X is removed"
     );
 }
+
+#[test]
+fn every_namespace_tolerance_test_fails_without_its_reports() {
+    // B5's contract §4 (the review of B5, B5-R4): `NoReport` planted, one run each.
+    super::fails_without_reports(&[
+        a_duplicate_name_in_a_later_table_is_abandoned_alone,
+        scope_needs_a_scope,
+    ]);
+}
