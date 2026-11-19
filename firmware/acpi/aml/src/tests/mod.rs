@@ -106,7 +106,8 @@ pub(crate) enum Told {
     Unterminated(u32),
     HighBytes(u32),
     LongStall(u8),
-    Released(Vec<[u8; 4]>),
+    /// The mutex's path, and the path of the method that took it.
+    Released(Vec<[u8; 4]>, Vec<[u8; 4]>),
     Pieces(Vec<[u8; 4]>, u64),
     Suppressed(u64),
 }
@@ -299,7 +300,7 @@ impl Host for TestHost {
             Report::Unterminated { at } => Told::Unterminated(at.offset),
             Report::HighBytes { at } => Told::HighBytes(at.offset),
             Report::LongStall { us, .. } => Told::LongStall(us),
-            Report::Released { mutex } => Told::Released(mutex.to_vec()),
+            Report::Released { mutex, method } => Told::Released(mutex.to_vec(), method.to_vec()),
             Report::Pieces { field, pieces } => Told::Pieces(field.to_vec(), pieces),
             Report::Suppressed { count } => Told::Suppressed(count),
         });

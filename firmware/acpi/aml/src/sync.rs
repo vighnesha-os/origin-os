@@ -37,6 +37,9 @@ pub(crate) struct Held {
     pub(crate) mutex: Option<ObjRef>,
     /// The node `Acquire` named it by, for the report if it is still held at the end.
     pub(crate) node: Option<NodeId>,
+    /// The method that took it, for the same report; `None` for load-time code (the review of
+    /// B5, B5-R8: a mutex a method declared goes with the method's names, its hold does not).
+    pub(crate) method: Option<NodeId>,
     /// The method activation whose implicit mutex this is.
     pub(crate) call: u64,
     pub(crate) sync: u8,
@@ -72,6 +75,7 @@ impl<H: Host> Interpreter<H> {
             Held {
                 mutex: None,
                 node: None,
+                method: None,
                 call,
                 sync,
                 global: false,
@@ -124,7 +128,7 @@ impl<H: Host> Interpreter<H> {
                 ..h
             };
             if h.mutex.is_some() {
-                self.tell_released(h.node);
+                self.tell_released(h.node, h.method);
             }
             i = i.saturating_add(1);
         }
@@ -188,11 +192,17 @@ impl<H: Host> Interpreter<H> {
         if let Object::Mutex(m) = self.heap.get_mut(r)? {
             m.depth = 1;
         }
+        let method = if self.in_load_time_code() {
+            None
+        } else {
+            self.calls.last().map(|c| c.method)
+        };
         mem::push(
             &mut self.held,
             Held {
                 mutex: Some(r),
                 node,
+                method,
                 // The method activation that took it; 0 for load-time code. Its return no longer
                 // releases it (G2, step B5).
                 call: self.calls.last().map_or(0, |c| c.serial),

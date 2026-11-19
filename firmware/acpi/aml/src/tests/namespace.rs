@@ -282,6 +282,7 @@ fn an_aborted_evaluation_leaves_what_was_there_before_it() {
     i.push_owner(Owner::Call(7)).unwrap();
     let outer = CallFrame {
         serial: 7,
+        method: crate::namespace::Namespace::root(),
         ret: i.cur,
         locals: [Val::None; 8],
         args: [Val::None; 7],
@@ -291,6 +292,7 @@ fn an_aborted_evaluation_leaves_what_was_there_before_it() {
     let held = Held {
         mutex: None,
         node: None,
+        method: None,
         call: 7,
         sync: 0,
         global: false,

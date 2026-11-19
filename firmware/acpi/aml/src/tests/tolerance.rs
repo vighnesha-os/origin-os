@@ -558,6 +558,44 @@ fn a_place_naming_a_method_in_a_body_does_not_run_past_it() {
 }
 
 #[test]
+fn a_mutex_a_method_declared_is_held_past_its_names() {
+    // The review of B5, B5-R8 (G2): `TMP` declares `TMX` (level 5), takes it and returns. The
+    // name goes with the method's; the hold stays until the outermost evaluation ends, keeping
+    // the sync level at 5, so a later `Acquire` of a level-1 mutex in the same evaluation fails
+    // `SyncLevel`. Released at the end, it is reported with no mutex path and the method's.
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            mutex("LO", 1),
+            method(
+                "TMP",
+                0,
+                &[mutex("TMX", 5), acquire(nm("TMX"), 0xFFFF), ret(one())],
+            ),
+            method("ONLY", 0, &[ret(call("TMP", &[]))]),
+            method(
+                "THEN",
+                0,
+                &[call("TMP", &[]), acquire(nm("LO"), 0xFFFF), ret(one())],
+            ),
+        ],
+    )
+    .unwrap();
+    assert_eq!(int(&mut i, "ONLY"), 1);
+    assert!(!exists(&i, "\\TMP.TMX"));
+    assert_eq!(told(&mut i), vec![Told::Released(vec![], vec![*b"TMP_"])]);
+    assert!(i.held.is_empty());
+    assert_eq!(
+        eval(&mut i, "THEN").map_err(|e| e.kind),
+        Err(ErrorKind::SyncLevel)
+    );
+    // A failed evaluation releases what it holds without a report: its error is the report.
+    assert_eq!(told(&mut i), vec![]);
+    assert!(i.held.is_empty());
+}
+
+#[test]
 fn a_skip_whose_work_list_reaches_the_memory_limit_fails_the_table_whole() {
     // The skip's work list is a vector charged to the memory limit and given back after each skip
     // (B5's contract, corrected; the coordinating session's ruling on the hand-over's point 4). A

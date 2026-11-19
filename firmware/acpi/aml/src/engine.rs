@@ -134,6 +134,8 @@ pub(crate) struct Ctx {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CallFrame {
     pub(crate) serial: u64,
+    /// The method running, for a report naming what took a mutex (the review of B5, B5-R8).
+    pub(crate) method: NodeId,
     pub(crate) ret: Cursor,
     pub(crate) locals: [Val; 8],
     pub(crate) args: [Val; 7],
@@ -1649,6 +1651,7 @@ impl<H: Host> Interpreter<H> {
         let serialized = m.flags & 8 != 0;
         let call = CallFrame {
             serial: self.serial,
+            method: node,
             ret: self.cur,
             locals: [Val::None; 8],
             args,

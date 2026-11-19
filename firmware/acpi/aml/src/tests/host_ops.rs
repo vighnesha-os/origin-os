@@ -560,7 +560,10 @@ fn mutexes_nest_keep_their_sync_levels_and_are_never_left_held() {
     // G2 (step B5): `KEEP` returns holding `LO`; the evaluation ends well, and `LO` is released
     // and reported.
     assert_eq!(int(&mut i, "KEEP"), 1);
-    assert_eq!(told(&mut i), vec![Told::Released(vec![*b"LO__"])]);
+    assert_eq!(
+        told(&mut i),
+        vec![Told::Released(vec![*b"LO__"], vec![*b"KEEP"])]
+    );
     // Released by the evaluations that ended: taken again at once.
     assert_eq!(int(&mut i, "NEST"), 0);
     assert_eq!(int(&mut i, "GL"), 1);
@@ -1340,7 +1343,8 @@ fn a_mutex_a_method_run_by_export_keeps_is_released_and_reported_at_the_end() {
     // lower level can be taken afterwards. The function found is kept: the next export runs no
     // `_ADR`, and takes nothing.
     let _ = told(&mut i);
-    for reported in [vec![Told::Released(vec![*b"MX__"])], vec![]] {
+    let adr = vec![*b"_SB_", *b"PCI0", *b"D1__", *b"_ADR"];
+    for reported in [vec![Told::Released(vec![*b"MX__"], adr)], vec![]] {
         assert!(i.evaluate("\\PK", &[]).is_ok());
         assert_eq!(told(&mut i), reported);
         assert!(i.held.is_empty());
@@ -1459,7 +1463,10 @@ fn a_method_that_returns_holding_a_mutex_keeps_it_until_the_evaluation_ends() {
     ]);
     let _ = told(&mut i);
     assert_eq!(i.evaluate("\\OUTR", &[]), Ok(None));
-    assert_eq!(told(&mut i), vec![Told::Released(vec![*b"MX__"])]);
+    assert_eq!(
+        told(&mut i),
+        vec![Told::Released(vec![*b"MX__"], vec![*b"INNR"])]
+    );
     assert_eq!(int(&mut i, "FLAG"), 1, "the caller went on");
     assert!(i.held.is_empty());
     assert_eq!(int(&mut i, "NEST"), 1);
@@ -1559,7 +1566,7 @@ fn a_mutex_load_time_code_keeps_is_released_and_reported_as_the_load_ends() {
         acquire(nm("MX"), 0xFFFF),
         name("AFT", one()),
     ]);
-    assert_eq!(told(&mut i), vec![Told::Released(vec![*b"MX__"])]);
+    assert_eq!(told(&mut i), vec![Told::Released(vec![*b"MX__"], vec![])]);
     assert!(i.held.is_empty());
     assert_eq!(int(&mut i, "AFT"), 1);
 }
@@ -1598,7 +1605,10 @@ fn planted_faults_are_caught_by_the_g2_tests() {
         assert_eq!(r, Ok(Some(crate::Value::Integer(1))));
         assert_eq!(t, vec![], "{f:?}");
     }
-    assert_eq!(kept().1, vec![Told::Released(vec![*b"LO__"])]);
+    assert_eq!(
+        kept().1,
+        vec![Told::Released(vec![*b"LO__"], vec![*b"KEEP"])]
+    );
 }
 
 #[test]

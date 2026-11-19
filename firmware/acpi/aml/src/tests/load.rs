@@ -1289,7 +1289,7 @@ fn r3_a_table_ending_with_a_mutex_held_gives_true_into_a_pci_target() {
     let first = i.table_count() as u32;
     let _ = told(&mut i);
     assert_eq!(get(&mut i, "LD"), u64::MAX);
-    assert_eq!(told(&mut i), vec![Told::Released(vec![*b"MX__"])]);
+    assert_eq!(told(&mut i), vec![Told::Released(vec![*b"MX__"], vec![])]);
     assert_eq!(
         loads_traced(&mut i),
         vec![Event::Load(*b"SSDT"), Event::Loaded(Ok(first))]

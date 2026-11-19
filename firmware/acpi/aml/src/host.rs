@@ -281,10 +281,15 @@ pub enum Report<'a> {
         /// Its microseconds.
         us: u8,
     },
-    /// The outermost evaluation ended holding a mutex, which is now released.
+    /// A mutex was released at an end other than its `Release`: the outermost evaluation's, or
+    /// a failed run-time load's (the review of B5, B5-R9).
     Released {
-        /// Its path, or empty for one deeper than 32 segments or named by no node.
+        /// Its path, or empty for one deeper than 32 segments or named by no node: a mutex a
+        /// method declared is gone with the method's names when the method returns.
         mutex: &'a [[u8; 4]],
+        /// The path of the method that took it (the review of B5, B5-R8), or empty for load-time
+        /// code, or for a method deeper than 32 segments or itself gone.
+        method: &'a [[u8; 4]],
     },
     /// Data longer than a field unit was stored to it in `pieces` field-sized pieces, lowest
     /// first (ACPI 6.6 Table 19.7), where ACPICA writes one piece cut to the field. Not a

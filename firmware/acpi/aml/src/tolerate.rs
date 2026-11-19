@@ -107,14 +107,21 @@ impl<H: Host> Interpreter<H> {
         }
     }
 
-    /// Tells the host that `node`'s mutex was still held when the outermost evaluation ended:
-    /// its path, written without allocating.
-    pub(crate) fn tell_released(&mut self, node: Option<NodeId>) {
+    /// Tells the host that `node`'s mutex, taken by `method`, was released at an end other than
+    /// its `Release`: their paths, written without allocating.
+    pub(crate) fn tell_released(&mut self, node: Option<NodeId>, method: Option<NodeId>) {
         let mut buf = [[0u8; 4]; 32];
+        let mut by = [[0u8; 4]; 32];
         let path = node
             .and_then(|n| self.ns.path_into(n, &mut buf))
             .unwrap_or(&[]);
-        self.tell(&Report::Released { mutex: path });
+        let method = method
+            .and_then(|n| self.ns.path_into(n, &mut by))
+            .unwrap_or(&[]);
+        self.tell(&Report::Released {
+            mutex: path,
+            method,
+        });
     }
 
     /// Tells the host that a store to field unit `node` goes in `pieces` pieces: its path,
