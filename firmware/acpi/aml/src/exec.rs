@@ -606,8 +606,13 @@ impl<H: Host> Interpreter<H> {
                 self.sleep(ms)
             }
             Op::Acquire => {
-                let m = self.object_at(loc(&f, 0)?)?;
-                let v = self.acquire(m, raw(&f, 1)?)?;
+                let at = loc(&f, 0)?;
+                let node = match at {
+                    Loc::Node(n) => Some(n),
+                    _ => None,
+                };
+                let m = self.object_at(at)?;
+                let v = self.acquire(m, node, raw(&f, 1)?)?;
                 self.give_val(v)
             }
             Op::Release => {

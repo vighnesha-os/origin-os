@@ -1403,11 +1403,12 @@ fn adversarial_cases() {
             Setup::PLAIN,
             Expect::Eval(Ok(None)),
         ),
-        // An evaluation that ends holding the Global Lock fails, and the lock goes back.
+        // An evaluation that ends holding the Global Lock ends well, and the lock goes back
+        // (G2, step B5).
         (
             vec![method("M0", 0, &[acquire(nm("\\_GL"), 0xFFFF), ret(one())])],
             Setup::PLAIN,
-            Expect::Eval(Err(ErrorKind::MutexHeld)),
+            Expect::Eval(Ok(Some(Value::Integer(1)))),
         ),
         // Step B4: what each of `loadables`' tables gives a `Load`, its value read through an
         // `If` (True is Ones at either width): the first number for True, the second for Zero.

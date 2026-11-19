@@ -76,6 +76,7 @@ mod probe;
 mod region;
 mod store;
 mod sync;
+mod tolerate;
 mod value;
 
 #[cfg(test)]
@@ -84,12 +85,14 @@ mod tests;
 pub use config::{Config, DefinitionBlock, IntegerWidth, Limits};
 pub use error::{At, Error, ErrorKind, Limit, Result};
 pub use host::{
-    BridgeBus, BufferAccess, Host, HostError, PciAddress, RegionAccess, Space, TableKey, Trace,
+    BridgeBus, BufferAccess, Host, HostError, PciAddress, RegionAccess, Report, Space, TableKey,
+    Trace,
 };
 pub use init::InitOutcome;
 pub use osi::{OS_NAME, OSI_STRINGS, REV};
 #[doc(hidden)]
 pub use probe::no_panic_probe;
+pub use tolerate::REPORTS;
 pub use value::{Node, Plain, Value};
 
 use alloc::vec::Vec;
@@ -137,6 +140,8 @@ struct RunCounts {
     charged_seen: u64,
     /// Units counted since the clock was last read.
     since_clock: u64,
+    /// Tolerances reported this evaluation, given or not ([`REPORTS`]).
+    reports: u64,
 }
 
 /// An AML interpreter: one namespace, its tables and its host.

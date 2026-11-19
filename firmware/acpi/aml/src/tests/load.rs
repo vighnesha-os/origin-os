@@ -5,7 +5,7 @@
 //! its parameter; and a load nested inside methods and other loads on a fixed native stack.
 
 use super::encode::*;
-use super::{Event, Fault, Interp, interp, interp_with, load, plant};
+use super::{Event, Fault, Interp, Told, interp, interp_with, load, plant, told};
 use crate::{ErrorKind, IntegerWidth, Limit, Limits, TableKey, Value};
 
 fn m(path: &str, body: &[B]) -> B {
@@ -1216,11 +1216,36 @@ fn r2_the_same_load_from_a_blocks_own_load_time_code() {
 }
 
 #[test]
-fn r3_a_table_ending_with_a_mutex_held_gives_zero_into_a_pci_target() {
+fn r3_a_table_ending_with_a_mutex_held_gives_true_into_a_pci_target() {
+    // G2 (step B5): load-time code may keep a mutex; it is released, and reported, when the
+    // outermost evaluation ends, and the load gives True.
     let held = ssdt(&[name("QM0", one()), acquire(nm("\\MX"), 0xFFFF)]);
     let mut i = with_pci(&[
         mutex("MX", 0),
         name("TM", buffer_of(&held)),
+        method("LD", 0, &[name("TMP0", one()), ret(load_op("TM", nm(F1)))]),
+    ]);
+    let first = i.table_count() as u32;
+    let _ = told(&mut i);
+    assert_eq!(get(&mut i, "LD"), u64::MAX);
+    assert_eq!(told(&mut i), vec![Told::Released(vec![*b"MX__"])]);
+    assert_eq!(
+        loads_traced(&mut i),
+        vec![Event::Load(*b"SSDT"), Event::Loaded(Ok(first))]
+    );
+    assert!(exists(&i, "\\QM0"));
+    assert!(!i.table(first).unwrap().failed);
+    assert_eq!(f1(&i), 0xFF, "True stored");
+    at_rest(&i);
+}
+
+#[test]
+fn r3b_a_table_that_fails_whole_gives_zero_into_a_pci_target() {
+    // R3's first purpose, kept with a failure the load policy still treats as the whole table's:
+    // a reserved opcode (step B5).
+    let bad = ssdt(&[name("QM0", one()), vec![0x02]]);
+    let mut i = with_pci(&[
+        name("TM", buffer_of(&bad)),
         method("LD", 0, &[name("TMP0", one()), ret(load_op("TM", nm(F1)))]),
     ]);
     let (nodes, first) = (i.node_count(), i.table_count() as u32);
@@ -1229,7 +1254,10 @@ fn r3_a_table_ending_with_a_mutex_held_gives_zero_into_a_pci_target() {
         loads_traced(&mut i),
         vec![
             Event::Load(*b"SSDT"),
-            Event::Loaded(Err(ErrorKind::MutexHeld))
+            Event::Loaded(Err(ErrorKind::Reserved {
+                first: 0x02,
+                second: None
+            }))
         ]
     );
     assert_eq!(i.node_count(), nodes);
@@ -1690,7 +1718,8 @@ fn planted_faults_are_caught_by_the_load_tests() {
                 a_table_loaded_twice_fails_at_its_first_duplicate,
                 r1_a_load_whose_target_needs_its_pci_function_ends_once,
                 r2_the_same_load_from_a_blocks_own_load_time_code,
-                r3_a_table_ending_with_a_mutex_held_gives_zero_into_a_pci_target,
+                r3_a_table_ending_with_a_mutex_held_gives_true_into_a_pci_target,
+                r3b_a_table_that_fails_whole_gives_zero_into_a_pci_target,
                 r8_load_tables_parameter_needing_its_pci_function_ends_once,
                 r9_a_failing_term_list_gives_zero_into_a_pci_target,
                 r10_a_region_source_is_read_once_when_the_target_needs_its_pci_function,
@@ -1740,7 +1769,8 @@ fn planted_faults_are_caught_by_the_load_tests() {
             &[
                 r1_a_load_whose_target_needs_its_pci_function_ends_once,
                 r2_the_same_load_from_a_blocks_own_load_time_code,
-                r3_a_table_ending_with_a_mutex_held_gives_zero_into_a_pci_target,
+                r3_a_table_ending_with_a_mutex_held_gives_true_into_a_pci_target,
+                r3b_a_table_that_fails_whole_gives_zero_into_a_pci_target,
                 r8_load_tables_parameter_needing_its_pci_function_ends_once,
                 r9_a_failing_term_list_gives_zero_into_a_pci_target,
                 r10_a_region_source_is_read_once_when_the_target_needs_its_pci_function,

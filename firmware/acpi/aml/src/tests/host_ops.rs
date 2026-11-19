@@ -3,7 +3,7 @@
 //! initialization walk and `_REG`, each against the model host of `mod.rs`.
 
 use super::encode::*;
-use super::{Interp, Seen, interp, interp_with, load};
+use super::{Interp, Seen, Told, interp, interp_with, load, told};
 use crate::{
     ErrorKind, HostError, InitOutcome, IntegerWidth, Limit, Limits, PciAddress, Space, TableKey,
     Value,
@@ -542,8 +542,12 @@ fn mutexes_nest_keep_their_sync_levels_and_are_never_left_held() {
     assert_eq!(int(&mut i, "NEST"), 0);
     assert_eq!(fails(&mut i, "DOWN"), ErrorKind::SyncLevel);
     assert_eq!(fails(&mut i, "ORDR"), ErrorKind::SyncLevel);
-    assert_eq!(fails(&mut i, "KEEP"), ErrorKind::MutexHeld);
-    // Released by the failed evaluations: taken again at once.
+    let _ = told(&mut i);
+    // G2 (step B5): `KEEP` returns holding `LO`; the evaluation ends well, and `LO` is released
+    // and reported.
+    assert_eq!(int(&mut i, "KEEP"), 1);
+    assert_eq!(told(&mut i), vec![Told::Released(vec![*b"LO__"])]);
+    // Released by the evaluations that ended: taken again at once.
     assert_eq!(int(&mut i, "NEST"), 0);
     assert_eq!(int(&mut i, "GL"), 1);
     assert_eq!((i.host().global_taken, i.host().global_held), (1, 0));
@@ -1297,10 +1301,10 @@ fn a_walk_cut_off_by_an_error_is_counted_out() {
 }
 
 #[test]
-fn a_mutex_a_method_run_by_export_keeps_is_released_at_the_end() {
-    // The review of B2, B2-6. `PK` returns a package naming a field of `D1`, whose region's
-    // function is found only when the package is exported, by running `_ADR`, which takes `MX`
-    // (sync level 5) and keeps it.
+fn a_mutex_a_method_run_by_export_keeps_is_released_and_reported_at_the_end() {
+    // The review of B2, B2-6, with G2 as step B5 builds it. `PK` returns a package naming a field
+    // of `D1`, whose region's function is found only when the package is exported, by running
+    // `_ADR`, which takes `MX` (sync level 5) and keeps it.
     let mut i = pci_device(
         &[acquire(nm("\\MX"), 0xFFFF), ret(dword(0x0001_0000))],
         &[
@@ -1314,11 +1318,13 @@ fn a_mutex_a_method_run_by_export_keeps_is_released_at_the_end() {
             ),
         ],
     );
-    // Reported, and released: a mutex of a lower level can be taken afterwards. Since B2-10 the
-    // `_ADR` is stopped at its own return, so the walk fails and the function stays unknown: the
-    // next export fails the same way, and again leaves nothing held.
-    for _ in 0..2 {
-        assert_eq!(fails(&mut i, "PK"), ErrorKind::MutexHeld);
+    // The export succeeds; `MX` is released and reported as the evaluation ends, so a mutex of a
+    // lower level can be taken afterwards. The function found is kept: the next export runs no
+    // `_ADR`, and takes nothing.
+    let _ = told(&mut i);
+    for reported in [vec![Told::Released(vec![*b"MX__"])], vec![]] {
+        assert!(i.evaluate("\\PK", &[]).is_ok());
+        assert_eq!(told(&mut i), reported);
         assert!(i.held.is_empty());
         assert_eq!(int(&mut i, "LOW"), 1);
     }
@@ -1416,9 +1422,10 @@ fn an_adr_outside_a_device_and_function_is_refused() {
 }
 
 #[test]
-fn a_method_that_returns_holding_a_mutex_is_stopped_at_its_return() {
-    // The review of B2, B2-10: G2's strict choice applies at the method's return, so its caller
-    // does not go on using what the mutex guards.
+fn a_method_that_returns_holding_a_mutex_keeps_it_until_the_evaluation_ends() {
+    // G2 as step B5 builds it (the coordinating session's ruling of 2026-11-19), in place of the
+    // review of B2's B2-10: the mutex outlives `INNR`, its caller goes on, and it is released and
+    // reported when the evaluation ends.
     let mut i = loaded(&[
         mutex("MX", 3),
         name("FLAG", zero()),
@@ -1432,10 +1439,148 @@ fn a_method_that_returns_holding_a_mutex_is_stopped_at_its_return() {
             &[acquire(nm("MX"), 0xFFFF), release(nm("MX")), ret(one())],
         ),
     ]);
-    assert_eq!(fails(&mut i, "OUTR"), ErrorKind::MutexHeld);
-    assert_eq!(int(&mut i, "FLAG"), 0, "the caller went on");
+    let _ = told(&mut i);
+    assert_eq!(i.evaluate("\\OUTR", &[]), Ok(None));
+    assert_eq!(told(&mut i), vec![Told::Released(vec![*b"MX__"])]);
+    assert_eq!(int(&mut i, "FLAG"), 1, "the caller went on");
     assert!(i.held.is_empty());
     assert_eq!(int(&mut i, "NEST"), 1);
+}
+
+#[test]
+fn a_pair_that_takes_a_mutex_in_one_method_and_releases_it_in_another_works() {
+    // TASKS 72's finding 1 (G2, step B5): a Super I/O's configuration helpers, one taking `MT0`
+    // and returning with it, the other releasing it, both called by a device's `_STA`. Before
+    // step B5 the first one's return failed, and so did `_STA`.
+    let mut i = loaded(&[
+        mutex("MT0", 0),
+        name("CFG", zero()),
+        m(
+            "ENTR",
+            &[acquire(nm("MT0"), 0xFFFF), store(one(), nm("CFG"))],
+        ),
+        m("EXIT", &[store(zero(), nm("CFG")), release(nm("MT0"))]),
+        device(
+            "DEV",
+            &[method(
+                "_STA",
+                0,
+                &[
+                    call("\\ENTR", &[]),
+                    store(nm("\\CFG"), local(0)),
+                    call("\\EXIT", &[]),
+                    ret(local(0)),
+                ],
+            )],
+        ),
+    ]);
+    let _ = told(&mut i);
+    for _ in 0..2 {
+        assert_eq!(int(&mut i, "DEV._STA"), 1);
+        assert_eq!(told(&mut i), vec![]);
+        assert!(i.held.is_empty());
+    }
+}
+
+#[test]
+fn a_mutex_kept_across_a_return_keeps_the_sync_level_raised() {
+    // G2 (step B5): order stays strict on `Acquire` and `Release` while a mutex outlives the
+    // method that took it.
+    let mut i = loaded(&[
+        mutex("HI", 5),
+        mutex("LO", 1),
+        m("TAKE", &[acquire(nm("HI"), 0xFFFF)]),
+        m("THEN", &[call("TAKE", &[]), acquire(nm("LO"), 0xFFFF)]),
+        m(
+            "TWO",
+            &[
+                acquire(nm("LO"), 0xFFFF),
+                call("TAKE", &[]),
+                release(nm("LO")),
+            ],
+        ),
+    ]);
+    assert_eq!(fails(&mut i, "THEN"), ErrorKind::SyncLevel);
+    assert!(i.held.is_empty());
+    assert_eq!(fails(&mut i, "TWO"), ErrorKind::SyncLevel);
+    assert!(i.held.is_empty());
+    assert_eq!(
+        told(&mut i),
+        vec![],
+        "a failed evaluation's error is its report"
+    );
+}
+
+#[test]
+fn a_serialized_methods_own_mutex_still_goes_at_its_return() {
+    // G2 (step B5): only what `Acquire` took outlives its method. After `SER` (sync level 5)
+    // returns, its implicit mutex is gone, so `LO` (level 1) can be taken.
+    let mut i = loaded(&[
+        mutex("LO", 1),
+        method("SER", 8 | (5 << 4), &[ret(one())]),
+        m(
+            "BOTH",
+            &[
+                store(call("SER", &[]), local(0)),
+                acquire(nm("LO"), 0xFFFF),
+                release(nm("LO")),
+                ret(local(0)),
+            ],
+        ),
+    ]);
+    let _ = told(&mut i);
+    assert_eq!(int(&mut i, "BOTH"), 1);
+    assert_eq!(told(&mut i), vec![]);
+}
+
+#[test]
+fn a_mutex_load_time_code_keeps_is_released_and_reported_as_the_load_ends() {
+    // G2 (step B5): a boot load is the outermost evaluation.
+    let mut i = loaded(&[
+        mutex("MX", 0),
+        acquire(nm("MX"), 0xFFFF),
+        name("AFT", one()),
+    ]);
+    assert_eq!(told(&mut i), vec![Told::Released(vec![*b"MX__"])]);
+    assert!(i.held.is_empty());
+    assert_eq!(int(&mut i, "AFT"), 1);
+}
+
+#[test]
+fn planted_faults_are_caught_by_the_g2_tests() {
+    // The controls of step B5's G2: each planted fault makes one of the tests above fail.
+    use crate::tests::{Fault, plant};
+    let pair = || {
+        let mut i = loaded(&[
+            mutex("MT0", 0),
+            m("ENTR", &[acquire(nm("MT0"), 0xFFFF)]),
+            m("EXIT", &[release(nm("MT0"))]),
+            m("STA", &[call("ENTR", &[]), call("EXIT", &[]), ret(one())]),
+        ]);
+        i.evaluate("\\STA", &[]).map_err(|e| e.kind)
+    };
+    let kept = || {
+        let mut i = loaded(&[
+            mutex("LO", 0),
+            m("KEEP", &[acquire(nm("LO"), 0xFFFF), ret(one())]),
+        ]);
+        let _ = told(&mut i);
+        let r = i.evaluate("\\KEEP", &[]).map_err(|e| e.kind);
+        (r, told(&mut i))
+    };
+    assert_eq!(pair(), Ok(Some(crate::Value::Integer(1))));
+    plant(Some(Fault::ReleaseOnReturn));
+    let caught = pair();
+    plant(None);
+    assert_eq!(caught, Err(ErrorKind::NotOwned), "ReleaseOnReturn");
+    for f in [Fault::SilentRelease, Fault::NoReport] {
+        plant(Some(f));
+        let (r, t) = kept();
+        plant(None);
+        assert_eq!(r, Ok(Some(crate::Value::Integer(1))));
+        assert_eq!(t, vec![], "{f:?}");
+    }
+    assert_eq!(kept().1, vec![Told::Released(vec![*b"LO__"])]);
 }
 
 #[test]

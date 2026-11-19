@@ -83,6 +83,35 @@ pub(crate) struct TestHost {
     pub(crate) time_left: Vec<u64>,
     /// With `Some`, the host traces: each event it heard.
     pub(crate) events: Option<Vec<Event>>,
+    /// Every report, in order (step B5).
+    pub(crate) told: Vec<Told>,
+}
+
+/// A report, as the model host keeps it (step B5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Told {
+    Abandoned {
+        kind: crate::ErrorKind,
+        table: u32,
+        statement: u32,
+        resumed: u32,
+    },
+    AlreadyLoaded(u32),
+    Unbound(u32),
+    Extra {
+        count: u64,
+        found: u64,
+    },
+    Unterminated(u32),
+    HighBytes(u32),
+    LongStall(u8),
+    Released(Vec<[u8; 4]>),
+    Suppressed(u64),
+}
+
+/// The reports since the last call, taken.
+pub(crate) fn told(i: &mut Interp) -> Vec<Told> {
+    core::mem::take(&mut i.host_mut().told)
 }
 
 /// A trace event, as the model host keeps it.
@@ -249,6 +278,29 @@ impl Host for TestHost {
     fn breakpoint(&mut self) {
         self.breakpoints += 1;
     }
+    fn report(&mut self, report: &crate::Report<'_>) {
+        use crate::Report;
+        self.told.push(match *report {
+            Report::Abandoned {
+                error,
+                statement,
+                resumed,
+            } => Told::Abandoned {
+                kind: error.kind,
+                table: statement.table,
+                statement: statement.offset,
+                resumed: resumed.offset,
+            },
+            Report::AlreadyLoaded { table } => Told::AlreadyLoaded(table),
+            Report::UnboundElement { at } => Told::Unbound(at.offset),
+            Report::ExtraElements { count, found, .. } => Told::Extra { count, found },
+            Report::Unterminated { at } => Told::Unterminated(at.offset),
+            Report::HighBytes { at } => Told::HighBytes(at.offset),
+            Report::LongStall { us, .. } => Told::LongStall(us),
+            Report::Released { mutex } => Told::Released(mutex.to_vec()),
+            Report::Suppressed { count } => Told::Suppressed(count),
+        });
+    }
     fn tracing(&self) -> bool {
         self.events.is_some()
     }
@@ -367,6 +419,14 @@ pub(crate) enum Fault {
     /// A run-time-loaded table's table-level code may name its caller's locals and arguments
     /// (`load.rs`, `at_loaded_table_level`).
     AllowLoadLocals,
+    /// No report reaches the host (`tolerate.rs`, `tell`).
+    NoReport,
+    /// A method's return releases the mutexes it took, as before step B5 (`engine.rs`,
+    /// `finish_call`).
+    ReleaseOnReturn,
+    /// A mutex still held at the end is released without a report (`sync.rs`,
+    /// `release_reported`).
+    SilentRelease,
 }
 
 thread_local! {

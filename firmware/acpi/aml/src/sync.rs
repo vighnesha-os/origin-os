@@ -9,12 +9,18 @@
 //! pending can be ended only by another evaluation, so with a timeout it sleeps the timeout and
 //! reports one, and without one it is refused ([`ErrorKind::WouldBlock`]).
 //!
-//! **Sync levels** (G2, strict until the reading session answers): an acquisition below the
-//! current level, or a release at another level, is an error. A method that returns holding a
-//! mutex it took has it released, and its return fails with [`ErrorKind::MutexHeld`], so its
-//! caller does not go on (the review of B2, B2-10). What has no method to return from, load-time
-//! code, is released when its evaluation ends, which reports the same error; and nothing,
-//! whatever `export` ran, outlives an evaluation (B2-6).
+//! **Sync levels** (G2, as ACPICA's default: TASKS 64's ledger §3, which has no lenient mode for
+//! them): an acquisition below the current level, a release at another level (ACPI 4.0's rule), or
+//! a `Serialized` method entered below it, is an error.
+//!
+//! **A mutex outlives the method that took it** (G2, step B5; the coordinating session's ruling of
+//! 2026-11-19, on TASKS 72's finding that a server's Super I/O helpers take a mutex in one method
+//! and release it in another). It is held until the outermost evaluation ends; whatever is still
+//! held then is released and reported ([`crate::Report::Released`]), and the evaluation does not
+//! fail. A `Serialized` method's own mutex goes when that method ends. The library never
+//! serializes a method because it creates names, so no method has its level waived for that. An
+//! evaluation that fails releases what it holds without a report: its error is the report; and
+//! nothing, whatever `export` ran, outlives an evaluation (B2-6).
 
 use alloc::vec::Vec;
 
@@ -29,6 +35,8 @@ use crate::object::{NodeId, ObjRef, Object, ScopeKind, Val};
 pub(crate) struct Held {
     /// The mutex object, or `None` for a serialized method's implicit mutex.
     pub(crate) mutex: Option<ObjRef>,
+    /// The node `Acquire` named it by, for the report if it is still held at the end.
+    pub(crate) node: Option<NodeId>,
     /// The method activation whose implicit mutex this is.
     pub(crate) call: u64,
     pub(crate) sync: u8,
@@ -63,6 +71,7 @@ impl<H: Host> Interpreter<H> {
             &mut self.held,
             Held {
                 mutex: None,
+                node: None,
                 call,
                 sync,
                 global: false,
@@ -71,20 +80,15 @@ impl<H: Host> Interpreter<H> {
         )
     }
 
-    /// A method returns: the mutexes it took and did not release are released, and whether there
-    /// were any is returned, for its return to fail with `MutexHeld` (G2's strict choice, at the
-    /// method's return and not only the evaluation's end: the review of B2, B2-10).
-    pub(crate) fn release_call_holds(&mut self, call: u64) -> bool {
-        // A scan of the held list at every return: a unit an entry (the audit after N-soak-1;
-        // left out of `58583fb1` by mistake, as the review of B2's Addendum 2 found).
-        self.note_held_scan();
-        let mut any = false;
+    /// The planted fault `ReleaseOnReturn`: a method's return releases the mutexes it took, as
+    /// before step B5 (the review of B2, B2-10), so that the tests of G2 can be shown to catch it.
+    #[cfg(test)]
+    pub(crate) fn release_call_holds(&mut self, call: u64) {
         let mut globals = 0u32;
         for h in &self.held {
             if let Some(r) = h.mutex
                 && h.call == call
             {
-                any = true;
                 if let Ok(Object::Mutex(m)) = self.heap.get_mut(r) {
                     m.depth = 0;
                 }
@@ -93,13 +97,10 @@ impl<H: Host> Interpreter<H> {
                 }
             }
         }
-        if any {
-            self.held.retain(|h| !(h.mutex.is_some() && h.call == call));
-            for _ in 0..globals {
-                let _ = self.give_global();
-            }
+        self.held.retain(|h| !(h.mutex.is_some() && h.call == call));
+        for _ in 0..globals {
+            let _ = self.give_global();
         }
-        any
     }
 
     /// A serialized method returns: its implicit mutex goes.
@@ -107,6 +108,27 @@ impl<H: Host> Interpreter<H> {
         // One entry per activation: `retain` removes it without a panicking index.
         self.note_held_scan();
         self.held.retain(|h| !(h.mutex.is_none() && h.call == call));
+    }
+
+    /// The outermost evaluation has ended without an error: what it still holds above `above` is
+    /// released, each mutex reported (G2, step B5).
+    pub(crate) fn release_reported(&mut self, above: usize) {
+        self.note_held_scan();
+        let mut i = above;
+        while let Some(h) = self.held.get(i).copied() {
+            #[cfg(test)]
+            let h = Held {
+                mutex: h
+                    .mutex
+                    .filter(|_| !crate::tests::planted(crate::tests::Fault::SilentRelease)),
+                ..h
+            };
+            if h.mutex.is_some() {
+                self.tell_released(h.node);
+            }
+            i = i.saturating_add(1);
+        }
+        self.release_held(above);
     }
 
     /// Releases what was taken above the mark `above` (an evaluation ends or is aborted). Returns
@@ -146,8 +168,9 @@ impl<H: Host> Interpreter<H> {
         }
     }
 
-    /// `Acquire`: `Ones` on a timeout, `Zero` when held.
-    pub(crate) fn acquire(&mut self, v: Val, timeout: u64) -> Result<Val> {
+    /// `Acquire`: `Ones` on a timeout, `Zero` when held. `node` is the name it was given by, if
+    /// any, for a report should it still be held when the outermost evaluation ends.
+    pub(crate) fn acquire(&mut self, v: Val, node: Option<NodeId>, timeout: u64) -> Result<Val> {
         let (r, m) = self.mutex_of(v)?;
         if m.depth > 0 {
             if let Object::Mutex(m) = self.heap.get_mut(r)? {
@@ -169,8 +192,9 @@ impl<H: Host> Interpreter<H> {
             &mut self.held,
             Held {
                 mutex: Some(r),
-                // The method activation that took it, so that its return can tell (the review of
-                // B2, B2-10); 0 for load-time code.
+                node,
+                // The method activation that took it; 0 for load-time code. Its return no longer
+                // releases it (G2, step B5).
                 call: self.calls.last().map_or(0, |c| c.serial),
                 sync: m.sync,
                 global: m.global,

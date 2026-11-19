@@ -62,8 +62,8 @@ use origin_acpi_tables::fadt::Fadt;
 use origin_acpi_tables::header::{self, HEADER_LEN, Header};
 use origin_aml::{
     BridgeBus, BufferAccess, Config, DefinitionBlock, Error, ErrorKind, Host, HostError,
-    InitOutcome, IntegerWidth, Interpreter, Limit, Limits, Node, Plain, RegionAccess, Space,
-    TableKey, Trace, Value,
+    InitOutcome, IntegerWidth, Interpreter, Limit, Limits, Node, Plain, RegionAccess, Report,
+    Space, TableKey, Trace, Value,
 };
 
 use crate::acpi_census::Firmware;
@@ -177,6 +177,9 @@ impl Host for BootHost {
 
     fn debug(&mut self, _: &[u8]) {}
 
+    /// Nothing to do: the [`Recorder`] around it counts every report for the verdict.
+    fn report(&mut self, _: &Report<'_>) {}
+
     /// Refused: `DataTableRegion` and `LoadTable` get nothing at boot (the review of B2's
     /// Addendum 2: the host decides it knowingly).
     fn table(&mut self, _: &TableKey, _: &mut dyn FnMut(u64, &[u8])) -> Result<bool, HostError> {
@@ -207,6 +210,8 @@ pub struct Seen {
     pub waits: u32,
     /// `Notify`, `Fatal`, `Debug` and `BreakPoint`.
     pub reports: u32,
+    /// Tolerances the interpreter reported (TASKS item 63, step B5).
+    pub tolerated: u32,
     /// The lowest stack address a host call was made at.
     pub lowest: Option<usize>,
 }
@@ -277,6 +282,7 @@ impl<H: Host> Recorder<H> {
                 lock_other: 0,
                 waits: 0,
                 reports: 0,
+                tolerated: 0,
                 lowest: None,
             },
         }
@@ -392,6 +398,12 @@ impl<H: Host> Host for Recorder<H> {
         self.seen.note_stack();
         self.seen.reports = self.seen.reports.saturating_add(1);
         self.inner.breakpoint();
+    }
+
+    fn report(&mut self, report: &Report<'_>) {
+        self.seen.note_stack();
+        self.seen.tolerated = self.seen.tolerated.saturating_add(1);
+        self.inner.report(report);
     }
 
     fn tracing(&self) -> bool {

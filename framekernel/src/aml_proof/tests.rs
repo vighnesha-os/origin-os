@@ -464,6 +464,9 @@ impl Host for Changed {
     fn debug(&mut self, text: &[u8]) {
         self.boot.debug(text);
     }
+    fn report(&mut self, report: &origin_aml::Report<'_>) {
+        self.boot.report(report);
+    }
     fn table(
         &mut self,
         key: &TableKey,

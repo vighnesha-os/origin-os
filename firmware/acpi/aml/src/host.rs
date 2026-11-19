@@ -215,6 +215,75 @@ pub enum Trace<'a> {
     Limit(crate::Limit),
 }
 
+/// Something the interpreter tolerated, told to the host (TASKS item 63, step B5; the coordinating
+/// session's rulings of 2026-11-19): firmware ACPI 6.6 calls wrong, accepted as TASKS 64's ledger
+/// (`docs/research/2026-11-14-aml-gaps-acpica.md`) says deployed interpreters accept it. Never a
+/// tolerance passed silently: each is one of these. A place is a table and the offset in its term
+/// list. At most [`crate::REPORTS`] are given in one top-level evaluation (a load, an evaluation,
+/// one `_STA`, `_INI` or `_REG` of a walk, or [`crate::Interpreter::bind_deferred`]), then one
+/// [`Report::Suppressed`] with the count of the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Report<'a> {
+    /// A statement of load-time code failed with `error` and was abandoned: skipped whole, from
+    /// `statement` to `resumed`, where the load went on.
+    Abandoned {
+        /// What failed, and where.
+        error: crate::Error,
+        /// Where the statement began.
+        statement: crate::At,
+        /// Where the load went on: the statement's end.
+        resumed: crate::At,
+    },
+    /// A block byte-identical to loaded table `table` was refused, nothing of it created.
+    AlreadyLoaded {
+        /// The table already loaded.
+        table: u32,
+    },
+    /// A name in a package that load-time code made names nothing when the package's names were
+    /// bound: the element is empty.
+    UnboundElement {
+        /// Where the name is.
+        at: crate::At,
+    },
+    /// A package listed `found` elements for a count of `count`: those past the count were
+    /// dropped.
+    ExtraElements {
+        /// Where the package is.
+        at: crate::At,
+        /// Its count.
+        count: u64,
+        /// The elements it listed.
+        found: u64,
+    },
+    /// A string literal with no NUL before the end of the range around it, where it ends.
+    Unterminated {
+        /// Where the literal is.
+        at: crate::At,
+    },
+    /// A string literal holds a byte above 0x7F (§20.2.3 allows 0x01 to 0x7F).
+    HighBytes {
+        /// Where the literal is.
+        at: crate::At,
+    },
+    /// `Stall` of more than 100 µs (§19.6.129 asks for 100 at most), up to 255.
+    LongStall {
+        /// Where the `Stall` is.
+        at: crate::At,
+        /// Its microseconds.
+        us: u8,
+    },
+    /// The outermost evaluation ended holding a mutex, which is now released.
+    Released {
+        /// Its path, or empty for one deeper than 32 segments or named by no node.
+        mutex: &'a [[u8; 4]],
+    },
+    /// `count` reports more in this evaluation, not given.
+    Suppressed {
+        /// How many.
+        count: u64,
+    },
+}
+
 /// The host. See the module's documentation for who enforces what.
 pub trait Host {
     /// A monotonic clock in 100 ns units: `Timer`'s value and the time limit's clock.
@@ -279,6 +348,10 @@ pub trait Host {
     /// `BreakPoint`. Does nothing unless the host has a debugger, and returns at once even then:
     /// the evaluation is never stopped in one.
     fn breakpoint(&mut self) {}
+
+    /// Something tolerated (see [`Report`]). Required, with no default: every host decides what
+    /// to do with each. Returns at once.
+    fn report(&mut self, report: &Report<'_>);
 
     /// Whether this host traces the interpreter: [`Host::trace`] is called only if so.
     fn tracing(&self) -> bool {

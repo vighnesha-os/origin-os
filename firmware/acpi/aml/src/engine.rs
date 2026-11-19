@@ -347,10 +347,8 @@ impl<H: Host> Interpreter<H> {
                 pred: 0,
             })?;
             self.run_frames(marks.frames)?;
-            // Load-time code that ends holding a mutex fails the load (§19.6.89; G2).
-            if self.release_held(marks.held) {
-                return err(ErrorKind::MutexHeld);
-            }
+            // What load-time code still holds is released and reported (G2, step B5).
+            self.release_reported(marks.held);
             Ok(())
         });
         match outcome {
@@ -407,6 +405,7 @@ impl<H: Host> Interpreter<H> {
     /// Ends one: everything unreachable is collected, and the stacks, empty at the top level,
     /// give their memory back.
     pub(crate) fn end_evaluation(&mut self) {
+        self.tell_suppressed();
         self.result = Val::None;
         // At the top level nothing may stay held: the paths above release and report; this only
         // makes sure no hold, the Global Lock's least, outlives the evaluation whatever path
@@ -1588,13 +1587,14 @@ impl<H: Host> Interpreter<H> {
         if call.serialized {
             self.drop_implicit(call.serial);
         }
-        let kept = self.release_call_holds(call.serial);
+        // A mutex the method took and did not release stays held (G2, step B5).
+        #[cfg(test)]
+        if crate::tests::planted(crate::tests::Fault::ReleaseOnReturn) {
+            self.release_call_holds(call.serial);
+        }
         self.pop_owner(true);
         self.run.depth = self.run.depth.saturating_sub(1);
         self.cur = call.ret;
-        if kept {
-            return err(ErrorKind::MutexHeld);
-        }
         if v == Val::None {
             // G6, as ACPICA's default (TASKS 64's ledger §3; not its lenient mode): no value where
             // one is needed is an error; as a statement it is nothing.

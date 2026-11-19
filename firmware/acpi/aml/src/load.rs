@@ -400,17 +400,12 @@ impl<H: Host> Interpreter<H> {
         })
     }
 
-    /// The table's block has ended: its names stay, and the operator gets True. Load-time code
-    /// that ends holding a mutex fails the load instead, as a table's load at the top level does
-    /// (§19.6.89; G2). Nothing here can be put back: `Load`'s target was made ready at the
-    /// operator (B4-1), and `LoadTable`'s parameter is a step of its own, pushed here once the
-    /// load has ended (B4-12).
+    /// The table's block has ended: its names stay, and the operator gets True. A mutex its
+    /// load-time code still holds stays held until the outermost evaluation ends (G2, step B5).
+    /// Nothing here can be put back: `Load`'s target was made ready at the operator (B4-1), and
+    /// `LoadTable`'s parameter is a step of its own, pushed here once the load has ended (B4-12).
     pub(crate) fn finish_load(&mut self, l: Loading) -> Result<()> {
         self.pop_frame();
-        if self.release_held(l.held) {
-            let at = self.frames.len();
-            return self.fail_load(at, l, Error::new(ErrorKind::MutexHeld));
-        }
         self.pop_owner(false);
         self.run.depth = l.depth;
         self.cur = l.ret;

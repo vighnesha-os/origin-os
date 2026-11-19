@@ -267,6 +267,7 @@ fn an_aborted_evaluation_leaves_what_was_there_before_it() {
     crate::mem::push(&mut i.calls, outer, &mut i.budget).unwrap();
     let held = Held {
         mutex: None,
+        node: None,
         call: 7,
         sync: 0,
         global: false,

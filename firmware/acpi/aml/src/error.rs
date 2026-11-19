@@ -89,13 +89,11 @@ pub enum ErrorKind {
         cause: HostError,
     },
     /// A mutex acquired below the current sync level, or released at another (ACPI 6.6
-    /// §19.6.89). G2, strict until the reading session answers.
+    /// §19.6.89; ACPI 4.0's release rule). G2: ACPICA's default too, with no lenient mode (TASKS
+    /// 64's ledger §3).
     SyncLevel,
     /// `Release` of a mutex this evaluation does not hold (§19.6.117).
     NotOwned,
-    /// The evaluation ended holding a mutex (§19.6.89): it was released, and this is reported.
-    /// G2, strict until the reading session answers.
-    MutexHeld,
     /// A wait that only another evaluation could end (`Wait` with no timeout on an event with no
     /// signal pending): the interpreter runs one evaluation at a time, so it would never end.
     WouldBlock,
