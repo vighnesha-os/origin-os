@@ -1214,10 +1214,13 @@ const WINDOW_TICKS: u64 = 50;
 /// one processor (TASKS item 66).
 const WINDOW_BUDGET_SECONDS: u64 = 10;
 
-/// Runs of the preemption proof's window it may make: another only after a run whose
+/// Runs of the preemption proof's window it may make: another only after a correct run whose
 /// processors' own ticks show a stall before today's bound ([`WindowVerdict::Stalled`]), each
-/// against the same verdict (TASKS item 66, the review's T66-R1).
-const PREEMPTION_ATTEMPTS: u32 = 4;
+/// against the same verdict (TASKS item 66, the review's T66-R1). Eight, as the timed waits:
+/// on the oversubscribed software-processor machines such stalls come in episodes of a boot
+/// or a round, the longest seen covering 4 runs, about 15 to 20 s (the coordinating session's
+/// ruling of 2026-11-19, from the research ledger's §3.1).
+const PREEMPTION_ATTEMPTS: u32 = 8;
 
 /// One run of the preemption proof's window, as the boot flow measured it.
 struct WindowRun {
