@@ -489,10 +489,7 @@ impl Lending {
     /// located yet ([`Lending::located`]), or no slot is left: `false` then, and nothing is
     /// recorded. A range that holds earlier ones takes their slots.
     pub fn lend(&mut self, base: u64, end: u64) -> bool {
-        if !self.located
-            || overlaps_any(self.writable(), base, end)
-            || overlaps_any(self.never(), base, end)
-        {
+        if self.guards(base, end) || overlaps_any(self.writable(), base, end) {
             return false;
         }
         if self.lent().iter().any(|&(b, e)| b <= base && end <= e) {
@@ -584,6 +581,15 @@ impl Lending {
     /// Whether `[base, end)` overlaps a range that may never be lent.
     pub fn never_lent(&self, base: u64, end: u64) -> bool {
         overlaps_any(self.never(), base, end)
+    }
+
+    /// Whether [`Lending::lend`] refuses `[base, end)` for the guard over the firmware's
+    /// structures that change after boot: before they have been located ([`Lending::located`]),
+    /// or when it overlaps one ([`Lending::never_lend`]). The very check `lend` makes, recording
+    /// nothing, so the census can ask it at every boot without making the lend it tests (the
+    /// review of TASKS item 71, T71-7).
+    pub fn guards(&self, base: u64, end: u64) -> bool {
+        !self.located || overlaps_any(self.never(), base, end)
     }
 
     fn never(&self) -> &[(u64, u64)] {
@@ -1115,6 +1121,7 @@ mod tests {
         let mut l = Lending::new();
         // Before the ranges are located, nothing is lent, not even a table far from them.
         assert!(!l.located());
+        assert!(l.guards(0x7A00_0000, 0x7A00_0024));
         assert!(!l.lend(0x7A00_0000, 0x7A00_0024));
         let report = l.never_lend(&[facs, fbpt]);
         assert_eq!(
@@ -1139,6 +1146,15 @@ mod tests {
             assert!(!l.lend(b, e), "{b:#x}-{e:#x}");
             assert!(l.never_lent(b, e), "{b:#x}-{e:#x}");
         }
+        // The review of TASKS item 71, T71-7: a range that starts before a structure and runs
+        // into it, at either structure; `guards` says so and records nothing.
+        for (b, e) in [(0x7FFD_FFF8, 0x7FFE_0008), (0x7FEF_FFF0, 0x7FF0_0010)] {
+            assert!(l.guards(b, e), "{b:#x}-{e:#x}");
+            assert!(!l.lend(b, e), "{b:#x}-{e:#x}");
+        }
+        let lent_before = l.lent().len();
+        assert!(!l.guards(0x7A10_0000, 0x7A10_0024));
+        assert_eq!(l.lent().len(), lent_before, "guards records nothing");
         // Touching without overlapping is lent.
         assert!(l.lend(0x7FFE_0040, 0x7FFE_0080));
         assert!(l.lend(0x7FFD_FFC0, 0x7FFE_0000));

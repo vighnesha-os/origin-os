@@ -35,6 +35,14 @@ pub fn bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
     if vm::names_mmio(addr, end) {
         return Err(MMIO);
     }
+    guard(addr, end, len)?;
+    vm::firmware_bytes(PhysAddr::new(addr), len as u64).map_err(|_| "cannot map an ACPI table")
+}
+
+/// [`bytes`]'s own check of the guard over the firmware's structures that change after boot,
+/// before the lending registry's: nothing before they are located, no range that overlaps one,
+/// and nothing whose first four bytes are such a structure's signature (N3).
+fn guard(addr: u64, end: u64, len: usize) -> Result<(), &'static str> {
     if !vm::changing_located() {
         return Err("nothing is lent before the firmware's changing structures are located");
     }
@@ -49,7 +57,20 @@ pub fn bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
             return Err("the firmware changes it after boot: copy it, never lend it");
         }
     }
-    vm::firmware_bytes(PhysAddr::new(addr), len as u64).map_err(|_| "cannot map an ACPI table")
+    Ok(())
+}
+
+/// Whether [`bytes`] refuses to lend `len` bytes at physical `addr` for its guard over the
+/// firmware's structures that change after boot, lending nothing: its own check and the lending
+/// registry's ([`vm::lend_guarded`]), the very two a lend goes through. For the ACPI census's
+/// check of the guard at every boot, which must not make the lend it tests (the review of TASKS
+/// item 71, T71-7). A range that wraps or starts at zero counts as refused, as [`bytes`] refuses
+/// it.
+pub fn guards(addr: u64, len: usize) -> bool {
+    let Some(end) = addr.checked_add(len as u64).filter(|_| addr != 0) else {
+        return true;
+    };
+    guard(addr, end, len).is_err() || vm::lend_guarded(addr, end)
 }
 
 /// Copies `out.len()` bytes of firmware memory at physical `addr` into `out`, with volatile

@@ -59,6 +59,13 @@ pub trait Firmware {
     fn lend(&mut self, addr: u64, len: usize) -> Result<&'static [u8], &'static str>;
     /// Copies `out.len()` bytes at physical `addr`, lending nothing (`firmware::copy`).
     fn copy(&mut self, addr: u64, out: &mut [u8]) -> Result<(), &'static str>;
+    /// Whether [`Firmware::lend`] refuses `len` bytes at `addr` for its guard over the firmware's
+    /// structures that change after boot, asked without lending (`firmware::guards`; the review
+    /// of TASKS item 71, T71-7). A reader that cannot ask (the AML proof's, which runs no
+    /// census) says it would not refuse, so a census run through it fails rather than passes.
+    fn guards(&mut self, _addr: u64, _len: usize) -> bool {
+        false
+    }
     /// A monotonic clock in nanoseconds, for the time the census took.
     fn now(&self) -> u64;
     /// What the kernel's first table lookup located as the firmware's structures that change
@@ -80,6 +87,9 @@ impl Firmware for Boot {
     }
     fn copy(&mut self, addr: u64, out: &mut [u8]) -> Result<(), &'static str> {
         crate::firmware::copy(addr, out)
+    }
+    fn guards(&mut self, addr: u64, len: usize) -> bool {
+        crate::firmware::guards(addr, len)
     }
     fn now(&self) -> u64 {
         crate::time::monotonic_nanos()
@@ -116,8 +126,9 @@ pub struct Findings {
     pub unreadable: u32,
     /// Structures copied rather than lent that declare more than the census copies (N2).
     pub too_large: u32,
-    /// Structures the firmware changes after boot that a lend over them did not refuse: the
-    /// lending registry's guard, tested at every boot (TASKS item 71). Any fails the verdict.
+    /// Lends over a structure the firmware changes after boot that the guard would not refuse,
+    /// asked without lending, at every boot (TASKS item 71; the review's T71-7). Any fails the
+    /// verdict.
     pub lendable_changing: u32,
     /// XSDT entries that were zero, which name no table (the review's F8).
     pub null_entries: u32,
@@ -135,8 +146,10 @@ pub struct Findings {
 
 impl Findings {
     /// The verdict: no table refused, every table the XSDT lists read, no fault in a structure or
-    /// field the kernel relies on (N1), a FADT, a DSDT, and a FACS unless the platform is
-    /// hardware-reduced. Not counted against it: a fault reported in a structure or field nothing
+    /// field the kernel relies on (N1), a FADT, a DSDT, a FACS unless the platform is
+    /// hardware-reduced, and no lend over a structure the firmware changes that the guard would
+    /// make (TASKS item 71). Not counted against it: a fault reported in a structure or field
+    /// nothing
     /// in the kernel uses, so that ordinary firmware bugs in unused tables do not mark a machine
     /// degraded (the coordinating session's ruling on N1); a null XSDT entry, which names no
     /// table; and a table the FPDT points to that cannot be read or is too large to judge, which
@@ -531,23 +544,37 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
         performance_tables(out, fw, &mut found, fpdt);
     }
     if let Some((changing, kept)) = fw.changing() {
-        // The guard, at every boot: a lend over each such structure, its start and its middle,
-        // must be refused. One that is not stays lent, so this is a check of last resort.
-        let mut refused = true;
-        for &(_, base, end) in changing.ranges() {
+        // The guard, at every boot, asked without lending (T71-7): a lend at each structure's
+        // start, in its middle, and from before its start into it must be refused.
+        let mut not_refused = None;
+        for &(kind, base, end) in changing.ranges() {
             let middle = base.saturating_add(end.saturating_sub(base) / 2);
-            for (at, len) in [(base, HEADER_LEN), (middle, 8)] {
-                if fw.lend(at, len).is_ok() {
-                    refused = false;
+            let before = base.checked_sub(8).map(|b| (b, 16));
+            for (at, len) in [Some((base, HEADER_LEN)), Some((middle, 8)), before]
+                .into_iter()
+                .flatten()
+            {
+                if !fw.guards(at, len) {
                     found.lendable_changing = found.lendable_changing.saturating_add(1);
+                    not_refused.get_or_insert((kind, at, at.saturating_add(len as u64)));
                 }
             }
         }
-        let _ = writeln!(
+        let _ = write!(
             out,
-            "{LINE}{}; a lend over each refused: {refused}",
-            NeverLent(&changing, kept)
+            "{LINE}{}; a lend over each refused: {}",
+            NeverLent(&changing, kept),
+            not_refused.is_none()
         );
+        if let Some((kind, at, end)) = not_refused {
+            let _ = write!(
+                out,
+                " (not over the {} at {at:#x}-{:#x})",
+                kind.name(),
+                end.saturating_sub(1)
+            );
+        }
+        let _ = writeln!(out);
     }
     let consistent = found.consistent();
     let micros = fw.now().saturating_sub(started) / 1000;
@@ -853,6 +880,14 @@ mod tests {
             out.copy_from_slice(self.range(addr, out.len())?);
             Ok(())
         }
+        fn guards(&mut self, addr: u64, len: usize) -> bool {
+            // As `firmware::guards`: the registry's check, and the signature (N3).
+            !self.guard_broken
+                && (self.registry.guards(addr, addr + len as u64)
+                    || self
+                        .range(addr, 4)
+                        .is_ok_and(|s| CHANGES_AFTER_BOOT.iter().any(|c| s == *c)))
+        }
         fn now(&self) -> u64 {
             0
         }
@@ -904,21 +939,28 @@ mod tests {
         assert!(!lent.contains(&(FACS + 32)));
     }
 
-    /// TASKS item 71: the census's live check of the lending registry. With the guard broken, a
-    /// lend into the FACS's middle is made, and the census's verdict fails.
+    /// TASKS item 71: the census's live check of the guard. With it broken, the census counts
+    /// each lend the guard would make over the FACS, its start, its middle and from before its
+    /// start, and its verdict fails; and it lends none of them (the review's T71-7).
     #[test]
     fn a_lend_over_what_the_firmware_changes_fails_the_census() {
         let mut m = Machine::new();
         m.guard_broken = true;
         let (ok, out, lent) = m.run();
         assert!(!ok, "{out}");
-        assert!(lent.contains(&(FACS + 32)), "{out}");
         assert!(
-            out.contains("1 kept; a lend over each refused: false"),
+            lent.iter().all(|&a| !(FACS - 8..FACS + 64).contains(&a)),
+            "{lent:x?}"
+        );
+        assert!(
+            out.contains(
+                "1 kept; a lend over each refused: false (not over the FACS at \
+                 0x7f003000-0x7f003023)"
+            ),
             "{out}"
         );
         assert!(
-            last_line(&out).contains(", 1 lends over what the firmware changes;"),
+            last_line(&out).contains(", 3 lends over what the firmware changes;"),
             "{out}"
         );
         assert!(last_line(&out).ends_with("consistent false: acpi tables failed"));

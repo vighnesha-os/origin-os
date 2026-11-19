@@ -595,6 +595,13 @@ pub fn never_lent(base: u64, end: u64) -> bool {
     crate::cpu::without_interrupts(|| LENDING.lock().never_lent(base, end))
 }
 
+/// Whether the lending registry refuses `[base, end)` for its guard over the firmware's
+/// structures that change after boot ([`crate::reserved::Lending::guards`]): the check
+/// [`firmware_bytes`]'s lend makes, recording nothing (the review of TASKS item 71, T71-7).
+pub fn lend_guarded(base: u64, end: u64) -> bool {
+    crate::cpu::without_interrupts(|| LENDING.lock().guards(base, end))
+}
+
 /// Whether any of `[raw, end)` is memory the memory map calls MMIO ([`crate::reserved::names_mmio`]):
 /// `firmware::bytes` and `firmware::copy` read no table there (TASKS item 71, the review's F14).
 pub fn names_mmio(raw: u64, end: u64) -> bool {
