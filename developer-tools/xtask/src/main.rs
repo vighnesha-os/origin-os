@@ -2245,11 +2245,6 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: scheduler: 3 SIMD threads kept their XMM state across ".into(),
             " corruptions".into(),
             "origin-kernel: scheduler: yield alternated ".into(),
-            // The framework's measured stack in a thread that yields on it (TASKS item 68): the
-            // boot flow ran meanwhile, and the thread's own stack stayed in use (ruling A1).
-            "origin-kernel: measured stack: in a thread, 32 levels and a yield at the deepest: ".into(),
-            "; switched away and back true after ".into(),
-            " yields; its own stack in use meanwhile true; value right true; ended true; passed".into(),
             // A thread is created whole or not at all.
             "origin-kernel: scheduler: spawns refused for want of an FPU area (Err(Full)) and on a full queue (Err(Full)) give back".into(),
             // M4 groundwork: ring 3, the one DPL-3 gate, and crash isolation.
@@ -2320,6 +2315,13 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(stack_markers(machine))
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
+            // The framework's measured stack in a thread that yields on it (TASKS item 68), after
+            // the comparison above (T68-5): the boot flow ran meanwhile, the thread's own stack
+            // stayed in use (ruling A1), and the reap gave it back rather than leaking it (T68-1).
+            "origin-kernel: measured stack: in a thread, 32 levels and a yield at the deepest: ".into(),
+            "; switched away and back true after ".into(),
+            " yields; its own stack in use meanwhile true; value right true; ended true; its own stack given back after the reap true (".into(),
+            "); passed".into(),
         ])
         .chain(kernel_bound_markers(true))
         .chain([

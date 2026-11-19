@@ -18,14 +18,20 @@
 //!   thread's saved frame is on the measured stack, and only the measured call's record of the
 //!   stack it left keeps the thread's own stack from being freed (ruling A1). The depth must be at
 //!   least [`TRAP_MARGIN`] bytes below the sample: the yield's trap frame, 22 words, is written
-//!   below the yielding call, and the sample's word is at most 32 bytes below that call. Its
-//!   bounds count yields, not time, so a loaded host cannot fail it (TASKS item 66).
+//!   below the yielding call, and the sample's word is at most 32 bytes below that call. Once the
+//!   thread has ended and been reaped, its own stack must have been given back, not leaked
+//!   (`stack::slot_state`): a measured call's record left behind would leak it (T68-1). Its bounds
+//!   count yields, not time, so a loaded host cannot fail it (TASKS item 66).
 //!
-//! Neither runs inside another proof's comparison of stack slots or frames: the one at boot runs
-//! before any proof that compares them, and the one in a thread runs between the thread-lifecycle
-//! and refused-spawn proofs, reaps its thread before it ends, and leaves only stacks kept for
-//! reuse, which every later comparing proof settles first (TASKS item 67). No address in the stack
-//! region is printed (ADR-0004 Amendment 2, A6): only depths and sizes.
+//! Neither runs inside another proof's comparison of stack slots or frames (T68-5). The one at boot
+//! runs before any proof that compares them. The one in a thread runs just after `sched::prove`'s
+//! own comparison of held stacks and the heap ("thread reaping") has closed with a settle, and
+//! before the kernel-wide bound, which settles before it reads (TASKS item 67). That settle leaves
+//! no stack kept for reuse, so when the thread is reaped its stack is kept (`State::Idle`), not
+//! retired, and no shootdown touches it during the proof: a lost state there is a leak, never a
+//! shootdown that stalled on an oversubscribed machine (decision items 313 and 314). The stacks it
+//! leaves kept for reuse are retired by the next settle. No address in the stack region is printed
+//! (ADR-0004 Amendment 2, A6): only depths and sizes.
 #![forbid(unsafe_code)]
 
 use core::fmt::Write;
@@ -34,7 +40,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use origin_frame::once::SetOnce;
-use origin_frame::stack::{self, Measured, StackSlot};
+use origin_frame::stack::{self, Measured, StackSlot, State};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, rdtsc};
@@ -266,6 +272,13 @@ pub(crate) fn prove_in_thread(com1: &mut Console, bsp: CpuIndex) -> bool {
     // The thread's stack and FPU area, given back here rather than in a later proof's window.
     crate::sched::reap();
     let ended = DONE.load(Ordering::Acquire) && live(bsp) == 1;
+    // Its own stack given back by the reap, not leaked (T68-1; see the module docs for why a lost
+    // state here is a leak).
+    let own = OWN_SLOT.get().and_then(|own| stack::slot_state(*own));
+    let given_back = matches!(
+        own,
+        Some(State::Idle | State::Retired | State::Reclaiming | State::Free)
+    );
     let measured = MEASURED.load(Ordering::Relaxed);
     let (depth, sampled, size) = (
         DEPTH.load(Ordering::Relaxed) as usize,
@@ -283,11 +296,21 @@ pub(crate) fn prove_in_thread(com1: &mut Console, bsp: CpuIndex) -> bool {
         && in_use
         && sampled != 0
         && below >= TRAP_MARGIN
-        && depth < size;
+        && depth < size
+        && given_back;
     let _ = writeln!(
         com1,
-        "origin-kernel: measured stack: in a thread, {THREAD_LEVELS} levels and a yield at the deepest: {depth} bytes measured, {sampled} sampled, {below} below the sample; switched away and back {switched} after {} yields; its own stack in use meanwhile {in_use}; value right {right}; ended {ended}; {}",
+        "origin-kernel: measured stack: in a thread, {THREAD_LEVELS} levels and a yield at the deepest: {depth} bytes measured, {sampled} sampled, {below} below the sample; switched away and back {switched} after {} yields; its own stack in use meanwhile {in_use}; value right {right}; ended {ended}; its own stack given back after the reap {given_back} ({}); {}",
         YIELDS.load(Ordering::Relaxed),
+        match own {
+            Some(State::Free) => "free",
+            Some(State::Live) => "held",
+            Some(State::Idle) => "kept for reuse",
+            Some(State::Retired) => "retired",
+            Some(State::Reclaiming) => "being reclaimed",
+            Some(State::Lost) => "lost",
+            None => "no slot",
+        },
         if ok {
             "passed"
         } else {

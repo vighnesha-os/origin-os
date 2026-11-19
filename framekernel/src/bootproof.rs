@@ -99,7 +99,6 @@ proofs! {
     Weights "scheduler weights" => Report;
     SimdState "SIMD state across switches" => Refuse;
     ThreadLifecycle "thread lifecycle" => Report;
-    MeasuredStackThread "measured stack in a thread" => Report;
     SpawnRefusal "refused spawns" => Report;
     UserIsolation "ring-3 isolation" => Refuse;
     TscConsistency "TSC consistency" => Report;
@@ -123,6 +122,7 @@ proofs! {
     UserClock "the clock as ring 3 reads it" => Report;
     Stacks "kernel stacks" => Refuse;
     ThreadsReaped "thread reaping" => Report;
+    MeasuredStackThread "measured stack in a thread" => Report;
     KernelBound "the kernel-wide bound" => Refuse;
     Ibpb "IBPB at each change of process" => Refuse;
     // Devices.

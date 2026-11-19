@@ -50,7 +50,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use origin_paging::PAGE;
 use origin_paging::layout::{self, STACK_REGION, STACK_REGION_SIZE};
-use origin_sync::slots::{Counts, Slots, State, Taken};
+pub use origin_sync::slots::State;
+use origin_sync::slots::{Counts, Slots, Taken};
 
 use crate::cpu::{self, CpuIndex, without_interrupts};
 use crate::descriptors::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
@@ -402,6 +403,9 @@ impl Drop for GuardedStack {
     fn drop(&mut self) {
         let top = self.top();
         // Leak rather than give back memory a processor could still run on (see the module docs).
+        // This and `slot_in_use` must decide through the same `in_use`: the boot proof in a thread
+        // asks `slot_in_use`, and its control MS-7 shows that this drop reads the same table
+        // (TASKS item 68, the review's T68-1).
         if in_use(top - self.bytes as u64, top) {
             without_interrupts(|| REGION.leak(self.slot));
             return;
@@ -517,6 +521,13 @@ fn in_use(low: u64, top: u64) -> bool {
 pub fn slot_in_use(slot: StackSlot) -> bool {
     let low = slot_base(slot.0);
     in_use(low, low + SLOT)
+}
+
+/// The state of slot `slot` in the stack region's table, or `None` if there is no such slot. For
+/// a proof that a stack was given back rather than leaked (`State::Lost`; TASKS item 68, T68-1).
+/// It names no address.
+pub fn slot_state(slot: StackSlot) -> Option<State> {
+    without_interrupts(|| REGION.state(slot.0))
 }
 
 /// The most measured calls that may run at once, on every processor together; a call past it is
