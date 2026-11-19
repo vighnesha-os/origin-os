@@ -5354,6 +5354,8 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 
 ## TASKS item 66: the review's answers (ADR-0013; 2026-11-19)
 
+*(Superseded in part by the next entry, the addendum review's answers: the ten-gap rule below and its "5 % to 15 %" limit are gone since `0df830a8`, the rate coming from the timer's count; `periodic_programming` is gone since `53c03bea`, the read-back being compared with the timed run's registers.)*
+
 - **What:** the answers to the independent review of `c0f0d02a` (`docs/engineering/REVIEW_T66_2026-11-19.md`: 1 High, 2 Medium, 7 Low), each finding accepted by the coordinating session, and its ruling A on T66-R1. Each answer is in `TASKS.md`, entry 66.
   - **`origin-frame`:**
     - `apic.rs`: `TimerProgramming` (an initial count, a divide configuration and an LVT entry, compared field by field); `judge_ticks` takes only the first `wanted` stamps (T66-R4), judges the median on the slow side only, and holds a run within its bounds as stalled when some ten consecutive gaps add up to under 8.5 periods (T66-R5); `TickRun::least_ten`.
@@ -5375,7 +5377,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Review:** the review above, by one AI reviewer; the same reviewer reads the answers. No person.
 - **Open-source references consulted:** none. No third-party source was read.
 - **Licence:** MIT OR Apache-2.0.
-- **Known limits:** QEMU only (CLAUDE.md §74). The preemption proof's tick floor is 15 ticks in 500 ms, about 30 Hz: a slow tick above it with its timer programmed right is caught by no timing clause, as before TASKS item 66. A tick 5 % to 15 % fast whose total a stall made look right passes the tick proof, as before. The stacks proof's own reclaims and a user space's stalled shootdowns print no line of their own; they are counted in the next line's "stall N of this boot".
+- **Known limits:** QEMU only (CLAUDE.md §74). The preemption proof's tick floor is 15 ticks in 500 ms, about 30 Hz: a slow tick above it with its timer programmed right is caught by no timing clause, as before TASKS item 66. A tick 5 % to 15 % fast whose total a stall made look right passes the tick proof, as before. *(Superseded: it held for a single stall only, and since `0df830a8` a rate within 3 % of nominal is the limit.)* The stacks proof's own reclaims and a user space's stalled shootdowns print no line of their own; they are counted in the next line's "stall N of this boot".
 
 ## TASKS item 66: the addendum review's answers (ADR-0013; 2026-11-19)
 
@@ -5399,4 +5401,5 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Review:** the same AI reviewer reads these answers. No person.
 - **Open-source references consulted:** none. No third-party source was read.
 - **Licence:** MIT OR Apache-2.0.
-- **Known limits:** QEMU only (CLAUDE.md §74). A rate within 3 % of nominal passes the tick proof. A processor whose timer reads back as the boot processor's but whose own timer clock is slow is caught only below about 30 Hz. The preemption window stalls in episodes on the oversubscribed machines (the research ledger, §3.1).
+- **Known limits:** QEMU only (CLAUDE.md §74). A rate within 3 % of nominal passes the tick proof. A processor whose timer reads back as the boot processor's but whose own timer clock is slow is caught only below about 30 Hz, and one whose own clock is fast is not caught: every processor's registers are read back, and one clock drives every core's APIC timer on the platforms in scope (ADR-0013's stated limit; the second addendum review's T66-R19). The preemption window stalls in episodes on the oversubscribed machines (the research ledger, §3.1).
+- **Since the second addendum review** (`docs/engineering/REVIEW_T66_addendum2_2026-11-19.md`): the sampler's logic moved into `apic::sample_period` with a reader closure, host-tested against a simulated timer, and its gap between reads is measured across their brackets (T66-R17, `500f6cd1`; control T66-31).
