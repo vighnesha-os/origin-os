@@ -3343,9 +3343,10 @@ fn contexts_two_retirers_lose_no_ended_context() {
 /// gives back at its reap.
 const SETTLED_EARLY: &str = "a settle passed while an ended thread still held what it gives back";
 
-/// E2's and E3's bound in `cargo xtask check`: three threads searched exhaustively take over a
-/// million executions (96 s and 65 s), so the gate stops at two preemptions, which every control's
-/// bug needs at most one of; `ORIGIN_LOOM_DEEP` searches them exhaustively.
+/// E2's and E3's bound in `cargo xtask check`: three threads searched exhaustively take half a
+/// million executions and more (E2 1,105,056 in 96 s, E3 524,132 in 65 s, both passing), so the gate
+/// stops at two preemptions (325 and 555 executions), within which controls X2 and X3 are caught by
+/// them; `ORIGIN_LOOM_DEEP` searches them exhaustively.
 const EXITS_QUICK: Bound = preempted(2, SPINS);
 
 /// What an ending thread holds until its reap: 1 while held, 0 once given back. Loom's cell
