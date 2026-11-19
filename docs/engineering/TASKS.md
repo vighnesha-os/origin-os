@@ -518,6 +518,8 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 77. **The framework sets a processor's kernel-stack record from the incoming context's home (TASKS item 70's question 9). Numbered by the coordinating session on 2026-11-19; not started; after TASKS item 70.** `set_kernel_stack` takes any stack the scheduler holds, including one that carries another context's suspended frame. An interrupt from ring 3 on that processor would then push onto that frame. With TASKS item 70's home word for each context, `resume` can set `kernel_stack` and TSS.RSP0 itself from the incoming context's home, and `set_kernel_stack` goes. Loom models and a boot control show that no stack but the running context's own is named.
 
+79. **A settle waits for every thread whose end was seen to leave its processor (TASKS item 79; from the keeper's `boot-matrix` on `land/batch-7` `6c754c45`, 2026-11-19). Numbered by the coordinating session on 2026-11-19 and given to TASKS item 70's session, contract first (the coordination notes' `t79-contract.md`); rulings R1 to R7 accepted as recommended the same day. On `claude/t79-ending-threads` from `6c754c45`; built, controlled and gated on 2026-11-19; not landed, not pushed. Its contract, the rulings and the result are under "Task contracts".** A thread's end is seen before it gives anything back, and `sched::settle` waited only for zombies, so a proof could count with an ending thread's stack, FPU area and address space held. Done means: a settle that has seen an end waits until that thread has left its processor and been reaped, for user and kernel threads alike, shown by Loom models with negative controls, by boot controls that hold a thread between its end and its exit (the old code failing as the keeper's run did, the fix passing), and by `check`, `boot-test` and `boot-matrix`.
+
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
@@ -2425,6 +2427,7 @@ Assigned by the coordinating session on 2026-11-19, from the independent review 
 - **T70-7 (Low, folded in), `927e699d`.**
   - `reap_zombies` lowers `ZOMBIES` only after the FPU area, the stack and the address space are dropped. So a `settle` that sees no zombie knows the stack is in the cache of kept stacks before it trims.
   - It is a path that gives the directory proof's four frames on `ab25746a` exactly, found by reasoning and never reproduced, so nothing shows it was their cause. The code that does it predates this task.
+  - TASKS item 79 found a second path to the same four frames (H2), and closes it.
 - **T70-4 and T70-5 (Low), `4775d00c`.**
   - The clauses begin with `stack::trim` and a reclaim of every retired stack. The thread's stack then has room in the cache, and no reclaim's shootdown is under way while a processor is held.
   - W3 without room now fails as "not judged".
@@ -2442,6 +2445,7 @@ Assigned by the coordinating session on 2026-11-19, from the independent review 
   - The boot flow waited at most 10.9 and 14.8 ms for readiness, and 179 and 113 µs for the hold.
   - The cap is 500 ms.
 - **The open item is closed in reasoning, not by recurrence.** T70-7's path gives the logged symptom exactly: four frames, the heap exact, both settles passing. The fix removes it.
+  - **A second path, found later (TASKS item 79, ruling R7, 2026-11-19).** A proof's own last thread still between its end and its exit at the compare's settle gives the same symptom: the compare's re-check reaps it after the trim, so its stack sits in the cache of kept stacks, four frames short with the heap exact (H2). T70-7 closed its own path; TASKS item 79 closes this one. Which of the two gave `ab25746a`'s four frames is not known.
 
 **Answers to the addendum to the review (2026-11-19).** `REVIEW_T70_addendum_2026-11-19.md` (the same AI reviewer, from 10:17 UTC): all seven findings closed, no High or Medium, two new Low, answered on the coordinating session's rulings, one commit each. Both reports are in the repository as received (`317d13c4`). The last commit that changes code is `e6a4b1b4`.
 - **T70-8 (Low), `bb3f9f49`.** The boot flow's wait for the held processor spun with interrupts off for at most 500 ms, so a host stall of half a second on the 65-, 67- or 288-processor machines would have refused the boot, against ADR-0013 R1(b); Amendment 3(b) does not run such a boot again, since no stack is lost.
@@ -2796,3 +2800,44 @@ Recorded, not changed: the memory proof's two one-second budgets (TASKS item 74)
   - **The idle round,** right after (10 large boots, host load average 7 to 27): all passed. Nine needed 1 run of the window and 1 s of its budget; intel-65.1 needed 2 runs and 5 s, after one stall of 242 ms. Every tick proof passed at run 1, 998,981 to 1,003,798 ppm, from 1 to 10 pairs; 1 to 38 calibration windows were discarded, and every RTC second was confirmed.
 - **Not shown:** anything under KVM, in CI or on a physical machine. The intermediate commits were not each built on their own; the final tree was. No person has reviewed it.
 
+
+### 79. A settle waits for every thread whose end was seen to leave its processor
+
+Assigned by the coordinating session on 2026-11-19 to TASKS item 70's session, from the keeper's `boot-matrix` on `land/batch-7` at `6c754c45` (about 20:05 UTC, the Intel-IOMMU 1-processor machine). The contract went to the coordinating session before any code (the coordination notes' `t79-contract.md`), and it accepted rulings R1 to R7 as recommended, adding two things: case (c)'s verdict recorded in ADR-0013 as a deliberate change, with xtask's timeouts checked, and the cost in the ledger (ADR-0018 V3).
+
+**What was wrong** (read at `6c754c45`):
+
+- **The keeper's run.** `directory: … heap 29408 bytes (was 37632), 128191 free frames (was 128158): directory failed`. Its first count held 8,224 bytes and 33 frames more than every other leak check of that boot: about one thread's stack, its FPU area and the space it still held. The proof before it, `prove_entry_flags`, ran `PIN_PROGRAM` twice, waited with `await_end` (`ending()` only) and compares no counts. About 250 earlier directory proofs in saved logs never showed it.
+- **The window.** A user thread's end runs with interrupts on: `thread_ended` raises the thread's `TERMINATED`, then `close_out` closes the handles and sets the process's `ending`, then `ipc::reap_closed` and `sched::reap` run. Only then does the exit vector reach `on_exit`, which queues the stack, FPU area and space reference as a zombie. A tick in that stretch gives one processor to the boot flow. On several processors no tick is needed.
+- **Why the settle passed.** `settle` reaped, then waited for `zombies() == 0`, which held at once, so it never yielded; it trimmed, reclaimed and read the counts with everything held.
+- **Kernel threads, the same.** All 23 kernel thread ends raised a done-flag and then called `sched::exit()`.
+- **H1, an earlier proof's end at a first count.** Exposed: the directory proof after `prove_entry_flags` (the failure), the kernel stacks proof after `prove_user_clock`, and the IPC proof after `wait::prove`'s workers. `measured_stack::prove_in_thread` was already sound: it waits for its flag and for the thread to leave the queue.
+- **H2, a proof's own last end at its compare.** The compare's 2 s re-check lets the thread finish and its `reap()` gives back the FPU area and the space, but not the trim: the stack goes into the cache of kept stacks the settle has just emptied, 4 frames short with the heap exact. That is a second path to the directory proof's 4-frame shortfall on `boot-x2apic` that TASKS item 70's T70-7 was taken to explain (item 70's Result, ruling R7).
+
+| Field | |
+|---|---|
+| Task ID | TASKS item 79, on `claude/t79-ending-threads` (worktree `sweet-wilbur-674acb`), cut from `land/batch-7` at `6c754c45`, which holds TASKS items 66 and 70 (ruling R5). |
+| Objective | A settle that has seen a thread's end, by any signal, waits until that thread has left its processor and been reaped, for user and kernel threads alike, so that no count a Refuse proof compares is read while an ending thread still holds memory. |
+| Source ownership | This task alone edits: a new module `framekernel/frame/sync/src/exits.rs` (atomics only, `forbid(unsafe_code)`), its line in `lib.rs`, its models in `models.rs` and its controls in `developer-tools/xtask/src/loom.rs`; `sched.rs`'s exits, `settle`, `on_exit`, `reap_zombies`, `end_with` and `finish`; `Process::thread_ended`; `percpu.rs`'s sizing line; `settled.rs`; the 23 kernel thread ends; an xtask host test; the records. |
+| Architecture contract | CLAUDE.md §13 (no new `unsafe`, no assembly), §72 and §73 (concurrency testing, Loom), §1 ("Validate failure paths", "Review sensitive boundaries independently"). ADR-0013 R1, R4 and the TASKS item 67 settle; Amendment 3 (b) unchanged. ADR-0018 V3 for the cost. |
+| Relevant specifications | The memory model Rust 1.100.0's atomics follow (`core::sync::atomic::Ordering`, which defers to C++20's): release sequences of read-modify-writes, synchronizes-with, happens-before. |
+| Required dependencies | The base above. Loom as `cargo xtask loom` builds it. No new crate (§5), no owner decision (no ABI, format or scope change). |
+| Security invariants | No count a proof compares is read while a thread whose end was seen still holds memory. A thread that never leaves its processor after its end is named by every later settle, never miscounted. Nothing here weakens a check: a settle only waits longer. |
+| Performance constraints | A thread's end: the run queue's and the threads' locks once more with interrupts off, and two more atomic read-modify-writes. A settle: one more load for each processor at each poll of its first wait. Ledger row CL42 (ADR-0018 V3). |
+| Required tests | Host tests of `Exits` and of `settled::judge`; Loom models E1 to E3 with controls X1 to X5, each caught; an xtask host test for Amendment 3 (b); boot controls C1, C1w, C2, C3 and C4 on the Intel-IOMMU 1-processor and the 4-processor machines, the old code (`6c754c45`) failing where aimed and the fix passing; `check`, `boot-test`, `boot-matrix` in one turn of the machine. |
+| Actual deliverables | The code above, the records (ADR-0013, the ledger, this entry, the provenance entry), an independent review and its answers. |
+| Acceptance conditions | Every test above as stated; the review's findings answered; the coordinating session's reading. |
+
+**Result (2026-11-19).** Built on `claude/t79-ending-threads` from `6c754c45`: `5b1299c5` (`origin_sync::exits`, Loom models E1 to E3, controls X1 to X5), `9c103f30` (the kernel: `EXITS`, `end_with`, `finish` at all 23 kernel thread ends, `thread_ended` marked, `on_exit`, `reap_zombies`, `settle`, `settled.rs`), `e292f8d1` (xtask's Amendment 3 (b) test) and `aea42421` (E2's and E3's bound stated as run).
+
+- **How it works.** A thread counts itself as ending on its processor before anything about its end can be seen; its exit counts its zombie and only then stops counting it; the reap lowers the zombie only after giving back what it held; `settle` reads every processor's ending count before any zombie count and waits for both to be zero. Kernel threads have no other way to end than `finish(signal)`, whose closure is their done-flag. The scheduler proofs' done-counts, which were Relaxed, are AcqRel and read with Acquire, so that a waiter's settle is ordered after the mark.
+- **Host and Loom.** `exits`' 7 host tests, `settled`'s and xtask's new test pass. `cargo xtask loom`: all 64 models passed and all 94 negative controls were caught, X1 to X5 by the exits models they aim at. E2 and E3 took 1,105,056 and 524,132 executions exhaustively (96 s and 65 s), both passing, so the gate runs them at two preemptions (325 and 555), within which X2 and X3 are caught.
+- **Boot controls** (ADR-0013, "Controls of TASKS item 79"; 20:39 to 20:46 UTC, 1 and 4 processors):
+  - **C1,** the entry-flags proof's second process held 200 ms after its end could be seen: the old code failed with the keeper's figures, 8,224 bytes and 33 frames, but at the memory proof, since the directory proof counted the held memory at both ends and passed; the fix passed.
+  - **C1w,** every process end held: the old code failed the IPC proof's compare 60 and 64 frames short (H2); the fix passed every count line on both machines, whole on 4 processors. On 1 processor the IPC proof's last six clauses returned early, printing nothing, and the old code did the same under the same edit: the edit's effect, not the fix's.
+  - **C2,** the wait-queue workers held between their done-count and their exit: the old code failed the IPC proof's first count (H1 from kernel threads); the fix passed.
+  - **C3,** the fix without its wait for ending threads: failed as the old code did.
+  - **C4,** a 15 s hold: the directory proof's first settle waited its 10 s in vain and the line said `not settled before its first count: 1 ending threads not yet exited`; `xtask` stopped there.
+- **Case (c), a deliberate change** (the coordinating session's addition 1): recorded in ADR-0013 with its reason and with `xtask`'s timeouts: one or two waits of 10 s before the refusal is said, against boots of about 13 s in 120 s (1 to 4 processors) and about 76 s in 242 s (65).
+- **The cost** (addition 2): ledger row CL42, and CL20's settles; `cost-gate` passes. Nothing is measured.
+- **The date.** The keeper's run was on 2026-11-19 at about 20:05 UTC; these records use the UTC date.
