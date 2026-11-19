@@ -2159,10 +2159,10 @@ Assigned by the coordinating session on 2026-11-19 (its brief was written on 202
 | R1 | APIC timer's calibration (feeds the clocks) | Up to 32 windows; with none clean, the least disturbed | Up to 1,024 windows (about 10 s, spent only while spoiled); the rest as before |
 | R2 | Clock sources (Report), the RTC second | Decided within 3.2 s | Within 5.2 s; decides at the second edge where it did |
 | R3 | Wait timing (Report) | One run: 50 to 80 ms, and under 500 ms | The same bounds; a late run whose waiter's processor lost at least 3 ticks, or whose boot flow was away a tenth of the time, is run again, up to 8 runs; otherwise it fails at once |
-| R4 | Preemption (Refuse) | 15 switches in a 500 ms window of TSC time | 15 switches in a window that ends when every processor has taken 50 of its own ticks, within 10 s |
-| R5 | APIC timer's rate (Refuse) | 50 interrupts in 95 % to 150 % of 500 ms, within 2 s | The same bounds on the first 50 interrupts; a slow run whose median gap is in bounds and with a gap of two periods or more is run again, up to 4 runs; too fast, or a median out of bounds, fails at once |
+| R4 | Preemption (Refuse) | 15 switches in a 500 ms window of TSC time | 15 switches in a window that ends when every processor has taken 50 of its own ticks, within 10 s. *(Since the review's T66-R1 and ruling A: each processor's timer programming, read back at its first tick, must be what the boot processor's timed proof ran, or it fails at once; its 15th tick must come within 500 ms of TSC time, today's bound; a run late with a gap of two periods or more is measured again, up to 4 runs, never passed; late with no such gap, or short at the budget, fails)* |
+| R5 | APIC timer's rate (Refuse) | 50 interrupts in 95 % to 150 % of 500 ms, within 2 s | The same bounds on the first 50 interrupts; a slow run whose median gap is in bounds and with a gap of two periods or more is run again, up to 4 runs; too fast, or a median out of bounds, fails at once *(Since the review's T66-R5: a run whose total is in bounds is still measured again, and never passed, if some ten consecutive gaps, counted from a stamp not shared with the next, add up to under 8.5 periods; the median judges only the slow side)* |
 | R6 | TSC consistency, monotonic clock (Report) | 100 handoffs by 500 ms | By 5 s |
-| R7 | Refuse proofs' waits on another processor (TLB, `settle`, the kernel-wide bound, the Rust program) | 2 s | One budget of 10 s, `sched::OTHERS_PATIENCE` |
+| R7 | Waits on another processor: the Refuse proofs' (TLB, `settle`, the kernel-wide bound, the Rust program, the preemption workers' exit) and, since the evidence after the change, the clock proofs' turn-takers and readers (Report) | 2 s; the timed waits' own wait 4 s | One budget of 10 s, `sched::OTHERS_PATIENCE`. *(Since the review's T66-R3, each wait that goes past its former bound says so on a line of its own)* |
 | R8 | Stalled shootdowns | A count only | Each recorded (who did not answer, who asked, how long), and a line from the reaper when a stack is lost; the stacks proof's summary after TASKS item 70 |
 
 Recorded, not changed: the memory proof's two one-second budgets (TASKS item 74); the kernel's own shootdowns, which panic on a 1 s stall; the AML proof's wall-clock limit (TASKS item 63's); the tight Report and Withdraw clauses not seen failing. A stalled reclaim retried rather than lost is TASKS item 73.
@@ -2175,7 +2175,7 @@ Recorded, not changed: the memory proof's two one-second budgets (TASKS item 74)
 | Architecture contract | ADR-0013 R1, R3, R8 and Amendments 2 and 3; ADR-0012; ADR-0004 Amendment 1, A2, and Amendment 2, A6.3; ADR-0018 V3; CLAUDE.md §13 (no new `unsafe`), §26, §68, §72, §74. |
 | Relevant specifications | None new. |
 | Required dependencies | `land/batch-6` at `0ed7bfb9`; TASKS item 71 merged first if it lands in the batch before the final gates. No crate (§5). |
-| Security invariants | (1) Every run that passes meets today's bound. (2) Evidence of a disturbance buys a repeat, never a pass; each budget is bounded. (3) A Refuse proof's correctness half is judged on every run. (4) No new or changed line holds ADR-0013 R8's `: … failed` form unless it is a failure, any existing marker's text, or an address; R8's lines name processors and milliseconds only. |
+| Security invariants | (1) Every run that passes meets today's bound. *(Not so for the preemption proof as first built; restored by the review's T66-R1: its 15th tick within 500 ms of TSC time)* (2) Evidence of a disturbance buys a repeat, never a pass; each budget is bounded. (3) A Refuse proof's correctness half is judged on every run. (4) No new or changed line holds ADR-0013 R8's `: … failed` form unless it is a failure, any existing marker's text, or an address; R8's lines name processors and milliseconds only. |
 | Performance constraints | None at run time: boot proofs only. A boot with no disturbance pays nothing more. The worst cases when disturbed go into CL20. |
 | Required tests | Host tests of R3's and R5's judgements at their edges, a grid showing that only an in-bound run passes, and of R8's records; a check that the new lines cannot match a failure marker. The planted controls T66-1 onward under ADR-0013. The evidence boots again on the final commit. Then the quick gates, `check`, `boot-test` and `boot-matrix` in one turn, in that order, with the first `boot-matrix`'s large boots reported. |
 | Actual deliverables | The code, host tests, controls, records, and a hand-over to the coordinating session listing each proof's old and new rule, the evidence, and which proofs can now pass a disturbed run on a machine without a hypervisor. Nothing pushed. |
@@ -2188,7 +2188,7 @@ Recorded, not changed: the memory proof's two one-second budgets (TASKS item 74)
 4. **TASKS item 71** may change which PM timer form the clocks read; if it lands in the batch before the final gates, the batch is merged first.
 5. **An independent review is required.**
 
-**Result (2026-11-19): built and gated under QEMU; not landed and not pushed. The independent review the rulings require is to come.** The evidence is in ADR-0013's "Timing proofs that judge the kernel" and in `SOURCE_PROVENANCE.md`, "TASKS item 66".
+**Result (2026-11-19): built and gated under QEMU; not landed and not pushed.** *(The first build. The review found a High in it; the answers and the result after them follow below)* The evidence is in ADR-0013's "Timing proofs that judge the kernel" and in `SOURCE_PROVENANCE.md`, "TASKS item 66".
 
 - **Commits on `0ed7bfb9`:**
   - `3df35070`: the contract.
@@ -2236,3 +2236,65 @@ Recorded, not changed: the memory proof's two one-second budgets (TASKS item 74)
   All three were confirmed. Each ticked 50 interrupts in 515 ms, its preemption window lasted 1,120 to 1,329 ms, and it lost no stack. None of the 17 kernel-boot logs the gate wrote (each copied as it was written) shows a repeat or a stalled shootdown.
 - **The probe of QEMU's threads** (a 65-processor boot in the same turn, before the gates): all 65 virtual processors were busy, the host's 10 threads full, for about 14 s while the firmware brought them up. The kernel's calibration comes right after, at a moment the probe's 1.5 s samples cannot resolve. It neither confirms nor rules out a cause for the spoiled windows, and changes no rule.
 - **Not shown:** anything under KVM, in CI or on a physical machine. Each intermediate commit was not built on its own; the final tree was. No person has reviewed it.
+
+**The independent review of `c0f0d02a` (2026-11-19) and its answers.** One AI reviewer read the whole diff (the coordination notes' `REVIEW_T66_2026-11-19.md`) and found 1 High, 2 Medium and 7 Low. The coordinating session accepted all ten the same day, and then ruled on T66-R1's median clause (ruling A). Each finding was fixed:
+
+- **T66-R1 (High): the preemption proof could pass a slow tick in its disturbed run.**
+  - **The defect:** the window was counted in the very ticks it checks, nothing compared them with the TSC, and the disturbed run itself passed.
+  - **The first fix (`b4a8e3ed`):**
+    - each processor's ticks are watched on the TSC (`runqueue::TickWatch`, noted by the tick handler while armed);
+    - the 15th tick must come within 500 ms of TSC time, today's bound;
+    - a run late with a gap of two periods or more is measured again with fresh workers, up to 4 runs, and the stalled run never passes;
+    - a run late with no such gap fails;
+    - a processor short at the 10 s budget fails.
+  - **The median clause, replaced (`4c856ce3`).** That first fix also judged each processor's median tick gap within 95 % to 150 %. A diagnostic build showed it fails right rates under TCG (`docs/research/2026-11-19-timing-proofs.md`, §2): a third of a correct timer's gaps fall under 95 % on a quiet two-processor machine, and 2 of 4 large boots failed. **Ruling A** replaced it. Each processor's tick handler reads back, at its first watched tick, its own timer's initial count, divide configuration and LVT entry (vector, mask, periodic mode) through `X2Apic::read`. They are compared with what `start_periodic` programs, which is what the boot processor's timed proof ran with (`apic::TimerProgramming`). A difference fails at once and ends the window at once. The line names the processor, the register and both values, and a misprogrammed processor is named before any other made short of its ticks by the early end (`4dc3bff6`).
+  - **A stated limit, not an allowance.** A slow tick between about 30 Hz and 100 Hz with its timer programmed right is caught by no timing clause, as before TASKS item 66: the floor is 15 ticks in 500 ms.
+  - **Controls:**
+    - T66-9: one stall, repeated, then passed;
+    - T66-9b: a stall in every run, which fails at run 4;
+    - T66-20, 20b and 20c: a wrong divisor, a wrong count and one-shot mode, each on one application processor only, each failing at once.
+- **T66-R2 (Medium): the signalled wait's "away" was mis-measured, and had no one-processor guard (`6d9f0aa3`).**
+  - The 20 ms phase now measures at the real rate (`sched::yield_until_away_for`), so only a step of 3 ms counts as away.
+  - On one processor the away reading is 0, as in the ping-pong.
+  - The away figure is printed on the judgement's own line.
+  - Control T66-21: the signalled wait never woken, its ticks all there, fails at run 1.
+- **T66-R3 (Medium): R6's and R7's extensions left no trace, and the records listed them wrongly.**
+  - `a9c96bb9` made each extension visible:
+    - every R7 wait goes through `sched::wait_for_others`, which prints `waited N ms for …, past the former 2000 ms` whenever it went past its old bound;
+    - a run of turns past the former 500 ms says so on a line of its own;
+    - the timed waits' own wait says so past its former 4 s (`6d9f0aa3`).
+  - The records now list the timed waits' own wait (4 s to 10 s) and the clock cost's two waits.
+  - ADR-0013's controls are now labelled for what each shows.
+- **The Lows:**
+  - **T66-R4 (`bf073014`):** `apic::judge_ticks` judges the first `wanted` stamps only. Its test: 64 stamps at 75 % were in bounds on 64, and are too fast on the first 50.
+  - **T66-R5:** a fast tick whose total a stall made look right no longer passes.
+    - **First answer (`bf073014`):** a median gap under 95 % counted as too fast. Its controls showed that fails correct timers under TCG: the poll-stamped gaps of a right timer have a median of 9.03 to 9.09 ms for 10 ms, and T66-12 to T66-14 were stopped at the tick proof.
+    - **Second answer (`4dc3bff6`):** a run with a gap of two periods or more was stalled whatever its total, measured again and never passed. Its evidence boots showed that fails correct timers under load, where almost every run has such a gap: the tick proof failed at run 4 on all three 65-processor boots at three busy loops, both at ten, and three of five small ones at twenty.
+    - **The rule now (`66f47442`):** a run within its bounds is still measured again, and never passed, if some ten consecutive gaps, each span counted from a stamp not shared with the next, add up to under 8.5 periods. A correct timer's ten gaps span more than nine periods when its expiries are raised on time, and a fast one's are all short. A short span is a repeat, not a failure, because a host that raises an expiry late can take up to a period more off one span. Each run measured again prints a line of its own, and the tick proof's lines give the least span.
+    - **Controls:** T66-22, twice the rate with a 300 ms stall once (measured again, then too fast by its total), and T66-22b, the stall in every run (fails at run 4).
+    - **A stated limit:** a rate 5 % to 15 % fast whose total a stall made look right is caught by neither clause, as before TASKS item 66.
+    - Host tests cover each clause at its edge, a stamp shared with the next, and the grid; the documentation says exactly what is checked, in order.
+  - **T66-R6 (`bf073014`):** `take_ticks` opens an interrupt window before it counts, so a pending expiry cannot start a repeated run one ahead.
+  - **T66-R7:** every new line is under the console's 160 bytes, counted at the widest each figure can print. The tick proof's failure line gives a short run's length (`bf073014`), and each run it measures again has a line of its own (`66f47442`). The timed waits' judgement has a line of its own (`6d9f0aa3`). The reaper's line uses the boot flow's console there (`a9c96bb9`).
+  - **T66-R8 (`a9c96bb9`):** the stall record is `framekernel/frame/src/stalls.rs`, a host-built `StallLog` with four host tests, and every reclaim the scheduler makes, `settle`'s own among them, reports a lost stack. **A departure, recorded:** the stacks proof's own reclaims and user-space (`shootdown_space`) stalls print no line of their own, being counted only in the next line's "stall N of this boot". The line names the boot's last stall, which another processor's stall can overtake.
+  - **T66-R9 (`a9c96bb9`):** the boot flow, which takes turns with interrupts off for up to 5 s, opens an interrupt window between its turns.
+  - **T66-R10:** the records were corrected:
+    - the provenance rows' dates;
+    - ADR-0013's pointer to the evidence, now the research ledger `docs/research/2026-11-19-timing-proofs.md`;
+    - CL20's per-run bounds;
+    - "no real-machine bound changed", qualified for the preemption proof.
+
+**Result after the review (2026-11-19): built under QEMU; not landed and not pushed. The same reviewer is to read the answers.** The rules and evidence are in ADR-0013's "Timing proofs that judge the kernel", in the research ledger `docs/research/2026-11-19-timing-proofs.md`, and in `SOURCE_PROVENANCE.md`, "TASKS item 66: the review's answers".
+- **Commits after `c0f0d02a`:**
+  - `a9c96bb9`: T66-R3, R7, R8 and R9.
+  - `6d9f0aa3`: T66-R2.
+  - `b4a8e3ed`: T66-R1's first fix.
+  - `bf073014`: T66-R4 to R7.
+  - `4c856ce3`: ruling A, in place of the per-processor median.
+  - `90ee371b`: `main` at `2d0187c0` (pull request 41) merged in, as ruled, with no conflict.
+  - `4dc3bff6`: T66-R5's second answer, since replaced; a misprogrammed timer named first.
+  - `66f47442`: T66-R5's answer now.
+  - Then these records; the gates' result follows them.
+- **Controls:** all 26, T66-1 to T66-22b, on `66f47442` (ADR-0013's table). Each fault failed where aimed; of the disturbances short of their budget, T66-6, 9 and 12 were repeated and then passed, and T66-1, 2, 15 and 18 passed in the disturbed run itself.
+- **Evidence** (`66f47442`, 20 boots in one turn, 10:34 to 10:56 UTC): no refusal and no repeat idle, at three busy loops on the 65-processor machine or at twenty on the small machines; at ten busy loops both large machines were refused at the tick proof, as before TASKS item 66. The least span of ten tick gaps of a correct timer was 89 to 98 ms in every run, against the 85 ms that triggers a repeat.
+- **Not shown:** anything under KVM, in CI or on a physical machine. The intermediate commits were not each built on their own; the final tree was. No person has reviewed it.
