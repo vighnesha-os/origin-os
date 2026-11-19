@@ -5305,3 +5305,27 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Open-source references consulted:** none. No third-party source was read.
 - **Licence:** MIT OR Apache-2.0.
 - **Known limits:** QEMU only (CLAUDE.md §74). The preemption proof's tick floor is 15 ticks in 500 ms, about 30 Hz: a slow tick above it with its timer programmed right is caught by no timing clause, as before TASKS item 66. A tick 5 % to 15 % fast whose total a stall made look right passes the tick proof, as before. The stacks proof's own reclaims and a user space's stalled shootdowns print no line of their own; they are counted in the next line's "stall N of this boot".
+
+## TASKS item 66: the addendum review's answers (ADR-0013; 2026-11-19)
+
+- **What:** the answers to the addendum review of `c0f0d02a..f700daa0` (`docs/engineering/REVIEW_T66_addendum_2026-11-19.md`: 3 Medium, 3 Low, T66-R11 to R16), each ruled by the coordinating session, T66-R13 after a diagnostic. Each answer is in `TASKS.md`, entry 66, one commit each.
+  - **`origin-frame`:**
+    - `apic.rs`: `CountRead` and `PeriodSample`, the period from two bracketed reads of the timer's count; `judge_period` and `RateVerdict` (97 % to 103 % of nominal), `tick_verdict`; `judge_ticks` on delivery only, the ten-gap rule removed (T66-R13).
+    - `timer.rs`: `take_ticks` returns a `TimedRun` with the registers it ran (T66-R14) and the period's sample, read by `sample_period` and `read_count` with up to 64 pairs (T66-R13); `timed_programming` in place of `periodic_programming` (T66-R14); the lines give the period.
+  - **`framekernel`:**
+    - `runqueue.rs`: R3's four timed-wait tests restored (T66-R12); `TickWatch::switches_from`, `at_switches` and `note_switches`, and `RunQueue::note_switches`: the 15th context switch stamped (T66-R15).
+    - `sched.rs`: `with_queue` stamps the switches (T66-R15); `RUN`, `worker_arg`, `workers_on`, `run_correct`, and `EXITED` per run: every run judged on correctness first, a repeat only after every worker exited (T66-R11); `timer_read_back` against the timed registers (T66-R14).
+    - `wait.rs`: every timed-wait run past 4 s says so (T66-R16).
+    - `sched.rs`: `PREEMPTION_ATTEMPTS` 8, as ruled after the evidence of the stalls' episodes.
+- **Why:** the addendum review found that a stalled preemption run was repeated without its correctness clauses (R11), that R3's tests had been deleted (R12), that a fast tick masked by recurring stalls passed the tick proof (R13), that "as timed" was rebuilt rather than read (R14), that the rounds clause stamped ticks, not switches (R15), and that one extension went unsaid (R16).
+- **Specifications:** the Intel SDM, Volume 3A's chapter on the APIC (the current count register, read as calibration reads it), as `apic.rs` already cites it. None new.
+- **Architecture:** ADR-0013 R1, R3 and R8 (unchanged); Amendments 2 and 3 (unchanged; item 316).
+- **Unsafe:** none added. The count is read through the existing `X2Apic::read`; no `unsafe` line changed.
+- **Tests:**
+  - **Host tests:** `apic::tests` (the count's arithmetic, the rate at its edges, the reviewer's recurring-stall probes, the grid by 1 % steps), `runqueue::tests` (R3's four restored; the switch stamp, the review's 40 Hz scenario among them). Counts before (`f700daa0`) and after: `apic::tests` 19 and 20, `runqueue::tests` 25 and 30 (R3's four restored, and the switch stamp's), `stalls::tests` 4 and 4.
+  - **Planted boots:** all 32 controls, T66-1 to T66-30 with 9b, 20b, 20c and 22b, on `0df830a8` (ADR-0013).
+  - **Loom:** 61 models, 89 controls caught, on `0df830a8`.
+- **Review:** the same AI reviewer reads these answers. No person.
+- **Open-source references consulted:** none. No third-party source was read.
+- **Licence:** MIT OR Apache-2.0.
+- **Known limits:** QEMU only (CLAUDE.md §74). A rate within 3 % of nominal passes the tick proof. A processor whose timer reads back as the boot processor's but whose own timer clock is slow is caught only below about 30 Hz. The preemption window stalls in episodes on the oversubscribed machines (the research ledger, §3.1).
