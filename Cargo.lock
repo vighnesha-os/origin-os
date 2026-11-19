@@ -17,6 +17,7 @@ version = "0.0.0"
 dependencies = [
  "origin-abi",
  "origin-acpi-tables",
+ "origin-aml",
  "origin-boot-info",
  "origin-directory",
  "origin-frame",
@@ -90,6 +91,9 @@ version = "0.0.0"
 [[package]]
 name = "origin-aml"
 version = "0.0.0"
+dependencies = [
+ "origin-acpi-tables",
+]
 
 [[package]]
 name = "origin-boot-info"

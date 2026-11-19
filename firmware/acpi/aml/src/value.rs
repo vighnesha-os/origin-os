@@ -39,6 +39,15 @@ pub enum Value {
     Reference(Node),
 }
 
+/// A node's value when reading it runs nothing and asks the host nothing ([`Interpreter::plain`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plain<'a> {
+    /// An integer.
+    Integer(u64),
+    /// A string's characters, without the NUL.
+    String(&'a [u8]),
+}
+
 /// One level of a package being copied out.
 struct Out {
     src: ObjRef,
@@ -75,6 +84,25 @@ impl<H: Host> Interpreter<H> {
     /// [`ErrorKind::Stale`] for a node that has been removed.
     pub fn object_type(&self, node: Node) -> Result<u64> {
         Ok(self.heap.get(self.ns.obj(node.0)?)?.type_code())
+    }
+
+    /// What `node` holds, if it is plain data: an integer or a string, after following aliases
+    /// as name lookups do. `None` for every other object, among them each whose reading could run
+    /// AML or reach the host: a method, a field unit, a buffer field, a package whose elements
+    /// name such things. Runs nothing, asks the host nothing and counts nothing (the review of B3,
+    /// B3-1: the kernel's boot proof reads a device's `_HID` with it).
+    ///
+    /// # Errors
+    /// [`ErrorKind::Stale`] for a node that has been removed; [`ErrorKind::NotFound`] for an
+    /// alias chain longer than lookups follow.
+    pub fn plain(&self, node: Node) -> Result<Option<Plain<'_>>> {
+        let heap = &self.heap;
+        let target = self.ns.unalias(node.0, |o| Self::alias_target(heap, o))?;
+        Ok(match self.heap.get(self.ns.obj(target)?)? {
+            Object::Integer(i) => Some(Plain::Integer(*i)),
+            Object::String(s) => Some(Plain::String(s.as_slice())),
+            _ => None,
+        })
     }
 
     /// A node's name segment.
@@ -156,7 +184,7 @@ impl<H: Host> Interpreter<H> {
                 let kept = self.release_held(marks.held);
                 match r {
                     Err(e) => {
-                        self.abort(marks);
+                        self.abort(marks, &e);
                         Err(e)
                     }
                     Ok(_) if kept => Err(Error::new(ErrorKind::MutexHeld)),
@@ -164,14 +192,11 @@ impl<H: Host> Interpreter<H> {
                 }
             }
             Err(e) => {
-                self.abort(marks);
+                self.abort(marks, &e);
                 Err(e)
             }
         };
         self.end_evaluation();
-        if let Err(e) = &out {
-            self.trace_limit(e);
-        }
         out
     }
 

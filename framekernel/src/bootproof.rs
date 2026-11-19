@@ -90,6 +90,8 @@ proofs! {
     Numa "NUMA affinities" => Report;
     NumaDistances "NUMA distances" => Report;
     AcpiTables "ACPI tables" => Report;
+    MeasuredStackBoot "measured stack at boot" => Report;
+    AmlInterpreter "AML interpreter" => Report;
     Random "random-number generator" => Withdraw("no randomness");
     // Threads, and what runs in ring 3.
     Preemption "preemption" => Refuse;
@@ -120,6 +122,7 @@ proofs! {
     UserClock "the clock as ring 3 reads it" => Report;
     Stacks "kernel stacks" => Refuse;
     ThreadsReaped "thread reaping" => Report;
+    MeasuredStackThread "measured stack in a thread" => Report;
     KernelBound "the kernel-wide bound" => Refuse;
     Ibpb "IBPB at each change of process" => Refuse;
     // Devices.
@@ -306,7 +309,7 @@ mod tests {
 
     #[test]
     fn the_table_has_one_row_per_proof_in_order() {
-        assert_eq!(Proof::ALL.len(), 68);
+        assert_eq!(Proof::ALL.len(), 71);
         for (i, &proof) in Proof::ALL.iter().enumerate() {
             assert_eq!(proof as usize, i, "{proof:?} is out of order");
             assert!(!proof.name().is_empty(), "{proof:?} has no name");
@@ -369,7 +372,7 @@ mod tests {
         assert!(!tally.must_stop());
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 61 of 62 proofs passed; 6 did not run; failed: random-number generator (no randomness)\n"
+            "origin-kernel: boot verdict: degraded: 64 of 65 proofs passed; 6 did not run; failed: random-number generator (no randomness)\n"
         );
     }
 
@@ -420,7 +423,7 @@ mod tests {
     fn the_verdict_of_a_clean_boot_is_exact() {
         assert_eq!(
             verdict(passed_all()),
-            "origin-kernel: boot verdict: 68 of 68 proofs passed\n"
+            "origin-kernel: boot verdict: 71 of 71 proofs passed\n"
         );
     }
 
@@ -432,7 +435,7 @@ mod tests {
         tally.record(Proof::Nvme, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 65 of 68 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
+            "origin-kernel: boot verdict: degraded: 68 of 71 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
         );
     }
 
@@ -443,7 +446,7 @@ mod tests {
         tally.record(Proof::PageTables, true);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 66 did not run\n"
+            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 69 did not run\n"
         );
     }
 
@@ -454,7 +457,7 @@ mod tests {
         tally.record(Proof::Raster, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 67 of 68 proofs passed; failed: rasterizer\n"
+            "origin-kernel: boot verdict: degraded: 70 of 71 proofs passed; failed: rasterizer\n"
         );
     }
 

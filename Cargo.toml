@@ -82,6 +82,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 origin-version = { path = "runtime/version" }
 origin-acpi-tables = { path = "firmware/acpi/tables" }
+origin-aml = { path = "firmware/acpi/aml" }
 origin-boot-info = { path = "boot/info" }
 origin-crypto = { path = "security/crypto" }
 origin-random = { path = "security/random" }

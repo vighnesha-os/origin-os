@@ -199,6 +199,29 @@ pub(crate) fn reap() -> usize {
     freed
 }
 
+pub(crate) use crate::settled::{Unsettled, not_settled};
+
+/// Settles the machine before a proof reads the whole machine's heap or free frames to compare
+/// them (TASKS item 67): every exited thread reaped on its own processor, every stack kept for
+/// reuse retired (`stack::trim`), and every retired stack reclaimed (`stack::reclaim`, one
+/// shootdown each, which waits for every processor). Each of those moves the counts on its own
+/// schedule: on the 65-processor machine the stacks that earlier proofs' threads left were still
+/// being reclaimed, one shootdown at a time, when the IPC proof took its first count, so the
+/// count rose during the proof; and a cache of kept stacks that refills during a proof lowers it.
+/// Settled at both reads, the counts change only with what the proof does. Waits up to 2 s for
+/// each part; `Err` names what was still pending, and any stack lost to a stalled shootdown while
+/// it ran (`settled`: safe by design, 4 frames each).
+pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
+    let lost_before = origin_frame::stack::counts().lost;
+    reap();
+    yield_until(|| zombies() == 0, tsc_hz, 2);
+    origin_frame::stack::trim();
+    origin_frame::stack::reclaim();
+    yield_until(|| origin_frame::stack::counts().retired == 0, tsc_hz, 2);
+    let counts = origin_frame::stack::counts();
+    crate::settled::judge(zombies(), counts.retired, lost_before, counts.lost)
+}
+
 /// [`reap`]'s own processor's exited threads.
 fn reap_zombies() -> usize {
     let Some(threads) = THREADS.get(this_cpu()) else {
@@ -1045,6 +1068,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     for &id in cpus {
         init_cpu_fpu(id);
     }
+    // Settled first, so that only these proofs move the counts (TASKS item 67).
+    let settled_before = settle(tsc_hz);
     let heap_before = crate::memory::stats().map(|(h, _)| h.bytes_in_use);
     // The stacks the processors hold for good: their own and their interrupt stacks.
     let stacks_before = origin_frame::stack::counts().live;
@@ -1276,17 +1301,27 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before
             && stacks() == stacks_before
     };
+    let settled_after = settle(tsc_hz);
     yield_until(back, tsc_hz, 2);
-    let reaped = back();
+    let reaped = back() && settled_before.is_ok() && settled_after.is_ok();
     let now = crate::memory::stats().map_or(0, |(h, _)| h.bytes_in_use);
+    // After the counts are read, so that the words' own allocation is not in them.
+    let unsettled = not_settled(settled_before, settled_after);
     proofs.record(Proof::ThreadsReaped, reaped);
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap {} KiB, {} KiB before the first spawn; {} stacks held, {stacks_before} before the first spawn{}",
+        "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap {} KiB, {} KiB before the first spawn; {} stacks held, {stacks_before} before the first spawn{unsettled}{}",
         now >> 10,
         heap_before.unwrap_or(0) >> 10,
         stacks(),
         if reaped { "" } else { ": scheduler failed" }
+    );
+    // The framework's measured stack in a thread switched out on it (TASKS item 68): after the
+    // comparison above has closed with a settle, so that it runs inside no proof's window of
+    // stacks or frames (the review of TASKS item 68, T68-5).
+    proofs.record(
+        Proof::MeasuredStackThread,
+        crate::measured_stack::prove_in_thread(com1, bsp),
     );
     // The kernel-wide bound (ADR-0005 G5; task S4-3), after every proof that makes a process, so
     // that its root can be seen whole again.

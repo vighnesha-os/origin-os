@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{TestHost, tables_standin};
+use super::{TestHost, block};
 use crate::{Config, ErrorKind, InitOutcome, Interpreter, Limits, Value};
 
 /// Every DSDT and SSDT under `dir`, with the directory it is in.
@@ -48,7 +48,7 @@ fn qemu_tables_load_and_answer() {
         tables.iter().filter(|t| t.1.starts_with(b"DSDT")).collect();
     assert!(!dsdts.is_empty(), "no DSDT under {dir:?}");
     for (here, dsdt) in dsdts {
-        let (block, width) = tables_standin::block(dsdt).expect("QEMU's DSDT is well-formed");
+        let (block, width) = block(dsdt).expect("QEMU's DSDT is well-formed");
         let start = std::time::Instant::now();
         let mut i = Interpreter::new(
             TestHost::default(),
@@ -64,7 +64,7 @@ fn qemu_tables_load_and_answer() {
             .iter()
             .filter(|(d, t)| d == here && t.starts_with(b"SSDT"))
         {
-            let (block, _) = tables_standin::block(ssdt).expect("QEMU's SSDT is well-formed");
+            let (block, _) = super::block(ssdt).expect("QEMU's SSDT is well-formed");
             i.load(block).expect("QEMU's SSDT loads");
             ssdts += 1;
         }

@@ -18,6 +18,8 @@
 //! crate root covers every module. What the framework needs is re-exported here from it.
 //! The logic unit-tested on the build host:
 //! - [`acpi`]: RSDP, XSDT and MADT parsing (checksummed) for processor discovery;
+//! - [`aml_proof`]: the boot proof of the AML interpreter (`origin-aml`): its host, which refuses
+//!   all hardware, and the proof over the firmware's DSDT and SSDTs;
 //! - [`amdvi`]: AMD IOMMU (AMD-Vi) register, table, command and event encodings and a host
 //!   page-table walker (DMA and interrupt remapping);
 //! - [`apic`]: x2APIC and 8254 PIT encodings and timer calibration arithmetic;
@@ -111,6 +113,7 @@ extern crate alloc;
 
 pub mod acpi_census;
 pub mod acpi_text;
+pub mod aml_proof;
 pub mod base64;
 pub mod blockcache;
 pub mod bootproof;
@@ -195,6 +198,8 @@ mod kernel;
 #[cfg(target_os = "none")]
 mod launch;
 #[cfg(target_os = "none")]
+mod measured_stack;
+#[cfg(target_os = "none")]
 mod memory_object;
 #[cfg(target_os = "none")]
 mod pcie;
@@ -208,6 +213,7 @@ mod process;
 mod program_proof;
 #[cfg(target_os = "none")]
 mod sched;
+pub mod settled;
 #[cfg(target_os = "none")]
 mod stacks;
 #[cfg(target_os = "none")]
