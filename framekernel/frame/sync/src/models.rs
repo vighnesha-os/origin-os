@@ -27,6 +27,14 @@
 //! then the delivery). A binding's account is an atomic count, charged before each reservation
 //! and refunded as each storage comes back.
 //!
+//! The table of a processor's contexts (`contexts.rs`, TASKS item 70, which `origin_frame::cpu`
+//! instantiates) is real too, with four slots in place of 32. What stands in for the machine there:
+//! a thread that calls `Contexts::switch` is the processor's trap entry; a thread that calls
+//! `Contexts::covers` is another processor deciding whether a stack may be given back; a relaxed
+//! store made after the exit's switch and before the retirement is the processor's last use of
+//! the ended stack, on its way out of the trap entry. Two threads that both retire stand for the
+//! same processor in thread context and in an interrupt, which only over-approximates it.
+//!
 //! Copies, written by hand here, standing in for kernel code; nothing compares them with it:
 //!
 //! - `ThreadName` is `sched::ThreadRef`, and `OnCpu::current_thread` is `sched::current_thread`.
@@ -212,6 +220,7 @@ use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use loom::sync::{Arc, Notify};
 use loom::thread::{self, JoinHandle};
 
+use crate::contexts::{Contexts, Refused};
 use crate::floor::MonotonicFloor;
 use crate::ports::{self, Kind, Packet, Port, Reservation, Source, Storage, TakeError, Unreserved};
 use crate::refcount::RefCount;
@@ -3105,6 +3114,211 @@ fn ports_two_reservations_race_to_grow_a_bound_of_two() {
             }
             let me = world.boot_flow_on(0);
             close_and_settle(&port, &me, &account);
+        },
+    );
+}
+
+// ---------------------------------------------------------------- contexts (TASKS item 70)
+
+/// What a contexts model reports when a stack a context may still use was in no record.
+const UNCOVERED: &str = "a live context's stack was in no record";
+/// ... when a stack was found free before its processor's last use of it was visible.
+const LAST_TOUCH: &str = "a stack was found free before its processor's last use of it";
+/// ... when a published context, or the boot flow's frame, went unrecorded.
+const LOST_CONTEXT: &str = "a published context went unrecorded";
+/// ... when an ended context's home was never retired.
+const NEVER_RETIRED: &str = "an ended context's home was never retired";
+
+/// Stack `n` of the contexts models, as `[low, top)`.
+fn ctx_stack(n: u64) -> (u64, u64) {
+    let low = 0x10_0000 + n * 0x1_0000;
+    (low, low + 0x4000)
+}
+
+/// Stack `n`'s first frame, near its top.
+fn ctx_frame(n: u64) -> u64 {
+    ctx_stack(n).1 - 0xb0
+}
+
+/// Whether `table` covers stack `n`.
+fn ctx_covered(table: &Contexts, n: u64) -> bool {
+    let (low, top) = ctx_stack(n);
+    table.covers(low, top)
+}
+
+/// No model's processor is on the stack of a context it retires.
+fn ctx_off(_: u64) -> bool {
+    false
+}
+
+/// The boot flow, on stack 9, switched to context 1, then to 2, then back to 1: so each of the
+/// two has been switched out once before the model's own switch. Returns context 2's saved frame.
+fn ctx_two_threads(table: &Contexts) -> u64 {
+    assert!(table.publish(ctx_frame(1)));
+    assert!(table.publish(ctx_frame(2)));
+    let at_1 = ctx_frame(1) - 0x100;
+    let at_2 = ctx_frame(2) - 0x100;
+    assert_eq!(
+        table.switch(ctx_frame(9), ctx_frame(1), false, ctx_off),
+        Ok(ctx_frame(1))
+    );
+    assert_eq!(
+        table.switch(at_1, ctx_frame(2), false, ctx_off),
+        Ok(ctx_frame(2))
+    );
+    assert_eq!(table.switch(at_2, at_1, false, ctx_off), Ok(at_1));
+    at_2
+}
+
+/// Context 1 runs and context 2 is suspended. The processor switches from 1 to 2 while
+/// another processor asks whether stack `asked` is in use: whichever it is, it is in use before,
+/// during and after the switch.
+fn ctx_switch_beside_a_reader(asked: u64) {
+    let table = Arc::new(Contexts::new());
+    let at_2 = ctx_two_threads(&table);
+    let reader = {
+        let table = Arc::clone(&table);
+        thread::spawn(move || assert!(ctx_covered(&table, asked), "{UNCOVERED}"))
+    };
+    let here = ctx_frame(1) - 0x200;
+    assert_eq!(table.switch(here, at_2, false, ctx_off), Ok(at_2));
+    reader.join().unwrap();
+}
+
+/// L1: the switch-out window of T68-2 is closed: the outgoing context's stack stays covered.
+#[test]
+fn contexts_switch_out_keeps_the_outgoing_stack_covered() {
+    check(
+        "contexts_switch_out_keeps_the_outgoing_stack_covered",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || ctx_switch_beside_a_reader(1),
+    );
+}
+
+/// L2: the switch-in interleaving of T68-2 is closed: the incoming context's stack stays covered.
+#[test]
+fn contexts_switch_in_keeps_the_incoming_stack_covered() {
+    check(
+        "contexts_switch_in_keeps_the_incoming_stack_covered",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || ctx_switch_beside_a_reader(2),
+    );
+}
+
+/// L3: context 1 ends and the processor switches to context 2, uses stack 1 once more on its way
+/// out of the trap entry, and only then retires context 1's home. Another processor that finds
+/// stack 1 free must see that last use.
+#[test]
+fn contexts_an_ended_stack_is_free_only_after_its_last_use() {
+    check(
+        "contexts_an_ended_stack_is_free_only_after_its_last_use",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let table = Arc::new(Contexts::new());
+            let at_2 = ctx_two_threads(&table);
+            let last_use = Arc::new(AtomicU64::new(0));
+            let reader = {
+                let (table, last_use) = (Arc::clone(&table), Arc::clone(&last_use));
+                thread::spawn(move || {
+                    if !ctx_covered(&table, 1) {
+                        assert_eq!(last_use.load(Relaxed), 1, "{LAST_TOUCH}");
+                    }
+                })
+            };
+            let here = ctx_frame(1) - 0x200;
+            assert_eq!(table.switch(here, at_2, true, ctx_off), Ok(at_2));
+            last_use.store(1, Relaxed);
+            assert_eq!(table.retire_ended(ctx_off), Ok(()));
+            reader.join().unwrap();
+            assert!(!ctx_covered(&table, 1), "{NEVER_RETIRED}");
+        },
+    );
+}
+
+/// L4: two processors publish a thread each into this processor's table while its boot flow,
+/// switched out for the first time, claims a slot for its frame. Four contexts, four slots:
+/// every one is recorded once, and each can be resumed.
+#[test]
+fn contexts_publications_beside_a_switch_each_get_a_slot() {
+    check(
+        "contexts_publications_beside_a_switch_each_get_a_slot",
+        preempted(3, SPINS),
+        EXHAUSTIVE,
+        || {
+            let table = Arc::new(Contexts::new());
+            assert!(table.publish(ctx_frame(1)));
+            let publishers = [3, 4].map(|n| {
+                let table = Arc::clone(&table);
+                thread::spawn(move || assert!(table.publish(ctx_frame(n)), "{LOST_CONTEXT}"))
+            });
+            let boot = ctx_frame(9);
+            assert_eq!(
+                table.switch(boot, ctx_frame(1), false, ctx_off),
+                Ok(ctx_frame(1))
+            );
+            for publisher in publishers {
+                publisher.join().unwrap();
+            }
+            for n in [1, 3, 4, 9] {
+                assert!(ctx_covered(&table, n), "{LOST_CONTEXT}");
+            }
+            // Each saved frame resumes once: 3, then 4, then the boot flow.
+            let mut here = ctx_frame(1) - 0x100;
+            for next in [ctx_frame(3), ctx_frame(4), boot] {
+                assert_eq!(
+                    table.switch(here, next, false, ctx_off),
+                    Ok(next),
+                    "{LOST_CONTEXT}"
+                );
+                here = next - 0x100;
+            }
+            assert_eq!(
+                table.switch(here, boot, false, ctx_off),
+                Err(Refused::NeverSaved),
+                "a frame resumed twice"
+            );
+        },
+    );
+}
+
+/// L5: context 1 has ended. One thread retires it as a stack's drop does, while the processor's
+/// next switch, which also retires, ends context 2. Each home is retired, and neither record is
+/// lost.
+#[test]
+fn contexts_two_retirers_lose_no_ended_context() {
+    check(
+        "contexts_two_retirers_lose_no_ended_context",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let table = Arc::new(Contexts::new());
+            assert!(table.publish(ctx_frame(1)));
+            assert!(table.publish(ctx_frame(2)));
+            assert!(table.publish(ctx_frame(3)));
+            assert_eq!(
+                table.switch(ctx_frame(9), ctx_frame(1), false, ctx_off),
+                Ok(ctx_frame(1))
+            );
+            assert_eq!(
+                table.switch(0x100, ctx_frame(2), true, ctx_off),
+                Ok(ctx_frame(2))
+            );
+            let dropper = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || assert_eq!(table.retire_ended(ctx_off), Ok(())))
+            };
+            assert_eq!(
+                table.switch(0x200, ctx_frame(3), true, ctx_off),
+                Ok(ctx_frame(3))
+            );
+            dropper.join().unwrap();
+            assert_eq!(table.retire_ended(ctx_off), Ok(()));
+            assert!(!ctx_covered(&table, 1), "{NEVER_RETIRED}");
+            assert!(!ctx_covered(&table, 2), "{NEVER_RETIRED}");
+            assert!(ctx_covered(&table, 3), "{UNCOVERED}");
         },
     );
 }

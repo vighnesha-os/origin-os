@@ -38,6 +38,14 @@ use origin_frame::trap::Switch;
 /// Each kernel thread's stack.
 pub(crate) const THREAD_STACK: usize = 16 * 1024;
 
+// A processor's table of contexts (`origin_frame::sync::contexts`, TASKS item 70) holds one per
+// run-queue slot, the boot or idle flow's among them, and one ended and not yet retired: the
+// queue's capacity must be less than the table's.
+const _: () = assert!(
+    crate::runqueue::CAPACITY < origin_frame::sync::contexts::SLOTS,
+    "every context of a full run queue, and one ended, fits a processor's table"
+);
+
 /// Each processor's run queue, by CPU index (ADR-0008 Amendment 1, D1: sized at discovery).
 pub(crate) static QUEUES: PerCpu<SpinLock<RunQueue>> = PerCpu::new(
     "framekernel::sched::QUEUES",
@@ -335,9 +343,6 @@ fn reap_zombies() -> usize {
         let Some(Zombie { stack, fpu, user }) = next else {
             return freed;
         };
-        if let Some(z) = ZOMBIES.get(this_cpu()) {
-            z.fetch_sub(1, Ordering::AcqRel);
-        }
         drop(fpu);
         drop(stack);
         if let Some(user) = user {
@@ -347,6 +352,12 @@ fn reap_zombies() -> usize {
             drop(user);
             // After the memory, so that whoever sees `TERMINATED` knows it has gone (P11).
             process.thread_reaped();
+        }
+        // Lowered last: a `settle` that sees no zombie left then knows that everything this one
+        // held has been given back, its stack in the cache of kept stacks among it, before it
+        // trims that cache (the review of TASKS item 70, T70-7).
+        if let Some(z) = ZOMBIES.get(this_cpu()) {
+            z.fetch_sub(1, Ordering::AcqRel);
         }
         freed += 1;
     }
@@ -382,7 +393,10 @@ pub(crate) fn on_yield(interrupted: u64, switch: &Switch) -> u64 {
 
 /// `SLEEP_VECTOR`: the running thread sleeps for `ticks` timer ticks.
 pub(crate) fn on_sleep(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q| q.sleep(interrupted, ticks).ok())
+    let next = with_queue(interrupted, switch, |q| q.sleep(interrupted, ticks).ok());
+    // The kernel stacks proof holds one thread here, in its switch-out window (TASKS item 70).
+    crate::stacks::hold_in_window(interrupted, next);
+    next
 }
 
 /// `BLOCK_VECTOR`: the running thread blocks until [`wake`] (or goes on, if a wake-up is
@@ -469,7 +483,7 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
 /// [`reap`] on this processor.
 pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
     let id = this_cpu();
-    with_queue(interrupted, switch, |q| {
+    let next = with_queue(interrupted, switch, |q| {
         let slot = q.current();
         let next = q.exit(interrupted).ok()?;
         if let Some(threads) = THREADS.get(id) {
@@ -491,7 +505,10 @@ pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
             }
         }
         Some(next)
-    })
+    });
+    // The kernel stacks proof holds one thread here, in its exit's window (TASKS item 70).
+    crate::stacks::hold_in_window(interrupted, next);
+    next
 }
 
 /// Gives up the processor to the next ready context on this CPU.

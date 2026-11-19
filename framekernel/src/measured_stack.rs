@@ -20,12 +20,13 @@
 //!   processor runs the recursion at [`THREAD_LEVELS`] levels, and at the deepest, after its
 //!   sample, yields until the boot flow has had a turn. Meanwhile the boot flow asks the framework
 //!   whether the thread's own stack is in use (`stack::slot_in_use`), which it must be: the
-//!   thread's saved frame is on the measured stack, and only the measured call's record of the
-//!   stack it left keeps the thread's own stack from being freed (ruling A1). The depth must be at
+//!   thread's saved frame is on the measured stack, and what keeps the thread's own stack from
+//!   being freed is its home in its processor's table of contexts (TASKS item 70, which replaced
+//!   ruling A1's table of the stacks measured calls left). The depth must be at
 //!   least [`TRAP_MARGIN`] bytes below the sample: the yield's trap frame, 22 words, is written
 //!   below the yielding call, and the sample's word is at most 32 bytes below that call. Once the
 //!   thread has ended and been reaped, its own stack must have been given back, not leaked
-//!   (`stack::slot_state`): a measured call's record left behind would leak it (T68-1). Its bounds
+//!   (`stack::slot_state`): a record of it left behind would leak it (T68-1). Its bounds
 //!   count yields, not time, so a loaded host cannot fail it (TASKS item 66).
 //!
 //! Neither runs inside another proof's comparison of stack slots or frames (T68-5). The one at boot
