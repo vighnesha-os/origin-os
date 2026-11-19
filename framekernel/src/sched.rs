@@ -1288,14 +1288,16 @@ fn judge_run(
             .zip(&run.watches)
             .map(|(&id, w)| (id, *w, judge_window(w, WINDOW_TICKS, bound, expected)))
     };
-    let failing = |v: WindowVerdict| {
-        matches!(
-            v,
-            WindowVerdict::Short | WindowVerdict::WrongRate | WindowVerdict::Late
-        )
-    };
-    if let Some((id, w, v)) = judged().find(|&(_, _, v)| failing(v)) {
-        return (v, Some((id, w)));
+    // A timer programmed otherwise is named first: it ends the window at once, which leaves
+    // other processors short of their ticks for no fault of theirs.
+    for wanted in [
+        WindowVerdict::WrongRate,
+        WindowVerdict::Short,
+        WindowVerdict::Late,
+    ] {
+        if let Some((id, w, v)) = judged().find(|&(_, _, v)| v == wanted) {
+            return (v, Some((id, w)));
+        }
     }
     if let Some((id, w, v)) = judged().find(|&(_, _, v)| v == WindowVerdict::Stalled) {
         return (v, Some((id, w)));
@@ -1338,7 +1340,7 @@ fn say_window(
             match v {
                 WindowVerdict::Short => write!(
                     com1,
-                    "CPU {id} took {} of {WINDOW_TICKS} ticks in {WINDOW_BUDGET_SECONDS} s{what}",
+                    "CPU {id} took {} of {WINDOW_TICKS} ticks in the window{what}",
                     w.ticks
                 ),
                 WindowVerdict::WrongRate => match w
