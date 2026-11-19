@@ -761,6 +761,57 @@ fn a_global_lock_not_given_back_fails_the_proof() {
 }
 
 #[test]
+fn package_names_that_cannot_be_bound_fail_the_proof() {
+    // The review of B5, B5-R5: the binding pass is an evaluation of its own, under the limits. No
+    // step limit can reach it in a whole proof: a name costs its load more units than the pass,
+    // and the proof's bound, three evaluations' steps, is checked before each table. So the limit
+    // met is time: a host clock still for its first `K` readings and 10 s on after them. The pass
+    // over 1,250 names charges them at once, which reads the clock; for one `K`, that reading is
+    // the first late one, and the binding's reason comes first.
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static READS: AtomicU64 = AtomicU64::new(0);
+    static STILL_FOR: AtomicU64 = AtomicU64::new(0);
+    fn late() -> u64 {
+        if READS.fetch_add(1, Relaxed) < STILL_FOR.load(Relaxed) {
+            0
+        } else {
+            10_000_000_000
+        }
+    }
+    let names = |p: &str| -> B {
+        let elems: Vec<B> = (0..250).map(|_| nm("\\NONE")).collect();
+        name(p, package(250, &elems))
+    };
+    let dsdt = qemu_ids(table(
+        b"DSDT",
+        1,
+        &[
+            names("PK0"),
+            names("PK1"),
+            names("PK2"),
+            names("PK3"),
+            names("PK4"),
+        ],
+    ));
+    let reason = "the names in QEMU's packages could not be bound";
+    let hit = (0..400u64).find_map(|k| {
+        READS.store(0, Relaxed);
+        STILL_FOR.store(k, Relaxed);
+        let (found, out) = Machine::new(dsdt.clone()).run_with(
+            BootHost::new(late),
+            Limits::BOOT_PROOF,
+            &mut || Some(4096),
+        );
+        (found.failed == Some(reason)).then_some(out)
+    });
+    let out = hit.expect("a clock reading that only the binding pass meets late");
+    assert!(
+        out.contains("origin-kernel: aml: binding package names failed"),
+        "{out}"
+    );
+}
+
+#[test]
 fn a_store_in_pieces_on_qemus_tables_fails_the_proof() {
     // TASKS item 63, step B5's point 1: a `_STA` that stores two bytes into a byte field. The
     // interpreter tells the host the store goes in two pieces before the first, which the host
