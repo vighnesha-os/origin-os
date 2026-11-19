@@ -2018,6 +2018,33 @@ Where it differs from the contract or needs saying:
 - **Not verified:** a boot under KVM (the Mac has none; the dry comparison and the host tests cover CI's KVM job, which CI runs); the 288-processor `boot-many` booted (dry only); a boot that stops on a lost stack, so the re-run's path in process was not booted (host tests and the dry comparison only; TASKS item 69's planted boots ran it before this task, in the same function).
 - **ADR-0011's T1 note and Amendment 4's status line** are the coordinating session's, from the hand-over's draft, after the task lands in a batch.
 
+**Addendum to the result (2026-11-19, after the coordinating session's read of R5).** Two commits and a merge on `ddd5974d`:
+
+- `7c48a2b9`: R5's refusal is checked through the commands' entry (`entry_settings`, which `in_turn_with_settings` calls before the turn). A host test takes one command of each kind: `boot-matrix` and each scenario command refuse each of the four variables, naming it, and take what carries over; `boot-test`, `boot-console` and `run` take all four.
+- `67c0d598`: merge of TASKS item 68 at `89672e44`, as the coordinating session asked before these final gates. In `boot_scenario_markers`, 68's `measured_stack_markers()` stays between the ACPI and AML markers, which take the machine's typed ACPI setting. 68's thread-proof markers after "thread reaping" and its failure string merged without a conflict.
+
+**Evidence on `67c0d598`, in one turn of the machine (02:59 to 03:31 UTC).**
+
+- `cargo test --package xtask`: 392 passed.
+- **The dry comparison**, against `89672e44` (`b983bf6c` with 68's markers):
+  - Seven environments boot and compare: none; CI's real-CPU job; CI with `ORIGIN_BOOT_MATRIX_ANY_COUNT=on`; a person's CPU model, timeout and filter; the fields no scenario overrides, without `ORIGIN_QEMU_BRIDGE=on`, which R5 refuses; the firmware pair named; and `boot-many` under the first two. That is 941 boots on each tree, all identical.
+  - 68's markers are there in both trees and in the same places: 46, two in each of the 23 kernel boots, and 33 entries for its failure string.
+  - One environment for each refused variable (`ORIGIN_QEMU_TOPOLOGY=x2apic`, `_BRIDGE=on`, `_RESERVED=on`, `_ACPI=on`) shows the only differences. On `89672e44`, `boot-matrix` booted 193 boots with the person's machine under every label. On `67c0d598`, it refuses before any boot, naming the variable.
+- **The gates:**
+  - The quick gates passed.
+  - `cargo xtask check` passed in 497 s.
+  - `boot-test` passed 11 of 11 in 54 s.
+  - `boot-matrix` passed on its first run, in 1,074 s (03:13 to 03:31 UTC; load 4.2 at its start).
+
+  The turn began at a load of 139, left by the previous holder's run; it was 6.2 by `check`.
+- **The booted comparison** with `b983bf6c`'s run:
+  - the same 193 scenarios in the same order, each passing;
+  - the same 57 summary lines;
+  - 23 kernel boots with the stacks' region at 23 distinct bases;
+  - 68's two proofs passed in each of the 31 kernel boots that print them.
+
+  Fair shares were let pass only on the 65- and 67-processor machines: 36 this time, 32 on the old tree's run. No stack was lost, and no boot ran once more.
+
 ### 68. A closure run on a painted, guarded stack, and the depth it used
 
 Assigned by the coordinating session on 2026-11-19, from the question TASKS item 63's step B3 left open (its question 3). The AML boot proof samples its stack only at host calls, so the depth it prints is a lower bound and the room it prints above the guard page an upper one (the review of B3, B3-7). Written before any of it was built. Its questions, each with a recommendation, follow the table; nothing is built until the coordinating session rules on them.
