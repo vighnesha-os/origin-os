@@ -79,15 +79,16 @@ pub(crate) fn on_tick(interrupted: u64, switch: &Switch) -> u64 {
     })
 }
 
-/// This processor's timer, read back and compared with what the boot processor's timed proof
-/// ran (TASKS item 66, ruling A on the review's T66-R1).
+/// This processor's timer, read back and compared with the boot processor's registers as its
+/// timed proof ran them (TASKS item 66, ruling A on the review's T66-R1; the addendum review's
+/// T66-R14). Unread if either cannot be had.
 fn timer_read_back() -> ReadBack {
-    match timer::programmed() {
-        None => ReadBack::Unread,
-        Some(read) => match read.first_difference(&timer::periodic_programming()) {
+    match (timer::programmed(), timer::timed_programming()) {
+        (Some(read), Some(timed)) => match read.first_difference(&timed) {
             None => ReadBack::AsTimed,
             Some((register, got, timed)) => ReadBack::Otherwise(register, got, timed),
         },
+        _ => ReadBack::Unread,
     }
 }
 

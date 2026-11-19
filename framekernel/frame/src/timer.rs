@@ -344,15 +344,20 @@ pub fn calibrated_tsc_hz() -> Option<u64> {
 /// The calibrated initial count for [`HZ`] interrupts per second, once known (0 before).
 static PERIOD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// What [`start_periodic`] programs on every processor: the calibrated initial count, the
-/// divide configuration and a periodic, unmasked entry at the timer's vector, the very values
-/// [`init`]'s timed proof ran with on the boot processor.
-pub fn periodic_programming() -> apic::TimerProgramming {
-    apic::TimerProgramming::from_registers(
-        u64::from(PERIOD.load(core::sync::atomic::Ordering::Acquire)),
-        apic::divide_config(DIVISOR).unwrap_or(0b0011),
-        apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false),
-    )
+/// The boot processor's timer as [`init`]'s timed proof ran it: its initial count, divide
+/// configuration and LVT entry, read from its registers in the run that passed, before the timer
+/// was stopped. What every processor's timer must read back as in the preemption proof (TASKS
+/// item 66, the addendum review's T66-R14: read from the timed run, not rebuilt from
+/// [`PERIOD`]). Zero until the proof passes.
+static TIMED: [core::sync::atomic::AtomicU64; 3] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The boot processor's timer as its timed proof ran it ([`TIMED`]); `None` before the proof
+/// passed.
+pub fn timed_programming() -> Option<apic::TimerProgramming> {
+    let [initial, divide, lvt] =
+        core::array::from_fn(|i| TIMED[i].load(core::sync::atomic::Ordering::Acquire));
+    (initial != 0).then(|| apic::TimerProgramming::from_registers(initial, divide, lvt))
 }
 
 /// This processor's timer as programmed, read back from its x2APIC through [`X2Apic::read`];
@@ -542,9 +547,9 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
     let expected = PROOF_TICKS * 1_000_000 / HZ;
     let mut stamps = [0u64; PROOF_TICKS as usize];
     let mut attempts = 0;
-    let (run, taken, lasted) = loop {
+    let (run, taken, lasted, registers) = loop {
         attempts += 1;
-        let (start, taken, end) = take_ticks(&lapic, count, tsc_hz, &mut stamps);
+        let (start, taken, end, registers) = take_ticks(&lapic, count, tsc_hz, &mut stamps);
         let seen = stamps.get(..taken).unwrap_or(&[]);
         let run = apic::judge_ticks(start, seen, PROOF_TICKS as usize, period);
         if run.verdict != TickVerdict::Stalled || attempts == PROOF_ATTEMPTS {
@@ -554,7 +559,7 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
             } else {
                 run.elapsed
             };
-            break (run, taken, lasted);
+            break (run, taken, lasted, registers);
         }
         // Each run measured again is said, with what made it say nothing: a repeat is a finding
         // on a machine without a hypervisor (ADR-0013's note of TASKS item 66). Lines stay under
@@ -600,6 +605,9 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
         let _ = write!(com1, ", run {attempts} of {PROOF_ATTEMPTS}");
     }
     let _ = writeln!(com1);
+    for (cell, value) in TIMED.iter().zip(registers) {
+        cell.store(value, core::sync::atomic::Ordering::Release);
+    }
     PERIOD.store(count, core::sync::atomic::Ordering::Release);
     // The first measurement stands.
     let _ = CALIBRATED_TSC_HZ.compare_exchange(
@@ -615,7 +623,12 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
 /// poll that saw it, until `stamps` is full or two seconds pass, polling with interrupt windows
 /// (never halting, so a lost interrupt cannot hang the check). Returns the TSC at the start and
 /// how many interrupts were stamped, and the TSC at the end. The timer is stopped again.
-fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> (u64, usize, u64) {
+fn take_ticks(
+    lapic: &X2Apic,
+    count: u32,
+    tsc_hz: u64,
+    stamps: &mut [u64],
+) -> (u64, usize, u64, [u64; 3]) {
     // An expiry a stopped run left pending is taken here, before the count starts, so that a
     // repeated run cannot begin one interrupt ahead (the review's T66-R6).
     cpu::interrupt_window();
@@ -642,8 +655,15 @@ fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> (u
         core::hint::spin_loop();
     }
     let end = rdtsc();
+    // The registers as this run ran them, read before the timer stops: the programming every
+    // processor's timer must read back as (`TIMED`, the addendum review's T66-R14).
+    let registers = [
+        lapic.read(ApicRead::TimerInitial),
+        lapic.read(ApicRead::TimerDivide),
+        lapic.read(ApicRead::LvtTimer),
+    ];
     lapic.stop_timer();
-    (start, seen, end)
+    (start, seen, end, registers)
 }
 
 /// One PIT channel-2 one-shot of `pit` input clocks, with the APIC timer counting down and
