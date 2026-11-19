@@ -429,8 +429,10 @@ pub fn names_mmio(map: &[MemoryRegion], base: u64, end: u64) -> bool {
 pub const LENDING_SLOTS: usize = 128;
 
 /// Ranges [`Lending`] keeps that may never be lent: the firmware's structures that change after
-/// boot (TASKS item 71). The tables name at most five: the FACS through either of the FADT's two
-/// pointers, and the FBPT, S3PT and MBPT through the FPDT, which names each kind once.
+/// boot (TASKS item 71). The first valid FADT and FPDT name at most five: the FACS through either
+/// of the FADT's two pointers, and the FBPT, S3PT and MBPT through the FPDT, which names each
+/// kind once. The three left take what any other FADT or FPDT names (the addendum review of
+/// TASKS item 71, T71-11).
 pub const NEVER_SLOTS: usize = 8;
 
 /// What [`Lending::never_lend`] did with the ranges it was given.

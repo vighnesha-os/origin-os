@@ -132,8 +132,9 @@ pub struct Findings {
     /// Any fails the verdict.
     pub lendable_changing: u32,
     /// Gaps in what the kernel's first lookup located and recorded as never lent: a structure
-    /// not located or passed over, one the registry had no room for, and a range lent before one
-    /// of them (the review of TASKS item 71, T71-1); and each structure recorded that meets a
+    /// not located or passed over, one found with no slot left (the addendum review, T71-11), one
+    /// the registry had no room for, and a range lent before one of them (the review of TASKS item
+    /// 71, T71-1); and each structure recorded that meets a
     /// table the kernel lends, over its minimum or cut short at it (the addendum review, T71-9).
     /// Any fails the verdict.
     pub guard_gaps: u32,
@@ -257,6 +258,9 @@ impl core::fmt::Display for NeverLent<'_> {
             }
         }
         write!(f, "; {} kept", self.1.recorded)?;
+        if self.0.unkept != 0 {
+            write!(f, ", {} found with no slot left", self.0.unkept)?;
+        }
         if self.1.untracked != 0 {
             write!(f, ", {} not kept for want of room", self.1.untracked)?;
         }
@@ -593,6 +597,7 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
     if let Some((located, kept)) = &changing {
         found.guard_gaps = u32::from(located.unlocated.is_some())
             .saturating_add(u32::try_from(located.met()).unwrap_or(u32::MAX))
+            .saturating_add(u32::try_from(located.unkept).unwrap_or(u32::MAX))
             .saturating_add(u32::try_from(kept.untracked).unwrap_or(u32::MAX))
             .saturating_add(u32::from(kept.already_lent.is_some()));
     }
@@ -819,9 +824,9 @@ mod tests {
         guard_broken: bool,
         /// Done to the lending registry before the first lookup records what it located.
         prepare: fn(&mut origin_frame::reserved::Lending),
-        /// The first lookup reads the FADT with its checksum spoiled, so takes it for an invalid
-        /// one and locates no FACS, with no gap to report (a test of the census's own finds, the
-        /// review of TASKS item 71, T71-1).
+        /// The first lookup reads the FADT with its FACS pointer zeroed, so locates no FACS, with
+        /// no gap to report (a test of the census's own finds, the review of TASKS item 71,
+        /// T71-1).
         locator_misreads_fadt: bool,
     }
 
@@ -897,8 +902,8 @@ mod tests {
             let mut copy = |addr: u64, out: &mut [u8]| {
                 let at = usize::try_from(addr.checked_sub(BASE).ok_or("no")?).map_err(|_| "no")?;
                 out.copy_from_slice(bytes.get(at..at + out.len()).ok_or("no")?);
-                if misreads && addr == FADT {
-                    out[9] = out[9].wrapping_add(1);
+                if misreads && addr == FADT && out.len() >= 40 {
+                    out[36..40].fill(0);
                 }
                 Ok(())
             };
@@ -1053,9 +1058,9 @@ mod tests {
 
     /// The review of TASKS item 71, T71-1 (c): the census tests the guard over the structures it
     /// finds itself, not only over what the first lookup recorded. A first lookup that missed the
-    /// FACS (here it read a FADT whose checksum fails, so took none) recorded nothing, with no gap
-    /// to report; the census finds the FACS, a lend into its middle and from before it is not
-    /// refused, and the verdict fails.
+    /// FACS (here it read the FADT's FACS pointer as zero, so named none) recorded nothing, with
+    /// no gap to report; the census finds the FACS, a lend into its middle and from before it is
+    /// not refused, and the verdict fails.
     #[test]
     fn the_census_tests_the_guard_over_what_it_finds_itself() {
         let mut m = Machine::new();
@@ -1180,10 +1185,8 @@ mod tests {
         );
     }
 
-    /// The review of TASKS item 71, probe P1: an XSDT that lists three FPDTs before the FADT. Only
-    /// the first FPDT counts, so the FACS is still located, recorded and guarded.
-    #[test]
-    fn three_fpdts_before_the_fadt_leave_the_facs_guarded() {
+    /// A machine whose XSDT lists `n` FPDTs, each pointing to an FBPT of its own, before the FADT.
+    fn fpdts_before_the_fadt(n: u64) -> Machine {
         let pointer = |address: u64| {
             let mut r = vec![0u8, 0, 16, 1, 0, 0, 0, 0];
             r.extend_from_slice(&address.to_le_bytes());
@@ -1198,7 +1201,7 @@ mod tests {
         };
         let mut m = Machine::new();
         let mut entries = Vec::new();
-        for i in 0..3u64 {
+        for i in 0..n {
             let (fpdt, target) = (FPDT + 0x100 * i, FBPT + 0x100 * i);
             m.put(fpdt, &table(b"FPDT", 1, &pointer(target)));
             m.put(target, &fbpt);
@@ -1206,18 +1209,52 @@ mod tests {
         }
         entries.push(FADT);
         m.entries = entries;
-        let (ok, out, lent) = m.run();
+        m
+    }
+
+    /// The review of TASKS item 71, probe P1: an XSDT that lists three FPDTs before the FADT. The
+    /// FACS is still located, recorded first and guarded; and the later FPDTs' FBPTs are recorded
+    /// too (its addendum review, T71-11).
+    #[test]
+    fn three_fpdts_before_the_fadt_leave_the_facs_guarded() {
+        let (ok, out, lent) = fpdts_before_the_fadt(3).run();
         assert!(ok, "{out}");
         assert!(
             out.contains(
                 "never lent, as the firmware changes them after boot: FACS 0x7f003000-0x7f00303f, \
-                 FBPT 0x7f005000-0x7f005037; 2 kept; a lend over each refused: true"
+                 FBPT 0x7f005000-0x7f005037, FBPT 0x7f005100-0x7f005137, FBPT \
+                 0x7f005200-0x7f005237; 4 kept; a lend over each refused: true"
             ),
             "{out}"
         );
         assert!(
             lent.iter().all(|&a| !(FACS..FACS + 64).contains(&a)),
             "{lent:x?}"
+        );
+    }
+
+    /// The addendum review of TASKS item 71, T71-11: eight FPDTs before the FADT name nine
+    /// structures with the FACS, one more than the registry has slots for. The FACS and the first
+    /// FPDT's FBPT are recorded first; the last FBPT found has no slot, which is a gap, and the
+    /// verdict fails.
+    #[test]
+    fn a_structure_with_no_slot_left_fails_the_census() {
+        let (ok, out, _) = fpdts_before_the_fadt(8).run();
+        assert!(!ok, "{out}");
+        assert!(
+            out.contains(
+                "never lent, as the firmware changes them after boot: FACS 0x7f003000-0x7f00303f, \
+                 FBPT 0x7f005000-0x7f005037, FBPT 0x7f005100-0x7f005137"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("FBPT 0x7f005600-0x7f005637; 8 kept, 1 found with no slot left;"),
+            "{out}"
+        );
+        assert!(
+            last_line(&out).contains(", 1 gaps in locating it;"),
+            "{out}"
         );
     }
 
