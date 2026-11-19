@@ -148,7 +148,10 @@ impl Context {
     }
 }
 
-/// One processor's contexts; see the module documentation.
+/// One processor's contexts; see the module documentation. Its `Debug` writes its name alone:
+/// its words are addresses in the kernel stacks' region, which nothing prints (ADR-0004
+/// Amendment 2, A6), and this crate's release object may format nothing more (ONBF §12, the
+/// no-panic check).
 pub struct Contexts {
     slots: [Context; SLOTS],
     /// The slot of the context this processor runs, or `NONE` before its boot or idle flow's
@@ -158,18 +161,9 @@ pub struct Contexts {
     ended: prim::AtomicUsize,
 }
 
-/// Shows how many slots are taken. Homes and frames are addresses in the kernel stacks' region,
-/// which nothing prints (ADR-0004 Amendment 2, A6).
 impl core::fmt::Debug for Contexts {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let taken = self
-            .slots
-            .iter()
-            .filter(|s| s.home.load(Relaxed) != 0)
-            .count();
-        f.debug_struct("Contexts")
-            .field("taken", &taken)
-            .finish_non_exhaustive()
+        f.write_str("Contexts")
     }
 }
 
@@ -550,7 +544,6 @@ mod tests {
     fn debug_names_no_address() {
         let table = Contexts::new();
         assert!(table.publish(0xffff_c000_0001_ff40));
-        let shown = format!("{table:?}");
-        assert_eq!(shown, "Contexts { taken: 1, .. }");
+        assert_eq!(format!("{table:?}"), "Contexts");
     }
 }
