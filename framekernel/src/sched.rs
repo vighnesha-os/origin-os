@@ -286,7 +286,10 @@ pub(crate) fn on_yield(interrupted: u64, switch: &Switch) -> u64 {
 
 /// `SLEEP_VECTOR`: the running thread sleeps for `ticks` timer ticks.
 pub(crate) fn on_sleep(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q| q.sleep(interrupted, ticks).ok())
+    let next = with_queue(interrupted, switch, |q| q.sleep(interrupted, ticks).ok());
+    // The kernel stacks proof holds one thread here, in its switch-out window (TASKS item 70).
+    crate::stacks::hold_in_window(interrupted, next);
+    next
 }
 
 /// `BLOCK_VECTOR`: the running thread blocks until [`wake`] (or goes on, if a wake-up is
@@ -373,7 +376,7 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
 /// [`reap`] on this processor.
 pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
     let id = this_cpu();
-    with_queue(interrupted, switch, |q| {
+    let next = with_queue(interrupted, switch, |q| {
         let slot = q.current();
         let next = q.exit(interrupted).ok()?;
         if let Some(threads) = THREADS.get(id) {
@@ -395,7 +398,10 @@ pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
             }
         }
         Some(next)
-    })
+    });
+    // The kernel stacks proof holds one thread here, in its exit's window (TASKS item 70).
+    crate::stacks::hold_in_window(interrupted, next);
+    next
 }
 
 /// Gives up the processor to the next ready context on this CPU.

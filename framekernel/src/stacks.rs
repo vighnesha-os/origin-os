@@ -11,15 +11,25 @@
 //! - **A freed stack is out of every processor's reach:** another processor caches the
 //!   translations of a stack's pages; once the stack has been freed and reclaimed, its reads
 //!   fault, and the slot is free again, which it is only once the frames have been released.
+//! - **A thread's own stack stays in use through its switches** (TASKS item 70; the review of
+//!   TASKS item 68, T68-2). A thread on another processor is held in the window of its own
+//!   switch-out, after the scheduler has moved that processor's kernel-stack record and before
+//!   the trap entry saves its frame. It is held again in the window of its exit, when its stack
+//!   has become a zombie. Each time the boot flow asks the framework whether the stack is in use,
+//!   as a stack's drop would decide, and the answer must be yes. Once the thread has ended and
+//!   its processor has reaped it, that drop must have given the stack back, not leaked it.
 //! - **Nothing leaks:** once the proof's stacks are given back and reclaimed, the region holds
 //!   exactly what it held before.
 //! - **What it costs** (CLAUDE.md rule 21: under QEMU, with no budget).
 #![forbid(unsafe_code)]
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::hint::black_box;
+use core::ptr;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use origin_frame::stack::{self, GuardedStack};
+use origin_frame::once::SetOnce;
+use origin_frame::stack::{self, GuardedStack, StackSlot, State};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, Probe, rdtsc};
@@ -244,6 +254,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     // A freed stack, cached by another processor.
     ok &= reclaimed_out_of_reach(com1, cpus, bsp, tsc_hz);
 
+    // A thread's own stack in the windows of its switch-out and its exit (TASKS item 70).
+    ok &= switch_windows(com1, cpus, bsp, tsc_hz);
+
     // What it costs.
     ok &= cost(com1, tsc_hz);
 
@@ -406,6 +419,219 @@ fn cost(com1: &mut Console, tsc_hz: u64) -> bool {
         nanos_each(reclaiming, alone, tsc_hz),
         interrupts / alone.max(1) as u32,
         stack::IDLE
+    );
+    ok
+}
+
+// ---------------------------------------------------------------- the switch windows
+
+/// How long either side waits for the other in the switch windows, in seconds: far above any
+/// wait seen, so that a correct kernel on a loaded host does not fail this Refuse proof
+/// (ADR-0013 R1(b)).
+const WINDOW_SECONDS: u64 = 5;
+
+/// The handshake between the boot flow and the held thread:
+/// - `READY`: the thread is about to switch away;
+/// - `GO`: the boot flow now spins, and will answer at once, without yielding, reaping or sending
+///   an interrupt;
+/// - `HELD`: the thread's processor is held in the window, taken from `GO` by a compare-and-swap,
+///   so a processor is held only while the boot flow spins for it;
+/// - `ANSWERED`: the boot flow has asked, and the processor may go on;
+/// - `GAVE_UP`: the boot flow stopped waiting, taken from `GO` the same way, so no processor is
+///   held after it.
+const READY: u64 = 1;
+const GO: u64 = 2;
+const HELD: u64 = 3;
+const ANSWERED: u64 = 4;
+const GAVE_UP: u64 = 5;
+static WINDOW_STAGE: AtomicU64 = AtomicU64::new(0);
+/// The slot of the held thread's own stack.
+static WINDOW_SLOT: SetOnce<StackSlot> = SetOnce::new();
+/// The TSC's frequency, for the held processor's budget.
+static WINDOW_TSC_HZ: AtomicU64 = AtomicU64::new(0);
+/// How long the processor was held, in TSC ticks, in each window, and whether it gave up.
+static HELD_TICKS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static HOLDS: AtomicU64 = AtomicU64::new(0);
+static HOLD_GAVE_UP: AtomicBool = AtomicBool::new(false);
+
+/// Spins until `done`, for at most [`WINDOW_SECONDS`]; whether it was done. Takes no lock, sends
+/// nothing, and does not yield.
+fn spin_until(done: impl Fn() -> bool, tsc_hz: u64) -> bool {
+    let start = rdtsc();
+    while !done() {
+        if rdtsc().wrapping_sub(start) >= tsc_hz.saturating_mul(WINDOW_SECONDS) {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
+/// The held thread, on another processor: it records its own stack's slot, then twice tells the
+/// boot flow it is about to switch away, waits for its word, and switches: first by sleeping
+/// for a tick, then by ending. Each switch is held in its window by [`hold_in_window`]. A
+/// sleep, not a yield: a yield switches only to another ready thread, and the processor's idle
+/// context runs only when none is.
+extern "sysv64" fn windowed(_: u64) -> ! {
+    let here = 0u64;
+    if let Some(own) = stack::slot_holding(ptr::from_ref(black_box(&here)).addr() as u64) {
+        let _ = WINDOW_SLOT.set(own);
+    }
+    let tsc_hz = WINDOW_TSC_HZ.load(Ordering::Relaxed);
+    let ready = || {
+        WINDOW_STAGE.store(READY, Ordering::Release);
+        spin_until(|| WINDOW_STAGE.load(Ordering::Acquire) != READY, tsc_hz);
+    };
+    ready();
+    crate::sched::sleep(1);
+    ready();
+    crate::sched::exit()
+}
+
+/// Called by the scheduler's sleep and exit hooks once the switch is decided (`sched::on_sleep`,
+/// `sched::on_exit`): the processor's kernel-stack record has moved, and the trap entry has not
+/// yet saved the outgoing frame `here`. If the switch is away from the held thread's stack and the
+/// boot flow is spinning for it (`GO`), this processor waits here, with interrupts off, until the
+/// boot flow has asked about that stack. Otherwise it costs a relaxed load.
+pub(crate) fn hold_in_window(here: u64, next: u64) {
+    if WINDOW_STAGE.load(Ordering::Relaxed) != GO || next == here {
+        return;
+    }
+    let own = WINDOW_SLOT.get().copied();
+    if own.is_none() || stack::slot_holding(here) != own {
+        return;
+    }
+    if WINDOW_STAGE
+        .compare_exchange(GO, HELD, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let start = rdtsc();
+    let answered = spin_until(
+        || WINDOW_STAGE.load(Ordering::Acquire) == ANSWERED,
+        WINDOW_TSC_HZ.load(Ordering::Relaxed),
+    );
+    if !answered {
+        HOLD_GAVE_UP.store(true, Ordering::Relaxed);
+    }
+    let round = HOLDS.fetch_add(1, Ordering::Relaxed) as usize;
+    if let Some(ticks) = HELD_TICKS.get(round) {
+        ticks.store(rdtsc().wrapping_sub(start), Ordering::Relaxed);
+    }
+}
+
+/// What the boot flow learnt in one window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    /// The stack was in use, as a drop would decide, or not.
+    InUse(bool),
+    /// The thread never said it was about to switch.
+    NotReady,
+    /// Its processor never reached the window.
+    NotHeld,
+}
+
+impl core::fmt::Display for Asked {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InUse(in_use) => write!(f, "{in_use}"),
+            Self::NotReady => f.write_str("the thread never said it was about to switch"),
+            Self::NotHeld => f.write_str("its processor never reached the window"),
+        }
+    }
+}
+
+/// One window, from the boot flow: waits for the held thread to be ready, gives the word, waits
+/// for its processor to be held, and asks the framework about the thread's stack. From the word
+/// to the answer nothing here yields, reaps, reclaims or sends an interrupt, so nothing waits for
+/// the held processor, which does not answer interrupts.
+fn ask_in_window(tsc_hz: u64) -> Asked {
+    crate::sched::yield_until(
+        || WINDOW_STAGE.load(Ordering::Acquire) == READY,
+        tsc_hz,
+        WINDOW_SECONDS,
+    );
+    if WINDOW_STAGE.load(Ordering::Acquire) != READY {
+        return Asked::NotReady;
+    }
+    WINDOW_STAGE.store(GO, Ordering::Release);
+    let held = spin_until(|| WINDOW_STAGE.load(Ordering::Acquire) == HELD, tsc_hz)
+        || WINDOW_STAGE
+            .compare_exchange(GO, GAVE_UP, Ordering::AcqRel, Ordering::Acquire)
+            .is_err_and(|stage| stage == HELD);
+    if !held {
+        return Asked::NotHeld;
+    }
+    let in_use = WINDOW_SLOT
+        .get()
+        .is_some_and(|slot| stack::slot_in_use(*slot));
+    WINDOW_STAGE.store(ANSWERED, Ordering::Release);
+    Asked::InUse(in_use)
+}
+
+/// Microseconds for `ticks` of the TSC.
+fn micros(ticks: u64, tsc_hz: u64) -> u64 {
+    nanos_each(ticks, 1, tsc_hz) / 1000
+}
+
+/// The switch windows (TASKS item 70), on the first processor after the boot processor.
+fn switch_windows(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let Some(cpu) = cpus.iter().copied().find(|&c| c != bsp) else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: kernel stacks: a thread's own stack in its switch windows: not asked, with one processor, where no other can drop it while its own is in a window"
+        );
+        return true;
+    };
+    WINDOW_TSC_HZ.store(tsc_hz, Ordering::Relaxed);
+    if crate::sched::spawn(cpu, windowed, 0).is_err() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: kernel stacks: cannot spawn on {}: kernel stacks failed",
+            cpu.named()
+        );
+        return false;
+    }
+    let switched_out = ask_in_window(tsc_hz);
+    // Room in the cache of kept stacks, before the thread ends: its drop then keeps its stack
+    // there (`Idle`), which no reclaim touches until the proof trims, so a `Lost` state after the
+    // reap can only be the drop's own leak (the coordinating session's ruling (d)).
+    let room = stack::counts().idle < stack::IDLE;
+    let ended = ask_in_window(tsc_hz);
+    let slot = WINDOW_SLOT.get().copied();
+    let reaped = |slot: StackSlot| stack::slot_state(slot) != Some(State::Live);
+    crate::sched::yield_until(|| slot.is_some_and(reaped), tsc_hz, WINDOW_SECONDS);
+    let state = slot.and_then(stack::slot_state);
+    let (given_back, how) = match state {
+        Some(State::Idle) => (true, "kept for reuse"),
+        Some(State::Retired | State::Reclaiming | State::Free) => (true, "retired"),
+        Some(State::Lost) if room => (false, "leaked"),
+        Some(State::Lost) => (true, "lost with no room kept, so not judged"),
+        Some(State::Live) => (false, "not reaped"),
+        None => (false, "no slot"),
+    };
+    let held = |round: usize| {
+        HELD_TICKS
+            .get(round)
+            .map_or(0, |t| micros(t.load(Ordering::Relaxed), tsc_hz))
+    };
+    let gave_up = HOLD_GAVE_UP.load(Ordering::Relaxed);
+    let ok =
+        switched_out == Asked::InUse(true) && ended == Asked::InUse(true) && given_back && !gave_up;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: kernel stacks: a thread's own stack, asked about from {} while {} switched it out (that processor's kernel-stack record moved, the thread's frame not yet saved): in use: {switched_out} (held {} us); while it ended: in use: {ended} (held {} us); given back by its processor's reap, not leaked: {given_back} ({how}){}{}",
+        bsp.named(),
+        cpu.named(),
+        held(0),
+        held(1),
+        if gave_up {
+            "; a held processor gave up waiting"
+        } else {
+            ""
+        },
+        if ok { "" } else { ": kernel stacks failed" }
     );
     ok
 }
