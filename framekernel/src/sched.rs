@@ -228,6 +228,13 @@ fn exits_pending() -> Pending {
 /// and by [`finish`] for a kernel thread. Its exit lowers the count once the thread has left the
 /// processor as a zombie, so a [`settle`] that has seen the end waits until then. The boot or idle
 /// flow, which never exits, is not counted.
+///
+/// **What "seen" requires** (the review of TASKS item 79, T79-3): the settle is ordered after the
+/// count only through the end itself. So `publish` must make the end visible with a Release write
+/// (a Release store, an AcqRel read-modify-write, or a write under a lock it then releases), and a
+/// thread that waits for the end must read it with Acquire (or under that lock), and settle after
+/// that read, in the same thread. A Relaxed end or a Relaxed wait leaves the settle unordered with
+/// the count, which the hardware happens to order on x86-64 and the compiler need not.
 pub(crate) fn end_with<R>(publish: impl FnOnce() -> R) -> R {
     let id = this_cpu();
     let (Some(queue), Some(threads), Some(exits)) =
@@ -595,7 +602,9 @@ pub(crate) fn sleep(ticks: u64) {
 }
 
 /// Ends the running kernel thread: counts it as ending ([`end_with`]), runs `signal`, which is
-/// whatever tells other threads it has ended (a done-flag or a count), and exits. Every kernel
+/// whatever tells other threads it has ended (a done-flag or a count), and exits. `signal` writes
+/// with Release (or as an AcqRel read-modify-write), and whoever waits for it reads with Acquire,
+/// as [`end_with`] requires. Every kernel
 /// thread ends here, so that a [`settle`] made by a thread that has seen `signal` waits until
 /// this one has left its processor and been reaped (TASKS item 79). There is no other way for a
 /// kernel thread to end: a done-flag raised before an exit that does not count it would let a
