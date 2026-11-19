@@ -686,7 +686,6 @@ impl<H: Host> Interpreter<H> {
         self.new_buffer(data)
     }
 
-    /// One transfer of a field's own bytes (GeneralPurposeIO, PCC).
     /// An EmbeddedControl field wider than 8 bits: one host transfer of the bytes it spans, up
     /// to 255, all inside the region (G5, TASKS 64's ledger §3; step B5, B5's contract Q6). A
     /// write that does not fill whole bytes merges by the update rule: Preserve reads the bytes
@@ -799,6 +798,7 @@ impl<H: Host> Interpreter<H> {
         got
     }
 
+    /// One transfer of a field's own bytes (GeneralPurposeIO, PCC).
     fn pins(&mut self, f: &FieldUnit, r: &Region, write: Option<&[u8]>) -> Result<Val> {
         if f.bit_offset / 8 >= r.length {
             return err(ErrorKind::Range);
