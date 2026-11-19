@@ -14,8 +14,8 @@
 //!
 //! - **`ending`**: threads whose end may have been seen and that have not yet left the
 //!   processor. The ending thread raises it before anything about its end is visible
-//!   ([`Exits::end`]), and the processor lowers it in the thread's exit, once the zombie is
-//!   queued ([`Exits::queued`]).
+//!   ([`Exits::end`], which hands back a [`Mark`]), and the processor lowers it in the thread's
+//!   exit, once the zombie is queued, by consuming that mark ([`Exits::queued`]).
 //! - **`zombies`**: zombies queued and not yet reaped. Raised in the exit before `ending` is
 //!   lowered, and lowered by the reaper only after everything the zombie held has been given back
 //!   ([`Exits::reap`]), the process's `TERMINATED` among it when it was the last thread.
@@ -31,8 +31,12 @@
 //! after its [`Exits::end`] marked it.
 //!
 //! - The mark happens before the settler's load of T's processor's `ending`, so that load reads
-//!   the mark or a later value. Each thread's mark comes before its own lowering in the count's
-//!   modification order, so a value of 0 means T's lowering is at or before the value read.
+//!   the mark or a later value. Every lowering of a count consumes a [`Mark`] raised earlier on
+//!   that count by the same thread: only [`Exits::end`] makes a mark, it raises the count it names
+//!   before handing the mark back, and the mark is consumed by value. So each lowering comes
+//!   after its own raising in the count's modification order, and a value of 0 means T's lowering
+//!   is at or before the value read: no other thread's lowering can stand for T's. The type
+//!   holds this premise, not the scheduler's bookkeeping (the review of TASKS item 79, T79-1).
 //! - Every write after T's lowering is a read-modify-write, so all of them are in its release
 //!   sequence. Reading any of them synchronizes with T's lowering, and so with T's raising of
 //!   `zombies`, made just before it.
@@ -48,17 +52,17 @@
 //! The Loom models (`models.rs`, "exits") check this in the memory model Rust's atomics follow,
 //! with negative controls that break each step: a mark made after the end is published, a queue
 //! that lowers `ending` before it raises `zombies`, a settle that reads `zombies` first, a reap
-//! that lowers `zombies` before it gives back, and a settle whose `ending` loads are Relaxed.
+//! that lowers `zombies` before it gives back, a settle whose `ending` loads are Relaxed, and a
+//! queue that lowers `ending` for a thread that brought no mark.
 //!
 //! # Who calls what
 //!
 //! - [`Exits::end`]: the ending thread, on its own processor, at most once per thread. The
-//!   scheduler keeps a mark per thread, so that its exit lowers `ending` only for a thread that
-//!   raised it.
-//! - [`Exits::queued`] and [`Exits::not_queued`]: the thread's processor, in its exit, with
-//!   interrupts off. `not_queued` is the exit that could keep no zombie and leaked what the thread
-//!   held: that thread has left the processor, so a settle should not wait on it. What it leaked
-//!   is the count compare's to find.
+//!   scheduler keeps the [`Mark`] in the thread's slot until its exit.
+//! - [`Exits::queued`] and [`Mark::left`]: the thread's processor, in its exit, with interrupts
+//!   off. [`Mark::left`] is the exit that could keep no zombie and leaked what the thread held:
+//!   the thread is leaving the processor and nothing more it holds will be given back, so a settle
+//!   should not wait on it. What it leaked is the count compare's to find.
 //! - [`Exits::reap`]: the processor's reaper, in thread context, one zombie at a time.
 //! - [`pending`]: any processor.
 #![forbid(unsafe_code)]
@@ -71,6 +75,34 @@ use crate::prim;
 pub struct Exits {
     ending: prim::AtomicU64,
     zombies: prim::AtomicU64,
+}
+
+/// A thread's count as ending, raised by [`Exits::end`] on the counts it names: the only way to
+/// lower that count, once, by [`Exits::queued`] or [`Mark::left`]. It is neither `Clone` nor
+/// `Copy`, so no lowering can be made twice or without its own raising. A mark dropped without
+/// either keeps the count raised, which every later settle names.
+#[must_use = "a mark dropped keeps its thread counted as ending; consume it in the thread's exit"]
+pub struct Mark<'a> {
+    exits: &'a Exits,
+}
+
+impl core::fmt::Debug for Mark<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Mark")
+    }
+}
+
+impl Mark<'_> {
+    /// The thread's processor, in an exit that could queue no zombie: the thread is leaving the
+    /// processor and nothing more it holds will be given back, so its count as ending is lowered.
+    pub fn left(self) {
+        self.lower();
+    }
+
+    /// Lowers the count this mark raised.
+    fn lower(self) {
+        self.exits.ending.fetch_sub(1, AcqRel);
+    }
 }
 
 /// What a settle found still held: threads whose end may have been seen that have not yet left
@@ -125,26 +157,20 @@ impl Exits {
     }
 
     /// The ending thread, before anything about its end is visible: counts it as ending, then
-    /// runs `publish`, which makes the end visible, and returns what `publish` returns.
-    pub fn end<R>(&self, publish: impl FnOnce() -> R) -> R {
+    /// runs `publish`, which makes the end visible. Returns the thread's [`Mark`], to be consumed
+    /// in its exit, and what `publish` returned.
+    pub fn end<R>(&self, publish: impl FnOnce() -> R) -> (Mark<'_>, R) {
         self.ending.fetch_add(1, AcqRel);
-        publish()
+        (Mark { exits: self }, publish())
     }
 
-    /// The thread's processor, in its exit, once its zombie is queued: counts the zombie, then,
-    /// if the thread raised `ending` (`marked`), lowers it.
-    pub fn queued(&self, marked: bool) {
+    /// The thread's processor, in its exit, once its zombie is queued: counts the zombie, then
+    /// lowers the thread's count as ending by consuming its `mark`. A thread that brought none,
+    /// never counted as ending, lowers nothing.
+    pub fn queued(&self, mark: Option<Mark<'_>>) {
         self.zombies.fetch_add(1, AcqRel);
-        if marked {
-            self.ending.fetch_sub(1, AcqRel);
-        }
-    }
-
-    /// The thread's processor, in an exit that could queue no zombie: the thread has left the
-    /// processor all the same, so if it raised `ending` (`marked`), it is lowered.
-    pub fn not_queued(&self, marked: bool) {
-        if marked {
-            self.ending.fetch_sub(1, AcqRel);
+        if let Some(mark) = mark {
+            mark.lower();
         }
     }
 
@@ -193,7 +219,7 @@ mod tests {
     fn an_ended_thread_is_pending_until_its_zombie_is_reaped() {
         let exits = Exits::new();
         assert!(one(&exits).none());
-        exits.end(|| ());
+        let (mark, ()) = exits.end(|| ());
         assert_eq!(
             one(&exits),
             Pending {
@@ -201,7 +227,7 @@ mod tests {
                 zombies: 0
             }
         );
-        exits.queued(true);
+        exits.queued(Some(mark));
         assert_eq!(
             one(&exits),
             Pending {
@@ -217,15 +243,16 @@ mod tests {
     #[test]
     fn the_end_is_counted_before_it_is_published() {
         let exits = Exits::new();
-        let seen = exits.end(|| one(&exits));
+        let (mark, seen) = exits.end(|| one(&exits));
         assert_eq!(seen.ending, 1);
+        mark.left();
     }
 
     #[test]
     fn the_zombie_is_counted_until_after_its_release() {
         let exits = Exits::new();
-        exits.end(|| ());
-        exits.queued(true);
+        let (mark, ()) = exits.end(|| ());
+        exits.queued(Some(mark));
         let during = exits.reap(|| one(&exits));
         assert_eq!(
             during,
@@ -238,12 +265,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unmarked_exit_lowers_no_ending() {
-        // A thread that never raised `ending` (one that exited without `end`) leaves it alone, so
-        // another thread's mark is not lost.
+    fn an_exit_with_no_mark_lowers_no_ending() {
+        // A thread that never counted itself as ending leaves the count alone, so another
+        // thread's mark is not lost (the review of TASKS item 79, T79-1).
         let exits = Exits::new();
-        exits.end(|| ());
-        exits.queued(false);
+        let (mark, ()) = exits.end(|| ());
+        exits.queued(None);
         assert_eq!(
             one(&exits),
             Pending {
@@ -251,24 +278,40 @@ mod tests {
                 zombies: 1
             }
         );
-        exits.not_queued(false);
-        assert_eq!(one(&exits).ending, 1);
+        mark.left();
+        assert_eq!(one(&exits).ending, 0);
     }
 
     #[test]
     fn an_exit_that_queued_nothing_still_lowers_its_mark() {
         let exits = Exits::new();
-        exits.end(|| ());
-        exits.not_queued(true);
+        let (mark, ()) = exits.end(|| ());
+        mark.left();
         assert!(one(&exits).none());
+    }
+
+    #[test]
+    fn a_mark_lowers_the_counts_that_raised_it() {
+        // Consumed beside another processor's counts, it still lowers its own.
+        let cpus = [Exits::new(), Exits::new()];
+        let (mark, ()) = cpus[0].end(|| ());
+        cpus[1].queued(Some(mark));
+        assert_eq!(
+            pending(|| cpus.iter()),
+            Pending {
+                ending: 0,
+                zombies: 1
+            }
+        );
+        assert_eq!(one(&cpus[0]).ending, 0);
     }
 
     #[test]
     fn every_processor_is_summed() {
         let cpus = [Exits::new(), Exits::new(), Exits::new()];
-        cpus[0].end(|| ());
-        cpus[2].end(|| ());
-        cpus[2].queued(true);
+        let (kept, ()) = cpus[0].end(|| ());
+        let (mark, ()) = cpus[2].end(|| ());
+        cpus[2].queued(Some(mark));
         assert_eq!(
             pending(|| cpus.iter()),
             Pending {
@@ -276,6 +319,7 @@ mod tests {
                 zombies: 1
             }
         );
+        kept.left();
     }
 
     #[test]
@@ -290,8 +334,8 @@ mod tests {
                 let exits = std::sync::Arc::clone(&exits);
                 std::thread::spawn(move || {
                     for _ in 0..ROUNDS {
-                        exits.end(|| ());
-                        exits.queued(true);
+                        let (mark, ()) = exits.end(|| ());
+                        exits.queued(Some(mark));
                         exits.reap(|| ());
                     }
                 })

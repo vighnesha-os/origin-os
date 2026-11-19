@@ -33,7 +33,7 @@ use origin_frame::objref::ObjectRef;
 use origin_frame::percpu::PerCpu;
 use origin_frame::stack::{FpuArea, GuardedStack, ThreadStart};
 use origin_frame::sync::SpinLock;
-use origin_frame::sync::exits::{Exits, Pending};
+use origin_frame::sync::exits::{Exits, Mark, Pending};
 use origin_frame::trap::Switch;
 
 /// Each kernel thread's stack.
@@ -175,9 +175,10 @@ pub(crate) struct Threads {
     fpu: [Option<FpuArea>; crate::runqueue::CAPACITY],
     /// What each slot's thread runs in (`None`: a kernel thread).
     user: [Option<ObjectRef<UserContext>>; crate::runqueue::CAPACITY],
-    /// Whether each slot's thread has counted itself as ending ([`end_with`]), so that its exit
-    /// lowers that count once, and only for a thread that raised it (TASKS item 79).
-    ending: [bool; crate::runqueue::CAPACITY],
+    /// Each slot's thread's count as ending, once it has counted itself ([`end_with`]): its exit
+    /// consumes the mark, so it lowers that count once, and only for a thread that raised it
+    /// (TASKS item 79; the review's T79-1).
+    ending: [Option<Mark<'static>>; crate::runqueue::CAPACITY],
 }
 
 impl Threads {
@@ -188,7 +189,7 @@ impl Threads {
             zombies: [const { None }; crate::runqueue::CAPACITY],
             fpu: [const { None }; crate::runqueue::CAPACITY],
             user: [const { None }; crate::runqueue::CAPACITY],
-            ending: [false; crate::runqueue::CAPACITY],
+            ending: [const { None }; crate::runqueue::CAPACITY],
         }
     }
 }
@@ -229,24 +230,30 @@ fn exits_pending() -> Pending {
 /// flow, which never exits, is not counted.
 pub(crate) fn end_with<R>(publish: impl FnOnce() -> R) -> R {
     let id = this_cpu();
-    let first = match (QUEUES.get(id), THREADS.get(id)) {
-        (Some(queue), Some(threads)) => without_interrupts(|| {
-            let slot = queue.lock().current();
-            let mut t = threads.lock();
-            match t.ending.get_mut(slot) {
-                Some(marked) if slot != 0 && !*marked => {
-                    *marked = true;
-                    true
-                }
-                _ => false,
-            }
-        }),
-        _ => false,
+    let (Some(queue), Some(threads), Some(exits)) =
+        (QUEUES.get(id), THREADS.get(id), EXITS.get(id))
+    else {
+        return publish();
     };
-    match EXITS.get(id) {
-        Some(exits) if first => exits.end(publish),
-        _ => publish(),
-    }
+    // The running thread's slot, if it has not counted itself already. No other thread can take
+    // the slot or its mark while this one runs, so the mark is stored after `publish`.
+    let slot = without_interrupts(|| {
+        let slot = queue.lock().current();
+        let counted = threads.lock().ending.get(slot).is_some_and(Option::is_some);
+        (slot != 0 && !counted).then_some(slot)
+    });
+    let Some(slot) = slot else {
+        return publish();
+    };
+    let (mark, published) = exits.end(publish);
+    without_interrupts(|| {
+        // Always there: the slot came from this queue. A mark not kept is not consumed, so its
+        // count stays raised, which every later settle names; it is never lowered early.
+        if let Some(entry) = threads.lock().ending.get_mut(slot) {
+            *entry = Some(mark);
+        }
+    });
+    published
 }
 
 /// Frees the stacks of threads that exited on **this** processor. Only this processor may
@@ -545,14 +552,16 @@ pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
             let fpu = t.fpu.get_mut(slot).and_then(Option::take);
             let user = t.user.get_mut(slot).and_then(Option::take);
             // Taken whatever happens below, so that the slot's next thread starts unmarked.
-            let marked = t.ending.get_mut(slot).is_some_and(core::mem::take);
+            let mark = t.ending.get_mut(slot).and_then(Option::take);
             match (t.zombies.iter_mut().find(|z| z.is_none()), stack) {
                 (Some(free), Some(stack)) => {
                     *free = Some(Zombie { stack, fpu, user });
                     // The zombie counts before the thread stops counting as ending, so that a
                     // `settle` never finds it in neither (TASKS item 79; `Exits::queued`).
+                    // Every processor has its counts. A mark not consumed keeps its count raised:
+                    // never lowered early.
                     if let Some(exits) = EXITS.get(id) {
-                        exits.queued(marked);
+                        exits.queued(mark);
                     }
                 }
                 // No record of it can be kept. Its references are leaked deliberately: this
@@ -562,8 +571,8 @@ pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
                 // the compare's to find (TASKS item 79, case (a)).
                 _ => {
                     core::mem::forget(user);
-                    if let Some(exits) = EXITS.get(id) {
-                        exits.not_queued(marked);
+                    if let Some(mark) = mark {
+                        mark.left();
                     }
                 }
             }

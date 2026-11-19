@@ -1407,8 +1407,8 @@ const CONTROLS: &[Control] = &[
         // pending while the thread still holds everything.
         name: "exits_counted_after_publishing",
         file: EXITS,
-        from: "        self.ending.fetch_add(1, AcqRel);\n        publish()\n",
-        to: "        let published = publish();\n        self.ending.fetch_add(1, AcqRel);\n        published\n",
+        from: "        self.ending.fetch_add(1, AcqRel);\n        (Mark { exits: self }, publish())\n",
+        to: "        let published = publish();\n        self.ending.fetch_add(1, AcqRel);\n        (Mark { exits: self }, published)\n",
         models: &[("exits_a_settle_sees_what_an_ended_thread_held", EXITS_EARLY)],
     },
     Control {
@@ -1417,12 +1417,12 @@ const CONTROLS: &[Control] = &[
         name: "exits_ending_lowered_before_the_zombie_counts",
         file: EXITS,
         from: "        self.zombies.fetch_add(1, AcqRel);
-        if marked {
-            self.ending.fetch_sub(1, AcqRel);
+        if let Some(mark) = mark {
+            mark.lower();
         }
 ",
-        to: "        if marked {
-            self.ending.fetch_sub(1, AcqRel);
+        to: "        if let Some(mark) = mark {
+            mark.lower();
         }
         self.zombies.fetch_add(1, AcqRel);
 ",
@@ -1475,6 +1475,27 @@ const CONTROLS: &[Control] = &[
         from: "        .map(|exits| exits.ending.load(Acquire))\n",
         to: "        .map(|exits| exits.ending.load(core::sync::atomic::Ordering::Relaxed))\n",
         models: &[("exits_a_settle_sees_what_an_ended_thread_held", EXITS_EARLY)],
+    },
+    Control {
+        // X6 (the review of TASKS item 79, T79-1): an exit that brought no mark lowers `ending`
+        // all the same, so another thread's lowering can stand for the ending thread's.
+        name: "exits_lowered_without_a_mark",
+        file: EXITS,
+        from: "        if let Some(mark) = mark {
+            mark.lower();
+        }
+",
+        to: "        match mark {
+            Some(mark) => mark.lower(),
+            None => {
+                self.ending.fetch_sub(1, AcqRel);
+            }
+        }
+",
+        models: &[(
+            "exits_an_exit_without_a_mark_cannot_stand_for_one",
+            EXITS_EARLY,
+        )],
     },
 ];
 

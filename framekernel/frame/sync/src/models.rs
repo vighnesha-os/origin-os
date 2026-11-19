@@ -151,8 +151,9 @@
 //! - The exit counts: a settle that has seen a thread's end and finds nothing pending (no thread
 //!   ending, no zombie, summed as `exits::pending` sums them) is ordered after everything that
 //!   thread gave back at its reap, whether it ended alone, beside another thread on its processor
-//!   whose marks and lowerings interleave with its own in one count, or beside one on another
-//!   processor.
+//!   whose marks and lowerings interleave with its own in one count, beside one on another
+//!   processor, or beside one on its processor whose exit brought no mark (an exit's lowering
+//!   consumes its own thread's mark, so it cannot stand for another's).
 //!
 //! # What is not proved
 //!
@@ -3358,8 +3359,8 @@ type Kept = UnsafeCell<u64>;
 /// `held`. In the kernel the reap runs later on the same processor, after the exit; a Loom thread
 /// running both in order stands for that.
 fn exits_one_end(exits: &Exits, seen: &AtomicBool, held: &Kept) {
-    exits.end(|| seen.store(true, Release));
-    exits.queued(true);
+    let (mark, ()) = exits.end(|| seen.store(true, Release));
+    exits.queued(Some(mark));
     // SAFETY: the pointer is the cell's own; Loom's cell checks this write against the settler's
     // read, and panics if they are not ordered, which is the point of the model.
     exits.reap(|| held.with_mut(|p| unsafe { *p = 0 }));
@@ -3465,6 +3466,39 @@ fn exits_a_settle_over_two_processors_sees_both() {
             for ender in enders {
                 ender.join().unwrap();
             }
+        },
+    );
+}
+
+/// E4: one thread ends as in E1 while another, on the same processor, exits without having
+/// counted itself as ending (no mark): its exit cannot stand for the first thread's, so nothing
+/// pending still means the first gave back what it held (the review of TASKS item 79, T79-1,
+/// whose own model this is).
+#[test]
+fn exits_an_exit_without_a_mark_cannot_stand_for_one() {
+    check(
+        "exits_an_exit_without_a_mark_cannot_stand_for_one",
+        EXITS_QUICK,
+        EXHAUSTIVE,
+        || {
+            let exits = Arc::new(Exits::new());
+            let seen = Arc::new(AtomicBool::new(false));
+            let held = Arc::new(Kept::new(1));
+            let ender = {
+                let (exits, seen, held) =
+                    (Arc::clone(&exits), Arc::clone(&seen), Arc::clone(&held));
+                thread::spawn(move || exits_one_end(&exits, &seen, &held))
+            };
+            let unmarked = {
+                let exits = Arc::clone(&exits);
+                thread::spawn(move || {
+                    exits.queued(None);
+                    exits.reap(|| ());
+                })
+            };
+            exits_settle_then_count(&seen, &exits, &held);
+            ender.join().unwrap();
+            unmarked.join().unwrap();
         },
     );
 }
