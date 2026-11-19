@@ -29,15 +29,25 @@
 //! mark-and-sweep collector at safe points between steps; every allocation goes through `mem.rs`,
 //! which charges it to the memory limit before it is made.
 //!
-//! **What is built** (steps B1, B2 and B4 of TASKS item 63): the whole parser, the namespace,
+//! **What is built** (steps B1 to B5 of TASKS item 63): the whole parser, the namespace,
 //! every operator, field units over every region space through the host, mutexes and the Global
 //! Lock, events, the device initialization walk ([`Interpreter::initialize`]) and `_REG`
 //! ([`Interpreter::connect_space`]). `Load` and `LoadTable` load a table while an evaluation
 //! runs, on the engine's frame stack, after `origin-acpi-tables` has checked it (`load.rs`).
 //! `Unload` is refused (G8).
 //!
-//! Sources: ACPI 6.6 and Microsoft's `_OSI` documentation only, paraphrased
-//! (`docs/research/2026-11-14-aml-interpreter.md`). No other interpreter's source was read.
+//! **Tolerances** (step B5; `tolerate.rs`): where TASKS 64's ledger says deployed firmware or
+//! other implementations rely on ACPICA's default, the library follows it, never ACPICA's lenient
+//! mode, and tells its host of each tolerance through [`Host::report`], bounded per evaluation:
+//! a load is best-effort, a failing statement of load-time code abandoned; a mutex outlives the
+//! method that took it until the outermost evaluation ends; load-time package names are bound
+//! once ([`Interpreter::bind_deferred`]).
+//!
+//! Sources: ACPI 6.6 and Microsoft's `_OSI` documentation, paraphrased
+//! (`docs/research/2026-11-14-aml-interpreter.md`), and, for step B5, TASKS item 64's ledger
+//! (`docs/research/2026-11-14-aml-gaps-acpica.md`), which another session wrote from ACPICA's
+//! source under CLAUDE.md §3. No interpreter's source was read by the session that wrote this
+//! code.
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -76,6 +86,7 @@ mod probe;
 mod region;
 mod store;
 mod sync;
+mod tolerate;
 mod value;
 
 #[cfg(test)]
@@ -84,12 +95,14 @@ mod tests;
 pub use config::{Config, DefinitionBlock, IntegerWidth, Limits};
 pub use error::{At, Error, ErrorKind, Limit, Result};
 pub use host::{
-    BridgeBus, BufferAccess, Host, HostError, PciAddress, RegionAccess, Space, TableKey, Trace,
+    BridgeBus, BufferAccess, Host, HostError, PciAddress, RegionAccess, Report, Space, TableKey,
+    Trace,
 };
 pub use init::InitOutcome;
 pub use osi::{OS_NAME, OSI_STRINGS, REV};
 #[doc(hidden)]
 pub use probe::no_panic_probe;
+pub use tolerate::REPORTS;
 pub use value::{Node, Plain, Value};
 
 use alloc::vec::Vec;
@@ -113,6 +126,8 @@ pub struct TableInfo {
     pub oem_table_id: [u8; 8],
     /// Its load failed and was rolled back.
     pub failed: bool,
+    /// Statements its load abandoned and reported, the load going on (step B5; saturating).
+    pub abandoned: u32,
 }
 
 /// A loaded definition block.
@@ -124,6 +139,8 @@ struct Table {
     oem_table_id: [u8; 8],
     /// Its load failed and was rolled back: its methods are not run.
     failed: bool,
+    /// Statements its load abandoned (step B5; saturating).
+    abandoned: u32,
 }
 
 /// The counts of one top-level evaluation, against the limits.
@@ -137,6 +154,19 @@ struct RunCounts {
     charged_seen: u64,
     /// Units counted since the clock was last read.
     since_clock: u64,
+    /// Entries the binding passes of this evaluation took: what the review of B5, B5-R2, asks a
+    /// run-time load's pass to bound by its own table's names.
+    #[cfg(test)]
+    pass_entries: u64,
+    /// Reports made this evaluation, given or not ([`REPORTS`]).
+    reports: u64,
+    /// Of them, [`host::Report::Pieces`] past the bound (the review of B5's answers, B5-R14).
+    pieces_over: u64,
+    /// Mutexes released this evaluation other than by `Release`, reported or not: the soak's
+    /// audit compares them with the reports (B5's contract §4.9, audit 3; the review of B5,
+    /// B5-R4).
+    #[cfg(test)]
+    ended_holds: u64,
 }
 
 /// An AML interpreter: one namespace, its tables and its host.
@@ -158,6 +188,12 @@ pub struct Interpreter<H: Host> {
     serial: u64,
     /// The mutexes the running evaluation holds, in the order taken (`sync.rs`).
     held: Vec<sync::Held>,
+    /// The names load-time code put in packages and not yet bound, in the order made (G1, step
+    /// B5; the review of B5, B5-R2, and of its answers, B5-R10 and B5-R11; `tolerate.rs`). Weak:
+    /// no root of the collector, which takes off it what it frees, and a binding pass marks what
+    /// can still be read before it binds, so what it sees never depends on whether the collector
+    /// ran.
+    deferred: Vec<object::ObjRef>,
     /// How deep the runs of frames for a PCI_Config region outside the frames go (`pci.rs`,
     /// `with_address`): the collector runs only at 0.
     nested: u32,
@@ -252,6 +288,7 @@ impl<H: Host> Interpreter<H> {
             oem_id: t.oem_id,
             oem_table_id: t.oem_table_id,
             failed: t.failed,
+            abandoned: t.abandoned,
         })
     }
 }

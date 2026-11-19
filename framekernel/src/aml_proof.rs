@@ -62,8 +62,8 @@ use origin_acpi_tables::fadt::Fadt;
 use origin_acpi_tables::header::{self, HEADER_LEN, Header};
 use origin_aml::{
     BridgeBus, BufferAccess, Config, DefinitionBlock, Error, ErrorKind, Host, HostError,
-    InitOutcome, IntegerWidth, Interpreter, Limit, Limits, Node, Plain, RegionAccess, Space,
-    TableKey, Trace, Value,
+    InitOutcome, IntegerWidth, Interpreter, Limit, Limits, Node, Plain, RegionAccess, Report,
+    Space, TableKey, Trace, Value,
 };
 
 use crate::acpi_census::Firmware;
@@ -177,6 +177,9 @@ impl Host for BootHost {
 
     fn debug(&mut self, _: &[u8]) {}
 
+    /// Nothing to do: the [`Recorder`] around it counts every report for the verdict.
+    fn report(&mut self, _: &Report<'_>) {}
+
     /// Refused: `DataTableRegion` and `LoadTable` get nothing at boot (the review of B2's
     /// Addendum 2: the host decides it knowingly).
     fn table(&mut self, _: &TableKey, _: &mut dyn FnMut(u64, &[u8])) -> Result<bool, HostError> {
@@ -207,6 +210,13 @@ pub struct Seen {
     pub waits: u32,
     /// `Notify`, `Fatal`, `Debug` and `BreakPoint`.
     pub reports: u32,
+    /// Tolerances the interpreter reported (TASKS item 63, step B5).
+    pub tolerated: u32,
+    /// The first of them, for the proof's line.
+    pub first_tolerance: Option<Tolerance>,
+    /// Stores the interpreter reported making in pieces ([`Report::Pieces`]): not tolerances,
+    /// counted apart.
+    pub pieces: u32,
     /// The lowest stack address a host call was made at.
     pub lowest: Option<usize>,
 }
@@ -254,6 +264,51 @@ fn stack_mark() -> usize {
     core::ptr::from_ref(core::hint::black_box(&here)).addr()
 }
 
+/// A tolerance the interpreter reported, as the proof prints it (TASKS item 63, step B5): what,
+/// where, and the error of an abandoned statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tolerance {
+    /// The report's kind.
+    pub what: &'static str,
+    /// Where, if the report says.
+    pub at: Option<origin_aml::At>,
+    /// An abandoned statement's error.
+    pub error: Option<ErrorKind>,
+}
+
+impl Tolerance {
+    fn of(r: &Report<'_>) -> Self {
+        let (what, at, error) = match *r {
+            Report::Abandoned {
+                error, statement, ..
+            } => ("a statement abandoned", Some(statement), Some(error.kind)),
+            Report::AlreadyLoaded { .. } => ("a table already loaded", None, None),
+            Report::UnboundElement { at } => ("a package name bound to nothing", Some(at), None),
+            Report::ExtraElements { at, .. } => ("a package with extra elements", Some(at), None),
+            Report::Unterminated { at } => ("an unterminated string", Some(at), None),
+            Report::HighBytes { at } => ("a string byte above 0x7F", Some(at), None),
+            Report::LongStall { at, .. } => ("a Stall over 100 us", Some(at), None),
+            Report::Released { .. } => ("a mutex held to the end", None, None),
+            Report::Pieces { .. } => ("a store in pieces", None, None),
+            Report::Suppressed { .. } => ("tolerances past the bound", None, None),
+        };
+        Self { what, at, error }
+    }
+}
+
+impl fmt::Display for Tolerance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.what)?;
+        if let Some(at) = self.at {
+            write!(f, " at table {} offset {:#x}", at.table, at.offset)?;
+        }
+        if let Some(e) = self.error {
+            write!(f, " ({e:?})")?;
+        }
+        Ok(())
+    }
+}
+
 /// Counts every answer of the host it wraps, for the verdict (see the module's documentation).
 #[derive(Debug)]
 pub struct Recorder<H> {
@@ -277,6 +332,9 @@ impl<H: Host> Recorder<H> {
                 lock_other: 0,
                 waits: 0,
                 reports: 0,
+                tolerated: 0,
+                first_tolerance: None,
+                pieces: 0,
                 lowest: None,
             },
         }
@@ -392,6 +450,26 @@ impl<H: Host> Host for Recorder<H> {
         self.seen.note_stack();
         self.seen.reports = self.seen.reports.saturating_add(1);
         self.inner.breakpoint();
+    }
+
+    fn report(&mut self, report: &Report<'_>) {
+        self.seen.note_stack();
+        // Past the bound, the reports are counted by kind, so each fails the proof with its own
+        // reason (the review of B5's answers, B5-R14).
+        let (tolerances, pieces) = match *report {
+            Report::Pieces { .. } => (0, 1),
+            Report::Suppressed { tolerances, pieces } => (tolerances, pieces),
+            _ => (1, 0),
+        };
+        let n = |k: u64| u32::try_from(k).unwrap_or(u32::MAX);
+        self.seen.pieces = self.seen.pieces.saturating_add(n(pieces));
+        if tolerances != 0 {
+            self.seen.tolerated = self.seen.tolerated.saturating_add(n(tolerances));
+            if self.seen.first_tolerance.is_none() {
+                self.seen.first_tolerance = Some(Tolerance::of(report));
+            }
+        }
+        self.inner.report(report);
     }
 
     fn tracing(&self) -> bool {
@@ -571,6 +649,14 @@ fn cut_off(
 
 /// The reason a proof past its bound gives.
 const CUT_OFF: &str = "the proof was cut off by its bound";
+
+/// The reason a proof gives when the interpreter reported a tolerance on QEMU's own tables (TASKS
+/// item 63, step B5).
+const TOLERATED: &str = "a tolerance was reported on QEMU's own tables";
+
+/// The reason a proof gives when the interpreter stored data in pieces on QEMU's own tables, where
+/// ACPICA would cut it (TASKS item 63, step B5's point 1).
+const IN_PIECES: &str = "a store in pieces was reported on QEMU's own tables";
 
 /// The reason a proof gives when the DSDT's checked read is not the one whose IDs were judged
 /// (the review of B4, B4-9).
@@ -867,6 +953,13 @@ fn interpret<H: Host>(
             }
         }
     }
+    // Every table the proof loads is in: the names its load-time code put in packages are bound
+    // (TASKS item 63, step B5; `initialize` would bind them too, but the named results are read
+    // first).
+    if let Err(e) = i.bind_deferred() {
+        let _ = writeln!(out, "{LINE}binding package names failed {}", Failure(e));
+        found.fail("the names in QEMU's packages could not be bound");
+    }
     found.named = named_results(out, fw, &bound, &mut i, found);
     if !found.named {
         found.fail("a named result was not as QEMU's tables give it");
@@ -890,6 +983,24 @@ fn interpret<H: Host>(
     }
     if seen.tables != 0 {
         found.fail("the AML asked for a table");
+    }
+    // QEMU's own tables are known clean: a tolerance there is a regression to learn of (TASKS
+    // item 63, step B5; the coordinating session's ruling on B5's contract, Q9).
+    if seen.tolerated != 0 {
+        if let Some(t) = seen.first_tolerance {
+            let _ = writeln!(
+                out,
+                "{LINE}tolerated {} time(s); the first: {t}",
+                seen.tolerated
+            );
+        }
+        found.fail(TOLERATED);
+    }
+    // Nor do QEMU's tables store data longer than a field: one that did would be a place where
+    // Origin and ACPICA leave the hardware different, to learn of (step B5's point 1).
+    if seen.pieces != 0 {
+        let _ = writeln!(out, "{LINE}stored in pieces {} time(s)", seen.pieces);
+        found.fail(IN_PIECES);
     }
     if seen.lock_other != 0 || seen.lock_taken != seen.lock_given_back {
         found.fail("the Global Lock was not given back as often as it was granted");

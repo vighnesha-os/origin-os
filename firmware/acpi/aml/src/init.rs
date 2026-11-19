@@ -1,6 +1,7 @@
 //! Namespace initialization (ACPI 6.6 §6.3.7, §6.5.1 and Table 6.67) and `_REG` (§6.5.4).
 //!
-//! - [`Interpreter::initialize`] runs `\_SB._INI` if there is one, then walks the devices and
+//! - [`Interpreter::initialize`] binds the names load-time code put in packages (step B5), then
+//!   runs `\_SB._INI` if there is one, then walks the devices and
 //!   processors depth first in definition order: each one's `_STA` (none means present and
 //!   functioning), then its `_INI` if it is present, then its children if it is present or
 //!   functioning. A failing `_STA` or `_INI` is reported, and the walk goes on with the next
@@ -155,6 +156,9 @@ impl<H: Host> Interpreter<H> {
     /// [`ErrorKind::Limit`] (time or steps) if the walk as a whole reached the limits; it stops
     /// there, and what it reached before was reported.
     pub fn initialize(&mut self, report: &mut dyn FnMut(Node, InitOutcome)) -> Result<()> {
+        // Every boot table has loaded: the names load-time code put in packages are bound first,
+        // if the host has not bound them (G1, step B5). Only names not yet bound are.
+        self.bind_deferred()?;
         let mut w = self.start_walk();
         self.initialize_within(&mut w, report)
             .map_err(|e| self.walk_cut(e))

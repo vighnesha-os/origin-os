@@ -104,6 +104,8 @@ pub(crate) enum Frame {
         scope: NodeId,
         /// A `While`'s predicate offset.
         pred: u32,
+        /// Where the statement it is running began: what load-time code abandons (step B5).
+        stmt: Cursor,
     },
     Op(OpFrame),
     Call,
@@ -132,6 +134,8 @@ pub(crate) struct Ctx {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CallFrame {
     pub(crate) serial: u64,
+    /// The method running, for a report naming what took a mutex (the review of B5, B5-R8).
+    pub(crate) method: NodeId,
     pub(crate) ret: Cursor,
     pub(crate) locals: [Val; 8],
     pub(crate) args: [Val; 7],
@@ -172,7 +176,7 @@ enum Want {
 }
 
 /// The operands a method invocation takes: up to seven `TermArg`s.
-const CALL_KINDS: &[Kind] = &[Kind::TermArg; 7];
+pub(crate) const CALL_KINDS: &[Kind] = &[Kind::TermArg; 7];
 
 pub(crate) const ELSE: u8 = 0xA1;
 
@@ -220,6 +224,7 @@ impl<H: Host> Interpreter<H> {
             cur: Cursor { table: 0, pc: 0 },
             serial: 0,
             held: Vec::new(),
+            deferred: Vec::new(),
             nested: 0,
             pending: None,
             resolving: 0,
@@ -306,12 +311,24 @@ impl<H: Host> Interpreter<H> {
 
     // --- Loading -----------------------------------------------------------------------------
 
-    /// Loads a definition block: its term list is run at the root (ACPI 6.6 §5.4.2). On any
-    /// error every name it created is removed, and its methods are never run.
+    /// Loads a definition block: its term list is run at the root (ACPI 6.6 §5.4.2), on a
+    /// best-effort basis (step B5; TASKS 64's ledger §2): a statement that fails is abandoned
+    /// and reported, and the load goes on (`tolerate.rs`). On a failure the parser cannot step
+    /// past, a limit or `Fatal`, every name it created is removed, and its methods are never run.
+    /// A block identical to a table already loaded is refused, nothing of it created.
     ///
     /// # Errors
-    /// Whatever the term list does wrong, with where; a limit reached.
+    /// What fails the table whole, with where; a limit reached; [`ErrorKind::Duplicate`] for a
+    /// block identical to a table already loaded ([`crate::Report::AlreadyLoaded`] tells which).
     pub fn load(&mut self, block: DefinitionBlock<'_>) -> Result<u32> {
+        if let Some(table) =
+            self.identical_table(block.signature, block.oem_id, block.oem_table_id, block.aml)
+        {
+            self.begin_evaluation()?;
+            self.tell(&crate::Report::AlreadyLoaded { table });
+            self.end_evaluation();
+            return err(ErrorKind::Duplicate);
+        }
         let index =
             u32::try_from(self.tables.len()).map_err(|_| ErrorKind::Limit(Limit::Memory))?;
         let end = u32::try_from(block.aml.len()).map_err(|_| ErrorKind::Truncated)?;
@@ -326,6 +343,7 @@ impl<H: Host> Interpreter<H> {
                 oem_id: block.oem_id,
                 oem_table_id: block.oem_table_id,
                 failed: false,
+                abandoned: 0,
             },
             &mut self.budget,
         )?;
@@ -345,12 +363,11 @@ impl<H: Host> Interpreter<H> {
                 end,
                 scope: Namespace::root(),
                 pred: 0,
+                stmt: self.cur,
             })?;
             self.run_frames(marks.frames)?;
-            // Load-time code that ends holding a mutex fails the load (§19.6.89; G2).
-            if self.release_held(marks.held) {
-                return err(ErrorKind::MutexHeld);
-            }
+            // What load-time code still holds is released and reported (G2, step B5).
+            self.release_reported(marks.held);
             Ok(())
         });
         match outcome {
@@ -361,14 +378,11 @@ impl<H: Host> Interpreter<H> {
                 Ok(index)
             }
             Err(e) => {
-                // The table's identity stays; its bytes go (the review of B1, F7). Its methods
-                // already fail `TableFailed`, and a name kept in a package pointing into it now
-                // fails `Truncated`.
-                if let Some(t) = self.tables.get_mut(us(index)) {
-                    t.failed = true;
-                    let aml = core::mem::take(&mut t.aml);
-                    mem::release(aml, &mut self.budget);
-                }
+                // The table's identity stays; its bytes go (the review of B1, F7) once no name
+                // it put in a package is listed, so that `bind_deferred` can still read those
+                // (B5-R15). Its methods already fail `TableFailed`, and a name kept in a package
+                // pointing into it fails `Truncated` once the bytes are gone.
+                self.fail_table(index);
                 self.abort(marks, &e);
                 self.end_evaluation();
                 self.trace(&Trace::Loaded(Err(e)));
@@ -407,6 +421,7 @@ impl<H: Host> Interpreter<H> {
     /// Ends one: everything unreachable is collected, and the stacks, empty at the top level,
     /// give their memory back.
     pub(crate) fn end_evaluation(&mut self) {
+        self.tell_suppressed();
         self.result = Val::None;
         // At the top level nothing may stay held: the paths above release and report; this only
         // makes sure no hold, the Global Lock's least, outlives the evaluation whatever path
@@ -475,6 +490,11 @@ impl<H: Host> Interpreter<H> {
                 self.held
                     .capacity()
                     .saturating_mul(size_of::<crate::sync::Held>()),
+            )
+            .saturating_add(
+                self.deferred
+                    .capacity()
+                    .saturating_mul(size_of::<crate::object::ObjRef>()),
             );
         for o in &self.owners {
             n = n.saturating_add(o.created.capacity().saturating_mul(size_of::<NodeId>()));
@@ -632,9 +652,11 @@ impl<H: Host> Interpreter<H> {
         self.ctx.truncate(n);
     }
 
-    /// Runs until the frames are back to `base`. An error inside a table that `Load` or
-    /// `LoadTable` is loading, other than a limit, fails that load alone: it is rolled back and its
-    /// operator gives Zero, and the evaluation goes on (`load.rs`; B4's contract, Q3).
+    /// Runs until the frames are back to `base`. A statement's failure in load-time code
+    /// abandons that statement alone, and the load goes on (`tolerate.rs`; step B5). Any other
+    /// error inside a table that `Load` or `LoadTable` is loading, other than a limit or `Fatal`,
+    /// fails that load alone: it is rolled back and its operator gives Zero, and the evaluation
+    /// goes on (`load.rs`; B4's contract, Q3).
     pub(crate) fn run_frames(&mut self, base: usize) -> Result<()> {
         loop {
             if self.frames.len() <= base {
@@ -647,6 +669,10 @@ impl<H: Host> Interpreter<H> {
                         table: self.cur.table,
                         offset: self.cur.pc,
                     });
+                }
+                if let Some(b) = self.abandon_target(base, &e) {
+                    failure = self.abandon(b, e).err();
+                    continue;
                 }
                 match self.failing_load(base, &e) {
                     Some(at) => failure = self.fail_load_at(at, e).err(),
@@ -676,13 +702,26 @@ impl<H: Host> Interpreter<H> {
         if self.budget.used() <= self.gc_threshold {
             return None;
         }
+        let roots = self.root_work();
+        self.collect_garbage();
+        let used = self.budget.used();
+        let gap = (self.budget.limit().saturating_sub(used) / 2).max(64 << 10);
+        self.gc_threshold = used.saturating_add(gap).min(self.budget.limit());
+        // Marking reads every element of every live package, however few the slots: a unit each.
+        let traced = self.heap.take_traced();
+        Some(roots.saturating_add(traced))
+    }
+
+    /// A marking's work besides what it traces: a unit for each eight slots, and one for each
+    /// root besides the namespace's (every frame, activation and hold), each entry of the
+    /// deferred list, and each table and creator the recount after a collection reads.
+    pub(crate) fn root_work(&self) -> u64 {
         let slots = u64::try_from(self.heap.slot_count()).unwrap_or(u64::MAX);
-        // Besides the slots, the collector reads every frame, activation and hold as roots, and
-        // the recount that follows every table and creator: a unit each.
         let roots = [
             self.frames.len(),
             self.calls.len(),
             self.held.len(),
+            self.deferred.len(),
             self.tables.len(),
             self.owners.len(),
         ]
@@ -690,13 +729,7 @@ impl<H: Host> Interpreter<H> {
         .fold(0u64, |n, &k| {
             n.saturating_add(u64::try_from(k).unwrap_or(u64::MAX))
         });
-        self.collect_garbage();
-        let used = self.budget.used();
-        let gap = (self.budget.limit().saturating_sub(used) / 2).max(64 << 10);
-        self.gc_threshold = used.saturating_add(gap).min(self.budget.limit());
-        // Marking reads every element of every live package, however few the slots: a unit each.
-        let traced = self.heap.take_traced();
-        Some((slots / 8).saturating_add(roots).saturating_add(traced))
+        (slots / 8).saturating_add(roots)
     }
 
     /// Counts `units` of work against the step limit, with the work done since the last count:
@@ -784,6 +817,9 @@ impl<H: Host> Interpreter<H> {
                 }
                 if self.cur.pc > end {
                     return err(ErrorKind::PackageLength);
+                }
+                if let Some(Frame::Block { stmt, .. }) = self.frames.last_mut() {
+                    *stmt = self.cur;
                 }
                 self.decode(Want::Statement)
             }
@@ -1022,7 +1058,13 @@ impl<H: Host> Interpreter<H> {
         match b {
             // A table loaded at run time has no locals or arguments of its own at its table level:
             // those are the method's that ran `Load` (the review of B4's addendum, B4-13).
-            0x60..=0x6E if self.at_loaded_table_level() => return err(ErrorKind::Grammar),
+            // So has a boot table's, which has no method at all: the same kind, so that only
+            // its statement is abandoned (step B5, Q2's line).
+            0x60..=0x6E
+                if self.at_loaded_table_level() || (self.loading == 0 && self.calls.is_empty()) =>
+            {
+                return err(ErrorKind::OutsideMethod);
+            }
             0x60..=0x67 => {
                 #[cfg(test)]
                 crate::tests::ran(u16::from(b));
@@ -1144,28 +1186,44 @@ impl<H: Host> Interpreter<H> {
 
     fn decode_string(&mut self, want: Want, start: u32) -> Result<()> {
         let from = us(start);
-        let (len, bad) = {
-            let rest = self.aml().get(from..).ok_or(ErrorKind::Truncated)?;
-            let len = rest
-                .iter()
-                .position(|&c| c == 0)
+        let limit = us(self.enclosing_end());
+        // G13 (TASKS 64's ledger §3; step B5): every byte up to the NUL is a character, one above
+        // 0x7F (§20.2.3 allows 0x01 to 0x7F) included, reported; a literal with no NUL before the
+        // end of the range around it ends there, reported. The table's bytes are never written.
+        let (len, terminated, high) = {
+            let rest = self
+                .aml()
+                .get(from..limit.max(from))
                 .ok_or(ErrorKind::Truncated)?;
-            // §20.2.3: characters are 0x01–0x7F. One above fails the whole table (G13, strict
-            // until the reading session answers).
-            (len, rest.iter().take(len).any(|&c| c > 0x7F))
+            let (len, terminated) = match rest.iter().position(|&c| c == 0) {
+                Some(n) => (n, true),
+                None => (rest.len(), false),
+            };
+            (len, terminated, rest.iter().take(len).any(|&c| c > 0x7F))
         };
-        // The scan for the NUL read `len` bytes: work, counted a unit for each 64 and one more,
-        // whether or not the string is kept.
+        // The scan read `len` bytes: work, counted a unit for each 64 and one more, whether or
+        // not the string is kept.
         self.note_work(
             u64::try_from(len / 64)
                 .unwrap_or(u64::MAX)
                 .saturating_add(1),
         );
-        if bad {
+        let literal = At {
+            table: self.cur.table,
+            offset: start.saturating_sub(1),
+        };
+        #[cfg(test)]
+        if high && crate::tests::planted(crate::tests::Fault::RefuseHighBytes) {
             return err(ErrorKind::Grammar);
         }
+        if !terminated {
+            self.tell(&crate::Report::Unterminated { at: literal });
+        }
+        if high {
+            self.tell(&crate::Report::HighBytes { at: literal });
+        }
         let end = add(start, u32::try_from(len).map_err(|_| ErrorKind::Truncated)?)?;
-        self.cur.pc = add(end, 1)?;
+        self.cur.pc = if terminated { add(end, 1)? } else { end };
         if want == Want::Statement {
             return Ok(());
         }
@@ -1185,21 +1243,39 @@ impl<H: Host> Interpreter<H> {
         let (name, next) = name::parse(self.aml(), at)?;
         self.cur.pc = next;
         if want == Want::Element {
+            // Load-time code's names are bound once every boot table has loaded, or when the
+            // run-time load that made them ends (G1, step B5); a method's, when they are read.
+            let bind = if self.in_load_time_code() {
+                crate::object::Bind::Deferred
+            } else {
+                crate::object::Bind::Lazy
+            };
+            // A deferred name is listed until bound or no longer readable (B5-R2, B5-R10): room
+            // first, so that no element is made deferred and left out of the list.
+            if bind == crate::object::Bind::Deferred {
+                mem::reserve(&mut self.deferred, 1, &mut self.budget)?;
+            }
             let r = self.heap.alloc(
                 Object::NameElem(crate::object::NameElem {
                     scope: self.scope(),
                     table: self.cur.table,
                     at,
+                    bind,
                 }),
                 &mut self.budget,
             )?;
+            if bind == crate::object::Bind::Deferred {
+                // Room was made before the element: this push cannot fail.
+                mem::push(&mut self.deferred, r, &mut self.budget)?;
+            }
             return self.give_val(Val::Obj(r));
         }
         if want == Want::Data {
             return err(ErrorKind::Grammar);
         }
-        // G1, strict until the reading session answers: a name that resolves to nothing is an
-        // error; one that resolves to a method is a call.
+        // G1 (TASKS 64's ledger §3): a name that resolves to nothing is an error, which in
+        // load-time code abandons its statement (`tolerate.rs`; step B5); one that resolves to a
+        // method is a call taking the method's declared arguments.
         let node = self.resolve(name)?.ok_or(ErrorKind::NotFound)?;
         let obj = self.ns.obj(node)?;
         let argc = match self.heap.get(obj)? {
@@ -1294,10 +1370,25 @@ impl<H: Host> Interpreter<H> {
         self.pop_frame();
         #[cfg(test)]
         self.note_ran(f.at);
-        match f.arg(6) {
-            Operand::Val(v) => self.give_val(v),
-            _ => err(ErrorKind::Grammar),
+        let Operand::Val(v) = f.arg(6) else {
+            return err(ErrorKind::Grammar);
+        };
+        if let Val::Obj(r) = v
+            && let Ok(Object::Package(elems)) = self.heap.get(r)
+        {
+            let count = u64::try_from(elems.len()).unwrap_or(u64::MAX);
+            if f.aux > count {
+                self.tell(&crate::Report::ExtraElements {
+                    at: At {
+                        table: self.cur.table,
+                        offset: f.at,
+                    },
+                    count,
+                    found: f.aux,
+                });
+            }
         }
+        self.give_val(v)
     }
 
     /// Decodes one element: a data object, kept here, or a name, kept unresolved.
@@ -1344,10 +1435,19 @@ impl<H: Host> Interpreter<H> {
         let i = usize::try_from(index).map_err(|_| ErrorKind::Range)?;
         match self.heap.get_mut(pkg)? {
             Object::Package(elems) => {
-                // More elements than the count: a compile-time error by §19.6.102 (G14, strict
-                // until the reading session answers).
-                let slot = elems.get_mut(i).ok_or(ErrorKind::Range)?;
-                *slot = v;
+                // More elements than the count (a compile-time error by §19.6.102): the extra
+                // ones are decoded, then dropped, and reported when the package ends (G14, TASKS
+                // 64's ledger §3; step B5). Nothing reads a dropped one's names, so the binding
+                // pass finds them unreadable (the review of B5, B5-R3; of its answers, B5-R10).
+                #[cfg(test)]
+                if i >= elems.len()
+                    && crate::tests::planted(crate::tests::Fault::RefuseExtraElements)
+                {
+                    return err(ErrorKind::Range);
+                }
+                if let Some(slot) = elems.get_mut(i) {
+                    *slot = v;
+                }
             }
             _ => return err(ErrorKind::Grammar),
         }
@@ -1401,6 +1501,7 @@ impl<H: Host> Interpreter<H> {
                 end,
                 scope,
                 pred: 0,
+                stmt: self.cur,
             })
         } else {
             self.cur.pc = end;
@@ -1444,6 +1545,7 @@ impl<H: Host> Interpreter<H> {
                 end: f.end,
                 scope,
                 pred: 0,
+                stmt: self.cur,
             })
         } else {
             self.cur.pc = f.end;
@@ -1461,6 +1563,7 @@ impl<H: Host> Interpreter<H> {
                 end: f.end,
                 scope,
                 pred,
+                stmt: self.cur,
             })
         } else {
             self.cur.pc = f.end;
@@ -1504,6 +1607,7 @@ impl<H: Host> Interpreter<H> {
             end: f.end,
             scope,
             pred: 0,
+            stmt: self.cur,
         })
     }
 
@@ -1547,6 +1651,7 @@ impl<H: Host> Interpreter<H> {
         let serialized = m.flags & 8 != 0;
         let call = CallFrame {
             serial: self.serial,
+            method: node,
             ret: self.cur,
             locals: [Val::None; 8],
             args,
@@ -1571,6 +1676,7 @@ impl<H: Host> Interpreter<H> {
             end: m.end,
             scope: m.node,
             pred: 0,
+            stmt: self.cur,
         })
     }
 
@@ -1588,16 +1694,17 @@ impl<H: Host> Interpreter<H> {
         if call.serialized {
             self.drop_implicit(call.serial);
         }
-        let kept = self.release_call_holds(call.serial);
+        // A mutex the method took and did not release stays held (G2, step B5).
+        #[cfg(test)]
+        if crate::tests::planted(crate::tests::Fault::ReleaseOnReturn) {
+            self.release_call_holds(call.serial);
+        }
         self.pop_owner(true);
         self.run.depth = self.run.depth.saturating_sub(1);
         self.cur = call.ret;
-        if kept {
-            return err(ErrorKind::MutexHeld);
-        }
         if v == Val::None {
-            // G6, strict until the reading session answers: no value where one is needed is an
-            // error; as a statement it is nothing.
+            // G6, as ACPICA's default (TASKS 64's ledger §3; not its lenient mode): no value where
+            // one is needed is an error; as a statement it is nothing.
             if self.top_wants_value() {
                 return err(ErrorKind::NoValue);
             }
@@ -1734,6 +1841,10 @@ impl<H: Host> Interpreter<H> {
         let Object::NameElem(e) = *self.heap.get(r)? else {
             return Ok(v);
         };
+        // A name bound to nothing is an empty element (G1, step B5).
+        if e.bind == crate::object::Bind::Empty {
+            return Ok(Val::None);
+        }
         let node = self.resolve_elem(e)?;
         let obj = self.ns.obj(node)?;
         if self.heap.get(obj)?.is_data() {
@@ -1745,6 +1856,12 @@ impl<H: Host> Interpreter<H> {
 
     /// Resolves a name kept in a package.
     pub(crate) fn resolve_elem(&self, e: crate::object::NameElem) -> Result<NodeId> {
+        match e.bind {
+            crate::object::Bind::Node(n) if self.ns.exists(n) => return Ok(n),
+            crate::object::Bind::Node(_) => return err(ErrorKind::Stale),
+            crate::object::Bind::Empty => return err(ErrorKind::NotFound),
+            crate::object::Bind::Lazy | crate::object::Bind::Deferred => {}
+        }
         let aml = self
             .tables
             .get(us(e.table))
@@ -1780,8 +1897,21 @@ impl<H: Host> Interpreter<H> {
 
     // --- The collector -----------------------------------------------------------------------
 
-    /// Collects every object unreachable from the namespace and the frames.
+    /// Collects every object unreachable from the namespace and the frames, and takes it off the
+    /// deferred list, which is no root (the review of B5, B5-R10 and B5-R11).
     pub(crate) fn collect_garbage(&mut self) {
+        if self.mark_reachable() {
+            self.prune_deferred();
+            self.heap.sweep(&mut self.budget);
+        } else {
+            self.heap.clear_marks();
+        }
+    }
+
+    /// Marks every object reachable from the roots: the namespace, the frames, the activations,
+    /// the result and the holds. `false`: the marking was abandoned (it cannot be: its stack has
+    /// room for every slot).
+    pub(crate) fn mark_reachable(&mut self) -> bool {
         self.heap.clear_marks();
         let mut ok = true;
         for r in self.ns.objects() {
@@ -1833,10 +1963,22 @@ impl<H: Host> Interpreter<H> {
                 ok &= self.heap.mark(Val::Obj(r), &mut self.budget);
             }
         }
-        if ok && self.heap.trace(&mut self.budget) {
-            self.heap.sweep(&mut self.budget);
-        } else {
-            self.heap.clear_marks();
+        // Planted, the deferred list is a root again, as before the review of B5's answers.
+        #[cfg(test)]
+        if crate::tests::planted(crate::tests::Fault::StrongDeferred) {
+            for &r in &self.deferred {
+                ok &= self.heap.mark(Val::Obj(r), &mut self.budget);
+            }
         }
+        ok && self.heap.trace(&mut self.budget)
+    }
+
+    /// Keeps on the deferred list only what the last marking reached. Nothing else can be read
+    /// again, since only the list names it and nothing but a binding pass follows the list: a
+    /// name taken off here is one that no later pass would find readable (B5-R10, B5-R11).
+    pub(crate) fn prune_deferred(&mut self) {
+        let heap = &self.heap;
+        self.deferred.retain(|&r| heap.marked(r));
+        self.release_failed_bytes();
     }
 }

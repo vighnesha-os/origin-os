@@ -178,6 +178,21 @@ pub(crate) struct NameElem {
     pub(crate) table: u32,
     /// Where the name string is in the table's term list.
     pub(crate) at: u32,
+    /// What it names, once bound (G1, step B5).
+    pub(crate) bind: Bind,
+}
+
+/// How a name kept in a package is resolved (G1, step B5; `tolerate.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Bind {
+    /// Made inside a method, or a field's `Connection`: looked up each time it is read.
+    Lazy,
+    /// Made by load-time code, not yet bound: looked up each time it is read until it is.
+    Deferred,
+    /// Bound to this node.
+    Node(NodeId),
+    /// Bound to nothing: an empty element.
+    Empty,
 }
 
 /// An object.
@@ -440,6 +455,19 @@ impl Heap {
         }
     }
 
+    /// The name kept in a package at slot `i`, if that slot holds one and the last marking
+    /// reached it (the soak's audit).
+    #[cfg(test)]
+    pub(crate) fn marked_name_elem_at(&self, i: usize) -> Option<NameElem> {
+        match self.slots.get(i) {
+            Some(s) if s.mark => match &s.obj {
+                Object::NameElem(e) => Some(*e),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub(crate) fn get_mut(&mut self, r: ObjRef) -> Result<&mut Object> {
         match self.slots.get_mut(index(r.index)) {
             Some(s) if s.generation == r.generation && !matches!(s.obj, Object::Free) => {
@@ -481,6 +509,13 @@ impl Heap {
             Some(r) => self.mark_obj(r, budget),
             None => true,
         }
+    }
+
+    /// Whether the last marking reached the object `r` names.
+    pub(crate) fn marked(&self, r: ObjRef) -> bool {
+        self.slots
+            .get(index(r.index))
+            .is_some_and(|s| s.generation == r.generation && s.mark)
     }
 
     fn mark_obj(&mut self, r: ObjRef, budget: &mut Budget) -> bool {

@@ -458,8 +458,9 @@ impl Reference {
 
     fn read(self) -> u64 {
         match self {
-            // SAFETY: CPL 0, boot processor; `port` is the FADT's PM_TMR_BLK, a read-only
-            // timer that cannot affect memory, and `pm_timer` refused a system-owned port.
+            // SAFETY: CPL 0, boot processor; `port` is the PM timer's port as the FADT names it
+            // (`X_PM_TMR_BLK` or `PM_TMR_BLK`, chosen by `acpi::parse_fadt`), a read-only timer
+            // that cannot affect memory, and `pm_timer` refused a system-owned port.
             Self::PmTimer { port, mask } => u64::from(unsafe { crate::port::ind(port) }) & mask,
             Self::CpuidTsc { .. } => rdtsc(),
         }

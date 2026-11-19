@@ -63,6 +63,9 @@ impl Host for Opaque {
     fn breakpoint(&mut self) {
         black_box(());
     }
+    fn report(&mut self, r: &crate::Report<'_>) {
+        black_box(r);
+    }
     fn tracing(&self) -> bool {
         black_box(true)
     }

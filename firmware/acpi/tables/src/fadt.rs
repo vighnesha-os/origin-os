@@ -6,7 +6,10 @@
 //!
 //! Where a 32-bit field has a 64-bit `X_` form, the `X_` form is used when its address is not zero,
 //! and the 32-bit field is then ignored whatever it holds (§5.2.9: the two need not agree).
-//! [`Fadt::block`], [`Fadt::facs_address`] and [`Fadt::dsdt_address`] apply that rule.
+//! [`Fadt::block`], [`Fadt::facs_address`] and [`Fadt::dsdt_address`] apply that rule. §5.2.9 has
+//! the `X_` form used when it is non-zero *and usable*, and the 32-bit field otherwise:
+//! [`Fadt::port_block`] gives that 32-bit field to an OS that cannot use a block's `X_` form, or
+//! when the `X_` form breaks a rule of its own (TASKS item 71).
 //!
 //! With `HW_REDUCED_ACPI` set, ACPI 6.6 tells the OS to ignore the fields at offsets 46 to 108 and
 //! 148 to 232 and nine of the flags; none of them is checked then.
@@ -514,14 +517,39 @@ impl<'a> Fadt<'a> {
             .filter(|_| self.usable(Field::Block(block)))
     }
 
+    /// `block`'s 32-bit field as a system I/O port, for an operating system that cannot use the
+    /// block's `X_` form: §5.2.9 has the 64-bit field preferred when it is non-zero *and* the OS can
+    /// use it, and the 32-bit field used otherwise (TASKS item 71: the kernel reads a PM timer
+    /// through a port only). An `X_` form that breaks a rule of its own (a reserved address space
+    /// or access size) cannot be used either, so it does not stop the port: the fault stays named
+    /// by [`Fadt::faults`] (the review of TASKS item 71, T71-4). `None` on a hardware-reduced
+    /// platform, when the 32-bit field is zero, or when the block's length breaks its rule with the
+    /// port as its form (a PM timer not 4 bytes long).
+    #[must_use]
+    pub fn port_block(&self, block: Block) -> Option<Register> {
+        if self.flags.hw_reduced_acpi() {
+            return None;
+        }
+        let port = self.port_form(block)?;
+        self.length_verdict(&self.table.reader(), block, true)
+            .ok()
+            .map(|()| port)
+    }
+
     /// Where `block` is and how long, judged or not.
     fn locate(&self, block: Block) -> Option<Register> {
-        let b = self.table.reader();
-        let (legacy, _, _) = block.fields();
-        let length = b.u8(block.length_at()).ok()?;
+        let length = self.table.reader().u8(block.length_at()).ok()?;
         if let Some(gas) = self.x_block(block).filter(|g| !g.is_null()) {
             return Some(Register { gas, length });
         }
+        self.port_form(block)
+    }
+
+    /// `block`'s 32-bit field as a system I/O port, judged or not; `None` if it is zero.
+    fn port_form(&self, block: Block) -> Option<Register> {
+        let b = self.table.reader();
+        let (legacy, _, _) = block.fields();
+        let length = b.u8(block.length_at()).ok()?;
         let port = b.u32(legacy).ok().filter(|&p| p != 0)?;
         Some(Register {
             gas: Gas {
@@ -625,7 +653,7 @@ impl<'a> Fadt<'a> {
     /// The rules on one fixed hardware block, on a platform that is not hardware-reduced.
     fn block_verdict(&self, b: &Bytes<'_>, block: Block) -> Result<(), Error> {
         let value = |at: usize, field: &'static str| b.error(at, ErrorKind::Value { field });
-        let (legacy, x, name) = block.fields();
+        let (_, x, name) = block.fields();
         if let Some(gas) = self.x_block(block).filter(|g| !g.is_null()) {
             match block {
                 // §5.2.9: the OS ignores the X_ GPE blocks' width, offset and access size (the
@@ -641,7 +669,13 @@ impl<'a> Fadt<'a> {
                 _ => gas.check_register(b, x, name)?,
             }
         }
-        let present = self.locate(block).is_some();
+        self.length_verdict(b, block, self.locate(block).is_some())
+    }
+
+    /// The rules on a fixed hardware block's length, `present` saying whether the block is given.
+    fn length_verdict(&self, b: &Bytes<'_>, block: Block, present: bool) -> Result<(), Error> {
+        let value = |at: usize, field: &'static str| b.error(at, ErrorKind::Value { field });
+        let (legacy, _, name) = block.fields();
         let length_at = block.length_at();
         let length = b.u8(length_at)?;
         match block {
@@ -662,6 +696,27 @@ impl<'a> Fadt<'a> {
             _ => Ok(()),
         }
     }
+}
+
+/// Both of a FADT's pointers to the FACS, `X_FIRMWARE_CTRL` and `FIRMWARE_CTRL`, read from as
+/// many of its bytes as `bytes` holds, whatever else the table holds: 0 for a field it does not
+/// reach or that is zero. For a reader that must find the FACS before it has checked the FADT,
+/// to keep it from ever being lent (TASKS item 71), and that then chooses between them as
+/// §5.2.9 says, as [`Fadt::facs_address`] does: the first if non-zero, else the second.
+#[must_use]
+pub fn facs_pointers(bytes: &[u8]) -> [u64; 2] {
+    let b = Bytes::new(bytes, crate::Signature::new(b"FACP"));
+    [b.u64(132).unwrap_or(0), u64::from(b.u32(36).unwrap_or(0))]
+}
+
+/// Both of a FADT's pointers to the DSDT, `X_DSDT` and `DSDT`, read as [`facs_pointers`] reads
+/// the FACS's: for the reader that locates the structures the firmware changes, which must not
+/// record one over the DSDT the kernel lends (the review of TASKS item 71, T71-2), and chooses as
+/// [`Fadt::dsdt_address`] does.
+#[must_use]
+pub fn dsdt_pointers(bytes: &[u8]) -> [u64; 2] {
+    let b = Bytes::new(bytes, crate::Signature::new(b"FACP"));
+    [b.u64(140).unwrap_or(0), u64::from(b.u32(40).unwrap_or(0))]
 }
 
 /// The 64-bit value if present and not zero, else the 32-bit one if not zero.
@@ -971,5 +1026,72 @@ pub(crate) mod tests {
         assert_eq!(f.preferred_pm_profile, PmProfile::Reserved(200));
         assert_eq!(f.flags.persistent_cpu_caches(), PersistentCaches::Reserved);
         assert!(f.iapc_boot_arch.i8042());
+    }
+
+    /// TASKS item 71: a block's 32-bit port form, for an OS that cannot use its `X_` form.
+    #[test]
+    fn the_port_form_stands_when_the_x_form_cannot_be_used() {
+        // QEMU's shape: both forms name port 0x608.
+        let t = fadt();
+        let f = Fadt::parse(&t).unwrap();
+        let port = |r: Option<Register>| r.map(|r| (r.gas.space, r.gas.address, r.length));
+        assert_eq!(
+            port(f.block(Block::PmTimer)),
+            Some((AddressSpace::SystemIo, 0x608, 4))
+        );
+        assert_eq!(
+            port(f.port_block(Block::PmTimer)),
+            port(f.block(Block::PmTimer))
+        );
+        // The X_ form in system memory: `block` names it, `port_block` the 32-bit port.
+        let t = edited(|t| put(t, 208, &gas(0, 32, 0, 3, 0xFED0_0000)));
+        let f = Fadt::parse(&t).unwrap();
+        assert_eq!(
+            port(f.block(Block::PmTimer)),
+            Some((AddressSpace::SystemMemory, 0xFED0_0000, 4))
+        );
+        assert_eq!(
+            port(f.port_block(Block::PmTimer)),
+            Some((AddressSpace::SystemIo, 0x608, 4))
+        );
+        // The review's T71-4: an X_ form with a reserved address space or a reserved access size
+        // cannot be used; `block` gives none, the fault is named, and the port stands.
+        for x in [gas(0x20, 32, 0, 3, 0x608), gas(1, 32, 0, 5, 0x608)] {
+            let t = edited(|t| put(t, 208, &x));
+            let f = Fadt::parse(&t).unwrap();
+            assert_eq!(f.block(Block::PmTimer), None);
+            assert!(!f.usable(Field::Block(Block::PmTimer)));
+            assert_eq!(
+                port(f.port_block(Block::PmTimer)),
+                Some((AddressSpace::SystemIo, 0x608, 4))
+            );
+        }
+        // No 32-bit field, a block that breaks its rule, or a hardware-reduced platform: none.
+        let t = edited(|t| {
+            put(t, 208, &gas(0, 32, 0, 3, 0xFED0_0000));
+            put(t, 76, &[0; 4]);
+        });
+        assert_eq!(Fadt::parse(&t).unwrap().port_block(Block::PmTimer), None);
+        let t = edited(|t| t[91] = 3);
+        assert_eq!(Fadt::parse(&t).unwrap().port_block(Block::PmTimer), None);
+        let t = edited(|t| put(t, 112, &(1u32 << 20).to_le_bytes()));
+        assert_eq!(Fadt::parse(&t).unwrap().port_block(Block::PmTimer), None);
+    }
+
+    /// TASKS item 71: both FACS pointers, from whatever prefix of a FADT a reader has.
+    #[test]
+    fn both_facs_pointers_from_any_prefix() {
+        let t = fadt();
+        assert_eq!(facs_pointers(&t), [0x7FFE_0000, 0x7FFE_0000]);
+        assert_eq!(facs_pointers(&t[..140]), [0x7FFE_0000, 0x7FFE_0000]);
+        assert_eq!(facs_pointers(&t[..139]), [0, 0x7FFE_0000]);
+        assert_eq!(facs_pointers(&t[..39]), [0, 0]);
+        let t = edited(|t| put(t, 132, &0x7F00_0040u64.to_le_bytes()));
+        assert_eq!(facs_pointers(&t), [0x7F00_0040, 0x7FFE_0000]);
+        // The DSDT's two pointers, the same way (T71-2).
+        let t = fadt();
+        assert_eq!(dsdt_pointers(&t), [0x7FFD_0000, 0x7FFD_0000]);
+        assert_eq!(dsdt_pointers(&t[..147]), [0, 0x7FFD_0000]);
+        assert_eq!(dsdt_pointers(&t[..43]), [0, 0]);
     }
 }

@@ -413,9 +413,38 @@ pub fn may_map(never: &[Span], phys: u64) -> bool {
     !never.iter().any(|s| s.contains(phys))
 }
 
+/// Whether any of `[base, end)` is memory `map` calls MMIO (`EfiMemoryMappedIO`): device
+/// registers, where no firmware table lives, so `firmware::bytes` and `firmware::copy` read
+/// nothing there (TASKS item 71, the review's F14). A hole in the map is not MMIO.
+pub fn names_mmio(map: &[MemoryRegion], base: u64, end: u64) -> bool {
+    map.iter().any(|r| {
+        r.kind == RegionKind::Mmio as u32
+            && r.base < end
+            && base < r.base.saturating_add(r.pages.saturating_mul(PAGE))
+    })
+}
+
 /// Ranges [`Lending`] keeps of each sort. Fixed, because the kernel lends firmware tables
 /// before it has a heap; a firmware with more is refused, not trusted (fail closed).
 pub const LENDING_SLOTS: usize = 128;
+
+/// Ranges [`Lending`] keeps that may never be lent: the firmware's structures that change after
+/// boot (TASKS item 71). The first valid FADT and FPDT name at most five: the FACS through either
+/// of the FADT's two pointers, and the FBPT, S3PT and MBPT through the FPDT, which names each
+/// kind once. The three left take what any other FADT or FPDT names (the addendum review of
+/// TASKS item 71, T71-11).
+pub const NEVER_SLOTS: usize = 8;
+
+/// What [`Lending::never_lend`] did with the ranges it was given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Never {
+    /// Ranges now kept as never lendable.
+    pub recorded: usize,
+    /// Ranges no slot was left for ([`NEVER_SLOTS`]).
+    pub untracked: usize,
+    /// A range lent before, which one of them overlaps: it stays lent, and the caller reports it.
+    pub already_lent: Option<(u64, u64)>,
+}
 
 /// The firmware memory the kernel lends as `&'static` references (ACPI tables) and the
 /// firmware memory devices may write (identity ranges with write access), kept apart: a
@@ -428,6 +457,9 @@ pub struct Lending {
     lent_count: usize,
     writable: [(u64, u64); LENDING_SLOTS],
     writable_count: usize,
+    never: [(u64, u64); NEVER_SLOTS],
+    never_count: usize,
+    located: bool,
 }
 
 impl Default for Lending {
@@ -448,13 +480,18 @@ impl Lending {
             lent_count: 0,
             writable: [(0, 0); LENDING_SLOTS],
             writable_count: 0,
+            never: [(0, 0); NEVER_SLOTS],
+            never_count: 0,
+            located: false,
         }
     }
 
-    /// Records `[base, end)` as lent, unless a device may write any of it or no slot is left:
-    /// `false` then, and nothing is recorded. A range that holds earlier ones takes their slots.
+    /// Records `[base, end)` as lent, unless a device may write any of it, it overlaps a range
+    /// that may never be lent ([`Lending::never_lend`]), the never-lendable ranges have not been
+    /// located yet ([`Lending::located`]), or no slot is left: `false` then, and nothing is
+    /// recorded. A range that holds earlier ones takes their slots.
     pub fn lend(&mut self, base: u64, end: u64) -> bool {
-        if overlaps_any(self.writable(), base, end) {
+        if self.guards(base, end) || overlaps_any(self.writable(), base, end) {
             return false;
         }
         if self.lent().iter().any(|&(b, e)| b <= base && end <= e) {
@@ -504,6 +541,61 @@ impl Lending {
     /// Every range lent so far.
     pub fn lent(&self) -> &[(u64, u64)] {
         self.lent.get(..self.lent_count).unwrap_or(&[])
+    }
+
+    /// Records `ranges` as never lendable, the firmware's structures that change after boot, and
+    /// that they have been located, so lending may begin (TASKS item 71). A range already kept, or
+    /// held by one kept, is not kept twice. One that overlaps a range lent before is still kept,
+    /// so nothing more is lent over it, and the earlier range is returned for the caller to report:
+    /// a reference to it cannot be taken back.
+    pub fn never_lend(&mut self, ranges: &[(u64, u64)]) -> Never {
+        let mut report = Never::default();
+        for &(base, end) in ranges {
+            if report.already_lent.is_none() {
+                report.already_lent = self
+                    .lent()
+                    .iter()
+                    .copied()
+                    .find(|&(b, e)| b < end && base < e);
+            }
+            if self.never().iter().any(|&(b, e)| b <= base && end <= e) {
+                continue;
+            }
+            match self.never.get_mut(self.never_count) {
+                Some(slot) => {
+                    *slot = (base, end);
+                    self.never_count += 1;
+                    report.recorded += 1;
+                }
+                None => report.untracked += 1,
+            }
+        }
+        self.located = true;
+        report
+    }
+
+    /// Whether the never-lendable ranges have been located and recorded ([`Lending::never_lend`]);
+    /// nothing is lent before.
+    pub fn located(&self) -> bool {
+        self.located
+    }
+
+    /// Whether `[base, end)` overlaps a range that may never be lent.
+    pub fn never_lent(&self, base: u64, end: u64) -> bool {
+        overlaps_any(self.never(), base, end)
+    }
+
+    /// Whether [`Lending::lend`] refuses `[base, end)` for the guard over the firmware's
+    /// structures that change after boot: before they have been located ([`Lending::located`]),
+    /// or when it overlaps one ([`Lending::never_lend`]). The very check `lend` makes, recording
+    /// nothing, so the census can ask it at every boot without making the lend it tests (the
+    /// review of TASKS item 71, T71-7).
+    pub fn guards(&self, base: u64, end: u64) -> bool {
+        !self.located || overlaps_any(self.never(), base, end)
+    }
+
+    fn never(&self) -> &[(u64, u64)] {
+        self.never.get(..self.never_count).unwrap_or(&[])
     }
 
     fn writable(&self) -> &[(u64, u64)] {
@@ -985,6 +1077,7 @@ mod tests {
     fn lent_memory_and_device_writable_memory_never_overlap() {
         // A table lent first: a grant of writes over any of it is refused.
         let mut l = Lending::new();
+        l.never_lend(&[]);
         assert!(l.lend(0x7A00_0040, 0x7A00_00C0));
         assert_eq!(
             l.allow_writes(0x7A00_0000, 0x7A00_1000),
@@ -1021,9 +1114,106 @@ mod tests {
         );
     }
 
+    /// TASKS item 71: the firmware's structures that change after boot are never lent, by any
+    /// range that overlaps them, and nothing is lent before they have been located.
+    #[test]
+    fn what_the_firmware_changes_is_never_lent() {
+        let facs = (0x7FFE_0000, 0x7FFE_0040);
+        let fbpt = (0x7FF0_0000, 0x7FF0_0100);
+        let mut l = Lending::new();
+        // Before the ranges are located, nothing is lent, not even a table far from them.
+        assert!(!l.located());
+        assert!(l.guards(0x7A00_0000, 0x7A00_0024));
+        assert!(!l.lend(0x7A00_0000, 0x7A00_0024));
+        let report = l.never_lend(&[facs, fbpt]);
+        assert_eq!(
+            report,
+            Never {
+                recorded: 2,
+                untracked: 0,
+                already_lent: None
+            }
+        );
+        assert!(l.located());
+        assert!(l.lend(0x7A00_0000, 0x7A00_0024));
+        // Overlaps at either end, inside, around, and the exact range: all refused.
+        for (b, e) in [
+            (0x7FFD_FFF0, 0x7FFE_0001),
+            (0x7FFE_003F, 0x7FFE_0100),
+            (0x7FFE_0008, 0x7FFE_0010),
+            (0x7FFD_0000, 0x7FFF_0000),
+            facs,
+            (0x7FF0_00F0, 0x7FF0_0200),
+        ] {
+            assert!(!l.lend(b, e), "{b:#x}-{e:#x}");
+            assert!(l.never_lent(b, e), "{b:#x}-{e:#x}");
+        }
+        // The review of TASKS item 71, T71-7: a range that starts before a structure and runs
+        // into it, at either structure; `guards` says so and records nothing.
+        for (b, e) in [(0x7FFD_FFF8, 0x7FFE_0008), (0x7FEF_FFF0, 0x7FF0_0010)] {
+            assert!(l.guards(b, e), "{b:#x}-{e:#x}");
+            assert!(!l.lend(b, e), "{b:#x}-{e:#x}");
+        }
+        let lent_before = l.lent().len();
+        assert!(!l.guards(0x7A10_0000, 0x7A10_0024));
+        assert_eq!(l.lent().len(), lent_before, "guards records nothing");
+        // Touching without overlapping is lent.
+        assert!(l.lend(0x7FFE_0040, 0x7FFE_0080));
+        assert!(l.lend(0x7FFD_FFC0, 0x7FFE_0000));
+        assert!(!l.never_lent(0x7FFE_0040, 0x7FFE_0080));
+        // A range kept, or held by one kept, is not kept twice.
+        let again = l.never_lend(&[facs, (0x7FFE_0010, 0x7FFE_0020)]);
+        assert_eq!((again.recorded, again.untracked), (0, 0));
+        // One that overlaps a range already lent is still kept, and the lent range reported.
+        let late = l.never_lend(&[(0x7A00_0010, 0x7A00_0020)]);
+        assert_eq!(late.already_lent, Some((0x7A00_0000, 0x7A00_0024)));
+        assert_eq!(late.recorded, 1);
+        // Nothing more is lent over it, the table lent before included.
+        assert!(!l.lend(0x7A00_0000, 0x7A00_0024));
+        // The cap: past NEVER_SLOTS, a range is counted, not kept.
+        let mut c = Lending::new();
+        let many: Vec<(u64, u64)> = (0..NEVER_SLOTS as u64 + 2)
+            .map(|i| (i * 0x1000, i * 0x1000 + 0x40))
+            .collect();
+        let report = c.never_lend(&many);
+        assert_eq!((report.recorded, report.untracked), (NEVER_SLOTS, 2));
+        assert!(c.located());
+        assert!(!c.lend(0x10, 0x20));
+    }
+
+    /// TASKS item 71, F14: a range the memory map calls MMIO, any part of it.
+    #[test]
+    fn mmio_is_named_by_the_memory_map_alone() {
+        let map = [
+            region(0x7F00_0000, 16, RegionKind::AcpiReclaimable),
+            region(0xFEC0_0000, 1, RegionKind::Mmio),
+            region(0x7E00_0000, 4, RegionKind::Reserved),
+        ];
+        assert!(names_mmio(&map, 0xFEC0_0000, 0xFEC0_0024));
+        assert!(
+            names_mmio(&map, 0xFEBF_FFF0, 0xFEC0_0001),
+            "overlapping its start"
+        );
+        assert!(
+            names_mmio(&map, 0xFEC0_0FFF, 0xFEC0_1010),
+            "overlapping its end"
+        );
+        assert!(!names_mmio(&map, 0xFEC0_1000, 0xFEC0_1024), "just past it");
+        assert!(!names_mmio(&map, 0x7F00_0000, 0x7F00_0024), "ACPI memory");
+        assert!(
+            !names_mmio(&map, 0x7E00_0000, 0x7E00_0024),
+            "reserved memory"
+        );
+        assert!(
+            !names_mmio(&map, 0x9000_0000, 0x9000_0024),
+            "a hole in the map"
+        );
+    }
+
     #[test]
     fn lending_allocates_nothing_and_fails_closed_when_full() {
         let mut l = Lending::new();
+        l.never_lend(&[]);
         for i in 0..LENDING_SLOTS as u64 {
             assert!(l.lend(i * 0x1000, i * 0x1000 + 0x24), "lend {i}");
         }

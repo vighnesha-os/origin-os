@@ -27,7 +27,9 @@ use origin_acpi_tables::madt::Madt;
 use origin_acpi_tables::srat::Srat;
 use origin_acpi_tables::{CHANGES_AFTER_BOOT, Error, Signature};
 
+use crate::acpi::{Changing, ChangingRanges};
 use crate::acpi_text::{Ascii, Refused, Sig, Whose};
+use origin_frame::reserved::Never;
 
 /// Where every line of the census starts.
 const LINE: &str = "origin-kernel: acpi: ";
@@ -57,8 +59,24 @@ pub trait Firmware {
     fn lend(&mut self, addr: u64, len: usize) -> Result<&'static [u8], &'static str>;
     /// Copies `out.len()` bytes at physical `addr`, lending nothing (`firmware::copy`).
     fn copy(&mut self, addr: u64, out: &mut [u8]) -> Result<(), &'static str>;
+    /// Whether [`Firmware::lend`] refuses `len` bytes at `addr` for its guard over the firmware's
+    /// structures that change after boot, asked without lending (`firmware::guards`; the review
+    /// of TASKS item 71, T71-7). A reader that cannot ask (the AML proof's, which runs no
+    /// census) says it would not refuse, so a census run through it fails rather than passes.
+    /// It is a test of the guard, never a precondition to lend: that default is fail-closed only
+    /// because the census counts "not refused" as a failure, and a caller that lent on `false`
+    /// would be fail-open (the addendum review of TASKS item 71, its caution on decision 2).
+    fn guards(&mut self, _addr: u64, _len: usize) -> bool {
+        false
+    }
     /// A monotonic clock in nanoseconds, for the time the census took.
     fn now(&self) -> u64;
+    /// What the kernel's first table lookup located as the firmware's structures that change
+    /// after boot, and what the lending registry did with them (`firmware::changing`; TASKS item
+    /// 71), if it has run.
+    fn changing(&self) -> Option<(ChangingRanges, Never)> {
+        None
+    }
 }
 
 /// The kernel's firmware memory.
@@ -73,8 +91,14 @@ impl Firmware for Boot {
     fn copy(&mut self, addr: u64, out: &mut [u8]) -> Result<(), &'static str> {
         crate::firmware::copy(addr, out)
     }
+    fn guards(&mut self, addr: u64, len: usize) -> bool {
+        crate::firmware::guards(addr, len)
+    }
     fn now(&self) -> u64 {
         crate::time::monotonic_nanos()
+    }
+    fn changing(&self) -> Option<(ChangingRanges, Never)> {
+        crate::firmware::changing().copied()
     }
 }
 
@@ -105,6 +129,18 @@ pub struct Findings {
     pub unreadable: u32,
     /// Structures copied rather than lent that declare more than the census copies (N2).
     pub too_large: u32,
+    /// Lends over a structure the firmware changes after boot that the guard would not refuse,
+    /// asked without lending, at every boot (TASKS item 71; the review's T71-7): over each
+    /// structure the kernel's first lookup recorded and each the census found itself (T71-1).
+    /// Any fails the verdict.
+    pub lendable_changing: u32,
+    /// Gaps in what the kernel's first lookup located and recorded as never lent: a structure
+    /// not located or passed over, one found with no slot left (the addendum review, T71-11), one
+    /// the registry had no room for, and a range lent before one of them (the review of TASKS item
+    /// 71, T71-1); and each structure recorded that meets a
+    /// table the kernel lends, over its minimum or cut short at it (the addendum review, T71-9).
+    /// Any fails the verdict.
+    pub guard_gaps: u32,
     /// XSDT entries that were zero, which name no table (the review's F8).
     pub null_entries: u32,
     /// XSDT entries that could not be read: each might have been any table.
@@ -121,8 +157,10 @@ pub struct Findings {
 
 impl Findings {
     /// The verdict: no table refused, every table the XSDT lists read, no fault in a structure or
-    /// field the kernel relies on (N1), a FADT, a DSDT, and a FACS unless the platform is
-    /// hardware-reduced. Not counted against it: a fault reported in a structure or field nothing
+    /// field the kernel relies on (N1), a FADT, a DSDT, a FACS unless the platform is
+    /// hardware-reduced, no lend over a structure the firmware changes that the guard would make,
+    /// and no gap in what the kernel's first lookup located (TASKS item 71). Not counted against
+    /// it: a fault reported in a structure or field nothing
     /// in the kernel uses, so that ordinary firmware bugs in unused tables do not mark a machine
     /// degraded (the coordinating session's ruling on N1); a null XSDT entry, which names no
     /// table; and a table the FPDT points to that cannot be read or is too large to judge, which
@@ -132,6 +170,8 @@ impl Findings {
         self.refused == 0
             && self.unreadable_entries == 0
             && self.relied == 0
+            && self.lendable_changing == 0
+            && self.guard_gaps == 0
             && self.fadt
             && self.dsdt
             && (self.facs || self.reduced)
@@ -174,6 +214,106 @@ pub fn relied_on(table: &[u8]) -> u32 {
             )
         }),
         _ => 0,
+    }
+}
+
+/// The firmware's structures that change after boot, as the kernel's first table lookup located
+/// them and recorded them as never lent (TASKS item 71): each with its range, inclusive, and the
+/// tables the kernel lends that it meets (the addendum review, T71-9); what the registry could
+/// not keep or found lent before; and why not all were located, naming the first structure passed
+/// over. Its gaps are counted in [`Findings::guard_gaps`].
+struct NeverLent<'c>(&'c ChangingRanges, Never);
+
+impl core::fmt::Display for NeverLent<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("never lent, as the firmware changes them after boot:")?;
+        if self.0.ranges().is_empty() {
+            f.write_str(" none named")?;
+        }
+        for (i, (&(kind, base, end), met)) in
+            self.0.ranges().iter().zip(self.0.overlaps()).enumerate()
+        {
+            let sep = if i == 0 { " " } else { ", " };
+            write!(
+                f,
+                "{sep}{} {base:#x}-{:#x}",
+                kind.name(),
+                end.saturating_sub(1)
+            )?;
+            if met.tables != 0 {
+                write!(
+                    f,
+                    " (declared to {:#x}, over {} lent tables",
+                    met.declared_end.saturating_sub(1),
+                    met.tables
+                )?;
+                if let Some((b, e)) = met.over_minimum {
+                    write!(
+                        f,
+                        "; its least under {b:#x}-{:#x}, never lent",
+                        e.saturating_sub(1)
+                    )?;
+                }
+                if let Some((b, e)) = met.trimmed_at {
+                    write!(f, "; cut at {b:#x}-{:#x}, lent", e.saturating_sub(1))?;
+                }
+                f.write_str(")")?;
+            }
+        }
+        write!(f, "; {} kept", self.1.recorded)?;
+        if self.0.unkept != 0 {
+            write!(f, ", {} found with no slot left", self.0.unkept)?;
+        }
+        if self.1.untracked != 0 {
+            write!(f, ", {} not kept for want of room", self.1.untracked)?;
+        }
+        if let Some((base, end)) = self.1.already_lent {
+            write!(
+                f,
+                ", one overlapping {base:#x}-{:#x}, lent before",
+                end.saturating_sub(1)
+            )?;
+        }
+        if let Some(why) = self.0.unlocated {
+            write!(f, "; not all located: {why}")?;
+        }
+        if let Some((kind, base, end)) = self.0.passed_over {
+            write!(
+                f,
+                " ({} {base:#x}-{:#x} not recorded)",
+                kind.name(),
+                end.saturating_sub(1)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The PM timer as the census line words it (TASKS item 71): `X_PM_TMR_BLK` and the 32-bit
+/// `PM_TMR_BLK` as the FADT gives them, and the port the kernel's own reader
+/// (`acpi::parse_fadt`) takes, as §5.2.9 says to choose it.
+struct PmTimer<'f, 'a>(&'f Fadt<'a>, Option<&'a [u8]>);
+
+impl core::fmt::Display for PmTimer<'_, '_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let fadt = self.0;
+        match fadt.x_block(Block::PmTimer) {
+            None => f.write_str("X_PM_TMR_BLK absent")?,
+            Some(g) if g.is_null() => f.write_str("X_PM_TMR_BLK zero")?,
+            Some(g) => write!(f, "X_PM_TMR_BLK {:?} {:#x}", g.space, g.address)?,
+        }
+        match fadt.port_block(Block::PmTimer) {
+            Some(r) => write!(f, ", PM_TMR_BLK port {:#x}", r.gas.address)?,
+            None => f.write_str(", PM_TMR_BLK none")?,
+        }
+        let taken = self
+            .1
+            .and_then(|b| crate::acpi::parse_fadt(b).ok())
+            .and_then(|k| k.pm_timer_port);
+        match taken {
+            Some(port) => write!(f, "; the kernel's: port {port:#x}"),
+            None => f.write_str("; the kernel's: none"),
+        }
     }
 }
 
@@ -394,6 +534,9 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
         return false;
     };
     let (mut fadt, mut fpdt) = (None, None);
+    // The structures the firmware changes that the census itself found and checked, with their
+    // ranges: the guard is tested over these too, not only over what the kernel recorded (T71-1).
+    let mut own: Vec<(Changing, u64, u64)> = Vec::new();
     for (i, addr) in crate::acpi::xsdt_entries(xsdt).enumerate() {
         if addr == 0 {
             found.null_entries = found.null_entries.saturating_add(1);
@@ -413,6 +556,7 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
             found.unreadable_entries = found.unreadable_entries.saturating_add(1);
         }
     }
+    let fadt_bytes = fadt;
     let fadt = fadt.and_then(|b| Fadt::parse(b).ok());
     found.fadt = fadt.is_some();
     if let Some(fadt) = &fadt {
@@ -425,13 +569,17 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
             fadt.sci_int,
             found.reduced,
             fadt.reset().map_or("none", |_| "given"),
-            fadt.block(Block::PmTimer).map_or("none", |_| "given"),
+            PmTimer(fadt, fadt_bytes),
         );
         if let Some(dsdt) = fadt.dsdt_address() {
             found.dsdt = census_at(out, fw, &mut found, "the DSDT", dsdt, Some(b"DSDT")).is_some();
         }
         if let Some(facs) = fadt.facs_address() {
-            found.facs = check_facs(out, fw, &mut found, facs);
+            let checked = check_facs(out, fw, &mut found, facs);
+            found.facs = checked.is_some();
+            if let Some(length) = checked {
+                own.push((Changing::Facs, facs, facs.saturating_add(length)));
+            }
         }
         // §5.2.7 and §5.2.8: the root tables' OEM table ID is the FADT's. Reported, not judged.
         let id = fadt.table().header().oem_table_id;
@@ -446,13 +594,63 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
         );
     }
     if let Some(fpdt) = fpdt {
-        performance_tables(out, fw, &mut found, fpdt);
+        performance_tables(out, fw, &mut found, fpdt, &mut own);
+    }
+    let changing = fw.changing();
+    if let Some((located, kept)) = &changing {
+        found.guard_gaps = u32::from(located.unlocated.is_some())
+            .saturating_add(u32::try_from(located.met()).unwrap_or(u32::MAX))
+            .saturating_add(u32::try_from(located.unkept).unwrap_or(u32::MAX))
+            .saturating_add(u32::try_from(kept.untracked).unwrap_or(u32::MAX))
+            .saturating_add(u32::from(kept.already_lent.is_some()));
+    }
+    if changing.is_some() || !own.is_empty() {
+        // The guard, at every boot, asked without lending (T71-7): a lend at each structure's
+        // start, in its middle, and from before its start into it must be refused, over each
+        // structure the kernel recorded and each the census found itself (T71-1).
+        let recorded = changing.as_ref().map_or(&[][..], |(c, _)| c.ranges());
+        let mut not_refused = None;
+        for &(kind, base, end) in recorded.iter().chain(&own) {
+            let middle = base.saturating_add(end.saturating_sub(base) / 2);
+            let before = base.checked_sub(8).map(|b| (b, 16));
+            for (at, len) in [Some((base, HEADER_LEN)), Some((middle, 8)), before]
+                .into_iter()
+                .flatten()
+            {
+                if !fw.guards(at, len) {
+                    found.lendable_changing = found.lendable_changing.saturating_add(1);
+                    not_refused.get_or_insert((kind, at, at.saturating_add(len as u64)));
+                }
+            }
+        }
+        let _ = write!(out, "{LINE}");
+        match &changing {
+            Some((located, kept)) => {
+                let _ = write!(out, "{}", NeverLent(located, *kept));
+            }
+            None => {
+                let _ = write!(
+                    out,
+                    "never lent: nothing recorded, as no table lookup has run"
+                );
+            }
+        }
+        let _ = write!(out, "; a lend over each refused: {}", not_refused.is_none());
+        if let Some((kind, at, end)) = not_refused {
+            let _ = write!(
+                out,
+                " (not over the {} at {at:#x}-{:#x})",
+                kind.name(),
+                end.saturating_sub(1)
+            );
+        }
+        let _ = writeln!(out);
     }
     let consistent = found.consistent();
     let micros = fw.now().saturating_sub(started) / 1000;
     let _ = writeln!(
         out,
-        "{LINE}{} tables: {} checked, {} refused, {} reported, {} of them where the kernel relies on it, {} with only their headers checked, {} not readable, {} too large to judge, {} null XSDT entries; FADT {}, DSDT {}, FACS {}; {} us; consistent {}{}",
+        "{LINE}{} tables: {} checked, {} refused, {} reported, {} of them where the kernel relies on it, {} with only their headers checked, {} not readable, {} too large to judge, {} null XSDT entries, {} lends over what the firmware changes, {} gaps in locating it; FADT {}, DSDT {}, FACS {}; {} us; consistent {}{}",
         found.tables,
         found.checked,
         found.refused,
@@ -462,6 +660,8 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
         found.unreadable,
         found.too_large,
         found.null_entries,
+        found.lendable_changing,
+        found.guard_gaps,
         found.fadt,
         found.dsdt,
         if found.reduced && !found.facs {
@@ -483,24 +683,25 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
 }
 
 /// Copies and checks the FACS, which has no header: its first eight bytes give its length.
+/// Returns how many bytes it is, if it was checked.
 fn check_facs(
     out: &mut impl Write,
     fw: &mut impl Firmware,
     found: &mut Findings,
     addr: u64,
-) -> bool {
+) -> Option<u64> {
     let read = copy_structure(fw, addr, 8);
     found.tables = found.tables.saturating_add(1);
     match read.as_deref().map(Facs::parse) {
         Err(Uncopied::Unreadable(why)) => {
             found.unreadable = found.unreadable.saturating_add(1);
             let _ = writeln!(out, "{LINE}the FACS: not readable: {why}");
-            false
+            None
         }
         Err(Uncopied::TooLarge(length)) => {
             found.too_large = found.too_large.saturating_add(1);
             let _ = writeln!(out, "{LINE}the FACS: {length} bytes, too large to judge");
-            false
+            None
         }
         Ok(Ok(facs)) => {
             found.checked = found.checked.saturating_add(1);
@@ -512,12 +713,12 @@ fn check_facs(
                 facs.flags.wake_64bit_supported(),
                 facs.global_lock.owned
             );
-            true
+            Some(read.as_deref().map_or(64, |b| b.len() as u64))
         }
         Ok(Err(e)) => {
             found.refused = found.refused.saturating_add(1);
             let _ = writeln!(out, "{LINE}the FACS: {}", Refused(e));
-            false
+            None
         }
     }
 }
@@ -529,6 +730,7 @@ fn performance_tables(
     fw: &mut impl Firmware,
     found: &mut Findings,
     fpdt: &'static [u8],
+    own: &mut Vec<(Changing, u64, u64)>,
 ) {
     let Ok(fpdt) = Fpdt::parse(fpdt) else { return };
     for record in fpdt.walk() {
@@ -556,6 +758,12 @@ fn performance_tables(
         match PerformanceTable::parse(&bytes, kind) {
             Ok(t) => {
                 found.checked = found.checked.saturating_add(1);
+                let changing = match kind {
+                    PerformanceKind::Fbpt => Changing::Fbpt,
+                    PerformanceKind::S3pt => Changing::S3pt,
+                    PerformanceKind::Mbpt => Changing::Mbpt,
+                };
+                own.push((changing, addr, addr.saturating_add(bytes.len() as u64)));
                 let records = t.records().count();
                 let _ = writeln!(
                     out,
@@ -615,6 +823,14 @@ mod tests {
         memory: Vec<u8>,
         entries: Vec<u64>,
         fadt: Vec<u8>,
+        /// The lending registry's guard broken: what the census's live check must catch.
+        guard_broken: bool,
+        /// Done to the lending registry before the first lookup records what it located.
+        prepare: fn(&mut origin_frame::reserved::Lending),
+        /// The first lookup reads the FADT with its FACS pointer zeroed, so locates no FACS, with
+        /// no gap to report (a test of the census's own finds, the review of TASKS item 71,
+        /// T71-1).
+        locator_misreads_fadt: bool,
     }
 
     impl Machine {
@@ -623,6 +839,9 @@ mod tests {
                 memory: vec![0u8; 0x8000 + (256 << 10)],
                 entries: vec![FADT],
                 fadt: Vec::new(),
+                guard_broken: false,
+                prepare: |_| {},
+                locator_misreads_fadt: false,
             };
             // A FADT of 276 bytes, with fixed hardware, its FACS and DSDT given.
             let mut f = vec![0u8; 240];
@@ -679,9 +898,29 @@ mod tests {
             rsdp[8] = sum(&rsdp[..20]);
             rsdp[32] = sum(&rsdp);
             self.put(RSDP, &rsdp);
+            let bytes: &'static [u8] = Vec::leak(self.memory);
+            // As the kernel's first lookup does: the changing structures located by copy and
+            // recorded with a lending registry (TASKS item 71).
+            let misreads = self.locator_misreads_fadt;
+            let mut copy = |addr: u64, out: &mut [u8]| {
+                let at = usize::try_from(addr.checked_sub(BASE).ok_or("no")?).map_err(|_| "no")?;
+                out.copy_from_slice(bytes.get(at..at + out.len()).ok_or("no")?);
+                if misreads && addr == FADT && out.len() >= 40 {
+                    out[36..40].fill(0);
+                }
+                Ok(())
+            };
+            let found = crate::acpi::changing_ranges(RSDP, &mut copy);
+            let ranges: Vec<(u64, u64)> = found.ranges().iter().map(|&(_, b, e)| (b, e)).collect();
+            let mut registry = origin_frame::reserved::Lending::new();
+            (self.prepare)(&mut registry);
+            let kept = registry.never_lend(&ranges);
             let mut fw = Memory {
-                bytes: Vec::leak(self.memory),
+                bytes,
                 lent: Vec::new(),
+                changing: Some((found, kept)),
+                registry,
+                guard_broken: self.guard_broken,
             };
             let mut out = String::new();
             let verdict = census(&mut out, &mut fw, RSDP);
@@ -689,10 +928,15 @@ mod tests {
         }
     }
 
-    /// Firmware memory at [`BASE`]: lent and copied from one buffer, and every lending recorded.
+    /// Firmware memory at [`BASE`]: lent and copied from one buffer, and every lend made recorded.
     struct Memory {
         bytes: &'static [u8],
         lent: Vec<u64>,
+        changing: Option<(ChangingRanges, Never)>,
+        /// The lending registry the kernel's lends go through, with the changing ranges in it.
+        registry: origin_frame::reserved::Lending,
+        /// A lend the registry refused is still made: the guard broken, for a test.
+        guard_broken: bool,
     }
 
     impl Memory {
@@ -709,8 +953,11 @@ mod tests {
 
     impl Firmware for Memory {
         fn lend(&mut self, addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
-            self.lent.push(addr);
             let bytes = self.range(addr, len)?;
+            // As `firmware::bytes`: through the lending registry (TASKS item 71).
+            if !self.registry.lend(addr, addr + len as u64) && !self.guard_broken {
+                return Err("refused by the lending registry");
+            }
             // As `firmware::bytes` refuses them (N3).
             if bytes
                 .get(..4)
@@ -718,14 +965,26 @@ mod tests {
             {
                 return Err("the firmware changes it after boot: copy it, never lend it");
             }
+            self.lent.push(addr);
             Ok(bytes)
         }
         fn copy(&mut self, addr: u64, out: &mut [u8]) -> Result<(), &'static str> {
             out.copy_from_slice(self.range(addr, out.len())?);
             Ok(())
         }
+        fn guards(&mut self, addr: u64, len: usize) -> bool {
+            // As `firmware::guards`: the registry's check, and the signature (N3).
+            !self.guard_broken
+                && (self.registry.guards(addr, addr + len as u64)
+                    || self
+                        .range(addr, 4)
+                        .is_ok_and(|s| CHANGES_AFTER_BOOT.iter().any(|c| s == *c)))
+        }
         fn now(&self) -> u64 {
             0
+        }
+        fn changing(&self) -> Option<(ChangingRanges, Never)> {
+            self.changing
         }
     }
 
@@ -741,13 +1000,265 @@ mod tests {
             last_line(&out).ends_with(
                 "4 tables: 4 checked, 0 refused, 0 reported, 0 of them where the kernel relies on \
                  it, 0 with only their headers checked, 0 not readable, 0 too large to judge, 0 null \
-                 XSDT entries; FADT true, DSDT true, FACS true; 0 us; consistent true"
+                 XSDT entries, 0 lends over what the firmware changes, 0 gaps in locating it; FADT \
+                 true, DSDT true, FACS true; 0 us; consistent true"
             ),
             "{out}"
         );
         assert!(out.contains("FACS version 2, 64 bytes: checked"), "{out}");
+        // TASKS item 71: what the first lookup located and recorded as never lent.
+        assert!(
+            out.contains(
+                "never lent, as the firmware changes them after boot: FACS \
+                 0x7f003000-0x7f00303f; 1 kept"
+            ),
+            "{out}"
+        );
+        // TASKS item 71: the PM timer's two forms, and the one the kernel's reader takes.
+        assert!(
+            out.contains(
+                "PM timer X_PM_TMR_BLK zero, PM_TMR_BLK port 0x608; the kernel's: port 0x608"
+            ),
+            "{out}"
+        );
         // The review's F2: the FACS is copied, never lent.
         assert!(!lent.contains(&FACS));
+        // TASKS item 71: the guard checked live, a lend at the FACS's start and middle refused.
+        assert!(
+            out.contains("1 kept; a lend over each refused: true"),
+            "{out}"
+        );
+        assert!(!lent.contains(&(FACS + 32)));
+    }
+
+    /// TASKS item 71: the census's live check of the guard. With it broken, the census counts
+    /// each lend the guard would make, three over each structure (its start, its middle, and
+    /// from before its start), over the one the first lookup recorded and the one it found
+    /// itself, and its verdict fails; and it lends none of them (the review's T71-7).
+    #[test]
+    fn a_lend_over_what_the_firmware_changes_fails_the_census() {
+        let mut m = Machine::new();
+        m.guard_broken = true;
+        let (ok, out, lent) = m.run();
+        assert!(!ok, "{out}");
+        assert!(
+            lent.iter().all(|&a| !(FACS - 8..FACS + 64).contains(&a)),
+            "{lent:x?}"
+        );
+        assert!(
+            out.contains(
+                "1 kept; a lend over each refused: false (not over the FACS at \
+                 0x7f003000-0x7f003023)"
+            ),
+            "{out}"
+        );
+        assert!(
+            last_line(&out).contains(", 6 lends over what the firmware changes, 0 gaps"),
+            "{out}"
+        );
+        assert!(last_line(&out).ends_with("consistent false: acpi tables failed"));
+    }
+
+    /// The review of TASKS item 71, T71-1 (c): the census tests the guard over the structures it
+    /// finds itself, not only over what the first lookup recorded. A first lookup that missed the
+    /// FACS (here it read the FADT's FACS pointer as zero, so named none) recorded nothing, with
+    /// no gap to report; the census finds the FACS, a lend into its middle and from before it is
+    /// not refused, and the verdict fails.
+    #[test]
+    fn the_census_tests_the_guard_over_what_it_finds_itself() {
+        let mut m = Machine::new();
+        m.locator_misreads_fadt = true;
+        let (ok, out, _) = m.run();
+        assert!(!ok, "{out}");
+        assert!(
+            out.contains(
+                "none named; 0 kept; a lend over each refused: false (not over the FACS at"
+            ),
+            "{out}"
+        );
+        assert!(
+            last_line(&out).contains(", 2 lends over what the firmware changes, 0 gaps"),
+            "{out}"
+        );
+    }
+
+    /// The review of TASKS item 71, T71-1 (b): each gap in what the first lookup recorded fails
+    /// the verdict, though nothing else does: a range lent before that overlaps the FACS; no room
+    /// left in the registry for it; and a structure that meets a table the kernel lends, here an
+    /// FBPT whose length would cover one, recorded up to it (the addendum review, T71-9).
+    #[test]
+    fn a_gap_in_what_was_located_fails_the_census() {
+        let mut m = Machine::new();
+        m.prepare = |l| {
+            l.never_lend(&[]);
+            assert!(l.lend(FACS + 8, FACS + 16));
+        };
+        let (ok, out, _) = m.run();
+        assert!(!ok, "{out}");
+        assert!(
+            out.contains("1 kept, one overlapping 0x7f003008-0x7f00300f, lent before"),
+            "{out}"
+        );
+        assert!(
+            last_line(&out).contains(", 1 gaps in locating it;"),
+            "{out}"
+        );
+
+        let mut m = Machine::new();
+        m.prepare = |l| {
+            let full: Vec<(u64, u64)> = (0..origin_frame::reserved::NEVER_SLOTS as u64)
+                .map(|i| (NOWHERE + i * 0x100, NOWHERE + i * 0x100 + 8))
+                .collect();
+            l.never_lend(&full);
+        };
+        let (ok, out, _) = m.run();
+        assert!(!ok, "{out}");
+        assert!(out.contains("0 kept, 1 not kept for want of room"), "{out}");
+        assert!(
+            last_line(&out).contains(", 1 gaps in locating it;"),
+            "{out}"
+        );
+
+        let pointer = |address: u64| {
+            let mut r = vec![0u8, 0, 16, 1, 0, 0, 0, 0];
+            r.extend_from_slice(&address.to_le_bytes());
+            r
+        };
+        let mut m = Machine::new();
+        let mut fbpt = b"FBPT".to_vec();
+        fbpt.extend_from_slice(&0x1100u32.to_le_bytes());
+        fbpt.extend_from_slice(&[2, 0, 48, 2]);
+        fbpt.extend_from_slice(&[0; 44]);
+        m.put(FPDT, &table(b"FPDT", 1, &pointer(FBPT)));
+        m.put(FBPT, &fbpt);
+        m.put(OEM, &table(b"OEMX", 1, &[]));
+        m.entries.extend([FPDT, OEM]);
+        let (ok, out, lent) = m.run();
+        assert!(!ok, "{out}");
+        assert!(
+            out.contains(
+                "FBPT 0x7f005000-0x7f005fff (declared to 0x7f0060ff, over 1 lent tables; cut at \
+                 0x7f006000-0x7f006023, lent); 2 kept; a lend over each refused: true"
+            ),
+            "{out}"
+        );
+        assert!(lent.contains(&OEM), "{lent:x?}");
+        assert!(
+            last_line(&out).contains(", 1 gaps in locating it;"),
+            "{out}"
+        );
+    }
+
+    /// The addendum review of TASKS item 71, T71-9 and its probe P4: a listed table whose
+    /// declared length runs over the FACS, from 0x80 bytes before it. The FACS is recorded at its
+    /// 64 bytes and the table reported; the census's lend of that table is refused and named, no
+    /// lend over the FACS is made, and the verdict fails.
+    #[test]
+    fn a_table_over_the_facs_is_refused_and_fails_the_census() {
+        let mut m = Machine::new();
+        // The table holds the FACS's bytes, and its checksum counts them: a valid table.
+        let mut oem = table(b"OEMX", 1, &[0u8; 0x100 - 36]);
+        let at = usize::try_from(FACS - BASE).unwrap();
+        oem[0x80..0xC0].copy_from_slice(&m.memory[at..at + 64]);
+        seal(&mut oem);
+        m.put(FACS - 0x80, &oem);
+        m.entries.push(FACS - 0x80);
+        let (ok, out, lent) = m.run();
+        assert!(!ok, "{out}");
+        assert!(
+            out.contains(
+                "FACS 0x7f003000-0x7f00303f (declared to 0x7f00303f, over 1 lent tables; its \
+                 least under 0x7f002f80-0x7f00307f, never lent); 1 kept; a lend over each \
+                 refused: true"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("an XSDT entry: not readable: refused by the lending registry"),
+            "{out}"
+        );
+        assert!(!lent.contains(&(FACS - 0x80)), "{lent:x?}");
+        assert!(
+            lent.iter().all(|&a| !(FACS - 0x80..FACS + 64).contains(&a)),
+            "{lent:x?}"
+        );
+        assert!(
+            last_line(&out).contains(", 1 not readable,") && last_line(&out).contains(", 1 gaps"),
+            "{out}"
+        );
+    }
+
+    /// A machine whose XSDT lists `n` FPDTs, each pointing to an FBPT of its own, before the FADT.
+    fn fpdts_before_the_fadt(n: u64) -> Machine {
+        let pointer = |address: u64| {
+            let mut r = vec![0u8, 0, 16, 1, 0, 0, 0, 0];
+            r.extend_from_slice(&address.to_le_bytes());
+            r
+        };
+        let fbpt = {
+            let mut t = b"FBPT".to_vec();
+            t.extend_from_slice(&56u32.to_le_bytes());
+            t.extend_from_slice(&[2, 0, 48, 2]);
+            t.extend_from_slice(&[0; 44]);
+            t
+        };
+        let mut m = Machine::new();
+        let mut entries = Vec::new();
+        for i in 0..n {
+            let (fpdt, target) = (FPDT + 0x100 * i, FBPT + 0x100 * i);
+            m.put(fpdt, &table(b"FPDT", 1, &pointer(target)));
+            m.put(target, &fbpt);
+            entries.push(fpdt);
+        }
+        entries.push(FADT);
+        m.entries = entries;
+        m
+    }
+
+    /// The review of TASKS item 71, probe P1: an XSDT that lists three FPDTs before the FADT. The
+    /// FACS is still located, recorded first and guarded; and the later FPDTs' FBPTs are recorded
+    /// too (its addendum review, T71-11).
+    #[test]
+    fn three_fpdts_before_the_fadt_leave_the_facs_guarded() {
+        let (ok, out, lent) = fpdts_before_the_fadt(3).run();
+        assert!(ok, "{out}");
+        assert!(
+            out.contains(
+                "never lent, as the firmware changes them after boot: FACS 0x7f003000-0x7f00303f, \
+                 FBPT 0x7f005000-0x7f005037, FBPT 0x7f005100-0x7f005137, FBPT \
+                 0x7f005200-0x7f005237; 4 kept; a lend over each refused: true"
+            ),
+            "{out}"
+        );
+        assert!(
+            lent.iter().all(|&a| !(FACS..FACS + 64).contains(&a)),
+            "{lent:x?}"
+        );
+    }
+
+    /// The addendum review of TASKS item 71, T71-11: eight FPDTs before the FADT name nine
+    /// structures with the FACS, one more than the registry has slots for. The FACS and the first
+    /// FPDT's FBPT are recorded first; the last FBPT found has no slot, which is a gap, and the
+    /// verdict fails.
+    #[test]
+    fn a_structure_with_no_slot_left_fails_the_census() {
+        let (ok, out, _) = fpdts_before_the_fadt(8).run();
+        assert!(!ok, "{out}");
+        assert!(
+            out.contains(
+                "never lent, as the firmware changes them after boot: FACS 0x7f003000-0x7f00303f, \
+                 FBPT 0x7f005000-0x7f005037, FBPT 0x7f005100-0x7f005137"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("FBPT 0x7f005600-0x7f005637; 8 kept, 1 found with no slot left;"),
+            "{out}"
+        );
+        assert!(
+            last_line(&out).contains(", 1 gaps in locating it;"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -767,7 +1278,7 @@ mod tests {
         let (ok, out, _) = m.run();
         assert!(ok, "{out}");
         assert!(out.contains("XSDT entry 0: null, names no table"), "{out}");
-        assert!(last_line(&out).contains(", 1 null XSDT entries;"), "{out}");
+        assert!(last_line(&out).contains(", 1 null XSDT entries,"), "{out}");
     }
 
     #[test]

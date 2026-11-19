@@ -382,7 +382,8 @@ fn prove_pm_timer(com1: &mut Console, rsdp: u64, scale: Scale) -> bool {
         return true;
     };
     let mask: u32 = if wide { 0xFFFF_FFFF } else { 0x00FF_FFFF };
-    // The FADT's PM_TMR_BLK: a read-only 32-bit timer port. A first claim of it succeeds.
+    // The PM timer's port as the FADT names it (`X_PM_TMR_BLK` or `PM_TMR_BLK`, chosen by
+    // `acpi::parse_fadt`): a read-only 32-bit timer port. A first claim of it succeeds.
     let Some(timer) = origin_frame::port::PortRange::claim(port, 4) else {
         let _ = writeln!(
             com1,
