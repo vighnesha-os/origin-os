@@ -241,7 +241,9 @@ pub enum Report<'a> {
         /// Where the load went on: the statement's end.
         resumed: crate::At,
     },
-    /// A block byte-identical to loaded table `table` was refused, nothing of it created.
+    /// A block with the signature, OEM ID, OEM table ID and term list of loaded table `table`
+    /// was refused, nothing of it created. The revision, OEM revision and creator are not
+    /// compared: a boot load hands the interpreter no header (the review of B5, B5-R7).
     AlreadyLoaded {
         /// The table already loaded.
         table: u32,
