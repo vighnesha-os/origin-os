@@ -29,6 +29,8 @@ use crate::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
     TSS, TSS_SIZE,
 };
+use origin_sync::contexts::{Contexts, Refused};
+
 use crate::percpu::PerCpu;
 use crate::trap::Switch;
 
@@ -733,7 +735,8 @@ pub fn set_kernel_stack(stack: &crate::stack::GuardedStack) {
     }
     let field = ptr::with_exposed_provenance_mut::<u32>(tss as usize + d::TSS_RSP0_OFFSET);
     if let Some(l) = CPU_LOCAL.get(local) {
-        l.kernel_stack.store(top, Ordering::Relaxed);
+        // Release, read with Acquire by `stack_in_use` (TASKS item 70, Q2).
+        l.kernel_stack.store(top, Ordering::Release);
     }
     // SAFETY: `tss` is this processor's TSS (recorded by `init_cpu_local`), live for ever
     // and written only by this processor; RSP0 is two `u32` words at byte 4, 4-aligned.
@@ -746,84 +749,106 @@ pub fn set_kernel_stack(stack: &crate::stack::GuardedStack) {
 /// boot or idle flow): nothing is on any freed stack's account (`stack_in_use`).
 pub fn clear_kernel_stack() {
     if let Some(l) = CPU_LOCAL.get(this_cpu().0) {
-        l.kernel_stack.store(0, Ordering::Relaxed);
+        l.kernel_stack.store(0, Ordering::Release);
     }
 }
 
-/// How many thread frames one processor can have saved at once: the run queue's capacity
-/// (`RunQueue` holds 16 contexts) and some.
-pub(crate) const SAVED_FRAME_SLOTS: usize = 32;
-/// Each processor's saved thread frames: addresses the trap entry saved (a thread preempted,
-/// yielding, sleeping or blocked) or a new thread's first frame. Only these are ever
-/// resumed, so a wrong answer from the scheduler above cannot make the trap entry load anything
-/// else. 0 is an empty slot.
-pub(crate) static SAVED_FRAMES: PerCpu<[AtomicU64; SAVED_FRAME_SLOTS]> = PerCpu::new(
-    "origin_frame::cpu::SAVED_FRAMES",
-    [const { AtomicU64::new(0) }; SAVED_FRAME_SLOTS],
-    || [const { AtomicU64::new(0) }; SAVED_FRAME_SLOTS],
+/// Each processor's contexts (TASKS item 70): for each thread published to it, and its boot or
+/// idle flow, the context's own stack (its home) and the frame the trap entry may resume. Only
+/// a frame recorded here is ever resumed, so a wrong answer from the scheduler above cannot make
+/// the trap entry load anything else. A context's home stays recorded from its publication until
+/// its processor has left its stack after it ended, and no switch writes it, so a stack a
+/// context may still use is always in this table for any processor's `stack_in_use`.
+///
+/// It replaces `SAVED_FRAMES`, whose 32 slots held only suspended threads' frames. A slot is now
+/// held from a thread's publication until it has ended and its processor has left its stack, so
+/// the capacity is counted again (the coordinating session's ruling (a) on TASKS item 70): a
+/// processor has at most one context per slot of its run queue, whose 16
+/// (`runqueue::CAPACITY`) include the boot or idle flow's, plus at most one that has ended and is
+/// not yet retired, 17 of `origin_sync::contexts::SLOTS`' 32. The kernel checks that at compile
+/// time (`sched.rs`). A full table refuses a publication ([`publish_context`], so the kernel
+/// refuses the spawn), and refuses a boot or idle flow's first switch-out, which halts.
+pub(crate) static CONTEXTS: PerCpu<Contexts> = PerCpu::new(
+    "origin_frame::cpu::CONTEXTS",
+    Contexts::new(),
+    Contexts::new,
 );
 
-/// Records `frame` as a saved frame of processor `cpu`: a thread's first frame, or one the
-/// trap entry saved. `false` if the table is full (it cannot be: see the slot count).
-pub(crate) fn record_saved_frame(cpu: CpuIndex, frame: u64) -> bool {
-    SAVED_FRAMES.get(cpu.get()).is_some_and(|table| {
-        table.iter().any(|slot| {
-            slot.compare_exchange(0, frame, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        })
-    })
+/// Records a new thread on processor `cpu`, whose first frame is `frame`, on its own stack: the
+/// frame becomes its home and the frame to resume. `false` if the table is full or `cpu` has
+/// none.
+pub(crate) fn publish_context(cpu: CpuIndex, frame: u64) -> bool {
+    CONTEXTS
+        .get(cpu.get())
+        .is_some_and(|table| table.publish(frame))
 }
 
-/// Consumes `frame` from this processor's saved frames; `false` if it is not one of them.
-fn take_saved_frame(frame: u64) -> bool {
-    let me = this_cpu().get();
-    SAVED_FRAMES.get(me).is_some_and(|table| {
-        table.iter().any(|slot| {
-            slot.compare_exchange(frame, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        })
-    })
+/// This processor's stack pointer.
+fn stack_pointer() -> u64 {
+    let rsp: u64;
+    // SAFETY: reads the stack pointer; no memory, no stack, flags preserved.
+    unsafe { asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
+    rsp
+}
+
+/// Whether this processor runs on the kernel stack holding `address`: the stack pointer is in
+/// the same slot of the stack region. The check a retirement makes (`Contexts::retire_ended`).
+fn running_on(address: u64) -> bool {
+    let slot = crate::stack::slot_holding(address);
+    slot.is_some() && slot == crate::stack::slot_holding(stack_pointer())
 }
 
 /// What the trap entry resumes after a scheduler upcall: `next`, the frame the scheduler
-/// answered for the interrupted context at `here`. Unless they are the same, `next` must be one
-/// of the frames this processor saved (the scheduler can name no other), and `here` becomes
-/// one, unless the interrupted thread is ending (`exiting`).
+/// answered for the interrupted context at `here` (`Contexts::switch`). Unless they are the same,
+/// `next` must be a frame this processor saved, and the context at `here` saves it as its frame,
+/// unless it is ending (`exiting`). No address is printed (ADR-0004 Amendment 2, A6.2): a frame
+/// is told as an offset in its window.
 fn resume(here: u64, next: u64, exiting: bool) -> u64 {
-    if next == here {
-        return here;
+    let me = this_cpu();
+    let outcome = CONTEXTS
+        .get(me.get())
+        .map_or(Err(Refused::NeverSaved), |table| {
+            table.switch(here, next, exiting, running_on)
+        });
+    match outcome {
+        Ok(frame) => frame,
+        Err(Refused::NeverSaved) => panic!(
+            "the scheduler returned a frame {} never saved: {}",
+            me.named(),
+            crate::phys::told(next)
+        ),
+        Err(Refused::Full) => panic!("too many saved thread frames on this processor"),
+        Err(Refused::StillOnIt) => {
+            panic!("an ended thread's stack was to be retired while this processor still ran on it")
+        }
     }
-    if !take_saved_frame(next) {
-        panic!("the scheduler returned a frame the kernel never saved: {next:#x}");
-    }
-    if !exiting && !record_saved_frame(this_cpu(), here) {
-        panic!("too many saved thread frames on this processor");
-    }
-    next
 }
 
-/// Whether a processor is using the kernel stack `[start, end)`: it is some processor's current
-/// kernel stack, or a saved thread frame is on it. Only a stack that no processor is using
-/// can be freed.
+/// Whether a processor may be using the kernel stack `[start, end)`, whose top is `top`: the
+/// caller's own stack pointer is on it, a processor's kernel-stack record names it, or a
+/// context's home or saved frame is on it (TASKS item 70). Only a stack in none of them can be
+/// freed. It never waits and takes no lock.
+///
+/// It first retires this processor's own ended context, if any: this processor has left that
+/// stack, since any code it runs after the exit's switch runs on another context's stack
+/// (`Contexts::retire_ended`). So a stack reaped here before this processor's next switch is
+/// given back, not leaked.
 pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
     let used = |value: u64| value >= start && value < end;
-    let here = {
-        let rsp: u64;
-        // SAFETY: reads the stack pointer; no memory, no stack, flags preserved.
-        unsafe { asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
-        rsp
-    };
-    used(here)
+    if tables_ready()
+        && let Some(table) = CONTEXTS.get(this_cpu().get())
+        && table.retire_ended(running_on) == Err(Refused::StillOnIt)
+    {
+        panic!("an ended thread's stack was to be retired while this processor still ran on it");
+    }
+    used(stack_pointer())
         // `kernel_stack` holds the top of the stack the processor runs on: this stack's top is
         // one past its end, so compare it exactly (another stack's top can equal our guard
-        // page's address).
+        // page's address). Acquire, with `set_kernel_stack`'s Release.
         || CPU_LOCAL
             .iter()
-            .any(|l| l.kernel_stack.load(Ordering::Relaxed) == top)
-        || SAVED_FRAMES
-            .iter()
-            .flatten()
-            .any(|f| used(f.load(Ordering::Acquire)))
+            .any(|l| l.kernel_stack.load(Ordering::Acquire) == top)
+        || CONTEXTS.iter().any(|table| table.covers(start, end))
 }
 
 /// This processor's CPU index: one GS-relative load from its CPU-local area. On a
@@ -1750,8 +1775,10 @@ const COMPLETED: u64 = u64::MAX;
 /// probe returns [`COMPLETED`]. It is writable data, so it must never be executable.
 static mut PROBE_CODE: [u8; 8] = PROBE_RETURN;
 
-/// What a probe access did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a probe access did. Its `Debug` tells a faulting address as an offset in its window,
+/// since a guard probe's is in the kernel stacks' region (ADR-0004 Amendment 2, A6.2; TASKS item
+/// 70, Q8).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Probe {
     /// The access completed: the page allowed it.
     Completed,
@@ -1764,6 +1791,20 @@ pub enum Probe {
     },
     /// The address is in a window of device memory: not read.
     Refused,
+}
+
+impl core::fmt::Debug for Probe {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::Completed => f.write_str("Completed"),
+            Self::Faulted { error, address } => f
+                .debug_struct("Faulted")
+                .field("error", &error)
+                .field("address", &format_args!("{}", crate::phys::told(address)))
+                .finish(),
+            Self::Refused => f.write_str("Refused"),
+        }
+    }
 }
 
 /// Arms the probe for a fault at `fault_rip`, runs `access`, and disarms it.

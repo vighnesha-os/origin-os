@@ -35,6 +35,14 @@ use origin_frame::trap::Switch;
 /// Each kernel thread's stack.
 pub(crate) const THREAD_STACK: usize = 16 * 1024;
 
+// A processor's table of contexts (`origin_frame::sync::contexts`, TASKS item 70) holds one per
+// run-queue slot, the boot or idle flow's among them, and one ended and not yet retired: the
+// queue's capacity must be less than the table's.
+const _: () = assert!(
+    crate::runqueue::CAPACITY < origin_frame::sync::contexts::SLOTS,
+    "every context of a full run queue, and one ended, fits a processor's table"
+);
+
 /// Each processor's run queue, by CPU index (ADR-0008 Amendment 1, D1: sized at discovery).
 pub(crate) static QUEUES: PerCpu<SpinLock<RunQueue>> = PerCpu::new(
     "framekernel::sched::QUEUES",
