@@ -470,6 +470,55 @@ fn a_boot_tables_local_abandons_its_statement() {
     assert!(exists(&i, "\\AFT"));
 }
 
+#[test]
+fn a_skip_whose_work_list_reaches_the_memory_limit_fails_the_table_whole() {
+    // The skip's work list is a vector charged to the memory limit and given back after each skip
+    // (B5's contract, corrected; the coordinating session's ruling on the hand-over's point 4). A
+    // statement nested deep enough that its list cannot be held fails the table whole, as a limit,
+    // and leaves nothing held. `Store (Add (UNDF, Add (UNDF, … , Zero), Zero), X)`: the decoder
+    // fails at the first `UNDF`, two levels down; the skip steps over all 20,000 levels, a level
+    // of the work list each, more than 256 KiB can hold.
+    let mut e = add(nm("UNDF"), zero(), zero());
+    for _ in 0..20_000 {
+        e = add(nm("UNDF"), e, zero());
+    }
+    let body = [name("X", zero()), store(e, nm("X")), name("AFT", one())];
+    let mut i = interp_with(
+        IntegerWidth::Bits64,
+        Limits {
+            memory_bytes: 1 << 18,
+            ..Limits::SERVICE
+        },
+    );
+    i.settle_memory();
+    let before = i.memory_used();
+    assert_eq!(
+        load(&mut i, &body).map_err(|e| e.kind),
+        Err(ErrorKind::Limit(crate::Limit::Memory))
+    );
+    assert!(!exists(&i, "\\X") && !exists(&i, "\\AFT"));
+    assert!(i.table(0).unwrap().failed);
+    assert_eq!(told(&mut i), vec![], "the skip failed before its report");
+    at_rest(&i);
+    i.settle_memory();
+    assert!(
+        i.memory_used() < before + 1024,
+        "{} bytes held after, {before} before",
+        i.memory_used()
+    );
+    // With room, the same table loads and the statement is abandoned.
+    let mut j = fresh();
+    assert_eq!(load(&mut j, &body), Ok(0));
+    assert!(matches!(
+        told(&mut j).as_slice(),
+        [Told::Abandoned {
+            kind: ErrorKind::NotFound,
+            ..
+        }]
+    ));
+    assert!(exists(&j, "\\AFT"));
+}
+
 // --- Names in load-time packages -------------------------------------------------------------
 
 #[test]

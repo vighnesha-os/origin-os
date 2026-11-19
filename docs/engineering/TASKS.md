@@ -1635,7 +1635,13 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
   - `cargo xtask check`: 2,371 tests passed, none failed, 29 ignored; Loom's 56 models and 83 negative controls; the no-panic check at 204 symbols of `origin-aml`'s own; the allocation gate over 21 library files, `tolerate.rs` among them;
   - `boot-test` 11 of 11; `boot-matrix` 193 scenarios, none failed, the AML proof passing on all 31 kernel boots with no tolerance reported (the discovery machine: 232 ms to load, 129 ms to walk).
 - **TASKS item 72's harness on B5**, outside the repository (item 232), rental A's tables under both stubs: `UAR1` and `UAR2` `_STA` succeed (0x0D with every read zero; 0, absent, with every read all ones, as the firmware's own code gives for that register), `\M652` reads, and there is no failure and no report; before step B5, five failures.
-- **For the coordinating session** (in the hand-over): a buffer longer than its field is still written in pieces (Table 19.7), where ledger 64 says ACPICA cuts it, G15's ruling covering strings only; a boot table's locals as `OutsideMethod`, an extension of Q2's ruling; Q3's identity is the interpreter's (signature, IDs, term list), not the whole header; the skip's work list is charged to the memory limit and released, where the contract said nothing new is allocated per statement.
+- **The hand-over's five points, ruled by the coordinating session on 2026-11-19:**
+  1. A buffer longer than its field: ruled to be cut, unless Table 19.7 requires the pieces. It does (the Buffer to Field Unit row), so the point went back for a new ruling, and nothing was built.
+  2. A boot table's locals and arguments give `OutsideMethod`: confirmed, recorded in the ledger §9 as this session's extension of Q2.
+  3. Q3's identity (signature, OEM IDs, term list): confirmed, with the stated limit that tables differing only in revision, OEM revision or creator count as the same.
+  4. The contract's §5 sentence corrected: the skip's work list is a vector charged to the memory limit and released after each skip; `a_skip_whose_work_list_reaches_the_memory_limit_fails_the_table_whole` shows one at the limit failing the table whole and freeing everything.
+  5. A table that loads itself is refused at its own load: confirmed; the call-depth bound on loads is shown by `a_chain_of_loads_is_bounded_by_the_call_depth` and `nested_loads_run_on_a_fixed_native_stack`.
+- **`main` merged** at `2d0187c0` (PR 41, the sixth batch) into the branch at `6b4c5e09`, cleanly.
 - **Not covered:** the similarity check owed before B5's code reaches `main` (decision item 121; a session that writes no code, with the owner's permission and sign-off); `_INI` and `_REG` after a run-time load (G17, the ACPI service's); no boot runs a run-time load; real firmware run only outside the repository (TASKS item 72's harness; item 232).
 
 

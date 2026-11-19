@@ -593,6 +593,38 @@ fn a_limit_inside_a_loaded_table_ends_the_evaluation_and_rolls_it_back() {
 }
 
 #[test]
+fn a_chain_of_loads_is_bounded_by_the_call_depth() {
+    // Each load is a level of the call depth: twelve distinct tables, each loading the next, under
+    // a depth of 8 (the coordinating session's ruling on the hand-over's point 5: a table that
+    // loads itself is refused as already loaded, so the bound is shown by a chain).
+    let mut body = vec![m("LD", &[ret(load_op("TB01", none()))])];
+    for k in 1..=12u32 {
+        let mut t = vec![name(&format!("Q{k:03}"), one())];
+        if k < 12 {
+            t.push(load_op(&format!("\\TB{:02}", k + 1), none()));
+        }
+        body.push(name(&format!("TB{k:02}"), buffer_of(&ssdt(&t))));
+    }
+    let mut i = interp_with(
+        IntegerWidth::Bits64,
+        Limits {
+            call_depth: 8,
+            ..Limits::SERVICE
+        },
+    );
+    load(&mut i, &body).unwrap();
+    let nodes = i.node_count();
+    assert_eq!(fails(&mut i, "LD"), ErrorKind::Limit(Limit::Depth));
+    assert_eq!(
+        i.node_count(),
+        nodes,
+        "every table in the chain rolled back"
+    );
+    assert_eq!(named(&i, b"Q0"), 0);
+    at_rest(&i);
+}
+
+#[test]
 fn a_table_that_loads_itself_is_bounded_by_the_call_depth() {
     // Its first term loads it again. Since step B5 that load is of a table already loaded (the
     // one loading), refused and reported, and the table loads; a load is still a level of the
