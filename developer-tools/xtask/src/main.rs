@@ -3693,6 +3693,9 @@ fn entry_settings(command: &str, settings: Settings) -> Result<Settings> {
 
 /// `boot-matrix` and its ten scenario commands: each sets every machine's topology, bridge,
 /// reserved memory and ACPI tables itself (the coordinating session's ruling R5 of 2026-11-19).
+/// The list is of names, so a new scenario command of `boot-matrix`'s belongs here, by hand; the
+/// host test `each_kind_of_command_takes_or_refuses_the_person_s_machine_at_entry` holds these
+/// eleven.
 const SETS_ITS_MACHINES: [&str; 11] = [
     "boot-matrix",
     "boot-x2apic",
