@@ -36,8 +36,6 @@
 //! [`RunQueue::preempt_for_wake`]: it charges nothing, and switches only if a thread woken
 //! since the last choice should run now.
 
-use origin_frame::apic::TimerProgramming;
-
 /// Contexts one queue holds, its boot context included.
 pub const CAPACITY: usize = 16;
 /// The pass a weight-1 context advances per quantum.
@@ -181,9 +179,24 @@ pub struct TickWatch {
     pub longest: u64,
     /// The TSC at the [`PREEMPTION_ROUNDS`]th tick, 0 until then.
     pub at_rounds: u64,
-    /// The timer's programming as this processor read it back at its first tick; `None` before
-    /// it, or if it could not be read.
-    pub programmed: Option<TimerProgramming>,
+    /// The timer's programming as this processor read it back at its first tick, against the
+    /// programming the tick proof timed.
+    pub read_back: ReadBack,
+}
+
+/// A processor's timer as read back at its first watched tick, against the initial count, divide
+/// configuration and LVT entry the boot processor's timed proof ran with
+/// (`origin_frame::apic::TimerProgramming::first_difference` compares them). Plain values, so
+/// that this file also builds in `origin-sync`'s Loom models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadBack {
+    /// Not read yet, or its registers could not be read.
+    Unread,
+    /// Programmed as timed.
+    AsTimed,
+    /// Programmed otherwise: the first register that differs, by name, with the value read and
+    /// the value timed.
+    Otherwise(&'static str, u64, u64),
 }
 
 impl TickWatch {
@@ -197,7 +210,7 @@ impl TickWatch {
             ticks: 0,
             longest: 0,
             at_rounds: 0,
-            programmed: None,
+            read_back: ReadBack::Unread,
         }
     }
 
@@ -218,9 +231,9 @@ impl TickWatch {
     }
 
     /// Notes the timer's programming as read back on its processor.
-    pub fn note_programming(&mut self, programmed: Option<TimerProgramming>) {
+    pub fn note_read_back(&mut self, read_back: ReadBack) {
         if self.armed {
-            self.programmed = programmed;
+            self.read_back = read_back;
         }
     }
 
@@ -265,28 +278,21 @@ pub enum WindowVerdict {
 }
 
 /// Judges one processor's [`TickWatch`] over a run: it should have taken `wanted` ticks, with its
-/// timer programmed as `expected` (the initial count, divide configuration and LVT entry the
-/// boot processor's timed proof ran with), and its [`PREEMPTION_ROUNDS`]th tick within `bound` TSC
-/// ticks of the start (today's bound: 15 rounds in 500 ms). Only [`WindowVerdict::InBounds`]
-/// passes.
+/// timer read back as programmed the way the boot processor's timed proof ran it
+/// ([`ReadBack::AsTimed`]), and its [`PREEMPTION_ROUNDS`]th tick within `bound` TSC ticks of the
+/// start (today's bound: 15 rounds in 500 ms). Only [`WindowVerdict::InBounds`] passes.
 ///
 /// The rate is checked by the programming, not by the gaps' spread: under QEMU's software
 /// processor the ticks' delivery jitters, so that a third or more of the gaps of a correct
 /// timer fall under 95 % of the period even on a quiet two-processor machine (TASKS item 66's
 /// diagnostic boots), and a median of gaps cannot be a verdict there.
-pub fn judge_window(
-    watch: &TickWatch,
-    wanted: u64,
-    bound: u64,
-    expected: TimerProgramming,
-) -> WindowVerdict {
-    let misprogrammed = matches!(watch.programmed, Some(p) if p != expected);
-    if misprogrammed {
+pub fn judge_window(watch: &TickWatch, wanted: u64, bound: u64) -> WindowVerdict {
+    if matches!(watch.read_back, ReadBack::Otherwise(..)) {
         // Named first, whatever else the run shows: a timer left in one-shot mode ticks once.
         WindowVerdict::WrongRate
     } else if watch.ticks < wanted || watch.ticks < PREEMPTION_ROUNDS {
         WindowVerdict::Short
-    } else if watch.programmed.is_none() {
+    } else if watch.read_back == ReadBack::Unread {
         WindowVerdict::WrongRate
     } else if watch.at_rounds.saturating_sub(watch.start) <= bound {
         WindowVerdict::InBounds
@@ -381,10 +387,10 @@ impl RunQueue {
     }
 
     /// Notes a tick taken at TSC `now`, if the ticks are being watched; at the first, also the
-    /// timer's programming as `programmed` reads it back on this processor.
-    pub fn note_tick(&mut self, now: u64, programmed: impl FnOnce() -> Option<TimerProgramming>) {
+    /// timer's programming as `read_back` reads it back on this processor.
+    pub fn note_tick(&mut self, now: u64, read_back: impl FnOnce() -> ReadBack) {
         if self.watch.first_tick() {
-            self.watch.note_programming(programmed());
+            self.watch.note_read_back(read_back());
         }
         self.watch.note(now);
     }
@@ -686,22 +692,15 @@ impl RunQueue {
 mod tests {
     use super::*;
 
-    /// The programming the tests' boot processor ran with.
-    const PROGRAMMED: TimerProgramming = TimerProgramming {
-        initial: 625_000,
-        divide: 0b0011,
-        lvt: (1 << 17) | 0x40,
-    };
-
     /// A watch over ticks at the given gaps, from TSC 0, with a 10 ms period on a 1 GHz TSC,
-    /// its timer read back as `programmed` at the first tick.
-    fn watched_as(gaps: &[u64], programmed: Option<TimerProgramming>) -> TickWatch {
+    /// its timer read back as `read_back` at the first tick.
+    fn watched_as(gaps: &[u64], read_back: ReadBack) -> TickWatch {
         let mut w = TickWatch::armed(0, 10_000_000);
         let mut at = 0;
         for &gap in gaps {
             at += gap;
             if w.first_tick() {
-                w.note_programming(programmed);
+                w.note_read_back(read_back);
             }
             w.note(at);
         }
@@ -709,7 +708,7 @@ mod tests {
     }
 
     fn watched(gaps: &[u64]) -> TickWatch {
-        watched_as(gaps, Some(PROGRAMMED))
+        watched_as(gaps, ReadBack::AsTimed)
     }
 
     const P: u64 = 10_000_000;
@@ -719,80 +718,54 @@ mod tests {
     fn a_window_at_the_programmed_rate_is_in_bounds() {
         let w = watched(&[P; 50]);
         assert_eq!((w.ticks, w.longest, w.at_rounds), (50, P, 15 * P));
-        assert_eq!(
-            judge_window(&w, 50, HALF_SECOND, PROGRAMMED),
-            WindowVerdict::InBounds
-        );
+        assert_eq!(judge_window(&w, 50, HALF_SECOND), WindowVerdict::InBounds);
         // Jitter in the ticks' delivery changes nothing: a third of the gaps short, a third long.
         let jittery: alloc::vec::Vec<u64> = (0..50)
             .map(|i| [P * 7 / 10, P, P * 13 / 10][i % 3])
             .collect();
         assert_eq!(
-            judge_window(&watched(&jittery), 50, HALF_SECOND, PROGRAMMED),
+            judge_window(&watched(&jittery), 50, HALF_SECOND),
             WindowVerdict::InBounds
         );
         // A watch that is not armed notes nothing, and reads nothing.
         let mut idle = TickWatch::new();
         idle.note(5);
-        idle.note_programming(Some(PROGRAMMED));
-        assert_eq!((idle.ticks, idle.programmed), (0, None));
+        idle.note_read_back(ReadBack::AsTimed);
+        assert_eq!((idle.ticks, idle.read_back), (0, ReadBack::Unread));
     }
 
     #[test]
     fn a_timer_programmed_otherwise_fails_at_once() {
-        // The review's T66-R1: divide-by-128 for 16, another count from the one timed, a timer
-        // left in one-shot mode or masked.
+        // The review's T66-R1: any register read back otherwise than timed (which ones differ is
+        // `origin_frame::apic`'s tests'): divide-by-128 for 16, another count, a timer left in
+        // one-shot mode or masked.
         let wrongs = [
-            TimerProgramming {
-                divide: 0b1010,
-                ..PROGRAMMED
-            },
-            TimerProgramming {
-                initial: 5_000_000,
-                ..PROGRAMMED
-            },
-            TimerProgramming {
-                initial: 0,
-                ..PROGRAMMED
-            },
-            TimerProgramming {
-                lvt: 0x40,
-                ..PROGRAMMED
-            },
-            TimerProgramming {
-                lvt: PROGRAMMED.lvt | (1 << 16),
-                ..PROGRAMMED
-            },
+            ReadBack::Otherwise("divide configuration", 0b1010, 0b0011),
+            ReadBack::Otherwise("initial count", 5_000_000, 625_000),
+            ReadBack::Otherwise("initial count", 0, 625_000),
+            ReadBack::Otherwise("LVT entry", 0x40, (1 << 17) | 0x40),
+            ReadBack::Otherwise("LVT entry", (1 << 17) | (1 << 16) | 0x40, (1 << 17) | 0x40),
         ];
         for wrong in wrongs {
-            let w = watched_as(&[P; 50], Some(wrong));
-            assert_eq!(
-                judge_window(&w, 50, HALF_SECOND, PROGRAMMED),
-                WindowVerdict::WrongRate
-            );
+            let w = watched_as(&[P; 50], wrong);
+            assert_eq!(judge_window(&w, 50, HALF_SECOND), WindowVerdict::WrongRate);
         }
         // A misprogrammed timer is named even when it also stops ticking, as one in one-shot mode
         // does after its first.
         let once = watched_as(
             &[P],
-            Some(TimerProgramming {
-                lvt: 0x40,
-                ..PROGRAMMED
-            }),
+            ReadBack::Otherwise("LVT entry", 0x40, (1 << 17) | 0x40),
         );
         assert_eq!(
-            judge_window(&once, 50, HALF_SECOND, PROGRAMMED),
+            judge_window(&once, 50, HALF_SECOND),
             WindowVerdict::WrongRate
         );
         // Not read back at all.
-        let w = watched_as(&[P; 50], None);
-        assert_eq!(
-            judge_window(&w, 50, HALF_SECOND, PROGRAMMED),
-            WindowVerdict::WrongRate
-        );
+        let w = watched_as(&[P; 50], ReadBack::Unread);
+        assert_eq!(judge_window(&w, 50, HALF_SECOND), WindowVerdict::WrongRate);
         // Read at the first tick only: a later change of the register is not this check's.
         let mut w = TickWatch::armed(0, P);
-        w.note_programming(Some(PROGRAMMED));
+        w.note_read_back(ReadBack::AsTimed);
         w.note(P);
         assert!(!w.first_tick());
     }
@@ -803,40 +776,31 @@ mod tests {
         let mut gaps = [P; 50];
         gaps[5] = 400_000_000;
         let w = watched(&gaps);
-        assert_eq!(
-            judge_window(&w, 50, HALF_SECOND, PROGRAMMED),
-            WindowVerdict::Stalled
-        );
+        assert_eq!(judge_window(&w, 50, HALF_SECOND), WindowVerdict::Stalled);
         // The same stall after the 15th tick changes nothing: today's bound was met.
         let mut later = [P; 50];
         later[20] = 400_000_000;
         assert_eq!(
-            judge_window(&watched(&later), 50, HALF_SECOND, PROGRAMMED),
+            judge_window(&watched(&later), 50, HALF_SECOND),
             WindowVerdict::InBounds
         );
         // Late with no gap of two periods: no stall to blame, so it fails.
         let late = watched(&[P * 19 / 10; 50]);
-        assert_eq!(
-            judge_window(&late, 50, P * 15, PROGRAMMED),
-            WindowVerdict::Late
-        );
+        assert_eq!(judge_window(&late, 50, P * 15), WindowVerdict::Late);
         // Slow enough for every gap to be two periods: stalled in every run, so it fails at the
         // proof's last run (the kernel's budget of runs), never passing.
         let slow = watched(&[8 * P; 50]);
-        assert_eq!(
-            judge_window(&slow, 50, HALF_SECOND, PROGRAMMED),
-            WindowVerdict::Stalled
-        );
+        assert_eq!(judge_window(&slow, 50, HALF_SECOND), WindowVerdict::Stalled);
     }
 
     #[test]
     fn a_processor_short_of_its_ticks_fails() {
         assert_eq!(
-            judge_window(&watched(&[P; 49]), 50, HALF_SECOND, PROGRAMMED),
+            judge_window(&watched(&[P; 49]), 50, HALF_SECOND),
             WindowVerdict::Short
         );
         assert_eq!(
-            judge_window(&watched(&[]), 50, HALF_SECOND, PROGRAMMED),
+            judge_window(&watched(&[]), 50, HALF_SECOND),
             WindowVerdict::Short
         );
     }

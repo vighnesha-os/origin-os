@@ -21,8 +21,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bootproof::{Proof, Tally};
 use crate::runqueue::{
-    PREEMPTION_ROUNDS, QueueError, RunQueue, TickWatch, WindowVerdict, judge_window, per_mille,
-    share_near_weight,
+    PREEMPTION_ROUNDS, QueueError, ReadBack, RunQueue, TickWatch, WindowVerdict, judge_window,
+    per_mille, share_near_weight,
 };
 
 use crate::console::Console;
@@ -65,10 +65,22 @@ pub(crate) fn on_tick(interrupted: u64, switch: &Switch) -> u64 {
     with_queue(interrupted, switch, |q| {
         // The preemption proof's watch (TASKS item 66): the TSC only while it is armed.
         if q.watching() {
-            q.note_tick(rdtsc(), timer::programmed);
+            q.note_tick(rdtsc(), timer_read_back);
         }
         Some(q.tick(interrupted))
     })
+}
+
+/// This processor's timer, read back and compared with what the boot processor's timed proof
+/// ran (TASKS item 66, ruling A on the review's T66-R1).
+fn timer_read_back() -> ReadBack {
+    match timer::programmed() {
+        None => ReadBack::Unread,
+        Some(read) => match read.first_difference(&timer::periodic_programming()) {
+            None => ReadBack::AsTimed,
+            Some((register, got, timed)) => ReadBack::Otherwise(register, got, timed),
+        },
+    }
 }
 
 /// Makes sure CPU `cpu`'s boot/idle context (slot 0) has an FPU area, so the first switch
@@ -1206,13 +1218,12 @@ fn run_window(cpus: &[CpuIndex], tsc_hz: u64, workers: u64) -> WindowRun {
     };
     // A processor whose timer reads back otherwise than timed ends the window at once: no wait
     // can change that verdict.
-    let expected = timer::periodic_programming();
     let settled = || {
         cpus.iter()
             .all(|id| watch_of(id).is_none_or(|w| w.ticks >= WINDOW_TICKS))
-            || cpus
-                .iter()
-                .any(|id| watch_of(id).is_some_and(|w| w.programmed.is_some_and(|p| p != expected)))
+            || cpus.iter().any(|id| {
+                watch_of(id).is_some_and(|w| matches!(w.read_back, ReadBack::Otherwise(..)))
+            })
     };
     let budget = tsc_hz.saturating_mul(WINDOW_BUDGET_SECONDS);
     while !settled() && rdtsc().wrapping_sub(start) < budget {
@@ -1279,14 +1290,13 @@ fn judge_run(
     cpus: &[CpuIndex],
     tsc_hz: u64,
 ) -> (WindowVerdict, Option<(CpuIndex, TickWatch)>) {
-    // Today's bound: the rounds clause's 15 rounds within 500 ms. The programming every
-    // processor's timer must have: what the boot processor's timed proof ran with.
+    // Today's bound: the rounds clause's 15 rounds within 500 ms. Every processor's timer must
+    // read back as the boot processor's timed proof ran it (`timer_read_back`).
     let bound = tsc_hz / 2;
-    let expected = timer::periodic_programming();
     let judged = || {
         cpus.iter()
             .zip(&run.watches)
-            .map(|(&id, w)| (id, *w, judge_window(w, WINDOW_TICKS, bound, expected)))
+            .map(|(&id, w)| (id, *w, judge_window(w, WINDOW_TICKS, bound)))
     };
     // A timer programmed otherwise is named first: it ends the window at once, which leaves
     // other processors short of their ticks for no fault of theirs.
@@ -1343,15 +1353,12 @@ fn say_window(
                     "CPU {id} took {} of {WINDOW_TICKS} ticks in the window{what}",
                     w.ticks
                 ),
-                WindowVerdict::WrongRate => match w
-                    .programmed
-                    .and_then(|p| p.first_difference(&timer::periodic_programming()))
-                {
-                    Some((register, got, want)) => write!(
+                WindowVerdict::WrongRate => match w.read_back {
+                    ReadBack::Otherwise(register, got, want) => write!(
                         com1,
                         "CPU {id}'s timer {register} is {got:#x}, not {want:#x} as timed{what}"
                     ),
-                    None => write!(com1, "CPU {id}'s timer could not be read back{what}"),
+                    _ => write!(com1, "CPU {id}'s timer could not be read back{what}"),
                 },
                 _ => write!(
                     com1,
