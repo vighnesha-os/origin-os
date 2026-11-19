@@ -247,9 +247,6 @@ fn reap_zombies() -> usize {
         let Some(Zombie { stack, fpu, user }) = next else {
             return freed;
         };
-        if let Some(z) = ZOMBIES.get(this_cpu()) {
-            z.fetch_sub(1, Ordering::AcqRel);
-        }
         drop(fpu);
         drop(stack);
         if let Some(user) = user {
@@ -259,6 +256,12 @@ fn reap_zombies() -> usize {
             drop(user);
             // After the memory, so that whoever sees `TERMINATED` knows it has gone (P11).
             process.thread_reaped();
+        }
+        // Lowered last: a `settle` that sees no zombie left then knows that everything this one
+        // held has been given back, its stack in the cache of kept stacks among it, before it
+        // trims that cache (the review of TASKS item 70, T70-7).
+        if let Some(z) = ZOMBIES.get(this_cpu()) {
+            z.fetch_sub(1, Ordering::AcqRel);
         }
         freed += 1;
     }
