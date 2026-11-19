@@ -1653,6 +1653,13 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
   - B5-R9 `fa0cf5d8`: a failed run-time load reports what it releases;
   - G15's two stated limits, ruled the same day, `fe40b139`; the records, the review's Status column and its Resolution in the commit after `8be81730`.
   - **Host tests** under the machine's turn lock on the tree those commits make (2026-11-19, 11:36 UTC): `origin-aml`'s 210 passed and 1 ignored, the kernel proof's 42 passed, formatting and both crates' Clippy clean. The same reviewer reads the answers; the full gates then run once, on the final tip.
+- **The addendum** (`docs/engineering/REVIEW_T63_B5_addendum_2026-11-19.md`, copied in at `743b4c3e`; the same reviewer, no person): B5-R1 to B5-R9 closed; new, 2 Low, 3 Informational and a nit. Answered to the coordinating session's rulings of 2026-11-19, a commit each:
+  - B5-R10 and B5-R11, one cause, `b83fe91a`: the deferred list keeps nothing alive, and a pass binds or reports only what a marking of its own finds readable, a failed run-time load's names included;
+  - B5-R12 `f182d374`: a failed run-time load reports its releases before its names are removed;
+  - B5-R13 `c252b83a`: Table 19.7's pages corrected, and a string that fits a wider field named in the stated limit;
+  - B5-R14 `83c76eb8`: `Suppressed` counts the stores in pieces apart from the tolerances;
+  - the nit `d852444a`; the records, the addendum's Status column and its Resolution in the commit after it.
+  - **Host tests** under the machine's turn lock on the tree those commits make (2026-11-19, 13:38 UTC): `origin-aml`'s 215 passed and 1 ignored, the kernel proof's 43 passed, formatting and both crates' Clippy clean. The same reviewer reads the B5-R10/R11 change and the rest briefly; the full gates then run once, on the final tip.
 - **Not covered:** the similarity check owed before B5's code reaches `main` (decision item 121; a session that writes no code, with the owner's permission and sign-off); `_INI` and `_REG` after a run-time load (G17, the ACPI service's); no boot runs a run-time load; real firmware run only outside the repository (TASKS item 72's harness; item 232).
 
 
