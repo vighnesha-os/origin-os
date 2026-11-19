@@ -32,9 +32,11 @@
 //! - True is Ones at the integer width (Q4);
 //! - `LoadTable` of a `DSDT` or `SSDT` key gives Zero without asking the host: the operating
 //!   system loads those itself, as §19.6.78's note says (Q6);
-//! - a table loaded twice fails at its first duplicate name (Q7);
-//! - a key's ID matches a table's when the table's field holds the key's characters, then NUL or
-//!   space to its end (G18);
+//! - a table already loaded, the same signature, IDs and term list as one loaded and not
+//!   failed, is refused whole and gives Zero (Q7, as ruled for step B5; `tolerate.rs`);
+//! - a key's signature is four AML name characters; an empty OEM ID or OEM table ID matches any
+//!   table, any other is compared byte for byte, padded with NUL (G18, TASKS 64's ledger §3;
+//!   step B5);
 //! - `_INI` and `_REG` are not run for what a run-time load adds: that is the ACPI service's to
 //!   decide (G17, Q9).
 
@@ -137,16 +139,67 @@ pub(crate) fn answers(key: &TableKey, bytes: &[u8]) -> bool {
     })
 }
 
-/// Whether a table's ID field `field` matches a key's `key` (G18, strict until the reading
-/// session answers): the key's characters up to its first NUL, then only NUL or space in the
-/// field. ACPI tables pad their IDs with spaces; a key from AML strings is padded with NUL.
+/// Whether a table's ID field `field` matches a key's `key` (G18, TASKS 64's ledger §3; step
+/// B5): an empty key, all NUL, matches any table; any other is compared byte for byte, padded
+/// with NUL, so a table's trailing spaces must be in the key.
 fn id_matches(key: &[u8], field: &[u8]) -> bool {
-    let used = key.iter().position(|&c| c == 0).unwrap_or(key.len());
-    let (head, rest) = field.split_at(used.min(field.len()));
-    key.get(..used) == Some(head) && rest.iter().all(|&c| c == 0 || c == b' ')
+    #[cfg(test)]
+    if crate::tests::planted(crate::tests::Fault::OldIdMatch) {
+        let used = key.iter().position(|&c| c == 0).unwrap_or(key.len());
+        let (head, rest) = field.split_at(used.min(field.len()));
+        return key.get(..used) == Some(head) && rest.iter().all(|&c| c == 0 || c == b' ');
+    }
+    key.iter().all(|&c| c == 0) || key == field
+}
+
+/// Whether `c` may be in a table signature `LoadTable` or `DataTableRegion` is given: an AML
+/// name character (G18; B5's contract, Q8).
+const fn signature_char(c: u8) -> bool {
+    c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'
 }
 
 impl<H: Host> Interpreter<H> {
+    /// The key `LoadTable` and `DataTableRegion` look a table up by, from their three strings
+    /// (G18, TASKS 64's ledger §3; step B5): the signature's first four characters, which must be
+    /// AML name characters (`Name` otherwise, a shorter string included), the rest of it not
+    /// compared; the OEM ID and OEM table ID padded with NUL, each `Range` if longer than its
+    /// field.
+    pub(crate) fn table_key(&mut self, strings: [Val; 3]) -> Result<TableKey> {
+        let mut key = TableKey {
+            signature: [0; 4],
+            oem_id: [0; 6],
+            oem_table_id: [0; 8],
+        };
+        for (i, (out, v)) in [
+            &mut key.signature[..],
+            &mut key.oem_id[..],
+            &mut key.oem_table_id[..],
+        ]
+        .into_iter()
+        .zip(strings)
+        .enumerate()
+        {
+            let s = self.string_of(v)?;
+            let fits = if i == 0 {
+                s.get(..4).is_some_and(|sig| sig.iter().all(|&c| signature_char(c)))
+            } else {
+                s.len() <= out.len()
+            };
+            for (d, c) in out.iter_mut().zip(&s) {
+                *d = *c;
+            }
+            mem::release(s, &mut self.budget);
+            if !fits {
+                return err(if i == 0 {
+                    ErrorKind::Name
+                } else {
+                    ErrorKind::Range
+                });
+            }
+        }
+        Ok(key)
+    }
+
     // --- `Load` ------------------------------------------------------------------------------
 
     /// `Load (Object, Result)` (§19.6.77): the object is a buffer, a SystemMemory region read
@@ -204,29 +257,7 @@ impl<H: Host> Interpreter<H> {
     /// after it, the parameter stored. Keys too long are errors; a key signed `DSDT` or `SSDT`,
     /// a table not found, and a copy that fails its checks give Zero.
     pub(crate) fn exec_load_table(&mut self, f: &OpFrame) -> Result<()> {
-        let mut key = TableKey {
-            signature: [0; 4],
-            oem_id: [0; 6],
-            oem_table_id: [0; 8],
-        };
-        for (i, out) in [
-            &mut key.signature[..],
-            &mut key.oem_id[..],
-            &mut key.oem_table_id[..],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let s = self.string_of(val(f, i)?)?;
-            let fits = s.len() <= out.len();
-            for (d, c) in out.iter_mut().zip(&s) {
-                *d = *c;
-            }
-            mem::release(s, &mut self.budget);
-            if !fits {
-                return err(ErrorKind::Range);
-            }
-        }
+        let key = self.table_key([val(f, 0)?, val(f, 1)?, val(f, 2)?])?;
         // The root path first: a path that names nothing is an error, whether or not the table
         // is there. It must name a scope object, as `Scope`'s does: the root, a predefined scope,
         // a device, processor, thermal zone or power resource (§19.6.122; the review of B4, B4-4,

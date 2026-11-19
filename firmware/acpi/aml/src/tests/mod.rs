@@ -326,7 +326,14 @@ impl Host for TestHost {
         self.debug.push(text.to_vec());
     }
     fn table(&mut self, k: &TableKey, out: &mut dyn FnMut(u64, &[u8])) -> Result<bool, HostError> {
-        match self.tables.iter().find(|(t, _, _)| t == k) {
+        // As `host.rs` asks of a host (G18, step B5): the first listed table whose signature
+        // is the key's and whose IDs match, an empty ID matching any.
+        let id = |key: &[u8], listed: &[u8]| key.iter().all(|&c| c == 0) || key == listed;
+        match self.tables.iter().find(|(t, _, _)| {
+            t.signature == k.signature
+                && id(&k.oem_id, &t.oem_id)
+                && id(&k.oem_table_id, &t.oem_table_id)
+        }) {
             Some((_, address, bytes)) => {
                 out(*address, bytes);
                 Ok(true)
@@ -457,6 +464,9 @@ pub(crate) enum Fault {
     /// An EmbeddedControl field wider than a byte is accessed a byte at a time, as before step B5
     /// (`region.rs`, `field_locked`).
     EcBytewise,
+    /// A key's ID matches a table's up to the key's first NUL, the rest NUL or space, as step B4
+    /// ruled (`load.rs`, `id_matches`).
+    OldIdMatch,
 }
 
 thread_local! {

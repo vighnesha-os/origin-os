@@ -707,29 +707,7 @@ impl<H: Host> Interpreter<H> {
     /// `DataTableRegion` (§19.6.25): a SystemMemory region over the table the XSDT lists under the
     /// signature, OEM ID and OEM table ID.
     fn data_region(&mut self, f: &OpFrame) -> Result<()> {
-        let mut key = crate::host::TableKey {
-            signature: [0; 4],
-            oem_id: [0; 6],
-            oem_table_id: [0; 8],
-        };
-        for (i, out) in [
-            &mut key.signature[..],
-            &mut key.oem_id[..],
-            &mut key.oem_table_id[..],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let s = self.string_of(val(f, i.saturating_add(1))?)?;
-            let fits = s.len() <= out.len();
-            for (d, c) in out.iter_mut().zip(&s) {
-                *d = *c;
-            }
-            mem::release(s, &mut self.budget);
-            if !fits {
-                return err(ErrorKind::Range);
-            }
-        }
+        let key = self.table_key([val(f, 1)?, val(f, 2)?, val(f, 3)?])?;
         // The host's copy is checked before its address and length are taken (the review of B2,
         // B2-14): a copy that is not a sound table under the key gives the region nothing.
         let mut found = None;

@@ -373,9 +373,11 @@ pub trait Host {
     /// first copy charged and unreleased until the evaluation's recount (the review of B4,
     /// B4-11).
     ///
-    /// The key's IDs are padded with NUL, a table's own with spaces as a rule: the library
-    /// compares an ID up to the key's first NUL and lets the table's rest be NUL or space (G18),
-    /// and a host should find the table the same way.
+    /// The key's IDs are padded with NUL (G18, TASKS 64's ledger §3; step B5). A host finds the
+    /// first table in root-table order whose signature is the key's and whose IDs match: an
+    /// empty ID, all NUL, matches any table; any other is compared byte for byte, so a table whose
+    /// ID is padded with spaces matches only a key that gives the spaces. The library checks the
+    /// copy the same way.
     ///
     /// # Errors
     /// Whatever the host refuses or fails.

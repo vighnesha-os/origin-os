@@ -1089,3 +1089,119 @@ fn planted_faults_are_caught_by_the_width_tests() {
         }
     }
 }
+
+// --- `LoadTable`'s and `DataTableRegion`'s IDs: G18 (step B5-6) ----------------------------------
+
+/// An interpreter whose host lists `OEM1`, a table with the encoder's IDs (`ORIGIN`,
+/// `AMLTEST `), under `listed`, and a method `LT` loading by `sig`, `oem` and `id`.
+fn with_oem1(listed: TableKey, sig: &str, oem: &str, id: &str) -> Interp {
+    let t = table(b"OEM1", 2, &[name("QY", one())]);
+    let mut i = fresh();
+    i.host_mut().tables.push((listed, 0x2000, t));
+    load(
+        &mut i,
+        &[method(
+            "LT",
+            0,
+            &[ret(load_table([
+                string(sig),
+                string(oem),
+                string(id),
+                string(""),
+                string(""),
+                zero(),
+            ]))],
+        )],
+    )
+    .unwrap();
+    i
+}
+
+const OEM1: TableKey = TableKey {
+    signature: *b"OEM1",
+    oem_id: *b"ORIGIN",
+    oem_table_id: *b"AMLTEST ",
+};
+
+#[test]
+fn ids_compare_exactly_with_zero_padding() {
+    // The table's OEM table ID is padded with a space: a key without it does not match it.
+    let mut i = with_oem1(OEM1, "OEM1", "ORIGIN", "AMLTEST");
+    assert_eq!(int(&mut i, "LT"), 0);
+    let mut i = with_oem1(OEM1, "OEM1", "ORIGIN", "AMLTEST ");
+    assert_eq!(int(&mut i, "LT"), u64::MAX);
+    assert!(exists(&i, "\\QY"));
+}
+
+#[test]
+fn a_hosts_copy_is_checked_with_the_same_rule() {
+    // A host that lists the table under the key AML gives ("AMLTEST" and NUL): the library's check
+    // of the copy still refuses it, its ID being "AMLTEST " (G18).
+    let loose = TableKey {
+        oem_table_id: *b"AMLTEST\0",
+        ..OEM1
+    };
+    let mut i = with_oem1(loose, "OEM1", "ORIGIN", "AMLTEST");
+    assert_eq!(int(&mut i, "LT"), 0);
+    assert!(!exists(&i, "\\QY"));
+}
+
+#[test]
+fn empty_id_matches_any() {
+    let mut i = with_oem1(OEM1, "OEM1", "", "");
+    assert_eq!(int(&mut i, "LT"), u64::MAX);
+    let mut i = with_oem1(OEM1, "OEM1", "ORIGIN", "");
+    assert_eq!(int(&mut i, "LT"), u64::MAX);
+}
+
+#[test]
+fn signature_checked_and_cut_to_four() {
+    let mut i = with_oem1(OEM1, "OEM1XYZ", "ORIGIN", "AMLTEST ");
+    assert_eq!(int(&mut i, "LT"), u64::MAX, "only four compared");
+    for bad in ["OEM", "oem1", ""] {
+        let mut i = with_oem1(OEM1, bad, "ORIGIN", "AMLTEST ");
+        assert_eq!(
+            eval(&mut i, "LT").map_err(|e| e.kind),
+            Err(ErrorKind::Name),
+            "{bad:?}"
+        );
+    }
+    let mut i = with_oem1(OEM1, "OEM1", "ORIGINAL", "AMLTEST ");
+    assert_eq!(
+        eval(&mut i, "LT").map_err(|e| e.kind),
+        Err(ErrorKind::Range)
+    );
+}
+
+#[test]
+fn datatableregion_same_rule() {
+    let t = table(b"OEM1", 2, &[]);
+    for (id, made) in [("", true), ("AMLTEST ", true), ("AMLTEST", false)] {
+        let mut i = fresh();
+        i.host_mut().tables.push((OEM1, 0x2000, t.clone()));
+        let body = [
+            data_region("DR", string("OEM1"), string("ORIGIN"), string(id)),
+            name("AFT", one()),
+        ];
+        load(&mut i, &body).unwrap();
+        assert_eq!(exists(&i, "\\DR"), made, "{id:?}");
+        assert_eq!(told(&mut i).len(), usize::from(!made), "{id:?}");
+        assert!(exists(&i, "\\AFT"));
+    }
+}
+
+#[test]
+fn planted_faults_are_caught_by_the_id_tests() {
+    let tests: [(Option<Fault>, &[fn()]); 2] = [
+        (None, &[ids_compare_exactly_with_zero_padding, a_hosts_copy_is_checked_with_the_same_rule, empty_id_matches_any, signature_checked_and_cut_to_four, datatableregion_same_rule]),
+        (Some(Fault::OldIdMatch), &[a_hosts_copy_is_checked_with_the_same_rule]),
+    ];
+    for (f, cases) in tests {
+        for case in cases {
+            plant(f);
+            let failed = std::panic::catch_unwind(case).is_err();
+            plant(None);
+            assert_eq!(failed, f.is_some(), "{f:?}: case {case:?}");
+        }
+    }
+}
