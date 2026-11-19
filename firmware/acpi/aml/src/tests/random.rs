@@ -337,7 +337,7 @@ fn load_table_key() -> TableKey {
     TableKey {
         signature: *b"OEMT",
         oem_id: *b"ORIGIN",
-        oem_table_id: *b"AMLTEST\0",
+        oem_table_id: *b"AMLTEST ",
     }
 }
 
@@ -435,7 +435,9 @@ impl Gen {
             30 => load_table([
                 string(self.rng.pick(&["OEMT", "OEMT", "SSDT", "OEMU"])),
                 string("ORIGIN"),
-                string(self.rng.pick(&["AMLTEST", "AMLTEST", "OTHER"])),
+                // G18 (step B5): the table's ID with its space, an empty ID matching any table,
+                // and two that match none.
+                string(self.rng.pick(&["AMLTEST ", "AMLTEST ", "", "AMLTEST", "OTHER"])),
                 string(self.rng.pick(&["", "\\D0", "D0", "\\NOPE"])),
                 // `PF` reaches the parameter's own step through a PCI function walk (the review
                 // of B4's addendum, B4-14).
@@ -1613,7 +1615,7 @@ fn adversarial_cases() {
                             load_table([
                                 string("OEMT"),
                                 string("ORIGIN"),
-                                string("AMLTEST"),
+                                string("AMLTEST "),
                                 string("\\D0"),
                                 string("QG1"),
                                 int(9),
@@ -1778,7 +1780,12 @@ fn planted_faults_are_caught() {
             Fault::AllowLoadLocals,
             "written for Eval(Ok(Some(Integer(121))))",
         ),
-        (Fault::NoAbandon, "written for Eval(Ok(Some(Integer(131))))"),
+        // Block 10 comes first: with no abandonment its first duplicate fails the table, as
+        // before step B5, where the step limit should end it.
+        (
+            Fault::NoAbandon,
+            "Load(Duplicate), written for Load(Limit(Steps))",
+        ),
         (
             Fault::ReleaseOnReturn,
             "written for Eval(Ok(Some(Integer(132))))",
