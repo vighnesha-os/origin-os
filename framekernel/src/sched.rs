@@ -716,11 +716,12 @@ extern "sysv64" fn quitter(_: u64) -> ! {
 }
 
 /// How long, in seconds, a Refuse proof waits for what only a thread on another processor can
-/// do: a prober running, an exited thread reaped, a retired stack reclaimed. A budget, not a
-/// bound (ADR-0013 R1(b)): each wait ends as soon as its condition holds, which on a real
-/// machine is within microseconds, and its verdict does not change. Under QEMU's software
-/// processor a 65-processor machine with a little outside load left one processor's prober
-/// unrun past the 2 s this was before TASKS item 66.
+/// do: a prober running, an exited thread reaped, a retired stack reclaimed. The clock proofs'
+/// turn-takers starting and finishing wait as long. A budget, not a bound (ADR-0013 R1(b)):
+/// each wait ends as soon as its condition holds, which on a real machine is within
+/// microseconds, and its verdict does not change. Under QEMU's software processor a
+/// 65-processor machine with a little outside load left one processor's prober unrun past
+/// the 2 s this was before TASKS item 66, and in another boot its turn-takers.
 pub(crate) const OTHERS_PATIENCE: u64 = 10;
 
 /// Yields until `done()` or `seconds` pass.

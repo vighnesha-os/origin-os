@@ -702,7 +702,11 @@ fn run_turns(
         }
         aps += 1;
     }
-    crate::sched::yield_until(|| READY.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    crate::sched::yield_until(
+        || READY.load(Ordering::Acquire) == aps,
+        tsc_hz,
+        crate::sched::OTHERS_PATIENCE,
+    );
     if READY.load(Ordering::Acquire) != aps {
         UNTIL.store(1, Ordering::Release);
         let _ = writeln!(
@@ -722,7 +726,11 @@ fn run_turns(
         if cpus.len() < 2 { 0 } else { wanted },
         reading,
     );
-    crate::sched::yield_until(|| DONE.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    crate::sched::yield_until(
+        || DONE.load(Ordering::Acquire) == aps,
+        tsc_hz,
+        crate::sched::OTHERS_PATIENCE,
+    );
     Some(Turns {
         readings: READINGS.load(Ordering::Relaxed),
         handoffs: HANDOFFS.load(Ordering::Relaxed),
@@ -819,7 +827,11 @@ fn report_read_cost(com1: &mut Console, cpus: &[cpu::CpuIndex], bsp: cpu::CpuInd
         started &= crate::sched::spawn(id, cost_reader, 0).is_ok();
         aps += 1;
     }
-    crate::sched::yield_until(|| READY.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    crate::sched::yield_until(
+        || READY.load(Ordering::Acquire) == aps,
+        tsc_hz,
+        crate::sched::OTHERS_PATIENCE,
+    );
     started &= READY.load(Ordering::Acquire) == aps;
     // Whatever happened, release those that did start: they would otherwise spin for the
     // whole boot.
@@ -832,7 +844,11 @@ fn report_read_cost(com1: &mut Console, cpus: &[cpu::CpuIndex], bsp: cpu::CpuInd
         return;
     }
     COST_TICKS.fetch_add(ticks_per_read(monotonic_nanos), Ordering::Relaxed);
-    crate::sched::yield_until(|| DONE.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    crate::sched::yield_until(
+        || DONE.load(Ordering::Acquire) == aps,
+        tsc_hz,
+        crate::sched::OTHERS_PATIENCE,
+    );
     let finished = DONE.load(Ordering::Acquire) == aps;
     let together = COST_TICKS.load(Ordering::Relaxed) / (aps + 1);
     let _ = writeln!(
