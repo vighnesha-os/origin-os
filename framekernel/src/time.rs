@@ -538,6 +538,12 @@ static DONE: AtomicU64 = AtomicU64::new(0);
 static UNTIL: AtomicU64 = AtomicU64::new(0);
 /// The TSC value at which they stop whatever else has happened.
 static LATEST: AtomicU64 = AtomicU64::new(0);
+/// How long a run of turns may go on, in seconds, until it has its handoffs: a budget, not a
+/// bound, since the verdict is only whether a reading stepped back. On a real machine the
+/// handoffs come within the first 100 ms. Under QEMU's software processor on a loaded host the
+/// virtual processors rarely run at the same moment: on two processors at a load of 20 a run
+/// reached 101 handoffs at the 500 ms this was before TASKS item 66.
+const HANDOFF_BUDGET_SECONDS: u64 = 5;
 /// How many handoffs a run keeps going for, up to [`LATEST`].
 static WANTED_HANDOFFS: AtomicU64 = AtomicU64::new(0);
 /// Handoffs needed for the check to mean anything: the processors must really have
@@ -664,7 +670,7 @@ struct Turns {
 }
 
 /// One run of turns with every online processor reading `reading`, for `window` ticks and on
-/// to 500 ms until `wanted` handoffs have happened. `None`, reported, if the turn-takers cannot
+/// to [`HANDOFF_BUDGET_SECONDS`] until `wanted` handoffs have happened. `None`, reported, if the turn-takers cannot
 /// be started. Runs from the boot flow with every scheduler active, after any earlier run has
 /// finished: nothing else reads or writes this state.
 fn run_turns(
@@ -706,7 +712,10 @@ fn run_turns(
         return None;
     }
     let start = rdtsc();
-    LATEST.store(start.saturating_add(tsc_hz / 2), Ordering::Relaxed);
+    LATEST.store(
+        start.saturating_add(tsc_hz.saturating_mul(HANDOFF_BUDGET_SECONDS)),
+        Ordering::Relaxed,
+    );
     UNTIL.store(start.saturating_add(window), Ordering::Release);
     take_turns(
         bsp.get() as u64,
@@ -725,7 +734,7 @@ fn run_turns(
 }
 
 /// Proves that the TSC readings of every online processor are consistent: for 100 ms
-/// (and on, to 500 ms, until they have really interleaved) all of them take ordered
+/// (and on, to [`HANDOFF_BUDGET_SECONDS`], until they have really interleaved) all of them take ordered
 /// readings in turn, and no reading may be below the one taken just before it on another
 /// processor. Runs from the boot flow with every scheduler active.
 pub(crate) fn prove_consistent(
