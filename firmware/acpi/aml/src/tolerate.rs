@@ -7,8 +7,9 @@
 //! [`Report`], never silence. Nothing here raises a limit or lets AML reach anything new.
 //!
 //! **Reports.** Each top-level evaluation gives its host at most [`REPORTS`] reports; the rest are
-//! counted and told in one [`Report::Suppressed`] as it ends, so that firmware cannot flood the
-//! host. A report is a unit of work, given or not.
+//! counted, the stores in pieces apart from the tolerances, and told in one
+//! [`Report::Suppressed`] as it ends, so that firmware cannot flood the host. A report is a unit of
+//! work, given or not.
 //!
 //! **The load policy** (G1 and G3; the ledger's §2). Load-time code is a table's table level and
 //! the bodies of the `Scope`, `Device`, `Processor`, `PowerResource`, `ThermalZone`, `If`, `Else`
@@ -99,14 +100,28 @@ impl<H: Host> Interpreter<H> {
         }
         if self.run.reports <= REPORTS {
             self.host.report(report);
+        } else if matches!(report, Report::Pieces { .. }) {
+            self.run.pieces_over = self.run.pieces_over.saturating_add(1);
         }
     }
 
-    /// As an evaluation ends: the reports past the bound, as one count.
+    /// As an evaluation ends: the reports past the bound, as one count of each kind (the review
+    /// of B5's answers, B5-R14). Planted (`SuppressedAsOne`), every one is counted a tolerance.
     pub(crate) fn tell_suppressed(&mut self) {
         let over = self.run.reports.saturating_sub(REPORTS);
+        #[cfg(test)]
+        let pieces = if crate::tests::planted(crate::tests::Fault::SuppressedAsOne) {
+            0
+        } else {
+            self.run.pieces_over
+        };
+        #[cfg(not(test))]
+        let pieces = self.run.pieces_over;
         if over > 0 {
-            self.host.report(&Report::Suppressed { count: over });
+            self.host.report(&Report::Suppressed {
+                tolerances: over.saturating_sub(pieces),
+                pieces,
+            });
         }
     }
 

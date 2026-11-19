@@ -160,6 +160,8 @@ struct RunCounts {
     pass_entries: u64,
     /// Reports made this evaluation, given or not ([`REPORTS`]).
     reports: u64,
+    /// Of them, [`host::Report::Pieces`] past the bound (the review of B5's answers, B5-R14).
+    pieces_over: u64,
     /// Mutexes released this evaluation other than by `Release`, reported or not: the soak's
     /// audit compares them with the reports (B5's contract §4.9, audit 3; the review of B5,
     /// B5-R4).

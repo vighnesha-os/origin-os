@@ -290,7 +290,7 @@ impl Tolerance {
             Report::LongStall { at, .. } => ("a Stall over 100 us", Some(at), None),
             Report::Released { .. } => ("a mutex held to the end", None, None),
             Report::Pieces { .. } => ("a store in pieces", None, None),
-            Report::Suppressed { .. } => ("reports past the bound", None, None),
+            Report::Suppressed { .. } => ("tolerances past the bound", None, None),
         };
         Self { what, at, error }
     }
@@ -454,10 +454,17 @@ impl<H: Host> Host for Recorder<H> {
 
     fn report(&mut self, report: &Report<'_>) {
         self.seen.note_stack();
-        if matches!(report, Report::Pieces { .. }) {
-            self.seen.pieces = self.seen.pieces.saturating_add(1);
-        } else {
-            self.seen.tolerated = self.seen.tolerated.saturating_add(1);
+        // Past the bound, the reports are counted by kind, so each fails the proof with its own
+        // reason (the review of B5's answers, B5-R14).
+        let (tolerances, pieces) = match *report {
+            Report::Pieces { .. } => (0, 1),
+            Report::Suppressed { tolerances, pieces } => (tolerances, pieces),
+            _ => (1, 0),
+        };
+        let n = |k: u64| u32::try_from(k).unwrap_or(u32::MAX);
+        self.seen.pieces = self.seen.pieces.saturating_add(n(pieces));
+        if tolerances != 0 {
+            self.seen.tolerated = self.seen.tolerated.saturating_add(n(tolerances));
             if self.seen.first_tolerance.is_none() {
                 self.seen.first_tolerance = Some(Tolerance::of(report));
             }

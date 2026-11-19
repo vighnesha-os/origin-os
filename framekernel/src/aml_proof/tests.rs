@@ -843,6 +843,35 @@ fn a_store_in_pieces_on_qemus_tables_fails_the_proof() {
 }
 
 #[test]
+fn reports_past_the_bound_count_by_kind() {
+    // The review of B5's answers, B5-R14: a `Suppressed` adds its stores in pieces to the stores
+    // in pieces and its tolerances to the tolerances, so a proof fails with the reason of each
+    // kind it saw: `IN_PIECES` and `TOLERATED`, each shown above with one report. No evaluation
+    // on QEMU-shaped tables makes 65 stores in pieces, since the host refuses each one's first
+    // write and the evaluation ends there; so the recorder is given the reports directly.
+    let mut r = Recorder::new(BootHost::new(still));
+    r.report(&Report::Pieces {
+        field: &[],
+        pieces: 2,
+    });
+    r.report(&Report::Suppressed {
+        tolerances: 0,
+        pieces: 6,
+    });
+    assert_eq!((r.seen().pieces, r.seen().tolerated), (7, 0));
+    assert_eq!(r.seen().first_tolerance, None);
+    r.report(&Report::Suppressed {
+        tolerances: 3,
+        pieces: 1,
+    });
+    assert_eq!((r.seen().pieces, r.seen().tolerated), (8, 3));
+    assert_eq!(
+        r.seen().first_tolerance.map(|t| t.what),
+        Some("tolerances past the bound")
+    );
+}
+
+#[test]
 fn a_device_that_fails_other_than_by_a_refusal_fails_the_proof() {
     let dsdt = qemu_dsdt(&[scope(
         "\\_SB_",

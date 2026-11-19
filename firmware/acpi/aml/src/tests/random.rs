@@ -867,7 +867,7 @@ fn reports_bounded(i: &mut Interpreter<TestHost>, seed: u64, ended: Result<(), E
     );
     for (k, r) in t.iter().enumerate() {
         assert_eq!(
-            matches!(r, Told::Suppressed(_)),
+            matches!(r, Told::Suppressed(..)),
             k == bound,
             "seed {seed:#x}: a report out of place: {r:?}"
         );
@@ -886,7 +886,7 @@ fn reports_bounded(i: &mut Interpreter<TestHost>, seed: u64, ended: Result<(), E
             info.abandoned
         );
     }
-    let suppressed = t.iter().any(|r| matches!(r, Told::Suppressed(_)));
+    let suppressed = t.iter().any(|r| matches!(r, Told::Suppressed(..)));
     if ended.is_ok() && !suppressed {
         let told = t.iter().filter(|r| matches!(r, Told::Released(..))).count() as u64;
         assert_eq!(

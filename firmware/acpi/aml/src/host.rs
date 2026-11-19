@@ -228,7 +228,7 @@ pub enum Trace<'a> {
 /// [`Report::Pieces`] marks a place where Origin knowingly differs from the deployed interpreter.
 /// A place is a table and the offset in its term list. At most [`crate::REPORTS`] are given in one top-level evaluation (a load, an evaluation,
 /// one `_STA`, `_INI` or `_REG` of a walk, or [`crate::Interpreter::bind_deferred`]), then one
-/// [`Report::Suppressed`] with the count of the rest.
+/// [`Report::Suppressed`] with the count of the rest, by kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Report<'a> {
     /// A statement of load-time code failed with `error` and was abandoned: skipped whole, from
@@ -302,10 +302,14 @@ pub enum Report<'a> {
         /// How many pieces the store makes.
         pieces: u64,
     },
-    /// `count` reports more in this evaluation, not given.
+    /// Reports more in this evaluation, not given: how many of them were [`Report::Pieces`], and
+    /// how many the rest, tolerances, so that a host can tell the two apart past the bound too
+    /// (the review of B5's answers, B5-R14).
     Suppressed {
-        /// How many.
-        count: u64,
+        /// Reports other than [`Report::Pieces`].
+        tolerances: u64,
+        /// [`Report::Pieces`].
+        pieces: u64,
     },
 }
 

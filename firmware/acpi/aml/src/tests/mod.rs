@@ -116,7 +116,8 @@ pub(crate) enum Told {
     /// The mutex's path, and the path of the method that took it.
     Released(Vec<[u8; 4]>, Vec<[u8; 4]>),
     Pieces(Vec<[u8; 4]>, u64),
-    Suppressed(u64),
+    /// Tolerances and stores in pieces past the bound.
+    Suppressed(u64, u64),
 }
 
 /// Each case fails with `NoReport` planted, in a run of its own: a test of a tolerance asserts
@@ -334,7 +335,7 @@ impl Host for TestHost {
             Report::LongStall { us, .. } => Told::LongStall(us),
             Report::Released { mutex, method } => Told::Released(mutex.to_vec(), method.to_vec()),
             Report::Pieces { field, pieces } => Told::Pieces(field.to_vec(), pieces),
-            Report::Suppressed { count } => Told::Suppressed(count),
+            Report::Suppressed { tolerances, pieces } => Told::Suppressed(tolerances, pieces),
         });
     }
     fn tracing(&self) -> bool {
@@ -492,6 +493,9 @@ pub(crate) enum Fault {
     /// A failed run-time load reports its releases after its names are removed, as before the
     /// review of B5's answers, B5-R12 (`load.rs`, `fail_load`).
     ReleaseAfterUnwind,
+    /// Every report past the bound is counted a tolerance, as before the review of B5's answers,
+    /// B5-R14 (`tolerate.rs`, `tell_suppressed`).
+    SuppressedAsOne,
     /// A string byte above 0x7F fails the table, as before step B5 (`engine.rs`,
     /// `decode_string`).
     RefuseHighBytes,

@@ -309,7 +309,7 @@ fn abandon_and_skip_are_bounded() {
     assert_eq!(load(&mut i, &body), Ok(0));
     let t = told(&mut i);
     assert_eq!(t.len(), 65);
-    assert_eq!(t[64], Told::Suppressed(10_000 - 64));
+    assert_eq!(t[64], Told::Suppressed(10_000 - 64, 0));
     assert_eq!(i.table(0).unwrap().abandoned, 10_000);
     assert!(exists(&i, "\\AFT"));
     let mut i = interp_with(
@@ -1204,6 +1204,7 @@ fn every_tolerance_test_fails_without_its_reports() {
         strings_go_to_a_field_as_a_buffer_of_their_bytes,
         ec_pieces_are_one_transfer_each,
         a_long_buffer_into_a_one_bit_field_ends_at_a_limit,
+        reports_past_the_bound_are_counted_by_kind,
     ]);
 }
 
@@ -1718,15 +1719,71 @@ fn a_long_buffer_into_a_one_bit_field_ends_at_a_limit() {
 }
 
 #[test]
+fn reports_past_the_bound_are_counted_by_kind() {
+    // The review of B5's answers, B5-R14: past the bound, the reports are told as one
+    // `Suppressed` that counts the stores in pieces apart from the tolerances, so the kernel's
+    // proof can fail with the reason of each. `P1` stores in pieces 70 times: 64 told, then 6
+    // pieces suppressed. `P2` alternates a reported `Stall` and a store in pieces 40 times: 64
+    // told, then 8 of each suppressed.
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            op_region("RM", 0, word(0x1000), byte(4)),
+            field("RM", 3, &[Fe::Named("F32", 32)]),
+            name("N", zero()),
+            method(
+                "P1",
+                0,
+                &[
+                    store(zero(), nm("N")),
+                    while_(
+                        logic(0x95, nm("N"), byte(70)),
+                        &[store(string("ABCDEF"), nm("F32")), increment(nm("N"))],
+                    ),
+                ],
+            ),
+            method(
+                "P2",
+                0,
+                &[
+                    store(zero(), nm("N")),
+                    while_(
+                        logic(0x95, nm("N"), byte(40)),
+                        &[
+                            stall(byte(150)),
+                            store(string("ABCDEF"), nm("F32")),
+                            increment(nm("N")),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+    .unwrap();
+    for (method, tolerances, pieces) in [("P1", 0, 6), ("P2", 8, 8)] {
+        eval(&mut i, method).unwrap();
+        let t = told(&mut i);
+        assert_eq!(t.len(), 65, "{method}");
+        assert_eq!(t[64], Told::Suppressed(tolerances, pieces), "{method}");
+    }
+}
+
+#[test]
 fn planted_faults_are_caught_by_the_piece_tests() {
-    let tests: [Control; 4] = [
+    let tests: [Control; 5] = [
         (
             None,
             &[
                 strings_go_to_a_field_as_a_buffer_of_their_bytes,
                 ec_pieces_are_one_transfer_each,
                 a_long_buffer_into_a_one_bit_field_ends_at_a_limit,
+                reports_past_the_bound_are_counted_by_kind,
             ],
+        ),
+        (
+            Some(Fault::SuppressedAsOne),
+            &[reports_past_the_bound_are_counted_by_kind],
         ),
         (
             Some(Fault::StringCut),
