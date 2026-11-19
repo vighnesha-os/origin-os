@@ -345,6 +345,15 @@ fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> Results {
             );
             return Results::FAILED;
         };
+        if run.waited_ms > 4000 {
+            // Past the 4 s this wait had before TASKS item 66 (the review's T66-R3), said for
+            // every run, the repeated ones too (the addendum review's T66-R16).
+            let _ = writeln!(
+                com1,
+                "origin-kernel: waited {} ms for the timed waiters to return, past the former 4000 ms, run {attempts} of {TIMED_ATTEMPTS}",
+                run.waited_ms
+            );
+        }
         let finished = run.short != 0 && run.long != 0;
         let correct = finished && run.short & 1 == 1 && run.long & 1 == 0;
         let verdict = if finished {
@@ -357,14 +366,6 @@ fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> Results {
         }
     };
     let ok = correct && timely;
-    if run.waited_ms > 4000 {
-        // Past the 4 s this wait had before TASKS item 66 (the review's T66-R3).
-        let _ = writeln!(
-            com1,
-            "origin-kernel: waited {} ms for the timed waiters to return, past the former 4000 ms",
-            run.waited_ms
-        );
-    }
     if run.short != 0 && run.long != 0 {
         let (s, l) = (run.short_wait, run.long_wait);
         // The line as it was before TASKS item 66, then its judgement on a line of its own, each
