@@ -1642,6 +1642,17 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
   4. The contract's §5 sentence corrected: the skip's work list is a vector charged to the memory limit and released after each skip; `a_skip_whose_work_list_reaches_the_memory_limit_fails_the_table_whole` shows one at the limit failing the table whole and freeing everything.
   5. A table that loads itself is refused at its own load: confirmed; the call-depth bound on loads is shown by `a_chain_of_loads_is_bounded_by_the_call_depth` and `nested_loads_run_on_a_fixed_native_stack`.
 - **`main` merged** at `2d0187c0` (PR 41, the sixth batch) into the branch at `6b4c5e09`, cleanly.
+- **The review of B5** (`docs/engineering/REVIEW_T63_B5_2026-11-19.md`, copied in at `7cb282dc`; one AI reviewer started by the coordinating session, no person): 0 High, 1 Medium, 5 Low, 3 Informational, its view of the hand-over's five points the coordinating session's. Answered to that session's rulings of 2026-11-19, a commit each:
+  - B5-R1 `180bc6ad`: the skip steps over a name in a place as a name, never a call;
+  - B5-R2 `adce2aac`: a run-time load binds only its own table's package names, before its `Loading` frame is popped;
+  - B5-R3 `d869001b`: what nothing can read is never bound, whether or not the collector ran;
+  - B5-R4 `8be81730`: the soak's audits 1, 3 and 5, its missing grammar, and every tolerance test failing with `NoReport`;
+  - B5-R5 `3d301ff5`: a host test of the boot proof's binding branch;
+  - B5-R6 `7621917c`, B5-R7 `62d0ce79`: two comments;
+  - B5-R8 `acf159d4`: `Released` names the method that took the mutex;
+  - B5-R9 `fa0cf5d8`: a failed run-time load reports what it releases;
+  - G15's two stated limits, ruled the same day, `fe40b139`; the records, the review's Status column and its Resolution in the commit after `8be81730`.
+  - **Host tests** under the machine's turn lock on the tree those commits make (2026-11-19, 11:36 UTC): `origin-aml`'s 210 passed and 1 ignored, the kernel proof's 42 passed, formatting and both crates' Clippy clean. The same reviewer reads the answers; the full gates then run once, on the final tip.
 - **Not covered:** the similarity check owed before B5's code reaches `main` (decision item 121; a session that writes no code, with the owner's permission and sign-off); `_INI` and `_REG` after a run-time load (G17, the ACPI service's); no boot runs a run-time load; real firmware run only outside the repository (TASKS item 72's harness; item 232).
 
 
