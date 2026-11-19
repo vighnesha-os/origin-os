@@ -55,13 +55,15 @@
 //!   than its capacity counts. The host test
 //!   `a_retirement_interrupted_between_its_take_and_its_clear_leaves_the_stack_covered` shows
 //!   that gap on this code.
-//! - `ended` is taken by an atomic swap, and every write of it is a swap, a read-modify-write,
-//!   never a plain store, so all of them lie in one order. With the exit's record written by a
-//!   plain store, Loom found an execution of model L5 in which two later swaps read the value
-//!   before it, and that exit's home was never retired. As far as this module's author reads the
-//!   C11 model, a read-modify-write may not do that; whether Loom's search is wider than C11
-//!   there was not settled. With every write a swap, both order them, and it costs one `xchg` per
-//!   thread that ends.
+//! - `ended` is taken by a swap, and the exit's record is written by a swap too. On one processor
+//!   with interrupts off nothing interleaves with either, and C++20 would let the record be a
+//!   plain Release store: a read-modify-write reads the last value in the modification order
+//!   ([atomics.order]), and a value sequenced after a store reads that store or a later one
+//!   ([intro.races]), so a plain store cannot be missed by the swaps after it. Loom 0.7.2 found an
+//!   execution of model L5 that breaks both rules, a false alarm (the review of TASKS item 70,
+//!   T70-3, which reproduced it and showed no C++20 execution matches it). The swap is kept for
+//!   Loom's sake, at one `xchg` per thread that ends. A Loom failure on a location written by both
+//!   plain stores and read-modify-writes gets that C++20 check before the code changes for it.
 //! - A retirement with nothing ended costs one plain load (T70-2), so a tick that switches
 //!   nothing executes no locked instruction.
 //! - [`Contexts::covers`]: any processor. It never waits and takes no lock, so a stack may still
