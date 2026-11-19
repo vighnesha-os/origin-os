@@ -21,18 +21,22 @@ pub const MAX_STRUCTURES: usize = 8192;
 /// The deepest processor hierarchy followed (thread, core, cluster, die, package and a few more).
 pub const MAX_DEPTH: usize = 16;
 /// The longest cache chain followed from a cache's next level. A node's private resource is the
-/// cache that starts such a chain, so from a node a chain may hold one cache more.
+/// cache that starts such a chain, so from a node a chain may hold one cache more, nine in all:
+/// ACPI 6.6 §5.2.31 sets no limit on a chain's length (read 2026-11-19), so since TASKS item 71
+/// a node's resource is not counted against this (the review of TASKS item 71, T71-5).
 pub const MAX_CACHE_LEVELS: usize = 8;
 /// The most private resources a processor node can name: a node is at most 255 bytes, 20 of them
 /// fixed, and each resource is 4.
 pub const MAX_RESOURCES: usize = (255 - 20) / 4;
 /// The most structure lookups [`Pptt::parse`] makes for one structure (TASKS item 71, the review's
-/// F18): a node's parents to [`MAX_DEPTH`] (and one past, which shows a cycle) and one for each of
-/// its [`MAX_RESOURCES`] private resources; a cache's chain to [`MAX_CACHE_LEVELS`] (and one past).
-/// Each lookup walks at most `ceil(count / 64)` structures from the index's nearest checkpoint, so
-/// a parse takes at most `count * MAX_LOOKUPS * (count.div_ceil(64) + 1)` walk steps besides the
-/// two whole walks: about 8 × 10⁷ at [`MAX_STRUCTURES`] (8,192 × 75 × 129), where following
-/// every resource's chain cost about 10⁹ by the review's estimate.
+/// F18): a node's parents to [`MAX_DEPTH`], and a seventeenth lookup, which shows a cycle, and one
+/// for each of its [`MAX_RESOURCES`] private resources; a cache's chain to [`MAX_CACHE_LEVELS`] and
+/// one past, nine at most. Each lookup walks at most `ceil(count / 64)` structures from the
+/// index's nearest checkpoint, so a parse takes at most
+/// `count * MAX_LOOKUPS * (count.div_ceil(64) + 1)` walk steps besides its three whole walks (two
+/// to build the index, one to check each structure): about 8 × 10⁷ at [`MAX_STRUCTURES`]
+/// (8,192 × 75 × 129), where following every resource's chain cost about 10⁹ by the review's
+/// estimate.
 pub const MAX_LOOKUPS: usize = MAX_DEPTH + 1 + MAX_RESOURCES;
 
 /// A processor hierarchy node's flags (§5.2.31.1).
@@ -161,8 +165,10 @@ impl<'a> Pptt<'a> {
     /// Checks the table. Refused besides each structure's length: more than [`MAX_STRUCTURES`]; a
     /// thread that is not a leaf; a parent that is not a processor hierarchy node, or is a leaf; a
     /// private resource that is a processor hierarchy node or not a structure's start; a next-level
-    /// cache that is not a cache; a parent chain deeper than [`MAX_DEPTH`] or a cache chain longer
-    /// than [`MAX_CACHE_LEVELS`], which is how a cycle shows; and a cache ID of zero marked valid.
+    /// cache that is not a cache; a parent chain deeper than [`MAX_DEPTH`], or a chain of more than
+    /// [`MAX_CACHE_LEVELS`] caches after any cache, which is how a cycle shows; and a cache ID of
+    /// zero marked valid. Each cache's chain is checked from that cache, so a node's private
+    /// resource may head nine caches (TASKS item 71: before, eight).
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Error> {
         let table = header::check_signature(bytes, b"PPTT")?;
         let run = table.reader().rest(header::HEADER_LEN)?;
@@ -455,6 +461,22 @@ pub(crate) mod tests {
         let many = vec![vec![9u8, 2]; MAX_STRUCTURES + 1];
         assert!(Pptt::parse(&table(b"PPTT", 3, &many[..MAX_STRUCTURES].concat())).is_ok());
         assert!(matches!(refusal(&many), ErrorKind::Value { .. }));
+        // The review of TASKS item 71, T71-5: a node (at 36, 24 bytes) whose private resource
+        // heads a chain of caches, each the next level of the one before. §5.2.31 sets no limit,
+        // so nine are taken (MAX_CACHE_LEVELS after the first); ten show a cycle.
+        let caches = |n: usize| {
+            let mut t = vec![node(0b1, 0, 0, &[60])];
+            for i in 0..n {
+                let next = if i + 1 < n { 60 + 28 * (i + 1) } else { 0 };
+                t.push(cache(
+                    u32::try_from(next).unwrap(),
+                    u32::try_from(i + 1).unwrap(),
+                ));
+            }
+            t
+        };
+        assert!(Pptt::parse(&table(b"PPTT", 3, &caches(MAX_CACHE_LEVELS + 1).concat())).is_ok());
+        assert_eq!(refusal(&caches(MAX_CACHE_LEVELS + 2)), ErrorKind::Cycle);
     }
 
     #[test]
