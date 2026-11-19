@@ -5276,14 +5276,14 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - **Host tests:** `apic::tests` (four: the edges, a stall's repeat, a wrong rate, a grid showing that only an in-bound run passes); `runqueue::tests` (four of the same kind for the timed waits); the RTC meter's capacity test, generalised to six edges.
   - **Planted boots:** T66-1 to T66-19 in ADR-0013.
   - **The gates:** in `TASKS.md`'s result.
-- **Review:** one AI reviewer, `REVIEW_T66_2026-11-19.md` in the coordination notes, required by the coordinating session's ruling (three Refuse proofs' verdict logic changes); its answers are the next entry. No person.
+- **Review:** one AI reviewer, `docs/engineering/REVIEW_T66_2026-11-19.md`, required by the coordinating session's ruling (three Refuse proofs' verdict logic changes); its answers are the next entry. No person.
 - **Open-source references consulted:** none. No third-party source was read.
 - **Licence:** MIT OR Apache-2.0.
 - **Known limits:** QEMU only (CLAUDE.md §74). A repeat on a machine without a hypervisor is a finding for qualification review, not a pass to rely on (ADR-0013's note). The stacks proof's summary of stalls waits for TASKS item 70.
 
 ## TASKS item 66: the review's answers (ADR-0013; 2026-11-19)
 
-- **What:** the answers to the independent review of `c0f0d02a` (`REVIEW_T66_2026-11-19.md` in the coordination notes: 1 High, 2 Medium, 7 Low), each finding accepted by the coordinating session, and its ruling A on T66-R1. Each answer is in `TASKS.md`, entry 66.
+- **What:** the answers to the independent review of `c0f0d02a` (`docs/engineering/REVIEW_T66_2026-11-19.md`: 1 High, 2 Medium, 7 Low), each finding accepted by the coordinating session, and its ruling A on T66-R1. Each answer is in `TASKS.md`, entry 66.
   - **`origin-frame`:**
     - `apic.rs`: `TimerProgramming` (an initial count, a divide configuration and an LVT entry, compared field by field); `judge_ticks` takes only the first `wanted` stamps (T66-R4), judges the median on the slow side only, and holds a run within its bounds as stalled when some ten consecutive gaps add up to under 8.5 periods (T66-R5); `TickRun::least_ten`.
     - `timer.rs`: `periodic_programming` and `programmed`, which reads the three registers back through `X2Apic::read`; an interrupt window before each run (T66-R6); a line for each run measured again, and the least ten-gap span on the tick proof's lines.

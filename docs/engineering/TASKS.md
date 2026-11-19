@@ -2487,7 +2487,7 @@ Recorded, not changed: the memory proof's two one-second budgets (TASKS item 74)
 - **The probe of QEMU's threads** (a 65-processor boot in the same turn, before the gates): all 65 virtual processors were busy, the host's 10 threads full, for about 14 s while the firmware brought them up. The kernel's calibration comes right after, at a moment the probe's 1.5 s samples cannot resolve. It neither confirms nor rules out a cause for the spoiled windows, and changes no rule.
 - **Not shown:** anything under KVM, in CI or on a physical machine. Each intermediate commit was not built on its own; the final tree was. No person has reviewed it.
 
-**The independent review of `c0f0d02a` (2026-11-19) and its answers.** One AI reviewer read the whole diff (the coordination notes' `REVIEW_T66_2026-11-19.md`) and found 1 High, 2 Medium and 7 Low. The coordinating session accepted all ten the same day, and then ruled on T66-R1's median clause (ruling A). Each finding was fixed:
+**The independent review of `c0f0d02a` (2026-11-19) and its answers.** One AI reviewer read the whole diff (`docs/engineering/REVIEW_T66_2026-11-19.md`) and found 1 High, 2 Medium and 7 Low. The coordinating session accepted all ten the same day, and then ruled on T66-R1's median clause (ruling A). Each finding was fixed:
 
 - **T66-R1 (High): the preemption proof could pass a slow tick in its disturbed run.**
   - **The defect:** the window was counted in the very ticks it checks, nothing compared them with the TSC, and the disturbed run itself passed.

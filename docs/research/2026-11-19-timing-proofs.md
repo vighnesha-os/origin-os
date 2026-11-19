@@ -6,7 +6,7 @@
 | Question | Why do the kernel's timing proofs fail `boot-matrix` under QEMU's software processor (TCG) on the development Mac, with nothing wrong in the kernel, and what rule lets each judge the kernel rather than the host's load, without weakening it on a real machine? (TASKS item 66.) |
 | Method | Kernel boots of the `kernel boot` scenario alone, one machine per `cargo xtask boot-test`, each inside the machine's turn (`cargo xtask exclusive --`), serial logs kept, the 1-minute load average read before and after. "Load N" is N busy loops (`while :; do :; done`) planted on the 10-thread host, standing for work outside the turn; load 0 is the turn alone. A diagnostic build (a temporary edit, put back with `git checkout`) printed each processor's tick watch. The records of earlier failures are those in `TASKS.md` and `SOURCE_PROVENANCE.md`. |
 | Host | The development Mac (Apple M1 Max, 10 threads), QEMU 11.1.3 TCG with OVMF, Rust 1.100.0. Under TCG on this host the guest TSC is the host's nanosecond clock: exactly 1,000,000 kHz. |
-| Reviewed by | One AI reviewer (`docs/engineering/REVIEW_T66_2026-11-19.md` in the coordination notes; its findings and answers are in `TASKS.md`, entry 66). **No person has reviewed this ledger.** |
+| Reviewed by | One AI reviewer (`docs/engineering/REVIEW_T66_2026-11-19.md`, and its addendum review `REVIEW_T66_addendum_2026-11-19.md`; its findings and answers are in `TASKS.md`, entry 66). **No person has reviewed this ledger.** |
 | Other sources | None. No source of QEMU, OVMF or any other project was opened (CLAUDE.md §3). |
 
 ## 1. Before the change: 33 boots (`0ed7bfb9`'s kernel, 2026-11-19 02:10 to 03:00 UTC)
