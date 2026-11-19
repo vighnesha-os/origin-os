@@ -171,8 +171,7 @@ extern "sysv64" fn reader(_: u64) -> ! {
             STALE.fetch_add(1, Ordering::Relaxed);
         }
     }
-    STAGE.store(3, Ordering::Release);
-    crate::sched::exit()
+    crate::sched::finish(|| STAGE.store(3, Ordering::Release))
 }
 
 /// Every retired stack reclaimed, here or by another processor: the others reclaim in their idle
@@ -519,7 +518,8 @@ extern "sysv64" fn windowed(_: u64) -> ! {
     ready();
     crate::sched::sleep(1);
     ready();
-    crate::sched::exit()
+    // Nothing waits for its end but the exit window's own handshake, in the exit itself.
+    crate::sched::finish(|| ())
 }
 
 /// Called by the scheduler's sleep and exit hooks once the switch is decided (`sched::on_sleep`,

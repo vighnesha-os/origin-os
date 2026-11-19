@@ -254,8 +254,7 @@ extern "sysv64" fn worker(_: u64) -> ! {
     }
     SWITCHED.store(switched, Ordering::Relaxed);
     YIELDS.store(yields, Ordering::Relaxed);
-    DONE.store(true, Ordering::Release);
-    crate::sched::exit()
+    crate::sched::finish(|| DONE.store(true, Ordering::Release))
 }
 
 /// The threads alive on processor `cpu`, the boot flow among them.

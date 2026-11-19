@@ -662,8 +662,9 @@ extern "sysv64" fn turn_taker(reading: u64) -> ! {
         WANTED_HANDOFFS.load(Ordering::Relaxed),
         Reading::of(reading),
     );
-    DONE.fetch_add(1, Ordering::AcqRel);
-    crate::sched::exit()
+    crate::sched::finish(|| {
+        DONE.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// What one run of turns saw.
@@ -821,8 +822,9 @@ extern "sysv64" fn cost_reader(_: u64) -> ! {
         core::hint::spin_loop();
     }
     COST_TICKS.fetch_add(ticks_per_read(monotonic_nanos), Ordering::Relaxed);
-    DONE.fetch_add(1, Ordering::AcqRel);
-    crate::sched::exit()
+    crate::sched::finish(|| {
+        DONE.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// Measures and reports what a read of the monotonic clock costs (CLAUDE.md §66, rule 21): on
