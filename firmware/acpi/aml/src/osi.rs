@@ -8,8 +8,9 @@
 //! and each ACPI-defined feature-group string of Table 5.248 until the task that builds that
 //! feature adds it. `\_REV` is 2. This is the one table of answers; a change to it is the owner's.
 //!
-//! **`\_OS` is provisional**: "Origin OS", the truthful name, until TASKS item 64 answers G10 with
-//! evidence of what deployed firmware expects, and the owner decides it as an item of its own.
+//! **`\_OS` is "Origin OS"**, Origin's own name: ADR-0019 Amendment 2, decision item 315 (the owner,
+//! 2026-11-19), after TASKS item 64's reading of G10 and TASKS item 72's run of a server's firmware,
+//! whose only readers of `\_OS` reach it when `\_OSI` is missing.
 
 use crate::Interpreter;
 use crate::error::{ErrorKind, Result, err};
@@ -42,7 +43,7 @@ pub const OSI_STRINGS: &[&[u8]] = &[
     b"Windows 2022",
 ];
 
-/// `\_OS`. Provisional until G10 is answered and the owner decides it.
+/// `\_OS` (ADR-0019 Amendment 2, decision item 315).
 pub const OS_NAME: &[u8] = b"Origin OS";
 
 /// `\_REV` (ADR-0019 Amendment 1, decision item 309).

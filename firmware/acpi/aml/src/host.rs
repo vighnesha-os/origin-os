@@ -121,7 +121,13 @@ pub struct RegionAccess<'a> {
 }
 
 /// One transaction on a buffer-protocol region space (SMBus, IPMI, GenericSerialBus,
-/// GeneralPurposeIO, PCC, PlatformRtMechanism, FFixedHW).
+/// GeneralPurposeIO, PCC, PlatformRtMechanism, FFixedHW), or an EmbeddedControl field wider than
+/// 8 bits (step B5; B5's contract, Q6): `address` is the region's base plus the field's first
+/// byte, `data` the bytes it spans, at most 255, `bit_offset` and `bit_length` where the field
+/// lies in them (its offset within the first byte, and its bits). A read fills `data`; a write
+/// sends it, the bits outside the field already merged by the field's update rule (for Preserve,
+/// by a read transfer first). A host for the ACPI service makes it one Embedded Controller
+/// transaction, as ACPICA does (TASKS 64's ledger §3, G5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BufferAccess<'a> {
     /// The space.
@@ -215,6 +221,98 @@ pub enum Trace<'a> {
     Limit(crate::Limit),
 }
 
+/// Something the interpreter tolerated, told to the host (TASKS item 63, step B5; the coordinating
+/// session's rulings of 2026-11-19): firmware ACPI 6.6 calls wrong, accepted as TASKS 64's ledger
+/// (`docs/research/2026-11-14-aml-gaps-acpica.md`) says deployed interpreters accept it. Never a
+/// tolerance passed silently: each is one of these. One report is not a tolerance:
+/// [`Report::Pieces`] marks a place where Origin knowingly differs from the deployed interpreter.
+/// A place is a table and the offset in its term list. At most [`crate::REPORTS`] are given in one top-level evaluation (a load, an evaluation,
+/// one `_STA`, `_INI` or `_REG` of a walk, or [`crate::Interpreter::bind_deferred`]), then one
+/// [`Report::Suppressed`] with the count of the rest, by kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Report<'a> {
+    /// A statement of load-time code failed with `error` and was abandoned: skipped whole, from
+    /// `statement` to `resumed`, where the load went on.
+    Abandoned {
+        /// What failed, and where.
+        error: crate::Error,
+        /// Where the statement began.
+        statement: crate::At,
+        /// Where the load went on: the statement's end.
+        resumed: crate::At,
+    },
+    /// A block with the signature, OEM ID, OEM table ID and term list of loaded table `table`
+    /// was refused, nothing of it created. The revision, OEM revision and creator are not
+    /// compared: a boot load hands the interpreter no header (the review of B5, B5-R7).
+    AlreadyLoaded {
+        /// The table already loaded.
+        table: u32,
+    },
+    /// A name in a package that load-time code made names nothing when the package's names were
+    /// bound: the element is empty.
+    UnboundElement {
+        /// Where the name is.
+        at: crate::At,
+    },
+    /// A package listed `found` elements for a count of `count`: those past the count were
+    /// dropped.
+    ExtraElements {
+        /// Where the package is.
+        at: crate::At,
+        /// Its count.
+        count: u64,
+        /// The elements it listed.
+        found: u64,
+    },
+    /// A string literal with no NUL before the end of the range around it, where it ends.
+    Unterminated {
+        /// Where the literal is.
+        at: crate::At,
+    },
+    /// A string literal holds a byte above 0x7F (§20.2.3 allows 0x01 to 0x7F).
+    HighBytes {
+        /// Where the literal is.
+        at: crate::At,
+    },
+    /// `Stall` of more than 100 µs (§19.6.129 asks for 100 at most), up to 255.
+    LongStall {
+        /// Where the `Stall` is.
+        at: crate::At,
+        /// Its microseconds.
+        us: u8,
+    },
+    /// A mutex was released at an end other than its `Release`: the outermost evaluation's, or
+    /// a failed run-time load's (the review of B5, B5-R9).
+    Released {
+        /// Its path, or empty for one deeper than 32 segments or named by no node: a mutex a
+        /// method declared is gone with the method's names when the method returns.
+        mutex: &'a [[u8; 4]],
+        /// The path of the method that took it (the review of B5, B5-R8), or empty for load-time
+        /// code, or for a method deeper than 32 segments or itself gone.
+        method: &'a [[u8; 4]],
+    },
+    /// Data longer than a field unit was stored to it in `pieces` field-sized pieces, lowest
+    /// first (ACPI 6.6 Table 19.7), where ACPICA writes one piece cut to the field. Not a
+    /// tolerance: a store where Origin knowingly differs from the deployed interpreter (the
+    /// coordinating session's ruling of 2026-11-19 on step B5's point 1). Told once, before the
+    /// first piece.
+    Pieces {
+        /// The field's path, or empty for one deeper than 32 segments.
+        field: &'a [[u8; 4]],
+        /// How many pieces the store makes.
+        pieces: u64,
+    },
+    /// Reports more in this evaluation, not given: how many of them were [`Report::Pieces`], and
+    /// how many the rest, tolerances, so that a host can tell the two apart past the bound too
+    /// (the review of B5's answers, B5-R14).
+    Suppressed {
+        /// Reports other than [`Report::Pieces`].
+        tolerances: u64,
+        /// [`Report::Pieces`].
+        pieces: u64,
+    },
+}
+
 /// The host. See the module's documentation for who enforces what.
 pub trait Host {
     /// A monotonic clock in 100 ns units: `Timer`'s value and the time limit's clock.
@@ -280,6 +378,10 @@ pub trait Host {
     /// the evaluation is never stopped in one.
     fn breakpoint(&mut self) {}
 
+    /// Something tolerated (see [`Report`]). Required, with no default: every host decides what
+    /// to do with each. Returns at once.
+    fn report(&mut self, report: &Report<'_>);
+
     /// Whether this host traces the interpreter: [`Host::trace`] is called only if so.
     fn tracing(&self) -> bool {
         false
@@ -294,9 +396,11 @@ pub trait Host {
     /// first copy charged and unreleased until the evaluation's recount (the review of B4,
     /// B4-11).
     ///
-    /// The key's IDs are padded with NUL, a table's own with spaces as a rule: the library
-    /// compares an ID up to the key's first NUL and lets the table's rest be NUL or space (G18),
-    /// and a host should find the table the same way.
+    /// The key's IDs are padded with NUL (G18, TASKS 64's ledger §3; step B5). A host finds the
+    /// first table in root-table order whose signature is the key's and whose IDs match: an
+    /// empty ID, all NUL, matches any table; any other is compared byte for byte, so a table whose
+    /// ID is padded with spaces matches only a key that gives the spaces. The library checks the
+    /// copy the same way.
     ///
     /// # Errors
     /// Whatever the host refuses or fails.

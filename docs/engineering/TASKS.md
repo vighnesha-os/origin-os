@@ -1624,6 +1624,72 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
     - The discovery machine: 265 ms to load, 136 ms to walk, at most 11,897,534 bytes.
     - The least room above the guard page: 47,151 bytes.
 
+**Step B5 (2026-11-19): the tolerances, on branch `claude/aml-tolerance`, cut from `land/batch-6` at `d99d1c56`** (the coordinating session's word: B5 goes into the seventh batch, `main` merged in before the final gates once PR 41 has merged).
+- **The rulings.** `t63-g-rulings.md` in the coordination notes (2026-11-19), on TASKS item 64's ledger (`docs/research/2026-11-14-aml-gaps-acpica.md` at `659a8b8c`) and TASKS item 72's run of a server's firmware: follow ACPICA's default wherever the ledger says deployed firmware or other implementations rely on it, never its lenient mode, and report every tolerance to the host, bounded. Adopted: the best-effort load (G1, G3, with B4's Q3 and Q7 changed), G2, G4, G5, G11, G13, G14 and G18; unchanged: G6 to G9, G12, G16, G19 and B4-12. G15's string half was adopted (B5-4) and then replaced, by the ruling on the hand-over's point 1, with Table 19.7's pieces: not an adoption.
+- **The contract.** `t63-b5-contract.md`, accepted the same day with Q1 to Q12 as recommended, Q12 then superseded: the tolerances are recorded in A19-A3's row, not a row of their own, the gate needing an ADR-0019 decision for a row.
+- **Built**, a commit each, named by its ruling:
+  - B5-0 `dcfbfbc0`: records first (the ledger's choice table cites ledger 64; the similarity sentence names B5's code; `osi.rs` cites ADR-0019 Amendment 2, item 315).
+  - B5-1 `f63c6179`: `Host::report` and `Report` (at most 64 a top-level evaluation, then one `Suppressed`); G2, a mutex held until the outermost evaluation ends, then released and reported; `ErrorKind::MutexHeld` removed.
+  - B5-2 `d6c2426c` and `22420fbd`: the load policy (`tolerate.rs`: the statement skipped whole by a structural re-parse, Origin's choice under Q1); `OutsideMethod` for B4-13's refusal and for a boot table's locals; the already-loaded refusal; the binding of load-time package names (`bind_deferred`).
+  - B5-3 `e8198acd`: G13, G14, and a `Stall` of 101 to 255 µs reported.
+  - B5-4 `7497fb42`: G4's texts and total conversions, G11, G15.
+  - B5-5 `519c3202`: `AnyAcc` as bytes; an EmbeddedControl field wider than a byte as one `transfer` of up to 255 bytes.
+  - B5-6 `20ec9f31`: G18's key and comparison, for `LoadTable` and `DataTableRegion`.
+  - B5-7 `2da392d1`: the kernel's AML proof binds QEMU's package names and fails on any report (Q9); AML-7.
+  - `08a2124d`: B1 to B4's tests follow the rulings, each keeping its purpose; `9cce702c`: formatting and Clippy; `fcbb2a10` (B5-8): the soak's grammar, audit and four planted faults; `6a6e8757`: records; `c72f1a85`, `a1930f52` and `ebe2a18a`: three soak expectations of my own corrected (block 10 on the step limit, block 33's `LoadTable` key with its space, block 35's method order) and one formatting line, found by the gates' first runs.
+- **Gates** on `ebe2a18a` (2026-11-19, 08:48 to 09:21 UTC, one turn of the machine, a clean tree before and after; Rust 1.100.0 on the development Mac):
+  - formatting, Clippy, and the library's and the kernel proof's host tests;
+  - boot controls AML-1 to AML-7, each caught, every file restored byte for byte (ADR-0013); the baseline passed with no tolerance reported on QEMU's tables;
+  - the soak at seed `0x63d00000`: 1,010,310 grammar cases (98% loaded, 22% returned a value, 26% ran 32 operations, 21 kinds of error), 1,000,000 mutation cases and 76 adversarial, its seventeen planted faults caught;
+  - the release tests: load 69, tolerance 47, proof 41;
+  - `cargo xtask check`: 2,371 tests passed, none failed, 29 ignored; Loom's 56 models and 83 negative controls; the no-panic check at 204 symbols of `origin-aml`'s own; the allocation gate over 21 library files, `tolerate.rs` among them;
+  - `boot-test` 11 of 11; `boot-matrix` 193 scenarios, none failed, the AML proof passing on all 31 kernel boots with no tolerance reported (the discovery machine: 232 ms to load, 129 ms to walk).
+- **TASKS item 72's harness on B5**, outside the repository (item 232), rental A's tables under both stubs: `UAR1` and `UAR2` `_STA` succeed (0x0D with every read zero; 0, absent, with every read all ones, as the firmware's own code gives for that register), `\M652` reads, and there is no failure and no report; before step B5, five failures.
+- **The hand-over's five points, ruled by the coordinating session on 2026-11-19:**
+  1. A buffer longer than its field: ruled to be cut, unless Table 19.7 requires the pieces. It does (the Buffer to Field Unit row), so the point went back for a new ruling. **Ruled again the same day: (a).** Buffers keep B2's pieces, and a string goes as a buffer of its bytes, so in pieces when longer than the field. Each store in pieces is reported (`Report::Pieces`, not a tolerance), and each piece counts against the limits. Built at `c4e0719d`, with the controls `StringCut`, `SilentPieces` and `StringByCharacter`. The kernel's proof fails on a `Pieces` report with its own reason. Two limits of the reading, B2's comparison in bytes and fields narrower than 8 bits, were raised with the coordinating session and ruled the same day: kept as built and recorded as stated limits (ledger §9, G15; A19-A3's limitations), a `Pieces` report seen on real firmware being a finding that reopens the choice. The kernel proof's failing on `Pieces` with its own reason, and the boot control AML-8, were accepted with it, and point 4's test now says why its limit is 256 KiB.
+  2. A boot table's locals and arguments give `OutsideMethod`: confirmed, recorded in the ledger §9 as this session's extension of Q2.
+  3. Q3's identity (signature, OEM IDs, term list): confirmed, with the stated limit that tables differing only in revision, OEM revision or creator count as the same.
+  4. The contract's §5 sentence corrected: the skip's work list is a vector charged to the memory limit and released after each skip; `a_skip_whose_work_list_reaches_the_memory_limit_fails_the_table_whole` shows one at the limit failing the table whole and freeing everything.
+  5. A table that loads itself is refused at its own load: confirmed; the call-depth bound on loads is shown by `a_chain_of_loads_is_bounded_by_the_call_depth` and `nested_loads_run_on_a_fixed_native_stack`.
+- **`main` merged** at `2d0187c0` (PR 41, the sixth batch) into the branch at `6b4c5e09`, cleanly.
+- **The review of B5** (`docs/engineering/REVIEW_T63_B5_2026-11-19.md`, copied in at `7cb282dc`; one AI reviewer started by the coordinating session, no person): 0 High, 1 Medium, 5 Low, 3 Informational, its view of the hand-over's five points the coordinating session's. Answered to that session's rulings of 2026-11-19, a commit each:
+  - B5-R1 `180bc6ad`: the skip steps over a name in a place as a name, never a call;
+  - B5-R2 `adce2aac`: a run-time load binds only its own table's package names, before its `Loading` frame is popped;
+  - B5-R3 `d869001b`: what nothing can read is never bound, whether or not the collector ran;
+  - B5-R4 `8be81730`: the soak's audits 1, 3 and 5, its missing grammar, and every tolerance test failing with `NoReport`;
+  - B5-R5 `3d301ff5`: a host test of the boot proof's binding branch;
+  - B5-R6 `7621917c`, B5-R7 `62d0ce79`: two comments;
+  - B5-R8 `acf159d4`: `Released` names the method that took the mutex;
+  - B5-R9 `fa0cf5d8`: a failed run-time load reports what it releases;
+  - G15's two stated limits, ruled the same day, `fe40b139`; the records, the review's Status column and its Resolution in the commit after `8be81730`.
+  - **Host tests** under the machine's turn lock on the tree those commits make (2026-11-19, 11:36 UTC): `origin-aml`'s 210 passed and 1 ignored, the kernel proof's 42 passed, formatting and both crates' Clippy clean. The same reviewer reads the answers; the full gates then run once, on the final tip.
+- **The addendum** (`docs/engineering/REVIEW_T63_B5_addendum_2026-11-19.md`, copied in at `743b4c3e`; the same reviewer, no person): B5-R1 to B5-R9 closed; new, 2 Low, 3 Informational and a nit. Answered to the coordinating session's rulings of 2026-11-19, a commit each:
+  - B5-R10 and B5-R11, one cause, `b83fe91a`: the deferred list keeps nothing alive, and a pass binds or reports only what a marking of its own finds readable, a failed run-time load's names included;
+  - B5-R12 `f182d374`: a failed run-time load reports its releases before its names are removed;
+  - B5-R13 `c252b83a`: Table 19.7's pages corrected, and a string that fits a wider field named in the stated limit;
+  - B5-R14 `83c76eb8`: `Suppressed` counts the stores in pieces apart from the tolerances;
+  - the nit `d852444a`; the records, the addendum's Status column and its Resolution in the commit after it.
+  - **Host tests** under the machine's turn lock on the tree those commits make (2026-11-19, 13:38 UTC): `origin-aml`'s 215 passed and 1 ignored, the kernel proof's 43 passed, formatting and both crates' Clippy clean. The same reviewer reads the B5-R10/R11 change and the rest briefly; the full gates then run once, on the final tip.
+- **The second addendum** (`docs/engineering/REVIEW_T63_B5_addendum2_2026-11-19.md`, copied in at `022f3c0f`; the same reviewer's short read, no person): B5-R10 to B5-R14 and the nit closed, the four requirements holding by probe; new, 1 Low and 1 Informational, ruled by the coordinating session the same day:
+  - B5-R15 `b028c14b`: a failed table keeps its bytes while a name it put in a package is listed, so a pass binds a name that names something rather than reporting it empty; the fix read by the coordinating session alone;
+  - B5-R16: recorded beside CL41, the pass's charge counting garbage not yet collected; with the records, the second addendum's Status column and its Resolution, in the commit after `b028c14b`.
+  - **Host tests** under the machine's turn lock on the tree of `b028c14b` (2026-11-19, 15:13 UTC): `origin-aml`'s 216 passed and 1 ignored, the kernel proof's 43 passed, formatting and both crates' Clippy clean. The full gates then run once, on the final tip.
+- **The similarity check** (decision item 121; TASKS item 64's session, `SIMILARITY_T63_B5_2026-11-19.md` at `a51c83c4` on `docs/similarity-t63-b5`, against the 48 ACPICA files of ledger 64 §5): nothing to fix in B5's code (`2d0187c0..f3aff5ef`), the owner's sign-off pending. Its two record points are at `95143d52`: `host.rs`'s wording (G5), and three more differences from ACPICA named in the ledger's §9 (G13, G5, G7).
+- **Gates on B5's final code, `f3aff5ef`** (2026-11-19, 15:15 to 15:36 UTC, one turn of the machine, a clean tree before and after; Rust 1.100.0 on the development Mac). `95143d52` after it changes one doc comment and the ledger; its quick gates passed.
+  - formatting, Clippy, and the library's and the kernel proof's host tests;
+  - boot controls AML-1 to AML-8, each caught for its own reason, AML-8 on "a store in pieces was reported on QEMU's own tables", every file restored byte for byte (ADR-0013); the baseline passed with no tolerance and no store in pieces reported;
+  - the soak at seed `0x63d00000`: 1,010,310 grammar cases, 1,000,000 mutation cases and the adversarial blocks, every audit, its planted faults caught;
+  - the release tests: load 76, tolerance 69, proof 44;
+  - `cargo xtask check`: 2,402 tests passed, none failed, 29 ignored; Loom's 56 models and 83 negative controls; the no-panic check at 209 symbols of `origin-aml`'s own; the allocation gate over 21 library files;
+  - `boot-test` 11 of 11;
+  - **`boot-matrix` stopped, and has not passed whole on B5's tip.**
+    - **The stop:** at the AMD IOMMU machine with 65 processors, the kernel's clock proof failed, before the AML proof. After "32 disturbed windows discarded" it printed `clock: one RTC second lasted 1016353 us on the calibrated TSC (+/- 2975 us, over 1 s): clock failed`. The scenarios after it did not run.
+    - **Before it:** nine machines booted (Intel 1, 2, 3, 4 and 65; AMD 1, 2, 3 and 4), and the AML proof passed on each, with no tolerance reported.
+    - **The cause:** TASKS item 66's finding F1. On the 65- and 67-processor machines nearly every 10 ms calibration window is disturbed, and that is the cause of every refuted RTC second. The line is F1's signature, and B5 changes only `firmware/acpi/aml/`, `framekernel/src/aml_proof*` and records: no clock, timer, scheduler or other kernel file.
+    - **Not repeated,** by the coordinating session's ruling of 2026-11-19: the batch's full gates run `boot-matrix` whole after the keeper merges B5.
+  - TASKS item 72's harness on rental A's tables, outside the repository (item 232), at 15:45 UTC: every table loads, the walk completes, and there is no failure and no report under either stub, so no store in pieces.
+- **Not covered:** the similarity check owed before B5's code reaches `main` (decision item 121; a session that writes no code, with the owner's permission and sign-off); `_INI` and `_REG` after a run-time load (G17, the ACPI service's); no boot runs a run-time load; real firmware run only outside the repository (TASKS item 72's harness; item 232).
+
 
 ### 60. The host tools are libraries first (ADR-0011 Amendment 4, T1)
 

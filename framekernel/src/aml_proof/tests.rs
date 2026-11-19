@@ -464,6 +464,9 @@ impl Host for Changed {
     fn debug(&mut self, text: &[u8]) {
         self.boot.debug(text);
     }
+    fn report(&mut self, report: &origin_aml::Report<'_>) {
+        self.boot.report(report);
+    }
     fn table(
         &mut self,
         key: &TableKey,
@@ -658,9 +661,10 @@ fn an_xsdt_entry_that_cannot_be_read_fails_the_proof() {
 }
 
 #[test]
-fn a_definition_block_that_does_not_load_fails_the_proof() {
+fn a_tolerance_on_qemus_tables_fails_the_proof() {
+    // TASKS item 63, step B5 (Q9): `XTRA` twice, the second a duplicate the load abandons and
+    // reports; the table loads, and the report fails the proof, printed.
     let mut m = Machine::new(qemu_dsdt(&[]));
-    // `XTRA` twice: the second is a duplicate, and the table is rolled back.
     m.ssdts.push(table(
         b"SSDT",
         1,
@@ -669,11 +673,32 @@ fn a_definition_block_that_does_not_load_fails_the_proof() {
     let (found, out) = m.run();
     assert_eq!(
         found.failed,
+        Some("a tolerance was reported on QEMU's own tables"),
+        "{out}"
+    );
+    assert!(
+        out.contains("tolerated 1 time(s); the first: a statement abandoned at table 1 offset 0x6 (Duplicate)"),
+        "{out}"
+    );
+    assert_eq!(found.tables, 2, "{out}");
+}
+
+#[test]
+fn a_definition_block_that_does_not_load_fails_the_proof() {
+    let mut m = Machine::new(qemu_dsdt(&[]));
+    // A reserved opcode after `XTRA`: the parser cannot step past it, and the table is rolled
+    // back (step B5's load policy abandons only a statement that fails as it runs).
+    m.ssdts
+        .push(table(b"SSDT", 1, &[name("XTRA", one()), vec![0x02]]));
+    let (found, out) = m.run();
+    assert_eq!(
+        found.failed,
         Some("a definition block did not load"),
         "{out}"
     );
     assert!(out.contains("load failed at table 1 offset "), "{out}");
-    assert!(out.contains("Duplicate; rolled back"), "{out}");
+    assert!(out.contains("Reserved"), "{out}");
+    assert!(out.contains("rolled back"), "{out}");
 }
 
 #[test]
@@ -733,6 +758,117 @@ fn a_global_lock_not_given_back_fails_the_proof() {
         "{out}"
     );
     assert!(found.seen.lock_other > 0, "{out}");
+}
+
+#[test]
+fn package_names_that_cannot_be_bound_fail_the_proof() {
+    // The review of B5, B5-R5: the binding pass is an evaluation of its own, under the limits. No
+    // step limit can reach it in a whole proof: a name costs its load more units than the pass,
+    // and the proof's bound, three evaluations' steps, is checked before each table. So the limit
+    // met is time: a host clock still for its first `K` readings and 10 s on after them. The pass
+    // over 1,250 names charges them at once, which reads the clock; for one `K`, that reading is
+    // the first late one, and the binding's reason comes first.
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static READS: AtomicU64 = AtomicU64::new(0);
+    static STILL_FOR: AtomicU64 = AtomicU64::new(0);
+    fn late() -> u64 {
+        if READS.fetch_add(1, Relaxed) < STILL_FOR.load(Relaxed) {
+            0
+        } else {
+            10_000_000_000
+        }
+    }
+    let names = |p: &str| -> B {
+        let elems: Vec<B> = (0..250).map(|_| nm("\\NONE")).collect();
+        name(p, package(250, &elems))
+    };
+    let dsdt = qemu_ids(table(
+        b"DSDT",
+        1,
+        &[
+            names("PK0"),
+            names("PK1"),
+            names("PK2"),
+            names("PK3"),
+            names("PK4"),
+        ],
+    ));
+    let reason = "the names in QEMU's packages could not be bound";
+    let hit = (0..400u64).find_map(|k| {
+        READS.store(0, Relaxed);
+        STILL_FOR.store(k, Relaxed);
+        let (found, out) = Machine::new(dsdt.clone()).run_with(
+            BootHost::new(late),
+            Limits::BOOT_PROOF,
+            &mut || Some(4096),
+        );
+        (found.failed == Some(reason)).then_some(out)
+    });
+    let out = hit.expect("a clock reading that only the binding pass meets late");
+    assert!(
+        out.contains("origin-kernel: aml: binding package names failed"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_store_in_pieces_on_qemus_tables_fails_the_proof() {
+    // TASKS item 63, step B5's point 1: a `_STA` that stores two bytes into a byte field. The
+    // interpreter tells the host the store goes in two pieces before the first, which the host
+    // then refuses, as it refuses every port; the device's refusal is allowed, the report is not.
+    let dsdt = qemu_dsdt(&[scope(
+        "\\_SB_",
+        &[
+            op_region("PRTR", 1, word(0x80), one()),
+            field("PRTR", 1, &[Fe::Named("PRT8", 8)]),
+            device(
+                "PCS0",
+                &[method(
+                    "_STA",
+                    0,
+                    &[store(buffer(byte(2), &[1, 2]), nm("PRT8")), ret(byte(0x0F))],
+                )],
+            ),
+        ],
+    )]);
+    let (found, out) = Machine::new(dsdt).run();
+    assert_eq!(
+        found.failed,
+        Some("a store in pieces was reported on QEMU's own tables"),
+        "{out}"
+    );
+    assert!(out.contains("stored in pieces 1 time(s)"), "{out}");
+    assert_eq!(found.seen.pieces, 1, "{out}");
+    assert_eq!(found.seen.tolerated, 0, "{out}");
+}
+
+#[test]
+fn reports_past_the_bound_count_by_kind() {
+    // The review of B5's answers, B5-R14: a `Suppressed` adds its stores in pieces to the stores
+    // in pieces and its tolerances to the tolerances, so a proof fails with the reason of each
+    // kind it saw: `IN_PIECES` and `TOLERATED`, each shown above with one report. No evaluation
+    // on QEMU-shaped tables makes 65 stores in pieces, since the host refuses each one's first
+    // write and the evaluation ends there; so the recorder is given the reports directly.
+    let mut r = Recorder::new(BootHost::new(still));
+    r.report(&Report::Pieces {
+        field: &[],
+        pieces: 2,
+    });
+    r.report(&Report::Suppressed {
+        tolerances: 0,
+        pieces: 6,
+    });
+    assert_eq!((r.seen().pieces, r.seen().tolerated), (7, 0));
+    assert_eq!(r.seen().first_tolerance, None);
+    r.report(&Report::Suppressed {
+        tolerances: 3,
+        pieces: 1,
+    });
+    assert_eq!((r.seen().pieces, r.seen().tolerated), (8, 3));
+    assert_eq!(
+        r.seen().first_tolerance.map(|t| t.what),
+        Some("tolerances past the bound")
+    );
 }
 
 #[test]

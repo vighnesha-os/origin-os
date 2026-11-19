@@ -5,9 +5,11 @@
 //!   PciBarTarget, OEM): a field is read and written in naturally aligned units of its access
 //!   width, each unit one host access inside the region. A unit the field covers only in part is
 //!   written by the update rule: Preserve reads it first, WriteAsOnes and WriteAsZeros fill the
-//!   rest. EmbeddedControl and SystemCMOS take bytes only. `AnyAcc` uses the narrowest naturally
-//!   aligned width that holds the whole field, else bytes (G5, strict until the reading session
-//!   answers).
+//!   rest. SystemCMOS takes bytes only, and so does an EmbeddedControl field of 8 bits or fewer;
+//!   a wider EmbeddedControl field is one host transfer of the bytes it spans, up to 255 (G5,
+//!   TASKS 64's ledger §3; step B5, B5's contract Q6). `AnyAcc`, and `BufferAcc` in these spaces,
+//!   is byte access (G5; step B5): every unit lies within the field's bytes, and no unit reaches
+//!   past a region's end that the field does not.
 //! - **Index fields** write the unit's byte offset to the index field, then read or write the data
 //!   field; **bank fields** write the bank value to the bank field first. A chain of fields is at
 //!   most [`FIELD_DEPTH`] deep.
@@ -61,6 +63,16 @@ fn reach(space: u8) -> Reach {
     }
 }
 
+/// The planted fault `EcBytewise`: an EmbeddedControl field wider than a byte read and written a
+/// byte at a time, as before step B5.
+fn ec_bytewise() -> bool {
+    #[cfg(test)]
+    let planted = crate::tests::planted(crate::tests::Fault::EcBytewise);
+    #[cfg(not(test))]
+    let planted = false;
+    planted
+}
+
 fn ones(bits: u64) -> u64 {
     if bits >= 64 {
         u64::MAX
@@ -75,11 +87,19 @@ fn width(f: &FieldUnit, byte_only: bool) -> u64 {
     if byte_only {
         return 1;
     }
+    #[cfg(test)]
+    let widest = crate::tests::planted(crate::tests::Fault::WidestAnyAcc);
+    #[cfg(not(test))]
+    let widest = false;
     match f.access {
         1 => 1,
         2 => 2,
         3 => 4,
         4 => 8,
+        // `AnyAcc` and `BufferAcc`: byte access (G5, TASKS 64's ledger §3; step B5).
+        _ if !widest => 1,
+        // The planted fault `WidestAnyAcc`: the rule before step B5, the narrowest naturally
+        // aligned width that holds the whole field.
         _ => {
             let last = f.bit_offset.saturating_add(f.bit_len.saturating_sub(1));
             [1u64, 2, 4, 8]
@@ -148,28 +168,31 @@ impl<H: Host> Interpreter<H> {
     fn write_value(&mut self, node: NodeId, v: Val, depth: u32) -> Result<Option<Val>> {
         let f = self.unit_of(node)?;
         let bytes = usize::try_from(f.bit_len.div_ceil(8)).map_err(|_| ErrorKind::Range)?;
-        // A string is written a character at a time (Table 19.7).
-        if let Val::Obj(r) = v
-            && let Object::String(s) = self.heap.get(r)?
+        // A string is written as a buffer of its bytes, without its NUL: into a field it fits,
+        // one write, zero-extended; longer, in field-sized pieces as a buffer is (G15's string
+        // half, as the coordinating session ruled it again on 2026-11-19, step B5's point 1;
+        // ACPICA's single write cut to the field, TASKS 64's ledger §3, considered and not
+        // adopted).
+        let string = match v {
+            Val::Obj(r) => match self.heap.get(r)? {
+                Object::String(s) => Some(mem::copy_bytes(s, &mut self.budget)?),
+                _ => None,
+            },
+            _ => None,
+        };
+        #[cfg(test)]
+        if let Some(chars) = &string
+            && let Some(out) = self.planted_string_rule(node, chars, bytes, depth)
         {
-            let chars = mem::copy_bytes(s, &mut self.budget)?;
-            let mut out = Ok(None);
-            for &c in &chars {
-                // Each character is a write, work counted whatever the field's width.
-                out = self
-                    .charge(1)
-                    .and_then(|()| self.field_at(node, Some(&[c]), depth))
-                    .map(|_| None);
-                if out.is_err() {
-                    break;
-                }
+            if let Some(chars) = string {
+                mem::release(chars, &mut self.budget);
             }
-            mem::release(chars, &mut self.budget);
             return out;
         }
-        let data = match v {
-            Val::Int(i) => mem::copy_bytes(&i.to_le_bytes(), &mut self.budget)?,
-            other => self.buffer_of(other)?,
+        let data = match (string, v) {
+            (Some(chars), _) => chars,
+            (None, Val::Int(i)) => mem::copy_bytes(&i.to_le_bytes(), &mut self.budget)?,
+            (None, other) => self.buffer_of(other)?,
         };
         let protocol = match f.kind {
             FieldKind::Region(rn) | FieldKind::Bank { region: rn, .. } => {
@@ -186,10 +209,13 @@ impl<H: Host> Interpreter<H> {
             // below advanced by the field's width, 0, for ever (found by the soak of 2026-11-14).
             Ok(None)
         } else {
-            // A buffer larger than the field is written in pieces, lower first (Table 19.7), each
-            // a write counted as work.
+            // Data longer than the field is written in field-sized pieces, lower first, the last
+            // zero-extended (Table 19.7's Buffer to Field Unit row), each a region access counted
+            // as work, so a long buffer into a narrow field ends at a limit. The host is told
+            // first: ACPICA writes one piece, cut.
             let mut r = Ok(None);
             let bits = u64::try_from(data.len()).unwrap_or(0).saturating_mul(8);
+            self.tell_pieces(node, bits.div_ceil(f.bit_len));
             let mut at: u64 = 0;
             let mut piece = mem::zeroed(bytes, &mut self.budget)?;
             while at < bits && r.is_ok() {
@@ -207,6 +233,37 @@ impl<H: Host> Interpreter<H> {
         };
         mem::release(data, &mut self.budget);
         out
+    }
+
+    /// The planted faults on a string's store: `StringByCharacter`, the rule before step B5, a
+    /// character at a time; `StringCut`, step B5's first rule for G15, the bytes cut to the field
+    /// in one write. `None` when neither is planted.
+    #[cfg(test)]
+    fn planted_string_rule(
+        &mut self,
+        node: NodeId,
+        chars: &[u8],
+        bytes: usize,
+        depth: u32,
+    ) -> Option<Result<Option<Val>>> {
+        use crate::tests::{Fault, planted};
+        if planted(Fault::StringCut) {
+            let cut = chars.get(..bytes.min(chars.len())).unwrap_or(&[]);
+            return Some(self.field_at(node, Some(cut), depth).map(|_| None));
+        }
+        if !planted(Fault::StringByCharacter) {
+            return None;
+        }
+        for &c in chars {
+            // Each character is a write, work counted whatever the field's width.
+            if let Err(e) = self
+                .charge(1)
+                .and_then(|()| self.field_at(node, Some(&[c]), depth))
+            {
+                return Some(Err(e));
+            }
+        }
+        Some(Ok(None))
     }
 
     fn region_space(&self, node: NodeId) -> Result<u8> {
@@ -257,6 +314,9 @@ impl<H: Host> Interpreter<H> {
             match reach(region.space) {
                 Reach::Protocol(size) => return self.protocol(f, &region, write, size),
                 Reach::Pins => return self.pins(f, &region, write),
+                Reach::Units { .. } if region.space == 3 && f.bit_len > 8 && !ec_bytewise() => {
+                    return self.ec_wide(f, &region, write);
+                }
                 Reach::Units { .. } => {}
             }
         }
@@ -624,6 +684,118 @@ impl<H: Host> Interpreter<H> {
         };
         data.truncate(filled);
         self.new_buffer(data)
+    }
+
+    /// An EmbeddedControl field wider than 8 bits: one host transfer of the bytes it spans, up
+    /// to 255, all inside the region (G5, TASKS 64's ledger §3; step B5, B5's contract Q6). A
+    /// write that does not fill whole bytes merges by the update rule: Preserve reads the bytes
+    /// first, in one transfer of its own.
+    fn ec_wide(&mut self, f: &FieldUnit, r: &Region, write: Option<&[u8]>) -> Result<Val> {
+        let shift = f.bit_offset % 8;
+        let span = shift
+            .checked_add(f.bit_len)
+            .ok_or(ErrorKind::Range)?
+            .div_ceil(8);
+        let first = f.bit_offset / 8;
+        if span > 255 || first.checked_add(span).is_none_or(|e| e > r.length) {
+            return err(ErrorKind::Range);
+        }
+        let address = r.offset.checked_add(first).ok_or(ErrorKind::Range)?;
+        let n = usize::try_from(span).map_err(|_| ErrorKind::Range)?;
+        let mut data = mem::zeroed(n, &mut self.budget)?;
+        let out = match write {
+            None => self.ec_read(f, r, address, shift, &mut data),
+            Some(src) => self.ec_write(f, r, address, shift, src, &mut data),
+        };
+        mem::release(data, &mut self.budget);
+        out
+    }
+
+    fn ec_read(
+        &mut self,
+        f: &FieldUnit,
+        r: &Region,
+        address: u64,
+        shift: u64,
+        data: &mut [u8],
+    ) -> Result<Val> {
+        self.ec_transfer(f, r, address, false, data)?;
+        let bytes = usize::try_from(f.bit_len.div_ceil(8)).map_err(|_| ErrorKind::Range)?;
+        let mut value = mem::zeroed(bytes, &mut self.budget)?;
+        if let Err(e) = get_bits(data, shift, f.bit_len, &mut value) {
+            mem::release(value, &mut self.budget);
+            return Err(e);
+        }
+        self.field_value(f.bit_len, value)
+    }
+
+    fn ec_write(
+        &mut self,
+        f: &FieldUnit,
+        r: &Region,
+        address: u64,
+        shift: u64,
+        src: &[u8],
+        data: &mut [u8],
+    ) -> Result<Val> {
+        if shift != 0 || !f.bit_len.is_multiple_of(8) {
+            match f.update {
+                0 => self.ec_transfer(f, r, address, false, data)?,
+                1 => data.fill(0xFF),
+                _ => {}
+            }
+        }
+        // The value's bits, from bit 0, zero-extended to the field.
+        let bytes = usize::try_from(f.bit_len.div_ceil(8)).map_err(|_| ErrorKind::Range)?;
+        let mut value = mem::zeroed(bytes, &mut self.budget)?;
+        for (d, s) in value.iter_mut().zip(src) {
+            *d = *s;
+        }
+        let r0 = set_bits(data, shift, f.bit_len, &value);
+        mem::release(value, &mut self.budget);
+        r0?;
+        self.ec_transfer(f, r, address, true, data)?;
+        Ok(Val::None)
+    }
+
+    /// One host transfer of an EmbeddedControl field's bytes (`ec_wide`).
+    fn ec_transfer(
+        &mut self,
+        f: &FieldUnit,
+        r: &Region,
+        address: u64,
+        write: bool,
+        data: &mut [u8],
+    ) -> Result<()> {
+        let region_path = self.path_of_region(&Path::Region(*r))?;
+        let got = match self.time_for_host() {
+            Ok(time_left_100ns) => {
+                let access = BufferAccess {
+                    space: Space(r.space),
+                    address,
+                    write,
+                    attribute: f.attrib,
+                    length: u8::try_from(data.len()).unwrap_or(u8::MAX),
+                    connection: None,
+                    bit_offset: f.bit_offset % 8,
+                    bit_length: f.bit_len,
+                    region: &region_path,
+                    time_left_100ns,
+                };
+                let got = self.host.transfer(&access, data);
+                self.trace(&Trace::Transfer(&access, got));
+                got.map(|_| ()).map_err(|cause| {
+                    Error::from(ErrorKind::Region {
+                        space: r.space,
+                        address,
+                        cause,
+                    })
+                })
+            }
+            Err(e) => Err(e),
+        };
+        mem::release(region_path, &mut self.budget);
+        got
     }
 
     /// One transfer of a field's own bytes (GeneralPurposeIO, PCC).
