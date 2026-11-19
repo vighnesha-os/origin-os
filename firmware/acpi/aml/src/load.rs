@@ -609,7 +609,9 @@ impl<H: Host> Interpreter<H> {
             mem::release(kept, &mut self.budget);
         }
         self.unwind(at, l.calls, l.owners);
-        self.release_held(l.held);
+        // What the table's code took goes with the table, each release reported: the evaluation
+        // goes on, so this is an end other than its own (G2; the review of B5, B5-R9).
+        self.release_reported(l.held);
         self.pending = None;
         self.run.depth = l.depth;
         self.fail_table(l.table);

@@ -596,6 +596,61 @@ fn a_mutex_a_method_declared_is_held_past_its_names() {
 }
 
 #[test]
+fn a_failed_runtime_load_reports_what_it_releases() {
+    // The review of B5, B5-R9 (G2): a run-time table whose code takes `MX` and then fails whole (a
+    // reserved opcode) is rolled back, and what its code took is released then, each release
+    // reported; the evaluation goes on with `Load`'s Zero.
+    let bad = ssdt(&[acquire(nm("\\MX"), 0xFFFF), vec![0x02]]);
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            mutex("MX", 0),
+            name("TB", buffer_of(&bad)),
+            name("AFT", zero()),
+            method(
+                "LD",
+                0,
+                &[store(load_op("TB", zero()), nm("AFT")), ret(nm("AFT"))],
+            ),
+        ],
+    )
+    .unwrap();
+    assert_eq!(int(&mut i, "LD"), 0);
+    assert_eq!(told(&mut i), vec![Told::Released(vec![*b"MX__"], vec![])]);
+    assert!(i.held.is_empty());
+    assert!(i.table(1).unwrap().failed);
+}
+
+#[test]
+fn planted_faults_are_caught_by_the_release_tests() {
+    let tests: [Control; 2] = [
+        (
+            None,
+            &[
+                a_mutex_a_method_declared_is_held_past_its_names,
+                a_failed_runtime_load_reports_what_it_releases,
+            ],
+        ),
+        (
+            Some(Fault::SilentRelease),
+            &[
+                a_mutex_a_method_declared_is_held_past_its_names,
+                a_failed_runtime_load_reports_what_it_releases,
+            ],
+        ),
+    ];
+    for (f, cases) in tests {
+        for case in cases {
+            plant(f);
+            let failed = std::panic::catch_unwind(case).is_err();
+            plant(None);
+            assert_eq!(failed, f.is_some(), "{f:?}: case {case:?}");
+        }
+    }
+}
+
+#[test]
 fn a_skip_whose_work_list_reaches_the_memory_limit_fails_the_table_whole() {
     // The skip's work list is a vector charged to the memory limit and given back after each skip
     // (B5's contract, corrected; the coordinating session's ruling on the hand-over's point 4). A
