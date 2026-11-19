@@ -531,7 +531,10 @@ pub fn slot_state(slot: StackSlot) -> Option<State> {
 }
 
 /// The most measured calls that may run at once, on every processor together; a call past it is
-/// refused before its closure runs.
+/// refused, before it takes a stack, and its closure does not run. A record is given back when its
+/// call returns, so a thread that ends inside a measured closure never gives its record back (nor
+/// one for each call it was nested in): each such record counts against these 64 for the rest of
+/// the boot (the review of TASKS item 68, T68-9).
 pub const MEASURED_CALLS: usize = 64;
 
 /// For each measured call running, the stack pointer of the stack it left; 0 is a free entry.
@@ -629,6 +632,10 @@ pub struct Measured<R> {
 /// The stack's contents are not wiped when it is given back: like any kernel stack, it is zeroed
 /// before its next holder gets it.
 pub fn with_measured_stack<R>(bytes: usize, f: impl FnOnce() -> R) -> Option<Measured<R>> {
+    // The record of the stack this call leaves (A1), taken first, so a full table refuses the call
+    // before any stack is taken (T68-9): any address on the caller's stack, which stays live until
+    // this returns, is a record of it. It is given back only after the switch back.
+    let left = Left::record(stack_pointer())?;
     let stack = GuardedStack::new(bytes)?;
     let size = stack.bytes();
     let words = size / 8;
@@ -639,9 +646,6 @@ pub fn with_measured_stack<R>(bytes: usize, f: impl FnOnce() -> R) -> Option<Mea
         // long as `stack` is held. Nothing runs on the stack yet: it was taken just now.
         unsafe { low.wrapping_add(word).write_volatile(PAINT) };
     }
-    // The record of the stack this call leaves (A1), taken before the switch and given back only
-    // after the switch back.
-    let left = Left::record(stack_pointer())?;
     let mut f = Some(f);
     let mut value = None;
     let mut run = || {
