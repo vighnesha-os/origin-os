@@ -3,14 +3,19 @@
 //!
 //! Both run one recursion of known shape on a measured stack: each level writes an array of
 //! [`PAD`] words, keeps it across the next level and adds it up after, and the deepest level
-//! samples the stack in a leaf that is never inlined ([`mark`]): the address of the one word
-//! that leaf writes below its saved frame pointer.
+//! samples the stack in a leaf that is never inlined ([`mark`]): the address of its local.
 //!
 //! - **At boot** ([`prove_at_boot`], before the AML proof, in the boot flow with interrupts off):
-//!   at [`SHALLOW`] and [`DEEP`] levels, the depth measured must equal the depth sampled, to the byte
-//!   (the coordinating session's ruling, Q7). Nothing runs below the sample: the leaf calls
-//!   nothing, no interrupt comes, and the kernel's target uses no red zone, so nothing is written
-//!   below the stack pointer. A call with an empty closure gives what a call costs.
+//!   at [`SHALLOW`] and [`DEEP`] levels on [`BOOT_STACK`] bytes, the depth measured must equal the
+//!   depth sampled, to the byte (the coordinating session's ruling, Q7). `mark` writes two words
+//!   below its saved frame pointer, its local and `black_box`'s copy of the local's address, and
+//!   in this build the local takes the lower slot (`rbp-0x10`), so it is the deepest word written.
+//!   Nothing runs below it: the leaf calls nothing, no interrupt comes, and the kernel's target
+//!   uses no red zone, so nothing is written below the stack pointer. A build that gave the local
+//!   the upper slot would measure 8 bytes more than it sampled, at both depths, with nothing wrong
+//!   in the function: the proof's failure line says so, and a toolchain upgrade (CLAUDE.md §15)
+//!   reads `mark`'s disassembly again (the review of TASKS item 68, T68-4). A call with an empty
+//!   closure gives what a call costs.
 //! - **In a thread** ([`prove_in_thread`], in `sched::prove`): a kernel thread on the boot
 //!   processor runs the recursion at [`THREAD_LEVELS`] levels, and at the deepest, after its
 //!   sample, yields until the boot flow has had a turn. Meanwhile the boot flow asks the framework
@@ -45,8 +50,12 @@ use origin_frame::stack::{self, Measured, StackSlot, State};
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, rdtsc};
 
-/// The measured stack's size: a kernel thread's.
+/// The measured stack's size in a thread: a kernel thread's.
 const STACK: usize = 16 * 1024;
+/// The measured stack's size at boot: about three times what the deep run needs in this build
+/// (176 bytes a level), so a frame that grew by half still fits, and a Report proof does not
+/// become a double fault that halts the boot (T68-6). Under `MAX_STACK`.
+const BOOT_STACK: usize = 32 * 1024;
 /// Words each level of the recursion writes and keeps across the next.
 const PAD: usize = 16;
 /// The two depths of the proof at boot.
@@ -63,8 +72,10 @@ const THREAD_YIELDS: u64 = 1_000;
 /// The most turns the boot flow gives the thread before it gives up.
 const BOOT_TURNS: u64 = 100_000;
 
-/// The address of the one word this leaf writes below its saved frame pointer: the deepest word
-/// written at the deepest level of the recursion.
+/// The address of this leaf's local. The leaf writes two words below its saved frame pointer, the
+/// local and `black_box`'s copy of its address; in this build the local is the lower, so its
+/// address is the deepest word written at the deepest level of the recursion (see the module
+/// docs, T68-4).
 #[inline(never)]
 fn mark() -> usize {
     let here = 0u64;
@@ -123,27 +134,28 @@ fn sampled_depth(sampled: usize) -> Option<usize> {
 /// thread exists.
 pub(crate) fn prove_at_boot(com1: &mut Console, tsc_hz: u64) -> bool {
     let began = rdtsc();
-    let empty = stack::with_measured_stack(STACK, || ());
+    let empty = stack::with_measured_stack(BOOT_STACK, || ());
     let call_ticks = rdtsc().wrapping_sub(began);
     let Some(empty) = empty else {
         let _ = writeln!(
             com1,
-            "origin-kernel: measured stack: no stack of {STACK} bytes could be had: measured stack failed"
+            "origin-kernel: measured stack: no stack of {BOOT_STACK} bytes could be had: measured stack failed"
         );
         return false;
     };
     let _ = write!(
         com1,
-        "origin-kernel: measured stack: at boot, on {STACK} bytes: "
+        "origin-kernel: measured stack: at boot, on {BOOT_STACK} bytes: "
     );
     let mut ok = true;
+    let mut eight_more = false;
     let (mut shallow, mut deep) = (0usize, 0usize);
     for (levels, measured) in [(SHALLOW, &mut shallow), (DEEP, &mut deep)] {
         let Some(Measured {
             value: found,
             depth,
             size,
-        }) = stack::with_measured_stack(STACK, || level(levels, None))
+        }) = stack::with_measured_stack(BOOT_STACK, || level(levels, None))
         else {
             let _ = writeln!(com1, "no stack for {levels} levels: measured stack failed");
             return false;
@@ -152,6 +164,7 @@ pub(crate) fn prove_at_boot(com1: &mut Console, tsc_hz: u64) -> bool {
         let right = found.sum == expected_sum(levels);
         let exact = sampled == Some(depth) && depth < size;
         ok &= right && exact;
+        eight_more |= sampled.is_some_and(|sampled| depth == sampled + 8);
         *measured = depth;
         let _ = write!(
             com1,
@@ -161,10 +174,15 @@ pub(crate) fn prove_at_boot(com1: &mut Console, tsc_hz: u64) -> bool {
     }
     let _ = writeln!(
         com1,
-        "{} bytes a level; an empty closure {} bytes deep, the call {} us; {}",
+        "{} bytes a level; an empty closure {} bytes deep, the call {} us; {}{}",
         deep.saturating_sub(shallow) / (DEEP - SHALLOW) as usize,
         empty.depth,
         call_ticks.saturating_mul(1_000_000) / tsc_hz.max(1),
+        if eight_more {
+            "8 bytes more than sampled may be `mark`'s two words in swapped slots, a change in the build rather than the function: read its disassembly first; "
+        } else {
+            ""
+        },
         if ok {
             "passed"
         } else {

@@ -2616,7 +2616,7 @@ fn acpi_markers() -> Vec<String> {
 /// only when the two are equal to the byte at both.
 fn measured_stack_markers() -> Vec<String> {
     [
-        "origin-kernel: measured stack: at boot, on 16384 bytes: 8 levels: ",
+        "origin-kernel: measured stack: at boot, on 32768 bytes: 8 levels: ",
         " sampled, value right true; 64 levels: ",
         " sampled, value right true; ",
         " bytes a level; an empty closure ",
