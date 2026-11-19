@@ -380,7 +380,8 @@ impl<H: Host> Interpreter<H> {
                     .map(|()| None)
             }
             (Mode::Store, Target::Buf) => {
-                // G11, strict until the reading session answers: a named buffer keeps its length.
+                // G11 (TASKS 64's ledger §3): a named buffer keeps its length, except that a
+                // zero-length one takes the source's (step B5).
                 let bytes = self.buffer_of(v)?;
                 // Every byte of the target is written, whatever the source's size: charged
                 // before, a unit each 64 (the review of B1, A1).
@@ -388,6 +389,16 @@ impl<H: Host> Interpreter<H> {
                     Ok(Object::Buffer(b)) => b.len(),
                     _ => 0,
                 };
+                #[cfg(test)]
+                let keep = crate::tests::planted(crate::tests::Fault::KeepZeroLength);
+                #[cfg(not(test))]
+                let keep = false;
+                if len == 0 && !keep {
+                    return self
+                        .heap
+                        .replace(obj, Object::Buffer(bytes), &mut self.budget)
+                        .map(|()| None);
+                }
                 let r = self.charge(
                     u64::try_from(len / 64)
                         .unwrap_or(u64::MAX)

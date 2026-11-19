@@ -530,7 +530,7 @@ impl<H: Host> Interpreter<H> {
                 let text = match self.data(source)? {
                     Data::Int => {
                         let i = self.int_of(source)?;
-                        self.int_hex(i)?
+                        self.int_hex_short(i)?
                     }
                     Data::Str => self.string_of(source)?,
                     Data::Buf => {

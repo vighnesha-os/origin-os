@@ -148,7 +148,25 @@ impl<H: Host> Interpreter<H> {
     fn write_value(&mut self, node: NodeId, v: Val, depth: u32) -> Result<Option<Val>> {
         let f = self.unit_of(node)?;
         let bytes = usize::try_from(f.bit_len.div_ceil(8)).map_err(|_| ErrorKind::Range)?;
-        // A string is written a character at a time (Table 19.7).
+        // A string is written as its bytes, without its NUL, zero-extended or cut to the field,
+        // in one write (G15, TASKS 64's ledger §3; step B5).
+        #[cfg(test)]
+        let by_character = crate::tests::planted(crate::tests::Fault::StringByCharacter);
+        #[cfg(not(test))]
+        let by_character = false;
+        if let Val::Obj(r) = v
+            && let Object::String(s) = self.heap.get(r)?
+            && !by_character
+        {
+            let mut chars = mem::copy_bytes(s, &mut self.budget)?;
+            if chars.len() > bytes {
+                chars.truncate(bytes);
+            }
+            let out = self.field_at(node, Some(&chars), depth).map(|_| None);
+            mem::release(chars, &mut self.budget);
+            return out;
+        }
+        // The planted fault `StringByCharacter`: the rule before step B5, a character at a time.
         if let Val::Obj(r) = v
             && let Object::String(s) = self.heap.get(r)?
         {

@@ -766,3 +766,173 @@ fn planted_faults_are_caught_by_the_decoder_tests() {
         }
     }
 }
+
+// --- Conversions and stores: G4, G11, G15 (step B5-4) ------------------------------------------
+
+/// The value a method returning `v` gives, at `width`.
+fn value_of(width: IntegerWidth, v: B) -> Value {
+    let mut i = interp(width);
+    load(&mut i, &[method("M", 0, &[ret(v)])]).unwrap();
+    eval(&mut i, "M").unwrap().unwrap()
+}
+
+fn text(s: &str) -> Value {
+    Value::String(s.as_bytes().to_vec())
+}
+
+#[test]
+fn g4_texts() {
+    use IntegerWidth::{Bits32, Bits64};
+    let buf = || buffer(byte(3), &[0x01, 0xAB, 0x00]);
+    let empty = || buffer(zero(), &[]);
+    for (width, v, want) in [
+        (Bits64, concat(string(""), byte(0x1A), none()), "000000000000001A"),
+        (Bits32, concat(string(""), byte(0x1A), none()), "0000001A"),
+        (Bits64, un(0x98, byte(0x1A), none()), "0x1A"),
+        (Bits64, un(0x98, zero(), none()), "0x0"),
+        (Bits64, un(0x98, qword(u64::MAX), none()), "0xFFFFFFFFFFFFFFFF"),
+        (Bits64, un(0x97, word(1234), none()), "1234"),
+        (Bits64, un(0x97, zero(), none()), "0"),
+        (Bits64, concat(string(""), buf(), none()), "0x01 0xAB 0x00"),
+        (Bits64, un(0x98, buf(), none()), "0x01,0xAB,0x00"),
+        (Bits64, un(0x97, buf(), none()), "1,171,0"),
+        (Bits64, un(0x98, empty(), none()), ""),
+        (Bits64, un(0x97, empty(), none()), ""),
+        (Bits64, concat(string(""), empty(), none()), ""),
+    ] {
+        assert_eq!(value_of(width, v), text(want), "{want}");
+    }
+}
+
+#[test]
+fn string_to_integer_is_total() {
+    use IntegerWidth::{Bits32, Bits64};
+    // Implicit (here through `Add`): hexadecimal, a `0x` tolerated.
+    for (w, s, want) in [
+        (Bits64, "1A", 0x1A),
+        (Bits64, "  \t1a", 0x1A),
+        (Bits64, "0x1A", 0x1A),
+        (Bits64, "001A", 0x1A),
+        (Bits64, "1AZ9", 0x1A),
+        (Bits64, "", 0),
+        (Bits64, "zz", 0),
+        (Bits64, "12345678901234567", 0x1234_5678_9012_3456),
+        (Bits32, "123456789", 0x1234_5678),
+        (Bits64, "0000000000000000001", 1),
+    ] {
+        assert_eq!(
+            value_of(w, add(string(s), zero(), none())),
+            Value::Integer(want),
+            "{s:?}"
+        );
+    }
+}
+
+#[test]
+fn to_integer_decimal_and_hex() {
+    use IntegerWidth::{Bits32, Bits64};
+    for (w, s, want) in [
+        (Bits64, "  1234", 1234),
+        (Bits64, "0x1A", 26),
+        (Bits64, "0X1f", 31),
+        (Bits64, "12AB", 12),
+        (Bits64, "", 0),
+        (Bits64, "99999999999999999999999", 9_999_999_999_999_999_999),
+        (Bits32, "9999999999", 999_999_999),
+    ] {
+        assert_eq!(
+            value_of(w, un(0x99, string(s), none())),
+            Value::Integer(want),
+            "{s:?}"
+        );
+    }
+    // A string becomes a buffer with its NUL, an empty one as one zero byte.
+    assert_eq!(
+        value_of(Bits64, un(0x96, string("AB"), none())),
+        Value::Buffer(vec![0x41, 0x42, 0])
+    );
+    assert_eq!(
+        value_of(Bits64, un(0x96, string(""), none())),
+        Value::Buffer(vec![0])
+    );
+}
+
+#[test]
+fn zero_length_buffer_takes_source_length() {
+    // G11: a zero-length named buffer takes the source's length; any other keeps its own; a named
+    // string takes the new string's.
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            name("B0", buffer(zero(), &[])),
+            name("B2", buffer(byte(2), &[9, 9])),
+            name("S", string("abcdef")),
+            method(
+                "M",
+                0,
+                &[
+                    store(buffer(byte(3), &[1, 2, 3]), nm("B0")),
+                    store(buffer(byte(3), &[1, 2, 3]), nm("B2")),
+                    store(string("xy"), nm("S")),
+                ],
+            ),
+            method("N", 0, &[store(buffer(byte(1), &[7]), nm("B2"))]),
+        ],
+    )
+    .unwrap();
+    eval(&mut i, "M").unwrap();
+    assert_eq!(eval(&mut i, "B0"), Ok(Some(Value::Buffer(vec![1, 2, 3]))));
+    assert_eq!(eval(&mut i, "B2"), Ok(Some(Value::Buffer(vec![1, 2]))));
+    assert_eq!(eval(&mut i, "S"), Ok(Some(text("xy"))));
+    eval(&mut i, "N").unwrap();
+    assert_eq!(eval(&mut i, "B2"), Ok(Some(Value::Buffer(vec![7, 0]))));
+    assert_eq!(told(&mut i), vec![]);
+}
+
+#[test]
+fn string_to_field_as_bytes() {
+    // G15: one write of the string's bytes, without its NUL, zero-extended or cut to the field.
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            op_region("RM", 0, word(0x1000), byte(4)),
+            field("RM", 3, &[Fe::Named("F32", 32)]),
+            method("W", 1, &[store(arg(0), nm("F32")), ret(nm("F32"))]),
+        ],
+    )
+    .unwrap();
+    for (s, want) in [
+        ("ABCD", 0x4443_4241u64),
+        ("AB", 0x4241),
+        ("ABCDEF", 0x4443_4241),
+        ("", 0),
+    ] {
+        i.host_mut().seen.clear();
+        let got = i
+            .evaluate("\\W", &[Value::String(s.as_bytes().to_vec())])
+            .unwrap();
+        assert_eq!(got, Some(Value::Integer(want)), "{s:?}");
+        let writes = i.host().seen.iter().filter(|x| x.write).count();
+        assert_eq!(writes, 1, "{s:?}");
+    }
+}
+
+#[test]
+fn planted_faults_are_caught_by_the_conversion_tests() {
+    let tests: [(Option<Fault>, &[fn()]); 4] = [
+        (None, &[g4_texts, string_to_integer_is_total, to_integer_decimal_and_hex, zero_length_buffer_takes_source_length, string_to_field_as_bytes]),
+        (Some(Fault::OldTexts), &[g4_texts]),
+        (Some(Fault::KeepZeroLength), &[zero_length_buffer_takes_source_length]),
+        (Some(Fault::StringByCharacter), &[string_to_field_as_bytes]),
+    ];
+    for (f, cases) in tests {
+        for case in cases {
+            plant(f);
+            let failed = std::panic::catch_unwind(case).is_err();
+            plant(None);
+            assert_eq!(failed, f.is_some(), "{f:?}: case {case:?}");
+        }
+    }
+}

@@ -1,11 +1,16 @@
 //! Conversions between data types (ACPI 6.6 §19.3.5, Tables 19.6 and 19.7), and the text forms
 //! the explicit conversion operators make.
 //!
-//! The text forms are G4's strict choices, provisional until the reading session answers
-//! (`docs/research/2026-11-14-aml-interpreter.md` §9): integers as the integer width's
-//! hexadecimal digits, upper case, no prefix; a buffer as two upper-case digits a byte, separated
-//! by spaces (implicit) or commas (`ToHexString`); `ToDecimalString` of a buffer as decimal values
-//! separated by commas.
+//! The text forms are ACPICA's (G4, TASKS 64's ledger §3; step B5), upper-case digits throughout:
+//! an integer, implicitly, as the integer width's hexadecimal digits with leading zeros and no
+//! prefix; `ToHexString` of an integer as `0x` and its digits without leading zeros (`0x0`); a
+//! buffer as `0x` and two digits a byte, separated by a space (implicit) or a comma
+//! (`ToHexString`); `ToDecimalString` as decimal, a buffer's bytes separated by commas; an empty
+//! buffer as an empty string. A string becomes an integer without ever failing: leading white
+//! space and zeros skipped, hexadecimal (a `0x` tolerated) implicitly, decimal for `ToInteger`
+//! unless `0x`; it stops at the first character that is not a digit, or at the digit that would
+//! overflow the integer width, keeping the value so far; an empty string gives 0. A string becomes
+//! a buffer with its terminating NUL, an empty one as one zero byte.
 
 use alloc::vec::Vec;
 use core::cmp::Ordering;
@@ -30,6 +35,41 @@ const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 fn hex_digit(n: u8) -> u8 {
     HEX.get(usize::from(n & 0xF)).copied().unwrap_or(b'0')
+}
+
+/// White space a string-to-integer conversion skips first: space, and 0x09 to 0x0D (B5's
+/// contract, Q8).
+const fn is_space(c: u8) -> bool {
+    c == b' ' || matches!(c, 0x09..=0x0D)
+}
+
+/// The digits of `s` from the first after white space, an optional `0x` (`hex` is then forced on
+/// when `prefix_sets_hex`), and leading zeros; and the radix.
+fn digits_of(s: &[u8], hex: bool) -> (&[u8], u64) {
+    let start = s.iter().position(|&c| !is_space(c)).unwrap_or(s.len());
+    let rest = s.get(start..).unwrap_or(&[]);
+    let (rest, radix) = match rest {
+        [b'0', b'x' | b'X', tail @ ..] => (tail, 16u64),
+        all => (all, if hex { 16u64 } else { 10u64 }),
+    };
+    let first = rest.iter().position(|&c| c != b'0').unwrap_or(rest.len());
+    (rest.get(first..).unwrap_or(&[]), radix)
+}
+
+/// `digits` in `radix`, up to the first character that is not one and before the digit that would
+/// overflow `mask`: never an error (G4, step B5).
+fn total_int(digits: &[u8], radix: u64, mask: u64) -> u64 {
+    let mut x: u64 = 0;
+    for &c in digits {
+        let Some(d) = hex_value(c).filter(|&d| d < radix) else {
+            break;
+        };
+        match x.checked_mul(radix).and_then(|x| x.checked_add(d)) {
+            Some(n) if n & !mask == 0 => x = n,
+            _ => break,
+        }
+    }
+    x
 }
 
 fn hex_value(c: u8) -> Option<u64> {
@@ -61,7 +101,6 @@ impl<H: Host> Interpreter<H> {
     pub(crate) fn int_of(&mut self, v: Val) -> Result<u64> {
         let mask = self.width.mask();
         let bytes = self.width.bytes();
-        let digits = bytes.saturating_mul(2);
         match v {
             Val::Int(i) => Ok(i & mask),
             Val::None => err(ErrorKind::Uninitialized),
@@ -79,17 +118,15 @@ impl<H: Host> Interpreter<H> {
                     Ok(x & mask)
                 }
                 Object::String(s) => {
-                    // Hexadecimal digits from the first, to the first other character or the
-                    // width; no `0x` prefix; an empty string refused.
-                    if s.is_empty() {
-                        return err(ErrorKind::Type);
-                    }
-                    let mut x: u64 = 0;
-                    for &c in s.iter().take(digits) {
-                        let Some(d) = hex_value(c) else { break };
-                        x = (x << 4) | d;
-                    }
-                    Ok(x & mask)
+                    // Hexadecimal, a `0x` tolerated, never failing (G4, step B5).
+                    let s = s.as_slice();
+                    self.note_work(
+                        u64::try_from(s.len() / 64)
+                            .unwrap_or(u64::MAX)
+                            .saturating_add(1),
+                    );
+                    let (d, radix) = digits_of(s, true);
+                    Ok(total_int(d, radix, mask))
                 }
                 _ => err(ErrorKind::Type),
             },
@@ -118,9 +155,8 @@ impl<H: Host> Interpreter<H> {
                 }
                 Object::Buffer(b) => mem::copy_bytes(b, &mut self.budget),
                 Object::String(s) => {
-                    if s.is_empty() {
-                        return Ok(Vec::new());
-                    }
+                    // Its terminating NUL too, an empty string's included (G4, step B5; B5's
+                    // contract, Q8).
                     let mut out = mem::with_capacity(s.len().saturating_add(1), &mut self.budget)?;
                     mem::extend_bytes(&mut out, s, &mut self.budget)?;
                     mem::extend_bytes(&mut out, &[0], &mut self.budget)?;
@@ -147,17 +183,47 @@ impl<H: Host> Interpreter<H> {
         Ok(out)
     }
 
-    /// Bytes as two hexadecimal digits each, separated by `sep`.
+    /// Bytes as `0x` and two hexadecimal digits each, separated by `sep` (G4, step B5).
     pub(crate) fn bytes_hex(&mut self, bytes: &[u8], sep: u8) -> Result<Vec<u8>> {
-        let len = bytes.len().saturating_mul(3);
+        let len = bytes.len().saturating_mul(5);
         let mut out = mem::with_capacity(len, &mut self.budget)?;
+        #[cfg(test)]
+        let prefix: &[u8] = if crate::tests::planted(crate::tests::Fault::OldTexts) {
+            b""
+        } else {
+            b"0x"
+        };
+        #[cfg(not(test))]
+        let prefix: &[u8] = b"0x";
         for (k, &b) in bytes.iter().enumerate() {
             if k > 0 {
                 mem::extend_bytes(&mut out, &[sep], &mut self.budget)?;
             }
+            mem::extend_bytes(&mut out, prefix, &mut self.budget)?;
             mem::extend_bytes(
                 &mut out,
                 &[hex_digit(b >> 4), hex_digit(b)],
+                &mut self.budget,
+            )?;
+        }
+        Ok(out)
+    }
+
+    /// `ToHexString`'s text of an integer: `0x` and its digits without leading zeros, so zero is
+    /// `0x0` (G4, step B5).
+    pub(crate) fn int_hex_short(&mut self, i: u64) -> Result<Vec<u8>> {
+        let mut out = mem::with_capacity(18, &mut self.budget)?;
+        mem::extend_bytes(&mut out, b"0x", &mut self.budget)?;
+        let mut started = false;
+        for k in (0..16u32).rev() {
+            let nibble = (i >> (k.saturating_mul(4) & 63)) & 0xF;
+            if nibble == 0 && !started && k > 0 {
+                continue;
+            }
+            started = true;
+            mem::extend_bytes(
+                &mut out,
+                &[hex_digit(u8::try_from(nibble).unwrap_or(0))],
                 &mut self.budget,
             )?;
         }
@@ -271,30 +337,15 @@ impl<H: Host> Interpreter<H> {
         let Object::String(s) = self.heap.get(r)? else {
             return self.int_of(v);
         };
-        let (digits, radix) = match s.as_slice() {
-            [b'0', b'x' | b'X', rest @ ..] => (rest, 16u64),
-            all => (all, 10u64),
-        };
-        if digits.is_empty() {
-            return err(ErrorKind::Type);
-        }
-        // Leading zeros keep the loop going for the whole string: a unit for each 64 digits.
+        // Decimal unless `0x`, never failing (G4, step B5). The scan of white space and zeros
+        // reads the whole string at most: a unit for each 64 bytes.
+        let s = s.as_slice();
         self.note_work(
-            u64::try_from(digits.len() / 64)
+            u64::try_from(s.len() / 64)
                 .unwrap_or(u64::MAX)
                 .saturating_add(1),
         );
-        let mut x: u64 = 0;
-        for &c in digits {
-            let d = hex_value(c).filter(|&d| d < radix).ok_or(ErrorKind::Type)?;
-            x = x
-                .checked_mul(radix)
-                .and_then(|x| x.checked_add(d))
-                .ok_or(ErrorKind::Type)?;
-        }
-        if x & !self.width.mask() != 0 {
-            return err(ErrorKind::Type);
-        }
-        Ok(x)
+        let (digits, radix) = digits_of(s, false);
+        Ok(total_int(digits, radix, self.width.mask()))
     }
 }

@@ -443,6 +443,14 @@ pub(crate) enum Fault {
     RefuseExtraElements,
     /// A `Stall` of 101 to 255 µs is not reported (`sync.rs`, `stall`).
     SilentStall,
+    /// A buffer's text has no `0x` before each byte, as before step B5 (`convert.rs`,
+    /// `bytes_hex`).
+    OldTexts,
+    /// A zero-length named buffer keeps its length, as before step B5 (`store.rs`).
+    KeepZeroLength,
+    /// A string is written to a field a character at a time, as before step B5 (`region.rs`,
+    /// `write_value`).
+    StringByCharacter,
 }
 
 thread_local! {
