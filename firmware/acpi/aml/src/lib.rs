@@ -29,15 +29,25 @@
 //! mark-and-sweep collector at safe points between steps; every allocation goes through `mem.rs`,
 //! which charges it to the memory limit before it is made.
 //!
-//! **What is built** (steps B1, B2 and B4 of TASKS item 63): the whole parser, the namespace,
+//! **What is built** (steps B1 to B5 of TASKS item 63): the whole parser, the namespace,
 //! every operator, field units over every region space through the host, mutexes and the Global
 //! Lock, events, the device initialization walk ([`Interpreter::initialize`]) and `_REG`
 //! ([`Interpreter::connect_space`]). `Load` and `LoadTable` load a table while an evaluation
 //! runs, on the engine's frame stack, after `origin-acpi-tables` has checked it (`load.rs`).
 //! `Unload` is refused (G8).
 //!
-//! Sources: ACPI 6.6 and Microsoft's `_OSI` documentation only, paraphrased
-//! (`docs/research/2026-11-14-aml-interpreter.md`). No other interpreter's source was read.
+//! **Tolerances** (step B5; `tolerate.rs`): where TASKS 64's ledger says deployed firmware or
+//! other implementations rely on ACPICA's default, the library follows it, never ACPICA's lenient
+//! mode, and tells its host of each tolerance through [`Host::report`], bounded per evaluation:
+//! a load is best-effort, a failing statement of load-time code abandoned; a mutex outlives the
+//! method that took it until the outermost evaluation ends; load-time package names are bound
+//! once ([`Interpreter::bind_deferred`]).
+//!
+//! Sources: ACPI 6.6 and Microsoft's `_OSI` documentation, paraphrased
+//! (`docs/research/2026-11-14-aml-interpreter.md`), and, for step B5, TASKS item 64's ledger
+//! (`docs/research/2026-11-14-aml-gaps-acpica.md`), which another session wrote from ACPICA's
+//! source under CLAUDE.md §3. No interpreter's source was read by the session that wrote this
+//! code.
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 #![cfg_attr(

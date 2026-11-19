@@ -1046,7 +1046,11 @@ impl<H: Host> Interpreter<H> {
         match b {
             // A table loaded at run time has no locals or arguments of its own at its table level:
             // those are the method's that ran `Load` (the review of B4's addendum, B4-13).
-            0x60..=0x6E if self.at_loaded_table_level() => {
+            // So has a boot table's, which has no method at all: the same kind, so that only
+            // its statement is abandoned (step B5, Q2's line).
+            0x60..=0x6E
+                if self.at_loaded_table_level() || (self.loading == 0 && self.calls.is_empty()) =>
+            {
                 return err(ErrorKind::OutsideMethod);
             }
             0x60..=0x67 => {
@@ -1183,11 +1187,7 @@ impl<H: Host> Interpreter<H> {
                 Some(n) => (n, true),
                 None => (rest.len(), false),
             };
-            (
-                len,
-                terminated,
-                rest.iter().take(len).any(|&c| c > 0x7F),
-            )
+            (len, terminated, rest.iter().take(len).any(|&c| c > 0x7F))
         };
         // The scan read `len` bytes: work, counted a unit for each 64 and one more, whether or
         // not the string is kept.

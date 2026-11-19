@@ -7,6 +7,9 @@ use super::encode::*;
 use super::{Fault, Interp, Told, eval, int, interp, interp_with, load, plant, told};
 use crate::{ErrorKind, IntegerWidth, Limits, TableKey, Value};
 
+/// A planted fault, or none, and the tests that must fail with it (or pass without one).
+type Control = (Option<Fault>, &'static [fn()]);
+
 fn fresh() -> Interp {
     interp(IntegerWidth::Bits64)
 }
@@ -445,6 +448,28 @@ fn loaded_table_with_abandoned_statements_gives_true() {
     at_rest(&i);
 }
 
+#[test]
+fn a_boot_tables_local_abandons_its_statement() {
+    // A boot table's table level has no method, so no locals or arguments: the statement naming
+    // one is refused with `OutsideMethod`, as at a loaded table's table level (B4-13), and only
+    // it is abandoned (step B5, Q2's line).
+    let body = [
+        store(byte(1), local(0)),
+        store(arg(0), debug()),
+        name("AFT", one()),
+    ];
+    let mut i = fresh();
+    assert_eq!(load(&mut i, &body), Ok(0));
+    assert_eq!(
+        told(&mut i),
+        vec![
+            abandoned(&body, 0, 0, ErrorKind::OutsideMethod),
+            abandoned(&body, 1, 0, ErrorKind::OutsideMethod),
+        ]
+    );
+    assert!(exists(&i, "\\AFT"));
+}
+
 // --- Names in load-time packages -------------------------------------------------------------
 
 #[test]
@@ -556,7 +581,11 @@ fn method_packages_resolve_when_read() {
 
 #[test]
 fn planted_faults_are_caught_by_the_tolerance_tests() {
-    let tests: [(Option<Fault>, &[fn()]); 4] = [
+    let tests: [Control; 5] = [
+        (
+            Some(Fault::AllowDuplicate),
+            &[duplicate_keeps_the_first_object],
+        ),
         (
             None,
             &[
@@ -718,7 +747,12 @@ fn long_stall_reported() {
             method(
                 "ST",
                 0,
-                &[stall(byte(100)), stall(byte(101)), stall(byte(255)), ret(one())],
+                &[
+                    stall(byte(100)),
+                    stall(byte(101)),
+                    stall(byte(255)),
+                    ret(one()),
+                ],
             ),
             method("BIG", 0, &[stall(word(256)), ret(one())]),
         ],
@@ -738,7 +772,7 @@ fn long_stall_reported() {
 
 #[test]
 fn planted_faults_are_caught_by_the_decoder_tests() {
-    let tests: [(Option<Fault>, &[fn()]); 4] = [
+    let tests: [Control; 4] = [
         (
             None,
             &[
@@ -750,7 +784,10 @@ fn planted_faults_are_caught_by_the_decoder_tests() {
                 long_stall_reported,
             ],
         ),
-        (Some(Fault::RefuseHighBytes), &[high_bytes_accepted_and_reported]),
+        (
+            Some(Fault::RefuseHighBytes),
+            &[high_bytes_accepted_and_reported],
+        ),
         (
             Some(Fault::RefuseExtraElements),
             &[extra_elements_dropped_and_reported],
@@ -786,11 +823,19 @@ fn g4_texts() {
     let buf = || buffer(byte(3), &[0x01, 0xAB, 0x00]);
     let empty = || buffer(zero(), &[]);
     for (width, v, want) in [
-        (Bits64, concat(string(""), byte(0x1A), none()), "000000000000001A"),
+        (
+            Bits64,
+            concat(string(""), byte(0x1A), none()),
+            "000000000000001A",
+        ),
         (Bits32, concat(string(""), byte(0x1A), none()), "0000001A"),
         (Bits64, un(0x98, byte(0x1A), none()), "0x1A"),
         (Bits64, un(0x98, zero(), none()), "0x0"),
-        (Bits64, un(0x98, qword(u64::MAX), none()), "0xFFFFFFFFFFFFFFFF"),
+        (
+            Bits64,
+            un(0x98, qword(u64::MAX), none()),
+            "0xFFFFFFFFFFFFFFFF",
+        ),
         (Bits64, un(0x97, word(1234), none()), "1234"),
         (Bits64, un(0x97, zero(), none()), "0"),
         (Bits64, concat(string(""), buf(), none()), "0x01 0xAB 0x00"),
@@ -921,10 +966,22 @@ fn string_to_field_as_bytes() {
 
 #[test]
 fn planted_faults_are_caught_by_the_conversion_tests() {
-    let tests: [(Option<Fault>, &[fn()]); 4] = [
-        (None, &[g4_texts, string_to_integer_is_total, to_integer_decimal_and_hex, zero_length_buffer_takes_source_length, string_to_field_as_bytes]),
+    let tests: [Control; 4] = [
+        (
+            None,
+            &[
+                g4_texts,
+                string_to_integer_is_total,
+                to_integer_decimal_and_hex,
+                zero_length_buffer_takes_source_length,
+                string_to_field_as_bytes,
+            ],
+        ),
         (Some(Fault::OldTexts), &[g4_texts]),
-        (Some(Fault::KeepZeroLength), &[zero_length_buffer_takes_source_length]),
+        (
+            Some(Fault::KeepZeroLength),
+            &[zero_length_buffer_takes_source_length],
+        ),
         (Some(Fault::StringByCharacter), &[string_to_field_as_bytes]),
     ];
     for (f, cases) in tests {
@@ -1015,7 +1072,13 @@ fn ec_wide_field_is_one_transfer() {
     let t = take(&mut i);
     assert_eq!(t.len(), 1);
     assert_eq!(
-        (t[0].0.space, t[0].0.address, t[0].0.write, t[0].0.bit_length, t[0].0.sent.len()),
+        (
+            t[0].0.space,
+            t[0].0.address,
+            t[0].0.write,
+            t[0].0.bit_length,
+            t[0].0.sent.len()
+        ),
         (3, 0, false, 16, 2)
     );
     // A write of whole bytes: one transfer, no read.
@@ -1075,9 +1138,20 @@ fn ec_field_over_255_bytes_refused() {
 
 #[test]
 fn planted_faults_are_caught_by_the_width_tests() {
-    let tests: [(Option<Fault>, &[fn()]); 3] = [
-        (None, &[anyacc_is_byte_access, field_at_region_end_reads_within_it, ec_wide_field_is_one_transfer, ec_field_over_255_bytes_refused]),
-        (Some(Fault::WidestAnyAcc), &[field_at_region_end_reads_within_it]),
+    let tests: [Control; 3] = [
+        (
+            None,
+            &[
+                anyacc_is_byte_access,
+                field_at_region_end_reads_within_it,
+                ec_wide_field_is_one_transfer,
+                ec_field_over_255_bytes_refused,
+            ],
+        ),
+        (
+            Some(Fault::WidestAnyAcc),
+            &[field_at_region_end_reads_within_it],
+        ),
         (Some(Fault::EcBytewise), &[ec_wide_field_is_one_transfer]),
     ];
     for (f, cases) in tests {
@@ -1192,9 +1266,21 @@ fn datatableregion_same_rule() {
 
 #[test]
 fn planted_faults_are_caught_by_the_id_tests() {
-    let tests: [(Option<Fault>, &[fn()]); 2] = [
-        (None, &[ids_compare_exactly_with_zero_padding, a_hosts_copy_is_checked_with_the_same_rule, empty_id_matches_any, signature_checked_and_cut_to_four, datatableregion_same_rule]),
-        (Some(Fault::OldIdMatch), &[a_hosts_copy_is_checked_with_the_same_rule]),
+    let tests: [Control; 2] = [
+        (
+            None,
+            &[
+                ids_compare_exactly_with_zero_padding,
+                a_hosts_copy_is_checked_with_the_same_rule,
+                empty_id_matches_any,
+                signature_checked_and_cut_to_four,
+                datatableregion_same_rule,
+            ],
+        ),
+        (
+            Some(Fault::OldIdMatch),
+            &[a_hosts_copy_is_checked_with_the_same_rule],
+        ),
     ];
     for (f, cases) in tests {
         for case in cases {

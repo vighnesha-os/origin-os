@@ -20,9 +20,11 @@
 //! included, comes after the table was added and leaves it loaded (§19.6.78). A `Pending` that
 //! still reaches a load's store is the interpreter's own error (`Grammar`), never a retry.
 //!
-//! **A load that fails other than by a limit** (a check, a duplicate name, any error in its term
-//! list) is rolled back whole, names and bytes, and its operator gives Zero; the evaluation goes on
-//! ([`Interpreter::fail_load_at`], from `run_frames`). A limit or a `Fatal` ends the evaluation,
+//! **A load is best-effort** (step B5; `tolerate.rs`): a statement of its load-time code that
+//! fails as it runs, a duplicate name or an unresolved one among them, is abandoned and reported,
+//! and the table loads. **A load that fails whole** (a check, a block already loaded, a failure
+//! the parser cannot step past) is rolled back whole, names and bytes, and its operator gives
+//! Zero; the evaluation goes on ([`Interpreter::fail_load_at`], from `run_frames`). A limit or a `Fatal` ends the evaluation,
 //! as everywhere, and the table is rolled back with it (`Fatal`: B4-2). **A load that completes
 //! stays**, even if the evaluation around it fails later: AML has no transactions (B4's contract,
 //! Q8).
@@ -181,7 +183,8 @@ impl<H: Host> Interpreter<H> {
         {
             let s = self.string_of(v)?;
             let fits = if i == 0 {
-                s.get(..4).is_some_and(|sig| sig.iter().all(|&c| signature_char(c)))
+                s.get(..4)
+                    .is_some_and(|sig| sig.iter().all(|&c| signature_char(c)))
             } else {
                 s.len() <= out.len()
             };
@@ -544,8 +547,9 @@ impl<H: Host> Interpreter<H> {
 
     /// Whether `LocalX` and `ArgX` are refused here: at a loaded table's table level they would
     /// be the method's that ran `Load`, which the table has no right to read or write (the
-    /// review of B4's addendum, B4-13). The same block loaded by the host has no method and fails
-    /// `Grammar` at them too. A test may plant their admission (`AllowLoadLocals`).
+    /// review of B4's addendum, B4-13). The same block loaded by the host has no method, and
+    /// `decode` refuses them there with the same kind, `OutsideMethod` (step B5). A test may plant
+    /// their admission (`AllowLoadLocals`).
     pub(crate) fn at_loaded_table_level(&self) -> bool {
         #[cfg(test)]
         if crate::tests::planted(crate::tests::Fault::AllowLoadLocals) {
