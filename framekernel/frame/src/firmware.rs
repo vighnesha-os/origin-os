@@ -32,6 +32,9 @@ pub fn bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
     let Some(end) = addr.checked_add(len as u64).filter(|_| addr != 0) else {
         return Err("bad table address");
     };
+    if vm::names_mmio(addr, end) {
+        return Err(MMIO);
+    }
     if !vm::changing_located() {
         return Err("nothing is lent before the firmware's changing structures are located");
     }
@@ -52,13 +55,21 @@ pub fn bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
 /// Copies `out.len()` bytes of firmware memory at physical `addr` into `out`, with volatile
 /// reads, mapping it read-only first if the kernel does not map it, and lends nothing: for the
 /// firmware's structures that change after boot, which no reference may cover (see [`bytes`]).
-/// Refused as [`bytes`] is.
+/// Refused, as [`bytes`] is, for memory the memory map does not call the firmware's and for a
+/// range it calls MMIO; never for what [`bytes`] will not lend, since this lends nothing.
 pub fn copy(addr: u64, out: &mut [u8]) -> Result<(), &'static str> {
-    if addr == 0 || addr.checked_add(out.len() as u64).is_none() {
+    let Some(end) = addr.checked_add(out.len() as u64).filter(|_| addr != 0) else {
         return Err("bad table address");
+    };
+    if vm::names_mmio(addr, end) {
+        return Err(MMIO);
     }
     vm::read_firmware(PhysAddr::new(addr), out).map_err(|_| "cannot map an ACPI table")
 }
+
+/// Why [`bytes`] and [`copy`] refuse a range the memory map calls MMIO: device registers hold no
+/// firmware table, and reading them could have effects (TASKS item 71, the review's F14).
+const MMIO: &str = "the memory map calls it MMIO, which holds no table";
 
 /// What [`acpi_table`]'s first call located as the firmware's structures that change after boot,
 /// and what the lending registry did with them: for the ACPI census to report.

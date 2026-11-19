@@ -413,6 +413,17 @@ pub fn may_map(never: &[Span], phys: u64) -> bool {
     !never.iter().any(|s| s.contains(phys))
 }
 
+/// Whether any of `[base, end)` is memory `map` calls MMIO (`EfiMemoryMappedIO`): device
+/// registers, where no firmware table lives, so `firmware::bytes` and `firmware::copy` read
+/// nothing there (TASKS item 71, the review's F14). A hole in the map is not MMIO.
+pub fn names_mmio(map: &[MemoryRegion], base: u64, end: u64) -> bool {
+    map.iter().any(|r| {
+        r.kind == RegionKind::Mmio as u32
+            && r.base < end
+            && base < r.base.saturating_add(r.pages.saturating_mul(PAGE))
+    })
+}
+
 /// Ranges [`Lending`] keeps of each sort. Fixed, because the kernel lends firmware tables
 /// before it has a heap; a firmware with more is refused, not trusted (fail closed).
 pub const LENDING_SLOTS: usize = 128;
@@ -1150,6 +1161,35 @@ mod tests {
         assert_eq!((report.recorded, report.untracked), (NEVER_SLOTS, 2));
         assert!(c.located());
         assert!(!c.lend(0x10, 0x20));
+    }
+
+    /// TASKS item 71, F14: a range the memory map calls MMIO, any part of it.
+    #[test]
+    fn mmio_is_named_by_the_memory_map_alone() {
+        let map = [
+            region(0x7F00_0000, 16, RegionKind::AcpiReclaimable),
+            region(0xFEC0_0000, 1, RegionKind::Mmio),
+            region(0x7E00_0000, 4, RegionKind::Reserved),
+        ];
+        assert!(names_mmio(&map, 0xFEC0_0000, 0xFEC0_0024));
+        assert!(
+            names_mmio(&map, 0xFEBF_FFF0, 0xFEC0_0001),
+            "overlapping its start"
+        );
+        assert!(
+            names_mmio(&map, 0xFEC0_0FFF, 0xFEC0_1010),
+            "overlapping its end"
+        );
+        assert!(!names_mmio(&map, 0xFEC0_1000, 0xFEC0_1024), "just past it");
+        assert!(!names_mmio(&map, 0x7F00_0000, 0x7F00_0024), "ACPI memory");
+        assert!(
+            !names_mmio(&map, 0x7E00_0000, 0x7E00_0024),
+            "reserved memory"
+        );
+        assert!(
+            !names_mmio(&map, 0x9000_0000, 0x9000_0024),
+            "a hole in the map"
+        );
     }
 
     #[test]

@@ -595,6 +595,17 @@ pub fn never_lent(base: u64, end: u64) -> bool {
     crate::cpu::without_interrupts(|| LENDING.lock().never_lent(base, end))
 }
 
+/// Whether any of `[raw, end)` is memory the memory map calls MMIO ([`crate::reserved::names_mmio`]):
+/// `firmware::bytes` and `firmware::copy` read no table there (TASKS item 71, the review's F14).
+pub fn names_mmio(raw: u64, end: u64) -> bool {
+    crate::cpu::without_interrupts(|| {
+        KERNEL_SPACE
+            .lock()
+            .as_ref()
+            .is_some_and(|k| crate::reserved::names_mmio(k.memory_map, raw, end))
+    })
+}
+
 /// Whether `[raw, end)` is memory the firmware described as its own (reserved, ACPI, runtime
 /// or device memory, or firmware memory of another type): never RAM the kernel owns or will
 /// own. Unaccepted memory is RAM, not firmware data (boot info 0.7).
