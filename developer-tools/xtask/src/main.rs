@@ -3654,11 +3654,17 @@ fn in_turn(command: &str, run: impl FnOnce() -> Result) -> Result {
 /// ([`SETS_ITS_MACHINES`]), a person's topology, bridge, reserved-memory or ACPI machine is
 /// refused too ([`Settings::refuse_machine`]).
 fn in_turn_with_settings(command: &str, run: impl FnOnce(&Settings) -> Result) -> Result {
-    let settings = Settings::from_env()?;
+    let settings = entry_settings(command, Settings::from_env()?)?;
+    in_turn(command, || run(&settings))
+}
+
+/// The settings boot command `command` runs with: the person's, refused if `command` sets each
+/// machine itself and they name one ([`SETS_ITS_MACHINES`], [`Settings::refuse_machine`]).
+fn entry_settings(command: &str, settings: Settings) -> Result<Settings> {
     if SETS_ITS_MACHINES.contains(&command) {
         settings.refuse_machine(command)?;
     }
-    in_turn(command, || run(&settings))
+    Ok(settings)
 }
 
 /// `boot-matrix` and its ten scenario commands: each sets every machine's topology, bridge,

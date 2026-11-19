@@ -471,6 +471,43 @@ fn the_commands_that_set_their_machines_refuse_the_person_s() {
     }
 }
 
+/// R5 through the commands' own entry (`entry_settings`, which `in_turn_with_settings` calls
+/// before the turn), one command of each kind: `boot-matrix`, each scenario command, and the
+/// three commands that take the person's machine.
+#[test]
+fn each_kind_of_command_takes_or_refuses_the_person_s_machine_at_entry() {
+    let machine = [
+        (TOPOLOGY, "sparse"),
+        (BRIDGE, "on"),
+        (RESERVED, "on"),
+        (ACPI, "on"),
+    ];
+    for command in crate::SETS_ITS_MACHINES {
+        for (name, value) in machine {
+            let e = crate::entry_settings(command, read(&[(name, value)]).unwrap()).unwrap_err();
+            assert!(
+                e.starts_with(&format!("{command} sets each machine's"))
+                    && e.contains(&format!("{name}={value} is refused here")),
+                "{command}: {e}"
+            );
+        }
+        // What carries over is taken.
+        let carried = read(&[(SMP, "3"), (MACHINE, "hpet=off"), (BRIDGE, "off")]).unwrap();
+        assert_eq!(crate::entry_settings(command, carried.clone()), Ok(carried));
+    }
+    let all = read(&machine).unwrap();
+    for command in ["boot-test", "boot-console", "run"] {
+        assert_eq!(
+            crate::entry_settings(command, all.clone()),
+            Ok(all.clone()),
+            "{command}"
+        );
+    }
+    assert!(
+        (all.topology, all.bridge, all.reserved, all.acpi) == (Topology::Sparse, true, true, true)
+    );
+}
+
 /// The scenario filter's refusal names its variable, from this module.
 #[test]
 fn a_filter_that_matches_nothing_is_named() {
