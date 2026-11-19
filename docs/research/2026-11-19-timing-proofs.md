@@ -78,6 +78,20 @@ Twenty boots of the usual series on `0df830a8`, 2026-11-19 16:11 to 16:32 UTC, i
 - **At ten busy loops** both large machines were refused, as before TASKS item 66: the 65-processor machine at the window, the 67-processor machine at the tick proof, slow in all 4 runs (1,093 to 1,262 ms for 50) with its count's period in bounds.
 - **Extended waits were said:** the preemption workers' exit up to 3,959 ms at load 3 and 11,313 ms at load 10.
 
+### 3.1a The second addendum review's gap rule, tried and reverted
+
+The second addendum review's T66-R17 measured each gap between the period sampler's reads across both reads' brackets (`500f6cd1`), so that a stall inside an intermediate read could not hide a reload. On `8d9d3759` (2026-11-19 17:56 to 18:12 UTC, one turn) it failed the gates, and the coordinating session ruled it reverted (`361c813c`) and R17's case a stated limit, with a check that tolerates stalls as TASKS item 78.
+
+| Rule | Machines and boots | Runs that found a clean pair | Pairs a clean pair took |
+|---|---|---|---|
+| `0df830a8`: the gap between the brackets | 65 and 67 processors, 37 boots at loads 0, 3 and 10 (`ev8`, `ev9`) | every run | 1 to 32 |
+| `500f6cd1`: the gap across the brackets | the gates' `boot-matrix`, the Intel-IOMMU 65-processor boot | none of 4 runs | undecided after 64; the boot failed |
+| the same | 10 idle large boots (`ev10`), host load average 13 to 31 | 2 boots: intel-65.4 at run 3, sparse-67.3 at run 1 | 27 and 13; the other 8 boots undecided after 64 in all 4 runs |
+
+- **Delivery was fine** in those runs: 50 ticks in 502 to 515 ms, the longest gaps 13 to 21 ms.
+- **The inference, unmeasured:** on these machines an intermediate read of the timer's count often stalls inside its own bracket for over 100 µs, most likely contending for QEMU's big lock under MTTCG. No read's bracket was recorded.
+- **Logs:** `t66-evidence/r17-gates-fail.tar.gz` in the coordination notes.
+
 ### 3.2 The rounds before it
 
 Each answer was booted in the same series before the next was chosen:
@@ -116,5 +130,6 @@ Before the rate's verdict moved to the timer's count, a temporary build on `2364
 - Anything under KVM, in CI or on a physical machine (CLAUDE.md §74).
 - The cause of the calibration's spoiled windows on the large machines.
 - A rate within 3 % of nominal: the tick proof passes it, by its tolerance.
+- A timer over 5 times fast whose reload a stall inside an intermediate read of its count hides: the count passes it, and its delivery fails it as too fast in total unless recurring stalls also make that total look normal in the same run (the second addendum review's T66-R17; TASKS item 78).
 - A processor whose timer reads back as the boot processor's but ticks slower, its own timer clock being wrong, between about 30 Hz and 100 Hz: only the preemption proof's floor of 15 switches in 500 ms catches it, below that. One whose own timer clock runs fast: nothing catches it, the count's period being measured on the boot processor alone; on the platforms in scope one clock drives every core's APIC timer.
 - Why the 67-processor machine's preemption workers did not exit within 10 s at ten busy loops.
