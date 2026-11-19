@@ -2,13 +2,14 @@
 //! before a boot proof compares the whole machine's heap and free frames.
 //!
 //! A thread's end is seen before the thread has given anything back. A user thread's
-//! `Process::thread_ended` raises the thread's `TERMINATED`, then closes the process's handles
-//! and makes its `ending` visible, all with interrupts on. Only then does the thread reach the
-//! scheduler's exit, which queues its stack, its FPU area and its reference to the address space
-//! as a zombie for its own processor to reap. A kernel thread raises its own done-flag and then
-//! exits. Between the two, a settle that counted zombies alone found none, and read the counts
-//! with the thread's stack, FPU area and space still held (TASKS item 79: the directory proof's
-//! first count on `land/batch-7` `6c754c45`, 2026-11-20).
+//! `Process::thread_ended` raises the thread's `TERMINATED`, then closes the process's handles and
+//! makes its `ending` visible, with interrupts on (off only for a fault taken on an exception
+//! stack, which changes nothing here: another processor can still see the end). Only then does the
+//! thread reach the scheduler's exit, which queues its stack, its FPU area and its reference to the
+//! address space as a zombie for its own processor to reap. A kernel thread raises its own
+//! done-flag and then exits. Between the two, a settle that counted zombies alone found none, and
+//! read the counts with the thread's stack, FPU area and space still held (TASKS item 79: the
+//! directory proof's first count on `land/batch-7` `6c754c45`, 2026-11-19).
 //!
 //! So each processor counts two things in an [`Exits`]:
 //!
@@ -40,9 +41,11 @@
 //! - Every write after T's lowering is a read-modify-write, so all of them are in its release
 //!   sequence. Reading any of them synchronizes with T's lowering, and so with T's raising of
 //!   `zombies`, made just before it.
-//! - The settler's later load of `zombies` therefore reads T's raising or a later value. By the
-//!   same argument, 0 there means the reaper's lowering of T's zombie is at or before it, and the
-//!   settler synchronizes with it. Everything the reaper gave back before lowering it happens
+//! - The settler's later load of `zombies` therefore reads T's raising or a later value. Each
+//!   zombie's raising happens before its own reap's lowering: both run on its processor, the
+//!   raising in the exit and the lowering after the reaper takes the zombie, under the same lock
+//!   as the exit that queued it. By the same argument, 0 there means the reaper's lowering of T's
+//!   zombie is at or before it, and the settler synchronizes with it. Everything the reaper gave back before lowering it happens
 //!   before whatever the settler does next.
 //!
 //! A count split over processors changes nothing in this: T's two counts are on its own

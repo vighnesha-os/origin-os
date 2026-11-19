@@ -351,10 +351,10 @@ pub(crate) use crate::settled::{Unsettled, not_settled};
 /// them (TASKS item 67): every thread whose end may have been seen gone from its processor and
 /// reaped there (TASKS item 79), every stack kept for reuse retired (`stack::trim`), and every
 /// retired stack reclaimed (`stack::reclaim`, one shootdown each, which waits for every
-/// processor). Each of those moves the counts on its own
-/// schedule: on the 65-processor machine the stacks that earlier proofs' threads left were still
-/// being reclaimed, one shootdown at a time, when the IPC proof took its first count, so the
-/// count rose during the proof; and a cache of kept stacks that refills during a proof lowers it.
+/// processor). Each of those moves the counts on its own schedule: on the 65-processor machine the
+/// stacks that earlier proofs' threads left were still being reclaimed, one shootdown at a time,
+/// when the IPC proof took its first count, so the count rose during the proof; and a cache of
+/// kept stacks that refills during a proof lowers it.
 /// A thread's end is seen before it has given anything back: a user thread's process says it has
 /// ended, and a kernel thread raises its own done-flag, before the thread leaves its processor as
 /// a zombie. So waiting for zombies alone found none for a thread still in that stretch, and the

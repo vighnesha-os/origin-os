@@ -3,9 +3,9 @@
 //!
 //! A settle is whole when no thread whose end may have been seen is still on its processor (TASKS
 //! item 79), no exited thread awaits its reaping, no kernel stack is retired or being reclaimed,
-//! and no stack was lost while it ran. A stack is lost when its reclaim's
-//! shootdown stalls: some processor did not answer within the shootdown's patience (1 s), so the
-//! slot and its 4 frames are withheld for good while a stale translation may remain. That is safe
+//! and no stack was lost while it ran. A stack is lost when its reclaim's shootdown stalls: some
+//! processor did not answer within the shootdown's patience (1 s), so the slot and its 4 frames
+//! are withheld for good while a stale translation may remain. That is safe
 //! by design, and it costs 4 frames each. Under QEMU a processor left unscheduled by a busy host
 //! does it; on a real machine a processor held in SMM for over a second would do it too. So a
 //! stall during a settle is named, never left to show later as a bare frame mismatch.
