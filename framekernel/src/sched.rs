@@ -195,8 +195,34 @@ pub(crate) fn zombies() -> u64 {
 /// the shootdown that must come first waits for every processor (ADR-0004 Amendment 1, A2).
 pub(crate) fn reap() -> usize {
     let freed = reap_zombies();
-    origin_frame::stack::reclaim();
+    let reclaimed = origin_frame::stack::reclaim();
+    if reclaimed.lost > 0 {
+        report_lost_stacks(reclaimed.lost);
+    }
     freed
+}
+
+/// Says where kernel stacks were lost to a stalled shootdown, as it happens: which processor
+/// asked, which did not answer within the patience, how long it waited, and how many stalls the
+/// boot has had (TASKS item 66). A report, judged by nothing: the proofs that count the stacks
+/// judge the loss. It names processors and times only, never an address.
+fn report_lost_stacks(lost: u32) {
+    let mut out = crate::console::Console::new();
+    let millis = |ticks: u64| ticks / (crate::time::tsc_hz() / 1000).max(1);
+    let _ = match origin_frame::tlb::last_stall() {
+        Some(stall) => writeln!(
+            out,
+            "origin-kernel: TLB: a shootdown from CPU {} waited {} ms for CPU {}, which did not answer (stall {} of this boot); {lost} kernel stacks withheld for good, with their frames",
+            stall.asker,
+            millis(stall.waited),
+            stall.target,
+            stall.count
+        ),
+        None => writeln!(
+            out,
+            "origin-kernel: TLB: {lost} kernel stacks withheld for good, with their frames, after a stalled shootdown"
+        ),
+    };
 }
 
 pub(crate) use crate::settled::{Unsettled, not_settled};
