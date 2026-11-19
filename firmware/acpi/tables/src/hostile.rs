@@ -409,7 +409,15 @@ fn step_bound(sig: &[u8], n: usize) -> u64 {
 }
 
 /// The review's F13: a large table of every signature the soak generates, built from that table's
-/// valid sample so its acceptance paths and lookups run, costs no more walk steps than its bound.
+/// valid sample so its acceptance paths and lookups run, costs no more walk steps than its bound,
+/// and is checked whole, so the steps counted are those of a table taken, not one refused early
+/// (the review of TASKS item 71, T71-6). The NFIT is the one exception, by design: its copies
+/// repeat the sample's SPA range index, which it refuses at the first repeat, so at 400 copies the
+/// refusal is asserted, and its large case is TASKS item 62's bound test (F1).
+///
+/// The copies' references all point into the first copy, so each PPTT or VIOT lookup starts at
+/// the index's first checkpoint and the quadratic part of those bounds is not reached here: the
+/// PPTT's lookups are measured by `pptt::tests::each_cache_chain_is_checked_once` (F18).
 #[test]
 fn large_tables_cost_no_more_than_their_bounds() {
     let mut seen = Vec::new();
@@ -420,14 +428,23 @@ fn large_tables_cost_no_more_than_their_bounds() {
         for copies in [1usize, 400] {
             let (t, n) = replicate(&sample, fixed, copies);
             crate::walk::steps::take();
-            let _ = checked(&t);
+            let result = checked(&t);
             let steps = crate::walk::steps::take();
             let bound = step_bound(sig, n);
+            let name = String::from_utf8_lossy(sig);
             assert!(
                 steps <= bound,
-                "{}: {steps} steps for {n} structures, past {bound}",
-                String::from_utf8_lossy(sig)
+                "{name}: {steps} steps for {n} structures, past {bound}"
             );
+            if sig == b"NFIT" && copies > 1 {
+                assert!(result.is_err(), "{name}: its copies are refused, by design");
+            } else {
+                let census = result.unwrap_or_else(|e| panic!("{name} x{copies}: {e:?}"));
+                assert!(
+                    matches!(census.class, Class::Checked(_)),
+                    "{name} x{copies}: not checked whole"
+                );
+            }
         }
         seen.push(sig);
     }

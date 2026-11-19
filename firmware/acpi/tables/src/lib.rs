@@ -128,9 +128,11 @@
 //! [`pptt::MAX_CACHE_LEVELS`] long), [`viot::MAX_NODES`] VIOT nodes, and PMTT devices nested
 //! [`memory::PMTT_MAX_DEPTH`] deep. The PPTT checks each cache chain once, from the cache itself,
 //! so a parse takes at most [`pptt::MAX_LOOKUPS`] lookups a structure, about 8 × 10⁷ walk steps
-//! at 8,192 structures, where the review estimated 10⁹ before (its F18; TASKS item 71). Every
-//! table this crate parses has a test that builds a large one and counts its steps against its
-//! bound (F13; TASKS item 71).
+//! at 8,192 structures, where the review estimated 10⁹ before (its F18; TASKS item 71). The 12
+//! tables the hostile soak generates (the MADT, SRAT, CPEP, NFIT, HMAT, SDEV, PPTT, FPDT, PHAT,
+//! VIOT, PMTT and MSCT) each have a test that builds a large one, checks it whole and counts its
+//! steps against its bound; the NFIT's copies are refused by design, and its large case is F1's
+//! test (F13; TASKS item 71). The other tables this crate parses have no such test.
 //!
 //! # Iterators
 //!
