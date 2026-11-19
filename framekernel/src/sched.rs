@@ -65,7 +65,7 @@ pub(crate) fn on_tick(interrupted: u64, switch: &Switch) -> u64 {
     with_queue(interrupted, switch, |q| {
         // The preemption proof's watch (TASKS item 66): the TSC only while it is armed.
         if q.watching() {
-            q.note_tick(rdtsc());
+            q.note_tick(rdtsc(), timer::programmed);
         }
         Some(q.tick(interrupted))
     })
@@ -1199,14 +1199,23 @@ fn run_window(cpus: &[CpuIndex], tsc_hz: u64, workers: u64) -> WindowRun {
             })
         })
         .collect();
-    let ticks_of = |id: &CpuIndex| {
+    let watch_of = |id: &CpuIndex| {
         QUEUES
             .get(id.get())
-            .map_or(0, |q| without_interrupts(|| q.lock().watch().ticks))
+            .map(|q| without_interrupts(|| q.lock().watch()))
+    };
+    // A processor whose timer reads back otherwise than timed ends the window at once: no wait
+    // can change that verdict.
+    let expected = timer::periodic_programming();
+    let settled = || {
+        cpus.iter()
+            .all(|id| watch_of(id).is_none_or(|w| w.ticks >= WINDOW_TICKS))
+            || cpus
+                .iter()
+                .any(|id| watch_of(id).is_some_and(|w| w.programmed.is_some_and(|p| p != expected)))
     };
     let budget = tsc_hz.saturating_mul(WINDOW_BUDGET_SECONDS);
-    while cpus.iter().any(|id| ticks_of(id) < WINDOW_TICKS) && rdtsc().wrapping_sub(start) < budget
-    {
+    while !settled() && rdtsc().wrapping_sub(start) < budget {
         // Interrupts on only while halted: the timer may switch to a worker here, and this
         // flow resumes after `hlt` when its turn comes round again.
         cpu::idle_disabling();
@@ -1270,12 +1279,14 @@ fn judge_run(
     cpus: &[CpuIndex],
     tsc_hz: u64,
 ) -> (WindowVerdict, Option<(CpuIndex, TickWatch)>) {
-    // Today's bound: the rounds clause's 15 rounds within 500 ms.
+    // Today's bound: the rounds clause's 15 rounds within 500 ms. The programming every
+    // processor's timer must have: what the boot processor's timed proof ran with.
     let bound = tsc_hz / 2;
+    let expected = timer::periodic_programming();
     let judged = || {
         cpus.iter()
             .zip(&run.watches)
-            .map(|(&id, w)| (id, *w, judge_window(w, WINDOW_TICKS, bound)))
+            .map(|(&id, w)| (id, *w, judge_window(w, WINDOW_TICKS, bound, expected)))
     };
     let failing = |v: WindowVerdict| {
         matches!(
@@ -1311,7 +1322,7 @@ fn say_window(
     let _ = match verdict {
         (WindowVerdict::InBounds, _) => write!(
             com1,
-            "every tick's median in bounds, every 15th tick within 500 ms{}",
+            "every timer as timed, every 15th tick within 500 ms{}",
             if attempt > 1 {
                 " (after a stalled run)"
             } else {
@@ -1330,14 +1341,16 @@ fn say_window(
                     "CPU {id} took {} of {WINDOW_TICKS} ticks in {WINDOW_BUDGET_SECONDS} s{what}",
                     w.ticks
                 ),
-                WindowVerdict::WrongRate => write!(
-                    com1,
-                    "CPU {id}'s tick gaps: {} under 95 % and {} over 150 % of {} ms in {}{what}",
-                    w.below,
-                    w.above,
-                    ms(&w, w.period),
-                    w.ticks
-                ),
+                WindowVerdict::WrongRate => match w
+                    .programmed
+                    .and_then(|p| p.first_difference(&timer::periodic_programming()))
+                {
+                    Some((register, got, want)) => write!(
+                        com1,
+                        "CPU {id}'s timer {register} is {got:#x}, not {want:#x} as timed{what}"
+                    ),
+                    None => write!(com1, "CPU {id}'s timer could not be read back{what}"),
+                },
                 _ => write!(
                     com1,
                     "CPU {id}'s 15th tick at {} ms, longest gap {} ms{}{}",
@@ -1362,8 +1375,9 @@ fn say_window(
 /// until every processor has taken [`WINDOW_TICKS`] of its own timer ticks (500 ms on a real
 /// machine), within [`WINDOW_BUDGET_SECONDS`]. On each processor, both workers must have run
 /// there, with shares within a factor of two, over at least five full rounds of context
-/// switches; and its own ticks, on the TSC, must have a median gap within 95 % to 150 % of the
-/// period and its 15th within 500 ms, today's bound (TASKS item 66, the review's T66-R1). A
+/// switches; its timer, read back at its first tick, must be programmed as the boot
+/// processor's timed proof ran it, and its 15th tick must come within 500 ms on the TSC,
+/// today's bound (TASKS item 66, the review's T66-R1). A
 /// run whose 15th tick came late with a gap of two periods or more is measured again, up to
 /// [`PREEMPTION_ATTEMPTS`] runs. Then the rest of the thread proofs; each result goes into
 /// `proofs`, and `kernel_main` decides what they mean (ADR-0013). Fairness counts loop

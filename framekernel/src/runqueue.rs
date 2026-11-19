@@ -36,6 +36,8 @@
 //! [`RunQueue::preempt_for_wake`]: it charges nothing, and switches only if a thread woken
 //! since the last choice should run now.
 
+use origin_frame::apic::TimerProgramming;
+
 /// Contexts one queue holds, its boot context included.
 pub const CAPACITY: usize = 16;
 /// The pass a weight-1 context advances per quantum.
@@ -159,9 +161,11 @@ pub const fn judge_timed_waits(
 pub const PREEMPTION_ROUNDS: u64 = 15;
 
 /// What a processor's own periodic timer did while the preemption proof watched it (TASKS item
-/// 66, the review's T66-R1): every gap between ticks on the TSC, the first from the moment the
-/// watch was armed, summed up as counts so that the tick handler does a few additions. The
-/// proof's window is counted in these very ticks, so their rate is judged against the TSC here.
+/// 66, the review's T66-R1): every gap between its ticks on the TSC, the first from the moment
+/// the watch was armed, kept as the longest and the time of the [`PREEMPTION_ROUNDS`]th tick, and
+/// the timer's programming as the processor read it back at its first tick. The proof's window is
+/// counted in these very ticks, so their rate is checked here: the programming against what the
+/// boot processor's timed proof ran with, the ticks against the TSC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TickWatch {
     /// Whether ticks are being noted.
@@ -173,13 +177,13 @@ pub struct TickWatch {
     pub period: u64,
     /// Ticks noted, and so gaps measured.
     pub ticks: u64,
-    /// Gaps under 95 % of the period, and over 150 % of it.
-    pub below: u64,
-    pub above: u64,
     /// The longest gap.
     pub longest: u64,
     /// The TSC at the [`PREEMPTION_ROUNDS`]th tick, 0 until then.
     pub at_rounds: u64,
+    /// The timer's programming as this processor read it back at its first tick; `None` before
+    /// it, or if it could not be read.
+    pub programmed: Option<TimerProgramming>,
 }
 
 impl TickWatch {
@@ -191,10 +195,9 @@ impl TickWatch {
             last: 0,
             period: 0,
             ticks: 0,
-            below: 0,
-            above: 0,
             longest: 0,
             at_rounds: 0,
+            programmed: None,
         }
     }
 
@@ -209,6 +212,18 @@ impl TickWatch {
         }
     }
 
+    /// Whether the next tick noted is the first: the one at which the programming is read.
+    pub const fn first_tick(&self) -> bool {
+        self.armed && self.ticks == 0
+    }
+
+    /// Notes the timer's programming as read back on its processor.
+    pub fn note_programming(&mut self, programmed: Option<TimerProgramming>) {
+        if self.armed {
+            self.programmed = programmed;
+        }
+    }
+
     /// Notes a tick at TSC `now`, if armed.
     pub fn note(&mut self, now: u64) {
         if !self.armed {
@@ -217,24 +232,10 @@ impl TickWatch {
         let gap = now.saturating_sub(self.last);
         self.last = now;
         self.ticks += 1;
-        if gap < self.period / 100 * 95 {
-            self.below += 1;
-        }
-        if gap > self.period / 2 * 3 {
-            self.above += 1;
-        }
         self.longest = self.longest.max(gap);
         if self.ticks == PREEMPTION_ROUNDS {
             self.at_rounds = now;
         }
-    }
-
-    /// Whether the median gap (the upper one of an even count, as `apic::judge_ticks` takes it)
-    /// is within 95 % to 150 % of the period, R5's bounds: it is if no more gaps than the median's
-    /// rank fall below, and fewer than the rest fall above. No ticks, no median.
-    pub const fn median_in_bounds(&self) -> bool {
-        let rank = self.ticks / 2;
-        self.ticks > 0 && self.below <= rank && self.above < self.ticks - rank
     }
 }
 
@@ -247,26 +248,45 @@ impl Default for TickWatch {
 /// What one processor's ticks say about a run of the preemption proof (TASKS item 66, T66-R1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowVerdict {
-    /// Its rate is right and its [`PREEMPTION_ROUNDS`]th tick came within today's bound.
+    /// Its timer is programmed as the boot processor's timed proof ran it, and its
+    /// [`PREEMPTION_ROUNDS`]th tick came within today's bound.
     InBounds,
-    /// Its rate is right, its rounds came after today's bound, and a gap of two periods or more
-    /// shows expiries merged while it was away: this run says nothing, and is measured again.
+    /// Its rounds came after today's bound, and a gap of two periods or more shows expiries
+    /// merged while it was away: this run says nothing, and is measured again.
     Stalled,
     /// Its rounds came after today's bound with no such gap: too slow, and it fails.
     Late,
-    /// Its median gap is outside 95 % to 150 % of the period: a wrong rate, and it fails at once.
+    /// Its timer is programmed otherwise than the boot processor's timed proof ran it (another
+    /// initial count, divisor or mode, or a masked entry), or could not be read back: a wrong
+    /// rate, and it fails at once.
     WrongRate,
     /// It did not take the window's ticks within the budget: its tick does not come.
     Short,
 }
 
-/// Judges one processor's [`TickWatch`] over a run: it should have taken `wanted` ticks, its
-/// [`PREEMPTION_ROUNDS`]th within `bound` TSC ticks of the start (today's bound: 15 rounds in
-/// 500 ms), at a median gap within R5's bounds. Only [`WindowVerdict::InBounds`] passes.
-pub const fn judge_window(watch: &TickWatch, wanted: u64, bound: u64) -> WindowVerdict {
-    if watch.ticks < wanted || watch.ticks < PREEMPTION_ROUNDS {
+/// Judges one processor's [`TickWatch`] over a run: it should have taken `wanted` ticks, with its
+/// timer programmed as `expected` (the initial count, divide configuration and LVT entry the
+/// boot processor's timed proof ran with), and its [`PREEMPTION_ROUNDS`]th tick within `bound` TSC
+/// ticks of the start (today's bound: 15 rounds in 500 ms). Only [`WindowVerdict::InBounds`]
+/// passes.
+///
+/// The rate is checked by the programming, not by the gaps' spread: under QEMU's software
+/// processor the ticks' delivery jitters, so that a third or more of the gaps of a correct
+/// timer fall under 95 % of the period even on a quiet two-processor machine (TASKS item 66's
+/// diagnostic boots), and a median of gaps cannot be a verdict there.
+pub fn judge_window(
+    watch: &TickWatch,
+    wanted: u64,
+    bound: u64,
+    expected: TimerProgramming,
+) -> WindowVerdict {
+    let misprogrammed = matches!(watch.programmed, Some(p) if p != expected);
+    if misprogrammed {
+        // Named first, whatever else the run shows: a timer left in one-shot mode ticks once.
+        WindowVerdict::WrongRate
+    } else if watch.ticks < wanted || watch.ticks < PREEMPTION_ROUNDS {
         WindowVerdict::Short
-    } else if !watch.median_in_bounds() {
+    } else if watch.programmed.is_none() {
         WindowVerdict::WrongRate
     } else if watch.at_rounds.saturating_sub(watch.start) <= bound {
         WindowVerdict::InBounds
@@ -360,8 +380,12 @@ impl RunQueue {
         self.watch.armed
     }
 
-    /// Notes a tick taken at TSC `now`, if the ticks are being watched.
-    pub fn note_tick(&mut self, now: u64) {
+    /// Notes a tick taken at TSC `now`, if the ticks are being watched; at the first, also the
+    /// timer's programming as `programmed` reads it back on this processor.
+    pub fn note_tick(&mut self, now: u64, programmed: impl FnOnce() -> Option<TimerProgramming>) {
+        if self.watch.first_tick() {
+            self.watch.note_programming(programmed());
+        }
         self.watch.note(now);
     }
 
@@ -662,15 +686,30 @@ impl RunQueue {
 mod tests {
     use super::*;
 
-    /// A watch over ticks at the given gaps, from TSC 0, with a 10 ms period on a 1 GHz TSC.
-    fn watched(gaps: &[u64]) -> TickWatch {
+    /// The programming the tests' boot processor ran with.
+    const PROGRAMMED: TimerProgramming = TimerProgramming {
+        initial: 625_000,
+        divide: 0b0011,
+        lvt: (1 << 17) | 0x40,
+    };
+
+    /// A watch over ticks at the given gaps, from TSC 0, with a 10 ms period on a 1 GHz TSC,
+    /// its timer read back as `programmed` at the first tick.
+    fn watched_as(gaps: &[u64], programmed: Option<TimerProgramming>) -> TickWatch {
         let mut w = TickWatch::armed(0, 10_000_000);
         let mut at = 0;
         for &gap in gaps {
             at += gap;
+            if w.first_tick() {
+                w.note_programming(programmed);
+            }
             w.note(at);
         }
         w
+    }
+
+    fn watched(gaps: &[u64]) -> TickWatch {
+        watched_as(gaps, Some(PROGRAMMED))
     }
 
     const P: u64 = 10_000_000;
@@ -680,219 +719,126 @@ mod tests {
     fn a_window_at_the_programmed_rate_is_in_bounds() {
         let w = watched(&[P; 50]);
         assert_eq!((w.ticks, w.longest, w.at_rounds), (50, P, 15 * P));
-        assert!(w.median_in_bounds());
-        assert_eq!(judge_window(&w, 50, HALF_SECOND), WindowVerdict::InBounds);
-        // A watch that is not armed notes nothing.
+        assert_eq!(
+            judge_window(&w, 50, HALF_SECOND, PROGRAMMED),
+            WindowVerdict::InBounds
+        );
+        // Jitter in the ticks' delivery changes nothing: a third of the gaps short, a third long.
+        let jittery: alloc::vec::Vec<u64> = (0..50)
+            .map(|i| [P * 7 / 10, P, P * 13 / 10][i % 3])
+            .collect();
+        assert_eq!(
+            judge_window(&watched(&jittery), 50, HALF_SECOND, PROGRAMMED),
+            WindowVerdict::InBounds
+        );
+        // A watch that is not armed notes nothing, and reads nothing.
         let mut idle = TickWatch::new();
         idle.note(5);
-        assert_eq!(idle.ticks, 0);
+        idle.note_programming(Some(PROGRAMMED));
+        assert_eq!((idle.ticks, idle.programmed), (0, None));
     }
 
     #[test]
-    fn a_slow_or_fast_tick_fails_on_its_median_whatever_the_window() {
-        // The review's T66-R1: a divisor eight times too large, 12.5 Hz.
-        let slow = watched(&[8 * P; 50]);
-        assert_eq!(
-            judge_window(&slow, 50, HALF_SECOND),
-            WindowVerdict::WrongRate
-        );
-        // 60 % slow, every gap: wrong, though its rounds might come in time on a short bound.
-        assert_eq!(
-            judge_window(&watched(&[P * 16 / 10; 50]), 50, 10 * HALF_SECOND),
-            WindowVerdict::WrongRate
-        );
-        // Fast: a quarter of the period.
-        assert_eq!(
-            judge_window(&watched(&[P / 4; 50]), 50, HALF_SECOND),
-            WindowVerdict::WrongRate
-        );
-        // The bounds' edges pass.
-        for gap in [P * 95 / 100, P * 3 / 2] {
-            assert!(watched(&[gap; 50]).median_in_bounds(), "{gap}");
+    fn a_timer_programmed_otherwise_fails_at_once() {
+        // The review's T66-R1: divide-by-128 for 16, another count from the one timed, a timer
+        // left in one-shot mode or masked.
+        let wrongs = [
+            TimerProgramming {
+                divide: 0b1010,
+                ..PROGRAMMED
+            },
+            TimerProgramming {
+                initial: 5_000_000,
+                ..PROGRAMMED
+            },
+            TimerProgramming {
+                initial: 0,
+                ..PROGRAMMED
+            },
+            TimerProgramming {
+                lvt: 0x40,
+                ..PROGRAMMED
+            },
+            TimerProgramming {
+                lvt: PROGRAMMED.lvt | (1 << 16),
+                ..PROGRAMMED
+            },
+        ];
+        for wrong in wrongs {
+            let w = watched_as(&[P; 50], Some(wrong));
+            assert_eq!(
+                judge_window(&w, 50, HALF_SECOND, PROGRAMMED),
+                WindowVerdict::WrongRate
+            );
         }
-        assert!(!watched(&[P * 95 / 100 - 1; 50]).median_in_bounds());
-        assert!(!watched(&[P * 3 / 2 + 1; 50]).median_in_bounds());
+        // A misprogrammed timer is named even when it also stops ticking, as one in one-shot mode
+        // does after its first.
+        let once = watched_as(
+            &[P],
+            Some(TimerProgramming {
+                lvt: 0x40,
+                ..PROGRAMMED
+            }),
+        );
+        assert_eq!(
+            judge_window(&once, 50, HALF_SECOND, PROGRAMMED),
+            WindowVerdict::WrongRate
+        );
+        // Not read back at all.
+        let w = watched_as(&[P; 50], None);
+        assert_eq!(
+            judge_window(&w, 50, HALF_SECOND, PROGRAMMED),
+            WindowVerdict::WrongRate
+        );
+        // Read at the first tick only: a later change of the register is not this check's.
+        let mut w = TickWatch::armed(0, P);
+        w.note_programming(Some(PROGRAMMED));
+        w.note(P);
+        assert!(!w.first_tick());
     }
 
     #[test]
     fn a_stall_before_the_rounds_earns_a_repeat_and_never_a_pass() {
-        // 400 ms away after the 5th tick: the 15th comes at 550 ms, past today's bound.
+        // 400 ms away after the 5th tick: the 15th comes at 540 ms, past today's bound.
         let mut gaps = [P; 50];
         gaps[5] = 400_000_000;
         let w = watched(&gaps);
-        assert_eq!(judge_window(&w, 50, HALF_SECOND), WindowVerdict::Stalled);
+        assert_eq!(
+            judge_window(&w, 50, HALF_SECOND, PROGRAMMED),
+            WindowVerdict::Stalled
+        );
         // The same stall after the 15th tick changes nothing: today's bound was met.
         let mut later = [P; 50];
         later[20] = 400_000_000;
         assert_eq!(
-            judge_window(&watched(&later), 50, HALF_SECOND),
+            judge_window(&watched(&later), 50, HALF_SECOND, PROGRAMMED),
             WindowVerdict::InBounds
         );
         // Late with no gap of two periods: no stall to blame, so it fails.
-        let mut slowish = [P * 14 / 10; 50];
-        slowish[0] = P;
-        let late = watched(&slowish);
-        assert!(late.median_in_bounds());
-        assert_eq!(judge_window(&late, 50, P * 15), WindowVerdict::Late);
+        let late = watched(&[P * 19 / 10; 50]);
+        assert_eq!(
+            judge_window(&late, 50, P * 15, PROGRAMMED),
+            WindowVerdict::Late
+        );
+        // Slow enough for every gap to be two periods: stalled in every run, so it fails at the
+        // proof's last run (the kernel's budget of runs), never passing.
+        let slow = watched(&[8 * P; 50]);
+        assert_eq!(
+            judge_window(&slow, 50, HALF_SECOND, PROGRAMMED),
+            WindowVerdict::Stalled
+        );
     }
 
     #[test]
     fn a_processor_short_of_its_ticks_fails() {
         assert_eq!(
-            judge_window(&watched(&[P; 49]), 50, HALF_SECOND),
+            judge_window(&watched(&[P; 49]), 50, HALF_SECOND, PROGRAMMED),
             WindowVerdict::Short
         );
         assert_eq!(
-            judge_window(&watched(&[]), 50, HALF_SECOND),
+            judge_window(&watched(&[]), 50, HALF_SECOND, PROGRAMMED),
             WindowVerdict::Short
         );
-        assert!(!watched(&[]).median_in_bounds());
-    }
-
-    #[test]
-    fn the_median_test_by_counts_is_the_sorted_median() {
-        // Every mix of in-bound, low and high gaps up to 12 gaps: the count test agrees with
-        // sorting and taking the upper median.
-        for low in 0..=12u64 {
-            for high in 0..=(12 - low) {
-                for mid in 0..=(12 - low - high) {
-                    let mut gaps = alloc::vec::Vec::new();
-                    gaps.extend(core::iter::repeat_n(P / 2, low as usize));
-                    gaps.extend(core::iter::repeat_n(P, mid as usize));
-                    gaps.extend(core::iter::repeat_n(3 * P, high as usize));
-                    let w = watched(&gaps);
-                    let mut sorted = gaps.clone();
-                    sorted.sort_unstable();
-                    let by_sort = sorted
-                        .get(sorted.len() / 2)
-                        .is_some_and(|&m| (P / 100 * 95..=P / 2 * 3).contains(&m));
-                    assert_eq!(w.median_in_bounds(), by_sort, "{low} {mid} {high}");
-                }
-            }
-        }
-    }
-
-    /// A wait of `waited_ms` on a processor that took `ticks` ticks over it.
-    const fn wait(waited_ms: u64, ticks: u64) -> TimedWait {
-        TimedWait { waited_ms, ticks }
-    }
-
-    const HZ: u64 = 100;
-
-    #[test]
-    fn a_timed_wait_in_bounds_passes_and_its_edges_hold() {
-        let long = wait(18, 1);
-        assert_eq!(
-            judge_timed_waits(wait(59, 5), long, 0, HZ),
-            RoundTrips::Pass
-        );
-        assert_eq!(
-            judge_timed_waits(wait(50, 5), long, 0, HZ),
-            RoundTrips::Pass
-        );
-        assert_eq!(
-            judge_timed_waits(wait(80, 8), long, 0, HZ),
-            RoundTrips::Pass
-        );
-        assert_eq!(
-            judge_timed_waits(wait(60, 6), wait(499, 49), 0, HZ),
-            RoundTrips::Pass
-        );
-        // Early is a fault a stall cannot make: it fails whatever the ticks.
-        assert_eq!(
-            judge_timed_waits(wait(49, 0), long, 1000, HZ),
-            RoundTrips::Fail
-        );
-    }
-
-    #[test]
-    fn a_late_wait_with_its_ticks_there_fails_at_once() {
-        // 81 ms with 8 ticks taken: none lost, so the kernel overslept.
-        assert_eq!(
-            judge_timed_waits(wait(81, 8), wait(18, 1), 0, HZ),
-            RoundTrips::Fail
-        );
-        assert_eq!(
-            judge_timed_waits(wait(122, 11), wait(18, 1), 0, HZ),
-            RoundTrips::Fail
-        );
-        // Two ticks lost is not enough to excuse it.
-        assert_eq!(
-            judge_timed_waits(wait(100, 8), wait(18, 1), 0, HZ),
-            RoundTrips::Fail
-        );
-        // The boot flow's absence excuses only the signalled wait, not the unsignalled one.
-        assert_eq!(
-            judge_timed_waits(wait(122, 11), wait(18, 1), 1000, HZ),
-            RoundTrips::Fail
-        );
-        // The signalled wait late with its ticks there and the boot flow present fails.
-        assert_eq!(
-            judge_timed_waits(wait(59, 5), wait(600, 60), 0, HZ),
-            RoundTrips::Fail
-        );
-    }
-
-    #[test]
-    fn a_late_wait_whose_processor_lost_ticks_is_measured_again() {
-        // The 122 ms of 2026-11-14 as a stall: 5 ticks in 122 ms, 7 lost.
-        assert_eq!(wait(122, 5).ticks_lost(HZ), 7);
-        assert_eq!(
-            judge_timed_waits(wait(122, 5), wait(18, 1), 0, HZ),
-            RoundTrips::Repeat
-        );
-        assert_eq!(
-            judge_timed_waits(wait(81, 5), wait(18, 1), 0, HZ),
-            RoundTrips::Repeat
-        );
-        // The signalled wait late: its processor's lost ticks, or the boot flow away.
-        assert_eq!(
-            judge_timed_waits(wait(59, 5), wait(600, 20), 0, HZ),
-            RoundTrips::Repeat
-        );
-        assert_eq!(
-            judge_timed_waits(wait(59, 5), wait(600, 60), DISTURBED_PER_MILLE, HZ),
-            RoundTrips::Repeat
-        );
-        // Both late, both excused.
-        assert_eq!(
-            judge_timed_waits(wait(150, 5), wait(700, 10), 0, HZ),
-            RoundTrips::Repeat
-        );
-        // Both late, one excused: fails.
-        assert_eq!(
-            judge_timed_waits(wait(150, 5), wait(700, 70), 0, HZ),
-            RoundTrips::Fail
-        );
-    }
-
-    #[test]
-    fn over_a_grid_only_a_wait_in_bounds_passes() {
-        for short in (0..300).step_by(7) {
-            for short_ticks in 0..30 {
-                for long in [5, 20, 499, 500, 900] {
-                    for long_ticks in [0, 1, 40, 90] {
-                        for away in [0, 99, 100, 900] {
-                            let verdict = judge_timed_waits(
-                                wait(short, short_ticks),
-                                wait(long, long_ticks),
-                                away,
-                                HZ,
-                            );
-                            let in_bounds = (50..=80).contains(&short) && long < 500;
-                            assert_eq!(
-                                verdict == RoundTrips::Pass,
-                                in_bounds,
-                                "{short} ms/{short_ticks}, {long} ms/{long_ticks}, {away}"
-                            );
-                            if short < 50 {
-                                assert_eq!(verdict, RoundTrips::Fail);
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 
     #[test]

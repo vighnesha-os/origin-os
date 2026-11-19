@@ -68,6 +68,9 @@ pub enum ApicRead {
     Id,
     Version,
     TimerCurrent,
+    TimerInitial,
+    TimerDivide,
+    LvtTimer,
 }
 
 /// x2APIC registers this module writes: the timer and the spurious-vector register only,
@@ -134,6 +137,9 @@ impl X2Apic {
             ApicRead::Id => X2APIC_ID,
             ApicRead::Version => X2APIC_VERSION,
             ApicRead::TimerCurrent => X2APIC_TIMER_CURRENT,
+            ApicRead::TimerInitial => X2APIC_TIMER_INITIAL,
+            ApicRead::TimerDivide => X2APIC_TIMER_DIVIDE,
+            ApicRead::LvtTimer => X2APIC_LVT_TIMER,
         };
         // SAFETY: x2APIC mode is on (type invariant), so the register exists, and none of
         // these reads has a side effect.
@@ -336,6 +342,29 @@ pub fn calibrated_tsc_hz() -> Option<u64> {
 
 /// The calibrated initial count for [`HZ`] interrupts per second, once known (0 before).
 static PERIOD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// What [`start_periodic`] programs on every processor: the calibrated initial count, the
+/// divide configuration and a periodic, unmasked entry at the timer's vector, the very values
+/// [`init`]'s timed proof ran with on the boot processor.
+pub fn periodic_programming() -> apic::TimerProgramming {
+    apic::TimerProgramming::from_registers(
+        u64::from(PERIOD.load(core::sync::atomic::Ordering::Acquire)),
+        apic::divide_config(DIVISOR).unwrap_or(0b0011),
+        apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false),
+    )
+}
+
+/// This processor's timer as programmed, read back from its x2APIC through [`X2Apic::read`];
+/// `None` if x2APIC mode is not on. For the preemption proof's check that every processor
+/// ticks as the boot processor's proof timed (TASKS item 66, the review's T66-R1).
+pub fn programmed() -> Option<apic::TimerProgramming> {
+    let lapic = X2Apic::this_cpu()?;
+    Some(apic::TimerProgramming::from_registers(
+        lapic.read(ApicRead::TimerInitial),
+        lapic.read(ApicRead::TimerDivide),
+        lapic.read(ApicRead::LvtTimer),
+    ))
+}
 
 /// Starts this processor's APIC timer at the calibrated [`HZ`]. Returns false if the
 /// boot processor has not calibrated it.

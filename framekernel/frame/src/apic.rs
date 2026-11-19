@@ -90,6 +90,51 @@ pub const fn lvt_timer(vector: u8, mode: TimerMode, masked: bool) -> u64 {
     vector as u64 | mode_bits | mask
 }
 
+/// The bits of the divide configuration register that hold the divisor (Intel SDM Vol. 3A,
+/// "Divide Configuration Register": bits 0, 1 and 3; the rest are reserved).
+pub const DIVIDE_BITS: u64 = 0b1011;
+
+/// The bits of the LVT timer entry that say how the timer interrupts: the vector, the mask and
+/// the timer mode. Bit 12, the delivery status, is the hardware's and is left out.
+pub const LVT_TIMER_BITS: u64 = 0xFF | LVT_MASKED | (0b11 << 17);
+
+/// A local APIC timer's programming: its initial count, its divide configuration's divisor
+/// bits ([`DIVIDE_BITS`]) and its LVT timer entry's vector, mask and mode ([`LVT_TIMER_BITS`]).
+/// For the preemption proof's check that every processor's tick is programmed as the boot
+/// processor's timed proof ran it (TASKS item 66, the review's T66-R1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerProgramming {
+    pub initial: u64,
+    pub divide: u64,
+    pub lvt: u64,
+}
+
+impl TimerProgramming {
+    /// The programming from the three registers' raw values, keeping only the bits that set
+    /// the rate and the interrupt.
+    pub const fn from_registers(initial: u64, divide: u64, lvt: u64) -> Self {
+        Self {
+            initial,
+            divide: divide & DIVIDE_BITS,
+            lvt: lvt & LVT_TIMER_BITS,
+        }
+    }
+
+    /// The first register that differs from `expected`, by name, with this value and the
+    /// expected one; `None` if all three agree.
+    pub const fn first_difference(&self, expected: &Self) -> Option<(&'static str, u64, u64)> {
+        if self.initial != expected.initial {
+            Some(("initial count", self.initial, expected.initial))
+        } else if self.divide != expected.divide {
+            Some(("divide configuration", self.divide, expected.divide))
+        } else if self.lvt != expected.lvt {
+            Some(("LVT entry", self.lvt, expected.lvt))
+        } else {
+            None
+        }
+    }
+}
+
 /// Divide-configuration register value for `divisor` (1, 2, 4, …, 128), or `None`.
 ///
 /// The encoding is bits 3, 1 and 0: 0b000 divides by 2 up to 0b110 by 128, and 0b111 by 1.
@@ -345,6 +390,42 @@ pub const fn initial_count(rate: u64, hz: u64) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timer_s_programming_keeps_only_the_bits_that_set_the_rate_and_the_interrupt() {
+        let periodic = lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false);
+        let p = TimerProgramming::from_registers(625_000, 0b0011 | 0b0100, periodic | (1 << 12));
+        assert_eq!(
+            p,
+            TimerProgramming {
+                initial: 625_000,
+                divide: 0b0011,
+                lvt: periodic
+            }
+        );
+        assert_eq!(p.first_difference(&p), None);
+        let one_shot = TimerProgramming::from_registers(
+            625_000,
+            0b0011,
+            lvt_timer(TIMER_VECTOR, TimerMode::OneShot, false),
+        );
+        assert_eq!(
+            one_shot.first_difference(&p),
+            Some(("LVT entry", u64::from(TIMER_VECTOR), periodic))
+        );
+        let masked = TimerProgramming::from_registers(625_000, 0b0011, periodic | LVT_MASKED);
+        assert_eq!(masked.first_difference(&p).map(|d| d.0), Some("LVT entry"));
+        let divide = TimerProgramming::from_registers(625_000, 0b1010, periodic);
+        assert_eq!(
+            divide.first_difference(&p),
+            Some(("divide configuration", 0b1010, 0b0011))
+        );
+        let count = TimerProgramming::from_registers(5_000_000, 0b0011, periodic);
+        assert_eq!(
+            count.first_difference(&p),
+            Some(("initial count", 5_000_000, 625_000))
+        );
+    }
 
     /// The tick proof's period at 100 Hz on a 1 GHz TSC, and the run it wants.
     const PERIOD: u64 = 10_000_000;
