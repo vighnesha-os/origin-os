@@ -364,7 +364,14 @@ fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> Results {
             } else {
                 ""
             },
-            if ok { "" } else { ": wait queues failed" }
+            if ok {
+                ""
+            } else if correct {
+                // The Report row's own word (TASKS item 66, Q4): the waits were right but late.
+                ": wait timing failed"
+            } else {
+                ": wait queues failed"
+            }
         );
     } else {
         let _ = writeln!(
@@ -467,7 +474,8 @@ fn prove_ping_pong(com1: &mut Console, bsp: CpuIndex, far: CpuIndex, tsc_hz: u64
         }
     };
     let (mean, away) = (run.mean, run.away);
-    let failed = if ok { "" } else { ": wait queues failed" };
+    // Printed only on a run that finished: what failed is the Report row's timing.
+    let failed = if ok { "" } else { ": wait timing failed" };
     if run.done && far == bsp {
         let _ = writeln!(
             com1,
