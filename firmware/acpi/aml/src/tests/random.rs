@@ -437,7 +437,10 @@ impl Gen {
                 string("ORIGIN"),
                 // G18 (step B5): the table's ID with its space, an empty ID matching any table,
                 // and two that match none.
-                string(self.rng.pick(&["AMLTEST ", "AMLTEST ", "", "AMLTEST", "OTHER"])),
+                string(
+                    self.rng
+                        .pick(&["AMLTEST ", "AMLTEST ", "", "AMLTEST", "OTHER"]),
+                ),
                 string(self.rng.pick(&["", "\\D0", "D0", "\\NOPE"])),
                 // `PF` reaches the parameter's own step through a PCI function walk (the review
                 // of B4's addendum, B4-14).
