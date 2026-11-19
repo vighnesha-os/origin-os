@@ -26,15 +26,27 @@
 //! [`reclaim`], once a TLB shootdown has reached every processor. The scheduler reclaims where it
 //! reaps exited threads.
 //!
-//! A stack still in use is never given back: the framework knows which stacks are in use because
-//! every kernel stack a processor runs on has its top in some processor's TSS
-//! (`cpu::set_kernel_stack`) and every suspended thread has a saved frame on its stack that the
-//! trap entry recorded (`cpu::record_saved_frame`). A thread running a closure on a measured stack
+//! A stack's drop decides from records whether a processor may still be using it. A thread's
+//! stack has its top in the TSS of the processor running the thread (`cpu::set_kernel_stack`),
+//! and a suspended thread has a saved frame on its stack that the trap entry recorded
+//! (`cpu::record_saved_frame`). A thread running a closure on a measured stack
 //! ([`with_measured_stack`]) has its saved frame there, not on its own stack, so each such call
 //! also records the stack pointer of the stack it left, for as long as the closure runs: one
 //! record for each call, nested ones included, in one table for every processor, since the thread
 //! can move (TASKS item 68, the coordinating session's ruling A1). A stack in any of these is
 //! leaked rather than freed, which is the safe failure for a safe caller that drops one too early.
+//!
+//! The records do not cover every stack a processor runs on:
+//! - **An open gap: a thread being switched out.** Between the scheduler's hook moving the
+//!   processor's kernel-stack record to the next thread (`follow_thread`) and the trap entry
+//!   recording the outgoing frame (`cpu::resume`), the processor still runs on the outgoing
+//!   thread's stack, and no record holds it. A caller on another processor that dropped that
+//!   stack in the window would have it given back under the processor. No caller does so today:
+//!   a thread's stack is freed only where it is reaped, on its own processor, after it ended.
+//!   Closing the window is TASKS item 70 (the review of TASKS item 68, T68-2).
+//! - **Stacks held by their user:** the interrupt stacks, the generator's stacks, and a measured
+//!   stack while its closure runs on it are in no record. That is safe because only their holder
+//!   can drop them, and none does while running on them (T68-3).
 //!
 //! # Measuring a closure's stack
 //!
@@ -515,9 +527,11 @@ fn in_use(low: u64, top: u64) -> bool {
     cpu::stack_in_use(low, top, top) || left_on(low, top)
 }
 
-/// Whether the stack in slot `slot` is in use, as a stack's drop decides it: for a proof that a
-/// thread's own stack stays in use while the thread is switched out on a measured stack (TASKS
-/// item 68, A1). It names no address.
+/// What a stack's drop would decide, from the records, about the stack in slot `slot`: whether
+/// one of them holds it (see the module docs). For a proof that a thread's own stack stays held
+/// while the thread is switched out on a measured stack (TASKS item 68, A1). It is not a test of
+/// whether a processor runs on the slot: a stack held by its user, such as a measured stack while
+/// its closure runs, is in no record and answers `false` (T68-3). It names no address.
 pub fn slot_in_use(slot: StackSlot) -> bool {
     let low = slot_base(slot.0);
     in_use(low, low + SLOT)
@@ -604,9 +618,16 @@ pub struct Measured<R> {
 /// written while `f` ran, and a lower bound on the deepest access: it misses a word that was
 /// reserved and only read, or touched without its value changing, or written with exactly the
 /// paint's value (which is why the paint is neither a canonical address nor a small integer).
-/// Safe Rust reads no stack word it has not written, and the kernel's target uses no red zone,
-/// so nothing is written below the stack pointer. So the room the stack had left, `size -
-/// depth`, is an upper bound, by at most the unwritten part of the deepest frame.
+/// Safe Rust reads no stack word it has not written, so a word reserved and only read does not
+/// arise in safe code. The kernel's target uses no red zone, so nothing is written below the
+/// stack pointer, and the deepest access is in the deepest frame. So the room the stack had
+/// left, `size - depth`, is an upper bound, by at most the part of the deepest frame below its
+/// lowest write. In this build that part is at most one page. As a frame's stack pointer moves
+/// past each page but its last, the page is probed with a zero write (`subq $0x1000, %rsp;
+/// movq $0x0, (%rsp)`, or the same in a loop), which the paint counts. The last page or less of a
+/// frame is not probed, since a move of one page or less cannot pass the unmapped space below a
+/// stack, and nothing is allocated on the stack dynamically. The probes are this build's, read
+/// from the kernel image (TASKS item 68's result), and a toolchain upgrade reads them again (T68-8).
 ///
 /// **Interrupts** (Q3): the caller's interrupt state is kept. An interrupt or exception taken
 /// while `f` runs is pushed on this stack, since its gate names no IST and the privilege level
