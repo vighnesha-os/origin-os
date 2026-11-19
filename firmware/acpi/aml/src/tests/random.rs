@@ -178,7 +178,9 @@ const NAMES: &[&str] = &[
 /// Names a store writes. `PF` is a PCI_Config field whose function is found only when first
 /// needed, so a store there, `Load`'s target among them, is put back once (the review of B4,
 /// B4-1).
-const PLACES: &[&str] = &["N0", "N1", "BF", "PK", "BD", "F0", "LK", "N3", PF];
+const PLACES: &[&str] = &[
+    "N0", "N1", "BF", "PK", "BD", "F0", "LK", "N3", PF, "EW", "EX", "AE",
+];
 const PF: &str = "\\_SB.PCI0.DP.PF";
 const METHODS: &[(&str, u8)] = &[("M0", 0), ("M1", 1), ("M2", 2), ("\\D0.M3", 1)];
 /// What `Load` is given: the buffers [`loadables`] makes, and objects that hold no table (an
@@ -233,10 +235,12 @@ fn with_table_id(mut t: Vec<u8>, id: &[u8; 8]) -> Vec<u8> {
 
 /// The buffers the grammar's `Load`s read, each an SSDT unless said otherwise, each table's names
 /// under a prefix of its own: `XA` loads (with `extra`, load-time code the generator adds); `XB`
-/// fails midway; `XC` has a bad checksum; `XD` loads `XB` and then `XA` inside its own load; `XE`
-/// reaches the loop limit midway; `XF` loads itself after its first name, which fails, and goes
-/// on; `XG` is signed `OEMX`; `XH` writes `Local0` at its table level, which is refused, so its
-/// load fails (B4-13).
+/// fails midway, on a reserved opcode the parser cannot step past (step B5: a statement that
+/// fails as it runs is only abandoned); `XC` has a bad checksum; `XD` loads `XB` and then `XA`
+/// inside its own load; `XE` reaches the loop limit midway; `XF` loads itself after its first
+/// name, which is refused as a table already loaded (step B5), and goes on; `XG` is signed
+/// `OEMX`; `XH` writes `Local0` at its table level, which is refused (B4-13), and since step B5
+/// that statement alone is abandoned, the table loading.
 fn loadables(extra: &[B]) -> Vec<B> {
     let mut qa = vec![
         name("QA0", int(1)),
@@ -254,7 +258,7 @@ fn loadables(extra: &[B]) -> Vec<B> {
                 &[
                     name("QB0", one()),
                     device("QBD", &[name("QBX", one())]),
-                    store(nm("\\NOPE"), debug()),
+                    vec![0x02],
                     name("QB1", one()),
                 ],
             ),
@@ -467,7 +471,7 @@ impl Gen {
 
     fn stmt(&mut self, depth: u32) -> B {
         let d = depth.saturating_sub(1);
-        match self.rng.below(if depth == 0 { 6 } else { 18 }) {
+        match self.rng.below(if depth == 0 { 6 } else { 19 }) {
             0 => store(self.expr(2), self.place()),
             1 => ret(self.expr(2)),
             2 => noop(),
@@ -514,6 +518,8 @@ impl Gen {
             14 => sleep(word(*self.rng.pick(&[0, 1, 3, 400, 1500]))),
             15 => stall(self.expr(1)),
             16 => notify(nm(self.rng.pick(&["D0", "N0"])), self.expr(1)),
+            // Step B5: one half of the pair that holds `MX` across a return (G2).
+            17 => call(self.rng.pick(&["\\PA", "\\PB"]), &[]),
             _ => device(self.rng.pick(&["DD0", "DD1"]), &[name("X", one())]),
         }
     }
@@ -541,7 +547,16 @@ impl Gen {
         let r = &mut self.rng;
         match r.below(5) {
             0 | 1 => int(r.next() >> r.below(64)),
-            2 => string(r.pick(&["", "a", "0x10", "12", "\\N0"])),
+            2 => string(r.pick(&[
+                "",
+                "a",
+                "0x10",
+                "12",
+                "\\N0",
+                " 0x1Fz",
+                "99999999999999999999",
+                "caf\u{e9}",
+            ])),
             3 => buffer(byte(r.below(6) as u8), &[1, 2, 3][..r.below(4) as usize]),
             _ => small_package(r),
         }
@@ -580,7 +595,40 @@ impl Gen {
             event("EV"),
             create_dword_field(nm("BF"), zero(), "BD"),
             alias("\\N0", "\\N2"),
+            // Step B5: an EmbeddedControl field wider than a byte (one transfer, G5), a field of
+            // any width ending at its region's end (G5), and a pair of methods that take `MX` in
+            // one and release it in the other (G2).
+            op_region("RE", 3, zero(), byte(32)),
+            field(
+                "RE",
+                0,
+                &[Fe::Named("EW", 24), Fe::Reserved(5), Fe::Named("EX", 11)],
+            ),
+            op_region("RA", 0, word(0x5000), byte(7)),
+            field("RA", 0x10, &[Fe::Reserved(24), Fe::Named("AE", 32)]),
         ];
+        // Some of the time only: two short methods in every table would crowd out the deep
+        // evaluations the floors hold (a call of a missing one is an error the grammar meets
+        // anyway).
+        if self.rng.chance(40) {
+            body.push(method("PA", 0, &[acquire(nm("MX"), 0xFFFF)]));
+            body.push(method("PB", 0, &[release(nm("MX"))]));
+        }
+        let mut late = false;
+        if self.rng.chance(20) {
+            // Step B5: load-time statements that fail alone, abandoned and reported: an unresolved
+            // name, a call of a method defined further on (a plain name, its arguments' bytes
+            // then statements), a duplicate, and a scope over nothing.
+            body.push(match self.rng.below(4) {
+                0 => store(nm("\\NOPE"), debug()),
+                1 => {
+                    late = true;
+                    call("\\LATE", &[one(), byte(2)])
+                }
+                2 => name("N0", one()),
+                _ => scope("\\NOPE", &[name("QZ", one())]),
+            });
+        }
         for (n, argc) in METHODS.iter().take(3) {
             let flags = *argc | if self.rng.chance(20) { 8 } else { 0 };
             let b = self.body(*argc);
@@ -618,6 +666,9 @@ impl Gen {
         if self.rng.chance(15) {
             // A load inside this block's own load.
             body.push(load_op(self.rng.pick(LOADS), none()));
+        }
+        if late {
+            body.push(method("LATE", 2, &[ret(arg(0))]));
         }
         body
     }
@@ -766,6 +817,38 @@ fn at_rest(i: &Interpreter<TestHost>, seed: u64) {
 
 /// Requires no name of a failed table.
 #[track_caller]
+/// One evaluation's reports (step B5): at most `REPORTS`, then one `Suppressed`, and none
+/// `Suppressed` before the bound.
+fn reports_bounded(i: &mut Interpreter<TestHost>, seed: u64) {
+    let t = super::told(i);
+    let bound = crate::REPORTS as usize;
+    assert!(
+        t.len() <= bound + 1,
+        "seed {seed:#x}: {} reports, past the bound",
+        t.len()
+    );
+    for (k, r) in t.iter().enumerate() {
+        assert_eq!(
+            matches!(r, super::Told::Suppressed(_)),
+            k == bound,
+            "seed {seed:#x}: a report out of place: {r:?}"
+        );
+    }
+}
+
+/// No name load-time code put in a package is left deferred once bound (step B5).
+fn no_deferred(i: &Interpreter<TestHost>, seed: u64) {
+    for k in 0..i.heap.slot_count() {
+        if let Some(e) = i.heap.name_elem_at(k) {
+            assert_ne!(
+                e.bind,
+                crate::object::Bind::Deferred,
+                "seed {seed:#x}: a package name left unbound"
+            );
+        }
+    }
+}
+
 fn no_failed_names(a: &Audit, seed: u64) {
     if let Some((t, path)) = &a.failed {
         panic!(
@@ -1016,6 +1099,18 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
         0,
         "seed {seed:#x}: the Global Lock was kept"
     );
+    reports_bounded(&mut i, seed);
+    // The names load-time code put in packages are bound once (step B5), leaving none deferred.
+    match i.bind_deferred() {
+        Ok(_)
+        | Err(crate::Error {
+            kind: ErrorKind::Limit(_),
+            ..
+        }) => {}
+        Err(e) => panic!("seed {seed:#x}: binding failed: {e:?}"),
+    }
+    no_deferred(&i, seed);
+    reports_bounded(&mut i, seed);
     // The block's own load may have loaded tables inside it: none failed may leave a name.
     no_failed_names(&audit(&i, 0), seed);
     at_rest(&i, seed);
@@ -1045,6 +1140,7 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
             Ok(None) => 4,
             Err(e) => 5 + e.at.map_or(0, |a| u64::from(a.offset)),
         });
+        reports_bounded(&mut i, seed);
         // What the evaluation's loads made stays (B4's contract, Q8); nothing else may.
         let a = audit(&i, tables_after_load);
         no_failed_names(&a, seed);
@@ -1301,7 +1397,13 @@ fn adversarial_cases() {
             Setup::PLAIN,
             Expect::Load(ErrorKind::Limit(Limit::Steps)),
         ),
-        (many, Setup::ROOMY, Expect::Load(ErrorKind::Duplicate)),
+        // Since step B5 each duplicate past the 4,096th is abandoned and reported, and the load
+        // goes on: the comparisons of some 16,000 duplicates end it even with room.
+        (
+            many,
+            Setup::ROOMY,
+            Expect::Load(ErrorKind::Limit(Limit::Steps)),
+        ),
         // A package length that claims past the end of the block.
         (
             vec![vec![0x10, 0xFF, 0xFF, 0xFF, 0x0F]],
@@ -1452,8 +1554,9 @@ fn adversarial_cases() {
             Setup::PLAIN,
             Expect::Eval(Ok(Some(Value::Integer(82)))),
         ),
-        // B4-13: a table whose table level writes `Local0` fails to load, and the caller's
-        // `Local0` keeps 1: 121 returned.
+        // B4-13: a table whose table level writes `Local0` has that statement refused, since
+        // step B5 abandoned alone while the table loads, and the caller's `Local0` keeps 1: 121
+        // returned.
         (
             {
                 let mut body = loadables(&[]);
@@ -1489,11 +1592,16 @@ fn adversarial_cases() {
             {
                 let mut body = loadables(&[]);
                 body.push(load_op("\\XA", none()));
-                body.push(store(nm("\\NOPE"), debug()));
+                // A reserved opcode: since step B5 a statement that fails as it runs is only
+                // abandoned, and this one fails the block whole.
+                body.push(vec![0x02]);
                 body
             },
             Setup::PLAIN,
-            Expect::Load(ErrorKind::NotFound),
+            Expect::Load(ErrorKind::Reserved {
+                first: 0x02,
+                second: None,
+            }),
         ),
         (
             vec![
@@ -1519,6 +1627,58 @@ fn adversarial_cases() {
             ],
             Setup::PLAIN,
             Expect::Eval(Ok(Some(Value::Integer(9)))),
+        ),
+        // Step B5's controls. A load-time statement naming nothing is abandoned, and the block
+        // loads: 131.
+        (
+            vec![
+                method("M0", 0, &[ret(nm("N9"))]),
+                name("N9", byte(131)),
+                store(nm("\\NOPE"), debug()),
+            ],
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(131)))),
+        ),
+        // A mutex taken in one method and released in another (G2): 132.
+        (
+            vec![
+                mutex("MP", 0),
+                method("M0", 0, &[call("PA", &[]), call("PB", &[]), ret(byte(132))]),
+                method("PA", 0, &[acquire(nm("MP"), 0xFFFF)]),
+                method("PB", 0, &[release(nm("MP"))]),
+            ],
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(132)))),
+        ),
+        // A field of any width ending at its region's end, read in bytes (G5): 133.
+        (
+            vec![
+                method("M0", 0, &[store(nm("AE"), local(0)), ret(byte(133))]),
+                op_region("RA", 0, word(0x5000), byte(7)),
+                field("RA", 0x10, &[Fe::Reserved(24), Fe::Named("AE", 32)]),
+            ],
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(133)))),
+        ),
+        // `ToHexString` of a buffer is `0x` and its digits (G4): 134.
+        (
+            vec![method(
+                "M0",
+                0,
+                &[
+                    if_(
+                        logic(
+                            0x93,
+                            un(0x98, buffer(byte(1), &[1]), none()),
+                            string("0x01"),
+                        ),
+                        &[ret(byte(134))],
+                    ),
+                    ret(byte(135)),
+                ],
+            )],
+            Setup::PLAIN,
+            Expect::Eval(Ok(Some(Value::Integer(134)))),
         ),
     ];
     for (k, (body, setup, expect)) in cases.iter().enumerate() {
@@ -1618,6 +1778,16 @@ fn planted_faults_are_caught() {
             Fault::AllowLoadLocals,
             "written for Eval(Ok(Some(Integer(121))))",
         ),
+        (Fault::NoAbandon, "written for Eval(Ok(Some(Integer(131))))"),
+        (
+            Fault::ReleaseOnReturn,
+            "written for Eval(Ok(Some(Integer(132))))",
+        ),
+        (
+            Fault::WidestAnyAcc,
+            "written for Eval(Ok(Some(Integer(133))))",
+        ),
+        (Fault::OldTexts, "written for Eval(Ok(Some(Integer(134))))"),
     ];
     for (f, by) in faults {
         let message = outcome(Some(f));
