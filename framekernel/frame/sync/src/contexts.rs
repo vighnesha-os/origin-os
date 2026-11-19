@@ -62,6 +62,8 @@
 //!   C11 model, a read-modify-write may not do that; whether Loom's search is wider than C11
 //!   there was not settled. With every write a swap, both order them, and it costs one `xchg` per
 //!   thread that ends.
+//! - A retirement with nothing ended costs one plain load (T70-2), so a tick that switches
+//!   nothing executes no locked instruction.
 //! - [`Contexts::covers`]: any processor. It never waits and takes no lock, so a stack may still
 //!   be dropped under any lock.
 //!
@@ -269,6 +271,11 @@ impl Contexts {
     /// retirement puts its record back only if no newer exit has recorded itself meanwhile
     /// (T70-6); its callers halt on the refusal in any case.
     pub fn retire_ended(&self, running_on: impl Fn(u64) -> bool) -> Result<(), Refused> {
+        // Only this processor writes `ended`, so a plain load sees its own last write: with
+        // nothing ended, nothing is written and no locked instruction runs (T70-2).
+        if self.ended.load(Relaxed) == NONE {
+            return Ok(());
+        }
         let ended = self.ended.swap(NONE, AcqRel);
         let Some(slot) = self.slots.get(ended) else {
             return Ok(());
