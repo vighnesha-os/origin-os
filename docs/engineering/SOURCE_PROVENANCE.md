@@ -5273,7 +5273,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Architecture:** ADR-0013 R1, R3 and R8 (unchanged), Amendments 2 and 3 (unchanged; decision item 316 asks the owner about Amendment 3); ADR-0018 V3 (CL20).
 - **Unsafe:** none added. `frame/src/timer.rs` and `frame/src/tlb.rs` are on the gate's list already, and no `unsafe` line changed.
 - **Tests:**
-  - **Host tests:** `apic::tests` (four: the edges, a stall's repeat, a wrong rate, a grid showing that only an in-bound run passes); `runqueue::tests` (four of the same kind for the timed waits); the RTC meter's capacity test, generalised to six edges.
+  - **Host tests:** `apic::tests` (four: the edges, a stall's repeat, a wrong rate, a grid showing that only an in-bound run passes); `runqueue::tests` (four of the same kind for the timed waits; deleted with the window's first tests in `4c856ce3`, so that from it to their restoration nothing tested R3's judgement, and restored unchanged from `c0f0d02a`: the addendum review's T66-R12); the RTC meter's capacity test, generalised to six edges.
   - **Planted boots:** T66-1 to T66-19 in ADR-0013.
   - **The gates:** in `TASKS.md`'s result.
 - **Review:** one AI reviewer, `docs/engineering/REVIEW_T66_2026-11-19.md`, required by the coordinating session's ruling (three Refuse proofs' verdict logic changes); its answers are the next entry. No person.
@@ -5298,7 +5298,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Architecture:** ADR-0013 R1, R3 and R8 (unchanged); Amendments 2 and 3 (unchanged; Amendment 3 holds until TASKS item 73 lands, decision item 316).
 - **Unsafe:** none added. `timer::programmed` reads through the existing `X2Apic::read`; `stalls.rs` forbids `unsafe`.
 - **Tests:**
-  - **Host tests:** `apic::tests` (the programming's differences, each tick clause at its edge, a stamp shared with the next, the grid), `stalls::tests` (four), `runqueue::tests` (the window's verdicts in their order).
+  - **Host tests:** `apic::tests` (the programming's differences, each tick clause at its edge, a stamp shared with the next, the grid), `stalls::tests` (four), `runqueue::tests` (the window's verdicts in their order; R3's four timed-wait tests, which `4c856ce3` deleted, restored: 25 tests in the module before, 29 after).
   - **Planted boots:** T66-9 to T66-14 and T66-20 to T66-22b, run again or added, in ADR-0013.
   - **The gates:** in `TASKS.md`'s result.
 - **Review:** the review above, by one AI reviewer; the same reviewer reads the answers. No person.
