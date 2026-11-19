@@ -1316,6 +1316,13 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         stacks(),
         if reaped { "" } else { ": scheduler failed" }
     );
+    // The framework's measured stack in a thread switched out on it (TASKS item 68): after the
+    // comparison above has closed with a settle, so that it runs inside no proof's window of
+    // stacks or frames (the review of TASKS item 68, T68-5).
+    proofs.record(
+        Proof::MeasuredStackThread,
+        crate::measured_stack::prove_in_thread(com1, bsp),
+    );
     // The kernel-wide bound (ADR-0005 G5; task S4-3), after every proof that makes a process, so
     // that its root can be seen whole again.
     proofs.record(

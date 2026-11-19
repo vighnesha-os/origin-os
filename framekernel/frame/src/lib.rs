@@ -52,6 +52,7 @@ pub mod pci;
 pub mod percpu;
 pub mod reserved;
 pub mod speculation;
+pub mod stackpaint;
 pub mod tablebound;
 pub mod told;
 pub mod topology;

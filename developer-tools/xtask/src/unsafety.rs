@@ -129,7 +129,7 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
     ),
     (
         "framekernel/frame/src/stack.rs",
-        "kernel stacks and FPU areas: raw allocation, guard pages, first frames",
+        "kernel stacks and FPU areas: raw allocation, guard pages, first frames, a closure run on a painted stack",
     ),
     (
         "framekernel/frame/src/timer.rs",

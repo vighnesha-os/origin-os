@@ -75,7 +75,7 @@ fn the_gate_s_own_controls_are_caught() {
             pack_line.as_ref(),
             &sign_manifest
         ),
-        Ok(11)
+        Ok(12)
     );
     // A control is missed when the rule it tests is gone: with no first-party programs, the
     // path control finds nothing to name.
@@ -183,29 +183,52 @@ fn a_first_party_program_by_name_or_path_is_caught() {
     }
 }
 
+/// The function of the turn lock's test, the one place `SELF_RUNS` lists since TASKS item 61.
+const LOCK_TEST: &str = "the_lock_goes_with_the_process_however_it_ends";
+
+/// `boot-matrix` and its ten scenario commands, which re-ran `xtask` until TASKS item 61.
+const SCENARIO_COMMANDS: [&str; 11] = [
+    "boot_matrix",
+    "boot_x2apic",
+    "boot_bridge",
+    "boot_reserved",
+    "boot_legacy_free",
+    "boot_random",
+    "boot_identity",
+    "boot_sparse",
+    "boot_many",
+    "boot_listed",
+    "boot_acpi",
+];
+
 #[test]
 fn xtask_names_itself_only_where_the_list_allows() {
-    // In a listed function of the listed file: allowed.
-    let listed = "fn boot_matrix() -> Result { let exe = env::current_exe()?; Ok(()) }";
+    // In the listed function of the listed file: allowed.
+    let listed = format!("fn {LOCK_TEST}() {{ let exe = std::env::current_exe().unwrap(); }}");
     let (_, consts, programs) = real();
-    assert_eq!(program_hits("src/main.rs", listed, &consts, &programs), []);
+    assert_eq!(
+        program_hits("src/turns.rs", &listed, &consts, &programs),
+        []
+    );
     // The same function in another file, an unlisted function, and no function at all.
-    let hits = program_hits("src/image.rs", listed, &consts, &programs);
+    let hits = program_hits("src/main.rs", &listed, &consts, &programs);
     assert_eq!(hits.len(), 1, "{hits:?}");
-    assert!(hits[0].what.contains("`boot_matrix`") && hits[0].what.contains("300"));
-    // Each listed place names its authority: item 300 for `boot_matrix`, item 311 for the three
-    // scenario commands TASKS item 58 added, item 312 for those added since (`boot_acpi`, TASKS
-    // item 62), item 310 for the rest (the review of 2026-11-14, finding F6; all four accepted by
-    // the owner).
-    for (file, function, why) in SELF_RUNS {
-        let expected = match *function {
-            "boot_matrix" => "decision item 300",
-            "boot_sparse" | "boot_many" | "boot_listed" => "decision item 311",
-            "boot_acpi" => "decision item 312 (ADR-0011 Amendment 4, T1's fourth note)",
-            _ => "decision item 310",
-        };
-        assert!(why.contains(expected), "{file} {function}: {why}");
-        assert!(!why.contains("pending"), "{file} {function}: {why}");
+    assert!(
+        hits[0].what.contains(&format!("`{LOCK_TEST}`")) && hits[0].what.contains("TASKS item 61"),
+        "{hits:?}"
+    );
+    // The list holds the turn lock's test alone, by decision item 310 (the review of 2026-11-14,
+    // finding F6, accepted by the owner): TASKS item 61 ended the allowances of items 300 (for
+    // `boot-matrix`), 310, 311 and 312 for the scenario commands.
+    assert_eq!(SELF_RUNS, [("src/turns.rs", LOCK_TEST, ITEM_310_TEST)]);
+    assert!(ITEM_310_TEST.contains("decision item 310"));
+    // `boot-matrix` and every scenario command are refused where they re-run `xtask`.
+    for function in SCENARIO_COMMANDS {
+        let rerun =
+            format!("fn {function}() -> Result {{ let exe = env::current_exe()?; Ok(()) }}");
+        let hits = program_hits("src/main.rs", &rerun, &consts, &programs);
+        assert_eq!(hits.len(), 1, "{function}: {hits:?}");
+        assert!(hits[0].what.contains(&format!("`{function}`")), "{hits:?}");
     }
     let hits = planted_in_main("fn again() { Command::new(std::env::current_exe().unwrap()); }");
     assert_eq!(hits.len(), 1, "{hits:?}");
@@ -214,16 +237,28 @@ fn xtask_names_itself_only_where_the_list_allows() {
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert!(hits[0].what.contains("no function"), "{hits:?}");
     // A closure inside a listed function is still inside it.
-    let nested = "fn boot_x2apic() { let f = || std::env::current_exe(); }";
-    assert_eq!(program_hits("src/main.rs", nested, &consts, &programs), []);
-    // A listed place that no longer names itself is a stale allowance.
+    let nested = format!("fn {LOCK_TEST}() {{ let f = || std::env::current_exe(); }}");
     assert_eq!(
-        stale_self_runs("src/main.rs", "fn boot_matrix() {}"),
-        SELF_RUNS
-            .iter()
-            .filter(|(file, _, _)| *file == "src/main.rs")
-            .map(|(_, function, _)| *function)
-            .collect::<Vec<_>>()
+        program_hits("src/turns.rs", &nested, &consts, &programs),
+        []
+    );
+    // A listed place that no longer names itself is a stale allowance; `main.rs` has none.
+    assert_eq!(
+        stale_self_runs("src/turns.rs", &format!("fn {LOCK_TEST}() {{}}")),
+        [LOCK_TEST]
+    );
+    assert!(stale_self_runs("src/main.rs", "fn boot_matrix() {}").is_empty());
+}
+
+/// TASKS item 61's control, as the gate plants it: `boot_x2apic` as it was before the task is
+/// refused, once, as a `current_exe` outside the list.
+#[test]
+fn a_scenario_command_that_re_runs_xtask_is_refused() {
+    let hits = planted_in_main(PLANTED_SCENARIO_RERUN);
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(
+        hits[0].what.contains("`current_exe` in `boot_x2apic`"),
+        "{hits:?}"
     );
 }
 
@@ -487,10 +522,11 @@ fn cargo_s_aliases_are_cargo_run() {
             r#"fn g() { cargo().args(["clippy", "-p", "xtask", "--all-targets"]); }"#,
             false,
         ),
-        // In a function `SELF_RUNS` lists: `xtask` re-running itself.
+        // In a function `SELF_RUNS` no longer lists since TASKS item 61: `boot-matrix`
+        // re-running itself (the listed place is tested below).
         (
             r#"fn boot_matrix() { cargo().args(["xtask", "boot-test"]); }"#,
-            false,
+            true,
         ),
         // The option before an alias takes its value only from the element before it, and an
         // element that is not a literal is unknown (the review's addendum, finding N1).
@@ -531,14 +567,20 @@ fn cargo_s_aliases_are_cargo_run() {
         let hits = planted_in_main(planted);
         assert_eq!(hits.len(), usize::from(refused), "{planted}: {hits:?}");
     }
-    // An alias that runs another package is refused even in a listed function.
+    // In the function `SELF_RUNS` lists: `xtask` re-running itself is allowed.
     let (_, consts, mut known) = real();
+    let in_lock_test = format!(r#"fn {LOCK_TEST}() {{ cargo().args(["xtask", "boot-test"]); }}"#);
+    assert_eq!(
+        program_hits("src/turns.rs", &in_lock_test, &consts, &known),
+        []
+    );
+    // An alias that runs another package is refused even in a listed function.
     known
         .runs
         .insert("pack".into(), Some("onbf-pack".to_string()));
     let hits = program_hits(
-        "src/main.rs",
-        r#"fn boot_matrix() { cargo().args(["pack", "krn"]); }"#,
+        "src/turns.rs",
+        &format!(r#"fn {LOCK_TEST}() {{ cargo().args(["pack", "krn"]); }}"#),
         &consts,
         &known,
     );
