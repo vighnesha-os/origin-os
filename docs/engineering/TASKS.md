@@ -2017,3 +2017,30 @@ Assigned by the coordinating session on 2026-11-19, from the question TASKS item
 - **Controls MS-1 to MS-6** (ADR-0013, "Controls of the measured stack"; 00:15:49 to 00:18:21, the same turn as the second `boot-matrix`): each failed its boot as aimed, MS-5 on the double fault's report, the others on `measured stack failed`; every file restored byte for byte.
 - **Where it differs from the contract or the rulings:** A1's table is consulted in `stack.rs`'s `in_use`, beside `cpu::stack_in_use`, rather than inside it: one predicate for a stack's drop and for `slot_in_use`, and `cpu.rs` untouched. R2's bounds are 1,000 yields for the thread and 100,000 turns for the boot flow, and it reads `sched::QUEUES` to count live threads, as `prove_lifecycle` does, rather than adding a function to `sched.rs`.
 - **Not shown:** anything under KVM, in CI or on a physical machine; the AML proof does not use the function yet. No independent review yet (Q9), and no person has reviewed the code.
+
+**The independent review and its answers (2026-11-19).** One AI reviewer read `b983bf6c..b200dbbd` (`docs/engineering/REVIEW_T68_2026-11-19.md`, copied in at `150af01d`) and found 0 High, 2 Medium and 8 Low. Each finding is answered on the coordinating session's rulings, and the report's Resolution names each commit:
+- `882a108a`: T68-1 (R2 checks, through `stack::slot_state`, that its thread's stack was given back after the reap, not leaked; control MS-7) and T68-5 (R2 runs just after "thread reaping" has closed with a settle, before the kernel-wide bound);
+- `6e4fdee4`: T68-9 (the record taken before the stack; `MEASURED_CALLS` says what a record left behind costs);
+- `6a29f273`: T68-4 (`mark` writes two words, and R1's exactness rests on its local taking the lower slot; the failure line names an 8-byte difference) and T68-6 (R1 on 32 KiB);
+- `dd6b2649`: T68-2 (the module documentation names the switch-out window as an open gap, TASKS item 70), T68-3 (stacks held by their user are in no record; what `slot_in_use` answers) and T68-8 (the depth's gap, at most one page in this build, with a departure from the ruling's "under one page", explained in the Resolution);
+- T68-7 in MS-4's edit; T68-10 in the hand-over's departures;
+- `0e1816a0`: ADR-0013's rows.
+
+The last commit that changes code is `dd6b2649`.
+
+**Corrections to the Result above, from the review:**
+- `mark` writes two words below its saved frame pointer, not one. R1 is exact because its local takes the lower slot (T68-4).
+- R2 now runs after "thread reaping", not inside its window (T68-5).
+- The deepest frame's unwritten part is at most one page in this build (T68-8).
+- The earlier gates ran in two turns of the machine (T68-10).
+
+**Gates on `dd6b2649`'s code, at `0e1816a0`, in one turn of the machine** (2026-11-19, 01:01:31 to 01:31:57 UTC, the tree clean before and after). The quick gates passed first.
+- `cargo xtask check` passed: 2,304 host tests, 0 failed, 29 ignored; Loom's 56 models passed and its 83 controls were caught.
+- `cargo xtask boot-test` passed 11 of 11.
+- `cargo xtask boot-matrix` passed on its first run, 31 kernel boots:
+  - R1: 1,648 and 11,504 bytes measured and sampled, on 32 KiB;
+  - R2: 520 bytes below the sample, the boot flow's turn after 1 yield, its own stack in use meanwhile, and given back after the reap (kept for reuse);
+  - the empty closure's call took 633 to 794 µs.
+- Controls MS-1 to MS-7 each failed their boot as aimed (ADR-0013, "The controls again, after the review of TASKS item 68").
+
+**Not shown:** anything under KVM, in CI or on a physical machine. No person has reviewed the code. The review of these answers is to come, as an addendum.

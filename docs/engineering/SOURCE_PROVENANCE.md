@@ -5143,3 +5143,20 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - Host: `stackpaint`'s seven (no change, the bottom word, the deepest change over a hole, each position, no words, a word written with the paint's value, the paint neither a canonical address nor a small integer); the proof table's pinned rows and verdicts.
   - Gates on `831f7ee8` (2026-11-18 23:45 to 2026-11-19 00:18 UTC, two turns of the machine, a clean tree): `check` (2,304 host tests, 0 failed, 29 ignored; Loom 56 models, 83 controls caught); `boot-test` 11 of 11; `boot-matrix` failed once on the 65-processor VT-d machine's RTC-second clock proof under host load (TASKS item 66's class, before any measured stack) and passed when run again at once: 31 kernel boots, R1 exact (1,648 and 11,504 bytes) and R2 passing (520 bytes below the sample) on each.
   - Controls MS-1 to MS-6 (ADR-0013): the paint skipped, the scan one word off, the scan stopped at a hole, R2's yield removed, R1 past its stack (a double fault, reported), A1's record removed; each failed its boot as aimed.
+
+### TASKS item 68: the answers to its review (2026-11-19)
+
+- **What:** the answers to `docs/engineering/REVIEW_T68_2026-11-19.md` (one AI reviewer, 0 High, 2 Medium, 8 Low), on the coordinating session's rulings:
+  - `882a108a`: T68-1 and T68-5;
+  - `6e4fdee4`: T68-9;
+  - `6a29f273`: T68-4 and T68-6;
+  - `dd6b2649`: T68-2, T68-3 and T68-8;
+  - `0e1816a0`: ADR-0013's rows;
+  - `150af01d`: the report, as received; then the records.
+- **New:** `stack::slot_state`, a read of one slot's state that names no address; `State` re-exported from `origin_sync::slots`. No new `unsafe`.
+- **Review:** the review above; its Resolution answers each finding. The answers are to be reviewed as an addendum. No person has reviewed the code.
+- **Tests:**
+  - Gates on `dd6b2649`'s code, at `0e1816a0`, in one turn of the machine (2026-11-19, 01:01 to 01:32 UTC): `check` (2,304 host tests, 0 failed, 29 ignored; Loom 56 models, 83 controls); `boot-test` 11 of 11; `boot-matrix` passed on its first run, 31 kernel boots with R1 exact and R2 passing on each.
+  - Controls MS-1 to MS-7 each failed their boot as aimed.
+  - The kernel image of `dd6b2649` read again with `llvm-objdump`: `mark`'s layout, and the stack probes (60 zero-write sites, a probe loop in `cpu::init`, two one-page frames unprobed).
+

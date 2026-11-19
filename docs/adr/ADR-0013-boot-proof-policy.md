@@ -574,6 +574,20 @@ The verdict's branches are host tests too (`framekernel/src/aml_proof/tests.rs`)
 | MS-5 | R1 asked for 200 levels where the 16 KiB stack holds about 90 (`DEEP` 64 to 200) | The recursion wrote into the unmapped page below the stack: `exception 8 (#DF double fault) at rip image +0x8b1ec, error code 0x0`, in `measured_stack::level`'s stores, and the kernel halted. An overflow faults; it writes nothing past the stack |
 | MS-6 | Ruling A1's record removed (`stack.rs`: no `Left::record` before the switch) | R1 passed; R2: `6392 bytes measured, 5872 sampled, 520 below the sample; switched away and back true after 1 yields; its own stack in use meanwhile false; ...; measured stack failed`. Without the record, nothing kept the switched-out thread's own stack in use |
 
+**The controls again, after the review of TASKS item 68** (`docs/engineering/REVIEW_T68_2026-11-19.md`; 2026-11-19, 01:28:49 to 01:31:57 UTC, the same machine and way, in the same turn as the gates on `dd6b2649`'s code, at `0e1816a0`). The same script, with MS-4's edit made sound (T68-7), MS-5 on R1's new 32 KiB stack (T68-6) and MS-7, the new control for T68-1.
+- **The baseline passed:** R1 `at boot, on 32768 bytes: 8 levels: 1648 bytes measured, 1648 sampled ...; 64 levels: 11504 bytes measured, 11504 sampled ...; passed`; R2 `6392 bytes measured, 5872 sampled, 520 below the sample; switched away and back true after 1 yields; its own stack in use meanwhile true; value right true; ended true; its own stack given back after the reap true (kept for reuse); passed`.
+- **Each edited boot failed** (`boot-test` exit 1), MS-5 on `(#DF double fault)` and the others on `measured stack failed`. Every file was restored byte for byte, and the tree was clean before and after.
+
+| # | Edit | What caught it |
+|---|---|---|
+| MS-1 | As above | `8 levels: 32768 bytes measured, 1648 sampled ...; 64 levels: 32768 bytes measured, 11504 sampled ...; an empty closure 32768 bytes deep ...; measured stack failed` |
+| MS-2 | As above | `8 levels: 1640 bytes measured, 1648 sampled ...; 64 levels: 11496 bytes measured, 11504 sampled ...; measured stack failed` |
+| MS-3 | As above | `8 levels: 200 bytes measured, 1648 sampled ...; 64 levels: 200 bytes measured, 11504 sampled ...; measured stack failed` |
+| MS-4 | **Made sound (T68-7):** R2's yield removed and the thread's wait run inside `cpu::without_interrupts`, so no tick can switch it away | R1 passed; R2: `5872 bytes measured, 5872 sampled, 0 below the sample; switched away and back false after 1000 yields; its own stack in use meanwhile false; ...; measured stack failed` |
+| MS-5 | R1 asked for 200 levels, now on 32 KiB (T68-6) | `exception 8 (#DF double fault) at rip image +0x8b55b, error code 0x0`, and the kernel halted |
+| MS-6 | As above | R1 passed; R2: `... its own stack in use meanwhile false; ...; its own stack given back after the reap true (kept for reuse); measured stack failed` |
+| MS-7 | **New (T68-1):** `Left::drop` emptied (`stack.rs`), so every measured call's record stays behind | R1 passed (its three stale records point into the loader's stack and hold nothing); R2: `... its own stack in use meanwhile true; ...; its own stack given back after the reap false (lost); measured stack failed`. The thread's stale record kept its stack in use at the reap, so the drop leaked it: the drop reads the table |
+
 ## Alternatives
 
 | Alternative | For | Against |
