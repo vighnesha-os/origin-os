@@ -516,15 +516,21 @@ impl<'a> Fadt<'a> {
 
     /// `block`'s 32-bit field as a system I/O port, for an operating system that cannot use the
     /// block's `X_` form: §5.2.9 has the 64-bit field preferred when it is non-zero *and* the OS can
-    /// use it, and the 32-bit field used otherwise. `None` as [`Fadt::block`] gives it (a
-    /// hardware-reduced platform, a block that breaks a rule), or when the 32-bit field is zero
-    /// (TASKS item 71: the kernel reads a PM timer through a port only).
+    /// use it, and the 32-bit field used otherwise (TASKS item 71: the kernel reads a PM timer
+    /// through a port only). An `X_` form that breaks a rule of its own (a reserved address space
+    /// or access size) cannot be used either, so it does not stop the port: the fault stays named
+    /// by [`Fadt::faults`] (the review of TASKS item 71, T71-4). `None` on a hardware-reduced
+    /// platform, when the 32-bit field is zero, or when the block's length breaks its rule with the
+    /// port as its form (a PM timer not 4 bytes long).
     #[must_use]
     pub fn port_block(&self, block: Block) -> Option<Register> {
-        if self.flags.hw_reduced_acpi() || !self.usable(Field::Block(block)) {
+        if self.flags.hw_reduced_acpi() {
             return None;
         }
-        self.port_form(block)
+        let port = self.port_form(block)?;
+        self.length_verdict(&self.table.reader(), block, true)
+            .ok()
+            .map(|()| port)
     }
 
     /// Where `block` is and how long, judged or not.
@@ -644,7 +650,7 @@ impl<'a> Fadt<'a> {
     /// The rules on one fixed hardware block, on a platform that is not hardware-reduced.
     fn block_verdict(&self, b: &Bytes<'_>, block: Block) -> Result<(), Error> {
         let value = |at: usize, field: &'static str| b.error(at, ErrorKind::Value { field });
-        let (legacy, x, name) = block.fields();
+        let (_, x, name) = block.fields();
         if let Some(gas) = self.x_block(block).filter(|g| !g.is_null()) {
             match block {
                 // §5.2.9: the OS ignores the X_ GPE blocks' width, offset and access size (the
@@ -660,7 +666,13 @@ impl<'a> Fadt<'a> {
                 _ => gas.check_register(b, x, name)?,
             }
         }
-        let present = self.locate(block).is_some();
+        self.length_verdict(b, block, self.locate(block).is_some())
+    }
+
+    /// The rules on a fixed hardware block's length, `present` saying whether the block is given.
+    fn length_verdict(&self, b: &Bytes<'_>, block: Block, present: bool) -> Result<(), Error> {
+        let value = |at: usize, field: &'static str| b.error(at, ErrorKind::Value { field });
+        let (legacy, _, name) = block.fields();
         let length_at = block.length_at();
         let length = b.u8(length_at)?;
         match block {
@@ -1029,6 +1041,18 @@ pub(crate) mod tests {
             port(f.port_block(Block::PmTimer)),
             Some((AddressSpace::SystemIo, 0x608, 4))
         );
+        // The review's T71-4: an X_ form with a reserved address space or a reserved access size
+        // cannot be used; `block` gives none, the fault is named, and the port stands.
+        for x in [gas(0x20, 32, 0, 3, 0x608), gas(1, 32, 0, 5, 0x608)] {
+            let t = edited(|t| put(t, 208, &x));
+            let f = Fadt::parse(&t).unwrap();
+            assert_eq!(f.block(Block::PmTimer), None);
+            assert!(!f.usable(Field::Block(Block::PmTimer)));
+            assert_eq!(
+                port(f.port_block(Block::PmTimer)),
+                Some((AddressSpace::SystemIo, 0x608, 4))
+            );
+        }
         // No 32-bit field, a block that breaks its rule, or a hardware-reduced platform: none.
         let t = edited(|t| {
             put(t, 208, &gas(0, 32, 0, 3, 0xFED0_0000));

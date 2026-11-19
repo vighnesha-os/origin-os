@@ -539,7 +539,8 @@ pub fn parse_fadt(table: &[u8]) -> Result<Fadt, AcpiError> {
         .map_err(|e| refused(table, e, AcpiError::Field))?;
     let reduced = f.flags.hw_reduced_acpi();
     // §5.2.9: the X_ form when it is non-zero and this kernel can use it, which for the PM
-    // timer is a system I/O port; else the 32-bit field.
+    // timer is a system I/O port that keeps its rules; else the 32-bit field (`port_block`, which
+    // a faulty X_ form does not stop: the review's T71-4).
     let port = |r: Register| {
         (r.gas.space == AddressSpace::SystemIo)
             .then(|| u16::try_from(r.gas.address).ok())
@@ -1200,6 +1201,17 @@ mod tests {
             Some(0x0608),
             "the 32-bit port stands"
         );
+        // The review's T71-4: an X_ form with a reserved address space or access size cannot be
+        // used either, and the 32-bit port stands, as it did before TASKS item 71.
+        for (space, access) in [(0x20, 3), (1, 5)] {
+            let faulty = parse_fadt(&fadt(&|b| {
+                let mut g = gas(space, 0x0408);
+                g[3] = access;
+                b[208 - 36..220 - 36].copy_from_slice(&g);
+            }))
+            .unwrap();
+            assert_eq!(faulty.pm_timer_port, Some(0x0608), "{space:#x} {access}");
+        }
         // A length other than 4 makes the timer unusable, whichever form names it.
         let bad_length = parse_fadt(&fadt(&|b| b[FADT_PM_TMR_LEN - 36] = 3)).unwrap();
         assert_eq!(bad_length.pm_timer_port, None);
