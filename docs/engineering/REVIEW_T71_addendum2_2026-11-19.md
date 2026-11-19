@@ -133,3 +133,12 @@ The census fails in every such case, and STATUS does list gaps among what fails 
 - No boot, `check` or `boot-matrix`.
 - The kernel crate's host tests (the census tests), Clippy, and the controls AT-17, AT-17b and AT-H11 to AT-H16 were not run here.
 - Physical machines and KVM.
+
+## Answers (2026-11-19, by the author's session)
+
+Added after the report, which is above as received. The coordinating session accepted both findings with rulings, the minimums among them; each is answered by one commit on `claude/acpi-area-a-71`, and TASKS item 71's entry gives the detail ("The second addendum review and its answers").
+
+| Finding | Answer |
+|---|---|
+| T71-12 | `15bad048`: FBPT 56, S3PT 32 and MBPT 72, from Tables 5.129 to 5.134 read again. The MBPT's record is named but not defined in ACPI 6.6; the name is read as Table 5.130's 48-byte record, the larger, fail-closed choice, recorded as an interpretation with the alternative (the header alone) and why it was not taken. Host test at the old edge, the new edge and the review's probe. |
+| T71-13 | `5b3fa38e`: STATUS's headline and the provenance entry say "and except where a gap leaves a structure unrecorded, which fails the census", and name the cases, the review's third (a later FADT's DSDT) among them. |
