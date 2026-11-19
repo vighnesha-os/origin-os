@@ -66,8 +66,7 @@ pub enum ErrorKind {
     Type,
     /// An uninitialized object used as an operand (Table 19.5).
     Uninitialized,
-    /// A method's value used where it returned none (G6, strict until the reading session
-    /// answers).
+    /// A method's value used where it returned none (G6: ACPICA's default too, TASKS 64's ledger, `docs/research/2026-11-14-aml-gaps-acpica.md` §3).
     NoValue,
     /// `Divide` or `Mod` by zero.
     DivideByZero,

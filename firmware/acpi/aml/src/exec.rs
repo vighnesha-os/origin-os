@@ -322,7 +322,7 @@ impl<H: Host> Interpreter<H> {
                 let x = match f.op {
                     Op::Add => a.wrapping_add(b),
                     Op::Subtract => a.wrapping_sub(b),
-                    // G9, strict until the reading session answers: the low bits are kept.
+                    // G9, as ACPICA does (TASKS 64's ledger §3): the low bits are kept.
                     Op::Multiply => a.wrapping_mul(b),
                     Op::And => a & b,
                     Op::Nand => !(a & b),

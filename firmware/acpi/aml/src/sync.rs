@@ -340,7 +340,7 @@ impl<H: Host> Interpreter<H> {
         self.check_time()
     }
 
-    /// `Stall`: at most 255 µs (G7, strict until the reading session answers).
+    /// `Stall`: at most 255 µs (G7, as ACPICA does: TASKS 64's ledger §3).
     pub(crate) fn stall(&mut self, us: u64) -> Result<()> {
         let us = u8::try_from(us).map_err(|_| ErrorKind::Range)?;
         self.charge_time(u64::from(us).saturating_mul(10))?;

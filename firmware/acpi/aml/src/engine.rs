@@ -1596,8 +1596,8 @@ impl<H: Host> Interpreter<H> {
             return err(ErrorKind::MutexHeld);
         }
         if v == Val::None {
-            // G6, strict until the reading session answers: no value where one is needed is an
-            // error; as a statement it is nothing.
+            // G6, as ACPICA's default (TASKS 64's ledger §3; not its lenient mode): no value where
+            // one is needed is an error; as a statement it is nothing.
             if self.top_wants_value() {
                 return err(ErrorKind::NoValue);
             }
