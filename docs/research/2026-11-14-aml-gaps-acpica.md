@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Date | Read on 2026-11-19 (UTC), 01:24 to 01:45; written the same day. The file name keeps the date TASKS item 64 was given (2026-11-14). |
+| Date | Read on 2026-11-19 (UTC), 01:24 to 01:45, and again 01:47 to 01:51 to strengthen G10 at the coordinating session's request; written the same day. The file name keeps the date TASKS item 64 was given (2026-11-14). |
 | For | TASKS item 64: the gaps that TASKS item 63's ledger (`docs/research/2026-11-14-aml-interpreter.md`, §9, as step B4 left it on `land/batch-6`) hands to a separate session. TASKS item 63 reads this ledger and never ACPICA. |
 | Requires | CLAUDE.md §3 (reference code read apart from the code, facts only, today's version), §6 (provenance), §16 (research first); ADR-0019 A4 (order of sources for the interpreter: ACPI 6.6, then Microsoft's documents, then ACPICA under §3's split); decision items 91 to 97 and 121 |
 | Source | ACPICA release **20260930**: tag `20260930`, commit `e85aa3bebaae81ed1e6d163511ac7e1eafe732cf` (tag dated 2026-09-30 10:10 UTC; release published 2026-09-30 10:18 UTC). It was the newest release and the newest tag on the repository's releases and tags pages on 2026-11-19; the one before it is 20260408. The repository is now `open-acpica/acpica`; `acpica/acpica` redirects there. The release's own version constant agrees (`source/include/acpixf.h` 17–19). |
@@ -27,7 +27,7 @@ Every citation is a path in the ACPICA tree at commit `e85aa3b…` and a line ra
 | G7 | `Stall` over 255 µs is an error and does not stall; 101–255 µs warns and stalls. `Sleep` is capped at 2 s. | Same |
 | G8 | 0x5B 0x2A is still decoded as `Unload`. It logs a warning and an error, and since a handle no longer reaches AML, the call fails. It has never been seen in the field. | Same in effect |
 | G9 | A shift by the integer width or more gives 0. `Multiply` keeps the low bits. | Same |
-| G10 | `_OS` is "Microsoft Windows NT", which deployed firmware is said to expect. A host may override it. | `_OS` is still open |
+| G10 | `_OS` is the String "Microsoft Windows NT", unchanged since 2004. ACPICA says much deployed AML compares against it, and some calls `_OSI` only if it matches. A host may override it; ACPICA's own hosts do not. | For the owner: decision item 315 |
 | G11 | A named buffer keeps its length (zero-fill or truncate), except that a zero-length buffer takes the source's length. | Same, except zero length |
 | G12 | A method is a scope, so `^` from its body names the Device it is in. | Same |
 | G13 | String bytes are not checked: any non-zero byte is accepted. | Differs |
@@ -306,20 +306,36 @@ Two other defaults matter here: methods that create names are serialized automat
 
 **Question.** What does deployed firmware in scope expect `\_OS` to return?
 
+This answer feeds the owner's decision item 315, which waits on it.
+
 **What ACPICA does.**
-- **The value.** The root object `_OS` is the string "Microsoft Windows NT" (`source/include/acconfig.h` 35–43; `source/components/namespace/nsaccess.c` 86–98). ACPICA's comment gives the reasons:
-  - `_OS` is essentially obsolete, but a great deal of existing AML compares it against that string;
-  - that string usually sends the AML down its most-tested path;
-  - some AML does not call `_OSI` unless `_OS` matches it;
-  - changing it is at the integrator's own risk.
-- **History.** The change log records the default as chosen in 2004 for maximum compatibility (`documents/changes.txt` 15481–15485, release 20040514).
-- **The host may override it.** The value is set at build time, and at start-up the host may supply a different initial value for any predefined root object. A failed override is logged and the default kept (`source/components/namespace/nsaccess.c` 138–155).
-- **Related.** The root object `_REV` is 2 (`source/components/namespace/nsaccess.c` 94), as decision item 309 already chose. `_OSI` exists by default (`source/include/acpixf.h` 121–126).
+- **The value and its type.**
+  - `\_OS` is one of the objects ACPICA creates at the root when it first sets up the namespace, before any table loads. It is a String, and its value is the build-time OS name "Microsoft Windows NT" (`source/components/utilities/utglobal.c` 83–104, the entry at 98; `source/include/acconfig.h` 43).
+  - The String's length is that text's 20 characters, with no terminator counted. The object refers to the constant text and is never freed (`source/components/namespace/nsaccess.c` 198–205).
+  - ACPICA's own sketch of the namespace at start-up shows the same object, beside `_REV` and `_OSI` (`source/components/namespace/nsaccess.c` 86–98).
+- **Why that string.** ACPICA's comment beside the setting gives four reasons (`source/include/acconfig.h` 35–42):
+  - `_OS` is essentially obsolete, but a large body of AML in existing machines compares it against that string;
+  - answering with that string usually sends the AML down its most-tested path;
+  - some AML does not call `_OSI` at all unless `_OS` matches that string;
+  - so whoever changes it does so at their own risk.
+- **Since when.** The change log records that in release 20040514 (14 May 2004) the OS name was taken out of the per-OS headers. The single default became "Microsoft Windows NT", for maximum compatibility, changeable only by editing the configuration header (`documents/changes.txt` 15467, 15481–15485).
+  - A search of the whole change log, for `_OS`, for the OS-name setting and for the override hook below, found no other entry. The value has not changed since 2004.
+- **Can a host change it?** There are two ways.
+  - At build time, by editing the configuration header, with the warning above (`source/include/acconfig.h` 35–43).
+  - At start-up. For every predefined root object that has an initial value, ACPICA asks the host's override hook. A value the hook returns replaces the default; a failure of the hook is logged and the default kept (`source/components/namespace/nsaccess.c` 138–155).
+  - ACPICA's own UNIX and Windows service layers, which its tools run on, return no override (`source/os_specific/service_layers/osunixxf.c` 238–263; `source/os_specific/service_layers/oswinxf.c` 166–191). ACPICA as shipped therefore answers "Microsoft Windows NT".
+- **The values around it.**
+  - `_REV` is 2. A comment dated March 2015 says `_REV` is being deprecated: other ACPI implementations always return 2, so the value says little, and ACPICA returns 2 to match them (`source/components/utilities/utglobal.c` 90–97). Decision item 309 already chose the same.
+  - `_OSI` is created by default (`source/include/acpixf.h` 121–126; `source/components/utilities/utglobal.c` 100; `source/components/namespace/nsaccess.c` 103–108). Its answers are decision item 309's.
+- **What this evidence is, and is not.**
+  - It is the ACPICA maintainers' statement of their experience, kept unchanged since 2004.
+  - ACPICA names no machine, and gives no count of machines that test `_OS`.
+  - This ledger reads ACPICA only. Whether Microsoft's published pages, which ADR-0019 A4 ranks before ACPICA, say what Windows returns for `_OS` is outside it.
 
 **For an interpreter.**
-- Answering `_OS` with "Microsoft Windows NT" is what ACPICA says deployed firmware expects.
-- Another string risks the less-tested paths, and on some machines a skipped `_OSI`.
-- The value is the owner's decision (TASKS item 64; decision item 309's note).
+- ACPICA's answer: `\_OS` is a String of 20 characters, "Microsoft Windows NT", created at the root before any table loads.
+- By ACPICA's account, firmware given another string may take a less-tested path, and on some machines may never call `_OSI`. That would also bypass the `_OSI` answers decision item 309 chose.
+- The value is the owner's: decision item 315.
 
 ### G11. `Store` of a buffer into a named buffer of another length
 
@@ -545,7 +561,7 @@ All files are from ACPICA, repository `open-acpica/acpica`, release `20260930` a
 | 8 | `source/components/parser/psxface.c` | 381 | Section 2; G6 | Running a method and a table |
 | 9 | `source/components/namespace/nsparse.c` | 302 | Section 2; G1 | Table run as one method |
 | 10 | `source/components/namespace/nsload.c` | 329 | Section 2; G1, G3, G17, G19 | Loading one table |
-| 11 | `source/components/namespace/nsaccess.c` | 782 | G1, G10, G12 | Root objects; name lookup |
+| 11 | `source/components/namespace/nsaccess.c` | 782 | G1, G10, G12 | Root objects and their initial values (86–240); name lookup |
 | 12 | `source/components/namespace/nssearch.c` | 424 | G3 | Existing names |
 | 13 | `source/components/namespace/nsinit.c` | 740 | G1, G17 | Deferred packages; `_INI`, `_REG` at boot |
 | 14 | `source/components/namespace/nsalloc.c` | 571 | G19 | Removing names |
@@ -581,6 +597,9 @@ All files are from ACPICA, repository `open-acpica/acpica`, release `20260930` a
 | 44 | `source/components/utilities/utstrtoul64.c` | 365 | G4 | String to integer |
 | 45 | `source/components/utilities/utstrsuppt.c` | 526 | G4 | Hex string and white space (lines 168–225 and 259–283 only) |
 | 46 | `documents/changes.txt` (GitHub file page) | 19,995 | G1–G4, G6–G8, G10, G16, G17 | Change-log entries cited above, found by searching for the gaps' terms; not read whole |
+| 47 | `source/components/utilities/utglobal.c` | 211 | G10 | The table of root objects and its notes (lines 72–104 only) |
+| 48 | `source/os_specific/service_layers/osunixxf.c` | 1,552 | G10 | Header and the override hook (lines 1–12 and 238–263 only) |
+| 49 | `source/os_specific/service_layers/oswinxf.c` | 1,563 | G10 | Header and the override hook (lines 3–10 and 166–191 only) |
 
 Where only part of a file is named, only that part was read; elsewhere the parts cited above were read, after a search of the file for the gap's terms.
 
