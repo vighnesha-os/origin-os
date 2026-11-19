@@ -107,6 +107,7 @@ pub(crate) enum Told {
     HighBytes(u32),
     LongStall(u8),
     Released(Vec<[u8; 4]>),
+    Pieces(Vec<[u8; 4]>, u64),
     Suppressed(u64),
 }
 
@@ -299,6 +300,7 @@ impl Host for TestHost {
             Report::HighBytes { at } => Told::HighBytes(at.offset),
             Report::LongStall { us, .. } => Told::LongStall(us),
             Report::Released { mutex } => Told::Released(mutex.to_vec()),
+            Report::Pieces { field, pieces } => Told::Pieces(field.to_vec(), pieces),
             Report::Suppressed { count } => Told::Suppressed(count),
         });
     }
@@ -458,6 +460,11 @@ pub(crate) enum Fault {
     /// A string is written to a field a character at a time, as before step B5 (`region.rs`,
     /// `write_value`).
     StringByCharacter,
+    /// A string's bytes are cut to the field and written once, step B5's first rule for G15,
+    /// replaced by the coordinating session's ruling on point 1 (`region.rs`, `write_value`).
+    StringCut,
+    /// A store in pieces is not told to the host (`tolerate.rs`, `tell_pieces`).
+    SilentPieces,
     /// `AnyAcc` takes the narrowest naturally aligned width holding the field, as before step B5
     /// (`region.rs`, `width`).
     WidestAnyAcc,

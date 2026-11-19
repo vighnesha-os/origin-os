@@ -985,8 +985,12 @@ fn zero_length_buffer_takes_source_length() {
 }
 
 #[test]
-fn string_to_field_as_bytes() {
-    // G15: one write of the string's bytes, without its NUL, zero-extended or cut to the field.
+fn strings_go_to_a_field_as_a_buffer_of_their_bytes() {
+    // G15's string half, as the coordinating session ruled it again on 2026-11-19 (step B5's
+    // point 1): a string is a buffer of its bytes, without its NUL. As long as the field or
+    // shorter, one write, zero-extended; longer, field-sized pieces, lowest first, the last
+    // zero-extended (ACPI 6.6 Table 19.7, the Buffer to Field Unit row), the host told once. The
+    // field keeps the last piece, where ACPICA's one write, cut, keeps the first.
     let mut i = fresh();
     load(
         &mut i,
@@ -997,25 +1001,154 @@ fn string_to_field_as_bytes() {
         ],
     )
     .unwrap();
-    for (s, want) in [
-        ("ABCD", 0x4443_4241u64),
-        ("AB", 0x4241),
-        ("ABCDEF", 0x4443_4241),
-        ("", 0),
+    for (s, writes, pieces) in [
+        ("", vec![0u64], None),
+        ("AB", vec![0x4241], None),
+        ("ABCD", vec![0x4443_4241], None),
+        ("ABCDEF", vec![0x4443_4241, 0x4645], Some(2)),
+        ("ABCDEFGH", vec![0x4443_4241, 0x4847_4645], Some(2)),
+        ("ABCDEFGHI", vec![0x4443_4241, 0x4847_4645, 0x49], Some(3)),
     ] {
         i.host_mut().seen.clear();
         let got = i
             .evaluate("\\W", &[Value::String(s.as_bytes().to_vec())])
             .unwrap();
-        assert_eq!(got, Some(Value::Integer(want)), "{s:?}");
-        let writes = i.host().seen.iter().filter(|x| x.write).count();
-        assert_eq!(writes, 1, "{s:?}");
+        let last = *writes.last().unwrap();
+        assert_eq!(got, Some(Value::Integer(last)), "{s:?}");
+        let made: Vec<u64> = i
+            .host()
+            .seen
+            .iter()
+            .filter(|x| x.write)
+            .map(|x| x.value)
+            .collect();
+        assert_eq!(made, writes, "{s:?}");
+        let want: Vec<Told> = pieces
+            .map(|n| Told::Pieces(vec![*b"F32_"], n))
+            .into_iter()
+            .collect();
+        assert_eq!(told(&mut i), want, "{s:?}");
+    }
+}
+
+#[test]
+fn ec_pieces_are_one_transfer_each() {
+    // Step B5's point 1 with G5: a string longer than an Embedded Controller field over 8 bits
+    // goes in field-sized pieces, each one transfer.
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            op_region("EC0", 3, zero(), byte(4)),
+            field("EC0", 0, &[Fe::Named("E16", 16)]),
+            method("W", 0, &[store(string("ABCDE"), nm("E16"))]),
+        ],
+    )
+    .unwrap();
+    eval(&mut i, "W").unwrap();
+    let sent: Vec<(u64, bool, Vec<u8>)> = core::mem::take(&mut i.host_mut().transfers)
+        .into_iter()
+        .map(|t| (t.0.address, t.0.write, t.0.sent))
+        .collect();
+    assert_eq!(
+        sent,
+        vec![
+            (0, true, vec![0x41, 0x42]),
+            (0, true, vec![0x43, 0x44]),
+            (0, true, vec![0x45, 0x00]),
+        ]
+    );
+    assert_eq!(told(&mut i), vec![Told::Pieces(vec![*b"E16_"], 3)]);
+}
+
+#[test]
+fn a_long_buffer_into_a_one_bit_field_ends_at_a_limit() {
+    // Each piece is a region access counted as work (step B5's point 1, its bound): a buffer of
+    // 256 KiB, as large as a 1 MiB memory limit lets the store hold it and its copy, into a field
+    // of one bit would be 2,097,152 writes. The step limit ends the store, every write made before
+    // it counted; the host was told the store's pieces first.
+    let mut i = interp_with(
+        IntegerWidth::Bits64,
+        Limits {
+            steps: 50_000,
+            memory_bytes: 1 << 20,
+            ..Limits::SERVICE
+        },
+    );
+    load(
+        &mut i,
+        &[
+            op_region("RM", 0, word(0x1000), byte(1)),
+            field("RM", 1, &[Fe::Named("BIT", 1)]),
+            method("W", 0, &[store(buffer(dword(0x4_0000), &[]), nm("BIT"))]),
+        ],
+    )
+    .unwrap();
+    i.host_mut().seen.clear();
+    assert_eq!(
+        eval(&mut i, "W").map_err(|e| e.kind),
+        Err(ErrorKind::Limit(crate::Limit::Steps))
+    );
+    let writes = u64::try_from(i.host().seen.iter().filter(|s| s.write).count()).unwrap();
+    assert!(writes > 1_000, "{writes} writes before the limit");
+    // Every write made was counted, and the count passed the limit (13,914 writes for 50,002
+    // units when written: a piece costs more than its write).
+    assert!(
+        writes <= i.run.steps && i.run.steps > 50_000,
+        "{writes} writes, {} steps",
+        i.run.steps
+    );
+    assert_eq!(told(&mut i), vec![Told::Pieces(vec![*b"BIT_"], 2_097_152)]);
+    at_rest(&i);
+}
+
+#[test]
+fn planted_faults_are_caught_by_the_piece_tests() {
+    let tests: [Control; 4] = [
+        (
+            None,
+            &[
+                strings_go_to_a_field_as_a_buffer_of_their_bytes,
+                ec_pieces_are_one_transfer_each,
+                a_long_buffer_into_a_one_bit_field_ends_at_a_limit,
+            ],
+        ),
+        (
+            Some(Fault::StringCut),
+            &[
+                strings_go_to_a_field_as_a_buffer_of_their_bytes,
+                ec_pieces_are_one_transfer_each,
+            ],
+        ),
+        (
+            Some(Fault::SilentPieces),
+            &[
+                strings_go_to_a_field_as_a_buffer_of_their_bytes,
+                ec_pieces_are_one_transfer_each,
+                a_long_buffer_into_a_one_bit_field_ends_at_a_limit,
+            ],
+        ),
+        (
+            Some(Fault::StringByCharacter),
+            &[
+                strings_go_to_a_field_as_a_buffer_of_their_bytes,
+                ec_pieces_are_one_transfer_each,
+            ],
+        ),
+    ];
+    for (f, cases) in tests {
+        for case in cases {
+            plant(f);
+            let failed = std::panic::catch_unwind(case).is_err();
+            plant(None);
+            assert_eq!(failed, f.is_some(), "{f:?}: case {case:?}");
+        }
     }
 }
 
 #[test]
 fn planted_faults_are_caught_by_the_conversion_tests() {
-    let tests: [Control; 4] = [
+    let tests: [Control; 3] = [
         (
             None,
             &[
@@ -1023,7 +1156,6 @@ fn planted_faults_are_caught_by_the_conversion_tests() {
                 string_to_integer_is_total,
                 to_integer_decimal_and_hex,
                 zero_length_buffer_takes_source_length,
-                string_to_field_as_bytes,
             ],
         ),
         (Some(Fault::OldTexts), &[g4_texts]),
@@ -1031,7 +1163,6 @@ fn planted_faults_are_caught_by_the_conversion_tests() {
             Some(Fault::KeepZeroLength),
             &[zero_length_buffer_takes_source_length],
         ),
-        (Some(Fault::StringByCharacter), &[string_to_field_as_bytes]),
     ];
     for (f, cases) in tests {
         for case in cases {

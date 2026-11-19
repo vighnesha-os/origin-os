@@ -154,7 +154,7 @@ struct RunCounts {
     charged_seen: u64,
     /// Units counted since the clock was last read.
     since_clock: u64,
-    /// Tolerances reported this evaluation, given or not ([`REPORTS`]).
+    /// Reports made this evaluation, given or not ([`REPORTS`]).
     reports: u64,
 }
 

@@ -214,6 +214,9 @@ pub struct Seen {
     pub tolerated: u32,
     /// The first of them, for the proof's line.
     pub first_tolerance: Option<Tolerance>,
+    /// Stores the interpreter reported making in pieces ([`Report::Pieces`]): not tolerances,
+    /// counted apart.
+    pub pieces: u32,
     /// The lowest stack address a host call was made at.
     pub lowest: Option<usize>,
 }
@@ -286,6 +289,7 @@ impl Tolerance {
             Report::HighBytes { at } => ("a string byte above 0x7F", Some(at), None),
             Report::LongStall { at, .. } => ("a Stall over 100 us", Some(at), None),
             Report::Released { .. } => ("a mutex held to the end", None, None),
+            Report::Pieces { .. } => ("a store in pieces", None, None),
             Report::Suppressed { .. } => ("reports past the bound", None, None),
         };
         Self { what, at, error }
@@ -330,6 +334,7 @@ impl<H: Host> Recorder<H> {
                 reports: 0,
                 tolerated: 0,
                 first_tolerance: None,
+                pieces: 0,
                 lowest: None,
             },
         }
@@ -449,9 +454,13 @@ impl<H: Host> Host for Recorder<H> {
 
     fn report(&mut self, report: &Report<'_>) {
         self.seen.note_stack();
-        self.seen.tolerated = self.seen.tolerated.saturating_add(1);
-        if self.seen.first_tolerance.is_none() {
-            self.seen.first_tolerance = Some(Tolerance::of(report));
+        if matches!(report, Report::Pieces { .. }) {
+            self.seen.pieces = self.seen.pieces.saturating_add(1);
+        } else {
+            self.seen.tolerated = self.seen.tolerated.saturating_add(1);
+            if self.seen.first_tolerance.is_none() {
+                self.seen.first_tolerance = Some(Tolerance::of(report));
+            }
         }
         self.inner.report(report);
     }
@@ -637,6 +646,10 @@ const CUT_OFF: &str = "the proof was cut off by its bound";
 /// The reason a proof gives when the interpreter reported a tolerance on QEMU's own tables (TASKS
 /// item 63, step B5).
 const TOLERATED: &str = "a tolerance was reported on QEMU's own tables";
+
+/// The reason a proof gives when the interpreter stored data in pieces on QEMU's own tables, where
+/// ACPICA would cut it (TASKS item 63, step B5's point 1).
+const IN_PIECES: &str = "a store in pieces was reported on QEMU's own tables";
 
 /// The reason a proof gives when the DSDT's checked read is not the one whose IDs were judged
 /// (the review of B4, B4-9).
@@ -975,6 +988,12 @@ fn interpret<H: Host>(
             );
         }
         found.fail(TOLERATED);
+    }
+    // Nor do QEMU's tables store data longer than a field: one that did would be a place where
+    // Origin and ACPICA leave the hardware different, to learn of (step B5's point 1).
+    if seen.pieces != 0 {
+        let _ = writeln!(out, "{LINE}stored in pieces {} time(s)", seen.pieces);
+        found.fail(IN_PIECES);
     }
     if seen.lock_other != 0 || seen.lock_taken != seen.lock_given_back {
         found.fail("the Global Lock was not given back as often as it was granted");

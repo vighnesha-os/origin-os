@@ -474,25 +474,35 @@ fn a_data_table_region_is_refused_on_a_copy_that_fails_its_check() {
 }
 
 #[test]
-fn strings_are_written_as_their_bytes_and_long_buffers_in_pieces() {
-    // G15 (TASKS 64's ledger §3; step B5): a string is its bytes, cut to the field, in one write.
-    // A buffer longer than the field is still written in pieces (Table 19.7).
+fn strings_and_long_buffers_are_written_in_pieces() {
+    // Table 19.7: a buffer longer than the field is written in field-sized pieces, lowest first;
+    // a string goes as a buffer of its bytes (G15's string half, as the coordinating session ruled
+    // it again for step B5 on 2026-11-19, point 1), so into a byte field one character a piece.
+    // Each such store is told to the host once.
     let mut i = loaded(&[
         op_region("IO", 1, word(0x80), one()),
         field("IO", BYTE, &[Fe::Named("PORT", 8)]),
         m("WS", &[store(string("AB"), nm("PORT")), ret(one())]),
         m(
             "WB",
-            &[store(buffer(byte(3), &[1, 2, 3]), nm("PORT")), ret(one())],
+            &[
+                store(buffer(byte(5), &[1, 2, 3, 4, 5]), nm("PORT")),
+                ret(one()),
+            ],
         ),
     ]);
     int(&mut i, "WS");
-    assert_eq!(taken(&mut i), vec![(true, 0x80, 8, 0x41)]);
+    assert_eq!(
+        taken(&mut i),
+        vec![(true, 0x80, 8, 0x41), (true, 0x80, 8, 0x42)]
+    );
+    assert_eq!(told(&mut i), vec![Told::Pieces(vec![*b"PORT"], 2)]);
     int(&mut i, "WB");
     assert_eq!(
         taken(&mut i),
-        vec![(true, 0x80, 8, 1), (true, 0x80, 8, 2), (true, 0x80, 8, 3)]
+        (1..=5).map(|v| (true, 0x80, 8, v)).collect::<Vec<_>>()
     );
+    assert_eq!(told(&mut i), vec![Told::Pieces(vec![*b"PORT"], 5)]);
 }
 
 #[test]

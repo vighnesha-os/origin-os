@@ -761,6 +761,37 @@ fn a_global_lock_not_given_back_fails_the_proof() {
 }
 
 #[test]
+fn a_store_in_pieces_on_qemus_tables_fails_the_proof() {
+    // TASKS item 63, step B5's point 1: a `_STA` that stores two bytes into a byte field. The
+    // interpreter tells the host the store goes in two pieces before the first, which the host
+    // then refuses, as it refuses every port; the device's refusal is allowed, the report is not.
+    let dsdt = qemu_dsdt(&[scope(
+        "\\_SB_",
+        &[
+            op_region("PRTR", 1, word(0x80), one()),
+            field("PRTR", 1, &[Fe::Named("PRT8", 8)]),
+            device(
+                "PCS0",
+                &[method(
+                    "_STA",
+                    0,
+                    &[store(buffer(byte(2), &[1, 2]), nm("PRT8")), ret(byte(0x0F))],
+                )],
+            ),
+        ],
+    )]);
+    let (found, out) = Machine::new(dsdt).run();
+    assert_eq!(
+        found.failed,
+        Some("a store in pieces was reported on QEMU's own tables"),
+        "{out}"
+    );
+    assert!(out.contains("stored in pieces 1 time(s)"), "{out}");
+    assert_eq!(found.seen.pieces, 1, "{out}");
+    assert_eq!(found.seen.tolerated, 0, "{out}");
+}
+
+#[test]
 fn a_device_that_fails_other_than_by_a_refusal_fails_the_proof() {
     let dsdt = qemu_dsdt(&[scope(
         "\\_SB_",

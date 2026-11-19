@@ -168,46 +168,31 @@ impl<H: Host> Interpreter<H> {
     fn write_value(&mut self, node: NodeId, v: Val, depth: u32) -> Result<Option<Val>> {
         let f = self.unit_of(node)?;
         let bytes = usize::try_from(f.bit_len.div_ceil(8)).map_err(|_| ErrorKind::Range)?;
-        // A string is written as its bytes, without its NUL, zero-extended or cut to the field,
-        // in one write (G15, TASKS 64's ledger §3; step B5).
+        // A string is written as a buffer of its bytes, without its NUL: into a field it fits,
+        // one write, zero-extended; longer, in field-sized pieces as a buffer is (G15's string
+        // half, as the coordinating session ruled it again on 2026-11-19, step B5's point 1;
+        // ACPICA's single write cut to the field, TASKS 64's ledger §3, considered and not
+        // adopted).
+        let string = match v {
+            Val::Obj(r) => match self.heap.get(r)? {
+                Object::String(s) => Some(mem::copy_bytes(s, &mut self.budget)?),
+                _ => None,
+            },
+            _ => None,
+        };
         #[cfg(test)]
-        let by_character = crate::tests::planted(crate::tests::Fault::StringByCharacter);
-        #[cfg(not(test))]
-        let by_character = false;
-        if let Val::Obj(r) = v
-            && let Object::String(s) = self.heap.get(r)?
-            && !by_character
+        if let Some(chars) = &string
+            && let Some(out) = self.planted_string_rule(node, chars, bytes, depth)
         {
-            let mut chars = mem::copy_bytes(s, &mut self.budget)?;
-            if chars.len() > bytes {
-                chars.truncate(bytes);
+            if let Some(chars) = string {
+                mem::release(chars, &mut self.budget);
             }
-            let out = self.field_at(node, Some(&chars), depth).map(|_| None);
-            mem::release(chars, &mut self.budget);
             return out;
         }
-        // The planted fault `StringByCharacter`: the rule before step B5, a character at a time.
-        if let Val::Obj(r) = v
-            && let Object::String(s) = self.heap.get(r)?
-        {
-            let chars = mem::copy_bytes(s, &mut self.budget)?;
-            let mut out = Ok(None);
-            for &c in &chars {
-                // Each character is a write, work counted whatever the field's width.
-                out = self
-                    .charge(1)
-                    .and_then(|()| self.field_at(node, Some(&[c]), depth))
-                    .map(|_| None);
-                if out.is_err() {
-                    break;
-                }
-            }
-            mem::release(chars, &mut self.budget);
-            return out;
-        }
-        let data = match v {
-            Val::Int(i) => mem::copy_bytes(&i.to_le_bytes(), &mut self.budget)?,
-            other => self.buffer_of(other)?,
+        let data = match (string, v) {
+            (Some(chars), _) => chars,
+            (None, Val::Int(i)) => mem::copy_bytes(&i.to_le_bytes(), &mut self.budget)?,
+            (None, other) => self.buffer_of(other)?,
         };
         let protocol = match f.kind {
             FieldKind::Region(rn) | FieldKind::Bank { region: rn, .. } => {
@@ -224,10 +209,13 @@ impl<H: Host> Interpreter<H> {
             // below advanced by the field's width, 0, for ever (found by the soak of 2026-11-14).
             Ok(None)
         } else {
-            // A buffer larger than the field is written in pieces, lower first (Table 19.7), each
-            // a write counted as work.
+            // Data longer than the field is written in field-sized pieces, lower first, the last
+            // zero-extended (Table 19.7's Buffer to Field Unit row), each a region access counted
+            // as work, so a long buffer into a narrow field ends at a limit. The host is told
+            // first: ACPICA writes one piece, cut.
             let mut r = Ok(None);
             let bits = u64::try_from(data.len()).unwrap_or(0).saturating_mul(8);
+            self.tell_pieces(node, bits.div_ceil(f.bit_len));
             let mut at: u64 = 0;
             let mut piece = mem::zeroed(bytes, &mut self.budget)?;
             while at < bits && r.is_ok() {
@@ -245,6 +233,37 @@ impl<H: Host> Interpreter<H> {
         };
         mem::release(data, &mut self.budget);
         out
+    }
+
+    /// The planted faults on a string's store: `StringByCharacter`, the rule before step B5, a
+    /// character at a time; `StringCut`, step B5's first rule for G15, the bytes cut to the field
+    /// in one write. `None` when neither is planted.
+    #[cfg(test)]
+    fn planted_string_rule(
+        &mut self,
+        node: NodeId,
+        chars: &[u8],
+        bytes: usize,
+        depth: u32,
+    ) -> Option<Result<Option<Val>>> {
+        use crate::tests::{Fault, planted};
+        if planted(Fault::StringCut) {
+            let cut = chars.get(..bytes.min(chars.len())).unwrap_or(&[]);
+            return Some(self.field_at(node, Some(cut), depth).map(|_| None));
+        }
+        if !planted(Fault::StringByCharacter) {
+            return None;
+        }
+        for &c in chars {
+            // Each character is a write, work counted whatever the field's width.
+            if let Err(e) = self
+                .charge(1)
+                .and_then(|()| self.field_at(node, Some(&[c]), depth))
+            {
+                return Some(Err(e));
+            }
+        }
+        Some(Ok(None))
     }
 
     fn region_space(&self, node: NodeId) -> Result<u8> {

@@ -224,8 +224,9 @@ pub enum Trace<'a> {
 /// Something the interpreter tolerated, told to the host (TASKS item 63, step B5; the coordinating
 /// session's rulings of 2026-11-19): firmware ACPI 6.6 calls wrong, accepted as TASKS 64's ledger
 /// (`docs/research/2026-11-14-aml-gaps-acpica.md`) says deployed interpreters accept it. Never a
-/// tolerance passed silently: each is one of these. A place is a table and the offset in its term
-/// list. At most [`crate::REPORTS`] are given in one top-level evaluation (a load, an evaluation,
+/// tolerance passed silently: each is one of these. One report is not a tolerance:
+/// [`Report::Pieces`] marks a place where Origin knowingly differs from the deployed interpreter.
+/// A place is a table and the offset in its term list. At most [`crate::REPORTS`] are given in one top-level evaluation (a load, an evaluation,
 /// one `_STA`, `_INI` or `_REG` of a walk, or [`crate::Interpreter::bind_deferred`]), then one
 /// [`Report::Suppressed`] with the count of the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -282,6 +283,17 @@ pub enum Report<'a> {
     Released {
         /// Its path, or empty for one deeper than 32 segments or named by no node.
         mutex: &'a [[u8; 4]],
+    },
+    /// Data longer than a field unit was stored to it in `pieces` field-sized pieces, lowest
+    /// first (ACPI 6.6 Table 19.7), where ACPICA writes one piece cut to the field. Not a
+    /// tolerance: a store where Origin knowingly differs from the deployed interpreter (the
+    /// coordinating session's ruling of 2026-11-19 on step B5's point 1). Told once, before the
+    /// first piece.
+    Pieces {
+        /// The field's path, or empty for one deeper than 32 segments.
+        field: &'a [[u8; 4]],
+        /// How many pieces the store makes.
+        pieces: u64,
     },
     /// `count` reports more in this evaluation, not given.
     Suppressed {

@@ -83,7 +83,7 @@ fn us(x: u32) -> usize {
 type Level = (&'static [Kind], usize);
 
 impl<H: Host> Interpreter<H> {
-    /// Tells the host of a tolerance, within the bound.
+    /// Tells the host of a tolerance, or of a store in pieces, within the bound.
     pub(crate) fn tell(&mut self, report: &Report<'_>) {
         self.note_work(1);
         self.run.reports = self.run.reports.saturating_add(1);
@@ -112,6 +112,22 @@ impl<H: Host> Interpreter<H> {
             .and_then(|n| self.ns.path_into(n, &mut buf))
             .unwrap_or(&[]);
         self.tell(&Report::Released { mutex: path });
+    }
+
+    /// Tells the host that a store to field unit `node` goes in `pieces` pieces: its path,
+    /// written without allocating.
+    pub(crate) fn tell_pieces(&mut self, node: NodeId, pieces: u64) {
+        // The planted fault `SilentPieces`: the store goes in pieces and the host is not told.
+        #[cfg(test)]
+        if crate::tests::planted(crate::tests::Fault::SilentPieces) {
+            return;
+        }
+        let mut buf = [[0u8; 4]; 32];
+        let path = self.ns.path_into(node, &mut buf).unwrap_or(&[]);
+        self.tell(&Report::Pieces {
+            field: path,
+            pieces,
+        });
     }
 
     // --- The load policy -----------------------------------------------------------------------
