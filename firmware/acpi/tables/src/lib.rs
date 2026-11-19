@@ -126,10 +126,11 @@
 //! walk steps whatever the table's length: the review's F1),
 //! [`pptt::MAX_STRUCTURES`] PPTT structures (its chains [`pptt::MAX_DEPTH`] and
 //! [`pptt::MAX_CACHE_LEVELS`] long), [`viot::MAX_NODES`] VIOT nodes, and PMTT devices nested
-//! [`memory::PMTT_MAX_DEPTH`] deep. The PPTT's bound holds but is large: at 8,192 structures,
-//! nodes with 58 private resources each pointing at caches 8 deep cost, by the independent
-//! review's estimate, about 10⁹ walk steps (its F18). Checking each cache chain once would cut
-//! that; it is not done yet. The NFIT's alone has a test that counts its steps.
+//! [`memory::PMTT_MAX_DEPTH`] deep. The PPTT checks each cache chain once, from the cache itself,
+//! so a parse takes at most [`pptt::MAX_LOOKUPS`] lookups a structure, about 8 × 10⁷ walk steps
+//! at 8,192 structures, where the review estimated 10⁹ before (its F18; TASKS item 71). Every
+//! table this crate parses has a test that builds a large one and counts its steps against its
+//! bound (F13; TASKS item 71).
 //!
 //! # Iterators
 //!

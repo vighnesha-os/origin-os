@@ -4,8 +4,10 @@
 //! Every reference is checked to land on the start of a structure of the right kind: a parent on a
 //! processor hierarchy node, a private resource on anything but one, a next-level cache on a cache.
 //! Parent chains and cache chains are followed to a bounded depth, so a cycle or an absurd depth is
-//! refused rather than followed. Types other than 0 and 1 are walked and listed (ACPI 6.6 defines
-//! no others).
+//! refused rather than followed. Each cache's chain is followed once, by the cache itself: a
+//! processor node's private resource is checked to be a cache, and the chain beyond it is that
+//! cache's own check (TASKS item 71, the review's F18). Types other than 0 and 1 are walked and
+//! listed (ACPI 6.6 defines no others).
 
 use crate::census::Tally;
 use crate::error::{Error, ErrorKind, Signature};
@@ -14,14 +16,24 @@ use crate::read::Bytes;
 use crate::walk::{Index, Raw, Shape, Walk, body};
 
 /// The most structures a PPTT may hold here, which bounds the work of checking its references; a
-/// two-socket machine of 2026 with a few hundred threads needs a few thousand. The worst case at
-/// this bound is large: about 10⁹ walk steps by the independent review's estimate (its F18), for
-/// nodes of 255 bytes with 58 private resources each pointing at caches 8 deep.
+/// two-socket machine of 2026 with a few hundred threads needs a few thousand.
 pub const MAX_STRUCTURES: usize = 8192;
 /// The deepest processor hierarchy followed (thread, core, cluster, die, package and a few more).
 pub const MAX_DEPTH: usize = 16;
-/// The longest cache chain followed.
+/// The longest cache chain followed from a cache's next level. A node's private resource is the
+/// cache that starts such a chain, so from a node a chain may hold one cache more.
 pub const MAX_CACHE_LEVELS: usize = 8;
+/// The most private resources a processor node can name: a node is at most 255 bytes, 20 of them
+/// fixed, and each resource is 4.
+pub const MAX_RESOURCES: usize = (255 - 20) / 4;
+/// The most structure lookups [`Pptt::parse`] makes for one structure (TASKS item 71, the review's
+/// F18): a node's parents to [`MAX_DEPTH`] (and one past, which shows a cycle) and one for each of
+/// its [`MAX_RESOURCES`] private resources; a cache's chain to [`MAX_CACHE_LEVELS`] (and one past).
+/// Each lookup walks at most `ceil(count / 64)` structures from the index's nearest checkpoint, so
+/// a parse takes at most `count * MAX_LOOKUPS * (count.div_ceil(64) + 1)` walk steps besides the
+/// two whole walks: about 8 × 10⁷ at [`MAX_STRUCTURES`] (8,192 × 75 × 129), where following
+/// every resource's chain cost about 10⁹ by the review's estimate.
+pub const MAX_LOOKUPS: usize = MAX_DEPTH + 1 + MAX_RESOURCES;
 
 /// A processor hierarchy node's flags (§5.2.31.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,9 +255,9 @@ impl<'a> Pptt<'a> {
                                 },
                             );
                         }
-                        Some(PpttEntry::Cache { .. }) => {
-                            self.cache_chain(&b, at, u32::from_le_bytes(*offset))?
-                        }
+                        // A cache: the chain beyond it is its own check, made once when the walk
+                        // reaches it (F18).
+                        Some(PpttEntry::Cache { .. }) => {}
                         Some(PpttEntry::Reserved(_)) => {}
                     }
                 }
@@ -455,6 +467,57 @@ pub(crate) mod tests {
         assert!(matches!(
             p.at(36),
             Some(PpttEntry::Cache { cache_id: None, .. })
+        ));
+    }
+
+    /// The review's F18 (TASKS item 71): a worst-case table, every node at the most private
+    /// resources, each naming a cache at the far end, caches in chains of eight and parents in
+    /// chains of sixteen, costs no more than `MAX_LOOKUPS` lookups a structure; and a cycle of
+    /// caches a node reaches is still refused, by the caches' own checks.
+    #[test]
+    fn each_cache_chain_is_checked_once() {
+        const NODES: usize = 512;
+        const CACHES: usize = 512;
+        let node_len = 20 + 4 * MAX_RESOURCES;
+        let node_at = |j: usize| u32::try_from(36 + j * node_len).unwrap();
+        let cache_at = |i: usize| u32::try_from(36 + NODES * node_len + i * 28).unwrap();
+        let mut body = Vec::new();
+        for j in 0..NODES {
+            let parent = if j % MAX_DEPTH == 0 {
+                0
+            } else {
+                node_at(j - 1)
+            };
+            let resources: Vec<u32> = (0..MAX_RESOURCES)
+                .map(|r| cache_at((j * 7 + r * 13) % CACHES))
+                .collect();
+            body.extend_from_slice(&node(0, parent, u32::try_from(j).unwrap(), &resources));
+        }
+        for i in 0..CACHES {
+            let next = if i % MAX_CACHE_LEVELS == MAX_CACHE_LEVELS - 1 {
+                0
+            } else {
+                cache_at(i + 1)
+            };
+            body.extend_from_slice(&cache(next, u32::try_from(i + 1).unwrap()));
+        }
+        let t = table(b"PPTT", 3, &body);
+        let n = NODES + CACHES;
+        crate::walk::steps::take();
+        let p = Pptt::parse(&t).unwrap_or_else(|e| panic!("{e:?}"));
+        let steps = crate::walk::steps::take();
+        assert_eq!(p.len(), n);
+        let bound = 2 * n + n * MAX_LOOKUPS * (n.div_ceil(64) + 1);
+        assert!(steps as usize <= bound, "{steps} > {bound}");
+
+        // A cycle among caches a node names is refused by the caches' own checks.
+        let package = node(0b1, 0, 0, &[60]); // at 36, 24 bytes
+        let a = cache(88, 1); // at 60, next at 88
+        let b = cache(60, 2); // at 88, next back at 60
+        let t = table(b"PPTT", 3, &[package, a, b].concat());
+        assert!(matches!(
+            Pptt::parse(&t).unwrap_err().kind,
+            ErrorKind::Cycle
         ));
     }
 }
