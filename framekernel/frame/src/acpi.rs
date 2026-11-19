@@ -19,6 +19,8 @@
 #![forbid(unsafe_code)]
 
 use origin_acpi_tables::ErrorKind;
+use origin_acpi_tables::fadt::{Block, Register};
+use origin_acpi_tables::gas::AddressSpace;
 use origin_acpi_tables::madt::{Entry, Madt, Polarity, Trigger, override_redirect};
 use origin_acpi_tables::srat::{Affinity, Srat};
 
@@ -66,6 +68,9 @@ pub enum AcpiError {
     SratEntry(usize),
     /// More affinity structures than the caller has room for.
     TooManyEntries,
+    /// A field the table cannot be used without breaks its rule, at this offset: a FADT that
+    /// names no DSDT (TASKS item 71, ruling 1a).
+    Field(usize),
 }
 
 fn u32_at(b: &[u8], at: usize) -> Option<u32> {
@@ -221,6 +226,665 @@ fn whole_table<'t>(
     Ok(all)
 }
 
+/// A structure the firmware changes after boot, which is copied and never lent (TASKS item 71).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Changing {
+    /// The FACS, which firmware in SMM writes (its global lock, §5.2.10.1).
+    Facs,
+    /// The firmware basic boot performance table, rewritten on resume (§5.2.24.8).
+    Fbpt,
+    /// The S3 performance table, rewritten on each resume (§5.2.24.10).
+    S3pt,
+    /// The microcontroller boot performance table the FPDT may point to.
+    Mbpt,
+}
+
+impl Changing {
+    /// Its signature, as the firmware writes it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Facs => "FACS",
+            Self::Fbpt => "FBPT",
+            Self::S3pt => "S3PT",
+            Self::Mbpt => "MBPT",
+        }
+    }
+
+    /// The least it can be, which is guarded whatever overlaps it (the addendum review of TASKS
+    /// item 71, T71-9): what ACPI 6.6 says its length covers at the least (the second addendum
+    /// review, T71-12, read again on 2026-11-19).
+    /// - A FACS is 64 bytes or more (§5.2.10, Table 5.13).
+    /// - An FBPT's length covers at least its 8-byte header (signature and length) and the
+    ///   48-byte Host Firmware Boot Performance Data Record, which §5.2.24.8 says it must hold
+    ///   and the firmware overwrites on S4 resume: 56 (Tables 5.129 and 5.130).
+    /// - An S3PT's covers at least its 8-byte header and the 24-byte Basic S3 Resume Performance
+    ///   Record, which §5.2.24.10 says it must hold and the firmware overwrites on S3 resume: 32
+    ///   (Tables 5.131 and 5.132).
+    /// - An MBPT's covers at least its 24-byte header (signature, length, controller ID and
+    ///   timestamp domain ID) and a record Table 5.134 calls the "Firmware Basic Boot
+    ///   Performance Data Record". ACPI 6.6 defines no record by that name, and gives no layout
+    ///   for the Microcontroller Boot Performance Data Record (type 3, Table 5.124). It does use
+    ///   "Firmware Basic Boot Performance" for the host firmware's boot performance structures
+    ///   (Table 5.125's type 0), so the name is read as Table 5.130's 48-byte record: 72. A
+    ///   shorter reading would guard less of what the firmware writes; a longer one only refuses
+    ///   a table that starts inside it, and fails the census.
+    pub const fn minimum(self) -> u64 {
+        match self {
+            Self::Facs => 64,
+            Self::Mbpt => 72,
+            Self::Fbpt => 56,
+            Self::S3pt => 32,
+        }
+    }
+}
+
+/// The tables the kernel lends that a recorded structure meets (the addendum review of TASKS
+/// item 71, T71-9): each is reported, and any fails the census.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Overlaps {
+    /// The structure's end as its length field declares it, at least its minimum.
+    pub declared_end: u64,
+    /// The first lent table that overlaps the structure's minimum ([`Changing::minimum`]). The
+    /// minimum stays guarded, so that table cannot be lent.
+    pub over_minimum: Option<(u64, u64)>,
+    /// The lent table, starting inside the declared extent beyond the minimum, at whose start
+    /// the recorded range ends. That table stays lendable.
+    pub trimmed_at: Option<(u64, u64)>,
+    /// How many lent tables overlap the declared extent.
+    pub tables: u32,
+}
+
+/// The most structures [`changing_ranges`] takes from the first valid FADT and FPDT the XSDT
+/// lists, the ones the kernel's lookups take ([`find_table`] takes the first valid table of a
+/// signature): the FACS that §5.2.9 chooses, a second FACS the other pointer names, and the FBPT,
+/// S3PT and MBPT the FPDT names, one each (§5.2.24.4 to §5.2.24.6: only one of each pointer
+/// record is produced). They are recorded first, so they always fit (the review of TASKS item
+/// 71, T71-1).
+pub const CHANGING_FIRST: usize = 5;
+
+/// The most structures [`changing_ranges`] keeps: as many as the lending registry has slots for
+/// (`reserved::NEVER_SLOTS`). After the first FADT's and FPDT's, every other FADT's and FPDT's
+/// take the slots left; one found with no slot left is counted ([`ChangingRanges::unkept`]),
+/// and fails the census (the addendum review of TASKS item 71, T71-11).
+pub const CHANGING_MAX: usize = crate::reserved::NEVER_SLOTS;
+
+/// The most XSDT entries [`changing_ranges`] reads, each by copy; a longer XSDT is read that far
+/// and the rest said not located.
+pub const CHANGING_XSDT_ENTRIES: usize = 1024;
+
+/// The longest FADT [`changing_ranges`] copies to check it whole (ACPI 6.6's is 276 bytes); a
+/// longer one is taken, unchecked, as the first, and said not located.
+const CHANGING_FADT_MAX: usize = 512;
+
+/// The longest FPDT [`changing_ranges`] copies; a longer one is said not located.
+const CHANGING_FPDT_MAX: usize = 1024;
+
+/// Where the firmware's structures that change after boot are, as the tables at an RSDP name
+/// them, found by [`changing_ranges`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChangingRanges {
+    ranges: [(Changing, u64, u64); CHANGING_MAX],
+    overlaps: [Overlaps; CHANGING_MAX],
+    count: usize,
+    /// Why not every such structure the tables name was located and recorded, if one was not:
+    /// part of the tables could not be read, or a structure was passed over ([`Self::passed_over`]).
+    /// The kernel then relies on `firmware::bytes`'s signature check alone for what it did not
+    /// record, and the census's verdict fails (the review of TASKS item 71, T71-1). The first
+    /// reason found is kept.
+    pub unlocated: Option<&'static str>,
+    /// The first structure found and not recorded, with the range it would have had: its pointer
+    /// names no structure of its kind (T71-2), or its minimum runs past the address space. A
+    /// structure that overlaps a table the kernel lends is recorded, never passed over
+    /// ([`Self::overlaps`]; the addendum review, T71-9).
+    pub passed_over: Option<(Changing, u64, u64)>,
+    /// Structures found, beyond the first FADT's and FPDT's, with no slot left
+    /// ([`CHANGING_MAX`]): each is a gap, and fails the census (the addendum review, T71-11).
+    pub unkept: usize,
+}
+
+impl ChangingRanges {
+    const fn new() -> Self {
+        Self {
+            ranges: [(Changing::Facs, 0, 0); CHANGING_MAX],
+            overlaps: [Overlaps {
+                declared_end: 0,
+                over_minimum: None,
+                trimmed_at: None,
+                tables: 0,
+            }; CHANGING_MAX],
+            count: 0,
+            unlocated: None,
+            passed_over: None,
+            unkept: 0,
+        }
+    }
+
+    /// Each structure found, with its range `[base, end)`.
+    pub fn ranges(&self) -> &[(Changing, u64, u64)] {
+        self.ranges.get(..self.count).unwrap_or(&[])
+    }
+
+    /// What each recorded structure met among the tables the kernel lends, in the order of
+    /// [`Self::ranges`] (the addendum review of TASKS item 71, T71-9).
+    pub fn overlaps(&self) -> &[Overlaps] {
+        self.overlaps.get(..self.count).unwrap_or(&[])
+    }
+
+    /// How many recorded structures meet a table the kernel lends: each is reported, and fails
+    /// the census (T71-9).
+    pub fn met(&self) -> usize {
+        self.overlaps().iter().filter(|o| o.tables != 0).count()
+    }
+
+    /// Whether every slot is taken.
+    fn full(&self) -> bool {
+        self.count >= CHANGING_MAX
+    }
+
+    /// Whether a structure of `kind` at `base` is recorded already.
+    fn has(&self, kind: Changing, base: u64) -> bool {
+        self.ranges()
+            .iter()
+            .any(|&(k, b, _)| k == kind && b == base)
+    }
+
+    /// Notes why not everything was located, unless a reason is already noted.
+    fn note(&mut self, why: &'static str) {
+        self.unlocated = self.unlocated.or(Some(why));
+    }
+
+    /// Notes `range` as passed over, for `why`.
+    fn pass_over(&mut self, range: (Changing, u64, u64), why: &'static str) {
+        self.note(why);
+        self.passed_over = self.passed_over.or(Some(range));
+    }
+
+    fn push(&mut self, range: (Changing, u64, u64), overlaps: Overlaps) {
+        match (
+            self.ranges.get_mut(self.count),
+            self.overlaps.get_mut(self.count),
+        ) {
+            (Some(slot), Some(met)) => {
+                *slot = range;
+                *met = overlaps;
+                self.count += 1;
+            }
+            // Not reached: `place` counts one with no slot left first. Kept to fail closed.
+            _ => self.unkept = self.unkept.saturating_add(1),
+        }
+    }
+}
+
+/// The `u32` at offset 4 of `header`: a structure's length field.
+fn length_field(header: &[u8]) -> u64 {
+    u64::from(u32_at(header, 4).unwrap_or(0))
+}
+
+/// The `i`th entry of the XSDT at `xsdt`, by copy: `None` if it could not be read.
+fn xsdt_entry(
+    xsdt: u64,
+    i: usize,
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+) -> Option<u64> {
+    let mut entry = [0u8; 8];
+    let at = xsdt.saturating_add(HEADER_LENGTH as u64 + 8 * i as u64);
+    copy(at, &mut entry).ok()?;
+    Some(u64::from_le_bytes(entry))
+}
+
+/// The extent of the table whose header is at `addr`, by copy, if its length is one
+/// [`table_length`] takes: what a lend of that table covers.
+fn table_extent(
+    addr: u64,
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+) -> Option<(u64, u64, [u8; 4])> {
+    let mut header = [0u8; HEADER_LENGTH];
+    copy(addr, &mut header).ok()?;
+    let length = table_length(&header).ok()?;
+    Some((
+        addr,
+        addr.checked_add(u64::from(length))?,
+        signature(&header)?,
+    ))
+}
+
+/// What a lend of the table at `addr` covers, if the kernel may lend it: a table whose signature
+/// is a structure the firmware changes is never lent (`firmware::bytes`, N3), so an XSDT entry or
+/// a DSDT pointer that names the FACS leaves the FACS guarded.
+fn lendable_extent(
+    addr: u64,
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+) -> Option<(u64, u64)> {
+    table_extent(addr, copy)
+        .filter(|&(_, _, sig)| !origin_acpi_tables::CHANGES_AFTER_BOOT.contains(&&sig))
+        .map(|(b, e, _)| (b, e))
+}
+
+/// The tables the kernel lends, as a structure the firmware changes must be weighed against
+/// (T71-2, T71-9): the RSDP, the RSDT, the XSDT, the DSDT the first valid FADT names, and each
+/// table the XSDT lists that is not itself such a structure. The RSDT's entries are never
+/// followed, so never lent.
+#[derive(Clone, Copy)]
+struct Lent {
+    rsdp: u64,
+    rsdt: u64,
+    xsdt: u64,
+    dsdt: u64,
+    entries: usize,
+}
+
+impl Lent {
+    /// Calls `each` with the extent of every table the kernel lends, read by copy.
+    fn each(
+        self,
+        copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+        mut each: impl FnMut(u64, u64),
+    ) {
+        if let Some(end) = self.rsdp.checked_add(RSDP_LENGTH as u64) {
+            each(self.rsdp, end);
+        }
+        for table in [self.rsdt, self.xsdt, self.dsdt] {
+            if table != 0
+                && let Some((b, e)) = lendable_extent(table, copy)
+            {
+                each(b, e);
+            }
+        }
+        for i in 0..self.entries {
+            if let Some((b, e)) = xsdt_entry(self.xsdt, i, copy)
+                .filter(|&a| a != 0)
+                .and_then(|a| lendable_extent(a, copy))
+            {
+                each(b, e);
+            }
+        }
+    }
+}
+
+/// Records the structure of `kind` that a pointer names at `base`, if it is one (T71-2, T71-9).
+/// It must begin with its kind's signature: if not, it is passed over and reported, unless
+/// `ignored` (the FACS field §5.2.9 says to ignore, where a stale value is no fault). One that
+/// does is guarded, never dropped: always its minimum ([`Changing::minimum`]), whatever overlaps
+/// it; then the rest of the extent its length field declares, up to the first table the kernel
+/// lends ([`Lent`]) that starts beyond the minimum. Every lent table it meets is recorded beside
+/// it ([`Overlaps`]). One that cannot be read is not recorded; one with no slot left is counted
+/// ([`ChangingRanges::unkept`]; T71-11).
+fn place(
+    found: &mut ChangingRanges,
+    (kind, base): (Changing, u64),
+    ignored: bool,
+    lent: Lent,
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+) {
+    let mut head = [0u8; 8];
+    if copy(base, &mut head).is_err() {
+        return;
+    }
+    let minimum = kind.minimum();
+    let Some(minimum_end) = base.checked_add(minimum) else {
+        found.pass_over(
+            (kind, base, u64::MAX),
+            "a structure the firmware changes runs past the address space",
+        );
+        return;
+    };
+    if head.get(..4) != Some(kind.name().as_bytes()) {
+        if !ignored {
+            found.pass_over(
+                (kind, base, minimum_end),
+                "a pointer to a structure the firmware changes names something else",
+            );
+        }
+        return;
+    }
+    if found.has(kind, base) {
+        return;
+    }
+    if found.full() {
+        found.unkept = found.unkept.saturating_add(1);
+        return;
+    }
+    let declared_end = base.saturating_add(length_field(&head).max(minimum));
+    let mut overlaps = Overlaps {
+        declared_end,
+        ..Overlaps::default()
+    };
+    let mut end = declared_end;
+    lent.each(copy, |b, e| {
+        if b < declared_end && base < e {
+            overlaps.tables = overlaps.tables.saturating_add(1);
+            if b < minimum_end {
+                overlaps.over_minimum = overlaps.over_minimum.or(Some((b, e)));
+            } else if b < end {
+                end = b;
+                overlaps.trimmed_at = Some((b, e));
+            }
+        }
+    });
+    found.push((kind, base, end), overlaps);
+}
+
+/// The address of the XSDT's `i`th entry and the header of the table there, by copy: `None` for
+/// a null entry, and for one that could not be read, which is noted, as it might have been a
+/// FADT or an FPDT.
+fn entry_header(
+    xsdt: u64,
+    i: usize,
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+    found: &mut ChangingRanges,
+) -> Option<(u64, [u8; HEADER_LENGTH])> {
+    let Some(addr) = xsdt_entry(xsdt, i, copy) else {
+        found.note("an XSDT entry could not be read to locate them");
+        return None;
+    };
+    if addr == 0 {
+        return None;
+    }
+    let mut header = [0u8; HEADER_LENGTH];
+    if copy(addr, &mut header).is_err() {
+        found.note("an XSDT entry could not be read to locate them");
+        return None;
+    }
+    Some((addr, header))
+}
+
+/// The FACS pointers (`X_FIRMWARE_CTRL`, `FIRMWARE_CTRL`) and the DSDT, chosen as §5.2.9 says,
+/// of the FADT at `addr` whose header is `header`, by copy. For the first (`first`), as the
+/// kernel's lookups take a FADT: `None` unless it is valid, with nothing noted, as an invalid one
+/// is not the first; one longer than [`CHANGING_FADT_MAX`] is taken unchecked, since it may be
+/// the first, and noted. For any other (the addendum review of TASKS item 71, T71-11): taken
+/// whatever its checksum, and noted if it cannot be read.
+fn fadt_pointers(
+    addr: u64,
+    header: &[u8; HEADER_LENGTH],
+    first: bool,
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+    found: &mut ChangingRanges,
+) -> Option<([u64; 2], u64)> {
+    // A length `table_length` refuses makes a table `find_table` refuses: not the first valid.
+    if table_length(header).is_err() {
+        if !first {
+            found.note("a FADT could not be read to locate the FACS");
+        }
+        return None;
+    }
+    let declared = usize::try_from(length_field(header)).unwrap_or(usize::MAX);
+    let mut fadt = [0u8; CHANGING_FADT_MAX];
+    let long = declared > fadt.len();
+    let len = declared.clamp(HEADER_LENGTH, fadt.len());
+    let fadt = fadt.get_mut(..len)?;
+    if copy(addr, fadt).is_err() {
+        found.note("a FADT could not be read to locate the FACS");
+        return None;
+    }
+    if long {
+        // Too long to check here, so taken: as the first, it may be the one the kernel's
+        // lookups take.
+        found.note("a FADT longer than the kernel reads to locate the FACS");
+    } else if first && check_table(fadt, b"FACP").is_err() {
+        // Not valid, so not the one the kernel's lookups take.
+        return None;
+    }
+    let [x_dsdt, dsdt] = origin_acpi_tables::fadt::dsdt_pointers(fadt);
+    Some((
+        origin_acpi_tables::fadt::facs_pointers(fadt),
+        if x_dsdt != 0 { x_dsdt } else { dsdt },
+    ))
+}
+
+/// The FACS a FADT's two pointers name: the one §5.2.9 chooses (`X_FIRMWARE_CTRL` when non-zero,
+/// else `FIRMWARE_CTRL`), then the one the ignored field names, if it differs, which §5.2.9
+/// forbids.
+fn facs_targets(x: u64, legacy: u64) -> [Option<(Changing, u64)>; 2] {
+    let chosen = if x != 0 { x } else { legacy };
+    [
+        (chosen != 0).then_some((Changing::Facs, chosen)),
+        (x != 0 && legacy != 0 && legacy != x).then_some((Changing::Facs, legacy)),
+    ]
+}
+
+/// What [`fpdt_targets`] read.
+enum FpdtRead {
+    /// Not an FPDT the rule takes, or one not read, which is noted.
+    Skip,
+    /// The first, too long to read here: it may be the one the kernel's lookups take (noted).
+    Long,
+    /// The targets of its first FBPT, S3PT and MBPT pointer records, in that order.
+    Targets([Option<(Changing, u64)>; 3]),
+}
+
+/// The FBPT, S3PT and MBPT that the FPDT at `addr`, whose header is `header`, points to, by
+/// copy: the first record of each kind (§5.2.24.4 to §5.2.24.6). For the first (`first`), as the
+/// kernel's lookups take an FPDT: only a valid one, with nothing noted for an invalid one. For
+/// any other (the addendum review of TASKS item 71, T71-11): whatever its checksum, and one whose
+/// records cannot be read is noted.
+fn fpdt_targets(
+    addr: u64,
+    header: &[u8; HEADER_LENGTH],
+    first: bool,
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+    found: &mut ChangingRanges,
+) -> FpdtRead {
+    use origin_acpi_tables::boot::{Fpdt, FpdtRecord};
+    if table_length(header).is_err() {
+        if !first {
+            found.note("an FPDT could not be read to locate its tables");
+        }
+        return FpdtRead::Skip;
+    }
+    let declared = usize::try_from(length_field(header)).unwrap_or(usize::MAX);
+    let mut fpdt = [0u8; CHANGING_FPDT_MAX];
+    let Some(fpdt) = fpdt.get_mut(..declared) else {
+        found.note("an FPDT longer than the kernel reads to locate its tables");
+        return if first {
+            FpdtRead::Long
+        } else {
+            FpdtRead::Skip
+        };
+    };
+    if copy(addr, fpdt).is_err() {
+        found.note("an FPDT could not be read to locate its tables");
+        return FpdtRead::Skip;
+    }
+    if first && check_table(fpdt, b"FPDT").is_err() {
+        return FpdtRead::Skip;
+    }
+    let Ok(parsed) = Fpdt::parse(fpdt) else {
+        if !first {
+            found.note("an FPDT's records could not be read to locate its tables");
+        }
+        return FpdtRead::Skip;
+    };
+    let mut targets = [None; 3];
+    for record in parsed.walk() {
+        let (index, kind, target) = match record {
+            Ok((_, FpdtRecord::Fbpt(a))) => (0, Changing::Fbpt, a),
+            Ok((_, FpdtRecord::S3pt(a))) => (1, Changing::S3pt, a),
+            Ok((_, FpdtRecord::Mbpt(a))) => (2, Changing::Mbpt, a),
+            _ => continue,
+        };
+        // Only one of each is produced (§5.2.24.4 to §5.2.24.6): the first counts.
+        if let Some(slot) = targets.get_mut(index)
+            && slot.is_none()
+        {
+            *slot = (target != 0).then_some((kind, target));
+        }
+    }
+    FpdtRead::Targets(targets)
+}
+
+/// Locates the firmware's structures that change after boot, as the tables at `rsdp_addr` name
+/// them (TASKS item 71). First by the rule the kernel's lookups follow (the review of TASKS item
+/// 71, T71-1): from the first valid FADT the XSDT lists, the FACS chosen as §5.2.9 says
+/// (`X_FIRMWARE_CTRL` when non-zero, else `FIRMWARE_CTRL`), and a second FACS if the ignored
+/// field names one, which §5.2.9 forbids; from the first valid FPDT, the first FBPT, S3PT and
+/// MBPT pointer records. Those are recorded first, the FACS first, and always fit
+/// ([`CHANGING_FIRST`]). Then every other FADT and FPDT the XSDT lists, valid or not, in its
+/// order, into the slots left (the addendum review of TASKS item 71, T71-11), as the firmware may
+/// still change what a table the kernel does not take names: one found with no slot left is
+/// counted ([`ChangingRanges::unkept`]), and an FPDT whose records cannot be read is noted.
+///
+/// Each target must begin with its kind's signature (`FACS`, `FBPT`, `S3PT`, `MBPT`; T71-2). One
+/// that does not is not recorded, and is reported ([`ChangingRanges::passed_over`]), so a pointer
+/// the kernel does not act on blocks no table lookup; the ignored FACS field's target is passed
+/// over without a report, as a stale value there is no fault. One that does is guarded, never
+/// dropped (the addendum review of TASKS item 71, T71-9): always its kind's minimum
+/// ([`Changing::minimum`]), whatever overlaps it, so a table the kernel lends that overlaps the
+/// minimum cannot be lent; and the rest of the extent its length field declares, up to the first
+/// table the kernel lends that starts beyond the minimum, which stays lendable. Every table it
+/// meets is reported ([`ChangingRanges::overlaps`]). The tables the kernel lends are the RSDP,
+/// the RSDT, the XSDT, each table the XSDT lists that is not itself such a structure, and the
+/// DSDT that FADT names. So a table listed at an address inside a structure's declared extent,
+/// beyond its minimum, is lent, and reported: a stated limit. A target that cannot be read is
+/// not recorded and not reported: `firmware::bytes` and `firmware::copy` refuse the same memory
+/// by the memory map, and the census fails if it reads one there.
+///
+/// Every byte is read by copy (`copy`), into the stack: this takes no lend, so it can neither
+/// lend a range before the ones it finds are recorded nor recurse into a table lookup, and it
+/// allocates nothing, since the first lookup comes before the kernel's heap. What could not be
+/// read to locate them is noted ([`ChangingRanges::unlocated`]): an RSDP or XSDT that could not
+/// be read, an XSDT entry or its header that could not be read, an XSDT longer than
+/// [`CHANGING_XSDT_ENTRIES`] entries, a FADT longer than 512 bytes (taken unchecked, its FACS
+/// pointers being at offsets 36 and 132), an FPDT longer than 1 KiB, and any other FADT or FPDT
+/// that could not be read.
+pub fn changing_ranges(
+    rsdp_addr: u64,
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+) -> ChangingRanges {
+    let mut found = ChangingRanges::new();
+    let mut rsdp = [0u8; RSDP_LENGTH];
+    let Some(xsdt) = copy(rsdp_addr, &mut rsdp)
+        .ok()
+        .and_then(|()| parse_rsdp(&rsdp).ok())
+        .map(|r| r.xsdt)
+    else {
+        found.note("the RSDP could not be read");
+        return found;
+    };
+    let Some((_, xsdt_end, _)) = table_extent(xsdt, copy) else {
+        found.note("the XSDT could not be read");
+        return found;
+    };
+    let entries = usize::try_from(xsdt_end.saturating_sub(xsdt))
+        .unwrap_or(0)
+        .saturating_sub(HEADER_LENGTH)
+        / 8;
+    if entries > CHANGING_XSDT_ENTRIES {
+        found.note("an XSDT longer than the kernel reads to locate them");
+    }
+    let entries = entries.min(CHANGING_XSDT_ENTRIES);
+
+    // The first valid FADT and FPDT, as the kernel's lookups take them (T71-1), and their
+    // targets in the order they are recorded: the chosen FACS, the second FACS, then the FBPT,
+    // S3PT and MBPT.
+    let mut candidates: [Option<(Changing, u64)>; CHANGING_FIRST] = [None; CHANGING_FIRST];
+    let (mut fadt_at, mut fpdt_at, mut dsdt) = (None, None, 0u64);
+    for i in 0..entries {
+        if fadt_at.is_some() && fpdt_at.is_some() {
+            break;
+        }
+        let Some((addr, header)) = entry_header(xsdt, i, copy, &mut found) else {
+            continue;
+        };
+        match signature(&header) {
+            Some(sig) if &sig == b"FACP" && fadt_at.is_none() => {
+                let Some(([x, legacy], named)) =
+                    fadt_pointers(addr, &header, true, copy, &mut found)
+                else {
+                    continue;
+                };
+                fadt_at = Some(i);
+                dsdt = named;
+                for (slot, target) in candidates.iter_mut().zip(facs_targets(x, legacy)) {
+                    *slot = target;
+                }
+            }
+            Some(sig) if &sig == b"FPDT" && fpdt_at.is_none() => {
+                match fpdt_targets(addr, &header, true, copy, &mut found) {
+                    FpdtRead::Skip => continue,
+                    FpdtRead::Long => fpdt_at = Some(i),
+                    FpdtRead::Targets(targets) => {
+                        fpdt_at = Some(i);
+                        for (slot, target) in candidates.iter_mut().skip(2).zip(targets) {
+                            *slot = target;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let lent = Lent {
+        rsdp: rsdp_addr,
+        rsdt: u32_at(&rsdp, 16).map_or(0, u64::from),
+        xsdt,
+        dsdt,
+        entries,
+    };
+    for (i, candidate) in candidates.into_iter().enumerate() {
+        if let Some(target) = candidate {
+            // Index 1 is the FACS field §5.2.9 says to ignore.
+            place(&mut found, target, i == 1, lent, copy);
+        }
+    }
+
+    // Every other FADT and FPDT the XSDT lists, valid or not, into the slots left (T71-11).
+    for i in 0..entries {
+        if Some(i) == fadt_at || Some(i) == fpdt_at {
+            continue;
+        }
+        let Some((addr, header)) = entry_header(xsdt, i, copy, &mut found) else {
+            continue;
+        };
+        match signature(&header) {
+            Some(sig) if &sig == b"FACP" => {
+                if let Some(([x, legacy], _)) =
+                    fadt_pointers(addr, &header, false, copy, &mut found)
+                {
+                    for (j, target) in facs_targets(x, legacy).into_iter().enumerate() {
+                        if let Some(target) = target {
+                            place(&mut found, target, j == 1, lent, copy);
+                        }
+                    }
+                }
+            }
+            Some(sig) if &sig == b"FPDT" => {
+                if let FpdtRead::Targets(targets) =
+                    fpdt_targets(addr, &header, false, copy, &mut found)
+                {
+                    for target in targets.into_iter().flatten() {
+                        place(&mut found, target, false, lent, copy);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// The table with signature `sig` that the XSDT at `rsdp_addr` lists, as `firmware::acpi_table`
+/// gives it: the never-lendable ranges located and recorded first (`located`, [`changing_ranges`],
+/// `record`), only if `located` says they have not been, and before anything is lent; then the
+/// RSDP and the XSDT lent, and [`find_table`]. `lend` refuses, as `firmware::bytes` does, any
+/// range before the ranges are recorded and any that overlaps one (TASKS item 71).
+pub fn lookup<'t>(
+    rsdp_addr: u64,
+    sig: &[u8; 4],
+    located: &mut impl FnMut() -> bool,
+    record: &mut impl FnMut(&ChangingRanges),
+    copy: &mut impl FnMut(u64, &mut [u8]) -> Result<(), &'static str>,
+    lend: &mut impl FnMut(u64, usize) -> Result<&'t [u8], &'static str>,
+) -> Result<&'t [u8], &'static str> {
+    if !located() {
+        record(&changing_ranges(rsdp_addr, copy));
+    }
+    let rsdp = parse_rsdp(lend(rsdp_addr, RSDP_LENGTH)?).map_err(|_| "invalid RSDP")?;
+    let xsdt = lend_table(rsdp.xsdt, b"XSDT", copy, lend)?;
+    find_table(xsdt, sig, copy, lend)
+}
+
 /// The first valid table with signature `sig` that a checked XSDT lists: each entry's header
 /// compared by copy (`copy`), and only a table whose signature is `sig` lent (`lend`) and checked.
 /// One bad entry does not hide the entries after it; the error is why the last table with this
@@ -265,7 +929,8 @@ pub fn find_table<'t>(
 pub struct Fadt {
     /// The CMOS index of the RTC's century register, if the firmware names a usable one
     /// (`CENTURY`, offset 108; 0 means none). Indexes 00h–0Dh are the clock's own
-    /// registers and 80h and above are outside the standard bank, so neither is accepted.
+    /// registers and 80h and above are outside the standard bank, so neither is accepted. None
+    /// on a hardware-reduced platform, whose OS §5.2.9 has ignore offset 108 (TASKS item 71).
     pub century: Option<u8>,
     /// `IAPC_BOOT_ARCH` (offset 109) bit 5: the platform has no CMOS RTC.
     pub cmos_rtc_absent: bool,
@@ -273,54 +938,58 @@ pub struct Fadt {
     /// (`IAPC_BOOT_ARCH` bit 1), or `None` if the table predates that flag (FADT revision 1,
     /// ACPI 1.0, where the byte is reserved).
     pub i8042: Option<bool>,
-    /// The ACPI power-management timer's I/O port (`PM_TMR_BLK`, offset 76), if the
-    /// firmware provides one (nonzero and `PM_TMR_LEN` is 4).
+    /// The ACPI power-management timer's I/O port, if the firmware provides one this kernel can
+    /// read, as §5.2.9 says to choose it (TASKS item 71): `X_PM_TMR_BLK` when it is non-zero and a
+    /// system I/O port; else `PM_TMR_BLK`, the 32-bit field. Either only with `PM_TMR_LEN` 4 and
+    /// not on a hardware-reduced platform.
     pub pm_timer_port: Option<u16>,
-    /// Whether the PM timer is 32-bit (`FADT.flags` bit 8, `TMR_VAL_EXT`); else 24-bit.
+    /// Whether the PM timer is 32-bit (`FADT.flags` bit 8, `TMR_VAL_EXT`); else 24-bit. False on
+    /// a hardware-reduced platform, whose OS ignores the bit.
     pub pm_timer_32bit: bool,
 }
 
-/// Offset of the FADT's `CENTURY` byte.
+/// Offsets in a FADT, for the tests' fixtures.
+#[cfg(test)]
 const FADT_CENTURY: usize = 108;
-/// Offset of the FADT's 16-bit `IAPC_BOOT_ARCH` flags.
+#[cfg(test)]
 const FADT_IAPC_BOOT_ARCH: usize = 109;
-/// `IAPC_BOOT_ARCH` bit 1: the platform has an 8042 or equivalent (ACPI 2.0 and later).
-const HAS_8042: u16 = 1 << 1;
-/// Offset of the FADT's revision in its table header.
+#[cfg(test)]
 const FADT_REVISION: usize = 8;
-/// Offset of `PM_TMR_BLK` (the PM timer's 32-bit I/O port address).
+#[cfg(test)]
 const FADT_PM_TMR_BLK: usize = 76;
-/// Offset of `PM_TMR_LEN`.
+#[cfg(test)]
 const FADT_PM_TMR_LEN: usize = 91;
-/// Offset of the `FADT.flags` dword; bit 8 is `TMR_VAL_EXT` (a 32-bit PM timer).
+#[cfg(test)]
 const FADT_FLAGS: usize = 112;
-/// `IAPC_BOOT_ARCH` bit 5: CMOS RTC not present.
-const CMOS_RTC_NOT_PRESENT: u16 = 1 << 5;
 
-/// Reads the fields of a checked FADT that the kernel uses. A table too short to hold
-/// them (an ACPI 1.0 FADT has them; anything shorter is malformed) is refused.
-pub fn parse_fadt(fadt: &[u8]) -> Result<Fadt, AcpiError> {
-    let short = || AcpiError::Length(u32::try_from(fadt.len()).unwrap_or(u32::MAX));
-    let century = *fadt.get(FADT_CENTURY).ok_or_else(short)?;
-    let arch = fadt
-        .get(FADT_IAPC_BOOT_ARCH..FADT_IAPC_BOOT_ARCH + 2)
-        .ok_or_else(short)?;
-    let arch = u16::from_le_bytes([
-        arch.first().copied().unwrap_or(0),
-        arch.get(1).copied().unwrap_or(0),
-    ]);
-    let pm_tmr_blk = u32_at(fadt, FADT_PM_TMR_BLK).ok_or_else(short)?;
-    let pm_tmr_len = *fadt.get(FADT_PM_TMR_LEN).ok_or_else(short)?;
-    let flags = u32_at(fadt, FADT_FLAGS).ok_or_else(short)?;
-    let revision = *fadt.get(FADT_REVISION).ok_or_else(short)?;
-    let pm_timer_port =
-        (pm_tmr_len == 4 && pm_tmr_blk != 0 && pm_tmr_blk <= 0xFFFF).then_some(pm_tmr_blk as u16);
+/// Reads the fields of a checked FADT that the kernel uses, through `origin-acpi-tables`
+/// (TASKS item 71: the tree's one FADT parser). Refused, as its `Fadt::parse` refuses: a header
+/// that is not a FACP's, a table shorter than ACPI 1.0's 116 bytes ([`AcpiError::Length`]), and
+/// a FADT that names no DSDT ([`AcpiError::Field`]), on which no operating system can run and
+/// which the census fails (ruling 1a). A field the FADT's other rules make unusable (a PM timer
+/// whose length is not 4, say) is simply not given.
+pub fn parse_fadt(table: &[u8]) -> Result<Fadt, AcpiError> {
+    let f = origin_acpi_tables::fadt::Fadt::parse(table)
+        .map_err(|e| refused(table, e, AcpiError::Field))?;
+    let reduced = f.flags.hw_reduced_acpi();
+    // §5.2.9: the X_ form when it is non-zero and this kernel can use it, which for the PM
+    // timer is a system I/O port that keeps its rules; else the 32-bit field (`port_block`, which
+    // a faulty X_ form does not stop: the review's T71-4).
+    let port = |r: Register| {
+        (r.gas.space == AddressSpace::SystemIo)
+            .then(|| u16::try_from(r.gas.address).ok())
+            .flatten()
+    };
+    let pm_timer_port = f
+        .block(Block::PmTimer)
+        .and_then(port)
+        .or_else(|| f.port_block(Block::PmTimer).and_then(port));
     Ok(Fadt {
-        century: (0x0E..=0x7F).contains(&century).then_some(century),
-        cmos_rtc_absent: arch & CMOS_RTC_NOT_PRESENT != 0,
-        i8042: (revision >= 2).then_some(arch & HAS_8042 != 0),
+        century: (!reduced && (0x0E..=0x7F).contains(&f.century)).then_some(f.century),
+        cmos_rtc_absent: f.iapc_boot_arch.cmos_rtc_not_present(),
+        i8042: (f.table().revision() >= 2).then_some(f.iapc_boot_arch.i8042()),
         pm_timer_port,
-        pm_timer_32bit: flags & (1 << 8) != 0,
+        pm_timer_32bit: !reduced && f.flags.tmr_val_ext(),
     })
 }
 
@@ -873,11 +1542,19 @@ mod tests {
         }
     }
 
+    /// An ACPI 6 FADT's 240-byte body after the header, naming a DSDT (offset 40), which
+    /// `parse_fadt` needs since TASKS item 71.
+    fn fadt_body() -> Vec<u8> {
+        let mut body = vec![0u8; 240];
+        body[40 - 36..44 - 36].copy_from_slice(&0x7FFD_0000u32.to_le_bytes());
+        body
+    }
+
     #[test]
     fn fadt_century_register_and_rtc_presence() {
         // An ACPI 6 FADT is 276 bytes: a 240-byte body after the header.
         let fadt = |century: u8, arch: u16| {
-            let mut body = vec![0u8; 240];
+            let mut body = fadt_body();
             body[FADT_CENTURY - 36] = century;
             body[FADT_IAPC_BOOT_ARCH - 36..FADT_IAPC_BOOT_ARCH - 34]
                 .copy_from_slice(&arch.to_le_bytes());
@@ -903,19 +1580,104 @@ mod tests {
         assert_eq!(parse_fadt(&fadt(0x0E, 0)).unwrap().century, Some(0x0E));
         assert!(parse_fadt(&fadt(0x32, 1 << 5)).unwrap().cmos_rtc_absent);
         assert!(!parse_fadt(&fadt(0x32, !(1 << 5))).unwrap().cmos_rtc_absent);
-        // The flags dword ends at offset 116, so a shorter table is refused.
-        assert_eq!(parse_fadt(&qemu[..115]), Err(AcpiError::Length(115)));
-        assert!(parse_fadt(&qemu[..116]).is_ok());
+        // ACPI 1.0's FADT is 116 bytes, through the flags dword, so a shorter table is refused.
+        let short = |len: usize| {
+            let mut t = qemu[..len].to_vec();
+            reseal(&mut t);
+            t
+        };
+        assert_eq!(parse_fadt(&short(115)), Err(AcpiError::Length(115)));
+        assert!(parse_fadt(&short(116)).is_ok());
+    }
+
+    /// TASKS item 71: the FADT read through `origin-acpi-tables`, and what that changes.
+    #[test]
+    fn the_fadt_is_read_as_the_crate_judges_it() {
+        let gas = |space: u8, address: u64| {
+            let mut g = vec![space, 32, 0, 3];
+            g.extend_from_slice(&address.to_le_bytes());
+            g
+        };
+        let fadt = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut body = fadt_body();
+            body[FADT_CENTURY - 36] = 0x32;
+            body[FADT_PM_TMR_BLK - 36..FADT_PM_TMR_BLK - 32]
+                .copy_from_slice(&0x0608u32.to_le_bytes());
+            body[FADT_PM_TMR_LEN - 36] = 4;
+            body[FADT_FLAGS - 36..FADT_FLAGS - 32].copy_from_slice(&(1u32 << 8).to_le_bytes());
+            edit(&mut body);
+            table(b"FACP", &body)
+        };
+        let base = parse_fadt(&fadt(&|_| {})).unwrap();
+        assert_eq!(
+            (base.pm_timer_port, base.century, base.pm_timer_32bit),
+            (Some(0x0608), Some(0x32), true)
+        );
+        // Ruling 1a: a FADT that names no DSDT is refused, so the kernel takes no PM timer,
+        // century or 8042 flag from it, where before it did.
+        assert_eq!(
+            parse_fadt(&fadt(&|b| b[40 - 36..44 - 36].fill(0))),
+            Err(AcpiError::Field(40))
+        );
+        // §5.2.9: the X_ form when non-zero and usable here (a system I/O port)...
+        let x_port = parse_fadt(&fadt(&|b| {
+            b[208 - 36..220 - 36].copy_from_slice(&gas(1, 0x0408));
+        }))
+        .unwrap();
+        assert_eq!(x_port.pm_timer_port, Some(0x0408), "X_PM_TMR_BLK preferred");
+        // ...else the 32-bit field: an X_ form in system memory, which the kernel cannot read.
+        let x_memory = parse_fadt(&fadt(&|b| {
+            b[208 - 36..220 - 36].copy_from_slice(&gas(0, 0xFED0_0000));
+        }))
+        .unwrap();
+        assert_eq!(
+            x_memory.pm_timer_port,
+            Some(0x0608),
+            "the 32-bit port stands"
+        );
+        // The review's T71-4: an X_ form with a reserved address space or access size cannot be
+        // used either, and the 32-bit port stands, as it did before TASKS item 71.
+        for (space, access) in [(0x20, 3), (1, 5)] {
+            let faulty = parse_fadt(&fadt(&|b| {
+                let mut g = gas(space, 0x0408);
+                g[3] = access;
+                b[208 - 36..220 - 36].copy_from_slice(&g);
+            }))
+            .unwrap();
+            assert_eq!(faulty.pm_timer_port, Some(0x0608), "{space:#x} {access}");
+        }
+        // A length other than 4 makes the timer unusable, whichever form names it.
+        let bad_length = parse_fadt(&fadt(&|b| b[FADT_PM_TMR_LEN - 36] = 3)).unwrap();
+        assert_eq!(bad_length.pm_timer_port, None);
+        // A hardware-reduced platform: no PM timer, no century, no TMR_VAL_EXT (§5.2.9 has
+        // its OS ignore offsets 46 to 108 and flag bit 8); the RTC and 8042 flags at offset
+        // 109 still read.
+        let reduced = parse_fadt(&fadt(&|b| {
+            b[FADT_FLAGS - 36..FADT_FLAGS - 32]
+                .copy_from_slice(&((1u32 << 20) | (1 << 8)).to_le_bytes());
+            b[FADT_IAPC_BOOT_ARCH - 36] = 1 << 5;
+        }))
+        .unwrap();
+        assert_eq!(
+            (
+                reduced.pm_timer_port,
+                reduced.century,
+                reduced.pm_timer_32bit
+            ),
+            (None, None, false)
+        );
+        assert!(reduced.cmos_rtc_absent);
     }
 
     #[test]
     fn the_fadt_says_whether_there_is_an_8042_from_revision_2() {
         let fadt = |revision: u8, arch: u16| {
-            let mut body = vec![0u8; 240];
+            let mut body = fadt_body();
             body[FADT_IAPC_BOOT_ARCH - 36..FADT_IAPC_BOOT_ARCH - 34]
                 .copy_from_slice(&arch.to_le_bytes());
             let mut t = table(b"FACP", &body);
             t[FADT_REVISION] = revision;
+            fix_checksum(&mut t, 9);
             t
         };
         // ACPI 1.0's table has no such flag: the byte is reserved, so zero means nothing.
@@ -949,7 +1711,7 @@ mod tests {
             &x2apic(300, 1, 7),
             &[1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         ]);
-        let mut fadt_body = vec![0u8; 240];
+        let mut fadt_body = fadt_body();
         fadt_body[FADT_CENTURY - 36] = 0x32;
         let good_fadt = table(b"FACP", &fadt_body);
         let mut accepted = [0u32; 3];
@@ -986,6 +1748,11 @@ mod tests {
             }
             let mut f = good_fadt.clone();
             mutate(&mut f, &mut rng);
+            // The FADT is read through the crate since TASKS item 71, which checks its header:
+            // half the cases repaired, so its fields are reached.
+            if case % 2 == 0 {
+                reseal(&mut f);
+            }
             if let Ok(fadt) = parse_fadt(&f) {
                 assert!(
                     fadt.century.is_none_or(|c| (0x0E..=0x7F).contains(&c)),
@@ -1740,7 +2507,7 @@ mod tests {
     #[test]
     fn mutated_fadts_read_their_fields_from_the_right_bytes() {
         use crate::testing::{Rng, mutate_window};
-        let mut body = vec![0u8; 240];
+        let mut body = fadt_body();
         body[FADT_CENTURY - 36] = 0x32;
         body[FADT_PM_TMR_BLK - 36..FADT_PM_TMR_BLK - 36 + 4]
             .copy_from_slice(&0x608u32.to_le_bytes());
@@ -1753,27 +2520,33 @@ mod tests {
             mutate_window(&mut f, FADT_PM_TMR_BLK..FADT_FLAGS + 4, &mut rng);
             let len = case % (f.len() + 1);
             let cut = if case % 4 == 0 { len } else { f.len() };
-            let f = &f[..cut];
-            let Ok(fadt) = parse_fadt(f) else {
-                assert!(
-                    f.len() < FADT_FLAGS + 4,
-                    "case {case}: refused a whole table"
-                );
+            let mut f = f[..cut].to_vec();
+            // Read through the crate since TASKS item 71, which checks the header: repaired.
+            reseal(&mut f);
+            let Ok(fadt) = parse_fadt(&f) else {
+                assert!(f.len() < 116, "case {case}: refused a whole table");
                 continue;
             };
+            let reduced = le32(&f[FADT_FLAGS..]) & (1 << 20) != 0;
             assert_eq!(
                 fadt.century,
-                Some(f[FADT_CENTURY]).filter(|c| (0x0E..=0x7F).contains(c)),
+                Some(f[FADT_CENTURY]).filter(|c| !reduced && (0x0E..=0x7F).contains(c)),
                 "case {case}"
             );
             let port = le32(&f[FADT_PM_TMR_BLK..]);
+            // The fixture's X_PM_TMR_BLK, if the table holds it, is zero, so the 32-bit field
+            // names the timer: usable with a length of 4, on a platform that is not
+            // hardware-reduced.
             match fadt.pm_timer_port {
                 Some(p) => {
                     assert_eq!(u32::from(p), port, "case {case}");
-                    assert!(f[FADT_PM_TMR_LEN] == 4 && p != 0, "case {case}");
+                    assert!(f[FADT_PM_TMR_LEN] == 4 && p != 0 && !reduced, "case {case}");
                     with_port += 1;
                 }
-                None => assert!(f[FADT_PM_TMR_LEN] != 4 || port == 0 || port > 0xFFFF),
+                None => assert!(
+                    reduced || f[FADT_PM_TMR_LEN] != 4 || port == 0 || port > 0xFFFF,
+                    "case {case}"
+                ),
             }
         }
         assert!(with_port > 500, "{with_port}");
@@ -1895,5 +2668,684 @@ mod tests {
         // A locality count that would overflow the table length is refused, not panicked.
         let s = slit(u64::MAX, &[10]);
         assert!(matches!(parse_slit(&s), Err(AcpiError::Length(_))));
+    }
+
+    /// Firmware memory for the item-2 tests, at [`BASE`]: copies read any part of it, as
+    /// `firmware::copy` does.
+    const BASE: u64 = 0x7F00_0000;
+
+    fn machine_memory() -> (Vec<u8>, u64) {
+        const RSDP_AT: u64 = BASE;
+        const XSDT_AT: u64 = BASE + 0x100;
+        const FADT_AT: u64 = BASE + 0x1000;
+        const FACS_AT: u64 = BASE + 0x2000;
+        const FPDT_AT: u64 = BASE + 0x3000;
+        const FBPT_AT: u64 = BASE + 0x4000;
+        const S3PT_AT: u64 = BASE + 0x5000;
+        const MADT_AT: u64 = BASE + 0x6000;
+        let mut mem = vec![0u8; 0x8000];
+        let mut put = |at: u64, bytes: &[u8]| {
+            let at = (at - BASE) as usize;
+            mem[at..at + bytes.len()].copy_from_slice(bytes);
+        };
+        let mut xsdt = Vec::new();
+        for e in [FADT_AT, FPDT_AT, MADT_AT] {
+            xsdt.extend_from_slice(&e.to_le_bytes());
+        }
+        put(XSDT_AT, &table(b"XSDT", &xsdt));
+        put(RSDP_AT, &rsdp(XSDT_AT));
+        // The FADT: its X_FIRMWARE_CTRL names the FACS; its FIRMWARE_CTRL is stale and points
+        // into the XSDT, which §5.2.9 says to ignore when the X_ field is non-zero.
+        let mut body = fadt_body();
+        body[..4].copy_from_slice(&(XSDT_AT as u32).to_le_bytes()); // FIRMWARE_CTRL, offset 36
+        body[132 - 36..140 - 36].copy_from_slice(&FACS_AT.to_le_bytes());
+        put(FADT_AT, &table(b"FACP", &body));
+        let mut facs = vec![0u8; 64];
+        facs[..4].copy_from_slice(b"FACS");
+        facs[4..8].copy_from_slice(&64u32.to_le_bytes());
+        put(FACS_AT, &facs);
+        let pointer = |kind: u16, at: u64| {
+            let mut r = kind.to_le_bytes().to_vec();
+            r.extend_from_slice(&[16, 1, 0, 0, 0, 0]);
+            r.extend_from_slice(&at.to_le_bytes());
+            r
+        };
+        put(
+            FPDT_AT,
+            &table(
+                b"FPDT",
+                &[pointer(0, FBPT_AT), pointer(1, S3PT_AT)].concat(),
+            ),
+        );
+        let mut fbpt = b"FBPT".to_vec();
+        fbpt.extend_from_slice(&0x200u32.to_le_bytes());
+        put(FBPT_AT, &fbpt);
+        let mut s3pt = b"S3PT".to_vec();
+        s3pt.extend_from_slice(&52u32.to_le_bytes());
+        put(S3PT_AT, &s3pt);
+        put(MADT_AT, &madt(&[&lapic(0, 0, 1)]));
+        (mem, RSDP_AT)
+    }
+
+    fn copy_from(mem: &[u8]) -> impl FnMut(u64, &mut [u8]) -> Result<(), &'static str> + '_ {
+        move |addr: u64, out: &mut [u8]| {
+            let at = addr.checked_sub(BASE).ok_or("not firmware memory")? as usize;
+            let bytes = mem.get(at..at + out.len()).ok_or("not firmware memory")?;
+            out.copy_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    /// TASKS item 71: the FACS the FADT names as §5.2.9 says (a stale 32-bit pointer ignored), and
+    /// the FPDT's FBPT and S3PT, located by copy alone.
+    #[test]
+    fn the_changing_structures_are_located_by_copy() {
+        let (mem, rsdp_at) = machine_memory();
+        let found = changing_ranges(rsdp_at, &mut copy_from(&mem));
+        assert_eq!(found.unlocated, None);
+        assert_eq!(
+            found.ranges(),
+            &[
+                (Changing::Facs, BASE + 0x2000, BASE + 0x2040),
+                (Changing::Fbpt, BASE + 0x4000, BASE + 0x4200),
+                (Changing::S3pt, BASE + 0x5000, BASE + 0x5034),
+            ]
+        );
+        // An unreadable RSDP locates nothing, and says so.
+        let none = changing_ranges(0x10, &mut copy_from(&mem));
+        assert_eq!(
+            (none.ranges().len(), none.unlocated),
+            (0, Some("the RSDP could not be read"))
+        );
+        // FIRMWARE_CTRL naming a second FACS, which §5.2.9 forbids beside a non-zero
+        // X_FIRMWARE_CTRL: both are guarded.
+        let mut two = mem.clone();
+        two[0x7000..0x7004].copy_from_slice(b"FACS");
+        two[0x7004..0x7008].copy_from_slice(&64u32.to_le_bytes());
+        two[0x1000 + 36..0x1000 + 40].copy_from_slice(&((BASE + 0x7000) as u32).to_le_bytes());
+        reseal(&mut two[0x1000..0x1000 + 276]);
+        let found = changing_ranges(rsdp_at, &mut copy_from(&two));
+        assert_eq!(
+            &found.ranges()[..2],
+            &[
+                (Changing::Facs, BASE + 0x2000, BASE + 0x2040),
+                (Changing::Facs, BASE + 0x7000, BASE + 0x7040),
+            ]
+        );
+        // A FACS that declares more than 64 bytes is guarded whole while it covers no table the
+        // kernel lends (the review of TASKS item 71: no longer cut at 1 MiB)...
+        let mut big = mem.clone();
+        big[0x2004..0x2008].copy_from_slice(&0x800u32.to_le_bytes());
+        let found = changing_ranges(rsdp_at, &mut copy_from(&big));
+        assert_eq!(found.unlocated, None);
+        assert_eq!(
+            found.ranges()[0],
+            (Changing::Facs, BASE + 0x2000, BASE + 0x2800)
+        );
+        assert_eq!(found.met(), 0);
+        // ...and, when it would cover one, still recorded, cut at the first such table that
+        // starts beyond its 64 bytes, here the FPDT, and reported, with the MADT it also covers
+        // (the addendum review of TASKS item 71, T71-9: trimmed, never dropped).
+        big[0x2004..0x2008].copy_from_slice(&u32::MAX.to_le_bytes());
+        let found = changing_ranges(rsdp_at, &mut copy_from(&big));
+        assert_eq!((found.unlocated, found.passed_over), (None, None));
+        assert_eq!(
+            found.ranges()[0],
+            (Changing::Facs, BASE + 0x2000, BASE + 0x3000)
+        );
+        assert_eq!(
+            found.overlaps()[0],
+            Overlaps {
+                declared_end: BASE + 0x2000 + u64::from(u32::MAX),
+                over_minimum: None,
+                trimmed_at: Some((BASE + 0x3000, BASE + 0x3000 + 36 + 32)),
+                tables: 2,
+            }
+        );
+        assert_eq!(found.met(), 1);
+        // A FADT whose checksum fails is not the one the kernel's lookups take, so its FACS is
+        // not first; it is still located, after the FPDT's tables, as every other FADT's is (the
+        // addendum review of TASKS item 71, T71-11).
+        let mut bad = mem.clone();
+        bad[0x1000 + 9] ^= 1;
+        let found = changing_ranges(rsdp_at, &mut copy_from(&bad));
+        assert_eq!((found.unlocated, found.unkept), (None, 0));
+        assert_eq!(
+            found.ranges(),
+            &[
+                (Changing::Fbpt, BASE + 0x4000, BASE + 0x4200),
+                (Changing::S3pt, BASE + 0x5000, BASE + 0x5034),
+                (Changing::Facs, BASE + 0x2000, BASE + 0x2040),
+            ]
+        );
+        // An XSDT entry that cannot be read is noted (T71-1): it might have been the FADT.
+        let mut gap = mem.clone();
+        gap[0x100 + 36..0x100 + 44].copy_from_slice(&0x10u64.to_le_bytes());
+        reseal(&mut gap[0x100..0x100 + 36 + 24]);
+        let found = changing_ranges(rsdp_at, &mut copy_from(&gap));
+        assert_eq!(
+            found.unlocated,
+            Some("an XSDT entry could not be read to locate them")
+        );
+    }
+
+    /// A machine with the RSDP, an XSDT listing `entries` (each address and its table), and any
+    /// other structures, at [`BASE`].
+    fn machine_of(entries: &[(u64, Vec<u8>)], others: &[(u64, Vec<u8>)]) -> Vec<u8> {
+        let mut mem = vec![0u8; 0x10000];
+        let mut put = |at: u64, bytes: &[u8]| {
+            let at = (at - BASE) as usize;
+            mem[at..at + bytes.len()].copy_from_slice(bytes);
+        };
+        let xsdt: Vec<u8> = entries.iter().flat_map(|(a, _)| a.to_le_bytes()).collect();
+        put(BASE + 0x100, &table(b"XSDT", &xsdt));
+        put(BASE, &rsdp(BASE + 0x100));
+        for (at, bytes) in entries.iter().chain(others) {
+            put(*at, bytes);
+        }
+        mem
+    }
+
+    /// A FADT whose `X_FIRMWARE_CTRL` is `x` and `FIRMWARE_CTRL` `legacy`.
+    fn fadt_naming(x: u64, legacy: u32) -> Vec<u8> {
+        let mut body = fadt_body();
+        body[..4].copy_from_slice(&legacy.to_le_bytes());
+        body[132 - 36..140 - 36].copy_from_slice(&x.to_le_bytes());
+        table(b"FACP", &body)
+    }
+
+    /// An FPDT of pointer `records` (type, address).
+    fn fpdt_of(records: &[(u16, u64)]) -> Vec<u8> {
+        let body: Vec<u8> = records
+            .iter()
+            .flat_map(|&(kind, at)| {
+                let mut r = kind.to_le_bytes().to_vec();
+                r.extend_from_slice(&[16, 1, 0, 0, 0, 0]);
+                r.extend_from_slice(&at.to_le_bytes());
+                r
+            })
+            .collect();
+        table(b"FPDT", &body)
+    }
+
+    /// A structure the firmware changes: its signature, then its length.
+    fn changing_at(sig: &[u8; 4], length: u32) -> Vec<u8> {
+        let mut c = sig.to_vec();
+        c.extend_from_slice(&length.to_le_bytes());
+        c
+    }
+
+    /// The review of TASKS item 71, T71-1 (a), and its addendum review, T71-11: the first valid
+    /// FADT and FPDT come first, as the kernel's lookups take the first valid table of a
+    /// signature, and only the first of each pointer record (the crate refuses a second); their
+    /// worst case, both FACS pointers and all three performance tables, fills
+    /// [`CHANGING_FIRST`] slots. Every other FADT and FPDT, valid or not, then takes the slots
+    /// left, in the XSDT's order, and each found with no slot left is counted. The review's probe
+    /// P1, three FPDTs before the FADT, leaves the FACS guarded, and first.
+    #[test]
+    fn the_first_valid_fadt_and_fpdt_come_first_then_every_other() {
+        let fpdt = |n: u64| BASE + 0x1000 + 0x100 * n;
+        let mut bad_fadt = fadt_naming(BASE + 0x9000, 0);
+        bad_fadt[9] ^= 1;
+        let entries = [
+            // Two FBPT pointers, which the crate refuses: not the first valid FPDT.
+            (fpdt(0), fpdt_of(&[(0, BASE + 0x4100), (0, BASE + 0x4400)])),
+            (
+                fpdt(1),
+                fpdt_of(&[(0, BASE + 0x4000), (1, BASE + 0x5000), (2, BASE + 0x6000)]),
+            ),
+            (fpdt(2), fpdt_of(&[(0, BASE + 0x4200), (1, BASE + 0x5100)])),
+            (fpdt(3), fpdt_of(&[(0, BASE + 0x4300)])),
+            (BASE + 0x2000, bad_fadt),
+            (
+                BASE + 0x2400,
+                fadt_naming(BASE + 0x3000, (BASE + 0x3100) as u32),
+            ),
+            (BASE + 0x2800, fadt_naming(BASE + 0x3200, 0)),
+        ];
+        let others = [
+            (BASE + 0x3000, changing_at(b"FACS", 64)),
+            (BASE + 0x3100, changing_at(b"FACS", 64)),
+            (BASE + 0x3200, changing_at(b"FACS", 64)),
+            (BASE + 0x4000, changing_at(b"FBPT", 0x40)),
+            (BASE + 0x4100, changing_at(b"FBPT", 0x40)),
+            (BASE + 0x4400, changing_at(b"FBPT", 0x40)),
+            (BASE + 0x4200, changing_at(b"FBPT", 0x40)),
+            (BASE + 0x4300, changing_at(b"FBPT", 0x40)),
+            (BASE + 0x5000, changing_at(b"S3PT", 0x40)),
+            (BASE + 0x5100, changing_at(b"S3PT", 0x40)),
+            // An MBPT of its least length, 72 bytes (T71-12).
+            (BASE + 0x6000, changing_at(b"MBPT", 0x48)),
+            (BASE + 0x9000, changing_at(b"FACS", 64)),
+        ];
+        let mem = machine_of(&entries, &others);
+        let found = changing_ranges(BASE, &mut copy_from(&mem));
+        assert_eq!(found.passed_over, None);
+        // The first FPDT, with two FBPT records, the crate refuses: its tables are not located.
+        assert_eq!(
+            found.unlocated,
+            Some("an FPDT's records could not be read to locate its tables")
+        );
+        assert_eq!(
+            found.ranges(),
+            &[
+                (Changing::Facs, BASE + 0x3000, BASE + 0x3040),
+                (Changing::Facs, BASE + 0x3100, BASE + 0x3140),
+                (Changing::Fbpt, BASE + 0x4000, BASE + 0x4040),
+                (Changing::S3pt, BASE + 0x5000, BASE + 0x5040),
+                (Changing::Mbpt, BASE + 0x6000, BASE + 0x6048),
+                (Changing::Fbpt, BASE + 0x4200, BASE + 0x4240),
+                (Changing::S3pt, BASE + 0x5100, BASE + 0x5140),
+                (Changing::Fbpt, BASE + 0x4300, BASE + 0x4340),
+            ]
+        );
+        assert_eq!(found.ranges().len(), CHANGING_MAX);
+        // No slot left for the invalid FADT's FACS or the last FADT's.
+        assert_eq!(found.unkept, 2);
+        let mut registry = crate::reserved::Lending::new();
+        let ranges: Vec<(u64, u64)> = found.ranges().iter().map(|&(_, b, e)| (b, e)).collect();
+        let kept = registry.never_lend(&ranges);
+        assert_eq!((kept.recorded, kept.untracked), (CHANGING_MAX, 0));
+        // P1: a lend into the FACS's middle is refused.
+        assert!(!registry.lend(BASE + 0x3010, BASE + 0x3018));
+        // What found no slot, and what the refused FPDT names, is guarded only at its start, by
+        // its signature (N3).
+        for unkept in [0x3200, 0x4100, 0x4400, 0x9000] {
+            assert!(
+                !registry.never_lent(BASE + unkept, BASE + unkept + 8),
+                "{unkept:#x}"
+            );
+        }
+        // The other order, the FADTs first, and a later FPDT that names a kind the first does
+        // not: the first of each comes first, then the later FADT's FACS and FPDT's tables, all
+        // with room.
+        let entries = [
+            (BASE + 0x2400, fadt_naming(BASE + 0x3000, 0)),
+            (BASE + 0x2800, fadt_naming(BASE + 0x3200, 0)),
+            (fpdt(0), fpdt_of(&[(0, BASE + 0x4000), (1, BASE + 0x5000)])),
+            (fpdt(1), fpdt_of(&[(0, BASE + 0x4200), (2, BASE + 0x6000)])),
+        ];
+        let mem = machine_of(&entries, &others);
+        let found = changing_ranges(BASE, &mut copy_from(&mem));
+        assert_eq!((found.unlocated, found.unkept), (None, 0));
+        assert_eq!(
+            found.ranges(),
+            &[
+                (Changing::Facs, BASE + 0x3000, BASE + 0x3040),
+                (Changing::Fbpt, BASE + 0x4000, BASE + 0x4040),
+                (Changing::S3pt, BASE + 0x5000, BASE + 0x5040),
+                (Changing::Facs, BASE + 0x3200, BASE + 0x3240),
+                (Changing::Fbpt, BASE + 0x4200, BASE + 0x4240),
+                (Changing::Mbpt, BASE + 0x6000, BASE + 0x6048),
+            ]
+        );
+    }
+
+    /// The review of TASKS item 71, T71-2 and its probe P2: a pointer that names no structure of
+    /// its kind is reported and not recorded, and one whose declared length would cover the
+    /// tables the kernel lends is recorded only up to the first of them (the addendum review,
+    /// T71-9), so neither blocks a table lookup: the MADT, MCFG, SPCR and FADT stay readable.
+    #[test]
+    fn a_pointer_that_names_no_structure_blocks_no_lookup() {
+        use crate::reserved::Lending;
+        use std::cell::RefCell;
+        const XSDT_AT: u64 = BASE + 0x100;
+        let entries = [
+            // P2: X_FIRMWARE_CTRL names the XSDT.
+            (BASE + 0x1000, fadt_naming(XSDT_AT, 0)),
+            // An FBPT pointer naming a structure that begins "FBPT" and declares a length that
+            // covers every table; an S3PT pointer naming the MADT.
+            (
+                BASE + 0x1400,
+                fpdt_of(&[(0, BASE + 0x80), (1, BASE + 0x2000)]),
+            ),
+            (BASE + 0x2000, madt(&[&lapic(0, 0, 1)])),
+            (BASE + 0x2400, table(b"MCFG", &[0u8; 8])),
+            (BASE + 0x2800, table(b"SPCR", &[0u8; 44])),
+        ];
+        let mem = machine_of(&entries, &[(BASE + 0x80, changing_at(b"FBPT", 0x8000))]);
+        let found = changing_ranges(BASE, &mut copy_from(&mem));
+        assert_eq!(found.ranges(), &[(Changing::Fbpt, BASE + 0x80, XSDT_AT)]);
+        assert_eq!(
+            found.passed_over,
+            Some((Changing::Facs, XSDT_AT, XSDT_AT + 64))
+        );
+        assert_eq!(
+            found.unlocated,
+            Some("a pointer to a structure the firmware changes names something else")
+        );
+        // The FBPT alone: recorded up to the XSDT, the first table it would cover, and that
+        // reported, with the other five it would cover (the FADT, FPDT, MADT, MCFG and SPCR).
+        let mut fbpt_only = entries.to_vec();
+        fbpt_only[0].1 = fadt_naming(0, 0);
+        fbpt_only[1].1 = fpdt_of(&[(0, BASE + 0x80)]);
+        let fbpt_only = machine_of(&fbpt_only, &[(BASE + 0x80, changing_at(b"FBPT", 0x8000))]);
+        let fbpt = changing_ranges(BASE, &mut copy_from(&fbpt_only));
+        assert_eq!((fbpt.unlocated, fbpt.passed_over), (None, None));
+        assert_eq!(fbpt.ranges(), &[(Changing::Fbpt, BASE + 0x80, XSDT_AT)]);
+        let met = fbpt.overlaps()[0];
+        assert_eq!(
+            (met.declared_end, met.over_minimum, met.tables),
+            (BASE + 0x8080, None, 6)
+        );
+        assert_eq!(met.trimmed_at.map(|(b, _)| b), Some(XSDT_AT));
+        // Through the kernel's lookup, every table stays readable.
+        let mem: &'static [u8] = Vec::leak(mem);
+        let registry = RefCell::new(Lending::new());
+        let mut located = || registry.borrow().located();
+        let mut record = |found: &ChangingRanges| {
+            let ranges: Vec<(u64, u64)> = found.ranges().iter().map(|&(_, b, e)| (b, e)).collect();
+            registry.borrow_mut().never_lend(&ranges);
+        };
+        let mut copy = copy_from(mem);
+        let mut lend = |addr: u64, len: usize| -> Result<&'static [u8], &'static str> {
+            let at = (addr - BASE) as usize;
+            let bytes = mem.get(at..at + len).ok_or("not firmware memory")?;
+            if registry.borrow_mut().lend(addr, addr + len as u64) {
+                Ok(bytes)
+            } else {
+                Err("refused")
+            }
+        };
+        for sig in [b"APIC", b"MCFG", b"SPCR", b"FACP"] {
+            let t = lookup(BASE, sig, &mut located, &mut record, &mut copy, &mut lend);
+            assert_eq!(t.map(|t| &t[..4]), Ok(&sig[..]), "{sig:?}");
+        }
+    }
+
+    /// A table lookup's result, for [`lookups_over`].
+    type Looked = Result<&'static [u8], &'static str>;
+    /// The lending registry [`lookups_over`] shares with its caller.
+    type Shared = std::rc::Rc<std::cell::RefCell<crate::reserved::Lending>>;
+
+    /// A lookup through a registry that holds what [`changing_ranges`] found at `mem`'s RSDP, as
+    /// the kernel's first lookup records it; and the registry, to test lends against.
+    fn lookups_over(mem: Vec<u8>) -> (impl FnMut(&[u8; 4]) -> Looked, Shared) {
+        use crate::reserved::Lending;
+        use std::{cell::RefCell, rc::Rc};
+        let mem: &'static [u8] = Vec::leak(mem);
+        let registry = Rc::new(RefCell::new(Lending::new()));
+        let reg = Rc::clone(&registry);
+        let lookup_in = move |sig: &[u8; 4]| {
+            let mut located = || reg.borrow().located();
+            let mut record = |found: &ChangingRanges| {
+                let ranges: Vec<(u64, u64)> =
+                    found.ranges().iter().map(|&(_, b, e)| (b, e)).collect();
+                reg.borrow_mut().never_lend(&ranges);
+            };
+            let mut lend = |addr: u64, len: usize| -> Result<&'static [u8], &'static str> {
+                let at = (addr - BASE) as usize;
+                let bytes = mem.get(at..at + len).ok_or("not firmware memory")?;
+                if reg.borrow_mut().lend(addr, addr + len as u64) {
+                    Ok(bytes)
+                } else {
+                    Err("refused")
+                }
+            };
+            lookup(
+                BASE,
+                sig,
+                &mut located,
+                &mut record,
+                &mut copy_from(mem),
+                &mut lend,
+            )
+        };
+        (lookup_in, registry)
+    }
+
+    /// The addendum review of TASKS item 71, T71-9 and its probe P4: a listed table, valid, whose
+    /// declared extent runs over a genuine FACS, from 0x80 bytes before it for 0x100. The FACS is
+    /// recorded at its 64 bytes and the table reported; a lookup of that table is refused, and no
+    /// lend over the FACS is made, while every other table stays readable.
+    #[test]
+    fn a_table_over_a_structure_is_refused_and_the_structure_kept() {
+        const FACS_AT: u64 = BASE + 0x3000;
+        const OEM_AT: u64 = FACS_AT - 0x80;
+        let mut facs = changing_at(b"FACS", 64);
+        facs.resize(64, 0);
+        // The table holds the FACS's bytes, and its checksum counts them: a valid table.
+        let mut oem = table(b"OEMX", &[0u8; 0x100 - 36]);
+        oem[0x80..0xC0].copy_from_slice(&facs);
+        reseal(&mut oem);
+        assert!(check_table(&oem, b"OEMX").is_ok());
+        let entries = [
+            (BASE + 0x1000, fadt_naming(FACS_AT, 0)),
+            (BASE + 0x2000, madt(&[&lapic(0, 0, 1)])),
+            (OEM_AT, oem),
+        ];
+        let mem = machine_of(&entries, &[(FACS_AT, facs)]);
+        let found = changing_ranges(BASE, &mut copy_from(&mem));
+        assert_eq!((found.unlocated, found.passed_over), (None, None));
+        assert_eq!(found.ranges(), &[(Changing::Facs, FACS_AT, FACS_AT + 64)]);
+        assert_eq!(
+            found.overlaps(),
+            &[Overlaps {
+                declared_end: FACS_AT + 64,
+                over_minimum: Some((OEM_AT, OEM_AT + 0x100)),
+                trimmed_at: None,
+                tables: 1,
+            }]
+        );
+        assert_eq!(found.met(), 1);
+        let (mut lookup_in, registry) = lookups_over(mem);
+        assert_eq!(lookup_in(b"OEMX"), Err("refused"));
+        for sig in [b"APIC", b"FACP"] {
+            assert_eq!(lookup_in(sig).map(|t| &t[..4]), Ok(&sig[..]), "{sig:?}");
+        }
+        let registry = registry.borrow();
+        assert!(registry.guards(FACS_AT + 32, FACS_AT + 40));
+        assert!(
+            registry
+                .lent()
+                .iter()
+                .all(|&(b, e)| e <= FACS_AT || FACS_AT + 64 <= b),
+            "{:x?}",
+            registry.lent()
+        );
+    }
+
+    /// The addendum review of TASKS item 71, T71-9: a structure whose declared length runs over
+    /// tables listed beyond its minimum is guarded up to the first of them, which, with the
+    /// table after it, stays readable and is reported; a table over its minimum is refused, and
+    /// reported first.
+    #[test]
+    fn a_structure_is_trimmed_at_a_table_beyond_its_minimum() {
+        const FACS_AT: u64 = BASE + 0x3000;
+        const NEAR: u64 = FACS_AT + 0x100;
+        const FAR: u64 = FACS_AT + 0x200;
+        let entries = [
+            (BASE + 0x1000, fadt_naming(FACS_AT, 0)),
+            (FAR, table(b"OEMB", &[])),
+            (NEAR, table(b"OEMA", &[])),
+        ];
+        let mut facs = changing_at(b"FACS", 0x400);
+        facs.resize(64, 0);
+        let mem = machine_of(&entries, &[(FACS_AT, facs.clone())]);
+        let found = changing_ranges(BASE, &mut copy_from(&mem));
+        assert_eq!((found.unlocated, found.passed_over), (None, None));
+        assert_eq!(found.ranges(), &[(Changing::Facs, FACS_AT, NEAR)]);
+        assert_eq!(
+            found.overlaps(),
+            &[Overlaps {
+                declared_end: FACS_AT + 0x400,
+                over_minimum: None,
+                trimmed_at: Some((NEAR, NEAR + 36)),
+                tables: 2,
+            }]
+        );
+        let (mut lookup_in, registry) = lookups_over(mem);
+        for sig in [b"OEMA", b"OEMB"] {
+            assert_eq!(lookup_in(sig).map(|t| &t[..4]), Ok(&sig[..]), "{sig:?}");
+        }
+        // What lies between the minimum and the cut stays guarded.
+        assert!(registry.borrow().guards(FACS_AT + 0x80, FACS_AT + 0x88));
+        // A third table over the minimum: refused, and reported as well as the cut.
+        let mut over = entries.to_vec();
+        over.push((FACS_AT - 0x10, table(b"OEMC", &[])));
+        let mem = machine_of(&over, &[(FACS_AT, facs)]);
+        let found = changing_ranges(BASE, &mut copy_from(&mem));
+        assert_eq!(found.ranges(), &[(Changing::Facs, FACS_AT, NEAR)]);
+        let met = found.overlaps()[0];
+        assert_eq!(
+            (met.over_minimum, met.trimmed_at, met.tables),
+            (
+                Some((FACS_AT - 0x10, FACS_AT + 0x14)),
+                Some((NEAR, NEAR + 36)),
+                3
+            )
+        );
+        let (mut lookup_in, _) = lookups_over(mem);
+        assert_eq!(lookup_in(b"OEMC"), Err("refused"));
+        assert_eq!(lookup_in(b"OEMA").map(|t| &t[..4]), Ok(&b"OEMA"[..]));
+    }
+
+    /// The second addendum review of TASKS item 71, T71-12: a performance table's minimum is its
+    /// header and the record ACPI 6.6 says its length covers at the least (FBPT 56, S3PT 32,
+    /// MBPT 72). A listed table at the header's end, or at the review's probe (FBPT + 0x30), is
+    /// over the minimum, so it is refused and the structure kept whole; one at the minimum's end
+    /// is lent, and the structure cut there.
+    #[test]
+    fn a_performance_tables_minimum_holds_its_record() {
+        const AT: u64 = BASE + 0x4000;
+        // An FPDT must hold an FBPT pointer record (the crate refuses one without), so the S3PT's
+        // and MBPT's machines have an FBPT elsewhere too.
+        const OTHER_FBPT: u64 = BASE + 0x8000;
+        let case = |kind: Changing, record: u16, offset: u64| {
+            let mut sig = [0u8; 4];
+            sig.copy_from_slice(kind.name().as_bytes());
+            let mut records = vec![(record, AT)];
+            let mut others = vec![(AT, changing_at(&sig, 0x200))];
+            if kind != Changing::Fbpt {
+                records.push((0, OTHER_FBPT));
+                others.push((OTHER_FBPT, changing_at(b"FBPT", 0x40)));
+            }
+            let entries = [
+                (BASE + 0x1000, fadt_naming(0, 0)),
+                (BASE + 0x1400, fpdt_of(&records)),
+                (AT + offset, table(b"OEMX", &[])),
+            ];
+            let mem = machine_of(&entries, &others);
+            let found = changing_ranges(BASE, &mut copy_from(&mem));
+            assert_eq!((found.unlocated, found.passed_over), (None, None));
+            let i = found.ranges().iter().position(|r| r.1 == AT).unwrap();
+            let (mut lookup_in, _) = lookups_over(mem);
+            let lent = lookup_in(b"OEMX").map(|t| t.len());
+            (found.ranges()[i], found.overlaps()[i], lent)
+        };
+        for (kind, record, header) in [
+            (Changing::Fbpt, 0, 8),
+            (Changing::S3pt, 1, 8),
+            (Changing::Mbpt, 2, 24),
+        ] {
+            let minimum = kind.minimum();
+            assert_eq!(
+                minimum,
+                header + if kind == Changing::S3pt { 24 } else { 48 }
+            );
+            // Inside the minimum, at the header's end (where the minimum ended before T71-12)
+            // and at its last byte: refused, and the structure guarded to its declared end.
+            for offset in [header, minimum - 1] {
+                let (range, met, lent) = case(kind, record, offset);
+                assert_eq!(range, (kind, AT, AT + 0x200), "{kind:?} {offset:#x}");
+                assert_eq!(
+                    (met.over_minimum, met.trimmed_at, met.tables),
+                    (Some((AT + offset, AT + offset + 36)), None, 1),
+                    "{kind:?} {offset:#x}"
+                );
+                assert_eq!(lent, Err("refused"), "{kind:?} {offset:#x}");
+            }
+            // At the minimum's end: lent, and the structure cut there.
+            let (range, met, lent) = case(kind, record, minimum);
+            assert_eq!(range, (kind, AT, AT + minimum), "{kind:?}");
+            assert_eq!(
+                (met.over_minimum, met.trimmed_at, met.tables),
+                (None, Some((AT + minimum, AT + minimum + 36)), 1),
+                "{kind:?}"
+            );
+            assert_eq!(lent, Ok(36), "{kind:?}");
+        }
+        // The review's probe: a table at FBPT + 0x30, over its Host Firmware Boot Performance
+        // Data Record, which T71-9's minimum of 8 lent.
+        let (range, met, lent) = case(Changing::Fbpt, 0, 0x30);
+        assert_eq!(range, (Changing::Fbpt, AT, AT + 0x200));
+        assert_eq!(met.over_minimum, Some((AT + 0x30, AT + 0x54)));
+        assert_eq!(lent, Err("refused"));
+    }
+
+    /// TASKS item 71, ruling addition 2: the first lookup locates and records the changing
+    /// structures before it lends anything, a later one does not locate them again, and nothing
+    /// is lent over them, the FACS's middle included.
+    #[test]
+    fn the_first_lookup_records_before_it_lends() {
+        use crate::reserved::Lending;
+        use std::cell::RefCell;
+        let (mem, rsdp_at) = machine_memory();
+        let mem: &'static [u8] = Vec::leak(mem);
+        let registry = RefCell::new(Lending::new());
+        let events = RefCell::new(Vec::<&'static str>::new());
+        let mut located = || registry.borrow().located();
+        let mut record = |found: &ChangingRanges| {
+            events.borrow_mut().push("record");
+            let ranges: Vec<(u64, u64)> = found.ranges().iter().map(|&(_, b, e)| (b, e)).collect();
+            registry.borrow_mut().never_lend(&ranges);
+        };
+        let mut copy = |addr: u64, out: &mut [u8]| {
+            events.borrow_mut().push("copy");
+            copy_from(mem)(addr, out)
+        };
+        let mut lend = |addr: u64, len: usize| -> Result<&'static [u8], &'static str> {
+            events.borrow_mut().push("lend");
+            let at = (addr - BASE) as usize;
+            let bytes = mem.get(at..at + len).ok_or("not firmware memory")?;
+            if registry.borrow_mut().lend(addr, addr + len as u64) {
+                Ok(bytes)
+            } else {
+                Err("refused")
+            }
+        };
+        // Before any lookup, nothing may be lent.
+        assert_eq!(lend(BASE + 0x6000, 36), Err("refused"));
+        events.borrow_mut().clear();
+        let madt_found = lookup(
+            rsdp_at,
+            b"APIC",
+            &mut located,
+            &mut record,
+            &mut copy,
+            &mut lend,
+        );
+        assert_eq!(madt_found.map(|t| &t[..4]), Ok(&b"APIC"[..]));
+        let log = events.borrow().clone();
+        let recorded = log.iter().position(|&e| e == "record").unwrap();
+        let first_lend = log.iter().position(|&e| e == "lend").unwrap();
+        assert!(recorded < first_lend, "{log:?}");
+        assert!(log[..recorded].iter().all(|&e| e == "copy"), "{log:?}");
+        // A second lookup finds the ranges recorded and does not locate them again.
+        events.borrow_mut().clear();
+        assert!(
+            lookup(
+                rsdp_at,
+                b"FPDT",
+                &mut located,
+                &mut record,
+                &mut copy,
+                &mut lend
+            )
+            .is_ok()
+        );
+        assert!(!events.borrow().contains(&"record"));
+        // Nothing is lent over a changing structure: its start, its middle, or across its end.
+        for (at, len) in [
+            (0x2000, 36),
+            (0x2010, 16),
+            (0x203F, 8),
+            (0x4100, 36),
+            (0x5000, 8),
+        ] {
+            assert_eq!(lend(BASE + at, len), Err("refused"), "{at:#x}");
+        }
+        // The stale FIRMWARE_CTRL, which points into the XSDT, blocked nothing.
+        assert!(lend(BASE + 0x100, 36).is_ok());
     }
 }
