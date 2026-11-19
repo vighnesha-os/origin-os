@@ -177,6 +177,34 @@ pub fn relied_on(table: &[u8]) -> u32 {
     }
 }
 
+/// The PM timer as the census line words it (TASKS item 71): `X_PM_TMR_BLK` and the 32-bit
+/// `PM_TMR_BLK` as the FADT gives them, and the port the kernel's own reader
+/// (`acpi::parse_fadt`) takes, as §5.2.9 says to choose it.
+struct PmTimer<'f, 'a>(&'f Fadt<'a>, Option<&'a [u8]>);
+
+impl core::fmt::Display for PmTimer<'_, '_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let fadt = self.0;
+        match fadt.x_block(Block::PmTimer) {
+            None => f.write_str("X_PM_TMR_BLK absent")?,
+            Some(g) if g.is_null() => f.write_str("X_PM_TMR_BLK zero")?,
+            Some(g) => write!(f, "X_PM_TMR_BLK {:?} {:#x}", g.space, g.address)?,
+        }
+        match fadt.port_block(Block::PmTimer) {
+            Some(r) => write!(f, ", PM_TMR_BLK port {:#x}", r.gas.address)?,
+            None => f.write_str(", PM_TMR_BLK none")?,
+        }
+        let taken = self
+            .1
+            .and_then(|b| crate::acpi::parse_fadt(b).ok())
+            .and_then(|k| k.pm_timer_port);
+        match taken {
+            Some(port) => write!(f, "; the kernel's: port {port:#x}"),
+            None => f.write_str("; the kernel's: none"),
+        }
+    }
+}
+
 /// The FADT's fields the kernel relies on that break a rule (N1): its FACS pointer, its PM1a
 /// event and control blocks and PM timer, and its reset register. The census reports every
 /// faulty field on the FADT's line; these also fail the verdict.
@@ -413,6 +441,7 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
             found.unreadable_entries = found.unreadable_entries.saturating_add(1);
         }
     }
+    let fadt_bytes = fadt;
     let fadt = fadt.and_then(|b| Fadt::parse(b).ok());
     found.fadt = fadt.is_some();
     if let Some(fadt) = &fadt {
@@ -425,7 +454,7 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
             fadt.sci_int,
             found.reduced,
             fadt.reset().map_or("none", |_| "given"),
-            fadt.block(Block::PmTimer).map_or("none", |_| "given"),
+            PmTimer(fadt, fadt_bytes),
         );
         if let Some(dsdt) = fadt.dsdt_address() {
             found.dsdt = census_at(out, fw, &mut found, "the DSDT", dsdt, Some(b"DSDT")).is_some();
@@ -746,6 +775,13 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("FACS version 2, 64 bytes: checked"), "{out}");
+        // TASKS item 71: the PM timer's two forms, and the one the kernel's reader takes.
+        assert!(
+            out.contains(
+                "PM timer X_PM_TMR_BLK zero, PM_TMR_BLK port 0x608; the kernel's: port 0x608"
+            ),
+            "{out}"
+        );
         // The review's F2: the FACS is copied, never lent.
         assert!(!lent.contains(&FACS));
     }
