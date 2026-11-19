@@ -227,6 +227,11 @@ Ledger 64 §3 G15 says ACPICA writes a string's bytes as one buffer, cut to the 
 - **Strings follow buffers,** so the String row holds exactly only for fields of 8 bits. Into a narrower field a one-character string is one write, its upper bits lost, as that row says; `"AB"` into a 4-bit field is four writes where the row gives two. Into a wider field a string that fits departs from the row too (found by the review of B5's answers, B5-R13): `"AB"` into a 16-bit field is one write, 0x4241, where the row gives two, a character each, leaving 0x0042.
 - **A `Pieces` report seen on real firmware is a finding,** and this choice is revisited with that evidence.
 
+**Three more differences from ACPICA** (named by the similarity check of step B5's code, `docs/engineering/SIMILARITY_T63_B5_2026-11-19.md`, TASKS 64's session, commit `a51c83c4` on `docs/similarity-t63-b5`; recorded at the coordinating session's request of 2026-11-19, each kept as built):
+- **An unterminated string literal** (G13): Origin's literal holds every byte up to the end of its enclosing range, and writes nothing into the table. ACPICA writes a zero into the range's last byte and ends the literal there, so its literal is one byte shorter.
+- **An Embedded Controller field over 255 bytes** (G5; B5's contract, Q6): Origin refuses it with `Range`. ACPICA keeps the field's ordinary access width, with no error.
+- **`Stall`'s operand** (G7, ruled unchanged): Origin refuses any value above 255. ACPICA first cuts the operand to 32 bits.
+
 **`Load` and `LoadTable`: what step B4 built, and its strict choices** (S1 §19.6.77 and §19.6.78, PDF 1070 and 1071, read again on 2026-11-18; B4's contract, accepted with its twelve questions as recommended the same day). Paraphrased:
 
 - **What the text asks.**

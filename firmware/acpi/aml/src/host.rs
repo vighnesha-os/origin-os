@@ -127,7 +127,7 @@ pub struct RegionAccess<'a> {
 /// lies in them (its offset within the first byte, and its bits). A read fills `data`; a write
 /// sends it, the bits outside the field already merged by the field's update rule (for Preserve,
 /// by a read transfer first). A host for the ACPI service makes it one Embedded Controller
-/// transaction, as ACPICA's hosts do (TASKS 64's ledger §3, G5).
+/// transaction, as ACPICA does (TASKS 64's ledger §3, G5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BufferAccess<'a> {
     /// The space.
