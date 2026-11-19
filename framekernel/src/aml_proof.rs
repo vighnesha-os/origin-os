@@ -276,9 +276,9 @@ pub struct Tolerance {
 impl Tolerance {
     fn of(r: &Report<'_>) -> Self {
         let (what, at, error) = match *r {
-            Report::Abandoned { error, statement, .. } => {
-                ("a statement abandoned", Some(statement), Some(error.kind))
-            }
+            Report::Abandoned {
+                error, statement, ..
+            } => ("a statement abandoned", Some(statement), Some(error.kind)),
             Report::AlreadyLoaded { .. } => ("a table already loaded", None, None),
             Report::UnboundElement { at } => ("a package name bound to nothing", Some(at), None),
             Report::ExtraElements { at, .. } => ("a package with extra elements", Some(at), None),
@@ -968,7 +968,11 @@ fn interpret<H: Host>(
     // item 63, step B5; the coordinating session's ruling on B5's contract, Q9).
     if seen.tolerated != 0 {
         if let Some(t) = seen.first_tolerance {
-            let _ = writeln!(out, "{LINE}tolerated {} time(s); the first: {t}", seen.tolerated);
+            let _ = writeln!(
+                out,
+                "{LINE}tolerated {} time(s); the first: {t}",
+                seen.tolerated
+            );
         }
         found.fail(TOLERATED);
     }

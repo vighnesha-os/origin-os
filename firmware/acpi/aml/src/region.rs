@@ -720,7 +720,7 @@ impl<H: Host> Interpreter<H> {
         src: &[u8],
         data: &mut [u8],
     ) -> Result<Val> {
-        if shift != 0 || f.bit_len % 8 != 0 {
+        if shift != 0 || !f.bit_len.is_multiple_of(8) {
             match f.update {
                 0 => self.ec_transfer(f, r, address, false, data)?,
                 1 => data.fill(0xFF),
