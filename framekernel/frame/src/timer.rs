@@ -13,7 +13,8 @@
 //! 4. run the APIC timer periodically at [`HZ`], take [`PROOF_TICKS`] interrupts while
 //!    polling with interrupt windows (never halting, so a lost interrupt cannot hang the
 //!    check past its two-second deadline), and check the TSC-measured time; a run a stall
-//!    made slow is measured again, up to [`PROOF_ATTEMPTS`] runs ([`apic::judge_ticks`]);
+//!    made slow, or whose ten consecutive gaps came too close, is measured again, up to
+//!    [`PROOF_ATTEMPTS`] runs ([`apic::judge_ticks`]);
 //! 5. mask the timer again: nothing schedules on it yet (M3).
 
 use core::fmt::Write;
@@ -36,9 +37,9 @@ use crate::port::{inb, outb};
 pub const HZ: u64 = 100;
 /// Interrupts to take.
 const PROOF_TICKS: u64 = 50;
-/// Runs the periodic proof may make: another only after a run that a stall made slow
+/// Runs the periodic proof may make: another only after a run that said nothing about the rate
 /// ([`apic::TickVerdict::Stalled`]), each against the same bounds. Each run is at most 2 s, so
-/// a boot pays for more only while stalled (TASKS item 66).
+/// a boot pays for more only while disturbed (TASKS item 66).
 const PROOF_ATTEMPTS: u32 = 4;
 /// Calibration window.
 const CALIBRATION_MICROS: u64 = 10_000;
@@ -533,14 +534,14 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
     // Never faster than programmed (at least 95 % of the nominal time: a calibration error
     // shows here), and at most 50 % slower (an emulator may coalesce late expiries, but a
     // gross error, such as a wrong divisor, still fails). Physical hardware qualification
-    // will tighten the upper bound (CLAUDE.md §74). A run that a stall made slow, and only
-    // such a run, is measured again against the same bounds (`apic::judge_ticks`).
+    // will tighten the upper bound (CLAUDE.md §74). A run that a stall made slow, or whose ten
+    // consecutive gaps came too close, and only such a run, is measured again against the same
+    // bounds (`apic::judge_ticks`).
     let period = tsc_hz / HZ;
     let micros = |ticks: u64| ticks.saturating_mul(1_000_000) / tsc_hz.max(1);
     let expected = PROOF_TICKS * 1_000_000 / HZ;
     let mut stamps = [0u64; PROOF_TICKS as usize];
     let mut attempts = 0;
-    let mut stalled_gap = 0;
     let (run, taken, lasted) = loop {
         attempts += 1;
         let (start, taken, end) = take_ticks(&lapic, count, tsc_hz, &mut stamps);
@@ -555,37 +556,48 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
             };
             break (run, taken, lasted);
         }
-        stalled_gap = stalled_gap.max(run.longest_gap);
-    };
-    let repeated = if attempts > 1 {
-        // The repeat is a finding on a machine without a hypervisor (ADR-0013's note of TASKS
-        // item 66): it is always said.
-        Some((attempts, micros(stalled_gap) / 1000))
-    } else {
-        None
+        // Each run measured again is said, with what made it say nothing: a repeat is a finding
+        // on a machine without a hypervisor (ADR-0013's note of TASKS item 66). Lines stay under
+        // the console's 160 bytes (the review's T66-R7).
+        let _ = write!(
+            com1,
+            "origin-kernel: APIC timer: run {attempts} of {PROOF_ATTEMPTS} disturbed ({taken} ticks in {} ms, longest gap {} ms",
+            micros(run.elapsed) / 1000,
+            micros(run.longest_gap) / 1000
+        );
+        if let Some(ten) = run.least_ten {
+            let _ = write!(com1, ", least ten gaps {} ms", micros(ten) / 1000);
+        }
+        let _ = writeln!(com1, "), measured again");
     };
     if run.verdict != TickVerdict::InBounds {
-        // Under the console's 160-byte line (the review's T66-R7).
-        let _ = writeln!(
+        let _ = write!(
             com1,
-            "origin-kernel: {taken} ticks in {} us, not {PROOF_TICKS} in {expected} (median gap {} us, longest {} us, run {attempts} of {PROOF_ATTEMPTS}{}): APIC timer is wrong",
+            "origin-kernel: {taken} ticks in {} us, not {PROOF_TICKS} in {expected} (median gap {} us, longest {} us",
             micros(lasted),
             micros(run.median_gap),
-            micros(run.longest_gap),
-            if repeated.is_some() { ", stalled" } else { "" }
+            micros(run.longest_gap)
+        );
+        if let Some(ten) = run.least_ten {
+            let _ = write!(com1, ", least ten {} us", micros(ten));
+        }
+        let _ = writeln!(
+            com1,
+            ", run {attempts} of {PROOF_ATTEMPTS}): APIC timer is wrong"
         );
         return None;
     }
     let _ = write!(
         com1,
-        "origin-kernel: APIC timer: {PROOF_TICKS} interrupts at {HZ} Hz in {} ms (initial count {count})",
+        "origin-kernel: APIC timer: {PROOF_TICKS} interrupts at {HZ} Hz in {} ms (initial count {count}",
         micros(run.elapsed) / 1000
     );
-    if let Some((attempts, gap_ms)) = repeated {
-        let _ = write!(
-            com1,
-            ", run {attempts} of {PROOF_ATTEMPTS} (after a stalled run: a gap of {gap_ms} ms)"
-        );
+    if let Some(ten) = run.least_ten {
+        let _ = write!(com1, ", least ten gaps {} ms", micros(ten) / 1000);
+    }
+    let _ = write!(com1, ")");
+    if attempts > 1 {
+        let _ = write!(com1, ", run {attempts} of {PROOF_ATTEMPTS}");
     }
     let _ = writeln!(com1);
     PERIOD.store(count, core::sync::atomic::Ordering::Release);

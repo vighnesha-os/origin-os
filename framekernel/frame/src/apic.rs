@@ -287,17 +287,18 @@ impl CalibrationWindow {
 /// stamped with the TSC at the poll that saw each, judged against the programmed period.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TickVerdict {
-    /// All of them came, within 95 % to 150 % of their nominal time, with no gap of two periods
-    /// or more: an undisturbed run at the right rate.
+    /// All of them came, within 95 % to 150 % of their nominal time, and every ten consecutive
+    /// gaps add up to 8.5 periods or more.
     InBounds,
     /// All of them came in under 95 % of their nominal time: the rate is wrong. A stall can only
     /// make interrupts later, so this fails at once.
     TooFast,
-    /// Some gap is two periods or more, and the median gap is not over 150 % of the period:
-    /// expiries were merged while the processor was away (a virtual processor the host left
-    /// unscheduled, or an SMI). The run says nothing about the rate, whatever its total, and may
-    /// be measured again; it never passes, so a fast tick whose total a stall made look right
-    /// fails on an undisturbed run (the review's T66-R5).
+    /// The run says nothing about the rate: it is measured again, and never passes. Either it was
+    /// too slow, or too few, with the median gap between interrupts not over 150 % of the period
+    /// and some gap of two periods or more (expiries merged while the processor was away: a
+    /// virtual processor the host left unscheduled, or an SMI); or all came within their bounds
+    /// but some ten consecutive gaps add up to under 8.5 periods (a fast rate whose total a stall
+    /// made look right, the review's T66-R5, or a host that raised a tick late).
     Stalled,
     /// Too slow or too few, with nothing to show a stall, or a median gap over 150 % of the
     /// period: the rate is wrong, or the interrupts do not come.
@@ -314,6 +315,9 @@ pub struct TickRun {
     pub median_gap: u64,
     /// The longest such gap.
     pub longest_gap: u64,
+    /// The least time that ten consecutive gaps took, each counted from a stamp not shared with
+    /// the next interrupt; `None` with fewer than eleven stamps.
+    pub least_ten: Option<u64>,
 }
 
 /// The most interrupts [`judge_ticks`] looks at.
@@ -323,15 +327,25 @@ pub const MAX_TICK_STAMPS: usize = 64;
 /// the TSC at which each interrupt was seen (in order, at most [`MAX_TICK_STAMPS`] are used), the
 /// run wanted `wanted` of them, and the programmed period is `period` TSC ticks.
 ///
-/// It checks exactly this, in order: too fast, if all `wanted` came in under 95 % of their
-/// nominal time; wrong, if the median gap is over 150 % of the period; stalled, if some gap is
-/// two periods or more; in bounds, if all `wanted` came within 150 % of their nominal time; else
-/// wrong. Only the first `wanted` stamps are judged. A stall widens a few gaps and leaves the
-/// median where it was, and a slow rate moves every gap, so a slow median fails at once. A run
-/// with a stall in it is never passed, whatever its total: it is measured again, so a fast tick
-/// whose total a stall made look right fails on its next, undisturbed run. The median is not used
-/// for the fast side: under QEMU's software processor the poll-stamped gaps of a correct timer
-/// have a median of 90 to 91 % of the period (TASKS item 66's controls), while their total holds.
+/// It checks exactly this, in order, on the first `wanted` stamps only: too fast, if all `wanted`
+/// came in under 95 % of their nominal time; wrong, if the median gap is over 150 % of the
+/// period; if all `wanted` came within 150 % of their nominal time, stalled when some ten
+/// consecutive gaps (counted from a stamp not shared with the next) add up to under 8.5 periods,
+/// and in bounds otherwise; stalled, if some gap is two periods or more; else wrong.
+///
+/// A stall widens a few gaps and leaves the median where it was, and a slow rate moves every
+/// gap, so a slow median fails at once. Ten consecutive interrupts are ten distinct expiries, a
+/// period apart at least, and the first was seen before the next was raised: on a machine that
+/// raises each expiry on time their stamps span more than nine periods, whatever the stalls.
+/// A fast rate's spans are all short, so a fast rate whose total a stall made look right never
+/// passes (the review's T66-R5): it is measured again, and fails by its total on an undisturbed
+/// run, or at the last run. A short span is measured again rather than failed, because a host
+/// that raises an expiry late can take up to a period more off one span. The median is not used
+/// for the fast side, and a stall is not held against a run in bounds: under QEMU's software
+/// processor the poll-stamped gaps of a correct timer have a median of 90 to 91 % of the period,
+/// and with load on the host almost every run has a gap of two periods (TASKS item 66's controls
+/// and evidence boots), while the total holds. A rate 5 % to 15 % fast whose total a stall made
+/// look right is caught by neither: a stated limit, as before TASKS item 66.
 #[must_use]
 pub fn judge_ticks(start: u64, stamps: &[u64], wanted: usize, period: u64) -> TickRun {
     // The first `wanted` only: the run is judged against their nominal time (the review's
@@ -351,17 +365,29 @@ pub fn judge_ticks(start: u64, stamps: &[u64], wanted: usize, period: u64) -> Ti
     let median_gap = gaps.get(gaps.len() / 2).copied().unwrap_or(0);
     let elapsed = stamps.last().map_or(0, |&last| last.saturating_sub(start));
     let nominal = period.saturating_mul(wanted as u64);
-    let stalled = longest_gap >= period.saturating_mul(2);
+    // A span starts only at a stamp not shared with the next interrupt (two seen at one poll),
+    // so that its first interrupt was seen before the next was raised.
+    let least_ten = stamps
+        .windows(11)
+        .filter(|w| w.first() != w.get(1))
+        .filter_map(|w| Some(w.last()?.saturating_sub(*w.first()?)))
+        .min();
+    let uneven = least_ten.is_some_and(|ten| ten < period.saturating_mul(17) / 2);
+    let all = stamps.len() >= wanted;
     let verdict = if wanted == 0 || period == 0 || stamps.is_empty() {
         TickVerdict::Wrong
-    } else if stamps.len() >= wanted && elapsed < nominal / 100 * 95 {
+    } else if all && elapsed < nominal / 100 * 95 {
         TickVerdict::TooFast
     } else if median_gap > period / 2 * 3 {
         TickVerdict::Wrong
-    } else if stalled {
+    } else if all && elapsed <= nominal / 2 * 3 {
+        if uneven {
+            TickVerdict::Stalled
+        } else {
+            TickVerdict::InBounds
+        }
+    } else if longest_gap >= period.saturating_mul(2) {
         TickVerdict::Stalled
-    } else if stamps.len() >= wanted && elapsed <= nominal / 2 * 3 {
-        TickVerdict::InBounds
     } else {
         TickVerdict::Wrong
     };
@@ -370,6 +396,7 @@ pub fn judge_ticks(start: u64, stamps: &[u64], wanted: usize, period: u64) -> Ti
         elapsed,
         median_gap,
         longest_gap,
+        least_ten,
     }
 }
 
@@ -481,10 +508,9 @@ mod tests {
         assert_eq!(run.verdict, TickVerdict::Stalled);
         assert_eq!(run.median_gap, PERIOD);
         assert_eq!(run.longest_gap, PERIOD + 300_000_000);
-        // A stall inside the bounds is measured again too: a run with a stall in it never
-        // passes (the review's T66-R5), whatever its total.
+        // A stall inside the bounds changes nothing: it passes as before.
         let small = judge_ticks(0, &stamps(WANTED, PERIOD, 10, 200_000_000), WANTED, PERIOD);
-        assert_eq!(small.verdict, TickVerdict::Stalled);
+        assert_eq!(small.verdict, TickVerdict::InBounds);
         // Too few in the time, with a stall and the median in bounds: a repeat, not a pass.
         let short = judge_ticks(0, &stamps(30, PERIOD, 5, 1_500_000_000), WANTED, PERIOD);
         assert_eq!(short.verdict, TickVerdict::Stalled);
@@ -536,10 +562,9 @@ mod tests {
     }
 
     #[test]
-    fn a_fast_tick_masked_by_a_stall_is_never_passed() {
+    fn a_fast_tick_masked_by_a_stall_never_passes() {
         // The review's T66-R5: twice the programmed rate with a 300 ms stall, whose total
-        // (550 ms) looks in bounds. The stall earns a repeat, not a pass; undisturbed, the same
-        // tick is too fast.
+        // (550 ms) looks in bounds. Its ten consecutive gaps span five periods: measured again.
         let run = judge_ticks(
             0,
             &stamps(WANTED, PERIOD / 2, 10, 300_000_000),
@@ -547,11 +572,34 @@ mod tests {
             PERIOD,
         );
         assert_eq!(run.elapsed, 550_000_000);
+        assert_eq!(run.least_ten, Some(5 * PERIOD));
         assert_eq!(run.verdict, TickVerdict::Stalled);
-        let undisturbed = judge_ticks(0, &stamps(WANTED, PERIOD / 2, WANTED, 0), WANTED, PERIOD);
-        assert_eq!(undisturbed.verdict, TickVerdict::TooFast);
-        // A correct timer whose poll-stamped gaps jitter, two in three of them short, passes:
-        // the median is not judged on the fast side.
+        // Undisturbed, the same rate fails at once by its total.
+        let run = judge_ticks(0, &stamps(WANTED, PERIOD / 2, WANTED, 0), WANTED, PERIOD);
+        assert_eq!(run.verdict, TickVerdict::TooFast);
+        // 20 % fast, masked: eight periods in ten gaps.
+        let run = judge_ticks(
+            0,
+            &stamps(WANTED, PERIOD * 8 / 10, 10, 120_000_000),
+            WANTED,
+            PERIOD,
+        );
+        assert_eq!(run.verdict, TickVerdict::Stalled);
+        // 15 % fast, masked, is the edge: 8.5 periods in ten gaps passes, a stated limit.
+        let run = judge_ticks(
+            0,
+            &stamps(WANTED, PERIOD * 85 / 100, 10, 80_000_000),
+            WANTED,
+            PERIOD,
+        );
+        assert_eq!(run.least_ten, Some(PERIOD * 17 / 2));
+        assert_eq!(run.verdict, TickVerdict::InBounds);
+    }
+
+    #[test]
+    fn a_correct_timer_seen_unevenly_passes() {
+        // Poll-stamped gaps that jitter, two in three of them short: the median is not judged on
+        // the fast side, and ten gaps still span ten periods.
         let mut jitter = alloc::vec::Vec::new();
         let mut at = 0;
         for i in 0..WANTED as u64 {
@@ -561,8 +609,19 @@ mod tests {
         let run = judge_ticks(0, &jitter, WANTED, PERIOD);
         assert!(run.median_gap < PERIOD / 100 * 95);
         assert_eq!(run.verdict, TickVerdict::InBounds);
+        // Some ticks seen late by just under a period, the most before the next is raised.
+        let late: alloc::vec::Vec<u64> = (1..=WANTED as u64)
+            .map(|i| i * PERIOD + if i % 7 == 1 { PERIOD - 1 } else { 0 })
+            .collect();
+        let run = judge_ticks(0, &late, WANTED, PERIOD);
+        assert_eq!(run.least_ten, Some(9 * PERIOD + 1));
+        assert_eq!(run.verdict, TickVerdict::InBounds);
+        // A stall inside the bounds passes, as before: a gap of two periods comes in almost every
+        // run with load on the host.
+        let run = judge_ticks(0, &stamps(WANTED, PERIOD, 10, 200_000_000), WANTED, PERIOD);
+        assert_eq!(run.verdict, TickVerdict::InBounds);
         // A slow median with a total in bounds is wrong: 25 gaps of 1.6 periods.
-        let mut s = stamps(25, PERIOD / 2, 25, 0);
+        let mut s = stamps(25, PERIOD, 25, 0);
         let last = *s.last().unwrap();
         s.extend((1..=25).map(|i| last + i * PERIOD * 16 / 10));
         let run = judge_ticks(0, &s, WANTED, PERIOD);
@@ -570,10 +629,26 @@ mod tests {
     }
 
     #[test]
+    fn a_stamp_shared_with_the_next_starts_no_span() {
+        // Interrupt 10 seen with interrupt 11, just before interrupt 12 was raised: from the
+        // shared stamp, ten gaps would span barely eight periods. From the next stamp they span
+        // nine.
+        let mut s = stamps(WANTED, PERIOD, WANTED, 0);
+        s[9] = 12 * PERIOD - 1;
+        s[10] = 12 * PERIOD - 1;
+        let run = judge_ticks(0, &s, WANTED, PERIOD);
+        assert_eq!(run.least_ten, Some(9 * PERIOD + 1));
+        assert_eq!(run.verdict, TickVerdict::InBounds);
+        // Fewer than eleven stamps have no span.
+        let few = judge_ticks(0, &stamps(10, PERIOD, 10, 0), 10, PERIOD);
+        assert_eq!((few.least_ten, few.verdict), (None, TickVerdict::InBounds));
+    }
+
+    #[test]
     fn over_a_grid_only_an_in_bounds_run_passes() {
         // Every rate from 50 % to 300 % of the period, with stalls of 0 to 1.5 s at three
-        // places: InBounds only when the whole run is within 95 % to 150 %, and Stalled only
-        // with the rate itself in bounds.
+        // places: InBounds only when the whole run is within 95 % to 150 % and the rate at most
+        // 15 % fast, and Stalled only with a gap of two periods and the rate not slow.
         for percent in (50..=300).step_by(5) {
             let gap = PERIOD * percent / 100;
             for extra in [0, 20_000_000, 100_000_000, 400_000_000, 1_500_000_000] {
@@ -586,7 +661,7 @@ mod tests {
                         TickVerdict::InBounds => assert!(
                             elapsed >= nominal / 100 * 95
                                 && elapsed <= nominal / 2 * 3
-                                && run.longest_gap < 2 * PERIOD,
+                                && percent >= 85,
                             "{percent}% +{extra} at {at}: {run:?}"
                         ),
                         TickVerdict::Stalled => assert!(
