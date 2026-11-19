@@ -573,11 +573,15 @@ pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
                 }
                 // No record of it can be kept. Its references are leaked deliberately: this
                 // processor is still in the process's address space, and dropping the last
-                // reference here would free the tables it is running on. It has left the
-                // processor all the same, so a `settle` stops waiting for it: what it leaked is
-                // the compare's to find (TASKS item 79, case (a)).
-                _ => {
+                // reference here would free the tables it is running on. Its stack and FPU area
+                // go first (the stack is leaked, as the processor is still on it). Then nothing
+                // more it holds will be given back and it is leaving the processor, so a `settle`
+                // stops waiting for it: what it leaked is the compare's to find (TASKS item 79,
+                // case (a); the review's T79-4).
+                (_, stack) => {
                     core::mem::forget(user);
+                    drop(stack);
+                    drop(fpu);
                     if let Some(mark) = mark {
                         mark.left();
                     }
