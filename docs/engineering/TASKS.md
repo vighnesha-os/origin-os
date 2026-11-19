@@ -485,7 +485,7 @@
 65. **The boot checker keeps a kernel panic's message in the log (found by TASKS item 58, 2026-11-14). Open: not started; after TASKS items 58 and 60 land, which both change the checker.** The checker stops QEMU at a panic's first line (`panicked at file:line:col:`), so no `boot-test` log holds the message on the lines after it; TASKS item 58 read its control AC-9's panic message only through `cargo xtask run`. Done means: after a panic's first line the checker reads on, for a bounded time or until the kernel's halt, and the log keeps the message; a planted panic shows it (CLAUDE.md §1, "Protect diagnostic data"; §69).
 
 
-66. **Timing proofs that fail on a busy host (found on 2026-11-14: the wait-queue timed wait, the RTC second and the scheduler's rounds on the oversubscribed machines). Assigned by the coordinating session on 2026-11-19, on `claude/t66-timing-proofs`, cut from `land/batch-6` at `b983bf6c` and moved to `0ed7bfb9` by the rulings. Its contract and the rulings are under "Task contracts"; the Amendment 3 question is decision item 316, and its follow-ups are TASKS items 73 and 74.** List every timing-sensitive boot proof, measure how close each runs to its bound under QEMU's software processor on an idle and a loaded host, and propose a principled rule for each (a bound derived from what the boot measured, a retry with the worst case reported, or an allowance named for the software processor), keeping each real-machine bound. Also: report every stalled shootdown where it happens (the processor that did not answer, the wait, a running count), and decide with figures what `lost: 0` means on the named oversubscribed machines, which item 313 allows to report, not fail, until then. Any change to ADR-0013's accepted text comes to the owner first.
+66. **Timing proofs that fail on a busy host (found on 2026-11-14: the wait-queue timed wait, the RTC second and the scheduler's rounds on the oversubscribed machines). Assigned by the coordinating session on 2026-11-19, on `claude/t66-timing-proofs`, cut from `land/batch-6` at `b983bf6c` and moved to `0ed7bfb9` by the rulings. Its contract and the rulings are under "Task contracts"; the Amendment 3 question is decision item 316, and its follow-ups are TASKS items 73 and 74. Built and gated under QEMU on 2026-11-19 (`0a79ee6c`); not landed and not pushed; an independent review is to come.** List every timing-sensitive boot proof, measure how close each runs to its bound under QEMU's software processor on an idle and a loaded host, and propose a principled rule for each (a bound derived from what the boot measured, a retry with the worst case reported, or an allowance named for the software processor), keeping each real-machine bound. Also: report every stalled shootdown where it happens (the processor that did not answer, the wait, a running count), and decide with figures what `lost: 0` means on the named oversubscribed machines, which item 313 allows to report, not fail, until then. Any change to ADR-0013's accepted text comes to the owner first.
 
 68. **A framework function that runs a closure on a painted, guarded stack and returns the depth it used (ADR-0019 A3; TASKS item 63's step B3, question 3). Numbered by the coordinating session on 2026-11-14; assigned on 2026-11-19, on `claude/t68-measured-stack`, cut from `land/batch-6` at `553bf6e` and moved to `b983bf6c` by the rulings (Q10). Its contract, the rulings and the result are under "Task contracts".** New `unsafe` in the framework, with its own review. It measures the AML interpreter's stack use in the kernel's own build, where today a release-mode host test on a 32 KiB thread is the proxy.
 
@@ -2187,3 +2187,52 @@ Recorded, not changed: the memory proof's two one-second budgets (TASKS item 74)
 3. **The pattern after `check`.** The final gates run `check`, `boot-test` and `boot-matrix` in one turn, in that order, and the first `boot-matrix`'s large boots are reported (windows discarded, the RTC second); the QEMU thread probe's result comes as an addendum.
 4. **TASKS item 71** may change which PM timer form the clocks read; if it lands in the batch before the final gates, the batch is merged first.
 5. **An independent review is required.**
+
+**Result (2026-11-19): built and gated under QEMU; not landed and not pushed. The independent review the rulings require is to come.** The evidence is in ADR-0013's "Timing proofs that judge the kernel" and in `SOURCE_PROVENANCE.md`, "TASKS item 66".
+
+- **Commits on `0ed7bfb9`:**
+  - `3df35070`: the contract.
+  - `d1326ba8`: R1 and R2.
+  - `bceac98b`: R6.
+  - `7b94325e`: R7.
+  - `f05d0a83`: R4.
+  - `79cc5e1d`: R5.
+  - `09a7dbf1`: R3.
+  - `fff57502`: R8's records and the reaper's line.
+  - `549a3fc0`: `land/batch-6` at `d99d1c56`, with TASKS item 61, merged in.
+  - `d906221d`: Q4's word.
+  - `5352f06c`: the clock proofs' turn-taker waits.
+  - `3b6c6605`: records.
+  - `f5b1f866`: the reaper's prefix.
+  - `0a79ee6c`: `land/batch-6` at `1e3cf1aa` merged in.
+  - The records after the gates follow.
+- **Where it departs from the contract:**
+  - **R7 also covers three more waits on other processors,** which the contract's list missed:
+    - the preemption proof's wait for its workers to exit, also a Refuse wait (in `7b94325e`);
+    - the clock proofs' two waits for their turn-takers to start and to finish, Report rows. One of them failed a 65-processor boot at three busy loops in the evidence after the change (`5352f06c`).
+  - **Q4 was done in this task,** after TASKS item 61 reached the batch and was merged in, as the rulings put it.
+  - **The reaper's line begins `origin-kernel: stalled shootdown: `.** It used to begin `TLB: `, a bare marker of the console scenario, which addition 2 rules out.
+  - **The probe** of QEMU's threads: see the hand-over.
+- **Evidence after the change** (`d906221d`, 20 boots in one turn, 05:32 to 05:54 UTC):
+  - **Calibration and the RTC second:** on the large machines a clean window came after 1 to 53 spoiled ones, and three boots needed more than 32. No RTC second was refuted.
+  - **Preemption:** the fewest switches on a processor rose from 17 to 52 idle, the window lasting 585 to 1,190 ms.
+  - **Failures, each under planted load:**
+    - load 3, 65 processors: the clock proofs' turn-taker wait, fixed in `5352f06c`;
+    - load 10, 65 processors: the tick proof, stalled through its 4 runs;
+    - load 10, 67 processors: `workers did not exit` after 10 s, cause not established.
+
+    Before the change both load-10 machines stopped at the tick proof's first run.
+- **Controls:** T66-1 to T66-19 (ADR-0013), each fault failing where aimed and each disturbance short of its budget passing.
+- **The checker:** no new or changed line that is not a failure holds `: … failed`, an address, or an existing marker's literal. Checked by a grep of 121 distinct new lines in the evidence and control logs against `xtask`'s literals, and the reaper's prefix changed as a result.
+- **The final gates, in one turn, in the ruled order, on `0a79ee6c`** (the code as at `f5b1f866`, with `land/batch-6` at `1e3cf1aa` merged in; a clean tree before and after; 2026-11-19 06:33 to 07:02 UTC):
+  - `cargo xtask check` passed in 540 s: 2,325 host tests passed, 0 failed, 29 ignored; Loom 56 models, 83 controls caught.
+  - `cargo xtask boot-test` passed, 11 of 11, in 53 s.
+  - `cargo xtask boot-matrix` passed on its first run, in 1,120 s, the kernel stacks' region at 23 distinct bases in 23 kernel boots.
+- **The pattern after `check` (addition 3).** In that first `boot-matrix`, straight after `check` and `boot-test`, the large machines' kernel boots:
+  - the 65-processor Intel machine discarded 20 calibration windows, and its RTC second lasted 1,001,487 ± 2,974 µs;
+  - the 65-processor AMD machine discarded 87, which would have meant a disturbed window before R1, and its second lasted 1,001,085 ± 1,544 µs;
+  - the 67-processor machine discarded 6, and its second lasted 1,001,463 ± 1,569 µs.
+
+  All three were confirmed. Each ticked 50 interrupts in 515 ms, its preemption window lasted 1,120 to 1,329 ms, and it lost no stack. None of the 17 kernel-boot logs the gate wrote (each copied as it was written) shows a repeat or a stalled shootdown.
+- **The probe of QEMU's threads** (a 65-processor boot in the same turn, before the gates): all 65 virtual processors were busy, the host's 10 threads full, for about 14 s while the firmware brought them up. The kernel's calibration comes right after, at a moment the probe's 1.5 s samples cannot resolve. It neither confirms nor rules out a cause for the spoiled windows, and changes no rule.
+- **Not shown:** anything under KVM, in CI or on a physical machine. Each intermediate commit was not built on its own; the final tree was. No person has reviewed it.
