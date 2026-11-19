@@ -6957,14 +6957,80 @@ mod gate_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// `body` as an executable shell script in a new directory under `target/xtask/`.
+    /// `body` as an executable shell script in a new directory under `target/xtask/`, run once
+    /// before it is handed back, so that the test's own run of it cannot fail with "Text file
+    /// busy" (ETXTBSY).
+    ///
+    /// Why (PR 41's CI, 2026-11-19): while `fs::write` holds the new file open for writing,
+    /// another test thread may fork a child (the turn lock's tests do), and the child holds a
+    /// copy of that descriptor until it execs; Linux refuses to exec a file open for writing
+    /// anywhere. Writing under another name and renaming does not help, since the inherited
+    /// descriptor is the cause. Once one exec of the file has succeeded, no process holds it for
+    /// writing (this one closed it, and every child that inherited it has exec'd or exited), and
+    /// nothing can open it so again, so the test's later runs, through `nm_symbols`, are safe.
+    /// Only here, in the tests: `nm_symbols` and every other path that runs a program report
+    /// ETXTBSY as the error it is.
     fn script(name: &str, body: &str) -> PathBuf {
         let dir = target_dir().join("xtask").join("gate-tests").join(name);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nm");
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        retry_while_busy(|| Command::new(&path).output())
+            .unwrap_or_else(|e| panic!("cannot run {}: {e}", path.display()));
         path
+    }
+
+    /// ETXTBSY, "Text file busy": the same number on Linux and on macOS.
+    const ETXTBSY: i32 = 26;
+    /// How many more times [`retry_while_busy`] tries, and how long it waits before each: one
+    /// second in all, far longer than a forked child takes to reach its exec.
+    const BUSY_RETRIES: u32 = 20;
+    const BUSY_WAIT: Duration = Duration::from_millis(50);
+
+    /// `run`, and again while it fails with ETXTBSY alone, up to [`BUSY_RETRIES`] more times;
+    /// any other result, or the last ETXTBSY, is returned as it is.
+    fn retry_while_busy<T>(mut run: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+        let mut retries = 0;
+        loop {
+            match run() {
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) && retries < BUSY_RETRIES => {
+                    retries += 1;
+                    thread::sleep(BUSY_WAIT);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// The retry, with ETXTBSY simulated: it tries again on ETXTBSY alone, gives up after
+    /// [`BUSY_RETRIES`] more tries with the error, and returns any other error at once.
+    #[test]
+    fn a_busy_text_file_is_tried_again_and_nothing_else_is() {
+        let busy = || std::io::Error::from_raw_os_error(ETXTBSY);
+        let mut calls = 0;
+        let result = retry_while_busy(|| {
+            calls += 1;
+            if calls < 3 { Err(busy()) } else { Ok(calls) }
+        });
+        assert_eq!(result.unwrap(), 3);
+
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry_while_busy(|| {
+            calls += 1;
+            Err(busy())
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(ETXTBSY));
+        assert_eq!(calls, BUSY_RETRIES + 1);
+
+        // Another error, ENOENT, is not tried again.
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry_while_busy(|| {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(2))
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(2));
+        assert_eq!(calls, 1);
     }
 
     #[test]
