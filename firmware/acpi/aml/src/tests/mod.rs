@@ -9,6 +9,7 @@ mod namespace;
 mod qemu;
 mod random;
 mod semantics;
+mod tolerance;
 
 use std::collections::BTreeMap;
 
@@ -427,6 +428,13 @@ pub(crate) enum Fault {
     /// A mutex still held at the end is released without a report (`sync.rs`,
     /// `release_reported`).
     SilentRelease,
+    /// A statement's failure in load-time code fails the table whole, as before step B5
+    /// (`tolerate.rs`, `abandon_target`).
+    NoAbandon,
+    /// A table already loaded is loaded again (`tolerate.rs`, `identical_table`).
+    LoadTwice,
+    /// The names load-time code put in packages are never bound (`tolerate.rs`, `bind_names`).
+    NoBind,
 }
 
 thread_local! {

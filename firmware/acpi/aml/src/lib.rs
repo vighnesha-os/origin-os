@@ -116,6 +116,8 @@ pub struct TableInfo {
     pub oem_table_id: [u8; 8],
     /// Its load failed and was rolled back.
     pub failed: bool,
+    /// Statements its load abandoned and reported, the load going on (step B5; saturating).
+    pub abandoned: u32,
 }
 
 /// A loaded definition block.
@@ -127,6 +129,8 @@ struct Table {
     oem_table_id: [u8; 8],
     /// Its load failed and was rolled back: its methods are not run.
     failed: bool,
+    /// Statements its load abandoned (step B5; saturating).
+    abandoned: u32,
 }
 
 /// The counts of one top-level evaluation, against the limits.
@@ -257,6 +261,7 @@ impl<H: Host> Interpreter<H> {
             oem_id: t.oem_id,
             oem_table_id: t.oem_table_id,
             failed: t.failed,
+            abandoned: t.abandoned,
         })
     }
 }

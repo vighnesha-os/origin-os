@@ -663,12 +663,10 @@ fn an_xsdt_entry_that_cannot_be_read_fails_the_proof() {
 #[test]
 fn a_definition_block_that_does_not_load_fails_the_proof() {
     let mut m = Machine::new(qemu_dsdt(&[]));
-    // `XTRA` twice: the second is a duplicate, and the table is rolled back.
-    m.ssdts.push(table(
-        b"SSDT",
-        1,
-        &[name("XTRA", one()), name("XTRA", one())],
-    ));
+    // A reserved opcode after `XTRA`: the parser cannot step past it, and the table is rolled
+    // back (step B5's load policy abandons only a statement that fails as it runs).
+    m.ssdts
+        .push(table(b"SSDT", 1, &[name("XTRA", one()), vec![0x02]]));
     let (found, out) = m.run();
     assert_eq!(
         found.failed,
@@ -676,7 +674,8 @@ fn a_definition_block_that_does_not_load_fails_the_proof() {
         "{out}"
     );
     assert!(out.contains("load failed at table 1 offset "), "{out}");
-    assert!(out.contains("Duplicate; rolled back"), "{out}");
+    assert!(out.contains("Reserved"), "{out}");
+    assert!(out.contains("rolled back"), "{out}");
 }
 
 #[test]

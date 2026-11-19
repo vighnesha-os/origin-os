@@ -340,6 +340,17 @@ impl<H: Host> Interpreter<H> {
         }
         let h = *t.header();
         let aml = t.bytes().get(HEADER_LEN..).unwrap_or(&[]);
+        // A table already loaded is refused whole, and the operator gives Zero (B4's Q7, as ruled
+        // for step B5).
+        if let Some(table) = self.identical_table(h.signature.0, h.oem_id, h.oem_table_id, aml) {
+            self.tell(&crate::Report::AlreadyLoaded { table });
+            let target = if f.op == Op::Load {
+                f.arg(1)
+            } else {
+                Operand::Empty
+            };
+            return self.load_result(f.op, target, false);
+        }
         let index =
             u32::try_from(self.tables.len()).map_err(|_| ErrorKind::Limit(Limit::Memory))?;
         let end = u32::try_from(aml.len()).map_err(|_| ErrorKind::Truncated)?;
@@ -354,6 +365,7 @@ impl<H: Host> Interpreter<H> {
                 oem_id: h.oem_id,
                 oem_table_id: h.oem_table_id,
                 failed: false,
+                abandoned: 0,
             },
             &mut self.budget,
         )?;
@@ -397,6 +409,7 @@ impl<H: Host> Interpreter<H> {
             end,
             scope,
             pred: 0,
+            stmt: self.cur,
         })
     }
 
@@ -407,6 +420,8 @@ impl<H: Host> Interpreter<H> {
     pub(crate) fn finish_load(&mut self, l: Loading) -> Result<()> {
         self.pop_frame();
         self.pop_owner(false);
+        // The names its load-time code put in packages are bound now (G1, step B5).
+        self.bind_names(Some(l.table))?;
         self.run.depth = l.depth;
         self.cur = l.ret;
         self.trace(&Trace::Loaded(Ok(l.table)));

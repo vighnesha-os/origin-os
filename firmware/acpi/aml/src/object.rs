@@ -178,6 +178,21 @@ pub(crate) struct NameElem {
     pub(crate) table: u32,
     /// Where the name string is in the table's term list.
     pub(crate) at: u32,
+    /// What it names, once bound (G1, step B5).
+    pub(crate) bind: Bind,
+}
+
+/// How a name kept in a package is resolved (G1, step B5; `tolerate.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Bind {
+    /// Made inside a method, or a field's `Connection`: looked up each time it is read.
+    Lazy,
+    /// Made by load-time code, not yet bound: looked up each time it is read until it is.
+    Deferred,
+    /// Bound to this node.
+    Node(NodeId),
+    /// Bound to nothing: an empty element.
+    Empty,
 }
 
 /// An object.
@@ -437,6 +452,21 @@ impl Heap {
         match self.slots.get(index(r.index)) {
             Some(s) if s.generation == r.generation && !matches!(s.obj, Object::Free) => Ok(&s.obj),
             _ => err(ErrorKind::Stale),
+        }
+    }
+
+    /// The name kept in a package at slot `i`, if that slot holds one (the binding pass).
+    pub(crate) fn name_elem_at(&self, i: usize) -> Option<NameElem> {
+        match self.slots.get(i).map(|s| &s.obj) {
+            Some(Object::NameElem(e)) => Some(*e),
+            _ => None,
+        }
+    }
+
+    /// Sets the bind state of the name kept at slot `i` (the binding pass).
+    pub(crate) fn set_bind_at(&mut self, i: usize, bind: Bind) {
+        if let Some(Object::NameElem(e)) = self.slots.get_mut(i).map(|s| &mut s.obj) {
+            e.bind = bind;
         }
     }
 

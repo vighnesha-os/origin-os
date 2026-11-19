@@ -805,6 +805,9 @@ impl<H: Host> Interpreter<H> {
                     Object::Reference(t) => Val::Ref(*t),
                     Object::NameElem(e) => {
                         let e = *e;
+                        if e.bind == crate::object::Bind::Empty {
+                            return err(ErrorKind::Uninitialized);
+                        }
                         Val::Obj(self.ns.obj(self.resolve_elem(e)?)?)
                     }
                     _ => return Ok(v),
@@ -1253,6 +1256,7 @@ impl<H: Host> Interpreter<H> {
                 scope: self.scope(),
                 table: self.cur.table,
                 at,
+                bind: crate::object::Bind::Lazy,
             }));
         }
         if b != 0x11 {

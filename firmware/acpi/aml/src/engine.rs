@@ -104,6 +104,8 @@ pub(crate) enum Frame {
         scope: NodeId,
         /// A `While`'s predicate offset.
         pred: u32,
+        /// Where the statement it is running began: what load-time code abandons (step B5).
+        stmt: Cursor,
     },
     Op(OpFrame),
     Call,
@@ -172,7 +174,7 @@ enum Want {
 }
 
 /// The operands a method invocation takes: up to seven `TermArg`s.
-const CALL_KINDS: &[Kind] = &[Kind::TermArg; 7];
+pub(crate) const CALL_KINDS: &[Kind] = &[Kind::TermArg; 7];
 
 pub(crate) const ELSE: u8 = 0xA1;
 
@@ -306,12 +308,24 @@ impl<H: Host> Interpreter<H> {
 
     // --- Loading -----------------------------------------------------------------------------
 
-    /// Loads a definition block: its term list is run at the root (ACPI 6.6 §5.4.2). On any
-    /// error every name it created is removed, and its methods are never run.
+    /// Loads a definition block: its term list is run at the root (ACPI 6.6 §5.4.2), on a
+    /// best-effort basis (step B5; TASKS 64's ledger §2): a statement that fails is abandoned
+    /// and reported, and the load goes on (`tolerate.rs`). On a failure the parser cannot step
+    /// past, a limit or `Fatal`, every name it created is removed, and its methods are never run.
+    /// A block identical to a table already loaded is refused, nothing of it created.
     ///
     /// # Errors
-    /// Whatever the term list does wrong, with where; a limit reached.
+    /// What fails the table whole, with where; a limit reached; [`ErrorKind::Duplicate`] for a
+    /// block identical to a table already loaded ([`crate::Report::AlreadyLoaded`] tells which).
     pub fn load(&mut self, block: DefinitionBlock<'_>) -> Result<u32> {
+        if let Some(table) =
+            self.identical_table(block.signature, block.oem_id, block.oem_table_id, block.aml)
+        {
+            self.begin_evaluation()?;
+            self.tell(&crate::Report::AlreadyLoaded { table });
+            self.end_evaluation();
+            return err(ErrorKind::Duplicate);
+        }
         let index =
             u32::try_from(self.tables.len()).map_err(|_| ErrorKind::Limit(Limit::Memory))?;
         let end = u32::try_from(block.aml.len()).map_err(|_| ErrorKind::Truncated)?;
@@ -326,6 +340,7 @@ impl<H: Host> Interpreter<H> {
                 oem_id: block.oem_id,
                 oem_table_id: block.oem_table_id,
                 failed: false,
+                abandoned: 0,
             },
             &mut self.budget,
         )?;
@@ -345,6 +360,7 @@ impl<H: Host> Interpreter<H> {
                 end,
                 scope: Namespace::root(),
                 pred: 0,
+                stmt: self.cur,
             })?;
             self.run_frames(marks.frames)?;
             // What load-time code still holds is released and reported (G2, step B5).
@@ -631,9 +647,11 @@ impl<H: Host> Interpreter<H> {
         self.ctx.truncate(n);
     }
 
-    /// Runs until the frames are back to `base`. An error inside a table that `Load` or
-    /// `LoadTable` is loading, other than a limit, fails that load alone: it is rolled back and its
-    /// operator gives Zero, and the evaluation goes on (`load.rs`; B4's contract, Q3).
+    /// Runs until the frames are back to `base`. A statement's failure in load-time code
+    /// abandons that statement alone, and the load goes on (`tolerate.rs`; step B5). Any other
+    /// error inside a table that `Load` or `LoadTable` is loading, other than a limit or `Fatal`,
+    /// fails that load alone: it is rolled back and its operator gives Zero, and the evaluation
+    /// goes on (`load.rs`; B4's contract, Q3).
     pub(crate) fn run_frames(&mut self, base: usize) -> Result<()> {
         loop {
             if self.frames.len() <= base {
@@ -646,6 +664,10 @@ impl<H: Host> Interpreter<H> {
                         table: self.cur.table,
                         offset: self.cur.pc,
                     });
+                }
+                if let Some(b) = self.abandon_target(base, &e) {
+                    failure = self.abandon(b, e).err();
+                    continue;
                 }
                 match self.failing_load(base, &e) {
                     Some(at) => failure = self.fail_load_at(at, e).err(),
@@ -783,6 +805,9 @@ impl<H: Host> Interpreter<H> {
                 }
                 if self.cur.pc > end {
                     return err(ErrorKind::PackageLength);
+                }
+                if let Some(Frame::Block { stmt, .. }) = self.frames.last_mut() {
+                    *stmt = self.cur;
                 }
                 self.decode(Want::Statement)
             }
@@ -1021,7 +1046,9 @@ impl<H: Host> Interpreter<H> {
         match b {
             // A table loaded at run time has no locals or arguments of its own at its table level:
             // those are the method's that ran `Load` (the review of B4's addendum, B4-13).
-            0x60..=0x6E if self.at_loaded_table_level() => return err(ErrorKind::Grammar),
+            0x60..=0x6E if self.at_loaded_table_level() => {
+                return err(ErrorKind::OutsideMethod);
+            }
             0x60..=0x67 => {
                 #[cfg(test)]
                 crate::tests::ran(u16::from(b));
@@ -1184,11 +1211,19 @@ impl<H: Host> Interpreter<H> {
         let (name, next) = name::parse(self.aml(), at)?;
         self.cur.pc = next;
         if want == Want::Element {
+            // Load-time code's names are bound once every boot table has loaded, or when the
+            // run-time load that made them ends (G1, step B5); a method's, when they are read.
+            let bind = if self.in_load_time_code() {
+                crate::object::Bind::Deferred
+            } else {
+                crate::object::Bind::Lazy
+            };
             let r = self.heap.alloc(
                 Object::NameElem(crate::object::NameElem {
                     scope: self.scope(),
                     table: self.cur.table,
                     at,
+                    bind,
                 }),
                 &mut self.budget,
             )?;
@@ -1197,8 +1232,9 @@ impl<H: Host> Interpreter<H> {
         if want == Want::Data {
             return err(ErrorKind::Grammar);
         }
-        // G1, strict until the reading session answers: a name that resolves to nothing is an
-        // error; one that resolves to a method is a call.
+        // G1 (TASKS 64's ledger §3): a name that resolves to nothing is an error, which in
+        // load-time code abandons its statement (`tolerate.rs`; step B5); one that resolves to a
+        // method is a call taking the method's declared arguments.
         let node = self.resolve(name)?.ok_or(ErrorKind::NotFound)?;
         let obj = self.ns.obj(node)?;
         let argc = match self.heap.get(obj)? {
@@ -1400,6 +1436,7 @@ impl<H: Host> Interpreter<H> {
                 end,
                 scope,
                 pred: 0,
+                stmt: self.cur,
             })
         } else {
             self.cur.pc = end;
@@ -1443,6 +1480,7 @@ impl<H: Host> Interpreter<H> {
                 end: f.end,
                 scope,
                 pred: 0,
+                stmt: self.cur,
             })
         } else {
             self.cur.pc = f.end;
@@ -1460,6 +1498,7 @@ impl<H: Host> Interpreter<H> {
                 end: f.end,
                 scope,
                 pred,
+                stmt: self.cur,
             })
         } else {
             self.cur.pc = f.end;
@@ -1503,6 +1542,7 @@ impl<H: Host> Interpreter<H> {
             end: f.end,
             scope,
             pred: 0,
+            stmt: self.cur,
         })
     }
 
@@ -1570,6 +1610,7 @@ impl<H: Host> Interpreter<H> {
             end: m.end,
             scope: m.node,
             pred: 0,
+            stmt: self.cur,
         })
     }
 
@@ -1734,6 +1775,10 @@ impl<H: Host> Interpreter<H> {
         let Object::NameElem(e) = *self.heap.get(r)? else {
             return Ok(v);
         };
+        // A name bound to nothing is an empty element (G1, step B5).
+        if e.bind == crate::object::Bind::Empty {
+            return Ok(Val::None);
+        }
         let node = self.resolve_elem(e)?;
         let obj = self.ns.obj(node)?;
         if self.heap.get(obj)?.is_data() {
@@ -1745,6 +1790,12 @@ impl<H: Host> Interpreter<H> {
 
     /// Resolves a name kept in a package.
     pub(crate) fn resolve_elem(&self, e: crate::object::NameElem) -> Result<NodeId> {
+        match e.bind {
+            crate::object::Bind::Node(n) if self.ns.exists(n) => return Ok(n),
+            crate::object::Bind::Node(_) => return err(ErrorKind::Stale),
+            crate::object::Bind::Empty => return err(ErrorKind::NotFound),
+            crate::object::Bind::Lazy | crate::object::Bind::Deferred => {}
+        }
         let aml = self
             .tables
             .get(us(e.table))
