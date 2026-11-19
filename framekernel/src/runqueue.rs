@@ -323,6 +323,35 @@ pub fn judge_window(watch: &TickWatch, wanted: u64, bound: u64) -> WindowVerdict
     }
 }
 
+/// The preemption proof's budget for its runs, from the first run's start: 120 s of wall time,
+/// the pauses between runs included (the coordinating session's ruling of 2026-11-20). On the
+/// oversubscribed software-processor machines a stall comes in an episode of seconds, the longest
+/// seen outlasting 8 runs, so the budget is time, not a count.
+pub const WINDOW_RUNS_SECONDS: u64 = 120;
+/// The most runs within that budget, which bounds the lines printed.
+pub const WINDOW_RUNS_MOST: u32 = 32;
+/// The pause before each further run, every processor idle, so that an episode can pass.
+pub const WINDOW_PAUSE_SECONDS: u64 = 2;
+
+/// Whether the preemption proof runs its window again after run `runs` (from 1), whose verdict
+/// was `verdict`, its correctness clauses `correct`, ending `elapsed` TSC ticks after the first
+/// run's start: only a correct run its processors' ticks showed stalled, and only while the next
+/// run can start within [`WINDOW_RUNS_SECONDS`], the pause before it counted, and
+/// [`WINDOW_RUNS_MOST`] runs have not been made.
+pub const fn window_again(
+    verdict: WindowVerdict,
+    correct: bool,
+    runs: u32,
+    elapsed: u64,
+    tsc_hz: u64,
+) -> bool {
+    correct
+        && matches!(verdict, WindowVerdict::Stalled)
+        && runs < WINDOW_RUNS_MOST
+        && elapsed.saturating_add(WINDOW_PAUSE_SECONDS.saturating_mul(tsc_hz))
+            < WINDOW_RUNS_SECONDS.saturating_mul(tsc_hz)
+}
+
 /// Why a request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueError {
@@ -970,6 +999,54 @@ mod tests {
         let mut q = RunQueue::new();
         q.arm_watch(0, P);
         assert_eq!(q.watch().switches_from, q.switches());
+    }
+
+    /// The verdict and the runs a proof makes over `runs`, each a verdict, its correctness and how
+    /// long it took with the pause after it, on a 1 GHz TSC: as `sched::prove` loops.
+    fn budgeted(runs: &[(WindowVerdict, bool, u64)]) -> (WindowVerdict, u32, u64) {
+        const HZ_TSC: u64 = 1_000_000_000;
+        let mut elapsed = 0;
+        let mut made = 0;
+        for &(verdict, correct, seconds) in runs {
+            made += 1;
+            elapsed += seconds * HZ_TSC;
+            if !window_again(verdict, correct, made, elapsed, HZ_TSC) {
+                return (verdict, made, elapsed / HZ_TSC);
+            }
+            elapsed += WINDOW_PAUSE_SECONDS * HZ_TSC;
+        }
+        (WindowVerdict::Stalled, made, elapsed / HZ_TSC)
+    }
+
+    #[test]
+    fn the_window_repeats_within_its_time_budget_and_its_cap() {
+        use WindowVerdict::{InBounds, Late, Stalled};
+        // A pass on a later run counts: two stalled runs, then one in bounds.
+        assert_eq!(
+            budgeted(&[(Stalled, true, 3), (Stalled, true, 3), (InBounds, true, 1)]),
+            (InBounds, 3, 11)
+        );
+        // Stalled in every run of 3 s: with the 2 s pauses, 5 s a run, the 24th ends at 118 s
+        // and the 25th could not start within 120 s.
+        let stalled = [(Stalled, true, 3); 40];
+        assert_eq!(budgeted(&stalled), (Stalled, 24, 118));
+        // Short runs stop at the cap of 32.
+        let quick = [(Stalled, true, 1); 40];
+        assert_eq!(budgeted(&quick).1, WINDOW_RUNS_MOST);
+        // The budget's edge: a run ending 118 s in, plus the 2 s pause, is not under 120 s.
+        const HZ_TSC: u64 = 1_000_000_000;
+        assert!(window_again(Stalled, true, 1, 117 * HZ_TSC, HZ_TSC));
+        assert!(!window_again(Stalled, true, 1, 118 * HZ_TSC, HZ_TSC));
+        assert!(!window_again(Stalled, true, WINDOW_RUNS_MOST, 0, HZ_TSC));
+        // Only a correct stalled run is repeated: a failure of correctness, a late run without
+        // a stall, or a pass ends the runs at once.
+        assert!(!window_again(Stalled, false, 1, 0, HZ_TSC));
+        assert!(!window_again(Late, true, 1, 0, HZ_TSC));
+        assert!(!window_again(InBounds, true, 1, 0, HZ_TSC));
+        assert_eq!(
+            budgeted(&[(Stalled, true, 3), (Stalled, false, 3)]),
+            (Stalled, 2, 8)
+        );
     }
 
     #[test]

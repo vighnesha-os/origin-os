@@ -21,8 +21,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bootproof::{Proof, Tally};
 use crate::runqueue::{
-    PREEMPTION_ROUNDS, QueueError, ReadBack, RunQueue, TickWatch, WindowVerdict, judge_window,
-    per_mille, share_near_weight,
+    PREEMPTION_ROUNDS, QueueError, ReadBack, RunQueue, TickWatch, WINDOW_PAUSE_SECONDS,
+    WINDOW_RUNS_SECONDS, WindowVerdict, judge_window, per_mille, share_near_weight, window_again,
 };
 
 use crate::console::Console;
@@ -1214,14 +1214,6 @@ const WINDOW_TICKS: u64 = 50;
 /// one processor (TASKS item 66).
 const WINDOW_BUDGET_SECONDS: u64 = 10;
 
-/// Runs of the preemption proof's window it may make: another only after a correct run whose
-/// processors' own ticks show a stall before today's bound ([`WindowVerdict::Stalled`]), each
-/// against the same verdict (TASKS item 66, the review's T66-R1). Eight, as the timed waits:
-/// on the oversubscribed software-processor machines such stalls come in episodes of a boot
-/// or a round, the longest seen covering 4 runs, about 15 to 20 s (the coordinating session's
-/// ruling of 2026-11-19, from the research ledger's §3.1).
-const PREEMPTION_ATTEMPTS: u32 = 8;
-
 /// One run of the preemption proof's window, as the boot flow measured it.
 struct WindowRun {
     /// How long the window lasted.
@@ -1388,11 +1380,13 @@ fn say_window(
     verdict: (WindowVerdict, Option<(CpuIndex, TickWatch)>),
     attempt: u32,
     correct: bool,
+    again: bool,
+    spent_seconds: u64,
 ) {
     let ms = |w: &TickWatch, ticks: u64| ticks / (w.period.saturating_mul(timer::HZ) / 1000).max(1);
     let _ = write!(
         com1,
-        "origin-kernel: scheduler: window of {} ms, run {attempt} of {PREEMPTION_ATTEMPTS}: ",
+        "origin-kernel: scheduler: window of {} ms, run {attempt}, {spent_seconds} s of {WINDOW_RUNS_SECONDS} spent: ",
         run.elapsed_ms
     );
     let _ = match verdict {
@@ -1409,8 +1403,10 @@ fn say_window(
             let what = match v {
                 // A run whose correctness clauses failed is never run again.
                 WindowVerdict::Stalled if !correct => "stalled, not run again: scheduler failed",
-                WindowVerdict::Stalled if attempt < PREEMPTION_ATTEMPTS => "stalled, run again",
-                WindowVerdict::Stalled => "stalled in every run: scheduler failed",
+                WindowVerdict::Stalled if again => "stalled, run again",
+                WindowVerdict::Stalled => {
+                    "stalled in every run, its budget spent: scheduler failed"
+                }
                 _ => ": scheduler failed",
             };
             match v {
@@ -1458,7 +1454,8 @@ fn say_window(
 /// processor's timed proof ran it (TASKS item 66, the review's T66-R1), and its 15th context
 /// switch must come within 500 ms on the TSC, today's bound (the addendum review's T66-R15). A
 /// run whose 15th switch came late with a gap of two periods or more between its ticks is
-/// measured again, up to [`PREEMPTION_ATTEMPTS`] runs. Then the rest of the thread proofs; each result goes into
+/// measured again after a pause, within [`WINDOW_RUNS_SECONDS`] of wall time and at most
+/// `WINDOW_RUNS_MOST` runs ([`window_again`]). Then the rest of the thread proofs; each result goes into
 /// `proofs`, and `kernel_main` decides what they mean (ADR-0013). Fairness counts loop
 /// iterations, which a processor sharing a physical core skews with nothing wrong, so it is a
 /// separate result from preemption.
@@ -1549,6 +1546,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     let workers = 2 * cpus.len();
     // Runs of the window, each against the same verdict: another only after a run whose
     // processors' own ticks show a stall before today's bound (TASKS item 66, T66-R1).
+    let budget_start = rdtsc();
     let mut attempts = 0;
     let (run, verdict) = loop {
         attempts += 1;
@@ -1568,9 +1566,28 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         // never repeated, and a repeat starts only once every worker of this run has exited
         // (the addendum review's T66-R11).
         let correct = run_correct(&run, cpus);
-        say_window(com1, &run, verdict, attempts, correct);
-        if !correct || verdict.0 != WindowVerdict::Stalled || attempts == PREEMPTION_ATTEMPTS {
+        // Within a budget of time, not a count: stalls come in episodes of seconds (the
+        // coordinating session's ruling of 2026-11-20).
+        let elapsed = rdtsc().wrapping_sub(budget_start);
+        let again = window_again(verdict.0, correct, attempts, elapsed, tsc_hz);
+        say_window(
+            com1,
+            &run,
+            verdict,
+            attempts,
+            correct,
+            again,
+            elapsed / tsc_hz.max(1),
+        );
+        if !again {
             break (run, verdict.0);
+        }
+        // Every worker of the run has exited: a pause with every processor idle, so that an
+        // episode of the host's stalls can pass before the next run.
+        let pause = WINDOW_PAUSE_SECONDS.saturating_mul(tsc_hz);
+        let paused = rdtsc();
+        while rdtsc().wrapping_sub(paused) < pause {
+            cpu::idle_disabling();
         }
     };
     let elapsed_ms = run.elapsed_ms;
