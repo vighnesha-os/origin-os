@@ -1643,11 +1643,12 @@ fn adversarial_cases() {
         ),
         // A mutex taken in one method and released in another (G2): 132.
         (
+            // `M0` last: the run evaluates a scope's methods from its last (`methods`).
             vec![
                 mutex("MP", 0),
-                method("M0", 0, &[call("PA", &[]), call("PB", &[]), ret(byte(132))]),
                 method("PA", 0, &[acquire(nm("MP"), 0xFFFF)]),
                 method("PB", 0, &[release(nm("MP"))]),
+                method("M0", 0, &[call("PA", &[]), call("PB", &[]), ret(byte(132))]),
             ],
             Setup::PLAIN,
             Expect::Eval(Ok(Some(Value::Integer(132)))),
