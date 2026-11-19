@@ -132,4 +132,4 @@ The manifest's digest above is kept so that a later check can confirm it read th
 | | |
 |---|---|
 | Checked by | The TASKS item 64 session (an AI that writes no Origin code), 2026-11-19 |
-| Signed off by a person | Pending: the owner |
+| Signed off by a person | **The owner, on 2026-11-19 at about 16:15 UTC**, in the coordinating session. Asked "Sign off the B5 similarity check?", the owner answered "Sign off". Before answering, the owner had the coordinating session's summary of this report: the method, the four controls (C4 caught only in part), the verdict for each file, the two rules B5 settled that coincide with ACPICA, and what a check cannot prove. The words were relayed by the coordinating session |
