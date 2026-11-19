@@ -1864,7 +1864,7 @@ mod tests {
         ] {
             assert!(is_search_setting(&OsString::from(name)), "{name}");
         }
-        for name in ["PATH", "XLOOM_", "ORIGIN_QEMU_SMP", "RUSTFLAGS"] {
+        for name in ["PATH", "XLOOM_", "ORIGIN_XTASK_LOCK_HELD", "RUSTFLAGS"] {
             assert!(!is_search_setting(&OsString::from(name)), "{name}");
         }
     }
