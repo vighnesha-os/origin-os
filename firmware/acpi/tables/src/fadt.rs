@@ -683,6 +683,17 @@ impl<'a> Fadt<'a> {
     }
 }
 
+/// Both of a FADT's pointers to the FACS, `X_FIRMWARE_CTRL` and `FIRMWARE_CTRL`, read from as
+/// many of its bytes as `bytes` holds, whatever else the table holds: 0 for a field it does not
+/// reach or that is zero. For a reader that must find the FACS before it has checked the FADT,
+/// to keep it from ever being lent (TASKS item 71), and that then chooses between them as
+/// §5.2.9 says, as [`Fadt::facs_address`] does: the first if non-zero, else the second.
+#[must_use]
+pub fn facs_pointers(bytes: &[u8]) -> [u64; 2] {
+    let b = Bytes::new(bytes, crate::Signature::new(b"FACP"));
+    [b.u64(132).unwrap_or(0), u64::from(b.u32(36).unwrap_or(0))]
+}
+
 /// The 64-bit value if present and not zero, else the 32-bit one if not zero.
 fn prefer(wide: Option<u64>, narrow: u32) -> Option<u64> {
     wide.filter(|&w| w != 0)
@@ -1028,5 +1039,17 @@ pub(crate) mod tests {
         assert_eq!(Fadt::parse(&t).unwrap().port_block(Block::PmTimer), None);
         let t = edited(|t| put(t, 112, &(1u32 << 20).to_le_bytes()));
         assert_eq!(Fadt::parse(&t).unwrap().port_block(Block::PmTimer), None);
+    }
+
+    /// TASKS item 71: both FACS pointers, from whatever prefix of a FADT a reader has.
+    #[test]
+    fn both_facs_pointers_from_any_prefix() {
+        let t = fadt();
+        assert_eq!(facs_pointers(&t), [0x7FFE_0000, 0x7FFE_0000]);
+        assert_eq!(facs_pointers(&t[..140]), [0x7FFE_0000, 0x7FFE_0000]);
+        assert_eq!(facs_pointers(&t[..139]), [0, 0x7FFE_0000]);
+        assert_eq!(facs_pointers(&t[..39]), [0, 0]);
+        let t = edited(|t| put(t, 132, &0x7F00_0040u64.to_le_bytes()));
+        assert_eq!(facs_pointers(&t), [0x7F00_0040, 0x7FFE_0000]);
     }
 }

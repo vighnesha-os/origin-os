@@ -27,7 +27,9 @@ use origin_acpi_tables::madt::Madt;
 use origin_acpi_tables::srat::Srat;
 use origin_acpi_tables::{CHANGES_AFTER_BOOT, Error, Signature};
 
+use crate::acpi::ChangingRanges;
 use crate::acpi_text::{Ascii, Refused, Sig, Whose};
+use origin_frame::reserved::Never;
 
 /// Where every line of the census starts.
 const LINE: &str = "origin-kernel: acpi: ";
@@ -59,6 +61,12 @@ pub trait Firmware {
     fn copy(&mut self, addr: u64, out: &mut [u8]) -> Result<(), &'static str>;
     /// A monotonic clock in nanoseconds, for the time the census took.
     fn now(&self) -> u64;
+    /// What the kernel's first table lookup located as the firmware's structures that change
+    /// after boot, and what the lending registry did with them (`firmware::changing`; TASKS item
+    /// 71), if it has run.
+    fn changing(&self) -> Option<(ChangingRanges, Never)> {
+        None
+    }
 }
 
 /// The kernel's firmware memory.
@@ -75,6 +83,9 @@ impl Firmware for Boot {
     }
     fn now(&self) -> u64 {
         crate::time::monotonic_nanos()
+    }
+    fn changing(&self) -> Option<(ChangingRanges, Never)> {
+        crate::firmware::changing().copied()
     }
 }
 
@@ -174,6 +185,44 @@ pub fn relied_on(table: &[u8]) -> u32 {
             )
         }),
         _ => 0,
+    }
+}
+
+/// The firmware's structures that change after boot, as the kernel's first table lookup located
+/// them and recorded them as never lent (TASKS item 71): each with its range, inclusive, and what
+/// the registry could not keep or found lent before. Reported; it decides nothing.
+struct NeverLent<'c>(&'c ChangingRanges, Never);
+
+impl core::fmt::Display for NeverLent<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("never lent, as the firmware changes them after boot:")?;
+        if self.0.ranges().is_empty() {
+            f.write_str(" none named")?;
+        }
+        for (i, &(kind, base, end)) in self.0.ranges().iter().enumerate() {
+            let sep = if i == 0 { " " } else { ", " };
+            write!(
+                f,
+                "{sep}{} {base:#x}-{:#x}",
+                kind.name(),
+                end.saturating_sub(1)
+            )?;
+        }
+        write!(f, "; {} kept", self.1.recorded)?;
+        if self.1.untracked != 0 {
+            write!(f, ", {} not kept for want of room", self.1.untracked)?;
+        }
+        if let Some((base, end)) = self.1.already_lent {
+            write!(
+                f,
+                ", one overlapping {base:#x}-{:#x}, lent before",
+                end.saturating_sub(1)
+            )?;
+        }
+        if let Some(why) = self.0.unlocated {
+            write!(f, "; not all located: {why}")?;
+        }
+        Ok(())
     }
 }
 
@@ -477,6 +526,9 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
     if let Some(fpdt) = fpdt {
         performance_tables(out, fw, &mut found, fpdt);
     }
+    if let Some((changing, kept)) = fw.changing() {
+        let _ = writeln!(out, "{LINE}{}", NeverLent(&changing, kept));
+    }
     let consistent = found.consistent();
     let micros = fw.now().saturating_sub(started) / 1000;
     let _ = writeln!(
@@ -708,9 +760,21 @@ mod tests {
             rsdp[8] = sum(&rsdp[..20]);
             rsdp[32] = sum(&rsdp);
             self.put(RSDP, &rsdp);
+            let bytes: &'static [u8] = Vec::leak(self.memory);
+            // As the kernel's first lookup does: the changing structures located by copy and
+            // recorded with a lending registry (TASKS item 71).
+            let mut copy = |addr: u64, out: &mut [u8]| {
+                let at = usize::try_from(addr.checked_sub(BASE).ok_or("no")?).map_err(|_| "no")?;
+                out.copy_from_slice(bytes.get(at..at + out.len()).ok_or("no")?);
+                Ok(())
+            };
+            let found = crate::acpi::changing_ranges(RSDP, &mut copy);
+            let ranges: Vec<(u64, u64)> = found.ranges().iter().map(|&(_, b, e)| (b, e)).collect();
+            let kept = origin_frame::reserved::Lending::new().never_lend(&ranges);
             let mut fw = Memory {
-                bytes: Vec::leak(self.memory),
+                bytes,
                 lent: Vec::new(),
+                changing: Some((found, kept)),
             };
             let mut out = String::new();
             let verdict = census(&mut out, &mut fw, RSDP);
@@ -722,6 +786,7 @@ mod tests {
     struct Memory {
         bytes: &'static [u8],
         lent: Vec<u64>,
+        changing: Option<(ChangingRanges, Never)>,
     }
 
     impl Memory {
@@ -756,6 +821,9 @@ mod tests {
         fn now(&self) -> u64 {
             0
         }
+        fn changing(&self) -> Option<(ChangingRanges, Never)> {
+            self.changing
+        }
     }
 
     fn last_line(out: &str) -> &str {
@@ -775,6 +843,14 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("FACS version 2, 64 bytes: checked"), "{out}");
+        // TASKS item 71: what the first lookup located and recorded as never lent.
+        assert!(
+            out.contains(
+                "never lent, as the firmware changes them after boot: FACS \
+                 0x7f003000-0x7f00303f; 1 kept"
+            ),
+            "{out}"
+        );
         // TASKS item 71: the PM timer's two forms, and the one the kernel's reader takes.
         assert!(
             out.contains(

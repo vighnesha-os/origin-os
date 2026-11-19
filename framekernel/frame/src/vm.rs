@@ -576,6 +576,25 @@ pub fn lent_ranges() -> Vec<(u64, u64)> {
     crate::cpu::without_interrupts(|| LENDING.lock().lent().to_vec())
 }
 
+/// Records `ranges`, the firmware's structures that change after boot (the FACS and the FPDT's
+/// tables), as never lent by [`firmware_bytes`], and that they have been located, so lending may
+/// begin (TASKS item 71). What it kept, and any range lent before that one of them overlaps, is
+/// returned for the caller to report.
+pub fn never_lend(ranges: &[(u64, u64)]) -> crate::reserved::Never {
+    crate::cpu::without_interrupts(|| LENDING.lock().never_lend(ranges))
+}
+
+/// Whether the firmware's structures that change after boot have been located and recorded
+/// ([`never_lend`]): [`firmware_bytes`] lends nothing before.
+pub fn changing_located() -> bool {
+    crate::cpu::without_interrupts(|| LENDING.lock().located())
+}
+
+/// Whether `[base, end)` overlaps a structure the firmware changes after boot ([`never_lend`]).
+pub fn never_lent(base: u64, end: u64) -> bool {
+    crate::cpu::without_interrupts(|| LENDING.lock().never_lent(base, end))
+}
+
 /// Whether `[raw, end)` is memory the firmware described as its own (reserved, ACPI, runtime
 /// or device memory, or firmware memory of another type): never RAM the kernel owns or will
 /// own. Unaccepted memory is RAM, not firmware data (boot info 0.7).
@@ -632,7 +651,9 @@ pub fn read_firmware(addr: PhysAddr, out: &mut [u8]) -> Result<(), MapError> {
 /// `&'static` because the tables it is used for do not change after boot. Those are the RSDP and
 /// the system description tables with a header (`firmware::bytes` lists them); never the FACS or
 /// the FPDT's FBPT and S3PT, which the firmware writes after boot and [`read_firmware`] copies
-/// instead (ACPI 6.6 §5.2.10.1, §5.2.24.8, §5.2.24.10). Refused for anything but the
+/// instead (ACPI 6.6 §5.2.10.1, §5.2.24.8, §5.2.24.10). The lending registry enforces that: it
+/// lends nothing before those structures have been located ([`never_lend`]), and no range that
+/// overlaps one (TASKS item 71). Refused for anything but the
 /// firmware's own data: a range that overlaps memory the kernel owns or will own (`Usable`,
 /// the heap, the kernel's image, the loader's memory), which safe code must not be able to
 /// read as a `&'static [u8]` while something writes it.

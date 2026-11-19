@@ -7,6 +7,7 @@
 
 use crate::acpi;
 use crate::addr::PhysAddr;
+use crate::once::SetOnce;
 
 use crate::vm;
 
@@ -21,13 +22,23 @@ use crate::vm;
 /// rewrites on resume (§5.2.24.8, §5.2.24.10), or a channel's shared memory: [`copy`] reads
 /// those (the independent review of TASKS item 62, F2).
 ///
-/// The rule is enforced, not only written (the review's addendum, N3): before lending, the first
-/// four bytes are copied and compared with `origin_acpi_tables::CHANGES_AFTER_BOOT`, and a range
-/// that starts with one of those signatures is refused, wherever it was named from. Its reader
-/// copies it instead.
+/// The rule is enforced, not only written. Nothing is lent before [`acpi_table`]'s first call
+/// has located those structures and recorded them as never lent (TASKS item 71), and a range that
+/// overlaps one is refused, wherever it was named from, the middle of the FACS included. Before
+/// lending, the first four bytes are also copied and compared with
+/// `origin_acpi_tables::CHANGES_AFTER_BOOT`, so a structure the tables did not lead to is refused
+/// by its signature (the review's addendum, N3). Its reader copies it instead.
 pub fn bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
-    if addr == 0 || addr.checked_add(len as u64).is_none() {
+    let Some(end) = addr.checked_add(len as u64).filter(|_| addr != 0) else {
         return Err("bad table address");
+    };
+    if !vm::changing_located() {
+        return Err("nothing is lent before the firmware's changing structures are located");
+    }
+    if vm::never_lent(addr, end) {
+        return Err(
+            "it overlaps a structure the firmware changes after boot: copy it, never lend it",
+        );
     }
     if let Some(mut signature) = (len >= 4).then_some([0u8; 4]) {
         copy(addr, &mut signature)?;
@@ -49,17 +60,44 @@ pub fn copy(addr: u64, out: &mut [u8]) -> Result<(), &'static str> {
     vm::read_firmware(PhysAddr::new(addr), out).map_err(|_| "cannot map an ACPI table")
 }
 
+/// What [`acpi_table`]'s first call located as the firmware's structures that change after boot,
+/// and what the lending registry did with them: for the ACPI census to report.
+static CHANGING: SetOnce<(acpi::ChangingRanges, crate::reserved::Never)> = SetOnce::new();
+
+/// What the first table lookup located and recorded as never lent, once it has run.
+pub fn changing() -> Option<&'static (acpi::ChangingRanges, crate::reserved::Never)> {
+    CHANGING.get()
+}
+
 /// The first valid table with signature `sig` that the XSDT lists, checked (signature, length,
-/// checksum): RSDP → XSDT → table ([`acpi::find_table`]). Each entry's header is compared by copy
-/// and only the table asked for is lent, so an XSDT that names the FACS or a performance table,
-/// which [`bytes`] never lends, still lets an absent table read as [`acpi::NOT_LISTED`] (the
+/// checksum): RSDP → XSDT → table ([`acpi::lookup`]). On the first call, before anything is lent,
+/// the firmware's structures that change after boot are located by copy alone
+/// ([`acpi::changing_ranges`]: no lend, no lookup, no allocation) and recorded as never lent
+/// ([`vm::never_lend`]), which also lets lending begin; a later call finds them recorded. Each
+/// entry's header is compared by copy and only the table asked for is lent, so an XSDT that names
+/// the FACS or a performance table still lets an absent table read as [`acpi::NOT_LISTED`] (the
 /// review's Addendum 2, A2-L1). An entry that could not be read might have been this table, so a
 /// search that finds nothing then says so. A null entry names nothing.
 pub fn acpi_table(rsdp_addr: u64, sig: &[u8; 4]) -> Result<&'static [u8], &'static str> {
-    let rsdp =
-        acpi::parse_rsdp(bytes(rsdp_addr, acpi::RSDP_LENGTH)?).map_err(|_| "invalid RSDP")?;
     let mut copy_header = |addr: u64, out: &mut [u8]| copy(addr, out);
     let mut lend = |addr: u64, len: usize| bytes(addr, len);
-    let xsdt = acpi::lend_table(rsdp.xsdt, b"XSDT", &mut copy_header, &mut lend)?;
-    acpi::find_table(xsdt, sig, &mut copy_header, &mut lend)
+    let mut record = |found: &acpi::ChangingRanges| {
+        let mut ranges = [(0u64, 0u64); acpi::CHANGING_MAX];
+        let mut n = 0;
+        for (slot, &(_, base, end)) in ranges.iter_mut().zip(found.ranges()) {
+            *slot = (base, end);
+            n += 1;
+        }
+        let kept = vm::never_lend(ranges.get(..n).unwrap_or(&[]));
+        // The first call's record is the one reported; a racing second finds the same.
+        let _ = CHANGING.set((*found, kept));
+    };
+    acpi::lookup(
+        rsdp_addr,
+        sig,
+        &mut vm::changing_located,
+        &mut record,
+        &mut copy_header,
+        &mut lend,
+    )
 }
