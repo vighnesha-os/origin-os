@@ -154,16 +154,17 @@ pub const fn judge_timed_waits(
     }
 }
 
-/// The ticks the preemption proof's rounds clause (ADR-0013) needs within today's bound: 15
-/// rounds of a processor's contexts, the clause since before TASKS item 66.
+/// The context switches the preemption proof's rounds clause (ADR-0013) needs within today's
+/// bound: 15, five rounds of a processor's three contexts, the clause since before TASKS item 66.
 pub const PREEMPTION_ROUNDS: u64 = 15;
 
 /// What a processor's own periodic timer did while the preemption proof watched it (TASKS item
 /// 66, the review's T66-R1): every gap between its ticks on the TSC, the first from the moment
-/// the watch was armed, kept as the longest and the time of the [`PREEMPTION_ROUNDS`]th tick, and
-/// the timer's programming as the processor read it back at its first tick. The proof's window is
-/// counted in these very ticks, so their rate is checked here: the programming against what the
-/// boot processor's timed proof ran with, the ticks against the TSC.
+/// the watch was armed, kept as the longest; the time of the processor's [`PREEMPTION_ROUNDS`]th
+/// context switch since then (the addendum review's T66-R15); and the timer's programming as the
+/// processor read it back at its first tick. The proof's window is counted in these very ticks,
+/// so their rate is checked here: the programming against what the boot processor's timed proof
+/// ran with, the switches against the TSC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TickWatch {
     /// Whether ticks are being noted.
@@ -177,8 +178,11 @@ pub struct TickWatch {
     pub ticks: u64,
     /// The longest gap.
     pub longest: u64,
-    /// The TSC at the [`PREEMPTION_ROUNDS`]th tick, 0 until then.
-    pub at_rounds: u64,
+    /// The queue's count of context switches when the watch was armed.
+    pub switches_from: u64,
+    /// The TSC just after the [`PREEMPTION_ROUNDS`]th context switch since the watch was armed,
+    /// 0 until then.
+    pub at_switches: u64,
     /// The timer's programming as this processor read it back at its first tick, against the
     /// programming the tick proof timed.
     pub read_back: ReadBack,
@@ -209,7 +213,8 @@ impl TickWatch {
             period: 0,
             ticks: 0,
             longest: 0,
-            at_rounds: 0,
+            switches_from: 0,
+            at_switches: 0,
             read_back: ReadBack::Unread,
         }
     }
@@ -246,8 +251,18 @@ impl TickWatch {
         self.last = now;
         self.ticks += 1;
         self.longest = self.longest.max(gap);
-        if self.ticks == PREEMPTION_ROUNDS {
-            self.at_rounds = now;
+    }
+
+    /// Notes, at TSC `now` just after a scheduling step, that the queue has made `switches`
+    /// context switches in all: the first time [`PREEMPTION_ROUNDS`] of them have come since the
+    /// watch was armed, `now` is their time. Called after every step, so it is never earlier than
+    /// the switch it stamps.
+    pub fn note_switches(&mut self, now: u64, switches: u64) {
+        if self.armed
+            && self.at_switches == 0
+            && switches.wrapping_sub(self.switches_from) >= PREEMPTION_ROUNDS
+        {
+            self.at_switches = now;
         }
     }
 }
@@ -262,12 +277,13 @@ impl Default for TickWatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowVerdict {
     /// Its timer is programmed as the boot processor's timed proof ran it, and its
-    /// [`PREEMPTION_ROUNDS`]th tick came within today's bound.
+    /// [`PREEMPTION_ROUNDS`]th context switch came within today's bound.
     InBounds,
-    /// Its rounds came after today's bound, and a gap of two periods or more shows expiries
-    /// merged while it was away: this run says nothing, and is measured again.
+    /// Its rounds came after today's bound, and a gap of two periods or more between its ticks
+    /// shows expiries merged while it was away: this run says nothing, and is measured again.
     Stalled,
-    /// Its rounds came after today's bound with no such gap: too slow, and it fails.
+    /// Its rounds came after today's bound with no such gap, or it switched fewer than
+    /// [`PREEMPTION_ROUNDS`] times in the whole window: too slow, and it fails.
     Late,
     /// Its timer is programmed otherwise than the boot processor's timed proof ran it (another
     /// initial count, divisor or mode, or a masked entry), or could not be read back: a wrong
@@ -279,8 +295,9 @@ pub enum WindowVerdict {
 
 /// Judges one processor's [`TickWatch`] over a run: it should have taken `wanted` ticks, with its
 /// timer read back as programmed the way the boot processor's timed proof ran it
-/// ([`ReadBack::AsTimed`]), and its [`PREEMPTION_ROUNDS`]th tick within `bound` TSC ticks of the
-/// start (today's bound: 15 rounds in 500 ms). Only [`WindowVerdict::InBounds`] passes.
+/// ([`ReadBack::AsTimed`]), and its [`PREEMPTION_ROUNDS`]th context switch within `bound` TSC
+/// ticks of the start (today's bound since before TASKS item 66: 15 switches in 500 ms of TSC
+/// time; the addendum review's T66-R15). Only [`WindowVerdict::InBounds`] passes.
 ///
 /// The rate is checked by the programming, not by the gaps' spread: under QEMU's software
 /// processor the ticks' delivery jitters, so that a third or more of the gaps of a correct
@@ -294,7 +311,10 @@ pub fn judge_window(watch: &TickWatch, wanted: u64, bound: u64) -> WindowVerdict
         WindowVerdict::Short
     } else if watch.read_back == ReadBack::Unread {
         WindowVerdict::WrongRate
-    } else if watch.at_rounds.saturating_sub(watch.start) <= bound {
+    } else if watch.at_switches == 0 {
+        // Fewer than its rounds in the whole window, whatever the gaps: no stall explains it.
+        WindowVerdict::Late
+    } else if watch.at_switches.saturating_sub(watch.start) <= bound {
         WindowVerdict::InBounds
     } else if watch.longest >= watch.period.saturating_mul(2) {
         WindowVerdict::Stalled
@@ -378,7 +398,16 @@ impl RunQueue {
     /// Starts watching this processor's ticks at TSC `now`, against a period of `period`
     /// TSC ticks ([`TickWatch`]).
     pub fn arm_watch(&mut self, now: u64, period: u64) {
-        self.watch = TickWatch::armed(now, period);
+        self.watch = TickWatch {
+            switches_from: self.switches,
+            ..TickWatch::armed(now, period)
+        };
+    }
+
+    /// Notes, at TSC `now` just after a scheduling step, the switches made so far, if the ticks
+    /// are being watched ([`TickWatch::note_switches`]).
+    pub fn note_switches(&mut self, now: u64) {
+        self.watch.note_switches(now, self.switches);
     }
 
     /// Whether the ticks are being watched: the tick handler then reads the TSC.
@@ -829,6 +858,9 @@ mod tests {
                 w.note_read_back(read_back);
             }
             w.note(at);
+            // A switch at every tick, as the proof's two workers and their processor's own
+            // context make.
+            w.note_switches(at, w.ticks);
         }
         w
     }
@@ -843,7 +875,7 @@ mod tests {
     #[test]
     fn a_window_at_the_programmed_rate_is_in_bounds() {
         let w = watched(&[P; 50]);
-        assert_eq!((w.ticks, w.longest, w.at_rounds), (50, P, 15 * P));
+        assert_eq!((w.ticks, w.longest, w.at_switches), (50, P, 15 * P));
         assert_eq!(judge_window(&w, 50, HALF_SECOND), WindowVerdict::InBounds);
         // Jitter in the ticks' delivery changes nothing: a third of the gaps short, a third long.
         let jittery: alloc::vec::Vec<u64> = (0..50)
@@ -894,6 +926,50 @@ mod tests {
         w.note_read_back(ReadBack::AsTimed);
         w.note(P);
         assert!(!w.first_tick());
+    }
+
+    #[test]
+    fn the_rounds_clause_stamps_the_fifteenth_switch_not_the_fifteenth_tick() {
+        // 50 ticks `gap` apart, armed with the programmed 10 ms period, switching at every
+        // `every`th tick.
+        let watched_switching = |every: u64, gap: u64| {
+            let mut w = TickWatch::armed(0, P);
+            for k in 1..=50 {
+                if w.first_tick() {
+                    w.note_read_back(ReadBack::AsTimed);
+                }
+                w.note(k * gap);
+                w.note_switches(k * gap, k / every);
+            }
+            w
+        };
+        // Switching at every other tick: the 15th switch at 300 ms, in bounds.
+        let half = watched_switching(2, P);
+        assert_eq!(half.at_switches, 30 * P);
+        assert_eq!(
+            judge_window(&half, 50, HALF_SECOND),
+            WindowVerdict::InBounds
+        );
+        // At every third tick of a 12 ms tick: its 15th tick at 180 ms met the old stamp, its
+        // 15th switch at 540 ms does not, and no gap of two periods excuses it: late.
+        let third = watched_switching(3, 12 * P / 10);
+        assert_eq!(third.at_switches, 540_000_000);
+        assert_eq!(judge_window(&third, 50, HALF_SECOND), WindowVerdict::Late);
+        // Fewer than 15 switches in the whole window fails, whatever else.
+        let few = watched_switching(5, P);
+        assert_eq!(few.at_switches, 0);
+        assert_eq!(judge_window(&few, 50, HALF_SECOND), WindowVerdict::Late);
+        // The addendum review's T66-R15: a 40 Hz tick that reads back as timed, switching at
+        // every other tick, whose 15th tick at 375 ms met the old stamp. Its 15th switch is at
+        // 750 ms, with gaps of 2.5 periods: never a pass, and stalled in every run, so it fails at
+        // the proof's last run.
+        let slow = watched_switching(2, 25 * P / 10);
+        assert_eq!(slow.at_switches, 750_000_000);
+        assert_eq!(judge_window(&slow, 50, HALF_SECOND), WindowVerdict::Stalled);
+        // The switches counted are those since the watch was armed.
+        let mut q = RunQueue::new();
+        q.arm_watch(0, P);
+        assert_eq!(q.watch().switches_from, q.switches());
     }
 
     #[test]

@@ -376,6 +376,11 @@ fn with_queue(
             let mut q = queue.lock();
             let old = q.current();
             let next = f(&mut q).unwrap_or(interrupted);
+            // The preemption proof's rounds clause stamps its 15th switch after the step that
+            // made it (TASKS item 66, the addendum review's T66-R15).
+            if q.watching() {
+                q.note_switches(rdtsc());
+            }
             let new = q.current();
             if new != old {
                 switch_fpu(id, old, new);
@@ -1352,7 +1357,7 @@ fn say_window(
     let _ = match verdict {
         (WindowVerdict::InBounds, _) => write!(
             com1,
-            "every timer as timed, every 15th tick within 500 ms{}",
+            "every timer as timed, every 15th switch within 500 ms{}",
             if attempt > 1 {
                 " (after a stalled run)"
             } else {
@@ -1378,10 +1383,14 @@ fn say_window(
                     ),
                     _ => write!(com1, "CPU {id}'s timer could not be read back{what}"),
                 },
+                _ if w.at_switches == 0 => write!(
+                    com1,
+                    "CPU {id} switched fewer than {PREEMPTION_ROUNDS} times in the window{what}"
+                ),
                 _ => write!(
                     com1,
-                    "CPU {id}'s 15th tick at {} ms, longest gap {} ms{}{}",
-                    ms(&w, w.at_rounds.saturating_sub(w.start)),
+                    "CPU {id}'s 15th switch at {} ms, longest gap {} ms{}{}",
+                    ms(&w, w.at_switches.saturating_sub(w.start)),
                     ms(&w, w.longest),
                     if v == WindowVerdict::Stalled {
                         ": "
@@ -1403,10 +1412,10 @@ fn say_window(
 /// machine), within [`WINDOW_BUDGET_SECONDS`]. On each processor, both workers must have run
 /// there, with shares within a factor of two, over at least five full rounds of context
 /// switches; its timer, read back at its first tick, must be programmed as the boot
-/// processor's timed proof ran it, and its 15th tick must come within 500 ms on the TSC,
-/// today's bound (TASKS item 66, the review's T66-R1). A
-/// run whose 15th tick came late with a gap of two periods or more is measured again, up to
-/// [`PREEMPTION_ATTEMPTS`] runs. Then the rest of the thread proofs; each result goes into
+/// processor's timed proof ran it (TASKS item 66, the review's T66-R1), and its 15th context
+/// switch must come within 500 ms on the TSC, today's bound (the addendum review's T66-R15). A
+/// run whose 15th switch came late with a gap of two periods or more between its ticks is
+/// measured again, up to [`PREEMPTION_ATTEMPTS`] runs. Then the rest of the thread proofs; each result goes into
 /// `proofs`, and `kernel_main` decides what they mean (ADR-0013). Fairness counts loop
 /// iterations, which a processor sharing a physical core skews with nothing wrong, so it is a
 /// separate result from preemption.
