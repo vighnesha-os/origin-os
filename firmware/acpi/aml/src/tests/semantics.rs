@@ -109,7 +109,8 @@ fn corpus() -> Vec<Case> {
                 assert_eq!(int(i, "C6"), 0x89AB_CDEF);
                 assert_eq!(int(i, "A0"), 0);
                 assert_eq!(val(i, "T0"), buf(&[1, 0, 0, 0]));
-                assert_eq!(val(i, "T1"), s("0000001F"));
+                // `ToHexString` of an integer: `0x`, no leading zeros (G4, step B5).
+                assert_eq!(val(i, "T1"), s("0x1F"));
                 assert_eq!(int(i, "N0"), 0xFFFF_FFFF);
                 assert_eq!(int(i, "L0"), 0xFFFF_FFFF);
             },
@@ -296,17 +297,20 @@ fn corpus() -> Vec<Case> {
             |i| {
                 assert_eq!(val(i, "T0"), buf(&[1, 0, 0, 0, 0, 0, 0, 0]));
                 assert_eq!(val(i, "T1"), buf(b"ab\0"));
-                assert_eq!(val(i, "T2"), s("000000000000001F"));
-                assert_eq!(val(i, "T3"), s("01,AB"));
+                // G4's texts (TASKS 64's ledger §3; step B5).
+                assert_eq!(val(i, "T2"), s("0x1F"));
+                assert_eq!(val(i, "T3"), s("0x01,0xAB"));
                 assert_eq!(val(i, "T4"), s("123"));
                 assert_eq!(val(i, "T5"), s("1,2"));
                 assert_eq!(int(i, "T6"), 0x1F);
                 assert_eq!(int(i, "T7"), 123);
-                fails(i, "T8", ErrorKind::Type);
+                // String to integer never fails: it stops at the first bad character (G4).
+                assert_eq!(int(i, "T8"), 12);
                 assert_eq!(val(i, "T9"), s("ab"));
                 assert_eq!(val(i, "TA"), s("a"));
                 assert_eq!(int(i, "TB"), 0x1234);
-                assert_eq!(val(i, "TC"), buf(&[]));
+                // Its NUL, an empty string's included (G4; B5's contract, Q8).
+                assert_eq!(val(i, "TC"), buf(&[0]));
             },
         ),
         case(
@@ -361,9 +365,11 @@ fn corpus() -> Vec<Case> {
                     val(i, "I7"),
                     Value::Package(vec![Value::Integer(8), Value::Integer(9)])
                 );
-                assert_eq!(val(i, "I8"), s("41"));
+                // A buffer's implicit text: `0x` before each byte (G4, step B5).
+                assert_eq!(val(i, "I8"), s("0x41"));
                 fails(i, "I9", ErrorKind::Type);
-                fails(i, "IA", ErrorKind::Type);
+                // An empty string is 0, never an error (G4).
+                assert_eq!(int(i, "IA"), 1);
             },
         ),
         case(
@@ -915,7 +921,7 @@ fn corpus() -> Vec<Case> {
                     &[ret(load_table([
                         string("OEMT"),
                         string("ORIGIN"),
-                        string("AMLTEST"),
+                        string("AMLTEST "),
                         string(""),
                         string(""),
                         zero(),
@@ -963,7 +969,7 @@ fn corpus() -> Vec<Case> {
                     crate::TableKey {
                         signature: *b"OEMT",
                         oem_id: *b"ORIGIN",
-                        oem_table_id: *b"AMLTEST\0",
+                        oem_table_id: *b"AMLTEST ",
                     },
                     0x9000,
                     table(b"OEMT", 2, &[name("LTX", byte(8))]),

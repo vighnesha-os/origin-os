@@ -106,7 +106,7 @@ fn access_widths_and_any_access() {
         op_region("MEM", 0, dword(0x1000), byte(16)),
         // A word field at bit 8 under WordAcc spans two words.
         field("MEM", WORD, &[Fe::Reserved(8), Fe::Named("WSPN", 16)]),
-        // AnyAcc: bits 8 to 23 fit one aligned dword (G5).
+        // AnyAcc: byte access (G5, TASKS 64's ledger §3; step B5).
         field("MEM", ANY, &[Fe::Reserved(8), Fe::Named("ANY1", 16)]),
         // DWordAcc on a 64-bit field: two dwords.
         field("MEM", DWORD, &[Fe::Reserved(64), Fe::Named("QW", 64)]),
@@ -126,7 +126,10 @@ fn access_widths_and_any_access() {
         vec![(false, 0x1000, 16, 0x3400), (false, 0x1002, 16, 0x12)]
     );
     assert_eq!(int(&mut i, "RA"), 0x1234);
-    assert_eq!(taken(&mut i), vec![(false, 0x1000, 32, 0x12_3400)]);
+    assert_eq!(
+        taken(&mut i),
+        vec![(false, 0x1001, 8, 0x34), (false, 0x1002, 8, 0x12)]
+    );
     assert_eq!(int(&mut i, "RQ"), 0x1122_3344_5566_7788);
     let t = taken(&mut i);
     assert_eq!(
@@ -162,12 +165,14 @@ fn a_field_past_its_region_is_refused_and_so_is_a_refused_access() {
 
 #[test]
 fn byte_only_spaces_are_read_a_byte_at_a_time() {
+    // SystemCMOS. An EmbeddedControl field wider than a byte is one transfer since step B5 (G5;
+    // `tolerance.rs`).
     let mut i = loaded(&[
-        op_region("EC", 3, zero(), byte(0x10)),
-        field("EC", DWORD, &[Fe::Named("TEMP", 32)]),
+        op_region("CM", 5, zero(), byte(0x10)),
+        field("CM", DWORD, &[Fe::Named("TEMP", 32)]),
         m("RT", &[ret(nm("TEMP"))]),
     ]);
-    i.host_mut().memory.insert((3, None, 2), 0x40);
+    i.host_mut().memory.insert((5, None, 2), 0x40);
     assert_eq!(int(&mut i, "RT"), 0x40_0000);
     let t = taken(&mut i);
     assert_eq!(t.len(), 4);
@@ -338,7 +343,7 @@ fn a_data_table_region_reads_the_table_the_host_names() {
         TableKey {
             signature: *b"OEMX",
             oem_id: *b"ORIGIN",
-            oem_table_id: *b"AMLTEST\0",
+            oem_table_id: *b"AMLTEST ",
         },
         0x7000,
         // A sound table of 64 bytes: the copy is checked before its address is taken (B2-14).
@@ -349,7 +354,7 @@ fn a_data_table_region_reads_the_table_the_host_names() {
         &[m(
             "RD",
             &[
-                data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST")),
+                data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST ")),
                 field("DTR", BYTE, &[Fe::Reserved(8 * 10), Fe::Named("B10", 8)]),
                 ret(nm("B10")),
             ],
@@ -370,7 +375,7 @@ fn a_data_table_regions_check_is_counted_as_work() {
             TableKey {
                 signature: *b"OEMX",
                 oem_id: *b"ORIGIN",
-                oem_table_id: *b"AMLTEST\0",
+                oem_table_id: *b"AMLTEST ",
             },
             0x7000,
             table(b"OEMX", 2, &[vec![0; body_bytes]]),
@@ -380,7 +385,7 @@ fn a_data_table_regions_check_is_counted_as_work() {
             &[m(
                 "RD",
                 &[
-                    data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST")),
+                    data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST ")),
                     ret(one()),
                 ],
             )],
@@ -443,7 +448,7 @@ fn a_data_table_region_is_refused_on_a_copy_that_fails_its_check() {
             TableKey {
                 signature: *b"OEMX",
                 oem_id: *b"ORIGIN",
-                oem_table_id: *b"AMLTEST\0",
+                oem_table_id: *b"AMLTEST ",
             },
             0x7000,
             bytes,
@@ -453,7 +458,7 @@ fn a_data_table_region_is_refused_on_a_copy_that_fails_its_check() {
             &[m(
                 "RD",
                 &[
-                    data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST")),
+                    data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST ")),
                     ret(one()),
                 ],
             )],
@@ -469,7 +474,9 @@ fn a_data_table_region_is_refused_on_a_copy_that_fails_its_check() {
 }
 
 #[test]
-fn strings_are_written_a_character_at_a_time_and_long_buffers_in_pieces() {
+fn strings_are_written_as_their_bytes_and_long_buffers_in_pieces() {
+    // G15 (TASKS 64's ledger §3; step B5): a string is its bytes, cut to the field, in one write.
+    // A buffer longer than the field is still written in pieces (Table 19.7).
     let mut i = loaded(&[
         op_region("IO", 1, word(0x80), one()),
         field("IO", BYTE, &[Fe::Named("PORT", 8)]),
@@ -480,10 +487,7 @@ fn strings_are_written_a_character_at_a_time_and_long_buffers_in_pieces() {
         ),
     ]);
     int(&mut i, "WS");
-    assert_eq!(
-        taken(&mut i),
-        vec![(true, 0x80, 8, 0x41), (true, 0x80, 8, 0x42)]
-    );
+    assert_eq!(taken(&mut i), vec![(true, 0x80, 8, 0x41)]);
     int(&mut i, "WB");
     assert_eq!(
         taken(&mut i),
@@ -929,16 +933,20 @@ fn a_tracing_host_hears_loads_calls_accesses_and_limits() {
     let leaves = ev.iter().filter(|e| **e == Event::Leave).count();
     assert_eq!((enters, leaves), (64, 64));
     assert_eq!(ev.last(), Some(&Event::Limit(Limit::Depth)));
-    // A failed load is told.
-    assert_eq!(
-        load(&mut i, &[m("X", &[]), m("X", &[])]).unwrap_err().kind,
-        ErrorKind::Duplicate
-    );
+    // A failed load is told: a reserved opcode fails it whole (since step B5 a duplicate is
+    // abandoned alone).
+    assert!(matches!(
+        load(&mut i, &[m("X", &[]), vec![0x02]]).unwrap_err().kind,
+        ErrorKind::Reserved { .. }
+    ));
     assert_eq!(
         take(&mut i),
         [
             Event::Load(*b"SSDT"),
-            Event::Loaded(Err(ErrorKind::Duplicate))
+            Event::Loaded(Err(ErrorKind::Reserved {
+                first: 0x02,
+                second: None
+            }))
         ]
     );
 }

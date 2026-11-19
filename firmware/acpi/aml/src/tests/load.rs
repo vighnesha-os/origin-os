@@ -313,10 +313,12 @@ fn a_block_not_signed_ssdt_gives_zero() {
 
 #[test]
 fn a_term_list_that_fails_gives_zero_and_takes_its_names_back() {
+    // A failure the parser cannot step past (step B5: a statement that fails as it runs is only
+    // abandoned, `tolerance.rs`).
     gives_zero(ssdt(&[
         name("QA0", one()),
         device("QAD", &[name("QAX", one())]),
-        store(nm("\\NOPE"), debug()),
+        vec![0x02],
         name("QA1", one()),
     ]));
 }
@@ -379,8 +381,9 @@ fn r5_a_fatal_inside_a_loaded_table_ends_the_evaluation() {
 #[test]
 fn break_and_continue_in_a_loaded_table_stop_at_its_block() {
     // The hand-over's point 2, agreed by the review: `leave_loop` meets the table's block and
-    // answers `NotInLoop`, so the load fails with Zero and its names go; the method's own loop
-    // around the `Load` is not left, and runs all its passes.
+    // answers `NotInLoop`; the method's own loop around the `Load` is not left, and runs all its
+    // passes. Since step B5 `NotInLoop` abandons only its statement: the table loads once, and the
+    // later passes find it already loaded.
     for stray in [brk(), cont()] {
         let t = ssdt(&[name("QA0", one()), stray]);
         let mut i = loaded(
@@ -410,14 +413,33 @@ fn break_and_continue_in_a_loaded_table_stop_at_its_block() {
             .into_iter()
             .filter(|e| matches!(e, Event::Loaded(_)))
             .collect();
-        assert_eq!(ended, vec![Event::Loaded(Err(ErrorKind::NotInLoop)); 3]);
-        assert_eq!(named(&i, b"QA"), 0);
+        assert!(
+            matches!(ended.as_slice(), [Event::Loaded(Ok(_))]),
+            "{ended:?}"
+        );
+        assert_eq!(named(&i, b"QA"), 1);
+        let t = told(&mut i);
+        assert!(
+            matches!(
+                t.as_slice(),
+                [
+                    Told::Abandoned {
+                        kind: ErrorKind::NotInLoop,
+                        ..
+                    },
+                    Told::AlreadyLoaded(_),
+                    Told::AlreadyLoaded(_)
+                ]
+            ),
+            "{t:?}"
+        );
     }
 }
 
 #[test]
 fn a_table_loaded_twice_fails_at_its_first_duplicate() {
-    // Q7.
+    // Q7, as ruled for step B5: a table already loaded is refused whole, before anything of it is
+    // created, and reported.
     let mut i = loaded(
         IntegerWidth::Bits64,
         &[
@@ -426,13 +448,14 @@ fn a_table_loaded_twice_fails_at_its_first_duplicate() {
         ],
     );
     assert_eq!(get(&mut i, "LD"), u64::MAX);
-    let nodes = i.node_count();
+    let (nodes, tables) = (i.node_count(), i.table_count());
+    let _ = told(&mut i);
     assert_eq!(get(&mut i, "LD"), 0);
+    assert_eq!(told(&mut i), vec![Told::AlreadyLoaded(tables as u32 - 1)]);
     assert_eq!(i.node_count(), nodes);
+    assert_eq!(i.table_count(), tables, "no entry for the refused one");
     assert_eq!(named(&i, b"QA"), 3, "the first load's names stay");
-    let last = (i.table_count() - 1) as u32;
-    assert!(i.table(last).unwrap().failed);
-    assert!(!i.table(last - 1).unwrap().failed);
+    assert!(!i.table(tables as u32 - 1).unwrap().failed);
 }
 
 #[test]
@@ -460,10 +483,16 @@ fn a_table_a_failed_block_loaded_stays() {
         &[
             name("TB", buffer_of(&qa())),
             load_op("\\TB", none()),
-            store(nm("\\NOPE"), debug()),
+            vec![0x02],
         ],
     );
-    assert_eq!(r.map_err(|e| e.kind), Err(ErrorKind::NotFound));
+    assert_eq!(
+        r.map_err(|e| e.kind),
+        Err(ErrorKind::Reserved {
+            first: 0x02,
+            second: None
+        })
+    );
     assert!(!exists(&i, "\\TB"), "the block is rolled back");
     assert_eq!(get(&mut i, "\\QAM"), 7);
     assert_eq!(i.node_count(), before + 3);
@@ -489,11 +518,7 @@ fn r4_a_completed_tables_names_under_a_failing_outer_tables_object_go_with_it() 
         alias("\\QOD", "\\QAL"),
         m("QIM", &[ret(nm("\\QOD.QIX"))]),
     ]);
-    let outer = ssdt(&[
-        device("\\QOD", &[]),
-        load_op("\\TI", none()),
-        store(nm("\\NOPE"), debug()),
-    ]);
+    let outer = ssdt(&[device("\\QOD", &[]), load_op("\\TI", none()), vec![0x02]]);
     let mut i = loaded(
         IntegerWidth::Bits64,
         &[
@@ -569,7 +594,9 @@ fn a_limit_inside_a_loaded_table_ends_the_evaluation_and_rolls_it_back() {
 
 #[test]
 fn a_table_that_loads_itself_is_bounded_by_the_call_depth() {
-    // Its first term loads it again: each load is a level of the call depth.
+    // Its first term loads it again. Since step B5 that load is of a table already loaded (the
+    // one loading), refused and reported, and the table loads; a load is still a level of the
+    // call depth (`nested_loads_run_on_a_fixed_native_stack`).
     let mut i = interp(IntegerWidth::Bits64);
     let me = ssdt(&[load_op("\\TB", none()), name("QA0", one())]);
     load(
@@ -580,15 +607,16 @@ fn a_table_that_loads_itself_is_bounded_by_the_call_depth() {
         ],
     )
     .unwrap();
-    let nodes = i.node_count();
-    assert_eq!(fails(&mut i, "LD"), ErrorKind::Limit(Limit::Depth));
-    assert_eq!(i.node_count(), nodes);
-    assert_eq!(named(&i, b"QA"), 0);
+    let first = i.table_count() as u32;
+    let _ = told(&mut i);
+    assert_eq!(get(&mut i, "LD"), u64::MAX);
+    assert_eq!(told(&mut i), vec![Told::AlreadyLoaded(first)]);
+    assert_eq!(named(&i, b"QA"), 1);
 }
 
 #[test]
 fn a_load_that_fails_inside_a_load_leaves_the_outer_one_whole() {
-    let inner = ssdt(&[name("QB0", one()), store(nm("\\NOPE"), debug())]);
+    let inner = ssdt(&[name("QB0", one()), vec![0x02]]);
     let outer = ssdt(&[
         name("QA0", one()),
         name("RIN", int(3)),
@@ -626,14 +654,10 @@ fn a_load_is_traced() {
         .iter()
         .filter(|e| matches!(e, Event::Load(_) | Event::Loaded(_)))
         .collect();
+    // The second is the same table: refused before it starts (B4's Q7, as ruled for step B5).
     assert_eq!(
         loads,
-        vec![
-            &Event::Load(*b"SSDT"),
-            &Event::Loaded(Ok(first)),
-            &Event::Load(*b"SSDT"),
-            &Event::Loaded(Err(ErrorKind::Duplicate)),
-        ]
+        vec![&Event::Load(*b"SSDT"), &Event::Loaded(Ok(first))]
     );
 }
 
@@ -763,7 +787,7 @@ fn every_memory_refusal_in_a_load_leaves_the_trace_balanced_and_no_name() {
 
 // --- `LoadTable` -------------------------------------------------------------------------------
 
-const KEY: (&[u8; 4], &[u8; 6], &[u8; 8]) = (b"OEMT", b"ORIGIN", b"AMLTEST\0");
+const KEY: (&[u8; 4], &[u8; 6], &[u8; 8]) = (b"OEMT", b"ORIGIN", b"AMLTEST ");
 
 /// The table the host lists under [`KEY`]: names under the prefix `QF`. The encoder pads its
 /// table ID with a space, as firmware does; the key from AML strings is padded with NUL (G18).
@@ -777,7 +801,7 @@ fn load_table_loads_what_the_host_lists() {
         IntegerWidth::Bits64,
         &[m(
             "LT",
-            &[load_table_of("OEMT", "ORIGIN", "AMLTEST", "", "", zero())],
+            &[load_table_of("OEMT", "ORIGIN", "AMLTEST ", "", "", zero())],
         )],
     );
     host_table(&mut i, KEY, qf());
@@ -811,7 +835,7 @@ fn load_table_loads_under_its_root_path_and_stores_its_parameter() {
                 &[load_table_of(
                     "OEMT",
                     "ORIGIN",
-                    "AMLTEST",
+                    "AMLTEST ",
                     "\\DV",
                     "QF1",
                     int(42),
@@ -839,7 +863,7 @@ fn load_table_takes_a_parameter_path_from_the_root_as_written() {
                 &[load_table_of(
                     "OEMT",
                     "ORIGIN",
-                    "AMLTEST",
+                    "AMLTEST ",
                     "DV",
                     "\\PRM",
                     int(42),
@@ -861,7 +885,7 @@ fn a_parameter_that_names_nothing_is_an_error_and_the_table_stays() {
             &[load_table_of(
                 "OEMT",
                 "ORIGIN",
-                "AMLTEST",
+                "AMLTEST ",
                 "",
                 "NONE",
                 int(1),
@@ -882,7 +906,7 @@ fn a_root_path_that_names_nothing_is_an_error() {
             &[load_table_of(
                 "OEMT",
                 "ORIGIN",
-                "AMLTEST",
+                "AMLTEST ",
                 "\\NODV",
                 "",
                 zero(),
@@ -906,7 +930,7 @@ fn r6_a_root_path_that_is_not_a_scope_object_is_refused() {
                 &[load_table_of(
                     "OEMT",
                     "ORIGIN",
-                    "AMLTEST",
+                    "AMLTEST ",
                     "\\NI",
                     "",
                     zero(),
@@ -933,7 +957,7 @@ fn load_table_of_a_dsdt_or_ssdt_key_gives_zero() {
     for sig in ["DSDT", "SSDT"] {
         let body = [m(
             "LT",
-            &[load_table_of(sig, "ORIGIN", "AMLTEST", "", "", zero())],
+            &[load_table_of(sig, "ORIGIN", "AMLTEST ", "", "", zero())],
         )];
         let mut i = loaded(IntegerWidth::Bits64, &body);
         let s: [u8; 4] = sig.as_bytes().try_into().unwrap();
@@ -949,10 +973,12 @@ fn load_table_of_a_dsdt_or_ssdt_key_gives_zero() {
 
 #[test]
 fn keys_too_long_are_errors() {
+    // An OEM ID or OEM table ID longer than its field is `Range`. A signature is its first four
+    // characters, a longer one not an error, a shorter one `Name` (G18, step B5).
     let mut i = loaded(
         IntegerWidth::Bits64,
         &[
-            m("K1", &[load_table_of("OEMTX", "", "", "", "", zero())]),
+            m("K1", &[load_table_of("OEM", "", "", "", "", zero())]),
             m(
                 "K2",
                 &[load_table_of("OEMT", "ORIGIN7", "", "", "", zero())],
@@ -961,11 +987,14 @@ fn keys_too_long_are_errors() {
                 "K3",
                 &[load_table_of("OEMT", "", "AMLTEST99", "", "", zero())],
             ),
+            m("K4", &[load_table_of("OEMTX", "", "", "", "", zero())]),
         ],
     );
-    for k in ["K1", "K2", "K3"] {
+    assert_eq!(fails(&mut i, "K1"), ErrorKind::Name);
+    for k in ["K2", "K3"] {
         assert_eq!(fails(&mut i, k), ErrorKind::Range, "{k}");
     }
+    assert_eq!(get(&mut i, "K4"), 0, "no table listed: Zero, not an error");
 }
 
 #[test]
@@ -996,7 +1025,7 @@ fn a_host_copy_that_fails_its_check_gives_zero() {
             IntegerWidth::Bits64,
             &[m(
                 "LT",
-                &[load_table_of("OEMT", "ORIGIN", "AMLTEST", "", "", zero())],
+                &[load_table_of("OEMT", "ORIGIN", "AMLTEST ", "", "", zero())],
             )],
         );
         host_table(&mut i, KEY, bytes);
@@ -1274,7 +1303,7 @@ fn r8_load_tables_parameter_needing_its_pci_function_ends_once() {
         0,
         &[
             name("TMP0", one()),
-            load_table_of("OEMT", "ORIGIN", "AMLTEST", "", F1, int(0x42)),
+            load_table_of("OEMT", "ORIGIN", "AMLTEST ", "", F1, int(0x42)),
         ],
     )]);
     host_table(&mut i, KEY, qf());
@@ -1292,7 +1321,7 @@ fn r8_load_tables_parameter_needing_its_pci_function_ends_once() {
 
 #[test]
 fn r9_a_failing_term_list_gives_zero_into_a_pci_target() {
-    let midway = ssdt(&[name("QB0", one()), store(nm("\\NOPE"), debug())]);
+    let midway = ssdt(&[name("QB0", one()), vec![0x02]]);
     let mut i = with_pci(&[
         name("TF", buffer_of(&midway)),
         method("LD", 0, &[ret(load_op("TF", nm(F1)))]),
@@ -1306,7 +1335,10 @@ fn r9_a_failing_term_list_gives_zero_into_a_pci_target() {
         loads_traced(&mut i),
         vec![
             Event::Load(*b"SSDT"),
-            Event::Loaded(Err(ErrorKind::NotFound))
+            Event::Loaded(Err(ErrorKind::Reserved {
+                first: 0x02,
+                second: None
+            }))
         ]
     );
     assert_eq!(i.node_count(), nodes);
@@ -1353,7 +1385,7 @@ fn a_pending_at_a_loads_end_fails_closed() {
     let r1_state = (i.node_count(), exists(&i, "\\LD.TMP0"), f1(&i));
     let r1_rest = (i.frames.len(), i.owners.len(), i.pending.is_none());
     // `fail_load`'s Zero into its target.
-    let midway = ssdt(&[name("QB0", one()), store(nm("\\NOPE"), debug())]);
+    let midway = ssdt(&[name("QB0", one()), vec![0x02]]);
     let mut j = with_pci(&[
         name("TF", buffer_of(&midway)),
         method("LD", 0, &[ret(load_op("TF", nm(F1)))]),
@@ -1367,7 +1399,7 @@ fn a_pending_at_a_loads_end_fails_closed() {
         &[load_table_of(
             "OEMT",
             "ORIGIN",
-            "AMLTEST",
+            "AMLTEST ",
             "",
             F1,
             int(0x42),
@@ -1420,7 +1452,7 @@ fn parameter_case(param: &str, more: &[B], limits: Limits) -> Interp {
                     load_table([
                         string("OEMT"),
                         string("ORIGIN"),
-                        string("AMLTEST"),
+                        string("AMLTEST "),
                         string(""),
                         string(param),
                         int(0x42),
@@ -1622,7 +1654,8 @@ fn caller_case(body: &[B]) -> (Interp, Result<Option<Value>, ErrorKind>, Vec<Eve
     (i, r, ended)
 }
 
-/// The load failed `Grammar` with Zero, rolled back, and the caller's local, its argument's
+/// Each statement naming a local or an argument was refused (`OutsideMethod`) and, since step
+/// B5, abandoned alone and reported; the table loaded, and the caller's local, its argument's
 /// target and `\\X` are as they were.
 #[track_caller]
 fn refused_at_table_level(body: &[B]) {
@@ -1632,11 +1665,26 @@ fn refused_at_table_level(body: &[B]) {
         Ok(Some(Value::Integer(5))),
         "the caller's Local0 untouched"
     );
-    assert_eq!(ended, vec![Event::Loaded(Err(ErrorKind::Grammar))]);
-    assert_eq!(get(&mut i, "\\RES"), 0, "Zero");
+    assert!(
+        matches!(ended.as_slice(), [Event::Loaded(Ok(_))]),
+        "{ended:?}"
+    );
+    assert_eq!(get(&mut i, "\\RES"), u64::MAX, "True");
     assert_eq!(get(&mut i, "\\GLB"), 0x11, "nothing written through Arg0");
     assert_eq!(get(&mut i, "\\X"), 0);
-    assert_eq!(named(&i, b"QL"), 0, "rolled back");
+    assert_eq!(named(&i, b"QL"), 1, "the table loaded");
+    let t = told(&mut i);
+    assert!(!t.is_empty());
+    assert!(
+        t.iter().all(|r| matches!(
+            r,
+            Told::Abandoned {
+                kind: ErrorKind::OutsideMethod,
+                ..
+            }
+        )),
+        "{t:?}"
+    );
     at_rest(&i);
 }
 
@@ -1648,12 +1696,16 @@ fn n5_a_loaded_tables_table_level_cannot_use_its_callers_locals_or_arguments() {
         store(byte(0x99), local(0)),
         store(byte(0x77), arg(0)),
     ]);
-    // The same block loaded by the host fails `Grammar` too: there is no method at all.
+    // The same block loaded by the host is refused the same way: there is no method at all.
     let mut i = interp(IntegerWidth::Bits64);
-    assert_eq!(
-        load(&mut i, &[store(byte(0x99), local(0))]).map_err(|e| e.kind),
-        Err(ErrorKind::Grammar)
-    );
+    assert_eq!(load(&mut i, &[store(byte(0x99), local(0))]), Ok(0));
+    assert!(matches!(
+        told(&mut i).as_slice(),
+        [Told::Abandoned {
+            kind: ErrorKind::OutsideMethod,
+            ..
+        }]
+    ));
 }
 
 #[test]
@@ -1750,7 +1802,9 @@ fn planted_faults_are_caught_by_the_load_tests() {
             &[a_buffer_loads_its_names_stay_and_the_target_holds_true],
         ),
         (
-            Some(Fault::AllowDuplicate),
+            // Since step B5 a table already loaded is refused by its identity, not at a
+            // duplicate name: `AllowDuplicate` is caught in `tolerance.rs`.
+            Some(Fault::LoadTwice),
             &[a_table_loaded_twice_fails_at_its_first_duplicate],
         ),
         (
