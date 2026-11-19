@@ -496,6 +496,9 @@ pub(crate) enum Fault {
     /// Every report past the bound is counted a tolerance, as before the review of B5's answers,
     /// B5-R14 (`tolerate.rs`, `tell_suppressed`).
     SuppressedAsOne,
+    /// A failed table's bytes go at once, before its listed names are bound, as before the
+    /// second addendum to the review of B5, B5-R15 (`load.rs`, `fail_table`).
+    ReleaseBeforeBinding,
     /// A string byte above 0x7F fails the table, as before step B5 (`engine.rs`,
     /// `decode_string`).
     RefuseHighBytes,

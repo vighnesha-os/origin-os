@@ -378,9 +378,10 @@ impl<H: Host> Interpreter<H> {
                 Ok(index)
             }
             Err(e) => {
-                // The table's identity stays; its bytes go (the review of B1, F7). Its methods
-                // already fail `TableFailed`, and a name kept in a package pointing into it now
-                // fails `Truncated`.
+                // The table's identity stays; its bytes go (the review of B1, F7) once no name
+                // it put in a package is listed, so that `bind_deferred` can still read those
+                // (B5-R15). Its methods already fail `TableFailed`, and a name kept in a package
+                // pointing into it fails `Truncated` once the bytes are gone.
                 self.fail_table(index);
                 self.abort(marks, &e);
                 self.end_evaluation();
@@ -1978,5 +1979,6 @@ impl<H: Host> Interpreter<H> {
     pub(crate) fn prune_deferred(&mut self) {
         let heap = &self.heap;
         self.deferred.retain(|&r| heap.marked(r));
+        self.release_failed_bytes();
     }
 }

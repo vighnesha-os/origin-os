@@ -1117,16 +1117,23 @@ fn a_loop_of_packages_with_names_keeps_no_more_alive_than_one_without() {
 }
 
 #[test]
-fn a_failed_runtime_loads_name_in_an_older_object_is_bound() {
-    // B5-R10, a failed load's side: a run-time table stores a package naming `\NONF` into `\GQ`,
-    // a boot table's, then fails whole (a reserved opcode). Its own names are rolled back, but
-    // `\GQ` still reads the package, so its name is bound at the load's end, here reported as
-    // naming nothing; the evaluation goes on with `Load`'s Zero.
-    let bad = ssdt(&[store(package(1, &[nm("\\NONF")]), nm("\\GQ")), vec![0x02]]);
+fn a_failed_runtime_loads_names_in_an_older_object_are_bound() {
+    // B5-R10, a failed load's side, and the second addendum's B5-R15: a run-time table stores a
+    // package naming `\EXST`, which a boot table made, and `\NONF`, which names nothing, into
+    // `\GQ`, a boot table's, then fails whole (a reserved opcode). Its own names are rolled back,
+    // but `\GQ` still reads the package, so its names are bound at the load's end, from the
+    // table's bytes, which go only after: `\EXST` to its node, `\NONF` empty and reported. The
+    // evaluation goes on with `Load`'s Zero.
+    let body = [
+        store(package(2, &[nm("\\EXST"), nm("\\NONF")]), nm("\\GQ")),
+        vec![0x02],
+    ];
+    let bad = ssdt(&body);
     let mut i = fresh();
     load(
         &mut i,
         &[
+            name("EXST", byte(7)),
             name("GQ", package(1, &[])),
             name("TB", buffer_of(&bad)),
             method("LD", 0, &[ret(load_op("TB", zero()))]),
@@ -1135,14 +1142,56 @@ fn a_failed_runtime_loads_name_in_an_older_object_is_bound() {
     .unwrap();
     assert_eq!(int(&mut i, "LD"), 0);
     assert!(i.table(1).unwrap().failed);
-    // In the run-time table: `Store`, `Package`, its length and its count, a byte each: the name
-    // at 4.
-    assert_eq!(told(&mut i), vec![Told::Unbound(4)]);
+    assert_eq!(told(&mut i), vec![Told::Unbound(found(&body, "\\NONF"))]);
     assert_eq!(
         eval(&mut i, "GQ"),
-        Ok(Some(Value::Package(vec![Value::Uninitialized])))
+        Ok(Some(Value::Package(vec![
+            Value::Integer(7),
+            Value::Uninitialized
+        ])))
     );
     assert!(i.deferred.is_empty());
+    assert!(i.tables[1].aml.is_empty(), "the failed table's bytes kept");
+}
+
+#[test]
+fn a_failed_boot_tables_names_in_an_older_object_are_bound() {
+    // The second addendum to the review of B5, B5-R15: a boot table stores a package naming
+    // `\EXST` and `\NONB` into `\GQ`, an earlier table's, then fails whole. Its bytes stay while
+    // those names are listed, so `bind_deferred` binds `\EXST` to its node and reports `\NONB`;
+    // then they go. A failed table that listed no name gives its bytes back at once.
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[name("EXST", byte(7)), name("GQ", package(1, &[]))],
+    )
+    .unwrap();
+    let body = [
+        store(package(2, &[nm("\\EXST"), nm("\\NONB")]), nm("\\GQ")),
+        vec![0x02],
+    ];
+    assert!(load(&mut i, &body).is_err());
+    assert!(i.table(1).unwrap().failed);
+    assert!(
+        !i.tables[1].aml.is_empty(),
+        "the bytes went before the pass"
+    );
+    assert!(load(&mut i, &[name("PLN", one()), vec![0x02]]).is_err());
+    assert!(
+        i.tables[2].aml.is_empty(),
+        "a table with no listed name kept its bytes"
+    );
+    let _ = told(&mut i);
+    assert_eq!(i.bind_deferred(), Ok(1));
+    assert_eq!(told(&mut i), vec![Told::Unbound(found(&body, "\\NONB"))]);
+    assert_eq!(
+        eval(&mut i, "GQ"),
+        Ok(Some(Value::Package(vec![
+            Value::Integer(7),
+            Value::Uninitialized
+        ])))
+    );
+    assert!(i.tables[1].aml.is_empty(), "the bytes kept after the pass");
 }
 
 #[test]
@@ -1196,7 +1245,8 @@ fn every_tolerance_test_fails_without_its_reports() {
         a_limit_in_a_runtime_loads_pass_fails_the_table,
         what_an_abandoned_while_stored_on_its_earlier_passes_is_bound,
         a_loop_of_packages_with_names_keeps_no_more_alive_than_one_without,
-        a_failed_runtime_loads_name_in_an_older_object_is_bound,
+        a_failed_runtime_loads_names_in_an_older_object_are_bound,
+        a_failed_boot_tables_names_in_an_older_object_are_bound,
         high_bytes_accepted_and_reported,
         unterminated_string_ends_at_its_range,
         unterminated_string_in_a_package,
@@ -1211,7 +1261,7 @@ fn every_tolerance_test_fails_without_its_reports() {
 
 #[test]
 fn planted_faults_are_caught_by_the_tolerance_tests() {
-    let tests: [Control; 10] = [
+    let tests: [Control; 11] = [
         (
             Some(Fault::AllowDuplicate),
             &[duplicate_keeps_the_first_object],
@@ -1241,7 +1291,8 @@ fn planted_faults_are_caught_by_the_tolerance_tests() {
                 names_nothing_can_read_are_never_bound_whether_or_not_the_collector_ran,
                 what_an_abandoned_while_stored_on_its_earlier_passes_is_bound,
                 a_loop_of_packages_with_names_keeps_no_more_alive_than_one_without,
-                a_failed_runtime_loads_name_in_an_older_object_is_bound,
+                a_failed_runtime_loads_names_in_an_older_object_are_bound,
+                a_failed_boot_tables_names_in_an_older_object_are_bound,
                 a_place_naming_a_method_is_skipped_as_a_name,
                 a_place_naming_a_method_before_a_device_keeps_the_device,
                 a_place_naming_a_method_in_a_body_does_not_run_past_it,
@@ -1283,7 +1334,14 @@ fn planted_faults_are_caught_by_the_tolerance_tests() {
         ),
         (
             Some(Fault::NoFailedPass),
-            &[a_failed_runtime_loads_name_in_an_older_object_is_bound],
+            &[a_failed_runtime_loads_names_in_an_older_object_are_bound],
+        ),
+        (
+            Some(Fault::ReleaseBeforeBinding),
+            &[
+                a_failed_runtime_loads_names_in_an_older_object_are_bound,
+                a_failed_boot_tables_names_in_an_older_object_are_bound,
+            ],
         ),
         (
             Some(Fault::SkipCallsInPlaces),

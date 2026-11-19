@@ -644,16 +644,23 @@ impl<H: Host> Interpreter<H> {
         self.load_result(l.op, target, false)
     }
 
-    /// Marks table `index` failed and gives its bytes back. The names it put in packages stay
-    /// listed: a boot table's are bound by [`Interpreter::bind_deferred`], a run-time load's at
-    /// its end (`fail_load`); those of a load an aborted evaluation failed are bound by
-    /// `bind_deferred` if it has yet to run, and are otherwise looked up when read (B5-R10).
+    /// Marks table `index` failed. The names it put in packages stay listed: a boot table's are
+    /// bound by [`Interpreter::bind_deferred`], a run-time load's at its end (`fail_load`); those
+    /// of a load an aborted evaluation failed are bound by `bind_deferred` if it has yet to run,
+    /// and are otherwise looked up when read (B5-R10). A listed name is read from the table's
+    /// bytes, so they go only once none is listed, still charged to the memory limit until then
+    /// (the review of B5's second addendum, B5-R15; `release_failed_bytes`). Planted
+    /// (`ReleaseBeforeBinding`), they go at once, as before.
     pub(crate) fn fail_table(&mut self, index: u32) {
         if let Some(t) = self.tables.get_mut(us(index)) {
             t.failed = true;
-            let aml = core::mem::take(&mut t.aml);
-            mem::release(aml, &mut self.budget);
+            #[cfg(test)]
+            if crate::tests::planted(crate::tests::Fault::ReleaseBeforeBinding) {
+                let aml = core::mem::take(&mut t.aml);
+                mem::release(aml, &mut self.budget);
+            }
         }
+        self.release_failed_bytes();
     }
 
     /// Fails every table a [`Loading`] frame above `frames` was loading, when an evaluation is

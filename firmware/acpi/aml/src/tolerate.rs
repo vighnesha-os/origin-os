@@ -513,7 +513,39 @@ impl<H: Host> Interpreter<H> {
             self.set_bind(r, bound);
         }
         self.deferred.truncate(from);
+        self.release_failed_bytes();
         Ok(empty)
+    }
+
+    /// Gives back the bytes of every failed table that no listed name reads from (the review of
+    /// B5's second addendum, B5-R15): a failed table's listed names are read from its bytes when
+    /// a pass binds them. A unit of work for each table, and for each entry read for a failed
+    /// table that still holds its bytes; there is seldom one.
+    pub(crate) fn release_failed_bytes(&mut self) {
+        let mut work = u64::try_from(self.tables.len()).unwrap_or(u64::MAX);
+        let mut k = 0usize;
+        while let Some(t) = self.tables.get(k) {
+            let here = k;
+            let index = u32::try_from(here).unwrap_or(u32::MAX);
+            k = k.saturating_add(1);
+            if !t.failed || t.aml.is_empty() {
+                continue;
+            }
+            let at = self
+                .deferred
+                .iter()
+                .position(|&r| self.elem(r).is_some_and(|e| e.table == index));
+            let read = at.map_or(self.deferred.len(), |p| p.saturating_add(1));
+            work = work.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            if at.is_some() {
+                continue;
+            }
+            if let Some(t) = self.tables.get_mut(here) {
+                let aml = core::mem::take(&mut t.aml);
+                mem::release(aml, &mut self.budget);
+            }
+        }
+        self.note_work(work);
     }
 
     /// Takes off the deferred list what nothing can read: a marking from the collector's roots,
