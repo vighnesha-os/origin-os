@@ -455,11 +455,15 @@ impl Heap {
         }
     }
 
-    /// The name kept in a package at slot `i`, if that slot holds one (the soak's audit).
+    /// The name kept in a package at slot `i`, if that slot holds one and the last marking
+    /// reached it (the soak's audit).
     #[cfg(test)]
-    pub(crate) fn name_elem_at(&self, i: usize) -> Option<NameElem> {
-        match self.slots.get(i).map(|s| &s.obj) {
-            Some(Object::NameElem(e)) => Some(*e),
+    pub(crate) fn marked_name_elem_at(&self, i: usize) -> Option<NameElem> {
+        match self.slots.get(i) {
+            Some(s) if s.mark => match &s.obj {
+                Object::NameElem(e) => Some(*e),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -505,6 +509,13 @@ impl Heap {
             Some(r) => self.mark_obj(r, budget),
             None => true,
         }
+    }
+
+    /// Whether the last marking reached the object `r` names.
+    pub(crate) fn marked(&self, r: ObjRef) -> bool {
+        self.slots
+            .get(index(r.index))
+            .is_some_and(|s| s.generation == r.generation && s.mark)
     }
 
     fn mark_obj(&mut self, r: ObjRef, budget: &mut Budget) -> bool {

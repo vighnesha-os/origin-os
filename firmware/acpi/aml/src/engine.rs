@@ -701,9 +701,21 @@ impl<H: Host> Interpreter<H> {
         if self.budget.used() <= self.gc_threshold {
             return None;
         }
+        let roots = self.root_work();
+        self.collect_garbage();
+        let used = self.budget.used();
+        let gap = (self.budget.limit().saturating_sub(used) / 2).max(64 << 10);
+        self.gc_threshold = used.saturating_add(gap).min(self.budget.limit());
+        // Marking reads every element of every live package, however few the slots: a unit each.
+        let traced = self.heap.take_traced();
+        Some(roots.saturating_add(traced))
+    }
+
+    /// A marking's work besides what it traces: a unit for each eight slots, and one for each
+    /// root besides the namespace's (every frame, activation and hold), each entry of the
+    /// deferred list, and each table and creator the recount after a collection reads.
+    pub(crate) fn root_work(&self) -> u64 {
         let slots = u64::try_from(self.heap.slot_count()).unwrap_or(u64::MAX);
-        // Besides the slots, the collector reads every frame, activation and hold as roots, and
-        // the recount that follows every table and creator: a unit each.
         let roots = [
             self.frames.len(),
             self.calls.len(),
@@ -716,13 +728,7 @@ impl<H: Host> Interpreter<H> {
         .fold(0u64, |n, &k| {
             n.saturating_add(u64::try_from(k).unwrap_or(u64::MAX))
         });
-        self.collect_garbage();
-        let used = self.budget.used();
-        let gap = (self.budget.limit().saturating_sub(used) / 2).max(64 << 10);
-        self.gc_threshold = used.saturating_add(gap).min(self.budget.limit());
-        // Marking reads every element of every live package, however few the slots: a unit each.
-        let traced = self.heap.take_traced();
-        Some((slots / 8).saturating_add(roots).saturating_add(traced))
+        (slots / 8).saturating_add(roots)
     }
 
     /// Counts `units` of work against the step limit, with the work done since the last count:
@@ -1243,8 +1249,8 @@ impl<H: Host> Interpreter<H> {
             } else {
                 crate::object::Bind::Lazy
             };
-            // A deferred name is listed until bound (B5-R2): room first, so that no element is
-            // made deferred and left out of the list.
+            // A deferred name is listed until bound or no longer readable (B5-R2, B5-R10): room
+            // first, so that no element is made deferred and left out of the list.
             if bind == crate::object::Bind::Deferred {
                 mem::reserve(&mut self.deferred, 1, &mut self.budget)?;
             }
@@ -1426,30 +1432,23 @@ impl<H: Host> Interpreter<H> {
             return err(ErrorKind::Grammar);
         };
         let i = usize::try_from(index).map_err(|_| ErrorKind::Range)?;
-        let dropped = match self.heap.get_mut(pkg)? {
+        match self.heap.get_mut(pkg)? {
             Object::Package(elems) => {
                 // More elements than the count (a compile-time error by §19.6.102): the extra
                 // ones are decoded, then dropped, and reported when the package ends (G14, TASKS
-                // 64's ledger §3; step B5).
+                // 64's ledger §3; step B5). Nothing reads a dropped one's names, so the binding
+                // pass finds them unreadable (the review of B5, B5-R3; of its answers, B5-R10).
                 #[cfg(test)]
                 if i >= elems.len()
                     && crate::tests::planted(crate::tests::Fault::RefuseExtraElements)
                 {
                     return err(ErrorKind::Range);
                 }
-                match elems.get_mut(i) {
-                    Some(slot) => {
-                        *slot = v;
-                        false
-                    }
-                    None => true,
+                if let Some(slot) = elems.get_mut(i) {
+                    *slot = v;
                 }
             }
             _ => return err(ErrorKind::Grammar),
-        };
-        // A dropped element's names are never bound: nothing can read them (B5-R3).
-        if dropped {
-            self.never_bind(self.cur.table, carrier.at, self.cur.pc);
         }
         if let Some(Frame::Op(top)) = self.frames.last_mut() {
             top.aux = top.aux.saturating_add(1);
@@ -1897,8 +1896,21 @@ impl<H: Host> Interpreter<H> {
 
     // --- The collector -----------------------------------------------------------------------
 
-    /// Collects every object unreachable from the namespace and the frames.
+    /// Collects every object unreachable from the namespace and the frames, and takes it off the
+    /// deferred list, which is no root (the review of B5, B5-R10 and B5-R11).
     pub(crate) fn collect_garbage(&mut self) {
+        if self.mark_reachable() {
+            self.prune_deferred();
+            self.heap.sweep(&mut self.budget);
+        } else {
+            self.heap.clear_marks();
+        }
+    }
+
+    /// Marks every object reachable from the roots: the namespace, the frames, the activations,
+    /// the result and the holds. `false`: the marking was abandoned (it cannot be: its stack has
+    /// room for every slot).
+    pub(crate) fn mark_reachable(&mut self) -> bool {
         self.heap.clear_marks();
         let mut ok = true;
         for r in self.ns.objects() {
@@ -1950,13 +1962,21 @@ impl<H: Host> Interpreter<H> {
                 ok &= self.heap.mark(Val::Obj(r), &mut self.budget);
             }
         }
-        for &r in &self.deferred {
-            ok &= self.heap.mark(Val::Obj(r), &mut self.budget);
+        // Planted, the deferred list is a root again, as before the review of B5's answers.
+        #[cfg(test)]
+        if crate::tests::planted(crate::tests::Fault::StrongDeferred) {
+            for &r in &self.deferred {
+                ok &= self.heap.mark(Val::Obj(r), &mut self.budget);
+            }
         }
-        if ok && self.heap.trace(&mut self.budget) {
-            self.heap.sweep(&mut self.budget);
-        } else {
-            self.heap.clear_marks();
-        }
+        ok && self.heap.trace(&mut self.budget)
+    }
+
+    /// Keeps on the deferred list only what the last marking reached. Nothing else can be read
+    /// again, since only the list names it and nothing but a binding pass follows the list: a
+    /// name taken off here is one that no later pass would find readable (B5-R10, B5-R11).
+    pub(crate) fn prune_deferred(&mut self) {
+        let heap = &self.heap;
+        self.deferred.retain(|&r| heap.marked(r));
     }
 }

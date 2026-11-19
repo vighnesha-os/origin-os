@@ -618,19 +618,30 @@ impl<H: Host> Interpreter<H> {
         self.cur = l.ret;
         self.trace_limit(&e);
         self.trace(&Trace::Loaded(Err(e)));
+        // A run-time load binds its names at its end, failed or not: what the table stored in an
+        // object older than it is still read (the review of B5's answers, B5-R10). After the
+        // load's `Loaded`, so a limit here is the evaluation's, which aborts it.
+        #[cfg(test)]
+        let skip = crate::tests::planted(crate::tests::Fault::NoFailedPass);
+        #[cfg(not(test))]
+        let skip = false;
+        if !skip {
+            self.bind_names(Some(l.table))?;
+        }
         let [target, _] = l.args;
         self.load_result(l.op, target, false)
     }
 
-    /// Marks table `index` failed and gives its bytes back; the names it put in packages are
-    /// never bound (B5-R3).
+    /// Marks table `index` failed and gives its bytes back. The names it put in packages stay
+    /// listed: a boot table's are bound by [`Interpreter::bind_deferred`], a run-time load's at
+    /// its end (`fail_load`); those of a load an aborted evaluation failed are bound by
+    /// `bind_deferred` if it has yet to run, and are otherwise looked up when read (B5-R10).
     pub(crate) fn fail_table(&mut self, index: u32) {
         if let Some(t) = self.tables.get_mut(us(index)) {
             t.failed = true;
             let aml = core::mem::take(&mut t.aml);
             mem::release(aml, &mut self.budget);
         }
-        self.never_bind_table(index);
     }
 
     /// Fails every table a [`Loading`] frame above `frames` was loading, when an evaluation is

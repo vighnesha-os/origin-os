@@ -891,12 +891,12 @@ fn a_limit_in_a_runtime_loads_pass_fails_the_table() {
 
 #[test]
 fn names_nothing_can_read_are_never_bound_whether_or_not_the_collector_ran() {
-    // The review of B5, B5-R3: an element dropped past its package's count (a name, and a nested
-    // package's), and the package of a duplicate `Name` abandoned, are marked never to bind when
-    // they are dropped. A temporary package of a statement that completes, one `Index` reads
-    // through `DerefOf` here, keeps its names until the pass, so its unbound name is reported
-    // however the collector ran. The same reports with the collector run before the pass and
-    // without it.
+    // The review of B5, B5-R3, and of its answers, B5-R10 and B5-R11: an element dropped past its
+    // package's count (a name, and a nested package's), the package of a duplicate `Name`
+    // abandoned, and a temporary package one `Index` reads through `DerefOf` are read by nothing
+    // once their statements end. The pass binds only what a marking from the collector's roots
+    // reaches, so it neither binds nor reports them: the same with the collector run before the
+    // pass and without it.
     let body = [
         name("A", one()),
         name("PK1", package(1, &[nm("\\A"), nm("\\NON1")])),
@@ -909,9 +909,6 @@ fn names_nothing_can_read_are_never_bound_whether_or_not_the_collector_ran() {
             nm("X"),
         ),
     ];
-    // `Store`, `DerefOf`, `Index`, `Package`, its length and its count, a byte each: the element
-    // at 6.
-    let non3 = at(&body, 6) + 6;
     let run = |collect: bool| {
         let mut i = fresh();
         assert_eq!(load(&mut i, &body), Ok(0));
@@ -946,8 +943,169 @@ fn names_nothing_can_read_are_never_bound_whether_or_not_the_collector_ran() {
         "{:?}",
         without.0
     );
-    assert_eq!((without.1, &without.2), (Ok(1), &vec![Told::Unbound(non3)]));
+    assert_eq!((without.1, &without.2), (Ok(0), &vec![]));
     assert_eq!(run(true), without);
+}
+
+/// Where `path`'s encoding first appears in `body`'s term list.
+fn found(body: &[B], path: &str) -> u32 {
+    let all = body.concat();
+    let n = nm(path);
+    let k = all.windows(n.len()).position(|w| w == n.as_slice());
+    u32::try_from(k.expect("the name is in the body")).unwrap()
+}
+
+#[test]
+fn what_an_abandoned_while_stored_on_its_earlier_passes_is_bound() {
+    // The review of B5's answers, B5-R10 (its probe Q1): a `While` stores a package naming
+    // `\NONE` into `GP` on each pass, and its predicate fails on the third (`Range`, as in
+    // `failed_predicate_skips_the_while_on_its_third_pass`), which abandons it. The packages its
+    // first two passes stored are read through `GP`, so their names are bound, here reported as
+    // naming nothing, as `CTL`'s outside the loop is. So is the name in the package an inner
+    // `Store` stored in `P` before its outer `Store` failed. The same with the collector run
+    // before the pass and without it.
+    let body = [
+        name("GP", package(3, &[])),
+        name("PKG", package(2, &[one(), one()])),
+        name("N", zero()),
+        name("CTL", package(1, &[nm("\\NONC")])),
+        while_(
+            logic(0x95, deref_of(index(nm("PKG"), nm("N"), zero())), byte(10)),
+            &[
+                store(
+                    package(1, &[nm("\\NONE")]),
+                    index(nm("GP"), nm("N"), zero()),
+                ),
+                increment(nm("N")),
+            ],
+        ),
+        name("P", package(1, &[])),
+        store(store(package(1, &[nm("\\NONX")]), nm("P")), nm("UNDF")),
+    ];
+    let (ctl, pass, inner) = (
+        found(&body, "\\NONC"),
+        found(&body, "\\NONE"),
+        found(&body, "\\NONX"),
+    );
+    let run = |collect: bool| {
+        let mut i = fresh();
+        assert_eq!(load(&mut i, &body), Ok(0));
+        let loaded = told(&mut i);
+        if collect {
+            i.settle_memory();
+        }
+        let empty = i.bind_deferred();
+        let bound = told(&mut i);
+        let gp = eval(&mut i, "GP").map_err(|e| e.kind);
+        let p = eval(&mut i, "P").map_err(|e| e.kind);
+        (loaded, empty, bound, gp, p)
+    };
+    let without = run(false);
+    assert!(
+        matches!(
+            without.0.as_slice(),
+            [
+                Told::Abandoned {
+                    kind: ErrorKind::Range,
+                    ..
+                },
+                Told::Abandoned {
+                    kind: ErrorKind::NotFound,
+                    ..
+                },
+            ]
+        ),
+        "{:?}",
+        without.0
+    );
+    assert_eq!(without.1, Ok(4));
+    assert_eq!(
+        without.2,
+        vec![
+            Told::Unbound(ctl),
+            Told::Unbound(pass),
+            Told::Unbound(pass),
+            Told::Unbound(inner),
+        ]
+    );
+    let empty = || Value::Package(vec![Value::Uninitialized]);
+    assert_eq!(
+        without.3,
+        Ok(Some(Value::Package(vec![
+            empty(),
+            empty(),
+            Value::Uninitialized
+        ])))
+    );
+    assert_eq!(without.4, Ok(Some(empty())));
+    assert_eq!(run(true), without);
+}
+
+#[test]
+fn a_loop_of_packages_with_names_keeps_no_more_alive_than_one_without() {
+    // The review of B5's answers, B5-R11 (its probe Q2b): a table-level `While` stores a new
+    // package into `PK` 5,000 times. With a name in each, the list of names waiting kept every
+    // one alive until the pass, which reported each. Now the list keeps nothing alive: after a
+    // collection no more objects live than with an integer in the package and the name element
+    // `PK` still reads, which is the only name on the list and the only one reported.
+    let body = |elem: B| {
+        [
+            name("PK", package(1, &[])),
+            name("N", zero()),
+            while_(
+                logic(0x95, nm("N"), word(5_000)),
+                &[store(package(1, &[elem]), nm("PK")), increment(nm("N"))],
+            ),
+        ]
+    };
+    let live = |elem: B| {
+        let mut i = fresh();
+        assert_eq!(load(&mut i, &body(elem)), Ok(0));
+        i.settle_memory();
+        let n = i.object_count();
+        (i, n)
+    };
+    let (_, plain) = live(one());
+    let (mut i, named) = live(nm("\\NONE"));
+    assert!(
+        named <= plain + 1,
+        "{named} objects live, {plain} without the name"
+    );
+    assert_eq!(i.deferred.len(), 1);
+    assert_eq!(i.bind_deferred(), Ok(1));
+    assert_eq!(
+        told(&mut i),
+        vec![Told::Unbound(found(&body(nm("\\NONE")), "\\NONE"))]
+    );
+}
+
+#[test]
+fn a_failed_runtime_loads_name_in_an_older_object_is_bound() {
+    // B5-R10, a failed load's side: a run-time table stores a package naming `\NONF` into `\GQ`,
+    // a boot table's, then fails whole (a reserved opcode). Its own names are rolled back, but
+    // `\GQ` still reads the package, so its name is bound at the load's end, here reported as
+    // naming nothing; the evaluation goes on with `Load`'s Zero.
+    let bad = ssdt(&[store(package(1, &[nm("\\NONF")]), nm("\\GQ")), vec![0x02]]);
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            name("GQ", package(1, &[])),
+            name("TB", buffer_of(&bad)),
+            method("LD", 0, &[ret(load_op("TB", zero()))]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(int(&mut i, "LD"), 0);
+    assert!(i.table(1).unwrap().failed);
+    // In the run-time table: `Store`, `Package`, its length and its count, a byte each: the name
+    // at 4.
+    assert_eq!(told(&mut i), vec![Told::Unbound(4)]);
+    assert_eq!(
+        eval(&mut i, "GQ"),
+        Ok(Some(Value::Package(vec![Value::Uninitialized])))
+    );
+    assert!(i.deferred.is_empty());
 }
 
 #[test]
@@ -997,7 +1155,9 @@ fn every_tolerance_test_fails_without_its_reports() {
         runtime_load_binds_its_own,
         a_runtime_loads_pass_binds_only_its_own,
         a_limit_in_a_runtime_loads_pass_fails_the_table,
-        names_nothing_can_read_are_never_bound_whether_or_not_the_collector_ran,
+        what_an_abandoned_while_stored_on_its_earlier_passes_is_bound,
+        a_loop_of_packages_with_names_keeps_no_more_alive_than_one_without,
+        a_failed_runtime_loads_name_in_an_older_object_is_bound,
         high_bytes_accepted_and_reported,
         unterminated_string_ends_at_its_range,
         unterminated_string_in_a_package,
@@ -1011,7 +1171,7 @@ fn every_tolerance_test_fails_without_its_reports() {
 
 #[test]
 fn planted_faults_are_caught_by_the_tolerance_tests() {
-    let tests: [Control; 7] = [
+    let tests: [Control; 10] = [
         (
             Some(Fault::AllowDuplicate),
             &[duplicate_keeps_the_first_object],
@@ -1039,6 +1199,9 @@ fn planted_faults_are_caught_by_the_tolerance_tests() {
                 a_runtime_loads_pass_binds_only_its_own,
                 a_limit_in_a_runtime_loads_pass_fails_the_table,
                 names_nothing_can_read_are_never_bound_whether_or_not_the_collector_ran,
+                what_an_abandoned_while_stored_on_its_earlier_passes_is_bound,
+                a_loop_of_packages_with_names_keeps_no_more_alive_than_one_without,
+                a_failed_runtime_loads_name_in_an_older_object_is_bound,
                 a_place_naming_a_method_is_skipped_as_a_name,
                 a_place_naming_a_method_before_a_device_keeps_the_device,
                 a_place_naming_a_method_in_a_body_does_not_run_past_it,
@@ -1064,8 +1227,23 @@ fn planted_faults_are_caught_by_the_tolerance_tests() {
         ),
         (Some(Fault::LoadTwice), &[already_loaded_is_refused]),
         (
-            Some(Fault::BindDropped),
+            Some(Fault::StrongDeferred),
+            &[
+                names_nothing_can_read_are_never_bound_whether_or_not_the_collector_ran,
+                a_loop_of_packages_with_names_keeps_no_more_alive_than_one_without,
+            ],
+        ),
+        (
+            Some(Fault::NoSift),
             &[names_nothing_can_read_are_never_bound_whether_or_not_the_collector_ran],
+        ),
+        (
+            Some(Fault::MarkAbandoned),
+            &[what_an_abandoned_while_stored_on_its_earlier_passes_is_bound],
+        ),
+        (
+            Some(Fault::NoFailedPass),
+            &[a_failed_runtime_loads_name_in_an_older_object_is_bound],
         ),
         (
             Some(Fault::SkipCallsInPlaces),

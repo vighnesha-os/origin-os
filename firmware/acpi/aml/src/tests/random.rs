@@ -940,17 +940,20 @@ fn within_regions(i: &mut Interpreter<TestHost>, seed: u64) {
     }
 }
 
-/// No name load-time code put in a package is left deferred once bound (step B5).
-fn no_deferred(i: &Interpreter<TestHost>, seed: u64) {
-    for k in 0..i.heap.slot_count() {
-        if let Some(e) = i.heap.name_elem_at(k) {
-            assert_ne!(
-                e.bind,
-                crate::object::Bind::Deferred,
-                "seed {seed:#x}: a package name left unbound"
-            );
-        }
-    }
+/// No name load-time code put in a package and something can still read is left deferred once
+/// bound (step B5; the review of B5's answers, B5-R10 and B5-R11): what a marking from the
+/// collector's roots reaches, as the pass's own.
+fn no_deferred(i: &mut Interpreter<TestHost>, seed: u64) {
+    assert!(
+        i.mark_reachable(),
+        "seed {seed:#x}: the marking was abandoned"
+    );
+    let left = (0..i.heap.slot_count())
+        .filter_map(|k| i.heap.marked_name_elem_at(k))
+        .filter(|e| e.bind == crate::object::Bind::Deferred)
+        .count();
+    i.heap.clear_marks();
+    assert_eq!(left, 0, "seed {seed:#x}: a package name left unbound");
 }
 
 fn no_failed_names(a: &Audit, seed: u64) {
@@ -1225,7 +1228,9 @@ fn run(aml: &[u8], width: IntegerWidth, seed: u64, setup: Setup) -> Ran {
         }) => Err(ErrorKind::Limit(l)),
         Err(e) => panic!("seed {seed:#x}: binding failed: {e:?}"),
     };
-    no_deferred(&i, seed);
+    if bound.is_ok() {
+        no_deferred(&mut i, seed);
+    }
     reports_bounded(&mut i, seed, bound);
     // The block's own load may have loaded tables inside it: none failed may leave a name.
     no_failed_names(&audit(&i, 0), seed);

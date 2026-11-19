@@ -36,8 +36,11 @@
 //!
 //! **Names in packages** (G1): a name that load-time code puts in a package is bound once, by
 //! [`Interpreter::bind_deferred`] after every boot table has loaded, or at the end of the run-time
-//! load that made it; one that still names nothing becomes an empty element, reported. A package
-//! made inside a method resolves its names when they are read.
+//! load that made it, whether the table loaded or failed; one that still names nothing becomes an
+//! empty element, reported. Only names something can still read then are bound or reported:
+//! the pass first marks what is reachable, as the collector does, and the list of names waiting
+//! keeps nothing alive (the review of B5's answers, B5-R10 and B5-R11). A package made inside a
+//! method resolves its names when they are read.
 //!
 //! **A table already loaded** (B4's Q7, as ruled for step B5): a block with the signature, IDs and
 //! term list of a table loaded and not failed is refused whole, before anything of it is created.
@@ -224,8 +227,12 @@ impl<H: Host> Interpreter<H> {
         self.cur = stmt;
         let resumed = self.skip_statement(stmt.pc, end)?;
         self.cur.pc = resumed;
-        // What the statement put in packages is never bound: nothing can read it (B5-R3).
-        self.never_bind(stmt.table, stmt.pc, resumed);
+        // What the statement put in packages is bound by the pass if something can still read
+        // it, an earlier pass's store of a `While` or an inner `Store`'s included (B5-R10).
+        #[cfg(test)]
+        if crate::tests::planted(crate::tests::Fault::MarkAbandoned) {
+            self.planted_never_bind(stmt.table, stmt.pc, resumed);
+        }
         if let Some(t) = self.tables.get_mut(us(stmt.table)) {
             t.abandoned = t.abandoned.saturating_add(1);
         }
@@ -422,26 +429,38 @@ impl<H: Host> Interpreter<H> {
         }
     }
 
-    /// Binds the names load-time code put in packages that are not bound yet: those of table
-    /// `table`, a run-time load's, which are the list's last (a load nested in it has bound or
-    /// dropped its own), or every one. Each is bound to its node, or left empty and reported.
-    /// Returns how many were left empty. A unit of work an entry, the run-time load's only (the
-    /// review of B5, B5-R2); it allocates nothing.
+    /// Binds the names load-time code put in packages that are not bound yet and that something
+    /// can still read: those of table `table`, a run-time load's, which are the list's last (a
+    /// load nested in it has bound its own at its end), or every one. Each is bound to its node,
+    /// or left empty and reported. Returns how many were left empty.
+    ///
+    /// What can be read is what a marking from the collector's roots reaches (the review of B5's
+    /// answers, B5-R10 and B5-R11): the list is pruned to it first, and nothing is freed, so the
+    /// pass may run where the collector may not (a run for a PCI_Config region's function outside
+    /// the frames, `pci.rs`). A name only a value held outside the frames there could still read
+    /// is taken off unbound, and is looked up when read, as a method's is. A name the marking did
+    /// not reach was unreachable at every earlier collection too, which took off only what was
+    /// unreachable then: so the pass binds and reports the same whether or not the collector ran.
+    ///
+    /// The marking's work, as a collection's, and a unit an entry, the run-time load's only (the
+    /// review of B5, B5-R2), are charged before anything is bound. No marking when no entry waits.
+    /// It allocates nothing.
     pub(crate) fn bind_names(&mut self, table: Option<u32>) -> Result<usize> {
+        let ours =
+            |i: &Self, r: ObjRef| table.is_none_or(|t| i.elem(r).is_some_and(|e| e.table == t));
+        if !self.deferred.last().is_some_and(|&r| ours(self, r)) {
+            return Ok(0);
+        }
+        let marked = self.sift_deferred();
         let mut from = self.deferred.len();
-        match table {
-            Some(t) => {
-                while let Some(&r) = from.checked_sub(1).and_then(|k| self.deferred.get(k)) {
-                    if self.elem(r).is_none_or(|e| e.table != t) {
-                        break;
-                    }
-                    from = from.saturating_sub(1);
-                }
+        while let Some(&r) = from.checked_sub(1).and_then(|k| self.deferred.get(k)) {
+            if !ours(self, r) {
+                break;
             }
-            None => from = 0,
+            from = from.saturating_sub(1);
         }
         let entries = self.deferred.len().saturating_sub(from);
-        self.charge(u64::try_from(entries).unwrap_or(u64::MAX))?;
+        self.charge(marked.saturating_add(u64::try_from(entries).unwrap_or(u64::MAX)))?;
         #[cfg(test)]
         {
             self.run.pass_entries = self
@@ -482,15 +501,28 @@ impl<H: Host> Interpreter<H> {
         Ok(empty)
     }
 
-    /// Marks never to bind the names in packages that bytes `from..to` of table `table` made and
-    /// that nothing can read: an abandoned statement's, or an element dropped past its package's
-    /// count (the review of B5, B5-R3). They are the list's last. Each is read, if ever, as a
-    /// method's is: looked up when read, never reported. A unit of work each.
-    pub(crate) fn never_bind(&mut self, table: u32, from: u32, to: u32) {
+    /// Takes off the deferred list what nothing can read: a marking from the collector's roots,
+    /// freeing nothing. Returns its work, counted as a collection's marking is. Planted
+    /// (`NoSift`), the pass takes the list as it is, so what it binds depends on the collector.
+    fn sift_deferred(&mut self) -> u64 {
         #[cfg(test)]
-        if crate::tests::planted(crate::tests::Fault::BindDropped) {
-            return;
+        if crate::tests::planted(crate::tests::Fault::NoSift) {
+            return 0;
         }
+        let work = self.root_work();
+        if self.mark_reachable() {
+            self.prune_deferred();
+        }
+        self.heap.clear_marks();
+        work.saturating_add(self.heap.take_traced())
+    }
+
+    /// The marking B5-R3 made and the review of its answers found wrong (B5-R10), planted: the
+    /// names an abandoned statement made, found by its byte range among the list's last, taken off
+    /// and never bound, though an earlier pass of a `While` may have stored them where they are
+    /// read.
+    #[cfg(test)]
+    fn planted_never_bind(&mut self, table: u32, from: u32, to: u32) {
         let mut k = self.deferred.len();
         while let Some(&r) = k.checked_sub(1).and_then(|j| self.deferred.get(j)) {
             if !self
@@ -502,28 +534,7 @@ impl<H: Host> Interpreter<H> {
             self.set_bind(r, Bind::Lazy);
             k = k.saturating_sub(1);
         }
-        self.note_work(u64::try_from(self.deferred.len().saturating_sub(k)).unwrap_or(u64::MAX));
         self.deferred.truncate(k);
-    }
-
-    /// Marks never to bind every name failed table `table` put in a package, wherever it is in
-    /// the list: a failed table's names are gone (B5-R3). A unit of work an entry.
-    pub(crate) fn never_bind_table(&mut self, table: u32) {
-        self.note_work(u64::try_from(self.deferred.len()).unwrap_or(u64::MAX));
-        let mut kept = 0usize;
-        let mut k = 0usize;
-        while let Some(&r) = self.deferred.get(k) {
-            k = k.saturating_add(1);
-            if self.elem(r).is_some_and(|e| e.table == table) {
-                self.set_bind(r, Bind::Lazy);
-                continue;
-            }
-            if let Some(slot) = self.deferred.get_mut(kept) {
-                *slot = r;
-            }
-            kept = kept.saturating_add(1);
-        }
-        self.deferred.truncate(kept);
     }
 
     /// Binds the names load-time code put in packages, once every boot table has loaded (G1, as

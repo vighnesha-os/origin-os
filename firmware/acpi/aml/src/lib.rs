@@ -187,8 +187,10 @@ pub struct Interpreter<H: Host> {
     /// The mutexes the running evaluation holds, in the order taken (`sync.rs`).
     held: Vec<sync::Held>,
     /// The names load-time code put in packages and not yet bound, in the order made (G1, step
-    /// B5; the review of B5, B5-R2 and B5-R3, `tolerate.rs`). Roots of the collector until bound
-    /// or dropped, so that what a binding pass sees never depends on whether the collector ran.
+    /// B5; the review of B5, B5-R2, and of its answers, B5-R10 and B5-R11; `tolerate.rs`). Weak:
+    /// no root of the collector, which takes off it what it frees, and a binding pass marks what
+    /// can still be read before it binds, so what it sees never depends on whether the collector
+    /// ran.
     deferred: Vec<object::ObjRef>,
     /// How deep the runs of frames for a PCI_Config region outside the frames go (`pci.rs`,
     /// `with_address`): the collector runs only at 0.

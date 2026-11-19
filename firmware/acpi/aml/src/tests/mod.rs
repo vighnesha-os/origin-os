@@ -477,9 +477,18 @@ pub(crate) enum Fault {
     LoadTwice,
     /// The names load-time code put in packages are never bound (`tolerate.rs`, `bind_names`).
     NoBind,
-    /// What nothing can read is bound as any name is, as before the review of B5, B5-R3
-    /// (`tolerate.rs`, `never_bind`).
-    BindDropped,
+    /// The deferred list is a root of the collector and of the binding pass's marking, as before
+    /// the review of B5's answers, B5-R11 (`engine.rs`, `mark_reachable`).
+    StrongDeferred,
+    /// The binding pass marks nothing first, and binds the list as the collector left it
+    /// (`tolerate.rs`, `sift_deferred`).
+    NoSift,
+    /// An abandoned statement's names are taken off the list by its byte range and never bound,
+    /// B5-R3's marking, which the review of its answers found wrong, B5-R10 (`tolerate.rs`,
+    /// `abandon`).
+    MarkAbandoned,
+    /// A failed run-time load leaves its names unbound (`load.rs`, `fail_load`).
+    NoFailedPass,
     /// A string byte above 0x7F fails the table, as before step B5 (`engine.rs`,
     /// `decode_string`).
     RefuseHighBytes,
