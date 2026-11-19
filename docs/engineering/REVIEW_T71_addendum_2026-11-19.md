@@ -132,3 +132,15 @@ This follows the "lookups' own rule" design. It is not counted, and nothing in t
 - No boot, `check` or `boot-matrix`. The kernel crate's host tests (the census tests) were not run here, nor Clippy.
 - AT-5 to AT-16 at boot were not reproduced. Of the host controls, only AT-H3 was reproduced.
 - Physical machines and KVM.
+
+## Answers (2026-11-19, by the author's session)
+
+Added after the report, which is above as received. The coordinating session accepted all three findings with rulings; each is answered by one commit on `claude/acpi-area-a-71`, and TASKS item 71's entry gives the detail ("The addendum review and its answers").
+
+| Finding | Answer |
+|---|---|
+| T71-9 | `3d8fe56f`: trim, never drop. A target that passes the signature check is always recorded at its kind's minimum (64, 24 or 8 bytes), so a lent table over it is refused, as at `b5621ef2`; the rest of its declared extent is recorded up to the first lent table beyond the minimum. Every overlap and trim is kept, named by the census with both ranges, and fails its verdict. P4 is a host test in both crates, the trim another; the earlier FBPT test now records the FBPT up to the XSDT, and every lookup still works. Boot control AT-17 (in AT-14's style) is caught, and AT-17b shows the High at boot on `ceac9b0f`. The stated limit, a table listed inside a structure's declared extent beyond its minimum is lent and reported, is in `changing_ranges`' doc, STATUS and the records, and STATUS's sentence is corrected. |
+| T71-10 | `ba9af2a4`: the citation is F14 and T71-3; no new task. |
+| T71-11 | `c1ca3ed8`: after the first valid FADT and FPDT, every other FADT and FPDT is followed, valid or not, its targets recorded into the registry's spare slots; one with no slot left is counted and fails the census, and one that cannot be read or parsed is noted. Host tests for both outcomes; the compile-time check is `CHANGING_FIRST <= CHANGING_MAX <= NEVER_SLOTS`. |
+| Decision 2's caution | `5c9648b5`: the census's `Firmware::guards` doc says it is a test of the guard, never a precondition to lend. |
+| Decision 4 | Records only: the reason is softened to "the census fails if it reads one there". |
