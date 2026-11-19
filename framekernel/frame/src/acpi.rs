@@ -250,16 +250,30 @@ impl Changing {
         }
     }
 
-    /// The least it can be, by its fixed part, which is guarded whatever overlaps it (the
-    /// addendum review of TASKS item 71, T71-9): a FACS is 64 bytes or more (§5.2.10, Table
-    /// 5.13); an FBPT's and an S3PT's header is their signature and length, 8 bytes (§5.2.24.8
-    /// and §5.2.24.10, Tables 5.129 and 5.131); an MBPT's header adds a controller ID and a
-    /// timestamp domain ID, 24 bytes (§5.2.24.11, Table 5.134).
+    /// The least it can be, which is guarded whatever overlaps it (the addendum review of TASKS
+    /// item 71, T71-9): what ACPI 6.6 says its length covers at the least (the second addendum
+    /// review, T71-12, read again on 2026-11-19).
+    /// - A FACS is 64 bytes or more (§5.2.10, Table 5.13).
+    /// - An FBPT's length covers at least its 8-byte header (signature and length) and the
+    ///   48-byte Host Firmware Boot Performance Data Record, which §5.2.24.8 says it must hold
+    ///   and the firmware overwrites on S4 resume: 56 (Tables 5.129 and 5.130).
+    /// - An S3PT's covers at least its 8-byte header and the 24-byte Basic S3 Resume Performance
+    ///   Record, which §5.2.24.10 says it must hold and the firmware overwrites on S3 resume: 32
+    ///   (Tables 5.131 and 5.132).
+    /// - An MBPT's covers at least its 24-byte header (signature, length, controller ID and
+    ///   timestamp domain ID) and a record Table 5.134 calls the "Firmware Basic Boot
+    ///   Performance Data Record". ACPI 6.6 defines no record by that name, and gives no layout
+    ///   for the Microcontroller Boot Performance Data Record (type 3, Table 5.124). It does use
+    ///   "Firmware Basic Boot Performance" for the host firmware's boot performance structures
+    ///   (Table 5.125's type 0), so the name is read as Table 5.130's 48-byte record: 72. A
+    ///   shorter reading would guard less of what the firmware writes; a longer one only refuses
+    ///   a table that starts inside it, and fails the census.
     pub const fn minimum(self) -> u64 {
         match self {
             Self::Facs => 64,
-            Self::Mbpt => 24,
-            Self::Fbpt | Self::S3pt => 8,
+            Self::Mbpt => 72,
+            Self::Fbpt => 56,
+            Self::S3pt => 32,
         }
     }
 }
@@ -2900,7 +2914,8 @@ mod tests {
             (BASE + 0x4300, changing_at(b"FBPT", 0x40)),
             (BASE + 0x5000, changing_at(b"S3PT", 0x40)),
             (BASE + 0x5100, changing_at(b"S3PT", 0x40)),
-            (BASE + 0x6000, changing_at(b"MBPT", 0x40)),
+            // An MBPT of its least length, 72 bytes (T71-12).
+            (BASE + 0x6000, changing_at(b"MBPT", 0x48)),
             (BASE + 0x9000, changing_at(b"FACS", 64)),
         ];
         let mem = machine_of(&entries, &others);
@@ -2918,7 +2933,7 @@ mod tests {
                 (Changing::Facs, BASE + 0x3100, BASE + 0x3140),
                 (Changing::Fbpt, BASE + 0x4000, BASE + 0x4040),
                 (Changing::S3pt, BASE + 0x5000, BASE + 0x5040),
-                (Changing::Mbpt, BASE + 0x6000, BASE + 0x6040),
+                (Changing::Mbpt, BASE + 0x6000, BASE + 0x6048),
                 (Changing::Fbpt, BASE + 0x4200, BASE + 0x4240),
                 (Changing::S3pt, BASE + 0x5100, BASE + 0x5140),
                 (Changing::Fbpt, BASE + 0x4300, BASE + 0x4340),
@@ -2961,7 +2976,7 @@ mod tests {
                 (Changing::S3pt, BASE + 0x5000, BASE + 0x5040),
                 (Changing::Facs, BASE + 0x3200, BASE + 0x3240),
                 (Changing::Fbpt, BASE + 0x4200, BASE + 0x4240),
-                (Changing::Mbpt, BASE + 0x6000, BASE + 0x6040),
+                (Changing::Mbpt, BASE + 0x6000, BASE + 0x6048),
             ]
         );
     }
@@ -3183,6 +3198,79 @@ mod tests {
         let (mut lookup_in, _) = lookups_over(mem);
         assert_eq!(lookup_in(b"OEMC"), Err("refused"));
         assert_eq!(lookup_in(b"OEMA").map(|t| &t[..4]), Ok(&b"OEMA"[..]));
+    }
+
+    /// The second addendum review of TASKS item 71, T71-12: a performance table's minimum is its
+    /// header and the record ACPI 6.6 says its length covers at the least (FBPT 56, S3PT 32,
+    /// MBPT 72). A listed table at the header's end, or at the review's probe (FBPT + 0x30), is
+    /// over the minimum, so it is refused and the structure kept whole; one at the minimum's end
+    /// is lent, and the structure cut there.
+    #[test]
+    fn a_performance_tables_minimum_holds_its_record() {
+        const AT: u64 = BASE + 0x4000;
+        // An FPDT must hold an FBPT pointer record (the crate refuses one without), so the S3PT's
+        // and MBPT's machines have an FBPT elsewhere too.
+        const OTHER_FBPT: u64 = BASE + 0x8000;
+        let case = |kind: Changing, record: u16, offset: u64| {
+            let mut sig = [0u8; 4];
+            sig.copy_from_slice(kind.name().as_bytes());
+            let mut records = vec![(record, AT)];
+            let mut others = vec![(AT, changing_at(&sig, 0x200))];
+            if kind != Changing::Fbpt {
+                records.push((0, OTHER_FBPT));
+                others.push((OTHER_FBPT, changing_at(b"FBPT", 0x40)));
+            }
+            let entries = [
+                (BASE + 0x1000, fadt_naming(0, 0)),
+                (BASE + 0x1400, fpdt_of(&records)),
+                (AT + offset, table(b"OEMX", &[])),
+            ];
+            let mem = machine_of(&entries, &others);
+            let found = changing_ranges(BASE, &mut copy_from(&mem));
+            assert_eq!((found.unlocated, found.passed_over), (None, None));
+            let i = found.ranges().iter().position(|r| r.1 == AT).unwrap();
+            let (mut lookup_in, _) = lookups_over(mem);
+            let lent = lookup_in(b"OEMX").map(|t| t.len());
+            (found.ranges()[i], found.overlaps()[i], lent)
+        };
+        for (kind, record, header) in [
+            (Changing::Fbpt, 0, 8),
+            (Changing::S3pt, 1, 8),
+            (Changing::Mbpt, 2, 24),
+        ] {
+            let minimum = kind.minimum();
+            assert_eq!(
+                minimum,
+                header + if kind == Changing::S3pt { 24 } else { 48 }
+            );
+            // Inside the minimum, at the header's end (where the minimum ended before T71-12)
+            // and at its last byte: refused, and the structure guarded to its declared end.
+            for offset in [header, minimum - 1] {
+                let (range, met, lent) = case(kind, record, offset);
+                assert_eq!(range, (kind, AT, AT + 0x200), "{kind:?} {offset:#x}");
+                assert_eq!(
+                    (met.over_minimum, met.trimmed_at, met.tables),
+                    (Some((AT + offset, AT + offset + 36)), None, 1),
+                    "{kind:?} {offset:#x}"
+                );
+                assert_eq!(lent, Err("refused"), "{kind:?} {offset:#x}");
+            }
+            // At the minimum's end: lent, and the structure cut there.
+            let (range, met, lent) = case(kind, record, minimum);
+            assert_eq!(range, (kind, AT, AT + minimum), "{kind:?}");
+            assert_eq!(
+                (met.over_minimum, met.trimmed_at, met.tables),
+                (None, Some((AT + minimum, AT + minimum + 36)), 1),
+                "{kind:?}"
+            );
+            assert_eq!(lent, Ok(36), "{kind:?}");
+        }
+        // The review's probe: a table at FBPT + 0x30, over its Host Firmware Boot Performance
+        // Data Record, which T71-9's minimum of 8 lent.
+        let (range, met, lent) = case(Changing::Fbpt, 0, 0x30);
+        assert_eq!(range, (Changing::Fbpt, AT, AT + 0x200));
+        assert_eq!(met.over_minimum, Some((AT + 0x30, AT + 0x54)));
+        assert_eq!(lent, Err("refused"));
     }
 
     /// TASKS item 71, ruling addition 2: the first lookup locates and records the changing
