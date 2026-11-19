@@ -265,14 +265,16 @@ impl Contexts {
     /// then loads the next frame with nothing in between that calls this. Every later call runs
     /// on another context's stack. `running_on` checks it all the same.
     ///
-    /// Call it with interrupts off (the module documentation, "Who calls what").
+    /// Call it with interrupts off (the module documentation, "Who calls what"). A refused
+    /// retirement puts its record back only if no newer exit has recorded itself meanwhile
+    /// (T70-6); its callers halt on the refusal in any case.
     pub fn retire_ended(&self, running_on: impl Fn(u64) -> bool) -> Result<(), Refused> {
         let ended = self.ended.swap(NONE, AcqRel);
         let Some(slot) = self.slots.get(ended) else {
             return Ok(());
         };
         if running_on(slot.home.load(Relaxed)) {
-            let _ = self.ended.swap(ended, AcqRel);
+            let _ = self.ended.compare_exchange(NONE, ended, AcqRel, Acquire);
             return Err(Refused::StillOnIt);
         }
         slot.home.store(0, Release);
@@ -595,6 +597,42 @@ mod tests {
         assert!(
             !covered(&table, 1),
             "retired once the interrupted call finishes"
+        );
+    }
+
+    /// T70-6: a refused retirement does not overwrite a newer exit's record.
+    #[test]
+    fn a_refused_retirement_does_not_overwrite_a_newer_exit() {
+        let table = Contexts::new();
+        for n in 1..=3 {
+            assert!(table.publish(first_frame(n)));
+        }
+        assert_eq!(
+            table.switch(0x9000, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        assert_eq!(
+            table.switch(0x100, first_frame(2), true, not_on_it),
+            Ok(first_frame(2))
+        );
+        let outcome = table.retire_ended(|_| {
+            // In the gap, context 2 ends too, and records itself.
+            assert_eq!(
+                table.switch(0x200, first_frame(3), true, not_on_it),
+                Ok(first_frame(3))
+            );
+            true
+        });
+        assert_eq!(outcome, Err(Refused::StillOnIt));
+        // The record left is context 2's, the newer: retiring it now clears its home.
+        assert_eq!(table.retire_ended(not_on_it), Ok(()));
+        assert!(
+            !covered(&table, 2),
+            "the newer exit's record survived the put-back"
+        );
+        assert!(
+            covered(&table, 1),
+            "the refused one stays covered: its caller halts"
         );
     }
 }
