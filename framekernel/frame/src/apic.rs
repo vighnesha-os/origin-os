@@ -393,10 +393,17 @@ pub const PERIOD_SHARE: u64 = 100;
 /// one read until a fifth of the `nominal` period has passed, or to the read before the next
 /// reload if that comes first. A pair is read again if its brackets together are wider than
 /// 1/[`PERIOD_SHARE`] of its interval, if it is shorter than a twentieth of the nominal period,
-/// or if two consecutive reads span more than a hundredth of it, from the first's bracket's start
-/// to the second's bracket's end: time in which a reload could pass unseen, a stall inside either
-/// read's bracket included (the second addendum review's T66-R17). The first clean pair, and how
-/// many pairs were tried; `None` after [`PERIOD_PAIRS`].
+/// or if the time between two consecutive reads, from the first's bracket's end to the second's
+/// start, is over a hundredth of it: time in which a reload could pass unseen. The first clean
+/// pair, and how many pairs were tried; `None` after [`PERIOD_PAIRS`].
+///
+/// **A stated limit** (the second addendum review's T66-R17; the coordinating session's ruling
+/// (a)): a stall inside an intermediate read's own bracket is not counted, so on a timer over 5
+/// times fast it can hide a reload and give a clean pair near nominal. Delivery then fails such a
+/// timer as too fast in total, unless recurring stalls also mask its total in the same run.
+/// Counting those stalls too, across the brackets, left the 65- and 67-processor software-processor
+/// machines undecided after 64 pairs in 8 of 10 idle boots, where intermediate reads seem to stall
+/// inside their brackets; a check that tolerates stalls is TASKS item 78.
 pub fn sample_period(
     initial: u64,
     nominal: u64,
@@ -410,9 +417,8 @@ pub fn sample_period(
     let mut prev = first;
     while tried < PERIOD_PAIRS {
         let next = read();
-        if next.after.wrapping_sub(prev.before) > gap {
-            // Long enough, between the two reads or inside either, for a reload to have passed
-            // unseen.
+        if next.before.wrapping_sub(prev.after) > gap {
+            // Away between two reads for long enough that a reload could have passed unseen.
             tried += 1;
             first = next;
             prev = next;
@@ -804,41 +810,51 @@ mod tests {
     }
 
     #[test]
-    fn a_stall_inside_an_intermediate_read_cannot_hide_a_reload() {
-        // The second addendum review's T66-R17: a timer 10 times fast (a period of 1 ms against
+    fn a_stall_inside_an_intermediate_read_can_hide_a_reload_a_stated_limit() {
+        // The second addendum review's T66-R17, kept as a stated limit (the coordinating
+        // session's ruling (a); TASKS item 78): a timer 10 times fast (a period of 1 ms against
         // 10 ms nominal), read from 111 µs before a reload; the read 61 µs on stalls 1.01 ms
-        // inside its bracket and samples a count below the one before, so the reload falls
-        // between them unseen if the gap is measured only between the brackets. The pair would
-        // then close at the next reload with clean end brackets and a period near nominal.
+        // inside its own bracket and samples a count below the one before, so the reload falls
+        // between them unseen. The pair closes at the next reload with clean end brackets, and
+        // the count is accepted near nominal.
         let (initial, nominal) = (625_000, PERIOD);
         let fast = nominal / 10;
-        let (sample, _) = sample_period(
+        let (sample, tried) = sample_period(
             initial,
             nominal,
             simulated_reads(initial, fast, 3 * fast - 111_000, 61, 1_010_000),
         );
-        // Measured across the brackets, the stall restarts the pair: the clean pair found
-        // after it shows the timer's true period, and the run fails at once.
         let sample = sample.unwrap();
-        assert!(
-            (99_000..=101_000).contains(&sample.ppm_of(nominal)),
-            "{sample:?}"
+        assert_eq!((sample.ppm_of(nominal), tried), (1_009_090, 1));
+        assert_eq!(judge_period(Some(sample), nominal), RateVerdict::InBounds);
+        // The same timer's interrupts, unless recurring stalls also mask their total in the same
+        // run, come in a tenth of the time: delivery fails it as too fast, whatever the count.
+        let delivered = judge_ticks(0, &stamps(WANTED, fast, WANTED, 0), WANTED, PERIOD);
+        assert_eq!(delivered.verdict, TickVerdict::TooFast);
+        assert_eq!(
+            tick_verdict(delivered.verdict, judge_period(Some(sample), nominal)),
+            TickVerdict::TooFast
         );
-        assert_eq!(judge_period(Some(sample), nominal), RateVerdict::Fast);
-        // A correct timer with the same stall still passes.
+        // A correct timer with the same stall passes, and both undisturbed are measured as they
+        // are.
         let (sample, _) = sample_period(
             initial,
             nominal,
             simulated_reads(initial, nominal, 3 * nominal - 111_000, 61, 1_010_000),
         );
         assert_eq!(judge_period(sample, nominal), RateVerdict::InBounds);
-        // Undisturbed, both are measured as they are.
         let (sample, tried) = sample_period(
             initial,
             nominal,
             simulated_reads(initial, nominal, 0, usize::MAX, 0),
         );
         assert_eq!((sample.unwrap().ppm_of(nominal) / 1_000, tried), (1_000, 1));
+        let (sample, _) = sample_period(
+            initial,
+            nominal,
+            simulated_reads(initial, fast, 0, usize::MAX, 0),
+        );
+        assert_eq!(judge_period(sample, nominal), RateVerdict::Fast);
     }
 
     #[test]
