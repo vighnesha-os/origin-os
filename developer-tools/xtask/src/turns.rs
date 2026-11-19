@@ -9,10 +9,11 @@
 //!
 //! - **No lock can be left behind.** It is `flock` (`std::fs::File::lock`), which the operating
 //!   system releases when the process ends, however it ends. Linux and macOS alike.
-//! - **A run's own children do not wait for it.** `boot-matrix` runs `xtask boot-test` as
-//!   child processes. The holder gives each child [`HELD`] with its process ID, and a child that
-//!   finds the lock held by exactly that process goes on inside its parent's turn. A stale or
-//!   copied variable names some other process, so that child takes its turn like anyone else.
+//! - **A run's own children do not wait for it.** What `exclusive` runs may be `cargo xtask`
+//!   again (`boot-matrix` ran `xtask boot-test` as child processes too, until TASKS item 61 ran
+//!   its boots in process). The holder gives each child [`HELD`] with its process ID, and a child
+//!   that finds the lock held by exactly that process goes on inside its parent's turn. A stale
+//!   or copied variable names some other process, so that child takes its turn like anyone else.
 //! - **A waiter says what it is waiting for.** The holder writes its process ID, worktree,
 //!   command and start time into the lock file, and a waiter prints them once, then about once
 //!   a minute.
@@ -297,8 +298,9 @@ fn wait(file: &mut File, out: &mut dyn Write) -> std::io::Result<()> {
     }
 }
 
-/// Tells `command` that it runs inside this process's turn, if it has one: for the xtask
-/// children of a heavy run, and for whatever `exclusive` runs.
+/// Tells `command` that it runs inside this process's turn, if it has one: for whatever
+/// `exclusive` runs. (`boot-matrix` passed it to its `xtask boot-test` children too, until TASKS
+/// item 61 ran them in process.)
 pub(crate) fn pass(command: &mut Command) -> &mut Command {
     if let Some(pid) = TURN_OF.get() {
         command.env(HELD, pid.to_string());
