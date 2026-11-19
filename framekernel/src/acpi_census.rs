@@ -116,6 +116,9 @@ pub struct Findings {
     pub unreadable: u32,
     /// Structures copied rather than lent that declare more than the census copies (N2).
     pub too_large: u32,
+    /// Structures the firmware changes after boot that a lend over them did not refuse: the
+    /// lending registry's guard, tested at every boot (TASKS item 71). Any fails the verdict.
+    pub lendable_changing: u32,
     /// XSDT entries that were zero, which name no table (the review's F8).
     pub null_entries: u32,
     /// XSDT entries that could not be read: each might have been any table.
@@ -143,6 +146,7 @@ impl Findings {
         self.refused == 0
             && self.unreadable_entries == 0
             && self.relied == 0
+            && self.lendable_changing == 0
             && self.fadt
             && self.dsdt
             && (self.facs || self.reduced)
@@ -527,13 +531,29 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
         performance_tables(out, fw, &mut found, fpdt);
     }
     if let Some((changing, kept)) = fw.changing() {
-        let _ = writeln!(out, "{LINE}{}", NeverLent(&changing, kept));
+        // The guard, at every boot: a lend over each such structure, its start and its middle,
+        // must be refused. One that is not stays lent, so this is a check of last resort.
+        let mut refused = true;
+        for &(_, base, end) in changing.ranges() {
+            let middle = base.saturating_add(end.saturating_sub(base) / 2);
+            for (at, len) in [(base, HEADER_LEN), (middle, 8)] {
+                if fw.lend(at, len).is_ok() {
+                    refused = false;
+                    found.lendable_changing = found.lendable_changing.saturating_add(1);
+                }
+            }
+        }
+        let _ = writeln!(
+            out,
+            "{LINE}{}; a lend over each refused: {refused}",
+            NeverLent(&changing, kept)
+        );
     }
     let consistent = found.consistent();
     let micros = fw.now().saturating_sub(started) / 1000;
     let _ = writeln!(
         out,
-        "{LINE}{} tables: {} checked, {} refused, {} reported, {} of them where the kernel relies on it, {} with only their headers checked, {} not readable, {} too large to judge, {} null XSDT entries; FADT {}, DSDT {}, FACS {}; {} us; consistent {}{}",
+        "{LINE}{} tables: {} checked, {} refused, {} reported, {} of them where the kernel relies on it, {} with only their headers checked, {} not readable, {} too large to judge, {} null XSDT entries, {} lends over what the firmware changes; FADT {}, DSDT {}, FACS {}; {} us; consistent {}{}",
         found.tables,
         found.checked,
         found.refused,
@@ -543,6 +563,7 @@ pub fn census(out: &mut impl Write, fw: &mut impl Firmware, rsdp_addr: u64) -> b
         found.unreadable,
         found.too_large,
         found.null_entries,
+        found.lendable_changing,
         found.fadt,
         found.dsdt,
         if found.reduced && !found.facs {
@@ -696,6 +717,8 @@ mod tests {
         memory: Vec<u8>,
         entries: Vec<u64>,
         fadt: Vec<u8>,
+        /// The lending registry's guard broken: what the census's live check must catch.
+        guard_broken: bool,
     }
 
     impl Machine {
@@ -704,6 +727,7 @@ mod tests {
                 memory: vec![0u8; 0x8000 + (256 << 10)],
                 entries: vec![FADT],
                 fadt: Vec::new(),
+                guard_broken: false,
             };
             // A FADT of 276 bytes, with fixed hardware, its FACS and DSDT given.
             let mut f = vec![0u8; 240];
@@ -770,11 +794,14 @@ mod tests {
             };
             let found = crate::acpi::changing_ranges(RSDP, &mut copy);
             let ranges: Vec<(u64, u64)> = found.ranges().iter().map(|&(_, b, e)| (b, e)).collect();
-            let kept = origin_frame::reserved::Lending::new().never_lend(&ranges);
+            let mut registry = origin_frame::reserved::Lending::new();
+            let kept = registry.never_lend(&ranges);
             let mut fw = Memory {
                 bytes,
                 lent: Vec::new(),
                 changing: Some((found, kept)),
+                registry,
+                guard_broken: self.guard_broken,
             };
             let mut out = String::new();
             let verdict = census(&mut out, &mut fw, RSDP);
@@ -782,11 +809,15 @@ mod tests {
         }
     }
 
-    /// Firmware memory at [`BASE`]: lent and copied from one buffer, and every lending recorded.
+    /// Firmware memory at [`BASE`]: lent and copied from one buffer, and every lend made recorded.
     struct Memory {
         bytes: &'static [u8],
         lent: Vec<u64>,
         changing: Option<(ChangingRanges, Never)>,
+        /// The lending registry the kernel's lends go through, with the changing ranges in it.
+        registry: origin_frame::reserved::Lending,
+        /// A lend the registry refused is still made: the guard broken, for a test.
+        guard_broken: bool,
     }
 
     impl Memory {
@@ -803,8 +834,11 @@ mod tests {
 
     impl Firmware for Memory {
         fn lend(&mut self, addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
-            self.lent.push(addr);
             let bytes = self.range(addr, len)?;
+            // As `firmware::bytes`: through the lending registry (TASKS item 71).
+            if !self.registry.lend(addr, addr + len as u64) && !self.guard_broken {
+                return Err("refused by the lending registry");
+            }
             // As `firmware::bytes` refuses them (N3).
             if bytes
                 .get(..4)
@@ -812,6 +846,7 @@ mod tests {
             {
                 return Err("the firmware changes it after boot: copy it, never lend it");
             }
+            self.lent.push(addr);
             Ok(bytes)
         }
         fn copy(&mut self, addr: u64, out: &mut [u8]) -> Result<(), &'static str> {
@@ -838,7 +873,8 @@ mod tests {
             last_line(&out).ends_with(
                 "4 tables: 4 checked, 0 refused, 0 reported, 0 of them where the kernel relies on \
                  it, 0 with only their headers checked, 0 not readable, 0 too large to judge, 0 null \
-                 XSDT entries; FADT true, DSDT true, FACS true; 0 us; consistent true"
+                 XSDT entries, 0 lends over what the firmware changes; FADT true, DSDT true, FACS true; 0 us; \
+                 consistent true"
             ),
             "{out}"
         );
@@ -860,6 +896,32 @@ mod tests {
         );
         // The review's F2: the FACS is copied, never lent.
         assert!(!lent.contains(&FACS));
+        // TASKS item 71: the guard checked live, a lend at the FACS's start and middle refused.
+        assert!(
+            out.contains("1 kept; a lend over each refused: true"),
+            "{out}"
+        );
+        assert!(!lent.contains(&(FACS + 32)));
+    }
+
+    /// TASKS item 71: the census's live check of the lending registry. With the guard broken, a
+    /// lend into the FACS's middle is made, and the census's verdict fails.
+    #[test]
+    fn a_lend_over_what_the_firmware_changes_fails_the_census() {
+        let mut m = Machine::new();
+        m.guard_broken = true;
+        let (ok, out, lent) = m.run();
+        assert!(!ok, "{out}");
+        assert!(lent.contains(&(FACS + 32)), "{out}");
+        assert!(
+            out.contains("1 kept; a lend over each refused: false"),
+            "{out}"
+        );
+        assert!(
+            last_line(&out).contains(", 1 lends over what the firmware changes;"),
+            "{out}"
+        );
+        assert!(last_line(&out).ends_with("consistent false: acpi tables failed"));
     }
 
     #[test]
@@ -879,7 +941,7 @@ mod tests {
         let (ok, out, _) = m.run();
         assert!(ok, "{out}");
         assert!(out.contains("XSDT entry 0: null, names no table"), "{out}");
-        assert!(last_line(&out).contains(", 1 null XSDT entries;"), "{out}");
+        assert!(last_line(&out).contains(", 1 null XSDT entries,"), "{out}");
     }
 
     #[test]
