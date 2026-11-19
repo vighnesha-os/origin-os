@@ -253,7 +253,7 @@ impl<H: Host> Interpreter<H> {
                 Kind::Word => add(pc, 2)?,
                 Kind::DWord => add(pc, 4)?,
                 Kind::NameNew | Kind::NameOld | Kind::NameRaw => name::parse(self.aml(), pc)?.1,
-                _ => self.skip_term(work, pc)?,
+                _ => self.skip_term(work, pc, end)?,
             };
             if pc > end {
                 return err(ErrorKind::PackageLength);
@@ -265,7 +265,7 @@ impl<H: Host> Interpreter<H> {
     /// Steps over the start of the term at `pc`: a data object, a local, an argument or a name
     /// whole, an operator with a package length whole; an operator's or a call's operands are
     /// pushed onto `work`. Returns where the term's own bytes end.
-    fn skip_term(&mut self, work: &mut Vec<Level>, pc: u32) -> Result<u32> {
+    fn skip_term(&mut self, work: &mut Vec<Level>, pc: u32, end: u32) -> Result<u32> {
         let b = self.byte(pc)?;
         let next = add(pc, 1)?;
         match b {
@@ -274,7 +274,7 @@ impl<H: Host> Interpreter<H> {
             0x0B => return add(pc, 3),
             0x0C => return add(pc, 5),
             0x0E => return add(pc, 9),
-            0x0D => return self.skip_string(next),
+            0x0D => return self.skip_string(next, end),
             _ => {}
         }
         // `Revision` and `Debug`.
@@ -317,13 +317,16 @@ impl<H: Host> Interpreter<H> {
         Ok(at)
     }
 
-    /// Steps over a string literal's characters from `from`: to its NUL.
-    fn skip_string(&mut self, from: u32) -> Result<u32> {
-        let rest = self.aml().get(us(from)..).ok_or(ErrorKind::Truncated)?;
-        let len = rest
-            .iter()
-            .position(|&c| c == 0)
+    /// Steps over a string literal's characters from `from`: past its NUL, or to `end` if it has
+    /// none before it (G13, as the decoder reads one; nothing is reported for a literal skipped).
+    fn skip_string(&mut self, from: u32, end: u32) -> Result<u32> {
+        let rest = self
+            .aml()
+            .get(us(from)..us(end).max(us(from)))
             .ok_or(ErrorKind::Truncated)?;
+        let Some(len) = rest.iter().position(|&c| c == 0) else {
+            return Ok(end);
+        };
         self.note_work(
             u64::try_from(len / 64)
                 .unwrap_or(u64::MAX)

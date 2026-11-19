@@ -1170,28 +1170,48 @@ impl<H: Host> Interpreter<H> {
 
     fn decode_string(&mut self, want: Want, start: u32) -> Result<()> {
         let from = us(start);
-        let (len, bad) = {
-            let rest = self.aml().get(from..).ok_or(ErrorKind::Truncated)?;
-            let len = rest
-                .iter()
-                .position(|&c| c == 0)
+        let limit = us(self.enclosing_end());
+        // G13 (TASKS 64's ledger §3; step B5): every byte up to the NUL is a character, one above
+        // 0x7F (§20.2.3 allows 0x01 to 0x7F) included, reported; a literal with no NUL before the
+        // end of the range around it ends there, reported. The table's bytes are never written.
+        let (len, terminated, high) = {
+            let rest = self
+                .aml()
+                .get(from..limit.max(from))
                 .ok_or(ErrorKind::Truncated)?;
-            // §20.2.3: characters are 0x01–0x7F. One above fails the whole table (G13, strict
-            // until the reading session answers).
-            (len, rest.iter().take(len).any(|&c| c > 0x7F))
+            let (len, terminated) = match rest.iter().position(|&c| c == 0) {
+                Some(n) => (n, true),
+                None => (rest.len(), false),
+            };
+            (
+                len,
+                terminated,
+                rest.iter().take(len).any(|&c| c > 0x7F),
+            )
         };
-        // The scan for the NUL read `len` bytes: work, counted a unit for each 64 and one more,
-        // whether or not the string is kept.
+        // The scan read `len` bytes: work, counted a unit for each 64 and one more, whether or
+        // not the string is kept.
         self.note_work(
             u64::try_from(len / 64)
                 .unwrap_or(u64::MAX)
                 .saturating_add(1),
         );
-        if bad {
+        let literal = At {
+            table: self.cur.table,
+            offset: start.saturating_sub(1),
+        };
+        #[cfg(test)]
+        if high && crate::tests::planted(crate::tests::Fault::RefuseHighBytes) {
             return err(ErrorKind::Grammar);
         }
+        if !terminated {
+            self.tell(&crate::Report::Unterminated { at: literal });
+        }
+        if high {
+            self.tell(&crate::Report::HighBytes { at: literal });
+        }
         let end = add(start, u32::try_from(len).map_err(|_| ErrorKind::Truncated)?)?;
-        self.cur.pc = add(end, 1)?;
+        self.cur.pc = if terminated { add(end, 1)? } else { end };
         if want == Want::Statement {
             return Ok(());
         }
@@ -1329,10 +1349,25 @@ impl<H: Host> Interpreter<H> {
         self.pop_frame();
         #[cfg(test)]
         self.note_ran(f.at);
-        match f.arg(6) {
-            Operand::Val(v) => self.give_val(v),
-            _ => err(ErrorKind::Grammar),
+        let Operand::Val(v) = f.arg(6) else {
+            return err(ErrorKind::Grammar);
+        };
+        if let Val::Obj(r) = v
+            && let Ok(Object::Package(elems)) = self.heap.get(r)
+        {
+            let count = u64::try_from(elems.len()).unwrap_or(u64::MAX);
+            if f.aux > count {
+                self.tell(&crate::Report::ExtraElements {
+                    at: At {
+                        table: self.cur.table,
+                        offset: f.at,
+                    },
+                    count,
+                    found: f.aux,
+                });
+            }
         }
+        self.give_val(v)
     }
 
     /// Decodes one element: a data object, kept here, or a name, kept unresolved.
@@ -1379,10 +1414,18 @@ impl<H: Host> Interpreter<H> {
         let i = usize::try_from(index).map_err(|_| ErrorKind::Range)?;
         match self.heap.get_mut(pkg)? {
             Object::Package(elems) => {
-                // More elements than the count: a compile-time error by §19.6.102 (G14, strict
-                // until the reading session answers).
-                let slot = elems.get_mut(i).ok_or(ErrorKind::Range)?;
-                *slot = v;
+                // More elements than the count (a compile-time error by §19.6.102): the extra
+                // ones are decoded, then dropped, and reported when the package ends (G14, TASKS
+                // 64's ledger §3; step B5).
+                #[cfg(test)]
+                if i >= elems.len()
+                    && crate::tests::planted(crate::tests::Fault::RefuseExtraElements)
+                {
+                    return err(ErrorKind::Range);
+                }
+                if let Some(slot) = elems.get_mut(i) {
+                    *slot = v;
+                }
             }
             _ => return err(ErrorKind::Grammar),
         }

@@ -599,7 +599,7 @@ impl<H: Host> Interpreter<H> {
             Op::LoadTable => self.exec_load_table(&f),
             Op::Stall => {
                 let us = self.int(&f, 0)?;
-                self.stall(us)
+                self.stall(us, f.at)
             }
             Op::Sleep => {
                 let ms = self.int(&f, 0)?;

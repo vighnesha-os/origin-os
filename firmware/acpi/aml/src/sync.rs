@@ -364,9 +364,21 @@ impl<H: Host> Interpreter<H> {
         self.check_time()
     }
 
-    /// `Stall`: at most 255 µs (G7, as ACPICA does: TASKS 64's ledger §3).
-    pub(crate) fn stall(&mut self, us: u64) -> Result<()> {
+    /// `Stall` at `at`: at most 255 µs (G7, as ACPICA does: TASKS 64's ledger §3); more than
+    /// 100 (§19.6.129's most) is made and reported (step B5).
+    pub(crate) fn stall(&mut self, us: u64, at: u32) -> Result<()> {
         let us = u8::try_from(us).map_err(|_| ErrorKind::Range)?;
+        #[cfg(test)]
+        let silent = crate::tests::planted(crate::tests::Fault::SilentStall);
+        #[cfg(not(test))]
+        let silent = false;
+        if us > 100 && !silent {
+            let at = crate::At {
+                table: self.cur.table,
+                offset: at,
+            };
+            self.tell(&crate::Report::LongStall { at, us });
+        }
         self.charge_time(u64::from(us).saturating_mul(10))?;
         self.host.stall_us(us);
         self.check_time()

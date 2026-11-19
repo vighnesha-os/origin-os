@@ -435,6 +435,14 @@ pub(crate) enum Fault {
     LoadTwice,
     /// The names load-time code put in packages are never bound (`tolerate.rs`, `bind_names`).
     NoBind,
+    /// A string byte above 0x7F fails the table, as before step B5 (`engine.rs`,
+    /// `decode_string`).
+    RefuseHighBytes,
+    /// A package with more elements than its count is a `Range` error, as before step B5
+    /// (`engine.rs`, `place_element`).
+    RefuseExtraElements,
+    /// A `Stall` of 101 to 255 µs is not reported (`sync.rs`, `stall`).
+    SilentStall,
 }
 
 thread_local! {

@@ -621,3 +621,148 @@ fn planted_faults_are_caught_by_the_tolerance_tests() {
     plant(None);
     assert!(failed, "NoReport");
 }
+
+// --- The decoder: G13, G14 and G7's report (step B5-3) -----------------------------------------
+
+#[test]
+fn high_bytes_accepted_and_reported() {
+    let body = [name("S", string("Caf\u{e9}")), name("AFT", one())];
+    let mut i = fresh();
+    assert_eq!(load(&mut i, &body), Ok(0));
+    // `Name` (1) and its name (4): the literal's 0x0D at 5.
+    assert_eq!(told(&mut i), vec![Told::HighBytes(5)]);
+    assert_eq!(
+        eval(&mut i, "S"),
+        Ok(Some(Value::String(vec![b'C', b'a', b'f', 0xC3, 0xA9])))
+    );
+    assert!(exists(&i, "\\AFT"));
+}
+
+#[test]
+fn unterminated_string_ends_at_its_range() {
+    // The last thing in a device's body: a literal with no NUL before the body's end.
+    let mut s = name("S", vec![0x0D]);
+    s.extend(b"abc");
+    let body = [device("D", &[s]), name("AFT", one())];
+    let mut i = fresh();
+    assert_eq!(load(&mut i, &body), Ok(0));
+    // The device: `0x5B 0x82` (2), its length (1), its name (4); then `Name` (1), its name (4).
+    assert_eq!(told(&mut i), vec![Told::Unterminated(12)]);
+    assert_eq!(
+        eval(&mut i, "D.S"),
+        Ok(Some(Value::String(b"abc".to_vec())))
+    );
+    assert!(exists(&i, "\\AFT"));
+}
+
+#[test]
+fn unterminated_string_in_a_package() {
+    let mut lit = vec![0x0D];
+    lit.extend(b"xy");
+    let body = [name("P", package(2, &[lit])), name("AFT", one())];
+    let mut i = fresh();
+    assert_eq!(load(&mut i, &body), Ok(0));
+    assert_eq!(told(&mut i), vec![Told::Unterminated(8)]);
+    assert_eq!(
+        eval(&mut i, "P"),
+        Ok(Some(Value::Package(vec![
+            Value::String(b"xy".to_vec()),
+            Value::Uninitialized
+        ])))
+    );
+}
+
+#[test]
+fn extra_elements_dropped_and_reported() {
+    let body = [
+        name("P", package(1, &[one(), byte(2), byte(3)])),
+        name("V", var_package(one(), &[byte(4), byte(5)])),
+    ];
+    let mut i = fresh();
+    assert_eq!(load(&mut i, &body), Ok(0));
+    assert_eq!(
+        told(&mut i),
+        vec![
+            Told::Extra { count: 1, found: 3 },
+            Told::Extra { count: 1, found: 2 }
+        ]
+    );
+    assert_eq!(
+        eval(&mut i, "P"),
+        Ok(Some(Value::Package(vec![Value::Integer(1)])))
+    );
+    assert_eq!(
+        eval(&mut i, "V"),
+        Ok(Some(Value::Package(vec![Value::Integer(4)])))
+    );
+}
+
+#[test]
+fn expression_element_still_refused() {
+    // An element that is an expression: refused, as ACPICA does; `Grammar` fails the table whole.
+    let body = [name("P", package(1, &[add(one(), one(), zero())]))];
+    let mut i = fresh();
+    assert_eq!(
+        load(&mut i, &body).map_err(|e| e.kind),
+        Err(ErrorKind::Grammar)
+    );
+    assert_eq!(told(&mut i), vec![]);
+}
+
+#[test]
+fn long_stall_reported() {
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            method(
+                "ST",
+                0,
+                &[stall(byte(100)), stall(byte(101)), stall(byte(255)), ret(one())],
+            ),
+            method("BIG", 0, &[stall(word(256)), ret(one())]),
+        ],
+    )
+    .unwrap();
+    let _ = told(&mut i);
+    assert_eq!(int(&mut i, "ST"), 1);
+    assert_eq!(
+        told(&mut i),
+        vec![Told::LongStall(101), Told::LongStall(255)]
+    );
+    assert_eq!(
+        eval(&mut i, "BIG").map_err(|e| e.kind),
+        Err(ErrorKind::Range)
+    );
+}
+
+#[test]
+fn planted_faults_are_caught_by_the_decoder_tests() {
+    let tests: [(Option<Fault>, &[fn()]); 4] = [
+        (
+            None,
+            &[
+                high_bytes_accepted_and_reported,
+                unterminated_string_ends_at_its_range,
+                unterminated_string_in_a_package,
+                extra_elements_dropped_and_reported,
+                expression_element_still_refused,
+                long_stall_reported,
+            ],
+        ),
+        (Some(Fault::RefuseHighBytes), &[high_bytes_accepted_and_reported]),
+        (
+            Some(Fault::RefuseExtraElements),
+            &[extra_elements_dropped_and_reported],
+        ),
+        (Some(Fault::SilentStall), &[long_stall_reported]),
+    ];
+    for (f, cases) in tests {
+        for case in cases {
+            plant(f);
+            let failed = std::panic::catch_unwind(case).is_err();
+            plant(None);
+            assert_eq!(failed, f.is_some(), "{f:?}: case {case:?}");
+        }
+    }
+}
