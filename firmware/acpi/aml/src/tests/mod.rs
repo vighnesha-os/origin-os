@@ -465,6 +465,9 @@ pub(crate) enum Fault {
     StringCut,
     /// A store in pieces is not told to the host (`tolerate.rs`, `tell_pieces`).
     SilentPieces,
+    /// The skip takes a name naming a method as a call in a place too, as before the review of
+    /// B5, B5-R1 (`tolerate.rs`, `skip_term`).
+    SkipCallsInPlaces,
     /// `AnyAcc` takes the narrowest naturally aligned width holding the field, as before step B5
     /// (`region.rs`, `width`).
     WidestAnyAcc,

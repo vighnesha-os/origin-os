@@ -470,6 +470,93 @@ fn a_boot_tables_local_abandons_its_statement() {
     assert!(exists(&i, "\\AFT"));
 }
 
+/// A method of one argument and one of two, for the place tests (B5-R1).
+fn takers() -> [B; 2] {
+    [
+        method("MT1", 1, &[ret(arg(0))]),
+        method("MT2", 2, &[ret(arg(1))]),
+    ]
+}
+
+#[test]
+fn a_place_naming_a_method_is_skipped_as_a_name() {
+    // The review of B5, B5-R1 (a): `MT1` takes one argument, but as `Store`'s target, or as
+    // `ObjectType`'s operand, it is a place, never a call. The statement is abandoned alone, and
+    // the names after it are created.
+    for failing in [
+        store(nm("UNDF"), nm("MT1")),
+        store(object_type(nm("MT1")), nm("UNDF")),
+        cond_ref_of(nm("MT1"), nm("UNDF")),
+    ] {
+        let [t1, t2] = takers();
+        let body = [t1, t2, failing, name("AF1", one()), name("AF2", one())];
+        let mut i = fresh();
+        assert_eq!(load(&mut i, &body), Ok(0));
+        assert_eq!(
+            told(&mut i),
+            vec![abandoned(&body, 2, 0, ErrorKind::NotFound)]
+        );
+        assert!(exists(&i, "\\AF1") && exists(&i, "\\AF2"));
+        at_rest(&i);
+    }
+}
+
+#[test]
+fn a_place_naming_a_method_before_a_device_keeps_the_device() {
+    // B5-R1 (b): the `Device` after `Store (UNDF, MT1)` is created, with its children.
+    let [t1, t2] = takers();
+    let body = [
+        t1,
+        t2,
+        store(nm("UNDF"), nm("MT1")),
+        device("DEV", &[name("_HID", string("ORG0001")), name("C1", one())]),
+        name("AFT", one()),
+    ];
+    let mut i = fresh();
+    assert_eq!(load(&mut i, &body), Ok(0));
+    assert_eq!(
+        told(&mut i),
+        vec![abandoned(&body, 2, 0, ErrorKind::NotFound)]
+    );
+    assert!(exists(&i, "\\DEV") && exists(&i, "\\DEV.C1") && exists(&i, "\\AFT"));
+}
+
+#[test]
+fn a_place_naming_a_method_in_a_body_does_not_run_past_it() {
+    // B5-R1 (c): `MT2` takes two arguments; `Store (UNDF, \MT2)` next to last in a `Device`'s
+    // body. Taken as a call, the skip ran past the body's end and the table failed whole with
+    // `PackageLength`. It is abandoned alone, the body's last name and the table kept.
+    let [t1, t2] = takers();
+    let failing = store(nm("UNDF"), nm("\\MT2"));
+    let inner = [failing.clone(), name("LAST", one())];
+    let body = [
+        t1,
+        t2,
+        name("BEF", one()),
+        device("DEV", &inner),
+        name("AFT", one()),
+    ];
+    let mut i = fresh();
+    assert_eq!(load(&mut i, &body), Ok(0));
+    let t = told(&mut i);
+    assert!(
+        matches!(
+            t.as_slice(),
+            [Told::Abandoned {
+                kind: ErrorKind::NotFound,
+                table: 0,
+                statement,
+                resumed,
+            }] if resumed - statement == failing.len() as u32
+        ),
+        "{t:?}"
+    );
+    assert!(!i.table(0).unwrap().failed);
+    for p in ["\\BEF", "\\DEV", "\\DEV.LAST", "\\AFT"] {
+        assert!(exists(&i, p), "{p}");
+    }
+}
+
 #[test]
 fn a_skip_whose_work_list_reaches_the_memory_limit_fails_the_table_whole() {
     // The skip's work list is a vector charged to the memory limit and given back after each skip
@@ -631,7 +718,7 @@ fn method_packages_resolve_when_read() {
 
 #[test]
 fn planted_faults_are_caught_by_the_tolerance_tests() {
-    let tests: [Control; 5] = [
+    let tests: [Control; 6] = [
         (
             Some(Fault::AllowDuplicate),
             &[duplicate_keeps_the_first_object],
@@ -656,6 +743,9 @@ fn planted_faults_are_caught_by_the_tolerance_tests() {
                 unbound_element_is_empty_and_reported,
                 binding_happens_once,
                 runtime_load_binds_its_own,
+                a_place_naming_a_method_is_skipped_as_a_name,
+                a_place_naming_a_method_before_a_device_keeps_the_device,
+                a_place_naming_a_method_in_a_body_does_not_run_past_it,
             ],
         ),
         (
@@ -677,6 +767,14 @@ fn planted_faults_are_caught_by_the_tolerance_tests() {
             ],
         ),
         (Some(Fault::LoadTwice), &[already_loaded_is_refused]),
+        (
+            Some(Fault::SkipCallsInPlaces),
+            &[
+                a_place_naming_a_method_is_skipped_as_a_name,
+                a_place_naming_a_method_before_a_device_keeps_the_device,
+                a_place_naming_a_method_in_a_body_does_not_run_past_it,
+            ],
+        ),
         (
             Some(Fault::NoBind),
             &[

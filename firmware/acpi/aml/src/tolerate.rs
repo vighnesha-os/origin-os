@@ -17,9 +17,12 @@
 //! - what it started above its block is unwound, a method it called ending as at any error, its
 //!   temporary names removed (what `Acquire` took stays held: G2);
 //! - it is skipped to its structural end by parsing it again from its start, running nothing,
-//!   creating nothing and asking the host nothing: names are looked up only to learn whether one is
-//!   a method and how many arguments it takes, and one that resolves to nothing takes none (G1). A
-//!   term is a unit of work. The work list is charged to the memory limit and given back;
+//!   creating nothing and asking the host nothing: a name in a statement or `TermArg` position is
+//!   looked up only to learn whether it is a method and how many arguments it takes, one that
+//!   resolves to nothing taking none (G1), and a name in a place (a `SuperName`, a `Target`, a
+//!   `SimpleName`) is stepped over as a name, never a call, as the decoder reads it (the review of
+//!   B5, B5-R1). A term is a unit of work. The work list is charged to the memory limit and given
+//!   back;
 //! - a statement with a package length is skipped by it, so a failing scope-opener loses its
 //!   whole body; an `If` abandoned in its predicate takes the `Else` after it, and a `While`'s
 //!   predicate, failing on any pass, abandons the whole `While`;
@@ -269,7 +272,7 @@ impl<H: Host> Interpreter<H> {
                 Kind::Word => add(pc, 2)?,
                 Kind::DWord => add(pc, 4)?,
                 Kind::NameNew | Kind::NameOld | Kind::NameRaw => name::parse(self.aml(), pc)?.1,
-                _ => self.skip_term(work, pc, end)?,
+                _ => self.skip_term(work, kind, pc, end)?,
             };
             if pc > end {
                 return err(ErrorKind::PackageLength);
@@ -278,10 +281,10 @@ impl<H: Host> Interpreter<H> {
         Ok(pc)
     }
 
-    /// Steps over the start of the term at `pc`: a data object, a local, an argument or a name
-    /// whole, an operator with a package length whole; an operator's or a call's operands are
-    /// pushed onto `work`. Returns where the term's own bytes end.
-    fn skip_term(&mut self, work: &mut Vec<Level>, pc: u32, end: u32) -> Result<u32> {
+    /// Steps over the start of the term at `pc`, an operand of `kind`: a data object, a local, an
+    /// argument or a name whole, an operator with a package length whole; an operator's or a
+    /// call's operands are pushed onto `work`. Returns where the term's own bytes end.
+    fn skip_term(&mut self, work: &mut Vec<Level>, kind: Kind, pc: u32, end: u32) -> Result<u32> {
         let b = self.byte(pc)?;
         let next = add(pc, 1)?;
         match b {
@@ -299,6 +302,15 @@ impl<H: Host> Interpreter<H> {
         }
         if name::starts_name(b) {
             let (n, after) = name::parse(self.aml(), pc)?;
+            // A name in a place is never called (`decode_location`; ledger 64 §3 G1: a call only
+            // where one is possible): only a statement or a `TermArg` may be one (B5-R1).
+            #[cfg(test)]
+            let anywhere = crate::tests::planted(crate::tests::Fault::SkipCallsInPlaces);
+            #[cfg(not(test))]
+            let anywhere = false;
+            if !anywhere && !matches!(kind, Kind::TermArg | Kind::TermArgRaw) {
+                return Ok(after);
+            }
             let argc = match self.resolve(n) {
                 Ok(Some(node)) => match self.heap.get(self.ns.obj(node)?)? {
                     Object::Method(m) => m.argc(),
