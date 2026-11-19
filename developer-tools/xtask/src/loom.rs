@@ -1377,8 +1377,12 @@ const CONTROLS: &[Control] = &[
         )],
     },
     Control {
-        // C6 (the coordinating session's ruling (c)): `ended` taken by a load and a store, not a
-        // swap. A retirement and the next exit's switch can then wipe that exit's record.
+        // C6 (the coordinating session's ruling (c)): `ended` taken by a load, then cleared by a
+        // swap whose value is dropped. An exit recorded between the two is wiped, and its home
+        // is never retired. Since T70-1 every caller retires with interrupts off on its own
+        // processor, so on a kernel no switch falls between the two; L5 runs its retirers as
+        // threads, a caller that breaks that precondition, and C6 shows that the single swap
+        // still covers it (the addendum to the review of TASKS item 70, T70-9).
         name: "contexts_ended_taken_in_two_steps",
         file: CONTEXTS,
         from: "        let ended = self.ended.swap(NONE, AcqRel);\n",

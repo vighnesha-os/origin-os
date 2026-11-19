@@ -5197,7 +5197,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
     - C4: retirement before leaving;
     - C5: a claim by load and store;
     - C6: `ended` taken in two steps.
-  - **What Loom found on the way.** With the exit's record written by a plain store, Loom found an execution of L5 in which a later swap, and the final swap sequenced after that store in the same thread, read the value before it, so an exit's home was never retired. As this task's author reads C11, a read-modify-write may not read so, and whether Loom's search is wider than C11 there was not settled. With every write of `ended` a swap, both order them; L5 passes in 9 executions.
+  - **What Loom found on the way.** With the exit's record written by a plain store, Loom found an execution of L5 in which a later swap, and the final swap sequenced after that store in the same thread, read the value before it, so an exit's home was never retired. As this task's author reads C11, a read-modify-write may not read so, and whether Loom's search is wider than C11 there was not settled then (since answered: C++20 forbids that execution, so it was a false alarm of Loom 0.7.2's, and the swap is kept for Loom's sake; the answers to the review, T70-3). With every write of `ended` a swap, both order them; L5 passes in 9 executions.
   - **Boot:**
     - W-0 on `81e6b6f9`: `in use: false` in both windows, boot refused. That is the window of T68-2, and the exit window, on a real boot.
     - Controls W-1 to W-4, W-2b and P-1 on `ab25746a` (ADR-0013, "Controls of the switch windows"), each failing as listed there. W-2 was caught by the IPC proof's frame count before W3; W-2b was caught by a latent `spawn_with` defect (follow-up).

@@ -264,10 +264,11 @@ impl Contexts {
     }
 
     /// Retires the home of a context that ended, if any: this processor only, after it has left
-    /// that context's stack. That holds whenever this is called, from [`Self::switch`] or with
-    /// interrupts on: the exit's own `switch` records the context as ended, and the trap entry
-    /// then loads the next frame with nothing in between that calls this. Every later call runs
-    /// on another context's stack. `running_on` checks it all the same.
+    /// that context's stack. That holds at every call: the exit's own `switch` records the
+    /// context as ended, and the trap entry then loads the next frame with nothing in between
+    /// that calls this, so every later call, from [`Self::switch`] or from a caller with
+    /// interrupts off on this processor, runs on another context's stack. `running_on` checks it
+    /// all the same.
     ///
     /// Call it with interrupts off (the module documentation, "Who calls what"). A refused
     /// retirement puts its record back only if no newer exit has recorded itself meanwhile
