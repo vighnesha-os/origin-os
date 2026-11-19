@@ -1178,6 +1178,7 @@ fn every_tolerance_test_fails_without_its_reports() {
         duplicate_keeps_the_first_object,
         scope_over_an_integer_stays_refused,
         abandon_and_skip_are_bounded,
+        the_skip_asks_the_host_nothing_and_reaches_no_fatal,
         already_loaded_is_refused,
         loaded_table_with_abandoned_statements_gives_true,
         a_boot_tables_local_abandons_its_statement,
