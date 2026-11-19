@@ -6,7 +6,10 @@
 //!
 //! Where a 32-bit field has a 64-bit `X_` form, the `X_` form is used when its address is not zero,
 //! and the 32-bit field is then ignored whatever it holds (§5.2.9: the two need not agree).
-//! [`Fadt::block`], [`Fadt::facs_address`] and [`Fadt::dsdt_address`] apply that rule.
+//! [`Fadt::block`], [`Fadt::facs_address`] and [`Fadt::dsdt_address`] apply that rule. §5.2.9 has
+//! the `X_` form used when it is non-zero *and usable*, and the 32-bit field otherwise:
+//! [`Fadt::port_block`] gives that 32-bit field to an OS that cannot use a block's `X_` form, or
+//! when the `X_` form breaks a rule of its own (TASKS item 71).
 //!
 //! With `HW_REDUCED_ACPI` set, ACPI 6.6 tells the OS to ignore the fields at offsets 46 to 108 and
 //! 148 to 232 and nine of the flags; none of them is checked then.
