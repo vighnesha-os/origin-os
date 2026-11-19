@@ -11,8 +11,8 @@
 //!    across QEMU's 244 µs update-in-progress pulse loses the pulse's precision, not the
 //!    edge. A pair of edges decides only if its whole interval of uncertainty is inside
 //!    or outside 1 % of the PIT rate ([`rtc::SecondMeter`]); a pair too vague to decide
-//!    gives way to the next edge, within a 3.2 s budget (the two seconds two edges need,
-//!    and one spare for an edge a stall has spoiled);
+//!    gives way to the next edge, within a 5.2 s budget (the two seconds two edges need,
+//!    and three more for edges a stall has spoiled: TASKS item 66);
 //! 3. chooses the TSC rate: CPUID leaf 15h's if enumerated and within 1 % of the PIT
 //!    calibration; else the RTC second's, if within 1 %; else the PIT calibration;
 //! 4. reads the RTC just after the sharpest edge, so the wall clock is right to within
@@ -75,10 +75,13 @@ fn rdtscp_supported() -> bool {
 /// Register B bit 7: updates are inhibited while the clock is being set.
 const STATUS_B_SET: u8 = 0x80;
 /// How long [`measure_rtc`] may take, in tenths of a second: the two seconds that two
-/// edges need, one more for an edge a stall has spoiled, and a margin of 0.2 s. This is
+/// edges need, three more for edges a stall has spoiled, and a margin of 0.2 s. This is
 /// the proof's whole cost when the RTC is working: without a spoiled edge, it stops at
-/// the second edge, at most two seconds in, as it always has.
-const RTC_BUDGET_TENTHS: u64 = 32;
+/// the second edge, at most two seconds in, as it always has. A pair of edges further
+/// apart divides the same vagueness by more seconds, so a second too vague to decide over
+/// one second decides over two or more: on QEMU's 65- and 67-processor machines each edge
+/// was vague by up to 9.7 ms, and one boot's 3.2 s ran out undecided (TASKS item 66).
+const RTC_BUDGET_TENTHS: u64 = 52;
 /// The RTC's second must agree with the PIT-calibrated TSC within this many parts per
 /// thousand (1 %).
 const RTC_TOLERANCE_PPT: u16 = 10;

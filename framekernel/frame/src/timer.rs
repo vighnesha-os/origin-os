@@ -44,10 +44,14 @@ const DIVISOR: u32 = 16;
 /// reaches its end does not hold up a boot for long.
 const WINDOW_BUDGET_TICKS: u64 = 1 << 31;
 /// Calibration windows to measure before taking the least disturbed one. A window is
-/// spoiled by a stall near its start or its end, and each spoiled one costs 10 ms; on the
-/// development host under full load about 60 % are spoiled, and a boot with no clean
-/// window among 32 is then a chance of about 1 in 10^7.
-const CALIBRATION_WINDOWS: u32 = 32;
+/// spoiled by a stall near its start or its end, and each spoiled one costs 10 ms, so the
+/// budget is spent only while windows are spoiled: on a real machine the first is clean.
+/// Under QEMU's software processor the 65- and 67-processor machines spoil about 98 % of
+/// them (TASKS item 66, 2026-11-19: in 7 of 14 idle boots none of 32 was clean, and the
+/// least disturbed one was up to 2.9 % off, which the RTC second then refuted). With 1024,
+/// a boot with no clean window is a chance of about 1 in 10^10 there; the budget is at
+/// most about 10 s of windows.
+const CALIBRATION_WINDOWS: u32 = 1024;
 
 /// Master and slave 8259 data (mask) ports.
 const PIC_MASTER_DATA: u16 = 0x21;
