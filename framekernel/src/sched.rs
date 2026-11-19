@@ -20,7 +20,10 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bootproof::{Proof, Tally};
-use crate::runqueue::{QueueError, RunQueue, per_mille, share_near_weight};
+use crate::runqueue::{
+    PREEMPTION_ROUNDS, QueueError, RunQueue, TickWatch, WindowVerdict, judge_window, per_mille,
+    share_near_weight,
+};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, rdtsc};
@@ -59,7 +62,13 @@ use crate::cpu::without_interrupts;
 /// The timer interrupted the context whose frame is at `interrupted`; returns the frame to
 /// resume. Processors without an active queue keep running what they were running.
 pub(crate) fn on_tick(interrupted: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q| Some(q.tick(interrupted)))
+    with_queue(interrupted, switch, |q| {
+        // The preemption proof's watch (TASKS item 66): the TSC only while it is armed.
+        if q.watching() {
+            q.note_tick(rdtsc());
+        }
+        Some(q.tick(interrupted))
+    })
 }
 
 /// Makes sure CPU `cpu`'s boot/idle context (slot 0) has an FPU area, so the first switch
@@ -1156,14 +1165,210 @@ const WINDOW_TICKS: u64 = 50;
 /// one processor (TASKS item 66).
 const WINDOW_BUDGET_SECONDS: u64 = 10;
 
+/// Runs of the preemption proof's window it may make: another only after a run whose
+/// processors' own ticks show a stall before today's bound ([`WindowVerdict::Stalled`]), each
+/// against the same verdict (TASKS item 66, the review's T66-R1).
+const PREEMPTION_ATTEMPTS: u32 = 4;
+
+/// One run of the preemption proof's window, as the boot flow measured it.
+struct WindowRun {
+    /// How long the window lasted.
+    elapsed_ms: u64,
+    /// Each processor's ticks over the window, and its context switches, in the proof's order.
+    watches: alloc::vec::Vec<TickWatch>,
+    switches: alloc::vec::Vec<u64>,
+    /// Whether every worker exited after the window.
+    exited: bool,
+}
+
+/// One run of the window: every processor's ticks watched from now, until each has taken
+/// [`WINDOW_TICKS`] or [`WINDOW_BUDGET_SECONDS`] pass; then the workers are told to stop and
+/// waited for.
+fn run_window(cpus: &[CpuIndex], tsc_hz: u64, workers: u64) -> WindowRun {
+    let period = tsc_hz / timer::HZ;
+    let start = rdtsc();
+    let switches_before: alloc::vec::Vec<u64> = cpus
+        .iter()
+        .map(|id| {
+            QUEUES.get(id.get()).map_or(0, |q| {
+                without_interrupts(|| {
+                    let mut q = q.lock();
+                    q.arm_watch(start, period);
+                    q.switches()
+                })
+            })
+        })
+        .collect();
+    let ticks_of = |id: &CpuIndex| {
+        QUEUES
+            .get(id.get())
+            .map_or(0, |q| without_interrupts(|| q.lock().watch().ticks))
+    };
+    let budget = tsc_hz.saturating_mul(WINDOW_BUDGET_SECONDS);
+    while cpus.iter().any(|id| ticks_of(id) < WINDOW_TICKS) && rdtsc().wrapping_sub(start) < budget
+    {
+        // Interrupts on only while halted: the timer may switch to a worker here, and this
+        // flow resumes after `hlt` when its turn comes round again.
+        cpu::idle_disabling();
+    }
+    let elapsed_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
+    let (watches, switches) = cpus
+        .iter()
+        .zip(&switches_before)
+        .map(|(id, &before)| {
+            QUEUES.get(id.get()).map_or((TickWatch::new(), 0), |q| {
+                without_interrupts(|| {
+                    let mut q = q.lock();
+                    q.disarm_watch();
+                    (q.watch(), q.switches().wrapping_sub(before))
+                })
+            })
+        })
+        .unzip();
+    drop(switches_before);
+    STOP.store(true, Ordering::Relaxed);
+    // Every worker now exits; the boot flow yields so the boot processor's workers run.
+    let exited = wait_for_others(
+        "the preemption workers' exit",
+        || EXITED.load(Ordering::Relaxed) == workers,
+        tsc_hz,
+        2000,
+    );
+    WindowRun {
+        elapsed_ms,
+        watches,
+        switches,
+        exited,
+    }
+}
+
+/// Starts the next run's workers, two on every processor, with their counts from zero; the CPU
+/// that refused one, if any.
+fn respawn_workers(cpus: &[CpuIndex]) -> Result<(), CpuIndex> {
+    STOP.store(false, Ordering::Relaxed);
+    EXITED.store(0, Ordering::Relaxed);
+    for slot in 0..2 * cpus.len() {
+        for table in [&PROGRESS, &RAN_ON] {
+            if let Some(entry) = worker_entry(table, slot) {
+                entry.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+    for (i, &id) in cpus.iter().enumerate() {
+        for k in 0..2 {
+            spawn(id, worker, (2 * i + k) as u64).map_err(|_| id)?;
+        }
+    }
+    Ok(())
+}
+
+/// The run's verdict from its processors' ticks: the first that fails ([`WindowVerdict::Short`],
+/// [`WindowVerdict::WrongRate`] or [`WindowVerdict::Late`]) decides, else the first stalled
+/// one, else every processor is in bounds. With the processor and its watch, for the line.
+fn judge_run(
+    run: &WindowRun,
+    cpus: &[CpuIndex],
+    tsc_hz: u64,
+) -> (WindowVerdict, Option<(CpuIndex, TickWatch)>) {
+    // Today's bound: the rounds clause's 15 rounds within 500 ms.
+    let bound = tsc_hz / 2;
+    let judged = || {
+        cpus.iter()
+            .zip(&run.watches)
+            .map(|(&id, w)| (id, *w, judge_window(w, WINDOW_TICKS, bound)))
+    };
+    let failing = |v: WindowVerdict| {
+        matches!(
+            v,
+            WindowVerdict::Short | WindowVerdict::WrongRate | WindowVerdict::Late
+        )
+    };
+    if let Some((id, w, v)) = judged().find(|&(_, _, v)| failing(v)) {
+        return (v, Some((id, w)));
+    }
+    if let Some((id, w, v)) = judged().find(|&(_, _, v)| v == WindowVerdict::Stalled) {
+        return (v, Some((id, w)));
+    }
+    (WindowVerdict::InBounds, None)
+}
+
+/// The run's line: how long the window lasted, which run it was, and what its processors' ticks
+/// showed. A stalled run says so, as on a machine without a hypervisor it is a finding (ADR-0013's
+/// note of TASKS item 66); a failing one ends `scheduler failed`, on this line and not on a
+/// processor's own, whose wording `xtask`'s fair-share allowances read.
+fn say_window(
+    com1: &mut Console,
+    run: &WindowRun,
+    verdict: (WindowVerdict, Option<(CpuIndex, TickWatch)>),
+    attempt: u32,
+) {
+    let ms = |w: &TickWatch, ticks: u64| ticks / (w.period.saturating_mul(timer::HZ) / 1000).max(1);
+    let _ = write!(
+        com1,
+        "origin-kernel: scheduler: window of {} ms, run {attempt} of {PREEMPTION_ATTEMPTS}: ",
+        run.elapsed_ms
+    );
+    let _ = match verdict {
+        (WindowVerdict::InBounds, _) => write!(
+            com1,
+            "every tick's median in bounds, every 15th tick within 500 ms{}",
+            if attempt > 1 {
+                " (after a stalled run)"
+            } else {
+                ""
+            }
+        ),
+        (v, Some((id, w))) => {
+            let what = match v {
+                WindowVerdict::Stalled if attempt < PREEMPTION_ATTEMPTS => "stalled, run again",
+                WindowVerdict::Stalled => "stalled in every run: scheduler failed",
+                _ => ": scheduler failed",
+            };
+            match v {
+                WindowVerdict::Short => write!(
+                    com1,
+                    "CPU {id} took {} of {WINDOW_TICKS} ticks in {WINDOW_BUDGET_SECONDS} s{what}",
+                    w.ticks
+                ),
+                WindowVerdict::WrongRate => write!(
+                    com1,
+                    "CPU {id}'s tick gaps: {} under 95 % and {} over 150 % of {} ms in {}{what}",
+                    w.below,
+                    w.above,
+                    ms(&w, w.period),
+                    w.ticks
+                ),
+                _ => write!(
+                    com1,
+                    "CPU {id}'s 15th tick at {} ms, longest gap {} ms{}{}",
+                    ms(&w, w.at_rounds.saturating_sub(w.start)),
+                    ms(&w, w.longest),
+                    if v == WindowVerdict::Stalled {
+                        ": "
+                    } else {
+                        ""
+                    },
+                    what
+                ),
+            }
+        }
+        (_, None) => Ok(()),
+    };
+    let _ = writeln!(com1);
+}
+
 /// Proves preemptive multitasking on every online processor: two non-yielding workers per
 /// processor run while the boot flow (itself one of the boot processor's contexts) waits,
 /// until every processor has taken [`WINDOW_TICKS`] of its own timer ticks (500 ms on a real
 /// machine), within [`WINDOW_BUDGET_SECONDS`]. On each processor, both workers must have run
 /// there, with shares within a factor of two, over at least five full rounds of context
-/// switches. Then the rest of the thread proofs; each result goes into `proofs`, and
-/// `kernel_main` decides what they mean (ADR-0013). Fairness counts loop iterations, which a processor sharing a
-/// physical core skews with nothing wrong, so it is a separate result from preemption.
+/// switches; and its own ticks, on the TSC, must have a median gap within 95 % to 150 % of the
+/// period and its 15th within 500 ms, today's bound (TASKS item 66, the review's T66-R1). A
+/// run whose 15th tick came late with a gap of two periods or more is measured again, up to
+/// [`PREEMPTION_ATTEMPTS`] runs. Then the rest of the thread proofs; each result goes into
+/// `proofs`, and `kernel_main` decides what they mean (ADR-0013). Fairness counts loop
+/// iterations, which a processor sharing a physical core skews with nothing wrong, so it is a
+/// separate result from preemption.
 pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: &mut Tally) {
     // Give every online processor's boot/idle context an FPU area before the baseline is
     // measured, so the first switch on it can save its state and the leak check is fair.
@@ -1249,55 +1454,31 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         }
     }
     let workers = 2 * cpus.len();
-    // The window: until every processor has taken 50 of its own ticks, so each of its three
-    // contexts (the boot or idle flow and two workers) is preempted and resumed many times
-    // whatever the host did with its virtual processor (TASKS item 66).
-    let ticks_before: alloc::vec::Vec<u64> =
-        cpus.iter().map(|id| queue_ticks_of(id.get())).collect();
-    let short_of_ticks = || {
-        cpus.iter()
-            .zip(&ticks_before)
-            .position(|(id, &before)| queue_ticks_of(id.get()).wrapping_sub(before) < WINDOW_TICKS)
+    // Runs of the window, each against the same verdict: another only after a run whose
+    // processors' own ticks show a stall before today's bound (TASKS item 66, T66-R1).
+    let mut attempts = 0;
+    let (run, verdict) = loop {
+        attempts += 1;
+        if attempts > 1
+            && let Err(id) = respawn_workers(cpus)
+        {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: cannot spawn on CPU {id}: scheduler failed"
+            );
+            proofs.record(Proof::Preemption, false);
+            return;
+        }
+        let run = run_window(cpus, tsc_hz, workers as u64);
+        let verdict = judge_run(&run, cpus, tsc_hz);
+        say_window(com1, &run, verdict, attempts);
+        if verdict.0 != WindowVerdict::Stalled || attempts == PREEMPTION_ATTEMPTS {
+            break (run, verdict.0);
+        }
     };
-    let start = rdtsc();
-    let budget = tsc_hz.saturating_mul(WINDOW_BUDGET_SECONDS);
-    while short_of_ticks().is_some() && rdtsc().wrapping_sub(start) < budget {
-        // Interrupts on only while halted: the timer may switch to a worker here, and this
-        // flow resumes after `hlt` when its turn comes round again.
-        cpu::idle_disabling();
-    }
-    let elapsed_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
-    // The window's length, judged by nothing: the rounds below are the verdict. A processor
-    // still short of its ticks at the budget is named; its own line then shows its switches.
-    let short = short_of_ticks().and_then(|i| cpus.get(i));
-    drop(ticks_before);
-    let _ = match short {
-        None => writeln!(
-            com1,
-            "origin-kernel: scheduler: the preemption window lasted {elapsed_ms} ms, until every processor had taken {WINDOW_TICKS} of its own ticks"
-        ),
-        Some(id) => writeln!(
-            com1,
-            "origin-kernel: scheduler: the preemption window reached its {WINDOW_BUDGET_SECONDS} s budget with CPU {id} short of {WINDOW_TICKS} of its own ticks"
-        ),
-    };
-    let switches_at_stop: alloc::vec::Vec<u64> = cpus
-        .iter()
-        .map(|id| {
-            QUEUES
-                .get(id.get())
-                .map_or(0, |q| without_interrupts(|| q.lock().switches()))
-        })
-        .collect();
-    STOP.store(true, Ordering::Relaxed);
-    // Every worker now exits; the boot flow yields so the boot processor's workers run.
-    yield_until(
-        || EXITED.load(Ordering::Relaxed) == workers as u64,
-        tsc_hz,
-        OTHERS_PATIENCE,
-    );
-    let mut ok = EXITED.load(Ordering::Relaxed) == workers as u64;
-    if !ok {
+    let elapsed_ms = run.elapsed_ms;
+    let mut ok = run.exited && verdict == WindowVerdict::InBounds;
+    if !run.exited {
         let _ = writeln!(
             com1,
             "origin-kernel: workers did not exit: scheduler failed"
@@ -1305,7 +1486,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     }
     let mut fair_everywhere = true;
     for (i, &id) in cpus.iter().enumerate() {
-        let switches = switches_at_stop.get(i).copied().unwrap_or(0);
+        let switches = run.switches.get(i).copied().unwrap_or(0);
         let (a, b) = (2 * i, 2 * i + 1);
         let count = |w: usize| worker_entry(&PROGRESS, w).map_or(0, |p| p.load(Ordering::Relaxed));
         let place = |w: usize| worker_entry(&RAN_ON, w).map_or(0, |r| r.load(Ordering::Relaxed));
@@ -1314,7 +1495,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         let (lo, hi) = (count(a).min(count(b)), count(a).max(count(b)));
         let fair = lo > 0 && lo * 2 >= hi;
         // At least five full rounds of the three contexts.
-        let rounds = switches >= 15;
+        let rounds = switches >= PREEMPTION_ROUNDS;
         let passed = right_cpu && fair && rounds;
         ok &= right_cpu && lo > 0 && rounds;
         fair_everywhere &= fair;
@@ -1328,7 +1509,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     }
     // Given back now: the reaping proof below finds the heap where it was before the first
     // spawn.
-    drop(switches_at_stop);
+    drop(run);
     if ok && fair_everywhere {
         let _ = writeln!(
             com1,

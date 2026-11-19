@@ -154,6 +154,129 @@ pub const fn judge_timed_waits(
     }
 }
 
+/// The ticks the preemption proof's rounds clause (ADR-0013) needs within today's bound: 15
+/// rounds of a processor's contexts, the clause since before TASKS item 66.
+pub const PREEMPTION_ROUNDS: u64 = 15;
+
+/// What a processor's own periodic timer did while the preemption proof watched it (TASKS item
+/// 66, the review's T66-R1): every gap between ticks on the TSC, the first from the moment the
+/// watch was armed, summed up as counts so that the tick handler does a few additions. The
+/// proof's window is counted in these very ticks, so their rate is judged against the TSC here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TickWatch {
+    /// Whether ticks are being noted.
+    pub armed: bool,
+    /// The TSC when the watch was armed, and at the last tick noted.
+    pub start: u64,
+    pub last: u64,
+    /// The programmed period, in TSC ticks.
+    pub period: u64,
+    /// Ticks noted, and so gaps measured.
+    pub ticks: u64,
+    /// Gaps under 95 % of the period, and over 150 % of it.
+    pub below: u64,
+    pub above: u64,
+    /// The longest gap.
+    pub longest: u64,
+    /// The TSC at the [`PREEMPTION_ROUNDS`]th tick, 0 until then.
+    pub at_rounds: u64,
+}
+
+impl TickWatch {
+    /// A watch that notes nothing.
+    pub const fn new() -> Self {
+        Self {
+            armed: false,
+            start: 0,
+            last: 0,
+            period: 0,
+            ticks: 0,
+            below: 0,
+            above: 0,
+            longest: 0,
+            at_rounds: 0,
+        }
+    }
+
+    /// A watch armed at TSC `now` for a period of `period` TSC ticks.
+    pub const fn armed(now: u64, period: u64) -> Self {
+        Self {
+            armed: true,
+            start: now,
+            last: now,
+            period,
+            ..Self::new()
+        }
+    }
+
+    /// Notes a tick at TSC `now`, if armed.
+    pub fn note(&mut self, now: u64) {
+        if !self.armed {
+            return;
+        }
+        let gap = now.saturating_sub(self.last);
+        self.last = now;
+        self.ticks += 1;
+        if gap < self.period / 100 * 95 {
+            self.below += 1;
+        }
+        if gap > self.period / 2 * 3 {
+            self.above += 1;
+        }
+        self.longest = self.longest.max(gap);
+        if self.ticks == PREEMPTION_ROUNDS {
+            self.at_rounds = now;
+        }
+    }
+
+    /// Whether the median gap (the upper one of an even count, as `apic::judge_ticks` takes it)
+    /// is within 95 % to 150 % of the period, R5's bounds: it is if no more gaps than the median's
+    /// rank fall below, and fewer than the rest fall above. No ticks, no median.
+    pub const fn median_in_bounds(&self) -> bool {
+        let rank = self.ticks / 2;
+        self.ticks > 0 && self.below <= rank && self.above < self.ticks - rank
+    }
+}
+
+impl Default for TickWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What one processor's ticks say about a run of the preemption proof (TASKS item 66, T66-R1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowVerdict {
+    /// Its rate is right and its [`PREEMPTION_ROUNDS`]th tick came within today's bound.
+    InBounds,
+    /// Its rate is right, its rounds came after today's bound, and a gap of two periods or more
+    /// shows expiries merged while it was away: this run says nothing, and is measured again.
+    Stalled,
+    /// Its rounds came after today's bound with no such gap: too slow, and it fails.
+    Late,
+    /// Its median gap is outside 95 % to 150 % of the period: a wrong rate, and it fails at once.
+    WrongRate,
+    /// It did not take the window's ticks within the budget: its tick does not come.
+    Short,
+}
+
+/// Judges one processor's [`TickWatch`] over a run: it should have taken `wanted` ticks, its
+/// [`PREEMPTION_ROUNDS`]th within `bound` TSC ticks of the start (today's bound: 15 rounds in
+/// 500 ms), at a median gap within R5's bounds. Only [`WindowVerdict::InBounds`] passes.
+pub const fn judge_window(watch: &TickWatch, wanted: u64, bound: u64) -> WindowVerdict {
+    if watch.ticks < wanted || watch.ticks < PREEMPTION_ROUNDS {
+        WindowVerdict::Short
+    } else if !watch.median_in_bounds() {
+        WindowVerdict::WrongRate
+    } else if watch.at_rounds.saturating_sub(watch.start) <= bound {
+        WindowVerdict::InBounds
+    } else if watch.longest >= watch.period.saturating_mul(2) {
+        WindowVerdict::Stalled
+    } else {
+        WindowVerdict::Late
+    }
+}
+
 /// Why a request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueError {
@@ -195,6 +318,8 @@ pub struct RunQueue {
     current: usize,
     ticks: u64,
     switches: u64,
+    /// What this processor's own timer does while the preemption proof watches it.
+    watch: TickWatch,
 }
 
 impl Default for RunQueue {
@@ -220,7 +345,34 @@ impl RunQueue {
             current: 0,
             ticks: 0,
             switches: 0,
+            watch: TickWatch::new(),
         }
+    }
+
+    /// Starts watching this processor's ticks at TSC `now`, against a period of `period`
+    /// TSC ticks ([`TickWatch`]).
+    pub fn arm_watch(&mut self, now: u64, period: u64) {
+        self.watch = TickWatch::armed(now, period);
+    }
+
+    /// Whether the ticks are being watched: the tick handler then reads the TSC.
+    pub const fn watching(&self) -> bool {
+        self.watch.armed
+    }
+
+    /// Notes a tick taken at TSC `now`, if the ticks are being watched.
+    pub fn note_tick(&mut self, now: u64) {
+        self.watch.note(now);
+    }
+
+    /// What the watch has seen; it goes on until armed again or [`RunQueue::disarm_watch`].
+    pub const fn watch(&self) -> TickWatch {
+        self.watch
+    }
+
+    /// Stops watching the ticks, keeping what was seen.
+    pub fn disarm_watch(&mut self) {
+        self.watch.armed = false;
     }
 
     /// Adds a thread whose initial frame is saved at `context`; returns its slot.
@@ -509,6 +661,116 @@ impl RunQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A watch over ticks at the given gaps, from TSC 0, with a 10 ms period on a 1 GHz TSC.
+    fn watched(gaps: &[u64]) -> TickWatch {
+        let mut w = TickWatch::armed(0, 10_000_000);
+        let mut at = 0;
+        for &gap in gaps {
+            at += gap;
+            w.note(at);
+        }
+        w
+    }
+
+    const P: u64 = 10_000_000;
+    const HALF_SECOND: u64 = 500_000_000;
+
+    #[test]
+    fn a_window_at_the_programmed_rate_is_in_bounds() {
+        let w = watched(&[P; 50]);
+        assert_eq!((w.ticks, w.longest, w.at_rounds), (50, P, 15 * P));
+        assert!(w.median_in_bounds());
+        assert_eq!(judge_window(&w, 50, HALF_SECOND), WindowVerdict::InBounds);
+        // A watch that is not armed notes nothing.
+        let mut idle = TickWatch::new();
+        idle.note(5);
+        assert_eq!(idle.ticks, 0);
+    }
+
+    #[test]
+    fn a_slow_or_fast_tick_fails_on_its_median_whatever_the_window() {
+        // The review's T66-R1: a divisor eight times too large, 12.5 Hz.
+        let slow = watched(&[8 * P; 50]);
+        assert_eq!(
+            judge_window(&slow, 50, HALF_SECOND),
+            WindowVerdict::WrongRate
+        );
+        // 60 % slow, every gap: wrong, though its rounds might come in time on a short bound.
+        assert_eq!(
+            judge_window(&watched(&[P * 16 / 10; 50]), 50, 10 * HALF_SECOND),
+            WindowVerdict::WrongRate
+        );
+        // Fast: a quarter of the period.
+        assert_eq!(
+            judge_window(&watched(&[P / 4; 50]), 50, HALF_SECOND),
+            WindowVerdict::WrongRate
+        );
+        // The bounds' edges pass.
+        for gap in [P * 95 / 100, P * 3 / 2] {
+            assert!(watched(&[gap; 50]).median_in_bounds(), "{gap}");
+        }
+        assert!(!watched(&[P * 95 / 100 - 1; 50]).median_in_bounds());
+        assert!(!watched(&[P * 3 / 2 + 1; 50]).median_in_bounds());
+    }
+
+    #[test]
+    fn a_stall_before_the_rounds_earns_a_repeat_and_never_a_pass() {
+        // 400 ms away after the 5th tick: the 15th comes at 550 ms, past today's bound.
+        let mut gaps = [P; 50];
+        gaps[5] = 400_000_000;
+        let w = watched(&gaps);
+        assert_eq!(judge_window(&w, 50, HALF_SECOND), WindowVerdict::Stalled);
+        // The same stall after the 15th tick changes nothing: today's bound was met.
+        let mut later = [P; 50];
+        later[20] = 400_000_000;
+        assert_eq!(
+            judge_window(&watched(&later), 50, HALF_SECOND),
+            WindowVerdict::InBounds
+        );
+        // Late with no gap of two periods: no stall to blame, so it fails.
+        let mut slowish = [P * 14 / 10; 50];
+        slowish[0] = P;
+        let late = watched(&slowish);
+        assert!(late.median_in_bounds());
+        assert_eq!(judge_window(&late, 50, P * 15), WindowVerdict::Late);
+    }
+
+    #[test]
+    fn a_processor_short_of_its_ticks_fails() {
+        assert_eq!(
+            judge_window(&watched(&[P; 49]), 50, HALF_SECOND),
+            WindowVerdict::Short
+        );
+        assert_eq!(
+            judge_window(&watched(&[]), 50, HALF_SECOND),
+            WindowVerdict::Short
+        );
+        assert!(!watched(&[]).median_in_bounds());
+    }
+
+    #[test]
+    fn the_median_test_by_counts_is_the_sorted_median() {
+        // Every mix of in-bound, low and high gaps up to 12 gaps: the count test agrees with
+        // sorting and taking the upper median.
+        for low in 0..=12u64 {
+            for high in 0..=(12 - low) {
+                for mid in 0..=(12 - low - high) {
+                    let mut gaps = alloc::vec::Vec::new();
+                    gaps.extend(core::iter::repeat_n(P / 2, low as usize));
+                    gaps.extend(core::iter::repeat_n(P, mid as usize));
+                    gaps.extend(core::iter::repeat_n(3 * P, high as usize));
+                    let w = watched(&gaps);
+                    let mut sorted = gaps.clone();
+                    sorted.sort_unstable();
+                    let by_sort = sorted
+                        .get(sorted.len() / 2)
+                        .is_some_and(|&m| (P / 100 * 95..=P / 2 * 3).contains(&m));
+                    assert_eq!(w.median_in_bounds(), by_sort, "{low} {mid} {high}");
+                }
+            }
+        }
+    }
 
     /// A wait of `waited_ms` on a processor that took `ticks` ticks over it.
     const fn wait(waited_ms: u64, ticks: u64) -> TimedWait {
