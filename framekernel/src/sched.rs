@@ -708,20 +708,31 @@ fn worker_entry(table: &PerCpu<[AtomicU64; 2]>, slot: usize) -> Option<&AtomicU6
 }
 /// Tells the workers to stop counting.
 static STOP: AtomicBool = AtomicBool::new(false);
-/// Workers that have stopped and exited.
-static EXITED: AtomicU64 = AtomicU64::new(0);
+/// The preemption proof's run, from 1. Each worker carries its run in the upper half of its
+/// argument, so that a worker of an earlier run counts nothing for a later one (TASKS item 66,
+/// the addendum review's T66-R11).
+static RUN: AtomicU64 = AtomicU64::new(1);
+/// The run in the upper half, and in the lower half its workers that have stopped and exited.
+static EXITED: AtomicU64 = AtomicU64::new(1 << 32);
+
+/// A worker's argument: its run and its slot.
+const fn worker_arg(run: u64, slot: usize) -> u64 {
+    (run << 32) | slot as u64
+}
 
 /// A worker that never yields: until [`STOP`] it adds up the time it sees itself run, so it
 /// only ever gives up its processor when the timer preempts it.
-extern "sysv64" fn worker(slot: u64) -> ! {
-    let slot = slot as usize;
+extern "sysv64" fn worker(arg: u64) -> ! {
+    let (run, slot) = (arg >> 32, (arg & 0xFFFF_FFFF) as usize);
     let limit = RUNNING_STEP.load(Ordering::Relaxed);
     let mut last = rdtsc();
     while !STOP.load(Ordering::Relaxed) {
         let now = rdtsc();
         let step = now.wrapping_sub(last);
         last = now;
-        if let (Some(p), Some(r)) = (worker_entry(&PROGRESS, slot), worker_entry(&RAN_ON, slot)) {
+        if let (Some(p), Some(r)) = (worker_entry(&PROGRESS, slot), worker_entry(&RAN_ON, slot))
+            && RUN.load(Ordering::Relaxed) == run
+        {
             if step < limit {
                 p.fetch_add(step, Ordering::Relaxed);
             }
@@ -729,7 +740,10 @@ extern "sysv64" fn worker(slot: u64) -> ! {
         }
         core::hint::spin_loop();
     }
-    EXITED.fetch_add(1, Ordering::Relaxed);
+    // Counted only for its own run.
+    let _ = EXITED.try_update(Ordering::AcqRel, Ordering::Acquire, |exited| {
+        (exited >> 32 == run).then_some(exited + 1)
+    });
     exit()
 }
 
@@ -1219,7 +1233,7 @@ struct WindowRun {
 /// One run of the window: every processor's ticks watched from now, until each has taken
 /// [`WINDOW_TICKS`] or [`WINDOW_BUDGET_SECONDS`] pass; then the workers are told to stop and
 /// waited for.
-fn run_window(cpus: &[CpuIndex], tsc_hz: u64, workers: u64) -> WindowRun {
+fn run_window(cpus: &[CpuIndex], tsc_hz: u64, workers: u64, run: u64) -> WindowRun {
     let period = tsc_hz / timer::HZ;
     let start = rdtsc();
     let switches_before: alloc::vec::Vec<u64> = cpus
@@ -1273,7 +1287,7 @@ fn run_window(cpus: &[CpuIndex], tsc_hz: u64, workers: u64) -> WindowRun {
     // Every worker now exits; the boot flow yields so the boot processor's workers run.
     let exited = wait_for_others(
         "the preemption workers' exit",
-        || EXITED.load(Ordering::Relaxed) == workers,
+        || EXITED.load(Ordering::Acquire) == (run << 32) | workers,
         tsc_hz,
         2000,
     );
@@ -1285,11 +1299,12 @@ fn run_window(cpus: &[CpuIndex], tsc_hz: u64, workers: u64) -> WindowRun {
     }
 }
 
-/// Starts the next run's workers, two on every processor, with their counts from zero; the CPU
-/// that refused one, if any.
-fn respawn_workers(cpus: &[CpuIndex]) -> Result<(), CpuIndex> {
-    STOP.store(false, Ordering::Relaxed);
-    EXITED.store(0, Ordering::Relaxed);
+/// Starts run `run`'s workers, two on every processor, with their counts from zero; the CPU
+/// that refused one, if any. Only after every worker of the run before has exited (its
+/// [`WindowRun::exited`]), so that nothing of it is left to run (the addendum review's T66-R11).
+fn respawn_workers(cpus: &[CpuIndex], run: u64) -> Result<(), CpuIndex> {
+    RUN.store(run, Ordering::Relaxed);
+    EXITED.store(run << 32, Ordering::Release);
     for slot in 0..2 * cpus.len() {
         for table in [&PROGRESS, &RAN_ON] {
             if let Some(entry) = worker_entry(table, slot) {
@@ -1297,12 +1312,34 @@ fn respawn_workers(cpus: &[CpuIndex]) -> Result<(), CpuIndex> {
             }
         }
     }
+    STOP.store(false, Ordering::Release);
     for (i, &id) in cpus.iter().enumerate() {
         for k in 0..2 {
-            spawn(id, worker, (2 * i + k) as u64).map_err(|_| id)?;
+            spawn(id, worker, worker_arg(run, 2 * i + k)).map_err(|_| id)?;
         }
     }
     Ok(())
+}
+
+/// What processor `id`'s two workers, `2 * i` and `2 * i + 1`, did in the last run: their
+/// counts, and whether both last ran on `id`.
+fn workers_on(i: usize, id: CpuIndex) -> (u64, u64, bool) {
+    let (a, b) = (2 * i, 2 * i + 1);
+    let count = |w: usize| worker_entry(&PROGRESS, w).map_or(0, |p| p.load(Ordering::Relaxed));
+    let place = |w: usize| worker_entry(&RAN_ON, w).map_or(0, |r| r.load(Ordering::Relaxed));
+    let here = id.get() as u64 + 1;
+    (count(a), count(b), place(a) == here && place(b) == here)
+}
+
+/// The run's correctness clauses, judged on every run (the contract's invariant (3); the
+/// addendum review's T66-R11): every worker exited, and on every processor both workers ran,
+/// and ran there.
+fn run_correct(run: &WindowRun, cpus: &[CpuIndex]) -> bool {
+    run.exited
+        && cpus.iter().enumerate().all(|(i, &id)| {
+            let (a, b, right_cpu) = workers_on(i, id);
+            right_cpu && a.min(b) > 0
+        })
 }
 
 /// The run's verdict from its processors' ticks: the first that fails ([`WindowVerdict::Short`],
@@ -1347,6 +1384,7 @@ fn say_window(
     run: &WindowRun,
     verdict: (WindowVerdict, Option<(CpuIndex, TickWatch)>),
     attempt: u32,
+    correct: bool,
 ) {
     let ms = |w: &TickWatch, ticks: u64| ticks / (w.period.saturating_mul(timer::HZ) / 1000).max(1);
     let _ = write!(
@@ -1366,6 +1404,8 @@ fn say_window(
         ),
         (v, Some((id, w))) => {
             let what = match v {
+                // A run whose correctness clauses failed is never run again.
+                WindowVerdict::Stalled if !correct => "stalled, not run again: scheduler failed",
                 WindowVerdict::Stalled if attempt < PREEMPTION_ATTEMPTS => "stalled, run again",
                 WindowVerdict::Stalled => "stalled in every run: scheduler failed",
                 _ => ": scheduler failed",
@@ -1436,7 +1476,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     );
     for (i, &id) in cpus.iter().enumerate() {
         for k in 0..2 {
-            if spawn(id, worker, (2 * i + k) as u64).is_err() {
+            if spawn(id, worker, worker_arg(1, 2 * i + k)).is_err() {
                 let _ = writeln!(
                     com1,
                     "origin-kernel: cannot spawn on CPU {id}: scheduler failed"
@@ -1510,7 +1550,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     let (run, verdict) = loop {
         attempts += 1;
         if attempts > 1
-            && let Err(id) = respawn_workers(cpus)
+            && let Err(id) = respawn_workers(cpus, u64::from(attempts))
         {
             let _ = writeln!(
                 com1,
@@ -1519,10 +1559,14 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
             proofs.record(Proof::Preemption, false);
             return;
         }
-        let run = run_window(cpus, tsc_hz, workers as u64);
+        let run = run_window(cpus, tsc_hz, workers as u64, u64::from(attempts));
         let verdict = judge_run(&run, cpus, tsc_hz);
-        say_window(com1, &run, verdict, attempts);
-        if verdict.0 != WindowVerdict::Stalled || attempts == PREEMPTION_ATTEMPTS {
+        // Every run is judged on correctness first: a failure there fails at once and is
+        // never repeated, and a repeat starts only once every worker of this run has exited
+        // (the addendum review's T66-R11).
+        let correct = run_correct(&run, cpus);
+        say_window(com1, &run, verdict, attempts, correct);
+        if !correct || verdict.0 != WindowVerdict::Stalled || attempts == PREEMPTION_ATTEMPTS {
             break (run, verdict.0);
         }
     };
@@ -1538,11 +1582,10 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     for (i, &id) in cpus.iter().enumerate() {
         let switches = run.switches.get(i).copied().unwrap_or(0);
         let (a, b) = (2 * i, 2 * i + 1);
-        let count = |w: usize| worker_entry(&PROGRESS, w).map_or(0, |p| p.load(Ordering::Relaxed));
-        let place = |w: usize| worker_entry(&RAN_ON, w).map_or(0, |r| r.load(Ordering::Relaxed));
-        let right_cpu = place(a) == id.get() as u64 + 1 && place(b) == id.get() as u64 + 1;
+        let (count_a, count_b, right_cpu) = workers_on(i, id);
+        let count = |w: usize| if w == a { count_a } else { count_b };
         // Both workers ran, with comparable shares (within a factor of two).
-        let (lo, hi) = (count(a).min(count(b)), count(a).max(count(b)));
+        let (lo, hi) = (count_a.min(count_b), count_a.max(count_b));
         let fair = lo > 0 && lo * 2 >= hi;
         // At least five full rounds of the three contexts.
         let rounds = switches >= PREEMPTION_ROUNDS;
