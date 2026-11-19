@@ -22,7 +22,9 @@
 //!
 //! **Each value is checked as it is read** (the rulings on the contract's questions 1 and 2): an
 //! empty value is an unset one, for every variable; a value a variable does not take is refused,
-//! with the variable named and the values it takes, before anything is built or booted.
+//! with the variable named and the values it takes, before anything is built or booted. And
+//! `boot-matrix` and its scenario commands, which set each machine themselves, refuse a person's
+//! topology, bridge, reserved-memory and ACPI machine ([`Settings::refuse_machine`], ruling R5).
 
 use std::collections::BTreeMap;
 use std::env;
@@ -52,7 +54,7 @@ const BRIDGE: &str = "ORIGIN_QEMU_BRIDGE";
 const RESERVED: &str = "ORIGIN_QEMU_RESERVED";
 /// `on` or `off`: the ACPI machine's NFIT, HMAT and generic initiator.
 const ACPI: &str = "ORIGIN_QEMU_ACPI";
-/// Set to anything: QEMU logs interrupts and resets.
+/// On if set and not empty: QEMU logs interrupts and resets.
 const DEBUG: &str = "ORIGIN_QEMU_DEBUG";
 /// A boot's timeout in whole seconds.
 const TIMEOUT: &str = "ORIGIN_BOOT_TEST_TIMEOUT";
@@ -238,6 +240,36 @@ impl Settings {
         !self.github_actions || self.any_count
     }
 
+    /// Refuses the person's machine for `command`, one of `boot-matrix` and its scenario
+    /// commands, which set each machine themselves (the coordinating session's ruling R5 of
+    /// 2026-11-19). With the children of before TASKS item 61, `ORIGIN_QEMU_TOPOLOGY=sparse
+    /// cargo xtask boot-matrix` booted the 67-processor machine under every "N processor(s)"
+    /// label and passed. A named topology and the bridge, reserved-memory and ACPI machines are
+    /// refused here; `boot-test`, `boot-console` and `run` take them. Every other setting
+    /// carries over to each machine, as it did to each child.
+    pub(crate) fn refuse_machine(&self, command: &str) -> Result {
+        let mut set = Vec::new();
+        if let Some(name) = self.topology.name() {
+            set.push(format!("{TOPOLOGY}={name}"));
+        }
+        for (on, name) in [
+            (self.bridge, BRIDGE),
+            (self.reserved, RESERVED),
+            (self.acpi, ACPI),
+        ] {
+            if on {
+                set.push(format!("{name}=on"));
+            }
+        }
+        if set.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{command} sets each machine's topology, bridge, reserved memory and ACPI tables itself, so {} is refused here; boot-test, boot-console and run take it",
+            set.join(" and ")
+        ))
+    }
+
     /// A boot's timeout: the one set, or [`DEFAULT_BOOT_TEST_TIMEOUT`].
     pub(crate) fn boot_timeout(&self) -> Duration {
         self.timeout.unwrap_or(DEFAULT_BOOT_TEST_TIMEOUT)
@@ -267,6 +299,25 @@ impl Settings {
             .split(',')
             .any(|option| option == minus || option == off)
     }
+}
+
+impl Topology {
+    /// The name [`TOPOLOGY`] gives a named machine; `None` for the plain one.
+    fn name(self) -> Option<&'static str> {
+        match self {
+            Topology::Plain(_) => None,
+            Topology::X2apic => Some("x2apic"),
+            Topology::Sparse => Some("sparse"),
+            Topology::Many => Some("many"),
+            Topology::Listed => Some("listed"),
+        }
+    }
+}
+
+/// Why a scenario filter (`ORIGIN_BOOT_TEST_ONLY`) that matches none of `scenarios` scenarios is
+/// refused: a mistyped name must not report a passing run with nothing booted.
+pub(crate) fn no_scenario_matches(only: &str, scenarios: usize) -> String {
+    format!("{ONLY}={only:?} matches none of the {scenarios} scenarios")
 }
 
 /// The accelerator a set value of [`ACCEL`] names.

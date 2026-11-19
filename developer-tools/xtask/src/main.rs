@@ -196,7 +196,9 @@ environment:
   command (boot-test, boot-console, run, boot-matrix or one of its scenario commands) starts.
   An empty value is an unset one, and a value a variable does not take is refused. boot-matrix
   and its scenario commands set each machine's own over them in this process, and give none of
-  them to another (TASKS item 61).
+  them to another (TASKS item 61); they set each machine's topology, bridge, reserved memory
+  and ACPI tables themselves, so ORIGIN_QEMU_TOPOLOGY, _BRIDGE, _RESERVED and _ACPI are refused
+  there (boot-test, boot-console and run take them).
   ORIGIN_OVMF_CODE, ORIGIN_OVMF_VARS  firmware code image and NVRAM template, both or neither
                                       (default: the EDK2 files installed next to QEMU)
   ORIGIN_BOOT_MATRIX_ANY_COUNT        on or off: in CI (GITHUB_ACTIONS=true), whether
@@ -239,8 +241,8 @@ environment:
   ORIGIN_QEMU_ACCEL                   tcg (default) or kvm: run on a real x86-64 processor (needs
                                       an x86-64 host with /dev/kvm); the devices and firmware
                                       stay QEMU's
-  ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
-                                      target/xtask/qemu-debug.log
+  ORIGIN_QEMU_DEBUG                   on if set and not empty: QEMU logs interrupts and resets
+                                      to target/xtask/qemu-debug.log
   RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS, CARGO_TARGET_<TRIPLE>_RUSTFLAGS for the kernel's, the
   loader's and the ring-3 programs' triples; RUSTC, RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER
   and their CARGO_BUILD_ forms; CARGO_TARGET_<TRIPLE>_LINKER for the kernel's and the
@@ -3648,11 +3650,32 @@ fn in_turn(command: &str, run: impl FnOnce() -> Result) -> Result {
 
 /// [`in_turn`] for a command that boots: the person's settings are read from the environment
 /// once, here, and refused before the turn is taken if a value is not one they take; `run` gets
-/// them as a typed value (TASKS item 61).
+/// them as a typed value (TASKS item 61). For a command that sets each machine itself
+/// ([`SETS_ITS_MACHINES`]), a person's topology, bridge, reserved-memory or ACPI machine is
+/// refused too ([`Settings::refuse_machine`]).
 fn in_turn_with_settings(command: &str, run: impl FnOnce(&Settings) -> Result) -> Result {
     let settings = Settings::from_env()?;
+    if SETS_ITS_MACHINES.contains(&command) {
+        settings.refuse_machine(command)?;
+    }
     in_turn(command, || run(&settings))
 }
+
+/// `boot-matrix` and its ten scenario commands: each sets every machine's topology, bridge,
+/// reserved memory and ACPI tables itself (the coordinating session's ruling R5 of 2026-11-19).
+const SETS_ITS_MACHINES: [&str; 11] = [
+    "boot-matrix",
+    "boot-x2apic",
+    "boot-bridge",
+    "boot-reserved",
+    "boot-legacy-free",
+    "boot-acpi",
+    "boot-random",
+    "boot-identity",
+    "boot-sparse",
+    "boot-many",
+    "boot-listed",
+];
 
 /// One machine `boot-matrix` or one of its scenario commands boots `boot-test` on: the line said
 /// before it, the machine's settings, and the words its failure begins with. Each command's
@@ -6297,10 +6320,7 @@ fn select_scenarios<'a>(
         .filter(|(s, _)| only.is_empty() || only.split(',').any(|p| s.label.contains(p)))
         .collect();
     if chosen.is_empty() {
-        return Err(format!(
-            "the scenario filter {only:?} (ORIGIN_BOOT_TEST_ONLY) matches none of the {} scenarios",
-            scenarios.len()
-        ));
+        return Err(settings::no_scenario_matches(only, scenarios.len()));
     }
     Ok(chosen)
 }

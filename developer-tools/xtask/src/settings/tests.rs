@@ -25,9 +25,18 @@ fn an_empty_environment_gives_the_defaults() {
     assert_eq!(settings.machine_options("q35"), "q35");
     assert_eq!(settings.ovmf, None);
     assert!(settings.runs_any_count_machines());
-    // Empty is unset, for every variable (the ruling on question 2).
+    // Empty is unset, for every variable (the ruling on question 2): an empty timeout is the
+    // default, where it was refused before TASKS item 61, and an empty debug log is off, where it
+    // was on.
     let empty: Vec<(&str, &str)> = VARIABLES.iter().map(|&v| (v, "")).collect();
     assert_eq!(read(&empty).unwrap(), Settings::default());
+    let timeout = read(&[(TIMEOUT, "")]).unwrap();
+    assert_eq!(
+        (timeout.timeout, timeout.boot_timeout()),
+        (None, Duration::from_secs(120))
+    );
+    assert!(!read(&[(DEBUG, "")]).unwrap().debug);
+    assert!(read(&[(DEBUG, "1")]).unwrap().debug);
 }
 
 #[test]
@@ -391,29 +400,84 @@ fn every_machine_has_the_settings_its_child_s_environment_gave() {
     }
 }
 
-/// The ruling on question 1: a processor count and a named machine are one field, so a machine
-/// that sets its count is the plain machine of that count, whatever topology the person named.
-/// Before TASKS item 61, `boot-matrix`'s child read `ORIGIN_QEMU_SMP` only with no topology
-/// set, so with a person's `ORIGIN_QEMU_TOPOLOGY` it booted the named machine for each count
-/// and `boot-acpi`'s two processors. Now each boots the plain machine its count names (that
-/// difference, and no other, the dry comparison shows for such a person).
+/// The ruling R5: `boot-matrix` and its ten scenario commands set each machine's topology,
+/// bridge, reserved memory and ACPI tables themselves, so a person's are refused at their entry,
+/// named; `boot-test`, `boot-console` and `run` take them. Every other setting carries over.
 #[test]
-fn a_machine_that_sets_its_count_is_the_plain_one() {
-    let base = read(&[(TOPOLOGY, "x2apic")]).unwrap();
-    let counts: Vec<Topology> = crate::matrix_runs(&base, &[1, 4, 65])
-        .iter()
-        .map(|r| r.settings.topology)
-        .collect();
-    assert_eq!(counts, [1, 4, 65, 1, 4, 65].map(Topology::Plain).to_vec());
+fn the_commands_that_set_their_machines_refuse_the_person_s() {
     assert_eq!(
-        crate::acpi_runs(&base)[0].settings.topology,
-        Topology::Plain(2)
+        crate::SETS_ITS_MACHINES,
+        [
+            "boot-matrix",
+            "boot-x2apic",
+            "boot-bridge",
+            "boot-reserved",
+            "boot-legacy-free",
+            "boot-acpi",
+            "boot-random",
+            "boot-identity",
+            "boot-sparse",
+            "boot-many",
+            "boot-listed",
+        ]
     );
-    // The machines that name their own topology keep it; the rest keep the person's.
-    assert!(crate::sparse_runs(&base)[0].settings.topology == Topology::Sparse);
-    for run in crate::bridge_runs(&base) {
-        assert_eq!(run.settings.topology, Topology::X2apic);
+    for command in ["boot-test", "boot-console", "run"] {
+        assert!(!crate::SETS_ITS_MACHINES.contains(&command), "{command}");
     }
+    for (vars, says) in [
+        (
+            &[(TOPOLOGY, "sparse")][..],
+            "ORIGIN_QEMU_TOPOLOGY=sparse is refused here",
+        ),
+        (
+            &[(TOPOLOGY, "x2apic")],
+            "ORIGIN_QEMU_TOPOLOGY=x2apic is refused here",
+        ),
+        (&[(TOPOLOGY, "many")], "ORIGIN_QEMU_TOPOLOGY=many"),
+        (&[(TOPOLOGY, "listed")], "ORIGIN_QEMU_TOPOLOGY=listed"),
+        (&[(BRIDGE, "on")], "ORIGIN_QEMU_BRIDGE=on is refused here"),
+        (
+            &[(RESERVED, "on")],
+            "ORIGIN_QEMU_RESERVED=on is refused here",
+        ),
+        (&[(ACPI, "on")], "ORIGIN_QEMU_ACPI=on is refused here"),
+        (
+            &[(TOPOLOGY, "sparse"), (BRIDGE, "on")],
+            "ORIGIN_QEMU_TOPOLOGY=sparse and ORIGIN_QEMU_BRIDGE=on is refused here",
+        ),
+    ] {
+        let e = read(vars)
+            .unwrap()
+            .refuse_machine("boot-matrix")
+            .unwrap_err();
+        assert!(e.starts_with("boot-matrix sets each machine's"), "{e}");
+        assert!(e.contains(says), "{vars:?}: {e}");
+        assert!(e.contains("boot-test, boot-console and run take it"), "{e}");
+    }
+    // What carries over to each machine is not refused, nor a switch set off.
+    for vars in [
+        &[][..],
+        &[(SMP, "3"), (CPU, "max,-avx2"), (MACHINE, "hpet=off")],
+        &[(NVME_PAIRS, "2"), (IOMMU, "amd"), (ACCEL, "kvm")],
+        &[(TIMEOUT, "600"), (ONLY, "kernel boot"), (DEBUG, "1")],
+        &[
+            (BRIDGE, "off"),
+            (RESERVED, "off"),
+            (ACPI, "off"),
+            (TOPOLOGY, ""),
+        ],
+    ] {
+        assert_eq!(read(vars).unwrap().refuse_machine("boot-x2apic"), Ok(()));
+    }
+}
+
+/// The scenario filter's refusal names its variable, from this module.
+#[test]
+fn a_filter_that_matches_nothing_is_named() {
+    assert_eq!(
+        no_scenario_matches("nope", 11),
+        "ORIGIN_BOOT_TEST_ONLY=\"nope\" matches none of the 11 scenarios"
+    );
 }
 
 /// The prefixes the tripwire refuses outside this module.
@@ -480,6 +544,10 @@ fn only_this_module_names_the_variables() {
     assert!(read > 20);
     // The planted controls: each is caught.
     for (planted, caught) in [
+        (
+            "fn x() -> Option<String> { env::var(\"ORIGIN_QEMU_SMP\").ok() }",
+            "ORIGIN_QEMU_SMP",
+        ),
         (
             "fn x(c: &mut Command) { c.env(\"ORIGIN_QEMU_SMP\", \"65\"); }",
             "ORIGIN_QEMU_SMP",
