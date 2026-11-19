@@ -620,13 +620,15 @@ impl<H: Host> Interpreter<H> {
         self.load_result(l.op, target, false)
     }
 
-    /// Marks table `index` failed and gives its bytes back, as a failed top-level load does.
-    fn fail_table(&mut self, index: u32) {
+    /// Marks table `index` failed and gives its bytes back; the names it put in packages are
+    /// never bound (B5-R3).
+    pub(crate) fn fail_table(&mut self, index: u32) {
         if let Some(t) = self.tables.get_mut(us(index)) {
             t.failed = true;
             let aml = core::mem::take(&mut t.aml);
             mem::release(aml, &mut self.budget);
         }
+        self.never_bind_table(index);
     }
 
     /// Fails every table a [`Loading`] frame above `frames` was loading, when an evaluation is

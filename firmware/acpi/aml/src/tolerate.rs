@@ -217,6 +217,8 @@ impl<H: Host> Interpreter<H> {
         self.cur = stmt;
         let resumed = self.skip_statement(stmt.pc, end)?;
         self.cur.pc = resumed;
+        // What the statement put in packages is never bound: nothing can read it (B5-R3).
+        self.never_bind(stmt.table, stmt.pc, resumed);
         if let Some(t) = self.tables.get_mut(us(stmt.table)) {
             t.abandoned = t.abandoned.saturating_add(1);
         }
@@ -471,6 +473,50 @@ impl<H: Host> Interpreter<H> {
         }
         self.deferred.truncate(from);
         Ok(empty)
+    }
+
+    /// Marks never to bind the names in packages that bytes `from..to` of table `table` made and
+    /// that nothing can read: an abandoned statement's, or an element dropped past its package's
+    /// count (the review of B5, B5-R3). They are the list's last. Each is read, if ever, as a
+    /// method's is: looked up when read, never reported. A unit of work each.
+    pub(crate) fn never_bind(&mut self, table: u32, from: u32, to: u32) {
+        #[cfg(test)]
+        if crate::tests::planted(crate::tests::Fault::BindDropped) {
+            return;
+        }
+        let mut k = self.deferred.len();
+        while let Some(&r) = k.checked_sub(1).and_then(|j| self.deferred.get(j)) {
+            if !self
+                .elem(r)
+                .is_some_and(|e| e.table == table && (from..to).contains(&e.at))
+            {
+                break;
+            }
+            self.set_bind(r, Bind::Lazy);
+            k = k.saturating_sub(1);
+        }
+        self.note_work(u64::try_from(self.deferred.len().saturating_sub(k)).unwrap_or(u64::MAX));
+        self.deferred.truncate(k);
+    }
+
+    /// Marks never to bind every name failed table `table` put in a package, wherever it is in
+    /// the list: a failed table's names are gone (B5-R3). A unit of work an entry.
+    pub(crate) fn never_bind_table(&mut self, table: u32) {
+        self.note_work(u64::try_from(self.deferred.len()).unwrap_or(u64::MAX));
+        let mut kept = 0usize;
+        let mut k = 0usize;
+        while let Some(&r) = self.deferred.get(k) {
+            k = k.saturating_add(1);
+            if self.elem(r).is_some_and(|e| e.table == table) {
+                self.set_bind(r, Bind::Lazy);
+                continue;
+            }
+            if let Some(slot) = self.deferred.get_mut(kept) {
+                *slot = r;
+            }
+            kept = kept.saturating_add(1);
+        }
+        self.deferred.truncate(kept);
     }
 
     /// Binds the names load-time code put in packages, once every boot table has loaded (G1, as

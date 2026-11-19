@@ -797,6 +797,67 @@ fn a_limit_in_a_runtime_loads_pass_fails_the_table() {
 }
 
 #[test]
+fn names_nothing_can_read_are_never_bound_whether_or_not_the_collector_ran() {
+    // The review of B5, B5-R3: an element dropped past its package's count (a name, and a nested
+    // package's), and the package of a duplicate `Name` abandoned, are marked never to bind when
+    // they are dropped. A temporary package of a statement that completes, one `Index` reads
+    // through `DerefOf` here, keeps its names until the pass, so its unbound name is reported
+    // however the collector ran. The same reports with the collector run before the pass and
+    // without it.
+    let body = [
+        name("A", one()),
+        name("PK1", package(1, &[nm("\\A"), nm("\\NON1")])),
+        name("PK2", package(1, &[one()])),
+        name("PK2", package(1, &[nm("\\NON2")])),
+        name("PK3", package(1, &[one(), package(1, &[nm("\\NON4")])])),
+        name("X", zero()),
+        store(
+            deref_of(index(package(2, &[nm("\\NON3"), one()]), one(), zero())),
+            nm("X"),
+        ),
+    ];
+    // `Store`, `DerefOf`, `Index`, `Package`, its length and its count, a byte each: the element
+    // at 6.
+    let non3 = at(&body, 6) + 6;
+    let run = |collect: bool| {
+        let mut i = fresh();
+        assert_eq!(load(&mut i, &body), Ok(0));
+        let loaded = told(&mut i);
+        if collect {
+            i.settle_memory();
+        }
+        let empty = i.bind_deferred();
+        let bound = told(&mut i);
+        for p in ["PK1", "PK2", "PK3"] {
+            assert_eq!(
+                eval(&mut i, p),
+                Ok(Some(Value::Package(vec![Value::Integer(1)]))),
+                "{p}"
+            );
+        }
+        (loaded, empty, bound)
+    };
+    let without = run(false);
+    assert!(
+        matches!(
+            without.0.as_slice(),
+            [
+                Told::Extra { count: 1, found: 2 },
+                Told::Abandoned {
+                    kind: ErrorKind::Duplicate,
+                    ..
+                },
+                Told::Extra { count: 1, found: 2 },
+            ]
+        ),
+        "{:?}",
+        without.0
+    );
+    assert_eq!((without.1, &without.2), (Ok(1), &vec![Told::Unbound(non3)]));
+    assert_eq!(run(true), without);
+}
+
+#[test]
 fn method_packages_resolve_when_read() {
     let mut i = fresh();
     load(
@@ -817,7 +878,7 @@ fn method_packages_resolve_when_read() {
 
 #[test]
 fn planted_faults_are_caught_by_the_tolerance_tests() {
-    let tests: [Control; 6] = [
+    let tests: [Control; 7] = [
         (
             Some(Fault::AllowDuplicate),
             &[duplicate_keeps_the_first_object],
@@ -844,6 +905,7 @@ fn planted_faults_are_caught_by_the_tolerance_tests() {
                 runtime_load_binds_its_own,
                 a_runtime_loads_pass_binds_only_its_own,
                 a_limit_in_a_runtime_loads_pass_fails_the_table,
+                names_nothing_can_read_are_never_bound_whether_or_not_the_collector_ran,
                 a_place_naming_a_method_is_skipped_as_a_name,
                 a_place_naming_a_method_before_a_device_keeps_the_device,
                 a_place_naming_a_method_in_a_body_does_not_run_past_it,
@@ -868,6 +930,10 @@ fn planted_faults_are_caught_by_the_tolerance_tests() {
             ],
         ),
         (Some(Fault::LoadTwice), &[already_loaded_is_refused]),
+        (
+            Some(Fault::BindDropped),
+            &[names_nothing_can_read_are_never_bound_whether_or_not_the_collector_ran],
+        ),
         (
             Some(Fault::SkipCallsInPlaces),
             &[

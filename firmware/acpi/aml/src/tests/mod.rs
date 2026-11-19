@@ -444,6 +444,9 @@ pub(crate) enum Fault {
     LoadTwice,
     /// The names load-time code put in packages are never bound (`tolerate.rs`, `bind_names`).
     NoBind,
+    /// What nothing can read is bound as any name is, as before the review of B5, B5-R3
+    /// (`tolerate.rs`, `never_bind`).
+    BindDropped,
     /// A string byte above 0x7F fails the table, as before step B5 (`engine.rs`,
     /// `decode_string`).
     RefuseHighBytes,

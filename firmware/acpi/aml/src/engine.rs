@@ -379,11 +379,7 @@ impl<H: Host> Interpreter<H> {
                 // The table's identity stays; its bytes go (the review of B1, F7). Its methods
                 // already fail `TableFailed`, and a name kept in a package pointing into it now
                 // fails `Truncated`.
-                if let Some(t) = self.tables.get_mut(us(index)) {
-                    t.failed = true;
-                    let aml = core::mem::take(&mut t.aml);
-                    mem::release(aml, &mut self.budget);
-                }
+                self.fail_table(index);
                 self.abort(marks, &e);
                 self.end_evaluation();
                 self.trace(&Trace::Loaded(Err(e)));
@@ -1428,7 +1424,7 @@ impl<H: Host> Interpreter<H> {
             return err(ErrorKind::Grammar);
         };
         let i = usize::try_from(index).map_err(|_| ErrorKind::Range)?;
-        match self.heap.get_mut(pkg)? {
+        let dropped = match self.heap.get_mut(pkg)? {
             Object::Package(elems) => {
                 // More elements than the count (a compile-time error by §19.6.102): the extra
                 // ones are decoded, then dropped, and reported when the package ends (G14, TASKS
@@ -1439,11 +1435,19 @@ impl<H: Host> Interpreter<H> {
                 {
                     return err(ErrorKind::Range);
                 }
-                if let Some(slot) = elems.get_mut(i) {
-                    *slot = v;
+                match elems.get_mut(i) {
+                    Some(slot) => {
+                        *slot = v;
+                        false
+                    }
+                    None => true,
                 }
             }
             _ => return err(ErrorKind::Grammar),
+        };
+        // A dropped element's names are never bound: nothing can read them (B5-R3).
+        if dropped {
+            self.never_bind(self.cur.table, carrier.at, self.cur.pc);
         }
         if let Some(Frame::Op(top)) = self.frames.last_mut() {
             top.aux = top.aux.saturating_add(1);
