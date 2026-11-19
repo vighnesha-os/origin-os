@@ -265,6 +265,9 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 |---|---|
 | A19-A2, A19-A3, A19-A5 | The firmware's AML in a user-mode service; the interpreter as a library first, with a read-only boot proof on QEMU's tables; an original AML encoder for its tests (ADR-0019) |
 | A19-Am1 | The interpreter's answers to `_OSI` and `_REV` (ADR-0019 Amendment 1, item 309) |
+| A19-Am2 | The interpreter's answer to `_OS` (ADR-0019 Amendment 2, item 315) |
+
+A19-Am2 was placed here on 2026-11-19 by the coordinating session under item 264's rule, beside A19-Am1, which it completes; it is in no exit test and changes none.
 
 ## M6. Native runtime
 
