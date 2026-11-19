@@ -195,11 +195,18 @@ pub(crate) fn zombies() -> u64 {
 /// the shootdown that must come first waits for every processor (ADR-0004 Amendment 1, A2).
 pub(crate) fn reap() -> usize {
     let freed = reap_zombies();
+    reclaim_stacks();
+    freed
+}
+
+/// Reclaims every retired kernel stack (`stack::reclaim`), and says where any was lost to a
+/// stalled shootdown ([`report_lost_stacks`]): every reclaim the scheduler makes goes through
+/// here, `settle`'s own among them.
+fn reclaim_stacks() {
     let reclaimed = origin_frame::stack::reclaim();
     if reclaimed.lost > 0 {
         report_lost_stacks(reclaimed.lost);
     }
-    freed
 }
 
 /// Says where kernel stacks were lost to a stalled shootdown, as it happens: which processor
@@ -207,22 +214,59 @@ pub(crate) fn reap() -> usize {
 /// boot has had (TASKS item 66). A report, judged by nothing: the proofs that count the stacks
 /// judge the loss. It names processors and times only, never an address.
 fn report_lost_stacks(lost: u32) {
-    let mut out = crate::console::Console::new();
+    let mut out = here_console();
     let millis = |ticks: u64| ticks / (crate::time::tsc_hz() / 1000).max(1);
+    // Under the console's 160-byte line (the review's T66-R7). The stall named is the boot's
+    // last: another processor's stall can come between the loss and this line.
     let _ = match origin_frame::tlb::last_stall() {
         Some(stall) => writeln!(
             out,
-            "origin-kernel: stalled shootdown: CPU {} asked, and CPU {} did not answer within {} ms (stall {} of this boot); {lost} kernel stacks withheld for good, with their frames",
+            "origin-kernel: stalled shootdown: CPU {} waited {} ms for CPU {} (stall {} of this boot); {lost} kernel stacks withheld, with their frames",
             stall.asker,
-            stall.target,
             millis(stall.waited),
+            stall.target,
             stall.count
         ),
         None => writeln!(
             out,
-            "origin-kernel: stalled shootdown: {lost} kernel stacks withheld for good, with their frames"
+            "origin-kernel: stalled shootdown: {lost} kernel stacks withheld, with their frames"
         ),
     };
+}
+
+/// A console for a line printed where the caller may be: the boot flow, which runs with
+/// interrupts off and may wait for the UART, gets its own kind, so that the line is not dropped
+/// (the review's T66-R7); anywhere else, the ordinary one.
+fn here_console() -> Console {
+    if !cpu::interrupts_enabled() && current_thread().is_none() && cpu::this_cpu().get() == 0 {
+        Console::boot_flow()
+    } else {
+        Console::new()
+    }
+}
+
+/// Waits, as [`yield_until`], up to [`OTHERS_PATIENCE`] seconds for what only a thread on another
+/// processor can do, and returns whether `done()` holds. A wait longer than `before_ms`, the
+/// bound it had before TASKS item 66, is said on a line of its own naming `what`, so that a
+/// reader of a machine without a hypervisor sees every extension (the review's T66-R3).
+pub(crate) fn wait_for_others(
+    what: &str,
+    done: impl Fn() -> bool,
+    tsc_hz: u64,
+    before_ms: u64,
+) -> bool {
+    let start = rdtsc();
+    yield_until(&done, tsc_hz, OTHERS_PATIENCE);
+    let waited_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
+    let held = done();
+    if waited_ms > before_ms {
+        let _ = writeln!(
+            here_console(),
+            "origin-kernel: waited {waited_ms} ms for {what}, past the former {before_ms} ms{}",
+            if held { "" } else { ", in vain" }
+        );
+    }
+    held
 }
 
 pub(crate) use crate::settled::{Unsettled, not_settled};
@@ -240,13 +284,14 @@ pub(crate) use crate::settled::{Unsettled, not_settled};
 pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
     let lost_before = origin_frame::stack::counts().lost;
     reap();
-    yield_until(|| zombies() == 0, tsc_hz, OTHERS_PATIENCE);
+    wait_for_others("exited threads' reaping", || zombies() == 0, tsc_hz, 2000);
     origin_frame::stack::trim();
-    origin_frame::stack::reclaim();
-    yield_until(
+    reclaim_stacks();
+    wait_for_others(
+        "retired stacks' reclaim",
         || origin_frame::stack::counts().retired == 0,
         tsc_hz,
-        OTHERS_PATIENCE,
+        2000,
     );
     let counts = origin_frame::stack::counts();
     crate::settled::judge(zombies(), counts.retired, lost_before, counts.lost)

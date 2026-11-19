@@ -640,6 +640,13 @@ fn take_turns(me: u64, min_handoffs: u64, reading: Reading) {
         for _ in 0..32 {
             core::hint::spin_loop();
         }
+        // The boot flow runs this with interrupts off, now for up to
+        // [`HANDOFF_BUDGET_SECONDS`]: past the shootdown's 1 s patience, so it opens a window
+        // between its turns, where a shootdown or a tick is taken (the review's T66-R9). The
+        // turn-takers run with interrupts on and need none.
+        if !cpu::interrupts_enabled() {
+            cpu::interrupt_window();
+        }
     }
 }
 
@@ -702,10 +709,11 @@ fn run_turns(
         }
         aps += 1;
     }
-    crate::sched::yield_until(
+    let _ = crate::sched::wait_for_others(
+        "the clock's turn-takers to start",
         || READY.load(Ordering::Acquire) == aps,
         tsc_hz,
-        crate::sched::OTHERS_PATIENCE,
+        2000,
     );
     if READY.load(Ordering::Acquire) != aps {
         UNTIL.store(1, Ordering::Release);
@@ -726,10 +734,19 @@ fn run_turns(
         if cpus.len() < 2 { 0 } else { wanted },
         reading,
     );
-    crate::sched::yield_until(
+    let ran_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
+    if ran_ms > 500 {
+        // Past the 500 ms a run had before TASKS item 66 (the review's T66-R3).
+        let _ = writeln!(
+            com1,
+            "origin-kernel: clock: a run of turns went on {ran_ms} ms for its {wanted} handoffs, past the former 500 ms"
+        );
+    }
+    let _ = crate::sched::wait_for_others(
+        "the clock's turn-takers to finish",
         || DONE.load(Ordering::Acquire) == aps,
         tsc_hz,
-        crate::sched::OTHERS_PATIENCE,
+        2000,
     );
     Some(Turns {
         readings: READINGS.load(Ordering::Relaxed),
@@ -827,10 +844,11 @@ fn report_read_cost(com1: &mut Console, cpus: &[cpu::CpuIndex], bsp: cpu::CpuInd
         started &= crate::sched::spawn(id, cost_reader, 0).is_ok();
         aps += 1;
     }
-    crate::sched::yield_until(
+    let _ = crate::sched::wait_for_others(
+        "the clock cost's readers to start",
         || READY.load(Ordering::Acquire) == aps,
         tsc_hz,
-        crate::sched::OTHERS_PATIENCE,
+        2000,
     );
     started &= READY.load(Ordering::Acquire) == aps;
     // Whatever happened, release those that did start: they would otherwise spin for the
@@ -844,10 +862,11 @@ fn report_read_cost(com1: &mut Console, cpus: &[cpu::CpuIndex], bsp: cpu::CpuInd
         return;
     }
     COST_TICKS.fetch_add(ticks_per_read(monotonic_nanos), Ordering::Relaxed);
-    crate::sched::yield_until(
+    let _ = crate::sched::wait_for_others(
+        "the clock cost's readers to finish",
         || DONE.load(Ordering::Acquire) == aps,
         tsc_hz,
-        crate::sched::OTHERS_PATIENCE,
+        2000,
     );
     let finished = DONE.load(Ordering::Acquire) == aps;
     let together = COST_TICKS.load(Ordering::Relaxed) / (aps + 1);

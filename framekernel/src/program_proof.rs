@@ -184,7 +184,12 @@ fn refused_whole(creator: &Process, stack_pages: u64, error: Error, tsc_hz: u64)
         ..FIRST_PROGRAM_RUN
     };
     let refused = launch::load_program(creator, &FIRST_PROGRAM, &run).err() == Some(error);
-    sched::yield_until(|| counts() == before, tsc_hz, sched::OTHERS_PATIENCE);
+    let _ = sched::wait_for_others(
+        "a refused launch's counts to come back",
+        || counts() == before,
+        tsc_hz,
+        2000,
+    );
     refused && before.is_some() && counts() == before
 }
 

@@ -122,7 +122,12 @@ fn verdict(ok: bool) -> &'static str {
 /// earlier proof's last threads may still be being reaped on their processors.
 fn back_whole(tsc_hz: u64) -> bool {
     let size = ROOT.size();
-    sched::yield_until(|| ROOT.left() == size, tsc_hz, sched::OTHERS_PATIENCE);
+    let _ = sched::wait_for_others(
+        "the root to be whole again",
+        || ROOT.left() == size,
+        tsc_hz,
+        2000,
+    );
     size > 0 && ROOT.left() == size
 }
 
@@ -324,7 +329,12 @@ fn paid_to_the_byte(
                         let ended = process.ending().is_some();
                         let still = ROOT.left() == left - figure - bytes;
                         drop(process);
-                        sched::yield_until(|| ROOT.left() == left, tsc_hz, sched::OTHERS_PATIENCE);
+                        let _ = sched::wait_for_others(
+                            "the root after a process's end",
+                            || ROOT.left() == left,
+                            tsc_hz,
+                            2000,
+                        );
                         ahead && settled && ended && still && ROOT.left() == left
                     })
             })
@@ -377,7 +387,12 @@ fn refund_waits(com1: &mut Console, tsc_hz: u64) -> bool {
     drop(one);
     drop(two);
     ipc::reap_closed();
-    sched::yield_until(|| ROOT.left() == left, tsc_hz, sched::OTHERS_PATIENCE);
+    let _ = sched::wait_for_others(
+        "the root after a channel's end",
+        || ROOT.left() == left,
+        tsc_hz,
+        2000,
+    );
     let back = ROOT.left() == left;
     let _ = writeln!(
         com1,

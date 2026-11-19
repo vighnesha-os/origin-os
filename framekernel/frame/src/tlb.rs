@@ -197,79 +197,27 @@ pub fn service() {
     note_answer();
 }
 
-/// Shootdowns that gave up waiting for some processor this boot, of every kind (TASKS item 66).
-static STALLS: AtomicU64 = AtomicU64::new(0);
-/// The last of them: the processor that did not answer and the one that asked (`u64::MAX`:
-/// none yet), how long the asker waited and when it gave up, in TSC ticks. Written together
-/// by the asker, read for a report: a report racing a second stall may mix the two.
-static LAST_TARGET: AtomicU64 = AtomicU64::new(u64::MAX);
-static LAST_ASKER: AtomicU64 = AtomicU64::new(u64::MAX);
-static LAST_WAITED: AtomicU64 = AtomicU64::new(0);
-static LAST_GAVE_UP: AtomicU64 = AtomicU64::new(0);
-/// TSC ticks from the last give-up to the next time its processor served a shootdown, plus
-/// one; 0 while it has not.
-static LAST_ANSWERED_AFTER: AtomicU64 = AtomicU64::new(0);
+/// Shootdowns that gave up waiting for some processor this boot, of every kind, and the last
+/// one's processors and wait (TASKS item 66; the record is `stalls`, tested on the host).
+static STALLS: crate::stalls::StallLog = crate::stalls::StallLog::new();
 
 /// Notes a shootdown that gave up on a processor, asked at TSC `asked_at`.
 fn note(outcome: &Result<Completed, Stalled>, asked_at: u64) {
     if let Err(Stalled { cpu }) = outcome {
-        let now = rdtsc();
-        LAST_ANSWERED_AFTER.store(0, Ordering::Relaxed);
-        LAST_TARGET.store(*cpu as u64, Ordering::Relaxed);
-        LAST_ASKER.store(this_cpu() as u64, Ordering::Relaxed);
-        LAST_WAITED.store(now.wrapping_sub(asked_at), Ordering::Relaxed);
-        LAST_GAVE_UP.store(now, Ordering::Release);
-        STALLS.fetch_add(1, Ordering::AcqRel);
+        STALLS.note(*cpu, this_cpu(), asked_at, rdtsc());
     }
 }
 
 /// On the processor the last stall gave up on, notes when it next served a shootdown.
 fn note_answer() {
-    if LAST_TARGET.load(Ordering::Relaxed) == this_cpu() as u64
-        && LAST_ANSWERED_AFTER.load(Ordering::Relaxed) == 0
-    {
-        let after = rdtsc().wrapping_sub(LAST_GAVE_UP.load(Ordering::Acquire));
-        let _ = LAST_ANSWERED_AFTER.compare_exchange(
-            0,
-            after.saturating_add(1),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-    }
+    STALLS.answered(this_cpu(), rdtsc());
 }
 
-/// A shootdown that gave up waiting for a processor, as the boot reports it (TASKS item 66).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Stall {
-    /// Shootdowns that have stalled this boot, this one included.
-    pub count: u64,
-    /// The processor that did not answer within the patience.
-    pub target: usize,
-    /// The processor that asked.
-    pub asker: usize,
-    /// How long the asker waited, in TSC ticks.
-    pub waited: u64,
-    /// TSC ticks from the give-up to the target's next answer, if it has answered since.
-    pub answered_after: Option<u64>,
-}
+pub use crate::stalls::Stall;
 
 /// The last shootdown that stalled, if any has.
 pub fn last_stall() -> Option<Stall> {
-    let count = STALLS.load(Ordering::Acquire);
-    let target = LAST_TARGET.load(Ordering::Relaxed);
-    if count == 0 || target == u64::MAX {
-        return None;
-    }
-    Some(Stall {
-        count,
-        target: target as usize,
-        asker: LAST_ASKER.load(Ordering::Relaxed) as usize,
-        waited: LAST_WAITED.load(Ordering::Relaxed),
-        answered_after: match LAST_ANSWERED_AFTER.load(Ordering::Relaxed) {
-            0 => None,
-            after => Some(after - 1),
-        },
-    })
+    STALLS.last()
 }
 
 /// How many shootdown interrupts each processor has taken.
