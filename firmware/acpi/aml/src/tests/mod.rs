@@ -451,6 +451,12 @@ pub(crate) enum Fault {
     /// A string is written to a field a character at a time, as before step B5 (`region.rs`,
     /// `write_value`).
     StringByCharacter,
+    /// `AnyAcc` takes the narrowest naturally aligned width holding the field, as before step B5
+    /// (`region.rs`, `width`).
+    WidestAnyAcc,
+    /// An EmbeddedControl field wider than a byte is accessed a byte at a time, as before step B5
+    /// (`region.rs`, `field_locked`).
+    EcBytewise,
 }
 
 thread_local! {

@@ -936,3 +936,156 @@ fn planted_faults_are_caught_by_the_conversion_tests() {
         }
     }
 }
+
+// --- Access widths and Embedded Controller fields: G5 (step B5-5) -------------------------------
+
+#[test]
+fn anyacc_is_byte_access() {
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            op_region("RM", 0, word(0x2000), byte(8)),
+            field("RM", 0, &[Fe::Named("W16", 16), Fe::Named("D32", 32)]),
+        ],
+    )
+    .unwrap();
+    i.host_mut().seen.clear();
+    assert_eq!(eval(&mut i, "D32"), Ok(Some(Value::Integer(0))));
+    let seen = &i.host().seen;
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    assert!(seen.iter().all(|s| s.width == 8), "{seen:?}");
+}
+
+#[test]
+fn field_at_region_end_reads_within_it() {
+    // `M652`'s shape (TASKS 72's finding 2): any width with the `Lock` rule, 4 bytes ending at
+    // the region's end and not 4-byte aligned. Before step B5 an 8-byte unit passed the end.
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            op_region("RM", 0, word(0x3000), byte(7)),
+            field("RM", 0x10, &[Fe::Reserved(24), Fe::Named("LAST", 32)]),
+        ],
+    )
+    .unwrap();
+    i.host_mut().seen.clear();
+    assert_eq!(eval(&mut i, "LAST"), Ok(Some(Value::Integer(0))));
+    let seen = &i.host().seen;
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    assert!(
+        seen.iter()
+            .all(|s| s.width == 8 && (0x3003..0x3007).contains(&s.address)),
+        "{seen:?}"
+    );
+    assert_eq!((i.host().global_taken, i.host().global_held), (1, 0));
+}
+
+#[test]
+fn ec_wide_field_is_one_transfer() {
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            op_region("EC0", 3, zero(), byte(32)),
+            field(
+                "EC0",
+                0,
+                &[
+                    Fe::Named("W16", 16),
+                    Fe::Named("D32", 32),
+                    Fe::Reserved(3),
+                    Fe::Named("X13", 13),
+                    Fe::Named("B136", 136),
+                ],
+            ),
+            field("EC0", 0x40, &[Fe::Reserved(3), Fe::Named("Z13", 13)]),
+            field("EC0", 0, &[Fe::Reserved(8 * 30), Fe::Named("BY", 8)]),
+            method("WD", 0, &[store(dword(0x1122_3344), nm("D32"))]),
+            method("WX", 0, &[store(zero(), nm("X13"))]),
+            method("WZ", 0, &[store(word(0x1FFF), nm("Z13"))]),
+        ],
+    )
+    .unwrap();
+    let take = |i: &mut Interp| core::mem::take(&mut i.host_mut().transfers);
+    // A read of 16 bits: one transfer of 2 bytes at the field's first byte.
+    i.host_mut().answer = vec![0x34, 0x12];
+    assert_eq!(eval(&mut i, "W16"), Ok(Some(Value::Integer(0x1234))));
+    let t = take(&mut i);
+    assert_eq!(t.len(), 1);
+    assert_eq!(
+        (t[0].0.space, t[0].0.address, t[0].0.write, t[0].0.bit_length, t[0].0.sent.len()),
+        (3, 0, false, 16, 2)
+    );
+    // A write of whole bytes: one transfer, no read.
+    i.host_mut().answer = vec![];
+    eval(&mut i, "WD").unwrap();
+    let t = take(&mut i);
+    assert_eq!(t.len(), 1);
+    assert_eq!(
+        (t[0].0.address, t[0].0.write, t[0].0.sent.clone()),
+        (2, true, vec![0x44, 0x33, 0x22, 0x11])
+    );
+    // 13 bits from bit 3 of byte 6, Preserve: a read, then the write with the other bits kept.
+    i.host_mut().answer = vec![0xFF, 0xFF];
+    eval(&mut i, "WX").unwrap();
+    let t = take(&mut i);
+    assert_eq!(t.len(), 2);
+    assert_eq!((t[0].0.address, t[0].0.write), (6, false));
+    assert_eq!(
+        (t[1].0.address, t[1].0.write, t[1].0.sent.clone()),
+        (6, true, vec![0x07, 0x00])
+    );
+    // WriteAsZeros: no read.
+    i.host_mut().answer = vec![];
+    eval(&mut i, "WZ").unwrap();
+    let t = take(&mut i);
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0].0.sent, vec![0xF8, 0xFF]);
+    // 136 bits: one transfer of 17 bytes.
+    eval(&mut i, "B136").unwrap();
+    let t = take(&mut i);
+    assert_eq!(t.len(), 1);
+    assert_eq!((t[0].0.address, t[0].0.sent.len()), (8, 17));
+    // A byte field stays a byte read.
+    i.host_mut().seen.clear();
+    eval(&mut i, "BY").unwrap();
+    assert!(take(&mut i).is_empty());
+    assert_eq!(i.host().seen.len(), 1);
+}
+
+#[test]
+fn ec_field_over_255_bytes_refused() {
+    let mut i = fresh();
+    load(
+        &mut i,
+        &[
+            op_region("EC1", 3, zero(), word(300)),
+            field("EC1", 0, &[Fe::Named("HUGE", 256 * 8)]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        eval(&mut i, "HUGE").map_err(|e| e.kind),
+        Err(ErrorKind::Range)
+    );
+    assert!(i.host().transfers.is_empty());
+}
+
+#[test]
+fn planted_faults_are_caught_by_the_width_tests() {
+    let tests: [(Option<Fault>, &[fn()]); 3] = [
+        (None, &[anyacc_is_byte_access, field_at_region_end_reads_within_it, ec_wide_field_is_one_transfer, ec_field_over_255_bytes_refused]),
+        (Some(Fault::WidestAnyAcc), &[field_at_region_end_reads_within_it]),
+        (Some(Fault::EcBytewise), &[ec_wide_field_is_one_transfer]),
+    ];
+    for (f, cases) in tests {
+        for case in cases {
+            plant(f);
+            let failed = std::panic::catch_unwind(case).is_err();
+            plant(None);
+            assert_eq!(failed, f.is_some(), "{f:?}: case {case:?}");
+        }
+    }
+}

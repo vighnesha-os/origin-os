@@ -121,7 +121,13 @@ pub struct RegionAccess<'a> {
 }
 
 /// One transaction on a buffer-protocol region space (SMBus, IPMI, GenericSerialBus,
-/// GeneralPurposeIO, PCC, PlatformRtMechanism, FFixedHW).
+/// GeneralPurposeIO, PCC, PlatformRtMechanism, FFixedHW), or an EmbeddedControl field wider than
+/// 8 bits (step B5; B5's contract, Q6): `address` is the region's base plus the field's first
+/// byte, `data` the bytes it spans, at most 255, `bit_offset` and `bit_length` where the field
+/// lies in them (its offset within the first byte, and its bits). A read fills `data`; a write
+/// sends it, the bits outside the field already merged by the field's update rule (for Preserve,
+/// by a read transfer first). A host for the ACPI service makes it one Embedded Controller
+/// transaction, as ACPICA's hosts do (TASKS 64's ledger §3, G5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BufferAccess<'a> {
     /// The space.
