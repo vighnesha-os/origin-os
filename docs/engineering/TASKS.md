@@ -1664,6 +1664,20 @@ Sent by the coordinating session on 2026-11-14, after the owner accepted ADR-001
   - B5-R15 `b028c14b`: a failed table keeps its bytes while a name it put in a package is listed, so a pass binds a name that names something rather than reporting it empty; the fix read by the coordinating session alone;
   - B5-R16: recorded beside CL41, the pass's charge counting garbage not yet collected; with the records, the second addendum's Status column and its Resolution, in the commit after `b028c14b`.
   - **Host tests** under the machine's turn lock on the tree of `b028c14b` (2026-11-19, 15:13 UTC): `origin-aml`'s 216 passed and 1 ignored, the kernel proof's 43 passed, formatting and both crates' Clippy clean. The full gates then run once, on the final tip.
+- **The similarity check** (decision item 121; TASKS item 64's session, `SIMILARITY_T63_B5_2026-11-19.md` at `a51c83c4` on `docs/similarity-t63-b5`, against the 48 ACPICA files of ledger 64 §5): nothing to fix in B5's code (`2d0187c0..f3aff5ef`), the owner's sign-off pending. Its two record points are at `95143d52`: `host.rs`'s wording (G5), and three more differences from ACPICA named in the ledger's §9 (G13, G5, G7).
+- **Gates on B5's final code, `f3aff5ef`** (2026-11-19, 15:15 to 15:36 UTC, one turn of the machine, a clean tree before and after; Rust 1.100.0 on the development Mac). `95143d52` after it changes one doc comment and the ledger; its quick gates passed.
+  - formatting, Clippy, and the library's and the kernel proof's host tests;
+  - boot controls AML-1 to AML-8, each caught for its own reason, AML-8 on "a store in pieces was reported on QEMU's own tables", every file restored byte for byte (ADR-0013); the baseline passed with no tolerance and no store in pieces reported;
+  - the soak at seed `0x63d00000`: 1,010,310 grammar cases, 1,000,000 mutation cases and the adversarial blocks, every audit, its planted faults caught;
+  - the release tests: load 76, tolerance 69, proof 44;
+  - `cargo xtask check`: 2,402 tests passed, none failed, 29 ignored; Loom's 56 models and 83 negative controls; the no-panic check at 209 symbols of `origin-aml`'s own; the allocation gate over 21 library files;
+  - `boot-test` 11 of 11;
+  - **`boot-matrix` stopped, and has not passed whole on B5's tip.**
+    - **The stop:** at the AMD IOMMU machine with 65 processors, the kernel's clock proof failed, before the AML proof. After "32 disturbed windows discarded" it printed `clock: one RTC second lasted 1016353 us on the calibrated TSC (+/- 2975 us, over 1 s): clock failed`. The scenarios after it did not run.
+    - **Before it:** nine machines booted (Intel 1, 2, 3, 4 and 65; AMD 1, 2, 3 and 4), and the AML proof passed on each, with no tolerance reported.
+    - **The cause:** TASKS item 66's finding F1. On the 65- and 67-processor machines nearly every 10 ms calibration window is disturbed, and that is the cause of every refuted RTC second. The line is F1's signature, and B5 changes only `firmware/acpi/aml/`, `framekernel/src/aml_proof*` and records: no clock, timer, scheduler or other kernel file.
+    - **Not repeated,** by the coordinating session's ruling of 2026-11-19: the batch's full gates run `boot-matrix` whole after the keeper merges B5.
+  - TASKS item 72's harness on rental A's tables, outside the repository (item 232), at 15:45 UTC: every table loads, the walk completes, and there is no failure and no report under either stub, so no store in pieces.
 - **Not covered:** the similarity check owed before B5's code reaches `main` (decision item 121; a session that writes no code, with the owner's permission and sign-off); `_INI` and `_REG` after a run-time load (G17, the ACPI service's); no boot runs a run-time load; real firmware run only outside the repository (TASKS item 72's harness; item 232).
 
 
