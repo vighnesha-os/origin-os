@@ -360,6 +360,25 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             Proof::AcpiTables,
             crate::acpi_census::prove(&mut com1, info.acpi_rsdp),
         );
+        // The framework's measured stack (TASKS item 68), in the boot flow before any thread
+        // exists, where the AML proof below is to use it: a known recursion's depth, measured on a
+        // painted stack, must equal the depth it sampled, to the byte.
+        proofs.record(
+            Proof::MeasuredStackBoot,
+            crate::measured_stack::prove_at_boot(&mut com1, tsc_hz),
+        );
+        // The AML interpreter over QEMU's DSDT and SSDTs, against a host that refuses every access
+        // to hardware (ADR-0019 A3; TASKS item 63, step B3); on any other firmware it runs no AML
+        // and passes. It runs here, on the loader's stack with its guard page, before any thread
+        // exists, so that nothing else allocates while its heap check runs.
+        proofs.record(
+            Proof::AmlInterpreter,
+            crate::aml_proof::prove(
+                &mut com1,
+                info.acpi_rsdp,
+                crate::phys::to_virt(info.stack_base),
+            ),
+        );
         // The random-number generator on every processor (CLAUDE.md §59; ADR-0016). If the
         // proof fails, randomness is withheld from here on (ADR-0013 R2, Amendment 1): nothing
         // is launched and nothing is placed at a random address.

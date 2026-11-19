@@ -4,7 +4,7 @@
 
 use super::encode::*;
 use super::{Interp, eval, int, interp, load};
-use crate::{ErrorKind, Feature, IntegerWidth, Value};
+use crate::{ErrorKind, IntegerWidth, Value};
 
 /// A method `path` with no arguments whose body is `body`.
 fn m(path: &str, body: &[B]) -> B {
@@ -889,14 +889,14 @@ fn corpus() -> Vec<Case> {
                 m("HA", &[load_op("MX0", none())]),
                 m(
                     "HB",
-                    &[load_table([
+                    &[ret(load_table([
                         string("OEM1"),
                         string(""),
                         string(""),
                         string(""),
                         string(""),
                         zero(),
-                    ])],
+                    ]))],
                 ),
                 m(
                     "HC",
@@ -904,9 +904,25 @@ fn corpus() -> Vec<Case> {
                 ),
                 m("HD", &[store(string("hello"), debug()), ret(one())]),
                 m("HE", &[breakpoint(), ret(one())]),
+                // B4: a table loaded from a buffer, and one the host lists.
+                name("TBX", {
+                    let t = table(b"SSDT", 2, &[name("LDX", byte(7))]);
+                    buffer(dword(t.len() as u32), &t)
+                }),
+                m("HF", &[ret(load_op("TBX", none()))]),
+                m(
+                    "HG",
+                    &[ret(load_table([
+                        string("OEMT"),
+                        string("ORIGIN"),
+                        string("AMLTEST"),
+                        string(""),
+                        string(""),
+                        zero(),
+                    ]))],
+                ),
             ],
             |i| {
-                use Feature as F;
                 assert_eq!(int(i, "H0"), 0);
                 fails(i, "H1", ErrorKind::NotOwned);
                 assert_eq!(int(i, "H2"), 0);
@@ -930,8 +946,9 @@ fn corpus() -> Vec<Case> {
                 assert_eq!(i.host().fatals, vec![(1, 2, 3)]);
                 let t = int(i, "H9");
                 assert!(t > 0 && t <= i.host().clock);
-                fails(i, "HA", ErrorKind::NotSupported(F::Load));
-                fails(i, "HB", ErrorKind::NotSupported(F::LoadTable));
+                // A mutex holds no table; no table is listed under `OEM1` (B4).
+                fails(i, "HA", ErrorKind::Type);
+                assert_eq!(int(i, "HB"), 0);
                 fails(i, "HC", ErrorKind::NotFound);
                 assert_eq!(int(i, "HD"), 1);
                 assert_eq!(
@@ -940,6 +957,19 @@ fn corpus() -> Vec<Case> {
                 );
                 assert_eq!(int(i, "HE"), 1);
                 assert_eq!(i.host().breakpoints, 1);
+                assert_eq!(int(i, "HF"), u64::MAX);
+                assert_eq!(int(i, "\\LDX"), 7);
+                i.host_mut().tables.push((
+                    crate::TableKey {
+                        signature: *b"OEMT",
+                        oem_id: *b"ORIGIN",
+                        oem_table_id: *b"AMLTEST\0",
+                    },
+                    0x9000,
+                    table(b"OEMT", 2, &[name("LTX", byte(8))]),
+                ));
+                assert_eq!(int(i, "HG"), u64::MAX);
+                assert_eq!(int(i, "\\LTX"), 8);
                 assert!(i.lookup("\\EXT0").unwrap().is_none());
             },
         ),

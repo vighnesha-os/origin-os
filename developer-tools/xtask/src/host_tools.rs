@@ -27,32 +27,27 @@
 //!   tree on each run.
 //! - **`xtask` naming itself** (`current_exe`) outside the functions [`SELF_RUNS`] lists.
 //!
-//! What it allows, each named here and in [`SELF_RUNS`] with its authority:
+//! What it allows, each named here, and in [`SELF_RUNS`] with its authority where it names
+//! `current_exe`:
 //!
 //! - **By decision item 300** (accepted by the owner on 2026-11-14; T1's added note in
 //!   ADR-0011 Amendment 4): `cargo xtask exclusive` running the command a person gives it
 //!   (`turns::exclusive`), that person's choice and not `xtask`'s, whose argument is their text
-//!   so neither rule meets it; and `boot-matrix` re-running `xtask` for each scenario
-//!   (`boot_matrix`, through `boot_test_child`, with each scenario's `ORIGIN_QEMU_*` settings in
-//!   its child's environment), until TASKS item 61 runs the scenarios in one process with typed
-//!   settings, after TASKS items 58 and 59.
+//!   so neither rule meets it. It names no `current_exe`, so [`SELF_RUNS`] does not list it.
 //! - **By decision item 310** (accepted by the owner on 2026-11-14, "Accept 310"; T1's second
-//!   note in ADR-0011 Amendment 4; the review's finding F6): item 300's allowance covers the six
-//!   scenario commands `boot-matrix` runs as steps of its own (`boot_x2apic`, `boot_bridge`,
-//!   `boot_reserved`, `boot_legacy_free`, `boot_random`, `boot_identity`), also when a person
-//!   runs one on its own, since each re-runs `xtask` the same way, until TASKS item 61. **By
-//!   decision item 311** (accepted by the owner on 2026-11-14, "Accept 311"; T1's third note in
-//!   ADR-0011 Amendment 4), the same allowance covers the three that TASKS item 58 added
-//!   (`boot_sparse`, `boot_many`, `boot_listed`): nine scenario commands in all. **By decision
-//!   item 312** (accepted by the owner on 2026-11-14, "Accept 312"; T1's fourth note in ADR-0011
-//!   Amendment 4), the general form: until TASKS item 61, any scenario command of `boot-matrix`'s
-//!   that re-runs `xtask` the same way is allowed, each still named in [`SELF_RUNS`] under its
-//!   own constant citing the item; the first is `boot_acpi`, the ACPI machine TASKS item 62
-//!   added: ten scenario commands in all. And a
-//!   test that starts a first-party program to test that same program is outside T1: the turn
-//!   lock's own test (`turns::tests::the_lock_goes_with_the_process_however_it_ends`) starts its
-//!   test binary to hold the lock and be killed. It stays listed in [`SELF_RUNS`], so that every
-//!   exception the gate allows is named.
+//!   note in ADR-0011 Amendment 4; the review's finding F6): a test that starts a first-party
+//!   program to test that same program is outside T1. The turn lock's own test
+//!   (`turns::tests::the_lock_goes_with_the_process_however_it_ends`) starts its test binary to
+//!   hold the lock and be killed. It stays listed in [`SELF_RUNS`], so that every exception the
+//!   gate allows is named, and it is the only place listed.
+//! - **Ended by TASKS item 61** (2026-11-19): item 300's other case, `boot-matrix` re-running
+//!   `xtask boot-test` for each scenario with its `ORIGIN_QEMU_*` settings in the child's
+//!   environment, and items 310, 311 and 312's extension of it to the ten scenario commands
+//!   (`boot-x2apic`, `boot-bridge`, `boot-reserved`, `boot-legacy-free`, `boot-random`,
+//!   `boot-identity`, `boot-sparse`, `boot-many`, `boot-listed`, `boot-acpi`), each allowed
+//!   "until TASKS item 61". Each now calls `boot_test` in process with the machine's settings as
+//!   a typed value (`settings.rs`), so none is listed, and the planted control below shows that a
+//!   scenario command that re-ran `xtask` again would be refused.
 //! - **Outside G1, by decision item 310** (finding F12): Cargo's subcommands other than `run`
 //!   (`xtask check` runs `cargo test --package onbf-pack`, and `onbf-pack`'s and `oidl`'s
 //!   integration tests start the binary they test, which item 310 puts outside T1 too) and
@@ -93,7 +88,9 @@
 //! files ([`controls`]), each of which must be refused or the gate fails: in `xtask`'s `main.rs`,
 //! the `cargo run --release --package onbf-pack` that `xtask` ran before T1, a `Command::new` of
 //! `oidl`'s binary, a `current_exe` outside the list, `cargo().args(["xtask", "boot-test"])`
-//! outside it, and the same after a `--config` whose value is a variable; in `onbf-sign`'s
+//! outside it, the same after a `--config` whose value is a variable, and `boot_x2apic` as it
+//! was before TASKS item 61 (a scenario command re-running `xtask boot-test` through
+//! `current_exe` with its machine's settings in the child's environment); in `onbf-sign`'s
 //! `lib.rs`, the `os_random` it had before T1, a test-only field with host access after it (which
 //! the scan before the fix for F1 would miss), a stream through `std::io` and a `Path::is_file`;
 //! in `onbf-pack`'s `main.rs`, the `onbf_verify::key_id` call it had before T1; in `onbf-sign`'s
@@ -191,45 +188,19 @@ pub(crate) struct Known {
     pub(crate) runs: BTreeMap<String, Option<String>>,
 }
 
-/// Item 300's words: `boot-matrix` re-running `xtask` for each scenario.
-const ITEM_300: &str = "decision item 300: `boot-matrix` re-runs `xtask` for each scenario";
-/// The first six scenario commands `boot-matrix` runs as steps, also when run alone (the
-/// review's finding F6; decision item 310). With [`ITEM_311_MACHINE`]'s three, nine in all, and
-/// [`ITEM_312_MACHINE`]'s since.
-const ITEM_310_MACHINE: &str = "decision item 310: a scenario command of `boot-matrix`'s, also when run on its own, until TASKS item 61";
-/// The three scenario commands TASKS item 58 added (`boot-sparse`, `boot-many`, `boot-listed`),
-/// which re-run `xtask` as the six do (decision item 311, ADR-0011 Amendment 4, T1's third
-/// note).
-const ITEM_311_MACHINE: &str = "decision item 311: a scenario command of `boot-matrix`'s that TASKS item 58 added, also when run on its own, until TASKS item 61";
-/// A scenario command of `boot-matrix`'s added after item 311, which re-runs `xtask` as the nine
-/// do: the general form of decision item 312, until TASKS item 61 (ADR-0011 Amendment 4, T1's
-/// fourth note). The first is `boot-acpi` (TASKS item 62).
-const ITEM_312_MACHINE: &str = "decision item 312 (ADR-0011 Amendment 4, T1's fourth note): a scenario command of `boot-matrix`'s that re-runs `xtask` the same way, also when run on its own, until TASKS item 61";
 /// The turn lock's own test (finding F6; decision item 310).
 const ITEM_310_TEST: &str = "decision item 310: a test starting the program it tests, outside T1";
 
 /// The places `xtask` may name itself (`current_exe`), by file under `developer-tools/xtask/`
 /// and function, each with its authority (the module documentation says more). A place not
 /// listed is refused, and a listed one that no longer names itself is a stale allowance, refused
-/// too.
-pub(crate) const SELF_RUNS: &[(&str, &str, &str)] = &[
-    ("src/main.rs", "boot_matrix", ITEM_300),
-    ("src/main.rs", "boot_reserved", ITEM_310_MACHINE),
-    ("src/main.rs", "boot_legacy_free", ITEM_310_MACHINE),
-    ("src/main.rs", "boot_random", ITEM_310_MACHINE),
-    ("src/main.rs", "boot_identity", ITEM_310_MACHINE),
-    ("src/main.rs", "boot_bridge", ITEM_310_MACHINE),
-    ("src/main.rs", "boot_x2apic", ITEM_310_MACHINE),
-    ("src/main.rs", "boot_sparse", ITEM_311_MACHINE),
-    ("src/main.rs", "boot_many", ITEM_311_MACHINE),
-    ("src/main.rs", "boot_listed", ITEM_311_MACHINE),
-    ("src/main.rs", "boot_acpi", ITEM_312_MACHINE),
-    (
-        "src/turns.rs",
-        "the_lock_goes_with_the_process_however_it_ends",
-        ITEM_310_TEST,
-    ),
-];
+/// too. Since TASKS item 61 no scenario command of `boot-matrix`'s is listed: each boots in
+/// process.
+pub(crate) const SELF_RUNS: &[(&str, &str, &str)] = &[(
+    "src/turns.rs",
+    "the_lock_goes_with_the_process_however_it_ends",
+    ITEM_310_TEST,
+)];
 
 /// Whether `function` of `file` is a place [`SELF_RUNS`] lists.
 fn self_run(file: &str, function: &str) -> bool {
@@ -684,7 +655,7 @@ pub(crate) fn program_hits(
                 hit(
                     token,
                     format!(
-                        "`current_exe` in {}: `xtask` re-runs itself only in the functions host_tools::SELF_RUNS lists, by decision items 300 and 310",
+                        "`current_exe` in {}: `xtask` re-runs itself only in the functions host_tools::SELF_RUNS lists, by decision item 310; boot-matrix's scenarios boot in process since TASKS item 61",
                         place.map_or("no function".to_string(), |f| format!("`{f}`"))
                     ),
                 );
@@ -1198,6 +1169,28 @@ fn planted_control_again() -> Command {
 }
 "#;
 
+/// A scenario command of `boot-matrix`'s as it was before TASKS item 61: `boot_x2apic`,
+/// re-running `xtask boot-test` with each machine's settings in its child's environment. Planted
+/// by the controls: no scenario command is listed since TASKS item 61, and this control is the
+/// proof that decision item 312's general form ("any scenario command that re-runs `xtask` the
+/// same way") is closed with it.
+const PLANTED_SCENARIO_RERUN: &str = r#"
+fn boot_x2apic() -> Result {
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    for (model, leaf) in [("max,vendor=GenuineIntel", "leaf 1Fh"), ("max", "leaf 0Bh")] {
+        let status = boot_test_child(&exe)
+            .env("ORIGIN_QEMU_TOPOLOGY", "x2apic")
+            .env("ORIGIN_QEMU_CPU", model)
+            .status()
+            .map_err(|e| format!("cannot run boot-test: {e}"))?;
+        if !status.success() {
+            return Err(format!("boot-test on the sparse machine with -cpu {model} ({leaf}) failed ({status})"));
+        }
+    }
+    Ok(())
+}
+"#;
+
 /// `xtask` run through Cargo's alias, from a function `SELF_RUNS` does not list (the review of
 /// 2026-11-14, finding F2): planted by the controls.
 const PLANTED_ALIAS_RUN: &str = r#"
@@ -1288,6 +1281,11 @@ fn controls(
             "a self-run",
         ),
         (
+            PLANTED_SCENARIO_RERUN,
+            "`current_exe` in `boot_x2apic`",
+            "a scenario command re-running `xtask` (TASKS item 61)",
+        ),
+        (
             PLANTED_ALIAS_RUN,
             "Cargo's alias `xtask` is `cargo run`",
             "`cargo xtask` outside SELF_RUNS",
@@ -1348,7 +1346,7 @@ fn controls(
         missed.push("a dependency in developer-tools/onbf-sign/Cargo.toml".into());
     }
     if missed.is_empty() {
-        Ok(7 + library_controls.len())
+        Ok(8 + library_controls.len())
     } else {
         Err(missed)
     }
@@ -1432,7 +1430,7 @@ pub(crate) fn gate() -> Result {
         ));
     }
     println!(
-        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs, by name or through `run` and the {} Cargo aliases that run one, and re-runs itself only in the {} places host_tools::SELF_RUNS lists (1 by decision item 300, the rest by item 310); the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host by the forms the gate reads, and depend on nothing but the crates it lists; their {} command lines name no crate but their own library and the standard library's; {caught} planted controls caught",
+        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs, by name or through `run` and the {} Cargo aliases that run one, and re-runs itself only in the {} place(s) host_tools::SELF_RUNS lists (the turn lock's own test, by decision item 310; boot-matrix and its scenario commands boot in process since TASKS item 61); the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host by the forms the gate reads, and depend on nothing but the crates it lists; their {} command lines name no crate but their own library and the standard library's; {caught} planted controls caught",
         xtask.len(),
         known.programs.len(),
         known.runs.len() - RUN_WORDS.len(),

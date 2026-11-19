@@ -41,17 +41,6 @@ pub enum Limit {
     Nesting,
 }
 
-/// What the interpreter met in a definition block and does not run yet. `Load` and `LoadTable`
-/// check the header of a table read at run time with `origin-acpi-tables` (TASKS 62), which
-/// reaches this crate only through the batch; until it does they answer `NotSupported`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Feature {
-    /// `Load`.
-    Load,
-    /// `LoadTable`.
-    LoadTable,
-}
-
 /// What went wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -90,8 +79,6 @@ pub enum ErrorKind {
     Stale,
     /// A limit was reached.
     Limit(Limit),
-    /// A construct this step of TASKS item 63 does not run yet.
-    NotSupported(Feature),
     /// The host refused or failed a request that is not a region access (the Global Lock, a
     /// table).
     Host(HostError),

@@ -47,6 +47,9 @@ const KERNEL_LEAVES: &[&str] = &[
     "boot/info",
     // ACPI 6.6's system description tables, parsed (ADR-0019 A6, area A; TASKS item 62).
     "firmware/acpi/tables",
+    // The AML interpreter, which the kernel's boot proof runs (ADR-0019 A3; TASKS item 63, step
+    // B3; the review of B3, B3-3).
+    "firmware/acpi/aml",
     "runtime/abi",
     "runtime/version",
     "sdk/directory",
@@ -126,7 +129,7 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
     ),
     (
         "framekernel/frame/src/stack.rs",
-        "kernel stacks and FPU areas: raw allocation, guard pages, first frames",
+        "kernel stacks and FPU areas: raw allocation, guard pages, first frames, a closure run on a painted stack",
     ),
     (
         "framekernel/frame/src/timer.rs",
@@ -231,6 +234,9 @@ const ABOVE_UNSAFE_FILES: &[&str] = &["framekernel/frame/src/lib.rs"];
 const LAYERS: &[(&str, &[&str])] = &[
     ("origin-version", &[]),
     ("origin-acpi-tables", &[]),
+    // The AML interpreter, which the kernel's boot proof runs (TASKS item 63, step B3). It checks
+    // every table `Load`, `LoadTable` and `DataTableRegion` read with `origin-acpi-tables` (B4).
+    ("origin-aml", &["origin-acpi-tables"]),
     ("origin-boot-info", &["origin-version"]),
     ("origin-abi", &["origin-version"]),
     ("origin-sync", &[]),
@@ -258,6 +264,7 @@ const LAYERS: &[(&str, &[&str])] = &[
         &[
             "origin-abi",
             "origin-acpi-tables",
+            "origin-aml",
             "origin-boot-info",
             "origin-crypto",
             "origin-frame",
@@ -302,6 +309,13 @@ pub(crate) fn gate() -> Result {
     if !problems.is_empty() {
         return Err(format!(
             "a kernel crate outside the framework must forbid `unsafe` at its root (ADR-0011 N6):\n  {}",
+            problems.join("\n  ")
+        ));
+    }
+    let problems = leaf_problems(&root)?;
+    if !problems.is_empty() {
+        return Err(format!(
+            "xtask's LAYERS and KERNEL_LEAVES disagree about which crates outside {KERNEL_ROOT} the kernel links (the review of TASKS 63's B3, B3-3):\n  {}",
             problems.join("\n  ")
         ));
     }
@@ -615,6 +629,69 @@ fn read(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// The package a manifest names.
+fn package_name(manifest: &Path) -> Result<String> {
+    read(manifest)?
+        .lines()
+        .find_map(|line| line.strip_prefix("name = "))
+        .map(|value| value.trim_matches('"').to_string())
+        .ok_or_else(|| format!("{}: no package name", manifest.display()))
+}
+
+/// Where [`LAYERS`] and [`KERNEL_LEAVES`] disagree. A crate of `LAYERS` outside [`KERNEL_ROOT`]
+/// whose directory is not a listed leaf is linked into the kernel and never scanned for `unsafe`,
+/// nor its root checked for `forbid(unsafe_code)`; a listed leaf that `LAYERS` does not name is
+/// not the kernel's. So the two lists cannot drift apart (the review of TASKS 63's B3, B3-3: B3
+/// added `origin-aml` to `LAYERS` and not its directory to `KERNEL_LEAVES`).
+fn leaf_problems(root: &Path) -> Result<Vec<String>> {
+    let kernel = kernel_packages(root)?;
+    let mut leaves = BTreeSet::new();
+    for dir in KERNEL_LEAVES {
+        leaves.insert(package_name(&root.join(dir).join("Cargo.toml"))?);
+    }
+    Ok(leaf_problems_of(LAYERS, &kernel, &leaves))
+}
+
+/// [`leaf_problems`] on a layering table, the packages under [`KERNEL_ROOT`] and the listed
+/// leaves' packages. Every crate the table names counts, as a row or in any row's allowed list (the
+/// review of TASKS 63's B3 addendum, B3-15): a crate named only in an allowed list is linked into
+/// the kernel as surely as one with a row, so it must have a row of its own, and be under
+/// [`KERNEL_ROOT`] or a listed leaf.
+fn leaf_problems_of(
+    layers: &[(&str, &[&str])],
+    kernel: &BTreeSet<String>,
+    leaves: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut named = BTreeSet::new();
+    for (row, allowed) in layers {
+        named.insert(*row);
+        for name in *allowed {
+            named.insert(*name);
+            if !layers.iter().any(|(n, _)| n == name) {
+                problems.push(format!(
+                    "{name} is allowed for {row} and has no row of its own in LAYERS: say where it sits"
+                ));
+            }
+        }
+    }
+    for name in named {
+        if !kernel.contains(name) && !leaves.contains(name) {
+            problems.push(format!(
+                "{name} is in LAYERS, outside {KERNEL_ROOT}, and its directory is not in KERNEL_LEAVES: the gate would not scan it"
+            ));
+        }
+    }
+    for name in leaves {
+        if !layers.iter().any(|(n, _)| n == name) {
+            problems.push(format!(
+                "{name}'s directory is in KERNEL_LEAVES, and LAYERS does not name it"
+            ));
+        }
+    }
+    problems
+}
+
 /// Each package named by a `Cargo.toml` under [`KERNEL_ROOT`].
 fn kernel_packages(root: &Path) -> Result<BTreeSet<String>> {
     let mut manifests = Vec::new();
@@ -722,6 +799,53 @@ fn tree_lines(package: &str, depth: Option<&str>) -> Result<BTreeSet<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The review of TASKS 63's B3, B3-3: a crate of `LAYERS` outside the kernel's directory that
+    /// is not a listed leaf, and a listed leaf `LAYERS` does not name, are each caught; the
+    /// checkout's own lists agree.
+    #[test]
+    fn layers_and_leaves_cannot_drift_apart() {
+        let root = crate::repo_root();
+        assert_eq!(leaf_problems(&root).unwrap(), Vec::<String>::new());
+        let kernel = kernel_packages(&root).unwrap();
+        let mut leaves = BTreeSet::new();
+        for dir in KERNEL_LEAVES {
+            leaves.insert(package_name(&root.join(dir).join("Cargo.toml")).unwrap());
+        }
+        let mut short = leaves.clone();
+        assert!(short.remove("origin-aml"));
+        let problems = leaf_problems_of(LAYERS, &kernel, &short);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("origin-aml is in LAYERS"),
+            "{problems:?}"
+        );
+        let mut extra = leaves;
+        extra.insert("origin-not-the-kernels".to_string());
+        let problems = leaf_problems_of(LAYERS, &kernel, &extra);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("LAYERS does not name it"),
+            "{problems:?}"
+        );
+        // B3-15: a crate named only in an allowed list, with no row and no listed directory, is
+        // caught twice: no row of its own, and not scanned.
+        let planted: &[(&str, &[&str])] = &[
+            ("framekernel", &["origin-frame", "origin-planted"]),
+            ("origin-frame", &[]),
+        ];
+        let kernel: BTreeSet<String> = ["framekernel", "origin-frame"].map(String::from).into();
+        let problems = leaf_problems_of(planted, &kernel, &BTreeSet::new());
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems[0].starts_with("origin-planted is allowed for framekernel and has no row"),
+            "{problems:?}"
+        );
+        assert!(
+            problems[1].starts_with("origin-planted is in LAYERS, outside framekernel"),
+            "{problems:?}"
+        );
+    }
 
     #[test]
     fn ring3_unsafe_is_only_in_the_listed_files() {
