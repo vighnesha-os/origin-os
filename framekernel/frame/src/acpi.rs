@@ -320,7 +320,9 @@ fn length_field(header: &[u8]) -> u64 {
 /// Locates the firmware's structures that change after boot, as the tables at `rsdp_addr` name
 /// them: the FACS the FADT names as §5.2.9 says to choose it (`X_FIRMWARE_CTRL` when non-zero,
 /// else `FIRMWARE_CTRL`, which is then ignored, so a stale value there blocks nothing), whatever
-/// else the FADT holds; and the FBPT, S3PT and MBPT through the FPDT's records (TASKS item 71). Every byte is read by copy
+/// else the FADT holds; a second FACS, if the ignored field names one, which §5.2.9 forbids (one
+/// whose first bytes are a FACS's signature, so a stale value still blocks nothing); and the
+/// FBPT, S3PT and MBPT through the FPDT's records (TASKS item 71). Every byte is read by copy
 /// (`copy`), into the stack: this takes no lend, so it can neither lend a range before the ones
 /// it finds are recorded nor recurse into a table lookup, and it allocates nothing, since the
 /// first lookup comes before the kernel's heap. A FADT longer than 512 bytes is read that far (its
@@ -378,6 +380,14 @@ pub fn changing_ranges(
                     let mut head = [0u8; 8];
                     let declared = copy(facs, &mut head).map_or(0, |()| length_field(&head));
                     found.push(Changing::Facs, facs, declared, 64);
+                }
+                // Both fields named, which §5.2.9 forbids: the ignored one guarded as well, if
+                // what it names is a FACS.
+                if x != 0 && legacy != 0 && legacy != x {
+                    let mut head = [0u8; 8];
+                    if copy(legacy, &mut head).is_ok() && head[..4] == *b"FACS" {
+                        found.push(Changing::Facs, legacy, length_field(&head), 64);
+                    }
                 }
             }
             Some(sig) if &sig == b"FPDT" => locate_performance(addr, &header, copy, &mut found),
@@ -2300,6 +2310,20 @@ mod tests {
         assert_eq!(
             (none.ranges().len(), none.unlocated),
             (0, Some("the RSDP could not be read"))
+        );
+        // FIRMWARE_CTRL naming a second FACS, which §5.2.9 forbids beside a non-zero
+        // X_FIRMWARE_CTRL: both are guarded.
+        let mut two = mem.clone();
+        two[0x7000..0x7004].copy_from_slice(b"FACS");
+        two[0x7004..0x7008].copy_from_slice(&64u32.to_le_bytes());
+        two[0x1000 + 36..0x1000 + 40].copy_from_slice(&((BASE + 0x7000) as u32).to_le_bytes());
+        let found = changing_ranges(rsdp_at, &mut copy_from(&two));
+        assert_eq!(
+            &found.ranges()[..2],
+            &[
+                (Changing::Facs, BASE + 0x2000, BASE + 0x2040),
+                (Changing::Facs, BASE + 0x7000, BASE + 0x7040),
+            ]
         );
         // A FACS that declares far more than it should is kept at CHANGING_MAX_LEN.
         let mut big = mem.clone();
