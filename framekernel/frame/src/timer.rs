@@ -12,7 +12,8 @@
 //!    ([`apic::CalibrationWindow`]);
 //! 4. run the APIC timer periodically at [`HZ`], take [`PROOF_TICKS`] interrupts while
 //!    polling with interrupt windows (never halting, so a lost interrupt cannot hang the
-//!    check past its two-second deadline), and check the TSC-measured time;
+//!    check past its two-second deadline), and check the TSC-measured time; a run a stall
+//!    made slow is measured again, up to [`PROOF_ATTEMPTS`] runs ([`apic::judge_ticks`]);
 //! 5. mask the timer again: nothing schedules on it yet (M3).
 
 use core::fmt::Write;
@@ -20,9 +21,9 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::acpi;
 use crate::apic::{
-    self, CalibrationWindow, IA32_APIC_BASE, SPURIOUS_VECTOR, TIMER_VECTOR, TimerMode, X2APIC_ID,
-    X2APIC_LVT_TIMER, X2APIC_SVR, X2APIC_TIMER_CURRENT, X2APIC_TIMER_DIVIDE, X2APIC_TIMER_INITIAL,
-    X2APIC_VERSION,
+    self, CalibrationWindow, IA32_APIC_BASE, SPURIOUS_VECTOR, TIMER_VECTOR, TickVerdict, TimerMode,
+    X2APIC_ID, X2APIC_LVT_TIMER, X2APIC_SVR, X2APIC_TIMER_CURRENT, X2APIC_TIMER_DIVIDE,
+    X2APIC_TIMER_INITIAL, X2APIC_VERSION,
 };
 use crate::clock;
 
@@ -35,6 +36,10 @@ use crate::port::{inb, outb};
 pub const HZ: u64 = 100;
 /// Interrupts to take.
 const PROOF_TICKS: u64 = 50;
+/// Runs the periodic proof may make: another only after a run that a stall made slow
+/// ([`apic::TickVerdict::Stalled`]), each against the same bounds. Each run is at most 2 s, so
+/// a boot pays for more only while stalled (TASKS item 66).
+const PROOF_ATTEMPTS: u32 = 4;
 /// Calibration window.
 const CALIBRATION_MICROS: u64 = 10_000;
 /// APIC timer divisor during calibration and afterwards.
@@ -496,40 +501,60 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
         return None;
     };
 
-    let before = cpu::ticks();
-    let start = rdtsc();
-    let limit = tsc_hz.saturating_mul(2); // two seconds
-    lapic.write(
-        ApicWrite::LvtTimer,
-        apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false),
-    );
-    lapic.write(ApicWrite::TimerInitial, u64::from(count));
-    while cpu::ticks() - before < PROOF_TICKS && rdtsc().wrapping_sub(start) < limit {
-        cpu::interrupt_window();
-        core::hint::spin_loop();
-    }
-    let elapsed = rdtsc().wrapping_sub(start);
-    lapic.stop_timer();
-    let taken = cpu::ticks() - before;
-    let micros = elapsed.saturating_mul(1_000_000) / tsc_hz.max(1);
-    let expected = PROOF_TICKS * 1_000_000 / HZ;
     // Never faster than programmed (at least 95 % of the nominal time: a calibration error
     // shows here), and at most 50 % slower (an emulator may coalesce late expiries, but a
     // gross error, such as a wrong divisor, still fails). Physical hardware qualification
-    // will tighten the upper bound (CLAUDE.md §74).
-    let in_range = micros >= expected * 95 / 100 && micros <= expected * 3 / 2;
-    if taken < PROOF_TICKS || !in_range {
-        let _ = writeln!(
+    // will tighten the upper bound (CLAUDE.md §74). A run that a stall made slow, and only
+    // such a run, is measured again against the same bounds (`apic::judge_ticks`).
+    let period = tsc_hz / HZ;
+    let micros = |ticks: u64| ticks.saturating_mul(1_000_000) / tsc_hz.max(1);
+    let expected = PROOF_TICKS * 1_000_000 / HZ;
+    let mut stamps = [0u64; PROOF_TICKS as usize];
+    let mut attempts = 0;
+    let mut stalled_gap = 0;
+    let (run, taken) = loop {
+        attempts += 1;
+        let (start, taken) = take_ticks(&lapic, count, tsc_hz, &mut stamps);
+        let seen = stamps.get(..taken).unwrap_or(&[]);
+        let run = apic::judge_ticks(start, seen, PROOF_TICKS as usize, period);
+        if run.verdict != TickVerdict::Stalled || attempts == PROOF_ATTEMPTS {
+            break (run, taken);
+        }
+        stalled_gap = stalled_gap.max(run.longest_gap);
+    };
+    let repeated = if attempts > 1 {
+        // The repeat is a finding on a machine without a hypervisor (ADR-0013's note of TASKS
+        // item 66): it is always said.
+        Some((attempts, micros(stalled_gap) / 1000))
+    } else {
+        None
+    };
+    if run.verdict != TickVerdict::InBounds {
+        let _ = write!(
             com1,
-            "origin-kernel: {taken} interrupts in {micros} us, expected {PROOF_TICKS} in {expected} us: APIC timer is wrong"
+            "origin-kernel: {taken} interrupts in {} us, expected {PROOF_TICKS} in {expected} us (median gap {} us, longest {} us, run {attempts} of {PROOF_ATTEMPTS}",
+            micros(run.elapsed),
+            micros(run.median_gap),
+            micros(run.longest_gap)
         );
+        if repeated.is_some() {
+            let _ = write!(com1, ", after a stalled run");
+        }
+        let _ = writeln!(com1, "): APIC timer is wrong");
         return None;
     }
-    let _ = writeln!(
+    let _ = write!(
         com1,
-        "origin-kernel: APIC timer: {taken} interrupts at {HZ} Hz in {} ms (initial count {count})",
-        micros / 1000
+        "origin-kernel: APIC timer: {PROOF_TICKS} interrupts at {HZ} Hz in {} ms (initial count {count})",
+        micros(run.elapsed) / 1000
     );
+    if let Some((attempts, gap_ms)) = repeated {
+        let _ = write!(
+            com1,
+            ", run {attempts} of {PROOF_ATTEMPTS} (after a stalled run: a gap of {gap_ms} ms)"
+        );
+    }
+    let _ = writeln!(com1);
     PERIOD.store(count, core::sync::atomic::Ordering::Release);
     // The first measurement stands.
     let _ = CALIBRATED_TSC_HZ.compare_exchange(
@@ -539,6 +564,37 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
         core::sync::atomic::Ordering::Acquire,
     );
     Some(tsc_hz)
+}
+
+/// Runs the APIC timer periodically with `count` and stamps each interrupt with the TSC at the
+/// poll that saw it, until `stamps` is full or two seconds pass, polling with interrupt windows
+/// (never halting, so a lost interrupt cannot hang the check). Returns the TSC at the start and
+/// how many interrupts were stamped. The timer is stopped again.
+fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> (u64, usize) {
+    let before = cpu::ticks();
+    let start = rdtsc();
+    let limit = tsc_hz.saturating_mul(2); // two seconds
+    lapic.write(
+        ApicWrite::LvtTimer,
+        apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false),
+    );
+    lapic.write(ApicWrite::TimerInitial, u64::from(count));
+    let mut seen = 0;
+    while seen < stamps.len() && rdtsc().wrapping_sub(start) < limit {
+        cpu::interrupt_window();
+        let taken = cpu::ticks().wrapping_sub(before);
+        let now = rdtsc();
+        while (seen as u64) < taken {
+            let Some(slot) = stamps.get_mut(seen) else {
+                break;
+            };
+            *slot = now;
+            seen += 1;
+        }
+        core::hint::spin_loop();
+    }
+    lapic.stop_timer();
+    (start, seen)
 }
 
 /// One PIT channel-2 one-shot of `pit` input clocks, with the APIC timer counting down and
