@@ -623,6 +623,19 @@ The verdict's branches are host tests too (`framekernel/src/aml_proof/tests.rs`)
 | W-5 | **New (T70-4):** `stack_in_use`'s retirement skipped only between the exit window and W3. A flag in `cpu.rs`, set and cleared by the clause in `stacks.rs`; two files, both put back | `in use: true (held 97 us); while it ended: in use: true (held 31 us); given back by its processor's reap, not leaked: false (leaked); ...: kernel stacks failed`. Then the proof's own count: `every stack the proof made is given back: Counts { live: 8, idle: 0, retired: 0, lost: 1, pages: 41 }, as before: false`; then `boot refused`. W3 judges the drop |
 | P-1 | As above | `the scheduler returned a frame CPU 0 (APIC ID 0) never saved: stack region +0x11ff00`; no address in the stack window in the log |
 
+**The controls after the addendum to the review of TASKS item 70** (`REVIEW_T70_addendum_2026-11-19.md`, T70-8; 2026-11-19, 10:56 to 10:59 UTC, the same machine and way, at `e6a4b1b4`, in the same turn as the gates on it).
+- **Since the second table:** the boot flow waits for the hold with interrupt windows between polls, for 5 s (`WINDOW_WAIT_SECONDS`); only the held processor's hold stops at 500 ms.
+- **The baseline passed:** `in use: true (held 91 us); while it ended: in use: true (held 31 us); given back by its processor's reap, not leaked: true (kept for reuse); the boot flow waited 6427 and 10954 us for the thread to be ready, then 215 and 46 us for its processor to be held`.
+- **W-6 and W-6b are new (T70-8).** W-6 shows a held processor that reaches the window late still passes; W-6b shows the same lateness failed under the old 500 ms budget, so W-6's stall is long enough to matter.
+- Every file was put back byte for byte, and the tree was clean before and after.
+
+| # | Edit | Result |
+|---|---|---|
+| W-4 | As above | Failed: `in use: its processor never reached the window (held 0 us); while it ended: ... never reached the window (held 0 us); ...; the boot flow waited 6431 and 0 us for the thread to be ready, then 5000059 and 5000004 us for its processor to be held: kernel stacks failed`, then `boot refused`. The 5 s budget ended each wait |
+| W-5 | As above | Failed: `... given back by its processor's reap, not leaked: false (leaked); ...: kernel stacks failed`, then the proof's count, `lost: 1 ... as before: false`, then `boot refused` |
+| W-6 | **New (T70-8):** the held thread spins 800 ms with interrupts on after the boot flow's word, before it switches, in both windows (`stacks.rs`, `windowed`) | **Passed**, as aimed: `in use: true (held 120 us); while it ended: in use: true (held 33 us); ... (kept for reuse); the boot flow waited 6026 and 156 us for the thread to be ready, then 800193 and 800112 us for its processor to be held`; `boot-test` exit 0 |
+| W-6b | **New:** W-6's stall, and the boot flow's wait for the hold given 500 ms (`HOLD_MILLIS`) in place of `WINDOW_WAIT_SECONDS` | Failed: `in use: its processor never reached the window (held 0 us); while it ended: ... never reached the window (held 0 us); ...; then 500064 and 500008 us for its processor to be held: kernel stacks failed`, then `boot refused`. The budget T70-8 removed would have refused this boot |
+
 ## Alternatives
 
 | Alternative | For | Against |

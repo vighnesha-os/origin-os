@@ -5232,3 +5232,20 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
     - `boot-test` 11 of 11;
     - `boot-matrix` passed on its first run (23 kernel boots, 30 window boots, holds at most 154 µs and 46 µs).
 
+
+### TASKS item 70: the answers to the addendum to its review (2026-11-19)
+
+- **What:** the answers to `REVIEW_T70_addendum_2026-11-19.md` (the same AI reviewer: the seven findings closed, two new Low), on the coordinating session's rulings:
+  - `317d13c4`: both reports, copied in as received;
+  - `bb3f9f49`: T70-8, the boot flow's wait for the hold takes interrupts between polls and has 5 s (`WINDOW_WAIT_SECONDS`, which names every interrupts-on wait of the windows); the held processor's hold alone stays capped at 500 ms; ADR-0013's row says which wait is capped and why;
+  - `e6a4b1b4`: T70-9, stale sentences in `contexts.rs`, `loom.rs`, `TASKS.md` and the entry above corrected or marked superseded.
+- **New:** no `unsafe`, no dependency. The polling loop uses the framework's `cpu::interrupt_window`, which the scheduler's waits already use.
+- **Specifications:** ADR-0013 R1(b) (a Refuse proof's waits have budgets of seconds); `tlb.rs`'s one-second shootdown patience, for the cap on the hold.
+- **Review:** the addendum above, by an AI reviewer independent of the author and of the coordinating session; the coordinating session reads these fixes itself. No person has reviewed the code.
+- **Tests:**
+  - **Controls** at `e6a4b1b4` (ADR-0013, "The controls after the addendum to the review of TASKS item 70"): W-4 and W-5 fail as before; W-6, an 800 ms stall of the held thread after the word, passes under the 5 s wait; W-6b, the same stall with the boot flow's budget back at 500 ms, fails.
+  - **Gates on `e6a4b1b4`**, in the same turn (10:59 to 11:26 UTC):
+    - the 14 quick gates;
+    - `check` (2,335 host tests, 0 failed, 29 ignored; Loom 61 models, 89 controls caught);
+    - `boot-test` 11 of 11;
+    - `boot-matrix` passed on its first run (23 kernel boots, 29 window lines, holds at most 104 µs and 38 µs, the boot flow's waits for the hold at most 333 and 276 µs).

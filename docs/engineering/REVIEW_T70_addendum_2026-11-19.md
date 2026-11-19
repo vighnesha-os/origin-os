@@ -108,3 +108,11 @@ None of this changes behaviour.
 - T70-8's stall has not been observed.
 - The merge `50ec0efb` outside the files TASKS 70 owns. In particular, TASKS 61's xtask refactor was read only for the window markers.
 - TASKS 66's coming changes to `sched.rs` (`settle`'s waits), which the keeper must merge with `927e699d`.
+
+## Resolution
+
+Answered on the coordinating session's rulings, one commit each (records: `TASKS.md`, item 70, "Answers to the addendum to the review"):
+- **T70-8: `bb3f9f49`.** The boot flow waits for the hold with interrupt windows between polls, for 5 s (`WINDOW_WAIT_SECONDS`, which names every interrupts-on wait of the windows, for TASKS item 66's R7). Only the held processor's hold stays capped at 500 ms. ADR-0013's row says which wait is capped and why. The boot flow keeps interrupts off only from seeing the hold to answering, so no exception to R1(b) is needed. Controls W-6 (an 800 ms stall passes) and W-6b (the same stall under a 500 ms budget fails) are in ADR-0013.
+- **T70-9: `e6a4b1b4`.** Each sentence named above corrected or marked superseded in place.
+
+Controls W-4, W-5, W-6 and W-6b, then the quick gates, `check`, `boot-test` and `boot-matrix`, passed or failed as aimed in one turn of the machine on `e6a4b1b4` (2026-11-19, 10:56 to 11:26 UTC).
