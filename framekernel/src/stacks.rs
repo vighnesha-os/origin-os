@@ -429,9 +429,9 @@ fn cost(com1: &mut Console, tsc_hz: u64) -> bool {
 /// step another processor takes: the boot flow's for the held thread to be ready, for its
 /// processor to be held, and for its processor's reap, and the thread's for the boot flow's word.
 /// Seconds, since the other processor may first have to be scheduled (ADR-0013 R1(b); the
-/// addendum to the review of TASKS item 70, T70-8). TASKS item 66's R7 gives such waits one
-/// budget, `sched::OTHERS_PATIENCE`, when the two meet.
-const WINDOW_WAIT_SECONDS: u64 = 5;
+/// addendum to the review of TASKS item 70, T70-8): TASKS item 66's R7 budget for a wait on
+/// another processor, `sched::OTHERS_PATIENCE`, set when the two met.
+const WINDOW_WAIT_SECONDS: u64 = crate::sched::OTHERS_PATIENCE;
 /// The most the held processor spins with interrupts off for the boot flow's answer: below the
 /// TLB shootdown's one-second patience (`tlb.rs`, `WAIT_SECONDS`), with margin, so that a
 /// shootdown another processor sends meanwhile is answered in time (the review of TASKS item 70,

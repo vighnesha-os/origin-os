@@ -103,13 +103,23 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
         aps += 1;
     }
     STAGE.store(1, Ordering::Release);
-    crate::sched::yield_until(|| CACHED.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    let _ = crate::sched::wait_for_others(
+        "the TLB proof's threads to cache their pages",
+        || CACHED.load(Ordering::Acquire) == aps,
+        tsc_hz,
+        2000,
+    );
     let single = one.unmap();
     let single_cycles = LAST_CYCLES.load(Ordering::Relaxed);
     let batch = GuardablePage::unmap_all(&mut [&mut two, &mut three]);
     let batch_cycles = LAST_CYCLES.load(Ordering::Relaxed);
     STAGE.store(2, Ordering::Release);
-    crate::sched::yield_until(|| PROBED.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    let _ = crate::sched::wait_for_others(
+        "the TLB proof's threads to probe their pages",
+        || PROBED.load(Ordering::Acquire) == aps,
+        tsc_hz,
+        2000,
+    );
     let (faulted, stale) = (
         FAULTED.load(Ordering::Relaxed),
         STALE.load(Ordering::Relaxed),

@@ -2642,6 +2642,8 @@ fn boot_failures() -> Vec<&'static str> {
         ": TLB failed",
         ": address spaces failed",
         ": wait queues failed",
+        // The timing half of the wait-queue proofs (Wait timing, a Report row; TASKS item 66).
+        ": wait timing failed",
         ": PCIe failed",
         // No BAR on the test machines is refused, and the exhaustive quiesce sees every
         // function before enumeration does.

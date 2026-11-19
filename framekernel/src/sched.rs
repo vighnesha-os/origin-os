@@ -20,7 +20,10 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bootproof::{Proof, Tally};
-use crate::runqueue::{QueueError, RunQueue, per_mille, share_near_weight};
+use crate::runqueue::{
+    PREEMPTION_ROUNDS, QueueError, ReadBack, RunQueue, TickWatch, WINDOW_PAUSE_SECONDS,
+    WINDOW_RUNS_SECONDS, WindowVerdict, judge_window, per_mille, share_near_weight, window_again,
+};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, rdtsc};
@@ -67,7 +70,26 @@ use crate::cpu::without_interrupts;
 /// The timer interrupted the context whose frame is at `interrupted`; returns the frame to
 /// resume. Processors without an active queue keep running what they were running.
 pub(crate) fn on_tick(interrupted: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q| Some(q.tick(interrupted)))
+    with_queue(interrupted, switch, |q| {
+        // The preemption proof's watch (TASKS item 66): the TSC only while it is armed.
+        if q.watching() {
+            q.note_tick(rdtsc(), timer_read_back);
+        }
+        Some(q.tick(interrupted))
+    })
+}
+
+/// This processor's timer, read back and compared with the boot processor's registers as its
+/// timed proof ran them (TASKS item 66, ruling A on the review's T66-R1; the addendum review's
+/// T66-R14). Unread if either cannot be had.
+fn timer_read_back() -> ReadBack {
+    match (timer::programmed(), timer::timed_programming()) {
+        (Some(read), Some(timed)) => match read.first_difference(&timed) {
+            None => ReadBack::AsTimed,
+            Some((register, got, timed)) => ReadBack::Otherwise(register, got, timed),
+        },
+        _ => ReadBack::Unread,
+    }
 }
 
 /// Makes sure CPU `cpu`'s boot/idle context (slot 0) has an FPU area, so the first switch
@@ -203,8 +225,78 @@ pub(crate) fn zombies() -> u64 {
 /// the shootdown that must come first waits for every processor (ADR-0004 Amendment 1, A2).
 pub(crate) fn reap() -> usize {
     let freed = reap_zombies();
-    origin_frame::stack::reclaim();
+    reclaim_stacks();
     freed
+}
+
+/// Reclaims every retired kernel stack (`stack::reclaim`), and says where any was lost to a
+/// stalled shootdown ([`report_lost_stacks`]): every reclaim the scheduler makes goes through
+/// here, `settle`'s own among them.
+fn reclaim_stacks() {
+    let reclaimed = origin_frame::stack::reclaim();
+    if reclaimed.lost > 0 {
+        report_lost_stacks(reclaimed.lost);
+    }
+}
+
+/// Says where kernel stacks were lost to a stalled shootdown, as it happens: which processor
+/// asked, which did not answer within the patience, how long it waited, and how many stalls the
+/// boot has had (TASKS item 66). A report, judged by nothing: the proofs that count the stacks
+/// judge the loss. It names processors and times only, never an address.
+fn report_lost_stacks(lost: u32) {
+    let mut out = here_console();
+    let millis = |ticks: u64| ticks / (crate::time::tsc_hz() / 1000).max(1);
+    // Under the console's 160-byte line (the review's T66-R7). The stall named is the boot's
+    // last: another processor's stall can come between the loss and this line.
+    let _ = match origin_frame::tlb::last_stall() {
+        Some(stall) => writeln!(
+            out,
+            "origin-kernel: stalled shootdown: CPU {} waited {} ms for CPU {} (stall {} of this boot); {lost} kernel stacks withheld, with their frames",
+            stall.asker,
+            millis(stall.waited),
+            stall.target,
+            stall.count
+        ),
+        None => writeln!(
+            out,
+            "origin-kernel: stalled shootdown: {lost} kernel stacks withheld, with their frames"
+        ),
+    };
+}
+
+/// A console for a line printed where the caller may be: the boot flow, which runs with
+/// interrupts off and may wait for the UART, gets its own kind, so that the line is not dropped
+/// (the review's T66-R7); anywhere else, the ordinary one.
+fn here_console() -> Console {
+    if !cpu::interrupts_enabled() && current_thread().is_none() && cpu::this_cpu().get() == 0 {
+        Console::boot_flow()
+    } else {
+        Console::new()
+    }
+}
+
+/// Waits, as [`yield_until`], up to [`OTHERS_PATIENCE`] seconds for what only a thread on another
+/// processor can do, and returns whether `done()` holds. A wait longer than `before_ms`, the
+/// bound it had before TASKS item 66, is said on a line of its own naming `what`, so that a
+/// reader of a machine without a hypervisor sees every extension (the review's T66-R3).
+pub(crate) fn wait_for_others(
+    what: &str,
+    done: impl Fn() -> bool,
+    tsc_hz: u64,
+    before_ms: u64,
+) -> bool {
+    let start = rdtsc();
+    yield_until(&done, tsc_hz, OTHERS_PATIENCE);
+    let waited_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
+    let held = done();
+    if waited_ms > before_ms {
+        let _ = writeln!(
+            here_console(),
+            "origin-kernel: waited {waited_ms} ms for {what}, past the former {before_ms} ms{}",
+            if held { "" } else { ", in vain" }
+        );
+    }
+    held
 }
 
 pub(crate) use crate::settled::{Unsettled, not_settled};
@@ -216,16 +308,21 @@ pub(crate) use crate::settled::{Unsettled, not_settled};
 /// schedule: on the 65-processor machine the stacks that earlier proofs' threads left were still
 /// being reclaimed, one shootdown at a time, when the IPC proof took its first count, so the
 /// count rose during the proof; and a cache of kept stacks that refills during a proof lowers it.
-/// Settled at both reads, the counts change only with what the proof does. Waits up to 2 s for
-/// each part; `Err` names what was still pending, and any stack lost to a stalled shootdown while
-/// it ran (`settled`: safe by design, 4 frames each).
+/// Settled at both reads, the counts change only with what the proof does. Waits up to
+/// [`OTHERS_PATIENCE`] seconds for each part; `Err` names what was still pending, and any
+/// stack lost to a stalled shootdown while it ran (`settled`: safe by design, 4 frames each).
 pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
     let lost_before = origin_frame::stack::counts().lost;
     reap();
-    yield_until(|| zombies() == 0, tsc_hz, 2);
+    wait_for_others("exited threads' reaping", || zombies() == 0, tsc_hz, 2000);
     origin_frame::stack::trim();
-    origin_frame::stack::reclaim();
-    yield_until(|| origin_frame::stack::counts().retired == 0, tsc_hz, 2);
+    reclaim_stacks();
+    wait_for_others(
+        "retired stacks' reclaim",
+        || origin_frame::stack::counts().retired == 0,
+        tsc_hz,
+        2000,
+    );
     let counts = origin_frame::stack::counts();
     crate::settled::judge(zombies(), counts.retired, lost_before, counts.lost)
 }
@@ -279,6 +376,11 @@ fn with_queue(
             let mut q = queue.lock();
             let old = q.current();
             let next = f(&mut q).unwrap_or(interrupted);
+            // The preemption proof's rounds clause stamps its 15th switch after the step that
+            // made it (TASKS item 66, the addendum review's T66-R15).
+            if q.watching() {
+                q.note_switches(rdtsc());
+            }
             let new = q.current();
             if new != old {
                 switch_fpu(id, old, new);
@@ -441,7 +543,7 @@ pub(crate) fn current_user() -> Option<ObjectRef<UserContext>> {
 }
 
 /// This CPU's tick count, as its run queue sees it.
-fn queue_ticks() -> u64 {
+pub(crate) fn queue_ticks() -> u64 {
     queue_ticks_of(this_cpu())
 }
 
@@ -606,20 +708,31 @@ fn worker_entry(table: &PerCpu<[AtomicU64; 2]>, slot: usize) -> Option<&AtomicU6
 }
 /// Tells the workers to stop counting.
 static STOP: AtomicBool = AtomicBool::new(false);
-/// Workers that have stopped and exited.
-static EXITED: AtomicU64 = AtomicU64::new(0);
+/// The preemption proof's run, from 1. Each worker carries its run in the upper half of its
+/// argument, so that a worker of an earlier run counts nothing for a later one (TASKS item 66,
+/// the addendum review's T66-R11).
+static RUN: AtomicU64 = AtomicU64::new(1);
+/// The run in the upper half, and in the lower half its workers that have stopped and exited.
+static EXITED: AtomicU64 = AtomicU64::new(1 << 32);
+
+/// A worker's argument: its run and its slot.
+const fn worker_arg(run: u64, slot: usize) -> u64 {
+    (run << 32) | slot as u64
+}
 
 /// A worker that never yields: until [`STOP`] it adds up the time it sees itself run, so it
 /// only ever gives up its processor when the timer preempts it.
-extern "sysv64" fn worker(slot: u64) -> ! {
-    let slot = slot as usize;
+extern "sysv64" fn worker(arg: u64) -> ! {
+    let (run, slot) = (arg >> 32, (arg & 0xFFFF_FFFF) as usize);
     let limit = RUNNING_STEP.load(Ordering::Relaxed);
     let mut last = rdtsc();
     while !STOP.load(Ordering::Relaxed) {
         let now = rdtsc();
         let step = now.wrapping_sub(last);
         last = now;
-        if let (Some(p), Some(r)) = (worker_entry(&PROGRESS, slot), worker_entry(&RAN_ON, slot)) {
+        if let (Some(p), Some(r)) = (worker_entry(&PROGRESS, slot), worker_entry(&RAN_ON, slot))
+            && RUN.load(Ordering::Relaxed) == run
+        {
             if step < limit {
                 p.fetch_add(step, Ordering::Relaxed);
             }
@@ -627,7 +740,10 @@ extern "sysv64" fn worker(slot: u64) -> ! {
         }
         core::hint::spin_loop();
     }
-    EXITED.fetch_add(1, Ordering::Relaxed);
+    // Counted only for its own run.
+    let _ = EXITED.try_update(Ordering::AcqRel, Ordering::Acquire, |exited| {
+        (exited >> 32 == run).then_some(exited + 1)
+    });
     exit()
 }
 
@@ -702,6 +818,15 @@ extern "sysv64" fn quitter(_: u64) -> ! {
     exit()
 }
 
+/// How long, in seconds, a Refuse proof waits for what only a thread on another processor can
+/// do: a prober running, an exited thread reaped, a retired stack reclaimed. The clock proofs'
+/// turn-takers starting and finishing wait as long. A budget, not a bound (ADR-0013 R1(b)):
+/// each wait ends as soon as its condition holds, which on a real machine is within
+/// microseconds, and its verdict does not change. Under QEMU's software processor a
+/// 65-processor machine with a little outside load left one processor's prober unrun past
+/// the 2 s this was before TASKS item 66, and in another boot its turn-takers.
+pub(crate) const OTHERS_PATIENCE: u64 = 10;
+
 /// Yields until `done()` or `seconds` pass.
 ///
 /// The boot flow runs with interrupts disabled, so yielding alone would never let a timer
@@ -719,11 +844,18 @@ pub(crate) fn yield_until(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) {
 /// tell which. So the result is only a hint: it may earn a repeat of a measurement, never
 /// a more lenient verdict.
 pub(crate) fn yield_until_away(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) -> u64 {
+    yield_until_away_for(done, tsc_hz, tsc_hz.saturating_mul(seconds))
+}
+
+/// As [`yield_until_away`], for at most `duration` TSC ticks: a step of the loop counts as away
+/// from [`RUNNING_STEP_MICROS`] of the real rate `tsc_hz`, whatever the duration (the review's
+/// T66-R2: a short wait passed as a rate of its own made 60 µs count as away).
+pub(crate) fn yield_until_away_for(done: impl Fn() -> bool, tsc_hz: u64, duration: u64) -> u64 {
     let limit = (tsc_hz / 1_000_000).max(1) * RUNNING_STEP_MICROS;
     let start = rdtsc();
     let mut last = start;
     let mut away = 0;
-    while !done() && rdtsc().wrapping_sub(start) < tsc_hz.saturating_mul(seconds) {
+    while !done() && rdtsc().wrapping_sub(start) < duration {
         yield_now();
         cpu::interrupt_window();
         reap();
@@ -1072,13 +1204,261 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     ok
 }
 
+/// The preemption window, in each processor's own timer ticks: what 500 ms holds at 100 Hz.
+const WINDOW_TICKS: u64 = 50;
+/// How long the preemption window may last, in seconds, while some processor has not yet
+/// taken its [`WINDOW_TICKS`]: a budget, not a bound (ADR-0013 R1(b)). On a real machine the
+/// ticks take 500 ms. Under QEMU's software processor a virtual processor the host leaves
+/// unscheduled misses ticks (QEMU merges a periodic timer's expiries it was away for), and on
+/// the 65-processor machine a 500 ms window of the host's time held only 12 to 14 switches on
+/// one processor (TASKS item 66).
+const WINDOW_BUDGET_SECONDS: u64 = 10;
+
+/// One run of the preemption proof's window, as the boot flow measured it.
+struct WindowRun {
+    /// How long the window lasted.
+    elapsed_ms: u64,
+    /// Each processor's ticks over the window, and its context switches, in the proof's order.
+    watches: alloc::vec::Vec<TickWatch>,
+    switches: alloc::vec::Vec<u64>,
+    /// Whether every worker exited after the window.
+    exited: bool,
+}
+
+/// One run of the window: every processor's ticks watched from now, until each has taken
+/// [`WINDOW_TICKS`] or [`WINDOW_BUDGET_SECONDS`] pass; then the workers are told to stop and
+/// waited for.
+fn run_window(cpus: &[CpuIndex], tsc_hz: u64, workers: u64, run: u64) -> WindowRun {
+    let period = tsc_hz / timer::HZ;
+    let start = rdtsc();
+    let switches_before: alloc::vec::Vec<u64> = cpus
+        .iter()
+        .map(|id| {
+            QUEUES.get(id.get()).map_or(0, |q| {
+                without_interrupts(|| {
+                    let mut q = q.lock();
+                    q.arm_watch(start, period);
+                    q.switches()
+                })
+            })
+        })
+        .collect();
+    let watch_of = |id: &CpuIndex| {
+        QUEUES
+            .get(id.get())
+            .map(|q| without_interrupts(|| q.lock().watch()))
+    };
+    // A processor whose timer reads back otherwise than timed ends the window at once: no wait
+    // can change that verdict.
+    let settled = || {
+        cpus.iter()
+            .all(|id| watch_of(id).is_none_or(|w| w.ticks >= WINDOW_TICKS))
+            || cpus.iter().any(|id| {
+                watch_of(id).is_some_and(|w| matches!(w.read_back, ReadBack::Otherwise(..)))
+            })
+    };
+    let budget = tsc_hz.saturating_mul(WINDOW_BUDGET_SECONDS);
+    while !settled() && rdtsc().wrapping_sub(start) < budget {
+        // Interrupts on only while halted: the timer may switch to a worker here, and this
+        // flow resumes after `hlt` when its turn comes round again.
+        cpu::idle_disabling();
+    }
+    let elapsed_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
+    let (watches, switches) = cpus
+        .iter()
+        .zip(&switches_before)
+        .map(|(id, &before)| {
+            QUEUES.get(id.get()).map_or((TickWatch::new(), 0), |q| {
+                without_interrupts(|| {
+                    let mut q = q.lock();
+                    q.disarm_watch();
+                    (q.watch(), q.switches().wrapping_sub(before))
+                })
+            })
+        })
+        .unzip();
+    drop(switches_before);
+    STOP.store(true, Ordering::Relaxed);
+    // Every worker now exits; the boot flow yields so the boot processor's workers run.
+    let exited = wait_for_others(
+        "the preemption workers' exit",
+        || EXITED.load(Ordering::Acquire) == (run << 32) | workers,
+        tsc_hz,
+        2000,
+    );
+    WindowRun {
+        elapsed_ms,
+        watches,
+        switches,
+        exited,
+    }
+}
+
+/// Starts run `run`'s workers, two on every processor, with their counts from zero; the CPU
+/// that refused one, if any. Only after every worker of the run before has exited (its
+/// [`WindowRun::exited`]), so that nothing of it is left to run (the addendum review's T66-R11).
+fn respawn_workers(cpus: &[CpuIndex], run: u64) -> Result<(), CpuIndex> {
+    RUN.store(run, Ordering::Relaxed);
+    EXITED.store(run << 32, Ordering::Release);
+    for slot in 0..2 * cpus.len() {
+        for table in [&PROGRESS, &RAN_ON] {
+            if let Some(entry) = worker_entry(table, slot) {
+                entry.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+    STOP.store(false, Ordering::Release);
+    for (i, &id) in cpus.iter().enumerate() {
+        for k in 0..2 {
+            spawn(id, worker, worker_arg(run, 2 * i + k)).map_err(|_| id)?;
+        }
+    }
+    Ok(())
+}
+
+/// What processor `id`'s two workers, `2 * i` and `2 * i + 1`, did in the last run: their
+/// counts, and whether both last ran on `id`.
+fn workers_on(i: usize, id: CpuIndex) -> (u64, u64, bool) {
+    let (a, b) = (2 * i, 2 * i + 1);
+    let count = |w: usize| worker_entry(&PROGRESS, w).map_or(0, |p| p.load(Ordering::Relaxed));
+    let place = |w: usize| worker_entry(&RAN_ON, w).map_or(0, |r| r.load(Ordering::Relaxed));
+    let here = id.get() as u64 + 1;
+    (count(a), count(b), place(a) == here && place(b) == here)
+}
+
+/// The run's correctness clauses, judged on every run (the contract's invariant (3); the
+/// addendum review's T66-R11): every worker exited, and on every processor both workers ran,
+/// and ran there.
+fn run_correct(run: &WindowRun, cpus: &[CpuIndex]) -> bool {
+    run.exited
+        && cpus.iter().enumerate().all(|(i, &id)| {
+            let (a, b, right_cpu) = workers_on(i, id);
+            right_cpu && a.min(b) > 0
+        })
+}
+
+/// The run's verdict from its processors' ticks: the first that fails ([`WindowVerdict::Short`],
+/// [`WindowVerdict::WrongRate`] or [`WindowVerdict::Late`]) decides, else the first stalled
+/// one, else every processor is in bounds. With the processor and its watch, for the line.
+fn judge_run(
+    run: &WindowRun,
+    cpus: &[CpuIndex],
+    tsc_hz: u64,
+) -> (WindowVerdict, Option<(CpuIndex, TickWatch)>) {
+    // Today's bound: the rounds clause's 15 rounds within 500 ms. Every processor's timer must
+    // read back as the boot processor's timed proof ran it (`timer_read_back`).
+    let bound = tsc_hz / 2;
+    let judged = || {
+        cpus.iter()
+            .zip(&run.watches)
+            .map(|(&id, w)| (id, *w, judge_window(w, WINDOW_TICKS, bound)))
+    };
+    // A timer programmed otherwise is named first: it ends the window at once, which leaves
+    // other processors short of their ticks for no fault of theirs.
+    for wanted in [
+        WindowVerdict::WrongRate,
+        WindowVerdict::Short,
+        WindowVerdict::Late,
+    ] {
+        if let Some((id, w, v)) = judged().find(|&(_, _, v)| v == wanted) {
+            return (v, Some((id, w)));
+        }
+    }
+    if let Some((id, w, v)) = judged().find(|&(_, _, v)| v == WindowVerdict::Stalled) {
+        return (v, Some((id, w)));
+    }
+    (WindowVerdict::InBounds, None)
+}
+
+/// The run's line: how long the window lasted, which run it was, and what its processors' ticks
+/// showed. A stalled run says so, as on a machine without a hypervisor it is a finding (ADR-0013's
+/// note of TASKS item 66); a failing one ends `scheduler failed`, on this line and not on a
+/// processor's own, whose wording `xtask`'s fair-share allowances read.
+fn say_window(
+    com1: &mut Console,
+    run: &WindowRun,
+    verdict: (WindowVerdict, Option<(CpuIndex, TickWatch)>),
+    attempt: u32,
+    correct: bool,
+    again: bool,
+    spent_seconds: u64,
+) {
+    let ms = |w: &TickWatch, ticks: u64| ticks / (w.period.saturating_mul(timer::HZ) / 1000).max(1);
+    let _ = write!(
+        com1,
+        "origin-kernel: scheduler: window of {} ms, run {attempt}, {spent_seconds} s of {WINDOW_RUNS_SECONDS} spent: ",
+        run.elapsed_ms
+    );
+    let _ = match verdict {
+        (WindowVerdict::InBounds, _) => write!(
+            com1,
+            "every timer as timed, every 15th switch within 500 ms{}",
+            if attempt > 1 {
+                " (after a stalled run)"
+            } else {
+                ""
+            }
+        ),
+        (v, Some((id, w))) => {
+            let what = match v {
+                // A run whose correctness clauses failed is never run again.
+                WindowVerdict::Stalled if !correct => "stalled, not run again: scheduler failed",
+                WindowVerdict::Stalled if again => "stalled, run again",
+                WindowVerdict::Stalled => {
+                    "stalled in every run, its budget spent: scheduler failed"
+                }
+                _ => ": scheduler failed",
+            };
+            match v {
+                WindowVerdict::Short => write!(
+                    com1,
+                    "CPU {id} took {} of {WINDOW_TICKS} ticks in the window{what}",
+                    w.ticks
+                ),
+                WindowVerdict::WrongRate => match w.read_back {
+                    ReadBack::Otherwise(register, got, want) => write!(
+                        com1,
+                        "CPU {id}'s timer {register} is {got:#x}, not {want:#x} as timed{what}"
+                    ),
+                    _ => write!(com1, "CPU {id}'s timer could not be read back{what}"),
+                },
+                _ if w.at_switches == 0 => write!(
+                    com1,
+                    "CPU {id} switched fewer than {PREEMPTION_ROUNDS} times in the window{what}"
+                ),
+                _ => write!(
+                    com1,
+                    "CPU {id}'s 15th switch at {} ms, longest gap {} ms{}{}",
+                    ms(&w, w.at_switches.saturating_sub(w.start)),
+                    ms(&w, w.longest),
+                    if v == WindowVerdict::Stalled {
+                        ": "
+                    } else {
+                        ""
+                    },
+                    what
+                ),
+            }
+        }
+        (_, None) => Ok(()),
+    };
+    let _ = writeln!(com1);
+}
+
 /// Proves preemptive multitasking on every online processor: two non-yielding workers per
-/// processor run for 500 ms while the boot flow (itself one of the boot processor's
-/// contexts) waits. On each processor, both workers must have run there, with shares
-/// within a factor of two, over at least five full rounds of context switches. Then the
-/// rest of the thread proofs; each result goes into `proofs`, and `kernel_main` decides
-/// what they mean (ADR-0013). Fairness counts loop iterations, which a processor sharing a
-/// physical core skews with nothing wrong, so it is a separate result from preemption.
+/// processor run while the boot flow (itself one of the boot processor's contexts) waits,
+/// until every processor has taken [`WINDOW_TICKS`] of its own timer ticks (500 ms on a real
+/// machine), within [`WINDOW_BUDGET_SECONDS`]. On each processor, both workers must have run
+/// there, with shares within a factor of two, over at least five full rounds of context
+/// switches; its timer, read back at its first tick, must be programmed as the boot
+/// processor's timed proof ran it (TASKS item 66, the review's T66-R1), and its 15th context
+/// switch must come within 500 ms on the TSC, today's bound (the addendum review's T66-R15). A
+/// run whose 15th switch came late with a gap of two periods or more between its ticks is
+/// measured again after a pause, within [`WINDOW_RUNS_SECONDS`] of wall time and at most
+/// `WINDOW_RUNS_MOST` runs ([`window_again`]). Then the rest of the thread proofs; each result goes into
+/// `proofs`, and `kernel_main` decides what they mean (ADR-0013). Fairness counts loop
+/// iterations, which a processor sharing a physical core skews with nothing wrong, so it is a
+/// separate result from preemption.
 pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: &mut Tally) {
     // Give every online processor's boot/idle context an FPU area before the baseline is
     // measured, so the first switch on it can save its state and the leak check is fair.
@@ -1096,7 +1476,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     );
     for (i, &id) in cpus.iter().enumerate() {
         for k in 0..2 {
-            if spawn(id, worker, (2 * i + k) as u64).is_err() {
+            if spawn(id, worker, worker_arg(1, 2 * i + k)).is_err() {
                 let _ = writeln!(
                     com1,
                     "origin-kernel: cannot spawn on CPU {id}: scheduler failed"
@@ -1164,33 +1544,55 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         }
     }
     let workers = 2 * cpus.len();
-    let start = rdtsc();
-    // A fixed window: 500 ms at 100 Hz is 50 ticks per processor, so each of its three
-    // contexts (the boot or idle flow and two workers) is preempted and resumed many times.
-    let window = tsc_hz / 2;
-    while rdtsc().wrapping_sub(start) < window {
-        // Interrupts on only while halted: the timer may switch to a worker here, and this
-        // flow resumes after `hlt` when its turn comes round again.
-        cpu::idle_disabling();
-    }
-    let elapsed_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
-    let switches_at_stop: alloc::vec::Vec<u64> = cpus
-        .iter()
-        .map(|id| {
-            QUEUES
-                .get(id.get())
-                .map_or(0, |q| without_interrupts(|| q.lock().switches()))
-        })
-        .collect();
-    STOP.store(true, Ordering::Relaxed);
-    // Every worker now exits; the boot flow yields so the boot processor's workers run.
-    yield_until(
-        || EXITED.load(Ordering::Relaxed) == workers as u64,
-        tsc_hz,
-        2,
-    );
-    let mut ok = EXITED.load(Ordering::Relaxed) == workers as u64;
-    if !ok {
+    // Runs of the window, each against the same verdict: another only after a run whose
+    // processors' own ticks show a stall before today's bound (TASKS item 66, T66-R1).
+    let budget_start = rdtsc();
+    let mut attempts = 0;
+    let (run, verdict) = loop {
+        attempts += 1;
+        if attempts > 1
+            && let Err(id) = respawn_workers(cpus, u64::from(attempts))
+        {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: cannot spawn on CPU {id}: scheduler failed"
+            );
+            proofs.record(Proof::Preemption, false);
+            return;
+        }
+        let run = run_window(cpus, tsc_hz, workers as u64, u64::from(attempts));
+        let verdict = judge_run(&run, cpus, tsc_hz);
+        // Every run is judged on correctness first: a failure there fails at once and is
+        // never repeated, and a repeat starts only once every worker of this run has exited
+        // (the addendum review's T66-R11).
+        let correct = run_correct(&run, cpus);
+        // Within a budget of time, not a count: stalls come in episodes of seconds (the
+        // coordinating session's ruling of 2026-11-20).
+        let elapsed = rdtsc().wrapping_sub(budget_start);
+        let again = window_again(verdict.0, correct, attempts, elapsed, tsc_hz);
+        say_window(
+            com1,
+            &run,
+            verdict,
+            attempts,
+            correct,
+            again,
+            elapsed / tsc_hz.max(1),
+        );
+        if !again {
+            break (run, verdict.0);
+        }
+        // Every worker of the run has exited: a pause with every processor idle, so that an
+        // episode of the host's stalls can pass before the next run.
+        let pause = WINDOW_PAUSE_SECONDS.saturating_mul(tsc_hz);
+        let paused = rdtsc();
+        while rdtsc().wrapping_sub(paused) < pause {
+            cpu::idle_disabling();
+        }
+    };
+    let elapsed_ms = run.elapsed_ms;
+    let mut ok = run.exited && verdict == WindowVerdict::InBounds;
+    if !run.exited {
         let _ = writeln!(
             com1,
             "origin-kernel: workers did not exit: scheduler failed"
@@ -1198,16 +1600,15 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     }
     let mut fair_everywhere = true;
     for (i, &id) in cpus.iter().enumerate() {
-        let switches = switches_at_stop.get(i).copied().unwrap_or(0);
+        let switches = run.switches.get(i).copied().unwrap_or(0);
         let (a, b) = (2 * i, 2 * i + 1);
-        let count = |w: usize| worker_entry(&PROGRESS, w).map_or(0, |p| p.load(Ordering::Relaxed));
-        let place = |w: usize| worker_entry(&RAN_ON, w).map_or(0, |r| r.load(Ordering::Relaxed));
-        let right_cpu = place(a) == id.get() as u64 + 1 && place(b) == id.get() as u64 + 1;
+        let (count_a, count_b, right_cpu) = workers_on(i, id);
+        let count = |w: usize| if w == a { count_a } else { count_b };
         // Both workers ran, with comparable shares (within a factor of two).
-        let (lo, hi) = (count(a).min(count(b)), count(a).max(count(b)));
+        let (lo, hi) = (count_a.min(count_b), count_a.max(count_b));
         let fair = lo > 0 && lo * 2 >= hi;
         // At least five full rounds of the three contexts.
-        let rounds = switches >= 15;
+        let rounds = switches >= PREEMPTION_ROUNDS;
         let passed = right_cpu && fair && rounds;
         ok &= right_cpu && lo > 0 && rounds;
         fair_everywhere &= fair;
@@ -1221,7 +1622,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     }
     // Given back now: the reaping proof below finds the heap where it was before the first
     // spawn.
-    drop(switches_at_stop);
+    drop(run);
     if ok && fair_everywhere {
         let _ = writeln!(
             com1,
