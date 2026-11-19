@@ -212,15 +212,15 @@ fn report_lost_stacks(lost: u32) {
     let _ = match origin_frame::tlb::last_stall() {
         Some(stall) => writeln!(
             out,
-            "origin-kernel: TLB: a shootdown from CPU {} waited {} ms for CPU {}, which did not answer (stall {} of this boot); {lost} kernel stacks withheld for good, with their frames",
+            "origin-kernel: stalled shootdown: CPU {} asked, and CPU {} did not answer within {} ms (stall {} of this boot); {lost} kernel stacks withheld for good, with their frames",
             stall.asker,
-            millis(stall.waited),
             stall.target,
+            millis(stall.waited),
             stall.count
         ),
         None => writeln!(
             out,
-            "origin-kernel: TLB: {lost} kernel stacks withheld for good, with their frames, after a stalled shootdown"
+            "origin-kernel: stalled shootdown: {lost} kernel stacks withheld for good, with their frames"
         ),
     };
 }
