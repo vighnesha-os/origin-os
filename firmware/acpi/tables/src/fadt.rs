@@ -514,14 +514,33 @@ impl<'a> Fadt<'a> {
             .filter(|_| self.usable(Field::Block(block)))
     }
 
+    /// `block`'s 32-bit field as a system I/O port, for an operating system that cannot use the
+    /// block's `X_` form: §5.2.9 has the 64-bit field preferred when it is non-zero *and* the OS can
+    /// use it, and the 32-bit field used otherwise. `None` as [`Fadt::block`] gives it (a
+    /// hardware-reduced platform, a block that breaks a rule), or when the 32-bit field is zero
+    /// (TASKS item 71: the kernel reads a PM timer through a port only).
+    #[must_use]
+    pub fn port_block(&self, block: Block) -> Option<Register> {
+        if self.flags.hw_reduced_acpi() || !self.usable(Field::Block(block)) {
+            return None;
+        }
+        self.port_form(block)
+    }
+
     /// Where `block` is and how long, judged or not.
     fn locate(&self, block: Block) -> Option<Register> {
-        let b = self.table.reader();
-        let (legacy, _, _) = block.fields();
-        let length = b.u8(block.length_at()).ok()?;
+        let length = self.table.reader().u8(block.length_at()).ok()?;
         if let Some(gas) = self.x_block(block).filter(|g| !g.is_null()) {
             return Some(Register { gas, length });
         }
+        self.port_form(block)
+    }
+
+    /// `block`'s 32-bit field as a system I/O port, judged or not; `None` if it is zero.
+    fn port_form(&self, block: Block) -> Option<Register> {
+        let b = self.table.reader();
+        let (legacy, _, _) = block.fields();
+        let length = b.u8(block.length_at()).ok()?;
         let port = b.u32(legacy).ok().filter(|&p| p != 0)?;
         Some(Register {
             gas: Gas {
@@ -971,5 +990,43 @@ pub(crate) mod tests {
         assert_eq!(f.preferred_pm_profile, PmProfile::Reserved(200));
         assert_eq!(f.flags.persistent_cpu_caches(), PersistentCaches::Reserved);
         assert!(f.iapc_boot_arch.i8042());
+    }
+
+    /// TASKS item 71: a block's 32-bit port form, for an OS that cannot use its `X_` form.
+    #[test]
+    fn the_port_form_stands_when_the_x_form_cannot_be_used() {
+        // QEMU's shape: both forms name port 0x608.
+        let t = fadt();
+        let f = Fadt::parse(&t).unwrap();
+        let port = |r: Option<Register>| r.map(|r| (r.gas.space, r.gas.address, r.length));
+        assert_eq!(
+            port(f.block(Block::PmTimer)),
+            Some((AddressSpace::SystemIo, 0x608, 4))
+        );
+        assert_eq!(
+            port(f.port_block(Block::PmTimer)),
+            port(f.block(Block::PmTimer))
+        );
+        // The X_ form in system memory: `block` names it, `port_block` the 32-bit port.
+        let t = edited(|t| put(t, 208, &gas(0, 32, 0, 3, 0xFED0_0000)));
+        let f = Fadt::parse(&t).unwrap();
+        assert_eq!(
+            port(f.block(Block::PmTimer)),
+            Some((AddressSpace::SystemMemory, 0xFED0_0000, 4))
+        );
+        assert_eq!(
+            port(f.port_block(Block::PmTimer)),
+            Some((AddressSpace::SystemIo, 0x608, 4))
+        );
+        // No 32-bit field, a block that breaks its rule, or a hardware-reduced platform: none.
+        let t = edited(|t| {
+            put(t, 208, &gas(0, 32, 0, 3, 0xFED0_0000));
+            put(t, 76, &[0; 4]);
+        });
+        assert_eq!(Fadt::parse(&t).unwrap().port_block(Block::PmTimer), None);
+        let t = edited(|t| t[91] = 3);
+        assert_eq!(Fadt::parse(&t).unwrap().port_block(Block::PmTimer), None);
+        let t = edited(|t| put(t, 112, &(1u32 << 20).to_le_bytes()));
+        assert_eq!(Fadt::parse(&t).unwrap().port_block(Block::PmTimer), None);
     }
 }

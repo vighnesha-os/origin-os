@@ -19,6 +19,8 @@
 #![forbid(unsafe_code)]
 
 use origin_acpi_tables::ErrorKind;
+use origin_acpi_tables::fadt::{Block, Register};
+use origin_acpi_tables::gas::AddressSpace;
 use origin_acpi_tables::madt::{Entry, Madt, Polarity, Trigger, override_redirect};
 use origin_acpi_tables::srat::{Affinity, Srat};
 
@@ -66,6 +68,9 @@ pub enum AcpiError {
     SratEntry(usize),
     /// More affinity structures than the caller has room for.
     TooManyEntries,
+    /// A field the table cannot be used without breaks its rule, at this offset: a FADT that
+    /// names no DSDT (TASKS item 71, ruling 1a).
+    Field(usize),
 }
 
 fn u32_at(b: &[u8], at: usize) -> Option<u32> {
@@ -265,7 +270,8 @@ pub fn find_table<'t>(
 pub struct Fadt {
     /// The CMOS index of the RTC's century register, if the firmware names a usable one
     /// (`CENTURY`, offset 108; 0 means none). Indexes 00h–0Dh are the clock's own
-    /// registers and 80h and above are outside the standard bank, so neither is accepted.
+    /// registers and 80h and above are outside the standard bank, so neither is accepted. None
+    /// on a hardware-reduced platform, whose OS §5.2.9 has ignore offset 108 (TASKS item 71).
     pub century: Option<u8>,
     /// `IAPC_BOOT_ARCH` (offset 109) bit 5: the platform has no CMOS RTC.
     pub cmos_rtc_absent: bool,
@@ -273,54 +279,57 @@ pub struct Fadt {
     /// (`IAPC_BOOT_ARCH` bit 1), or `None` if the table predates that flag (FADT revision 1,
     /// ACPI 1.0, where the byte is reserved).
     pub i8042: Option<bool>,
-    /// The ACPI power-management timer's I/O port (`PM_TMR_BLK`, offset 76), if the
-    /// firmware provides one (nonzero and `PM_TMR_LEN` is 4).
+    /// The ACPI power-management timer's I/O port, if the firmware provides one this kernel can
+    /// read, as §5.2.9 says to choose it (TASKS item 71): `X_PM_TMR_BLK` when it is non-zero and a
+    /// system I/O port; else `PM_TMR_BLK`, the 32-bit field. Either only with `PM_TMR_LEN` 4 and
+    /// not on a hardware-reduced platform.
     pub pm_timer_port: Option<u16>,
-    /// Whether the PM timer is 32-bit (`FADT.flags` bit 8, `TMR_VAL_EXT`); else 24-bit.
+    /// Whether the PM timer is 32-bit (`FADT.flags` bit 8, `TMR_VAL_EXT`); else 24-bit. False on
+    /// a hardware-reduced platform, whose OS ignores the bit.
     pub pm_timer_32bit: bool,
 }
 
-/// Offset of the FADT's `CENTURY` byte.
+/// Offsets in a FADT, for the tests' fixtures.
+#[cfg(test)]
 const FADT_CENTURY: usize = 108;
-/// Offset of the FADT's 16-bit `IAPC_BOOT_ARCH` flags.
+#[cfg(test)]
 const FADT_IAPC_BOOT_ARCH: usize = 109;
-/// `IAPC_BOOT_ARCH` bit 1: the platform has an 8042 or equivalent (ACPI 2.0 and later).
-const HAS_8042: u16 = 1 << 1;
-/// Offset of the FADT's revision in its table header.
+#[cfg(test)]
 const FADT_REVISION: usize = 8;
-/// Offset of `PM_TMR_BLK` (the PM timer's 32-bit I/O port address).
+#[cfg(test)]
 const FADT_PM_TMR_BLK: usize = 76;
-/// Offset of `PM_TMR_LEN`.
+#[cfg(test)]
 const FADT_PM_TMR_LEN: usize = 91;
-/// Offset of the `FADT.flags` dword; bit 8 is `TMR_VAL_EXT` (a 32-bit PM timer).
+#[cfg(test)]
 const FADT_FLAGS: usize = 112;
-/// `IAPC_BOOT_ARCH` bit 5: CMOS RTC not present.
-const CMOS_RTC_NOT_PRESENT: u16 = 1 << 5;
 
-/// Reads the fields of a checked FADT that the kernel uses. A table too short to hold
-/// them (an ACPI 1.0 FADT has them; anything shorter is malformed) is refused.
-pub fn parse_fadt(fadt: &[u8]) -> Result<Fadt, AcpiError> {
-    let short = || AcpiError::Length(u32::try_from(fadt.len()).unwrap_or(u32::MAX));
-    let century = *fadt.get(FADT_CENTURY).ok_or_else(short)?;
-    let arch = fadt
-        .get(FADT_IAPC_BOOT_ARCH..FADT_IAPC_BOOT_ARCH + 2)
-        .ok_or_else(short)?;
-    let arch = u16::from_le_bytes([
-        arch.first().copied().unwrap_or(0),
-        arch.get(1).copied().unwrap_or(0),
-    ]);
-    let pm_tmr_blk = u32_at(fadt, FADT_PM_TMR_BLK).ok_or_else(short)?;
-    let pm_tmr_len = *fadt.get(FADT_PM_TMR_LEN).ok_or_else(short)?;
-    let flags = u32_at(fadt, FADT_FLAGS).ok_or_else(short)?;
-    let revision = *fadt.get(FADT_REVISION).ok_or_else(short)?;
-    let pm_timer_port =
-        (pm_tmr_len == 4 && pm_tmr_blk != 0 && pm_tmr_blk <= 0xFFFF).then_some(pm_tmr_blk as u16);
+/// Reads the fields of a checked FADT that the kernel uses, through `origin-acpi-tables`
+/// (TASKS item 71: the tree's one FADT parser). Refused, as its `Fadt::parse` refuses: a header
+/// that is not a FACP's, a table shorter than ACPI 1.0's 116 bytes ([`AcpiError::Length`]), and
+/// a FADT that names no DSDT ([`AcpiError::Field`]), on which no operating system can run and
+/// which the census fails (ruling 1a). A field the FADT's other rules make unusable (a PM timer
+/// whose length is not 4, say) is simply not given.
+pub fn parse_fadt(table: &[u8]) -> Result<Fadt, AcpiError> {
+    let f = origin_acpi_tables::fadt::Fadt::parse(table)
+        .map_err(|e| refused(table, e, AcpiError::Field))?;
+    let reduced = f.flags.hw_reduced_acpi();
+    // §5.2.9: the X_ form when it is non-zero and this kernel can use it, which for the PM
+    // timer is a system I/O port; else the 32-bit field.
+    let port = |r: Register| {
+        (r.gas.space == AddressSpace::SystemIo)
+            .then(|| u16::try_from(r.gas.address).ok())
+            .flatten()
+    };
+    let pm_timer_port = f
+        .block(Block::PmTimer)
+        .and_then(port)
+        .or_else(|| f.port_block(Block::PmTimer).and_then(port));
     Ok(Fadt {
-        century: (0x0E..=0x7F).contains(&century).then_some(century),
-        cmos_rtc_absent: arch & CMOS_RTC_NOT_PRESENT != 0,
-        i8042: (revision >= 2).then_some(arch & HAS_8042 != 0),
+        century: (!reduced && (0x0E..=0x7F).contains(&f.century)).then_some(f.century),
+        cmos_rtc_absent: f.iapc_boot_arch.cmos_rtc_not_present(),
+        i8042: (f.table().revision() >= 2).then_some(f.iapc_boot_arch.i8042()),
         pm_timer_port,
-        pm_timer_32bit: flags & (1 << 8) != 0,
+        pm_timer_32bit: !reduced && f.flags.tmr_val_ext(),
     })
 }
 
@@ -873,11 +882,19 @@ mod tests {
         }
     }
 
+    /// An ACPI 6 FADT's 240-byte body after the header, naming a DSDT (offset 40), which
+    /// `parse_fadt` needs since TASKS item 71.
+    fn fadt_body() -> Vec<u8> {
+        let mut body = vec![0u8; 240];
+        body[40 - 36..44 - 36].copy_from_slice(&0x7FFD_0000u32.to_le_bytes());
+        body
+    }
+
     #[test]
     fn fadt_century_register_and_rtc_presence() {
         // An ACPI 6 FADT is 276 bytes: a 240-byte body after the header.
         let fadt = |century: u8, arch: u16| {
-            let mut body = vec![0u8; 240];
+            let mut body = fadt_body();
             body[FADT_CENTURY - 36] = century;
             body[FADT_IAPC_BOOT_ARCH - 36..FADT_IAPC_BOOT_ARCH - 34]
                 .copy_from_slice(&arch.to_le_bytes());
@@ -903,19 +920,93 @@ mod tests {
         assert_eq!(parse_fadt(&fadt(0x0E, 0)).unwrap().century, Some(0x0E));
         assert!(parse_fadt(&fadt(0x32, 1 << 5)).unwrap().cmos_rtc_absent);
         assert!(!parse_fadt(&fadt(0x32, !(1 << 5))).unwrap().cmos_rtc_absent);
-        // The flags dword ends at offset 116, so a shorter table is refused.
-        assert_eq!(parse_fadt(&qemu[..115]), Err(AcpiError::Length(115)));
-        assert!(parse_fadt(&qemu[..116]).is_ok());
+        // ACPI 1.0's FADT is 116 bytes, through the flags dword, so a shorter table is refused.
+        let short = |len: usize| {
+            let mut t = qemu[..len].to_vec();
+            reseal(&mut t);
+            t
+        };
+        assert_eq!(parse_fadt(&short(115)), Err(AcpiError::Length(115)));
+        assert!(parse_fadt(&short(116)).is_ok());
+    }
+
+    /// TASKS item 71: the FADT read through `origin-acpi-tables`, and what that changes.
+    #[test]
+    fn the_fadt_is_read_as_the_crate_judges_it() {
+        let gas = |space: u8, address: u64| {
+            let mut g = vec![space, 32, 0, 3];
+            g.extend_from_slice(&address.to_le_bytes());
+            g
+        };
+        let fadt = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut body = fadt_body();
+            body[FADT_CENTURY - 36] = 0x32;
+            body[FADT_PM_TMR_BLK - 36..FADT_PM_TMR_BLK - 32]
+                .copy_from_slice(&0x0608u32.to_le_bytes());
+            body[FADT_PM_TMR_LEN - 36] = 4;
+            body[FADT_FLAGS - 36..FADT_FLAGS - 32].copy_from_slice(&(1u32 << 8).to_le_bytes());
+            edit(&mut body);
+            table(b"FACP", &body)
+        };
+        let base = parse_fadt(&fadt(&|_| {})).unwrap();
+        assert_eq!(
+            (base.pm_timer_port, base.century, base.pm_timer_32bit),
+            (Some(0x0608), Some(0x32), true)
+        );
+        // Ruling 1a: a FADT that names no DSDT is refused, so the kernel takes no PM timer,
+        // century or 8042 flag from it, where before it did.
+        assert_eq!(
+            parse_fadt(&fadt(&|b| b[40 - 36..44 - 36].fill(0))),
+            Err(AcpiError::Field(40))
+        );
+        // §5.2.9: the X_ form when non-zero and usable here (a system I/O port)...
+        let x_port = parse_fadt(&fadt(&|b| {
+            b[208 - 36..220 - 36].copy_from_slice(&gas(1, 0x0408));
+        }))
+        .unwrap();
+        assert_eq!(x_port.pm_timer_port, Some(0x0408), "X_PM_TMR_BLK preferred");
+        // ...else the 32-bit field: an X_ form in system memory, which the kernel cannot read.
+        let x_memory = parse_fadt(&fadt(&|b| {
+            b[208 - 36..220 - 36].copy_from_slice(&gas(0, 0xFED0_0000));
+        }))
+        .unwrap();
+        assert_eq!(
+            x_memory.pm_timer_port,
+            Some(0x0608),
+            "the 32-bit port stands"
+        );
+        // A length other than 4 makes the timer unusable, whichever form names it.
+        let bad_length = parse_fadt(&fadt(&|b| b[FADT_PM_TMR_LEN - 36] = 3)).unwrap();
+        assert_eq!(bad_length.pm_timer_port, None);
+        // A hardware-reduced platform: no PM timer, no century, no TMR_VAL_EXT (§5.2.9 has
+        // its OS ignore offsets 46 to 108 and flag bit 8); the RTC and 8042 flags at offset
+        // 109 still read.
+        let reduced = parse_fadt(&fadt(&|b| {
+            b[FADT_FLAGS - 36..FADT_FLAGS - 32]
+                .copy_from_slice(&((1u32 << 20) | (1 << 8)).to_le_bytes());
+            b[FADT_IAPC_BOOT_ARCH - 36] = 1 << 5;
+        }))
+        .unwrap();
+        assert_eq!(
+            (
+                reduced.pm_timer_port,
+                reduced.century,
+                reduced.pm_timer_32bit
+            ),
+            (None, None, false)
+        );
+        assert!(reduced.cmos_rtc_absent);
     }
 
     #[test]
     fn the_fadt_says_whether_there_is_an_8042_from_revision_2() {
         let fadt = |revision: u8, arch: u16| {
-            let mut body = vec![0u8; 240];
+            let mut body = fadt_body();
             body[FADT_IAPC_BOOT_ARCH - 36..FADT_IAPC_BOOT_ARCH - 34]
                 .copy_from_slice(&arch.to_le_bytes());
             let mut t = table(b"FACP", &body);
             t[FADT_REVISION] = revision;
+            fix_checksum(&mut t, 9);
             t
         };
         // ACPI 1.0's table has no such flag: the byte is reserved, so zero means nothing.
@@ -949,7 +1040,7 @@ mod tests {
             &x2apic(300, 1, 7),
             &[1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         ]);
-        let mut fadt_body = vec![0u8; 240];
+        let mut fadt_body = fadt_body();
         fadt_body[FADT_CENTURY - 36] = 0x32;
         let good_fadt = table(b"FACP", &fadt_body);
         let mut accepted = [0u32; 3];
@@ -986,6 +1077,11 @@ mod tests {
             }
             let mut f = good_fadt.clone();
             mutate(&mut f, &mut rng);
+            // The FADT is read through the crate since TASKS item 71, which checks its header:
+            // half the cases repaired, so its fields are reached.
+            if case % 2 == 0 {
+                reseal(&mut f);
+            }
             if let Ok(fadt) = parse_fadt(&f) {
                 assert!(
                     fadt.century.is_none_or(|c| (0x0E..=0x7F).contains(&c)),
@@ -1740,7 +1836,7 @@ mod tests {
     #[test]
     fn mutated_fadts_read_their_fields_from_the_right_bytes() {
         use crate::testing::{Rng, mutate_window};
-        let mut body = vec![0u8; 240];
+        let mut body = fadt_body();
         body[FADT_CENTURY - 36] = 0x32;
         body[FADT_PM_TMR_BLK - 36..FADT_PM_TMR_BLK - 36 + 4]
             .copy_from_slice(&0x608u32.to_le_bytes());
@@ -1753,27 +1849,33 @@ mod tests {
             mutate_window(&mut f, FADT_PM_TMR_BLK..FADT_FLAGS + 4, &mut rng);
             let len = case % (f.len() + 1);
             let cut = if case % 4 == 0 { len } else { f.len() };
-            let f = &f[..cut];
-            let Ok(fadt) = parse_fadt(f) else {
-                assert!(
-                    f.len() < FADT_FLAGS + 4,
-                    "case {case}: refused a whole table"
-                );
+            let mut f = f[..cut].to_vec();
+            // Read through the crate since TASKS item 71, which checks the header: repaired.
+            reseal(&mut f);
+            let Ok(fadt) = parse_fadt(&f) else {
+                assert!(f.len() < 116, "case {case}: refused a whole table");
                 continue;
             };
+            let reduced = le32(&f[FADT_FLAGS..]) & (1 << 20) != 0;
             assert_eq!(
                 fadt.century,
-                Some(f[FADT_CENTURY]).filter(|c| (0x0E..=0x7F).contains(c)),
+                Some(f[FADT_CENTURY]).filter(|c| !reduced && (0x0E..=0x7F).contains(c)),
                 "case {case}"
             );
             let port = le32(&f[FADT_PM_TMR_BLK..]);
+            // The fixture's X_PM_TMR_BLK, if the table holds it, is zero, so the 32-bit field
+            // names the timer: usable with a length of 4, on a platform that is not
+            // hardware-reduced.
             match fadt.pm_timer_port {
                 Some(p) => {
                     assert_eq!(u32::from(p), port, "case {case}");
-                    assert!(f[FADT_PM_TMR_LEN] == 4 && p != 0, "case {case}");
+                    assert!(f[FADT_PM_TMR_LEN] == 4 && p != 0 && !reduced, "case {case}");
                     with_port += 1;
                 }
-                None => assert!(f[FADT_PM_TMR_LEN] != 4 || port == 0 || port > 0xFFFF),
+                None => assert!(
+                    reduced || f[FADT_PM_TMR_LEN] != 4 || port == 0 || port > 0xFFFF,
+                    "case {case}"
+                ),
             }
         }
         assert!(with_port > 500, "{with_port}");
