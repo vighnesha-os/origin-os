@@ -4,7 +4,7 @@
 //! exactly.
 
 use super::encode::*;
-use super::{Fault, Interp, Told, eval, int, interp, interp_with, load, plant, told};
+use super::{Event, Fault, Interp, Told, eval, int, interp, interp_with, load, plant, told};
 use crate::{ErrorKind, IntegerWidth, Limits, TableKey, Value};
 
 /// A planted fault, or none, and the tests that must fail with it (or pass without one).
@@ -698,6 +698,105 @@ fn runtime_load_binds_its_own() {
 }
 
 #[test]
+fn a_runtime_loads_pass_binds_only_its_own() {
+    // The review of B5, B5-R2: a run-time load's binding pass takes only the names its own table
+    // put in packages, a unit of work each: one entry here, however many names a boot table has
+    // left deferred, which are left to `bind_deferred`. (The evaluation's whole step count is no
+    // measure of it: how the interpreter's vectors happen to grow moves it by more.)
+    let t = ssdt(&[name("PK2", package(1, &[nm("\\NONE")]))]);
+    let run = |boot: u32| {
+        let mut body = vec![
+            name("TM", buffer_of(&t)),
+            method("LD", 0, &[ret(load_op("TM", zero()))]),
+        ];
+        let names: Vec<B> = (0..boot)
+            .map(|k| name(&format!("P{k:03}"), package(1, &[nm("\\LATE")])))
+            .collect();
+        body.push(device("PD", &names));
+        let mut i = fresh();
+        load(&mut i, &body).unwrap();
+        assert_eq!(int(&mut i, "LD"), u64::MAX);
+        assert_eq!(told(&mut i), vec![Told::Unbound(8)]);
+        assert_eq!(
+            i.run.pass_entries, 1,
+            "the pass took more than its table's names"
+        );
+        i
+    };
+    run(1);
+    let mut i = run(300);
+    // The boot table's names are still deferred, and bind once `\LATE` exists.
+    load(&mut i, &[name("LATE", byte(7))]).unwrap();
+    assert_eq!(i.bind_deferred(), Ok(0));
+    assert_eq!(told(&mut i), vec![]);
+    assert_eq!(
+        eval(&mut i, "\\PD.P299"),
+        Ok(Some(Value::Package(vec![Value::Integer(7)])))
+    );
+}
+
+#[test]
+fn a_limit_in_a_runtime_loads_pass_fails_the_table() {
+    // B5-R2: the pass runs while the load's frame still stands, so a limit there fails the table
+    // whole and is traced, as any limit in its load is: rolled back, its `Loaded` an error.
+    let elems: Vec<B> = (0..40).map(|_| nm("\\NONE")).collect();
+    let t = ssdt(&[name("QA0", one()), name("PK", package(40, &elems))]);
+    let body = [
+        name("TM", buffer_of(&t)),
+        method("LD", 0, &[ret(load_op("TM", zero()))]),
+    ];
+    let at = |steps: u64| {
+        let mut i = interp_with(
+            IntegerWidth::Bits64,
+            Limits {
+                steps,
+                ..Limits::SERVICE
+            },
+        );
+        load(&mut i, &body).unwrap();
+        i.host_mut().events = Some(Vec::new());
+        let r = i.evaluate("\\LD", &[]).map_err(|e| e.kind);
+        (r, i)
+    };
+    // The least step limit under which the table stays loaded. One less refuses the last charge
+    // the load makes, its pass's, which comes before anything is bound.
+    let (mut lo, mut hi) = (1u64, 1u64 << 20);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if at(mid).1.table(1).is_some_and(|t| !t.failed) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let (_, mut i) = at(lo);
+    assert!(!i.table(1).unwrap().failed);
+    assert_eq!(told(&mut i).len(), 40);
+    let (r, mut i) = at(lo - 1);
+    assert_eq!(r, Err(ErrorKind::Limit(crate::Limit::Steps)));
+    assert!(i.table(1).unwrap().failed);
+    assert!(!exists(&i, "\\QA0") && !exists(&i, "\\PK"));
+    assert_eq!(told(&mut i), vec![], "the pass is charged before it binds");
+    let loads: Vec<Event> = i
+        .host_mut()
+        .events
+        .take()
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Load(_) | Event::Loaded(_) | Event::Limit(_)))
+        .collect();
+    assert_eq!(
+        loads,
+        vec![
+            Event::Load(*b"SSDT"),
+            Event::Limit(crate::Limit::Steps),
+            Event::Loaded(Err(ErrorKind::Limit(crate::Limit::Steps))),
+        ]
+    );
+    at_rest(&i);
+}
+
+#[test]
 fn method_packages_resolve_when_read() {
     let mut i = fresh();
     load(
@@ -743,6 +842,8 @@ fn planted_faults_are_caught_by_the_tolerance_tests() {
                 unbound_element_is_empty_and_reported,
                 binding_happens_once,
                 runtime_load_binds_its_own,
+                a_runtime_loads_pass_binds_only_its_own,
+                a_limit_in_a_runtime_loads_pass_fails_the_table,
                 a_place_naming_a_method_is_skipped_as_a_name,
                 a_place_naming_a_method_before_a_device_keeps_the_device,
                 a_place_naming_a_method_in_a_body_does_not_run_past_it,

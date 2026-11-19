@@ -154,6 +154,10 @@ struct RunCounts {
     charged_seen: u64,
     /// Units counted since the clock was last read.
     since_clock: u64,
+    /// Entries the binding passes of this evaluation took: what the review of B5, B5-R2, asks a
+    /// run-time load's pass to bound by its own table's names.
+    #[cfg(test)]
+    pass_entries: u64,
     /// Reports made this evaluation, given or not ([`REPORTS`]).
     reports: u64,
 }
@@ -177,6 +181,10 @@ pub struct Interpreter<H: Host> {
     serial: u64,
     /// The mutexes the running evaluation holds, in the order taken (`sync.rs`).
     held: Vec<sync::Held>,
+    /// The names load-time code put in packages and not yet bound, in the order made (G1, step
+    /// B5; the review of B5, B5-R2 and B5-R3, `tolerate.rs`). Roots of the collector until bound
+    /// or dropped, so that what a binding pass sees never depends on whether the collector ran.
+    deferred: Vec<object::ObjRef>,
     /// How deep the runs of frames for a PCI_Config region outside the frames go (`pci.rs`,
     /// `with_address`): the collector runs only at 0.
     nested: u32,

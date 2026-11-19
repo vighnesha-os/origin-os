@@ -455,18 +455,12 @@ impl Heap {
         }
     }
 
-    /// The name kept in a package at slot `i`, if that slot holds one (the binding pass).
+    /// The name kept in a package at slot `i`, if that slot holds one (the soak's audit).
+    #[cfg(test)]
     pub(crate) fn name_elem_at(&self, i: usize) -> Option<NameElem> {
         match self.slots.get(i).map(|s| &s.obj) {
             Some(Object::NameElem(e)) => Some(*e),
             _ => None,
-        }
-    }
-
-    /// Sets the bind state of the name kept at slot `i` (the binding pass).
-    pub(crate) fn set_bind_at(&mut self, i: usize, bind: Bind) {
-        if let Some(Object::NameElem(e)) = self.slots.get_mut(i).map(|s| &mut s.obj) {
-            e.bind = bind;
         }
     }
 

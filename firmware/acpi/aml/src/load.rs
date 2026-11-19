@@ -452,10 +452,12 @@ impl<H: Host> Interpreter<H> {
     /// Nothing here can be put back: `Load`'s target was made ready at the operator (B4-1), and
     /// `LoadTable`'s parameter is a step of its own, pushed here once the load has ended (B4-12).
     pub(crate) fn finish_load(&mut self, l: Loading) -> Result<()> {
+        // The names its load-time code put in packages are bound now (G1, step B5), while the
+        // `Loading` frame still stands: a limit here fails the table whole and traces it, as any
+        // limit in its load does (the review of B5, B5-R2).
+        self.bind_names(Some(l.table))?;
         self.pop_frame();
         self.pop_owner(false);
-        // The names its load-time code put in packages are bound now (G1, step B5).
-        self.bind_names(Some(l.table))?;
         self.run.depth = l.depth;
         self.cur = l.ret;
         self.trace(&Trace::Loaded(Ok(l.table)));

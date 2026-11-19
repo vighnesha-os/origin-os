@@ -222,6 +222,7 @@ impl<H: Host> Interpreter<H> {
             cur: Cursor { table: 0, pc: 0 },
             serial: 0,
             held: Vec::new(),
+            deferred: Vec::new(),
             nested: 0,
             pending: None,
             resolving: 0,
@@ -490,6 +491,11 @@ impl<H: Host> Interpreter<H> {
                 self.held
                     .capacity()
                     .saturating_mul(size_of::<crate::sync::Held>()),
+            )
+            .saturating_add(
+                self.deferred
+                    .capacity()
+                    .saturating_mul(size_of::<crate::object::ObjRef>()),
             );
         for o in &self.owners {
             n = n.saturating_add(o.created.capacity().saturating_mul(size_of::<NodeId>()));
@@ -704,6 +710,7 @@ impl<H: Host> Interpreter<H> {
             self.frames.len(),
             self.calls.len(),
             self.held.len(),
+            self.deferred.len(),
             self.tables.len(),
             self.owners.len(),
         ]
@@ -1238,6 +1245,11 @@ impl<H: Host> Interpreter<H> {
             } else {
                 crate::object::Bind::Lazy
             };
+            // A deferred name is listed until bound (B5-R2): room first, so that no element is
+            // made deferred and left out of the list.
+            if bind == crate::object::Bind::Deferred {
+                mem::reserve(&mut self.deferred, 1, &mut self.budget)?;
+            }
             let r = self.heap.alloc(
                 Object::NameElem(crate::object::NameElem {
                     scope: self.scope(),
@@ -1247,6 +1259,10 @@ impl<H: Host> Interpreter<H> {
                 }),
                 &mut self.budget,
             )?;
+            if bind == crate::object::Bind::Deferred {
+                // Room was made before the element: this push cannot fail.
+                mem::push(&mut self.deferred, r, &mut self.budget)?;
+            }
             return self.give_val(Val::Obj(r));
         }
         if want == Want::Data {
@@ -1926,6 +1942,9 @@ impl<H: Host> Interpreter<H> {
             if let Some(r) = h.mutex {
                 ok &= self.heap.mark(Val::Obj(r), &mut self.budget);
             }
+        }
+        for &r in &self.deferred {
+            ok &= self.heap.mark(Val::Obj(r), &mut self.budget);
         }
         if ok && self.heap.trace(&mut self.budget) {
             self.heap.sweep(&mut self.budget);

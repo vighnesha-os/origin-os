@@ -50,7 +50,7 @@ use crate::error::{At, Error, ErrorKind, Result, err};
 use crate::host::{Host, Report};
 use crate::mem;
 use crate::name;
-use crate::object::{Bind, NodeId, Object};
+use crate::object::{Bind, NameElem, NodeId, ObjRef, Object};
 use crate::op::{self, Kind};
 
 /// The most reports one top-level evaluation gives its host (the coordinating session's ruling
@@ -399,22 +399,59 @@ impl<H: Host> Interpreter<H> {
 
     // --- Names in packages ---------------------------------------------------------------------
 
-    /// Binds every name that load-time code put in a package, of table `table` or of every table,
-    /// and that is not bound yet: to its node, or empty, reported. Returns how many were left
-    /// empty. One pass over the object arena, a unit of work a slot; it allocates nothing.
+    /// The name element `r` is, if it is one.
+    fn elem(&self, r: ObjRef) -> Option<NameElem> {
+        match self.heap.get(r) {
+            Ok(Object::NameElem(e)) => Some(*e),
+            _ => None,
+        }
+    }
+
+    fn set_bind(&mut self, r: ObjRef, bind: Bind) {
+        if let Ok(Object::NameElem(e)) = self.heap.get_mut(r) {
+            e.bind = bind;
+        }
+    }
+
+    /// Binds the names load-time code put in packages that are not bound yet: those of table
+    /// `table`, a run-time load's, which are the list's last (a load nested in it has bound or
+    /// dropped its own), or every one. Each is bound to its node, or left empty and reported.
+    /// Returns how many were left empty. A unit of work an entry, the run-time load's only (the
+    /// review of B5, B5-R2); it allocates nothing.
     pub(crate) fn bind_names(&mut self, table: Option<u32>) -> Result<usize> {
-        let slots = self.heap.slot_count();
-        self.charge(u64::try_from(slots).unwrap_or(u64::MAX))?;
+        let mut from = self.deferred.len();
+        match table {
+            Some(t) => {
+                while let Some(&r) = from.checked_sub(1).and_then(|k| self.deferred.get(k)) {
+                    if self.elem(r).is_none_or(|e| e.table != t) {
+                        break;
+                    }
+                    from = from.saturating_sub(1);
+                }
+            }
+            None => from = 0,
+        }
+        let entries = self.deferred.len().saturating_sub(from);
+        self.charge(u64::try_from(entries).unwrap_or(u64::MAX))?;
+        #[cfg(test)]
+        {
+            self.run.pass_entries = self
+                .run
+                .pass_entries
+                .saturating_add(u64::try_from(entries).unwrap_or(u64::MAX));
+        }
         let mut empty = 0usize;
-        for i in 0..slots {
+        let mut k = from;
+        while let Some(&r) = self.deferred.get(k) {
+            k = k.saturating_add(1);
             #[cfg(test)]
             if crate::tests::planted(crate::tests::Fault::NoBind) {
                 break;
             }
-            let Some(e) = self.heap.name_elem_at(i) else {
+            let Some(e) = self.elem(r) else {
                 continue;
             };
-            if e.bind != Bind::Deferred || table.is_some_and(|t| t != e.table) {
+            if e.bind != Bind::Deferred {
                 continue;
             }
             let bound = match self.resolve_elem(e) {
@@ -430,8 +467,9 @@ impl<H: Host> Interpreter<H> {
                     Bind::Empty
                 }
             };
-            self.heap.set_bind_at(i, bound);
+            self.set_bind(r, bound);
         }
+        self.deferred.truncate(from);
         Ok(empty)
     }
 
