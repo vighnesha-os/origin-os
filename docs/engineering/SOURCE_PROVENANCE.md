@@ -5437,6 +5437,10 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
     - **K1:** the registers program made with `threads: 0`, so `quota::may_start` refuses its start `Full`. The fix prints `…the registers program was not run: its thread was refused: Full: ipc failed`, and xtask stops the boot at that line. The old code prints no such line and is refused "IPC and handles failed".
     - **K2:** the sidt program's image replaced by `None`. The fix prints `…the sidt program was not run: its image could not be made: ipc failed`. The old code is silent and refused in the same way. The first run of K2 on the old code did not build: its edit ended a `let … else` initialiser with a block. It was run again with the edit in parentheses.
   - The control script and the eight serial logs are in the coordinating session's notes folder (`t76-80-evidence/`).
+- **Gates on `8134700e`** (one turn, 04:25 to 04:54 UTC, a clean tree):
+  - `check` passed: 2,469 host tests, 0 failed, 30 ignored; Loom 61 models, 89 controls caught;
+  - `boot-test` passed, 11 of 11;
+  - `boot-matrix` passed on its first run, in 1,072 s.
 - **Review:** one AI reviewer, read-only, on `ea2293ca..a77402a6` (`REVIEW_T76_80_2026-11-20.md`): 0 High, 1 Medium, 3 Low, 2 Info. Every finding is answered in a commit naming it; its Resolution lists them. No person has reviewed it.
 - **Known limits:**
   - No test reaches the kernel's `Debug` wiring (the target's `told` → `phys::told`). Host tests cannot reach a `target_os = "none"` function, and no boot line prints this `Debug` (T76-80-2, recorded, not closed).

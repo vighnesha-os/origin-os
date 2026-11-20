@@ -2832,11 +2832,19 @@ Assigned together by the coordinating session on 2026-11-20 to one side session.
 - **Q5:** TASKS.md and provenance only; no new ADR-0013 controls.
 - **Q6:** the other proofs' silent refusals are TASKS item 82.
 
-**Result (2026-11-20): built and reviewed, the full gates run once on the final tip (below); not landed and not pushed.** Code, each commit naming its item or finding:
+**Result (2026-11-20): built, reviewed, and gated under QEMU on the final tip; not landed and not pushed.** Code, each commit naming its item or finding:
 - `649ea562` (76): `ExceptionReport`'s `Debug` through `fields`, with `phys::told` on the kernel's target, and `Hooks { .. }`.
 - `a77402a6` (80): `NotRun`, `not_run` and `start_program`, and a line for each refusal.
 - `a779d253`: the review as received.
 - `c80205f4` (T76-80-2, T76-80-6), `40b9f61c` (T76-80-3) and `1d612ce9` (T76-80-4): the answers.
+
+**Gates on `8134700e`** (the code of `1d612ce9` and the records), under Rust 1.100.0 on the development Mac, in one turn of the machine (04:25 to 04:54 UTC, 2026-11-20), a clean tree before and after:
+- the quick gates passed: `cargo fmt --all --check`, `progress`, and the requirements, document, provenance, cost, names, roadmap and progress gates;
+- `cargo xtask check` passed in 590 s: 2,469 host tests passed, 0 failed and 30 ignored; Loom ran 61 models, all passed, and caught all 89 negative controls;
+- `cargo xtask boot-test` passed, 11 of 11 scenarios, in 54 s;
+- `cargo xtask boot-matrix` passed on its first run, in 1,072 s. The kernel stacks' region was at 23 distinct bases in 23 kernel boots, no boot was run again, and no boot printed the new line.
+
+The commit after it adds only these results to the records.
 
 **Fields of `ExceptionReport` checked (76):**
 - `vector`: a number.
