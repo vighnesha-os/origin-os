@@ -2129,8 +2129,9 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             "origin-kernel: scheduler: 3 SIMD threads kept their XMM state across ".into(),
             " corruptions".into(),
             "origin-kernel: scheduler: yield alternated ".into(),
-            // A thread is created whole or not at all.
-            "origin-kernel: scheduler: spawns refused for want of an FPU area (Err(Full)) and on a full queue (Err(Full)) give back".into(),
+            // A thread is created whole or not at all, and a refused one queues nothing (TASKS
+            // item 75).
+            "origin-kernel: scheduler: spawns refused for want of an FPU area (Err(Full)), at their publication (Err(Full)) and on a full queue (Err(Full)) give back".into(),
             // M4 groundwork: ring 3, the one DPL-3 gate, and crash isolation.
             "origin-kernel: user mode: good program: reported Some(42), exited with Some(0); kernel carries on".into(),
             "origin-kernel: user mode: kernel read: reported Some(7), ended by vector 14 (error 0x5".into(),
