@@ -2675,6 +2675,10 @@ fn rented_scenario(scenario: &mut Scenario) {
     if let Some(at) = scenario.markers.iter().position(|m| m == HANDOVER_LINE) {
         scenario.markers.drain(..=at);
     }
+    // The usual machine has no SPCR; this one's names COM2, so the console moves (below).
+    scenario
+        .markers
+        .retain(|m| !m.starts_with("origin-kernel: console: no usable ACPI SPCR table"));
     if let Some(at) = scenario
         .markers
         .iter()
@@ -2694,20 +2698,17 @@ fn rented_scenario(scenario: &mut Scenario) {
         .iter()
         .position(|m| m == "origin-kernel: acpi: FADT: ")
     {
-        scenario.markers.splice(
-            at..at,
-            [
-                "origin-kernel: acpi: FPDT rev 1",
-                "origin-kernel: acpi: FBPT, 56 bytes: checked: 1 records",
-                "origin-kernel: acpi: S3PT, 32 bytes: checked: 1 records",
-            ]
-            .map(String::from),
-        );
+        scenario
+            .markers
+            .splice(at..at, ["origin-kernel: acpi: FPDT rev 1".to_string()]);
     }
     if let Some(at) = scenario.markers.iter().position(|m| m == " tables: ") {
         scenario.markers.splice(
             at..at,
             [
+                // The FPDT's tables, read after the FADT's, DSDT's and FACS's lines.
+                "origin-kernel: acpi: FBPT, 56 bytes: checked: 1 records",
+                "origin-kernel: acpi: S3PT, 32 bytes: checked: 1 records",
                 "origin-kernel: acpi: never lent, as the firmware changes them after boot: FACS 0x",
                 ", FBPT 0x",
                 ", S3PT 0x",
