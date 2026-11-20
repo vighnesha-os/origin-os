@@ -105,7 +105,7 @@ M1-5 needs the prerequisites in "Before a first boot on a machine in scope".
 | A01-def5 | Merkle-SHA256-4K, which the loader verifies |
 | A04-H3, A04-H4 | KASLR; the loader builds the first page tables |
 | A09-H6 | Before the first boot (ADR-0009) |
-| A10-E1 to A10-Am2 | The early console (ADR-0010 and its amendments) |
+| A10-E1 to A10-Am3 | The early console (ADR-0010 and its amendments) |
 | A16-R10, A16-Am1 | The loader's generator, its seed for the kernel, and the stack region's value |
 | S13-01, S13-03, S13-08, S13-09 | `no_std`, explicit panic handling, defined stack and calling conventions, checked parsing of what the firmware hands over |
 | A13-R1 to A13-Am1 | What a failed boot proof means (ADR-0013): the test policy every boot runs under, on each declared machine (moved from M0 by item 269) |
