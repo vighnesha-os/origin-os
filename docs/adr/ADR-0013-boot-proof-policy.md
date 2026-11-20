@@ -905,7 +905,9 @@ Each control failed:
 | R84-4 | A refused move stops the loader's UART: the move's settle drops it (`framekernel/src/console.rs`) | `boot-rented`'s machine with the kernel's reading refused (`ORIGIN_QEMU_SHAPE=refused`, 64 GiB, AMD-Vi), exit 1: first missing marker `origin-kernel: boot verdict: `, on COM2; COM1 ran to `M1 entry complete; halting` |
 | R84-5 | The kernel accepts boot info 0.7 (`boot/info/src/lib.rs`, `BootInfo::check`) | `boot_info_0_7_is_refused`: `Ok(())`, where `Err(Version(0, 7))` is required |
 
-Control RB-1 of TASKS item 83, an RSDP in loader data, is now a machine of its own, `boot-rented`'s third. It passes on the console alone: the loader names COM2, the kernel's move is refused, and the boot, verdict included, is on COM2 and COM1 alike.
+The five ran again on the review's answers (`90aaf055`), with the same script, and each failed the same way. The review's T84-7 added a sixth, run by hand: `origin_spcr::port_block_allowed` loosened to `port >= 0x40` fails the loader's soak, which names `0x258`; the file was restored from a copy.
+
+Control RB-1 of TASKS item 83, an RSDP in loader data, is now a machine of its own, `boot-rented`'s fourth. It passes on the console alone: the loader names COM2, the kernel's move is refused, and the boot, verdict included, is on COM2 and COM1 alike.
 
 ## Alternatives
 

@@ -27,10 +27,16 @@ On `claude/t84-early-uart`, on the rental-B branch; **not landed and not pushed.
   - refused or unreadable, the kernel says so on both and keeps both for the rest of the boot (the coordinating session's ruling Q1).
 
 **What is shown, under QEMU 11.1.3's software processor on the development Mac only:**
-- every console scenario: the SPCR naming COM2 shows the framebuffer's line and the line about the loader's UART as COM2's first kernel lines, and COM1 stops at the take-over;
+- every console scenario: the SPCR naming COM2 shows the framebuffer's line and the line about the loader's UART as COM2's first kernel lines, COM2 carries every kernel line COM1 did, each once, and COM1 stops at the take-over;
+- E4's move with a replay, for an SPCR longer than the loader reads;
 - `boot-rented`'s two machines on the board's shapes;
+- a machine with the SPCR alone in RAM the kernel owns: both UARTs written to for the whole boot, and the console's proofs pass with both live.
 - a third machine, rental B's case. The RSDP is in RAM the kernel will not map, so the loader names COM2 and the kernel cannot read the SPCR. The refusal, the verdict and the halt are on COM2 and on COM1 alike: 321 kernel lines on each.
 - The cost (ledger row CL46): the loader's walk read 524 to 672 bytes in about 1 ms; 2,805 bytes of text went to the second UART before the move.
+
+An independent AI review (`REVIEW_T84_2026-11-20.md`: 0 High, 7 Medium, 6 Low, 2 Informational) is answered.
+
+**Found on the way:** one XSDT entry the kernel cannot read (a table in RAM it owns) fails its ACPI census, AML, PCIe and IOMMU proofs, since TASKS item 71's locator cannot rule out that the entry was the table each looks for. A follow-up, not changed here.
 
 **Not shown:** anything on a physical machine; under OVMF the loader's own line is on COM1, the firmware's console, so on COM2 the kernel states what the loader named; a memory-mapped UART is not named early (Amendment 3). A rental C (about $0.81, on the owner's word) can now show where rental B's kernel stopped.
 

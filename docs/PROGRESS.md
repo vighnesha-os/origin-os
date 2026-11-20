@@ -22,7 +22,7 @@ Where the counted rows' evidence ran:
 
 | On the development host | Under emulation (QEMU) | In a virtual machine on a real processor | On physical hardware | No evidence |
 |--:|--:|--:|--:|--:|
-| 228 | 113 | 286 | 0 | 1022 |
+| 228 | 114 | 285 | 0 | 1022 |
 
 ## By milestone
 

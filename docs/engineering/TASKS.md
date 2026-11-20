@@ -3365,33 +3365,74 @@ Both figures are owed, measured on the Mac and named as unmeasured on hardware (
 - **D1, the loader's line under QEMU (addition (b)).** The loader prints through the firmware's console. Under OVMF that is COM1, so the loader's own line, `origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line`, is on COM1, and no loader output can reach COM2 there.
   - On COM2 the kernel's second line states what the loader named, from boot info: `origin-kernel: console: the loader named the SPCR's UART at I/O port 0x2f8 (interface 0x0): written to from the first line, beside COM1, as the firmware set it`.
   - The machine with the kernel's reading refused checks that line and the refusal on COM2, and the loader's own line on COM1.
-  - On rental B's board, whose firmware console is COM2, the loader's own line is on COM2 as well.
+  - On rental B's board, whose firmware console is COM2, the loader's own line would be on COM2 as well, as its earlier lines were on rental B (inferred from rental B's log; nobody has seen this line there, the review's T84-11).
+  - The checks read the port from the loader's line on COM1 and from the kernel's on COM2, and require the same (the review's T84-14).
   - Making the loader also write its line to the UART it names was not done: on a board like rental B's, the line would then appear twice.
 - **D2, the first lines.** The framebuffer's line is the first kernel line on the loader's UART, as §5's table says. The line about the loader's UART is second: `attach_loader_uart` runs right after the boot info is read and says nothing, and its outcome is printed once the screen is attached, so that it is on every sink.
-- **D3, a UART that is not there.** The loader's UART is probed as the move's is. A status register that reads all ones is not used at all: `… which cannot be used (nothing answers at that address); COM1 and the screen until the SPCR is read`. That is the "port with no UART" scenario at `0x2E8`. A UART that answers and never takes a byte is given up on after one bounded wait, during the kernel's first line, and COM1 and the screen say `the loader's UART stopped taking bytes; serial output there off`. That is the "UART that takes no bytes" scenario. §5's table had the absent `0x2E8` given up on after a wait; the probe refuses it at once, before any wait.
+- **D3, a UART that is not there.** The loader's UART is probed as the move's is. A status register that reads all ones is not used at all: `… which cannot be used (nothing answers at that address); COM1 and the screen until the SPCR is read`. That is the "port with no UART" scenario at `0x2E8`.
+  - A UART that answers and never takes a byte costs at most two bounded waits: one while it is programmed (`configure` waits for its transmitter, as for COM1), and one during the kernel's first line, after which it is given up on (the review's T84-9).
+  - COM1 and the screen then say `the loader's UART stopped taking bytes; serial output there off`, and the writer that found it out goes on only once that is out on both (T84-9).
+  - The kernel's line about the loader's UART then says it stopped, not that it is written to (T84-9). That is the "UART that takes no bytes" scenario.
+  - §5's table had the absent `0x2E8` given up on after a wait; the probe refuses it at once, before any wait.
 - **D4, the loader's reads.**
   - The loader reads only memory the UEFI memory map describes, which UEFI 2.11 §2.3.4 keeps identity-mapped while boot services run, through `spcr::described`, a byte at a time and volatile.
   - Every read is bounded by a length checked first: the RSDP's 36 bytes; the XSDT, at most 16 MiB as the kernel's tables are, summed 64 bytes at a time; an SPCR of at most 1,024 bytes. A longer SPCR names no UART; the kernel still reads it itself.
   - A memory map that cannot be read names none, and the loader goes on.
 - **D5, the cost figures.** The loader prints what its walk read (`the walk read N bytes of firmware memory in M reads, T time-stamp counter ticks (cost ledger row CL46)`). The take-over prints what went to the loader's UART before the move (`N bytes of text went to that UART before the move, beside COM1 (cost ledger row CL46)`), on that UART alone.
 - **D6, `origin-spcr`'s additions.**
-  - `check` (the header: signature, declared length, checksum), which returns the table over its declared length.
+  - No header check of its own: the loader checks the SPCR's header with `origin-acpi-tables`' `header::check_signature`, the implementation the kernel's `acpi::check_table` runs (the review's T84-13). An earlier copy, `origin_spcr::check`, was removed.
   - `is_16550`, the interface rule for revision 2 and later, which boot info's `EarlyUart::check` uses.
   - `line_setup` as a free function, which `Spcr::line_setup` and the kernel's attach both call, so the speed rule is in one place (ruling Q2).
 - **D7, staying.** When the move does not happen, the kernel's line names both UARTs: `…; the UART stays at I/O port 0x3f8, and the loader's at I/O port 0x2f8`. The text is unchanged when there is no loader's UART.
 - **D8, the refused machine.**
   - `ORIGIN_QEMU_SHAPE` takes `on`, `refused` or `off`. `refused` sets the TEST ONLY application's new flag (configuration version 4): the RSDP's copy goes in loader-data pages, which the loader reads under boot services and the kernel, owning that RAM, will not map.
   - It runs as `boot-rented`'s third machine, under the AMD IOMMU, at the large machines' size.
-  - Without the ACPI tables most of the boot's proofs cannot run, so it is held to the console alone:
-    - markers: the framebuffer's line, the line about the loader's UART, the refusal, the verdict and the halt, on COM2;
-    - its check (`check_refused_boot`): the first two lines on COM2; the application's and the loader's lines on COM1; the refusal, the verdict and the halt on COM1 too; nothing sent again on either;
-    - failures: a crash or a refusal only (`REFUSED_FAILURES`), and no QEMU stderr markers.
+  - Without the ACPI tables most of the boot's proofs cannot run, so its markers are the console's alone: the framebuffer's line, the line about the loader's UART, the refusal, the verdict and the halt, on COM2.
+  - Its check (`check_refused_boot`):
+    - the first two lines on COM2;
+    - the application's and the loader's lines on COM1;
+    - the refusal, the verdict and the halt on COM1 too;
+    - COM1's and COM2's kernel lines the same, each once, from the first to the halt (T84-4);
+    - the verdict naming as failed only proofs that need the tables, and the speculation controls (`REFUSED_VERDICT_FAILED`);
+    - nothing sent again on either.
+  - Failures: every kernel boot's but the seven its boot prints because it cannot read the tables (`NEEDS_THE_TABLES`, the review's T84-3), and no QEMU stderr markers.
+  - The console's two section proofs fail there for the same reason: they count the interrupt they make pending through the I/O APIC, which only the MADT names (the screen's proof, which writes to no UART, fails the same way).
+- **D9, a fourth machine with the SPCR alone in RAM the kernel owns** (`ORIGIN_QEMU_SHAPE=spcr-refused`; the TEST ONLY application's `spcr_in_ram`; the review's T84-3).
+  - The loader reads the SPCR and names COM2. The kernel refuses that one table and reads every other, so its move is refused and both UARTs are written to for the whole boot, its console proofs among it.
+  - It is held to everything a kernel boot is: every marker but the SPCR's own lines, every failure, and the line checks on COM2 and on COM1, plus COM1's and COM2's kernel lines the same throughout (T84-4).
+- **D10, E4's move with a replay is booted again** (the review's T84-5). The console scenario "SPCR longer than the loader reads" has an SPCR of 1,100 bytes. The loader names no UART (`it declares 1100 bytes, more than the loader reads (1024)`, on COM1), and the kernel moves to `0x2F8` and replays its log. COM2's kernel lines up to the move's line must equal COM1's, each once.
   - Its verdict: `degraded: 55 of 65 proofs passed; 6 did not run; failed: …`, the proofs that need the tables. COM1 and COM2 carried the same 321 kernel lines.
 
 **What ran (QEMU 11.1.3's software processor on the development Mac, 2026-11-20, inside `cargo xtask exclusive`).**
-- `boot-console`: all 10 scenarios passed (136 s).
-- `boot-rented`: all 3 machines passed at 64 GiB (38 s).
+- Before the review: `boot-console`, all 9 scenarios then, passed (136 s); `boot-rented`, its 3 machines then, passed at 64 GiB (38 s).
+- On the review's answers (`90aaf055`): `boot-console`, all 10 scenarios, the move with a replay among them, passed (152 s); `boot-rented`, all 4 machines, passed at 64 GiB.
+- On the machine with the SPCR alone in RAM, the console's proofs passed with both UARTs live: a whole line was on both before its writer went on (262 of 262 bytes, two UARTs' worth), a writer that could wait waited for room on either, and an interrupt and a breakpoint in the middle of a line were taken as on any machine.
 - In the SPCR console scenario, COM2's first kernel lines are the framebuffer's and the loader's UART's, the take-over says nothing was sent again, and COM1 stops at it.
 - The loader's walk read 524 to 672 bytes of firmware memory in 20 to 23 reads, 0.79 to 1.37 ms at QEMU's 1,000 MHz time-stamp counter.
 - 2,805 bytes of text went to COM2 before the move.
 
+**Addition (a), the images (2026-11-20, 12:40 to 12:42 UTC, one turn, on `7ad41d28`).**
+- `image-graph-gate`, `reproducible-gate` and `image-gate` passed here.
+- `reproducible-gate` passed again in a second checkout of the same commit at another path, and `reproducible-compare` found all 40 files of the two builds the same bytes. That covers:
+  - both loaders, 209,408 bytes each;
+  - the kernel image, 1,967,880 bytes (SHA-256 `4cb380c5…`).
+
+**The review** (`REVIEW_T84_2026-11-20.md`, an independent AI reviewer, on `9517b2f6..62d84fba`: 0 High, 7 Medium, 6 Low, 2 Informational; as received in `db26dede`). Each finding is answered in a commit naming it:
+
+| Finding | Answer | Commit |
+|---|---|---|
+| T84-1 (Medium), a take-over to a UART that just stopped | The take-over decides under the lock after the drain; a dead loader's UART is not taken, COM1 stays, and a line says so | `67cdc046` |
+| T84-2 (Medium), two UART sections with interrupts off | The two UARTs take turns, one section of one UART per critical section; `make_room` pumps the full one; the module documentation says so | `67cdc046` |
+| T84-3 (Medium), two live UARTs never held through the console proofs | The proofs count every live UART and check every queue (`67cdc046`). A fourth machine, the SPCR alone in RAM, holds the console's proofs with both UARTs live, every failure but the four one unreadable entry causes, and the line checks on both UARTs; the RSDP-in-RAM machine fails on every marker but seven named ones and its verdict is held to a named list (`90aaf055`). Found doing it: one XSDT entry the kernel cannot read fails its census, AML, PCIe and IOMMU proofs (TASKS item 71's locator), a follow-up | `67cdc046`, `90aaf055` |
+| T84-4 (Medium), "nothing sent again" checked only by a sentence | COM1's and COM2's kernel lines are compared, each once and in order: to the take-over, or for the whole boot where both are kept | `90aaf055` |
+| T84-5 (Medium), no boot moves with a replay | The console scenario with an SPCR of 1,100 bytes: the loader names none, the kernel moves and replays, checked line by line. The line that drops a live loader's UART after such a move is not booted: no QEMU table pair makes the two readings name different I/O ports | `90aaf055` |
+| T84-6 (Medium), the loader reads MMIO, unaccepted memory and page 0 | `described` refuses all three | `f59e00a4` |
+| T84-7 (Medium), a soak that cannot fail | Reads bounded and counted, a literal port rule, refused reads required; it fails with the shared rule loosened to `port >= 0x40` (run by hand, the file restored from a copy) | `f59e00a4` |
+| T84-8 (Low), the walk past an SPCR it cannot check, null entries | It names none after an SPCR too long or unreadable, and passes over null entries | `f59e00a4` |
+| T84-9 (Low), a weaker give-up for the loader's UART | Its notice is waited for on COM1 and the screen; its line says it stopped; MOVED_UART is set first. The two bounded waits stay, and D3 now says so | `67cdc046`; this commit |
+| T84-10 (Low), COM1 named by the loader at another speed | Its speed is set at attach by the SPCR's rule; the move then changes nothing | `67cdc046` |
+| T84-11 (Low), records | A10-Am3 `emu`; the scenario counts; CL46's cost by path; provenance rows' dates and entries; ADR-0010's code row and the A10 rows' paths; D1's claim about rental B marked as inferred; the acceptance runs below | `f59e00a4`; this commit |
+| T84-12 (Low), a misplaced doc comment, a silent flag | `switch`'s comment back over it; `rsdp_in_ram` without `acpi_nvs` refused | `90aaf055` |
+| T84-13 (Low), a second header check | The loader runs `origin-acpi-tables`' check; `origin_spcr::check` is gone | `f59e00a4` |
+| T84-14 (Informational), D1 sound | The port is read from both lines and compared. D1's acceptance is the coordinating session's to record | `90aaf055` |
+| T84-15 (Informational), a 16 MiB XSDT in the loader | The loader walks at most 64 KiB | `f59e00a4` |
