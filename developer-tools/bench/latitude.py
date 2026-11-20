@@ -1024,9 +1024,18 @@ def last_boot(result):
 
 
 def redact(text, server_id, ips):
+    """Removes what item 232 keeps out of the repository: IP and MAC addresses, the machine's
+    GUID as a firmware's network boot prints it, and the server's ID."""
     for ip in ips:
         text = text.replace(ip, "<ip>")
     text = re.sub(r"\b\d{1,3}(\.\d{1,3}){3}\b", "<ip>", text)
+    # A MAC address in its usual forms, and after the word MAC in any (the firmware's "MAC:3CEC…",
+    # a network boot's "CLIENT MAC ADDR: 3C EC …").
+    text = re.sub(r"\b[0-9A-Fa-f]{2}([:-])(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}\b", "<mac>", text)
+    text = re.sub(r"(MAC[^0-9A-Za-z\n]{0,12}?(?:ADDR[^0-9A-Za-z\n]{0,4})?)(?:[0-9A-Fa-f]{2}[ :\-]?){5}[0-9A-Fa-f]{2}",
+                  r"\1<mac>", text, flags=re.IGNORECASE)
+    text = re.sub(r"((?:GUID|UUID)[^0-9A-Za-z\n]{0,4})[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}",
+                  r"\1<guid>", text, flags=re.IGNORECASE)
     return text.replace(server_id, "<server>")
 
 

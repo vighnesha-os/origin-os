@@ -365,6 +365,22 @@ class Guards(unittest.TestCase):
         self.assertNotIn("sv_te", out)
         self.assertEqual(self.lat.clean("\x1b[1;31mred\x1b[0m\r\n\x1b[?25l"), "red\n")
 
+    def test_redact_removes_mac_addresses_and_the_guid(self):
+        text = ("Boot0003* UEFI PXE IPv4: Intel(R) Ethernet Controller X550(MAC:020000000001)\n"
+                "CLIENT MAC ADDR: 02 00 00 00 00 02  GUID: C0FFEE00-0000-4000-8000-0000000000A1\n"
+                "link 02:00:00:00:00:01 up; MAC(020000000001,1)\n"
+                "origin-kernel: boot verdict: degraded: 64 of 71 proofs passed\n")
+        out = self.lat.redact(text, "sv_x", [])
+        for hidden in ("020000000001", "02 00 00 00 00 02", "02:00:00", "020000000001", "C0FFEE00"):
+            self.assertNotIn(hidden, out)
+        self.assertIn("(MAC:<mac>)", out)
+        self.assertIn("CLIENT MAC ADDR: <mac>", out)
+        self.assertIn("GUID: <guid>", out)
+        # Origin's own lines are kept as they are.
+        self.assertIn("origin-kernel: boot verdict: degraded: 64 of 71 proofs passed", out)
+        kept = "origin-kernel: APIC IDs 0 2 4 6 8 10; MSI-X 3 of 64; IOVA 0x1000 0x2000"
+        self.assertEqual(self.lat.redact(kept, "sv_x", []), kept)
+
     def test_console_reopens_after_each_drop(self):
         d = self.home / "rental"
         d.mkdir()
