@@ -47,6 +47,7 @@ use crate::handles::{GENERATION_BITS, Need};
 use crate::ipc::{self, Object};
 use crate::launch::{self, Given};
 use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, ObjectLimits, Process};
+use crate::runqueue::QueueError;
 use crate::{memory, sched, syscall, time};
 
 /// Where every proof process's code begins.
@@ -1976,22 +1977,78 @@ fn big_message(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     right
 }
 
+/// The step that stopped a proof program from running (TASKS item 80).
+enum NotRun {
+    /// Its image: the process, or a page of its code, data or stack.
+    Image,
+    /// Its scratch memory, in its data pages.
+    Scratch,
+    /// Its script, on its script pages.
+    Script,
+    /// The object that holds its process.
+    Process,
+    /// Its thread's start.
+    Thread(QueueError),
+}
+
+/// A refused start by `QueueError`'s `Debug`, which names the refusal and never prints the frame
+/// address `BadContext` carries (ADR-0004 Amendment 2, A6; the review's T76-80-3).
+impl core::fmt::Display for NotRun {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Image => f.write_str("its image could not be made"),
+            Self::Scratch => f.write_str("its scratch memory could not be written"),
+            Self::Script => f.write_str("its script could not be written"),
+            Self::Process => f.write_str("its process object could not be made"),
+            Self::Thread(error) => write!(f, "its thread was refused: {error:?}"),
+        }
+    }
+}
+
+/// Prints why `program` was not run, and answers `false` for its proof: a boot refused for
+/// "IPC and handles" then says which step of which program refused (TASKS item 80).
+fn not_run(com1: &mut Console, program: &str, why: NotRun) -> bool {
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: the {program} program was not run: {why}: ipc failed"
+    );
+    false
+}
+
+/// `program`'s process, made from `image`, with its thread started at [`CODE`] with `rdi`; or
+/// `None`, once [`not_run`] has printed the step that refused.
+fn start_program(
+    com1: &mut Console,
+    bsp: CpuIndex,
+    program: &str,
+    image: Option<Image>,
+    rdi: u64,
+) -> Option<ObjectRef<Process>> {
+    let Some(image) = image else {
+        not_run(com1, program, NotRun::Image);
+        return None;
+    };
+    let Some(process) = image.finish() else {
+        not_run(com1, program, NotRun::Process);
+        return None;
+    };
+    if let Err(error) = Process::start_thread(&process, bsp, CODE, STACK + PAGE, rdi) {
+        not_run(com1, program, NotRun::Thread(error));
+        return None;
+    }
+    Some(process)
+}
+
 /// P4's register convention, the `syscall`-origin rule, and the two hostile processor-state
-/// tests.
+/// tests. Each program's set-up prints the step that refused it, if one does.
 fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let mut ok = true;
 
     // Every register but RAX, RCX and R11 survives a call.
     let code = proof_programs::regs();
-    let Some(image) = Image::new(LIMITS, code) else {
+    let Some(regs) = start_program(com1, bsp, "registers", Image::new(LIMITS, code), 0) else {
         return false;
     };
-    let Some(regs) = image.finish() else {
-        return false;
-    };
-    if Process::start_thread(&regs, bsp, CODE, STACK + PAGE, 0).is_err() {
-        return false;
-    }
     let ended = await_end(&regs, tsc_hz, 5);
     let right = ended && regs.reports() == [0] && regs.ending() == Some(Ending::Exited(0));
     ok &= right;
@@ -2004,20 +2061,21 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     // System calls only from the code range the creator named (P4, ONBF §6.1): this process
     // is told its origin is the page below its code, so none of its calls is accepted, not
     // even `exit`. It ends by the deliberate fault at the end of its script.
+    const PINNED: &str = "pinned code range";
     let Some(mut image) = Image::with_origin(LIMITS, proof_programs::script(), (CODE - PAGE, CODE))
     else {
-        return false;
+        return not_run(com1, PINNED, NotRun::Image);
     };
     let script = alloc::vec![step("", sys::DEBUG_REPORT, &[Imm(1)], OK), fault()];
-    if image.scratch().is_none() || image.script(&script).is_none() {
-        return false;
+    if image.scratch().is_none() {
+        return not_run(com1, PINNED, NotRun::Scratch);
     }
-    let Some(pinned) = image.finish() else {
+    if image.script(&script).is_none() {
+        return not_run(com1, PINNED, NotRun::Script);
+    }
+    let Some(pinned) = start_program(com1, bsp, PINNED, Some(image), SCRIPT) else {
         return false;
     };
-    if Process::start_thread(&pinned, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
-        return false;
-    }
     let ended = await_end(&pinned, tsc_hz, 5);
     let refused = pinned.reports().is_empty();
     let right =
@@ -2037,15 +2095,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     // A program that changes GS cannot touch the kernel: a timer interrupt or system call
     // from it must find the kernel's GS.
     let gs = proof_programs::gs();
-    let Some(image) = Image::new(LIMITS, gs) else {
+    let Some(process) = start_program(com1, bsp, "null GS", Image::new(LIMITS, gs), 0) else {
         return false;
     };
-    let Some(process) = image.finish() else {
-        return false;
-    };
-    if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
-        return false;
-    }
     let ended = await_end(&process, tsc_hz, 10);
     let right = ended && process.reports() == [1, 0] && process.ending() == Some(Ending::Exited(0));
     ok &= right;
@@ -2058,15 +2110,18 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
 
     // A program that sets RFLAGS.AC cannot switch SMAP off in the kernel.
     let ac = proof_programs::ac();
+    // Its steps inline, not through `start_program`: the count is read between `finish` and the
+    // start, as before (TASKS item 80, Q3b).
+    const AC: &str = "RFLAGS.AC";
     let Some(image) = Image::new(LIMITS, ac) else {
-        return false;
+        return not_run(com1, AC, NotRun::Image);
     };
     let Some(process) = image.finish() else {
-        return false;
+        return not_run(com1, AC, NotRun::Process);
     };
     let leaks_before = cpu::ac_leaks();
-    if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
-        return false;
+    if let Err(error) = Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0) {
+        return not_run(com1, AC, NotRun::Thread(error));
     }
     let ended = await_end(&process, tsc_hz, 10);
     let leaks = cpu::ac_leaks().wrapping_sub(leaks_before);
@@ -2087,15 +2142,15 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         debug_calls: false,
         ..LIMITS
     };
-    let Some(image) = Image::new(limits, nodebug) else {
+    let Some(process) = start_program(
+        com1,
+        bsp,
+        "no developer calls",
+        Image::new(limits, nodebug),
+        0,
+    ) else {
         return false;
     };
-    let Some(process) = image.finish() else {
-        return false;
-    };
-    if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
-        return false;
-    }
     let ended = await_end(&process, tsc_hz, 5);
     let right =
         ended && process.ending() == Some(Ending::Exited(0)) && process.reports().is_empty();
@@ -2109,15 +2164,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     // With UMIP on, `sidt` from ring 3 faults: the kernel's descriptor-table addresses, which
     // reveal the KASLR slide, stay out of reach of programs.
     let sidt = proof_programs::sidt();
-    let Some(image) = Image::new(LIMITS, sidt) else {
+    let Some(process) = start_program(com1, bsp, "sidt", Image::new(LIMITS, sidt), 0) else {
         return false;
     };
-    let Some(process) = image.finish() else {
-        return false;
-    };
-    if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
-        return false;
-    }
     let ended = await_end(&process, tsc_hz, 5);
     let umip = cpu::umip_on();
     let refused = matches!(process.ending(), Some(Ending::Faulted { vector: 13, .. }));
@@ -2138,15 +2187,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     // A program that single-steps itself ends by #DB, which arrives on its own interrupt
     // stack: a debug exception can come with no usable kernel stack (see `cpu::init`).
     let step = proof_programs::step();
-    let Some(image) = Image::new(LIMITS, step) else {
+    let Some(process) = start_program(com1, bsp, "single-step", Image::new(LIMITS, step), 0) else {
         return false;
     };
-    let Some(process) = image.finish() else {
-        return false;
-    };
-    if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
-        return false;
-    }
     let ended = await_end(&process, tsc_hz, 5);
     let (low, high) = cpu::bsp_debug_stack();
     let frame = cpu::last_debug_frame();
