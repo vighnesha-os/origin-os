@@ -37,13 +37,16 @@
 //! A stack's drop decides from records whether a processor may still be using it
 //! (`cpu::stack_in_use`):
 //! - **The caller's own stack pointer.**
-//! - **Each processor's kernel-stack record** (`cpu::set_kernel_stack`): the stack an interrupt
-//!   from ring 3 would land on.
+//! - **Each processor's kernel-stack record**: the stack an interrupt or a system call from ring 3
+//!   would land on, which the trap entry names from the running context's home (`cpu::resume`,
+//!   TASKS item 77), so it never names a stack the table of contexts does not cover.
 //! - **Each processor's table of contexts** (`cpu::CONTEXTS`, `origin_sync::contexts`). Every
 //!   thread published to a processor has its home there, an address in its own stack, from its
 //!   publication ([`GuardedStack::publish_first_frame`]) until it has ended and its processor has
-//!   left the stack. A suspended context's saved frame is there too, which also covers a stack it
-//!   is suspended on that is not its own, such as a measured stack ([`with_measured_stack`]).
+//!   left the stack, or until its spawner withdraws it, never having made it runnable
+//!   ([`GuardedStack::withdraw_first_frame`], TASKS item 75). A suspended context's saved frame is
+//!   there too, which also covers a stack it is suspended on that is not its own, such as a
+//!   measured stack ([`with_measured_stack`]).
 //!
 //! No switch writes a home. So a thread's own stack stays covered while it runs, while it is
 //! suspended, while it runs a measured closure, and in the windows of a switch and of its exit,
@@ -287,6 +290,23 @@ pub fn slot_holding(addr: u64) -> Option<StackSlot> {
     slot_of(addr).map(StackSlot)
 }
 
+/// Whether `a` and `b` are both in the stack region, in the same slot: the trap entry's check that
+/// an entry from ring 3 landed on the running context's own stack (`cpu::check_landing`, TASKS
+/// item 77), with one read of the region's base and of its size for both (the review of TASKS
+/// items 75, 77 and 81, R77-2).
+pub(crate) fn same_slot(a: u64, b: u64) -> bool {
+    let base = STACK_REGION_BASE.load(Ordering::Acquire);
+    let base = if base == 0 { STACK_REGION } else { base };
+    let size = region_size();
+    let slot = |addr: u64| {
+        addr.checked_sub(base)
+            .filter(|&offset| offset < size)
+            .map(|offset| offset / SLOT)
+    };
+    let one = slot(a);
+    one.is_some() && one == slot(b)
+}
+
 /// The top of the slot holding `addr`, if `addr` is in the stack region: past it lies the next
 /// slot's unmapped space. For the backtrace (`cpu::capture_backtrace`).
 pub fn slot_top(addr: u64) -> Option<u64> {
@@ -303,6 +323,10 @@ pub struct GuardedStack {
     bytes: usize,
     /// The first frame built on this stack, not yet published to a processor.
     first_frame: Option<u64>,
+    /// The processor and frame this stack's first frame was published to, for a withdrawal by
+    /// its spawner ([`Self::withdraw_first_frame`]). Kept for the stack's life: once the
+    /// scheduler holds the stack, nothing withdraws it.
+    published: Option<(CpuIndex, u64)>,
 }
 
 impl core::fmt::Debug for GuardedStack {
@@ -332,6 +356,7 @@ impl GuardedStack {
             slot,
             bytes,
             first_frame: None,
+            published: None,
         };
         if mapped {
             // A stack kept for reuse: as its last holder left it.
@@ -369,8 +394,10 @@ impl GuardedStack {
 
     /// Writes a new thread's first frame on this stack, starting at `start` with every other
     /// register zero, and returns its address (the value the scheduler's run queue keeps). It
-    /// is recorded as resumable only by [`publish_first_frame`](Self::publish_first_frame), once
-    /// the scheduler has accepted the thread, so a refused spawn leaves nothing behind.
+    /// is recorded as resumable only by [`publish_first_frame`](Self::publish_first_frame), before
+    /// the scheduler makes the thread runnable, and a spawn refused after that withdraws it
+    /// ([`withdraw_first_frame`](Self::withdraw_first_frame)), so a refused spawn leaves nothing
+    /// behind.
     pub fn build_first_frame(&mut self, start: ThreadStart) -> Option<u64> {
         let base = self.bytes_mut().as_ptr().addr() as u64;
         let rsp = self.top() - 8;
@@ -416,12 +443,31 @@ impl GuardedStack {
 
     /// Records the frame built by [`build_first_frame`](Self::build_first_frame) as resumable
     /// on processor `cpu`: the trap entry resumes only frames it has saved or a built first
-    /// frame published here (and consumed by the first resume). The scheduler calls this once
-    /// it has accepted the thread and still holds it unrunnable (under the run queue's lock).
+    /// frame published here (and consumed by the first resume). The scheduler calls this before
+    /// it makes the thread runnable, so that no run queue ever names a frame the processor's
+    /// table does not hold (TASKS item 75). `false` if there is no built frame or the table is
+    /// full.
     pub fn publish_first_frame(&mut self, cpu: CpuIndex) -> bool {
-        self.first_frame
+        let Some(frame) = self.first_frame.take() else {
+            return false;
+        };
+        let published = cpu::publish_context(cpu, frame);
+        if published {
+            self.published = Some((cpu, frame));
+        }
+        published
+    }
+
+    /// Withdraws this stack's published first frame from its processor's table, for a spawn
+    /// refused after the publication, before the thread was made runnable (TASKS item 75): the
+    /// stack is then in no record, and its drop gives it back. Only the spawner calls it, before it
+    /// hands the stack to the scheduler. `false` if nothing was published, or the table no longer
+    /// holds the frame as never resumed (`Contexts::withdraw`); the home, if any, then stays, and
+    /// the drop leaks the stack rather than free one a processor may run on.
+    pub fn withdraw_first_frame(&mut self) -> bool {
+        self.published
             .take()
-            .is_some_and(|frame| cpu::publish_context(cpu, frame))
+            .is_some_and(|(cpu, frame)| cpu::withdraw_context(cpu, frame))
     }
 
     /// The stack's memory: the running thread's stack, or one being built. Only the framework
@@ -608,6 +654,17 @@ fn in_use(low: u64, top: u64) -> bool {
 pub fn slot_in_use(slot: StackSlot) -> bool {
     let low = slot_base(slot.0);
     in_use(low, low + SLOT)
+}
+
+/// Whether some processor's table of contexts covers the stack in slot `slot`: a context's home
+/// or saved frame there. Part of what [`slot_in_use`] asks, without the caller's stack pointer
+/// and the kernel-stack records. For the kernel stacks proof's switch windows, where since TASKS
+/// item 77 the held processor's kernel-stack record still names the held thread's stack, so
+/// that what [`slot_in_use`] answers there would not show its home word (the review of TASKS
+/// items 75, 77 and 81, R77-1). It names no address.
+pub fn slot_in_contexts(slot: StackSlot) -> bool {
+    let low = slot_base(slot.0);
+    cpu::contexts_cover(low, low + SLOT)
 }
 
 /// The state of slot `slot` in the stack region's table, or `None` if there is no such slot. For

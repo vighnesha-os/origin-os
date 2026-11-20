@@ -353,7 +353,7 @@ pub const fn window_again(
 }
 
 /// Why a request was refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum QueueError {
     /// The queue holds [`CAPACITY`] contexts.
     Full,
@@ -361,6 +361,19 @@ pub enum QueueError {
     BadContext(u64),
     /// The boot context (slot 0) may not sleep or exit.
     BootContext,
+}
+
+/// Names the refusal, never `BadContext`'s value: it is a frame's address, in the kernel
+/// stacks' region, which no line prints (ADR-0004 Amendment 2, A6 and A6.3; the review of TASKS
+/// items 76 and 80, T76-80-3). `core` only: `origin-sync`'s Loom models compile this file too.
+impl core::fmt::Debug for QueueError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Full => "Full",
+            Self::BadContext(_) => "BadContext(..)",
+            Self::BootContext => "BootContext",
+        })
+    }
 }
 
 /// What a slot holds.
@@ -1524,5 +1537,27 @@ mod tests {
         assert_eq!(q.push(0), Err(QueueError::BadContext(0)));
         assert_eq!(q.push(0x1004), Err(QueueError::BadContext(0x1004)));
         assert_eq!(q.live(), 1);
+    }
+
+    /// A refusal's `Debug` names it and never prints the frame `BadContext` carries, in any
+    /// base: the scheduler's proof prints a `Result<usize, QueueError>` (T76-80-3).
+    #[test]
+    fn a_refusal_s_debug_prints_no_frame_address() {
+        let frame = 0xffff_c000_0001_fff4_u64;
+        let refused: Result<usize, QueueError> = Err(QueueError::BadContext(frame));
+        let text = alloc::format!("{refused:?}");
+        assert_eq!(text, "Err(BadContext(..))");
+        for shown in [
+            alloc::format!("{frame:x}"),
+            alloc::format!("{frame:X}"),
+            alloc::format!("{frame}"),
+        ] {
+            assert!(!text.contains(shown.as_str()), "{text}");
+        }
+        assert_eq!(alloc::format!("{:?}", QueueError::Full), "Full");
+        assert_eq!(
+            alloc::format!("{:?}", QueueError::BootContext),
+            "BootContext"
+        );
     }
 }

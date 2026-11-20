@@ -234,7 +234,8 @@ use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use loom::sync::{Arc, Notify};
 use loom::thread::{self, JoinHandle};
 
-use crate::contexts::{Contexts, Refused};
+use crate::backlog::Backlog;
+use crate::contexts::{BOOT_FLOW, Contexts, Refused};
 use crate::exits::Exits;
 use crate::floor::MonotonicFloor;
 use crate::ports::{self, Kind, Packet, Port, Reservation, Source, Storage, TakeError, Unreserved};
@@ -3478,6 +3479,19 @@ fn ctx_off(_: u64) -> bool {
     false
 }
 
+/// The frame `table`'s switch resumes, which most contexts models compare.
+fn ctx_switch(
+    table: &Contexts,
+    here: u64,
+    next: u64,
+    exiting: bool,
+    running_on: impl Fn(u64) -> bool,
+) -> Result<u64, Refused> {
+    table
+        .switch(here, next, exiting, running_on)
+        .map(|switched| switched.frame)
+}
+
 /// The boot flow, on stack 9, switched to context 1, then to 2, then back to 1: so each of the
 /// two has been switched out once before the model's own switch. Returns context 2's saved frame.
 fn ctx_two_threads(table: &Contexts) -> u64 {
@@ -3486,14 +3500,14 @@ fn ctx_two_threads(table: &Contexts) -> u64 {
     let at_1 = ctx_frame(1) - 0x100;
     let at_2 = ctx_frame(2) - 0x100;
     assert_eq!(
-        table.switch(ctx_frame(9), ctx_frame(1), false, ctx_off),
+        ctx_switch(table, ctx_frame(9), ctx_frame(1), false, ctx_off),
         Ok(ctx_frame(1))
     );
     assert_eq!(
-        table.switch(at_1, ctx_frame(2), false, ctx_off),
+        ctx_switch(table, at_1, ctx_frame(2), false, ctx_off),
         Ok(ctx_frame(2))
     );
-    assert_eq!(table.switch(at_2, at_1, false, ctx_off), Ok(at_1));
+    assert_eq!(ctx_switch(table, at_2, at_1, false, ctx_off), Ok(at_1));
     at_2
 }
 
@@ -3508,7 +3522,7 @@ fn ctx_switch_beside_a_reader(asked: u64) {
         thread::spawn(move || assert!(ctx_covered(&table, asked), "{UNCOVERED}"))
     };
     let here = ctx_frame(1) - 0x200;
-    assert_eq!(table.switch(here, at_2, false, ctx_off), Ok(at_2));
+    assert_eq!(ctx_switch(&table, here, at_2, false, ctx_off), Ok(at_2));
     reader.join().unwrap();
 }
 
@@ -3556,7 +3570,7 @@ fn contexts_an_ended_stack_is_free_only_after_its_last_use() {
                 })
             };
             let here = ctx_frame(1) - 0x200;
-            assert_eq!(table.switch(here, at_2, true, ctx_off), Ok(at_2));
+            assert_eq!(ctx_switch(&table, here, at_2, true, ctx_off), Ok(at_2));
             last_use.store(1, Relaxed);
             assert_eq!(table.retire_ended(ctx_off), Ok(()));
             reader.join().unwrap();
@@ -3583,7 +3597,7 @@ fn contexts_publications_beside_a_switch_each_get_a_slot() {
             });
             let boot = ctx_frame(9);
             assert_eq!(
-                table.switch(boot, ctx_frame(1), false, ctx_off),
+                ctx_switch(&table, boot, ctx_frame(1), false, ctx_off),
                 Ok(ctx_frame(1))
             );
             for publisher in publishers {
@@ -3596,14 +3610,14 @@ fn contexts_publications_beside_a_switch_each_get_a_slot() {
             let mut here = ctx_frame(1) - 0x100;
             for next in [ctx_frame(3), ctx_frame(4), boot] {
                 assert_eq!(
-                    table.switch(here, next, false, ctx_off),
+                    ctx_switch(&table, here, next, false, ctx_off),
                     Ok(next),
                     "{LOST_CONTEXT}"
                 );
                 here = next - 0x100;
             }
             assert_eq!(
-                table.switch(here, boot, false, ctx_off),
+                ctx_switch(&table, here, boot, false, ctx_off),
                 Err(Refused::NeverSaved),
                 "a frame resumed twice"
             );
@@ -3626,11 +3640,11 @@ fn contexts_two_retirers_lose_no_ended_context() {
             assert!(table.publish(ctx_frame(2)));
             assert!(table.publish(ctx_frame(3)));
             assert_eq!(
-                table.switch(ctx_frame(9), ctx_frame(1), false, ctx_off),
+                ctx_switch(&table, ctx_frame(9), ctx_frame(1), false, ctx_off),
                 Ok(ctx_frame(1))
             );
             assert_eq!(
-                table.switch(0x100, ctx_frame(2), true, ctx_off),
+                ctx_switch(&table, 0x100, ctx_frame(2), true, ctx_off),
                 Ok(ctx_frame(2))
             );
             let dropper = {
@@ -3638,7 +3652,7 @@ fn contexts_two_retirers_lose_no_ended_context() {
                 thread::spawn(move || assert_eq!(table.retire_ended(ctx_off), Ok(())))
             };
             assert_eq!(
-                table.switch(0x200, ctx_frame(3), true, ctx_off),
+                ctx_switch(&table, 0x200, ctx_frame(3), true, ctx_off),
                 Ok(ctx_frame(3))
             );
             dropper.join().unwrap();
@@ -3646,6 +3660,260 @@ fn contexts_two_retirers_lose_no_ended_context() {
             assert!(!ctx_covered(&table, 1), "{NEVER_RETIRED}");
             assert!(!ctx_covered(&table, 2), "{NEVER_RETIRED}");
             assert!(ctx_covered(&table, 3), "{UNCOVERED}");
+        },
+    );
+}
+
+/// What W1 reports when a context's first frame was both withdrawn and resumed, or neither.
+const WITHDRAWN_OR_RESUMED: &str = "a published context was both withdrawn and resumed, or neither";
+
+/// W1 (TASKS item 75; the coordinating session's addition (b)): the processor runs context D
+/// (stack 1), and context A (stack 2) is published and never made runnable. Its publisher
+/// withdraws it while, on the processor, a wrong scheduler names A's first frame, and a third
+/// processor publishes context C (stack 3) into the same table, whose one free slot it takes, or
+/// A's once A's withdrawal has freed it. Exactly one of the withdrawal and the switch takes A's
+/// frame; a withdrawn A leaves no home and a resumed one keeps it; C's claim is never lost, its
+/// home never cleared (so A's slot is reused only after A's home store), and its frame resumes.
+#[test]
+fn contexts_a_withdrawal_beside_a_switch_and_a_publication() {
+    check(
+        "contexts_a_withdrawal_beside_a_switch_and_a_publication",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let table = Arc::new(Contexts::new());
+            // D runs: the boot flow switched to it, and claimed a slot for its own frame. Then A is
+            // published: three of the model's four slots are taken.
+            assert!(table.publish(ctx_frame(1)));
+            assert_eq!(
+                ctx_switch(&table, ctx_frame(9), ctx_frame(1), false, ctx_off),
+                Ok(ctx_frame(1))
+            );
+            assert!(table.publish(ctx_frame(2)));
+            let withdrawer = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || table.withdraw(ctx_frame(2)))
+            };
+            let publisher = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || assert!(table.publish(ctx_frame(3)), "{LOST_CONTEXT}"))
+            };
+            let at_d = ctx_frame(1) - 0x100;
+            let resumed = ctx_switch(&table, at_d, ctx_frame(2), false, ctx_off);
+            let withdrawn = withdrawer.join().unwrap();
+            publisher.join().unwrap();
+            assert!(
+                withdrawn != resumed.is_ok(),
+                "{WITHDRAWN_OR_RESUMED}: withdrawn {withdrawn}, switch {resumed:?}"
+            );
+            if withdrawn {
+                assert_eq!(resumed, Err(Refused::NeverSaved), "{WITHDRAWN_OR_RESUMED}");
+                assert!(!ctx_covered(&table, 2), "a withdrawn context kept its home");
+            } else {
+                assert_eq!(resumed, Ok(ctx_frame(2)), "{WITHDRAWN_OR_RESUMED}");
+                assert!(ctx_covered(&table, 2), "{UNCOVERED}");
+            }
+            assert!(ctx_covered(&table, 1), "{UNCOVERED}");
+            assert!(ctx_covered(&table, 3), "{LOST_CONTEXT}");
+            // C's frame is intact: the running context, A or still D, switches to it.
+            let here = if withdrawn {
+                ctx_frame(1) - 0x200
+            } else {
+                ctx_frame(2) - 0x100
+            };
+            assert_eq!(
+                ctx_switch(&table, here, ctx_frame(3), false, ctx_off),
+                Ok(ctx_frame(3)),
+                "{LOST_CONTEXT}"
+            );
+        },
+    );
+}
+
+/// What K1 reports when a switch answered, or the table read back, a home other than the
+/// incoming context's.
+const WRONG_HOME: &str = "a switch named a stack not the incoming context's own";
+
+/// K1 (TASKS item 77): the processor's boot flow switches to A (stack 1) on its first run, then
+/// to B (stack 2), back to A at the frame it saved, and back to the boot flow, while another
+/// processor publishes C (stack 3) into the same table, so the slots' places vary. Each switch
+/// answers the home of the context whose frame it resumed, the boot flow's `BOOT_FLOW` included,
+/// and `running_home` reads the same back: the stack the trap entry names, and the one it checks
+/// a landing against, is always the running context's own.
+#[test]
+fn contexts_a_switch_names_the_incoming_home() {
+    check(
+        "contexts_a_switch_names_the_incoming_home",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let table = Arc::new(Contexts::new());
+            assert!(table.publish(ctx_frame(1)));
+            assert!(table.publish(ctx_frame(2)));
+            let publisher = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || assert!(table.publish(ctx_frame(3)), "{LOST_CONTEXT}"))
+            };
+            let boot = ctx_frame(9);
+            let at_1 = ctx_frame(1) - 0x100;
+            let at_2 = ctx_frame(2) - 0x100;
+            for (here, next, home) in [
+                (boot, ctx_frame(1), ctx_frame(1)),
+                (at_1, ctx_frame(2), ctx_frame(2)),
+                (at_2, at_1, ctx_frame(1)),
+                (at_1 - 0x100, boot, BOOT_FLOW),
+            ] {
+                let switched = table.switch(here, next, false, ctx_off);
+                assert_eq!(
+                    switched.map(|s| (s.frame, s.home)),
+                    Ok((next, Some(home))),
+                    "{WRONG_HOME}"
+                );
+                assert_eq!(table.running_home(), Some(home), "{WRONG_HOME}");
+            }
+            publisher.join().unwrap();
+            assert!(ctx_covered(&table, 3), "{LOST_CONTEXT}");
+        },
+    );
+}
+
+// ---------------------------------------------------------------- backlog (TASKS item 81)
+
+/// What B1 reports when a settle passed while a reap still held what it frees.
+const REAPED_EARLY: &str = "a settle passed while a reap still held what it frees";
+
+/// One reap, as `reap_closed` makes one: if anything is pending, the listed piece is taken off
+/// the list under its lock, and then, with the lock released, drained: its release gives back
+/// what it holds (`held` to 0).
+fn backlog_reap(backlog: &Backlog, list: &SpinLock<Option<u32>>, held: &Kept) {
+    if backlog.pending() == 0 {
+        return;
+    }
+    let taken = list.lock().take();
+    if taken.is_some() {
+        // SAFETY: the pointer is the cell's own; Loom's cell checks this write against the
+        // settler's read, and panics if they are not ordered, which is the point of the model.
+        backlog.drained(|| held.with_mut(|p| unsafe { *p = 0 }));
+    }
+}
+
+/// B1 (TASKS item 81; the review of TASKS item 79, T79-6): a process ends with a message still
+/// queued to it. Its close lists the channel and counts it, and then its end is seen. A system
+/// call's reap on another processor may take the channel and free the message. The boot flow,
+/// having seen the end, reaps what it can itself, and if nothing is pending it counts the heap,
+/// which reads `held`: the message must be freed, and the read ordered after its freeing,
+/// whichever of the two reaped it.
+#[test]
+fn backlog_a_settle_sees_what_a_reap_freed() {
+    check(
+        "backlog_a_settle_sees_what_a_reap_freed",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let backlog = Arc::new(Backlog::new());
+            let list = Arc::new(SpinLock::new(None));
+            let seen = Arc::new(AtomicBool::new(false));
+            let held = Arc::new(Kept::new(1));
+            let lister = {
+                let (backlog, list, seen) =
+                    (Arc::clone(&backlog), Arc::clone(&list), Arc::clone(&seen));
+                thread::spawn(move || {
+                    backlog.add(&list, |listed| *listed = Some(1));
+                    seen.store(true, Release);
+                })
+            };
+            let reaper = {
+                let (backlog, list, held) =
+                    (Arc::clone(&backlog), Arc::clone(&list), Arc::clone(&held));
+                thread::spawn(move || backlog_reap(&backlog, &list, &held))
+            };
+            if seen.load(Acquire) {
+                backlog_reap(&backlog, &list, &held);
+                if backlog.pending() == 0 {
+                    // SAFETY: as in `backlog_reap`.
+                    let now = held.with(|p| unsafe { *p });
+                    assert_eq!(now, 0, "{REAPED_EARLY}");
+                }
+            }
+            lister.join().unwrap();
+            reaper.join().unwrap();
+        },
+    );
+}
+
+/// Two pieces on a list that takes from its head, as `ipc::CLOSED` does: `(head, next)`.
+type TwoPieces = SpinLock<(Option<u32>, Option<u32>)>;
+
+/// `reap_closed`'s loop: while anything is pending, the head is taken under the list's lock and
+/// then drained, which gives back what it holds.
+fn backlog_reap_all(backlog: &Backlog, list: &TwoPieces, held: &[Arc<Kept>; 2]) {
+    while backlog.pending() != 0 {
+        let taken = {
+            let mut listed = list.lock();
+            let head = listed.0.take();
+            listed.0 = listed.1.take();
+            head
+        };
+        let Some(piece) = taken else {
+            return;
+        };
+        let Some(cell) = held.get(piece as usize).cloned() else {
+            return;
+        };
+        // SAFETY: as in `backlog_reap`.
+        backlog.drained(move || cell.with_mut(|p| unsafe { *p = 0 }));
+    }
+}
+
+/// Lists piece `n` at the head of the list, as `ipc::list_closed` does.
+fn backlog_list(backlog: &Backlog, list: &TwoPieces, n: u32) {
+    backlog.add(list, |listed| {
+        listed.1 = listed.0.take();
+        listed.0 = Some(n);
+    });
+}
+
+/// B2 (the review of TASKS items 75, 77 and 81, R81-1, whose own model this is): piece X is
+/// listed by a process P that is ending; another processor lists piece Y meanwhile; P's own reap
+/// in its `close_out`, then its end; the boot flow, having seen the end, reaps what it can and,
+/// with nothing pending, counts, which reads X's cell. A raise made after the list's lock is
+/// released lets P's reap take Y uncounted, and its lowering cancel X's raise while X is still
+/// listed.
+#[test]
+fn backlog_a_lowering_cannot_cancel_another_pieces_raise() {
+    check(
+        "backlog_a_lowering_cannot_cancel_another_pieces_raise",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let backlog = Arc::new(Backlog::new());
+            let list: Arc<TwoPieces> = Arc::new(SpinLock::new((None, None)));
+            let held = [Arc::new(Kept::new(1)), Arc::new(Kept::new(1))];
+            let seen = Arc::new(AtomicBool::new(false));
+            backlog_list(&backlog, &list, 0);
+            let lister = {
+                let (backlog, list) = (Arc::clone(&backlog), Arc::clone(&list));
+                thread::spawn(move || backlog_list(&backlog, &list, 1))
+            };
+            let ender = {
+                let (backlog, list, seen) =
+                    (Arc::clone(&backlog), Arc::clone(&list), Arc::clone(&seen));
+                let held = [Arc::clone(&held[0]), Arc::clone(&held[1])];
+                thread::spawn(move || {
+                    backlog_reap_all(&backlog, &list, &held);
+                    seen.store(true, Release);
+                })
+            };
+            if seen.load(Acquire) {
+                backlog_reap_all(&backlog, &list, &held);
+                if backlog.pending() == 0 {
+                    // SAFETY: as in `backlog_reap`.
+                    let now = held[0].with(|p| unsafe { *p });
+                    assert_eq!(now, 0, "{REAPED_EARLY}");
+                }
+            }
+            lister.join().unwrap();
+            ender.join().unwrap();
         },
     );
 }
