@@ -31,7 +31,7 @@ use crate::process::UserContext;
 use crate::timer::{self, X2Apic};
 use origin_frame::objref::ObjectRef;
 use origin_frame::percpu::PerCpu;
-use origin_frame::stack::{FpuArea, GuardedStack, ThreadStart};
+use origin_frame::stack::{FpuArea, GuardedStack, StackSlot, State as SlotState, ThreadStart};
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::exits::{Exits, Mark, Pending};
 use origin_frame::trap::Switch;
@@ -1321,11 +1321,17 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
             .map_or(0, |q| without_interrupts(|| q.lock().live()))
     };
     let in_use = || crate::memory::stats().map_or(0, |(h, _)| h.bytes_in_use);
-    let lost = || origin_frame::stack::counts().lost;
+    // A refused stack's own slot, read as soon as the spawn returns: a leak, which is what a
+    // publication left behind would cause, makes it `Lost` at once. Not the region's count of
+    // lost slots, which a stalled shootdown of any processor's reclaim also raises meanwhile
+    // (the review of TASKS items 75, 77 and 81, R75-1). Reused already by another spawn, it is
+    // `Live`: not leaked either.
+    let not_leaked = |slot: Option<StackSlot>| {
+        slot.is_some_and(|slot| origin_frame::stack::slot_state(slot) != Some(SlotState::Lost))
+    };
     let started = FINISHED.load(Ordering::Acquire);
     let contexts = live();
     let before = in_use();
-    let lost_before = lost();
     let quitting = || ThreadStart::Kernel {
         entry: quitter,
         arg: 0,
@@ -1340,18 +1346,22 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     );
     let no_area_clean =
         no_area == Err(QueueError::Full) && in_use() <= before && live() == contexts;
+    let unpublished_slot = core::cell::Cell::new(None);
     let unpublished = spawn_with_parts(
         bsp,
         quitting(),
         crate::runqueue::DEFAULT_WEIGHT,
         None,
         FpuArea::new,
-        |_, _| false,
+        |stack, _| {
+            unpublished_slot.set(Some(stack.slot()));
+            false
+        },
     );
     let unpublished_clean = unpublished == Err(QueueError::Full)
+        && not_leaked(unpublished_slot.get())
         && in_use() <= before
-        && live() == contexts
-        && lost() == lost_before;
+        && live() == contexts;
     let free = crate::runqueue::CAPACITY.saturating_sub(contexts);
     let mut filled = 0;
     for _ in 0..free {
@@ -1360,11 +1370,23 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         }
     }
     let full_use = in_use();
-    let full = spawn(bsp, quitter, 0);
+    // Published, then refused by the full queue: withdrawn before its stack drops.
+    let full_slot = core::cell::Cell::new(None);
+    let full = spawn_with_parts(
+        bsp,
+        quitting(),
+        crate::runqueue::DEFAULT_WEIGHT,
+        None,
+        FpuArea::new,
+        |stack, cpu| {
+            full_slot.set(Some(stack.slot()));
+            stack.publish_first_frame(cpu)
+        },
+    );
     let full_clean = full == Err(QueueError::Full)
+        && not_leaked(full_slot.get())
         && in_use() <= full_use
-        && live() == contexts + free
-        && lost() == lost_before;
+        && live() == contexts + free;
     let finished = started + filled as u64;
     yield_until(
         || FINISHED.load(Ordering::Acquire) == finished && live() == contexts,
@@ -1377,8 +1399,7 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         && full_clean
         && filled == free
         && live() == contexts
-        && FINISHED.load(Ordering::Acquire) == finished
-        && lost() == lost_before;
+        && FINISHED.load(Ordering::Acquire) == finished;
     let _ = writeln!(
         com1,
         "origin-kernel: scheduler: spawns refused for want of an FPU area ({no_area:?}), at their publication ({unpublished:?}) and on a full queue ({full:?}) give back the stack, its guard page and the FPU area, queue nothing and lose no stack{}",
