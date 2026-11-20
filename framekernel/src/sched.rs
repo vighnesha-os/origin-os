@@ -122,26 +122,20 @@ fn switch_fpu(id: usize, old: usize, new: usize) {
     }
 }
 
-/// Prepares CPU `id` to resume the thread in `slot`: TSS.RSP0 points at its kernel stack, so
-/// an interrupt from user mode always lands on the running thread's own stack (the boot or
-/// idle flow, with no stack of its own, never runs in user mode), and the page tables are its
-/// process's (the kernel's for a kernel thread).
+/// Prepares CPU `id` to resume the thread in `slot`: the page tables are its process's (the
+/// kernel's for a kernel thread). The stack an interrupt or a system call from user mode lands on
+/// is not set here: the framework's trap entry names the incoming context's own stack from its
+/// home in the processor's table of contexts, whatever this scheduler answered (TASKS item 77).
 fn follow_thread(id: usize, slot: usize, switch: &Switch) {
     let Some(threads) = THREADS.get(id) else {
         return;
     };
     let t = threads.lock();
-    match t.stacks.get(slot).and_then(Option::as_ref) {
-        Some(stack) => cpu::set_kernel_stack(stack),
-        // Every thread but the boot or idle flow has a stack: a slot without one means a
-        // thread was made runnable before its state was written, which `spawn_with` rules
-        // out by writing it under the queue lock. Counted for the boot proof.
-        None if slot != 0 => {
-            UNREADY_SWITCHES.fetch_add(1, Ordering::Relaxed);
-        }
-        // The boot or idle flow has no stack of its own: no thread's stack is current here
-        // any more, and an exited thread's stack can be freed.
-        None => cpu::clear_kernel_stack(),
+    // Every thread but the boot or idle flow has a stack: a slot without one means a thread was
+    // made runnable before its state was written, which `spawn_with` rules out by writing it under
+    // the queue lock. Counted for the boot proof.
+    if slot != 0 && t.stacks.get(slot).and_then(Option::as_ref).is_none() {
+        UNREADY_SWITCHES.fetch_add(1, Ordering::Relaxed);
     }
     match t.user.get(slot).and_then(Option::as_ref) {
         Some(user) => {

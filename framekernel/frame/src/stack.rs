@@ -29,8 +29,9 @@
 //! A stack's drop decides from records whether a processor may still be using it
 //! (`cpu::stack_in_use`):
 //! - **The caller's own stack pointer.**
-//! - **Each processor's kernel-stack record** (`cpu::set_kernel_stack`): the stack an interrupt
-//!   from ring 3 would land on.
+//! - **Each processor's kernel-stack record**: the stack an interrupt or a system call from ring 3
+//!   would land on, which the trap entry names from the running context's home (`cpu::resume`,
+//!   TASKS item 77), so it never names a stack the table of contexts does not cover.
 //! - **Each processor's table of contexts** (`cpu::CONTEXTS`, `origin_sync::contexts`). Every
 //!   thread published to a processor has its home there, an address in its own stack, from its
 //!   publication ([`GuardedStack::publish_first_frame`]) until it has ended and its processor has

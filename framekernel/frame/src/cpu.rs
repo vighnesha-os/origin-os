@@ -29,7 +29,7 @@ use crate::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
     TSS, TSS_SIZE,
 };
-use origin_sync::contexts::{Contexts, Refused};
+use origin_sync::contexts::{BOOT_FLOW, Contexts, Refused, Switched};
 
 use crate::percpu::PerCpu;
 use crate::trap::Switch;
@@ -201,14 +201,7 @@ struct ExceptionFrame {
 pub unsafe fn init() {
     let mut idt = Idt([[0; 2]; 256]);
     for (vector, (gate, stub)) in idt.0.iter_mut().zip(STUBS.iter()).enumerate() {
-        let ist = match vector {
-            1 => DEBUG_IST,
-            2 => NMI_IST,
-            8 => DOUBLE_FAULT_IST,
-            18 => MACHINE_CHECK_IST,
-            _ => 0,
-        };
-        *gate = d::interrupt_gate(*stub as usize as u64, KERNEL_CODE, ist);
+        *gate = d::interrupt_gate(*stub as usize as u64, KERNEL_CODE, ist_of(vector as u64));
     }
     let interrupts: [(u8, extern "sysv64" fn()); 12] = [
         (TIMER_VECTOR, timer_stub),
@@ -461,10 +454,11 @@ pub(crate) fn assign(index: CpuIndex, apic_id: u32) {
 pub(crate) struct CpuLocal {
     /// This processor's CPU index (offset 0, read by [`this_cpu`]).
     id: AtomicU64,
-    /// Address of this processor's TSS (offset 8, used by [`set_kernel_stack`]).
+    /// Address of this processor's TSS (offset 8, used by [`name_kernel_stack`]).
     tss: AtomicU64,
-    /// The running thread's kernel stack top (offset 16), the stack `syscall_entry`
-    /// switches to; kept equal to TSS.RSP0.
+    /// The running context's kernel stack top (offset 16), the stack `syscall_entry`
+    /// switches to; kept equal to TSS.RSP0, and both written only by [`name_kernel_stack`], from
+    /// the running context's home (TASKS item 77). 0 while the boot or idle flow runs.
     kernel_stack: AtomicU64,
     /// Scratch for the user RSP during `syscall_entry` (offset 24).
     user_rsp: AtomicU64,
@@ -472,6 +466,9 @@ pub(crate) struct CpuLocal {
     probe_rip: AtomicU64,
     /// CR2 of this CPU's last probe fault.
     probe_address: AtomicU64,
+    /// Entries from ring 3 whose landing [`check_landing`] has checked on this processor (TASKS
+    /// item 77). Written only by this processor, with interrupts off.
+    landings: AtomicU64,
 }
 
 impl CpuLocal {
@@ -484,6 +481,7 @@ impl CpuLocal {
             user_rsp: AtomicU64::new(0),
             probe_rip: AtomicU64::new(0),
             probe_address: AtomicU64::new(0),
+            landings: AtomicU64::new(0),
         }
     }
 }
@@ -505,6 +503,7 @@ static OUT_OF_RANGE: CpuLocal = CpuLocal {
     user_rsp: AtomicU64::new(0),
     probe_rip: AtomicU64::new(0),
     probe_address: AtomicU64::new(0),
+    landings: AtomicU64::new(0),
 };
 
 /// This processor's x2APIC ID from CPUID (leaf 0Bh EDX, else leaf 1 EBX bits 31:24), which
@@ -721,11 +720,29 @@ fn local() -> &'static CpuLocal {
     CPU_LOCAL.get(this_cpu().0).unwrap_or(&OUT_OF_RANGE)
 }
 
-/// Sets this processor's TSS.RSP0 to `stack`'s top: the stack an interrupt or exception from
-/// user mode switches to. `stack` is the kernel stack of the thread about to run in user mode;
-/// taking it by reference means a stale or invented value cannot be installed.
-pub fn set_kernel_stack(stack: &crate::stack::GuardedStack) {
-    let top = stack.top();
+/// Names the stack the running context's interrupts and system calls from ring 3 land on: this
+/// processor's kernel-stack record and its TSS.RSP0 become the top of the slot holding `home`, the
+/// incoming context's home in the table of contexts, or 0 for the boot or idle flow, whose home
+/// is `BOOT_FLOW` and which never runs in ring 3 (TASKS item 77). Only [`resume`] calls it, with
+/// the home its table's switch answered, so the scheduler above cannot name another context's
+/// stack, nor a stack that carries another context's suspended frame. The stack switch this
+/// sets up is the one the Intel SDM describes for a privilege change in IA-32e mode (Vol. 3A,
+/// order 325384-093US, September 2026, read 2026-11-20: §7.14.4, "Stack Switching in IA-32e
+/// Mode"; §10.7, the 64-bit TSS's RSPn); SYSCALL loads no stack pointer of its own (§6.8.8), so
+/// `syscall_entry` loads the record. A home in no kernel stack cannot be one a published context
+/// has, and halts the processor rather than name nothing for a context that may enter ring 3.
+fn name_kernel_stack(home: u64) {
+    let top = if home == BOOT_FLOW {
+        0
+    } else {
+        match crate::stack::slot_top(home) {
+            Some(top) => top,
+            None => panic!(
+                "the context resumed {} has its home in no kernel stack",
+                this_cpu().named()
+            ),
+        }
+    };
     let local = this_cpu().0;
     let Some(tss) = CPU_LOCAL.get(local).map(|l| l.tss.load(Ordering::Relaxed)) else {
         return;
@@ -745,12 +762,58 @@ pub fn set_kernel_stack(stack: &crate::stack::GuardedStack) {
     unsafe { field.wrapping_add(1).write_volatile((top >> 32) as u32) };
 }
 
-/// Records that this processor is running a context with no kernel stack of its own (the
-/// boot or idle flow): nothing is on any freed stack's account (`stack_in_use`).
-pub fn clear_kernel_stack() {
-    if let Some(l) = CPU_LOCAL.get(this_cpu().0) {
-        l.kernel_stack.store(0, Ordering::Release);
+/// The IST slot vector `vector`'s gate switches to (0: none), as [`init`] installs them: an entry
+/// through one of these lands on that stack of the interrupt stack table, never on the running
+/// context's (Intel SDM Vol. 3A, order 325384-093US, §7.14.5, "Interrupt Stack Table").
+const fn ist_of(vector: u64) -> u8 {
+    match vector {
+        1 => DEBUG_IST,
+        2 => NMI_IST,
+        8 => DOUBLE_FAULT_IST,
+        18 => MACHINE_CHECK_IST,
+        _ => 0,
     }
+}
+
+/// Checks that an entry from ring 3 at frame `here`, through a vector with no IST stack, landed
+/// in the running context's own stack (TASKS item 77, I2), and counts it. The source is the table
+/// of contexts: the home of its `current` slot, read lock-free with interrupts off, as the trap
+/// entry runs, and written only by this processor's switches. Never this processor's
+/// kernel-stack record or TSS.RSP0, which [`name_kernel_stack`] wrote from the same table: a
+/// wrong record would land the entry on the wrong stack and pass a check against itself (the
+/// coordinating session's addition (c)). A system call enters here too: `syscall_entry` builds
+/// an interrupt's frame on the stack its record names and joins the common path, so this check,
+/// at the start of [`dispatch`], is also the first thing the system-call path does in Rust (the
+/// addition (d)). A frame elsewhere was pushed onto another stack, perhaps over a suspended
+/// context's frame: the processor halts, as the trap entry does for a frame it never saved.
+fn check_landing(here: u64, vector: u64) {
+    let me = this_cpu();
+    let own = CONTEXTS
+        .get(me.get())
+        .and_then(Contexts::running_home)
+        .and_then(crate::stack::slot_holding);
+    if own.is_none() || own != crate::stack::slot_holding(here) {
+        panic!(
+            "an entry from ring 3 (vector {vector}) {} landed on a stack not the running context's own",
+            me.named()
+        );
+    }
+    if let Some(l) = CPU_LOCAL.get(me.0) {
+        // Only this processor writes it, with interrupts off: a plain load and store.
+        l.landings.store(
+            l.landings.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// How many entries from ring 3 every processor's [`check_landing`] has checked: for the boot
+/// proof, which shows that the check ran.
+pub fn landings_checked() -> u64 {
+    CPU_LOCAL
+        .iter()
+        .map(|l| l.landings.load(Ordering::Relaxed))
+        .fold(0, u64::wrapping_add)
 }
 
 /// Each processor's contexts (TASKS item 70): for each thread published to it, and its boot or
@@ -820,7 +883,13 @@ fn resume(here: u64, next: u64, exiting: bool) -> u64 {
             table.switch(here, next, exiting, running_on)
         });
     match outcome {
-        Ok(frame) => frame,
+        Ok(Switched { frame, home }) => {
+            // The incoming context's own stack, from its home, unless nothing switched.
+            if let Some(home) = home {
+                name_kernel_stack(home);
+            }
+            frame
+        }
         Err(Refused::NeverSaved) => panic!(
             "the scheduler returned a frame {} never saved: {}",
             me.named(),
@@ -853,9 +922,11 @@ pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
         panic!("an ended thread's stack was to be retired while this processor still ran on it");
     }
     used(stack_pointer())
-        // `kernel_stack` holds the top of the stack the processor runs on: this stack's top is
+        // `kernel_stack` holds the top of the running context's own stack: this stack's top is
         // one past its end, so compare it exactly (another stack's top can equal our guard
-        // page's address). Acquire, with `set_kernel_stack`'s Release.
+        // page's address). Acquire, with `name_kernel_stack`'s Release. Since TASKS item 77 it
+        // names only a stack whose home is in the table, so it adds no case the table misses;
+        // it stays, as the record `syscall_entry` reads (the coordinating session's Q6).
         || CPU_LOCAL
             .iter()
             .any(|l| l.kernel_stack.load(Ordering::Acquire) == top)
@@ -1066,6 +1137,10 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     use crate::irq::{self, Action};
     // The frame to resume: this one, unless the scheduler switches to another thread.
     let here = ptr::from_mut(frame).addr() as u64;
+    // An entry from ring 3 must have landed on the running context's own stack (TASKS item 77).
+    if frame.cs & 3 == 3 && ist_of(frame.vector) == 0 {
+        check_landing(here, frame.vector);
+    }
     // A program can set RFLAGS.AC; the entry path must have cleared it for the kernel.
     if frame.cs & 3 == 3 && SMAP_ON.load(Ordering::Relaxed) && read_rflags() & RFLAGS_AC != 0 {
         AC_LEAKS.fetch_add(1, Ordering::Relaxed);

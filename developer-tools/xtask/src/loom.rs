@@ -133,6 +133,9 @@ const CTX_LOST: &[&str] = &["a published context went unrecorded"];
 const CTX_NEVER_RETIRED: &[&str] = &["an ended context's home was never retired"];
 /// W1's reports (TASKS item 75): a first frame both withdrawn and resumed, or neither; a running
 /// context's stack uncovered; C's context lost; a withdrawn context's home left behind.
+/// K1's report (TASKS item 77): a switch, or the table read back, named a home other than the
+/// incoming context's.
+const CTX_WRONG_HOME: &[&str] = &["a switch named a stack not the incoming context's own"];
 const CTX_WITHDRAWN: &[&str] = &[
     "a published context was both withdrawn and resumed, or neither",
     "a live context's stack was in no record",
@@ -1408,6 +1411,41 @@ const CONTROLS: &[Control] = &[
             "contexts_two_retirers_lose_no_ended_context",
             CTX_NEVER_RETIRED,
         )],
+    },
+    Control {
+        // KX1 (TASKS item 77): the answer carries the outgoing context's home, so the trap entry
+        // would name the stack of the context it just suspended.
+        name: "contexts_switch_names_the_outgoing_home",
+        file: CONTEXTS,
+        from: "        let home = self.slots.get(incoming).map(|slot| slot.home.load(Acquire));\n",
+        to: "        let home = self.slots.get(outgoing).map(|slot| slot.home.load(Acquire));\n",
+        models: &[("contexts_a_switch_names_the_incoming_home", CTX_WRONG_HOME)],
+    },
+    Control {
+        // KX2: the answer carries `next` as the home: right on a context's first run, where its
+        // frame is its home, and wrong once it resumes at a frame it saved, or for the boot flow.
+        name: "contexts_switch_names_next_as_home",
+        file: CONTEXTS,
+        from: "        let home = self.slots.get(incoming).map(|slot| slot.home.load(Acquire));\n",
+        to: "        let home = Some(next);\n",
+        models: &[("contexts_a_switch_names_the_incoming_home", CTX_WRONG_HOME)],
+    },
+    Control {
+        // KX3: the answer carries the first slot's home, whichever context runs.
+        name: "contexts_switch_names_the_first_slot",
+        file: CONTEXTS,
+        from: "        let home = self.slots.get(incoming).map(|slot| slot.home.load(Acquire));\n",
+        to: "        let home = self.slots.first().map(|slot| slot.home.load(Acquire));\n",
+        models: &[("contexts_a_switch_names_the_incoming_home", CTX_WRONG_HOME)],
+    },
+    Control {
+        // KX4: the trap entry's check reads the home of the first slot, not of `current`'s: a
+        // landing on another context's stack could pass it.
+        name: "contexts_running_home_reads_the_first_slot",
+        file: CONTEXTS,
+        from: "            .get(self.current.load(Relaxed))\n            .map(|slot| slot.home.load(Acquire))\n",
+        to: "            .first()\n            .map(|slot| slot.home.load(Acquire))\n",
+        models: &[("contexts_a_switch_names_the_incoming_home", CTX_WRONG_HOME)],
     },
     Control {
         // WX1 (TASKS item 75): a withdrawal that takes the first frame by a plain store, not by
