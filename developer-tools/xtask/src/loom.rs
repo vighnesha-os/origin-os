@@ -185,6 +185,11 @@ const STALE_WOKE: &[&str] = &["a stale name woke the record's next thread"];
 /// followed an exit, or a new thread in the record, as if it were a move.
 const EXIT_FOLLOWED: &[&str] = &["a wake-up counted an exit or a new thread as a move"];
 
+/// What `threads_a_switch_takes_each_record_in_turn` reports (the review of TASKS item 92, R92-8):
+/// a switch restored a thread's state other than its last switch-out saved.
+const NOT_RESTORED: &[&str] =
+    &["a switch restored other than what the thread's last switch-out saved"];
+
 /// The models of a change to a space whose shootdowns may stall (`models.rs`).
 const ROUND_STALLS: &str =
     "a_change_whose_round_stalls_is_still_made_and_frees_only_what_a_flush_covered";
@@ -444,6 +449,38 @@ const CONTROLS: &[Control] = &[
             ("threads_a_wake_follows_a_move", DEADLOCK),
             ("threads_a_timed_wake_follows_a_move", DEADLOCK),
         ],
+    },
+    Control {
+        // The review of TASKS item 92, R92-1: a wake-up that follows its thread to the processor
+        // it moved to but wakes the slot it left there. In the move models the thread leaves
+        // slot 1 and arrives in slot 2, beside a blocked thread in slot 1.
+        name: "wake_to_the_slot_it_left",
+        file: THREADS,
+        from: "                    ready: Q::wake_slot(queue, at.slot()),\n",
+        to: "                    ready: Q::wake_slot(queue, at.slot().min(1)),\n",
+        models: &[
+            ("threads_a_wake_follows_a_move", DEADLOCK),
+            ("threads_a_timed_wake_follows_a_move", DEADLOCK),
+        ],
+    },
+    Control {
+        // The review's R92-6: the location read Relaxed. A wake-up that locks the old queue after
+        // its thread's exit may read the new thread's location there with the old generation,
+        // and follow it as a move.
+        name: "location_load_relaxed",
+        file: THREADS,
+        from: "Location::unpack(self.location.load(Acquire))",
+        to: "Location::unpack(self.location.load(Relaxed))",
+        models: &[("threads_a_wake_racing_an_exit_follows_nothing", EXIT_FOLLOWED)],
+    },
+    Control {
+        // The review's R92-8: a slot that names another thread's record, so a switch saves and
+        // restores the wrong thread's state.
+        name: "slot_names_another_record",
+        file: RUN_QUEUE,
+        from: "            *r = record;\n",
+        to: "            *r = record.map(|r| r ^ 1);\n",
+        models: &[("threads_a_switch_takes_each_record_in_turn", NOT_RESTORED)],
     },
     Control {
         // A location found clear under the lock taken for a move: the wake-up follows an exit.

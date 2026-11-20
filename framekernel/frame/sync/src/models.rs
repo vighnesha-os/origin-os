@@ -159,16 +159,19 @@
 //! - The thread records (`threads.rs`, TASKS item 92):
 //!   - A thread moved to another processor between its registration on a wait queue and its
 //!     block (timed or not) is woken: at its new slot, or at its old one before the move, which
-//!     carries the kept wake-up. A lost one leaves it blocked, a deadlock.
+//!     carries the kept wake-up. A lost one leaves it blocked, a deadlock. It arrives in another
+//!     slot than the one it left, so a wake-up that follows the processor alone fails too.
 //!   - A wake-up by a name whose thread has exited, and whose record went to a new thread in the
 //!     same slot, answers `Stale`, and leaves the new thread neither ready nor holding a wake-up.
 //!   - A wake-up racing its thread's exit, the record's return and its reuse on another processor
 //!     follows nothing (the count the kernel's boot proofs hold at 0) and never reaches the new
 //!     thread.
 //!   - A switch that saves the outgoing thread's state in its record and restores the incoming
-//!     one's, taking each record's lock in turn, beside a waker and a reader of the running
-//!     thread's record on other processors, restores what each thread's last switch-out saved,
-//!     with every access to a record's state ordered and no lock waiting in a circle.
+//!     one's, taking each record's lock in turn, beside a reader of a record on another
+//!     processor, restores what each thread's last switch-out saved, with every access to a
+//!     record's state ordered by that record's lock. The switch is a copy of `sched::with_queue`'s
+//!     steps, not the kernel's code; and since no path takes two records' locks together, no
+//!     model can show an order that waits in a circle.
 //! - The exit counts: a settle that has seen a thread's end and finds nothing pending (no thread
 //!   ending, no zombie, summed as `exits::pending` sums them) is ordered after everything that
 //!   thread gave back at its reap, whether it ended alone, beside another thread on its processor
@@ -599,6 +602,8 @@ fn rwlock_readers_share() {
 const THREAD_FRAME: u64 = 0x2000;
 /// The frame of the processor's idle context.
 const IDLE_FRAME: u64 = 0x1000;
+/// The frame of a thread a model queues beside the kernel thread, which never runs it.
+const OTHER_FRAME: u64 = 0x5000;
 /// Slots in a wait queue, as in the kernel (`WAITERS`).
 const WAITERS: usize = 16;
 /// The timed models' deadline, on the model's clock (which starts at 0).
@@ -1524,6 +1529,16 @@ fn wait_queue_timed_stale_wake_up_is_harmless() {
 /// Loom reports as a deadlock.
 fn a_wake_follows_a_move(wait: Wait) {
     let world = Kernel::with_threads_on(&[true, false, false]);
+    {
+        // Processor 1's slot 1 holds another thread, blocked for good, so the waiter, which
+        // leaves slot 1 of processor 0, arrives in slot 2: a wake-up that follows the processor
+        // but keeps the slot its thread left wakes this one instead (the review of TASKS item 92,
+        // R92-1).
+        let mut q = world.0.cpus[1].queue.lock();
+        assert_eq!(q.push(OTHER_FRAME).unwrap(), 1);
+        assert_eq!(q.tick(IDLE_FRAME), OTHER_FRAME);
+        assert_eq!(q.block(OTHER_FRAME).unwrap(), IDLE_FRAME);
+    }
     let queue = Arc::new(Queue::new());
     let flag = Arc::new(AtomicBool::new(false));
     let waiter = world.spawn_moving(0, 1, {
@@ -1694,14 +1709,15 @@ fn threads_a_wake_racing_an_exit_follows_nothing() {
 /// What a switch must find in the incoming thread's record.
 const NOT_RESTORED: &str = "a switch restored other than what the thread's last switch-out saved";
 
-/// A processor's timer switches twice between two threads, as `sched::with_queue` does: under
-/// its queue's lock, the outgoing thread's state is saved in its record, then the incoming one's
-/// read from its own, each record's lock released before the next is taken (the lock order of
-/// `threads.rs`). Meanwhile, from other processors, a waker names the first thread and wakes it
-/// through its record, and a reader finds the running thread's record through the queue, then
-/// reads it, as `sched::current_user` does. Each restore reads what that thread's last switch-out
-/// saved; Loom's cell checks that every access to a record's state is ordered with every other,
-/// and its deadlock check that the locks are taken in an order that cannot wait in a circle.
+/// A processor's timer switches twice between two threads, as `sched::with_queue` does (a copy):
+/// under its queue's lock, the outgoing thread's state is saved in its record, then the incoming
+/// one's read from its own, each record's lock released before the next is taken (the lock order
+/// of `threads.rs`). Meanwhile another processor reads the first thread's state under that
+/// record's lock alone, as a reaper or `sched::end_with` does. Each restore reads what that
+/// thread's last switch-out saved, which needs each slot to name its own thread's record; and
+/// the reader shares nothing with the timer but the records, so Loom's cell, which checks that
+/// every access to a record's state is ordered with every other, checks what the records' locks
+/// order (the review of TASKS item 92, R92-8).
 fn a_switch_takes_each_record_in_turn() {
     let world = Kernel::with_threads_on(&[true, false, false]);
     let kernel = Arc::clone(&world.0);
@@ -1739,18 +1755,10 @@ fn a_switch_takes_each_record_in_turn() {
             }
         }
     });
-    let waker = world.spawn(1, move |me| me.wake(first));
     let reader = thread::spawn(move || {
-        let running = {
-            let q = kernel.cpus[0].queue.lock();
-            q.record(q.current())
-        };
-        if let Some(record) = running {
-            let _ = *kernel.record(record).state().lock();
-        }
+        let _ = *kernel.record(first.record).state().lock();
     });
     timer.join().unwrap();
-    waker.join().unwrap();
     reader.join().unwrap();
 }
 
