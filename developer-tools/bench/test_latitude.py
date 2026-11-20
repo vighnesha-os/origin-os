@@ -224,6 +224,13 @@ class Guards(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.lat.boot_entry(sneaky, self.PARTUUID)
 
+    def test_started_by_says_whether_the_last_start_followed_the_order(self):
+        # Rental A's own form: started by Boot0004 (network) with Boot0002 (the disk) first.
+        self.assertIn("started by Boot0004, not by Boot0002", self.lat.started_by(self.OLD_STYLE, "Boot0002"))
+        same = self.OLD_STYLE.replace("BootCurrent: 0004", "BootCurrent: 0002")
+        self.assertIn("the entry Origin's loader replaced", self.lat.started_by(same, "Boot0002"))
+        self.assertEqual(self.lat.started_by(self.NEW_STYLE, "Boot0002"), "efibootmgr shows no BootCurrent")
+
     def test_boot_result(self):
         verdict = "\x1b[0morigin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF (1 MiB)\r\n" \
                   "origin-kernel: boot verdict: degraded: 58 of 59 proofs passed\r\n"
@@ -488,7 +495,10 @@ class Guards(unittest.TestCase):
         self.assertEqual([(m, p) for m, p, _ in posts], [("POST", "/servers/sv_x/actions")] * 2)
         self.assertEqual(posts[0][2]["data"]["attributes"]["action"], "reboot")
         self.assertEqual(len(json.loads((d / "boots.json").read_text())), 3)
-        self.assertIn("boot 3: origin-kernel: boot verdict: 71 of 71", (d / "record-draft.md").read_text())
+        record = (d / "record-draft.md").read_text()
+        self.assertIn("boot 3: origin-kernel: boot verdict: 71 of 71", record)
+        self.assertIn("| Boot entry | Boot0002 \\EFI\\ubuntu\\shimx64.efi; the running system was "
+                      "started by Boot0004, not by Boot0002", record)
 
     def test_two_writers_lose_nothing(self):
         self.lat.add_rental({"server_id": "sv", "usd_per_hour": 0.41, "deployed_at": 1.0, "deadline": 2.0})

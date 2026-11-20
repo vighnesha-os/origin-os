@@ -949,6 +949,22 @@ def boot_entry(efibootmgr, esp_partuuid):
 IDENTITY_LINE = "origin-kernel: CPU identity: "
 
 
+def started_by(efibootmgr, entry):
+    """What the firmware last started, against the entry Origin's loader now sits in. Rental A's
+    Linux had been started by a network-boot entry although the disk's came first in the order:
+    if a reset goes the same way, the firmware does not start Origin's loader, and the console
+    shows another system or the network boot. The record says which was the case."""
+    current = re.search(r"^BootCurrent:\s*([0-9A-Fa-f]{4})", efibootmgr, re.MULTILINE)
+    if not current:
+        return "efibootmgr shows no BootCurrent"
+    current = f"Boot{current.group(1).upper()}"
+    if current == entry:
+        return f"the running system was started by {entry}, the entry Origin's loader replaced"
+    return (f"the running system was started by {current}, not by {entry}, which is first in "
+            "the order: its last start did not follow the order (a one-time choice by the "
+            "provider, or a disk that was empty then)")
+
+
 def scope_row(origin_lines, lscpu):
     """The record's scope: the kernel's own `CPU identity` line (ADR-0009 A2, TASKS item 16),
     verbatim; only if the console never carried it, ADR-0009 A2's rule applied by hand to what
@@ -1047,7 +1063,8 @@ def cmd_rental_b(args):
                               text=True, check=True, timeout=60).stdout.strip()
         entry, path = boot_entry((dump / "efibootmgr.txt").read_text(), partuuid)
         target = "/boot/efi" + path.replace("\\", "/")
-        print(f"{stamp()} the firmware's first entry, {entry}, starts {path} on the mounted ESP")
+        last = started_by((dump / "efibootmgr.txt").read_text(), entry)
+        print(f"{stamp()} the firmware's first entry, {entry}, starts {path} on the mounted ESP; {last}")
         rental.ssh("rm -rf /tmp/origin && mkdir -m 700 /tmp/origin", check=True, timeout=60)
         subprocess.run(["scp", "-q"] + ssh_base(rental.dir)[1:] + [str(loader), str(kernel),
                        f"{OS_USER}@{rental.ip}:/tmp/origin/"], check=True, timeout=300)
@@ -1059,7 +1076,7 @@ def cmd_rental_b(args):
                           timeout=120).stdout.split()
         if sums[0] != sha256(loader) or sums[2] != sha256(kernel):
             raise RuntimeError("the files on the ESP do not match the image")
-        (rental.dir / "installed.txt").write_text(f"{entry} {path}\n{' '.join(sums)}\n")
+        (rental.dir / "installed.txt").write_text(f"{entry} {path}; {last}\n{' '.join(sums)}\n")
         print(f"{stamp()} Origin's loader is {path}, and its kernel \\EFI\\ORIGIN\\KERNEL.ONBF; "
               "no UEFI variable was written")
         console = rental.console
@@ -1111,6 +1128,7 @@ def write_record(args, rental, results):
     lscpu = read("lscpu.txt")
     cpu = dict((k.strip(), v.strip()) for k, _, v in (l.partition(":") for l in lscpu.splitlines()))
     console_text = rental.console.text() if rental.console else ""
+    installed = (rental.dir / "installed.txt").read_text() if (rental.dir / "installed.txt").exists() else ""
     log = redact(console_text, rental.server_id, [rental.ip])
     (rental.dir / "console-redacted.log").write_text(log)
     origin = [l.strip() for l in log.splitlines() if "origin-kernel:" in l]
@@ -1131,6 +1149,7 @@ def write_record(args, rental, results):
         ("Scope", scope_row(origin, lscpu) + ". Bench equipment: it qualifies nothing and "
                   "supports no hardware claim (CLAUDE.md §74, §76, rules 30 and 40; item 233)"),
         ("Environment", "A physical machine with no hypervisor; the provider's firmware and BMC"),
+        ("Boot entry", installed.splitlines()[0] if installed else "Origin's files were not installed"),
         ("Speculation controls", pick("speculation")),
         ("IOMMU", pick("iommu")),
         ("Log", f"`console-redacted.log`, SHA-256 {sha256(rental.dir / 'console-redacted.log')}"),
