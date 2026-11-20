@@ -7085,7 +7085,9 @@ mod oversubscribed_tests {
 
     /// Decision item 316: ADR-0013 Amendment 3 ended when TASKS item 73 landed, so the named
     /// machines' kernel boot requires the stacks proof's last line to count no stack lost, as
-    /// every other machine's does, under QEMU's software processor and under KVM.
+    /// every other machine's does, under QEMU's software processor and under KVM: every machine
+    /// `boot-matrix` and the scenario commands make (the independent review of TASKS item 73
+    /// asked for all of them, not the named ones alone).
     #[test]
     fn every_machine_requires_no_stack_lost() {
         let kvm = Settings {
@@ -7094,16 +7096,27 @@ mod oversubscribed_tests {
         };
         for base in [&Settings::default(), &kvm] {
             let runs = [
-                super::matrix_runs(base, &[1, 4, 65]),
+                super::matrix_runs(base, &[1, 2, 3, 4, 65]),
                 super::sparse_runs(base),
                 super::many_runs(base),
+                super::x2apic_runs(base),
+                super::bridge_runs(base),
+                super::reserved_runs(base),
+                super::legacy_free_runs(base),
+                super::acpi_runs(base),
+                super::random_runs(base),
+                super::identity_runs(base),
+                super::listed_runs(base),
             ];
+            // Every machine whose kernel boot runs the stacks proof; the one without the
+            // random-number instructions withholds it, and its line, and no named machine may.
+            let mut judged = 0;
             for run in runs.into_iter().flatten() {
                 let markers = super::boot_scenario(&run.settings).markers;
-                let at = markers
-                    .iter()
-                    .position(|m| m == super::STACKS_GIVEN_BACK)
-                    .expect("the stacks proof's last line is a marker");
+                let Some(at) = markers.iter().position(|m| m == super::STACKS_GIVEN_BACK) else {
+                    assert!(!super::oversubscribed(&run.settings), "{:?}", run.settings);
+                    continue;
+                };
                 assert_eq!(
                     markers.get(at + 1..at + 3),
                     Some(
@@ -7114,7 +7127,10 @@ mod oversubscribed_tests {
                     "{:?}",
                     run.settings
                 );
+                judged += 1;
             }
+            // The ten machines of `boot-matrix` at least.
+            assert!(judged >= 10, "{judged}");
         }
     }
 
