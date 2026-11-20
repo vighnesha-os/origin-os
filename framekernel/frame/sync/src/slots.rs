@@ -66,7 +66,8 @@ pub enum State {
     Idle,
     /// Given back, still mapped, to be reclaimed.
     Retired,
-    /// Being reclaimed: unmapped, waiting for its shootdown, its first or a fresh one.
+    /// Taken by the one reclaim under way: to be unmapped and shot down for the first time (set
+    /// before its unmap runs), or, after a stall, sent a fresh shootdown (T73-7).
     Reclaiming,
     /// Unmapped, and its shootdown stalled: what was mapped is kept until a fresh shootdown
     /// completes ([`Slots::reclaim`]).
@@ -136,8 +137,9 @@ pub struct Counts {
     pub lost: usize,
     /// Pages mapped in the region: those of Live, Idle and Retired slots, of slots being
     /// reclaimed for the first time, and of slots lost by [`Slots::leak`], which stay mapped
-    /// because a processor may still run on them. A slot waiting after a stall counts none: its
-    /// pages left the tables before its first shootdown.
+    /// because a processor may still run on them. A slot reclaimed for the first time is counted
+    /// until its shootdown returns, though its unmap may have run (T73-7). A slot waiting after a
+    /// stall counts none: its pages left the tables before its first shootdown.
     pub pages: u64,
 }
 

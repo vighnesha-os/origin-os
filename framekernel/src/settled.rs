@@ -58,7 +58,7 @@ impl core::fmt::Display for Unsettled {
             (retired, Some(cpu)) => part(
                 f,
                 format_args!(
-                    "{retired} kernel stacks retired (one waiting for CPU {cpu} to answer)"
+                    "{retired} kernel stacks retired (one withheld since CPU {cpu} did not answer its shootdown)"
                 ),
             )?,
         }
@@ -158,7 +158,7 @@ mod tests {
         // 73): counted among the retired, with the processor named.
         assert_eq!(
             judge(0, 0, 3, Some(7), 0, 0, 0).unwrap_err().to_string(),
-            "3 kernel stacks retired (one waiting for CPU 7 to answer)"
+            "3 kernel stacks retired (one withheld since CPU 7 did not answer its shootdown)"
         );
         // A loss during the settle: the growth, not the total.
         assert_eq!(
@@ -177,7 +177,7 @@ mod tests {
         );
         assert_eq!(
             judge(2, 1, 2, Some(64), 0, 0, 3).unwrap_err().to_string(),
-            "2 ending threads not yet exited, 1 exited threads unreaped, 2 kernel stacks retired (one waiting for CPU 64 to answer), 3 kernel stacks lost"
+            "2 ending threads not yet exited, 1 exited threads unreaped, 2 kernel stacks retired (one withheld since CPU 64 did not answer its shootdown), 3 kernel stacks lost"
         );
         // Closed channels not yet reaped (TASKS item 81), after the stacks retired and before
         // the stacks lost: alone, and beside everything else.
@@ -187,7 +187,7 @@ mod tests {
         );
         assert_eq!(
             judge(2, 1, 2, Some(64), 4, 0, 3).unwrap_err().to_string(),
-            "2 ending threads not yet exited, 1 exited threads unreaped, 2 kernel stacks retired (one waiting for CPU 64 to answer), 4 closed channels not yet reaped, 3 kernel stacks lost"
+            "2 ending threads not yet exited, 1 exited threads unreaped, 2 kernel stacks retired (one withheld since CPU 64 did not answer its shootdown), 4 closed channels not yet reaped, 3 kernel stacks lost"
         );
     }
 
@@ -233,11 +233,11 @@ mod tests {
         assert_eq!(not_settled(Ok(()), Ok(())), "");
         assert_eq!(
             not_settled(waiting, Ok(())),
-            "; not settled before its first count: 1 kernel stacks retired (one waiting for CPU 3 to answer)"
+            "; not settled before its first count: 1 kernel stacks retired (one withheld since CPU 3 did not answer its shootdown)"
         );
         assert_eq!(
             not_settled(Ok(()), waiting),
-            "; not settled before its compare: 1 kernel stacks retired (one waiting for CPU 3 to answer)"
+            "; not settled before its compare: 1 kernel stacks retired (one withheld since CPU 3 did not answer its shootdown)"
         );
     }
 }
