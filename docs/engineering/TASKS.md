@@ -3514,7 +3514,10 @@ Built on `claude/t92-thread-records`, cut from `main` at `1c9c7a96` (PR 47 and P
 - `9af6cbc4`: the first delta review's answers (R92-11 to R92-14).
 - `25e47f5a`: the switch reads its records from the slots, resolved once at spawn (the second Q6 ruling).
 - `1c690a50`: the second delta review's answers (R92-15 to R92-19).
-- The records: this entry, CL47, the provenance entry.
+- `4e0a2861`: the records: this entry, CL47, the provenance entry.
+- `2f38bf77`: G92-1, the lifecycle proof's race, found by the gates (below).
+- `1675118d`: the G92-1 delta review's answers (R92-20 to R92-29): the opening check waits too, and a failing line names more causes.
+- The gates' results, in this entry.
 
 **The design as it lands:**
 
@@ -3651,7 +3654,53 @@ The calls a thread-to-thread switch makes are now the base's: `RunQueue::switch`
   - **The new controls:** `wake_to_the_stale_slot`, `location_not_read_again_under_the_lock`, `wake_to_the_slot_it_left`, `generation_not_compared`, `an_exit_followed_as_a_move`, `a_new_thread_followed_as_a_move`, `location_load_relaxed` and `slot_names_another_record`.
   - **One existing control widened:** `unlock_release_relaxed` now also names the switch model.
 - **Boots:** `boot-test`, 11 of 11, on each code change; the comparison's 36 large-machine boots and 18 B1 boots, every one passing.
-- **The gates on the final tip:** GATES.
+- **The gates on the final tip:** GATES_FINAL.
+
+**The gates' first round, on `4e0a2861`, and G92-1.** Each gate ran in its own turn, with the worktree clean.
+
+| Gate | Result |
+|---|---|
+| `check` | Passed, 710 s: 2,547 host tests passed, 0 failed, 30 ignored; Loom 79 models, 120 controls caught; every document gate |
+| `boot-test` | Passed, 11 of 11 |
+| `boot-matrix` runs 1, 2 and 4 | Passed (1,156, 1,160 and 1,154 s) |
+| `boot-matrix` run 3 | Failed after 253 s |
+| `boot-matrix` run 5 | Failed after 342 s |
+
+- **Run 3 (2026-11-20, about 18:51 UTC):** the Intel-IOMMU 4-processor machine's "wrong key" scenario, in which the loader refuses a kernel signed with an untrusted key and no Origin code runs, printed nothing within 120 s.
+  - Its serial log, `boot-test-wrong-key.log`, holds 0 bytes: not even the firmware's first line.
+  - Every other scenario of that machine had passed in the same run.
+  - No other worktree's or scratch copy's xtask boot wrote a log between 18:42 and 18:55 UTC. A QEMU started outside xtask cannot be seen.
+  - Recorded as a stall of the host or firmware, on the coordinating session's ruling of 2026-11-21 (`t92-gates-ruling.md`). No follow-up is numbered on one occurrence; another empty log in the next three runs, on any machine, would stop the work.
+- **Run 5, G92-1:** the AMD-IOMMU 3-processor machine's lifecycle proof printed "exited threads freed their slots (slot Ok(1) reused): scheduler failed".
+  - Its alternations, sleep and reuse held, so it failed on `live() == 1`.
+  - `prove_lifecycle`, `measure_switch`, `bencher` and `quitter` were the base's, byte for byte. `measure_switch` stopped waiting once `FINISHED` counted both bench threads, but each raises it inside `finish`, before its exit. A tick between the two left the thread in its slot, and the proof read the queue with no wait: TASKS item 79's race, in a proof it did not cover. The quitter's 1 s wait giving up was a second way in.
+  - **On the ruling, closed here (`2f38bf77`):**
+    - After `measure_switch` the proof waits, through `wait_for_others` as the settles do (10 s; a line only past 2 s), for every thread whose end it has seen to leave the queue. A thread that never leaves still fails it.
+    - The quitter's wait giving up is a failure of its own.
+    - The passing line is unchanged. A failing line names each cause after ": scheduler failed".
+  - **`main` keeps the race until the ninth batch lands.**
+- **The delta review of G92-1** (R92-20 to R92-29, in `REVIEW_T92`) found the same race one line earlier (R92-20, Medium). The proof before, `prove_simd`, ends when its workers have counted themselves finished, which each does before its exit. `prove_lifecycle`'s opening check then read the queue with no wait.
+  - **`1675118d`:** the opening check waits the same way first, and a failure says how many contexts were still queued.
+  - **A failing line also names, without judging them:** the first threads' 3 s wait giving up, and a switch benchmark that could not spawn.
+  - **The verdict** is derived from the named conditions.
+- **The controls,** each planted in a `git archive` export (the script `plant.py`, kept with the session's logs). Each was booted with `cargo xtask boot-test` on the AMD-IOMMU 3-processor machine and on 1 processor, with the same result on both. C92-L1 and C92-L5 on the base are planted on `main` at `1c9c7a96`; the rest on `1675118d`.
+
+| Control | Plant | Result |
+|---|---|---|
+| C92-L1 | On the base: a bench thread sleeps 3 ticks between its `FINISHED` raise and its exit | Fails with run 5's line, word for word: the race is the base's (and `main`'s) |
+| C92-L2 | The same plant on the fix | Passes, 11 of 11, with no extension line |
+| C92-L2b | On the fix: the bench thread held 2.5 s, past the wait's 2 s (R92-21) | Passes, 11 of 11, after "waited 2499 ms for the lifecycle proof's threads to leave the queue, past the former 2000 ms" (2487 ms on 1 processor) |
+| C92-L3 | On the fix: a bench thread never exits after its raise | Fails after "waited 10000 ms … in vain", with "…: scheduler failed; 2 contexts still queued after the wait" |
+| C92-L4 | On the fix: the quitter sleeps 1.5 s before it finishes | Fails with "…: scheduler failed; the quitter's wait gave up after 1 s" |
+| C92-L5 | A SIMD worker sleeps 3 ticks between its `SIMD_EXITED` raise and its exit (R92-20): on the base | Fails with "CPU 0 still has threads: scheduler failed" |
+| | The same plant on the fix | Passes, 11 of 11 |
+
+C92-L1 to L4 were first run on `2f38bf77`, with the same results.
+
+- **Whether this task widened the window:** from `FINISHED`'s raise to the exit's `int $0x83`, the executed path is 17 instructions in the base and 15 on the tip, not counting padding.
+  - Each is the raise, the interrupt flag saved and cleared, one locked compare-exchange for the lock (the processor's `Threads` table's in the base, the thread's record's on the tip), the mark's store, the release and the flag restored. The base also checks the slot's index.
+  - Neither path makes a call. Read from each image's `bencher` (`llvm-objdump`), following the executed branches.
+  - Reported, not judged.
 
 **Review:** three AI reviews, each given the code and the properties without the author's argument, recorded in `REVIEW_T92_2026-11-20.md`.
 

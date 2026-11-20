@@ -5563,6 +5563,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - **`sched`:** spawn, the switch, `current_thread`, `current_user`, `end_with`, `on_exit`, the reap and `wake` through records.
   - **Proofs and verdicts:** the IPC proof's condition and `settled::judge`'s verdict, holding the moves followed at 0 and every record accounted for.
   - **Loom:** the threads named by records, five models and eight negative controls.
+  - **G92-1:** the lifecycle proof waits for its threads to leave the queue and names each cause of a failure. A race in the base's code that the gates found; boot controls C92-L1 to C92-L4.
   - Built on `claude/t92-thread-records` from `main` at `1c9c7a96`. The contract, its rulings, the commits and the comparison are in TASKS item 92's entry.
 - **Authoring agent:** a Claude Code side session of the coordinating session (Claude Opus 5.5), on that session's rulings: Q1 to Q10 of the contract, and three on the comparison (`t92-q6-ruling.md`, `-2` and `-3`).
 - **Specifications:** none outside the repository. The C11 memory model as Loom 0.7.2 implements it, for the models.
