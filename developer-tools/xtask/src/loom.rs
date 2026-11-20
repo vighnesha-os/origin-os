@@ -114,6 +114,26 @@ const GIVEN_BACK: &[&str] = &[
 /// A change that returned a stall left its space confirmed.
 const FORGOTTEN: &[&str] = &["a change that stalled left its space confirmed"];
 
+/// What the models of a reclaim that stalls report (`models.rs`; TASKS item 73): what a slot held
+/// reused while a processor could still reach it, a slot never given back or given back twice,
+/// and two slots out of the tables at once.
+const WAITING_REUSED: &[&str] = &[
+    "Causality violation",
+    "a processor kept a translation the shootdown took away",
+    "what an unmap returned was not released exactly once",
+];
+const NEVER_GIVEN_BACK: &[&str] = &[
+    "a stalled slot was never given back",
+    "what an unmap returned was not released exactly once",
+];
+const TWO_OUT: &[&str] = &["a second slot was unmapped while one waited"];
+/// What a waiting slot held, released on a stall of a fresh shootdown (T73-5).
+const RELEASED_ON_A_STALL: &[&str] = &[
+    "what a waiting slot held was released on a stall",
+    "Causality violation",
+    "what an unmap returned was not released exactly once",
+];
+
 /// What the port models report (`models.rs`): a packet lost or doubled, a binding left armed
 /// after its handle closed, and a closed port left holding something.
 const PORT_LOST: &[&str] = &["a signal was lost, or one binding made two packets"];
@@ -1011,23 +1031,65 @@ const CONTROLS: &[Control] = &[
         // another processor still holds the old translation (ADR-0004 Amendment 1, A2).
         name: "slot_free_before_the_shootdown",
         file: SLOTS,
-        from: "            table.set(slot, State::Reclaiming);\n",
-        to: "            table.free(slot);\n",
+        from: "        self.set(slot, State::Reclaiming);\n",
+        to: "        self.free(slot);\n",
         models: &[("slots_reclaimed_slot_is_taken_only_after_its_shootdown", STALE)],
     },
     Control {
         // What a reclaimed slot held goes back as soon as it leaves the tables.
         name: "slot_released_before_the_shootdown",
         file: SLOTS,
-        from: "        let unmapped = unmap(slot, pages);
-        let outcome = shoot(slot, pages);
-        match outcome {
-            Ok(_) => release(unmapped),
-            Err(_) => core::mem::forget(unmapped),
-        }
+        from: "                let unmapped = unmap(slot, pages);
+                let outcome = shoot(slot, pages);
+                match outcome {
+                    Ok(completed) => {
+                        release(unmapped);
+                        let mut table = self.table.lock();
+                        table.counts.retired -= 1;
+                        table.counts.pages -= u64::from(pages);
+                        table.free(slot);
+                        Some(Reclaim::Freed {
+                            completed,
+                            asked_again: 0,
+                        })
+                    }
+                    Err(stall) => {
+                        let mut table = self.table.lock();
+                        // Out of the tables, so no longer mapped, though still retired.
+                        table.counts.pages -= u64::from(pages);
+                        table.set(slot, State::Waiting);
+                        table.waiting = Some(Waiting {
+                            slot,
+                            pages,
+                            kept: unmapped,
+                            stall,
+                            asked_again: 0,
+                        });
+                        self.publish(&table);
+                        Some(Reclaim::Stalled {
+                            stall,
+                            asked_again: 0,
+                        })
+                    }
+                }
+            }
 ",
-        to: "        release(unmap(slot, pages));
-        let outcome = shoot(slot, pages);
+        to: "                release(unmap(slot, pages));
+                let outcome = shoot(slot, pages);
+                match outcome {
+                    Ok(completed) => {
+                        let mut table = self.table.lock();
+                        table.counts.retired -= 1;
+                        table.counts.pages -= u64::from(pages);
+                        table.free(slot);
+                        Some(Reclaim::Freed {
+                            completed,
+                            asked_again: 0,
+                        })
+                    }
+                    Err(_) => None,
+                }
+            }
 ",
         models: &[(
             "slots_reclaimed_slot_is_taken_only_after_its_shootdown",
@@ -1046,6 +1108,83 @@ const CONTROLS: &[Control] = &[
                     .find(|&s| matches!(table.state(s), Some(State::Free | State::Reclaiming)))?;
 ",
         models: &[("slots_reclaimed_slot_is_taken_only_after_its_shootdown", STALE)],
+    },
+    Control {
+        // TASKS item 73: a stall taken for an answer, so what the slot held goes back while the
+        // processor that stalled may still reach it.
+        name: "slot_released_on_a_stall",
+        file: SLOTS,
+        from: "                let outcome = shoot(slot, pages);\n                match outcome {\n",
+        to: "                let outcome = shoot(slot, pages);\n                match outcome.or(Ok(Completed { processors: 0, ticks: 0 })) {\n",
+        models: &[(
+            "slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown",
+            WAITING_REUSED,
+        )],
+    },
+    Control {
+        // T73-5 (the independent review of TASKS item 73): the slot's pages left the tables only
+        // after its shootdown, so a processor that served it can walk to them again.
+        name: "slot_unmapped_after_its_shootdown",
+        file: SLOTS,
+        from: "                let unmapped = unmap(slot, pages);\n                let outcome = shoot(slot, pages);\n",
+        to: "                let outcome = shoot(slot, pages);\n                let unmapped = unmap(slot, pages);\n",
+        models: &[
+            ("slots_reclaimed_slot_is_taken_only_after_its_shootdown", WAITING_REUSED),
+            (
+                "slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown",
+                WAITING_REUSED,
+            ),
+        ],
+    },
+    Control {
+        // T73-5: what a waiting slot held goes back when a fresh shootdown stalls too.
+        name: "slot_released_on_a_reask_stall",
+        file: SLOTS,
+        from: "                    Err(again) => {\n                        table.set(slot, State::Waiting);\n",
+        to: "                    Err(again) => {\n                        if let Some(w) = table.waiting.take() {\n                            drop(table);\n                            release(w.kept);\n                            return Some(Reclaim::Stalled { stall: again, asked_again: 1 });\n                        }\n                        table.set(slot, State::Waiting);\n",
+        models: &[("slots_a_reask_that_stalls_keeps_the_slot", RELEASED_ON_A_STALL)],
+    },
+    Control {
+        // TASKS item 73: a waiting slot given back once the processor that stalled has answered,
+        // with no fresh shootdown: its late answer may have served another page's request.
+        name: "slot_freed_on_an_answer_without_a_fresh_shootdown",
+        file: SLOTS,
+        from: "                self.table.lock().set(slot, State::Reclaiming);\n                let outcome = shoot(slot, pages);\n",
+        to: "                self.table.lock().set(slot, State::Reclaiming);\n                let outcome: Result<Completed, Stalled> = Ok(Completed { processors: 0, ticks: 0 });\n",
+        models: &[(
+            "slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown",
+            WAITING_REUSED,
+        )],
+    },
+    Control {
+        // TASKS item 73, Q2: two reclaims at once.
+        name: "the_reclaim_role_never_refused",
+        file: SLOTS,
+        from: "        if self.reclaiming.load(Ordering::Relaxed) {\n            return None;\n        }\n        #[cfg(all(test, not(loom)))]\n        self.role_tries.fetch_add(1, Ordering::Relaxed);\n        self.reclaiming\n            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)\n            .ok()\n            .map(|_| Role(&self.reclaiming))\n",
+        to: "        let _ = self.reclaiming.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed);\n        Some(Role(&self.reclaiming))\n",
+        models: &[
+            ("slots_two_reclaimers_and_a_waiting_slot", NEVER_GIVEN_BACK),
+            ("slots_at_most_one_slot_out_of_the_tables", TWO_OUT),
+        ],
+    },
+    Control {
+        // TASKS item 73, Q2: a Retired slot unmapped while another waits.
+        name: "a_slot_unmapped_while_one_waits",
+        file: SLOTS,
+        from: "        if let Some(w) = &self.waiting {\n",
+        to: "        if let Some(w) = self.waiting.as_ref().filter(|_| false) {\n",
+        models: &[("slots_at_most_one_slot_out_of_the_tables", TWO_OUT)],
+    },
+    Control {
+        // TASKS item 73, Q1: a processor counted as having answered before it served.
+        name: "answered_before_the_processor_served",
+        file: SHOOTDOWN,
+        from: ".is_none_or(|served| served.load(Ordering::Acquire) >= stall.generation)",
+        to: ".is_none_or(|served| served.load(Ordering::Acquire) + 1 >= stall.generation)",
+        models: &[(
+            "shootdown_answered_only_after_the_stalled_processor_served",
+            STALE,
+        )],
     },
     Control {
         // S3-5b's review, finding A, case a, as the code was: a change returns when the flush

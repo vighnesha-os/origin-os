@@ -508,7 +508,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 72. **What the firmware does with each answer to `_OS` (decision item 315; ADR-0019 A4 and Amendment 1). Numbered by the coordinating session on 2026-11-19, on the owner's word ("Test both answers first"), and given to TASKS item 63's session.** ACPICA answers "Microsoft Windows NT" (TASKS item 64's ledger, G10), ACPI 6.6 §5.7.3 suggests a name that differs per operating-system release, and Microsoft's `_OSI` page says nothing of `_OS`. The experiment loads the DSDT and SSDTs of the server rented on 2026-11-12 into `origin-aml` on the development Mac, in a scratch copy, and runs the start-up sequence once with each answer, under two stubbed hosts (every region read 0, and all ones). It reports every named value, device status, region write and failure that differs, and what reads each. The tables stay private (decision item 232) and nothing is committed from them. Its report comes to the coordinating session, which puts item 315 to the owner again.
 
-73. **A stalled reclaim is retried, not lost (TASKS item 66's R10; ADR-0004 Amendment 1, A2; ADR-0013 Amendment 3). Numbered by the coordinating session on 2026-11-19; not started; after TASKS item 70.** A retired kernel stack whose reclaim's shootdown stalls stays retired, is asked again at a later reclaim, and is given back only once every processor has answered, so that `lost` counts only a processor that never answers again. It changes `framekernel/frame/src/stack.rs` and `origin_sync::slots`, with Loom models. Decision item 316, accepted by the owner on 2026-11-19, keeps ADR-0013 Amendment 3 until this lands and ends it then. So the change that lands this task also removes both parts of `cargo xtask`'s allowance (item 313's report of a `lost` count and item 314's second run), with their host tests, and records the amendment's end in ADR-0013 and the matrix's row A13-Am3. From then on, a lost stack fails the boot on every machine.
+73. **A stalled reclaim is retried, not lost (TASKS item 66's R10; ADR-0004 Amendment 1, A2; ADR-0013 Amendment 3). Numbered by the coordinating session on 2026-11-19 and assigned on 2026-11-20 (the owner's "Start all three"), contract first (the coordination notes' `t73-contract.md`), accepted with four additions the same day. On `claude/t73-stalled-reclaim` from `land/batch-8` at `618b0961`; built, controlled, measured in a diagnostic round and ruled on (item 316's removal) on 2026-11-20; reviewed independently the same day (`REVIEW_T73_2026-11-20.md`: no High, one Medium fixed by `c548658d`, six Low, each answered in a commit naming it or proposed as a follow-up); merged with `land/batch-8` at `8da7dab6` (TASKS items 75, 77 and 81) as `b6d0c42d`; gated in one turn on `300c69b2` (`check`, `boot-test`, `boot-matrix`: all passed); not landed, not pushed. Its contract and result are under "Task contracts".** A retired kernel stack whose reclaim's shootdown stalls stays retired, is asked again at a later reclaim, and is given back only once every processor has answered, so that `lost` counts only a processor that never answers again. It changes `framekernel/frame/src/stack.rs` and `origin_sync::slots`, with Loom models. Decision item 316, accepted by the owner on 2026-11-19, keeps ADR-0013 Amendment 3 until this lands and ends it then. So the change that lands this task also removes both parts of `cargo xtask`'s allowance (item 313's report of a `lost` count and item 314's second run), with their host tests, and records the amendment's end in ADR-0013 and the matrix's row A13-Am3. From then on, a lost stack fails the boot on every machine.
 
 74. **The memory proof's two one-second budgets (TASKS item 66's R9, question 5). Numbered by the coordinating session on 2026-11-19; not started.** The hostile unmap loop's fifth unmap, and the unreported map's unmap, are refused only within about a second; a stall of a second, which the large software-processor machines show, would fail them, though neither has been seen failing. The rule TASKS item 66 proposed: the kernel brackets the script's run, and a refusal missing from a run that took over a second is undecided and run again.
 
@@ -2810,6 +2810,96 @@ Recorded, not changed: the memory proof's two one-second budgets (TASKS item 74)
   - **The idle round,** right after (10 large boots, host load average 7 to 27): all passed. Nine needed 1 run of the window and 1 s of its budget; intel-65.1 needed 2 runs and 5 s, after one stall of 242 ms. Every tick proof passed at run 1, 998,981 to 1,003,798 ppm, from 1 to 10 pairs; 1 to 38 calibration windows were discarded, and every RTC second was confirmed.
 - **Not shown:** anything under KVM, in CI or on a physical machine. The intermediate commits were not each built on their own; the final tree was. No person has reviewed it.
 
+
+### 73. A stalled reclaim is retried, not lost
+
+Assigned by the coordinating session on 2026-11-20, after the owner said "Start all three". Item 316 decides that ADR-0013 Amendment 3 ends when this lands; the coordinating session ruled the removal from this task's diagnostic figures, on the condition that they came first. The contract (`t73-contract.md`, in the coordinating session's notes) was accepted the same day, with its recommendations on Q1 to Q8 and four additions: (a) the reclaim role given up by a guard on every way out, with a host test; (b) the cost of a processor that never answers stated, with a host test that `take` is refused cleanly; (c) the diagnostic round's longest wait reported against `sched::OTHERS_PATIENCE`; (d) the reviewer given `shootdown.rs`'s `service` and `answered`, `slots.rs` and the reclaim path as code, to check I1 and I2 from the code alone.
+
+| Field | |
+|---|---|
+| Task ID | TASKS item 73, on branch `claude/t73-stalled-reclaim`, cut from `land/batch-8` at `618b0961` (TASKS item 79 at `68c61209`, and `main` at `ea2293ca`'s records). |
+| Objective | A retired kernel stack whose reclaim's shootdown stalls stays retired, with its frames kept, and is asked again at a later reclaim; it is given back only once a shootdown naming its pages, published after its unmap, completes on every processor. No reclaim loses a stack. Then item 316's end of ADR-0013 Amendment 3: `xtask`'s two allowances and their host tests removed. |
+| Source ownership | This task's session: `origin_sync::slots` and its models and controls, `origin_sync::shootdown`'s `Stalled` and `answered`, `origin_frame::stack` and `tlb`, `sched`'s `reclaim_stacks`, its lines and the `judge` call, `settled`, and `xtask`'s removal. |
+| Architecture contract | ADR-0004 Amendment 1, A2; ADR-0013 R8, Amendment 3 and item 316; ADR-0008 Amendment 1, D3; CLAUDE.md §28 and §13 (no `unsafe` added; `slots.rs` stays `forbid(unsafe_code)`). |
+| Relevant specifications | Intel SDM Vol. 3A §4.10.5, as `shootdown.rs` cites it. Nothing new read. |
+| Required dependencies | `land/batch-8` with TASKS item 79. No new crate. |
+| Security invariants | I1 no early reuse; I2 nothing counted or freed twice; I3 the bound; I4 nothing waits under a lock; I5 TASKS item 79's shape kept (the contract's words). |
+| Performance constraints | No stall: one compare-and-swap more per reclaim. A stall: one 1 s wait, not one per retired stack; while a stack waits, a reclaim costs a CAS, a lock and a read, and sends no interrupt. |
+| Required tests | Host tests in `slots.rs`, `shootdown.rs`, `settled.rs`; Loom models L1 to L4 and five controls; boot controls K1 to K4; the diagnostic round. |
+| Actual deliverables | The code, its tests and controls; the diagnostic round's figures; after the ruling, the removal and the records. |
+| Acceptance conditions | Clippy and the quick gates; an independent review answered; `check`, `boot-test` and `boot-matrix` in one turn on the final tip. Nothing pushed. |
+
+**Result (2026-11-20).** Built on `claude/t73-stalled-reclaim` from `618b0961`:
+- `231efb70`: `Stalled` names its generation, and `Shootdown::answered` (Q1);
+- `e9a12a34`: the waiting stack;
+- `9b026e19`: Loom models L1 to L4 and their controls;
+- `b9aa25b8`: the kernel stacks proof's cost clause waits after a round it did not count;
+- `f3f485df`: the reclaim role read before its compare-and-swap;
+- `c548658d`: item 316, the allowance removed.
+
+- **How it works.**
+  - A reclaim takes the role, one at a time. A guard gives it up on every way out, a panic included, and a host test shows it (addition a).
+  - It then takes a job under the lock. The first job of a Retired slot unmaps it and shoots. If the shootdown stalls, the slot becomes `Waiting`, outside the tables, with what the unmap returned (the frames) and the stall. At most one slot waits, and no new unmap is made while one does.
+  - Each later reclaim asks the waiting slot again first. If the stalled processor has not served since (`answered`), it returns `Unanswered` at once and sends no interrupt. Otherwise it sends a fresh shootdown, and gives the frames back and frees the slot only if that completes.
+  - Q1's rule is stated where `answered` is defined and in L4's comment: nothing may treat `answered` as proof that the pages were dropped. I1 rests only on the fresh shootdown, sent after the unmap, completing on every processor.
+  - A reclaim that finds the role held returns `Busy` after reading it, with no compare-and-swap (`f3f485df`, the coordinating session's addition after the diagnostic round). A host test counts the attempts.
+- **The invariants** (the contract's I1 to I5).
+  - I1: no slot is taken again before a shootdown sent after its unmap has completed everywhere.
+  - I2: nothing is counted or freed twice.
+  - I3: at most one stack out of the tables, holding at most 16 frames, waiting until the processor answers, plus one idle tick and one shootdown. A processor that never answers keeps it waiting for good, and the stacks retired after it stay mapped. Once the slots run out, `take` is refused cleanly and so are thread starts, which a host test shows (addition b). Before this task, the cost was one stack lost for each reclaim that stalled, after a 1 s wait.
+  - I4: nothing waits under a lock.
+  - I5: TASKS item 79's settle is unchanged in shape. Its waits re-ask through `yield_until`'s reap.
+- **Host and Loom.**
+  - New host tests in `slots.rs`: a stalled slot stays retired until a fresh shootdown completes; a waiting slot holds back every other reclaim, and takers are refused cleanly; the role is given up on every way out; a reclaim that reads the role held tries no compare-and-swap. `shootdown.rs` has one more: a stalled processor has answered once it serves. `settled.rs`'s tests name a waiting stack.
+  - Loom models:
+    - L1 `slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown`;
+    - L2 `slots_two_reclaimers_and_a_waiting_slot`;
+    - L3 `slots_at_most_one_slot_out_of_the_tables`;
+    - L4 `shootdown_answered_only_after_the_stalled_processor_served`;
+    - L5 `slots_a_reask_that_stalls_keeps_the_slot` (the review's T73-5).
+  - New controls, each caught:
+    - `slot_released_on_a_stall`;
+    - `slot_freed_on_an_answer_without_a_fresh_shootdown`;
+    - `the_reclaim_role_never_refused` (by L2 and L3);
+    - `a_slot_unmapped_while_one_waits`;
+    - `answered_before_the_processor_served`;
+    - `slot_unmapped_after_its_shootdown` (by L0 and L1, whose holders now walk the page table after each interrupt; T73-5);
+    - `slot_released_on_a_reask_stall` (by L5; T73-5).
+  - `slot_free_before_the_shootdown` and `slot_released_before_the_shootdown` were moved to the new code.
+  - A planted removal of the role's read fails the host test that counts compare-and-swaps (08:21 UTC, "a reclaim that read the role held tried to take it"; at `f3f485df` L1 to L4 passed again and all nine slots controls were caught).
+  - `cargo xtask check` on `9b026e19`: all 69 Loom models passed, and all 100 negative controls were caught. On the merge with TASKS items 75, 77 and 81 (`b6d0c42d`): 73 models and 110 controls. After the review's answers (09:22 UTC): L0 to L5 passed and all twelve slots and shootdown controls were caught; origin-sync's 117 host tests passed.
+- **The diagnostic round** (condition of the assignment, and addition c; the coordination notes' `t73-diagnostic-figures.md`).
+  - **The build.** `9b026e19` with a counter of each reclaim's outcome, never committed, and with the allowance still in place. 10 idle boots each of the 65-processor Intel and AMD machines and the 67-processor sparse machine, then 5 each beside three spinning shells: all 45 passed.
+  - **No stall in any boot.** 29,777 reclaim shootdowns: 19,779 idle, 9,998 loaded. So there were no fresh shootdowns and no unanswered checks, nothing waited at the halt, and no stack was lost. The longest wait against `sched::OTHERS_PATIENCE` (10 s): none came. The only waits were planted, the longest 1,501 ms (K1-65).
+  - **Host load.** The host's one-minute load before each boot was 3 to 34 idle and 18 to 35 loaded, mostly the previous boot's own QEMU.
+  - **`Busy` returns.** Median 35,967 to 38,509 a boot idle and 43,566 to 47,474 loaded on the large machines; 0 to 264 on 1 to 4 processors. Only the stacks proof's cost clause read its own reclaim's count.
+  - **`boot-matrix`, twice.**
+    - Run 1 on `9b026e19` failed: the 67-processor sparse machine's cost clause printed "0 of 16 reclaimed here". A processor that took one round's stack first held the role through its shootdown, and every later round ended `Busy`.
+    - Control K5 separates the old code (14 of 16), `9b026e19` (0 of 16) and the fix `b9aa25b8` (15 of 16). The fix waits after a round not counted, and the clause's rule, `alone > 0`, is unchanged.
+    - Run 2 on `b9aa25b8` passed, every kernel boot counting 16 of 16.
+- **The ruling.** The coordinating session ruled on 2026-11-20 that step 7 goes ahead, with these reasons:
+  - no stall in 45 boots;
+  - the planted stall given back after one fresh shootdown, 1,501 ms after the unmap;
+  - K5 separating the three trees;
+  - the diagnostic `boot-matrix` passing on the fix.
+  `c548658d` removes:
+  - item 313's report (`allow_lost_stacks`, `stacks_lost`, `forgave_lost_stacks`);
+  - item 314's second run (`lost_stacks_only`, `stopped_by_lost_stacks`, `REFUSE_COUNT_LINES`, `MAX_STACK_PAGES`, `number_and_was`, `run_scenario`'s second boot);
+  - their ten host tests.
+  `every_machine_requires_no_stack_lost` pins `lost: 0` on every machine, KVM included. K4 (a stack leaked on the 65-processor machine): Refused: the stacks proof's last line counted `lost: 1` (`Counts { live: 386, idle: 0, retired: 0, lost: 1, pages: 2187 }, as before: true`), and `cargo xtask` failed the boot on the missing marker `lost: 0` at its 300 s timeout, as it does any missing marker. Ran on the removal, `c548658d`, 08:25 to 08:30 UTC.
+- **The lines (Q5).** The stall line, the given-back line and the settle's waiting words match none of `cargo xtask`'s failure markers (`boot_failures`, 92 after the merge, checked again with T73-7's words). The longest is 155 bytes.
+- **The cost:** ledger row CL45 (the number the coordinating session gave); `cost-gate` passes.
+- **Review** (addition d): an AI reviewer independent of the author, given `shootdown.rs`, `slots.rs` and the reclaim path as code and not the author's argument, at `f3f485df`, and `c548658d` after it (`REVIEW_T73_2026-11-20.md`). It found I1 to I5 hold from the code alone, no High finding, one Medium and six Low. No person has reviewed the code.
+  - **T73-1** (Medium): at `f3f485df` alone, Amendment 3 (a) would forgive a leak as a stall on the named machines. Fixed by `c548658d`: the two land together, as they do on this branch.
+  - **T73-2**: `answered`'s doc on a processor with no record was wrong; corrected (`81b1e3b0`).
+  - **T73-3**: the cost clause's comment and `stack::reclaim`'s doc claimed more than the code guarantees (the role's holder can miss a stack retired as it gives the role up, and a counted round's stack may be any one, its time including a stall); corrected, the clause's rule and count unchanged (`8ca621b1`).
+  - **T73-4** (contention while a stack waits for a processor that never answers): not built. That case already refuses the boot at the next settle, and in every other case the wait ends when the processor answers. Proposed as a follow-up: the waiting stall's processor and generation in atomics, so that a reap can check `answered` before taking the role or the lock.
+  - **T73-5**: the holders of L0 and L1 walk the page table after each interrupt, a new control moves the unmap after the shootdown, and L5 covers a fresh shootdown that stalls, with its control (`7680f0d3`). Not built: a re-ask on another thread against the TLB world; proposed as a follow-up. The cross-thread order it would check (the unmap before a later reclaim's request, through the table's lock and the role's Acquire) is the reviewer's own reading under I1.
+  - **T73-6**: the re-ask's two unreachable `?` returns give the slot up as Lost, where the count of lost slots shows it, with a host test (`a0566349`); origin-sync's lints forbid a panic.
+  - **T73-7**: `State::Reclaiming`'s and `Counts::pages`' docs, and the settle's words, now "one withheld since CPU c did not answer its shootdown" (`3c289e0f`).
+  - **On `c548658d`:** nothing of the allowance is left, `run_scenario` is the one-boot function, and the new test is not vacuous; at its suggestion the test now covers every machine the boot commands make (`5fef08ee`). Item 316's words on `lost`: ADR-0013's "Ended" note says what they mean as built.
+- **Gates:** one turn of the machine on `300c69b2` (the review's answers, merged with `land/batch-8` at `241bb3a5`), 09:28 to 09:57 UTC, Rust 1.100.0, the tree clean before and after: `cargo xtask check` passed in 639 s (2,498 host tests passed, 0 failed, 30 ignored; Loom: all 74 models passed and all 112 negative controls were caught); `cargo xtask boot-test` passed, 11 of 11, in 54 s; `cargo xtask boot-matrix` passed on its first run in 1,059 s: 24 kernel boots, the kernel stacks' region at 23 distinct bases in 23 of them, no stalled shootdown, no stack given back after one, no settle that waited or failed, every cost clause at 16 of 16, and the fair share forgiven 4 times on the oversubscribed machines (Amendment 2). This commit, after that tip, changes documents only.
+- **The date.** All of this is 2026-11-20, UTC.
 
 ### 76 and 80. `ExceptionReport`'s `Debug`, and `abi_and_entry`'s silent refusals
 

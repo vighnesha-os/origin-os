@@ -269,29 +269,36 @@ pub(crate) fn reap() -> usize {
     freed
 }
 
-/// Reclaims every retired kernel stack (`stack::reclaim`), and says where any was lost to a
-/// stalled shootdown ([`report_lost_stacks`]): every reclaim the scheduler makes goes through
+/// Reclaims every retired kernel stack it can (`stack::reclaim`), and says when a stack is given
+/// back after a stalled shootdown had withheld it ([`report_given_back`]) and when a shootdown
+/// stalls and withholds one ([`report_withheld`]): every reclaim the scheduler makes goes through
 /// here, `settle`'s own among them.
 fn reclaim_stacks() {
     let reclaimed = origin_frame::stack::reclaim();
-    if reclaimed.lost > 0 {
-        report_lost_stacks(reclaimed.lost);
+    if let Some(back) = reclaimed.given_back {
+        report_given_back(back);
+    }
+    if let Some(withheld) = reclaimed.stalled {
+        report_withheld(withheld);
     }
 }
 
-/// Says where kernel stacks were lost to a stalled shootdown, as it happens: which processor
-/// asked, which did not answer within the patience, how long it waited, and how many stalls the
-/// boot has had (TASKS item 66). A report, judged by nothing: the proofs that count the stacks
-/// judge the loss. It names processors and times only, never an address.
-fn report_lost_stacks(lost: u32) {
+/// Says when a kernel stack's shootdown stalls, as it happens: which processor asked, which did
+/// not answer within the patience, how long it waited, and how many stalls the boot has had
+/// (TASKS item 66). The stack is withheld, with its frames and slot, until a fresh shootdown
+/// completes on every processor (TASKS item 73). A report, judged by nothing: the settles and
+/// the proofs that count the stacks judge a stack still withheld when they read. It names
+/// processors, counts and times only, never an address.
+fn report_withheld(withheld: origin_frame::stack::Withheld) {
     let mut out = here_console();
     let millis = |ticks: u64| ticks / (crate::time::tsc_hz() / 1000).max(1);
     // Under the console's 160-byte line (the review's T66-R7). The stall named is the boot's
-    // last: another processor's stall can come between the loss and this line.
+    // last: another processor's stall can come between this one and this line.
+    let what = WithheldWords(withheld.asked_again);
     let _ = match origin_frame::tlb::last_stall() {
         Some(stall) => writeln!(
             out,
-            "origin-kernel: stalled shootdown: CPU {} waited {} ms for CPU {} (stall {} of this boot); {lost} kernel stacks withheld, with their frames",
+            "origin-kernel: stalled shootdown: CPU {} waited {} ms for CPU {} (stall {} of this boot); {what}",
             stall.asker,
             millis(stall.waited),
             stall.target,
@@ -299,9 +306,39 @@ fn report_lost_stacks(lost: u32) {
         ),
         None => writeln!(
             out,
-            "origin-kernel: stalled shootdown: {lost} kernel stacks withheld, with their frames"
+            "origin-kernel: stalled shootdown: CPU {} did not answer; {what}",
+            withheld.stall.cpu
         ),
     };
+}
+
+/// What [`report_withheld`] says of the stack: withheld after its first shootdown stalled, or
+/// still withheld after this many fresh ones.
+struct WithheldWords(u32);
+
+impl core::fmt::Display for WithheldWords {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            0 => f.write_str("a kernel stack withheld until every processor answers"),
+            n => write!(
+                f,
+                "a withheld kernel stack asked again {n} times, still withheld"
+            ),
+        }
+    }
+}
+
+/// Says when a kernel stack a stalled shootdown withheld is given back: a fresh shootdown of its
+/// pages completed on every processor. How many fresh shootdowns it took, and how long the stack
+/// was out of the tables before its frames went back (TASKS item 73). A report, judged by
+/// nothing.
+fn report_given_back(back: origin_frame::stack::GivenBack) {
+    let millis = back.ticks / (crate::time::tsc_hz() / 1000).max(1);
+    let _ = writeln!(
+        here_console(),
+        "origin-kernel: a kernel stack withheld by a stalled shootdown is given back: asked again {} times, {millis} ms after its unmap",
+        back.asked_again
+    );
 }
 
 /// A console for a line printed where the caller may be: the boot flow, which runs with
@@ -356,7 +393,8 @@ pub(crate) use crate::settled::{Unsettled, not_settled};
 /// earlier proof's thread was there at a proof's first count, H2 when its own was at its compare).
 /// Settled at both reads, the counts change only with what the proof does. Waits up to
 /// [`OTHERS_PATIENCE`] seconds for each part; `Err` names what was still pending, and any
-/// stack lost to a stalled shootdown while it ran (`settled`: safe by design, 4 frames each).
+/// stack lost while it ran (`settled`), and the processor a stack withheld by a stalled
+/// shootdown still waits for.
 ///
 /// **Closed channels** (TASKS item 81). First, every closed channel's undelivered messages are
 /// freed: those still listed by this flow's own [`crate::ipc::reap_closed`], and those another
@@ -419,6 +457,7 @@ pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
         exits.ending,
         exits.zombies,
         counts.retired,
+        origin_frame::stack::waiting().map(|stall| stall.cpu),
         crate::ipc::closed_pending(),
         lost_before,
         counts.lost,

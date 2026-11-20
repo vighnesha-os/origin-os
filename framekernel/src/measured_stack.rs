@@ -295,7 +295,7 @@ pub(crate) fn prove_in_thread(com1: &mut Console, bsp: CpuIndex) -> bool {
     let own = OWN_SLOT.get().and_then(|own| stack::slot_state(*own));
     let given_back = matches!(
         own,
-        Some(State::Idle | State::Retired | State::Reclaiming | State::Free)
+        Some(State::Idle | State::Retired | State::Reclaiming | State::Waiting | State::Free)
     );
     let measured = MEASURED.load(Ordering::Relaxed);
     let (depth, sampled, size) = (
@@ -326,6 +326,7 @@ pub(crate) fn prove_in_thread(com1: &mut Console, bsp: CpuIndex) -> bool {
             Some(State::Idle) => "kept for reuse",
             Some(State::Retired) => "retired",
             Some(State::Reclaiming) => "being reclaimed",
+            Some(State::Waiting) => "waiting after a stalled shootdown",
             Some(State::Lost) => "lost",
             None => "no slot",
         },
