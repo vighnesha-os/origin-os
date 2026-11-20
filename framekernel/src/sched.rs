@@ -111,7 +111,9 @@ pub(crate) fn init_cpu_fpu(cpu: CpuIndex) {
 /// What a run-queue slot runs, as a switch sees it: the boot or idle flow (slot 0), whose FPU
 /// area is the processor's own; a thread, whose state is in its record, found once per switch; or
 /// nothing any more, a thread that has just exited, whose slot names no record (its state stays in
-/// its record, a zombie's, until its reap).
+/// its record, a zombie's, until its reap, or, when no zombie could be kept, was dropped and its
+/// record given back at once). A non-zero slot whose record cannot be found is `Exited` too; the
+/// kernel never makes one (the review of TASKS item 92, R92-14).
 #[derive(Clone, Copy)]
 enum Running {
     Flow,
@@ -153,10 +155,11 @@ fn save_outgoing(id: usize, old: Running) {
 
 /// Prepares this processor to resume `new`: if the context changed (`restore`), its FPU/SIMD state
 /// is restored, and the page tables are its process's (the kernel's for a kernel thread, and for
-/// the boot or idle flow). Both under one lock of the incoming record, taken after
-/// [`save_outgoing`] released the outgoing one's: a switch takes two locks, as the base's took its
-/// processor's thread table twice (TASKS item 92; the coordinating session's ruling on its Q6
-/// stop). The stack an interrupt or a system call from user mode lands on is not set here: the
+/// the boot or idle flow). For a thread, both under one lock of its record, taken after
+/// [`save_outgoing`] released the outgoing context's lock: a switch takes two locks, as the base's
+/// took its processor's thread table twice (TASKS item 92; the coordinating session's ruling on
+/// its Q6 stop). For the boot or idle flow, the restore is under its processor's table lock and
+/// the address space under none; for an exited slot, no lock is taken (the review's R92-11). The stack an interrupt or a system call from user mode lands on is not set here: the
 /// framework's trap entry names the incoming context's own stack from its home in the processor's
 /// table of contexts, whatever this scheduler answered (TASKS item 77).
 fn follow_thread(id: usize, new: Running, restore: bool, switch: &Switch) {
@@ -569,8 +572,9 @@ fn with_queue(
                 q.note_switches(rdtsc());
             }
             let new = q.current();
-            // After `f`: an exited thread's slot names no record any more. The outgoing record's
-            // lock is taken and released, then the incoming one's once (`follow_thread`).
+            // After `f`: an exited thread's slot names no record any more. The outgoing context's
+            // lock (its record's, or the boot or idle flow's table lock) is taken and released,
+            // then the incoming context's once (`follow_thread`).
             let switched = new != old;
             if switched {
                 save_outgoing(id, running(&q, old));
