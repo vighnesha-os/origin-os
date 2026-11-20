@@ -1425,10 +1425,20 @@ fn prove_lifecycle(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
             .get(bsp.get())
             .map_or(0, |q| without_interrupts(|| q.lock().live()))
     };
+    // The proof before this one (`prove_simd`) ends when its workers have counted themselves
+    // finished, which each does before it exits: wait for them to leave the queue too, as below
+    // (the delta review of TASKS item 92's G92-1, R92-20). An empty queue costs no wait.
+    wait_for_others(
+        "the earlier proofs' threads to leave the queue",
+        || live() == 1,
+        tsc_hz,
+        2000,
+    );
     if live() != 1 {
         let _ = writeln!(
             com1,
-            "origin-kernel: CPU {bsp} still has threads: scheduler failed"
+            "origin-kernel: CPU {bsp} still has {} after the wait: scheduler failed",
+            Contexts(live().saturating_sub(1))
         );
         return false;
     }
@@ -1441,16 +1451,15 @@ fn prove_lifecycle(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         let _ = writeln!(com1, "origin-kernel: cannot spawn: scheduler failed");
         return false;
     }
-    yield_until(
-        || FINISHED.load(Ordering::Acquire) == 3 && live() == 1,
-        tsc_hz,
-        3,
-    );
+    let first_left = || FINISHED.load(Ordering::Acquire) == 3 && live() == 1;
+    yield_until(first_left, tsc_hz, 3);
+    let first_waited = first_left();
     let reused = spawn(bsp, quitter, 0);
     let quitter_left = || FINISHED.load(Ordering::Acquire) == 4 && live() == 1;
     yield_until(quitter_left, tsc_hz, 1);
     let quitter_waited = quitter_left();
-    if let Some(cycles) = measure_switch(bsp) {
+    let measured = measure_switch(bsp);
+    if let Some(cycles) = measured {
         let _ = writeln!(
             com1,
             "origin-kernel: scheduler: {cycles} TSC cycles ({} ns) per context switch, yield ping-pong of 3 contexts",
@@ -1470,42 +1479,57 @@ fn prove_lifecycle(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let alternations = ALTERNATIONS.load(Ordering::Relaxed);
     let slept = SLEPT.load(Ordering::Relaxed).saturating_sub(1);
     let queued = live().saturating_sub(1);
-    let alternated = alternations >= 2 * TURNS - 5;
-    let slept_right = (SLEEP_TICKS..=10 * SLEEP_TICKS).contains(&slept);
-    let ok = alternated && slept_right && reused == Ok(1) && queued == 0 && quitter_waited;
+    let words = LifecycleWords {
+        alternated: alternations >= 2 * TURNS - 5,
+        slept_right: (SLEEP_TICKS..=10 * SLEEP_TICKS).contains(&slept),
+        reused: reused == Ok(1),
+        queued,
+        quitter_waited,
+        first_waited,
+        measured: measured.is_some(),
+    };
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: yield alternated {alternations} of {} turns; sleep({SLEEP_TICKS}) took {slept} ticks; exited threads freed their slots (slot {:?} reused){}",
+        "origin-kernel: scheduler: yield alternated {alternations} of {} turns; sleep({SLEEP_TICKS}) took {slept} ticks; exited threads freed their slots (slot {:?} reused){words}",
         2 * TURNS,
         reused,
-        LifecycleWords {
-            ok,
-            alternated,
-            slept_right,
-            reused: reused == Ok(1),
-            queued,
-            quitter_waited,
-        }
     );
-    ok
+    words.ok()
 }
 
 /// What [`prove_lifecycle`]'s line adds: nothing when it holds, otherwise ": scheduler failed"
 /// and each condition that failed, so that a failure says which way it came (TASKS item 92's
 /// gates, G92-1, as TASKS item 80 did for the IPC refusals). The counts themselves are on the line
-/// already.
+/// already. The verdict is [`LifecycleWords::ok`], derived from the same conditions, so no failure
+/// can name none (the delta review's R92-29).
 struct LifecycleWords {
-    ok: bool,
     alternated: bool,
     slept_right: bool,
     reused: bool,
     queued: usize,
     quitter_waited: bool,
+    /// Said on a failure, not judged: the pingers' and the sleeper's 3 s wait gave up, which may
+    /// be why the quitter's wait did (the delta review's R92-23).
+    first_waited: bool,
+    /// Said on a failure, not judged: the switch benchmark could not spawn its threads, which
+    /// may be why one is still queued (R92-24).
+    measured: bool,
+}
+
+impl LifecycleWords {
+    /// The proof's verdict.
+    fn ok(&self) -> bool {
+        self.alternated
+            && self.slept_right
+            && self.reused
+            && self.queued == 0
+            && self.quitter_waited
+    }
 }
 
 impl core::fmt::Display for LifecycleWords {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        if self.ok {
+        if self.ok() {
             return Ok(());
         }
         f.write_str(": scheduler failed")?;
@@ -1519,12 +1543,28 @@ impl core::fmt::Display for LifecycleWords {
             f.write_str("; the exited thread's slot not reused")?;
         }
         if self.queued > 0 {
-            write!(f, "; {} contexts still queued after the wait", self.queued)?;
+            write!(f, "; {} still queued after the wait", Contexts(self.queued))?;
         }
         if !self.quitter_waited {
             f.write_str("; the quitter's wait gave up after 1 s")?;
         }
+        if !self.first_waited {
+            f.write_str("; the first threads' wait gave up after 3 s")?;
+        }
+        if !self.measured {
+            f.write_str("; the switch benchmark could not spawn")?;
+        }
         Ok(())
+    }
+}
+
+/// `n` contexts, in words: "1 context", "2 contexts" (the delta review's R92-25).
+struct Contexts(usize);
+
+impl core::fmt::Display for Contexts {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let plural = if self.0 == 1 { "" } else { "s" };
+        write!(f, "{} context{plural}", self.0)
     }
 }
 
