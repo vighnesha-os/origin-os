@@ -530,7 +530,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 83. **QEMU machines with the rented board's shapes: more than 4 GiB of RAM, and its firmware tables (rental B's findings, option C). Numbered by the coordinating session on 2026-11-20; contract accepted with rulings the same day; built on `claude/rental-b-readiness-33dcba`, reviewed independently and answered, not landed.** Rental B (2026-11-20, `docs/research/2026-11-20-rental-b-findings.md`) ran Origin's loader on a rented EPYC 4244P server three times, and no kernel line reached the serial console: the kernel prints on COM1 until its SPCR move, and COM1 there was a real UART nobody watched. Every QEMU machine in `xtask` has 512 MiB, and none has the board's table shapes. This task adds machines with more than 4 GiB (64 GiB if the development Mac allows) and with the shapes the findings describe: an SPCR naming COM2 at `0x2F8` with COM1 present, an RSDP and XSDT in ACPI NVS, a FACS named only by the 32-bit `FIRMWARE_CTRL`, an FPDT whose FBPT and S3PT lie in reserved memory, and reserved and device ranges above the RAM. Each shows the kernel reaching its SPCR move and its verdict, or names where it stopped. Built from the findings' description, not from the rental's dumps (item 232). Contract below. (Item 82's line lands with the coordinating session's records.)
 
-84. **Boot info 0.8: the loader hands the SPCR's UART to the kernel (decision item 317; ADR-0010 Amendment 3). Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 83, in the session that ran rental B.** Rental B's kernel printed nothing on the operator's console: it writes to COM1 until its SPCR move, and that server's console is COM2. The loader finds the SPCR before `ExitBootServices`, checks it with the kernel's parser, moved to a crate both build, and records an I/O-port 16550-compatible UART in a new boot-info structure (version 0.8). From `kernel_main`'s first line the kernel writes to that UART and COM1, and E4's move still rules once the page tables are live. Done means: a boot-console scenario whose SPCR names COM2, with COM1 unread, shows the kernel's first line on COM2; a malformed or memory-mapped SPCR gives no UART in boot info and the boot goes on, both as controls; the boot-info structure is checked in the loader and the kernel, with host tests; and a cost-ledger row. A third rental (about $0.81, on the owner's word) can then show where the kernel stops on rental B's server.
+84. **Boot info 0.8: the loader hands the SPCR's UART to the kernel (decision item 317; ADR-0010 Amendment 3). Numbered by the coordinating session on 2026-11-20; contract accepted the same day; being built on `claude/t84-early-uart`; after TASKS item 83, in the session that ran rental B.** Rental B's kernel printed nothing on the operator's console: it writes to COM1 until its SPCR move, and that server's console is COM2. The loader finds the SPCR before `ExitBootServices`, checks it with the kernel's parser, moved to a crate both build, and records an I/O-port 16550-compatible UART in a new boot-info structure (version 0.8). From `kernel_main`'s first line the kernel writes to that UART and COM1, and E4's move still rules once the page tables are live. Done means: a boot-console scenario whose SPCR names COM2, with COM1 unread, shows the kernel's first line on COM2; a malformed or memory-mapped SPCR gives no UART in boot info and the boot goes on, both as controls; the boot-info structure is checked in the loader and the kernel, with host tests; and a cost-ledger row. A third rental (about $0.81, on the owner's word) can then show where the kernel stops on rental B's server.
 
 85. **`follow_thread` activates the incoming thread's address space from the scheduler's slot (TASKS item 77's review, R77-4). Numbered by the coordinating session on 2026-11-20; not started.** TASKS item 77 made the kernel-stack record and TSS.RSP0 come from the table of contexts, the incoming context's home, rather than from what the scheduler passes, and checks every entry from ring 3 against it. The address space is still taken from the scheduler's slot. A wrong slot would then run one process's thread in another's address space. The fix names the address space from the context the table resumes, or checks the scheduler's choice against it at `resume`, as item 77 did for the stack, with a Loom model and a boot control that plants the wrong slot.
 
@@ -3206,3 +3206,156 @@ The application prints each change, as it prints its regions now, so the checker
   - **T83-5 to T83-12:** each fixed, as `88aac4dc` lists, but T83-6, which is recorded: the application is aimed at OVMF and departs from UEFI 2.11 §7.2's note on runtime memory types.
 - **Checked on `88aac4dc`, in one turn (2026-11-20, 09:58 to 10:07 UTC):** `boot-large` and `boot-rented` under both IOMMUs at 64 GiB and at 8 GiB (`GITHUB_ACTIONS=true`, CI's size), each in about 13 s; the rented 8 GiB machine's `8101 MiB` free is the figure T83-1 predicted. The four controls failed with their reasons.
 - **No requirements row covers the FACS and FPDT locator** (TASKS item 71; ADR-0019's area A row, A19-A6, is not started), so none was updated for it, as the contract's deliverables assumed.
+
+### 84. Boot info 0.8: the loader hands the SPCR's UART to the kernel (decision item 317; ADR-0010 Amendment 3)
+
+Written 2026-11-20 by the session that built TASKS item 83, before any of it was built, and accepted by the coordinating session the same day as drafted, with the rulings and additions below. Built on `claude/t84-early-uart`, cut from `f37abcbc` (TASKS item 83's branch with `land/batch-8` merged, which holds `main` at `4718d312`, PR 46).
+
+- **Task ID:** TASKS item 84, after TASKS item 83.
+- **Objective:** from `kernel_main`'s first line, every kernel line reaches the UART the firmware's SPCR names, when that UART is a 16550 in I/O space, as well as COM1 and the screen. The loader finds and checks the SPCR before `ExitBootServices` and names the UART in boot info 0.8. E4's move still rules once the page tables are live. A rented server whose console is COM2 then shows where the kernel stops.
+- **Source ownership:**
+  - `boot/info` (the structure, its check, the version);
+  - `boot/uefi` (finding the SPCR);
+  - a new crate for the SPCR parser;
+  - `framekernel/src/console.rs`, `serial.rs`, `spcr.rs` (which becomes the new crate's user);
+  - `origin-version.toml`;
+  - `developer-tools/xtask` (scenarios);
+  - the records.
+
+  Boot info and its version are an ABI decision, accepted by the owner as item 317; the exact layout below is this contract's to settle with the coordinating session.
+- **Architecture contract:**
+  - ADR-0010 E1, E4, E5 and Amendments 2 and 3;
+  - ADR-0002 B4 (boot info, the version check);
+  - ADR-0013 (no SPCR outcome stops a boot);
+  - CLAUDE.md §13 (checked parsing of untrusted input);
+  - §62 (one release identity);
+  - ADR-0018 V3 (the cost, ledger row CL46).
+- **Specifications:**
+  - Microsoft's SPCR, as the kernel's parser cites it today (revision history to 1.10, table revision 4), and DBG2 Table 3;
+  - ACPI 6.6 §5.2.5 to §5.2.8 (RSDP, XSDT);
+  - UEFI 2.11 §4.6 (the configuration table).
+
+  Nothing new to read.
+- **Dependencies:** none new outside the workspace.
+
+**1. Boot info 0.8: one structure appended**
+
+```rust
+/// The UART the firmware's SPCR names, when the loader found one the kernel can write to from its
+/// first line: a 16550-compatible UART in I/O space (ADR-0010 Amendment 3). `port` is 0 if none.
+#[repr(C)]
+pub struct EarlyUart {
+    /// I/O port base of the UART's 8 registers, or 0: none.
+    pub port: u16,
+    /// The SPCR's interface type (0x00, 0x01, 0x12 or 0x14), for the kernel's lines.
+    pub interface: u8,
+    /// Bit 0: `baud` is the rate the table states. Bit 1: `clock_hz` is the clock it states.
+    /// Every other bit is 0.
+    pub flags: u8,
+    /// The rate the table states, in bits per second, or 0 (bit 0 clear): leave it as the
+    /// firmware set it.
+    pub baud: u32,
+    /// The UART's input clock the table states, in Hz, or 0 (bit 1 clear).
+    pub clock_hz: u32,
+    /// 0.
+    pub reserved: u32,
+}
+```
+
+- 16 bytes, 4-byte aligned. It is appended to `BootInfo` after `boot_seed` as `early_uart`, so `size` grows by 16, and the version becomes 0.8 in `origin-version.toml`. The kernel accepts only 0.8 (B4's rule for major 0).
+- **`EarlyUart::check()`, run by both the loader and the kernel, as `Framebuffer::check` is.** It accepts either:
+  - `port` 0 with every other field 0; or
+  - a port in a block the parser allows: the four standard COM blocks, or one at or above `0x1000` that does not wrap, the rule `spcr.rs`'s `port_block_allowed` holds today.
+
+  It also requires a known interface, only flag bits 0 and 1, a non-zero `baud` exactly when bit 0 is set and a non-zero `clock_hz` exactly when bit 1 is set, and `reserved` 0.
+- **On a refusal the kernel uses no early UART and says so on COM1 and the screen.** The boot goes on (E5).
+- **The loader translates the table.** No ACPI structure crosses into boot info (Amendment 3).
+
+**2. The parser in a crate both build**
+
+- New crate `origin-spcr` (`firmware/acpi/spcr`), `#![no_std]`, `forbid(unsafe_code)`, no dependencies. It takes from the kernel unchanged:
+  - `spcr.rs`'s `parse`, `Spcr`, `UartAddress`, `Access`, `SpcrError` and the port rule;
+  - `serial.rs`'s `divisor_for`, `INPUT_CLOCK_HZ` and `LineSetup`, which `Spcr::line_setup` needs;
+  - the header checks `parse` needs (signature, length, checksum, revision), which it takes from the kernel's `acpi` module today.
+- The kernel's `spcr.rs` and `serial.rs` use the crate instead, and their tests and the 200,000-case mutation soak move with the code.
+- `SOURCE_PROVENANCE.md` gains a row; `xtask`'s gates (provenance, unsafe, names, dependency lists) learn the crate.
+- A file moved within the repository is not a new authorship: the provenance row says where it came from.
+
+**3. The loader**
+
+- Before `ExitBootServices`, from the RSDP `find_rsdp` already finds, it walks the XSDT (checked: signature, length, checksum, entry count bounded, as the kernel's walk is). It takes the first SPCR whose header checks, and parses it with `origin-spcr`.
+- If that gives `UartAddress::Port(p)` with an accepted interface, it fills `EarlyUart`. Otherwise `port` is 0. Either way it prints one line, for example:
+  - `origin-boot: console: the SPCR names a UART at I/O port 0x2f8: the kernel writes to it from its first line`;
+  - `origin-boot: console: the SPCR names a UART in memory space: the kernel moves to it once its page tables are live`;
+  - `origin-boot: console: no SPCR (…)`;
+  - `origin-boot: console: the SPCR was refused (…)`.
+- Nothing here stops the loader. Every read is of firmware memory identity-mapped under boot services, bounded by the table's checked length.
+
+**4. The kernel**
+
+- `kernel_main`, before its first line, checks `info.early_uart`. If a port is named, it claims the 8 ports as the SPCR's port is claimed today and adds a second UART sink to the console. It does not reprogram that UART's speed unless the structure states a rate and a clock, `Spcr::line_setup`'s rule, and it sets the line format as `configure` does.
+- Every line goes to COM1, to that UART and to the screen, each UART a section at a time (Amendment 2). A UART that takes no bytes is given up on after one bounded wait (E5), as COM1 is now.
+- **The move (E4) still rules, and reads the SPCR itself:**
+  - **It names the boot-info port:** COM1 stops. Nothing is replayed to that port, which already has every line. The move's line says so: `… names a UART at I/O port 0x2f8: the console has written there since its first line; COM1 stops`.
+  - **It names another port, or a memory-mapped UART:** the console moves there and replays its log, as now. The kernel says so on every UART it was writing to, then stops writing to them.
+  - **It refuses, or the table cannot be read:** the kernel says so on every UART it is writing to, and **keeps writing to both COM1 and the boot-info UART for the rest of the boot.** That is question 1 below. It is the case rental B could not see: the loader read the table, the kernel could not.
+
+**5. Scenarios (xtask) and their cost**
+
+| Machine | What it must show |
+|---|---|
+| The existing SPCR console scenario (COM2 named, COM1 present) | The kernel's first line, `origin-kernel: console: framebuffer …`, on COM2 **before** the move line, and the move saying nothing was replayed. COM1 stops at the move. The loader's line names `0x2f8` |
+| The other existing SPCR scenarios (COM1 named; an absent UART at `0x2E8`; interface 3, refused; a memory-mapped UART) | As now, plus the loader's line. For `0x2E8` the early UART is given up on after one bounded wait, and the move refuses it, said on COM1. For interface 3 and the memory-mapped UART the loader names none |
+| `boot-rented` (TASKS item 83) | As now, plus the kernel's first line on COM2 before the move |
+| **New: `boot-rented` with the kernel's reading refused** (the application puts the RSDP's copy in loader-data memory, as control RB-1 did, but as a scenario) | The loader names COM2 (it read the table under boot services). The kernel's move refuses (`no usable ACPI SPCR table (…)`), says so on COM1 and COM2, and **the whole boot, verdict included, is on COM2**. This is the rental B case, now visible |
+
+**Cost in `boot-matrix` time:**
+- one kernel boot added: the new rented variant, under one IOMMU (AMD, the board's), about 13 s at 64 GiB on the Mac and about the same at 8 GiB in CI;
+- the existing console scenarios change their markers only.
+
+**Cost in the product, ledger row CL46:**
+- the loader's walk of the XSDT, once, before `ExitBootServices`;
+- until the move, each line sent to one more UART. Rental B's kernel sent 2,593 bytes before its move, about 0.23 s more at 115,200 baud.
+
+Both figures are owed, measured on the Mac and named as unmeasured on hardware (ADR-0018 V3). The row is added by this task.
+
+**6. Controls (ADR-0013), each failing**
+
+- **R84-1:** the loader names no UART. The SPCR console scenario fails: the kernel's first line is not on COM2 before the move.
+- **R84-2:** the kernel ignores `early_uart`. Fails the same way.
+- **R84-3:** `EarlyUart::check` accepts port `0x60`. A host test fails: the keyboard controller's ports are not a UART block.
+- **R84-4:** on a refused move the kernel stops writing to the boot-info UART. The new rented variant fails: its verdict is not on COM2.
+- **R84-5:** the kernel accepts boot info 0.7. A host test fails.
+
+**Host tests:**
+- the structure's layout, pinned by offset;
+- its check, for each field;
+- the loader's walk over tables that are good, short, mis-summed, without an SPCR, with a memory-mapped SPCR, and with a refused SPCR;
+- the moved parser's existing tests and soak.
+
+**7. Security invariants**
+
+1. The loader parses the SPCR as untrusted input, with the kernel's own checks. A table naming a port outside the allowed blocks is refused in the loader, and again in the kernel's `EarlyUart::check`.
+2. The kernel's early writes go only to a port the table named and both checks accepted, never to a guessed one.
+3. No SPCR outcome stops the loader or the kernel (E5).
+4. Boot info's version check refuses a mismatched loader and kernel (§62).
+
+**8. Acceptance**
+
+- The scenarios above pass under both IOMMUs where they run.
+- Each control fails.
+- `check`, `boot-test` and `boot-matrix` pass in one turn.
+- An independent review is done and answered.
+- Records:
+  - ADR-0010 Amendment 3's status;
+  - row A10-Am3;
+  - ledger row CL46;
+  - `STATUS.md`;
+  - provenance.
+
+**Rulings of the coordinating session (2026-11-20), accepting the contract as drafted:**
+- **Q1, yes:** after a refused move, the kernel keeps the boot-info UART for the rest of the boot, beside COM1.
+- **Q2, yes:** the 16-byte `EarlyUart`, with the rate and clock as the table states them. Amendment 3 left the layout to this task.
+- **Q3, yes:** `origin-spcr` in `firmware/acpi/spcr`, `no_std`, `forbid(unsafe_code)`, no dependencies.
+- **Addition (a):** the loader's image changes, so the image gates and the reproducible-image comparison are run and kept green.
+- **Addition (b):** in the new "kernel's reading refused" scenario, the loader's line naming `0x2f8` and the kernel's refusal line are both checked on COM2.
