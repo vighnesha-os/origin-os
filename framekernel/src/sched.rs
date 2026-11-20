@@ -35,7 +35,7 @@ use origin_frame::percpu::PerCpu;
 use origin_frame::stack::{FpuArea, GuardedStack, StackSlot, State as SlotState, ThreadStart};
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::exits::{Exits, Pending};
-use origin_frame::sync::threads::{Empty, Location, Outcome, Queues};
+use origin_frame::sync::threads::{Empty, Location, Outcome, Queues, Record};
 use origin_frame::trap::Switch;
 
 /// Each kernel thread's stack.
@@ -109,30 +109,31 @@ pub(crate) fn init_cpu_fpu(cpu: CpuIndex) {
 }
 
 /// What a run-queue slot runs, as a switch sees it: the boot or idle flow (slot 0), whose FPU
-/// area is the processor's own; a thread, whose state is in its record; or nothing any more, a
-/// thread that has just exited, whose slot names no record (its state stays in its record, a
-/// zombie's, until its reap).
+/// area is the processor's own; a thread, whose state is in its record, found once per switch; or
+/// nothing any more, a thread that has just exited, whose slot names no record (its state stays in
+/// its record, a zombie's, until its reap).
 #[derive(Clone, Copy)]
 enum Running {
     Flow,
-    Thread(u32),
+    Thread(&'static Record<threads::State>),
     Exited,
 }
 
-/// What `slot` of `q` runs ([`Running`]).
+/// What `slot` of `q` runs ([`Running`]): its record looked up once, here.
 fn running(q: &RunQueue, slot: usize) -> Running {
-    match (slot, q.record(slot)) {
+    match (slot, q.record(slot).and_then(threads::record)) {
         (0, _) => Running::Flow,
         (_, Some(record)) => Running::Thread(record),
         (_, None) => Running::Exited,
     }
 }
 
-/// Saves the outgoing context's FPU/SIMD state and restores the incoming one's, so SIMD
-/// registers belong to one thread at a time. Each area is locked and released in turn, the
-/// outgoing one first (the lock order of `origin_sync::threads`). An exited thread's state is not
-/// saved: it is dead.
-fn switch_fpu(id: usize, old: Running, new: Running) {
+/// Saves the outgoing context's FPU/SIMD state, so SIMD registers belong to one thread at a time:
+/// the boot or idle flow's in its processor's table, a thread's in its record. That lock is
+/// released before [`follow_thread`] takes the incoming one's, so a switch never holds two record
+/// locks at once (the lock order of `origin_sync::threads`). An exited thread's state is not saved:
+/// it is dead.
+fn save_outgoing(id: usize, old: Running) {
     match old {
         Running::Flow => {
             if let Some(table) = threads::table(id)
@@ -142,52 +143,46 @@ fn switch_fpu(id: usize, old: Running, new: Running) {
             }
         }
         Running::Thread(record) => {
-            if let Some(record) = threads::record(record)
-                && let Some(area) = record.state().lock().fpu.as_mut()
-            {
+            if let Some(area) = record.state().lock().fpu.as_mut() {
                 area.save();
-            }
-        }
-        Running::Exited => {}
-    }
-    match new {
-        Running::Flow => {
-            if let Some(table) = threads::table(id)
-                && let Some(area) = table.lock().idle_fpu.as_ref()
-            {
-                area.restore();
-            }
-        }
-        Running::Thread(record) => {
-            if let Some(record) = threads::record(record)
-                && let Some(area) = record.state().lock().fpu.as_ref()
-            {
-                area.restore();
             }
         }
         Running::Exited => {}
     }
 }
 
-/// Prepares this processor to resume `new`: the page tables are its process's (the kernel's for a
-/// kernel thread, and for the boot or idle flow). The stack an interrupt or a system call from
-/// user mode lands on is not set here: the framework's trap entry names the incoming context's
-/// own stack from its home in the processor's table of contexts, whatever this scheduler answered
-/// (TASKS item 77).
-fn follow_thread(new: Running, switch: &Switch) {
+/// Prepares this processor to resume `new`: if the context changed (`restore`), its FPU/SIMD state
+/// is restored, and the page tables are its process's (the kernel's for a kernel thread, and for
+/// the boot or idle flow). Both under one lock of the incoming record, taken after
+/// [`save_outgoing`] released the outgoing one's: a switch takes two locks, as the base's took its
+/// processor's thread table twice (TASKS item 92; the coordinating session's ruling on its Q6
+/// stop). The stack an interrupt or a system call from user mode lands on is not set here: the
+/// framework's trap entry names the incoming context's own stack from its home in the processor's
+/// table of contexts, whatever this scheduler answered (TASKS item 77).
+fn follow_thread(id: usize, new: Running, restore: bool, switch: &Switch) {
     let record = match new {
-        Running::Flow => return crate::vm::activate_kernel_space(switch),
-        Running::Thread(record) => threads::record(record),
-        Running::Exited => None,
-    };
-    // Every thread but the boot or idle flow has a record with a stack: a ready slot without one
-    // means a thread was made runnable before its state was written, which `spawn_with` rules out
-    // by writing it under the queue lock. Counted for the boot proof.
-    let Some(record) = record else {
-        UNREADY_SWITCHES.fetch_add(1, Ordering::Relaxed);
-        return crate::vm::activate_kernel_space(switch);
+        Running::Flow => {
+            if restore
+                && let Some(table) = threads::table(id)
+                && let Some(area) = table.lock().idle_fpu.as_ref()
+            {
+                area.restore();
+            }
+            return crate::vm::activate_kernel_space(switch);
+        }
+        Running::Thread(record) => record,
+        // Every thread but the boot or idle flow has a record with a stack: a ready slot without
+        // one means a thread was made runnable before its state was written, which `spawn_with`
+        // rules out by writing it under the queue lock. Counted for the boot proof.
+        Running::Exited => {
+            UNREADY_SWITCHES.fetch_add(1, Ordering::Relaxed);
+            return crate::vm::activate_kernel_space(switch);
+        }
     };
     let state = record.state().lock();
+    if restore && let Some(area) = state.fpu.as_ref() {
+        area.restore();
+    }
     if state.stack.is_none() {
         UNREADY_SWITCHES.fetch_add(1, Ordering::Relaxed);
     }
@@ -574,12 +569,13 @@ fn with_queue(
                 q.note_switches(rdtsc());
             }
             let new = q.current();
-            // After `f`: an exited thread's slot names no record any more.
-            let (old, new) = ((old, running(&q, old)), (new, running(&q, new)));
-            if new.0 != old.0 {
-                switch_fpu(id, old.1, new.1);
+            // After `f`: an exited thread's slot names no record any more. The outgoing record's
+            // lock is taken and released, then the incoming one's once (`follow_thread`).
+            let switched = new != old;
+            if switched {
+                save_outgoing(id, running(&q, old));
             }
-            follow_thread(new.1, switch);
+            follow_thread(id, running(&q, new), switched, switch);
             next
         }
         _ => interrupted,
@@ -919,7 +915,7 @@ fn spawn_with_parts(
     let guard = stack.guard_addr();
     let frame_at = stack.build_first_frame(start).ok_or(QueueError::Full)?;
     // A thread without its own FPU save area would run on the previous thread's registers
-    // (`switch_fpu` then has nothing to restore), which may be another process's data; it
+    // (`follow_thread` then has nothing to restore), which may be another process's data; it
     // is refused instead.
     let fpu_area = fpu_area().ok_or(QueueError::Full)?;
     if !publish(&mut stack, cpu) {
