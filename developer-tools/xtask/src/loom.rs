@@ -133,6 +133,12 @@ const CTX_LOST: &[&str] = &["a published context went unrecorded"];
 const CTX_NEVER_RETIRED: &[&str] = &["an ended context's home was never retired"];
 /// W1's reports (TASKS item 75): a first frame both withdrawn and resumed, or neither; a running
 /// context's stack uncovered; C's context lost; a withdrawn context's home left behind.
+/// B1's reports (TASKS item 81): a settle counted while a reap still held what it frees, or its
+/// read of what the reap freed was not ordered after the freeing.
+const BACKLOG_EARLY: &[&str] = &[
+    "a settle passed while a reap still held what it frees",
+    "Causality violation",
+];
 /// K1's report (TASKS item 77): a switch, or the table read back, named a home other than the
 /// incoming context's.
 const CTX_WRONG_HOME: &[&str] = &["a switch named a stack not the incoming context's own"];
@@ -179,6 +185,7 @@ const REFCOUNT: &str = "framekernel/frame/sync/src/refcount.rs";
 const SLOTS: &str = "framekernel/frame/sync/src/slots.rs";
 const PORTS: &str = "framekernel/frame/sync/src/ports.rs";
 const CONTEXTS: &str = "framekernel/frame/sync/src/contexts.rs";
+const BACKLOG: &str = "framekernel/frame/sync/src/backlog.rs";
 const EXITS: &str = "framekernel/frame/sync/src/exits.rs";
 
 /// `WaitQueue::take_all`'s one critical section.
@@ -1411,6 +1418,33 @@ const CONTROLS: &[Control] = &[
             "contexts_two_retirers_lose_no_ended_context",
             CTX_NEVER_RETIRED,
         )],
+    },
+    Control {
+        // BX1 (TASKS item 81): the count lowered before the release, the order `reap_closed` had
+        // before TASKS item 81 (the review of TASKS item 79, T79-6): a settle on another processor
+        // can find nothing pending while the release still holds what it frees.
+        name: "backlog_lowered_before_released",
+        file: BACKLOG,
+        from: "        let released = release();\n        self.count.fetch_sub(1, AcqRel);\n",
+        to: "        self.count.fetch_sub(1, AcqRel);\n        let released = release();\n",
+        models: &[("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY)],
+    },
+    Control {
+        // BX2: the count read Relaxed: a settle that reads 0 is not ordered after the releases.
+        name: "backlog_pending_relaxed",
+        file: BACKLOG,
+        from: "        self.count.load(Acquire)\n",
+        to: "        self.count.load(core::sync::atomic::Ordering::Relaxed)\n",
+        models: &[("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY)],
+    },
+    Control {
+        // BX3: the count lowered Relaxed: the lowering heads no release sequence, so a settle
+        // that reads it is not ordered after the release before it.
+        name: "backlog_drained_relaxed",
+        file: BACKLOG,
+        from: "        self.count.fetch_sub(1, AcqRel);\n",
+        to: "        self.count.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);\n",
+        models: &[("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY)],
     },
     Control {
         // KX1 (TASKS item 77): the answer carries the outgoing context's home, so the trap entry

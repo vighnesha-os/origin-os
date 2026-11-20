@@ -234,6 +234,7 @@ use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use loom::sync::{Arc, Notify};
 use loom::thread::{self, JoinHandle};
 
+use crate::backlog::Backlog;
 use crate::contexts::{BOOT_FLOW, Contexts, Refused};
 use crate::exits::Exits;
 use crate::floor::MonotonicFloor;
@@ -3460,6 +3461,71 @@ fn contexts_a_switch_names_the_incoming_home() {
             }
             publisher.join().unwrap();
             assert!(ctx_covered(&table, 3), "{LOST_CONTEXT}");
+        },
+    );
+}
+
+// ---------------------------------------------------------------- backlog (TASKS item 81)
+
+/// What B1 reports when a settle passed while a reap still held what it frees.
+const REAPED_EARLY: &str = "a settle passed while a reap still held what it frees";
+
+/// One reap, as `reap_closed` makes one: if anything is pending, the listed piece is taken off
+/// the list under its lock, and then, with the lock released, drained: its release gives back
+/// what it holds (`held` to 0).
+fn backlog_reap(backlog: &Backlog, list: &SpinLock<Option<u32>>, held: &Kept) {
+    if backlog.pending() == 0 {
+        return;
+    }
+    let taken = list.lock().take();
+    if taken.is_some() {
+        // SAFETY: the pointer is the cell's own; Loom's cell checks this write against the
+        // settler's read, and panics if they are not ordered, which is the point of the model.
+        backlog.drained(|| held.with_mut(|p| unsafe { *p = 0 }));
+    }
+}
+
+/// B1 (TASKS item 81; the review of TASKS item 79, T79-6): a process ends with a message still
+/// queued to it. Its close lists the channel and counts it, and then its end is seen. A system
+/// call's reap on another processor may take the channel and free the message. The boot flow,
+/// having seen the end, reaps what it can itself, and if nothing is pending it counts the heap,
+/// which reads `held`: the message must be freed, and the read ordered after its freeing,
+/// whichever of the two reaped it.
+#[test]
+fn backlog_a_settle_sees_what_a_reap_freed() {
+    check(
+        "backlog_a_settle_sees_what_a_reap_freed",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let backlog = Arc::new(Backlog::new());
+            let list = Arc::new(SpinLock::new(None));
+            let seen = Arc::new(AtomicBool::new(false));
+            let held = Arc::new(Kept::new(1));
+            let lister = {
+                let (backlog, list, seen) =
+                    (Arc::clone(&backlog), Arc::clone(&list), Arc::clone(&seen));
+                thread::spawn(move || {
+                    *list.lock() = Some(1);
+                    backlog.added();
+                    seen.store(true, Release);
+                })
+            };
+            let reaper = {
+                let (backlog, list, held) =
+                    (Arc::clone(&backlog), Arc::clone(&list), Arc::clone(&held));
+                thread::spawn(move || backlog_reap(&backlog, &list, &held))
+            };
+            if seen.load(Acquire) {
+                backlog_reap(&backlog, &list, &held);
+                if backlog.pending() == 0 {
+                    // SAFETY: as in `backlog_reap`.
+                    let now = held.with(|p| unsafe { *p });
+                    assert_eq!(now, 0, "{REAPED_EARLY}");
+                }
+            }
+            lister.join().unwrap();
+            reaper.join().unwrap();
         },
     );
 }
