@@ -1130,7 +1130,8 @@ def sha256(path):
 
 def write_record(args, rental, results):
     """A draft of the hardware record (the requirements gate's form) and a redacted console log,
-    both in the rental's directory. A person reads them before either goes into the repository."""
+    both in the rental's directory and both redacted (item 232). A person reads them before
+    either goes into the repository."""
     dump = rental.dir / "dump"
     read = lambda name: (dump / name).read_text(errors="replace") if (dump / name).exists() else ""
     dmi = dict(l.split(": ", 1) for l in read("dmi.txt").splitlines() if ": " in l)
@@ -1166,8 +1167,12 @@ def write_record(args, rental, results):
                           "SHA-256 of the tables in `dump/acpi.sha256`"),
     ]
     table = "\n".join(f"| {k} | {v.replace('|', '/')} |" for k, v in rows)
-    (rental.dir / "record-draft.md").write_text(
-        f"# Bench boot: Latitude.sh {args.plan}, {date}\n\n| | |\n|---|---|\n{table}\n")
+    draft = f"# Bench boot: Latitude.sh {args.plan}, {date}\n\n| | |\n|---|---|\n{table}\n"
+    # Item 232: the draft is what goes into the repository once a person has read it, so it is
+    # redacted as the console log is. A boot's summary is read from the raw console, and when
+    # Origin printed nothing it is the console's last line: a network boot's, with the machine's
+    # address and MAC, say.
+    (rental.dir / "record-draft.md").write_text(redact(draft, rental.server_id, [rental.ip]))
     print(f"{stamp()} record draft: {rental.dir / 'record-draft.md'}")
 
 
