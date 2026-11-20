@@ -846,6 +846,13 @@ pub(crate) fn publish_context(cpu: CpuIndex, frame: u64) -> bool {
         .is_some_and(|table| table.publish(frame))
 }
 
+/// Whether some processor's table of contexts covers `[start, end)`: a context's home or saved
+/// frame there. Part of what [`stack_in_use`] asks, without the caller's stack pointer and the
+/// kernel-stack records (`stack::slot_in_contexts`).
+pub(crate) fn contexts_cover(start: u64, end: u64) -> bool {
+    CONTEXTS.iter().any(|table| table.covers(start, end))
+}
+
 /// Withdraws the context published on processor `cpu` at `frame`, which its spawner never made
 /// runnable (TASKS item 75; `Contexts::withdraw`). `false` if the table does not hold it as never
 /// resumed, or `cpu` has none.

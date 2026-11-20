@@ -574,6 +574,17 @@ pub fn slot_in_use(slot: StackSlot) -> bool {
     in_use(low, low + SLOT)
 }
 
+/// Whether some processor's table of contexts covers the stack in slot `slot`: a context's home
+/// or saved frame there. Part of what [`slot_in_use`] asks, without the caller's stack pointer
+/// and the kernel-stack records. For the kernel stacks proof's switch windows, where since TASKS
+/// item 77 the held processor's kernel-stack record still names the held thread's stack, so
+/// that what [`slot_in_use`] answers there would not show its home word (the review of TASKS
+/// items 75, 77 and 81, R77-1). It names no address.
+pub fn slot_in_contexts(slot: StackSlot) -> bool {
+    let low = slot_base(slot.0);
+    cpu::contexts_cover(low, low + SLOT)
+}
+
 /// The state of slot `slot` in the stack region's table, or `None` if there is no such slot. For
 /// a proof that a stack was given back rather than leaked (`State::Lost`; TASKS item 68, T68-1).
 /// It names no address.

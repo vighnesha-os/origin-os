@@ -14,12 +14,14 @@
 //! - **A thread's own stack stays in use through its switches** (TASKS item 70; the review of
 //!   TASKS item 68, T68-2). A thread on another processor is held in the window of its own
 //!   switch-out, after the scheduler has decided the switch and before the trap entry saves its
-//!   frame. (Until TASKS item 77 the scheduler had moved that processor's kernel-stack record
-//!   there; since then the trap entry moves it only after the frame is saved, so the window holds
-//!   the thread's frame unsaved and its stack named by neither the frame nor the record, its home
-//!   alone covering it.) It is held again in the window of its exit, when its stack
-//!   has become a zombie. Each time the boot flow asks the framework whether the stack is in use,
-//!   as a stack's drop would decide, and the answer must be yes. Once the thread has ended and
+//!   frame. It is held again in the window of its exit, when its stack has become a zombie. Each
+//!   time the boot flow asks the framework whether the stack is in use, as a stack's drop would
+//!   decide, and whether the table of contexts alone covers it, and both answers must be yes. The
+//!   second is what shows the home word: until TASKS item 77 the scheduler had moved that
+//!   processor's kernel-stack record to the incoming context before the window, but since then the
+//!   trap entry moves it only after the frame is saved, so in both windows the record still names
+//!   the held thread's stack and the first answer would be yes without the home (the review of
+//!   TASKS items 75, 77 and 81, R77-1). Once the thread has ended and
 //!   its processor has reaped it, that drop must have given the stack back, not leaked it.
 //! - **Nothing leaks:** once the proof's stacks are given back and reclaimed, the region holds
 //!   exactly what it held before.
@@ -624,9 +626,11 @@ fn ask_in_window(tsc_hz: u64) -> Window {
     if !held {
         return window(Asked::NotHeld, held_wait);
     }
+    // What a drop decides, and the table of contexts alone: the record still names the held
+    // thread's stack in this window (R77-1), so only the second shows its home.
     let in_use = WINDOW_SLOT
         .get()
-        .is_some_and(|slot| stack::slot_in_use(*slot));
+        .is_some_and(|slot| stack::slot_in_use(*slot) && stack::slot_in_contexts(*slot));
     WINDOW_STAGE.store(ANSWERED, Ordering::Release);
     window(Asked::InUse(in_use), held_wait)
 }
@@ -690,7 +694,7 @@ fn switch_windows(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: 
         && !gave_up;
     let _ = writeln!(
         com1,
-        "origin-kernel: kernel stacks: a thread's own stack, asked about from {} while {} switched it out (its switch decided, the thread's frame not yet saved): in use: {} (held {} us); while it ended: in use: {} (held {} us); given back by its processor's reap, not leaked: {given_back} ({how}); the boot flow waited {} and {} us for the thread to be ready, then {} and {} us for its processor to be held{}{}",
+        "origin-kernel: kernel stacks: a thread's own stack, asked about from {} while {} switched it out (its switch decided, the thread's frame not yet saved): in use, and covered by the table of contexts: {} (held {} us); while it ended: the same: {} (held {} us); given back by its processor's reap, not leaked: {given_back} ({how}); the boot flow waited {} and {} us for the thread to be ready, then {} and {} us for its processor to be held{}{}",
         bsp.named(),
         cpu.named(),
         switched_out.asked,
