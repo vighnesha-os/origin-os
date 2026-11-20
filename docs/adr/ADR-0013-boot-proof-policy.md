@@ -799,6 +799,18 @@ Each fault failed where aimed: T66-3, 4, 5, 7, 8, 9b, 10, 11, 13, 14, 16, 17, 19
 - **At twenty** (5 small boots): 4 passed; one failed the ping-pong at its run 8, by its own rule.
 - **At ten** (2 large boots): both refused, as before TASKS item 66: the 65-processor machine at the window, the 67-processor machine at the tick proof, slow in all 4 runs with its count's period in bounds.
 
+
+**The controls of TASKS item 83 (QEMU machines with the rented board's shapes; 2026-11-20, Rust 1.100.0, QEMU 11.1.3 TCG, 2 processors, 64 GiB, the same machine and way):** temporary edits on `claude/rental-b-readiness-33dcba` at `7fefbf96`, each applied by a script that booted the `kernel boot` scenario once with the rented board's settings (`ORIGIN_QEMU_SHAPE=on`, `ORIGIN_QEMU_MEMORY=64G`; RB-3 with the memory alone), put the file back with `git checkout` and touched it, in one turn of the machine (2026-11-20). The tree was clean afterwards. The same code passed before them: `boot-rented` and `boot-large` under both IOMMUs, the console moved to COM2 (`the UART is now at I/O port 0x2f8, as the firmware set it; 2593 bytes of earlier output sent to it again, 0 did not fit`), the census `never lent, as the firmware changes them after boot: FACS 0x7fbdd000-0x7fbdd03f, FBPT 0x7fb32000-0x7fb32037, S3PT 0x7fb31000-0x7fb3101f; 3 kept`, then `17 tables: 12 checked, 0 refused, 0 reported, ..., 0 gaps in locating it; ...; consistent true`, and `degraded: 70 of 71 proofs passed; failed: speculation controls`. Each control failed with `boot-test` exit 1. RB-1, RB-2 and RB-4 are rental B's case: the kernel stayed on COM1 and ran to its last line there, `M1 entry complete; halting`, with nothing on the UART the firmware names, and the checker named that line.
+
+| Control | Edit | Caught |
+|---|---|---|
+| RB-1 | The application puts the RSDP's copy in loader-data pages, RAM the kernel owns, not ACPI NVS (`tests/emulator/reserved-memory/src/main.rs`) | Nothing on COM2: `first missing marker "origin-kernel: console: framebuffer 1280x800 at 0x"`; `COM1's last kernel line: "origin-kernel: M1 entry complete; halting"` |
+| RB-2 | The FBPT's header put 16 bytes before a copy of the SPCR, which the XSDT then names, so the SPCR lies inside the FBPT's 56-byte minimum (the application) | As RB-1: nothing on COM2, and COM1's last kernel line `M1 entry complete; halting` |
+| RB-3 | `covered_end` counts no memory above 4 GiB (`framekernel/frame/src/frames.rs`) | The memory check: `the frame allocator has 1989 MiB free of the machine's 65536 MiB: not within 1% of it` |
+| RB-4 | No UART at `0x2F8`: QEMU's second UART moved to `0x3E8` (`developer-tools/xtask/src/main.rs`) | As RB-1: nothing on COM2, and COM1's last kernel line `M1 entry complete; halting` |
+
+From `5a184a3c` on, a failure report also gives the console's last line about the firmware's UART, so these three say why the console stayed on COM1; the run of the controls before the final gates records those lines.
+
 ## Alternatives
 
 | Alternative | For | Against |
