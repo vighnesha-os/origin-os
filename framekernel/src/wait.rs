@@ -158,8 +158,9 @@ extern "sysv64" fn producer(_: u64) -> ! {
         });
         NOT_EMPTY.wake_one();
     }
-    FINISHED.fetch_add(1, Ordering::AcqRel);
-    sched::exit()
+    sched::finish(|| {
+        FINISHED.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 extern "sysv64" fn consumer(_: u64) -> ! {
@@ -179,8 +180,9 @@ extern "sysv64" fn consumer(_: u64) -> ! {
         RECEIVED.fetch_add(1, Ordering::Relaxed);
     }
     IN_ORDER.store(in_order, Ordering::Relaxed);
-    FINISHED.fetch_add(1, Ordering::AcqRel);
-    sched::exit()
+    sched::finish(|| {
+        FINISHED.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// 0: the pinger's turn; 1: the ponger's; 2: done.
@@ -204,8 +206,9 @@ extern "sysv64" fn pinger(_: u64) -> ! {
     PING_CYCLES.store(rdtsc().wrapping_sub(start), Ordering::Relaxed);
     TURN.store(2, Ordering::Release);
     PONG.wake_one();
-    FINISHED.fetch_add(1, Ordering::AcqRel);
-    sched::exit()
+    sched::finish(|| {
+        FINISHED.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 extern "sysv64" fn ponger(_: u64) -> ! {
@@ -217,8 +220,9 @@ extern "sysv64" fn ponger(_: u64) -> ! {
         TURN.store(0, Ordering::Release);
         PING.wake_one();
     }
-    FINISHED.fetch_add(1, Ordering::AcqRel);
-    sched::exit()
+    sched::finish(|| {
+        FINISHED.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// Nobody signals this queue: a timed wait on it can only time out.
@@ -259,8 +263,9 @@ extern "sysv64" fn timed_waiter(which: u64) -> ! {
             Ordering::Release,
         );
     }
-    FINISHED.fetch_add(1, Ordering::AcqRel);
-    sched::exit()
+    sched::finish(|| {
+        FINISHED.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// One run of the timed waits, as the waiters and the boot flow measured it.

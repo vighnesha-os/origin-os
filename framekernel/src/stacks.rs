@@ -13,10 +13,15 @@
 //!   fault, and the slot is free again, which it is only once the frames have been released.
 //! - **A thread's own stack stays in use through its switches** (TASKS item 70; the review of
 //!   TASKS item 68, T68-2). A thread on another processor is held in the window of its own
-//!   switch-out, after the scheduler has moved that processor's kernel-stack record and before
-//!   the trap entry saves its frame. It is held again in the window of its exit, when its stack
-//!   has become a zombie. Each time the boot flow asks the framework whether the stack is in use,
-//!   as a stack's drop would decide, and the answer must be yes. Once the thread has ended and
+//!   switch-out, after the scheduler has decided the switch and before the trap entry saves its
+//!   frame. It is held again in the window of its exit, when its stack has become a zombie. Each
+//!   time the boot flow asks the framework whether the stack is in use, as a stack's drop would
+//!   decide, and whether the table of contexts alone covers it, and both answers must be yes. The
+//!   second is what shows the home word: until TASKS item 77 the scheduler had moved that
+//!   processor's kernel-stack record to the incoming context before the window, but since then the
+//!   trap entry moves it only after the frame is saved, so in both windows the record still names
+//!   the held thread's stack and the first answer would be yes without the home (the review of
+//!   TASKS items 75, 77 and 81, R77-1). Once the thread has ended and
 //!   its processor has reaped it, that drop must have given the stack back, not leaked it.
 //! - **Nothing leaks:** once the proof's stacks are given back and reclaimed, the region holds
 //!   exactly what it held before.
@@ -171,8 +176,7 @@ extern "sysv64" fn reader(_: u64) -> ! {
             STALE.fetch_add(1, Ordering::Relaxed);
         }
     }
-    STAGE.store(3, Ordering::Release);
-    crate::sched::exit()
+    crate::sched::finish(|| STAGE.store(3, Ordering::Release))
 }
 
 /// Every retired stack reclaimed, here or by another processor: the others reclaim in their idle
@@ -393,8 +397,17 @@ fn cost(com1: &mut Console, tsc_hz: u64) -> bool {
     free(reuse);
     stack::trim();
     reclaimed(tsc_hz);
-    // One stack at a time, freed, retired and reclaimed here; a round in which another
-    // processor reclaimed it first, in its idle loop, is not counted.
+    // One stack at a time, freed, retired and reclaimed here. A round counts when this reclaim
+    // gave back one stack, whichever it was; its time then includes whatever that reclaim did,
+    // a stall included (the scheduler's line says so if one came). A round in which another
+    // processor reclaimed the stack first, in its idle loop, is not counted. Reclaims are served
+    // one at a time (`Slots::reclaim`, TASKS item 73): that processor holds the role through its
+    // shootdown, and its loop takes the stacks retired meanwhile that it sees; one it misses is
+    // given back by the next reap anywhere. After a round not counted this waits until nothing is
+    // retired, which makes a run of `Busy` rounds unlikely but does not exclude another processor
+    // from taking the next round's stack; without the wait every later round ended `Busy` and
+    // none was counted (0 of 16 on the 67-processor sparse machine, 2026-11-20; control K5). The
+    // independent review of TASKS item 73, T73-3, corrected these words.
     let (mut alone, mut reclaiming, mut interrupts) = (0, 0, 0);
     for _ in 0..stack::IDLE {
         drop(GuardedStack::new(MEASURED));
@@ -406,6 +419,8 @@ fn cost(com1: &mut Console, tsc_hz: u64) -> bool {
             alone += 1;
             reclaiming += took;
             interrupts += done.interrupts;
+        } else {
+            reclaimed(tsc_hz);
         }
     }
     reclaimed(tsc_hz);
@@ -519,12 +534,13 @@ extern "sysv64" fn windowed(_: u64) -> ! {
     ready();
     crate::sched::sleep(1);
     ready();
-    crate::sched::exit()
+    // Nothing waits for its end but the exit window's own handshake, in the exit itself.
+    crate::sched::finish(|| ())
 }
 
 /// Called by the scheduler's sleep and exit hooks once the switch is decided (`sched::on_sleep`,
-/// `sched::on_exit`): the processor's kernel-stack record has moved, and the trap entry has not
-/// yet saved the outgoing frame `here`. If the switch is away from the held thread's stack and the
+/// `sched::on_exit`): the trap entry has not yet saved the outgoing frame `here`, nor moved the
+/// processor's kernel-stack record (TASKS item 77). If the switch is away from the held thread's stack and the
 /// boot flow is spinning for it (`GO`), this processor waits here, with interrupts off, until the
 /// boot flow has asked about that stack, for at most [`HOLD_MILLIS`]. Otherwise it costs a relaxed
 /// load.
@@ -621,9 +637,11 @@ fn ask_in_window(tsc_hz: u64) -> Window {
     if !held {
         return window(Asked::NotHeld, held_wait);
     }
+    // What a drop decides, and the table of contexts alone: the record still names the held
+    // thread's stack in this window (R77-1), so only the second shows its home.
     let in_use = WINDOW_SLOT
         .get()
-        .is_some_and(|slot| stack::slot_in_use(*slot));
+        .is_some_and(|slot| stack::slot_in_use(*slot) && stack::slot_in_contexts(*slot));
     WINDOW_STAGE.store(ANSWERED, Ordering::Release);
     window(Asked::InUse(in_use), held_wait)
 }
@@ -670,7 +688,9 @@ fn switch_windows(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: 
     let (given_back, how) = match state {
         _ if !room => (false, "not judged: no room was kept for it"),
         Some(State::Idle) => (true, "kept for reuse"),
-        Some(State::Retired | State::Reclaiming | State::Free) => (true, "retired"),
+        Some(State::Retired | State::Reclaiming | State::Waiting | State::Free) => {
+            (true, "retired")
+        }
         Some(State::Lost) => (false, "leaked"),
         Some(State::Live) => (false, "not reaped"),
         None => (false, "no slot"),
@@ -687,7 +707,7 @@ fn switch_windows(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: 
         && !gave_up;
     let _ = writeln!(
         com1,
-        "origin-kernel: kernel stacks: a thread's own stack, asked about from {} while {} switched it out (that processor's kernel-stack record moved, the thread's frame not yet saved): in use: {} (held {} us); while it ended: in use: {} (held {} us); given back by its processor's reap, not leaked: {given_back} ({how}); the boot flow waited {} and {} us for the thread to be ready, then {} and {} us for its processor to be held{}{}",
+        "origin-kernel: kernel stacks: a thread's own stack, asked about from {} while {} switched it out (its switch decided, the thread's frame not yet saved): in use, and covered by the table of contexts: {} (held {} us); while it ended: the same: {} (held {} us); given back by its processor's reap, not leaked: {given_back} ({how}); the boot flow waited {} and {} us for the thread to be ready, then {} and {} us for its processor to be held{}{}",
         bsp.named(),
         cpu.named(),
         switched_out.asked,

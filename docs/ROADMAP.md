@@ -105,7 +105,7 @@ M1-5 needs the prerequisites in "Before a first boot on a machine in scope".
 | A01-def5 | Merkle-SHA256-4K, which the loader verifies |
 | A04-H3, A04-H4 | KASLR; the loader builds the first page tables |
 | A09-H6 | Before the first boot (ADR-0009) |
-| A10-E1 to A10-Am2 | The early console (ADR-0010 and its amendments) |
+| A10-E1 to A10-Am3 | The early console (ADR-0010 and its amendments) |
 | A16-R10, A16-Am1 | The loader's generator, its seed for the kernel, and the stack region's value |
 | S13-01, S13-03, S13-08, S13-09 | `no_std`, explicit panic handling, defined stack and calling conventions, checked parsing of what the firmware hands over |
 | A13-R1 to A13-Am1 | What a failed boot proof means (ADR-0013): the test policy every boot runs under, on each declared machine (moved from M0 by item 269) |
@@ -178,7 +178,7 @@ M3-6 needs the prerequisites in "Before a first boot on a machine in scope".
 | A08-C1 to A08-C7 | The CPU index (ADR-0008) |
 | A08-D1 to A08-D8 | Any processor count (ADR-0008 Amendment 1, items 283 to 290; placed by the coordinating session under item 264's rule, in no exit test) |
 | A13-Am2 | The fair share reported, not failed, on the oversubscribed software-processor machines (ADR-0013 Amendment 2, item 308; placed by the coordinating session under item 264's rule, in no exit test) |
-| A13-Am3 | A kernel stack lost to a stalled shootdown reported, not failed, or its boot run once more, on the oversubscribed software-processor machines (ADR-0013 Amendment 3, items 313, 314 and 316, until TASKS item 73 lands; placed by the coordinating session under item 264's rule, in no exit test) |
+| A13-Am3 | A kernel stack lost to a stalled shootdown reported, not failed, or its boot run once more, on the oversubscribed software-processor machines (ADR-0013 Amendment 3, items 313, 314 and 316; placed by the coordinating session under item 264's rule, in no exit test). Ended by the change that lands TASKS item 73 (2026-11-20), and removed from scope (item 316) |
 | A09-H4, A09-H5 | The first machines, one hybrid and one with SMT, as M3-6 asks; what to check before buying |
 | S13-05 | Explicit memory ordering |
 | S18-03, S18-04 | ADRs for the scheduler and for locking (TASKS item 27) |

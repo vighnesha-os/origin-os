@@ -8,10 +8,13 @@
 //!
 //! - **`home`**: an address inside the context's own stack (its first frame's), from the moment
 //!   that frame is published ([`Contexts::publish`]) until the context has ended and its processor
-//!   has left the stack ([`Contexts::retire_ended`]). For the boot or idle flow, which has no stack
-//!   of its own in the region, it is [`BOOT_FLOW`], an address no stack contains. 0 is a free slot.
-//! - **`frame`**: the frame the trap entry may resume, while the context is suspended, and 0 while
-//!   it runs or after it ended.
+//!   has left the stack ([`Contexts::retire_ended`]), or until its publisher withdraws it, never
+//!   having made it runnable ([`Contexts::withdraw`]). For the boot or idle flow, which has no
+//!   stack of its own in the region, it is [`BOOT_FLOW`], an address no stack contains. 0 is a
+//!   free slot.
+//! - **`frame`**: the frame the trap entry may resume, while the context is suspended (a published
+//!   context waits for its first run suspended at its first frame), and 0 while it runs, after it
+//!   ended, and while a withdrawal is under way.
 //!
 //! # What covers a stack, and why no switch uncovers one
 //!
@@ -30,13 +33,39 @@
 //!
 //! - A slot is claimed by a compare-and-swap of `home` from 0 (AcqRel), and its `frame` is
 //!   stored with Release. Readers load both with Acquire.
-//! - A home is retired with a Release store of 0, made only on the context's own processor, and
-//!   only after that processor has left the stack ([`Contexts::retire_ended`]). A reader that does
-//!   not find the home has read that store or a later value. So everything the processor did on
-//!   the stack happens before whatever the reader does next, such as giving the stack back.
+//! - A `frame` word becomes 0 in two ways, each a compare-and-swap of the word from the frame
+//!   it holds: this processor's `switch` takes it to resume it, or the context's publisher, on
+//!   any processor, takes its first frame to withdraw a context it never made runnable
+//!   ([`Contexts::withdraw`]). Both are compare-and-swaps of the same word, so at most one of them
+//!   takes a given frame: a context withdrawn is never resumed, and one resumed is never
+//!   withdrawn. Nothing else writes a nonzero frame to 0. A frame is written into a slot whose
+//!   `frame` is 0 only by a claimer that has just taken it while free, or by this processor's
+//!   switch-out of the context it runs (`current`); a context being withdrawn never ran, so it
+//!   was never `current`, and no switch-out writes its slot (the review of TASKS items 75, 77
+//!   and 81, R75-3).
+//! - A home leaves the table by a Release store of 0, in one of two ways:
+//!   - **retired** on the context's own processor, only after that processor has left the stack
+//!     ([`Contexts::retire_ended`]);
+//!   - **withdrawn** by its publisher, from any processor, only after the publisher's
+//!     compare-and-swap took the first frame, so that no processor has run or ever will run on
+//!     the stack as this context.
+//!
+//!   A reader that does not find the home has read that store or a later value. So everything
+//!   the processor did on the stack, or the publisher did before withdrawing, happens before
+//!   whatever the reader does next, such as giving the stack back. A claimer that takes the slot
+//!   afterwards reads the store with its compare-and-swap, so the withdrawn context's words are
+//!   behind it and cannot overwrite the claim.
 //! - A home is claimed before anything can run on its stack: only a published frame is ever
-//!   resumed. The publisher also holds the stack exclusively when it publishes, so any later
-//!   holder's drop happens after the claim.
+//!   resumed. The publisher also holds the stack exclusively when it publishes, and until it
+//!   withdraws, so any later holder's drop happens after the claim, and after the withdrawal.
+//!
+//! **Between a withdrawal's two stores** the slot has a home and a `frame` of 0, as a running
+//! context's slot has. Nothing infers "running" from that pair: which context runs is `current`,
+//! and which ended is `ended`, both slot indexes written only by this processor's `switch` (and
+//! `ended` cleared by its retirement), and a withdrawn context is never either, since it never
+//! ran. Meanwhile [`Contexts::covers`] still finds the home, so the stack stays covered until the
+//! publisher's own drop; no claim can take the slot, whose home is not 0; and no `switch` can
+//! match it, since a `switch` never looks for a frame of 0.
 //!
 //! On x86-64, Acquire loads and Release stores are plain moves, and the compare-and-swap is the
 //! `lock cmpxchg` the table needed before. The Loom models (`models.rs`, "contexts") check these
@@ -45,6 +74,8 @@
 //! # Who calls what
 //!
 //! - [`Contexts::publish`]: any processor, for a thread it is placing on this one.
+//! - [`Contexts::withdraw`]: the publisher, on any processor, for a context it published and
+//!   never made runnable (a spawn that its run queue then refused; TASKS item 75).
 //! - [`Contexts::switch`] and [`Contexts::retire_ended`]: this processor only, and **with
 //!   interrupts off**. `switch` runs from the trap entry; a stack's drop, which may run with
 //!   interrupts on, wraps its retirement in `cpu::without_interrupts` (the review of TASKS item
@@ -69,6 +100,16 @@
 //! - [`Contexts::covers`]: any processor. It never waits and takes no lock, so a stack may still
 //!   be dropped under any lock.
 //!
+//! # The stack a processor names for ring 3 (TASKS item 77)
+//!
+//! A switch answers the incoming context's home with the frame to resume ([`Switched`]), and the
+//! trap entry names the stack that home is in as the one an interrupt or a system call from ring
+//! 3 lands on (`origin_frame::cpu`, the processor's kernel-stack record and TSS.RSP0). For the
+//! boot or idle flow the home is [`BOOT_FLOW`], in no stack, which never runs in ring 3. So the
+//! stack named is always the running context's own, whatever the scheduler above answered: the
+//! table, not the scheduler, says whose frame was resumed. [`Contexts::running_home`] reads the
+//! same home back for the entry's check that an entry from ring 3 landed on it.
+//!
 //! # A context never moves between processors
 //!
 //! A frame is resumed only by the processor whose table holds it, and the frames a context saves
@@ -88,6 +129,17 @@
 //! is 17 of 32. If a table were ever full, [`Contexts::publish`] returns `false`, and the kernel
 //! refuses the spawn. A boot flow's first switch-out that found no slot would be refused by
 //! [`Contexts::switch`] with [`Refused::Full`], and the trap entry halts.
+//!
+//! **Spawns in flight** (TASKS item 75; the review of TASKS items 75, 77 and 81, R75-2). A spawn
+//! publishes before it queues, so the table also holds, for a moment, every spawn to this
+//! processor between its publication and its push or withdrawal: one per spawner in that
+//! stretch, which runs with interrupts on and may be preempted there. They share the 15 slots to
+//! spare. More at once would have a publication refused, which only fails that spawn, and would
+//! halt a processor whose boot or idle flow had not yet made its first switch-out. Today's kernel
+//! reaches neither: every processor's boot or idle flow first switches out in the boot's first
+//! scheduler proofs, to threads the boot flow spawns one at a time, before any thread can spawn
+//! another. Claiming the boot or idle flow's slot when the table is made, rather than at its first
+//! switch-out, would remove the halt; that is a follow-up.
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
@@ -178,6 +230,25 @@ impl core::fmt::Debug for Contexts {
     }
 }
 
+/// What [`Contexts::switch`] answers: the frame to resume, and the home of the context that now
+/// runs if the switch changed it (TASKS item 77). Its `Debug` writes its name alone, as
+/// [`Contexts`]' does: its words are addresses in the kernel stacks' region.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Switched {
+    /// The frame the trap entry resumes: `next`, which the table held, or `here` if nothing
+    /// switched.
+    pub frame: u64,
+    /// The incoming context's home, which its stack holds ([`BOOT_FLOW`] for the boot or idle
+    /// flow), or `None` if nothing switched and the running context stays.
+    pub home: Option<u64>,
+}
+
+impl core::fmt::Debug for Switched {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Switched")
+    }
+}
+
 impl Contexts {
     /// A table with no context.
     #[cfg(not(all(test, loom)))]
@@ -207,6 +278,40 @@ impl Contexts {
         frame > BOOT_FLOW && self.slots.iter().any(|slot| slot.claim(frame, frame))
     }
 
+    /// Withdraws a context published at `frame` and never resumed: its slot is free again, and
+    /// its stack no longer covered. Only its publisher calls it, from any processor, for a context
+    /// it never made runnable (TASKS item 75).
+    ///
+    /// The first frame is taken by a compare-and-swap first, the same take a `switch` makes to
+    /// resume it, so that at most one of the two succeeds; only then is the home cleared, with
+    /// Release (the module documentation, "The orderings"). `false` if no slot holds `frame` as
+    /// both its home and its frame to resume: a frame never published, one already withdrawn, or
+    /// one a `switch` took first. Any home then stays, and the stack it covers is leaked rather
+    /// than freed under a context that may run on it. It is for a context never made runnable,
+    /// the only kind its publisher withdraws. A context that ran is not taken by mistake either:
+    /// its saved frames are never at its first frame's address. In 64-bit mode the processor
+    /// aligns the stack to 16 bytes before it pushes an interrupt's frame (Intel SDM Vol. 3A,
+    /// order 325384-093US, §7.14.2), and the kernel builds a system call's frame from the stack's
+    /// top likewise, while a first frame is built 8 bytes below such a place
+    /// (`origin_frame::stack::GuardedStack::build_first_frame`; the review of TASKS items 75, 77
+    /// and 81).
+    pub fn withdraw(&self, frame: u64) -> bool {
+        if frame <= BOOT_FLOW {
+            return false;
+        }
+        let Some(slot) = self.slots.iter().find(|slot| {
+            slot.home.load(Acquire) == frame
+                && slot
+                    .frame
+                    .compare_exchange(frame, 0, AcqRel, Acquire)
+                    .is_ok()
+        }) else {
+            return false;
+        };
+        slot.home.store(0, Release);
+        true
+    }
+
     /// What the trap entry resumes after a scheduler upcall, which the scheduler answered with
     /// `next` for the context interrupted at `here`. This processor only, interrupts off.
     ///
@@ -215,7 +320,9 @@ impl Contexts {
     /// twice, and its context becomes the running one. The context that was running keeps its
     /// home and saves `here` as its frame, or, if `exiting`, is recorded as ended and saves
     /// nothing. The boot or idle flow's first switch-out claims a slot for it. No `home` is
-    /// written.
+    /// written. The answer carries the incoming context's home, read from the slot whose frame
+    /// was taken, which the trap entry names as the stack ring 3 lands on (TASKS item 77); with
+    /// nothing switched it carries none.
     ///
     /// `running_on(address)` says whether this processor runs on the stack holding `address`.
     pub fn switch(
@@ -224,16 +331,24 @@ impl Contexts {
         next: u64,
         exiting: bool,
         running_on: impl Fn(u64) -> bool,
-    ) -> Result<u64, Refused> {
+    ) -> Result<Switched, Refused> {
         self.retire_ended(running_on)?;
         if next == here {
-            return Ok(here);
+            return Ok(Switched {
+                frame: here,
+                home: None,
+            });
         }
         if next <= BOOT_FLOW {
             return Err(Refused::NeverSaved);
         }
-        // Only this processor clears a frame, and a publisher only fills a slot it has just
-        // claimed, so a frame read equal to `next` is still `next` at the swap.
+        // The take is a compare-and-swap: between the load and the swap a publisher on another
+        // processor may withdraw the same frame (a context it never made runnable, so the
+        // scheduler had no business naming it), which takes the word by the same swap. Then this
+        // one fails and the search goes on, to `NeverSaved` if nothing else holds `next`. A frame
+        // read equal to `next` is otherwise still `next` at the swap: only this processor's
+        // switches and a withdrawal clear one, and a publisher writes one only into a slot it has
+        // just claimed.
         let incoming = self
             .slots
             .iter()
@@ -260,7 +375,22 @@ impl Contexts {
             }
         }
         self.current.store(incoming, Relaxed);
-        Ok(next)
+        // The slot whose frame this switch took: its home is the incoming context's (its claim,
+        // AcqRel, came before the Release store of the frame the take read with Acquire).
+        let home = self.slots.get(incoming).map(|slot| slot.home.load(Acquire));
+        Ok(Switched { frame: next, home })
+    }
+
+    /// The home of the context this processor runs: what [`Self::switch`] last answered, read
+    /// back from the slot `current` names, or `None` before the boot or idle flow's first
+    /// switch-out. This processor only, with interrupts off, as the trap entry runs: `current` is
+    /// written only by its switches, and the running context's home only by its publication. The
+    /// trap entry's check that an entry from ring 3 landed on the running context's own stack
+    /// reads it, and never the record it wrote from the switch's answer (TASKS item 77).
+    pub fn running_home(&self) -> Option<u64> {
+        self.slots
+            .get(self.current.load(Relaxed))
+            .map(|slot| slot.home.load(Acquire))
     }
 
     /// Retires the home of a context that ended, if any: this processor only, after it has left
@@ -325,6 +455,19 @@ mod tests {
         false
     }
 
+    /// The frame a switch resumes, which is what these tests compare.
+    fn switch_to(
+        table: &Contexts,
+        here: u64,
+        next: u64,
+        exiting: bool,
+        running_on: impl Fn(u64) -> bool,
+    ) -> Result<u64, Refused> {
+        table
+            .switch(here, next, exiting, running_on)
+            .map(|switched| switched.frame)
+    }
+
     fn covered(table: &Contexts, n: u64) -> bool {
         let (low, top) = stack(n);
         table.covers(low, top)
@@ -338,16 +481,16 @@ mod tests {
         // The boot flow switches to it: its frame is taken, its home stays.
         let boot = 0x9000;
         assert_eq!(
-            table.switch(boot, first_frame(1), false, not_on_it),
+            switch_to(&table, boot, first_frame(1), false, not_on_it),
             Ok(first_frame(1))
         );
         assert!(covered(&table, 1), "running, by its home");
         // It is switched out at a frame lower on its stack, and the boot flow resumed.
         let here = first_frame(1) - 0x200;
-        assert_eq!(table.switch(here, boot, false, not_on_it), Ok(boot));
+        assert_eq!(switch_to(&table, here, boot, false, not_on_it), Ok(boot));
         assert!(covered(&table, 1), "suspended");
         // Resumed again: the frame it saved is the one the scheduler names.
-        assert_eq!(table.switch(boot, here, false, not_on_it), Ok(here));
+        assert_eq!(switch_to(&table, boot, here, false, not_on_it), Ok(here));
         assert!(covered(&table, 1));
     }
 
@@ -356,29 +499,38 @@ mod tests {
         let table = Contexts::new();
         assert!(table.publish(first_frame(1)));
         assert_eq!(
-            table.switch(0x9000, 0, false, not_on_it),
+            switch_to(&table, 0x9000, 0, false, not_on_it),
             Err(Refused::NeverSaved),
             "0 matches no slot, free ones included"
         );
         assert_eq!(
-            table.switch(0x9000, BOOT_FLOW, false, not_on_it),
+            switch_to(&table, 0x9000, BOOT_FLOW, false, not_on_it),
             Err(Refused::NeverSaved)
         );
         assert_eq!(
-            table.switch(0x9000, first_frame(2), false, not_on_it),
+            switch_to(&table, 0x9000, first_frame(2), false, not_on_it),
             Err(Refused::NeverSaved)
         );
         assert_eq!(
-            table.switch(0x9000, first_frame(1), false, not_on_it),
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
             Ok(first_frame(1))
         );
         // Taken: a second resume of the same frame is refused.
         assert_eq!(
-            table.switch(first_frame(1) - 0x100, first_frame(1), false, not_on_it),
+            switch_to(
+                &table,
+                first_frame(1) - 0x100,
+                first_frame(1),
+                false,
+                not_on_it
+            ),
             Err(Refused::NeverSaved)
         );
         // The same frame as `here` is no switch.
-        assert_eq!(table.switch(0x7000, 0x7000, false, not_on_it), Ok(0x7000));
+        assert_eq!(
+            switch_to(&table, 0x7000, 0x7000, false, not_on_it),
+            Ok(0x7000)
+        );
     }
 
     #[test]
@@ -388,13 +540,13 @@ mod tests {
         assert!(table.publish(first_frame(2)));
         let boot = 0x9000;
         assert_eq!(
-            table.switch(boot, first_frame(1), false, not_on_it),
+            switch_to(&table, boot, first_frame(1), false, not_on_it),
             Ok(first_frame(1))
         );
         // Context 1 ends, and the processor switches to context 2.
         let at_exit = first_frame(1) - 0x300;
         assert_eq!(
-            table.switch(at_exit, first_frame(2), true, not_on_it),
+            switch_to(&table, at_exit, first_frame(2), true, not_on_it),
             Ok(first_frame(2))
         );
         assert!(covered(&table, 1), "ended, not yet retired");
@@ -416,11 +568,11 @@ mod tests {
         assert!(table.publish(first_frame(1)));
         assert!(table.publish(first_frame(2)));
         assert_eq!(
-            table.switch(0x9000, first_frame(1), false, not_on_it),
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
             Ok(first_frame(1))
         );
         assert_eq!(
-            table.switch(first_frame(1) - 8, first_frame(2), true, not_on_it),
+            switch_to(&table, first_frame(1) - 8, first_frame(2), true, not_on_it),
             Ok(first_frame(2))
         );
         let (low, top) = stack(1);
@@ -429,7 +581,13 @@ mod tests {
         assert!(covered(&table, 1), "still covered");
         // The next switch, made from another stack, retires it.
         assert_eq!(
-            table.switch(first_frame(2) - 8, first_frame(2) - 8, false, not_on_it),
+            switch_to(
+                &table,
+                first_frame(2) - 8,
+                first_frame(2) - 8,
+                false,
+                not_on_it
+            ),
             Ok(first_frame(2) - 8)
         );
         assert!(!covered(&table, 1));
@@ -442,15 +600,15 @@ mod tests {
             assert!(table.publish(first_frame(n)));
         }
         assert_eq!(
-            table.switch(0x9000, first_frame(1), false, not_on_it),
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
             Ok(first_frame(1))
         );
         assert_eq!(
-            table.switch(0x100, first_frame(2), true, not_on_it),
+            switch_to(&table, 0x100, first_frame(2), true, not_on_it),
             Ok(first_frame(2))
         );
         assert_eq!(
-            table.switch(0x200, first_frame(3), true, not_on_it),
+            switch_to(&table, 0x200, first_frame(3), true, not_on_it),
             Ok(first_frame(3))
         );
         assert!(!covered(&table, 1), "retired by the second exit's switch");
@@ -465,13 +623,13 @@ mod tests {
         assert!(table.publish(first_frame(1)));
         let boot = stack(5).1 - 0x40;
         assert_eq!(
-            table.switch(boot, first_frame(1), false, not_on_it),
+            switch_to(&table, boot, first_frame(1), false, not_on_it),
             Ok(first_frame(1))
         );
         // Suspended, its frame covers the stack it is on; its home covers nothing.
         assert!(covered(&table, 5));
         assert_eq!(
-            table.switch(first_frame(1) - 8, boot, false, not_on_it),
+            switch_to(&table, first_frame(1) - 8, boot, false, not_on_it),
             Ok(boot)
         );
         assert!(
@@ -488,18 +646,18 @@ mod tests {
         assert!(table.publish(first_frame(1)));
         assert!(table.publish(first_frame(2)));
         assert_eq!(
-            table.switch(0x9000, first_frame(1), false, not_on_it),
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
             Ok(first_frame(1))
         );
         let on_measured = stack(7).1 - 0x100;
         assert_eq!(
-            table.switch(on_measured, first_frame(2), false, not_on_it),
+            switch_to(&table, on_measured, first_frame(2), false, not_on_it),
             Ok(first_frame(2))
         );
         assert!(covered(&table, 7), "the measured stack, by the frame");
         assert!(covered(&table, 1), "its own stack, by its home");
         assert_eq!(
-            table.switch(first_frame(2) - 8, on_measured, false, not_on_it),
+            switch_to(&table, first_frame(2) - 8, on_measured, false, not_on_it),
             Ok(on_measured)
         );
         assert!(!covered(&table, 7), "running again: the frame is taken");
@@ -519,12 +677,12 @@ mod tests {
         }
         let boot = 0x9000;
         assert_eq!(
-            table.switch(boot, first_frame(1), false, not_on_it),
+            switch_to(&table, boot, first_frame(1), false, not_on_it),
             Ok(first_frame(1))
         );
         // Thread 1 ends; its queue slot takes a new thread before the home is retired.
         assert_eq!(
-            table.switch(0x100, first_frame(2), true, not_on_it),
+            switch_to(&table, 0x100, first_frame(2), true, not_on_it),
             Ok(first_frame(2))
         );
         assert!(table.publish(first_frame(CAPACITY)));
@@ -549,7 +707,7 @@ mod tests {
             assert!(table.publish(first_frame(n)));
         }
         assert_eq!(
-            table.switch(0x9000, first_frame(0), false, not_on_it),
+            switch_to(&table, 0x9000, first_frame(0), false, not_on_it),
             Err(Refused::Full)
         );
     }
@@ -561,11 +719,118 @@ mod tests {
         assert!(!table.publish(BOOT_FLOW));
     }
 
+    /// TASKS item 75: a context published and never resumed is withdrawn whole, its slot free
+    /// again for another publication; a second withdrawal finds nothing.
+    #[test]
+    fn a_context_never_resumed_is_withdrawn_and_its_slot_reused() {
+        let table = Contexts::new();
+        for n in 0..SLOTS as u64 {
+            assert!(table.publish(first_frame(n)));
+        }
+        assert!(!table.publish(first_frame(100)), "full");
+        assert!(table.withdraw(first_frame(3)));
+        assert!(!covered(&table, 3), "its stack is no longer covered");
+        assert_eq!(
+            switch_to(&table, 0x9000, first_frame(3), false, not_on_it),
+            Err(Refused::NeverSaved),
+            "a withdrawn frame is never resumed"
+        );
+        assert!(!table.withdraw(first_frame(3)), "withdrawn once");
+        assert!(table.publish(first_frame(100)), "the slot is free again");
+        assert!(covered(&table, 100));
+        assert!(covered(&table, 4), "the others keep their homes");
+    }
+
+    /// TASKS item 75: a context the processor resumed is never withdrawn, and keeps its home.
+    #[test]
+    fn a_resumed_context_is_not_withdrawn() {
+        let table = Contexts::new();
+        assert!(table.publish(first_frame(1)));
+        assert!(table.publish(first_frame(2)));
+        assert_eq!(
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        assert!(!table.withdraw(first_frame(1)), "running");
+        assert!(covered(&table, 1), "its home stays");
+        // Suspended at a frame of its own, it is still not the context published at that frame.
+        let here = first_frame(1) - 0x200;
+        assert_eq!(
+            switch_to(&table, here, first_frame(2), false, not_on_it),
+            Ok(first_frame(2))
+        );
+        assert!(!table.withdraw(first_frame(1)), "suspended");
+        assert!(!table.withdraw(here), "a saved frame is no home");
+        assert!(covered(&table, 1));
+        assert_eq!(
+            switch_to(&table, first_frame(2) - 8, here, false, not_on_it),
+            Ok(here)
+        );
+    }
+
+    /// TASKS item 75: nothing that cannot be a published frame is withdrawn.
+    #[test]
+    fn a_withdrawal_refuses_what_was_never_published() {
+        let table = Contexts::new();
+        assert!(!table.withdraw(0));
+        assert!(!table.withdraw(BOOT_FLOW));
+        assert!(!table.withdraw(first_frame(1)));
+        assert!(table.publish(first_frame(1)));
+        let boot = stack(5).1 - 0x40;
+        assert_eq!(
+            switch_to(&table, boot, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        // The boot flow's slot: its home is BOOT_FLOW, its frame `boot`.
+        assert!(!table.withdraw(boot));
+        assert!(covered(&table, 5), "the boot flow's frame stays");
+    }
+
+    /// TASKS item 77: a switch answers the incoming context's home, on its first run (frame and
+    /// home the same) and on a later one (a saved frame below it), the boot flow's `BOOT_FLOW`
+    /// when it is switched back to, and none when nothing switched; `running_home` reads the
+    /// same back.
+    #[test]
+    fn a_switch_answers_the_incoming_home() {
+        let table = Contexts::new();
+        assert_eq!(table.running_home(), None, "before the first switch-out");
+        assert!(table.publish(first_frame(1)));
+        assert!(table.publish(first_frame(2)));
+        let boot = 0x9000;
+        let first = table
+            .switch(boot, first_frame(1), false, not_on_it)
+            .unwrap();
+        assert_eq!(
+            (first.frame, first.home),
+            (first_frame(1), Some(first_frame(1)))
+        );
+        assert_eq!(table.running_home(), Some(first_frame(1)));
+        let at_1 = first_frame(1) - 0x200;
+        let second = table
+            .switch(at_1, first_frame(2), false, not_on_it)
+            .unwrap();
+        assert_eq!(second.home, Some(first_frame(2)));
+        let at_2 = first_frame(2) - 0x200;
+        let back = table.switch(at_2, at_1, false, not_on_it).unwrap();
+        assert_eq!((back.frame, back.home), (at_1, Some(first_frame(1))));
+        assert_eq!(table.running_home(), Some(first_frame(1)));
+        let same = table.switch(0x7000, 0x7000, false, not_on_it).unwrap();
+        assert_eq!((same.frame, same.home), (0x7000, None));
+        let to_boot = table.switch(at_1 - 8, boot, false, not_on_it).unwrap();
+        assert_eq!((to_boot.frame, to_boot.home), (boot, Some(BOOT_FLOW)));
+        assert_eq!(table.running_home(), Some(BOOT_FLOW));
+    }
+
     #[test]
     fn debug_names_no_address() {
         let table = Contexts::new();
         assert!(table.publish(0xffff_c000_0001_ff40));
         assert_eq!(format!("{table:?}"), "Contexts");
+        let switched = Switched {
+            frame: 0xffff_c000_0001_ff40,
+            home: Some(0xffff_c000_0001_ff40),
+        };
+        assert_eq!(format!("{switched:?}"), "Switched");
     }
 
     /// The review of TASKS item 70, T70-1, its experiment (a): a retirement interrupted between
@@ -580,18 +845,18 @@ mod tests {
             assert!(table.publish(first_frame(n)));
         }
         assert_eq!(
-            table.switch(0x9000, first_frame(1), false, not_on_it),
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
             Ok(first_frame(1))
         );
         assert_eq!(
-            table.switch(0x100, first_frame(2), true, not_on_it),
+            switch_to(&table, 0x100, first_frame(2), true, not_on_it),
             Ok(first_frame(2))
         );
         let seen_in_the_gap = core::cell::Cell::new(None);
         let outcome = table.retire_ended(|_| {
             // The interrupt: a switch whose own retirement finds `ended` already taken.
             assert_eq!(
-                table.switch(first_frame(2) - 8, first_frame(3), false, not_on_it),
+                switch_to(&table, first_frame(2) - 8, first_frame(3), false, not_on_it),
                 Ok(first_frame(3))
             );
             // A reaper here would find stack 1, ended and no longer recorded as ended, in use.
@@ -618,17 +883,17 @@ mod tests {
             assert!(table.publish(first_frame(n)));
         }
         assert_eq!(
-            table.switch(0x9000, first_frame(1), false, not_on_it),
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
             Ok(first_frame(1))
         );
         assert_eq!(
-            table.switch(0x100, first_frame(2), true, not_on_it),
+            switch_to(&table, 0x100, first_frame(2), true, not_on_it),
             Ok(first_frame(2))
         );
         let outcome = table.retire_ended(|_| {
             // In the gap, context 2 ends too, and records itself.
             assert_eq!(
-                table.switch(0x200, first_frame(3), true, not_on_it),
+                switch_to(&table, 0x200, first_frame(3), true, not_on_it),
                 Ok(first_frame(3))
             );
             true

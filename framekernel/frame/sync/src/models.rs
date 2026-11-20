@@ -35,6 +35,14 @@
 //! the ended stack, on its way out of the trap entry. Two threads that both retire stand for the
 //! same processor in thread context and in an interrupt, which only over-approximates it.
 //!
+//! A processor's exit counts (`exits.rs`, TASKS item 79, which `sched` instantiates per processor)
+//! are real too. What stands in for the kernel there: a Release store of a flag is a thread's end
+//! being published (its `TERMINATED`, its process's `ending`, or a kernel worker's done-flag); a
+//! Loom cell is what the thread holds until its reap (its stack, FPU area and address space); and
+//! one Loom thread running the end, the exit's queueing and the reap in order stands for the
+//! thread and, after it, its processor's exit and reaper, which on the machine follow it on the
+//! same processor.
+//!
 //! Copies, written by hand here, standing in for kernel code; nothing compares them with it:
 //!
 //! - `ThreadName` is `sched::ThreadRef`, and `OnCpu::current_thread` is `sched::current_thread`.
@@ -140,6 +148,12 @@
 //!     paths too.
 //!   - In every one, each binding's storage comes back exactly once: an account charged at each
 //!     reservation ends at zero, and never goes below it.
+//! - The exit counts: a settle that has seen a thread's end and finds nothing pending (no thread
+//!   ending, no zombie, summed as `exits::pending` sums them) is ordered after everything that
+//!   thread gave back at its reap, whether it ended alone, beside another thread on its processor
+//!   whose marks and lowerings interleave with its own in one count, beside one on another
+//!   processor, or beside one on its processor whose exit brought no mark (an exit's lowering
+//!   consumes its own thread's mark, so it cannot stand for another's).
 //!
 //! # What is not proved
 //!
@@ -220,7 +234,9 @@ use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use loom::sync::{Arc, Notify};
 use loom::thread::{self, JoinHandle};
 
-use crate::contexts::{Contexts, Refused};
+use crate::backlog::Backlog;
+use crate::contexts::{BOOT_FLOW, Contexts, Refused};
+use crate::exits::Exits;
 use crate::floor::MonotonicFloor;
 use crate::ports::{self, Kind, Packet, Port, Reservation, Source, Storage, TakeError, Unreserved};
 use crate::refcount::RefCount;
@@ -228,7 +244,7 @@ use crate::runqueue::RunQueue;
 use crate::shootdown::{
     Confirmation, Held, Request, Rounds, Scope, Shootdown, Stalled, TlbHardware,
 };
-use crate::slots::Slots;
+use crate::slots::{Reclaim, Slots, State as SlotState};
 use crate::wait::{Scheduler, TimedOut, WaitQueue};
 use crate::{RwLock, SpinLock};
 
@@ -2207,7 +2223,10 @@ fn world_switch(me: &IrqCpu, to: u64) {
 /// another holds the page's translation and touches the frame, and a third tries to take the
 /// slot: `origin_frame::stack`'s reclaim, with `vm`'s unmap and `tlb`'s shootdown stood in for
 /// by the world's. What the slot held is released only after every access through the old
-/// translation, and the taker gets the slot only once no processor holds that translation.
+/// translation, and the taker gets the slot only once no processor holds that translation. The
+/// holder walks the page table after its interrupt, as a processor would on its next access, so
+/// an unmap made after the shootdown refills its TLB (the control
+/// `slot_unmapped_after_its_shootdown`; the independent review of TASKS item 73, T73-5).
 #[test]
 fn slots_reclaimed_slot_is_taken_only_after_its_shootdown() {
     check(
@@ -2222,7 +2241,7 @@ fn slots_reclaimed_slot_is_taken_only_after_its_shootdown() {
                 world.shootdown.mark_online(cpu);
             }
             world.tlb[1].store(true, Relaxed);
-            let slots = Arc::new(Slots::<1, 0>::new());
+            let slots = Arc::new(Slots::<1, 0, Arc<ModelFrame>>::new());
             let taken = slots.take(1).expect("the slot is free");
             // Nothing is kept for reuse (`IDLE` is 0): the slot is retired.
             slots.give_back(taken.slot, true);
@@ -2233,7 +2252,10 @@ fn slots_reclaimed_slot_is_taken_only_after_its_shootdown() {
                     1,
                     thread::spawn(move || {
                         me.touch(&frame);
-                        me.take_interrupt_then_touch(&frame);
+                        me.world.kick[1].wait();
+                        me.world.shootdown.service(&me);
+                        me.walk();
+                        me.touch(&frame);
                         me.serve();
                     }),
                 )
@@ -2261,10 +2283,420 @@ fn slots_reclaimed_slot_is_taken_only_after_its_shootdown() {
                         .shootdown
                         .shoot(&near, Request::page(THE_PAGE), Scope::Kernel)
                 },
+                |_| unreachable!("no slot waits"),
                 |frame| reuse(&frame),
             );
-            assert!(matches!(outcome, Some(Ok(_))), "{NO_ANSWER}");
+            assert!(
+                matches!(outcome, Some(Reclaim::Freed { .. })),
+                "{NO_ANSWER}"
+            );
             world.finish(vec![holding, taking]);
+        },
+    );
+}
+
+// ---------------------------------------------------------------- a reclaim that stalls (TASKS item 73)
+
+/// What a model says when a slot whose shootdown stalled was never given back.
+const NEVER_GIVEN_BACK: &str = "a stalled slot was never given back";
+/// What a model says when what one unmap returned was released twice, or never.
+const NOT_ONCE: &str = "what an unmap returned was not released exactly once";
+/// What a model says when two slots were out of the tables and not yet free at once.
+const TWO_OUT: &str = "a second slot was unmapped while one waited";
+
+/// The one-slot region of the model above, reclaimed by a processor that gives up on a shootdown
+/// after [`IMPATIENCE`] polls, while another holds the page's translation and touches the frame,
+/// taking its interrupts late. (That a waiting slot is never taken is a host test of `slots.rs`:
+/// a taker here multiplies the search.) If the reclaim's shootdown
+/// stalls, the slot waits with its frame. Before the processor that stalled answers, the same
+/// processor shoots down another page, so the late answer may serve that request and keep this
+/// page's translation: that the processor has answered says nothing of what it dropped. Then a
+/// reclaim asks again with patience. What the slot held is released once, after every access
+/// through the old translation (Loom's cell), and by then no processor holds that translation.
+/// The holder walks the page table after each interrupt (T73-5). The controls
+/// `slot_released_on_a_stall`, `slot_freed_on_an_answer_without_a_fresh_shootdown` and
+/// `slot_unmapped_after_its_shootdown` fail it.
+#[test]
+fn slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown() {
+    check(
+        "slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, holder) = (ImpatientCpu(tlb_cpu(&world, 0)), tlb_cpu(&world, 1));
+            world.shootdown.mark_online(&near);
+            world.shootdown.mark_online(&holder);
+            world.tlb[1].store(true, Relaxed);
+            let slots = Arc::new(Slots::<1, 0, Arc<ModelFrame>>::new());
+            let taken = slots.take(1).expect("the slot is free");
+            slots.give_back(taken.slot, false);
+            let frame = Arc::new(ModelFrame::new(0));
+            let holding = {
+                let (me, frame) = (holder.clone(), Arc::clone(&frame));
+                (
+                    1,
+                    thread::spawn(move || {
+                        me.touch(&frame);
+                        loop {
+                            me.world.kick[1].wait();
+                            if me.world.stop.load(Relaxed) {
+                                return;
+                            }
+                            me.world.shootdown.service(&me);
+                            me.walk();
+                            me.touch(&frame);
+                        }
+                    }),
+                )
+            };
+            let released = core::cell::Cell::new(0u32);
+            let release = |frame: Arc<ModelFrame>| {
+                released.set(released.get() + 1);
+                reuse(&frame);
+            };
+            let first = slots.reclaim(
+                |_, _| {
+                    world.pte.store(0, Relaxed);
+                    Arc::clone(&frame)
+                },
+                |_, _| {
+                    world
+                        .shootdown
+                        .shoot(&near, Request::page(THE_PAGE), Scope::Kernel)
+                },
+                |_| unreachable!("no slot waits yet"),
+                release,
+            );
+            match first {
+                Some(Reclaim::Freed { asked_again: 0, .. }) => {}
+                Some(Reclaim::Stalled {
+                    stall,
+                    asked_again: 0,
+                }) => {
+                    assert_eq!(released.get(), 0, "released after a stall");
+                    assert_eq!(slots.state(0), Some(SlotState::Waiting));
+                    // Another request, for another page, before the late answer.
+                    let _ = world
+                        .shootdown
+                        .shoot(&near, Request::page(NEXT_PAGE), Scope::Kernel);
+                    while !world.shootdown.answered(stall) {
+                        crate::prim::spin_loop();
+                    }
+                    let again = slots.reclaim(
+                        |_, _| unreachable!("a waiting slot is not unmapped again"),
+                        |_, _| {
+                            world
+                                .shootdown
+                                .shoot(&near.0, Request::page(THE_PAGE), Scope::Kernel)
+                        },
+                        |stall| world.shootdown.answered(stall),
+                        release,
+                    );
+                    assert!(
+                        matches!(again, Some(Reclaim::Freed { asked_again: 1, .. })),
+                        "{NEVER_GIVEN_BACK}: {again:?}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(released.get(), 1, "{NOT_ONCE}");
+            assert!(!holder.holds(), "{STALE}");
+            assert_eq!(slots.state(0), Some(SlotState::Free));
+            world.finish(vec![holding]);
+        },
+    );
+}
+
+/// What a waiting slot held, released on a stall: the message of [`slots_a_reask_that_stalls_keeps_the_slot`].
+const RELEASED_ON_A_STALL: &str = "what a waiting slot held was released on a stall";
+
+/// L5 (the independent review of TASKS item 73, T73-5): the one-slot region of L1, reclaimed by a
+/// processor that gives up after [`IMPATIENCE`] polls on its first shootdown and on its first
+/// fresh one, while another holds the page's translation, takes its interrupts late, walks the
+/// page table after each and touches the frame. A fresh shootdown that stalls keeps the slot
+/// waiting with what it held; a later one, with patience, gives it back. What the slot held is
+/// released once, never on a stall, after every access through the old translation. The control
+/// `slot_released_on_a_reask_stall` fails it.
+#[test]
+fn slots_a_reask_that_stalls_keeps_the_slot() {
+    check(
+        "slots_a_reask_that_stalls_keeps_the_slot",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, holder) = (ImpatientCpu(tlb_cpu(&world, 0)), tlb_cpu(&world, 1));
+            world.shootdown.mark_online(&near);
+            world.shootdown.mark_online(&holder);
+            world.tlb[1].store(true, Relaxed);
+            let slots = Arc::new(Slots::<1, 0, Arc<ModelFrame>>::new());
+            let taken = slots.take(1).expect("the slot is free");
+            slots.give_back(taken.slot, false);
+            let frame = Arc::new(ModelFrame::new(0));
+            let holding = {
+                let (me, frame) = (holder.clone(), Arc::clone(&frame));
+                (
+                    1,
+                    thread::spawn(move || {
+                        me.touch(&frame);
+                        loop {
+                            me.world.kick[1].wait();
+                            if me.world.stop.load(Relaxed) {
+                                return;
+                            }
+                            me.world.shootdown.service(&me);
+                            me.walk();
+                            me.touch(&frame);
+                        }
+                    }),
+                )
+            };
+            let released = core::cell::Cell::new(0u32);
+            let release = |frame: Arc<ModelFrame>| {
+                released.set(released.get() + 1);
+                reuse(&frame);
+            };
+            let mut outcome = slots.reclaim(
+                |_, _| {
+                    world.pte.store(0, Relaxed);
+                    Arc::clone(&frame)
+                },
+                |_, _| {
+                    world
+                        .shootdown
+                        .shoot(&near, Request::page(THE_PAGE), Scope::Kernel)
+                },
+                |_| unreachable!("no slot waits yet"),
+                release,
+            );
+            // Two fresh shootdowns at most: the first as impatient as the first ask, the second
+            // patient.
+            for patient in [false, true] {
+                let Some(Reclaim::Stalled { stall, .. }) = outcome else {
+                    break;
+                };
+                assert_eq!(released.get(), 0, "{RELEASED_ON_A_STALL}");
+                assert_eq!(slots.state(0), Some(SlotState::Waiting));
+                while !world.shootdown.answered(stall) {
+                    crate::prim::spin_loop();
+                }
+                outcome = slots.reclaim(
+                    |_, _| unreachable!("a waiting slot is not unmapped again"),
+                    |_, _| {
+                        let request = Request::page(THE_PAGE);
+                        if patient {
+                            world.shootdown.shoot(&near.0, request, Scope::Kernel)
+                        } else {
+                            world.shootdown.shoot(&near, request, Scope::Kernel)
+                        }
+                    },
+                    |stall| world.shootdown.answered(stall),
+                    release,
+                );
+            }
+            assert!(
+                matches!(outcome, Some(Reclaim::Freed { .. })),
+                "{NEVER_GIVEN_BACK}: {outcome:?}"
+            );
+            assert_eq!(released.get(), 1, "{NOT_ONCE}");
+            assert!(!holder.holds(), "{STALE}");
+            assert_eq!(slots.state(0), Some(SlotState::Free));
+            world.finish(vec![holding]);
+        },
+    );
+}
+
+/// A slot waits after a stall (its first shootdown stood in for by one that stalls, on a
+/// processor that has answered since), and two processors reclaim at once with shootdowns that
+/// complete: one asks again and gives the slot back, the other does nothing, finding the reclaim
+/// role held or the work done. What the slot held is released once, and the slot ends Free. The
+/// control `the_reclaim_role_never_refused` fails it.
+#[test]
+fn slots_two_reclaimers_and_a_waiting_slot() {
+    check(
+        "slots_two_reclaimers_and_a_waiting_slot",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let slots = Arc::new(Slots::<1, 0, Arc<AtomicU32>>::new());
+            slots.take(1).expect("the slot is free");
+            slots.give_back(0, false);
+            let released = Arc::new(AtomicU32::new(0));
+            let stalled = slots.reclaim(
+                |_, _| Arc::clone(&released),
+                |_, _| {
+                    Err(Stalled {
+                        cpu: 1,
+                        generation: 0,
+                    })
+                },
+                |_| unreachable!("no slot waits yet"),
+                |_| unreachable!("a stall releases nothing"),
+            );
+            assert!(matches!(stalled, Some(Reclaim::Stalled { .. })));
+            let reclaimer = |slots: Arc<Slots<1, 0, Arc<AtomicU32>>>| {
+                thread::spawn(move || {
+                    slots.reclaim(
+                        |_, _| unreachable!("a waiting slot is not unmapped again"),
+                        |_, _| {
+                            Ok(crate::shootdown::Completed {
+                                processors: 1,
+                                ticks: 0,
+                            })
+                        },
+                        |_| true,
+                        |kept| {
+                            kept.fetch_add(1, Relaxed);
+                        },
+                    )
+                })
+            };
+            let (a, b) = (reclaimer(Arc::clone(&slots)), reclaimer(Arc::clone(&slots)));
+            let outcomes = [a.join().unwrap(), b.join().unwrap()];
+            let freed = outcomes
+                .iter()
+                .filter(|o| matches!(o, Some(Reclaim::Freed { asked_again: 1, .. })))
+                .count();
+            assert_eq!(freed, 1, "{NOT_ONCE}: {outcomes:?}");
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|o| matches!(o, None | Some(Reclaim::Busy | Reclaim::Freed { .. }))),
+                "{outcomes:?}"
+            );
+            assert_eq!(released.load(Relaxed), 1, "{NOT_ONCE}");
+            assert_eq!(slots.state(0), Some(SlotState::Free), "{NEVER_GIVEN_BACK}");
+            assert_eq!(slots.counts(), crate::slots::Counts::default());
+        },
+    );
+}
+
+/// What one unmap returned, in [`slots_at_most_one_slot_out_of_the_tables`]: counted out of the
+/// tables while it lives, and released once, or the model fails.
+struct OutOfTables {
+    out: Arc<AtomicU32>,
+    released: bool,
+}
+
+impl OutOfTables {
+    /// A slot leaves the tables: none may be out already.
+    fn unmapped(out: &Arc<AtomicU32>) -> Self {
+        assert_eq!(out.fetch_add(1, Relaxed), 0, "{TWO_OUT}");
+        Self {
+            out: Arc::clone(out),
+            released: false,
+        }
+    }
+
+    fn release(mut self) {
+        self.out.fetch_sub(1, Relaxed);
+        self.released = true;
+    }
+}
+
+impl Drop for OutOfTables {
+    fn drop(&mut self) {
+        // Not while a failed assertion unwinds: its message is the model's verdict.
+        if !std::thread::panicking() {
+            assert!(self.released, "{NOT_ONCE}: dropped, never released");
+        }
+    }
+}
+
+/// Two Retired slots, and two processors reclaiming at once with shootdowns that stall: one
+/// unmaps a slot and it waits; the other finds the role held, or asks the waiting slot again. At
+/// no time are two slots out of the tables and not yet free, and nothing an unmap returned is
+/// dropped without its release. Then shootdowns that complete give both back. The controls
+/// `the_reclaim_role_never_refused` and `a_slot_unmapped_while_one_waits` fail it.
+#[test]
+fn slots_at_most_one_slot_out_of_the_tables() {
+    check(
+        "slots_at_most_one_slot_out_of_the_tables",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let slots = Arc::new(Slots::<2, 0, OutOfTables>::new());
+            for slot in 0..2 {
+                slots.take(1).expect("the slots are free");
+                slots.give_back(slot, false);
+            }
+            let out = Arc::new(AtomicU32::new(0));
+            let reclaimer = |slots: Arc<Slots<2, 0, OutOfTables>>, out: Arc<AtomicU32>| {
+                thread::spawn(move || {
+                    slots.reclaim(
+                        |_, _| OutOfTables::unmapped(&out),
+                        |_, _| {
+                            Err(Stalled {
+                                cpu: 1,
+                                generation: 0,
+                            })
+                        },
+                        |_| true,
+                        OutOfTables::release,
+                    )
+                })
+            };
+            let a = reclaimer(Arc::clone(&slots), Arc::clone(&out));
+            let b = reclaimer(Arc::clone(&slots), Arc::clone(&out));
+            a.join().unwrap();
+            b.join().unwrap();
+            assert_eq!(out.load(Relaxed), 1, "one slot waits");
+            let mut freed = 0;
+            while let Some(outcome) = slots.reclaim(
+                |_, _| OutOfTables::unmapped(&out),
+                |_, _| {
+                    Ok(crate::shootdown::Completed {
+                        processors: 1,
+                        ticks: 0,
+                    })
+                },
+                |_| true,
+                OutOfTables::release,
+            ) {
+                assert!(matches!(outcome, Reclaim::Freed { .. }), "{outcome:?}");
+                freed += 1;
+            }
+            assert_eq!(freed, 2);
+            assert_eq!(out.load(Relaxed), 0);
+            assert_eq!(slots.counts(), crate::slots::Counts::default());
+        },
+    );
+}
+
+/// A shootdown of one page, the only request, stalls on a processor that takes its interrupts
+/// late. `answered` turns true once that processor has served, and not before: here, with no
+/// other request, serving it dropped the page, so the translation is gone by then. In general
+/// an answer says only that the processor served some request since, maybe another page's, and
+/// is never proof that this page was dropped: what was mapped is released only after a fresh
+/// shootdown completes (`Slots::reclaim`; the model
+/// `slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown`). The control
+/// `answered_before_the_processor_served` fails it.
+#[test]
+fn shootdown_answered_only_after_the_stalled_processor_served() {
+    check(
+        "shootdown_answered_only_after_the_stalled_processor_served",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let world = TlbWorld::new();
+            let (near, late) = (ImpatientCpu(tlb_cpu(&world, 0)), tlb_cpu(&world, 1));
+            world.shootdown.mark_online(&near);
+            world.shootdown.mark_online(&late);
+            world.tlb[1].store(true, Relaxed);
+            let serving = late.serving();
+            world.pte.store(0, Relaxed);
+            if let Err(stall) = world
+                .shootdown
+                .shoot(&near, Request::page(THE_PAGE), Scope::Kernel)
+            {
+                assert_eq!(stall.cpu, 1);
+                while !world.shootdown.answered(stall) {
+                    crate::prim::spin_loop();
+                }
+                assert!(!late.holds(), "{STALE}");
+            }
+            world.finish(vec![serving]);
         },
     );
 }
@@ -2420,7 +2852,10 @@ fn stalling_change(unconfirmed: bool) {
     };
     let confirmation = Confirmation::new();
     if unconfirmed {
-        let _ = confirmation.record(Err(Stalled { cpu: 1 }));
+        let _ = confirmation.record(Err(Stalled {
+            cpu: 1,
+            generation: 1,
+        }));
     }
     let first_made = core::cell::Cell::new(false);
     let mut change = TwoPages {
@@ -3151,6 +3586,19 @@ fn ctx_off(_: u64) -> bool {
     false
 }
 
+/// The frame `table`'s switch resumes, which most contexts models compare.
+fn ctx_switch(
+    table: &Contexts,
+    here: u64,
+    next: u64,
+    exiting: bool,
+    running_on: impl Fn(u64) -> bool,
+) -> Result<u64, Refused> {
+    table
+        .switch(here, next, exiting, running_on)
+        .map(|switched| switched.frame)
+}
+
 /// The boot flow, on stack 9, switched to context 1, then to 2, then back to 1: so each of the
 /// two has been switched out once before the model's own switch. Returns context 2's saved frame.
 fn ctx_two_threads(table: &Contexts) -> u64 {
@@ -3159,14 +3607,14 @@ fn ctx_two_threads(table: &Contexts) -> u64 {
     let at_1 = ctx_frame(1) - 0x100;
     let at_2 = ctx_frame(2) - 0x100;
     assert_eq!(
-        table.switch(ctx_frame(9), ctx_frame(1), false, ctx_off),
+        ctx_switch(table, ctx_frame(9), ctx_frame(1), false, ctx_off),
         Ok(ctx_frame(1))
     );
     assert_eq!(
-        table.switch(at_1, ctx_frame(2), false, ctx_off),
+        ctx_switch(table, at_1, ctx_frame(2), false, ctx_off),
         Ok(ctx_frame(2))
     );
-    assert_eq!(table.switch(at_2, at_1, false, ctx_off), Ok(at_1));
+    assert_eq!(ctx_switch(table, at_2, at_1, false, ctx_off), Ok(at_1));
     at_2
 }
 
@@ -3181,7 +3629,7 @@ fn ctx_switch_beside_a_reader(asked: u64) {
         thread::spawn(move || assert!(ctx_covered(&table, asked), "{UNCOVERED}"))
     };
     let here = ctx_frame(1) - 0x200;
-    assert_eq!(table.switch(here, at_2, false, ctx_off), Ok(at_2));
+    assert_eq!(ctx_switch(&table, here, at_2, false, ctx_off), Ok(at_2));
     reader.join().unwrap();
 }
 
@@ -3229,7 +3677,7 @@ fn contexts_an_ended_stack_is_free_only_after_its_last_use() {
                 })
             };
             let here = ctx_frame(1) - 0x200;
-            assert_eq!(table.switch(here, at_2, true, ctx_off), Ok(at_2));
+            assert_eq!(ctx_switch(&table, here, at_2, true, ctx_off), Ok(at_2));
             last_use.store(1, Relaxed);
             assert_eq!(table.retire_ended(ctx_off), Ok(()));
             reader.join().unwrap();
@@ -3256,7 +3704,7 @@ fn contexts_publications_beside_a_switch_each_get_a_slot() {
             });
             let boot = ctx_frame(9);
             assert_eq!(
-                table.switch(boot, ctx_frame(1), false, ctx_off),
+                ctx_switch(&table, boot, ctx_frame(1), false, ctx_off),
                 Ok(ctx_frame(1))
             );
             for publisher in publishers {
@@ -3269,14 +3717,14 @@ fn contexts_publications_beside_a_switch_each_get_a_slot() {
             let mut here = ctx_frame(1) - 0x100;
             for next in [ctx_frame(3), ctx_frame(4), boot] {
                 assert_eq!(
-                    table.switch(here, next, false, ctx_off),
+                    ctx_switch(&table, here, next, false, ctx_off),
                     Ok(next),
                     "{LOST_CONTEXT}"
                 );
                 here = next - 0x100;
             }
             assert_eq!(
-                table.switch(here, boot, false, ctx_off),
+                ctx_switch(&table, here, boot, false, ctx_off),
                 Err(Refused::NeverSaved),
                 "a frame resumed twice"
             );
@@ -3299,11 +3747,11 @@ fn contexts_two_retirers_lose_no_ended_context() {
             assert!(table.publish(ctx_frame(2)));
             assert!(table.publish(ctx_frame(3)));
             assert_eq!(
-                table.switch(ctx_frame(9), ctx_frame(1), false, ctx_off),
+                ctx_switch(&table, ctx_frame(9), ctx_frame(1), false, ctx_off),
                 Ok(ctx_frame(1))
             );
             assert_eq!(
-                table.switch(0x100, ctx_frame(2), true, ctx_off),
+                ctx_switch(&table, 0x100, ctx_frame(2), true, ctx_off),
                 Ok(ctx_frame(2))
             );
             let dropper = {
@@ -3311,7 +3759,7 @@ fn contexts_two_retirers_lose_no_ended_context() {
                 thread::spawn(move || assert_eq!(table.retire_ended(ctx_off), Ok(())))
             };
             assert_eq!(
-                table.switch(0x200, ctx_frame(3), true, ctx_off),
+                ctx_switch(&table, 0x200, ctx_frame(3), true, ctx_off),
                 Ok(ctx_frame(3))
             );
             dropper.join().unwrap();
@@ -3319,6 +3767,425 @@ fn contexts_two_retirers_lose_no_ended_context() {
             assert!(!ctx_covered(&table, 1), "{NEVER_RETIRED}");
             assert!(!ctx_covered(&table, 2), "{NEVER_RETIRED}");
             assert!(ctx_covered(&table, 3), "{UNCOVERED}");
+        },
+    );
+}
+
+/// What W1 reports when a context's first frame was both withdrawn and resumed, or neither.
+const WITHDRAWN_OR_RESUMED: &str = "a published context was both withdrawn and resumed, or neither";
+
+/// W1 (TASKS item 75; the coordinating session's addition (b)): the processor runs context D
+/// (stack 1), and context A (stack 2) is published and never made runnable. Its publisher
+/// withdraws it while, on the processor, a wrong scheduler names A's first frame, and a third
+/// processor publishes context C (stack 3) into the same table, whose one free slot it takes, or
+/// A's once A's withdrawal has freed it. Exactly one of the withdrawal and the switch takes A's
+/// frame; a withdrawn A leaves no home and a resumed one keeps it; C's claim is never lost, its
+/// home never cleared (so A's slot is reused only after A's home store), and its frame resumes.
+#[test]
+fn contexts_a_withdrawal_beside_a_switch_and_a_publication() {
+    check(
+        "contexts_a_withdrawal_beside_a_switch_and_a_publication",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let table = Arc::new(Contexts::new());
+            // D runs: the boot flow switched to it, and claimed a slot for its own frame. Then A is
+            // published: three of the model's four slots are taken.
+            assert!(table.publish(ctx_frame(1)));
+            assert_eq!(
+                ctx_switch(&table, ctx_frame(9), ctx_frame(1), false, ctx_off),
+                Ok(ctx_frame(1))
+            );
+            assert!(table.publish(ctx_frame(2)));
+            let withdrawer = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || table.withdraw(ctx_frame(2)))
+            };
+            let publisher = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || assert!(table.publish(ctx_frame(3)), "{LOST_CONTEXT}"))
+            };
+            let at_d = ctx_frame(1) - 0x100;
+            let resumed = ctx_switch(&table, at_d, ctx_frame(2), false, ctx_off);
+            let withdrawn = withdrawer.join().unwrap();
+            publisher.join().unwrap();
+            assert!(
+                withdrawn != resumed.is_ok(),
+                "{WITHDRAWN_OR_RESUMED}: withdrawn {withdrawn}, switch {resumed:?}"
+            );
+            if withdrawn {
+                assert_eq!(resumed, Err(Refused::NeverSaved), "{WITHDRAWN_OR_RESUMED}");
+                assert!(!ctx_covered(&table, 2), "a withdrawn context kept its home");
+            } else {
+                assert_eq!(resumed, Ok(ctx_frame(2)), "{WITHDRAWN_OR_RESUMED}");
+                assert!(ctx_covered(&table, 2), "{UNCOVERED}");
+            }
+            assert!(ctx_covered(&table, 1), "{UNCOVERED}");
+            assert!(ctx_covered(&table, 3), "{LOST_CONTEXT}");
+            // C's frame is intact: the running context, A or still D, switches to it.
+            let here = if withdrawn {
+                ctx_frame(1) - 0x200
+            } else {
+                ctx_frame(2) - 0x100
+            };
+            assert_eq!(
+                ctx_switch(&table, here, ctx_frame(3), false, ctx_off),
+                Ok(ctx_frame(3)),
+                "{LOST_CONTEXT}"
+            );
+        },
+    );
+}
+
+/// What K1 reports when a switch answered, or the table read back, a home other than the
+/// incoming context's.
+const WRONG_HOME: &str = "a switch named a stack not the incoming context's own";
+
+/// K1 (TASKS item 77): the processor's boot flow switches to A (stack 1) on its first run, then
+/// to B (stack 2), back to A at the frame it saved, and back to the boot flow, while another
+/// processor publishes C (stack 3) into the same table, so the slots' places vary. Each switch
+/// answers the home of the context whose frame it resumed, the boot flow's `BOOT_FLOW` included,
+/// and `running_home` reads the same back: the stack the trap entry names, and the one it checks
+/// a landing against, is always the running context's own.
+#[test]
+fn contexts_a_switch_names_the_incoming_home() {
+    check(
+        "contexts_a_switch_names_the_incoming_home",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let table = Arc::new(Contexts::new());
+            assert!(table.publish(ctx_frame(1)));
+            assert!(table.publish(ctx_frame(2)));
+            let publisher = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || assert!(table.publish(ctx_frame(3)), "{LOST_CONTEXT}"))
+            };
+            let boot = ctx_frame(9);
+            let at_1 = ctx_frame(1) - 0x100;
+            let at_2 = ctx_frame(2) - 0x100;
+            for (here, next, home) in [
+                (boot, ctx_frame(1), ctx_frame(1)),
+                (at_1, ctx_frame(2), ctx_frame(2)),
+                (at_2, at_1, ctx_frame(1)),
+                (at_1 - 0x100, boot, BOOT_FLOW),
+            ] {
+                let switched = table.switch(here, next, false, ctx_off);
+                assert_eq!(
+                    switched.map(|s| (s.frame, s.home)),
+                    Ok((next, Some(home))),
+                    "{WRONG_HOME}"
+                );
+                assert_eq!(table.running_home(), Some(home), "{WRONG_HOME}");
+            }
+            publisher.join().unwrap();
+            assert!(ctx_covered(&table, 3), "{LOST_CONTEXT}");
+        },
+    );
+}
+
+// ---------------------------------------------------------------- backlog (TASKS item 81)
+
+/// What B1 reports when a settle passed while a reap still held what it frees.
+const REAPED_EARLY: &str = "a settle passed while a reap still held what it frees";
+
+/// One reap, as `reap_closed` makes one: if anything is pending, the listed piece is taken off
+/// the list under its lock, and then, with the lock released, drained: its release gives back
+/// what it holds (`held` to 0).
+fn backlog_reap(backlog: &Backlog, list: &SpinLock<Option<u32>>, held: &Kept) {
+    if backlog.pending() == 0 {
+        return;
+    }
+    let taken = list.lock().take();
+    if taken.is_some() {
+        // SAFETY: the pointer is the cell's own; Loom's cell checks this write against the
+        // settler's read, and panics if they are not ordered, which is the point of the model.
+        backlog.drained(|| held.with_mut(|p| unsafe { *p = 0 }));
+    }
+}
+
+/// B1 (TASKS item 81; the review of TASKS item 79, T79-6): a process ends with a message still
+/// queued to it. Its close lists the channel and counts it, and then its end is seen. A system
+/// call's reap on another processor may take the channel and free the message. The boot flow,
+/// having seen the end, reaps what it can itself, and if nothing is pending it counts the heap,
+/// which reads `held`: the message must be freed, and the read ordered after its freeing,
+/// whichever of the two reaped it.
+#[test]
+fn backlog_a_settle_sees_what_a_reap_freed() {
+    check(
+        "backlog_a_settle_sees_what_a_reap_freed",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let backlog = Arc::new(Backlog::new());
+            let list = Arc::new(SpinLock::new(None));
+            let seen = Arc::new(AtomicBool::new(false));
+            let held = Arc::new(Kept::new(1));
+            let lister = {
+                let (backlog, list, seen) =
+                    (Arc::clone(&backlog), Arc::clone(&list), Arc::clone(&seen));
+                thread::spawn(move || {
+                    backlog.add(&list, |listed| *listed = Some(1));
+                    seen.store(true, Release);
+                })
+            };
+            let reaper = {
+                let (backlog, list, held) =
+                    (Arc::clone(&backlog), Arc::clone(&list), Arc::clone(&held));
+                thread::spawn(move || backlog_reap(&backlog, &list, &held))
+            };
+            if seen.load(Acquire) {
+                backlog_reap(&backlog, &list, &held);
+                if backlog.pending() == 0 {
+                    // SAFETY: as in `backlog_reap`.
+                    let now = held.with(|p| unsafe { *p });
+                    assert_eq!(now, 0, "{REAPED_EARLY}");
+                }
+            }
+            lister.join().unwrap();
+            reaper.join().unwrap();
+        },
+    );
+}
+
+/// Two pieces on a list that takes from its head, as `ipc::CLOSED` does: `(head, next)`.
+type TwoPieces = SpinLock<(Option<u32>, Option<u32>)>;
+
+/// `reap_closed`'s loop: while anything is pending, the head is taken under the list's lock and
+/// then drained, which gives back what it holds.
+fn backlog_reap_all(backlog: &Backlog, list: &TwoPieces, held: &[Arc<Kept>; 2]) {
+    while backlog.pending() != 0 {
+        let taken = {
+            let mut listed = list.lock();
+            let head = listed.0.take();
+            listed.0 = listed.1.take();
+            head
+        };
+        let Some(piece) = taken else {
+            return;
+        };
+        let Some(cell) = held.get(piece as usize).cloned() else {
+            return;
+        };
+        // SAFETY: as in `backlog_reap`.
+        backlog.drained(move || cell.with_mut(|p| unsafe { *p = 0 }));
+    }
+}
+
+/// Lists piece `n` at the head of the list, as `ipc::list_closed` does.
+fn backlog_list(backlog: &Backlog, list: &TwoPieces, n: u32) {
+    backlog.add(list, |listed| {
+        listed.1 = listed.0.take();
+        listed.0 = Some(n);
+    });
+}
+
+/// B2 (the review of TASKS items 75, 77 and 81, R81-1, whose own model this is): piece X is
+/// listed by a process P that is ending; another processor lists piece Y meanwhile; P's own reap
+/// in its `close_out`, then its end; the boot flow, having seen the end, reaps what it can and,
+/// with nothing pending, counts, which reads X's cell. A raise made after the list's lock is
+/// released lets P's reap take Y uncounted, and its lowering cancel X's raise while X is still
+/// listed.
+#[test]
+fn backlog_a_lowering_cannot_cancel_another_pieces_raise() {
+    check(
+        "backlog_a_lowering_cannot_cancel_another_pieces_raise",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let backlog = Arc::new(Backlog::new());
+            let list: Arc<TwoPieces> = Arc::new(SpinLock::new((None, None)));
+            let held = [Arc::new(Kept::new(1)), Arc::new(Kept::new(1))];
+            let seen = Arc::new(AtomicBool::new(false));
+            backlog_list(&backlog, &list, 0);
+            let lister = {
+                let (backlog, list) = (Arc::clone(&backlog), Arc::clone(&list));
+                thread::spawn(move || backlog_list(&backlog, &list, 1))
+            };
+            let ender = {
+                let (backlog, list, seen) =
+                    (Arc::clone(&backlog), Arc::clone(&list), Arc::clone(&seen));
+                let held = [Arc::clone(&held[0]), Arc::clone(&held[1])];
+                thread::spawn(move || {
+                    backlog_reap_all(&backlog, &list, &held);
+                    seen.store(true, Release);
+                })
+            };
+            if seen.load(Acquire) {
+                backlog_reap_all(&backlog, &list, &held);
+                if backlog.pending() == 0 {
+                    // SAFETY: as in `backlog_reap`.
+                    let now = held[0].with(|p| unsafe { *p });
+                    assert_eq!(now, 0, "{REAPED_EARLY}");
+                }
+            }
+            lister.join().unwrap();
+            ender.join().unwrap();
+        },
+    );
+}
+
+// ---------------------------------------------------------------- exits (TASKS item 79)
+
+/// What an exits model reports when a settle passed while an ended thread still held what it
+/// gives back at its reap.
+const SETTLED_EARLY: &str = "a settle passed while an ended thread still held what it gives back";
+
+/// E2's and E3's bound in `cargo xtask check`: three threads searched exhaustively take half a
+/// million executions and more (E2 1,105,056 in 96 s, E3 524,132 in 65 s, both passing), so the gate
+/// stops at two preemptions (325 and 555 executions), within which controls X2 and X3 are caught by
+/// them; `ORIGIN_LOOM_DEEP` searches them exhaustively.
+const EXITS_QUICK: Bound = preempted(2, SPINS);
+
+/// What an ending thread holds until its reap: 1 while held, 0 once given back. Loom's cell
+/// reports a settler's read that is not ordered after the reaper's write.
+type Kept = UnsafeCell<u64>;
+
+/// One thread's whole end on processor `exits`: it is counted as ending, publishes its end with a
+/// Release store of `seen`, leaves its processor as a zombie, and is reaped, which gives back
+/// `held`. In the kernel the reap runs later on the same processor, after the exit; a Loom thread
+/// running both in order stands for that.
+fn exits_one_end(exits: &Exits, seen: &AtomicBool, held: &Kept) {
+    let (mark, ()) = exits.end(|| seen.store(true, Release));
+    exits.queued(Some(mark));
+    // SAFETY: the pointer is the cell's own; Loom's cell checks this write against the settler's
+    // read, and panics if they are not ordered, which is the point of the model.
+    exits.reap(|| held.with_mut(|p| unsafe { *p = 0 }));
+}
+
+/// The boot flow: once it has seen the end in `seen`, it settles over `exits`, and if nothing is
+/// pending it counts, which reads `held`: that must have been given back, and the read must be
+/// ordered after it.
+fn exits_settle_then_count(seen: &AtomicBool, exits: &Exits, held: &Kept) {
+    if seen.load(Acquire) && crate::exits::pending(|| core::iter::once(exits)).none() {
+        // SAFETY: as in `exits_one_end`.
+        let now = held.with(|p| unsafe { *p });
+        assert_eq!(now, 0, "{SETTLED_EARLY}");
+    }
+}
+
+/// E1: one thread ends on one processor while the boot flow, having seen its end, settles and
+/// counts. A settle that finds nothing pending comes after everything the thread gave back.
+#[test]
+fn exits_a_settle_sees_what_an_ended_thread_held() {
+    check(
+        "exits_a_settle_sees_what_an_ended_thread_held",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let exits = Arc::new(Exits::new());
+            let seen = Arc::new(AtomicBool::new(false));
+            let held = Arc::new(Kept::new(1));
+            let ender = {
+                let (exits, seen, held) =
+                    (Arc::clone(&exits), Arc::clone(&seen), Arc::clone(&held));
+                thread::spawn(move || exits_one_end(&exits, &seen, &held))
+            };
+            exits_settle_then_count(&seen, &exits, &held);
+            ender.join().unwrap();
+            assert!(crate::exits::pending(|| core::iter::once(&*exits)).none());
+        },
+    );
+}
+
+/// E2: two threads end on one processor, their marks and lowerings interleaved in one count,
+/// while the boot flow, having seen the first one's end, settles. A lowering made by the second
+/// cannot stand for the first's: nothing pending still means the first gave back what it held.
+#[test]
+fn exits_two_threads_on_one_processor_each_count_for_themselves() {
+    check(
+        "exits_two_threads_on_one_processor_each_count_for_themselves",
+        EXITS_QUICK,
+        EXHAUSTIVE,
+        || {
+            let exits = Arc::new(Exits::new());
+            let seen = Arc::new(AtomicBool::new(false));
+            let held = Arc::new(Kept::new(1));
+            let other_seen = Arc::new(AtomicBool::new(false));
+            let other_held = Arc::new(Kept::new(1));
+            let first = {
+                let (exits, seen, held) =
+                    (Arc::clone(&exits), Arc::clone(&seen), Arc::clone(&held));
+                thread::spawn(move || exits_one_end(&exits, &seen, &held))
+            };
+            let second = {
+                let (exits, seen, held) = (
+                    Arc::clone(&exits),
+                    Arc::clone(&other_seen),
+                    Arc::clone(&other_held),
+                );
+                thread::spawn(move || exits_one_end(&exits, &seen, &held))
+            };
+            exits_settle_then_count(&seen, &exits, &held);
+            first.join().unwrap();
+            second.join().unwrap();
+        },
+    );
+}
+
+/// E3: two threads end on two processors, and the boot flow, having seen both ends, settles over
+/// both counts. Nothing pending means both gave back what they held.
+#[test]
+fn exits_a_settle_over_two_processors_sees_both() {
+    check(
+        "exits_a_settle_over_two_processors_sees_both",
+        EXITS_QUICK,
+        EXHAUSTIVE,
+        || {
+            let cpus = Arc::new([Exits::new(), Exits::new()]);
+            let seen = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
+            let held = Arc::new([Kept::new(1), Kept::new(1)]);
+            let enders: Vec<_> = (0..2)
+                .map(|k| {
+                    let (cpus, seen, held) =
+                        (Arc::clone(&cpus), Arc::clone(&seen), Arc::clone(&held));
+                    thread::spawn(move || exits_one_end(&cpus[k], &seen[k], &held[k]))
+                })
+                .collect();
+            let both = seen[0].load(Acquire) && seen[1].load(Acquire);
+            if both && crate::exits::pending(|| cpus.iter()).none() {
+                for cell in held.iter() {
+                    // SAFETY: as in `exits_one_end`.
+                    let now = cell.with(|p| unsafe { *p });
+                    assert_eq!(now, 0, "{SETTLED_EARLY}");
+                }
+            }
+            for ender in enders {
+                ender.join().unwrap();
+            }
+        },
+    );
+}
+
+/// E4: one thread ends as in E1 while another, on the same processor, exits without having
+/// counted itself as ending (no mark): its exit cannot stand for the first thread's, so nothing
+/// pending still means the first gave back what it held (the review of TASKS item 79, T79-1,
+/// whose own model this is).
+#[test]
+fn exits_an_exit_without_a_mark_cannot_stand_for_one() {
+    check(
+        "exits_an_exit_without_a_mark_cannot_stand_for_one",
+        EXITS_QUICK,
+        EXHAUSTIVE,
+        || {
+            let exits = Arc::new(Exits::new());
+            let seen = Arc::new(AtomicBool::new(false));
+            let held = Arc::new(Kept::new(1));
+            let ender = {
+                let (exits, seen, held) =
+                    (Arc::clone(&exits), Arc::clone(&seen), Arc::clone(&held));
+                thread::spawn(move || exits_one_end(&exits, &seen, &held))
+            };
+            let unmarked = {
+                let exits = Arc::clone(&exits);
+                thread::spawn(move || {
+                    exits.queued(None);
+                    exits.reap(|| ());
+                })
+            };
+            exits_settle_then_count(&seen, &exits, &held);
+            ender.join().unwrap();
+            unmarked.join().unwrap();
         },
     );
 }

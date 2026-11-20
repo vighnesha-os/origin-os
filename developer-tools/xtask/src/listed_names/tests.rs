@@ -106,3 +106,29 @@ fn the_raw_write_is_found_as_a_call_and_a_definition() {
         assert!(!names_raw_write(&lex::tokens(text)), "{text}");
     }
 }
+
+/// TASKS item 79's review, T79-2: the framework's thread exit is found as a path and in a `use`
+/// group, and the kernel's own `thread_exit` system call, a method of that name, is not.
+#[test]
+fn the_framework_thread_exit_is_found_as_a_path_and_in_a_group() {
+    for text in [
+        "cpu::thread_exit()",
+        "crate::cpu::thread_exit()",
+        "origin_frame::cpu :: thread_exit()",
+        "use crate::cpu::thread_exit;",
+        "use origin_frame::cpu::{self, thread_exit};",
+        "use crate::cpu::{rdtsc, {thread_exit as leave}};",
+    ] {
+        assert!(names_thread_exit(&lex::tokens(text)), "{text}");
+    }
+    for text in [
+        "fn thread_exit(&self, code: u64) { self.process.thread_ended(&self.thread, code) }",
+        "crate::sched::finish(|| DONE.store(true, Ordering::Release))",
+        "// cpu::thread_exit ends a thread",
+        "let s = \"cpu::thread_exit\";",
+        "cpu::thread_yield()",
+        "use crate::cpu::{rdtsc, thread_yield};",
+    ] {
+        assert!(!names_thread_exit(&lex::tokens(text)), "{text}");
+    }
+}

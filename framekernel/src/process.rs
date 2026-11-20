@@ -933,19 +933,27 @@ impl Process {
     /// The calling thread, `thread`, is ending, for the reason `ending`. `TERMINATED` is raised
     /// on the thread now. If it was the process's last, every handle closes now, and peers see
     /// that.
+    ///
+    /// The thread is counted as ending on its processor first (`sched::end_with`), before any of
+    /// that can be seen: its `TERMINATED`, the process's `ending`, its peers' closed ends. Until it
+    /// has left the processor as a zombie and been reaped, a `sched::settle` made by a thread that
+    /// saw any of those waits, rather than count the stack, FPU area and address space it still
+    /// holds (TASKS item 79).
     pub(crate) fn thread_ended(&self, thread: &ThreadObject, ending: Ending) {
-        thread.termination.raise();
-        let last = without_interrupts(|| {
-            let mut life = self.lifecycle.lock();
-            life.running -= 1;
-            life.latest = Some(ending);
-            let last = life.running == 0;
-            life.ended |= last;
-            last
+        crate::sched::end_with(|| {
+            thread.termination.raise();
+            let last = without_interrupts(|| {
+                let mut life = self.lifecycle.lock();
+                life.running -= 1;
+                life.latest = Some(ending);
+                let last = life.running == 0;
+                life.ended |= last;
+                last
+            });
+            if last {
+                self.close_out(ending);
+            }
         });
-        if last {
-            self.close_out(ending);
-        }
     }
 
     /// The last thread has ended: its handles close, and the creator's reference to its

@@ -36,7 +36,9 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::Ordering;
 
+pub mod backlog;
 pub mod contexts;
+pub mod exits;
 pub mod floor;
 pub mod ports;
 pub mod refcount;

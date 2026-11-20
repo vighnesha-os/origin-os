@@ -114,6 +114,26 @@ const GIVEN_BACK: &[&str] = &[
 /// A change that returned a stall left its space confirmed.
 const FORGOTTEN: &[&str] = &["a change that stalled left its space confirmed"];
 
+/// What the models of a reclaim that stalls report (`models.rs`; TASKS item 73): what a slot held
+/// reused while a processor could still reach it, a slot never given back or given back twice,
+/// and two slots out of the tables at once.
+const WAITING_REUSED: &[&str] = &[
+    "Causality violation",
+    "a processor kept a translation the shootdown took away",
+    "what an unmap returned was not released exactly once",
+];
+const NEVER_GIVEN_BACK: &[&str] = &[
+    "a stalled slot was never given back",
+    "what an unmap returned was not released exactly once",
+];
+const TWO_OUT: &[&str] = &["a second slot was unmapped while one waited"];
+/// What a waiting slot held, released on a stall of a fresh shootdown (T73-5).
+const RELEASED_ON_A_STALL: &[&str] = &[
+    "what a waiting slot held was released on a stall",
+    "Causality violation",
+    "what an unmap returned was not released exactly once",
+];
+
 /// What the port models report (`models.rs`): a packet lost or doubled, a binding left armed
 /// after its handle closed, and a closed port left holding something.
 const PORT_LOST: &[&str] = &["a signal was lost, or one binding made two packets"];
@@ -131,6 +151,31 @@ const CTX_UNCOVERED: &[&str] = &["a live context's stack was in no record"];
 const CTX_LAST_TOUCH: &[&str] = &["a stack was found free before its processor's last use of it"];
 const CTX_LOST: &[&str] = &["a published context went unrecorded"];
 const CTX_NEVER_RETIRED: &[&str] = &["an ended context's home was never retired"];
+/// B1's and B2's reports (TASKS item 81): a settle counted while a reap still held what it frees,
+/// or its read of what the reap freed was not ordered after the freeing.
+const BACKLOG_EARLY: &[&str] = &[
+    "a settle passed while a reap still held what it frees",
+    "Causality violation",
+];
+/// K1's report (TASKS item 77): a switch, or the table read back, named a home other than the
+/// incoming context's.
+const CTX_WRONG_HOME: &[&str] = &["a switch named a stack not the incoming context's own"];
+/// W1's reports (TASKS item 75): a first frame both withdrawn and resumed, or neither; a running
+/// context's stack uncovered; C's context lost; a withdrawn context's home left behind.
+const CTX_WITHDRAWN: &[&str] = &[
+    "a published context was both withdrawn and resumed, or neither",
+    "a live context's stack was in no record",
+    "a published context went unrecorded",
+    "a withdrawn context kept its home",
+];
+
+/// What the exits models report (`models.rs`; TASKS item 79): a settle that passed while an
+/// ended thread still held what it gives back at its reap, seen as a wrong value or as a read
+/// Loom's cell finds unordered with the reaper's write.
+const EXITS_EARLY: &[&str] = &[
+    "a settle passed while an ended thread still held what it gives back",
+    "Causality violation",
+];
 
 /// The models of a change to a space whose shootdowns may stall (`models.rs`).
 const ROUND_STALLS: &str =
@@ -160,6 +205,8 @@ const REFCOUNT: &str = "framekernel/frame/sync/src/refcount.rs";
 const SLOTS: &str = "framekernel/frame/sync/src/slots.rs";
 const PORTS: &str = "framekernel/frame/sync/src/ports.rs";
 const CONTEXTS: &str = "framekernel/frame/sync/src/contexts.rs";
+const BACKLOG: &str = "framekernel/frame/sync/src/backlog.rs";
+const EXITS: &str = "framekernel/frame/sync/src/exits.rs";
 
 /// `WaitQueue::take_all`'s one critical section.
 const TAKE_ALL: &str = "        scheduler.without_interrupts(|| core::mem::replace(&mut *self.waiters.lock(), [None; N]))\n";
@@ -984,23 +1031,65 @@ const CONTROLS: &[Control] = &[
         // another processor still holds the old translation (ADR-0004 Amendment 1, A2).
         name: "slot_free_before_the_shootdown",
         file: SLOTS,
-        from: "            table.set(slot, State::Reclaiming);\n",
-        to: "            table.free(slot);\n",
+        from: "        self.set(slot, State::Reclaiming);\n",
+        to: "        self.free(slot);\n",
         models: &[("slots_reclaimed_slot_is_taken_only_after_its_shootdown", STALE)],
     },
     Control {
         // What a reclaimed slot held goes back as soon as it leaves the tables.
         name: "slot_released_before_the_shootdown",
         file: SLOTS,
-        from: "        let unmapped = unmap(slot, pages);
-        let outcome = shoot(slot, pages);
-        match outcome {
-            Ok(_) => release(unmapped),
-            Err(_) => core::mem::forget(unmapped),
-        }
+        from: "                let unmapped = unmap(slot, pages);
+                let outcome = shoot(slot, pages);
+                match outcome {
+                    Ok(completed) => {
+                        release(unmapped);
+                        let mut table = self.table.lock();
+                        table.counts.retired -= 1;
+                        table.counts.pages -= u64::from(pages);
+                        table.free(slot);
+                        Some(Reclaim::Freed {
+                            completed,
+                            asked_again: 0,
+                        })
+                    }
+                    Err(stall) => {
+                        let mut table = self.table.lock();
+                        // Out of the tables, so no longer mapped, though still retired.
+                        table.counts.pages -= u64::from(pages);
+                        table.set(slot, State::Waiting);
+                        table.waiting = Some(Waiting {
+                            slot,
+                            pages,
+                            kept: unmapped,
+                            stall,
+                            asked_again: 0,
+                        });
+                        self.publish(&table);
+                        Some(Reclaim::Stalled {
+                            stall,
+                            asked_again: 0,
+                        })
+                    }
+                }
+            }
 ",
-        to: "        release(unmap(slot, pages));
-        let outcome = shoot(slot, pages);
+        to: "                release(unmap(slot, pages));
+                let outcome = shoot(slot, pages);
+                match outcome {
+                    Ok(completed) => {
+                        let mut table = self.table.lock();
+                        table.counts.retired -= 1;
+                        table.counts.pages -= u64::from(pages);
+                        table.free(slot);
+                        Some(Reclaim::Freed {
+                            completed,
+                            asked_again: 0,
+                        })
+                    }
+                    Err(_) => None,
+                }
+            }
 ",
         models: &[(
             "slots_reclaimed_slot_is_taken_only_after_its_shootdown",
@@ -1019,6 +1108,83 @@ const CONTROLS: &[Control] = &[
                     .find(|&s| matches!(table.state(s), Some(State::Free | State::Reclaiming)))?;
 ",
         models: &[("slots_reclaimed_slot_is_taken_only_after_its_shootdown", STALE)],
+    },
+    Control {
+        // TASKS item 73: a stall taken for an answer, so what the slot held goes back while the
+        // processor that stalled may still reach it.
+        name: "slot_released_on_a_stall",
+        file: SLOTS,
+        from: "                let outcome = shoot(slot, pages);\n                match outcome {\n",
+        to: "                let outcome = shoot(slot, pages);\n                match outcome.or(Ok(Completed { processors: 0, ticks: 0 })) {\n",
+        models: &[(
+            "slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown",
+            WAITING_REUSED,
+        )],
+    },
+    Control {
+        // T73-5 (the independent review of TASKS item 73): the slot's pages left the tables only
+        // after its shootdown, so a processor that served it can walk to them again.
+        name: "slot_unmapped_after_its_shootdown",
+        file: SLOTS,
+        from: "                let unmapped = unmap(slot, pages);\n                let outcome = shoot(slot, pages);\n",
+        to: "                let outcome = shoot(slot, pages);\n                let unmapped = unmap(slot, pages);\n",
+        models: &[
+            ("slots_reclaimed_slot_is_taken_only_after_its_shootdown", WAITING_REUSED),
+            (
+                "slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown",
+                WAITING_REUSED,
+            ),
+        ],
+    },
+    Control {
+        // T73-5: what a waiting slot held goes back when a fresh shootdown stalls too.
+        name: "slot_released_on_a_reask_stall",
+        file: SLOTS,
+        from: "                    Err(again) => {\n                        table.set(slot, State::Waiting);\n",
+        to: "                    Err(again) => {\n                        if let Some(w) = table.waiting.take() {\n                            drop(table);\n                            release(w.kept);\n                            return Some(Reclaim::Stalled { stall: again, asked_again: 1 });\n                        }\n                        table.set(slot, State::Waiting);\n",
+        models: &[("slots_a_reask_that_stalls_keeps_the_slot", RELEASED_ON_A_STALL)],
+    },
+    Control {
+        // TASKS item 73: a waiting slot given back once the processor that stalled has answered,
+        // with no fresh shootdown: its late answer may have served another page's request.
+        name: "slot_freed_on_an_answer_without_a_fresh_shootdown",
+        file: SLOTS,
+        from: "                self.table.lock().set(slot, State::Reclaiming);\n                let outcome = shoot(slot, pages);\n",
+        to: "                self.table.lock().set(slot, State::Reclaiming);\n                let outcome: Result<Completed, Stalled> = Ok(Completed { processors: 0, ticks: 0 });\n",
+        models: &[(
+            "slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown",
+            WAITING_REUSED,
+        )],
+    },
+    Control {
+        // TASKS item 73, Q2: two reclaims at once.
+        name: "the_reclaim_role_never_refused",
+        file: SLOTS,
+        from: "        if self.reclaiming.load(Ordering::Relaxed) {\n            return None;\n        }\n        #[cfg(all(test, not(loom)))]\n        self.role_tries.fetch_add(1, Ordering::Relaxed);\n        self.reclaiming\n            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)\n            .ok()\n            .map(|_| Role(&self.reclaiming))\n",
+        to: "        let _ = self.reclaiming.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed);\n        Some(Role(&self.reclaiming))\n",
+        models: &[
+            ("slots_two_reclaimers_and_a_waiting_slot", NEVER_GIVEN_BACK),
+            ("slots_at_most_one_slot_out_of_the_tables", TWO_OUT),
+        ],
+    },
+    Control {
+        // TASKS item 73, Q2: a Retired slot unmapped while another waits.
+        name: "a_slot_unmapped_while_one_waits",
+        file: SLOTS,
+        from: "        if let Some(w) = &self.waiting {\n",
+        to: "        if let Some(w) = self.waiting.as_ref().filter(|_| false) {\n",
+        models: &[("slots_at_most_one_slot_out_of_the_tables", TWO_OUT)],
+    },
+    Control {
+        // TASKS item 73, Q1: a processor counted as having answered before it served.
+        name: "answered_before_the_processor_served",
+        file: SHOOTDOWN,
+        from: ".is_none_or(|served| served.load(Ordering::Acquire) >= stall.generation)",
+        to: ".is_none_or(|served| served.load(Ordering::Acquire) + 1 >= stall.generation)",
+        models: &[(
+            "shootdown_answered_only_after_the_stalled_processor_served",
+            STALE,
+        )],
     },
     Control {
         // S3-5b's review, finding A, case a, as the code was: a change returns when the flush
@@ -1390,6 +1556,229 @@ const CONTROLS: &[Control] = &[
         models: &[(
             "contexts_two_retirers_lose_no_ended_context",
             CTX_NEVER_RETIRED,
+        )],
+    },
+    Control {
+        // BX1 (TASKS item 81): the count lowered before the release, the order `reap_closed` had
+        // before TASKS item 81 (the review of TASKS item 79, T79-6): a settle on another processor
+        // can find nothing pending while the release still holds what it frees. B1's alone: B2's
+        // settle reaps and reads only once the ender has finished its reaps, releases included,
+        // so no lowering before a release is ever seen there (B2 passes under BX1).
+        name: "backlog_lowered_before_released",
+        file: BACKLOG,
+        from: "        let released = release();\n        self.count.fetch_sub(1, AcqRel);\n",
+        to: "        self.count.fetch_sub(1, AcqRel);\n        let released = release();\n",
+        models: &[("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY)],
+    },
+    Control {
+        // BX4 (the review of TASKS items 75, 77 and 81, R81-1): the count raised after the list's
+        // lock is released, as `list_closed` did: a taker can take the piece uncounted, and its
+        // lowering cancel another piece's raise while that piece is still listed.
+        name: "backlog_raised_after_the_lock",
+        file: BACKLOG,
+        from: "        self.count.fetch_add(1, AcqRel);\n        drop(listed);\n",
+        to: "        drop(listed);\n        self.count.fetch_add(1, AcqRel);\n",
+        models: &[(
+            "backlog_a_lowering_cannot_cancel_another_pieces_raise",
+            BACKLOG_EARLY,
+        )],
+    },
+    Control {
+        // BX2: the count read Relaxed: a settle that reads 0 is not ordered after the releases.
+        name: "backlog_pending_relaxed",
+        file: BACKLOG,
+        from: "        self.count.load(Acquire)\n",
+        to: "        self.count.load(core::sync::atomic::Ordering::Relaxed)\n",
+        models: &[("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY)],
+    },
+    Control {
+        // BX3: the count lowered Relaxed: the lowering heads no release sequence, so a settle
+        // that reads it is not ordered after the release before it.
+        name: "backlog_drained_relaxed",
+        file: BACKLOG,
+        from: "        self.count.fetch_sub(1, AcqRel);\n",
+        to: "        self.count.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);\n",
+        models: &[("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY)],
+    },
+    Control {
+        // KX1 (TASKS item 77): the answer carries the outgoing context's home, so the trap entry
+        // would name the stack of the context it just suspended.
+        name: "contexts_switch_names_the_outgoing_home",
+        file: CONTEXTS,
+        from: "        let home = self.slots.get(incoming).map(|slot| slot.home.load(Acquire));\n",
+        to: "        let home = self.slots.get(outgoing).map(|slot| slot.home.load(Acquire));\n",
+        models: &[("contexts_a_switch_names_the_incoming_home", CTX_WRONG_HOME)],
+    },
+    Control {
+        // KX2: the answer carries `next` as the home: right on a context's first run, where its
+        // frame is its home, and wrong once it resumes at a frame it saved, or for the boot flow.
+        name: "contexts_switch_names_next_as_home",
+        file: CONTEXTS,
+        from: "        let home = self.slots.get(incoming).map(|slot| slot.home.load(Acquire));\n",
+        to: "        let home = Some(next);\n",
+        models: &[("contexts_a_switch_names_the_incoming_home", CTX_WRONG_HOME)],
+    },
+    Control {
+        // KX3: the answer carries the first slot's home, whichever context runs.
+        name: "contexts_switch_names_the_first_slot",
+        file: CONTEXTS,
+        from: "        let home = self.slots.get(incoming).map(|slot| slot.home.load(Acquire));\n",
+        to: "        let home = self.slots.first().map(|slot| slot.home.load(Acquire));\n",
+        models: &[("contexts_a_switch_names_the_incoming_home", CTX_WRONG_HOME)],
+    },
+    Control {
+        // KX4: the trap entry's check reads the home of the first slot, not of `current`'s: a
+        // landing on another context's stack could pass it.
+        name: "contexts_running_home_reads_the_first_slot",
+        file: CONTEXTS,
+        from: "            .get(self.current.load(Relaxed))\n            .map(|slot| slot.home.load(Acquire))\n",
+        to: "            .first()\n            .map(|slot| slot.home.load(Acquire))\n",
+        models: &[("contexts_a_switch_names_the_incoming_home", CTX_WRONG_HOME)],
+    },
+    Control {
+        // WX1 (TASKS item 75): a withdrawal that takes the first frame by a plain store, not by
+        // the compare-and-swap a switch also makes: a switch that resumed the context and the
+        // withdrawal can both succeed, and the running context's home is cleared.
+        name: "contexts_withdrawal_takes_the_frame_by_a_store",
+        file: CONTEXTS,
+        from: "                && slot
+                    .frame
+                    .compare_exchange(frame, 0, AcqRel, Acquire)
+                    .is_ok()
+",
+        to: "                && {
+                    slot.frame.store(0, Release);
+                    true
+                }
+",
+        models: &[(
+            "contexts_a_withdrawal_beside_a_switch_and_a_publication",
+            CTX_WITHDRAWN,
+        )],
+    },
+    Control {
+        // WX2 (TASKS item 75; the coordinating session's addition (b)): the home cleared before
+        // the first frame is taken. A publisher can claim the slot in between and have its frame
+        // overwritten, and a context a switch resumed loses its home.
+        name: "contexts_withdrawal_clears_the_home_first",
+        file: CONTEXTS,
+        from: "        let Some(slot) = self.slots.iter().find(|slot| {
+            slot.home.load(Acquire) == frame
+                && slot
+                    .frame
+                    .compare_exchange(frame, 0, AcqRel, Acquire)
+                    .is_ok()
+        }) else {
+            return false;
+        };
+        slot.home.store(0, Release);
+        true
+",
+        to: "        let Some(slot) = self.slots.iter().find(|slot| slot.home.load(Acquire) == frame) else {
+            return false;
+        };
+        slot.home.store(0, Release);
+        slot.frame.compare_exchange(frame, 0, AcqRel, Acquire).is_ok()
+",
+        models: &[(
+            "contexts_a_withdrawal_beside_a_switch_and_a_publication",
+            CTX_WITHDRAWN,
+        )],
+    },
+    Control {
+        // X1 (TASKS item 79): the end published before it is counted as ending, as `settle` was
+        // before TASKS item 79 for every end: a settle that sees the end can find nothing
+        // pending while the thread still holds everything.
+        name: "exits_counted_after_publishing",
+        file: EXITS,
+        from: "        self.ending.fetch_add(1, AcqRel);\n        (Mark { exits: self }, publish())\n",
+        to: "        let published = publish();\n        self.ending.fetch_add(1, AcqRel);\n        (Mark { exits: self }, published)\n",
+        models: &[("exits_a_settle_sees_what_an_ended_thread_held", EXITS_EARLY)],
+    },
+    Control {
+        // X2: the exit lowers `ending` before it counts the zombie: between the two, nothing is
+        // pending.
+        name: "exits_ending_lowered_before_the_zombie_counts",
+        file: EXITS,
+        from: "        self.zombies.fetch_add(1, AcqRel);
+        if let Some(mark) = mark {
+            mark.lower();
+        }
+",
+        to: "        if let Some(mark) = mark {
+            mark.lower();
+        }
+        self.zombies.fetch_add(1, AcqRel);
+",
+        models: &[
+            ("exits_a_settle_sees_what_an_ended_thread_held", EXITS_EARLY),
+            (
+                "exits_two_threads_on_one_processor_each_count_for_themselves",
+                EXITS_EARLY,
+            ),
+        ],
+    },
+    Control {
+        // X3: the settle reads `zombies` before `ending`: it can read no zombie before the exit
+        // counts one, and no ending thread after the exit lowers it.
+        name: "exits_settle_reads_zombies_first",
+        file: EXITS,
+        from: "    let ending = each()
+        .map(|exits| exits.ending.load(Acquire))
+        .fold(0, u64::saturating_add);
+    let zombies = each()
+        .map(|exits| exits.zombies.load(Acquire))
+        .fold(0, u64::saturating_add);
+",
+        to: "    let zombies = each()
+        .map(|exits| exits.zombies.load(Acquire))
+        .fold(0, u64::saturating_add);
+    let ending = each()
+        .map(|exits| exits.ending.load(Acquire))
+        .fold(0, u64::saturating_add);
+",
+        models: &[
+            ("exits_a_settle_sees_what_an_ended_thread_held", EXITS_EARLY),
+            ("exits_a_settle_over_two_processors_sees_both", EXITS_EARLY),
+        ],
+    },
+    Control {
+        // X4: the reaper counts the zombie gone before it gives back what it held: T70-7's order
+        // undone (the review of TASKS item 70).
+        name: "exits_reaped_before_released",
+        file: EXITS,
+        from: "        let released = release();\n        self.zombies.fetch_sub(1, AcqRel);\n        released\n",
+        to: "        self.zombies.fetch_sub(1, AcqRel);\n        release()\n",
+        models: &[("exits_a_settle_sees_what_an_ended_thread_held", EXITS_EARLY)],
+    },
+    Control {
+        // X5: the settle reads `ending` with Relaxed: reading the exit's lowering then orders
+        // nothing, and its read of `zombies` may miss the zombie the exit counted first.
+        name: "exits_ending_read_relaxed",
+        file: EXITS,
+        from: "        .map(|exits| exits.ending.load(Acquire))\n",
+        to: "        .map(|exits| exits.ending.load(core::sync::atomic::Ordering::Relaxed))\n",
+        models: &[("exits_a_settle_sees_what_an_ended_thread_held", EXITS_EARLY)],
+    },
+    Control {
+        // X6 (the review of TASKS item 79, T79-1): an exit that brought no mark lowers `ending`
+        // all the same, so another thread's lowering can stand for the ending thread's.
+        name: "exits_lowered_without_a_mark",
+        file: EXITS,
+        from: "        if let Some(mark) = mark {
+            mark.lower();
+        }
+",
+        to: "        match mark {
+            Some(mark) => mark.lower(),
+            None => {
+                self.ending.fetch_sub(1, AcqRel);
+            }
+        }
+",
+        models: &[(
+            "exits_an_exit_without_a_mark_cannot_stand_for_one",
+            EXITS_EARLY,
         )],
     },
 ];
