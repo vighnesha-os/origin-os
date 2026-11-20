@@ -925,8 +925,23 @@ def boot_entry(efibootmgr, esp_partuuid):
     return f"Boot{first}", path.group(1)
 
 
+IDENTITY_LINE = "origin-kernel: CPU identity: "
+
+
+def scope_row(origin_lines, lscpu):
+    """The record's scope: the kernel's own `CPU identity` line (ADR-0009 A2, TASKS item 16),
+    verbatim; only if the console never carried it, ADR-0009 A2's rule applied by hand to what
+    Linux reported, and said to be so."""
+    line = next((l for l in origin_lines if IDENTITY_LINE in l), None)
+    if line:
+        return "the kernel's line: " + line[line.find(IDENTITY_LINE) + len(IDENTITY_LINE):]
+    return (scope_verdict(lscpu) + " (by hand, from Linux's lscpu: the console carried no "
+            "`CPU identity` line from the kernel)")
+
+
 def scope_verdict(lscpu):
-    """ADR-0009 A2's rule, by hand, until the kernel prints it (P9 of the plan)."""
+    """ADR-0009 A2's rule, by hand, for a record whose console lacks the kernel's own line. The
+    kernel's rule is `origin_frame::cpuident`'s; the Intel models here are its listed ones."""
     fields = {}
     for line in lscpu.splitlines():
         key, _, value = line.partition(":")
@@ -1085,8 +1100,8 @@ def write_record(args, rental, results):
                             f"{sha256(Path(args.image_dir) / 'KERNEL.ONBF')}"),
         ("Date", date),
         ("Result", "; ".join(f"boot {r['boot']}: {r['summary']}" for r in results) or "no boot ran"),
-        ("Scope", scope_verdict(lscpu) + ". It qualifies nothing and supports no hardware claim "
-                  "(CLAUDE.md §74, §76, rules 30 and 40; item 233)"),
+        ("Scope", scope_row(origin, lscpu) + ". Bench equipment: it qualifies nothing and "
+                  "supports no hardware claim (CLAUDE.md §74, §76, rules 30 and 40; item 233)"),
         ("Environment", "A physical machine with no hypervisor; the provider's firmware and BMC"),
         ("Speculation controls", pick("speculation")),
         ("IOMMU", pick("iommu")),

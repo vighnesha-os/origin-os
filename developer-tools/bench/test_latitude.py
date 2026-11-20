@@ -356,8 +356,21 @@ class Guards(unittest.TestCase):
         for key in ("Machine", "Firmware", "Source revision", "Date", "Result"):
             self.assertIn(f"| {key} | ", record)
         self.assertIn("older than Zen 5", record)
+        self.assertIn("by hand, from Linux's lscpu", record)  # no kernel line in this console
         self.assertIn("automatic IBRS on", record)
         self.assertNotIn("192.0.2.3", (d / "console-redacted.log").read_text())
+
+    def test_the_scope_row_quotes_the_kernels_own_line(self):
+        # The line `origin_frame::cpuident` pins for rental A's processor, the EPYC 4244P.
+        kernel = ("origin-kernel: CPU identity: AuthenticAMD family 19h (25) model 61h stepping 2 "
+                  "(leaf 1 EAX 00A60F12h): older than Zen 5; outside the declared scope, a bench "
+                  "machine: AMD family below 1Ah, where Zen 5 begins (ADR-0009 A2); no erratum "
+                  "listed for it")
+        lscpu = "Vendor ID: AuthenticAMD\nCPU family: 25\nModel: 97\n"
+        row = self.lat.scope_row(["origin-kernel: Origin OS", kernel], lscpu)
+        self.assertTrue(row.startswith("the kernel's line: AuthenticAMD family 19h (25) model 61h"))
+        self.assertNotIn("by hand", row)
+        self.assertIn("by hand", self.lat.scope_row(["origin-kernel: Origin OS"], lscpu))
 
     def test_two_writers_lose_nothing(self):
         self.lat.add_rental({"server_id": "sv", "usd_per_hour": 0.41, "deployed_at": 1.0, "deadline": 2.0})
