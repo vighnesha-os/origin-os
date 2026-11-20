@@ -463,7 +463,10 @@ mod tests {
     }
 
     fn stalled() -> Result<Completed, Stalled> {
-        Err(Stalled { cpu: 1 })
+        Err(Stalled {
+            cpu: 1,
+            generation: 1,
+        })
     }
 
     /// Reclaims every Retired slot with a shootdown that completes; returns how many.

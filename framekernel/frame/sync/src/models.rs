@@ -2435,7 +2435,10 @@ fn stalling_change(unconfirmed: bool) {
     };
     let confirmation = Confirmation::new();
     if unconfirmed {
-        let _ = confirmation.record(Err(Stalled { cpu: 1 }));
+        let _ = confirmation.record(Err(Stalled {
+            cpu: 1,
+            generation: 1,
+        }));
     }
     let first_made = core::cell::Cell::new(false);
     let mut change = TwoPages {

@@ -185,6 +185,9 @@ pub struct Completed {
 pub struct Stalled {
     /// The first processor that did not answer.
     pub cpu: usize,
+    /// The generation of the request it did not answer: what [`Shootdown::answered`] compares
+    /// its record with.
+    pub generation: u64,
 }
 
 /// Whether every change to one address space is known to have reached every processor
@@ -547,6 +550,23 @@ impl<S: Records> Shootdown<S> {
         self.records.record(id).is_some()
     }
 
+    /// Whether the processor `stall` names has served a request since: the one it did not
+    /// answer in time, or a later one. True also for a processor with no record, which can
+    /// never serve, so that whether to ask again is left to a fresh request, which then stalls
+    /// at once.
+    ///
+    /// **This is no proof that any translation was dropped.** A processor that serves late
+    /// serves the request current when it runs, which may name other pages than the one it
+    /// stalled on: it has dropped those, not necessarily these. It only says that asking that
+    /// processor again is worth an interrupt now: its record moves forward once it takes the
+    /// interrupt it was sent, which stays pending until it does. What was mapped may be reused
+    /// only after a fresh request, published after the mapping left the tables, has completed on
+    /// every processor (`slots::Slots::reclaim`; TASKS item 73).
+    pub fn answered(&self, stall: Stalled) -> bool {
+        self.served(stall.cpu)
+            .is_none_or(|served| served.load(Ordering::Acquire) >= stall.generation)
+    }
+
     /// Makes this processor a target of later requests, then flushes its whole TLB, so it holds
     /// no translation older than the first request it is sent. In that order: a request whose
     /// initiator does not yet see this processor online was made before the flush.
@@ -729,7 +749,10 @@ impl<S: Records> Shootdown<S> {
             for id in 0..count {
                 if id != me && self.must_answer(id, scope) {
                     let Some(asked) = self.records.asked(id) else {
-                        stalled.get_or_insert(Stalled { cpu: id });
+                        stalled.get_or_insert(Stalled {
+                            cpu: id,
+                            generation,
+                        });
                         continue;
                     };
                     asked.0.store(true, Ordering::Relaxed);
@@ -749,7 +772,10 @@ impl<S: Records> Shootdown<S> {
                 }
                 asked.0.store(false, Ordering::Relaxed);
                 let Some(served) = self.served(target) else {
-                    stalled.get_or_insert(Stalled { cpu: target });
+                    stalled.get_or_insert(Stalled {
+                        cpu: target,
+                        generation,
+                    });
                     continue;
                 };
                 if stalled.is_some() {
@@ -760,7 +786,10 @@ impl<S: Records> Shootdown<S> {
                         // Looked at once more: this processor may have been the one away.
                         && served.load(Ordering::Acquire) < generation
                     {
-                        stalled = Some(Stalled { cpu: target });
+                        stalled = Some(Stalled {
+                            cpu: target,
+                            generation,
+                        });
                         break;
                     }
                     prim::spin_loop();
@@ -1104,6 +1133,58 @@ mod tests {
         assert_eq!(*machine.ipis.lock().unwrap(), [(0, 1), (0, 2)]);
     }
 
+    /// TASKS item 73: `answered` says only whether the processor a stall named has served a
+    /// request since, the one it stalled on or a later one; never that it dropped any page.
+    #[test]
+    fn a_stalled_processor_has_answered_once_it_serves() {
+        let machine = Machine::default();
+        machine.ticking.store(true, Ordering::Relaxed);
+        let shootdown = Shootdown::new(Held::new(3));
+        shootdown.mark_online(&cpu(0, &machine));
+        shootdown.mark_online(&cpu(2, &machine));
+        let Err(stall) = shootdown.shoot(&cpu(0, &machine), Request::page(0x1000), Scope::Kernel)
+        else {
+            panic!("CPU 2 never serves here, so the request must stall");
+        };
+        assert_eq!(
+            stall,
+            Stalled {
+                cpu: 2,
+                generation: 1
+            }
+        );
+        assert!(!shootdown.answered(stall), "before it served anything");
+        // Another request, for other pages, stalls on it too: still not answered.
+        let later = shootdown.shoot(&cpu(0, &machine), Request::page(0x9000), Scope::Kernel);
+        assert_eq!(
+            later,
+            Err(Stalled {
+                cpu: 2,
+                generation: 2
+            })
+        );
+        assert!(!shootdown.answered(stall));
+        // It takes its interrupt late and serves the request current then, the later one: it
+        // has answered, though it dropped 0x9000's translation, not 0x1000's.
+        shootdown.service(&cpu(2, &machine));
+        assert!(shootdown.answered(stall));
+        assert!(
+            machine
+                .invalidated
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| *id == 2)
+                .all(|(_, request)| *request != Request::page(0x1000)),
+            "CPU 2 served the later request, not the one it stalled on"
+        );
+        // A processor with no record never serves: a fresh request decides, and stalls at once.
+        assert!(shootdown.answered(Stalled {
+            cpu: 7,
+            generation: 1
+        }));
+    }
+
     #[test]
     fn a_processor_that_does_not_answer_is_named() {
         let machine = Machine::default();
@@ -1112,10 +1193,22 @@ mod tests {
         shootdown.mark_online(&cpu(0, &machine));
         shootdown.mark_online(&cpu(2, &machine));
         let outcome = shootdown.shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Kernel);
-        assert_eq!(outcome, Err(Stalled { cpu: 2 }));
+        assert_eq!(
+            outcome,
+            Err(Stalled {
+                cpu: 2,
+                generation: 1
+            })
+        );
         // The turn is given back, so the next request can be made.
         let next = shootdown.shoot(&cpu(2, &machine), Request::Everything, Scope::Kernel);
-        assert_eq!(next, Err(Stalled { cpu: 0 }));
+        assert_eq!(
+            next,
+            Err(Stalled {
+                cpu: 0,
+                generation: 2
+            })
+        );
     }
 
     /// Two processors shooting at each other each serve the other's request while they wait
@@ -1287,7 +1380,10 @@ mod tests {
             // It has not loaded the other space yet: its TLB still holds this one's.
             assert_eq!(
                 shootdown.shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Space(SPACE)),
-                Err(Stalled { cpu: 1 })
+                Err(Stalled {
+                    cpu: 1,
+                    generation: 1
+                })
             );
         });
         // Gone, and nobody needs it any more.
@@ -1383,7 +1479,13 @@ mod tests {
                 released.fetch_add(1, Ordering::Relaxed);
             },
         );
-        assert_eq!(outcome, Err(Stalled { cpu: 1 }));
+        assert_eq!(
+            outcome,
+            Err(Stalled {
+                cpu: 1,
+                generation: 1
+            })
+        );
         assert_eq!(released.load(Ordering::Relaxed), 0);
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
     }
@@ -1395,7 +1497,10 @@ mod tests {
             processors: 1,
             ticks: 5,
         };
-        let stall = Stalled { cpu: 3 };
+        let stall = Stalled {
+            cpu: 3,
+            generation: 4,
+        };
         let mut flushes = 0;
         // Nothing to settle: no flush.
         assert_eq!(confirmation.settle(|| unreachable!("no flush")), Ok(None));
@@ -1514,7 +1619,10 @@ mod tests {
     ) -> (Result<Cost, Refused>, Vec<Request>, bool) {
         let confirmation = Confirmation::new();
         if unconfirmed {
-            let _ = confirmation.record(Err(Stalled { cpu: 1 }));
+            let _ = confirmation.record(Err(Stalled {
+                cpu: 1,
+                generation: 1,
+            }));
         }
         let mut asked = Vec::new();
         let outcome = confirmation.change(pages, |request| {
@@ -1526,7 +1634,10 @@ mod tests {
                     ticks: 1,
                 })
             } else {
-                Err(Stalled { cpu: 1 })
+                Err(Stalled {
+                    cpu: 1,
+                    generation: 1,
+                })
             }
         });
         assert_eq!(
@@ -1580,7 +1691,13 @@ mod tests {
     fn when_the_flush_at_the_end_stalls_too_what_was_kept_is_lost() {
         let mut pages = Pages::of(3);
         let (outcome, asked, unconfirmed) = change(&mut pages, false, &[true, false, false]);
-        assert_eq!(outcome, Err(Refused::Stalled(Stalled { cpu: 1 })));
+        assert_eq!(
+            outcome,
+            Err(Refused::Stalled(Stalled {
+                cpu: 1,
+                generation: 1
+            }))
+        );
         assert_eq!(asked, [page(0), page(1), Request::NonGlobal]);
         assert_eq!(pages.made, 3, "every page left the tables");
         assert_eq!(
@@ -1622,7 +1739,13 @@ mod tests {
 
         let mut pages = Pages::of(3);
         let (outcome, _, unconfirmed) = change(&mut pages, true, &[false, false]);
-        assert_eq!(outcome, Err(Refused::Stalled(Stalled { cpu: 1 })));
+        assert_eq!(
+            outcome,
+            Err(Refused::Stalled(Stalled {
+                cpu: 1,
+                generation: 1
+            }))
+        );
         assert_eq!(pages.made, 3, "every page left the tables");
         assert!(pages.given_back.is_empty());
         assert_eq!(pages.lost, [0, 1, 2]);
@@ -1745,13 +1868,25 @@ mod tests {
             shootdown.mark_online(&cpu(id, &machine));
         }
         let outcome = shootdown.shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Kernel);
-        assert_eq!(outcome, Err(Stalled { cpu: 2 }));
+        assert_eq!(
+            outcome,
+            Err(Stalled {
+                cpu: 2,
+                generation: 1
+            })
+        );
         for id in 0..5 {
             let asked = shootdown.records().asked(id).unwrap();
             assert!(!asked.0.load(Ordering::Relaxed), "CPU {id}'s mark");
         }
         let again = shootdown.shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Kernel);
-        assert_eq!(again, Err(Stalled { cpu: 2 }));
+        assert_eq!(
+            again,
+            Err(Stalled {
+                cpu: 2,
+                generation: 2
+            })
+        );
         assert_eq!(
             *machine.ipis.lock().unwrap(),
             [(0, 2), (0, 4), (0, 2), (0, 4)]
@@ -1779,7 +1914,13 @@ mod tests {
             shootdown.mark_online(&cpu(id, &machine));
         }
         let outcome = shootdown.shoot(&cpu(0, &machine), Request::page(0x1000), Scope::Kernel);
-        assert_eq!(outcome, Err(Stalled { cpu: 2 }));
+        assert_eq!(
+            outcome,
+            Err(Stalled {
+                cpu: 2,
+                generation: 1
+            })
+        );
     }
 
     #[test]

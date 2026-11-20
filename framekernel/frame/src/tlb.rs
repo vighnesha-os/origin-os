@@ -203,7 +203,7 @@ static STALLS: crate::stalls::StallLog = crate::stalls::StallLog::new();
 
 /// Notes a shootdown that gave up on a processor, asked at TSC `asked_at`.
 fn note(outcome: &Result<Completed, Stalled>, asked_at: u64) {
-    if let Err(Stalled { cpu }) = outcome {
+    if let Err(Stalled { cpu, .. }) = outcome {
         STALLS.note(*cpu, this_cpu(), asked_at, rdtsc());
     }
 }
@@ -265,7 +265,9 @@ fn finished(outcome: Result<Completed, Stalled>, asked_at: u64) -> u64 {
             LAST_CYCLES.store(done.ticks, Ordering::Relaxed);
             done.ticks
         }
-        Err(Stalled { cpu }) => panic!("TLB shootdown: CPU {cpu} did not answer within a second"),
+        Err(Stalled { cpu, .. }) => {
+            panic!("TLB shootdown: CPU {cpu} did not answer within a second")
+        }
     }
 }
 
