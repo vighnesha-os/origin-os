@@ -852,7 +852,7 @@ fn spawn_with_parts(
         // The queue lock is held until the thread's state is complete: the moment the slot
         // is Ready the target processor can pick it, and `follow_thread` needs the state.
         let mut queue = queue.lock();
-        let slot = queue.push_weighted(frame_at, weight)?;
+        let slot = queue.push_weighted(frame_at, weight, None)?;
         let mut t = threads.lock();
         if let Some((stack, fpu_area, user)) = parts.take() {
             if let Some(s) = t.stacks.get_mut(slot) {

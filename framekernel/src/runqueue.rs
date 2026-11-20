@@ -396,6 +396,10 @@ pub struct RunQueue {
     generation: [u32; CAPACITY],
     /// A wake-up that arrived while the slot's thread was not blocked.
     wake_pending: [bool; CAPACITY],
+    /// The number of the record each slot's thread has (ADR-0020 S1, TASKS item 92), so that the
+    /// processor finds the thread's state, and a wake-up its name, under this queue's lock.
+    /// `None` for slot 0 and for a free slot.
+    record: [Option<u32>; CAPACITY],
     /// The slots a wake-up made ready since this queue last chose what to run.
     woken: [bool; CAPACITY],
     /// Each slot's weight and pass (stride scheduling).
@@ -426,6 +430,7 @@ impl RunQueue {
             state,
             generation: [0; CAPACITY],
             wake_pending: [false; CAPACITY],
+            record: [None; CAPACITY],
             woken: [false; CAPACITY],
             weight: [DEFAULT_WEIGHT; CAPACITY],
             pass: [0; CAPACITY],
@@ -476,13 +481,19 @@ impl RunQueue {
         self.watch.armed = false;
     }
 
-    /// Adds a thread whose initial frame is saved at `context`; returns its slot.
+    /// Adds a thread whose initial frame is saved at `context`, with no record; returns its slot.
     pub fn push(&mut self, context: u64) -> Result<usize, QueueError> {
-        self.push_weighted(context, DEFAULT_WEIGHT)
+        self.push_weighted(context, DEFAULT_WEIGHT, None)
     }
 
-    /// As [`RunQueue::push`], with `weight` (clamped to 1–[`MAX_WEIGHT`]).
-    pub fn push_weighted(&mut self, context: u64, weight: u32) -> Result<usize, QueueError> {
+    /// As [`RunQueue::push`], with `weight` (clamped to 1–[`MAX_WEIGHT`]) and the number of the
+    /// thread's record, which [`RunQueue::record`] answers until the thread exits.
+    pub fn push_weighted(
+        &mut self,
+        context: u64,
+        weight: u32,
+        record: Option<u32>,
+    ) -> Result<usize, QueueError> {
         if context == 0 || !context.is_multiple_of(8) {
             return Err(QueueError::BadContext(context));
         }
@@ -505,6 +516,9 @@ impl RunQueue {
         if let (Some(w), Some(p)) = (self.weight.get_mut(slot), self.pass.get_mut(slot)) {
             *w = weight.clamp(1, MAX_WEIGHT);
             *p = floor;
+        }
+        if let Some(r) = self.record.get_mut(slot) {
+            *r = record;
         }
         Ok(slot)
     }
@@ -559,6 +573,23 @@ impl RunQueue {
     /// The generation of the thread in `slot` (0 for slot 0, the boot context).
     pub fn generation(&self, slot: usize) -> u32 {
         self.generation.get(slot).copied().unwrap_or(0)
+    }
+
+    /// The number of the record of the thread in `slot`, as [`RunQueue::push_weighted`] was
+    /// given it: `None` for slot 0, for a free slot (also the moment its thread has exited), and
+    /// for a thread pushed without one.
+    pub fn record(&self, slot: usize) -> Option<u32> {
+        match self.state.get(slot) {
+            Some(State::Free) | None => None,
+            Some(_) => self.record.get(slot).copied().flatten(),
+        }
+    }
+
+    /// Whether `slot`'s thread holds a wake-up that came before it blocked, which its next
+    /// [`RunQueue::block`] consumes. Read only: a thread that leaves this queue for another
+    /// carries it (ADR-0020 S6), as the Loom models' stand-in for a move does.
+    pub fn wake_pending(&self, slot: usize) -> bool {
+        self.wake_pending.get(slot).copied().unwrap_or(false)
     }
 
     /// Contexts in the queue (ready or asleep), the boot context included.
@@ -754,6 +785,9 @@ impl RunQueue {
         }
         if let Some(s) = self.state.get_mut(self.current) {
             *s = State::Free;
+        }
+        if let Some(r) = self.record.get_mut(self.current) {
+            *r = None;
         }
         Ok(self.switch(interrupted, false))
     }
@@ -1267,7 +1301,7 @@ mod tests {
         let mut q = RunQueue::new();
         q.set_idle(true);
         for (i, w) in [1u32, 4, 16].into_iter().enumerate() {
-            q.push_weighted(0x1000 * (i as u64 + 1), w).unwrap();
+            q.push_weighted(0x1000 * (i as u64 + 1), w, None).unwrap();
         }
         // 21 quanta make one full cycle of strides 16 : 4 : 1.
         let runs = run(&mut q, 2100);
@@ -1412,7 +1446,7 @@ mod tests {
         for q in [&mut quiet, &mut busy] {
             q.set_idle(true);
             for (i, w) in [1u32, 4, 16].into_iter().enumerate() {
-                q.push_weighted(0x1000 * (i as u64 + 1), w).unwrap();
+                q.push_weighted(0x1000 * (i as u64 + 1), w, None).unwrap();
             }
         }
         // 21 quanta make one full cycle of strides 16 : 4 : 1. On `busy`, the running thread
@@ -1559,5 +1593,48 @@ mod tests {
             alloc::format!("{:?}", QueueError::BootContext),
             "BootContext"
         );
+    }
+
+    /// Each slot answers the record its thread was pushed with (ADR-0020 S1, TASKS item 92);
+    /// slot 0, a free slot and a thread pushed without one answer none.
+    #[test]
+    fn a_slot_answers_its_thread_s_record_until_the_thread_exits() {
+        let mut q = RunQueue::new();
+        assert_eq!(q.record(0), None, "the boot or idle flow has no record");
+        let a = q.push_weighted(0x1000, DEFAULT_WEIGHT, Some(7)).unwrap();
+        let b = q.push(0x2000).unwrap();
+        assert_eq!((q.record(a), q.record(b)), (Some(7), None));
+        assert_eq!(q.record(5), None, "a free slot");
+        assert_eq!(q.record(CAPACITY), None, "no such slot");
+        // `a` runs and exits: from the critical section that freed its slot on, nothing finds
+        // its record through the slot.
+        assert_eq!(q.tick(0x9000), 0x1000);
+        assert_eq!(q.current(), a);
+        q.exit(0x1000).unwrap();
+        assert_eq!(q.record(a), None);
+        // The slot's next thread has its own.
+        let c = q.push_weighted(0x3000, DEFAULT_WEIGHT, Some(40)).unwrap();
+        assert_eq!(c, a, "the lowest free slot is reused");
+        assert_eq!(q.record(c), Some(40));
+        assert_eq!(q.generation(c), 2);
+    }
+
+    /// The pending wake-up of a thread not yet blocked can be read, and reading it changes
+    /// nothing: its next block consumes it as before.
+    #[test]
+    fn a_pending_wake_up_can_be_read_without_consuming_it() {
+        let mut q = RunQueue::new();
+        let slot = q.push(0x1000).unwrap();
+        assert!(!q.wake_pending(slot));
+        assert_eq!(q.tick(0x9000), 0x1000);
+        assert!(
+            !q.wake(slot, q.generation(slot)),
+            "ready: the wake-up is kept"
+        );
+        assert!(q.wake_pending(slot));
+        assert!(q.wake_pending(slot), "a read consumes nothing");
+        assert_eq!(q.block(0x1000), Ok(0x1000), "the block returns at once");
+        assert!(!q.wake_pending(slot));
+        assert!(!q.wake_pending(0) && !q.wake_pending(CAPACITY));
     }
 }
