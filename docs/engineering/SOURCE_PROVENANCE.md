@@ -5382,7 +5382,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **New:** no `unsafe` outside the Loom models, no dependency.
 - **Specifications:** as the entry above.
 - **Review:** the report above, by an AI reviewer independent of the author and of the coordinating session, which reads these answers itself. No person has reviewed the code.
-- **Tests:** not yet run on the final tip.
+- **Tests:** the controls on an export of `3e1e4312` (07:01 to 07:19 UTC, and 07:29 to 07:32), as ADR-0013's table gives them; gates on `c74eeeff` in one turn (07:52 to 08:20 UTC): the 14 quick gates; `check` (2,492 host tests, 0 failed, 30 ignored; Loom 69 models, 105 controls caught); `boot-test` 11 of 11; `boot-matrix` on its first run (23 kernel boots, no settle past 2 s).
 
 ## TASKS item 66: timing proofs that judge the kernel, not the host's load (ADR-0013; 2026-11-19)
 

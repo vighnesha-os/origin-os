@@ -2911,7 +2911,11 @@ Built on `claude/t75-77-81` from `618b0961`: `be2fdf9e` (`Contexts::withdraw`, t
 - **R81-2 (Low), `3e1e4312`, on the coordinating session's rulings.** The closed-channel wait ran after the exits wait, so a drain could wake a thread that then ended between the exits wait and the verdict. Each pass now drains first; `reap_closed` returns how many it drained, and a pass that drained any, or left anything pending, is followed by a yield, an interrupt window and another pass, at most three (`settled::again`, host-tested). Control C81w fails as first built and passes now; ADR-0013 states the two limits.
 - **R81-3 (Low), the ledger.** While a drain is under way, a system call that finds the count raised takes the list's lock once: CL44, ADR-0005 P8.
 
-**Gates.** Not yet run on the final tip.
+**Gates.** On `c74eeeff`, in one turn of the machine (07:52 to 08:20 UTC, after 1,100 s waiting for TASKS item 73's run), under Rust 1.100.0, the tree clean:
+  - the 14 quick gates, before the turn;
+  - `cargo xtask check` passed: 2,492 host tests, 0 failed, 30 ignored; Loom's 69 models passed and its 105 controls were caught, WX1, WX2, KX1 to KX4 and BX1 to BX4 by the models they aim at (B1 55,475 and B2 134,259 executions, both exhaustive);
+  - `boot-test` 11 of 11;
+  - `boot-matrix` passed on its first run, in 1,070 s: 23 kernel boots. No settle on any machine waited past 2 s (no `waited … ms` line), and none printed "not settled", a closed channel or a stalled shootdown; the landing check halted nothing.
 
 **Follow-ups, for the coordinating session to number:**
 1. R77-4: name the address space from the table of contexts, or check the scheduler's against it at `resume`, as 77 did for the stack.
