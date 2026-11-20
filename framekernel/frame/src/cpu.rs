@@ -828,9 +828,11 @@ pub fn landings_checked() -> u64 {
 /// the capacity is counted again (the coordinating session's ruling (a) on TASKS item 70): a
 /// processor has at most one context per slot of its run queue, whose 16
 /// (`runqueue::CAPACITY`) include the boot or idle flow's, plus at most one that has ended and is
-/// not yet retired, 17 of `origin_sync::contexts::SLOTS`' 32. The kernel checks that at compile
-/// time (`sched.rs`). A full table refuses a publication ([`publish_context`], so the kernel
-/// refuses the spawn), and refuses a boot or idle flow's first switch-out, which halts.
+/// not yet retired, 17 of `origin_sync::contexts::SLOTS`' 32, and, since TASKS item 75, each
+/// spawn to it between its publication and its queueing (`origin_sync::contexts`, "Capacity").
+/// The kernel checks the 17 at compile time (`sched.rs`). A full table refuses a publication
+/// ([`publish_context`], so the kernel refuses the spawn), and refuses a boot or idle flow's first
+/// switch-out, which halts.
 pub(crate) static CONTEXTS: PerCpu<Contexts> = PerCpu::new(
     "origin_frame::cpu::CONTEXTS",
     Contexts::new(),

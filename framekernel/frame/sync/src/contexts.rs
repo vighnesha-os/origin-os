@@ -129,6 +129,17 @@
 //! is 17 of 32. If a table were ever full, [`Contexts::publish`] returns `false`, and the kernel
 //! refuses the spawn. A boot flow's first switch-out that found no slot would be refused by
 //! [`Contexts::switch`] with [`Refused::Full`], and the trap entry halts.
+//!
+//! **Spawns in flight** (TASKS item 75; the review of TASKS items 75, 77 and 81, R75-2). A spawn
+//! publishes before it queues, so the table also holds, for a moment, every spawn to this
+//! processor between its publication and its push or withdrawal: one per spawner in that
+//! stretch, which runs with interrupts on and may be preempted there. They share the 15 slots to
+//! spare. More at once would have a publication refused, which only fails that spawn, and would
+//! halt a processor whose boot or idle flow had not yet made its first switch-out. Today's kernel
+//! reaches neither: every processor's boot or idle flow first switches out in the boot's first
+//! scheduler proofs, to threads the boot flow spawns one at a time, before any thread can spawn
+//! another. Claiming the boot or idle flow's slot when the table is made, rather than at its first
+//! switch-out, would remove the halt; that is a follow-up.
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};

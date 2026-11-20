@@ -743,9 +743,12 @@ fn spawn_with(
 /// publication needs no lock. A refused publication returns at once, having touched neither the
 /// queue nor the thread table. A queue that then refuses the thread (it is full) has the
 /// publication withdrawn before the stack is dropped: otherwise the stack's home would still be in
-/// the table, and its drop would leak it. While a refused spawn is between the two, its context
-/// holds a slot of the table, which has 15 to spare (`cpu::CONTEXTS`); a table filled that way
-/// refuses another spawn, which is safe.
+/// the table, and its drop would leak it. Every spawn holds a slot of the table between its
+/// publication and its push or withdrawal, with interrupts on, so the spawns in that stretch share
+/// the table's 15 slots to spare: more would have a publication refused, which fails that spawn
+/// safely, and would halt a processor whose boot or idle flow had not yet switched out. Today's
+/// boot reaches neither (`origin_sync::contexts`, "Capacity"; the review of TASKS items 75, 77
+/// and 81, R75-2).
 fn spawn_with_parts(
     cpu: CpuIndex,
     start: ThreadStart,
