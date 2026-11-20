@@ -44,6 +44,7 @@ use crate::quota::footprint;
 use origin_abi::{Error, Handle, ObjectType};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
+use origin_frame::sync::backlog::Backlog;
 use origin_frame::sync::ports::Source;
 
 use crate::cpu::without_interrupts;
@@ -394,8 +395,12 @@ pub(crate) const MAX_HOLDER_DEPTH: usize = 16;
 
 /// Channels with undelivered messages waiting for [`reap_closed`].
 static CLOSED: SpinLock<Option<ObjectRef<KernelChannel>>> = SpinLock::new(None);
-/// How many channels are on that list: the common case is none, checked without the lock.
-static CLOSED_COUNT: AtomicU64 = AtomicU64::new(0);
+/// How many channels are on that list or being reaped: the common case is none, checked without
+/// the lock. A reaped channel stops counting only once its messages, and the channel itself as far
+/// as the list's reference held it, are freed, so a [`closed_pending`] of 0 seen by a settle on
+/// another processor comes after all of that (TASKS item 81; the review of TASKS item 79, T79-6;
+/// `origin_frame::sync::backlog`).
+static CLOSED_COUNT: Backlog = Backlog::new();
 
 /// Wake-ups of threads blocked on another processor, for the boot proof.
 static CROSS_CPU_WAKES: AtomicU64 = AtomicU64::new(0);
@@ -457,14 +462,19 @@ fn list_closed(channel: &ObjectRef<KernelChannel>) {
         *channel.next_closed.lock() = head.take();
         *head = Some(channel.clone());
     });
-    CLOSED_COUNT.fetch_add(1, Ordering::Release);
+    CLOSED_COUNT.added();
 }
 
 /// Drops every undelivered message on the closed list, iteratively, with no lock held. Each
 /// message's handles may close further ends, which only join this list: however deep the
 /// chain, the stack stays flat.
+///
+/// A channel taken off the list still counts until its messages and the list's reference to it
+/// are dropped (TASKS item 81), so a reap in progress here keeps [`closed_pending`] above 0 for
+/// every other processor. One that finds a count but an empty list, because another processor
+/// is reaping, returns: it does not wait for that reap. [`crate::sched::settle`] does.
 pub(crate) fn reap_closed() {
-    while CLOSED_COUNT.load(Ordering::Acquire) != 0 {
+    while CLOSED_COUNT.pending() != 0 {
         let taken = without_interrupts(|| {
             let mut head = CLOSED.lock();
             let channel = head.take()?;
@@ -477,12 +487,22 @@ pub(crate) fn reap_closed() {
         // Off the list. A later close lists the channel again; one that saw it still listed
         // stored its messages before this swap, so the loop below takes them.
         channel.listed.swap(false, Ordering::AcqRel);
-        CLOSED_COUNT.fetch_sub(1, Ordering::AcqRel);
-        for slot in &channel.undelivered {
-            let undelivered = without_interrupts(|| core::mem::take(&mut *slot.lock()));
-            drop(undelivered);
-        }
+        // It stops counting only after what it held is dropped: its messages, and then the
+        // list's reference to the channel, which may be the last.
+        CLOSED_COUNT.drained(move || {
+            for slot in &channel.undelivered {
+                let undelivered = without_interrupts(|| core::mem::take(&mut *slot.lock()));
+                drop(undelivered);
+            }
+            drop(channel);
+        });
     }
+}
+
+/// Closed channels listed and not yet reaped, and those being reaped on any processor (TASKS
+/// item 81): what [`crate::sched::settle`] waits on.
+pub(crate) fn closed_pending() -> u64 {
+    CLOSED_COUNT.pending()
 }
 
 /// Creates a channel charged to `account`: its two ends, or why not.

@@ -7398,6 +7398,22 @@ mod rerun_tests {
         }
     }
 
+    /// TASKS item 81: a settle that found a closed channel not yet reaped is not a loss of stacks
+    /// alone, whether the channel is named alone or beside lost stacks, before them as `settled`
+    /// orders them or after: such a boot is not re-run (ADR-0013 Amendment 3, part (b)).
+    #[test]
+    fn closed_channels_do_not_qualify() {
+        let cases = [
+            format!("{IPC}; not settled before its first count: 1 closed channels not yet reaped: ipc failed"),
+            format!("{IPC}; not settled before its first count: 1 closed channels not yet reaped, 1 kernel stacks lost to a stalled shootdown: ipc failed"),
+            format!("{IPC}; not settled before its compare: 1 kernel stacks lost to a stalled shootdown, 1 closed channels not yet reaped: ipc failed"),
+            "origin-kernel: directory: the directory, the service, the client and all they held are gone: heap 29408 bytes (was 29408), 128191 free frames (was 128191); not settled before its first count: 1 closed channels not yet reaped: directory failed".to_string(),
+        ];
+        for line in &cases {
+            assert_eq!(lost_stacks_only(line), None, "{line}");
+        }
+    }
+
     /// Only the first failing line counts: an earlier failure in the same boot means no re-run.
     #[test]
     fn only_the_first_failure_decides() {

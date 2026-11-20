@@ -357,6 +357,29 @@ pub(crate) use crate::settled::{Unsettled, not_settled};
 /// Settled at both reads, the counts change only with what the proof does. Waits up to
 /// [`OTHERS_PATIENCE`] seconds for each part; `Err` names what was still pending, and any
 /// stack lost to a stalled shootdown while it ran (`settled`: safe by design, 4 frames each).
+///
+/// **Closed channels** (TASKS item 81). Last, every closed channel's undelivered messages are
+/// freed: those still listed by this flow's own [`crate::ipc::reap_closed`], and those another
+/// processor took off the list by its own, for which it waits. A reap in a system call's epilogue
+/// on another processor could otherwise still be freeing what an ended process's messages held
+/// when a proof read its first count (the review of TASKS item 79, T79-6).
+///
+/// **Reaping closed channels here** (the coordinating session's addition (e)). The wait's closure
+/// runs on the boot flow, which waits with interrupts off (an interrupt window between rounds),
+/// and holds no lock: `wait_for_others` takes none, and `reap_closed` takes the list's lock and
+/// each channel's message slot only to take from them, each with interrupts off, and drops the
+/// messages with neither held. Dropping them can close channel ends (each end's state, its charge
+/// list, the wait queues and port sources it wakes, and the list again), and free processes,
+/// their address spaces and memory objects. Each of those takes its own lock only around its own
+/// change, with interrupts off, and none waits for another processor: an address space's drop
+/// leaks a space a processor still has loaded rather than shoot it down
+/// (`origin_frame::userspace::UserSpace`'s `Drop`), and frees one no processor has loaded without
+/// a shootdown. So nothing the closure frees waits on a processor that waits on the boot flow, and
+/// a processor spinning on a lock the closure takes finds it released without help. Were a drop
+/// to start a TLB shootdown, the protocol would still not deadlock here: the boot flow holds no
+/// lock while it waits for answers, and a processor waiting for its turn to shoot serves the
+/// request in progress (`origin_sync::shootdown`, "How a request travels"). Only the boot flow
+/// settles, so no other processor is waiting in a settle meanwhile.
 pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
     let lost_before = origin_frame::stack::counts().lost;
     reap();
@@ -374,12 +397,25 @@ pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
         tsc_hz,
         2000,
     );
+    // Closed channels' messages, reaped here or on another processor, are freed (TASKS item 81).
+    // The reap runs on the boot flow, with interrupts off and no lock held between messages, as a
+    // proof's own `reap_closed` does; see "Reaping closed channels here" above.
+    wait_for_others(
+        "closed channels' reaping",
+        || {
+            crate::ipc::reap_closed();
+            crate::ipc::closed_pending() == 0
+        },
+        tsc_hz,
+        2000,
+    );
     let counts = origin_frame::stack::counts();
     let exits = exits_pending();
     crate::settled::judge(
         exits.ending,
         exits.zombies,
         counts.retired,
+        crate::ipc::closed_pending(),
         lost_before,
         counts.lost,
     )
