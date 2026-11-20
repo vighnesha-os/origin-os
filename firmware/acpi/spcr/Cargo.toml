@@ -1,0 +1,10 @@
+[package]
+name = "origin-spcr"
+description = "Origin OS: the ACPI SPCR table, parsed and checked as untrusted input, for the UEFI loader and the Framekernel (ADR-0010 E4 and Amendment 3; TASKS item 84)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

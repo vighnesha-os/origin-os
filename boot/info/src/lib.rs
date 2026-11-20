@@ -266,6 +266,116 @@ impl Framebuffer {
     }
 }
 
+/// The UART the firmware's SPCR names, when the loader found one the kernel can write to from
+/// its first line: a 16550-compatible UART in I/O space (boot info 0.8; ADR-0010 Amendment 3;
+/// decision item 317; TASKS item 84). `port` is 0 when there is none. The loader translates the
+/// table into this, so no ACPI structure crosses into boot info, and both it and the kernel run
+/// [`EarlyUart::check`] before trusting it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct EarlyUart {
+    /// I/O port base of the UART's eight registers, or 0: none.
+    pub port: u16,
+    /// The SPCR's interface type (0x00, 0x01, 0x12 or 0x14), for the kernel's lines.
+    pub interface: u8,
+    /// Bit 0 ([`EARLY_UART_BAUD`]): `baud` is the rate the table states. Bit 1
+    /// ([`EARLY_UART_CLOCK`]): `clock_hz` is the clock it states. Every other bit is 0.
+    pub flags: u8,
+    /// The rate the table states, in bits per second, or 0 (bit 0 clear): leave it as the
+    /// firmware set it.
+    pub baud: u32,
+    /// The UART's input clock the table states, in Hz, or 0 (bit 1 clear).
+    pub clock_hz: u32,
+    /// 0.
+    pub reserved: u32,
+}
+
+/// [`EarlyUart::flags`]: the table states a rate.
+pub const EARLY_UART_BAUD: u8 = 1;
+/// [`EarlyUart::flags`]: the table states the UART's clock.
+pub const EARLY_UART_CLOCK: u8 = 2;
+
+/// Why an [`EarlyUart`] is not used. None of these stops a boot (ADR-0010 E5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EarlyUartError {
+    /// `port` is 0 but another field is not: not the structure for "none".
+    NotNone,
+    /// A port outside the blocks the SPCR's parser allows: the four standard COM blocks, or a
+    /// whole block at or above `0x1000` (`origin_spcr::port_block_allowed`).
+    Port(u16),
+    /// An interface type the parser does not accept for a 16550.
+    Interface(u8),
+    /// A flag bit other than [`EARLY_UART_BAUD`] and [`EARLY_UART_CLOCK`], `reserved` not 0, or
+    /// a rate or clock that is not stated exactly when its flag says it is.
+    Fields,
+}
+
+impl EarlyUart {
+    /// No UART.
+    pub const NONE: Self = Self {
+        port: 0,
+        interface: 0,
+        flags: 0,
+        baud: 0,
+        clock_hz: 0,
+        reserved: 0,
+    };
+
+    /// Whether the loader named a UART.
+    pub const fn is_present(&self) -> bool {
+        self.port != 0
+    }
+
+    /// Checks the structure against the contract (TASKS item 84): [`EarlyUart::NONE`], or a port
+    /// in a block the SPCR's parser allows, a 16550 interface type, only the two known flags,
+    /// a non-zero rate exactly when [`EARLY_UART_BAUD`] is set and a non-zero clock exactly when
+    /// [`EARLY_UART_CLOCK`] is, and `reserved` 0. Run by the loader before it hands the
+    /// structure over, and by the kernel before it writes to the UART.
+    pub fn check(&self) -> Result<(), EarlyUartError> {
+        if !self.is_present() {
+            return if *self == Self::NONE {
+                Ok(())
+            } else {
+                Err(EarlyUartError::NotNone)
+            };
+        }
+        if !origin_spcr::port_block_allowed(self.port) {
+            return Err(EarlyUartError::Port(self.port));
+        }
+        if !origin_spcr::is_16550(self.interface) {
+            return Err(EarlyUartError::Interface(self.interface));
+        }
+        let baud_stated = self.flags & EARLY_UART_BAUD != 0;
+        let clock_stated = self.flags & EARLY_UART_CLOCK != 0;
+        if self.flags & !(EARLY_UART_BAUD | EARLY_UART_CLOCK) != 0
+            || self.reserved != 0
+            || baud_stated != (self.baud != 0)
+            || clock_stated != (self.clock_hz != 0)
+        {
+            return Err(EarlyUartError::Fields);
+        }
+        Ok(())
+    }
+
+    /// The rate the table states, if it states one.
+    pub const fn stated_baud(&self) -> Option<u32> {
+        if self.flags & EARLY_UART_BAUD != 0 {
+            Some(self.baud)
+        } else {
+            None
+        }
+    }
+
+    /// The clock the table states, if it states one.
+    pub const fn stated_clock(&self) -> Option<u32> {
+        if self.flags & EARLY_UART_CLOCK != 0 {
+            Some(self.clock_hz)
+        } else {
+            None
+        }
+    }
+}
+
 /// Whether `[base, base + bytes)` touches a region that holds memory rather than device
 /// space: everything except [`RegionKind::Mmio`], [`RegionKind::Reserved`],
 /// [`RegionKind::FirmwareOther`] and unknown kinds, which the contract treats as reserved.
@@ -346,6 +456,9 @@ pub struct BootInfo {
     /// The kernel takes each once and overwrites the whole area where it lies. Neither side
     /// prints any of it: this field is the area's address and nothing of its contents.
     pub boot_seed: u64,
+    /// The I/O-port UART the firmware's SPCR names, which the kernel writes to from its first
+    /// line, or [`EarlyUart::NONE`] (0.8; ADR-0010 Amendment 3, decision item 317).
+    pub early_uart: EarlyUart,
 }
 
 /// The seed for the kernel's generator: the first bytes of the area [`BootInfo::boot_seed`]
@@ -416,7 +529,15 @@ const _: () = {
     assert!(offset_of!(BootInfo, kernel_virtual_base) == 112);
     assert!(offset_of!(BootInfo, flags) == 120);
     assert!(offset_of!(BootInfo, boot_seed) == 176);
-    assert!(size_of::<BootInfo>() == 184);
+    assert!(offset_of!(BootInfo, early_uart) == 184);
+    assert!(offset_of!(EarlyUart, port) == 0);
+    assert!(offset_of!(EarlyUart, interface) == 2);
+    assert!(offset_of!(EarlyUart, flags) == 3);
+    assert!(offset_of!(EarlyUart, baud) == 4);
+    assert!(offset_of!(EarlyUart, clock_hz) == 8);
+    assert!(offset_of!(EarlyUart, reserved) == 12);
+    assert!(size_of::<EarlyUart>() == 16);
+    assert!(size_of::<BootInfo>() == 200);
     assert!(size_of::<KernelSegment>() == 24);
 };
 
@@ -528,6 +649,7 @@ mod tests {
             flags: FLAG_KASLR,
             framebuffer: Framebuffer::NONE,
             boot_seed: 0,
+            early_uart: EarlyUart::NONE,
         }
     }
 
@@ -665,12 +787,12 @@ mod tests {
 
     #[test]
     fn version_comes_from_origin_version_toml() {
-        assert_eq!(VERSION, (0, 7));
+        assert_eq!(VERSION, (0, 8));
     }
 
     #[test]
     fn a_boot_seed_is_taken_only_from_inside_the_boot_info_region() {
-        // The header at 0x8000, 184 bytes; three regions at 0x8100; one segment at 0x8200; the
+        // The header at 0x8000, 200 bytes; three regions at 0x8110; one segment at 0x8200; the
         // boot-info region is the two pages from 0x8000.
         let region = |base, pages, kind: RegionKind| MemoryRegion {
             base,
@@ -684,7 +806,7 @@ mod tests {
             region(0xA000, 16, RegionKind::KernelStack),
         ];
         let mut info = sample();
-        info.regions = 0x8100;
+        info.regions = 0x8110;
         info.region_count = 3;
         info.kernel_segments = 0x8200;
         info.kernel_segment_count = 1;
@@ -718,19 +840,19 @@ mod tests {
         );
         // Clear of the header, the region array and the segment array.
         assert_eq!(at(0x8000), None, "on the header");
-        assert_eq!(at(0x80B7), None, "the header's last byte");
+        assert_eq!(at(0x80C7), None, "the header's last byte");
         assert_eq!(
-            at(0x80B8),
-            Some(0x80B8),
+            at(0x80C8),
+            Some(0x80C8),
             "right after the header, up to the region array"
         );
         assert_eq!(
-            at(0x80B9),
+            at(0x80C9),
             None,
             "its last byte is the region array's first"
         );
-        assert_eq!(at(0x8100 + 71), None, "the region array's last byte");
-        assert_eq!(at(0x8100 + 72), Some(0x8148));
+        assert_eq!(at(0x8110 + 71), None, "the region array's last byte");
+        assert_eq!(at(0x8110 + 72), Some(0x8158));
         assert_eq!(at(0x8200 - 72), Some(0x81B8), "up to the segment array");
         assert_eq!(
             at(0x8200 - 71),
@@ -749,6 +871,169 @@ mod tests {
         others[1].kind = RegionKind::LoaderReclaimable as u32;
         info.boot_seed = 0x9000;
         assert_eq!(boot_seed(&info, 0x8000, &others), None);
+    }
+
+    /// TASKS item 84's control R84-5: a kernel of boot info 0.8 refuses a loader of 0.7, whose
+    /// header is 16 bytes shorter and has no `early_uart`.
+    #[test]
+    fn boot_info_0_7_is_refused() {
+        let mut b = sample();
+        b.version_minor = 7;
+        assert_eq!(b.check(), Err(BootInfoError::Version(0, 7)));
+        let mut b = sample();
+        b.size = 184;
+        assert_eq!(b.check(), Err(BootInfoError::TooSmall(184)));
+    }
+
+    /// The SPCR's UART as the loader hands it (TASKS item 84): every field is checked, and only
+    /// a port the SPCR's parser allows is ever named. Control R84-3 is the keyboard controller's
+    /// port 0x60 accepted.
+    #[test]
+    fn an_early_uart_is_checked_field_by_field() {
+        use EarlyUartError as E;
+        let com2 = EarlyUart {
+            port: 0x2F8,
+            interface: 0,
+            flags: 0,
+            baud: 0,
+            clock_hz: 0,
+            reserved: 0,
+        };
+        let stated = EarlyUart {
+            flags: EARLY_UART_BAUD | EARLY_UART_CLOCK,
+            baud: 115_200,
+            clock_hz: 1_843_200,
+            ..com2
+        };
+        for good in [
+            EarlyUart::NONE,
+            com2,
+            stated,
+            EarlyUart {
+                port: 0x3F8,
+                ..com2
+            },
+            EarlyUart {
+                port: 0x3E8,
+                ..com2
+            },
+            EarlyUart {
+                port: 0x2E8,
+                ..com2
+            },
+            EarlyUart {
+                port: 0x1000,
+                interface: 0x12,
+                ..com2
+            },
+            EarlyUart {
+                port: 0xFFF8,
+                interface: 0x14,
+                ..com2
+            },
+            EarlyUart {
+                flags: EARLY_UART_BAUD,
+                baud: 9_600,
+                ..com2
+            },
+            EarlyUart {
+                flags: EARLY_UART_CLOCK,
+                clock_hz: 48_000_000,
+                ..com2
+            },
+        ] {
+            assert_eq!(good.check(), Ok(()), "{good:?}");
+        }
+        assert!(!EarlyUart::NONE.is_present());
+        assert!(com2.is_present());
+        assert_eq!((com2.stated_baud(), com2.stated_clock()), (None, None));
+        assert_eq!(
+            (stated.stated_baud(), stated.stated_clock()),
+            (Some(115_200), Some(1_843_200))
+        );
+        let cases: [(EarlyUart, EarlyUartError); 14] = [
+            // The keyboard controller, the PIT and the CMOS clock: never a UART block.
+            (EarlyUart { port: 0x60, ..com2 }, E::Port(0x60)),
+            (EarlyUart { port: 0x40, ..com2 }, E::Port(0x40)),
+            (EarlyUart { port: 0x70, ..com2 }, E::Port(0x70)),
+            // Inside a COM block but not its base, and a block that wraps the port space.
+            (
+                EarlyUart {
+                    port: 0x2F9,
+                    ..com2
+                },
+                E::Port(0x2F9),
+            ),
+            (
+                EarlyUart {
+                    port: 0xFFF9,
+                    ..com2
+                },
+                E::Port(0xFFF9),
+            ),
+            (
+                EarlyUart {
+                    interface: 3,
+                    ..com2
+                },
+                E::Interface(3),
+            ),
+            (
+                EarlyUart {
+                    interface: 0x10,
+                    ..com2
+                },
+                E::Interface(0x10),
+            ),
+            (EarlyUart { flags: 4, ..com2 }, E::Fields),
+            (
+                EarlyUart {
+                    flags: EARLY_UART_BAUD,
+                    ..com2
+                },
+                E::Fields,
+            ),
+            (
+                EarlyUart {
+                    baud: 115_200,
+                    ..com2
+                },
+                E::Fields,
+            ),
+            (
+                EarlyUart {
+                    flags: EARLY_UART_CLOCK,
+                    ..com2
+                },
+                E::Fields,
+            ),
+            (
+                EarlyUart {
+                    clock_hz: 1_843_200,
+                    ..com2
+                },
+                E::Fields,
+            ),
+            (
+                EarlyUart {
+                    reserved: 1,
+                    ..com2
+                },
+                E::Fields,
+            ),
+            // Port 0 with anything else set is not the structure for "none".
+            (
+                EarlyUart {
+                    port: 0,
+                    interface: 1,
+                    ..com2
+                },
+                E::NotNone,
+            ),
+        ];
+        for (uart, error) in cases {
+            assert_eq!(uart.check(), Err(error), "{uart:?}");
+        }
     }
 
     #[test]

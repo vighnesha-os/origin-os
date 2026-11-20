@@ -68,9 +68,13 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         data.segments(),
         data.summary(),
     );
-    // The firmware's framebuffer, drawn on from here on (ADR-0010). The earlier lines of a
-    // boot this far can only have been a report of an invalid boot info, on the UART.
+    // The UART the loader named from the SPCR, written to beside COM1 from here on (ADR-0010
+    // Amendment 3, decision item 317; TASKS item 84), and the firmware's framebuffer, drawn on
+    // from here on (ADR-0010): the framebuffer's line is the first on both. The earlier lines of
+    // a boot this far can only have been a report of an invalid boot info, on COM1.
+    let loader_uart = console::attach_loader_uart(&info);
     console::attach_framebuffer(&mut com1, &info, regions);
+    let _ = writeln!(com1, "origin-kernel: console: {loader_uart}");
     let _ = report::write_report(&mut com1, &info, &memory);
     for (i, s) in segments.iter().enumerate() {
         let access = match (
