@@ -183,19 +183,34 @@ class Guards(unittest.TestCase):
         self.assertIn("cannot tell the launch year", self.lat.scope_verdict(zen5))
         self.assertIn("a 2026 generation", self.lat.scope_verdict(ptl))
 
+    # Commits on `main`: the old `main` the tool was first written on, before identity maps, and
+    # pull request 45's merge, after them.
+    BEFORE_IDENTITY_MAPS = "405495c0c27cb34180edca526335d4161bf9cce5"
+    AFTER_IDENTITY_MAPS = "ea2293caea775206ab219c7cf25b1b8c40a3d20f"
+
     def test_identity_maps_must_be_in_the_image(self):
-        self.assertTrue(self.lat.is_ancestor("7113b48", "11bb986"))
-        self.assertFalse(self.lat.is_ancestor("11bb986", "7113b48"))
+        # Item 229 names TASKS item 40's commit, which reached `main` with pull request 27.
+        self.assertEqual(self.lat.IDENTITY_MAPS_COMMIT, "b2a67f982ab9820757887712f01de4f91b9bc54f")
+        self.assertTrue(self.lat.is_ancestor(self.lat.IDENTITY_MAPS_COMMIT, self.AFTER_IDENTITY_MAPS))
+        self.assertFalse(self.lat.is_ancestor(self.lat.IDENTITY_MAPS_COMMIT, self.BEFORE_IDENTITY_MAPS))
         image = self.home / "image"
         image.mkdir()
         (image / "BOOTX64.EFI").write_bytes(b"loader")
         (image / "KERNEL.ONBF").write_bytes(b"kernel")
         args = mock.Mock(plan="m4-metal-small", max_minutes=50, image_dir=str(image),
-                         source_revision="7113b48", identity_maps_commit="11bb986", yes=False)
+                         source_revision=self.BEFORE_IDENTITY_MAPS, yes=False)
         with mock.patch.object(self.lat, "project_id") as project:
             with self.assertRaises(SystemExit):
                 self.lat.cmd_rental_b(args)
             project.assert_not_called()  # refused before any request
+
+    def test_the_identity_maps_commit_is_not_an_option(self):
+        with mock.patch.object(sys, "argv", ["latitude.py", "rental-b", "--image-dir", "d",
+                                             "--source-revision", "c", "--identity-maps-commit", "x"]), \
+                mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as stop:
+                self.lat.main()
+        self.assertEqual(stop.exception.code, 2)  # argparse refuses an unknown option
 
     def test_redact_and_clean(self):
         text = "Connection to 192.0.2.10 closed\nserver sv_test0000000000 at 198.51.100.20\n"

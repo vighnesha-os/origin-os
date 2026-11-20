@@ -34,9 +34,10 @@ are the board maker's data and carry serial numbers and addresses.
 Commands:
   preflight                  read-only: projects, prices and stock per site, servers, keys
   rental-a [--yes]           rental A: deploy Ubuntu, read the machine, delete it
-  rental-b --image-dir D --source-revision C --identity-maps-commit M [--yes]
+  rental-b --image-dir D --source-revision C [--yes]
                              rental B: put Origin's loader where the firmware's first boot
-                             entry points, boot it, capture each boot's verdict, delete it
+                             entry points, boot it, capture each boot's verdict, delete it.
+                             C must contain IDENTITY_MAPS_COMMIT (item 229)
   status                     the bench servers that exist now, and the ledger
   delete SERVER_ID           delete one server
   reap [--yes]               delete every server whose hostname starts with origin-bench-
@@ -842,6 +843,10 @@ LOADER_LINE = "origin-boot:"
 VERDICT_LINE = "origin-kernel: boot verdict:"
 REFUSED_LINE = "origin-kernel: boot refused"
 REPO = Path(__file__).resolve().parents[2]
+# Item 229: Origin boots on real hardware only once identity maps for firmware-reserved memory
+# have landed. They landed with TASKS item 40, cleared at this commit and merged into `main` with
+# pull request 27. Fixed here, not taken from the command line, so a run cannot name another.
+IDENTITY_MAPS_COMMIT = "b2a67f982ab9820757887712f01de4f91b9bc54f"
 # A firmware boot entry's file, as the tool will accept it: on the ESP, under \EFI, a .efi name.
 ENTRY_FILE = re.compile(r"^\\EFI\\[A-Za-z0-9_.\-]+(\\[A-Za-z0-9_.\-]+)*\.efi$", re.IGNORECASE)
 
@@ -928,11 +933,11 @@ def cmd_rental_b(args):
             if not f.is_file():
                 die(f"{f} is missing: build with `cargo xtask build` and copy the loader as BOOTX64.EFI")
         # Item 229: Origin boots on real hardware only once identity maps have landed.
-        if not is_ancestor(args.identity_maps_commit, args.source_revision):
-            die(f"{args.identity_maps_commit} (identity maps) is not in the history of "
-                f"{args.source_revision}: item 229 forbids this boot")
+        if not is_ancestor(IDENTITY_MAPS_COMMIT, args.source_revision):
+            die(f"{IDENTITY_MAPS_COMMIT[:12]} (identity maps, TASKS item 40) is not in the history "
+                f"of {args.source_revision}: item 229 forbids this boot")
         print(f"image: {args.source_revision}; loader SHA-256 {sha256(loader)}; "
-              f"kernel SHA-256 {sha256(kernel)}; identity maps {args.identity_maps_commit} included")
+              f"kernel SHA-256 {sha256(kernel)}; identity maps {IDENTITY_MAPS_COMMIT[:12]} included")
 
     def work(rental):
         read_machine(rental)
@@ -1065,8 +1070,6 @@ def main():
             p.add_argument("--image-dir", required=True,
                            help="holds BOOTX64.EFI (the developer-mode loader) and KERNEL.ONBF")
             p.add_argument("--source-revision", required=True, help="the commit the image was built from")
-            p.add_argument("--identity-maps-commit", required=True,
-                           help="the commit that landed identity maps (item 229)")
             p.add_argument("--boots", type=int, default=3, choices=range(1, 6))
             p.add_argument("--boot-minutes", type=int, default=8, help="how long one boot may take")
     p = sub.add_parser("watchdog")
