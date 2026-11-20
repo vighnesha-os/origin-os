@@ -372,6 +372,84 @@ class Guards(unittest.TestCase):
         self.assertNotIn("by hand", row)
         self.assertIn("by hand", self.lat.scope_row(["origin-kernel: Origin OS"], lscpu))
 
+    def run_rental_b(self, api, console_text):
+        """Runs rental B's work against a pretend machine: no request, no SSH, no copy."""
+        image = self.home / "image"
+        image.mkdir()
+        loader, kernel = self.images()
+        (image / "BOOTX64.EFI").write_bytes(bytes(loader))
+        (image / "KERNEL.ONBF").write_bytes(bytes(kernel))
+        d = self.home / "rental"
+        d.mkdir()
+
+        def read_machine(rental):
+            dump = d / "dump"
+            dump.mkdir()
+            (dump / "boot-mode.txt").write_text("uefi 64\n")
+            (dump / "secure-boot.txt").write_text(" 6 0 0 0 0\n")
+            (dump / "efibootmgr.txt").write_text(self.OLD_STYLE)
+            (dump / "lscpu.txt").write_text("Vendor ID: AuthenticAMD\nCPU family: 25\nModel: 97\n")
+
+        sums = f"{self.lat.sha256(image / 'BOOTX64.EFI')} a {self.lat.sha256(image / 'KERNEL.ONBF')} b"
+        replies = {"findmnt": '{"filesystems": [{"source": "/dev/x1", "target": "/boot/efi", "fstype": "vfat"}]}',
+                   "blkid": self.PARTUUID, "sha256sum": sums}
+
+        def ssh(command, **kwargs):
+            out = next((v for k, v in replies.items() if k in command), "")
+            return mock.Mock(stdout=out, returncode=0)
+
+        console = mock.Mock()
+        sizes = iter(range(0, 10_000, 100))
+        console.size.side_effect = lambda: next(sizes)
+        console.text.side_effect = console_text
+        rental = self.lat.Rental("sv_x", "192.0.2.3", d, self.lat.now() + 3000, "key", console)
+        rental.ssh = ssh
+        args = mock.Mock(plan="m4-metal-small", max_minutes=50, image_dir=str(image), boots=3,
+                         boot_minutes=8, source_revision=self.AFTER_IDENTITY_MAPS, yes=True)
+
+        def rent(args, kind, work, check=None):
+            check()
+            work(rental)
+
+        real_run = self.lat.subprocess.run
+
+        def run(command, **kwargs):  # git reads this repository; scp copies nothing
+            if command[0] == "git":
+                return real_run(command, **kwargs)
+            self.assertEqual(command[0], "scp")
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(self.lat, "rent", rent), \
+                mock.patch.object(self.lat, "read_machine", read_machine), \
+                mock.patch.object(self.lat, "api", api), \
+                mock.patch.object(self.lat.subprocess, "run", side_effect=run), \
+                mock.patch.object(self.lat.time, "sleep"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.lat.cmd_rental_b(args)
+        return d
+
+    def test_a_refused_power_action_keeps_the_first_boots_record(self):
+        def api(method, path, body=None, ok=None):
+            raise self.lat.ApiError(422, f"{method} {path}: HTTP 422: busy")
+
+        verdict = lambda start=0: "origin-kernel: boot verdict: degraded: 60 of 71 proofs passed\n"
+        with self.assertRaises(self.lat.ApiError):
+            self.run_rental_b(api, verdict)
+        d = self.home / "rental"
+        record = (d / "record-draft.md").read_text()
+        self.assertIn("boot 1: origin-kernel: boot verdict: degraded: 60 of 71 proofs passed", record)
+        self.assertEqual(len(json.loads((d / "boots.json").read_text())), 1)
+
+    def test_three_boots_when_each_ends_in_a_verdict(self):
+        posts = []
+        api = lambda method, path, body=None, ok=None: posts.append((method, path, body)) or {}
+        verdict = lambda start=0: "origin-kernel: boot verdict: 71 of 71 proofs passed\n"
+        d = self.run_rental_b(api, verdict)
+        self.assertEqual([(m, p) for m, p, _ in posts], [("POST", "/servers/sv_x/actions")] * 2)
+        self.assertEqual(posts[0][2]["data"]["attributes"]["action"], "reboot")
+        self.assertEqual(len(json.loads((d / "boots.json").read_text())), 3)
+        self.assertIn("boot 3: origin-kernel: boot verdict: 71 of 71", (d / "record-draft.md").read_text())
+
     def test_two_writers_lose_nothing(self):
         self.lat.add_rental({"server_id": "sv", "usd_per_hour": 0.41, "deployed_at": 1.0, "deadline": 2.0})
         context = multiprocessing.get_context("spawn")

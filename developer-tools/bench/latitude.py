@@ -1045,26 +1045,33 @@ def cmd_rental_b(args):
         if not console:
             raise RuntimeError("no serial console: a boot would show nothing")
         results = []
-        for boot in range(1, args.boots + 1):
-            start = console.size()
-            if boot == 1:
-                rental.ssh("sudo -n systemctl reboot", timeout=60)
-            else:
-                api("POST", f"/servers/{rental.server_id}/actions",
-                    {"data": {"type": "actions", "attributes": {"action": "reboot"}}})
-            print(f"{stamp()} boot {boot} of {args.boots}: restarting")
-            limit = min(now() + args.boot_minutes * 60, rental.deadline - 300)
-            result = boot_result(console.text(start))
-            while not result["ended"] and now() < limit:
-                time.sleep(10)
+        try:
+            for boot in range(1, args.boots + 1):
+                start = console.size()
+                if boot == 1:
+                    rental.ssh("sudo -n systemctl reboot", timeout=60)
+                else:
+                    api("POST", f"/servers/{rental.server_id}/actions",
+                        {"data": {"type": "actions", "attributes": {"action": "reboot"}}})
+                print(f"{stamp()} boot {boot} of {args.boots}: restarting")
+                limit = min(now() + args.boot_minutes * 60, rental.deadline - 300)
                 result = boot_result(console.text(start))
-            result.update(boot=boot, start=start, end=console.size())
-            results.append(result)
-            print(f"{stamp()} boot {boot}: {result['summary']}")
-            (rental.dir / "boots.json").write_text(json.dumps(results, indent=2))
-            if last_boot(result) or now() > rental.deadline - 600:
-                break
-        write_record(args, rental, results)
+                while not result["ended"] and now() < limit:
+                    time.sleep(10)
+                    result = boot_result(console.text(start))
+                result.update(boot=boot, start=start, end=console.size())
+                results.append(result)
+                print(f"{stamp()} boot {boot}: {result['summary']}")
+                (rental.dir / "boots.json").write_text(json.dumps(results, indent=2))
+                if last_boot(result) or now() > rental.deadline - 600:
+                    break
+        finally:
+            # The boots that ran are evidence even if a later one could not start (a refused
+            # power action, say). The error, if any, still ends the rental.
+            try:
+                write_record(args, rental, results)
+            except Exception as e:
+                print(f"{stamp()} the record draft could not be written: {e!r}", file=sys.stderr)
 
     rent(args, "b", work, check)
 
