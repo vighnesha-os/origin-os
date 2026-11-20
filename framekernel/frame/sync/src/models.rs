@@ -1709,7 +1709,10 @@ fn threads_a_wake_racing_an_exit_follows_nothing() {
 /// What a switch must find in the incoming thread's record.
 const NOT_RESTORED: &str = "a switch restored other than what the thread's last switch-out saved";
 
-/// A processor's timer switches twice between two threads, as `sched::with_queue` does (a copy):
+/// A processor's timer switches twice between two threads, as `sched::with_queue` does (a copy,
+/// which looks each record up by the number its slot holds, where the kernel's slot holds the
+/// number and the record resolved together at spawn, `threads::Placed`; that the two halves of
+/// a `Placed` agree is not modelled: `take` alone makes one, the review of TASKS item 92, R92-16):
 /// under its queue's lock, the outgoing thread's state is saved in its record, then the incoming
 /// one's read from its own, each record's lock released before the next is taken (the lock order
 /// of `threads.rs`). Meanwhile another processor reads the first thread's state under that

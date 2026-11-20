@@ -8,7 +8,8 @@
 //! saved frame to resume. Slot 0 is the context that was running when the queue started
 //! (the CPU's boot flow or idle loop); it can never sleep or exit, so there is always
 //! something to run. Time is counted in this CPU's timer ticks. This is policy only: plain
-//! integers, no `unsafe`, tested on the host. Priorities, fairness accounting and load
+//! integers, and whatever the caller keeps of each slot's thread record (`RunQueue<R>`), no
+//! `unsafe`, tested on the host. Priorities, fairness accounting and load
 //! balancing come later (an EEVDF-style design is to be evaluated, §26).
 //!
 //! Choosing the next context is stride scheduling (C. A. Waldspurger and W. E. Weihl,

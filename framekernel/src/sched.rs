@@ -113,7 +113,8 @@ pub(crate) fn init_cpu_fpu(cpu: CpuIndex) {
 /// resolved when the thread was placed ([`Placed`]); or nothing any more, a thread that has just
 /// exited, whose slot names no record (its state stays in its record, a zombie's, until its reap,
 /// or, when no zombie could be kept, was dropped and its record given back at once; the review of
-/// TASKS item 92, R92-14).
+/// TASKS item 92, R92-14). A non-zero slot that holds no record is `Exited` too, which the kernel
+/// never makes: `follow_thread` counts it in `UNREADY_SWITCHES` (R92-18).
 #[derive(Clone, Copy)]
 enum Running {
     Flow,
@@ -126,7 +127,7 @@ enum Running {
 fn running(q: &RunQueue<Placed>, slot: usize) -> Running {
     match (slot, q.record(slot)) {
         (0, _) => Running::Flow,
-        (_, Some(placed)) => Running::Thread(placed.record),
+        (_, Some(placed)) => Running::Thread(placed.record()),
         (_, None) => Running::Exited,
     }
 }
@@ -227,7 +228,7 @@ pub(crate) fn end_with<R>(publish: impl FnOnce() -> R) -> R {
             let q = queue.lock();
             q.record(q.current())
         }?
-        .record;
+        .record();
         let counted = record.state().lock().ending.is_some();
         (!counted).then_some(record)
     });
@@ -631,8 +632,8 @@ pub(crate) fn current_thread() -> Option<ThreadRef> {
         // Read under the queue's lock, as `origin_sync::threads::Record::generation` asks.
         let placed = q.record(q.current())?;
         Some(ThreadRef {
-            record: placed.number,
-            generation: placed.record.generation(),
+            record: placed.number(),
+            generation: placed.record().generation(),
         })
     })
 }
@@ -727,7 +728,8 @@ pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
     let next = with_queue(interrupted, switch, |q| {
         let placed = q.record(q.current());
         let next = q.exit(interrupted).ok()?;
-        if let (Some(table), Some(Placed { number, record })) = (threads::table(id), placed) {
+        if let (Some(table), Some(placed)) = (threads::table(id), placed) {
+            let (number, record) = (placed.number(), placed.record());
             let mut t = table.lock();
             let mut state = record.state().lock();
             // In the critical section that freed its slot: from here no wake-up finds it
@@ -803,7 +805,7 @@ pub(crate) fn current_user() -> Option<ObjectRef<UserContext>> {
             let q = queue.lock();
             q.record(q.current())
         };
-        placed?.record.state().lock().user.clone()
+        placed?.record().state().lock().user.clone()
     })
 }
 
@@ -931,11 +933,11 @@ fn spawn_with_parts(
         let slot = match queue.push_weighted(frame_at, weight, Some(placed)) {
             Ok(slot) => slot,
             Err(refused) => {
-                threads::give_back(placed.number);
+                threads::give_back(placed.number());
                 return Err(refused);
             }
         };
-        let record = placed.record;
+        let record = placed.record();
         // A slot fits a location (`threads`'s assertion): neither `if` below can fail (the review
         // of TASKS item 92, R92-5).
         if let Some((stack, fpu_area, user)) = parts.take() {

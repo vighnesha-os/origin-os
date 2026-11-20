@@ -124,12 +124,28 @@ pub(crate) fn table(cpu: usize) -> Option<&'static SpinLock<Table>> {
 /// placed in the queue, so that a switch reaches the thread's state without a lookup (TASKS item
 /// 92; the coordinating session's second ruling on its Q6). A record is never moved or freed, so
 /// the reference stays good wherever the thread runs.
+///
+/// It holds the record's identity twice, so only [`take`] makes one, from one index of one block,
+/// and its fields are read through [`Placed::number`] and [`Placed::record`] alone: a move (ADR-0020
+/// S6) carries the value its slot holds, and builds none (the review of TASKS item 92, R92-15).
 #[derive(Clone, Copy)]
 pub(crate) struct Placed {
-    /// The record's number.
-    pub(crate) number: u32,
-    /// The record.
-    pub(crate) record: &'static Record<State>,
+    number: u32,
+    record: &'static Record<State>,
+}
+
+impl Placed {
+    /// The record's number: the thread's name, its zombie entry and its give-back.
+    #[inline]
+    pub(crate) const fn number(self) -> u32 {
+        self.number
+    }
+
+    /// The record: the thread's state, location and generation.
+    #[inline]
+    pub(crate) const fn record(self) -> &'static Record<State> {
+        self.record
+    }
 }
 
 /// Record `number`, if there is one.
@@ -138,9 +154,9 @@ pub(crate) fn record(number: u32) -> Option<&'static Record<State>> {
     THREADS.get(block)?.records.get(index)
 }
 
-/// A record for a new thread on processor `cpu`, from that processor's block, with its new
-/// generation, resolved for its run-queue slot ([`Placed`]). `None` if the block holds no free
-/// record.
+/// A record for a new thread on processor `cpu`, from that processor's block, given its next
+/// generation (`Block::take`), and resolved for its run-queue slot ([`Placed`]). `None` if the
+/// block holds no free record (the review's R92-18).
 pub(crate) fn take(cpu: CpuIndex) -> Option<Placed> {
     let block = &THREADS.get(cpu.get())?.records;
     let (index, _) = block.take()?;
@@ -148,7 +164,8 @@ pub(crate) fn take(cpu: CpuIndex) -> Option<Placed> {
         .zip(block.get(index))
         .map(|(number, record)| Placed { number, record });
     if placed.is_none() {
-        // A processor index past what a `u32` numbers: the record goes back unused.
+        // A processor index past what a `u32` numbers (the record itself is always there): the
+        // record goes back unused.
         give_back_index(block, index);
     }
     placed
