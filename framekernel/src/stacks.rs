@@ -13,8 +13,11 @@
 //!   fault, and the slot is free again, which it is only once the frames have been released.
 //! - **A thread's own stack stays in use through its switches** (TASKS item 70; the review of
 //!   TASKS item 68, T68-2). A thread on another processor is held in the window of its own
-//!   switch-out, after the scheduler has moved that processor's kernel-stack record and before
-//!   the trap entry saves its frame. It is held again in the window of its exit, when its stack
+//!   switch-out, after the scheduler has decided the switch and before the trap entry saves its
+//!   frame. (Until TASKS item 77 the scheduler had moved that processor's kernel-stack record
+//!   there; since then the trap entry moves it only after the frame is saved, so the window holds
+//!   the thread's frame unsaved and its stack named by neither the frame nor the record, its home
+//!   alone covering it.) It is held again in the window of its exit, when its stack
 //!   has become a zombie. Each time the boot flow asks the framework whether the stack is in use,
 //!   as a stack's drop would decide, and the answer must be yes. Once the thread has ended and
 //!   its processor has reaped it, that drop must have given the stack back, not leaked it.
@@ -523,8 +526,8 @@ extern "sysv64" fn windowed(_: u64) -> ! {
 }
 
 /// Called by the scheduler's sleep and exit hooks once the switch is decided (`sched::on_sleep`,
-/// `sched::on_exit`): the processor's kernel-stack record has moved, and the trap entry has not
-/// yet saved the outgoing frame `here`. If the switch is away from the held thread's stack and the
+/// `sched::on_exit`): the trap entry has not yet saved the outgoing frame `here`, nor moved the
+/// processor's kernel-stack record (TASKS item 77). If the switch is away from the held thread's stack and the
 /// boot flow is spinning for it (`GO`), this processor waits here, with interrupts off, until the
 /// boot flow has asked about that stack, for at most [`HOLD_MILLIS`]. Otherwise it costs a relaxed
 /// load.
@@ -687,7 +690,7 @@ fn switch_windows(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: 
         && !gave_up;
     let _ = writeln!(
         com1,
-        "origin-kernel: kernel stacks: a thread's own stack, asked about from {} while {} switched it out (that processor's kernel-stack record moved, the thread's frame not yet saved): in use: {} (held {} us); while it ended: in use: {} (held {} us); given back by its processor's reap, not leaked: {given_back} ({how}); the boot flow waited {} and {} us for the thread to be ready, then {} and {} us for its processor to be held{}{}",
+        "origin-kernel: kernel stacks: a thread's own stack, asked about from {} while {} switched it out (its switch decided, the thread's frame not yet saved): in use: {} (held {} us); while it ended: in use: {} (held {} us); given back by its processor's reap, not leaked: {given_back} ({how}); the boot flow waited {} and {} us for the thread to be ready, then {} and {} us for its processor to be held{}{}",
         bsp.named(),
         cpu.named(),
         switched_out.asked,

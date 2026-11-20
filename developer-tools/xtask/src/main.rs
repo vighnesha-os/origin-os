@@ -3217,7 +3217,7 @@ fn stack_markers(machine: &Machine) -> Vec<String> {
     let windows = if cpus > 1 {
         vec![
             format!(
-                "origin-kernel: kernel stacks: a thread's own stack, asked about from {} while {reader} switched it out (that processor's kernel-stack record moved, the thread's frame not yet saved): in use: true (held ",
+                "origin-kernel: kernel stacks: a thread's own stack, asked about from {} while {reader} switched it out (its switch decided, the thread's frame not yet saved): in use: true (held ",
                 machine.named(0)
             ),
             " us); while it ended: in use: true (held ".into(),
