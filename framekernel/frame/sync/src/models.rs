@@ -35,6 +35,14 @@
 //! the ended stack, on its way out of the trap entry. Two threads that both retire stand for the
 //! same processor in thread context and in an interrupt, which only over-approximates it.
 //!
+//! A processor's exit counts (`exits.rs`, TASKS item 79, which `sched` instantiates per processor)
+//! are real too. What stands in for the kernel there: a Release store of a flag is a thread's end
+//! being published (its `TERMINATED`, its process's `ending`, or a kernel worker's done-flag); a
+//! Loom cell is what the thread holds until its reap (its stack, FPU area and address space); and
+//! one Loom thread running the end, the exit's queueing and the reap in order stands for the
+//! thread and, after it, its processor's exit and reaper, which on the machine follow it on the
+//! same processor.
+//!
 //! Copies, written by hand here, standing in for kernel code; nothing compares them with it:
 //!
 //! - `ThreadName` is `sched::ThreadRef`, and `OnCpu::current_thread` is `sched::current_thread`.
@@ -140,6 +148,12 @@
 //!     paths too.
 //!   - In every one, each binding's storage comes back exactly once: an account charged at each
 //!     reservation ends at zero, and never goes below it.
+//! - The exit counts: a settle that has seen a thread's end and finds nothing pending (no thread
+//!   ending, no zombie, summed as `exits::pending` sums them) is ordered after everything that
+//!   thread gave back at its reap, whether it ended alone, beside another thread on its processor
+//!   whose marks and lowerings interleave with its own in one count, beside one on another
+//!   processor, or beside one on its processor whose exit brought no mark (an exit's lowering
+//!   consumes its own thread's mark, so it cannot stand for another's).
 //!
 //! # What is not proved
 //!
@@ -221,6 +235,7 @@ use loom::sync::{Arc, Notify};
 use loom::thread::{self, JoinHandle};
 
 use crate::contexts::{Contexts, Refused};
+use crate::exits::Exits;
 use crate::floor::MonotonicFloor;
 use crate::ports::{self, Kind, Packet, Port, Reservation, Source, Storage, TakeError, Unreserved};
 use crate::refcount::RefCount;
@@ -3319,6 +3334,171 @@ fn contexts_two_retirers_lose_no_ended_context() {
             assert!(!ctx_covered(&table, 1), "{NEVER_RETIRED}");
             assert!(!ctx_covered(&table, 2), "{NEVER_RETIRED}");
             assert!(ctx_covered(&table, 3), "{UNCOVERED}");
+        },
+    );
+}
+
+// ---------------------------------------------------------------- exits (TASKS item 79)
+
+/// What an exits model reports when a settle passed while an ended thread still held what it
+/// gives back at its reap.
+const SETTLED_EARLY: &str = "a settle passed while an ended thread still held what it gives back";
+
+/// E2's and E3's bound in `cargo xtask check`: three threads searched exhaustively take half a
+/// million executions and more (E2 1,105,056 in 96 s, E3 524,132 in 65 s, both passing), so the gate
+/// stops at two preemptions (325 and 555 executions), within which controls X2 and X3 are caught by
+/// them; `ORIGIN_LOOM_DEEP` searches them exhaustively.
+const EXITS_QUICK: Bound = preempted(2, SPINS);
+
+/// What an ending thread holds until its reap: 1 while held, 0 once given back. Loom's cell
+/// reports a settler's read that is not ordered after the reaper's write.
+type Kept = UnsafeCell<u64>;
+
+/// One thread's whole end on processor `exits`: it is counted as ending, publishes its end with a
+/// Release store of `seen`, leaves its processor as a zombie, and is reaped, which gives back
+/// `held`. In the kernel the reap runs later on the same processor, after the exit; a Loom thread
+/// running both in order stands for that.
+fn exits_one_end(exits: &Exits, seen: &AtomicBool, held: &Kept) {
+    let (mark, ()) = exits.end(|| seen.store(true, Release));
+    exits.queued(Some(mark));
+    // SAFETY: the pointer is the cell's own; Loom's cell checks this write against the settler's
+    // read, and panics if they are not ordered, which is the point of the model.
+    exits.reap(|| held.with_mut(|p| unsafe { *p = 0 }));
+}
+
+/// The boot flow: once it has seen the end in `seen`, it settles over `exits`, and if nothing is
+/// pending it counts, which reads `held`: that must have been given back, and the read must be
+/// ordered after it.
+fn exits_settle_then_count(seen: &AtomicBool, exits: &Exits, held: &Kept) {
+    if seen.load(Acquire) && crate::exits::pending(|| core::iter::once(exits)).none() {
+        // SAFETY: as in `exits_one_end`.
+        let now = held.with(|p| unsafe { *p });
+        assert_eq!(now, 0, "{SETTLED_EARLY}");
+    }
+}
+
+/// E1: one thread ends on one processor while the boot flow, having seen its end, settles and
+/// counts. A settle that finds nothing pending comes after everything the thread gave back.
+#[test]
+fn exits_a_settle_sees_what_an_ended_thread_held() {
+    check(
+        "exits_a_settle_sees_what_an_ended_thread_held",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let exits = Arc::new(Exits::new());
+            let seen = Arc::new(AtomicBool::new(false));
+            let held = Arc::new(Kept::new(1));
+            let ender = {
+                let (exits, seen, held) =
+                    (Arc::clone(&exits), Arc::clone(&seen), Arc::clone(&held));
+                thread::spawn(move || exits_one_end(&exits, &seen, &held))
+            };
+            exits_settle_then_count(&seen, &exits, &held);
+            ender.join().unwrap();
+            assert!(crate::exits::pending(|| core::iter::once(&*exits)).none());
+        },
+    );
+}
+
+/// E2: two threads end on one processor, their marks and lowerings interleaved in one count,
+/// while the boot flow, having seen the first one's end, settles. A lowering made by the second
+/// cannot stand for the first's: nothing pending still means the first gave back what it held.
+#[test]
+fn exits_two_threads_on_one_processor_each_count_for_themselves() {
+    check(
+        "exits_two_threads_on_one_processor_each_count_for_themselves",
+        EXITS_QUICK,
+        EXHAUSTIVE,
+        || {
+            let exits = Arc::new(Exits::new());
+            let seen = Arc::new(AtomicBool::new(false));
+            let held = Arc::new(Kept::new(1));
+            let other_seen = Arc::new(AtomicBool::new(false));
+            let other_held = Arc::new(Kept::new(1));
+            let first = {
+                let (exits, seen, held) =
+                    (Arc::clone(&exits), Arc::clone(&seen), Arc::clone(&held));
+                thread::spawn(move || exits_one_end(&exits, &seen, &held))
+            };
+            let second = {
+                let (exits, seen, held) = (
+                    Arc::clone(&exits),
+                    Arc::clone(&other_seen),
+                    Arc::clone(&other_held),
+                );
+                thread::spawn(move || exits_one_end(&exits, &seen, &held))
+            };
+            exits_settle_then_count(&seen, &exits, &held);
+            first.join().unwrap();
+            second.join().unwrap();
+        },
+    );
+}
+
+/// E3: two threads end on two processors, and the boot flow, having seen both ends, settles over
+/// both counts. Nothing pending means both gave back what they held.
+#[test]
+fn exits_a_settle_over_two_processors_sees_both() {
+    check(
+        "exits_a_settle_over_two_processors_sees_both",
+        EXITS_QUICK,
+        EXHAUSTIVE,
+        || {
+            let cpus = Arc::new([Exits::new(), Exits::new()]);
+            let seen = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
+            let held = Arc::new([Kept::new(1), Kept::new(1)]);
+            let enders: Vec<_> = (0..2)
+                .map(|k| {
+                    let (cpus, seen, held) =
+                        (Arc::clone(&cpus), Arc::clone(&seen), Arc::clone(&held));
+                    thread::spawn(move || exits_one_end(&cpus[k], &seen[k], &held[k]))
+                })
+                .collect();
+            let both = seen[0].load(Acquire) && seen[1].load(Acquire);
+            if both && crate::exits::pending(|| cpus.iter()).none() {
+                for cell in held.iter() {
+                    // SAFETY: as in `exits_one_end`.
+                    let now = cell.with(|p| unsafe { *p });
+                    assert_eq!(now, 0, "{SETTLED_EARLY}");
+                }
+            }
+            for ender in enders {
+                ender.join().unwrap();
+            }
+        },
+    );
+}
+
+/// E4: one thread ends as in E1 while another, on the same processor, exits without having
+/// counted itself as ending (no mark): its exit cannot stand for the first thread's, so nothing
+/// pending still means the first gave back what it held (the review of TASKS item 79, T79-1,
+/// whose own model this is).
+#[test]
+fn exits_an_exit_without_a_mark_cannot_stand_for_one() {
+    check(
+        "exits_an_exit_without_a_mark_cannot_stand_for_one",
+        EXITS_QUICK,
+        EXHAUSTIVE,
+        || {
+            let exits = Arc::new(Exits::new());
+            let seen = Arc::new(AtomicBool::new(false));
+            let held = Arc::new(Kept::new(1));
+            let ender = {
+                let (exits, seen, held) =
+                    (Arc::clone(&exits), Arc::clone(&seen), Arc::clone(&held));
+                thread::spawn(move || exits_one_end(&exits, &seen, &held))
+            };
+            let unmarked = {
+                let exits = Arc::clone(&exits);
+                thread::spawn(move || {
+                    exits.queued(None);
+                    exits.reap(|| ());
+                })
+            };
+            exits_settle_then_count(&seen, &exits, &held);
+            ender.join().unwrap();
+            unmarked.join().unwrap();
         },
     );
 }

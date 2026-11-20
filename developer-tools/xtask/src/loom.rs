@@ -132,6 +132,14 @@ const CTX_LAST_TOUCH: &[&str] = &["a stack was found free before its processor's
 const CTX_LOST: &[&str] = &["a published context went unrecorded"];
 const CTX_NEVER_RETIRED: &[&str] = &["an ended context's home was never retired"];
 
+/// What the exits models report (`models.rs`; TASKS item 79): a settle that passed while an
+/// ended thread still held what it gives back at its reap, seen as a wrong value or as a read
+/// Loom's cell finds unordered with the reaper's write.
+const EXITS_EARLY: &[&str] = &[
+    "a settle passed while an ended thread still held what it gives back",
+    "Causality violation",
+];
+
 /// The models of a change to a space whose shootdowns may stall (`models.rs`).
 const ROUND_STALLS: &str =
     "a_change_whose_round_stalls_is_still_made_and_frees_only_what_a_flush_covered";
@@ -160,6 +168,7 @@ const REFCOUNT: &str = "framekernel/frame/sync/src/refcount.rs";
 const SLOTS: &str = "framekernel/frame/sync/src/slots.rs";
 const PORTS: &str = "framekernel/frame/sync/src/ports.rs";
 const CONTEXTS: &str = "framekernel/frame/sync/src/contexts.rs";
+const EXITS: &str = "framekernel/frame/sync/src/exits.rs";
 
 /// `WaitQueue::take_all`'s one critical section.
 const TAKE_ALL: &str = "        scheduler.without_interrupts(|| core::mem::replace(&mut *self.waiters.lock(), [None; N]))\n";
@@ -1390,6 +1399,102 @@ const CONTROLS: &[Control] = &[
         models: &[(
             "contexts_two_retirers_lose_no_ended_context",
             CTX_NEVER_RETIRED,
+        )],
+    },
+    Control {
+        // X1 (TASKS item 79): the end published before it is counted as ending, as `settle` was
+        // before TASKS item 79 for every end: a settle that sees the end can find nothing
+        // pending while the thread still holds everything.
+        name: "exits_counted_after_publishing",
+        file: EXITS,
+        from: "        self.ending.fetch_add(1, AcqRel);\n        (Mark { exits: self }, publish())\n",
+        to: "        let published = publish();\n        self.ending.fetch_add(1, AcqRel);\n        (Mark { exits: self }, published)\n",
+        models: &[("exits_a_settle_sees_what_an_ended_thread_held", EXITS_EARLY)],
+    },
+    Control {
+        // X2: the exit lowers `ending` before it counts the zombie: between the two, nothing is
+        // pending.
+        name: "exits_ending_lowered_before_the_zombie_counts",
+        file: EXITS,
+        from: "        self.zombies.fetch_add(1, AcqRel);
+        if let Some(mark) = mark {
+            mark.lower();
+        }
+",
+        to: "        if let Some(mark) = mark {
+            mark.lower();
+        }
+        self.zombies.fetch_add(1, AcqRel);
+",
+        models: &[
+            ("exits_a_settle_sees_what_an_ended_thread_held", EXITS_EARLY),
+            (
+                "exits_two_threads_on_one_processor_each_count_for_themselves",
+                EXITS_EARLY,
+            ),
+        ],
+    },
+    Control {
+        // X3: the settle reads `zombies` before `ending`: it can read no zombie before the exit
+        // counts one, and no ending thread after the exit lowers it.
+        name: "exits_settle_reads_zombies_first",
+        file: EXITS,
+        from: "    let ending = each()
+        .map(|exits| exits.ending.load(Acquire))
+        .fold(0, u64::saturating_add);
+    let zombies = each()
+        .map(|exits| exits.zombies.load(Acquire))
+        .fold(0, u64::saturating_add);
+",
+        to: "    let zombies = each()
+        .map(|exits| exits.zombies.load(Acquire))
+        .fold(0, u64::saturating_add);
+    let ending = each()
+        .map(|exits| exits.ending.load(Acquire))
+        .fold(0, u64::saturating_add);
+",
+        models: &[
+            ("exits_a_settle_sees_what_an_ended_thread_held", EXITS_EARLY),
+            ("exits_a_settle_over_two_processors_sees_both", EXITS_EARLY),
+        ],
+    },
+    Control {
+        // X4: the reaper counts the zombie gone before it gives back what it held: T70-7's order
+        // undone (the review of TASKS item 70).
+        name: "exits_reaped_before_released",
+        file: EXITS,
+        from: "        let released = release();\n        self.zombies.fetch_sub(1, AcqRel);\n        released\n",
+        to: "        self.zombies.fetch_sub(1, AcqRel);\n        release()\n",
+        models: &[("exits_a_settle_sees_what_an_ended_thread_held", EXITS_EARLY)],
+    },
+    Control {
+        // X5: the settle reads `ending` with Relaxed: reading the exit's lowering then orders
+        // nothing, and its read of `zombies` may miss the zombie the exit counted first.
+        name: "exits_ending_read_relaxed",
+        file: EXITS,
+        from: "        .map(|exits| exits.ending.load(Acquire))\n",
+        to: "        .map(|exits| exits.ending.load(core::sync::atomic::Ordering::Relaxed))\n",
+        models: &[("exits_a_settle_sees_what_an_ended_thread_held", EXITS_EARLY)],
+    },
+    Control {
+        // X6 (the review of TASKS item 79, T79-1): an exit that brought no mark lowers `ending`
+        // all the same, so another thread's lowering can stand for the ending thread's.
+        name: "exits_lowered_without_a_mark",
+        file: EXITS,
+        from: "        if let Some(mark) = mark {
+            mark.lower();
+        }
+",
+        to: "        match mark {
+            Some(mark) => mark.lower(),
+            None => {
+                self.ending.fetch_sub(1, AcqRel);
+            }
+        }
+",
+        models: &[(
+            "exits_an_exit_without_a_mark_cannot_stand_for_one",
+            EXITS_EARLY,
         )],
     },
 ];

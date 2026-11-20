@@ -1346,8 +1346,7 @@ extern "sysv64" fn net_thread(_: u64) -> ! {
         RX_FRAMES.store(rx.received, Ordering::Relaxed);
         RX_RECYCLED.store(rx.recycled, Ordering::Relaxed);
     }
-    RX_DONE.store(1, Ordering::Release);
-    crate::sched::exit()
+    crate::sched::finish(|| RX_DONE.store(1, Ordering::Release))
 }
 
 /// Polls the status register for 0 after a reset, with a bound: a device may take a moment, and

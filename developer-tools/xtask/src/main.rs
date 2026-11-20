@@ -7381,6 +7381,22 @@ mod rerun_tests {
         assert_eq!(lost_stacks_only(&retired), None);
     }
 
+    /// A thread whose end was seen and that never left its processor (TASKS item 79) is not a
+    /// stalled shootdown, so Amendment 3 (b) does not run it again: alone, before the lost
+    /// stacks, or after them, and on either settle.
+    #[test]
+    fn ending_threads_do_not_qualify() {
+        let cases = [
+            format!("{IPC}; not settled before its first count: 1 ending threads not yet exited: ipc failed"),
+            format!("{IPC}; not settled before its first count: 1 ending threads not yet exited, 1 kernel stacks lost to a stalled shootdown: ipc failed"),
+            format!("{IPC}; not settled before its compare: 1 kernel stacks lost to a stalled shootdown, 1 ending threads not yet exited: ipc failed"),
+            "origin-kernel: directory: the directory, the service, the client and all they held are gone: heap 29408 bytes (was 29408), 128191 free frames (was 128191); not settled before its first count: 1 ending threads not yet exited: directory failed".to_string(),
+        ];
+        for line in &cases {
+            assert_eq!(lost_stacks_only(line), None, "{line}");
+        }
+    }
+
     /// Only the first failing line counts: an earlier failure in the same boot means no re-run.
     #[test]
     fn only_the_first_failure_decides() {

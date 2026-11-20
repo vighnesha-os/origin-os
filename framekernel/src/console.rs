@@ -1220,8 +1220,9 @@ extern "sysv64" fn printer(_: u64) -> ! {
         core::hint::spin_loop();
     }
     print_lines(&mut Console::new(), crate::cpu::this_cpu().get() as u64);
-    PRINTERS_DONE.fetch_add(1, Ordering::AcqRel);
-    crate::sched::exit()
+    crate::sched::finish(|| {
+        PRINTERS_DONE.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// Called by the handler of every interrupt on `cpu::IOAPIC_VECTOR`: if the proof has asked
@@ -1265,8 +1266,7 @@ extern "sysv64" fn section_printer(_: u64) -> ! {
     THREAD_UART_SECTIONS.store(u64::from(uart_sections), Ordering::Relaxed);
     THREAD_SECTIONS.store(u64::from(sections), Ordering::Relaxed);
     THREAD_INTERRUPTS_ON.store(interrupts_on, Ordering::Relaxed);
-    THREAD_DONE.store(true, Ordering::Release);
-    crate::sched::exit()
+    crate::sched::finish(|| THREAD_DONE.store(true, Ordering::Release))
 }
 
 /// A thread (one on the first processor other than the boot processor, or on the boot
