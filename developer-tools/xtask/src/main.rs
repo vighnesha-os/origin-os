@@ -6726,7 +6726,7 @@ fn com1_last_kernel_line(com1: Option<&str>) -> String {
         return String::new();
     };
     let text = serial::clean(com1.as_bytes());
-    match text
+    let last = match text
         .lines()
         .rev()
         .find(|l| l.starts_with("origin-kernel: "))
@@ -6736,6 +6736,14 @@ fn com1_last_kernel_line(com1: Option<&str>) -> String {
             Some(line) => format!("; COM1 has no kernel line; its last line: {line:?}"),
             None => "; COM1 has nothing".into(),
         },
+    };
+    // What the console decided about the firmware's UART, which says why a boot stayed on COM1.
+    match text.lines().rev().find(|l| {
+        l.starts_with("origin-kernel: console: ")
+            && (l.contains("SPCR") || l.contains("the UART at"))
+    }) {
+        Some(line) if !last.contains(line) => format!("{last}; its console's UART: {line:?}"),
+        _ => last,
     }
 }
 
@@ -7098,6 +7106,40 @@ fn run(settings: &Settings) -> Result {
         Ok(())
     } else {
         Err(format!("{QEMU} exited with {status}"))
+    }
+}
+
+#[cfg(test)]
+mod com1_report_tests {
+    use super::com1_last_kernel_line;
+
+    /// TASKS item 83: a failed boot names COM1's last kernel line, and why its console stayed
+    /// there, when COM1 is kept in a file.
+    #[test]
+    fn a_failure_names_com1_s_last_kernel_line_and_its_uart() {
+        assert_eq!(com1_last_kernel_line(None), "");
+        assert_eq!(com1_last_kernel_line(Some("")), "; COM1 has nothing");
+        assert_eq!(
+            com1_last_kernel_line(Some("BdsDxe: loading\r\norigin-boot: exiting\n")),
+            "; COM1 has no kernel line; its last line: \"origin-boot: exiting\""
+        );
+        let stayed = "origin-kernel: a\norigin-kernel: console: no usable ACPI SPCR table (x); the UART stays at I/O port 0x3f8\norigin-kernel: M1 entry complete; halting\n";
+        let said = com1_last_kernel_line(Some(stayed));
+        assert!(
+            said.starts_with(
+                "; COM1's last kernel line: \"origin-kernel: M1 entry complete; halting\""
+            ),
+            "{said}"
+        );
+        assert!(
+            said.ends_with("its console's UART: \"origin-kernel: console: no usable ACPI SPCR table (x); the UART stays at I/O port 0x3f8\""),
+            "{said}"
+        );
+        let moved = "origin-kernel: console: the ACPI SPCR (revision 2, interface 0x0) names a UART at I/O port 0x2f8: moving the console there\n";
+        assert_eq!(
+            com1_last_kernel_line(Some(moved)),
+            format!("; COM1's last kernel line: {:?}", moved.trim_end())
+        );
     }
 }
 
