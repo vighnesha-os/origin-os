@@ -2223,7 +2223,10 @@ fn world_switch(me: &IrqCpu, to: u64) {
 /// another holds the page's translation and touches the frame, and a third tries to take the
 /// slot: `origin_frame::stack`'s reclaim, with `vm`'s unmap and `tlb`'s shootdown stood in for
 /// by the world's. What the slot held is released only after every access through the old
-/// translation, and the taker gets the slot only once no processor holds that translation.
+/// translation, and the taker gets the slot only once no processor holds that translation. The
+/// holder walks the page table after its interrupt, as a processor would on its next access, so
+/// an unmap made after the shootdown refills its TLB (the control
+/// `slot_unmapped_after_its_shootdown`; the independent review of TASKS item 73, T73-5).
 #[test]
 fn slots_reclaimed_slot_is_taken_only_after_its_shootdown() {
     check(
@@ -2249,7 +2252,10 @@ fn slots_reclaimed_slot_is_taken_only_after_its_shootdown() {
                     1,
                     thread::spawn(move || {
                         me.touch(&frame);
-                        me.take_interrupt_then_touch(&frame);
+                        me.world.kick[1].wait();
+                        me.world.shootdown.service(&me);
+                        me.walk();
+                        me.touch(&frame);
                         me.serve();
                     }),
                 )
@@ -2307,8 +2313,9 @@ const TWO_OUT: &str = "a second slot was unmapped while one waited";
 /// page's translation: that the processor has answered says nothing of what it dropped. Then a
 /// reclaim asks again with patience. What the slot held is released once, after every access
 /// through the old translation (Loom's cell), and by then no processor holds that translation.
-/// The controls `slot_released_on_a_stall` and
-/// `slot_freed_on_an_answer_without_a_fresh_shootdown` fail it.
+/// The holder walks the page table after each interrupt (T73-5). The controls
+/// `slot_released_on_a_stall`, `slot_freed_on_an_answer_without_a_fresh_shootdown` and
+/// `slot_unmapped_after_its_shootdown` fail it.
 #[test]
 fn slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown() {
     check(
@@ -2337,6 +2344,7 @@ fn slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown() {
                                 return;
                             }
                             me.world.shootdown.service(&me);
+                            me.walk();
                             me.touch(&frame);
                         }
                     }),
@@ -2392,6 +2400,105 @@ fn slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown() {
                 }
                 other => panic!("{other:?}"),
             }
+            assert_eq!(released.get(), 1, "{NOT_ONCE}");
+            assert!(!holder.holds(), "{STALE}");
+            assert_eq!(slots.state(0), Some(SlotState::Free));
+            world.finish(vec![holding]);
+        },
+    );
+}
+
+/// What a waiting slot held, released on a stall: the message of [`slots_a_reask_that_stalls_keeps_the_slot`].
+const RELEASED_ON_A_STALL: &str = "what a waiting slot held was released on a stall";
+
+/// L5 (the independent review of TASKS item 73, T73-5): the one-slot region of L1, reclaimed by a
+/// processor that gives up after [`IMPATIENCE`] polls on its first shootdown and on its first
+/// fresh one, while another holds the page's translation, takes its interrupts late, walks the
+/// page table after each and touches the frame. A fresh shootdown that stalls keeps the slot
+/// waiting with what it held; a later one, with patience, gives it back. What the slot held is
+/// released once, never on a stall, after every access through the old translation. The control
+/// `slot_released_on_a_reask_stall` fails it.
+#[test]
+fn slots_a_reask_that_stalls_keeps_the_slot() {
+    check(
+        "slots_a_reask_that_stalls_keeps_the_slot",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, holder) = (ImpatientCpu(tlb_cpu(&world, 0)), tlb_cpu(&world, 1));
+            world.shootdown.mark_online(&near);
+            world.shootdown.mark_online(&holder);
+            world.tlb[1].store(true, Relaxed);
+            let slots = Arc::new(Slots::<1, 0, Arc<ModelFrame>>::new());
+            let taken = slots.take(1).expect("the slot is free");
+            slots.give_back(taken.slot, false);
+            let frame = Arc::new(ModelFrame::new(0));
+            let holding = {
+                let (me, frame) = (holder.clone(), Arc::clone(&frame));
+                (
+                    1,
+                    thread::spawn(move || {
+                        me.touch(&frame);
+                        loop {
+                            me.world.kick[1].wait();
+                            if me.world.stop.load(Relaxed) {
+                                return;
+                            }
+                            me.world.shootdown.service(&me);
+                            me.walk();
+                            me.touch(&frame);
+                        }
+                    }),
+                )
+            };
+            let released = core::cell::Cell::new(0u32);
+            let release = |frame: Arc<ModelFrame>| {
+                released.set(released.get() + 1);
+                reuse(&frame);
+            };
+            let mut outcome = slots.reclaim(
+                |_, _| {
+                    world.pte.store(0, Relaxed);
+                    Arc::clone(&frame)
+                },
+                |_, _| {
+                    world
+                        .shootdown
+                        .shoot(&near, Request::page(THE_PAGE), Scope::Kernel)
+                },
+                |_| unreachable!("no slot waits yet"),
+                release,
+            );
+            // Two fresh shootdowns at most: the first as impatient as the first ask, the second
+            // patient.
+            for patient in [false, true] {
+                let Some(Reclaim::Stalled { stall, .. }) = outcome else {
+                    break;
+                };
+                assert_eq!(released.get(), 0, "{RELEASED_ON_A_STALL}");
+                assert_eq!(slots.state(0), Some(SlotState::Waiting));
+                while !world.shootdown.answered(stall) {
+                    crate::prim::spin_loop();
+                }
+                outcome = slots.reclaim(
+                    |_, _| unreachable!("a waiting slot is not unmapped again"),
+                    |_, _| {
+                        let request = Request::page(THE_PAGE);
+                        if patient {
+                            world.shootdown.shoot(&near.0, request, Scope::Kernel)
+                        } else {
+                            world.shootdown.shoot(&near, request, Scope::Kernel)
+                        }
+                    },
+                    |stall| world.shootdown.answered(stall),
+                    release,
+                );
+            }
+            assert!(
+                matches!(outcome, Some(Reclaim::Freed { .. })),
+                "{NEVER_GIVEN_BACK}: {outcome:?}"
+            );
             assert_eq!(released.get(), 1, "{NOT_ONCE}");
             assert!(!holder.holds(), "{STALE}");
             assert_eq!(slots.state(0), Some(SlotState::Free));

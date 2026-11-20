@@ -127,6 +127,12 @@ const NEVER_GIVEN_BACK: &[&str] = &[
     "what an unmap returned was not released exactly once",
 ];
 const TWO_OUT: &[&str] = &["a second slot was unmapped while one waited"];
+/// What a waiting slot held, released on a stall of a fresh shootdown (T73-5).
+const RELEASED_ON_A_STALL: &[&str] = &[
+    "what a waiting slot held was released on a stall",
+    "Causality violation",
+    "what an unmap returned was not released exactly once",
+];
 
 /// What the port models report (`models.rs`): a packet lost or doubled, a binding left armed
 /// after its handle closed, and a closed port left holding something.
@@ -1114,6 +1120,29 @@ const CONTROLS: &[Control] = &[
             "slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown",
             WAITING_REUSED,
         )],
+    },
+    Control {
+        // T73-5 (the independent review of TASKS item 73): the slot's pages left the tables only
+        // after its shootdown, so a processor that served it can walk to them again.
+        name: "slot_unmapped_after_its_shootdown",
+        file: SLOTS,
+        from: "                let unmapped = unmap(slot, pages);\n                let outcome = shoot(slot, pages);\n",
+        to: "                let outcome = shoot(slot, pages);\n                let unmapped = unmap(slot, pages);\n",
+        models: &[
+            ("slots_reclaimed_slot_is_taken_only_after_its_shootdown", WAITING_REUSED),
+            (
+                "slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown",
+                WAITING_REUSED,
+            ),
+        ],
+    },
+    Control {
+        // T73-5: what a waiting slot held goes back when a fresh shootdown stalls too.
+        name: "slot_released_on_a_reask_stall",
+        file: SLOTS,
+        from: "                    Err(again) => {\n                        table.set(slot, State::Waiting);\n",
+        to: "                    Err(again) => {\n                        if let Some(w) = table.waiting.take() {\n                            drop(table);\n                            release(w.kept);\n                            return Some(Reclaim::Stalled { stall: again, asked_again: 1 });\n                        }\n                        table.set(slot, State::Waiting);\n",
+        models: &[("slots_a_reask_that_stalls_keeps_the_slot", RELEASED_ON_A_STALL)],
     },
     Control {
         // TASKS item 73: a waiting slot given back once the processor that stalled has answered,
