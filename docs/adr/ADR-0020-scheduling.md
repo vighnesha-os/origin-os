@@ -584,7 +584,7 @@ Each has negative controls (`docs/engineering/M3_SCHEDULING_PLAN.md`).
 |---|---|---|---|
 | A lost wake-up leaves a thread blocked for ever (denial of service against a thread) | none needed: a race | S1 | — |
 | Two processors on one kernel stack (memory corruption, one thread's data in another's) | none needed: a race | S4, S5 | — |
-| A stack given back while a context may run on it | none needed: a race | S4's move sequence | A scan that gives up leaks the stack (counted) |
+| A stack given back while a context may run on it | none needed: a race | S4's move sequence and move gate | — (a scan always answers: four tries without the gate, then one under it) |
 | More of the processor by making more threads | a hostile program | S15 | Approximate (S15's trade-off) |
 | Claiming Interactive to starve the foreground or the system | a hostile program | S12 | — |
 | Kick storms (IPIs to idle processors) | a hostile program | S7: one kick per tick per processor | Power and noise within that bound |
