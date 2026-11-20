@@ -1981,7 +1981,9 @@ fn big_message(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
 enum NotRun {
     /// Its image: the process, or a page of its code, data or stack.
     Image,
-    /// Its scratch memory or its script.
+    /// Its scratch memory, in its data pages.
+    Scratch,
+    /// Its script, on its script pages.
     Script,
     /// The object that holds its process.
     Process,
@@ -1995,6 +1997,7 @@ impl core::fmt::Display for NotRun {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Image => f.write_str("its image could not be made"),
+            Self::Scratch => f.write_str("its scratch memory could not be written"),
             Self::Script => f.write_str("its script could not be written"),
             Self::Process => f.write_str("its process object could not be made"),
             Self::Thread(error) => write!(f, "its thread was refused: {error:?}"),
@@ -2064,7 +2067,10 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         return not_run(com1, PINNED, NotRun::Image);
     };
     let script = alloc::vec![step("", sys::DEBUG_REPORT, &[Imm(1)], OK), fault()];
-    if image.scratch().is_none() || image.script(&script).is_none() {
+    if image.scratch().is_none() {
+        return not_run(com1, PINNED, NotRun::Scratch);
+    }
+    if image.script(&script).is_none() {
         return not_run(com1, PINNED, NotRun::Script);
     }
     let Some(pinned) = start_program(com1, bsp, PINNED, Some(image), SCRIPT) else {
