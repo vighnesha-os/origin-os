@@ -1447,11 +1447,9 @@ fn prove_lifecycle(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         3,
     );
     let reused = spawn(bsp, quitter, 0);
-    yield_until(
-        || FINISHED.load(Ordering::Acquire) == 4 && live() == 1,
-        tsc_hz,
-        1,
-    );
+    let quitter_left = || FINISHED.load(Ordering::Acquire) == 4 && live() == 1;
+    yield_until(quitter_left, tsc_hz, 1);
+    let quitter_waited = quitter_left();
     if let Some(cycles) = measure_switch(bsp) {
         let _ = writeln!(
             com1,
@@ -1459,20 +1457,75 @@ fn prove_lifecycle(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
             cycles * 1_000_000_000 / tsc_hz.max(1)
         );
     }
+    // A bench thread counts itself finished before it exits (`finish`), so `measure_switch` can
+    // return with one still in its slot: the proof waits for every thread whose end it has seen
+    // to leave the queue before it reads its verdict, as the settles wait (TASKS item 92's gates,
+    // G92-1; TASKS item 79). A thread that never leaves still fails it, once the wait is spent.
+    wait_for_others(
+        "the lifecycle proof's threads to leave the queue",
+        || live() == 1,
+        tsc_hz,
+        2000,
+    );
     let alternations = ALTERNATIONS.load(Ordering::Relaxed);
     let slept = SLEPT.load(Ordering::Relaxed).saturating_sub(1);
-    let ok = alternations >= 2 * TURNS - 5
-        && (SLEEP_TICKS..=10 * SLEEP_TICKS).contains(&slept)
-        && reused == Ok(1)
-        && live() == 1;
+    let queued = live().saturating_sub(1);
+    let alternated = alternations >= 2 * TURNS - 5;
+    let slept_right = (SLEEP_TICKS..=10 * SLEEP_TICKS).contains(&slept);
+    let ok = alternated && slept_right && reused == Ok(1) && queued == 0 && quitter_waited;
     let _ = writeln!(
         com1,
         "origin-kernel: scheduler: yield alternated {alternations} of {} turns; sleep({SLEEP_TICKS}) took {slept} ticks; exited threads freed their slots (slot {:?} reused){}",
         2 * TURNS,
         reused,
-        if ok { "" } else { ": scheduler failed" }
+        LifecycleWords {
+            ok,
+            alternated,
+            slept_right,
+            reused: reused == Ok(1),
+            queued,
+            quitter_waited,
+        }
     );
     ok
+}
+
+/// What [`prove_lifecycle`]'s line adds: nothing when it holds, otherwise ": scheduler failed"
+/// and each condition that failed, so that a failure says which way it came (TASKS item 92's
+/// gates, G92-1, as TASKS item 80 did for the IPC refusals). The counts themselves are on the line
+/// already.
+struct LifecycleWords {
+    ok: bool,
+    alternated: bool,
+    slept_right: bool,
+    reused: bool,
+    queued: usize,
+    quitter_waited: bool,
+}
+
+impl core::fmt::Display for LifecycleWords {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.ok {
+            return Ok(());
+        }
+        f.write_str(": scheduler failed")?;
+        if !self.alternated {
+            f.write_str("; too few alternations")?;
+        }
+        if !self.slept_right {
+            f.write_str("; the sleep's ticks out of bounds")?;
+        }
+        if !self.reused {
+            f.write_str("; the exited thread's slot not reused")?;
+        }
+        if self.queued > 0 {
+            write!(f, "; {} contexts still queued after the wait", self.queued)?;
+        }
+        if !self.quitter_waited {
+            f.write_str("; the quitter's wait gave up after 1 s")?;
+        }
+        Ok(())
+    }
 }
 
 /// A spawn that cannot be completed leaves nothing behind: refused for want of an FPU area
