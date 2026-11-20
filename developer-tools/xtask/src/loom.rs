@@ -131,8 +131,6 @@ const CTX_UNCOVERED: &[&str] = &["a live context's stack was in no record"];
 const CTX_LAST_TOUCH: &[&str] = &["a stack was found free before its processor's last use of it"];
 const CTX_LOST: &[&str] = &["a published context went unrecorded"];
 const CTX_NEVER_RETIRED: &[&str] = &["an ended context's home was never retired"];
-/// W1's reports (TASKS item 75): a first frame both withdrawn and resumed, or neither; a running
-/// context's stack uncovered; C's context lost; a withdrawn context's home left behind.
 /// B1's and B2's reports (TASKS item 81): a settle counted while a reap still held what it frees,
 /// or its read of what the reap freed was not ordered after the freeing.
 const BACKLOG_EARLY: &[&str] = &[
@@ -142,6 +140,8 @@ const BACKLOG_EARLY: &[&str] = &[
 /// K1's report (TASKS item 77): a switch, or the table read back, named a home other than the
 /// incoming context's.
 const CTX_WRONG_HOME: &[&str] = &["a switch named a stack not the incoming context's own"];
+/// W1's reports (TASKS item 75): a first frame both withdrawn and resumed, or neither; a running
+/// context's stack uncovered; C's context lost; a withdrawn context's home left behind.
 const CTX_WITHDRAWN: &[&str] = &[
     "a published context was both withdrawn and resumed, or neither",
     "a live context's stack was in no record",
