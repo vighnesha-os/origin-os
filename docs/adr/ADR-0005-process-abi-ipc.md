@@ -348,3 +348,45 @@ method object_signal = 10 (object: handle<any, signal>, clear: signals, set: sig
 **Migration consequences.** None for a program: `user-abi` is at major 0 (P12), and no call's shape changes. The kernel's `Limits` gains one field, given in each place that writes one (G6).
 
 **What stays unknown.** The right value for a real service. The index's cost per binding was measured on the host only, by S4-3's test.
+
+## Amendment 11 (Accepted, 2026-11-20): a waiting client lends its class and weight across a call
+
+**Status: Accepted by the owner on 2026-11-20 with the recommended answer ("Accept all 24", decision sheet item 341, ADR-0020's question 24; CLAUDE.md §84). Nothing in it is built: TASKS item 109 builds it after ADR-0020's core.** Proposed by TASKS item 90 beside ADR-0020, at the coordinating session's ruling of 2026-11-20 that lending across a call belongs to this ADR, which owns the call's semantics, and not to ADR-0020. The evidence is ADR-0020's research ledger, `docs/research/2026-11-20-m3-scheduling.md` (§3.3, source P2), and ADR-0020 S16.
+
+ADR-0020 S16 lends a waiting thread's weight and class to the owner of a lock it waits on. It cannot do the same for calls between programs, which is where most waiting will be: under CLAUDE.md §48 every operation of a first-party client goes through a service. P8 makes IPC asynchronous channels, and a synchronous call is the client's write, its `wait_one` for `READABLE`, and its read (composed by the generated client, ADR-0011 L4). So the kernel never learns that a service thread is working for a client that waits. An Interactive client waiting on a reply from a service that runs at Normal or Background, among busy threads on the service's processor, waits behind work it should outrank: the priority inversion Sha, Rajkumar and Lehoczky (1990) describe, here between programs.
+
+| # | Item | Decision | Refines |
+|---|---|---|---|
+| J1 | 341 | **The kernel learns of a call from the writer.** `channel_write` gains a flag, `CALL`: the writer means to wait for a reply on the same channel end. The message records its writer thread (an ADR-0020 S1 name, inside the kernel only). The kernel fast path of ADR-0011 L4, when designed, carries the same meaning without the flag. The generated client sets `CALL` on every two-way method | P8; ADR-0011 L4 |
+| J2 | 341 | **The loan.** When a thread of the peer process reads a message marked `CALL`, and its writer is then waiting on that channel end (`wait_one` or `port_wait`), the reading thread receives the writer's class and effective weight as a loan, by ADR-0020 S16's lending. If the writer starts waiting only after the read, the loan begins then. A loan is derived from what the waiting thread actually has, never from anything in the message | ADR-0020 S16 |
+| J3 | 341 | **The loan ends** at the first of: the reader writes a message on that channel (its reply); the reader reads another message marked `CALL` (a thread holds one call loan at a time, the newest); the writer stops waiting (a signal, its deadline, `CANCELED`, its handle closed or moved, P9 and Amendment 1's A2); either process ends | P9 |
+| J4 | 341 | **Bounds.** A loan only raises: the reader runs with the larger class and with its own weight plus the lent one, up to ADR-0020's `MAX_WEIGHT`. A reader that makes calls of its own while it holds a loan passes it on, to a depth of 8, ADR-0020 S16's bound for owned waits; a longer chain stops lending there and is reported | ADR-0020 S16 |
+| J5 | 341 | **A service may refuse loans.** The process holding a channel end may mark it so that no loan reaches a thread through messages read from it: for a service whose work must stay at the class its launcher gave it | P1 (the holder decides) |
+| J6 | 341 | **Order of work.** Built after ADR-0020's core, as one task with Loom models of the loan's beginning and ending (no loan outlives the wait; every weight returns) and a Report-class boot proof: an Interactive client's call to a Background service among Normal busy threads on the service's processor completes within twice its unloaded time, with a control that removes the loan | ADR-0013; ADR-0020 S23 |
+
+**Options that were put.** (a) As decided. (b) Nothing until the fast path exists: no ABI change now, but the commonest inversion stays, and the fast path is not scheduled. (c) The client names its class in the message: no kernel state, but a client could claim Interactive, which is forgeable and against deny-by-default. (d) A scheduling-context object passed with the message, carrying a budget: general, but a new object type and a larger ABI, for a need J2 already meets. (e) The service raises its own class per request, from the caller's identity (Amendment 2's C-series): no kernel lending, but every service must be trusted to raise itself and to lower itself again.
+
+**Recorded, and no decision.**
+- J1's flag and J5's mark are this ADR's ABI decisions; their numbers and bit positions are chosen when TASKS item 109 writes them into `user-abi` and OIDL, at major 0 (P12).
+- Until TASKS item 109 lands, a service runs at the class its launcher gives it.
+
+**Performance cost (ADR-0018 V3).** Unmeasured, owed (cost ledger row CL59): at a write marked `CALL`, recording the writer; at the read, finding whether the writer waits and making a loan (the reader's owning queue lock, through ADR-0020 S1's location); at the reply or the end, the loan's return. Writes and reads without the flag, and J5's mark when no loan is made: none, by construction.
+
+**Trade-offs.** A flag and kernel state per call message, in exchange for a client's class reaching the thread that serves it. A service that serves many clients from one thread is raised by its most recent caller only (J3), not by all of them.
+
+**Migration consequences.**
+- `user-abi` is at major 0 (P12): a new flag on `channel_write`, and a mark on a channel end (J5).
+- The generated client (OIDL) sets `CALL` for two-way methods; ADR-0011's stubs change with it.
+- The requirements matrix holds rows A05-J1 to A05-J6.
+
+**Threat model (§58).**
+
+| Threat | Covered by |
+|---|---|
+| A client forges a class | J2: the loan is the waiter's own class and weight |
+| A client drags a service down | J4: a loan only raises |
+| A hostile service keeps a loan | J3: the loan ends when the client stops waiting |
+| Many clients pile loans on one service thread | J3: one call loan per thread; J4: capped at `MAX_WEIGHT` |
+| A service that must not be raised | J5 |
+
+**What stays unknown.** Nothing of it has run. How often a real service's threads serve a waiting client, and so what the loan buys, is measured only once services exist (M4's step 4 and later).
