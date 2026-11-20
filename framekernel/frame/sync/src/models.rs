@@ -10,7 +10,9 @@
 //!
 //! Real, and compiled in unchanged: the two locks with their orderings (`lib.rs`), `crate::wait`
 //! (the protocol `framekernel/src/wait.rs` instantiates), the run queue
-//! (`framekernel/src/runqueue.rs`) and the monotonic clock's floor (`floor.rs`, which
+//! (`framekernel/src/runqueue.rs`), the thread records and the wake-up that follows a thread
+//! through its record's location (`threads.rs`, TASKS item 92, which `framekernel::sched`
+//! instantiates) and the monotonic clock's floor (`floor.rs`, which
 //! `origin_frame::monotonic` reads through). What differs under `--cfg loom` is `prim` in `lib.rs`, which
 //! swaps `core`'s atomics, cell and spin hint for Loom's, and that the constructors are not
 //! `const`.
@@ -45,9 +47,14 @@
 //!
 //! Copies, written by hand here, standing in for kernel code; nothing compares them with it:
 //!
-//! - `ThreadName` is `sched::ThreadRef`, and `OnCpu::current_thread` is `sched::current_thread`.
-//! - `OnCpu::wake` is the logic of `sched::wake`: `RunQueue::wake` under the queue's lock, then
-//!   a kick (the reschedule IPI) only if the thread it woke is on another processor.
+//! - `ThreadName` is `sched::ThreadRef`: a record and its generation. `OnCpu::current_thread` is
+//!   `sched::current_thread`, except that it reads the thread's own record without the queue's
+//!   lock, where the kernel finds the record through the running slot under that lock; in these
+//!   models a thread's record is never handed to another while the thread can name itself.
+//! - `OnCpu::wake` is `sched::wake` around the real `threads::wake`, over the processors' real
+//!   queues (`World`'s `Queues`, the kernel's `KernelQueues`): a kick (the reschedule IPI) only if
+//!   the thread it made ready is on another processor, and a stop if it followed its thread
+//!   `WAKE_TRIES` times.
 //! - `OnCpu::block` and `OnCpu::block_until` make the run-queue calls `sched::on_block` makes, and
 //!   `sched::block_until` turns a deadline into its tick count; the copy takes one tick to any
 //!   reachable deadline and `u64::MAX` ticks to `UNREACHABLE`.
@@ -55,7 +62,8 @@
 //!   `sched::on_tick` (`RunQueue::tick`) make for a processor halted in its idle context. What
 //!   else those handlers do around them (`with_queue`, the FPU and TSS switch) is not here.
 //! - `Cpu::new` leaves a real run queue as `sched` has it while a kernel thread runs: the idle
-//!   context in slot 0 and that thread current.
+//!   context in slot 0 and that thread current, its record taken from the world's real `Block`
+//!   and located in its slot, as `sched::spawn_with` does.
 //! - `wake_all` is the loop of `WaitQueue::wake_all` in `framekernel/src/wait.rs`.
 //! - `monotonic_nanos` stands for `time::monotonic_nanos`, and `yield_now` for `sched::yield_now`
 //!   (to Loom, a spin).
@@ -148,6 +156,19 @@
 //!     paths too.
 //!   - In every one, each binding's storage comes back exactly once: an account charged at each
 //!     reservation ends at zero, and never goes below it.
+//! - The thread records (`threads.rs`, TASKS item 92):
+//!   - A thread moved to another processor between its registration on a wait queue and its
+//!     block (timed or not) is woken: at its new slot, or at its old one before the move, which
+//!     carries the kept wake-up. A lost one leaves it blocked, a deadlock.
+//!   - A wake-up by a name whose thread has exited, and whose record went to a new thread in the
+//!     same slot, answers `Stale`, and leaves the new thread neither ready nor holding a wake-up.
+//!   - A wake-up racing its thread's exit, the record's return and its reuse on another processor
+//!     follows nothing (the count the kernel's boot proofs hold at 0) and never reaches the new
+//!     thread.
+//!   - A switch that saves the outgoing thread's state in its record and restores the incoming
+//!     one's, taking each record's lock in turn, beside a waker and a reader of the running
+//!     thread's record on other processors, restores what each thread's last switch-out saved,
+//!     with every access to a record's state ordered and no lock waiting in a circle.
 //! - The exit counts: a settle that has seen a thread's end and finds nothing pending (no thread
 //!   ending, no zombie, summed as `exits::pending` sums them) is ordered after everything that
 //!   thread gave back at its reap, whether it ended alone, beside another thread on its processor
@@ -193,6 +214,10 @@
 //! - The slots of a region beyond a reclaim and a take: a slot kept with its mapping for reuse,
 //!   `abandon`, `leak`, `trim`, and a reclaim whose shootdown stalls are tested on the host only
 //!   (`slots.rs`), and so is more than one slot.
+//! - Moves beyond one: the move in the thread-record models stands for ADR-0020 S6's, which is not
+//!   built (`OnCpu::move_if_asked` frees the source slot by `RunQueue::exit` and lets the
+//!   destination's tick pick the thread). A thread moved more than once, a wake-up that follows
+//!   several moves, and `Exhausted` are tested on the host only (`threads.rs`).
 //! - `RwLock` writer starvation, which its documentation accepts; a timed waiter that finds the
 //!   queue full (the other way to reach `Step::Poll`, the same loop as the boot flow's); and what
 //!   callers must uphold themselves: the state changes before `wake_one`, and one condition per
@@ -225,6 +250,7 @@
 //! limits how many of those changes a thread can wait through while its execution is explored.
 //! `ORIGIN_LOOM_DEEP` selects each model's larger bound (a long run, `cargo xtask loom` only).
 
+use std::cell::Cell;
 use std::sync::atomic::AtomicU64 as ExecutionCounter;
 
 use core::sync::atomic::Ordering::{self, Acquire, Relaxed, Release};
@@ -240,11 +266,12 @@ use crate::exits::Exits;
 use crate::floor::MonotonicFloor;
 use crate::ports::{self, Kind, Packet, Port, Reservation, Source, Storage, TakeError, Unreserved};
 use crate::refcount::RefCount;
-use crate::runqueue::RunQueue;
+use crate::runqueue::{DEFAULT_WEIGHT, RunQueue};
 use crate::shootdown::{
     Confirmation, Held, Request, Rounds, Scope, Shootdown, Stalled, TlbHardware,
 };
 use crate::slots::{Reclaim, Slots, State as SlotState};
+use crate::threads::{self, Block, Empty, Location, Outcome, Queues, Record, WAKE_TRIES};
 use crate::wait::{Scheduler, TimedOut, WaitQueue};
 use crate::{RwLock, SpinLock};
 
@@ -589,6 +616,14 @@ enum Restart {
     Tick,
 }
 
+/// Records the models' threads can have: one for each processor's kernel thread, at most four.
+const RECORDS: usize = 4;
+
+/// The models' thread state: a number standing for what the kernel keeps in a record.
+impl Empty for u64 {
+    const EMPTY: Self = 0;
+}
+
 /// A processor: its real run queue, holding one kernel thread and the idle context.
 struct Cpu {
     queue: SpinLock<RunQueue>,
@@ -597,32 +632,77 @@ struct Cpu {
     /// that readies nothing: the queue, not this, decides what runs.
     kick: Notify,
     restart: Restart,
-    slot: usize,
-    generation: u32,
+    /// The record of the kernel thread this processor started with, and the slot it was queued
+    /// in; `None` for a processor that runs only its idle context.
+    home: Option<(u32, usize)>,
 }
 
 impl Cpu {
-    /// A processor already running its kernel thread.
-    fn new(restart: Restart) -> Self {
+    /// Processor `cpu`, already running its kernel thread, whose record it takes from `records`
+    /// and locates in its slot, as `sched::spawn_with` does.
+    fn new(restart: Restart, cpu: usize, records: &Block<u64, RECORDS>) -> Self {
         let mut queue = RunQueue::new();
         queue.set_idle(true);
-        let slot = queue.push(THREAD_FRAME).unwrap();
-        let generation = queue.generation(slot);
+        let (index, _) = records.take().unwrap();
+        let record = u32::try_from(index).unwrap();
+        let slot = queue
+            .push_weighted(THREAD_FRAME, DEFAULT_WEIGHT, Some(record))
+            .unwrap();
+        records.get(index).unwrap().set_location(Location::new(
+            cpu.try_into().unwrap(),
+            slot.try_into().unwrap(),
+        ));
         assert_eq!(queue.tick(IDLE_FRAME), THREAD_FRAME);
         Self {
             queue: SpinLock::new(queue),
             kick: Notify::new(),
             restart,
-            slot,
-            generation,
+            home: Some((record, slot)),
+        }
+    }
+
+    /// A processor running only its idle context.
+    fn idle(restart: Restart) -> Self {
+        let mut queue = RunQueue::new();
+        queue.set_idle(true);
+        Self {
+            queue: SpinLock::new(queue),
+            kick: Notify::new(),
+            restart,
+            home: None,
         }
     }
 }
 
-/// The processors, and the monotonic clock they share.
+/// The processors, the monotonic clock they share, and the threads' records.
 struct World {
     cpus: Vec<Cpu>,
     clock: AtomicU64,
+    records: Block<u64, RECORDS>,
+}
+
+impl World {
+    /// Record `record`.
+    fn record(&self, record: u32) -> &Record<u64> {
+        self.records.get(record as usize).unwrap()
+    }
+}
+
+/// The queues `threads::wake` locks: the processors' real run queues, as the kernel's
+/// (`framekernel::sched`, `KernelQueues`) gives them.
+impl Queues for World {
+    type Queue = RunQueue;
+
+    fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut RunQueue) -> R) -> Option<R> {
+        let cpu = self.cpus.get(usize::try_from(cpu).ok()?)?;
+        Some(f(&mut cpu.queue.lock()))
+    }
+
+    fn wake_slot(queue: &mut RunQueue, slot: u16) -> bool {
+        let slot = usize::from(slot);
+        let generation = queue.generation(slot);
+        queue.wake(slot, generation)
+    }
 }
 
 /// A handle on the [`World`] that makes kernel threads in it.
@@ -640,9 +720,31 @@ impl Kernel {
     }
 
     fn new(cpus: usize, restart: Restart) -> Self {
+        Self::built(restart, (0..cpus).map(|_| true))
+    }
+
+    /// A kernel whose processors are restarted by the reschedule IPI, each running a kernel thread
+    /// where `threads` says so and otherwise only its idle context.
+    fn with_threads_on(threads: &[bool]) -> Self {
+        Self::built(Restart::Ipi, threads.iter().copied())
+    }
+
+    fn built(restart: Restart, threads: impl Iterator<Item = bool>) -> Self {
+        let records = Block::new();
+        let cpus = threads
+            .enumerate()
+            .map(|(cpu, thread)| {
+                if thread {
+                    Cpu::new(restart, cpu, &records)
+                } else {
+                    Cpu::idle(restart)
+                }
+            })
+            .collect();
         Self(Arc::new(World {
-            cpus: (0..cpus).map(|_| Cpu::new(restart)).collect(),
+            cpus,
             clock: AtomicU64::new(0),
+            records,
         }))
     }
 
@@ -650,8 +752,10 @@ impl Kernel {
     fn thread_on(&self, cpu: usize) -> OnCpu {
         OnCpu {
             world: Arc::clone(&self.0),
-            cpu,
+            cpu: Cell::new(cpu),
+            record: self.0.cpus[cpu].home.map(|(record, _)| record),
             can_block: true,
+            moves_to: Cell::new(None),
         }
     }
 
@@ -672,13 +776,25 @@ impl Kernel {
         let me = self.thread_on(cpu);
         thread::spawn(move || body(me))
     }
+
+    /// Spawns the kernel thread on `cpu`, which is moved to processor `to` just before it first
+    /// blocks (`OnCpu::move_if_asked`).
+    fn spawn_moving<R: 'static>(
+        &self,
+        cpu: usize,
+        to: usize,
+        body: impl FnOnce(OnCpu) -> R + 'static,
+    ) -> JoinHandle<R> {
+        let me = self.thread_on(cpu);
+        me.moves_to.set(Some(to));
+        thread::spawn(move || body(me))
+    }
 }
 
-/// `sched::ThreadRef`: a processor and a run-queue slot's generation.
+/// `sched::ThreadRef`: a thread's record and the record's generation (ADR-0020 S1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ThreadName {
-    cpu: usize,
-    slot: usize,
+    record: u32,
     generation: u32,
 }
 
@@ -687,13 +803,18 @@ struct ThreadName {
 /// under the same lock.
 struct OnCpu {
     world: Arc<World>,
-    cpu: usize,
+    /// The processor the thread runs on.
+    cpu: Cell<usize>,
+    /// The thread's record; `None` for a processor's idle context.
+    record: Option<u32>,
     can_block: bool,
+    /// The processor this thread is moved to just before it next blocks, if a model asked.
+    moves_to: Cell<Option<usize>>,
 }
 
 impl OnCpu {
     fn this_cpu(&self) -> &Cpu {
-        &self.world.cpus[self.cpu]
+        &self.world.cpus[self.cpu.get()]
     }
 
     /// Halted in the idle context until a restart finds this thread ready.
@@ -716,19 +837,55 @@ impl OnCpu {
     fn timer_tick(&self) {
         self.this_cpu().kick.notify();
     }
+
+    /// If a model asked, moves this thread to another processor, standing for ADR-0020 S6's move
+    /// of a preempted thread, made by another processor: under both queues' locks, taken in index
+    /// order, the thread's slot leaves the source queue and a slot of the destination's takes it,
+    /// carrying its pending wake-up, and its record's location follows. It then runs there. A
+    /// copy of a move not yet built: the source frees the slot by `RunQueue::exit`, which S6's
+    /// `depart` will replace, and the destination's next tick picks it.
+    fn move_if_asked(&self) {
+        let Some(to) = self.moves_to.take() else {
+            return;
+        };
+        let from = self.cpu.get();
+        let record = self.record.unwrap();
+        let first = self.world.cpus[from.min(to)].queue.lock();
+        let second = self.world.cpus[from.max(to)].queue.lock();
+        let (mut source, mut destination) = if from < to {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let left = source.current();
+        let pending = source.wake_pending(left);
+        assert_eq!(source.exit(THREAD_FRAME).unwrap(), IDLE_FRAME);
+        let arrived = destination
+            .push_weighted(THREAD_FRAME, DEFAULT_WEIGHT, Some(record))
+            .unwrap();
+        if pending {
+            let generation = destination.generation(arrived);
+            // Ready there, so it keeps the wake-up for its block.
+            assert!(!destination.wake(arrived, generation));
+        }
+        assert_eq!(destination.tick(IDLE_FRAME), THREAD_FRAME);
+        self.world.record(record).set_location(Location::new(
+            to.try_into().unwrap(),
+            arrived.try_into().unwrap(),
+        ));
+        drop((source, destination));
+        self.cpu.set(to);
+    }
 }
 
 impl Scheduler for OnCpu {
     type Thread = ThreadName;
 
     fn current_thread(&self) -> Option<ThreadName> {
-        self.can_block.then(|| {
-            let cpu = self.this_cpu();
-            ThreadName {
-                cpu: self.cpu,
-                slot: cpu.slot,
-                generation: cpu.generation,
-            }
+        let record = self.record.filter(|_| self.can_block)?;
+        Some(ThreadName {
+            record,
+            generation: self.world.record(record).generation(),
         })
     }
 
@@ -738,6 +895,7 @@ impl Scheduler for OnCpu {
     }
 
     fn block(&self) {
+        self.move_if_asked();
         let next = self.this_cpu().queue.lock().block(THREAD_FRAME).unwrap();
         if next == THREAD_FRAME {
             return; // A wake-up was pending: this thread goes on.
@@ -747,6 +905,7 @@ impl Scheduler for OnCpu {
     }
 
     fn block_until(&self, deadline: u64) {
+        self.move_if_asked();
         let cpu = self.this_cpu();
         let ticks = if deadline == UNREACHABLE { u64::MAX } else { 1 };
         let next = cpu
@@ -774,12 +933,15 @@ impl Scheduler for OnCpu {
     }
 
     fn wake(&self, thread: ThreadName) {
-        let target = &self.world.cpus[thread.cpu];
-        let woke = target.queue.lock().wake(thread.slot, thread.generation);
-        // `sched::wake`: the IPI goes only to another processor. A thread woken from its own
-        // processor runs at that processor's next timer tick.
-        if woke && thread.cpu != self.cpu {
-            target.kick.notify();
+        let record = self.world.record(thread.record);
+        match threads::wake(&*self.world, record, thread.generation).outcome {
+            // `sched::wake`: the IPI goes only to another processor. A thread woken from its own
+            // processor runs at that processor's next timer tick.
+            Outcome::Reached { ready: true, cpu } if cpu as usize != self.cpu.get() => {
+                self.world.cpus[cpu as usize].kick.notify();
+            }
+            Outcome::Exhausted => panic!("a wake-up followed its thread {WAKE_TRIES} times"),
+            Outcome::Reached { .. } | Outcome::Stale | Outcome::Gone => {}
         }
     }
 
@@ -1350,6 +1512,255 @@ fn wait_queue_timed_stale_wake_up_is_harmless() {
         preempted(3, SPINS),
         preempted(4, SPINS),
         || stale_wake_up(Wait::Timed),
+    );
+}
+
+// ---------------------------------------------------------------- the thread records
+
+/// A thread registers on a wait queue and, before it blocks, is moved to another processor; a
+/// waker on a third processor sets the condition and wakes the queue at any point of that
+/// (ADR-0020 S1, TASKS item 92). The wake-up must follow the thread to its new slot, or reach the
+/// old one before the move and travel with it. A lost wake-up leaves the waiter blocked, which
+/// Loom reports as a deadlock.
+fn a_wake_follows_a_move(wait: Wait) {
+    let world = Kernel::with_threads_on(&[true, false, false]);
+    let queue = Arc::new(Queue::new());
+    let flag = Arc::new(AtomicBool::new(false));
+    let waiter = world.spawn_moving(0, 1, {
+        let (queue, flag) = (Arc::clone(&queue), Arc::clone(&flag));
+        move |me| {
+            wait.until(&queue, &me, || flag.load(Acquire));
+            assert!(flag.load(Acquire), "returned with the condition false");
+        }
+    });
+    let waker = world.spawn(2, move |me| {
+        flag.store(true, Release);
+        queue.wake_one(&me);
+    });
+    waiter.join().unwrap();
+    waker.join().unwrap();
+}
+
+#[test]
+fn threads_a_wake_follows_a_move() {
+    check(
+        "threads_a_wake_follows_a_move",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || a_wake_follows_a_move(Wait::Untimed),
+    );
+}
+
+/// As `threads_a_wake_follows_a_move`, the waiter's wait timed, with a deadline that never comes.
+#[test]
+fn threads_a_timed_wake_follows_a_move() {
+    check(
+        "threads_a_timed_wake_follows_a_move",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || a_wake_follows_a_move(Wait::Timed),
+    );
+}
+
+/// What a wake-up by a stale name must not do.
+const STALE_WOKE: &str = "a stale name woke the record's next thread";
+
+/// A thread is named, then exits; its record is given back and handed to a new thread, which is
+/// queued in the very slot the first one had, so its location is the old one's. A wake-up by the
+/// old name, racing the new thread's wait, must answer `Stale` and leave it alone: no wake-up
+/// kept for it, none made ready. The new thread's own waker then ends its wait.
+fn a_stale_name_wakes_nobody() {
+    let world = Kernel::with_cpus(2);
+    let kernel = Arc::clone(&world.0);
+    let old = world.thread_on(0).current_thread().unwrap();
+    let (_, slot) = kernel.cpus[0].home.unwrap();
+    let record = kernel.record(old.record);
+    {
+        // `sched::on_exit`: the slot freed and the location cleared in one critical section.
+        let mut q = kernel.cpus[0].queue.lock();
+        assert_eq!(q.exit(THREAD_FRAME).unwrap(), IDLE_FRAME);
+        record.clear_location();
+    }
+    // Its reap gives the record back; a spawn takes it again, with its next generation, and
+    // queues the new thread, which lands in the same slot.
+    assert!(kernel.records.give_back(old.record as usize));
+    let (index, generation) = kernel.records.take().unwrap();
+    assert_eq!(index, old.record as usize);
+    assert_ne!(generation, old.generation);
+    {
+        let mut q = kernel.cpus[0].queue.lock();
+        let again = q
+            .push_weighted(THREAD_FRAME, DEFAULT_WEIGHT, Some(old.record))
+            .unwrap();
+        assert_eq!(again, slot);
+        record.set_location(Location::new(0, slot.try_into().unwrap()));
+        assert_eq!(q.tick(IDLE_FRAME), THREAD_FRAME);
+    }
+    let queue = Arc::new(Queue::new());
+    let flag = Arc::new(AtomicBool::new(false));
+    let second = world.spawn(0, {
+        let (queue, flag) = (Arc::clone(&queue), Arc::clone(&flag));
+        move |me| {
+            assert_eq!(me.current_thread().unwrap().generation, generation);
+            Wait::Untimed.until(&queue, &me, || flag.load(Acquire));
+        }
+    });
+    let waker = world.spawn(1, move |me| {
+        let woke = threads::wake(&*me.world, me.world.record(old.record), old.generation);
+        assert!(woke.outcome == Outcome::Stale, "{STALE_WOKE}");
+        assert!(
+            !me.world.cpus[0].queue.lock().wake_pending(slot),
+            "{STALE_WOKE}: it kept a wake-up"
+        );
+        flag.store(true, Release);
+        queue.wake_one(&me);
+    });
+    second.join().unwrap();
+    waker.join().unwrap();
+}
+
+#[test]
+fn threads_a_stale_name_wakes_nobody() {
+    check(
+        "threads_a_stale_name_wakes_nobody",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        a_stale_name_wakes_nobody,
+    );
+}
+
+/// What a wake-up racing its thread's exit must not do.
+const EXIT_FOLLOWED: &str = "a wake-up counted an exit or a new thread as a move";
+
+/// A wake-up by a thread's name races the thread's exit on its processor, the record's return
+/// to its block, and a spawn that takes the record for a new thread on another processor. Nothing
+/// moves, so the wake-up must follow nothing (the count the kernel's boot proofs hold at 0, TASKS
+/// item 92): it reaches the thread before its exit, or finds it gone, or finds its name stale;
+/// and it never wakes the new thread.
+fn a_wake_racing_an_exit_follows_nothing() {
+    let world = Kernel::with_cpus(2);
+    let kernel = Arc::clone(&world.0);
+    let name = world.thread_on(0).current_thread().unwrap();
+    let exit = thread::spawn({
+        let kernel = Arc::clone(&kernel);
+        move || {
+            let record = kernel.record(name.record);
+            {
+                // `sched::on_exit`.
+                let mut q = kernel.cpus[0].queue.lock();
+                assert_eq!(q.exit(THREAD_FRAME).unwrap(), IDLE_FRAME);
+                record.clear_location();
+            }
+            // Its reap, then `sched::spawn_with` on processor 1.
+            assert!(kernel.records.give_back(name.record as usize));
+            let (index, _) = kernel.records.take().unwrap();
+            assert_eq!(index, name.record as usize);
+            let mut q = kernel.cpus[1].queue.lock();
+            let slot = q
+                .push_weighted(IDLE_FRAME + 0x2000, DEFAULT_WEIGHT, Some(name.record))
+                .unwrap();
+            record.set_location(Location::new(1, slot.try_into().unwrap()));
+            slot
+        }
+    });
+    let waker = thread::spawn({
+        let kernel = Arc::clone(&kernel);
+        move || {
+            let woke = threads::wake(&*kernel, kernel.record(name.record), name.generation);
+            assert_eq!(woke.retries, 0, "{EXIT_FOLLOWED}");
+            if let Outcome::Reached { cpu, .. } = woke.outcome {
+                assert_eq!(cpu, 0, "{EXIT_FOLLOWED}: it reached the new thread");
+            }
+        }
+    });
+    let slot = exit.join().unwrap();
+    waker.join().unwrap();
+    assert!(
+        !kernel.cpus[1].queue.lock().wake_pending(slot),
+        "{EXIT_FOLLOWED}: the new thread kept its wake-up"
+    );
+}
+
+#[test]
+fn threads_a_wake_racing_an_exit_follows_nothing() {
+    check(
+        "threads_a_wake_racing_an_exit_follows_nothing",
+        preempted(3, SPINS),
+        EXHAUSTIVE,
+        a_wake_racing_an_exit_follows_nothing,
+    );
+}
+
+/// What a switch must find in the incoming thread's record.
+const NOT_RESTORED: &str = "a switch restored other than what the thread's last switch-out saved";
+
+/// A processor's timer switches twice between two threads, as `sched::with_queue` does: under
+/// its queue's lock, the outgoing thread's state is saved in its record, then the incoming one's
+/// read from its own, each record's lock released before the next is taken (the lock order of
+/// `threads.rs`). Meanwhile, from other processors, a waker names the first thread and wakes it
+/// through its record, and a reader finds the running thread's record through the queue, then
+/// reads it, as `sched::current_user` does. Each restore reads what that thread's last switch-out
+/// saved; Loom's cell checks that every access to a record's state is ordered with every other,
+/// and its deadlock check that the locks are taken in an order that cannot wait in a circle.
+fn a_switch_takes_each_record_in_turn() {
+    let world = Kernel::with_threads_on(&[true, false, false]);
+    let kernel = Arc::clone(&world.0);
+    let first = world.thread_on(0).current_thread().unwrap();
+    // A second thread on the first's processor, ready, its record located in its slot.
+    let (index, _) = kernel.records.take().unwrap();
+    let second = u32::try_from(index).unwrap();
+    {
+        let mut q = kernel.cpus[0].queue.lock();
+        let slot = q
+            .push_weighted(IDLE_FRAME + 0x2000, DEFAULT_WEIGHT, Some(second))
+            .unwrap();
+        kernel
+            .record(second)
+            .set_location(Location::new(0, slot.try_into().unwrap()));
+    }
+    let timer = thread::spawn({
+        let kernel = Arc::clone(&kernel);
+        move || {
+            for round in 1..=2_u64 {
+                let mut q = kernel.cpus[0].queue.lock();
+                let old = q.current();
+                q.tick(THREAD_FRAME);
+                let new = q.current();
+                assert_ne!(old, new, "two equal threads take turns");
+                if let Some(record) = q.record(old) {
+                    *kernel.record(record).state().lock() = round;
+                }
+                if let Some(record) = q.record(new) {
+                    let restored = *kernel.record(record).state().lock();
+                    // The first thread's last switch-out was round 1; the second has not run.
+                    let saved = if record == first.record { round - 1 } else { 0 };
+                    assert_eq!(restored, saved, "{NOT_RESTORED}");
+                }
+            }
+        }
+    });
+    let waker = world.spawn(1, move |me| me.wake(first));
+    let reader = thread::spawn(move || {
+        let running = {
+            let q = kernel.cpus[0].queue.lock();
+            q.record(q.current())
+        };
+        if let Some(record) = running {
+            let _ = *kernel.record(record).state().lock();
+        }
+    });
+    timer.join().unwrap();
+    waker.join().unwrap();
+    reader.join().unwrap();
+}
+
+#[test]
+fn threads_a_switch_takes_each_record_in_turn() {
+    check(
+        "threads_a_switch_takes_each_record_in_turn",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        a_switch_takes_each_record_in_turn,
     );
 }
 
