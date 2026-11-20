@@ -874,6 +874,22 @@ Each fault failed where aimed: T66-3, 4, 5, 7, 8, 9b, 10, 11, 13, 14, 16, 17, 19
 - **At twenty** (5 small boots): 4 passed; one failed the ping-pong at its run 8, by its own rule.
 - **At ten** (2 large boots): both refused, as before TASKS item 66: the 65-processor machine at the window, the 67-processor machine at the tick proof, slow in all 4 runs with its count's period in bounds.
 
+
+**The controls of TASKS item 83 (QEMU machines with the rented board's shapes; 2026-11-20, Rust 1.100.0, QEMU 11.1.3 TCG, 2 processors, 64 GiB, AMD-Vi, the board's IOMMU):** temporary edits on `claude/rental-b-readiness-33dcba` at `88aac4dc`, the code of the review's answers (`REVIEW_T83_2026-11-20.md`). A script applied each edit, kept its diff, booted the `kernel boot` scenario once with the rented board's settings (`ORIGIN_QEMU_SHAPE=on`, `ORIGIN_QEMU_MEMORY=64G`, `ORIGIN_QEMU_IOMMU=amd`; RB-3 without the shape), then put the file back with `git checkout`, in one turn of the machine (09:58 to 10:07 UTC). The four diffs are kept with the coordinating session's notes (`t83-controls/`). In the same turn the same code passed `boot-large` and `boot-rented` under both IOMMUs at 64 GiB and again at 8 GiB, CI's size (`GITHUB_ACTIONS=true`):
+- **64 GiB:** `65448 MiB usable`, `65443 MiB` free, a `65495 MiB direct map` and `numa: … 65535 MiB` on the rented machine. The console moved to COM2, and the census recorded the FACS, FBPT and S3PT as never lent, 3 kept, 0 gaps.
+- **8 GiB:** `8104 MiB usable` and `8101 MiB` free, the figure the review's T83-1 predicted the earlier 1% rule would fail.
+
+Each control failed with `boot-test` exit 1, and the tree was clean afterwards. RB-1, RB-2 and RB-4 are rental B's case: the kernel stayed on COM1 and ran to its last line there, with nothing on the UART the firmware names, and the checker names that line and the console's own reason.
+
+| Control | Edit | Caught |
+|---|---|---|
+| RB-1 | The application puts the RSDP's copy in a loader-data page, RAM the kernel owns, not ACPI NVS: `allocate(bs, ACPI_NVS, 1)` becomes `allocate(bs, LOADER_DATA, 1)` (`tests/emulator/reserved-memory/src/main.rs`) | Nothing on COM2; `COM1's last kernel line: "origin-kernel: M1 entry complete; halting"`; `its console's UART: "origin-kernel: console: no usable ACPI SPCR table (cannot map an ACPI table); the UART stays at I/O port 0x3f8"` |
+| RB-2 | The FBPT's page holds only its 8-byte header (`FBPT` and the length 56) at its start, and a byte-for-byte copy of the SPCR at offset 16, which the XSDT's SPCR entry then names. The SPCR so lies inside the FBPT's 56-byte minimum, which the locator guards whatever overlaps it (the application). The contract's RB-2, an FBPT whose declared length covers the SPCR, would not have stopped the move: by the locator's rule a table beyond a structure's minimum stays lendable, and only the census fails | Nothing on COM2; COM1's last kernel line `M1 entry complete; halting`; `its console's UART: "… no usable ACPI SPCR table (it overlaps a structure the firmware changes after boot: copy it, never lend it); …"` |
+| RB-3 | `covered_end` counts no memory above 4 GiB (`framekernel/frame/src/frames.rs`) | The memory figures: `the frame allocator's 1989 MiB free is not within 16 MiB below the 65480 MiB usable` |
+| RB-4 | No UART at `0x2F8`: QEMU's second UART moved to `0x3E8` (`developer-tools/xtask/src/main.rs`) | Nothing on COM2; COM1's last kernel line `M1 entry complete; halting`; `its console's UART: "… the ACPI SPCR names a UART at I/O port 0x2f8 that cannot be used (nothing answers at that address); …"` |
+
+An earlier run of the same four, at `7fefbf96`, before the report gave the console's reason, failed the same way.
+
 ## Alternatives
 
 | Alternative | For | Against |

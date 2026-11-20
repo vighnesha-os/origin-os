@@ -528,6 +528,8 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 82. **The IPC proofs' remaining silent refusals print why (TASKS item 80's question 6; the review of TASKS items 76 and 80, T76-80-5). Numbered by the coordinating session on 2026-11-20; not started.** TASKS item 80 makes `abi_and_entry` print the step that refused each of its programs before it fails. The other proofs of "IPC and handles" still return `false` without a line when a process's image, its process object, its script or its thread start is refused, among them `ping_pong`, `exit_closes`, `cancel`, `quotas`, `byte_quota`, `transfer_depth` and `big_message`: 97 more `return false` in `ipc_proof.rs` and 42 in `ipc_proof/*.rs`, not all of them set-up refusals. A refusal in any of them gives only "IPC and handles failed". The fix routes them through TASKS item 80's `not_run` and `start_program`, which then takes its caller's processor and start argument, with a boot control that refuses one and looks for the line.
 
+83. **QEMU machines with the rented board's shapes: more than 4 GiB of RAM, and its firmware tables (rental B's findings, option C). Numbered by the coordinating session on 2026-11-20; contract accepted with rulings the same day; built on `claude/rental-b-readiness-33dcba`, reviewed independently and answered, not landed.** Rental B (2026-11-20, `docs/research/2026-11-20-rental-b-findings.md`) ran Origin's loader on a rented EPYC 4244P server three times, and no kernel line reached the serial console: the kernel prints on COM1 until its SPCR move, and COM1 there was a real UART nobody watched. Every QEMU machine in `xtask` has 512 MiB, and none has the board's table shapes. This task adds machines with more than 4 GiB (64 GiB if the development Mac allows) and with the shapes the findings describe: an SPCR naming COM2 at `0x2F8` with COM1 present, an RSDP and XSDT in ACPI NVS, a FACS named only by the 32-bit `FIRMWARE_CTRL`, an FPDT whose FBPT and S3PT lie in reserved memory, and reserved and device ranges above the RAM. Each shows the kernel reaching its SPCR move and its verdict, or names where it stopped. Built from the findings' description, not from the rental's dumps (item 232). Contract below. (Item 82's line lands with the coordinating session's records.)
+
 84. **Boot info 0.8: the loader hands the SPCR's UART to the kernel (decision item 317; ADR-0010 Amendment 3). Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 83, in the session that ran rental B.** Rental B's kernel printed nothing on the operator's console: it writes to COM1 until its SPCR move, and that server's console is COM2. The loader finds the SPCR before `ExitBootServices`, checks it with the kernel's parser, moved to a crate both build, and records an I/O-port 16550-compatible UART in a new boot-info structure (version 0.8). From `kernel_main`'s first line the kernel writes to that UART and COM1, and E4's move still rules once the page tables are live. Done means: a boot-console scenario whose SPCR names COM2, with COM1 unread, shows the kernel's first line on COM2; a malformed or memory-mapped SPCR gives no UART in boot info and the boot goes on, both as controls; the boot-info structure is checked in the loader and the kernel, with host tests; and a cost-ledger row. A third rental (about $0.81, on the owner's word) can then show where the kernel stops on rental B's server.
 
 85. **`follow_thread` activates the incoming thread's address space from the scheduler's slot (TASKS item 77's review, R77-4). Numbered by the coordinating session on 2026-11-20; not started.** TASKS item 77 made the kernel-stack record and TSS.RSP0 come from the table of contexts, the incoming context's home, rather than from what the scheduler passes, and checks every entry from ring 3 against it. The address space is still taken from the scheduler's slot. A wrong slot would then run one process's thread in another's address space. The fix names the address space from the context the table resumes, or checks the scheduler's choice against it at `resume`, as item 77 did for the stack, with a Loom model and a boot control that plants the wrong slot.
@@ -539,6 +541,9 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 88. **A Loom model of the re-ask on another thread, against the TLB world (TASKS item 73's review, the rest of T73-5). Numbered by the coordinating session on 2026-11-20; not started.** TASKS item 73's models L1 to L4 run the stalled reclaim and its re-ask on one thread. Today only the reviewer's reading under invariant I1 covers a re-ask made by another processor: that the unmap is ordered before the later reclaim's request, through the table's lock and the role's Acquire. The model runs the re-ask on a second thread against the models' TLB world, with a negative control that weakens that ordering and must be caught.
 
 89. **`cargo xtask` fails a boot at its halt line once a required marker is missing (TASKS item 73's hand-over). Numbered by the coordinating session on 2026-11-20; not started.** `cargo xtask` judges a missing marker only when a boot ends at its timeout. TASKS item 73's control K4 on 65 processors failed only at the 300 s timeout, though the kernel had halted at about 80 s. Failing at the kernel's halt line, once every required marker that should precede it is missing, saves that time on every failed boot, with no change to what passes. It needs host tests, and a control showing that a passing boot is unaffected.
+
+91. **A boot proof that writes and reads back a frame near the top of the RAM through the direct map (TASKS item 83's review, T83-3). Numbered by the coordinating session on 2026-11-20; not started.** No boot proof touches memory above the first frames the allocator hands out, so a direct map that stopped short of the RAM's top would pass every proof that does not check its figure. `boot-large` and `boot-rented` now hold the direct map's figure against the RAM (TASKS item 83), and this proof would show the mapping itself works there: a frame near the top, written and read back through its direct-map address, and freed. Kernel code, outside TASKS item 83's ownership.
+
 
 ## Waiting on the owner
 
@@ -3117,3 +3122,87 @@ Built on `claude/t75-77-81` from `618b0961`: `be2fdf9e` (`Contexts::withdraw`, t
 2. R75-2: reserve a table slot for each processor's boot or idle flow, so that spawns in flight can never make that flow's switch-out halt.
 
 **Not shown:** anything under KVM, in CI or on a physical machine; an exhaustive Loom search of W1, K1, B1 and B2 beyond the gate's bounds. No person has reviewed the code.
+
+### 83. QEMU machines with the rented board's shapes: more than 4 GiB of RAM, and its firmware tables
+
+Written 2026-11-20, before any of it was built, by the session that ran rental B's readiness and findings. Proposed to the coordinating session; nothing here is built until it rules.
+
+- **Task ID:** TASKS item 83 (rental B's findings, option C; no owner decision needed).
+- **Objective:** boot the kernel under QEMU on machines that have what rental B's board had and no `xtask` machine has: more than 4 GiB of RAM, and the firmware-table and memory-map shapes `docs/research/2026-11-20-rental-b-findings.md` describes. Each machine must show the kernel reaching its SPCR move and its verdict, or name where it stopped (COM1's last kernel line, which the machine keeps in a file). If one of these shapes is what stopped the kernel on the rented board, it fails here, for free.
+- **Source ownership:** `developer-tools/xtask` (the machines, their settings and checks); the TEST ONLY application `tests/emulator/reserved-memory` (extended, see question 2); the records below. No kernel or loader code: if a machine fails, the fix is a task of its own, numbered by the coordinating session.
+- **Architecture contract:** ADR-0010 E4 (the console's move to the SPCR's UART, and its replay); ADR-0019 A6 and TASKS item 71 (the first lookup's locator, the never-lent structures); ADR-0004's layout (the direct map, a directory per GiB); ADR-0007 Amendment 1 (reserved memory); ADR-0013 (the verdict and the controls' record); ADR-0011 Amendment 4 and TASKS item 61 (`boot-matrix` in one process, typed settings, variable names only in `settings.rs`).
+- **Relevant specifications:** ACPI 6.6 §5.2.5 (RSDP), §5.2.8 (XSDT), §5.2.9 (FADT: `FIRMWARE_CTRL` and `X_FIRMWARE_CTRL`), §5.2.10 (FACS), §5.2.24 (FPDT, FBPT, S3PT); Microsoft's SPCR (revision 2, as `spcr_table` builds it now); UEFI 2.11 §4.6 (`InstallConfigurationTable`), §7.2 (`AllocatePages` and the memory types). The owner's local copies; paraphrased, nothing copied in.
+- **Required dependencies:** none new. The application keeps to the UEFI specification. Device ranges above the RAM may need the PI specification's DXE services (question 3).
+
+**The machines** (each the kernel boot only, as `boot-reserved`'s are):
+
+| Machine | What it is | IOMMU | What it must show |
+|---|---|---|---|
+| `large` | The usual machine with 64 GiB (two NUMA nodes of 32 GiB), or the largest the Mac takes (below) | Intel and AMD: 2 boots | `frame allocator: N free frames (M MiB)` with M within 1% of the RAM the firmware gives; `page tables loaded: … direct map` covering it; the NUMA proofs on 32 GiB nodes; the verdict, the usual QEMU one (decision item 154) |
+| `rented` | `large`'s memory, the SPCR scenario's UARTs (COM1 to a file, COM2 at `0x2F8` to the checker, both present), and the TEST ONLY application before the loader, shaping the tables and the map as below | AMD (the board's), and Intel: 2 boots | On COM2: the replayed early lines, the move (`the ACPI SPCR (revision 2, interface 0x0) names a UART at I/O port 0x2f8: moving the console there`, `the UART is now at I/O port 0x2f8, as the firmware set it`), the census's lines for the located FACS, FBPT and S3PT, and the verdict. COM1 stops at the move (`check_com1_stopped_at_the_move`) |
+
+**What the application shapes for `rented`,** all built from the findings' description and the specifications, none from the rental's bytes:
+1. The RSDP and the XSDT copied into new `EfiACPIMemoryNVS` pages, and the ACPI 2.0 configuration table pointed at the copy.
+2. A copy of QEMU's FADT whose `X_FIRMWARE_CTRL` is 0 and whose 32-bit `FIRMWARE_CTRL` names the FACS, re-checksummed, with the XSDT's entry pointed at it.
+3. An FPDT (FBPT and S3PT pointer records) added to the XSDT, its FBPT and S3PT in new `EfiReservedMemoryType` pages, each with its signature and header (ACPI 6.6 §5.2.24).
+4. The SPCR as the SPCR scenario gives it now: revision 2, a 16550 at I/O `0x2F8`, 115 200 baud.
+5. Reserved memory above 4 GiB: a range at the top of the RAM, as the board's firmware keeps one there; and, through DXE services if question 3 allows, a device range above the RAM and a reserved range just below 1 TiB, as the board's map has.
+The application prints each change, as it prints its regions now, so the checker can hold the kernel's report against it.
+
+**When a machine fails, it names where:** the checker prints COM1's last kernel line, which the file keeps from the first line of the boot, beside COM2's. That is the line rental B could not see.
+
+**Controls** (ADR-0013, each run once and recorded; none in `boot-matrix`):
+- RB-1: the application puts the RSDP copy in loader-data memory (RAM the kernel will own). The kernel must refuse to read it, the move must not happen, and `rented` must fail naming COM1's last line.
+- RB-2: an FBPT whose declared length covers the SPCR. The lend of the SPCR is refused, the move does not happen, and `rented` fails.
+- RB-3: `covered_end` changed to ignore memory above 4 GiB. `large`'s frame-allocator figure is wrong, and it fails.
+- RB-4: COM2's output thrown away (the SPCR names `0x2F8`, but no device is there). The kernel's probe finds nothing, it stays on COM1, and `rented` fails, showing that the checker cannot pass a move it did not see.
+
+**Memory on the Mac (performance constraint):** the 8 GiB boot of 2026-11-20 passed. The first step is one 64 GiB boot under `exclusive`, watching QEMU's resident memory and the Mac's swap. If QEMU stays under 4 GiB resident and the Mac does not swap, the machines use 64 GiB. Otherwise they use 32 GiB, then 16 GiB, and the record says why.
+
+**Cost in `boot-matrix` time:** four kernel boots added. On 2026-11-20 a 512 MiB and an 8 GiB boot of the same image under `cargo xtask run` took 16 and 17 seconds under TCG on the Mac, once they had the turn, build checks included. At 64 GiB, OVMF's start may take longer: the first step measures it. **Estimate: 2 to 5 minutes added** to `boot-matrix`'s boots, about 1,150 s now (TASKS item 71's gates); every boot runs inside `cargo xtask exclusive --`. CI: see question 1.
+
+**Security invariants:**
+1. The application stays TEST ONLY: it is built only by `xtask` and never staged by `cargo xtask build`.
+2. No byte of the rental's dumps enters the repository (item 232).
+3. The checker can fail a machine but never makes one pass that did not print what it requires: every new marker is the kernel's own text.
+
+**Required tests:**
+- host tests for each table the application builds (checksum, lengths, the 32-bit FACS pointer);
+- the four machines in `boot-matrix`, and the four controls each failing;
+- `check`, `boot-test` and `boot-matrix` in one turn at the end.
+
+**Deliverables:**
+- the machines (`cargo xtask boot-large`, `cargo xtask boot-rented`), and both in `boot-matrix`;
+- the application's shaping;
+- ADR-0013's controls RB-1 to RB-4;
+- `docs/STATUS.md`;
+- the requirements rows whose evidence these machines add to: the console move (ADR-0010 E4), the frame allocator, the direct map, and the FACS/FPDT locator;
+- `SOURCE_PROVENANCE.md`'s row for the application.
+
+**Acceptance:** each machine shows its move and its verdict on both IOMMUs, or the failure is reported to the coordinating session with COM1's last line and becomes a task of its own; the controls fail; the gates pass.
+
+**Questions for the coordinating session:**
+1. **CI.** GitHub's standard runners have far less memory than 64 GiB. Should CI run `large` and `rented` at the size its runners take (8 GiB, say), or only on the Mac, as `ORIGIN_BOOT_MATRIX_ANY_COUNT` keeps the large processor counts?
+2. **One application or two.** Extend `tests/emulator/reserved-memory`, which already copies tables, edits the XSDT and starts the loader, with a second configuration (recommended), or write a sibling application?
+3. **Device and high reserved ranges above the RAM.** Creating ranges where there is no RAM needs the PI specification's DXE services (`AddMemorySpace`, `SetMemorySpaceAttributes`), not UEFI's. Is the PI specification an allowed source here (free, from uefi.org)? Without it, item 5 shapes only the reserved range at the top of the RAM, and the rest is recorded as not shown.
+
+**Rulings of the coordinating session (2026-11-20), accepting the contract:**
+- **Q1, CI:** as `ORIGIN_BOOT_MATRIX_ANY_COUNT`'s machines are kept: the full-size `large` and `rented` boots run on the Mac only, and CI runs both machines at 8 GiB, so the shapes and the move are covered on every pull request. The size is one typed setting in `xtask`'s `Settings` (as TASKS item 61 made them), not a reading of the environment of its own.
+- **Q2:** `tests/emulator/reserved-memory` is extended.
+- **Q3:** the UEFI Platform Initialization specification is a free official specification, allowed under §3 if it can be read. No project's source fills the gap: this session writes code, and §3 keeps such reading in a session of its own. **No copy is at hand** (uefi.org refuses automated reading), so item 5 shapes only reserved RAM at the top of the memory; device and reserved ranges above the RAM are recorded as not shown. The owner can supply the PI specification's PDF, as they did UEFI 2.11's.
+- **Memory, a hard stop:** 64 GiB is tried once, under `exclusive`, watching QEMU's resident memory and the Mac's swap. If QEMU passes 8 GB resident or swap grows at all, the boot is stopped and 32 GiB, then 16 GiB, tried. The size settled on, and why, is recorded.
+- **The rest as written:** RB-1 to RB-4, each failing; the checker printing COM1's last kernel line on a failure; about four boots added. Then an independent review, the full gates once on the final tip, and the branch to the keeper with the tool, the findings and the records. Item 317 stays unbuilt until the owner accepts it.
+
+**As built (2026-11-20):**
+- **The memory trial:** one 64 GiB boot under `exclusive`, guarded by a script that would have stopped QEMU at 8 GB resident or at any growth of the swap. QEMU's resident memory peaked at 0.23 GB, the swap stayed at 4,760 MB, and the boot took 14 s. **The full size is 64 GiB** (`FULL_MEMORY_GIB` in `settings.rs`); CI's is 8 GiB.
+- **The machines:** `boot-large` and `boot-rented`, each under both IOMMUs, in about 13 s a boot, each ending with the QEMU verdict. Their first boots failed on two markers of the rented machine's, both fixed to what the machine showed (`7fefbf96`).
+- **The controls:** RB-1 to RB-4, each failing (ADR-0013). RB-1, RB-2 and RB-4 leave the kernel running to `M1 entry complete; halting` on COM1 with nothing on COM2, as on rental B.
+- **Item 5 of the shapes:** only reserved RAM at the top of the memory (Q3); the ranges above the RAM are not shown.
+- **A departure:** the failure report also gives the console's last line about the firmware's UART (`5a184a3c`), which the contract did not ask for, so that a boot that stayed on COM1 says why.
+- **The independent review** (`docs/engineering/REVIEW_T83_2026-11-20.md`, an AI reviewer: 1 High, 3 Medium, 8 Low), **answered in `88aac4dc`:**
+  - **T83-1, T83-2:** the contract's 1% rule would have failed CI's rented machine on a correct kernel. It is replaced by the boot's own figures, each held against the RAM less the reserved top: the usable memory, the free memory, the direct map and the NUMA total (`check_memory`).
+  - **T83-3:** the direct map and the NUMA total are now checked. No proof touches a frame near the top of the RAM; that is kernel code, outside this task, and is proposed to the coordinating session as a task of its own.
+  - **T83-4:** the controls were run again with the console's reason, under AMD-Vi, their diffs kept, and RB-2's change of design from the contract's is recorded (ADR-0013).
+  - **T83-5 to T83-12:** each fixed, as `88aac4dc` lists, but T83-6, which is recorded: the application is aimed at OVMF and departs from UEFI 2.11 §7.2's note on runtime memory types.
+- **Checked on `88aac4dc`, in one turn (2026-11-20, 09:58 to 10:07 UTC):** `boot-large` and `boot-rented` under both IOMMUs at 64 GiB and at 8 GiB (`GITHUB_ACTIONS=true`, CI's size), each in about 13 s; the rented 8 GiB machine's `8101 MiB` free is the figure T83-1 predicted. The four controls failed with their reasons.
+- **No requirements row covers the FACS and FPDT locator** (TASKS item 71; ADR-0019's area A row, A19-A6, is not started), so none was updated for it, as the contract's deliverables assumed.

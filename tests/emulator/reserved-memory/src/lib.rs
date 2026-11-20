@@ -1,6 +1,10 @@
 //! **TEST ONLY, never shipped.** The pure half of a UEFI application that gives the boot test
 //! firmware tables with reserved memory in them (TASKS item 40; research ledger
-//! `docs/research/2026-11-12-reserved-memory-identity-maps.md` §4).
+//! `docs/research/2026-11-12-reserved-memory-identity-maps.md` §4), and the firmware-table shapes
+//! of the board rental B ran on (TASKS item 83; `docs/research/2026-11-20-rental-b-findings.md`):
+//! an RSDP and XSDT in ACPI NVS memory, a FACS named only by the FADT's 32-bit field, an FPDT
+//! whose FBPT and S3PT lie in reserved memory, and reserved pages at the top of the RAM. The
+//! shapes are built from that ledger's description and ACPI 6.6, never from the rental's tables.
 //!
 //! QEMU 11.1 builds its DMAR (VT-d) and IVRS (AMD-Vi) with no RMRR and no IVMD, and appends the
 //! tables `-acpitable` gives after its own, so the kernel, which reads the first valid table of
@@ -21,10 +25,11 @@
 /// The configuration file's first four bytes.
 pub const MAGIC: [u8; 4] = *b"ORRV";
 /// The configuration format's version (2: [`Placement::ReservedOther`] and [`Placement::Table`],
-/// and a fill bound to each page's address).
-pub const VERSION: u16 = 2;
-/// Bytes of the header: magic, version, region count.
-pub const HEADER: usize = 8;
+/// and a fill bound to each page's address; 3: the [`Shape`] in the header, TASKS item 83).
+pub const VERSION: u16 = 3;
+/// Bytes of the header: magic, version, region count, the shape's flags and its reserved pages
+/// at the top of the RAM.
+pub const HEADER: usize = 16;
 /// Bytes of one region record.
 pub const RECORD: usize = 24;
 /// Regions a configuration may hold.
@@ -82,10 +87,41 @@ pub struct Region {
     pub pages: u32,
 }
 
+/// What the application shapes besides the regions: rental B's board's firmware tables (TASKS
+/// item 83). [`Shape::default`] shapes nothing, as for `boot-reserved`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shape {
+    /// The RSDP and the XSDT copied into `EfiACPIMemoryNVS` pages, and the configuration
+    /// table's ACPI 2.0 entry pointed at the RSDP's copy.
+    pub acpi_nvs: bool,
+    /// The FADT copied with `X_FIRMWARE_CTRL` zero, so the FACS is named only by the 32-bit
+    /// `FIRMWARE_CTRL` ([`facs_by_32_bit_field`]).
+    pub facs_32: bool,
+    /// An FPDT added to the XSDT, its FBPT and S3PT in `EfiReservedMemoryType` pages.
+    pub fpdt: bool,
+    /// `EfiReservedMemoryType` pages taken at the top of the RAM, as the board's firmware keeps
+    /// a range there; 0 for none.
+    pub top_reserved_pages: u32,
+}
+
+impl Shape {
+    /// Whether it shapes anything.
+    pub const fn any(&self) -> bool {
+        self.acpi_nvs || self.facs_32 || self.fpdt || self.top_reserved_pages != 0
+    }
+
+    const fn flags(&self) -> u32 {
+        (self.acpi_nvs as u32) | (self.facs_32 as u32) << 1 | (self.fpdt as u32) << 2
+    }
+}
+
+/// The flags a [`Shape`] may set.
+const SHAPE_FLAGS: u32 = 0b111;
+
 /// Why a configuration file was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigError {
-    /// Not this format, or not this version.
+    /// Not this format, or not this version, or a shape flag this version does not define.
     Header,
     /// The file's length does not match its region count, or the count is above
     /// [`MAX_REGIONS`].
@@ -110,9 +146,9 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(v))
 }
 
-/// A configuration file for `regions` (at most [`MAX_REGIONS`]): the header, then one record
-/// each.
-pub fn encode(regions: &[Region], out: &mut [u8]) -> Option<usize> {
+/// A configuration file for `regions` (at most [`MAX_REGIONS`]) and `shape`: the header, then
+/// one record each.
+pub fn encode(regions: &[Region], shape: Shape, out: &mut [u8]) -> Option<usize> {
     if regions.len() > MAX_REGIONS {
         return None;
     }
@@ -122,6 +158,8 @@ pub fn encode(regions: &[Region], out: &mut [u8]) -> Option<usize> {
     out[..4].copy_from_slice(&MAGIC);
     out[4..6].copy_from_slice(&VERSION.to_le_bytes());
     out[6..8].copy_from_slice(&(regions.len() as u16).to_le_bytes());
+    out[8..12].copy_from_slice(&shape.flags().to_le_bytes());
+    out[12..16].copy_from_slice(&shape.top_reserved_pages.to_le_bytes());
     for (r, rec) in regions.iter().zip(out[HEADER..].chunks_mut(RECORD)) {
         rec[0] = match r.table {
             Table::Dmar => 1,
@@ -145,12 +183,22 @@ pub fn encode(regions: &[Region], out: &mut [u8]) -> Option<usize> {
     Some(len)
 }
 
-/// Reads a configuration file into `out`; returns how many regions it holds.
-pub fn decode(b: &[u8], out: &mut [Region; MAX_REGIONS]) -> Result<usize, ConfigError> {
+/// Reads a configuration file into `out`; returns how many regions it holds, and its shape.
+pub fn decode(b: &[u8], out: &mut [Region; MAX_REGIONS]) -> Result<(usize, Shape), ConfigError> {
     if b.get(..4) != Some(&MAGIC[..]) || u16_at(b, 4) != Some(VERSION) {
         return Err(ConfigError::Header);
     }
     let count = usize::from(u16_at(b, 6).ok_or(ConfigError::Header)?);
+    let flags = u32_at(b, 8).ok_or(ConfigError::Header)?;
+    if flags & !SHAPE_FLAGS != 0 {
+        return Err(ConfigError::Header);
+    }
+    let shape = Shape {
+        acpi_nvs: flags & 1 != 0,
+        facs_32: flags & 2 != 0,
+        fpdt: flags & 4 != 0,
+        top_reserved_pages: u32_at(b, 12).ok_or(ConfigError::Header)?,
+    };
     if count > MAX_REGIONS || b.len() != HEADER + RECORD * count {
         return Err(ConfigError::Length);
     }
@@ -187,7 +235,7 @@ pub fn decode(b: &[u8], out: &mut [Region; MAX_REGIONS]) -> Result<usize, Config
             pages,
         };
     }
-    Ok(count)
+    Ok((count, shape))
 }
 
 /// The first 16 bytes of every page the application fills.
@@ -313,6 +361,153 @@ pub fn xsdt_set(xsdt: &mut [u8], index: usize, addr: u64) -> Option<()> {
     Some(())
 }
 
+/// Bytes of an ACPI 2.0 RSDP (ACPI 6.6 §5.2.5.3).
+pub const RSDP_LEN: usize = 36;
+/// Bytes of the FPDT the application adds: the 36-byte header and two 16-byte pointer records
+/// (§5.2.24, Tables 5.121, 5.125 and 5.126).
+pub const FPDT_LEN: usize = 68;
+/// Bytes of its FBPT: the 8-byte header and the 48-byte Host Firmware Boot Performance Data
+/// Record (§5.2.24.8 and §5.2.24.9, Tables 5.129 and 5.130).
+pub const FBPT_LEN: usize = 56;
+/// Bytes of its S3PT: the 8-byte header and the 24-byte Basic S3 Resume Performance Record
+/// (§5.2.24.10, Tables 5.131 and 5.132).
+pub const S3PT_LEN: usize = 32;
+/// The FADT's 32-bit FACS field, and its 64-bit one (§5.2.9).
+const FIRMWARE_CTRL: usize = 36;
+const X_FIRMWARE_CTRL: usize = 132;
+
+/// Whether `rsdp` is an ACPI 2.0 RSDP (revision 2 or later, length 36) that names an XSDT, so
+/// its `XsdtAddress` may be read (§5.2.5.3).
+pub fn names_an_xsdt(rsdp: &[u8]) -> bool {
+    rsdp.get(..8) == Some(&b"RSD PTR "[..])
+        && rsdp.get(15).is_some_and(|&r| r >= 2)
+        && u32_at(rsdp, 20) == Some(RSDP_LEN as u32)
+        && u64_at(rsdp, 24).is_some_and(|x| x != 0)
+}
+
+/// A copy of the ACPI 2.0 RSDP `old` that names the RSDT at `rsdt` and the XSDT at `xsdt`, with
+/// both checksums fixed: the first 20 bytes', and the whole structure's (§5.2.5.3). `None` unless
+/// `old` is an RSDP of revision 2 or later that names an XSDT.
+pub fn rsdp_naming(old: &[u8], rsdt: u32, xsdt: u64) -> Option<[u8; RSDP_LEN]> {
+    let old = old.get(..RSDP_LEN)?;
+    if !names_an_xsdt(old) {
+        return None;
+    }
+    let mut new = [0u8; RSDP_LEN];
+    new.copy_from_slice(old);
+    new[16..20].copy_from_slice(&rsdt.to_le_bytes());
+    new[24..32].copy_from_slice(&xsdt.to_le_bytes());
+    new[8] = 0;
+    new[8] = 0u8.wrapping_sub(new[..20].iter().fold(0u8, |s, &b| s.wrapping_add(b)));
+    new[32] = 0;
+    new[32] = 0u8.wrapping_sub(new.iter().fold(0u8, |s, &b| s.wrapping_add(b)));
+    Some(new)
+}
+
+/// The RSDT's entries (§5.2.7): 4-byte physical addresses after the 36-byte header.
+pub fn rsdt_entries(rsdt: &[u8]) -> impl Iterator<Item = (usize, u32)> + '_ {
+    let len = u32_at(rsdt, 4).map_or(0, |l| l as usize).min(rsdt.len());
+    let body = rsdt.get(36..len).unwrap_or(&[]);
+    body.as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, u32::from_le_bytes(*c)))
+}
+
+/// Points RSDT entry `index` at `addr` and fixes the RSDT's checksum.
+pub fn rsdt_set(rsdt: &mut [u8], index: usize, addr: u32) -> Option<()> {
+    let at = 36 + 4 * index;
+    let len = usize::try_from(u32_at(rsdt, 4)?).ok()?;
+    if at + 4 > len || len > rsdt.len() {
+        return None;
+    }
+    rsdt[at..at + 4].copy_from_slice(&addr.to_le_bytes());
+    fix_checksum(&mut rsdt[..len]);
+    Some(())
+}
+
+/// The FADT's two FACS fields, `FIRMWARE_CTRL` and `X_FIRMWARE_CTRL`, as the firmware wrote them
+/// (§5.2.9), or `None` for a table too short to hold the second.
+pub fn facs_fields(fadt: &[u8]) -> Option<(u32, u64)> {
+    if fadt.len() < X_FIRMWARE_CTRL + 8 {
+        return None;
+    }
+    Some((u32_at(fadt, FIRMWARE_CTRL)?, u64_at(fadt, X_FIRMWARE_CTRL)?))
+}
+
+/// Makes the FADT `fadt` name its FACS only by the 32-bit `FIRMWARE_CTRL`: the FACS the table
+/// names (`X_FIRMWARE_CTRL` when non-zero, else `FIRMWARE_CTRL`, as §5.2.9 chooses) goes into
+/// `FIRMWARE_CTRL`, `X_FIRMWARE_CTRL` becomes 0, and the checksum is fixed. Returns the FACS's
+/// address; `None`, and nothing changed, unless the table is a FADT long enough to hold
+/// `X_FIRMWARE_CTRL` whose FACS is named and lies below 4 GiB.
+pub fn facs_by_32_bit_field(fadt: &mut [u8]) -> Option<u32> {
+    let len = usize::try_from(u32_at(fadt, 4)?).ok()?;
+    if fadt.get(..4) != Some(&b"FACP"[..]) || len > fadt.len() || len < X_FIRMWARE_CTRL + 8 {
+        return None;
+    }
+    let x = u64_at(fadt, X_FIRMWARE_CTRL)?;
+    let facs = if x != 0 {
+        u32::try_from(x).ok()?
+    } else {
+        u32_at(fadt, FIRMWARE_CTRL)?
+    };
+    if facs == 0 {
+        return None;
+    }
+    fadt[FIRMWARE_CTRL..FIRMWARE_CTRL + 4].copy_from_slice(&facs.to_le_bytes());
+    fadt[X_FIRMWARE_CTRL..X_FIRMWARE_CTRL + 8].fill(0);
+    fix_checksum(&mut fadt[..len]);
+    Some(facs)
+}
+
+/// An FBPT (§5.2.24.8): its header and the Host Firmware Boot Performance Data Record, type 2,
+/// revision 2, with every timer zero, as no boot was timed.
+pub fn fbpt() -> [u8; FBPT_LEN] {
+    let mut t = [0u8; FBPT_LEN];
+    t[..4].copy_from_slice(b"FBPT");
+    t[4..8].copy_from_slice(&(FBPT_LEN as u32).to_le_bytes());
+    t[8..10].copy_from_slice(&2u16.to_le_bytes());
+    t[10] = 48;
+    t[11] = 2;
+    t
+}
+
+/// An S3PT (§5.2.24.10): its header and the Basic S3 Resume Performance Record, type 0, revision
+/// 1, with no resume counted.
+pub fn s3pt() -> [u8; S3PT_LEN] {
+    let mut t = [0u8; S3PT_LEN];
+    t[..4].copy_from_slice(b"S3PT");
+    t[4..8].copy_from_slice(&(S3PT_LEN as u32).to_le_bytes());
+    t[8..10].copy_from_slice(&0u16.to_le_bytes());
+    t[10] = 24;
+    t[11] = 1;
+    t
+}
+
+/// An FPDT, revision 1 (§5.2.24, Table 5.121), with a Host Firmware Boot Performance Table
+/// Pointer Record naming `fbpt` and an S3 Performance Table Pointer Record naming `s3pt`
+/// (Tables 5.125 and 5.126), and its checksum fixed. The OEM fields name this application.
+pub fn fpdt(fbpt: u64, s3pt: u64) -> [u8; FPDT_LEN] {
+    let mut t = [0u8; FPDT_LEN];
+    t[..4].copy_from_slice(b"FPDT");
+    t[4..8].copy_from_slice(&(FPDT_LEN as u32).to_le_bytes());
+    t[8] = 1;
+    t[10..16].copy_from_slice(b"ORIGIN");
+    t[16..24].copy_from_slice(b"TESTFPDT");
+    t[24..28].copy_from_slice(&1u32.to_le_bytes());
+    t[28..32].copy_from_slice(b"ORGN");
+    t[32..36].copy_from_slice(&1u32.to_le_bytes());
+    for (at, kind, target) in [(36, 0u16, fbpt), (52, 1u16, s3pt)] {
+        t[at..at + 2].copy_from_slice(&kind.to_le_bytes());
+        t[at + 2] = 16;
+        t[at + 3] = 1;
+        t[at + 8..at + 16].copy_from_slice(&target.to_le_bytes());
+    }
+    fix_checksum(&mut t);
+    t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,22 +548,64 @@ mod tests {
         ]
     }
 
+    fn rented() -> Shape {
+        Shape {
+            acpi_nvs: true,
+            facs_32: true,
+            fpdt: true,
+            top_reserved_pages: 8192,
+        }
+    }
+
     #[test]
     fn a_configuration_round_trips() {
         let mut buf = [0u8; 256];
-        let len = encode(&regions(), &mut buf).unwrap();
+        let len = encode(&regions(), Shape::default(), &mut buf).unwrap();
         assert_eq!(len, HEADER + 3 * RECORD);
         let mut out = [regions()[0]; MAX_REGIONS];
-        assert_eq!(decode(&buf[..len], &mut out), Ok(3));
+        assert_eq!(decode(&buf[..len], &mut out), Ok((3, Shape::default())));
         assert_eq!(&out[..3], &regions()[..]);
+        // A shape, with no regions or with them.
+        let len = encode(&[], rented(), &mut buf).unwrap();
+        assert_eq!(len, HEADER);
+        assert_eq!(decode(&buf[..len], &mut out), Ok((0, rented())));
+        for one in [
+            Shape {
+                acpi_nvs: true,
+                ..Shape::default()
+            },
+            Shape {
+                facs_32: true,
+                ..Shape::default()
+            },
+            Shape {
+                fpdt: true,
+                ..Shape::default()
+            },
+            Shape {
+                top_reserved_pages: 1,
+                ..Shape::default()
+            },
+        ] {
+            let len = encode(&regions(), one, &mut buf).unwrap();
+            assert_eq!(decode(&buf[..len], &mut out), Ok((3, one)));
+            assert!(one.any());
+        }
+        assert!(!Shape::default().any());
     }
 
     #[test]
     fn a_bad_configuration_is_refused() {
         let mut buf = [0u8; 256];
-        let len = encode(&regions(), &mut buf).unwrap();
+        let len = encode(&regions(), Shape::default(), &mut buf).unwrap();
         let mut out = [regions()[0]; MAX_REGIONS];
         assert_eq!(decode(&buf[..len - 1], &mut out), Err(ConfigError::Length));
+        let mut bad = buf;
+        bad[8] = 0b1000; // a shape flag version 3 does not define
+        assert_eq!(decode(&bad[..len], &mut out), Err(ConfigError::Header));
+        let mut bad = buf;
+        bad[4] = 2; // version 2's files have an 8-byte header
+        assert_eq!(decode(&bad[..len], &mut out), Err(ConfigError::Header));
         let mut bad = buf;
         bad[0] = b'X';
         assert_eq!(decode(&bad[..len], &mut out), Err(ConfigError::Header));
@@ -386,13 +623,17 @@ mod tests {
         assert_eq!(decode(&bad[..len], &mut out), Err(ConfigError::Record(0)));
         let mut other = buf;
         other[HEADER + 3] = 4; // the reserved pages without the fill
-        assert_eq!(decode(&other[..len], &mut out), Ok(3));
+        assert_eq!(decode(&other[..len], &mut out), Ok((3, Shape::default())));
         assert_eq!(out[0].placement, Placement::ReservedOther);
         other[HEADER + 3] = 5; // the table's own page
-        assert_eq!(decode(&other[..len], &mut out), Ok(3));
+        assert_eq!(decode(&other[..len], &mut out), Ok((3, Shape::default())));
         assert_eq!(out[0].placement, Placement::Table);
         assert_eq!(
-            encode(&[regions()[0]; MAX_REGIONS + 1], &mut [0u8; 1024]),
+            encode(
+                &[regions()[0]; MAX_REGIONS + 1],
+                Shape::default(),
+                &mut [0u8; 1024]
+            ),
             None
         );
     }
@@ -561,5 +802,208 @@ mod tests {
         assert_eq!(&range[..8], &[0x22, 0b0011, 32, 0, 0x10, 0, 0x18, 0]);
         assert_eq!(u64_at(&range, 16), Some(0x1000));
         assert_eq!(u64_at(&range, 24), Some(PAGE));
+    }
+
+    // TASKS item 83: rental B's board's shapes.
+
+    /// An ACPI table: `signature`, its length, revision `rev`, `body` after the header, checksum
+    /// fixed.
+    fn table(signature: &[u8; 4], rev: u8, body: &[u8]) -> Vec<u8> {
+        let mut t = vec![0u8; 36];
+        t[..4].copy_from_slice(signature);
+        t[8] = rev;
+        t[10..16].copy_from_slice(b"ORIGIN");
+        t.extend_from_slice(body);
+        let len = t.len() as u32;
+        t[4..8].copy_from_slice(&len.to_le_bytes());
+        fix_checksum(&mut t);
+        t
+    }
+
+    /// A FADT of revision 6 (276 bytes) naming `facs` by `X_FIRMWARE_CTRL` only, or by both
+    /// fields, and the DSDT at `dsdt` by both of its fields.
+    fn fadt(facs: u64, both: bool, dsdt: u32) -> Vec<u8> {
+        let mut body = vec![0u8; 276 - 36];
+        if both {
+            body[FIRMWARE_CTRL - 36..FIRMWARE_CTRL - 32]
+                .copy_from_slice(&(facs as u32).to_le_bytes());
+        }
+        body[40 - 36..44 - 36].copy_from_slice(&dsdt.to_le_bytes());
+        body[X_FIRMWARE_CTRL - 36..X_FIRMWARE_CTRL - 28].copy_from_slice(&facs.to_le_bytes());
+        body[140 - 36..148 - 36].copy_from_slice(&u64::from(dsdt).to_le_bytes());
+        let mut t = table(b"FACP", 6, &body);
+        t[131] = 0; // FADT minor version
+        fix_checksum(&mut t);
+        t
+    }
+
+    #[test]
+    fn the_facs_ends_up_named_by_the_32_bit_field_alone() {
+        for both in [false, true] {
+            let mut f = fadt(0x7FBD_0000, both, 0x7FB0_0000);
+            assert_eq!(facs_by_32_bit_field(&mut f), Some(0x7FBD_0000));
+            assert_eq!(u32_at(&f, FIRMWARE_CTRL), Some(0x7FBD_0000));
+            assert_eq!(u64_at(&f, X_FIRMWARE_CTRL), Some(0));
+            assert_eq!(sum(&f), 0);
+            // The DSDT's two fields are untouched.
+            assert_eq!(u32_at(&f, 40), Some(0x7FB0_0000));
+            assert_eq!(u64_at(&f, 140), Some(0x7FB0_0000));
+        }
+        // A FACS above 4 GiB cannot be named by 32 bits; nothing changes.
+        let mut high = fadt(0x1_0000_0000, false, 0x7FB0_0000);
+        let before = high.clone();
+        assert_eq!(facs_by_32_bit_field(&mut high), None);
+        assert_eq!(high, before);
+        // No FACS, too short, or not a FADT: refused.
+        assert_eq!(facs_by_32_bit_field(&mut fadt(0, false, 1)), None);
+        assert_eq!(facs_by_32_bit_field(&mut table(b"FACP", 1, &[0; 80])), None);
+        let mut other = fadt(0x7FBD_0000, true, 1);
+        other[..4].copy_from_slice(b"APIC");
+        assert_eq!(facs_by_32_bit_field(&mut other), None);
+    }
+
+    #[test]
+    fn the_rsdp_copy_names_the_new_xsdt_with_both_checksums() {
+        let mut old = [0u8; RSDP_LEN];
+        old[..8].copy_from_slice(b"RSD PTR ");
+        old[9..15].copy_from_slice(b"ORIGIN");
+        old[15] = 2;
+        old[16..20].copy_from_slice(&0x7FB7_E000u32.to_le_bytes());
+        old[20..24].copy_from_slice(&36u32.to_le_bytes());
+        old[24..32].copy_from_slice(&0x7FB7_D000u64.to_le_bytes());
+        let new = rsdp_naming(&old, 0x8E4F_0000, 0x8E4F_1000).unwrap();
+        assert_eq!(u64_at(&new, 24), Some(0x8E4F_1000));
+        assert_eq!(
+            u32_at(&new, 16),
+            Some(0x8E4F_0000),
+            "the RSDT's copy is named"
+        );
+        assert_eq!(sum(&new[..20]), 0);
+        assert_eq!(sum(&new), 0);
+        assert!(names_an_xsdt(&old) && names_an_xsdt(&new));
+        let mut v1 = old;
+        v1[15] = 0;
+        assert!(!names_an_xsdt(&v1));
+        assert_eq!(rsdp_naming(&v1, 1, 1), None, "ACPI 1.0's RSDP has no XSDT");
+        assert_eq!(rsdp_naming(&old[..20], 1, 1), None);
+        let mut no_xsdt = old;
+        no_xsdt[24..32].fill(0);
+        assert!(!names_an_xsdt(&no_xsdt), "an XSDT address of 0 names none");
+    }
+
+    #[test]
+    fn rsdt_entries_are_read_and_set_and_the_facs_fields_read() {
+        let mut rsdt = table(b"RSDT", 1, &[0x00, 0x10, 0, 0, 0x00, 0x20, 0, 0]);
+        assert_eq!(
+            rsdt_entries(&rsdt).collect::<Vec<_>>(),
+            vec![(0, 0x1000), (1, 0x2000)]
+        );
+        rsdt_set(&mut rsdt, 1, 0x3000).unwrap();
+        assert_eq!(rsdt_entries(&rsdt).nth(1), Some((1, 0x3000)));
+        assert_eq!(sum(&rsdt), 0);
+        assert_eq!(rsdt_set(&mut rsdt, 2, 1), None);
+        let mut out = [0u8; 64];
+        let len = grow(&rsdt, &0x4000u32.to_le_bytes(), &mut out).unwrap();
+        assert_eq!(rsdt_entries(&out[..len]).nth(2), Some((2, 0x4000)));
+        let f = fadt(0x7FBD_0000, true, 1);
+        assert_eq!(facs_fields(&f), Some((0x7FBD_0000, 0x7FBD_0000)));
+        assert_eq!(facs_fields(&f[..100]), None);
+    }
+
+    #[test]
+    fn the_performance_tables_have_their_minimum_layouts() {
+        let (b, s) = (fbpt(), s3pt());
+        assert_eq!((&b[..4], u32_at(&b, 4)), (&b"FBPT"[..], Some(56)));
+        assert_eq!((u16_at(&b, 8), b[10], b[11]), (Some(2), 48, 2));
+        assert_eq!((&s[..4], u32_at(&s, 4)), (&b"S3PT"[..], Some(32)));
+        assert_eq!((u16_at(&s, 8), s[10], s[11]), (Some(0), 24, 1));
+        let f = fpdt(0x8E36_4000, 0x8E37_D000);
+        assert_eq!((&f[..4], u32_at(&f, 4), f[8]), (&b"FPDT"[..], Some(68), 1));
+        assert_eq!(sum(&f), 0);
+        assert_eq!((u16_at(&f, 36), f[38], f[39]), (Some(0), 16, 1));
+        assert_eq!(u64_at(&f, 44), Some(0x8E36_4000));
+        assert_eq!((u16_at(&f, 52), f[54], f[55]), (Some(1), 16, 1));
+        assert_eq!(u64_at(&f, 60), Some(0x8E37_D000));
+    }
+
+    /// The shapes as the application leaves them, in a pretend physical memory, read by the
+    /// kernel's own locator and lookup (`origin_frame::acpi`), as `firmware::acpi_table` reads
+    /// them at the console's move: the FACS (by the 32-bit field), the FBPT and the S3PT are
+    /// located and recorded as never lent, and the SPCR the XSDT lists is found and lent.
+    #[test]
+    fn the_kernels_locator_reads_the_shaped_tables() {
+        use origin_frame::acpi::{self, Changing};
+        // Addresses as the board's map has them, in their kinds' ranges: the RSDP, XSDT and FACS
+        // in ACPI NVS, the FADT, FPDT, DSDT and SPCR in ACPI data, the FBPT and S3PT in
+        // reserved memory.
+        const RSDP: u64 = 0x9046_6014;
+        const XSDT: u64 = 0x9046_5728;
+        const FACS: u64 = 0x9046_3000;
+        const FADT: u64 = 0x8E47_3000;
+        const DSDT: u64 = 0x8E3F_5000;
+        const SPCR: u64 = 0x8E47_2000;
+        const FPDT: u64 = 0x8E46_9000;
+        const FBPT: u64 = 0x8E36_4000;
+        const S3PT: u64 = 0x8E37_D000;
+        let mut memory: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut f = fadt(FACS, false, DSDT as u32);
+        facs_by_32_bit_field(&mut f).unwrap();
+        memory.push((FADT, f));
+        let mut facs = vec![0u8; 64];
+        facs[..4].copy_from_slice(b"FACS");
+        facs[4..8].copy_from_slice(&64u32.to_le_bytes());
+        memory.push((FACS, facs));
+        memory.push((DSDT, table(b"DSDT", 2, &[0x10; 4])));
+        let mut spcr = vec![0u8; 80 - 36];
+        spcr[0] = 0; // interface type 0, a full 16550
+        memory.push((SPCR, table(b"SPCR", 2, &spcr)));
+        memory.push((FPDT, fpdt(FBPT, S3PT).to_vec()));
+        memory.push((FBPT, fbpt().to_vec()));
+        memory.push((S3PT, s3pt().to_vec()));
+        let mut entries = Vec::new();
+        for addr in [FADT, SPCR, FPDT] {
+            entries.extend_from_slice(&addr.to_le_bytes());
+        }
+        memory.push((XSDT, table(b"XSDT", 1, &entries)));
+        let mut rsdp = [0u8; RSDP_LEN];
+        rsdp[..8].copy_from_slice(b"RSD PTR ");
+        rsdp[15] = 2;
+        rsdp[20..24].copy_from_slice(&36u32.to_le_bytes());
+        rsdp[24..32].copy_from_slice(&1u64.to_le_bytes());
+        memory.push((RSDP, rsdp_naming(&rsdp, 0, XSDT).unwrap().to_vec()));
+
+        let read = |addr: u64, len: usize| -> Option<&[u8]> {
+            memory.iter().find_map(|(base, bytes)| {
+                let at = usize::try_from(addr.checked_sub(*base)?).ok()?;
+                bytes.get(at..at.checked_add(len)?)
+            })
+        };
+        let mut copy = |addr: u64, out: &mut [u8]| -> Result<(), &'static str> {
+            out.copy_from_slice(read(addr, out.len()).ok_or("not readable")?);
+            Ok(())
+        };
+        let found = acpi::changing_ranges(RSDP, &mut copy);
+        let kinds: Vec<(Changing, u64)> = found.ranges().iter().map(|&(k, b, _)| (k, b)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (Changing::Facs, FACS),
+                (Changing::Fbpt, FBPT),
+                (Changing::S3pt, S3PT)
+            ]
+        );
+        let mut located = false;
+        let mut lend = |addr: u64, len: usize| read(addr, len).ok_or("not readable");
+        let table = acpi::lookup(
+            RSDP,
+            b"SPCR",
+            &mut || core::mem::replace(&mut located, true),
+            &mut |_| {},
+            &mut copy,
+            &mut lend,
+        )
+        .unwrap();
+        assert_eq!(&table[..4], b"SPCR");
+        assert_eq!(table.len(), 80);
     }
 }

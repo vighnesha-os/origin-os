@@ -51,6 +51,7 @@ fn each_variable_is_read_as_boot_test_read_it() {
         (BRIDGE, "on"),
         (RESERVED, "on"),
         (ACPI, "on"),
+        (MEMORY, "8G"),
         (DEBUG, "1"),
         (TIMEOUT, "600"),
         (ONLY, "kernel boot,wrong key"),
@@ -72,6 +73,8 @@ fn each_variable_is_read_as_boot_test_read_it() {
             bridge: true,
             reserved: true,
             acpi: true,
+            memory: Memory::gib(8),
+            shape: false,
             debug: true,
             timeout: Some(Duration::from_secs(600)),
             only: "kernel boot,wrong key".into(),
@@ -112,6 +115,61 @@ fn each_variable_is_read_as_boot_test_read_it() {
     assert_eq!(
         read(&[(TIMEOUT, "0")]).unwrap().timeout,
         Some(Duration::ZERO)
+    );
+}
+
+/// `ORIGIN_QEMU_MEMORY` (TASKS item 83): 512 MiB unset; an even number of MiB from 512, or 1 to
+/// 64 GiB; anything else refused. QEMU takes it as written, and each NUMA node half of it.
+#[test]
+fn the_memory_is_read_and_split_between_the_nodes() {
+    assert_eq!(read(&[]).unwrap().memory, Memory::default());
+    for (value, mib, qemu, node) in [
+        ("512M", 512, "512M", "256M"),
+        ("1024M", 1024, "1G", "512M"),
+        ("1536M", 1536, "1536M", "768M"),
+        ("1G", 1024, "1G", "512M"),
+        ("8G", 8192, "8G", "4G"),
+        ("64G", 65536, "64G", "32G"),
+    ] {
+        let memory = read(&[(MEMORY, value)]).unwrap().memory;
+        assert_eq!(
+            (memory.mib(), memory.qemu(), memory.node()),
+            (mib, qemu.to_string(), node.to_string()),
+            "{value}"
+        );
+    }
+    for bad in [
+        "256M", "513M", "0G", "65G", "8", "8g", "8GiB", "G", "-8G", "8.5G", "+8G", " 8G", "8É",
+        "8Ｇ", "É", "M",
+    ] {
+        let e = read(&[(MEMORY, bad)]).unwrap_err();
+        assert!(e.starts_with("ORIGIN_QEMU_MEMORY must be"), "{bad}: {e}");
+    }
+    assert!(read(&[(SHAPE, "on")]).unwrap().shape);
+    assert!(read(&[(SHAPE, "ON")]).is_err());
+    // The combinations whose checks would replace or drop each other are refused (T83-9).
+    let e = read(&[(SHAPE, "on"), (RESERVED, "on")]).unwrap_err();
+    assert!(e.contains("are not booted together"), "{e}");
+    let e = read(&[(SHAPE, "on"), (CPU, "max,-rdseed,-rdrand")]).unwrap_err();
+    assert!(e.contains("neither RDSEED nor RDRAND"), "{e}");
+    assert!(read(&[(SHAPE, "on"), (CPU, "max,-rdseed")]).is_ok());
+}
+
+/// The coordinating session's ruling Q1 on TASKS item 83: the large machines' full size on a
+/// developer's machine, and 8 GiB in CI, whatever the any-count switch says.
+#[test]
+fn ci_boots_the_large_machines_at_8_gib() {
+    assert_eq!(
+        read(&[]).unwrap().large_memory(),
+        Memory::gib(FULL_MEMORY_GIB)
+    );
+    let ci = read(&[(GITHUB_ACTIONS, "true")]).unwrap();
+    assert_eq!(ci.large_memory(), Memory::gib(8));
+    let ci_all = read(&[(GITHUB_ACTIONS, "true"), (ANY_COUNT, "on")]).unwrap();
+    assert_eq!(ci_all.large_memory(), Memory::gib(8));
+    assert!(
+        read(&[]).unwrap().large_memory().mib() > 4096,
+        "more than 4 GiB"
     );
 }
 
@@ -419,6 +477,8 @@ fn the_commands_that_set_their_machines_refuse_the_person_s() {
             "boot-sparse",
             "boot-many",
             "boot-listed",
+            "boot-large",
+            "boot-rented",
         ]
     );
     for command in ["boot-test", "boot-console", "run"] {
@@ -441,6 +501,12 @@ fn the_commands_that_set_their_machines_refuse_the_person_s() {
             "ORIGIN_QEMU_RESERVED=on is refused here",
         ),
         (&[(ACPI, "on")], "ORIGIN_QEMU_ACPI=on is refused here"),
+        (&[(SHAPE, "on")], "ORIGIN_QEMU_SHAPE=on is refused here"),
+        (&[(MEMORY, "8G")], "ORIGIN_QEMU_MEMORY=8G is refused here"),
+        (
+            &[(MEMORY, "1024M")],
+            "ORIGIN_QEMU_MEMORY=1G is refused here",
+        ),
         (
             &[(TOPOLOGY, "sparse"), (BRIDGE, "on")],
             "ORIGIN_QEMU_TOPOLOGY=sparse and ORIGIN_QEMU_BRIDGE=on is refused here",
@@ -464,6 +530,8 @@ fn the_commands_that_set_their_machines_refuse_the_person_s() {
             (BRIDGE, "off"),
             (RESERVED, "off"),
             (ACPI, "off"),
+            (SHAPE, "off"),
+            (MEMORY, "512M"),
             (TOPOLOGY, ""),
         ],
     ] {
