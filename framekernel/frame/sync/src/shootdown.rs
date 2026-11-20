@@ -551,9 +551,11 @@ impl<S: Records> Shootdown<S> {
     }
 
     /// Whether the processor `stall` names has served a request since: the one it did not
-    /// answer in time, or a later one. True also for a processor with no record, which can
-    /// never serve, so that whether to ask again is left to a fresh request, which then stalls
-    /// at once.
+    /// answer in time, or a later one. A processor that never takes the interrupt it was sent is
+    /// never answered, and what waits on it waits for good. True for a processor with no record,
+    /// a state no stall reaches: a request asks only processors with a record (`must_answer`),
+    /// and a processor it does not ask cannot stall it. (The independent review of TASKS item 73,
+    /// T73-2, found the earlier words here wrong.)
     ///
     /// **This is no proof that any translation was dropped.** A processor that serves late
     /// serves the request current when it runs, which may name other pages than the one it
