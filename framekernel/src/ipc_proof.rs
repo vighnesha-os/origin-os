@@ -1989,18 +1989,16 @@ enum NotRun {
     Thread(QueueError),
 }
 
-/// A refused start is named, not shown: `BadContext` carries the first frame's address, in
-/// the stack region, which nothing prints (ADR-0004 Amendment 2, A6).
+/// A refused start by `QueueError`'s `Debug`, which names the refusal and never prints the frame
+/// address `BadContext` carries (ADR-0004 Amendment 2, A6; the review's T76-80-3).
 impl core::fmt::Display for NotRun {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::Image => "its image could not be made",
-            Self::Script => "its script could not be written",
-            Self::Process => "its process object could not be made",
-            Self::Thread(QueueError::Full) => "its thread was refused: Full",
-            Self::Thread(QueueError::BadContext(_)) => "its thread was refused: BadContext",
-            Self::Thread(QueueError::BootContext) => "its thread was refused: BootContext",
-        })
+        match self {
+            Self::Image => f.write_str("its image could not be made"),
+            Self::Script => f.write_str("its script could not be written"),
+            Self::Process => f.write_str("its process object could not be made"),
+            Self::Thread(error) => write!(f, "its thread was refused: {error:?}"),
+        }
     }
 }
 
