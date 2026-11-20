@@ -28,7 +28,9 @@
 //!   completes on every processor, and only then is what was kept released. If it stalls, the
 //!   slot waits again. A processor that never answers keeps the slot Waiting for good.
 //! - **Live** to **Lost** ([`Slots::leak`]): its holder cannot give it back safely. No reclaim
-//!   makes a slot Lost.
+//!   makes a slot Lost, except one that finds the waiting slot's record gone, which the one
+//!   reclaim role makes unreachable: the slot is then given up as Lost, so the count of lost
+//!   slots shows it (the independent review of TASKS item 73, T73-6).
 //!
 //! # One reclaim at a time, and at most one slot waiting
 //!
@@ -129,7 +131,8 @@ pub struct Counts {
     /// Retired slots, slots being reclaimed and the slot waiting after a stall: given back and
     /// not yet free.
     pub retired: usize,
-    /// Lost slots: never reused. Only [`Slots::leak`] makes one.
+    /// Lost slots: never reused. [`Slots::leak`] makes one, and so would a reclaim that found
+    /// the waiting slot's record gone, which the reclaim role makes unreachable (T73-6).
     pub lost: usize,
     /// Pages mapped in the region: those of Live, Idle and Retired slots, of slots being
     /// reclaimed for the first time, and of slots lost by [`Slots::leak`], which stay mapped
@@ -304,6 +307,15 @@ impl<const N: usize, const IDLE: usize, K> Table<N, IDLE, K> {
         }
         self.idle_count = last;
         Some(slot)
+    }
+
+    /// Gives up `slot`, whose reclaim found the waiting slot's record gone, as Lost: what it held
+    /// is no longer known, so it is never reused, and the count of lost slots shows it (T73-6).
+    /// Its pages left the count at its first stall.
+    fn give_up(&mut self, slot: usize) {
+        self.set(slot, State::Lost);
+        self.counts.retired -= 1;
+        self.counts.lost += 1;
     }
 
     /// Makes `slot` Free again, after a reclaim.
@@ -575,7 +587,14 @@ impl<const N: usize, const IDLE: usize, K> Slots<N, IDLE, K> {
                 let mut table = self.table.lock();
                 match outcome {
                     Ok(completed) => {
-                        let waiting = table.waiting.take()?;
+                        // The role's holder took this job from `waiting`, and only it writes
+                        // `waiting`, so the record is there; were it gone, the slot is given up
+                        // where the count of lost slots shows it, not left Reclaiming (T73-6).
+                        let Some(waiting) = table.waiting.take() else {
+                            table.give_up(slot);
+                            self.publish(&table);
+                            return None;
+                        };
                         self.publish(&table);
                         drop(table);
                         release(waiting.kept);
@@ -589,13 +608,19 @@ impl<const N: usize, const IDLE: usize, K> Slots<N, IDLE, K> {
                     }
                     Err(again) => {
                         table.set(slot, State::Waiting);
-                        let waiting = table.waiting.as_mut()?;
-                        waiting.stall = again;
-                        waiting.asked_again += 1;
-                        Some(Reclaim::Stalled {
-                            stall: again,
-                            asked_again: waiting.asked_again,
-                        })
+                        if let Some(waiting) = table.waiting.as_mut() {
+                            waiting.stall = again;
+                            waiting.asked_again += 1;
+                            Some(Reclaim::Stalled {
+                                stall: again,
+                                asked_again: waiting.asked_again,
+                            })
+                        } else {
+                            // As in the arm above (T73-6).
+                            table.give_up(slot);
+                            self.publish(&table);
+                            None
+                        }
                     }
                 }
             }
@@ -1139,6 +1164,40 @@ mod tests {
             Some(Reclaim::Freed { .. })
         ));
         assert_eq!(tries(), 2);
+    }
+
+    /// T73-6: a re-ask that finds the waiting slot's record gone, which the role makes
+    /// unreachable and only a test can force, gives the slot up as Lost, whether its shootdown
+    /// completed or stalled: the count of lost slots shows it, nothing is released, and no later
+    /// reclaim touches it.
+    #[test]
+    fn a_reask_that_finds_no_waiting_record_gives_the_slot_up_as_lost() {
+        for completes in [true, false] {
+            let slots = Slots::<1, 0, ()>::new();
+            slots.take(1).unwrap();
+            slots.give_back(0, false).unwrap();
+            assert!(matches!(
+                slots.reclaim(|_, _| (), |_, _| stalled(), answered, |()| ()),
+                Some(Reclaim::Stalled { .. })
+            ));
+            let outcome = slots.reclaim(
+                |_, _| (),
+                |_, _| {
+                    slots.table.lock().waiting = None;
+                    if completes { done() } else { stalled() }
+                },
+                answered,
+                |()| panic!("nothing is released"),
+            );
+            assert_eq!(outcome, None, "completes: {completes}");
+            let counts = slots.counts();
+            assert_eq!((counts.retired, counts.lost, counts.pages), (0, 1, 0));
+            assert_eq!(slots.state(0), Some(State::Lost));
+            assert_eq!(
+                slots.reclaim(|_, _| (), |_, _| done(), answered, |()| ()),
+                None
+            );
+        }
     }
 
     /// A slot lost by `leak` stays mapped, so its pages stay counted; one waiting after a stall
