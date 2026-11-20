@@ -273,6 +273,23 @@ pub fn slot_holding(addr: u64) -> Option<StackSlot> {
     slot_of(addr).map(StackSlot)
 }
 
+/// Whether `a` and `b` are both in the stack region, in the same slot: the trap entry's check that
+/// an entry from ring 3 landed on the running context's own stack (`cpu::check_landing`, TASKS
+/// item 77), with one read of the region's base and of its size for both (the review of TASKS
+/// items 75, 77 and 81, R77-2).
+pub(crate) fn same_slot(a: u64, b: u64) -> bool {
+    let base = STACK_REGION_BASE.load(Ordering::Acquire);
+    let base = if base == 0 { STACK_REGION } else { base };
+    let size = region_size();
+    let slot = |addr: u64| {
+        addr.checked_sub(base)
+            .filter(|&offset| offset < size)
+            .map(|offset| offset / SLOT)
+    };
+    let one = slot(a);
+    one.is_some() && one == slot(b)
+}
+
 /// The top of the slot holding `addr`, if `addr` is in the stack region: past it lies the next
 /// slot's unmapped space. For the backtrace (`cpu::capture_backtrace`).
 pub fn slot_top(addr: u64) -> Option<u64> {

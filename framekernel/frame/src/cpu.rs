@@ -730,7 +730,12 @@ fn local() -> &'static CpuLocal {
 /// order 325384-093US, September 2026, read 2026-11-20: §7.14.4, "Stack Switching in IA-32e
 /// Mode"; §10.7, the 64-bit TSS's RSPn); SYSCALL loads no stack pointer of its own (§6.8.8), so
 /// `syscall_entry` loads the record. A home in no kernel stack cannot be one a published context
-/// has, and halts the processor rather than name nothing for a context that may enter ring 3.
+/// has, and halts the processor rather than name nothing for a context that may enter ring 3. The
+/// boot or idle flow's 0 names no stack: were it ever used, the processor's pushes would wrap to
+/// the top page of the kernel-image window, which nothing maps: only the image is mapped there,
+/// placed at least 2 MiB below the window's top (`layout::place`), and its guard pages are
+/// unmapped ones. So the delivery would fault into #DF, on its own stack, rather than write
+/// anywhere (the review of TASKS items 75, 77 and 81, R77-3).
 fn name_kernel_stack(home: u64) {
     let top = if home == BOOT_FLOW {
         0
@@ -788,11 +793,8 @@ const fn ist_of(vector: u64) -> u8 {
 /// context's frame: the processor halts, as the trap entry does for a frame it never saved.
 fn check_landing(here: u64, vector: u64) {
     let me = this_cpu();
-    let own = CONTEXTS
-        .get(me.get())
-        .and_then(Contexts::running_home)
-        .and_then(crate::stack::slot_holding);
-    if own.is_none() || own != crate::stack::slot_holding(here) {
+    let home = CONTEXTS.get(me.get()).and_then(Contexts::running_home);
+    if !home.is_some_and(|home| crate::stack::same_slot(home, here)) {
         panic!(
             "an entry from ring 3 (vector {vector}) {} landed on a stack not the running context's own",
             me.named()
