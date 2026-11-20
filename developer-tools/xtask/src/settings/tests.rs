@@ -52,7 +52,6 @@ fn each_variable_is_read_as_boot_test_read_it() {
         (RESERVED, "on"),
         (ACPI, "on"),
         (MEMORY, "8G"),
-        (SHAPE, "on"),
         (DEBUG, "1"),
         (TIMEOUT, "600"),
         (ONLY, "kernel boot,wrong key"),
@@ -75,7 +74,7 @@ fn each_variable_is_read_as_boot_test_read_it() {
             reserved: true,
             acpi: true,
             memory: Memory::gib(8),
-            shape: true,
+            shape: false,
             debug: true,
             timeout: Some(Duration::from_secs(600)),
             only: "kernel boot,wrong key".into(),
@@ -140,13 +139,20 @@ fn the_memory_is_read_and_split_between_the_nodes() {
         );
     }
     for bad in [
-        "256M", "513M", "0G", "65G", "8", "8g", "8GiB", "G", "-8G", "8.5G",
+        "256M", "513M", "0G", "65G", "8", "8g", "8GiB", "G", "-8G", "8.5G", "+8G", " 8G", "8É",
+        "8Ｇ", "É", "M",
     ] {
         let e = read(&[(MEMORY, bad)]).unwrap_err();
         assert!(e.starts_with("ORIGIN_QEMU_MEMORY must be"), "{bad}: {e}");
     }
     assert!(read(&[(SHAPE, "on")]).unwrap().shape);
     assert!(read(&[(SHAPE, "ON")]).is_err());
+    // The combinations whose checks would replace or drop each other are refused (T83-9).
+    let e = read(&[(SHAPE, "on"), (RESERVED, "on")]).unwrap_err();
+    assert!(e.contains("are not booted together"), "{e}");
+    let e = read(&[(SHAPE, "on"), (CPU, "max,-rdseed,-rdrand")]).unwrap_err();
+    assert!(e.contains("neither RDSEED nor RDRAND"), "{e}");
+    assert!(read(&[(SHAPE, "on"), (CPU, "max,-rdseed")]).is_ok());
 }
 
 /// The coordinating session's ruling Q1 on TASKS item 83: the large machines' full size on a

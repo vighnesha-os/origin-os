@@ -1,6 +1,6 @@
 [package]
 name = "origin-test-reserved-memory"
-description = "TEST ONLY, never shipped: a UEFI application that plants firmware-reserved memory (RMRRs, IVMDs) in QEMU's ACPI tables and starts Origin's loader, for the boot test (TASKS item 40)"
+description = "TEST ONLY, never shipped: a UEFI application that plants firmware-reserved memory (RMRRs, IVMDs) in QEMU's ACPI tables, or shapes them as a rented board's, and starts Origin's loader, for the boot test (TASKS items 40 and 83)"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

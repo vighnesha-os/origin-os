@@ -376,22 +376,64 @@ pub const S3PT_LEN: usize = 32;
 const FIRMWARE_CTRL: usize = 36;
 const X_FIRMWARE_CTRL: usize = 132;
 
-/// A copy of the ACPI 2.0 RSDP `old` that names the XSDT at `xsdt`, with both checksums fixed:
-/// the first 20 bytes', and the whole structure's (§5.2.5.3). `None` unless `old` is an RSDP of
-/// revision 2 or later.
-pub fn rsdp_naming(old: &[u8], xsdt: u64) -> Option<[u8; RSDP_LEN]> {
+/// Whether `rsdp` is an ACPI 2.0 RSDP (revision 2 or later, length 36) that names an XSDT, so
+/// its `XsdtAddress` may be read (§5.2.5.3).
+pub fn names_an_xsdt(rsdp: &[u8]) -> bool {
+    rsdp.get(..8) == Some(&b"RSD PTR "[..])
+        && rsdp.get(15).is_some_and(|&r| r >= 2)
+        && u32_at(rsdp, 20) == Some(RSDP_LEN as u32)
+        && u64_at(rsdp, 24).is_some_and(|x| x != 0)
+}
+
+/// A copy of the ACPI 2.0 RSDP `old` that names the RSDT at `rsdt` and the XSDT at `xsdt`, with
+/// both checksums fixed: the first 20 bytes', and the whole structure's (§5.2.5.3). `None` unless
+/// `old` is an RSDP of revision 2 or later that names an XSDT.
+pub fn rsdp_naming(old: &[u8], rsdt: u32, xsdt: u64) -> Option<[u8; RSDP_LEN]> {
     let old = old.get(..RSDP_LEN)?;
-    if &old[..8] != b"RSD PTR " || old[15] < 2 || u32_at(old, 20)? as usize != RSDP_LEN {
+    if !names_an_xsdt(old) {
         return None;
     }
     let mut new = [0u8; RSDP_LEN];
     new.copy_from_slice(old);
+    new[16..20].copy_from_slice(&rsdt.to_le_bytes());
     new[24..32].copy_from_slice(&xsdt.to_le_bytes());
     new[8] = 0;
     new[8] = 0u8.wrapping_sub(new[..20].iter().fold(0u8, |s, &b| s.wrapping_add(b)));
     new[32] = 0;
     new[32] = 0u8.wrapping_sub(new.iter().fold(0u8, |s, &b| s.wrapping_add(b)));
     Some(new)
+}
+
+/// The RSDT's entries (§5.2.7): 4-byte physical addresses after the 36-byte header.
+pub fn rsdt_entries(rsdt: &[u8]) -> impl Iterator<Item = (usize, u32)> + '_ {
+    let len = u32_at(rsdt, 4).map_or(0, |l| l as usize).min(rsdt.len());
+    let body = rsdt.get(36..len).unwrap_or(&[]);
+    body.as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, u32::from_le_bytes(*c)))
+}
+
+/// Points RSDT entry `index` at `addr` and fixes the RSDT's checksum.
+pub fn rsdt_set(rsdt: &mut [u8], index: usize, addr: u32) -> Option<()> {
+    let at = 36 + 4 * index;
+    let len = usize::try_from(u32_at(rsdt, 4)?).ok()?;
+    if at + 4 > len || len > rsdt.len() {
+        return None;
+    }
+    rsdt[at..at + 4].copy_from_slice(&addr.to_le_bytes());
+    fix_checksum(&mut rsdt[..len]);
+    Some(())
+}
+
+/// The FADT's two FACS fields, `FIRMWARE_CTRL` and `X_FIRMWARE_CTRL`, as the firmware wrote them
+/// (§5.2.9), or `None` for a table too short to hold the second.
+pub fn facs_fields(fadt: &[u8]) -> Option<(u32, u64)> {
+    if fadt.len() < X_FIRMWARE_CTRL + 8 {
+        return None;
+    }
+    Some((u32_at(fadt, FIRMWARE_CTRL)?, u64_at(fadt, X_FIRMWARE_CTRL)?))
 }
 
 /// Makes the FADT `fadt` name its FACS only by the 32-bit `FIRMWARE_CTRL`: the FACS the table
@@ -829,15 +871,43 @@ mod tests {
         old[16..20].copy_from_slice(&0x7FB7_E000u32.to_le_bytes());
         old[20..24].copy_from_slice(&36u32.to_le_bytes());
         old[24..32].copy_from_slice(&0x7FB7_D000u64.to_le_bytes());
-        let new = rsdp_naming(&old, 0x8E4F_1000).unwrap();
+        let new = rsdp_naming(&old, 0x8E4F_0000, 0x8E4F_1000).unwrap();
         assert_eq!(u64_at(&new, 24), Some(0x8E4F_1000));
-        assert_eq!(u32_at(&new, 16), Some(0x7FB7_E000), "the RSDT stays named");
+        assert_eq!(
+            u32_at(&new, 16),
+            Some(0x8E4F_0000),
+            "the RSDT's copy is named"
+        );
         assert_eq!(sum(&new[..20]), 0);
         assert_eq!(sum(&new), 0);
+        assert!(names_an_xsdt(&old) && names_an_xsdt(&new));
         let mut v1 = old;
         v1[15] = 0;
-        assert_eq!(rsdp_naming(&v1, 1), None, "ACPI 1.0's RSDP has no XSDT");
-        assert_eq!(rsdp_naming(&old[..20], 1), None);
+        assert!(!names_an_xsdt(&v1));
+        assert_eq!(rsdp_naming(&v1, 1, 1), None, "ACPI 1.0's RSDP has no XSDT");
+        assert_eq!(rsdp_naming(&old[..20], 1, 1), None);
+        let mut no_xsdt = old;
+        no_xsdt[24..32].fill(0);
+        assert!(!names_an_xsdt(&no_xsdt), "an XSDT address of 0 names none");
+    }
+
+    #[test]
+    fn rsdt_entries_are_read_and_set_and_the_facs_fields_read() {
+        let mut rsdt = table(b"RSDT", 1, &[0x00, 0x10, 0, 0, 0x00, 0x20, 0, 0]);
+        assert_eq!(
+            rsdt_entries(&rsdt).collect::<Vec<_>>(),
+            vec![(0, 0x1000), (1, 0x2000)]
+        );
+        rsdt_set(&mut rsdt, 1, 0x3000).unwrap();
+        assert_eq!(rsdt_entries(&rsdt).nth(1), Some((1, 0x3000)));
+        assert_eq!(sum(&rsdt), 0);
+        assert_eq!(rsdt_set(&mut rsdt, 2, 1), None);
+        let mut out = [0u8; 64];
+        let len = grow(&rsdt, &0x4000u32.to_le_bytes(), &mut out).unwrap();
+        assert_eq!(rsdt_entries(&out[..len]).nth(2), Some((2, 0x4000)));
+        let f = fadt(0x7FBD_0000, true, 1);
+        assert_eq!(facs_fields(&f), Some((0x7FBD_0000, 0x7FBD_0000)));
+        assert_eq!(facs_fields(&f[..100]), None);
     }
 
     #[test]
@@ -899,7 +969,8 @@ mod tests {
         rsdp[..8].copy_from_slice(b"RSD PTR ");
         rsdp[15] = 2;
         rsdp[20..24].copy_from_slice(&36u32.to_le_bytes());
-        memory.push((RSDP, rsdp_naming(&rsdp, XSDT).unwrap().to_vec()));
+        rsdp[24..32].copy_from_slice(&1u64.to_le_bytes());
+        memory.push((RSDP, rsdp_naming(&rsdp, 0, XSDT).unwrap().to_vec()));
 
         let read = |addr: u64, len: usize| -> Option<&[u8]> {
             memory.iter().find_map(|(base, bytes)| {

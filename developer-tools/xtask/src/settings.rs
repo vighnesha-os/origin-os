@@ -24,7 +24,8 @@
 //! empty value is an unset one, for every variable; a value a variable does not take is refused,
 //! with the variable named and the values it takes, before anything is built or booted. And
 //! `boot-matrix` and its scenario commands, which set each machine themselves, refuse a person's
-//! topology, bridge, reserved-memory and ACPI machine ([`Settings::refuse_machine`], ruling R5).
+//! topology, bridge, reserved-memory and ACPI machine, RAM and table shapes
+//! ([`Settings::refuse_machine`], ruling R5; TASKS item 83).
 
 use std::collections::BTreeMap;
 use std::env;
@@ -251,7 +252,7 @@ impl Settings {
         // Empty is unset, for every variable.
         let set = |name: &str| vars.get(name).map(String::as_str).filter(|v| !v.is_empty());
         let defaults = Settings::default();
-        Ok(Settings {
+        let settings = Settings {
             accel: accel(set(ACCEL))?,
             iommu: iommu(set(IOMMU))?,
             topology: topology(set(TOPOLOGY), set(SMP))?,
@@ -289,7 +290,21 @@ impl Settings {
             },
             any_count: switch(ANY_COUNT, set(ANY_COUNT))?,
             github_actions: set(GITHUB_ACTIONS) == Some("true"),
-        })
+        };
+        // The rented board's machine has a whole-boot check of its own, which would replace the
+        // reserved-memory machine's and is dropped by the machine without a generator: those
+        // combinations are refused, not booted with less checked (the review's T83-9).
+        if settings.shape && settings.reserved {
+            return Err(format!(
+                "{SHAPE}=on and {RESERVED}=on are not booted together: each machine's whole-boot check would replace the other's"
+            ));
+        }
+        if settings.shape && settings.cpu_lacks("rdseed") && settings.cpu_lacks("rdrand") {
+            return Err(format!(
+                "{SHAPE}=on is not booted on a processor with neither RDSEED nor RDRAND: that machine's markers drop the rented board's whole-boot check"
+            ));
+        }
+        Ok(settings)
     }
 
     /// Whether `boot-matrix` runs the machines of ADR-0008 Amendment 1, D7: always on a
@@ -467,15 +482,28 @@ const FULL_MEMORY_GIB: u32 = 64;
 
 /// The RAM a set value of [`MEMORY`] names.
 fn memory(value: &str) -> Result<Memory> {
-    let refused =
-        || format!("{MEMORY} must be 512M or more MiB, even (1024M), or 1G to 64G, not {value:?}");
-    let (number, unit) = value.split_at(value.len().saturating_sub(1));
-    let n: u32 = number.parse().map_err(|_| refused())?;
-    match unit {
-        "G" if (1..=64).contains(&n) => Ok(Memory::gib(n)),
-        "M" if n >= 512 && n.is_multiple_of(2) && n <= 64 * 1024 => Ok(Memory(n)),
-        _ => Err(refused()),
+    // Digits only before the unit: no sign, no space, and a value ending in any other character,
+    // multi-byte ones included, is refused, never split (the review's T83-10).
+    let digits = |n: &str| {
+        (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| n.parse::<u32>().ok())
+            .flatten()
+    };
+    if let Some(n) = value.strip_suffix('G').and_then(digits)
+        && (1..=64).contains(&n)
+    {
+        return Ok(Memory::gib(n));
     }
+    if let Some(n) = value.strip_suffix('M').and_then(digits)
+        && n >= 512
+        && n.is_multiple_of(2)
+        && n <= 64 * 1024
+    {
+        return Ok(Memory(n));
+    }
+    Err(format!(
+        "{MEMORY} must be 512M or more MiB, even (1024M), or 1G to 64G, not {value:?}"
+    ))
 }
 
 /// A switch: `on`, or `off` (or unset).

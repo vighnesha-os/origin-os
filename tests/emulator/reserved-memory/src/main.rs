@@ -21,6 +21,13 @@
 //! Any failure is printed and returned: the loader never starts, and the boot test fails.
 //! The `unsafe` here is the firmware's calling convention and its memory, each with a SAFETY
 //! note; written against UEFI 2.11 (§4.3, §4.4, §7.2, §7.4, §9.1, §13.4, §13.5).
+//!
+//! **Aimed at OVMF, with one departure from UEFI 2.11 §7.2.** §7.2 asks that an application not
+//! aimed at one implementation allocate the runtime memory types (reserved, ACPI reclaim, ACPI
+//! NVS) with `AllocateAnyPages`. This one allocates them below 4 GiB (`AllocateMaxAddress`), where
+//! firmware keeps its tables and the RSDT can name them with its 32-bit entries, and takes the
+//! reserved pages at the top of the RAM at their address (`AllocateAddress`), which is the shape
+//! itself (TASKS item 83; the review's T83-6). OVMF allows both.
 #![no_std]
 #![no_main]
 
@@ -29,6 +36,7 @@ use core::fmt::Write;
 use core::ptr;
 
 use origin_boot_uefi::console::ConOut;
+use origin_boot_uefi::protocols::BOOT_SERVICES_SIGNATURE;
 use origin_boot_uefi::protocols::{
     ACPI_20_TABLE, BootServices, ConfigurationTable, FILE_INFO, FILE_INFO_FILE_SIZE_OFFSET,
     FILE_MODE_READ, FileProtocol, Guid, LOADED_IMAGE_PROTOCOL, LoadedImageProtocol,
@@ -37,8 +45,8 @@ use origin_boot_uefi::protocols::{
 use origin_boot_uefi::uefi::{Handle, Status, SystemTable};
 use origin_test_reserved_memory::{
     FBPT_LEN, FPDT_LEN, MAX_REGIONS, PAGE, Placement, RSDP_LEN, Region, S3PT_LEN, STRUCTURE, Shape,
-    Table, decode, facs_by_32_bit_field, fbpt, fill_byte, fpdt, grow, rsdp_naming, s3pt, structure,
-    xsdt_entries, xsdt_set,
+    Table, decode, facs_by_32_bit_field, facs_fields, fbpt, fill_byte, fpdt, grow, names_an_xsdt,
+    rsdp_naming, rsdt_entries, rsdt_set, s3pt, structure, xsdt_entries, xsdt_set,
 };
 
 /// `AllocateMaxAddress`: at or below the address given; `AllocateAddress`: at it (§7.2).
@@ -51,7 +59,7 @@ const LOADER_DATA: u32 = 2;
 const CONVENTIONAL_MEMORY: u32 = 7;
 const ACPI_RECLAIM: u32 = 9;
 const ACPI_NVS: u32 = 10;
-/// Bytes of the buffer the memory map is read into: room for 1,000 descriptors of 48 bytes.
+/// Bytes of the buffer the memory map is read into: room for 1,024 descriptors of 48 bytes.
 const MAP_BUFFER: usize = 48 * 1024;
 /// Regions are placed below 4 GiB, where firmware puts its legacy reservations.
 const BELOW_4G: u64 = 0xFFFF_F000;
@@ -112,10 +120,14 @@ fn run(image: Handle, st: &SystemTable, out: &mut ConOut) -> Result<Status, Fail
     }
     // SAFETY: the system table's boot services table is valid while boot services are.
     let bs = unsafe { &*bs_ptr };
-    let _ = writeln!(
-        out,
-        "origin-test-reserved: TEST ONLY: planting reserved memory in the firmware's tables"
-    );
+    // The slots this application calls by position, up to `StartImage` at 208, must lie in the
+    // table the firmware says it has (UEFI 2.11 §4.4; the review's T83-11).
+    if bs.hdr.signature != BOOT_SERVICES_SIGNATURE || bs.hdr.header_size < 216 {
+        return Err((
+            Status::UNSUPPORTED,
+            "the boot services table is not one this application knows",
+        ));
+    }
     let loaded = protocol::<LoadedImageProtocol>(bs, image, &LOADED_IMAGE_PROTOCOL)?;
     // SAFETY: `HandleProtocol` returned this image's live loaded-image protocol.
     let device = unsafe { (*loaded).device_handle };
@@ -134,6 +146,12 @@ fn run(image: Handle, st: &SystemTable, out: &mut ConOut) -> Result<Status, Fail
     let (count, shape) = decode(config, &mut regions)
         .map_err(|_| (Status::LOAD_ERROR, "RESERVED.CFG is invalid"))?;
     let regions = &regions[..count];
+    if count != 0 {
+        let _ = writeln!(
+            out,
+            "origin-test-reserved: TEST ONLY: planting reserved memory in the firmware's tables"
+        );
+    }
     let rsdp = rsdp_address(st)?;
     let xsdt = xsdt_at(rsdp)?;
     for table in [Table::Dmar, Table::Ivrs] {
@@ -163,7 +181,9 @@ fn rsdp_address(st: &SystemTable) -> Result<u64, Failure> {
         // below that count and the base is aligned (checked).
         let entry = unsafe { table.wrapping_add(i).read() };
         if entry.vendor_guid == ACPI_20_TABLE {
+            // The first, as the loader takes it.
             rsdp = entry.vendor_table as u64;
+            break;
         }
     }
     if rsdp == 0 {
@@ -177,6 +197,12 @@ fn xsdt_at(rsdp: u64) -> Result<&'static mut [u8], Failure> {
     // SAFETY: the RSDP the firmware published is 36 bytes of identity-mapped memory (ACPI 6.6
     // §5.2.5.3); boot services keep it mapped.
     let rsdp_bytes = unsafe { physical(rsdp, 36) };
+    if !names_an_xsdt(rsdp_bytes) {
+        return Err((
+            Status::LOAD_ERROR,
+            "the RSDP is not an ACPI 2.0 one that names an XSDT",
+        ));
+    }
     if rsdp_bytes.get(..8) != Some(&b"RSD PTR "[..]) {
         return Err((Status::LOAD_ERROR, "the RSDP's signature is wrong"));
     }
@@ -352,8 +378,15 @@ fn shape_tables(
             "origin-test-reserved: reserved {base:#x}-{last:#x} ({pages} pages) at the top of the RAM"
         );
     }
+    let mut fadt_copy = None;
     if shape.facs_32 {
         let (index, addr, old) = find_table(xsdt, b"FACP")?;
+        if let Some((legacy, x)) = facs_fields(old) {
+            let _ = writeln!(
+                out,
+                "origin-test-reserved: the firmware's FADT names the FACS by FIRMWARE_CTRL {legacy:#x} and X_FIRMWARE_CTRL {x:#x}"
+            );
+        }
         let new = allocate(bs, ACPI_RECLAIM, old.len().div_ceil(PAGE as usize))?;
         // SAFETY: the pages just allocated, identity-mapped, owned by nothing else, at least
         // `old.len()` bytes.
@@ -362,6 +395,7 @@ fn shape_tables(
         let facs = facs_by_32_bit_field(copy)
             .ok_or((Status::LOAD_ERROR, "the FADT names no FACS below 4 GiB"))?;
         xsdt_set(xsdt, index, new).ok_or((Status::LOAD_ERROR, "the XSDT cannot be changed"))?;
+        fadt_copy = Some((addr, new));
         let _ = writeln!(
             out,
             "origin-test-reserved: the XSDT now names FACP at {new:#x} in place of the firmware's at {addr:#x}: the FACS at {facs:#x} by FIRMWARE_CTRL alone"
@@ -411,9 +445,10 @@ fn shape_tables(
         out,
         "origin-test-reserved: the XSDT is copied to {new_xsdt:#x} ({name}), {new_len} bytes"
     );
-    // SAFETY: the RSDP the firmware published, 36 bytes (`xsdt_at` checked its signature).
+    // SAFETY: the RSDP the firmware published, 36 bytes (`xsdt_at` checked it names an XSDT).
     let old_rsdp = unsafe { physical(rsdp, RSDP_LEN) };
-    let new_rsdp = rsdp_naming(old_rsdp, new_xsdt)
+    let new_rsdt = rsdt_copy(bs, out, old_rsdp, kind, name, fadt_copy, appended)?;
+    let new_rsdp = rsdp_naming(old_rsdp, new_rsdt, new_xsdt)
         .ok_or((Status::LOAD_ERROR, "the RSDP is not an ACPI 2.0 one"))?;
     if shape.acpi_nvs {
         let at = allocate(bs, ACPI_NVS, 1)?;
@@ -434,6 +469,59 @@ fn shape_tables(
         );
     }
     Ok(())
+}
+
+/// A copy of the RSDT the RSDP names, made as the XSDT's is (TASKS item 83; the review's T83-5):
+/// the FADT's entry pointed at its copy, and the FPDT's appended, in pages of `kind`. Returns the
+/// copy's address, or the firmware's RSDT's unchanged when it names none (0). Every address it
+/// writes lies below 4 GiB, where `allocate` takes pages.
+fn rsdt_copy(
+    bs: &BootServices,
+    out: &mut ConOut,
+    rsdp: &[u8],
+    kind: u32,
+    name: &str,
+    fadt: Option<(u64, u64)>,
+    fpdt: Option<u64>,
+) -> Result<u32, Failure> {
+    let rsdt = u32::from_le_bytes([rsdp[16], rsdp[17], rsdp[18], rsdp[19]]);
+    if rsdt == 0 {
+        return Ok(0);
+    }
+    // SAFETY: the RSDT the RSDP names, its 36-byte header first.
+    let head = unsafe { physical(u64::from(rsdt), 36) };
+    let len = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+    if &head[..4] != b"RSDT" || !(36..=4096).contains(&len) {
+        return Err((Status::LOAD_ERROR, "the RSDT is not one"));
+    }
+    // SAFETY: as above, over its declared length.
+    let old = unsafe { physical(u64::from(rsdt), len) };
+    let below_4g =
+        |a: u64| u32::try_from(a).map_err(|_| (Status::LOAD_ERROR, "a table above 4 GiB"));
+    let (extra, extra_len) = match fpdt {
+        Some(at) => (below_4g(at)?.to_le_bytes(), 4),
+        None => ([0u8; 4], 0),
+    };
+    let extra = &extra[..extra_len];
+    let new_len = len + extra.len();
+    let new = allocate(bs, kind, new_len.div_ceil(PAGE as usize))?;
+    // SAFETY: the pages just allocated, identity-mapped, owned by nothing else, at least
+    // `new_len` bytes.
+    let dst = unsafe { physical_mut(new, new_len) };
+    grow(old, extra, dst).ok_or((Status::LOAD_ERROR, "the RSDT's copy does not fit"))?;
+    if let Some((firmware, copy)) = fadt {
+        let index = rsdt_entries(dst)
+            .find(|&(_, a)| u64::from(a) == firmware)
+            .map(|(i, _)| i)
+            .ok_or((Status::LOAD_ERROR, "the RSDT does not name the FADT"))?;
+        rsdt_set(dst, index, below_4g(copy)?)
+            .ok_or((Status::LOAD_ERROR, "the RSDT cannot be changed"))?;
+    }
+    let _ = writeln!(
+        out,
+        "origin-test-reserved: the RSDT is copied to {new:#x} ({name}), {new_len} bytes"
+    );
+    below_4g(new)
 }
 
 /// The first table with signature `sig` the XSDT lists: its index there, its address, and its

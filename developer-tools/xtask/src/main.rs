@@ -243,10 +243,14 @@ environment:
                                       memory (RMRRs or IVMDs) in QEMU's tables before the
                                       loader starts (the boot-reserved machine); off or unset: not
   ORIGIN_QEMU_MEMORY                  the machine's RAM: 512M (default), an even number of MiB
-                                      above it, or 1G to 64G (the boot-large machine)
+                                      above it, or 1G to 64G (the boot-large machine); above
+                                      512M the kernel's memory figures are checked against it
   ORIGIN_QEMU_SHAPE                   on: a TEST ONLY UEFI application shapes the tables as
-                                      rental B's board has them, with the console's UART at
-                                      0x2F8 (the boot-rented machine); off or unset: not
+                                      rental B's board has them (the boot-rented machine); for
+                                      boot-test's kernel boot, also an SPCR naming a second UART
+                                      at 0x2F8, which carries the markers; not with
+                                      ORIGIN_QEMU_RESERVED, nor on a processor without RDSEED and
+                                      RDRAND; off or unset: not
   ORIGIN_QEMU_ACPI                    on: QEMU builds an NFIT, an HMAT and an SRAT with a generic
                                       initiator (the boot-acpi machine; needs
                                       ORIGIN_QEMU_MACHINE=nvdimm=on,hmat=on); off or unset: not
@@ -2600,45 +2604,120 @@ fn check_rented_boot(done: &Completed, settings: &Settings) -> Result {
     }
 }
 
-/// The RAM a machine larger than 512 MiB gives the kernel (TASKS item 83): the frame
-/// allocator's free memory is at least 99% of it and no more than it. OVMF keeps the rest, and
-/// on `boot-rented` the 32 MiB the application reserves at the top. A 512 MiB machine is not
-/// held to it: OVMF keeps more than 1% of so little.
+/// What a machine larger than 512 MiB gives the kernel (TASKS item 83; the review's T83-1 to
+/// T83-3), from four of the boot's own figures, each held against the RAM QEMU was given (`-m`)
+/// less the pages `boot-rented`'s application reserves at the top ([`RENTED_SHAPE`]):
+///
+/// - the boot info's usable memory: at most that, and at least that less
+///   [`FIRMWARE_ALLOWANCE_MIB`], which OVMF keeps whatever the size (59 to 61 MiB at 8 and
+///   64 GiB);
+/// - the frame allocator's free memory: at most the usable memory, and at least that less
+///   [`ALLOCATOR_ALLOWANCE_MIB`], its bitmap and page-table pool (5 MiB at 64 GiB);
+/// - the kernel's direct map: at least the usable memory, which it must cover, and at most the
+///   RAM less the reserved top, which it must not map;
+/// - the NUMA ranges' total, from the SRAT: within the firmware's allowance of the whole RAM.
+///
+/// A 512 MiB machine is not held to it: every machine before TASKS item 83 had that size.
 fn check_memory(serial: &str, settings: &Settings) -> Result {
     if settings.memory == Memory::default() {
         return Ok(());
     }
-    let ram = u64::from(settings.memory.mib());
-    let line = serial
-        .lines()
-        .find(|l| l.starts_with("origin-kernel: frame allocator: "))
-        .ok_or("no frame allocator line")?;
-    let free = line
-        .split_once(" free frames (")
-        .and_then(|(_, rest)| rest.split_once(" MiB)"))
-        .and_then(|(mib, _)| mib.parse::<u64>().ok())
-        .ok_or_else(|| format!("the frame allocator's line does not give its MiB: {line:?}"))?;
-    if free * 100 < ram * 99 || free > ram {
-        return Err(format!(
-            "the frame allocator has {free} MiB free of the machine's {ram} MiB: not within 1% of it ({line:?})"
+    memory_figures(
+        serial,
+        settings.memory.mib().into(),
+        reserved_top_mib(settings),
+    )
+}
+
+/// MiB the firmware may keep of the RAM it was given ([`check_memory`]).
+const FIRMWARE_ALLOWANCE_MIB: u64 = 128;
+/// MiB the frame allocator may keep of the usable memory for its bitmap and page-table pool.
+const ALLOCATOR_ALLOWANCE_MIB: u64 = 16;
+
+/// MiB `boot-rented`'s application reserves at the top of the RAM, 0 on other machines.
+fn reserved_top_mib(settings: &Settings) -> u64 {
+    if settings.shape {
+        (u64::from(RENTED_SHAPE.top_reserved_pages) * 4096) >> 20
+    } else {
+        0
+    }
+}
+
+/// [`check_memory`]'s rules over `serial`, for `ram` MiB of which `reserved` are reserved at the top.
+fn memory_figures(serial: &str, ram: u64, reserved: u64) -> Result {
+    let figure = |prefix: &str, before: &str, after: &str| -> Result<u64> {
+        let line = serial
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .ok_or_else(|| format!("no line starting {prefix:?}"))?;
+        line.split_once(before)
+            .and_then(|(head, _)| head.rsplit(|c: char| !c.is_ascii_digit()).next())
+            .filter(|n| !n.is_empty())
+            .and_then(|n| n.parse::<u64>().ok())
+            .filter(|_| line.contains(after))
+            .ok_or_else(|| format!("{line:?} does not give its figure"))
+    };
+    let usable = figure("origin-kernel: boot info ", " MiB usable", " MiB usable")?;
+    let free = figure(
+        "origin-kernel: frame allocator: ",
+        " MiB)",
+        " free frames (",
+    )?;
+    let direct = figure(
+        "origin-kernel: page tables loaded: ",
+        " MiB direct map",
+        " MiB direct map",
+    )?;
+    let numa = figure("origin-kernel: numa: ", " MiB; ", " memory ranges, ")?;
+    let room = ram.saturating_sub(reserved);
+    let mut wrong = Vec::new();
+    if usable > room || usable + FIRMWARE_ALLOWANCE_MIB < room {
+        wrong.push(format!(
+            "the boot info's {usable} MiB usable is not within {FIRMWARE_ALLOWANCE_MIB} MiB below the {room} MiB the firmware can give"
         ));
     }
-    Ok(())
+    if free > usable || free + ALLOCATOR_ALLOWANCE_MIB < usable {
+        wrong.push(format!(
+            "the frame allocator's {free} MiB free is not within {ALLOCATOR_ALLOWANCE_MIB} MiB below the {usable} MiB usable"
+        ));
+    }
+    if direct < usable || direct > room {
+        wrong.push(format!(
+            "the {direct} MiB direct map does not cover the {usable} MiB usable within the {room} MiB the firmware can give"
+        ));
+    }
+    if numa > ram || numa + FIRMWARE_ALLOWANCE_MIB < ram {
+        wrong.push(format!(
+            "the NUMA ranges' {numa} MiB is not within {FIRMWARE_ALLOWANCE_MIB} MiB of the machine's {ram} MiB"
+        ));
+    }
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the machine's {ram} MiB of RAM ({reserved} reserved at the top): {}",
+            wrong.join("; ")
+        ))
+    }
 }
 
 /// The firmware console's lines on the rented board's machine, all on COM1: the application's
 /// shaping (TASKS item 83), then the loader's lines up to its hand-over, as the kernel boot's
-/// own markers have them.
+/// own markers have them. A hand-over line the kernel boot lacks makes an impossible marker, so
+/// the boot fails rather than check less (the review's T83-8).
 fn rented_firmware_markers(settings: &Settings) -> Vec<String> {
     let mut markers: Vec<String> = [
         "origin-test-reserved: TEST ONLY: shaping the firmware's tables as rental B's board has them",
         "origin-test-reserved: reserved 0x",
         " (8192 pages) at the top of the RAM",
+        "origin-test-reserved: the firmware's FADT names the FACS by FIRMWARE_CTRL 0x",
         "origin-test-reserved: the XSDT now names FACP at 0x",
         "by FIRMWARE_CTRL alone",
         "origin-test-reserved: FPDT at 0x",
         "in reserved pages",
         "origin-test-reserved: the XSDT is copied to 0x",
+        " (ACPI NVS), ",
+        "origin-test-reserved: the RSDT is copied to 0x",
         " (ACPI NVS), ",
         "origin-test-reserved: the RSDP is copied to 0x",
         " (ACPI NVS), and the configuration table names it",
@@ -2650,12 +2729,10 @@ fn rented_firmware_markers(settings: &Settings) -> Vec<String> {
         shape: false,
         ..settings.clone()
     });
-    let handover = plain
-        .markers
-        .iter()
-        .position(|m| m == HANDOVER_LINE)
-        .map_or(0, |i| i + 1);
-    markers.extend(plain.markers.into_iter().take(handover));
+    match plain.markers.iter().position(|m| m == HANDOVER_LINE) {
+        Some(at) => markers.extend(plain.markers.into_iter().take(at + 1)),
+        None => markers.push(format!("xtask: the marker {HANDOVER_LINE:?} is missing")),
+    }
     markers
 }
 
@@ -2672,51 +2749,65 @@ fn rented_scenario(scenario: &mut Scenario) {
     scenario.capture = Capture::SpcrUart;
     scenario.qemu_args = Some(|work| spcr_args(work, &spcr_table(0, gas_io(SPCR_PORT), 7), &[]));
     scenario.check = Some(check_rented_boot);
-    if let Some(at) = scenario.markers.iter().position(|m| m == HANDOVER_LINE) {
-        scenario.markers.drain(..=at);
-    }
-    // The usual machine has no SPCR; this one's names COM2, so the console moves (below).
-    scenario
-        .markers
-        .retain(|m| !m.starts_with("origin-kernel: console: no usable ACPI SPCR table"));
-    if let Some(at) = scenario
-        .markers
-        .iter()
-        .position(|m| m.starts_with("origin-kernel: allocated, wrote and freed 3 frames at "))
-    {
-        scenario.markers.splice(
-            at..at,
-            [
-                MOVED_LINE,
-                "origin-kernel: console: the UART is now at I/O port 0x2f8, as the firmware set it; ",
-            ]
-            .map(String::from),
-        );
-    }
-    if let Some(at) = scenario
-        .markers
-        .iter()
-        .position(|m| m == "origin-kernel: acpi: FADT: ")
-    {
+    // Each edit below needs its anchor: one that is missing makes an impossible marker, so the
+    // boot fails rather than check less (the review's T83-8).
+    let missing = |scenario: &mut Scenario, anchor: &str| {
         scenario
             .markers
-            .splice(at..at, ["origin-kernel: acpi: FPDT rev 1".to_string()]);
+            .push(format!("xtask: the marker {anchor:?} is missing"));
+    };
+    match scenario.markers.iter().position(|m| m == HANDOVER_LINE) {
+        Some(at) => {
+            scenario.markers.drain(..=at);
+        }
+        None => missing(scenario, HANDOVER_LINE),
     }
-    if let Some(at) = scenario.markers.iter().position(|m| m == " tables: ") {
-        scenario.markers.splice(
-            at..at,
-            [
-                // The FPDT's tables, read after the FADT's, DSDT's and FACS's lines.
-                "origin-kernel: acpi: FBPT, 56 bytes: checked: 1 records",
-                "origin-kernel: acpi: S3PT, 32 bytes: checked: 1 records",
-                "origin-kernel: acpi: never lent, as the firmware changes them after boot: FACS 0x",
-                ", FBPT 0x",
-                ", S3PT 0x",
-                "; 3 kept",
-            ]
-            .map(String::from),
-        );
+    // The usual machine has no SPCR; this one's names COM2, so the console moves (below).
+    let no_spcr = "origin-kernel: console: no usable ACPI SPCR table";
+    match scenario.markers.iter().position(|m| m.starts_with(no_spcr)) {
+        Some(at) => {
+            scenario.markers.remove(at);
+        }
+        None => missing(scenario, no_spcr),
     }
+    let insert_before = |scenario: &mut Scenario, anchor: &str, items: &[&str]| match scenario
+        .markers
+        .iter()
+        .position(|m| m.starts_with(anchor))
+    {
+        Some(at) => {
+            scenario
+                .markers
+                .splice(at..at, items.iter().map(|m| (*m).to_string()));
+        }
+        None => missing(scenario, anchor),
+    };
+    insert_before(
+        scenario,
+        "origin-kernel: allocated, wrote and freed 3 frames at ",
+        &[
+            MOVED_LINE,
+            "origin-kernel: console: the UART is now at I/O port 0x2f8, as the firmware set it; ",
+        ],
+    );
+    insert_before(
+        scenario,
+        "origin-kernel: acpi: FADT: ",
+        &["origin-kernel: acpi: FPDT rev 1"],
+    );
+    insert_before(
+        scenario,
+        " tables: ",
+        &[
+            // The FPDT's tables, read after the FADT's, DSDT's and FACS's lines.
+            "origin-kernel: acpi: FBPT, 56 bytes: checked: 1 records",
+            "origin-kernel: acpi: S3PT, 32 bytes: checked: 1 records",
+            "origin-kernel: acpi: never lent, as the firmware changes them after boot: FACS 0x",
+            ", FBPT 0x",
+            ", S3PT 0x",
+            "; 3 kept",
+        ],
+    );
 }
 
 /// What fails a kernel boot under QEMU alone, and never a physical machine's (the review of TASKS 63's
@@ -3884,11 +3975,11 @@ fn entry_settings(command: &str, settings: Settings) -> Result<Settings> {
     Ok(settings)
 }
 
-/// `boot-matrix` and its ten scenario commands: each sets every machine's topology, bridge,
-/// reserved memory and ACPI tables itself (the coordinating session's ruling R5 of 2026-11-19).
-/// The list is of names, so a new scenario command of `boot-matrix`'s belongs here, by hand; the
-/// host test `each_kind_of_command_takes_or_refuses_the_person_s_machine_at_entry` holds these
-/// eleven.
+/// `boot-matrix` and its twelve scenario commands: each sets every machine's topology, bridge,
+/// reserved memory, ACPI tables, RAM and table shapes itself (the coordinating session's ruling R5
+/// of 2026-11-19; TASKS item 83). The list is of names, so a new scenario command of
+/// `boot-matrix`'s belongs here, by hand; the host test
+/// `each_kind_of_command_takes_or_refuses_the_person_s_machine_at_entry` holds these thirteen.
 const SETS_ITS_MACHINES: [&str; 13] = [
     "boot-matrix",
     "boot-x2apic",
@@ -6726,16 +6817,27 @@ fn com1_last_kernel_line(com1: Option<&str>) -> String {
         return String::new();
     };
     let text = serial::clean(com1.as_bytes());
-    let last = match text
-        .lines()
-        .rev()
-        .find(|l| l.starts_with("origin-kernel: "))
-    {
+    let last_of = |prefix: &str| text.lines().rev().find(|l| l.starts_with(prefix));
+    let last = match last_of("origin-kernel: ") {
         Some(line) => format!("; COM1's last kernel line: {line:?}"),
-        None => match text.lines().rev().find(|l| !l.trim().is_empty()) {
-            Some(line) => format!("; COM1 has no kernel line; its last line: {line:?}"),
-            None => "; COM1 has nothing".into(),
-        },
+        // No kernel line: what the application and the loader said last, which the firmware's
+        // later text would hide (the review's T83-7).
+        None => {
+            let mut said = String::from("; COM1 has no kernel line");
+            for (whose, prefix) in [
+                ("the application's", "origin-test-reserved: "),
+                ("the loader's", "origin-boot: "),
+            ] {
+                if let Some(line) = last_of(prefix) {
+                    said.push_str(&format!("; {whose} last line: {line:?}"));
+                }
+            }
+            match text.lines().rev().find(|l| !l.trim().is_empty()) {
+                Some(line) => said.push_str(&format!("; its last line: {line:?}")),
+                None => said = "; COM1 has nothing".into(),
+            }
+            said
+        }
     };
     // What the console decided about the firmware's UART, which says why a boot stayed on COM1.
     match text.lines().rev().find(|l| {
@@ -7020,10 +7122,15 @@ fn run_scenario_once(scenario: &Scenario, kernel: &[u8], settings: &Settings) ->
         Err(e) => {
             eprintln!("--- serial output ---\n{text}\n--- {QEMU} stderr ---\n{qemu_stderr}");
             Err(format!(
-                "boot-test ({}) failed: {e} (QEMU: {exit:?}){}; serial log: {}",
+                "boot-test ({}) failed: {e} (QEMU: {exit:?}){}; serial log: {}{}",
                 scenario.label,
                 com1_last_kernel_line(done.com1.as_deref()),
-                log.display()
+                log.display(),
+                if done.com1.is_some() {
+                    format!("; COM1's log: {}", com1_log.display())
+                } else {
+                    String::new()
+                }
             ))
         }
     }
@@ -7110,6 +7217,134 @@ fn run(settings: &Settings) -> Result {
 }
 
 #[cfg(test)]
+mod rented_scenario_tests {
+    use super::*;
+
+    /// The rented board's scenario keeps what it must hold (the review's T83-8): on COM2 the move
+    /// and the census's FPDT, FBPT, S3PT and never-lent lines, and none of the firmware console's
+    /// lines; on COM1 the application's shaping and the loader's lines to its hand-over; and no
+    /// anchor it edits is missing.
+    #[test]
+    fn the_rented_scenario_holds_its_markers() {
+        let settings = Settings {
+            shape: true,
+            memory: Memory::gib(64),
+            ..Settings::default()
+        };
+        let scenario = boot_scenario(&settings);
+        assert_eq!(scenario.capture, Capture::SpcrUart);
+        let has = |m: &str| scenario.markers.iter().any(|x| x == m);
+        for required in [
+            MOVED_LINE,
+            "origin-kernel: console: the UART is now at I/O port 0x2f8, as the firmware set it; ",
+            "origin-kernel: acpi: FPDT rev 1",
+            "origin-kernel: acpi: FBPT, 56 bytes: checked: 1 records",
+            "origin-kernel: acpi: S3PT, 32 bytes: checked: 1 records",
+            "origin-kernel: acpi: never lent, as the firmware changes them after boot: FACS 0x",
+            "; 3 kept",
+        ] {
+            assert!(has(required), "{required}");
+        }
+        assert!(
+            !scenario
+                .markers
+                .iter()
+                .any(|m| m.starts_with("xtask: the marker "))
+        );
+        assert!(
+            !scenario
+                .markers
+                .iter()
+                .any(|m| m.starts_with("origin-boot: "))
+        );
+        assert!(!has(HANDOVER_LINE));
+        let at = |m: &str| scenario.markers.iter().position(|x| x == m).unwrap();
+        assert!(at(MOVED_LINE) < at("origin-kernel: acpi: FPDT rev 1"));
+        assert!(at("origin-kernel: acpi: FPDT rev 1") < at("origin-kernel: acpi: FADT: "));
+        assert!(at("origin-kernel: acpi: FADT: ") < at("; 3 kept"));
+        let com1 = rented_firmware_markers(&settings);
+        assert!(com1.iter().any(|m| m == HANDOVER_LINE));
+        assert!(
+            com1.iter()
+                .any(|m| m == "origin-test-reserved: starting the loader")
+        );
+        assert!(!com1.iter().any(|m| m.starts_with("xtask: the marker ")));
+    }
+}
+
+#[cfg(test)]
+mod memory_figure_tests {
+    use super::memory_figures;
+
+    /// The four lines, as the kernel prints them (TASKS item 83's boots of 2026-11-20).
+    fn boot(usable: u64, free: u64, direct: u64, numa: u64) -> String {
+        format!(
+            "origin-kernel: boot info 0.7, 44 memory regions, {usable} MiB usable\n\
+             origin-kernel: frame allocator: 16761756 free frames ({free} MiB), bitmap of 528 pages at 0x100000\n\
+             origin-kernel: page tables loaded: 467 tables, {direct} MiB direct map, 502 image pages, 5067 4 KiB and 32755 2 MiB leaves; global pages true\n\
+             origin-kernel: numa: 2 nodes, 2 cpus, 4 memory ranges, {numa} MiB; consistent true\n"
+        )
+    }
+
+    /// The figures the machines showed pass, and the 8 GiB rented machine the review's T83-1
+    /// predicted would fail the old 1% rule, too.
+    #[test]
+    fn the_machines_figures_pass() {
+        assert_eq!(
+            memory_figures(&boot(65480, 65475, 65527, 65535), 65536, 0),
+            Ok(())
+        );
+        assert_eq!(
+            memory_figures(&boot(65448, 65443, 65495, 65535), 65536, 32),
+            Ok(())
+        );
+        assert_eq!(
+            memory_figures(&boot(8137, 8133, 8183, 8191), 8192, 0),
+            Ok(())
+        );
+        assert_eq!(
+            memory_figures(&boot(8105, 8101, 8151, 8191), 8192, 32),
+            Ok(())
+        );
+        assert_eq!(
+            memory_figures(&boot(4041, 4037, 4087, 4095), 4096, 0),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn each_figure_out_of_its_bounds_fails() {
+        for (serial, says) in [
+            // RB-3's figure: memory above 4 GiB missing from the allocator.
+            (
+                boot(65480, 1989, 65527, 65535),
+                "the frame allocator's 1989 MiB free",
+            ),
+            // Reserved memory at the top taken as usable.
+            (
+                boot(65512, 65507, 65527, 65535),
+                "the boot info's 65512 MiB usable",
+            ),
+            // A direct map that stops short of the usable memory, or maps the reserved top.
+            (boot(65448, 65443, 4096, 65535), "the 4096 MiB direct map"),
+            (boot(65448, 65443, 65527, 65535), "the 65527 MiB direct map"),
+            // NUMA ranges that lose a node.
+            (
+                boot(65448, 65443, 65495, 32767),
+                "the NUMA ranges' 32767 MiB",
+            ),
+        ] {
+            let e = memory_figures(&serial, 65536, 32).unwrap_err();
+            assert!(e.contains(says), "{says}: {e}");
+        }
+        let e = memory_figures("origin-kernel: boot info 0.7\n", 8192, 0).unwrap_err();
+        assert!(e.contains("does not give its figure"), "{e}");
+        let e = memory_figures("", 8192, 0).unwrap_err();
+        assert!(e.starts_with("no line starting"), "{e}");
+    }
+}
+
+#[cfg(test)]
 mod com1_report_tests {
     use super::com1_last_kernel_line;
 
@@ -7121,7 +7356,14 @@ mod com1_report_tests {
         assert_eq!(com1_last_kernel_line(Some("")), "; COM1 has nothing");
         assert_eq!(
             com1_last_kernel_line(Some("BdsDxe: loading\r\norigin-boot: exiting\n")),
-            "; COM1 has no kernel line; its last line: \"origin-boot: exiting\""
+            "; COM1 has no kernel line; the loader's last line: \"origin-boot: exiting\"; its last line: \"origin-boot: exiting\""
+        );
+        // The application failed, and the firmware went on to other boot options.
+        assert_eq!(
+            com1_last_kernel_line(Some(
+                "origin-test-reserved: AllocatePages failed: EFI_OUT_OF_RESOURCES\nBdsDxe: loading Boot0003\n"
+            )),
+            "; COM1 has no kernel line; the application's last line: \"origin-test-reserved: AllocatePages failed: EFI_OUT_OF_RESOURCES\"; its last line: \"BdsDxe: loading Boot0003\""
         );
         let stayed = "origin-kernel: a\norigin-kernel: console: no usable ACPI SPCR table (x); the UART stays at I/O port 0x3f8\norigin-kernel: M1 entry complete; halting\n";
         let said = com1_last_kernel_line(Some(stayed));
