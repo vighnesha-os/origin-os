@@ -38,8 +38,11 @@
 //!   any processor, takes its first frame to withdraw a context it never made runnable
 //!   ([`Contexts::withdraw`]). Both are compare-and-swaps of the same word, so at most one of them
 //!   takes a given frame: a context withdrawn is never resumed, and one resumed is never
-//!   withdrawn. Nothing else writes a nonzero frame to 0, and only a claimer that has just taken a
-//!   free slot writes a frame into one whose `frame` is 0.
+//!   withdrawn. Nothing else writes a nonzero frame to 0. A frame is written into a slot whose
+//!   `frame` is 0 only by a claimer that has just taken it while free, or by this processor's
+//!   switch-out of the context it runs (`current`); a context being withdrawn never ran, so it
+//!   was never `current`, and no switch-out writes its slot (the review of TASKS items 75, 77
+//!   and 81, R75-3).
 //! - A home leaves the table by a Release store of 0, in one of two ways:
 //!   - **retired** on the context's own processor, only after that processor has left the stack
 //!     ([`Contexts::retire_ended`]);
@@ -274,8 +277,13 @@ impl Contexts {
     /// both its home and its frame to resume: a frame never published, one already withdrawn, or
     /// one a `switch` took first. Any home then stays, and the stack it covers is leaked rather
     /// than freed under a context that may run on it. It is for a context never made runnable,
-    /// the only kind its publisher withdraws: it cannot tell a context that ran and is suspended
-    /// at exactly its first frame's address from one that never ran.
+    /// the only kind its publisher withdraws. A context that ran is not taken by mistake either:
+    /// its saved frames are never at its first frame's address. In 64-bit mode the processor
+    /// aligns the stack to 16 bytes before it pushes an interrupt's frame (Intel SDM Vol. 3A,
+    /// order 325384-093US, §7.14.2), and the kernel builds a system call's frame from the stack's
+    /// top likewise, while a first frame is built 8 bytes below such a place
+    /// (`origin_frame::stack::GuardedStack::build_first_frame`; the review of TASKS items 75, 77
+    /// and 81).
     pub fn withdraw(&self, frame: u64) -> bool {
         if frame <= BOOT_FLOW {
             return false;
