@@ -32,6 +32,14 @@
 //! before its thread has blocked (it registered with a wait queue and is about to block) is
 //! kept, and its next `block` returns at once: no wake-up is lost.
 //!
+//! The kernel names a thread by its record instead (`origin_sync::threads`, ADR-0020 S1). It
+//! finds the slot through the record's location, checks the record's generation under this
+//! queue's lock, and then passes the slot's own generation, so here the slot's generation is not
+//! a second check: the record's location, cleared in the same critical section as
+//! [`RunQueue::exit`], is what keeps a stale name from a slot's next thread (the review of TASKS
+//! item 92, R92-4). Whatever later frees or reuses a slot must clear or move that location in the
+//! same critical section.
+//!
 //! An interrupt or IPI that may have woken a thread goes through
 //! [`RunQueue::preempt_for_wake`]: it charges nothing, and switches only if a thread woken
 //! since the last choice should run now.

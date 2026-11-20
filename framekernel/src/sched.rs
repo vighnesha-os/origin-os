@@ -469,6 +469,7 @@ pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
         lost_before,
         counts.lost,
         wakes_followed(),
+        threads::unaccounted(),
     )
 }
 
@@ -526,7 +527,7 @@ fn reap_zombies() -> usize {
             let record = threads::record(number)?;
             let state = core::mem::replace(&mut *record.state().lock(), threads::State::EMPTY);
             // Its location was cleared at its exit, so the block takes it back.
-            let _ = threads::give_back(number);
+            threads::give_back(number);
             Some(state)
         });
         let Some(threads::State {
@@ -763,7 +764,7 @@ pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
                     drop(state.stack.take());
                     drop(state.fpu.take());
                     drop(state);
-                    let _ = threads::give_back(number);
+                    threads::give_back(number);
                     if let Some(mark) = mark {
                         mark.left();
                     }
@@ -888,8 +889,9 @@ fn spawn_with(
 /// publishes its first frame to `cpu`'s table of contexts (the boot proof gives sources that
 /// refuse: an FPU area that is not there, and a publication refused as a full table refuses one).
 /// A thread is created whole or not at all: every way this fails gives back the stack, its guard
-/// page and the FPU area, through their `Drop`s, and leaves the run queue and the thread table as
-/// they were.
+/// page and the FPU area, through their `Drop`s, and leaves the run queue and the processor's
+/// block of records as they were, but for the generation of a record taken and given back when
+/// the queue is full (the review of TASKS item 92, R92-7).
 ///
 /// **The order** (TASKS item 75). The first frame is published before the thread is queued, so
 /// that no run queue ever names a frame its processor's table does not hold: the trap entry
@@ -934,12 +936,14 @@ fn spawn_with_parts(
         let slot = match queue.push_weighted(frame_at, weight, Some(number)) {
             Ok(slot) => slot,
             Err(refused) => {
-                let _ = threads::give_back(number);
+                threads::give_back(number);
                 return Err(refused);
             }
         };
-        if let (Some(record), Some((stack, fpu_area, user))) =
-            (threads::record(number), parts.take())
+        // The record was just taken from this block, and a slot fits a location (`threads`'s
+        // assertion): neither `if` below can fail (the review of TASKS item 92, R92-5).
+        if let Some(record) = threads::record(number)
+            && let Some((stack, fpu_area, user)) = parts.take()
         {
             let mut state = record.state().lock();
             state.stack = Some(stack);

@@ -246,8 +246,10 @@ impl<S, const N: usize> Block<S, N> {
         let index = (0..N).find(|&i| *held & bit(i) == 0)?;
         let record = self.records.get(index)?;
         *held |= bit(index);
-        // Under the allocator's lock and with the location clear: no holder of a queue lock can
-        // be comparing this generation (see `Record::generation`).
+        // With the location clear, so no wake-up can compare this generation with a name's under
+        // the lock of the queue the location names until the spawn has set it. One may read it
+        // meanwhile under the lock of the queue its thread left (`changed`): it differs from the
+        // name's either way, the old value or the new (the review of TASKS item 92, R92-7).
         let generation = record.generation.load(Relaxed).wrapping_add(1);
         record.generation.store(generation, Relaxed);
         Some((index, generation))
@@ -275,6 +277,22 @@ impl<S, const N: usize> Block<S, N> {
     /// How many records are held.
     pub fn held(&self) -> u32 {
         self.held.lock().count_ones()
+    }
+
+    /// The number of record `index` of block `block`, where every block holds `N`: `block` × `N`
+    /// + `index`. `None` past `N`, or if the number does not fit a `u32`.
+    pub fn number(block: usize, index: usize) -> Option<u32> {
+        if index >= N {
+            return None;
+        }
+        let number = block.checked_mul(N)?.checked_add(index)?;
+        u32::try_from(number).ok()
+    }
+
+    /// The block and index of record `number` ([`Block::number`]'s inverse); `None` if `N` is 0.
+    pub fn split(number: u32) -> Option<(usize, usize)> {
+        let number = usize::try_from(number).ok()?;
+        Some((number.checked_div(N)?, number.checked_rem(N)?))
     }
 }
 
@@ -530,6 +548,24 @@ mod tests {
         assert!(block.give_back(index));
         assert!(!block.give_back(index), "given back twice");
         assert_eq!(block.held(), 0);
+    }
+
+    #[test]
+    fn a_record_s_number_names_its_block_and_index_and_back() {
+        type B = Block<u32, 32>;
+        assert_eq!(B::number(0, 0), Some(0));
+        assert_eq!(B::number(2, 5), Some(69));
+        assert_eq!(B::split(69), Some((2, 5)));
+        assert_eq!(B::number(2, 32), None, "an index past the block");
+        for (block, index) in [(0, 31), (1, 0), (64, 17), (134_217_727, 31)] {
+            let number = B::number(block, index).expect("fits a u32");
+            assert_eq!(B::split(number), Some((block, index)));
+        }
+        // The last block a `u32` numbers whole, and the first it does not.
+        assert_eq!(B::number(134_217_727, 31), Some(u32::MAX));
+        assert_eq!(B::number(134_217_728, 0), None);
+        assert_eq!(B::number(usize::MAX, 0), None, "no overflow");
+        assert_eq!(Block::<u32, 0>::split(5), None);
     }
 
     #[test]
