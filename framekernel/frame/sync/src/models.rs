@@ -3545,7 +3545,7 @@ fn backlog_reap_all(backlog: &Backlog, list: &TwoPieces, held: &[Arc<Kept>; 2]) 
         let Some(piece) = taken else {
             return;
         };
-        let Some(cell) = held.get(piece as usize).map(Arc::clone) else {
+        let Some(cell) = held.get(piece as usize).cloned() else {
             return;
         };
         // SAFETY: as in `backlog_reap`.
