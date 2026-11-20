@@ -44,6 +44,7 @@ pub mod ports;
 pub mod refcount;
 pub mod shootdown;
 pub mod slots;
+pub mod threads;
 pub mod wait;
 
 #[cfg(all(test, loom))]
@@ -61,7 +62,7 @@ mod runqueue;
 #[cfg(not(all(test, loom)))]
 mod prim {
     pub(crate) use core::hint::spin_loop;
-    pub(crate) use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, fence};
+    pub(crate) use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, fence};
 
     /// `core::cell::UnsafeCell` with the closure API of Loom's checked cell.
     pub(crate) struct UnsafeCell<T>(core::cell::UnsafeCell<T>);
@@ -88,7 +89,7 @@ mod prim {
     use core::cell::Cell;
 
     pub(crate) use loom::cell::UnsafeCell;
-    pub(crate) use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, fence};
+    pub(crate) use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, fence};
 
     std::thread_local! {
         /// How many spin iterations one thread of the running model may make before its
