@@ -197,6 +197,30 @@ class Guards(unittest.TestCase):
         r = self.lat.boot_result("Pre-memory NB Initialization\n")
         self.assertFalse(r["ended"])
         self.assertIn("Pre-memory", r["summary"])
+        self.assertTrue(self.lat.last_boot(r))  # nothing of Origin's: no second boot
+
+    def test_a_boot_ends_on_the_lines_the_kernel_halts_after(self):
+        # The texts `framekernel/src/report.rs` and the CPU baseline check print before halting.
+        for line in ("origin-kernel: panic: panicked at kernel.rs:1:1: boom",
+                     "origin-kernel: invalid boot info: BadMagic",
+                     "origin-kernel: invalid image: relocations not applied",
+                     "origin-kernel: this CPU is below the x86-64-v3 baseline Origin OS requires "
+                     "(CLAUDE.md §14); missing: avx2: CPU baseline failed"):
+            r = self.lat.boot_result("origin-boot: read x\norigin-kernel: Origin OS\n" + line + "\n")
+            self.assertTrue(r["ended"], line)
+            self.assertEqual(r["summary"], line)
+            self.assertFalse(self.lat.last_boot(r))  # Origin ran: boot it again
+        # A line that only mentions a panic does not end the boot.
+        r = self.lat.boot_result("origin-kernel: nmi: no panic here\n")
+        self.assertFalse(r["ended"])
+
+    def test_the_kernel_alone_is_enough_to_boot_again(self):
+        # The firmware may not carry the loader's lines; the kernel's on the SPCR UART still count.
+        r = self.lat.boot_result("origin-kernel: boot verdict: degraded: 60 of 71 proofs passed\n")
+        self.assertTrue(r["ended"] and r["kernel"] and not r["loader"])
+        self.assertFalse(self.lat.last_boot(r))
+        r = self.lat.boot_result("origin-boot: read x\nUbuntu 24.04 LTS host ttyS1\nhost login: ")
+        self.assertTrue(self.lat.last_boot(r))
 
     def test_scope_verdict(self):
         zen4 = "Vendor ID: AuthenticAMD\nCPU family: 25\nModel: 97\n"

@@ -853,8 +853,13 @@ def stop_sol(process):
 # Rental B: Origin's first boot on a physical machine.
 
 LOADER_LINE = "origin-boot:"
+KERNEL_LINE = "origin-kernel:"
 VERDICT_LINE = "origin-kernel: boot verdict:"
 REFUSED_LINE = "origin-kernel: boot refused"
+# Lines after which the kernel halts with no verdict (`framekernel/src/report.rs` and the CPU
+# baseline check in `kernel.rs`): nothing more will come, so the boot need not wait them out.
+HALTED_LINES = ("origin-kernel: panic: ", "origin-kernel: invalid boot info: ",
+                "origin-kernel: invalid image: ", ": CPU baseline failed")
 REPO = Path(__file__).resolve().parents[2]
 # Item 229: Origin boots on real hardware only once identity maps for firmware-reserved memory
 # have landed. They landed with TASKS item 40, cleared at this commit and merged into `main` with
@@ -941,19 +946,29 @@ def scope_verdict(lscpu):
 
 
 def boot_result(text):
-    """What one boot showed on the console: the loader's first line, the kernel's verdict, or how
-    far it got."""
+    """What one boot showed on the console: the kernel's verdict or refusal, the line it halted
+    on, or how far it got. `loader` and `kernel` say whether each printed anything: the loader
+    writes through the firmware's console and the kernel to the UART the SPCR names, so either
+    can be missing while the other is there."""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    loader = next((l for l in lines if LOADER_LINE in l), None)
+    seen = {"loader": any(LOADER_LINE in l for l in lines),
+            "kernel": any(KERNEL_LINE in l for l in lines)}
     verdict = next((l for l in lines if VERDICT_LINE in l or REFUSED_LINE in l), None)
-    origin = [l for l in lines if "origin-kernel:" in l or LOADER_LINE in l]
-    if verdict:
-        return {"ended": True, "summary": verdict[verdict.find("origin-kernel:"):], "loader": bool(loader)}
+    halted = next((l for l in lines if KERNEL_LINE in l and any(h in l for h in HALTED_LINES)), None)
+    origin = [l for l in lines if KERNEL_LINE in l or LOADER_LINE in l]
+    if verdict or halted:
+        line = verdict or halted
+        return {"ended": True, "summary": line[line.find(KERNEL_LINE):], **seen}
     if any("login:" in l for l in lines):
-        return {"ended": True, "summary": "a system other than Origin started (a login prompt)",
-                "loader": bool(loader)}
+        return {"ended": True, "summary": "a system other than Origin started (a login prompt)", **seen}
     last = origin[-1] if origin else (lines[-1] if lines else "nothing on the console")
-    return {"ended": False, "summary": f"no verdict; last line: {last[:200]}", "loader": bool(loader)}
+    return {"ended": False, "summary": f"no verdict; last line: {last[:200]}", **seen}
+
+
+def last_boot(result):
+    """Whether no boot should follow this one: Origin printed nothing, or another system started.
+    Running Origin again would show nothing new."""
+    return not (result["loader"] or result["kernel"]) or "login prompt" in result["summary"]
 
 
 def redact(text, server_id, ips):
@@ -1032,7 +1047,7 @@ def cmd_rental_b(args):
             results.append(result)
             print(f"{stamp()} boot {boot}: {result['summary']}")
             (rental.dir / "boots.json").write_text(json.dumps(results, indent=2))
-            if not result["loader"] or "login prompt" in result["summary"] or now() > rental.deadline - 600:
+            if last_boot(result) or now() > rental.deadline - 600:
                 break
         write_record(args, rental, results)
 
