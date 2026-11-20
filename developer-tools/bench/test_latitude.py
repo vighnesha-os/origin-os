@@ -423,6 +423,33 @@ class Guards(unittest.TestCase):
         self.assertIn("automatic IBRS on", record)
         self.assertNotIn("192.0.2.3", (d / "console-redacted.log").read_text())
 
+    def test_the_record_draft_is_redacted_too(self):
+        # A boot that showed nothing of Origin: its summary is the console's last raw line, here
+        # a network boot's, which names the machine's address, its MAC and its GUID (item 232).
+        d = self.home / "rental"
+        (d / "dump").mkdir(parents=True)
+        image = self.home / "image"
+        image.mkdir()
+        (image / "BOOTX64.EFI").write_bytes(b"loader")
+        (image / "KERNEL.ONBF").write_bytes(b"kernel")
+        console = mock.Mock()
+        console.text.return_value = "PXE-E18: Server response timeout.\n"
+        rental = self.lat.Rental("sv_test0000000000", "192.0.2.10", d, 0, "key", console)
+        args = mock.Mock(plan="m4-metal-small", source_revision="abc1234", image_dir=str(image))
+        last = ("no verdict; last line: CLIENT MAC ADDR: 02 00 00 00 00 02  GUID: "
+                "C0FFEE00-0000-4000-8000-0000000000A1 at 198.51.100.20 for sv_test0000000000 "
+                "on 192.0.2.10, link 02:00:00:00:00:01")
+        self.lat.write_record(args, rental, [{"boot": 1, "summary": last}])
+        record = (d / "record-draft.md").read_text()
+        for hidden in ("02 00 00 00 00 02", "C0FFEE00", "198.51.100.20", "192.0.2.10",
+                       "sv_test0000000000", "02:00:00:00:00:01"):
+            self.assertNotIn(hidden, record)
+        self.assertIn("CLIENT MAC ADDR: <mac>", record)
+        self.assertIn("| Result | boot 1: no verdict; last line: ", record)
+        # The rows Origin's own work fills are kept as they are.
+        self.assertIn(f"`KERNEL.ONBF` SHA-256 {self.lat.sha256(image / 'KERNEL.ONBF')}", record)
+        self.assertIn("| Source revision | `abc1234`;", record)
+
     def test_the_scope_row_quotes_the_kernels_own_line(self):
         # The line `origin_frame::cpuident` pins for rental A's processor, the EPYC 4244P.
         kernel = ("origin-kernel: CPU identity: AuthenticAMD family 19h (25) model 61h stepping 2 "

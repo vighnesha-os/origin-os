@@ -365,9 +365,15 @@ fn shape_tables(
     xsdt: &mut [u8],
     shape: Shape,
 ) -> Result<(), Failure> {
+    let only_spcr = shape.spcr_in_ram && !(shape.acpi_nvs || shape.facs_32 || shape.fpdt);
     let _ = writeln!(
         out,
-        "origin-test-reserved: TEST ONLY: shaping the firmware's tables as rental B's board has them"
+        "origin-test-reserved: TEST ONLY: shaping the firmware's tables {}",
+        if only_spcr {
+            "with the SPCR in RAM the kernel owns"
+        } else {
+            "as rental B's board has them"
+        }
     );
     if shape.top_reserved_pages != 0 {
         let pages = shape.top_reserved_pages as usize;
@@ -399,6 +405,20 @@ fn shape_tables(
         let _ = writeln!(
             out,
             "origin-test-reserved: the XSDT now names FACP at {new:#x} in place of the firmware's at {addr:#x}: the FACS at {facs:#x} by FIRMWARE_CTRL alone"
+        );
+    }
+    if shape.spcr_in_ram {
+        // TASKS item 84's review, T84-3: the loader reads it under boot services; the kernel,
+        // owning that RAM, refuses this one table and reads every other.
+        let (index, addr, old) = find_table(xsdt, b"SPCR")?;
+        let new = allocate(bs, LOADER_DATA, old.len().div_ceil(PAGE as usize))?;
+        // SAFETY: the pages just allocated, identity-mapped, owned by nothing else, at least
+        // `old.len()` bytes.
+        unsafe { physical_mut(new, old.len()) }.copy_from_slice(old);
+        xsdt_set(xsdt, index, new).ok_or((Status::LOAD_ERROR, "the XSDT cannot be changed"))?;
+        let _ = writeln!(
+            out,
+            "origin-test-reserved: the XSDT now names SPCR at {new:#x} (loader data, RAM the kernel owns) in place of the firmware's at {addr:#x}"
         );
     }
     let mut appended = None;
@@ -451,13 +471,19 @@ fn shape_tables(
     let new_rsdp = rsdp_naming(old_rsdp, new_rsdt, new_xsdt)
         .ok_or((Status::LOAD_ERROR, "the RSDP is not an ACPI 2.0 one"))?;
     if shape.acpi_nvs {
-        let at = allocate(bs, ACPI_NVS, 1)?;
+        // TASKS item 84: in loader data, the loader still reads it, and the kernel refuses it.
+        let (kind, name) = if shape.rsdp_in_ram {
+            (LOADER_DATA, "loader data, RAM the kernel owns")
+        } else {
+            (ACPI_NVS, "ACPI NVS")
+        };
+        let at = allocate(bs, kind, 1)?;
         // SAFETY: the page just allocated, identity-mapped and owned by nothing else.
         unsafe { physical_mut(at, RSDP_LEN) }.copy_from_slice(&new_rsdp);
         install_configuration_table(bs, &ACPI_20_TABLE, at)?;
         let _ = writeln!(
             out,
-            "origin-test-reserved: the RSDP is copied to {at:#x} (ACPI NVS), and the configuration table names it"
+            "origin-test-reserved: the RSDP is copied to {at:#x} ({name}), and the configuration table names it"
         );
     } else {
         // SAFETY: the firmware's RSDP, 36 bytes of identity-mapped memory this application

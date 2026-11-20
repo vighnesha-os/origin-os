@@ -22,6 +22,7 @@ test = false
 bench = false
 
 [dependencies]
+origin-spcr.workspace = true
 origin-abi = { path = "../runtime/abi" }
 # ACPI 6.6's system description tables, checked whole by the boot's census of them (ADR-0019 A6,
 # area A; TASKS item 62).

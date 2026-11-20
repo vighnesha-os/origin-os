@@ -22,7 +22,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use origin_boot_info::{
-    BOOT_SECRET_LEN, BOOT_SEED_LEN, BootInfo, FLAG_KASLR, Framebuffer, KernelSegment,
+    BOOT_SECRET_LEN, BOOT_SEED_LEN, BootInfo, EarlyUart, FLAG_KASLR, Framebuffer, KernelSegment,
     MAX_KERNEL_SEGMENTS, MemoryRegion,
 };
 use origin_boot_uefi::console::ConOut;
@@ -36,7 +36,7 @@ use origin_boot_uefi::protocols::{
 use origin_boot_uefi::uefi::{
     self, ExitOutcome, Handle, Revision, SimpleTextOutputProtocol, Status, SystemTable, TableHeader,
 };
-use origin_boot_uefi::{framebuffer, kernel, memmap, place, trust};
+use origin_boot_uefi::{framebuffer, kernel, memmap, place, spcr, trust};
 use origin_paging::layout::{self, Placement};
 use origin_paging::{Access, Attributes, Table, TablePool};
 
@@ -369,6 +369,37 @@ fn boot(
             format_args!("the processor has no NX bit"),
         ));
     }
+    // ADR-0010 Amendment 3 (decision item 317; TASKS item 84): the UART the firmware's SPCR
+    // names, for the kernel's first line. Read under boot services, only from memory the map
+    // describes; no outcome stops the boot (ADR-0010 E5).
+    let early_uart = match read_memory_map(get_map, map, regions) {
+        Ok((_, n)) => {
+            let described = regions.get(..n).unwrap_or(&[]);
+            let (mut reads, mut read) = (0u32, 0usize);
+            let start = random::rdtsc();
+            let found = spcr::find(rsdp, &mut |at, bytes| {
+                reads += 1;
+                read += bytes.len();
+                read_described(described, at, bytes)
+            });
+            let cycles = random::rdtsc().wrapping_sub(start);
+            let _ = writeln!(out, "origin-boot: console: {found}");
+            // What the walk cost (cost ledger row CL46): the time-stamp counter's rate is not
+            // known here, so it is counted, not timed.
+            let _ = writeln!(
+                out,
+                "origin-boot: console: the walk read {read} bytes of firmware memory in {reads} reads, {cycles} time-stamp counter ticks (cost ledger row CL46)"
+            );
+            found.early_uart()
+        }
+        Err(_) => {
+            let _ = writeln!(
+                out,
+                "origin-boot: console: no SPCR read (the memory map could not be read); the kernel's console starts on COM1 and the screen"
+            );
+            EarlyUart::NONE
+        }
+    };
     // The table pool, sized from the memory map as it stands: the last allocation before the
     // tables are built, so the map they are built from differs from this one by very little.
     let (_, n) = read_memory_map(get_map, map, regions).map_err(|e| e.report(out))?;
@@ -583,6 +614,7 @@ fn boot(
                 flags: if kaslr { FLAG_KASLR } else { 0 },
                 framebuffer,
                 boot_seed,
+                early_uart,
             };
             // SAFETY: `info_addr` is the start of this loader's zeroed, 4 KiB-aligned boot-info
             // allocation, large enough for a `BootInfo`.
@@ -851,6 +883,22 @@ fn probe_memory_map(bs: &BootServices) -> Result<(usize, usize), Status> {
         });
     }
     Ok((size, dsize))
+}
+
+/// Copies `bytes.len()` bytes of firmware memory at physical `at` into `bytes`, if the memory
+/// map `described` covers the whole range (`spcr::described`); `false` if not.
+fn read_described(described: &[MemoryRegion], at: u64, bytes: &mut [u8]) -> bool {
+    if !spcr::described(described, at, bytes.len()) {
+        return false;
+    }
+    for (address, byte) in (at..).zip(bytes.iter_mut()) {
+        // SAFETY: `described` checked that the range lies in memory the firmware's memory map
+        // describes, which UEFI 2.11 §2.3.4 keeps identity-mapped while boot services run, and
+        // that it neither wraps nor starts at 0. Each byte is read once, volatile, with no
+        // reference held to firmware memory.
+        *byte = unsafe { ptr::with_exposed_provenance::<u8>(address as usize).read_volatile() };
+    }
+    true
 }
 
 /// The ACPI 2.0+ RSDP from the configuration table, or 0.

@@ -22,8 +22,9 @@ use core::fmt;
 
 use crate::linequeue::LineQueue;
 
-/// The UART input clock on PC-compatible platforms: 1.8432 MHz.
-pub const INPUT_CLOCK_HZ: u32 = 1_843_200;
+/// The UART input clock on PC-compatible platforms, the line setup and the divisor rule, which
+/// the SPCR's reading needs too: in `origin-spcr`, shared with the loader (TASKS item 84).
+pub use origin_spcr::{INPUT_CLOCK_HZ, LineSetup, divisor_for};
 /// Line speed in bits per second.
 pub const BAUD: u32 = 115_200;
 /// Baud-rate divisor. The UART samples each bit 16 times, so the divisor is
@@ -177,15 +178,6 @@ impl<const N: usize> Default for EarlyLog<N> {
     }
 }
 
-/// How [`Uart16550::configure`] sets the line speed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LineSetup {
-    /// Program this baud-rate divisor and 8N1.
-    Divisor(u16),
-    /// Leave the speed and format as the firmware set them.
-    Keep,
-}
-
 /// A UART's line format and divisor, as [`Uart16550::line_settings`] read them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LineSettings {
@@ -193,23 +185,6 @@ pub struct LineSettings {
     pub line_control: u8,
     /// The baud-rate divisor.
     pub divisor: u16,
-}
-
-/// The divisor for `baud` given the UART's input clock, or `None` if the clock cannot produce
-/// the rate to within 2 %. A UART samples each bit 16 times.
-pub fn divisor_for(baud: u32, clock_hz: u32) -> Option<u16> {
-    let per_tick = u64::from(baud).checked_mul(16)?;
-    if per_tick == 0 || clock_hz == 0 {
-        return None;
-    }
-    let clock = u64::from(clock_hz);
-    let divisor = (clock + per_tick / 2) / per_tick;
-    if divisor == 0 || divisor > u64::from(u16::MAX) {
-        return None;
-    }
-    let actual = clock / (16 * divisor);
-    // Within 2 % of the rate; a UART tolerates a few percent, so this is safely usable.
-    (actual.abs_diff(u64::from(baud)) * 50 <= u64::from(baud)).then_some(divisor as u16)
 }
 
 /// Access to the registers of one 16550-compatible UART.
@@ -784,21 +759,6 @@ mod tests {
         assert_eq!(log.dropped(), 0);
         log.push(b"xy");
         assert_eq!(log.as_bytes(), b"xy");
-    }
-
-    #[test]
-    fn divisors_come_from_the_rate_and_the_clock() {
-        assert_eq!(divisor_for(115_200, INPUT_CLOCK_HZ), Some(1));
-        assert_eq!(divisor_for(9_600, INPUT_CLOCK_HZ), Some(12));
-        assert_eq!(divisor_for(115_200, 48_000_000), Some(26)); // 115 384 baud, 0.16 % fast
-        assert_eq!(divisor_for(1_500_000, 48_000_000), Some(2));
-        // The clock cannot reach the rate, or the divisor does not fit in 16 bits.
-        assert_eq!(divisor_for(115_200, 1_000_000), None);
-        assert_eq!(divisor_for(1, u32::MAX), None);
-        assert_eq!(divisor_for(0, INPUT_CLOCK_HZ), None);
-        assert_eq!(divisor_for(115_200, 0), None);
-        // Never a panic on the extremes.
-        assert_eq!(divisor_for(u32::MAX, u32::MAX), None);
     }
 
     #[test]

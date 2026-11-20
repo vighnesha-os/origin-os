@@ -33,6 +33,13 @@
 //! working FIFO takes a byte at a time.) Waiting for those 16 bytes to leave, 1.4 ms at 115 200
 //! baud, is done between sections, with the lock free and interrupts as the writer has them.
 //!
+//! Until its move settles the console, the kernel also writes every line to the UART the loader
+//! named from the SPCR (boot info 0.8; ADR-0010 Amendment 3; [`attach_loader_uart`]), and after a
+//! refused move for the rest of the boot. That UART has a queue of its own, given up on alone
+//! after the same bounded wait. The two take turns, a section each, so one stretch with
+//! interrupts off is still one section of one UART (TASKS item 84's review, T84-2), and a writer
+//! that can wait goes on only when its line is on both.
+//!
 //! The framebuffer's time is uncached writes: under KVM on a real AMD EPYC 7763 one console
 //! line, about 40,960 pixels, took 4.3 to 4.6 ms and up to 10 ms. A section writes at most
 //! [`SECTION_PIXELS`] pixels; at the cost measured there (105 to 245 ns a pixel), that is about
@@ -73,7 +80,7 @@ use crate::serial::{
     Uart16550, UartRegisters,
 };
 use crate::spcr::{self, Access, Spcr, UartAddress};
-use origin_boot_info::{BootInfo, Framebuffer, MemoryRegion, overlaps_ram};
+use origin_boot_info::{BootInfo, EarlyUart, Framebuffer, MemoryRegion, overlaps_ram};
 use origin_frame::addr::PhysAddr;
 use origin_frame::mmio::MmioRegion;
 use origin_frame::once::SetOnce;
@@ -121,6 +128,11 @@ impl KernelUart {
     fn port(base: u16) -> Option<Self> {
         if base == COM1_BASE {
             return com1_ports().map(Self::Port);
+        }
+        if let Some(&uart @ Self::Port(ports)) = LOADER_UART.get()
+            && ports.base() == base
+        {
+            return Some(uart);
         }
         PortRange::claim(base, 8).map(Self::Port)
     }
@@ -222,6 +234,14 @@ static CURSOR: Cursor = Cursor::new();
 static MOVED_UART: SetOnce<KernelUart> = SetOnce::new();
 /// The move was undone (the new UART took no bytes): back to COM1.
 static FELL_BACK_TO_COM1: AtomicBool = AtomicBool::new(false);
+/// The UART the loader named from the SPCR (boot info 0.8), claimed and probed by
+/// [`attach_loader_uart`]: written to beside the console's UART from the first line until the
+/// move settles the console (ADR-0010 Amendment 3, decision item 317; TASKS item 84). Set once,
+/// while the boot processor runs alone.
+static LOADER_UART: SetOnce<KernelUart> = SetOnce::new();
+/// Whether the console still writes to [`LOADER_UART`]: for urgent reports that cannot get the
+/// lock.
+static LOADER_UART_ON: AtomicBool = AtomicBool::new(false);
 
 /// Writes to the UART's data register: counted at the sink, so that the proof of
 /// [`TX_FIFO_BYTES`] does not take the queue's word for it.
@@ -277,6 +297,8 @@ enum Sent {
     /// is not going to (that sink is gone, or had no room and the writer cannot wait).
     Queued {
         uart: Option<u64>,
+        /// On the loader's UART ([`LoaderLine`]).
+        loader: Option<u64>,
         screen: Option<u64>,
     },
     /// Nowhere yet: a queue is full and this writer can wait for room.
@@ -286,6 +308,19 @@ enum Sent {
 /// What the screen is told when the UART goes.
 const UART_STOPPED: &[u8] =
     b"origin-kernel: console: the UART stopped taking bytes; serial output off\n";
+/// What the screen and the console's UART are told when the loader's UART goes.
+const LOADER_UART_STOPPED: &[u8] =
+    b"origin-kernel: console: the loader's UART stopped taking bytes; serial output there off\n";
+
+/// The UART the loader named from the SPCR, while the console writes to it beside its own
+/// (ADR-0010 Amendment 3): its own queue, sent a section at a time like the console's UART, and
+/// given up on in the same way, on its own.
+struct LoaderLine {
+    uart: Uart16550<KernelUart>,
+    /// Cleared when it stops taking bytes, as [`Sinks::uart_alive`].
+    alive: bool,
+    tx: TxQueue<UART_QUEUE_BYTES>,
+}
 
 /// The console's state, under [`SINKS`].
 struct Sinks {
@@ -301,6 +336,17 @@ struct Sinks {
     early_open: bool,
     /// What the UART has not taken yet.
     tx: TxQueue<UART_QUEUE_BYTES>,
+    /// The loader's UART, from [`attach_loader_uart`] until the move settles the console.
+    loader: Option<LoaderLine>,
+    /// Whose turn the next section is while both UARTs have bytes waiting: the loader's if set
+    /// (TASKS item 84's review, T84-2).
+    loader_turn: bool,
+    /// Where the console's own UART has carried the notice that the loader's UART stopped, once
+    /// it is queued: no writer that can wait goes on before it has (T84-9). 0 until then.
+    loader_notice: u64,
+    /// The loader named COM1, and its speed was set then by the SPCR's rule: the move to COM1
+    /// finds nothing left to change (T84-10).
+    com1_from_loader: bool,
     /// What the screen has not shown yet.
     backlog: Backlog<BACKLOG_BYTES>,
     /// Where the screen has shown that the UART stopped, once it has got that far: no writer
@@ -324,9 +370,31 @@ impl Sinks {
             early: EarlyLog::new(),
             early_open: true,
             tx: TxQueue::new(),
+            loader: None,
+            loader_turn: false,
+            loader_notice: 0,
+            com1_from_loader: false,
             backlog: Backlog::new(),
             stop_notice: 0,
         }
+    }
+
+    /// The loader's UART, if the console still writes to it.
+    fn loader_alive(&mut self) -> Option<&mut LoaderLine> {
+        self.loader.as_mut().filter(|line| line.alive)
+    }
+
+    /// Whether every UART the console writes to has taken a line that ends at `uart` on its
+    /// own and at `loader` on the loader's: a UART given up on since has nothing to wait for.
+    fn reached(&self, uart: Option<u64>, loader: Option<u64>) -> bool {
+        let own = uart
+            .is_none_or(|end| !self.uart_alive || self.tx.sent() >= end.max(self.loader_notice));
+        let named = loader.is_none_or(|end| {
+            self.loader
+                .as_ref()
+                .is_none_or(|line| !line.alive || line.tx.sent() >= end)
+        });
+        own && named
     }
 
     /// Hands `bytes` over: into the queue for the UART and the backlog for the screen,
@@ -335,8 +403,13 @@ impl Sinks {
     /// says whether the writer waits for room or the line is lost on that sink alone.
     fn send(&mut self, bytes: &[u8], may_wait: bool) -> Sent {
         let has_screen = screen().is_some();
+        let loader_full = self
+            .loader
+            .as_ref()
+            .is_some_and(|line| line.alive && !line.tx.has_room(bytes.len()));
         if may_wait
             && ((self.uart_alive && !self.tx.has_room(bytes.len()))
+                || loader_full
                 || (has_screen && !self.backlog.has_room(bytes.len())))
         {
             return Sent::NoRoom;
@@ -350,6 +423,13 @@ impl Sinks {
         } else {
             None
         };
+        let loader = self.loader_alive().and_then(|line| {
+            let position = line.tx.push(bytes);
+            if position.is_none() {
+                line.tx.note_lost();
+            }
+            position
+        });
         let screen = if has_screen {
             let position = self.backlog.push(bytes);
             if position.is_none() {
@@ -365,42 +445,122 @@ impl Sinks {
         if screen.is_some() {
             note_line();
         }
-        Sent::Queued { uart, screen }
+        Sent::Queued {
+            uart,
+            loader,
+            screen,
+        }
     }
 
     /// One section of the sink that has no room for `needed` more bytes.
     fn make_room(&mut self, needed: usize) {
+        let loader_full = self
+            .loader
+            .as_ref()
+            .is_some_and(|line| line.alive && !line.tx.has_room(needed));
         if self.uart_alive && !self.tx.has_room(needed) {
             UART_NO_ROOM.fetch_add(1, Ordering::Relaxed);
-            self.pump_uart();
+            self.pump_own();
+        } else if loader_full {
+            UART_NO_ROOM.fetch_add(1, Ordering::Relaxed);
+            self.pump_loader();
         } else {
             self.paint_section();
         }
     }
 
-    /// Sends one section of the queue, the most the console writes to the UART in one stretch
-    /// with interrupts off: at most [`TX_FIFO_BYTES`] bytes, with no waiting in it. Returns
-    /// whether more is waiting. See the module documentation.
+    /// Sends one section, the most the console writes to a UART in one stretch with interrupts
+    /// off: at most [`TX_FIFO_BYTES`] bytes to one UART, with no waiting in it. While the
+    /// loader's UART is written to as well, the two take turns, a section each, so a stretch
+    /// with interrupts off is still one section (TASKS item 84's review, T84-2). Returns whether
+    /// more is waiting for either. See the module documentation.
     fn pump_uart(&mut self) -> bool {
-        if !self.uart_alive {
-            return false;
-        }
-        let (start, written) = (crate::cpu::rdtsc(), UART_BYTES.load(Ordering::Relaxed));
-        let pumped = self.tx.pump(&mut self.uart);
-        let cycles = crate::cpu::rdtsc().wrapping_sub(start);
-        match pumped {
-            Pumped::Stopped { polls } => {
-                UART_GIVEN_UP_AFTER.fetch_add(u64::from(polls), Ordering::Relaxed);
-                self.give_up_on_uart();
-                return false;
+        let own = self.uart_alive && !self.tx.is_empty();
+        let named = self
+            .loader
+            .as_ref()
+            .is_some_and(|line| line.alive && !line.tx.is_empty());
+        let loader_turn = match (own, named) {
+            (true, true) => {
+                self.loader_turn = !self.loader_turn;
+                self.loader_turn
             }
-            Pumped::Idle => {}
-            Pumped::Busy | Pumped::Sent(_) => note_uart_section(
-                cycles,
-                UART_BYTES.load(Ordering::Relaxed).wrapping_sub(written),
-            ),
+            (false, true) => true,
+            _ => false,
+        };
+        if loader_turn {
+            self.pump_loader();
+        } else {
+            self.pump_own();
         }
-        !self.tx.is_empty()
+        self.waiting()
+    }
+
+    /// One section of the console's own UART.
+    fn pump_own(&mut self) {
+        if self.uart_alive
+            && let Pumped::Stopped { polls } = pump_section(&mut self.tx, &mut self.uart)
+        {
+            UART_GIVEN_UP_AFTER.fetch_add(u64::from(polls), Ordering::Relaxed);
+            self.give_up_on_uart();
+        }
+    }
+
+    /// One section of the loader's UART.
+    fn pump_loader(&mut self) {
+        if let Some(line) = self.loader_alive()
+            && let Pumped::Stopped { .. } = pump_section(&mut line.tx, &mut line.uart)
+        {
+            self.give_up_on_loader_uart();
+        }
+    }
+
+    /// Whether any UART the console writes to has bytes waiting.
+    fn waiting(&self) -> bool {
+        (self.uart_alive && !self.tx.is_empty())
+            || self
+                .loader
+                .as_ref()
+                .is_some_and(|line| line.alive && !line.tx.is_empty())
+    }
+
+    /// Whether every UART the console writes to has room for `needed` more bytes.
+    fn every_uart_has_room(&self, needed: usize) -> bool {
+        (!self.uart_alive || self.tx.has_room(needed))
+            && self
+                .loader
+                .as_ref()
+                .is_none_or(|line| !line.alive || line.tx.has_room(needed))
+    }
+
+    /// How many UARTs the console writes to.
+    fn live_uarts(&self) -> u64 {
+        u64::from(self.uart_alive) + u64::from(self.loader.as_ref().is_some_and(|l| l.alive))
+    }
+
+    /// The loader's UART stopped taking bytes: nothing more goes to it, and the screen and the
+    /// console's UART say so.
+    fn give_up_on_loader_uart(&mut self) {
+        let Some(line) = self.loader.as_mut() else {
+            return;
+        };
+        line.alive = false;
+        line.tx.clear();
+        LOADER_UART_ON.store(false, Ordering::Release);
+        // As for the console's own UART (Amendment 2): the writer that found it out goes on only
+        // once the notice is out, on COM1 and on the screen (TASKS item 84's review, T84-9).
+        if self.uart_alive {
+            match self.tx.push(LOADER_UART_STOPPED) {
+                Some(end) => self.loader_notice = end,
+                None => self.tx.note_lost(),
+            }
+        }
+        if screen().is_some() {
+            match self.backlog.push(LOADER_UART_STOPPED) {
+                Some(end) => self.stop_notice = self.stop_notice.max(end),
+                None => self.backlog.note_lost(),
+            }
+        }
     }
 
     /// The UART stopped taking bytes: nothing more goes to it, and the screen says so.
@@ -415,9 +575,9 @@ impl Sinks {
         }
     }
 
-    /// Sends everything queued, and waits for that here: before the console moves to another
-    /// UART, when nothing else is running. Bounded: the queue's size, and the one wait a UART
-    /// that stops taking bytes is given.
+    /// Sends everything queued, to every UART the console writes to, and waits for that here:
+    /// before the console moves to another UART, when nothing else is running. Bounded: the
+    /// queues' size, and the one wait a UART that stops taking bytes is given.
     fn drain_uart(&mut self) {
         while self.pump_uart() {
             core::hint::spin_loop();
@@ -441,6 +601,20 @@ impl Sinks {
     }
 }
 
+/// One section of `tx` on `uart`, counted at the sink (see [`Sinks::pump_uart`]).
+fn pump_section(tx: &mut TxQueue<UART_QUEUE_BYTES>, uart: &mut Uart16550<KernelUart>) -> Pumped {
+    let (start, written) = (crate::cpu::rdtsc(), UART_BYTES.load(Ordering::Relaxed));
+    let pumped = tx.pump(uart);
+    let cycles = crate::cpu::rdtsc().wrapping_sub(start);
+    if matches!(pumped, Pumped::Busy | Pumped::Sent(_)) {
+        note_uart_section(
+            cycles,
+            UART_BYTES.load(Ordering::Relaxed).wrapping_sub(written),
+        );
+    }
+    pumped
+}
+
 /// The programmed UART and the rest of the console, once [`init`] has run.
 static SINKS: SpinLock<Option<Sinks>> = SpinLock::new(None);
 
@@ -462,6 +636,10 @@ pub(crate) fn init(uart: Uart16550<KernelUart>, firmware_line: LineSettings) {
             early: EarlyLog::new(),
             early_open: true,
             tx: TxQueue::new(),
+            loader: None,
+            loader_turn: false,
+            loader_notice: 0,
+            com1_from_loader: false,
             backlog: Backlog::new(),
             stop_notice: 0,
         });
@@ -588,7 +766,7 @@ fn pause(flow: Flow) {
 /// `between` runs after each section but the last, with interrupts as the caller has them:
 /// for [`prove`].
 fn send_and_draw(bytes: &[u8], flow: Flow, between: &mut dyn FnMut(Sink, u32)) {
-    let (uart, screen) = loop {
+    let (uart, loader, screen) = loop {
         let sent = with_sinks(flow, |sinks| {
             let sent = sinks.send(bytes, flow != Flow::NoWaiting);
             match sent {
@@ -602,7 +780,11 @@ fn send_and_draw(bytes: &[u8], flow: Flow, between: &mut dyn FnMut(Sink, u32)) {
             sent
         });
         match sent {
-            Sent::Queued { uart, screen } => break (uart, screen),
+            Sent::Queued {
+                uart,
+                loader,
+                screen,
+            } => break (uart, loader, screen),
             Sent::NoRoom => pause(flow),
         }
     };
@@ -610,9 +792,11 @@ fn send_and_draw(bytes: &[u8], flow: Flow, between: &mut dyn FnMut(Sink, u32)) {
         return;
     }
     let polls_given = UART_GIVEN_UP_AFTER.load(Ordering::Relaxed);
-    if let Some(end) = uart {
+    if uart.is_some() || loader.is_some() {
         let mut section = 0;
-        while with_sinks(flow, |sinks| sinks.pump_uart() && sinks.tx.sent() < end) {
+        while with_sinks(flow, |sinks| {
+            sinks.pump_uart() && !sinks.reached(uart, loader)
+        }) {
             pause(flow);
             section += 1;
             between(Sink::Uart, section);
@@ -653,7 +837,7 @@ fn urgent_section<T>(f: impl FnOnce(&mut Sinks) -> T) -> Option<T> {
 /// A report through the console's own queues: handed over, sent, then drawn, each a section
 /// at a time, with the lock let go between them. `None` if the lock could not be got.
 fn send_report(bytes: &[u8]) -> Option<()> {
-    let (uart, screen) = loop {
+    let (uart, loader, screen) = loop {
         let sent = urgent_section(|sinks| {
             let sent = sinks.send(bytes, true);
             if sent == Sent::NoRoom {
@@ -661,12 +845,17 @@ fn send_report(bytes: &[u8]) -> Option<()> {
             }
             sent
         })?;
-        if let Sent::Queued { uart, screen } = sent {
-            break (uart, screen);
+        if let Sent::Queued {
+            uart,
+            loader,
+            screen,
+        } = sent
+        {
+            break (uart, loader, screen);
         }
     };
-    if let Some(end) = uart {
-        while urgent_section(|sinks| sinks.pump_uart() && sinks.tx.sent() < end)? {
+    if uart.is_some() || loader.is_some() {
+        while urgent_section(|sinks| sinks.pump_uart() && !sinks.reached(uart, loader))? {
             core::hint::spin_loop();
         }
     }
@@ -686,6 +875,11 @@ fn send_urgent(bytes: &[u8]) {
             // The holder is stuck (this processor faulted inside a section, or another died
             // holding the lock): send without it.
             let _ = emit(&mut unowned_uart(), bytes);
+            if LOADER_UART_ON.load(Ordering::Acquire)
+                && let Some(&uart) = LOADER_UART.get()
+            {
+                let _ = emit(&mut Uart16550::new(uart), bytes);
+            }
             draw(bytes);
         }
     });
@@ -793,6 +987,257 @@ pub(crate) fn has_screen() -> bool {
     screen().is_some()
 }
 
+/// Where the loader's UART is, while the console writes to it.
+fn loader_port_on() -> Option<u16> {
+    if !LOADER_UART_ON.load(Ordering::Acquire) {
+        return None;
+    }
+    match LOADER_UART.get() {
+        Some(KernelUart::Port(ports)) => Some(ports.base()),
+        _ => None,
+    }
+}
+
+/// Where the console stays when it does not move: COM1 and, while it writes there, the loader's
+/// UART, which it keeps for the rest of the boot (TASKS item 84, ruling Q1).
+struct Stays;
+
+impl fmt::Display for Stays {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the UART stays at I/O port {COM1_BASE:#x}")?;
+        if let Some(port) = loader_port_on() {
+            write!(f, ", and the loader's at I/O port {port:#x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// What became of the UART the loader named ([`attach_loader_uart`]), said once the screen is
+/// attached, so that the line is on every sink.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LoaderUart {
+    /// Written to from here on, beside COM1, with this speed.
+    Attached {
+        port: u16,
+        interface: u8,
+        setup: LineSetup,
+    },
+    /// COM1 itself, written to from the first line anyway, with its speed set by the SPCR's rule
+    /// (T84-10).
+    Com1 { setup: LineSetup },
+    /// Written to from the first line, and given up on during it: it took no bytes.
+    Stopped { port: u16, interface: u8 },
+    /// None named.
+    None,
+    /// The structure fails boot info's check.
+    Refused(origin_boot_info::EarlyUartError),
+    /// Named, and not used: why.
+    Unusable { port: u16, why: &'static str },
+}
+
+impl LoaderUart {
+    /// What became of it by now: a UART given up on during the first line is said to have
+    /// stopped, not to be written to (TASKS item 84's review, T84-9).
+    pub(crate) fn now(self) -> Self {
+        match self {
+            Self::Attached {
+                port, interface, ..
+            } if !LOADER_UART_ON.load(Ordering::Acquire) => Self::Stopped { port, interface },
+            other => other,
+        }
+    }
+}
+
+/// How a speed setup is said in the console's lines.
+fn speed(setup: LineSetup) -> &'static str {
+    match setup {
+        LineSetup::Divisor(_) => "programmed to the stated rate",
+        LineSetup::Keep => "as the firmware set it",
+    }
+}
+
+impl fmt::Display for LoaderUart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const UNTIL: &str = "COM1 and the screen until the SPCR is read";
+        match *self {
+            Self::Attached {
+                port,
+                interface,
+                setup,
+            } => write!(
+                f,
+                "the loader named the SPCR's UART at I/O port {port:#x} (interface {interface:#x}): written to from the first line, beside COM1, {}",
+                speed(setup)
+            ),
+            Self::Com1 { setup } => write!(
+                f,
+                "the loader named the SPCR's UART at I/O port {COM1_BASE:#x}: COM1, written to from the first line, {}",
+                speed(setup)
+            ),
+            Self::Stopped { port, interface } => write!(
+                f,
+                "the loader named the SPCR's UART at I/O port {port:#x} (interface {interface:#x}): written to from the first line, and it stopped taking bytes there; {UNTIL}"
+            ),
+            Self::None => write!(f, "the loader named no UART from the SPCR; {UNTIL}"),
+            Self::Refused(why) => write!(f, "the loader's UART was refused ({why:?}); {UNTIL}"),
+            Self::Unusable { port, why } => write!(
+                f,
+                "the loader named the SPCR's UART at I/O port {port:#x}, which cannot be used ({why}); {UNTIL}"
+            ),
+        }
+    }
+}
+
+/// Starts writing to the UART the loader named from the SPCR (boot info 0.8), beside COM1, from
+/// the kernel's first line on (ADR-0010 Amendment 3, decision item 317; TASKS item 84). Called
+/// once by `kernel_main`, right after the boot info is read and before anything is printed but
+/// a report of an invalid boot info, while the boot processor runs alone. What it did is said
+/// once the screen is attached too.
+///
+/// The structure is checked again here (`EarlyUart::check`), the 8 ports are claimed and
+/// probed as the move's are, and the speed is set by the SPCR's own rule
+/// (`origin_spcr::line_setup`). No outcome stops the boot (ADR-0010 E5).
+/// [`adopt_firmware_uart`] settles the console later, from the SPCR it reads itself.
+pub(crate) fn attach_loader_uart(info: &BootInfo) -> LoaderUart {
+    let named: EarlyUart = info.early_uart;
+    if let Err(why) = named.check() {
+        return LoaderUart::Refused(why);
+    }
+    if !named.is_present() {
+        return LoaderUart::None;
+    }
+    let port = named.port;
+    if port == COM1_BASE {
+        // COM1 is the console's UART already, programmed at entry to the console's own 115,200
+        // baud: its speed is set now by the SPCR's rule, as the move would set it, so its lines
+        // are readable there from the first (TASKS item 84's review, T84-10).
+        let setup = crate::cpu::without_interrupts(|| {
+            let mut sinks = SINKS.lock();
+            let sinks = sinks.as_mut()?;
+            let latch = sinks.firmware_line.divisor;
+            let setup = spcr::line_setup(
+                UartAddress::Port(port),
+                named.stated_baud(),
+                named.stated_clock(),
+                latch,
+            );
+            match setup {
+                LineSetup::Divisor(_) => sinks.uart.configure(setup),
+                LineSetup::Keep if latch != 0 => sinks.uart.restore(sinks.firmware_line),
+                LineSetup::Keep => {}
+            }
+            sinks.com1_from_loader = true;
+            Some(setup)
+        });
+        return LoaderUart::Com1 {
+            setup: setup.unwrap_or(LineSetup::Keep),
+        };
+    }
+    let Some(uart) = KernelUart::port(port) else {
+        return LoaderUart::Unusable {
+            port,
+            why: "its ports are not available",
+        };
+    };
+    // Kept claimed whatever the probe finds, so the move's own claim of the same ports
+    // (`uart_for`) gets this one, and probes it again.
+    let _ = LOADER_UART.set(uart);
+    // A floating bus reads as all ones, where a 16550 never sets every status bit at once:
+    // nothing answers there (as `uart_for` probes the SPCR's UART).
+    let mut probe = uart;
+    if probe.read(Register::LineStatus) == 0xFF {
+        return LoaderUart::Unusable {
+            port,
+            why: "nothing answers at that address",
+        };
+    }
+    let mut line = Uart16550::new(uart);
+    let latch = line.line_settings().divisor;
+    let setup = spcr::line_setup(
+        UartAddress::Port(port),
+        named.stated_baud(),
+        named.stated_clock(),
+        latch,
+    );
+    line.configure(setup);
+    crate::cpu::without_interrupts(|| {
+        if let Some(sinks) = SINKS.lock().as_mut() {
+            sinks.loader = Some(LoaderLine {
+                uart: line,
+                alive: true,
+                tx: TxQueue::new(),
+            });
+            LOADER_UART_ON.store(true, Ordering::Release);
+        }
+    });
+    LoaderUart::Attached {
+        port,
+        interface: named.interface,
+        setup,
+    }
+}
+
+/// The move to the loader's UART, which already has every line: COM1 stops, and nothing is sent
+/// again (TASKS item 84). `false` if the loader's UART is not the one the console writes to.
+fn take_over_loader_uart(out: &mut Console, spcr: &Spcr) -> bool {
+    use core::fmt::Write as _;
+    let UartAddress::Port(port) = spcr.address else {
+        return false;
+    };
+    if loader_port_on() != Some(port) {
+        return false;
+    }
+    // Printed before the move, on COM1 too, so someone watching it sees where it went.
+    let _ = writeln!(
+        out,
+        "origin-kernel: console: the ACPI SPCR (revision {}, interface {:#x}) names a UART at {}: the console has written there since its first line, so nothing is sent again; COM1 stops",
+        spcr.revision,
+        spcr.interface,
+        Named(spcr)
+    );
+    // Decided under the lock, after the drain: a UART that stopped taking bytes during that line
+    // or the drain is not taken over, and COM1 stays (TASKS item 84's review, T84-1).
+    let taken = crate::cpu::without_interrupts(|| {
+        let mut sinks = SINKS.lock();
+        let sinks = sinks.as_mut()?;
+        sinks.drain_uart();
+        let line = sinks.loader.take()?;
+        sinks.early_open = false;
+        sinks.early.clear();
+        if !line.alive {
+            return Some(None);
+        }
+        let taken = line.tx.sent();
+        sinks.uart = line.uart;
+        sinks.uart_alive = true;
+        sinks.tx = line.tx;
+        // `MOVED_UART` first, so a report without the lock in between still reaches it (T84-9).
+        if let Some(&uart) = LOADER_UART.get() {
+            let _ = MOVED_UART.set(uart);
+        }
+        LOADER_UART_ON.store(false, Ordering::Release);
+        Some(Some(taken))
+    });
+    match taken {
+        // What writing there from the first line cost, in bytes of text (ledger row CL46): on
+        // that UART alone, now the console's.
+        Some(Some(taken)) => {
+            let _ = writeln!(
+                out,
+                "origin-kernel: console: {taken} bytes of text went to that UART before the move, beside COM1 (cost ledger row CL46)"
+            );
+        }
+        Some(None) => {
+            let _ = writeln!(
+                out,
+                "origin-kernel: console: the loader's UART stopped taking bytes during the move; the UART stays at I/O port {COM1_BASE:#x}"
+            );
+        }
+        None => {}
+    }
+    true
+}
+
 /// Moves the console's UART to the one the firmware names in its ACPI SPCR table, when it names
 /// one this kernel can drive: the UART's address comes from there, and 0x3F8 is only used
 /// when the firmware gives nothing better (ADR-0010). What was printed before this goes to
@@ -821,9 +1266,7 @@ pub(crate) fn adopt_firmware_uart(out: &mut Console, rsdp: u64, regions: &[Memor
         Err(why) => {
             settle(
                 out,
-                format_args!(
-                    "no usable ACPI SPCR table ({why}); the UART stays at I/O port {COM1_BASE:#x}"
-                ),
+                format_args!("no usable ACPI SPCR table ({why}); {Stays}"),
             );
             return;
         }
@@ -833,19 +1276,20 @@ pub(crate) fn adopt_firmware_uart(out: &mut Console, rsdp: u64, regions: &[Memor
         Err(why) => {
             settle(
                 out,
-                format_args!(
-                    "the ACPI SPCR table was refused ({why:?}); the UART stays at I/O port {COM1_BASE:#x}"
-                ),
+                format_args!("the ACPI SPCR table was refused ({why:?}); {Stays}"),
             );
             return;
         }
     };
+    if take_over_loader_uart(out, &spcr) {
+        return;
+    }
     match uart_for(&spcr, regions) {
         Ok(uart) => move_to(out, &spcr, uart),
         Err(why) => settle(
             out,
             format_args!(
-                "the ACPI SPCR names a UART at {} that cannot be used ({why}); the UART stays at I/O port {COM1_BASE:#x}",
+                "the ACPI SPCR names a UART at {} that cannot be used ({why}); {Stays}",
                 Named(&spcr)
             ),
         ),
@@ -925,7 +1369,7 @@ fn move_to(out: &mut Console, spcr: &Spcr, uart: KernelUart) {
     if stayed {
         let _ = writeln!(
             out,
-            "origin-kernel: console: the UART at {} takes no bytes; the UART stays at I/O port {COM1_BASE:#x}",
+            "origin-kernel: console: the UART at {} takes no bytes; {Stays}",
             Named(spcr)
         );
         return;
@@ -961,7 +1405,11 @@ fn move_uart(sinks: &mut Sinks, spcr: &Spcr, uart: KernelUart) -> (LineSetup, us
         new.line_settings().divisor
     };
     let setup = spcr.line_setup(latch);
-    let reprogrammed = if same_port {
+    let reprogrammed = if same_port && sinks.com1_from_loader {
+        // The loader named COM1, and its speed was set then by this same rule: every line so far
+        // went out at it (TASKS item 84's review, T84-10).
+        false
+    } else if same_port {
         match setup {
             LineSetup::Divisor(divisor) => {
                 sinks.uart.configure(setup);
@@ -1003,6 +1451,12 @@ fn move_uart(sinks: &mut Sinks, spcr: &Spcr, uart: KernelUart) -> (LineSetup, us
             }
             Err(_) => sinks.give_up_on_uart(),
         }
+    }
+    // The console has a UART that takes bytes: the loader's, which was told of the move before
+    // it, stops (TASKS item 84).
+    if sinks.uart_alive {
+        sinks.loader = None;
+        LOADER_UART_ON.store(false, Ordering::Release);
     }
     (setup, replayed, dropped, false)
 }
@@ -1315,7 +1769,10 @@ fn prove_room(com1: &mut Console) -> bool {
     let flow = com1.flow();
     let needed = ROOM.len() + PROOF_FILL + 1;
     let mut lines = 0;
-    while lines < MOST_LINES && with_sinks(flow, |sinks| sinks.tx.has_room(needed)) {
+    // Every UART the console writes to counts: the loader's too, while it is written to (TASKS
+    // item 84's review, T84-3).
+    let live = with_sinks(flow, |sinks| sinks.live_uarts());
+    while lines < MOST_LINES && with_sinks(flow, |sinks| sinks.every_uart_has_room(needed)) {
         let mut out = Console::new();
         let _ = write!(
             out,
@@ -1332,9 +1789,9 @@ fn prove_room(com1: &mut Console) -> bool {
     print_long(com1, ROOM, &mut |_, _| {});
     let waited = UART_NO_ROOM.load(Ordering::Relaxed) > no_room;
     let written = UART_BYTES.load(Ordering::Relaxed).wrapping_sub(before);
-    let emptied = with_sinks(com1.flow(), |sinks| sinks.tx.is_empty());
-    // CR LF at the end of it, on top of what was in front of it.
-    let ok = lines > 1 && waited && emptied && written > (needed + 1) as u64;
+    let emptied = with_sinks(com1.flow(), |sinks| !sinks.waiting());
+    // CR LF at the end of it, on top of what was in front of it, on each UART.
+    let ok = lines > 1 && waited && emptied && written > (needed + 1) as u64 * live;
     let _ = writeln!(
         com1,
         "origin-kernel: console: {lines} lines from a writer that cannot wait filled the UART's queue; the next writer waited for room: {waited}, and when it went on the queue was empty: {emptied}{}",
@@ -1345,7 +1802,12 @@ fn prove_room(com1: &mut Console) -> bool {
 
 /// Whether the console still sends to its UART.
 fn uart_is_on() -> bool {
-    crate::cpu::without_interrupts(|| SINKS.lock().as_ref().is_some_and(|sinks| sinks.uart_alive))
+    crate::cpu::without_interrupts(|| {
+        SINKS
+            .lock()
+            .as_ref()
+            .is_some_and(|sinks| sinks.live_uarts() > 0)
+    })
 }
 
 /// Proves what [`TX_FIFO_BYTES`] promises, from the boot flow, just before [`prove_sections`]
@@ -1376,11 +1838,14 @@ pub(crate) fn prove_uart_sections(com1: &mut Console) -> bool {
         return true;
     }
     const PLAIN: &str = "origin-kernel: console: a line sent on the UART a section at a time: ";
+    // Every UART the console writes to counts: the loader's too, while it is written to (TASKS
+    // item 84's review, T84-3).
+    let live = with_sinks(com1.flow(), |sinks| sinks.live_uarts());
     let before = UART_BYTES.load(Ordering::Relaxed);
     print_long(com1, PLAIN, &mut |_, _| {});
     let written = UART_BYTES.load(Ordering::Relaxed).wrapping_sub(before);
-    // CR LF at the end of it.
-    let whole_line = (PLAIN.len() + PROOF_FILL + 2) as u64;
+    // CR LF at the end of it, on each UART.
+    let whole_line = (PLAIN.len() + PROOF_FILL + 2) as u64 * live;
     let on_the_uart = written >= whole_line;
 
     let bsp = crate::cpu::this_cpu();
@@ -1400,7 +1865,7 @@ pub(crate) fn prove_uart_sections(com1: &mut Console) -> bool {
             }
         },
     );
-    let handler_waited = with_sinks(com1.flow(), |sinks| !sinks.tx.is_empty());
+    let handler_waited = with_sinks(com1.flow(), |sinks| sinks.waiting());
 
     let flow = com1.flow();
     let mut report_out = false;
@@ -1410,7 +1875,7 @@ pub(crate) fn prove_uart_sections(com1: &mut Console) -> bool {
         &mut |sink, section| {
             if sink == Sink::Uart && section == BREAK_AT {
                 crate::cpu::breakpoint();
-                report_out = with_sinks(flow, |sinks| sinks.tx.is_empty());
+                report_out = with_sinks(flow, |sinks| !sinks.waiting());
             }
         },
     );

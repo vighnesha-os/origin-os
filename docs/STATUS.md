@@ -15,6 +15,31 @@ One Latitude.sh `m4-metal-small` (AMD EPYC 4244P, Zen 4; Supermicro H13SRE-F, AM
 
 **Not shown: anything about the kernel.** No kernel line reached the serial console in 8 minutes on any boot, and the machine did not restart by itself. The kernel prints on COM1 and the screen until it moves to the UART the SPCR names (ADR-0010 E4); on this board COM1 is a real UART nobody watched, so a stop before that move, or a refused move, is silent there. Where it stopped is not known. The same images boot under QEMU with 8 GiB to the usual QEMU verdict. TASKS item 83 builds QEMU machines with this board's table and memory-map shapes.
 
+## The SPCR's UART from the kernel's first line (ADR-0010 Amendment 3, decision item 317; TASKS item 84; 2026-11-20)
+
+On `claude/t84-early-uart`, on the rental-B branch; **not landed and not pushed.** What rental B could not show: a server whose console is COM2 now sees the kernel from its first line.
+
+- **Boot info 0.8:** a 16-byte `EarlyUart` (the port, the SPCR's interface type, and the rate and clock when the table states them), checked by the loader and the kernel. The kernel refuses boot info 0.7.
+- **The loader** walks the RSDP, XSDT and SPCR before `ExitBootServices`, reading only memory the UEFI memory map describes. It uses the kernel's own parser, now the crate `origin-spcr`, and names a 16550 in I/O space. A memory-mapped UART, a refused table or no table names none, and nothing stops the loader.
+- **The kernel** claims, probes and programs that UART right after reading the boot info, and writes every line there beside COM1, each a section at a time, each given up on alone after one bounded wait. Its SPCR move still rules:
+  - naming that UART, COM1 stops and nothing is sent again;
+  - naming another, the console moves there as before;
+  - refused or unreadable, the kernel says so on both and keeps both for the rest of the boot (the coordinating session's ruling Q1).
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:**
+- every console scenario: the SPCR naming COM2 shows the framebuffer's line and the line about the loader's UART as COM2's first kernel lines, COM2 carries every kernel line COM1 did, each once, and COM1 stops at the take-over;
+- E4's move with a replay, for an SPCR longer than the loader reads;
+- `boot-rented`'s two machines on the board's shapes;
+- a machine with the SPCR alone in RAM the kernel owns: both UARTs written to for the whole boot, and the console's proofs pass with both live.
+- a third machine, rental B's case. The RSDP is in RAM the kernel will not map, so the loader names COM2 and the kernel cannot read the SPCR. The refusal, the verdict and the halt are on COM2 and on COM1 alike: 321 kernel lines on each.
+- The cost (ledger row CL46): the loader's walk read 524 to 672 bytes in about 1 ms; 2,805 bytes of text went to the second UART before the move.
+
+An independent AI review (`REVIEW_T84_2026-11-20.md`: 0 High, 7 Medium, 6 Low, 2 Informational) is answered.
+
+**Found on the way:** one XSDT entry the kernel cannot read (a table in RAM it owns) fails its ACPI census, AML, PCIe and IOMMU proofs, since TASKS item 71's locator cannot rule out that the entry was the table each looks for. A follow-up, not changed here.
+
+**Not shown:** anything on a physical machine; under OVMF the loader's own line is on COM1, the firmware's console, so on COM2 the kernel states what the loader named; a memory-mapped UART is not named early (Amendment 3). A rental C (about $0.81, on the owner's word) can now show where rental B's kernel stopped.
+
 ## QEMU machines with the rented board's shapes (TASKS item 83; 2026-11-20)
 
 On `claude/rental-b-readiness-33dcba`; **not landed and not pushed.** Rental B's option C: the shapes the rented board had and no QEMU machine had, so a fault they cause shows for free.
