@@ -1,4 +1,4 @@
-//! `cargo xtask check`'s gate on two names that only listed files may use, each with its reason
+//! `cargo xtask check`'s gate on names that only listed files may use, each with its reason
 //! (task S4-2; the independent review of 2026-11-13, findings K5 and K12). It is held like the
 //! `unsafe` list (`unsafety`): a name in a file off its list fails, and so does a listed file that
 //! no longer uses it, so that the list stays what the tree does.
@@ -18,6 +18,15 @@
 //!   reaches the kernel through `origin.core`'s imports and names no call number. `origin_abi`
 //!   has a public `syscall` module of the numbers, for the kernel and for proofs. A ring-3 file
 //!   may name it only if it is listed here.
+//!
+//! - **The framework's thread exit in the kernel** (TASKS item 79; its review's T79-2).
+//!   `cpu::thread_exit` ends the running thread without counting it as ending. A kernel thread
+//!   ends through `sched::finish`, which counts it first and then raises its done-signal, so that
+//!   a settle made by a thread that saw the signal waits until this one has left its processor.
+//!   A worker that raised its flag and then called `cpu::thread_exit` would reopen the window
+//!   the item closed. Only `sched.rs`, which defines `finish`, may name it. The kernel's own
+//!   `thread_exit` system call (`syscall.rs`'s method of that name) is not the framework's, and
+//!   is not matched: only `cpu::thread_exit` as a path or in a `use … cpu::{…}` group is.
 //!
 //! It reads tokens (`lex`), so a name in a comment or a string does not count. It is the
 //! source-level form of two rules whose run-time form is the per-call pin; it shows nothing
@@ -89,6 +98,33 @@ const CALL_NUMBER_FILES: &[(&str, &str)] = &[(
     "tests/kernel/pin-program/src/calls.rs",
     "the pin proof's interpreter maps a script's call number to the import of that call; the numbers are this program's on purpose, and the proof's scripts are written in them",
 )];
+
+/// The kernel files that may name the framework's `cpu::thread_exit`, and why.
+const THREAD_EXIT_FILES: &[(&str, &str)] = &[(
+    "framekernel/src/sched.rs",
+    "`sched::finish`, every kernel thread's end, counts the thread as ending before its signal and then calls it (TASKS item 79)",
+)];
+
+/// Whether `tokens` name the framework's `thread_exit`: `cpu::thread_exit` as a path, or
+/// `thread_exit` among the items of a `use … cpu::{…}` group at any depth.
+fn names_thread_exit(tokens: &[Token<'_>]) -> bool {
+    let colon = |t: Option<&Token<'_>>| t.is_some_and(|t| t.kind == Kind::Punct && t.text == ":");
+    tokens.iter().enumerate().any(|(i, token)| {
+        if !token.is_ident("cpu") || !colon(tokens.get(i + 1)) || !colon(tokens.get(i + 2)) {
+            return false;
+        }
+        match tokens.get(i + 3) {
+            Some(next) if next.is_ident("thread_exit") => true,
+            Some(next) if next.kind == Kind::Punct && next.text == "{" => {
+                let close = lex::closing(tokens, i + 3).unwrap_or(tokens.len());
+                tokens
+                    .get(i + 4..close)
+                    .is_some_and(|group| group.iter().any(|t| t.is_ident("thread_exit")))
+            }
+            _ => false,
+        }
+    })
+}
 
 /// Whether `tokens` name one of the proof-process constructors: `Process::` or `Self::`
 /// followed by `proof` or `proof_child_of`, or a definition `fn proof` / `fn proof_child_of`.
@@ -218,6 +254,12 @@ pub(crate) fn gate() -> Result {
         names_raw_write,
     ));
     found.extend(problems(
+        "`cpu::thread_exit`, which ends a thread without counting it as ending (use `sched::finish`; TASKS item 79)",
+        &kernel,
+        THREAD_EXIT_FILES,
+        names_thread_exit,
+    ));
+    found.extend(problems(
         "`origin_abi::syscall`, the private call numbers (CLAUDE.md §42; ADR-0011 L3)",
         &ring3,
         CALL_NUMBER_FILES,
@@ -231,10 +273,11 @@ pub(crate) fn gate() -> Result {
         ));
     }
     println!(
-        "xtask: names gate: the proof-process constructors are named in {} kernel files, each listed with its reason, and in none of the other {}; the framework's raw `write_frame` in {}, listed, and in no other; the call numbers in {} ring-3 file, listed, and in none of the other {}",
+        "xtask: names gate: the proof-process constructors are named in {} kernel files, each listed with its reason, and in none of the other {}; the framework's raw `write_frame` in {}, listed, and in no other; its `cpu::thread_exit` in {}, listed, and in no other; the call numbers in {} ring-3 file, listed, and in none of the other {}",
         PROOF_PROCESS_FILES.len(),
         kernel.len() - PROOF_PROCESS_FILES.len(),
         RAW_WRITE_FILES.len(),
+        THREAD_EXIT_FILES.len(),
         CALL_NUMBER_FILES.len(),
         ring3.len() - CALL_NUMBER_FILES.len()
     );

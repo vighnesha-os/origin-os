@@ -508,25 +508,43 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 72. **What the firmware does with each answer to `_OS` (decision item 315; ADR-0019 A4 and Amendment 1). Numbered by the coordinating session on 2026-11-19, on the owner's word ("Test both answers first"), and given to TASKS item 63's session.** ACPICA answers "Microsoft Windows NT" (TASKS item 64's ledger, G10), ACPI 6.6 §5.7.3 suggests a name that differs per operating-system release, and Microsoft's `_OSI` page says nothing of `_OS`. The experiment loads the DSDT and SSDTs of the server rented on 2026-11-12 into `origin-aml` on the development Mac, in a scratch copy, and runs the start-up sequence once with each answer, under two stubbed hosts (every region read 0, and all ones). It reports every named value, device status, region write and failure that differs, and what reads each. The tables stay private (decision item 232) and nothing is committed from them. Its report comes to the coordinating session, which puts item 315 to the owner again.
 
-73. **A stalled reclaim is retried, not lost (TASKS item 66's R10; ADR-0004 Amendment 1, A2; ADR-0013 Amendment 3). Numbered by the coordinating session on 2026-11-19; not started; after TASKS item 70.** A retired kernel stack whose reclaim's shootdown stalls stays retired, is asked again at a later reclaim, and is given back only once every processor has answered, so that `lost` counts only a processor that never answers again. It changes `framekernel/frame/src/stack.rs` and `origin_sync::slots`, with Loom models. Decision item 316, accepted by the owner on 2026-11-19, keeps ADR-0013 Amendment 3 until this lands and ends it then. So the change that lands this task also removes both parts of `cargo xtask`'s allowance (item 313's report of a `lost` count and item 314's second run), with their host tests, and records the amendment's end in ADR-0013 and the matrix's row A13-Am3. From then on, a lost stack fails the boot on every machine.
+73. **A stalled reclaim is retried, not lost (TASKS item 66's R10; ADR-0004 Amendment 1, A2; ADR-0013 Amendment 3). Numbered by the coordinating session on 2026-11-19 and assigned on 2026-11-20 (the owner's "Start all three"), contract first (the coordination notes' `t73-contract.md`), accepted with four additions the same day. On `claude/t73-stalled-reclaim` from `land/batch-8` at `618b0961`; built, controlled, measured in a diagnostic round and ruled on (item 316's removal) on 2026-11-20; reviewed independently the same day (`REVIEW_T73_2026-11-20.md`: no High, one Medium fixed by `c548658d`, six Low, each answered in a commit naming it or proposed as a follow-up); merged with `land/batch-8` at `8da7dab6` (TASKS items 75, 77 and 81) as `b6d0c42d`; gated in one turn on `300c69b2` (`check`, `boot-test`, `boot-matrix`: all passed); not landed, not pushed. Its contract and result are under "Task contracts".** A retired kernel stack whose reclaim's shootdown stalls stays retired, is asked again at a later reclaim, and is given back only once every processor has answered, so that `lost` counts only a processor that never answers again. It changes `framekernel/frame/src/stack.rs` and `origin_sync::slots`, with Loom models. Decision item 316, accepted by the owner on 2026-11-19, keeps ADR-0013 Amendment 3 until this lands and ends it then. So the change that lands this task also removes both parts of `cargo xtask`'s allowance (item 313's report of a `lost` count and item 314's second run), with their host tests, and records the amendment's end in ADR-0013 and the matrix's row A13-Am3. From then on, a lost stack fails the boot on every machine.
 
 74. **The memory proof's two one-second budgets (TASKS item 66's R9, question 5). Numbered by the coordinating session on 2026-11-19; not started.** The hostile unmap loop's fifth unmap, and the unreported map's unmap, are refused only within about a second; a stall of a second, which the large software-processor machines show, would fail them, though neither has been seen failing. The rule TASKS item 66 proposed: the kernel brackets the script's run, and a refusal missing from a run that took over a second is undecided and run again.
 
-75. **`sched::spawn_with` queues a thread before publishing its first frame (TASKS item 70's follow-up 1). Numbered by the coordinating session on 2026-11-19; not started; after TASKS item 70.** `spawn_with` pushes the new thread into its processor's run queue before `publish_first_frame` records its first frame in the context table. When publication is refused, it returns `Err(Full)` but leaves the thread queued. The scheduler can then pick a frame that was never saved, which the trap entry refuses with a panic. The defect predates TASKS item 70 and cannot be reached while retirement works. TASKS item 70's control W-2b, which removes retirement entirely, reached it. The fix publishes before queueing and takes nothing into the run queue on a refusal, with a boot control that fills the table.
+75. **`sched::spawn_with` queues a thread before publishing its first frame (TASKS item 70's follow-up 1). Numbered by the coordinating session on 2026-11-19; given to TASKS item 70's session on 2026-11-20 with items 77 and 81 on one branch, contract first (the coordination notes' `t75-77-81-contract.md`), Q1 to Q11 accepted with additions (a) to (f). On `claude/t75-77-81` from `land/batch-8` `618b0961`; built, reviewed independently (`REVIEW_T75_77_81_2026-11-20.md`: three Medium, eight Low; ten answered, one a follow-up), controlled and gated on 2026-11-20; not landed, not pushed. Its contract, the rulings and the result are under "Task contracts", "75, 77 and 81".** `spawn_with` pushes the new thread into its processor's run queue before `publish_first_frame` records its first frame in the context table. When publication is refused, it returns `Err(Full)` but leaves the thread queued. The scheduler can then pick a frame that was never saved, which the trap entry refuses with a panic. The defect predates TASKS item 70 and cannot be reached while retirement works. TASKS item 70's control W-2b, which removes retirement entirely, reached it. The fix publishes before queueing and takes nothing into the run queue on a refusal, with a boot control that fills the table.
 
-76. **`trap::ExceptionReport`'s `Debug` prints `rip` raw (TASKS item 70's question 8). Numbered by the coordinating session on 2026-11-19; not started.** The exception report's own line gives the faulting instruction's address as `image +0x…` (ADR-0004 A6.2, item 158; ADR-0013 control C47), but its derived `Debug` prints `rip` as it is: an address in the kernel's image. TASKS item 70 changed `GuardedStack`'s and `Probe`'s `Debug` so that they no longer print such addresses, and this is the one it left. The fix makes `Debug` print `rip` as A6.2 says, with a host test.
+76. **`trap::ExceptionReport`'s `Debug` prints `rip` raw (TASKS item 70's question 8). Numbered by the coordinating session on 2026-11-19. Built on 2026-11-20 with TASKS item 80, on `claude/t76-80-small-fixes-9c820a` from `main` at `ea2293ca`; reviewed independently the same day (`REVIEW_T76_80_2026-11-20.md`: no High, 1 Medium, 3 Low, 2 Info, all answered); not landed, not pushed. Its contract, the rulings and the result are under "Task contracts", 76 and 80.** The exception report's own line gives the faulting instruction's address as `image +0x…` (ADR-0004 A6.2, item 158; ADR-0013 control C47), but its derived `Debug` prints `rip` as it is: an address in the kernel's image. TASKS item 70 changed `GuardedStack`'s and `Probe`'s `Debug` so that they no longer print such addresses, and this is the one it left. The fix makes `Debug` print `rip` as A6.2 says, with a host test.
 
-77. **The framework sets a processor's kernel-stack record from the incoming context's home (TASKS item 70's question 9). Numbered by the coordinating session on 2026-11-19; not started; after TASKS item 70.** `set_kernel_stack` takes any stack the scheduler holds, including one that carries another context's suspended frame. An interrupt from ring 3 on that processor would then push onto that frame. With TASKS item 70's home word for each context, `resume` can set `kernel_stack` and TSS.RSP0 itself from the incoming context's home, and `set_kernel_stack` goes. Loom models and a boot control show that no stack but the running context's own is named.
+77. **The framework sets a processor's kernel-stack record from the incoming context's home (TASKS item 70's question 9). Numbered by the coordinating session on 2026-11-19; given to TASKS item 70's session on 2026-11-20 with items 75 and 81 on one branch, contract first (the coordination notes' `t75-77-81-contract.md`), Q1 to Q11 accepted with additions (a) to (f). On `claude/t75-77-81` from `land/batch-8` `618b0961`; built, reviewed independently (`REVIEW_T75_77_81_2026-11-20.md`: three Medium, eight Low; ten answered, one a follow-up), controlled and gated on 2026-11-20; not landed, not pushed. Its contract, the rulings and the result are under "Task contracts", "75, 77 and 81".** `set_kernel_stack` takes any stack the scheduler holds, including one that carries another context's suspended frame. An interrupt from ring 3 on that processor would then push onto that frame. With TASKS item 70's home word for each context, `resume` can set `kernel_stack` and TSS.RSP0 itself from the incoming context's home, and `set_kernel_stack` goes. Loom models and a boot control show that no stack but the running context's own is named.
 
 78. **A period check that tolerates stalls (TASKS item 66's review, T66-R17; the coordinating session's ruling (a) of 2026-11-19). Numbered by the coordinating session on 2026-11-19; not started.** TASKS item 66's sampler reads the local APIC timer's count between RDTSC brackets and refuses a pair whose brackets lie too far apart. A stall inside an intermediate read's own bracket escapes that rule, and on a timer over 5 times fast it can hide a reload, so the count passes and only the delivery check fails such a timer, unless recurring stalls also mask its total in the same run. ADR-0013 states this as a limit, and `apic::sample_period`'s host test shows it. The reviewer's rule, the gap measured from the first bracket's start to the second's end (`500f6cd1`), left the period undecided after 64 pairs on 8 of 10 idle 65- and 67-processor boots and failed `boot-matrix`, so it was reverted (`361c813c`). This item finds a check that closes R17's case and still decides on those machines. It starts with a diagnostic round on the 65- and 67-processor software-processor machines, measuring how long and how often intermediate reads stall inside their brackets. The figures go to the coordinating session before any rule is chosen.
 
-80. **`ipc_proof::abi_and_entry` says nothing when a thread start is refused (TASKS item 79's follow-up 1). Numbered by the coordinating session on 2026-11-20; not started.** When a thread start in `abi_and_entry` is refused, the function returns `false` without printing a line, so the boot is refused with "IPC and handles failed" and nothing says which start failed or why. TASKS item 79's control C1w found it on the 1-processor machine; it predates that item. The fix prints the refused start and its error before returning, with a boot control that refuses a start and looks for the line.
+79. **A settle waits for every thread whose end was seen to leave its processor (TASKS item 79; from the keeper's `boot-matrix` on `land/batch-7` `6c754c45`, 2026-11-19). Numbered by the coordinating session on 2026-11-19 and given to TASKS item 70's session, contract first (the coordination notes' `t79-contract.md`); rulings R1 to R7 accepted as recommended the same day. On `claude/t79-ending-threads` from `6c754c45`; built, controlled and gated on 2026-11-19; reviewed independently the same day (`REVIEW_T79_2026-11-20.md`: no High or Medium, 6 Low, five answered, one a follow-up); gated again on `cea3b835`; not landed, not pushed. Its contract, the rulings and the result are under "Task contracts".** A thread's end is seen before it gives anything back, and `sched::settle` waited only for zombies, so a proof could count with an ending thread's stack, FPU area and address space held. Done means: a settle that has seen an end waits until that thread has left its processor and been reaped, for user and kernel threads alike, shown by Loom models with negative controls, by boot controls that hold a thread between its end and its exit (the old code failing as the keeper's run did, the fix passing), and by `check`, `boot-test` and `boot-matrix`.
 
-81. **`ipc::reap_closed` lowers its count before it frees a closed channel's messages (TASKS item 79's review, T79-6). Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 79.** `reap_closed` lowers `CLOSED_COUNT` before it drops the undelivered messages of the channel it took, so a settle that waits for the count to reach zero can read the heap while another processor is still freeing them. Whether today's proofs reach it is not known. The reviewer suggests counting a reap in progress and having `settle` wait for it, as TASKS item 79 makes it wait for ending threads. A Loom model of the count, and a boot control that holds a reap open, show it.
+80. **`ipc_proof::abi_and_entry` says nothing when a thread start is refused (TASKS item 79's follow-up 1). Numbered by the coordinating session on 2026-11-20. Built on 2026-11-20 with TASKS item 76, on `claude/t76-80-small-fixes-9c820a` from `main` at `ea2293ca`; reviewed independently the same day (`REVIEW_T76_80_2026-11-20.md`: no High, 1 Medium, 3 Low, 2 Info, all answered); not landed, not pushed. Its contract, the rulings and the result are under "Task contracts", 76 and 80.** When a thread start in `abi_and_entry` is refused, the function returns `false` without printing a line, so the boot is refused with "IPC and handles failed" and nothing says which start failed or why. TASKS item 79's control C1w found it on the 1-processor machine; it predates that item. The fix prints the refused start and its error before returning, with a boot control that refuses a start and looks for the line.
 
-84. **Boot info 0.8: the loader hands the SPCR's UART to the kernel (decision item 317; ADR-0010 Amendment 3). Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 83, in the session that ran rental B.** Rental B's kernel printed nothing on the operator's console: it writes to COM1 until its SPCR move, and that server's console is COM2. The loader finds the SPCR before `ExitBootServices`, checks it with the kernel's parser, moved to a crate both build, and records an I/O-port 16550-compatible UART in a new boot-info structure (version 0.8). From `kernel_main`'s first line the kernel writes to that UART and COM1, and E4's move still rules once the page tables are live. Done means: a boot-console scenario whose SPCR names COM2, with COM1 unread, shows the kernel's first line on COM2; a malformed or memory-mapped SPCR gives no UART in boot info and the boot goes on, both as controls; the boot-info structure is checked in the loader and the kernel, with host tests; and a cost-ledger row. A third rental (about $0.81, on the owner's word) can then show where the kernel stops on rental B's server.
+81. **`ipc::reap_closed` lowers its count before it frees a closed channel's messages (TASKS item 79's review, T79-6). Numbered by the coordinating session on 2026-11-20; given to TASKS item 70's session on 2026-11-20 with items 75 and 77 on one branch, contract first (the coordination notes' `t75-77-81-contract.md`), Q1 to Q11 accepted with additions (a) to (f). On `claude/t75-77-81` from `land/batch-8` `618b0961`; built, reviewed independently (`REVIEW_T75_77_81_2026-11-20.md`: three Medium, eight Low; ten answered, one a follow-up), controlled and gated on 2026-11-20; not landed, not pushed. Its contract, the rulings and the result are under "Task contracts", "75, 77 and 81".** `reap_closed` lowers `CLOSED_COUNT` before it drops the undelivered messages of the channel it took, so a settle that waits for the count to reach zero can read the heap while another processor is still freeing them. Whether today's proofs reach it is not known. The reviewer suggests counting a reap in progress and having `settle` wait for it, as TASKS item 79 makes it wait for ending threads. A Loom model of the count, and a boot control that holds a reap open, show it.
+
+82. **The IPC proofs' remaining silent refusals print why (TASKS item 80's question 6; the review of TASKS items 76 and 80, T76-80-5). Numbered by the coordinating session on 2026-11-20; not started.** TASKS item 80 makes `abi_and_entry` print the step that refused each of its programs before it fails. The other proofs of "IPC and handles" still return `false` without a line when a process's image, its process object, its script or its thread start is refused, among them `ping_pong`, `exit_closes`, `cancel`, `quotas`, `byte_quota`, `transfer_depth` and `big_message`: 97 more `return false` in `ipc_proof.rs` and 42 in `ipc_proof/*.rs`, not all of them set-up refusals. A refusal in any of them gives only "IPC and handles failed". The fix routes them through TASKS item 80's `not_run` and `start_program`, which then takes its caller's processor and start argument, with a boot control that refuses one and looks for the line.
+
+83. **QEMU machines with the rented board's shapes: more than 4 GiB of RAM, and its firmware tables (rental B's findings, option C). Numbered by the coordinating session on 2026-11-20; contract accepted with rulings the same day; built on `claude/rental-b-readiness-33dcba`, reviewed independently and answered, not landed.** Rental B (2026-11-20, `docs/research/2026-11-20-rental-b-findings.md`) ran Origin's loader on a rented EPYC 4244P server three times, and no kernel line reached the serial console: the kernel prints on COM1 until its SPCR move, and COM1 there was a real UART nobody watched. Every QEMU machine in `xtask` has 512 MiB, and none has the board's table shapes. This task adds machines with more than 4 GiB (64 GiB if the development Mac allows) and with the shapes the findings describe: an SPCR naming COM2 at `0x2F8` with COM1 present, an RSDP and XSDT in ACPI NVS, a FACS named only by the 32-bit `FIRMWARE_CTRL`, an FPDT whose FBPT and S3PT lie in reserved memory, and reserved and device ranges above the RAM. Each shows the kernel reaching its SPCR move and its verdict, or names where it stopped. Built from the findings' description, not from the rental's dumps (item 232). Contract below. (Item 82's line lands with the coordinating session's records.)
+
+84. **Boot info 0.8: the loader hands the SPCR's UART to the kernel (decision item 317; ADR-0010 Amendment 3). Numbered by the coordinating session on 2026-11-20; contract accepted the same day; built on `claude/t84-early-uart` the same day ("As built" below), on `claude/rental-b-clean`; after TASKS item 83, in the session that ran rental B.** Rental B's kernel printed nothing on the operator's console: it writes to COM1 until its SPCR move, and that server's console is COM2. The loader finds the SPCR before `ExitBootServices`, checks it with the kernel's parser, moved to a crate both build, and records an I/O-port 16550-compatible UART in a new boot-info structure (version 0.8). From `kernel_main`'s first line the kernel writes to that UART and COM1, and E4's move still rules once the page tables are live. Done means: a boot-console scenario whose SPCR names COM2, with COM1 unread, shows the kernel's first line on COM2; a malformed or memory-mapped SPCR gives no UART in boot info and the boot goes on, both as controls; the boot-info structure is checked in the loader and the kernel, with host tests; and a cost-ledger row. A third rental (about $0.81, on the owner's word) can then show where the kernel stops on rental B's server.
+
+85. **`follow_thread` activates the incoming thread's address space from the scheduler's slot (TASKS item 77's review, R77-4). Numbered by the coordinating session on 2026-11-20; not started.** TASKS item 77 made the kernel-stack record and TSS.RSP0 come from the table of contexts, the incoming context's home, rather than from what the scheduler passes, and checks every entry from ring 3 against it. The address space is still taken from the scheduler's slot. A wrong slot would then run one process's thread in another's address space. The fix names the address space from the context the table resumes, or checks the scheduler's choice against it at `resume`, as item 77 did for the stack, with a Loom model and a boot control that plants the wrong slot.
+
+86. **A table slot reserved for each processor's boot or idle flow (TASKS item 75's review, R75-2). Numbered by the coordinating session on 2026-11-20; not started.** Since TASKS item 75, a spawn holds a slot of its processor's table of contexts from its publication until it is queued. Enough spawns in flight could fill the table just as the processor's boot or idle flow switches out for the first time, and that switch would halt. Today's boot reaches neither case, and the rule is stated in `origin_sync::contexts`. The fix keeps one slot for that flow from the start, with a host test and a Loom model that fills the table with publishers.
+
+87. **A reap asks whether the stalled processor has answered before it takes the reclaim role (TASKS item 73's review, T73-4). Numbered by the coordinating session on 2026-11-20; not started.** While a kernel stack waits on a processor that never answers, every idle processor's reap still takes the one-at-a-time reclaim role and the slots table's lock on every tick, only to find nothing to do. The proposal keeps the waiting stall's processor and generation in atomics, so that a reap checks `Shootdown::answered` before it takes the role or the lock. It is not urgent: that case already fails the boot at the next settle, and in every other case the wait ends when the processor answers. It needs Loom models and a figure for the ledger's CL45.
+
+88. **A Loom model of the re-ask on another thread, against the TLB world (TASKS item 73's review, the rest of T73-5). Numbered by the coordinating session on 2026-11-20; not started.** TASKS item 73's models L1 to L4 run the stalled reclaim and its re-ask on one thread. Today only the reviewer's reading under invariant I1 covers a re-ask made by another processor: that the unmap is ordered before the later reclaim's request, through the table's lock and the role's Acquire. The model runs the re-ask on a second thread against the models' TLB world, with a negative control that weakens that ordering and must be caught.
+
+89. **`cargo xtask` fails a boot at its halt line once a required marker is missing (TASKS item 73's hand-over). Numbered by the coordinating session on 2026-11-20; not started.** `cargo xtask` judges a missing marker only when a boot ends at its timeout. TASKS item 73's control K4 on 65 processors failed only at the 300 s timeout, though the kernel had halted at about 80 s. Failing at the kernel's halt line, once every required marker that should precede it is missing, saves that time on every failed boot, with no change to what passes. It needs host tests, and a control showing that a passing boot is unaffected.
 
 90. **M3 scheduling: the research and design (ADR-0020; ADR-0005 Amendment 11; decision items 318 to 341). Numbered by the coordinating session on 2026-11-20; done the same day: documents only.** The research ledger `docs/research/2026-11-20-m3-scheduling.md`, ADR-0020 (S1 to S23), the amendment to ADR-0005 for lending across calls (J1 to J6) and the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`, written on `claude/m3-scheduling-design-a5598a` (unpushed, cut from `land/batch-8` at `fa88211a`) from `695cb90d` to `b1c469f2`, at the coordinating session's rulings on its outline. The owner accepted all 24 questions on 2026-11-20, and the records came to `main` on a branch of their own (item 106). No Loom model, boot or code: the design rests on the kernel as the eighth batch leaves it, and no person has reviewed it.
+
+91. **A boot proof that writes and reads back a frame near the top of the RAM through the direct map (TASKS item 83's review, T83-3). Numbered by the coordinating session on 2026-11-20; not started.** No boot proof touches memory above the first frames the allocator hands out, so a direct map that stopped short of the RAM's top would pass every proof that does not check its figure. `boot-large` and `boot-rented` now hold the direct map's figure against the RAM (TASKS item 83), and this proof would show the mapping itself works there: a frame near the top, written and read back through its direct-map address, and freed. Kernel code, outside TASKS item 83's ownership.
 
 92. **Thread records and names that survive moves (ADR-0020 S1). Plan P1, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after the eighth batch and the records of items 318 to 341 are on `main`.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Lands with no change of behaviour: no thread moves.
 
@@ -563,6 +581,8 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 108. **The EEVDF evaluation (ADR-0020 S19). Plan P17, batch 10. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 96 to 105 pass their proofs.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first; adoption is the owner's, by amendment.
 
 109. **Lending across calls (ADR-0005 Amendment 11, J1 to J6). Plan P18, after the M3 core. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 105 and the M3 core, with ADR-0011 L4's fast-path design or the `CALL` flag alone.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
+
+110. **An unreadable XSDT entry fails the ACPI census, AML, PCIe and IOMMU proofs (TASKS item 84's follow-up). Numbered by the coordinating session on 2026-11-20; not started.** TASKS item 71's rule in `origin_frame::acpi` treats an XSDT entry the kernel cannot read as possibly any table, so each of those proofs fails. On a real machine, one firmware table in RAM would cost it its PCIe and IOMMU. The fix narrows the rule to what can be shown, with host tests and a control on a rented board's shape. It was found by the machine TASKS items 83 and 84 built with the SPCR alone in RAM.
 
 ## Waiting on the owner
 
@@ -2471,6 +2491,7 @@ Assigned by the coordinating session on 2026-11-19, from the independent review 
 - **T70-7 (Low, folded in), `927e699d`.**
   - `reap_zombies` lowers `ZOMBIES` only after the FPU area, the stack and the address space are dropped. So a `settle` that sees no zombie knows the stack is in the cache of kept stacks before it trims.
   - It is a path that gives the directory proof's four frames on `ab25746a` exactly, found by reasoning and never reproduced, so nothing shows it was their cause. The code that does it predates this task.
+  - TASKS item 79 found a second path to the same four frames (H2), and closes it.
 - **T70-4 and T70-5 (Low), `4775d00c`.**
   - The clauses begin with `stack::trim` and a reclaim of every retired stack. The thread's stack then has room in the cache, and no reclaim's shootdown is under way while a processor is held.
   - W3 without room now fails as "not judged".
@@ -2488,6 +2509,7 @@ Assigned by the coordinating session on 2026-11-19, from the independent review 
   - The boot flow waited at most 10.9 and 14.8 ms for readiness, and 179 and 113 µs for the hold.
   - The cap is 500 ms.
 - **The open item is closed in reasoning, not by recurrence.** T70-7's path gives the logged symptom exactly: four frames, the heap exact, both settles passing. The fix removes it.
+  - **A second path, found later (TASKS item 79, ruling R7, 2026-11-19).** A proof's own last thread still between its end and its exit at the compare's settle gives the same symptom: the compare's re-check reaps it after the trim, so its stack sits in the cache of kept stacks, four frames short with the heap exact (H2). T70-7 closed its own path; TASKS item 79 closes this one. Which of the two gave `ab25746a`'s four frames is not known.
 
 **Answers to the addendum to the review (2026-11-19).** `REVIEW_T70_addendum_2026-11-19.md` (the same AI reviewer, from 10:17 UTC): all seven findings closed, no High or Medium, two new Low, answered on the coordinating session's rulings, one commit each. Both reports are in the repository as received (`317d13c4`). The last commit that changes code is `e6a4b1b4`.
 - **T70-8 (Low), `bb3f9f49`.** The boot flow's wait for the held processor spun with interrupts off for at most 500 ms, so a host stall of half a second on the 65-, 67- or 288-processor machines would have refused the boot, against ADR-0013 R1(b); Amendment 3(b) does not run such a boot again, since no stack is lost.
@@ -2842,3 +2864,621 @@ Recorded, not changed: the memory proof's two one-second budgets (TASKS item 74)
   - **The idle round,** right after (10 large boots, host load average 7 to 27): all passed. Nine needed 1 run of the window and 1 s of its budget; intel-65.1 needed 2 runs and 5 s, after one stall of 242 ms. Every tick proof passed at run 1, 998,981 to 1,003,798 ppm, from 1 to 10 pairs; 1 to 38 calibration windows were discarded, and every RTC second was confirmed.
 - **Not shown:** anything under KVM, in CI or on a physical machine. The intermediate commits were not each built on their own; the final tree was. No person has reviewed it.
 
+
+### 73. A stalled reclaim is retried, not lost
+
+Assigned by the coordinating session on 2026-11-20, after the owner said "Start all three". Item 316 decides that ADR-0013 Amendment 3 ends when this lands; the coordinating session ruled the removal from this task's diagnostic figures, on the condition that they came first. The contract (`t73-contract.md`, in the coordinating session's notes) was accepted the same day, with its recommendations on Q1 to Q8 and four additions: (a) the reclaim role given up by a guard on every way out, with a host test; (b) the cost of a processor that never answers stated, with a host test that `take` is refused cleanly; (c) the diagnostic round's longest wait reported against `sched::OTHERS_PATIENCE`; (d) the reviewer given `shootdown.rs`'s `service` and `answered`, `slots.rs` and the reclaim path as code, to check I1 and I2 from the code alone.
+
+| Field | |
+|---|---|
+| Task ID | TASKS item 73, on branch `claude/t73-stalled-reclaim`, cut from `land/batch-8` at `618b0961` (TASKS item 79 at `68c61209`, and `main` at `ea2293ca`'s records). |
+| Objective | A retired kernel stack whose reclaim's shootdown stalls stays retired, with its frames kept, and is asked again at a later reclaim; it is given back only once a shootdown naming its pages, published after its unmap, completes on every processor. No reclaim loses a stack. Then item 316's end of ADR-0013 Amendment 3: `xtask`'s two allowances and their host tests removed. |
+| Source ownership | This task's session: `origin_sync::slots` and its models and controls, `origin_sync::shootdown`'s `Stalled` and `answered`, `origin_frame::stack` and `tlb`, `sched`'s `reclaim_stacks`, its lines and the `judge` call, `settled`, and `xtask`'s removal. |
+| Architecture contract | ADR-0004 Amendment 1, A2; ADR-0013 R8, Amendment 3 and item 316; ADR-0008 Amendment 1, D3; CLAUDE.md §28 and §13 (no `unsafe` added; `slots.rs` stays `forbid(unsafe_code)`). |
+| Relevant specifications | Intel SDM Vol. 3A §4.10.5, as `shootdown.rs` cites it. Nothing new read. |
+| Required dependencies | `land/batch-8` with TASKS item 79. No new crate. |
+| Security invariants | I1 no early reuse; I2 nothing counted or freed twice; I3 the bound; I4 nothing waits under a lock; I5 TASKS item 79's shape kept (the contract's words). |
+| Performance constraints | No stall: one compare-and-swap more per reclaim. A stall: one 1 s wait, not one per retired stack; while a stack waits, a reclaim costs a CAS, a lock and a read, and sends no interrupt. |
+| Required tests | Host tests in `slots.rs`, `shootdown.rs`, `settled.rs`; Loom models L1 to L4 and five controls; boot controls K1 to K4; the diagnostic round. |
+| Actual deliverables | The code, its tests and controls; the diagnostic round's figures; after the ruling, the removal and the records. |
+| Acceptance conditions | Clippy and the quick gates; an independent review answered; `check`, `boot-test` and `boot-matrix` in one turn on the final tip. Nothing pushed. |
+
+**Result (2026-11-20).** Built on `claude/t73-stalled-reclaim` from `618b0961`:
+- `231efb70`: `Stalled` names its generation, and `Shootdown::answered` (Q1);
+- `e9a12a34`: the waiting stack;
+- `9b026e19`: Loom models L1 to L4 and their controls;
+- `b9aa25b8`: the kernel stacks proof's cost clause waits after a round it did not count;
+- `f3f485df`: the reclaim role read before its compare-and-swap;
+- `c548658d`: item 316, the allowance removed.
+
+- **How it works.**
+  - A reclaim takes the role, one at a time. A guard gives it up on every way out, a panic included, and a host test shows it (addition a).
+  - It then takes a job under the lock. The first job of a Retired slot unmaps it and shoots. If the shootdown stalls, the slot becomes `Waiting`, outside the tables, with what the unmap returned (the frames) and the stall. At most one slot waits, and no new unmap is made while one does.
+  - Each later reclaim asks the waiting slot again first. If the stalled processor has not served since (`answered`), it returns `Unanswered` at once and sends no interrupt. Otherwise it sends a fresh shootdown, and gives the frames back and frees the slot only if that completes.
+  - Q1's rule is stated where `answered` is defined and in L4's comment: nothing may treat `answered` as proof that the pages were dropped. I1 rests only on the fresh shootdown, sent after the unmap, completing on every processor.
+  - A reclaim that finds the role held returns `Busy` after reading it, with no compare-and-swap (`f3f485df`, the coordinating session's addition after the diagnostic round). A host test counts the attempts.
+- **The invariants** (the contract's I1 to I5).
+  - I1: no slot is taken again before a shootdown sent after its unmap has completed everywhere.
+  - I2: nothing is counted or freed twice.
+  - I3: at most one stack out of the tables, holding at most 16 frames, waiting until the processor answers, plus one idle tick and one shootdown. A processor that never answers keeps it waiting for good, and the stacks retired after it stay mapped. Once the slots run out, `take` is refused cleanly and so are thread starts, which a host test shows (addition b). Before this task, the cost was one stack lost for each reclaim that stalled, after a 1 s wait.
+  - I4: nothing waits under a lock.
+  - I5: TASKS item 79's settle is unchanged in shape. Its waits re-ask through `yield_until`'s reap.
+- **Host and Loom.**
+  - New host tests in `slots.rs`: a stalled slot stays retired until a fresh shootdown completes; a waiting slot holds back every other reclaim, and takers are refused cleanly; the role is given up on every way out; a reclaim that reads the role held tries no compare-and-swap. `shootdown.rs` has one more: a stalled processor has answered once it serves. `settled.rs`'s tests name a waiting stack.
+  - Loom models:
+    - L1 `slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown`;
+    - L2 `slots_two_reclaimers_and_a_waiting_slot`;
+    - L3 `slots_at_most_one_slot_out_of_the_tables`;
+    - L4 `shootdown_answered_only_after_the_stalled_processor_served`;
+    - L5 `slots_a_reask_that_stalls_keeps_the_slot` (the review's T73-5).
+  - New controls, each caught:
+    - `slot_released_on_a_stall`;
+    - `slot_freed_on_an_answer_without_a_fresh_shootdown`;
+    - `the_reclaim_role_never_refused` (by L2 and L3);
+    - `a_slot_unmapped_while_one_waits`;
+    - `answered_before_the_processor_served`;
+    - `slot_unmapped_after_its_shootdown` (by L0 and L1, whose holders now walk the page table after each interrupt; T73-5);
+    - `slot_released_on_a_reask_stall` (by L5; T73-5).
+  - `slot_free_before_the_shootdown` and `slot_released_before_the_shootdown` were moved to the new code.
+  - A planted removal of the role's read fails the host test that counts compare-and-swaps (08:21 UTC, "a reclaim that read the role held tried to take it"; at `f3f485df` L1 to L4 passed again and all nine slots controls were caught).
+  - `cargo xtask check` on `9b026e19`: all 69 Loom models passed, and all 100 negative controls were caught. On the merge with TASKS items 75, 77 and 81 (`b6d0c42d`): 73 models and 110 controls. After the review's answers (09:22 UTC): L0 to L5 passed and all twelve slots and shootdown controls were caught; origin-sync's 117 host tests passed.
+- **The diagnostic round** (condition of the assignment, and addition c; the coordination notes' `t73-diagnostic-figures.md`).
+  - **The build.** `9b026e19` with a counter of each reclaim's outcome, never committed, and with the allowance still in place. 10 idle boots each of the 65-processor Intel and AMD machines and the 67-processor sparse machine, then 5 each beside three spinning shells: all 45 passed.
+  - **No stall in any boot.** 29,777 reclaim shootdowns: 19,779 idle, 9,998 loaded. So there were no fresh shootdowns and no unanswered checks, nothing waited at the halt, and no stack was lost. The longest wait against `sched::OTHERS_PATIENCE` (10 s): none came. The only waits were planted, the longest 1,501 ms (K1-65).
+  - **Host load.** The host's one-minute load before each boot was 3 to 34 idle and 18 to 35 loaded, mostly the previous boot's own QEMU.
+  - **`Busy` returns.** Median 35,967 to 38,509 a boot idle and 43,566 to 47,474 loaded on the large machines; 0 to 264 on 1 to 4 processors. Only the stacks proof's cost clause read its own reclaim's count.
+  - **`boot-matrix`, twice.**
+    - Run 1 on `9b026e19` failed: the 67-processor sparse machine's cost clause printed "0 of 16 reclaimed here". A processor that took one round's stack first held the role through its shootdown, and every later round ended `Busy`.
+    - Control K5 separates the old code (14 of 16), `9b026e19` (0 of 16) and the fix `b9aa25b8` (15 of 16). The fix waits after a round not counted, and the clause's rule, `alone > 0`, is unchanged.
+    - Run 2 on `b9aa25b8` passed, every kernel boot counting 16 of 16.
+- **The ruling.** The coordinating session ruled on 2026-11-20 that step 7 goes ahead, with these reasons:
+  - no stall in 45 boots;
+  - the planted stall given back after one fresh shootdown, 1,501 ms after the unmap;
+  - K5 separating the three trees;
+  - the diagnostic `boot-matrix` passing on the fix.
+  `c548658d` removes:
+  - item 313's report (`allow_lost_stacks`, `stacks_lost`, `forgave_lost_stacks`);
+  - item 314's second run (`lost_stacks_only`, `stopped_by_lost_stacks`, `REFUSE_COUNT_LINES`, `MAX_STACK_PAGES`, `number_and_was`, `run_scenario`'s second boot);
+  - their ten host tests.
+  `every_machine_requires_no_stack_lost` pins `lost: 0` on every machine, KVM included. K4 (a stack leaked on the 65-processor machine): Refused: the stacks proof's last line counted `lost: 1` (`Counts { live: 386, idle: 0, retired: 0, lost: 1, pages: 2187 }, as before: true`), and `cargo xtask` failed the boot on the missing marker `lost: 0` at its 300 s timeout, as it does any missing marker. Ran on the removal, `c548658d`, 08:25 to 08:30 UTC.
+- **The lines (Q5).** The stall line, the given-back line and the settle's waiting words match none of `cargo xtask`'s failure markers (`boot_failures`, 92 after the merge, checked again with T73-7's words). The longest is 155 bytes.
+- **The cost:** ledger row CL45 (the number the coordinating session gave); `cost-gate` passes.
+- **Review** (addition d): an AI reviewer independent of the author, given `shootdown.rs`, `slots.rs` and the reclaim path as code and not the author's argument, at `f3f485df`, and `c548658d` after it (`REVIEW_T73_2026-11-20.md`). It found I1 to I5 hold from the code alone, no High finding, one Medium and six Low. No person has reviewed the code.
+  - **T73-1** (Medium): at `f3f485df` alone, Amendment 3 (a) would forgive a leak as a stall on the named machines. Fixed by `c548658d`: the two land together, as they do on this branch.
+  - **T73-2**: `answered`'s doc on a processor with no record was wrong; corrected (`81b1e3b0`).
+  - **T73-3**: the cost clause's comment and `stack::reclaim`'s doc claimed more than the code guarantees (the role's holder can miss a stack retired as it gives the role up, and a counted round's stack may be any one, its time including a stall); corrected, the clause's rule and count unchanged (`8ca621b1`).
+  - **T73-4** (contention while a stack waits for a processor that never answers): not built. That case already refuses the boot at the next settle, and in every other case the wait ends when the processor answers. Proposed as a follow-up: the waiting stall's processor and generation in atomics, so that a reap can check `answered` before taking the role or the lock.
+  - **T73-5**: the holders of L0 and L1 walk the page table after each interrupt, a new control moves the unmap after the shootdown, and L5 covers a fresh shootdown that stalls, with its control (`7680f0d3`). Not built: a re-ask on another thread against the TLB world; proposed as a follow-up. The cross-thread order it would check (the unmap before a later reclaim's request, through the table's lock and the role's Acquire) is the reviewer's own reading under I1.
+  - **T73-6**: the re-ask's two unreachable `?` returns give the slot up as Lost, where the count of lost slots shows it, with a host test (`a0566349`); origin-sync's lints forbid a panic.
+  - **T73-7**: `State::Reclaiming`'s and `Counts::pages`' docs, and the settle's words, now "one withheld since CPU c did not answer its shootdown" (`3c289e0f`).
+  - **On `c548658d`:** nothing of the allowance is left, `run_scenario` is the one-boot function, and the new test is not vacuous; at its suggestion the test now covers every machine the boot commands make (`5fef08ee`). Item 316's words on `lost`: ADR-0013's "Ended" note says what they mean as built.
+- **Gates:** one turn of the machine on `300c69b2` (the review's answers, merged with `land/batch-8` at `241bb3a5`), 09:28 to 09:57 UTC, Rust 1.100.0, the tree clean before and after: `cargo xtask check` passed in 639 s (2,498 host tests passed, 0 failed, 30 ignored; Loom: all 74 models passed and all 112 negative controls were caught); `cargo xtask boot-test` passed, 11 of 11, in 54 s; `cargo xtask boot-matrix` passed on its first run in 1,059 s: 24 kernel boots, the kernel stacks' region at 23 distinct bases in 23 of them, no stalled shootdown, no stack given back after one, no settle that waited or failed, every cost clause at 16 of 16, and the fair share forgiven 4 times on the oversubscribed machines (Amendment 2). This commit, after that tip, changes documents only.
+- **The date.** All of this is 2026-11-20, UTC.
+
+### 76 and 80. `ExceptionReport`'s `Debug`, and `abi_and_entry`'s silent refusals
+
+Assigned together by the coordinating session on 2026-11-20 to one side session. The contract was sent before any code (`t76-80-contract.md` in that session's notes folder), and was accepted as written the same day, with the recommendation taken on every question.
+
+| Field | |
+|---|---|
+| Task ID | TASKS items 76 and 80, on branch `claude/t76-80-small-fixes-9c820a`, from `main` at `ea2293ca`. |
+| Objective | **76:** `trap::ExceptionReport`'s `Debug` prints `rip` as ADR-0004 Amendment 2, A6.2 says, and no field prints an image address. **80:** `ipc_proof::abi_and_entry` prints which start was refused, and the error, before it returns `false`, and so does every other early return of it. |
+| Source ownership | This task's session: `framekernel/frame/src/trap.rs` and `framekernel/src/ipc_proof.rs`; since the review, `runqueue::QueueError`'s `Debug` in `framekernel/src/runqueue.rs` (T76-80-3). **Not:** `stack.rs` and `sched::settle` (TASKS item 73), `sched.rs` and `ipc::reap_closed` (TASKS items 75, 77 and 81). |
+| Architecture contract | ADR-0004 Amendment 2, A6, A6.2 and A6.3 (decision items 158 and 159); ADR-0013 (C47; "IPC and handles" is Refuse); TASKS item 70's `Debug` of `GuardedStack` and `Probe`. **No ABI or format decision.** |
+| Relevant specifications | None opened. The error codes are as `cpu.rs` records them from the Intel SDM. No other operating system's or project's source (§3). |
+| Required dependencies | `main` at `ea2293ca`. No owner decision. |
+| Security invariants | No new `unsafe`. Nothing prints an image, stack-region or direct-map address, or a base, through these `Debug`s or the new lines. |
+| Performance constraints | None. The lines print only when a proof fails. |
+| Required tests | **Host:** `Debug` tells `rip` against slid bases, a planted raw `rip` fails the test, and `Hooks` prints no address. **Boot:** K1, a start refused, and K2, an image refused, each on the fix and on `ea2293ca`, on the 1-processor Intel-IOMMU and 4-processor machines. |
+| Actual deliverables | Small commits, each naming its item or finding; the records (this entry, items 76, 80 and 82, provenance); a hand-over to the coordinating session. |
+| Acceptance conditions | The quick gates, then `cargo xtask check`, `boot-test` and `boot-matrix` once on the final tip, in one turn; an independent review, every finding answered. **Not shown:** anything under KVM or on a physical machine. |
+
+**Rulings of the coordinating session (2026-11-20).** The contract was accepted with the recommendation on every question:
+- **Q1:** `fields`, with the `told` split by target, and the host test through `fields` with its planted control. `check`'s kernel build compiles the target's branch.
+- **Q2:** `Hooks { .. }` in the same commit, with a host test that its text holds no `0x` and no decimal of any hook's address.
+- **Q3:** all of `abi_and_entry`'s refusals print, in one format ending `: ipc failed`. Confirm that `QueueError`'s `Debug` prints no address.
+- **Q3b:** the RFLAGS.AC program stays inline.
+- **Q4:** K1 is required and K2 is extra, both on the fix and on `ea2293ca`.
+- **Q5:** TASKS.md and provenance only; no new ADR-0013 controls.
+- **Q6:** the other proofs' silent refusals are TASKS item 82.
+
+**Result (2026-11-20): built, reviewed, and gated under QEMU on the final tip; not landed and not pushed.** Code, each commit naming its item or finding:
+- `649ea562` (76): `ExceptionReport`'s `Debug` through `fields`, with `phys::told` on the kernel's target, and `Hooks { .. }`.
+- `a77402a6` (80): `NotRun`, `not_run` and `start_program`, and a line for each refusal.
+- `a779d253`: the review as received.
+- `c80205f4` (T76-80-2, T76-80-6), `40b9f61c` (T76-80-3) and `1d612ce9` (T76-80-4): the answers.
+
+**Gates on `8134700e`** (the code of `1d612ce9` and the records), under Rust 1.100.0 on the development Mac, in one turn of the machine (04:25 to 04:54 UTC, 2026-11-20), a clean tree before and after:
+- the quick gates passed: `cargo fmt --all --check`, `progress`, and the requirements, document, provenance, cost, names, roadmap and progress gates;
+- `cargo xtask check` passed in 590 s: 2,469 host tests passed, 0 failed and 30 ignored; Loom ran 61 models, all passed, and caught all 89 negative controls;
+- `cargo xtask boot-test` passed, 11 of 11 scenarios, in 54 s;
+- `cargo xtask boot-matrix` passed on its first run, in 1,072 s. The kernel stacks' region was at 23 distinct bases in 23 kernel boots, no boot was run again, and no boot printed the new line.
+
+The commit after it adds only these results to the records.
+
+**Fields of `ExceptionReport` checked (76):**
+- `vector`: a number.
+- `error_code`: the processor's error code or the stubs' 0. Every gate but the system call's is DPL 0, so ring 3 cannot raise an error-code vector with `int n` (the review checked this).
+- `rip`: now `image +0x…` on the kernel's target.
+- `rsp`, `rax` to `rdx`: may hold addresses; left out, as before.
+- `rflags`, `cs`, `machine_check`: left out.
+- `Hooks`: nine function pointers, whose own `Debug` is their address; now `Hooks { .. }`.
+
+**Refusals in `abi_and_entry` (80): all 23 print one line,** `origin-kernel: ipc: the <program> program was not run: <step>: ipc failed`. The 22 of the contract became 23 when the review's T76-80-4 split the pinned program's scratch-or-script check in two.
+- **Programs:** registers, pinned code range, null GS, RFLAGS.AC, no developer calls, sidt, single-step.
+- **Steps:**
+  - the image (7);
+  - the process object (7);
+  - the thread start (7), with `QueueError`'s `Debug`;
+  - the pinned program's scratch memory and its script (1 each).
+- On success the order, the arguments and every line are unchanged, as the review checked.
+
+**`QueueError`'s `Debug` (ruling Q3).** It did print an address. `BadContext(u64)` carries the first frame's address, in the stack region, and the derived `Debug` printed it in decimal. The scheduler's proof prints a `Result<usize, QueueError>` with it. Since `40b9f61c` it prints `Full`, `BadContext(..)` or `BootContext`, with a host test and a planted control.
+
+**Tests and controls:**
+- **Host:** `trap.rs` 3 tests; `runqueue.rs` `a_refusal_s_debug_prints_no_frame_address`.
+- **Planted controls:**
+  - raw `rip` put back inside `fields` fails 2 tests;
+  - the derived `Hooks` `Debug` fails 1, printing nine addresses;
+  - the derived `QueueError` `Debug` fails 1.
+- **Boot controls K1 and K2,** on the 1-processor Intel-IOMMU and 4-processor machines, kernel boot only, every file put back byte for byte:
+  - **K1:** the registers program made with `threads: 0`, so `quota::may_start` refuses the start. On `a77402a6`: `the registers program was not run: its thread was refused: Full: ipc failed`, and xtask stops the boot at that line. On `ea2293ca`: no such line; the IPC proof's later lines pass, and the boot is refused "IPC and handles failed".
+  - **K2:** the sidt program's image replaced by `None`. On `a77402a6`: the registers line, then `the sidt program was not run: its image could not be made: ipc failed`. On `ea2293ca`: silent, with the same refusal. K2's first run on the old code did not build, because the block ended a `let … else` initialiser; it was run again with the edit in parentheses.
+  - Evidence: `t76-80-evidence/` in the coordinating session's notes folder.
+
+**The independent review and its answers (2026-11-20).** One AI reviewer read `ea2293ca..a77402a6`, read-only, with no build: 0 High, 1 Medium, 3 Low, 2 Info (`REVIEW_T76_80_2026-11-20.md`; its Resolution lists the answers).
+- **T76-80-1 (Medium):** no boot control was in the change. Answered by K1 and K2 above.
+- **T76-80-2 (Low):** no test reaches the kernel's `Debug` wiring. Recorded as a known limit (option (b)).
+- **T76-80-3 (Low):** `QueueError`'s `Debug`. Fixed.
+- **T76-80-4 (Low):** scratch named as script. Split.
+- **T76-80-5 (Info):** the other proofs. TASKS item 82.
+- **T76-80-6 (Info):** the doc on the host's output, and where the plant went. Corrected; the plant was inside `fields`.
+
+**Where it differs from the contract:**
+1. **`runqueue.rs` changed,** outside the files named, for T76-80-3. Neither the TASKS 73 branch nor `land/batch-8` changes it.
+2. **`NotRun` prints a refused start through `QueueError`'s `Debug`,** not through its own list, once that `Debug` printed no address. `BadContext` reads `BadContext(..)`.
+3. **23 refusals, not 22** (T76-80-4).
+
+**Not shown:**
+- the kernel's `Debug` of a report, in any boot (T76-80-2);
+- the scratch-memory line and `BadContext(..)`, in any boot;
+- anything under KVM or on a physical machine.
+
+**Review:** one AI reviewer; no person.
+
+### 79. A settle waits for every thread whose end was seen to leave its processor
+
+Assigned by the coordinating session on 2026-11-19 to TASKS item 70's session, from the keeper's `boot-matrix` on `land/batch-7` at `6c754c45` (about 20:05 UTC, the Intel-IOMMU 1-processor machine). The contract went to the coordinating session before any code (the coordination notes' `t79-contract.md`), and it accepted rulings R1 to R7 as recommended, adding two things: case (c)'s verdict recorded in ADR-0013 as a deliberate change, with xtask's timeouts checked, and the cost in the ledger (ADR-0018 V3).
+
+**What was wrong** (read at `6c754c45`):
+
+- **The keeper's run.** `directory: … heap 29408 bytes (was 37632), 128191 free frames (was 128158): directory failed`. Its first count held 8,224 bytes and 33 frames more than every other leak check of that boot: about one thread's stack, its FPU area and the space it still held. The proof before it, `prove_entry_flags`, ran `PIN_PROGRAM` twice, waited with `await_end` (`ending()` only) and compares no counts. About 250 earlier directory proofs in saved logs never showed it.
+- **The window.** A user thread's end runs with interrupts on: `thread_ended` raises the thread's `TERMINATED`, then `close_out` closes the handles and sets the process's `ending`, then `ipc::reap_closed` and `sched::reap` run. Only then does the exit vector reach `on_exit`, which queues the stack, FPU area and space reference as a zombie. A tick in that stretch gives one processor to the boot flow. On several processors no tick is needed.
+- **Why the settle passed.** `settle` reaped, then waited for `zombies() == 0`, which held at once, so it never yielded; it trimmed, reclaimed and read the counts with everything held.
+- **Kernel threads, the same.** All 23 kernel thread ends raised a done-flag and then called `sched::exit()`.
+- **H1, an earlier proof's end at a first count.** Exposed: the directory proof after `prove_entry_flags` (the failure), the kernel stacks proof after `prove_user_clock`, and the IPC proof after `wait::prove`'s workers. `measured_stack::prove_in_thread` was already sound: it waits for its flag and for the thread to leave the queue.
+- **H2, a proof's own last end at its compare.** The compare's 2 s re-check lets the thread finish and its `reap()` gives back the FPU area and the space, but not the trim: the stack goes into the cache of kept stacks the settle has just emptied, 4 frames short with the heap exact. That is a second path to the directory proof's 4-frame shortfall on `boot-x2apic` that TASKS item 70's T70-7 was taken to explain (item 70's Result, ruling R7).
+
+| Field | |
+|---|---|
+| Task ID | TASKS item 79, on `claude/t79-ending-threads` (worktree `sweet-wilbur-674acb`), cut from `land/batch-7` at `6c754c45`, which holds TASKS items 66 and 70 (ruling R5). |
+| Objective | A settle that has seen a thread's end, by any signal, waits until that thread has left its processor and been reaped, for user and kernel threads alike, so that no count a Refuse proof compares is read while an ending thread still holds memory. |
+| Source ownership | This task alone edits: a new module `framekernel/frame/sync/src/exits.rs` (atomics only, `forbid(unsafe_code)`), its line in `lib.rs`, its models in `models.rs` and its controls in `developer-tools/xtask/src/loom.rs`; `sched.rs`'s exits, `settle`, `on_exit`, `reap_zombies`, `end_with` and `finish`; `Process::thread_ended`; `percpu.rs`'s sizing line; `settled.rs`; the 23 kernel thread ends; an xtask host test; the records. |
+| Architecture contract | CLAUDE.md §13 (no new `unsafe`, no assembly), §72 and §73 (concurrency testing, Loom), §1 ("Validate failure paths", "Review sensitive boundaries independently"). ADR-0013 R1, R4 and the TASKS item 67 settle; Amendment 3 (b) unchanged. ADR-0018 V3 for the cost. |
+| Relevant specifications | The memory model Rust 1.100.0's atomics follow (`core::sync::atomic::Ordering`, which defers to C++20's): release sequences of read-modify-writes, synchronizes-with, happens-before. |
+| Required dependencies | The base above. Loom as `cargo xtask loom` builds it. No new crate (§5), no owner decision (no ABI, format or scope change). |
+| Security invariants | No count a proof compares is read while a thread whose end was seen still holds memory. A thread that never leaves its processor after its end is named by every later settle, never miscounted. Nothing here weakens a check: a settle only waits longer. |
+| Performance constraints | A thread's end: the run queue's and the threads' locks once more with interrupts off, and two more atomic read-modify-writes. A settle: one more load for each processor at each poll of its first wait. Ledger row CL42 (ADR-0018 V3). |
+| Required tests | Host tests of `Exits` and of `settled::judge`; Loom models E1 to E3 with controls X1 to X5, each caught; an xtask host test for Amendment 3 (b); boot controls C1, C1w, C2, C3 and C4 on the Intel-IOMMU 1-processor and the 4-processor machines, the old code (`6c754c45`) failing where aimed and the fix passing; `check`, `boot-test`, `boot-matrix` in one turn of the machine. |
+| Actual deliverables | The code above, the records (ADR-0013, the ledger, this entry, the provenance entry), an independent review and its answers. |
+| Acceptance conditions | Every test above as stated; the review's findings answered; the coordinating session's reading. |
+
+**Result (2026-11-19).** Built on `claude/t79-ending-threads` from `6c754c45`: `5b1299c5` (`origin_sync::exits`, Loom models E1 to E3, controls X1 to X5), `9c103f30` (the kernel: `EXITS`, `end_with`, `finish` at all 23 kernel thread ends, `thread_ended` marked, `on_exit`, `reap_zombies`, `settle`, `settled.rs`), `e292f8d1` (xtask's Amendment 3 (b) test) and `aea42421` (E2's and E3's bound stated as run).
+
+- **How it works.** A thread counts itself as ending on its processor before anything about its end can be seen; its exit counts its zombie and only then stops counting it; the reap lowers the zombie only after giving back what it held; `settle` reads every processor's ending count before any zombie count and waits for both to be zero. Kernel threads have no other way to end than `finish(signal)`, whose closure is their done-flag. The scheduler proofs' done-counts, which were Relaxed, are AcqRel and read with Acquire, so that a waiter's settle is ordered after the mark.
+- **Host and Loom.** `exits`' 7 host tests, `settled`'s and xtask's new test pass. `cargo xtask loom`: all 64 models passed and all 94 negative controls were caught, X1 to X5 by the exits models they aim at. E2 and E3 took 1,105,056 and 524,132 executions exhaustively (96 s and 65 s), both passing, so the gate runs them at two preemptions (325 and 555), within which X2 and X3 are caught.
+- **Boot controls** (ADR-0013, "Controls of TASKS item 79"; 20:39 to 20:46 UTC, 1 and 4 processors):
+  - **C1,** the entry-flags proof's second process held 200 ms after its end could be seen: the old code failed with the keeper's figures, 8,224 bytes and 33 frames, but at the memory proof, since the directory proof counted the held memory at both ends and passed; the fix passed.
+  - **C1w,** every process end held: the old code failed the IPC proof's compare 60 and 64 frames short (H2); the fix passed every count line on both machines, whole on 4 processors. On 1 processor the IPC proof's last six clauses returned early, printing nothing, and the old code did the same under the same edit: the edit's effect, not the fix's. A diagnostic boot traced it to a start refused `Full`, the run queue holding the threads asleep in the edit's stall; that the clause returns `false` without a line when a start is refused predates this task (follow-up 1 in the hand-over).
+  - **C2,** the wait-queue workers held between their done-count and their exit: the old code failed the IPC proof's first count (H1 from kernel threads); the fix passed.
+  - **C3,** the fix without its wait for ending threads: failed as the old code did.
+  - **C4,** a 15 s hold: the directory proof's first settle waited its 10 s in vain and the line said `not settled before its first count: 1 ending threads not yet exited`; `xtask` stopped there.
+- **Case (c), a deliberate change** (the coordinating session's addition 1): recorded in ADR-0013 with its reason and with `xtask`'s timeouts: one or two waits of 10 s before the refusal is said, against boots of about 13 s in 120 s (1 to 4 processors) and about 76 s in 242 s (65).
+- **The cost** (addition 2): ledger row CL42, and CL20's settles; `cost-gate` passes. Nothing is measured.
+- **The date.** The keeper's run was on 2026-11-19 at about 20:05 UTC; these records use the UTC date.
+
+**Answers to the review (2026-11-19).** `REVIEW_T79_2026-11-20.md` (an AI reviewer independent of the author; its file name and title keep the reviewer's local date): no High or Medium, six Low. Each answered in a commit naming it; the report is in the repository as received (`cea3b835`). The last commit that changes code is `7fb88193`.
+- **T79-1 (Low), `efd8264f`.** The pairing of a thread's raising of `ending` with its lowering rested on a `bool` in the scheduler's table. `Exits::end` now hands back a `Mark`, neither `Clone` nor `Copy`, naming the counts it raised; `Exits::queued` and `Mark::left` consume it, and an exit with no mark lowers nothing. So no lowering can stand for another thread's, none can be made twice, and one consumed on another processor still lowers its own count. The slot keeps the mark from `end_with` to `on_exit`; a mark not kept is not consumed, which keeps its count raised and every later settle names it. `exits.rs` states the premise. Loom model E4 is the reviewer's own (an exit with no mark beside an ending thread on the same processor); control X6 (a lowering made without a mark) is caught by it.
+- **T79-2 (Low), `af1526c1`.** The names gate now refuses the framework's `cpu::thread_exit`, as a path or in a `use … cpu::{…}` group, in any kernel file but `sched.rs`, whose `finish` is every kernel thread's end. The kernel's own `thread_exit` system call, a method of that name, is not matched. A host test shows both.
+- **T79-3 (Low), `42390f4c`.** `end_with`'s and `finish`'s docs state the handoff a settle relies on: the end written with Release (or an AcqRel read-modify-write, or under a lock), read with Acquire, and the settle after that read in the same thread. No helper replaces the closure: the 23 ends raise a flag, a count, a count for one run only, or a row of result slots, which no one helper covers. The reviewer checked every end and waiter and found each correct.
+- **T79-4 (Low), `112a528f`.** In `on_exit`'s branch that keeps no zombie (case (a)), the stack and the FPU area are dropped before the mark is consumed, and the comment says what holds there: nothing more will be given back and the thread is leaving the processor.
+- **T79-5 (Low), `7fb88193`.** `exits.rs` says a fault taken on an exception stack ends with interrupts off, which changes nothing in the argument, and names the zombie's own premise (its raising before its reap's lowering, both on its processor); the run's date there is the UTC one; two comment lines the edits left short are reflowed.
+- **T79-6 (Low, predates this item, not answered here).** `ipc::reap_closed` lowers `CLOSED_COUNT` before it drops the channel's undelivered messages, so a settle can read the heap while another processor still frees messages that carried an ended process's ends. Whether today's proofs reach it is not known. A follow-up for the coordinating session to number (the hand-over's follow-up 2).
+- **The controls again** on an export of `cea3b835` (21:11 to 21:16 UTC), every file put back byte for byte: the baseline, C1, C1w, C2, C3 and C4 on the fix behaved as on `e292f8d1`. C1, C2 and the baseline passed on both machines; C1w passed whole on 4 processors and every count line on 1, its boot refused there for the edit's own reason; C3 failed as the old code does (`heap 29408 bytes (was 37632), 128192 free frames (was 128159): memory failed` on 1 processor); C4 failed `; not settled before its first count: 1 ending threads not yet exited: directory failed` on both.
+- **Gates on `cea3b835`**, in the same turn of the machine (21:15 to 21:43 UTC), under Rust 1.100.0, the tree clean:
+  - the 14 quick gates;
+  - `cargo xtask check` passed: 2,479 host tests, 0 failed, 30 ignored; Loom's 65 models passed and its 95 controls were caught, X1 to X6 by the exits models they aim at;
+  - `boot-test` 11 of 11;
+  - `boot-matrix` passed on its first run, in 1,053 s: 23 kernel boots. No settle on any machine waited past 2 s (no `waited … ms for ending threads'` line), and none printed "not settled" or a stalled shootdown.
+- **Not shown:** anything under KVM, in CI or on a physical machine; the exhaustive Loom search of E2 to E4 on this tip (E2 and E3 passed it before T79-1's token; E4 has not had it). No person has reviewed the code.
+
+### 75, 77 and 81. A refused spawn queues nothing; the trap entry names the running context's own stack; a settle waits for a reap in progress
+
+Assigned by the coordinating session on 2026-11-20 to TASKS item 70's session, one branch for the eighth batch, in that order, on the owner's "Start all three". The contract went to the coordinating session before any code (the coordination notes' `t75-77-81-contract.md`), and it accepted Q1 to Q11 as recommended, with additions (a) to (f): `contexts.rs`'s two rules restated for a withdrawal (a); a concurrent publisher in model W1 (b); the landing check's source, the table's `current` home, never the record or RSP0 (c); the same check for SYSCALL, with a control C77d (d); the interrupt state, locks and deadlock freedom of `settle`'s drain, with an address space freed through it (e); and a question before 81's merge path with TASKS item 73 (f), answered: build on `618b0961`, whichever of 73 and this branch reaches the batch second resolves `settle` and `judge` to `ending, zombies, retired, waiting_for, closed, lost_before, lost_after`.
+
+**What was wrong** (read at `cdff1455`, the code of `land/batch-8` `618b0961`):
+
+- **75.** `spawn_with` pushed a thread into its run queue before it published the thread's first frame. A refused publication returned `Err(Full)`, dropped the stack and left the slot `Ready`, naming a frame the processor's table never held: the next switch to it panics ("never saved"). Unreachable while retirement works (17 of 32 slots); TASKS item 70's W-2b reached it.
+- **77.** `follow_thread` named whatever stack the scheduler's table held for the slot (`cpu::set_kernel_stack`, any `&GuardedStack`) as TSS.RSP0 and the record `syscall_entry` loads, so a scheduler error could land an entry from ring 3 on another context's stack, over its suspended frame. The boot or idle flow left TSS.RSP0 at the last thread's top.
+- **81.** `ipc::reap_closed` lowered its count when it took a channel off the list, before it freed the channel's messages, so a settle or a proof's own reap on another processor could find nothing pending while those messages and what they held were still allocated (the review of TASKS item 79, T79-6).
+
+| Field | |
+|---|---|
+| Task ID | TASKS items 75, 77 and 81, on `claude/t75-77-81` (worktree `sweet-wilbur-674acb`), cut from `land/batch-8` at `618b0961`. |
+| Objective | 75: no run queue ever names a frame its processor's table does not hold, and a refused spawn leaves nothing behind. 77: while a context runs, the stack ring 3 lands on is its own, named by the framework from the table, and every such entry is checked. 81: a settle that finds no closed channel pending comes after every listed channel's messages, and what they held, were freed. |
+| Source ownership | `framekernel/frame/sync/src/contexts.rs` (`withdraw`, `Switched`, `running_home`), a new `framekernel/frame/sync/src/backlog.rs`, their models in `models.rs` and controls in `developer-tools/xtask/src/loom.rs`; `framekernel/frame/src/cpu.rs` (`name_kernel_stack`, `ist_of`, `check_landing`, `resume`, `withdraw_context`, `contexts_cover`, `CpuLocal.landings`) and `stack.rs` (`publish_first_frame`, `withdraw_first_frame`, `slot_in_contexts`, `same_slot`); `framekernel/src/sched.rs` (`spawn_with_parts`, `follow_thread`, `settle`, `settle_pass`, `prove_spawn_refused`), `ipc.rs` (`CLOSED_COUNT`, `list_closed`, `reap_closed`, `closed_pending`), `settled.rs`, `user.rs` (`concurrent`), `stacks.rs` (its windows); xtask's markers and host test. |
+| Architecture contract | CLAUDE.md §13 (no new `unsafe` file, no assembly), §72 and §73 (Loom), §1 ("Validate failure paths", "Review sensitive boundaries independently"). TASKS item 70's table of contexts; ADR-0003 K8; ADR-0013 R1, R4, the settle; ADR-0018 V3. |
+| Relevant specifications | Intel SDM Vol. 3A, order 325384-093US, September 2026, read in memory on 2026-11-20: §7.14.2, §7.14.4, §7.14.5, §10.7 and §6.8.8. The memory model Rust 1.100.0's atomics follow (C++20's). |
+| Required dependencies | The base above; Loom as `cargo xtask loom` builds it; no new crate, no owner decision. |
+| Security invariants | 75-I1 to I3, 77-I1 to I3, 81-I1 and I2 (the contract). Nothing weakens a check: a spawn refuses where it refused, a settle waits longer, and the trap entry refuses one more thing. |
+| Performance constraints | 75: nothing on a successful spawn. 77: CL43. 81: CL44, and a settle's passes (CL20). |
+| Required tests | Host tests of `withdraw`, `Switched`, `Backlog`, `again` and `judge`; Loom models W1, K1, B1 and B2 with controls WX1, WX2, KX1 to KX4, BX1 to BX4; boot controls on the Intel-IOMMU 1-processor and 4-processor machines, the old code failing where aimed and the fix passing; `check`, `boot-test` and `boot-matrix` in one turn of the machine. |
+| Actual deliverables | The code above, the records (ADR-0003's note, ADR-0013, the ledger, this entry, the provenance entry), an independent review and its answers. |
+| Acceptance conditions | Every test above as stated; the review's findings answered; the coordinating session's reading. |
+
+**Result (2026-11-20).**
+
+Built on `claude/t75-77-81` from `618b0961`: `be2fdf9e` (`Contexts::withdraw`, the module's rules restated, Loom model W1 with a concurrent publisher, controls WX1 and WX2), `fb7e3fe6` (publish before queueing, the withdrawal on a refused queue, the refusal proof's third case), `64f20e91` (its boot-test expectation), `003bd88a` (77: `Switched`, `name_kernel_stack` from the incoming home, `set_kernel_stack` and `clear_kernel_stack` gone, the landing check at every entry from ring 3 without an IST stack, SYSCALL's included, its count in the user-isolation proof; Loom model K1, controls KX1 to KX4), `c2a55c61` (`origin_sync::backlog::Backlog`, Loom model B1, controls BX1 to BX3), `fa01a78e` (81 in the kernel: `CLOSED_COUNT` a `Backlog`, `settle`'s drain and wait, `settled`'s closed channels, xtask's host test) and `922cba29` (the kernel stacks proof's window described as it now is).
+
+- **75: how it works.** `spawn_with_parts` publishes the first frame before it takes the queue's lock; a refused publication returns before anything is queued; a queue that refuses the thread has the publication withdrawn (`GuardedStack::withdraw_first_frame`, `Contexts::withdraw`) before the stack drops. `withdraw` takes the frame word by the same compare-and-swap a switch uses, then clears the home with Release, so a withdrawal and a resumption of one context cannot both succeed (75-I3), and a context that ran is never taken: its saved frames are 16-byte aligned and a first frame is not (SDM §7.14.2). The refusal proof injects a refused publication beside its two refusals and checks each refused stack's own slot was not leaked.
+- **77: how it works.** `Contexts::switch` answers the incoming context's home with its frame (`Switched`); the trap entry's `resume` names that home's stack top in `CpuLocal.kernel_stack` and TSS.RSP0 (`name_kernel_stack`), or 0 for the boot or idle flow, and nothing else writes them. `dispatch` checks every entry from ring 3 through a vector without an IST stack, a system call's included (`syscall_entry` builds an interrupt's frame on the record's stack and joins the common path), against the table's `current` home, never against the record or RSP0 (additions (c) and (d)): a frame outside that home's slot halts the processor. The user-isolation proof counts the checks while its two processes run.
+- **81: how it works.** `CLOSED_COUNT` is a `Backlog`: raised under the list's lock as a channel is listed, lowered only after the channel's messages and the list's reference are dropped, read with Acquire. `settle` makes up to three passes; each drains the list on the boot flow and waits for every reap in progress anywhere, then for ending threads and zombies, trims, reclaims and waits for retired stacks; it passes again, after one yield and an interrupt window, while anything is pending or its own drain freed a channel (`settled::again`), then judges, naming "N closed channels not yet reaped" after the retired stacks. The drain runs with interrupts off and no lock held while messages drop (addition (e)).
+- **Host and Loom.** On `3e1e4312`: Clippy on each changed crate (as `check` runs it), and the host tests: `origin-sync` 112 passed, `origin-frame` 312, `framekernel`'s `settled` 4, xtask 396. Loom on `edcbc1b2` (07:24 to 07:29 UTC), by a script that applies each control as `loom.rs` writes it: the contexts models, W1 and K1 among them, and B1 and B2 passed (B2 exhaustively, 134,259 executions in 7.4 s); WX1, WX2, KX1 to KX4, BX1 (by B1), BX2, BX3 and BX4 were caught. B2 did not catch BX1, which the R81-1 commit had listed it as catching: its settle reads only after the ender's reaps, releases included, have finished. `a2d71cf2` lists BX1 under B1 alone. An earlier run on `3e1e4312` stopped at Clippy under `--cfg loom` before any model ran (`edcbc1b2`).
+- **Boot controls** (ADR-0013, "Controls of TASKS items 75, 77 and 81"; 1 and 4 processors, the final round on an export of `3e1e4312`): the old code panicked on C75a and C75b ("never saved"), double-faulted on C77-old and failed the IPC proof's counts on C81 and C81e; the final code passed C75a, C81, C81e, C81s (a 15 s hold, waited out in the second pass) and C81w (R81-2's case), and refused C75b's spawns with a line, not a panic. Its negative controls failed where aimed: C75c and C75d (the refusal proof; "never saved"), C77a2 and C77b2 (the landing check's panic), C77c2 (without the check, one process's frame overwritten and `user isolation failed`), C77d3 (the record alone wrong, named from the last other user context: the landing check halted a system call's entry), C81n (the old code's figures), C81s35 (a 35 s hold: three passes in vain, then `not settled before its first count: 1 closed channels not yet reaped`) and C81w as first built (`ipc failed`, the woken process not yet ended at the first count). W-1, TASKS item 70's control, now fails the switch windows too (R77-1).
+- **The cost** (ADR-0018 V3): ledger rows CL43 (77: about a dozen loads, a compare and a store at each entry from ring 3) and CL44 (81: a system call that finds a drain under way takes the list's lock once), and CL20's passes; `cost-gate` passes. Nothing is measured.
+
+**Answers to the review (2026-11-20).** `REVIEW_T75_77_81_2026-11-20.md` (an AI reviewer independent of the author, briefed with each item's code and invariants and no conclusions): three Medium, eight Low. Each answered in a commit naming it, the report in the repository as received (`5f52e35b`). The last commit that changes kernel code is `3e1e4312`; `edcbc1b2` and `a2d71cf2` change one Loom model and the Loom table.
+- **R81-1 (Medium), `2df3d062`.** `list_closed` raised the count after releasing the list's lock, so a reap could take a channel uncounted and its lowering cancel another listed channel's raise: a settle could read 0 with that channel's messages allocated. `Backlog::add` takes the list's lock and raises under it. Loom model B2, the reviewer's own, with control BX4 (the raise after the lock).
+- **R77-1 (Medium), `dd0b7f96`.** Since the record moves only after the frame is saved, it still names the held thread's stack in both of the kernel stacks proof's windows, so those clauses no longer tested the home word. They now ask the table alone as well (`stack::slot_in_contexts`); TASKS item 70's W-1 fails them again.
+- **R75-1 (Medium), `1a7ff14d`.** The refusal proof required the region's count of lost slots unchanged, which a stalled shootdown of any processor's reclaim also raises. It now checks each refused stack's own slot, read as soon as its spawn returns.
+- **R75-2 (Low), `97ed7264`.** The table's capacity rule names the spawns in flight between their publication and their queueing, what more of them would do (a refused spawn; a halt of a processor whose idle flow had not yet switched out), and why today's boot reaches neither; a reservation that would remove the halt is follow-up 2.
+- **R75-3 (Low), `09c9cabb`.** One sentence of the new rules was false as written: a frame is written into a slot whose frame is 0 also by this processor's switch-out of the context it runs. `contexts.rs` says so and why that never touches a slot being withdrawn; `withdraw`'s docs cite the alignment (SDM §7.14.2), the review's own note.
+- **R75-4 (Low), `523f2a33`.** W1's doc comment stands above its reports.
+- **R77-2 (Low), `174d8130`.** The landing check read the region's base and size twice; `stack::same_slot` reads them once. CL43 says what it costs on every system call.
+- **R77-3 (Low), `174d8130`.** `name_kernel_stack`'s docs say why the boot or idle flow's 0 faults into #DF, never writes anywhere: only the image is mapped in its window, at least 2 MiB below the top.
+- **R77-4 (Low, scope note, not answered here).** Only the stack is taken from the table; `follow_thread` still activates the address space from the scheduler's slot, so a scheduler whose slot disagreed with the table's answer would load another process's CR3, which the landing check does not see. Follow-up 1.
+- **R81-2 (Low), `3e1e4312`, on the coordinating session's rulings.** The closed-channel wait ran after the exits wait, so a drain could wake a thread that then ended between the exits wait and the verdict. Each pass now drains first; `reap_closed` returns how many it drained, and a pass that drained any, or left anything pending, is followed by a yield, an interrupt window and another pass, at most three (`settled::again`, host-tested). Control C81w fails as first built and passes now; ADR-0013 states the two limits.
+- **R81-3 (Low), the ledger.** While a drain is under way, a system call that finds the count raised takes the list's lock once: CL44, ADR-0005 P8.
+
+**Gates.** On `c74eeeff`, in one turn of the machine (07:52 to 08:20 UTC, after 1,100 s waiting for TASKS item 73's run), under Rust 1.100.0, the tree clean:
+  - the 14 quick gates, before the turn;
+  - `cargo xtask check` passed: 2,492 host tests, 0 failed, 30 ignored; Loom's 69 models passed and its 105 controls were caught, WX1, WX2, KX1 to KX4 and BX1 to BX4 by the models they aim at (B1 55,475 and B2 134,259 executions, both exhaustive);
+  - `boot-test` 11 of 11;
+  - `boot-matrix` passed on its first run, in 1,070 s: 23 kernel boots. No settle on any machine waited past 2 s (no `waited … ms` line), and none printed "not settled", a closed channel or a stalled shootdown; the landing check halted nothing.
+
+**Follow-ups, for the coordinating session to number:**
+1. R77-4: name the address space from the table of contexts, or check the scheduler's against it at `resume`, as 77 did for the stack.
+2. R75-2: reserve a table slot for each processor's boot or idle flow, so that spawns in flight can never make that flow's switch-out halt.
+
+**Not shown:** anything under KVM, in CI or on a physical machine; an exhaustive Loom search of W1, K1, B1 and B2 beyond the gate's bounds. No person has reviewed the code.
+
+### 83. QEMU machines with the rented board's shapes: more than 4 GiB of RAM, and its firmware tables
+
+Written 2026-11-20, before any of it was built, by the session that ran rental B's readiness and findings. Proposed to the coordinating session; nothing here is built until it rules.
+
+- **Task ID:** TASKS item 83 (rental B's findings, option C; no owner decision needed).
+- **Objective:** boot the kernel under QEMU on machines that have what rental B's board had and no `xtask` machine has: more than 4 GiB of RAM, and the firmware-table and memory-map shapes `docs/research/2026-11-20-rental-b-findings.md` describes. Each machine must show the kernel reaching its SPCR move and its verdict, or name where it stopped (COM1's last kernel line, which the machine keeps in a file). If one of these shapes is what stopped the kernel on the rented board, it fails here, for free.
+- **Source ownership:** `developer-tools/xtask` (the machines, their settings and checks); the TEST ONLY application `tests/emulator/reserved-memory` (extended, see question 2); the records below. No kernel or loader code: if a machine fails, the fix is a task of its own, numbered by the coordinating session.
+- **Architecture contract:** ADR-0010 E4 (the console's move to the SPCR's UART, and its replay); ADR-0019 A6 and TASKS item 71 (the first lookup's locator, the never-lent structures); ADR-0004's layout (the direct map, a directory per GiB); ADR-0007 Amendment 1 (reserved memory); ADR-0013 (the verdict and the controls' record); ADR-0011 Amendment 4 and TASKS item 61 (`boot-matrix` in one process, typed settings, variable names only in `settings.rs`).
+- **Relevant specifications:** ACPI 6.6 §5.2.5 (RSDP), §5.2.8 (XSDT), §5.2.9 (FADT: `FIRMWARE_CTRL` and `X_FIRMWARE_CTRL`), §5.2.10 (FACS), §5.2.24 (FPDT, FBPT, S3PT); Microsoft's SPCR (revision 2, as `spcr_table` builds it now); UEFI 2.11 §4.6 (`InstallConfigurationTable`), §7.2 (`AllocatePages` and the memory types). The owner's local copies; paraphrased, nothing copied in.
+- **Required dependencies:** none new. The application keeps to the UEFI specification. Device ranges above the RAM may need the PI specification's DXE services (question 3).
+
+**The machines** (each the kernel boot only, as `boot-reserved`'s are):
+
+| Machine | What it is | IOMMU | What it must show |
+|---|---|---|---|
+| `large` | The usual machine with 64 GiB (two NUMA nodes of 32 GiB), or the largest the Mac takes (below) | Intel and AMD: 2 boots | `frame allocator: N free frames (M MiB)` with M within 1% of the RAM the firmware gives; `page tables loaded: … direct map` covering it; the NUMA proofs on 32 GiB nodes; the verdict, the usual QEMU one (decision item 154) |
+| `rented` | `large`'s memory, the SPCR scenario's UARTs (COM1 to a file, COM2 at `0x2F8` to the checker, both present), and the TEST ONLY application before the loader, shaping the tables and the map as below | AMD (the board's), and Intel: 2 boots | On COM2: the replayed early lines, the move (`the ACPI SPCR (revision 2, interface 0x0) names a UART at I/O port 0x2f8: moving the console there`, `the UART is now at I/O port 0x2f8, as the firmware set it`), the census's lines for the located FACS, FBPT and S3PT, and the verdict. COM1 stops at the move (`check_com1_stopped_at_the_move`) |
+
+**What the application shapes for `rented`,** all built from the findings' description and the specifications, none from the rental's bytes:
+1. The RSDP and the XSDT copied into new `EfiACPIMemoryNVS` pages, and the ACPI 2.0 configuration table pointed at the copy.
+2. A copy of QEMU's FADT whose `X_FIRMWARE_CTRL` is 0 and whose 32-bit `FIRMWARE_CTRL` names the FACS, re-checksummed, with the XSDT's entry pointed at it.
+3. An FPDT (FBPT and S3PT pointer records) added to the XSDT, its FBPT and S3PT in new `EfiReservedMemoryType` pages, each with its signature and header (ACPI 6.6 §5.2.24).
+4. The SPCR as the SPCR scenario gives it now: revision 2, a 16550 at I/O `0x2F8`, 115 200 baud.
+5. Reserved memory above 4 GiB: a range at the top of the RAM, as the board's firmware keeps one there; and, through DXE services if question 3 allows, a device range above the RAM and a reserved range just below 1 TiB, as the board's map has.
+The application prints each change, as it prints its regions now, so the checker can hold the kernel's report against it.
+
+**When a machine fails, it names where:** the checker prints COM1's last kernel line, which the file keeps from the first line of the boot, beside COM2's. That is the line rental B could not see.
+
+**Controls** (ADR-0013, each run once and recorded; none in `boot-matrix`):
+- RB-1: the application puts the RSDP copy in loader-data memory (RAM the kernel will own). The kernel must refuse to read it, the move must not happen, and `rented` must fail naming COM1's last line.
+- RB-2: an FBPT whose declared length covers the SPCR. The lend of the SPCR is refused, the move does not happen, and `rented` fails.
+- RB-3: `covered_end` changed to ignore memory above 4 GiB. `large`'s frame-allocator figure is wrong, and it fails.
+- RB-4: COM2's output thrown away (the SPCR names `0x2F8`, but no device is there). The kernel's probe finds nothing, it stays on COM1, and `rented` fails, showing that the checker cannot pass a move it did not see.
+
+**Memory on the Mac (performance constraint):** the 8 GiB boot of 2026-11-20 passed. The first step is one 64 GiB boot under `exclusive`, watching QEMU's resident memory and the Mac's swap. If QEMU stays under 4 GiB resident and the Mac does not swap, the machines use 64 GiB. Otherwise they use 32 GiB, then 16 GiB, and the record says why.
+
+**Cost in `boot-matrix` time:** four kernel boots added. On 2026-11-20 a 512 MiB and an 8 GiB boot of the same image under `cargo xtask run` took 16 and 17 seconds under TCG on the Mac, once they had the turn, build checks included. At 64 GiB, OVMF's start may take longer: the first step measures it. **Estimate: 2 to 5 minutes added** to `boot-matrix`'s boots, about 1,150 s now (TASKS item 71's gates); every boot runs inside `cargo xtask exclusive --`. CI: see question 1.
+
+**Security invariants:**
+1. The application stays TEST ONLY: it is built only by `xtask` and never staged by `cargo xtask build`.
+2. No byte of the rental's dumps enters the repository (item 232).
+3. The checker can fail a machine but never makes one pass that did not print what it requires: every new marker is the kernel's own text.
+
+**Required tests:**
+- host tests for each table the application builds (checksum, lengths, the 32-bit FACS pointer);
+- the four machines in `boot-matrix`, and the four controls each failing;
+- `check`, `boot-test` and `boot-matrix` in one turn at the end.
+
+**Deliverables:**
+- the machines (`cargo xtask boot-large`, `cargo xtask boot-rented`), and both in `boot-matrix`;
+- the application's shaping;
+- ADR-0013's controls RB-1 to RB-4;
+- `docs/STATUS.md`;
+- the requirements rows whose evidence these machines add to: the console move (ADR-0010 E4), the frame allocator, the direct map, and the FACS/FPDT locator;
+- `SOURCE_PROVENANCE.md`'s row for the application.
+
+**Acceptance:** each machine shows its move and its verdict on both IOMMUs, or the failure is reported to the coordinating session with COM1's last line and becomes a task of its own; the controls fail; the gates pass.
+
+**Questions for the coordinating session:**
+1. **CI.** GitHub's standard runners have far less memory than 64 GiB. Should CI run `large` and `rented` at the size its runners take (8 GiB, say), or only on the Mac, as `ORIGIN_BOOT_MATRIX_ANY_COUNT` keeps the large processor counts?
+2. **One application or two.** Extend `tests/emulator/reserved-memory`, which already copies tables, edits the XSDT and starts the loader, with a second configuration (recommended), or write a sibling application?
+3. **Device and high reserved ranges above the RAM.** Creating ranges where there is no RAM needs the PI specification's DXE services (`AddMemorySpace`, `SetMemorySpaceAttributes`), not UEFI's. Is the PI specification an allowed source here (free, from uefi.org)? Without it, item 5 shapes only the reserved range at the top of the RAM, and the rest is recorded as not shown.
+
+**Rulings of the coordinating session (2026-11-20), accepting the contract:**
+- **Q1, CI:** as `ORIGIN_BOOT_MATRIX_ANY_COUNT`'s machines are kept: the full-size `large` and `rented` boots run on the Mac only, and CI runs both machines at 8 GiB, so the shapes and the move are covered on every pull request. The size is one typed setting in `xtask`'s `Settings` (as TASKS item 61 made them), not a reading of the environment of its own.
+- **Q2:** `tests/emulator/reserved-memory` is extended.
+- **Q3:** the UEFI Platform Initialization specification is a free official specification, allowed under §3 if it can be read. No project's source fills the gap: this session writes code, and §3 keeps such reading in a session of its own. **No copy is at hand** (uefi.org refuses automated reading), so item 5 shapes only reserved RAM at the top of the memory; device and reserved ranges above the RAM are recorded as not shown. The owner can supply the PI specification's PDF, as they did UEFI 2.11's.
+- **Memory, a hard stop:** 64 GiB is tried once, under `exclusive`, watching QEMU's resident memory and the Mac's swap. If QEMU passes 8 GB resident or swap grows at all, the boot is stopped and 32 GiB, then 16 GiB, tried. The size settled on, and why, is recorded.
+- **The rest as written:** RB-1 to RB-4, each failing; the checker printing COM1's last kernel line on a failure; about four boots added. Then an independent review, the full gates once on the final tip, and the branch to the keeper with the tool, the findings and the records. Item 317 stays unbuilt until the owner accepts it.
+
+**As built (2026-11-20):**
+- **The memory trial:** one 64 GiB boot under `exclusive`, guarded by a script that would have stopped QEMU at 8 GB resident or at any growth of the swap. QEMU's resident memory peaked at 0.23 GB, the swap stayed at 4,760 MB, and the boot took 14 s. **The full size is 64 GiB** (`FULL_MEMORY_GIB` in `settings.rs`); CI's is 8 GiB.
+- **The machines:** `boot-large` and `boot-rented`, each under both IOMMUs, in about 13 s a boot, each ending with the QEMU verdict. Their first boots failed on two markers of the rented machine's, both fixed to what the machine showed (`7fefbf96`).
+- **The controls:** RB-1 to RB-4, each failing (ADR-0013). RB-1, RB-2 and RB-4 leave the kernel running to `M1 entry complete; halting` on COM1 with nothing on COM2, as on rental B.
+- **Item 5 of the shapes:** only reserved RAM at the top of the memory (Q3); the ranges above the RAM are not shown.
+- **A departure:** the failure report also gives the console's last line about the firmware's UART (`5a184a3c`), which the contract did not ask for, so that a boot that stayed on COM1 says why.
+- **The independent review** (`docs/engineering/REVIEW_T83_2026-11-20.md`, an AI reviewer: 1 High, 3 Medium, 8 Low), **answered in `88aac4dc`:**
+  - **T83-1, T83-2:** the contract's 1% rule would have failed CI's rented machine on a correct kernel. It is replaced by the boot's own figures, each held against the RAM less the reserved top: the usable memory, the free memory, the direct map and the NUMA total (`check_memory`).
+  - **T83-3:** the direct map and the NUMA total are now checked. No proof touches a frame near the top of the RAM; that is kernel code, outside this task, and is proposed to the coordinating session as a task of its own.
+  - **T83-4:** the controls were run again with the console's reason, under AMD-Vi, their diffs kept, and RB-2's change of design from the contract's is recorded (ADR-0013).
+  - **T83-5 to T83-12:** each fixed, as `88aac4dc` lists, but T83-6, which is recorded: the application is aimed at OVMF and departs from UEFI 2.11 §7.2's note on runtime memory types.
+- **Checked on `88aac4dc`, in one turn (2026-11-20, 09:58 to 10:07 UTC):** `boot-large` and `boot-rented` under both IOMMUs at 64 GiB and at 8 GiB (`GITHUB_ACTIONS=true`, CI's size), each in about 13 s; the rented 8 GiB machine's `8101 MiB` free is the figure T83-1 predicted. The four controls failed with their reasons.
+- **No requirements row covers the FACS and FPDT locator** (TASKS item 71; ADR-0019's area A row, A19-A6, is not started), so none was updated for it, as the contract's deliverables assumed.
+
+### 84. Boot info 0.8: the loader hands the SPCR's UART to the kernel (decision item 317; ADR-0010 Amendment 3)
+
+Written 2026-11-20 by the session that built TASKS item 83, before any of it was built, and accepted by the coordinating session the same day as drafted, with the rulings and additions below. Built on `claude/t84-early-uart`, cut from `f37abcbc` (TASKS item 83's branch with `land/batch-8` merged, which holds `main` at `4718d312`, PR 46).
+
+- **Task ID:** TASKS item 84, after TASKS item 83.
+- **Objective:** from `kernel_main`'s first line, every kernel line reaches the UART the firmware's SPCR names, when that UART is a 16550 in I/O space, as well as COM1 and the screen. The loader finds and checks the SPCR before `ExitBootServices` and names the UART in boot info 0.8. E4's move still rules once the page tables are live. A rented server whose console is COM2 then shows where the kernel stops.
+- **Source ownership:**
+  - `boot/info` (the structure, its check, the version);
+  - `boot/uefi` (finding the SPCR);
+  - a new crate for the SPCR parser;
+  - `framekernel/src/console.rs`, `serial.rs`, `spcr.rs` (which becomes the new crate's user);
+  - `origin-version.toml`;
+  - `developer-tools/xtask` (scenarios);
+  - the records.
+
+  Boot info and its version are an ABI decision, accepted by the owner as item 317; the exact layout below is this contract's to settle with the coordinating session.
+- **Architecture contract:**
+  - ADR-0010 E1, E4, E5 and Amendments 2 and 3;
+  - ADR-0002 B4 (boot info, the version check);
+  - ADR-0013 (no SPCR outcome stops a boot);
+  - CLAUDE.md §13 (checked parsing of untrusted input);
+  - §62 (one release identity);
+  - ADR-0018 V3 (the cost, ledger row CL46).
+- **Specifications:**
+  - Microsoft's SPCR, as the kernel's parser cites it today (revision history to 1.10, table revision 4), and DBG2 Table 3;
+  - ACPI 6.6 §5.2.5 to §5.2.8 (RSDP, XSDT);
+  - UEFI 2.11 §4.6 (the configuration table).
+
+  Nothing new to read.
+- **Dependencies:** none new outside the workspace.
+
+**1. Boot info 0.8: one structure appended**
+
+```rust
+/// The UART the firmware's SPCR names, when the loader found one the kernel can write to from its
+/// first line: a 16550-compatible UART in I/O space (ADR-0010 Amendment 3). `port` is 0 if none.
+#[repr(C)]
+pub struct EarlyUart {
+    /// I/O port base of the UART's 8 registers, or 0: none.
+    pub port: u16,
+    /// The SPCR's interface type (0x00, 0x01, 0x12 or 0x14), for the kernel's lines.
+    pub interface: u8,
+    /// Bit 0: `baud` is the rate the table states. Bit 1: `clock_hz` is the clock it states.
+    /// Every other bit is 0.
+    pub flags: u8,
+    /// The rate the table states, in bits per second, or 0 (bit 0 clear): leave it as the
+    /// firmware set it.
+    pub baud: u32,
+    /// The UART's input clock the table states, in Hz, or 0 (bit 1 clear).
+    pub clock_hz: u32,
+    /// 0.
+    pub reserved: u32,
+}
+```
+
+- 16 bytes, 4-byte aligned. It is appended to `BootInfo` after `boot_seed` as `early_uart`, so `size` grows by 16, and the version becomes 0.8 in `origin-version.toml`. The kernel accepts only 0.8 (B4's rule for major 0).
+- **`EarlyUart::check()`, run by both the loader and the kernel, as `Framebuffer::check` is.** It accepts either:
+  - `port` 0 with every other field 0; or
+  - a port in a block the parser allows: the four standard COM blocks, or one at or above `0x1000` that does not wrap, the rule `spcr.rs`'s `port_block_allowed` holds today.
+
+  It also requires a known interface, only flag bits 0 and 1, a non-zero `baud` exactly when bit 0 is set and a non-zero `clock_hz` exactly when bit 1 is set, and `reserved` 0.
+- **On a refusal the kernel uses no early UART and says so on COM1 and the screen.** The boot goes on (E5).
+- **The loader translates the table.** No ACPI structure crosses into boot info (Amendment 3).
+
+**2. The parser in a crate both build**
+
+- New crate `origin-spcr` (`firmware/acpi/spcr`), `#![no_std]`, `forbid(unsafe_code)`, no dependencies. It takes from the kernel unchanged:
+  - `spcr.rs`'s `parse`, `Spcr`, `UartAddress`, `Access`, `SpcrError` and the port rule;
+  - `serial.rs`'s `divisor_for`, `INPUT_CLOCK_HZ` and `LineSetup`, which `Spcr::line_setup` needs;
+  - the header checks `parse` needs (signature, length, checksum, revision), which it takes from the kernel's `acpi` module today.
+- The kernel's `spcr.rs` and `serial.rs` use the crate instead, and their tests and the 200,000-case mutation soak move with the code.
+- `SOURCE_PROVENANCE.md` gains a row; `xtask`'s gates (provenance, unsafe, names, dependency lists) learn the crate.
+- A file moved within the repository is not a new authorship: the provenance row says where it came from.
+
+**3. The loader**
+
+- Before `ExitBootServices`, from the RSDP `find_rsdp` already finds, it walks the XSDT (checked: signature, length, checksum, entry count bounded, as the kernel's walk is). It takes the first SPCR whose header checks, and parses it with `origin-spcr`.
+- If that gives `UartAddress::Port(p)` with an accepted interface, it fills `EarlyUart`. Otherwise `port` is 0. Either way it prints one line, for example:
+  - `origin-boot: console: the SPCR names a UART at I/O port 0x2f8: the kernel writes to it from its first line`;
+  - `origin-boot: console: the SPCR names a UART in memory space: the kernel moves to it once its page tables are live`;
+  - `origin-boot: console: no SPCR (…)`;
+  - `origin-boot: console: the SPCR was refused (…)`.
+- Nothing here stops the loader. Every read is of firmware memory identity-mapped under boot services, bounded by the table's checked length.
+
+**4. The kernel**
+
+- `kernel_main`, before its first line, checks `info.early_uart`. If a port is named, it claims the 8 ports as the SPCR's port is claimed today and adds a second UART sink to the console. It does not reprogram that UART's speed unless the structure states a rate and a clock, `Spcr::line_setup`'s rule, and it sets the line format as `configure` does.
+- Every line goes to COM1, to that UART and to the screen, each UART a section at a time (Amendment 2). A UART that takes no bytes is given up on after one bounded wait (E5), as COM1 is now.
+- **The move (E4) still rules, and reads the SPCR itself:**
+  - **It names the boot-info port:** COM1 stops. Nothing is replayed to that port, which already has every line. The move's line says so: `… names a UART at I/O port 0x2f8: the console has written there since its first line; COM1 stops`.
+  - **It names another port, or a memory-mapped UART:** the console moves there and replays its log, as now. The kernel says so on every UART it was writing to, then stops writing to them.
+  - **It refuses, or the table cannot be read:** the kernel says so on every UART it is writing to, and **keeps writing to both COM1 and the boot-info UART for the rest of the boot.** That is question 1 below. It is the case rental B could not see: the loader read the table, the kernel could not.
+
+**5. Scenarios (xtask) and their cost**
+
+| Machine | What it must show |
+|---|---|
+| The existing SPCR console scenario (COM2 named, COM1 present) | The kernel's first line, `origin-kernel: console: framebuffer …`, on COM2 **before** the move line, and the move saying nothing was replayed. COM1 stops at the move. The loader's line names `0x2f8` |
+| The other existing SPCR scenarios (COM1 named; an absent UART at `0x2E8`; interface 3, refused; a memory-mapped UART) | As now, plus the loader's line. For `0x2E8` the early UART is given up on after one bounded wait, and the move refuses it, said on COM1. For interface 3 and the memory-mapped UART the loader names none |
+| `boot-rented` (TASKS item 83) | As now, plus the kernel's first line on COM2 before the move |
+| **New: `boot-rented` with the kernel's reading refused** (the application puts the RSDP's copy in loader-data memory, as control RB-1 did, but as a scenario) | The loader names COM2 (it read the table under boot services). The kernel's move refuses (`no usable ACPI SPCR table (…)`), says so on COM1 and COM2, and **the whole boot, verdict included, is on COM2**. This is the rental B case, now visible |
+
+**Cost in `boot-matrix` time:**
+- one kernel boot added: the new rented variant, under one IOMMU (AMD, the board's), about 13 s at 64 GiB on the Mac and about the same at 8 GiB in CI;
+- the existing console scenarios change their markers only.
+
+**Cost in the product, ledger row CL46:**
+- the loader's walk of the XSDT, once, before `ExitBootServices`;
+- until the move, each line sent to one more UART. Rental B's kernel sent 2,593 bytes before its move, about 0.23 s more at 115,200 baud.
+
+Both figures are owed, measured on the Mac and named as unmeasured on hardware (ADR-0018 V3). The row is added by this task.
+
+**6. Controls (ADR-0013), each failing**
+
+- **R84-1:** the loader names no UART. The SPCR console scenario fails: the kernel's first line is not on COM2 before the move.
+- **R84-2:** the kernel ignores `early_uart`. Fails the same way.
+- **R84-3:** `EarlyUart::check` accepts port `0x60`. A host test fails: the keyboard controller's ports are not a UART block.
+- **R84-4:** on a refused move the kernel stops writing to the boot-info UART. The new rented variant fails: its verdict is not on COM2.
+- **R84-5:** the kernel accepts boot info 0.7. A host test fails.
+
+**Host tests:**
+- the structure's layout, pinned by offset;
+- its check, for each field;
+- the loader's walk over tables that are good, short, mis-summed, without an SPCR, with a memory-mapped SPCR, and with a refused SPCR;
+- the moved parser's existing tests and soak.
+
+**7. Security invariants**
+
+1. The loader parses the SPCR as untrusted input, with the kernel's own checks. A table naming a port outside the allowed blocks is refused in the loader, and again in the kernel's `EarlyUart::check`.
+2. The kernel's early writes go only to a port the table named and both checks accepted, never to a guessed one.
+3. No SPCR outcome stops the loader or the kernel (E5).
+4. Boot info's version check refuses a mismatched loader and kernel (§62).
+
+**8. Acceptance**
+
+- The scenarios above pass under both IOMMUs where they run.
+- Each control fails.
+- `check`, `boot-test` and `boot-matrix` pass in one turn.
+- An independent review is done and answered.
+- Records:
+  - ADR-0010 Amendment 3's status;
+  - row A10-Am3;
+  - ledger row CL46;
+  - `STATUS.md`;
+  - provenance.
+
+**Rulings of the coordinating session (2026-11-20), accepting the contract as drafted:**
+- **Q1, yes:** after a refused move, the kernel keeps the boot-info UART for the rest of the boot, beside COM1.
+- **Q2, yes:** the 16-byte `EarlyUart`, with the rate and clock as the table states them. Amendment 3 left the layout to this task.
+- **Q3, yes:** `origin-spcr` in `firmware/acpi/spcr`, `no_std`, `forbid(unsafe_code)`, no dependencies.
+- **Addition (a):** the loader's image changes, so the image gates and the reproducible-image comparison are run and kept green.
+- **Addition (b):** in the new "kernel's reading refused" scenario, the loader's line naming `0x2f8` and the kernel's refusal line are both checked on COM2.
+
+**As built (2026-11-20).** On `claude/t84-early-uart`, on `claude/rental-b-clean` at `9517b2f6` (the rental-B branch rebuilt without the rentals' identifiers, the coordinating session's request): the code in `2d2dc4f5`, the scenarios in `7ad41d28`. Built to the contract, with these departures, each for the reason given:
+
+- **D1, the loader's line under QEMU (addition (b)).** The loader prints through the firmware's console. Under OVMF that is COM1, so the loader's own line, `origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line`, is on COM1, and no loader output can reach COM2 there.
+  - On COM2 the kernel's second line states what the loader named, from boot info: `origin-kernel: console: the loader named the SPCR's UART at I/O port 0x2f8 (interface 0x0): written to from the first line, beside COM1, as the firmware set it`.
+  - The machine with the kernel's reading refused checks that line and the refusal on COM2, and the loader's own line on COM1.
+  - On rental B's board, whose firmware console is COM2, the loader's own line would be on COM2 as well, as its earlier lines were on rental B (inferred from rental B's log; nobody has seen this line there, the review's T84-11).
+  - The checks read the port from the loader's line on COM1 and from the kernel's on COM2, and require the same (the review's T84-14).
+  - Making the loader also write its line to the UART it names was not done: on a board like rental B's, the line would then appear twice.
+- **D2, the first lines.** The framebuffer's line is the first kernel line on the loader's UART, as §5's table says. The line about the loader's UART is second: `attach_loader_uart` runs right after the boot info is read and says nothing, and its outcome is printed once the screen is attached, so that it is on every sink.
+- **D3, a UART that is not there.** The loader's UART is probed as the move's is. A status register that reads all ones is not used at all: `… which cannot be used (nothing answers at that address); COM1 and the screen until the SPCR is read`. That is the "port with no UART" scenario at `0x2E8`.
+  - A UART that answers and never takes a byte costs at most two bounded waits: one while it is programmed (`configure` waits for its transmitter, as for COM1), and one during the kernel's first line, after which it is given up on (the review's T84-9).
+  - COM1 and the screen then say `the loader's UART stopped taking bytes; serial output there off`, and the writer that found it out goes on only once that is out on both (T84-9).
+  - The kernel's line about the loader's UART then says it stopped, not that it is written to (T84-9). That is the "UART that takes no bytes" scenario.
+  - §5's table had the absent `0x2E8` given up on after a wait; the probe refuses it at once, before any wait.
+- **D4, the loader's reads.**
+  - The loader reads only memory the UEFI memory map describes, which UEFI 2.11 §2.3.4 keeps identity-mapped while boot services run, through `spcr::described`, a byte at a time and volatile.
+  - Every read is bounded by a length checked first: the RSDP's 36 bytes; the XSDT, at most 16 MiB as the kernel's tables are, summed 64 bytes at a time; an SPCR of at most 1,024 bytes. A longer SPCR names no UART; the kernel still reads it itself.
+  - A memory map that cannot be read names none, and the loader goes on.
+- **D5, the cost figures.** The loader prints what its walk read (`the walk read N bytes of firmware memory in M reads, T time-stamp counter ticks (cost ledger row CL46)`). The take-over prints what went to the loader's UART before the move (`N bytes of text went to that UART before the move, beside COM1 (cost ledger row CL46)`), on that UART alone.
+- **D6, `origin-spcr`'s additions.**
+  - No header check of its own: the loader checks the SPCR's header with `origin-acpi-tables`' `header::check_signature`, the implementation the kernel's `acpi::check_table` runs (the review's T84-13). An earlier copy, `origin_spcr::check`, was removed.
+  - `is_16550`, the interface rule for revision 2 and later, which boot info's `EarlyUart::check` uses.
+  - `line_setup` as a free function, which `Spcr::line_setup` and the kernel's attach both call, so the speed rule is in one place (ruling Q2).
+- **D7, staying.** When the move does not happen, the kernel's line names both UARTs: `…; the UART stays at I/O port 0x3f8, and the loader's at I/O port 0x2f8`. The text is unchanged when there is no loader's UART.
+- **D8, the refused machine.**
+  - `ORIGIN_QEMU_SHAPE` takes `on`, `refused` or `off`. `refused` sets the TEST ONLY application's new flag (configuration version 4): the RSDP's copy goes in loader-data pages, which the loader reads under boot services and the kernel, owning that RAM, will not map.
+  - It runs as `boot-rented`'s fourth machine, under the AMD IOMMU, at the large machines' size.
+  - Without the ACPI tables most of the boot's proofs cannot run, so its markers are the console's alone: the framebuffer's line, the line about the loader's UART, the refusal, the verdict and the halt, on COM2.
+  - Its check (`check_refused_boot`):
+    - the first two lines on COM2;
+    - the application's and the loader's lines on COM1;
+    - the refusal, the verdict and the halt on COM1 too;
+    - COM1's and COM2's kernel lines the same, each once, from the first to the halt (T84-4);
+    - the verdict naming as failed only proofs that need the tables, and the speculation controls (`REFUSED_VERDICT_FAILED`);
+    - nothing sent again on either.
+  - Failures: every kernel boot's but the seven its boot prints because it cannot read the tables (`NEEDS_THE_TABLES`, the review's T84-3), and no QEMU stderr markers.
+  - The console's two section proofs fail there for the same reason: they count the interrupt they make pending through the I/O APIC, which only the MADT names (the screen's proof, which writes to no UART, fails the same way).
+- **D9, a fourth machine with the SPCR alone in RAM the kernel owns** (`ORIGIN_QEMU_SHAPE=spcr-refused`; the TEST ONLY application's `spcr_in_ram`; the review's T84-3).
+  - The loader reads the SPCR and names COM2. The kernel refuses that one table and reads every other, so its move is refused and both UARTs are written to for the whole boot, its console proofs among it.
+  - It is held to everything a kernel boot is: every marker but the SPCR's own lines, every failure, and the line checks on COM2 and on COM1, plus COM1's and COM2's kernel lines the same throughout (T84-4).
+- **D10, E4's move with a replay is booted again** (the review's T84-5). The console scenario "SPCR longer than the loader reads" has an SPCR of 1,100 bytes. The loader names no UART (`it declares 1100 bytes, more than the loader reads (1024)`, on COM1), and the kernel moves to `0x2F8` and replays its log. COM2's kernel lines up to the move's line must equal COM1's, each once.
+  - Its verdict: `degraded: 55 of 65 proofs passed; 6 did not run; failed: …`, the proofs that need the tables. COM1 and COM2 carried the same 321 kernel lines.
+
+**What ran (QEMU 11.1.3's software processor on the development Mac, 2026-11-20, inside `cargo xtask exclusive`).**
+- Before the review: `boot-console`, all 9 scenarios then, passed (136 s); `boot-rented`, its 3 machines then, passed at 64 GiB (38 s).
+- On the review's answers (`90aaf055`): `boot-console`, all 10 scenarios, the move with a replay among them, passed (152 s); `boot-rented`, all 4 machines, passed at 64 GiB.
+- On the machine with the SPCR alone in RAM, the console's proofs passed with both UARTs live: a whole line was on both before its writer went on (262 of 262 bytes, two UARTs' worth), a writer that could wait waited for room on either, and an interrupt and a breakpoint in the middle of a line were taken as on any machine.
+- In the SPCR console scenario, COM2's first kernel lines are the framebuffer's and the loader's UART's, the take-over says nothing was sent again, and COM1 stops at it.
+- The loader's walk read 524 to 672 bytes of firmware memory in 20 to 23 reads, 0.79 to 1.37 ms at QEMU's 1,000 MHz time-stamp counter.
+- 2,805 bytes of text went to COM2 before the move.
+
+**Addition (a), the images (2026-11-20, 12:40 to 12:42 UTC, one turn, on `7ad41d28`).**
+- `image-graph-gate`, `reproducible-gate` and `image-gate` passed here.
+- `reproducible-gate` passed again in a second checkout of the same commit at another path, and `reproducible-compare` found all 40 files of the two builds the same bytes. That covers:
+  - both loaders, 209,408 bytes each;
+  - the kernel image, 1,967,880 bytes (SHA-256 `4cb380c5…`).
+
+**The review** (`REVIEW_T84_2026-11-20.md`, an independent AI reviewer, on `9517b2f6..62d84fba`: 0 High, 7 Medium, 6 Low, 2 Informational; as received in `db26dede`). Each finding is answered in a commit naming it:
+
+| Finding | Answer | Commit |
+|---|---|---|
+| T84-1 (Medium), a take-over to a UART that just stopped | The take-over decides under the lock after the drain; a dead loader's UART is not taken, COM1 stays, and a line says so | `67cdc046` |
+| T84-2 (Medium), two UART sections with interrupts off | The two UARTs take turns, one section of one UART per critical section; `make_room` pumps the full one; the module documentation says so | `67cdc046` |
+| T84-3 (Medium), two live UARTs never held through the console proofs | The proofs count every live UART and check every queue (`67cdc046`). A fourth machine, the SPCR alone in RAM, holds the console's proofs with both UARTs live, every failure but the four one unreadable entry causes, and the line checks on both UARTs; the RSDP-in-RAM machine fails on every marker but seven named ones and its verdict is held to a named list (`90aaf055`). Found doing it: one XSDT entry the kernel cannot read fails its census, AML, PCIe and IOMMU proofs (TASKS item 71's locator), a follow-up | `67cdc046`, `90aaf055` |
+| T84-4 (Medium), "nothing sent again" checked only by a sentence | COM1's and COM2's kernel lines are compared, each once and in order: to the take-over, or for the whole boot where both are kept | `90aaf055` |
+| T84-5 (Medium), no boot moves with a replay | The console scenario with an SPCR of 1,100 bytes: the loader names none, the kernel moves and replays, checked line by line. The line that drops a live loader's UART after such a move is not booted: no QEMU table pair makes the two readings name different I/O ports | `90aaf055` |
+| T84-6 (Medium), the loader reads MMIO, unaccepted memory and page 0 | `described` refuses all three | `f59e00a4` |
+| T84-7 (Medium), a soak that cannot fail | Reads bounded and counted, a literal port rule, refused reads required; it fails with the shared rule loosened to `port >= 0x40` (run by hand, the file restored from a copy) | `f59e00a4` |
+| T84-8 (Low), the walk past an SPCR it cannot check, null entries | It names none after an SPCR too long or unreadable, and passes over null entries | `f59e00a4` |
+| T84-9 (Low), a weaker give-up for the loader's UART | Its notice is waited for on COM1 and the screen; its line says it stopped; MOVED_UART is set first. The two bounded waits stay, and D3 now says so | `67cdc046`; this commit |
+| T84-10 (Low), COM1 named by the loader at another speed | Its speed is set at attach by the SPCR's rule; the move then changes nothing | `67cdc046` |
+| T84-11 (Low), records | A10-Am3 `emu`; the scenario counts; CL46's cost by path; provenance rows' dates and entries; ADR-0010's code row and the A10 rows' paths; D1's claim about rental B marked as inferred; the acceptance runs below | `f59e00a4`; this commit |
+| T84-12 (Low), a misplaced doc comment, a silent flag | `switch`'s comment back over it; `rsdp_in_ram` without `acpi_nvs` refused | `90aaf055` |
+| T84-13 (Low), a second header check | The loader runs `origin-acpi-tables`' check; `origin_spcr::check` is gone | `f59e00a4` |
+| T84-14 (Informational), D1 sound | The port is read from both lines and compared. D1's acceptance is the coordinating session's to record | `90aaf055` |
+| T84-15 (Informational), a 16 MiB XSDT in the loader | The loader walks at most 64 KiB | `f59e00a4` |
+
+**Acceptance (§8): the full gates on `20bfc398`, one turn, 2026-11-20, 13:30 to 14:02 UTC, inside `cargo xtask exclusive`, QEMU 11.1.3 TCG on the development Mac.**
+- `check` passed in 665 s: 2,525 host tests passed, 0 failed, 30 ignored; Loom 74 models, 112 controls caught.
+- `boot-test` passed, 11 of 11 scenarios, in 53 s.
+- `boot-matrix` passed in 1,157 s: `boot-console` 10 of 10 and `boot-rented`'s 4 machines among its boots.
+- The identifier scan of `466d138a..20bfc398`, every message and added line of the 10 commits, found only synthetic test values (RFC 5737 addresses, a made-up server ID, a locally administered MAC, a made-up GUID), public hosts and section numbers.
+- Not run: anything under KVM, until the branch is pushed; anything on a physical machine.

@@ -50,6 +50,9 @@ const KERNEL_LEAVES: &[&str] = &[
     // The AML interpreter, which the kernel's boot proof runs (ADR-0019 A3; TASKS item 63, step
     // B3; the review of B3, B3-3).
     "firmware/acpi/aml",
+    // Microsoft's SPCR, parsed by the loader and the kernel both (ADR-0010 Amendment 3; TASKS
+    // item 84).
+    "firmware/acpi/spcr",
     "runtime/abi",
     "runtime/version",
     "sdk/directory",
@@ -237,7 +240,9 @@ const LAYERS: &[(&str, &[&str])] = &[
     // The AML interpreter, which the kernel's boot proof runs (TASKS item 63, step B3). It checks
     // every table `Load`, `LoadTable` and `DataTableRegion` read with `origin-acpi-tables` (B4).
     ("origin-aml", &["origin-acpi-tables"]),
-    ("origin-boot-info", &["origin-version"]),
+    // The SPCR's parser (TASKS item 84): boot info's `EarlyUart::check` holds its port rule.
+    ("origin-spcr", &[]),
+    ("origin-boot-info", &["origin-spcr", "origin-version"]),
     ("origin-abi", &["origin-version"]),
     ("origin-sync", &[]),
     ("origin-crypto", &[]),
@@ -245,7 +250,10 @@ const LAYERS: &[(&str, &[&str])] = &[
     ("origin-syscalls", &[]),
     // The service directory's generated client and stub, which a boot proof uses.
     ("origin-directory", &[]),
-    ("origin-paging", &["origin-boot-info", "origin-version"]),
+    (
+        "origin-paging",
+        &["origin-boot-info", "origin-spcr", "origin-version"],
+    ),
     (
         "origin-frame",
         &[
@@ -255,6 +263,7 @@ const LAYERS: &[(&str, &[&str])] = &[
             "origin-crypto",
             "origin-paging",
             "origin-random",
+            "origin-spcr",
             "origin-sync",
             "origin-version",
         ],
@@ -271,6 +280,7 @@ const LAYERS: &[(&str, &[&str])] = &[
             "origin-paging",
             "origin-directory",
             "origin-random",
+            "origin-spcr",
             "origin-sync",
             "origin-syscalls",
             "origin-version",

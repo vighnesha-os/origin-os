@@ -31,8 +31,9 @@ use crate::process::UserContext;
 use crate::timer::{self, X2Apic};
 use origin_frame::objref::ObjectRef;
 use origin_frame::percpu::PerCpu;
-use origin_frame::stack::{FpuArea, GuardedStack, ThreadStart};
+use origin_frame::stack::{FpuArea, GuardedStack, StackSlot, State as SlotState, ThreadStart};
 use origin_frame::sync::SpinLock;
+use origin_frame::sync::exits::{Exits, Mark, Pending};
 use origin_frame::trap::Switch;
 
 /// Each kernel thread's stack.
@@ -121,26 +122,20 @@ fn switch_fpu(id: usize, old: usize, new: usize) {
     }
 }
 
-/// Prepares CPU `id` to resume the thread in `slot`: TSS.RSP0 points at its kernel stack, so
-/// an interrupt from user mode always lands on the running thread's own stack (the boot or
-/// idle flow, with no stack of its own, never runs in user mode), and the page tables are its
-/// process's (the kernel's for a kernel thread).
+/// Prepares CPU `id` to resume the thread in `slot`: the page tables are its process's (the
+/// kernel's for a kernel thread). The stack an interrupt or a system call from user mode lands on
+/// is not set here: the framework's trap entry names the incoming context's own stack from its
+/// home in the processor's table of contexts, whatever this scheduler answered (TASKS item 77).
 fn follow_thread(id: usize, slot: usize, switch: &Switch) {
     let Some(threads) = THREADS.get(id) else {
         return;
     };
     let t = threads.lock();
-    match t.stacks.get(slot).and_then(Option::as_ref) {
-        Some(stack) => cpu::set_kernel_stack(stack),
-        // Every thread but the boot or idle flow has a stack: a slot without one means a
-        // thread was made runnable before its state was written, which `spawn_with` rules
-        // out by writing it under the queue lock. Counted for the boot proof.
-        None if slot != 0 => {
-            UNREADY_SWITCHES.fetch_add(1, Ordering::Relaxed);
-        }
-        // The boot or idle flow has no stack of its own: no thread's stack is current here
-        // any more, and an exited thread's stack can be freed.
-        None => cpu::clear_kernel_stack(),
+    // Every thread but the boot or idle flow has a stack: a slot without one means a thread was
+    // made runnable before its state was written, which `spawn_with` rules out by writing it under
+    // the queue lock. Counted for the boot proof.
+    if slot != 0 && t.stacks.get(slot).and_then(Option::as_ref).is_none() {
+        UNREADY_SWITCHES.fetch_add(1, Ordering::Relaxed);
     }
     match t.user.get(slot).and_then(Option::as_ref) {
         Some(user) => {
@@ -174,6 +169,10 @@ pub(crate) struct Threads {
     fpu: [Option<FpuArea>; crate::runqueue::CAPACITY],
     /// What each slot's thread runs in (`None`: a kernel thread).
     user: [Option<ObjectRef<UserContext>>; crate::runqueue::CAPACITY],
+    /// Each slot's thread's count as ending, once it has counted itself ([`end_with`]): its exit
+    /// consumes the mark, so it lowers that count once, and only for a thread that raised it
+    /// (TASKS item 79; the review's T79-1).
+    ending: [Option<Mark<'static>>; crate::runqueue::CAPACITY],
 }
 
 impl Threads {
@@ -184,6 +183,7 @@ impl Threads {
             zombies: [const { None }; crate::runqueue::CAPACITY],
             fpu: [const { None }; crate::runqueue::CAPACITY],
             user: [const { None }; crate::runqueue::CAPACITY],
+            ending: [const { None }; crate::runqueue::CAPACITY],
         }
     }
 }
@@ -204,17 +204,57 @@ pub(crate) fn unready_switches() -> u64 {
     UNREADY_SWITCHES.load(Ordering::Relaxed)
 }
 
-/// Threads that exited on each processor and await [`reap`], so a processor can tell cheaply
-/// that it has none.
-pub(crate) static ZOMBIES: PerCpu<AtomicU64> =
-    PerCpu::new("framekernel::sched::ZOMBIES", AtomicU64::new(0), || {
-        AtomicU64::new(0)
-    });
+/// Each processor's ending threads and the zombies that await [`reap`] there
+/// (`origin_frame::sync::exits`, TASKS item 79): what [`settle`] waits on, and a cheap test that
+/// a processor has no zombie.
+pub(crate) static EXITS: PerCpu<Exits> =
+    PerCpu::new("framekernel::sched::EXITS", Exits::new(), Exits::new);
 
-/// Exited threads that await [`reap`] on any processor: for a proof that needs every stack
-/// given back before it counts them (`stacks`).
-pub(crate) fn zombies() -> u64 {
-    ZOMBIES.iter().map(|z| z.load(Ordering::Acquire)).sum()
+/// What every processor's exits still hold: threads whose end may have been seen that have not
+/// yet left their processor, then zombies not yet reaped, read in that order.
+fn exits_pending() -> Pending {
+    origin_frame::sync::exits::pending(|| EXITS.iter())
+}
+
+/// The running thread is ending: counts it as ending on this processor, once, then runs
+/// `publish`, which makes its end visible, and returns what `publish` returns (TASKS item 79).
+/// Called before anything about the end can be seen: by `Process::thread_ended` for a user thread
+/// and by [`finish`] for a kernel thread. Its exit lowers the count once the thread has left the
+/// processor as a zombie, so a [`settle`] that has seen the end waits until then. The boot or idle
+/// flow, which never exits, is not counted.
+///
+/// **What "seen" requires** (the review of TASKS item 79, T79-3): the settle is ordered after the
+/// count only through the end itself. So `publish` must make the end visible with a Release write
+/// (a Release store, an AcqRel read-modify-write, or a write under a lock it then releases), and a
+/// thread that waits for the end must read it with Acquire (or under that lock), and settle after
+/// that read, in the same thread. A Relaxed end or a Relaxed wait leaves the settle unordered with
+/// the count, which the hardware happens to order on x86-64 and the compiler need not.
+pub(crate) fn end_with<R>(publish: impl FnOnce() -> R) -> R {
+    let id = this_cpu();
+    let (Some(queue), Some(threads), Some(exits)) =
+        (QUEUES.get(id), THREADS.get(id), EXITS.get(id))
+    else {
+        return publish();
+    };
+    // The running thread's slot, if it has not counted itself already. No other thread can take
+    // the slot or its mark while this one runs, so the mark is stored after `publish`.
+    let slot = without_interrupts(|| {
+        let slot = queue.lock().current();
+        let counted = threads.lock().ending.get(slot).is_some_and(Option::is_some);
+        (slot != 0 && !counted).then_some(slot)
+    });
+    let Some(slot) = slot else {
+        return publish();
+    };
+    let (mark, published) = exits.end(publish);
+    without_interrupts(|| {
+        // Always there: the slot came from this queue. A mark not kept is not consumed, so its
+        // count stays raised, which every later settle names; it is never lowered early.
+        if let Some(entry) = threads.lock().ending.get_mut(slot) {
+            *entry = Some(mark);
+        }
+    });
+    published
 }
 
 /// Frees the stacks of threads that exited on **this** processor. Only this processor may
@@ -229,29 +269,36 @@ pub(crate) fn reap() -> usize {
     freed
 }
 
-/// Reclaims every retired kernel stack (`stack::reclaim`), and says where any was lost to a
-/// stalled shootdown ([`report_lost_stacks`]): every reclaim the scheduler makes goes through
+/// Reclaims every retired kernel stack it can (`stack::reclaim`), and says when a stack is given
+/// back after a stalled shootdown had withheld it ([`report_given_back`]) and when a shootdown
+/// stalls and withholds one ([`report_withheld`]): every reclaim the scheduler makes goes through
 /// here, `settle`'s own among them.
 fn reclaim_stacks() {
     let reclaimed = origin_frame::stack::reclaim();
-    if reclaimed.lost > 0 {
-        report_lost_stacks(reclaimed.lost);
+    if let Some(back) = reclaimed.given_back {
+        report_given_back(back);
+    }
+    if let Some(withheld) = reclaimed.stalled {
+        report_withheld(withheld);
     }
 }
 
-/// Says where kernel stacks were lost to a stalled shootdown, as it happens: which processor
-/// asked, which did not answer within the patience, how long it waited, and how many stalls the
-/// boot has had (TASKS item 66). A report, judged by nothing: the proofs that count the stacks
-/// judge the loss. It names processors and times only, never an address.
-fn report_lost_stacks(lost: u32) {
+/// Says when a kernel stack's shootdown stalls, as it happens: which processor asked, which did
+/// not answer within the patience, how long it waited, and how many stalls the boot has had
+/// (TASKS item 66). The stack is withheld, with its frames and slot, until a fresh shootdown
+/// completes on every processor (TASKS item 73). A report, judged by nothing: the settles and
+/// the proofs that count the stacks judge a stack still withheld when they read. It names
+/// processors, counts and times only, never an address.
+fn report_withheld(withheld: origin_frame::stack::Withheld) {
     let mut out = here_console();
     let millis = |ticks: u64| ticks / (crate::time::tsc_hz() / 1000).max(1);
     // Under the console's 160-byte line (the review's T66-R7). The stall named is the boot's
-    // last: another processor's stall can come between the loss and this line.
+    // last: another processor's stall can come between this one and this line.
+    let what = WithheldWords(withheld.asked_again);
     let _ = match origin_frame::tlb::last_stall() {
         Some(stall) => writeln!(
             out,
-            "origin-kernel: stalled shootdown: CPU {} waited {} ms for CPU {} (stall {} of this boot); {lost} kernel stacks withheld, with their frames",
+            "origin-kernel: stalled shootdown: CPU {} waited {} ms for CPU {} (stall {} of this boot); {what}",
             stall.asker,
             millis(stall.waited),
             stall.target,
@@ -259,9 +306,39 @@ fn report_lost_stacks(lost: u32) {
         ),
         None => writeln!(
             out,
-            "origin-kernel: stalled shootdown: {lost} kernel stacks withheld, with their frames"
+            "origin-kernel: stalled shootdown: CPU {} did not answer; {what}",
+            withheld.stall.cpu
         ),
     };
+}
+
+/// What [`report_withheld`] says of the stack: withheld after its first shootdown stalled, or
+/// still withheld after this many fresh ones.
+struct WithheldWords(u32);
+
+impl core::fmt::Display for WithheldWords {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            0 => f.write_str("a kernel stack withheld until every processor answers"),
+            n => write!(
+                f,
+                "a withheld kernel stack asked again {n} times, still withheld"
+            ),
+        }
+    }
+}
+
+/// Says when a kernel stack a stalled shootdown withheld is given back: a fresh shootdown of its
+/// pages completed on every processor. How many fresh shootdowns it took, and how long the stack
+/// was out of the tables before its frames went back (TASKS item 73). A report, judged by
+/// nothing.
+fn report_given_back(back: origin_frame::stack::GivenBack) {
+    let millis = back.ticks / (crate::time::tsc_hz() / 1000).max(1);
+    let _ = writeln!(
+        here_console(),
+        "origin-kernel: a kernel stack withheld by a stalled shootdown is given back: asked again {} times, {millis} ms after its unmap",
+        back.asked_again
+    );
 }
 
 /// A console for a line printed where the caller may be: the boot flow, which runs with
@@ -302,19 +379,115 @@ pub(crate) fn wait_for_others(
 pub(crate) use crate::settled::{Unsettled, not_settled};
 
 /// Settles the machine before a proof reads the whole machine's heap or free frames to compare
-/// them (TASKS item 67): every exited thread reaped on its own processor, every stack kept for
-/// reuse retired (`stack::trim`), and every retired stack reclaimed (`stack::reclaim`, one
-/// shootdown each, which waits for every processor). Each of those moves the counts on its own
-/// schedule: on the 65-processor machine the stacks that earlier proofs' threads left were still
-/// being reclaimed, one shootdown at a time, when the IPC proof took its first count, so the
-/// count rose during the proof; and a cache of kept stacks that refills during a proof lowers it.
+/// them (TASKS item 67): every thread whose end may have been seen gone from its processor and
+/// reaped there (TASKS item 79), every stack kept for reuse retired (`stack::trim`), and every
+/// retired stack reclaimed (`stack::reclaim`, one shootdown each, which waits for every
+/// processor). Each of those moves the counts on its own schedule: on the 65-processor machine the
+/// stacks that earlier proofs' threads left were still being reclaimed, one shootdown at a time,
+/// when the IPC proof took its first count, so the count rose during the proof; and a cache of
+/// kept stacks that refills during a proof lowers it.
+/// A thread's end is seen before it has given anything back: a user thread's process says it has
+/// ended, and a kernel thread raises its own done-flag, before the thread leaves its processor as
+/// a zombie. So waiting for zombies alone found none for a thread still in that stretch, and the
+/// count was read with its stack, FPU area and address space held (TASKS item 79: H1 when an
+/// earlier proof's thread was there at a proof's first count, H2 when its own was at its compare).
 /// Settled at both reads, the counts change only with what the proof does. Waits up to
 /// [`OTHERS_PATIENCE`] seconds for each part; `Err` names what was still pending, and any
-/// stack lost to a stalled shootdown while it ran (`settled`: safe by design, 4 frames each).
+/// stack lost while it ran (`settled`), and the processor a stack withheld by a stalled
+/// shootdown still waits for.
+///
+/// **Closed channels** (TASKS item 81). First, every closed channel's undelivered messages are
+/// freed: those still listed by this flow's own [`crate::ipc::reap_closed`], and those another
+/// processor took off the list by its own, for which it waits. A reap in a system call's epilogue
+/// on another processor could otherwise still be freeing what an ended process's messages held
+/// when a proof read its first count (the review of TASKS item 79, T79-6). It comes first because
+/// a drain can wake a thread that then ends, whose end the exits wait after it then sees; were it
+/// last, such an end would come after the exits wait and before the verdict, which would fail on
+/// what the settle itself did (the review of TASKS items 75, 77 and 81, R81-2).
+///
+/// **Passes** (the coordinating session's rulings on R81-2). The drain and its wait, the exits
+/// wait, the trim, the reclaim and the retired wait make one pass ([`settle_pass`]). After a pass
+/// that left a closed channel pending, or a thread ending or a zombie, or whose own drain freed a
+/// closed channel, the settle yields once and opens an interrupt window, so that a thread the
+/// drain woke gets the processor, and makes another pass; up to [`crate::settled::MAX_PASSES`] in
+/// all ([`crate::settled::again`]), then it judges. That also covers the reverse case: a thread
+/// that ends during the exits wait lists and reaps its own channels in its `end_with`, but if
+/// another processor had taken one of them first, that processor may still be freeing its
+/// messages once the closed wait has passed; the next pass waits for it. A settle that is still
+/// not settled after its last pass fails by name, as before.
+///
+/// Two limits. A thread a drain woke on another processor that has not ended by the next pass's
+/// look is an end no one has seen, which a settle never promised to wait for (TASKS item 79
+/// covers ends that were seen). And a drain in the third pass is followed by the verdict, with no
+/// pass after it.
+///
+/// **Reaping closed channels here** (the coordinating session's addition (e)). The wait's closure
+/// runs on the boot flow, which waits with interrupts off (an interrupt window between rounds),
+/// and holds no lock: `wait_for_others` takes none, and `reap_closed` takes the list's lock and
+/// each channel's message slot only to take from them, each with interrupts off, and drops the
+/// messages with neither held. Dropping them can close channel ends (each end's state, its charge
+/// list, the wait queues and port sources it wakes, and the list again), and free processes,
+/// their address spaces and memory objects. Each of those takes its own lock only around its own
+/// change, with interrupts off, and none waits for another processor: an address space's drop
+/// leaks a space a processor still has loaded rather than shoot it down
+/// (`origin_frame::userspace::UserSpace`'s `Drop`), and frees one no processor has loaded without
+/// a shootdown. So nothing the closure frees waits on a processor that waits on the boot flow, and
+/// a processor spinning on a lock the closure takes finds it released without help. Were a drop
+/// to start a TLB shootdown, the protocol would still not deadlock here: the boot flow holds no
+/// lock while it waits for answers, and a processor waiting for its turn to shoot serves the
+/// request in progress (`origin_sync::shootdown`, "How a request travels"). Only the boot flow
+/// settles, so no other processor is waiting in a settle meanwhile.
 pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
     let lost_before = origin_frame::stack::counts().lost;
+    let mut passes = 0;
+    loop {
+        let drained = settle_pass(tsc_hz);
+        passes += 1;
+        let pending = crate::ipc::closed_pending() != 0 || !exits_pending().none();
+        if !crate::settled::again(passes, pending, drained > 0) {
+            break;
+        }
+        // A thread the drain woke gets the processor before the next pass looks for its end.
+        yield_now();
+        cpu::interrupt_window();
+    }
+    let counts = origin_frame::stack::counts();
+    let exits = exits_pending();
+    crate::settled::judge(
+        exits.ending,
+        exits.zombies,
+        counts.retired,
+        origin_frame::stack::waiting().map(|stall| stall.cpu),
+        crate::ipc::closed_pending(),
+        lost_before,
+        counts.lost,
+    )
+}
+
+/// One pass of [`settle`]: closed channels drained and their reaps waited for (TASKS item 81),
+/// then ending threads and zombies, then the cache of kept stacks trimmed and every retired stack
+/// reclaimed and waited for. Each wait up to [`OTHERS_PATIENCE`] seconds. Returns how many closed
+/// channels this pass's own drain freed.
+fn settle_pass(tsc_hz: u64) -> usize {
     reap();
-    wait_for_others("exited threads' reaping", || zombies() == 0, tsc_hz, 2000);
+    // The reap runs on the boot flow, with interrupts off and no lock held between messages, as
+    // a proof's own `reap_closed` does; see `settle`'s "Reaping closed channels here".
+    let drained = core::cell::Cell::new(0);
+    wait_for_others(
+        "closed channels' reaping",
+        || {
+            drained.set(drained.get() + crate::ipc::reap_closed());
+            crate::ipc::closed_pending() == 0
+        },
+        tsc_hz,
+        2000,
+    );
+    wait_for_others(
+        "ending threads' exits and reaping",
+        || exits_pending().none(),
+        tsc_hz,
+        2000,
+    );
     origin_frame::stack::trim();
     reclaim_stacks();
     wait_for_others(
@@ -323,19 +496,15 @@ pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
         tsc_hz,
         2000,
     );
-    let counts = origin_frame::stack::counts();
-    crate::settled::judge(zombies(), counts.retired, lost_before, counts.lost)
+    drained.get()
 }
 
 /// [`reap`]'s own processor's exited threads.
 fn reap_zombies() -> usize {
-    let Some(threads) = THREADS.get(this_cpu()) else {
+    let (Some(threads), Some(exits)) = (THREADS.get(this_cpu()), EXITS.get(this_cpu())) else {
         return 0;
     };
-    if ZOMBIES
-        .get(this_cpu())
-        .is_some_and(|z| z.load(Ordering::Acquire) == 0)
-    {
+    if exits.zombies() == 0 {
         return 0;
     }
     let mut freed = 0;
@@ -344,22 +513,22 @@ fn reap_zombies() -> usize {
         let Some(Zombie { stack, fpu, user }) = next else {
             return freed;
         };
-        drop(fpu);
-        drop(stack);
-        if let Some(user) = user {
-            let process = user.process.clone();
-            // Possibly the last reference to the address space, which frees it: this processor
-            // left it when the thread exited, and no processor still runs in it.
-            drop(user);
-            // After the memory, so that whoever sees `TERMINATED` knows it has gone (P11).
-            process.thread_reaped();
-        }
-        // Lowered last: a `settle` that sees no zombie left then knows that everything this one
-        // held has been given back, its stack in the cache of kept stacks among it, before it
-        // trims that cache (the review of TASKS item 70, T70-7).
-        if let Some(z) = ZOMBIES.get(this_cpu()) {
-            z.fetch_sub(1, Ordering::AcqRel);
-        }
+        // The zombie is counted gone only after `release` has run: a `settle` that sees no zombie
+        // left then knows that everything this one held has been given back, its stack in the
+        // cache of kept stacks among it, before it trims that cache (the review of TASKS item 70,
+        // T70-7; `Exits::reap`).
+        exits.reap(|| {
+            drop(fpu);
+            drop(stack);
+            if let Some(user) = user {
+                let process = user.process.clone();
+                // Possibly the last reference to the address space, which frees it: this
+                // processor left it when the thread exited, and no processor still runs in it.
+                drop(user);
+                // After the memory, so that whoever sees `TERMINATED` knows it has gone (P11).
+                process.thread_reaped();
+            }
+        });
         freed += 1;
     }
 }
@@ -497,17 +666,34 @@ pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
             let stack = t.stacks.get_mut(slot).and_then(Option::take);
             let fpu = t.fpu.get_mut(slot).and_then(Option::take);
             let user = t.user.get_mut(slot).and_then(Option::take);
+            // Taken whatever happens below, so that the slot's next thread starts unmarked.
+            let mark = t.ending.get_mut(slot).and_then(Option::take);
             match (t.zombies.iter_mut().find(|z| z.is_none()), stack) {
                 (Some(free), Some(stack)) => {
                     *free = Some(Zombie { stack, fpu, user });
-                    if let Some(z) = ZOMBIES.get(id) {
-                        z.fetch_add(1, Ordering::AcqRel);
+                    // The zombie counts before the thread stops counting as ending, so that a
+                    // `settle` never finds it in neither (TASKS item 79; `Exits::queued`).
+                    // Every processor has its counts. A mark not consumed keeps its count raised:
+                    // never lowered early.
+                    if let Some(exits) = EXITS.get(id) {
+                        exits.queued(mark);
                     }
                 }
                 // No record of it can be kept. Its references are leaked deliberately: this
                 // processor is still in the process's address space, and dropping the last
-                // reference here would free the tables it is running on.
-                _ => core::mem::forget(user),
+                // reference here would free the tables it is running on. Its stack and FPU area
+                // go first (the stack is leaked, as the processor is still on it). Then nothing
+                // more it holds will be given back and it is leaving the processor, so a `settle`
+                // stops waiting for it: what it leaked is the compare's to find (TASKS item 79,
+                // case (a); the review's T79-4).
+                (_, stack) => {
+                    core::mem::forget(user);
+                    drop(stack);
+                    drop(fpu);
+                    if let Some(mark) = mark {
+                        mark.left();
+                    }
+                }
             }
         }
         Some(next)
@@ -527,8 +713,16 @@ pub(crate) fn sleep(ticks: u64) {
     cpu::thread_sleep(ticks);
 }
 
-/// Ends the running thread.
-pub(crate) fn exit() -> ! {
+/// Ends the running kernel thread: counts it as ending ([`end_with`]), runs `signal`, which is
+/// whatever tells other threads it has ended (a done-flag or a count), and exits. `signal` writes
+/// with Release (or as an AcqRel read-modify-write), and whoever waits for it reads with Acquire,
+/// as [`end_with`] requires. Every kernel
+/// thread ends here, so that a [`settle`] made by a thread that has seen `signal` waits until
+/// this one has left its processor and been reaped (TASKS item 79). There is no other way for a
+/// kernel thread to end: a done-flag raised before an exit that does not count it would let a
+/// settle pass while the thread still held its stack and FPU area.
+pub(crate) fn finish(signal: impl FnOnce()) -> ! {
+    end_with(signal);
     cpu::thread_exit()
 }
 
@@ -604,20 +798,45 @@ fn spawn_with(
     weight: u32,
     user: Option<ObjectRef<UserContext>>,
 ) -> Result<usize, QueueError> {
-    spawn_with_fpu(cpu, start, weight, user, FpuArea::new)
+    spawn_with_parts(
+        cpu,
+        start,
+        weight,
+        user,
+        FpuArea::new,
+        GuardedStack::publish_first_frame,
+    )
 }
 
-/// [`spawn_with`], with `fpu_area` the source of the thread's FPU area (the boot proof gives
-/// it one that has none). A thread is created whole or not at all: every way this fails
-/// gives back the stack, its guard page and the FPU area, through their `Drop`s.
-fn spawn_with_fpu(
+/// [`spawn_with`], with `fpu_area` the source of the thread's FPU area and `publish` what
+/// publishes its first frame to `cpu`'s table of contexts (the boot proof gives sources that
+/// refuse: an FPU area that is not there, and a publication refused as a full table refuses one).
+/// A thread is created whole or not at all: every way this fails gives back the stack, its guard
+/// page and the FPU area, through their `Drop`s, and leaves the run queue and the thread table as
+/// they were.
+///
+/// **The order** (TASKS item 75). The first frame is published before the thread is queued, so
+/// that no run queue ever names a frame its processor's table does not hold: the trap entry
+/// refuses such a frame with a panic. Nothing can pick a thread that is not queued, so the
+/// publication needs no lock. A refused publication returns at once, having touched neither the
+/// queue nor the thread table. A queue that then refuses the thread (it is full) has the
+/// publication withdrawn before the stack is dropped: otherwise the stack's home would still be in
+/// the table, and its drop would leak it. Every spawn holds a slot of the table between its
+/// publication and its push or withdrawal, with interrupts on, so the spawns in that stretch share
+/// the table's 15 slots to spare: more would have a publication refused, which fails that spawn
+/// safely, and would halt a processor whose boot or idle flow had not yet switched out. Today's
+/// boot reaches neither (`origin_sync::contexts`, "Capacity"; the review of TASKS items 75, 77
+/// and 81, R75-2).
+fn spawn_with_parts(
     cpu: CpuIndex,
     start: ThreadStart,
     weight: u32,
     user: Option<ObjectRef<UserContext>>,
     fpu_area: impl FnOnce() -> Option<FpuArea>,
+    publish: impl FnOnce(&mut GuardedStack, CpuIndex) -> bool,
 ) -> Result<usize, QueueError> {
     let queue = QUEUES.get(cpu.get()).ok_or(QueueError::Full)?;
+    let threads = THREADS.get(cpu.get()).ok_or(QueueError::Full)?;
     let mut stack = GuardedStack::new(THREAD_STACK).ok_or(QueueError::Full)?;
     let guard = stack.guard_addr();
     let frame_at = stack.build_first_frame(start).ok_or(QueueError::Full)?;
@@ -625,18 +844,17 @@ fn spawn_with_fpu(
     // (`switch_fpu` then has nothing to restore), which may be another process's data; it
     // is refused instead.
     let fpu_area = fpu_area().ok_or(QueueError::Full)?;
+    if !publish(&mut stack, cpu) {
+        return Err(QueueError::Full);
+    }
+    let mut parts = Some((stack, fpu_area, user));
     let spawned = without_interrupts(|| {
         // The queue lock is held until the thread's state is complete: the moment the slot
         // is Ready the target processor can pick it, and `follow_thread` needs the state.
         let mut queue = queue.lock();
-        let mut stack = stack;
         let slot = queue.push_weighted(frame_at, weight)?;
-        // Published before the slot can be picked: the lock is held until the thread is whole.
-        if !stack.publish_first_frame(cpu) {
-            return Err(QueueError::Full);
-        }
-        if let Some(threads) = THREADS.get(cpu.get()) {
-            let mut t = threads.lock();
+        let mut t = threads.lock();
+        if let Some((stack, fpu_area, user)) = parts.take() {
             if let Some(s) = t.stacks.get_mut(slot) {
                 *s = Some(stack);
             }
@@ -649,8 +867,17 @@ fn spawn_with_fpu(
         }
         Ok(slot)
     });
-    if spawned.is_ok() {
-        let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
+    match spawned {
+        Ok(_) => {
+            let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
+        }
+        // Never queued, so never resumed: the withdrawal finds the frame. Were it refused, the
+        // home would stay and the drop below would leak the stack, which is the safe failure.
+        Err(_) => {
+            if let Some((mut stack, _, _)) = parts {
+                let _ = stack.withdraw_first_frame();
+            }
+        }
     }
     spawned
 }
@@ -741,10 +968,11 @@ extern "sysv64" fn worker(arg: u64) -> ! {
         core::hint::spin_loop();
     }
     // Counted only for its own run.
-    let _ = EXITED.try_update(Ordering::AcqRel, Ordering::Acquire, |exited| {
-        (exited >> 32 == run).then_some(exited + 1)
-    });
-    exit()
+    finish(|| {
+        let _ = EXITED.try_update(Ordering::AcqRel, Ordering::Acquire, |exited| {
+            (exited >> 32 == run).then_some(exited + 1)
+        });
+    })
 }
 
 /// The last pinger to take a turn, and how often the turn changed hands.
@@ -765,8 +993,11 @@ extern "sysv64" fn pinger(me: u64) -> ! {
         }
         yield_now();
     }
-    FINISHED.fetch_add(1, Ordering::Relaxed);
-    exit()
+    // AcqRel, read with Acquire: a waiter that settles after seeing it is ordered after
+    // `finish`'s count of this thread as ending (TASKS item 79).
+    finish(|| {
+        FINISHED.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// Sleeps [`SLEEP_TICKS`] and records how long that took in ticks.
@@ -774,8 +1005,11 @@ extern "sysv64" fn sleeper(_: u64) -> ! {
     let before = queue_ticks();
     sleep(SLEEP_TICKS);
     SLEPT.store(queue_ticks() - before + 1, Ordering::Relaxed);
-    FINISHED.fetch_add(1, Ordering::Relaxed);
-    exit()
+    // AcqRel, read with Acquire: a waiter that settles after seeing it is ordered after
+    // `finish`'s count of this thread as ending (TASKS item 79).
+    finish(|| {
+        FINISHED.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// Tells the benchmark threads to exit.
@@ -788,14 +1022,17 @@ extern "sysv64" fn bencher(_: u64) -> ! {
     while !BENCH_STOP.load(Ordering::Relaxed) {
         yield_now();
     }
-    FINISHED.fetch_add(1, Ordering::Relaxed);
-    exit()
+    // AcqRel, read with Acquire: a waiter that settles after seeing it is ordered after
+    // `finish`'s count of this thread as ending (TASKS item 79).
+    finish(|| {
+        FINISHED.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// TSC cycles per context switch: the boot flow and two threads that only yield, so each
 /// boot-flow yield is three switches (boot → A → B → boot).
 fn measure_switch(bsp: CpuIndex) -> Option<u64> {
-    let before = FINISHED.load(Ordering::Relaxed);
+    let before = FINISHED.load(Ordering::Acquire);
     spawn(bsp, bencher, 0).ok()?;
     spawn(bsp, bencher, 1).ok()?;
     yield_now(); // let both start
@@ -805,7 +1042,7 @@ fn measure_switch(bsp: CpuIndex) -> Option<u64> {
     }
     let cycles = rdtsc().wrapping_sub(start);
     BENCH_STOP.store(true, Ordering::Relaxed);
-    while FINISHED.load(Ordering::Relaxed) < before + 2 {
+    while FINISHED.load(Ordering::Acquire) < before + 2 {
         yield_now();
     }
     reap();
@@ -814,8 +1051,11 @@ fn measure_switch(bsp: CpuIndex) -> Option<u64> {
 
 /// Exits at once.
 extern "sysv64" fn quitter(_: u64) -> ! {
-    FINISHED.fetch_add(1, Ordering::Relaxed);
-    exit()
+    // AcqRel, read with Acquire: a waiter that settles after seeing it is ordered after
+    // `finish`'s count of this thread as ending (TASKS item 79).
+    finish(|| {
+        FINISHED.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// How long, in seconds, a Refuse proof waits for what only a thread on another processor can
@@ -899,8 +1139,9 @@ extern "sysv64" fn simd_worker(index: u64) -> ! {
         }
         core::hint::spin_loop();
     }
-    SIMD_EXITED.fetch_add(1, Ordering::Relaxed);
-    exit()
+    finish(|| {
+        SIMD_EXITED.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// Proves that FPU/SIMD state is private to each thread across preemption: [`SIMD_WORKERS`]
@@ -923,7 +1164,7 @@ fn prove_simd(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     }
     SIMD_STOP.store(true, Ordering::Relaxed);
     yield_until(
-        || SIMD_EXITED.load(Ordering::Relaxed) == SIMD_WORKERS as u64,
+        || SIMD_EXITED.load(Ordering::Acquire) == SIMD_WORKERS as u64,
         tsc_hz,
         2,
     );
@@ -933,7 +1174,7 @@ fn prove_simd(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         .get(bsp.get())
         .map_or(0, |q| without_interrupts(|| q.lock().switches()));
     let ok =
-        SIMD_EXITED.load(Ordering::Relaxed) == SIMD_WORKERS as u64 && corrupt == 0 && iters > 0;
+        SIMD_EXITED.load(Ordering::Acquire) == SIMD_WORKERS as u64 && corrupt == 0 && iters > 0;
     let _ = writeln!(
         com1,
         "origin-kernel: scheduler: {SIMD_WORKERS} SIMD threads kept their XMM state across {switches} context switches: {iters} checks, {corrupt} corruptions{}",
@@ -977,8 +1218,9 @@ extern "sysv64" fn weighted_worker(index: u64) -> ! {
         }
         core::hint::spin_loop();
     }
-    WEIGHTED_EXITED.fetch_add(1, Ordering::Relaxed);
-    exit()
+    finish(|| {
+        WEIGHTED_EXITED.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// How long the workers of [`prove_weights`] share the processor, in seconds.
@@ -1026,10 +1268,10 @@ fn run_weighted(far: CpuIndex, tsc_hz: u64) -> Option<WeightedRun> {
     }
     let ticks = queue_ticks_of(far.get()).wrapping_sub(ticks_before);
     WEIGHTED_STOP.store(true, Ordering::Relaxed);
-    yield_until(|| WEIGHTED_EXITED.load(Ordering::Relaxed) == 3, tsc_hz, 2);
+    yield_until(|| WEIGHTED_EXITED.load(Ordering::Acquire) == 3, tsc_hz, 2);
     Some(WeightedRun {
         ran: core::array::from_fn(|i| WEIGHTED[i].load(Ordering::Relaxed)),
-        exited: WEIGHTED_EXITED.load(Ordering::Relaxed) == 3,
+        exited: WEIGHTED_EXITED.load(Ordering::Acquire) == 3,
         ticks,
     })
 }
@@ -1113,13 +1355,13 @@ fn prove_lifecycle(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         return false;
     }
     yield_until(
-        || FINISHED.load(Ordering::Relaxed) == 3 && live() == 1,
+        || FINISHED.load(Ordering::Acquire) == 3 && live() == 1,
         tsc_hz,
         3,
     );
     let reused = spawn(bsp, quitter, 0);
     yield_until(
-        || FINISHED.load(Ordering::Relaxed) == 4 && live() == 1,
+        || FINISHED.load(Ordering::Acquire) == 4 && live() == 1,
         tsc_hz,
         1,
     );
@@ -1147,10 +1389,12 @@ fn prove_lifecycle(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
 }
 
 /// A spawn that cannot be completed leaves nothing behind: refused for want of an FPU area
-/// (without one the thread would inherit another's SIMD registers), or because the queue
-/// is full, it hands back the stack, its guard page and the FPU area. The processor must
-/// hold only its boot context when this runs. (Anything a refusal leaks would also fail the
-/// final check in [`prove`], which holds the heap to the byte.)
+/// (without one the thread would inherit another's SIMD registers), because its first frame's
+/// publication is refused (as a full table of contexts refuses one), or because the queue is
+/// full, it hands back the stack, its guard page and the FPU area, queues nothing, and loses no
+/// stack (TASKS item 75: a publication the queue then refused is withdrawn, or its stack would be
+/// leaked). The processor must hold only its boot context when this runs. (Anything a refusal
+/// leaks would also fail the final check in [`prove`], which holds the heap to the byte.)
 fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let live = || {
         QUEUES
@@ -1158,21 +1402,47 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
             .map_or(0, |q| without_interrupts(|| q.lock().live()))
     };
     let in_use = || crate::memory::stats().map_or(0, |(h, _)| h.bytes_in_use);
-    let started = FINISHED.load(Ordering::Relaxed);
+    // A refused stack's own slot, read as soon as the spawn returns: a leak, which is what a
+    // publication left behind would cause, makes it `Lost` at once. Not the region's count of
+    // lost slots, which a stalled shootdown of any processor's reclaim also raises meanwhile
+    // (the review of TASKS items 75, 77 and 81, R75-1). Reused already by another spawn, it is
+    // `Live`: not leaked either.
+    let not_leaked = |slot: Option<StackSlot>| {
+        slot.is_some_and(|slot| origin_frame::stack::slot_state(slot) != Some(SlotState::Lost))
+    };
+    let started = FINISHED.load(Ordering::Acquire);
     let contexts = live();
     let before = in_use();
-    let no_area = spawn_with_fpu(
+    let quitting = || ThreadStart::Kernel {
+        entry: quitter,
+        arg: 0,
+    };
+    let no_area = spawn_with_parts(
         bsp,
-        ThreadStart::Kernel {
-            entry: quitter,
-            arg: 0,
-        },
+        quitting(),
         crate::runqueue::DEFAULT_WEIGHT,
         None,
         || None,
+        GuardedStack::publish_first_frame,
     );
     let no_area_clean =
         no_area == Err(QueueError::Full) && in_use() <= before && live() == contexts;
+    let unpublished_slot = core::cell::Cell::new(None);
+    let unpublished = spawn_with_parts(
+        bsp,
+        quitting(),
+        crate::runqueue::DEFAULT_WEIGHT,
+        None,
+        FpuArea::new,
+        |stack, _| {
+            unpublished_slot.set(Some(stack.slot()));
+            false
+        },
+    );
+    let unpublished_clean = unpublished == Err(QueueError::Full)
+        && not_leaked(unpublished_slot.get())
+        && in_use() <= before
+        && live() == contexts;
     let free = crate::runqueue::CAPACITY.saturating_sub(contexts);
     let mut filled = 0;
     for _ in 0..free {
@@ -1181,24 +1451,39 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         }
     }
     let full_use = in_use();
-    let full = spawn(bsp, quitter, 0);
-    let full_clean =
-        full == Err(QueueError::Full) && in_use() <= full_use && live() == contexts + free;
+    // Published, then refused by the full queue: withdrawn before its stack drops.
+    let full_slot = core::cell::Cell::new(None);
+    let full = spawn_with_parts(
+        bsp,
+        quitting(),
+        crate::runqueue::DEFAULT_WEIGHT,
+        None,
+        FpuArea::new,
+        |stack, cpu| {
+            full_slot.set(Some(stack.slot()));
+            stack.publish_first_frame(cpu)
+        },
+    );
+    let full_clean = full == Err(QueueError::Full)
+        && not_leaked(full_slot.get())
+        && in_use() <= full_use
+        && live() == contexts + free;
     let finished = started + filled as u64;
     yield_until(
-        || FINISHED.load(Ordering::Relaxed) == finished && live() == contexts,
+        || FINISHED.load(Ordering::Acquire) == finished && live() == contexts,
         tsc_hz,
         3,
     );
     reap();
     let ok = no_area_clean
+        && unpublished_clean
         && full_clean
         && filled == free
         && live() == contexts
-        && FINISHED.load(Ordering::Relaxed) == finished;
+        && FINISHED.load(Ordering::Acquire) == finished;
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: spawns refused for want of an FPU area ({no_area:?}) and on a full queue ({full:?}) give back the stack, its guard page and the FPU area{}",
+        "origin-kernel: scheduler: spawns refused for want of an FPU area ({no_area:?}), at their publication ({unpublished:?}) and on a full queue ({full:?}) give back the stack, its guard page and the FPU area, queue nothing and lose no stack{}",
         if ok { "" } else { ": scheduler failed" }
     );
     ok

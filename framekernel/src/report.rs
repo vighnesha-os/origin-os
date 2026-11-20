@@ -113,6 +113,7 @@ mod tests {
             flags: 1,
             framebuffer: origin_boot_info::Framebuffer::NONE,
             boot_seed: 0,
+            early_uart: origin_boot_info::EarlyUart::NONE,
         }
     }
 

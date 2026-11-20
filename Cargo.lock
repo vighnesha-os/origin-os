@@ -22,6 +22,7 @@ dependencies = [
  "origin-directory",
  "origin-frame",
  "origin-paging",
+ "origin-spcr",
  "origin-syscalls",
  "origin-version",
 ]
@@ -99,6 +100,7 @@ dependencies = [
 name = "origin-boot-info"
 version = "0.0.0"
 dependencies = [
+ "origin-spcr",
  "origin-version",
 ]
 
@@ -109,10 +111,12 @@ dependencies = [
  "onbf-format",
  "onbf-merkle",
  "onbf-verify",
+ "origin-acpi-tables",
  "origin-boot-info",
  "origin-crypto",
  "origin-paging",
  "origin-random",
+ "origin-spcr",
  "origin-version",
 ]
 
@@ -177,6 +181,13 @@ dependencies = [
 [[package]]
 name = "origin-rt-mem"
 version = "0.0.0"
+
+[[package]]
+name = "origin-spcr"
+version = "0.0.0"
+dependencies = [
+ "origin-acpi-tables",
+]
 
 [[package]]
 name = "origin-sync"

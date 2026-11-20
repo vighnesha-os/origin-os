@@ -24,7 +24,8 @@
 //! empty value is an unset one, for every variable; a value a variable does not take is refused,
 //! with the variable named and the values it takes, before anything is built or booted. And
 //! `boot-matrix` and its scenario commands, which set each machine themselves, refuse a person's
-//! topology, bridge, reserved-memory and ACPI machine ([`Settings::refuse_machine`], ruling R5).
+//! topology, bridge, reserved-memory and ACPI machine, RAM and table shapes
+//! ([`Settings::refuse_machine`], ruling R5; TASKS item 83).
 
 use std::collections::BTreeMap;
 use std::env;
@@ -54,6 +55,15 @@ const BRIDGE: &str = "ORIGIN_QEMU_BRIDGE";
 const RESERVED: &str = "ORIGIN_QEMU_RESERVED";
 /// `on` or `off`: the ACPI machine's NFIT, HMAT and generic initiator.
 const ACPI: &str = "ORIGIN_QEMU_ACPI";
+/// The machine's RAM: `512M` (the default), a larger even number of MiB (`1024M`), or a whole
+/// number of GiB from 1 to 64 (`8G`). TASKS item 83.
+const MEMORY: &str = "ORIGIN_QEMU_MEMORY";
+/// `on`, `refused`, `spcr-refused` or `off`: the firmware tables shaped as rental B's board has
+/// them, by the TEST ONLY application, with the console's UART at `0x2F8` (TASKS item 83);
+/// `refused` also puts the RSDP's copy in RAM the kernel owns, so the loader reads the SPCR and
+/// the kernel's own reading is refused (TASKS item 84); `spcr-refused` puts the SPCR alone there
+/// (its review, T84-3). See [`Shape`].
+const SHAPE: &str = "ORIGIN_QEMU_SHAPE";
 /// On if set and not empty: QEMU logs interrupts and resets.
 const DEBUG: &str = "ORIGIN_QEMU_DEBUG";
 /// A boot's timeout in whole seconds.
@@ -70,7 +80,7 @@ const OVMF_VARS: &str = "ORIGIN_OVMF_VARS";
 const GITHUB_ACTIONS: &str = "GITHUB_ACTIONS";
 
 /// Every variable [`Settings::from_env`] reads.
-const VARIABLES: [&str; 17] = [
+const VARIABLES: [&str; 19] = [
     ACCEL,
     IOMMU,
     SMP,
@@ -81,6 +91,8 @@ const VARIABLES: [&str; 17] = [
     BRIDGE,
     RESERVED,
     ACPI,
+    MEMORY,
+    SHAPE,
     DEBUG,
     TIMEOUT,
     ONLY,
@@ -103,6 +115,48 @@ pub(crate) enum Topology {
     Many,
     /// The discovery machine: 2 processors of the 4096 the MADT lists.
     Listed,
+}
+
+/// A machine's RAM, in MiB (TASKS item 83): at least 512, and even, so its two NUMA nodes each
+/// hold a whole number of MiB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Memory(u32);
+
+/// 512 MiB: every machine's before TASKS item 83.
+impl Default for Memory {
+    fn default() -> Memory {
+        Memory(512)
+    }
+}
+
+impl Memory {
+    /// `gib` GiB.
+    pub(crate) fn gib(gib: u32) -> Memory {
+        Memory(gib * 1024)
+    }
+
+    /// Its size in MiB.
+    pub(crate) fn mib(self) -> u32 {
+        self.0
+    }
+
+    /// The size QEMU's `-m` takes: whole GiB as `G`, else MiB as `M`.
+    pub(crate) fn qemu(self) -> String {
+        Memory::size(self.0)
+    }
+
+    /// One of the two NUMA nodes' memory backends, half of it, as QEMU takes a size.
+    pub(crate) fn node(self) -> String {
+        Memory::size(self.0 / 2)
+    }
+
+    fn size(mib: u32) -> String {
+        if mib.is_multiple_of(1024) {
+            format!("{}G", mib / 1024)
+        } else {
+            format!("{mib}M")
+        }
+    }
 }
 
 /// One boot's settings: what QEMU emulates, how it runs, which firmware it boots, which of
@@ -129,6 +183,10 @@ pub(crate) struct Settings {
     pub(crate) reserved: bool,
     /// The ACPI machine's tables ([`ACPI`], `boot-acpi`).
     pub(crate) acpi: bool,
+    /// The machine's RAM ([`MEMORY`]; `boot-large`, `boot-rented`).
+    pub(crate) memory: Memory,
+    /// The firmware tables shaped as rental B's board has them ([`SHAPE`], `boot-rented`).
+    pub(crate) shape: Shape,
     /// QEMU's log of interrupts and resets ([`DEBUG`]).
     pub(crate) debug: bool,
     /// A boot's timeout set by the person or by `boot-matrix` ([`TIMEOUT`]); `None` for
@@ -157,6 +215,8 @@ impl Default for Settings {
             bridge: false,
             reserved: false,
             acpi: false,
+            memory: Memory::default(),
+            shape: Shape::Off,
             debug: false,
             timeout: None,
             only: String::new(),
@@ -195,7 +255,7 @@ impl Settings {
         // Empty is unset, for every variable.
         let set = |name: &str| vars.get(name).map(String::as_str).filter(|v| !v.is_empty());
         let defaults = Settings::default();
-        Ok(Settings {
+        let settings = Settings {
             accel: accel(set(ACCEL))?,
             iommu: iommu(set(IOMMU))?,
             topology: topology(set(TOPOLOGY), set(SMP))?,
@@ -208,6 +268,11 @@ impl Settings {
             bridge: switch(BRIDGE, set(BRIDGE))?,
             reserved: switch(RESERVED, set(RESERVED))?,
             acpi: switch(ACPI, set(ACPI))?,
+            memory: match set(MEMORY) {
+                None => Memory::default(),
+                Some(v) => memory(v)?,
+            },
+            shape: shape(set(SHAPE))?,
             debug: set(DEBUG).is_some(),
             timeout: set(TIMEOUT)
                 .map(|v| {
@@ -228,7 +293,22 @@ impl Settings {
             },
             any_count: switch(ANY_COUNT, set(ANY_COUNT))?,
             github_actions: set(GITHUB_ACTIONS) == Some("true"),
-        })
+        };
+        // The rented board's machine has a whole-boot check of its own, which would replace the
+        // reserved-memory machine's and is dropped by the machine without a generator: those
+        // combinations are refused, not booted with less checked (the review's T83-9).
+        let shaped = settings.shape.name();
+        if settings.shape.is_on() && settings.reserved {
+            return Err(format!(
+                "{SHAPE}={shaped} and {RESERVED}=on are not booted together: each machine's whole-boot check would replace the other's"
+            ));
+        }
+        if settings.shape.is_on() && settings.cpu_lacks("rdseed") && settings.cpu_lacks("rdrand") {
+            return Err(format!(
+                "{SHAPE}={shaped} is not booted on a processor with neither RDSEED nor RDRAND: that machine's markers drop the rented board's whole-boot check"
+            ));
+        }
+        Ok(settings)
     }
 
     /// Whether `boot-matrix` runs the machines of ADR-0008 Amendment 1, D7: always on a
@@ -238,6 +318,18 @@ impl Settings {
     /// has accepted it.
     pub(crate) fn runs_any_count_machines(&self) -> bool {
         !self.github_actions || self.any_count
+    }
+
+    /// The size of `boot-large`'s and `boot-rented`'s machines (TASKS item 83; the coordinating
+    /// session's ruling Q1 of 2026-11-20): [`FULL_MEMORY_GIB`] on a developer's machine, 8 GiB in CI
+    /// (GitHub Actions), where the runners have far less, as the any-count machines are kept
+    /// ([`Settings::runs_any_count_machines`]).
+    pub(crate) fn large_memory(&self) -> Memory {
+        if self.github_actions {
+            Memory::gib(8)
+        } else {
+            Memory::gib(FULL_MEMORY_GIB)
+        }
     }
 
     /// Refuses the person's machine for `command`, one of `boot-matrix` and its scenario
@@ -261,11 +353,17 @@ impl Settings {
                 set.push(format!("{name}=on"));
             }
         }
+        if self.shape.is_on() {
+            set.push(format!("{SHAPE}={}", self.shape.name()));
+        }
+        if self.memory != Memory::default() {
+            set.push(format!("{MEMORY}={}", self.memory.qemu()));
+        }
         if set.is_empty() {
             return Ok(());
         }
         Err(format!(
-            "{command} sets each machine's topology, bridge, reserved memory and ACPI tables itself, so {} is refused here; boot-test, boot-console and run take it",
+            "{command} sets each machine's topology, bridge, reserved memory, ACPI tables, RAM and table shapes itself, so {} is refused here; boot-test, boot-console and run take it",
             set.join(" and ")
         ))
     }
@@ -382,6 +480,82 @@ fn at_least(name: &str, value: &str, least: u32, what: &str) -> Result<u32> {
         .ok_or_else(|| {
             format!("{name} must be a whole number of {what}, {least} or more, not {value:?}")
         })
+}
+
+/// The full size of `boot-large`'s and `boot-rented`'s machines on a developer's machine, in GiB
+/// (TASKS item 83): settled by the trial the coordinating session's ruling asked for.
+const FULL_MEMORY_GIB: u32 = 64;
+
+/// The RAM a set value of [`MEMORY`] names.
+fn memory(value: &str) -> Result<Memory> {
+    // Digits only before the unit: no sign, no space, and a value ending in any other character,
+    // multi-byte ones included, is refused, never split (the review's T83-10).
+    let digits = |n: &str| {
+        (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| n.parse::<u32>().ok())
+            .flatten()
+    };
+    if let Some(n) = value.strip_suffix('G').and_then(digits)
+        && (1..=64).contains(&n)
+    {
+        return Ok(Memory::gib(n));
+    }
+    if let Some(n) = value.strip_suffix('M').and_then(digits)
+        && n >= 512
+        && n.is_multiple_of(2)
+        && n <= 64 * 1024
+    {
+        return Ok(Memory(n));
+    }
+    Err(format!(
+        "{MEMORY} must be 512M or more MiB, even (1024M), or 1G to 64G, not {value:?}"
+    ))
+}
+
+/// The firmware tables' shape on the rented board's machines ([`SHAPE`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Shape {
+    /// Unshaped: every machine but `boot-rented`'s.
+    #[default]
+    Off,
+    /// As rental B's board has them (TASKS item 83).
+    Rented,
+    /// As [`Shape::Rented`], with the RSDP's copy in RAM the kernel owns: the loader reads the
+    /// SPCR under boot services, and the kernel's own reading is refused (TASKS item 84).
+    KernelRefused,
+    /// QEMU's tables unshaped but for the SPCR, copied into RAM the kernel owns: the kernel
+    /// refuses that one table, so both UARTs stay live for the whole boot, and reads every
+    /// other, so the whole boot's checks hold (TASKS item 84's review, T84-3).
+    SpcrRefused,
+}
+
+impl Shape {
+    /// Whether the tables are shaped at all.
+    pub(crate) fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Its value of [`SHAPE`].
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Rented => "on",
+            Self::KernelRefused => "refused",
+            Self::SpcrRefused => "spcr-refused",
+        }
+    }
+}
+
+fn shape(value: Option<&str>) -> Result<Shape> {
+    match value {
+        None | Some("off") => Ok(Shape::Off),
+        Some("on") => Ok(Shape::Rented),
+        Some("refused") => Ok(Shape::KernelRefused),
+        Some("spcr-refused") => Ok(Shape::SpcrRefused),
+        Some(other) => Err(format!(
+            "{SHAPE} must be on, refused, spcr-refused or off, not {other:?}"
+        )),
+    }
 }
 
 /// A switch: `on`, or `off` (or unset).

@@ -50,8 +50,9 @@ extern "sysv64" fn toucher(_: u64) -> ! {
             }
         }
     }
-    PROBED.fetch_add(1, Ordering::AcqRel);
-    crate::sched::exit()
+    crate::sched::finish(|| {
+        PROBED.fetch_add(1, Ordering::AcqRel);
+    })
 }
 
 /// Proves cross-processor invalidation and global pages:

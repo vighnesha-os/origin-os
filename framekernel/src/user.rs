@@ -199,6 +199,9 @@ fn copies(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
 /// thread's interrupt frames would land on the other's kernel stack).
 fn concurrent(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let started = crate::cpu::rdtsc();
+    // The trap entry checks that every entry from ring 3 landed on the running context's own
+    // stack, and halts if not (TASKS item 77): the count shows the check ran here.
+    let landed = crate::cpu::landings_checked();
     let top = STACK + PAGE;
     let (Some(a), Some(b)) = (start(&spinner(1, top), bsp), start(&spinner(2, top), bsp)) else {
         return false;
@@ -210,12 +213,14 @@ fn concurrent(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         .filter_map(|p| last_report(p))
         .filter(|&v| v < 64)
         .fold(0u64, |m, v| m | (1 << v));
+    let checked = crate::cpu::landings_checked().wrapping_sub(landed);
     let right = mask == 0b110
         && a.ending() == Some(Ending::Exited(0))
-        && b.ending() == Some(Ending::Exited(0));
+        && b.ending() == Some(Ending::Exited(0))
+        && checked > 0;
     let _ = writeln!(
         com1,
-        "origin-kernel: user mode: two compute-bound user processes at once finished in {ms} ms, reports {mask:#b}; kernel stack follows every switch{}",
+        "origin-kernel: user mode: two compute-bound user processes at once finished in {ms} ms, reports {mask:#b}; kernel stack follows every switch, {checked} entries from ring 3 checked to land on their own{}",
         if right { "" } else { ": user isolation failed" }
     );
     right

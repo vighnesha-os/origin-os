@@ -88,7 +88,7 @@ fn rdrand64() -> Option<u64> {
 }
 
 /// The time-stamp counter: one of the things that tell this boot's first seed from another's.
-fn rdtsc() -> u64 {
+pub(crate) fn rdtsc() -> u64 {
     let (low, high): (u32, u32);
     // SAFETY: RDTSC reads no memory and writes EAX and EDX only; the loader runs at CPL 0,
     // where it is always allowed.

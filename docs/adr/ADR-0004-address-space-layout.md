@@ -64,6 +64,14 @@ Kernel mappings are global (CR4.PGE); user address spaces use PCIDs where availa
 | A2 | **Kernel thread stacks move to `0xFFFF_C000_0000_0000` …,** each with an unmapped guard page below it in virtual space. A guard then costs no frame and splits no page of the direct map. Until task H2-stacks each guard was a direct-map page unmapped, which cost a frame and split a 2 MiB page into 4 KiB pages. The TLB proof's three pages use the region too while that proof runs, so after boot nothing cuts a page out of the direct map. |
 | A3 | **PML4 slot 480 (`0xFFFF_F000_0000_0000`) holds one page and nothing else:** the kernel-half proof's probe page. It is read-only, never executable and not global (S3-5a review finding 4), and mapped only while that proof runs. |
 
+*Note on A2 (TASKS item 73 and decision item 316, 2026-11-20; not an amendment).* A retired stack's slot and frames are given back only once a shootdown naming its pages, sent after they were unmapped, has completed on every processor. Until TASKS item 73 a reclaim whose shootdown stalled, a processor not answering within the shootdown's 1 s patience, withheld the slot and its frames for good, counted `lost`.
+- **Now the stack waits**, with its frames, outside the tables. A later reclaim checks whether that processor has served a request since (`Shootdown::answered`, never taken as proof that the pages were dropped), then sends a fresh shootdown, and gives the stack back only if that completes.
+- **One reclaim at a time.** Reclaims are served one at a time, at most one stack waits, and nothing is unmapped while one waits.
+- **A processor that never answers** keeps that stack waiting and the retired stacks after it mapped. Once the slots run out, new stacks are refused, and with them thread starts.
+- **What `lost` counts now:** only a stack its drop could not give back because a processor's records still held it.
+
+With this change ADR-0013 Amendment 3 ended (item 316). ADR-0013's "Evidence" has the controls.
+
 ## Amendment 2 (Accepted, 2026-11-10): a slide for the stack region
 
 **Status: Accepted by the owner on 2026-11-10 ("Accept all", decision sheet item 144). Built by the stack-slide task, 2026-11-11 (A4–A6, as notes A6.1–A6.4 settle it); proven under QEMU only. The note on A4 and A5 (item 166, 2026-11-11) changes where the random value comes from; it is accepted, and built in this batch since task 18b was merged into it on 2026-11-11 (`c2245ef`); proven under QEMU only.** Task H2-stacks (Amendment 1, A2) puts the kernel stacks at the fixed address `0xFFFF_C000_0000_0000` and takes the lowest free slot first, so a kernel stack's address is predictable, while the kernel image and the direct map are slid (H3). Its author asked rather than built, and recommended this answer. CLAUDE.md §58 requires ASLR.

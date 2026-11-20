@@ -1339,10 +1339,11 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
         }
     }
     let cycles = crate::cpu::rdtsc().wrapping_sub(start);
-    for (slot, v) in IRQ_RESULT.iter().zip([reads, matched, cycles]) {
-        slot.store(v + 1, Ordering::Release);
-    }
-    crate::sched::exit()
+    crate::sched::finish(|| {
+        for (slot, v) in IRQ_RESULT.iter().zip([reads, matched, cycles]) {
+            slot.store(v + 1, Ordering::Release);
+        }
+    })
 }
 
 /// Proves interrupt-driven completions: MSI-X set up for a second I/O queue, then a thread
@@ -1967,12 +1968,13 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
             &mut page,
         )
         && page.get(..512) == Some(&expected[..]);
-    if let Some(r) = result {
-        for (slot, v) in r.iter().zip([reads, matched, u64::from(back)]) {
-            slot.store(v + 1, Ordering::Release);
+    crate::sched::finish(|| {
+        if let Some(r) = result {
+            for (slot, v) in r.iter().zip([reads, matched, u64::from(back)]) {
+                slot.store(v + 1, Ordering::Release);
+            }
         }
-    }
-    crate::sched::exit()
+    })
 }
 
 /// Every processor given a queue pair and vector of its own reads and writes through them at the
