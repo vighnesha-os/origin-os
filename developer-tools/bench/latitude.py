@@ -10,8 +10,10 @@ Money is guarded these ways, because a forgotten server bills every hour:
   and the total, for each purchase; it never stands in for it. Without it, a command says what it
   would buy and stops.
 - A spend cap (`--cap-usd`, default 10, decision item 225) covers every rental in the local
-  ledger, each counted at its worst case: whole hours, from deployment to confirmed deletion, or
-  to the later of its deadline and now, plus a margin for deletion's own delay.
+  ledger, each counted at its worst case: every clock hour (UTC) it touches, from deployment to
+  confirmed deletion, or to the later of its deadline and now, plus a margin for deletion's own
+  delay. Latitude's documentation does not say how an hour is metered; rental A, 9 minutes
+  inside one clock hour, was billed one hour. Counting clock hours covers both readings.
 - The request that creates a server is never retried. If it fails or its reply cannot be read,
   every bench server is listed for a few minutes, recorded and deleted.
 - Every rental has a deadline (`--max-minutes`, at most 120). A separate watchdog process, kept
@@ -261,15 +263,26 @@ def ledger_for_update():
         tmp.replace(LEDGER)
 
 
+def clock_hours(start, end):
+    """The clock hours (UTC) a rental from `start` to `end` touches, at least one. It is never
+    fewer than the whole hours elapsed, so it bounds a bill metered either way."""
+    return max(1, math.ceil(end / 3600) - math.floor(start / 3600))
+
+
 def worst_case(rental):
-    """Whole hours from deployment to confirmed deletion; for a server not confirmed deleted, to
-    the later of its deadline and now, plus the margin deletion itself may take."""
+    """Every clock hour from deployment to confirmed deletion; for a server not confirmed
+    deleted, to the later of its deadline and now, plus the margin deletion itself may take."""
     if rental.get("deleted_at"):
         end = rental["deleted_at"]
     else:
         end = max(rental["deadline"], now()) + MARGIN_MINUTES * 60
-    hours = max(1, math.ceil((end - rental["deployed_at"]) / 3600))
-    return hours * rental["usd_per_hour"]
+    return clock_hours(rental["deployed_at"], end) * rental["usd_per_hour"]
+
+
+def planned_worst_case(max_minutes, usd_per_hour):
+    """A rental not yet bought: it may start at any minute, so its window, with the margin, can
+    touch one clock hour more than its length."""
+    return (math.ceil((max_minutes + MARGIN_MINUTES) / 60) + 1) * usd_per_hour
 
 
 def add_rental(rental):
@@ -575,7 +588,7 @@ def rent(args, kind, work, check=None):
         die(f"{args.plan} is not in stock{' at ' + args.site if args.site else ''}")
     hour, site, instant = found[0]
     spent = sum(worst_case(r) for r in ledger()["rentals"])
-    this = math.ceil((args.max_minutes + MARGIN_MINUTES) / 60) * hour
+    this = planned_worst_case(args.max_minutes, hour)
     print(f"would rent {args.plan} ({PLANS[args.plan]}) at {site}, ${hour:.2f}/h, hourly billing, "
           f"{'instant deploy' if instant else 'standard deploy'}; deleted within {args.max_minutes} "
           f"minutes; worst case ${this:.2f}; ledger so far ${spent:.2f}; cap ${args.cap_usd:.2f}")

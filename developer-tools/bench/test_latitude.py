@@ -63,14 +63,36 @@ class Guards(unittest.TestCase):
             self.assertEqual(calls, ["GET"] * 3)
 
     def test_worst_case_counts_a_server_past_its_deadline(self):
-        t0 = 1_000_000.0
-        rental = {"server_id": "sv", "usd_per_hour": 0.41, "deployed_at": t0, "deadline": t0 + 3000}
+        t0 = 1_000_800.0  # on the hour (UTC), so the hours below are clock hours
+        rental = {"server_id": "sv", "usd_per_hour": 0.81, "deployed_at": t0, "deadline": t0 + 3000}
         with mock.patch.object(self.lat, "now", return_value=t0 + 600):
-            self.assertAlmostEqual(self.lat.worst_case(rental), 0.41)  # 50 + 10 minutes: 1 hour
+            self.assertAlmostEqual(self.lat.worst_case(rental), 0.81)  # 50 + 10 minutes: 1 hour
         with mock.patch.object(self.lat, "now", return_value=t0 + 3 * 3600):
-            self.assertAlmostEqual(self.lat.worst_case(rental), 4 * 0.41)  # 3 h + margin: 4 hours
+            self.assertAlmostEqual(self.lat.worst_case(rental), 4 * 0.81)  # 3 h + margin: 4 hours
         rental["deleted_at"] = t0 + 1200
-        self.assertAlmostEqual(self.lat.worst_case(rental), 0.41)
+        self.assertAlmostEqual(self.lat.worst_case(rental), 0.81)
+
+    def test_worst_case_counts_clock_hours(self):
+        # Rental A from the ledger: 00:43:20 to 00:52:31 UTC on 2026-11-12, billed one hour.
+        a = {"usd_per_hour": 0.81, "deployed_at": 1794444200.667721, "deleted_at": 1794444751.686839}
+        self.assertAlmostEqual(self.lat.worst_case(a), 0.81)
+        # 25 minutes across an hour's turn touches two clock hours: two, if Latitude meters so.
+        b = {"usd_per_hour": 0.81, "deployed_at": 1794444200.0, "deleted_at": 1794444200.0 + 1500}
+        self.assertAlmostEqual(self.lat.worst_case(b), 2 * 0.81)
+        # Never fewer than the whole hours elapsed.
+        for start in range(0, 7200, 97):
+            for length in (1, 600, 3599, 3600, 3601, 7300):
+                elapsed = max(1, -(-length // 3600))
+                self.assertGreaterEqual(self.lat.clock_hours(start, start + length), elapsed)
+
+    def test_planned_worst_case_allows_one_more_clock_hour(self):
+        # Rental B's default: 50 minutes and the 10-minute margin may span two clock hours.
+        self.assertAlmostEqual(self.lat.planned_worst_case(50, 0.81), 2 * 0.81)
+        self.assertAlmostEqual(self.lat.planned_worst_case(120, 0.81), 4 * 0.81)
+        for start in range(0, 3600, 60):
+            window = (50 + self.lat.MARGIN_MINUTES) * 60
+            self.assertLessEqual(self.lat.clock_hours(start, start + window) * 0.81,
+                                 self.lat.planned_worst_case(50, 0.81) + 1e-9)
 
     def test_unconfirmed_deletion_is_not_recorded(self):
         self.lat.add_rental({"server_id": "sv", "usd_per_hour": 0.41, "deployed_at": 1.0, "deadline": 2.0})
