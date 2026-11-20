@@ -1113,8 +1113,8 @@ const CONTROLS: &[Control] = &[
         // TASKS item 73, Q2: two reclaims at once.
         name: "the_reclaim_role_never_refused",
         file: SLOTS,
-        from: "        flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)\n            .ok()\n            .map(|_| Self(flag))\n",
-        to: "        let _ = flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed);\n        Some(Self(flag))\n",
+        from: "        if self.reclaiming.load(Ordering::Relaxed) {\n            return None;\n        }\n        #[cfg(all(test, not(loom)))]\n        self.role_tries.fetch_add(1, Ordering::Relaxed);\n        self.reclaiming\n            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)\n            .ok()\n            .map(|_| Role(&self.reclaiming))\n",
+        to: "        let _ = self.reclaiming.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed);\n        Some(Role(&self.reclaiming))\n",
         models: &[
             ("slots_two_reclaimers_and_a_waiting_slot", NEVER_GIVEN_BACK),
             ("slots_at_most_one_slot_out_of_the_tables", TWO_OUT),

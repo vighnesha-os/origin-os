@@ -192,6 +192,10 @@ pub struct Slots<const N: usize, const IDLE: usize, K> {
     pending: prim::AtomicUsize,
     /// Whether a reclaim is under way ([`Role`]).
     reclaiming: prim::AtomicBool,
+    /// The compare-and-swaps tried on `reclaiming`, counted in this crate's host tests only: for
+    /// the test that a reclaim that reads the role held tries none.
+    #[cfg(all(test, not(loom)))]
+    role_tries: core::sync::atomic::AtomicUsize,
 }
 
 impl<const N: usize, const IDLE: usize, K> core::fmt::Debug for Slots<N, IDLE, K> {
@@ -201,17 +205,9 @@ impl<const N: usize, const IDLE: usize, K> core::fmt::Debug for Slots<N, IDLE, K
 }
 
 /// The one reclaim under way: taken with a compare-and-swap that a second reclaim fails rather
-/// than waits on, and given up when dropped, so every way out of [`Slots::reclaim`], an early
-/// return included, gives it up.
+/// than waits on ([`Slots::role`]), and given up when dropped, so every way out of
+/// [`Slots::reclaim`], an early return included, gives it up.
 struct Role<'a>(&'a prim::AtomicBool);
-
-impl<'a> Role<'a> {
-    fn take(flag: &'a prim::AtomicBool) -> Option<Self> {
-        flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| Self(flag))
-    }
-}
 
 impl Drop for Role<'_> {
     fn drop(&mut self) {
@@ -361,6 +357,8 @@ impl<const N: usize, const IDLE: usize, K> Slots<N, IDLE, K> {
             table: SpinLock::new(Table::new()),
             pending: prim::AtomicUsize::new(0),
             reclaiming: prim::AtomicBool::new(false),
+            #[cfg(all(test, not(loom)))]
+            role_tries: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -372,6 +370,24 @@ impl<const N: usize, const IDLE: usize, K> Slots<N, IDLE, K> {
             pending: prim::AtomicUsize::new(0),
             reclaiming: prim::AtomicBool::new(false),
         }
+    }
+
+    /// The reclaim role ([`Role`]), if no reclaim holds it. The flag is read first, and the
+    /// compare-and-swap tried only if it reads free: while one reclaim works through a burst of
+    /// retired stacks, every idle processor asks in its reap (TASKS item 73's diagnostic round:
+    /// 30 000 to 80 000 refusals a boot on 65 processors), and a plain load keeps them off the
+    /// flag's cache line, which a compare-and-swap takes exclusive even when it fails. The
+    /// compare-and-swap still decides: a reclaim that reads the flag free may lose it.
+    fn role(&self) -> Option<Role<'_>> {
+        if self.reclaiming.load(Ordering::Relaxed) {
+            return None;
+        }
+        #[cfg(all(test, not(loom)))]
+        self.role_tries.fetch_add(1, Ordering::Relaxed);
+        self.reclaiming
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Role(&self.reclaiming))
     }
 
     /// Publishes what a reclaim has to do. Called under the lock, after each change to it.
@@ -505,7 +521,7 @@ impl<const N: usize, const IDLE: usize, K> Slots<N, IDLE, K> {
         if self.pending.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        let Some(_role) = Role::take(&self.reclaiming) else {
+        let Some(_role) = self.role() else {
             return Some(Reclaim::Busy);
         };
         let job = {
@@ -1085,6 +1101,44 @@ mod tests {
             ),
             "the role was left held"
         );
+    }
+
+    /// A reclaim that reads the role held is refused without trying the compare-and-swap; one
+    /// that reads it free tries it.
+    #[test]
+    fn a_reclaim_that_reads_the_role_held_tries_no_compare_and_swap() {
+        let slots = Slots::<3, 0, ()>::new();
+        for _ in 0..3 {
+            slots.take(1).unwrap();
+        }
+        slots.give_back(0, false).unwrap();
+        slots.give_back(1, false).unwrap();
+        let tries = || slots.role_tries.load(Ordering::Relaxed);
+        let outcome = slots.reclaim(
+            |_, _| (),
+            |_, _| {
+                // The first reclaim tried one, and holds the role; slot 1 is still to reclaim.
+                assert_eq!(tries(), 1);
+                assert_eq!(
+                    slots.reclaim(|_, _| (), |_, _| done(), answered, |()| ()),
+                    Some(Reclaim::Busy)
+                );
+                assert_eq!(
+                    tries(),
+                    1,
+                    "a reclaim that read the role held tried to take it"
+                );
+                done()
+            },
+            answered,
+            |()| (),
+        );
+        assert!(matches!(outcome, Some(Reclaim::Freed { .. })));
+        assert!(matches!(
+            slots.reclaim(|_, _| (), |_, _| done(), answered, |()| ()),
+            Some(Reclaim::Freed { .. })
+        ));
+        assert_eq!(tries(), 2);
     }
 
     /// A slot lost by `leak` stays mapped, so its pages stay counted; one waiting after a stall
