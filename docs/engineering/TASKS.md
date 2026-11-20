@@ -582,6 +582,8 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 109. **Lending across calls (ADR-0005 Amendment 11, J1 to J6). Plan P18, after the M3 core. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 105 and the M3 core, with ADR-0011 L4's fast-path design or the `CALL` flag alone.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
 
+110. **An unreadable XSDT entry fails the ACPI census, AML, PCIe and IOMMU proofs (TASKS item 84's follow-up). Numbered by the coordinating session on 2026-11-20; not started.** TASKS item 71's rule in `origin_frame::acpi` treats an XSDT entry the kernel cannot read as possibly any table, so each of those proofs fails. On a real machine, one firmware table in RAM would cost it its PCIe and IOMMU. The fix narrows the rule to what can be shown, with host tests and a control on a rented board's shape. It was found by the machine TASKS items 83 and 84 built with the SPCR alone in RAM.
+
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:

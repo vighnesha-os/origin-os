@@ -17,7 +17,7 @@ One Latitude.sh `m4-metal-small` (AMD EPYC 4244P, Zen 4; Supermicro H13SRE-F, AM
 
 ## The SPCR's UART from the kernel's first line (ADR-0010 Amendment 3, decision item 317; TASKS item 84; 2026-11-20)
 
-On `claude/t84-early-uart`, on the rental-B branch; **not landed and not pushed.** What rental B could not show: a server whose console is COM2 now sees the kernel from its first line.
+On `claude/t84-early-uart`, on the rental-B branch; **in the eighth batch (pull request 47) since merge `d8d15be4`**, where the quick gates and the build passed; its author ran the check, the boot test and the boot matrix on `20bfc398`, the same code. What rental B could not show: a server whose console is COM2 now sees the kernel from its first line.
 
 - **Boot info 0.8:** a 16-byte `EarlyUart` (the port, the SPCR's interface type, and the rate and clock when the table states them), checked by the loader and the kernel. The kernel refuses boot info 0.7.
 - **The loader** walks the RSDP, XSDT and SPCR before `ExitBootServices`, reading only memory the UEFI memory map describes. It uses the kernel's own parser, now the crate `origin-spcr`, and names a 16550 in I/O space. A memory-mapped UART, a refused table or no table names none, and nothing stops the loader.
