@@ -3654,7 +3654,11 @@ The calls a thread-to-thread switch makes are now the base's: `RunQueue::switch`
   - **The new controls:** `wake_to_the_stale_slot`, `location_not_read_again_under_the_lock`, `wake_to_the_slot_it_left`, `generation_not_compared`, `an_exit_followed_as_a_move`, `a_new_thread_followed_as_a_move`, `location_load_relaxed` and `slot_names_another_record`.
   - **One existing control widened:** `unlock_release_relaxed` now also names the switch model.
 - **Boots:** `boot-test`, 11 of 11, on each code change; the comparison's 36 large-machine boots and 18 B1 boots, every one passing.
-- **The gates on the final tip:** GATES_FINAL.
+- **The gates on `6cbcfabd`** (the code at `1675118d` with every record but these results; each gate in its own turn, the worktree clean, 2026-11-20, 19:58 to 21:08 UTC):
+  - `check` passed in 660 s: 2,547 host tests passed, 0 failed, 30 ignored; Loom 79 models passed and 120 negative controls caught; every document gate.
+  - `boot-test` passed, 11 of 11.
+  - `boot-matrix` passed three times in a row, in 1,156, 1,153 and 1,155 s, with no empty log in any of them.
+  - Before them, `cargo clippy --locked --all-targets -- -D warnings` on the default members, and Clippy on the kernel for its target, found nothing.
 
 **The gates' first round, on `4e0a2861`, and G92-1.** Each gate ran in its own turn, with the worktree clean.
 
