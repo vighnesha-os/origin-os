@@ -131,6 +131,23 @@ const CTX_UNCOVERED: &[&str] = &["a live context's stack was in no record"];
 const CTX_LAST_TOUCH: &[&str] = &["a stack was found free before its processor's last use of it"];
 const CTX_LOST: &[&str] = &["a published context went unrecorded"];
 const CTX_NEVER_RETIRED: &[&str] = &["an ended context's home was never retired"];
+/// B1's and B2's reports (TASKS item 81): a settle counted while a reap still held what it frees,
+/// or its read of what the reap freed was not ordered after the freeing.
+const BACKLOG_EARLY: &[&str] = &[
+    "a settle passed while a reap still held what it frees",
+    "Causality violation",
+];
+/// K1's report (TASKS item 77): a switch, or the table read back, named a home other than the
+/// incoming context's.
+const CTX_WRONG_HOME: &[&str] = &["a switch named a stack not the incoming context's own"];
+/// W1's reports (TASKS item 75): a first frame both withdrawn and resumed, or neither; a running
+/// context's stack uncovered; C's context lost; a withdrawn context's home left behind.
+const CTX_WITHDRAWN: &[&str] = &[
+    "a published context was both withdrawn and resumed, or neither",
+    "a live context's stack was in no record",
+    "a published context went unrecorded",
+    "a withdrawn context kept its home",
+];
 
 /// What the exits models report (`models.rs`; TASKS item 79): a settle that passed while an
 /// ended thread still held what it gives back at its reap, seen as a wrong value or as a read
@@ -168,6 +185,7 @@ const REFCOUNT: &str = "framekernel/frame/sync/src/refcount.rs";
 const SLOTS: &str = "framekernel/frame/sync/src/slots.rs";
 const PORTS: &str = "framekernel/frame/sync/src/ports.rs";
 const CONTEXTS: &str = "framekernel/frame/sync/src/contexts.rs";
+const BACKLOG: &str = "framekernel/frame/sync/src/backlog.rs";
 const EXITS: &str = "framekernel/frame/sync/src/exits.rs";
 
 /// `WaitQueue::take_all`'s one critical section.
@@ -1399,6 +1417,133 @@ const CONTROLS: &[Control] = &[
         models: &[(
             "contexts_two_retirers_lose_no_ended_context",
             CTX_NEVER_RETIRED,
+        )],
+    },
+    Control {
+        // BX1 (TASKS item 81): the count lowered before the release, the order `reap_closed` had
+        // before TASKS item 81 (the review of TASKS item 79, T79-6): a settle on another processor
+        // can find nothing pending while the release still holds what it frees. B1's alone: B2's
+        // settle reaps and reads only once the ender has finished its reaps, releases included,
+        // so no lowering before a release is ever seen there (B2 passes under BX1).
+        name: "backlog_lowered_before_released",
+        file: BACKLOG,
+        from: "        let released = release();\n        self.count.fetch_sub(1, AcqRel);\n",
+        to: "        self.count.fetch_sub(1, AcqRel);\n        let released = release();\n",
+        models: &[("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY)],
+    },
+    Control {
+        // BX4 (the review of TASKS items 75, 77 and 81, R81-1): the count raised after the list's
+        // lock is released, as `list_closed` did: a taker can take the piece uncounted, and its
+        // lowering cancel another piece's raise while that piece is still listed.
+        name: "backlog_raised_after_the_lock",
+        file: BACKLOG,
+        from: "        self.count.fetch_add(1, AcqRel);\n        drop(listed);\n",
+        to: "        drop(listed);\n        self.count.fetch_add(1, AcqRel);\n",
+        models: &[(
+            "backlog_a_lowering_cannot_cancel_another_pieces_raise",
+            BACKLOG_EARLY,
+        )],
+    },
+    Control {
+        // BX2: the count read Relaxed: a settle that reads 0 is not ordered after the releases.
+        name: "backlog_pending_relaxed",
+        file: BACKLOG,
+        from: "        self.count.load(Acquire)\n",
+        to: "        self.count.load(core::sync::atomic::Ordering::Relaxed)\n",
+        models: &[("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY)],
+    },
+    Control {
+        // BX3: the count lowered Relaxed: the lowering heads no release sequence, so a settle
+        // that reads it is not ordered after the release before it.
+        name: "backlog_drained_relaxed",
+        file: BACKLOG,
+        from: "        self.count.fetch_sub(1, AcqRel);\n",
+        to: "        self.count.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);\n",
+        models: &[("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY)],
+    },
+    Control {
+        // KX1 (TASKS item 77): the answer carries the outgoing context's home, so the trap entry
+        // would name the stack of the context it just suspended.
+        name: "contexts_switch_names_the_outgoing_home",
+        file: CONTEXTS,
+        from: "        let home = self.slots.get(incoming).map(|slot| slot.home.load(Acquire));\n",
+        to: "        let home = self.slots.get(outgoing).map(|slot| slot.home.load(Acquire));\n",
+        models: &[("contexts_a_switch_names_the_incoming_home", CTX_WRONG_HOME)],
+    },
+    Control {
+        // KX2: the answer carries `next` as the home: right on a context's first run, where its
+        // frame is its home, and wrong once it resumes at a frame it saved, or for the boot flow.
+        name: "contexts_switch_names_next_as_home",
+        file: CONTEXTS,
+        from: "        let home = self.slots.get(incoming).map(|slot| slot.home.load(Acquire));\n",
+        to: "        let home = Some(next);\n",
+        models: &[("contexts_a_switch_names_the_incoming_home", CTX_WRONG_HOME)],
+    },
+    Control {
+        // KX3: the answer carries the first slot's home, whichever context runs.
+        name: "contexts_switch_names_the_first_slot",
+        file: CONTEXTS,
+        from: "        let home = self.slots.get(incoming).map(|slot| slot.home.load(Acquire));\n",
+        to: "        let home = self.slots.first().map(|slot| slot.home.load(Acquire));\n",
+        models: &[("contexts_a_switch_names_the_incoming_home", CTX_WRONG_HOME)],
+    },
+    Control {
+        // KX4: the trap entry's check reads the home of the first slot, not of `current`'s: a
+        // landing on another context's stack could pass it.
+        name: "contexts_running_home_reads_the_first_slot",
+        file: CONTEXTS,
+        from: "            .get(self.current.load(Relaxed))\n            .map(|slot| slot.home.load(Acquire))\n",
+        to: "            .first()\n            .map(|slot| slot.home.load(Acquire))\n",
+        models: &[("contexts_a_switch_names_the_incoming_home", CTX_WRONG_HOME)],
+    },
+    Control {
+        // WX1 (TASKS item 75): a withdrawal that takes the first frame by a plain store, not by
+        // the compare-and-swap a switch also makes: a switch that resumed the context and the
+        // withdrawal can both succeed, and the running context's home is cleared.
+        name: "contexts_withdrawal_takes_the_frame_by_a_store",
+        file: CONTEXTS,
+        from: "                && slot
+                    .frame
+                    .compare_exchange(frame, 0, AcqRel, Acquire)
+                    .is_ok()
+",
+        to: "                && {
+                    slot.frame.store(0, Release);
+                    true
+                }
+",
+        models: &[(
+            "contexts_a_withdrawal_beside_a_switch_and_a_publication",
+            CTX_WITHDRAWN,
+        )],
+    },
+    Control {
+        // WX2 (TASKS item 75; the coordinating session's addition (b)): the home cleared before
+        // the first frame is taken. A publisher can claim the slot in between and have its frame
+        // overwritten, and a context a switch resumed loses its home.
+        name: "contexts_withdrawal_clears_the_home_first",
+        file: CONTEXTS,
+        from: "        let Some(slot) = self.slots.iter().find(|slot| {
+            slot.home.load(Acquire) == frame
+                && slot
+                    .frame
+                    .compare_exchange(frame, 0, AcqRel, Acquire)
+                    .is_ok()
+        }) else {
+            return false;
+        };
+        slot.home.store(0, Release);
+        true
+",
+        to: "        let Some(slot) = self.slots.iter().find(|slot| slot.home.load(Acquire) == frame) else {
+            return false;
+        };
+        slot.home.store(0, Release);
+        slot.frame.compare_exchange(frame, 0, AcqRel, Acquire).is_ok()
+",
+        models: &[(
+            "contexts_a_withdrawal_beside_a_switch_and_a_publication",
+            CTX_WITHDRAWN,
         )],
     },
     Control {

@@ -2129,8 +2129,9 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             "origin-kernel: scheduler: 3 SIMD threads kept their XMM state across ".into(),
             " corruptions".into(),
             "origin-kernel: scheduler: yield alternated ".into(),
-            // A thread is created whole or not at all.
-            "origin-kernel: scheduler: spawns refused for want of an FPU area (Err(Full)) and on a full queue (Err(Full)) give back".into(),
+            // A thread is created whole or not at all, and a refused one queues nothing (TASKS
+            // item 75).
+            "origin-kernel: scheduler: spawns refused for want of an FPU area (Err(Full)), at their publication (Err(Full)) and on a full queue (Err(Full)) give back".into(),
             // M4 groundwork: ring 3, the one DPL-3 gate, and crash isolation.
             "origin-kernel: user mode: good program: reported Some(42), exited with Some(0); kernel carries on".into(),
             "origin-kernel: user mode: kernel read: reported Some(7), ended by vector 14 (error 0x5".into(),
@@ -3216,10 +3217,10 @@ fn stack_markers(machine: &Machine) -> Vec<String> {
     let windows = if cpus > 1 {
         vec![
             format!(
-                "origin-kernel: kernel stacks: a thread's own stack, asked about from {} while {reader} switched it out (that processor's kernel-stack record moved, the thread's frame not yet saved): in use: true (held ",
+                "origin-kernel: kernel stacks: a thread's own stack, asked about from {} while {reader} switched it out (its switch decided, the thread's frame not yet saved): in use, and covered by the table of contexts: true (held ",
                 machine.named(0)
             ),
-            " us); while it ended: in use: true (held ".into(),
+            " us); while it ended: the same: true (held ".into(),
             " us); given back by its processor's reap, not leaked: true (".into(),
         ]
     } else {
@@ -7391,6 +7392,22 @@ mod rerun_tests {
             format!("{IPC}; not settled before its first count: 1 ending threads not yet exited, 1 kernel stacks lost to a stalled shootdown: ipc failed"),
             format!("{IPC}; not settled before its compare: 1 kernel stacks lost to a stalled shootdown, 1 ending threads not yet exited: ipc failed"),
             "origin-kernel: directory: the directory, the service, the client and all they held are gone: heap 29408 bytes (was 29408), 128191 free frames (was 128191); not settled before its first count: 1 ending threads not yet exited: directory failed".to_string(),
+        ];
+        for line in &cases {
+            assert_eq!(lost_stacks_only(line), None, "{line}");
+        }
+    }
+
+    /// TASKS item 81: a settle that found a closed channel not yet reaped is not a loss of stacks
+    /// alone, whether the channel is named alone or beside lost stacks, before them as `settled`
+    /// orders them or after: such a boot is not re-run (ADR-0013 Amendment 3, part (b)).
+    #[test]
+    fn closed_channels_do_not_qualify() {
+        let cases = [
+            format!("{IPC}; not settled before its first count: 1 closed channels not yet reaped: ipc failed"),
+            format!("{IPC}; not settled before its first count: 1 closed channels not yet reaped, 1 kernel stacks lost to a stalled shootdown: ipc failed"),
+            format!("{IPC}; not settled before its compare: 1 kernel stacks lost to a stalled shootdown, 1 closed channels not yet reaped: ipc failed"),
+            "origin-kernel: directory: the directory, the service, the client and all they held are gone: heap 29408 bytes (was 29408), 128191 free frames (was 128191); not settled before its first count: 1 closed channels not yet reaped: directory failed".to_string(),
         ];
         for line in &cases {
             assert_eq!(lost_stacks_only(line), None, "{line}");
