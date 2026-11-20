@@ -54,6 +54,12 @@ const BRIDGE: &str = "ORIGIN_QEMU_BRIDGE";
 const RESERVED: &str = "ORIGIN_QEMU_RESERVED";
 /// `on` or `off`: the ACPI machine's NFIT, HMAT and generic initiator.
 const ACPI: &str = "ORIGIN_QEMU_ACPI";
+/// The machine's RAM: `512M` (the default), a larger even number of MiB (`1024M`), or a whole
+/// number of GiB from 1 to 64 (`8G`). TASKS item 83.
+const MEMORY: &str = "ORIGIN_QEMU_MEMORY";
+/// `on` or `off`: the firmware tables shaped as rental B's board has them, by the TEST ONLY
+/// application, with the console's UART at `0x2F8` (TASKS item 83).
+const SHAPE: &str = "ORIGIN_QEMU_SHAPE";
 /// On if set and not empty: QEMU logs interrupts and resets.
 const DEBUG: &str = "ORIGIN_QEMU_DEBUG";
 /// A boot's timeout in whole seconds.
@@ -70,7 +76,7 @@ const OVMF_VARS: &str = "ORIGIN_OVMF_VARS";
 const GITHUB_ACTIONS: &str = "GITHUB_ACTIONS";
 
 /// Every variable [`Settings::from_env`] reads.
-const VARIABLES: [&str; 17] = [
+const VARIABLES: [&str; 19] = [
     ACCEL,
     IOMMU,
     SMP,
@@ -81,6 +87,8 @@ const VARIABLES: [&str; 17] = [
     BRIDGE,
     RESERVED,
     ACPI,
+    MEMORY,
+    SHAPE,
     DEBUG,
     TIMEOUT,
     ONLY,
@@ -103,6 +111,48 @@ pub(crate) enum Topology {
     Many,
     /// The discovery machine: 2 processors of the 4096 the MADT lists.
     Listed,
+}
+
+/// A machine's RAM, in MiB (TASKS item 83): at least 512, and even, so its two NUMA nodes each
+/// hold a whole number of MiB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Memory(u32);
+
+/// 512 MiB: every machine's before TASKS item 83.
+impl Default for Memory {
+    fn default() -> Memory {
+        Memory(512)
+    }
+}
+
+impl Memory {
+    /// `gib` GiB.
+    pub(crate) fn gib(gib: u32) -> Memory {
+        Memory(gib * 1024)
+    }
+
+    /// Its size in MiB.
+    pub(crate) fn mib(self) -> u32 {
+        self.0
+    }
+
+    /// The size QEMU's `-m` takes: whole GiB as `G`, else MiB as `M`.
+    pub(crate) fn qemu(self) -> String {
+        Memory::size(self.0)
+    }
+
+    /// One of the two NUMA nodes' memory backends, half of it, as QEMU takes a size.
+    pub(crate) fn node(self) -> String {
+        Memory::size(self.0 / 2)
+    }
+
+    fn size(mib: u32) -> String {
+        if mib.is_multiple_of(1024) {
+            format!("{}G", mib / 1024)
+        } else {
+            format!("{mib}M")
+        }
+    }
 }
 
 /// One boot's settings: what QEMU emulates, how it runs, which firmware it boots, which of
@@ -129,6 +179,10 @@ pub(crate) struct Settings {
     pub(crate) reserved: bool,
     /// The ACPI machine's tables ([`ACPI`], `boot-acpi`).
     pub(crate) acpi: bool,
+    /// The machine's RAM ([`MEMORY`]; `boot-large`, `boot-rented`).
+    pub(crate) memory: Memory,
+    /// The firmware tables shaped as rental B's board has them ([`SHAPE`], `boot-rented`).
+    pub(crate) shape: bool,
     /// QEMU's log of interrupts and resets ([`DEBUG`]).
     pub(crate) debug: bool,
     /// A boot's timeout set by the person or by `boot-matrix` ([`TIMEOUT`]); `None` for
@@ -157,6 +211,8 @@ impl Default for Settings {
             bridge: false,
             reserved: false,
             acpi: false,
+            memory: Memory::default(),
+            shape: false,
             debug: false,
             timeout: None,
             only: String::new(),
@@ -208,6 +264,11 @@ impl Settings {
             bridge: switch(BRIDGE, set(BRIDGE))?,
             reserved: switch(RESERVED, set(RESERVED))?,
             acpi: switch(ACPI, set(ACPI))?,
+            memory: match set(MEMORY) {
+                None => Memory::default(),
+                Some(v) => memory(v)?,
+            },
+            shape: switch(SHAPE, set(SHAPE))?,
             debug: set(DEBUG).is_some(),
             timeout: set(TIMEOUT)
                 .map(|v| {
@@ -240,6 +301,18 @@ impl Settings {
         !self.github_actions || self.any_count
     }
 
+    /// The size of `boot-large`'s and `boot-rented`'s machines (TASKS item 83; the coordinating
+    /// session's ruling Q1 of 2026-11-20): [`FULL_MEMORY_GIB`] on a developer's machine, 8 GiB in CI
+    /// (GitHub Actions), where the runners have far less, as the any-count machines are kept
+    /// ([`Settings::runs_any_count_machines`]).
+    pub(crate) fn large_memory(&self) -> Memory {
+        if self.github_actions {
+            Memory::gib(8)
+        } else {
+            Memory::gib(FULL_MEMORY_GIB)
+        }
+    }
+
     /// Refuses the person's machine for `command`, one of `boot-matrix` and its scenario
     /// commands, which set each machine themselves (the coordinating session's ruling R5 of
     /// 2026-11-19). With the children of before TASKS item 61, `ORIGIN_QEMU_TOPOLOGY=sparse
@@ -256,16 +329,20 @@ impl Settings {
             (self.bridge, BRIDGE),
             (self.reserved, RESERVED),
             (self.acpi, ACPI),
+            (self.shape, SHAPE),
         ] {
             if on {
                 set.push(format!("{name}=on"));
             }
         }
+        if self.memory != Memory::default() {
+            set.push(format!("{MEMORY}={}", self.memory.qemu()));
+        }
         if set.is_empty() {
             return Ok(());
         }
         Err(format!(
-            "{command} sets each machine's topology, bridge, reserved memory and ACPI tables itself, so {} is refused here; boot-test, boot-console and run take it",
+            "{command} sets each machine's topology, bridge, reserved memory, ACPI tables, RAM and table shapes itself, so {} is refused here; boot-test, boot-console and run take it",
             set.join(" and ")
         ))
     }
@@ -382,6 +459,23 @@ fn at_least(name: &str, value: &str, least: u32, what: &str) -> Result<u32> {
         .ok_or_else(|| {
             format!("{name} must be a whole number of {what}, {least} or more, not {value:?}")
         })
+}
+
+/// The full size of `boot-large`'s and `boot-rented`'s machines on a developer's machine, in GiB
+/// (TASKS item 83): settled by the trial the coordinating session's ruling asked for.
+const FULL_MEMORY_GIB: u32 = 64;
+
+/// The RAM a set value of [`MEMORY`] names.
+fn memory(value: &str) -> Result<Memory> {
+    let refused =
+        || format!("{MEMORY} must be 512M or more MiB, even (1024M), or 1G to 64G, not {value:?}");
+    let (number, unit) = value.split_at(value.len().saturating_sub(1));
+    let n: u32 = number.parse().map_err(|_| refused())?;
+    match unit {
+        "G" if (1..=64).contains(&n) => Ok(Memory::gib(n)),
+        "M" if n >= 512 && n.is_multiple_of(2) && n <= 64 * 1024 => Ok(Memory(n)),
+        _ => Err(refused()),
+    }
 }
 
 /// A switch: `on`, or `off` (or unset).

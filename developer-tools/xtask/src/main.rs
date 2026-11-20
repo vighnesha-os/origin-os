@@ -47,7 +47,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use settings::{Settings, Topology};
+use settings::{Memory, Settings, Topology};
 
 const USAGE: &str = "\
 usage: cargo xtask <command>
@@ -62,12 +62,19 @@ commands:
               signature and tampered content, each with its own message
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
               one after another, then boot-x2apic, boot-bridge, boot-legacy-free,
-              boot-random, boot-identity and boot-console
+              boot-random, boot-identity, boot-console, boot-large and boot-rented
   boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
               cleared on the bridge too and opened again above the device its driver attached
   boot-reserved  the kernel boot with firmware-reserved memory (RMRRs, IVMDs) a TEST ONLY UEFI
               application plants in QEMU's tables (both IOMMUs): the NVMe controller's domain
               identity-maps what the kernel may trust, and the rest is refused by name
+  boot-large  the kernel boot on a machine with more than 4 GiB of RAM (both IOMMUs; 8 GiB in
+              CI): the frame allocator holds all but 1% of it (TASKS item 83)
+  boot-rented the kernel boot on rental B's board's shapes (both IOMMUs, the large machine's
+              RAM): a TEST ONLY UEFI application puts the RSDP and XSDT in ACPI NVS, names the
+              FACS by the FADT's 32-bit field alone, adds an FPDT whose tables are in reserved
+              memory and reserves the top of the RAM; the SPCR names COM2 with COM1 present,
+              and the kernel must move its console there and end with its verdict
   boot-legacy-free  the kernel boot on a machine with no 8254 and no 8042: the timers
               calibrate against the ACPI PM timer, and the proofs that need those devices
               say they cannot run
@@ -235,6 +242,11 @@ environment:
   ORIGIN_QEMU_RESERVED                on: a TEST ONLY UEFI application plants firmware-reserved
                                       memory (RMRRs or IVMDs) in QEMU's tables before the
                                       loader starts (the boot-reserved machine); off or unset: not
+  ORIGIN_QEMU_MEMORY                  the machine's RAM: 512M (default), an even number of MiB
+                                      above it, or 1G to 64G (the boot-large machine)
+  ORIGIN_QEMU_SHAPE                   on: a TEST ONLY UEFI application shapes the tables as
+                                      rental B's board has them, with the console's UART at
+                                      0x2F8 (the boot-rented machine); off or unset: not
   ORIGIN_QEMU_ACPI                    on: QEMU builds an NFIT, an HMAT and an SRAT with a generic
                                       initiator (the boot-acpi machine; needs
                                       ORIGIN_QEMU_MACHINE=nvdimm=on,hmat=on); off or unset: not
@@ -482,6 +494,19 @@ fn numa_node(id: u32, cpus: u32, acpi: bool) -> String {
         format!("{node},initiator=0")
     }
 }
+
+/// The shapes `boot-rented` gives the firmware's tables, as rental B's board has them (TASKS item
+/// 83; `docs/research/2026-11-20-rental-b-findings.md`): the RSDP and XSDT in ACPI NVS, the FACS
+/// named by the FADT's 32-bit field alone, an FPDT whose FBPT and S3PT are in reserved memory,
+/// and 32 MiB of reserved pages at the top of the RAM. The board's device and reserved ranges
+/// above its RAM, up to just below 1 TiB, need the PI specification's DXE services, which no one
+/// here has read: not shown (the coordinating session's ruling Q3).
+const RENTED_SHAPE: origin_test_reserved_memory::Shape = origin_test_reserved_memory::Shape {
+    acpi_nvs: true,
+    facs_32: true,
+    fpdt: true,
+    top_reserved_pages: 8192,
+};
 
 /// The device the planted ranges name and no driver attaches: 00:1f.6, absent on QEMU's q35.
 const ABSENT_DEVICE: u16 = 0x1F << 3 | 6;
@@ -1002,6 +1027,9 @@ fn boot_scenario(settings: &Settings) -> Scenario {
     }
     if settings.reserved {
         reserved_markers(&mut scenario, settings.iommu == Iommu::Amd);
+    }
+    if settings.shape {
+        rented_scenario(&mut scenario);
     }
     if settings.machine_lacks("pit") {
         no_pit_markers(&mut scenario);
@@ -2547,7 +2575,147 @@ fn check_kernel_boot(done: &Completed, settings: &Settings) -> Result {
     console_lines_intact(&done.serial, machine(settings).cpus() as usize)?;
     long_lines_whole(&done.serial)?;
     unwaited_lines_whole(&done.serial)?;
+    check_memory(&done.serial, settings)?;
     check_screen(done)
+}
+
+/// The rented board's machine (`boot-rented`, TASKS item 83): the kernel boot's checks but the
+/// screen's (this machine's monitor is not on stdio), the RAM, COM1 stopping at the console's
+/// move, and on COM1, where the firmware's console is, the application's shaping and the
+/// loader's lines in their order.
+fn check_rented_boot(done: &Completed, settings: &Settings) -> Result {
+    console_lines_intact(&done.serial, machine(settings).cpus() as usize)?;
+    long_lines_whole(&done.serial)?;
+    unwaited_lines_whole(&done.serial)?;
+    check_memory(&done.serial, settings)?;
+    check_com1_stopped_at_the_move(done, settings)?;
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    let firmware = rented_firmware_markers(settings);
+    let markers: Vec<&str> = firmware.iter().map(String::as_str).collect();
+    match serial::first_missing(&com1, &markers) {
+        None => Ok(()),
+        Some(missing) => Err(format!(
+            "COM1, the firmware's console, lacks {missing:?} in its order (the application's shaping and the loader's lines)"
+        )),
+    }
+}
+
+/// The RAM a machine larger than 512 MiB gives the kernel (TASKS item 83): the frame
+/// allocator's free memory is at least 99% of it and no more than it. OVMF keeps the rest, and
+/// on `boot-rented` the 32 MiB the application reserves at the top. A 512 MiB machine is not
+/// held to it: OVMF keeps more than 1% of so little.
+fn check_memory(serial: &str, settings: &Settings) -> Result {
+    if settings.memory == Memory::default() {
+        return Ok(());
+    }
+    let ram = u64::from(settings.memory.mib());
+    let line = serial
+        .lines()
+        .find(|l| l.starts_with("origin-kernel: frame allocator: "))
+        .ok_or("no frame allocator line")?;
+    let free = line
+        .split_once(" free frames (")
+        .and_then(|(_, rest)| rest.split_once(" MiB)"))
+        .and_then(|(mib, _)| mib.parse::<u64>().ok())
+        .ok_or_else(|| format!("the frame allocator's line does not give its MiB: {line:?}"))?;
+    if free * 100 < ram * 99 || free > ram {
+        return Err(format!(
+            "the frame allocator has {free} MiB free of the machine's {ram} MiB: not within 1% of it ({line:?})"
+        ));
+    }
+    Ok(())
+}
+
+/// The firmware console's lines on the rented board's machine, all on COM1: the application's
+/// shaping (TASKS item 83), then the loader's lines up to its hand-over, as the kernel boot's
+/// own markers have them.
+fn rented_firmware_markers(settings: &Settings) -> Vec<String> {
+    let mut markers: Vec<String> = [
+        "origin-test-reserved: TEST ONLY: shaping the firmware's tables as rental B's board has them",
+        "origin-test-reserved: reserved 0x",
+        " (8192 pages) at the top of the RAM",
+        "origin-test-reserved: the XSDT now names FACP at 0x",
+        "by FIRMWARE_CTRL alone",
+        "origin-test-reserved: FPDT at 0x",
+        "in reserved pages",
+        "origin-test-reserved: the XSDT is copied to 0x",
+        " (ACPI NVS), ",
+        "origin-test-reserved: the RSDP is copied to 0x",
+        " (ACPI NVS), and the configuration table names it",
+        "origin-test-reserved: starting the loader",
+    ]
+    .map(String::from)
+    .to_vec();
+    let plain = boot_scenario(&Settings {
+        shape: false,
+        ..settings.clone()
+    });
+    let handover = plain
+        .markers
+        .iter()
+        .position(|m| m == HANDOVER_LINE)
+        .map_or(0, |i| i + 1);
+    markers.extend(plain.markers.into_iter().take(handover));
+    markers
+}
+
+/// The loader's last line, after which only the kernel prints.
+const HANDOVER_LINE: &str = "origin-boot: exiting boot services; entering the Framekernel";
+
+/// The kernel boot made the rented board's (TASKS item 83): the console's UART is the one the
+/// SPCR names at `0x2F8`, with COM1 present and kept in a file, so the markers are read from
+/// that UART, and they start with the kernel's lines that the move sends it again; the
+/// firmware's console, the application's and the loader's lines, stays on COM1
+/// ([`check_rented_boot`]). The move comes after the kernel's page-table proofs, and the census
+/// names the FPDT's tables and what it never lends.
+fn rented_scenario(scenario: &mut Scenario) {
+    scenario.capture = Capture::SpcrUart;
+    scenario.qemu_args = Some(|work| spcr_args(work, &spcr_table(0, gas_io(SPCR_PORT), 7), &[]));
+    scenario.check = Some(check_rented_boot);
+    if let Some(at) = scenario.markers.iter().position(|m| m == HANDOVER_LINE) {
+        scenario.markers.drain(..=at);
+    }
+    if let Some(at) = scenario
+        .markers
+        .iter()
+        .position(|m| m.starts_with("origin-kernel: allocated, wrote and freed 3 frames at "))
+    {
+        scenario.markers.splice(
+            at..at,
+            [
+                MOVED_LINE,
+                "origin-kernel: console: the UART is now at I/O port 0x2f8, as the firmware set it; ",
+            ]
+            .map(String::from),
+        );
+    }
+    if let Some(at) = scenario
+        .markers
+        .iter()
+        .position(|m| m == "origin-kernel: acpi: FADT: ")
+    {
+        scenario.markers.splice(
+            at..at,
+            [
+                "origin-kernel: acpi: FPDT rev 1",
+                "origin-kernel: acpi: FBPT, 56 bytes: checked: 1 records",
+                "origin-kernel: acpi: S3PT, 32 bytes: checked: 1 records",
+            ]
+            .map(String::from),
+        );
+    }
+    if let Some(at) = scenario.markers.iter().position(|m| m == " tables: ") {
+        scenario.markers.splice(
+            at..at,
+            [
+                "origin-kernel: acpi: never lent, as the firmware changes them after boot: FACS 0x",
+                ", FBPT 0x",
+                ", S3PT 0x",
+                "; 3 kept",
+            ]
+            .map(String::from),
+        );
+    }
 }
 
 /// What fails a kernel boot under QEMU alone, and never a physical machine's (the review of TASKS 63's
@@ -3656,6 +3824,8 @@ fn main() -> ExitCode {
         ["boot-console"] => in_turn_with_settings("boot-console", boot_console),
         ["boot-bridge"] => in_turn_with_settings("boot-bridge", boot_bridge),
         ["boot-reserved"] => in_turn_with_settings("boot-reserved", boot_reserved),
+        ["boot-large"] => in_turn_with_settings("boot-large", boot_large),
+        ["boot-rented"] => in_turn_with_settings("boot-rented", boot_rented),
         ["boot-legacy-free"] => in_turn_with_settings("boot-legacy-free", boot_legacy_free),
         ["boot-acpi"] => in_turn_with_settings("boot-acpi", boot_acpi),
         ["boot-random"] => in_turn_with_settings("boot-random", boot_random),
@@ -3718,7 +3888,7 @@ fn entry_settings(command: &str, settings: Settings) -> Result<Settings> {
 /// The list is of names, so a new scenario command of `boot-matrix`'s belongs here, by hand; the
 /// host test `each_kind_of_command_takes_or_refuses_the_person_s_machine_at_entry` holds these
 /// eleven.
-const SETS_ITS_MACHINES: [&str; 11] = [
+const SETS_ITS_MACHINES: [&str; 13] = [
     "boot-matrix",
     "boot-x2apic",
     "boot-bridge",
@@ -3730,6 +3900,8 @@ const SETS_ITS_MACHINES: [&str; 11] = [
     "boot-sparse",
     "boot-many",
     "boot-listed",
+    "boot-large",
+    "boot-rented",
 ];
 
 /// One machine `boot-matrix` or one of its scenario commands boots `boot-test` on: the line said
@@ -3797,6 +3969,10 @@ fn boot_matrix(base: &Settings) -> Result {
     boot_random(base)?;
     boot_identity(base)?;
     boot_console(base)?;
+    // TASKS item 83: more than 4 GiB of RAM, and rental B's board's table shapes, at their full
+    // size on a developer's machine and 8 GiB in CI (`Settings::large_memory`).
+    boot_large(base)?;
+    boot_rented(base)?;
     // ADR-0008 D7 as decision item 294 has it: the large sparse machine of 67 processors, and
     // the discovery machine. The 288-processor run (`boot-many`) is outside the gate: on the
     // development Mac QEMU disturbs the guest's timing at 288 processors before any AP starts.
@@ -3815,12 +3991,13 @@ fn boot_matrix(base: &Settings) -> Result {
         "xtask: boot-matrix: the kernel stacks' region was at {boots} distinct bases in {boots} kernel boots, read through QEMU's monitor; none is printed"
     );
     println!(
-        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with {} processors, the sparse machine, the bridge machine, the reserved-memory machines, the legacy-free machine, the ACPI machine, the two machines without the random-number instructions, the two CPU identities, the console machines{})",
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with {} processors, the sparse machine, the bridge machine, the reserved-memory machines, the legacy-free machine, the ACPI machine, the two machines without the random-number instructions, the two CPU identities, the console machines, the {} machines with and without rental B's board's shapes{})",
         if any_count {
             "1, 2, 3, 4 and 65"
         } else {
             "1, 2 and 4"
         },
+        base.large_memory().qemu(),
         if any_count {
             ", the 67-processor sparse machine, the discovery machine"
         } else {
@@ -4247,6 +4424,81 @@ fn reserved_runs(base: &Settings) -> Vec<MachineRun> {
                 ..base.clone()
             },
             failed: format!("boot-test with reserved memory planted and the {name} IOMMU"),
+        })
+        .collect()
+}
+
+/// Runs the kernel boot under each IOMMU on a machine with more than 4 GiB of RAM
+/// ([`Settings::large_memory`]: 8 GiB in CI; TASKS item 83): the frame allocator, the direct map
+/// and the NUMA proofs over memory no other machine has, each checked ([`check_memory`]).
+fn boot_large(base: &Settings) -> Result {
+    boot_machines(large_runs(base))?;
+    println!(
+        "xtask: boot-large passed (both IOMMUs, {} of RAM)",
+        base.large_memory().qemu()
+    );
+    Ok(())
+}
+
+/// [`boot_large`]'s machines.
+fn large_runs(base: &Settings) -> Vec<MachineRun> {
+    let memory = base.large_memory();
+    iommus()
+        .into_iter()
+        .map(|(name, iommu)| MachineRun {
+            said: format!(
+                "xtask: boot-large: the {name} IOMMU, {} of RAM",
+                memory.qemu()
+            ),
+            settings: Settings {
+                iommu,
+                memory,
+                only: KERNEL_BOOT.into(),
+                ..base.clone()
+            },
+            failed: format!(
+                "boot-test with {} of RAM and the {name} IOMMU",
+                memory.qemu()
+            ),
+        })
+        .collect()
+}
+
+/// Runs the kernel boot under each IOMMU on rental B's board's shapes (TASKS item 83;
+/// `docs/research/2026-11-20-rental-b-findings.md`): the large machine's RAM, the SPCR naming COM2
+/// at `0x2F8` with COM1 present, and the firmware's tables shaped by the TEST ONLY application
+/// ([`RENTED_SHAPE`]). The kernel must move its console to COM2 and end with its verdict there; a
+/// boot that fails says COM1's last kernel line, which the rented board's console could not show.
+fn boot_rented(base: &Settings) -> Result {
+    boot_machines(rented_runs(base))?;
+    println!(
+        "xtask: boot-rented passed (both IOMMUs, {} of RAM, rental B's board's table shapes)",
+        base.large_memory().qemu()
+    );
+    Ok(())
+}
+
+/// [`boot_rented`]'s machines.
+fn rented_runs(base: &Settings) -> Vec<MachineRun> {
+    let memory = base.large_memory();
+    iommus()
+        .into_iter()
+        .map(|(name, iommu)| MachineRun {
+            said: format!(
+                "xtask: boot-rented: the {name} IOMMU, {} of RAM, rental B's board's table shapes",
+                memory.qemu()
+            ),
+            settings: Settings {
+                iommu,
+                memory,
+                shape: true,
+                only: KERNEL_BOOT.into(),
+                ..base.clone()
+            },
+            failed: format!(
+                "boot-test on rental B's board's shapes with {} of RAM and the {name} IOMMU",
+                memory.qemu()
+            ),
         })
         .collect()
 }
@@ -6105,17 +6357,27 @@ fn stage(kernel: &[u8], loader: Loader, settings: &Settings) -> Result<Staged> {
     // Where the loader looks for the Framekernel (ADR-0002 B1).
     let origin_dir = esp.join("EFI").join("ORIGIN");
     fs::create_dir_all(&origin_dir).map_err(|e| format!("{}: {e}", origin_dir.display()))?;
-    if settings.reserved {
-        // TEST ONLY (TASKS item 40): the application that plants firmware-reserved memory
-        // starts first, and starts the unchanged loader from \EFI\ORIGIN\LOADER.EFI.
+    if settings.reserved || settings.shape {
+        // TEST ONLY (TASKS items 40 and 83): the application that plants firmware-reserved
+        // memory, and shapes the tables as rental B's board has them, starts first, and starts
+        // the unchanged loader from \EFI\ORIGIN\LOADER.EFI.
         let fixture = build_reserved_fixture()?;
         fs::copy(&fixture, boot_dir.join("BOOTX64.EFI"))
             .map_err(|e| format!("copy {}: {e}", fixture.display()))?;
         fs::copy(&efi, origin_dir.join("LOADER.EFI"))
             .map_err(|e| format!("copy {}: {e}", efi.display()))?;
-        let regions = reserved_regions(settings.iommu == Iommu::Amd);
+        let regions = if settings.reserved {
+            reserved_regions(settings.iommu == Iommu::Amd)
+        } else {
+            Vec::new()
+        };
+        let shape = if settings.shape {
+            RENTED_SHAPE
+        } else {
+            origin_test_reserved_memory::Shape::default()
+        };
         let mut config = vec![0u8; 1024];
-        let len = origin_test_reserved_memory::encode(&regions, &mut config)
+        let len = origin_test_reserved_memory::encode(&regions, shape, &mut config)
             .ok_or("too many reserved regions")?;
         fs::write(origin_dir.join("RESERVED.CFG"), &config[..len])
             .map_err(|e| format!("write RESERVED.CFG: {e}"))?;
@@ -6159,11 +6421,16 @@ fn qemu_command(s: &Staged, settings: &Settings) -> Result<Command> {
         .arg("-cpu")
         .arg(&settings.cpu)
         .arg("-m")
-        // The ACPI machine's NVDIMM sits in a slot above the 512M of RAM.
+        // The ACPI machine's NVDIMM sits in a slot above the RAM. The RAM is 512 MiB unless
+        // `boot-large` or `boot-rented` sets more (TASKS item 83).
         .arg(if settings.acpi {
-            "512M,slots=2,maxmem=1G"
+            format!(
+                "{},slots=2,maxmem={}M",
+                settings.memory.qemu(),
+                settings.memory.mib() + 512
+            )
         } else {
-            "512M"
+            settings.memory.qemu()
         })
         .arg("-smp")
         .arg(&machine.smp);
@@ -6171,12 +6438,20 @@ fn qemu_command(s: &Staged, settings: &Settings) -> Result<Command> {
         c.args(["-device", cpu]);
     }
     c
-        // Two NUMA nodes so the ACPI SRAT is populated (CLAUDE.md §24, §28). The 256M
+        // Two NUMA nodes so the ACPI SRAT is populated (CLAUDE.md §24, §28). The two halves'
         // backends sum to -m, and QEMU auto-distributes the vCPUs across the nodes, so this
         // is valid for any -smp (verified at 1/2/4/8, and for the sparse x2APIC machine,
         // whose packages go to one node each).
-        .args(["-object", "memory-backend-ram,id=onuma0,size=256M"])
-        .args(["-object", "memory-backend-ram,id=onuma1,size=256M"])
+        .arg("-object")
+        .arg(format!(
+            "memory-backend-ram,id=onuma0,size={}",
+            settings.memory.node()
+        ))
+        .arg("-object")
+        .arg(format!(
+            "memory-backend-ram,id=onuma1,size={}",
+            settings.memory.node()
+        ))
         // With the ACPI machine's HMAT, each node names the initiator nearest its memory.
         .args(["-numa", &numa_node(0, machine.cpus(), settings.acpi)])
         .args(["-numa", &numa_node(1, machine.cpus(), settings.acpi)])
@@ -6438,6 +6713,28 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
                 ""
             }
         )),
+    }
+}
+
+/// Where a boot whose console's UART is not COM1 stopped, as COM1 alone saw it (TASKS item 83):
+/// the kernel prints there until the console moves, so on a boot that never moved, or stopped
+/// before, COM1's last kernel line is the last thing the kernel said. Empty for a boot that
+/// kept no COM1 file.
+fn com1_last_kernel_line(com1: Option<&str>) -> String {
+    let Some(com1) = com1 else {
+        return String::new();
+    };
+    let text = serial::clean(com1.as_bytes());
+    match text
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("origin-kernel: "))
+    {
+        Some(line) => format!("; COM1's last kernel line: {line:?}"),
+        None => match text.lines().rev().find(|l| !l.trim().is_empty()) {
+            Some(line) => format!("; COM1 has no kernel line; its last line: {line:?}"),
+            None => "; COM1 has nothing".into(),
+        },
     }
 }
 
@@ -6714,8 +7011,9 @@ fn run_scenario_once(scenario: &Scenario, kernel: &[u8], settings: &Settings) ->
         Err(e) => {
             eprintln!("--- serial output ---\n{text}\n--- {QEMU} stderr ---\n{qemu_stderr}");
             Err(format!(
-                "boot-test ({}) failed: {e} (QEMU: {exit:?}); serial log: {}",
+                "boot-test ({}) failed: {e} (QEMU: {exit:?}){}; serial log: {}",
                 scenario.label,
+                com1_last_kernel_line(done.com1.as_deref()),
                 log.display()
             ))
         }
