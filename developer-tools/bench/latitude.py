@@ -874,6 +874,32 @@ def is_ancestor(older, newer):
                           capture_output=True).returncode == 0
 
 
+def image_fault(loader, kernel):
+    """Why the two files are not a loader and a Framekernel image, or None. Read from their
+    headers only, before anything is bought, so a swapped or wrong file does not use the hour.
+
+    The kernel: an ONBF container, format 1, profile 6 (KRN), architecture 1 (x86-64)
+    (`docs/spec/ONBF.md` §1 and §4.2). The loader: a PE32+ image for x86-64 whose subsystem is
+    10, an EFI application (the PE format's optional header)."""
+    u16 = lambda b, at: int.from_bytes(b[at:at + 2], "little")
+    k = kernel[:128]
+    if len(k) < 128 or k[:8] != b"\x89ONBF\r\n\x1a":
+        return "KERNEL.ONBF is not an ONBF container"
+    if u16(k, 8) != 1 or u16(k, 12) != 6 or u16(k, 112) != 1:
+        return (f"KERNEL.ONBF is format {u16(k, 8)}, profile {u16(k, 12)}, architecture "
+                f"{u16(k, 112)}; a Framekernel image is format 1, profile 6 (KRN), architecture 1")
+    if len(loader) < 0x40 or loader[:2] != b"MZ":
+        return "BOOTX64.EFI is not a PE image"
+    pe = int.from_bytes(loader[0x3C:0x40], "little")
+    if loader[pe:pe + 4] != b"PE\0\0" or len(loader) < pe + 24 + 70:
+        return "BOOTX64.EFI is not a PE image"
+    machine, magic, subsystem = u16(loader, pe + 4), u16(loader, pe + 24), u16(loader, pe + 24 + 68)
+    if (machine, magic, subsystem) != (0x8664, 0x20B, 10):
+        return (f"BOOTX64.EFI is machine {machine:#x}, optional header {magic:#x}, subsystem "
+                f"{subsystem}; a UEFI loader is 0x8664, 0x20b (PE32+), 10 (EFI application)")
+    return None
+
+
 def boot_entry(efibootmgr, esp_partuuid):
     """The firmware's first boot entry, if it starts a file on the ESP the system has mounted.
 
@@ -945,6 +971,9 @@ def cmd_rental_b(args):
         for f in (loader, kernel):
             if not f.is_file():
                 die(f"{f} is missing: build with `cargo xtask build` and copy the loader as BOOTX64.EFI")
+        fault = image_fault(loader.read_bytes(), kernel.read_bytes())
+        if fault:
+            die(fault)
         # Item 229: Origin boots on real hardware only once identity maps have landed.
         if not is_ancestor(IDENTITY_MAPS_COMMIT, args.source_revision):
             die(f"{IDENTITY_MAPS_COMMIT[:12]} (identity maps, TASKS item 40) is not in the history "

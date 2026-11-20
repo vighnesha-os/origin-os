@@ -6,6 +6,7 @@ Run: python3 -I developer-tools/bench/test_latitude.py
 """
 
 import importlib.util
+import io
 import json
 import multiprocessing
 import os
@@ -210,6 +211,55 @@ class Guards(unittest.TestCase):
     BEFORE_IDENTITY_MAPS = "405495c0c27cb34180edca526335d4161bf9cce5"
     AFTER_IDENTITY_MAPS = "ea2293caea775206ab219c7cf25b1b8c40a3d20f"
 
+    @staticmethod
+    def images():
+        """Headers of a minimal UEFI loader and Framekernel image, as `image_fault` reads them."""
+        loader = bytearray(0x200)
+        loader[:2] = b"MZ"
+        loader[0x3C:0x40] = (0x80).to_bytes(4, "little")
+        loader[0x80:0x84] = b"PE\0\0"
+        loader[0x84:0x86] = (0x8664).to_bytes(2, "little")
+        loader[0x98:0x9A] = (0x20B).to_bytes(2, "little")
+        loader[0x98 + 68:0x98 + 70] = (10).to_bytes(2, "little")
+        kernel = bytearray(256)
+        kernel[:8] = b"\x89ONBF\r\n\x1a"
+        kernel[8:10] = (1).to_bytes(2, "little")
+        kernel[12:14] = (6).to_bytes(2, "little")
+        kernel[112:114] = (1).to_bytes(2, "little")
+        return loader, kernel
+
+    def test_image_headers(self):
+        loader, kernel = self.images()
+        self.assertIsNone(self.lat.image_fault(bytes(loader), bytes(kernel)))
+        self.assertIn("not an ONBF", self.lat.image_fault(bytes(kernel), bytes(loader)))  # swapped
+        for at, value, word in ((12, 3, "profile 3"), (8, 2, "format 2"), (112, 2, "architecture 2")):
+            bad = bytearray(kernel)
+            bad[at:at + 2] = value.to_bytes(2, "little")
+            self.assertIn(word, self.lat.image_fault(bytes(loader), bytes(bad)))
+        elf = b"\x7fELF" + bytes(300)  # the kernel's ELF before onbf-pack
+        self.assertIn("not an ONBF", self.lat.image_fault(bytes(loader), elf))
+        for at, value, word in ((0x84, 0x14C, "machine 0x14c"), (0x98, 0x10B, "0x10b"),
+                                (0x98 + 68, 3, "subsystem 3")):
+            bad = bytearray(loader)
+            bad[at:at + 2] = value.to_bytes(2, "little")
+            self.assertIn(word, self.lat.image_fault(bytes(bad), bytes(kernel)))
+        self.assertIn("not a PE", self.lat.image_fault(b"MZ" + bytes(10), bytes(kernel)))
+
+    def test_a_wrong_image_is_refused_before_any_request(self):
+        image = self.home / "image"
+        image.mkdir()
+        loader, kernel = self.images()
+        (image / "BOOTX64.EFI").write_bytes(bytes(kernel))
+        (image / "KERNEL.ONBF").write_bytes(bytes(loader))
+        args = mock.Mock(plan="m4-metal-small", max_minutes=50, image_dir=str(image),
+                         source_revision=self.AFTER_IDENTITY_MAPS, yes=False)
+        with mock.patch.object(self.lat, "project_id") as project, \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            with self.assertRaises(SystemExit):
+                self.lat.cmd_rental_b(args)
+            project.assert_not_called()
+        self.assertIn("not an ONBF", err.getvalue())
+
     def test_identity_maps_must_be_in_the_image(self):
         # Item 229 names TASKS item 40's commit, which reached `main` with pull request 27.
         self.assertEqual(self.lat.IDENTITY_MAPS_COMMIT, "b2a67f982ab9820757887712f01de4f91b9bc54f")
@@ -217,14 +267,17 @@ class Guards(unittest.TestCase):
         self.assertFalse(self.lat.is_ancestor(self.lat.IDENTITY_MAPS_COMMIT, self.BEFORE_IDENTITY_MAPS))
         image = self.home / "image"
         image.mkdir()
-        (image / "BOOTX64.EFI").write_bytes(b"loader")
-        (image / "KERNEL.ONBF").write_bytes(b"kernel")
+        loader, kernel = self.images()
+        (image / "BOOTX64.EFI").write_bytes(bytes(loader))
+        (image / "KERNEL.ONBF").write_bytes(bytes(kernel))
         args = mock.Mock(plan="m4-metal-small", max_minutes=50, image_dir=str(image),
                          source_revision=self.BEFORE_IDENTITY_MAPS, yes=False)
-        with mock.patch.object(self.lat, "project_id") as project:
+        with mock.patch.object(self.lat, "project_id") as project, \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             with self.assertRaises(SystemExit):
                 self.lat.cmd_rental_b(args)
             project.assert_not_called()  # refused before any request
+        self.assertIn("item 229 forbids this boot", err.getvalue())
 
     def test_the_identity_maps_commit_is_not_an_option(self):
         with mock.patch.object(sys, "argv", ["latitude.py", "rental-b", "--image-dir", "d",
