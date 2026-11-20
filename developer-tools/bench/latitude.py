@@ -19,7 +19,9 @@ Money is guarded these ways, because a forgotten server bills every hour:
 - Every rental has a deadline (`--max-minutes`, at most 120). A separate watchdog process, kept
   awake with `caffeinate`, deletes the server at the deadline whatever happens to this one, and
   keeps trying until the deletion is confirmed.
-- The rental deletes its server on every way out: success, error and Ctrl-C.
+- The rental deletes its server on every way out: success, error, Ctrl-C, and a SIGTERM or
+  SIGHUP (a stopped background job, a closed terminal). Only SIGKILL, a crash of Python or the
+  Mac itself leave it to the watchdog.
 - A deletion counts only when the API confirms it. Until then the ledger and `status` show the
   server as not deleted.
 
@@ -52,6 +54,7 @@ import json
 import math
 import os
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -597,6 +600,24 @@ def rent(args, kind, work, check=None):
     if not args.yes:
         print("nothing bought: run again with --yes to rent")
         return
+    previous = {sig: signal.signal(sig, stop_on_signal) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        buy_and_run(args, kind, work, project, site, hour)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def stop_on_signal(signum, frame):
+    """Turns SIGTERM and SIGHUP into an exception, so `buy_and_run`'s `finally` deletes the
+    server now rather than the watchdog at the deadline. A second signal is ignored, so it
+    cannot interrupt that deletion."""
+    signal.signal(signum, signal.SIG_IGN)
+    raise SystemExit(f"stopped by signal {signum}")
+
+
+def buy_and_run(args, kind, work, project, site, hour):
+    """Buys the server `rent` has checked, runs `work`, and deletes the server on every way out."""
     print("keep this Mac plugged in, its lid open and online until `status` shows the server "
           "deleted: the watchdog runs here, and the API cannot set a deletion time")
     key_id = ensure_key(project)

@@ -10,6 +10,7 @@ import io
 import json
 import multiprocessing
 import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -155,6 +156,45 @@ class Guards(unittest.TestCase):
         self.assertEqual(rental["server_id"], "sv_late")
         self.assertIn("deleted_at", rental)
         watchdog.assert_not_called()
+
+    def test_sigterm_deletes_the_server_at_once(self):
+        args = mock.Mock(plan="m4-metal-small", max_minutes=50, project=None, site=None, yes=True,
+                         cap_usd=10.0)
+
+        def api(method, path, body=None, ok=None):
+            if (method, path) == ("POST", "/servers"):
+                return {"data": {"id": "sv_t"}}
+            if (method, path) == ("GET", "/servers/sv_t"):
+                return {"data": {"attributes": {"status": "on", "primary_ipv4": "192.0.2.7"}}}
+            raise AssertionError(f"unexpected {method} {path}")
+
+        def work(rental):
+            os.kill(os.getpid(), signal.SIGTERM)
+            for _ in range(1000):  # the handler runs between two bytecodes, here
+                pass
+            raise AssertionError("SIGTERM did not stop the work")
+
+        before = signal.getsignal(signal.SIGTERM)
+        deleted = []
+        with mock.patch.object(self.lat, "project_id", return_value="proj"), \
+                mock.patch.object(self.lat, "bench_servers", return_value=[]), \
+                mock.patch.object(self.lat, "offers", return_value=[(0.81, "AMS", True)]), \
+                mock.patch.object(self.lat, "ensure_key", return_value="key"), \
+                mock.patch.object(self.lat, "api", api), \
+                mock.patch.object(self.lat, "start_watchdog", return_value=4242) as watchdog, \
+                mock.patch.object(self.lat, "wait_for_ssh"), \
+                mock.patch.object(self.lat.Console, "open", return_value=None), \
+                mock.patch.object(self.lat, "delete_server", side_effect=lambda s: deleted.append(s) or "gone"), \
+                mock.patch.object(self.lat.os, "killpg") as killpg, \
+                mock.patch.object(self.lat.time, "sleep"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.lat.rent(args, "b", work)
+        self.assertEqual(deleted, ["sv_t"])
+        self.assertIn("stopped by signal", err.getvalue())
+        killpg.assert_called_once_with(4242, 15)  # confirmed, so the watchdog is stopped
+        self.assertTrue(self.lat.ledger()["rentals"][0]["deleted_by"] == "rental")
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before)  # handlers put back
 
     # Rental B.
 
