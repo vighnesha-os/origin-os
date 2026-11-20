@@ -514,15 +514,17 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 75. **`sched::spawn_with` queues a thread before publishing its first frame (TASKS item 70's follow-up 1). Numbered by the coordinating session on 2026-11-19; not started; after TASKS item 70.** `spawn_with` pushes the new thread into its processor's run queue before `publish_first_frame` records its first frame in the context table. When publication is refused, it returns `Err(Full)` but leaves the thread queued. The scheduler can then pick a frame that was never saved, which the trap entry refuses with a panic. The defect predates TASKS item 70 and cannot be reached while retirement works. TASKS item 70's control W-2b, which removes retirement entirely, reached it. The fix publishes before queueing and takes nothing into the run queue on a refusal, with a boot control that fills the table.
 
-76. **`trap::ExceptionReport`'s `Debug` prints `rip` raw (TASKS item 70's question 8). Numbered by the coordinating session on 2026-11-19; not started.** The exception report's own line gives the faulting instruction's address as `image +0x…` (ADR-0004 A6.2, item 158; ADR-0013 control C47), but its derived `Debug` prints `rip` as it is: an address in the kernel's image. TASKS item 70 changed `GuardedStack`'s and `Probe`'s `Debug` so that they no longer print such addresses, and this is the one it left. The fix makes `Debug` print `rip` as A6.2 says, with a host test.
+76. **`trap::ExceptionReport`'s `Debug` prints `rip` raw (TASKS item 70's question 8). Numbered by the coordinating session on 2026-11-19. Built on 2026-11-20 with TASKS item 80, on `claude/t76-80-small-fixes-9c820a` from `main` at `ea2293ca`; reviewed independently the same day (`REVIEW_T76_80_2026-11-20.md`: no High, 1 Medium, 3 Low, 2 Info, all answered); not landed, not pushed. Its contract, the rulings and the result are under "Task contracts", 76 and 80.** The exception report's own line gives the faulting instruction's address as `image +0x…` (ADR-0004 A6.2, item 158; ADR-0013 control C47), but its derived `Debug` prints `rip` as it is: an address in the kernel's image. TASKS item 70 changed `GuardedStack`'s and `Probe`'s `Debug` so that they no longer print such addresses, and this is the one it left. The fix makes `Debug` print `rip` as A6.2 says, with a host test.
 
 77. **The framework sets a processor's kernel-stack record from the incoming context's home (TASKS item 70's question 9). Numbered by the coordinating session on 2026-11-19; not started; after TASKS item 70.** `set_kernel_stack` takes any stack the scheduler holds, including one that carries another context's suspended frame. An interrupt from ring 3 on that processor would then push onto that frame. With TASKS item 70's home word for each context, `resume` can set `kernel_stack` and TSS.RSP0 itself from the incoming context's home, and `set_kernel_stack` goes. Loom models and a boot control show that no stack but the running context's own is named.
 
 78. **A period check that tolerates stalls (TASKS item 66's review, T66-R17; the coordinating session's ruling (a) of 2026-11-19). Numbered by the coordinating session on 2026-11-19; not started.** TASKS item 66's sampler reads the local APIC timer's count between RDTSC brackets and refuses a pair whose brackets lie too far apart. A stall inside an intermediate read's own bracket escapes that rule, and on a timer over 5 times fast it can hide a reload, so the count passes and only the delivery check fails such a timer, unless recurring stalls also mask its total in the same run. ADR-0013 states this as a limit, and `apic::sample_period`'s host test shows it. The reviewer's rule, the gap measured from the first bracket's start to the second's end (`500f6cd1`), left the period undecided after 64 pairs on 8 of 10 idle 65- and 67-processor boots and failed `boot-matrix`, so it was reverted (`361c813c`). This item finds a check that closes R17's case and still decides on those machines. It starts with a diagnostic round on the 65- and 67-processor software-processor machines, measuring how long and how often intermediate reads stall inside their brackets. The figures go to the coordinating session before any rule is chosen.
 
-80. **`ipc_proof::abi_and_entry` says nothing when a thread start is refused (TASKS item 79's follow-up 1). Numbered by the coordinating session on 2026-11-20; not started.** When a thread start in `abi_and_entry` is refused, the function returns `false` without printing a line, so the boot is refused with "IPC and handles failed" and nothing says which start failed or why. TASKS item 79's control C1w found it on the 1-processor machine; it predates that item. The fix prints the refused start and its error before returning, with a boot control that refuses a start and looks for the line.
+80. **`ipc_proof::abi_and_entry` says nothing when a thread start is refused (TASKS item 79's follow-up 1). Numbered by the coordinating session on 2026-11-20. Built on 2026-11-20 with TASKS item 76, on `claude/t76-80-small-fixes-9c820a` from `main` at `ea2293ca`; reviewed independently the same day (`REVIEW_T76_80_2026-11-20.md`: no High, 1 Medium, 3 Low, 2 Info, all answered); not landed, not pushed. Its contract, the rulings and the result are under "Task contracts", 76 and 80.** When a thread start in `abi_and_entry` is refused, the function returns `false` without printing a line, so the boot is refused with "IPC and handles failed" and nothing says which start failed or why. TASKS item 79's control C1w found it on the 1-processor machine; it predates that item. The fix prints the refused start and its error before returning, with a boot control that refuses a start and looks for the line.
 
 81. **`ipc::reap_closed` lowers its count before it frees a closed channel's messages (TASKS item 79's review, T79-6). Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 79.** `reap_closed` lowers `CLOSED_COUNT` before it drops the undelivered messages of the channel it took, so a settle that waits for the count to reach zero can read the heap while another processor is still freeing them. Whether today's proofs reach it is not known. The reviewer suggests counting a reap in progress and having `settle` wait for it, as TASKS item 79 makes it wait for ending threads. A Loom model of the count, and a boot control that holds a reap open, show it.
+
+82. **The IPC proofs' remaining silent refusals print why (TASKS item 80's question 6; the review of TASKS items 76 and 80, T76-80-5). Numbered by the coordinating session on 2026-11-20; not started.** TASKS item 80 makes `abi_and_entry` print the step that refused each of its programs before it fails. The other proofs of "IPC and handles" still return `false` without a line when a process's image, its process object, its script or its thread start is refused, among them `ping_pong`, `exit_closes`, `cancel`, `quotas`, `byte_quota`, `transfer_depth` and `big_message`: 97 more `return false` in `ipc_proof.rs` and 42 in `ipc_proof/*.rs`, not all of them set-up refusals. A refusal in any of them gives only "IPC and handles failed". The fix routes them through TASKS item 80's `not_run` and `start_program`, which then takes its caller's processor and start argument, with a boot control that refuses one and looks for the line.
 
 ## Waiting on the owner
 
@@ -2802,3 +2804,86 @@ Recorded, not changed: the memory proof's two one-second budgets (TASKS item 74)
   - **The idle round,** right after (10 large boots, host load average 7 to 27): all passed. Nine needed 1 run of the window and 1 s of its budget; intel-65.1 needed 2 runs and 5 s, after one stall of 242 ms. Every tick proof passed at run 1, 998,981 to 1,003,798 ppm, from 1 to 10 pairs; 1 to 38 calibration windows were discarded, and every RTC second was confirmed.
 - **Not shown:** anything under KVM, in CI or on a physical machine. The intermediate commits were not each built on their own; the final tree was. No person has reviewed it.
 
+
+### 76 and 80. `ExceptionReport`'s `Debug`, and `abi_and_entry`'s silent refusals
+
+Assigned together by the coordinating session on 2026-11-20 to one side session. The contract was sent before any code (`t76-80-contract.md` in that session's notes folder), and was accepted as written the same day, with the recommendation taken on every question.
+
+| Field | |
+|---|---|
+| Task ID | TASKS items 76 and 80, on branch `claude/t76-80-small-fixes-9c820a`, from `main` at `ea2293ca`. |
+| Objective | **76:** `trap::ExceptionReport`'s `Debug` prints `rip` as ADR-0004 Amendment 2, A6.2 says, and no field prints an image address. **80:** `ipc_proof::abi_and_entry` prints which start was refused, and the error, before it returns `false`, and so does every other early return of it. |
+| Source ownership | This task's session: `framekernel/frame/src/trap.rs` and `framekernel/src/ipc_proof.rs`; since the review, `runqueue::QueueError`'s `Debug` in `framekernel/src/runqueue.rs` (T76-80-3). **Not:** `stack.rs` and `sched::settle` (TASKS item 73), `sched.rs` and `ipc::reap_closed` (TASKS items 75, 77 and 81). |
+| Architecture contract | ADR-0004 Amendment 2, A6, A6.2 and A6.3 (decision items 158 and 159); ADR-0013 (C47; "IPC and handles" is Refuse); TASKS item 70's `Debug` of `GuardedStack` and `Probe`. **No ABI or format decision.** |
+| Relevant specifications | None opened. The error codes are as `cpu.rs` records them from the Intel SDM. No other operating system's or project's source (§3). |
+| Required dependencies | `main` at `ea2293ca`. No owner decision. |
+| Security invariants | No new `unsafe`. Nothing prints an image, stack-region or direct-map address, or a base, through these `Debug`s or the new lines. |
+| Performance constraints | None. The lines print only when a proof fails. |
+| Required tests | **Host:** `Debug` tells `rip` against slid bases, a planted raw `rip` fails the test, and `Hooks` prints no address. **Boot:** K1, a start refused, and K2, an image refused, each on the fix and on `ea2293ca`, on the 1-processor Intel-IOMMU and 4-processor machines. |
+| Actual deliverables | Small commits, each naming its item or finding; the records (this entry, items 76, 80 and 82, provenance); a hand-over to the coordinating session. |
+| Acceptance conditions | The quick gates, then `cargo xtask check`, `boot-test` and `boot-matrix` once on the final tip, in one turn; an independent review, every finding answered. **Not shown:** anything under KVM or on a physical machine. |
+
+**Rulings of the coordinating session (2026-11-20).** The contract was accepted with the recommendation on every question:
+- **Q1:** `fields`, with the `told` split by target, and the host test through `fields` with its planted control. `check`'s kernel build compiles the target's branch.
+- **Q2:** `Hooks { .. }` in the same commit, with a host test that its text holds no `0x` and no decimal of any hook's address.
+- **Q3:** all of `abi_and_entry`'s refusals print, in one format ending `: ipc failed`. Confirm that `QueueError`'s `Debug` prints no address.
+- **Q3b:** the RFLAGS.AC program stays inline.
+- **Q4:** K1 is required and K2 is extra, both on the fix and on `ea2293ca`.
+- **Q5:** TASKS.md and provenance only; no new ADR-0013 controls.
+- **Q6:** the other proofs' silent refusals are TASKS item 82.
+
+**Result (2026-11-20): built and reviewed, the full gates run once on the final tip (below); not landed and not pushed.** Code, each commit naming its item or finding:
+- `649ea562` (76): `ExceptionReport`'s `Debug` through `fields`, with `phys::told` on the kernel's target, and `Hooks { .. }`.
+- `a77402a6` (80): `NotRun`, `not_run` and `start_program`, and a line for each refusal.
+- `a779d253`: the review as received.
+- `c80205f4` (T76-80-2, T76-80-6), `40b9f61c` (T76-80-3) and `1d612ce9` (T76-80-4): the answers.
+
+**Fields of `ExceptionReport` checked (76):**
+- `vector`: a number.
+- `error_code`: the processor's error code or the stubs' 0. Every gate but the system call's is DPL 0, so ring 3 cannot raise an error-code vector with `int n` (the review checked this).
+- `rip`: now `image +0x…` on the kernel's target.
+- `rsp`, `rax` to `rdx`: may hold addresses; left out, as before.
+- `rflags`, `cs`, `machine_check`: left out.
+- `Hooks`: nine function pointers, whose own `Debug` is their address; now `Hooks { .. }`.
+
+**Refusals in `abi_and_entry` (80): all 23 print one line,** `origin-kernel: ipc: the <program> program was not run: <step>: ipc failed`. The 22 of the contract became 23 when the review's T76-80-4 split the pinned program's scratch-or-script check in two.
+- **Programs:** registers, pinned code range, null GS, RFLAGS.AC, no developer calls, sidt, single-step.
+- **Steps:**
+  - the image (7);
+  - the process object (7);
+  - the thread start (7), with `QueueError`'s `Debug`;
+  - the pinned program's scratch memory and its script (1 each).
+- On success the order, the arguments and every line are unchanged, as the review checked.
+
+**`QueueError`'s `Debug` (ruling Q3).** It did print an address. `BadContext(u64)` carries the first frame's address, in the stack region, and the derived `Debug` printed it in decimal. The scheduler's proof prints a `Result<usize, QueueError>` with it. Since `40b9f61c` it prints `Full`, `BadContext(..)` or `BootContext`, with a host test and a planted control.
+
+**Tests and controls:**
+- **Host:** `trap.rs` 3 tests; `runqueue.rs` `a_refusal_s_debug_prints_no_frame_address`.
+- **Planted controls:**
+  - raw `rip` put back inside `fields` fails 2 tests;
+  - the derived `Hooks` `Debug` fails 1, printing nine addresses;
+  - the derived `QueueError` `Debug` fails 1.
+- **Boot controls K1 and K2,** on the 1-processor Intel-IOMMU and 4-processor machines, kernel boot only, every file put back byte for byte:
+  - **K1:** the registers program made with `threads: 0`, so `quota::may_start` refuses the start. On `a77402a6`: `the registers program was not run: its thread was refused: Full: ipc failed`, and xtask stops the boot at that line. On `ea2293ca`: no such line; the IPC proof's later lines pass, and the boot is refused "IPC and handles failed".
+  - **K2:** the sidt program's image replaced by `None`. On `a77402a6`: the registers line, then `the sidt program was not run: its image could not be made: ipc failed`. On `ea2293ca`: silent, with the same refusal. K2's first run on the old code did not build, because the block ended a `let … else` initialiser; it was run again with the edit in parentheses.
+  - Evidence: `t76-80-evidence/` in the coordinating session's notes folder.
+
+**The independent review and its answers (2026-11-20).** One AI reviewer read `ea2293ca..a77402a6`, read-only, with no build: 0 High, 1 Medium, 3 Low, 2 Info (`REVIEW_T76_80_2026-11-20.md`; its Resolution lists the answers).
+- **T76-80-1 (Medium):** no boot control was in the change. Answered by K1 and K2 above.
+- **T76-80-2 (Low):** no test reaches the kernel's `Debug` wiring. Recorded as a known limit (option (b)).
+- **T76-80-3 (Low):** `QueueError`'s `Debug`. Fixed.
+- **T76-80-4 (Low):** scratch named as script. Split.
+- **T76-80-5 (Info):** the other proofs. TASKS item 82.
+- **T76-80-6 (Info):** the doc on the host's output, and where the plant went. Corrected; the plant was inside `fields`.
+
+**Where it differs from the contract:**
+1. **`runqueue.rs` changed,** outside the files named, for T76-80-3. Neither the TASKS 73 branch nor `land/batch-8` changes it.
+2. **`NotRun` prints a refused start through `QueueError`'s `Debug`,** not through its own list, once that `Debug` printed no address. `BadContext` reads `BadContext(..)`.
+3. **23 refusals, not 22** (T76-80-4).
+
+**Not shown:**
+- the kernel's `Debug` of a report, in any boot (T76-80-2);
+- the scratch-memory line and `BadContext(..)`, in any boot;
+- anything under KVM or on a physical machine.
+
+**Review:** one AI reviewer; no person.
