@@ -65,6 +65,19 @@ impl core::fmt::Display for Unsettled {
     }
 }
 
+/// The most passes a settle makes before it judges (the review of TASKS items 75, 77 and 81,
+/// R81-2; the coordinating session's ruling).
+pub const MAX_PASSES: u32 = 3;
+
+/// Whether a settle that has made `passes` passes makes another: the last one left something
+/// pending (`pending`: a closed channel listed or being reaped, a thread ending, or a zombie), or
+/// its own drain freed a closed channel (`drained`), which may have woken a thread that has not
+/// yet run to its end; and it has made fewer than [`MAX_PASSES`]. Otherwise it judges what it
+/// reads.
+pub fn again(passes: u32, pending: bool, drained: bool) -> bool {
+    (pending || drained) && passes < MAX_PASSES
+}
+
 /// The settle's verdict from what it read when its waits ended: `ending` threads not yet off
 /// their processors, `zombies` exited threads unreaped, `retired` stacks retired, `closed`
 /// closed channels not yet reaped, and the stacks lost before it began (`lost_before`) and after
@@ -154,6 +167,42 @@ mod tests {
             judge(2, 1, 2, 4, 0, 3).unwrap_err().to_string(),
             "2 ending threads not yet exited, 1 exited threads unreaped, 2 kernel stacks retired, 4 closed channels not yet reaped, 3 kernel stacks lost to a stalled shootdown"
         );
+    }
+
+    /// The pass rule (R81-2): a pass that leaves nothing pending and drained nothing itself is
+    /// the last; one that leaves something, or whose own drain freed a channel, is followed by
+    /// another, up to three in all, after which the settle judges.
+    #[test]
+    fn a_settle_passes_again_only_while_something_is_pending_or_drained_and_at_most_three_times() {
+        assert!(!again(1, false, false), "quiet: judge after one pass");
+        assert!(again(1, true, false), "something pending");
+        assert!(again(1, false, true), "its own drain freed a channel");
+        assert!(again(2, true, true));
+        assert!(
+            !again(3, true, true),
+            "three passes, then judge, which names what is pending"
+        );
+        assert!(!again(3, false, true), "a drain in the third pass: judged");
+        assert!(!again(2, false, false));
+        assert_eq!(MAX_PASSES, 3);
+        // The passes a settle makes, for each pass's outcome (pending, drained) in turn.
+        let passes_made = |outcomes: &[(bool, bool)]| {
+            let mut passes = 0;
+            for &(pending, drained) in outcomes {
+                passes += 1;
+                if !again(passes, pending, drained) {
+                    break;
+                }
+            }
+            passes
+        };
+        assert_eq!(passes_made(&[(false, false), (true, true)]), 1);
+        assert_eq!(passes_made(&[(false, true), (false, false)]), 2);
+        assert_eq!(
+            passes_made(&[(true, false), (false, true), (false, false)]),
+            3
+        );
+        assert_eq!(passes_made(&[(true, true); 4]), 3);
     }
 
     #[test]

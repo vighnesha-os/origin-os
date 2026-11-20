@@ -358,11 +358,30 @@ pub(crate) use crate::settled::{Unsettled, not_settled};
 /// [`OTHERS_PATIENCE`] seconds for each part; `Err` names what was still pending, and any
 /// stack lost to a stalled shootdown while it ran (`settled`: safe by design, 4 frames each).
 ///
-/// **Closed channels** (TASKS item 81). Last, every closed channel's undelivered messages are
+/// **Closed channels** (TASKS item 81). First, every closed channel's undelivered messages are
 /// freed: those still listed by this flow's own [`crate::ipc::reap_closed`], and those another
 /// processor took off the list by its own, for which it waits. A reap in a system call's epilogue
 /// on another processor could otherwise still be freeing what an ended process's messages held
-/// when a proof read its first count (the review of TASKS item 79, T79-6).
+/// when a proof read its first count (the review of TASKS item 79, T79-6). It comes first because
+/// a drain can wake a thread that then ends, whose end the exits wait after it then sees; were it
+/// last, such an end would come after the exits wait and before the verdict, which would fail on
+/// what the settle itself did (the review of TASKS items 75, 77 and 81, R81-2).
+///
+/// **Passes** (the coordinating session's rulings on R81-2). The drain and its wait, the exits
+/// wait, the trim, the reclaim and the retired wait make one pass ([`settle_pass`]). After a pass
+/// that left a closed channel pending, or a thread ending or a zombie, or whose own drain freed a
+/// closed channel, the settle yields once and opens an interrupt window, so that a thread the
+/// drain woke gets the processor, and makes another pass; up to [`crate::settled::MAX_PASSES`] in
+/// all ([`crate::settled::again`]), then it judges. That also covers the reverse case: a thread
+/// that ends during the exits wait lists and reaps its own channels in its `end_with`, but if
+/// another processor had taken one of them first, that processor may still be freeing its
+/// messages once the closed wait has passed; the next pass waits for it. A settle that is still
+/// not settled after its last pass fails by name, as before.
+///
+/// Two limits. A thread a drain woke on another processor that has not ended by the next pass's
+/// look is an end no one has seen, which a settle never promised to wait for (TASKS item 79
+/// covers ends that were seen). And a drain in the third pass is followed by the verdict, with no
+/// pass after it.
 ///
 /// **Reaping closed channels here** (the coordinating session's addition (e)). The wait's closure
 /// runs on the boot flow, which waits with interrupts off (an interrupt window between rounds),
@@ -382,7 +401,48 @@ pub(crate) use crate::settled::{Unsettled, not_settled};
 /// settles, so no other processor is waiting in a settle meanwhile.
 pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
     let lost_before = origin_frame::stack::counts().lost;
+    let mut passes = 0;
+    loop {
+        let drained = settle_pass(tsc_hz);
+        passes += 1;
+        let pending = crate::ipc::closed_pending() != 0 || !exits_pending().none();
+        if !crate::settled::again(passes, pending, drained > 0) {
+            break;
+        }
+        // A thread the drain woke gets the processor before the next pass looks for its end.
+        yield_now();
+        cpu::interrupt_window();
+    }
+    let counts = origin_frame::stack::counts();
+    let exits = exits_pending();
+    crate::settled::judge(
+        exits.ending,
+        exits.zombies,
+        counts.retired,
+        crate::ipc::closed_pending(),
+        lost_before,
+        counts.lost,
+    )
+}
+
+/// One pass of [`settle`]: closed channels drained and their reaps waited for (TASKS item 81),
+/// then ending threads and zombies, then the cache of kept stacks trimmed and every retired stack
+/// reclaimed and waited for. Each wait up to [`OTHERS_PATIENCE`] seconds. Returns how many closed
+/// channels this pass's own drain freed.
+fn settle_pass(tsc_hz: u64) -> usize {
     reap();
+    // The reap runs on the boot flow, with interrupts off and no lock held between messages, as
+    // a proof's own `reap_closed` does; see `settle`'s "Reaping closed channels here".
+    let drained = core::cell::Cell::new(0);
+    wait_for_others(
+        "closed channels' reaping",
+        || {
+            drained.set(drained.get() + crate::ipc::reap_closed());
+            crate::ipc::closed_pending() == 0
+        },
+        tsc_hz,
+        2000,
+    );
     wait_for_others(
         "ending threads' exits and reaping",
         || exits_pending().none(),
@@ -397,28 +457,7 @@ pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
         tsc_hz,
         2000,
     );
-    // Closed channels' messages, reaped here or on another processor, are freed (TASKS item 81).
-    // The reap runs on the boot flow, with interrupts off and no lock held between messages, as a
-    // proof's own `reap_closed` does; see "Reaping closed channels here" above.
-    wait_for_others(
-        "closed channels' reaping",
-        || {
-            crate::ipc::reap_closed();
-            crate::ipc::closed_pending() == 0
-        },
-        tsc_hz,
-        2000,
-    );
-    let counts = origin_frame::stack::counts();
-    let exits = exits_pending();
-    crate::settled::judge(
-        exits.ending,
-        exits.zombies,
-        counts.retired,
-        crate::ipc::closed_pending(),
-        lost_before,
-        counts.lost,
-    )
+    drained.get()
 }
 
 /// [`reap`]'s own processor's exited threads.

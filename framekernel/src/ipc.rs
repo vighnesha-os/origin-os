@@ -475,7 +475,12 @@ fn list_closed(channel: &ObjectRef<KernelChannel>) {
 /// are dropped (TASKS item 81), so a reap in progress here keeps [`closed_pending`] above 0 for
 /// every other processor. One that finds a count but an empty list, because another processor
 /// is reaping, returns: it does not wait for that reap. [`crate::sched::settle`] does.
-pub(crate) fn reap_closed() {
+///
+/// Returns how many channels this call drained: a settle whose own drain freed one passes again,
+/// since what it freed may have woken a thread that then ends (the review of TASKS items 75, 77
+/// and 81, R81-2).
+pub(crate) fn reap_closed() -> usize {
+    let mut drained = 0;
     while CLOSED_COUNT.pending() != 0 {
         let taken = without_interrupts(|| {
             let mut head = CLOSED.lock();
@@ -484,7 +489,7 @@ pub(crate) fn reap_closed() {
             Some(channel)
         });
         let Some(channel) = taken else {
-            return;
+            return drained;
         };
         // Off the list. A later close lists the channel again; one that saw it still listed
         // stored its messages before this swap, so the loop below takes them.
@@ -498,7 +503,9 @@ pub(crate) fn reap_closed() {
             }
             drop(channel);
         });
+        drained += 1;
     }
+    drained
 }
 
 /// Closed channels listed and not yet reaped, and those being reaped on any processor (TASKS
