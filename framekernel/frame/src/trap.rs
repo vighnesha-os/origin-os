@@ -64,8 +64,10 @@ pub struct ExceptionReport<'a> {
 }
 
 /// Shows the vector, the error code, and `rip` as a crash report prints an address (ADR-0004
-/// Amendment 2, A6.2; TASKS item 76): `image +0x…`, never the address, which would give the
-/// image's base away. The rest is left out: `rsp` and `rax` to `rdx` may hold addresses too.
+/// Amendment 2, A6.2; TASKS item 76). On the kernel's target that is `image +0x…`, never the
+/// address, which would give the image's base away. On the host, where there is no image and no
+/// base, it is the address itself. The rest is left out: `rsp` and `rax` to `rdx` may hold
+/// addresses too.
 /// `error_code` is never one: it is the processor's error code, or the 0 the entry pushes for a
 /// vector that has none.
 impl core::fmt::Debug for ExceptionReport<'_> {
@@ -185,6 +187,11 @@ mod tests {
     /// `rip` is an image offset, as the report's own line prints it (ADR-0013 C47); no field
     /// that may hold an address is printed, and no base: every one of them holds an address in
     /// a sliding window here, and the machine check's text names the image's base.
+    ///
+    /// What this shows is that `fields` tells `rip` through the teller it is given. That the
+    /// kernel's `Debug` gives it `phys::told` (the target's `told`) is not tested: no host test
+    /// reaches a `target_os = "none"` function, and no boot line prints this `Debug` (the
+    /// review's T76-80-2, a known limit).
     #[test]
     fn debug_tells_rip_as_an_image_offset_and_prints_no_address() {
         let b = bases();
