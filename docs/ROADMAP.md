@@ -168,6 +168,8 @@ M2-6's negative controls are shown under QEMU: ADR-0013's controls are temporary
 
 M3-6 needs the prerequisites in "Before a first boot on a machine in scope".
 
+**M3-1 and processors offline and back** (ADR-0020 S21, decision item 338, 2026-11-20). M3-1 names processors taken offline and back. That work is decided in an amendment of its own to ADR-0008, written once threads can move between processors (after TASKS item 96); ADR-0020 provides only the evacuation of a processor. **M3-1 stays partial until that amendment is built**, whatever else of M3 is done. Row A20-S21 is a rule and needs no place.
+
 **Further rows placed here: accepted (item 269).**
 
 | Rows | Subject |
@@ -185,6 +187,12 @@ M3-6 needs the prerequisites in "Before a first boot on a machine in scope".
 | S28-13 | NUMA policies |
 | S68-03, S68-11 | High-resolution timers and their cancellation |
 | S84-14 | SMP and topology work started |
+
+**Twenty-one more rows placed here (items 318 to 337 and 340, 2026-11-20).** Placed under item 264's rule by TASKS item 90's records, for the coordinating session's review; they are in no exit test and change none. ADR-0020 decides how M3-2 to M3-4's rows are to be met, and its build plan (`docs/engineering/M3_SCHEDULING_PLAN.md`) builds them as TASKS items 92 to 108. A20-S21 and A20-S22 are rules and need no place.
+
+| Rows | Subject |
+|---|---|
+| A20-S1 to A20-S20, A20-S23 | Scheduling across processors (ADR-0020): threads that move, balancing and placement by topology and capacity, affinity, classes and levels, accounting, quotas, weight lending, power and heat, SMT, EEVDF's evaluation, pinned mode, and its proofs and machines |
 
 ## M4. Processes and IPC
 
@@ -223,6 +231,12 @@ M4-1 rests on ADR-0005 G3 and G4, drafts to be decided again with step 5 and wit
 | Rows | Subject |
 |---|---|
 | A05-I1 | A port's creator pays for its index (ADR-0005 Amendment 10) |
+
+**Five more rows placed here, beside P8 and P9, which they refine (item 341, 2026-11-20).** Placed under item 264's rule by TASKS item 90's records, for the coordinating session's review; they are in no exit test and change none. They are built after ADR-0020's core, as TASKS item 109. A05-J6 is a rule and needs no place.
+
+| Rows | Subject |
+|---|---|
+| A05-J1 to A05-J5 | A waiting client lends its class and weight across a call (ADR-0005 Amendment 11) |
 
 ## M5. Storage
 
