@@ -11,8 +11,12 @@
 //!    `EfiReservedMemoryType` pages (a firmware may keep its tables there; then a range over
 //!    the copy passes the memory-map rule, and only the kernel's refusal of writable ranges over
 //!    tables it holds stops it), and points the XSDT's entry at the copy;
-//! 4. prints each region on the console, so the boot test can hold the kernel's report against
-//!    it, and starts the loader with this volume as its device.
+//! 4. shapes the tables as rental B's board has them, if the configuration asks (TASKS item 83):
+//!    reserved pages at the top of the RAM; a copy of the FADT naming the FACS by its 32-bit
+//!    field alone; an FPDT whose FBPT and S3PT are in reserved pages; and copies of the XSDT and
+//!    the RSDP in ACPI NVS memory, with the configuration table pointed at the RSDP's copy;
+//! 5. prints each region and each change on the console, so the boot test can hold the
+//!    kernel's report against it, and starts the loader with this volume as its device.
 //!
 //! Any failure is printed and returned: the loader never starts, and the boot test fails.
 //! The `unsafe` here is the firmware's calling convention and its memory, each with a SAFETY
@@ -32,15 +36,23 @@ use origin_boot_uefi::protocols::{
 };
 use origin_boot_uefi::uefi::{Handle, Status, SystemTable};
 use origin_test_reserved_memory::{
-    MAX_REGIONS, PAGE, Placement, Region, STRUCTURE, Table, decode, fill_byte, grow, structure,
+    FBPT_LEN, FPDT_LEN, MAX_REGIONS, PAGE, Placement, RSDP_LEN, Region, S3PT_LEN, STRUCTURE, Shape,
+    Table, decode, facs_by_32_bit_field, fbpt, fill_byte, fpdt, grow, rsdp_naming, s3pt, structure,
     xsdt_entries, xsdt_set,
 };
 
-/// `AllocateMaxAddress`: at or below the address given.
+/// `AllocateMaxAddress`: at or below the address given; `AllocateAddress`: at it (§7.2).
 const ALLOCATE_MAX_ADDRESS: u32 = 1;
-/// `EfiReservedMemoryType`, `EfiLoaderData`, `EfiACPIReclaimMemory` (§7.2).
+const ALLOCATE_ADDRESS: u32 = 2;
+/// `EfiReservedMemoryType`, `EfiLoaderData`, `EfiConventionalMemory`, `EfiACPIReclaimMemory`,
+/// `EfiACPIMemoryNVS` (§7.2).
 const RESERVED_MEMORY: u32 = 0;
 const LOADER_DATA: u32 = 2;
+const CONVENTIONAL_MEMORY: u32 = 7;
+const ACPI_RECLAIM: u32 = 9;
+const ACPI_NVS: u32 = 10;
+/// Bytes of the buffer the memory map is read into: room for 1,000 descriptors of 48 bytes.
+const MAP_BUFFER: usize = 48 * 1024;
 /// Regions are placed below 4 GiB, where firmware puts its legacy reservations.
 const BELOW_4G: u64 = 0xFFFF_F000;
 /// The largest file read (the loader is about 300 KiB).
@@ -58,6 +70,9 @@ type LoadImageFn = unsafe extern "efiapi" fn(
 /// `EFI_IMAGE_START` (§7.4).
 type StartImageFn =
     unsafe extern "efiapi" fn(image: Handle, exit_size: *mut usize, exit: *mut *mut u16) -> Status;
+/// `EFI_INSTALL_CONFIGURATION_TABLE` (§4.4).
+type InstallConfigurationTableFn =
+    unsafe extern "efiapi" fn(guid: *const Guid, table: *mut c_void) -> Status;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
@@ -116,20 +131,24 @@ fn run(image: Handle, st: &SystemTable, out: &mut ConOut) -> Result<Status, Fail
         last_device: 0,
         pages: 1,
     }; MAX_REGIONS];
-    let count = decode(config, &mut regions)
+    let (count, shape) = decode(config, &mut regions)
         .map_err(|_| (Status::LOAD_ERROR, "RESERVED.CFG is invalid"))?;
     let regions = &regions[..count];
-    let xsdt = xsdt(st)?;
+    let rsdp = rsdp_address(st)?;
+    let xsdt = xsdt_at(rsdp)?;
     for table in [Table::Dmar, Table::Ivrs] {
         if regions.iter().any(|r| r.table == table) {
             plant(bs, out, xsdt, table, regions)?;
         }
     }
+    if shape.any() {
+        shape_tables(bs, out, rsdp, xsdt, shape)?;
+    }
     start_loader(bs, out, image, device, loader)
 }
 
-/// The firmware's XSDT, writable: found through the ACPI 2.0 RSDP in the configuration table.
-fn xsdt(st: &SystemTable) -> Result<&'static mut [u8], Failure> {
+/// The ACPI 2.0 RSDP's address, from the configuration table.
+fn rsdp_address(st: &SystemTable) -> Result<u64, Failure> {
     let table = st
         .configuration_table
         .cast::<ConfigurationTable>()
@@ -150,6 +169,11 @@ fn xsdt(st: &SystemTable) -> Result<&'static mut [u8], Failure> {
     if rsdp == 0 {
         return Err(missing);
     }
+    Ok(rsdp)
+}
+
+/// The XSDT the RSDP at `rsdp` names, writable.
+fn xsdt_at(rsdp: u64) -> Result<&'static mut [u8], Failure> {
     // SAFETY: the RSDP the firmware published is 36 bytes of identity-mapped memory (ACPI 6.6
     // §5.2.5.3); boot services keep it mapped.
     let rsdp_bytes = unsafe { physical(rsdp, 36) };
@@ -299,6 +323,216 @@ fn plant(
         "origin-test-reserved: the XSDT now names {} at {new:#x} ({new_len} bytes) in place of the firmware's at {addr:#x}",
         core::str::from_utf8(sig).unwrap_or("the table")
     );
+    Ok(())
+}
+
+/// Shapes the firmware's tables as rental B's board has them (TASKS item 83), in this order:
+/// reserved pages at the top of the RAM; a copy of the FADT whose FACS is named by
+/// `FIRMWARE_CTRL` alone; an FPDT whose FBPT and S3PT are in reserved pages; then a copy of the
+/// XSDT (in ACPI NVS memory if asked, with the FPDT's entry appended), and an RSDP naming it:
+/// a copy in ACPI NVS memory, which the configuration table then names, or the firmware's own,
+/// rewritten in place.
+fn shape_tables(
+    bs: &BootServices,
+    out: &mut ConOut,
+    rsdp: u64,
+    xsdt: &mut [u8],
+    shape: Shape,
+) -> Result<(), Failure> {
+    let _ = writeln!(
+        out,
+        "origin-test-reserved: TEST ONLY: shaping the firmware's tables as rental B's board has them"
+    );
+    if shape.top_reserved_pages != 0 {
+        let pages = shape.top_reserved_pages as usize;
+        let base = allocate_at_top(bs, RESERVED_MEMORY, pages)?;
+        let last = base + pages as u64 * PAGE - 1;
+        let _ = writeln!(
+            out,
+            "origin-test-reserved: reserved {base:#x}-{last:#x} ({pages} pages) at the top of the RAM"
+        );
+    }
+    if shape.facs_32 {
+        let (index, addr, old) = find_table(xsdt, b"FACP")?;
+        let new = allocate(bs, ACPI_RECLAIM, old.len().div_ceil(PAGE as usize))?;
+        // SAFETY: the pages just allocated, identity-mapped, owned by nothing else, at least
+        // `old.len()` bytes.
+        let copy = unsafe { physical_mut(new, old.len()) };
+        copy.copy_from_slice(old);
+        let facs = facs_by_32_bit_field(copy)
+            .ok_or((Status::LOAD_ERROR, "the FADT names no FACS below 4 GiB"))?;
+        xsdt_set(xsdt, index, new).ok_or((Status::LOAD_ERROR, "the XSDT cannot be changed"))?;
+        let _ = writeln!(
+            out,
+            "origin-test-reserved: the XSDT now names FACP at {new:#x} in place of the firmware's at {addr:#x}: the FACS at {facs:#x} by FIRMWARE_CTRL alone"
+        );
+    }
+    let mut appended = None;
+    if shape.fpdt {
+        let fbpt_at = allocate(bs, RESERVED_MEMORY, FBPT_LEN.div_ceil(PAGE as usize))?;
+        let s3pt_at = allocate(bs, RESERVED_MEMORY, S3PT_LEN.div_ceil(PAGE as usize))?;
+        let fpdt_at = allocate(bs, ACPI_RECLAIM, FPDT_LEN.div_ceil(PAGE as usize))?;
+        // SAFETY: each the pages just allocated for it, identity-mapped and owned by nothing
+        // else, at least as long as what is written.
+        unsafe { physical_mut(fbpt_at, FBPT_LEN) }.copy_from_slice(&fbpt());
+        // SAFETY: as above.
+        unsafe { physical_mut(s3pt_at, S3PT_LEN) }.copy_from_slice(&s3pt());
+        // SAFETY: as above.
+        unsafe { physical_mut(fpdt_at, FPDT_LEN) }.copy_from_slice(&fpdt(fbpt_at, s3pt_at));
+        let _ = writeln!(
+            out,
+            "origin-test-reserved: FPDT at {fpdt_at:#x}, its FBPT at {fbpt_at:#x} and S3PT at {s3pt_at:#x} in reserved pages"
+        );
+        appended = Some(fpdt_at);
+    }
+    if !shape.acpi_nvs && appended.is_none() {
+        return Ok(());
+    }
+    // The XSDT's copy, with the FPDT's entry after the firmware's entries.
+    let old_len = xsdt.len();
+    let new_len = old_len + appended.map_or(0, |_| 8);
+    let (kind, name) = if shape.acpi_nvs {
+        (ACPI_NVS, "ACPI NVS")
+    } else {
+        (ACPI_RECLAIM, "ACPI reclaim")
+    };
+    let new_xsdt = allocate(bs, kind, new_len.div_ceil(PAGE as usize))?;
+    // SAFETY: the pages just allocated, identity-mapped, owned by nothing else, at least
+    // `new_len` bytes.
+    let dst = unsafe { physical_mut(new_xsdt, new_len) };
+    match appended {
+        Some(fpdt_at) => {
+            grow(xsdt, &fpdt_at.to_le_bytes(), dst)
+                .ok_or((Status::LOAD_ERROR, "the XSDT's copy does not fit"))?;
+        }
+        None => dst.copy_from_slice(xsdt),
+    }
+    let _ = writeln!(
+        out,
+        "origin-test-reserved: the XSDT is copied to {new_xsdt:#x} ({name}), {new_len} bytes"
+    );
+    // SAFETY: the RSDP the firmware published, 36 bytes (`xsdt_at` checked its signature).
+    let old_rsdp = unsafe { physical(rsdp, RSDP_LEN) };
+    let new_rsdp = rsdp_naming(old_rsdp, new_xsdt)
+        .ok_or((Status::LOAD_ERROR, "the RSDP is not an ACPI 2.0 one"))?;
+    if shape.acpi_nvs {
+        let at = allocate(bs, ACPI_NVS, 1)?;
+        // SAFETY: the page just allocated, identity-mapped and owned by nothing else.
+        unsafe { physical_mut(at, RSDP_LEN) }.copy_from_slice(&new_rsdp);
+        install_configuration_table(bs, &ACPI_20_TABLE, at)?;
+        let _ = writeln!(
+            out,
+            "origin-test-reserved: the RSDP is copied to {at:#x} (ACPI NVS), and the configuration table names it"
+        );
+    } else {
+        // SAFETY: the firmware's RSDP, 36 bytes of identity-mapped memory this application
+        // alone writes while it runs.
+        unsafe { physical_mut(rsdp, RSDP_LEN) }.copy_from_slice(&new_rsdp);
+        let _ = writeln!(
+            out,
+            "origin-test-reserved: the RSDP at {rsdp:#x} now names it"
+        );
+    }
+    Ok(())
+}
+
+/// The first table with signature `sig` the XSDT lists: its index there, its address, and its
+/// bytes over its declared length.
+fn find_table(xsdt: &[u8], sig: &[u8; 4]) -> Result<(usize, u64, &'static [u8]), Failure> {
+    let (index, addr) = xsdt_entries(xsdt)
+        .find(|&(_, a)| {
+            // SAFETY: every XSDT entry names a table whose 4-byte signature is readable.
+            a != 0 && unsafe { physical(a, 4) } == sig
+        })
+        .ok_or((Status::NOT_FOUND, "the firmware has no such table"))?;
+    // SAFETY: the table's header, then its declared length.
+    let head = unsafe { physical(addr, 8) };
+    let mut l = [0u8; 4];
+    l.copy_from_slice(&head[4..8]);
+    let len = u32::from_le_bytes(l) as usize;
+    if !(36..=0x1_0000).contains(&len) {
+        return Err((Status::LOAD_ERROR, "a table has a strange length"));
+    }
+    // SAFETY: as above.
+    Ok((index, addr, unsafe { physical(addr, len) }))
+}
+
+/// `pages` pages of `memory_type` at the top of the RAM: the end of the highest
+/// `EfiConventionalMemory` range the memory map lists that holds them (§7.2).
+fn allocate_at_top(bs: &BootServices, memory_type: u32, pages: usize) -> Result<u64, Failure> {
+    let get = bs
+        .get_memory_map
+        .ok_or((Status::UNSUPPORTED, "no GetMemoryMap"))?;
+    let buffer = allocate(bs, LOADER_DATA, MAP_BUFFER.div_ceil(PAGE as usize))?;
+    let (mut size, mut key, mut descriptor, mut version) = (MAP_BUFFER, 0usize, 0usize, 0u32);
+    // SAFETY: valid `GetMemoryMap` into this application's buffer of `size` bytes, with live
+    // out-parameters.
+    let status = unsafe {
+        get(
+            &mut size,
+            ptr::with_exposed_provenance_mut::<u8>(buffer as usize),
+            &mut key,
+            &mut descriptor,
+            &mut version,
+        )
+    };
+    if status.is_error() || descriptor < 40 || size > MAP_BUFFER {
+        return Err((status, "the memory map cannot be read"));
+    }
+    // SAFETY: the `size` bytes `GetMemoryMap` just wrote into this application's buffer.
+    let map = unsafe { physical(buffer, size) };
+    let want = pages as u64 * PAGE;
+    let field = |d: &[u8], at: usize| {
+        let mut v = [0u8; 8];
+        v.copy_from_slice(&d[at..at + 8]);
+        u64::from_le_bytes(v)
+    };
+    // `EFI_MEMORY_DESCRIPTOR`: Type at 0, PhysicalStart at 8, NumberOfPages at 24.
+    let top = map
+        .chunks_exact(descriptor)
+        .filter(|d| u32::from_le_bytes([d[0], d[1], d[2], d[3]]) == CONVENTIONAL_MEMORY)
+        .map(|d| (field(d, 8), field(d, 24).saturating_mul(PAGE)))
+        .filter(|&(_, bytes)| bytes >= want)
+        .map(|(start, bytes)| start + bytes)
+        .max()
+        .ok_or((
+            Status::OUT_OF_RESOURCES,
+            "no free range holds the top's pages",
+        ))?;
+    let f = bs
+        .allocate_pages
+        .ok_or((Status::UNSUPPORTED, "no AllocatePages"))?;
+    let mut addr = top - want;
+    // SAFETY: valid `AllocatePages` at the address in `addr`, a live local.
+    let status = unsafe { f(ALLOCATE_ADDRESS, memory_type, pages, &mut addr) };
+    if status.is_error() {
+        return Err((status, "AllocatePages at the top of the RAM failed"));
+    }
+    Ok(addr)
+}
+
+/// `InstallConfigurationTable` for `guid`, naming the table at physical `table`.
+fn install_configuration_table(bs: &BootServices, guid: &Guid, table: u64) -> Result<(), Failure> {
+    // `LocateDevicePath` and `InstallConfigurationTable` follow `LocateHandle` (§4.4).
+    let install = bs.device_paths[1];
+    if install.is_null() {
+        return Err((Status::UNSUPPORTED, "no InstallConfigurationTable"));
+    }
+    // SAFETY: the boot services table's slot at offset 192, after `LocateDevicePath` and
+    // before `LoadImage` at 200, holds `InstallConfigurationTable` (§4.4).
+    let install: InstallConfigurationTableFn =
+        unsafe { core::mem::transmute::<*const c_void, InstallConfigurationTableFn>(install) };
+    // SAFETY: valid `InstallConfigurationTable` with a live GUID and a table this application
+    // allocated, which stays allocated.
+    let status = unsafe {
+        install(
+            guid,
+            ptr::with_exposed_provenance_mut::<c_void>(table as usize),
+        )
+    };
+    if status.is_error() {
+        return Err((status, "InstallConfigurationTable failed"));
+    }
     Ok(())
 }
 
