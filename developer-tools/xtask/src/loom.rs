@@ -1422,15 +1422,14 @@ const CONTROLS: &[Control] = &[
     Control {
         // BX1 (TASKS item 81): the count lowered before the release, the order `reap_closed` had
         // before TASKS item 81 (the review of TASKS item 79, T79-6): a settle on another processor
-        // can find nothing pending while the release still holds what it frees.
+        // can find nothing pending while the release still holds what it frees. B1's alone: B2's
+        // settle reaps and reads only once the ender has finished its reaps, releases included,
+        // so no lowering before a release is ever seen there (B2 passes under BX1).
         name: "backlog_lowered_before_released",
         file: BACKLOG,
         from: "        let released = release();\n        self.count.fetch_sub(1, AcqRel);\n",
         to: "        self.count.fetch_sub(1, AcqRel);\n        let released = release();\n",
-        models: &[
-            ("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY),
-            ("backlog_a_lowering_cannot_cancel_another_pieces_raise", BACKLOG_EARLY),
-        ],
+        models: &[("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY)],
     },
     Control {
         // BX4 (the review of TASKS items 75, 77 and 81, R81-1): the count raised after the list's
