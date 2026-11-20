@@ -4,7 +4,9 @@
 //! A settle is whole when no thread whose end may have been seen is still on its processor (TASKS
 //! item 79), no exited thread awaits its reaping, no kernel stack is retired, being reclaimed or
 //! waiting after a stall, no closed channel's messages are listed or being freed
-//! (TASKS item 81), and no stack was lost while it ran.
+//! (TASKS item 81), and no stack was lost while it ran. Nor has any wake-up yet followed a thread
+//! that moved, since no thread moves (TASKS item 92): one that did is named by every later
+//! settle.
 //!
 //! A stack waits when its reclaim's shootdown stalls: some processor did not answer within the
 //! shootdown's patience (1 s), so a stale translation may remain, and the slot and its frames are
@@ -33,6 +35,9 @@ pub struct Unsettled {
     pub closed: u64,
     /// Kernel stacks lost while the settle ran.
     pub lost: usize,
+    /// Moves of a thread that wake-ups have followed since the boot began (`sched::wake`, TASKS
+    /// item 92). None, while no thread moves.
+    pub followed: u64,
 }
 
 impl core::fmt::Display for Unsettled {
@@ -71,6 +76,15 @@ impl core::fmt::Display for Unsettled {
         if self.lost > 0 {
             part(f, format_args!("{} kernel stacks lost", self.lost))?;
         }
+        if self.followed > 0 {
+            part(
+                f,
+                format_args!(
+                    "{} moves followed by wake-ups, where no thread moves",
+                    self.followed
+                ),
+            )?;
+        }
         Ok(())
     }
 }
@@ -91,9 +105,11 @@ pub fn again(passes: u32, pending: bool, drained: bool) -> bool {
 /// The settle's verdict from what it read when its waits ended: `ending` threads not yet off
 /// their processors, `zombies` exited threads unreaped, `retired` stacks retired, the processor a
 /// stack waiting after a stall waits for (`waiting_for`), `closed` closed channels not yet
-/// reaped, and the stacks lost before it began (`lost_before`) and after it ended
-/// (`lost_after`). `waiting_for` only says more of `retired`: read apart from it, it is dropped
-/// when `retired` is 0, so the verdict rests on the count.
+/// reaped, the stacks lost before it began (`lost_before`) and after it ended (`lost_after`), and
+/// the moves wake-ups have followed since the boot began (`followed`). `waiting_for` only says
+/// more of `retired`: read apart from it, it is dropped when `retired` is 0, so the verdict rests
+/// on the count.
+#[allow(clippy::too_many_arguments)]
 pub fn judge(
     ending: u64,
     zombies: u64,
@@ -102,6 +118,7 @@ pub fn judge(
     closed: u64,
     lost_before: usize,
     lost_after: usize,
+    followed: u64,
 ) -> Result<(), Unsettled> {
     let pending = Unsettled {
         ending,
@@ -110,6 +127,7 @@ pub fn judge(
         waiting_for: waiting_for.filter(|_| retired > 0),
         closed,
         lost: lost_after.saturating_sub(lost_before),
+        followed,
     };
     if pending == Unsettled::default() {
         Ok(())
@@ -137,57 +155,71 @@ mod tests {
 
     #[test]
     fn a_whole_settle_is_ok() {
-        assert_eq!(judge(0, 0, 0, None, 0, 0, 0), Ok(()));
+        assert_eq!(judge(0, 0, 0, None, 0, 0, 0, 0), Ok(()));
         // Stacks lost before the settle are not its doing.
-        assert_eq!(judge(0, 0, 0, None, 0, 3, 3), Ok(()));
+        assert_eq!(judge(0, 0, 0, None, 0, 3, 3, 0), Ok(()));
         // A waiting stack read after the count found none retired says nothing on its own.
-        assert_eq!(judge(0, 0, 0, Some(7), 0, 0, 0), Ok(()));
+        assert_eq!(judge(0, 0, 0, Some(7), 0, 0, 0, 0), Ok(()));
     }
 
     #[test]
     fn each_thing_pending_is_named() {
         assert_eq!(
-            judge(0, 2, 0, None, 0, 0, 0).unwrap_err().to_string(),
+            judge(0, 2, 0, None, 0, 0, 0, 0).unwrap_err().to_string(),
             "2 exited threads unreaped"
         );
         assert_eq!(
-            judge(0, 0, 5, None, 0, 0, 0).unwrap_err().to_string(),
+            judge(0, 0, 5, None, 0, 0, 0, 0).unwrap_err().to_string(),
             "5 kernel stacks retired"
         );
         // A stack withheld by a stalled shootdown, still waiting for its processor (TASKS item
         // 73): counted among the retired, with the processor named.
         assert_eq!(
-            judge(0, 0, 3, Some(7), 0, 0, 0).unwrap_err().to_string(),
+            judge(0, 0, 3, Some(7), 0, 0, 0, 0).unwrap_err().to_string(),
             "3 kernel stacks retired (one withheld since CPU 7 did not answer its shootdown)"
         );
         // A loss during the settle: the growth, not the total.
         assert_eq!(
-            judge(0, 0, 0, None, 0, 3, 4).unwrap_err().to_string(),
+            judge(0, 0, 0, None, 0, 3, 4, 0).unwrap_err().to_string(),
             "1 kernel stacks lost"
         );
         assert_eq!(
-            judge(0, 1, 2, None, 0, 0, 3).unwrap_err().to_string(),
+            judge(0, 1, 2, None, 0, 0, 3, 0).unwrap_err().to_string(),
             "1 exited threads unreaped, 2 kernel stacks retired, 3 kernel stacks lost"
         );
         // A thread whose end was seen and that has not left its processor (TASKS item 79), named
         // first: alone, and beside everything else.
         assert_eq!(
-            judge(1, 0, 0, None, 0, 0, 0).unwrap_err().to_string(),
+            judge(1, 0, 0, None, 0, 0, 0, 0).unwrap_err().to_string(),
             "1 ending threads not yet exited"
         );
         assert_eq!(
-            judge(2, 1, 2, Some(64), 0, 0, 3).unwrap_err().to_string(),
+            judge(2, 1, 2, Some(64), 0, 0, 3, 0)
+                .unwrap_err()
+                .to_string(),
             "2 ending threads not yet exited, 1 exited threads unreaped, 2 kernel stacks retired (one withheld since CPU 64 did not answer its shootdown), 3 kernel stacks lost"
         );
         // Closed channels not yet reaped (TASKS item 81), after the stacks retired and before
         // the stacks lost: alone, and beside everything else.
         assert_eq!(
-            judge(0, 0, 0, None, 1, 0, 0).unwrap_err().to_string(),
+            judge(0, 0, 0, None, 1, 0, 0, 0).unwrap_err().to_string(),
             "1 closed channels not yet reaped"
         );
         assert_eq!(
-            judge(2, 1, 2, Some(64), 4, 0, 3).unwrap_err().to_string(),
+            judge(2, 1, 2, Some(64), 4, 0, 3, 0)
+                .unwrap_err()
+                .to_string(),
             "2 ending threads not yet exited, 1 exited threads unreaped, 2 kernel stacks retired (one withheld since CPU 64 did not answer its shootdown), 4 closed channels not yet reaped, 3 kernel stacks lost"
+        );
+        // A wake-up that followed a moved thread, while none moves (TASKS item 92): named last,
+        // alone and beside everything else.
+        assert_eq!(
+            judge(0, 0, 0, None, 0, 0, 0, 1).unwrap_err().to_string(),
+            "1 moves followed by wake-ups, where no thread moves"
+        );
+        assert_eq!(
+            judge(0, 1, 0, None, 0, 0, 0, 2).unwrap_err().to_string(),
+            "1 exited threads unreaped, 2 moves followed by wake-ups, where no thread moves"
         );
     }
 
@@ -229,7 +261,7 @@ mod tests {
 
     #[test]
     fn a_line_says_where_the_settle_failed() {
-        let waiting = judge(0, 0, 1, Some(3), 0, 0, 0);
+        let waiting = judge(0, 0, 1, Some(3), 0, 0, 0, 0);
         assert_eq!(not_settled(Ok(()), Ok(())), "");
         assert_eq!(
             not_settled(waiting, Ok(())),

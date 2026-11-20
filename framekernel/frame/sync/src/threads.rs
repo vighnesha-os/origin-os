@@ -29,7 +29,7 @@
 //! # Locks
 //!
 //! In this order, and never the other way: a processor's run queue (two, in index order, for a
-//! move), that processor's thread table (in the kernel, `sched::Threads`: its zombies and the boot
+//! move), that processor's thread table (in the kernel, `threads::Table`: its zombies and the boot
 //! or idle flow's FPU area), a record's state, then a block's allocator. A switch takes the outgoing
 //! record's state and then the incoming one's, each released before the next is taken. The kernel
 //! holds each lock with interrupts off.

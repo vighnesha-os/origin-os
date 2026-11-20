@@ -28,12 +28,14 @@ use crate::runqueue::{
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, rdtsc};
 use crate::process::UserContext;
+use crate::threads;
 use crate::timer::{self, X2Apic};
 use origin_frame::objref::ObjectRef;
 use origin_frame::percpu::PerCpu;
 use origin_frame::stack::{FpuArea, GuardedStack, StackSlot, State as SlotState, ThreadStart};
 use origin_frame::sync::SpinLock;
-use origin_frame::sync::exits::{Exits, Mark, Pending};
+use origin_frame::sync::exits::{Exits, Pending};
+use origin_frame::sync::threads::{Empty, Location, Outcome, Queues};
 use origin_frame::trap::Switch;
 
 /// Each kernel thread's stack.
@@ -96,48 +98,100 @@ fn timer_read_back() -> ReadBack {
 /// Makes sure CPU `cpu`'s boot/idle context (slot 0) has an FPU area, so the first switch
 /// away from it can save its state. Called before the processor's scheduler runs.
 pub(crate) fn init_cpu_fpu(cpu: CpuIndex) {
-    if let Some(threads) = THREADS.get(cpu.get()) {
+    if let Some(table) = threads::table(cpu.get()) {
         without_interrupts(|| {
-            let mut t = threads.lock();
-            if t.fpu[0].is_none() {
-                t.fpu[0] = FpuArea::new();
+            let mut t = table.lock();
+            if t.idle_fpu.is_none() {
+                t.idle_fpu = FpuArea::new();
             }
         });
     }
 }
 
-/// Saves the outgoing context's FPU/SIMD state and restores the incoming one's, so SIMD
-/// registers belong to one thread at a time. An exiting thread's area is already gone (moved
-/// to its zombie), so its dead state is not saved.
-fn switch_fpu(id: usize, old: usize, new: usize) {
-    let Some(threads) = THREADS.get(id) else {
-        return;
-    };
-    let mut t = threads.lock();
-    if let Some(area) = t.fpu.get_mut(old).and_then(Option::as_mut) {
-        area.save();
-    }
-    if let Some(area) = t.fpu.get(new).and_then(Option::as_ref) {
-        area.restore();
+/// What a run-queue slot runs, as a switch sees it: the boot or idle flow (slot 0), whose FPU
+/// area is the processor's own; a thread, whose state is in its record; or nothing any more, a
+/// thread that has just exited, whose slot names no record (its state stays in its record, a
+/// zombie's, until its reap).
+#[derive(Clone, Copy)]
+enum Running {
+    Flow,
+    Thread(u32),
+    Exited,
+}
+
+/// What `slot` of `q` runs ([`Running`]).
+fn running(q: &RunQueue, slot: usize) -> Running {
+    match (slot, q.record(slot)) {
+        (0, _) => Running::Flow,
+        (_, Some(record)) => Running::Thread(record),
+        (_, None) => Running::Exited,
     }
 }
 
-/// Prepares CPU `id` to resume the thread in `slot`: the page tables are its process's (the
-/// kernel's for a kernel thread). The stack an interrupt or a system call from user mode lands on
-/// is not set here: the framework's trap entry names the incoming context's own stack from its
-/// home in the processor's table of contexts, whatever this scheduler answered (TASKS item 77).
-fn follow_thread(id: usize, slot: usize, switch: &Switch) {
-    let Some(threads) = THREADS.get(id) else {
-        return;
+/// Saves the outgoing context's FPU/SIMD state and restores the incoming one's, so SIMD
+/// registers belong to one thread at a time. Each area is locked and released in turn, the
+/// outgoing one first (the lock order of `origin_sync::threads`). An exited thread's state is not
+/// saved: it is dead.
+fn switch_fpu(id: usize, old: Running, new: Running) {
+    match old {
+        Running::Flow => {
+            if let Some(table) = threads::table(id)
+                && let Some(area) = table.lock().idle_fpu.as_mut()
+            {
+                area.save();
+            }
+        }
+        Running::Thread(record) => {
+            if let Some(record) = threads::record(record)
+                && let Some(area) = record.state().lock().fpu.as_mut()
+            {
+                area.save();
+            }
+        }
+        Running::Exited => {}
+    }
+    match new {
+        Running::Flow => {
+            if let Some(table) = threads::table(id)
+                && let Some(area) = table.lock().idle_fpu.as_ref()
+            {
+                area.restore();
+            }
+        }
+        Running::Thread(record) => {
+            if let Some(record) = threads::record(record)
+                && let Some(area) = record.state().lock().fpu.as_ref()
+            {
+                area.restore();
+            }
+        }
+        Running::Exited => {}
+    }
+}
+
+/// Prepares this processor to resume `new`: the page tables are its process's (the kernel's for a
+/// kernel thread, and for the boot or idle flow). The stack an interrupt or a system call from
+/// user mode lands on is not set here: the framework's trap entry names the incoming context's
+/// own stack from its home in the processor's table of contexts, whatever this scheduler answered
+/// (TASKS item 77).
+fn follow_thread(new: Running, switch: &Switch) {
+    let record = match new {
+        Running::Flow => return crate::vm::activate_kernel_space(switch),
+        Running::Thread(record) => threads::record(record),
+        Running::Exited => None,
     };
-    let t = threads.lock();
-    // Every thread but the boot or idle flow has a stack: a slot without one means a thread was
-    // made runnable before its state was written, which `spawn_with` rules out by writing it under
-    // the queue lock. Counted for the boot proof.
-    if slot != 0 && t.stacks.get(slot).and_then(Option::as_ref).is_none() {
+    // Every thread but the boot or idle flow has a record with a stack: a ready slot without one
+    // means a thread was made runnable before its state was written, which `spawn_with` rules out
+    // by writing it under the queue lock. Counted for the boot proof.
+    let Some(record) = record else {
+        UNREADY_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        return crate::vm::activate_kernel_space(switch);
+    };
+    let state = record.state().lock();
+    if state.stack.is_none() {
         UNREADY_SWITCHES.fetch_add(1, Ordering::Relaxed);
     }
-    match t.user.get(slot).and_then(Option::as_ref) {
+    match state.user.as_ref() {
         Some(user) => {
             // ADR-0017 Z3: a barrier, if this processor last ran another process in ring 3.
             cpu::entering_process(user.process.id(), switch);
@@ -149,51 +203,6 @@ fn follow_thread(id: usize, slot: usize, switch: &Switch) {
 
 /// The guard page of the first thread `spawn` created, for the boot proof.
 static FIRST_GUARD: AtomicU64 = AtomicU64::new(0);
-
-/// A thread that has exited, awaiting [`reap`]: its stack, FPU area and, for a user
-/// thread, the references that keep its process and address space until this processor has left
-/// them.
-struct Zombie {
-    stack: GuardedStack,
-    fpu: Option<FpuArea>,
-    user: Option<ObjectRef<UserContext>>,
-}
-
-/// Per CPU: each slot's stack, and the stacks of threads that exited and await
-/// [`reap`]. Locked after the run queue, always with interrupts disabled.
-pub(crate) struct Threads {
-    stacks: [Option<GuardedStack>; crate::runqueue::CAPACITY],
-    /// Exited threads awaiting [`reap`].
-    zombies: [Option<Zombie>; crate::runqueue::CAPACITY],
-    /// Each slot's FPU/SIMD save area; slot 0 is the boot or idle context.
-    fpu: [Option<FpuArea>; crate::runqueue::CAPACITY],
-    /// What each slot's thread runs in (`None`: a kernel thread).
-    user: [Option<ObjectRef<UserContext>>; crate::runqueue::CAPACITY],
-    /// Each slot's thread's count as ending, once it has counted itself ([`end_with`]): its exit
-    /// consumes the mark, so it lowers that count once, and only for a thread that raised it
-    /// (TASKS item 79; the review's T79-1).
-    ending: [Option<Mark<'static>>; crate::runqueue::CAPACITY],
-}
-
-impl Threads {
-    /// No thread.
-    const fn new() -> Self {
-        Self {
-            stacks: [const { None }; crate::runqueue::CAPACITY],
-            zombies: [const { None }; crate::runqueue::CAPACITY],
-            fpu: [const { None }; crate::runqueue::CAPACITY],
-            user: [const { None }; crate::runqueue::CAPACITY],
-            ending: [const { None }; crate::runqueue::CAPACITY],
-        }
-    }
-}
-
-/// Each processor's threads, by CPU index.
-pub(crate) static THREADS: PerCpu<SpinLock<Threads>> = PerCpu::new(
-    "framekernel::sched::THREADS",
-    SpinLock::new(Threads::new()),
-    || SpinLock::new(Threads::new()),
-);
 
 /// Times a processor picked a thread whose state was not complete (never, if the queue
 /// lock is held as it must be; the boot proof requires 0).
@@ -231,29 +240,27 @@ fn exits_pending() -> Pending {
 /// the count, which the hardware happens to order on x86-64 and the compiler need not.
 pub(crate) fn end_with<R>(publish: impl FnOnce() -> R) -> R {
     let id = this_cpu();
-    let (Some(queue), Some(threads), Some(exits)) =
-        (QUEUES.get(id), THREADS.get(id), EXITS.get(id))
-    else {
+    let (Some(queue), Some(exits)) = (QUEUES.get(id), EXITS.get(id)) else {
         return publish();
     };
-    // The running thread's slot, if it has not counted itself already. No other thread can take
-    // the slot or its mark while this one runs, so the mark is stored after `publish`.
-    let slot = without_interrupts(|| {
-        let slot = queue.lock().current();
-        let counted = threads.lock().ending.get(slot).is_some_and(Option::is_some);
-        (slot != 0 && !counted).then_some(slot)
+    // The running thread's record, if it has not counted itself already. No other thread can take
+    // the record or its mark while this one runs, so the mark is stored after `publish`.
+    let record = without_interrupts(|| {
+        let record = {
+            let q = queue.lock();
+            q.record(q.current())
+        };
+        let record = record.and_then(threads::record)?;
+        let counted = record.state().lock().ending.is_some();
+        (!counted).then_some(record)
     });
-    let Some(slot) = slot else {
+    let Some(record) = record else {
         return publish();
     };
     let (mark, published) = exits.end(publish);
-    without_interrupts(|| {
-        // Always there: the slot came from this queue. A mark not kept is not consumed, so its
-        // count stays raised, which every later settle names; it is never lowered early.
-        if let Some(entry) = threads.lock().ending.get_mut(slot) {
-            *entry = Some(mark);
-        }
-    });
+    // A mark not kept is not consumed, so its count stays raised, which every later settle names;
+    // it is never lowered early.
+    without_interrupts(|| record.state().lock().ending = Some(mark));
     published
 }
 
@@ -461,6 +468,7 @@ pub(crate) fn settle(tsc_hz: u64) -> Result<(), Unsettled> {
         crate::ipc::closed_pending(),
         lost_before,
         counts.lost,
+        wakes_followed(),
     )
 }
 
@@ -501,7 +509,7 @@ fn settle_pass(tsc_hz: u64) -> usize {
 
 /// [`reap`]'s own processor's exited threads.
 fn reap_zombies() -> usize {
-    let (Some(threads), Some(exits)) = (THREADS.get(this_cpu()), EXITS.get(this_cpu())) else {
+    let (Some(table), Some(exits)) = (threads::table(this_cpu()), EXITS.get(this_cpu())) else {
         return 0;
     };
     if exits.zombies() == 0 {
@@ -509,8 +517,22 @@ fn reap_zombies() -> usize {
     }
     let mut freed = 0;
     loop {
-        let next = without_interrupts(|| threads.lock().zombies.iter_mut().find_map(Option::take));
-        let Some(Zombie { stack, fpu, user }) = next else {
+        // The zombie's state is taken out of its record, and the record given back, under the
+        // list's lock; what it held is dropped below with no lock held. So a reap in progress
+        // holds no record (`crate::threads`, "Enough").
+        let next = without_interrupts(|| {
+            let mut t = table.lock();
+            let number = t.zombies.iter_mut().find_map(Option::take)?;
+            let record = threads::record(number)?;
+            let state = core::mem::replace(&mut *record.state().lock(), threads::State::EMPTY);
+            // Its location was cleared at its exit, so the block takes it back.
+            let _ = threads::give_back(number);
+            Some(state)
+        });
+        let Some(threads::State {
+            stack, fpu, user, ..
+        }) = next
+        else {
             return freed;
         };
         // The zombie is counted gone only after `release` has run: a `settle` that sees no zombie
@@ -551,10 +573,12 @@ fn with_queue(
                 q.note_switches(rdtsc());
             }
             let new = q.current();
-            if new != old {
-                switch_fpu(id, old, new);
+            // After `f`: an exited thread's slot names no record any more.
+            let (old, new) = ((old, running(&q, old)), (new, running(&q, new)));
+            if new.0 != old.0 {
+                switch_fpu(id, old.1, new.1);
             }
-            follow_thread(id, new, switch);
+            follow_thread(new.1, switch);
             next
         }
         _ => interrupted,
@@ -593,26 +617,25 @@ pub(crate) fn on_reschedule(interrupted: u64, switch: &Switch) -> u64 {
     })
 }
 
-/// A kernel thread: its processor (CPU index), run-queue slot, and the slot's generation,
-/// so a reference that outlives its thread never names the slot's next one.
+/// A thread: its record and the record's generation (ADR-0020 S1, TASKS item 92). A wake-up
+/// finds the thread through its record wherever it is, and a name that outlives its thread never
+/// names the record's next one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ThreadRef {
-    cpu: CpuIndex,
-    slot: u32,
+    record: u32,
     generation: u32,
 }
 
-/// The running kernel thread, or `None` for the boot or idle flow (which cannot block).
+/// The running thread, or `None` for the boot or idle flow (which cannot block).
 pub(crate) fn current_thread() -> Option<ThreadRef> {
-    let cpu = cpu::this_cpu();
-    let queue = QUEUES.get(cpu.get())?;
+    let queue = QUEUES.get(this_cpu())?;
     without_interrupts(|| {
         let q = queue.lock();
-        let slot = q.current();
-        (slot != 0).then(|| ThreadRef {
-            cpu,
-            slot: slot as u32,
-            generation: q.generation(slot),
+        // Read under the queue's lock, as `origin_sync::threads::Record::generation` asks.
+        let record = q.record(q.current())?;
+        Some(ThreadRef {
+            record,
+            generation: threads::record(record)?.generation(),
         })
     })
 }
@@ -635,42 +658,91 @@ pub(crate) fn block_until(deadline: u64) {
     cpu::thread_block(ticks);
 }
 
-/// Makes `thread` ready. If it was blocked on another processor, that processor is sent a
-/// reschedule IPI (to its APIC ID), so it switches to the thread now rather than at its
-/// next timer tick. Returns whether an IPI was sent, so a wake-up across processors can be
-/// counted.
-pub(crate) fn wake(thread: ThreadRef) -> bool {
-    let Some(queue) = QUEUES.get(thread.cpu.get()) else {
-        return false;
-    };
-    let woke = without_interrupts(|| queue.lock().wake(thread.slot as usize, thread.generation));
-    if woke
-        && thread.cpu != cpu::this_cpu()
-        && let Some(apic_id) = thread.cpu.apic_id()
-    {
-        timer::send_reschedule_ipi(apic_id);
-        return true;
+/// The processors' run queues, as `origin_sync::threads::wake` locks them: each under its lock,
+/// with interrupts off, as everywhere else.
+struct KernelQueues;
+
+impl Queues for KernelQueues {
+    type Queue = RunQueue;
+
+    fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut RunQueue) -> R) -> Option<R> {
+        let queue = QUEUES.get(usize::try_from(cpu).ok()?)?;
+        Some(without_interrupts(|| f(&mut queue.lock())))
     }
-    false
+
+    fn wake_slot(queue: &mut RunQueue, slot: u16) -> bool {
+        let slot = usize::from(slot);
+        let generation = queue.generation(slot);
+        queue.wake(slot, generation)
+    }
 }
 
-/// `EXIT_VECTOR`: the running thread ends. Its stack becomes a zombie, freed later by
-/// [`reap`] on this processor.
+/// Moves a wake-up followed: times it found, under the lock of the queue it had read, its
+/// thread's location changed to another slot with the same generation. No thread moves yet
+/// (ADR-0003 K7 still holds; ADR-0020 S6 is not built), so the boot proofs require 0 (TASKS item
+/// 92, the coordinating session's ruling Q5).
+static WAKES_FOLLOWED: AtomicU64 = AtomicU64::new(0);
+
+/// How many moves wake-ups have followed ([`WAKES_FOLLOWED`]).
+pub(crate) fn wakes_followed() -> u64 {
+    WAKES_FOLLOWED.load(Ordering::Relaxed)
+}
+
+/// Makes `thread` ready, wherever it is (`origin_sync::threads::wake`). If it was blocked on
+/// another processor, that processor is sent a reschedule IPI (to its APIC ID), so it switches to
+/// the thread now rather than at its next timer tick. Returns whether an IPI was sent, so a
+/// wake-up across processors can be counted.
+pub(crate) fn wake(thread: ThreadRef) -> bool {
+    let Some(record) = threads::record(thread.record) else {
+        return false;
+    };
+    let woke = origin_frame::sync::threads::wake(&KernelQueues, record, thread.generation);
+    if woke.retries != 0 {
+        WAKES_FOLLOWED.fetch_add(u64::from(woke.retries), Ordering::Relaxed);
+    }
+    match woke.outcome {
+        Outcome::Reached { ready: true, cpu } => {
+            let Some(cpu) = usize::try_from(cpu).ok().and_then(CpuIndex::new) else {
+                return false;
+            };
+            if cpu != cpu::this_cpu()
+                && let Some(apic_id) = cpu.apic_id()
+            {
+                timer::send_reschedule_ipi(apic_id);
+                return true;
+            }
+            false
+        }
+        // Never while no thread moves. Until ADR-0020 S20's pinned mode (TASKS item 96), the
+        // kernel stops rather than lose a wake-up (the coordinating session's ruling Q4).
+        Outcome::Exhausted => panic!(
+            "a wake-up followed its thread {} times",
+            origin_frame::sync::threads::WAKE_TRIES
+        ),
+        Outcome::Reached { ready: false, .. } | Outcome::Stale | Outcome::Gone => false,
+    }
+}
+
+/// `EXIT_VECTOR`: the running thread ends. Its record, holding its stack, becomes a zombie, which
+/// [`reap`] empties and gives back later on this processor.
 pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
     let id = this_cpu();
     let next = with_queue(interrupted, switch, |q| {
-        let slot = q.current();
+        let number = q.record(q.current());
         let next = q.exit(interrupted).ok()?;
-        if let Some(threads) = THREADS.get(id) {
-            let mut t = threads.lock();
-            let stack = t.stacks.get_mut(slot).and_then(Option::take);
-            let fpu = t.fpu.get_mut(slot).and_then(Option::take);
-            let user = t.user.get_mut(slot).and_then(Option::take);
-            // Taken whatever happens below, so that the slot's next thread starts unmarked.
-            let mark = t.ending.get_mut(slot).and_then(Option::take);
-            match (t.zombies.iter_mut().find(|z| z.is_none()), stack) {
-                (Some(free), Some(stack)) => {
-                    *free = Some(Zombie { stack, fpu, user });
+        if let (Some(table), Some(number)) = (threads::table(id), number)
+            && let Some(record) = threads::record(number)
+        {
+            let mut t = table.lock();
+            let mut state = record.state().lock();
+            // In the critical section that freed its slot: from here no wake-up finds it
+            // (`origin_sync::threads`, "The location").
+            record.clear_location();
+            // Taken whatever happens below, so that the record's next thread starts unmarked.
+            let mark = state.ending.take();
+            match t.zombies.iter_mut().find(|z| z.is_none()) {
+                Some(free) if state.stack.is_some() => {
+                    *free = Some(number);
                     // The zombie counts before the thread stops counting as ending, so that a
                     // `settle` never finds it in neither (TASKS item 79; `Exits::queued`).
                     // Every processor has its counts. A mark not consumed keeps its count raised:
@@ -679,17 +751,19 @@ pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
                         exits.queued(mark);
                     }
                 }
-                // No record of it can be kept. Its references are leaked deliberately: this
+                // No zombie of it can be kept. Its references are leaked deliberately: this
                 // processor is still in the process's address space, and dropping the last
                 // reference here would free the tables it is running on. Its stack and FPU area
-                // go first (the stack is leaked, as the processor is still on it). Then nothing
-                // more it holds will be given back and it is leaving the processor, so a `settle`
-                // stops waiting for it: what it leaked is the compare's to find (TASKS item 79,
-                // case (a); the review's T79-4).
-                (_, stack) => {
-                    core::mem::forget(user);
-                    drop(stack);
-                    drop(fpu);
+                // go first (the stack is leaked, as the processor is still on it), and its record
+                // goes back at once. Then nothing more it holds will be given back and it is
+                // leaving the processor, so a `settle` stops waiting for it: what it leaked is the
+                // compare's to find (TASKS item 79, case (a); the review's T79-4).
+                _ => {
+                    core::mem::forget(state.user.take());
+                    drop(state.stack.take());
+                    drop(state.fpu.take());
+                    drop(state);
+                    let _ = threads::give_back(number);
                     if let Some(mark) = mark {
                         mark.left();
                     }
@@ -728,11 +802,13 @@ pub(crate) fn finish(signal: impl FnOnce()) -> ! {
 
 /// What the running thread runs in, or `None` for a kernel thread.
 pub(crate) fn current_user() -> Option<ObjectRef<UserContext>> {
-    let id = this_cpu();
-    let (queue, threads) = (QUEUES.get(id)?, THREADS.get(id)?);
+    let queue = QUEUES.get(this_cpu())?;
     without_interrupts(|| {
-        let slot = queue.lock().current();
-        threads.lock().user.get(slot).cloned().flatten()
+        let record = {
+            let q = queue.lock();
+            q.record(q.current())
+        };
+        threads::record(record?)?.state().lock().user.clone()
     })
 }
 
@@ -836,7 +912,7 @@ fn spawn_with_parts(
     publish: impl FnOnce(&mut GuardedStack, CpuIndex) -> bool,
 ) -> Result<usize, QueueError> {
     let queue = QUEUES.get(cpu.get()).ok_or(QueueError::Full)?;
-    let threads = THREADS.get(cpu.get()).ok_or(QueueError::Full)?;
+    let index = u32::try_from(cpu.get()).map_err(|_| QueueError::Full)?;
     let mut stack = GuardedStack::new(THREAD_STACK).ok_or(QueueError::Full)?;
     let guard = stack.guard_addr();
     let frame_at = stack.build_first_frame(start).ok_or(QueueError::Full)?;
@@ -849,20 +925,31 @@ fn spawn_with_parts(
     }
     let mut parts = Some((stack, fpu_area, user));
     let spawned = without_interrupts(|| {
-        // The queue lock is held until the thread's state is complete: the moment the slot
-        // is Ready the target processor can pick it, and `follow_thread` needs the state.
+        // The queue lock is held until the thread's state is complete and its record located: the
+        // moment the slot is Ready the target processor can pick it, and `follow_thread` needs
+        // the state. The record comes from the target's block (`crate::threads`), taken here so
+        // that no spawn holds one it has not queued.
         let mut queue = queue.lock();
-        let slot = queue.push_weighted(frame_at, weight, None)?;
-        let mut t = threads.lock();
-        if let Some((stack, fpu_area, user)) = parts.take() {
-            if let Some(s) = t.stacks.get_mut(slot) {
-                *s = Some(stack);
+        let (number, _) = threads::take(cpu).ok_or(QueueError::Full)?;
+        let slot = match queue.push_weighted(frame_at, weight, Some(number)) {
+            Ok(slot) => slot,
+            Err(refused) => {
+                let _ = threads::give_back(number);
+                return Err(refused);
             }
-            if let Some(f) = t.fpu.get_mut(slot) {
-                *f = Some(fpu_area);
-            }
-            if let Some(u) = t.user.get_mut(slot) {
-                *u = user;
+        };
+        if let (Some(record), Some((stack, fpu_area, user))) =
+            (threads::record(number), parts.take())
+        {
+            let mut state = record.state().lock();
+            state.stack = Some(stack);
+            state.fpu = Some(fpu_area);
+            state.user = user;
+            state.ending = None;
+            drop(state);
+            // After the push, under the same lock (`origin_sync::threads`, "The location").
+            if let Ok(slot) = u16::try_from(slot) {
+                record.set_location(Location::new(index, slot));
             }
         }
         Ok(slot)

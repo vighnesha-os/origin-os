@@ -221,6 +221,8 @@ mod storage;
 #[cfg(target_os = "none")]
 mod syscall;
 #[cfg(target_os = "none")]
+mod threads;
+#[cfg(target_os = "none")]
 mod time;
 #[cfg(target_os = "none")]
 mod tlb;
