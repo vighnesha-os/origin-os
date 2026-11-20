@@ -26,7 +26,7 @@
 pub const MAGIC: [u8; 4] = *b"ORRV";
 /// The configuration format's version (2: [`Placement::ReservedOther`] and [`Placement::Table`],
 /// and a fill bound to each page's address; 3: the [`Shape`] in the header, TASKS item 83; 4:
-/// [`Shape::rsdp_in_ram`], TASKS item 84).
+/// [`Shape::rsdp_in_ram`] and [`Shape::spcr_in_ram`], TASKS item 84).
 pub const VERSION: u16 = 4;
 /// Bytes of the header: magic, version, region count, the shape's flags and its reserved pages
 /// at the top of the RAM.
@@ -108,6 +108,10 @@ pub struct Shape {
     /// table (TASKS item 84's machine with the kernel's reading refused; control RB-1 of TASKS
     /// item 83 as a machine of its own).
     pub rsdp_in_ram: bool,
+    /// The SPCR alone copied into `EfiLoaderData` pages, and the XSDT pointed at the copy: the
+    /// loader reads it, the kernel refuses that one table and reads every other (TASKS item 84's
+    /// review, T84-3: a boot with two UARTs live that the whole boot's checks hold).
+    pub spcr_in_ram: bool,
 }
 
 impl Shape {
@@ -118,6 +122,7 @@ impl Shape {
             || self.fpdt
             || self.top_reserved_pages != 0
             || self.rsdp_in_ram
+            || self.spcr_in_ram
     }
 
     const fn flags(&self) -> u32 {
@@ -125,11 +130,12 @@ impl Shape {
             | (self.facs_32 as u32) << 1
             | (self.fpdt as u32) << 2
             | (self.rsdp_in_ram as u32) << 3
+            | (self.spcr_in_ram as u32) << 4
     }
 }
 
 /// The flags a [`Shape`] may set.
-const SHAPE_FLAGS: u32 = 0b1111;
+const SHAPE_FLAGS: u32 = 0b1_1111;
 
 /// Why a configuration file was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,7 +218,13 @@ pub fn decode(b: &[u8], out: &mut [Region; MAX_REGIONS]) -> Result<(usize, Shape
         fpdt: flags & 4 != 0,
         top_reserved_pages: u32_at(b, 12).ok_or(ConfigError::Header)?,
         rsdp_in_ram: flags & 8 != 0,
+        spcr_in_ram: flags & 16 != 0,
     };
+    // The RSDP is copied only with the XSDT (`acpi_nvs`): alone, the flag would shape nothing
+    // and say nothing (TASKS item 84's review, T84-12).
+    if shape.rsdp_in_ram && !shape.acpi_nvs {
+        return Err(ConfigError::Header);
+    }
     if count > MAX_REGIONS || b.len() != HEADER + RECORD * count {
         return Err(ConfigError::Length);
     }
@@ -569,6 +581,7 @@ mod tests {
             fpdt: true,
             top_reserved_pages: 8192,
             rsdp_in_ram: false,
+            spcr_in_ram: false,
         }
     }
 
@@ -605,6 +618,10 @@ mod tests {
                 rsdp_in_ram: true,
                 ..rented()
             },
+            Shape {
+                spcr_in_ram: true,
+                ..Shape::default()
+            },
         ] {
             let len = encode(&regions(), one, &mut buf).unwrap();
             assert_eq!(decode(&buf[..len], &mut out), Ok((3, one)));
@@ -620,8 +637,15 @@ mod tests {
         let mut out = [regions()[0]; MAX_REGIONS];
         assert_eq!(decode(&buf[..len - 1], &mut out), Err(ConfigError::Length));
         let mut bad = buf;
-        bad[8] = 0b1_0000; // a shape flag version 4 does not define
+        bad[8] = 0b10_0000; // a shape flag version 4 does not define
         assert_eq!(decode(&bad[..len], &mut out), Err(ConfigError::Header));
+        // The RSDP in RAM without the copies it belongs to (T84-12).
+        let lone = Shape {
+            rsdp_in_ram: true,
+            ..Shape::default()
+        };
+        let lone_len = encode(&regions(), lone, &mut bad).unwrap();
+        assert_eq!(decode(&bad[..lone_len], &mut out), Err(ConfigError::Header));
         let mut bad = buf;
         bad[4] = 3; // version 3's files have no RSDP-in-RAM flag
         assert_eq!(decode(&bad[..len], &mut out), Err(ConfigError::Header));

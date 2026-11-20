@@ -513,6 +513,7 @@ const RENTED_SHAPE: origin_test_reserved_memory::Shape = origin_test_reserved_me
     fpdt: true,
     top_reserved_pages: 8192,
     rsdp_in_ram: false,
+    spcr_in_ram: false,
 };
 
 /// The device the planted ranges name and no driver attaches: 00:1f.6, absent on QEMU's q35.
@@ -2641,7 +2642,7 @@ const ALLOCATOR_ALLOWANCE_MIB: u64 = 16;
 
 /// MiB `boot-rented`'s application reserves at the top of the RAM, 0 on other machines.
 fn reserved_top_mib(settings: &Settings) -> u64 {
-    if settings.shape.is_on() {
+    if matches!(settings.shape, Shape::Rented | Shape::KernelRefused) {
         (u64::from(RENTED_SHAPE.top_reserved_pages) * 4096) >> 20
     } else {
         0
@@ -2711,7 +2712,39 @@ fn memory_figures(serial: &str, ram: u64, reserved: u64) -> Result {
 /// own markers have them. A hand-over line the kernel boot lacks makes an impossible marker, so
 /// the boot fails rather than check less (the review's T83-8).
 fn rented_firmware_markers(settings: &Settings) -> Vec<String> {
-    let mut markers: Vec<String> = [
+    let shaping = if settings.shape == Shape::SpcrRefused {
+        [
+            "origin-test-reserved: TEST ONLY: shaping the firmware's tables with the SPCR in RAM the kernel owns",
+            "origin-test-reserved: the XSDT now names SPCR at 0x",
+            " (loader data, RAM the kernel owns) in place of the firmware's at 0x",
+            "origin-test-reserved: starting the loader",
+        ]
+        .map(String::from)
+        .to_vec()
+    } else {
+        rented_shaping_markers(settings)
+    };
+    let mut markers = shaping;
+    let plain = boot_scenario(&Settings {
+        shape: Shape::Off,
+        ..settings.clone()
+    });
+    match plain.markers.iter().position(|m| m == HANDOVER_LINE) {
+        Some(at) => markers.extend(plain.markers.into_iter().take(at + 1)),
+        None => markers.push(format!("xtask: the marker {HANDOVER_LINE:?} is missing")),
+    }
+    // This machine's SPCR names COM2, and the loader reads it under boot services, whatever the
+    // kernel can read later (TASKS item 84).
+    match markers.iter().position(|m| m == LOADER_NO_SPCR) {
+        Some(at) => markers[at] = LOADER_NAMES_COM2.to_string(),
+        None => markers.push(format!("xtask: the marker {LOADER_NO_SPCR:?} is missing")),
+    }
+    markers
+}
+
+/// The application's lines when it shapes the tables as rental B's board has them.
+fn rented_shaping_markers(settings: &Settings) -> Vec<String> {
+    [
         "origin-test-reserved: TEST ONLY: shaping the firmware's tables as rental B's board has them",
         "origin-test-reserved: reserved 0x",
         " (8192 pages) at the top of the RAM",
@@ -2733,22 +2766,7 @@ fn rented_firmware_markers(settings: &Settings) -> Vec<String> {
         "origin-test-reserved: starting the loader",
     ]
     .map(String::from)
-    .to_vec();
-    let plain = boot_scenario(&Settings {
-        shape: Shape::Off,
-        ..settings.clone()
-    });
-    match plain.markers.iter().position(|m| m == HANDOVER_LINE) {
-        Some(at) => markers.extend(plain.markers.into_iter().take(at + 1)),
-        None => markers.push(format!("xtask: the marker {HANDOVER_LINE:?} is missing")),
-    }
-    // This machine's SPCR names COM2, and the loader reads it under boot services, whatever the
-    // kernel can read later (TASKS item 84).
-    match markers.iter().position(|m| m == LOADER_NO_SPCR) {
-        Some(at) => markers[at] = LOADER_NAMES_COM2.to_string(),
-        None => markers.push(format!("xtask: the marker {LOADER_NO_SPCR:?} is missing")),
-    }
-    markers
+    .to_vec()
 }
 
 /// The loader's last line, after which only the kernel prints.
@@ -2773,37 +2791,45 @@ fn refused_scenario(scenario: &mut Scenario) {
         BOOT_VERDICT.to_string(),
         HALT_LINE.to_string(),
     ];
-    scenario.failures = REFUSED_FAILURES.to_vec();
+    // Every marker that fails a kernel boot, but the ones that need the ACPI tables, which the
+    // kernel cannot read on this machine by design (TASKS item 84's review, T84-3).
+    scenario.failures = qemu_boot_failures()
+        .into_iter()
+        .filter(|f| !NEEDS_THE_TABLES.contains(f))
+        .collect();
     // QEMU's own lines that the boot's proofs cause: none run here that need the ACPI tables.
     scenario.stderr = vec![];
     scenario.check = Some(check_refused_boot);
 }
 
-/// What fails [`refused_scenario`]'s boot at once: a crash, a refusal, a broken generator, stack or
-/// memory. Not a boot proof that needs the ACPI tables, which the kernel cannot read on that
-/// machine by design: those fail, the verdict says so, and the boot goes on to its halt.
-const REFUSED_FAILURES: &[&str] = &[
-    "origin-boot: panic:",
-    "origin-kernel: panic:",
-    "origin-boot: kernel rejected",
-    "origin-boot: random: known-answer test FAILED",
-    "origin-boot: random: no seed for the kernel",
-    "ran over its stack",
-    "kernel stacks' region: WRONG",
-    "origin-kernel: invalid boot info",
-    "origin-kernel: invalid image",
-    "origin-kernel: boot refused",
-    "(#DF double fault)",
-    "(#GP general protection)",
-    "(#PF page fault)",
-    "(#UD invalid opcode)",
-    "origin-kernel: machine check:",
-    "origin-kernel: frame allocator exhausted",
-    "origin-kernel: page tables not built",
-    "origin-kernel: page protection violated",
-    "RWX at",
-    "origin-kernel: heap contents are wrong",
-    "origin-kernel: heap leaked",
+/// The failure markers [`refused_scenario`]'s boot prints because the kernel can read no ACPI
+/// table: processor discovery, the topology, the tables' census, the AML interpreter, PCIe and
+/// the IOMMU need them; and the console's two section proofs count the interrupt they make
+/// pending through the I/O APIC, which only the MADT names (the screen's proof, which does not
+/// touch a UART, fails the same way). The boot goes on to its verdict and halt.
+const NEEDS_THE_TABLES: &[&str] = &[
+    "origin-kernel: ACPI processor discovery failed",
+    ": topology failed",
+    ": acpi tables failed",
+    "; aml failed",
+    ": console failed",
+    ": PCIe failed",
+    ": IOMMU failed",
+];
+
+/// The proofs [`refused_scenario`]'s verdict may name as failed: those that need the ACPI tables,
+/// and the speculation controls, which fail under QEMU on every machine (decision item 154).
+const REFUSED_VERDICT_FAILED: &[&str] = &[
+    "bus-master quiesce",
+    "IOMMU bring-up",
+    "application processors",
+    "speculation controls",
+    "CPU topology",
+    "ACPI tables",
+    "AML interpreter",
+    "PCIe enumeration",
+    "console UART sections",
+    "console screen sections",
 ];
 
 /// How the kernel's verdict line starts.
@@ -2814,20 +2840,209 @@ const BOOT_VERDICT: &str = "origin-kernel: boot verdict: ";
 /// the loader's lines, and the kernel's to the end, the refusal and the verdict among them; and
 /// neither UART was sent anything again.
 fn check_refused_boot(done: &Completed, settings: &Settings) -> Result {
-    check_first_line_on_the_uart(&done.serial)?;
-    check_firmware_console(done, settings)?;
+    check_both_uarts_kept(done, settings)?;
     let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
     if let Some(missing) = serial::first_missing(&com1, &[REFUSED_STAYS, BOOT_VERDICT, HALT_LINE]) {
         return Err(format!(
             "COM1 lacks {missing:?}: the console must keep it beside the loader's UART when the move is refused"
         ));
     }
+    let unexpected = verdict_failed_beyond(&done.serial, REFUSED_VERDICT_FAILED)?;
+    if !unexpected.is_empty() {
+        return Err(format!(
+            "the verdict names proofs that do not need the ACPI tables as failed: {unexpected:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// A boot whose move was refused (ruling Q1): the UART the loader named carries the kernel's lines
+/// from the first; COM1, the firmware's console, carries the application's and the loader's lines,
+/// the loader's naming the same port as the kernel's line on that UART (T84-14); both UARTs carry
+/// the same kernel lines, each once, from the first to the halt (T84-4); and neither was sent
+/// anything again.
+fn check_both_uarts_kept(done: &Completed, settings: &Settings) -> Result {
+    check_first_line_on_the_uart(&done.serial)?;
+    check_firmware_console(done, settings)?;
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    check_same_port_named(&com1, &done.serial)?;
+    same_kernel_lines(&com1, &done.serial, None)?;
     if done.serial.contains(REPLAYED) || com1.contains(REPLAYED) {
         return Err(format!(
             "a UART was sent the earlier lines again ({REPLAYED:?}), though the console never moved"
         ));
     }
     Ok(())
+}
+
+/// The machine with the SPCR alone in RAM the kernel owns (T84-3): the boot's line checks on both
+/// UARTs, its memory figures, [`check_both_uarts_kept`], the refused move keeping both UARTs, and
+/// a verdict whose failed proofs one unreadable XSDT entry explains.
+fn check_spcr_refused_boot(done: &Completed, settings: &Settings) -> Result {
+    let cpus = machine(settings).cpus() as usize;
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    for (name, text) in [("the SPCR's UART", done.serial.as_str()), ("COM1", &com1)] {
+        console_lines_intact(text, cpus).map_err(|e| format!("{name}: {e}"))?;
+        long_lines_whole(text).map_err(|e| format!("{name}: {e}"))?;
+        unwaited_lines_whole(text).map_err(|e| format!("{name}: {e}"))?;
+    }
+    check_memory(&done.serial, settings)?;
+    check_both_uarts_kept(done, settings)?;
+    let refused = done
+        .serial
+        .lines()
+        .find(|l| l.starts_with(SPCR_REFUSED_PREFIX))
+        .ok_or("no line about the refused SPCR")?;
+    if !refused.ends_with(STAYS_WITH_THE_LOADERS) {
+        return Err(format!(
+            "the refused move does not keep both UARTs: {refused:?}"
+        ));
+    }
+    let unexpected = verdict_failed_beyond(&done.serial, SPCR_REFUSED_VERDICT_FAILED)?;
+    if !unexpected.is_empty() {
+        return Err(format!(
+            "the verdict names proofs as failed that one unreadable XSDT entry does not explain: {unexpected:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The machine with the SPCR alone in RAM the kernel owns (TASKS item 84's review, T84-3): both
+/// UARTs are written to for the whole boot, and every other table is read, so the console's
+/// proofs run as on any machine. Its markers are the console's: every line of the kernel boot's
+/// that starts `origin-kernel: console:`, in order, with the loader's UART and the refused move in
+/// place of "none" and "no SPCR", then a verdict and the halt.
+fn spcr_refused_scenario(scenario: &mut Scenario) {
+    let console = "origin-kernel: console: ";
+    let mut markers = Vec::new();
+    for marker in scenario.markers.drain(..) {
+        if marker == KERNEL_NO_LOADER_UART {
+            markers.push(KERNEL_WRITES_COM2.to_string());
+        } else if marker.starts_with("origin-kernel: console: no usable ACPI SPCR table") {
+            markers.push(SPCR_REFUSED_PREFIX.to_string());
+        } else if marker.starts_with(console) {
+            markers.push(marker);
+        }
+    }
+    markers.push(BOOT_VERDICT.to_string());
+    markers.push(HALT_LINE.to_string());
+    scenario.markers = markers;
+    // Every marker that fails a kernel boot, but the four that one unreadable XSDT entry fails,
+    // by the locator's rule that it may have been the table asked for (TASKS item 71). The
+    // console's proofs are held, with both UARTs live (T84-3).
+    scenario.failures = qemu_boot_failures()
+        .into_iter()
+        .filter(|f| !NEEDS_EVERY_ENTRY.contains(f))
+        .collect();
+    // The IOMMU's own QEMU lines: the IOMMU is not brought up without its tables.
+    scenario.stderr = vec![];
+    scenario.check = Some(check_spcr_refused_boot);
+}
+
+/// The failure markers [`spcr_refused_scenario`]'s boot prints because one XSDT entry, the SPCR's
+/// copy, cannot be read: the tables' census, the AML interpreter, PCIe's reserved ranges and the
+/// IOMMU each look for a table the entry might have been (TASKS item 71's locator), and refuse.
+const NEEDS_EVERY_ENTRY: &[&str] = &[
+    ": acpi tables failed",
+    "; aml failed",
+    ": PCIe failed",
+    ": IOMMU failed",
+];
+
+/// The proofs [`spcr_refused_scenario`]'s verdict may name as failed: those, and the speculation
+/// controls, which fail under QEMU on every machine (decision item 154).
+const SPCR_REFUSED_VERDICT_FAILED: &[&str] = &[
+    "IOMMU bring-up",
+    "speculation controls",
+    "ACPI tables",
+    "AML interpreter",
+    "PCIe enumeration",
+];
+
+/// The proofs `serial`'s verdict names as failed that are not in `allowed`.
+fn verdict_failed_beyond<'a>(serial: &'a str, allowed: &[&str]) -> Result<Vec<&'a str>> {
+    let verdict = serial
+        .lines()
+        .find(|l| l.starts_with(BOOT_VERDICT))
+        .ok_or("no verdict on the SPCR's UART")?;
+    Ok(verdict
+        .split_once("failed: ")
+        .map(|(_, list)| list.split(", ").collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|proof| proof.split(" (").next().unwrap_or(proof))
+        .filter(|proof| !allowed.contains(proof))
+        .collect())
+}
+
+/// How the line about a refused SPCR starts, whatever the reason (T84-3).
+const SPCR_REFUSED_PREFIX: &str = "origin-kernel: console: no usable ACPI SPCR table (";
+/// How a refused move ends its line when the loader's UART is kept with COM1 (ruling Q1).
+const STAYS_WITH_THE_LOADERS: &str =
+    "; the UART stays at I/O port 0x3f8, and the loader's at I/O port 0x2f8";
+
+/// The kernel lines of `com1` and of `named` (the SPCR's UART) are the same, each once and in
+/// order (T84-4): all of them when `upto` is `None`, or COM1's (which end with `upto`) against
+/// `named`'s up to and including `upto`. A queue's notice that it lost lines is the only line
+/// either may have alone, and none is expected.
+fn same_kernel_lines(com1: &str, named: &str, upto: Option<&str>) -> Result {
+    let named = serial::clean(named.as_bytes());
+    let lost = "origin-kernel: console: some lines were lost here";
+    let kernel = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| l.starts_with("origin-kernel:") && !l.starts_with(lost))
+            .map(str::to_string)
+            .collect()
+    };
+    let ours = kernel(com1);
+    let mut theirs = kernel(&named);
+    if let Some(end) = upto {
+        let at = theirs
+            .iter()
+            .position(|l| l == end)
+            .ok_or_else(|| format!("the SPCR's UART lacks {end:?}"))?;
+        theirs.truncate(at + 1);
+    }
+    if ours == theirs {
+        return Ok(());
+    }
+    let first = ours
+        .iter()
+        .zip(&theirs)
+        .position(|(a, b)| a != b)
+        .unwrap_or(ours.len().min(theirs.len()));
+    Err(format!(
+        "COM1 and the SPCR's UART do not carry the same kernel lines: {} and {} lines, first differing at line {}: {:?} against {:?}",
+        ours.len(),
+        theirs.len(),
+        first + 1,
+        ours.get(first),
+        theirs.get(first)
+    ))
+}
+
+/// The port the loader's line on COM1 names is the one the kernel's line on the SPCR's UART says
+/// the loader named (T84-14): read from each line, not from xtask's constants.
+fn check_same_port_named(com1: &str, named: &str) -> Result {
+    let port_after = |text: &str, prefix: &str| -> Option<String> {
+        let line = text.lines().find(|l| l.starts_with(prefix))?;
+        let rest = line.split_once("I/O port ")?.1;
+        Some(rest.split([' ', ':', ',', ')']).next()?.to_string())
+    };
+    let loader = port_after(
+        com1,
+        "origin-boot: console: the SPCR names a UART at I/O port ",
+    );
+    let kernel = port_after(
+        named,
+        "origin-kernel: console: the loader named the SPCR's UART at I/O port ",
+    );
+    match (loader, kernel) {
+        (Some(a), Some(b)) if a == b => Ok(()),
+        (a, b) => Err(format!(
+            "the loader's line on COM1 names port {a:?}, and the kernel's line on the SPCR's UART says it named {b:?}"
+        )),
+    }
 }
 
 /// The kernel boot made the rented board's (TASKS item 83): the console's UART is the one the
@@ -2843,7 +3058,15 @@ fn rented_scenario(scenario: &mut Scenario, shape: Shape) {
         refused_scenario(scenario);
         return;
     }
-    scenario.check = Some(check_rented_boot);
+    if shape == Shape::SpcrRefused {
+        spcr_refused_scenario(scenario);
+        return;
+    }
+    scenario.check = Some(if shape == Shape::SpcrRefused {
+        check_spcr_refused_boot
+    } else {
+        check_rented_boot
+    });
     // Each edit below needs its anchor: one that is missing makes an impossible marker, so the
     // boot fails rather than check less (the review's T83-8).
     let missing = |scenario: &mut Scenario, anchor: &str| {
@@ -2858,9 +3081,13 @@ fn rented_scenario(scenario: &mut Scenario, shape: Shape) {
         None => missing(scenario, HANDOVER_LINE),
     }
     // The usual machine has no SPCR; this one's names COM2, which the loader names and the
-    // kernel writes to from its first line, and the console moves there for good (below).
+    // kernel writes to from its first line. The console moves there for good (below), or, with
+    // the SPCR alone in RAM the kernel owns, the kernel refuses it and keeps both UARTs.
     let no_spcr = "origin-kernel: console: no usable ACPI SPCR table";
     match scenario.markers.iter().position(|m| m.starts_with(no_spcr)) {
+        Some(at) if shape == Shape::SpcrRefused => {
+            scenario.markers[at] = SPCR_REFUSED_PREFIX.to_string();
+        }
         Some(at) => {
             scenario.markers.remove(at);
         }
@@ -2873,6 +3100,9 @@ fn rented_scenario(scenario: &mut Scenario, shape: Shape) {
     {
         Some(at) => scenario.markers[at] = KERNEL_WRITES_COM2.to_string(),
         None => missing(scenario, KERNEL_NO_LOADER_UART),
+    }
+    if shape == Shape::SpcrRefused {
+        return;
     }
     let insert_before = |scenario: &mut Scenario, anchor: &str, items: &[&str]| match scenario
         .markers
@@ -4281,6 +4511,39 @@ const TAKEN_OVER_LINE: &str = "origin-kernel: console: the ACPI SPCR (revision 2
 /// (cost ledger row CL46).
 const TAKEN_BYTES: &str =
     " bytes of text went to that UART before the move, beside COM1 (cost ledger row CL46)";
+/// The line announcing a move to a UART the loader did not name, the last COM1 carries.
+const MOVED_LINE: &str = "origin-kernel: console: the ACPI SPCR (revision 2, interface 0x0) names a UART at I/O port 0x2f8: moving the console there";
+/// The bytes of [`long_spcr_table`]: more than the loader reads (1,024).
+const LONG_SPCR: u32 = 1100;
+
+/// An SPCR naming COM2 at 115,200 baud, padded to [`LONG_SPCR`] bytes: the loader reads no more
+/// than 1 KiB of one and names no UART; the kernel reads it whole and moves to it (TASKS item 84's
+/// review, T84-5).
+fn long_spcr_table() -> Vec<u8> {
+    let mut table = spcr_table(0, gas_io(SPCR_PORT), 7);
+    table.resize(LONG_SPCR as usize, 0);
+    table[4..8].copy_from_slice(&LONG_SPCR.to_le_bytes());
+    table[9] = 0;
+    let sum = table.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+    table[9] = 0u8.wrapping_sub(sum);
+    table
+}
+
+/// E4's move, as before TASKS item 84, for an SPCR the loader cannot read whole (T84-5): COM1
+/// stops at the move's line and holds the loader's refusal; the SPCR's UART is sent the earlier
+/// lines again, every one of COM1's kernel lines, each once and in order, up to that line.
+fn check_moved_with_a_replay(done: &Completed, _settings: &Settings) -> Result {
+    check_com1_stopped_at(done, MOVED_LINE)?;
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    let refused = format!(
+        "origin-boot: console: the SPCR was refused (it declares {LONG_SPCR} bytes, more than the loader reads (1024)); the kernel's console starts on COM1 and the screen"
+    );
+    if !com1.contains(&refused) {
+        return Err(format!("COM1, the loader's console, lacks {refused:?}"));
+    }
+    same_kernel_lines(&com1, &done.serial, Some(MOVED_LINE))
+}
+
 /// The move that sends the earlier lines again: a UART the loader did not name.
 const REPLAYED: &str = " bytes of earlier output sent to it again";
 
@@ -4297,6 +4560,10 @@ fn check_spcr_console(done: &Completed, settings: &Settings) -> Result {
         ));
     }
     check_first_line_on_the_uart(&done.serial)?;
+    check_same_port_named(&com1, &done.serial)?;
+    // Everything COM1 carried, the SPCR's UART carried too, each line once, up to the take-over
+    // (T84-4): a replay without its sentence, or a line lost or doubled there, fails.
+    same_kernel_lines(&com1, &done.serial, Some(TAKEN_OVER_LINE))?;
     if done.serial.contains(REPLAYED) {
         return Err(format!(
             "the SPCR's UART was sent the earlier lines again ({REPLAYED:?}), though it has had them from the first line"
@@ -4325,13 +4592,18 @@ fn check_first_line_on_the_uart(serial: &str) -> Result {
 /// Once the firmware has named a better UART, the fallback is not used: COM1 holds the move
 /// line as its last kernel line, and has never heard of anything after it.
 fn check_com1_stopped_at_the_move(done: &Completed, _settings: &Settings) -> Result {
+    check_com1_stopped_at(done, TAKEN_OVER_LINE)
+}
+
+/// COM1's last kernel line is `moved`, the line announcing a move away from it.
+fn check_com1_stopped_at(done: &Completed, moved: &str) -> Result {
     let com1 = done.com1.as_deref().ok_or("no COM1 log")?;
     let text = serial::clean(com1.as_bytes());
     let kernel_lines: Vec<&str> = text
         .lines()
         .filter(|l| l.starts_with("origin-kernel:"))
         .collect();
-    if kernel_lines.last().copied() != Some(TAKEN_OVER_LINE) {
+    if kernel_lines.last().copied() != Some(moved) {
         return Err(format!(
             "COM1's last kernel line is {:?}; it should be the line about the move",
             kernel_lines.last()
@@ -4352,6 +4624,23 @@ fn check_com1_stopped_at_the_move(done: &Completed, _settings: &Settings) -> Res
 fn console_scenarios() -> Vec<Scenario> {
     vec![
         spcr_uart_scenario(),
+        // E4's move and replay (T84-5): an SPCR the loader cannot read whole names no UART in
+        // boot info, so the kernel moves to it, as every SPCR was moved to before TASKS item 84.
+        console_scenario(
+            "console: SPCR longer than the loader reads, moved to with a replay",
+            Capture::SpcrUart,
+            console_markers(&[
+                // Everything before the move, sent again after it.
+                "origin-kernel: console: framebuffer ",
+                KERNEL_NO_LOADER_UART,
+                MOVED_LINE,
+                "origin-kernel: console: the UART is now at I/O port 0x2f8, as the firmware set it; ",
+                REPLAYED,
+                "origin-kernel: allocated, wrote and freed 3 frames at ",
+            ]),
+            Some(|work| spcr_args(work, &long_spcr_table(), &[])),
+            Some(check_moved_with_a_replay),
+        ),
         console_scenario(
             "console: SPCR naming COM1 itself",
             Capture::Com1,
@@ -4375,7 +4664,8 @@ fn console_scenarios() -> Vec<Scenario> {
                 "origin-boot: console: the SPCR names a UART at I/O port 0x2e8 (interface 0x0, 115200 baud): the kernel writes to it from its first line",
                 // Given up on after one bounded wait, during the kernel's first line.
                 "origin-kernel: console: the loader's UART stopped taking bytes; serial output there off",
-                "origin-kernel: console: the loader named the SPCR's UART at I/O port 0x2e8 (interface 0x0): written to from the first line, beside COM1, ",
+                // Said as it is by then, not as it was attached (T84-9).
+                "origin-kernel: console: the loader named the SPCR's UART at I/O port 0x2e8 (interface 0x0): written to from the first line, and it stopped taking bytes there; COM1 and the screen until the SPCR is read",
                 "origin-kernel: console: the ACPI SPCR (revision 2, interface 0x0) names a UART at I/O port 0x2e8: moving the console there",
                 "origin-kernel: console: the UART at I/O port 0x2e8 takes no bytes; the UART stays at I/O port 0x3f8",
                 "origin-kernel: allocated, wrote and freed 3 frames at ",
@@ -4494,7 +4784,7 @@ fn boot_console(settings: &Settings) -> Result {
         run_scenario(scenario, kernel, settings)?;
     }
     println!(
-        "xtask: boot-console passed ({} of {} scenarios: the UART the SPCR names, COM1 named, refused tables, a UART that takes no bytes, one that stops taking them, no display, no UART)",
+        "xtask: boot-console passed ({} of {} scenarios: the UART the SPCR names, one moved to with a replay, COM1 named, refused tables, a UART that takes no bytes, one that stops taking them, no display, no UART)",
         chosen.len(),
         scenarios.len()
     );
@@ -4574,7 +4864,7 @@ fn large_runs(base: &Settings) -> Vec<MachineRun> {
 fn boot_rented(base: &Settings) -> Result {
     boot_machines(rented_runs(base))?;
     println!(
-        "xtask: boot-rented passed (both IOMMUs, {} of RAM, rental B's board's table shapes; and with the kernel's reading of the SPCR refused, under the AMD IOMMU)",
+        "xtask: boot-rented passed (both IOMMUs, {} of RAM, rental B's board's table shapes; and, under the AMD IOMMU, the SPCR alone refused by the kernel and its reading of every table refused)",
         base.large_memory().qemu()
     );
     Ok(())
@@ -4603,6 +4893,25 @@ fn rented_runs(base: &Settings) -> Vec<MachineRun> {
             ),
         })
         .collect();
+    // TASKS item 84's review, T84-3: the SPCR alone in RAM the kernel owns, so both UARTs are
+    // written to for the whole boot, which every check of a kernel boot holds.
+    runs.push(MachineRun {
+        said: format!(
+            "xtask: boot-rented: the AMD IOMMU, {} of RAM, the SPCR alone in RAM the kernel owns, both UARTs kept",
+            memory.qemu()
+        ),
+        settings: Settings {
+            iommu: Iommu::Amd,
+            memory,
+            shape: Shape::SpcrRefused,
+            only: KERNEL_BOOT.into(),
+            ..base.clone()
+        },
+        failed: format!(
+            "boot-test with the SPCR alone in RAM the kernel owns, {} of RAM and the AMD IOMMU",
+            memory.qemu()
+        ),
+    });
     // TASKS item 84: rental B's case, the loader reading the SPCR that the kernel cannot, under
     // the board's IOMMU alone.
     runs.push(MachineRun {
@@ -6500,6 +6809,10 @@ fn stage(kernel: &[u8], loader: Loader, settings: &Settings) -> Result<Staged> {
                 rsdp_in_ram: true,
                 ..RENTED_SHAPE
             },
+            Shape::SpcrRefused => origin_test_reserved_memory::Shape {
+                spcr_in_ram: true,
+                ..origin_test_reserved_memory::Shape::default()
+            },
         };
         let mut config = vec![0u8; 1024];
         let len = origin_test_reserved_memory::encode(&regions, shape, &mut config)
@@ -7257,7 +7570,21 @@ mod rented_scenario_tests {
         assert_eq!(scenario.markers[2], REFUSED_STAYS);
         assert_eq!(scenario.markers.last().map(String::as_str), Some(HALT_LINE));
         assert!(scenario.stderr.is_empty());
-        assert!(!scenario.failures.iter().any(|f| f.ends_with(" failed")));
+        // Every kernel boot's failure but the ones that need the ACPI tables (T84-3).
+        for kept in [
+            "(#PF page fault)",
+            ": scheduler failed",
+            "origin-kernel: boot refused",
+        ] {
+            assert!(scenario.failures.contains(&kept), "{kept}");
+        }
+        for dropped in NEEDS_THE_TABLES {
+            assert!(!scenario.failures.contains(dropped), "{dropped}");
+        }
+        assert_eq!(
+            scenario.failures.len() + NEEDS_THE_TABLES.len(),
+            qemu_boot_failures().len()
+        );
         let com1 = rented_firmware_markers(&settings);
         assert!(com1.iter().any(|m| m == LOADER_NAMES_COM2));
         assert!(
@@ -7265,9 +7592,95 @@ mod rented_scenario_tests {
                 .any(|m| m.contains("(loader data, RAM the kernel owns)"))
         );
         let runs = rented_runs(&settings);
-        assert_eq!(runs.len(), 3);
-        assert_eq!(runs[2].settings.shape, Shape::KernelRefused);
-        assert_eq!(runs[2].settings.iommu, Iommu::Amd);
+        assert_eq!(runs.len(), 4);
+        assert_eq!(runs[2].settings.shape, Shape::SpcrRefused);
+        assert_eq!(runs[3].settings.shape, Shape::KernelRefused);
+        assert!(runs[2..].iter().all(|r| r.settings.iommu == Iommu::Amd));
+    }
+
+    /// The machine with the SPCR alone in RAM (T84-3): the kernel boot's console lines, with the
+    /// loader's UART line in place of "none" and the refusal in place of "no SPCR", and no move;
+    /// every failure but the four one unreadable entry causes, `: console failed` among those
+    /// held; COM1 has the application's SPCR line and the loader's naming of COM2.
+    #[test]
+    fn the_spcr_refused_machine_holds_its_console_proofs() {
+        let settings = Settings {
+            shape: Shape::SpcrRefused,
+            memory: Memory::gib(64),
+            ..Settings::default()
+        };
+        let scenario = boot_scenario(&settings);
+        assert_eq!(scenario.capture, Capture::SpcrUart);
+        // Every failure but the four one unreadable entry causes: the console's proofs are held.
+        assert!(scenario.failures.contains(&": console failed"));
+        assert_eq!(
+            scenario.failures.len() + NEEDS_EVERY_ENTRY.len(),
+            qemu_boot_failures().len()
+        );
+        // The console's lines of the kernel boot, and nothing else of the kernel's.
+        assert!(
+            scenario
+                .markers
+                .iter()
+                .all(|m| m.starts_with("origin-kernel: console: ")
+                    || m == BOOT_VERDICT
+                    || m == HALT_LINE)
+        );
+        assert!(scenario.markers.iter().any(|m| {
+            m.ends_with(" lines from a writer that cannot wait filled the UART's queue")
+                || m.starts_with("origin-kernel: console: a line took ")
+        }));
+        let has = |m: &str| scenario.markers.iter().any(|x| x == m);
+        assert!(has(KERNEL_WRITES_COM2));
+        assert!(has(SPCR_REFUSED_PREFIX));
+        assert!(has(HALT_LINE));
+        assert!(!has(KERNEL_NO_LOADER_UART));
+        assert!(!has(TAKEN_OVER_LINE));
+        assert!(
+            !scenario
+                .markers
+                .iter()
+                .any(|m| m.starts_with("xtask: the marker "))
+        );
+        assert_eq!(reserved_top_mib(&settings), 0);
+        let com1 = rented_firmware_markers(&settings);
+        assert!(com1.iter().any(|m| m == LOADER_NAMES_COM2));
+        assert!(
+            com1.iter()
+                .any(|m| m == "origin-test-reserved: the XSDT now names SPCR at 0x")
+        );
+        assert!(!com1.iter().any(|m| m.contains("reserved 0x")));
+    }
+
+    /// T84-4 and T84-14's checks fail on the faults they name.
+    #[test]
+    fn the_two_uarts_are_compared_line_by_line() {
+        let com1 = "origin-kernel: a\norigin-kernel: b\norigin-boot: x\n";
+        assert_eq!(
+            same_kernel_lines(com1, "origin-kernel: a\norigin-kernel: b\n", None),
+            Ok(())
+        );
+        // A line doubled, lost, or out of order on the SPCR's UART.
+        for named in [
+            "origin-kernel: a\norigin-kernel: a\norigin-kernel: b\n",
+            "origin-kernel: b\n",
+            "origin-kernel: b\norigin-kernel: a\n",
+        ] {
+            assert!(same_kernel_lines(com1, named, None).is_err(), "{named:?}");
+        }
+        // Up to the take-over line, then whatever follows on that UART alone.
+        let named = "origin-kernel: a\norigin-kernel: b\norigin-kernel: after\n";
+        assert_eq!(
+            same_kernel_lines(com1, named, Some("origin-kernel: b")),
+            Ok(())
+        );
+        assert!(same_kernel_lines(com1, named, Some("origin-kernel: c")).is_err());
+        // The ports read from the two lines.
+        let loader = "origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): …";
+        let kernel = "origin-kernel: console: the loader named the SPCR's UART at I/O port 0x2f8 (interface 0x0): …";
+        assert_eq!(check_same_port_named(loader, kernel), Ok(()));
+        assert!(check_same_port_named(loader, &kernel.replace("0x2f8", "0x3e8")).is_err());
+        assert!(check_same_port_named("", kernel).is_err());
     }
 }
 

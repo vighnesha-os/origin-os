@@ -58,10 +58,11 @@ const ACPI: &str = "ORIGIN_QEMU_ACPI";
 /// The machine's RAM: `512M` (the default), a larger even number of MiB (`1024M`), or a whole
 /// number of GiB from 1 to 64 (`8G`). TASKS item 83.
 const MEMORY: &str = "ORIGIN_QEMU_MEMORY";
-/// `on`, `refused` or `off`: the firmware tables shaped as rental B's board has them, by the
-/// TEST ONLY application, with the console's UART at `0x2F8` (TASKS item 83); `refused` also puts
-/// the RSDP's copy in RAM the kernel owns, so the loader reads the SPCR and the kernel's own
-/// reading is refused (TASKS item 84). See [`Shape`].
+/// `on`, `refused`, `spcr-refused` or `off`: the firmware tables shaped as rental B's board has
+/// them, by the TEST ONLY application, with the console's UART at `0x2F8` (TASKS item 83);
+/// `refused` also puts the RSDP's copy in RAM the kernel owns, so the loader reads the SPCR and
+/// the kernel's own reading is refused (TASKS item 84); `spcr-refused` puts the SPCR alone there
+/// (its review, T84-3). See [`Shape`].
 const SHAPE: &str = "ORIGIN_QEMU_SHAPE";
 /// On if set and not empty: QEMU logs interrupts and resets.
 const DEBUG: &str = "ORIGIN_QEMU_DEBUG";
@@ -511,7 +512,6 @@ fn memory(value: &str) -> Result<Memory> {
     ))
 }
 
-/// A switch: `on`, or `off` (or unset).
 /// The firmware tables' shape on the rented board's machines ([`SHAPE`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Shape {
@@ -523,6 +523,10 @@ pub(crate) enum Shape {
     /// As [`Shape::Rented`], with the RSDP's copy in RAM the kernel owns: the loader reads the
     /// SPCR under boot services, and the kernel's own reading is refused (TASKS item 84).
     KernelRefused,
+    /// QEMU's tables unshaped but for the SPCR, copied into RAM the kernel owns: the kernel
+    /// refuses that one table, so both UARTs stay live for the whole boot, and reads every
+    /// other, so the whole boot's checks hold (TASKS item 84's review, T84-3).
+    SpcrRefused,
 }
 
 impl Shape {
@@ -537,6 +541,7 @@ impl Shape {
             Self::Off => "off",
             Self::Rented => "on",
             Self::KernelRefused => "refused",
+            Self::SpcrRefused => "spcr-refused",
         }
     }
 }
@@ -546,10 +551,14 @@ fn shape(value: Option<&str>) -> Result<Shape> {
         None | Some("off") => Ok(Shape::Off),
         Some("on") => Ok(Shape::Rented),
         Some("refused") => Ok(Shape::KernelRefused),
-        Some(other) => Err(format!("{SHAPE} must be on, refused or off, not {other:?}")),
+        Some("spcr-refused") => Ok(Shape::SpcrRefused),
+        Some(other) => Err(format!(
+            "{SHAPE} must be on, refused, spcr-refused or off, not {other:?}"
+        )),
     }
 }
 
+/// A switch: `on`, or `off` (or unset).
 fn switch(name: &str, value: Option<&str>) -> Result<bool> {
     match value {
         None | Some("off") => Ok(false),

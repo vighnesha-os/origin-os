@@ -151,9 +151,16 @@ fn the_memory_is_read_and_split_between_the_nodes() {
         Shape::KernelRefused
     );
     assert_eq!(read(&[(SHAPE, "off")]).unwrap().shape, Shape::Off);
+    assert_eq!(
+        read(&[(SHAPE, "spcr-refused")]).unwrap().shape,
+        Shape::SpcrRefused
+    );
     for bad in ["ON", "Refused", "yes"] {
         let e = read(&[(SHAPE, bad)]).unwrap_err();
-        assert!(e.contains("must be on, refused or off"), "{bad:?}: {e}");
+        assert!(
+            e.contains("must be on, refused, spcr-refused or off"),
+            "{bad:?}: {e}"
+        );
     }
     // The combinations whose checks would replace or drop each other are refused (T83-9).
     let e = read(&[(SHAPE, "on"), (RESERVED, "on")]).unwrap_err();
