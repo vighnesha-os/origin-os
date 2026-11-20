@@ -61,7 +61,7 @@
 //! # Who calls what
 //!
 //! - [`Exits::end`]: the ending thread, on its own processor, at most once per thread. The
-//!   scheduler keeps the [`Mark`] in the thread's slot until its exit.
+//!   scheduler keeps the [`Mark`] in the thread's record until its exit.
 //! - [`Exits::queued`] and [`Mark::left`]: the thread's processor, in its exit, with interrupts
 //!   off. [`Mark::left`] is the exit that could keep no zombie and leaked what the thread held:
 //!   the thread is leaving the processor and nothing more it holds will be given back, so a settle

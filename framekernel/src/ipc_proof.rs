@@ -3287,12 +3287,15 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     // After the counts are read, so that the words' own allocation is not in them.
     let unsettled = sched::not_settled(settled_before, settled_after);
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
-    // Every thread's state was complete before it could be picked (`sched::spawn_with`).
+    // Every thread's state was complete before it could be picked (`sched::spawn_with`). And no
+    // wake-up followed a thread to another slot, since none moves (TASKS item 92, the
+    // coordinating session's ruling Q5): held here, with no line of its own.
     let unready = sched::unready_switches();
+    let followed = sched::wakes_followed();
     let _ = writeln!(
         com1,
         "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}), {elapsed} ms for the whole proof; threads run before their state existed: {unready}{unsettled}{}",
-        if back && unready == 0 {
+        if back && unready == 0 && followed == 0 {
             ""
         } else {
             ": ipc failed"

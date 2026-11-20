@@ -59,6 +59,22 @@
 
 **Migration consequences.** No ABI: `ThreadRef` never crosses the system-call boundary. The Loom models' copy of `sched::wake` (`OnCpu::wake` in `models.rs`) gains the location loop. ADR-0005's thread object (`ThreadObject`) can later name the record for SDK operations on a thread.
 
+**Note, 2026-11-20: the loop is real code in the models (TASKS item 92; the coordinating session's ruling Q1; no decision changes).**
+- **One loop.** The location loop is `origin_sync::threads::wake`. The kernel instantiates it over its run queues (`sched::wake`) and the Loom models over theirs, so the models run the loop itself, not a copy; `OnCpu::wake` only calls it. The record and its block are the same code in both.
+- **What a changed location says.** Under the lock the loop took, a location found changed is one of three things:
+  - clear: the thread has exited, and there is nothing to wake;
+  - set, with another generation: the record holds a new thread, and the name is stale;
+  - set, with the same generation: the thread moved. Only this is followed, and only this counts towards the 64.
+- **Why the three are told apart.** Without that, a wake-up racing its thread's exit, or a reuse of its record, would count as a move although nothing moved.
+- **The count.** No thread moves until S6 is built. The kernel counts the moves wake-ups follow, and its boot proofs require that count to be 0 (the IPC proof's condition and every settle's verdict, with no line of their own).
+
+**Note, 2026-11-20: how S1's storage is built, and where a record's state is kept (TASKS item 92; the coordinating session's rulings Q2 and Q3).** The storage is built as the decision says. Where the state is kept refines the Ownership bullet above, as ruling Q3 accepted (the review of TASKS item 92, R92-10).
+- **The table.** One block of 32 records per processor, in the per-processor table that also holds its zombies (`framekernel::threads::THREADS`). Each block is a chunk published once, when the processors are discovered (`percpu::size_per_cpu`; ADR-0008 Amendment 1, D1), and never moved or freed.
+- **Taking and giving back.** A spawn takes its record from the block of the processor it queues the thread on. The thread's reap gives it back there, as it takes the zombie's state out.
+- **Why 32 is enough.** While no thread moves, a processor's records belong to the threads of its run queue (at most 15) and its zombies awaiting their reap (at most 16). So 31 × the processor count covers every thread the run queues and zombie lists can hold, and S1's growth path applies only if a queue's capacity ever grows. A spawn takes its record before its push, so one about to find its queue full holds a 32nd for a moment.
+- **The memory.** It is counted in the boot-time sizing, before the root is sized, and nothing is allocated when a thread starts. So ADR-0005 G5's per-thread figure is unchanged.
+- **Where the state is kept (ruling Q3, refining the Ownership bullet).** Each record's state (stack, FPU area, user context, exit mark) is read and written under a lock of the record's own, not under the owning queue's. That lock is taken after the owning queue's lock and the processor's thread table, and before a block's allocator. The location and the generation are kept as the decision above says.
+
 **Threats.** A stale name cannot wake another thread (the generation). No program can name a record: handles name thread objects (ADR-0005 P1).
 
 ### S2. Threads are pinned unless declared movable, and some never move

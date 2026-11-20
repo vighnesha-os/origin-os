@@ -11,6 +11,11 @@
 //! A thread blocked on another processor is woken with a reschedule IPI (`sched::wake`),
 //! so it runs within microseconds instead of at that processor's next timer tick (10 ms).
 //!
+//! A queue keeps its waiters' names, `sched::ThreadRef`: each thread's record and the record's
+//! generation, not where the thread runs. A wake-up finds the thread through its record's location
+//! (`origin_frame::sync::threads::wake`; ADR-0020 S1, TASKS item 92), so a name stays good if the
+//! thread moves, and a name kept past its thread's reap wakes no one.
+//!
 //! Lock order: a wait queue's lock, then whatever its condition reads. A waker never holds
 //! a wait queue's lock while it takes another one.
 //!

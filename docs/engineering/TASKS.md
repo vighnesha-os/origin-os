@@ -546,7 +546,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 91. **A boot proof that writes and reads back a frame near the top of the RAM through the direct map (TASKS item 83's review, T83-3). Numbered by the coordinating session on 2026-11-20; not started.** No boot proof touches memory above the first frames the allocator hands out, so a direct map that stopped short of the RAM's top would pass every proof that does not check its figure. `boot-large` and `boot-rented` now hold the direct map's figure against the RAM (TASKS item 83), and this proof would show the mapping itself works there: a frame near the top, written and read back through its direct-map address, and freed. Kernel code, outside TASKS item 83's ownership.
 
-92. **Thread records and names that survive moves (ADR-0020 S1). Plan P1, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after the eighth batch and the records of items 318 to 341 are on `main`.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Lands with no change of behaviour: no thread moves.
+92. **Thread records and names that survive moves (ADR-0020 S1). Plan P1, batch 9. Numbered by the coordinating session on 2026-11-20; contract accepted the same day; built on `claude/t92-thread-records` from `main` at `1c9c7a96` the same day ("As built" below).** Every thread's state is in a record of its own, which names it (`{ record, generation }`) and through which a wake-up finds it wherever it runs. Lands with no change of behaviour: no thread moves. The contract, its rulings, the comparison on the large machines under three rulings, three reviews and the gates are under "Task contracts", 92.
 
 93. **The processor-index witness and the pin (ADR-0020 S2, S3). Plan P2, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 92.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Converts the 74 sites that read the processor index.
 
@@ -3482,3 +3482,249 @@ Both figures are owed, measured on the Mac and named as unmeasured on hardware (
 - `boot-matrix` passed in 1,157 s: `boot-console` 10 of 10 and `boot-rented`'s 4 machines among its boots.
 - The identifier scan of `466d138a..20bfc398`, every message and added line of the 10 commits, found only synthetic test values (RFC 5737 addresses, a made-up server ID, a locally administered MAC, a made-up GUID), public hosts and section numbers.
 - Not run: anything under KVM, until the branch is pushed; anything on a physical machine.
+
+### 92. Thread records and names that survive moves (ADR-0020 S1; plan P1)
+
+Assigned by the coordinating session on 2026-11-20, on the owner's word ("Start TASKS 92"). The contract went to the coordinating session before any code (the coordination notes' `t92-contract.md`, written against `land/batch-8` at `90021bf6`). It was accepted the same day with the recommendation on Q1 to Q10 and these conditions:
+
+- two dated notes in ADR-0020 S1 (Q1: the models run the real loop; Q2: how the storage is built);
+- the bytes reserved per processor shown here;
+- Loom to cover a switch taking the outgoing and incoming records in turn (Q3);
+- a stop, never a lost wake-up, at the 64th try (Q4);
+- the count of moves followed held at 0 in the IPC proof's condition and at every settle, with no new line (Q5);
+- the large-machine comparison (Q6) and B1 paired;
+- spawn returns the slot (Q7);
+- `runqueue.rs` imports nothing from `origin_frame`, and Clippy on the default members before the gates (Q8);
+- no boot control (Q9);
+- every before/after leak line equal within each boot (Q10).
+
+Built on `claude/t92-thread-records`, cut from `main` at `1c9c7a96` (PR 47 and PR 48 merged), checked before the first commit.
+
+**As built**, in order:
+
+- `c8fcebca`: `origin_sync::threads`: `Location`, `Record` and `Block`; `prim` gains `AtomicU32`.
+- `583aa05d`: `origin_sync::threads::wake`, over a `Queues` trait that the kernel and the Loom models both implement (Q1).
+- `3f35ab3a`: `RunQueue` holds a record per slot (`push_weighted`'s third argument, `record`), and `wake_pending`, a read.
+- `86dcd25b`: a wake-up follows only moves (see "Changed from the contract").
+- `e9fd03bd`: the kernel: `framekernel/src/threads.rs` and `sched` through records.
+- `cddaec30`: Loom: the models' threads named by records, five new models and their controls.
+- `00a11e9f`: ADR-0020 S1's two dated notes.
+- `304b1c91`, `04dbbe3f`, `297f33d1`: the answers to the review (R92-1 to R92-10).
+- `53e5a3bc`: a switch takes two locks, as the base's did (the first Q6 ruling; R92-9).
+- `9af6cbc4`: the first delta review's answers (R92-11 to R92-14).
+- `25e47f5a`: the switch reads its records from the slots, resolved once at spawn (the second Q6 ruling).
+- `1c690a50`: the second delta review's answers (R92-15 to R92-19).
+- `4e0a2861`: the records: this entry, CL47, the provenance entry.
+- `2f38bf77`: G92-1, the lifecycle proof's race, found by the gates (below).
+- `1675118d`: the G92-1 delta review's answers (R92-20 to R92-29): the opening check waits too, and a failing line names more causes.
+- The gates' results, in this entry.
+
+**The design as it lands:**
+
+- **`origin_sync::threads`:**
+  - **`Location`:** a processor and a run-queue slot, packed in one word with a set bit.
+  - **`Record`:** a generation, a location, and the thread's state behind a lock of its own; aligned to a 64-byte line.
+  - **`Block`:** at most 64 records; `take` gives a free record its next generation; `give_back` refuses a record not held or still located.
+  - **`wake`:** reads the location, locks the queue it names, reads the location again, and compares the generation under that lock.
+    - A location found changed under the lock is an exit (`Gone`), a new thread in the record (`Stale`), or a move: same generation, another slot, followed, at most 64 times.
+- **`framekernel::threads`:**
+  - **`State`:** stack, FPU area, user context, exit mark.
+  - **`THREADS`:** one per-processor table holding the processor's block of 32 records and its `Table` (its 16 zombies' record numbers and the boot or idle flow's FPU area). It replaces `sched::THREADS`, so the kernel keeps 27 per-processor tables.
+  - **`Placed`:** a record's number and the record itself, made only by `take`, which a run-queue slot holds.
+  - **`unaccounted`:** the settles' check that every processor's block holds as many records as it has queued threads and zombies, and that no give-back was refused.
+- **`RunQueue<R = u32>`:** holds what the caller gives it of each slot's record and hands it back; the tests and the models keep the number, and the kernel's queues hold `Placed`.
+- **`sched`:**
+  - **Spawn:** takes a record from the target's block under the queue lock, pushes the thread with it, fills the state and then sets the location; a full queue gives the record back.
+  - **A switch:** saves the outgoing context's FPU area under its lock and releases it, then takes the incoming record's lock once for its restore and its address space.
+  - **`current_thread`, `current_user`, `end_with`:** read the record from the slot.
+  - **`on_exit`:** clears the location in the critical section that frees the slot and lists the record as a zombie.
+  - **The reap:** takes the state out, gives the record back, then drops what it held.
+  - **`ThreadRef`** is `{ record, generation }`.
+  - **`wake`:** goes through `origin_sync::threads::wake` and counts the moves it follows; the 64th try stops the kernel (Q4).
+- **The boot proofs:** the IPC proof's condition requires 0 moves followed, and every settle's verdict requires 0 moves followed and every record accounted for, with no new line.
+
+**Changed from the contract, and why:**
+
+- **The wake-up tells an exit and a new thread from a move (`86dcd25b`).**
+  - The contract's loop retried whenever the location under the lock differed from the one first read.
+  - Two races do that with no thread moving: a wake-up that read the location before its thread's exit and locked after it, and the same with the record handed to a new thread in between.
+  - Q5 holds the count at 0, so either would have failed a proof with nothing wrong.
+  - Covered by host tests and a Loom model.
+- **One per-processor table, not two.**
+  - The contract's separate `RECORDS` table changed a boot marker ("27 per-CPU tables" became 28), and the first `boot-test` stopped there.
+  - Steer (a) keeps every marker, so the block lives in the table that holds the zombies.
+- **The reap gives the record back before it drops what the record held**, not after `Exits::reap` (contract invariant 8).
+  - A reap in progress then holds no record, so 31 records cover every thread a queue and its zombie list hold.
+  - A 32nd covers the one a spawn holds before it finds its queue full (R92-7).
+  - `Exits::reap` still lowers the zombie count only after the drops.
+- **`RunQueue::wake_pending`** (a read): the Loom stand-in for a move must carry a kept wake-up, as ADR-0020 S6's move will.
+- **The contract's `zombie` flag in the state was not needed.**
+- **Five Loom models, not three:**
+  - `threads_a_wake_racing_an_exit_follows_nothing`, for the races above;
+  - `threads_a_switch_takes_each_record_in_turn`, for Q3.
+- **The settles also account for every record (R92-2).**
+- **`RunQueue` is generic over what a slot holds of its record**, and the kernel resolves each record once at spawn (the second Q6 ruling), where the contract had a `u32` per slot.
+
+**The large-machine comparison (Q6) and its rulings.** Every boot ran inside `cargo xtask exclusive --` with the machine idle, from a frozen export (`git archive`) of the commit named. The base is `1c9c7a96`. Logs, the scripts and each comparison are in the session's scratchpad.
+
+- **The literal rule fired on noise.** The first rule, any tip figure outside the base's three-run range, flagged 476 of 1,422 figures on 65 processors and 643 of 1,464 on 67. The base against its own other runs flagged 529 of 1,368 and 759 of 1,428 with nothing changed. So it could not tell a change from these machines' noise.
+- **The rule that replaced it** (the coordinating session's rulings `t92-q6-ruling.md`, `t92-q6-ruling-2.md` and `t92-q6-ruling-3.md`, in its notes folder, 2026-11-20, 16:45, 17:35 and 18:00 UTC). Stop on any of:
+  - **(a) Anything the base does not show:** a failed proof other than speculation controls and scheduler fairness; a leak line that differs within a boot; a past-the-former, stalled-shootdown, withheld-stack or not-settled line; a preemption window that uses up its 120 s.
+  - **(b) Window re-runs:** stalled windows passing on a re-run in 2 or more of the tip's 6 boots, while the base's 12 boots have none.
+  - **(c) Timing figures:** for each machine, the tip's mean of 3 worse than the base's worst single run of 6.
+    - Fair-share switches and counts per CPU: fewer is worse.
+    - Wait-queue ping-pong, IPC round trip and the 50 ms timed wait: more is worse.
+    - TSC handoffs count how readings interleave, and are not judged.
+    - **A figure quantised by the 10 ms tick** (the 50 ms wait): the tip's worst single run is judged against the 50 to 60 ms bound plus the base's largest overshoot, and against the base's worst run on either machine. The proof's own judge must pass in every boot, and no means are used.
+- **B1 alone stops nothing** once (a) to (c) pass on the final code (the second ruling, §4).
+
+**B1, paired** (the default machine, base and tip alternating, TSC cycles per context switch, `emu`: QEMU 11.1.3's software processor on the development Mac):
+
+| Round | Tip | Base | Tip | Means (base / tip) |
+|---|---|---|---|---|
+| Three locks per switch | `297f33d1` | 1691, 1695, 1812 | 2082, 1922, 1895 | 1733 / 1966 |
+| Two locks | `53e5a3bc` | 1684, 1808, 1828 | 1962, 2164, 1951 | 1773 / 2026 |
+| Shortened | `25e47f5a` | 1879, 1688, 1849 | 1798, 1841, 1695 | 1805 / 1778 |
+
+**The switch path's static counts** (`llvm-objdump` of `on_yield` and the `sched` functions it calls; instructions / call sites):
+
+| Kernel | Counts |
+|---|---|
+| The base | 265 / 11 |
+| Three locks | 519 / 17 |
+| Two locks | 444 / 16 |
+| Shortened | 355 / 13 |
+
+The calls a thread-to-thread switch makes are now the base's: `RunQueue::switch`, the FPU save, `follow_thread`, the FPU restore and the address space's activation.
+
+**What remains on the path beyond the base's,** each with the ADR-0020 S1 clause that needs it:
+
+| What remains | The clause |
+|---|---|
+| The slot's record read, for the outgoing and the incoming slot | The switch reaches a thread's state through its record ("`ThreadRef` names the record", "the record holds what the per-slot arrays hold") |
+| Two different locks, where the base took one table's lock twice | The state under a lock of its own (Ownership, refined by ruling Q3) and its order, never two records at once |
+| The three-way dispatch: boot or idle flow, thread, exited | S2 point 4: the boot or idle flow has no record |
+| The `UNREADY_SWITCHES` paths | The base's two checks, one now through the record |
+
+**The large machines:**
+
+- **Three-lock code:** a stalled preemption window passed on a re-run in 2 of its 12 boots, and the base had none in 6. That was the first stop.
+- **Two-lock code:**
+  - (a) clean;
+  - window re-runs 0 of 6, against 0 of 12;
+  - (c) passed but for TSC handoffs on 65 processors (11,679 against 11,888), which the second ruling took out of (c).
+- **The shortened code:**
+  - (a) clean in all 6 boots;
+  - window re-runs 0 of 6, against 0 of 12;
+  - (c) passed on both machines, but for the 50 ms wait on 65 processors (61, 61 and 61 ms against the base's 59 on 65). The third ruling judged that under the tick reading: the base reached 61 on 67 (`base-67-1`), and `judge_timed_waits` passed every boot with 0 ticks lost.
+
+| Figure | Machine | Base (6 runs) | Shortened tip (3 runs) |
+|---|---|---|---|
+| Switches per CPU | 65 | 64.6, 62.2, 70.0, 60.4, 63.2, 63.7 | 60.8, 64.5, 60.6 |
+| | 67 | 61.3, 60.4, 62.0, 66.4, 62.5, 68.7 | 60.0, 64.5, 58.4 |
+| Counts per CPU (M) | 65 | 106.4, 96.3, 110.0, 103.5, 95.0, 111.6 | 97.5, 114.1, 98.7 |
+| | 67 | 97.0, 105.8, 104.6, 107.1, 120.6, 110.4 | 99.7, 115.8, 91.8 |
+| Ping-pong (µs) | 65 | 35, 28, 22, 26, 32, 27 | 21, 23, 16 |
+| | 67 | 38, 36, 37, 45, 34, 35 | 35, 32, 27 |
+| IPC round trip (ns) | 65 | 90798, 116579, 78946, 79548, 135330, 89613 | 108915, 76074, 88119 |
+| | 67 | 95176, 114023, 89809, 94602, 127547, 94799 | 86240, 79120, 98173 |
+| 50 ms timed wait (ms) | 65 | 59, 50, 50, 58, 59, 59 | 61, 61, 61 |
+| | 67 | 61, 57, 59, 53, 51, 58 | 50, 59, 50 |
+| TSC handoffs (not judged) | 65 | 11888, 12613, 12656, 12530, 12671, 11974 | 12505, 12026, 12836 |
+| | 67 | 11732, 11793, 12492, 11776, 12551, 11602 | 12391, 12078, 11894 |
+
+**Memory (Q2, Q10).** The before/after leak lines were equal within every boot.
+
+- **Per-CPU tables:** the boot's own line reads "27 per-CPU tables hold N each, 6478 bytes per index" on the base and "7938 bytes per index" on the final tip, on every machine: 1,460 bytes more per processor.
+- **From the images** (`llvm-nm -S`; each table's boot element less `PerCpu`'s 56 bytes):
+  - `threads::THREADS`' element is 4,360 bytes. Its block is 32 records of 128 bytes, aligned to their lines, then its allocator's word and lock, then the 160-byte table.
+  - The base's `sched::THREADS` element was 2,952 bytes.
+  - `sched::QUEUES`' element grows from 816 to 1,072 bytes, as a slot holds a `Placed` where it held nothing.
+- **All of it is taken at discovery,** before the root is sized; nothing is allocated when a thread starts. ADR-0005 G5's per-thread figure is unchanged (ruling Q2).
+
+**Evidence:**
+
+- **Host tests:**
+  - `origin_sync::threads`: 18, covering the packing, the block, the numbering at its edges, and the wake-up against a stub that moves, exits or replaces the thread between the read and the lock;
+  - the run queue's record and pending-read tests;
+  - `settled`'s new verdicts.
+  - The kernel library's 566 and `origin-sync`'s 132 pass.
+- **Loom:** all 79 models passed and all 120 negative controls were caught, on `25e47f5a`.
+  - **The new models:** a wake-up that follows a move (untimed and timed), a stale name that wakes nobody, a wake-up racing an exit that follows nothing, and a switch through the records.
+  - **The new controls:** `wake_to_the_stale_slot`, `location_not_read_again_under_the_lock`, `wake_to_the_slot_it_left`, `generation_not_compared`, `an_exit_followed_as_a_move`, `a_new_thread_followed_as_a_move`, `location_load_relaxed` and `slot_names_another_record`.
+  - **One existing control widened:** `unlock_release_relaxed` now also names the switch model.
+- **Boots:** `boot-test`, 11 of 11, on each code change; the comparison's 36 large-machine boots and 18 B1 boots, every one passing.
+- **The gates on `6cbcfabd`** (the code at `1675118d` with every record but these results; each gate in its own turn, the worktree clean, 2026-11-20, 19:58 to 21:08 UTC):
+  - `check` passed in 660 s: 2,547 host tests passed, 0 failed, 30 ignored; Loom 79 models passed and 120 negative controls caught; every document gate.
+  - `boot-test` passed, 11 of 11.
+  - `boot-matrix` passed three times in a row, in 1,156, 1,153 and 1,155 s, with no empty log in any of them.
+  - Before them, `cargo clippy --locked --all-targets -- -D warnings` on the default members, and Clippy on the kernel for its target, found nothing.
+
+**The gates' first round, on `4e0a2861`, and G92-1.** Each gate ran in its own turn, with the worktree clean.
+
+| Gate | Result |
+|---|---|
+| `check` | Passed, 710 s: 2,547 host tests passed, 0 failed, 30 ignored; Loom 79 models, 120 controls caught; every document gate |
+| `boot-test` | Passed, 11 of 11 |
+| `boot-matrix` runs 1, 2 and 4 | Passed (1,156, 1,160 and 1,154 s) |
+| `boot-matrix` run 3 | Failed after 253 s |
+| `boot-matrix` run 5 | Failed after 342 s |
+
+- **Run 3 (2026-11-20, about 18:51 UTC):** the Intel-IOMMU 4-processor machine's "wrong key" scenario, in which the loader refuses a kernel signed with an untrusted key and no Origin code runs, printed nothing within 120 s.
+  - Its serial log, `boot-test-wrong-key.log`, holds 0 bytes: not even the firmware's first line.
+  - Every other scenario of that machine had passed in the same run.
+  - No other worktree's or scratch copy's xtask boot wrote a log between 18:42 and 18:55 UTC. A QEMU started outside xtask cannot be seen.
+  - Recorded as a stall of the host or firmware, on the coordinating session's ruling of 2026-11-21 (`t92-gates-ruling.md`). No follow-up is numbered on one occurrence; another empty log in the next three runs, on any machine, would stop the work.
+- **Run 5, G92-1:** the AMD-IOMMU 3-processor machine's lifecycle proof printed "exited threads freed their slots (slot Ok(1) reused): scheduler failed".
+  - Its alternations, sleep and reuse held, so it failed on `live() == 1`.
+  - `prove_lifecycle`, `measure_switch`, `bencher` and `quitter` were the base's, byte for byte. `measure_switch` stopped waiting once `FINISHED` counted both bench threads, but each raises it inside `finish`, before its exit. A tick between the two left the thread in its slot, and the proof read the queue with no wait: TASKS item 79's race, in a proof it did not cover. The quitter's 1 s wait giving up was a second way in.
+  - **On the ruling, closed here (`2f38bf77`):**
+    - After `measure_switch` the proof waits, through `wait_for_others` as the settles do (10 s; a line only past 2 s), for every thread whose end it has seen to leave the queue. A thread that never leaves still fails it.
+    - The quitter's wait giving up is a failure of its own.
+    - The passing line is unchanged. A failing line names each cause after ": scheduler failed".
+  - **`main` keeps the race until the ninth batch lands.**
+- **The delta review of G92-1** (R92-20 to R92-29, in `REVIEW_T92`) found the same race one line earlier (R92-20, Medium). The proof before, `prove_simd`, ends when its workers have counted themselves finished, which each does before its exit. `prove_lifecycle`'s opening check then read the queue with no wait.
+  - **`1675118d`:** the opening check waits the same way first, and a failure says how many contexts were still queued.
+  - **A failing line also names, without judging them:** the first threads' 3 s wait giving up, and a switch benchmark that could not spawn.
+  - **The verdict** is derived from the named conditions.
+- **The controls,** each planted in a `git archive` export (the script `plant.py`, kept with the session's logs). Each was booted with `cargo xtask boot-test` on the AMD-IOMMU 3-processor machine and on 1 processor, with the same result on both. C92-L1 and C92-L5 on the base are planted on `main` at `1c9c7a96`; the rest on `1675118d`.
+
+| Control | Plant | Result |
+|---|---|---|
+| C92-L1 | On the base: a bench thread sleeps 3 ticks between its `FINISHED` raise and its exit | Fails with run 5's line, word for word: the race is the base's (and `main`'s) |
+| C92-L2 | The same plant on the fix | Passes, 11 of 11, with no extension line |
+| C92-L2b | On the fix: the bench thread held 2.5 s, past the wait's 2 s (R92-21) | Passes, 11 of 11, after "waited 2499 ms for the lifecycle proof's threads to leave the queue, past the former 2000 ms" (2487 ms on 1 processor) |
+| C92-L3 | On the fix: a bench thread never exits after its raise | Fails after "waited 10000 ms … in vain", with "…: scheduler failed; 2 contexts still queued after the wait" |
+| C92-L4 | On the fix: the quitter sleeps 1.5 s before it finishes | Fails with "…: scheduler failed; the quitter's wait gave up after 1 s" |
+| C92-L5 | A SIMD worker sleeps 3 ticks between its `SIMD_EXITED` raise and its exit (R92-20): on the base | Fails with "CPU 0 still has threads: scheduler failed" |
+| | The same plant on the fix | Passes, 11 of 11 |
+
+C92-L1 to L4 were first run on `2f38bf77`, with the same results.
+
+- **Whether this task widened the window:** from `FINISHED`'s raise to the exit's `int $0x83`, the executed path is 17 instructions in the base and 15 on the tip, not counting padding.
+  - Each is the raise, the interrupt flag saved and cleared, one locked compare-exchange for the lock (the processor's `Threads` table's in the base, the thread's record's on the tip), the mark's store, the release and the flag restored. The base also checks the slot's index.
+  - Neither path makes a call. Read from each image's `bencher` (`llvm-objdump`), following the executed branches.
+  - Reported, not judged.
+
+**Review:** four AI reviews, each given the code and the properties without the author's argument, recorded in `REVIEW_T92_2026-11-20.md`.
+
+- **The change at `cddaec30`:** no High finding; R92-1 to R92-10.
+- **The first delta, `53e5a3bc`:** no High or Medium; R92-11 to R92-14.
+- **The second delta, `25e47f5a`:** no High or Medium; R92-15 to R92-19.
+- **G92-1, `2f38bf77`, with its controls:** no High; one Medium (R92-20, the same race at the proof's opening check); R92-20 to R92-29.
+
+Every finding is answered in a commit naming it, or left as a follow-up named there. R92-9's first answer was wrong (it said the tip took as many locks per switch as the base), and the record says so. No person has reviewed it.
+
+**Known limits:**
+
+- Moves, pins, affinity and the new per-thread fields are not built. Matrix row A20-S1 becomes `partial` in TASKS item 101 (P10).
+- The Loom move is a stand-in for S6's (`OnCpu::move_if_asked`), with one move per model.
+- `Exhausted` stops the kernel until TASKS item 96 (S20's pinned mode).
+- B1's figures are `emu`. A hardware figure is owed (§74; ADR-0018 V9). The record's line alignment (R92-13) is a layout choice that no emulated figure can show.
+- QEMU only.
+
+**Follow-ups:**
+
+- **Run the kernel's own spawn and exit record steps in the Loom models** (R92-3). They are hand copies in the models today. This moves code from `sched` into `origin_sync::threads`, which TASKS items 93 and 96 change next.
+- **A second check of the slot's generation** beside the record's location, for when S6's `depart` frees slots (R92-4). This belongs to TASKS item 96.
+- **The design branch `claude/m3-scheduling-design-a5598a`** is kept until `land/batch-9` reaches `main` (the coordinating session).

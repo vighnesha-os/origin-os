@@ -177,6 +177,19 @@ const EXITS_EARLY: &[&str] = &[
     "Causality violation",
 ];
 
+/// What `threads_a_stale_name_wakes_nobody` reports (TASKS item 92): a wake-up by a stale name
+/// reached the record's next thread.
+const STALE_WOKE: &[&str] = &["a stale name woke the record's next thread"];
+
+/// What `threads_a_wake_racing_an_exit_follows_nothing` reports (TASKS item 92): a wake-up
+/// followed an exit, or a new thread in the record, as if it were a move.
+const EXIT_FOLLOWED: &[&str] = &["a wake-up counted an exit or a new thread as a move"];
+
+/// What `threads_a_switch_takes_each_record_in_turn` reports (the review of TASKS item 92, R92-8):
+/// a switch restored a thread's state other than its last switch-out saved.
+const NOT_RESTORED: &[&str] =
+    &["a switch restored other than what the thread's last switch-out saved"];
+
 /// The models of a change to a space whose shootdowns may stall (`models.rs`).
 const ROUND_STALLS: &str =
     "a_change_whose_round_stalls_is_still_made_and_frees_only_what_a_flush_covered";
@@ -207,6 +220,7 @@ const PORTS: &str = "framekernel/frame/sync/src/ports.rs";
 const CONTEXTS: &str = "framekernel/frame/sync/src/contexts.rs";
 const BACKLOG: &str = "framekernel/frame/sync/src/backlog.rs";
 const EXITS: &str = "framekernel/frame/sync/src/exits.rs";
+const THREADS: &str = "framekernel/frame/sync/src/threads.rs";
 
 /// `WaitQueue::take_all`'s one critical section.
 const TAKE_ALL: &str = "        scheduler.without_interrupts(|| core::mem::replace(&mut *self.waiters.lock(), [None; N]))\n";
@@ -244,6 +258,9 @@ const CONTROLS: &[Control] = &[
             ("spin_lock_two_threads_two_rounds", CAUSALITY),
             ("spin_lock_passes_writes_to_the_next_holder", CAUSALITY),
             ("wait_queue_waker_and_waiter_relaxed", CAUSALITY),
+            // A thread's state reaches the next holder of its record, and the running slot's
+            // record a reader on another processor, only through the locks (TASKS item 92).
+            ("threads_a_switch_takes_each_record_in_turn", CAUSALITY),
         ],
     },
     Control {
@@ -391,6 +408,104 @@ const CONTROLS: &[Control] = &[
             ("wait_queue_same_cpu_wake_resumes_on_a_tick", DEADLOCK),
             ("wait_queue_same_cpu_timed_wake_resumes_on_a_tick", DEADLOCK),
         ],
+    },
+    Control {
+        // TASKS item 92 (ADR-0020 S1): today's `ThreadRef`, the processor and slot a thread had
+        // when it was named, kept across a move. In the models a thread registers on the
+        // processor it started on, so that is the slot its processor's `home` records.
+        name: "wake_to_the_stale_slot",
+        file: MODELS,
+        from: "        let record = self.world.record(thread.record);
+        match threads::wake(&*self.world, record, thread.generation).outcome {
+",
+        to: "        let (cpu, slot) = (self.world.cpus.iter().enumerate())
+            .find_map(|(cpu, c)| c.home.filter(|h| h.0 == thread.record).map(|h| (cpu, h.1)))
+            .unwrap();
+        let ready = {
+            let mut queue = self.world.cpus[cpu].queue.lock();
+            let generation = queue.generation(slot);
+            queue.wake(slot, generation)
+        };
+        let cpu = cpu as u32;
+        match (Outcome::Reached { ready, cpu }) {
+",
+        models: &[
+            ("threads_a_wake_follows_a_move", DEADLOCK),
+            ("threads_a_timed_wake_follows_a_move", DEADLOCK),
+        ],
+    },
+    Control {
+        // The location read once and trusted: a move that completes between the read and the
+        // lock leaves the wake-up at the slot the thread left.
+        name: "location_not_read_again_under_the_lock",
+        file: THREADS,
+        from: "            if now != Some(at) {
+                return changed(now, record.generation() == generation);
+            }
+",
+        to: "            let _ = now;
+",
+        models: &[
+            ("threads_a_wake_follows_a_move", DEADLOCK),
+            ("threads_a_timed_wake_follows_a_move", DEADLOCK),
+        ],
+    },
+    Control {
+        // The review of TASKS item 92, R92-1: a wake-up that follows its thread to the processor
+        // it moved to but wakes the slot it left there. In the move models the thread leaves
+        // slot 1 and arrives in slot 2, beside a blocked thread in slot 1.
+        name: "wake_to_the_slot_it_left",
+        file: THREADS,
+        from: "                    ready: Q::wake_slot(queue, at.slot()),\n",
+        to: "                    ready: Q::wake_slot(queue, at.slot().min(1)),\n",
+        models: &[
+            ("threads_a_wake_follows_a_move", DEADLOCK),
+            ("threads_a_timed_wake_follows_a_move", DEADLOCK),
+        ],
+    },
+    Control {
+        // The review's R92-6: the location read Relaxed. A wake-up that locks the old queue after
+        // its thread's exit may read the new thread's location there with the old generation,
+        // and follow it as a move.
+        name: "location_load_relaxed",
+        file: THREADS,
+        from: "Location::unpack(self.location.load(Acquire))",
+        to: "Location::unpack(self.location.load(Relaxed))",
+        models: &[("threads_a_wake_racing_an_exit_follows_nothing", EXIT_FOLLOWED)],
+    },
+    Control {
+        // The review's R92-8: a slot that names another thread's record (slots 1 and 2, the
+        // model's two threads, swapped), so a switch saves and restores the wrong thread's state.
+        name: "slot_names_another_record",
+        file: RUN_QUEUE,
+        from: "            Some(_) => self.record.get(slot).copied().flatten(),\n",
+        to: "            Some(_) => self.record.get(slot ^ 3).copied().flatten(),\n",
+        models: &[("threads_a_switch_takes_each_record_in_turn", NOT_RESTORED)],
+    },
+    Control {
+        // A location found clear under the lock taken for a move: the wake-up follows an exit.
+        name: "an_exit_followed_as_a_move",
+        file: THREADS,
+        from: "        (None, _) => Look::Ends(Outcome::Gone),\n",
+        to: "        (None, _) => Look::Moved,\n",
+        models: &[("threads_a_wake_racing_an_exit_follows_nothing", EXIT_FOLLOWED)],
+    },
+    Control {
+        // A location found set with a new generation taken for a move: the wake-up follows the
+        // record's next thread.
+        name: "a_new_thread_followed_as_a_move",
+        file: THREADS,
+        from: "        (Some(_), false) => Look::Ends(Outcome::Stale),\n",
+        to: "        (Some(_), false) => Look::Moved,\n",
+        models: &[("threads_a_wake_racing_an_exit_follows_nothing", EXIT_FOLLOWED)],
+    },
+    Control {
+        // A name kept past its thread's reap wakes the record's next thread.
+        name: "generation_not_compared",
+        file: THREADS,
+        from: "            Look::Ends(if record.generation() == generation {\n",
+        to: "            Look::Ends(if record.generation() == record.generation() {\n",
+        models: &[("threads_a_stale_name_wakes_nobody", STALE_WOKE)],
     },
     Control {
         // The run queue reports a waiter it did not make ready: nothing can ever run it.
@@ -637,11 +752,9 @@ const CONTROLS: &[Control] = &[
         // Across processors nothing but the reschedule IPI restarts a halted one.
         name: "cross_cpu_wake_sends_no_ipi",
         file: MODELS,
-        from: "        if woke && thread.cpu != self.cpu {
-            target.kick.notify();
-        }
+        from: "                self.world.cpus[cpu as usize].kick.notify();
 ",
-        to: "        let _ = (woke, target);
+        to: "                let _ = cpu;
 ",
         models: &[
             ("wait_queue_waker_and_waiter_release_acquire", DEADLOCK),
