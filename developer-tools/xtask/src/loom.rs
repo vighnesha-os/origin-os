@@ -993,23 +993,65 @@ const CONTROLS: &[Control] = &[
         // another processor still holds the old translation (ADR-0004 Amendment 1, A2).
         name: "slot_free_before_the_shootdown",
         file: SLOTS,
-        from: "            table.set(slot, State::Reclaiming);\n",
-        to: "            table.free(slot);\n",
+        from: "        self.set(slot, State::Reclaiming);\n",
+        to: "        self.free(slot);\n",
         models: &[("slots_reclaimed_slot_is_taken_only_after_its_shootdown", STALE)],
     },
     Control {
         // What a reclaimed slot held goes back as soon as it leaves the tables.
         name: "slot_released_before_the_shootdown",
         file: SLOTS,
-        from: "        let unmapped = unmap(slot, pages);
-        let outcome = shoot(slot, pages);
-        match outcome {
-            Ok(_) => release(unmapped),
-            Err(_) => core::mem::forget(unmapped),
-        }
+        from: "                let unmapped = unmap(slot, pages);
+                let outcome = shoot(slot, pages);
+                match outcome {
+                    Ok(completed) => {
+                        release(unmapped);
+                        let mut table = self.table.lock();
+                        table.counts.retired -= 1;
+                        table.counts.pages -= u64::from(pages);
+                        table.free(slot);
+                        Some(Reclaim::Freed {
+                            completed,
+                            asked_again: 0,
+                        })
+                    }
+                    Err(stall) => {
+                        let mut table = self.table.lock();
+                        // Out of the tables, so no longer mapped, though still retired.
+                        table.counts.pages -= u64::from(pages);
+                        table.set(slot, State::Waiting);
+                        table.waiting = Some(Waiting {
+                            slot,
+                            pages,
+                            kept: unmapped,
+                            stall,
+                            asked_again: 0,
+                        });
+                        self.publish(&table);
+                        Some(Reclaim::Stalled {
+                            stall,
+                            asked_again: 0,
+                        })
+                    }
+                }
+            }
 ",
-        to: "        release(unmap(slot, pages));
-        let outcome = shoot(slot, pages);
+        to: "                release(unmap(slot, pages));
+                let outcome = shoot(slot, pages);
+                match outcome {
+                    Ok(completed) => {
+                        let mut table = self.table.lock();
+                        table.counts.retired -= 1;
+                        table.counts.pages -= u64::from(pages);
+                        table.free(slot);
+                        Some(Reclaim::Freed {
+                            completed,
+                            asked_again: 0,
+                        })
+                    }
+                    Err(_) => None,
+                }
+            }
 ",
         models: &[(
             "slots_reclaimed_slot_is_taken_only_after_its_shootdown",

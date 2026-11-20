@@ -26,6 +26,14 @@
 //! [`reclaim`], once a TLB shootdown has reached every processor. The scheduler reclaims where it
 //! reaps exited threads.
 //!
+//! A reclaim whose shootdown stalls keeps the stack's frames and slot, and the stack stays
+//! retired. A later reclaim asks again, with a fresh shootdown of the same pages, once the
+//! processor that did not answer has answered something since, and gives the stack back only
+//! when that shootdown completes on every processor (TASKS item 73). One stack at most waits so:
+//! while it does, no other is unmapped, and the stacks retired behind it stay mapped, with their
+//! frames, until it is given back. A processor that never answers keeps it waiting for good, and
+//! once every slot is taken or retired a new stack is refused.
+//!
 //! A stack's drop decides from records whether a processor may still be using it
 //! (`cpu::stack_in_use`):
 //! - **The caller's own stack pointer.**
@@ -61,8 +69,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use origin_paging::PAGE;
 use origin_paging::layout::{self, STACK_REGION, STACK_REGION_SIZE};
+pub use origin_sync::shootdown::Stalled;
 pub use origin_sync::slots::State;
-use origin_sync::slots::{Counts, Slots, Taken};
+use origin_sync::slots::{Counts, Reclaim, Slots, Taken};
 
 use crate::cpu::{self, CpuIndex, without_interrupts};
 use crate::descriptors::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
@@ -91,8 +100,16 @@ const _: () = assert!(
     "a stack's shootdown names its pages"
 );
 
-/// The region's slots: the floor's, and those [`grow`] adds.
-static REGION: Slots<SLOTS, IDLE> = Slots::new();
+/// What a reclaim's unmap took out of the tables: the stack's frames, and when, for the line that
+/// says how long a stack waited after a stall.
+struct Unmapped {
+    frames: [Option<OwnedFrame>; MAX_PAGES],
+    at: u64,
+}
+
+/// The region's slots: the floor's, and those [`grow`] adds. The table keeps what one unmap took
+/// out, for a stack whose shootdown stalled.
+static REGION: Slots<SLOTS, IDLE, Unmapped> = Slots::new();
 /// The region's size in bytes: its floor until [`grow`] adds to it, once, before any
 /// application processor starts. Every address check reads it ([`region_size`]).
 static REGION_SIZE: AtomicU64 = AtomicU64::new(STACK_REGION_SIZE);
@@ -470,23 +487,48 @@ fn map_fresh(slot: usize, pages: u32) -> bool {
 /// What [`reclaim`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Reclaimed {
-    /// Retired stacks whose pages left the tables, each with a shootdown, and whose frames and
-    /// slots are free again.
+    /// Retired stacks whose pages left the tables, each with a shootdown that completed, and
+    /// whose frames and slots are free again.
     pub stacks: u32,
     /// The interrupts those shootdowns sent to other processors.
     pub interrupts: u32,
-    /// Retired stacks whose shootdown stalled: their slots and frames are never reused.
-    pub lost: u32,
+    /// A shootdown that stalled, the last thing this reclaim did: its stack waits, with its
+    /// frames and slot, for a fresh shootdown to complete.
+    pub stalled: Option<Withheld>,
+    /// A stack given back after it had waited, if one was.
+    pub given_back: Option<GivenBack>,
 }
 
-/// Gives back what every retired stack holds: its pages leave the kernel's tables, a shootdown
+/// A stack's shootdown that stalled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Withheld {
+    /// Who did not answer.
+    pub stall: Stalled,
+    /// How many fresh shootdowns the stack had been sent since its first stall, this one
+    /// included: 0 if this was its first.
+    pub asked_again: u32,
+}
+
+/// A stack given back after it had waited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GivenBack {
+    /// How many fresh shootdowns it was sent, the one that completed included.
+    pub asked_again: u32,
+    /// TSC ticks from its unmap to its release.
+    pub ticks: u64,
+}
+
+/// Gives back what retired stacks hold: a stack's pages leave the kernel's tables, a shootdown
 /// drops their translations from every processor, and only then are its frames and its slot
-/// free. It waits for every processor, so never call it under a lock another processor may wait
-/// for with interrupts off: the scheduler calls it where it reaps exited threads. With no stack
-/// retired it takes no lock.
+/// free. A stack whose shootdown stalled is asked again first, once the processor that stalled
+/// has answered since; until it is given back no other stack is unmapped. It waits for every
+/// processor, so never call it under a lock another processor may wait for with interrupts off:
+/// the scheduler calls it where it reaps exited threads. With no stack retired it takes no lock.
+/// Returns at once, having done nothing, while another processor reclaims.
 pub fn reclaim() -> Reclaimed {
     let mut done = Reclaimed::default();
     loop {
+        let mut waited = 0;
         let outcome = without_interrupts(|| {
             REGION.reclaim(
                 |slot, pages| {
@@ -494,27 +536,49 @@ pub fn reclaim() -> Reclaimed {
                     if let Some(taken) = frames.get_mut(..pages as usize) {
                         crate::vm::unmap_stack_pages(stack_low(slot, pages), taken);
                     }
-                    frames
+                    Unmapped {
+                        frames,
+                        at: cpu::rdtsc(),
+                    }
                 },
                 |slot, pages| {
                     crate::tlb::shootdown_kernel_pages(stack_low(slot, pages), u64::from(pages))
                 },
-                |frames| {
-                    for frame in frames.into_iter().flatten() {
+                crate::tlb::answered,
+                |unmapped| {
+                    waited = cpu::rdtsc().wrapping_sub(unmapped.at);
+                    for frame in unmapped.frames.into_iter().flatten() {
                         let _ = memory::free_frame(frame);
                     }
                 },
             )
         });
         match outcome {
-            None => return done,
-            Some(Ok(completed)) => {
+            None | Some(Reclaim::Busy | Reclaim::Unanswered(_)) => return done,
+            Some(Reclaim::Freed {
+                completed,
+                asked_again,
+            }) => {
                 done.stacks += 1;
                 done.interrupts += completed.processors;
+                if asked_again > 0 {
+                    done.given_back = Some(GivenBack {
+                        asked_again,
+                        ticks: waited,
+                    });
+                }
             }
-            Some(Err(_)) => done.lost += 1,
+            Some(Reclaim::Stalled { stall, asked_again }) => {
+                done.stalled = Some(Withheld { stall, asked_again });
+                return done;
+            }
         }
     }
+}
+
+/// The last stall of the stack waiting after one, if a stack waits: for a settle's words.
+pub fn waiting() -> Option<Stalled> {
+    without_interrupts(|| REGION.waiting())
 }
 
 /// Retires every freed stack that is kept mapped for reuse, so that the next [`reclaim`] gives
@@ -523,7 +587,8 @@ pub fn trim() -> usize {
     without_interrupts(|| REGION.trim())
 }
 
-/// How many stacks are held, kept for reuse, retired or lost, and the pages they map.
+/// How many stacks are held, kept for reuse, retired (a stack waiting after a stall among them)
+/// or lost, and the pages they map.
 pub fn counts() -> Counts {
     without_interrupts(|| REGION.counts())
 }

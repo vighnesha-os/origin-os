@@ -243,7 +243,7 @@ use crate::runqueue::RunQueue;
 use crate::shootdown::{
     Confirmation, Held, Request, Rounds, Scope, Shootdown, Stalled, TlbHardware,
 };
-use crate::slots::Slots;
+use crate::slots::{Reclaim, Slots};
 use crate::wait::{Scheduler, TimedOut, WaitQueue};
 use crate::{RwLock, SpinLock};
 
@@ -2237,7 +2237,7 @@ fn slots_reclaimed_slot_is_taken_only_after_its_shootdown() {
                 world.shootdown.mark_online(cpu);
             }
             world.tlb[1].store(true, Relaxed);
-            let slots = Arc::new(Slots::<1, 0>::new());
+            let slots = Arc::new(Slots::<1, 0, Arc<ModelFrame>>::new());
             let taken = slots.take(1).expect("the slot is free");
             // Nothing is kept for reuse (`IDLE` is 0): the slot is retired.
             slots.give_back(taken.slot, true);
@@ -2276,9 +2276,13 @@ fn slots_reclaimed_slot_is_taken_only_after_its_shootdown() {
                         .shootdown
                         .shoot(&near, Request::page(THE_PAGE), Scope::Kernel)
                 },
+                |_| unreachable!("no slot waits"),
                 |frame| reuse(&frame),
             );
-            assert!(matches!(outcome, Some(Ok(_))), "{NO_ANSWER}");
+            assert!(
+                matches!(outcome, Some(Reclaim::Freed { .. })),
+                "{NO_ANSWER}"
+            );
             world.finish(vec![holding, taking]);
         },
     );

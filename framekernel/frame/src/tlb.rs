@@ -302,7 +302,8 @@ pub fn shootdown_all() -> u64 {
 /// Drops the translations of the `pages` pages from `base` on every online processor, after the
 /// caller took them out of the kernel's tables; more than `MAX_LISTED_PAGES` pages flush every
 /// translation. A stall is returned rather than stopping the kernel: the stack region's caller
-/// (`stack`, through `origin_sync::slots`) then never reuses the pages or what they held.
+/// (`stack`, through `origin_sync::slots`) then keeps the pages and what they held until a fresh
+/// request for them completes (TASKS item 73).
 pub(crate) fn shootdown_kernel_pages(base: u64, pages: u64) -> Result<Completed, Stalled> {
     let request = if (1..=origin_sync::shootdown::MAX_LISTED_PAGES).contains(&pages) {
         Request::Pages { base, pages }
@@ -316,4 +317,11 @@ pub(crate) fn shootdown_kernel_pages(base: u64, pages: u64) -> Result<Completed,
         LAST_CYCLES.store(done.ticks, Ordering::Relaxed);
     }
     outcome
+}
+
+/// Whether the processor `stall` names has served a shootdown since it stalled
+/// (`Shootdown::answered`): when asking it again is worth an interrupt. Never proof that it
+/// dropped any translation: only a fresh request that completes is (TASKS item 73).
+pub(crate) fn answered(stall: Stalled) -> bool {
+    SHOOTDOWN.answered(stall)
 }

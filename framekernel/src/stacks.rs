@@ -670,7 +670,9 @@ fn switch_windows(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: 
     let (given_back, how) = match state {
         _ if !room => (false, "not judged: no room was kept for it"),
         Some(State::Idle) => (true, "kept for reuse"),
-        Some(State::Retired | State::Reclaiming | State::Free) => (true, "retired"),
+        Some(State::Retired | State::Reclaiming | State::Waiting | State::Free) => {
+            (true, "retired")
+        }
         Some(State::Lost) => (false, "leaked"),
         Some(State::Live) => (false, "not reaped"),
         None => (false, "no slot"),
