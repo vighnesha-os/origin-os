@@ -397,13 +397,17 @@ fn cost(com1: &mut Console, tsc_hz: u64) -> bool {
     free(reuse);
     stack::trim();
     reclaimed(tsc_hz);
-    // One stack at a time, freed, retired and reclaimed here; a round in which another
-    // processor reclaimed it first, in its idle loop, is not counted. Reclaims are served one at
-    // a time (`Slots::reclaim`, TASKS item 73): that processor holds the role through its
-    // shootdown and takes each stack retired meanwhile, so a stack is still given back, by the
-    // role's holder. After a round not counted this waits for that reclaim, so the next round
-    // starts with none under way; without the wait every later round ended `Busy` and none was
-    // counted (0 of 16 on the 67-processor sparse machine, 2026-11-20; control K5).
+    // One stack at a time, freed, retired and reclaimed here. A round counts when this reclaim
+    // gave back one stack, whichever it was; its time then includes whatever that reclaim did,
+    // a stall included (the scheduler's line says so if one came). A round in which another
+    // processor reclaimed the stack first, in its idle loop, is not counted. Reclaims are served
+    // one at a time (`Slots::reclaim`, TASKS item 73): that processor holds the role through its
+    // shootdown, and its loop takes the stacks retired meanwhile that it sees; one it misses is
+    // given back by the next reap anywhere. After a round not counted this waits until nothing is
+    // retired, which makes a run of `Busy` rounds unlikely but does not exclude another processor
+    // from taking the next round's stack; without the wait every later round ended `Busy` and
+    // none was counted (0 of 16 on the 67-processor sparse machine, 2026-11-20; control K5). The
+    // independent review of TASKS item 73, T73-3, corrected these words.
     let (mut alone, mut reclaiming, mut interrupts) = (0, 0, 0);
     for _ in 0..stack::IDLE {
         drop(GuardedStack::new(MEASURED));

@@ -570,7 +570,9 @@ pub struct GivenBack {
 /// has answered since; until it is given back no other stack is unmapped. It waits for every
 /// processor, so never call it under a lock another processor may wait for with interrupts off:
 /// the scheduler calls it where it reaps exited threads. With no stack retired it takes no lock.
-/// Returns at once, having done nothing, while another processor reclaims.
+/// Returns at once, having done nothing, while another processor reclaims: what this call
+/// leaves is given back by a later reclaim, that processor's own loop if it sees the stack, or
+/// the next reap anywhere, since every processor's idle loop reaps (T73-3).
 pub fn reclaim() -> Reclaimed {
     let mut done = Reclaimed::default();
     loop {
