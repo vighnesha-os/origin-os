@@ -2,7 +2,7 @@
 //! nodes.
 
 use super::encode::*;
-use super::{block, interp, load};
+use super::{Told, block, interp, load, told};
 use crate::{ErrorKind, IntegerWidth, Plain, Value};
 
 /// `plain` reads an integer or a string, through an alias, and nothing else, running nothing and
@@ -67,12 +67,13 @@ fn a_failed_load_is_rolled_back_whole() {
             ),
             scope("\\_SB.KEEP", &[name("INNR", one())]),
             name("\\TOP", one()),
-            // Fails here: \MISS does not exist.
-            scope("\\MISS", &[]),
+            // Fails here, whole: a reserved opcode (step B5: a statement that fails as it runs is
+            // only abandoned).
+            vec![0x02],
         ],
     )
     .unwrap_err();
-    assert_eq!(e.kind, ErrorKind::NotFound);
+    assert!(matches!(e.kind, ErrorKind::Reserved { .. }), "{e:?}");
     assert_eq!(i.node_count(), nodes);
     assert!(i.lookup("\\_SB.NEW1").unwrap().is_none());
     assert!(i.lookup("\\_SB.KEEP.INNR").unwrap().is_none());
@@ -82,13 +83,24 @@ fn a_failed_load_is_rolled_back_whole() {
 }
 
 #[test]
-fn a_duplicate_name_in_a_later_table_fails_that_table_only() {
+fn a_duplicate_name_in_a_later_table_is_abandoned_alone() {
+    // G3 (TASKS 64's ledger §3; step B5): the duplicate definition is refused, the first object
+    // stays, and the later table loads.
     let mut i = interp(IntegerWidth::Bits64);
     load(&mut i, &[name("\\DUP", one())]).unwrap();
     let nodes = i.node_count();
-    let e = load(&mut i, &[name("\\OK1", one()), name("\\DUP", byte(2))]).unwrap_err();
-    assert_eq!(e.kind, ErrorKind::Duplicate);
-    assert_eq!(i.node_count(), nodes);
+    assert_eq!(
+        load(&mut i, &[name("\\OK1", one()), name("\\DUP", byte(2))]),
+        Ok(1)
+    );
+    assert!(matches!(
+        told(&mut i).as_slice(),
+        [Told::Abandoned {
+            kind: ErrorKind::Duplicate,
+            ..
+        }]
+    ));
+    assert_eq!(i.node_count(), nodes + 1);
     assert_eq!(i.evaluate("\\DUP", &[]).unwrap(), Some(Value::Integer(1)));
 }
 
@@ -134,9 +146,19 @@ fn single_segments_are_searched_upward_and_paths_are_exact() {
 
 #[test]
 fn scope_needs_a_scope() {
+    // Refused, and since step B5 abandoned alone (G3's ruling keeps the refusal).
     let mut i = interp(IntegerWidth::Bits64);
-    let e = load(&mut i, &[name("NAM", one()), scope("NAM", &[])]).unwrap_err();
-    assert_eq!(e.kind, ErrorKind::WrongObject);
+    assert_eq!(
+        load(&mut i, &[name("NAM", one()), scope("NAM", &[])]),
+        Ok(0)
+    );
+    assert!(matches!(
+        told(&mut i).as_slice(),
+        [Told::Abandoned {
+            kind: ErrorKind::WrongObject,
+            ..
+        }]
+    ));
 }
 
 #[test]
@@ -214,7 +236,8 @@ fn a_failed_table_gives_its_bytes_back() {
         .map(|k| name(&format!("\\N{:03X}", k % 4096), one()))
         .collect();
     let mut failing = big.clone();
-    failing.push(scope("\\MISS", &[]));
+    // A failure of the whole table (step B5: a missing scope is only a statement's).
+    failing.push(vec![0x02]);
     // Collections are spaced (the review of B2, B2-7), so the failed tables' objects are garbage
     // until one is due, and the heap's slot table, which keeps its size for reuse, grows to hold
     // them: twenty failures first, so that it has, and each measure after the collection.
@@ -259,6 +282,7 @@ fn an_aborted_evaluation_leaves_what_was_there_before_it() {
     i.push_owner(Owner::Call(7)).unwrap();
     let outer = CallFrame {
         serial: 7,
+        method: crate::namespace::Namespace::root(),
         ret: i.cur,
         locals: [Val::None; 8],
         args: [Val::None; 7],
@@ -267,6 +291,8 @@ fn an_aborted_evaluation_leaves_what_was_there_before_it() {
     crate::mem::push(&mut i.calls, outer, &mut i.budget).unwrap();
     let held = Held {
         mutex: None,
+        node: None,
+        method: None,
         call: 7,
         sync: 0,
         global: false,
@@ -283,4 +309,13 @@ fn an_aborted_evaluation_leaves_what_was_there_before_it() {
         nodes,
         "the failed evaluation's X is removed"
     );
+}
+
+#[test]
+fn every_namespace_tolerance_test_fails_without_its_reports() {
+    // B5's contract §4 (the review of B5, B5-R4): `NoReport` planted, one run each.
+    super::fails_without_reports(&[
+        a_duplicate_name_in_a_later_table_is_abandoned_alone,
+        scope_needs_a_scope,
+    ]);
 }

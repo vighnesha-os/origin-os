@@ -9,6 +9,7 @@ mod namespace;
 mod qemu;
 mod random;
 mod semantics;
+mod tolerance;
 
 use std::collections::BTreeMap;
 
@@ -83,6 +84,57 @@ pub(crate) struct TestHost {
     pub(crate) time_left: Vec<u64>,
     /// With `Some`, the host traces: each event it heard.
     pub(crate) events: Option<Vec<Event>>,
+    /// Every report, in order (step B5).
+    pub(crate) told: Vec<Told>,
+    /// When set, every region access and transfer: the region's path, the address and the bytes
+    /// spanned, for the soak's audit that each lies within its region (B5's contract §4.9, audit
+    /// 5; the review of B5, B5-R4).
+    pub(crate) accesses: Option<Vec<Access>>,
+}
+
+/// One access the test host logged: the region's path, the address, and the bytes spanned.
+pub(crate) type Access = (Vec<[u8; 4]>, u64, u64);
+
+/// A report, as the model host keeps it (step B5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Told {
+    Abandoned {
+        kind: crate::ErrorKind,
+        table: u32,
+        statement: u32,
+        resumed: u32,
+    },
+    AlreadyLoaded(u32),
+    Unbound(u32),
+    Extra {
+        count: u64,
+        found: u64,
+    },
+    Unterminated(u32),
+    HighBytes(u32),
+    LongStall(u8),
+    /// The mutex's path, and the path of the method that took it.
+    Released(Vec<[u8; 4]>, Vec<[u8; 4]>),
+    Pieces(Vec<[u8; 4]>, u64),
+    /// Tolerances and stores in pieces past the bound.
+    Suppressed(u64, u64),
+}
+
+/// Each case fails with `NoReport` planted, in a run of its own: a test of a tolerance asserts
+/// its reports (B5's contract §4; the review of B5, B5-R4).
+#[track_caller]
+pub(crate) fn fails_without_reports(cases: &[fn()]) {
+    for case in cases {
+        plant(Some(Fault::NoReport));
+        let failed = std::panic::catch_unwind(case).is_err();
+        plant(None);
+        assert!(failed, "{case:?} passed with every report dropped");
+    }
+}
+
+/// The reports since the last call, taken.
+pub(crate) fn told(i: &mut Interp) -> Vec<Told> {
+    core::mem::take(&mut i.host_mut().told)
 }
 
 /// A trace event, as the model host keeps it.
@@ -117,6 +169,13 @@ pub(crate) struct BufferSeen {
 }
 
 impl TestHost {
+    /// An access to `region` at `address`, `bytes` long, kept for the soak's audit when it asks.
+    fn note_access(&mut self, region: &[[u8; 4]], address: u64, bytes: u64) {
+        if let Some(log) = &mut self.accesses {
+            log.push((region.to_vec(), address, bytes));
+        }
+    }
+
     /// An access was given `left` of time: never none (the review of B1, F9).
     fn given(&mut self, left: u64) {
         assert!(left > 0, "a region access made with no time left");
@@ -142,6 +201,7 @@ impl Host for TestHost {
     }
     fn read(&mut self, a: &RegionAccess<'_>) -> Result<u64, HostError> {
         self.given(a.time_left_100ns);
+        self.note_access(a.region, a.address, u64::from(a.width / 8));
         if self.refuse {
             self.refused += 1;
             return Err(HostError::Refused);
@@ -162,6 +222,7 @@ impl Host for TestHost {
     }
     fn write(&mut self, a: &RegionAccess<'_>, value: u64) -> Result<(), HostError> {
         self.given(a.time_left_100ns);
+        self.note_access(a.region, a.address, u64::from(a.width / 8));
         if self.refuse {
             self.refused += 1;
             return Err(HostError::Refused);
@@ -194,6 +255,10 @@ impl Host for TestHost {
     }
     fn transfer(&mut self, a: &BufferAccess<'_>, data: &mut [u8]) -> Result<usize, HostError> {
         self.given(a.time_left_100ns);
+        // An Embedded Controller transfer spans its bytes; another space's address is a command
+        // or a register, one byte of its region's space.
+        let span = if a.space.0 == 3 { data.len() } else { 1 };
+        self.note_access(a.region, a.address, span as u64);
         if self.refuse {
             self.refused += 1;
             return Err(HostError::Refused);
@@ -249,6 +314,30 @@ impl Host for TestHost {
     fn breakpoint(&mut self) {
         self.breakpoints += 1;
     }
+    fn report(&mut self, report: &crate::Report<'_>) {
+        use crate::Report;
+        self.told.push(match *report {
+            Report::Abandoned {
+                error,
+                statement,
+                resumed,
+            } => Told::Abandoned {
+                kind: error.kind,
+                table: statement.table,
+                statement: statement.offset,
+                resumed: resumed.offset,
+            },
+            Report::AlreadyLoaded { table } => Told::AlreadyLoaded(table),
+            Report::UnboundElement { at } => Told::Unbound(at.offset),
+            Report::ExtraElements { count, found, .. } => Told::Extra { count, found },
+            Report::Unterminated { at } => Told::Unterminated(at.offset),
+            Report::HighBytes { at } => Told::HighBytes(at.offset),
+            Report::LongStall { us, .. } => Told::LongStall(us),
+            Report::Released { mutex, method } => Told::Released(mutex.to_vec(), method.to_vec()),
+            Report::Pieces { field, pieces } => Told::Pieces(field.to_vec(), pieces),
+            Report::Suppressed { tolerances, pieces } => Told::Suppressed(tolerances, pieces),
+        });
+    }
     fn tracing(&self) -> bool {
         self.events.is_some()
     }
@@ -273,7 +362,14 @@ impl Host for TestHost {
         self.debug.push(text.to_vec());
     }
     fn table(&mut self, k: &TableKey, out: &mut dyn FnMut(u64, &[u8])) -> Result<bool, HostError> {
-        match self.tables.iter().find(|(t, _, _)| t == k) {
+        // As `host.rs` asks of a host (G18, step B5): the first listed table whose signature
+        // is the key's and whose IDs match, an empty ID matching any.
+        let id = |key: &[u8], listed: &[u8]| key.iter().all(|&c| c == 0) || key == listed;
+        match self.tables.iter().find(|(t, _, _)| {
+            t.signature == k.signature
+                && id(&k.oem_id, &t.oem_id)
+                && id(&k.oem_table_id, &t.oem_table_id)
+        }) {
             Some((_, address, bytes)) => {
                 out(*address, bytes);
                 Ok(true)
@@ -367,6 +463,75 @@ pub(crate) enum Fault {
     /// A run-time-loaded table's table-level code may name its caller's locals and arguments
     /// (`load.rs`, `at_loaded_table_level`).
     AllowLoadLocals,
+    /// No report reaches the host (`tolerate.rs`, `tell`).
+    NoReport,
+    /// A method's return releases the mutexes it took, as before step B5 (`engine.rs`,
+    /// `finish_call`).
+    ReleaseOnReturn,
+    /// A mutex still held at the end is released without a report (`sync.rs`,
+    /// `release_reported`).
+    SilentRelease,
+    /// A statement's failure in load-time code fails the table whole, as before step B5
+    /// (`tolerate.rs`, `abandon_target`).
+    NoAbandon,
+    /// A table already loaded is loaded again (`tolerate.rs`, `identical_table`).
+    LoadTwice,
+    /// The names load-time code put in packages are never bound (`tolerate.rs`, `bind_names`).
+    NoBind,
+    /// The deferred list is a root of the collector and of the binding pass's marking, as before
+    /// the review of B5's answers, B5-R11 (`engine.rs`, `mark_reachable`).
+    StrongDeferred,
+    /// The binding pass marks nothing first, and binds the list as the collector left it
+    /// (`tolerate.rs`, `sift_deferred`).
+    NoSift,
+    /// An abandoned statement's names are taken off the list by its byte range and never bound,
+    /// B5-R3's marking, which the review of its answers found wrong, B5-R10 (`tolerate.rs`,
+    /// `abandon`).
+    MarkAbandoned,
+    /// A failed run-time load leaves its names unbound (`load.rs`, `fail_load`).
+    NoFailedPass,
+    /// A failed run-time load reports its releases after its names are removed, as before the
+    /// review of B5's answers, B5-R12 (`load.rs`, `fail_load`).
+    ReleaseAfterUnwind,
+    /// Every report past the bound is counted a tolerance, as before the review of B5's answers,
+    /// B5-R14 (`tolerate.rs`, `tell_suppressed`).
+    SuppressedAsOne,
+    /// A failed table's bytes go at once, before its listed names are bound, as before the
+    /// second addendum to the review of B5, B5-R15 (`load.rs`, `fail_table`).
+    ReleaseBeforeBinding,
+    /// A string byte above 0x7F fails the table, as before step B5 (`engine.rs`,
+    /// `decode_string`).
+    RefuseHighBytes,
+    /// A package with more elements than its count is a `Range` error, as before step B5
+    /// (`engine.rs`, `place_element`).
+    RefuseExtraElements,
+    /// A `Stall` of 101 to 255 µs is not reported (`sync.rs`, `stall`).
+    SilentStall,
+    /// A buffer's text has no `0x` before each byte, as before step B5 (`convert.rs`,
+    /// `bytes_hex`).
+    OldTexts,
+    /// A zero-length named buffer keeps its length, as before step B5 (`store.rs`).
+    KeepZeroLength,
+    /// A string is written to a field a character at a time, as before step B5 (`region.rs`,
+    /// `write_value`).
+    StringByCharacter,
+    /// A string's bytes are cut to the field and written once, step B5's first rule for G15,
+    /// replaced by the coordinating session's ruling on point 1 (`region.rs`, `write_value`).
+    StringCut,
+    /// A store in pieces is not told to the host (`tolerate.rs`, `tell_pieces`).
+    SilentPieces,
+    /// The skip takes a name naming a method as a call in a place too, as before the review of
+    /// B5, B5-R1 (`tolerate.rs`, `skip_term`).
+    SkipCallsInPlaces,
+    /// `AnyAcc` takes the narrowest naturally aligned width holding the field, as before step B5
+    /// (`region.rs`, `width`).
+    WidestAnyAcc,
+    /// An EmbeddedControl field wider than a byte is accessed a byte at a time, as before step B5
+    /// (`region.rs`, `field_locked`).
+    EcBytewise,
+    /// A key's ID matches a table's up to the key's first NUL, the rest NUL or space, as step B4
+    /// ruled (`load.rs`, `id_matches`).
+    OldIdMatch,
 }
 
 thread_local! {

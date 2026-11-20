@@ -407,6 +407,9 @@ fn device<'a>(
     depth: usize,
     visit: &mut dyn FnMut(DeviceNode<'a>),
 ) -> Result<usize, Error> {
+    // The PMTT is walked here, not by `Walk`, so its steps are counted here (the review's F13).
+    #[cfg(test)]
+    crate::walk::steps::add();
     if depth >= PMTT_MAX_DEPTH {
         return Err(b.error(
             at,

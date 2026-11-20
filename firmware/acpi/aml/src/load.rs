@@ -20,9 +20,11 @@
 //! included, comes after the table was added and leaves it loaded (§19.6.78). A `Pending` that
 //! still reaches a load's store is the interpreter's own error (`Grammar`), never a retry.
 //!
-//! **A load that fails other than by a limit** (a check, a duplicate name, any error in its term
-//! list) is rolled back whole, names and bytes, and its operator gives Zero; the evaluation goes on
-//! ([`Interpreter::fail_load_at`], from `run_frames`). A limit or a `Fatal` ends the evaluation,
+//! **A load is best-effort** (step B5; `tolerate.rs`): a statement of its load-time code that
+//! fails as it runs, a duplicate name or an unresolved one among them, is abandoned and reported,
+//! and the table loads. **A load that fails whole** (a check, a block already loaded, a failure
+//! the parser cannot step past) is rolled back whole, names and bytes, and its operator gives
+//! Zero; the evaluation goes on ([`Interpreter::fail_load_at`], from `run_frames`). A limit or a `Fatal` ends the evaluation,
 //! as everywhere, and the table is rolled back with it (`Fatal`: B4-2). **A load that completes
 //! stays**, even if the evaluation around it fails later: AML has no transactions (B4's contract,
 //! Q8).
@@ -32,9 +34,11 @@
 //! - True is Ones at the integer width (Q4);
 //! - `LoadTable` of a `DSDT` or `SSDT` key gives Zero without asking the host: the operating
 //!   system loads those itself, as §19.6.78's note says (Q6);
-//! - a table loaded twice fails at its first duplicate name (Q7);
-//! - a key's ID matches a table's when the table's field holds the key's characters, then NUL or
-//!   space to its end (G18);
+//! - a table already loaded, the same signature, IDs and term list as one loaded and not
+//!   failed, is refused whole and gives Zero (Q7, as ruled for step B5; `tolerate.rs`);
+//! - a key's signature is four AML name characters; an empty OEM ID or OEM table ID matches any
+//!   table, any other is compared byte for byte, padded with NUL (G18, TASKS 64's ledger §3;
+//!   step B5);
 //! - `_INI` and `_REG` are not run for what a run-time load adds: that is the ACPI service's to
 //!   decide (G17, Q9).
 
@@ -137,16 +141,68 @@ pub(crate) fn answers(key: &TableKey, bytes: &[u8]) -> bool {
     })
 }
 
-/// Whether a table's ID field `field` matches a key's `key` (G18, strict until the reading
-/// session answers): the key's characters up to its first NUL, then only NUL or space in the
-/// field. ACPI tables pad their IDs with spaces; a key from AML strings is padded with NUL.
+/// Whether a table's ID field `field` matches a key's `key` (G18, TASKS 64's ledger §3; step
+/// B5): an empty key, all NUL, matches any table; any other is compared byte for byte, padded
+/// with NUL, so a table's trailing spaces must be in the key.
 fn id_matches(key: &[u8], field: &[u8]) -> bool {
-    let used = key.iter().position(|&c| c == 0).unwrap_or(key.len());
-    let (head, rest) = field.split_at(used.min(field.len()));
-    key.get(..used) == Some(head) && rest.iter().all(|&c| c == 0 || c == b' ')
+    #[cfg(test)]
+    if crate::tests::planted(crate::tests::Fault::OldIdMatch) {
+        let used = key.iter().position(|&c| c == 0).unwrap_or(key.len());
+        let (head, rest) = field.split_at(used.min(field.len()));
+        return key.get(..used) == Some(head) && rest.iter().all(|&c| c == 0 || c == b' ');
+    }
+    key.iter().all(|&c| c == 0) || key == field
+}
+
+/// Whether `c` may be in a table signature `LoadTable` or `DataTableRegion` is given: an AML
+/// name character (G18; B5's contract, Q8).
+const fn signature_char(c: u8) -> bool {
+    c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'
 }
 
 impl<H: Host> Interpreter<H> {
+    /// The key `LoadTable` and `DataTableRegion` look a table up by, from their three strings
+    /// (G18, TASKS 64's ledger §3; step B5): the signature's first four characters, which must be
+    /// AML name characters (`Name` otherwise, a shorter string included), the rest of it not
+    /// compared; the OEM ID and OEM table ID padded with NUL, each `Range` if longer than its
+    /// field.
+    pub(crate) fn table_key(&mut self, strings: [Val; 3]) -> Result<TableKey> {
+        let mut key = TableKey {
+            signature: [0; 4],
+            oem_id: [0; 6],
+            oem_table_id: [0; 8],
+        };
+        for (i, (out, v)) in [
+            &mut key.signature[..],
+            &mut key.oem_id[..],
+            &mut key.oem_table_id[..],
+        ]
+        .into_iter()
+        .zip(strings)
+        .enumerate()
+        {
+            let s = self.string_of(v)?;
+            let fits = if i == 0 {
+                s.get(..4)
+                    .is_some_and(|sig| sig.iter().all(|&c| signature_char(c)))
+            } else {
+                s.len() <= out.len()
+            };
+            for (d, c) in out.iter_mut().zip(&s) {
+                *d = *c;
+            }
+            mem::release(s, &mut self.budget);
+            if !fits {
+                return err(if i == 0 {
+                    ErrorKind::Name
+                } else {
+                    ErrorKind::Range
+                });
+            }
+        }
+        Ok(key)
+    }
+
     // --- `Load` ------------------------------------------------------------------------------
 
     /// `Load (Object, Result)` (§19.6.77): the object is a buffer, a SystemMemory region read
@@ -204,29 +260,7 @@ impl<H: Host> Interpreter<H> {
     /// after it, the parameter stored. Keys too long are errors; a key signed `DSDT` or `SSDT`,
     /// a table not found, and a copy that fails its checks give Zero.
     pub(crate) fn exec_load_table(&mut self, f: &OpFrame) -> Result<()> {
-        let mut key = TableKey {
-            signature: [0; 4],
-            oem_id: [0; 6],
-            oem_table_id: [0; 8],
-        };
-        for (i, out) in [
-            &mut key.signature[..],
-            &mut key.oem_id[..],
-            &mut key.oem_table_id[..],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let s = self.string_of(val(f, i)?)?;
-            let fits = s.len() <= out.len();
-            for (d, c) in out.iter_mut().zip(&s) {
-                *d = *c;
-            }
-            mem::release(s, &mut self.budget);
-            if !fits {
-                return err(ErrorKind::Range);
-            }
-        }
+        let key = self.table_key([val(f, 0)?, val(f, 1)?, val(f, 2)?])?;
         // The root path first: a path that names nothing is an error, whether or not the table
         // is there. It must name a scope object, as `Scope`'s does: the root, a predefined scope,
         // a device, processor, thermal zone or power resource (§19.6.122; the review of B4, B4-4,
@@ -340,6 +374,17 @@ impl<H: Host> Interpreter<H> {
         }
         let h = *t.header();
         let aml = t.bytes().get(HEADER_LEN..).unwrap_or(&[]);
+        // A table already loaded is refused whole, and the operator gives Zero (B4's Q7, as ruled
+        // for step B5).
+        if let Some(table) = self.identical_table(h.signature.0, h.oem_id, h.oem_table_id, aml) {
+            self.tell(&crate::Report::AlreadyLoaded { table });
+            let target = if f.op == Op::Load {
+                f.arg(1)
+            } else {
+                Operand::Empty
+            };
+            return self.load_result(f.op, target, false);
+        }
         let index =
             u32::try_from(self.tables.len()).map_err(|_| ErrorKind::Limit(Limit::Memory))?;
         let end = u32::try_from(aml.len()).map_err(|_| ErrorKind::Truncated)?;
@@ -354,6 +399,7 @@ impl<H: Host> Interpreter<H> {
                 oem_id: h.oem_id,
                 oem_table_id: h.oem_table_id,
                 failed: false,
+                abandoned: 0,
             },
             &mut self.budget,
         )?;
@@ -397,20 +443,20 @@ impl<H: Host> Interpreter<H> {
             end,
             scope,
             pred: 0,
+            stmt: self.cur,
         })
     }
 
-    /// The table's block has ended: its names stay, and the operator gets True. Load-time code
-    /// that ends holding a mutex fails the load instead, as a table's load at the top level does
-    /// (§19.6.89; G2). Nothing here can be put back: `Load`'s target was made ready at the
-    /// operator (B4-1), and `LoadTable`'s parameter is a step of its own, pushed here once the
-    /// load has ended (B4-12).
+    /// The table's block has ended: its names stay, and the operator gets True. A mutex its
+    /// load-time code still holds stays held until the outermost evaluation ends (G2, step B5).
+    /// Nothing here can be put back: `Load`'s target was made ready at the operator (B4-1), and
+    /// `LoadTable`'s parameter is a step of its own, pushed here once the load has ended (B4-12).
     pub(crate) fn finish_load(&mut self, l: Loading) -> Result<()> {
+        // The names its load-time code put in packages are bound now (G1, step B5), while the
+        // `Loading` frame still stands: a limit here fails the table whole and traces it, as any
+        // limit in its load does (the review of B5, B5-R2).
+        self.bind_names(Some(l.table))?;
         self.pop_frame();
-        if self.release_held(l.held) {
-            let at = self.frames.len();
-            return self.fail_load(at, l, Error::new(ErrorKind::MutexHeld));
-        }
         self.pop_owner(false);
         self.run.depth = l.depth;
         self.cur = l.ret;
@@ -503,8 +549,9 @@ impl<H: Host> Interpreter<H> {
 
     /// Whether `LocalX` and `ArgX` are refused here: at a loaded table's table level they would
     /// be the method's that ran `Load`, which the table has no right to read or write (the
-    /// review of B4's addendum, B4-13). The same block loaded by the host has no method and fails
-    /// `Grammar` at them too. A test may plant their admission (`AllowLoadLocals`).
+    /// review of B4's addendum, B4-13). The same block loaded by the host has no method, and
+    /// `decode` refuses them there with the same kind, `OutsideMethod` (step B5). A test may plant
+    /// their admission (`AllowLoadLocals`).
     pub(crate) fn at_loaded_table_level(&self) -> bool {
         #[cfg(test)]
         if crate::tests::planted(crate::tests::Fault::AllowLoadLocals) {
@@ -561,25 +608,59 @@ impl<H: Host> Interpreter<H> {
             let kept = core::mem::take(&mut ctx.created);
             mem::release(kept, &mut self.budget);
         }
+        // What the table's code took goes with the table, each release reported: the evaluation
+        // goes on, so this is an end other than its own (G2; the review of B5, B5-R9). Before the
+        // unwind, which removes the table's names, so that a mutex or a method the table declared
+        // is named in its report (the review of B5's answers, B5-R12). Planted
+        // (`ReleaseAfterUnwind`), after it.
+        #[cfg(test)]
+        let late = crate::tests::planted(crate::tests::Fault::ReleaseAfterUnwind);
+        #[cfg(not(test))]
+        let late = false;
+        if !late {
+            self.release_reported(l.held);
+        }
         self.unwind(at, l.calls, l.owners);
-        self.release_held(l.held);
+        if late {
+            self.release_reported(l.held);
+        }
         self.pending = None;
         self.run.depth = l.depth;
         self.fail_table(l.table);
         self.cur = l.ret;
         self.trace_limit(&e);
         self.trace(&Trace::Loaded(Err(e)));
+        // A run-time load binds its names at its end, failed or not: what the table stored in an
+        // object older than it is still read (the review of B5's answers, B5-R10). After the
+        // load's `Loaded`, so a limit here is the evaluation's, which aborts it.
+        #[cfg(test)]
+        let skip = crate::tests::planted(crate::tests::Fault::NoFailedPass);
+        #[cfg(not(test))]
+        let skip = false;
+        if !skip {
+            self.bind_names(Some(l.table))?;
+        }
         let [target, _] = l.args;
         self.load_result(l.op, target, false)
     }
 
-    /// Marks table `index` failed and gives its bytes back, as a failed top-level load does.
-    fn fail_table(&mut self, index: u32) {
+    /// Marks table `index` failed. The names it put in packages stay listed: a boot table's are
+    /// bound by [`Interpreter::bind_deferred`], a run-time load's at its end (`fail_load`); those
+    /// of a load an aborted evaluation failed are bound by `bind_deferred` if it has yet to run,
+    /// and are otherwise looked up when read (B5-R10). A listed name is read from the table's
+    /// bytes, so they go only once none is listed, still charged to the memory limit until then
+    /// (the review of B5's second addendum, B5-R15; `release_failed_bytes`). Planted
+    /// (`ReleaseBeforeBinding`), they go at once, as before.
+    pub(crate) fn fail_table(&mut self, index: u32) {
         if let Some(t) = self.tables.get_mut(us(index)) {
             t.failed = true;
-            let aml = core::mem::take(&mut t.aml);
-            mem::release(aml, &mut self.budget);
+            #[cfg(test)]
+            if crate::tests::planted(crate::tests::Fault::ReleaseBeforeBinding) {
+                let aml = core::mem::take(&mut t.aml);
+                mem::release(aml, &mut self.budget);
+            }
         }
+        self.release_failed_bytes();
     }
 
     /// Fails every table a [`Loading`] frame above `frames` was loading, when an evaluation is

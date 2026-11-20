@@ -66,8 +66,7 @@ pub enum ErrorKind {
     Type,
     /// An uninitialized object used as an operand (Table 19.5).
     Uninitialized,
-    /// A method's value used where it returned none (G6, strict until the reading session
-    /// answers).
+    /// A method's value used where it returned none (G6: ACPICA's default too, TASKS 64's ledger, `docs/research/2026-11-14-aml-gaps-acpica.md` §3).
     NoValue,
     /// `Divide` or `Mod` by zero.
     DivideByZero,
@@ -90,16 +89,20 @@ pub enum ErrorKind {
         cause: HostError,
     },
     /// A mutex acquired below the current sync level, or released at another (ACPI 6.6
-    /// §19.6.89). G2, strict until the reading session answers.
+    /// §19.6.89; ACPI 4.0's release rule). G2: ACPICA's default too, with no lenient mode (TASKS
+    /// 64's ledger §3).
     SyncLevel,
     /// `Release` of a mutex this evaluation does not hold (§19.6.117).
     NotOwned,
-    /// The evaluation ended holding a mutex (§19.6.89): it was released, and this is reported.
-    /// G2, strict until the reading session answers.
-    MutexHeld,
     /// A wait that only another evaluation could end (`Wait` with no timeout on an event with no
     /// signal pending): the interpreter runs one evaluation at a time, so it would never end.
     WouldBlock,
+    /// A local or an argument named where no method of the table runs: the table level of a
+    /// table `Load` or `LoadTable` is loading, whose locals would be its caller's (the review of
+    /// B4's addendum, B4-13), or a boot table's, which has none. A statement's failure: in
+    /// load-time code it abandons only its statement (step B5; the coordinating session's ruling
+    /// on B5's contract, Q2).
+    OutsideMethod,
     /// `Fatal` (§19.6.47): the firmware's report, also given to the host.
     Fatal { kind: u8, code: u32, arg: u64 },
     /// A path given to the API that is not one.

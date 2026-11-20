@@ -155,6 +155,19 @@ fn generate(
     kinds: &[u16],
     shape: (usize, usize, usize),
 ) -> Vec<u8> {
+    let n = rng.below(12);
+    generate_n(rng, signature, fixed, kinds, shape, n)
+}
+
+/// [`generate`] with `n` structures.
+fn generate_n(
+    rng: &mut Rng,
+    signature: &[u8; 4],
+    fixed: usize,
+    kinds: &[u16],
+    shape: (usize, usize, usize),
+    n: usize,
+) -> Vec<u8> {
     let (kind_width, len_at, len_width) = shape;
     let mut body: Vec<u8> = (0..fixed)
         .map(|_| if rng.chance(3) { rng.byte() } else { 0 })
@@ -164,7 +177,7 @@ fn generate(
         let at = rng.below(fixed / 4) * 4;
         put(&mut body, at, 4, rng.edge_len(fixed + 36));
     }
-    for _ in 0..rng.below(12) {
+    for _ in 0..n {
         let kind = u64::from(kinds[rng.below(kinds.len())]);
         let len = if rng.chance(5) {
             rng.edge_len(64) as usize & 0x3FF
@@ -301,5 +314,166 @@ fn tables_without_a_header_never_escape() {
             let _ = MpstChannel::parse(&b, 0);
         });
         assert!(r.is_ok(), "case {case}: {b:02x?}");
+    }
+}
+
+/// A large table of `sample`'s signature: its fixed part once, then its structures repeated
+/// `copies` times, the counts VIOT and PMTT keep set to match. The repeats' references point into
+/// the first copy, so the parsers' acceptance paths and lookups run on every structure. Two
+/// tables' rules between structures would refuse a plain repeat at its first copy, so the copies
+/// are made to keep them: the MSCT's domain ranges are moved up past the first copy's, and the
+/// FPDT's later copies take a reserved record type (4), which allows any number.
+fn replicate(sample: &[u8], fixed: usize, copies: usize) -> (Vec<u8>, usize) {
+    let body = &sample[36..];
+    let (head, structures) = body.split_at(fixed);
+    let per = match census::check(sample).map(|c| c.class) {
+        Ok(Class::Checked(s)) => s.structures() as usize,
+        _ => 0,
+    };
+    let mut t = crate::testing::table(
+        &sample[..4].try_into().unwrap(),
+        sample[8],
+        &[head, &structures.repeat(copies)].concat(),
+    );
+    let n = per * copies;
+    let first = 36 + head.len();
+    let width = structures.len();
+    for k in 1..copies {
+        let at = first + k * width;
+        match &sample[..4] {
+            // Every copy's ranges above the last one's, so they ascend without a gap.
+            b"MSCT" => {
+                // Each structure's length is its second byte; its range's low and high at 2 and 6.
+                let starts = |base: usize| {
+                    let mut r = base;
+                    let mut v = Vec::new();
+                    while r + 10 <= base + width && t[r + 1] >= 10 {
+                        v.push(r);
+                        r += usize::from(t[r + 1]);
+                    }
+                    v
+                };
+                let u32_at =
+                    |t: &[u8], f: usize| u32::from_le_bytes(t[f..f + 4].try_into().unwrap());
+                let stride = starts(first)
+                    .iter()
+                    .map(|&r| u32_at(&t, r + 6))
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                for r in starts(at) {
+                    for f in [r + 2, r + 6] {
+                        let v = u32_at(&t, f) + k as u32 * stride;
+                        put(&mut t, f, 4, u64::from(v));
+                    }
+                }
+            }
+            b"FPDT" => {
+                let mut r = at;
+                while r + 3 <= at + width {
+                    put(&mut t, r, 2, 4);
+                    r += usize::from(t[r + 2]).max(1);
+                }
+            }
+            _ => {}
+        }
+    }
+    match &sample[..4] {
+        b"VIOT" => put(&mut t, 36, 2, n as u64),
+        b"PMTT" => put(
+            &mut t,
+            36,
+            4,
+            copies as u64 * u64::from(u32::from_le_bytes(sample[36..40].try_into().unwrap())),
+        ),
+        _ => {}
+    }
+    seal(&mut t);
+    (t, n)
+}
+
+/// The most walk steps a parse and census of a table of `n` structures with signature `sig` may
+/// take (TASKS item 71, the review's F13). Most tables are walked a few times whole: at most four
+/// steps a structure. The PPTT and the VIOT look structures up through an index, each lookup at
+/// most `n.div_ceil(64) + 1` steps: the PPTT [`crate::pptt::MAX_LOOKUPS`] lookups a structure, the
+/// VIOT one. The NFIT is bounded whatever its length ([`crate::nfit::MAX_STEPS`]).
+fn step_bound(sig: &[u8], n: usize) -> u64 {
+    let lookup = n.div_ceil(64) + 1;
+    let bound = match sig {
+        b"PPTT" => 4 * n + n * crate::pptt::MAX_LOOKUPS * lookup,
+        b"VIOT" => 4 * n + n * lookup,
+        b"NFIT" => crate::nfit::MAX_STEPS + 4 * n,
+        _ => 4 * n,
+    };
+    bound as u64 + 16
+}
+
+/// The review's F13: a large table of every signature the soak generates, built from that table's
+/// valid sample so its acceptance paths and lookups run, costs no more walk steps than its bound,
+/// and is checked whole, so the steps counted are those of a table taken, not one refused early
+/// (the review of TASKS item 71, T71-6). The NFIT is the one exception, by design: its copies
+/// repeat the sample's SPA range index, which it refuses at the first repeat, so at 400 copies the
+/// refusal is asserted, and its large case is TASKS item 62's bound test (F1).
+///
+/// The copies' references all point into the first copy, so each PPTT or VIOT lookup starts at
+/// the index's first checkpoint and the quadratic part of those bounds is not reached here: the
+/// PPTT's lookups are measured by `pptt::tests::each_cache_chain_is_checked_once` (F18).
+#[test]
+fn large_tables_cost_no_more_than_their_bounds() {
+    let mut seen = Vec::new();
+    for sample in samples() {
+        let Some(&(sig, fixed, ..)) = GENERATED.iter().find(|g| g.0[..] == sample[..4]) else {
+            continue;
+        };
+        for copies in [1usize, 400] {
+            let (t, n) = replicate(&sample, fixed, copies);
+            crate::walk::steps::take();
+            let result = checked(&t);
+            let steps = crate::walk::steps::take();
+            let bound = step_bound(sig, n);
+            let name = String::from_utf8_lossy(sig);
+            assert!(
+                steps <= bound,
+                "{name}: {steps} steps for {n} structures, past {bound}"
+            );
+            if sig == b"NFIT" && copies > 1 {
+                assert!(result.is_err(), "{name}: its copies are refused, by design");
+            } else {
+                let census = result.unwrap_or_else(|e| panic!("{name} x{copies}: {e:?}"));
+                assert!(
+                    matches!(census.class, Class::Checked(_)),
+                    "{name} x{copies}: not checked whole"
+                );
+            }
+        }
+        seen.push(sig);
+    }
+    // Every generated signature has a sample, so each was measured large.
+    for &(sig, ..) in GENERATED {
+        assert!(seen.contains(&sig), "{}", String::from_utf8_lossy(sig));
+    }
+}
+
+/// The figures behind [`large_tables_cost_no_more_than_their_bounds`] (development aid).
+#[test]
+#[ignore = "prints figures; the bound test asserts them"]
+fn large_tables_measured() {
+    for sample in samples() {
+        let Some(&(sig, fixed, ..)) = GENERATED.iter().find(|g| g.0[..] == sample[..4]) else {
+            continue;
+        };
+        for copies in [100usize, 400] {
+            let (t, n) = replicate(&sample, fixed, copies);
+            crate::walk::steps::take();
+            let r = checked(&t);
+            let steps = crate::walk::steps::take();
+            eprintln!(
+                "{} copies={copies} structures={n} len={} steps={steps} bound={} refused={:?}",
+                String::from_utf8_lossy(sig),
+                t.len(),
+                step_bound(sig, n),
+                r.err().map(|e| e.kind)
+            );
+        }
     }
 }

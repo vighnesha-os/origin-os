@@ -124,6 +124,14 @@ const PORT_CLOSED: &[&str] = &[
     "a close did not take back its binding's storage",
 ];
 
+/// What the contexts models report (`models.rs`; TASKS item 70): a live context's stack in no
+/// record, a stack found free before its processor's last use of it, a context lost, and an
+/// ended context never retired.
+const CTX_UNCOVERED: &[&str] = &["a live context's stack was in no record"];
+const CTX_LAST_TOUCH: &[&str] = &["a stack was found free before its processor's last use of it"];
+const CTX_LOST: &[&str] = &["a published context went unrecorded"];
+const CTX_NEVER_RETIRED: &[&str] = &["an ended context's home was never retired"];
+
 /// The models of a change to a space whose shootdowns may stall (`models.rs`).
 const ROUND_STALLS: &str =
     "a_change_whose_round_stalls_is_still_made_and_frees_only_what_a_flush_covered";
@@ -151,6 +159,7 @@ const SHOOTDOWN: &str = "framekernel/frame/sync/src/shootdown.rs";
 const REFCOUNT: &str = "framekernel/frame/sync/src/refcount.rs";
 const SLOTS: &str = "framekernel/frame/sync/src/slots.rs";
 const PORTS: &str = "framekernel/frame/sync/src/ports.rs";
+const CONTEXTS: &str = "framekernel/frame/sync/src/contexts.rs";
 
 /// `WaitQueue::take_all`'s one critical section.
 const TAKE_ALL: &str = "        scheduler.without_interrupts(|| core::mem::replace(&mut *self.waiters.lock(), [None; N]))\n";
@@ -1272,6 +1281,116 @@ const CONTROLS: &[Control] = &[
         to: "        scheduler.without_interrupts(|| self.state.lock().growing = false);
 ",
         models: &[("ports_two_reservations_race_to_grow_a_bound_of_two", DEADLOCK)],
+    },
+    Control {
+        // C1 (TASKS item 70): a reader that looks only at saved frames, as `stack_in_use` did. A
+        // running context's stack is then in no record of the table.
+        name: "contexts_reader_skips_homes",
+        file: CONTEXTS,
+        from: "            .any(|slot| inside(slot.home.load(Acquire)) || inside(slot.frame.load(Acquire)))\n",
+        to: "            .any(|slot| inside(slot.frame.load(Acquire)))\n",
+        models: &[
+            ("contexts_switch_out_keeps_the_outgoing_stack_covered", CTX_UNCOVERED),
+            ("contexts_switch_in_keeps_the_incoming_stack_covered", CTX_UNCOVERED),
+        ],
+    },
+    Control {
+        // C2: a home retired with a relaxed store: a reader that finds it gone need not see what
+        // the processor did on the stack before it left.
+        name: "contexts_retirement_relaxed",
+        file: CONTEXTS,
+        from: "        slot.home.store(0, Release);\n        Ok(())\n",
+        to: "        slot.home.store(0, Relaxed);\n        Ok(())\n",
+        models: &[(
+            "contexts_an_ended_stack_is_free_only_after_its_last_use",
+            CTX_LAST_TOUCH,
+        )],
+    },
+    Control {
+        // C3: the record moves at a switch, from the home of a running context to the frame of a
+        // suspended one and back: the two records of T68-2. The incoming stack is uncovered
+        // between its frame's take and its home's store.
+        name: "contexts_record_moves_at_a_switch",
+        file: CONTEXTS,
+        from: "        let outgoing = self.current.load(Relaxed);
+        match self.slots.get(outgoing) {
+            Some(_) if exiting => {
+                let _ = self.ended.swap(outgoing, AcqRel);
+            }
+            Some(slot) => slot.frame.store(here, Release),
+",
+        to: "        if let Some(slot) = self.slots.get(incoming) {
+            slot.home.store(next, Release);
+        }
+        let outgoing = self.current.load(Relaxed);
+        match self.slots.get(outgoing) {
+            Some(_) if exiting => {
+                let _ = self.ended.swap(outgoing, AcqRel);
+            }
+            Some(slot) => {
+                slot.frame.store(here, Release);
+                slot.home.store(0, Release);
+            }
+",
+        models: &[(
+            "contexts_switch_in_keeps_the_incoming_stack_covered",
+            CTX_UNCOVERED,
+        )],
+    },
+    Control {
+        // C4: the home retired in the exit's own switch, while the processor is still on the
+        // stack it is leaving.
+        name: "contexts_retired_before_leaving",
+        file: CONTEXTS,
+        from: "            Some(_) if exiting => {
+                let _ = self.ended.swap(outgoing, AcqRel);
+            }
+",
+        to: "            Some(slot) if exiting => slot.home.store(0, Release),
+",
+        models: &[(
+            "contexts_an_ended_stack_is_free_only_after_its_last_use",
+            CTX_LAST_TOUCH,
+        )],
+    },
+    Control {
+        // C5: a slot claimed by a load and a store: two claimers can take one slot, and one
+        // context is lost.
+        name: "contexts_claim_not_atomic",
+        file: CONTEXTS,
+        from: "        if self
+            .home
+            .compare_exchange(0, home, AcqRel, Acquire)
+            .is_err()
+        {
+            return false;
+        }
+",
+        to: "        if self.home.load(Acquire) != 0 {
+            return false;
+        }
+        self.home.store(home, Release);
+",
+        models: &[(
+            "contexts_publications_beside_a_switch_each_get_a_slot",
+            CTX_LOST,
+        )],
+    },
+    Control {
+        // C6 (the coordinating session's ruling (c)): `ended` taken by a load, then cleared by a
+        // swap whose value is dropped. An exit recorded between the two is wiped, and its home
+        // is never retired. Since T70-1 every caller retires with interrupts off on its own
+        // processor, so on a kernel no switch falls between the two; L5 runs its retirers as
+        // threads, a caller that breaks that precondition, and C6 shows that the single swap
+        // still covers it (the addendum to the review of TASKS item 70, T70-9).
+        name: "contexts_ended_taken_in_two_steps",
+        file: CONTEXTS,
+        from: "        let ended = self.ended.swap(NONE, AcqRel);\n",
+        to: "        let ended = self.ended.load(Acquire);\n        let _ = self.ended.swap(NONE, AcqRel);\n",
+        models: &[(
+            "contexts_two_retirers_lose_no_ended_context",
+            CTX_NEVER_RETIRED,
+        )],
     },
 ];
 

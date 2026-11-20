@@ -411,9 +411,9 @@ impl SecondMeasurement {
     }
 }
 
-/// Edges a [`SecondMeter`] keeps: enough for every edge of its budget (at most four
-/// edges fall in 3.2 s), and a measurement can use any two of them.
-const METER_EDGES: usize = 4;
+/// Edges a [`SecondMeter`] keeps: enough for every edge of its budget (at most six
+/// edges fall in the kernel's 5.2 s), and a measurement can use any two of them.
+const METER_EDGES: usize = 6;
 
 /// Decides whether the RTC's second agrees with a counter's expected rate, from
 /// [`UpdateEdge`]s (CLAUDE.md §68: timer calibration).
@@ -1104,14 +1104,17 @@ mod tests {
         let got = m.add(edge(3 * HZ, 3 * HZ + US, 60)).unwrap();
         assert_eq!((got.seconds, got.verdict), (3, SecondVerdict::Confirmed));
 
-        // Wider edges are forgotten first once the meter is full, never a sharp one.
+        // Wider edges are forgotten first once the meter is full, never a sharp one: with
+        // METER_EDGES edges, the widest first, every pair is undecided.
+        let full = METER_EDGES as u64;
         let mut m = SecondMeter::new(HZ, 10);
-        for (i, width) in [40 * MS, 30 * MS, 20 * MS, 10 * MS].into_iter().enumerate() {
-            let at = (i as u64 + 1) * HZ;
+        for i in 0..full {
+            let (at, width) = ((i + 1) * HZ, 10 * MS * (full - i));
             assert_eq!(m.add(edge(at, at + width, i as u32)), None, "{i}");
         }
-        // The fifth edge is sharp and replaces the widest.
-        let _ = m.add(edge(5 * HZ, 5 * HZ + US, 4));
+        // One more edge, sharp, replaces the widest.
+        let at = (full + 1) * HZ;
+        let _ = m.add(edge(at, at + US, full as u32));
         let kept: u64 = m
             .edges
             .iter()
@@ -1119,7 +1122,7 @@ mod tests {
             .map(UpdateEdge::width)
             .max()
             .unwrap();
-        assert_eq!(kept, 30 * MS, "the 40 ms edge went");
+        assert_eq!(kept, 10 * MS * (full - 1), "the widest edge went");
     }
 
     /// One model clock for the proof's tests, in counter ticks at [`HZ`]. Its update
@@ -1226,8 +1229,8 @@ mod tests {
         at_edge_one_in: 0,
         at_edge_max: 0,
     };
-    /// What the kernel's RTC budget is: 3.2 s of polling.
-    const BUDGET: u64 = 3 * HZ + HZ / 5;
+    /// What the kernel's RTC budget is: 5.2 s of polling (`time::RTC_BUDGET_TENTHS`).
+    const BUDGET: u64 = 5 * HZ + HZ / 5;
 
     /// What a run of the proof against a model clock showed.
     #[derive(Clone, Copy, Debug, Default)]

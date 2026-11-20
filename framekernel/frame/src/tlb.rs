@@ -194,6 +194,30 @@ pub(crate) fn root_loaded(root: u64) -> bool {
 /// holding up the processor that made it.
 pub fn service() {
     SHOOTDOWN.service(&Hardware);
+    note_answer();
+}
+
+/// Shootdowns that gave up waiting for some processor this boot, of every kind, and the last
+/// one's processors and wait (TASKS item 66; the record is `stalls`, tested on the host).
+static STALLS: crate::stalls::StallLog = crate::stalls::StallLog::new();
+
+/// Notes a shootdown that gave up on a processor, asked at TSC `asked_at`.
+fn note(outcome: &Result<Completed, Stalled>, asked_at: u64) {
+    if let Err(Stalled { cpu }) = outcome {
+        STALLS.note(*cpu, this_cpu(), asked_at, rdtsc());
+    }
+}
+
+/// On the processor the last stall gave up on, notes when it next served a shootdown.
+fn note_answer() {
+    STALLS.answered(this_cpu(), rdtsc());
+}
+
+pub use crate::stalls::Stall;
+
+/// The last shootdown that stalled, if any has.
+pub fn last_stall() -> Option<Stall> {
+    STALLS.last()
 }
 
 /// How many shootdown interrupts each processor has taken.
@@ -221,7 +245,10 @@ pub fn interrupts_taken(cpu: CpuIndex) -> u64 {
 /// Drops what `request` names from every processor that has the address space `root` loaded,
 /// after a change to one of its user mappings. The caller changed the page tables first.
 pub(crate) fn shootdown_space(root: u64, request: Request) -> Result<Completed, Stalled> {
-    SHOOTDOWN.shoot(&Hardware, request, Scope::Space(root))
+    let asked_at = rdtsc();
+    let outcome = SHOOTDOWN.shoot(&Hardware, request, Scope::Space(root));
+    note(&outcome, asked_at);
+    outcome
 }
 
 /// How many processors have the address space `root` loaded now.
@@ -231,7 +258,8 @@ pub(crate) fn processors_holding(root: u64) -> u32 {
 
 /// The result of a kernel request. A processor that never answers is left holding a
 /// translation of memory the caller is about to reuse, so the kernel stops.
-fn finished(outcome: Result<Completed, Stalled>) -> u64 {
+fn finished(outcome: Result<Completed, Stalled>, asked_at: u64) -> u64 {
+    note(&outcome, asked_at);
     match outcome {
         Ok(done) => {
             LAST_CYCLES.store(done.ticks, Ordering::Relaxed);
@@ -249,7 +277,11 @@ fn finished(outcome: Result<Completed, Stalled>) -> u64 {
 /// If a processor does not answer within about a second. The caller is about to reuse
 /// memory that processor may still reach, so carrying on would not be memory-safe.
 pub fn shootdown(addr: u64) -> u64 {
-    finished(SHOOTDOWN.shoot(&Hardware, Request::page(addr), Scope::Kernel))
+    let asked_at = rdtsc();
+    finished(
+        SHOOTDOWN.shoot(&Hardware, Request::page(addr), Scope::Kernel),
+        asked_at,
+    )
 }
 
 /// Flushes every TLB entry on every online processor: for changes to many pages at once.
@@ -258,7 +290,11 @@ pub fn shootdown(addr: u64) -> u64 {
 ///
 /// As for [`shootdown`].
 pub fn shootdown_all() -> u64 {
-    finished(SHOOTDOWN.shoot(&Hardware, Request::Everything, Scope::Kernel))
+    let asked_at = rdtsc();
+    finished(
+        SHOOTDOWN.shoot(&Hardware, Request::Everything, Scope::Kernel),
+        asked_at,
+    )
 }
 
 /// Drops the translations of the `pages` pages from `base` on every online processor, after the
@@ -271,7 +307,9 @@ pub(crate) fn shootdown_kernel_pages(base: u64, pages: u64) -> Result<Completed,
     } else {
         Request::Everything
     };
+    let asked_at = rdtsc();
     let outcome = SHOOTDOWN.shoot(&Hardware, request, Scope::Kernel);
+    note(&outcome, asked_at);
     if let Ok(done) = outcome {
         LAST_CYCLES.store(done.ticks, Ordering::Relaxed);
     }

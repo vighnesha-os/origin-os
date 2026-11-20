@@ -322,7 +322,7 @@ impl<H: Host> Interpreter<H> {
                 let x = match f.op {
                     Op::Add => a.wrapping_add(b),
                     Op::Subtract => a.wrapping_sub(b),
-                    // G9, strict until the reading session answers: the low bits are kept.
+                    // G9, as ACPICA does (TASKS 64's ledger §3): the low bits are kept.
                     Op::Multiply => a.wrapping_mul(b),
                     Op::And => a & b,
                     Op::Nand => !(a & b),
@@ -530,7 +530,7 @@ impl<H: Host> Interpreter<H> {
                 let text = match self.data(source)? {
                     Data::Int => {
                         let i = self.int_of(source)?;
-                        self.int_hex(i)?
+                        self.int_hex_short(i)?
                     }
                     Data::Str => self.string_of(source)?,
                     Data::Buf => {
@@ -599,15 +599,20 @@ impl<H: Host> Interpreter<H> {
             Op::LoadTable => self.exec_load_table(&f),
             Op::Stall => {
                 let us = self.int(&f, 0)?;
-                self.stall(us)
+                self.stall(us, f.at)
             }
             Op::Sleep => {
                 let ms = self.int(&f, 0)?;
                 self.sleep(ms)
             }
             Op::Acquire => {
-                let m = self.object_at(loc(&f, 0)?)?;
-                let v = self.acquire(m, raw(&f, 1)?)?;
+                let at = loc(&f, 0)?;
+                let node = match at {
+                    Loc::Node(n) => Some(n),
+                    _ => None,
+                };
+                let m = self.object_at(at)?;
+                let v = self.acquire(m, node, raw(&f, 1)?)?;
                 self.give_val(v)
             }
             Op::Release => {
@@ -702,29 +707,7 @@ impl<H: Host> Interpreter<H> {
     /// `DataTableRegion` (§19.6.25): a SystemMemory region over the table the XSDT lists under the
     /// signature, OEM ID and OEM table ID.
     fn data_region(&mut self, f: &OpFrame) -> Result<()> {
-        let mut key = crate::host::TableKey {
-            signature: [0; 4],
-            oem_id: [0; 6],
-            oem_table_id: [0; 8],
-        };
-        for (i, out) in [
-            &mut key.signature[..],
-            &mut key.oem_id[..],
-            &mut key.oem_table_id[..],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let s = self.string_of(val(f, i.saturating_add(1))?)?;
-            let fits = s.len() <= out.len();
-            for (d, c) in out.iter_mut().zip(&s) {
-                *d = *c;
-            }
-            mem::release(s, &mut self.budget);
-            if !fits {
-                return err(ErrorKind::Range);
-            }
-        }
+        let key = self.table_key([val(f, 1)?, val(f, 2)?, val(f, 3)?])?;
         // The host's copy is checked before its address and length are taken (the review of B2,
         // B2-14): a copy that is not a sound table under the key gives the region nothing.
         let mut found = None;
@@ -800,6 +783,9 @@ impl<H: Host> Interpreter<H> {
                     Object::Reference(t) => Val::Ref(*t),
                     Object::NameElem(e) => {
                         let e = *e;
+                        if e.bind == crate::object::Bind::Empty {
+                            return err(ErrorKind::Uninitialized);
+                        }
                         Val::Obj(self.ns.obj(self.resolve_elem(e)?)?)
                     }
                     _ => return Ok(v),
@@ -1248,6 +1234,7 @@ impl<H: Host> Interpreter<H> {
                 scope: self.scope(),
                 table: self.cur.table,
                 at,
+                bind: crate::object::Bind::Lazy,
             }));
         }
         if b != 0x11 {

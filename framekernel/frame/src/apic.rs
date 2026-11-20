@@ -90,6 +90,51 @@ pub const fn lvt_timer(vector: u8, mode: TimerMode, masked: bool) -> u64 {
     vector as u64 | mode_bits | mask
 }
 
+/// The bits of the divide configuration register that hold the divisor (Intel SDM Vol. 3A,
+/// "Divide Configuration Register": bits 0, 1 and 3; the rest are reserved).
+pub const DIVIDE_BITS: u64 = 0b1011;
+
+/// The bits of the LVT timer entry that say how the timer interrupts: the vector, the mask and
+/// the timer mode. Bit 12, the delivery status, is the hardware's and is left out.
+pub const LVT_TIMER_BITS: u64 = 0xFF | LVT_MASKED | (0b11 << 17);
+
+/// A local APIC timer's programming: its initial count, its divide configuration's divisor
+/// bits ([`DIVIDE_BITS`]) and its LVT timer entry's vector, mask and mode ([`LVT_TIMER_BITS`]).
+/// For the preemption proof's check that every processor's tick is programmed as the boot
+/// processor's timed proof ran it (TASKS item 66, the review's T66-R1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerProgramming {
+    pub initial: u64,
+    pub divide: u64,
+    pub lvt: u64,
+}
+
+impl TimerProgramming {
+    /// The programming from the three registers' raw values, keeping only the bits that set
+    /// the rate and the interrupt.
+    pub const fn from_registers(initial: u64, divide: u64, lvt: u64) -> Self {
+        Self {
+            initial,
+            divide: divide & DIVIDE_BITS,
+            lvt: lvt & LVT_TIMER_BITS,
+        }
+    }
+
+    /// The first register that differs from `expected`, by name, with this value and the
+    /// expected one; `None` if all three agree.
+    pub const fn first_difference(&self, expected: &Self) -> Option<(&'static str, u64, u64)> {
+        if self.initial != expected.initial {
+            Some(("initial count", self.initial, expected.initial))
+        } else if self.divide != expected.divide {
+            Some(("divide configuration", self.divide, expected.divide))
+        } else if self.lvt != expected.lvt {
+            Some(("LVT entry", self.lvt, expected.lvt))
+        } else {
+            None
+        }
+    }
+}
+
 /// Divide-configuration register value for `divisor` (1, 2, 4, …, 128), or `None`.
 ///
 /// The encoding is bits 3, 1 and 0: 0b000 divides by 2 up to 0b110 by 128, and 0b111 by 1.
@@ -238,6 +283,280 @@ impl CalibrationWindow {
     }
 }
 
+/// What one run of the periodic timer's proof showed (TASKS item 66): the timer's rate, from
+/// its count against the TSC ([`judge_period`]), and the delivery of its interrupts, stamped with
+/// the TSC at the poll that saw each ([`judge_ticks`]); [`tick_verdict`] puts the two together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TickVerdict {
+    /// All of them came, within 95 % to 150 % of their nominal time, and the count's period is
+    /// within [`RATE_LOW_PPM`] to [`RATE_HIGH_PPM`] of nominal.
+    InBounds,
+    /// The count's period is short of [`RATE_LOW_PPM`], or all the interrupts came in under 95 %
+    /// of their nominal time: the rate is wrong, and it fails at once. A stall can only make
+    /// interrupts later, and cannot move the count.
+    TooFast,
+    /// The run says nothing about the rate, so it is measured again, and never passes: no clean
+    /// pair of count reads in [`PERIOD_PAIRS`]' worth, or interrupts too slow or too few with
+    /// the median gap between them not over 150 % of the period and some gap of two periods or
+    /// more (expiries merged while the processor was away: a virtual processor the host left
+    /// unscheduled, or an SMI).
+    Stalled,
+    /// The count's period is over [`RATE_HIGH_PPM`] of nominal, or the interrupts are too slow
+    /// or too few with nothing to show a stall, or with a median gap over 150 % of the period:
+    /// the rate is wrong, or the interrupts do not come.
+    Wrong,
+}
+
+/// What [`judge_ticks`] found in one run, for the boot's line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TickRun {
+    pub verdict: TickVerdict,
+    /// From the timer's start to the last interrupt taken, in TSC ticks.
+    pub elapsed: u64,
+    /// The median gap between consecutive interrupts (the first measured from the start).
+    pub median_gap: u64,
+    /// The longest such gap.
+    pub longest_gap: u64,
+}
+
+/// The most interrupts [`judge_ticks`] looks at.
+pub const MAX_TICK_STAMPS: usize = 64;
+
+/// Judges one run of the periodic timer's proof: the timer started at TSC `start`, `stamps` holds
+/// the TSC at which each interrupt was seen (in order, at most [`MAX_TICK_STAMPS`] are used), the
+/// run wanted `wanted` of them, and the programmed period is `period` TSC ticks.
+///
+/// The stamps judge the interrupts' delivery only (the addendum review's T66-R13): the rate
+/// comes from the count ([`judge_period`]). It checks exactly this, in order, on the first
+/// `wanted` stamps only: too fast, if all `wanted` came in under 95 % of their nominal time;
+/// wrong, if the median gap is over 150 % of the period; in bounds, if all `wanted` came within
+/// 150 % of their nominal time; stalled, if some gap is two periods or more; else wrong. A stall
+/// widens a few gaps and leaves the median where it was, and a slow delivery moves every gap, so
+/// a slow median fails at once. The median is not used for the fast side: under QEMU's software
+/// processor the poll-stamped gaps of a correct timer have a median of 90 to 91 % of the period
+/// (TASKS item 66's controls), while their total holds.
+#[must_use]
+pub fn judge_ticks(start: u64, stamps: &[u64], wanted: usize, period: u64) -> TickRun {
+    // The first `wanted` only: the run is judged against their nominal time (the review's
+    // T66-R4).
+    let stamps = stamps
+        .get(..stamps.len().min(wanted).min(MAX_TICK_STAMPS))
+        .unwrap_or(&[]);
+    let mut gaps = [0u64; MAX_TICK_STAMPS];
+    let mut previous = start;
+    for (gap, &stamp) in gaps.iter_mut().zip(stamps) {
+        *gap = stamp.saturating_sub(previous);
+        previous = stamp;
+    }
+    let gaps = gaps.get_mut(..stamps.len()).unwrap_or(&mut []);
+    let longest_gap = gaps.iter().copied().max().unwrap_or(0);
+    gaps.sort_unstable();
+    let median_gap = gaps.get(gaps.len() / 2).copied().unwrap_or(0);
+    let elapsed = stamps.last().map_or(0, |&last| last.saturating_sub(start));
+    let nominal = period.saturating_mul(wanted as u64);
+    let all = stamps.len() >= wanted;
+    let verdict = if wanted == 0 || period == 0 || stamps.is_empty() {
+        TickVerdict::Wrong
+    } else if all && elapsed < nominal / 100 * 95 {
+        TickVerdict::TooFast
+    } else if median_gap > period / 2 * 3 {
+        TickVerdict::Wrong
+    } else if all && elapsed <= nominal / 2 * 3 {
+        TickVerdict::InBounds
+    } else if longest_gap >= period.saturating_mul(2) {
+        TickVerdict::Stalled
+    } else {
+        TickVerdict::Wrong
+    };
+    TickRun {
+        verdict,
+        elapsed,
+        median_gap,
+        longest_gap,
+    }
+}
+
+/// The least period the timer's count may show, in parts per million of nominal: 97 %.
+pub const RATE_LOW_PPM: u64 = 970_000;
+/// The most: 103 %. Three times the widest deviation seen under QEMU's software processor
+/// (−0.45 % to +0.55 % in TASKS item 66's diagnostic, uncertainty included), and a 1.1× fast
+/// timer is outside it (the coordinating session's ruling on the addendum review's T66-R13).
+pub const RATE_HIGH_PPM: u64 = 1_030_000;
+/// Pairs of count reads a run may try for a clean one before it is undecided.
+pub const PERIOD_PAIRS: u32 = 64;
+/// A pair of count reads is clean when its two brackets together are within this share of its
+/// interval: 1 % (the addendum review's T66-R13).
+pub const PERIOD_SHARE: u64 = 100;
+
+/// Measures a running periodic timer's period from its count, reloaded with `initial`, in pairs
+/// of reads within one period (the addendum review's T66-R13), each read taken by `read`: from
+/// one read until a fifth of the `nominal` period has passed, or to the read before the next
+/// reload if that comes first. A pair is read again if its brackets together are wider than
+/// 1/[`PERIOD_SHARE`] of its interval, if it is shorter than a twentieth of the nominal period,
+/// or if the time between two consecutive reads, from the first's bracket's end to the second's
+/// start, is over a hundredth of it: time in which a reload could pass unseen. The first clean
+/// pair, and how many pairs were tried; `None` after [`PERIOD_PAIRS`].
+///
+/// **A stated limit** (the second addendum review's T66-R17; the coordinating session's ruling
+/// (a)): a stall inside an intermediate read's own bracket is not counted, so on a timer over 5
+/// times fast it can hide a reload and give a clean pair near nominal. Delivery then fails such a
+/// timer as too fast in total, unless recurring stalls also mask its total in the same run.
+/// Counting those stalls too, across the brackets, left the 65- and 67-processor software-processor
+/// machines undecided after 64 pairs in 8 of 10 idle boots, where intermediate reads seem to stall
+/// inside their brackets; a check that tolerates stalls is TASKS item 78.
+pub fn sample_period(
+    initial: u64,
+    nominal: u64,
+    mut read: impl FnMut() -> CountRead,
+) -> (Option<PeriodSample>, u32) {
+    let target = nominal / 5;
+    let least = nominal / 20;
+    let gap = nominal / 100;
+    let mut tried = 0;
+    let mut first = read();
+    let mut prev = first;
+    while tried < PERIOD_PAIRS {
+        let next = read();
+        if next.before.wrapping_sub(prev.after) > gap {
+            // Away between two reads for long enough that a reload could have passed unseen.
+            tried += 1;
+            first = next;
+            prev = next;
+            continue;
+        }
+        let reloaded = next.count > prev.count;
+        let last = if reloaded { prev } else { next };
+        let span = last.twice_middle().wrapping_sub(first.twice_middle()) / 2;
+        if reloaded || span >= target {
+            tried += 1;
+            if span >= least
+                && let Some(sample) = PeriodSample::from_reads(initial, first, last)
+                && sample.clean(PERIOD_SHARE)
+            {
+                return (Some(sample), tried);
+            }
+            first = next;
+        }
+        prev = next;
+    }
+    (None, tried)
+}
+
+/// What the timer's count says of its rate (the addendum review's T66-R13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateVerdict {
+    /// Its period is within [`RATE_LOW_PPM`] to [`RATE_HIGH_PPM`] of nominal.
+    InBounds,
+    /// Shorter: the timer runs fast.
+    Fast,
+    /// Longer: it runs slow.
+    Slow,
+    /// No clean pair of reads: nothing is known.
+    Undecided,
+}
+
+/// Judges the timer's rate from a clean pair of reads of its count, `None` if none came, against
+/// the `nominal` period in TSC ticks. The count falls at the timer's own rate whatever its
+/// interrupts do, so neither their delivery nor a host's stalls move this verdict.
+#[must_use]
+pub fn judge_period(sample: Option<PeriodSample>, nominal: u64) -> RateVerdict {
+    match sample.map(|s| s.ppm_of(nominal)) {
+        None => RateVerdict::Undecided,
+        Some(ppm) if ppm < RATE_LOW_PPM => RateVerdict::Fast,
+        Some(ppm) if ppm > RATE_HIGH_PPM => RateVerdict::Slow,
+        Some(_) => RateVerdict::InBounds,
+    }
+}
+
+/// A run's verdict: a wrong rate fails at once, whatever the interrupts did; then a fault in
+/// their delivery fails at once; then an undecided rate or a stalled delivery is measured again;
+/// only a rate in bounds with every interrupt delivered in bounds passes.
+#[must_use]
+pub const fn tick_verdict(delivery: TickVerdict, rate: RateVerdict) -> TickVerdict {
+    match (rate, delivery) {
+        (RateVerdict::Fast, _) => TickVerdict::TooFast,
+        (RateVerdict::Slow, _) => TickVerdict::Wrong,
+        (_, TickVerdict::TooFast) => TickVerdict::TooFast,
+        (_, TickVerdict::Wrong) => TickVerdict::Wrong,
+        (RateVerdict::Undecided, _) | (_, TickVerdict::Stalled) => TickVerdict::Stalled,
+        (RateVerdict::InBounds, TickVerdict::InBounds) => TickVerdict::InBounds,
+    }
+}
+
+/// One read of the APIC timer's current count, bracketed by the TSC (TASKS item 66, the
+/// review's T66-R13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CountRead {
+    pub before: u64,
+    pub count: u64,
+    pub after: u64,
+}
+
+impl CountRead {
+    /// Twice the TSC at the read's middle, kept whole.
+    const fn twice_middle(&self) -> u64 {
+        self.before.saturating_add(self.after)
+    }
+}
+
+/// The periodic timer's period as two reads of its count within one period show it, against
+/// the TSC (the review's T66-R13): the count falls at the timer's own rate whatever its
+/// interrupts do, so neither their delivery nor a host's stall between the reads moves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeriodSample {
+    /// TSC ticks between the reads' middles.
+    pub interval: u64,
+    /// How far the count fell between them.
+    pub fall: u64,
+    /// The two brackets' widths added: the interval is known to within half of this.
+    pub spread: u64,
+    /// The period in TSC ticks: the initial count at the measured rate.
+    pub period: u64,
+}
+
+impl PeriodSample {
+    /// From reads `first` and `last` of a timer reloaded with `initial`, with no reload between
+    /// them; `None` if the count did not fall or no time passed.
+    pub fn from_reads(initial: u64, first: CountRead, last: CountRead) -> Option<Self> {
+        let fall = first.count.checked_sub(last.count).filter(|&f| f > 0)?;
+        let interval = last.twice_middle().checked_sub(first.twice_middle())? / 2;
+        if interval == 0 {
+            return None;
+        }
+        let spread = first
+            .after
+            .saturating_sub(first.before)
+            .saturating_add(last.after.saturating_sub(last.before));
+        let period =
+            u64::try_from(u128::from(initial) * u128::from(interval) / u128::from(fall)).ok()?;
+        Some(Self {
+            interval,
+            fall,
+            spread,
+            period,
+        })
+    }
+
+    /// Whether its brackets together are within `1/share` of its interval.
+    pub const fn clean(&self, share: u64) -> bool {
+        self.spread.saturating_mul(share) <= self.interval
+    }
+
+    /// Its period in parts per million of `nominal` TSC ticks.
+    pub fn ppm_of(&self, nominal: u64) -> u64 {
+        if nominal == 0 {
+            return 0;
+        }
+        u64::try_from(u128::from(self.period) * 1_000_000 / u128::from(nominal)).unwrap_or(u64::MAX)
+    }
+
+    /// Its uncertainty, in parts per million of the period: half the spread over the interval.
+    pub fn uncertainty_ppm(&self) -> u64 {
+        u64::try_from(u128::from(self.spread) * 500_000 / u128::from(self.interval.max(1)))
+            .unwrap_or(u64::MAX)
+    }
+}
+
 /// Timer initial count for `hz` interrupts per second from a timer running at `rate` ticks
 /// per second, or `None` if it rounds to zero or does not fit 32 bits.
 pub const fn initial_count(rate: u64, hz: u64) -> Option<u32> {
@@ -255,6 +574,480 @@ pub const fn initial_count(rate: u64, hz: u64) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timer_s_programming_keeps_only_the_bits_that_set_the_rate_and_the_interrupt() {
+        let periodic = lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false);
+        let p = TimerProgramming::from_registers(625_000, 0b0011 | 0b0100, periodic | (1 << 12));
+        assert_eq!(
+            p,
+            TimerProgramming {
+                initial: 625_000,
+                divide: 0b0011,
+                lvt: periodic
+            }
+        );
+        assert_eq!(p.first_difference(&p), None);
+        let one_shot = TimerProgramming::from_registers(
+            625_000,
+            0b0011,
+            lvt_timer(TIMER_VECTOR, TimerMode::OneShot, false),
+        );
+        assert_eq!(
+            one_shot.first_difference(&p),
+            Some(("LVT entry", u64::from(TIMER_VECTOR), periodic))
+        );
+        let masked = TimerProgramming::from_registers(625_000, 0b0011, periodic | LVT_MASKED);
+        assert_eq!(masked.first_difference(&p).map(|d| d.0), Some("LVT entry"));
+        let divide = TimerProgramming::from_registers(625_000, 0b1010, periodic);
+        assert_eq!(
+            divide.first_difference(&p),
+            Some(("divide configuration", 0b1010, 0b0011))
+        );
+        let count = TimerProgramming::from_registers(5_000_000, 0b0011, periodic);
+        assert_eq!(
+            count.first_difference(&p),
+            Some(("initial count", 5_000_000, 625_000))
+        );
+    }
+
+    /// The tick proof's period at 100 Hz on a 1 GHz TSC, and the run it wants.
+    const PERIOD: u64 = 10_000_000;
+    const WANTED: usize = 50;
+
+    /// Stamps of `n` interrupts every `gap` ticks from 0, with `extra` added to interrupt
+    /// `stall_at` and every one after it (a stall merging expiries there).
+    fn stamps(n: usize, gap: u64, stall_at: usize, extra: u64) -> alloc::vec::Vec<u64> {
+        (1..=n as u64)
+            .map(|i| i * gap + if i as usize > stall_at { extra } else { 0 })
+            .collect()
+    }
+
+    #[test]
+    fn a_run_at_the_programmed_rate_is_in_bounds_and_its_edges_hold() {
+        let run = judge_ticks(0, &stamps(WANTED, PERIOD, WANTED, 0), WANTED, PERIOD);
+        assert_eq!(run.verdict, TickVerdict::InBounds);
+        assert_eq!(
+            (run.elapsed, run.median_gap, run.longest_gap),
+            (500_000_000, PERIOD, PERIOD)
+        );
+        // 150 % exactly passes; a tick more is slow, and with even gaps it is wrong.
+        let edge = judge_ticks(
+            0,
+            &stamps(WANTED, PERIOD * 3 / 2, WANTED, 0),
+            WANTED,
+            PERIOD,
+        );
+        assert_eq!(edge.verdict, TickVerdict::InBounds);
+        let over = judge_ticks(0, &stamps(WANTED, PERIOD * 3 / 2, 49, 1), WANTED, PERIOD);
+        assert_eq!(over.verdict, TickVerdict::Wrong);
+        // 95 % exactly passes; under it fails at once.
+        let fast = judge_ticks(
+            0,
+            &stamps(WANTED, PERIOD * 95 / 100, WANTED, 0),
+            WANTED,
+            PERIOD,
+        );
+        assert_eq!(fast.verdict, TickVerdict::InBounds);
+        let faster = judge_ticks(
+            0,
+            &stamps(WANTED, PERIOD * 94 / 100, WANTED, 0),
+            WANTED,
+            PERIOD,
+        );
+        assert_eq!(faster.verdict, TickVerdict::TooFast);
+    }
+
+    #[test]
+    fn a_stall_that_merges_expiries_earns_a_repeat_and_never_a_pass() {
+        // 300 ms lost after the 10th interrupt: 800 ms in all, the median still the period.
+        let run = judge_ticks(0, &stamps(WANTED, PERIOD, 10, 300_000_000), WANTED, PERIOD);
+        assert_eq!(run.verdict, TickVerdict::Stalled);
+        assert_eq!(run.median_gap, PERIOD);
+        assert_eq!(run.longest_gap, PERIOD + 300_000_000);
+        // A stall inside the bounds changes nothing: it passes as before.
+        let small = judge_ticks(0, &stamps(WANTED, PERIOD, 10, 200_000_000), WANTED, PERIOD);
+        assert_eq!(small.verdict, TickVerdict::InBounds);
+        // Too few in the time, with a stall and the median in bounds: a repeat, not a pass.
+        let short = judge_ticks(0, &stamps(30, PERIOD, 5, 1_500_000_000), WANTED, PERIOD);
+        assert_eq!(short.verdict, TickVerdict::Stalled);
+    }
+
+    #[test]
+    fn a_wrong_rate_fails_whatever_the_stalls() {
+        // A divisor twice too large: every gap two periods. The median says so.
+        let slow = judge_ticks(0, &stamps(WANTED, 2 * PERIOD, WANTED, 0), WANTED, PERIOD);
+        assert_eq!(slow.verdict, TickVerdict::Wrong);
+        let slow_and_stalled = judge_ticks(
+            0,
+            &stamps(WANTED, 2 * PERIOD, 10, 300_000_000),
+            WANTED,
+            PERIOD,
+        );
+        assert_eq!(slow_and_stalled.verdict, TickVerdict::Wrong);
+        // Slow by 60 % with even gaps: no stall to blame.
+        let uneven = judge_ticks(
+            0,
+            &stamps(WANTED, PERIOD * 16 / 10, WANTED, 0),
+            WANTED,
+            PERIOD,
+        );
+        assert_eq!(uneven.verdict, TickVerdict::Wrong);
+        // No interrupt at all.
+        assert_eq!(
+            judge_ticks(0, &[], WANTED, PERIOD).verdict,
+            TickVerdict::Wrong
+        );
+        // Too few, evenly spaced, no stall: the interrupts are slow or stop.
+        let few = judge_ticks(0, &stamps(20, PERIOD, 20, 0), WANTED, PERIOD);
+        assert_eq!(few.verdict, TickVerdict::Wrong);
+    }
+
+    #[test]
+    fn more_stamps_than_wanted_are_judged_on_the_first_wanted() {
+        // The review's T66-R4: 64 stamps at 75 % of the period, 50 wanted. Judged on all 64 the
+        // total looked in bounds; on the first 50 it is too fast.
+        let run = judge_ticks(0, &stamps(64, PERIOD * 3 / 4, 64, 0), WANTED, PERIOD);
+        assert_eq!(run.verdict, TickVerdict::TooFast);
+        assert_eq!(run.elapsed, 50 * PERIOD * 3 / 4);
+        // 64 at the period: in bounds, on the first 50.
+        let run = judge_ticks(0, &stamps(64, PERIOD, 64, 0), WANTED, PERIOD);
+        assert_eq!(
+            (run.verdict, run.elapsed),
+            (TickVerdict::InBounds, 50 * PERIOD)
+        );
+    }
+
+    /// A clean pair of count reads of a timer whose period is exactly `percent` % of nominal:
+    /// 125 000 of its 625 000 counts fall over a fifth of that period.
+    fn sample_at(percent: u64) -> Option<PeriodSample> {
+        let interval = PERIOD / 5 * percent / 100;
+        PeriodSample::from_reads(
+            625_000,
+            CountRead {
+                before: 0,
+                count: 600_000,
+                after: 5_000,
+            },
+            CountRead {
+                before: interval,
+                count: 475_000,
+                after: interval + 5_000,
+            },
+        )
+    }
+
+    #[test]
+    fn a_fast_tick_masked_by_stalls_fails_on_its_count() {
+        // The addendum review's T66-R13 probe: twice the rate with a stall of five periods in
+        // every tenth gap. Its stamps' total is 500 ms, so their delivery looks right...
+        let mut masked = alloc::vec::Vec::new();
+        let mut at = 0;
+        for i in 1..=WANTED as u64 {
+            at += PERIOD / 2 + if i % 10 == 0 { 5 * PERIOD } else { 0 };
+            masked.push(at);
+        }
+        let run = judge_ticks(0, &masked, WANTED, PERIOD);
+        assert_eq!((run.elapsed, run.median_gap), (500_000_000, PERIOD / 2));
+        assert_eq!(run.verdict, TickVerdict::InBounds);
+        // ...and its count, which falls at twice the rate whatever the stalls, fails it.
+        let rate = judge_period(sample_at(50), PERIOD);
+        assert_eq!(rate, RateVerdict::Fast);
+        assert_eq!(tick_verdict(run.verdict, rate), TickVerdict::TooFast);
+        // 1.5 times the rate with stalls of 3.4 periods in every tenth gap, the review's second
+        // probe: the same.
+        let mut masked = alloc::vec::Vec::new();
+        let mut at = 0;
+        for i in 1..=WANTED as u64 {
+            at += PERIOD * 2 / 3 + if i % 10 == 0 { PERIOD * 34 / 10 } else { 0 };
+            masked.push(at);
+        }
+        let run = judge_ticks(0, &masked, WANTED, PERIOD);
+        assert_eq!(run.verdict, TickVerdict::InBounds);
+        let rate = judge_period(sample_at(66), PERIOD);
+        assert_eq!(tick_verdict(run.verdict, rate), TickVerdict::TooFast);
+        // 10 % fast with one 50 ms stall: the old limit, now caught by the count.
+        let run = judge_ticks(
+            0,
+            &stamps(WANTED, PERIOD * 9 / 10, 10, 50_000_000),
+            WANTED,
+            PERIOD,
+        );
+        assert_eq!(run.verdict, TickVerdict::InBounds);
+        let rate = judge_period(sample_at(90), PERIOD);
+        assert_eq!(tick_verdict(run.verdict, rate), TickVerdict::TooFast);
+        // Undisturbed, a fast rate fails by its total as well.
+        let run = judge_ticks(0, &stamps(WANTED, PERIOD / 2, WANTED, 0), WANTED, PERIOD);
+        assert_eq!(run.verdict, TickVerdict::TooFast);
+    }
+
+    /// A simulated periodic timer of `initial` counts and a true period of `period` TSC ticks,
+    /// reloaded at TSC 0, read from TSC `start` 1 µs apart with 400 ns brackets; the read numbered
+    /// `stalled` sampling its count `stall` ticks after its bracket opened.
+    fn simulated_reads(
+        initial: u64,
+        period: u64,
+        start: u64,
+        stalled: usize,
+        stall: u64,
+    ) -> impl FnMut() -> CountRead {
+        let mut at = start;
+        let mut n = 0;
+        move || {
+            let before = at;
+            let sampled = before + 200 + if n == stalled { stall } else { 0 };
+            let into = sampled % period;
+            let count = initial - into * initial / period;
+            let after = sampled + 200;
+            at = after + 600;
+            n += 1;
+            CountRead {
+                before,
+                count,
+                after,
+            }
+        }
+    }
+
+    #[test]
+    fn a_stall_inside_an_intermediate_read_can_hide_a_reload_a_stated_limit() {
+        // The second addendum review's T66-R17, kept as a stated limit (the coordinating
+        // session's ruling (a); TASKS item 78): a timer 10 times fast (a period of 1 ms against
+        // 10 ms nominal), read from 111 µs before a reload; the read 61 µs on stalls 1.01 ms
+        // inside its own bracket and samples a count below the one before, so the reload falls
+        // between them unseen. The pair closes at the next reload with clean end brackets, and
+        // the count is accepted near nominal.
+        let (initial, nominal) = (625_000, PERIOD);
+        let fast = nominal / 10;
+        let (sample, tried) = sample_period(
+            initial,
+            nominal,
+            simulated_reads(initial, fast, 3 * fast - 111_000, 61, 1_010_000),
+        );
+        let sample = sample.unwrap();
+        assert_eq!((sample.ppm_of(nominal), tried), (1_009_090, 1));
+        assert_eq!(judge_period(Some(sample), nominal), RateVerdict::InBounds);
+        // The same timer's interrupts, unless recurring stalls also mask their total in the same
+        // run, come in a tenth of the time: delivery fails it as too fast, whatever the count.
+        let delivered = judge_ticks(0, &stamps(WANTED, fast, WANTED, 0), WANTED, PERIOD);
+        assert_eq!(delivered.verdict, TickVerdict::TooFast);
+        assert_eq!(
+            tick_verdict(delivered.verdict, judge_period(Some(sample), nominal)),
+            TickVerdict::TooFast
+        );
+        // A correct timer with the same stall passes, and both undisturbed are measured as they
+        // are.
+        let (sample, _) = sample_period(
+            initial,
+            nominal,
+            simulated_reads(initial, nominal, 3 * nominal - 111_000, 61, 1_010_000),
+        );
+        assert_eq!(judge_period(sample, nominal), RateVerdict::InBounds);
+        let (sample, tried) = sample_period(
+            initial,
+            nominal,
+            simulated_reads(initial, nominal, 0, usize::MAX, 0),
+        );
+        assert_eq!((sample.unwrap().ppm_of(nominal) / 1_000, tried), (1_000, 1));
+        let (sample, _) = sample_period(
+            initial,
+            nominal,
+            simulated_reads(initial, fast, 0, usize::MAX, 0),
+        );
+        assert_eq!(judge_period(sample, nominal), RateVerdict::Fast);
+    }
+
+    #[test]
+    fn the_count_judges_the_rate_at_its_edges() {
+        assert_eq!(judge_period(sample_at(100), PERIOD), RateVerdict::InBounds);
+        assert_eq!(judge_period(sample_at(97), PERIOD), RateVerdict::InBounds);
+        assert_eq!(judge_period(sample_at(103), PERIOD), RateVerdict::InBounds);
+        assert_eq!(judge_period(sample_at(96), PERIOD), RateVerdict::Fast);
+        assert_eq!(judge_period(sample_at(104), PERIOD), RateVerdict::Slow);
+        // 1.1 times fast is a period of 90.9 %.
+        let fast = PeriodSample::from_reads(
+            625_000,
+            CountRead {
+                before: 0,
+                count: 600_000,
+                after: 1_000,
+            },
+            CountRead {
+                before: 2_000_000,
+                count: 600_000 - 137_500,
+                after: 2_001_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(fast.ppm_of(PERIOD), 909_090);
+        assert_eq!(judge_period(Some(fast), PERIOD), RateVerdict::Fast);
+        // No clean pair: undecided, which is measured again and never passes, whatever the
+        // interrupts did.
+        assert_eq!(judge_period(None, PERIOD), RateVerdict::Undecided);
+        for delivery in [
+            TickVerdict::InBounds,
+            TickVerdict::Stalled,
+            TickVerdict::TooFast,
+            TickVerdict::Wrong,
+        ] {
+            assert_ne!(
+                tick_verdict(delivery, RateVerdict::Undecided),
+                TickVerdict::InBounds
+            );
+            assert_eq!(
+                tick_verdict(delivery, RateVerdict::Fast),
+                TickVerdict::TooFast
+            );
+            assert_eq!(
+                tick_verdict(delivery, RateVerdict::Slow),
+                TickVerdict::Wrong
+            );
+        }
+        assert_eq!(
+            tick_verdict(TickVerdict::InBounds, RateVerdict::Undecided),
+            TickVerdict::Stalled
+        );
+        assert_eq!(
+            tick_verdict(TickVerdict::Stalled, RateVerdict::InBounds),
+            TickVerdict::Stalled
+        );
+        assert_eq!(
+            tick_verdict(TickVerdict::InBounds, RateVerdict::InBounds),
+            TickVerdict::InBounds
+        );
+    }
+
+    #[test]
+    fn a_correct_timer_seen_unevenly_passes() {
+        // Poll-stamped gaps that jitter, two in three of them short: the median is not judged on
+        // the fast side.
+        let mut jitter = alloc::vec::Vec::new();
+        let mut at = 0;
+        for i in 0..WANTED as u64 {
+            at += [PERIOD * 9 / 10, PERIOD * 9 / 10, PERIOD * 12 / 10][(i % 3) as usize];
+            jitter.push(at);
+        }
+        let run = judge_ticks(0, &jitter, WANTED, PERIOD);
+        assert!(run.median_gap < PERIOD / 100 * 95);
+        assert_eq!(run.verdict, TickVerdict::InBounds);
+        // Some ticks seen late by just under a period, the most before the next is raised.
+        let late: alloc::vec::Vec<u64> = (1..=WANTED as u64)
+            .map(|i| i * PERIOD + if i % 7 == 1 { PERIOD - 1 } else { 0 })
+            .collect();
+        let run = judge_ticks(0, &late, WANTED, PERIOD);
+        assert_eq!(run.verdict, TickVerdict::InBounds);
+        // A stall inside the bounds passes, as before: a gap of two periods comes in almost every
+        // run with load on the host.
+        let run = judge_ticks(0, &stamps(WANTED, PERIOD, 10, 200_000_000), WANTED, PERIOD);
+        assert_eq!(run.verdict, TickVerdict::InBounds);
+        // A slow median with a total in bounds is wrong: 25 gaps of 1.6 periods.
+        let mut s = stamps(25, PERIOD, 25, 0);
+        let last = *s.last().unwrap();
+        s.extend((1..=25).map(|i| last + i * PERIOD * 16 / 10));
+        let run = judge_ticks(0, &s, WANTED, PERIOD);
+        assert_eq!(run.verdict, TickVerdict::Wrong);
+    }
+
+    fn read(at: u64, count: u64, width: u64) -> CountRead {
+        CountRead {
+            before: at,
+            count,
+            after: at + width,
+        }
+    }
+
+    #[test]
+    fn two_count_reads_give_the_period() {
+        // A timer reloaded with 625 000 counting 62.5 per microsecond on a 1 GHz TSC: a 10 ms
+        // period. 2 ms between the reads' middles, 125 000 counts.
+        let s = PeriodSample::from_reads(
+            625_000,
+            read(1_000_000, 600_000, 2_000),
+            read(3_000_000, 475_000, 2_000),
+        )
+        .unwrap();
+        assert_eq!((s.interval, s.fall, s.spread), (2_000_000, 125_000, 4_000));
+        assert_eq!(s.period, 10_000_000);
+        assert_eq!(s.ppm_of(10_000_000), 1_000_000);
+        assert_eq!(s.uncertainty_ppm(), 1_000);
+        assert!(s.clean(100));
+        // Twice the rate: the same fall in half the time.
+        let fast = PeriodSample::from_reads(
+            625_000,
+            read(0, 600_000, 1_000),
+            read(1_000_000, 475_000, 1_000),
+        )
+        .unwrap();
+        assert_eq!(fast.ppm_of(10_000_000), 500_000);
+        // A bracket a stall widened is not clean.
+        let wide = PeriodSample::from_reads(
+            625_000,
+            read(0, 600_000, 30_000),
+            read(2_000_000, 475_000, 1_000),
+        )
+        .unwrap();
+        assert!(!wide.clean(100));
+        // A count that did not fall, or rose (a reload between), gives nothing.
+        assert_eq!(
+            PeriodSample::from_reads(625_000, read(0, 5, 1), read(10, 5, 1)),
+            None
+        );
+        assert_eq!(
+            PeriodSample::from_reads(625_000, read(0, 5, 1), read(10, 600_000, 1)),
+            None
+        );
+        assert_eq!(
+            PeriodSample::from_reads(625_000, read(10, 9, 1), read(10, 5, 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn over_a_grid_only_an_in_bounds_run_passes() {
+        // Every rate from 50 % to 300 % of the period, with stalls of 0 to 1.5 s at three
+        // places, its count read as that rate: InBounds only with the count's period within
+        // 97 % to 103 % and the whole run within 95 % to 150 %; Stalled only with the count's
+        // period in bounds and a gap of two periods; a period out of bounds fails, whatever the
+        // stalls.
+        for percent in (50..=300).step_by(1) {
+            let gap = PERIOD * percent / 100;
+            let rate = judge_period(sample_at(percent), PERIOD);
+            for extra in [0, 20_000_000, 100_000_000, 400_000_000, 1_500_000_000] {
+                for at in [0, 10, 49] {
+                    let s = stamps(WANTED, gap, at, extra);
+                    let run = judge_ticks(0, &s, WANTED, PERIOD);
+                    let verdict = tick_verdict(run.verdict, rate);
+                    let elapsed = *s.last().unwrap();
+                    let nominal = PERIOD * WANTED as u64;
+                    let rate_in = (97..=103).contains(&percent);
+                    match verdict {
+                        TickVerdict::InBounds => assert!(
+                            rate_in && elapsed >= nominal / 100 * 95 && elapsed <= nominal / 2 * 3,
+                            "{percent}% +{extra} at {at}: {run:?}"
+                        ),
+                        TickVerdict::Stalled => assert!(
+                            rate_in && run.longest_gap >= 2 * PERIOD,
+                            "{percent}% +{extra} at {at}: {run:?}"
+                        ),
+                        TickVerdict::TooFast => assert!(
+                            percent < 97 || elapsed < nominal / 100 * 95,
+                            "{percent}%: {run:?}"
+                        ),
+                        TickVerdict::Wrong => assert!(
+                            percent > 103 || run.verdict == TickVerdict::Wrong,
+                            "{percent}%: {run:?}"
+                        ),
+                    }
+                    if !rate_in {
+                        assert!(
+                            matches!(verdict, TickVerdict::TooFast | TickVerdict::Wrong),
+                            "{percent}% +{extra} at {at}: never passed, never repeated"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn transitions_follow_the_legal_mode_order() {

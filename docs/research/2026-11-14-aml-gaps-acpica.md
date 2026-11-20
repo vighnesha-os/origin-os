@@ -548,6 +548,12 @@ Each of these bears on a choice TASKS item 63 has already made. They were met wh
 
 All files are from ACPICA, repository `open-acpica/acpica`, release `20260930` at commit `e85aa3bebaae81ed1e6d163511ac7e1eafe732cf`. All are under the BSD-3-Clause option of the `BSD-3-Clause OR GPL-2.0-only` licence, copyright Intel Corp. 1999–2026. All were read on 2026-11-19 (UTC) in the built-in browser, with nothing saved. This table feeds the "references consulted" field of `origin-aml`'s row in `docs/engineering/SOURCE_PROVENANCE.md`, and CLAUDE.md §6's similarity check before the code leaves the batch for `main` (decision item 121).
 
+**Note on the "Lines" column (2026-11-19, after B5's similarity check).**
+- Each figure counts the empty last line that the browser showed after each file's final newline. The file itself has one line fewer.
+- This was found when the 48 source files were downloaded for the similarity check (`docs/engineering/SIMILARITY_T63_B5_2026-11-19.md`). Every one of them had exactly one line fewer than its figure here.
+- The figures are left as they were written. The line numbers cited throughout this ledger are unaffected.
+- Row 46, the change log, was not downloaded, so its figure was not checked.
+
 | # | File | Lines | Read for | What was read |
 |---|---|---|---|---|
 | — | GitHub releases and tags pages of `open-acpica/acpica` | — | The release | Newest release 20260930, its tag and commit |

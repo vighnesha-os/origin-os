@@ -12,7 +12,10 @@
 //!    ([`apic::CalibrationWindow`]);
 //! 4. run the APIC timer periodically at [`HZ`], take [`PROOF_TICKS`] interrupts while
 //!    polling with interrupt windows (never halting, so a lost interrupt cannot hang the
-//!    check past its two-second deadline), and check the TSC-measured time;
+//!    check past its two-second deadline), and check the TSC-measured time ([`apic::judge_ticks`]);
+//!    then read the timer's count against the TSC for its period ([`apic::judge_period`]). A
+//!    run a stall made slow, or with no clean pair of count reads, is measured again, up to
+//!    [`PROOF_ATTEMPTS`] runs ([`apic::tick_verdict`]);
 //! 5. mask the timer again: nothing schedules on it yet (M3).
 
 use core::fmt::Write;
@@ -20,9 +23,9 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::acpi;
 use crate::apic::{
-    self, CalibrationWindow, IA32_APIC_BASE, SPURIOUS_VECTOR, TIMER_VECTOR, TimerMode, X2APIC_ID,
-    X2APIC_LVT_TIMER, X2APIC_SVR, X2APIC_TIMER_CURRENT, X2APIC_TIMER_DIVIDE, X2APIC_TIMER_INITIAL,
-    X2APIC_VERSION,
+    self, CalibrationWindow, IA32_APIC_BASE, SPURIOUS_VECTOR, TIMER_VECTOR, TickVerdict, TimerMode,
+    X2APIC_ID, X2APIC_LVT_TIMER, X2APIC_SVR, X2APIC_TIMER_CURRENT, X2APIC_TIMER_DIVIDE,
+    X2APIC_TIMER_INITIAL, X2APIC_VERSION,
 };
 use crate::clock;
 
@@ -35,6 +38,10 @@ use crate::port::{inb, outb};
 pub const HZ: u64 = 100;
 /// Interrupts to take.
 const PROOF_TICKS: u64 = 50;
+/// Runs the periodic proof may make: another only after a run that said nothing about the rate
+/// ([`apic::TickVerdict::Stalled`]), each against the same bounds. Each run is at most 2 s, so
+/// a boot pays for more only while disturbed (TASKS item 66).
+const PROOF_ATTEMPTS: u32 = 4;
 /// Calibration window.
 const CALIBRATION_MICROS: u64 = 10_000;
 /// APIC timer divisor during calibration and afterwards.
@@ -44,10 +51,14 @@ const DIVISOR: u32 = 16;
 /// reaches its end does not hold up a boot for long.
 const WINDOW_BUDGET_TICKS: u64 = 1 << 31;
 /// Calibration windows to measure before taking the least disturbed one. A window is
-/// spoiled by a stall near its start or its end, and each spoiled one costs 10 ms; on the
-/// development host under full load about 60 % are spoiled, and a boot with no clean
-/// window among 32 is then a chance of about 1 in 10^7.
-const CALIBRATION_WINDOWS: u32 = 32;
+/// spoiled by a stall near its start or its end, and each spoiled one costs 10 ms, so the
+/// budget is spent only while windows are spoiled: on a real machine the first is clean.
+/// Under QEMU's software processor the 65- and 67-processor machines spoil about 98 % of
+/// them (TASKS item 66, 2026-11-19: in 7 of 14 idle boots none of 32 was clean, and the
+/// least disturbed one was up to 2.9 % off, which the RTC second then refuted). With 1024,
+/// a boot with no clean window is a chance of about 1 in 10^10 there; the budget is at
+/// most about 10 s of windows.
+const CALIBRATION_WINDOWS: u32 = 1024;
 
 /// Master and slave 8259 data (mask) ports.
 const PIC_MASTER_DATA: u16 = 0x21;
@@ -59,6 +70,9 @@ pub enum ApicRead {
     Id,
     Version,
     TimerCurrent,
+    TimerInitial,
+    TimerDivide,
+    LvtTimer,
 }
 
 /// x2APIC registers this module writes: the timer and the spurious-vector register only,
@@ -125,6 +139,9 @@ impl X2Apic {
             ApicRead::Id => X2APIC_ID,
             ApicRead::Version => X2APIC_VERSION,
             ApicRead::TimerCurrent => X2APIC_TIMER_CURRENT,
+            ApicRead::TimerInitial => X2APIC_TIMER_INITIAL,
+            ApicRead::TimerDivide => X2APIC_TIMER_DIVIDE,
+            ApicRead::LvtTimer => X2APIC_LVT_TIMER,
         };
         // SAFETY: x2APIC mode is on (type invariant), so the register exists, and none of
         // these reads has a side effect.
@@ -328,6 +345,34 @@ pub fn calibrated_tsc_hz() -> Option<u64> {
 /// The calibrated initial count for [`HZ`] interrupts per second, once known (0 before).
 static PERIOD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// The boot processor's timer as [`init`]'s timed proof ran it: its initial count, divide
+/// configuration and LVT entry, read from its registers in the run that passed, before the timer
+/// was stopped. What every processor's timer must read back as in the preemption proof (TASKS
+/// item 66, the addendum review's T66-R14: read from the timed run, not rebuilt from
+/// [`PERIOD`]). Zero until the proof passes.
+static TIMED: [core::sync::atomic::AtomicU64; 3] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The boot processor's timer as its timed proof ran it ([`TIMED`]); `None` before the proof
+/// passed.
+pub fn timed_programming() -> Option<apic::TimerProgramming> {
+    let [initial, divide, lvt] =
+        core::array::from_fn(|i| TIMED[i].load(core::sync::atomic::Ordering::Acquire));
+    (initial != 0).then(|| apic::TimerProgramming::from_registers(initial, divide, lvt))
+}
+
+/// This processor's timer as programmed, read back from its x2APIC through [`X2Apic::read`];
+/// `None` if x2APIC mode is not on. For the preemption proof's check that every processor
+/// ticks as the boot processor's proof timed (TASKS item 66, the review's T66-R1).
+pub fn programmed() -> Option<apic::TimerProgramming> {
+    let lapic = X2Apic::this_cpu()?;
+    Some(apic::TimerProgramming::from_registers(
+        lapic.read(ApicRead::TimerInitial),
+        lapic.read(ApicRead::TimerDivide),
+        lapic.read(ApicRead::LvtTimer),
+    ))
+}
+
 /// Starts this processor's APIC timer at the calibrated [`HZ`]. Returns false if the
 /// boot processor has not calibrated it.
 pub fn start_periodic(lapic: &X2Apic) -> bool {
@@ -410,8 +455,9 @@ impl Reference {
 
     fn read(self) -> u64 {
         match self {
-            // SAFETY: CPL 0, boot processor; `port` is the FADT's PM_TMR_BLK, a read-only
-            // timer that cannot affect memory, and `pm_timer` refused a system-owned port.
+            // SAFETY: CPL 0, boot processor; `port` is the PM timer's port as the FADT names it
+            // (`X_PM_TMR_BLK` or `PM_TMR_BLK`, chosen by `acpi::parse_fadt`), a read-only timer
+            // that cannot affect memory, and `pm_timer` refused a system-owned port.
             Self::PmTimer { port, mask } => u64::from(unsafe { crate::port::ind(port) }) & mask,
             Self::CpuidTsc { .. } => rdtsc(),
         }
@@ -492,40 +538,73 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
         return None;
     };
 
-    let before = cpu::ticks();
-    let start = rdtsc();
-    let limit = tsc_hz.saturating_mul(2); // two seconds
-    lapic.write(
-        ApicWrite::LvtTimer,
-        apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false),
-    );
-    lapic.write(ApicWrite::TimerInitial, u64::from(count));
-    while cpu::ticks() - before < PROOF_TICKS && rdtsc().wrapping_sub(start) < limit {
-        cpu::interrupt_window();
-        core::hint::spin_loop();
-    }
-    let elapsed = rdtsc().wrapping_sub(start);
-    lapic.stop_timer();
-    let taken = cpu::ticks() - before;
-    let micros = elapsed.saturating_mul(1_000_000) / tsc_hz.max(1);
+    // The rate from the timer's count against the TSC: its period within 97 % to 103 % of
+    // nominal, whatever the interrupts did (the addendum review's T66-R13). The interrupts'
+    // delivery from their stamps: all 50 within the 2 s limit, not under 95 % of their nominal
+    // time in total, and at most 50 % slower (an emulator may coalesce late expiries; physical
+    // hardware qualification will tighten that, CLAUDE.md §74). A run with no clean pair of
+    // count reads, or whose delivery a stall made slow, and only such a run, is measured again
+    // against the same bounds (`apic::tick_verdict`).
+    let period = tsc_hz / HZ;
+    let micros = |ticks: u64| ticks.saturating_mul(1_000_000) / tsc_hz.max(1);
     let expected = PROOF_TICKS * 1_000_000 / HZ;
-    // Never faster than programmed (at least 95 % of the nominal time: a calibration error
-    // shows here), and at most 50 % slower (an emulator may coalesce late expiries, but a
-    // gross error, such as a wrong divisor, still fails). Physical hardware qualification
-    // will tighten the upper bound (CLAUDE.md §74).
-    let in_range = micros >= expected * 95 / 100 && micros <= expected * 3 / 2;
-    if taken < PROOF_TICKS || !in_range {
+    let mut stamps = [0u64; PROOF_TICKS as usize];
+    let mut attempts = 0;
+    let (run, verdict, seen_period, timed, lasted) = loop {
+        attempts += 1;
+        let timed = take_ticks(&lapic, count, tsc_hz, &mut stamps);
+        let seen = stamps.get(..timed.taken).unwrap_or(&[]);
+        let run = apic::judge_ticks(timed.start, seen, PROOF_TICKS as usize, period);
+        let verdict = apic::tick_verdict(run.verdict, apic::judge_period(timed.sample, period));
+        let seen_period = PeriodSeen {
+            ppm: timed.sample.map(|sample| sample.ppm_of(period)),
+            tries: timed.tries,
+        };
+        if verdict != TickVerdict::Stalled || attempts == PROOF_ATTEMPTS {
+            // A short run lasted until its limit, not until its last interrupt.
+            let lasted = if (timed.taken as u64) < PROOF_TICKS {
+                timed.end.wrapping_sub(timed.start)
+            } else {
+                run.elapsed
+            };
+            break (run, verdict, seen_period, timed, lasted);
+        }
+        // Each run measured again is said, with what made it say nothing: a repeat is a finding
+        // on a machine without a hypervisor (ADR-0013's note of TASKS item 66). Lines stay under
+        // the console's 160 bytes (the review's T66-R7).
         let _ = writeln!(
             com1,
-            "origin-kernel: {taken} interrupts in {micros} us, expected {PROOF_TICKS} in {expected} us: APIC timer is wrong"
+            "origin-kernel: APIC timer: run {attempts} of {PROOF_ATTEMPTS} disturbed ({} ticks in {} ms, longest gap {} ms, {seen_period}), measured again",
+            timed.taken,
+            micros(run.elapsed) / 1000,
+            micros(run.longest_gap) / 1000
+        );
+    };
+    let taken = timed.taken;
+    if verdict != TickVerdict::InBounds {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: {taken} ticks in {} us, not {PROOF_TICKS} in {expected} (median gap {} us, longest {} us, {}, run {attempts} of {PROOF_ATTEMPTS}): APIC timer is wrong",
+            micros(lasted),
+            micros(run.median_gap),
+            micros(run.longest_gap),
+            seen_period.short()
         );
         return None;
     }
-    let _ = writeln!(
+    let _ = write!(
         com1,
-        "origin-kernel: APIC timer: {taken} interrupts at {HZ} Hz in {} ms (initial count {count})",
-        micros / 1000
+        "origin-kernel: APIC timer: {PROOF_TICKS} interrupts at {HZ} Hz in {} ms (initial count {count}, {seen_period})",
+        micros(run.elapsed) / 1000
     );
+    if attempts > 1 {
+        let _ = write!(com1, ", run {attempts} of {PROOF_ATTEMPTS}");
+    }
+    let _ = writeln!(com1);
+    let registers = timed.registers;
+    for (cell, value) in TIMED.iter().zip(registers) {
+        cell.store(value, core::sync::atomic::Ordering::Release);
+    }
     PERIOD.store(count, core::sync::atomic::Ordering::Release);
     // The first measurement stands.
     let _ = CALIBRATED_TSC_HZ.compare_exchange(
@@ -535,6 +614,124 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
         core::sync::atomic::Ordering::Acquire,
     );
     Some(tsc_hz)
+}
+
+/// Runs the APIC timer periodically with `count` and stamps each interrupt with the TSC at the
+/// poll that saw it, until `stamps` is full or two seconds pass, polling with interrupt windows
+/// (never halting, so a lost interrupt cannot hang the check). Returns the TSC at the start and
+/// how many interrupts were stamped, and the TSC at the end. The timer is stopped again.
+fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> TimedRun {
+    // An expiry a stopped run left pending is taken here, before the count starts, so that a
+    // repeated run cannot begin one interrupt ahead (the review's T66-R6).
+    cpu::interrupt_window();
+    let before = cpu::ticks();
+    let start = rdtsc();
+    let limit = tsc_hz.saturating_mul(2); // two seconds
+    lapic.write(
+        ApicWrite::LvtTimer,
+        apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false),
+    );
+    lapic.write(ApicWrite::TimerInitial, u64::from(count));
+    let mut seen = 0;
+    while seen < stamps.len() && rdtsc().wrapping_sub(start) < limit {
+        cpu::interrupt_window();
+        let taken = cpu::ticks().wrapping_sub(before);
+        let now = rdtsc();
+        while (seen as u64) < taken {
+            let Some(slot) = stamps.get_mut(seen) else {
+                break;
+            };
+            *slot = now;
+            seen += 1;
+        }
+        core::hint::spin_loop();
+    }
+    let end = rdtsc();
+    // The registers as this run ran them, read before the timer stops: the programming every
+    // processor's timer must read back as (`TIMED`, the addendum review's T66-R14).
+    let registers = [
+        lapic.read(ApicRead::TimerInitial),
+        lapic.read(ApicRead::TimerDivide),
+        lapic.read(ApicRead::LvtTimer),
+    ];
+    // The timer's period from its count, still running as timed (the addendum review's
+    // T66-R13).
+    let (sample, tries) = sample_period(lapic, registers[0], tsc_hz / HZ);
+    lapic.stop_timer();
+    TimedRun {
+        start,
+        taken: seen,
+        end,
+        registers,
+        sample,
+        tries,
+    }
+}
+
+/// One run of the periodic proof, as [`take_ticks`] took it.
+struct TimedRun {
+    /// The TSC at the timer's start and at the run's end, and the interrupts stamped.
+    start: u64,
+    taken: usize,
+    end: u64,
+    /// The timer's initial count, divide configuration and LVT entry as the run held them.
+    registers: [u64; 3],
+    /// The first clean pair of reads of its count, if one came, and the pairs tried.
+    sample: Option<apic::PeriodSample>,
+    tries: u32,
+}
+
+/// How a run's count showed its period, for the proof's lines (the coordinating session's
+/// ruling on the addendum review's T66-R13): in parts per million of nominal, with the pairs
+/// of reads it took.
+struct PeriodSeen {
+    ppm: Option<u64>,
+    tries: u32,
+}
+
+impl PeriodSeen {
+    /// Without the pairs, for the failure line.
+    fn short(&self) -> PeriodShort {
+        PeriodShort(self.ppm)
+    }
+}
+
+impl core::fmt::Display for PeriodSeen {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.ppm {
+            Some(ppm) => write!(f, "period {ppm} ppm from {} pairs", self.tries),
+            None => write!(f, "period undecided after {} pairs", self.tries),
+        }
+    }
+}
+
+struct PeriodShort(Option<u64>);
+
+impl core::fmt::Display for PeriodShort {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(ppm) => write!(f, "period {ppm} ppm"),
+            None => write!(f, "period undecided"),
+        }
+    }
+}
+
+/// One read of the timer's current count, bracketed by the TSC.
+fn read_count(lapic: &X2Apic) -> apic::CountRead {
+    let before = rdtsc();
+    let count = lapic.read(ApicRead::TimerCurrent);
+    let after = rdtsc();
+    apic::CountRead {
+        before,
+        count,
+        after,
+    }
+}
+
+/// Measures the running periodic timer's period from its count, reloaded with `initial`
+/// ([`apic::sample_period`], which judges the reads).
+fn sample_period(lapic: &X2Apic, initial: u64, nominal: u64) -> (Option<apic::PeriodSample>, u32) {
+    apic::sample_period(initial, nominal, || read_count(lapic))
 }
 
 /// One PIT channel-2 one-shot of `pit` input clocks, with the APIC timer counting down and

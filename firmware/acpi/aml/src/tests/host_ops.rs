@@ -3,7 +3,7 @@
 //! initialization walk and `_REG`, each against the model host of `mod.rs`.
 
 use super::encode::*;
-use super::{Interp, Seen, interp, interp_with, load};
+use super::{Interp, Seen, Told, interp, interp_with, load, told};
 use crate::{
     ErrorKind, HostError, InitOutcome, IntegerWidth, Limit, Limits, PciAddress, Space, TableKey,
     Value,
@@ -106,7 +106,7 @@ fn access_widths_and_any_access() {
         op_region("MEM", 0, dword(0x1000), byte(16)),
         // A word field at bit 8 under WordAcc spans two words.
         field("MEM", WORD, &[Fe::Reserved(8), Fe::Named("WSPN", 16)]),
-        // AnyAcc: bits 8 to 23 fit one aligned dword (G5).
+        // AnyAcc: byte access (G5, TASKS 64's ledger §3; step B5).
         field("MEM", ANY, &[Fe::Reserved(8), Fe::Named("ANY1", 16)]),
         // DWordAcc on a 64-bit field: two dwords.
         field("MEM", DWORD, &[Fe::Reserved(64), Fe::Named("QW", 64)]),
@@ -126,7 +126,10 @@ fn access_widths_and_any_access() {
         vec![(false, 0x1000, 16, 0x3400), (false, 0x1002, 16, 0x12)]
     );
     assert_eq!(int(&mut i, "RA"), 0x1234);
-    assert_eq!(taken(&mut i), vec![(false, 0x1000, 32, 0x12_3400)]);
+    assert_eq!(
+        taken(&mut i),
+        vec![(false, 0x1001, 8, 0x34), (false, 0x1002, 8, 0x12)]
+    );
     assert_eq!(int(&mut i, "RQ"), 0x1122_3344_5566_7788);
     let t = taken(&mut i);
     assert_eq!(
@@ -162,12 +165,14 @@ fn a_field_past_its_region_is_refused_and_so_is_a_refused_access() {
 
 #[test]
 fn byte_only_spaces_are_read_a_byte_at_a_time() {
+    // SystemCMOS. An EmbeddedControl field wider than a byte is one transfer since step B5 (G5;
+    // `tolerance.rs`).
     let mut i = loaded(&[
-        op_region("EC", 3, zero(), byte(0x10)),
-        field("EC", DWORD, &[Fe::Named("TEMP", 32)]),
+        op_region("CM", 5, zero(), byte(0x10)),
+        field("CM", DWORD, &[Fe::Named("TEMP", 32)]),
         m("RT", &[ret(nm("TEMP"))]),
     ]);
-    i.host_mut().memory.insert((3, None, 2), 0x40);
+    i.host_mut().memory.insert((5, None, 2), 0x40);
     assert_eq!(int(&mut i, "RT"), 0x40_0000);
     let t = taken(&mut i);
     assert_eq!(t.len(), 4);
@@ -338,7 +343,7 @@ fn a_data_table_region_reads_the_table_the_host_names() {
         TableKey {
             signature: *b"OEMX",
             oem_id: *b"ORIGIN",
-            oem_table_id: *b"AMLTEST\0",
+            oem_table_id: *b"AMLTEST ",
         },
         0x7000,
         // A sound table of 64 bytes: the copy is checked before its address is taken (B2-14).
@@ -349,7 +354,7 @@ fn a_data_table_region_reads_the_table_the_host_names() {
         &[m(
             "RD",
             &[
-                data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST")),
+                data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST ")),
                 field("DTR", BYTE, &[Fe::Reserved(8 * 10), Fe::Named("B10", 8)]),
                 ret(nm("B10")),
             ],
@@ -370,7 +375,7 @@ fn a_data_table_regions_check_is_counted_as_work() {
             TableKey {
                 signature: *b"OEMX",
                 oem_id: *b"ORIGIN",
-                oem_table_id: *b"AMLTEST\0",
+                oem_table_id: *b"AMLTEST ",
             },
             0x7000,
             table(b"OEMX", 2, &[vec![0; body_bytes]]),
@@ -380,7 +385,7 @@ fn a_data_table_regions_check_is_counted_as_work() {
             &[m(
                 "RD",
                 &[
-                    data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST")),
+                    data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST ")),
                     ret(one()),
                 ],
             )],
@@ -443,7 +448,7 @@ fn a_data_table_region_is_refused_on_a_copy_that_fails_its_check() {
             TableKey {
                 signature: *b"OEMX",
                 oem_id: *b"ORIGIN",
-                oem_table_id: *b"AMLTEST\0",
+                oem_table_id: *b"AMLTEST ",
             },
             0x7000,
             bytes,
@@ -453,7 +458,7 @@ fn a_data_table_region_is_refused_on_a_copy_that_fails_its_check() {
             &[m(
                 "RD",
                 &[
-                    data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST")),
+                    data_region("DTR", string("OEMX"), string("ORIGIN"), string("AMLTEST ")),
                     ret(one()),
                 ],
             )],
@@ -469,14 +474,21 @@ fn a_data_table_region_is_refused_on_a_copy_that_fails_its_check() {
 }
 
 #[test]
-fn strings_are_written_a_character_at_a_time_and_long_buffers_in_pieces() {
+fn strings_and_long_buffers_are_written_in_pieces() {
+    // Table 19.7: a buffer longer than the field is written in field-sized pieces, lowest first;
+    // a string goes as a buffer of its bytes (G15's string half, as the coordinating session ruled
+    // it again for step B5 on 2026-11-19, point 1), so into a byte field one character a piece.
+    // Each such store is told to the host once.
     let mut i = loaded(&[
         op_region("IO", 1, word(0x80), one()),
         field("IO", BYTE, &[Fe::Named("PORT", 8)]),
         m("WS", &[store(string("AB"), nm("PORT")), ret(one())]),
         m(
             "WB",
-            &[store(buffer(byte(3), &[1, 2, 3]), nm("PORT")), ret(one())],
+            &[
+                store(buffer(byte(5), &[1, 2, 3, 4, 5]), nm("PORT")),
+                ret(one()),
+            ],
         ),
     ]);
     int(&mut i, "WS");
@@ -484,11 +496,13 @@ fn strings_are_written_a_character_at_a_time_and_long_buffers_in_pieces() {
         taken(&mut i),
         vec![(true, 0x80, 8, 0x41), (true, 0x80, 8, 0x42)]
     );
+    assert_eq!(told(&mut i), vec![Told::Pieces(vec![*b"PORT"], 2)]);
     int(&mut i, "WB");
     assert_eq!(
         taken(&mut i),
-        vec![(true, 0x80, 8, 1), (true, 0x80, 8, 2), (true, 0x80, 8, 3)]
+        (1..=5).map(|v| (true, 0x80, 8, v)).collect::<Vec<_>>()
     );
+    assert_eq!(told(&mut i), vec![Told::Pieces(vec![*b"PORT"], 5)]);
 }
 
 #[test]
@@ -542,8 +556,15 @@ fn mutexes_nest_keep_their_sync_levels_and_are_never_left_held() {
     assert_eq!(int(&mut i, "NEST"), 0);
     assert_eq!(fails(&mut i, "DOWN"), ErrorKind::SyncLevel);
     assert_eq!(fails(&mut i, "ORDR"), ErrorKind::SyncLevel);
-    assert_eq!(fails(&mut i, "KEEP"), ErrorKind::MutexHeld);
-    // Released by the failed evaluations: taken again at once.
+    let _ = told(&mut i);
+    // G2 (step B5): `KEEP` returns holding `LO`; the evaluation ends well, and `LO` is released
+    // and reported.
+    assert_eq!(int(&mut i, "KEEP"), 1);
+    assert_eq!(
+        told(&mut i),
+        vec![Told::Released(vec![*b"LO__"], vec![*b"KEEP"])]
+    );
+    // Released by the evaluations that ended: taken again at once.
     assert_eq!(int(&mut i, "NEST"), 0);
     assert_eq!(int(&mut i, "GL"), 1);
     assert_eq!((i.host().global_taken, i.host().global_held), (1, 0));
@@ -925,16 +946,20 @@ fn a_tracing_host_hears_loads_calls_accesses_and_limits() {
     let leaves = ev.iter().filter(|e| **e == Event::Leave).count();
     assert_eq!((enters, leaves), (64, 64));
     assert_eq!(ev.last(), Some(&Event::Limit(Limit::Depth)));
-    // A failed load is told.
-    assert_eq!(
-        load(&mut i, &[m("X", &[]), m("X", &[])]).unwrap_err().kind,
-        ErrorKind::Duplicate
-    );
+    // A failed load is told: a reserved opcode fails it whole (since step B5 a duplicate is
+    // abandoned alone).
+    assert!(matches!(
+        load(&mut i, &[m("X", &[]), vec![0x02]]).unwrap_err().kind,
+        ErrorKind::Reserved { .. }
+    ));
     assert_eq!(
         take(&mut i),
         [
             Event::Load(*b"SSDT"),
-            Event::Loaded(Err(ErrorKind::Duplicate))
+            Event::Loaded(Err(ErrorKind::Reserved {
+                first: 0x02,
+                second: None
+            }))
         ]
     );
 }
@@ -1297,10 +1322,10 @@ fn a_walk_cut_off_by_an_error_is_counted_out() {
 }
 
 #[test]
-fn a_mutex_a_method_run_by_export_keeps_is_released_at_the_end() {
-    // The review of B2, B2-6. `PK` returns a package naming a field of `D1`, whose region's
-    // function is found only when the package is exported, by running `_ADR`, which takes `MX`
-    // (sync level 5) and keeps it.
+fn a_mutex_a_method_run_by_export_keeps_is_released_and_reported_at_the_end() {
+    // The review of B2, B2-6, with G2 as step B5 builds it. `PK` returns a package naming a field
+    // of `D1`, whose region's function is found only when the package is exported, by running
+    // `_ADR`, which takes `MX` (sync level 5) and keeps it.
     let mut i = pci_device(
         &[acquire(nm("\\MX"), 0xFFFF), ret(dword(0x0001_0000))],
         &[
@@ -1314,11 +1339,14 @@ fn a_mutex_a_method_run_by_export_keeps_is_released_at_the_end() {
             ),
         ],
     );
-    // Reported, and released: a mutex of a lower level can be taken afterwards. Since B2-10 the
-    // `_ADR` is stopped at its own return, so the walk fails and the function stays unknown: the
-    // next export fails the same way, and again leaves nothing held.
-    for _ in 0..2 {
-        assert_eq!(fails(&mut i, "PK"), ErrorKind::MutexHeld);
+    // The export succeeds; `MX` is released and reported as the evaluation ends, so a mutex of a
+    // lower level can be taken afterwards. The function found is kept: the next export runs no
+    // `_ADR`, and takes nothing.
+    let _ = told(&mut i);
+    let adr = vec![*b"_SB_", *b"PCI0", *b"D1__", *b"_ADR"];
+    for reported in [vec![Told::Released(vec![*b"MX__"], adr)], vec![]] {
+        assert!(i.evaluate("\\PK", &[]).is_ok());
+        assert_eq!(told(&mut i), reported);
         assert!(i.held.is_empty());
         assert_eq!(int(&mut i, "LOW"), 1);
     }
@@ -1416,9 +1444,10 @@ fn an_adr_outside_a_device_and_function_is_refused() {
 }
 
 #[test]
-fn a_method_that_returns_holding_a_mutex_is_stopped_at_its_return() {
-    // The review of B2, B2-10: G2's strict choice applies at the method's return, so its caller
-    // does not go on using what the mutex guards.
+fn a_method_that_returns_holding_a_mutex_keeps_it_until_the_evaluation_ends() {
+    // G2 as step B5 builds it (the coordinating session's ruling of 2026-11-19), in place of the
+    // review of B2's B2-10: the mutex outlives `INNR`, its caller goes on, and it is released and
+    // reported when the evaluation ends.
     let mut i = loaded(&[
         mutex("MX", 3),
         name("FLAG", zero()),
@@ -1432,10 +1461,166 @@ fn a_method_that_returns_holding_a_mutex_is_stopped_at_its_return() {
             &[acquire(nm("MX"), 0xFFFF), release(nm("MX")), ret(one())],
         ),
     ]);
-    assert_eq!(fails(&mut i, "OUTR"), ErrorKind::MutexHeld);
-    assert_eq!(int(&mut i, "FLAG"), 0, "the caller went on");
+    let _ = told(&mut i);
+    assert_eq!(i.evaluate("\\OUTR", &[]), Ok(None));
+    assert_eq!(
+        told(&mut i),
+        vec![Told::Released(vec![*b"MX__"], vec![*b"INNR"])]
+    );
+    assert_eq!(int(&mut i, "FLAG"), 1, "the caller went on");
     assert!(i.held.is_empty());
     assert_eq!(int(&mut i, "NEST"), 1);
+}
+
+#[test]
+fn a_pair_that_takes_a_mutex_in_one_method_and_releases_it_in_another_works() {
+    // TASKS 72's finding 1 (G2, step B5): a Super I/O's configuration helpers, one taking `MT0`
+    // and returning with it, the other releasing it, both called by a device's `_STA`. Before
+    // step B5 the first one's return failed, and so did `_STA`.
+    let mut i = loaded(&[
+        mutex("MT0", 0),
+        name("CFG", zero()),
+        m(
+            "ENTR",
+            &[acquire(nm("MT0"), 0xFFFF), store(one(), nm("CFG"))],
+        ),
+        m("EXIT", &[store(zero(), nm("CFG")), release(nm("MT0"))]),
+        device(
+            "DEV",
+            &[method(
+                "_STA",
+                0,
+                &[
+                    call("\\ENTR", &[]),
+                    store(nm("\\CFG"), local(0)),
+                    call("\\EXIT", &[]),
+                    ret(local(0)),
+                ],
+            )],
+        ),
+    ]);
+    let _ = told(&mut i);
+    for _ in 0..2 {
+        assert_eq!(int(&mut i, "DEV._STA"), 1);
+        assert_eq!(told(&mut i), vec![]);
+        assert!(i.held.is_empty());
+    }
+}
+
+#[test]
+fn a_mutex_kept_across_a_return_keeps_the_sync_level_raised() {
+    // G2 (step B5): order stays strict on `Acquire` and `Release` while a mutex outlives the
+    // method that took it.
+    let mut i = loaded(&[
+        mutex("HI", 5),
+        mutex("LO", 1),
+        m("TAKE", &[acquire(nm("HI"), 0xFFFF)]),
+        m("THEN", &[call("TAKE", &[]), acquire(nm("LO"), 0xFFFF)]),
+        m(
+            "TWO",
+            &[
+                acquire(nm("LO"), 0xFFFF),
+                call("TAKE", &[]),
+                release(nm("LO")),
+            ],
+        ),
+    ]);
+    assert_eq!(fails(&mut i, "THEN"), ErrorKind::SyncLevel);
+    assert!(i.held.is_empty());
+    assert_eq!(fails(&mut i, "TWO"), ErrorKind::SyncLevel);
+    assert!(i.held.is_empty());
+    assert_eq!(
+        told(&mut i),
+        vec![],
+        "a failed evaluation's error is its report"
+    );
+}
+
+#[test]
+fn a_serialized_methods_own_mutex_still_goes_at_its_return() {
+    // G2 (step B5): only what `Acquire` took outlives its method. After `SER` (sync level 5)
+    // returns, its implicit mutex is gone, so `LO` (level 1) can be taken.
+    let mut i = loaded(&[
+        mutex("LO", 1),
+        method("SER", 8 | (5 << 4), &[ret(one())]),
+        m(
+            "BOTH",
+            &[
+                store(call("SER", &[]), local(0)),
+                acquire(nm("LO"), 0xFFFF),
+                release(nm("LO")),
+                ret(local(0)),
+            ],
+        ),
+    ]);
+    let _ = told(&mut i);
+    assert_eq!(int(&mut i, "BOTH"), 1);
+    assert_eq!(told(&mut i), vec![]);
+}
+
+#[test]
+fn a_mutex_load_time_code_keeps_is_released_and_reported_as_the_load_ends() {
+    // G2 (step B5): a boot load is the outermost evaluation.
+    let mut i = loaded(&[
+        mutex("MX", 0),
+        acquire(nm("MX"), 0xFFFF),
+        name("AFT", one()),
+    ]);
+    assert_eq!(told(&mut i), vec![Told::Released(vec![*b"MX__"], vec![])]);
+    assert!(i.held.is_empty());
+    assert_eq!(int(&mut i, "AFT"), 1);
+}
+
+#[test]
+fn planted_faults_are_caught_by_the_g2_tests() {
+    // The controls of step B5's G2: each planted fault makes one of the tests above fail.
+    use crate::tests::{Fault, plant};
+    let pair = || {
+        let mut i = loaded(&[
+            mutex("MT0", 0),
+            m("ENTR", &[acquire(nm("MT0"), 0xFFFF)]),
+            m("EXIT", &[release(nm("MT0"))]),
+            m("STA", &[call("ENTR", &[]), call("EXIT", &[]), ret(one())]),
+        ]);
+        i.evaluate("\\STA", &[]).map_err(|e| e.kind)
+    };
+    let kept = || {
+        let mut i = loaded(&[
+            mutex("LO", 0),
+            m("KEEP", &[acquire(nm("LO"), 0xFFFF), ret(one())]),
+        ]);
+        let _ = told(&mut i);
+        let r = i.evaluate("\\KEEP", &[]).map_err(|e| e.kind);
+        (r, told(&mut i))
+    };
+    assert_eq!(pair(), Ok(Some(crate::Value::Integer(1))));
+    plant(Some(Fault::ReleaseOnReturn));
+    let caught = pair();
+    plant(None);
+    assert_eq!(caught, Err(ErrorKind::NotOwned), "ReleaseOnReturn");
+    for f in [Fault::SilentRelease, Fault::NoReport] {
+        plant(Some(f));
+        let (r, t) = kept();
+        plant(None);
+        assert_eq!(r, Ok(Some(crate::Value::Integer(1))));
+        assert_eq!(t, vec![], "{f:?}");
+    }
+    assert_eq!(
+        kept().1,
+        vec![Told::Released(vec![*b"LO__"], vec![*b"KEEP"])]
+    );
+}
+
+#[test]
+fn every_g2_and_piece_test_fails_without_its_reports() {
+    // B5's contract §4 (the review of B5, B5-R4): `NoReport` planted, one run each.
+    super::fails_without_reports(&[
+        strings_and_long_buffers_are_written_in_pieces,
+        mutexes_nest_keep_their_sync_levels_and_are_never_left_held,
+        a_mutex_a_method_run_by_export_keeps_is_released_and_reported_at_the_end,
+        a_method_that_returns_holding_a_mutex_keeps_it_until_the_evaluation_ends,
+        a_mutex_load_time_code_keeps_is_released_and_reported_as_the_load_ends,
+    ]);
 }
 
 #[test]

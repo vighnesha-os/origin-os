@@ -11,8 +11,8 @@
 //!    across QEMU's 244 µs update-in-progress pulse loses the pulse's precision, not the
 //!    edge. A pair of edges decides only if its whole interval of uncertainty is inside
 //!    or outside 1 % of the PIT rate ([`rtc::SecondMeter`]); a pair too vague to decide
-//!    gives way to the next edge, within a 3.2 s budget (the two seconds two edges need,
-//!    and one spare for an edge a stall has spoiled);
+//!    gives way to the next edge, within a 5.2 s budget (the two seconds two edges need,
+//!    and three more for edges a stall has spoiled: TASKS item 66);
 //! 3. chooses the TSC rate: CPUID leaf 15h's if enumerated and within 1 % of the PIT
 //!    calibration; else the RTC second's, if within 1 %; else the PIT calibration;
 //! 4. reads the RTC just after the sharpest edge, so the wall clock is right to within
@@ -75,10 +75,13 @@ fn rdtscp_supported() -> bool {
 /// Register B bit 7: updates are inhibited while the clock is being set.
 const STATUS_B_SET: u8 = 0x80;
 /// How long [`measure_rtc`] may take, in tenths of a second: the two seconds that two
-/// edges need, one more for an edge a stall has spoiled, and a margin of 0.2 s. This is
+/// edges need, three more for edges a stall has spoiled, and a margin of 0.2 s. This is
 /// the proof's whole cost when the RTC is working: without a spoiled edge, it stops at
-/// the second edge, at most two seconds in, as it always has.
-const RTC_BUDGET_TENTHS: u64 = 32;
+/// the second edge, at most two seconds in, as it always has. A pair of edges further
+/// apart divides the same vagueness by more seconds, so a second too vague to decide over
+/// one second decides over two or more: on QEMU's 65- and 67-processor machines each edge
+/// was vague by up to 9.7 ms, and one boot's 3.2 s ran out undecided (TASKS item 66).
+const RTC_BUDGET_TENTHS: u64 = 52;
 /// The RTC's second must agree with the PIT-calibrated TSC within this many parts per
 /// thousand (1 %).
 const RTC_TOLERANCE_PPT: u16 = 10;
@@ -379,7 +382,8 @@ fn prove_pm_timer(com1: &mut Console, rsdp: u64, scale: Scale) -> bool {
         return true;
     };
     let mask: u32 = if wide { 0xFFFF_FFFF } else { 0x00FF_FFFF };
-    // The FADT's PM_TMR_BLK: a read-only 32-bit timer port. A first claim of it succeeds.
+    // The PM timer's port as the FADT names it (`X_PM_TMR_BLK` or `PM_TMR_BLK`, chosen by
+    // `acpi::parse_fadt`): a read-only 32-bit timer port. A first claim of it succeeds.
     let Some(timer) = origin_frame::port::PortRange::claim(port, 4) else {
         let _ = writeln!(
             com1,
@@ -535,6 +539,12 @@ static DONE: AtomicU64 = AtomicU64::new(0);
 static UNTIL: AtomicU64 = AtomicU64::new(0);
 /// The TSC value at which they stop whatever else has happened.
 static LATEST: AtomicU64 = AtomicU64::new(0);
+/// How long a run of turns may go on, in seconds, until it has its handoffs: a budget, not a
+/// bound, since the verdict is only whether a reading stepped back. On a real machine the
+/// handoffs come within the first 100 ms. Under QEMU's software processor on a loaded host the
+/// virtual processors rarely run at the same moment: on two processors at a load of 20 a run
+/// reached 101 handoffs at the 500 ms this was before TASKS item 66.
+const HANDOFF_BUDGET_SECONDS: u64 = 5;
 /// How many handoffs a run keeps going for, up to [`LATEST`].
 static WANTED_HANDOFFS: AtomicU64 = AtomicU64::new(0);
 /// Handoffs needed for the check to mean anything: the processors must really have
@@ -631,6 +641,13 @@ fn take_turns(me: u64, min_handoffs: u64, reading: Reading) {
         for _ in 0..32 {
             core::hint::spin_loop();
         }
+        // The boot flow runs this with interrupts off, now for up to
+        // [`HANDOFF_BUDGET_SECONDS`]: past the shootdown's 1 s patience, so it opens a window
+        // between its turns, where a shootdown or a tick is taken (the review's T66-R9). The
+        // turn-takers run with interrupts on and need none.
+        if !cpu::interrupts_enabled() {
+            cpu::interrupt_window();
+        }
     }
 }
 
@@ -661,7 +678,7 @@ struct Turns {
 }
 
 /// One run of turns with every online processor reading `reading`, for `window` ticks and on
-/// to 500 ms until `wanted` handoffs have happened. `None`, reported, if the turn-takers cannot
+/// to [`HANDOFF_BUDGET_SECONDS`] until `wanted` handoffs have happened. `None`, reported, if the turn-takers cannot
 /// be started. Runs from the boot flow with every scheduler active, after any earlier run has
 /// finished: nothing else reads or writes this state.
 fn run_turns(
@@ -693,7 +710,12 @@ fn run_turns(
         }
         aps += 1;
     }
-    crate::sched::yield_until(|| READY.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    let _ = crate::sched::wait_for_others(
+        "the clock's turn-takers to start",
+        || READY.load(Ordering::Acquire) == aps,
+        tsc_hz,
+        2000,
+    );
     if READY.load(Ordering::Acquire) != aps {
         UNTIL.store(1, Ordering::Release);
         let _ = writeln!(
@@ -703,14 +725,30 @@ fn run_turns(
         return None;
     }
     let start = rdtsc();
-    LATEST.store(start.saturating_add(tsc_hz / 2), Ordering::Relaxed);
+    LATEST.store(
+        start.saturating_add(tsc_hz.saturating_mul(HANDOFF_BUDGET_SECONDS)),
+        Ordering::Relaxed,
+    );
     UNTIL.store(start.saturating_add(window), Ordering::Release);
     take_turns(
         bsp.get() as u64,
         if cpus.len() < 2 { 0 } else { wanted },
         reading,
     );
-    crate::sched::yield_until(|| DONE.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    let ran_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
+    if ran_ms > 500 {
+        // Past the 500 ms a run had before TASKS item 66 (the review's T66-R3).
+        let _ = writeln!(
+            com1,
+            "origin-kernel: clock: a run of turns went on {ran_ms} ms for its {wanted} handoffs, past the former 500 ms"
+        );
+    }
+    let _ = crate::sched::wait_for_others(
+        "the clock's turn-takers to finish",
+        || DONE.load(Ordering::Acquire) == aps,
+        tsc_hz,
+        2000,
+    );
     Some(Turns {
         readings: READINGS.load(Ordering::Relaxed),
         handoffs: HANDOFFS.load(Ordering::Relaxed),
@@ -722,7 +760,7 @@ fn run_turns(
 }
 
 /// Proves that the TSC readings of every online processor are consistent: for 100 ms
-/// (and on, to 500 ms, until they have really interleaved) all of them take ordered
+/// (and on, to [`HANDOFF_BUDGET_SECONDS`], until they have really interleaved) all of them take ordered
 /// readings in turn, and no reading may be below the one taken just before it on another
 /// processor. Runs from the boot flow with every scheduler active.
 pub(crate) fn prove_consistent(
@@ -807,7 +845,12 @@ fn report_read_cost(com1: &mut Console, cpus: &[cpu::CpuIndex], bsp: cpu::CpuInd
         started &= crate::sched::spawn(id, cost_reader, 0).is_ok();
         aps += 1;
     }
-    crate::sched::yield_until(|| READY.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    let _ = crate::sched::wait_for_others(
+        "the clock cost's readers to start",
+        || READY.load(Ordering::Acquire) == aps,
+        tsc_hz,
+        2000,
+    );
     started &= READY.load(Ordering::Acquire) == aps;
     // Whatever happened, release those that did start: they would otherwise spin for the
     // whole boot.
@@ -820,7 +863,12 @@ fn report_read_cost(com1: &mut Console, cpus: &[cpu::CpuIndex], bsp: cpu::CpuInd
         return;
     }
     COST_TICKS.fetch_add(ticks_per_read(monotonic_nanos), Ordering::Relaxed);
-    crate::sched::yield_until(|| DONE.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    let _ = crate::sched::wait_for_others(
+        "the clock cost's readers to finish",
+        || DONE.load(Ordering::Acquire) == aps,
+        tsc_hz,
+        2000,
+    );
     let finished = DONE.load(Ordering::Acquire) == aps;
     let together = COST_TICKS.load(Ordering::Relaxed) / (aps + 1);
     let _ = writeln!(
