@@ -526,6 +526,44 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 84. **Boot info 0.8: the loader hands the SPCR's UART to the kernel (decision item 317; ADR-0010 Amendment 3). Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 83, in the session that ran rental B.** Rental B's kernel printed nothing on the operator's console: it writes to COM1 until its SPCR move, and that server's console is COM2. The loader finds the SPCR before `ExitBootServices`, checks it with the kernel's parser, moved to a crate both build, and records an I/O-port 16550-compatible UART in a new boot-info structure (version 0.8). From `kernel_main`'s first line the kernel writes to that UART and COM1, and E4's move still rules once the page tables are live. Done means: a boot-console scenario whose SPCR names COM2, with COM1 unread, shows the kernel's first line on COM2; a malformed or memory-mapped SPCR gives no UART in boot info and the boot goes on, both as controls; the boot-info structure is checked in the loader and the kernel, with host tests; and a cost-ledger row. A third rental (about $0.81, on the owner's word) can then show where the kernel stops on rental B's server.
 
+90. **M3 scheduling: the research and design (ADR-0020; ADR-0005 Amendment 11; decision items 318 to 341). Numbered by the coordinating session on 2026-11-20; done the same day: documents only.** The research ledger `docs/research/2026-11-20-m3-scheduling.md`, ADR-0020 (S1 to S23), the amendment to ADR-0005 for lending across calls (J1 to J6) and the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`, written on `claude/m3-scheduling-design-a5598a` (unpushed, cut from `land/batch-8` at `fa88211a`) from `695cb90d` to `b1c469f2`, at the coordinating session's rulings on its outline. The owner accepted all 24 questions on 2026-11-20, and the records came to `main` on a branch of their own (item 106). No Loom model, boot or code: the design rests on the kernel as the eighth batch leaves it, and no person has reviewed it.
+
+92. **Thread records and names that survive moves (ADR-0020 S1). Plan P1, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after the eighth batch and the records of items 318 to 341 are on `main`.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Lands with no change of behaviour: no thread moves.
+
+93. **The processor-index witness and the pin (ADR-0020 S2, S3). Plan P2, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 92.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Converts the 74 sites that read the processor index.
+
+94. **Every processor's FPU format checked (ADR-0020 S6). Plan P3, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after the records are on `main`; beside TASKS item 92.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
+
+95. **Moves between the tables of contexts: lend, adopt, forget, the move gate and deferred publication (ADR-0020 S4, S5). Plan P4, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after the eighth batch and the records are on `main`; beside TASKS item 92.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Loom models MV1 to MV7 and LV1.
+
+96. **The move, its proofs and pinned mode (ADR-0020 S6, S20, S23). Plan P5, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 93, 94 and 95.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
+
+97. **Scheduling domains, equal capacity and the SMT and two-package machines (ADR-0020 S8, S9, S23). Plan P6, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after the records are on `main`; beside TASKS item 92.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
+
+98. **The idle pull and the idle kick (ADR-0020 S7, S10). Plan P7, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 96 and 97.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
+
+99. **The periodic pull and the NUMA rule (ADR-0020 S7, S10). Plan P8, batch 10. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 98.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
+
+100. **Affinity, and user threads made movable (ADR-0020 S11, S2). Plan P9, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 96 and 97.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
+
+101. **Records for batch 9. Plan P10, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 98 and 100.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
+
+102. **Classes and levels (ADR-0020 S12, S13). Plan P11, batch 10. Numbered by the coordinating session on 2026-11-20; not started; after batch 9.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
+
+103. **CPU accounting (ADR-0020 S14). Plan P12, batch 10. Numbered by the coordinating session on 2026-11-20; not started; after batch 9.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
+
+104. **CPU quotas: shares and caps (ADR-0020 S15). Plan P13, batch 10. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 102.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
+
+105. **Weight lending for owned waits (ADR-0020 S16). Plan P14, batch 10. Numbered by the coordinating session on 2026-11-20; not started; after batch 9.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
+
+106. **Hardware capacity and heat: HFI, `_CPC` and the thermal interrupt (ADR-0020 S9, S17). Plan P15, batch 10. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 97.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Hybrid placement is shown only on ADR-0009 H4's machines.
+
+107. **Power mechanisms: pack, spread, avoid and consolidate (ADR-0020 S17). Plan P16, batch 10. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 106.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
+
+108. **The EEVDF evaluation (ADR-0020 S19). Plan P17, batch 10. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 96 to 105 pass their proofs.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first; adoption is the owner's, by amendment.
+
+109. **Lending across calls (ADR-0005 Amendment 11, J1 to J6). Plan P18, after the M3 core. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 105 and the M3 core, with ADR-0011 L4's fast-path design or the `CALL` flag alone.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
+
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
