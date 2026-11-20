@@ -3706,11 +3706,12 @@ C92-L1 to L4 were first run on `2f38bf77`, with the same results.
   - Neither path makes a call. Read from each image's `bencher` (`llvm-objdump`), following the executed branches.
   - Reported, not judged.
 
-**Review:** three AI reviews, each given the code and the properties without the author's argument, recorded in `REVIEW_T92_2026-11-20.md`.
+**Review:** four AI reviews, each given the code and the properties without the author's argument, recorded in `REVIEW_T92_2026-11-20.md`.
 
 - **The change at `cddaec30`:** no High finding; R92-1 to R92-10.
 - **The first delta, `53e5a3bc`:** no High or Medium; R92-11 to R92-14.
 - **The second delta, `25e47f5a`:** no High or Medium; R92-15 to R92-19.
+- **G92-1, `2f38bf77`, with its controls:** no High; one Medium (R92-20, the same race at the proof's opening check); R92-20 to R92-29.
 
 Every finding is answered in a commit naming it, or left as a follow-up named there. R92-9's first answer was wrong (it said the tip took as many locks per switch as the base), and the record says so. No person has reviewed it.
 
