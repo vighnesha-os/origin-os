@@ -111,6 +111,7 @@ dependencies = [
  "onbf-format",
  "onbf-merkle",
  "onbf-verify",
+ "origin-acpi-tables",
  "origin-boot-info",
  "origin-crypto",
  "origin-paging",
@@ -184,6 +185,9 @@ version = "0.0.0"
 [[package]]
 name = "origin-spcr"
 version = "0.0.0"
+dependencies = [
+ "origin-acpi-tables",
+]
 
 [[package]]
 name = "origin-sync"

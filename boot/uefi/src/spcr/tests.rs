@@ -3,11 +3,11 @@
 //! The boot scenarios prove the path on QEMU's tables and on the rented board's shapes.
 
 use origin_boot_info::{EARLY_UART_BAUD, EarlyUart, MemoryRegion, RegionKind};
-use origin_spcr::{HeaderError, SpcrError};
+use origin_spcr::SpcrError;
 
 use super::{
-    Found, MAX_SPCR_LENGTH, MAX_XSDT_LENGTH, Missing, Refused, RsdpError, XsdtError, described,
-    find,
+    Found, HeaderFault, MAX_SPCR_LENGTH, MAX_XSDT_LENGTH, Missing, Refused, RsdpError, XsdtError,
+    described, find,
 };
 
 const RSDP_AT: u64 = 0x9000_0014;
@@ -318,8 +318,29 @@ fn the_first_spcr_whose_header_checks_is_parsed() {
     *m.at(XSDT_AT) = xsdt(&[SECOND_AT]);
     assert_eq!(
         m.find(RSDP_AT),
-        Found::Refused(Refused::Header(HeaderError::Checksum))
+        Found::Refused(Refused::Header(HeaderFault::Checksum))
     );
+    // A null entry names nothing, as in the kernel's walk (T84-8), and is passed over.
+    *m.at(XSDT_AT) = xsdt(&[0, SPCR_AT]);
+    assert_eq!(m.find(RSDP_AT), Found::Port(COM2));
+    *m.at(XSDT_AT) = xsdt(&[0]);
+    assert_eq!(m.find(RSDP_AT), Found::Missing(Missing::NotListed));
+    // An SPCR the loader cannot read in full may be the kernel's first: no later one is named
+    // (T84-8), too long or unreadable alike.
+    for (declared, why) in [
+        (
+            MAX_SPCR_LENGTH as u32 + 1,
+            Refused::TooLong(MAX_SPCR_LENGTH as u32 + 1),
+        ),
+        (120, Refused::Unreadable(SECOND_AT)),
+    ] {
+        let mut m = machine();
+        let mut first = spcr();
+        first[4..8].copy_from_slice(&declared.to_le_bytes());
+        m.0.push((SECOND_AT, first));
+        *m.at(XSDT_AT) = xsdt(&[SECOND_AT, SPCR_AT]);
+        assert_eq!(m.find(RSDP_AT), Found::Refused(why));
+    }
     // A checking SPCR that the parser refuses decides: no later one is tried.
     let mut m = machine();
     let mut refused = spcr();
@@ -335,14 +356,14 @@ fn the_first_spcr_whose_header_checks_is_parsed() {
 
 #[test]
 fn a_short_or_overlong_spcr_is_refused() {
-    // Declares less than its header: read as the header alone, which `check` refuses.
+    // Declares less than its header: read as the header alone, which the header's check refuses.
     let mut m = machine();
     let t = m.at(SPCR_AT);
     t[4..8].copy_from_slice(&20u32.to_le_bytes());
     seal(t, 9);
     assert_eq!(
         m.find(RSDP_AT),
-        Found::Refused(Refused::Header(HeaderError::Length(36)))
+        Found::Refused(Refused::Header(HeaderFault::Length))
     );
     // Declares more than the loader reads.
     let mut m = machine();
@@ -374,10 +395,14 @@ fn a_short_or_overlong_spcr_is_refused() {
 }
 
 fn region(base: u64, pages: u64) -> MemoryRegion {
+    region_of(base, pages, RegionKind::AcpiNvs)
+}
+
+fn region_of(base: u64, pages: u64, kind: RegionKind) -> MemoryRegion {
     MemoryRegion {
         base,
         pages,
-        kind: RegionKind::AcpiNvs as u32,
+        kind: kind as u32,
         reserved: 0,
     }
 }
@@ -398,12 +423,47 @@ fn only_described_memory_is_read() {
     assert!(!described(&map, 0x1000, 0));
     assert!(!described(&map, u64::MAX - 3, 8));
     assert!(!described(&[], 0x1000, 8));
+    // What the kernel's walk refuses as well (T84-6): the first page, which firmware may leave
+    // unmapped to catch null pointers, memory-mapped I/O and unaccepted memory, even where the
+    // map describes them; loader data, where the refused machine's RSDP is, is read.
+    let low = [region_of(0, 4, RegionKind::LoaderReclaimable)];
+    assert!(!described(&low, 0x10, 36));
+    assert!(!described(&low, 0x0FFF, 8));
+    assert!(described(&low, 0x1000, 36));
+    let kinds = [
+        region_of(0x1000, 1, RegionKind::AcpiReclaimable),
+        region_of(0x2000, 1, RegionKind::Mmio),
+        region_of(0x3000, 1, RegionKind::Unaccepted),
+        region_of(0x4000, 1, RegionKind::LoaderReclaimable),
+    ];
+    assert!(described(&kinds, 0x1000, 0x1000));
+    assert!(!described(&kinds, 0x2000, 8));
+    assert!(
+        !described(&kinds, 0x1FF8, 16),
+        "a range that runs into MMIO"
+    );
+    assert!(!described(&kinds, 0x3000, 8));
+    assert!(described(&kinds, 0x4000, 8));
 }
 
-/// Mutations of every byte of the three tables: the walk never panics, never reads outside
-/// the model's memory, and names a UART only when boot info's own check accepts it.
+/// The bound on one walk's reads: the RSDP, the XSDT's header and its bytes in 64-byte chunks,
+/// two reads for each entry, and one SPCR.
+const MOST_READS: usize = 3 + MAX_XSDT_LENGTH as usize / 64 + 2 * (MAX_XSDT_LENGTH as usize / 8);
+
+/// A port block allowed by a rule written here, not the one `EarlyUart::check` and the parser
+/// share (T84-7): the four standard COM blocks, or a whole block at or above `0x1000`.
+fn literal_port_rule(port: u16) -> bool {
+    matches!(port, 0x3F8 | 0x2F8 | 0x3E8 | 0x2E8) || (0x1000..=0xFFF8).contains(&port)
+}
+
+/// Mutations of every byte of the three tables (TASKS item 84's review, T84-7). For each walk:
+/// it never panics; it asks for at most [`MOST_READS`] reads, each no longer than an SPCR the
+/// loader reads (1 KiB); and a UART it names is in a port block a rule written here allows. Over
+/// the whole soak it must both name a UART often and ask for memory the model refuses, so both
+/// the good path and the refusals are reached.
 #[test]
 fn hostile_tables_never_name_an_unchecked_uart() {
+    use std::cell::Cell;
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     let mut next = move || {
         state ^= state << 13;
@@ -412,7 +472,7 @@ fn hostile_tables_never_name_an_unchecked_uart() {
         state
     };
     let bases = [RSDP_AT, XSDT_AT, SPCR_AT];
-    let mut ports = 0;
+    let (mut ports, mut refused_reads) = (0, 0);
     for _ in 0..20_000 {
         let mut m = machine();
         let base = bases[(next() % 3) as usize];
@@ -428,15 +488,37 @@ fn hostile_tables_never_name_an_unchecked_uart() {
                 seal(t, 9);
             }
         }
-        let found = m.find(RSDP_AT);
+        let (reads, longest, refused) = (Cell::new(0usize), Cell::new(0usize), Cell::new(0));
+        let found = find(RSDP_AT, &mut |at, out| {
+            reads.set(reads.get() + 1);
+            longest.set(longest.get().max(out.len()));
+            let ok = m.read(at, out);
+            refused.set(refused.get() + usize::from(!ok));
+            ok
+        });
+        assert!(
+            reads.get() <= MOST_READS,
+            "{} reads: {found:?}",
+            reads.get()
+        );
+        assert!(
+            longest.get() <= MAX_SPCR_LENGTH,
+            "a read of {}",
+            longest.get()
+        );
+        refused_reads += refused.get();
         let uart = found.early_uart();
-        assert_eq!(uart.check(), Ok(()), "{found:?}");
         if uart.is_present() {
             ports += 1;
-            assert!(origin_spcr::port_block_allowed(uart.port), "{found:?}");
+            assert!(literal_port_rule(uart.port), "{found:?}");
+            assert!(
+                matches!(uart.interface, 0x00 | 0x01 | 0x12 | 0x14),
+                "{found:?}"
+            );
         }
         let _ = found.to_string();
     }
-    // The soak reached the good path often enough to mean something.
+    // The soak reached both the good path and the refused reads often enough to mean something.
     assert!(ports > 1_000, "{ports}");
+    assert!(refused_reads > 100, "{refused_reads}");
 }

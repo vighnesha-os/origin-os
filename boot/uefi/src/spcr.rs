@@ -15,15 +15,19 @@
 
 use core::fmt;
 
+use origin_acpi_tables::ErrorKind;
+use origin_acpi_tables::header::{HEADER_LEN as HEADER_LENGTH, check_signature};
 use origin_boot_info::{
-    EARLY_UART_BAUD, EARLY_UART_CLOCK, EarlyUart, EarlyUartError, MemoryRegion,
+    EARLY_UART_BAUD, EARLY_UART_CLOCK, EarlyUart, EarlyUartError, MemoryRegion, RegionKind,
 };
-use origin_spcr::{HEADER_LENGTH, HeaderError, SpcrError, UartAddress};
+use origin_spcr::{SpcrError, UartAddress};
 
 /// Bytes of an ACPI 2.0 or later RSDP that Origin reads (ACPI 6.6 §5.2.5.3).
 pub const RSDP_LENGTH: usize = 36;
-/// The longest XSDT walked: the kernel's limit on any table it reads (16 MiB).
-pub const MAX_XSDT_LENGTH: u32 = 16 << 20;
+/// The longest XSDT walked: 64 KiB, room for 8,187 tables, far more than any firmware lists. The
+/// kernel reads up to 16 MiB itself; a longer one names no UART here, and keeps the walk short
+/// under boot services (TASKS item 84's review, T84-15).
+pub const MAX_XSDT_LENGTH: u32 = 64 << 10;
 /// The longest SPCR read. Revision 4 with its namespace string is about a hundred bytes; a
 /// table declaring more names no early UART, and the kernel still reads it itself.
 pub const MAX_SPCR_LENGTH: usize = 1024;
@@ -78,17 +82,31 @@ pub enum Missing {
 /// Why the SPCR found names no early UART.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
-    /// Its header does not check, and no later SPCR in the XSDT does.
-    Header(HeaderError),
-    /// It declares more than [`MAX_SPCR_LENGTH`] bytes.
+    /// Its header does not check (`origin-acpi-tables`' rules), and no later SPCR in the XSDT
+    /// does.
+    Header(HeaderFault),
+    /// It declares more than [`MAX_SPCR_LENGTH`] bytes: no later SPCR is looked at, since the
+    /// kernel's first that checks may be this one (T84-8).
     TooLong(u32),
-    /// Its bytes, from this address, are not in memory the map describes.
+    /// Its bytes, from this address, are not in memory the map describes: no later SPCR is
+    /// looked at (T84-8).
     Unreadable(u64),
     /// The parser refuses it, as the kernel's would.
     Parse(SpcrError),
     /// The structure made from it fails boot info's own check (a parser that let through what
     /// boot info refuses: security invariant 1 of TASKS item 84).
     Uart(EarlyUartError),
+}
+
+/// Why an SPCR's header does not check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderFault {
+    /// Its declared length is below the header's 36 bytes, or not the bytes read.
+    Length,
+    /// Its bytes do not sum to zero.
+    Checksum,
+    /// Anything else the header's check refuses.
+    Other,
 }
 
 /// What the loader found, and says on its console.
@@ -117,7 +135,10 @@ impl Found {
 
 /// `true` if `[base, base + len)` lies wholly in regions of `regions` (sorted by base, as
 /// `memmap::translate` leaves them), with no gap: memory the firmware's map describes, which
-/// UEFI identity-maps while boot services run. An empty, null or wrapping range is refused.
+/// UEFI identity-maps while boot services run. Refused: an empty or wrapping range, one in the
+/// first page, which firmware may leave unmapped to catch null pointers, and one that touches
+/// memory-mapped I/O, where a read can change a device, or unaccepted memory, which faults in a
+/// confidential guest (the kernel's walk refuses both; TASKS item 84's review, T84-6).
 pub fn described(regions: &[MemoryRegion], base: u64, len: usize) -> bool {
     let Some(end) = u64::try_from(len)
         .ok()
@@ -125,16 +146,17 @@ pub fn described(regions: &[MemoryRegion], base: u64, len: usize) -> bool {
     else {
         return false;
     };
-    if base == 0 || len == 0 {
+    if base < PAGE || len == 0 {
         return false;
     }
+    let refused = [RegionKind::Mmio as u32, RegionKind::Unaccepted as u32];
     let mut at = base;
     for r in regions {
         let r_end = r.base.saturating_add(r.pages.saturating_mul(PAGE));
         if r_end <= at {
             continue;
         }
-        if r.base > at {
+        if r.base > at || refused.contains(&r.kind) {
             return false;
         }
         at = r_end;
@@ -175,6 +197,10 @@ fn walk(rsdp: u64, read: &mut impl FnMut(u64, &mut [u8]) -> bool) -> Result<Foun
             continue;
         }
         let table = u64::from_le_bytes(entry);
+        // A null entry names nothing, as the kernel's walk has it (T84-8).
+        if table == 0 {
+            continue;
+        }
         let mut header = [0u8; HEADER_LENGTH];
         if !read(table, &mut header) {
             unreadable.get_or_insert(table);
@@ -186,9 +212,12 @@ fn walk(rsdp: u64, read: &mut impl FnMut(u64, &mut [u8]) -> bool) -> Result<Foun
         match spcr_at(table, &header, read) {
             Ok(found) => return Ok(found),
             // A header that does not check: a later SPCR may (the kernel's first that checks).
-            Err(why) => {
+            Err(why @ Refused::Header(_)) => {
                 refused.get_or_insert(why);
             }
+            // One the loader cannot check in full may be the kernel's first: none is named
+            // (T84-8).
+            Err(why) => return Err(Found::Refused(why)),
         }
     }
     Err(match (refused, unreadable) {
@@ -258,7 +287,8 @@ fn check_xsdt(xsdt: u64, read: &mut impl FnMut(u64, &mut [u8]) -> bool) -> Resul
 }
 
 /// The SPCR at `at`, whose 36-byte header is `header`: read whole, checked, parsed.
-/// `Err` is a header that does not check, so the caller may go on to a later SPCR; once one
+/// `Err` is an SPCR that names nothing: one whose header does not check, after which the caller
+/// may go on to a later SPCR, or one it cannot read in full, after which it may not; once one
 /// checks, its parse decides.
 fn spcr_at(
     at: u64,
@@ -271,12 +301,21 @@ fn spcr_at(
         return Err(Refused::TooLong(declared));
     }
     let mut bytes = [0u8; MAX_SPCR_LENGTH];
-    // The header alone when the declared length is shorter: `check` then refuses it.
+    // The header alone when the declared length is shorter: the check then refuses it.
     let whole = bytes.get_mut(..len.max(HEADER_LENGTH)).unwrap_or(&mut []);
     if !read(at, whole) {
         return Err(Refused::Unreadable(at));
     }
-    let table = origin_spcr::check(whole).map_err(Refused::Header)?;
+    // The header's rules have one implementation, the kernel's (T84-13).
+    let table = check_signature(whole, b"SPCR")
+        .map_err(|e| {
+            Refused::Header(match e.kind {
+                ErrorKind::Length { .. } | ErrorKind::TooShort { .. } => HeaderFault::Length,
+                ErrorKind::Checksum => HeaderFault::Checksum,
+                _ => HeaderFault::Other,
+            })
+        })?
+        .bytes();
     Ok(match origin_spcr::parse(table) {
         Err(why) => Found::Refused(Refused::Parse(why)),
         Ok(spcr) => match spcr.address {
@@ -384,11 +423,11 @@ impl fmt::Display for Missing {
 impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Self::Header(HeaderError::Length(n)) => {
-                write!(f, "its declared length does not fit its {n} bytes")
+            Self::Header(HeaderFault::Length) => {
+                f.write_str("its declared length is not a whole table")
             }
-            Self::Header(HeaderError::Signature) => f.write_str("its signature is wrong"),
-            Self::Header(HeaderError::Checksum) => f.write_str("its checksum is wrong"),
+            Self::Header(HeaderFault::Checksum) => f.write_str("its checksum is wrong"),
+            Self::Header(HeaderFault::Other) => f.write_str("its header does not check"),
             Self::TooLong(n) => write!(
                 f,
                 "it declares {n} bytes, more than the loader reads ({MAX_SPCR_LENGTH})"

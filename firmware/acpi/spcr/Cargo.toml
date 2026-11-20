@@ -6,5 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[dev-dependencies]
+# The header's one implementation, which every caller runs before `parse` (T84-13).
+origin-acpi-tables.workspace = true
+
 [lints]
 workspace = true

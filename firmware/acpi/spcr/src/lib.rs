@@ -9,8 +9,9 @@
 //! (the serial port subtypes of SPCR revision 2 and later) and its notes on the Generic
 //! Address Structure of 16550-based UARTs, April 2023; ACPI 6.6 §5.2.6 (the table header).
 //!
-//! Firmware tables are untrusted input. [`check`] checks a table's header and checksum, and
-//! [`parse`] then looks at every field before using it, needs no `unsafe` and never panics. It
+//! Firmware tables are untrusted input. Its callers check a table's header and checksum first,
+//! with `origin-acpi-tables`' one implementation of those rules, and [`parse`] then looks at
+//! every field before using it, needs no `unsafe` and never panics. It
 //! refuses anything a kernel could not drive or that would make it touch the wrong thing: an
 //! address space or access it does not implement, an unaligned register, and I/O ports below
 //! `0x1000` other than the four standard COM blocks (see [`parse`]). A table that is refused
@@ -20,43 +21,6 @@
 
 /// Offset of the table header's Revision byte (ACPI 6.6 §5.2.6).
 const HEADER_REVISION: usize = 8;
-/// Bytes of an ACPI table header (§5.2.6).
-pub const HEADER_LENGTH: usize = 36;
-
-/// Why a table's header is refused ([`check`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeaderError {
-    /// Shorter than its header, or than the length its header declares.
-    Length(usize),
-    /// Not `SPCR`.
-    Signature,
-    /// Its bytes, over the declared length, do not sum to zero.
-    Checksum,
-}
-
-/// Checks `table` as an SPCR's header says it should be: the signature `SPCR`, a declared length
-/// of at least the header and no more than `table` holds, and a checksum over that length that
-/// sums to zero (§5.2.6). Returns the table over its declared length.
-pub fn check(table: &[u8]) -> Result<&[u8], HeaderError> {
-    let declared = table
-        .get(4..8)
-        .and_then(|b| <[u8; 4]>::try_from(b).ok())
-        .map(u32::from_le_bytes)
-        .and_then(|len| usize::try_from(len).ok())
-        .ok_or(HeaderError::Length(table.len()))?;
-    let whole = table
-        .get(..declared)
-        .filter(|_| declared >= HEADER_LENGTH)
-        .ok_or(HeaderError::Length(table.len()))?;
-    if whole.get(..4) != Some(&b"SPCR"[..]) {
-        return Err(HeaderError::Signature);
-    }
-    if whole.iter().fold(0u8, |s, &b| s.wrapping_add(b)) != 0 {
-        return Err(HeaderError::Checksum);
-    }
-    Ok(whole)
-}
-
 /// The UART input clock on PC-compatible platforms: 1.8432 MHz.
 pub const INPUT_CLOCK_HZ: u32 = 1_843_200;
 
@@ -239,7 +203,9 @@ pub const fn is_16550(interface: u8) -> bool {
     matches!(interface, 0x00 | 0x01 | 0x12 | 0x14)
 }
 
-/// Parses a checked SPCR ([`check`] passed).
+/// Parses a checked SPCR: one that `origin_acpi_tables::header::check_signature(table, b"SPCR")`
+/// accepted, the one implementation of the header's rules, which the kernel's `acpi::check_table`
+/// and the loader both run first (TASKS item 84's review, T84-13).
 ///
 /// Accepted: interface types 0 and 1 in revision 1 (a 16550, and a 16450 that also accepts
 /// writes to the FIFO register), and the 16550-compatible serial subtypes of the DBG2
@@ -376,30 +342,6 @@ mod tests {
         assert_eq!(divisor_for(u32::MAX, u32::MAX), None);
     }
 
-    /// The header check (TASKS item 84): the loader runs it before `parse`, as the kernel runs
-    /// its own `acpi::check_table`.
-    #[test]
-    fn the_header_is_checked_before_the_fields() {
-        let good = sealed(table());
-        assert_eq!(check(&good).map(<[u8]>::len), Ok(80));
-        // Bytes after the declared length are not the table's.
-        let mut longer = good.clone();
-        longer.extend_from_slice(&[0xAA; 8]);
-        assert_eq!(check(&longer).map(<[u8]>::len), Ok(80));
-        assert_eq!(check(&good[..79]), Err(HeaderError::Length(79)));
-        assert_eq!(check(&good[..7]), Err(HeaderError::Length(7)));
-        let mut short = good.clone();
-        short[4..8].copy_from_slice(&35u32.to_le_bytes());
-        assert_eq!(check(&short), Err(HeaderError::Length(80)));
-        let mut wrong = good.clone();
-        wrong[..4].copy_from_slice(b"SPCX");
-        seal(&mut wrong);
-        assert_eq!(check(&wrong), Err(HeaderError::Signature));
-        let mut summed = good;
-        summed[9] ^= 1;
-        assert_eq!(check(&summed), Err(HeaderError::Checksum));
-    }
-
     type Mutate = fn(&mut Vec<u8>);
 
     /// A valid revision 2 table for COM2 at 115 200 baud, checksum sealed by the caller.
@@ -427,7 +369,7 @@ mod tests {
 
     fn sealed(mut t: Vec<u8>) -> Vec<u8> {
         seal(&mut t);
-        assert_eq!(check(&t).map(<[u8]>::len), Ok(t.len()));
+        assert!(origin_acpi_tables::header::check_signature(&t, b"SPCR").is_ok());
         t
     }
 
@@ -719,7 +661,7 @@ mod tests {
                 t[4..8].copy_from_slice(&len.to_le_bytes());
                 seal(&mut t);
             }
-            let _ = check(&t);
+            let _ = origin_acpi_tables::header::check_signature(&t, b"SPCR");
             let Ok(s) = parse(&t) else {
                 refused += 1;
                 continue;

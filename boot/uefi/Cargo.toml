@@ -31,6 +31,8 @@ developer-mode = ["test-trust-store"]
 origin-version.workspace = true
 origin-boot-info.workspace = true
 origin-spcr.workspace = true
+# The ACPI header's one implementation, run on the SPCR before it is parsed (TASKS item 84).
+origin-acpi-tables.workspace = true
 onbf-format.workspace = true
 origin-crypto.workspace = true
 origin-random.workspace = true
