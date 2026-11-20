@@ -74,7 +74,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     // a boot this far can only have been a report of an invalid boot info, on COM1.
     let loader_uart = console::attach_loader_uart(&info);
     console::attach_framebuffer(&mut com1, &info, regions);
-    let _ = writeln!(com1, "origin-kernel: console: {loader_uart}");
+    let _ = writeln!(com1, "origin-kernel: console: {}", loader_uart.now());
     let _ = report::write_report(&mut com1, &info, &memory);
     for (i, s) in segments.iter().enumerate() {
         let access = match (
