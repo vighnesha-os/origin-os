@@ -58,8 +58,10 @@ const ACPI: &str = "ORIGIN_QEMU_ACPI";
 /// The machine's RAM: `512M` (the default), a larger even number of MiB (`1024M`), or a whole
 /// number of GiB from 1 to 64 (`8G`). TASKS item 83.
 const MEMORY: &str = "ORIGIN_QEMU_MEMORY";
-/// `on` or `off`: the firmware tables shaped as rental B's board has them, by the TEST ONLY
-/// application, with the console's UART at `0x2F8` (TASKS item 83).
+/// `on`, `refused` or `off`: the firmware tables shaped as rental B's board has them, by the
+/// TEST ONLY application, with the console's UART at `0x2F8` (TASKS item 83); `refused` also puts
+/// the RSDP's copy in RAM the kernel owns, so the loader reads the SPCR and the kernel's own
+/// reading is refused (TASKS item 84). See [`Shape`].
 const SHAPE: &str = "ORIGIN_QEMU_SHAPE";
 /// On if set and not empty: QEMU logs interrupts and resets.
 const DEBUG: &str = "ORIGIN_QEMU_DEBUG";
@@ -183,7 +185,7 @@ pub(crate) struct Settings {
     /// The machine's RAM ([`MEMORY`]; `boot-large`, `boot-rented`).
     pub(crate) memory: Memory,
     /// The firmware tables shaped as rental B's board has them ([`SHAPE`], `boot-rented`).
-    pub(crate) shape: bool,
+    pub(crate) shape: Shape,
     /// QEMU's log of interrupts and resets ([`DEBUG`]).
     pub(crate) debug: bool,
     /// A boot's timeout set by the person or by `boot-matrix` ([`TIMEOUT`]); `None` for
@@ -213,7 +215,7 @@ impl Default for Settings {
             reserved: false,
             acpi: false,
             memory: Memory::default(),
-            shape: false,
+            shape: Shape::Off,
             debug: false,
             timeout: None,
             only: String::new(),
@@ -269,7 +271,7 @@ impl Settings {
                 None => Memory::default(),
                 Some(v) => memory(v)?,
             },
-            shape: switch(SHAPE, set(SHAPE))?,
+            shape: shape(set(SHAPE))?,
             debug: set(DEBUG).is_some(),
             timeout: set(TIMEOUT)
                 .map(|v| {
@@ -294,14 +296,15 @@ impl Settings {
         // The rented board's machine has a whole-boot check of its own, which would replace the
         // reserved-memory machine's and is dropped by the machine without a generator: those
         // combinations are refused, not booted with less checked (the review's T83-9).
-        if settings.shape && settings.reserved {
+        let shaped = settings.shape.name();
+        if settings.shape.is_on() && settings.reserved {
             return Err(format!(
-                "{SHAPE}=on and {RESERVED}=on are not booted together: each machine's whole-boot check would replace the other's"
+                "{SHAPE}={shaped} and {RESERVED}=on are not booted together: each machine's whole-boot check would replace the other's"
             ));
         }
-        if settings.shape && settings.cpu_lacks("rdseed") && settings.cpu_lacks("rdrand") {
+        if settings.shape.is_on() && settings.cpu_lacks("rdseed") && settings.cpu_lacks("rdrand") {
             return Err(format!(
-                "{SHAPE}=on is not booted on a processor with neither RDSEED nor RDRAND: that machine's markers drop the rented board's whole-boot check"
+                "{SHAPE}={shaped} is not booted on a processor with neither RDSEED nor RDRAND: that machine's markers drop the rented board's whole-boot check"
             ));
         }
         Ok(settings)
@@ -344,11 +347,13 @@ impl Settings {
             (self.bridge, BRIDGE),
             (self.reserved, RESERVED),
             (self.acpi, ACPI),
-            (self.shape, SHAPE),
         ] {
             if on {
                 set.push(format!("{name}=on"));
             }
+        }
+        if self.shape.is_on() {
+            set.push(format!("{SHAPE}={}", self.shape.name()));
         }
         if self.memory != Memory::default() {
             set.push(format!("{MEMORY}={}", self.memory.qemu()));
@@ -507,6 +512,44 @@ fn memory(value: &str) -> Result<Memory> {
 }
 
 /// A switch: `on`, or `off` (or unset).
+/// The firmware tables' shape on the rented board's machines ([`SHAPE`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Shape {
+    /// Unshaped: every machine but `boot-rented`'s.
+    #[default]
+    Off,
+    /// As rental B's board has them (TASKS item 83).
+    Rented,
+    /// As [`Shape::Rented`], with the RSDP's copy in RAM the kernel owns: the loader reads the
+    /// SPCR under boot services, and the kernel's own reading is refused (TASKS item 84).
+    KernelRefused,
+}
+
+impl Shape {
+    /// Whether the tables are shaped at all.
+    pub(crate) fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Its value of [`SHAPE`].
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Rented => "on",
+            Self::KernelRefused => "refused",
+        }
+    }
+}
+
+fn shape(value: Option<&str>) -> Result<Shape> {
+    match value {
+        None | Some("off") => Ok(Shape::Off),
+        Some("on") => Ok(Shape::Rented),
+        Some("refused") => Ok(Shape::KernelRefused),
+        Some(other) => Err(format!("{SHAPE} must be on, refused or off, not {other:?}")),
+    }
+}
+
 fn switch(name: &str, value: Option<&str>) -> Result<bool> {
     match value {
         None | Some("off") => Ok(false),

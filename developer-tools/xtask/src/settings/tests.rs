@@ -74,7 +74,7 @@ fn each_variable_is_read_as_boot_test_read_it() {
             reserved: true,
             acpi: true,
             memory: Memory::gib(8),
-            shape: false,
+            shape: Shape::Off,
             debug: true,
             timeout: Some(Duration::from_secs(600)),
             only: "kernel boot,wrong key".into(),
@@ -145,11 +145,21 @@ fn the_memory_is_read_and_split_between_the_nodes() {
         let e = read(&[(MEMORY, bad)]).unwrap_err();
         assert!(e.starts_with("ORIGIN_QEMU_MEMORY must be"), "{bad}: {e}");
     }
-    assert!(read(&[(SHAPE, "on")]).unwrap().shape);
-    assert!(read(&[(SHAPE, "ON")]).is_err());
+    assert_eq!(read(&[(SHAPE, "on")]).unwrap().shape, Shape::Rented);
+    assert_eq!(
+        read(&[(SHAPE, "refused")]).unwrap().shape,
+        Shape::KernelRefused
+    );
+    assert_eq!(read(&[(SHAPE, "off")]).unwrap().shape, Shape::Off);
+    for bad in ["ON", "Refused", "yes"] {
+        let e = read(&[(SHAPE, bad)]).unwrap_err();
+        assert!(e.contains("must be on, refused or off"), "{bad:?}: {e}");
+    }
     // The combinations whose checks would replace or drop each other are refused (T83-9).
     let e = read(&[(SHAPE, "on"), (RESERVED, "on")]).unwrap_err();
     assert!(e.contains("are not booted together"), "{e}");
+    let e = read(&[(SHAPE, "refused"), (RESERVED, "on")]).unwrap_err();
+    assert!(e.contains("ORIGIN_QEMU_SHAPE=refused and"), "{e}");
     let e = read(&[(SHAPE, "on"), (CPU, "max,-rdseed,-rdrand")]).unwrap_err();
     assert!(e.contains("neither RDSEED nor RDRAND"), "{e}");
     assert!(read(&[(SHAPE, "on"), (CPU, "max,-rdseed")]).is_ok());
@@ -502,6 +512,10 @@ fn the_commands_that_set_their_machines_refuse_the_person_s() {
         ),
         (&[(ACPI, "on")], "ORIGIN_QEMU_ACPI=on is refused here"),
         (&[(SHAPE, "on")], "ORIGIN_QEMU_SHAPE=on is refused here"),
+        (
+            &[(SHAPE, "refused")],
+            "ORIGIN_QEMU_SHAPE=refused is refused here",
+        ),
         (&[(MEMORY, "8G")], "ORIGIN_QEMU_MEMORY=8G is refused here"),
         (
             &[(MEMORY, "1024M")],

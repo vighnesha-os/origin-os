@@ -451,13 +451,19 @@ fn shape_tables(
     let new_rsdp = rsdp_naming(old_rsdp, new_rsdt, new_xsdt)
         .ok_or((Status::LOAD_ERROR, "the RSDP is not an ACPI 2.0 one"))?;
     if shape.acpi_nvs {
-        let at = allocate(bs, ACPI_NVS, 1)?;
+        // TASKS item 84: in loader data, the loader still reads it, and the kernel refuses it.
+        let (kind, name) = if shape.rsdp_in_ram {
+            (LOADER_DATA, "loader data, RAM the kernel owns")
+        } else {
+            (ACPI_NVS, "ACPI NVS")
+        };
+        let at = allocate(bs, kind, 1)?;
         // SAFETY: the page just allocated, identity-mapped and owned by nothing else.
         unsafe { physical_mut(at, RSDP_LEN) }.copy_from_slice(&new_rsdp);
         install_configuration_table(bs, &ACPI_20_TABLE, at)?;
         let _ = writeln!(
             out,
-            "origin-test-reserved: the RSDP is copied to {at:#x} (ACPI NVS), and the configuration table names it"
+            "origin-test-reserved: the RSDP is copied to {at:#x} ({name}), and the configuration table names it"
         );
     } else {
         // SAFETY: the firmware's RSDP, 36 bytes of identity-mapped memory this application

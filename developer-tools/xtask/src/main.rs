@@ -47,7 +47,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use settings::{Memory, Settings, Topology};
+use settings::{Memory, Settings, Shape, Topology};
 
 const USAGE: &str = "\
 usage: cargo xtask <command>
@@ -302,6 +302,8 @@ const FREESTANDING_LIBS: &[&str] = &[
     // The AML interpreter (ADR-0019 A3), which the kernel's boot proof runs (TASKS item 63, step
     // B3). Its no-panic check is its own (`no_panic_check`), with `alloc`.
     AML_PACKAGE,
+    // Microsoft's SPCR, which the loader and the kernel both parse (TASKS item 84).
+    "origin-spcr",
     ONBF_FORMAT_PACKAGE,
     MERKLE_PACKAGE,
     CRYPTO_PACKAGE,
@@ -510,6 +512,7 @@ const RENTED_SHAPE: origin_test_reserved_memory::Shape = origin_test_reserved_me
     facs_32: true,
     fpdt: true,
     top_reserved_pages: 8192,
+    rsdp_in_ram: false,
 };
 
 /// The device the planted ranges name and no driver attaches: 00:1f.6, absent on QEMU's q35.
@@ -1029,8 +1032,8 @@ fn boot_scenario(settings: &Settings) -> Scenario {
     if settings.reserved {
         reserved_markers(&mut scenario, settings.iommu == Iommu::Amd);
     }
-    if settings.shape {
-        rented_scenario(&mut scenario);
+    if settings.shape.is_on() {
+        rented_scenario(&mut scenario, settings.shape);
     }
     if settings.machine_lacks("pit") {
         no_pit_markers(&mut scenario);
@@ -1939,6 +1942,11 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             "origin-boot: random: known-answer test passed; ".into(),
             "; the loader's generator is seeded".into(),
             "origin-boot: kernel placed at ".into(),
+            // The SPCR's UART for the kernel's first line (ADR-0010 Amendment 3; TASKS item 84):
+            // QEMU's tables have no SPCR.
+            LOADER_NO_SPCR.into(),
+            // What the walk cost (cost ledger row CL46).
+            "origin-boot: console: the walk read ".into(),
             // The firmware's framebuffer, for the kernel's console (ADR-0010).
             format!(
                 "origin-boot: framebuffer: {QEMU_DISPLAY} at 0x"
@@ -1953,6 +1961,7 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             // Attached before anything else is printed, so everything below is also on the
             // screen; `check_screen` holds the kernel to that.
             format!("origin-kernel: console: framebuffer {QEMU_DISPLAY} at 0x"),
+            KERNEL_NO_LOADER_UART.into(),
             format!("origin-kernel: {PRODUCT} {VERSION} Framekernel (build {BUILD})"),
             format!(
                 "origin-kernel: boot info {}.{}, ",
@@ -2582,7 +2591,13 @@ fn check_rented_boot(done: &Completed, settings: &Settings) -> Result {
     long_lines_whole(&done.serial)?;
     unwaited_lines_whole(&done.serial)?;
     check_memory(&done.serial, settings)?;
-    check_com1_stopped_at_the_move(done, settings)?;
+    check_spcr_console(done, settings)?;
+    check_firmware_console(done, settings)
+}
+
+/// On COM1, where the firmware's console is, the application's shaping and the loader's lines
+/// in their order ([`rented_firmware_markers`]).
+fn check_firmware_console(done: &Completed, settings: &Settings) -> Result {
     let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
     let firmware = rented_firmware_markers(settings);
     let markers: Vec<&str> = firmware.iter().map(String::as_str).collect();
@@ -2626,7 +2641,7 @@ const ALLOCATOR_ALLOWANCE_MIB: u64 = 16;
 
 /// MiB `boot-rented`'s application reserves at the top of the RAM, 0 on other machines.
 fn reserved_top_mib(settings: &Settings) -> u64 {
-    if settings.shape {
+    if settings.shape.is_on() {
         (u64::from(RENTED_SHAPE.top_reserved_pages) * 4096) >> 20
     } else {
         0
@@ -2710,18 +2725,28 @@ fn rented_firmware_markers(settings: &Settings) -> Vec<String> {
         "origin-test-reserved: the RSDT is copied to 0x",
         " (ACPI NVS), ",
         "origin-test-reserved: the RSDP is copied to 0x",
-        " (ACPI NVS), and the configuration table names it",
+        if settings.shape == Shape::KernelRefused {
+            " (loader data, RAM the kernel owns), and the configuration table names it"
+        } else {
+            " (ACPI NVS), and the configuration table names it"
+        },
         "origin-test-reserved: starting the loader",
     ]
     .map(String::from)
     .to_vec();
     let plain = boot_scenario(&Settings {
-        shape: false,
+        shape: Shape::Off,
         ..settings.clone()
     });
     match plain.markers.iter().position(|m| m == HANDOVER_LINE) {
         Some(at) => markers.extend(plain.markers.into_iter().take(at + 1)),
         None => markers.push(format!("xtask: the marker {HANDOVER_LINE:?} is missing")),
+    }
+    // This machine's SPCR names COM2, and the loader reads it under boot services, whatever the
+    // kernel can read later (TASKS item 84).
+    match markers.iter().position(|m| m == LOADER_NO_SPCR) {
+        Some(at) => markers[at] = LOADER_NAMES_COM2.to_string(),
+        None => markers.push(format!("xtask: the marker {LOADER_NO_SPCR:?} is missing")),
     }
     markers
 }
@@ -2729,15 +2754,95 @@ fn rented_firmware_markers(settings: &Settings) -> Vec<String> {
 /// The loader's last line, after which only the kernel prints.
 const HANDOVER_LINE: &str = "origin-boot: exiting boot services; entering the Framekernel";
 
+/// The kernel's line when it cannot read the SPCR the loader read: the RSDP's copy is in RAM it
+/// owns (`boot-rented`'s machine with the kernel's reading refused; TASKS item 84).
+const REFUSED_STAYS: &str = "origin-kernel: console: no usable ACPI SPCR table (cannot map an ACPI table); the UART stays at I/O port 0x3f8, and the loader's at I/O port 0x2f8";
+
+/// `boot-rented`'s machine with the kernel's reading refused (TASKS item 84; rental B's case):
+/// the loader reads the SPCR under boot services and names COM2; the kernel, which can read no
+/// ACPI table from an RSDP in RAM it owns, refuses the move, says so on COM1 and COM2, and keeps
+/// both for the rest of the boot (the coordinating session's ruling Q1). Without the ACPI tables
+/// most of the boot's proofs cannot run, so this machine is held to the console alone: its
+/// first lines, the refusal, a verdict and the halt, all on COM2 and on COM1, and the loader's
+/// line naming COM2 on COM1 ([`check_refused_boot`]).
+fn refused_scenario(scenario: &mut Scenario) {
+    scenario.markers = vec![
+        format!("origin-kernel: console: framebuffer {QEMU_DISPLAY} at 0x"),
+        KERNEL_WRITES_COM2.to_string(),
+        REFUSED_STAYS.to_string(),
+        BOOT_VERDICT.to_string(),
+        HALT_LINE.to_string(),
+    ];
+    scenario.failures = REFUSED_FAILURES.to_vec();
+    // QEMU's own lines that the boot's proofs cause: none run here that need the ACPI tables.
+    scenario.stderr = vec![];
+    scenario.check = Some(check_refused_boot);
+}
+
+/// What fails [`refused_scenario`]'s boot at once: a crash, a refusal, a broken generator, stack or
+/// memory. Not a boot proof that needs the ACPI tables, which the kernel cannot read on that
+/// machine by design: those fail, the verdict says so, and the boot goes on to its halt.
+const REFUSED_FAILURES: &[&str] = &[
+    "origin-boot: panic:",
+    "origin-kernel: panic:",
+    "origin-boot: kernel rejected",
+    "origin-boot: random: known-answer test FAILED",
+    "origin-boot: random: no seed for the kernel",
+    "ran over its stack",
+    "kernel stacks' region: WRONG",
+    "origin-kernel: invalid boot info",
+    "origin-kernel: invalid image",
+    "origin-kernel: boot refused",
+    "(#DF double fault)",
+    "(#GP general protection)",
+    "(#PF page fault)",
+    "(#UD invalid opcode)",
+    "origin-kernel: machine check:",
+    "origin-kernel: frame allocator exhausted",
+    "origin-kernel: page tables not built",
+    "origin-kernel: page protection violated",
+    "RWX at",
+    "origin-kernel: heap contents are wrong",
+    "origin-kernel: heap leaked",
+];
+
+/// How the kernel's verdict line starts.
+const BOOT_VERDICT: &str = "origin-kernel: boot verdict: ";
+
+/// [`refused_scenario`]'s check: the UART the loader named carries the kernel's lines from the
+/// first, as the boot's markers say; COM1, the firmware's console, carries the application's and
+/// the loader's lines, and the kernel's to the end, the refusal and the verdict among them; and
+/// neither UART was sent anything again.
+fn check_refused_boot(done: &Completed, settings: &Settings) -> Result {
+    check_first_line_on_the_uart(&done.serial)?;
+    check_firmware_console(done, settings)?;
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    if let Some(missing) = serial::first_missing(&com1, &[REFUSED_STAYS, BOOT_VERDICT, HALT_LINE]) {
+        return Err(format!(
+            "COM1 lacks {missing:?}: the console must keep it beside the loader's UART when the move is refused"
+        ));
+    }
+    if done.serial.contains(REPLAYED) || com1.contains(REPLAYED) {
+        return Err(format!(
+            "a UART was sent the earlier lines again ({REPLAYED:?}), though the console never moved"
+        ));
+    }
+    Ok(())
+}
+
 /// The kernel boot made the rented board's (TASKS item 83): the console's UART is the one the
 /// SPCR names at `0x2F8`, with COM1 present and kept in a file, so the markers are read from
 /// that UART, and they start with the kernel's lines that the move sends it again; the
 /// firmware's console, the application's and the loader's lines, stays on COM1
 /// ([`check_rented_boot`]). The move comes after the kernel's page-table proofs, and the census
 /// names the FPDT's tables and what it never lends.
-fn rented_scenario(scenario: &mut Scenario) {
+fn rented_scenario(scenario: &mut Scenario, shape: Shape) {
     scenario.capture = Capture::SpcrUart;
     scenario.qemu_args = Some(|work| spcr_args(work, &spcr_table(0, gas_io(SPCR_PORT), 7), &[]));
+    if shape == Shape::KernelRefused {
+        refused_scenario(scenario);
+        return;
+    }
     scenario.check = Some(check_rented_boot);
     // Each edit below needs its anchor: one that is missing makes an impossible marker, so the
     // boot fails rather than check less (the review's T83-8).
@@ -2752,13 +2857,22 @@ fn rented_scenario(scenario: &mut Scenario) {
         }
         None => missing(scenario, HANDOVER_LINE),
     }
-    // The usual machine has no SPCR; this one's names COM2, so the console moves (below).
+    // The usual machine has no SPCR; this one's names COM2, which the loader names and the
+    // kernel writes to from its first line, and the console moves there for good (below).
     let no_spcr = "origin-kernel: console: no usable ACPI SPCR table";
     match scenario.markers.iter().position(|m| m.starts_with(no_spcr)) {
         Some(at) => {
             scenario.markers.remove(at);
         }
         None => missing(scenario, no_spcr),
+    }
+    match scenario
+        .markers
+        .iter()
+        .position(|m| m == KERNEL_NO_LOADER_UART)
+    {
+        Some(at) => scenario.markers[at] = KERNEL_WRITES_COM2.to_string(),
+        None => missing(scenario, KERNEL_NO_LOADER_UART),
     }
     let insert_before = |scenario: &mut Scenario, anchor: &str, items: &[&str]| match scenario
         .markers
@@ -2775,10 +2889,7 @@ fn rented_scenario(scenario: &mut Scenario) {
     insert_before(
         scenario,
         "origin-kernel: allocated, wrote and freed 3 frames at ",
-        &[
-            MOVED_LINE,
-            "origin-kernel: console: the UART is now at I/O port 0x2f8, as the firmware set it; ",
-        ],
+        &[TAKEN_OVER_LINE, TAKEN_BYTES],
     );
     insert_before(
         scenario,
@@ -2927,6 +3038,10 @@ const QEMU_DISPLAY: &str = "1280x800";
 /// What the kernel says about the SPCR when the firmware has none (`console.rs`).
 const NO_SPCR: &str =
     "no usable ACPI SPCR table (table not listed in the XSDT); the UART stays at I/O port 0x3f8";
+/// What the loader says when the firmware has no SPCR (`boot/uefi/src/spcr.rs`; TASKS item 84).
+const LOADER_NO_SPCR: &str = "origin-boot: console: no SPCR (the XSDT lists none); the kernel's console starts on COM1 and the screen";
+/// What the kernel says when the loader named no UART (`console.rs`; TASKS item 84).
+const KERNEL_NO_LOADER_UART: &str = "origin-kernel: console: the loader named no UART from the SPCR; COM1 and the screen until the SPCR is read";
 /// Every scenario here boots the whole kernel, so it ends with this line.
 const HALT_LINE: &str = "origin-kernel: M1 entry complete; halting";
 
@@ -4124,22 +4239,26 @@ fn console_scenario(
     }
 }
 
-/// The UART the SPCR names: everything printed before the move is sent to it, from the first
-/// line of the boot, and what follows the move reaches it and only it. COM1's log is checked
-/// to stop at the line announcing the move.
+/// The UART the SPCR names, which the loader named in the boot info (ADR-0010 Amendment 3;
+/// TASKS item 84): the kernel writes to it from its first line, beside COM1, and at the move
+/// COM1 stops and nothing is sent again; what follows the move reaches it and only it. COM1's
+/// log is checked to hold the loader's line naming it, and to stop at the line announcing the
+/// move; this UART's, to start with the kernel's first line ([`check_spcr_console`]).
 fn spcr_uart_scenario() -> Scenario {
     use origin_version::{BUILD, PRODUCT, VERSION};
     console_scenario(
         "console: UART named by the SPCR",
         Capture::SpcrUart,
         console_markers(&[
-            // Everything before the move, replayed: the first kernel lines of the boot.
+            // Everything before the move, written here as it was printed: the first kernel
+            // lines of the boot.
             "origin-kernel: console: framebuffer ",
+            KERNEL_WRITES_COM2,
             &format!("origin-kernel: {PRODUCT} {VERSION} Framekernel (build {BUILD})"),
             "origin-kernel: GDT, TSS and IDT loaded (32 exception vectors)",
             "origin-kernel: page tables loaded: ",
-            MOVED_LINE,
-            "origin-kernel: console: the UART is now at I/O port 0x2f8, as the firmware set it; ",
+            TAKEN_OVER_LINE,
+            TAKEN_BYTES,
             // After the move: only this UART has these.
             "origin-kernel: allocated, wrote and freed 3 frames at ",
             "origin-kernel: TLB: ",
@@ -4147,12 +4266,61 @@ fn spcr_uart_scenario() -> Scenario {
             "origin-kernel: sysfs: built /sys with 4 facts",
         ]),
         Some(|work| spcr_args(work, &spcr_table(0, gas_io(SPCR_PORT), 7), &[])),
-        Some(check_com1_stopped_at_the_move),
+        Some(check_spcr_console),
     )
 }
 
-/// The line announcing the move, the last one COM1 may ever carry.
-const MOVED_LINE: &str = "origin-kernel: console: the ACPI SPCR (revision 2, interface 0x0) names a UART at I/O port 0x2f8: moving the console there";
+/// The loader's line, on its console (COM1 under OVMF), naming the SPCR's UART at `0x2F8`
+/// (TASKS item 84).
+const LOADER_NAMES_COM2: &str = "origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line";
+/// The kernel's line about the UART the loader named, on COM1, that UART and the screen.
+const KERNEL_WRITES_COM2: &str = "origin-kernel: console: the loader named the SPCR's UART at I/O port 0x2f8 (interface 0x0): written to from the first line, beside COM1, as the firmware set it";
+/// The line announcing the move to the UART the loader named, the last one COM1 may ever carry.
+const TAKEN_OVER_LINE: &str = "origin-kernel: console: the ACPI SPCR (revision 2, interface 0x0) names a UART at I/O port 0x2f8: the console has written there since its first line, so nothing is sent again; COM1 stops";
+/// After [`TAKEN_OVER_LINE`], on that UART alone: what writing there from the first line cost
+/// (cost ledger row CL46).
+const TAKEN_BYTES: &str =
+    " bytes of text went to that UART before the move, beside COM1 (cost ledger row CL46)";
+/// The move that sends the earlier lines again: a UART the loader did not name.
+const REPLAYED: &str = " bytes of earlier output sent to it again";
+
+/// The SPCR's UART as TASKS item 84 makes it ([`spcr_uart_scenario`], and `boot-rented`'s
+/// machine): the loader names it on COM1, its own console; the kernel's first line, the
+/// framebuffer's, is the first on that UART, and nothing is sent there again; COM1 stops at the
+/// move ([`check_com1_stopped_at_the_move`]).
+fn check_spcr_console(done: &Completed, settings: &Settings) -> Result {
+    check_com1_stopped_at_the_move(done, settings)?;
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    if !com1.contains(LOADER_NAMES_COM2) {
+        return Err(format!(
+            "COM1, the loader's console, lacks its line naming the SPCR's UART: {LOADER_NAMES_COM2:?}"
+        ));
+    }
+    check_first_line_on_the_uart(&done.serial)?;
+    if done.serial.contains(REPLAYED) {
+        return Err(format!(
+            "the SPCR's UART was sent the earlier lines again ({REPLAYED:?}), though it has had them from the first line"
+        ));
+    }
+    Ok(())
+}
+
+/// The UART the loader named carries the kernel's lines from the first: the framebuffer's, then
+/// the line saying the loader named it (TASKS item 84).
+fn check_first_line_on_the_uart(serial: &str) -> Result {
+    let text = serial::clean(serial.as_bytes());
+    let mut kernel_lines = text.lines().filter(|l| l.starts_with("origin-kernel:"));
+    let first = kernel_lines.next();
+    let second = kernel_lines.next();
+    if !first.is_some_and(|l| l.starts_with("origin-kernel: console: framebuffer "))
+        || second != Some(KERNEL_WRITES_COM2)
+    {
+        return Err(format!(
+            "the SPCR's UART does not carry the kernel's lines from the first: it starts with {first:?} and {second:?}"
+        ));
+    }
+    Ok(())
+}
 
 /// Once the firmware has named a better UART, the fallback is not used: COM1 holds the move
 /// line as its last kernel line, and has never heard of anything after it.
@@ -4163,7 +4331,7 @@ fn check_com1_stopped_at_the_move(done: &Completed, _settings: &Settings) -> Res
         .lines()
         .filter(|l| l.starts_with("origin-kernel:"))
         .collect();
-    if kernel_lines.last().copied() != Some(MOVED_LINE) {
+    if kernel_lines.last().copied() != Some(TAKEN_OVER_LINE) {
         return Err(format!(
             "COM1's last kernel line is {:?}; it should be the line about the move",
             kernel_lines.last()
@@ -4188,6 +4356,8 @@ fn console_scenarios() -> Vec<Scenario> {
             "console: SPCR naming COM1 itself",
             Capture::Com1,
             console_markers(&[
+                "origin-boot: console: the SPCR names a UART at I/O port 0x3f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line",
+                "origin-kernel: console: the loader named the SPCR's UART at I/O port 0x3f8: COM1, written to from the first line",
                 "origin-kernel: console: the ACPI SPCR (revision 2, interface 0x0) names a UART at I/O port 0x3f8: moving the console there",
                 "origin-kernel: console: the UART is now at I/O port 0x3f8, as the firmware set it; 0 bytes of earlier output sent to it again, 0 did not fit",
                 "origin-kernel: allocated, wrote and freed 3 frames at ",
@@ -4202,6 +4372,10 @@ fn console_scenarios() -> Vec<Scenario> {
             "console: SPCR naming a UART that takes no bytes",
             Capture::Com1,
             console_markers(&[
+                "origin-boot: console: the SPCR names a UART at I/O port 0x2e8 (interface 0x0, 115200 baud): the kernel writes to it from its first line",
+                // Given up on after one bounded wait, during the kernel's first line.
+                "origin-kernel: console: the loader's UART stopped taking bytes; serial output there off",
+                "origin-kernel: console: the loader named the SPCR's UART at I/O port 0x2e8 (interface 0x0): written to from the first line, beside COM1, ",
                 "origin-kernel: console: the ACPI SPCR (revision 2, interface 0x0) names a UART at I/O port 0x2e8: moving the console there",
                 "origin-kernel: console: the UART at I/O port 0x2e8 takes no bytes; the UART stays at I/O port 0x3f8",
                 "origin-kernel: allocated, wrote and freed 3 frames at ",
@@ -4224,6 +4398,8 @@ fn console_scenarios() -> Vec<Scenario> {
             "console: SPCR for an interface this kernel cannot drive",
             Capture::Com1,
             console_markers(&[
+                "origin-boot: console: the SPCR was refused (Interface(3)); the kernel's console starts on COM1 and the screen",
+                KERNEL_NO_LOADER_UART,
                 "origin-kernel: console: the ACPI SPCR table was refused (Interface(3)); the UART stays at I/O port 0x3f8",
                 "origin-kernel: allocated, wrote and freed 3 frames at ",
             ]),
@@ -4234,6 +4410,8 @@ fn console_scenarios() -> Vec<Scenario> {
             "console: SPCR naming a port with no UART",
             Capture::Com1,
             console_markers(&[
+                "origin-boot: console: the SPCR names a UART at I/O port 0x2e8 (interface 0x0, 115200 baud): the kernel writes to it from its first line",
+                "origin-kernel: console: the loader named the SPCR's UART at I/O port 0x2e8, which cannot be used (nothing answers at that address); COM1 and the screen until the SPCR is read",
                 "origin-kernel: console: the ACPI SPCR names a UART at I/O port 0x2e8 that cannot be used (nothing answers at that address); the UART stays at I/O port 0x3f8",
                 "origin-kernel: allocated, wrote and freed 3 frames at ",
             ]),
@@ -4244,6 +4422,8 @@ fn console_scenarios() -> Vec<Scenario> {
             "console: SPCR naming registers in RAM",
             Capture::Com1,
             console_markers(&[
+                "origin-boot: console: the SPCR names a UART in memory space at 0x1000000: the kernel moves to it once its page tables are live; the kernel's console starts on COM1 and the screen",
+                KERNEL_NO_LOADER_UART,
                 "origin-kernel: console: the ACPI SPCR names a UART at physical address 0x1000000 (registers 4 bytes apart, 4 bytes wide) that cannot be used (its registers are in RAM); the UART stays at I/O port 0x3f8",
                 "origin-kernel: allocated, wrote and freed 3 frames at ",
             ]),
@@ -4394,7 +4574,7 @@ fn large_runs(base: &Settings) -> Vec<MachineRun> {
 fn boot_rented(base: &Settings) -> Result {
     boot_machines(rented_runs(base))?;
     println!(
-        "xtask: boot-rented passed (both IOMMUs, {} of RAM, rental B's board's table shapes)",
+        "xtask: boot-rented passed (both IOMMUs, {} of RAM, rental B's board's table shapes; and with the kernel's reading of the SPCR refused, under the AMD IOMMU)",
         base.large_memory().qemu()
     );
     Ok(())
@@ -4403,7 +4583,7 @@ fn boot_rented(base: &Settings) -> Result {
 /// [`boot_rented`]'s machines.
 fn rented_runs(base: &Settings) -> Vec<MachineRun> {
     let memory = base.large_memory();
-    iommus()
+    let mut runs: Vec<MachineRun> = iommus()
         .into_iter()
         .map(|(name, iommu)| MachineRun {
             said: format!(
@@ -4413,7 +4593,7 @@ fn rented_runs(base: &Settings) -> Vec<MachineRun> {
             settings: Settings {
                 iommu,
                 memory,
-                shape: true,
+                shape: Shape::Rented,
                 only: KERNEL_BOOT.into(),
                 ..base.clone()
             },
@@ -4422,7 +4602,27 @@ fn rented_runs(base: &Settings) -> Vec<MachineRun> {
                 memory.qemu()
             ),
         })
-        .collect()
+        .collect();
+    // TASKS item 84: rental B's case, the loader reading the SPCR that the kernel cannot, under
+    // the board's IOMMU alone.
+    runs.push(MachineRun {
+        said: format!(
+            "xtask: boot-rented: the AMD IOMMU, {} of RAM, rental B's board's table shapes, the kernel's reading of the SPCR refused",
+            memory.qemu()
+        ),
+        settings: Settings {
+            iommu: Iommu::Amd,
+            memory,
+            shape: Shape::KernelRefused,
+            only: KERNEL_BOOT.into(),
+            ..base.clone()
+        },
+        failed: format!(
+            "boot-test on rental B's board's shapes with the kernel's reading of the SPCR refused, {} of RAM and the AMD IOMMU",
+            memory.qemu()
+        ),
+    });
+    runs
 }
 
 /// Runs the kernel boot on the ACPI machine (`ORIGIN_QEMU_ACPI=on`; TASKS item 62; ADR-0019 A6
@@ -6279,7 +6479,7 @@ fn stage(kernel: &[u8], loader: Loader, settings: &Settings) -> Result<Staged> {
     // Where the loader looks for the Framekernel (ADR-0002 B1).
     let origin_dir = esp.join("EFI").join("ORIGIN");
     fs::create_dir_all(&origin_dir).map_err(|e| format!("{}: {e}", origin_dir.display()))?;
-    if settings.reserved || settings.shape {
+    if settings.reserved || settings.shape.is_on() {
         // TEST ONLY (TASKS items 40 and 83): the application that plants firmware-reserved
         // memory, and shapes the tables as rental B's board has them, starts first, and starts
         // the unchanged loader from \EFI\ORIGIN\LOADER.EFI.
@@ -6293,10 +6493,13 @@ fn stage(kernel: &[u8], loader: Loader, settings: &Settings) -> Result<Staged> {
         } else {
             Vec::new()
         };
-        let shape = if settings.shape {
-            RENTED_SHAPE
-        } else {
-            origin_test_reserved_memory::Shape::default()
+        let shape = match settings.shape {
+            Shape::Off => origin_test_reserved_memory::Shape::default(),
+            Shape::Rented => RENTED_SHAPE,
+            Shape::KernelRefused => origin_test_reserved_memory::Shape {
+                rsdp_in_ram: true,
+                ..RENTED_SHAPE
+            },
         };
         let mut config = vec![0u8; 1024];
         let len = origin_test_reserved_memory::encode(&regions, shape, &mut config)
@@ -6989,16 +7192,18 @@ mod rented_scenario_tests {
     #[test]
     fn the_rented_scenario_holds_its_markers() {
         let settings = Settings {
-            shape: true,
+            shape: Shape::Rented,
             memory: Memory::gib(64),
             ..Settings::default()
         };
         let scenario = boot_scenario(&settings);
         assert_eq!(scenario.capture, Capture::SpcrUart);
         let has = |m: &str| scenario.markers.iter().any(|x| x == m);
+        assert!(!has(KERNEL_NO_LOADER_UART));
+        assert!(!scenario.markers.iter().any(|m| m.contains(REPLAYED)));
         for required in [
-            MOVED_LINE,
-            "origin-kernel: console: the UART is now at I/O port 0x2f8, as the firmware set it; ",
+            KERNEL_WRITES_COM2,
+            TAKEN_OVER_LINE,
             "origin-kernel: acpi: FPDT rev 1",
             "origin-kernel: acpi: FBPT, 56 bytes: checked: 1 records",
             "origin-kernel: acpi: S3PT, 32 bytes: checked: 1 records",
@@ -7021,7 +7226,8 @@ mod rented_scenario_tests {
         );
         assert!(!has(HANDOVER_LINE));
         let at = |m: &str| scenario.markers.iter().position(|x| x == m).unwrap();
-        assert!(at(MOVED_LINE) < at("origin-kernel: acpi: FPDT rev 1"));
+        assert!(at(KERNEL_WRITES_COM2) < at(TAKEN_OVER_LINE));
+        assert!(at(TAKEN_OVER_LINE) < at("origin-kernel: acpi: FPDT rev 1"));
         assert!(at("origin-kernel: acpi: FPDT rev 1") < at("origin-kernel: acpi: FADT: "));
         assert!(at("origin-kernel: acpi: FADT: ") < at("; 3 kept"));
         let com1 = rented_firmware_markers(&settings);
@@ -7030,7 +7236,38 @@ mod rented_scenario_tests {
             com1.iter()
                 .any(|m| m == "origin-test-reserved: starting the loader")
         );
+        assert!(com1.iter().any(|m| m == LOADER_NAMES_COM2));
+        assert!(!com1.iter().any(|m| m == LOADER_NO_SPCR));
         assert!(!com1.iter().any(|m| m.starts_with("xtask: the marker ")));
+    }
+
+    /// TASKS item 84's machine with the kernel's reading refused: held to the console alone, the
+    /// UART the loader named carrying the refusal and the verdict, and COM1 the loader's line and
+    /// the RSDP in loader data.
+    #[test]
+    fn the_refused_machine_holds_the_console() {
+        let settings = Settings {
+            shape: Shape::KernelRefused,
+            memory: Memory::gib(64),
+            ..Settings::default()
+        };
+        let scenario = boot_scenario(&settings);
+        assert_eq!(scenario.capture, Capture::SpcrUart);
+        assert_eq!(scenario.markers[1], KERNEL_WRITES_COM2);
+        assert_eq!(scenario.markers[2], REFUSED_STAYS);
+        assert_eq!(scenario.markers.last().map(String::as_str), Some(HALT_LINE));
+        assert!(scenario.stderr.is_empty());
+        assert!(!scenario.failures.iter().any(|f| f.ends_with(" failed")));
+        let com1 = rented_firmware_markers(&settings);
+        assert!(com1.iter().any(|m| m == LOADER_NAMES_COM2));
+        assert!(
+            com1.iter()
+                .any(|m| m.contains("(loader data, RAM the kernel owns)"))
+        );
+        let runs = rented_runs(&settings);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[2].settings.shape, Shape::KernelRefused);
+        assert_eq!(runs[2].settings.iommu, Iommu::Amd);
     }
 }
 
