@@ -243,7 +243,7 @@ use crate::runqueue::RunQueue;
 use crate::shootdown::{
     Confirmation, Held, Request, Rounds, Scope, Shootdown, Stalled, TlbHardware,
 };
-use crate::slots::{Reclaim, Slots};
+use crate::slots::{Reclaim, Slots, State as SlotState};
 use crate::wait::{Scheduler, TimedOut, WaitQueue};
 use crate::{RwLock, SpinLock};
 
@@ -2284,6 +2284,311 @@ fn slots_reclaimed_slot_is_taken_only_after_its_shootdown() {
                 "{NO_ANSWER}"
             );
             world.finish(vec![holding, taking]);
+        },
+    );
+}
+
+// ---------------------------------------------------------------- a reclaim that stalls (TASKS item 73)
+
+/// What a model says when a slot whose shootdown stalled was never given back.
+const NEVER_GIVEN_BACK: &str = "a stalled slot was never given back";
+/// What a model says when what one unmap returned was released twice, or never.
+const NOT_ONCE: &str = "what an unmap returned was not released exactly once";
+/// What a model says when two slots were out of the tables and not yet free at once.
+const TWO_OUT: &str = "a second slot was unmapped while one waited";
+
+/// The one-slot region of the model above, reclaimed by a processor that gives up on a shootdown
+/// after [`IMPATIENCE`] polls, while another holds the page's translation and touches the frame,
+/// taking its interrupts late. (That a waiting slot is never taken is a host test of `slots.rs`:
+/// a taker here multiplies the search.) If the reclaim's shootdown
+/// stalls, the slot waits with its frame. Before the processor that stalled answers, the same
+/// processor shoots down another page, so the late answer may serve that request and keep this
+/// page's translation: that the processor has answered says nothing of what it dropped. Then a
+/// reclaim asks again with patience. What the slot held is released once, after every access
+/// through the old translation (Loom's cell), and by then no processor holds that translation.
+/// The controls `slot_released_on_a_stall` and
+/// `slot_freed_on_an_answer_without_a_fresh_shootdown` fail it.
+#[test]
+fn slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown() {
+    check(
+        "slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, holder) = (ImpatientCpu(tlb_cpu(&world, 0)), tlb_cpu(&world, 1));
+            world.shootdown.mark_online(&near);
+            world.shootdown.mark_online(&holder);
+            world.tlb[1].store(true, Relaxed);
+            let slots = Arc::new(Slots::<1, 0, Arc<ModelFrame>>::new());
+            let taken = slots.take(1).expect("the slot is free");
+            slots.give_back(taken.slot, false);
+            let frame = Arc::new(ModelFrame::new(0));
+            let holding = {
+                let (me, frame) = (holder.clone(), Arc::clone(&frame));
+                (
+                    1,
+                    thread::spawn(move || {
+                        me.touch(&frame);
+                        loop {
+                            me.world.kick[1].wait();
+                            if me.world.stop.load(Relaxed) {
+                                return;
+                            }
+                            me.world.shootdown.service(&me);
+                            me.touch(&frame);
+                        }
+                    }),
+                )
+            };
+            let released = core::cell::Cell::new(0u32);
+            let release = |frame: Arc<ModelFrame>| {
+                released.set(released.get() + 1);
+                reuse(&frame);
+            };
+            let first = slots.reclaim(
+                |_, _| {
+                    world.pte.store(0, Relaxed);
+                    Arc::clone(&frame)
+                },
+                |_, _| {
+                    world
+                        .shootdown
+                        .shoot(&near, Request::page(THE_PAGE), Scope::Kernel)
+                },
+                |_| unreachable!("no slot waits yet"),
+                release,
+            );
+            match first {
+                Some(Reclaim::Freed { asked_again: 0, .. }) => {}
+                Some(Reclaim::Stalled {
+                    stall,
+                    asked_again: 0,
+                }) => {
+                    assert_eq!(released.get(), 0, "released after a stall");
+                    assert_eq!(slots.state(0), Some(SlotState::Waiting));
+                    // Another request, for another page, before the late answer.
+                    let _ = world
+                        .shootdown
+                        .shoot(&near, Request::page(NEXT_PAGE), Scope::Kernel);
+                    while !world.shootdown.answered(stall) {
+                        crate::prim::spin_loop();
+                    }
+                    let again = slots.reclaim(
+                        |_, _| unreachable!("a waiting slot is not unmapped again"),
+                        |_, _| {
+                            world
+                                .shootdown
+                                .shoot(&near.0, Request::page(THE_PAGE), Scope::Kernel)
+                        },
+                        |stall| world.shootdown.answered(stall),
+                        release,
+                    );
+                    assert!(
+                        matches!(again, Some(Reclaim::Freed { asked_again: 1, .. })),
+                        "{NEVER_GIVEN_BACK}: {again:?}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(released.get(), 1, "{NOT_ONCE}");
+            assert!(!holder.holds(), "{STALE}");
+            assert_eq!(slots.state(0), Some(SlotState::Free));
+            world.finish(vec![holding]);
+        },
+    );
+}
+
+/// A slot waits after a stall (its first shootdown stood in for by one that stalls, on a
+/// processor that has answered since), and two processors reclaim at once with shootdowns that
+/// complete: one asks again and gives the slot back, the other does nothing, finding the reclaim
+/// role held or the work done. What the slot held is released once, and the slot ends Free. The
+/// control `the_reclaim_role_never_refused` fails it.
+#[test]
+fn slots_two_reclaimers_and_a_waiting_slot() {
+    check(
+        "slots_two_reclaimers_and_a_waiting_slot",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let slots = Arc::new(Slots::<1, 0, Arc<AtomicU32>>::new());
+            slots.take(1).expect("the slot is free");
+            slots.give_back(0, false);
+            let released = Arc::new(AtomicU32::new(0));
+            let stalled = slots.reclaim(
+                |_, _| Arc::clone(&released),
+                |_, _| {
+                    Err(Stalled {
+                        cpu: 1,
+                        generation: 0,
+                    })
+                },
+                |_| unreachable!("no slot waits yet"),
+                |_| unreachable!("a stall releases nothing"),
+            );
+            assert!(matches!(stalled, Some(Reclaim::Stalled { .. })));
+            let reclaimer = |slots: Arc<Slots<1, 0, Arc<AtomicU32>>>| {
+                thread::spawn(move || {
+                    slots.reclaim(
+                        |_, _| unreachable!("a waiting slot is not unmapped again"),
+                        |_, _| {
+                            Ok(crate::shootdown::Completed {
+                                processors: 1,
+                                ticks: 0,
+                            })
+                        },
+                        |_| true,
+                        |kept| {
+                            kept.fetch_add(1, Relaxed);
+                        },
+                    )
+                })
+            };
+            let (a, b) = (reclaimer(Arc::clone(&slots)), reclaimer(Arc::clone(&slots)));
+            let outcomes = [a.join().unwrap(), b.join().unwrap()];
+            let freed = outcomes
+                .iter()
+                .filter(|o| matches!(o, Some(Reclaim::Freed { asked_again: 1, .. })))
+                .count();
+            assert_eq!(freed, 1, "{NOT_ONCE}: {outcomes:?}");
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|o| matches!(o, None | Some(Reclaim::Busy | Reclaim::Freed { .. }))),
+                "{outcomes:?}"
+            );
+            assert_eq!(released.load(Relaxed), 1, "{NOT_ONCE}");
+            assert_eq!(slots.state(0), Some(SlotState::Free), "{NEVER_GIVEN_BACK}");
+            assert_eq!(slots.counts(), crate::slots::Counts::default());
+        },
+    );
+}
+
+/// What one unmap returned, in [`slots_at_most_one_slot_out_of_the_tables`]: counted out of the
+/// tables while it lives, and released once, or the model fails.
+struct OutOfTables {
+    out: Arc<AtomicU32>,
+    released: bool,
+}
+
+impl OutOfTables {
+    /// A slot leaves the tables: none may be out already.
+    fn unmapped(out: &Arc<AtomicU32>) -> Self {
+        assert_eq!(out.fetch_add(1, Relaxed), 0, "{TWO_OUT}");
+        Self {
+            out: Arc::clone(out),
+            released: false,
+        }
+    }
+
+    fn release(mut self) {
+        self.out.fetch_sub(1, Relaxed);
+        self.released = true;
+    }
+}
+
+impl Drop for OutOfTables {
+    fn drop(&mut self) {
+        // Not while a failed assertion unwinds: its message is the model's verdict.
+        if !std::thread::panicking() {
+            assert!(self.released, "{NOT_ONCE}: dropped, never released");
+        }
+    }
+}
+
+/// Two Retired slots, and two processors reclaiming at once with shootdowns that stall: one
+/// unmaps a slot and it waits; the other finds the role held, or asks the waiting slot again. At
+/// no time are two slots out of the tables and not yet free, and nothing an unmap returned is
+/// dropped without its release. Then shootdowns that complete give both back. The controls
+/// `the_reclaim_role_never_refused` and `a_slot_unmapped_while_one_waits` fail it.
+#[test]
+fn slots_at_most_one_slot_out_of_the_tables() {
+    check(
+        "slots_at_most_one_slot_out_of_the_tables",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let slots = Arc::new(Slots::<2, 0, OutOfTables>::new());
+            for slot in 0..2 {
+                slots.take(1).expect("the slots are free");
+                slots.give_back(slot, false);
+            }
+            let out = Arc::new(AtomicU32::new(0));
+            let reclaimer = |slots: Arc<Slots<2, 0, OutOfTables>>, out: Arc<AtomicU32>| {
+                thread::spawn(move || {
+                    slots.reclaim(
+                        |_, _| OutOfTables::unmapped(&out),
+                        |_, _| {
+                            Err(Stalled {
+                                cpu: 1,
+                                generation: 0,
+                            })
+                        },
+                        |_| true,
+                        OutOfTables::release,
+                    )
+                })
+            };
+            let a = reclaimer(Arc::clone(&slots), Arc::clone(&out));
+            let b = reclaimer(Arc::clone(&slots), Arc::clone(&out));
+            a.join().unwrap();
+            b.join().unwrap();
+            assert_eq!(out.load(Relaxed), 1, "one slot waits");
+            let mut freed = 0;
+            while let Some(outcome) = slots.reclaim(
+                |_, _| OutOfTables::unmapped(&out),
+                |_, _| {
+                    Ok(crate::shootdown::Completed {
+                        processors: 1,
+                        ticks: 0,
+                    })
+                },
+                |_| true,
+                OutOfTables::release,
+            ) {
+                assert!(matches!(outcome, Reclaim::Freed { .. }), "{outcome:?}");
+                freed += 1;
+            }
+            assert_eq!(freed, 2);
+            assert_eq!(out.load(Relaxed), 0);
+            assert_eq!(slots.counts(), crate::slots::Counts::default());
+        },
+    );
+}
+
+/// A shootdown of one page, the only request, stalls on a processor that takes its interrupts
+/// late. `answered` turns true once that processor has served, and not before: here, with no
+/// other request, serving it dropped the page, so the translation is gone by then. In general
+/// an answer says only that the processor served some request since, maybe another page's, and
+/// is never proof that this page was dropped: what was mapped is released only after a fresh
+/// shootdown completes (`Slots::reclaim`; the model
+/// `slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown`). The control
+/// `answered_before_the_processor_served` fails it.
+#[test]
+fn shootdown_answered_only_after_the_stalled_processor_served() {
+    check(
+        "shootdown_answered_only_after_the_stalled_processor_served",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let world = TlbWorld::new();
+            let (near, late) = (ImpatientCpu(tlb_cpu(&world, 0)), tlb_cpu(&world, 1));
+            world.shootdown.mark_online(&near);
+            world.shootdown.mark_online(&late);
+            world.tlb[1].store(true, Relaxed);
+            let serving = late.serving();
+            world.pte.store(0, Relaxed);
+            if let Err(stall) = world
+                .shootdown
+                .shoot(&near, Request::page(THE_PAGE), Scope::Kernel)
+            {
+                assert_eq!(stall.cpu, 1);
+                while !world.shootdown.answered(stall) {
+                    crate::prim::spin_loop();
+                }
+                assert!(!late.holds(), "{STALE}");
+            }
+            world.finish(vec![serving]);
         },
     );
 }

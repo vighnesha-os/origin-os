@@ -114,6 +114,20 @@ const GIVEN_BACK: &[&str] = &[
 /// A change that returned a stall left its space confirmed.
 const FORGOTTEN: &[&str] = &["a change that stalled left its space confirmed"];
 
+/// What the models of a reclaim that stalls report (`models.rs`; TASKS item 73): what a slot held
+/// reused while a processor could still reach it, a slot never given back or given back twice,
+/// and two slots out of the tables at once.
+const WAITING_REUSED: &[&str] = &[
+    "Causality violation",
+    "a processor kept a translation the shootdown took away",
+    "what an unmap returned was not released exactly once",
+];
+const NEVER_GIVEN_BACK: &[&str] = &[
+    "a stalled slot was never given back",
+    "what an unmap returned was not released exactly once",
+];
+const TWO_OUT: &[&str] = &["a second slot was unmapped while one waited"];
+
 /// What the port models report (`models.rs`): a packet lost or doubled, a binding left armed
 /// after its handle closed, and a closed port left holding something.
 const PORT_LOST: &[&str] = &["a signal was lost, or one binding made two packets"];
@@ -1070,6 +1084,60 @@ const CONTROLS: &[Control] = &[
                     .find(|&s| matches!(table.state(s), Some(State::Free | State::Reclaiming)))?;
 ",
         models: &[("slots_reclaimed_slot_is_taken_only_after_its_shootdown", STALE)],
+    },
+    Control {
+        // TASKS item 73: a stall taken for an answer, so what the slot held goes back while the
+        // processor that stalled may still reach it.
+        name: "slot_released_on_a_stall",
+        file: SLOTS,
+        from: "                let outcome = shoot(slot, pages);\n                match outcome {\n",
+        to: "                let outcome = shoot(slot, pages);\n                match outcome.or(Ok(Completed { processors: 0, ticks: 0 })) {\n",
+        models: &[(
+            "slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown",
+            WAITING_REUSED,
+        )],
+    },
+    Control {
+        // TASKS item 73: a waiting slot given back once the processor that stalled has answered,
+        // with no fresh shootdown: its late answer may have served another page's request.
+        name: "slot_freed_on_an_answer_without_a_fresh_shootdown",
+        file: SLOTS,
+        from: "                self.table.lock().set(slot, State::Reclaiming);\n                let outcome = shoot(slot, pages);\n",
+        to: "                self.table.lock().set(slot, State::Reclaiming);\n                let outcome: Result<Completed, Stalled> = Ok(Completed { processors: 0, ticks: 0 });\n",
+        models: &[(
+            "slots_stalled_reclaim_is_given_back_only_after_a_fresh_shootdown",
+            WAITING_REUSED,
+        )],
+    },
+    Control {
+        // TASKS item 73, Q2: two reclaims at once.
+        name: "the_reclaim_role_never_refused",
+        file: SLOTS,
+        from: "        flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)\n            .ok()\n            .map(|_| Self(flag))\n",
+        to: "        let _ = flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed);\n        Some(Self(flag))\n",
+        models: &[
+            ("slots_two_reclaimers_and_a_waiting_slot", NEVER_GIVEN_BACK),
+            ("slots_at_most_one_slot_out_of_the_tables", TWO_OUT),
+        ],
+    },
+    Control {
+        // TASKS item 73, Q2: a Retired slot unmapped while another waits.
+        name: "a_slot_unmapped_while_one_waits",
+        file: SLOTS,
+        from: "        if let Some(w) = &self.waiting {\n",
+        to: "        if let Some(w) = self.waiting.as_ref().filter(|_| false) {\n",
+        models: &[("slots_at_most_one_slot_out_of_the_tables", TWO_OUT)],
+    },
+    Control {
+        // TASKS item 73, Q1: a processor counted as having answered before it served.
+        name: "answered_before_the_processor_served",
+        file: SHOOTDOWN,
+        from: ".is_none_or(|served| served.load(Ordering::Acquire) >= stall.generation)",
+        to: ".is_none_or(|served| served.load(Ordering::Acquire) + 1 >= stall.generation)",
+        models: &[(
+            "shootdown_answered_only_after_the_stalled_processor_served",
+            STALE,
+        )],
     },
     Control {
         // S3-5b's review, finding A, case a, as the code was: a change returns when the flush
