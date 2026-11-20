@@ -278,8 +278,131 @@ impl<S, const N: usize> Block<S, N> {
     }
 }
 
+/// The most times [`wake`] looks for its thread under a queue's lock (ADR-0020 S1).
+pub const WAKE_TRIES: u32 = 64;
+
+/// What [`wake`] needs of the kernel: each processor's run queue, under its lock.
+pub trait Queues {
+    /// A processor's run queue.
+    type Queue;
+
+    /// Runs `f` on processor `cpu`'s run queue with that queue's lock held (in the kernel, with
+    /// interrupts off), or returns `None` if there is no such processor.
+    fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut Self::Queue) -> R) -> Option<R>;
+
+    /// Wakes the thread in `slot` of `queue`, as `RunQueue::wake` does for the slot's own
+    /// generation: whether a blocked thread became ready. A thread not blocked keeps the wake-up
+    /// for its next block.
+    fn wake_slot(queue: &mut Self::Queue, slot: u16) -> bool;
+}
+
+/// How a [`wake`] ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The wake-up reached the thread, in processor `cpu`'s queue. `ready`: it was blocked and is
+    /// now ready, so that processor should reschedule; otherwise it keeps the wake-up for its
+    /// next block.
+    Reached {
+        /// Whether a blocked thread became ready.
+        ready: bool,
+        /// The processor whose queue holds it.
+        cpu: u32,
+    },
+    /// The record holds another thread: the name's thread has been reaped.
+    Stale,
+    /// The record's location is clear: its thread has exited, and has no wake-up to keep.
+    Gone,
+    /// The location had changed at each of [`WAKE_TRIES`] looks under the lock it named.
+    Exhausted,
+}
+
+/// What a [`wake`] did: how it ended, and how many times it found, under the lock of the queue it
+/// had read, that the location had changed, and followed it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Wake {
+    /// How it ended.
+    pub outcome: Outcome,
+    /// Locations followed.
+    pub retries: u32,
+}
+
+// Only their names, as for `Location`.
+impl core::fmt::Debug for Outcome {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Reached { .. } => "Reached",
+            Self::Stale => "Stale",
+            Self::Gone => "Gone",
+            Self::Exhausted => "Exhausted",
+        })
+    }
+}
+
+impl core::fmt::Debug for Wake {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Wake")
+    }
+}
+
+/// Wakes the thread `record` and `generation` name, wherever it is.
+///
+/// It reads the location, takes the lock of the queue that location names, and reads the
+/// location again. If it has changed, a move or an exit completed in between: the lock is
+/// released and the wake-up follows the new location, at most [`WAKE_TRIES`] times. If it is
+/// unchanged, the thread is in that slot and cannot leave it while the lock is held; the
+/// generation is compared under the lock, and the slot is woken as `RunQueue::wake` wakes it,
+/// with its pending wake-up for a thread not yet blocked. A clear location means the thread has
+/// exited: it is waiting for nothing.
+///
+/// While no thread moves, a location changes only at a spawn and at an exit, and after an exit it
+/// stays clear until the record's next spawn: so a wake-up follows at most one location, and
+/// that only when it read its thread's location before the exit and locked after it. The kernel
+/// counts what it follows, and its boot proofs require 0 (TASKS item 92).
+pub fn wake<S, Q: Queues>(queues: &Q, record: &Record<S>, generation: u32) -> Wake {
+    let mut retries = 0;
+    while retries < WAKE_TRIES {
+        let Some(at) = record.location() else {
+            return Wake {
+                outcome: Outcome::Gone,
+                retries,
+            };
+        };
+        let looked = queues.locked(at.cpu(), |queue| {
+            // A move or an exit since the first read: this queue no longer holds the thread.
+            if record.location() != Some(at) {
+                return None;
+            }
+            Some(if record.generation() == generation {
+                Outcome::Reached {
+                    ready: Q::wake_slot(queue, at.slot()),
+                    cpu: at.cpu(),
+                }
+            } else {
+                Outcome::Stale
+            })
+        });
+        match looked {
+            Some(Some(outcome)) => return Wake { outcome, retries },
+            Some(None) => retries = retries.saturating_add(1),
+            // A location names only a processor the kernel queued the thread on.
+            None => {
+                return Wake {
+                    outcome: Outcome::Gone,
+                    retries,
+                };
+            }
+        }
+    }
+    Wake {
+        outcome: Outcome::Exhausted,
+        retries,
+    }
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
+    use core::cell::{Cell, RefCell};
+
     use super::*;
 
     #[test]
@@ -396,5 +519,186 @@ mod tests {
         assert_eq!(block.take(), None);
         assert!(block.give_back(63));
         assert_eq!(block.take(), Some((63, 2)));
+    }
+
+    /// Processors the stub has: a location past them names no queue.
+    const CPUS: u32 = 1000;
+
+    /// What a stub queue was asked: its processor, and every slot woken there so far.
+    struct Calls {
+        cpu: u32,
+        woken: Vec<(u32, u16)>,
+    }
+
+    /// Queues that count their locks and wake-ups, and can change the record's location as a lock
+    /// is taken, after `wake` has read it: a move, or an exit, completing in between.
+    struct Stub<'a> {
+        record: &'a Record<u32>,
+        /// Locks still to come before which the record moves to the next processor.
+        moves: Cell<u32>,
+        /// Whether the record's thread exits before the next lock.
+        exits: Cell<bool>,
+        locks: Cell<u32>,
+        woken: RefCell<Vec<(u32, u16)>>,
+    }
+
+    impl<'a> Stub<'a> {
+        fn new(record: &'a Record<u32>) -> Self {
+            Self {
+                record,
+                moves: Cell::new(0),
+                exits: Cell::new(false),
+                locks: Cell::new(0),
+                woken: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Queues for Stub<'_> {
+        type Queue = Calls;
+
+        fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut Calls) -> R) -> Option<R> {
+            if cpu >= CPUS {
+                return None;
+            }
+            self.locks.set(self.locks.get() + 1);
+            if self.exits.replace(false) {
+                self.record.clear_location();
+            } else if self.moves.get() > 0 {
+                self.moves.set(self.moves.get() - 1);
+                let at = self.record.location().expect("a located thread moves");
+                self.record
+                    .set_location(Location::new(at.cpu() + 1, at.slot()));
+            }
+            let mut calls = Calls {
+                cpu,
+                woken: self.woken.take(),
+            };
+            let result = f(&mut calls);
+            self.woken.replace(calls.woken);
+            Some(result)
+        }
+
+        fn wake_slot(queue: &mut Calls, slot: u16) -> bool {
+            queue.woken.push((queue.cpu, slot));
+            true
+        }
+    }
+
+    /// A record taken from a block and located at slot 5 of processor 2, and its generation.
+    fn located(block: &Block<u32, 2>) -> (&Record<u32>, u32) {
+        let (index, generation) = block.take().expect("a free record");
+        let record = block.get(index).expect("taken from the block");
+        record.set_location(Location::new(2, 5));
+        (record, generation)
+    }
+
+    const fn reached(cpu: u32, retries: u32) -> Wake {
+        Wake {
+            outcome: Outcome::Reached { ready: true, cpu },
+            retries,
+        }
+    }
+
+    #[test]
+    fn a_wake_up_reaches_a_thread_that_stays_put_at_the_first_look() {
+        let block = Block::new();
+        let (record, generation) = located(&block);
+        let stub = Stub::new(record);
+        assert_eq!(wake(&stub, record, generation), reached(2, 0));
+        assert_eq!(stub.locks.get(), 1);
+        assert_eq!(*stub.woken.borrow(), [(2, 5)]);
+    }
+
+    #[test]
+    fn a_wake_up_follows_a_location_that_changed_before_its_lock() {
+        let block = Block::new();
+        let (record, generation) = located(&block);
+        let stub = Stub::new(record);
+        stub.moves.set(1);
+        assert_eq!(wake(&stub, record, generation), reached(3, 1));
+        assert_eq!(stub.locks.get(), 2);
+        assert_eq!(*stub.woken.borrow(), [(3, 5)], "woken where it went, once");
+    }
+
+    #[test]
+    fn a_wake_up_finds_no_one_at_a_clear_location() {
+        let block = Block::new();
+        let (record, generation) = located(&block);
+        record.clear_location();
+        let stub = Stub::new(record);
+        let gone = Wake {
+            outcome: Outcome::Gone,
+            retries: 0,
+        };
+        assert_eq!(wake(&stub, record, generation), gone);
+        assert_eq!(
+            stub.locks.get(),
+            0,
+            "no queue is locked for an exited thread"
+        );
+        // The one way a wake-up follows a location while no thread moves: it read the location
+        // before its thread's exit and locked after it.
+        record.set_location(Location::new(2, 5));
+        stub.exits.set(true);
+        let followed = Wake {
+            outcome: Outcome::Gone,
+            retries: 1,
+        };
+        assert_eq!(wake(&stub, record, generation), followed);
+        assert_eq!(stub.locks.get(), 1);
+        assert!(stub.woken.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_stale_name_wakes_no_one() {
+        let block = Block::new();
+        let (record, generation) = located(&block);
+        let stub = Stub::new(record);
+        let stale = Wake {
+            outcome: Outcome::Stale,
+            retries: 0,
+        };
+        assert_eq!(wake(&stub, record, generation.wrapping_sub(1)), stale);
+        assert_eq!(wake(&stub, record, generation.wrapping_add(1)), stale);
+        assert_eq!(stub.locks.get(), 2, "compared under the lock");
+        assert!(stub.woken.borrow().is_empty(), "the slot is never woken");
+    }
+
+    #[test]
+    fn a_wake_up_whose_thread_moves_at_every_look_gives_up_after_the_last_try() {
+        let block = Block::new();
+        let (record, generation) = located(&block);
+        let stub = Stub::new(record);
+        stub.moves.set(u32::MAX);
+        let exhausted = Wake {
+            outcome: Outcome::Exhausted,
+            retries: WAKE_TRIES,
+        };
+        assert_eq!(wake(&stub, record, generation), exhausted);
+        assert_eq!(stub.locks.get(), WAKE_TRIES);
+        assert!(stub.woken.borrow().is_empty());
+        // One move fewer than the tries: the last look finds it.
+        let block = Block::new();
+        let (record, generation) = located(&block);
+        let stub = Stub::new(record);
+        stub.moves.set(WAKE_TRIES - 1);
+        assert_eq!(
+            wake(&stub, record, generation),
+            reached(2 + WAKE_TRIES - 1, WAKE_TRIES - 1)
+        );
+    }
+
+    #[test]
+    fn a_location_naming_no_processor_is_no_one_to_wake() {
+        let block = Block::new();
+        let (record, generation) = located(&block);
+        record.set_location(Location::new(CPUS, 0));
+        let stub = Stub::new(record);
+        let gone = Wake {
+            outcome: Outcome::Gone,
+            retries: 0,
+        };
+        assert_eq!(wake(&stub, record, generation), gone);
     }
 }
