@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested under QEMU, and was merged into `claude/interesting-carson-ae7c83` on 2026-11-09 on the owner's word. Nothing here has shipped. **Amendments 1 and 2 (below, to E3) were accepted by the owner on 2026-11-09**, as proposed (decision sheet items 52 and 53). |
+| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested under QEMU, and was merged into `claude/interesting-carson-ae7c83` on 2026-11-09 on the owner's word. Nothing here has shipped. **Amendments 1 and 2 (below, to E3) were accepted by the owner on 2026-11-09**, as proposed (decision sheet items 52 and 53). **Amendment 3 (below, to E1 and E4: boot info 0.8 names the SPCR's UART from the loader) was accepted by the owner on 2026-11-20** (decision sheet item 317). It is not built; TASKS item 84 builds it. |
 | Requires | CLAUDE.md §13 (checked parsing), §19 (boot-info structure, early diagnostics), §51 (font provenance), §58 (threat-model privileged interfaces), §69 (diagnostics), §74, rules 14, 30 and 40 |
 | Implements | ADR-0009 H6, third bullet: a console that does not depend on a 16550 at `0x3F8` |
 | Code | `boot/info` (`Framebuffer`), `boot/uefi` (the Graphics Output Protocol hand-off), `framekernel/paging` (the mapping), `framekernel/src/{fbconsole,font,spcr,serial,console}.rs`, `developer-tools/xtask` |
@@ -40,6 +40,8 @@ Every line goes to the framebuffer, then to the UART, under the existing console
 
 ### E4. The UART: from the SPCR when the firmware names one
 
+(Amendment 3, below, adds the SPCR's UART from the loader, written to from the kernel's first line; the move described here still rules once the kernel's page tables are live.)
+
 The console starts on COM1, because the ACPI tables cannot be mapped until the kernel's own page tables are live. Then `console::adopt_firmware_uart` reads the SPCR (`framekernel::spcr`, parsed as untrusted input), and if the firmware names a UART this kernel can drive, moves the console there and sends it everything printed so far (kept in an 8 KiB log), so its log is complete. COM1 is only used when the firmware gives nothing better: no table, a table it refuses, a port the table names where nothing answers (a floating bus reads 0xFF), registers the memory map says are RAM, or a UART that answers but will not take the replayed log (then COM1 stays).
 
 The UART's speed: if the table states both a rate and the UART's clock (revision 3 and later), that rate is programmed. Otherwise a divisor latch the firmware programmed is left alone, because the table's rate is "the baud rate the BIOS used", so a programmed latch already holds it, whatever the clock behind it. A latch of zero (never programmed) gets the table's rate on the PC clock if the UART is in I/O space, and is left alone in memory space, where the clock could be anything. COM1's settings are read at entry before the console programs it, so "as is" for the COM1 port means what the firmware left, not the kernel's 115 200 baud; a latch of zero is never restored.
@@ -63,7 +65,7 @@ No framebuffer (no GOP, Blt-only, an unusable or unmapped one) leaves the UART a
 | E2: the loader maps nothing, the kernel maps the framebuffer itself | One less loader step | The screen would start only after the kernel's page tables, losing the earliest lines |
 | E2: the framebuffer in the direct map | One address, no new window | ADR-0004 keeps MMIO out of the direct map, and KASLR's slide would have to allow for a framebuffer at any address |
 | E3: scrolling | Newest text always at the bottom | Each line would read or rewrite the whole screen, with interrupts off |
-| E4: read the SPCR in the loader and pass it in boot info | The right UART from the first line | A parser for untrusted data in the loader, and more boot-info ABI; early lines are replayed anyway, and the screen shows them meanwhile |
+| E4: read the SPCR in the loader and pass it in boot info | The right UART from the first line | A parser for untrusted data in the loader, and more boot-info ABI; early lines are replayed anyway, and the screen shows them meanwhile. (Re-opened and accepted by Amendment 3, item 317, after rental B showed a server where neither holds.) |
 | E4: wait for the SPCR before writing anything to any UART | 0x3F8 is never touched when the firmware names something else | A hang before `init_paging` would show nothing on serial, a regression on every machine with a real COM1 |
 
 ## Evidence
@@ -157,3 +159,58 @@ The framebuffer mapping is kernel-only, writable and never executable, in the ke
 | One queue for both sinks | Less memory | A slow screen would hold the UART back and the other way round; today each sink can fall behind on its own |
 
 **Evidence.** `docs/engineering/SOURCE_PROVENANCE.md`, "The console: the UART a section at a time". QEMU's UART is effectively instant: what the boot proofs show is the bound in bytes, the windows between sections and the order on the wire, not the real time a section takes or the time a real line takes to drain.
+
+## Amendment 3 (Accepted by the owner, 2026-11-20): the loader names the SPCR's UART in boot info 0.8
+
+**Status: Accepted by the owner on 2026-11-20 ("Accept 317"), as proposed (decision sheet item 317). Not built; TASKS item 84 builds it.**
+
+**Why.** E4 starts the console on COM1, and moves it to the SPCR's UART only after the kernel's own page tables are live. Its alternatives table turned down reading the SPCR in the loader because "early lines are replayed anyway, and the screen shows them meanwhile". Rental B is the case where neither holds (2026-11-20; `docs/research/2026-11-20-rental-b-findings.md`, on `claude/rental-b-readiness-33dcba` until it lands).
+- **The machine.** On a rented server, the operator's console is the BMC's serial-over-LAN on COM2, at port `0x2F8`. COM1 is a real 16550A that nobody watches, and the screen is not captured.
+- **What ran.** Origin's loader ran to its hand-over on all three boots. No kernel line reached the console.
+- **What cannot be told.** Nothing shows whether the kernel stopped before the move, refused it, or ran to its verdict on COM1.
+
+On any server whose console is not COM1, a stop before the move is invisible.
+
+**The change to E1 and E4.**
+- **The loader.** Before `ExitBootServices`, the loader finds the SPCR through the ACPI 2.0 entry of the UEFI configuration table: the RSDP, then the XSDT.
+  - It checks the table as untrusted input (§13): checksums, lengths and every field bounded. It uses the same parser as the kernel, moved to a crate both build.
+  - If the table names a 16550-compatible UART in I/O space that the parser accepts, the loader records that UART in boot info. Otherwise it records none.
+  - Nothing about the SPCR ever stops the loader (E5).
+- **Boot info 0.8.** One fixed structure is appended, holding the UART's I/O port base and, when the table states them, its rate and clock.
+  - Its exact layout is TASKS item 84's. It is checked by `origin_boot_info` in both the loader and the kernel, as E1's `Framebuffer` is.
+  - The version in `origin-version.toml` becomes 0.8. The kernel accepts only its own version (ADR-0002 B4).
+  - The loader translates the table, so the kernel never sees an ACPI structure in boot info.
+- **The kernel.** From `kernel_main`'s first line, every line goes to that UART as well as to COM1, and to the screen as E3 and its amendments say, with Amendment 2's section-at-a-time sends.
+  - The port is claimed as the SPCR's port is claimed today, so no driver takes it later.
+  - A UART named in boot info that does not answer is given up on after one bounded wait, as E5 says, and the boot goes on.
+- **The move stays, and rules.** Once the page tables are live, `adopt_firmware_uart` reads the SPCR itself, as E4 says. The console moves where the move says and replays its log, and COM1 stops.
+  - If the move names the port boot info named, writing to COM1 simply stops.
+  - If it names another port, or refuses, the kernel says so on every port it is writing to.
+- **Memory-mapped UARTs** are not put in boot info. They need a mapping the kernel cannot make before its own page tables, so they still move as E4 says.
+
+**What it changes.**
+- `boot/info`: the new structure and the version.
+- `boot/uefi`: finding the SPCR before `ExitBootServices`.
+- The SPCR parser, moved to a crate both build.
+- `framekernel/src/console.rs` and `serial.rs`.
+- `origin-version.toml`.
+- `developer-tools/xtask`: in a boot-console scenario whose SPCR names COM2, the kernel's first line must be on COM2.
+
+**Alternatives.**
+
+| | Gain | Why not |
+|---|---|---|
+| Keep E4 as it is | No change | A stop before the move stays invisible on every server whose console is not COM1, and another rental cannot answer rental B's question |
+| Write early lines to every standard COM port that answers (`0x3F8`, `0x2F8`, `0x3E8`, `0x2E8`), until the SPCR settles it | No boot-info change | Writes to ports where nothing may be a console, and guesses at what the firmware already states |
+| The kernel reads the SPCR at its first line, through the loader's page tables | No boot-info change | E4's own reason: the ACPI tables cannot be mapped until the kernel's own page tables are live |
+
+**Trade-offs.** A parser of firmware data runs in the loader. Its checks are the kernel's own, in a shared crate. Boot info gains one structure. The SPCR is read twice, once by each, and the kernel's reading rules.
+
+**Performance cost (ADR-0018 V3).** Unmeasured, owed (cost ledger row CL46, added by TASKS item 84 when it builds this): one table walk in the loader before `ExitBootServices`, and, until the move, each line sent to one more UART.
+
+**Migration.** Boot info goes from 0.7 to 0.8. The loader and kernel are one release (§62), and a mismatched pair is refused by the version check, as for every boot-info change.
+
+**Threat model (§58).**
+- The SPCR comes from the firmware, which the boot trusts for the tables it hands over, but its contents are still parsed as untrusted (§13, E4).
+- A table naming a port the kernel would not drive is refused in the loader, and again in the kernel.
+- The early writes go only to an I/O port the table named and the parser accepted, never to a guessed one.
