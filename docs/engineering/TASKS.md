@@ -3386,7 +3386,7 @@ Both figures are owed, measured on the Mac and named as unmeasured on hardware (
 - **D7, staying.** When the move does not happen, the kernel's line names both UARTs: `…; the UART stays at I/O port 0x3f8, and the loader's at I/O port 0x2f8`. The text is unchanged when there is no loader's UART.
 - **D8, the refused machine.**
   - `ORIGIN_QEMU_SHAPE` takes `on`, `refused` or `off`. `refused` sets the TEST ONLY application's new flag (configuration version 4): the RSDP's copy goes in loader-data pages, which the loader reads under boot services and the kernel, owning that RAM, will not map.
-  - It runs as `boot-rented`'s third machine, under the AMD IOMMU, at the large machines' size.
+  - It runs as `boot-rented`'s fourth machine, under the AMD IOMMU, at the large machines' size.
   - Without the ACPI tables most of the boot's proofs cannot run, so its markers are the console's alone: the framebuffer's line, the line about the loader's UART, the refusal, the verdict and the halt, on COM2.
   - Its check (`check_refused_boot`):
     - the first two lines on COM2;
@@ -3436,3 +3436,10 @@ Both figures are owed, measured on the Mac and named as unmeasured on hardware (
 | T84-13 (Low), a second header check | The loader runs `origin-acpi-tables`' check; `origin_spcr::check` is gone | `f59e00a4` |
 | T84-14 (Informational), D1 sound | The port is read from both lines and compared. D1's acceptance is the coordinating session's to record | `90aaf055` |
 | T84-15 (Informational), a 16 MiB XSDT in the loader | The loader walks at most 64 KiB | `f59e00a4` |
+
+**Acceptance (§8): the full gates on `20bfc398`, one turn, 2026-11-20, 13:30 to 14:02 UTC, inside `cargo xtask exclusive`, QEMU 11.1.3 TCG on the development Mac.**
+- `check` passed in 665 s: 2,525 host tests passed, 0 failed, 30 ignored; Loom 74 models, 112 controls caught.
+- `boot-test` passed, 11 of 11 scenarios, in 53 s.
+- `boot-matrix` passed in 1,157 s: `boot-console` 10 of 10 and `boot-rented`'s 4 machines among its boots.
+- The identifier scan of `466d138a..20bfc398`, every message and added line of the 10 commits, found only synthetic test values (RFC 5737 addresses, a made-up server ID, a locally administered MAC, a made-up GUID), public hosts and section numbers.
+- Not run: anything under KVM, until the branch is pushed; anything on a physical machine.
