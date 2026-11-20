@@ -8,10 +8,13 @@
 //!
 //! - **`home`**: an address inside the context's own stack (its first frame's), from the moment
 //!   that frame is published ([`Contexts::publish`]) until the context has ended and its processor
-//!   has left the stack ([`Contexts::retire_ended`]). For the boot or idle flow, which has no stack
-//!   of its own in the region, it is [`BOOT_FLOW`], an address no stack contains. 0 is a free slot.
-//! - **`frame`**: the frame the trap entry may resume, while the context is suspended, and 0 while
-//!   it runs or after it ended.
+//!   has left the stack ([`Contexts::retire_ended`]), or until its publisher withdraws it, never
+//!   having made it runnable ([`Contexts::withdraw`]). For the boot or idle flow, which has no
+//!   stack of its own in the region, it is [`BOOT_FLOW`], an address no stack contains. 0 is a
+//!   free slot.
+//! - **`frame`**: the frame the trap entry may resume, while the context is suspended (a published
+//!   context waits for its first run suspended at its first frame), and 0 while it runs, after it
+//!   ended, and while a withdrawal is under way.
 //!
 //! # What covers a stack, and why no switch uncovers one
 //!
@@ -30,13 +33,36 @@
 //!
 //! - A slot is claimed by a compare-and-swap of `home` from 0 (AcqRel), and its `frame` is
 //!   stored with Release. Readers load both with Acquire.
-//! - A home is retired with a Release store of 0, made only on the context's own processor, and
-//!   only after that processor has left the stack ([`Contexts::retire_ended`]). A reader that does
-//!   not find the home has read that store or a later value. So everything the processor did on
-//!   the stack happens before whatever the reader does next, such as giving the stack back.
+//! - A `frame` word becomes 0 in two ways, each a compare-and-swap of the word from the frame
+//!   it holds: this processor's `switch` takes it to resume it, or the context's publisher, on
+//!   any processor, takes its first frame to withdraw a context it never made runnable
+//!   ([`Contexts::withdraw`]). Both are compare-and-swaps of the same word, so at most one of them
+//!   takes a given frame: a context withdrawn is never resumed, and one resumed is never
+//!   withdrawn. Nothing else writes a nonzero frame to 0, and only a claimer that has just taken a
+//!   free slot writes a frame into one whose `frame` is 0.
+//! - A home leaves the table by a Release store of 0, in one of two ways:
+//!   - **retired** on the context's own processor, only after that processor has left the stack
+//!     ([`Contexts::retire_ended`]);
+//!   - **withdrawn** by its publisher, from any processor, only after the publisher's
+//!     compare-and-swap took the first frame, so that no processor has run or ever will run on
+//!     the stack as this context.
+//!
+//!   A reader that does not find the home has read that store or a later value. So everything
+//!   the processor did on the stack, or the publisher did before withdrawing, happens before
+//!   whatever the reader does next, such as giving the stack back. A claimer that takes the slot
+//!   afterwards reads the store with its compare-and-swap, so the withdrawn context's words are
+//!   behind it and cannot overwrite the claim.
 //! - A home is claimed before anything can run on its stack: only a published frame is ever
-//!   resumed. The publisher also holds the stack exclusively when it publishes, so any later
-//!   holder's drop happens after the claim.
+//!   resumed. The publisher also holds the stack exclusively when it publishes, and until it
+//!   withdraws, so any later holder's drop happens after the claim, and after the withdrawal.
+//!
+//! **Between a withdrawal's two stores** the slot has a home and a `frame` of 0, as a running
+//! context's slot has. Nothing infers "running" from that pair: which context runs is `current`,
+//! and which ended is `ended`, both slot indexes written only by this processor's `switch` (and
+//! `ended` cleared by its retirement), and a withdrawn context is never either, since it never
+//! ran. Meanwhile [`Contexts::covers`] still finds the home, so the stack stays covered until the
+//! publisher's own drop; no claim can take the slot, whose home is not 0; and no `switch` can
+//! match it, since a `switch` never looks for a frame of 0.
 //!
 //! On x86-64, Acquire loads and Release stores are plain moves, and the compare-and-swap is the
 //! `lock cmpxchg` the table needed before. The Loom models (`models.rs`, "contexts") check these
@@ -45,6 +71,8 @@
 //! # Who calls what
 //!
 //! - [`Contexts::publish`]: any processor, for a thread it is placing on this one.
+//! - [`Contexts::withdraw`]: the publisher, on any processor, for a context it published and
+//!   never made runnable (a spawn that its run queue then refused; TASKS item 75).
 //! - [`Contexts::switch`] and [`Contexts::retire_ended`]: this processor only, and **with
 //!   interrupts off**. `switch` runs from the trap entry; a stack's drop, which may run with
 //!   interrupts on, wraps its retirement in `cpu::without_interrupts` (the review of TASKS item
@@ -207,6 +235,35 @@ impl Contexts {
         frame > BOOT_FLOW && self.slots.iter().any(|slot| slot.claim(frame, frame))
     }
 
+    /// Withdraws a context published at `frame` and never resumed: its slot is free again, and
+    /// its stack no longer covered. Only its publisher calls it, from any processor, for a context
+    /// it never made runnable (TASKS item 75).
+    ///
+    /// The first frame is taken by a compare-and-swap first, the same take a `switch` makes to
+    /// resume it, so that at most one of the two succeeds; only then is the home cleared, with
+    /// Release (the module documentation, "The orderings"). `false` if no slot holds `frame` as
+    /// both its home and its frame to resume: a frame never published, one already withdrawn, or
+    /// one a `switch` took first. Any home then stays, and the stack it covers is leaked rather
+    /// than freed under a context that may run on it. It is for a context never made runnable,
+    /// the only kind its publisher withdraws: it cannot tell a context that ran and is suspended
+    /// at exactly its first frame's address from one that never ran.
+    pub fn withdraw(&self, frame: u64) -> bool {
+        if frame <= BOOT_FLOW {
+            return false;
+        }
+        let Some(slot) = self.slots.iter().find(|slot| {
+            slot.home.load(Acquire) == frame
+                && slot
+                    .frame
+                    .compare_exchange(frame, 0, AcqRel, Acquire)
+                    .is_ok()
+        }) else {
+            return false;
+        };
+        slot.home.store(0, Release);
+        true
+    }
+
     /// What the trap entry resumes after a scheduler upcall, which the scheduler answered with
     /// `next` for the context interrupted at `here`. This processor only, interrupts off.
     ///
@@ -232,8 +289,13 @@ impl Contexts {
         if next <= BOOT_FLOW {
             return Err(Refused::NeverSaved);
         }
-        // Only this processor clears a frame, and a publisher only fills a slot it has just
-        // claimed, so a frame read equal to `next` is still `next` at the swap.
+        // The take is a compare-and-swap: between the load and the swap a publisher on another
+        // processor may withdraw the same frame (a context it never made runnable, so the
+        // scheduler had no business naming it), which takes the word by the same swap. Then this
+        // one fails and the search goes on, to `NeverSaved` if nothing else holds `next`. A frame
+        // read equal to `next` is otherwise still `next` at the swap: only this processor's
+        // switches and a withdrawal clear one, and a publisher writes one only into a slot it has
+        // just claimed.
         let incoming = self
             .slots
             .iter()
@@ -559,6 +621,73 @@ mod tests {
         let table = Contexts::new();
         assert!(!table.publish(0));
         assert!(!table.publish(BOOT_FLOW));
+    }
+
+    /// TASKS item 75: a context published and never resumed is withdrawn whole, its slot free
+    /// again for another publication; a second withdrawal finds nothing.
+    #[test]
+    fn a_context_never_resumed_is_withdrawn_and_its_slot_reused() {
+        let table = Contexts::new();
+        for n in 0..SLOTS as u64 {
+            assert!(table.publish(first_frame(n)));
+        }
+        assert!(!table.publish(first_frame(100)), "full");
+        assert!(table.withdraw(first_frame(3)));
+        assert!(!covered(&table, 3), "its stack is no longer covered");
+        assert_eq!(
+            table.switch(0x9000, first_frame(3), false, not_on_it),
+            Err(Refused::NeverSaved),
+            "a withdrawn frame is never resumed"
+        );
+        assert!(!table.withdraw(first_frame(3)), "withdrawn once");
+        assert!(table.publish(first_frame(100)), "the slot is free again");
+        assert!(covered(&table, 100));
+        assert!(covered(&table, 4), "the others keep their homes");
+    }
+
+    /// TASKS item 75: a context the processor resumed is never withdrawn, and keeps its home.
+    #[test]
+    fn a_resumed_context_is_not_withdrawn() {
+        let table = Contexts::new();
+        assert!(table.publish(first_frame(1)));
+        assert!(table.publish(first_frame(2)));
+        assert_eq!(
+            table.switch(0x9000, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        assert!(!table.withdraw(first_frame(1)), "running");
+        assert!(covered(&table, 1), "its home stays");
+        // Suspended at a frame of its own, it is still not the context published at that frame.
+        let here = first_frame(1) - 0x200;
+        assert_eq!(
+            table.switch(here, first_frame(2), false, not_on_it),
+            Ok(first_frame(2))
+        );
+        assert!(!table.withdraw(first_frame(1)), "suspended");
+        assert!(!table.withdraw(here), "a saved frame is no home");
+        assert!(covered(&table, 1));
+        assert_eq!(
+            table.switch(first_frame(2) - 8, here, false, not_on_it),
+            Ok(here)
+        );
+    }
+
+    /// TASKS item 75: nothing that cannot be a published frame is withdrawn.
+    #[test]
+    fn a_withdrawal_refuses_what_was_never_published() {
+        let table = Contexts::new();
+        assert!(!table.withdraw(0));
+        assert!(!table.withdraw(BOOT_FLOW));
+        assert!(!table.withdraw(first_frame(1)));
+        assert!(table.publish(first_frame(1)));
+        let boot = stack(5).1 - 0x40;
+        assert_eq!(
+            table.switch(boot, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        // The boot flow's slot: its home is BOOT_FLOW, its frame `boot`.
+        assert!(!table.withdraw(boot));
+        assert!(covered(&table, 5), "the boot flow's frame stays");
     }
 
     #[test]

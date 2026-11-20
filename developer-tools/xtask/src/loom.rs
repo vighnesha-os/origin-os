@@ -131,6 +131,14 @@ const CTX_UNCOVERED: &[&str] = &["a live context's stack was in no record"];
 const CTX_LAST_TOUCH: &[&str] = &["a stack was found free before its processor's last use of it"];
 const CTX_LOST: &[&str] = &["a published context went unrecorded"];
 const CTX_NEVER_RETIRED: &[&str] = &["an ended context's home was never retired"];
+/// W1's reports (TASKS item 75): a first frame both withdrawn and resumed, or neither; a running
+/// context's stack uncovered; C's context lost; a withdrawn context's home left behind.
+const CTX_WITHDRAWN: &[&str] = &[
+    "a published context was both withdrawn and resumed, or neither",
+    "a live context's stack was in no record",
+    "a published context went unrecorded",
+    "a withdrawn context kept its home",
+];
 
 /// What the exits models report (`models.rs`; TASKS item 79): a settle that passed while an
 /// ended thread still held what it gives back at its reap, seen as a wrong value or as a read
@@ -1399,6 +1407,56 @@ const CONTROLS: &[Control] = &[
         models: &[(
             "contexts_two_retirers_lose_no_ended_context",
             CTX_NEVER_RETIRED,
+        )],
+    },
+    Control {
+        // WX1 (TASKS item 75): a withdrawal that takes the first frame by a plain store, not by
+        // the compare-and-swap a switch also makes: a switch that resumed the context and the
+        // withdrawal can both succeed, and the running context's home is cleared.
+        name: "contexts_withdrawal_takes_the_frame_by_a_store",
+        file: CONTEXTS,
+        from: "                && slot
+                    .frame
+                    .compare_exchange(frame, 0, AcqRel, Acquire)
+                    .is_ok()
+",
+        to: "                && {
+                    slot.frame.store(0, Release);
+                    true
+                }
+",
+        models: &[(
+            "contexts_a_withdrawal_beside_a_switch_and_a_publication",
+            CTX_WITHDRAWN,
+        )],
+    },
+    Control {
+        // WX2 (TASKS item 75; the coordinating session's addition (b)): the home cleared before
+        // the first frame is taken. A publisher can claim the slot in between and have its frame
+        // overwritten, and a context a switch resumed loses its home.
+        name: "contexts_withdrawal_clears_the_home_first",
+        file: CONTEXTS,
+        from: "        let Some(slot) = self.slots.iter().find(|slot| {
+            slot.home.load(Acquire) == frame
+                && slot
+                    .frame
+                    .compare_exchange(frame, 0, AcqRel, Acquire)
+                    .is_ok()
+        }) else {
+            return false;
+        };
+        slot.home.store(0, Release);
+        true
+",
+        to: "        let Some(slot) = self.slots.iter().find(|slot| slot.home.load(Acquire) == frame) else {
+            return false;
+        };
+        slot.home.store(0, Release);
+        slot.frame.compare_exchange(frame, 0, AcqRel, Acquire).is_ok()
+",
+        models: &[(
+            "contexts_a_withdrawal_beside_a_switch_and_a_publication",
+            CTX_WITHDRAWN,
         )],
     },
     Control {

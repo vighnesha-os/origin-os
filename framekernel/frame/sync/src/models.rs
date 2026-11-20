@@ -3338,6 +3338,72 @@ fn contexts_two_retirers_lose_no_ended_context() {
     );
 }
 
+/// What W1 reports when a context's first frame was both withdrawn and resumed, or neither.
+const WITHDRAWN_OR_RESUMED: &str = "a published context was both withdrawn and resumed, or neither";
+
+/// W1 (TASKS item 75; the coordinating session's addition (b)): the processor runs context D
+/// (stack 1), and context A (stack 2) is published and never made runnable. Its publisher
+/// withdraws it while, on the processor, a wrong scheduler names A's first frame, and a third
+/// processor publishes context C (stack 3) into the same table, whose one free slot it takes, or
+/// A's once A's withdrawal has freed it. Exactly one of the withdrawal and the switch takes A's
+/// frame; a withdrawn A leaves no home and a resumed one keeps it; C's claim is never lost, its
+/// home never cleared (so A's slot is reused only after A's home store), and its frame resumes.
+#[test]
+fn contexts_a_withdrawal_beside_a_switch_and_a_publication() {
+    check(
+        "contexts_a_withdrawal_beside_a_switch_and_a_publication",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let table = Arc::new(Contexts::new());
+            // D runs: the boot flow switched to it, and claimed a slot for its own frame. Then A is
+            // published: three of the model's four slots are taken.
+            assert!(table.publish(ctx_frame(1)));
+            assert_eq!(
+                table.switch(ctx_frame(9), ctx_frame(1), false, ctx_off),
+                Ok(ctx_frame(1))
+            );
+            assert!(table.publish(ctx_frame(2)));
+            let withdrawer = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || table.withdraw(ctx_frame(2)))
+            };
+            let publisher = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || assert!(table.publish(ctx_frame(3)), "{LOST_CONTEXT}"))
+            };
+            let at_d = ctx_frame(1) - 0x100;
+            let resumed = table.switch(at_d, ctx_frame(2), false, ctx_off);
+            let withdrawn = withdrawer.join().unwrap();
+            publisher.join().unwrap();
+            assert!(
+                withdrawn != resumed.is_ok(),
+                "{WITHDRAWN_OR_RESUMED}: withdrawn {withdrawn}, switch {resumed:?}"
+            );
+            if withdrawn {
+                assert_eq!(resumed, Err(Refused::NeverSaved), "{WITHDRAWN_OR_RESUMED}");
+                assert!(!ctx_covered(&table, 2), "a withdrawn context kept its home");
+            } else {
+                assert_eq!(resumed, Ok(ctx_frame(2)), "{WITHDRAWN_OR_RESUMED}");
+                assert!(ctx_covered(&table, 2), "{UNCOVERED}");
+            }
+            assert!(ctx_covered(&table, 1), "{UNCOVERED}");
+            assert!(ctx_covered(&table, 3), "{LOST_CONTEXT}");
+            // C's frame is intact: the running context, A or still D, switches to it.
+            let here = if withdrawn {
+                ctx_frame(1) - 0x200
+            } else {
+                ctx_frame(2) - 0x100
+            };
+            assert_eq!(
+                table.switch(here, ctx_frame(3), false, ctx_off),
+                Ok(ctx_frame(3)),
+                "{LOST_CONTEXT}"
+            );
+        },
+    );
+}
+
 // ---------------------------------------------------------------- exits (TASKS item 79)
 
 /// What an exits model reports when a settle passed while an ended thread still held what it
