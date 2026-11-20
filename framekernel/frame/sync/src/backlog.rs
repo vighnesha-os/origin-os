@@ -7,7 +7,8 @@
 //! that is still being freed on another processor. [`Backlog`] is the count it reads: the pieces
 //! of work listed and not yet drained, and the ones being drained.
 //!
-//! - [`Backlog::added`]: after a piece is listed.
+//! - [`Backlog::add`]: lists a piece under its list's lock and counts it before the lock is
+//!   released.
 //! - [`Backlog::drained`]: runs one taken piece's `release`, then lowers the count.
 //! - [`Backlog::pending`]: the count.
 //!
@@ -28,19 +29,28 @@
 //!   whichever processor made it. Each lowering comes after its `release` in its own thread, so
 //!   everything every earlier drain freed happens before whatever the reader does next, such as
 //!   counting the heap.
+//! - **A piece is counted before anyone can take it.** [`Backlog::add`] raises the count while
+//!   it still holds the list's lock, and a taker takes under the same lock. So each piece's
+//!   lowering follows its own raise in the count's modification order, and the count is never
+//!   below the pieces listed and the pieces being drained: a 0 means the list was empty and no
+//!   drain was under way. A raise made after the lock is released would let a taker take that
+//!   piece first, and its lowering would cancel the raise of another piece still listed: a 0
+//!   with that piece's messages allocated (the review of TASKS items 75, 77 and 81, R81-1; Loom
+//!   model B2 and control BX4).
 //! - A reader is ordered after a listing only through something the lister did after
-//!   [`Backlog::added`] and the reader saw: in the kernel, an end it waited for (a thread's or a
+//!   [`Backlog::add`] and the reader saw: in the kernel, an end it waited for (a thread's or a
 //!   process's) that came after the close that listed the channel. Then the reader's Acquire load
 //!   reads the raise or a later value, and a 0 means the piece was drained.
 //!
-//! The Loom model B1 (`models.rs`, "backlog") checks this, and its negative controls in xtask
-//! break each part.
+//! The Loom models B1 and B2 (`models.rs`, "backlog") check this, and their negative controls in
+//! xtask break each part.
 //!
 //! **What a count of 0 does not say.** It does not say that nothing will be listed later: a
 //! drain's release can close further ends, whose messages are listed and counted before the
 //! release returns, so they are pending, not missed. And it does not pair a drain with the
-//! listing it drains: the list's own lock does that. A drain with no listing behind it would
-//! wrap the count, which every later settle would then find pending: never early.
+//! listing it drains: the list's own lock does that, which is why [`Backlog::add`] takes it. A
+//! drain of a piece that was never added would wrap the count, which every later settle would
+//! then find pending: never early.
 //!
 //! Its `Debug` writes its name alone: the kernel's no-panic check refuses formatting beyond
 //! `write_str` in this crate's release object.
@@ -48,7 +58,7 @@
 
 use core::sync::atomic::Ordering::{AcqRel, Acquire};
 
-use crate::prim;
+use crate::{SpinLock, prim};
 
 /// The count of pieces of work listed and not yet drained, and of pieces being drained; see the
 /// module documentation.
@@ -79,9 +89,14 @@ impl Backlog {
         }
     }
 
-    /// Counts a piece of work its caller has just listed.
-    pub fn added(&self) {
+    /// Lists a piece of work: runs `push` on the list under `list`'s lock, and counts the piece
+    /// before the lock is released, so that no taker, which takes under the same lock, can take
+    /// it uncounted (the module documentation, "The ordering").
+    pub fn add<T>(&self, list: &SpinLock<T>, push: impl FnOnce(&mut T)) {
+        let mut listed = list.lock();
+        push(&mut listed);
         self.count.fetch_add(1, AcqRel);
+        drop(listed);
     }
 
     /// Runs `release`, which frees one piece of work its caller took off the list, and only then
@@ -111,9 +126,11 @@ mod tests {
     #[test]
     fn a_piece_is_pending_from_its_listing_until_its_release_has_run() {
         let backlog = Backlog::new();
+        let list = SpinLock::new(0u32);
         assert_eq!(backlog.pending(), 0);
-        backlog.added();
-        backlog.added();
+        backlog.add(&list, |n| *n += 1);
+        backlog.add(&list, |n| *n += 1);
+        assert_eq!(*list.lock(), 2);
         assert_eq!(backlog.pending(), 2);
         let seen_inside = backlog.drained(|| backlog.pending());
         assert_eq!(seen_inside, 2, "still counted while its release runs");
@@ -125,15 +142,16 @@ mod tests {
     #[test]
     fn a_release_that_lists_more_leaves_them_pending() {
         let backlog = Backlog::new();
-        backlog.added();
-        backlog.drained(|| backlog.added());
+        let list = SpinLock::new(());
+        backlog.add(&list, |()| ());
+        backlog.drained(|| backlog.add(&list, |()| ()));
         assert_eq!(backlog.pending(), 1, "what the release listed is counted");
     }
 
     #[test]
     fn debug_names_nothing_it_counts() {
         let backlog = Backlog::new();
-        backlog.added();
+        backlog.add(&SpinLock::new(()), |()| ());
         assert_eq!(format!("{backlog:?}"), "Backlog");
     }
 }

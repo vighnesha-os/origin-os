@@ -457,12 +457,14 @@ fn list_closed(channel: &ObjectRef<KernelChannel>) {
     if channel.listed.swap(true, Ordering::AcqRel) {
         return;
     }
+    // Counted before the list's lock is released, so that no reap takes it uncounted (the review
+    // of TASKS items 75, 77 and 81, R81-1; `Backlog::add`).
     without_interrupts(|| {
-        let mut head = CLOSED.lock();
-        *channel.next_closed.lock() = head.take();
-        *head = Some(channel.clone());
+        CLOSED_COUNT.add(&CLOSED, |head| {
+            *channel.next_closed.lock() = head.take();
+            *head = Some(channel.clone());
+        });
     });
-    CLOSED_COUNT.added();
 }
 
 /// Drops every undelivered message on the closed list, iteratively, with no lock held. Each

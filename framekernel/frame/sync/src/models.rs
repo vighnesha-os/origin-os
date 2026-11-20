@@ -3506,8 +3506,7 @@ fn backlog_a_settle_sees_what_a_reap_freed() {
                 let (backlog, list, seen) =
                     (Arc::clone(&backlog), Arc::clone(&list), Arc::clone(&seen));
                 thread::spawn(move || {
-                    *list.lock() = Some(1);
-                    backlog.added();
+                    backlog.add(&list, |listed| *listed = Some(1));
                     seen.store(true, Release);
                 })
             };
@@ -3526,6 +3525,83 @@ fn backlog_a_settle_sees_what_a_reap_freed() {
             }
             lister.join().unwrap();
             reaper.join().unwrap();
+        },
+    );
+}
+
+/// Two pieces on a list that takes from its head, as `ipc::CLOSED` does: `(head, next)`.
+type TwoPieces = SpinLock<(Option<u32>, Option<u32>)>;
+
+/// `reap_closed`'s loop: while anything is pending, the head is taken under the list's lock and
+/// then drained, which gives back what it holds.
+fn backlog_reap_all(backlog: &Backlog, list: &TwoPieces, held: &[Arc<Kept>; 2]) {
+    while backlog.pending() != 0 {
+        let taken = {
+            let mut listed = list.lock();
+            let head = listed.0.take();
+            listed.0 = listed.1.take();
+            head
+        };
+        let Some(piece) = taken else {
+            return;
+        };
+        let Some(cell) = held.get(piece as usize).map(Arc::clone) else {
+            return;
+        };
+        // SAFETY: as in `backlog_reap`.
+        backlog.drained(move || cell.with_mut(|p| unsafe { *p = 0 }));
+    }
+}
+
+/// Lists piece `n` at the head of the list, as `ipc::list_closed` does.
+fn backlog_list(backlog: &Backlog, list: &TwoPieces, n: u32) {
+    backlog.add(list, |listed| {
+        listed.1 = listed.0.take();
+        listed.0 = Some(n);
+    });
+}
+
+/// B2 (the review of TASKS items 75, 77 and 81, R81-1, whose own model this is): piece X is
+/// listed by a process P that is ending; another processor lists piece Y meanwhile; P's own reap
+/// in its `close_out`, then its end; the boot flow, having seen the end, reaps what it can and,
+/// with nothing pending, counts, which reads X's cell. A raise made after the list's lock is
+/// released lets P's reap take Y uncounted, and its lowering cancel X's raise while X is still
+/// listed.
+#[test]
+fn backlog_a_lowering_cannot_cancel_another_pieces_raise() {
+    check(
+        "backlog_a_lowering_cannot_cancel_another_pieces_raise",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let backlog = Arc::new(Backlog::new());
+            let list: Arc<TwoPieces> = Arc::new(SpinLock::new((None, None)));
+            let held = [Arc::new(Kept::new(1)), Arc::new(Kept::new(1))];
+            let seen = Arc::new(AtomicBool::new(false));
+            backlog_list(&backlog, &list, 0);
+            let lister = {
+                let (backlog, list) = (Arc::clone(&backlog), Arc::clone(&list));
+                thread::spawn(move || backlog_list(&backlog, &list, 1))
+            };
+            let ender = {
+                let (backlog, list, seen) =
+                    (Arc::clone(&backlog), Arc::clone(&list), Arc::clone(&seen));
+                let held = [Arc::clone(&held[0]), Arc::clone(&held[1])];
+                thread::spawn(move || {
+                    backlog_reap_all(&backlog, &list, &held);
+                    seen.store(true, Release);
+                })
+            };
+            if seen.load(Acquire) {
+                backlog_reap_all(&backlog, &list, &held);
+                if backlog.pending() == 0 {
+                    // SAFETY: as in `backlog_reap`.
+                    let now = held[0].with(|p| unsafe { *p });
+                    assert_eq!(now, 0, "{REAPED_EARLY}");
+                }
+            }
+            lister.join().unwrap();
+            ender.join().unwrap();
         },
     );
 }

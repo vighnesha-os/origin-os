@@ -133,8 +133,8 @@ const CTX_LOST: &[&str] = &["a published context went unrecorded"];
 const CTX_NEVER_RETIRED: &[&str] = &["an ended context's home was never retired"];
 /// W1's reports (TASKS item 75): a first frame both withdrawn and resumed, or neither; a running
 /// context's stack uncovered; C's context lost; a withdrawn context's home left behind.
-/// B1's reports (TASKS item 81): a settle counted while a reap still held what it frees, or its
-/// read of what the reap freed was not ordered after the freeing.
+/// B1's and B2's reports (TASKS item 81): a settle counted while a reap still held what it frees,
+/// or its read of what the reap freed was not ordered after the freeing.
 const BACKLOG_EARLY: &[&str] = &[
     "a settle passed while a reap still held what it frees",
     "Causality violation",
@@ -1427,7 +1427,23 @@ const CONTROLS: &[Control] = &[
         file: BACKLOG,
         from: "        let released = release();\n        self.count.fetch_sub(1, AcqRel);\n",
         to: "        self.count.fetch_sub(1, AcqRel);\n        let released = release();\n",
-        models: &[("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY)],
+        models: &[
+            ("backlog_a_settle_sees_what_a_reap_freed", BACKLOG_EARLY),
+            ("backlog_a_lowering_cannot_cancel_another_pieces_raise", BACKLOG_EARLY),
+        ],
+    },
+    Control {
+        // BX4 (the review of TASKS items 75, 77 and 81, R81-1): the count raised after the list's
+        // lock is released, as `list_closed` did: a taker can take the piece uncounted, and its
+        // lowering cancel another piece's raise while that piece is still listed.
+        name: "backlog_raised_after_the_lock",
+        file: BACKLOG,
+        from: "        self.count.fetch_add(1, AcqRel);\n        drop(listed);\n",
+        to: "        drop(listed);\n        self.count.fetch_add(1, AcqRel);\n",
+        models: &[(
+            "backlog_a_lowering_cannot_cancel_another_pieces_raise",
+            BACKLOG_EARLY,
+        )],
     },
     Control {
         // BX2: the count read Relaxed: a settle that reads 0 is not ordered after the releases.
