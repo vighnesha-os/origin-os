@@ -28,7 +28,7 @@ use crate::runqueue::{
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, rdtsc};
 use crate::process::UserContext;
-use crate::threads;
+use crate::threads::{self, Placed};
 use crate::timer::{self, X2Apic};
 use origin_frame::objref::ObjectRef;
 use origin_frame::percpu::PerCpu;
@@ -50,10 +50,10 @@ const _: () = assert!(
 );
 
 /// Each processor's run queue, by CPU index (ADR-0008 Amendment 1, D1: sized at discovery).
-pub(crate) static QUEUES: PerCpu<SpinLock<RunQueue>> = PerCpu::new(
+pub(crate) static QUEUES: PerCpu<SpinLock<RunQueue<Placed>>> = PerCpu::new(
     "framekernel::sched::QUEUES",
-    SpinLock::new(RunQueue::new()),
-    || SpinLock::new(RunQueue::new()),
+    SpinLock::new(RunQueue::empty()),
+    || SpinLock::new(RunQueue::empty()),
 );
 /// Each processor whose scheduler runs.
 pub(crate) static ACTIVE: PerCpu<AtomicBool> =
@@ -109,11 +109,11 @@ pub(crate) fn init_cpu_fpu(cpu: CpuIndex) {
 }
 
 /// What a run-queue slot runs, as a switch sees it: the boot or idle flow (slot 0), whose FPU
-/// area is the processor's own; a thread, whose state is in its record, found once per switch; or
-/// nothing any more, a thread that has just exited, whose slot names no record (its state stays in
-/// its record, a zombie's, until its reap, or, when no zombie could be kept, was dropped and its
-/// record given back at once). A non-zero slot whose record cannot be found is `Exited` too; the
-/// kernel never makes one (the review of TASKS item 92, R92-14).
+/// area is the processor's own; a thread, whose state is in its record, which the slot holds,
+/// resolved when the thread was placed ([`Placed`]); or nothing any more, a thread that has just
+/// exited, whose slot names no record (its state stays in its record, a zombie's, until its reap,
+/// or, when no zombie could be kept, was dropped and its record given back at once; the review of
+/// TASKS item 92, R92-14).
 #[derive(Clone, Copy)]
 enum Running {
     Flow,
@@ -121,47 +121,26 @@ enum Running {
     Exited,
 }
 
-/// What `slot` of `q` runs ([`Running`]): its record looked up once, here.
-fn running(q: &RunQueue, slot: usize) -> Running {
-    match (slot, q.record(slot).and_then(threads::record)) {
+/// What `slot` of `q` runs ([`Running`]): one read of the slot, no lookup.
+#[inline]
+fn running(q: &RunQueue<Placed>, slot: usize) -> Running {
+    match (slot, q.record(slot)) {
         (0, _) => Running::Flow,
-        (_, Some(record)) => Running::Thread(record),
+        (_, Some(placed)) => Running::Thread(placed.record),
         (_, None) => Running::Exited,
-    }
-}
-
-/// Saves the outgoing context's FPU/SIMD state, so SIMD registers belong to one thread at a time:
-/// the boot or idle flow's in its processor's table, a thread's in its record. That lock is
-/// released before [`follow_thread`] takes the incoming one's, so a switch never holds two record
-/// locks at once (the lock order of `origin_sync::threads`). An exited thread's state is not saved:
-/// it is dead.
-fn save_outgoing(id: usize, old: Running) {
-    match old {
-        Running::Flow => {
-            if let Some(table) = threads::table(id)
-                && let Some(area) = table.lock().idle_fpu.as_mut()
-            {
-                area.save();
-            }
-        }
-        Running::Thread(record) => {
-            if let Some(area) = record.state().lock().fpu.as_mut() {
-                area.save();
-            }
-        }
-        Running::Exited => {}
     }
 }
 
 /// Prepares this processor to resume `new`: if the context changed (`restore`), its FPU/SIMD state
 /// is restored, and the page tables are its process's (the kernel's for a kernel thread, and for
 /// the boot or idle flow). For a thread, both under one lock of its record, taken after
-/// [`save_outgoing`] released the outgoing context's lock: a switch takes two locks, as the base's
+/// [`with_queue`] released the outgoing context's lock: a switch takes two locks, as the base's
 /// took its processor's thread table twice (TASKS item 92; the coordinating session's ruling on
 /// its Q6 stop). For the boot or idle flow, the restore is under its processor's table lock and
 /// the address space under none; for an exited slot, no lock is taken (the review's R92-11). The stack an interrupt or a system call from user mode lands on is not set here: the
 /// framework's trap entry names the incoming context's own stack from its home in the processor's
 /// table of contexts, whatever this scheduler answered (TASKS item 77).
+#[inline]
 fn follow_thread(id: usize, new: Running, restore: bool, switch: &Switch) {
     let record = match new {
         Running::Flow => {
@@ -247,8 +226,8 @@ pub(crate) fn end_with<R>(publish: impl FnOnce() -> R) -> R {
         let record = {
             let q = queue.lock();
             q.record(q.current())
-        };
-        let record = record.and_then(threads::record)?;
+        }?
+        .record;
         let counted = record.state().lock().ending.is_some();
         (!counted).then_some(record)
     });
@@ -558,7 +537,7 @@ fn reap_zombies() -> usize {
 fn with_queue(
     interrupted: u64,
     switch: &Switch,
-    f: impl FnOnce(&mut RunQueue) -> Option<u64>,
+    f: impl FnOnce(&mut RunQueue<Placed>) -> Option<u64>,
 ) -> u64 {
     let id = this_cpu();
     match (ACTIVE.get(id), QUEUES.get(id)) {
@@ -573,11 +552,28 @@ fn with_queue(
             }
             let new = q.current();
             // After `f`: an exited thread's slot names no record any more. The outgoing context's
-            // lock (its record's, or the boot or idle flow's table lock) is taken and released,
-            // then the incoming context's once (`follow_thread`).
+            // FPU/SIMD state is saved, so SIMD registers belong to one thread at a time, under its
+            // lock (its record's, or the boot or idle flow's table lock), which is released before
+            // `follow_thread` takes the incoming context's, once: never two record locks at once
+            // (the lock order of `origin_sync::threads`). An exited thread's state is not saved:
+            // it is dead.
             let switched = new != old;
             if switched {
-                save_outgoing(id, running(&q, old));
+                match running(&q, old) {
+                    Running::Flow => {
+                        if let Some(table) = threads::table(id)
+                            && let Some(area) = table.lock().idle_fpu.as_mut()
+                        {
+                            area.save();
+                        }
+                    }
+                    Running::Thread(record) => {
+                        if let Some(area) = record.state().lock().fpu.as_mut() {
+                            area.save();
+                        }
+                    }
+                    Running::Exited => {}
+                }
             }
             follow_thread(id, running(&q, new), switched, switch);
             next
@@ -633,10 +629,10 @@ pub(crate) fn current_thread() -> Option<ThreadRef> {
     without_interrupts(|| {
         let q = queue.lock();
         // Read under the queue's lock, as `origin_sync::threads::Record::generation` asks.
-        let record = q.record(q.current())?;
+        let placed = q.record(q.current())?;
         Some(ThreadRef {
-            record,
-            generation: threads::record(record)?.generation(),
+            record: placed.number,
+            generation: placed.record.generation(),
         })
     })
 }
@@ -664,14 +660,14 @@ pub(crate) fn block_until(deadline: u64) {
 struct KernelQueues;
 
 impl Queues for KernelQueues {
-    type Queue = RunQueue;
+    type Queue = RunQueue<Placed>;
 
-    fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut RunQueue) -> R) -> Option<R> {
+    fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut RunQueue<Placed>) -> R) -> Option<R> {
         let queue = QUEUES.get(usize::try_from(cpu).ok()?)?;
         Some(without_interrupts(|| f(&mut queue.lock())))
     }
 
-    fn wake_slot(queue: &mut RunQueue, slot: u16) -> bool {
+    fn wake_slot(queue: &mut RunQueue<Placed>, slot: u16) -> bool {
         let slot = usize::from(slot);
         let generation = queue.generation(slot);
         queue.wake(slot, generation)
@@ -729,11 +725,9 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
 pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
     let id = this_cpu();
     let next = with_queue(interrupted, switch, |q| {
-        let number = q.record(q.current());
+        let placed = q.record(q.current());
         let next = q.exit(interrupted).ok()?;
-        if let (Some(table), Some(number)) = (threads::table(id), number)
-            && let Some(record) = threads::record(number)
-        {
+        if let (Some(table), Some(Placed { number, record })) = (threads::table(id), placed) {
             let mut t = table.lock();
             let mut state = record.state().lock();
             // In the critical section that freed its slot: from here no wake-up finds it
@@ -805,11 +799,11 @@ pub(crate) fn finish(signal: impl FnOnce()) -> ! {
 pub(crate) fn current_user() -> Option<ObjectRef<UserContext>> {
     let queue = QUEUES.get(this_cpu())?;
     without_interrupts(|| {
-        let record = {
+        let placed = {
             let q = queue.lock();
             q.record(q.current())
         };
-        threads::record(record?)?.state().lock().user.clone()
+        placed?.record.state().lock().user.clone()
     })
 }
 
@@ -932,19 +926,19 @@ fn spawn_with_parts(
         // the state. The record comes from the target's block (`crate::threads`), taken here so
         // that no spawn holds one it has not queued.
         let mut queue = queue.lock();
-        let (number, _) = threads::take(cpu).ok_or(QueueError::Full)?;
-        let slot = match queue.push_weighted(frame_at, weight, Some(number)) {
+        // Resolved once, here, for the slot to hold (`threads::Placed`).
+        let placed = threads::take(cpu).ok_or(QueueError::Full)?;
+        let slot = match queue.push_weighted(frame_at, weight, Some(placed)) {
             Ok(slot) => slot,
             Err(refused) => {
-                threads::give_back(number);
+                threads::give_back(placed.number);
                 return Err(refused);
             }
         };
-        // The record was just taken from this block, and a slot fits a location (`threads`'s
-        // assertion): neither `if` below can fail (the review of TASKS item 92, R92-5).
-        if let Some(record) = threads::record(number)
-            && let Some((stack, fpu_area, user)) = parts.take()
-        {
+        let record = placed.record;
+        // A slot fits a location (`threads`'s assertion): neither `if` below can fail (the review
+        // of TASKS item 92, R92-5).
+        if let Some((stack, fpu_area, user)) = parts.take() {
             let mut state = record.state().lock();
             state.stack = Some(stack);
             state.fpu = Some(fpu_area);

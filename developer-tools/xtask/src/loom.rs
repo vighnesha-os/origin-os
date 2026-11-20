@@ -474,12 +474,12 @@ const CONTROLS: &[Control] = &[
         models: &[("threads_a_wake_racing_an_exit_follows_nothing", EXIT_FOLLOWED)],
     },
     Control {
-        // The review's R92-8: a slot that names another thread's record, so a switch saves and
-        // restores the wrong thread's state.
+        // The review's R92-8: a slot that names another thread's record (slots 1 and 2, the
+        // model's two threads, swapped), so a switch saves and restores the wrong thread's state.
         name: "slot_names_another_record",
         file: RUN_QUEUE,
-        from: "            *r = record;\n",
-        to: "            *r = record.map(|r| r ^ 1);\n",
+        from: "            Some(_) => self.record.get(slot).copied().flatten(),\n",
+        to: "            Some(_) => self.record.get(slot ^ 3).copied().flatten(),\n",
         models: &[("threads_a_switch_takes_each_record_in_turn", NOT_RESTORED)],
     },
     Control {

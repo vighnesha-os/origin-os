@@ -395,19 +395,23 @@ enum State {
     Blocked(Option<u64>),
 }
 
-/// One CPU's run queue.
+/// One CPU's run queue. `R` is what each slot holds of its thread's record (ADR-0020 S1, TASKS
+/// item 92): its number, in the tests and the Loom models; in the kernel, the number and the
+/// record itself, resolved once when the thread is placed in the queue, so that a switch reaches
+/// the thread's state without a lookup (the coordinating session's second ruling on TASKS item
+/// 92's Q6). The queue only stores it and hands it back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RunQueue {
+pub struct RunQueue<R = u32> {
     saved: [u64; CAPACITY],
     state: [State; CAPACITY],
     /// Bumped each time a slot gets a new thread.
     generation: [u32; CAPACITY],
     /// A wake-up that arrived while the slot's thread was not blocked.
     wake_pending: [bool; CAPACITY],
-    /// The number of the record each slot's thread has (ADR-0020 S1, TASKS item 92), so that the
-    /// processor finds the thread's state, and a wake-up its name, under this queue's lock.
-    /// `None` for slot 0 and for a free slot.
-    record: [Option<u32>; CAPACITY],
+    /// The record each slot's thread has (ADR-0020 S1, TASKS item 92), so that the processor
+    /// finds the thread's state, and a wake-up its name, under this queue's lock. `None` for slot
+    /// 0 and for a free slot.
+    record: [Option<R>; CAPACITY],
     /// The slots a wake-up made ready since this queue last chose what to run.
     woken: [bool; CAPACITY],
     /// Each slot's weight and pass (stride scheduling).
@@ -429,8 +433,15 @@ impl Default for RunQueue {
 }
 
 impl RunQueue {
-    /// A queue holding only the running (boot) context.
+    /// A queue holding only the running (boot) context, its slots holding record numbers.
     pub const fn new() -> Self {
+        Self::empty()
+    }
+}
+
+impl<R: Copy> RunQueue<R> {
+    /// A queue holding only the running (boot) context.
+    pub const fn empty() -> Self {
         let mut state = [State::Free; CAPACITY];
         state[0] = State::Ready;
         Self {
@@ -494,13 +505,13 @@ impl RunQueue {
         self.push_weighted(context, DEFAULT_WEIGHT, None)
     }
 
-    /// As [`RunQueue::push`], with `weight` (clamped to 1–[`MAX_WEIGHT`]) and the number of the
-    /// thread's record, which [`RunQueue::record`] answers until the thread exits.
+    /// As [`RunQueue::push`], with `weight` (clamped to 1–[`MAX_WEIGHT`]) and the thread's record
+    /// (`R`), which [`RunQueue::record`] answers until the thread exits.
     pub fn push_weighted(
         &mut self,
         context: u64,
         weight: u32,
-        record: Option<u32>,
+        record: Option<R>,
     ) -> Result<usize, QueueError> {
         if context == 0 || !context.is_multiple_of(8) {
             return Err(QueueError::BadContext(context));
@@ -583,10 +594,10 @@ impl RunQueue {
         self.generation.get(slot).copied().unwrap_or(0)
     }
 
-    /// The number of the record of the thread in `slot`, as [`RunQueue::push_weighted`] was
-    /// given it: `None` for slot 0, for a free slot (also the moment its thread has exited), and
-    /// for a thread pushed without one.
-    pub fn record(&self, slot: usize) -> Option<u32> {
+    /// The record of the thread in `slot`, as [`RunQueue::push_weighted`] was given it: `None`
+    /// for slot 0, for a free slot (also the moment its thread has exited), and for a thread
+    /// pushed without one.
+    pub fn record(&self, slot: usize) -> Option<R> {
         match self.state.get(slot) {
             Some(State::Free) | None => None,
             Some(_) => self.record.get(slot).copied().flatten(),

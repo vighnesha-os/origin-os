@@ -119,23 +119,39 @@ pub(crate) fn table(cpu: usize) -> Option<&'static SpinLock<Table>> {
     Some(&THREADS.get(cpu)?.table)
 }
 
+/// What a run-queue slot holds of its thread's record (`RunQueue<Placed>`): its number, for the
+/// thread's name and the zombie list, and the record itself, resolved once when the thread is
+/// placed in the queue, so that a switch reaches the thread's state without a lookup (TASKS item
+/// 92; the coordinating session's second ruling on its Q6). A record is never moved or freed, so
+/// the reference stays good wherever the thread runs.
+#[derive(Clone, Copy)]
+pub(crate) struct Placed {
+    /// The record's number.
+    pub(crate) number: u32,
+    /// The record.
+    pub(crate) record: &'static Record<State>,
+}
+
 /// Record `number`, if there is one.
 pub(crate) fn record(number: u32) -> Option<&'static Record<State>> {
     let (block, index) = Block::<State, PER_CPU>::split(number)?;
     THREADS.get(block)?.records.get(index)
 }
 
-/// A record for a new thread on processor `cpu`, from that processor's block: its number and
-/// its new generation. `None` if the block holds no free record.
-pub(crate) fn take(cpu: CpuIndex) -> Option<(u32, u32)> {
+/// A record for a new thread on processor `cpu`, from that processor's block, with its new
+/// generation, resolved for its run-queue slot ([`Placed`]). `None` if the block holds no free
+/// record.
+pub(crate) fn take(cpu: CpuIndex) -> Option<Placed> {
     let block = &THREADS.get(cpu.get())?.records;
-    let (index, generation) = block.take()?;
-    let number = Block::<State, PER_CPU>::number(cpu.get(), index);
-    if number.is_none() {
+    let (index, _) = block.take()?;
+    let placed = Block::<State, PER_CPU>::number(cpu.get(), index)
+        .zip(block.get(index))
+        .map(|(number, record)| Placed { number, record });
+    if placed.is_none() {
         // A processor index past what a `u32` numbers: the record goes back unused.
         give_back_index(block, index);
     }
-    Some((number?, generation))
+    placed
 }
 
 /// Give-backs a block refused since the boot began: each a record that stays held for good.

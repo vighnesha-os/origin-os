@@ -102,6 +102,12 @@ pub trait Empty {
 }
 
 /// One thread's record, from its spawn to its reap; see the module documentation.
+///
+/// Aligned to a 64-byte cache line, so that no two records share one: a processor switching to
+/// one thread does not contend for the line of another thread's record that a waker on another
+/// processor is reading, or that another processor's switch is locking once threads move (the
+/// review of TASKS item 92, R92-13; a layout choice, which no emulated figure can show).
+#[repr(align(64))]
 pub struct Record<S> {
     /// Changed only by [`Block::take`], while the location is clear.
     generation: prim::AtomicU32,
