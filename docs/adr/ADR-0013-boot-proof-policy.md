@@ -890,6 +890,23 @@ Each control failed with `boot-test` exit 1, and the tree was clean afterwards. 
 
 An earlier run of the same four, at `7fefbf96`, before the report gave the console's reason, failed the same way.
 
+**The controls of TASKS item 84 (the SPCR's UART from the kernel's first line, ADR-0010 Amendment 3; 2026-11-20, Rust 1.100.0, QEMU 11.1.3 TCG on the development Mac):** temporary edits on `claude/t84-early-uart` at `7ad41d28`.
+- A script applied each edit and kept its diff.
+- It ran the boot or host test the control names, inside `cargo xtask exclusive`.
+- It put the file back with `git checkout` afterwards, and the tree was clean after all five.
+
+Each control failed:
+
+| Control | Edit | Caught |
+|---|---|---|
+| R84-1 | The loader names no UART: `found.early_uart()` becomes `EarlyUart::NONE` (`boot/uefi/src/main.rs`) | `boot-console`'s SPCR scenario, exit 1: first missing marker `origin-kernel: console: the loader named the SPCR's UART at I/O port 0x2f8 …`; COM1's last kernel line is the old move's, `… names a UART at I/O port 0x2f8: moving the console there` |
+| R84-2 | The kernel ignores `early_uart`: `attach_loader_uart(&info)` becomes `LoaderUart::None` (`framekernel/src/kernel.rs`) | The same scenario, exit 1, the same first missing marker and the same last line on COM1 |
+| R84-3 | `EarlyUart::check` accepts port `0x60`, the keyboard controller's (`boot/info/src/lib.rs`) | `an_early_uart_is_checked_field_by_field`: `EarlyUart { port: 96, … }` gave `Ok(())`, where `Err(Port(96))` is required |
+| R84-4 | A refused move stops the loader's UART: the move's settle drops it (`framekernel/src/console.rs`) | `boot-rented`'s machine with the kernel's reading refused (`ORIGIN_QEMU_SHAPE=refused`, 64 GiB, AMD-Vi), exit 1: first missing marker `origin-kernel: boot verdict: `, on COM2; COM1 ran to `M1 entry complete; halting` |
+| R84-5 | The kernel accepts boot info 0.7 (`boot/info/src/lib.rs`, `BootInfo::check`) | `boot_info_0_7_is_refused`: `Ok(())`, where `Err(Version(0, 7))` is required |
+
+Control RB-1 of TASKS item 83, an RSDP in loader data, is now a machine of its own, `boot-rented`'s third. It passes on the console alone: the loader names COM2, the kernel's move is refused, and the boot, verdict included, is on COM2 and COM1 alike.
+
 ## Alternatives
 
 | Alternative | For | Against |

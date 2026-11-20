@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested under QEMU, and was merged into `claude/interesting-carson-ae7c83` on 2026-11-09 on the owner's word. Nothing here has shipped. **Amendments 1 and 2 (below, to E3) were accepted by the owner on 2026-11-09**, as proposed (decision sheet items 52 and 53). **Amendment 3 (below, to E1 and E4: boot info 0.8 names the SPCR's UART from the loader) was accepted by the owner on 2026-11-20** (decision sheet item 317). It is not built; TASKS item 84 builds it. |
+| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested under QEMU, and was merged into `claude/interesting-carson-ae7c83` on 2026-11-09 on the owner's word. Nothing here has shipped. **Amendments 1 and 2 (below, to E3) were accepted by the owner on 2026-11-09**, as proposed (decision sheet items 52 and 53). **Amendment 3 (below, to E1 and E4: boot info 0.8 names the SPCR's UART from the loader) was accepted by the owner on 2026-11-20** (decision sheet item 317), and built by TASKS item 84 the same day, under QEMU only. |
 | Requires | CLAUDE.md §13 (checked parsing), §19 (boot-info structure, early diagnostics), §51 (font provenance), §58 (threat-model privileged interfaces), §69 (diagnostics), §74, rules 14, 30 and 40 |
 | Implements | ADR-0009 H6, third bullet: a console that does not depend on a 16550 at `0x3F8` |
 | Code | `boot/info` (`Framebuffer`), `boot/uefi` (the Graphics Output Protocol hand-off), `framekernel/paging` (the mapping), `framekernel/src/{fbconsole,font,spcr,serial,console}.rs`, `developer-tools/xtask` |
@@ -162,7 +162,7 @@ The framebuffer mapping is kernel-only, writable and never executable, in the ke
 
 ## Amendment 3 (Accepted by the owner, 2026-11-20): the loader names the SPCR's UART in boot info 0.8
 
-**Status: Accepted by the owner on 2026-11-20 ("Accept 317"), as proposed (decision sheet item 317). Not built; TASKS item 84 builds it.**
+**Status: Accepted by the owner on 2026-11-20 ("Accept 317"), as proposed (decision sheet item 317). Built by TASKS item 84 on 2026-11-20 and boot-tested under QEMU only, not on a physical machine. TASKS.md §84, "As built", lists where the build departs from this text: the loader's own line is on the firmware's console (COM1 under QEMU); a UART that does not answer is refused at once by a probe; a refused move keeps both UARTs for the rest of the boot (the coordinating session's ruling Q1).**
 
 **Why.** E4 starts the console on COM1, and moves it to the SPCR's UART only after the kernel's own page tables are live. Its alternatives table turned down reading the SPCR in the loader because "early lines are replayed anyway, and the screen shows them meanwhile". Rental B is the case where neither holds (2026-11-20; `docs/research/2026-11-20-rental-b-findings.md`, on `claude/rental-b-readiness-33dcba` until it lands).
 - **The machine.** On a rented server, the operator's console is the BMC's serial-over-LAN on COM2, at port `0x2F8`. COM1 is a real 16550A that nobody watches, and the screen is not captured.
@@ -206,7 +206,7 @@ On any server whose console is not COM1, a stop before the move is invisible.
 
 **Trade-offs.** A parser of firmware data runs in the loader. Its checks are the kernel's own, in a shared crate. Boot info gains one structure. The SPCR is read twice, once by each, and the kernel's reading rules.
 
-**Performance cost (ADR-0018 V3).** Unmeasured, owed (cost ledger row CL46, added by TASKS item 84 when it builds this): one table walk in the loader before `ExitBootServices`, and, until the move, each line sent to one more UART.
+**Performance cost (ADR-0018 V3).** Cost ledger row CL46: one table walk in the loader before `ExitBootServices`, and, until the move, each line sent to one more UART. Measured by TASKS item 84 under QEMU only (`emu`): the walk read 524 to 672 bytes in 20 to 23 reads, 0.79 to 1.37 ms, and 2,805 bytes of text went to the second UART before the move. Unmeasured on a physical machine.
 
 **Migration.** Boot info goes from 0.7 to 0.8. The loader and kernel are one release (§62), and a mismatched pair is refused by the version check, as for every boot-info change.
 
