@@ -783,6 +783,15 @@ pub(crate) fn publish_context(cpu: CpuIndex, frame: u64) -> bool {
         .is_some_and(|table| table.publish(frame))
 }
 
+/// Withdraws the context published on processor `cpu` at `frame`, which its spawner never made
+/// runnable (TASKS item 75; `Contexts::withdraw`). `false` if the table does not hold it as never
+/// resumed, or `cpu` has none.
+pub(crate) fn withdraw_context(cpu: CpuIndex, frame: u64) -> bool {
+    CONTEXTS
+        .get(cpu.get())
+        .is_some_and(|table| table.withdraw(frame))
+}
+
 /// This processor's stack pointer.
 fn stack_pointer() -> u64 {
     let rsp: u64;

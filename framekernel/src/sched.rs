@@ -690,20 +690,42 @@ fn spawn_with(
     weight: u32,
     user: Option<ObjectRef<UserContext>>,
 ) -> Result<usize, QueueError> {
-    spawn_with_fpu(cpu, start, weight, user, FpuArea::new)
+    spawn_with_parts(
+        cpu,
+        start,
+        weight,
+        user,
+        FpuArea::new,
+        GuardedStack::publish_first_frame,
+    )
 }
 
-/// [`spawn_with`], with `fpu_area` the source of the thread's FPU area (the boot proof gives
-/// it one that has none). A thread is created whole or not at all: every way this fails
-/// gives back the stack, its guard page and the FPU area, through their `Drop`s.
-fn spawn_with_fpu(
+/// [`spawn_with`], with `fpu_area` the source of the thread's FPU area and `publish` what
+/// publishes its first frame to `cpu`'s table of contexts (the boot proof gives sources that
+/// refuse: an FPU area that is not there, and a publication refused as a full table refuses one).
+/// A thread is created whole or not at all: every way this fails gives back the stack, its guard
+/// page and the FPU area, through their `Drop`s, and leaves the run queue and the thread table as
+/// they were.
+///
+/// **The order** (TASKS item 75). The first frame is published before the thread is queued, so
+/// that no run queue ever names a frame its processor's table does not hold: the trap entry
+/// refuses such a frame with a panic. Nothing can pick a thread that is not queued, so the
+/// publication needs no lock. A refused publication returns at once, having touched neither the
+/// queue nor the thread table. A queue that then refuses the thread (it is full) has the
+/// publication withdrawn before the stack is dropped: otherwise the stack's home would still be in
+/// the table, and its drop would leak it. While a refused spawn is between the two, its context
+/// holds a slot of the table, which has 15 to spare (`cpu::CONTEXTS`); a table filled that way
+/// refuses another spawn, which is safe.
+fn spawn_with_parts(
     cpu: CpuIndex,
     start: ThreadStart,
     weight: u32,
     user: Option<ObjectRef<UserContext>>,
     fpu_area: impl FnOnce() -> Option<FpuArea>,
+    publish: impl FnOnce(&mut GuardedStack, CpuIndex) -> bool,
 ) -> Result<usize, QueueError> {
     let queue = QUEUES.get(cpu.get()).ok_or(QueueError::Full)?;
+    let threads = THREADS.get(cpu.get()).ok_or(QueueError::Full)?;
     let mut stack = GuardedStack::new(THREAD_STACK).ok_or(QueueError::Full)?;
     let guard = stack.guard_addr();
     let frame_at = stack.build_first_frame(start).ok_or(QueueError::Full)?;
@@ -711,18 +733,17 @@ fn spawn_with_fpu(
     // (`switch_fpu` then has nothing to restore), which may be another process's data; it
     // is refused instead.
     let fpu_area = fpu_area().ok_or(QueueError::Full)?;
+    if !publish(&mut stack, cpu) {
+        return Err(QueueError::Full);
+    }
+    let mut parts = Some((stack, fpu_area, user));
     let spawned = without_interrupts(|| {
         // The queue lock is held until the thread's state is complete: the moment the slot
         // is Ready the target processor can pick it, and `follow_thread` needs the state.
         let mut queue = queue.lock();
-        let mut stack = stack;
         let slot = queue.push_weighted(frame_at, weight)?;
-        // Published before the slot can be picked: the lock is held until the thread is whole.
-        if !stack.publish_first_frame(cpu) {
-            return Err(QueueError::Full);
-        }
-        if let Some(threads) = THREADS.get(cpu.get()) {
-            let mut t = threads.lock();
+        let mut t = threads.lock();
+        if let Some((stack, fpu_area, user)) = parts.take() {
             if let Some(s) = t.stacks.get_mut(slot) {
                 *s = Some(stack);
             }
@@ -735,8 +756,17 @@ fn spawn_with_fpu(
         }
         Ok(slot)
     });
-    if spawned.is_ok() {
-        let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
+    match spawned {
+        Ok(_) => {
+            let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
+        }
+        // Never queued, so never resumed: the withdrawal finds the frame. Were it refused, the
+        // home would stay and the drop below would leak the stack, which is the safe failure.
+        Err(_) => {
+            if let Some((mut stack, _, _)) = parts {
+                let _ = stack.withdraw_first_frame();
+            }
+        }
     }
     spawned
 }
@@ -1248,10 +1278,12 @@ fn prove_lifecycle(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
 }
 
 /// A spawn that cannot be completed leaves nothing behind: refused for want of an FPU area
-/// (without one the thread would inherit another's SIMD registers), or because the queue
-/// is full, it hands back the stack, its guard page and the FPU area. The processor must
-/// hold only its boot context when this runs. (Anything a refusal leaks would also fail the
-/// final check in [`prove`], which holds the heap to the byte.)
+/// (without one the thread would inherit another's SIMD registers), because its first frame's
+/// publication is refused (as a full table of contexts refuses one), or because the queue is
+/// full, it hands back the stack, its guard page and the FPU area, queues nothing, and loses no
+/// stack (TASKS item 75: a publication the queue then refused is withdrawn, or its stack would be
+/// leaked). The processor must hold only its boot context when this runs. (Anything a refusal
+/// leaks would also fail the final check in [`prove`], which holds the heap to the byte.)
 fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let live = || {
         QUEUES
@@ -1259,21 +1291,37 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
             .map_or(0, |q| without_interrupts(|| q.lock().live()))
     };
     let in_use = || crate::memory::stats().map_or(0, |(h, _)| h.bytes_in_use);
+    let lost = || origin_frame::stack::counts().lost;
     let started = FINISHED.load(Ordering::Acquire);
     let contexts = live();
     let before = in_use();
-    let no_area = spawn_with_fpu(
+    let lost_before = lost();
+    let quitting = || ThreadStart::Kernel {
+        entry: quitter,
+        arg: 0,
+    };
+    let no_area = spawn_with_parts(
         bsp,
-        ThreadStart::Kernel {
-            entry: quitter,
-            arg: 0,
-        },
+        quitting(),
         crate::runqueue::DEFAULT_WEIGHT,
         None,
         || None,
+        GuardedStack::publish_first_frame,
     );
     let no_area_clean =
         no_area == Err(QueueError::Full) && in_use() <= before && live() == contexts;
+    let unpublished = spawn_with_parts(
+        bsp,
+        quitting(),
+        crate::runqueue::DEFAULT_WEIGHT,
+        None,
+        FpuArea::new,
+        |_, _| false,
+    );
+    let unpublished_clean = unpublished == Err(QueueError::Full)
+        && in_use() <= before
+        && live() == contexts
+        && lost() == lost_before;
     let free = crate::runqueue::CAPACITY.saturating_sub(contexts);
     let mut filled = 0;
     for _ in 0..free {
@@ -1283,8 +1331,10 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     }
     let full_use = in_use();
     let full = spawn(bsp, quitter, 0);
-    let full_clean =
-        full == Err(QueueError::Full) && in_use() <= full_use && live() == contexts + free;
+    let full_clean = full == Err(QueueError::Full)
+        && in_use() <= full_use
+        && live() == contexts + free
+        && lost() == lost_before;
     let finished = started + filled as u64;
     yield_until(
         || FINISHED.load(Ordering::Acquire) == finished && live() == contexts,
@@ -1293,13 +1343,15 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     );
     reap();
     let ok = no_area_clean
+        && unpublished_clean
         && full_clean
         && filled == free
         && live() == contexts
-        && FINISHED.load(Ordering::Acquire) == finished;
+        && FINISHED.load(Ordering::Acquire) == finished
+        && lost() == lost_before;
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: spawns refused for want of an FPU area ({no_area:?}) and on a full queue ({full:?}) give back the stack, its guard page and the FPU area{}",
+        "origin-kernel: scheduler: spawns refused for want of an FPU area ({no_area:?}), at their publication ({unpublished:?}) and on a full queue ({full:?}) give back the stack, its guard page and the FPU area, queue nothing and lose no stack{}",
         if ok { "" } else { ": scheduler failed" }
     );
     ok
