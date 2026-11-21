@@ -7,6 +7,21 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** On a physical machine only Origin's loader has run: a rented bench server, outside the declared scope, on 2026-11-20 (see the next section). |
 
+## The reset diagnostic: a bench loader for rental E (TASKS item 116; 2026-11-21)
+
+On `claude/t116-reset-diagnostic`, with `land/batch-9` at `0e4f99f9` merged in; not yet in the batch. Rental D showed nothing after the loader's last line (`docs/research/2026-11-21-rental-d-findings.md`): either `ExitBootServices` does not return on the rented firmware, or nothing written straight to the SPCR's UART after it reaches the console.
+
+- **The bench loader, unless a QEMU scenario's `BENCH-AFTER` asks otherwise:**
+  - **before the call:** the UART's registers through the firmware's console, then a line straight to the UART, and a mark before each call;
+  - **after the call:** the registers read again, the firmware's values written back, and a line naming what was read and how each call ended;
+  - **then a reset, whatever was seen:** `ResetSystem` (decision item 344, ADR-0002 Amendment 3), then the FADT's reset register, then a halt. The kernel is not entered. A reset shows on the rented console as a new firmware start, which needs no UART.
+- **The rental tool** refuses an ESP that holds a bench switch, counts the loader's runs in each boot, and records when the console's bytes arrived.
+- **Normal images are unchanged:** the reproducible gate's 40 files are the same bytes as the batch's.
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:** `boot-bench`, 7 of 7: TASKS item 112's four scenarios with the new lines; the reset through `ResetSystem`; the reset through the FADT's register; and a UART disturbed as the call returns, whose line appears only once the firmware's values are written back. Each of its seven controls fails, and `check`, `boot-test` and `boot-matrix` three times pass on `8ff56bd9`. One independent AI review: no High; its Medium and Low findings answered or kept as limits.
+
+**Rental E** (2026-11-21, $0.81; `docs/hardware/records/2026-11-21-latitude-m4-metal-small-e.md`, `docs/research/2026-11-21-rental-e-findings.md`): three boots alike. The line straight to the UART and the mark before the call arrived; nothing came after the call, and the machine did not reset. That is the reading table's A row: `ExitBootServices` does not return on the rented firmware, or it returned and both the console's path and `ResetSystem` failed after it. Item 344's order was kept for the rental (the coordinating session's ruling on R116-1); the step that separates the two goes to the owner.
+
 ## Breadcrumbs on the SPCR's UART: a bench build (TASKS item 112; 2026-11-21)
 
 In `land/batch-9` since `1007a575`. Rentals B and C showed nothing between the loader's last line and the kernel's first (`docs/research/2026-11-21-rental-c-findings.md`).

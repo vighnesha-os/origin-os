@@ -269,6 +269,12 @@ A level whose groups each hold one child is dropped. Where ACPI's PPTT is presen
 
 **Threats.** The reports are the processor's and the firmware's (AC1). A malformed table (PPTT, SRAT, SLIT) is parsed as untrusted input, as every ACPI table is (ADR-0019).
 
+**Note (2026-11-21, TASKS item 97; the coordinating session's ruling Q1 on its contract, a reading of this decision, not an amendment).**
+- **What "its cache structures take precedence, as ACPI says" means.** It is read with ACPI 6.6 §5.2.31.2. That section gives precedence to a cache's properties flagged valid in the table (its size, sets, ways, line size and type) over the processor's own discovery. Which processors share a cache is not among them: the PPTT's cache structures complement or replace that discovery.
+- **How sharing is decided.** The PPTT's claims and CPUID's are both claims, combined conservatively, as the build plan's invariant has it ("a disagreement about sharing a cache is read as 'not shared' and reported"). Each group is split wherever either claim splits it. Every processor whose group either claim would have made larger is counted, and the "scheduling domains" proof fails. Where CPUID reports no sharing, the PPTT's claim stands alone.
+- **A PPTT that breaks a rule of §5.2.31 its reading rests on** is not used for sharing at all. Examples are a cache chain entering a cache that another level's node lists, or a processor the PPTT and the MADT do not both name.
+- **No boot stops on this.** The proof is Report class (ADR-0013 R3), so on a real machine whose firmware disagrees it degrades the verdict, and the boot goes on.
+
 ### S9. Capacity and load, only from what the hardware reports
 
 **Decision.** Each processor has a capacity from 1 to 1024, the most capable processor of the machine being 1024, taken from the first of these sources that holds:

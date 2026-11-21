@@ -401,6 +401,50 @@ class Guards(unittest.TestCase):
         self.assertNotIn("sv_te", out)
         self.assertEqual(self.lat.clean("\x1b[1;31mred\x1b[0m\r\n\x1b[?25l"), "red\n")
 
+    def test_the_install_refuses_every_switch_the_bench_loader_reads(self):
+        # TASKS items 112 and 116: each \\EFI\\ORIGIN\\BENCH-* path the bench loader names is
+        # refused on the rented ESP, so a rental takes its own key and the reset.
+        import re
+        source = (HERE.parent.parent / "boot" / "uefi" / "src" / "bench.rs").read_text()
+        named = set(re.findall(r'"\\\\EFI\\\\ORIGIN\\\\(BENCH-[A-Z-]+)"', source))
+        self.assertEqual(named, {"BENCH-STALE-KEY", "BENCH-AFTER"})
+        self.assertEqual(set(self.lat.BENCH_SWITCHES), named)
+        tests = self.lat.refuse_bench_switches()
+        for name in named:
+            self.assertIn(f"test ! -e /boot/efi/EFI/ORIGIN/{name}; ", tests)
+
+    def test_a_reset_build_counts_the_loaders_runs_and_times_them(self):
+        # TASKS item 116: no breadcrumbs; the loader's runs within the boot say whether the
+        # machine reset itself after the loader's last line.
+        banner = "Origin OS 0.1.0-dev UEFI loader (build 0)\r\n"
+        loader = (banner + "origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader "
+                  "resets the machine, and the kernel is not entered\r\n"
+                  "origin-boot: exiting boot services; entering the Framekernel\r\n")
+        once = self.lat.boot_result(self.lat.clean(loader))
+        self.assertEqual(once["loader_runs"], 1)
+        self.assertNotIn("breadcrumbs", once)
+        self.assertTrue(once["summary"].endswith("loader runs: 1, with no reset of its own"), once["summary"])
+        twice = self.lat.boot_result(self.lat.clean(loader + "\x1b[2JPre-memory NB Initialization\r\n" + loader))
+        self.assertEqual(twice["loader_runs"], 2)
+        self.assertIn("so the machine reset itself", twice["summary"])
+        # The timing: the loader's last line arrived at t=100, the firmware's next byte at
+        # t=107.5, the next loader at t=170; with nothing after the line, neither.
+        raw = (loader + "\x1b[2JPre-memory\r\n" + loader).encode()
+        line_end = raw.find(b"Framekernel") + len(b"Framekernel\r\n")
+        times = [(90.0, line_end - 10), (100.0, line_end), (107.5, line_end + 5),
+                 (170.0, len(raw))]
+        self.assertEqual(self.lat.after_last_line(raw, times), (7.5, 70.0))
+        self.assertEqual(self.lat.after_last_line(raw[:line_end], times[:2]), (None, None))
+        self.assertEqual(self.lat.after_last_line(b"no loader here", times), (None, None))
+        path = self.home / "times.log"
+        path.write_text("10.0 500\nx y\n11.5 900\n")
+        self.assertEqual(self.lat.read_times(path, 600), [(11.5, 300)])
+        bench = self.home / "BOOTX64.EFI"
+        bench.write_bytes(b"MZ...origin-boot: bench build: ...")
+        self.assertIn("the bench loader", self.lat.loader_kind(bench))
+        bench.write_bytes(b"MZ...origin-boot: ...")
+        self.assertEqual(self.lat.loader_kind(bench), "developer-mode loader")
+
     def test_redact_removes_mac_addresses_and_the_guid(self):
         text = ("Boot0003* UEFI PXE IPv4: Intel(R) Ethernet Controller X550(MAC:020000000001)\n"
                 "CLIENT MAC ADDR: 02 00 00 00 00 02  GUID: C0FFEE00-0000-4000-8000-0000000000A1\n"

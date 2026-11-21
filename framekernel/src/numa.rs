@@ -44,6 +44,20 @@ pub fn nearest_nodes(slit: &Slit, from: usize, out: &mut [usize]) -> usize {
     n
 }
 
+/// For each node that holds a processor, the other such nodes in ascending SLIT distance
+/// (ADR-0020 S8; the coordinating session's ruling Q7 of 2026-11-21: the scheduling domains' node
+/// level, and the order the idle pull looks outward in, TASKS item 98). A node the SLIT does not
+/// reach, or with no SLIT at all, comes after those it does; ties keep the nodes' order. A
+/// proximity domain is a SLIT locality's index (ACPI 6.6 §5.2.17).
+pub fn node_order(
+    slit: Option<&Slit>,
+    nodes: &[u32],
+) -> alloc::vec::Vec<(u32, alloc::vec::Vec<u32>)> {
+    origin_frame::domains::node_order(nodes, |from, to| {
+        slit?.distance(usize::try_from(from).ok()?, usize::try_from(to).ok()?)
+    })
+}
+
 /// Whether every locality's nearest node (by the SLIT) is itself — the basic sanity an
 /// allocator relies on, that local memory is never further than remote memory. Every
 /// locality is checked against every other, however many the SLIT lists (the matrix is

@@ -89,6 +89,15 @@ CONFIRMED = ("gone", "deleted", "deleting", "disk_erasing")
 # Methods that are safe to repeat. A repeated POST could create a second server.
 IDEMPOTENT = ("GET", "DELETE")
 
+# The bench loader's switches (TASKS items 112 and 116), each a file in \EFI\ORIGIN\ that only
+# QEMU scenarios write. The install refuses an ESP that holds any of them.
+BENCH_SWITCHES = ("BENCH-STALE-KEY", "BENCH-AFTER")
+
+
+def refuse_bench_switches():
+    """The shell tests that fail the install if the ESP holds a bench switch."""
+    return "".join(f"test ! -e /boot/efi/EFI/ORIGIN/{name}; " for name in BENCH_SWITCHES)
+
 
 def die(message):
     print(f"latitude: {message}", file=sys.stderr)
@@ -801,6 +810,11 @@ class Console:
         self.command, self.reopen = command, reopen
         self.path = rental_dir / "sol.log"
         self.events = open(rental_dir / "sol-events.log", "a")
+        # When the console's bytes arrived, sampled every half second: "<time> <size>" whenever
+        # the size changed (TASKS item 116: how long after the loader's last line the machine
+        # started again).
+        self.times = open(rental_dir / TIMES_FILE, "a")
+        self.last_size = None
         self.log = open(self.path, "ab")
         self.process = None
         self.stopping = threading.Event()
@@ -835,6 +849,7 @@ class Console:
             self.note(f"console session opened at byte {self.size()}")
             while self.process.poll() is None and not self.stopping.is_set():
                 time.sleep(0.5)
+                self.mark_time()
             if self.stopping.is_set():
                 break
             self.note(f"console session ended (exit {self.process.returncode}) at byte {self.size()}")
@@ -846,6 +861,13 @@ class Console:
                     self.command = command
                 quick_failures = 0
             time.sleep(1 if quick_failures == 0 else 2)
+
+    def mark_time(self):
+        size = self.size()
+        if size != self.last_size and not self.times.closed:
+            self.times.write(f"{now():.1f} {size}\n")
+            self.times.flush()
+            self.last_size = size
 
     def flush(self):
         if not self.log.closed:
@@ -869,6 +891,7 @@ class Console:
         self.thread.join(timeout=15)
         self.log.close()
         self.events.close()
+        self.times.close()
 
 
 def out_of_band(server_id, key_id, deadline):
@@ -1049,6 +1072,11 @@ def scope_verdict(lscpu):
 
 BENCH_LINE = "origin-boot: bench build:"
 CRUMB_BYTES = "RS12345678"
+# TASKS item 116: every bench loader that resets after ExitBootServices says whether BENCH-AFTER
+# is there, and each start of a loader prints its banner. The file of the console's arrival times.
+RESET_BUILD_LINE = "BENCH-AFTER"
+LOADER_START = "UEFI loader (build"
+TIMES_FILE = "sol-times.log"
 
 
 def breadcrumbs(text):
@@ -1057,7 +1085,7 @@ def breadcrumbs(text):
     `RS12345678` when every step passed, so the last one names the step the boot stopped after.
     None for a boot that was not a bench build's (no bench loader line), "" for one that wrote
     none."""
-    if BENCH_LINE not in text:
+    if BENCH_LINE not in text or RESET_BUILD_LINE in text:
         return None
     after = text[text.rfind(LOADER_LINE):]
     after = after[after.find("\n") + 1:] if "\n" in after else ""
@@ -1083,6 +1111,15 @@ def boot_result(text):
     if crumbs is not None:
         seen["breadcrumbs"] = crumbs
     said = "" if crumbs is None else f"; breadcrumbs: {crumbs or 'none'}"
+    # TASKS item 116: a bench loader that resets the machine starts again within the boot's
+    # window if ExitBootServices returned (reading B), and never does if it did not (reading A, or
+    # a ResetSystem that hung).
+    if RESET_BUILD_LINE in text:
+        runs = text.count(LOADER_START)
+        seen["loader_runs"] = runs
+        said = (f"; loader runs: {runs}, " +
+                ("so the machine reset itself after the loader's last line" if runs > 1
+                 else "with no reset of its own"))
     verdict = next((l for l in lines if VERDICT_LINE in l or REFUSED_LINE in l), None)
     halted = next((l for l in lines if KERNEL_LINE in l and any(h in l for h in HALTED_LINES)), None)
     origin = [l for l in lines if KERNEL_LINE in l or LOADER_LINE in l]
@@ -1093,6 +1130,46 @@ def boot_result(text):
         return {"ended": True, "summary": "a system other than Origin started (a login prompt)", **seen}
     last = origin[-1] if origin else (lines[-1] if lines else "nothing on the console")
     return {"ended": False, "summary": f"no verdict; last line: {last[:200]}{said}", **seen}
+
+
+def after_last_line(raw, times):
+    """TASKS item 116: in one boot's raw console bytes, how many seconds after the loader's first
+    `exiting boot services` line the next byte arrived, and the next loader's banner, from the
+    arrival times `[(time, size)]` (the console's size from the boot's start). None for what did
+    not arrive within the boot. Times are good to the half second the console is sampled at."""
+    end = raw.find(b"entering the Framekernel")
+    if end < 0 or not times:
+        return None, None
+    end = raw.find(b"\n", end)
+    end = len(raw) if end < 0 else end + 1
+
+    def arrived(offset):
+        return next((t for t, size in times if size > offset), None)
+
+    last = arrived(end - 1)
+
+    def after(offset):
+        if offset is None or offset >= len(raw) or last is None:
+            return None
+        when = arrived(offset)
+        return None if when is None else round(when - last, 1)
+
+    loader = raw.find(LOADER_START.encode(), end)
+    return after(end), after(loader if loader >= 0 else None)
+
+
+def read_times(path, start):
+    """The console's arrival times from `path`, as sizes counted from byte `start`."""
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        t, _, size = line.partition(" ")
+        try:
+            out.append((float(t), int(size) - start))
+        except ValueError:
+            continue
+    return [(t, size) for t, size in out if size > 0]
 
 
 def last_boot(result):
@@ -1155,9 +1232,10 @@ def cmd_rental_b(args):
         rental.ssh("rm -rf /tmp/origin && mkdir -m 700 /tmp/origin", check=True, timeout=60)
         subprocess.run(["scp", "-q"] + ssh_base(rental.dir)[1:] + [str(loader), str(kernel),
                        f"{OS_USER}@{rental.ip}:/tmp/origin/"], check=True, timeout=300)
-        # TASKS item 112: a bench loader's stale-key switch is for QEMU scenarios only; the rented
-        # ESP never holds it, so the board takes its natural path through ExitBootServices.
-        install = (f"set -eu; test -f '{target}'; test ! -e /boot/efi/EFI/ORIGIN/BENCH-STALE-KEY; "
+        # TASKS items 112 and 116: a bench loader's switches are for QEMU scenarios only; the
+        # rented ESP never holds one, so the board takes the rental's path: its own key in
+        # ExitBootServices, and the reset afterwards.
+        install = (f"set -eu; test -f '{target}'; {refuse_bench_switches()}"
                    f"install -D -m 0644 /tmp/origin/KERNEL.ONBF /boot/efi/EFI/ORIGIN/KERNEL.ONBF; "
                    f"cp /tmp/origin/BOOTX64.EFI '{target}'; sync; "
                    f"sha256sum '{target}' /boot/efi/EFI/ORIGIN/KERNEL.ONBF")
@@ -1167,7 +1245,7 @@ def cmd_rental_b(args):
             raise RuntimeError("the files on the ESP do not match the image")
         (rental.dir / "installed.txt").write_text(f"{entry} {path}; {last}\n{' '.join(sums)}\n")
         print(f"{stamp()} Origin's loader is {path}, and its kernel \\EFI\\ORIGIN\\KERNEL.ONBF; "
-              "no UEFI variable was written, and the ESP holds no BENCH-STALE-KEY")
+              f"no UEFI variable was written, and the ESP holds no {' and no '.join(BENCH_SWITCHES)}")
         console = rental.console
         if not console:
             raise RuntimeError("no serial console: a boot would show nothing")
@@ -1187,6 +1265,14 @@ def cmd_rental_b(args):
                     time.sleep(10)
                     result = boot_result(console.text(start))
                 result.update(boot=boot, start=start, end=console.size())
+                if RESET_BUILD_LINE in console.text(start):
+                    raw = console.path.read_bytes()[start:result["end"]]
+                    first, loader_again = after_last_line(raw, read_times(rental.dir / TIMES_FILE, start))
+                    result.update(next_byte_s=first, next_loader_s=loader_again)
+                    result["summary"] += (f"; after the loader's last line the next byte came "
+                                          f"{'after ' + str(first) + ' s' if first is not None else 'never, within the boot'}"
+                                          f", the next loader "
+                                          f"{'after ' + str(loader_again) + ' s' if loader_again is not None else 'never'}")
                 results.append(result)
                 print(f"{stamp()} boot {boot}: {result['summary']}")
                 (rental.dir / "boots.json").write_text(json.dumps(results, indent=2))
@@ -1201,6 +1287,15 @@ def cmd_rental_b(args):
                 print(f"{stamp()} the record draft could not be written: {e!r}", file=sys.stderr)
 
     rent(args, "b", work, check)
+
+
+def loader_kind(path):
+    """What the image directory's loader is: a bench build's says so in its own bytes (TASKS
+    items 112 and 116, F2's text)."""
+    data = Path(path).read_bytes() if Path(path).exists() else b""
+    if b"bench build" in data:
+        return "the bench loader (developer-mode, the TEST trust store; never signed or shipped)"
+    return "developer-mode loader"
 
 
 def sha256(path):
@@ -1231,7 +1326,7 @@ def write_record(args, rental, results):
                     f"{dmi.get('board_name', '?')}; {cpu.get('CPU(s)', '?')} logical processors"),
         ("Firmware", f"{dmi.get('bios_vendor', '?')} {dmi.get('bios_version', '?')} "
                      f"({dmi.get('bios_date', '?')}); {read('boot-mode.txt').strip()}; Secure Boot off"),
-        ("Source revision", f"`{args.source_revision}`; developer-mode loader; `BOOTX64.EFI` SHA-256 "
+        ("Source revision", f"`{args.source_revision}`; {loader_kind(Path(args.image_dir) / 'BOOTX64.EFI')}; `BOOTX64.EFI` SHA-256 "
                             f"{sha256(Path(args.image_dir) / 'BOOTX64.EFI')}; `KERNEL.ONBF` SHA-256 "
                             f"{sha256(Path(args.image_dir) / 'KERNEL.ONBF')}"),
         ("Date", date),

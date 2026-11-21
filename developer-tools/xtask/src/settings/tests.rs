@@ -247,7 +247,7 @@ fn a_value_a_variable_does_not_take_is_refused() {
         (&[(SMP, "-1")], "ORIGIN_QEMU_SMP must be"),
         (
             &[(TOPOLOGY, "sparce")],
-            "ORIGIN_QEMU_TOPOLOGY must be x2apic, sparse, many or listed",
+            "ORIGIN_QEMU_TOPOLOGY must be x2apic, sparse, many, listed, smt or packages",
         ),
         (&[(TOPOLOGY, "X2APIC")], "ORIGIN_QEMU_TOPOLOGY must be"),
         (
@@ -494,6 +494,7 @@ fn the_commands_that_set_their_machines_refuse_the_person_s() {
             "boot-sparse",
             "boot-many",
             "boot-listed",
+            "boot-domains",
             "boot-large",
             "boot-rented",
         ]

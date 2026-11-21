@@ -556,7 +556,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 96. **The move, its proofs and pinned mode (ADR-0020 S6, S20, S23). Plan P5, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 93, 94 and 95.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
 
-97. **Scheduling domains, equal capacity and the SMT and two-package machines (ADR-0020 S8, S9, S23). Plan P6, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after the records are on `main`; beside TASKS item 92.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
+97. **Scheduling domains, equal capacity and the SMT and two-package machines (ADR-0020 S8, S9, S23). Plan P6, batch 9. Numbered by the coordinating session on 2026-11-20; built on `claude/t97-domains-21554f` (2026-11-21), its contract, controls, comparison and review in its entry under "Task contracts"; lands after TASKS items 94 and 95.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
 
 98. **The idle pull and the idle kick (ADR-0020 S7, S10). Plan P7, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 96 and 97.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
 
@@ -595,7 +595,6 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 113. **The APIC timer's calibration under KVM (TASKS item 78's Q8). Numbered by the coordinating session on 2026-11-21; not started; after TASKS item 78's figures line.**
     - Every KVM boot in CI discards all 1,024 calibration windows as disturbed and keeps the least disturbed one: about 10 s a boot by arithmetic, not measured.
     - This item measures what disturbs the windows under KVM, with TASKS item 78's figures line, and finds a calibration that settles sooner without accepting a worse window.
-
 114. **`Online::add` reserves its list before the first INIT (TASKS item 94's review, R94-8). Numbered by the coordinating session on 2026-11-21; not started; after TASKS item 93.** Today `Online::add` pushes without a reservation, and a processor's start can panic for want of memory. The list is reserved before the first INIT, and a failed reservation is counted as `NotStarted::Memory`.
 115. **A pair set aside when a count pauses at zero (TASKS item 78's review, R7). Numbered by the coordinating session on 2026-11-21; built only if a log shows a correct timer judged Slow.** TASKS item 78's rule can judge a correct timer Slow at once if a hypervisor holds the count at zero after an expiry, which is outside its linear model. ADR-0013 states this as a limit. The reviewer's guard sets aside a pair whose lower slope exceeds the least upper slope of its single steps. It carries its own risk (coarse-step counts), so it waits for evidence.
 116. **A bench loader that tells apart a hand-over that never returns from a console port the firmware's exit switches off (rental D's findings, rank 1). Numbered by the coordinating session on 2026-11-21; started the same day, at the owner's word.**
@@ -4143,3 +4142,230 @@ Built on `claude/t95-context-moves-20031f`, cut from `land/batch-9` at `a25228c9
 - **The gated pass's cost** on the 65- and 67-processor machines, and the FIFO wait's (R95-10, D95-8), are owed in CL48 to item 96, when something moves.
 - **Not tested:** `relocate`'s mapping of a failed restore to `NotRestored`; an ABA race in a model (a sequential host test shows the case).
 
+### 116. The reset diagnostic: a bench loader that separates rental D's two readings (rental D's findings, rank 1)
+
+Asked for by the owner on 2026-11-21 ("Start it"), from rental D's findings (`docs/research/2026-11-21-rental-d-findings.md`, rank 1). Rental D booted TASKS item 112's bench build three times. After the loader's last line there was nothing: no line after `ExitBootServices`, no halting line, no breadcrumb. Two readings fit, each one cause for rentals B, C and D: **A**, the call does not return on the rented firmware; **B**, it returns, and nothing written straight to the SPCR's UART after it reaches the console (B1, the UART's registers changed as the firmware exits, the divisor included, which the kernel keeps; B2, the port switched off). Silence cannot tell them apart, so this build adds a channel that needs no UART: a reset, which a rented console shows as a new firmware start.
+
+The coordinating session gave the design in its brief and asked for the contract and the as-built design here, with no separate contract round. Built on `claude/t116-reset-diagnostic`, cut from `land/batch-9` at `843ef415`.
+
+- **Task ID:** TASKS item 116.
+- **Objective:** one rental tells A from B, and B1 from B2, through a bench loader that:
+  - **before the call**, prints through the firmware's console the UART's registers as the firmware left them (IER, LCR, MCR, LSR, MSR, scratch, and the divisor under DLAB, LCR put back), then writes one line straight to the UART, and one mark just before each call (`X`, `Y`);
+  - **after the call returns**, either way, writes the existing line (which call succeeded, or decision item 342's halting line), reads the registers again, writes the firmware's values back (divisor, LCR, IER, MCR, the FIFOs on and cleared), and writes a line naming what it read after the call;
+  - **then resets the machine, whatever was seen**: a cold `ResetSystem` about 5 s later; if the machine still runs 2 s after that, the FADT's reset register; then the halt. The kernel is not entered.
+- **Source ownership:** `boot/uefi/src/bench.rs` and `main.rs` under the bench flag; `boot/uefi/src/spcr.rs` (two private functions made crate-visible for the bench walk); `developer-tools/xtask` (`boot-bench`'s scenarios and checks, whether QEMU exited by itself); `developer-tools/bench/latitude.py` (the install refuses the new switch); the records.
+- **Architecture contract:** ADR-0002 B5 and B8, Amendment 2 (item 342) and Amendment 3 (item 344: a bench loader may call `ResetSystem` after `ExitBootServices`, a bench-only exception to B5); ADR-0010 E5; ADR-0013; ADR-0018 V3; TASKS item 112's F1, F2 and refusals, unchanged; CLAUDE.md §13 (items 110 and 111), §14.
+- **Specifications:** UEFI 2.11 §4.5.1 (the runtime services table, its signature, `ResetSystem`'s place), §7.4, §7.5.2 (`Stall`), §8.5.1.1 (`ResetSystem`, `EfiResetCold`, that it does not return); ACPI 6.6 §4.8.3.6 and §5.2.9 (`RESET_REG`, `RESET_VALUE`, `RESET_REG_SUP`: 8 bits at bit 0, in system I/O, system memory or bus 0's configuration space; the machine resets on the write); PC16550D (the registers, DLAB, loopback, THRE and TEMT). Read on 2026-11-21 in the owner's copies of UEFI 2.11 and ACPI 6.6, paraphrased.
+- **Dependencies:** none new. The bench walk reads the FADT with the kernel's own parser, `origin_acpi_tables::fadt`, which the loader already depends on.
+- **Security invariants:**
+  - No normal image holds any of it: every line is under `cfg(origin_bench)` in files F1 lists, and F2 and the refusals are unchanged. **The normal loaders are byte-identical to the batch's** (shown below).
+  - The FADT's reset register is untrusted input: the RSDP and XSDT checked as the SPCR's walk checks them, the first FADT whose header checks, the kernel's parser's rules (`RESET_REG_SUP`, 8 bits at bit 0, the value present), then **only system I/O, a port that fits 16 bits, or system memory in a region the firmware's map describes as memory-mapped I/O**. Anything else is said on the firmware's console before the call, and the loader then halts where it would have written it.
+  - `ResetSystem` comes from a runtime services table that is aligned, signed `RUNTSERV` and long enough to hold it, and is called with no reset data, the firmware's own page tables still loaded.
+  - The UART writes reach only the eight ports of the UART the SPCR named and the shared parser accepted, as TASKS item 112's do; the receive buffer is never read.
+- **Performance constraints:** none in normal images. In a bench build: one `Stall` of 20 ms to count the time-stamp counter, a few register reads and lines, and the waits of the reset (5 s, 2 s, 1 s).
+
+**Design (the coordinating session's brief, as built here):**
+- **How the bench build selects the reset, and how the kernel is still reached under QEMU.** A file on the loader's volume, `\EFI\ORIGIN\BENCH-AFTER`, read as `BENCH-STALE-KEY` is (at most 16 bytes, nothing allocated). **Without it, which is how every rental boots, the loader resets the machine and never enters the kernel.** QEMU's scenarios write it: `kernel` keeps TASKS item 112's path (the kernel after a successful call, the halt after a failed one, no reset), `fadt` leaves `ResetSystem` uncalled so that the FADT's register is what resets, and `disturb` has the loader itself turn the UART's loopback on and change its divisor as the call returns, rental D's reading B1 made under QEMU. The rental tool's install refuses an ESP that holds `BENCH-AFTER`, as it refuses `BENCH-STALE-KEY`, and a test ties its list to every such path the bench loader names.
+- **Every mode** writes the lines before the call and the line after it, so the registers' read-back and write-back run in every bench scenario, the kernel's included.
+- **The waits** use the time-stamp counter, counted before the call over 20 ms of the firmware's `Stall` and printed; with no count, 6,000,000 ticks a millisecond is taken, so a wait can only be longer than asked for. Interrupts are masked before the reset's waits.
+- **Under QEMU** every boot runs with `-no-reboot`, so a reset is QEMU exiting. `boot-test`'s harness now records whether QEMU exited by itself before it was stopped, and a reset scenario's check requires it within 30 s of the reset's line, with nothing after that line.
+
+**The review** (`REVIEW_T116_2026-11-21.md`): one independent AI reviewer, given the diff and not the author's conclusions, read only. No High; three Medium; nine Low. Answered in `a4dadf49`, except where said:
+- **R116-1 (Medium), a `ResetSystem` that hangs, kept as a limit for the coordinating session.** The FADT's register is reached only if `ResetSystem` returns, so a `ResetSystem` that neither resets nor returns reads as reading A. The order is the brief's and item 344's. **Reading rule for rental E: no reset means A, or a `ResetSystem` that hung after a call that returned.** Two ways to close it are the owner's call: write the FADT's register first (on the rented board an SMI, `0xBE` to port `0xB2`, so also firmware code), or a positive control, a boot that calls `ResetSystem` before `ExitBootServices`, which the rental tool would then have to allow.
+- **R116-2 (Medium):** the line after the call now names each call's status, since under B1 it is the first readable line. Under B2 the reset alone does not tell a successful call from a failed one; `Y` shows a first call refused for its key. Kept as a limit.
+- **R116-3 (Medium):** the rental tool samples the console's arrival times into `sol-times.log`. For a reset build, each boot's record counts the loader's runs and gives the seconds from the loader's last line to the next byte and to the next loader: seconds mean B, nothing within the boot means A, about five minutes would point to the firmware's watchdog. A reset build reports no breadcrumbs, and the record names the loader as the bench loader.
+- **R116-4:** a counted rate is capped at the assumed 6,000,000 ticks a millisecond. **R116-5:** interrupts are masked as soon as the call returns, either way, and again if `ResetSystem` returns. **R116-6:** the register read under the firmware runs with interrupts masked. **R116-7:** the marks are written only if the line before the call went out whole and the UART then emptied. **R116-8:** I/O port 0 is refused. **R116-9:** the reset line is formatted from the delays and says when there is no usable register. **R116-11:** a switch's name must leave room for its NUL. **R116-12:** the port writer's and reader's SAFETY comments are exact.
+- **R116-10:** a reset is now QEMU exiting with a success status, waited for after its output closes, and the normal-loader scenario refuses a bare mark. Kept as limits: a triple fault is a reset to QEMU too, which the scenarios tell apart only by their lines (the reset line, then nothing); and QEMU's UART ignores the divisor, so the disturbed scenario shows the loopback written back, and only the host test shows the divisor.
+
+**As built (2026-11-21).** On `claude/t116-reset-diagnostic`: `58c5c63c` (the loader), `2d23f28a` (xtask), `dc9b4ba8` (the rental tool), `a4dadf49` (the review's answers), `722e1141` (one `unsafe` operation per block, which the bench Clippy run asked for), `cc6d47a0` (rustfmt), and the records. `land/batch-9` at `a2898d14` (TASKS item 78, and main's PR 53 with ADR-0002 Amendment 3 and this item's list entry) merged in at `5b4e8cb0`.
+- **`boot/uefi/src/bench.rs`** (no `unsafe`): `After` and the `BENCH-AFTER` switch; `UartState` (`read`, `write_back`), `drain`, `disturb`; `UnderFirmware`, `BEFORE_CALL`, the marks, `AfterCall`; `find_reset` and its rules, `in_mmio`, `ResetLine`; the runtime table's constants; `ticks_per_ms`, `ResetPlan`, `ResetSoon`, `Tried`, `Fallback`, `NOT_RESET`.
+- **`boot/uefi/src/main.rs`**, under the flag: the switch read (`read_bench_file`, which `BENCH-STALE-KEY` now shares), the FADT's register read in the SPCR's walk, `bench_before_call`, `count_ticks` (over `Stall`), `runtime_reset_system`, the marks in the call's closure, `bench_disturb`, `bench_after_call`, `bench_reset`, `write_reset_register`, `wait_ms`, `mask_interrupts`, `with_interrupts_masked`. **`spcr.rs`:** `parse_rsdp` and `check_xsdt` crate-visible.
+- **xtask:** `Completed::exited`; the quiet period ended by QEMU's exit; `boot-bench`'s seven scenarios and their checks.
+- **The rental tool:** `BENCH_SWITCHES` and the install's refusal of each; `sol-times.log`; a reset build's loader runs and timing (`after_last_line`, `read_times`); `loader_kind`.
+
+**What ran (QEMU 11.1.3's software processor on the development Mac, 2026-11-21, inside `cargo xtask exclusive`).**
+- **Host tests:** the loader's library 78 (16 of them `bench.rs`'s: the 16550 model, the FADT walk's twelve cases, the lines, the switch); xtask's bench and toolchain tests; the rental tool's 36.
+- **The normal images, 10:29 to 10:31 UTC:** the reproducible gate's 40 kept files, from both of its builds (the loader each way it is built, the kernel, its image and the carried programs), are the same bytes on `land/batch-9` at `843ef415` and on this branch at `39bf8b0b` (`cargo xtask reproducible-compare`).
+- **`boot-bench` on `722e1141`, 10:32 to 10:33 UTC: 7 of 7 in 91 s**, Clippy and the bench builds included:
+
+| Scenario | Time | After the loader's last line, on the SPCR's UART |
+|---|---|---|
+| the firmware's key (`kernel`) | 13.4 s | `X`, `… exited on the first call`, `… after ExitBootServices (first call EFI_SUCCESS) the UART read …`, `RS12345678`, the kernel's lines |
+| a stale key once (`kernel`) | 13.5 s | `X`, `Y`, the retry's line, the after-call line, `RS12345678`, the kernel's lines |
+| a stale key twice (`kernel`) | 22.6 s | `X`, `Y`, the halting line, the after-call line with both statuses, then nothing for 20 s; QEMU still running |
+| no switch, as a rental | 7.7 s | `X`, `… exited on the first call`, the after-call line, the reset's line; QEMU exited (the reset through `ResetSystem`) |
+| `fadt` | 9.8 s | as above, then `ResetSystem was not called (BENCH-AFTER fadt): writing 0xf to I/O port 0xcf9, the FADT's reset register`; QEMU exited |
+| `disturb` | 7.7 s | `X`, then the after-call line reading `MCR 0x10, LSR 0x63, MSR 0x00, … divisor 0x000c`, the reset's line; the line written before the values went back never reached the console |
+| the bench kernel under the normal loader | 13.1 s | no bench line, no mark, no breadcrumb |
+
+  On the loader's console under OVMF: the counter counted at 1,001,150 to 1,001,650 ticks a millisecond over `Stall`; `ResetSystem` found; the FADT's register `0xf` to I/O port `0xcf9`; COM2 under the firmware `IER 0x00, LCR 0x03, MCR 0x00, LSR 0x60, MSR 0xb0, scratch 0x00, divisor 0x0001`.
+- **Found on the way:** OVMF leaves COM2's modem control at 0 (no DTR, RTS or OUT2), and QEMU's UART sends regardless. On rental E the line before the call shows whether the rented firmware's settings carry a raw write.
+
+**Controls and gates on `8ff56bd9`** (the code of `cc6d47a0` and the records; `land/batch-9` at `a2898d14` merged in), under Rust 1.100.0 on the development Mac with QEMU 11.1.3 TCG and OVMF, in one turn of the machine (12:07 to 13:31 UTC). The tree was clean before the controls, after them and after the gates.
+- **The batch's normal images:** the reproducible gate on `a2898d14`, in a separate checkout, kept its 40 files for the comparison below.
+- **Controls, each planted, run and restored; each failed:**
+
+| Control | What was planted | How it failed |
+|---|---|---|
+| BC-1 | the kernel's breadcrumbs 2 and 3 swapped | `boot-bench`'s firmware's-key scenario: first missing marker `RS12345678` |
+| BC-2 | the first call given the firmware's key despite `BENCH-STALE-KEY` | the stale-key-once scenario: the retry's line missing |
+| BC-3 | the bench build's settings added to the normal build's | the reproducible gate: the loader as a release builds it holds the text "bench build" (F2) |
+| BC-4 | the bench flag named in `framekernel/src/console.rs` | `bench-gate`: only listed files may name it (F1) |
+| BC-5 | the halting line silenced | the stale-key-twice scenario: its `ExitBootServices failed` line missing |
+| BC-6 | `ResetSystem`'s call and the FADT register's write both silenced | the no-switch scenario: the console ends with `the FADT's reset register did not reset the machine: halting`, and QEMU did not exit (stopped after 120 s) |
+| BC-7 | the write-back skipped | the disturbed scenario: loopback stayed on, so no line after the call reached the console; QEMU exited on the reset before the loader's output was complete |
+
+- **Gates:** `cargo xtask check` passed (710 s; Loom's 79 models and 120 controls among it). `reproducible-compare` against `a2898d14`'s files: all 40 the same bytes. `boot-test` passed (53 s). `boot-matrix` passed three times in a row, in 1,263, 1,259 and 1,250 s, each with `boot-bench` 7 of 7 (89, 88 and 88 s) and 41 kernel verdicts:
+  - 35 at `71 of 72`: speculation controls, as under QEMU always (item 154);
+  - 3 at `70 of 72`: the oversubscribed machines also failing scheduler fairness, forgiven by name (ADR-0013 Amendment 2);
+  - the three machines with proofs that do not run, as on the base.
+- **`cargo xtask bench-build` after them, the images for rental E:** `BOOTX64.EFI` 242,176 bytes, SHA-256 `68a0addf6d0a8f59bb1ca0b39585bd17beaa44903375a8f4b7319d50e6d8cd5d`; `KERNEL.ONBF` 1,969,408 bytes, SHA-256 `f65400db6d1e47e982a6a5f8688f709b4655454e9397e33d66cc9334b6d90097`. With no `BENCH-AFTER` the loader never enters that kernel; it still checks the kernel image before the call.
+
+`land/batch-9` at `0e4f99f9` (TASKS item 95) was merged after the gates, at `cbc68e1b`. No file is changed by both sides. `TASKS.md` conflicted only because each adds a section at its end; both were kept, 95's first. The quick gates ran again on the merge; no boot ran again for it.
+
+**Follow-ups:**
+- **R116-1, ruled by the coordinating session on 2026-11-21, before rental E:** item 344's order is kept: `ResetSystem`, then the FADT's register. The A-pattern reads as "A, or `ResetSystem` hung after a call that returned". Changing the order or adding a positive control would change the owner's item 344, or need a switch on the ESP, which the rental tool refuses. If rental E shows the A-pattern, the step that separates the two is put to the owner then: the FADT's register first, or the positive control.
+- `onbf-sign`'s own command line still does not refuse a bench kernel (TASKS item 112's follow-up).
+- TASKS item 84's D1 sentence about COM2 under OVMF still needs correcting (TASKS item 112's follow-up).
+- Done here, on the coordinating session's word: cost ledger row CL46 now holds rentals C's, D's and E's walk figures (`hw`): 1.4 to 1.5 µs, 4.3 to 4.4 µs and 1.4 to 1.7 µs, once a boot.
+
+**Rental E (2026-11-21, on the owner's "Rent it"; the coordinating session's guarded run, 14:00:36 to 14:25:54 UTC, $0.81; the ledger now 5 rentals, $4.05):** the images above, from `8ff56bd9`. Record `docs/hardware/records/2026-11-21-latitude-m4-metal-small-e.md` and its log; findings `docs/research/2026-11-21-rental-e-findings.md`. Three boots alike, one loader run in each: every line before the call arrived, the line straight to the UART and `X` included; nothing after it, no `Y` and no reset, for 6 to 7.4 minutes. That is the A-pattern of this entry's reading table: `ExitBootServices` does not return, or it returned and both the console's path and `ResetSystem` failed after it (R116-1). TASKS item 116's build did what it was for on the machine; the reading it gives is the A row's.
+
+### 97. Scheduling domains, equal capacity and the SMT and two-package machines (ADR-0020 S8, S9, S23; plan P6)
+
+Assigned by the coordinating session on 2026-11-20, on the owner's word ("Start all four"), beside TASKS items 93, 94 and 95. The contract went to the coordinating session before any code (the coordination notes' `t97-contract.md`, written against `land/batch-9` at `a25228c9` on 2026-11-21 between 23:53 and 00:45 UTC). It was accepted at 00:50 UTC with the recommendations of Q1 to Q13 and these conditions:
+
+- **Q1:** the PPTT's claims and CPUID's are combined by their meet. This is a reading of S8, recorded as a dated note in it citing ACPI 6.6 §5.2.31.2; no owner item. The proof is Report class.
+- **Q2:** the aligned-block rule, with a host test on a hybrid layout.
+- **Q4:** `-cpu max,vendor=GenuineIntel` for the new machines under TCG; `-machine smp-cache` pinned on every machine, after checking that QEMU accepts it on each; every existing machine's log shown unchanged apart from cache and domain lines (base against tip, on the Mac); under KVM the "from" line held to its start.
+- **Q6:** QEMU's MADT IDs measured before the PPTT was planted.
+- **Q9:** the two machines held out of CI behind `ORIGIN_BOOT_MATRIX_ANY_COUNT` until a CI run with it on passes at two guest processors per host processor.
+- **Q10:** a host test for each source that is missing one processor.
+- **Q11:** `cache.rs` left alone.
+- **Q13:** no new per-CPU table.
+- **Landing:** after TASKS items 94 and 95.
+
+Built on `claude/t97-domains-21554f`, cut from `land/batch-9` at `a25228c9` (`main` `fc96834d` plus TASKS item 92), checked with `git log -1` before the first commit.
+
+**As built**, in order:
+
+- `dfa9e28d`: `topology`: each processor reads which processors share its caches (leaf 04H, Fn8000_001D).
+- `66feaa16`: `capacity`: S9's sources as pure functions over synthetic inputs.
+- `b636882d`: `domains`: the tree, with disagreements read as "not shared".
+- `f5c68123`: `acpi`: the PPTT's shared caches, and the rules the reading rests on.
+- `b48748e7`: `numa::node_order`; the kernel crate re-exports `capacity` and `domains`.
+- `ed8e7f43`: the kernel's proof, "scheduling domains" (Report).
+- `f428e579`: xtask: the two machines, the pinned caches, the PPTT and the expected trees.
+- `bf509791`: ADR-0020 S8's dated note (Q1).
+- `edffc8ed`, `21d6ba7c`, `ad3aa081`, `9b4bcc8a`: the answers to the independent review (R97-1 to R97-17; `REVIEW_T97_2026-11-21.md`).
+- The records: this entry, ADR-0013's row and controls, the provenance entry, CL20, the research ledger `docs/research/2026-11-21-scheduling-domains.md` and `REVIEW_T97_2026-11-21.md`.
+- `c77b6243`: `land/batch-9` merged at `0e4f99f9` (TASKS items 94, 78, 112 and 95, rental D, main's PRs 51 to 53), once, as the coordinating session asked. Only four record files conflicted (ADR-0013, `PERFORMANCE_BUDGETS.md`, `SOURCE_PROVENANCE.md` and this file), each an append by both sides; both kept, the batch's first. The code merged cleanly. The merge sets `bootproof`'s six count tests to 73.
+
+**The design as it lands:**
+
+- **Shared caches (`origin_frame::topology::Caches`).**
+  - Each processor reads its own caches: Fn8000_001D where TopologyExtensions says it exists, else leaf 04H on an Intel processor (AMD reserves leaf 04H).
+  - For each cache it records the level, the type and the sharing shift: EAX\[25:14\] plus one, rounded up to a power of two.
+  - Reserved types and levels are skipped and named. At most 8 caches and 32 sub-leaves are read.
+- **The tree (`origin_frame::domains`).**
+  - Each processor claims an aligned block of APIC IDs for each level: core, L2, last-level cache, die (only where a leaf enumerates dies) and package.
+  - A processor's group is the largest aligned block inside its own claim and inside the claim of every member. A claim cut because a member claims less is counted.
+  - The PPTT's cache claims are met with CPUID's. Each processor where they differ is counted. A PPTT claim is used only where it names the same level as CPUID's; otherwise the processor is counted as naming another level.
+  - The SRAT gives the node level. Levels are ordered by refinement; equal levels are merged under joined names, and single processors are left out. Levels that cross fall back to core, die and package.
+  - Each node's other nodes are listed in ascending SLIT distance.
+  - Processors are named by CPU index.
+  - All of it is kept in `DOMAINS`, a `SetOnce` on the heap with no new per-CPU table, which items 98 and 100 read.
+- **The PPTT's reading (`origin_frame::acpi::pptt_caches`).**
+  - It walks from each leaf up through its parents, along each node's data chain.
+  - One structure listed by several nodes is one cache per node, unless its Cache ID is valid.
+  - Rules that leave the table unused:
+    - a leaf the MADT does not list, or lists twice;
+    - an enabled processor with no leaf;
+    - a leaf without an ID;
+    - an ID asked about twice;
+    - a chain entering a cache listed at another depth;
+    - two data chains on one node.
+  - Every lookup is a binary search over arrays sorted once.
+- **Capacity (`origin_frame::capacity`).** These are pure functions:
+  - HFI and Thread Director rows and flags;
+  - `_CPC`'s Highest Performance, as an Integer or as the field of a register;
+  - HWP's and AMD CPPC's Highest;
+  - AMD's ranking, which orders cores within one core type only.
+
+  `choose` takes the first source that gives every processor a value. No source reads a core type (S27-10). At boot every processor is 1024; TASKS item 106 reads the hardware.
+- **The proof.**
+  - `prove_domains` prints four lines:
+    - the tree;
+    - where its claims came from;
+    - what disagreed;
+    - the capacity.
+  - It fails, as a Report (ADR-0013 R3), on any finding.
+  - `bootproof` has 73 rows since `land/batch-9` was merged in: TASKS item 94's "FPU format" and this item's "scheduling domains" each added one.
+- **xtask.**
+  - `SMP_CACHE` pins QEMU's caches on every machine.
+  - Two new machines, as `boot-domains`:
+    - `ORIGIN_QEMU_TOPOLOGY=smt` and `packages`, each with explicit `cpus=` nodes;
+    - a PPTT planted on the two-package machine;
+    - expected lines computed from each machine's definition alone;
+    - run in `boot-matrix` on the Mac, and in CI only with `ORIGIN_BOOT_MATRIX_ANY_COUNT=on`.
+  - Under KVM the tree line and the "from" line are held to their starts. **No KVM tree has been measured.**
+
+**Measured:**
+
+- **QEMU 11.1.3 on the Mac**, guests paused:
+  - TCG's `max` is AuthenticAMD and refuses `topoext`;
+  - `smp-cache` is accepted on every machine;
+  - QEMU's default node placement puts a processor in its package's node (package index mod 2).
+- **QEMU's MADT ACPI processor IDs:** CPU 0 to 7 = ACPI IDs 0 to 7 on both new machines (a temporary print in `prove_domains`, booted once and reverted, 01:24 UTC). So the PPTT's leaves are named by CPU index.
+- **Boot times on the Mac** (`kernel boot: passed in`):
+  - first boots: SMT machine 15.1 s, two-package machine 14.7 s, default machine 13.1 s;
+  - in the control run: 15.3 s and 13.7 s;
+  - in the tip's full `boot-matrix` (04:55 to 05:15 UTC): 15.4 s and 15.0 s, against 13.2 to 13.4 s for the 4-processor machines and 76.9 to 78.8 s for the 65-processor ones;
+  - in the three `boot-matrix` runs of the gates on `c77b6243` (13:50 to 14:53 UTC): the SMT machine 15.1, 14.2 and 15.4 s, the two-package machine 13.7, 15.0 and 15.0 s, against 12.9 to 13.7 s for the 4-processor machines and 75.3 to 79.8 s for the 65-processor ones.
+- **CI** (2026-11-20, five runs): the real-processor `boot-matrix` step takes 14.7 to 19.2 minutes, 19.2 on an EPYC 7763. A kernel boot under KVM takes 24 to 27 s. Estimated share of the two new machines under KVM: 1 to 2 minutes, about 1 % of the 180-minute limit. **Held out of CI until measured there (Q9).**
+
+**Controls.** Each was a scripted edit, booted once with `cargo xtask boot-domains` at `9b4bcc8a` (04:49 to 04:55 UTC), the tree clean before and after; ADR-0013 has the table:
+- **C1, a narrower last-level-cache shift on CPU 3:** caught. `7 claims cut`, the tree changed, `consistent false: scheduling domains failed`, exit 1.
+- **C2, a PPTT on the SMT machine whose L3 is a node's:** caught. `8 differing from the PPTT`, the meet as the tree, the proof failed, exit 1.
+- **C3, the two-package machine's PPTT without Cache IDs:** passes as planned. `PPTT 5 caches, 0 with IDs`, with the same tree.
+
+**Base against tip (Q4 (b)).**
+- **The two runs:**
+  - The base is a full `boot-matrix` of `a25228c9` that TASKS item 94's session ran from an export, ending 00:55 UTC. Its export was compared file by file with this task's own export of `a25228c9` (`diff -rq`, nothing differed), so this task's queued run of the same commit was stopped rather than repeated.
+  - The tip is `9b4bcc8a`'s full `boot-matrix`, 04:55 to 05:15 UTC: `boot-matrix passed`.
+- **The method:** a script compared each of the 200 existing boots, as multisets of line forms (digits and hex masked, so the order processors interleave their lines does not count), with the cache and domain lines set aside.
+- **Unchanged:** 184 boots.
+- **The 16 that differ**, in two kinds of line only, each a run-to-run variation of host timing, not this change:
+  - the APIC timer's calibration line with or without `(1 disturbed window discarded)` (14 boots);
+  - on the two 65-processor machines, which of their boots carry the uneven fair-share lines ADR-0013 Amendment 2 reports (5 in each run, spread differently).
+- **Everything else matched:** the census, topology and NUMA lines, and every other proof's line. The verdict's count moved by the one new row.
+
+**The gates on `c77b6243`** (the code at `9b4bcc8a`, the records at `329f6e0d`, and `land/batch-9` merged at `0e4f99f9`), in one turn of the machine on a clean tree, 2026-11-21 from 13:33 to 14:53 UTC, under Rust 1.100.0 with QEMU 11.1.3 TCG and OVMF. The quick gates (fmt and every document gate) had passed before the turn:
+
+- `cargo clippy --locked --all-targets -- -D warnings` found nothing; `check` runs Clippy on the kernel for its target. The compiler's `harden-sls-ret` notice is printed, as everywhere since ADR-0017 Amendment 2.
+- `check` passed in 917 s: 2,566 host tests passed, 0 failed, 30 ignored (`origin-frame` 378, the kernel's library 566, xtask 403, `origin-sync` 147); Loom's 91 models passed and its 140 negative controls were caught; every document gate.
+- `boot-test` passed, 11 of 11, in 55 s.
+- `boot-matrix` passed three times in a row, in 1,278, 1,259 and 1,267 s, each with 43 kernel verdicts:
+  - 37 boots `degraded: 72 of 73 proofs passed; failed: speculation controls`, the two new machines among them;
+  - 3 with scheduler fairness too, the two 65-processor machines and the 67-processor sparse machine, their uneven shares forgiven as ADR-0013 names (65 or 67 guest processors on 10 host threads);
+  - the three machines built to lack something, each verdict naming it: `57 of 67` with 6 not run, `63 of 68` with 5 not run, and `65 of 67` with 6 not run (the random-number generator);
+  - the kernel stacks' region at 27 distinct bases in 27 kernel boots.
+- **The tree matched on every machine** in all three runs, as xtask computed it from each machine's definition.
+  - The SMT machine: `core, L2 4x2 [0-1|2-3|4-5|6-7]; node 2x4 [0-3|4-7]; last-level cache, package 1x8 [0-7]`, from leaf 04H on 8 of 8, no PPTT.
+  - The two-package machine: `last-level cache, package, node 2x4 [0-3|4-7]`, from leaf 04H on 8 of 8 and the planted PPTT's 5 caches, 2 with IDs.
+  - Both read `0 claims cut, 0 differing from the PPTT`, and capacity 1024 on 8 of 8.
+
+**Follow-ups** (for the coordinating session to number):
+
+1. Merge the two readers of leaf 04H: `cache.rs`'s sizes on the boot processor, and `topology`'s sharing on each processor (ruling Q11).
+2. Once the batch's first CI runs show the KVM tree lines on two or more runner processors, make them exact under KVM or record why they vary (ruling on R97-16).
+3. A CI run of the two new machines under KVM at two guest processors per host processor (ruling Q9): `ORIGIN_BOOT_MATRIX_ANY_COUNT=on`, or, booting only these two, a one-run step `cargo --locked xtask boot-domains` in `boot-real-cpu`. The hand-over says how.
+4. **No KVM tree has been measured** (ruling on R97-16): under KVM the tree line is held to its start until follow-up 2 is done.
+
+**Not shown:**
+
+- hybrid capacity, and any hardware capacity source at boot (ADR-0009 H4's machines; M3-6);
+- a cache-cluster level distinct from the core at boot: the machines S23 names have no modules (host tests only);
+- Fn8000_001D at boot (KVM on AMD only);
+- anything under KVM until CI runs it;
+- **no person has reviewed it.**
