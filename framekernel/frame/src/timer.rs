@@ -19,6 +19,7 @@
 //! 5. mask the timer again: nothing schedules on it yet (M3).
 
 use core::fmt::Write;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::acpi;
@@ -90,10 +91,15 @@ enum ApicWrite {
 
 /// The local APIC, in x2APIC mode: holding one proves the mode switch happened, so its
 /// register MSRs exist.
+///
+/// It is this processor's, so it lives no longer than the witness its processor was read under
+/// (`'a`; ADR-0020 S3), and is neither `Send` nor `Sync` (TASKS item 93, review finding R93-4).
+/// Kept past that witness, or sent to another thread, it would program the local APIC of whatever
+/// processor its holder ran on by then.
 #[derive(Debug)]
-pub struct X2Apic(());
+pub struct X2Apic<'a>(PhantomData<crate::trap::Here<'a>>);
 
-impl X2Apic {
+impl<'a> X2Apic<'a> {
     /// Switches the local APIC to x2APIC mode through the legal transitions and
     /// software-enables it with [`SPURIOUS_VECTOR`]. `me` is this processor, read under its
     /// start-up flow's witness (ADR-0020 S3; TASKS item 93): the mode is marked ready under it.
@@ -102,7 +108,7 @@ impl X2Apic {
     ///
     /// CPL 0, boot processor only, interrupts disabled, and x2APIC supported
     /// ([`cpu::x2apic_supported`]); the spurious vector must have an IDT gate.
-    pub unsafe fn enable(me: crate::cpu::ThisCpu<'_>) -> Self {
+    pub unsafe fn enable(me: crate::cpu::ThisCpu<'a>) -> Self {
         // SAFETY: the caller's contract; IA32_APIC_BASE exists on every x86-64 processor.
         let current = unsafe { rdmsr(IA32_APIC_BASE) };
         let (writes, count) = apic::x2apic_transition(current);
@@ -111,7 +117,7 @@ impl X2Apic {
             // disabled → xAPIC → x2APIC sequence, keeping every other bit as it was.
             unsafe { wrmsr(IA32_APIC_BASE, value) };
         }
-        let apic = Self(());
+        let apic = Self(PhantomData);
         apic.write(ApicWrite::SpuriousVector, apic::svr(SPURIOUS_VECTOR));
         if let Some(ready) = X2APIC_READY.this(me) {
             ready.store(true, core::sync::atomic::Ordering::Release);
@@ -122,11 +128,11 @@ impl X2Apic {
     /// This processor's handle, if its local APIC has been switched to x2APIC mode
     /// ([`X2Apic::enable`] has run here): the safe way to get one, for the processor `me` names,
     /// read under a witness (ADR-0020 S3; TASKS item 93). Its uses stay in that witness's life.
-    pub fn here(me: crate::cpu::ThisCpu<'_>) -> Option<Self> {
+    pub fn here(me: crate::cpu::ThisCpu<'a>) -> Option<Self> {
         X2APIC_READY
             .this(me)
             .is_some_and(|ready| ready.load(core::sync::atomic::Ordering::Acquire))
-            .then_some(Self(()))
+            .then_some(Self(PhantomData))
     }
 
     /// The handle for a processor whose local APIC is already in x2APIC mode, without
@@ -136,7 +142,7 @@ impl X2Apic {
     ///
     /// CPL 0, and [`X2Apic::enable`] has run on this processor.
     pub unsafe fn assume_enabled() -> Self {
-        Self(())
+        Self(PhantomData)
     }
 
     pub fn read(&self, reg: ApicRead) -> u64 {
@@ -397,7 +403,7 @@ pub fn start_periodic(lapic: &X2Apic) -> bool {
     true
 }
 
-impl X2Apic {
+impl X2Apic<'_> {
     /// Stops this processor's APIC timer.
     pub fn stop(&self) {
         self.stop_timer();
