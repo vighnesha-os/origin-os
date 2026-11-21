@@ -1588,7 +1588,9 @@ const CONTROLS: &[Control] = &[
     Control {
         // C3: the record moves at a switch, from the home of a running context to the frame of a
         // suspended one and back: the two records of T68-2. The incoming stack is uncovered
-        // between its frame's take and its home's store.
+        // between its frame's take and its home's store. Since TASKS item 95 (ADR-0020 S5) the
+        // outgoing frame is left in the leaving record rather than stored in its slot, so the
+        // texts name `record_leaving`; the bug and its model are the same.
         name: "contexts_record_moves_at_a_switch",
         file: CONTEXTS,
         from: "        let outgoing = self.current.load(Relaxed);
@@ -1596,7 +1598,7 @@ const CONTROLS: &[Control] = &[
             Some(_) if exiting => {
                 let _ = self.ended.swap(outgoing, AcqRel);
             }
-            Some(slot) => slot.frame.store(here, Release),
+            Some(_) => self.record_leaving(outgoing, here),
 ",
         to: "        if let Some(slot) = self.slots.get(incoming) {
             slot.home.store(next, Release);
@@ -1607,7 +1609,7 @@ const CONTROLS: &[Control] = &[
                 let _ = self.ended.swap(outgoing, AcqRel);
             }
             Some(slot) => {
-                slot.frame.store(here, Release);
+                self.record_leaving(outgoing, here);
                 slot.home.store(0, Release);
             }
 ",

@@ -14,7 +14,11 @@
 //!   free slot.
 //! - **`frame`**: the frame the trap entry may resume, while the context is suspended (a published
 //!   context waits for its first run suspended at its first frame), and 0 while it runs, after it
-//!   ended, and while a withdrawal is under way.
+//!   ended, while a withdrawal is under way, and from its switch-out until its processor publishes
+//!   the frame it left (below).
+//!
+//! Each table also has a **leaving record**: the frame the processor's last switch-out left and
+//! its slot, until the processor publishes it there.
 //!
 //! # What covers a stack, and why no switch uncovers one
 //!
@@ -26,8 +30,9 @@
 //! running thread and one for a suspended one, would not allow that. A switch-out hands a stack
 //! from the first to the second and a switch-in hands one back, so a reader that reads the two in
 //! a fixed order misses one direction. This was T68-2, in the review of TASKS item 68. The `frame`
-//! word still covers a stack a context is suspended on that is not its home: a measured stack
-//! (`origin_frame::stack::with_measured_stack`), or the boot flow's stack.
+//! word, or the leaving record until the frame is published, still covers a stack a context is
+//! suspended on that is not its home: a measured stack (`origin_frame::stack::with_measured_stack`),
+//! or the boot flow's stack.
 //!
 //! # The orderings
 //!
@@ -40,9 +45,9 @@
 //!   takes a given frame: a context withdrawn is never resumed, and one resumed is never
 //!   withdrawn. Nothing else writes a nonzero frame to 0. A frame is written into a slot whose
 //!   `frame` is 0 only by a claimer that has just taken it while free, or by this processor's
-//!   switch-out of the context it runs (`current`); a context being withdrawn never ran, so it
-//!   was never `current`, and no switch-out writes its slot (the review of TASKS items 75, 77
-//!   and 81, R75-3).
+//!   publication of the frame its switch-out of the running context (`current`) left; a context
+//!   being withdrawn never ran, so it was never `current`, and no publication writes its slot
+//!   (the review of TASKS items 75, 77 and 81, R75-3).
 //! - A home leaves the table by a Release store of 0, in one of two ways:
 //!   - **retired** on the context's own processor, only after that processor has left the stack
 //!     ([`Contexts::retire_ended`]);
@@ -97,8 +102,37 @@
 //!   plain stores and read-modify-writes gets that C++20 check before the code changes for it.
 //! - A retirement with nothing ended costs one plain load (T70-2), so a tick that switches
 //!   nothing executes no locked instruction.
+//! - [`Contexts::publish_leaving`]: this processor only, **with interrupts off**, as a
+//!   retirement. `switch` calls it first; a stack's drop calls it beside its retirement. A
+//!   publication interrupted between its two stores by a switch would then clear the record that
+//!   switch wrote, and the frame it named would never be published: its context lost.
 //! - [`Contexts::covers`]: any processor. It never waits and takes no lock, so a stack may still
 //!   be dropped under any lock.
+//!
+//! # A frame is published only after its processor has left the stack (ADR-0020 S5)
+//!
+//! A switch-out's frame lies on the stack the trap entry is still running on: after
+//! [`Contexts::switch`] returns, the entry returns along that stack, and only then loads the
+//! incoming frame's stack pointer (`origin_frame::cpu`, `exception_saved`: `call dispatch`, then
+//! `mov rsp, rax`). Once another processor may resume a frame, that frame must not be resumable
+//! before its processor has left the stack, or two processors would run on one stack. So
+//! `switch` does not store the outgoing frame in its slot: it records it, with its slot, as
+//! **leaving**, and the processor publishes it ([`Contexts::publish_leaving`]) at its next call
+//! into the table, which runs on another stack: the top of its next `switch`, before `next` is
+//! taken (so a switch straight back to that context finds it), or a stack's drop, which runs on
+//! the processor's current context. Until it is published nobody can take the frame, this
+//! processor included; this processor's own next switch publishes it before it takes anything.
+//!
+//! - **Publication** stores the frame in its slot (Release), then clears the record (Release).
+//!   Only this processor writes the record, with interrupts off, and never from a handler that
+//!   can interrupt a switch: an NMI, a machine check, a debug exception or a double fault.
+//! - **A reader** ([`Contexts::covers`]) reads the record (Acquire) before the slots. One that
+//!   finds the record clear has read the clear or a later value, so it sees the store into the
+//!   slot that came before the clear, or a later value of that slot. One that finds a frame there
+//!   covers the stack that frame is on. So no frame is missed between the two stores.
+//! - **The cost:** one plain load at each call with nothing leaving; when a frame is published,
+//!   two plain stores, on lines the processor owns; the switch-out writes two words of the record
+//!   where it wrote one into the slot.
 //!
 //! # The stack a processor names for ring 3 (TASKS item 77)
 //!
@@ -222,6 +256,14 @@ pub struct Contexts {
     current: prim::AtomicUsize,
     /// The slot of a context that ended and whose home is not yet retired, or `NONE`.
     ended: prim::AtomicUsize,
+    /// The frame of the context this processor last switched out, while it is not yet
+    /// published in its slot, or 0 (ADR-0020 S5; the module documentation, "A frame is
+    /// published only after its processor has left the stack"). Written only by this
+    /// processor, with interrupts off; read by any processor.
+    leaving: prim::AtomicU64,
+    /// The slot that frame belongs to. Written and read only by this processor, with
+    /// interrupts off.
+    leaving_slot: prim::AtomicUsize,
 }
 
 impl core::fmt::Debug for Contexts {
@@ -257,6 +299,8 @@ impl Contexts {
             slots: [const { Context::new() }; SLOTS],
             current: prim::AtomicUsize::new(NONE),
             ended: prim::AtomicUsize::new(NONE),
+            leaving: prim::AtomicU64::new(0),
+            leaving_slot: prim::AtomicUsize::new(NONE),
         }
     }
 
@@ -267,6 +311,8 @@ impl Contexts {
             slots: core::array::from_fn(|_| Context::new()),
             current: prim::AtomicUsize::new(NONE),
             ended: prim::AtomicUsize::new(NONE),
+            leaving: prim::AtomicU64::new(0),
+            leaving_slot: prim::AtomicUsize::new(NONE),
         }
     }
 
@@ -315,14 +361,16 @@ impl Contexts {
     /// What the trap entry resumes after a scheduler upcall, which the scheduler answered with
     /// `next` for the context interrupted at `here`. This processor only, interrupts off.
     ///
-    /// First it retires a context that ended earlier ([`Self::retire_ended`]). Unless `next`
-    /// is `here`, `next` must be a frame saved in this table. It is taken, so it cannot be resumed
-    /// twice, and its context becomes the running one. The context that was running keeps its
-    /// home and saves `here` as its frame, or, if `exiting`, is recorded as ended and saves
-    /// nothing. The boot or idle flow's first switch-out claims a slot for it. No `home` is
-    /// written. The answer carries the incoming context's home, read from the slot whose frame
-    /// was taken, which the trap entry names as the stack ring 3 lands on (TASKS item 77); with
-    /// nothing switched it carries none.
+    /// First it publishes the frame its last switch-out left ([`Self::publish_leaving`]), and
+    /// retires a context that ended earlier ([`Self::retire_ended`]). Unless `next` is `here`,
+    /// `next` must be a frame saved in this table. It is taken, so it cannot be resumed twice, and
+    /// its context becomes the running one. The context that was running keeps its home and
+    /// leaves `here` as its frame, which is published only at this processor's next call into the
+    /// table (ADR-0020 S5), or, if `exiting`, is recorded as ended and saves nothing. The boot or
+    /// idle flow's first switch-out claims a slot for it. No `home` is written. The answer carries
+    /// the incoming context's home, read from the slot whose frame was taken, which the trap
+    /// entry names as the stack ring 3 lands on (TASKS item 77); with nothing switched it carries
+    /// none.
     ///
     /// `running_on(address)` says whether this processor runs on the stack holding `address`.
     pub fn switch(
@@ -332,6 +380,9 @@ impl Contexts {
         exiting: bool,
         running_on: impl Fn(u64) -> bool,
     ) -> Result<Switched, Refused> {
+        // Before `next` is taken: a context switched out by the last switch, and switched back
+        // to now, is in its slot again to be taken.
+        self.publish_leaving();
         self.retire_ended(running_on)?;
         if next == here {
             return Ok(Switched {
@@ -365,13 +416,15 @@ impl Contexts {
             Some(_) if exiting => {
                 let _ = self.ended.swap(outgoing, AcqRel);
             }
-            Some(slot) => slot.frame.store(here, Release),
+            Some(_) => self.record_leaving(outgoing, here),
             // The boot or idle flow, switched out for the first time; it never ends.
             None if exiting => {}
             None => {
-                if !self.slots.iter().any(|slot| slot.claim(BOOT_FLOW, here)) {
+                // Its slot is claimed with no frame, which it leaves like any other.
+                let Some(slot) = self.slots.iter().position(|slot| slot.claim(BOOT_FLOW, 0)) else {
                     return Err(Refused::Full);
-                }
+                };
+                self.record_leaving(slot, here);
             }
         }
         self.current.store(incoming, Relaxed);
@@ -421,10 +474,45 @@ impl Contexts {
         Ok(())
     }
 
+    /// Records `frame` as the frame the context in slot `slot` leaves: published in that slot
+    /// only at this processor's next call into the table ([`Self::publish_leaving`]). This
+    /// processor only, interrupts off, in its switch, which has just published the previous one.
+    fn record_leaving(&self, slot: usize, frame: u64) {
+        self.leaving_slot.store(slot, Relaxed);
+        self.leaving.store(frame, Release);
+    }
+
+    /// Publishes the frame this processor's last switch-out left, if it has not been: the frame
+    /// is stored in its context's slot (Release), where it may be resumed, and only then is the
+    /// leaving record cleared (Release), so a reader that finds the record clear finds the frame
+    /// in the slot (ADR-0020 S5). This processor only, with interrupts off, at a call into the
+    /// table that runs after the switch-out has left the stack the frame is on: the top of the
+    /// next [`Self::switch`], or a caller such as a stack's drop. Never from a handler that can
+    /// interrupt a switch (an NMI, a machine check, a debug exception or a double fault). With
+    /// nothing leaving it costs one plain load.
+    pub fn publish_leaving(&self) {
+        // Only this processor writes `leaving`: a plain load sees its own last write.
+        let frame = self.leaving.load(Relaxed);
+        if frame == 0 {
+            return;
+        }
+        if let Some(slot) = self.slots.get(self.leaving_slot.load(Relaxed)) {
+            slot.frame.store(frame, Release);
+        }
+        self.leaving.store(0, Release);
+    }
+
     /// Whether any context's home or saved frame lies in `[low, top)`: a stack a context of this
     /// processor may still use. Any processor may ask. It never waits.
+    ///
+    /// The leaving record is read before the slots: a frame published between the two reads is
+    /// in the slot by the time the slot is read, since the reader that finds the record clear
+    /// sees the store into the slot that came before the clear (ADR-0020 S5).
     pub fn covers(&self, low: u64, top: u64) -> bool {
         let inside = |at: u64| at >= low && at < top;
+        if inside(self.leaving.load(Acquire)) {
+            return true;
+        }
         self.slots
             .iter()
             .any(|slot| inside(slot.home.load(Acquire)) || inside(slot.frame.load(Acquire)))
@@ -873,6 +961,132 @@ mod tests {
             !covered(&table, 1),
             "retired once the interrupted call finishes"
         );
+    }
+
+    /// The frames in the table's slots, in slot order: what a switch or a lend could take.
+    fn resumable(table: &Contexts) -> Vec<u64> {
+        table
+            .slots
+            .iter()
+            .map(|slot| slot.frame.load(Relaxed))
+            .filter(|&frame| frame != 0)
+            .collect()
+    }
+
+    /// ADR-0020 S5: a switch-out leaves its frame in the leaving record, in no slot, and covered;
+    /// the next call into the table publishes it in its context's slot.
+    #[test]
+    fn a_switched_out_frame_is_leaving_until_the_next_call() {
+        let table = Contexts::new();
+        assert!(table.publish(first_frame(1)));
+        assert!(table.publish(first_frame(2)));
+        let boot = stack(9).1 - 0x40;
+        assert_eq!(
+            switch_to(&table, boot, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        // The boot flow's first switch-out: its slot is claimed with no frame, the frame leaves.
+        assert_eq!(table.leaving.load(Relaxed), boot);
+        assert_eq!(resumable(&table), [first_frame(2)]);
+        assert!(covered(&table, 9), "covered by the leaving record");
+        // Context 1 is switched out on a measured stack: the next switch publishes the boot
+        // flow's frame, and context 1's frame leaves.
+        let on_measured = stack(7).1 - 0x100;
+        assert_eq!(
+            switch_to(&table, on_measured, first_frame(2), false, not_on_it),
+            Ok(first_frame(2))
+        );
+        assert_eq!(table.leaving.load(Relaxed), on_measured);
+        assert_eq!(resumable(&table), [boot], "published at the switch's top");
+        assert!(
+            covered(&table, 7),
+            "the measured stack, by the leaving record"
+        );
+        table.publish_leaving();
+        assert_eq!(table.leaving.load(Relaxed), 0);
+        assert!(resumable(&table).contains(&on_measured));
+        assert!(covered(&table, 7), "the measured stack, by its slot");
+        // Nothing left: a second publication changes nothing.
+        let before = resumable(&table);
+        table.publish_leaving();
+        assert_eq!(resumable(&table), before);
+    }
+
+    /// The coordinating session's condition on Q3 (TASKS item 95): a switch whose `next` is the
+    /// context that is leaving publishes it first and then takes it, so it is neither lost nor
+    /// taken twice.
+    #[test]
+    fn a_switch_back_to_the_leaving_context_publishes_it_then_takes_it() {
+        let table = Contexts::new();
+        assert!(table.publish(first_frame(1)));
+        assert!(table.publish(first_frame(2)));
+        assert_eq!(
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        let at_1 = first_frame(1) - 0x200;
+        assert_eq!(
+            switch_to(&table, at_1, first_frame(2), false, not_on_it),
+            Ok(first_frame(2))
+        );
+        assert_eq!(table.leaving.load(Relaxed), at_1);
+        // Straight back to context 1, before anything else called into the table.
+        let at_2 = first_frame(2) - 0x200;
+        assert_eq!(switch_to(&table, at_2, at_1, false, not_on_it), Ok(at_1));
+        assert_eq!(table.running_home(), Some(first_frame(1)));
+        assert_eq!(table.leaving.load(Relaxed), at_2, "context 2 leaves now");
+        assert!(!resumable(&table).contains(&at_1), "taken once");
+        // A second resume of the same frame is refused; context 2's frame is not lost.
+        assert_eq!(
+            switch_to(&table, at_1 - 0x100, at_1, false, not_on_it),
+            Err(Refused::NeverSaved)
+        );
+        assert_eq!(
+            switch_to(&table, at_1 - 0x100, at_2, false, not_on_it),
+            Ok(at_2)
+        );
+    }
+
+    /// A tick that switches nothing (`next == here`) still publishes what the last switch left:
+    /// a switched-out context becomes resumable elsewhere within one tick (ADR-0020 S5).
+    #[test]
+    fn a_switch_that_changes_nothing_still_publishes() {
+        let table = Contexts::new();
+        assert!(table.publish(first_frame(1)));
+        assert!(table.publish(first_frame(2)));
+        assert_eq!(
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        let at_1 = first_frame(1) - 0x200;
+        assert_eq!(
+            switch_to(&table, at_1, first_frame(2), false, not_on_it),
+            Ok(first_frame(2))
+        );
+        let at_2 = first_frame(2) - 0x200;
+        assert_eq!(switch_to(&table, at_2, at_2, false, not_on_it), Ok(at_2));
+        assert_eq!(table.leaving.load(Relaxed), 0);
+        assert!(resumable(&table).contains(&at_1));
+    }
+
+    /// An exit leaves nothing to publish: its frame is never saved, as before ADR-0020 S5.
+    #[test]
+    fn an_exit_leaves_no_frame() {
+        let table = Contexts::new();
+        assert!(table.publish(first_frame(1)));
+        assert!(table.publish(first_frame(2)));
+        assert_eq!(
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        // The boot flow's frame leaves; context 1's exit publishes it and leaves nothing itself.
+        let at_exit = first_frame(1) - 0x300;
+        assert_eq!(
+            switch_to(&table, at_exit, first_frame(2), true, not_on_it),
+            Ok(first_frame(2))
+        );
+        assert_eq!(table.leaving.load(Relaxed), 0);
+        assert_eq!(resumable(&table), [0x9000]);
     }
 
     /// T70-6: a refused retirement does not overwrite a newer exit's record.
