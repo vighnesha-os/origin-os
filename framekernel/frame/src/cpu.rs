@@ -29,7 +29,7 @@ use crate::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
     TSS, TSS_SIZE,
 };
-use origin_sync::contexts::{BOOT_FLOW, Contexts, Refused, Switched};
+use origin_sync::contexts::{BOOT_FLOW, Contexts, Moves, Quiet, Refused, Switched};
 
 use crate::percpu::PerCpu;
 use crate::trap::Switch;
@@ -855,7 +855,9 @@ pub fn landings_checked() -> u64 {
 /// a frame recorded here is ever resumed, so a wrong answer from the scheduler above cannot make
 /// the trap entry load anything else. A context's home stays recorded from its publication until
 /// its processor has left its stack after it ended, and no switch writes it, so a stack a
-/// context may still use is always in this table for any processor's `stack_in_use`.
+/// context may still use is always in some processor's table for any processor's `stack_in_use`:
+/// in this one, or, while it moves (ADR-0020 S4), in its destination's before it leaves this one,
+/// which the scans through [`MOVES`] cannot miss.
 ///
 /// It replaces `SAVED_FRAMES`, whose 32 slots held only suspended threads' frames. A slot is now
 /// held from a thread's publication until it has ended and its processor has left its stack, so
@@ -873,6 +875,23 @@ pub(crate) static CONTEXTS: PerCpu<Contexts> = PerCpu::new(
     Contexts::new,
 );
 
+/// The machine's move sequence (ADR-0020 S4; `origin_sync::contexts`, "Moves between
+/// processors"): the move gate and the begun and finished counters. A move of a context between
+/// two processors' tables of contexts holds the gate, and every scan of all the tables goes
+/// through [`Moves::scan`], so that a move cannot hide a home from it. Nothing moves a context
+/// yet: TASKS item 96 makes the first move.
+pub(crate) static MOVES: Moves = Moves::new();
+
+/// What a scan's pass under the move gate runs in: interrupts off on this processor, since a
+/// mover holds the gate with interrupts off and may be this processor's own interrupt handler.
+struct Quietly;
+
+impl Quiet for Quietly {
+    fn quietly<R>(&self, f: impl FnOnce() -> R) -> R {
+        without_interrupts(f)
+    }
+}
+
 /// Records a new thread on processor `cpu`, whose first frame is `frame`, on its own stack: the
 /// frame becomes its home and the frame to resume. `false` if the table is full or `cpu` has
 /// none.
@@ -882,11 +901,18 @@ pub(crate) fn publish_context(cpu: CpuIndex, frame: u64) -> bool {
         .is_some_and(|table| table.publish(frame))
 }
 
-/// Whether some processor's table of contexts covers `[start, end)`: a context's home or saved
-/// frame there. Part of what [`stack_in_use`] asks, without the caller's stack pointer and the
-/// kernel-stack records (`stack::slot_in_contexts`).
+/// Whether some processor's table of contexts covers `[start, end)`: a context's home, saved
+/// frame or leaving frame there. Part of what [`stack_in_use`] asks, without the caller's stack
+/// pointer and the kernel-stack records (`stack::slot_in_contexts`). It scans every table through
+/// the move sequence ([`MOVES`]), so a context moving between two tables is not missed: at most
+/// four passes with no lock, then one under the move gate with interrupts off (ADR-0020 S4).
 pub(crate) fn contexts_cover(start: u64, end: u64) -> bool {
-    CONTEXTS.iter().any(|table| table.covers(start, end))
+    MOVES
+        .scan(
+            || CONTEXTS.iter().any(|table| table.covers(start, end)),
+            &Quietly,
+        )
+        .covered
 }
 
 /// Withdraws the context published on processor `cpu` at `frame`, which its spawner never made
@@ -915,9 +941,12 @@ fn running_on(address: u64) -> bool {
 
 /// What the trap entry resumes after a scheduler upcall: `next`, the frame the scheduler
 /// answered for the interrupted context at `here` (`Contexts::switch`). Unless they are the same,
-/// `next` must be a frame this processor saved, and the context at `here` saves it as its frame,
-/// unless it is ending (`exiting`). No address is printed (ADR-0004 Amendment 2, A6.2): a frame
-/// is told as an offset in its window.
+/// `next` must be a frame this processor saved, and the context at `here` leaves `here` as its
+/// frame, unless it is ending (`exiting`). The table publishes that frame only at this
+/// processor's next call into it, the next switch or a stack's drop: [`exception_saved`] still
+/// returns along the outgoing stack after this, until its `mov rsp, rax`, so the frame must not
+/// be resumable anywhere before then (ADR-0020 S5). No address is printed (ADR-0004 Amendment 2,
+/// A6.2): a frame is told as an offset in its window.
 fn resume(here: u64, next: u64, exiting: bool) -> u64 {
     let me = this_cpu();
     let outcome = CONTEXTS
@@ -947,20 +976,30 @@ fn resume(here: u64, next: u64, exiting: bool) -> u64 {
 
 /// Whether a processor may be using the kernel stack `[start, end)`, whose top is `top`: the
 /// caller's own stack pointer is on it, a processor's kernel-stack record names it, or a
-/// context's home or saved frame is on it (TASKS item 70). Only a stack in none of them can be
-/// freed. It never waits and takes no lock.
+/// context's home, saved frame or leaving frame is on it (TASKS item 70; ADR-0020 S5). Only a
+/// stack in none of them can be freed. It takes no lock but the move gate, and that only in a
+/// scan's last pass, after its fast passes each overlapped a move (ADR-0020 S4; [`MOVES`]): so a
+/// stack may be dropped under any lock but the gate, and a mover holding the gate must drop none.
 ///
-/// It first retires this processor's own ended context, if any: this processor has left that
-/// stack, since any code it runs after the exit's switch runs on another context's stack
-/// (`Contexts::retire_ended`). So a stack reaped here before this processor's next switch is
-/// given back, not leaked. The retirement runs with interrupts off, as the table asks: a switch
-/// that interrupted it between its take and its clear would leave the ended stack in no record
-/// that retires it, and a reap then would leak it (the review of TASKS item 70, T70-1).
+/// It first publishes the frame this processor's last switch-out left, and retires its own ended
+/// context, if any: this processor has left both stacks, since any code it runs after a switch
+/// runs on another context's stack (`Contexts::publish_leaving`, `Contexts::retire_ended`; ADR-0020
+/// S5). So a stack reaped here before this processor's next switch is given back, not leaked.
+/// Both run with interrupts off, as the table asks: a switch that interrupted the retirement
+/// between its take and its clear would leave the ended stack in no record that retires it, and a
+/// reap then would leak it (the review of TASKS item 70, T70-1); one that interrupted the
+/// publication between its two stores would have its own leaving record cleared. The processor's
+/// index is read inside that section too, so the table is this processor's own even once a
+/// thread can be moved between a read and its use (the review of TASKS item 95, R95-3).
 pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
     let used = |value: u64| value >= start && value < end;
     if tables_ready()
-        && let Some(table) = CONTEXTS.get(this_cpu().get())
-        && without_interrupts(|| table.retire_ended(running_on)) == Err(Refused::StillOnIt)
+        && without_interrupts(|| {
+            CONTEXTS.get(this_cpu().get()).map(|table| {
+                table.publish_leaving();
+                table.retire_ended(running_on)
+            })
+        }) == Some(Err(Refused::StillOnIt))
     {
         panic!("an ended thread's stack was to be retired while this processor still ran on it");
     }
@@ -973,7 +1012,9 @@ pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
         || CPU_LOCAL
             .iter()
             .any(|l| l.kernel_stack.load(Ordering::Acquire) == top)
-        || CONTEXTS.iter().any(|table| table.covers(start, end))
+        // Last, through the move sequence: neither of the records above can name a context that
+        // is moving, which is suspended and not running.
+        || contexts_cover(start, end)
 }
 
 /// This processor's CPU index: one GS-relative load from its CPU-local area. On a
@@ -1883,24 +1924,97 @@ pub fn capture_backtrace(out: &mut [u64]) -> usize {
 /// taken before the lock that orders it is held: RDTSCP (Intel SDM Vol. 2B, RDTSCP; AMD
 /// APM Vol. 3) if `use_rdtscp` and this processor has it, else LFENCE then RDTSC.
 pub fn ordered_tsc(use_rdtscp: bool) -> u64 {
-    let has_rdtscp = use_rdtscp
-        && cpuid(0x8000_0000)[0] >= 0x8000_0001
-        && cpuid(0x8000_0001)[3] & (1 << 27) != 0;
-    let (low, high): (u32, u32);
-    if has_rdtscp {
-        // SAFETY: RDTSCP exists on this processor (just checked); it writes EDX:EAX and ECX
-        // (IA32_TSC_AUX, unused here) and reads no memory.
-        unsafe {
-            asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
-        }
+    let fence = if use_rdtscp {
+        TscFence::detect()
     } else {
-        // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory. No
-        // `preserves_flags`: Intel's entry for LFENCE does not say what it does to the flags.
-        unsafe {
-            asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
+        TscFence::LFENCE
+    };
+    fence.after()
+}
+
+/// How two TSC readings are ordered around what runs between them, so that they enclose it
+/// (TASKS item 78, `docs/research/2026-11-21-apic-timer-period.md` §2). Neither RDTSC nor
+/// RDMSR is serializing on either maker's processors, an x2APIC register's RDMSR included
+/// (Intel SDM Vol. 3A §13.12.3; AMD APM Vol. 2 §16.11.2): unfenced, a reading may be taken
+/// after the instruction it should precede, or before the one it should follow.
+///
+/// The form is private, so the RDTSCP form comes only from [`TscFence::detect`], which found
+/// RDTSCP on this processor: safe code cannot ask for an instruction the processor lacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TscFence(Fence);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fence {
+    /// RDTSCP, the first reading followed by LFENCE. Intel: LFENCE is always a barrier, and
+    /// RDTSCP waits for every earlier instruction. AMD: RDTSCP retires every older instruction
+    /// before it reads and is dispatch serializing, whatever MSR C001_1029 holds.
+    Rdtscp,
+    /// No RDTSCP: LFENCE beside RDTSC. Ordered where LFENCE is a barrier: on Intel always; on
+    /// AMD where CPUID Fn8000_0021_EAX[2] says so, or where the kernel set MSR C001_1029 bit 1
+    /// (ADR-0017, `Lfence::KernelSets`). Under a hypervisor on AMD without either, unordered.
+    Lfence,
+}
+
+impl TscFence {
+    /// LFENCE beside RDTSC, which every x86-64 processor has.
+    pub const LFENCE: Self = Self(Fence::Lfence);
+
+    /// RDTSCP where CPUID Fn8000_0001_EDX[27] reports it, else LFENCE. Read once, not for each
+    /// reading: CPUID leaves the guest under a hypervisor.
+    pub fn detect() -> Self {
+        if cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpuid(0x8000_0001)[3] & (1 << 27) != 0 {
+            Self(Fence::Rdtscp)
+        } else {
+            Self::LFENCE
         }
     }
-    (u64::from(high) << 32) | u64::from(low)
+
+    /// The TSC, read before any later instruction starts: RDTSCP or RDTSC, then LFENCE.
+    pub fn before(self) -> u64 {
+        let (low, high): (u32, u32);
+        match self.0 {
+            Fence::Rdtscp => {
+                // SAFETY: `Fence::Rdtscp` is private and made only by `detect`, which found
+                // RDTSCP on this processor; RDTSCP writes EDX:EAX and ECX (IA32_TSC_AUX, unused here) and
+                // reads no memory, and LFENCE reads and writes nothing. No `preserves_flags`:
+                // Intel's entry for LFENCE does not say what it does to the flags.
+                unsafe {
+                    asm!("rdtscp", "lfence", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack));
+                }
+            }
+            Fence::Lfence => {
+                // SAFETY: RDTSC and LFENCE exist on every x86-64 processor and read no memory.
+                // No `preserves_flags`, as above.
+                unsafe {
+                    asm!("rdtsc", "lfence", out("eax") low, out("edx") high, options(nomem, nostack));
+                }
+            }
+        }
+        (u64::from(high) << 32) | u64::from(low)
+    }
+
+    /// The TSC, read once every earlier instruction has executed: RDTSCP, or LFENCE then
+    /// RDTSC.
+    pub fn after(self) -> u64 {
+        let (low, high): (u32, u32);
+        match self.0 {
+            Fence::Rdtscp => {
+                // SAFETY: as in `before`; RDTSCP alone changes no flag.
+                unsafe {
+                    asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
+                }
+            }
+            Fence::Lfence => {
+                // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory.
+                // No `preserves_flags`: Intel's entry for LFENCE does not say what it does to
+                // the flags.
+                unsafe {
+                    asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
+                }
+            }
+        }
+        (u64::from(high) << 32) | u64::from(low)
+    }
 }
 
 /// The time-stamp counter.

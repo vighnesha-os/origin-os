@@ -246,6 +246,42 @@ class Guards(unittest.TestCase):
         self.assertIn("Pre-memory", r["summary"])
         self.assertTrue(self.lat.last_boot(r))  # nothing of Origin's: no second boot
 
+    def test_a_bench_boot_names_its_breadcrumbs(self):
+        loader = ("origin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF (1 MiB)\r\n"
+                  "origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key\r\n"
+                  "origin-boot: exiting boot services; entering the Framekernel\r\n"
+                  "origin-boot: bench build: boot services exited on the first call\r\n")
+        # Stopped after the kernel's fourth step: the record says so without the log.
+        r = self.lat.boot_result(self.lat.clean(loader + "RS1234"))
+        self.assertFalse(r["ended"])
+        self.assertEqual(r["breadcrumbs"], "RS1234")
+        self.assertTrue(r["summary"].endswith("; breadcrumbs: RS1234"), r["summary"])
+        # Every step, then the kernel's lines to its verdict.
+        r = self.lat.boot_result(self.lat.clean(
+            loader + "RS12345678\r\norigin-kernel: console: framebuffer 1024x768\r\n"
+            "origin-kernel: boot verdict: degraded: 70 of 71 proofs passed\r\n"))
+        self.assertTrue(r["ended"])
+        self.assertEqual(r["breadcrumbs"], "RS12345678")
+        self.assertEqual(r["summary"],
+                         "origin-kernel: boot verdict: degraded: 70 of 71 proofs passed; breadcrumbs: RS12345678")
+        # The loader halted after ExitBootServices failed twice, with every loader's line
+        # (decision item 342): no breadcrumb at all.
+        r = self.lat.boot_result(self.lat.clean(
+            loader.replace("origin-boot: bench build: boot services exited on the first call",
+                           "origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, "
+                           "retry EFI_INVALID_PARAMETER): halting")))
+        self.assertEqual(r["breadcrumbs"], "")
+        self.assertTrue(r["summary"].endswith("; breadcrumbs: none"), r["summary"])
+        # A reset after `RS12`: the firmware's text that follows is not read as breadcrumbs.
+        r = self.lat.boot_result(self.lat.clean(
+            loader + "RS12" + "\x1b[2J\x1b[0;37;40mPre-memory NB Initialization.15\r\nSuper 1 2 R S\r\n"))
+        self.assertEqual(r["breadcrumbs"], "RS12")
+        # A normal build's boot has no breadcrumbs entry and no change to its summary.
+        r = self.lat.boot_result("origin-boot: exiting boot services; entering the Framekernel\n")
+        self.assertNotIn("breadcrumbs", r)
+        self.assertEqual(r["summary"],
+                         "no verdict; last line: origin-boot: exiting boot services; entering the Framekernel")
+
     def test_a_boot_ends_on_the_lines_the_kernel_halts_after(self):
         # The texts `framekernel/src/report.rs` and the CPU baseline check print before halting.
         for line in ("origin-kernel: panic: panicked at kernel.rs:1:1: boom",

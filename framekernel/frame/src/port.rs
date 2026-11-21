@@ -147,6 +147,37 @@ impl Cmos {
     }
 }
 
+/// TASKS item 112, bench builds only: writes `bytes` to the 16550 at `port`, each after a wait
+/// for room of at most [`BENCH_POLLS`] line-status reads, and stops at the first byte that finds
+/// none. The ports are not claimed: the console claims them a step after the first breadcrumbs,
+/// and a claim here would refuse that. [`crate::bench::start`] took `port` from the bench
+/// loader's hand-over and refused the system's ports ([`RESERVED`]).
+#[cfg(all(origin_bench, target_os = "none"))]
+pub fn bench_write(port: u16, bytes: &[u8]) {
+    for &byte in bytes {
+        let mut room = false;
+        for _ in 0..BENCH_POLLS {
+            // SAFETY: CPL 0; `port + 5` is the line-status register of the UART the SPCR named,
+            // the shared parser accepted and the bench loader handed over, never a system port
+            // (`bench::start`); reading it has no side effect.
+            if unsafe { inb(port.wrapping_add(5)) } & 0x20 != 0 {
+                room = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !room {
+            return;
+        }
+        // SAFETY: as above, for that UART's transmit register.
+        unsafe { outb(port, byte) };
+    }
+}
+
+/// Line-status reads one breadcrumb byte may wait for room, as `serial::TX_POLL_LIMIT`.
+#[cfg(all(origin_bench, target_os = "none"))]
+const BENCH_POLLS: u32 = 100_000;
+
 /// Writes `value` to I/O port `port`.
 ///
 /// # Safety

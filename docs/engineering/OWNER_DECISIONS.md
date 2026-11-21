@@ -1281,3 +1281,56 @@ M3's exit tests M3-1 to M3-4 (item 259) ask for load balancing, affinity, CPU ac
   - the roadmap: A20's build rows placed in M3 and A05-J1 to A05-J5 in M4, in no exit test, under item 264's rule; A20-S21, A20-S22 and A05-J6 are rules; M3-1's note that it stays partial until ADR-0008's amendment on processors offline and back is built (item 338);
   - `PERFORMANCE_BUDGETS.md`: budgets B20 to B26 and ledger rows CL47 to CL59;
   - the build plan `docs/engineering/M3_SCHEDULING_PLAN.md` and TASKS items 92 to 109: batch 9 is items 92 to 98, 100 and 101 (about 94 commits); batch 10 is items 99 and 102 to 108 (about 68); item 109, lending across calls, follows the M3 core.
+
+### The loader's line before it halts, and a second rental board (items 342 and 343): Accepted 2026-11-21
+
+Rental C ran boot info 0.8 on the rented server three times, on 2026-11-21:
+- the loader found the SPCR and named COM2, the operator's console;
+- still no kernel line came.
+
+Its findings rank first a silent halt after a failed `ExitBootServices`, the loader's only silent end. TASKS item 112 builds breadcrumbs for the next rental, in bench builds only, and put two questions.
+
+| # | Question | Answer |
+|---|---|---|
+| 342, answered | Should every loader, not only bench builds, print one line before it halts after a failed `ExitBootServices`? The line goes to the UART that boot info would name (the SPCR's), with a bounded wait and no firmware call, on the failure path only. It amends ADR-0002 B5 and ADR-0010 | **Accept** |
+| 343, answered | Add Latitude's `m4.metal.large` to the rental tool's allowed plans, as a second bench board for the breadcrumbs build after the small board? It is an AMD EPYC 9254 (Zen 4) with 384 GB, in Ashburn, about $2.03 an hour by the owner's reading of the provider's page. Each rental still needs the owner's yes in chat, and item 225's $10 cap is unchanged | **Accepted, then withdrawn** the same day, once the price was corrected (below) |
+
+- **The alternatives put:**
+  - for 342: the line in bench builds only;
+  - for 343: not now; or `rs4.metal.large` (EPYC 9354P, 768 GB, about $3.22 an hour), whose worst case beside the small board's run passes the cap.
+- **The evidence:**
+  - rental C's findings, `docs/research/2026-11-21-rental-c-findings.md` (on `land/batch-9` at `94e0b6e2` until it lands);
+  - the tool's ledger, which holds three rentals at $2.43 of the $10 cap.
+- **Performance cost** (ADR-0018 V3):
+  - **342:** none, by construction, on a boot that succeeds, since the line runs only on the failure path.
+  - **343:** money, not run time. Its worst case is two clock hours, about $8.12 a rental at the likely hourly price (see the correction below).
+- **The board is bench equipment** (item 233). Its cores are Zen 4, outside ADR-0009 Amendment 1's scope, so it qualifies nothing.
+- **Corrected after the answer: the price of item 343's board.** The $2.03 figure is from the provider's pricing page, whose "/hr" figure is the monthly price over 730 hours, as item 224's correction found. Hourly billing through the API has been about twice the page's figure:
+  - `m4.metal.small`: page $0.41, billed $0.81;
+  - `f4.metal.large`: page $2.62, API $5.25.
+
+  So `m4.metal.large` is likely about $4.06 an hour, and its worst case of two clock hours about $8.12. With $2.43 in the ledger, that passes item 225's $10 cap.
+- **The owner withdrew item 343 on 2026-11-21** ("Withdraw it"). The rental tool's plans stay `m4-metal-small` and `f4-metal-large`, and no second board is added.
+- **The provider offers no hardware in the declared scope.** All ten of its bare-metal plans, read on its pricing page on 2026-11-21, are Zen 4 or Zen 5 EPYC 9005 (2024). Every rental there is bench equipment.
+- **Where they are written:** item 342 is in ADR-0002 Amendment 2 and ADR-0010 Amendment 4. Their wording was accepted by the owner on 2026-11-21 ("Accept the wording"), and their matrix rows are A02-Am2 and A10-Am4, placed in M1. TASKS item 112 builds it. Item 343 asks for nothing now.
+
+### A bench build's reset after `ExitBootServices` (item 344): Accepted 2026-11-21
+
+Rental D ran TASKS item 112's breadcrumbs build on the rented server on 2026-11-21. Nothing reached the console after the loader's last line, so two causes remain:
+- `ExitBootServices` never returns;
+- the firmware's exit switches the console port off, or changes it.
+
+Rental D's findings propose a bench loader that resets the machine on purpose after the call. A reset proves the call returned, whatever the port does. TASKS item 116 builds it, and the owner said "Start it" the same day.
+
+| # | Question | Answer |
+|---|---|---|
+| 344, answered | May a bench loader, which is never shipped or signed, call the runtime service `ResetSystem` after `ExitBootServices`, as a bench-only exception to ADR-0002 B5, with the FADT's reset register as the fallback? Or write only the FADT's reset register, with no exception? | **Allow in test builds** |
+
+- **The alternative put:** the FADT's reset register alone. It needs no exception, but on this board it is an SMI command port that nothing has shown to reset the machine.
+- **The evidence:** rental D's findings, `docs/research/2026-11-21-rental-d-findings.md` (on `land/batch-9` until it lands).
+- **Performance cost** (ADR-0018 V3): none, by construction. Only bench builds contain it.
+- **Where it is written:**
+  - ADR-0002 Amendment 3;
+  - the matrix row A02-Am3, placed in M1;
+  - TASKS item 116, which builds it.
+

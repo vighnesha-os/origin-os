@@ -4617,3 +4617,10 @@ fn exits_an_exit_without_a_mark_cannot_stand_for_one() {
         },
     );
 }
+
+// ---------------------------------------------------------------- moves (TASKS item 95)
+
+// The models of moving a context between two processors' tables (ADR-0020 S4, S5), in a file of
+// their own beside this one, run under this module's `check` and helpers.
+#[path = "moves_models.rs"]
+mod moves;

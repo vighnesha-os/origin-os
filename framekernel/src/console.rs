@@ -935,6 +935,7 @@ pub(crate) fn attach_framebuffer(out: &mut Console, info: &BootInfo, regions: &[
     use core::fmt::Write as _;
     let framebuffer = info.framebuffer;
     if !framebuffer.is_present() {
+        crumb!(b"8\r\n");
         let _ = writeln!(
             out,
             "origin-kernel: console: the loader found no framebuffer; output goes to the UART only"
@@ -945,6 +946,7 @@ pub(crate) fn attach_framebuffer(out: &mut Console, info: &BootInfo, regions: &[
         Ok((screen, mut memory)) => {
             let _ = SCREEN.set((screen, memory));
             screen.clear(&CURSOR, &mut memory);
+            crumb!(b"8\r\n");
             let _ = writeln!(
                 out,
                 "origin-kernel: console: framebuffer {}x{} at {:#x}, stride {}, red {:#x} green {:#x} blue {:#x}: {}x{} text cells, scale {}",
@@ -961,6 +963,7 @@ pub(crate) fn attach_framebuffer(out: &mut Console, info: &BootInfo, regions: &[
             );
         }
         Err(reason) => {
+            crumb!(b"8\r\n");
             let _ = writeln!(
                 out,
                 "origin-kernel: console: framebuffer at {:#x} not used ({reason}); output goes to the UART only",

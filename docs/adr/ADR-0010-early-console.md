@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested under QEMU, and was merged into `claude/interesting-carson-ae7c83` on 2026-11-09 on the owner's word. Nothing here has shipped. **Amendments 1 and 2 (below, to E3) were accepted by the owner on 2026-11-09**, as proposed (decision sheet items 52 and 53). **Amendment 3 (below, to E1 and E4: boot info 0.8 names the SPCR's UART from the loader) was accepted by the owner on 2026-11-20** (decision sheet item 317), and built by TASKS item 84 the same day, under QEMU only. |
+| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested under QEMU, and was merged into `claude/interesting-carson-ae7c83` on 2026-11-09 on the owner's word. Nothing here has shipped. **Amendments 1 and 2 (below, to E3) were accepted by the owner on 2026-11-09**, as proposed (decision sheet items 52 and 53). **Amendment 3 (below, to E1 and E4: boot info 0.8 names the SPCR's UART from the loader) was accepted by the owner on 2026-11-20** (decision sheet item 317), and built by TASKS item 84 the same day, under QEMU only. **Amendment 4 (below, to E1: the loader's one direct write to that UART, before a halt after a failed `ExitBootServices`) was accepted by the owner on 2026-11-21** (decision sheet item 342), with ADR-0002 Amendment 2, and built by TASKS item 112 the same day, under QEMU only. |
 | Requires | CLAUDE.md §13 (checked parsing), §19 (boot-info structure, early diagnostics), §51 (font provenance), §58 (threat-model privileged interfaces), §69 (diagnostics), §74, rules 14, 30 and 40 |
 | Implements | ADR-0009 H6, third bullet: a console that does not depend on a 16550 at `0x3F8` |
 | Code | `boot/info` (`Framebuffer`; `EarlyUart`, Amendment 3), `boot/uefi` (the Graphics Output Protocol hand-off; `spcr.rs`, the SPCR's UART read before `ExitBootServices`, Amendment 3), `firmware/acpi/spcr` (the SPCR's parser, which the loader and the kernel share since TASKS item 84), `framekernel/paging` (the mapping), `framekernel/src/{fbconsole,font,spcr,serial,console}.rs` (`spcr.rs` re-exports the parser since TASKS item 84), `developer-tools/xtask` |
@@ -214,3 +214,15 @@ On any server whose console is not COM1, a stop before the move is invisible.
 - The SPCR comes from the firmware, which the boot trusts for the tables it hands over, but its contents are still parsed as untrusted (§13, E4).
 - A table naming a port the kernel would not drive is refused in the loader, and again in the kernel.
 - The early writes go only to an I/O port the table named and the parser accepted, never to a guessed one.
+
+## Amendment 4 (Accepted by the owner, 2026-11-21): the loader's one direct write to the SPCR's UART
+
+**Status: Accepted by the owner on 2026-11-21 ("Yes, keep it"; decision sheet item 342), with ADR-0002 Amendment 2, which holds the change. Built by TASKS item 112 the same day, under QEMU only.**
+
+**Change to E1.** Until `ExitBootServices`, the loader's console is the firmware's, as before. Amendment 3 hands the SPCR's UART to the kernel; the loader itself still prints nothing there on any boot that leaves the firmware. The one exception: when `ExitBootServices` fails and the loader is about to halt (ADR-0002 B5 and Amendment 2), it writes one line to that UART saying why, straight to its registers, with a bounded wait, and then halts. The UART is the one boot info would have named, so the line reaches the same console the kernel would have used.
+
+**Bench builds.** TASKS item 112's bench build, which never ships, writes more there: the line after a successful `ExitBootServices`, and the entry stub's and the kernel's breadcrumbs. Those are not part of any image a normal build makes (`cargo xtask check`, F1 and F2).
+
+**Performance cost (ADR-0018 V3).** None, by construction: written only on the path that ends in a halt.
+
+**Threat model (§58).** As Amendment 3: only a port the table named and the parser accepted.
