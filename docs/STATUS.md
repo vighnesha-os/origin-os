@@ -7,6 +7,27 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** On a physical machine only Origin's loader has run: a rented bench server, outside the declared scope, on 2026-11-20 (see the next section). |
 
+## Breadcrumbs on the SPCR's UART: a bench build (TASKS item 112; 2026-11-21)
+
+On `claude/t112-breadcrumbs`, from `land/batch-9`; not yet in a batch. Rentals B and C showed nothing between the loader's last line and the kernel's first (`docs/research/2026-11-21-rental-c-findings.md`).
+
+- **Every loader** (decision item 342; ADR-0002 Amendment 2, ADR-0010 Amendment 4): after a failed `ExitBootServices` it writes one line saying why to the SPCR's UART, then halts. Before, that halt was silent.
+- **A bench build**, `cargo xtask bench-build`, never signed or shipped:
+  - the loader prints the processor state the kernel inherits, says on the SPCR's UART which `ExitBootServices` call succeeded, and enters through a stub that writes `R` and `S`;
+  - the kernel writes `1` to `8`, one after each step to its first line.
+- **What keeps it out of every other image:** a source gate (F1), a check of every normal image's bytes (F2), and the signing refusal.
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:** `boot-bench`'s four scenarios:
+- `RS12345678` between the loader's line and the kernel's;
+- the retry path and the halting line, under OVMF with stale map keys;
+- no breadcrumbs under the normal loader.
+
+Controls BC-1 to BC-5 each fail. The independent AI review found no High or Medium issue.
+
+`check`, `boot-test` and `boot-matrix` three times in a row passed on `54911a0d`, in one turn on a clean tree; `boot-bench` adds 62 to 81 s to a `boot-matrix` of about 1,230 s.
+
+**Not shown:** anything on a physical machine; the shadow-stack reads, which QEMU's software processor never takes. The next rental (about $0.81, on the owner's word) is what it is for.
+
 ## Rental B: Origin's loader on a rented bare-metal server (2026-11-20)
 
 One Latitude.sh `m4-metal-small` (AMD EPYC 4244P, Zen 4; Supermicro H13SRE-F, AMI firmware 2.4; 64 GiB) ran Origin at `69ce9ecd` (`main` `ea2293ca` and the rental tool) three times, with the owner's approval in chat, for $0.81. It is bench equipment, outside ADR-0009 A1's scope, and qualifies nothing (decision item 233). Record: `docs/hardware/records/2026-11-20-latitude-m4-metal-small.md`, with Origin's serial log beside it; findings: `docs/research/2026-11-20-rental-b-findings.md`.

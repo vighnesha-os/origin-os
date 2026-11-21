@@ -3882,3 +3882,87 @@ Started on 2026-11-21 by a session of its own, at the owner's word ("Start it no
 
 **Follow-ups:**
 - **TASKS item 113:** under KVM every calibration discards all 1,024 windows and keeps the least disturbed one, probably about 10 s of each KVM boot (arithmetic, not measured).
+
+### 112. Breadcrumbs on the SPCR's UART: a bench build of the loader and the kernel (rental C's findings, ranks 1 and 4)
+
+Asked for by the owner on 2026-11-21 ("Start breadcrumbs"), from rental C's findings (`docs/research/2026-11-21-rental-c-findings.md`): on rentals B and C nothing reached the serial console between the loader's last line and the kernel's first, and nothing shows which step the boot stopped at. Contract written on 2026-11-21 by the session that wrote those findings (`t112-contract.md`, the coordinating session's notes, Q1 to Q11). It was accepted the same day with the rulings below. Built on `claude/t112-breadcrumbs`, cut from `land/batch-9` at `94e0b6e2`.
+
+- **Task ID:** TASKS item 112.
+- **Objective:** one rental shows the exact step at which a boot stops between the loader's last line and the kernel's first line on the SPCR's UART. To that end, a **bench build** of the loader and the kernel, never shipped:
+  - the loader prints the processor state the kernel inherits;
+  - after `ExitBootServices` it says, on the SPCR's UART itself, which call succeeded, or why it halts;
+  - the entry stub and the kernel write one byte after each step from the CR3 load to the kernel's first line: `RS12345678`.
+
+  The loader's retry of `ExitBootServices` runs at least once under real firmware code (OVMF), and no image a normal build makes holds any of it.
+- **Source ownership:** `boot/info` (the hand-over in RSI), `boot/uefi` (the bench lines, stub and hook), `framekernel/frame/src/port.rs` and a new `bench.rs`, `framekernel/src/kernel.rs`, `lib.rs` and `console.rs` (the eight breadcrumbs), `developer-tools/xtask` (`bench-build`, `boot-bench`, F1, F2, the refusal), `developer-tools/bench/latitude.py` (the record names the breadcrumbs), the workspace `Cargo.toml` (check-cfg), the records.
+- **Architecture contract:** ADR-0002 B5, B6 and B8; ADR-0010 E5 and Amendment 3; ADR-0013; ADR-0018 V3 and V7; CLAUDE.md §13 (items 110 and 111), §14, §75.
+- **Specifications:** UEFI 2.11 §7.4 (`ExitBootServices`, the map key, the one retry); PC16550D (THRE); Intel SDM Volume 4 (335592-093) and AMD APM Volume 2 (24593, 3.46), read on 2026-11-21 and paraphrased in the rental C findings ledger: which CPUID bit each register the loader reads is tied to, and what AMD says about a shutdown.
+- **Dependencies:** none new.
+- **Security invariants:** no normal image holds bench code (F1 to F3). A bench kernel writes only to the port the bench loader handed it, under a 48-bit magic, and never to a system port; a bench kernel under a normal loader writes nothing. The bench loader is a developer-mode loader with the TEST trust store, and the bench kernel is never signed (ADR-0002 B8). Every register the loader reads exists wherever the bit it is gated on is set, on both vendors.
+- **Performance constraints:** none in normal images, which hold none of it; ADR-0018 V3, no cost row. In a bench build: one state line, one line after `ExitBootServices`, ten bytes, each with a bounded wait.
+
+**Rulings of the coordinating session (2026-11-21, 01:40 UTC), accepting the contract with these conditions:**
+- **Q1:** `--cfg origin_bench`, added only by `bench-build` and `boot-bench` and declared in check-cfg; F3 holds. No `xtask` path that signs or packages may accept a file from `target/bench`: a refusal and its test.
+- **Q2:** F1, F2 and F3, with BC-3 and BC-4 as their controls.
+- **Q3:** as recommended, and, P0 for the rental: every register the loader reads (S_CET, PL0_SSP, the SSP table address) must exist on both vendors whenever CPUID 07H.0:ECX[7] is 1, checked against the SDM and the APM on the day, gated on any other bit either ties it to, with host tests of the gating for each vendor.
+- **Q4:** RSI with `"ORIGIN" << 16 | port`, used only in a bench kernel and only when the magic matches; no magic means no breadcrumbs and an otherwise unchanged boot, with a test of that case.
+- **Q5:** the stale-key file is for QEMU scenarios; the rental's readiness must say it is absent from the rented ESP.
+- **Q6:** whether the halting line stays in normal builds goes to the owner as decision item 342. Until the answer, only the bench line is built, and BC-5 is kept ready for either answer.
+- **Q7:** (h) is left out; AMD's shutdown behaviour is paraphrased in the findings ledger.
+- **Q8:** the bytes are `RS12345678`; the loader's lines begin `origin-boot: bench build:`.
+- **Q9:** `boot-bench` runs in `boot-matrix` only; the time it adds is reported.
+- **Q10:** either order with TASKS item 93.
+- **Q11:** the record names the breadcrumbs, with an offline test.
+- **Gates:** `check`, `boot-test`, and `boot-matrix` three times in a row, in one turn on a clean tree.
+
+**Item 342 (2026-11-21, ~01:45 UTC).** The owner accepted Q6 ("Yes, keep it"): every loader, not only a bench build, writes one line to the UART boot info would name before it halts after a failed `ExitBootServices`. Its text is ADR-0002 Amendment 2 and ADR-0010 Amendment 4, which the owner accepted as drafted and which reached `main` in records PR 52 (`f8204f1e`). `land/batch-9` holds that `main` since `d81ca5b7`, merged here after the gates below: the two status lines now say "built by TASKS item 112, under QEMU only", and rows A02-Am2 and A10-Am4 are `built` (`emu`, `agent`). Item 343 (a second plan, `m4.metal.large`) was accepted and then withdrawn by the owner the same morning, before anything was added: `PLANS` is unchanged.
+
+**As built (2026-11-21).** On `claude/t112-breadcrumbs`: `b7a57f0c` (the loader and the kernel), `0a4ebefc` (xtask), `c0e626b0` (the rental tool), and the records.
+- **Every loader:** `boot/uefi/src/uart.rs` (forbids `unsafe`): `Uart`, a 16550 writer through a port trait, each byte after a wait of at most 100,000 line-status reads; `ExitCalls`, each call's status; `Halting`, the line. `main.rs` records each call and, on `ExitOutcome::Halt`, writes `origin-boot: ExitBootServices failed (first call …, retry …): halting` to boot info's UART before `halt()`.
+- **The bench loader** (`boot/uefi/src/bench.rs`, `main.rs` under the flag):
+  - It reads `\EFI\ORIGIN\BENCH-STALE-KEY` (at most 16 bytes, nothing allocated) and says on its console whether stale keys were asked for.
+  - It prints the state line in two parts: `Registers` (CR0, CR4, EFER, PAT where CPUID 01H:EDX[16]), then `Shadow` (S_CET, PL0_SSP, the SSP table, where CPUID 07H.0:ECX[7]).
+  - After a successful `ExitBootServices` it writes `Exited` to the SPCR's UART.
+  - It enters through `enter_kernel_bench`.
+- **The hand-over** (`boot/info/src/bench.rs`): RSI = `0x4F52_4947_494E << 16 | port`. `port()` accepts the magic only with a port `origin_spcr::port_block_allowed` allows.
+- **The kernel:** `kernel_main(entry, #[cfg(origin_bench)] crumbs)`; `origin_frame::bench` (forbids `unsafe`) keeps the port and writes through `port::bench_write` (the one new `unsafe`, in `port.rs`, on item 111's list); `crumb!` in `kernel.rs` (seven) and `console.rs` (`8`, then CR LF, in each of `attach_framebuffer`'s three paths); and one line after the console's first, `origin-kernel: bench build: breadcrumbs went to I/O port 0x2f8`, or `no breadcrumbs: the loader handed over no port`.
+- **xtask:** `bench-build`, `boot-bench` (in `boot-matrix`), `bench-gate` (F1, in `check`), F2 in the reproducible gate, the refusal in `sign_kernel` and `pack_kernel_to`, `Scenario::quiet`.
+- **The rental tool:** `breadcrumbs()`, in `boots.json` and the record's Result row; the install refuses an ESP that holds the switch.
+
+**What ran (QEMU 11.1.3's software processor on the development Mac, 2026-11-21, inside `cargo xtask exclusive`).**
+- **Host tests:** `origin-boot-info` 13, the loader's library 67 (the per-vendor gating, the state line, the exit and halting lines, the switch, the bounded writer), xtask's bench and toolchain tests 19, the rental tool's 34.
+- **`bench-build`:** `BOOTX64.EFI` 214,016 bytes, SHA-256 `1bea897c4d5530ce3eb2a056c1f0ec9f6709a0e6bf8758f38ba2db3387665457`; `KERNEL.ONBF` 1,961,216 bytes, SHA-256 `226d01ba2eafc37d85ca8da2412297875a469c1ccb59eed12886087d47ba70a8`, both holding the bench text. These are the code commits' images; the rental's are built again from the final tip and named in the hand-over.
+- **`boot-bench`:** 4 of 4 in 63 s, Clippy and the warm builds included (05:20 to 05:21 UTC):
+
+| Scenario | Time | COM2 (the SPCR's UART) after the loader's last line |
+|---|---|---|
+| the firmware's key | 13.3 s | `… exited on the first call`, `RS12345678`, the kernel's lines to its verdict |
+| a stale key once | 13.1 s | `… exited on the retry; the first call returned EFI_INVALID_PARAMETER …`, `RS12345678`, the kernel's lines |
+| a stale key twice | 22.4 s | `origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry EFI_INVALID_PARAMETER): halting`, then nothing for 20 s |
+| the bench kernel under the normal loader | 13.1 s | no breadcrumbs; `… no breadcrumbs: the loader handed over no port`; the kernel's lines |
+
+  The state line under TCG: `CR0 0x80010033, CR4 0x668, EFER 0xd00, PAT 0x7040600070406; shadow stacks: not reported (CPUID 07H.0:ECX[7] = 0)`: QEMU's software processor reports no CET_SS, so the shadow-stack reads first run on the rented board.
+- **Controls, each failing its command** (planted in the worktree, restored from a copy with a new modification time, hash checked):
+  - BC-1, two breadcrumbs swapped: `first missing marker "RS12345678"`;
+  - BC-2, the hook ignored: the retry line missing;
+  - BC-3, the normal images built with the bench flag: `the loader as a release builds it (no feature) holds the text "bench build" … (TASKS item 112, F2)`;
+  - BC-4, the flag named in `console.rs`: refused by F1;
+  - BC-5, every loader's halting line silenced: the halt scenario's marker missing, COM2 ending at the loader's last line.
+
+  The first runs of BC-2 and BC-5 were set aside. BC-2 ran on BC-1's kernel, because the first restore kept the old modification time and Cargo reused the planted build. BC-5's first plant left a function unused, which failed the compile instead of the scenario. Both were run again with the fix.
+
+**The gates on `54911a0d`** (the code and records above, with `land/batch-9` at `7b67be0b` merged in), under Rust 1.100.0 on the development Mac with QEMU 11.1.3 TCG and OVMF, in one turn of the machine (2026-11-21, 05:45 to 07:00 UTC, after 750 s waiting for two other sessions' runs), the worktree clean before and after. The quick gates had passed on `6e8184e1`.
+- `cargo xtask check` passed in 733 s (Loom: all 79 models passed and all 120 negative controls were caught).
+- `cargo xtask boot-test` passed in 53 s.
+- `cargo xtask boot-matrix` passed three times in a row: 1,245 s, 1,224 s and 1,232 s. Its `boot-bench` step passed 4 of 4 each time, in 81 s, 63 s and 62 s: the time it adds to `boot-matrix` (Q9), about 5 % of a run.
+- `cargo xtask bench-build` after them: `BOOTX64.EFI` 214,016 bytes, SHA-256 `1bea897c4d5530ce3eb2a056c1f0ec9f6709a0e6bf8758f38ba2db3387665457` (the same bytes as the code commits'); `KERNEL.ONBF` 1,965,312 bytes, SHA-256 `e39518f6c37348ba8453548f7cc1c76f9571cbe4d5709434a8813c863b4407d1` (TASKS items 94 and 78 changed the kernel). These are the images the hand-over names.
+
+`land/batch-9` at `d81ca5b7` (main's records PRs 51 and 52, documents only) was merged after the gates; no boot was run again for it.
+
+**The review** (`REVIEW_T112_2026-11-21.md`): one independent AI reviewer; no High or Medium; R112-1 to -6 and -9 answered in the code commits; R112-7, -8 and -10 kept, with reasons.
+
+**Found on the way:** under OVMF, the firmware's console, and with it the loader's lines, reach COM2 as well as COM1. TASKS item 84's D1 says the loader's line "cannot reach COM2" under OVMF; its checks look only at kernel lines on COM2 and are unaffected, but the sentence is wrong. `boot-bench`'s checks find the loader's line on COM2 rather than expect it first.
+
+**Follow-ups:**
+- `onbf-sign`'s own command line does not refuse a bench kernel (R112-5 covers `xtask` only).
+- The correction to TASKS item 84's D1 sentence, in its records.
