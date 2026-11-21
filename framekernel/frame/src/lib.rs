@@ -39,6 +39,7 @@ pub mod cpuident;
 pub mod cpumap;
 pub mod descriptors;
 pub mod dmar;
+pub mod domains;
 pub mod features;
 pub mod frames;
 pub mod heap;
