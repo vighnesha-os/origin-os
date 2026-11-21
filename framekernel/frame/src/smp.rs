@@ -59,7 +59,7 @@ use crate::acpi::{self, Processor};
 use crate::apstart::{Handshake, Outcome, Refusal};
 use crate::cpu::{self, CpuIndex, CpuTables, rdtsc};
 use crate::cpumap::CpuMap;
-use crate::features::{FpuFit, FpuFormat, fpu_fit};
+use crate::features::{ApLacks, FpuFit, FpuFormat, ap_lacks, fpu_fit};
 use crate::percpu::{PerCpu, Sizing};
 use crate::stack::GuardedStack;
 use crate::timer::{ApicRead, X2Apic};
@@ -1108,15 +1108,12 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // does not come online: it refuses, and the boot processor reports why and parks it.
     let baseline =
         crate::features::Features::decode(&cpuid).meets_baseline() && format.xcr0 & 0b111 == 0b111;
-    let lacks = if !(smep && smap) {
-        LACKS_SMEP_SMAP
-    } else if !baseline {
-        LACKS_BASELINE
-    } else if fit == FpuFit::TooLarge {
-        // Saving its state would write past every thread's FPU area.
-        LACKS_FPU_ROOM
-    } else {
-        0
+    // An AP whose state is too large: saving it would write past every thread's FPU area.
+    let lacks = match ap_lacks(smep && smap, baseline, fit) {
+        Some(ApLacks::SmepSmap) => LACKS_SMEP_SMAP,
+        Some(ApLacks::Baseline) => LACKS_BASELINE,
+        Some(ApLacks::FpuRoom) => LACKS_FPU_ROOM,
+        None => 0,
     };
     if lacks != 0 {
         // Release: the format above is read with `lacks`.

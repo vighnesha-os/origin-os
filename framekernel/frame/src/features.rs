@@ -282,6 +282,33 @@ pub enum FpuFit {
     TooLarge,
 }
 
+/// Why an application processor refuses to come online, from what it checked on itself before
+/// its handshake (ADR-0003, CLAUDE.md §14, ADR-0020 S6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApLacks {
+    /// No SMEP or no SMAP.
+    SmepSmap,
+    /// Below the x86-64-v3 baseline, or without the AVX state XCR0 must hold.
+    Baseline,
+    /// Its enabled XSAVE state is larger than every thread's FPU area.
+    FpuRoom,
+}
+
+/// What an AP lacks, if anything, in the order it is named: SMEP and SMAP, then the baseline,
+/// then room for its FPU state. Only the first is named, as the AP has one word to say it in
+/// (the review of TASKS item 94, R94-7).
+pub fn ap_lacks(smep_and_smap: bool, baseline: bool, fit: FpuFit) -> Option<ApLacks> {
+    if !smep_and_smap {
+        Some(ApLacks::SmepSmap)
+    } else if !baseline {
+        Some(ApLacks::Baseline)
+    } else if fit == FpuFit::TooLarge {
+        Some(ApLacks::FpuRoom)
+    } else {
+        None
+    }
+}
+
 /// Judges a processor's format `own` against the boot processor's, `boot` (`None` until the
 /// boot processor has recorded it), when every FPU area is `area` bytes. Room comes first: a
 /// state that does not fit is refused whatever else it matches.
@@ -511,6 +538,17 @@ mod tests {
     }
 
     #[test]
+    fn xsave_is_used_only_with_leaf_0dh() {
+        let mut id = modern();
+        assert!(xsave_usable(&id));
+        id.max_basic = 0x0C;
+        assert!(!xsave_usable(&id), "no leaf 0DH to size it");
+        let mut id = modern();
+        id.leaf1[2] &= !(1 << 26);
+        assert!(!xsave_usable(&id), "no XSAVE");
+    }
+
+    #[test]
     fn xsave_size_rejects_nonsense() {
         let mut id = modern();
         id.leaf_d0[2] = 100; // below the 576-byte minimum
@@ -533,17 +571,6 @@ mod tests {
         assert_eq!(fpu_fit(Some(BOOT), BOOT, AREA), FpuFit::Alike);
         // The area exactly as large as the state still holds it.
         assert_eq!(fpu_fit(Some(BOOT), BOOT, 832), FpuFit::Alike);
-    }
-
-    #[test]
-    fn xsave_is_used_only_with_leaf_0dh() {
-        let mut id = modern();
-        assert!(xsave_usable(&id));
-        id.max_basic = 0x0C;
-        assert!(!xsave_usable(&id), "no leaf 0DH to size it");
-        let mut id = modern();
-        id.leaf1[2] &= !(1 << 26);
-        assert!(!xsave_usable(&id), "no XSAVE");
     }
 
     #[test]
@@ -582,6 +609,20 @@ mod tests {
         // Room is judged first: even the boot processor's own format, in a smaller area.
         assert_eq!(fpu_fit(Some(BOOT), BOOT, 831), FpuFit::TooLarge);
         assert_eq!(fpu_fit(None, BOOT, 0), FpuFit::TooLarge);
+    }
+
+    #[test]
+    fn an_ap_names_the_first_thing_it_lacks() {
+        use FpuFit::{Alike, Differs, TooLarge};
+        for fit in [Alike, Differs, TooLarge] {
+            assert_eq!(ap_lacks(false, false, fit), Some(ApLacks::SmepSmap));
+            assert_eq!(ap_lacks(false, true, fit), Some(ApLacks::SmepSmap));
+            assert_eq!(ap_lacks(true, false, fit), Some(ApLacks::Baseline));
+        }
+        assert_eq!(ap_lacks(true, true, TooLarge), Some(ApLacks::FpuRoom));
+        // A format that differs but fits comes online, and takes no part in moves.
+        assert_eq!(ap_lacks(true, true, Differs), None);
+        assert_eq!(ap_lacks(true, true, Alike), None);
     }
 
     #[test]
