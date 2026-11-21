@@ -381,6 +381,12 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         proofs.record(Proof::Numa, numa);
         // Inter-node distances from the ACPI SLIT (CLAUDE.md §27, §28).
         proofs.record(Proof::NumaDistances, prove_slit(&mut com1, info.acpi_rsdp));
+        // The scheduling domains from those reports, the SRAT and any PPTT (ADR-0020 S8, S9;
+        // TASKS item 97).
+        proofs.record(
+            Proof::Domains,
+            prove_domains(&mut com1, info.acpi_rsdp, &online),
+        );
         // Every ACPI table the firmware gives, checked whole (ADR-0019 A6, area A; TASKS item 62).
         proofs.record(
             Proof::AcpiTables,
@@ -1368,6 +1374,209 @@ fn prove_slit(com1: &mut console::Console, rsdp: u64) -> bool {
         consistent,
         if consistent { "" } else { ": slit failed" }
     );
+    consistent
+}
+
+/// Builds the scheduling domains (ADR-0020 S8; TASKS item 97) from what each processor recorded
+/// about itself, the SRAT's nodes and the PPTT's caches where the firmware has one, keeps them in
+/// `domains::DOMAINS` for the balancer, and prints them, so `cargo xtask` can compare the tree with
+/// the machine it booted. Every processor's capacity is the same (S9's source 5): no hardware
+/// source is read before TASKS item 106.
+///
+/// A Report proof (ADR-0013 R3): it fails, and the boot goes on, when a processor recorded
+/// nothing, a claim was cut because two processors disagree about sharing, the PPTT and CPUID
+/// disagree or the PPTT breaks a rule its reading needs, a processor is in no node while the SRAT
+/// exists, or the levels do not nest. Each is read the conservative way, as "not shared".
+fn prove_domains(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -> bool {
+    use crate::acpi::{self, CpuAffinity, Processor as Listed};
+    use crate::domains::{self, Domains, Input, Processor, Tree};
+    use crate::topology::CacheLeaf;
+    use alloc::vec::Vec;
+
+    let cpus = online.cpus();
+    let n = cpus.len();
+
+    // The SRAT's nodes, as the NUMA proof reads them.
+    let srat = crate::firmware::acpi_table(rsdp, b"SRAT").ok();
+    let affinities: Option<Vec<CpuAffinity>> = srat.and_then(|t| {
+        let mut out = alloc::vec![CpuAffinity::default(); t.len() / 16];
+        let count = acpi::srat_cpu_affinities(t, &mut out).ok()?;
+        out.truncate(count);
+        Some(out)
+    });
+
+    // Each online processor's own reports.
+    let processors: Vec<Processor> = cpus
+        .iter()
+        .map(|&c| {
+            let apic_id = c.apic_id().unwrap_or(u32::MAX);
+            Processor {
+                cpu: u32::try_from(c.get()).unwrap_or(u32::MAX),
+                apic_id,
+                topology: smp::topology_of(c),
+                node: affinities
+                    .as_deref()
+                    .and_then(|a| crate::numa::node_of_cpu(a, apic_id)),
+            }
+        })
+        .collect();
+
+    // The PPTT, where the firmware has one: its processors are named by the MADT's ACPI
+    // processor IDs.
+    let madt: Vec<Listed> = crate::firmware::acpi_table(rsdp, b"APIC")
+        .ok()
+        .and_then(|t| {
+            let mut out = alloc::vec![Listed::default(); t.len() / 8];
+            let count = acpi::madt_processors(t, &mut out).ok()?;
+            out.truncate(count);
+            Some(out)
+        })
+        .unwrap_or_default();
+    let pptt_bytes = crate::firmware::acpi_table(rsdp, b"PPTT").ok();
+    let pptt = pptt_bytes.map(|t| {
+        let listed: Vec<(u32, bool)> = madt.iter().map(|p| (p.uid, p.enabled)).collect();
+        let asked: Vec<u32> = processors
+            .iter()
+            .map(|p| {
+                madt.iter()
+                    .find(|l| l.apic_id == p.apic_id)
+                    .map_or(u32::MAX, |l| l.uid)
+            })
+            .collect();
+        acpi::pptt_caches(t, &listed, &asked)
+    });
+    let claims = match &pptt {
+        Some(Ok(Some(c))) => Some(domains::PpttClaims {
+            second_level: c.second_level.clone(),
+            last_level: c.last_level.clone(),
+        }),
+        _ => None,
+    };
+
+    let tree = Tree::build(&Input {
+        processors: &processors,
+        srat: affinities.is_some(),
+        pptt: claims.as_ref(),
+    });
+
+    let _ = write!(com1, "origin-kernel: domains: {n} processors: ");
+    for (i, level) in tree.levels().iter().enumerate() {
+        let _ = write!(com1, "{}{level}", if i == 0 { "" } else { "; " });
+    }
+    let _ = writeln!(com1);
+
+    // Where the claims came from.
+    let recorded: Vec<_> = processors.iter().filter_map(|p| p.topology).collect();
+    let _ = write!(com1, "origin-kernel: domains: from: caches by ");
+    let mut first = true;
+    for leaf in [CacheLeaf::Leaf04, CacheLeaf::Leaf8000001D, CacheLeaf::None] {
+        let k = recorded.iter().filter(|t| t.caches.leaf() == leaf).count();
+        if k > 0 {
+            let _ = write!(
+                com1,
+                "{}{leaf} on {k} of {n}",
+                if first { "" } else { ", " }
+            );
+            first = false;
+        }
+    }
+    if first {
+        let _ = write!(com1, "nothing recorded");
+    }
+    let unused = recorded
+        .iter()
+        .filter(|t| t.caches.problem().is_some())
+        .count();
+    if unused > 0 {
+        let _ = write!(com1, " ({unused} with a sub-leaf not used)");
+    }
+    let pptt_ok = match &pptt {
+        None => {
+            let _ = write!(com1, "; PPTT none");
+            true
+        }
+        Some(Ok(None)) => {
+            let _ = write!(com1, "; PPTT without caches");
+            true
+        }
+        Some(Ok(Some(c))) => {
+            let _ = write!(com1, "; PPTT {} caches, {} with IDs", c.caches, c.with_id);
+            true
+        }
+        Some(Err(rule)) => {
+            let _ = write!(com1, "; PPTT not used: {rule}");
+            false
+        }
+    };
+    let nodes: Vec<u32> = processors.iter().filter_map(|p| p.node).collect();
+    let order = match &affinities {
+        None => Vec::new(),
+        Some(_) => {
+            let slit = crate::firmware::acpi_table(rsdp, b"SLIT")
+                .ok()
+                .and_then(|t| acpi::parse_slit(t).ok());
+            crate::numa::node_order(slit.as_ref(), &nodes)
+        }
+    };
+    match &affinities {
+        None => {
+            let _ = writeln!(com1, "; no SRAT");
+        }
+        Some(_) => {
+            let _ = write!(com1, "; nodes by the SRAT, nearest first:");
+            for (i, (node, others)) in order.iter().enumerate() {
+                let _ = write!(com1, "{} {node} [", if i == 0 { "" } else { "," });
+                for (j, other) in others.iter().enumerate() {
+                    let _ = write!(com1, "{}{other}", if j == 0 { "" } else { "," });
+                }
+                let _ = write!(com1, "]");
+            }
+            let _ = writeln!(com1);
+        }
+    }
+
+    // What disagreed, each read as "not shared".
+    let f = *tree.findings();
+    let _ = write!(
+        com1,
+        "origin-kernel: domains: {} claims cut, {} differing from the PPTT, {} naming another cache level than CPUID, {} in no node, {} recorded nothing; levels crossing: ",
+        f.cuts(),
+        f.differences(),
+        f.level_mismatches(),
+        f.unplaced,
+        f.unrecorded
+    );
+    match f.crossing {
+        None => {
+            let _ = writeln!(com1, "none");
+        }
+        Some((a, b)) => {
+            let _ = writeln!(
+                com1,
+                "{} and {}, so only the processors' own core, die and package are used",
+                a.name(),
+                b.name()
+            );
+        }
+    }
+
+    let capacity = crate::capacity::equal(n);
+    let consistent = f.agree() && pptt_ok;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: domains: capacity {} on {n} of {n} processors (ADR-0020 S9 source 5: no hardware source is read before TASKS item 106); consistent {consistent}{}",
+        crate::capacity::FULL,
+        if consistent {
+            ""
+        } else {
+            ": scheduling domains failed"
+        }
+    );
+    let _ = domains::DOMAINS.set(Domains {
+        tree,
+        node_order: order,
+        capacity,
+    });
     consistent
 }
 
