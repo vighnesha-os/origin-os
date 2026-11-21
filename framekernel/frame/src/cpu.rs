@@ -1849,24 +1849,97 @@ pub fn capture_backtrace(out: &mut [u64]) -> usize {
 /// taken before the lock that orders it is held: RDTSCP (Intel SDM Vol. 2B, RDTSCP; AMD
 /// APM Vol. 3) if `use_rdtscp` and this processor has it, else LFENCE then RDTSC.
 pub fn ordered_tsc(use_rdtscp: bool) -> u64 {
-    let has_rdtscp = use_rdtscp
-        && cpuid(0x8000_0000)[0] >= 0x8000_0001
-        && cpuid(0x8000_0001)[3] & (1 << 27) != 0;
-    let (low, high): (u32, u32);
-    if has_rdtscp {
-        // SAFETY: RDTSCP exists on this processor (just checked); it writes EDX:EAX and ECX
-        // (IA32_TSC_AUX, unused here) and reads no memory.
-        unsafe {
-            asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
-        }
+    let fence = if use_rdtscp {
+        TscFence::detect()
     } else {
-        // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory. No
-        // `preserves_flags`: Intel's entry for LFENCE does not say what it does to the flags.
-        unsafe {
-            asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
+        TscFence::LFENCE
+    };
+    fence.after()
+}
+
+/// How two TSC readings are ordered around what runs between them, so that they enclose it
+/// (TASKS item 78, `docs/research/2026-11-21-apic-timer-period.md` §2). Neither RDTSC nor
+/// RDMSR is serializing on either maker's processors, an x2APIC register's RDMSR included
+/// (Intel SDM Vol. 3A §13.12.3; AMD APM Vol. 2 §16.11.2): unfenced, a reading may be taken
+/// after the instruction it should precede, or before the one it should follow.
+///
+/// The form is private, so the RDTSCP form comes only from [`TscFence::detect`], which found
+/// RDTSCP on this processor: safe code cannot ask for an instruction the processor lacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TscFence(Fence);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fence {
+    /// RDTSCP, the first reading followed by LFENCE. Intel: LFENCE is always a barrier, and
+    /// RDTSCP waits for every earlier instruction. AMD: RDTSCP retires every older instruction
+    /// before it reads and is dispatch serializing, whatever MSR C001_1029 holds.
+    Rdtscp,
+    /// No RDTSCP: LFENCE beside RDTSC. Ordered where LFENCE is a barrier: on Intel always; on
+    /// AMD where CPUID Fn8000_0021_EAX[2] says so, or where the kernel set MSR C001_1029 bit 1
+    /// (ADR-0017, `Lfence::KernelSets`). Under a hypervisor on AMD without either, unordered.
+    Lfence,
+}
+
+impl TscFence {
+    /// LFENCE beside RDTSC, which every x86-64 processor has.
+    pub const LFENCE: Self = Self(Fence::Lfence);
+
+    /// RDTSCP where CPUID Fn8000_0001_EDX[27] reports it, else LFENCE. Read once, not for each
+    /// reading: CPUID leaves the guest under a hypervisor.
+    pub fn detect() -> Self {
+        if cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpuid(0x8000_0001)[3] & (1 << 27) != 0 {
+            Self(Fence::Rdtscp)
+        } else {
+            Self::LFENCE
         }
     }
-    (u64::from(high) << 32) | u64::from(low)
+
+    /// The TSC, read before any later instruction starts: RDTSCP or RDTSC, then LFENCE.
+    pub fn before(self) -> u64 {
+        let (low, high): (u32, u32);
+        match self.0 {
+            Fence::Rdtscp => {
+                // SAFETY: `Fence::Rdtscp` is private and made only by `detect`, which found
+                // RDTSCP on this processor; RDTSCP writes EDX:EAX and ECX (IA32_TSC_AUX, unused here) and
+                // reads no memory, and LFENCE reads and writes nothing. No `preserves_flags`:
+                // Intel's entry for LFENCE does not say what it does to the flags.
+                unsafe {
+                    asm!("rdtscp", "lfence", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack));
+                }
+            }
+            Fence::Lfence => {
+                // SAFETY: RDTSC and LFENCE exist on every x86-64 processor and read no memory.
+                // No `preserves_flags`, as above.
+                unsafe {
+                    asm!("rdtsc", "lfence", out("eax") low, out("edx") high, options(nomem, nostack));
+                }
+            }
+        }
+        (u64::from(high) << 32) | u64::from(low)
+    }
+
+    /// The TSC, read once every earlier instruction has executed: RDTSCP, or LFENCE then
+    /// RDTSC.
+    pub fn after(self) -> u64 {
+        let (low, high): (u32, u32);
+        match self.0 {
+            Fence::Rdtscp => {
+                // SAFETY: as in `before`; RDTSCP alone changes no flag.
+                unsafe {
+                    asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
+                }
+            }
+            Fence::Lfence => {
+                // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory.
+                // No `preserves_flags`: Intel's entry for LFENCE does not say what it does to
+                // the flags.
+                unsafe {
+                    asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
+                }
+            }
+        }
+        (u64::from(high) << 32) | u64::from(low)
+    }
 }
 
 /// The time-stamp counter.

@@ -25,6 +25,8 @@ use origin_boot_info::{
     BOOT_SECRET_LEN, BOOT_SEED_LEN, BootInfo, EarlyUart, FLAG_KASLR, Framebuffer, KernelSegment,
     MAX_KERNEL_SEGMENTS, MemoryRegion,
 };
+#[cfg(origin_bench)]
+use origin_boot_uefi::bench;
 use origin_boot_uefi::console::ConOut;
 use origin_boot_uefi::protocols::{
     ACPI_20_TABLE, ALLOCATE_ANY_PAGES, BOOT_SERVICES_SIGNATURE, BootServices, CONSOLE_OUT_DEVICE,
@@ -36,7 +38,7 @@ use origin_boot_uefi::protocols::{
 use origin_boot_uefi::uefi::{
     self, ExitOutcome, Handle, Revision, SimpleTextOutputProtocol, Status, SystemTable, TableHeader,
 };
-use origin_boot_uefi::{framebuffer, kernel, memmap, place, spcr, trust};
+use origin_boot_uefi::{framebuffer, kernel, memmap, place, spcr, trust, uart};
 use origin_paging::layout::{self, Placement};
 use origin_paging::{Access, Attributes, Table, TablePool};
 
@@ -148,6 +150,31 @@ fn boot(
         "origin-boot: read {KERNEL_PATH} ({} bytes)",
         file.len()
     );
+    // TASKS item 112: in a bench build, whether a QEMU scenario asks for stale map keys. A
+    // rented machine's volume never holds the file, so its boots take their natural path.
+    #[cfg(origin_bench)]
+    let stale = {
+        let (stale, said) = match read_bench_switch(image, &bs) {
+            None => (
+                0,
+                "no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key",
+            ),
+            Some(Some(1)) => (
+                1,
+                "BENCH-STALE-KEY: the first ExitBootServices call gets a stale key",
+            ),
+            Some(Some(_)) => (
+                2,
+                "BENCH-STALE-KEY: both ExitBootServices calls get a stale key",
+            ),
+            Some(None) => (
+                0,
+                "BENCH-STALE-KEY not understood: ExitBootServices gets the firmware's own key",
+            ),
+        };
+        let _ = writeln!(out, "{}{said}", bench::PREFIX);
+        stale
+    };
 
     // B2: verify it.
     if DEVELOPER_MODE {
@@ -482,7 +509,10 @@ fn boot(
             .map_err(|e| fail(out, Status::LOAD_ERROR, format_args!("page tables: {e:?}")))?;
         // The entry stub runs its last instructions after loading CR3: map its pages at
         // their identity address, read/execute, in the new tables.
+        #[cfg(not(origin_bench))]
         let stub = (enter_kernel as *const ()).addr() as u64 & !(PAGE as u64 - 1);
+        #[cfg(origin_bench)]
+        let stub = (enter_kernel_bench as *const ()).addr() as u64 & !(PAGE as u64 - 1);
         for page in [stub, stub + PAGE as u64] {
             space
                 .map(
@@ -575,11 +605,16 @@ fn boot(
             "64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info"
         }
     );
+    // TASKS item 112: the processor state the kernel inherits, in a bench build.
+    #[cfg(origin_bench)]
+    say_entry_state(out);
     let _ = writeln!(
         out,
         "origin-boot: exiting boot services; entering the Framekernel"
     );
     PANIC_CONSOLE.store(ptr::null_mut(), Ordering::Release);
+    // Each call's status, for the line the loader writes if it halts (decision item 342).
+    let mut calls = uart::ExitCalls::default();
     let outcome: ExitOutcome<MapFailure> = uefi::exit_boot_services(
         || {
             let (key, n) = read_memory_map(get_map, map, regions)?;
@@ -622,23 +657,50 @@ fn boot(
             Ok(key)
         },
         |key| {
+            // A bench build gives the first `stale` calls a stale key (QEMU scenarios only).
+            #[cfg(origin_bench)]
+            let key = bench::key_for(calls.made(), stale, key);
             // SAFETY: valid `ExitBootServices` with this image's handle and the key of the map
             // just obtained; nothing has been allocated since `GetMemoryMap`.
-            unsafe { exit(image, key) }
+            let status = unsafe { exit(image, key) };
+            calls.record(status);
+            status
         },
     );
     match outcome {
         ExitOutcome::Exited => {
             let stack_top = direct_map_base + stack + (STACK_PAGES * PAGE) as u64;
+            #[cfg(origin_bench)]
+            {
+                let port = bench_exited(early_uart, bench::Exited { calls, stale });
+                // SAFETY: as for `enter_kernel` below; `crumbs` names a port the SPCR named
+                // and the shared parser accepted, or is 0.
+                unsafe {
+                    enter_kernel_bench(
+                        entry,
+                        direct_map_base + info_addr,
+                        stack_top,
+                        root,
+                        origin_boot_info::bench::register(port),
+                    )
+                }
+            }
+            #[cfg(not(origin_bench))]
             // SAFETY: boot services have exited; `root` holds complete tables that map the
             // kernel image at `kernel_virtual` (so `entry`, the verified entry point inside
             // its RX segment, ADR-0002 B2), the stack and the boot info in the direct map,
             // and the entry stub at its identity address; `stack_top` is 16-byte aligned.
-            unsafe { enter_kernel(entry, direct_map_base + info_addr, stack_top, root) }
+            unsafe {
+                enter_kernel(entry, direct_map_base + info_addr, stack_top, root)
+            }
         }
         // `ExitBootServices` has not been called, so the firmware's console may still be used.
         ExitOutcome::NotAttempted(failure) => Err(failure.report(out)),
-        ExitOutcome::Halt => halt(),
+        ExitOutcome::Halt => {
+            // Decision item 342: why, on the UART boot info would name, before it halts.
+            say_halting(early_uart, calls);
+            halt()
+        }
     }
 }
 
@@ -705,7 +767,8 @@ fn read_memory_map(
 }
 
 /// Stops this processor for good. A failed `ExitBootServices` may have shut part of the
-/// firmware down, so none of it may be used again, not even to print (UEFI 2.11 §7.4).
+/// firmware down, so none of it may be used again, not even to print (UEFI 2.11 §7.4): the line
+/// saying why goes straight to the SPCR's UART first ([`say_halting`], decision item 342).
 fn halt() -> ! {
     loop {
         // SAFETY: the loader runs at CPL 0; masking interrupts and halting touch no memory.
@@ -1023,6 +1086,7 @@ fn framebuffer_of(bs: &BootServices, handle: Handle) -> Result<Framebuffer, fram
 /// Boot services must have exited and NX must be supported. `cr3` must hold complete tables
 /// that map this function's pages at their identity address, `entry` (the kernel's verified
 /// entry point), `stack_top` (16-byte aligned) and `boot_info` (a complete `BootInfo`).
+#[cfg(not(origin_bench))]
 #[unsafe(naked)]
 unsafe extern "sysv64" fn enter_kernel(entry: u64, boot_info: u64, stack_top: u64, cr3: u64) -> ! {
     core::arch::naked_asm!(
@@ -1061,6 +1125,239 @@ fn read_cr4() -> u64 {
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
     }
     cr4
+}
+
+/// TASKS item 112's entry stub, in a bench build: `enter_kernel`'s steps, with one byte to the
+/// UART `crumbs` names after the CR3 load (`R`) and after the stack switch (`S`), each after a
+/// wait for room of at most 100,000 line-status reads; and `crumbs` handed on in RSI, where
+/// `_start` leaves it for `kernel_main` (`origin_boot_info::bench`). With `crumbs` 0 it writes
+/// nothing. The bytes go to the port in `crumbs`' low 16 bits, which the SPCR named and the
+/// shared parser accepted.
+///
+/// # Safety
+///
+/// As for `enter_kernel`, and `crumbs` is 0 or `origin_boot_info::bench::register` of such a port.
+#[cfg(origin_bench)]
+#[unsafe(naked)]
+unsafe extern "sysv64" fn enter_kernel_bench(
+    entry: u64,
+    boot_info: u64,
+    stack_top: u64,
+    cr3: u64,
+    crumbs: u64,
+) -> ! {
+    core::arch::naked_asm!(
+        "cli",
+        "cld",
+        "mov r9, rdx",
+        "mov r10, rdi",
+        "mov r11, rsi",
+        "mov rsi, r8",
+        "mov r8, rcx",
+        "mov ecx, 0xC0000080",
+        "rdmsr",
+        "or eax, 0x800",
+        "wrmsr",
+        "mov rax, cr0",
+        "or rax, 0x10000",
+        "mov cr0, rax",
+        "mov cr3, r8",
+        // `R`: the tables are loaded.
+        "test rsi, rsi",
+        "jz 7f",
+        "mov dx, si",
+        "add dx, 5",
+        "mov ecx, 100000",
+        "3:",
+        "in al, dx",
+        "test al, 0x20",
+        "jnz 4f",
+        "dec ecx",
+        "jnz 3b",
+        "4:",
+        "sub dx, 5",
+        "mov al, 0x52",
+        "out dx, al",
+        "7:",
+        "mov rsp, r9",
+        // `S`: on the kernel stack, which this write proves mapped and writable (the slot the
+        // `call` below writes its return address to; TASKS item 112's review, R112-1).
+        "mov qword ptr [rsp - 8], 0",
+        "test rsi, rsi",
+        "jz 8f",
+        "mov dx, si",
+        "add dx, 5",
+        "mov ecx, 100000",
+        "5:",
+        "in al, dx",
+        "test al, 0x20",
+        "jnz 6f",
+        "dec ecx",
+        "jnz 5b",
+        "6:",
+        "sub dx, 5",
+        "mov al, 0x53",
+        "out dx, al",
+        "8:",
+        "xor ebp, ebp",
+        "mov rdi, r11",
+        "call r10",
+        "2:",
+        "cli",
+        "hlt",
+        "jmp 2b",
+    );
+}
+
+/// The loader's port I/O for [`uart::Uart`]: the line before a halt (decision item 342) and,
+/// in a bench build, the bench lines (TASKS item 112).
+struct LoaderPorts;
+
+impl uart::Port for LoaderPorts {
+    fn read(&mut self, port: u16) -> u8 {
+        let value: u8;
+        // SAFETY: CPL 0; the port is the line-status register of the UART the SPCR named and the
+        // shared parser accepted, and reading it has no side effect. IN leaves the flags as they
+        // were.
+        unsafe {
+            core::arch::asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack, preserves_flags));
+        }
+        value
+    }
+
+    fn write(&mut self, port: u16, value: u8) {
+        // SAFETY: CPL 0; the port is the transmit register of that UART, written only after
+        // `ExitBootServices` was called, when the firmware no longer drives it. OUT leaves the
+        // flags as they were.
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// Writes `line` and a line break to the UART boot info names, if it names one, straight to its
+/// registers: no firmware service is called (ADR-0002 B5). Returns that UART's port, or 0.
+fn say_on_uart(early_uart: EarlyUart, line: impl core::fmt::Display) -> u16 {
+    if !early_uart.is_present() {
+        return 0;
+    }
+    let mut io = LoaderPorts;
+    let mut uart = uart::Uart::new(&mut io, early_uart.port);
+    let _ = writeln!(uart, "{line}");
+    early_uart.port
+}
+
+/// Decision item 342: after `ExitBootServices` failed, the one line saying why, before the halt.
+fn say_halting(early_uart: EarlyUart, calls: uart::ExitCalls) {
+    say_on_uart(early_uart, calls.halting());
+}
+
+/// TASKS item 112, a bench build: which call succeeded, on the SPCR's UART. Returns its port.
+#[cfg(origin_bench)]
+fn bench_exited(early_uart: EarlyUart, exited: bench::Exited) -> u16 {
+    say_on_uart(early_uart, exited)
+}
+
+/// The processor state the kernel inherits, on the firmware's console, reading only the
+/// registers CPUID says exist ([`bench::reads`]). CR0, CR4, EFER and PAT are printed before the
+/// shadow-stack registers are read, so a read that faults there still leaves the rest on the
+/// console (TASKS item 112's review, R112-2).
+#[cfg(origin_bench)]
+fn say_entry_state(out: &mut ConOut) {
+    let reads = bench::reads(cpuid(0)[0], cpuid(1)[3], cpuid(7)[2]);
+    let registers = bench::Registers {
+        cr0: read_cr0(),
+        cr4: read_cr4(),
+        efer: rdmsr(0xC000_0080),
+        pat: reads.pat.then(|| rdmsr(0x277)),
+    };
+    let _ = write!(out, "{}{registers}", bench::PREFIX);
+    let shadow_stacks = reads.shadow_stacks.then(|| bench::ShadowStacks {
+        s_cet: rdmsr(0x6A2),
+        pl0_ssp: rdmsr(0x6A4),
+        ssp_table: rdmsr(0x6A8),
+    });
+    let _ = writeln!(out, "{}", bench::Shadow(shadow_stacks));
+}
+
+/// The value of CR0.
+#[cfg(origin_bench)]
+fn read_cr0() -> u64 {
+    let cr0: u64;
+    // SAFETY: as for `read_cr4`: CPL 0, and the flags are left undefined, so not claimed.
+    unsafe {
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
+    }
+    cr0
+}
+
+/// Model-specific register `msr`. Only for a register CPUID says exists ([`bench::reads`]): any
+/// other takes a #GP, under the firmware's IDT.
+#[cfg(origin_bench)]
+fn rdmsr(msr: u32) -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: CPL 0; the callers read only EFER, which every x86-64 processor has, and the
+    // registers `bench::reads` found enumerated. RDMSR leaves the flags as they were.
+    unsafe {
+        core::arch::asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Reads [`bench::STALE_KEY_PATH`] from the loader's volume, in a bench build: `None` if there
+/// is no such file, `Some(None)` if its contents ask for nothing [`bench::stale_calls`] knows,
+/// `Some(Some(n))` for `n` stale keys. Reads at most 16 bytes into the stack: nothing is
+/// allocated.
+#[cfg(origin_bench)]
+fn read_bench_switch(image: Handle, bs: &BootServices) -> Option<Option<u8>> {
+    let loaded = protocol::<LoadedImageProtocol>(bs, image, &LOADED_IMAGE_PROTOCOL).ok()?;
+    // SAFETY: `HandleProtocol` returned a live `EFI_LOADED_IMAGE_PROTOCOL` for this image.
+    let device = unsafe { (*loaded).device_handle };
+    let fs = protocol::<SimpleFileSystemProtocol>(bs, device, &SIMPLE_FILE_SYSTEM_PROTOCOL).ok()?;
+    // SAFETY: `HandleProtocol` returned a live `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`.
+    let open_volume = unsafe { (*fs).open_volume }?;
+    let mut root: *mut FileProtocol = ptr::null_mut();
+    // SAFETY: valid `OpenVolume` of a live protocol instance; `root` is a live local.
+    let status = unsafe { open_volume(fs, &mut root) };
+    if status.is_error() || root.is_null() {
+        return None;
+    }
+    let mut path = [0u16; 64];
+    for (dst, b) in path.iter_mut().zip(bench::STALE_KEY_PATH.bytes()) {
+        *dst = u16::from(b);
+    }
+    let mut contents = [0u8; 16];
+    let mut len = 0usize;
+    let mut found = false;
+    // SAFETY: `root` is a live file handle from `OpenVolume`.
+    if let Some(open) = unsafe { (*root).open } {
+        let mut file: *mut FileProtocol = ptr::null_mut();
+        // SAFETY: valid `Open` on a live handle; `path` is NUL-terminated (the array is longer
+        // than the ASCII path); `file` is a live local.
+        let status = unsafe { open(root, &mut file, path.as_ptr(), FILE_MODE_READ, 0) };
+        if !status.is_error() && !file.is_null() {
+            found = true;
+            // SAFETY: `file` is the live handle `Open` just returned.
+            if let Some(read) = unsafe { (*file).read } {
+                len = contents.len();
+                // SAFETY: valid `Read` on a live handle into `contents`, which has `len` bytes.
+                if unsafe { read(file, &mut len, contents.as_mut_ptr().cast()) }.is_error() {
+                    len = 0;
+                }
+            }
+            // SAFETY: `file` is the handle `Open` returned; it is not used afterwards.
+            if let Some(close) = unsafe { (*file).close } {
+                // SAFETY: closing the handle this function opened.
+                let _ = unsafe { close(file) };
+            }
+        }
+    }
+    // SAFETY: `root` is the open volume handle from `OpenVolume`.
+    if let Some(close) = unsafe { (*root).close } {
+        // SAFETY: closing the handle this function opened; it is not used afterwards.
+        let _ = unsafe { close(root) };
+    }
+    found.then(|| bench::stale_calls(contents.get(..len.min(contents.len())).unwrap_or(&[])))
 }
 
 /// CPUID `leaf`, sub-leaf 0: `[eax, ebx, ecx, edx]`.

@@ -1,0 +1,18 @@
+# Bench boot: Latitude.sh m4-metal-small, 2026-11-21 (rental D, the bench build)
+
+| | |
+|---|---|
+| Machine | Latitude.sh `m4-metal-small`, Amsterdam: AMD EPYC 4244P, CPUID family 19h (25), model 61h (97), stepping 2; board Supermicro H13SRE-F (system AS-3015MR-H10TNR); 12 logical processors; 64 GiB of RAM, most of it above 4 GiB. The provider gave it a server ID that neither earlier server had; its firmware revision and its DSDT, FIDT and UEFI tables match rental B's machine |
+| Firmware | American Megatrends 2.4 (2025-04-29), UEFI 2.9 (firmware revision 0x50023 as the loader read it), UEFI mode, Secure Boot off; console redirection on COM2 (I/O port 0x2F8) at 115 200 baud, the UART the SPCR names |
+| Source revision | `0fc45e51375980c1d131b004bd2bbb9a382d021c` (TASKS item 112); `cargo xtask bench-build`: the bench loader, developer-mode with the TEST trust store, and the bench kernel, never signed (neither ships); `BOOTX64.EFI` SHA-256 `1bea897c4d5530ce3eb2a056c1f0ec9f6709a0e6bf8758f38ba2db3387665457`; `KERNEL.ONBF` SHA-256 `e39518f6c37348ba8453548f7cc1c76f9571cbe4d5709434a8813c863b4407d1` |
+| Date | 2026-11-21 |
+| Result | Boots 1, 2 and 3 alike. The loader named the SPCR's UART at I/O port `0x2f8`, printed the processor state the kernel inherits (`CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)`), and ran to `origin-boot: exiting boot services; entering the Framekernel`. Nothing followed on the serial console in the 8 minutes each boot was given: no loader line after `ExitBootServices`, no halting line, no breadcrumb byte (the tool's reading: `breadcrumbs: none`). The machine did not restart by itself. No verdict |
+| Scope | By hand, since the kernel printed nothing on the console: AuthenticAMD family 19h, older than Zen 5; outside the declared scope, a bench machine (ADR-0009 A1). Bench equipment: it qualifies nothing and supports no hardware claim (CLAUDE.md §74, §76, rules 30 and 40; item 233) |
+| Environment | A physical machine with no hypervisor; the provider's firmware and BMC |
+| Boot entry | Origin's loader replaced `\EFI\ubuntu\shimx64.efi`, which `Boot0002`, first in `BootOrder`, starts (item 236). The provider's system had been started by `Boot0004`; every reset of this rental started `Boot0002`. The ESP held no `BENCH-STALE-KEY`, as the tool checked before writing, and the loader said so on each boot |
+| Speculation controls | Not printed |
+| IOMMU | IVRS present: the same table as rentals A, B and C. Bring-up not printed |
+| Log | `2026-11-21-latitude-m4-metal-small-d.log`, SHA-256 `94c69ce6b3de12cf650fe383cce6e994ace3d1777f0d16a0acbd1d9ba14b42eb`: the serial console from each boot's firmware start to the next reset, the provider's own system left out, with IP and MAC addresses, GUIDs and the server's ID removed. Runs of 20 or more spaces, which the firmware uses to place its progress text, are written as line breaks (the treatment of rental C's log, which it reproduces byte for byte) |
+| Not kept here | ACPI tables, `lspci -vvv`, `efibootmgr -v`, `dmesg`, CPUID: held privately by the owner (item 232). SHA-256 of the tables Origin reads first: SPCR `2f93c54c877ec205131b5e18fb4601c5806e98a05c1b4983ee0a5f0e2fc71df1`, IVRS `7f8517f6c55cceb3f9b8335bfd831d7f20049d51cf089ccc57e6f8098fdfdbc3`, APIC `9b9e93881d3ee48a0a51f7e6b5db0c809b2ccba34dc715be9e595b808d2664ea`, FACP `2918822e4067ee055656d769964e396783827098adfa48dde5263452d6b5ae8c`, FPDT `ee3c7c272face85db12433c01112474b1d21c4bd71143ebbfd504c32de09bfd9`, DSDT `b4a0ef3b36d44ac0505a9bc15718b8fc67ae17c466014ad36508b1072da611b4` |
+
+What happened, and where the boot stops: `docs/research/2026-11-21-rental-d-findings.md`.
