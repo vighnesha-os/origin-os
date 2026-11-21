@@ -1772,15 +1772,11 @@ pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
-/// [`without_interrupts`], with the section's witness (ADR-0020 S3; TASKS item 93). `f` reads the
-/// processor index, and this processor's entries of per-processor tables, under it. The closure
-/// takes the witness for any lifetime it is given, so nothing bound to that lifetime can leave it.
-///
-/// `f` must not enable interrupts, open an interrupt window, idle, yield, sleep, block or exit.
-/// Any of those would let the thread be switched out inside the section, where the witness says it
-/// cannot be (`trap::Here`).
+/// [`without_interrupts`], with the section's witness (ADR-0020 S3; TASKS item 93): `trap::section`,
+/// which makes the witness, as its documentation says. `f` must not enable interrupts, open an
+/// interrupt window, idle, yield, sleep, block or exit.
 pub fn without_interrupts_here<T>(f: impl for<'a> FnOnce(crate::trap::Here<'a>) -> T) -> T {
-    without_interrupts(|| f(crate::trap::Here::new()))
+    crate::trap::section(f)
 }
 
 /// This processor's CPU index, read under a witness that the reader cannot leave the processor
@@ -1825,26 +1821,12 @@ impl<'a> ThisCpu<'a> {
 }
 
 /// The boot or idle flow's witness (ADR-0020 S2, point 4; TASKS item 93, the coordinating
-/// session's ruling Q6): `Some` if the context running on this processor is the processor's boot
-/// or idle flow, `None` on a thread.
-///
-/// A flow has no record and never moves, and it never becomes a thread. So the witness holds for
-/// the flow's whole life. Each flow takes it once, at its entry, and passes it down.
-///
-/// It is the flow if:
-/// - the descriptor tables are not loaded yet, so nothing but the boot flow has run;
-/// - this processor has no table of contexts, so no thread can have been switched in;
-/// - or its table names no running home (no switch yet) or the flow's own (`trap::runs_a_flow`).
-///
-/// It is read with interrupts off, since only this processor's switches write the running slot.
+/// session's rulings Q6 and on `cba7462b`): `trap::flow`, which makes the check and the witness,
+/// as its documentation says. `Some` if the context running on this processor is the processor's
+/// boot or idle flow, `None` on a thread. Each flow takes it once, at its entry, and passes it
+/// down.
 pub fn flow() -> Option<crate::trap::Pinned<'static>> {
-    let runs = without_interrupts(|| {
-        !tables_ready()
-            || CONTEXTS
-                .get(this_cpu().get())
-                .is_none_or(|table| crate::trap::runs_a_flow(table.running_home()))
-    });
-    runs.then(crate::trap::Pinned::new)
+    crate::trap::flow()
 }
 
 /// CR3: the physical address of the live PML4 (and, with PCIDs off, nothing else).

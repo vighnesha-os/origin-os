@@ -49,15 +49,18 @@ impl Switch {
 /// (`cpu::this_cpu`), and this processor's entry of a per-processor table is lent only for its
 /// life (`PerCpu::this`).
 ///
-/// **Who makes one.**
-/// - An interrupts-off section, `cpu::without_interrupts_here`. Its closure takes the witness for
-///   any lifetime it is given, so nothing bound to that lifetime can be returned from it.
-/// - The trap entry: [`Switch::here`] for the scheduling hooks, and its own for the device handlers
-///   and its own checks.
+/// **Who makes one.** Three makers, each in this module, and nothing else (TASKS item 93, the
+/// coordinating session's ruling on `cba7462b`):
+/// - An interrupts-off section, `section` (which `cpu::without_interrupts_here` forwards to). Its
+///   closure takes the witness for any lifetime it is given, so nothing bound to that lifetime can
+///   be returned from it.
+/// - The trap entry, through its [`Switch`]: [`Switch::here`], for the scheduling hooks, the
+///   device handlers and its own checks.
 /// - [`Pinned::here`].
 ///
-/// Nothing else can: the field is private. It is zero-sized and `Copy`, and neither `Send` nor
-/// `Sync`, so it never reaches another thread.
+/// Its field and its constructor are private to this module, so no other module, in this crate or
+/// another, can make one. It is zero-sized and `Copy`, and neither `Send` nor `Sync`, so it never
+/// reaches another thread.
 ///
 /// **What a section's or the trap entry's witness rests on.** It holds only while nothing its
 /// holder runs switches the holder out. Code holding one never enables interrupts, opens an
@@ -100,10 +103,10 @@ impl core::fmt::Debug for Here<'_> {
 }
 
 impl Here<'_> {
-    /// For the framework's makers of a witness, each named in the type's documentation (the
-    /// kernel's target only, where they exist).
+    /// For [`section`] only (the kernel's target only, where it exists). Private: a call from any
+    /// other module does not build.
     #[cfg(target_os = "none")]
-    pub(crate) const fn new() -> Self {
+    const fn new() -> Self {
         Self { _here: PhantomData }
     }
 }
@@ -114,7 +117,12 @@ impl Here<'_> {
 /// Two things give one:
 /// - **a pin the running thread holds** (`sched::pin`), turned into a witness only through the
 ///   [`PinMint`];
-/// - **the boot or idle flow** (`cpu::flow`). A flow has no record, and never moves (S2, point 4).
+/// - **the boot or idle flow** (`flow`, which `cpu::flow` forwards to), only once its check has
+///   found the processor running its flow. A flow has no record, and never moves (S2, point 4).
+///
+/// Its field and its constructor are private to this module, so no other module, in this crate or
+/// another, can make one any other way (TASKS item 93, the coordinating session's ruling on
+/// `cba7462b`).
 ///
 /// It gives a [`Here`] for the same life. A function whose body may be switched out takes a
 /// `Pinned`, never a `Here`.
@@ -152,9 +160,10 @@ impl core::fmt::Debug for Pinned<'_> {
 }
 
 impl<'a> Pinned<'a> {
-    /// For `cpu::flow`, the boot or idle flow's maker (the kernel's target only).
+    /// For [`flow`] only, once its check has passed (the kernel's target only). Private: a call
+    /// from any other module does not build.
     #[cfg(target_os = "none")]
-    pub(crate) const fn new() -> Self {
+    const fn new() -> Self {
         Self { _here: PhantomData }
     }
 
@@ -242,8 +251,46 @@ impl Default for MintHolder {
     }
 }
 
+/// Runs `f` with interrupts off on this processor, with the section's witness (ADR-0020 S3; TASKS
+/// item 93). `f` reads the processor index, and this processor's entries of per-processor tables,
+/// under it. The closure takes the witness for any lifetime it is given, so nothing bound to that
+/// lifetime can leave it. `cpu::without_interrupts_here` forwards here.
+///
+/// `f` must not enable interrupts, open an interrupt window, idle, yield, sleep, block or exit.
+/// Any of those would let the thread be switched out inside the section, where the witness says it
+/// cannot be ([`Here`]).
+#[cfg(target_os = "none")]
+pub(crate) fn section<T>(f: impl for<'a> FnOnce(Here<'a>) -> T) -> T {
+    crate::cpu::without_interrupts(|| f(Here::new()))
+}
+
+/// The boot or idle flow's witness (ADR-0020 S2, point 4; TASKS item 93, the coordinating
+/// session's rulings Q6 and on `cba7462b`): `Some` if the context running on this processor is the
+/// processor's boot or idle flow, `None` on a thread. `cpu::flow` forwards here, and this is the
+/// only place a flow's [`Pinned`] is made.
+///
+/// A flow has no record and never moves, and it never becomes a thread. So the witness holds for
+/// the flow's whole life. Each flow takes it once, at its entry, and passes it down.
+///
+/// It is the flow if:
+/// - the descriptor tables are not loaded yet, so nothing but the boot flow has run;
+/// - this processor has no table of contexts, so no thread can have been switched in;
+/// - or its table names no running home (no switch yet) or the flow's own ([`runs_a_flow`]).
+///
+/// It is read in a [`section`], since only this processor's switches write the running slot.
+#[cfg(target_os = "none")]
+pub(crate) fn flow() -> Option<Pinned<'static>> {
+    let runs = section(|here| {
+        !crate::cpu::tables_ready()
+            || crate::cpu::CONTEXTS
+                .this(crate::cpu::this_cpu_at(here))
+                .is_none_or(|table| runs_a_flow(table.running_home()))
+    });
+    runs.then(Pinned::new)
+}
+
 /// Whether a processor whose table of contexts names `running_home` as its running context's home
-/// runs its boot or idle flow (`cpu::flow`; TASKS item 93, the coordinating session's ruling Q6):
+/// runs its boot or idle flow ([`flow`]; TASKS item 93, the coordinating session's ruling Q6):
 /// - `None`: no switch yet, so the flow is the only context that has run;
 /// - the flow's own home, `BOOT_FLOW`.
 ///
