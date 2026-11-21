@@ -267,8 +267,9 @@ impl Early {
         unsafe { cpu::init() };
     }
 
-    /// Enables SSE and AVX state on the boot processor, from what its CPUID reports; returns
-    /// XCR0. Only the first call does anything.
+    /// Enables SSE and AVX state on the boot processor, from what its CPUID reports, and records
+    /// its FPU format and the size of every thread's FPU area, which application processors are
+    /// held to (ADR-0020 S6); returns XCR0 as read back. Only the first call does anything.
     pub fn enable_simd(&mut self) -> u64 {
         if let Some(xcr0) = self.xcr0 {
             return xcr0;
@@ -277,9 +278,11 @@ impl Early {
         // SAFETY: CPL 0, the boot processor, once (`xcr0` above). No code on it uses SSE or
         // XSAVE yet: the kernel is soft-float, and no thread has been started. `cpuid` is what
         // this processor reports: it is read here and passed to nobody else.
-        let xcr0 = unsafe { cpu::enable_simd(&cpuid) };
-        self.xcr0 = Some(xcr0);
-        xcr0
+        let format = unsafe { cpu::enable_simd(&cpuid) };
+        // Before any FPU area is allocated: no thread has been started.
+        let _ = cpu::record_boot_fpu(&cpuid, format);
+        self.xcr0 = Some(format.xcr0);
+        format.xcr0
     }
 
     /// Builds the frame allocator, with its bitmap and then the page-table pool at the start
@@ -498,7 +501,9 @@ impl Early {
     /// heap, which starts the `alloc` crate. Does nothing unless the kernel's own tables are
     /// live and proven. Returns whether the heap has started.
     pub fn start_heap(&mut self, com1: &mut dyn Write) -> bool {
-        if self.heap || !self.paged {
+        // Not before `enable_simd`: every FPU area is sized from what it records, and the heap
+        // is where areas come from (the delta review of TASKS item 94, R94-9).
+        if self.heap || !self.paged || self.xcr0.is_none() {
             return false;
         }
         let Some(mut boot) = self.memory.take() else {

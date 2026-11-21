@@ -184,6 +184,12 @@ What stays: zombies and the exit counts (N5, N6), and so TASKS item 79's settle;
 
 **The FPU format** (N9). Each application processor, at start, compares its XCR0 and the size of its enabled XSAVE state (CPUID.0DH.00H:EBX) with the boot processor's. One that differs never takes part in a move, as source or destination, and the boot says so. The SDM puts the supported-XCR0 bitmap and every component's offset in its Platform domain and checks a standard-format image only against XCR0 and its header (I1 §21.1.4, §13.4.3, §13.8.1), but never says outright that an image moves between logical processors (ledger §2.10), and AMD reports the same values for Zen 5 and Zen 5c without saying so either (§2.7). So it is checked, not assumed. The kernel's area size becomes the boot processor's, and each processor checks against it.
 
+*Note, 2026-11-21 (TASKS item 94, as built, on the coordinating session's rulings on its contract; not an amendment).*
+- **What is compared:** XCR0 as XGETBV reads it back, and CPUID.0DH.00H:EBX read after XCR0 is set: equal both, or the processor takes no part. Each component's offset and size in the standard format is in the Platform domain (SDM Vol. 1, Table 21 for leaf 0DH), so a difference there is not one the documents allow, and it is not compared.
+- **The area:** the boot processor's CPUID.0DH.00H:ECX, never less than its own enabled size, recorded once by the boot processor before the first area is allocated. Shrinking it to the enabled size is TASKS item 111.
+- **An AP whose enabled state is larger than the area** would write past every area its threads save into. It does not come online: it refuses before its handshake and is parked, as one below the baseline is.
+- **The flag** is written by each processor on itself, with its control state, in one store before its handshake answer. It is asked through the processors online (`smp::Online::takes_part_in_moves`), so a processor parked after a late answer never takes part. The boot prints one line ("FPU format: … N of N processors alike, every one taking part in moves"), and ADR-0013 records it as a Report proof, until the mover of TASKS item 96 withholds such a processor.
+
 **Evidence.** N2, N5 to N12.
 
 **Wake-ups.** A woken thread stays on the processor it is on: S7 decides it.
