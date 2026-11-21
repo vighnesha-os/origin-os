@@ -293,7 +293,7 @@ unsafe fn on_stack(stack: &GuardedStack, run: &mut dyn FnMut(), overwrite: bool)
 /// generator stack, or a step is already running on it.
 fn step_here<R>(work: impl FnOnce(&Slot, u32, u64, u64) -> R) -> Option<R> {
     cpu::without_interrupts_here(|here| {
-        let me = cpu::this_cpu_at(here);
+        let me = cpu::this_cpu(here);
         let index = me.index();
         let slot = SLOTS.this(me)?;
         let stack = slot.stack.get()?;
@@ -857,7 +857,7 @@ impl StackWords {
 /// after a request the whole stack holds zeros. `None` if this processor has no generator.
 pub fn prove_stack() -> Option<StackProof> {
     cpu::without_interrupts_here(|here| {
-        let slot = SLOTS.this(cpu::this_cpu_at(here))?;
+        let slot = SLOTS.this(cpu::this_cpu(here))?;
         let stack = slot.stack.get()?;
         if slot.in_step.load(Ordering::Acquire) {
             return None;

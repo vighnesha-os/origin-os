@@ -82,7 +82,7 @@ impl TlbHardware for Hardware {
     type Here<'a> = crate::trap::Here<'a>;
 
     fn this_cpu(&self, here: crate::trap::Here<'_>) -> usize {
-        cpu::this_cpu_at(here).index().get()
+        cpu::this_cpu(here).index().get()
     }
 
     fn invalidate(&self, request: Request) {
@@ -206,12 +206,7 @@ static STALLS: crate::stalls::StallLog = crate::stalls::StallLog::new();
 fn note(outcome: &Result<Completed, Stalled>, asked_at: u64) {
     if let Err(Stalled { cpu, .. }) = outcome {
         cpu::without_interrupts_here(|here| {
-            STALLS.note(
-                *cpu,
-                cpu::this_cpu_at(here).index().get(),
-                asked_at,
-                rdtsc(),
-            );
+            STALLS.note(*cpu, cpu::this_cpu(here).index().get(), asked_at, rdtsc());
         });
     }
 }
@@ -221,7 +216,7 @@ fn note(outcome: &Result<Completed, Stalled>, asked_at: u64) {
 /// as having answered when it had not, or the one that had answered not marked.
 fn note_answer() {
     cpu::without_interrupts_here(|here| {
-        STALLS.answered(cpu::this_cpu_at(here).index().get(), rdtsc());
+        STALLS.answered(cpu::this_cpu(here).index().get(), rdtsc());
     });
 }
 
@@ -240,7 +235,7 @@ pub(crate) static INTERRUPTS: PerCpu<AtomicU64> =
 
 /// The shootdown interrupt, under the trap entry's witness (ADR-0020 S3; TASKS item 93).
 pub(crate) fn interrupted(here: crate::trap::Here<'_>) {
-    if let Some(taken) = INTERRUPTS.this(cpu::this_cpu_at(here)) {
+    if let Some(taken) = INTERRUPTS.this(cpu::this_cpu(here)) {
         taken.fetch_add(1, Ordering::Relaxed);
     }
     service();

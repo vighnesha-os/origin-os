@@ -273,7 +273,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         // clock from the RTC (CLAUDE.md §68).
         proofs.record(Proof::Clocks, time::init(&mut com1, hz, info.acpi_rsdp));
         // I/O APIC interrupt routing, proven by routing the PIT's IRQ0 (CLAUDE.md §24).
-        let bsp = timer::X2Apic::here(cpu::this_cpu_at(flow.here()))
+        let bsp = timer::X2Apic::here(cpu::this_cpu(flow.here()))
             .map_or(u32::MAX, |l| l.read(timer::ApicRead::Id) as u32);
         proofs.record(
             Proof::IoApic,
@@ -324,7 +324,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         let stack_value = prove_stack_value(&mut com1, info.boot_seed != 0);
         report_random_start(
             &mut com1,
-            origin_frame::random::start_boot(cpu::this_cpu_at(flow.here())),
+            origin_frame::random::start_boot(cpu::this_cpu(flow.here())),
         );
         let online = smp::start(flow, &mut com1, sched::run_ap, crate::percpu::size_per_cpu);
         proofs.record(Proof::Processors, online.complete());
@@ -710,7 +710,7 @@ fn prove_ibpb(
     let start = time::monotonic_nanos();
     let mut issued = 0;
     for _ in 0..SAMPLES {
-        issued += u64::from(cpu::issue_ibpb(cpu::this_cpu_at(flow.here())));
+        issued += u64::from(cpu::issue_ibpb(cpu::this_cpu(flow.here())));
     }
     let taken = time::monotonic_nanos().saturating_sub(start);
     let _ = if issued == SAMPLES {
@@ -1125,7 +1125,7 @@ fn prove_topology(
     use crate::topology::{self, CpuTopology, Layout, Source};
 
     // The boot processor's own record; every AP wrote its own before it came online.
-    smp::record_topology(cpu::this_cpu_at(flow.here()));
+    smp::record_topology(cpu::this_cpu(flow.here()));
     // The cache hierarchy from leaf 04h.
     let mut caches = [crate::cache::Cache {
         level: 0,
@@ -1590,7 +1590,7 @@ fn prove_random(
     // The rest after a "not now" is one second (TASKS 18b S3).
     const FRESH_WAIT_NANOS: u64 = 1_100_000_000;
     // The boot flow's own processor (TASKS item 93): a value, read under the flow's witness.
-    let here = random::processor(cpu::this_cpu_at(flow.here()).index());
+    let here = random::processor(cpu::this_cpu(flow.here()).index());
     let rdseed = here.is_some_and(|p| p.rdseed == Condition::Healthy);
     let mut fresh = [0u8; 32];
     let mut fresh_result = random::fill_fresh(&mut fresh);
@@ -1873,7 +1873,7 @@ fn prove_nmi_ist(
     tsc_hz: u64,
 ) -> NmiProof {
     let (before, _) = cpu::nmis();
-    timer::send_nmi_to_self(cpu::this_cpu_at(flow.here()));
+    timer::send_nmi_to_self(cpu::this_cpu(flow.here()));
     let start = cpu::rdtsc();
     while cpu::nmis().0 == before && cpu::rdtsc().wrapping_sub(start) < tsc_hz {
         core::hint::spin_loop();

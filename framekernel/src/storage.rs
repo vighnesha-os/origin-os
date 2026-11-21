@@ -458,7 +458,7 @@ static INTERRUPT_CPU: AtomicU64 = AtomicU64::new(0);
 /// processor that took it and wakes the waiter there, which then reads the completion itself.
 /// The processor is read under the trap entry's witness (ADR-0020 S3; TASKS item 93).
 fn on_interrupt(here: origin_frame::trap::Here<'_>) -> origin_frame::irq::Action {
-    let me = crate::cpu::this_cpu_at(here);
+    let me = crate::cpu::this_cpu(here);
     INTERRUPTS.fetch_add(1, Ordering::Relaxed);
     INTERRUPT_CPU.store(
         (me.index().get() as u64).saturating_add(1),
@@ -1262,7 +1262,7 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
     // Its processor's wait queue, which the completion interrupt taken here wakes, for every read:
     // pinned while it reads (TASKS item 93).
     let pin = crate::sched::pin();
-    let me = crate::cpu::this_cpu_at(pin.pinned().here());
+    let me = crate::cpu::this_cpu(pin.pinned().here());
     let start = crate::cpu::rdtsc();
     let (mut reads, mut matched) = (0u64, 0u64);
     let mut copy = [0u8; 4096];
@@ -1369,7 +1369,7 @@ fn prove_interrupts(
     tsc_hz: u64,
 ) -> bool {
     // The boot flow's processor, a value read under its witness (TASKS item 93).
-    let bsp = crate::cpu::this_cpu_at(flow.here()).index();
+    let bsp = crate::cpu::this_cpu(flow.here()).index();
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let setup = with_driver_out(|d| {
         let apic_id = target
@@ -1912,7 +1912,7 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
     // Its processor's own queue and wait queue, for its whole life: pinned until it ends, and its
     // end keeps the pin as every ending thread's does (TASKS item 93).
     let pin = crate::sched::pin();
-    let me = crate::cpu::this_cpu_at(pin.pinned().here());
+    let me = crate::cpu::this_cpu(pin.pinned().here());
     let (mut reads, mut matched) = (0u64, 0u64);
     let mut page = [0u8; 4096];
     let mut expected = [0u8; 512];
@@ -2455,7 +2455,7 @@ pub(crate) fn prove_iommu(
     // 3. Remapped interrupts: every programmed MSI-X entry is a handle to its own IRTE, whose
     //    destination is the target processor's APIC ID.
     // The boot flow's processor, a value read under its witness (TASKS item 93).
-    let bsp = crate::cpu::this_cpu_at(flow.here()).index();
+    let bsp = crate::cpu::this_cpu(flow.here()).index();
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let apic = |c: CpuIndex| c.apic_id().unwrap_or(crate::cpumap::BROADCAST);
     let mut routes: Vec<(pci::Address, vtd::MsiMessage, u8, u32)> = Vec::new();

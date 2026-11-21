@@ -347,7 +347,7 @@ unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex, interrupt_stacks:
     init_cpu_state();
     // The index just set, read in a section (ADR-0020 S3; TASKS item 93): interrupts are already
     // off here, as the caller's contract says, so the section only gives the witness.
-    without_interrupts_here(|at| init_speculation(this_cpu_at(at)));
+    without_interrupts_here(|at| init_speculation(this_cpu(at)));
 }
 
 /// The processor indexes the kernel has: 1, the boot processor's, until the processors are
@@ -783,11 +783,11 @@ fn name_kernel_stack(at: crate::trap::Here<'_>, home: u64) {
             Some(top) => top,
             None => panic!(
                 "the context resumed {} has its home in no kernel stack",
-                this_cpu_at(at).index().named()
+                this_cpu(at).index().named()
             ),
         }
     };
-    let local = this_cpu_at(at);
+    let local = this_cpu(at);
     let Some(tss) = CPU_LOCAL.this(local).map(|l| l.tss.load(Ordering::Relaxed)) else {
         return;
     };
@@ -833,7 +833,7 @@ const fn ist_of(vector: u64) -> u8 {
 ///
 /// `at` is the trap entry's witness, under which the index is read (ADR-0020 S3; TASKS item 93).
 fn check_landing(at: crate::trap::Here<'_>, here: u64, vector: u64) {
-    let me = this_cpu_at(at);
+    let me = this_cpu(at);
     let home = CONTEXTS.this(me).and_then(Contexts::running_home);
     if !home.is_some_and(|home| crate::stack::same_slot(home, here)) {
         panic!(
@@ -959,7 +959,7 @@ fn running_on(address: u64) -> bool {
 ///
 /// `at` is the trap entry's witness, under which the index is read (ADR-0020 S3; TASKS item 93).
 fn resume(at: crate::trap::Here<'_>, here: u64, next: u64, exiting: bool) -> u64 {
-    let me = this_cpu_at(at);
+    let me = this_cpu(at);
     let outcome = CONTEXTS.this(me).map_or(Err(Refused::NeverSaved), |table| {
         table.switch(here, next, exiting, running_on)
     });
@@ -1005,7 +1005,7 @@ pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
     let used = |value: u64| value >= start && value < end;
     if tables_ready()
         && without_interrupts_here(|at| {
-            CONTEXTS.this(this_cpu_at(at)).map(|table| {
+            CONTEXTS.this(this_cpu(at)).map(|table| {
                 table.publish_leaving();
                 table.retire_ended(running_on)
             })
@@ -1029,7 +1029,10 @@ pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
 
 /// This processor's CPU index: one GS-relative load from its CPU-local area. On a
 /// processor without one ([`OUT_OF_RANGE`]) it is an index no array has.
-pub fn this_cpu() -> CpuIndex {
+///
+/// Private (ADR-0020 S3; TASKS item 93): [`this_cpu`] is its one caller, under a witness that the
+/// reader cannot leave the processor. A read without one does not build.
+fn read_index() -> CpuIndex {
     let id: u64;
     // SAFETY: `load_tables` set GS's base to a live `CpuLocal` on every processor before
     // any code that calls this runs, and offset 0 is its `id`, a `u64`.
@@ -1419,11 +1422,11 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     if frame.vector == 14 {
         // Two reads of the index, each under the trap entry's witness: as the code read it before
         // TASKS item 93, so what is built here does not change.
-        let armed = local(this_cpu_at(Switch::new().here()))
+        let armed = local(this_cpu(Switch::new().here()))
             .probe_rip
             .load(Ordering::SeqCst);
         if armed != 0 && frame.rip == armed {
-            local(this_cpu_at(Switch::new().here()))
+            local(this_cpu(Switch::new().here()))
                 .probe_address
                 .store(read_cr2(), Ordering::SeqCst);
             frame.rax = frame.error_code;
@@ -1796,7 +1799,7 @@ fn init_speculation(me: ThisCpu<'_>) {
 /// scheduler's switch point, which has interrupts off, so nothing else on this processor
 /// runs between the note and the barrier.
 pub fn entering_process(process: u64, switch: &Switch) {
-    if crate::speculation::enters(this_cpu_at(switch.here()).index().get(), process) {
+    if crate::speculation::enters(this_cpu(switch.here()).index().get(), process) {
         // SAFETY: CPL 0; `enters` says yes only where this processor recorded that it has
         // the IBPB command, so the register exists. Bit 0 is the command, and it changes
         // nothing but what the branch predictors hold.
@@ -1842,12 +1845,11 @@ pub fn without_interrupts_here<T>(f: impl for<'a> FnOnce(crate::trap::Here<'a>) 
 }
 
 /// This processor's CPU index, read under a witness that the reader cannot leave the processor
-/// (ADR-0020 S3), and branded with the witness's life ([`ThisCpu`]). The name is TASKS item 93's,
-/// for while both forms exist: its last step removes the form without a witness and gives this one
-/// the name `this_cpu`.
-pub fn this_cpu_at(here: crate::trap::Here<'_>) -> ThisCpu<'_> {
+/// (ADR-0020 S3; TASKS item 93), and branded with the witness's life ([`ThisCpu`]). It is the only
+/// way to read the index: a call without a witness does not build.
+pub fn this_cpu(here: crate::trap::Here<'_>) -> ThisCpu<'_> {
     ThisCpu {
-        index: this_cpu(),
+        index: read_index(),
         here,
     }
 }
@@ -2179,7 +2181,7 @@ impl core::fmt::Debug for Probe {
 fn run_probe(fault_rip: u64, access: impl FnOnce() -> u64) -> Probe {
     // Per CPU: probes and user copies on different processors never disarm each other.
     without_interrupts_here(|at| {
-        let here = local(this_cpu_at(at));
+        let here = local(this_cpu(at));
         here.probe_rip.store(fault_rip, Ordering::SeqCst);
         let result = access();
         here.probe_rip.store(0, Ordering::SeqCst);

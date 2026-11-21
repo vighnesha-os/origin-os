@@ -370,7 +370,7 @@ pub fn timed_programming() -> Option<apic::TimerProgramming> {
 /// `None` if x2APIC mode is not on. For the preemption proof's check that every processor
 /// ticks as the boot processor's proof timed (TASKS item 66, the review's T66-R1).
 pub fn programmed(here: crate::trap::Here<'_>) -> Option<apic::TimerProgramming> {
-    let lapic = X2Apic::here(crate::cpu::this_cpu_at(here))?;
+    let lapic = X2Apic::here(crate::cpu::this_cpu(here))?;
     Some(apic::TimerProgramming::from_registers(
         lapic.read(ApicRead::TimerInitial),
         lapic.read(ApicRead::TimerDivide),
@@ -509,7 +509,7 @@ pub fn init(flow: crate::trap::Pinned<'_>, com1: &mut dyn Write, rsdp: u64) -> O
     // SAFETY: CPL 0, boot processor, interrupts disabled, x2APIC supported (checked), and
     // `cpu::init` installed a gate for the spurious vector. The index is read under the boot
     // flow's witness, after the check above that the CPU's tables (and so GS) are live.
-    let lapic = unsafe { X2Apic::enable(crate::cpu::this_cpu_at(flow.here())) };
+    let lapic = unsafe { X2Apic::enable(crate::cpu::this_cpu(flow.here())) };
     let version = lapic.read(ApicRead::Version);
     let _ = writeln!(
         com1,

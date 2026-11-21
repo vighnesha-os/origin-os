@@ -229,7 +229,7 @@ pub(crate) fn quiesce(
     own: &[Address],
 ) -> Option<Quiesce> {
     // The boot flow's processor, read under its witness (TASKS item 93).
-    let me = crate::cpu::this_cpu_at(flow.here());
+    let me = crate::cpu::this_cpu(flow.here());
     let pat = crate::cpu::check_pat(me);
     let bsp = me.index();
     if crate::cpu::pat_ready(&[bsp]) != 1 {
@@ -637,7 +637,7 @@ pub(crate) fn init(
     regions: &[MemoryRegion],
     reserved: &[(u64, u64)],
 ) -> bool {
-    let pat = crate::cpu::check_pat(crate::cpu::this_cpu_at(flow.here()));
+    let pat = crate::cpu::check_pat(crate::cpu::this_cpu(flow.here()));
     let ready = crate::cpu::pat_ready(cpus);
     if ready != cpus.len() {
         let _ = writeln!(

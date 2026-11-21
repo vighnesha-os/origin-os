@@ -471,7 +471,7 @@ impl Early {
         unsafe { cpu::load_page_tables(space.root()) };
         // SAFETY: CPL 0; the tables just loaded mark only the kernel half global (`layout`).
         // Toggling CR4.PGE also drops every translation cached under the loader's tables.
-        let global = unsafe { tlb::enable_global_pages(cpu::this_cpu_at(flow.here())) };
+        let global = unsafe { tlb::enable_global_pages(cpu::this_cpu(flow.here())) };
         let used = tables.used();
         // SAFETY: once (`KernelTables` is made once and consumed here), with the tables
         // `load_page_tables` just loaded: they map everything running now, and from here on
@@ -541,7 +541,7 @@ impl Early {
         }
         self.user_isolation = true;
         // SAFETY: CPL 0, and the kernel has no user mappings yet.
-        let (smep, smap) = unsafe { cpu::enable_smep_smap(cpu::this_cpu_at(flow.here())) };
+        let (smep, smap) = unsafe { cpu::enable_smep_smap(cpu::this_cpu(flow.here())) };
         if !(smep && smap) {
             let _ = writeln!(
                 com1,

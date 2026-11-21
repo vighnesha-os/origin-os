@@ -88,7 +88,7 @@ static NET_WAKES: AtomicU64 = AtomicU64::new(0);
 fn on_interrupt(here: origin_frame::trap::Here<'_>) -> origin_frame::irq::Action {
     NET_IRQS.fetch_add(1, Ordering::Relaxed);
     NET_IRQ_CPU.store(
-        (crate::cpu::this_cpu_at(here).index().get() as u64).saturating_add(1),
+        (crate::cpu::this_cpu(here).index().get() as u64).saturating_add(1),
         Ordering::Relaxed,
     );
     if NET_WAIT.wake_one() {
@@ -1520,7 +1520,7 @@ pub(crate) fn prove(
     // config-change interrupt, then set up the receive queue (interrupt on entry
     // RX_MSIX_ENTRY) and the transmit queue (no interrupt; its completion is polled).
     // The boot flow's processor, a value read under its witness (TASKS item 93).
-    let bsp = crate::cpu::this_cpu_at(flow.here()).index();
+    let bsp = crate::cpu::this_cpu(flow.here()).index();
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let msix_enabled = target
         .apic_id()

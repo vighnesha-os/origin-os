@@ -120,7 +120,7 @@ pub(crate) fn ioapic_irqs_on(cpu: CpuIndex) -> u64 {
 /// count is read under the trap entry's witness (ADR-0020 S3; TASKS item 93).
 fn on_interrupt(here: origin_frame::trap::Here<'_>) -> Action {
     IOAPIC_IRQS.fetch_add(1, Ordering::Relaxed);
-    if let Some(n) = IOAPIC_IRQS_ON.this(cpu::this_cpu_at(here)) {
+    if let Some(n) = IOAPIC_IRQS_ON.this(cpu::this_cpu(here)) {
         n.fetch_add(1, Ordering::Relaxed);
     }
     // The console's boot proof prints from this handler once.
@@ -429,7 +429,7 @@ pub(crate) fn prove_remapped(
         return true;
     }
     // The boot flow's processor, a value read under its witness (TASKS item 93).
-    let bsp = cpu::this_cpu_at(flow.here()).index();
+    let bsp = cpu::this_cpu(flow.here()).index();
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let mut ids = cpus.to_vec();
     if !ids.contains(&target) {

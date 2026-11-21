@@ -285,7 +285,7 @@ pub(crate) fn flow() -> Option<Pinned<'static>> {
     let runs = section(|here| {
         !crate::cpu::tables_ready()
             || crate::cpu::CONTEXTS
-                .this(crate::cpu::this_cpu_at(here))
+                .this(crate::cpu::this_cpu(here))
                 .is_none_or(|table| runs_a_flow(table.running_home()))
     });
     runs.then(Pinned::new)

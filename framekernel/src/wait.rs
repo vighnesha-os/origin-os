@@ -251,7 +251,7 @@ const TIMED_ATTEMPTS: u32 = 8;
 extern "sysv64" fn timed_waiter(which: u64) -> ! {
     // Pinned across the wait, so both tick counts are this processor's (TASKS item 93).
     let pin = sched::pin();
-    let me = cpu::this_cpu_at(pin.pinned().here());
+    let me = cpu::this_cpu(pin.pinned().here());
     let start = crate::time::monotonic_nanos();
     let ticks_at_start = sched::queue_ticks(me);
     let (queue, flag, ms) = if which == 0 {

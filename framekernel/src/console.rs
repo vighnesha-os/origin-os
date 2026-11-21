@@ -1678,7 +1678,7 @@ extern "sysv64" fn printer(_: u64) -> ! {
     }
     // Its processor, as the label of its lines, pinned while it prints them (TASKS item 93).
     let pin = crate::sched::pin();
-    let me = crate::cpu::this_cpu_at(pin.pinned().here());
+    let me = crate::cpu::this_cpu(pin.pinned().here());
     print_lines(&mut Console::new(), me.index().get() as u64);
     drop(pin);
     crate::sched::finish(|| {
@@ -1859,7 +1859,7 @@ pub(crate) fn prove_uart_sections(
     let on_the_uart = written >= whole_line;
 
     // The boot flow's processor, read under its witness (TASKS item 93).
-    let me = crate::cpu::this_cpu_at(flow.here());
+    let me = crate::cpu::this_cpu(flow.here());
     let bsp = me.index();
     let irqs = crate::irq::ioapic_irqs_on(bsp);
     PRINT_IN_INTERRUPT.store(true, Ordering::Release);
@@ -1938,7 +1938,7 @@ pub(crate) fn prove_sections(flow: origin_frame::trap::Pinned<'_>, com1: &mut Co
         return true;
     }
     // The boot flow's processor, read under its witness (TASKS item 93).
-    let me = crate::cpu::this_cpu_at(flow.here());
+    let me = crate::cpu::this_cpu(flow.here());
     let bsp = me.index();
     let irqs = crate::irq::ioapic_irqs_on(bsp);
     let (mut taken_after, mut sections) = (None, 0);

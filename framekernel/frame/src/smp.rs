@@ -285,7 +285,7 @@ pub fn start(
     };
     let (info, regions) = (boot.info(), boot.regions());
     // The boot flow's index (ADR-0020 S3; TASKS item 93): it never moves.
-    let me = cpu::this_cpu_at(flow.here());
+    let me = cpu::this_cpu(flow.here());
     // The timer bring-up switched this APIC to x2APIC mode; without it no AP is started.
     let Some(lapic) = X2Apic::here(me) else {
         let _ = writeln!(
@@ -1112,7 +1112,7 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
         let _ = start.handshake.refuse(Refusal::NotMine);
         cpu::halt();
     };
-    let me = cpu::this_cpu_at(flow.here());
+    let me = cpu::this_cpu(flow.here());
     // SAFETY: CPL 0; the kernel has no user mappings. Every processor enforces SMEP and SMAP.
     let (smep, smap) = unsafe { cpu::enable_smep_smap(me) };
     // SAFETY: CPL 0; the kernel's tables mark only the kernel half global.
