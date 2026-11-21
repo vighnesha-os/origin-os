@@ -1281,3 +1281,30 @@ M3's exit tests M3-1 to M3-4 (item 259) ask for load balancing, affinity, CPU ac
   - the roadmap: A20's build rows placed in M3 and A05-J1 to A05-J5 in M4, in no exit test, under item 264's rule; A20-S21, A20-S22 and A05-J6 are rules; M3-1's note that it stays partial until ADR-0008's amendment on processors offline and back is built (item 338);
   - `PERFORMANCE_BUDGETS.md`: budgets B20 to B26 and ledger rows CL47 to CL59;
   - the build plan `docs/engineering/M3_SCHEDULING_PLAN.md` and TASKS items 92 to 109: batch 9 is items 92 to 98, 100 and 101 (about 94 commits); batch 10 is items 99 and 102 to 108 (about 68); item 109, lending across calls, follows the M3 core.
+
+### The loader's line before it halts, and a second rental board (items 342 and 343): Accepted 2026-11-21
+
+Rental C ran boot info 0.8 on the rented server three times, on 2026-11-21:
+- the loader found the SPCR and named COM2, the operator's console;
+- still no kernel line came.
+
+Its findings rank first a silent halt after a failed `ExitBootServices`, the loader's only silent end. TASKS item 112 builds breadcrumbs for the next rental, in bench builds only, and put two questions.
+
+| # | Question | Answer |
+|---|---|---|
+| 342, answered | Should every loader, not only bench builds, print one line before it halts after a failed `ExitBootServices`? The line goes to the UART that boot info would name (the SPCR's), with a bounded wait and no firmware call, on the failure path only. It amends ADR-0002 B5 and ADR-0010 | **Accept** |
+| 343, answered | Add Latitude's `m4.metal.large` to the rental tool's allowed plans, as a second bench board for the breadcrumbs build after the small board? It is an AMD EPYC 9254 (Zen 4) with 384 GB, in Ashburn, about $2.03 an hour by the owner's reading of the provider's page. Each rental still needs the owner's yes in chat, and item 225's $10 cap is unchanged | **Accept** |
+
+- **The alternatives put:**
+  - for 342: the line in bench builds only;
+  - for 343: not now; or `rs4.metal.large` (EPYC 9354P, 768 GB, about $3.22 an hour), whose worst case beside the small board's run passes the cap.
+- **The evidence:**
+  - rental C's findings, `docs/research/2026-11-21-rental-c-findings.md` (on `land/batch-9` at `94e0b6e2` until it lands);
+  - the tool's ledger, which holds three rentals at $2.43 of the $10 cap.
+- **Performance cost** (ADR-0018 V3):
+  - **342:** none, by construction, on a boot that succeeds, since the line runs only on the failure path.
+  - **343:** money, not run time. Its worst case is two clock hours, $4.06 a rental. With one small-board run (at most $1.62), the ledger would reach at most $8.11 of the cap.
+- **The board is bench equipment** (item 233). Its cores are Zen 4, outside ADR-0009 Amendment 1's scope, so it qualifies nothing.
+- **Where they are written:** TASKS item 112 builds both:
+  - the normal loader's line, with the amendment text for ADR-0002 B5 and ADR-0010 drafted in its records, which lands with it;
+  - the tool's allowed plans, with offline tests, the API's slug and site code confirmed by a read-only preflight.
