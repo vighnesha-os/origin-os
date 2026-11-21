@@ -1525,7 +1525,7 @@ mod tests {
     /// middle of the stall.
     fn stalled_reads(bracket: u64, every: u64, stall: u64) -> impl FnMut() -> CountRead {
         let mut at = 0;
-        let mut n = 0;
+        let mut n = 0u64;
         move || {
             n += 1;
             let extra = if n.is_multiple_of(every) { stall } else { 0 };
