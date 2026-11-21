@@ -1334,3 +1334,26 @@ Rental D's findings propose a bench loader that resets the machine on purpose af
   - the matrix row A02-Am3, placed in M1;
   - TASKS item 116, which builds it.
 
+### A bench build's reset with no firmware code (item 345): Accepted 2026-11-21
+
+Rental E ran TASKS item 116's reset diagnostic on the rented server on 2026-11-21. In all three boots, two things reached the console: a line written straight to the UART, and the marker written just before `ExitBootServices`. Nothing came after them, and there was no reset. That reads two ways:
+- the call never returns;
+- it returned, and both the console's path and the firmware's reset failed.
+
+Both of item 344's reset methods run firmware code on this board. Rental E's findings propose a reset that runs none, made before anything else after the call.
+
+| # | Question | Answer |
+|---|---|---|
+| 345, answered | May a bench loader reset the machine with no firmware code, as a bench-only amendment to ADR-0002 Amendment 3? It would write `0x06` to the reset port `0xCF9` the instant `ExitBootServices` returns, then trigger a triple fault 100 ms later if needed. It would also make one `0xCF9` reset before the call, as a control the FCH itself records, and print the FCH's reset registers before the call. Or only swap item 344's order, or rent no more for now? | **Allow it** |
+
+- **The alternatives put:**
+  - swap item 344's order: the FADT's register first, then `ResetSystem`. On this board that register still runs firmware code;
+  - no more rentals now: only the free work.
+- **The evidence:** rental E's findings, `docs/research/2026-11-21-rental-e-findings.md` (on `land/batch-9` until it lands).
+- **Performance cost** (ADR-0018 V3): none, by construction. Only bench builds contain it.
+- **Where it is written:**
+  - ADR-0002 Amendment 4;
+  - the matrix row A02-Am4, placed in M1;
+  - TASKS item 121, which builds it and also lists what Origin's loader does before the call that a minimal UEFI program does not.
+- **The next rental** (rental F, about $0.81) is put to the owner separately, once TASKS item 121 is built.
+
