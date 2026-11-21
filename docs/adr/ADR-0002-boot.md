@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). |
-| Date | 2026-11-07; Amendment 1 2026-11-10; boot info 0.6 accepted 2026-11-10 and built 2026-11-11 (B4) |
+| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). B5 gained one line on the SPCR's UART before a halt after a failed `ExitBootServices` by Amendment 2, accepted by the owner on 2026-11-21 (decision sheet item 342). |
+| Date | 2026-11-07; Amendment 1 2026-11-10; Amendment 2 2026-11-21; boot info 0.6 accepted 2026-11-10 and built 2026-11-11 (B4) |
 | Owner decisions still open | None. B7, carried over from ADR-0001, was decided on 2026-11-07 and amended on 2026-11-10. |
 | Implements | CLAUDE.md §19 (UEFI boot chain), §20 (boot manager, later), §58 (Secure Boot), ONBF §8.1 (chain of trust) |
 | Code | `boot/info` (`origin-boot-info`), `boot/uefi` (`origin-boot-uefi`), `framekernel/`, `developer-tools/onbf-pack` |
@@ -141,3 +141,34 @@ The 2011 CA expired in June 2026, so only the 2023 CA matters ([Microsoft](https
 - B7's first stage is still worth building small and stable, because the same first stage is what Microsoft would later sign.
 
 **Migration.** Nothing built changes: neither path exists yet. CLAUDE.md §19 says which path is the default (revision 7.3).
+
+## Amendment 2 (2026-11-21): one line on the SPCR's UART before a halt after `ExitBootServices`
+
+*Accepted by the owner on 2026-11-21 ("Yes, keep it"; decision sheet item 342). Proposed by TASKS item 112's contract (Q6). TASKS item 112 builds it, in the ninth batch (`land/batch-9`); until that lands, nothing here is built.*
+
+**Change to B5.** After the first `ExitBootServices` call the loader still calls nothing in the firmware. If that call and its one retry both fail, or the retry cannot be made, the loader now does one more thing before it halts: it writes one line to the UART boot info would name (Amendment 3 of ADR-0010: the SPCR's 16550 in I/O space, as the loader's walk found it before the call), and then halts as before. The line names each call's status, or why there was no retry:
+
+```text
+origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry EFI_INVALID_PARAMETER): halting
+```
+
+- **No firmware call.** The loader reads that UART's line-status register and writes its transmit register with `in` and `out`, as the firmware left it programmed. It does not reprogram it.
+- **Bounded.** Each byte waits for room for at most 100,000 line-status reads, the kernel's own bound. A byte that never finds room ends the line, and the loader halts anyway.
+- **Only on the failure path.** A boot whose call succeeds writes nothing to the UART, and its console is unchanged. A machine whose firmware names no such UART gets no line, as before.
+- It is the loader's only direct write to a UART (ADR-0010 Amendment 4).
+
+**Why.** The failed retry is the loader's one silent end. On rentals B and C (2026-11-20 and 2026-11-21) nothing reached the serial console between the loader's last line and the kernel's first, and a failed retry was the first cause rental C's findings ranked (`docs/research/2026-11-21-rental-c-findings.md`). On a server whose console is the SPCR's UART, the line says why at no cost to a boot that succeeds.
+
+**Alternatives.**
+
+| | Why not |
+|---|---|
+| Keep the silent halt | A failed `ExitBootServices` stays indistinguishable from a hang anywhere after it |
+| Print through the firmware's console after the failure | UEFI 2.11 §7.4 allows only the memory-map service and `ExitBootServices` after the first call: the console may already be shut down |
+| Only in bench builds (TASKS item 112) | Every machine whose console is the SPCR's UART would still halt silently |
+
+**Performance cost (ADR-0018 V3).** None, by construction: the line is written only on the path that ends in a halt, and a boot that leaves the firmware does no extra work for it.
+
+**Threat model (§58).** The write goes only to the port the SPCR named and the shared parser accepted (ADR-0010 Amendment 3), never to a guessed one. It happens after the firmware stopped driving the UART, and the loader halts right after it.
+
+**Code (to come with TASKS item 112).** `boot/uefi/src/uart.rs` (the bounded writer and the line, host-tested through a port trait) and `boot/uefi/src/main.rs` (the calls' statuses and the port instructions).
