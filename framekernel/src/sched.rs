@@ -1103,12 +1103,9 @@ fn spawn_with_parts(
 /// An application processor's scheduler: waits until the boot processor has queued its
 /// threads, then starts its own timer and idles with interrupts on; the timer preempts the
 /// idle loop to run the queue's threads.
-pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
-    // This processor's idle flow, which never moves (ADR-0020 S2, point 4): its witness, taken
-    // once here (TASKS item 93, the ruling's Q6).
-    let Some(flow) = cpu::flow() else {
-        panic!("an application processor's scheduler started off its idle flow");
-    };
+pub(crate) fn run_ap(flow: Pinned<'static>, lapic: &X2Apic) -> ! {
+    // This processor's idle flow, which never moves (ADR-0020 S2, point 4): its witness, made
+    // in `smp::ap_entry` with interrupts off and passed down (TASKS item 93).
     let me = cpu::this_cpu_at(flow.here());
     while !GO.load(Ordering::Acquire) {
         core::hint::spin_loop();

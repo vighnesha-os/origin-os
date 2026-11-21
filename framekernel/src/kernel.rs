@@ -109,7 +109,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     let out_of_turn = !early.start_heap(&mut com1)
         && !early.prove_user_isolation(&mut com1)
         && early.build_kernel_tables(&mut com1).is_none()
-        && timer::init(&mut com1, info.acpi_rsdp).is_none();
+        && timer::init(flow, &mut com1, info.acpi_rsdp).is_none();
 
     // The trap entry (in `cpu`) knows the layers above only through these upcalls.
     origin_frame::trap::install(origin_frame::trap::Hooks {
@@ -192,7 +192,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     // M2, third step: the kernel's own page tables, proven with deliberate faults; then
     // the frame allocator is proven again through the new direct map.
     let mut heap_ok = false;
-    let paging = init_paging(&mut com1, &mut early);
+    let paging = init_paging(flow, &mut com1, &mut early);
     // The kernel's own tables are loaded, so firmware tables can be mapped: the console's
     // UART is the one the firmware names, if it names one (ADR-0010).
     console::adopt_firmware_uart(&mut com1, info.acpi_rsdp, regions);
@@ -239,7 +239,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
 
     // M2, fourth step: interrupts. The local APIC in x2APIC mode, its timer calibrated
     // against the PIT and proven by taking periodic interrupts.
-    let tsc_hz = timer::init(&mut com1, info.acpi_rsdp);
+    let tsc_hz = timer::init(flow, &mut com1, info.acpi_rsdp);
     record_or_stop(&mut com1, &mut proofs, Proof::ApicTimer, tsc_hz.is_some());
     if let Some(hz) = tsc_hz {
         // The timer runs and every vector that can arrive has a gate: from here on, the
@@ -310,7 +310,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             &mut com1,
             origin_frame::random::start_boot(cpu::this_cpu_at(flow.here())),
         );
-        let online = smp::start(&mut com1, sched::run_ap, crate::percpu::size_per_cpu);
+        let online = smp::start(flow, &mut com1, sched::run_ap, crate::percpu::size_per_cpu);
         proofs.record(Proof::Processors, online.complete());
         // What each processor put in its own control registers, which ring 3 relies on.
         let held = cpu::cpu_states_holding(online.cpus()) == online.cpus().len();
@@ -340,7 +340,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         }
         // Every boot step, and the two that bring up hardware for good, run once: a repeat
         // changes nothing (`smp::start` would otherwise reset running processors).
-        let again = smp::start(&mut com1, sched::run_ap, crate::percpu::size_per_cpu);
+        let again = smp::start(flow, &mut com1, sched::run_ap, crate::percpu::size_per_cpu);
         let once = again.cpus().len() == 1
             && !again.complete()
             && early.reclaim_loader_memory(&online).is_none()
@@ -374,7 +374,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // CPU topology from CPUID, each processor's on itself, checked against the MADT
         // (CLAUDE.md §24, §27).
         let apic_ids = online.apic_ids();
-        let topology = prove_topology(&mut com1, info.acpi_rsdp, &online);
+        let topology = prove_topology(flow, &mut com1, info.acpi_rsdp, &online);
         proofs.record(Proof::Topology, topology);
         // NUMA affinities from the ACPI SRAT (CLAUDE.md §24, §28).
         let numa = prove_numa(&mut com1, info.acpi_rsdp, &apic_ids);
@@ -1096,11 +1096,16 @@ pub(crate) fn check_initramfs(image: &[u8]) -> InitramfsCheck {
 ///   the resulting package, die, module and core counts with the machine it asked QEMU for.
 ///
 /// None of this reads the QEMU machine definition; the counts are only printed here.
-fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -> bool {
+fn prove_topology(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut console::Console,
+    rsdp: u64,
+    online: &smp::Online,
+) -> bool {
     use crate::topology::{self, CpuTopology, Layout, Source};
 
     // The boot processor's own record; every AP wrote its own before it came online.
-    smp::record_topology();
+    smp::record_topology(cpu::this_cpu_at(flow.here()));
     // The cache hierarchy from leaf 04h.
     let mut caches = [crate::cache::Cache {
         level: 0,
@@ -1699,7 +1704,11 @@ fn prove_backtrace(com1: &mut Console, info: &BootInfo) -> bool {
 
 /// The kernel's page tables, built, the framebuffer kept, loaded and proven. Returns whether
 /// the kernel now runs on them.
-fn init_paging(com1: &mut Console, early: &mut Early) -> bool {
+fn init_paging(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    early: &mut Early,
+) -> bool {
     let Some(mut tables) = early.build_kernel_tables(com1) else {
         return false;
     };
@@ -1708,7 +1717,7 @@ fn init_paging(com1: &mut Console, early: &mut Early) -> bool {
     if console::has_screen() && !early.map_framebuffer(&mut tables) {
         console::withdraw_framebuffer(com1);
     }
-    early.load_kernel_tables(com1, tables)
+    early.load_kernel_tables(flow, com1, tables)
 }
 
 /// Writes `origin.core` into its frames, once, and says what it took: every process that is

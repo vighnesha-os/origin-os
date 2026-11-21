@@ -95,13 +95,14 @@ pub struct X2Apic(());
 
 impl X2Apic {
     /// Switches the local APIC to x2APIC mode through the legal transitions and
-    /// software-enables it with [`SPURIOUS_VECTOR`].
+    /// software-enables it with [`SPURIOUS_VECTOR`]. `me` is this processor, read under its
+    /// start-up flow's witness (ADR-0020 S3; TASKS item 93): the mode is marked ready under it.
     ///
     /// # Safety
     ///
     /// CPL 0, boot processor only, interrupts disabled, and x2APIC supported
     /// ([`cpu::x2apic_supported`]); the spurious vector must have an IDT gate.
-    pub unsafe fn enable() -> Self {
+    pub unsafe fn enable(me: crate::cpu::ThisCpu<'_>) -> Self {
         // SAFETY: the caller's contract; IA32_APIC_BASE exists on every x86-64 processor.
         let current = unsafe { rdmsr(IA32_APIC_BASE) };
         let (writes, count) = apic::x2apic_transition(current);
@@ -112,7 +113,7 @@ impl X2Apic {
         }
         let apic = Self(());
         apic.write(ApicWrite::SpuriousVector, apic::svr(SPURIOUS_VECTOR));
-        if let Some(ready) = X2APIC_READY.get(crate::cpu::this_cpu().get()) {
+        if let Some(ready) = X2APIC_READY.this(me) {
             ready.store(true, core::sync::atomic::Ordering::Release);
         }
         apic
@@ -124,15 +125,6 @@ impl X2Apic {
     pub fn here(me: crate::cpu::ThisCpu<'_>) -> Option<Self> {
         X2APIC_READY
             .this(me)
-            .is_some_and(|ready| ready.load(core::sync::atomic::Ordering::Acquire))
-            .then_some(Self(()))
-    }
-
-    /// [`X2Apic::here`] without a witness: for the callers TASKS item 93 converts last (its
-    /// shared files), and removed with them.
-    pub fn this_cpu() -> Option<Self> {
-        X2APIC_READY
-            .get(crate::cpu::this_cpu().get())
             .is_some_and(|ready| ready.load(core::sync::atomic::Ordering::Acquire))
             .then_some(Self(()))
     }
@@ -497,8 +489,8 @@ fn pm_timer(rsdp: u64) -> Option<Reference> {
 
 /// Brings up the local APIC and proves its timer, with the ACPI tables at `rsdp` for a
 /// reference other than the PIT if it does not count. Returns the TSC rate in Hz if every
-/// step passed.
-pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
+/// step passed. `flow` is the boot flow's witness (ADR-0020 S3; TASKS item 93).
+pub fn init(flow: crate::trap::Pinned<'_>, com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
     // Every vector this can make arrive needs the kernel's own IDT.
     if !cpu::tables_ready() {
         let _ = writeln!(
@@ -515,8 +507,9 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
     let mut ports = unsafe { LegacyPorts::new() };
     ports.mask_pics();
     // SAFETY: CPL 0, boot processor, interrupts disabled, x2APIC supported (checked), and
-    // `cpu::init` installed a gate for the spurious vector.
-    let lapic = unsafe { X2Apic::enable() };
+    // `cpu::init` installed a gate for the spurious vector. The index is read under the boot
+    // flow's witness, after the check above that the CPU's tables (and so GS) are live.
+    let lapic = unsafe { X2Apic::enable(crate::cpu::this_cpu_at(flow.here())) };
     let version = lapic.read(ApicRead::Version);
     let _ = writeln!(
         com1,

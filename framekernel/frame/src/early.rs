@@ -445,8 +445,14 @@ impl Early {
     }
 
     /// Loads `kernel` and proves its protections on the processor. Returns whether the kernel
-    /// now runs on its own tables, proven.
-    pub fn load_kernel_tables(&mut self, com1: &mut dyn Write, kernel: KernelTables) -> bool {
+    /// now runs on its own tables, proven. `flow` is the boot flow's witness (ADR-0020 S3;
+    /// TASKS item 93).
+    pub fn load_kernel_tables(
+        &mut self,
+        flow: crate::trap::Pinned<'_>,
+        com1: &mut dyn Write,
+        kernel: KernelTables,
+    ) -> bool {
         let KernelTables {
             space,
             tables,
@@ -465,7 +471,7 @@ impl Early {
         unsafe { cpu::load_page_tables(space.root()) };
         // SAFETY: CPL 0; the tables just loaded mark only the kernel half global (`layout`).
         // Toggling CR4.PGE also drops every translation cached under the loader's tables.
-        let global = unsafe { tlb::enable_global_pages() };
+        let global = unsafe { tlb::enable_global_pages(cpu::this_cpu_at(flow.here())) };
         let used = tables.used();
         // SAFETY: once (`KernelTables` is made once and consumed here), with the tables
         // `load_page_tables` just loaded: they map everything running now, and from here on

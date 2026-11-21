@@ -684,8 +684,9 @@ pub fn start_boot(me: cpu::ThisCpu<'_>) -> Option<BootStart> {
 
 /// Starts the generator of the application processor this runs on: its instructions' start-up
 /// tests and a first seed from the root (R5). The boot processor called [`prepare`] for it.
-pub(crate) fn start_this_processor() {
-    let Some(slot) = SLOTS.get(cpu::this_cpu().get()) else {
+/// `me` is this processor, read under its start-up flow's witness (ADR-0020 S3; TASKS item 93).
+pub(crate) fn start_this_processor(me: cpu::ThisCpu<'_>) {
+    let Some(slot) = SLOTS.this(me) else {
         return;
     };
     if slot.started.load(Ordering::Acquire) {

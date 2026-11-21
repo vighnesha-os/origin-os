@@ -131,23 +131,24 @@ impl TlbHardware for Hardware {
     }
 }
 
-/// The index without a witness, for the two callers TASKS item 93 converts last, with its shared
-/// files: [`enable_global_pages`] and [`interrupted`]. Removed with them.
+/// The index without a witness, for the one caller TASKS item 93 converts last, with its shared
+/// files: [`interrupted`], which the trap entry in `cpu` calls. Removed with it.
 fn this_cpu() -> usize {
     cpu::this_cpu().get()
 }
 
 /// Turns on global pages on this processor and marks its CPU index, for the boot report.
 /// The proof counts only the processors online, so an AP that got this far but never came
-/// online (it was parked, `smp::park`) is not counted.
+/// online (it was parked, `smp::park`) is not counted. `me` is this processor, read under its
+/// start-up flow's witness (ADR-0020 S3; TASKS item 93).
 ///
 /// # Safety
 ///
 /// As for `cpu::enable_global_pages`.
-pub unsafe fn enable_global_pages() -> bool {
+pub unsafe fn enable_global_pages(me: cpu::ThisCpu<'_>) -> bool {
     // SAFETY: the caller's contract.
     let on = unsafe { cpu::enable_global_pages() };
-    if on && let Some(global) = GLOBAL_PAGES.get(this_cpu()) {
+    if on && let Some(global) = GLOBAL_PAGES.this(me) {
         global.store(true, Ordering::Relaxed);
     }
     on
