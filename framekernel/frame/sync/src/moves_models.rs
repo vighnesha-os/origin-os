@@ -56,6 +56,7 @@
 //! passes; more than two tables, or more than the moves each model makes; that the gate's wait
 //! ends (above); and the deterministic bound with the kernel's own four fast tries, which the
 //! host test `contexts::tests::a_scan_makes_its_fast_passes_then_one_under_the_gate` shows.
+#![forbid(unsafe_code)]
 
 use super::*;
 
