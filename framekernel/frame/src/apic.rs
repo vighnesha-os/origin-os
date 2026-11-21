@@ -404,22 +404,28 @@ pub const PERIOD_SHARE: u64 = 100;
 /// Counting those stalls too, across the brackets, left the 65- and 67-processor software-processor
 /// machines undecided after 64 pairs in 8 of 10 idle boots, where intermediate reads seem to stall
 /// inside their brackets; a check that tolerates stalls is TASKS item 78.
+///
+/// It also returns what the reads showed ([`CountFigures`]), which judges nothing.
 pub fn sample_period(
     initial: u64,
     nominal: u64,
     mut read: impl FnMut() -> CountRead,
-) -> (Option<PeriodSample>, u32) {
+) -> (Option<PeriodSample>, u32, CountFigures) {
     let target = nominal / 5;
     let least = nominal / 20;
     let gap = nominal / 100;
     let mut tried = 0;
     let mut first = read();
     let mut prev = first;
+    let mut figures = CountFigures::default();
+    figures.saw(None, first);
     while tried < PERIOD_PAIRS {
         let next = read();
+        figures.saw(Some(prev), next);
         if next.before.wrapping_sub(prev.after) > gap {
             // Away between two reads for long enough that a reload could have passed unseen.
             tried += 1;
+            figures.gap += 1;
             first = next;
             prev = next;
             continue;
@@ -429,17 +435,139 @@ pub fn sample_period(
         let span = last.twice_middle().wrapping_sub(first.twice_middle()) / 2;
         if reloaded || span >= target {
             tried += 1;
-            if span >= least
-                && let Some(sample) = PeriodSample::from_reads(initial, first, last)
-                && sample.clean(PERIOD_SHARE)
-            {
-                return (Some(sample), tried);
+            if span < least {
+                figures.short += 1;
+            } else if let Some(sample) = PeriodSample::from_reads(initial, first, last) {
+                figures.closed(&sample);
+                if sample.clean(PERIOD_SHARE) {
+                    return (Some(sample), tried, figures);
+                }
+                figures.wide += 1;
+            } else {
+                figures.flat += 1;
             }
             first = next;
         }
         prev = next;
     }
-    (None, tried)
+    (None, tried, figures)
+}
+
+/// What a run's reads of the timer's count showed (TASKS item 78), for a line of its own on
+/// every run: they judge nothing. Under KVM on one runner's processor (a Xeon 8370C, CI run
+/// 44837410914) no pair was clean in 64 tries while the interrupts came on time, and the
+/// proof's lines could not say why; these figures can.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CountFigures {
+    /// The narrowest read's bracket, in TSC ticks: what a read costs at the least.
+    pub least_bracket: Option<u64>,
+    /// The longest step from one read's bracket's start to the next one's end, in TSC ticks: a
+    /// stall inside a bracket counts here, and not in the gap that [`sample_period`] judges.
+    pub longest_step: u64,
+    /// Pairs given up for a gap between two reads over a hundredth of the period.
+    pub gap: u32,
+    /// Pairs ended by a rise of the count (a reload, or a count that jumps back) before they
+    /// spanned a twentieth of the period.
+    pub short: u32,
+    /// Pairs whose end brackets were too wide for [`PERIOD_SHARE`].
+    pub wide: u32,
+    /// Pairs over which the count did not fall.
+    pub flat: u32,
+    /// The least uncertainty of a pair that spanned enough, in parts per million of its period
+    /// ([`PeriodSample::uncertainty_ppm`]): the clean pair's, if one came.
+    pub best_ppm: Option<u64>,
+}
+
+impl CountFigures {
+    /// Takes in one read, and the read before it if there was one.
+    fn saw(&mut self, prev: Option<CountRead>, read: CountRead) {
+        let bracket = read.after.saturating_sub(read.before);
+        self.least_bracket = Some(self.least_bracket.map_or(bracket, |b| b.min(bracket)));
+        if let Some(prev) = prev {
+            self.longest_step = self
+                .longest_step
+                .max(read.after.saturating_sub(prev.before));
+        }
+    }
+
+    /// Takes in a pair that spanned enough to be measured.
+    fn closed(&mut self, sample: &PeriodSample) {
+        let ppm = sample.uncertainty_ppm();
+        self.best_ppm = Some(self.best_ppm.map_or(ppm, |b| b.min(ppm)));
+    }
+
+    /// The line for run number `run`, with TSC ticks at `tsc_hz` per second. Every figure is
+    /// capped, so the line stays under the console's 160 bytes at the widest it can print
+    /// while `run` has at most two digits (the tick proof's runs are fewer, which `timer.rs`
+    /// asserts). It names no failure and holds no address.
+    #[must_use]
+    pub const fn line(&self, run: u32, tsc_hz: u64) -> CountLine {
+        CountLine {
+            figures: *self,
+            run,
+            tsc_hz,
+        }
+    }
+}
+
+/// [`CountFigures::line`]'s line.
+#[derive(Debug)]
+pub struct CountLine {
+    figures: CountFigures,
+    run: u32,
+    tsc_hz: u64,
+}
+
+/// The largest bracket printed in full, in nanoseconds: just under 1 ms.
+const LINE_MAX_NS: u64 = 999_999;
+/// The largest step, in microseconds: just under 100 ms.
+const LINE_MAX_US: u64 = 99_999;
+/// The largest uncertainty, in parts per million: just under 10 %.
+const LINE_MAX_PPM: u64 = 99_999;
+
+/// A figure printed as itself up to `cap`, and as the cap with a `+` above it.
+struct Capped(u64, u64);
+
+impl core::fmt::Display for Capped {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 > self.1 {
+            write!(f, "{}+", self.1)
+        } else {
+            write!(f, "{}", self.0)
+        }
+    }
+}
+
+impl core::fmt::Display for CountLine {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let per = |ticks: u64, unit: u64| {
+            u64::try_from(u128::from(ticks) * u128::from(unit) / u128::from(self.tsc_hz.max(1)))
+                .unwrap_or(u64::MAX)
+        };
+        let c = &self.figures;
+        write!(f, "origin-kernel: APIC timer: run {} count: ", self.run)?;
+        match c.least_bracket {
+            Some(b) => write!(
+                f,
+                "brackets from {} ns",
+                Capped(per(b, 1_000_000_000), LINE_MAX_NS)
+            )?,
+            None => write!(f, "no reads")?,
+        }
+        write!(
+            f,
+            ", steps up to {} us; spoiled: {} gap, {} short, {} wide, {} flat; ",
+            Capped(per(c.longest_step, 1_000_000), LINE_MAX_US),
+            c.gap,
+            c.short,
+            c.wide,
+            c.flat
+        )?;
+        match c.best_ppm {
+            Some(ppm) => write!(f, "best +/-{} ppm", Capped(ppm, LINE_MAX_PPM)),
+            None => write!(f, "best none"),
+        }
+    }
 }
 
 /// What the timer's count says of its rate (the addendum review's T66-R13).
@@ -819,7 +947,7 @@ mod tests {
         // the count is accepted near nominal.
         let (initial, nominal) = (625_000, PERIOD);
         let fast = nominal / 10;
-        let (sample, tried) = sample_period(
+        let (sample, tried, _) = sample_period(
             initial,
             nominal,
             simulated_reads(initial, fast, 3 * fast - 111_000, 61, 1_010_000),
@@ -837,24 +965,192 @@ mod tests {
         );
         // A correct timer with the same stall passes, and both undisturbed are measured as they
         // are.
-        let (sample, _) = sample_period(
+        let (sample, _, _) = sample_period(
             initial,
             nominal,
             simulated_reads(initial, nominal, 3 * nominal - 111_000, 61, 1_010_000),
         );
         assert_eq!(judge_period(sample, nominal), RateVerdict::InBounds);
-        let (sample, tried) = sample_period(
+        let (sample, tried, _) = sample_period(
             initial,
             nominal,
             simulated_reads(initial, nominal, 0, usize::MAX, 0),
         );
         assert_eq!((sample.unwrap().ppm_of(nominal) / 1_000, tried), (1_000, 1));
-        let (sample, _) = sample_period(
+        let (sample, _, _) = sample_period(
             initial,
             nominal,
             simulated_reads(initial, fast, 0, usize::MAX, 0),
         );
         assert_eq!(judge_period(sample, nominal), RateVerdict::Fast);
+    }
+
+    /// Reads of a timer whose count at TSC `t` is `count(t)`, sampled at each bracket's middle:
+    /// every bracket `bracket` ticks wide, the next opening `gap` ticks after it closes.
+    fn reads_of(bracket: u64, gap: u64, count: impl Fn(u64) -> u64) -> impl FnMut() -> CountRead {
+        let mut at = 0;
+        move || {
+            let before = at;
+            let after = before + bracket;
+            at = after + gap;
+            CountRead {
+                before,
+                count: count(before + bracket / 2),
+                after,
+            }
+        }
+    }
+
+    /// A correct timer of 625,000 counts at the tests' period, reloaded at TSC 0.
+    fn correct(t: u64) -> u64 {
+        625_000 - (t % PERIOD) * 625_000 / PERIOD
+    }
+
+    #[test]
+    fn the_count_figures_say_why_no_pair_was_clean() {
+        // TASKS item 78: the figures judge nothing; they say why a run's period was or was not
+        // decided. Each case's numbers were derived by an independent model of the sampler
+        // (TASKS item 78's evidence, `figures.py`).
+        let figures = |bracket, gap, count: fn(u64) -> u64| {
+            let (sample, tried, figures) =
+                sample_period(625_000, PERIOD, reads_of(bracket, gap, count));
+            (sample.map(|s| s.ppm_of(PERIOD)), tried, figures)
+        };
+        let none = CountFigures::default();
+        // Undisturbed: the first pair is clean, its 800 ticks of brackets over 2 ms.
+        assert_eq!(
+            figures(400, 600, correct),
+            (
+                Some(1_000_000),
+                1,
+                CountFigures {
+                    least_bracket: Some(400),
+                    longest_step: 1_400,
+                    best_ppm: Some(200),
+                    ..none
+                }
+            )
+        );
+        // Every read 30 µs wide, as a slow read under a hypervisor would be: no pair is clean,
+        // every one too wide by about three times the 1 % allowed.
+        assert_eq!(
+            figures(30_000, 600, correct),
+            (
+                None,
+                PERIOD_PAIRS,
+                CountFigures {
+                    least_bracket: Some(30_000),
+                    longest_step: 60_600,
+                    wide: 64,
+                    best_ppm: Some(14_854),
+                    ..none
+                }
+            )
+        );
+        // A gap over a hundredth of the period between every two reads.
+        assert_eq!(
+            figures(400, PERIOD / 100 + 1, correct),
+            (
+                None,
+                PERIOD_PAIRS,
+                CountFigures {
+                    least_bracket: Some(400),
+                    longest_step: 100_801,
+                    gap: 64,
+                    ..none
+                }
+            )
+        );
+        // A count that does not move.
+        assert_eq!(
+            figures(400, 600, |_| 5_000),
+            (
+                None,
+                PERIOD_PAIRS,
+                CountFigures {
+                    least_bracket: Some(400),
+                    longest_step: 1_400,
+                    flat: 64,
+                    ..none
+                }
+            )
+        );
+        // A count that jumps back by 1,000 every 200 µs: each pair ends at the jump, short.
+        assert_eq!(
+            figures(400, 600, |t| correct(t) + (t / 100_000) % 2 * 1_000),
+            (
+                None,
+                PERIOD_PAIRS,
+                CountFigures {
+                    least_bracket: Some(400),
+                    longest_step: 1_400,
+                    short: 64,
+                    ..none
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn the_count_figures_line_is_pinned_and_short_and_names_no_failure() {
+        let undisturbed = CountFigures {
+            least_bracket: Some(400),
+            longest_step: 1_400,
+            best_ppm: Some(200),
+            ..CountFigures::default()
+        };
+        assert_eq!(
+            alloc::format!("{}", undisturbed.line(1, 1_000_000_000)),
+            "origin-kernel: APIC timer: run 1 count: brackets from 400 ns, steps up to 1 us; \
+             spoiled: 0 gap, 0 short, 0 wide, 0 flat; best +/-200 ppm"
+        );
+        let undecided = CountFigures {
+            least_bracket: Some(84_000),
+            longest_step: 168_000,
+            wide: 64,
+            best_ppm: Some(14_854),
+            ..CountFigures::default()
+        };
+        assert_eq!(
+            alloc::format!("{}", undecided.line(4, 2_800_000_000)),
+            "origin-kernel: APIC timer: run 4 count: brackets from 30000 ns, steps up to 60 us; \
+             spoiled: 0 gap, 0 short, 64 wide, 0 flat; best +/-14854 ppm"
+        );
+        // Every figure at its widest: each is capped, and a run's number has two digits at most
+        // (`timer.rs` asserts it), so the line stays under the console's 160 bytes (the review's
+        // T66-R7). The pair counts are at most `PERIOD_PAIRS`.
+        let widest = CountFigures {
+            least_bracket: Some(u64::MAX),
+            longest_step: u64::MAX,
+            gap: PERIOD_PAIRS,
+            short: PERIOD_PAIRS,
+            wide: PERIOD_PAIRS,
+            flat: PERIOD_PAIRS,
+            best_ppm: Some(u64::MAX),
+        };
+        assert_eq!(
+            alloc::format!("{}", widest.line(99, 1)),
+            "origin-kernel: APIC timer: run 99 count: brackets from 999999+ ns, steps up to \
+             99999+ us; spoiled: 64 gap, 64 short, 64 wide, 64 flat; best +/-99999+ ppm"
+        );
+        let nothing = CountFigures::default();
+        for figures in [undisturbed, undecided, widest, nothing] {
+            for tsc_hz in [0, 1, 1_000_000_000, u64::MAX] {
+                for run in [1, 4, 99] {
+                    let line = alloc::format!("{}", figures.line(run, tsc_hz));
+                    assert!(line.len() < 160, "{} bytes: {line}", line.len());
+                    // ADR-0013 R8: no failure's words, no address (TASKS item 66's invariant 4).
+                    for word in ["fail", "FAIL", "WRONG", "wrong", "refused", "panic", "0x"] {
+                        assert!(!line.contains(word), "{word:?} in {line}");
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            alloc::format!("{}", nothing.line(1, 1)),
+            "origin-kernel: APIC timer: run 1 count: no reads, steps up to 0 us; spoiled: 0 gap, \
+             0 short, 0 wide, 0 flat; best none"
+        );
     }
 
     #[test]
