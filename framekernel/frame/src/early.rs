@@ -501,7 +501,9 @@ impl Early {
     /// heap, which starts the `alloc` crate. Does nothing unless the kernel's own tables are
     /// live and proven. Returns whether the heap has started.
     pub fn start_heap(&mut self, com1: &mut dyn Write) -> bool {
-        if self.heap || !self.paged {
+        // Not before `enable_simd`: every FPU area is sized from what it records, and the heap
+        // is where areas come from (the delta review of TASKS item 94, R94-9).
+        if self.heap || !self.paged || self.xcr0.is_none() {
             return false;
         }
         let Some(mut boot) = self.memory.take() else {
