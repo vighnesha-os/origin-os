@@ -392,7 +392,9 @@ pub const STRETCH_SHARE: u64 = 20;
 /// A pair undecided at a fifth of the period goes on toward the reload, up to this many tenths
 /// of it.
 const LONGEST_PAIR_TENTHS: u64 = 9;
-/// Reads a run takes at the most, whatever the TSC does: about 0.5 s of reads at 30 ns each.
+/// Reads a run takes at the most, whatever each costs and whatever the TSC does. It binds only
+/// where the TSC does not pass the budget, a stopped or very slow TSC, which the calibration
+/// refuses first: at 1 µs a read, 2^24 reads take about 17 s.
 const MOST_READS: u32 = 1 << 24;
 
 /// Measures a running periodic timer's period from its count, reloaded with `initial`, in pairs
@@ -415,20 +417,24 @@ const MOST_READS: u32 = 1 << 24;
 ///   - A pair whose own slope misses its stretches' bounds is set aside, never judged.
 ///   - A pair is judged only when its stretches' upper slope is within twice its own lower
 ///     slope, so they have measured the slope.
-///   - A pair with one hidden reload reads near nominal only if the timer is about twice as fast
-///     or more, and then its stretches' slope is twice its own. Under about 2.06 times fast, such
-///     a pair cannot fit in 0.9 of a period.
+///   - So a hidden reload is never judged, for any span and any number of reloads hidden. A
+///     pair's observed fall is at most the initial count, so a pair that hides a reload fell
+///     truly by more than twice its observed fall less one count. Its stretches hide none, so
+///     their upper slope is at least the true one, and so more than twice the pair's lower slope
+///     (the independent review's argument, `REVIEW_T78_2026-11-21.md`).
 /// - **Longer pairs.** A pair still undecided at a fifth of the period goes on toward the
-///   reload, up to 0.9 of it, so reads that each cost up to about 200 µs still decide.
+///   reload, up to 0.9 of it, so reads that each cost up to about 200 µs still decide. That
+///   bounds only how long an undecided pair goes on: a pair is judged at whatever span its last
+///   read gives, which one long step can carry past 0.9 of the period.
 /// - **The budget (B).** A run ends after [`PERIOD_PAIRS`] fifths of the period, about 128 ms at
 ///   100 Hz, or [`MOST_READS`] reads.
 ///
-/// Returns the first pair that decides, and how many pairs were given up before it. It also
-/// returns what the reads showed ([`CountFigures`]), which judges nothing.
+/// Returns the first pair that decides, and how many pairs were tried, the deciding one
+/// included. It also returns what the reads showed ([`CountFigures`]), which judges nothing.
 ///
-/// Above 20 times fast a stretch could hide a reload. The timer then delivers 50 interrupts in
-/// under 25 ms, which delivery fails unless the same run's interrupts are held off for over
-/// 475 ms.
+/// From 20 times fast (strictly, 20 × (1 − 1/`initial`)) a stretch could hide a reload. The timer
+/// then delivers 50 interrupts in under 25 ms, which delivery fails unless the same run's
+/// interrupts are held off for about 450 ms or more.
 pub fn sample_period(
     initial: u64,
     nominal: u64,
@@ -660,15 +666,19 @@ pub struct CountFigures {
     /// Pairs ended by a rise of the count (a reload, or a count that jumps back) before they
     /// spanned a twentieth of the period.
     pub short: u32,
-    /// Pairs whose period's bounds straddled 97 % or 103 %: their end brackets too wide, or the
-    /// timer too near a bound, for the pair to decide ([`PeriodSample::verdict`]).
+    /// Pairs given up undecided, for one of two reasons: their period's bounds straddled 97 % or
+    /// 103 % (end brackets too wide, or the timer too near a bound; [`PeriodSample::verdict`]),
+    /// or their stretches never measured the slope, every step being over a twentieth of the
+    /// period. The line's longest step tells the two apart: over a twentieth, it is the second.
     pub wide: u32,
     /// Pairs over which the count did not fall.
     pub flat: u32,
     /// Pairs set aside, their slope not their stretches' (a reload may be hidden in them).
     pub aside: u32,
-    /// The least uncertainty of a pair that spanned enough, in parts per million of its period
-    /// ([`PeriodSample::uncertainty_ppm`]): the deciding pair's, if one came.
+    /// The least uncertainty of any pair that spanned enough and fell, in parts per million of
+    /// its period ([`PeriodSample::uncertainty_ppm`]): set-aside and undecided pairs included,
+    /// so where one decides, this may be under the deciding pair's own. It shows how narrow the
+    /// reads' brackets were where they were narrowest.
     pub best_ppm: Option<u64>,
 }
 
@@ -1279,8 +1289,9 @@ mod tests {
                 }
             )
         );
-        // 300 µs wide: not even 0.9 of a period narrows the bounds enough; 24 pairs in the run's
-        // 128 ms, each given up undecided.
+        // 300 µs wide: every step is over a twentieth of the period, so no stretch measures the
+        // slope, and not even 0.9 of a period would narrow the bounds enough; 24 pairs in the
+        // run's 128 ms, each given up undecided.
         assert_eq!(
             figures(300_000, 600, correct),
             (
@@ -1478,8 +1489,8 @@ mod tests {
     fn no_hidden_reload_passes_below_twenty_times_fast() {
         // TASKS item 78's sweep (the coordinating session's ruling on the round): 2.2 to 19 times
         // fast, one read held open to each of 351 places from 0.05 to 1.8 periods, the gap the
-        // rule allows after it. None is ever in bounds. Below 2.2 times the randomized model
-        // stands in.
+        // rule allows after it. None is ever in bounds. From 1.9 times, holds aimed at a reading
+        // in bounds are the next test's.
         let mut checked = 0;
         for fast_x100 in [220, 250, 342, 500, 1_000, 1_500, 1_900] {
             let mut held_to = PERIOD / 20;
@@ -1499,25 +1510,104 @@ mod tests {
     }
 
     #[test]
+    fn no_hidden_reload_passes_from_under_twice_as_fast() {
+        // The independent review's T78-R6 (its search R-B): 1.9 to 19.99 times fast, with 1, 2 or
+        // 5 reloads hidden by one held read. The hold is timed so that the pair from the first
+        // read to the one after the held read reads 97.05 %, 100 % or 102.95 % of nominal: a
+        // phase past the hidden reloads with (hidden + phase) / (fast × phase) = the reading.
+        // 0 or 20 reads in a stretch come before it and 20 after, then one every 50 µs, every
+        // count taken at its bracket's start or at its end. None is ever in bounds, though in
+        // every case the pair's own reading is: the cases have teeth.
+        const N: u64 = 625_000;
+        let (mut cases, mut reading_in_bounds) = (0u32, 0u32);
+        for fast_x100 in (190..2_000).step_by(13) {
+            let period = PERIOD * 100 / fast_x100;
+            for hidden in [1, 2, 5] {
+                for reading_ppm in [970_500, 1_000_000, 1_029_500] {
+                    // reading × fast, scaled by 10^8; the phase is under one period only if it
+                    // exceeds hidden + 1.
+                    let scaled = reading_ppm * fast_x100;
+                    if scaled <= 100_000_000 * (hidden + 1) {
+                        continue;
+                    }
+                    let past =
+                        hidden * period + period * hidden * 100_000_000 / (scaled - 100_000_000);
+                    for pre in [0, 20] {
+                        for at_end in [false, true] {
+                            // The timer reloads as the first read's count is taken.
+                            let first = if at_end { 200 } else { 0 };
+                            let count = move |t: u64| N - ((t - first) % period) * N / period;
+                            let t_last = first + past;
+                            let held_from = 800 * (pre + 1);
+                            let last_from = t_last - if at_end { 200 } else { 0 };
+                            let mut n = 0u64;
+                            let read = move || {
+                                n += 1;
+                                let (before, after) = if n <= pre + 1 {
+                                    (800 * (n - 1), 800 * (n - 1) + 200)
+                                } else if n == pre + 2 {
+                                    (held_from, last_from - 600)
+                                } else {
+                                    let k = n - pre - 3;
+                                    let before = if k <= 20 {
+                                        last_from + 800 * k
+                                    } else {
+                                        last_from + 16_000 + 50_000 * (k - 20)
+                                    };
+                                    (before, before + 200)
+                                };
+                                CountRead {
+                                    before,
+                                    count: count(if at_end { after } else { before }),
+                                    after,
+                                }
+                            };
+                            let fall = count(first) - count(t_last);
+                            let own = u128::from(t_last - first) * u128::from(N) * 1_000_000
+                                / (u128::from(PERIOD) * u128::from(fall));
+                            reading_in_bounds += u32::from((970_000..=1_030_000).contains(&own));
+                            let (sample, _, _) = sample_period(N, PERIOD, read);
+                            assert_ne!(
+                                judge_period(sample, PERIOD),
+                                RateVerdict::InBounds,
+                                "{fast_x100} {hidden} {reading_ppm} {pre} {at_end}"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!((cases, reading_in_bounds), (4_532, 4_532));
+    }
+
+    #[test]
     fn wide_reads_decide_and_a_rate_six_percent_out_never_passes() {
         // Reads 60, 120 and 200 µs wide decide in bounds (the diagnostic round's (p1)); a timer
         // 6 % fast or slow read as widely is never in bounds; 300 µs decides nothing.
-        let verdict = |bracket, period: u64| {
-            let count = move |t: u64| 625_000 - (t % period) * 625_000 / period;
+        let verdict = |bracket, period: u64, phase: u64| {
+            let count = move |t: u64| 625_000 - ((t + phase) % period) * 625_000 / period;
             let (sample, _, _) = sample_period(625_000, PERIOD, reads_of(bracket, 600, count));
             judge_period(sample, PERIOD)
         };
         for bracket in [60_000, 120_000, 200_000] {
-            assert_eq!(verdict(bracket, PERIOD), RateVerdict::InBounds, "{bracket}");
+            assert_eq!(
+                verdict(bracket, PERIOD, 0),
+                RateVerdict::InBounds,
+                "{bracket}"
+            );
             for period in [PERIOD * 100 / 106, PERIOD * 106 / 100] {
-                assert_ne!(
-                    verdict(bracket, period),
-                    RateVerdict::InBounds,
-                    "{bracket} {period}"
-                );
+                // At eight phases of the reload (the review's T78-R11).
+                for eighth in 0..8 {
+                    assert_ne!(
+                        verdict(bracket, period, period * eighth / 8),
+                        RateVerdict::InBounds,
+                        "{bracket} {period} {eighth}"
+                    );
+                }
             }
         }
-        assert_eq!(verdict(300_000, PERIOD), RateVerdict::Undecided);
+        assert_eq!(verdict(300_000, PERIOD, 0), RateVerdict::Undecided);
     }
 
     /// Reads of a correct timer, each bracket `bracket` ticks wide and the next `gap` after it;
@@ -1582,8 +1672,9 @@ mod tests {
     #[test]
     fn a_randomized_model_never_judges_a_rate_wrong() {
         // TASKS item 78's randomized model (the coordinating session's ruling on the round: it
-        // stands in below 2.2 times fast, where the sweep stops). Timers from 20 times fast to
-        // 2.5 times slow, reloaded at a random phase, read with brackets of 0 to 150 µs and gaps
+        // stands in below 2.2 times fast, where the sweep stops). Timers from just under 20 times
+        // fast (50,100 ppm: at exactly 20 times a stretch could hide a reload, the review's
+        // T78-R11) to 2.5 times slow, reloaded at a random phase, read with brackets of 0 to 150 µs and gaps
         // of up to a hundredth of the period; one read in 2 to 40 held open from 0 to 1.8
         // periods, its count sampled at a random instant inside its bracket. The verdict is
         // never wrong: in bounds only between 97 % and 103 %, fast only below, slow only above.
@@ -1593,9 +1684,9 @@ mod tests {
             // The true period in parts per million of nominal: a third of the cases fast, near
             // or below twice the rate, a third close to the bounds, a third anywhere.
             let ppm = match random.within(0, 2) {
-                0 => random.within(50_000, 520_000),
+                0 => random.within(50_100, 520_000),
                 1 => random.within(940_000, 1_060_000),
-                _ => random.within(50_000, 2_500_000),
+                _ => random.within(50_100, 2_500_000),
             };
             let period = PERIOD * ppm / 1_000_000;
             let phase = random.within(0, period);
