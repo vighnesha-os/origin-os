@@ -971,6 +971,12 @@ The record's two bits are told apart in C94-1's boot: the control-state line rea
 
 T78-1b's unwarmed base boots are the boot evidence that the rule before this item passes a hidden reload, as round 3 of the diagnostic did. At 10 times, the base's evidence is its host test at `fcef041d`, `a_stall_inside_an_intermediate_read_can_hide_a_reload_a_stated_limit` (the second addendum review's case, accepted at 1,009,090 ppm), and the review's R-H. Nothing here ran under KVM or on a physical machine.
 
+**The boot control of TASKS item 95 (moves between the tables of contexts, ADR-0020 S4 and S5; 2026-11-21, Rust 1.100.0, QEMU 11.1.3 TCG on the development Mac; the coordinating session's ruling Q11):** planted in a `git archive` export of `629bca7c`, never in the worktree, by a script that applied each edit and touched every file, and booted with `cargo xtask boot-test`, inside the worktree's `cargo xtask exclusive`, on 1 and 4 processors and on the AMD-IOMMU 3-processor machine. The plant adds two counters, printed before the verdict, to show what it reached.
+
+| Control | Edit | Caught |
+|---|---|---|
+| C95-B1 | `Contexts::covers` reads the slots only, not the leaving record (ADR-0020 S5); a counter of switch-outs that leave a frame on a stack that is not the outgoing context's home, and one of scans that the leaving record alone would have answered | Run on 1, 4 and the AMD-IOMMU 3-processor machine, not caught: no scan yet depends on the leaving record alone (no moves); carried to TASKS item 96, which boots the plant once moves exist, where it must fail (the coordinating session's ruling, 2026-11-21). `boot-test` passed, 11 of 11, on all three machines, each boot `degraded: 71 of 72 proofs passed; failed: speculation controls`. Each boot made one switch-out that left a frame on a stack not its home (the measured-stack proof's yield at its deepest level), and no scan found a stack only through the leaving record: the window was not crossed. The kernel stacks proofs ask about a thread's home stack, which the slot's home word covers through the switch-out window; a scan on the processor that switched out publishes its own leaving frame first (`stack_in_use`); and no proof asks another processor about a measured stack between its switch-out and that processor's next call into its table. Until then the evidence is Loom's: LX2a plants the same edit and LV2 catches it, LV1 shows the publication's order, and host tests ask `covers` about a leaving frame |
+
 ## Alternatives
 
 | Alternative | For | Against |
