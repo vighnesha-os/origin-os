@@ -53,6 +53,16 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     let mut com1 = console::Console::boot_flow();
     // What each boot proof found, and what that means for this boot (ADR-0013).
     let mut proofs = Tally::new();
+    // The boot flow's witness (ADR-0020 S2, point 4; TASKS item 93, the coordinating session's
+    // ruling Q6): this flow never moves and never becomes a thread, so the witness holds for the
+    // rest of the boot. Taken once, here, and passed down to what reads the processor index.
+    let Some(flow) = cpu::flow() else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: the kernel did not start on the boot flow"
+        );
+        halt();
+    };
 
     let mut early = match entry.read_boot_info() {
         Ok(early) => early,
@@ -202,6 +212,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             early.frames_proven(),
         );
         quiesced = pcie::quiesce(
+            flow,
             &mut com1,
             info.acpi_rsdp,
             regions,
@@ -237,7 +248,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         if let Some(q) = quiesced.as_mut() {
             proofs.record(Proof::BusMastersSettled, pcie::settle(&mut com1, q, hz));
         }
-        let nmi = prove_nmi_ist(&mut com1, hz);
+        let nmi = prove_nmi_ist(flow, &mut com1, hz);
         proofs.record(Proof::NmiDelivery, nmi.delivered);
         if nmi.delivered {
             record_or_stop(&mut com1, &mut proofs, Proof::NmiStack, nmi.on_own_stack);
@@ -246,8 +257,8 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // clock from the RTC (CLAUDE.md §68).
         proofs.record(Proof::Clocks, time::init(&mut com1, hz, info.acpi_rsdp));
         // I/O APIC interrupt routing, proven by routing the PIT's IRQ0 (CLAUDE.md §24).
-        let bsp =
-            timer::X2Apic::this_cpu().map_or(u32::MAX, |l| l.read(timer::ApicRead::Id) as u32);
+        let bsp = timer::X2Apic::here(cpu::this_cpu_at(flow.here()))
+            .map_or(u32::MAX, |l| l.read(timer::ApicRead::Id) as u32);
         proofs.record(
             Proof::IoApic,
             irq::prove(&mut com1, info.acpi_rsdp, bsp, hz),
@@ -295,7 +306,10 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // Boot info 0.6 (decision item 166): the loader's value for the kernel stacks' region
         // can be taken once, and only before the generator's start overwrites it with the seed.
         let stack_value = prove_stack_value(&mut com1, info.boot_seed != 0);
-        report_random_start(&mut com1, origin_frame::random::start_boot());
+        report_random_start(
+            &mut com1,
+            origin_frame::random::start_boot(cpu::this_cpu_at(flow.here())),
+        );
         let online = smp::start(&mut com1, sched::run_ap, crate::percpu::size_per_cpu);
         proofs.record(Proof::Processors, online.complete());
         // What each processor put in its own control registers, which ring 3 relies on.
@@ -388,7 +402,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // The random-number generator on every processor (CLAUDE.md §59; ADR-0016). If the
         // proof fails, randomness is withheld from here on (ADR-0013 R2, Amendment 1): nothing
         // is launched and nothing is placed at a random address.
-        let random = prove_random(&mut com1, online.cpus(), tsc_hz) && stack_value;
+        let random = prove_random(flow, &mut com1, online.cpus(), tsc_hz) && stack_value;
         if !random {
             origin_frame::random::withhold();
         }
@@ -402,7 +416,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // M3, second step: preemptive kernel threads on every online processor. Its proofs
         // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
         // use only the kernel's fixed programs, and the operator sees every result.
-        sched::prove(&mut com1, online.cpus(), tsc_hz, &mut proofs);
+        sched::prove(flow, &mut com1, online.cpus(), tsc_hz, &mut proofs);
         // ADR-0017 Z3, after the proofs above have run several processes in ring 3.
         proofs.record(Proof::Ibpb, prove_ibpb(&mut com1, online.cpus()));
         stop_if_refused(&mut com1, proofs);
@@ -427,20 +441,23 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             // attaches.
             proofs.record(Proof::BusMastersQuiet, pcie::check_quiet(&mut com1, q));
             // M5: the NVMe driver and block I/O, polled and then interrupt-driven.
-            proofs.record(Proof::Nvme, storage::init(&mut com1, online.cpus(), tsc_hz));
+            proofs.record(
+                Proof::Nvme,
+                storage::init(flow, &mut com1, online.cpus(), tsc_hz),
+            );
             // M10: bring up the virtio-net NIC; an interrupt-driven receive thread takes the
             // OS onto the network (CLAUDE.md §31, §54). The one proof not in the verdict yet
             // (ADR-0013): `virtionet` returns nothing, and it prints each failure itself.
-            virtionet::prove(&mut com1, online.cpus(), tsc_hz);
+            virtionet::prove(flow, &mut com1, online.cpus(), tsc_hz);
             // The IOMMU's own proofs, through the bound NVMe controller: translated DMA, a
             // blocked and recorded DMA, remapped and blocked interrupts.
-            let devices = storage::prove_iommu(&mut com1, online.cpus(), tsc_hz);
+            let devices = storage::prove_iommu(flow, &mut com1, online.cpus(), tsc_hz);
             proofs.record(Proof::IommuDevices, devices);
             // Legacy interrupts under interrupt remapping: the PIT's IRQ0 through the I/O
             // APIC in remappable format and an IRTE that checks the I/O APIC's source ID,
             // with the IRTE made not present and given a wrong source ID (CLAUDE.md §24,
             // §32; ADR-0007 I8).
-            let remapped = irq::prove_remapped(&mut com1, online.cpus(), tsc_hz);
+            let remapped = irq::prove_remapped(flow, &mut com1, online.cpus(), tsc_hz);
             proofs.record(Proof::IoApicRemapped, remapped);
             // Bus mastering is on exactly for what the drivers attached to a domain.
             let mastering = pcie::prove_bus_mastering(&mut com1, q);
@@ -448,7 +465,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         } else {
             proofs.record(Proof::Pcie, false);
         }
-        sched::stop_boot_processor();
+        sched::stop_boot_processor(flow);
     }
 
     // M8/M9 groundwork: the in-memory VFS (paths, directories, files).
@@ -470,9 +487,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     proofs.record(Proof::Sysfs, prove_sysfs(&mut com1));
     // The console's sending and drawing in sections, proven last so that what it prints is
     // still on the screen when the boot test compares the screen with the serial log.
-    let uart = console::prove_uart_sections(&mut com1);
+    let uart = console::prove_uart_sections(flow, &mut com1);
     proofs.record(Proof::ConsoleUartSections, uart);
-    let screen = console::prove_sections(&mut com1);
+    let screen = console::prove_sections(flow, &mut com1);
     proofs.record(Proof::ConsoleSections, screen);
 
     // The operator's summary: everything above scrolls past on a real machine's screen.
@@ -1465,7 +1482,12 @@ fn ticks_to_nanos(ticks: u64, tsc_hz: u64) -> u64 {
 /// requests are answered with values that differ, the generator's stack holds only zeros after
 /// a request (R9 Z3), and what a request costs and how long a step kept interrupts off
 /// (R12; rules 21 and 22). With no generator it says so and fails: randomness is withheld.
-fn prove_random(com1: &mut Console, cpus: &[cpu::CpuIndex], tsc_hz: u64) -> bool {
+fn prove_random(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[cpu::CpuIndex],
+    tsc_hz: u64,
+) -> bool {
     use origin_frame::random::{self, Condition, Error};
 
     // Every processor started its generator as it came up; give the last of them a moment.
@@ -1536,7 +1558,8 @@ fn prove_random(com1: &mut Console, cpus: &[cpu::CpuIndex], tsc_hz: u64) -> bool
     const FRESH_ASKS: u32 = 3;
     // The rest after a "not now" is one second (TASKS 18b S3).
     const FRESH_WAIT_NANOS: u64 = 1_100_000_000;
-    let here = random::processor(cpu::this_cpu());
+    // The boot flow's own processor (TASKS item 93): a value, read under the flow's witness.
+    let here = random::processor(cpu::this_cpu_at(flow.here()).index());
     let rdseed = here.is_some_and(|p| p.rdseed == Condition::Healthy);
     let mut fresh = [0u8; 32];
     let mut fresh_result = random::fill_fresh(&mut fresh);
@@ -1809,9 +1832,13 @@ struct NmiProof {
 
 /// Sends this processor an NMI and checks where it was taken. An NMI that does not arrive
 /// says nothing about the stack: that case, and a wrong stack, stay apart in the result.
-fn prove_nmi_ist(com1: &mut Console, tsc_hz: u64) -> NmiProof {
+fn prove_nmi_ist(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    tsc_hz: u64,
+) -> NmiProof {
     let (before, _) = cpu::nmis();
-    timer::send_nmi_to_self();
+    timer::send_nmi_to_self(cpu::this_cpu_at(flow.here()));
     let start = cpu::rdtsc();
     while cpu::nmis().0 == before && cpu::rdtsc().wrapping_sub(start) < tsc_hz {
         core::hint::spin_loop();

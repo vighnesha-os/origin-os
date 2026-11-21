@@ -1361,7 +1361,12 @@ fn reset_completed(common: MmioRegion) -> bool {
 
 /// Brings up the virtio-net device, hands its queues to a receive thread on another
 /// processor (the boot one when there is no other), and reports the result (CLAUDE.md §54).
-pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u64) {
+pub(crate) fn prove(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[crate::cpu::CpuIndex],
+    tsc_hz: u64,
+) {
     let Some(dev) = crate::pcie::find(0x02, 0x00, 0x00) else {
         let _ = writeln!(
             com1,
@@ -1513,7 +1518,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
     // the interrupt wakes it. Turn MSI-X on (so the queues can take vectors), with no
     // config-change interrupt, then set up the receive queue (interrupt on entry
     // RX_MSIX_ENTRY) and the transmit queue (no interrupt; its completion is polled).
-    let bsp = crate::cpu::this_cpu();
+    // The boot flow's processor, a value read under its witness (TASKS item 93).
+    let bsp = crate::cpu::this_cpu_at(flow.here()).index();
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let msix_enabled = target
         .apic_id()

@@ -472,9 +472,9 @@ fn on_interrupt() -> origin_frame::irq::Action {
     origin_frame::irq::Action::Reschedule
 }
 
-/// Counts `blocks` waits for a completion by a thread on this processor.
-fn count_blocks(blocks: u64) {
-    if let Some(n) = CPU_BLOCKS.get(crate::cpu::this_cpu().get()) {
+/// Counts `blocks` waits for a completion by a thread on this processor, which `me` names.
+fn count_blocks(me: crate::cpu::ThisCpu<'_>, blocks: u64) {
+    if let Some(n) = CPU_BLOCKS.this(me) {
         n.fetch_add(blocks, Ordering::Relaxed);
     }
 }
@@ -483,7 +483,12 @@ fn count_blocks(blocks: u64) {
 /// interrupt-driven. Returns whether every step and check passed (no controller at all is
 /// reported, and passes, and so does a disk that is not the boot test's, on which only the
 /// read-only proofs that do not need its contents run).
-pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
+pub(crate) fn init(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    tsc_hz: u64,
+) -> bool {
     let Some(dev) = crate::pcie::find(0x01, 0x08, 0x02) else {
         let _ = writeln!(com1, "origin-kernel: NVMe: no controller");
         return true;
@@ -527,7 +532,7 @@ pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
     if !on_test_disk {
         return polled;
     }
-    let interrupts = polled && prove_interrupts(com1, cpus, tsc_hz);
+    let interrupts = polled && prove_interrupts(flow, com1, cpus, tsc_hz);
     // A controller whose own numbers leave no interrupt queue (ruling (a) of 2026-11-14): the
     // proofs through interrupts are not proven, and say why; the polled ones still run.
     let no_interrupts =
@@ -1250,6 +1255,10 @@ fn setup_interrupts(
 /// interrupt wakes it. The wait's condition is the completion queue itself, so a
 /// completion that lands before the thread blocks is never missed.
 extern "sysv64" fn io_thread(_: u64) -> ! {
+    // Its processor's wait queue, which the completion interrupt taken here wakes, for every read:
+    // pinned while it reads (TASKS item 93).
+    let pin = crate::sched::pin();
+    let me = crate::cpu::this_cpu_at(pin.pinned().here());
     let start = crate::cpu::rdtsc();
     let (mut reads, mut matched) = (0u64, 0u64);
     let mut copy = [0u8; 4096];
@@ -1281,7 +1290,7 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
         };
         let done = core::cell::Cell::new(None);
         let deadline = begun + ms * 1_000_000;
-        let Some(wait) = IO_WAIT.get(crate::cpu::this_cpu().get()) else {
+        let Some(wait) = IO_WAIT.this(me) else {
             record(&mut |r| r.end("a read", Err(Fault::NoQueue), 0));
             break;
         };
@@ -1299,7 +1308,7 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
             },
             deadline,
         );
-        count_blocks(*waited.as_ref().unwrap_or(&0));
+        count_blocks(me, *waited.as_ref().unwrap_or(&0));
         let us = (crate::time::monotonic_nanos() - begun) / 1000;
         let result = match done.get() {
             Some(Ok(c)) if c.status.ok() => Ok(()),
@@ -1339,6 +1348,7 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
         }
     }
     let cycles = crate::cpu::rdtsc().wrapping_sub(start);
+    drop(pin);
     crate::sched::finish(|| {
         for (slot, v) in IRQ_RESULT.iter().zip([reads, matched, cycles]) {
             slot.store(v + 1, Ordering::Release);
@@ -1348,8 +1358,14 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
 
 /// Proves interrupt-driven completions: MSI-X set up for a second I/O queue, then a thread
 /// on another processor reads through it, blocking for each completion.
-fn prove_interrupts(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
-    let bsp = crate::cpu::this_cpu();
+fn prove_interrupts(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    tsc_hz: u64,
+) -> bool {
+    // The boot flow's processor, a value read under its witness (TASKS item 93).
+    let bsp = crate::cpu::this_cpu_at(flow.here()).index();
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let setup = with_driver_out(|d| {
         let apic_id = target
@@ -1806,8 +1822,13 @@ enum CpuOp {
 /// `nvme::prps` and the namespace's block size (L7; the review's F8). Copies the page out for a
 /// read. The queue's record holds the step as outstanding while it runs, then how it ended
 /// (P1; the review's F1). Returns whether it succeeded.
-fn cpu_command(me: usize, step: &'static str, op: CpuOp, out: &mut [u8; 4096]) -> bool {
-    let (Some(slot), Some(wait)) = (CPU_QUEUES.get(me), IO_WAIT.get(me)) else {
+fn cpu_command(
+    me: crate::cpu::ThisCpu<'_>,
+    step: &'static str,
+    op: CpuOp,
+    out: &mut [u8; 4096],
+) -> bool {
+    let (Some(slot), Some(wait)) = (CPU_QUEUES.this(me), IO_WAIT.this(me)) else {
         return false;
     };
     let start = crate::time::monotonic_nanos();
@@ -1859,7 +1880,7 @@ fn cpu_command(me: usize, step: &'static str, op: CpuOp, out: &mut [u8; 4096]) -
         },
         deadline,
     );
-    count_blocks(*waited.as_ref().unwrap_or(&0));
+    count_blocks(me, *waited.as_ref().unwrap_or(&0));
     let us = (crate::time::monotonic_nanos() - start) / 1000;
     let result = match done.get() {
         Some(Ok(c)) if c.status.ok() => Ok(()),
@@ -1884,11 +1905,14 @@ fn cpu_command(me: usize, step: &'static str, op: CpuOp, out: &mut [u8; 4096]) -
 /// A processor's thread: [`CPU_READS`] reads of the pattern blocks through its own queue,
 /// then one block of its own written, flushed and read back.
 extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
-    let me = crate::cpu::this_cpu().get();
+    // Its processor's own queue and wait queue, for its whole life: pinned until it ends, and its
+    // end keeps the pin as every ending thread's does (TASKS item 93).
+    let pin = crate::sched::pin();
+    let me = crate::cpu::this_cpu_at(pin.pinned().here());
     let (mut reads, mut matched) = (0u64, 0u64);
     let mut page = [0u8; 4096];
     let mut expected = [0u8; 512];
-    let result = CPU_RESULT.get(me);
+    let result = CPU_RESULT.this(me);
     // Reads and matches are published as they go, so a line written while the thread still
     // waits shows them; the third slot, set last, says it ended (the review's F1).
     let publish = |reads: u64, matched: u64| {
@@ -1924,7 +1948,7 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
     pattern(scratch ^ 0x5A5A, &mut expected);
     let filled = on_test_disk()
         && crate::cpu::without_interrupts(|| {
-            let Some(s) = CPU_QUEUES.get(me) else {
+            let Some(s) = CPU_QUEUES.this(me) else {
                 return false;
             };
             let g = s.lock();
@@ -1950,7 +1974,7 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
     if wrote {
         crate::cpu::without_interrupts(|| {
             if let Some(q) = CPU_QUEUES
-                .get(me)
+                .this(me)
                 .and_then(|s| s.lock().as_ref().map(|q| q.page))
             {
                 q.fill(&[0u8; 512]);
@@ -2300,7 +2324,12 @@ pub(crate) fn routed_through_irte(
 /// Faults recorded before the proofs are reported; one from an attached device fails the
 /// proof (a driver's DMA went where it had not mapped). Returns whether everything held;
 /// with no IOMMU there is nothing to prove.
-pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
+pub(crate) fn prove_iommu(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    tsc_hz: u64,
+) -> bool {
     let driver = crate::cpu::without_interrupts(|| {
         DRIVER.lock().as_ref().map(|d| {
             (
@@ -2421,7 +2450,8 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
 
     // 3. Remapped interrupts: every programmed MSI-X entry is a handle to its own IRTE, whose
     //    destination is the target processor's APIC ID.
-    let bsp = crate::cpu::this_cpu();
+    // The boot flow's processor, a value read under its witness (TASKS item 93).
+    let bsp = crate::cpu::this_cpu_at(flow.here()).index();
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let apic = |c: CpuIndex| c.apic_id().unwrap_or(crate::cpumap::BROADCAST);
     let mut routes: Vec<(pci::Address, vtd::MsiMessage, u8, u32)> = Vec::new();

@@ -222,13 +222,16 @@ fn map_window(
 /// page tables and heap exist, on the boot processor alone. `None` (reported) if segment 0's
 /// window cannot be used; the later PCIe steps then do not run.
 pub(crate) fn quiesce(
+    flow: origin_frame::trap::Pinned<'_>,
     com1: &mut Console,
     rsdp: u64,
     regions: &'static [MemoryRegion],
     own: &[Address],
 ) -> Option<Quiesce> {
     let pat = crate::cpu::check_pat();
-    if crate::cpu::pat_ready(&[crate::cpu::this_cpu()]) != 1 {
+    // The boot flow's processor, a value read under its witness (TASKS item 93).
+    let bsp = crate::cpu::this_cpu_at(flow.here()).index();
+    if crate::cpu::pat_ready(&[bsp]) != 1 {
         let _ = writeln!(
             com1,
             "origin-kernel: PCIe: PAT entry 3 is not uncached on the boot processor (IA32_PAT {pat:#x}): PCIe failed"

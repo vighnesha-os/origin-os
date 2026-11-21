@@ -393,7 +393,12 @@ fn probe(
 /// After each probe the IRTE is restored and interrupts must arrive again. Then the entry is
 /// masked, the PIT stopped and the IRTE released. Returns whether everything held; without
 /// interrupt remapping, or without an I/O APIC, there is nothing to prove.
-pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
+pub(crate) fn prove_remapped(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    tsc_hz: u64,
+) -> bool {
     let Some(pin) = cpu::without_interrupts(|| *PIT_PIN.lock()) else {
         let _ = writeln!(
             com1,
@@ -422,7 +427,8 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
         );
         return true;
     }
-    let bsp = cpu::this_cpu();
+    // The boot flow's processor, a value read under its witness (TASKS item 93).
+    let bsp = cpu::this_cpu_at(flow.here()).index();
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let mut ids = cpus.to_vec();
     if !ids.contains(&target) {

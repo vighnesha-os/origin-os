@@ -291,10 +291,11 @@ unsafe fn on_stack(stack: &GuardedStack, run: &mut dyn FnMut(), overwrite: bool)
 /// Runs `work` as one step on the processor the caller is on: interrupts off, on the
 /// generator's stack, which is overwritten afterwards. `None` if this processor has no
 /// generator stack, or a step is already running on it.
-fn step_here<R>(work: impl FnOnce(&'static Slot, u32, u64, u64) -> R) -> Option<R> {
-    cpu::without_interrupts(|| {
-        let index = cpu::this_cpu();
-        let slot = SLOTS.get(index.get())?;
+fn step_here<R>(work: impl FnOnce(&Slot, u32, u64, u64) -> R) -> Option<R> {
+    cpu::without_interrupts_here(|here| {
+        let me = cpu::this_cpu_at(here);
+        let index = me.index();
+        let slot = SLOTS.this(me)?;
         let stack = slot.stack.get()?;
         if slot.in_step.swap(true, Ordering::Acquire) {
             return None;
@@ -309,7 +310,7 @@ fn step_here<R>(work: impl FnOnce(&'static Slot, u32, u64, u64) -> R) -> Option<
             }
         };
         let overwrite = !slot.keep_stack.load(Ordering::Relaxed);
-        // SAFETY: interrupts are off (`without_interrupts`), and `in_step` was clear and is now
+        // SAFETY: interrupts are off (`without_interrupts_here`), and `in_step` was clear and is now
         // set, so no step is running on this processor's generator stack; no other processor
         // ever runs on it.
         unsafe { on_stack(stack, &mut run, overwrite) };
@@ -649,8 +650,8 @@ pub struct BootStart {
 /// Starts the root and the boot processor's own generator (R5, R8). Once, on the boot
 /// processor, after the heap and the clock and before any other processor starts; a second
 /// call, or a call from another processor, does nothing and returns `None`.
-pub fn start_boot() -> Option<BootStart> {
-    if cpu::this_cpu() != CpuIndex::BOOT || BOOT_STARTED.swap(true, Ordering::AcqRel) {
+pub fn start_boot(me: cpu::ThisCpu<'_>) -> Option<BootStart> {
+    if me.index() != CpuIndex::BOOT || BOOT_STARTED.swap(true, Ordering::AcqRel) {
         return None;
     }
     let slot = SLOTS.get(CpuIndex::BOOT.get())?;
@@ -854,8 +855,8 @@ impl StackWords {
 /// Measures how much of this processor's generator stack one request uses, and checks that
 /// after a request the whole stack holds zeros. `None` if this processor has no generator.
 pub fn prove_stack() -> Option<StackProof> {
-    cpu::without_interrupts(|| {
-        let slot = SLOTS.get(cpu::this_cpu().get())?;
+    cpu::without_interrupts_here(|here| {
+        let slot = SLOTS.this(cpu::this_cpu_at(here))?;
         let stack = slot.stack.get()?;
         if slot.in_step.load(Ordering::Acquire) {
             return None;

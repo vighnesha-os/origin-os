@@ -657,11 +657,14 @@ extern "sysv64" fn turn_taker(reading: u64) -> ! {
     while UNTIL.load(Ordering::Acquire) == 0 {
         core::hint::spin_loop();
     }
+    // Its processor names its turns, pinned while it takes them (TASKS item 93).
+    let pin = crate::sched::pin();
     take_turns(
-        cpu::this_cpu().get() as u64,
+        cpu::this_cpu_at(pin.pinned().here()).index().get() as u64,
         WANTED_HANDOFFS.load(Ordering::Relaxed),
         Reading::of(reading),
     );
+    drop(pin);
     crate::sched::finish(|| {
         DONE.fetch_add(1, Ordering::AcqRel);
     })
