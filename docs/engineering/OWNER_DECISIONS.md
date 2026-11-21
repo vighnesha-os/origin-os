@@ -1293,7 +1293,7 @@ Its findings rank first a silent halt after a failed `ExitBootServices`, the loa
 | # | Question | Answer |
 |---|---|---|
 | 342, answered | Should every loader, not only bench builds, print one line before it halts after a failed `ExitBootServices`? The line goes to the UART that boot info would name (the SPCR's), with a bounded wait and no firmware call, on the failure path only. It amends ADR-0002 B5 and ADR-0010 | **Accept** |
-| 343, answered | Add Latitude's `m4.metal.large` to the rental tool's allowed plans, as a second bench board for the breadcrumbs build after the small board? It is an AMD EPYC 9254 (Zen 4) with 384 GB, in Ashburn, about $2.03 an hour by the owner's reading of the provider's page. Each rental still needs the owner's yes in chat, and item 225's $10 cap is unchanged | **Accept** |
+| 343, answered | Add Latitude's `m4.metal.large` to the rental tool's allowed plans, as a second bench board for the breadcrumbs build after the small board? It is an AMD EPYC 9254 (Zen 4) with 384 GB, in Ashburn, about $2.03 an hour by the owner's reading of the provider's page. Each rental still needs the owner's yes in chat, and item 225's $10 cap is unchanged | **Accepted, then withdrawn** the same day, once the price was corrected (below) |
 
 - **The alternatives put:**
   - for 342: the line in bench builds only;
@@ -1309,7 +1309,7 @@ Its findings rank first a silent halt after a failed `ExitBootServices`, the loa
   - `m4.metal.small`: page $0.41, billed $0.81;
   - `f4.metal.large`: page $2.62, API $5.25.
 
-  So `m4.metal.large` is likely about $4.06 an hour, and its worst case of two clock hours about $8.12. With $2.43 in the ledger, that passes item 225's $10 cap, so the tool will refuse to rent it unless the owner raises the cap. Adding it to the tool's plans spends nothing. TASKS item 112's read-only preflight reads the real price.
-- **Where they are written:** TASKS item 112 builds both:
-  - the normal loader's line, with the amendment text for ADR-0002 B5 and ADR-0010 drafted in its records, which lands with it;
-  - the tool's allowed plans, with offline tests, the API's slug and site code confirmed by a read-only preflight.
+  So `m4.metal.large` is likely about $4.06 an hour, and its worst case of two clock hours about $8.12. With $2.43 in the ledger, that passes item 225's $10 cap.
+- **The owner withdrew item 343 on 2026-11-21** ("Withdraw it"). The rental tool's plans stay `m4-metal-small` and `f4-metal-large`, and no second board is added.
+- **The provider offers no hardware in the declared scope.** All ten of its bare-metal plans, read on its pricing page on 2026-11-21, are Zen 4 or Zen 5 EPYC 9005 (2024). Every rental there is bench equipment.
+- **Where they are written:** TASKS item 112 builds item 342: the normal loader's line, with the amendment text for ADR-0002 B5 and ADR-0010 drafted in its records, which lands with it. Item 343 asks for nothing now.

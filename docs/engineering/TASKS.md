@@ -590,9 +590,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 112. **Breadcrumbs for the next rental (rental C's findings, ranks 1 and 4). Numbered by the coordinating session on 2026-11-21; started the same day, at the owner's word.**
     - A bench build, selected by `--cfg origin_bench` and never signed or packaged, prints the processor state the kernel inherits through the firmware's console. After `ExitBootServices` it says which call succeeded, writing straight to the SPCR's UART, and then writes one byte on that UART after each step from the CR3 load to the kernel's first line.
     - A QEMU scenario checks the bytes in order. A development hook makes the first `ExitBootServices` fail, so the retry path runs at least once. Rules in `cargo xtask check` and the reproducible gate show that no normal image holds any of it.
-    - It also builds items 342 and 343:
-      - every loader's line before it halts after a failed `ExitBootServices`, with the amendment text for ADR-0002 B5 and ADR-0010;
-      - `m4.metal.large` among the rental tool's plans.
+    - It also builds item 342: every loader's line before it halts after a failed `ExitBootServices`, with the amendment text for ADR-0002 B5 and ADR-0010.
     - The rental that uses the build needs the owner's yes.
 113. **The APIC timer's calibration under KVM (TASKS item 78's Q8). Numbered by the coordinating session on 2026-11-21; not started; after TASKS item 78's figures line.**
     - Every KVM boot in CI discards all 1,024 calibration windows as disturbed and keeps the least disturbed one: about 10 s a boot by arithmetic, not measured.
