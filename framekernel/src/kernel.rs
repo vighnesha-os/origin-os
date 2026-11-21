@@ -315,6 +315,12 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // What each processor put in its own control registers, which ring 3 relies on.
         let held = cpu::cpu_states_holding(online.cpus()) == online.cpus().len();
         record_or_stop(&mut com1, &mut proofs, Proof::CpuState, held);
+        // ADR-0020 S6: every processor online saves its FPU state as the boot processor does,
+        // and so may take part in moves. Report until a mover reads it (TASKS item 96).
+        proofs.record(
+            Proof::FpuFormat,
+            cpu::fpu_formats_alike(online.cpus()) == online.cpus().len(),
+        );
         // ADR-0017: what each processor reported and set as it started, and the two forms
         // of the lookup every index and address from ring 3 goes through.
         let controls = prove_speculation(&mut com1, online.cpus());

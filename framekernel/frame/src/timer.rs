@@ -42,6 +42,9 @@ const PROOF_TICKS: u64 = 50;
 /// ([`apic::TickVerdict::Stalled`]), each against the same bounds. Each run is at most 2 s, so
 /// a boot pays for more only while disturbed (TASKS item 66).
 const PROOF_ATTEMPTS: u32 = 4;
+// The count's figures line stays under 160 bytes only while a run's number has two digits
+// (`apic::CountFigures::line`).
+const _: () = assert!(PROOF_ATTEMPTS < 100);
 /// Calibration window.
 const CALIBRATION_MICROS: u64 = 10_000;
 /// APIC timer divisor during calibration and afterwards.
@@ -570,6 +573,9 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
             ppm: timed.sample.map(|sample| sample.ppm_of(period)),
             tries: timed.tries,
         };
+        // What the count reads showed, on every run and before its verdict's line: it judges
+        // nothing, and says why a run's period was or was not decided (TASKS item 78).
+        let _ = writeln!(com1, "{}", timed.figures.line(attempts, tsc_hz));
         if verdict != TickVerdict::Stalled || attempts == PROOF_ATTEMPTS {
             // A short run lasted until its limit, not until its last interrupt.
             let lasted = if (timed.taken as u64) < PROOF_TICKS {
@@ -666,7 +672,7 @@ fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> Ti
     ];
     // The timer's period from its count, still running as timed (the addendum review's
     // T66-R13).
-    let (sample, tries) = sample_period(lapic, registers[0], tsc_hz / HZ);
+    let (sample, tries, figures) = sample_period(lapic, registers[0], tsc_hz / HZ);
     lapic.stop_timer();
     TimedRun {
         start,
@@ -675,6 +681,7 @@ fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> Ti
         registers,
         sample,
         tries,
+        figures,
     }
 }
 
@@ -689,6 +696,8 @@ struct TimedRun {
     /// The first clean pair of reads of its count, if one came, and the pairs tried.
     sample: Option<apic::PeriodSample>,
     tries: u32,
+    /// What the count reads showed, for the run's figures line (TASKS item 78).
+    figures: apic::CountFigures,
 }
 
 /// How a run's count showed its period, for the proof's lines (the coordinating session's
@@ -740,7 +749,11 @@ fn read_count(lapic: &X2Apic) -> apic::CountRead {
 
 /// Measures the running periodic timer's period from its count, reloaded with `initial`
 /// ([`apic::sample_period`], which judges the reads).
-fn sample_period(lapic: &X2Apic, initial: u64, nominal: u64) -> (Option<apic::PeriodSample>, u32) {
+fn sample_period(
+    lapic: &X2Apic,
+    initial: u64,
+    nominal: u64,
+) -> (Option<apic::PeriodSample>, u32, apic::CountFigures) {
     apic::sample_period(initial, nominal, || read_count(lapic))
 }
 
