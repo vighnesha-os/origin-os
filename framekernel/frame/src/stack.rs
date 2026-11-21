@@ -46,13 +46,20 @@
 //!   left the stack, or until its spawner withdraws it, never having made it runnable
 //!   ([`GuardedStack::withdraw_first_frame`], TASKS item 75). A suspended context's saved frame is
 //!   there too, which also covers a stack it is suspended on that is not its own, such as a
-//!   measured stack ([`with_measured_stack`]).
+//!   measured stack ([`with_measured_stack`]): in its slot, or, from its switch-out until its
+//!   processor's next call into the table, in the table's leaving record (ADR-0020 S5).
 //!
 //! No switch writes a home. So a thread's own stack stays covered while it runs, while it is
 //! suspended, while it runs a measured closure, and in the windows of a switch and of its exit,
 //! however a processor's reads of the records interleave with switches (TASKS item 70; the review
 //! of TASKS item 68, T68-2). A stack in any record is leaked rather than freed, which is the safe
 //! failure for a safe caller that drops one too early.
+//!
+//! **A context moving between processors** (ADR-0020 S4) has its home claimed in the destination's
+//! table before it is cleared in the source's, and every scan of all the tables, the one a drop
+//! makes and [`slot_in_contexts`], goes through the move sequence (`cpu::MOVES`), so a scan that
+//! reads the destination before the claim and the source after the clear tries again, and after
+//! four tries makes one pass under the move gate. Nothing moves a context yet (TASKS item 96).
 //!
 //! **Stacks held by their user** are in no record: the interrupt stacks, the generator's stacks,
 //! and a measured stack while its closure runs on it. That is safe because only their holder can
@@ -659,7 +666,7 @@ pub fn slot_in_use(slot: StackSlot) -> bool {
 }
 
 /// Whether some processor's table of contexts covers the stack in slot `slot`: a context's home
-/// or saved frame there. Part of what [`slot_in_use`] asks, without the caller's stack pointer
+/// or saved frame there, scanned through the move sequence (`cpu::contexts_cover`). Part of what [`slot_in_use`] asks, without the caller's stack pointer
 /// and the kernel-stack records. For the kernel stacks proof's switch windows, where since TASKS
 /// item 77 the held processor's kernel-stack record still names the held thread's stack, so
 /// that what [`slot_in_use`] answers there would not show its home word (the review of TASKS

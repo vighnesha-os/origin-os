@@ -29,7 +29,7 @@ use crate::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
     TSS, TSS_SIZE,
 };
-use origin_sync::contexts::{BOOT_FLOW, Contexts, Refused, Switched};
+use origin_sync::contexts::{BOOT_FLOW, Contexts, Moves, Quiet, Refused, Switched};
 
 use crate::percpu::PerCpu;
 use crate::trap::Switch;
@@ -841,6 +841,23 @@ pub(crate) static CONTEXTS: PerCpu<Contexts> = PerCpu::new(
     Contexts::new,
 );
 
+/// The machine's move sequence (ADR-0020 S4; `origin_sync::contexts`, "Moves between
+/// processors"): the move gate and the begun and finished counters. A move of a context between
+/// two processors' tables of contexts holds the gate, and every scan of all the tables goes
+/// through [`Moves::scan`], so that a move cannot hide a home from it. Nothing moves a context
+/// yet: TASKS item 96 makes the first move.
+pub(crate) static MOVES: Moves = Moves::new();
+
+/// What a scan's pass under the move gate runs in: interrupts off on this processor, since a
+/// mover holds the gate with interrupts off and may be this processor's own interrupt handler.
+struct Quietly;
+
+impl Quiet for Quietly {
+    fn quietly<R>(&self, f: impl FnOnce() -> R) -> R {
+        without_interrupts(f)
+    }
+}
+
 /// Records a new thread on processor `cpu`, whose first frame is `frame`, on its own stack: the
 /// frame becomes its home and the frame to resume. `false` if the table is full or `cpu` has
 /// none.
@@ -850,11 +867,18 @@ pub(crate) fn publish_context(cpu: CpuIndex, frame: u64) -> bool {
         .is_some_and(|table| table.publish(frame))
 }
 
-/// Whether some processor's table of contexts covers `[start, end)`: a context's home or saved
-/// frame there. Part of what [`stack_in_use`] asks, without the caller's stack pointer and the
-/// kernel-stack records (`stack::slot_in_contexts`).
+/// Whether some processor's table of contexts covers `[start, end)`: a context's home, saved
+/// frame or leaving frame there. Part of what [`stack_in_use`] asks, without the caller's stack
+/// pointer and the kernel-stack records (`stack::slot_in_contexts`). It scans every table through
+/// the move sequence ([`MOVES`]), so a context moving between two tables is not missed: at most
+/// four passes with no lock, then one under the move gate with interrupts off (ADR-0020 S4).
 pub(crate) fn contexts_cover(start: u64, end: u64) -> bool {
-    CONTEXTS.iter().any(|table| table.covers(start, end))
+    MOVES
+        .scan(
+            || CONTEXTS.iter().any(|table| table.covers(start, end)),
+            &Quietly,
+        )
+        .covered
 }
 
 /// Withdraws the context published on processor `cpu` at `frame`, which its spawner never made
@@ -883,9 +907,12 @@ fn running_on(address: u64) -> bool {
 
 /// What the trap entry resumes after a scheduler upcall: `next`, the frame the scheduler
 /// answered for the interrupted context at `here` (`Contexts::switch`). Unless they are the same,
-/// `next` must be a frame this processor saved, and the context at `here` saves it as its frame,
-/// unless it is ending (`exiting`). No address is printed (ADR-0004 Amendment 2, A6.2): a frame
-/// is told as an offset in its window.
+/// `next` must be a frame this processor saved, and the context at `here` leaves `here` as its
+/// frame, unless it is ending (`exiting`). The table publishes that frame only at this
+/// processor's next call into it, the next switch or a stack's drop: [`exception_saved`] still
+/// returns along the outgoing stack after this, until its `mov rsp, rax`, so the frame must not
+/// be resumable anywhere before then (ADR-0020 S5). No address is printed (ADR-0004 Amendment 2,
+/// A6.2): a frame is told as an offset in its window.
 fn resume(here: u64, next: u64, exiting: bool) -> u64 {
     let me = this_cpu();
     let outcome = CONTEXTS
@@ -918,17 +945,22 @@ fn resume(here: u64, next: u64, exiting: bool) -> u64 {
 /// context's home or saved frame is on it (TASKS item 70). Only a stack in none of them can be
 /// freed. It never waits and takes no lock.
 ///
-/// It first retires this processor's own ended context, if any: this processor has left that
-/// stack, since any code it runs after the exit's switch runs on another context's stack
-/// (`Contexts::retire_ended`). So a stack reaped here before this processor's next switch is
-/// given back, not leaked. The retirement runs with interrupts off, as the table asks: a switch
-/// that interrupted it between its take and its clear would leave the ended stack in no record
-/// that retires it, and a reap then would leak it (the review of TASKS item 70, T70-1).
+/// It first publishes the frame this processor's last switch-out left, and retires its own ended
+/// context, if any: this processor has left both stacks, since any code it runs after a switch
+/// runs on another context's stack (`Contexts::publish_leaving`, `Contexts::retire_ended`; ADR-0020
+/// S5). So a stack reaped here before this processor's next switch is given back, not leaked.
+/// Both run with interrupts off, as the table asks: a switch that interrupted the retirement
+/// between its take and its clear would leave the ended stack in no record that retires it, and a
+/// reap then would leak it (the review of TASKS item 70, T70-1); one that interrupted the
+/// publication between its two stores would have its own leaving record cleared.
 pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
     let used = |value: u64| value >= start && value < end;
     if tables_ready()
         && let Some(table) = CONTEXTS.get(this_cpu().get())
-        && without_interrupts(|| table.retire_ended(running_on)) == Err(Refused::StillOnIt)
+        && without_interrupts(|| {
+            table.publish_leaving();
+            table.retire_ended(running_on)
+        }) == Err(Refused::StillOnIt)
     {
         panic!("an ended thread's stack was to be retired while this processor still ran on it");
     }
@@ -941,7 +973,9 @@ pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
         || CPU_LOCAL
             .iter()
             .any(|l| l.kernel_stack.load(Ordering::Acquire) == top)
-        || CONTEXTS.iter().any(|table| table.covers(start, end))
+        // Last, through the move sequence: neither of the records above can name a context that
+        // is moving, which is suspended and not running.
+        || contexts_cover(start, end)
 }
 
 /// This processor's CPU index: one GS-relative load from its CPU-local area. On a
