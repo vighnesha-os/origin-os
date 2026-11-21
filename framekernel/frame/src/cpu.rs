@@ -2369,8 +2369,8 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> crate::features::FpuFo
 
 /// Records the boot processor's FPU format, from what [`enable_simd`] returned there, and the
 /// size of every thread's FPU area: CPUID.0DH.00H:ECX, the size for every component the
-/// processor supports, and never less than the format's own enabled size, so the boot
-/// processor's state always fits. Returns `false`, and changes nothing, if they were recorded
+/// processor supports, and never less than what one save in the format writes
+/// ([`crate::features::fpu_bytes`]), so the boot processor's state always fits. Returns `false`, and changes nothing, if they were recorded
 /// already.
 ///
 /// Called by `Early::enable_simd` alone: once, on the boot processor, before any area is
@@ -2385,7 +2385,8 @@ pub(crate) fn record_boot_fpu(
     } else {
         xsave_area_size(id).unwrap_or(FXSAVE_SIZE)
     };
-    let area = supported.max(format.enabled_size as usize);
+    // Never less than what one save in its own format writes (R94-10).
+    let area = supported.max(crate::features::fpu_bytes(format));
     if BOOT_FPU.set(BootFpu { format, area }).is_err() {
         return false;
     }

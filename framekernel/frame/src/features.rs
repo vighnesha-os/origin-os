@@ -309,11 +309,23 @@ pub fn ap_lacks(smep_and_smap: bool, baseline: bool, fit: FpuFit) -> Option<ApLa
     }
 }
 
+/// The bytes one save in `format` may write: [`FXSAVE_SIZE`] without XSAVE; with it, the
+/// enabled size CPUID reports, but never less than the legacy region and the XSAVE header that
+/// every XSAVE writes (576 bytes, Intel SDM Vol. 1 §13.4), whatever CPUID says (the delta
+/// review of TASKS item 94, R94-10).
+pub fn fpu_bytes(format: FpuFormat) -> usize {
+    if format.xcr0 == 0 {
+        FXSAVE_SIZE
+    } else {
+        (format.enabled_size as usize).max(FXSAVE_SIZE + 64)
+    }
+}
+
 /// Judges a processor's format `own` against the boot processor's, `boot` (`None` until the
 /// boot processor has recorded it), when every FPU area is `area` bytes. Room comes first: a
-/// state that does not fit is refused whatever else it matches.
+/// state that does not fit ([`fpu_bytes`]) is refused whatever else it matches.
 pub fn fpu_fit(boot: Option<FpuFormat>, own: FpuFormat, area: usize) -> FpuFit {
-    if own.enabled_size as usize > area {
+    if fpu_bytes(own) > area {
         FpuFit::TooLarge
     } else if boot == Some(own) {
         FpuFit::Alike
@@ -626,6 +638,25 @@ mod tests {
     }
 
     #[test]
+    fn an_xsave_writes_at_least_its_header_whatever_cpuid_says() {
+        // A hypervisor that reports an enabled size below the legacy region and the header.
+        let small = FpuFormat {
+            xcr0: 0x7,
+            enabled_size: 100,
+        };
+        assert_eq!(fpu_bytes(small), 576);
+        assert_eq!(fpu_fit(Some(small), small, 512), FpuFit::TooLarge);
+        assert_eq!(fpu_fit(Some(small), small, 576), FpuFit::Alike);
+        assert_eq!(fpu_bytes(BOOT), 832);
+        // Without XSAVE, the FXSAVE area's 512 bytes.
+        let fxsave = FpuFormat {
+            xcr0: 0,
+            enabled_size: 512,
+        };
+        assert_eq!(fpu_bytes(fxsave), FXSAVE_SIZE);
+    }
+
+    #[test]
     fn nothing_is_alike_before_the_boot_processor_records_its_format() {
         assert_eq!(fpu_fit(None, BOOT, AREA), FpuFit::Differs);
     }
@@ -653,14 +684,15 @@ mod tests {
             };
             let area = rng.edge_u32() as usize;
             let fit = fpu_fit(boot, own, area);
+            assert!(fpu_bytes(own) >= own.enabled_size as usize || own.xcr0 == 0);
             assert_eq!(
                 fit == FpuFit::TooLarge,
-                own.enabled_size as usize > area,
+                fpu_bytes(own) > area,
                 "case {case}"
             );
             assert_eq!(
                 fit == FpuFit::Alike,
-                boot == Some(own) && own.enabled_size as usize <= area,
+                boot == Some(own) && fpu_bytes(own) <= area,
                 "case {case}"
             );
         }
