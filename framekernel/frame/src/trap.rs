@@ -44,6 +44,10 @@ impl Switch {
     /// The witness of this switch point (ADR-0020 S3): the trap entry runs with interrupts off,
     /// and a scheduling hook chooses what this processor runs next without leaving the processor
     /// itself, so nothing that holds this borrow can be moved before the hook returns.
+    ///
+    /// `#[inline]`: the scheduler's hooks, in another crate, call it on the switch path, where an
+    /// out-of-line call would be one the base does not make (review finding R93-9).
+    #[inline]
     pub fn here(&self) -> Here<'_> {
         Here { _here: PhantomData }
     }
@@ -174,7 +178,8 @@ impl<'a> Pinned<'a> {
         Self { _here: PhantomData }
     }
 
-    /// The same witness, for what a section's witness reads.
+    /// The same witness, for what a section's witness reads. `#[inline]`, as [`Switch::here`].
+    #[inline]
     pub fn here(self) -> Here<'a> {
         Here { _here: PhantomData }
     }

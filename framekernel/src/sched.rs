@@ -161,10 +161,12 @@ fn raise_pin(record: &Record<threads::State>) {
 /// The timer interrupted the context whose frame is at `interrupted`; returns the frame to
 /// resume. Processors without an active queue keep running what they were running.
 pub(crate) fn on_tick(interrupted: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q| {
-        // The preemption proof's watch (TASKS item 66): the TSC only while it is armed.
+    with_queue(interrupted, switch, |q, here| {
+        // The preemption proof's watch (TASKS item 66): the TSC only while it is armed. The read
+        // back takes the trap entry's witness by value, which is zero-sized, so the closure is as
+        // the function item it replaces (review finding R93-9).
         if q.watching() {
-            q.note_tick(rdtsc(), || timer_read_back(switch.here()));
+            q.note_tick(rdtsc(), move || timer_read_back(here));
         }
         Some(q.tick(interrupted))
     })
@@ -673,14 +675,14 @@ fn reap_zombies(pinned: Pinned<'_>) -> usize {
 fn with_queue(
     interrupted: u64,
     switch: &Switch,
-    f: impl FnOnce(&mut RunQueue<Placed>) -> Option<u64>,
+    f: impl FnOnce(&mut RunQueue<Placed>, origin_frame::trap::Here<'_>) -> Option<u64>,
 ) -> u64 {
     let me = cpu::this_cpu(switch.here());
     match (ACTIVE.this(me), QUEUES.this(me)) {
         (Some(active), Some(queue)) if active.load(Ordering::Acquire) => {
             let mut q = queue.lock();
             let old = q.current();
-            let next = f(&mut q).unwrap_or(interrupted);
+            let next = f(&mut q, switch.here()).unwrap_or(interrupted);
             // The preemption proof's rounds clause stamps its 15th switch after the step that
             // made it (TASKS item 66, the addendum review's T66-R15).
             if q.watching() {
@@ -720,12 +722,12 @@ fn with_queue(
 
 /// `YIELD_VECTOR`: the running context gives up the processor.
 pub(crate) fn on_yield(interrupted: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q| Some(q.yield_now(interrupted)))
+    with_queue(interrupted, switch, |q, _| Some(q.yield_now(interrupted)))
 }
 
 /// `SLEEP_VECTOR`: the running thread sleeps for `ticks` timer ticks.
 pub(crate) fn on_sleep(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
-    let next = with_queue(interrupted, switch, |q| q.sleep(interrupted, ticks).ok());
+    let next = with_queue(interrupted, switch, |q, _| q.sleep(interrupted, ticks).ok());
     // The kernel stacks proof holds one thread here, in its switch-out window (TASKS item 70).
     crate::stacks::hold_in_window(interrupted, next);
     next
@@ -735,7 +737,7 @@ pub(crate) fn on_sleep(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
 /// already pending).
 /// RDI holds the most ticks to wait (0: no limit).
 pub(crate) fn on_block(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q| {
+    with_queue(interrupted, switch, |q, _| {
         q.block_for(interrupted, (ticks != 0).then_some(ticks)).ok()
     })
 }
@@ -745,7 +747,7 @@ pub(crate) fn on_block(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
 /// switches only if a thread that was woken should run now
 /// ([`RunQueue::preempt_for_wake`]), and otherwise resumes what the interrupt interrupted.
 pub(crate) fn on_reschedule(interrupted: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q| {
+    with_queue(interrupted, switch, |q, _| {
         Some(q.preempt_for_wake(interrupted))
     })
 }
@@ -865,7 +867,7 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
 /// [`reap`] empties and gives back later on this processor.
 pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
     let me = cpu::this_cpu(switch.here());
-    let next = with_queue(interrupted, switch, |q| {
+    let next = with_queue(interrupted, switch, |q, _| {
         let placed = q.record(q.current());
         let next = q.exit(interrupted).ok()?;
         if let (Some(table), Some(placed)) = (threads::table_here(me), placed) {
