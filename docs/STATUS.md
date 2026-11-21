@@ -9,7 +9,7 @@
 
 ## Breadcrumbs on the SPCR's UART: a bench build (TASKS item 112; 2026-11-21)
 
-On `claude/t112-breadcrumbs`, from `land/batch-9`; not yet in a batch. Rentals B and C showed nothing between the loader's last line and the kernel's first (`docs/research/2026-11-21-rental-c-findings.md`).
+In `land/batch-9` since `1007a575`. Rentals B and C showed nothing between the loader's last line and the kernel's first (`docs/research/2026-11-21-rental-c-findings.md`).
 
 - **Every loader** (decision item 342; ADR-0002 Amendment 2, ADR-0010 Amendment 4): after a failed `ExitBootServices` it writes one line saying why to the SPCR's UART, then halts. Before, that halt was silent.
 - **A bench build**, `cargo xtask bench-build`, never signed or shipped:
@@ -27,6 +27,10 @@ Controls BC-1 to BC-5 each fail. The independent AI review found no High or Medi
 `check`, `boot-test` and `boot-matrix` three times in a row passed on `54911a0d`, in one turn on a clean tree; `boot-bench` adds 62 to 81 s to a `boot-matrix` of about 1,230 s.
 
 **Not shown:** anything on a physical machine; the shadow-stack reads, which QEMU's software processor never takes. The next rental (about $0.81, on the owner's word) is what it is for.
+
+**Rental D (2026-11-21, $0.81, bench equipment, item 233)** ran the bench build three times on the same kind of server, with rental B's firmware revision. Record: `docs/hardware/records/2026-11-21-latitude-m4-metal-small-d.md`; findings: `docs/research/2026-11-21-rental-d-findings.md`.
+- **Shown:** the entry state on a physical machine for the first time. Supervisor shadow stacks are off (S_CET 0), PAT is the processor's power-on value, and the three shadow-stack reads ran without a fault on a real Zen 4.
+- **Not shown:** anything after the loader's last line. There was no line after `ExitBootServices`, no halting line and no breadcrumb, so either `ExitBootServices` does not return on this firmware, or nothing written straight to `0x2F8` after it reaches the console. The findings propose one bench-loader rental that separates the two.
 
 ## Rental B: Origin's loader on a rented bare-metal server (2026-11-20)
 
