@@ -205,6 +205,13 @@ impl<S> Record<S> {
     /// count through the lock the thread's last switch-out released after its last write. The one
     /// other writer is [`Block::take`], while no thread holds the record.
     ///
+    /// That rule is the callers', not the type's (review finding R93-7): the method is open to any
+    /// holder of a `&Record`, and another thread's records are reachable. In the kernel only
+    /// `sched::pin` and `sched::end_with` call it, and `sched::PinGuard`'s drop calls
+    /// [`Record::unpin`], each on the running thread's own record. Anything else that pinned or
+    /// unpinned another thread, a mover included (ADR-0020 S6), would race that thread's own
+    /// update, and an unpin could lower an ending thread's pin, which is kept for good (N5).
+    ///
     /// Returns `false`, and raises nothing, if the count is at its largest. The kernel stops then,
     /// as for [`Record::unpin`]'s refusal.
     pub fn pin(&self) -> bool {
