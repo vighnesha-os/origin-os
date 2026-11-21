@@ -25,29 +25,41 @@
 //!
 //! - MV1: a scan whose pass reads the destination before the source finds a home that moves
 //!   between them, or tries again (N4 (a); ADR-0020 S4).
-//! - MV2: a move and the source's own switch naming the same frame: at most one takes it.
+//! - MV2: a move and the source's own switch naming the same frame: exactly one takes it. When
+//!   the move wins, the switch is refused, which on the kernel halts it: TASKS item 96's mover
+//!   lends only a thread its source queue says is ready, under that queue's lock, so the source's
+//!   scheduler cannot have named the frame (`Moves::relocate`, "What the caller must hold").
+//! - MV2b: the same against a switch straight back to the context the source has just switched
+//!   out, which publishes the frame and takes it at once.
 //! - MV3: a moved context is resumed by the destination only after its `adopt`, and never by the
 //!   source after its `lend`: never by both.
 //! - MV4: a `forget` followed by another context's claim of the same slot: a scan is never told
 //!   the moved stack is uncovered.
-//! - MV5: a full destination refuses the context, and `restore` gives the source back a frame it
-//!   resumes; the stack stays covered throughout.
+//! - MV5: a destination with one free slot, which a publication on it and the move race for:
+//!   whichever loses, the move is refused and `restore` gives the source back a frame it resumes,
+//!   or the publication is refused.
 //! - MV6: two movers contending for the gate beside a scan: neither moving home is missed.
-//! - MV7: a scan racing three back-to-back moves of one context finds its home within
-//!   `FAST_TRIES` passes and one under the gate.
+//! - MV7: a scan racing three back-to-back moves of one context, enough for each of its fast
+//!   passes to miss the home, finds it, after its pass under the gate if need be. That the scan
+//!   makes at most `FAST_TRIES + 1` passes is its code's structure; that the gate's wait ends is
+//!   the ticket order's, which Loom's spin bound cannot show (an execution that spins past the
+//!   bound is not explored further).
+//! - MV8: a context suspended on a stack that is not its home (a measured stack) moves; a scan
+//!   asking about that stack, which only the frame word covers, finds it. Begun is raised before
+//!   `lend` for this: between `lend` and `adopt` the frame is in neither table.
 //! - LV1: a frame switched out on one processor is resumed by another only after the first
 //!   processor's last use of the stack it was saved on (N4 (b); ADR-0020 S5).
 //! - LV2: a frame on a stack that is not its context's home is covered while its processor
 //!   publishes it, by the leaving record or by its slot (ADR-0020 S5).
 //!
 //! **Not proved:** the kernel's mover (TASKS item 96), its queue locks and the run-queue entry it
-//! passes; more than two tables, or more than the moves each model makes; and the deterministic
-//! bound with the kernel's own four fast tries, which the host test
-//! `contexts::tests::a_scan_makes_its_fast_passes_then_one_under_the_gate` shows instead.
+//! passes; more than two tables, or more than the moves each model makes; that the gate's wait
+//! ends (above); and the deterministic bound with the kernel's own four fast tries, which the
+//! host test `contexts::tests::a_scan_makes_its_fast_passes_then_one_under_the_gate` shows.
 
 use super::*;
 
-use crate::contexts::{AdoptRefused, FAST_TRIES, LendRefused, MoveRefused, Moves, Quiet, Scanned};
+use crate::contexts::{AdoptRefused, LendRefused, MoveRefused, Moves, Quiet, Scanned};
 
 /// What MV2 and MV3 report when one frame was taken twice.
 const TAKEN_TWICE: &str = "a frame was taken twice: by a move and a switch, or by two switches";
@@ -58,8 +70,6 @@ const NOT_GIVEN_BACK: &str =
 /// stack was visible.
 const RESUMED_TOO_SOON: &str =
     "a frame was resumed on another processor before its own had left its stack";
-/// What MV7 reports when a scan made more passes than its bound.
-const TOO_MANY_PASSES: &str = "a scan made more passes than its bound";
 
 /// A host thread stands in for a processor with interrupts off: nothing interrupts it.
 struct Plain;
@@ -148,6 +158,41 @@ fn mv2_a_move_and_the_source_switch_take_a_frame_once() {
     );
 }
 
+/// MV2b: processor 0 runs context 1, switches it out to its boot flow, and switches straight
+/// back to it, the second switch publishing context 1's frame and taking it at once, while a mover
+/// moves that frame to processor 1. Exactly one of the switch back and the move takes it.
+#[test]
+fn mv2b_a_move_and_a_switch_back_to_the_leaving_context_take_a_frame_once() {
+    check(
+        "moves::mv2b_a_move_and_a_switch_back_to_the_leaving_context_take_a_frame_once",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
+            assert!(tables[0].publish(ctx_frame(1)));
+            assert_eq!(
+                ctx_switch(&tables[0], ctx_frame(9), ctx_frame(1), false, ctx_off),
+                Ok(ctx_frame(1))
+            );
+            let at_1 = ctx_frame(1) - 0x100;
+            let mover = {
+                let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
+                thread::spawn(move || moves.relocate(&tables[0], &tables[1], at_1, |_| ()))
+            };
+            assert_eq!(
+                ctx_switch(&tables[0], at_1, ctx_frame(9), false, ctx_off),
+                Ok(ctx_frame(9))
+            );
+            let back = ctx_switch(&tables[0], ctx_frame(9) - 0x100, at_1, false, ctx_off);
+            let moved = mover.join().unwrap();
+            assert!(
+                moved.is_ok() != back.is_ok(),
+                "{TAKEN_TWICE}: moved {moved:?}, switched back {back:?}"
+            );
+        },
+    );
+}
+
 /// MV3: context 1 is published on processor 0. A mover moves it to processor 1 while each
 /// processor's boot flow tries once to switch to it. The destination resumes it only if the move
 /// happened (after its `adopt`), the source only if it did not (before its `lend`), and never
@@ -223,9 +268,10 @@ fn mv4_a_forgotten_slot_claimed_again_hides_no_moved_home() {
     );
 }
 
-/// MV5: processor 1's table is full, so a move of context 1 from processor 0 is refused and its
-/// frame restored, while another processor asks whether stack 1 is in use. The stack is covered
-/// throughout, and afterwards processor 0's boot flow resumes the frame.
+/// MV5: processor 1's table has one free slot, which a publication on processor 1 and a move of
+/// context 1 from processor 0 race for (N13). Whichever loses is refused: a refused move restores
+/// the frame, and processor 0's boot flow then resumes it; a move that won leaves processor 1 to
+/// resume it.
 #[test]
 fn mv5_a_full_destination_gives_the_frame_back() {
     check(
@@ -235,23 +281,29 @@ fn mv5_a_full_destination_gives_the_frame_back() {
         || {
             let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
             assert!(tables[0].publish(ctx_frame(1)));
-            for n in 4..8 {
+            for n in 4..7 {
                 assert!(tables[1].publish(ctx_frame(n)));
             }
             let mover = {
                 let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
                 thread::spawn(move || moves.relocate(&tables[0], &tables[1], ctx_frame(1), |_| ()))
             };
-            assert!(scan_for(&moves, &tables, 1).covered, "{UNCOVERED}");
-            assert_eq!(
-                mover.join().unwrap(),
-                Err(MoveRefused::Adopt(AdoptRefused::Full))
+            let published = tables[1].publish(ctx_frame(7));
+            let moved = mover.join().unwrap();
+            assert!(
+                moved.is_ok() != published,
+                "the last slot went to neither or both: moved {moved:?}, published {published}"
             );
-            assert_eq!(
-                ctx_switch(&tables[0], ctx_frame(9), ctx_frame(1), false, ctx_off),
-                Ok(ctx_frame(1)),
-                "{NOT_GIVEN_BACK}"
-            );
+            if moved.is_ok() {
+                assert!(ctx_covered(&tables[1], 1), "{UNCOVERED}");
+            } else {
+                assert_eq!(moved, Err(MoveRefused::Adopt(AdoptRefused::Full)));
+                assert_eq!(
+                    ctx_switch(&tables[0], ctx_frame(9), ctx_frame(1), false, ctx_off),
+                    Ok(ctx_frame(1)),
+                    "{NOT_GIVEN_BACK}"
+                );
+            }
         },
     );
 }
@@ -310,13 +362,47 @@ fn mv7_a_scan_racing_back_to_back_moves_ends_and_finds_the_home() {
                     }
                 })
             };
-            let scanned = scan_for(&moves, &tables, 1);
-            assert!(scanned.covered, "{UNCOVERED}");
-            assert!(
-                scanned.passes <= FAST_TRIES + 1,
-                "{TOO_MANY_PASSES}: {scanned:?}"
-            );
+            assert!(scan_for(&moves, &tables, 1).covered, "{UNCOVERED}");
             mover.join().unwrap();
+        },
+    );
+}
+
+/// MV8: context 1 ran on processor 1 and was switched out on a measured stack (stack 7), so its
+/// saved frame is there and its home on stack 1. It moves to processor 0 while a scan reading
+/// processor 0's table first asks about stack 7, which only the frame word covers: between `lend`
+/// and `adopt` the frame is in neither table, and the scan must still find it, or try again.
+#[test]
+fn mv8_a_frame_off_its_home_stack_is_found_while_it_moves() {
+    check(
+        "moves::mv8_a_frame_off_its_home_stack_is_found_while_it_moves",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
+            let _ = running_context_1(&tables[1]);
+            let on_measured = ctx_stack(7).1 - 0x100;
+            assert_eq!(
+                ctx_switch(
+                    &tables[1],
+                    on_measured,
+                    ctx_frame(9) - 0x100,
+                    false,
+                    ctx_off
+                ),
+                Ok(ctx_frame(9) - 0x100)
+            );
+            tables[1].publish_leaving();
+            let mover = {
+                let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
+                thread::spawn(move || {
+                    let moved = moves.relocate(&tables[1], &tables[0], on_measured, |_| ());
+                    assert_eq!(moved, Ok((ctx_frame(1), ())));
+                })
+            };
+            assert!(scan_for(&moves, &tables, 7).covered, "{UNCOVERED}");
+            mover.join().unwrap();
+            assert!(ctx_covered(&tables[0], 7), "{UNCOVERED}");
         },
     );
 }

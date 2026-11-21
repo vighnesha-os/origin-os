@@ -1927,8 +1927,9 @@ const CONTROLS: &[Control] = &[
         models: &[("moves::mv1_a_scan_reading_the_destination_first_finds_a_moving_home", CTX_UNCOVERED)],
     },
     Control {
-        // MX2 (MV2's control): `lend` takes the frame by a plain store, not by the compare-and-swap
-        // a switch also makes, so the source's switch and the move can both take it.
+        // MX2 (MV2's and MV2b's control): `lend` takes the frame by a plain store, not by the
+        // compare-and-swap a switch also makes, so the source's switch and the move can both take
+        // it.
         name: "moves_lend_by_a_plain_store",
         file: CONTEXTS,
         from: "            if context
@@ -1944,7 +1945,13 @@ const CONTROLS: &[Control] = &[
             } {
                 return Ok(Lent {
 ",
-        models: &[("moves::mv2_a_move_and_the_source_switch_take_a_frame_once", MOVE_TAKEN_TWICE)],
+        models: &[
+            ("moves::mv2_a_move_and_the_source_switch_take_a_frame_once", MOVE_TAKEN_TWICE),
+            (
+                "moves::mv2b_a_move_and_a_switch_back_to_the_leaving_context_take_a_frame_once",
+                MOVE_TAKEN_TWICE,
+            ),
+        ],
     },
     Control {
         // MX3 (MV3's control): the destination adopts the context before the source lends it, so
@@ -2013,6 +2020,20 @@ const CONTROLS: &[Control] = &[
         to: "        if let Some(slot) = self.source.slots.get(self.slot) {
             slot.home.store(0, Relaxed);
         }
+",
+        models: &[("moves::mv4_a_forgotten_slot_claimed_again_hides_no_moved_home", CTX_UNCOVERED)],
+    },
+    Control {
+        // MX4c (MV4's control, the independent reviewer's answer to Q6): finished raised after
+        // `lend` and before `adopt`. A scan that reads that finish is not ordered after the
+        // destination's claim, so it can read the destination before the claim, the source after
+        // the forget, and believe the pass.
+        name: "moves_finished_before_adopt",
+        file: CONTEXTS,
+        from: "        let adopted = match destination.adopt(&moving, lent) {
+",
+        to: "        self.raise_finished();
+        let adopted = match destination.adopt(&moving, lent) {
 ",
         models: &[("moves::mv4_a_forgotten_slot_claimed_again_hides_no_moved_home", CTX_UNCOVERED)],
     },
@@ -2104,6 +2125,46 @@ const CONTROLS: &[Control] = &[
         models: &[("moves::mv7_a_scan_racing_back_to_back_moves_ends_and_finds_the_home", CTX_UNCOVERED)],
     },
     Control {
+        // MX8 (the review of TASKS item 95, R95-7 (c)): finished raised with Relaxed. A scan that
+        // reads it is not ordered after the destination's claim.
+        name: "moves_finished_relaxed",
+        file: CONTEXTS,
+        from: "        let _ = self.finished.fetch_add(1, Release);
+",
+        to: "        let _ = self.finished.fetch_add(1, Relaxed);
+",
+        models: &[("moves::mv1_a_scan_reading_the_destination_first_finds_a_moving_home", CTX_UNCOVERED)],
+    },
+    Control {
+        // MX9 (R95-7 (d)): a pass believed whenever begun did not change across it, finished
+        // unread. A move whose raise of begun the scan already counted, but whose claim it does not
+        // yet see, is missed.
+        name: "moves_settled_without_finished",
+        file: CONTEXTS,
+        from: "        finished == begun && self.begun.load(Acquire) == begun
+",
+        to: "        let _ = finished;
+        self.begun.load(Acquire) == begun
+",
+        models: &[("moves::mv1_a_scan_reading_the_destination_first_finds_a_moving_home", CTX_UNCOVERED)],
+    },
+    Control {
+        // MX10 (R95-7 (e)): begun raised after `lend` rather than before it. A frame on a stack
+        // that is not its home is in neither table between `lend` and `adopt`, and a scan that
+        // reads the source's frame word after the take is then not ordered after the raise.
+        name: "moves_begun_after_lend",
+        file: CONTEXTS,
+        from: "        let moving = self.begin();
+        let lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
+",
+        to: "        let moving = self.begin();
+        let _ = self.begun.fetch_sub(1, Relaxed);
+        let lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
+        let _ = self.begun.fetch_add(1, Relaxed);
+",
+        models: &[("moves::mv8_a_frame_off_its_home_stack_is_found_while_it_moves", CTX_UNCOVERED)],
+    },
+    Control {
         // LX1 (LV1's control; ADR-0020 S5): the outgoing frame stored in its slot at the switch, as
         // before TASKS item 95. Another processor can then take and resume it while its own
         // processor still returns along its stack.
@@ -2112,6 +2173,21 @@ const CONTROLS: &[Control] = &[
         from: "            Some(_) => self.record_leaving(outgoing, here),
 ",
         to: "            Some(slot) => slot.frame.store(here, Release),
+",
+        models: &[("moves::lv1_a_frame_is_resumed_elsewhere_only_after_its_processor_left_the_stack", MOVE_RESUMED_TOO_SOON)],
+    },
+    Control {
+        // LX4 (R95-7 (b)): the publication stores the frame in its slot with Relaxed: a mover that
+        // takes it is not ordered after the processor's last use of the stack.
+        name: "moves_publication_relaxed",
+        file: CONTEXTS,
+        from: "        if let Some(slot) = self.slots.get(self.leaving_slot.load(Relaxed)) {
+            slot.frame.store(frame, Release);
+        }
+",
+        to: "        if let Some(slot) = self.slots.get(self.leaving_slot.load(Relaxed)) {
+            slot.frame.store(frame, Relaxed);
+        }
 ",
         models: &[("moves::lv1_a_frame_is_resumed_elsewhere_only_after_its_processor_left_the_stack", MOVE_RESUMED_TOO_SOON)],
     },
@@ -2144,6 +2220,23 @@ const CONTROLS: &[Control] = &[
             .iter()
             .any(|slot| inside(slot.home.load(Acquire)) || inside(slot.frame.load(Acquire)))
             || inside(self.leaving.load(Acquire))
+",
+        models: &[("moves::lv2_a_frame_is_covered_while_its_processor_publishes_it", CTX_UNCOVERED)],
+    },
+    Control {
+        // LX3 (R95-7 (a)): the publication clears the leaving record before it stores the frame in
+        // its slot: a reader between the two finds the frame in neither.
+        name: "moves_publication_clears_first",
+        file: CONTEXTS,
+        from: "        if let Some(slot) = self.slots.get(self.leaving_slot.load(Relaxed)) {
+            slot.frame.store(frame, Release);
+        }
+        self.leaving.store(0, Release);
+",
+        to: "        self.leaving.store(0, Release);
+        if let Some(slot) = self.slots.get(self.leaving_slot.load(Relaxed)) {
+            slot.frame.store(frame, Release);
+        }
 ",
         models: &[("moves::lv2_a_frame_is_covered_while_its_processor_publishes_it", CTX_UNCOVERED)],
     },
