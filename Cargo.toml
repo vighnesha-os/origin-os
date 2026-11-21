@@ -100,7 +100,10 @@ missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 # `cfg(loom)`: `cargo xtask loom` builds `origin-sync`'s tests against Loom (CLAUDE.md §73), in a
 # scratch workspace of its own: nothing in this workspace depends on Loom.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+# `cfg(origin_bench)`: the bench build of the loader and the kernel, with breadcrumbs on the
+# SPCR's UART (TASKS item 112). Only `cargo xtask bench-build` and `boot-bench` set it, into
+# `target/bench`; no image a normal build makes holds any of it (`cargo xtask check`, F1 and F2).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(origin_bench)'] }
 
 [workspace.lints.clippy]
 # CLAUDE.md §13 and final rule 5: every unsafe boundary documents its invariants.

@@ -13,6 +13,9 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+#[cfg(any(test, origin_bench))]
+pub mod bench;
+
 /// `"ORIGBOOT"` as a little-endian `u64`.
 pub const MAGIC: u64 = u64::from_le_bytes(*b"ORIGBOOT");
 /// Version the loader provides and the kernel expects.
