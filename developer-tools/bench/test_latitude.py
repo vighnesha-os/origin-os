@@ -402,12 +402,14 @@ class Guards(unittest.TestCase):
         self.assertEqual(self.lat.clean("\x1b[1;31mred\x1b[0m\r\n\x1b[?25l"), "red\n")
 
     def test_the_install_refuses_every_switch_the_bench_loader_reads(self):
-        # TASKS items 112 and 116: each \\EFI\\ORIGIN\\BENCH-* path the bench loader names is
-        # refused on the rented ESP, so a rental takes its own key and the reset.
+        # TASKS items 112, 116 and 121: each \\EFI\\ORIGIN\\BENCH-* path any of the loader's
+        # sources names is refused on the rented ESP, so a rental takes its own key, reads the
+        # FCH's own registers, and resets.
         import re
-        source = (HERE.parent.parent / "boot" / "uefi" / "src" / "bench.rs").read_text()
+        sources = sorted((HERE.parent.parent / "boot" / "uefi" / "src").rglob("*.rs"))
+        source = "".join(p.read_text() for p in sources)
         named = set(re.findall(r'"\\\\EFI\\\\ORIGIN\\\\(BENCH-[A-Z-]+)"', source))
-        self.assertEqual(named, {"BENCH-STALE-KEY", "BENCH-AFTER"})
+        self.assertEqual(named, {"BENCH-STALE-KEY", "BENCH-AFTER", "BENCH-FCH"})
         self.assertEqual(set(self.lat.BENCH_SWITCHES), named)
         tests = self.lat.refuse_bench_switches()
         for name in named:
