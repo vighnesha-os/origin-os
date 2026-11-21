@@ -140,7 +140,10 @@ impl<'a> X2Apic<'a> {
     ///
     /// # Safety
     ///
-    /// CPL 0, and [`X2Apic::enable`] has run on this processor.
+    /// CPL 0, and [`X2Apic::enable`] has run on this processor. And the handle is used only while
+    /// its holder cannot leave this processor: with interrupts off, or in a witness's life (ADR-0020
+    /// S3). The caller chooses its lifetime, `'static` included, so the type does not hold that
+    /// part (TASKS item 93, the addendum review's A93-1).
     pub unsafe fn assume_enabled() -> Self {
         Self(PhantomData)
     }
