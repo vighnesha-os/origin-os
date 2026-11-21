@@ -182,9 +182,8 @@ fn boot(
     // kernel (`bench::After::Reset`).
     #[cfg(origin_bench)]
     let after = {
-        let found = read_bench_file(image, &bs, bench::AFTER_PATH).map(|(contents, len)| {
-            bench::After::from_contents(contents.get(..len).unwrap_or(&[]))
-        });
+        let found = read_bench_file(image, &bs, bench::AFTER_PATH)
+            .map(|(contents, len)| bench::After::from_contents(contents.get(..len).unwrap_or(&[])));
         let _ = writeln!(out, "{}{}", bench::PREFIX, bench::After::said(found));
         found.flatten().unwrap_or(bench::After::Reset)
     };
@@ -1476,9 +1475,9 @@ fn bench_before_call(
     );
     // With interrupts masked: a firmware timer callback that wrote the UART while DLAB is set
     // would change its divisor (TASKS item 116's review, R116-6).
-    let under = early_uart
-        .is_present()
-        .then(|| with_interrupts_masked(|| bench::UartState::read(&mut LoaderPorts, early_uart.port)));
+    let under = early_uart.is_present().then(|| {
+        with_interrupts_masked(|| bench::UartState::read(&mut LoaderPorts, early_uart.port))
+    });
     let _ = writeln!(
         out,
         "{}",
@@ -1518,7 +1517,9 @@ fn with_interrupts_masked<T>(f: impl FnOnce() -> T) -> T {
     let flags: u64;
     // SAFETY: CPL 0; PUSHFQ and POP read the flags through the stack, which the block uses and
     // leaves as it found it.
-    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };
+    unsafe {
+        core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags))
+    };
     mask_interrupts();
     let value = f();
     if flags & (1 << 9) != 0 {
@@ -1671,7 +1672,9 @@ fn write_reset_register(register: bench::ResetRegister) {
             // SAFETY: the FADT's reset register, a byte of memory-mapped I/O the firmware's map
             // describes (`bench::find_reset`), so the firmware's page tables, still loaded, map it
             // at its physical address; one volatile byte store, as §4.8.3.6 asks.
-            unsafe { ptr::with_exposed_provenance_mut::<u8>(address as usize).write_volatile(value) };
+            unsafe {
+                ptr::with_exposed_provenance_mut::<u8>(address as usize).write_volatile(value)
+            };
         }
     }
 }

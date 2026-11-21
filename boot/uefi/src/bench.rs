@@ -787,7 +787,10 @@ impl fmt::Display for Fallback {
         })?;
         match self.register {
             Ok(register) => write!(f, ": writing {register}, the FADT's reset register"),
-            Err(why) => write!(f, ", and the FADT gives no usable reset register ({why}): halting"),
+            Err(why) => write!(
+                f,
+                ", and the FADT gives no usable reset register ({why}): halting"
+            ),
         }
     }
 }
@@ -1185,7 +1188,9 @@ mod tests {
                 wrote_back: false
             }
             .to_string()
-            .contains("(first call EFI_INVALID_PARAMETER, retry EFI_INVALID_PARAMETER) the UART read ")
+            .contains(
+                "(first call EFI_INVALID_PARAMETER, retry EFI_INVALID_PARAMETER) the UART read "
+            )
         );
         assert!(BEFORE_CALL.starts_with(PREFIX));
         assert!(NOT_RESET.starts_with(PREFIX));
@@ -1312,11 +1317,9 @@ mod tests {
             (OTHER_AT, xsdt(&[])),
             (FADT_AT, fadt_bytes),
         ];
-        find_reset(
-            RSDP_AT,
-            &mut |at, out| read_from(&memory, at, out),
-            |at| (0xFED0_0000..0xFED0_1000).contains(&at),
-        )
+        find_reset(RSDP_AT, &mut |at, out| read_from(&memory, at, out), |at| {
+            (0xFED0_0000..0xFED0_1000).contains(&at)
+        })
     }
 
     #[test]

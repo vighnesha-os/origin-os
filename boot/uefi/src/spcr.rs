@@ -254,7 +254,10 @@ pub(crate) fn parse_rsdp(b: &[u8; RSDP_LENGTH]) -> Result<u64, RsdpError> {
 
 /// Checks the XSDT at `xsdt` (signature, length, whole-table checksum) and returns how many
 /// entries it lists. The bench loader's walk to the FADT uses it too (TASKS item 116).
-pub(crate) fn check_xsdt(xsdt: u64, read: &mut impl FnMut(u64, &mut [u8]) -> bool) -> Result<u32, Missing> {
+pub(crate) fn check_xsdt(
+    xsdt: u64,
+    read: &mut impl FnMut(u64, &mut [u8]) -> bool,
+) -> Result<u32, Missing> {
     let mut header = [0u8; HEADER_LENGTH];
     if !read(xsdt, &mut header) {
         return Err(Missing::XsdtUnreadable(xsdt));
