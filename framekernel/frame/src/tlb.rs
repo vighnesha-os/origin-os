@@ -131,12 +131,6 @@ impl TlbHardware for Hardware {
     }
 }
 
-/// The index without a witness, for the one caller TASKS item 93 converts last, with its shared
-/// files: [`interrupted`], which the trap entry in `cpu` calls. Removed with it.
-fn this_cpu() -> usize {
-    cpu::this_cpu().get()
-}
-
 /// Turns on global pages on this processor and marks its CPU index, for the boot report.
 /// The proof counts only the processors online, so an AP that got this far but never came
 /// online (it was parked, `smp::park`) is not counted. `me` is this processor, read under its
@@ -244,9 +238,9 @@ pub(crate) static INTERRUPTS: PerCpu<AtomicU64> =
         AtomicU64::new(0)
     });
 
-/// The shootdown interrupt.
-pub(crate) fn interrupted() {
-    if let Some(taken) = INTERRUPTS.get(this_cpu()) {
+/// The shootdown interrupt, under the trap entry's witness (ADR-0020 S3; TASKS item 93).
+pub(crate) fn interrupted(here: crate::trap::Here<'_>) {
+    if let Some(taken) = INTERRUPTS.this(cpu::this_cpu_at(here)) {
         taken.fetch_add(1, Ordering::Relaxed);
     }
     service();

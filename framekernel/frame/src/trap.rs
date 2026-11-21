@@ -18,6 +18,8 @@ use origin_paging::layout::Told;
 /// The scheduler's switch point: the moment, inside the trap entry with interrupts off, when
 /// it chooses what this processor runs next. Only the trap entry makes one, for the scheduling
 /// hooks, and only for the length of the call (it is not `Send`, and the hooks get a borrow).
+/// The trap entry also takes its witness, [`Switch::here`], for the code it runs itself and for
+/// the device handlers (ADR-0020 S3; TASKS item 93): `Switch::new` is its one caller.
 ///
 /// What is loaded with it stays: the address space for the thread about to resume
 /// (`UserSpace::activate`). Anywhere else, a space loaded on a processor would be undone the

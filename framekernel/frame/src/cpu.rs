@@ -747,9 +747,10 @@ extern "sysv64" fn syscall_entry() {
     );
 }
 
-/// This processor's CPU-local area.
-fn local() -> &'static CpuLocal {
-    CPU_LOCAL.get(this_cpu().0).unwrap_or(&OUT_OF_RANGE)
+/// This processor's CPU-local area, lent for the life of the witness `me` was read under
+/// (ADR-0020 S3; TASKS item 93).
+fn local(me: ThisCpu<'_>) -> &'_ CpuLocal {
+    CPU_LOCAL.this(me).unwrap_or(&OUT_OF_RANGE)
 }
 
 /// Names the stack the running context's interrupts and system calls from ring 3 land on: this
@@ -768,7 +769,10 @@ fn local() -> &'static CpuLocal {
 /// placed at least 2 MiB below the window's top (`layout::place`), and its guard pages are
 /// unmapped ones. So the delivery would fault into #DF, on its own stack, rather than write
 /// anywhere (the review of TASKS items 75, 77 and 81, R77-3).
-fn name_kernel_stack(home: u64) {
+///
+/// `at` is the trap entry's witness ([`resume`]'s), under which the index is read (ADR-0020 S3;
+/// TASKS item 93).
+fn name_kernel_stack(at: crate::trap::Here<'_>, home: u64) {
     let top = if home == BOOT_FLOW {
         0
     } else {
@@ -776,19 +780,19 @@ fn name_kernel_stack(home: u64) {
             Some(top) => top,
             None => panic!(
                 "the context resumed {} has its home in no kernel stack",
-                this_cpu().named()
+                this_cpu_at(at).index().named()
             ),
         }
     };
-    let local = this_cpu().0;
-    let Some(tss) = CPU_LOCAL.get(local).map(|l| l.tss.load(Ordering::Relaxed)) else {
+    let local = this_cpu_at(at);
+    let Some(tss) = CPU_LOCAL.this(local).map(|l| l.tss.load(Ordering::Relaxed)) else {
         return;
     };
     if tss == 0 {
         return;
     }
     let field = ptr::with_exposed_provenance_mut::<u32>(tss as usize + d::TSS_RSP0_OFFSET);
-    if let Some(l) = CPU_LOCAL.get(local) {
+    if let Some(l) = CPU_LOCAL.this(local) {
         // Release, read with Acquire by `stack_in_use` (TASKS item 70, Q2).
         l.kernel_stack.store(top, Ordering::Release);
     }
@@ -823,16 +827,18 @@ const fn ist_of(vector: u64) -> u8 {
 /// at the start of [`dispatch`], is also the first thing the system-call path does in Rust (the
 /// addition (d)). A frame elsewhere was pushed onto another stack, perhaps over a suspended
 /// context's frame: the processor halts, as the trap entry does for a frame it never saved.
-fn check_landing(here: u64, vector: u64) {
-    let me = this_cpu();
-    let home = CONTEXTS.get(me.get()).and_then(Contexts::running_home);
+///
+/// `at` is the trap entry's witness, under which the index is read (ADR-0020 S3; TASKS item 93).
+fn check_landing(at: crate::trap::Here<'_>, here: u64, vector: u64) {
+    let me = this_cpu_at(at);
+    let home = CONTEXTS.this(me).and_then(Contexts::running_home);
     if !home.is_some_and(|home| crate::stack::same_slot(home, here)) {
         panic!(
             "an entry from ring 3 (vector {vector}) {} landed on a stack not the running context's own",
-            me.named()
+            me.index().named()
         );
     }
-    if let Some(l) = CPU_LOCAL.get(me.0) {
+    if let Some(l) = CPU_LOCAL.this(me) {
         // Only this processor writes it, with interrupts off: a plain load and store.
         l.landings.store(
             l.landings.load(Ordering::Relaxed).wrapping_add(1),
@@ -947,24 +953,24 @@ fn running_on(address: u64) -> bool {
 /// returns along the outgoing stack after this, until its `mov rsp, rax`, so the frame must not
 /// be resumable anywhere before then (ADR-0020 S5). No address is printed (ADR-0004 Amendment 2,
 /// A6.2): a frame is told as an offset in its window.
-fn resume(here: u64, next: u64, exiting: bool) -> u64 {
-    let me = this_cpu();
-    let outcome = CONTEXTS
-        .get(me.get())
-        .map_or(Err(Refused::NeverSaved), |table| {
-            table.switch(here, next, exiting, running_on)
-        });
+///
+/// `at` is the trap entry's witness, under which the index is read (ADR-0020 S3; TASKS item 93).
+fn resume(at: crate::trap::Here<'_>, here: u64, next: u64, exiting: bool) -> u64 {
+    let me = this_cpu_at(at);
+    let outcome = CONTEXTS.this(me).map_or(Err(Refused::NeverSaved), |table| {
+        table.switch(here, next, exiting, running_on)
+    });
     match outcome {
         Ok(Switched { frame, home }) => {
             // The incoming context's own stack, from its home, unless nothing switched.
             if let Some(home) = home {
-                name_kernel_stack(home);
+                name_kernel_stack(at, home);
             }
             frame
         }
         Err(Refused::NeverSaved) => panic!(
             "the scheduler returned a frame {} never saved: {}",
-            me.named(),
+            me.index().named(),
             crate::phys::told(next)
         ),
         Err(Refused::Full) => panic!("too many saved thread frames on this processor"),
@@ -1223,7 +1229,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     let here = ptr::from_mut(frame).addr() as u64;
     // An entry from ring 3 must have landed on the running context's own stack (TASKS item 77).
     if frame.cs & 3 == 3 && ist_of(frame.vector) == 0 {
-        check_landing(here, frame.vector);
+        check_landing(Switch::new().here(), here, frame.vector);
     }
     // A program can set RFLAGS.AC; the entry path must have cleared it for the kernel.
     if frame.cs & 3 == 3 && SMAP_ON.load(Ordering::Relaxed) && read_rflags() & RFLAGS_AC != 0 {
@@ -1238,7 +1244,12 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // writing 0 to the EOI register only acknowledges the interrupt in service.
         unsafe { wrmsr(X2APIC_EOI, 0) };
         return hooks.map_or(here, |h| {
-            resume(here, (h.tick)(here, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.tick)(here, &Switch::new()),
+                false,
+            )
         });
     }
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
@@ -1252,10 +1263,15 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // SAFETY: as for the timer: interrupt messages are only routed to processors whose
         // APIC is in x2APIC mode; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
-        return match irq::run(vector) {
+        return match irq::run(vector, Switch::new().here()) {
             Action::Resume => here,
             Action::Reschedule => hooks.map_or(here, |h| {
-                resume(here, (h.reschedule)(here, &Switch::new()), false)
+                resume(
+                    Switch::new().here(),
+                    here,
+                    (h.reschedule)(here, &Switch::new()),
+                    false,
+                )
             }),
         };
     }
@@ -1266,12 +1282,17 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // vector, so x2APIC mode is on; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
         return hooks.map_or(here, |h| {
-            resume(here, (h.reschedule)(here, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.reschedule)(here, &Switch::new()),
+                false,
+            )
         });
     }
     // Another processor changed a kernel mapping: invalidate it here, then acknowledge.
     if frame.vector == u64::from(crate::tlb::SHOOTDOWN_VECTOR) {
-        crate::tlb::interrupted();
+        crate::tlb::interrupted(Switch::new().here());
         // SAFETY: as for the timer: x2APIC mode is on (only processors with an active
         // scheduler are sent this vector), and the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
@@ -1286,20 +1307,42 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     // Scheduler requests from kernel threads (`sched::yield_now`, `sleep`, `exit`).
     if frame.vector == u64::from(YIELD_VECTOR) {
         return hooks.map_or(here, |h| {
-            resume(here, (h.yield_now)(here, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.yield_now)(here, &Switch::new()),
+                false,
+            )
         });
     }
     if frame.vector == u64::from(SLEEP_VECTOR) {
         return hooks.map_or(here, |h| {
-            resume(here, (h.sleep)(here, frame.rdi, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.sleep)(here, frame.rdi, &Switch::new()),
+                false,
+            )
         });
     }
     if frame.vector == u64::from(EXIT_VECTOR) {
-        return hooks.map_or(here, |h| resume(here, (h.exit)(here, &Switch::new()), true));
+        return hooks.map_or(here, |h| {
+            resume(
+                Switch::new().here(),
+                here,
+                (h.exit)(here, &Switch::new()),
+                true,
+            )
+        });
     }
     if frame.vector == u64::from(BLOCK_VECTOR) {
         return hooks.map_or(here, |h| {
-            resume(here, (h.block)(here, frame.rdi, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.block)(here, frame.rdi, &Switch::new()),
+                false,
+            )
         });
     }
     if frame.vector == u64::from(SYSCALL_VECTOR) {
@@ -1314,9 +1357,12 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
                 frame.rax = status as u64;
                 here
             }
-            crate::trap::SyscallOutcome::ThreadExit => {
-                resume(here, (hooks.exit)(here, &Switch::new()), true)
-            }
+            crate::trap::SyscallOutcome::ThreadExit => resume(
+                Switch::new().here(),
+                here,
+                (hooks.exit)(here, &Switch::new()),
+                true,
+            ),
         };
     }
     // A machine check is the hardware reporting on itself: it says nothing about the program
@@ -1345,7 +1391,12 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             halt();
         };
         (hooks.user_fault)(frame.vector, frame.error_code, address, on_exception_stack);
-        return resume(here, (hooks.exit)(here, &Switch::new()), true);
+        return resume(
+            Switch::new().here(),
+            here,
+            (hooks.exit)(here, &Switch::new()),
+            true,
+        );
     }
     // A page fault at the user-copy instruction, on a user address: resume at
     // `probe_recover`, which returns "failed" to `copy_user`'s caller.
@@ -1362,9 +1413,15 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     // A page fault at the exact instruction a probe armed: record it and resume at
     // `probe_recover`, which returns the error code to the probe's caller.
     if frame.vector == 14 {
-        let armed = local().probe_rip.load(Ordering::SeqCst);
+        // Two reads of the index, each under the trap entry's witness: as the code read it before
+        // TASKS item 93, so what is built here does not change.
+        let armed = local(this_cpu_at(Switch::new().here()))
+            .probe_rip
+            .load(Ordering::SeqCst);
         if armed != 0 && frame.rip == armed {
-            local().probe_address.store(read_cr2(), Ordering::SeqCst);
+            local(this_cpu_at(Switch::new().here()))
+                .probe_address
+                .store(read_cr2(), Ordering::SeqCst);
             frame.rax = frame.error_code;
             frame.rip = (probe_recover as *const ()).addr() as u64;
             return here;
@@ -1734,8 +1791,8 @@ fn init_speculation() {
 /// issues an IBPB if that is not the process it ran there last (ADR-0017 Z3). Only at the
 /// scheduler's switch point, which has interrupts off, so nothing else on this processor
 /// runs between the note and the barrier.
-pub fn entering_process(process: u64, _switch: &Switch) {
-    if crate::speculation::enters(this_cpu().get(), process) {
+pub fn entering_process(process: u64, switch: &Switch) {
+    if crate::speculation::enters(this_cpu_at(switch.here()).index().get(), process) {
         // SAFETY: CPL 0; `enters` says yes only where this processor recorded that it has
         // the IBPB command, so the register exists. Bit 0 is the command, and it changes
         // nothing but what the branch predictors hold.
@@ -2108,20 +2165,28 @@ impl core::fmt::Debug for Probe {
 }
 
 /// Arms the probe for a fault at `fault_rip`, runs `access`, and disarms it.
+///
+/// The three run in one interrupts-off section, and the processor's CPU-local area is read under
+/// its witness (ADR-0020 S3; TASKS item 93): the fault `access` may take is taken on the processor
+/// that armed the probe, whose trap entry reads the same area, and the record read back is that
+/// processor's. Before TASKS item 93 interrupts stayed as the caller had them; now they are off
+/// for the one access and its fault.
 fn run_probe(fault_rip: u64, access: impl FnOnce() -> u64) -> Probe {
     // Per CPU: probes and user copies on different processors never disarm each other.
-    let here = local();
-    here.probe_rip.store(fault_rip, Ordering::SeqCst);
-    let result = access();
-    here.probe_rip.store(0, Ordering::SeqCst);
-    if result == COMPLETED {
-        Probe::Completed
-    } else {
-        Probe::Faulted {
-            error: result,
-            address: here.probe_address.load(Ordering::SeqCst),
+    without_interrupts_here(|at| {
+        let here = local(this_cpu_at(at));
+        here.probe_rip.store(fault_rip, Ordering::SeqCst);
+        let result = access();
+        here.probe_rip.store(0, Ordering::SeqCst);
+        if result == COMPLETED {
+            Probe::Completed
+        } else {
+            Probe::Faulted {
+                error: result,
+                address: here.probe_address.load(Ordering::SeqCst),
+            }
         }
-    }
+    })
 }
 
 /// Reads the byte at `addr` through a fault-tolerant instruction and reports what happened.

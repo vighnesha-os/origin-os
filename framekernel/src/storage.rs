@@ -456,16 +456,20 @@ static INTERRUPT_CPU: AtomicU64 = AtomicU64::new(0);
 
 /// The completion interrupt (`cpu::DEVICE_VECTOR`, registered by [`init`]): counts it on the
 /// processor that took it and wakes the waiter there, which then reads the completion itself.
-fn on_interrupt() -> origin_frame::irq::Action {
-    let me = crate::cpu::this_cpu().get();
+/// The processor is read under the trap entry's witness (ADR-0020 S3; TASKS item 93).
+fn on_interrupt(here: origin_frame::trap::Here<'_>) -> origin_frame::irq::Action {
+    let me = crate::cpu::this_cpu_at(here);
     INTERRUPTS.fetch_add(1, Ordering::Relaxed);
-    INTERRUPT_CPU.store((me as u64).saturating_add(1), Ordering::Relaxed);
-    if let Some(n) = CPU_INTERRUPTS.get(me) {
+    INTERRUPT_CPU.store(
+        (me.index().get() as u64).saturating_add(1),
+        Ordering::Relaxed,
+    );
+    if let Some(n) = CPU_INTERRUPTS.this(me) {
         n.fetch_add(1, Ordering::Relaxed);
     }
-    if let Some(w) = IO_WAIT.get(me)
+    if let Some(w) = IO_WAIT.this(me)
         && w.wake_one()
-        && let Some(n) = CPU_WAKES.get(me)
+        && let Some(n) = CPU_WAKES.this(me)
     {
         n.fetch_add(1, Ordering::Relaxed);
     }

@@ -83,11 +83,12 @@ static NET_WAIT: WaitQueue = WaitQueue::new();
 static NET_WAKES: AtomicU64 = AtomicU64::new(0);
 
 /// The NIC's interrupt vector (`cpu::NET_VECTOR`), registered at bring-up: records the
-/// used-buffer interrupt and wakes the receive thread, which then reads the used ring itself.
-fn on_interrupt() -> origin_frame::irq::Action {
+/// used-buffer interrupt and wakes the receive thread, which then reads the used ring itself. The
+/// processor it records is read under the trap entry's witness (ADR-0020 S3; TASKS item 93).
+fn on_interrupt(here: origin_frame::trap::Here<'_>) -> origin_frame::irq::Action {
     NET_IRQS.fetch_add(1, Ordering::Relaxed);
     NET_IRQ_CPU.store(
-        (crate::cpu::this_cpu().get() as u64).saturating_add(1),
+        (crate::cpu::this_cpu_at(here).index().get() as u64).saturating_add(1),
         Ordering::Relaxed,
     );
     if NET_WAIT.wake_one() {
@@ -255,7 +256,7 @@ static DEVICE_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// The NIC's TX-completion vector (`cpu::NET_TX_VECTOR`), registered at bring-up: counts it
 /// and wakes a transmitter waiting for a descriptor, which then reclaims the completions
 /// itself.
-fn on_tx_interrupt() -> origin_frame::irq::Action {
+fn on_tx_interrupt(_: origin_frame::trap::Here<'_>) -> origin_frame::irq::Action {
     TX_IRQS.fetch_add(1, Ordering::Relaxed);
     if TX_WAIT.wake_one() {
         TX_WAKES.fetch_add(1, Ordering::Relaxed);
