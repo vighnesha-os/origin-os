@@ -89,6 +89,7 @@ proofs! {
     Topology "CPU topology" => Report;
     Numa "NUMA affinities" => Report;
     NumaDistances "NUMA distances" => Report;
+    Domains "scheduling domains" => Report;
     AcpiTables "ACPI tables" => Report;
     MeasuredStackBoot "measured stack at boot" => Report;
     AmlInterpreter "AML interpreter" => Report;
