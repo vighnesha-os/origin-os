@@ -552,10 +552,12 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
     let micros = |ticks: u64| ticks.saturating_mul(1_000_000) / tsc_hz.max(1);
     let expected = PROOF_TICKS * 1_000_000 / HZ;
     let mut stamps = [0u64; PROOF_TICKS as usize];
+    // How each count read's TSC readings are fenced, chosen once (TASKS item 78, Q7).
+    let fence = cpu::TscFence::detect();
     let mut attempts = 0;
     let (run, verdict, seen_period, timed, lasted) = loop {
         attempts += 1;
-        let timed = take_ticks(&lapic, count, tsc_hz, &mut stamps);
+        let timed = take_ticks(&lapic, fence, count, tsc_hz, &mut stamps);
         let seen = stamps.get(..timed.taken).unwrap_or(&[]);
         let run = apic::judge_ticks(timed.start, seen, PROOF_TICKS as usize, period);
         let verdict = apic::tick_verdict(run.verdict, apic::judge_period(timed.sample, period));
@@ -626,7 +628,13 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
 /// poll that saw it, until `stamps` is full or two seconds pass, polling with interrupt windows
 /// (never halting, so a lost interrupt cannot hang the check). Returns the TSC at the start and
 /// how many interrupts were stamped, and the TSC at the end. The timer is stopped again.
-fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> TimedRun {
+fn take_ticks(
+    lapic: &X2Apic,
+    fence: cpu::TscFence,
+    count: u32,
+    tsc_hz: u64,
+    stamps: &mut [u64],
+) -> TimedRun {
     // An expiry a stopped run left pending is taken here, before the count starts, so that a
     // repeated run cannot begin one interrupt ahead (the review's T66-R6).
     cpu::interrupt_window();
@@ -662,7 +670,7 @@ fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> Ti
     ];
     // The timer's period from its count, still running as timed (the addendum review's
     // T66-R13).
-    let (sample, tries, figures) = sample_period(lapic, registers[0], tsc_hz / HZ);
+    let (sample, tries, figures) = sample_period(lapic, fence, registers[0], tsc_hz / HZ);
     lapic.stop_timer();
     TimedRun {
         start,
@@ -725,11 +733,13 @@ impl core::fmt::Display for PeriodShort {
     }
 }
 
-/// One read of the timer's current count, bracketed by the TSC.
-fn read_count(lapic: &X2Apic) -> apic::CountRead {
-    let before = rdtsc();
+/// One read of the timer's current count, bracketed by the TSC: the first reading taken before
+/// the count's RDMSR can start, the second only once it has executed (`fence`; TASKS item 78,
+/// Q7), so that the bracket encloses the instant the count was taken.
+fn read_count(lapic: &X2Apic, fence: cpu::TscFence) -> apic::CountRead {
+    let before = fence.before();
     let count = lapic.read(ApicRead::TimerCurrent);
-    let after = rdtsc();
+    let after = fence.after();
     apic::CountRead {
         before,
         count,
@@ -741,10 +751,11 @@ fn read_count(lapic: &X2Apic) -> apic::CountRead {
 /// ([`apic::sample_period`], which judges the reads).
 fn sample_period(
     lapic: &X2Apic,
+    fence: cpu::TscFence,
     initial: u64,
     nominal: u64,
 ) -> (Option<apic::PeriodSample>, u32, apic::CountFigures) {
-    apic::sample_period(initial, nominal, || read_count(lapic))
+    apic::sample_period(initial, nominal, || read_count(lapic, fence))
 }
 
 /// One PIT channel-2 one-shot of `pit` input clocks, with the APIC timer counting down and
