@@ -33,6 +33,7 @@ pub mod apic;
 pub mod apstart;
 pub mod bitmap;
 pub mod boot;
+pub mod capacity;
 pub mod clock;
 pub mod cpuident;
 pub mod cpumap;
