@@ -98,9 +98,12 @@ pub struct Reports<'a> {
 /// The capacities of `n` processors: the first source that gives every one a value, scaled so
 /// the largest is [`FULL`].
 ///
-/// - **HFI:** a 0 is kept as capacity 0 ("avoid": no movable thread is placed there). A table
-///   all of 0 has not been written by the processor yet (the operating system zeroes it before
-///   enabling it), so it is no source.
+/// - **HFI:** a 0 is kept as capacity 0 ("avoid": no movable thread is placed there). A table the
+///   processor has not written yet is all 0 (the operating system zeroes it before enabling it):
+///   the caller gives `None` for every processor of a package whose table has not yet been
+///   written (its status bit says so, SDM Vol. 3 §17.6.5), so one package's unwritten table never
+///   reads as "avoid" (the review's R97-14; TASKS item 106 keeps that contract). Every value 0
+///   across the machine is no source either.
 /// - **`_CPC` and the register:** a Highest of 0 is no value; that processor has none, and the
 ///   source is passed over.
 pub fn choose(n: usize, reports: &Reports<'_>) -> (Source, Vec<u16>) {
@@ -275,11 +278,12 @@ pub struct CpcRegister {
 pub enum CpcError {
     /// Fewer than three elements, or NumEntries is not an Integer equal to the package's length.
     NumEntries,
-    /// The revision is not an Integer.
+    /// The revision is not an Integer, or is not one of [`CPC_REVISIONS`].
     Revision,
     /// Highest Performance is neither an Integer nor a register.
     Highest,
-    /// The buffer is not one Generic Register Descriptor.
+    /// The buffer is not one Generic Register Descriptor, or its field does not fit the register:
+    /// a width of 0, or an offset and width past 64 bits or past its access size.
     Descriptor,
     /// The NULL register, which marks a field unsupported: Highest is not optional.
     NullRegister,
@@ -311,8 +315,10 @@ pub fn generic_register(buffer: &[u8]) -> Result<CpcRegister, CpcError> {
 /// NumEntries against the package's length, and Highest's place, are checked.
 pub const CPC_REVISIONS: [u64; 3] = [2, 3, 4];
 
-/// `_CPC`'s Highest Performance: element 2, an Integer read directly or a register read through
-/// `read`. NumEntries (element 0) must equal the package's length.
+/// `_CPC`'s Highest Performance: element 2, an Integer read directly, or a register read through
+/// `read`, which gives the whole register, and the field its descriptor names taken from it: the
+/// bit width at the bit offset (the review's R97-5). NumEntries (element 0) must equal the
+/// package's length, and the revision must be one of [`CPC_REVISIONS`].
 pub fn cpc_highest(
     package: &[CpcElement<'_>],
     read: impl Fn(&CpcRegister) -> Option<u64>,
@@ -321,8 +327,9 @@ pub fn cpc_highest(
         Some(CpcElement::Integer(n)) if usize::try_from(*n) == Ok(package.len()) && *n >= 3 => {}
         _ => return Err(CpcError::NumEntries),
     }
-    if !matches!(package.get(1), Some(CpcElement::Integer(_))) {
-        return Err(CpcError::Revision);
+    match package.get(1) {
+        Some(CpcElement::Integer(revision)) if CPC_REVISIONS.contains(revision) => {}
+        _ => return Err(CpcError::Revision),
     }
     let value = match package.get(2) {
         Some(CpcElement::Integer(v)) => *v,
@@ -331,7 +338,23 @@ pub fn cpc_highest(
             if register.space == 0 && register.bit_width == 0 && register.address == 0 {
                 return Err(CpcError::NullRegister);
             }
-            read(&register).ok_or(CpcError::Unread)?
+            let (offset, width) = (
+                u32::from(register.bit_offset),
+                u32::from(register.bit_width),
+            );
+            let limit = match register.access_size {
+                size @ 1..=4 => 8 << (size - 1),
+                _ => 64,
+            };
+            if width == 0 || offset + width > limit {
+                return Err(CpcError::Descriptor);
+            }
+            let field = read(&register).ok_or(CpcError::Unread)? >> offset;
+            if width == 64 {
+                field
+            } else {
+                field & ((1u64 << width) - 1)
+            }
         }
         _ => return Err(CpcError::Highest),
     };
@@ -579,7 +602,12 @@ mod tests {
     }
 
     fn register(space: u8, width: u8, address: u64) -> Vec<u8> {
-        let mut b = vec![0x82, 12, 0, space, width, 0, 3];
+        field_register(space, width, 0, address)
+    }
+
+    /// A Generic Register Descriptor for the `width` bits at `offset`, by quad-word access.
+    fn field_register(space: u8, width: u8, offset: u8, address: u64) -> Vec<u8> {
+        let mut b = vec![0x82, 12, 0, space, width, offset, 4];
         b.extend_from_slice(&address.to_le_bytes());
         b.extend_from_slice(&[0x79, 0]);
         b
@@ -645,6 +673,41 @@ mod tests {
         assert_eq!(cpc_highest(&package, none), Err(CpcError::Unread));
     }
 
+    /// A register that reads whole, as a real `read` gives it: the field is taken out (R97-5).
+    /// Intel's IA32_HWP_CAPABILITIES holds Highest in bits 7:0, AMD's CPPC_CAPABILITY_1
+    /// HighestPerf in bits 31:24.
+    #[test]
+    fn a_register_field_is_taken_from_the_whole_register() {
+        let hwp = field_register(0x7F, 8, 0, 0x771);
+        let amd = field_register(0x7F, 8, 24, 0xC001_02B0);
+        let zero = field_register(0x7F, 0, 0, 0x771);
+        let mut byte = field_register(1, 8, 4, 0x80);
+        byte[6] = 1;
+        fn package(b: &[u8]) -> Vec<CpcElement<'_>> {
+            let mut p = vec![
+                CpcElement::Integer(25),
+                CpcElement::Integer(4),
+                CpcElement::Buffer(b),
+            ];
+            p.resize(25, CpcElement::Integer(0));
+            p
+        }
+        assert_eq!(cpc_highest(&package(&hwp), |_| Some(0x0108_2A30)), Ok(0x30));
+        assert_eq!(
+            cpc_highest(&package(&amd), |_| Some(0x0000_00AA_7766_5544)),
+            Ok(0x77)
+        );
+        // A field that does not fit its register is refused: width 0, or past the access size.
+        assert_eq!(
+            cpc_highest(&package(&zero), |_| Some(1)),
+            Err(CpcError::Descriptor)
+        );
+        assert_eq!(
+            cpc_highest(&package(&byte), |_| Some(0xFF)),
+            Err(CpcError::Descriptor)
+        );
+    }
+
     #[test]
     fn malformed_cpc_packages_are_refused() {
         let read = |_: &CpcRegister| Some(1);
@@ -672,6 +735,20 @@ mod tests {
             ),
             Err(CpcError::Revision)
         );
+        for revision in [0, 1, 5] {
+            assert_eq!(
+                cpc_highest(
+                    &pkg(vec![
+                        CpcElement::Integer(3),
+                        CpcElement::Integer(revision),
+                        CpcElement::Integer(9)
+                    ]),
+                    read
+                ),
+                Err(CpcError::Revision),
+                "{revision}"
+            );
+        }
         assert_eq!(
             cpc_highest(
                 &pkg(vec![
@@ -746,8 +823,8 @@ mod tests {
         assert_eq!(amd_cppc_highest(0xFF_D1_00_00_00), 0xD1);
     }
 
-    /// S9's Fn8000_0026 cases: core types, rankings, the heterogeneous flag. The ranking orders
-    /// within a type and never across.
+    /// S9's Fn8000_0026 cases: core types and rankings. The ranking orders within a type and never
+    /// across. (The heterogeneous flag is `topology`'s `hybrid`, which no capacity reads.)
     #[test]
     fn rankings_order_within_a_core_type_only() {
         let id = |core_type, rank| {
@@ -767,58 +844,28 @@ mod tests {
         assert_eq!(Ranking::of(None), None);
     }
 
-    /// S27-10: processors that differ only in their core-type codes get the same capacities,
-    /// under every source and none; the codes change only which pairs a ranking may order.
+    /// S27-10. No capacity can come from a core type: [`choose`] takes none. The one reader of a
+    /// core type, [`Ranking::compare`], only says which processors a ranking may order: never two
+    /// of different types, and within one type only by their rankings, whatever the codes are.
     #[test]
-    fn no_capacity_from_a_core_type() {
+    fn a_core_type_only_scopes_a_ranking() {
         let mut rng = Rng::new(0x5332_3731);
-        for case in 0..cases(2000) {
-            let n = 1 + rng.below(12);
-            let draw = |rng: &mut Rng| -> Option<Vec<Option<u32>>> {
-                (rng.below(3) != 0).then(|| {
-                    (0..n)
-                        .map(|_| (rng.below(8) != 0).then(|| rng.below(256) as u32))
-                        .collect()
+        for case in 0..cases(4000) {
+            let id = |rng: &mut Rng| {
+                Some(CoreIdentity {
+                    core_type: rng.below(4) as u8,
+                    native_model: rng.below(16) as u32,
+                    efficiency_rank: (rng.below(5) != 0).then(|| rng.byte()),
                 })
             };
-            let (hfi, cpc, register) = (draw(&mut rng), draw(&mut rng), draw(&mut rng));
-            let reports = Reports {
-                hfi: hfi.as_deref(),
-                cpc: cpc.as_deref(),
-                register: register.as_deref(),
-            };
-            let rank = |core_type: u8| {
-                Ranking::of(Some(CoreIdentity {
-                    core_type,
-                    native_model: 0,
-                    efficiency_rank: Some(1),
-                }))
-            };
-            // The same reports under two assignments of core types.
-            let one: Vec<u8> = (0..n).map(|_| rng.below(16) as u8).collect();
-            let other: Vec<u8> = (0..n).map(|_| rng.below(16) as u8).collect();
-            let (source, capacities) = choose(n, &reports);
-            for types in [&one, &other] {
-                let _ranks: Vec<Option<Ranking>> = types.iter().map(|&t| rank(t)).collect();
-                assert_eq!(
-                    choose(n, &reports),
-                    (source, capacities.clone()),
-                    "case {case}"
-                );
-            }
-            assert_eq!(capacities.len(), n, "case {case}");
-            assert!(capacities.iter().all(|&v| v <= FULL), "case {case}");
-            assert!(
-                capacities.contains(&FULL),
-                "case {case}: the largest is full"
-            );
-            // Across types a ranking orders nothing; within one, only by rank.
-            if n >= 2 && one[0] != one[1] {
-                assert_eq!(
-                    Ranking::compare(rank(one[0]), rank(one[1])),
-                    None,
-                    "case {case}"
-                );
+            let (a, b) = (id(&mut rng), id(&mut rng));
+            let order = Ranking::compare(Ranking::of(a), Ranking::of(b));
+            let (a, b) = (a.unwrap(), b.unwrap());
+            match (a.efficiency_rank, b.efficiency_rank) {
+                (Some(x), Some(y)) if a.core_type == b.core_type => {
+                    assert_eq!(order, Some(x.cmp(&y)), "case {case}");
+                }
+                _ => assert_eq!(order, None, "case {case}"),
             }
         }
     }
