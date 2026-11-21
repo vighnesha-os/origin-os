@@ -1303,8 +1303,13 @@ Its findings rank first a silent halt after a failed `ExitBootServices`, the loa
   - the tool's ledger, which holds three rentals at $2.43 of the $10 cap.
 - **Performance cost** (ADR-0018 V3):
   - **342:** none, by construction, on a boot that succeeds, since the line runs only on the failure path.
-  - **343:** money, not run time. Its worst case is two clock hours, $4.06 a rental. With one small-board run (at most $1.62), the ledger would reach at most $8.11 of the cap.
+  - **343:** money, not run time. Its worst case is two clock hours, about $8.12 a rental at the likely hourly price (see the correction below).
 - **The board is bench equipment** (item 233). Its cores are Zen 4, outside ADR-0009 Amendment 1's scope, so it qualifies nothing.
+- **Corrected after the answer: the price of item 343's board.** The $2.03 figure is from the provider's pricing page, whose "/hr" figure is the monthly price over 730 hours, as item 224's correction found. Hourly billing through the API has been about twice the page's figure:
+  - `m4.metal.small`: page $0.41, billed $0.81;
+  - `f4.metal.large`: page $2.62, API $5.25.
+
+  So `m4.metal.large` is likely about $4.06 an hour, and its worst case of two clock hours about $8.12. With $2.43 in the ledger, that passes item 225's $10 cap, so the tool will refuse to rent it unless the owner raises the cap. Adding it to the tool's plans spends nothing. TASKS item 112's read-only preflight reads the real price.
 - **Where they are written:** TASKS item 112 builds both:
   - the normal loader's line, with the amendment text for ADR-0002 B5 and ADR-0010 drafted in its records, which lands with it;
   - the tool's allowed plans, with offline tests, the API's slug and site code confirmed by a read-only preflight.
