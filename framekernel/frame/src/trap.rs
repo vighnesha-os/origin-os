@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::once::SetOnce;
 use crate::told::Shown;
@@ -34,6 +35,237 @@ impl Switch {
     pub(crate) const fn new() -> Self {
         Self { _here: PhantomData }
     }
+
+    /// The witness of this switch point (ADR-0020 S3): the trap entry runs with interrupts off,
+    /// and a scheduling hook chooses what this processor runs next without leaving the processor
+    /// itself, so nothing that holds this borrow can be moved before the hook returns.
+    pub fn here(&self) -> Here<'_> {
+        Here { _here: PhantomData }
+    }
+}
+
+/// A witness that the code holding it runs on one processor, and cannot leave it while the witness
+/// lives (ADR-0020 S3; TASKS item 93). The processor index is read only under one
+/// (`cpu::this_cpu`), and this processor's entry of a per-processor table is lent only for its
+/// life (`PerCpu::this`).
+///
+/// **Who makes one.**
+/// - An interrupts-off section, `cpu::without_interrupts_here`. Its closure takes the witness for
+///   any lifetime it is given, so nothing bound to that lifetime can be returned from it.
+/// - The trap entry: [`Switch::here`] for the scheduling hooks, and its own for the device handlers
+///   and its own checks.
+/// - [`Pinned::here`].
+///
+/// Nothing else can: the field is private. It is zero-sized and `Copy`, and neither `Send` nor
+/// `Sync`, so it never reaches another thread.
+///
+/// **What a section's or the trap entry's witness rests on.** It holds only while nothing its
+/// holder runs switches the holder out. Code holding one never enables interrupts, opens an
+/// interrupt window, idles, yields, sleeps, blocks or exits. A software interrupt is not masked by
+/// the interrupt flag, so a yield inside a section would still switch the thread out. Code whose
+/// body may be switched out takes a [`Pinned`] instead (the coordinating session's ruling Q2).
+///
+/// The witness is valid inside its section:
+///
+/// ```
+/// let read = origin_frame::trap::host_section(|here| {
+///     let _ = here;
+///     1
+/// });
+/// assert_eq!(read, 1);
+/// ```
+///
+/// It cannot be returned from it:
+///
+/// ```compile_fail
+/// let escaped = origin_frame::trap::host_section(|here| here);
+/// ```
+///
+/// Nor sent to another thread:
+///
+/// ```compile_fail,E0277
+/// fn send<T: Send>(_: T) {}
+/// origin_frame::trap::host_section(|here| send(here));
+/// ```
+#[derive(Clone, Copy)]
+pub struct Here<'a> {
+    _here: PhantomData<(*const (), &'a ())>,
+}
+
+// Never an address or an index: there is nothing in it to show.
+impl core::fmt::Debug for Here<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Here")
+    }
+}
+
+impl Here<'_> {
+    /// For the framework's makers of a witness, each named in the type's documentation (the
+    /// kernel's target only, where they exist).
+    #[cfg(target_os = "none")]
+    pub(crate) const fn new() -> Self {
+        Self { _here: PhantomData }
+    }
+}
+
+/// A witness that the code holding it stays on its processor while the witness lives, **even if it
+/// is switched out meanwhile** (ADR-0020 S2; TASKS item 93, the coordinating session's ruling Q2).
+///
+/// Two things give one:
+/// - **a pin the running thread holds** (`sched::pin`), turned into a witness only through the
+///   [`PinMint`];
+/// - **the boot or idle flow** (`cpu::flow`). A flow has no record, and never moves (S2, point 4).
+///
+/// It gives a [`Here`] for the same life. A function whose body may be switched out takes a
+/// `Pinned`, never a `Here`.
+///
+/// It cannot outlive the pin it was made from:
+///
+/// ```compile_fail,E0505
+/// struct Guard;
+/// let mint = origin_frame::trap::host_mint();
+/// let guard = Guard;
+/// let pinned = mint.pinned(&guard);
+/// drop(guard);
+/// let _ = pinned.here();
+/// ```
+///
+/// Nor be sent to another thread:
+///
+/// ```compile_fail,E0277
+/// fn send<T: Send>(_: T) {}
+/// struct Guard;
+/// let mint = origin_frame::trap::host_mint();
+/// let guard = Guard;
+/// send(mint.pinned(&guard));
+/// ```
+#[derive(Clone, Copy)]
+pub struct Pinned<'a> {
+    _here: PhantomData<(*const (), &'a ())>,
+}
+
+// As `Here`'s.
+impl core::fmt::Debug for Pinned<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Pinned")
+    }
+}
+
+impl<'a> Pinned<'a> {
+    /// For `cpu::flow`, the boot or idle flow's maker (the kernel's target only).
+    #[cfg(target_os = "none")]
+    pub(crate) const fn new() -> Self {
+        Self { _here: PhantomData }
+    }
+
+    /// The same witness, for what a section's witness reads.
+    pub fn here(self) -> Here<'a> {
+        Here { _here: PhantomData }
+    }
+}
+
+/// The right to turn the running thread's pin into a [`Pinned`] (ADR-0020 S2 and S3; TASKS item
+/// 93, the coordinating session's ruling Q3).
+///
+/// Exactly one is ever made:
+/// - [`take_pin_mint`] hands it out once, to the scheduler, before any thread exists.
+/// - The scheduler keeps it in a `static` of its own, a [`MintHolder`] that no other module names.
+/// - A second take stops the kernel, and so does a pin asked for before the mint was kept.
+///
+/// So the only witnesses that survive a switch are the scheduler's pins and the flows'. The
+/// scheduler raises the running thread's pin count before it asks for a witness, on every path.
+#[derive(Debug)]
+pub struct PinMint {
+    _one: (),
+}
+
+impl PinMint {
+    /// The witness of a pin that the caller raised on the running thread and holds as `pin`, for
+    /// as long as `pin` is borrowed.
+    pub fn pinned<'a, G>(&self, _pin: &'a G) -> Pinned<'a> {
+        Pinned { _here: PhantomData }
+    }
+
+    /// The witness of a pin that the caller raised on the running thread and never lowers: an
+    /// ending thread's (ADR-0020 S2, point 2).
+    pub fn pinned_for_good(&self) -> Pinned<'static> {
+        Pinned { _here: PhantomData }
+    }
+}
+
+/// Whether the kernel's one [`PinMint`] has been handed out.
+static PIN_MINT_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// The kernel's one [`PinMint`]. The scheduler takes it, before any thread exists. A second call
+/// stops the kernel: the mint is the scheduler's alone.
+pub fn take_pin_mint() -> PinMint {
+    take_mint_from(&PIN_MINT_TAKEN)
+}
+
+/// The mint `taken` says has not been handed out yet, or a stop.
+fn take_mint_from(taken: &AtomicBool) -> PinMint {
+    assert!(
+        !taken.swap(true, Ordering::AcqRel),
+        "the pin's mint was taken twice"
+    );
+    PinMint { _one: () }
+}
+
+/// Where the scheduler keeps the [`PinMint`]: one `static` of its own (the ruling's Q3).
+#[derive(Debug)]
+pub struct MintHolder(SetOnce<PinMint>);
+
+impl MintHolder {
+    /// A holder with no mint yet.
+    pub const fn new() -> Self {
+        Self(SetOnce::new())
+    }
+
+    /// Keeps `mint`. The kernel stops if this holder already holds one.
+    pub fn keep(&self, mint: PinMint) {
+        assert!(self.0.set(mint).is_ok(), "a second pin mint was kept");
+    }
+
+    /// The mint. The kernel stops if none was kept: a pin was asked for before the scheduler had
+    /// taken the mint.
+    pub fn mint(&self) -> &PinMint {
+        match self.0.get() {
+            Some(mint) => mint,
+            None => panic!("a pin was asked for before the scheduler took the pin's mint"),
+        }
+    }
+}
+
+impl Default for MintHolder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Whether a processor whose table of contexts names `running_home` as its running context's home
+/// runs its boot or idle flow (`cpu::flow`; TASKS item 93, the coordinating session's ruling Q6):
+/// - `None`: no switch yet, so the flow is the only context that has run;
+/// - the flow's own home, `BOOT_FLOW`.
+///
+/// A thread's home is refused.
+#[cfg(any(test, target_os = "none"))]
+pub(crate) fn runs_a_flow(running_home: Option<u64>) -> bool {
+    running_home.is_none_or(|home| home == crate::sync::contexts::BOOT_FLOW)
+}
+
+/// For the host's tests and doctests only, where there is no processor index: runs `f` with a
+/// [`Here`], as an interrupts-off section does on the kernel's target. It is absent from the
+/// kernel's build, so no kernel code can make a witness this way.
+#[cfg(not(target_os = "none"))]
+pub fn host_section<T>(f: impl for<'a> FnOnce(Here<'a>) -> T) -> T {
+    f(Here { _here: PhantomData })
+}
+
+/// For the host's tests and doctests only: a [`PinMint`] apart from the kernel's one. It is absent
+/// from the kernel's build.
+#[cfg(not(target_os = "none"))]
+pub fn host_mint() -> PinMint {
+    PinMint { _one: () }
 }
 
 /// What a system call's upcall asks for.
@@ -291,5 +523,79 @@ mod tests {
             assert!(!holds(&text, addr as u64), "{text} holds {addr:#x}");
         }
         assert!(!text.contains("0x"), "{text}");
+    }
+
+    /// The mint is handed out once; a second take stops the kernel (the ruling's Q3).
+    #[test]
+    #[should_panic(expected = "the pin's mint was taken twice")]
+    fn the_pin_mint_taken_twice_stops() {
+        let taken = AtomicBool::new(false);
+        let first = take_mint_from(&taken);
+        let _ = first.pinned_for_good();
+        let _second = take_mint_from(&taken);
+    }
+
+    /// A holder that never kept the mint stops the kernel when a pin asks for it: the scheduler
+    /// had not taken it (the ruling's Q3, "not at all").
+    #[test]
+    #[should_panic(expected = "a pin was asked for before the scheduler took the pin's mint")]
+    fn a_pin_without_the_mint_stops() {
+        let holder = MintHolder::new();
+        let _ = holder.mint();
+    }
+
+    /// A holder keeps one mint: a second stops the kernel.
+    #[test]
+    #[should_panic(expected = "a second pin mint was kept")]
+    fn a_second_mint_kept_stops() {
+        let holder = MintHolder::new();
+        holder.keep(host_mint());
+        holder.keep(host_mint());
+    }
+
+    /// The flow check over a real table of contexts (the ruling's Q6): no running home, then a
+    /// thread's home, which is refused, then the flow's own.
+    #[test]
+    fn only_a_flow_passes_the_flow_check() {
+        use crate::sync::contexts::{BOOT_FLOW, Contexts};
+        let table = Contexts::new();
+        assert_eq!(table.running_home(), None);
+        assert!(runs_a_flow(table.running_home()), "no switch yet");
+        // A thread's first frame, inside a stack of the region's kind: its home is that frame.
+        let thread = 0xffff_c000_0001_ff40;
+        assert!(table.publish(thread));
+        let boot_flow_frame = 0x9000;
+        let on_nothing = |_| false;
+        assert!(
+            table
+                .switch(boot_flow_frame, thread, false, on_nothing)
+                .is_ok()
+        );
+        assert_eq!(table.running_home(), Some(thread));
+        assert!(
+            !runs_a_flow(table.running_home()),
+            "a thread's home is refused"
+        );
+        assert!(
+            table
+                .switch(thread - 0x200, boot_flow_frame, false, on_nothing)
+                .is_ok()
+        );
+        assert_eq!(table.running_home(), Some(BOOT_FLOW));
+        assert!(runs_a_flow(table.running_home()), "the flow's own home");
+    }
+
+    /// A holder that kept the mint lends it, and the witnesses carry no state.
+    #[test]
+    fn a_kept_mint_is_lent() {
+        let taken = AtomicBool::new(false);
+        let holder = MintHolder::new();
+        holder.keep(take_mint_from(&taken));
+        let pin = ();
+        let pinned = holder.mint().pinned(&pin);
+        let _ = pinned.here();
+        assert_eq!(core::mem::size_of::<Here<'_>>(), 0);
+        assert_eq!(core::mem::size_of::<Pinned<'_>>(), 0);
+        assert_eq!(format!("{:?} {pinned:?}", pinned.here()), "Here Pinned");
     }
 }

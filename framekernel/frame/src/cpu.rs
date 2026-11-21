@@ -1699,6 +1699,81 @@ pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// [`without_interrupts`], with the section's witness (ADR-0020 S3; TASKS item 93). `f` reads the
+/// processor index, and this processor's entries of per-processor tables, under it. The closure
+/// takes the witness for any lifetime it is given, so nothing bound to that lifetime can leave it.
+///
+/// `f` must not enable interrupts, open an interrupt window, idle, yield, sleep, block or exit.
+/// Any of those would let the thread be switched out inside the section, where the witness says it
+/// cannot be (`trap::Here`).
+pub fn without_interrupts_here<T>(f: impl for<'a> FnOnce(crate::trap::Here<'a>) -> T) -> T {
+    without_interrupts(|| f(crate::trap::Here::new()))
+}
+
+/// This processor's CPU index, read under a witness that the reader cannot leave the processor
+/// (ADR-0020 S3), and branded with the witness's life ([`ThisCpu`]). The name is TASKS item 93's,
+/// for while both forms exist: its last step removes the form without a witness and gives this one
+/// the name `this_cpu`.
+pub fn this_cpu_at(here: crate::trap::Here<'_>) -> ThisCpu<'_> {
+    ThisCpu {
+        index: this_cpu(),
+        here,
+    }
+}
+
+/// This processor's CPU index, read once under a witness and branded with its life (ADR-0020 S3;
+/// TASKS item 93, the coordinating session's ruling Q4).
+///
+/// Every lookup of this processor's own entry of a per-processor table goes through it
+/// (`PerCpu::this`), and is lent for that life. So no such entry is used after its reader might
+/// have left the processor, and one read of the index serves every lookup under one witness, as
+/// one read served them before.
+///
+/// [`ThisCpu::index`] gives the plain index, as a value only: one to compare, print or record as
+/// a fact about the moment it was read.
+#[derive(Clone, Copy, Debug)]
+pub struct ThisCpu<'a> {
+    index: CpuIndex,
+    here: crate::trap::Here<'a>,
+}
+
+impl<'a> ThisCpu<'a> {
+    /// The index, as a value (see the type's documentation).
+    #[inline]
+    pub fn index(self) -> CpuIndex {
+        self.index
+    }
+
+    /// The witness it was read under.
+    #[inline]
+    pub fn here(self) -> crate::trap::Here<'a> {
+        self.here
+    }
+}
+
+/// The boot or idle flow's witness (ADR-0020 S2, point 4; TASKS item 93, the coordinating
+/// session's ruling Q6): `Some` if the context running on this processor is the processor's boot
+/// or idle flow, `None` on a thread.
+///
+/// A flow has no record and never moves, and it never becomes a thread. So the witness holds for
+/// the flow's whole life. Each flow takes it once, at its entry, and passes it down.
+///
+/// It is the flow if:
+/// - the descriptor tables are not loaded yet, so nothing but the boot flow has run;
+/// - this processor has no table of contexts, so no thread can have been switched in;
+/// - or its table names no running home (no switch yet) or the flow's own (`trap::runs_a_flow`).
+///
+/// It is read with interrupts off, since only this processor's switches write the running slot.
+pub fn flow() -> Option<crate::trap::Pinned<'static>> {
+    let runs = without_interrupts(|| {
+        !tables_ready()
+            || CONTEXTS
+                .get(this_cpu().get())
+                .is_none_or(|table| crate::trap::runs_a_flow(table.running_home()))
+    });
+    runs.then(crate::trap::Pinned::new)
+}
+
 /// CR3: the physical address of the live PML4 (and, with PCIDs off, nothing else).
 pub fn read_cr3() -> u64 {
     let value: u64;
