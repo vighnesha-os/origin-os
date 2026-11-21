@@ -50,6 +50,10 @@ const FILES: &[(&str, &str)] = &[
         "boot/uefi/src/bench.rs",
         "the bench loader's lines and switch",
     ),
+    (
+        "boot/uefi/src/fch.rs",
+        "the bench loader's FCH reads and reset (TASKS item 121)",
+    ),
     ("framekernel/frame/src/bench.rs", "the breadcrumbs"),
     ("boot/uefi/src/lib.rs", "the bench loader's module"),
     (
@@ -315,6 +319,26 @@ const FADT_WRITE: &str =
 /// 7 s, and room for a slow host.
 const RESET_WITHIN: Duration = Duration::from_secs(30);
 
+// TASKS item 121: the FCH's lines on the loader's console, and how long QEMU took to exit.
+const NO_FCH: &str = "origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it";
+const FCH_SWITCH: &str = "origin-boot: bench build: BENCH-FCH: the FCH's registers are not read; the switch's values stand in for them";
+const FCH_WHERE: &str = "origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): ";
+/// QEMU's DSDT describes no region there, on an AMD processor; or the processor is not AMD's.
+const FCH_QEMU_NOT_READ: [&str; 2] = [
+    "not read, the DSDT describes no system-memory region with constant bounds that holds it",
+    "not read, the processor is not AMD's",
+];
+const FCH_BY_SWITCH: &str = "not read; BENCH-FCH's values stand in";
+const FCH_REGISTERS: &str = "origin-boot: bench build: the FCH's registers (BENCH-FCH's): ";
+const FCH_NO_CONTROL: &str = "origin-boot: bench build: no FCH control: ExitBootServices is called, and Amendment 3's path follows it";
+const FCH_CONTROL: &str = "origin-boot: bench build: the last reset was not this loader's (the reset pin (bit 16)): the boot's first run, the control: 0x06 to 0xcf9 now, and ExitBootServices is not called";
+const FCH_AFTER_CALL: &str = "origin-boot: bench build: the last reset was this loader's own, 0x06 to 0xcf9 (PMxC0 bit 19): ExitBootServices is called, then 0x06 to 0xcf9 as the first thing after it returns, then a triple fault";
+const FCH_CONTRADICTS: &str = "origin-boot: bench build: the FCH's registers contradict AMD's documents (PMx00 reads all ones): no control; ExitBootServices is called, and Amendment 3's path follows it";
+const FCH_CONTROL_FAILED: &str = "origin-boot: bench build: 0xcf9 did not reset the machine within 100 ms: ExitBootServices is called, and Amendment 3's path follows it";
+/// A reset through `0xCF9` ends QEMU at once; the triple fault comes after `slow`'s 5 s wait.
+const CF9_AT_ONCE: Duration = Duration::from_millis(2_500);
+const AFTER_THE_WAIT: Duration = Duration::from_secs(4);
+
 /// The SPCR naming COM2, as `boot-console`'s scenario gives it.
 fn spcr(work: &Path) -> Result<Vec<String>> {
     crate::spcr_args(
@@ -368,6 +392,36 @@ fn spcr_disturb(work: &Path) -> Result<Vec<String>> {
     spcr(work)
 }
 
+/// `BENCH-FCH` with `words` (TASKS item 121).
+fn fch(work: &Path, words: &[u8]) -> Result<Vec<String>> {
+    write_switch(work, "BENCH-FCH", words)?;
+    spcr(work)
+}
+
+fn fch_first(work: &Path) -> Result<Vec<String>> {
+    fch(work, b"first\n")
+}
+
+fn fch_mine(work: &Path) -> Result<Vec<String>> {
+    fch(work, b"mine slow\n")
+}
+
+fn fch_mine_nocf9(work: &Path) -> Result<Vec<String>> {
+    fch(work, b"mine nocf9 slow\n")
+}
+
+fn fch_mine_neither(work: &Path) -> Result<Vec<String>> {
+    fch(work, b"mine nocf9 noshutdown slow\n")
+}
+
+fn fch_bad(work: &Path) -> Result<Vec<String>> {
+    fch(work, b"bad\n")
+}
+
+fn fch_first_nocf9(work: &Path) -> Result<Vec<String>> {
+    fch(work, b"first nocf9\n")
+}
+
 /// The kernel's markers on the SPCR's UART, as `boot-console`'s SPCR scenario has them, with the
 /// bench kernel's line after the line naming the UART.
 fn kernel_markers(said: &str) -> Vec<String> {
@@ -401,7 +455,8 @@ fn scenario(
     }
 }
 
-/// The seven scenarios of [`boot`].
+/// The thirteen scenarios of [`boot`]: TASKS item 112's four, TASKS item 116's three, and TASKS
+/// item 121's six.
 fn scenarios() -> Vec<Scenario> {
     let with_crumbs = |first: &str| {
         let mut m = vec![
@@ -470,6 +525,60 @@ fn scenarios() -> Vec<Scenario> {
             check_normal_loader,
             None,
         ),
+        scenario(
+            "bench: FCH first, the control through 0xCF9 before the call",
+            Loader::Bench,
+            lines(&[FCH_REGISTERS, FCH_CONTROL]),
+            fch_first,
+            check_fch_control,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: FCH mine, 0xCF9 at once after the call",
+            Loader::Bench,
+            lines(&[FCH_AFTER_CALL, BEFORE_CALL, LAST_LOADER_LINE]),
+            fch_mine,
+            check_fch_cf9,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: FCH mine nocf9, the triple fault after the wait",
+            Loader::Bench,
+            lines(&[FCH_AFTER_CALL, BEFORE_CALL, LAST_LOADER_LINE]),
+            fch_mine_nocf9,
+            check_fch_triple_fault,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: FCH mine nocf9 noshutdown, Amendment 3's order after them",
+            Loader::Bench,
+            lines(&[FCH_AFTER_CALL, FIRST_CALL, AFTER_CALL, RESET_SOON]),
+            fch_mine_neither,
+            check_fch_fall_through,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: FCH bad, a layout that contradicts AMD's documents",
+            Loader::Bench,
+            lines(&[FCH_CONTRADICTS, FIRST_CALL, AFTER_CALL, RESET_SOON]),
+            fch_bad,
+            check_fch_contradicts,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: FCH first nocf9, a control that does not reset",
+            Loader::Bench,
+            lines(&[
+                FCH_CONTROL,
+                FCH_CONTROL_FAILED,
+                FIRST_CALL,
+                AFTER_CALL,
+                RESET_SOON,
+            ]),
+            fch_first_nocf9,
+            check_fch_control_failed,
+            Some(RESET_WITHIN),
+        ),
     ]
 }
 
@@ -499,6 +608,7 @@ fn check_loader_console(done: &Completed, switch_line: &str, after_line: &str) -
             }
         }
     }
+    check_fch_lines(&com1, last)?;
     let state = com1
         .lines()
         .find(|l| l.starts_with(STATE))
@@ -708,6 +818,152 @@ fn check_disturbed(done: &Completed, _settings: &Settings) -> Result {
     Ok(())
 }
 
+/// TASKS item 121's lines on the loader's console, before `before` (a byte offset in `com1`): with
+/// no `BENCH-FCH`, the line saying so, the FCH's block not read under QEMU (no region in its DSDT,
+/// or not an AMD processor), and no control; with it, the switch's values and the registers'
+/// line.
+fn check_fch_lines(com1: &str, before: usize) -> Result {
+    let line_at = |start: &str| {
+        com1.find(start)
+            .filter(|&i| i < before)
+            .map(|i| com1[i..].lines().next().unwrap_or_default())
+    };
+    let where_line = line_at(FCH_WHERE)
+        .ok_or_else(|| format!("COM1 lacks {FCH_WHERE:?} before the loader's last line"))?;
+    let tail = &where_line[FCH_WHERE.len()..];
+    let wanted: &[&str] = if line_at(FCH_SWITCH).is_some() {
+        if tail != FCH_BY_SWITCH {
+            return Err(format!(
+                "with BENCH-FCH the FCH's line should say {FCH_BY_SWITCH:?}: {where_line:?}"
+            ));
+        }
+        &[FCH_REGISTERS]
+    } else {
+        if !FCH_QEMU_NOT_READ.contains(&tail) {
+            return Err(format!(
+                "under QEMU, with no BENCH-FCH, the FCH's block is not read: {where_line:?}"
+            ));
+        }
+        &[NO_FCH, FCH_NO_CONTROL]
+    };
+    for needle in wanted {
+        if line_at(needle).is_none() {
+            return Err(format!(
+                "COM1 lacks {needle:?} before the loader's last line"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The registers' line and `decision` on COM1, the loader's console; and QEMU exited by itself.
+fn check_fch_decided(done: &Completed, decision: &str) -> Result {
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    for needle in [FCH_SWITCH, FCH_REGISTERS, decision] {
+        if !com1.contains(needle) {
+            return Err(format!(
+                "COM1, the bench loader's console, lacks {needle:?}"
+            ));
+        }
+    }
+    if !done.exited {
+        return Err(format!(
+            "QEMU did not exit within {} s, with a success status: the machine was not reset",
+            RESET_WITHIN.as_secs()
+        ));
+    }
+    Ok(())
+}
+
+/// The boot's first run: the control line is the loader's last, and QEMU exits. The call is never
+/// made: no line straight to the UART, no mark, no last line.
+fn check_fch_control(done: &Completed, _settings: &Settings) -> Result {
+    check_fch_decided(done, FCH_CONTROL)?;
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    let uart = serial::clean(done.serial.as_bytes());
+    if com1.contains(FCH_CONTROL_FAILED) || com1.contains(LAST_LOADER_LINE) {
+        return Err("the loader went on after the control: 0xCF9 did not reset the machine".into());
+    }
+    if uart.contains(BEFORE_CALL) || uart.lines().any(|l| l == MARK_FIRST) {
+        return Err("the line before the call or its mark was written: the call was made".into());
+    }
+    let last = com1.lines().rev().find(|l| l.starts_with("origin-boot:"));
+    if last != Some(FCH_CONTROL) {
+        return Err(format!(
+            "the loader's last line should be the control's: {last:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// A run after the loader's own reset: the mark, then nothing, and QEMU exits at once: `0xCF9`,
+/// before the triple fault's wait.
+fn check_fch_cf9(done: &Completed, _settings: &Settings) -> Result {
+    check_fch_decided(done, FCH_AFTER_CALL)?;
+    check_after(done, &[MARK_FIRST], true)?;
+    match done.quiet_before_exit {
+        Some(quiet) if quiet < CF9_AT_ONCE => Ok(()),
+        other => Err(format!(
+            "QEMU should exit within {} ms of the mark, by 0xCF9; it took {other:?}",
+            CF9_AT_ONCE.as_millis()
+        )),
+    }
+}
+
+/// With no `0xCF9` write: the mark, then nothing, and QEMU exits only after the wait: the triple
+/// fault.
+fn check_fch_triple_fault(done: &Completed, _settings: &Settings) -> Result {
+    check_fch_decided(done, FCH_AFTER_CALL)?;
+    check_after(done, &[MARK_FIRST], true)?;
+    match done.quiet_before_exit {
+        Some(quiet) if quiet >= AFTER_THE_WAIT => Ok(()),
+        other => Err(format!(
+            "QEMU should exit {} s or more after the mark, by the triple fault after the wait; it took {other:?}",
+            AFTER_THE_WAIT.as_secs()
+        )),
+    }
+}
+
+/// With neither: the mark, then TASKS item 116's path, and `ResetSystem` resets the machine.
+fn check_fch_fall_through(done: &Completed, _settings: &Settings) -> Result {
+    check_fch_decided(done, FCH_AFTER_CALL)?;
+    check_after(
+        done,
+        &[MARK_FIRST, FIRST_CALL, AFTER_FIRST, RESET_SOON],
+        true,
+    )
+}
+
+/// A layout that contradicts the documents: no control, and TASKS item 116's path after the call.
+fn check_fch_contradicts(done: &Completed, _settings: &Settings) -> Result {
+    check_fch_decided(done, FCH_CONTRADICTS)?;
+    check_after(
+        done,
+        &[MARK_FIRST, FIRST_CALL, AFTER_FIRST, RESET_SOON],
+        true,
+    )
+}
+
+/// A control whose `0xCF9` does not reset: its line, the line saying so, then the call and TASKS
+/// item 116's path.
+fn check_fch_control_failed(done: &Completed, _settings: &Settings) -> Result {
+    check_fch_decided(done, FCH_CONTROL_FAILED)?;
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    match (com1.find(FCH_CONTROL), com1.find(FCH_CONTROL_FAILED)) {
+        (Some(a), Some(b)) if a < b => {}
+        _ => {
+            return Err(
+                "COM1 should hold the control's line, then the line saying it did not reset".into(),
+            );
+        }
+    }
+    check_after(
+        done,
+        &[MARK_FIRST, FIRST_CALL, AFTER_FIRST, RESET_SOON],
+        true,
+    )
+}
+
 /// A bench kernel under the normal loader: no breadcrumb anywhere, the line saying so, and the
 /// boot otherwise as `boot-console`'s SPCR scenario requires.
 fn check_normal_loader(done: &Completed, settings: &Settings) -> Result {
@@ -755,7 +1011,7 @@ pub(crate) fn boot(settings: &Settings) -> Result {
         run_scenario(scenario, kernel, settings)?;
     }
     println!(
-        "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, the bench kernel under the normal loader, the reset through ResetSystem, through the FADT's register, and a disturbed UART written back) in {} s",
+        "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, the bench kernel under the normal loader, the reset through ResetSystem, through the FADT's register, a disturbed UART written back, and the FCH's six: the control, 0xCF9 after the call, the triple fault, the fall-through, a contradicting layout, and a control that does not reset) in {} s",
         chosen.len(),
         all.len(),
         started.elapsed().as_secs()

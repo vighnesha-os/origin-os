@@ -489,18 +489,28 @@ pub enum NoReset {
 /// The longest FADT read: ACPI 6.6's is 276 bytes.
 pub const MAX_FADT_LENGTH: usize = 1024;
 
-/// The FADT's reset register (ACPI 6.6 §4.8.3.6, §5.2.9), checked as untrusted input: the RSDP
-/// and XSDT as the SPCR's walk checks them; the first FADT the XSDT lists, passed over only when
-/// the shared parser refuses it, and the end of the walk when it is longer than
-/// [`MAX_FADT_LENGTH`] or cannot be read whole, as the SPCR's walk does (T84-8); the kernel's own
-/// parser (`RESET_REG_SUP`, 8 bits at bit 0, the value present); then system I/O or system memory
-/// only, an I/O port from 1 to `0xFFFF`, and memory only where `is_mmio` says the firmware's map
-/// describes memory-mapped I/O. Every byte is read through `read`, as in `spcr::find`.
+/// The FADT's reset register (ACPI 6.6 §4.8.3.6, §5.2.9), checked as untrusted input: the FADT
+/// as [`with_fadt`] finds it; the kernel's own parser (`RESET_REG_SUP`, 8 bits at bit 0, the
+/// value present); then system I/O or system memory only, an I/O port from 1 to `0xFFFF`, and
+/// memory only where `is_mmio` says the firmware's map describes memory-mapped I/O.
 pub fn find_reset(
     rsdp: u64,
     read: &mut impl FnMut(u64, &mut [u8]) -> bool,
     is_mmio: impl Fn(u64) -> bool,
 ) -> Result<ResetRegister, NoReset> {
+    with_fadt(rsdp, read, |fadt, _| register(fadt, &is_mmio))?
+}
+
+/// The FADT, handed to `f` with `read` (TASKS items 116 and 121): the RSDP and XSDT as the SPCR's
+/// walk checks them; the first FADT the XSDT lists, passed over only when the shared parser
+/// refuses it, and the end of the walk when it is longer than [`MAX_FADT_LENGTH`] or cannot be
+/// read whole, as the SPCR's walk does (T84-8). Every byte is read through `read`, as in
+/// `spcr::find`.
+pub fn with_fadt<T>(
+    rsdp: u64,
+    read: &mut impl FnMut(u64, &mut [u8]) -> bool,
+    f: impl FnOnce(&Fadt<'_>, &mut dyn FnMut(u64, &mut [u8]) -> bool) -> T,
+) -> Result<T, NoReset> {
     let missing = |m| NoReset::Missing(m);
     if rsdp == 0 {
         return Err(missing(Missing::NoRsdp));
@@ -543,7 +553,7 @@ pub fn find_reset(
             return Err(NoReset::Unreadable(table));
         }
         match Fadt::parse(whole) {
-            Ok(fadt) => return register(&fadt, &is_mmio),
+            Ok(fadt) => return Ok(f(&fadt, read)),
             // A header that does not check: a later FADT may.
             Err(e) => {
                 refused.get_or_insert(NoReset::Table(e.kind));

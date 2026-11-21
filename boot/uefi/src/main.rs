@@ -28,6 +28,8 @@ use origin_boot_info::{
 #[cfg(origin_bench)]
 use origin_boot_uefi::bench;
 use origin_boot_uefi::console::ConOut;
+#[cfg(origin_bench)]
+use origin_boot_uefi::fch;
 use origin_boot_uefi::protocols::{
     ACPI_20_TABLE, ALLOCATE_ANY_PAGES, BOOT_SERVICES_SIGNATURE, BootServices, CONSOLE_OUT_DEVICE,
     ConfigurationTable, FILE_INFO, FILE_INFO_FILE_SIZE_OFFSET, FILE_MODE_READ, FileProtocol,
@@ -186,6 +188,16 @@ fn boot(
             .map(|(contents, len)| bench::After::from_contents(contents.get(..len).unwrap_or(&[])));
         let _ = writeln!(out, "{}{}", bench::PREFIX, bench::After::said(found));
         found.flatten().unwrap_or(bench::After::Reset)
+    };
+    // TASKS item 121: values in place of the FCH's registers, for QEMU scenarios only. A rented
+    // machine's volume never holds the file, so a rental reads the registers where the firmware's
+    // tables allow it.
+    #[cfg(origin_bench)]
+    let pretend = {
+        let found = read_bench_file(image, &bs, fch::SWITCH_PATH)
+            .map(|(contents, len)| fch::Pretend::from_contents(contents.get(..len).unwrap_or(&[])));
+        let _ = writeln!(out, "{}{}", bench::PREFIX, fch::Pretend::said(found));
+        found.flatten()
     };
 
     // B2: verify it.
@@ -411,6 +423,9 @@ fn boot(
     // TASKS item 116: the FADT's reset register, read in the same walk in a bench build.
     #[cfg(origin_bench)]
     let mut reset_register = Err(bench::NoReset::NoMap);
+    // TASKS item 121: the FCH's registers, read in the same walk in a bench build.
+    #[cfg(origin_bench)]
+    let mut fch_seen = FchSeen::not_read(fch::NotRead::NoFadt(bench::NoReset::NoMap));
     // ADR-0010 Amendment 3 (decision item 317; TASKS item 84): the UART the firmware's SPCR
     // names, for the kernel's first line. Read under boot services, only from memory the map
     // describes; no outcome stops the boot (ADR-0010 E5).
@@ -439,6 +454,7 @@ fn boot(
                     &mut |at, bytes| read_described(described, at, bytes),
                     |at| bench::in_mmio(described, at),
                 );
+                fch_seen = bench_fch_read(rsdp, described, pretend);
             }
             found.early_uart()
         }
@@ -636,7 +652,7 @@ fn boot(
     // TASKS item 116: the UART as the firmware left it, a line straight to it, and how the reset
     // will go.
     #[cfg(origin_bench)]
-    let plan = bench_before_call(st, &bs, early_uart, after, reset_register, out);
+    let plan = bench_before_call(st, &bs, early_uart, after, reset_register, fch_seen, out);
     let _ = writeln!(
         out,
         "origin-boot: exiting boot services; entering the Framekernel"
@@ -704,6 +720,13 @@ fn boot(
             // SAFETY: valid `ExitBootServices` with this image's handle and the key of the map
             // just obtained; nothing has been allocated since `GetMemoryMap`.
             let status = unsafe { exit(image, key) };
+            // TASKS item 121 (decision item 345, ADR-0002 Amendment 4): in a run whose last reset
+            // was the loader's own, nothing comes before this reset: no line, no register read,
+            // no write-back, whatever the call returned.
+            #[cfg(origin_bench)]
+            if let Some(free) = plan.free {
+                reset_without_firmware(free);
+            }
             calls.record(status);
             status
         },
@@ -1364,9 +1387,9 @@ fn rdmsr(msr: u32) -> u64 {
 
 /// Reads a bench switch, [`bench::STALE_KEY_PATH`] or [`bench::AFTER_PATH`], from the loader's
 /// volume, in a bench build: `None` if there is no such file, else its first bytes and how many
-/// were read. Reads at most 16 bytes into the stack: nothing is allocated.
+/// were read. Reads at most 32 bytes into the stack: nothing is allocated.
 #[cfg(origin_bench)]
-fn read_bench_file(image: Handle, bs: &BootServices, name: &str) -> Option<([u8; 16], usize)> {
+fn read_bench_file(image: Handle, bs: &BootServices, name: &str) -> Option<([u8; 32], usize)> {
     let loaded = protocol::<LoadedImageProtocol>(bs, image, &LOADED_IMAGE_PROTOCOL).ok()?;
     // SAFETY: `HandleProtocol` returned a live `EFI_LOADED_IMAGE_PROTOCOL` for this image.
     let device = unsafe { (*loaded).device_handle };
@@ -1387,7 +1410,7 @@ fn read_bench_file(image: Handle, bs: &BootServices, name: &str) -> Option<([u8;
     for (dst, b) in path.iter_mut().zip(name.bytes()) {
         *dst = u16::from(b);
     }
-    let mut contents = [0u8; 16];
+    let mut contents = [0u8; 32];
     let mut len = 0usize;
     let mut found = false;
     // SAFETY: `root` is a live file handle from `OpenVolume`.
@@ -1447,6 +1470,9 @@ struct BenchPlan {
     /// out whole and the UART then emptied, so a mark never waits between `GetMemoryMap` and
     /// `ExitBootServices` (TASKS item 116's review, R116-7).
     marks: bool,
+    /// TASKS item 121: the reset with no firmware code after the call, in a run whose last reset
+    /// was the loader's own.
+    free: Option<fch::Free>,
 }
 
 /// TASKS item 116, before `ExitBootServices`, under the firmware: the counter's rate over the
@@ -1460,6 +1486,7 @@ fn bench_before_call(
     early_uart: EarlyUart,
     after: bench::After,
     register: Result<bench::ResetRegister, bench::NoReset>,
+    fch_seen: FchSeen,
     out: &mut ConOut,
 ) -> BenchPlan {
     let (ticks_per_ms, counted) = bench::ticks_per_ms(count_ticks(bs));
@@ -1473,6 +1500,9 @@ fn bench_before_call(
             counted,
         }
     );
+    // TASKS item 121: the FCH's registers, the control in a boot's first run, or the reset after
+    // the call in a run that follows the loader's own.
+    let free = bench_fch_decide(fch_seen, ticks_per_ms, early_uart, out);
     // With interrupts masked: a firmware timer callback that wrote the UART while DLAB is set
     // would change its divisor (TASKS item 116's review, R116-6).
     let under = early_uart.is_present().then(|| {
@@ -1499,6 +1529,7 @@ fn bench_before_call(
         register,
         ticks_per_ms,
         marks,
+        free,
     }
 }
 
@@ -1687,6 +1718,262 @@ fn wait_ms(ticks_per_ms: u64, ms: u64) {
     while random::rdtsc().wrapping_sub(start) < goal {
         core::hint::spin_loop();
     }
+}
+
+/// TASKS item 121: what the table walk saw of the FCH's power-management block, settled before
+/// the page tables are built and said in [`bench_fch_decide`].
+#[cfg(origin_bench)]
+#[derive(Clone, Copy)]
+struct FchSeen {
+    /// Where the registers are, and whether they were read.
+    where_line: fch::WhereLine,
+    /// The registers, read or given by `BENCH-FCH`.
+    registers: Option<fch::Registers>,
+    /// The FADT's PM1a event block, in system I/O.
+    pm1a_event: Option<u16>,
+    /// `BENCH-FCH`, which only QEMU's ESP may hold.
+    pretend: Option<fch::Pretend>,
+}
+
+#[cfg(origin_bench)]
+impl FchSeen {
+    const fn not_read(why: fch::NotRead) -> Self {
+        Self {
+            where_line: fch::WhereLine::NotRead(why),
+            registers: None,
+            pm1a_event: None,
+            pretend: None,
+        }
+    }
+}
+
+/// TASKS item 121 (decision item 345, ADR-0002 Amendment 4), under boot services: the FCH's
+/// power-management registers, read only on an AMD processor, only where the firmware's DSDT
+/// describes a system-memory region holding them and its page tables map them, and only through
+/// loads; or `BENCH-FCH`'s values in their place. Every table and page-table byte is read from
+/// memory the firmware's map describes.
+#[cfg(origin_bench)]
+fn bench_fch_read(rsdp: u64, described: &[MemoryRegion], pretend: Option<fch::Pretend>) -> FchSeen {
+    if pretend.is_none() && !is_amd() {
+        return FchSeen::not_read(fch::NotRead::NotAmd);
+    }
+    let mut read = |at: u64, bytes: &mut [u8]| read_described(described, at, bytes);
+    let located = fch::locate(rsdp, &mut read);
+    let pm1a_event = located.ok().and_then(|l| l.pm1a_event);
+    if let Some(p) = pretend {
+        return FchSeen {
+            where_line: fch::WhereLine::Switch,
+            registers: Some(p.values(pm1a_event)),
+            pm1a_event,
+            pretend,
+        };
+    }
+    let region = match located.map(|l| l.region) {
+        Err(why) => return FchSeen::not_read(fch::NotRead::NoFadt(why)),
+        Ok(Err(why)) => return FchSeen::not_read(fch::NotRead::NoRegion(why)),
+        Ok(Ok(region)) => region,
+    };
+    let la57 = read_cr4() & (1 << 12) != 0;
+    let cr3 = read_cr3();
+    for at in [fch::PM_BLOCK, fch::PM_BLOCK + fch::SPAN - 1] {
+        match fch::walk(cr3, la57, at, &mut read) {
+            fch::Mapping::Mapped => {}
+            other => return FchSeen::not_read(fch::NotRead::NotMapped(other)),
+        }
+    }
+    FchSeen {
+        where_line: fch::WhereLine::Read(region, fch::map_says(described, fch::PM_BLOCK)),
+        registers: Some(read_fch_registers()),
+        pm1a_event,
+        pretend: None,
+    }
+}
+
+/// TASKS item 121, before the call, on the firmware's console: where the FCH's registers are,
+/// their values, and what the run does. In a boot's first run, the control: `0x06` to `0xCF9`
+/// once the UART has emptied, and if the machine still runs after the wait, a line saying so; the
+/// run then makes the call and takes Amendment 3's path. In a run whose last reset was the
+/// loader's own, what [`reset_without_firmware`] does after the call.
+#[cfg(origin_bench)]
+fn bench_fch_decide(
+    seen: FchSeen,
+    ticks_per_ms: u64,
+    early_uart: EarlyUart,
+    out: &mut ConOut,
+) -> Option<fch::Free> {
+    let _ = writeln!(out, "{}", seen.where_line);
+    let pretend = seen.pretend;
+    let Some(registers) = seen.registers else {
+        let _ = writeln!(
+            out,
+            "{}",
+            fch::DecisionLine {
+                decision: fch::Decision::NotRead,
+                pretend,
+            }
+        );
+        return None;
+    };
+    let _ = writeln!(
+        out,
+        "{}",
+        fch::RegistersLine {
+            registers,
+            read: pretend.is_none(),
+        }
+    );
+    let layout = fch::Layout::check(&registers, seen.pm1a_event);
+    let decision = if layout.fits() {
+        match fch::Branch::of(registers.reset_status) {
+            fch::Branch::First => fch::Decision::Control(registers.reset_status),
+            fch::Branch::Mine => fch::Decision::AfterCall,
+        }
+    } else {
+        fch::Decision::Contradicts(layout)
+    };
+    let _ = writeln!(out, "{}", fch::DecisionLine { decision, pretend });
+    let wait = pretend.map_or(fch::WAIT_MS, fch::Pretend::wait_ms);
+    let cf9 = !pretend.is_some_and(|p| p.no_cf9);
+    match decision {
+        fch::Decision::Control(_) => {
+            // The line just written is on the wire before the reset can cut it.
+            if early_uart.is_present() {
+                let _ = bench::drain(&mut LoaderPorts, early_uart.port);
+            }
+            if cf9 {
+                write_cf9();
+            }
+            wait_ms(ticks_per_ms, wait);
+            let _ = writeln!(out, "{}", fch::ControlFailed(wait));
+            None
+        }
+        fch::Decision::AfterCall => Some(fch::Free {
+            cf9,
+            shutdown: !pretend.is_some_and(|p| p.no_shutdown),
+            wait_ticks: ticks_per_ms.saturating_mul(wait),
+        }),
+        fch::Decision::NotRead | fch::Decision::Contradicts(_) => None,
+    }
+}
+
+/// TASKS item 121, after `ExitBootServices` returned, whatever its status, in a run whose last
+/// reset was the loader's own: `0x06` to `0xCF9` before anything else; interrupts masked; the wait
+/// by the time-stamp counter; then a triple fault. If the machine is still running after that
+/// (only when `BENCH-FCH` leaves the triple fault out), the caller goes on to TASKS item 116's path
+/// and Amendment 3's order.
+#[cfg(origin_bench)]
+#[inline(always)]
+fn reset_without_firmware(free: fch::Free) {
+    if free.cf9 {
+        write_cf9();
+    }
+    mask_interrupts();
+    wait_ticks(free.wait_ticks);
+    if free.shutdown {
+        triple_fault();
+    }
+}
+
+/// `0x06`, a warm reset, to the FCH's reset control port `0xCF9`.
+#[cfg(origin_bench)]
+#[inline(always)]
+fn write_cf9() {
+    // SAFETY: CPL 0; port 0xCF9 is the FCH's reset control register, and 0x06 its documented
+    // warm-reset command (AMD's FCH documents, TASKS item 121), written only to end a diagnostic
+    // run on a bench machine (decision item 345). It touches no memory, and OUT leaves the flags
+    // as they were.
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") fch::RESET_PORT, in("al") fch::WARM_RESET, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// A triple fault: an IDT with a zero limit, then a breakpoint.
+#[cfg(origin_bench)]
+fn triple_fault() -> ! {
+    // SAFETY: CPL 0, interrupts masked, after `ExitBootServices`, and only to end a diagnostic
+    // run (decision item 345). The block pushes 16 zero bytes and loads them as the IDT: limit 0,
+    // base 0. `int3` then finds no gate within the limit, nor do the #GP and the double fault that
+    // follow, so the processor shuts down (AMD64 APM Volume 2 §8.2.9). It does not return; `ud2`
+    // is never reached.
+    unsafe {
+        core::arch::asm!(
+            "push 0",
+            "push 0",
+            "lidt [rsp]",
+            "int3",
+            "ud2",
+            options(noreturn)
+        )
+    }
+}
+
+/// Spins until `ticks` time-stamp counter ticks have passed.
+#[cfg(origin_bench)]
+fn wait_ticks(ticks: u64) {
+    let start = random::rdtsc();
+    while random::rdtsc().wrapping_sub(start) < ticks {
+        core::hint::spin_loop();
+    }
+}
+
+/// Whether CPUID's vendor is AMD's: `AuthenticAMD` in EBX, EDX and ECX.
+#[cfg(origin_bench)]
+fn is_amd() -> bool {
+    let [_, ebx, ecx, edx] = cpuid(0);
+    (ebx, edx, ecx) == (0x6874_7541, 0x6974_6E65, 0x444D_4163)
+}
+
+/// CR3: the firmware's page tables, which stay loaded until the kernel is entered.
+#[cfg(origin_bench)]
+fn read_cr3() -> u64 {
+    let cr3: u64;
+    // SAFETY: as for `read_cr4`: CPL 0, and the flags are left undefined, so not claimed.
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    }
+    cr3
+}
+
+/// The FCH's power-management registers, each one volatile load of its documented width
+/// ([`fch::Registers`]).
+#[cfg(origin_bench)]
+fn read_fch_registers() -> fch::Registers {
+    fch::Registers {
+        decode_en: fch_read32(fch::DECODE_EN),
+        pci_control: fch_read32(fch::PCI_CONTROL),
+        pm1_evt_blk: fch_read16(fch::PM1_EVT_BLK),
+        acpi_config: fch_read32(fch::ACPI_CONFIG),
+        reset_status: fch_read32(fch::RESET_STATUS),
+        pmio_debug: fch_read8(fch::PMIO_DEBUG),
+    }
+}
+
+/// The 32-bit register at `offset` in the FCH's power-management block.
+#[cfg(origin_bench)]
+fn fch_read32(offset: u64) -> u32 {
+    // SAFETY: the FCH's power-management block, which the firmware's DSDT describes as system
+    // memory and its page tables, still loaded, map (`bench_fch_read` checked both before calling
+    // this); `offset` is a documented 32-bit register's, 4-aligned; one volatile load, with no
+    // effect AMD's documents name.
+    unsafe {
+        ptr::with_exposed_provenance::<u32>((fch::PM_BLOCK + offset) as usize).read_volatile()
+    }
+}
+
+/// The 16-bit register at `offset`.
+#[cfg(origin_bench)]
+fn fch_read16(offset: u64) -> u16 {
+    // SAFETY: as for `fch_read32`, for a documented 16-bit register, 2-aligned.
+    unsafe {
+        ptr::with_exposed_provenance::<u16>((fch::PM_BLOCK + offset) as usize).read_volatile()
+    }
+}
+
+/// The 8-bit register at `offset`.
+#[cfg(origin_bench)]
+fn fch_read8(offset: u64) -> u8 {
+    // SAFETY: as for `fch_read32`, for a documented 8-bit register.
+    unsafe { ptr::with_exposed_provenance::<u8>((fch::PM_BLOCK + offset) as usize).read_volatile() }
 }
 
 /// CPUID `leaf`, sub-leaf 0: `[eax, ebx, ecx, edx]`.
