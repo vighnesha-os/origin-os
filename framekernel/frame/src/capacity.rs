@@ -401,8 +401,9 @@ impl Ranking {
     }
 
     /// Which of two processors to prefer for performance, between processors of equal capacity:
-    /// the higher ranking, AMD's "lower value: lower power and possibly lower performance". Only
-    /// within one core type; across types, or where either has none, there is no order.
+    /// the higher ranking, since a lower value means less power, and perhaps less performance
+    /// (AMD APM Vol. 3 §E.4.24, paraphrased). Only within one core type; across types, or where
+    /// either has none, there is no order.
     pub fn compare(a: Option<Ranking>, b: Option<Ranking>) -> Option<Ordering> {
         match (a, b) {
             (Some(a), Some(b)) if a.core_type == b.core_type => Some(a.rank.cmp(&b.rank)),
