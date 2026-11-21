@@ -2025,7 +2025,7 @@ const CONTROLS: &[Control] = &[
         name: "moves_one_counter_by_parity",
         file: CONTEXTS,
         from: "    /// A move's start: the gate, then begun.
-    fn enter(&self) -> SpinGuard<'_, ()> {
+    fn enter(&self) -> GateGuard<'_> {
         let gate = self.gate.lock();
         let _ = self.begun.fetch_add(1, Relaxed);
         gate
@@ -2048,7 +2048,7 @@ const CONTROLS: &[Control] = &[
     }
 ",
         to: "    /// A move's start: the counter, then the gate.
-    fn enter(&self) -> SpinGuard<'_, ()> {
+    fn enter(&self) -> GateGuard<'_> {
         let _ = self.begun.fetch_add(1, Relaxed);
         self.gate.lock()
     }

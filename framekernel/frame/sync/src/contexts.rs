@@ -106,9 +106,10 @@
 //!   retirement. `switch` calls it first; a stack's drop calls it beside its retirement. A
 //!   publication interrupted between its two stores by a switch would then clear the record that
 //!   switch wrote, and the frame it named would never be published: its context lost.
-//! - [`Contexts::covers`]: any processor. It never waits and takes no lock, so a stack may still
-//!   be dropped under any lock. A scan of every processor's table goes through [`Moves::scan`],
-//!   which may wait once for the move gate, with interrupts off, after its fast passes.
+//! - [`Contexts::covers`]: any processor. It never waits and takes no lock. A scan of every
+//!   processor's table goes through [`Moves::scan`], which may wait once for the move gate, with
+//!   interrupts off, after its fast passes: so a stack may still be dropped under any lock but
+//!   the move gate, and a mover holding the gate drops none.
 //! - [`Moves::relocate`], or [`Moves::begin`] with [`Contexts::lend`], [`Contexts::adopt`] and
 //!   [`Lent::restore`] or [`Lent::forget`]: a mover, on any processor, with both queue locks
 //!   held and interrupts off.
@@ -198,9 +199,15 @@
 //! **A scan always ends.** After [`FAST_TRIES`] passes that each overlapped a move, the scan makes
 //! one last pass under the gate, with interrupts off ([`Quiet`]): no move is then under way, and
 //! every move that finished before it released the gate is visible to it. So a scan ends after
-//! at most `FAST_TRIES + 1` passes and one wait for the gate, one move's critical section,
-//! whatever the rate of moves. The lock order is always queue locks, then the gate: a mover holds
-//! both queue locks first, and a scanner may hold one (a stack dropped under it).
+//! at most `FAST_TRIES + 1` passes and one wait for the gate. The gate is a ticket lock, which
+//! serves its waiters in the order they came, and each processor holds at most one ticket at a
+//! time, with interrupts off: so that wait is at most one critical section for each other
+//! processor waiting ahead of it, whatever the rate of moves. (A test-and-set lock would let a
+//! waiter lose to every newcomer in turn; ADR-0020 S4's "one move's critical section" holds only
+//! when no other processor waits for the gate; the review of TASKS item 95, R95-2.) Loom cannot
+//! show the wait ends: an execution that spins past its bound is not explored further. The lock
+//! order is always queue locks, then the gate: a mover holds both queue locks first, and a
+//! scanner may hold one (a stack dropped under it).
 //!
 //! **Begun is Relaxed.** Nothing reads it to learn what came before it: the scan's argument above
 //! rests on happens-before carried by the forget's Release store (or the claims in its release
@@ -245,7 +252,7 @@
 
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 
-use crate::{SpinGuard, SpinLock, prim};
+use crate::prim;
 
 /// The contexts one processor's table holds; see the module documentation's "Capacity".
 #[cfg(not(all(test, loom)))]
@@ -665,12 +672,73 @@ impl Scanned {
     }
 }
 
+/// The move gate: a ticket lock, so that whoever waits for it is served in the order it came
+/// (the review of TASKS item 95, R95-2). A test-and-set lock lets a waiter lose to every newcomer
+/// in turn, so a scan's last pass could wait as long as moves keep coming. Each processor holds at
+/// most one ticket at a time, with interrupts off, so a waiter waits for at most one critical
+/// section per other processor, whatever the rate of moves.
+struct Gate {
+    /// The next ticket to hand out.
+    next: prim::AtomicU32,
+    /// The ticket allowed in.
+    serving: prim::AtomicU32,
+}
+
+/// Holding the gate: dropping it lets the next ticket in (Release).
+struct GateGuard<'g> {
+    gate: &'g Gate,
+    ticket: u32,
+}
+
+impl Gate {
+    #[cfg(not(all(test, loom)))]
+    const fn new() -> Self {
+        Self {
+            next: prim::AtomicU32::new(0),
+            serving: prim::AtomicU32::new(0),
+        }
+    }
+
+    #[cfg(all(test, loom))]
+    fn new() -> Self {
+        Self {
+            next: prim::AtomicU32::new(0),
+            serving: prim::AtomicU32::new(0),
+        }
+    }
+
+    /// Takes a ticket and waits for its turn. The Acquire load that sees the turn reads the last
+    /// holder's Release store, so everything the holders before did is visible.
+    fn lock(&self) -> GateGuard<'_> {
+        let ticket = self.next.fetch_add(1, Relaxed);
+        while self.serving.load(Acquire) != ticket {
+            prim::spin_loop();
+        }
+        GateGuard { gate: self, ticket }
+    }
+
+    /// Whether nobody holds or waits for the gate: for the host tests.
+    #[cfg(all(test, not(loom)))]
+    fn is_free(&self) -> bool {
+        self.next.load(Relaxed) == self.serving.load(Relaxed)
+    }
+}
+
+impl Drop for GateGuard<'_> {
+    fn drop(&mut self) {
+        self.gate
+            .serving
+            .store(self.ticket.wrapping_add(1), Release);
+    }
+}
+
 /// The machine's move sequence (ADR-0020 S4): the move gate and the two counters, **begun** and
 /// **finished**. The module documentation, "Moves between processors", says what each is for.
 pub struct Moves {
     /// Held by a move from before its `lend` to after its `forget`, with interrupts off, after
-    /// both queue locks; whoever holds it takes no other lock. A scan's last pass holds it too.
-    gate: SpinLock<()>,
+    /// both queue locks; whoever holds it takes no other lock and drops no stack. A scan's last
+    /// pass holds it too.
+    gate: Gate,
     /// Raised by each move, under the gate, before its `lend`.
     begun: prim::AtomicU64,
     /// Raised by each move (Release), under the gate, after its `forget` or `restore`.
@@ -688,7 +756,7 @@ impl Moves {
     #[cfg(not(all(test, loom)))]
     pub const fn new() -> Self {
         Self {
-            gate: SpinLock::new(()),
+            gate: Gate::new(),
             begun: prim::AtomicU64::new(0),
             finished: prim::AtomicU64::new(0),
         }
@@ -698,15 +766,16 @@ impl Moves {
     #[cfg(all(test, loom))]
     pub fn new() -> Self {
         Self {
-            gate: SpinLock::new(()),
+            gate: Gate::new(),
             begun: prim::AtomicU64::new(0),
             finished: prim::AtomicU64::new(0),
         }
     }
 
     /// Begins a move: takes the gate, then raises begun. The caller already holds the source's
-    /// and the destination's queue locks, with interrupts off, and takes no other lock until the
-    /// move ends, when the [`Moving`] is dropped.
+    /// and the destination's queue locks, with interrupts off, and takes no other lock, and drops
+    /// no stack, until the move ends, when the [`Moving`] is dropped: a stack's drop scans, and a
+    /// scan's last pass waits for the gate, which this move holds.
     pub fn begin(&self) -> Moving<'_> {
         Moving {
             moves: self,
@@ -754,10 +823,12 @@ impl Moves {
     /// the pass, equal, and begun read again after it unchanged. Otherwise the scan tries again,
     /// at most [`FAST_TRIES`] times, and then makes one last pass under the move gate, inside
     /// `quiet`, with no move under way. So it ends after at most `FAST_TRIES + 1` passes and one
-    /// wait for the gate, which is one move's critical section, whatever the rate of moves.
+    /// wait for the gate, during which at most one critical section per other processor runs
+    /// before it, whatever the rate of moves (the gate serves its waiters in order).
     ///
     /// The caller may hold a queue lock, which a mover takes before the gate: the order is
-    /// always queue locks, then the gate.
+    /// always queue locks, then the gate. It must not hold the gate itself: a mover that dropped a
+    /// stack would wait here for its own gate.
     pub fn scan(&self, pass: impl Fn() -> bool, quiet: &impl Quiet) -> Scanned {
         let mut passes = 0;
         while passes < FAST_TRIES {
@@ -791,7 +862,7 @@ impl Moves {
     // enough).
 
     /// A move's start: the gate, then begun.
-    fn enter(&self) -> SpinGuard<'_, ()> {
+    fn enter(&self) -> GateGuard<'_> {
         let gate = self.gate.lock();
         let _ = self.begun.fetch_add(1, Relaxed);
         gate
@@ -828,7 +899,7 @@ impl Default for Moves {
 pub struct Moving<'m> {
     moves: &'m Moves,
     /// Dropped after `Drop::drop` has raised finished.
-    _gate: SpinGuard<'m, ()>,
+    _gate: GateGuard<'m>,
 }
 
 impl Drop for Moving<'_> {
@@ -1761,7 +1832,7 @@ mod tests {
         }));
         assert!(unwound.is_err());
         assert_eq!(moves.readings(), (1, 1));
-        assert!(moves.gate.try_lock().is_some(), "the gate is free");
+        assert!(moves.gate.is_free(), "the gate is free");
     }
 
     /// ADR-0020 S4, the bound: a scan makes at most `FAST_TRIES` passes with no lock, then one
