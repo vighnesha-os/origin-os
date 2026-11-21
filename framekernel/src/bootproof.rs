@@ -83,6 +83,7 @@ proofs! {
     Iommu "IOMMU bring-up" => Withdraw("no device drivers");
     Processors "application processors" => Withdraw("fewer processors");
     CpuState "per-processor control state" => Refuse;
+    FpuFormat "FPU format" => Report;
     SpeculationControls "speculation controls" => Report;
     Nospec "index and address clamps" => Refuse;
     BootSteps "boot steps run once" => Refuse;
