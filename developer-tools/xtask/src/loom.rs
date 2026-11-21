@@ -1022,8 +1022,8 @@ const CONTROLS: &[Control] = &[
         // A processor comes online and walks tables without ordering that after the flag.
         name: "online_no_fence_before_the_first_flush",
         file: SHOOTDOWN,
-        from: "        prim::fence(Ordering::SeqCst);\n        hardware.invalidate(Request::Everything);\n",
-        to: "        hardware.invalidate(Request::Everything);\n",
+        from: "            prim::fence(Ordering::SeqCst);\n            hardware.invalidate(Request::Everything);\n",
+        to: "            hardware.invalidate(Request::Everything);\n",
         models: &[("shootdown_and_a_processor_coming_online", STALE)],
     },
     Control {

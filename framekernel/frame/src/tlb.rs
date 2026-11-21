@@ -148,8 +148,9 @@ pub unsafe fn enable_global_pages(me: cpu::ThisCpu<'_>) -> bool {
     on
 }
 
-/// Makes this processor a shootdown target, then flushes its whole TLB. Returns whether it has a
-/// record; one that has none is not made a target and must stay out (review finding F6).
+/// Makes this processor a shootdown target, then flushes its whole TLB, in one interrupts-off
+/// section (TASKS item 93, review finding R93-1). Returns whether it has a record; one that has
+/// none is not made a target and must stay out (review finding F6).
 pub fn mark_online() -> bool {
     SHOOTDOWN.mark_online(&Hardware)
 }

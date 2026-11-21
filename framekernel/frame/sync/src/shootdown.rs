@@ -584,18 +584,21 @@ impl<S: Records> Shootdown<S> {
     /// never be asked to flush and an address space could be freed under it: nothing is done,
     /// and the caller must keep it out (review finding F6 of 2026-11-14).
     ///
-    /// Its callers are the processors' boot and idle flows, which never move (ADR-0020 S2, point
-    /// 4): the index is read in a section of its own (TASKS item 93), and the flush that follows is
-    /// this processor's.
+    /// All of it in one interrupts-off section (ADR-0020 S3; TASKS item 93, review finding R93-1):
+    /// the processor whose flag it sets is the one whose TLB it flushes, whoever calls it. Read in
+    /// one section and used after it, a caller moved in between would mark one processor online
+    /// and flush another. Its callers today are the processors' boot and idle flows, which never
+    /// move (ADR-0020 S2, point 4).
     pub fn mark_online(&self, hardware: &impl TlbHardware) -> bool {
-        let Some(online) = hardware.without_interrupts(|here| self.online(hardware.this_cpu(here)))
-        else {
-            return false;
-        };
-        online.store(true, Ordering::Release);
-        prim::fence(Ordering::SeqCst);
-        hardware.invalidate(Request::Everything);
-        true
+        hardware.without_interrupts(|here| {
+            let Some(online) = self.online(hardware.this_cpu(here)) else {
+                return false;
+            };
+            online.store(true, Ordering::Release);
+            prim::fence(Ordering::SeqCst);
+            hardware.invalidate(Request::Everything);
+            true
+        })
     }
 
     /// Moves this processor to the address space `to`, by running `load` (the CR3 write), and
