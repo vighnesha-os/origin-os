@@ -435,6 +435,10 @@ const MOST_READS: u32 = 1 << 24;
 /// From 20 times fast (strictly, 20 × (1 − 1/`initial`)) a stretch could hide a reload. The timer
 /// then delivers 50 interrupts in under 25 ms, which delivery fails unless the same run's
 /// interrupts are held off for about 450 ms or more.
+///
+/// The rule assumes a count that falls linearly between reloads. A correct timer whose count
+/// stays at 0 for a while after an expiry before it reloads can be judged slow, and so fail the
+/// run at once: a stated limit, with no guard (the review's T78-R7; TASKS item 115).
 pub fn sample_period(
     initial: u64,
     nominal: u64,
@@ -1608,6 +1612,47 @@ mod tests {
             }
         }
         assert_eq!(verdict(300_000, PERIOD, 0), RateVerdict::Undecided);
+    }
+
+    #[test]
+    fn a_count_that_pauses_at_zero_can_be_judged_slow() {
+        // A stated limit, not a guarantee (the independent review's T78-R7; the coordinating
+        // session's ruling: no guard now, TASKS item 115). A correct timer whose count stays at 0
+        // for a while after each expiry before it reloads is outside I2's model, a count that
+        // falls linearly. A pair across the pause sees too little fall for its time, and at some
+        // phases it is judged slow, which fails the run at once; never fast, since a pause only
+        // slows the count. Over 100 phases of the cycle, as an independent model gave them:
+        // (bracket, pause, phases judged slow); every other phase passes.
+        for (bracket, pause, slow) in [
+            (5_000, 60_000, 12),
+            (5_000, 1_000_000, 17),
+            (120_000, 1_000_000, 37),
+        ] {
+            let cycle = PERIOD + pause;
+            let (mut in_bounds, mut judged_slow, mut other) = (0u32, 0u32, 0u32);
+            for i in 0..100 {
+                let phase = cycle * i / 100;
+                let count = move |t: u64| {
+                    let into = (t + phase) % cycle;
+                    if into < PERIOD {
+                        625_000 - into * 625_000 / PERIOD
+                    } else {
+                        0
+                    }
+                };
+                let (sample, _, _) = sample_period(625_000, PERIOD, reads_of(bracket, 600, count));
+                match judge_period(sample, PERIOD) {
+                    RateVerdict::InBounds => in_bounds += 1,
+                    RateVerdict::Slow => judged_slow += 1,
+                    RateVerdict::Fast | RateVerdict::Undecided => other += 1,
+                }
+            }
+            assert_eq!(
+                (in_bounds, judged_slow, other),
+                (100 - slow, slow, 0),
+                "{bracket} {pause}"
+            );
+        }
     }
 
     /// Reads of a correct timer, each bracket `bracket` ticks wide and the next `gap` after it;
