@@ -1100,11 +1100,18 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // interrupt stacks are four stacks of `IST_STACK_SIZE` bytes in the stack region that the
     // boot processor made for this AP alone and keeps for ever (`start_one`).
     unsafe { cpu::init_ap(start.tables, start.index, start.interrupt_stacks) };
-    // This AP's start-up flow, and its witness (ADR-0020 S3; TASKS item 93): interrupts have
-    // been off since the trampoline and stay off until its scheduler's idle loop, which is this
-    // same flow, so nothing switches it out and it never moves. Made once `cpu::init_ap` has
-    // set the CPU-local area that `cpu::this_cpu_at` reads, and passed down to the scheduler.
-    let flow: Pinned<'static> = Pinned::new();
+    // This AP's start-up flow, and its witness (ADR-0020 S3; TASKS item 93, the coordinating
+    // session's ruling Q6): taken once, through the same check as the boot flow's
+    // (`cpu::flow`), once `cpu::init_ap` has set the CPU-local area it reads, and passed down
+    // to the scheduler. Interrupts have been off since the trampoline and stay off until its
+    // scheduler's idle loop, which is this same flow, so nothing has switched a thread in here
+    // and the check holds. If it did not, this processor's table would name a thread running,
+    // so the index in its CPU-local area would be one already running threads, not the one it
+    // was given: it refuses as `NotMine`, and the boot processor parks it.
+    let Some(flow) = cpu::flow() else {
+        let _ = start.handshake.refuse(Refusal::NotMine);
+        cpu::halt();
+    };
     let me = cpu::this_cpu_at(flow.here());
     // SAFETY: CPL 0; the kernel has no user mappings. Every processor enforces SMEP and SMAP.
     let (smep, smap) = unsafe { cpu::enable_smep_smap() };
