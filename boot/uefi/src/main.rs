@@ -1727,7 +1727,8 @@ fn wait_ms(ticks_per_ms: u64, ms: u64) {
 }
 
 /// TASKS item 121: what the table walk saw of the FCH's power-management block, settled before
-/// the page tables are built and said in [`bench_fch_decide`].
+/// the page tables are built. Where it is is said in [`bench_fch_read`], before any register is
+/// read; the values and the decision in [`bench_fch_decide`].
 #[cfg(origin_bench)]
 #[derive(Clone, Copy)]
 struct FchSeen {
