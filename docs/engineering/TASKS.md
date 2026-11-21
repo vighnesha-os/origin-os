@@ -596,6 +596,13 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - Every KVM boot in CI discards all 1,024 calibration windows as disturbed and keeps the least disturbed one: about 10 s a boot by arithmetic, not measured.
     - This item measures what disturbs the windows under KVM, with TASKS item 78's figures line, and finds a calibration that settles sooner without accepting a worse window.
 
+114. **`Online::add` reserves its list before the first INIT (TASKS item 94's review, R94-8). Numbered by the coordinating session on 2026-11-21; not started; after TASKS item 93.** Today `Online::add` pushes without a reservation, and a processor's start can panic for want of memory. The list is reserved before the first INIT, and a failed reservation is counted as `NotStarted::Memory`.
+115. **A pair set aside when a count pauses at zero (TASKS item 78's review, R7). Numbered by the coordinating session on 2026-11-21; built only if a log shows a correct timer judged Slow.** TASKS item 78's rule can judge a correct timer Slow at once if a hypervisor holds the count at zero after an expiry, which is outside its linear model. ADR-0013 states this as a limit. The reviewer's guard sets aside a pair whose lower slope exceeds the least upper slope of its single steps. It carries its own risk (coarse-step counts), so it waits for evidence.
+116. **A bench loader that tells apart a hand-over that never returns from a console port the firmware's exit switches off (rental D's findings, rank 1). Numbered by the coordinating session on 2026-11-21; started the same day, at the owner's word.**
+    - **Before the call,** the bench loader prints the UART's registers through the firmware's console, writes a raw line to the SPCR's port, and writes one marker byte before each call.
+    - **After the call,** it reads the registers again, writes the firmware's values back, and names what it found.
+    - **Then it resets the machine on purpose:** `ResetSystem` (item 344, ADR-0002 Amendment 3), then the FADT's reset register.
+    - The kernel is not entered. One rental follows, on the owner's yes.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
