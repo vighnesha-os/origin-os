@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 use core::fmt::Write;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bootproof::{Proof, Tally};
@@ -36,7 +37,7 @@ use origin_frame::stack::{FpuArea, GuardedStack, StackSlot, State as SlotState, 
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::exits::{Exits, Pending};
 use origin_frame::sync::threads::{Empty, Location, Outcome, Queues, Record};
-use origin_frame::trap::Switch;
+use origin_frame::trap::{MintHolder, Pinned, Switch};
 
 /// Each kernel thread's stack.
 pub(crate) const THREAD_STACK: usize = 16 * 1024;
@@ -68,7 +69,88 @@ fn this_cpu() -> usize {
     cpu::this_cpu().get()
 }
 
-use crate::cpu::without_interrupts;
+use crate::cpu::{without_interrupts, without_interrupts_here};
+
+/// The scheduler's [`origin_frame::trap::PinMint`] (ADR-0020 S2, S3; TASKS item 93, the
+/// coordinating session's ruling Q3). It is kept here, in a `static` no other module can name,
+/// from before any thread exists ([`take_pin_mint`]), and is used only by [`PinGuard`], after the
+/// running thread's pin is raised.
+static PIN_MINT: MintHolder = MintHolder::new();
+
+/// Takes the pin's mint. The kernel's entry calls this once, before any thread exists:
+/// - a second take, by anyone, stops the kernel;
+/// - so does a spawn or a pin before this (`MintHolder::mint`).
+pub(crate) fn take_pin_mint() {
+    PIN_MINT.keep(origin_frame::trap::take_pin_mint());
+}
+
+/// A pin of the running context to its processor (ADR-0020 S2, "The pin"): until it is dropped,
+/// the context never moves, whatever it runs and however often it is switched out.
+///
+/// It is not the per-call pin of ADR-0005 Amendment 8, which `crate::pin` judges.
+///
+/// On a thread, it holds the count it raised in the thread's record, and lowers it when dropped.
+/// On the boot or idle flow it holds nothing, since a flow never moves (S2, point 4).
+///
+/// It is not `Send`, so the thread that raised the pin is the one that lowers it. Its witness,
+/// [`PinGuard::pinned`], is what a function whose body may be switched out asks for. Only
+/// [`pin`] and [`end_with`] make one, each after raising the count.
+pub(crate) struct PinGuard {
+    /// The running thread's record, whose pin count this raised; `None` on the boot or idle flow.
+    record: Option<&'static Record<threads::State>>,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl PinGuard {
+    /// The pin's witness, for as long as the guard is borrowed.
+    pub(crate) fn pinned(&self) -> Pinned<'_> {
+        PIN_MINT.mint().pinned(self)
+    }
+
+    /// Keeps the pin for good, never lowered: an ending thread's (ADR-0020 S2, point 2).
+    fn keep(self) -> Pinned<'static> {
+        let pinned = PIN_MINT.mint().pinned_for_good();
+        core::mem::forget(self);
+        pinned
+    }
+}
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        if let Some(record) = self.record
+            && !record.unpin()
+        {
+            panic!("a processor pin was lowered that was never raised");
+        }
+    }
+}
+
+/// Pins the running context to its processor until the guard is dropped (ADR-0020 S2). One
+/// interrupts-off section: it takes this processor's queue lock, finds the running slot's record,
+/// and raises that thread's pin count (two plain moves, CL47). On the boot or idle flow, whose slot
+/// has no record, it raises nothing. Not for the trap entry, which has its own witness.
+pub(crate) fn pin() -> PinGuard {
+    let record = without_interrupts_here(|here| {
+        let me = cpu::this_cpu_at(here);
+        let record = {
+            let q = QUEUES.this(me)?.lock();
+            q.record(q.current())
+        }?
+        .record();
+        raise_pin(record);
+        Some(record)
+    });
+    PinGuard {
+        record,
+        _not_send: PhantomData,
+    }
+}
+
+/// Raises `record`'s pin count; the kernel stops at its largest, as a thread that thinks itself
+/// pinned when it is not could act on another processor's state.
+fn raise_pin(record: &Record<threads::State>) {
+    assert!(record.pin(), "a processor pin count at its largest");
+}
 
 /// The timer interrupted the context whose frame is at `interrupted`; returns the frame to
 /// resume. Processors without an active queue keep running what they were running.

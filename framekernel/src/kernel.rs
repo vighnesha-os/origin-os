@@ -113,6 +113,8 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         user_fault: syscall::user_fault,
         report_exception: console::report_exception,
     });
+    // The pin's mint, to the scheduler, before any thread exists (TASKS item 93, the ruling's Q3).
+    sched::take_pin_mint();
     // M2, first step: the kernel's own GDT, TSS and IDT, proven with a breakpoint whose
     // handler reports it and resumes here.
     early.load_cpu_tables();
