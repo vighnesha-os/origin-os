@@ -3945,6 +3945,14 @@ Every finding is answered in the review's resolution:
 - **Beyond the rule's reach:** 1.04 times fast with 200 µs brackets, and 300 µs brackets: undecided in all four runs, refused at run 4.
 - **T66-11, 13, 22, 22b, 28 and 29:** as their rows say.
 
+**Final gates, on `22e4118a`** (the code at `79d02aa7`), under Rust 1.100.0 on the development Mac with QEMU 11.1.3 TCG and OVMF, in one turn of the machine (08:34 to 09:46 UTC). The tree was clean before the turn. After it, the only change was this entry's draft, written during the third `boot-matrix`; that is a record, which `boot-matrix` does not read. The quick gates had passed before the turn.
+- Clippy (`--all-targets -D warnings`) passed.
+- `cargo xtask check` passed (12 min; 2,566 host tests, none failed).
+- `cargo xtask boot-test` passed.
+- `cargo xtask boot-matrix` passed three times in a row (20, 19 and 19 min).
+- The host's load average was 4.5 to 13.3 at the start of each step.
+- **The figures lines:** 38 in each `boot-matrix` run and 1 in `boot-test`, none holding "failed" or "0x". Every boot decided at its first run with `0 aside`, and the longest line is 138 bytes. Every boot counted 1 to 15 gaps, steps reached 111 to 9,097 µs, and the best pair was within ±0 to ±7,212 ppm. That figure is the end brackets' spread, which TCG can make 0.
+
 **Follow-ups:**
 - **TASKS item 113:** under KVM every calibration discards all 1,024 windows and keeps the least disturbed one, probably about 10 s of each KVM boot (arithmetic, not measured).
 - **TASKS item 115:** the review's guard for a count that pauses at 0 (T78-R7). The rule would set aside a pair whose lower slope exceeds the least upper slope of its single steps. Build it if a log ever shows a correct timer judged slow, after measuring how a count that moves in coarse steps fares under it.
