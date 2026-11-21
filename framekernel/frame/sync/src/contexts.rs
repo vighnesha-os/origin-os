@@ -564,6 +564,7 @@ impl Contexts {
     /// Records `frame` as the frame the context in slot `slot` leaves: published in that slot
     /// only at this processor's next call into the table ([`Self::publish_leaving`]). This
     /// processor only, interrupts off, in its switch, which has just published the previous one.
+    #[inline]
     fn record_leaving(&self, slot: usize, frame: u64) {
         self.leaving_slot.store(slot, Relaxed);
         self.leaving.store(frame, Release);
@@ -577,6 +578,7 @@ impl Contexts {
     /// next [`Self::switch`], or a caller such as a stack's drop. Never from a handler that can
     /// interrupt a switch (an NMI, a machine check, a debug exception or a double fault). With
     /// nothing leaving it costs one plain load.
+    #[inline]
     pub fn publish_leaving(&self) {
         // Only this processor writes `leaving`: a plain load sees its own last write.
         let frame = self.leaving.load(Relaxed);
