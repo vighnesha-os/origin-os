@@ -382,34 +382,53 @@ pub const RATE_LOW_PPM: u64 = 970_000;
 /// (−0.45 % to +0.55 % in TASKS item 66's diagnostic, uncertainty included), and a 1.1× fast
 /// timer is outside it (the coordinating session's ruling on the addendum review's T66-R13).
 pub const RATE_HIGH_PPM: u64 = 1_030_000;
-/// Pairs of count reads a run may try for one that decides before it is undecided.
+/// A run reads the timer's count for at most this many fifths of the period, a fifth being a
+/// pair's usual span: 64, about 128 ms at 100 Hz (budget B, the coordinating session's ruling on
+/// TASKS item 78's diagnostic round). A step broken by a gap uses time but is not a pair.
 pub const PERIOD_PAIRS: u32 = 64;
+/// Steps of at most this share of the period make a stretch: a twentieth. No stretch can hide a
+/// reload of a timer under 20 times fast (TASKS item 78, C4/20B).
+pub const STRETCH_SHARE: u64 = 20;
+/// A pair undecided at a fifth of the period goes on toward the reload, up to this many tenths
+/// of it.
+const LONGEST_PAIR_TENTHS: u64 = 9;
+/// Reads a run takes at the most, whatever the TSC does: about 0.5 s of reads at 30 ns each.
+const MOST_READS: u32 = 1 << 24;
 
 /// Measures a running periodic timer's period from its count, reloaded with `initial`, in pairs
-/// of reads within one period (the addendum review's T66-R13), each read taken by `read`: from
-/// one read until a fifth of the `nominal` period has passed, or to the read before the next
-/// reload if that comes first. A pair is read again if the period its reads allow straddles
-/// either bound, between the shortest and the longest time they can be apart and a fall of one
-/// count more and one less ([`PeriodSample::verdict`]; TASKS item 78), if it is shorter than a
-/// twentieth of the nominal period, or if the time between two consecutive reads, from the
-/// first's bracket's end to the second's start, is over a hundredth of it: time in which a
-/// reload could pass unseen. The first pair that decides, and how many pairs were tried; `None`
-/// after [`PERIOD_PAIRS`].
+/// of reads within one period (the addendum review's T66-R13), each read taken by `read`.
 ///
-/// **A stated limit** (the second addendum review's T66-R17; the coordinating session's ruling
-/// (a)): a stall inside an intermediate read's own bracket is not counted, so on a timer from
-/// about 3.4 times fast it can hide a reload and give a pair that decides near nominal. An
-/// intermediate read's middle lies within a fifth of a period of the pair's first, so its bracket
-/// can stay open to about 0.4 of a period; with the gap between reads allowed, that hides one
-/// reload of a timer 3.42 times fast (TASKS item 78's correction of "over 5 times"; the host test
-/// `today_s_rule_hides_a_reload_from_about_3_4_times_fast` shows the edge). Delivery then fails
-/// such a timer as too fast in total, unless recurring stalls also mask its total in the same
-/// run.
-/// Counting those stalls too, across the brackets, left the 65- and 67-processor software-processor
-/// machines undecided after 64 pairs in 8 of 10 idle boots, where intermediate reads seem to stall
-/// inside their brackets; a check that tolerates stalls is TASKS item 78.
+/// - **A pair** runs from one read until a fifth of the `nominal` period has passed, or to the
+///   read before the next reload if that comes first. A pair is never judged under a twentieth
+///   of the period.
+/// - **The verdict** is the period's bounds: between the shortest and the longest time its reads
+///   can be apart, and a fall of one count more and one less. The pair decides only when those
+///   bounds lie wholly inside 97 % to 103 %, or wholly beyond a bound
+///   ([`PeriodSample::verdict`]; TASKS item 78, C2).
+/// - **A gap,** from one read's bracket's end to the next one's start, over a hundredth of the
+///   period breaks the pair: a reload could have passed unseen.
+/// - **Stretches (TASKS item 78, C4/20B).** A stall inside a read's own bracket is no gap, and on
+///   a fast timer it can hide a reload: the count reads lower after it, as if no reload had
+///   come. So the pair's reads are cut into stretches, wherever a step from one read's bracket's
+///   start to the next one's end exceeds a [`STRETCH_SHARE`]th of the period. A stretch cannot
+///   hide a reload of a timer under 20 times fast, and its reads bound the count's true slope.
+///   - A pair whose own slope misses its stretches' bounds is set aside, never judged.
+///   - A pair is judged only when its stretches' upper slope is within twice its own lower
+///     slope, so they have measured the slope.
+///   - A pair with one hidden reload reads near nominal only if the timer is about twice as fast
+///     or more, and then its stretches' slope is twice its own. Under about 2.06 times fast, such
+///     a pair cannot fit in 0.9 of a period.
+/// - **Longer pairs.** A pair still undecided at a fifth of the period goes on toward the
+///   reload, up to 0.9 of it, so reads that each cost up to about 200 µs still decide.
+/// - **The budget (B).** A run ends after [`PERIOD_PAIRS`] fifths of the period, about 128 ms at
+///   100 Hz, or [`MOST_READS`] reads.
 ///
-/// It also returns what the reads showed ([`CountFigures`]), which judges nothing.
+/// Returns the first pair that decides, and how many pairs were given up before it. It also
+/// returns what the reads showed ([`CountFigures`]), which judges nothing.
+///
+/// Above 20 times fast a stretch could hide a reload. The timer then delivers 50 interrupts in
+/// under 25 ms, which delivery fails unless the same run's interrupts are held off for over
+/// 475 ms.
 pub fn sample_period(
     initial: u64,
     nominal: u64,
@@ -418,43 +437,210 @@ pub fn sample_period(
     let target = nominal / 5;
     let least = nominal / 20;
     let gap = nominal / 100;
-    let mut tried = 0;
+    let stretch = nominal / STRETCH_SHARE;
+    let longest = nominal / 10 * LONGEST_PAIR_TENTHS;
+    let budget = target.saturating_mul(u64::from(PERIOD_PAIRS));
+    let mut tried = 0u32;
     let mut first = read();
+    let start = first.before;
     let mut prev = first;
+    let mut stretches = Stretches::new(first);
     let mut figures = CountFigures::default();
     figures.saw(None, first);
-    while tried < PERIOD_PAIRS {
+    for _ in 1..MOST_READS {
         let next = read();
         figures.saw(Some(prev), next);
+        if next.after.wrapping_sub(start) > budget {
+            break;
+        }
         if next.before.wrapping_sub(prev.after) > gap {
             // Away between two reads for long enough that a reload could have passed unseen.
-            tried += 1;
-            figures.gap += 1;
+            figures.gap = figures.gap.saturating_add(1);
             first = next;
             prev = next;
+            stretches = Stretches::new(next);
             continue;
         }
         let reloaded = next.count > prev.count;
+        if !reloaded {
+            stretches.step(prev, next, stretch);
+        }
         let last = if reloaded { prev } else { next };
         let span = last.twice_middle().wrapping_sub(first.twice_middle()) / 2;
         if reloaded || span >= target {
-            tried += 1;
-            if span < least {
-                figures.short += 1;
-            } else if let Some(sample) = PeriodSample::from_reads(initial, first, last) {
-                figures.closed(&sample);
-                if sample.verdict(nominal) != RateVerdict::Undecided {
-                    return (Some(sample), tried, figures);
-                }
-                figures.wide += 1;
+            let outcome = if span < least {
+                Pair::Short
             } else {
-                figures.flat += 1;
+                judge_pair(initial, nominal, first, last, &stretches, &mut figures)
+            };
+            match outcome {
+                Pair::Decided(sample) => return (Some(sample), tried.saturating_add(1), figures),
+                // Toward the reload, to narrow the bounds.
+                Pair::Undecided if !reloaded && span < longest => {}
+                given_up => {
+                    tried = tried.saturating_add(1);
+                    let count = match given_up {
+                        Pair::Short => &mut figures.short,
+                        Pair::Flat => &mut figures.flat,
+                        Pair::Aside => &mut figures.aside,
+                        Pair::Undecided | Pair::Decided(_) => &mut figures.wide,
+                    };
+                    *count = count.saturating_add(1);
+                    first = next;
+                    stretches = Stretches::new(next);
+                }
             }
-            first = next;
         }
         prev = next;
     }
     (None, tried, figures)
+}
+
+/// What became of a pair of count reads.
+enum Pair {
+    Decided(PeriodSample),
+    /// Its bounds straddle a bound, or its stretches have not measured the slope.
+    Undecided,
+    /// It spanned under a twentieth of the period.
+    Short,
+    /// The count did not fall.
+    Flat,
+    /// Its slope misses its stretches': a reload may be hidden in it.
+    Aside,
+}
+
+/// Judges the pair from `first` to `last` against its stretches (see [`sample_period`]).
+fn judge_pair(
+    initial: u64,
+    nominal: u64,
+    first: CountRead,
+    last: CountRead,
+    stretches: &Stretches,
+    figures: &mut CountFigures,
+) -> Pair {
+    let (Some(sample), Some((pair_low, pair_high))) = (
+        PeriodSample::from_reads(initial, first, last),
+        Slope::between(first, last),
+    ) else {
+        return Pair::Flat;
+    };
+    figures.closed(&sample);
+    let (low, high) = stretches.met_to(last);
+    if !(low.at_most(pair_high) && pair_low.at_most(high)) {
+        return Pair::Aside;
+    }
+    if !high.at_most(pair_low.doubled()) {
+        return Pair::Undecided;
+    }
+    match sample.verdict(nominal) {
+        RateVerdict::Undecided => Pair::Undecided,
+        _ => Pair::Decided(sample),
+    }
+}
+
+/// A slope of the timer's count against the TSC: `counts` over `ticks`, with no `ticks` for
+/// one without bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Slope {
+    counts: u64,
+    ticks: u64,
+}
+
+impl Slope {
+    const NONE: Self = Self {
+        counts: 0,
+        ticks: 1,
+    };
+    const UNBOUNDED: Self = Self {
+        counts: 1,
+        ticks: 0,
+    };
+
+    /// The count's slope between reads `a` and `b`, `b` the later, with no reload between: at
+    /// least its fall less one count over the longest time the reads can be apart, at most its
+    /// fall and one count over the shortest; `None` if the count rose.
+    fn between(a: CountRead, b: CountRead) -> Option<(Self, Self)> {
+        let fall = a.count.checked_sub(b.count)?;
+        let longest = b.after.saturating_sub(a.before).max(1);
+        let shortest = b.before.saturating_sub(a.after);
+        let low = Self {
+            counts: fall.saturating_sub(1),
+            ticks: longest,
+        };
+        let high = if shortest == 0 {
+            Self::UNBOUNDED
+        } else {
+            Self {
+                counts: fall.saturating_add(1),
+                ticks: shortest,
+            }
+        };
+        Some((low, high))
+    }
+
+    /// Whether this slope is at most `other`.
+    fn at_most(self, other: Self) -> bool {
+        u128::from(self.counts) * u128::from(other.ticks)
+            <= u128::from(other.counts) * u128::from(self.ticks)
+    }
+
+    const fn doubled(self) -> Self {
+        Self {
+            counts: self.counts.saturating_mul(2),
+            ticks: self.ticks,
+        }
+    }
+
+    /// The tighter of two lower bounds.
+    fn higher(self, other: Self) -> Self {
+        if self.at_most(other) { other } else { self }
+    }
+
+    /// The tighter of two upper bounds.
+    fn lower(self, other: Self) -> Self {
+        if self.at_most(other) { self } else { other }
+    }
+}
+
+/// What a pair's stretches say of the count's slope (see [`sample_period`]).
+#[derive(Clone, Copy, Debug)]
+struct Stretches {
+    /// The open stretch's first read.
+    start: CountRead,
+    /// The closed stretches' bounds met: the highest lower bound and the lowest upper one.
+    low: Slope,
+    high: Slope,
+}
+
+impl Stretches {
+    const fn new(at: CountRead) -> Self {
+        Self {
+            start: at,
+            low: Slope::NONE,
+            high: Slope::UNBOUNDED,
+        }
+    }
+
+    /// Takes in a step from `prev` to `next`, with no reload between: one over `limit` TSC
+    /// ticks closes the open stretch at `prev` and opens another at `next`.
+    fn step(&mut self, prev: CountRead, next: CountRead, limit: u64) {
+        if next.after.saturating_sub(prev.before) > limit {
+            let (low, high) = self.met_to(prev);
+            *self = Self {
+                start: next,
+                low,
+                high,
+            };
+        }
+    }
+
+    /// The bounds with the open stretch closed at `end`.
+    fn met_to(&self, end: CountRead) -> (Slope, Slope) {
+        match Slope::between(self.start, end) {
+            Some((low, high)) if self.start != end => (self.low.higher(low), self.high.lower(high)),
+            _ => (self.low, self.high),
+        }
+    }
 }
 
 /// What a run's reads of the timer's count showed (TASKS item 78), for a line of its own on
@@ -468,7 +654,8 @@ pub struct CountFigures {
     /// The longest step from one read's bracket's start to the next one's end, in TSC ticks: a
     /// stall inside a bracket counts here, and not in the gap that [`sample_period`] judges.
     pub longest_step: u64,
-    /// Pairs given up for a gap between two reads over a hundredth of the period.
+    /// Steps broken by a gap between two reads over a hundredth of the period: each starts the
+    /// pair again, and is no pair itself.
     pub gap: u32,
     /// Pairs ended by a rise of the count (a reload, or a count that jumps back) before they
     /// spanned a twentieth of the period.
@@ -478,6 +665,8 @@ pub struct CountFigures {
     pub wide: u32,
     /// Pairs over which the count did not fall.
     pub flat: u32,
+    /// Pairs set aside, their slope not their stretches' (a reload may be hidden in them).
+    pub aside: u32,
     /// The least uncertainty of a pair that spanned enough, in parts per million of its period
     /// ([`PeriodSample::uncertainty_ppm`]): the deciding pair's, if one came.
     pub best_ppm: Option<u64>,
@@ -503,8 +692,8 @@ impl CountFigures {
 
     /// The line for run number `run`, with TSC ticks at `tsc_hz` per second. Every figure is
     /// capped, so the line stays under the console's 160 bytes at the widest it can print
-    /// while `run` has at most two digits (the tick proof's runs are fewer, which `timer.rs`
-    /// asserts). It names no failure and holds no address.
+    /// while `run` has one digit (the tick proof's runs are fewer, which `timer.rs` asserts). It
+    /// names no failure and holds no address.
     #[must_use]
     pub const fn line(&self, run: u32, tsc_hz: u64) -> CountLine {
         CountLine {
@@ -529,6 +718,9 @@ const LINE_MAX_NS: u64 = 999_999;
 const LINE_MAX_US: u64 = 99_999;
 /// The largest uncertainty, in parts per million: just under 10 %.
 const LINE_MAX_PPM: u64 = 99_999;
+/// The largest count of pairs or steps printed in full: since budget B they are bounded by time,
+/// not by [`PERIOD_PAIRS`].
+const LINE_MAX_COUNT: u64 = 99;
 
 /// A figure printed as itself up to `cap`, and as the cap with a `+` above it.
 struct Capped(u64, u64);
@@ -550,7 +742,7 @@ impl core::fmt::Display for CountLine {
                 .unwrap_or(u64::MAX)
         };
         let c = &self.figures;
-        write!(f, "origin-kernel: APIC timer: run {} count: ", self.run)?;
+        write!(f, "origin-kernel: APIC timer: run {}: ", self.run)?;
         match c.least_bracket {
             Some(b) => write!(
                 f,
@@ -559,14 +751,16 @@ impl core::fmt::Display for CountLine {
             )?,
             None => write!(f, "no reads")?,
         }
+        let count = |n: u32| Capped(u64::from(n), LINE_MAX_COUNT);
         write!(
             f,
-            ", steps up to {} us; spoiled: {} gap, {} short, {} wide, {} flat; ",
+            ", steps to {} us; spoiled: {} gap, {} short, {} wide, {} flat, {} aside; ",
             Capped(per(c.longest_step, 1_000_000), LINE_MAX_US),
-            c.gap,
-            c.short,
-            c.wide,
-            c.flat
+            count(c.gap),
+            count(c.short),
+            count(c.wide),
+            count(c.flat),
+            count(c.aside)
         )?;
         match c.best_ppm {
             Some(ppm) => write!(f, "best +/-{} ppm", Capped(ppm, LINE_MAX_PPM)),
@@ -980,51 +1174,48 @@ mod tests {
     }
 
     #[test]
-    fn a_stall_inside_an_intermediate_read_can_hide_a_reload_a_stated_limit() {
-        // The second addendum review's T66-R17, kept as a stated limit (the coordinating
-        // session's ruling (a); TASKS item 78): a timer 10 times fast (a period of 1 ms against
-        // 10 ms nominal), read from 111 µs before a reload; the read 61 µs on stalls 1.01 ms
-        // inside its own bracket and samples a count below the one before, so the reload falls
-        // between them unseen. The pair closes at the next reload with clean end brackets, and
-        // the count is accepted near nominal.
+    fn a_stall_inside_a_read_that_hides_a_reload_is_set_aside() {
+        // The second addendum review's T66-R17 (TASKS item 78): a timer 10 times fast (a period
+        // of 1 ms against 10 ms nominal), read from 111 µs before a reload; the read 61 µs on
+        // stalls 1.01 ms inside its own bracket and samples a count below the one before, so the
+        // reload falls between them unseen. The rule before TASKS item 78 took that pair near
+        // nominal (1,009,090 ppm). Its slope is now a tenth of its stretches': it is set aside, and
+        // the next pair measures the timer as it is. Each figure was derived first by an
+        // independent model of the sampler (TASKS item 78's `c4.py`).
         let (initial, nominal) = (625_000, PERIOD);
         let fast = nominal / 10;
-        let (sample, tried, _) = sample_period(
-            initial,
-            nominal,
-            simulated_reads(initial, fast, 3 * fast - 111_000, 61, 1_010_000),
-        );
-        let sample = sample.unwrap();
-        assert_eq!((sample.ppm_of(nominal), tried), (1_009_090, 1));
-        assert_eq!(judge_period(Some(sample), nominal), RateVerdict::InBounds);
-        // The same timer's interrupts, unless recurring stalls also mask their total in the same
-        // run, come in a tenth of the time: delivery fails it as too fast, whatever the count.
-        let delivered = judge_ticks(0, &stamps(WANTED, fast, WANTED, 0), WANTED, PERIOD);
-        assert_eq!(delivered.verdict, TickVerdict::TooFast);
+        let outcome = |period, start, stalled, stall| {
+            let (sample, tried, figures) = sample_period(
+                initial,
+                nominal,
+                simulated_reads(initial, period, start, stalled, stall),
+            );
+            (
+                sample.map(|s| s.ppm_of(nominal)),
+                judge_period(sample, nominal),
+                tried,
+                figures.aside,
+            )
+        };
         assert_eq!(
-            tick_verdict(delivered.verdict, judge_period(Some(sample), nominal)),
-            TickVerdict::TooFast
+            outcome(fast, 3 * fast - 111_000, 61, 1_010_000),
+            (Some(100_000), RateVerdict::Fast, 2, 1)
         );
-        // A correct timer with the same stall passes, and both undisturbed are measured as they
-        // are.
-        let (sample, _, _) = sample_period(
-            initial,
-            nominal,
-            simulated_reads(initial, nominal, 3 * nominal - 111_000, 61, 1_010_000),
+        // A correct timer with the same stall passes, after a pair the reload cut short and one
+        // its stretches had not yet measured when the next reload ended it; and both
+        // undisturbed are measured as they are.
+        assert_eq!(
+            outcome(nominal, 3 * nominal - 111_000, 61, 1_010_000),
+            (Some(1_000_000), RateVerdict::InBounds, 3, 0)
         );
-        assert_eq!(judge_period(sample, nominal), RateVerdict::InBounds);
-        let (sample, tried, _) = sample_period(
-            initial,
-            nominal,
-            simulated_reads(initial, nominal, 0, usize::MAX, 0),
+        assert_eq!(
+            outcome(nominal, 0, usize::MAX, 0),
+            (Some(1_000_000), RateVerdict::InBounds, 1, 0)
         );
-        assert_eq!((sample.unwrap().ppm_of(nominal) / 1_000, tried), (1_000, 1));
-        let (sample, _, _) = sample_period(
-            initial,
-            nominal,
-            simulated_reads(initial, fast, 0, usize::MAX, 0),
+        assert_eq!(
+            outcome(fast, 0, usize::MAX, 0),
+            (Some(100_000), RateVerdict::Fast, 1, 0)
         );
-        assert_eq!(judge_period(sample, nominal), RateVerdict::Fast);
     }
 
     /// Reads of a timer whose count at TSC `t` is `count(t)`, sampled at each bracket's middle:
@@ -1049,17 +1240,17 @@ mod tests {
     }
 
     #[test]
-    fn the_count_figures_say_why_no_pair_was_clean() {
+    fn the_count_figures_say_why_no_pair_decided() {
         // TASKS item 78: the figures judge nothing; they say why a run's period was or was not
-        // decided. Each case's numbers were derived by an independent model of the sampler
-        // (TASKS item 78's evidence, `figures.py`).
+        // decided. Each case's numbers were derived first by an independent model of the
+        // sampler (TASKS item 78's evidence, `c4.py`).
         let figures = |bracket, gap, count: fn(u64) -> u64| {
             let (sample, tried, figures) =
                 sample_period(625_000, PERIOD, reads_of(bracket, gap, count));
             (sample.map(|s| s.ppm_of(PERIOD)), tried, figures)
         };
         let none = CountFigures::default();
-        // Undisturbed: the first pair is clean, its 800 ticks of brackets over 2 ms.
+        // Undisturbed: the first pair decides, its 800 ticks of brackets over 2 ms.
         assert_eq!(
             figures(400, 600, correct),
             (
@@ -1073,46 +1264,48 @@ mod tests {
                 }
             )
         );
-        // Every read 30 µs wide, as a slow read under a hypervisor would be: the first pair's
-        // period lies between about 98.5 % and 101.5 %, and decides.
+        // Every read 120 µs wide, as a slow read under a hypervisor would be: the first pair
+        // goes on past a fifth of the period until its bounds lie within 97 % to 103 %.
         assert_eq!(
-            figures(30_000, 600, correct),
+            figures(120_000, 600, correct),
             (
                 Some(1_000_000),
                 1,
                 CountFigures {
-                    least_bracket: Some(30_000),
-                    longest_step: 60_600,
-                    best_ppm: Some(14_854),
-                    ..none
-                }
-            )
-        );
-        // Every read 120 µs wide: every pair's bounds reach past 97 % and 103 %.
-        assert_eq!(
-            figures(120_000, 600, correct),
-            (
-                None,
-                PERIOD_PAIRS,
-                CountFigures {
                     least_bracket: Some(120_000),
                     longest_step: 240_600,
-                    wide: 64,
-                    best_ppm: Some(58_530),
+                    best_ppm: Some(29_265),
                     ..none
                 }
             )
         );
-        // A gap over a hundredth of the period between every two reads.
+        // 300 µs wide: not even 0.9 of a period narrows the bounds enough; 24 pairs in the run's
+        // 128 ms, each given up undecided.
+        assert_eq!(
+            figures(300_000, 600, correct),
+            (
+                None,
+                24,
+                CountFigures {
+                    least_bracket: Some(300_000),
+                    longest_step: 600_600,
+                    wide: 24,
+                    best_ppm: Some(33_266),
+                    ..none
+                }
+            )
+        );
+        // A gap over a hundredth of the period between every two reads: 1,274 broken steps in
+        // 128 ms, and no pair.
         assert_eq!(
             figures(400, PERIOD / 100 + 1, correct),
             (
                 None,
-                PERIOD_PAIRS,
+                0,
                 CountFigures {
                     least_bracket: Some(400),
                     longest_step: 100_801,
-                    gap: 64,
+                    gap: 1_274,
                     ..none
                 }
             )
@@ -1122,11 +1315,11 @@ mod tests {
             figures(400, 600, |_| 5_000),
             (
                 None,
-                PERIOD_PAIRS,
+                63,
                 CountFigures {
                     least_bracket: Some(400),
                     longest_step: 1_400,
-                    flat: 64,
+                    flat: 63,
                     ..none
                 }
             )
@@ -1136,11 +1329,11 @@ mod tests {
             figures(400, 600, |t| correct(t) + (t / 100_000) % 2 * 1_000),
             (
                 None,
-                PERIOD_PAIRS,
+                652,
                 CountFigures {
                     least_bracket: Some(400),
                     longest_step: 1_400,
-                    short: 64,
+                    short: 652,
                     ..none
                 }
             )
@@ -1157,42 +1350,43 @@ mod tests {
         };
         assert_eq!(
             alloc::format!("{}", undisturbed.line(1, 1_000_000_000)),
-            "origin-kernel: APIC timer: run 1 count: brackets from 400 ns, steps up to 1 us; \
-             spoiled: 0 gap, 0 short, 0 wide, 0 flat; best +/-200 ppm"
+            "origin-kernel: APIC timer: run 1: brackets from 400 ns, steps to 1 us; spoiled: \
+             0 gap, 0 short, 0 wide, 0 flat, 0 aside; best +/-200 ppm"
         );
         let undecided = CountFigures {
-            least_bracket: Some(84_000),
-            longest_step: 168_000,
-            wide: 64,
-            best_ppm: Some(14_854),
+            least_bracket: Some(840_000),
+            longest_step: 1_681_680,
+            wide: 24,
+            aside: 2,
+            best_ppm: Some(33_266),
             ..CountFigures::default()
         };
         assert_eq!(
             alloc::format!("{}", undecided.line(4, 2_800_000_000)),
-            "origin-kernel: APIC timer: run 4 count: brackets from 30000 ns, steps up to 60 us; \
-             spoiled: 0 gap, 0 short, 64 wide, 0 flat; best +/-14854 ppm"
+            "origin-kernel: APIC timer: run 4: brackets from 300000 ns, steps to 600 us; spoiled: \
+             0 gap, 0 short, 24 wide, 0 flat, 2 aside; best +/-33266 ppm"
         );
-        // Every figure at its widest: each is capped, and a run's number has two digits at most
-        // (`timer.rs` asserts it), so the line stays under the console's 160 bytes (the review's
-        // T66-R7). The pair counts are at most `PERIOD_PAIRS`.
+        // Every figure at its widest: each is capped, and a run's number has one digit (`timer.rs`
+        // asserts it), so the line stays under the console's 160 bytes (the review's T66-R7).
         let widest = CountFigures {
             least_bracket: Some(u64::MAX),
             longest_step: u64::MAX,
-            gap: PERIOD_PAIRS,
-            short: PERIOD_PAIRS,
-            wide: PERIOD_PAIRS,
-            flat: PERIOD_PAIRS,
+            gap: u32::MAX,
+            short: u32::MAX,
+            wide: u32::MAX,
+            flat: u32::MAX,
+            aside: u32::MAX,
             best_ppm: Some(u64::MAX),
         };
         assert_eq!(
-            alloc::format!("{}", widest.line(99, 1)),
-            "origin-kernel: APIC timer: run 99 count: brackets from 999999+ ns, steps up to \
-             99999+ us; spoiled: 64 gap, 64 short, 64 wide, 64 flat; best +/-99999+ ppm"
+            alloc::format!("{}", widest.line(9, 1)),
+            "origin-kernel: APIC timer: run 9: brackets from 999999+ ns, steps to 99999+ us; \
+             spoiled: 99+ gap, 99+ short, 99+ wide, 99+ flat, 99+ aside; best +/-99999+ ppm"
         );
         let nothing = CountFigures::default();
         for figures in [undisturbed, undecided, widest, nothing] {
             for tsc_hz in [0, 1, 1_000_000_000, u64::MAX] {
-                for run in [1, 4, 99] {
+                for run in [1, 4, 9] {
                     let line = alloc::format!("{}", figures.line(run, tsc_hz));
                     assert!(line.len() < 160, "{} bytes: {line}", line.len());
                     // ADR-0013 R8: no failure's words, no address (TASKS item 66's invariant 4).
@@ -1204,8 +1398,8 @@ mod tests {
         }
         assert_eq!(
             alloc::format!("{}", nothing.line(1, 1)),
-            "origin-kernel: APIC timer: run 1 count: no reads, steps up to 0 us; spoiled: 0 gap, \
-             0 short, 0 wide, 0 flat; best none"
+            "origin-kernel: APIC timer: run 1: no reads, steps to 0 us; spoiled: 0 gap, 0 short, \
+             0 wide, 0 flat, 0 aside; best none"
         );
     }
 
@@ -1244,32 +1438,32 @@ mod tests {
     }
 
     #[test]
-    fn today_s_rule_hides_a_reload_from_about_3_4_times_fast() {
-        // TASKS item 78's correction of the stated limit (ADR-0013), "over 5 times fast" before:
-        // a read held open to about 0.4 of a period, its count sampled at its start, hides one
-        // reload; the pair closes at the next read with clean end brackets. Each figure was
-        // found first by an independent model of the sampler (TASKS item 78's evidence).
-        let in_bounds = |fast_x100, held_to, gap| {
-            let (sample, _, _) = sample_period(625_000, PERIOD, held_open(fast_x100, held_to, gap));
-            sample
-                .filter(|s| judge_period(Some(*s), PERIOD) == RateVerdict::InBounds)
-                .map(|s| s.ppm_of(PERIOD))
+    fn a_held_read_no_longer_hides_a_reload() {
+        // The rule before TASKS item 78 passed these two, near 103 %: a read held open to about
+        // 0.4 of a period, its count sampled at its start, hid one reload of a timer 3.42 times
+        // fast (with the gap allowed after it) and 3.5 times (without). Now the pair across the
+        // held read is set aside and the next measures the timer as it is (figures from the
+        // independent model, TASKS item 78's `c4.py`).
+        let outcome = |fast_x100, held_to, gap| {
+            let (sample, tried, figures) =
+                sample_period(625_000, PERIOD, held_open(fast_x100, held_to, gap));
+            (
+                sample.map(|s| s.ppm_of(PERIOD)),
+                judge_period(sample, PERIOD),
+                tried,
+                figures.aside,
+            )
         };
-        // 3.42 times fast, with the gap the rule allows after the held read; 3.5 without one.
-        assert_eq!(in_bounds(342, 3_984_000, PERIOD / 100), Some(1_029_420));
-        assert_eq!(in_bounds(350, 3_954_000, 50), Some(1_029_919));
-        // At 3.4 times no read held open from 0.3 to 0.42 of a period gives a pair in bounds.
-        for held_to in (3_000_000..4_200_000).step_by(1_000) {
-            for gap in [50, PERIOD / 100] {
-                assert_eq!(
-                    in_bounds(340, held_to, gap),
-                    None,
-                    "held to {held_to}, gap {gap}"
-                );
-            }
-        }
-        // A correct timer read the same way is never judged fast or slow (TASKS item 78's
-        // invariant I2): its reload needs a whole period between two reads.
+        assert_eq!(
+            outcome(342, 3_984_000, PERIOD / 100),
+            (Some(292_397), RateVerdict::Fast, 2, 1)
+        );
+        assert_eq!(
+            outcome(350, 3_954_000, 50),
+            (Some(285_714), RateVerdict::Fast, 2, 1)
+        );
+        // A correct timer read the same way passes (TASKS item 78's invariant I2): its reload
+        // needs a whole period between two reads.
         for held_to in (3_000_000..4_200_000).step_by(1_000) {
             let (sample, _, _) = sample_period(625_000, PERIOD, held_open(100, held_to, 50));
             assert_eq!(
@@ -1278,6 +1472,178 @@ mod tests {
                 "held to {held_to}"
             );
         }
+    }
+
+    #[test]
+    fn no_hidden_reload_passes_below_twenty_times_fast() {
+        // TASKS item 78's sweep (the coordinating session's ruling on the round): 2.2 to 19 times
+        // fast, one read held open to each of 351 places from 0.05 to 1.8 periods, the gap the
+        // rule allows after it. None is ever in bounds. Below 2.2 times the randomized model
+        // stands in.
+        let mut checked = 0;
+        for fast_x100 in [220, 250, 342, 500, 1_000, 1_500, 1_900] {
+            let mut held_to = PERIOD / 20;
+            while held_to <= PERIOD * 18 / 10 {
+                let (sample, _, _) =
+                    sample_period(625_000, PERIOD, held_open(fast_x100, held_to, PERIOD / 100));
+                assert_ne!(
+                    judge_period(sample, PERIOD),
+                    RateVerdict::InBounds,
+                    "{fast_x100} held to {held_to}"
+                );
+                checked += 1;
+                held_to += PERIOD / 200;
+            }
+        }
+        assert_eq!(checked, 7 * 351);
+    }
+
+    #[test]
+    fn wide_reads_decide_and_a_rate_six_percent_out_never_passes() {
+        // Reads 60, 120 and 200 µs wide decide in bounds (the diagnostic round's (p1)); a timer
+        // 6 % fast or slow read as widely is never in bounds; 300 µs decides nothing.
+        let verdict = |bracket, period: u64| {
+            let count = move |t: u64| 625_000 - (t % period) * 625_000 / period;
+            let (sample, _, _) = sample_period(625_000, PERIOD, reads_of(bracket, 600, count));
+            judge_period(sample, PERIOD)
+        };
+        for bracket in [60_000, 120_000, 200_000] {
+            assert_eq!(verdict(bracket, PERIOD), RateVerdict::InBounds, "{bracket}");
+            for period in [PERIOD * 100 / 106, PERIOD * 106 / 100] {
+                assert_ne!(
+                    verdict(bracket, period),
+                    RateVerdict::InBounds,
+                    "{bracket} {period}"
+                );
+            }
+        }
+        assert_eq!(verdict(300_000, PERIOD), RateVerdict::Undecided);
+    }
+
+    /// Reads of a correct timer, each bracket `bracket` ticks wide and the next `gap` after it;
+    /// every `every`th read stalls `stall` ticks inside its bracket, its count sampled in the
+    /// middle of the stall.
+    fn stalled_reads(bracket: u64, every: u64, stall: u64) -> impl FnMut() -> CountRead {
+        let mut at = 0;
+        let mut n = 0;
+        move || {
+            n += 1;
+            let extra = if n.is_multiple_of(every) { stall } else { 0 };
+            let before = at;
+            let after = before + bracket + extra;
+            at = after + 600;
+            CountRead {
+                before,
+                count: correct(before + (bracket + extra) / 2),
+                after,
+            }
+        }
+    }
+
+    #[test]
+    fn no_correct_timer_is_judged_wrong_under_stalls() {
+        // TASKS item 78's invariant I2: stalls of 10 µs to 1.2 periods inside every 3rd to
+        // 333rd read, with brackets up to 120 µs: a correct timer is in bounds or undecided,
+        // never fast or slow.
+        for every in [3, 7, 50, 333] {
+            for stall in [
+                10_000, 150_000, 1_000_000, 3_000_000, 6_000_000, 9_000_000, 12_000_000,
+            ] {
+                for bracket in [400, 5_000, 40_000, 120_000] {
+                    let (sample, _, _) =
+                        sample_period(625_000, PERIOD, stalled_reads(bracket, every, stall));
+                    let verdict = judge_period(sample, PERIOD);
+                    assert!(
+                        matches!(verdict, RateVerdict::InBounds | RateVerdict::Undecided),
+                        "every {every}, stall {stall}, bracket {bracket}: {verdict:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A small xorshift generator for the randomized model: no crate (CLAUDE.md §5).
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// Uniform in `low..=high`.
+        fn within(&mut self, low: u64, high: u64) -> u64 {
+            low + self.next() % (high - low + 1)
+        }
+    }
+
+    #[test]
+    fn a_randomized_model_never_judges_a_rate_wrong() {
+        // TASKS item 78's randomized model (the coordinating session's ruling on the round: it
+        // stands in below 2.2 times fast, where the sweep stops). Timers from 20 times fast to
+        // 2.5 times slow, reloaded at a random phase, read with brackets of 0 to 150 µs and gaps
+        // of up to a hundredth of the period; one read in 2 to 40 held open from 0 to 1.8
+        // periods, its count sampled at a random instant inside its bracket. The verdict is
+        // never wrong: in bounds only between 97 % and 103 %, fast only below, slow only above.
+        let mut random = Random(0x7478_0017_0000_0078);
+        let (mut cases, mut decided, mut passed) = (0u32, 0u32, 0u32);
+        for _ in 0..1_500 {
+            // The true period in parts per million of nominal: a third of the cases fast, near
+            // or below twice the rate, a third close to the bounds, a third anywhere.
+            let ppm = match random.within(0, 2) {
+                0 => random.within(50_000, 520_000),
+                1 => random.within(940_000, 1_060_000),
+                _ => random.within(50_000, 2_500_000),
+            };
+            let period = PERIOD * ppm / 1_000_000;
+            let phase = random.within(0, period);
+            let bracket = random.within(0, 150_000);
+            let gap = random.within(0, PERIOD / 100);
+            let every = random.within(2, 40);
+            let mut at = 0u64;
+            let mut n = 0u64;
+            let mut seed = Random(random.next() | 1);
+            let read = move || {
+                n += 1;
+                let width = if n.is_multiple_of(every) {
+                    bracket + seed.within(0, PERIOD * 18 / 10)
+                } else {
+                    bracket
+                };
+                let before = at;
+                let sampled = before + seed.within(0, width);
+                let after = before + width;
+                at = after + gap;
+                let into = (sampled + phase) % period;
+                CountRead {
+                    before,
+                    count: 625_000 - into * 625_000 / period,
+                    after,
+                }
+            };
+            let (sample, _, _) = sample_period(625_000, PERIOD, read);
+            let verdict = judge_period(sample, PERIOD);
+            match verdict {
+                RateVerdict::InBounds => {
+                    assert!(
+                        (RATE_LOW_PPM..=RATE_HIGH_PPM).contains(&ppm),
+                        "{ppm} ppm judged in bounds"
+                    );
+                    passed += 1;
+                }
+                RateVerdict::Fast => assert!(ppm < RATE_LOW_PPM, "{ppm} ppm judged fast"),
+                RateVerdict::Slow => assert!(ppm > RATE_HIGH_PPM, "{ppm} ppm judged slow"),
+                RateVerdict::Undecided => {}
+            }
+            cases += 1;
+            decided += u32::from(verdict != RateVerdict::Undecided);
+        }
+        // Not vacuous: most cases decide, and some in bounds pass.
+        assert_eq!(cases, 1_500);
+        assert!(decided > 1_000, "{decided} of {cases} decided");
+        assert!(passed > 100, "{passed} of {cases} in bounds");
     }
 
     #[test]

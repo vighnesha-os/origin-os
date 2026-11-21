@@ -42,9 +42,9 @@ const PROOF_TICKS: u64 = 50;
 /// ([`apic::TickVerdict::Stalled`]), each against the same bounds. Each run is at most 2 s, so
 /// a boot pays for more only while disturbed (TASKS item 66).
 const PROOF_ATTEMPTS: u32 = 4;
-// The count's figures line stays under 160 bytes only while a run's number has two digits
+// The count's figures line stays under 160 bytes only while a run's number has one digit
 // (`apic::CountFigures::line`).
-const _: () = assert!(PROOF_ATTEMPTS < 100);
+const _: () = assert!(PROOF_ATTEMPTS < 10);
 /// Calibration window.
 const CALIBRATION_MICROS: u64 = 10_000;
 /// APIC timer divisor during calibration and afterwards.
