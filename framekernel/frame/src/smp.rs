@@ -237,6 +237,19 @@ impl Online {
     pub fn apic_ids(&self) -> Vec<u32> {
         self.cpus().iter().filter_map(|c| c.apic_id()).collect()
     }
+
+    /// Whether processor `index` may take part in a move of a thread, as source or
+    /// destination (ADR-0020 S6, N9): it is online, and it recorded an FPU format alike the
+    /// boot processor's. Asked through the processors online, so a parked processor whose
+    /// record says alike never takes part (the review of TASKS item 94, R94-3).
+    pub fn takes_part_in_moves(&self, index: CpuIndex) -> bool {
+        // In ascending order: the boot processor's index is 0, and the APs are started and
+        // added in the order of their indexes.
+        self.cpus()
+            .binary_search_by_key(&index.get(), |c| c.get())
+            .is_ok()
+            && cpu::fpu_alike(index)
+    }
 }
 
 /// Brings up every enabled AP the MADT lists. Returns the processors online, the boot
@@ -400,8 +413,10 @@ pub fn start(
     // printed.
     let started_at = rdtsc();
     let mut no_memory = 0;
-    // The APs that came online with another FPU format, to name (ADR-0020 S6).
+    // The APs that came online with another FPU format, to name (ADR-0020 S6), and how many
+    // of them the heap had no room to name.
     let mut differing = Vec::new();
+    let mut unnamed = 0_usize;
     for (i, apic_id) in map.iter().take(to_start).skip(1).filter(|_| parks) {
         let Some(index) = CpuIndex::new(i) else {
             continue;
@@ -409,8 +424,14 @@ pub fn start(
         match start_one(&lapic, index, apic_id, tsc_hz, ap_main) {
             Ok((micros, format)) => {
                 online.add(index);
-                if !cpu::takes_part_in_moves(index) {
-                    differing.push((index, format));
+                // Named if the heap has room for its entry; otherwise counted, so the start-up
+                // never fails for a name (review finding F8 of 2026-11-14; R94-4).
+                if !cpu::fpu_alike(index) {
+                    if differing.try_reserve(1).is_ok() {
+                        differing.push((index, format));
+                    } else {
+                        unnamed += 1;
+                    }
                 }
                 let _ = writeln!(
                     com1,
@@ -495,13 +516,18 @@ pub fn start(
             ": CPU baseline failed"
         }
     );
-    report_fpu_formats(com1, &online, &differing);
+    report_fpu_formats(com1, &online, &differing, unnamed);
     online
 }
 
 /// Prints ADR-0020 S6's line: the boot processor's FPU format and area, how many processors
 /// online share it and so take part in moves, and each AP online that does not, with its own.
-fn report_fpu_formats(com1: &mut dyn Write, online: &Online, differing: &[(CpuIndex, FpuFormat)]) {
+fn report_fpu_formats(
+    com1: &mut dyn Write,
+    online: &Online,
+    differing: &[(CpuIndex, FpuFormat)],
+    unnamed: usize,
+) {
     let alike = cpu::fpu_formats_alike(online.cpus());
     let _ = match cpu::boot_fpu_format() {
         Some(boot) => write!(
@@ -527,6 +553,12 @@ fn report_fpu_formats(com1: &mut dyn Write, online: &Online, differing: &[(CpuIn
             com1,
             "; CPU {index} (XCR0 {:#x}, {} bytes) takes no part in moves",
             format.xcr0, format.enabled_size
+        );
+    }
+    if unnamed > 0 {
+        let _ = write!(
+            com1,
+            "; {unnamed} more take no part in moves, not named for want of memory"
         );
     }
     let _ = writeln!(com1, ": FPU format failed");

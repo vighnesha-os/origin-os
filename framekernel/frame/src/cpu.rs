@@ -682,14 +682,15 @@ pub fn fpu_formats_alike(cpus: &[CpuIndex]) -> usize {
     recorded(cpus, FPU_ALIKE)
 }
 
-/// Whether processor `index` may take part in a move of a thread, as source or destination:
-/// it recorded an FPU format alike the boot processor's (ADR-0020 S6, N9). `false` for a
-/// processor that recorded nothing: an AP records only once every check before its handshake
-/// has passed, so one refused for any reason never takes part.
+/// Whether processor `index` recorded an FPU format alike the boot processor's (ADR-0020 S6,
+/// N9). `false` for a processor that recorded nothing: an AP records only once every check
+/// before its handshake has passed, so one refused for any reason never says alike.
 ///
-/// Ask it only of processors online. An AP whose answer came after the boot processor
-/// stopped waiting is parked with its record standing, and nothing writes it again.
-pub fn takes_part_in_moves(index: CpuIndex) -> bool {
+/// Not the whole answer to whether it takes part in moves: an AP whose answer came after the
+/// boot processor stopped waiting is parked with its record standing, and nothing writes it
+/// again. So the question is asked through the processors online,
+/// `smp::Online::takes_part_in_moves` (the review of TASKS item 94, R94-3).
+pub(crate) fn fpu_alike(index: CpuIndex) -> bool {
     recorded(&[index], FPU_ALIKE) == 1
 }
 
