@@ -1911,10 +1911,12 @@ const CONTROLS: &[Control] = &[
             "exits_an_exit_without_a_mark_cannot_stand_for_one",
             EXITS_EARLY,
         )],
-    },    Control {
+    },
+    Control {
         // MX1 (TASKS item 95; ADR-0020 S4's control for MV1): no move sequence. A pass that found
-        // nothing is believed at once, as a scan of claim-before-retire alone would be: a pass that
-        // reads the destination before the claim and the source after the forget misses the home.
+        // nothing is believed at once, as a scan of claim-before-retire alone would be, so a pass
+        // that reads the destination before the claim and the source after the forget misses the
+        // home.
         name: "moves_no_move_sequence",
         file: CONTEXTS,
         from: "        finished == begun && self.begun.load(Acquire) == begun
@@ -1925,8 +1927,8 @@ const CONTROLS: &[Control] = &[
         models: &[("moves::mv1_a_scan_reading_the_destination_first_finds_a_moving_home", CTX_UNCOVERED)],
     },
     Control {
-        // MX2 (MV2's control): `lend` takes the frame by a plain store, not by the compare-and-swap a
-        // switch also makes: the source's switch and the move can both take it.
+        // MX2 (MV2's control): `lend` takes the frame by a plain store, not by the compare-and-swap
+        // a switch also makes, so the source's switch and the move can both take it.
         name: "moves_lend_by_a_plain_store",
         file: CONTEXTS,
         from: "            if context
@@ -1945,33 +1947,43 @@ const CONTROLS: &[Control] = &[
         models: &[("moves::mv2_a_move_and_the_source_switch_take_a_frame_once", MOVE_TAKEN_TWICE)],
     },
     Control {
-        // MX3 (MV3's control): the destination adopts the context before the source lends it, so for a
-        // moment both tables hold the frame and both processors can resume it.
+        // MX3 (MV3's control): the destination adopts the context before the source lends it, so
+        // for a moment both tables hold the frame and both processors can resume it.
         name: "moves_adopt_before_lend",
         file: CONTEXTS,
         from: "        let lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
-        if let Err(refused) = destination.adopt(&moving, &lent) {
+        let adopted = match destination.adopt(&moving, lent) {
+            Ok(adopted) => adopted,
+            Err((refused, lent)) => {
+                return if lent.restore() {
+                    Err(MoveRefused::Adopt(refused))
+                } else {
+                    Err(MoveRefused::NotRestored)
+                };
 ",
-        to: "        let adopted = destination.adopt(
-            &moving,
-            &Lent {
-                table: source,
-                slot: usize::MAX,
-                home: frame,
-                frame,
-            },
-        );
-        let lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
-        if let Err(refused) = adopted {
+        to: "        let early = Lent {
+            table: source,
+            slot: usize::MAX,
+            home: frame,
+            frame,
+            settled: true,
+        };
+        let adopted = match destination.adopt(&moving, early) {
+            Ok(adopted) => adopted,
+            Err(_) => return Err(MoveRefused::NotRestored),
+        };
+        let mut lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
+        lent.settled = true;
 ",
         models: &[("moves::mv3_only_one_processor_resumes_a_moving_context", MOVE_TAKEN_TWICE)],
     },
     Control {
-        // MX4a (MV4's control; the coordinating session's ruling on Q6 of TASKS item 95): a claim made by
-        // a Relaxed load and a store, not a compare-and-swap. A scan that reads the new claim in the
-        // freed slot is then not ordered after the forget, so its last reading of begun may miss the
-        // move. The ADR's own control for MV4, finished raised before forget, was run and not caught
-        // (TASKS item 95's entry says why).
+        // MX4a (MV4's control; the coordinating session's ruling on Q6 of TASKS item 95): a claim
+        // made by a Relaxed load and a store, not a compare-and-swap. A scan that reads the new
+        // claim in the freed slot is then not ordered after the forget, so its last reading of
+        // begun may miss the move. ADR-0020 S4's own control for MV4, finished raised before
+        // forget, was run and not caught, exhaustively too: it is not a bug (S4's dated note of
+        // 2026-11-21).
         name: "moves_claim_checked_by_a_relaxed_load",
         file: CONTEXTS,
         from: "        if self
@@ -1990,38 +2002,44 @@ const CONTROLS: &[Control] = &[
         models: &[("moves::mv4_a_forgotten_slot_claimed_again_hides_no_moved_home", CTX_UNCOVERED)],
     },
     Control {
-        // MX4b (MV4's control, as MX4a): `forget` clears the home with a Relaxed store, so a scan that
-        // finds the home gone is not ordered after the move's raise of begun.
+        // MX4b (MV4's control, as MX4a): the forget clears the home with a Relaxed store, so a scan
+        // that finds the home gone is not ordered after the move's raise of begun.
         name: "moves_forget_relaxed",
         file: CONTEXTS,
-        from: "        if let Some(slot) = self.table.slots.get(self.slot) {
+        from: "        if let Some(slot) = self.source.slots.get(self.slot) {
             slot.home.store(0, Release);
         }
 ",
-        to: "        if let Some(slot) = self.table.slots.get(self.slot) {
+        to: "        if let Some(slot) = self.source.slots.get(self.slot) {
             slot.home.store(0, Relaxed);
         }
 ",
         models: &[("moves::mv4_a_forgotten_slot_claimed_again_hides_no_moved_home", CTX_UNCOVERED)],
     },
     Control {
-        // MX5 (MV5's control): a refused adoption does not restore the frame: its context can never be
-        // resumed, at its source or anywhere.
+        // MX5 (MV5's control): a refused adoption does not put the frame back, by `restore` or by
+        // the `Lent`'s drop: its context can never be resumed, at its source or anywhere.
         name: "moves_restore_omitted",
         file: CONTEXTS,
-        from: "            return if lent.restore() {
+        from: "    fn put_back(&self) -> bool {
+        self.table.slots.get(self.slot).is_some_and(|slot| {
+            slot.frame
+                .compare_exchange(0, self.frame, AcqRel, Acquire)
+                .is_ok()
+        })
+    }
 ",
-        to: "            return if {
-                let _ = lent;
-                true
-            } {
+        to: "    fn put_back(&self) -> bool {
+        let _ = (self.table, self.slot, self.frame);
+        true
+    }
 ",
         models: &[("moves::mv5_a_full_destination_gives_the_frame_back", MOVE_NOT_GIVEN_BACK)],
     },
     Control {
-        // MX6 (MV6's control): one counter whose parity marks a move under way, raised before the gate
-        // is taken. Two movers raise it to an even value together, and a scan then believes a pass
-        // that missed the home the first one moved.
+        // MX6 (MV6's control): one counter whose parity marks a move under way, raised before the
+        // gate is taken. Two movers raise it to an even value together, and a scan then believes a
+        // pass that missed the home the first one moved.
         name: "moves_one_counter_by_parity",
         file: CONTEXTS,
         from: "    /// A move's start: the gate, then begun.
@@ -2071,8 +2089,8 @@ const CONTROLS: &[Control] = &[
         models: &[("moves::mv6_two_movers_and_a_scan_miss_neither_home", CTX_UNCOVERED)],
     },
     Control {
-        // MX7 (MV7's control): the scan's pass under the gate removed. After its fast passes have all
-        // overlapped a move, it gives up and answers "not covered" for a home it never saw.
+        // MX7 (MV7's control): the scan's pass under the gate removed. After its fast passes have
+        // all overlapped a move, it gives up and answers "not covered" for a home it never saw.
         name: "moves_scan_without_its_gated_pass",
         file: CONTEXTS,
         from: "        let covered = quiet.quietly(|| {
@@ -2086,9 +2104,9 @@ const CONTROLS: &[Control] = &[
         models: &[("moves::mv7_a_scan_racing_back_to_back_moves_ends_and_finds_the_home", CTX_UNCOVERED)],
     },
     Control {
-        // LX1 (LV1's control; ADR-0020 S5): the outgoing frame stored in its slot at the switch, as before
-        // TASKS item 95. Another processor can then take and resume it while its own processor still
-        // returns along its stack.
+        // LX1 (LV1's control; ADR-0020 S5): the outgoing frame stored in its slot at the switch, as
+        // before TASKS item 95. Another processor can then take and resume it while its own
+        // processor still returns along its stack.
         name: "moves_frame_published_at_the_switch",
         file: CONTEXTS,
         from: "            Some(_) => self.record_leaving(outgoing, here),
@@ -2099,8 +2117,8 @@ const CONTROLS: &[Control] = &[
     },
     Control {
         // LX2a (LV2's control; the boot control C95-B1 plants the same): `covers` does not read the
-        // leaving record, so a frame on a stack that is not its home is uncovered from its switch-out
-        // to its publication.
+        // leaving record, so a frame on a stack that is not its home is uncovered from its switch-
+        // out to its publication.
         name: "moves_covers_skips_the_leaving_record",
         file: CONTEXTS,
         from: "        if inside(self.leaving.load(Acquire)) {
@@ -2111,8 +2129,8 @@ const CONTROLS: &[Control] = &[
         models: &[("moves::lv2_a_frame_is_covered_while_its_processor_publishes_it", CTX_UNCOVERED)],
     },
     Control {
-        // LX2b (LV2's control): `covers` reads the leaving record after the slots: a publication between
-        // the two reads moves the frame from the record to its slot behind the reader.
+        // LX2b (LV2's control): `covers` reads the leaving record after the slots: a publication
+        // between the two reads moves the frame from the record to its slot behind the reader.
         name: "moves_covers_reads_the_leaving_record_last",
         file: CONTEXTS,
         from: "        if inside(self.leaving.load(Acquire)) {
