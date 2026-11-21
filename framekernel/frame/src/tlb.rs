@@ -79,8 +79,10 @@ pub static GLOBAL_PAGES: PerCpu<AtomicBool> = PerCpu::new(
 struct Hardware;
 
 impl TlbHardware for Hardware {
-    fn this_cpu(&self) -> usize {
-        cpu::this_cpu().get()
+    type Here<'a> = crate::trap::Here<'a>;
+
+    fn this_cpu(&self, here: crate::trap::Here<'_>) -> usize {
+        cpu::this_cpu_at(here).index().get()
     }
 
     fn invalidate(&self, request: Request) {
@@ -110,8 +112,8 @@ impl TlbHardware for Hardware {
         unsafe { lapic.send_ipi(apic_id, ICR_ASSERT | u32::from(SHOOTDOWN_VECTOR)) };
     }
 
-    fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
-        cpu::without_interrupts(f)
+    fn without_interrupts<R>(&self, f: impl for<'a> FnOnce(crate::trap::Here<'a>) -> R) -> R {
+        cpu::without_interrupts_here(f)
     }
 
     fn now(&self) -> u64 {
@@ -129,6 +131,8 @@ impl TlbHardware for Hardware {
     }
 }
 
+/// The index without a witness, for the two callers TASKS item 93 converts last, with its shared
+/// files: [`enable_global_pages`] and [`interrupted`]. Removed with them.
 fn this_cpu() -> usize {
     cpu::this_cpu().get()
 }
@@ -201,16 +205,29 @@ pub fn service() {
 /// one's processors and wait (TASKS item 66; the record is `stalls`, tested on the host).
 static STALLS: crate::stalls::StallLog = crate::stalls::StallLog::new();
 
-/// Notes a shootdown that gave up on a processor, asked at TSC `asked_at`.
+/// Notes a shootdown that gave up on a processor, asked at TSC `asked_at`. The asker is read
+/// in a section of its own (TASKS item 93, the ruling's Q8): a stale index would name the wrong
+/// processor as the asker in the stall's record.
 fn note(outcome: &Result<Completed, Stalled>, asked_at: u64) {
     if let Err(Stalled { cpu, .. }) = outcome {
-        STALLS.note(*cpu, this_cpu(), asked_at, rdtsc());
+        cpu::without_interrupts_here(|here| {
+            STALLS.note(
+                *cpu,
+                cpu::this_cpu_at(here).index().get(),
+                asked_at,
+                rdtsc(),
+            );
+        });
     }
 }
 
-/// On the processor the last stall gave up on, notes when it next served a shootdown.
+/// On the processor the last stall gave up on, notes when it next served a shootdown. Read in a
+/// section of its own (the ruling's Q8): with a stale index, the processor named might be marked
+/// as having answered when it had not, or the one that had answered not marked.
 fn note_answer() {
-    STALLS.answered(this_cpu(), rdtsc());
+    cpu::without_interrupts_here(|here| {
+        STALLS.answered(cpu::this_cpu_at(here).index().get(), rdtsc());
+    });
 }
 
 pub use crate::stalls::Stall;
