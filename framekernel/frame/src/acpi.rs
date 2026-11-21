@@ -1340,6 +1340,218 @@ pub fn parse_slit(table: &[u8]) -> Result<Slit<'_>, AcpiError> {
     Slit::parse(table).map_err(|e| refused(table, e, |_| AcpiError::Length(0)))
 }
 
+/// What a PPTT says about which processors share their caches (ACPI 6.6 §5.2.31; ADR-0020 S8;
+/// TASKS item 97): for each processor asked about, the cache instance it reaches at level 2 and
+/// at its last level, where the table describes caches.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpttCaches {
+    /// Each processor's level-2 cache that holds data, as an instance: equal instances are one
+    /// cache.
+    pub second_level: alloc::vec::Vec<Option<u64>>,
+    /// Each processor's last cache that holds data.
+    pub last_level: alloc::vec::Vec<Option<u64>>,
+    /// Cache structures in the table.
+    pub caches: usize,
+    /// Of those, the ones whose Cache ID is valid.
+    pub with_id: usize,
+}
+
+/// A rule of ACPI 6.6 §5.2.31 the PPTT breaks that its reading of shared caches rests on. Its
+/// claims are then not used: CPUID alone decides (the coordinating session's ruling Q12 of
+/// 2026-11-21). `origin-acpi-tables` checks the structure (references, depth, cycles); these are
+/// what that check leaves to the reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PpttRule {
+    /// `origin-acpi-tables` refused the table, at this offset.
+    Refused(usize),
+    /// A leaf whose ACPI processor ID the MADT does not list (§5.2.31.1).
+    UnknownProcessor(u32),
+    /// Two leaves with one ACPI processor ID.
+    TwoLeaves(u32),
+    /// An enabled MADT processor with no leaf: the PPTT must describe every one.
+    NoLeaf(u32),
+    /// A leaf whose ACPI processor ID is not marked valid, which leaves must be.
+    LeafWithoutId(usize),
+    /// A cache chain that enters, at this offset, a cache another level's node lists, which
+    /// §5.2.31.2 forbids.
+    CrossesLevels(usize),
+}
+
+impl core::fmt::Display for PpttRule {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PpttRule::Refused(at) => write!(f, "refused by its checks at offset {at:#x}"),
+            PpttRule::UnknownProcessor(uid) => {
+                write!(
+                    f,
+                    "a leaf for processor ID {uid}, which the MADT does not list"
+                )
+            }
+            PpttRule::TwoLeaves(uid) => write!(f, "two leaves for processor ID {uid}"),
+            PpttRule::NoLeaf(uid) => write!(f, "no leaf for the MADT's processor ID {uid}"),
+            PpttRule::LeafWithoutId(at) => {
+                write!(f, "a leaf at {at:#x} without a valid processor ID")
+            }
+            PpttRule::CrossesLevels(at) => write!(
+                f,
+                "a cache chain enters, at {at:#x}, a cache another level's node lists"
+            ),
+        }
+    }
+}
+
+/// A cache's type from its attributes, where its flags say the type is valid (Table 5.191).
+fn pptt_instruction_only(flags: u32, attributes: u8) -> bool {
+    flags & (1 << 4) != 0 && (attributes >> 2) & 0b11 == 1
+}
+
+/// Reads the caches of a PPTT. `madt` lists every processor the MADT does, as `(ACPI processor
+/// ID, enabled)`; `asked` gives the ACPI processor IDs of the processors to answer for, in order.
+/// `Ok(None)` where the table describes no cache.
+///
+/// For each processor the walk starts at its leaf and goes up through its parents: at each node,
+/// the chain of the private cache that holds data (an instruction cache's chain is passed over,
+/// and joins the data chain at the next level anyway), each cache in it one level more. A cache
+/// listed by several nodes at one level is one cache per node ("for compactness"), unless its
+/// Cache ID is valid, which makes it one cache in the system; two structures with one valid ID
+/// are one cache.
+pub fn pptt_caches(
+    table: &[u8],
+    madt: &[(u32, bool)],
+    asked: &[u32],
+) -> Result<Option<PpttCaches>, PpttRule> {
+    use alloc::vec::Vec;
+    use origin_acpi_tables::pptt::{Pptt, PpttEntry};
+
+    let pptt = Pptt::parse(table).map_err(|e| PpttRule::Refused(e.at))?;
+    let mut nodes: Vec<(u32, PpttEntry<'_>)> = Vec::new();
+    let mut caches = 0usize;
+    let mut with_id = 0usize;
+    for item in pptt.entries() {
+        let (at, entry) = item.map_err(|e| PpttRule::Refused(e.at))?;
+        let at = u32::try_from(at).map_err(|_| PpttRule::Refused(at))?;
+        match entry {
+            PpttEntry::Node { .. } => nodes.push((at, entry)),
+            PpttEntry::Cache { cache_id, .. } => {
+                caches += 1;
+                with_id += usize::from(cache_id.is_some());
+            }
+            PpttEntry::Reserved(_) => {}
+        }
+    }
+    if caches == 0 {
+        return Ok(None);
+    }
+    let resources = |entry: &PpttEntry<'_>| -> Vec<u32> {
+        match entry {
+            PpttEntry::Node { resources, .. } => resources
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|r| u32::from_le_bytes(*r))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    // Which nodes list each structure as a private resource.
+    let listed_by = |structure: u32| -> Vec<u32> {
+        nodes
+            .iter()
+            .filter(|(_, n)| resources(n).contains(&structure))
+            .map(|&(at, _)| at)
+            .collect()
+    };
+
+    // The leaves, by ACPI processor ID.
+    let mut leaves: Vec<(u32, u32)> = Vec::new();
+    for (at, node) in &nodes {
+        if let PpttEntry::Node {
+            flags,
+            processor_id,
+            ..
+        } = node
+            && flags.leaf()
+        {
+            let uid = processor_id.ok_or(PpttRule::LeafWithoutId(*at as usize))?;
+            match madt.iter().find(|&&(id, _)| id == uid) {
+                None => return Err(PpttRule::UnknownProcessor(uid)),
+                Some(_) if leaves.iter().any(|&(id, _)| id == uid) => {
+                    return Err(PpttRule::TwoLeaves(uid));
+                }
+                Some(_) => leaves.push((uid, *at)),
+            }
+        }
+    }
+    if let Some(&(uid, _)) = madt
+        .iter()
+        .find(|&&(uid, enabled)| enabled && !leaves.iter().any(|&(id, _)| id == uid))
+    {
+        return Err(PpttRule::NoLeaf(uid));
+    }
+
+    let node_at = |at: u32| nodes.iter().find(|(n, _)| *n == at).map(|(_, e)| *e);
+    let mut answer = PpttCaches {
+        caches,
+        with_id,
+        ..PpttCaches::default()
+    };
+    for &uid in asked {
+        // The levels this processor reaches, in order, each as an instance.
+        let mut levels: Vec<u64> = Vec::new();
+        let mut at = leaves.iter().find(|&&(id, _)| id == uid).map(|&(_, at)| at);
+        let mut depth = 0usize;
+        while let Some(node) = at.and_then(|a| node_at(a).map(|e| (a, e))) {
+            let (node_at_offset, entry) = node;
+            let head = resources(&entry).into_iter().find(|&r| {
+                matches!(
+                    pptt.at(r),
+                    Some(PpttEntry::Cache { flags, attributes, .. })
+                        if !pptt_instruction_only(flags, attributes)
+                )
+            });
+            let mut next = head;
+            let mut steps = 0usize;
+            while let Some(structure) = next {
+                let Some(PpttEntry::Cache {
+                    next_level,
+                    cache_id,
+                    ..
+                }) = pptt.at(structure)
+                else {
+                    break;
+                };
+                if Some(structure) != head
+                    && listed_by(structure)
+                        .iter()
+                        .any(|&lister| lister != node_at_offset)
+                {
+                    return Err(PpttRule::CrossesLevels(structure as usize));
+                }
+                levels.push(match cache_id {
+                    Some(id) => 1 << 63 | u64::from(id),
+                    None => u64::from(node_at_offset) << 32 | u64::from(structure),
+                });
+                next = (next_level != 0).then_some(next_level);
+                steps += 1;
+                if steps > origin_acpi_tables::pptt::MAX_CACHE_LEVELS + 1 {
+                    break;
+                }
+            }
+            at = match entry {
+                PpttEntry::Node { parent, .. } if parent != 0 => Some(parent),
+                _ => None,
+            };
+            depth += 1;
+            if depth > origin_acpi_tables::pptt::MAX_DEPTH + 1 {
+                break;
+            }
+        }
+        answer.second_level.push(levels.get(1).copied());
+        answer.last_level.push(levels.last().copied());
+    }
+    Ok(Some(answer))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3347,5 +3559,254 @@ mod tests {
         }
         // The stale FIRMWARE_CTRL, which points into the XSDT, blocked nothing.
         assert!(lend(BASE + 0x100, 36).is_ok());
+    }
+}
+
+/// The PPTT's reading of shared caches (TASKS item 97): tables built here from ACPI 6.6 §5.2.31's
+/// layouts, independently of `origin-acpi-tables`' own samples.
+#[cfg(test)]
+mod pptt_tests {
+    use super::*;
+    use crate::testing::{Rng, cases, mutate};
+
+    /// Node flags: physical package, processor ID valid, thread, leaf.
+    const PACKAGE: u32 = 1;
+    const ID_VALID: u32 = 2;
+    const THREAD: u32 = 4;
+    const LEAF: u32 = 8;
+    /// Cache flags: every property valid but the ID; and with the ID valid.
+    const PROPERTIES: u32 = 0x7F;
+    const WITH_ID: u32 = 0xFF;
+    /// Attributes: unified, write-back; data; instruction.
+    const UNIFIED: u8 = 0b1000;
+    const DATA: u8 = 0b0000;
+    const INSTRUCTION: u8 = 0b0100;
+
+    /// A PPTT built structure by structure; each `add` returns the structure's offset.
+    struct Builder {
+        bytes: Vec<u8>,
+    }
+
+    impl Builder {
+        fn new() -> Self {
+            let mut bytes = vec![0u8; 36];
+            bytes[..4].copy_from_slice(b"PPTT");
+            bytes[8] = 3;
+            Self { bytes }
+        }
+
+        fn add(&mut self, s: Vec<u8>) -> u32 {
+            let at = self.bytes.len() as u32;
+            self.bytes.extend(s);
+            at
+        }
+
+        fn cache(&mut self, flags: u32, attributes: u8, next: u32, id: u32) -> u32 {
+            let mut c = vec![1, 28, 0, 0];
+            c.extend(flags.to_le_bytes());
+            c.extend(next.to_le_bytes());
+            c.extend((1u32 << 20).to_le_bytes());
+            c.extend(1024u32.to_le_bytes());
+            c.extend([8, attributes, 64, 0]);
+            c.extend(id.to_le_bytes());
+            self.add(c)
+        }
+
+        fn node(&mut self, flags: u32, parent: u32, uid: u32, resources: &[u32]) -> u32 {
+            let mut n = vec![0, (20 + 4 * resources.len()) as u8, 0, 0];
+            n.extend(flags.to_le_bytes());
+            n.extend(parent.to_le_bytes());
+            n.extend(uid.to_le_bytes());
+            n.extend((resources.len() as u32).to_le_bytes());
+            for r in resources {
+                n.extend(r.to_le_bytes());
+            }
+            self.add(n)
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            let len = self.bytes.len() as u32;
+            self.bytes[4..8].copy_from_slice(&len.to_le_bytes());
+            self.bytes[9] = 0;
+            let sum = self.bytes.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+            self.bytes[9] = 0u8.wrapping_sub(sum);
+            self.bytes
+        }
+    }
+
+    /// The SMT machine's shape: one package with an L3, four cores each with L1 data and
+    /// instructions leading to a private L2, two threads a core (IDs 0 to 7). `l3_id` 0 leaves
+    /// the L3 without an ID; `shared_l2` lists one L2 structure under every core.
+    fn smt(l3_id: u32, l2_id: u32, shared_l2: bool) -> Vec<u8> {
+        let mut b = Builder::new();
+        let l3 = b.cache(
+            if l3_id == 0 { PROPERTIES } else { WITH_ID },
+            UNIFIED,
+            0,
+            l3_id,
+        );
+        let package = b.node(PACKAGE, 0, 0, &[l3]);
+        let common_l2 = b.cache(
+            if l2_id == 0 { PROPERTIES } else { WITH_ID },
+            UNIFIED,
+            0,
+            l2_id,
+        );
+        for core in 0..4u32 {
+            let l2 = if shared_l2 {
+                common_l2
+            } else {
+                b.cache(PROPERTIES, UNIFIED, 0, 0)
+            };
+            let l1i = b.cache(PROPERTIES, INSTRUCTION, l2, 0);
+            let l1d = b.cache(PROPERTIES, DATA, l2, 0);
+            let node = b.node(0, package, 0, &[l1i, l1d]);
+            for thread in 0..2 {
+                b.node(ID_VALID | THREAD | LEAF, node, core * 2 + thread, &[]);
+            }
+        }
+        b.finish()
+    }
+
+    fn madt(n: u32) -> Vec<(u32, bool)> {
+        (0..n).map(|uid| (uid, true)).collect()
+    }
+
+    fn groups(instances: &[Option<u64>]) -> Vec<usize> {
+        // Each processor's group as the index of the first with its instance.
+        instances
+            .iter()
+            .map(|i| instances.iter().position(|j| j == i).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn threads_share_their_cores_l2_and_the_package_l3() {
+        for l3_id in [0, 9] {
+            let t = smt(l3_id, 0, false);
+            let caches = pptt_caches(&t, &madt(8), &(0..8).collect::<Vec<_>>())
+                .unwrap()
+                .unwrap();
+            assert_eq!(groups(&caches.second_level), [0, 0, 2, 2, 4, 4, 6, 6]);
+            assert_eq!(groups(&caches.last_level), [0; 8]);
+            assert_eq!(caches.with_id, usize::from(l3_id != 0));
+        }
+    }
+
+    /// One L2 structure listed by every core: four identical caches without an ID, one cache
+    /// with one.
+    #[test]
+    fn a_compact_structure_is_one_cache_only_with_its_id() {
+        let t = smt(0, 0, true);
+        let asked: Vec<u32> = (0..8).collect();
+        let caches = pptt_caches(&t, &madt(8), &asked).unwrap().unwrap();
+        // The L2 is reached through each core's L1 chain: one instance a core.
+        assert_eq!(groups(&caches.second_level), [0, 0, 2, 2, 4, 4, 6, 6]);
+        let t = smt(0, 5, true);
+        let caches = pptt_caches(&t, &madt(8), &asked).unwrap().unwrap();
+        assert_eq!(groups(&caches.second_level), [0; 8]);
+    }
+
+    #[test]
+    fn rules_the_reading_rests_on() {
+        let t = smt(0, 0, false);
+        let asked: Vec<u32> = (0..8).collect();
+        // A leaf the MADT does not list.
+        assert_eq!(
+            pptt_caches(&t, &madt(7), &asked[..7]),
+            Err(PpttRule::UnknownProcessor(7))
+        );
+        // An enabled processor with no leaf; a disabled one is fine.
+        let mut more = madt(8);
+        more.push((8, true));
+        assert_eq!(pptt_caches(&t, &more, &asked), Err(PpttRule::NoLeaf(8)));
+        more[8].1 = false;
+        assert!(pptt_caches(&t, &more, &asked).unwrap().is_some());
+        // Two leaves with one ID.
+        let mut b = Builder::new();
+        let l2 = b.cache(PROPERTIES, UNIFIED, 0, 0);
+        let p = b.node(PACKAGE, 0, 0, &[l2]);
+        b.node(ID_VALID | LEAF, p, 1, &[]);
+        b.node(ID_VALID | LEAF, p, 1, &[]);
+        assert_eq!(
+            pptt_caches(&b.finish(), &madt(2), &[1]),
+            Err(PpttRule::TwoLeaves(1))
+        );
+        // A leaf without a valid ID.
+        let mut b = Builder::new();
+        let l2 = b.cache(PROPERTIES, UNIFIED, 0, 0);
+        let p = b.node(PACKAGE, 0, 0, &[l2]);
+        let leaf = b.node(LEAF, p, 0, &[]);
+        assert_eq!(
+            pptt_caches(&b.finish(), &madt(1), &[0]),
+            Err(PpttRule::LeafWithoutId(leaf as usize))
+        );
+        // A core's L1 pointing at the L2 its package lists (ACPI 6.6 forbids it).
+        let mut b = Builder::new();
+        let l2 = b.cache(PROPERTIES, UNIFIED, 0, 0);
+        let p = b.node(PACKAGE, 0, 0, &[l2]);
+        let l1 = b.cache(PROPERTIES, DATA, l2, 0);
+        b.node(ID_VALID | LEAF, p, 0, &[l1]);
+        assert_eq!(
+            pptt_caches(&b.finish(), &madt(1), &[0]),
+            Err(PpttRule::CrossesLevels(l2 as usize))
+        );
+        // No cache structure: nothing to say.
+        let mut b = Builder::new();
+        let p = b.node(PACKAGE, 0, 0, &[]);
+        b.node(ID_VALID | LEAF, p, 0, &[]);
+        assert_eq!(pptt_caches(&b.finish(), &madt(1), &[0]), Ok(None));
+        // A table its checks refuse.
+        let mut broken = smt(0, 0, false);
+        broken[9] ^= 1;
+        assert!(matches!(
+            pptt_caches(&broken, &madt(8), &asked),
+            Err(PpttRule::Refused(_))
+        ));
+    }
+
+    /// Only the data chain counts: a core whose first listed cache is instruction-only still
+    /// reaches its L2 through its data chain.
+    #[test]
+    fn the_instruction_chain_is_passed_over() {
+        let mut b = Builder::new();
+        let l2 = b.cache(PROPERTIES, UNIFIED, 0, 0);
+        let l1i = b.cache(PROPERTIES, INSTRUCTION, l2, 0);
+        let l1d = b.cache(PROPERTIES, DATA, l2, 0);
+        let p = b.node(PACKAGE, 0, 0, &[]);
+        let core = b.node(0, p, 0, &[l1i, l1d]);
+        b.node(ID_VALID | LEAF, core, 0, &[]);
+        let c = pptt_caches(&b.finish(), &madt(1), &[0]).unwrap().unwrap();
+        assert_eq!(
+            c.second_level,
+            [Some(u64::from(core) << 32 | u64::from(l2))]
+        );
+        assert_eq!(c.last_level, c.second_level);
+    }
+
+    /// Mutated tables never panic, and an answer always covers every processor asked about.
+    #[test]
+    fn mutated_tables_never_panic() {
+        let base = smt(9, 0, false);
+        let asked: Vec<u32> = (0..8).collect();
+        let mut rng = Rng::new(0x5050_5454);
+        let mut answered = 0;
+        for case in 0..cases(6000) {
+            let mut t = base.clone();
+            mutate(&mut t, &mut rng);
+            if case % 2 == 0 && t.len() >= 36 {
+                let len = t.len() as u32;
+                t[4..8].copy_from_slice(&len.to_le_bytes());
+                t[9] = 0;
+                let sum = t.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+                t[9] = 0u8.wrapping_sub(sum);
+            }
+            if let Ok(Some(c)) = pptt_caches(&t, &madt(8), &asked) {
+                answered += 1;
+                assert_eq!(c.second_level.len(), 8, "case {case}");
+                assert_eq!(c.last_level.len(), 8, "case {case}");
+            }
+        }
+        assert!(answered > 100, "{answered}");
     }
 }
