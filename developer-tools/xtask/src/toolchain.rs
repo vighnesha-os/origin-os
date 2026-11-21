@@ -242,6 +242,21 @@ pub(crate) fn image_config() -> Result<Vec<String>> {
     config_for(&[UEFI_TARGET, KERNEL_TARGET])
 }
 
+/// [`image_config`] and, for both freestanding targets, `--cfg origin_bench`: the bench build of
+/// the loader and the kernel (TASKS item 112). Only `bench::build` and its Clippy run use it,
+/// into `target/bench`; nothing else in `xtask` gives a `--cfg` to an image build.
+pub(crate) fn bench_config() -> Result<Vec<String>> {
+    let mut config = image_config()?;
+    config.extend(bench_entries());
+    Ok(config)
+}
+
+/// The bench build's own entries: the flag, joined by Cargo to the remap and to
+/// `.cargo/config.toml`'s flags.
+fn bench_entries() -> Vec<String> {
+    entries_for(&[UEFI_TARGET, KERNEL_TARGET], r#"["--cfg","origin_bench"]"#)
+}
+
 /// The same for a ring-3 build, whose target is the userspace triple. Given after
 /// `.cargo/userspace.toml`, it is joined to that file's flags. It is not part of
 /// [`image_config`]: on CI the userspace triple is the host's own.
@@ -402,6 +417,30 @@ pub(crate) fn host_path_in<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_bench_build_gives_a_cfg() {
+        // What `image_config` adds to the remap, for any remap: no `--cfg` (TASKS item 112, F1).
+        let normal = entries_for(
+            &[UEFI_TARGET, KERNEL_TARGET],
+            r#"["--remap-path-prefix","/x=/rustc/0"]"#,
+        );
+        assert!(
+            normal.iter().all(|arg| !arg.contains("--cfg")),
+            "{normal:?}"
+        );
+        let bench = bench_entries();
+        assert_eq!(
+            bench,
+            [
+                "--config",
+                &format!(r#"target.{UEFI_TARGET}.rustflags=["--cfg","origin_bench"]"#),
+                "--config",
+                &format!(r#"target.{KERNEL_TARGET}.rustflags=["--cfg","origin_bench"]"#),
+            ]
+        );
+        assert_eq!(bench.iter().filter(|arg| arg.contains("--cfg")).count(), 2);
+    }
 
     const REPORT: &str = "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: aarch64-apple-darwin\nrelease: 1.99.1\nLLVM version: 23.1.1\n";
 

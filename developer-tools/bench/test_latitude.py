@@ -30,11 +30,11 @@ def load(home):
     return module
 
 
-def bump(home, server_id, n):
+def bump(home, key, n):
     """One writer process for the lock test."""
     lat = load(home)
     for i in range(n):
-        lat.update_rental(server_id, **{f"k{os.getpid()}_{i}": i})
+        lat.update_rental(key, **{f"k{os.getpid()}_{i}": i})
 
 
 class Guards(unittest.TestCase):
@@ -97,10 +97,10 @@ class Guards(unittest.TestCase):
                                  self.lat.planned_worst_case(50, 0.81) + 1e-9)
 
     def test_unconfirmed_deletion_is_not_recorded(self):
-        self.lat.add_rental({"server_id": "sv", "usd_per_hour": 0.41, "deployed_at": 1.0, "deadline": 2.0})
-        self.assertFalse(self.lat.confirm_deleted("sv", "unconfirmed", "test"))
+        key = self.lat.add_rental({"server_id": "sv", "usd_per_hour": 0.41, "deployed_at": 1.0, "deadline": 2.0})
+        self.assertFalse(self.lat.confirm_deleted(key, "unconfirmed", "test"))
         self.assertNotIn("deleted_at", self.lat.ledger()["rentals"][0])
-        self.assertTrue(self.lat.confirm_deleted("sv", "gone", "test"))
+        self.assertTrue(self.lat.confirm_deleted(key, "gone", "test"))
         self.assertIn("deleted_at", self.lat.ledger()["rentals"][0])
 
     def test_delete_command_fails_when_unconfirmed(self):
@@ -113,7 +113,7 @@ class Guards(unittest.TestCase):
 
     def test_watchdog_keeps_trying_until_confirmed(self):
         results = iter(["unconfirmed", "failed", "deleting"])
-        self.lat.add_rental({"server_id": "sv", "usd_per_hour": 0.41, "deployed_at": 1.0, "deadline": 2.0})
+        key = self.lat.add_rental({"server_id": "sv", "usd_per_hour": 0.41, "deployed_at": 1.0, "deadline": 2.0})
 
         def delete(_):
             r = next(results)
@@ -121,7 +121,7 @@ class Guards(unittest.TestCase):
                 raise self.lat.ApiError(500, "boom")
             return r
 
-        args = mock.Mock(server_id="sv", deadline=0.0)
+        args = mock.Mock(server_id="sv", rental=key, deadline=0.0)
         with mock.patch.object(self.lat, "delete_server", delete), \
                 mock.patch.object(self.lat.time, "sleep"):
             self.lat.cmd_watchdog(args)
@@ -245,6 +245,42 @@ class Guards(unittest.TestCase):
         self.assertFalse(r["ended"])
         self.assertIn("Pre-memory", r["summary"])
         self.assertTrue(self.lat.last_boot(r))  # nothing of Origin's: no second boot
+
+    def test_a_bench_boot_names_its_breadcrumbs(self):
+        loader = ("origin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF (1 MiB)\r\n"
+                  "origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key\r\n"
+                  "origin-boot: exiting boot services; entering the Framekernel\r\n"
+                  "origin-boot: bench build: boot services exited on the first call\r\n")
+        # Stopped after the kernel's fourth step: the record says so without the log.
+        r = self.lat.boot_result(self.lat.clean(loader + "RS1234"))
+        self.assertFalse(r["ended"])
+        self.assertEqual(r["breadcrumbs"], "RS1234")
+        self.assertTrue(r["summary"].endswith("; breadcrumbs: RS1234"), r["summary"])
+        # Every step, then the kernel's lines to its verdict.
+        r = self.lat.boot_result(self.lat.clean(
+            loader + "RS12345678\r\norigin-kernel: console: framebuffer 1024x768\r\n"
+            "origin-kernel: boot verdict: degraded: 70 of 71 proofs passed\r\n"))
+        self.assertTrue(r["ended"])
+        self.assertEqual(r["breadcrumbs"], "RS12345678")
+        self.assertEqual(r["summary"],
+                         "origin-kernel: boot verdict: degraded: 70 of 71 proofs passed; breadcrumbs: RS12345678")
+        # The loader halted after ExitBootServices failed twice, with every loader's line
+        # (decision item 342): no breadcrumb at all.
+        r = self.lat.boot_result(self.lat.clean(
+            loader.replace("origin-boot: bench build: boot services exited on the first call",
+                           "origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, "
+                           "retry EFI_INVALID_PARAMETER): halting")))
+        self.assertEqual(r["breadcrumbs"], "")
+        self.assertTrue(r["summary"].endswith("; breadcrumbs: none"), r["summary"])
+        # A reset after `RS12`: the firmware's text that follows is not read as breadcrumbs.
+        r = self.lat.boot_result(self.lat.clean(
+            loader + "RS12" + "\x1b[2J\x1b[0;37;40mPre-memory NB Initialization.15\r\nSuper 1 2 R S\r\n"))
+        self.assertEqual(r["breadcrumbs"], "RS12")
+        # A normal build's boot has no breadcrumbs entry and no change to its summary.
+        r = self.lat.boot_result("origin-boot: exiting boot services; entering the Framekernel\n")
+        self.assertNotIn("breadcrumbs", r)
+        self.assertEqual(r["summary"],
+                         "no verdict; last line: origin-boot: exiting boot services; entering the Framekernel")
 
     def test_a_boot_ends_on_the_lines_the_kernel_halts_after(self):
         # The texts `framekernel/src/report.rs` and the CPU baseline check print before halting.
@@ -544,15 +580,106 @@ class Guards(unittest.TestCase):
                       "started by Boot0004, not by Boot0002", record)
 
     def test_two_writers_lose_nothing(self):
-        self.lat.add_rental({"server_id": "sv", "usd_per_hour": 0.41, "deployed_at": 1.0, "deadline": 2.0})
+        key = self.lat.add_rental({"server_id": "sv", "usd_per_hour": 0.41, "deployed_at": 1.0, "deadline": 2.0})
         context = multiprocessing.get_context("spawn")
-        workers = [context.Process(target=bump, args=(self.home, "sv", 40)) for _ in range(2)]
+        workers = [context.Process(target=bump, args=(self.home, key, 40)) for _ in range(2)]
         for w in workers:
             w.start()
         for w in workers:
             w.join()
         keys = [k for k in self.lat.ledger()["rentals"][0] if k.startswith("k")]
         self.assertEqual(len(keys), 80)
+
+    # A server ID the provider gives again (rental C had rental A's, 2026-11-21).
+
+    REUSED = "sv_same"
+
+    def rental_a(self):
+        """Rental A's row as the ledger held it before rental C: deleted, its watchdog stopped."""
+        t0 = 1_000_800.0
+        key = self.lat.add_rental({"server_id": self.REUSED, "plan": "m4-metal-small", "site": "AMS",
+                                   "usd_per_hour": 0.81, "deployed_at": t0, "deadline": t0 + 3000,
+                                   "hostname": "origin-bench-a-x"})
+        self.lat.update_rental(key, watchdog_pid=11, deleted_at=t0 + 551, deleted_by="rental")
+        return key, dict(self.lat.ledger()["rentals"][0])
+
+    def test_a_rental_given_a_reused_server_id_has_a_row_of_its_own(self):
+        _, a = self.rental_a()
+        args = mock.Mock(plan="m4-metal-small", max_minutes=50, project=None, site=None, yes=True,
+                         cap_usd=10.0)
+
+        def api(method, path, body=None, ok=None):
+            if (method, path) == ("POST", "/servers"):
+                return {"data": {"id": self.REUSED}}
+            if (method, path) == ("GET", f"/servers/{self.REUSED}"):
+                return {"data": {"attributes": {"status": "on", "primary_ipv4": "192.0.2.7"}}}
+            raise AssertionError(f"unexpected {method} {path}")
+
+        with mock.patch.object(self.lat, "project_id", return_value="proj"), \
+                mock.patch.object(self.lat, "bench_servers", return_value=[]), \
+                mock.patch.object(self.lat, "offers", return_value=[(0.81, "AMS", True)]), \
+                mock.patch.object(self.lat, "ensure_key", return_value="key"), \
+                mock.patch.object(self.lat, "api", api), \
+                mock.patch.object(self.lat, "start_watchdog", return_value=4242) as watchdog, \
+                mock.patch.object(self.lat, "wait_for_ssh"), \
+                mock.patch.object(self.lat.Console, "open", return_value=None), \
+                mock.patch.object(self.lat, "delete_server", return_value="gone"), \
+                mock.patch.object(self.lat.os, "killpg"), \
+                mock.patch.object(self.lat.time, "sleep"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.lat.rent(args, "b", lambda rental: None)
+        rows = self.lat.ledger()["rentals"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0], a)  # rental A's row is untouched
+        c = rows[1]
+        self.assertEqual((c["server_id"], c["watchdog_pid"], c["deleted_by"]), (self.REUSED, 4242, "rental"))
+        self.assertNotEqual(self.lat.rental_key(c), self.lat.rental_key(a))
+        self.assertEqual(watchdog.call_args.args[1], self.lat.rental_key(c))  # its watchdog records on C
+        self.assertAlmostEqual(sum(self.lat.worst_case(r) for r in rows), 2 * 0.81)
+
+    def test_reap_and_delete_record_a_reused_server_id_on_its_own_row(self):
+        _, a = self.rental_a()
+        server = {"id": self.REUSED, "attributes": {"hostname": "origin-bench-b-y",
+                                                     "plan": {"slug": "m4-metal-small"}}}
+        with mock.patch.object(self.lat, "offers", return_value=[(0.81, "AMS", True)]), \
+                mock.patch.object(self.lat, "delete_server", return_value="unconfirmed"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            unconfirmed = self.lat.reap([server], "reap")  # a new row, still open
+            self.lat.reap([server], "reap")  # the open row is found, not added again
+        rows = self.lat.ledger()["rentals"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0], a)
+        self.assertEqual(unconfirmed, [(self.REUSED, self.lat.rental_key(rows[1]))])
+        self.assertNotIn("deleted_at", rows[1])
+        with mock.patch.object(self.lat, "delete_server", return_value="gone"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.lat.cmd_delete(mock.Mock(server_id=self.REUSED))
+        rows = self.lat.ledger()["rentals"]
+        self.assertEqual(rows[0], a)
+        self.assertEqual(rows[1]["deleted_by"], "delete")
+
+    def test_a_watchdog_records_only_on_its_own_row(self):
+        _, a = self.rental_a()
+        c = self.lat.add_rental({"server_id": self.REUSED, "usd_per_hour": 0.81,
+                                 "deployed_at": 2_000_000.0, "deadline": 2_003_000.0,
+                                 "hostname": "origin-bench-b-z"})
+        args = mock.Mock(server_id=self.REUSED, rental=c, deadline=0.0)
+        with mock.patch.object(self.lat, "delete_server", return_value="gone"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.lat.cmd_watchdog(args)
+        rows = self.lat.ledger()["rentals"]
+        self.assertEqual(rows[0], a)
+        self.assertEqual(rows[1]["deleted_by"], "watchdog")
+
+    def test_rows_without_keys_are_told_apart_and_keys_stay_unique(self):
+        old = {"server_id": "sv", "hostname": "origin-bench-a-x", "usd_per_hour": 0.81,
+               "deployed_at": 1.0, "deadline": 2.0}
+        self.assertEqual(self.lat.rental_key(old), "origin-bench-a-x-sv")
+        first = self.lat.add_rental(dict(old))
+        second = self.lat.add_rental(dict(old))  # the same hostname and ID: still a row of its own
+        self.assertEqual((first, second), ("origin-bench-a-x-sv", "origin-bench-a-x-sv-2"))
+        self.assertEqual(len(self.lat.ledger()["rentals"]), 2)
+        self.assertFalse(self.lat.update_rental("no-such-rental", x=1))
 
 
 if __name__ == "__main__":

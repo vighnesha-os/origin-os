@@ -33,14 +33,20 @@ static PANICKING: AtomicBool = AtomicBool::new(false);
 
 /// The kernel's Rust entry: `_start` jumps here with RBP zero, the stack aligned, and the
 /// loader's boot-info pointer as the [`Entry`] in RDI.
-pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
+pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u64) -> ! {
+    // TASKS item 112: a bench build's breadcrumbs, one byte after each step to the first line.
+    #[cfg(origin_bench)]
+    origin_frame::bench::start(crumbs);
+    crumb!(b"1");
     // The monotonic clock's zero (CLAUDE.md §68).
     time::mark_entry();
+    crumb!(b"2");
     // COM1 is the UART of last resort: nothing better is known until the ACPI tables can
     // be read, which `console::adopt_firmware_uart` does.
     let mut uart = Uart16550::new(console::KernelUart::com1());
     let firmware_line = uart.line_settings();
     uart.init();
+    crumb!(b"3");
 
     if !entry.relocations_applied() {
         // `core::fmt` would call through unrelocated vtables. `write_str` on the concrete
@@ -48,8 +54,10 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         let _ = uart.write_str(report::RELOCATIONS_NOT_APPLIED);
         halt();
     }
+    crumb!(b"4");
     // From here on every processor prints through the console, a line at a time.
     console::init(uart, firmware_line);
+    crumb!(b"5");
     let mut com1 = console::Console::boot_flow();
     // What each boot proof found, and what that means for this boot (ADR-0013).
     let mut proofs = Tally::new();
@@ -61,6 +69,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             halt();
         }
     };
+    crumb!(b"6");
     let data = early.data();
     let (info, regions, segments, memory) = (
         *data.info(),
@@ -73,8 +82,15 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     // from here on (ADR-0010): the framebuffer's line is the first on both. The earlier lines of
     // a boot this far can only have been a report of an invalid boot info, on COM1.
     let loader_uart = console::attach_loader_uart(&info);
+    crumb!(b"7");
     console::attach_framebuffer(&mut com1, &info, regions);
     let _ = writeln!(com1, "origin-kernel: console: {}", loader_uart.now());
+    #[cfg(origin_bench)]
+    let _ = writeln!(
+        com1,
+        "origin-kernel: bench build: {}",
+        origin_frame::bench::Said
+    );
     let _ = report::write_report(&mut com1, &info, &memory);
     for (i, s) in segments.iter().enumerate() {
         let access = match (
@@ -299,6 +315,12 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // What each processor put in its own control registers, which ring 3 relies on.
         let held = cpu::cpu_states_holding(online.cpus()) == online.cpus().len();
         record_or_stop(&mut com1, &mut proofs, Proof::CpuState, held);
+        // ADR-0020 S6: every processor online saves its FPU state as the boot processor does,
+        // and so may take part in moves. Report until a mover reads it (TASKS item 96).
+        proofs.record(
+            Proof::FpuFormat,
+            cpu::fpu_formats_alike(online.cpus()) == online.cpus().len(),
+        );
         // ADR-0017: what each processor reported and set as it started, and the two forms
         // of the lookup every index and address from ring 3 goes through.
         let controls = prove_speculation(&mut com1, online.cpus());

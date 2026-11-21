@@ -67,6 +67,8 @@ pub mod vtd;
 #[cfg(test)]
 mod testing;
 
+#[cfg(all(origin_bench, target_os = "none"))]
+pub mod bench;
 #[cfg(target_os = "none")]
 pub mod cpu;
 #[cfg(target_os = "none")]

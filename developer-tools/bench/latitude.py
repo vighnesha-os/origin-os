@@ -24,6 +24,8 @@ Money is guarded these ways, because a forgotten server bills every hour:
   Mac itself leave it to the watchdog.
 - A deletion counts only when the API confirms it. Until then the ledger and `status` show the
   server as not deleted.
+- Every rental is a ledger row of its own, keyed by its hostname and server ID, never by the
+  server ID alone: Latitude gives a server ID again (rental C had rental A's).
 
 What it cannot guard: the watchdog runs on this Mac. Latitude's API has no way to set a deletion
 time (the dashboard's scheduled deletion takes one; the API's "schedule deletion" removes a
@@ -288,23 +290,64 @@ def planned_worst_case(max_minutes, usd_per_hour):
     return (math.ceil((max_minutes + MARGIN_MINUTES) / 60) + 1) * usd_per_hour
 
 
+def rental_key(row):
+    """What tells one ledger row from another: its `rental` key, or, for a row written before
+    rows had keys, its hostname and server ID, which also name its folder. Never the server ID
+    alone: Latitude gave rental C (2026-11-21) the server ID it had given rental A."""
+    return row.get("rental") or f"{row.get('hostname')}-{row['server_id']}"
+
+
+def append_rental(book, rental):
+    """Appends `rental` to `book` as a row of its own, whatever server ID earlier rows share,
+    and returns its key: its hostname and server ID, with a count after them if a row has that
+    key already."""
+    taken = {rental_key(r) for r in book["rentals"]}
+    base = f"{rental.get('hostname')}-{rental['server_id']}"
+    key, n = base, 1
+    while key in taken:
+        n += 1
+        key = f"{base}-{n}"
+    book["rentals"].append({**rental, "rental": key})
+    return key
+
+
 def add_rental(rental):
+    """A new rental: always a row of its own. Returns its key."""
     with ledger_for_update() as book:
-        if not any(r["server_id"] == rental["server_id"] for r in book["rentals"]):
-            book["rentals"].append(rental)
+        return append_rental(book, rental)
 
 
-def update_rental(server_id, **fields):
+def open_rental(book, server_id):
+    """The key of the latest row for `server_id` not confirmed deleted, or None. An older open
+    row with that ID stays open, counted at its worst case, until someone looks at it."""
+    rows = [r for r in book["rentals"] if r["server_id"] == server_id and not r.get("deleted_at")]
+    return rental_key(max(rows, key=lambda r: r.get("deployed_at", 0))) if rows else None
+
+
+def add_found_rental(rental):
+    """A server found through the API: the open row that already has its ID, or a new row if
+    every row with that ID is deleted (a reused ID is a new rental). Returns the row's key."""
+    with ledger_for_update() as book:
+        return open_rental(book, rental["server_id"]) or append_rental(book, rental)
+
+
+def update_rental(key, **fields):
+    """Updates the row with `key`. Returns whether there was one."""
     with ledger_for_update() as book:
         for r in book["rentals"]:
-            if r["server_id"] == server_id:
+            if rental_key(r) == key:
                 r.update(fields)
+                return True
+    return False
 
 
-def confirm_deleted(server_id, result, by):
-    """Records the deletion only if the API confirmed it. Returns whether it did."""
+def confirm_deleted(key, result, by):
+    """Records the deletion on the row with `key` (none if `key` is None) only if the API
+    confirmed it. Returns whether the API did."""
     if result in CONFIRMED:
-        update_rental(server_id, deleted_at=now(), deleted_by=by)
+        if key is not None and not update_rental(key, deleted_at=now(), deleted_by=by):
+            print(f"{stamp()} the ledger has no row {key}: the deletion is not recorded",
+                  file=sys.stderr)
         return True
     return False
 
@@ -467,34 +510,35 @@ def cmd_status(args):
         print(f"{s['id']} {a.get('hostname')} {a.get('status')} {a.get('primary_ipv4')}")
     for r in ledger()["rentals"]:
         state = f"deleted {stamp(r['deleted_at'])}" if r.get("deleted_at") else "NOT DELETED"
-        print(f"{r['server_id']} {r['plan']} {r['site']} ${r['usd_per_hour']:.2f}/h "
+        print(f"{rental_key(r)} {r['plan']} {r['site']} ${r['usd_per_hour']:.2f}/h "
               f"from {stamp(r['deployed_at'])}: {state}; worst case ${worst_case(r):.2f}")
 
 
 def cmd_delete(args):
     result = delete_server(args.server_id)
     print(f"{args.server_id}: {result}")
-    if not confirm_deleted(args.server_id, result, "delete"):
+    if not confirm_deleted(open_rental(ledger(), args.server_id), result, "delete"):
         die(f"{args.server_id}: deletion not confirmed; it may still bill. Run delete again")
 
 
 def reap(servers, by):
-    """Deletes each server, recording it in the ledger first if it is not there. Returns the
-    IDs whose deletion the API did not confirm."""
+    """Deletes each server, recording it in the ledger first if no open row has it. Returns the
+    server ID and ledger key of each whose deletion the API did not confirm."""
     unconfirmed = []
     for s in servers:
         a = s["attributes"]
-        add_rental({"server_id": s["id"], "plan": (a.get("plan") or {}).get("slug", "?"),
-                    "site": ((a.get("region") or {}).get("site") or {}).get("slug", "?"),
-                    "usd_per_hour": offers_price_or_cap(a), "deployed_at": now(),
-                    "deadline": now(), "hostname": a.get("hostname"), "found_by": by})
+        key = add_found_rental({
+            "server_id": s["id"], "plan": (a.get("plan") or {}).get("slug", "?"),
+            "site": ((a.get("region") or {}).get("site") or {}).get("slug", "?"),
+            "usd_per_hour": offers_price_or_cap(a), "deployed_at": now(), "deadline": now(),
+            "hostname": a.get("hostname"), "found_by": by})
         try:
             result = delete_server(s["id"])
         except Exception as e:
             result = f"failed ({e})"
         print(f"{s['id']} {a.get('hostname')}: {result}")
-        if not confirm_deleted(s["id"], result, by):
-            unconfirmed.append(s["id"])
+        if not confirm_deleted(key, result, by):
+            unconfirmed.append((s["id"], key))
     return unconfirmed
 
 
@@ -519,7 +563,8 @@ def cmd_reap(args):
         return
     unconfirmed = reap(servers, "reap")
     if unconfirmed:
-        die(f"deletion not confirmed for {', '.join(unconfirmed)}; they may still bill. Run reap again")
+        die(f"deletion not confirmed for {', '.join(s for s, _ in unconfirmed)}; they may still "
+            "bill. Run reap again")
 
 
 def cmd_watchdog(args):
@@ -542,16 +587,17 @@ def cmd_watchdog(args):
         except Exception as e:
             result = f"failed ({e})"
         print(f"{stamp()} deadline: deleting {args.server_id}: {result}", flush=True)
-        if confirm_deleted(args.server_id, result, "watchdog"):
+        if confirm_deleted(args.rental, result, "watchdog"):
             return
         time.sleep(60)
 
 
-def start_watchdog(server_id, deadline, rental_dir):
+def start_watchdog(server_id, key, deadline, rental_dir):
+    """Starts the watchdog of `server_id`, which records its deletion on the ledger row `key`."""
     log = open(rental_dir / "watchdog.log", "a")
     process = subprocess.Popen(
         ["caffeinate", "-i", sys.executable, "-I", str(Path(__file__).resolve()), "watchdog",
-         "--server-id", server_id, "--deadline", str(deadline)],
+         "--server-id", server_id, "--rental", key, "--deadline", str(deadline)],
         stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
     return process.pid
 
@@ -641,22 +687,24 @@ def buy_and_run(args, kind, work, project, site, hour):
             seen.update(s["id"] for s in found_now)
             unconfirmed += reap(found_now, "failed-create")
             time.sleep(20)
-        for server in unconfirmed:
-            start_watchdog(server, now(), private_dir(STATE / f"failed-create-{server}"))
+        for server, key in unconfirmed:
+            start_watchdog(server, key, now(), private_dir(STATE / f"failed-create-{server}"))
         die(f"no rental: {len(seen)} server(s) found and deleted"
-            + (f"; {', '.join(unconfirmed)} not confirmed, watchdogs started" if unconfirmed else ""))
+            + (f"; {', '.join(s for s, _ in unconfirmed)} not confirmed, watchdogs started"
+               if unconfirmed else ""))
     deployed = now()
     deadline = deployed + args.max_minutes * 60
     rental_dir = STATE / f"{hostname}-{server_id}"
     watchdog = None
     console = None
+    key = None
     try:
         private_dir(rental_dir)
-        add_rental({"server_id": server_id, "plan": args.plan, "site": site, "usd_per_hour": hour,
-                    "deployed_at": deployed, "deadline": deadline, "hostname": hostname,
-                    "dir": str(rental_dir)})
-        watchdog = start_watchdog(server_id, deadline, rental_dir)
-        update_rental(server_id, watchdog_pid=watchdog)
+        key = add_rental({"server_id": server_id, "plan": args.plan, "site": site,
+                          "usd_per_hour": hour, "deployed_at": deployed, "deadline": deadline,
+                          "hostname": hostname, "dir": str(rental_dir)})
+        watchdog = start_watchdog(server_id, key, deadline, rental_dir)
+        update_rental(key, watchdog_pid=watchdog)
         print(f"{stamp()} deployed {server_id} ({hostname}); the watchdog (pid {watchdog}) deletes "
               f"it at {stamp(deadline)}")
         ip = None
@@ -685,7 +733,7 @@ def buy_and_run(args, kind, work, project, site, hour):
         except Exception as e:
             result = f"failed ({e})"
         print(f"{stamp()} deleting {server_id}: {result}")
-        if confirm_deleted(server_id, result, "rental"):
+        if confirm_deleted(key, result, "rental"):
             if watchdog:
                 try:
                     os.killpg(watchdog, 15)
@@ -693,7 +741,9 @@ def buy_and_run(args, kind, work, project, site, hour):
                     pass
         else:
             if not watchdog:
-                watchdog = start_watchdog(server_id, now(), private_dir(rental_dir))
+                # The key `add_rental` gives, if it never ran.
+                watchdog = start_watchdog(server_id, key or f"{hostname}-{server_id}", now(),
+                                          private_dir(rental_dir))
             print(f"{stamp()} deletion not confirmed: the watchdog (pid {watchdog}) keeps trying, "
                   f"and `status` shows the server; or run `delete {server_id}`", file=sys.stderr)
         print(f"files: {rental_dir}")
@@ -997,6 +1047,30 @@ def scope_verdict(lscpu):
     return f"{vendor}: outside the scope; bench equipment"
 
 
+BENCH_LINE = "origin-boot: bench build:"
+CRUMB_BYTES = "RS12345678"
+
+
+def breadcrumbs(text):
+    """A bench build's breadcrumbs in one boot's console text (TASKS item 112): the bytes the
+    entry stub and the kernel wrote between the loader's last line and the kernel's first,
+    `RS12345678` when every step passed, so the last one names the step the boot stopped after.
+    None for a boot that was not a bench build's (no bench loader line), "" for one that wrote
+    none."""
+    if BENCH_LINE not in text:
+        return None
+    after = text[text.rfind(LOADER_LINE):]
+    after = after[after.find("\n") + 1:] if "\n" in after else ""
+    # Only the run that starts right after the loader's line: a firmware's text after a reset,
+    # or another system's, may hold the same letters (TASKS item 112's review, R112-6).
+    run = ""
+    for c in after.lstrip("\r\n"):
+        if c not in CRUMB_BYTES:
+            break
+        run += c
+    return run
+
+
 def boot_result(text):
     """What one boot showed on the console: the kernel's verdict or refusal, the line it halted
     on, or how far it got. `loader` and `kernel` say whether each printed anything: the loader
@@ -1005,16 +1079,20 @@ def boot_result(text):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     seen = {"loader": any(LOADER_LINE in l for l in lines),
             "kernel": any(KERNEL_LINE in l for l in lines)}
+    crumbs = breadcrumbs(text)
+    if crumbs is not None:
+        seen["breadcrumbs"] = crumbs
+    said = "" if crumbs is None else f"; breadcrumbs: {crumbs or 'none'}"
     verdict = next((l for l in lines if VERDICT_LINE in l or REFUSED_LINE in l), None)
     halted = next((l for l in lines if KERNEL_LINE in l and any(h in l for h in HALTED_LINES)), None)
     origin = [l for l in lines if KERNEL_LINE in l or LOADER_LINE in l]
     if verdict or halted:
         line = verdict or halted
-        return {"ended": True, "summary": line[line.find(KERNEL_LINE):], **seen}
+        return {"ended": True, "summary": line[line.find(KERNEL_LINE):] + said, **seen}
     if any("login:" in l for l in lines):
         return {"ended": True, "summary": "a system other than Origin started (a login prompt)", **seen}
     last = origin[-1] if origin else (lines[-1] if lines else "nothing on the console")
-    return {"ended": False, "summary": f"no verdict; last line: {last[:200]}", **seen}
+    return {"ended": False, "summary": f"no verdict; last line: {last[:200]}{said}", **seen}
 
 
 def last_boot(result):
@@ -1077,7 +1155,9 @@ def cmd_rental_b(args):
         rental.ssh("rm -rf /tmp/origin && mkdir -m 700 /tmp/origin", check=True, timeout=60)
         subprocess.run(["scp", "-q"] + ssh_base(rental.dir)[1:] + [str(loader), str(kernel),
                        f"{OS_USER}@{rental.ip}:/tmp/origin/"], check=True, timeout=300)
-        install = (f"set -eu; test -f '{target}'; "
+        # TASKS item 112: a bench loader's stale-key switch is for QEMU scenarios only; the rented
+        # ESP never holds it, so the board takes its natural path through ExitBootServices.
+        install = (f"set -eu; test -f '{target}'; test ! -e /boot/efi/EFI/ORIGIN/BENCH-STALE-KEY; "
                    f"install -D -m 0644 /tmp/origin/KERNEL.ONBF /boot/efi/EFI/ORIGIN/KERNEL.ONBF; "
                    f"cp /tmp/origin/BOOTX64.EFI '{target}'; sync; "
                    f"sha256sum '{target}' /boot/efi/EFI/ORIGIN/KERNEL.ONBF")
@@ -1087,7 +1167,7 @@ def cmd_rental_b(args):
             raise RuntimeError("the files on the ESP do not match the image")
         (rental.dir / "installed.txt").write_text(f"{entry} {path}; {last}\n{' '.join(sums)}\n")
         print(f"{stamp()} Origin's loader is {path}, and its kernel \\EFI\\ORIGIN\\KERNEL.ONBF; "
-              "no UEFI variable was written")
+              "no UEFI variable was written, and the ESP holds no BENCH-STALE-KEY")
         console = rental.console
         if not console:
             raise RuntimeError("no serial console: a boot would show nothing")
@@ -1207,6 +1287,7 @@ def main():
             p.add_argument("--boot-minutes", type=int, default=8, help="how long one boot may take")
     p = sub.add_parser("watchdog")
     p.add_argument("--server-id", required=True)
+    p.add_argument("--rental", required=True, help="the ledger row that records the deletion")
     p.add_argument("--deadline", type=float, required=True)
     p.set_defaults(run=cmd_watchdog)
     args = parser.parse_args()
