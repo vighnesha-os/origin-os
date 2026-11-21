@@ -4171,7 +4171,7 @@ Built on `claude/t97-domains-21554f`, cut from `land/batch-9` at `a25228c9` (`ma
 - `bf509791`: ADR-0020 S8's dated note (Q1).
 - `edffc8ed`, `21d6ba7c`, `ad3aa081`, `9b4bcc8a`: the answers to the independent review (R97-1 to R97-17; `REVIEW_T97_2026-11-21.md`).
 - The records: this entry, ADR-0013's row and controls, the provenance entry, CL20, the research ledger `docs/research/2026-11-21-scheduling-domains.md` and `REVIEW_T97_2026-11-21.md`.
-- To come: `land/batch-9` merged once TASKS item 95 is in it, with bootproof's counts at 73, then the gates.
+- `c77b6243`: `land/batch-9` merged at `0e4f99f9` (TASKS items 94, 78, 112 and 95, rental D, main's PRs 51 to 53), once, as the coordinating session asked. Only four record files conflicted (ADR-0013, `PERFORMANCE_BUDGETS.md`, `SOURCE_PROVENANCE.md` and this file), each an append by both sides; both kept, the batch's first. The code merged cleanly. The merge sets `bootproof`'s six count tests to 73.
 
 **The design as it lands:**
 
@@ -4233,7 +4233,7 @@ Built on `claude/t97-domains-21554f`, cut from `land/batch-9` at `a25228c9` (`ma
   - first boots: SMT machine 15.1 s, two-package machine 14.7 s, default machine 13.1 s;
   - in the control run: 15.3 s and 13.7 s;
   - in the tip's full `boot-matrix` (04:55 to 05:15 UTC): 15.4 s and 15.0 s, against 13.2 to 13.4 s for the 4-processor machines and 76.9 to 78.8 s for the 65-processor ones;
-  - the three runs of the gates: in the gates' record below.
+  - in the three `boot-matrix` runs of the gates on `c77b6243` (13:50 to 14:53 UTC): the SMT machine 15.1, 14.2 and 15.4 s, the two-package machine 13.7, 15.0 and 15.0 s, against 12.9 to 13.7 s for the 4-processor machines and 75.3 to 79.8 s for the 65-processor ones.
 - **CI** (2026-11-20, five runs): the real-processor `boot-matrix` step takes 14.7 to 19.2 minutes, 19.2 on an EPYC 7763. A kernel boot under KVM takes 24 to 27 s. Estimated share of the two new machines under KVM: 1 to 2 minutes, about 1 % of the 180-minute limit. **Held out of CI until measured there (Q9).**
 
 **Controls.** Each was a scripted edit, booted once with `cargo xtask boot-domains` at `9b4bcc8a` (04:49 to 04:55 UTC), the tree clean before and after; ADR-0013 has the table:
@@ -4252,11 +4252,26 @@ Built on `claude/t97-domains-21554f`, cut from `land/batch-9` at `a25228c9` (`ma
   - on the two 65-processor machines, which of their boots carry the uneven fair-share lines ADR-0013 Amendment 2 reports (5 in each run, spread differently).
 - **Everything else matched:** the census, topology and NUMA lines, and every other proof's line. The verdict's count moved by the one new row.
 
+**The gates on `c77b6243`** (the code at `9b4bcc8a`, the records at `329f6e0d`, and `land/batch-9` merged at `0e4f99f9`), in one turn of the machine on a clean tree, 2026-11-21 from 13:33 to 14:53 UTC, under Rust 1.100.0 with QEMU 11.1.3 TCG and OVMF. The quick gates (fmt and every document gate) had passed before the turn:
+
+- `cargo clippy --locked --all-targets -- -D warnings` found nothing; `check` runs Clippy on the kernel for its target. The compiler's `harden-sls-ret` notice is printed, as everywhere since ADR-0017 Amendment 2.
+- `check` passed in 917 s: 2,566 host tests passed, 0 failed, 30 ignored (`origin-frame` 378, the kernel's library 566, xtask 403, `origin-sync` 147); Loom's 91 models passed and its 140 negative controls were caught; every document gate.
+- `boot-test` passed, 11 of 11, in 55 s.
+- `boot-matrix` passed three times in a row, in 1,278, 1,259 and 1,267 s, each with 43 kernel verdicts:
+  - 37 boots `degraded: 72 of 73 proofs passed; failed: speculation controls`, the two new machines among them;
+  - 3 with scheduler fairness too, the two 65-processor machines and the 67-processor sparse machine, their uneven shares forgiven as ADR-0013 names (65 or 67 guest processors on 10 host threads);
+  - the three machines built to lack something, each verdict naming it: `57 of 67` with 6 not run, `63 of 68` with 5 not run, and `65 of 67` with 6 not run (the random-number generator);
+  - the kernel stacks' region at 27 distinct bases in 27 kernel boots.
+- **The tree matched on every machine** in all three runs, as xtask computed it from each machine's definition.
+  - The SMT machine: `core, L2 4x2 [0-1|2-3|4-5|6-7]; node 2x4 [0-3|4-7]; last-level cache, package 1x8 [0-7]`, from leaf 04H on 8 of 8, no PPTT.
+  - The two-package machine: `last-level cache, package, node 2x4 [0-3|4-7]`, from leaf 04H on 8 of 8 and the planted PPTT's 5 caches, 2 with IDs.
+  - Both read `0 claims cut, 0 differing from the PPTT`, and capacity 1024 on 8 of 8.
+
 **Follow-ups** (for the coordinating session to number):
 
 1. Merge the two readers of leaf 04H: `cache.rs`'s sizes on the boot processor, and `topology`'s sharing on each processor (ruling Q11).
 2. Once the batch's first CI runs show the KVM tree lines on two or more runner processors, make them exact under KVM or record why they vary (ruling on R97-16).
-3. A CI run with `ORIGIN_BOOT_MATRIX_ANY_COUNT=on`, to measure the two new machines under KVM at two guest processors per host processor (ruling Q9). The hand-over says how.
+3. A CI run of the two new machines under KVM at two guest processors per host processor (ruling Q9): `ORIGIN_BOOT_MATRIX_ANY_COUNT=on`, or, booting only these two, a one-run step `cargo --locked xtask boot-domains` in `boot-real-cpu`. The hand-over says how.
 4. **No KVM tree has been measured** (ruling on R97-16): under KVM the tree line is held to its start until follow-up 2 is done.
 
 **Not shown:**
