@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). B5 gained one line on the SPCR's UART before a halt after a failed `ExitBootServices` by Amendment 2, accepted by the owner on 2026-11-21 (decision sheet item 342) and built by TASKS item 112 the same day, under QEMU only. |
-| Date | 2026-11-07; Amendment 1 2026-11-10; Amendment 2 2026-11-21; boot info 0.6 accepted 2026-11-10 and built 2026-11-11 (B4) |
+| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). B5 gained one line on the SPCR's UART before a halt after a failed `ExitBootServices` by Amendment 2, accepted by the owner on 2026-11-21 (decision sheet item 342) and built by TASKS item 112 the same day, under QEMU only. Amendment 3, accepted by the owner on 2026-11-21 (decision sheet item 344), lets a bench build, and only a bench build, call `ResetSystem` after `ExitBootServices`. |
+| Date | 2026-11-07; Amendment 1 2026-11-10; Amendment 2 2026-11-21; Amendment 3 2026-11-21; boot info 0.6 accepted 2026-11-10 and built 2026-11-11 (B4) |
 | Owner decisions still open | None. B7, carried over from ADR-0001, was decided on 2026-11-07 and amended on 2026-11-10. |
 | Implements | CLAUDE.md §19 (UEFI boot chain), §20 (boot manager, later), §58 (Secure Boot), ONBF §8.1 (chain of trust) |
 | Code | `boot/info` (`origin-boot-info`), `boot/uefi` (`origin-boot-uefi`), `framekernel/`, `developer-tools/onbf-pack` |
@@ -172,3 +172,25 @@ origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry EF
 **Threat model (§58).** The write goes only to the port the SPCR named and the shared parser accepted (ADR-0010 Amendment 3), never to a guessed one. It happens after the firmware stopped driving the UART, and the loader halts right after it.
 
 **Code (built by TASKS item 112, under QEMU only).** `boot/uefi/src/uart.rs` (the bounded writer and the line, host-tested through a port trait) and `boot/uefi/src/main.rs` (the calls' statuses and the port instructions).
+
+## Amendment 3 (2026-11-21): a bench build may call `ResetSystem` after `ExitBootServices`
+
+*Accepted by the owner on 2026-11-21 ("Allow in test builds"; decision sheet item 344). Proposed by rental D's findings (`docs/research/2026-11-21-rental-d-findings.md`, rank 1). TASKS item 116 builds it, in the ninth batch. Until that lands, nothing here is built.*
+
+**Change to B5, for bench builds only.** A loader built with `--cfg origin_bench` (TASKS item 112) may make one call into the firmware after `ExitBootServices`: the runtime service `ResetSystem`, with a cold reset. It makes the call only to end a diagnostic boot on a rented bench machine. If the machine is still running two seconds after the call, the loader writes the reset register that the FADT names, which it read and checked as untrusted input during its table walk before the call. Then it halts.
+
+- **Why:** on rentals B, C and D nothing reached the console after the loader's last line, and nothing told the two remaining causes apart: a call that never returns, and a console port that the firmware's exit switches off. A deliberate reset after the call is a signal that does not depend on that port. A reset proves the call returned.
+- **Every loader that is not a bench build is unchanged:** B5 holds for it in full, as Amendment 2 left it. A bench loader is never signed or packaged (TASKS item 112's F1 to F3), and `cargo xtask check` and the reproducible gate show that no normal image contains this code.
+- **Why `ResetSystem` first:** UEFI defines it as a runtime service, callable after `ExitBootServices`. The FADT's reset register needs no service call. On the board in question, though, it is an SMI command port, and nothing has shown that it resets the machine.
+
+**Alternatives.**
+
+| | Why not |
+|---|---|
+| The FADT's reset register alone, with no exception to B5 | Less certain to reset this board, and a reset that does not happen would read as the call never returning |
+| A reset from the kernel | The kernel is not entered in this diagnostic, and its console is the port in question |
+
+**Performance cost (ADR-0018 V3).** None, by construction: only bench builds contain the code, and none ships.
+
+**Threat model (§58).** Only bench builds, which are never signed, contain the call. The FADT is parsed as untrusted input, and a register that fails the check is not written.
+
