@@ -314,7 +314,7 @@ pub fn start(
     }
     // The boot processor's FPU format is the one every AP is held to, and its area holds it
     // by construction (`cpu::record_boot_fpu`): alike once it has been recorded.
-    cpu::record_cpu_state(cpu::boot_fpu_format().is_some());
+    cpu::record_cpu_state(me, cpu::boot_fpu_format().is_some());
     // The boot processor's interrupt stacks are in the kernel's image; nothing could guard
     // them before the kernel's own tables were live.
     // SAFETY: the boot processor's interrupt stacks lie above their guard pages and have not
@@ -1114,10 +1114,10 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     };
     let me = cpu::this_cpu_at(flow.here());
     // SAFETY: CPL 0; the kernel has no user mappings. Every processor enforces SMEP and SMAP.
-    let (smep, smap) = unsafe { cpu::enable_smep_smap() };
+    let (smep, smap) = unsafe { cpu::enable_smep_smap(me) };
     // SAFETY: CPL 0; the kernel's tables mark only the kernel half global.
     let _ = unsafe { crate::tlb::enable_global_pages(me) };
-    cpu::check_pat();
+    cpu::check_pat(me);
     let cpuid = cpu::gather_cpuid();
     // SAFETY: CPL 0, this AP, once, before any SIMD runs on it.
     let format = unsafe { cpu::enable_simd(&cpuid) };
@@ -1168,7 +1168,7 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // What it found about itself, in one store, once every check above has passed: so a
     // processor refused for any reason records nothing, and never takes part in moves. The
     // answer below orders the record before the boot processor sees it online.
-    cpu::record_cpu_state(fit == FpuFit::Alike);
+    cpu::record_cpu_state(me, fit == FpuFit::Alike);
     // Join only if this answer settles the start-up. If the boot processor stopped waiting
     // first, CPU `index` stays offline and this processor is being parked: do nothing more.
     if !start.handshake.answer(id) {

@@ -228,9 +228,10 @@ pub(crate) fn quiesce(
     regions: &'static [MemoryRegion],
     own: &[Address],
 ) -> Option<Quiesce> {
-    let pat = crate::cpu::check_pat();
-    // The boot flow's processor, a value read under its witness (TASKS item 93).
-    let bsp = crate::cpu::this_cpu_at(flow.here()).index();
+    // The boot flow's processor, read under its witness (TASKS item 93).
+    let me = crate::cpu::this_cpu_at(flow.here());
+    let pat = crate::cpu::check_pat(me);
+    let bsp = me.index();
     if crate::cpu::pat_ready(&[bsp]) != 1 {
         let _ = writeln!(
             com1,
@@ -626,15 +627,17 @@ fn platform_ranges(rsdp: u64) -> Result<Vec<(u64, u64)>, &'static str> {
 /// the quiesce did not see is stopped and recorded here; the IOMMUs' own functions are left
 /// unsized, since sizing would briefly move registers the running IOMMU depends on. A function
 /// that does not restore its command register or BARs after sizing is dropped alone, with its
-/// decoding off. Returns whether the listing succeeded; [`quiesce`] must have run.
+/// decoding off. Returns whether the listing succeeded; [`quiesce`] must have run. `flow` is the
+/// boot flow's witness, under which its PAT is checked (ADR-0020 S3; TASKS item 93).
 pub(crate) fn init(
+    flow: origin_frame::trap::Pinned<'_>,
     com1: &mut Console,
     q: &mut Quiesce,
     cpus: &[CpuIndex],
     regions: &[MemoryRegion],
     reserved: &[(u64, u64)],
 ) -> bool {
-    let pat = crate::cpu::check_pat();
+    let pat = crate::cpu::check_pat(crate::cpu::this_cpu_at(flow.here()));
     let ready = crate::cpu::pat_ready(cpus);
     if ready != cpus.len() {
         let _ = writeln!(

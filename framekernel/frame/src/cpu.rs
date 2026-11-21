@@ -345,7 +345,9 @@ unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex, interrupt_stacks:
     // GS was just reloaded (base 0): point it at this processor's CPU-local area.
     init_cpu_local(tss_field.addr() as u64, index);
     init_cpu_state();
-    init_speculation();
+    // The index just set, read in a section (ADR-0020 S3; TASKS item 93): interrupts are already
+    // off here, as the caller's contract says, so the section only gives the witness.
+    without_interrupts_here(|at| init_speculation(this_cpu_at(at)));
 }
 
 /// The processor indexes the kernel has: 1, the boot processor's, until the processors are
@@ -652,9 +654,10 @@ const FPU_ALIKE: u8 = 1 << 1;
 /// Records, in one store, whether this processor's control state holds (checked here, after
 /// `enable_simd`) and whether its FPU format is the boot processor's. The boot processor and
 /// every AP do it on themselves, once; an AP before its handshake, whose answer then orders
-/// the record before the boot processor sees it online.
-pub fn record_cpu_state(fpu_alike: bool) {
-    if let Some(state) = CPU_STATE.get(this_cpu().get()) {
+/// the record before the boot processor sees it online. `me` is the index its flow read
+/// (ADR-0020 S3; TASKS item 93).
+pub fn record_cpu_state(me: ThisCpu<'_>, fpu_alike: bool) {
+    if let Some(state) = CPU_STATE.this(me) {
         let holds = if cpu_state_holds() { STATE_HOLDS } else { 0 };
         let alike = if fpu_alike { FPU_ALIKE } else { 0 };
         state.store(holds | alike, Ordering::Release);
@@ -1748,7 +1751,7 @@ pub fn read_speculation() -> crate::speculation::Reported {
 /// Each register is written only where `Plan::decide` found the bit that says the
 /// processor has it, and is read back: a processor whose registers do not hold what was
 /// written says so in its record.
-fn init_speculation() {
+fn init_speculation(me: ThisCpu<'_>) {
     use crate::speculation::{self, Lfence, Plan};
     let plan = Plan::decide(&read_speculation());
     let mut held = true;
@@ -1779,7 +1782,7 @@ fn init_speculation() {
         // SAFETY: as above.
         held &= unsafe { rdmsr(DE_CFG) } & DE_CFG_LFENCE != 0;
     }
-    let cpu = this_cpu().get();
+    let cpu = me.index().get();
     if cpu == CpuIndex::BOOT.get() {
         // The maker and family are the machine's: the boot processor chooses for all.
         crate::nospec::set_form(plan.form);
@@ -1802,8 +1805,9 @@ pub fn entering_process(process: u64, switch: &Switch) {
 
 /// Issues one IBPB on this processor if it has the command, and says whether it did. For
 /// the boot's measurement of what one costs; the scheduler's own are [`entering_process`]'s.
-pub fn issue_ibpb() -> bool {
-    let offered = crate::speculation::recorded(this_cpu().get()).is_some_and(|(plan, _)| plan.ibpb);
+/// `me` is the index the boot flow read (ADR-0020 S3; TASKS item 93).
+pub fn issue_ibpb(me: ThisCpu<'_>) -> bool {
+    let offered = crate::speculation::recorded(me.index().get()).is_some_and(|(plan, _)| plan.ibpb);
     if offered {
         // SAFETY: as in `entering_process`.
         unsafe { wrmsr(PRED_CMD, 1) };
@@ -2335,14 +2339,14 @@ pub(crate) static PAT_READY: PerCpu<core::sync::atomic::AtomicBool> = PerCpu::ne
 /// Table 11-10), and marks this processor's CPU index if so. These are the architectural
 /// reset values; a firmware that changed them would make uncached mappings cacheable, so the
 /// kernel then refuses to map device registers rather than reprogramming caches it cannot
-/// see. Returns the PAT.
-pub fn check_pat() -> u64 {
+/// see. Returns the PAT. `me` is the index its flow read (ADR-0020 S3; TASKS item 93).
+pub fn check_pat(me: ThisCpu<'_>) -> u64 {
     // SAFETY: CPL 0; IA32_PAT exists on every x86-64 processor (CPUID 1 EDX bit 16) and
     // reading it has no side effect.
     let pat = unsafe { rdmsr(IA32_PAT) };
     if pat & 0xFF == 0x06
         && (pat >> 24) & 0xFF == 0x00
-        && let Some(ready) = PAT_READY.get(this_cpu().get())
+        && let Some(ready) = PAT_READY.this(me)
     {
         ready.store(true, Ordering::Relaxed);
     }
@@ -2724,17 +2728,19 @@ pub unsafe fn fpu_restore(area: u64) {
 ///
 /// CPL 0. The kernel must not rely on executing or accessing user pages from supervisor
 /// mode (it has none; a future user-copy path must set RFLAGS.AC around its accesses).
-pub unsafe fn enable_smep_smap() -> (bool, bool) {
+///
+/// `me` is the index its flow read (ADR-0020 S3; TASKS item 93).
+pub unsafe fn enable_smep_smap(me: ThisCpu<'_>) -> (bool, bool) {
     let (smep, smap) = smep_smap_supported();
     // The boot processor's answer decides what the kernel assumes: an AP that lacks SMAP
     // refuses to start (`smp::ap_entry`) and must not turn it off for everyone else.
-    if this_cpu() == CpuIndex::BOOT {
+    if me.index() == CpuIndex::BOOT {
         SMAP_ON.store(smap, Ordering::Relaxed);
     }
     // UMIP (CPUID.7.0:ECX bit 2): `sidt` from ring 3 would otherwise reveal the kernel's
     // descriptor-table addresses, and with them the KASLR slide (ADR-0004 H3).
     let umip = cpuid(0)[0] >= 7 && cpuid(7)[2] & (1 << 2) != 0;
-    if umip && this_cpu() == CpuIndex::BOOT {
+    if umip && me.index() == CpuIndex::BOOT {
         UMIP_ON.store(true, Ordering::Relaxed);
     }
     let bits = if smep { CR4_SMEP } else { 0 }

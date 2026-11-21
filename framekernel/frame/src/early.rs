@@ -529,14 +529,19 @@ impl Early {
     /// Enables SMEP and SMAP on the boot processor and proves both, on a temporary user page
     /// holding `mov rax, -1; ret`, which a supervisor fetch (SMEP) and a supervisor read
     /// (SMAP) must both fault on. The page is removed afterwards. Runs once, once the heap has
-    /// started; returns whether both protections hold.
-    pub fn prove_user_isolation(&mut self, com1: &mut dyn Write) -> bool {
+    /// started; returns whether both protections hold. `flow` is the boot flow's witness, under
+    /// which the index is read (ADR-0020 S3; TASKS item 93).
+    pub fn prove_user_isolation(
+        &mut self,
+        flow: crate::trap::Pinned<'_>,
+        com1: &mut dyn Write,
+    ) -> bool {
         if self.user_isolation || !self.heap {
             return false;
         }
         self.user_isolation = true;
         // SAFETY: CPL 0, and the kernel has no user mappings yet.
-        let (smep, smap) = unsafe { cpu::enable_smep_smap() };
+        let (smep, smap) = unsafe { cpu::enable_smep_smap(cpu::this_cpu_at(flow.here())) };
         if !(smep && smap) {
             let _ = writeln!(
                 com1,

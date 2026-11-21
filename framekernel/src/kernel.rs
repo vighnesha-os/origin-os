@@ -123,7 +123,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
     // Out of turn the boot steps do nothing, whoever calls them (`Early`): proven here, before
     // any of them has run, and below for a second run of each.
     let out_of_turn = !early.start_heap(&mut com1)
-        && !early.prove_user_isolation(&mut com1)
+        && !early.prove_user_isolation(flow, &mut com1)
         && early.build_kernel_tables(&mut com1).is_none()
         && timer::init(flow, &mut com1, info.acpi_rsdp).is_none();
 
@@ -241,7 +241,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         );
         heap_ok = prove_heap(&mut com1);
         record_or_stop(&mut com1, &mut proofs, Proof::Heap, heap_ok);
-        if heap_ok && !early.prove_user_isolation(&mut com1) {
+        if heap_ok && !early.prove_user_isolation(flow, &mut com1) {
             // Ring 3 comes next: a kernel that cannot keep itself from user pages must not
             // run it, any more than a processor below the baseline (and `prove_user_isolation`
             // has said why).
@@ -363,7 +363,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
             && !early.init_memory(&mut com1)
             && early.build_kernel_tables(&mut com1).is_none()
             && !early.start_heap(&mut com1)
-            && !early.prove_user_isolation(&mut com1)
+            && !early.prove_user_isolation(flow, &mut com1)
             && early.enable_simd() == xcr0
             && !iommu::init(
                 &mut com1,
@@ -440,7 +440,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         // use only the kernel's fixed programs, and the operator sees every result.
         sched::prove(flow, &mut com1, online.cpus(), tsc_hz, &mut proofs);
         // ADR-0017 Z3, after the proofs above have run several processes in ring 3.
-        proofs.record(Proof::Ibpb, prove_ibpb(&mut com1, online.cpus()));
+        proofs.record(Proof::Ibpb, prove_ibpb(flow, &mut com1, online.cpus()));
         stop_if_refused(&mut com1, proofs);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
         if let Some(q) = quiesced.as_mut()
@@ -455,7 +455,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
                         .filter(|r| r.verdict.is_ok())
                         .filter_map(|r| r.range.as_ref()),
                 ));
-                pcie::init(&mut com1, q, online.cpus(), regions, &reserved)
+                pcie::init(flow, &mut com1, q, online.cpus(), regions, &reserved)
             }
         {
             proofs.record(Proof::Pcie, true);
@@ -681,7 +681,11 @@ fn prove_nospec(com1: &mut Console) -> bool {
 /// ADR-0017 Z3: on every processor, one IBPB for each change of the process it runs in
 /// ring 3 where the processor has the command, and none where it has not; and the scheduler
 /// did note the processes the proofs before this one ran. Prints what one IBPB costs.
-fn prove_ibpb(com1: &mut Console, cpus: &[cpu::CpuIndex]) -> bool {
+fn prove_ibpb(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[cpu::CpuIndex],
+) -> bool {
     use origin_frame::speculation;
     let mut sound = true;
     let (mut changes, mut barriers, mut resumes) = (0u64, 0u64, 0u64);
@@ -706,7 +710,7 @@ fn prove_ibpb(com1: &mut Console, cpus: &[cpu::CpuIndex]) -> bool {
     let start = time::monotonic_nanos();
     let mut issued = 0;
     for _ in 0..SAMPLES {
-        issued += u64::from(cpu::issue_ibpb());
+        issued += u64::from(cpu::issue_ibpb(cpu::this_cpu_at(flow.here())));
     }
     let taken = time::monotonic_nanos().saturating_sub(start);
     let _ = if issued == SAMPLES {
