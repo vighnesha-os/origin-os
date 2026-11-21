@@ -12,13 +12,34 @@
 //! - for the QEMU scenarios, `ExitBootServices` given a stale map key once or twice
 //!   ([`stale_calls`], [`key_for`]), so the retry, and the halt, run under real firmware code.
 //!
-//! The entry stub and the kernel write one byte after each step (`RS12345678`). This module exists
-//! only under `cfg(origin_bench)`, and in the host tests; no image a normal build makes holds it
-//! (`cargo xtask check`, F1 and F2).
+//! The entry stub and the kernel write one byte after each step (`RS12345678`).
+//!
+//! TASKS item 116 adds what separates rental D's two readings, that `ExitBootServices` does not
+//! return on the rented firmware or that nothing written straight to its UART after the call
+//! reaches the console:
+//! - before the call, the UART's registers through the firmware's console ([`UartState`],
+//!   [`UnderFirmware`]), then one line straight to the UART ([`BEFORE_CALL`]), and one more just
+//!   before each call ([`MARK_FIRST`], [`MARK_RETRY`]);
+//! - after it, the registers read again, the firmware's values written back, and a line naming
+//!   what was read ([`AfterCall`]);
+//! - then, unless [`AFTER_PATH`] asks for the kernel, a reset however the call went: the
+//!   firmware's `ResetSystem` (decision item 344, ADR-0002 Amendment 3, a bench-only exception to
+//!   B5), and if the machine still runs, the FADT's reset register ([`find_reset`]). A reset
+//!   shows on the rented console as a new firmware start, which needs no UART.
+//!
+//! This module exists only under `cfg(origin_bench)`, and in the host tests; no image a normal
+//! build makes holds it (`cargo xtask check`, F1 and F2).
 
 use core::fmt;
 
-use crate::uart::ExitCalls;
+use origin_acpi_tables::ErrorKind;
+use origin_acpi_tables::fadt::Fadt;
+use origin_acpi_tables::gas::AddressSpace;
+use origin_acpi_tables::header::HEADER_LEN;
+use origin_boot_info::{MemoryRegion, RegionKind};
+
+use crate::spcr::{self, Missing};
+use crate::uart::{ExitCalls, POLLS, Port};
 
 /// How every line the bench loader adds begins: the text F2 looks for in images.
 pub const PREFIX: &str = "origin-boot: bench build: ";
@@ -156,6 +177,579 @@ pub const fn key_for(call: u8, stale: u8, key: usize) -> usize {
         key
     }
 }
+
+/// The file on the loader's volume that says what the bench loader does once `ExitBootServices`
+/// has returned, in QEMU scenarios only (TASKS item 116). A rented machine's volume never holds
+/// it: the rental tool refuses an ESP that does, so a rental takes [`After::Reset`].
+pub const AFTER_PATH: &str = "\\EFI\\ORIGIN\\BENCH-AFTER";
+
+/// What the bench loader does once `ExitBootServices` has returned, either way (TASKS item 116).
+/// Every mode writes the lines before the call and [`AfterCall`] after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum After {
+    /// No [`AFTER_PATH`]: the reset, and the kernel is not entered. What a rental runs.
+    Reset,
+    /// `kernel`: TASKS item 112's path. The kernel is entered after a successful call, and the
+    /// loader halts after a failed one, with no reset.
+    Kernel,
+    /// `fadt`: as [`After::Reset`], but `ResetSystem` is not called, as if it had returned, so
+    /// the FADT's reset register is what resets the machine.
+    Fadt,
+    /// `disturb`: as [`After::Reset`], once the loader itself has turned the UART's loopback on
+    /// and changed its divisor as soon as the call returns, as a firmware might as it exits.
+    /// Rental D's reading B1, made under QEMU, so that writing the firmware's values back is
+    /// seen to matter.
+    Disturb,
+}
+
+impl After {
+    /// The mode [`AFTER_PATH`]'s contents ask for, with any whitespace around the word; `None`
+    /// for anything else, which the loader takes as [`After::Reset`] and says so.
+    pub fn from_contents(contents: &[u8]) -> Option<Self> {
+        match contents.trim_ascii() {
+            b"kernel" => Some(Self::Kernel),
+            b"fadt" => Some(Self::Fadt),
+            b"disturb" => Some(Self::Disturb),
+            _ => None,
+        }
+    }
+
+    /// Whether the kernel is entered after a successful call.
+    pub const fn enters_kernel(self) -> bool {
+        matches!(self, Self::Kernel)
+    }
+
+    /// The loader's line on its console about the switch: `found` is `None` with no
+    /// [`AFTER_PATH`], `Some(None)` for contents not understood.
+    pub const fn said(found: Option<Option<Self>>) -> &'static str {
+        match found {
+            None => {
+                "no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered"
+            }
+            Some(None) => {
+                "BENCH-AFTER not understood: after ExitBootServices the loader resets the machine, and the kernel is not entered"
+            }
+            Some(Some(Self::Reset)) => {
+                "BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered"
+            }
+            Some(Some(Self::Kernel)) => {
+                "BENCH-AFTER kernel: after ExitBootServices the loader enters the kernel, or halts after a failed call"
+            }
+            Some(Some(Self::Fadt)) => {
+                "BENCH-AFTER fadt: after ExitBootServices the loader resets the machine through the FADT's reset register, without calling ResetSystem"
+            }
+            Some(Some(Self::Disturb)) => {
+                "BENCH-AFTER disturb: after ExitBootServices the loader turns the UART's loopback on and changes its divisor, then writes the firmware's values back, then resets the machine"
+            }
+        }
+    }
+}
+
+/// A 16550's registers, as offsets from its base (PC16550D): the transmit and receive buffer, or
+/// the divisor's low byte with DLAB set; the interrupt enable, or the divisor's high byte; the
+/// FIFO control (write only); line control; modem control; line status; modem status; scratch.
+const DATA: u16 = 0;
+const IER_DLM: u16 = 1;
+const FCR: u16 = 2;
+const LCR: u16 = 3;
+const MCR: u16 = 4;
+const LSR: u16 = 5;
+const MSR: u16 = 6;
+const SCR: u16 = 7;
+/// LCR's divisor-latch access bit.
+const DLAB: u8 = 0x80;
+/// MCR's loopback bit: what is sent goes to the receiver instead of the line.
+const LOOPBACK: u8 = 0x10;
+/// LSR's "transmitter empty": the holding register and the shift register are both empty.
+const TEMT: u8 = 0x40;
+/// FCR: the FIFOs on, both cleared.
+const FIFOS_ON_CLEARED: u8 = 0x07;
+
+/// A 16550's registers as the bench loader reads them, before `ExitBootServices` and after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UartState {
+    /// The interrupt enable register.
+    pub ier: u8,
+    /// Line control, as read: the value put back after reading the divisor.
+    pub lcr: u8,
+    /// Modem control.
+    pub mcr: u8,
+    /// Line status.
+    pub lsr: u8,
+    /// Modem status.
+    pub msr: u8,
+    /// The scratch register.
+    pub scratch: u8,
+    /// The divisor latch.
+    pub divisor: u16,
+}
+
+impl UartState {
+    /// Reads the UART at `base`. LCR is read first and written back as found last; the IER is read
+    /// with DLAB clear and the divisor with it set. Nothing else is written, and the receive
+    /// buffer is not read, so no byte is taken from it. A UART that is not there reads as all
+    /// ones, and the writes to LCR then go nowhere.
+    pub fn read<P: Port>(io: &mut P, base: u16) -> Self {
+        let at = |offset: u16| base.wrapping_add(offset);
+        let lcr = io.read(at(LCR));
+        io.write(at(LCR), lcr & !DLAB);
+        let ier = io.read(at(IER_DLM));
+        let mcr = io.read(at(MCR));
+        let lsr = io.read(at(LSR));
+        let msr = io.read(at(MSR));
+        let scratch = io.read(at(SCR));
+        io.write(at(LCR), lcr | DLAB);
+        let low = io.read(at(DATA));
+        let high = io.read(at(IER_DLM));
+        io.write(at(LCR), lcr);
+        Self {
+            ier,
+            lcr,
+            mcr,
+            lsr,
+            msr,
+            scratch,
+            divisor: u16::from_le_bytes([low, high]),
+        }
+    }
+
+    /// Writes these values back to the UART at `base`: the divisor, then LCR with DLAB clear, the
+    /// IER, MCR, and the FIFOs on and cleared, since FCR cannot be read. Waits first, for at most
+    /// [`POLLS`] line-status reads, until the transmitter is empty, so no byte of a line just
+    /// written is cleared away. Returns whether it emptied.
+    pub fn write_back<P: Port>(&self, io: &mut P, base: u16) -> bool {
+        let at = |offset: u16| base.wrapping_add(offset);
+        let emptied = (0..POLLS).any(|_| io.read(at(LSR)) & TEMT != 0);
+        let [low, high] = self.divisor.to_le_bytes();
+        io.write(at(LCR), self.lcr | DLAB);
+        io.write(at(DATA), low);
+        io.write(at(IER_DLM), high);
+        io.write(at(LCR), self.lcr & !DLAB);
+        io.write(at(IER_DLM), self.ier);
+        io.write(at(MCR), self.mcr);
+        io.write(at(FCR), FIFOS_ON_CLEARED);
+        emptied
+    }
+}
+
+impl fmt::Display for UartState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "IER {:#04x}, LCR {:#04x}, MCR {:#04x}, LSR {:#04x}, MSR {:#04x}, scratch {:#04x}, divisor {:#06x}",
+            self.ier, self.lcr, self.mcr, self.lsr, self.msr, self.scratch, self.divisor
+        )
+    }
+}
+
+/// The divisor [`disturb`] sets: one that is not `divisor`.
+pub const fn disturbed_divisor(divisor: u16) -> u16 {
+    if divisor == 0x000C { 0x0018 } else { 0x000C }
+}
+
+/// [`After::Disturb`]: what a firmware might do to the UART as it exits, done by the loader
+/// itself under QEMU. Loopback on, so nothing reaches the line, and another divisor.
+pub fn disturb<P: Port>(io: &mut P, base: u16, under: &UartState) {
+    let at = |offset: u16| base.wrapping_add(offset);
+    let [low, high] = disturbed_divisor(under.divisor).to_le_bytes();
+    io.write(at(LCR), under.lcr | DLAB);
+    io.write(at(DATA), low);
+    io.write(at(IER_DLM), high);
+    io.write(at(LCR), under.lcr & !DLAB);
+    io.write(at(MCR), under.mcr | LOOPBACK);
+}
+
+/// The bench loader's line on the firmware's console, before `ExitBootServices`: the UART the
+/// SPCR named, as the firmware left it, or that none was named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnderFirmware {
+    /// The UART's I/O port, 0 for none.
+    pub port: u16,
+    /// What was read there.
+    pub state: Option<UartState>,
+}
+
+impl fmt::Display for UnderFirmware {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(PREFIX)?;
+        match self.state {
+            Some(state) => write!(
+                f,
+                "the UART at I/O port {:#x} under the firmware: {state}",
+                self.port
+            ),
+            None => f.write_str(
+                "the SPCR names no UART in I/O space: no register is read, and no line goes straight to a UART",
+            ),
+        }
+    }
+}
+
+/// The line written straight to the UART before `ExitBootServices`, while the firmware still
+/// owns it.
+pub const BEFORE_CALL: &str =
+    "origin-boot: bench build: this line went straight to the UART, before ExitBootServices";
+/// Written straight to the UART just before the first call and before the retry, each on a line
+/// of its own: the memory map was read and the call is being made. Port writes leave memory, and
+/// so the map key, as they were.
+pub const MARK_FIRST: &str = "X";
+pub const MARK_RETRY: &str = "Y";
+
+/// The line written straight to the UART after `ExitBootServices` returned, either way, and after
+/// the registers were read again and the firmware's values written back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AfterCall {
+    /// What was read after the call.
+    pub read: UartState,
+    /// Whether the values read under the firmware were written back.
+    pub wrote_back: bool,
+}
+
+impl fmt::Display for AfterCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{PREFIX}after ExitBootServices the UART read {}; {}",
+            self.read,
+            if self.wrote_back {
+                "the firmware's values are written back"
+            } else {
+                "nothing was read under the firmware, so nothing is written back"
+            }
+        )
+    }
+}
+
+/// The FADT's reset register, once checked: where to write [`ResetRegister::value`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetRegister {
+    /// A system I/O port.
+    Io {
+        /// The port.
+        port: u16,
+        /// The value that resets the machine.
+        value: u8,
+    },
+    /// A byte of system memory, in memory-mapped I/O the firmware's map describes.
+    Memory {
+        /// Its physical address.
+        address: u64,
+        /// The value that resets the machine.
+        value: u8,
+    },
+}
+
+/// Why there is no reset register the bench loader will write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoReset {
+    /// The firmware's memory map could not be read, so no table was.
+    NoMap,
+    /// The walk found no FADT (`spcr`'s reasons, the same walk).
+    Missing(Missing),
+    /// The FADT declares more than [`MAX_FADT_LENGTH`] bytes.
+    TooLong(u32),
+    /// The FADT's bytes, from this address, are not in memory the firmware's map describes.
+    Unreadable(u64),
+    /// The shared parser refuses the FADT (`origin_acpi_tables::fadt`, the kernel's).
+    Table(ErrorKind),
+    /// The FADT's flags say there is no reset register (`RESET_REG_SUP` clear), or the table
+    /// ends before it.
+    NotSupported,
+    /// `RESET_REG` breaks ACPI 6.6's rules (§5.2.9: 8 bits at bit 0 in system I/O, system memory
+    /// or bus 0's configuration space).
+    Breaks,
+    /// It is in this address space, which the bench loader does not write: only system I/O and
+    /// system memory.
+    Space(AddressSpace),
+    /// An I/O port above `0xFFFF`.
+    Port(u64),
+    /// A memory address the firmware's map does not describe as memory-mapped I/O, so the
+    /// firmware's page tables may not map it.
+    NotMmio(u64),
+}
+
+/// The longest FADT read: ACPI 6.6's is 276 bytes.
+pub const MAX_FADT_LENGTH: usize = 1024;
+
+/// The FADT's reset register (ACPI 6.6 §4.8.3.6, §5.2.9), checked as untrusted input: the RSDP
+/// and XSDT as the SPCR's walk checks them, the first FADT whose header checks, the kernel's own
+/// parser (`RESET_REG_SUP`, 8 bits at bit 0, the value present), then system I/O or system memory
+/// only, an I/O port that fits 16 bits, and memory only where `is_mmio` says the firmware's map
+/// describes memory-mapped I/O. Every byte is read through `read`, as in `spcr::find`.
+pub fn find_reset(
+    rsdp: u64,
+    read: &mut impl FnMut(u64, &mut [u8]) -> bool,
+    is_mmio: impl Fn(u64) -> bool,
+) -> Result<ResetRegister, NoReset> {
+    let missing = |m| NoReset::Missing(m);
+    if rsdp == 0 {
+        return Err(missing(Missing::NoRsdp));
+    }
+    let mut bytes = [0u8; spcr::RSDP_LENGTH];
+    if !read(rsdp, &mut bytes) {
+        return Err(missing(Missing::RsdpUnreadable(rsdp)));
+    }
+    let xsdt = spcr::parse_rsdp(&bytes).map_err(|e| missing(Missing::Rsdp(e)))?;
+    let entries = spcr::check_xsdt(xsdt, read).map_err(missing)?;
+    let mut refused = None;
+    let mut unreadable = None;
+    for i in 0..entries {
+        let at = xsdt.wrapping_add(HEADER_LEN as u64 + 8 * u64::from(i));
+        let mut entry = [0u8; 8];
+        if !read(at, &mut entry) {
+            unreadable.get_or_insert(at);
+            continue;
+        }
+        let table = u64::from_le_bytes(entry);
+        if table == 0 {
+            continue;
+        }
+        let mut header = [0u8; HEADER_LEN];
+        if !read(table, &mut header) {
+            unreadable.get_or_insert(table);
+            continue;
+        }
+        if header.get(..4) != Some(&b"FACP"[..]) {
+            continue;
+        }
+        let declared = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        let len = declared as usize;
+        if len > MAX_FADT_LENGTH {
+            return Err(NoReset::TooLong(declared));
+        }
+        let mut whole = [0u8; MAX_FADT_LENGTH];
+        let whole = whole.get_mut(..len.max(HEADER_LEN)).unwrap_or(&mut []);
+        if !read(table, whole) {
+            return Err(NoReset::Unreadable(table));
+        }
+        match Fadt::parse(whole) {
+            Ok(fadt) => return register(&fadt, &is_mmio),
+            // A header that does not check: a later FADT may.
+            Err(e) => {
+                refused.get_or_insert(NoReset::Table(e.kind));
+            }
+        }
+    }
+    Err(match (refused, unreadable) {
+        (Some(why), _) => why,
+        (None, Some(at)) => missing(Missing::EntryUnreadable(at)),
+        (None, None) => missing(Missing::NotListed),
+    })
+}
+
+/// The bench loader's rules on a parsed FADT's reset register.
+fn register(fadt: &Fadt<'_>, is_mmio: &impl Fn(u64) -> bool) -> Result<ResetRegister, NoReset> {
+    if !fadt.flags.reset_reg_sup() || fadt.reset_reg.is_none() || fadt.reset_value.is_none() {
+        return Err(NoReset::NotSupported);
+    }
+    let (gas, value) = fadt.reset().ok_or(NoReset::Breaks)?;
+    match gas.space {
+        AddressSpace::SystemIo => u16::try_from(gas.address)
+            .map(|port| ResetRegister::Io { port, value })
+            .map_err(|_| NoReset::Port(gas.address)),
+        AddressSpace::SystemMemory if gas.address != 0 && is_mmio(gas.address) => {
+            Ok(ResetRegister::Memory {
+                address: gas.address,
+                value,
+            })
+        }
+        AddressSpace::SystemMemory => Err(NoReset::NotMmio(gas.address)),
+        other => Err(NoReset::Space(other)),
+    }
+}
+
+impl fmt::Display for ResetRegister {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Io { port, value } => write!(f, "{value:#x} to I/O port {port:#x}"),
+            Self::Memory { address, value } => write!(f, "{value:#x} to memory at {address:#x}"),
+        }
+    }
+}
+
+impl fmt::Display for NoReset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoMap => f.write_str("the memory map could not be read, so no table was"),
+            Self::Missing(Missing::NotListed) => f.write_str("the XSDT lists no FADT"),
+            Self::Missing(why) => write!(f, "no FADT: {why}"),
+            Self::TooLong(n) => write!(
+                f,
+                "the FADT declares {n} bytes, more than the loader reads ({MAX_FADT_LENGTH})"
+            ),
+            Self::Unreadable(at) => write!(
+                f,
+                "the FADT's bytes at {at:#x} are not in memory the firmware's map describes"
+            ),
+            Self::Table(kind) => write!(f, "the FADT is refused: {kind:?}"),
+            Self::NotSupported => {
+                f.write_str("the FADT's flags give no reset register (RESET_REG_SUP clear)")
+            }
+            Self::Breaks => f.write_str(
+                "RESET_REG breaks ACPI 6.6's rules (8 bits at bit 0, in I/O, memory or bus 0's configuration space)",
+            ),
+            Self::Space(space) => write!(
+                f,
+                "RESET_REG is in {space:?}, and this loader writes only system I/O or system memory"
+            ),
+            Self::Port(port) => write!(f, "RESET_REG names I/O port {port:#x}, above 0xffff"),
+            Self::NotMmio(at) => write!(
+                f,
+                "RESET_REG names memory at {at:#x}, which the firmware's map does not describe as memory-mapped I/O"
+            ),
+        }
+    }
+}
+
+/// The bench loader's line on the firmware's console about the FADT's reset register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResetLine(pub Result<ResetRegister, NoReset>);
+
+impl fmt::Display for ResetLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(PREFIX)?;
+        match self.0 {
+            Ok(register) => write!(f, "the FADT's reset register: write {register}"),
+            Err(why) => write!(f, "the FADT gives no usable reset register: {why}"),
+        }
+    }
+}
+
+/// `EFI_RUNTIME_SERVICES_SIGNATURE`, "RUNTSERV" (UEFI 2.11 §4.5.1).
+pub const RUNTIME_SERVICES_SIGNATURE: u64 = 0x5652_4553_544E_5552;
+/// `ResetSystem`'s offset in `EFI_RUNTIME_SERVICES` (UEFI 2.11 §4.5.1): after the 24-byte header,
+/// the ten pointers from `GetTime` to `GetNextHighMonotonicCount`.
+pub const RESET_SYSTEM_OFFSET: usize = 24 + 10 * 8;
+/// `EfiResetCold` (UEFI 2.11 §8.5.1.1).
+pub const RESET_COLD: u32 = 0;
+
+/// How long after its line the bench loader calls `ResetSystem`, then how long it waits before
+/// the FADT's register, then how long before it says that did not reset the machine either.
+pub const RESET_DELAY_MS: u64 = 5_000;
+pub const FALLBACK_DELAY_MS: u64 = 2_000;
+pub const AFTER_REGISTER_MS: u64 = 1_000;
+/// The firmware's `Stall` the time-stamp counter is counted over, before `ExitBootServices`.
+pub const CALIBRATION_US: usize = 20_000;
+/// The rate taken when it cannot be counted: above any rate a processor's counter runs at, so a
+/// wait is longer than asked for, never shorter.
+pub const ASSUMED_TICKS_PER_MS: u64 = 6_000_000;
+
+/// The time-stamp counter's ticks a millisecond, from `ticks` counted over [`CALIBRATION_US`] of
+/// the firmware's `Stall`, and whether it was counted: with no count, or a count below one tick a
+/// millisecond, [`ASSUMED_TICKS_PER_MS`].
+pub const fn ticks_per_ms(ticks: Option<u64>) -> (u64, bool) {
+    let ms = (CALIBRATION_US / 1_000) as u64;
+    match ticks {
+        Some(t) if t >= ms => (t / ms, true),
+        _ => (ASSUMED_TICKS_PER_MS, false),
+    }
+}
+
+/// Whether `at` lies in a region the firmware's map describes as memory-mapped I/O, which the
+/// firmware's page tables map while its own run (`memmap::translate`'s `Mmio`).
+pub fn in_mmio(regions: &[MemoryRegion], at: u64) -> bool {
+    regions.iter().any(|r| {
+        r.kind == RegionKind::Mmio as u32
+            && at
+                .checked_sub(r.base)
+                .is_some_and(|offset| offset < r.pages.saturating_mul(4096))
+    })
+}
+
+/// The bench loader's line on the firmware's console about the reset: whether `ResetSystem` can be
+/// called, and the counter's rate its waits use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResetPlan {
+    /// `ResetSystem`'s address, or why there is none.
+    pub reset_system: Result<u64, &'static str>,
+    /// The counter's ticks a millisecond.
+    pub ticks_per_ms: u64,
+    /// Whether that rate was counted, not assumed.
+    pub counted: bool,
+}
+
+impl fmt::Display for ResetPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(PREFIX)?;
+        match self.reset_system {
+            Ok(at) => write!(f, "ResetSystem is at {at:#x}")?,
+            Err(why) => write!(f, "ResetSystem will not be called: {why}")?,
+        }
+        write!(
+            f,
+            "; the time-stamp counter {} {} ticks a millisecond",
+            if self.counted {
+                "counted, over the firmware's Stall,"
+            } else {
+                "could not be counted, so the loader takes"
+            },
+            self.ticks_per_ms
+        )
+    }
+}
+
+/// The line straight to the UART when the reset begins: what comes first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResetSoon {
+    /// Whether `ResetSystem` will be called.
+    pub reset_system: bool,
+}
+
+impl fmt::Display for ResetSoon {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.reset_system {
+            write!(
+                f,
+                "{PREFIX}a cold reset through the firmware's ResetSystem in 5 s, and the FADT's reset register 2 s later if the machine still runs"
+            )
+        } else {
+            write!(
+                f,
+                "{PREFIX}a reset through the FADT's reset register in 7 s: ResetSystem is not called"
+            )
+        }
+    }
+}
+
+/// Whether `ResetSystem` was called before the FADT's register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tried {
+    /// It was called, and returned.
+    Returned,
+    /// [`After::Fadt`] asked for it not to be called.
+    NotCalled,
+    /// There was none to call.
+    Unavailable,
+}
+
+/// The line straight to the UART when `ResetSystem` did not reset the machine: the FADT's
+/// register next, or the halt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fallback {
+    /// What became of `ResetSystem`.
+    pub tried: Tried,
+    /// The FADT's register.
+    pub register: Result<ResetRegister, NoReset>,
+}
+
+impl fmt::Display for Fallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(PREFIX)?;
+        f.write_str(match self.tried {
+            Tried::Returned => "ResetSystem returned",
+            Tried::NotCalled => "ResetSystem was not called (BENCH-AFTER fadt)",
+            Tried::Unavailable => "there was no ResetSystem to call",
+        })?;
+        match self.register {
+            Ok(register) => write!(f, ": writing {register}, the FADT's reset register"),
+            Err(why) => write!(f, ", and the FADT gives no usable reset register ({why}): halting"),
+        }
+    }
+}
+
+/// The last line, when the FADT's register did not reset the machine either.
+pub const NOT_RESET: &str =
+    "origin-boot: bench build: the FADT's reset register did not reset the machine: halting";
 
 #[cfg(test)]
 mod tests {
@@ -341,5 +935,481 @@ mod tests {
         assert_eq!(calls.made(), 1);
         calls.record(Status::SUCCESS);
         assert_eq!(calls.made(), 2);
+    }
+
+    // TASKS item 116.
+
+    const BASE: u16 = 0x2F8;
+
+    /// A 16550 at `BASE` as PC16550D lays it out: the divisor behind DLAB, the FIFO control
+    /// write-only, and "transmitter empty" withheld for `busy` line-status reads.
+    struct Mock16550 {
+        dll: u8,
+        dlm: u8,
+        ier: u8,
+        lcr: u8,
+        mcr: u8,
+        lsr: u8,
+        msr: u8,
+        scr: u8,
+        fcr: Vec<u8>,
+        busy: u32,
+        sent: Vec<u8>,
+        received_reads: usize,
+    }
+
+    impl Mock16550 {
+        /// As a firmware's console leaves it: 115 200 baud from a 1.8432 MHz clock, 8N1, DTR,
+        /// RTS and OUT2, nothing pending.
+        fn firmware() -> Self {
+            Self {
+                dll: 1,
+                dlm: 0,
+                ier: 0,
+                lcr: 0x03,
+                mcr: 0x0B,
+                lsr: 0x60,
+                msr: 0xB0,
+                scr: 0,
+                fcr: Vec::new(),
+                busy: 0,
+                sent: Vec::new(),
+                received_reads: 0,
+            }
+        }
+
+        fn dlab(&self) -> bool {
+            self.lcr & DLAB != 0
+        }
+    }
+
+    impl Port for Mock16550 {
+        fn read(&mut self, port: u16) -> u8 {
+            match port - BASE {
+                0 if self.dlab() => self.dll,
+                0 => {
+                    self.received_reads += 1;
+                    0
+                }
+                1 if self.dlab() => self.dlm,
+                1 => self.ier,
+                2 => 0xC1,
+                3 => self.lcr,
+                4 => self.mcr,
+                5 if self.busy > 0 => {
+                    self.busy -= 1;
+                    self.lsr & !TEMT
+                }
+                5 => self.lsr,
+                6 => self.msr,
+                7 => self.scr,
+                _ => panic!("{port:#x} is not one of the UART's ports"),
+            }
+        }
+
+        fn write(&mut self, port: u16, value: u8) {
+            match port - BASE {
+                0 if self.dlab() => self.dll = value,
+                0 => self.sent.push(value),
+                1 if self.dlab() => self.dlm = value,
+                1 => self.ier = value,
+                2 => self.fcr.push(value),
+                3 => self.lcr = value,
+                4 => self.mcr = value,
+                7 => self.scr = value,
+                _ => panic!("{port:#x} is written, and is not writable"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_uart_is_read_whole_and_left_as_found() {
+        let mut uart = Mock16550::firmware();
+        uart.ier = 0x05;
+        uart.scr = 0x5A;
+        let state = UartState::read(&mut uart, BASE);
+        assert_eq!(
+            state,
+            UartState {
+                ier: 0x05,
+                lcr: 0x03,
+                mcr: 0x0B,
+                lsr: 0x60,
+                msr: 0xB0,
+                scratch: 0x5A,
+                divisor: 1,
+            }
+        );
+        assert_eq!(uart.lcr, 0x03, "LCR is put back as found");
+        assert_eq!(uart.received_reads, 0, "the receive buffer is never read");
+        assert!(uart.sent.is_empty() && uart.fcr.is_empty());
+        // A firmware that left DLAB set: the IER is still read with it clear, and LCR is put back.
+        let mut uart = Mock16550::firmware();
+        uart.lcr = 0x83;
+        uart.ier = 0x01;
+        uart.dll = 0x0C;
+        let state = UartState::read(&mut uart, BASE);
+        assert_eq!((state.ier, state.divisor, state.lcr), (0x01, 0x0C, 0x83));
+        assert_eq!(uart.lcr, 0x83);
+        assert_eq!(
+            state.to_string(),
+            "IER 0x01, LCR 0x83, MCR 0x0b, LSR 0x60, MSR 0xb0, scratch 0x00, divisor 0x000c"
+        );
+    }
+
+    #[test]
+    fn writing_back_undoes_what_a_firmware_might_do() {
+        let mut uart = Mock16550::firmware();
+        let under = UartState::read(&mut uart, BASE);
+        disturb(&mut uart, BASE, &under);
+        let after = UartState::read(&mut uart, BASE);
+        assert_eq!(after.mcr, 0x0B | LOOPBACK);
+        assert_eq!(after.divisor, 0x000C);
+        assert_eq!(after.lcr, 0x03);
+        assert!(under.write_back(&mut uart, BASE));
+        assert_eq!(UartState::read(&mut uart, BASE), under);
+        assert_eq!(uart.fcr, [FIFOS_ON_CLEARED]);
+        assert!(uart.sent.is_empty());
+        assert_eq!(disturbed_divisor(1), 0x000C);
+        assert_eq!(disturbed_divisor(0x000C), 0x0018);
+    }
+
+    #[test]
+    fn writing_back_waits_a_bounded_time_for_the_transmitter() {
+        let mut uart = Mock16550::firmware();
+        let under = UartState::read(&mut uart, BASE);
+        uart.busy = 5;
+        assert!(under.write_back(&mut uart, BASE));
+        assert_eq!(uart.busy, 0);
+        // Never empty: the values are written back anyway, after the bound.
+        let mut uart = Mock16550::firmware();
+        uart.mcr = 0x1B;
+        uart.busy = POLLS + 10;
+        assert!(!under.write_back(&mut uart, BASE));
+        assert_eq!(uart.busy, 10);
+        assert_eq!(uart.mcr, 0x0B);
+        assert_eq!(uart.fcr, [FIFOS_ON_CLEARED]);
+    }
+
+    #[test]
+    fn the_lines_around_the_call() {
+        let state = UartState {
+            ier: 0,
+            lcr: 0x03,
+            mcr: 0x0B,
+            lsr: 0x60,
+            msr: 0xB0,
+            scratch: 0,
+            divisor: 1,
+        };
+        assert_eq!(
+            UnderFirmware {
+                port: 0x2F8,
+                state: Some(state)
+            }
+            .to_string(),
+            "origin-boot: bench build: the UART at I/O port 0x2f8 under the firmware: IER 0x00, LCR 0x03, MCR 0x0b, LSR 0x60, MSR 0xb0, scratch 0x00, divisor 0x0001"
+        );
+        assert_eq!(
+            UnderFirmware {
+                port: 0,
+                state: None
+            }
+            .to_string(),
+            "origin-boot: bench build: the SPCR names no UART in I/O space: no register is read, and no line goes straight to a UART"
+        );
+        assert_eq!(
+            AfterCall {
+                read: state,
+                wrote_back: true
+            }
+            .to_string(),
+            "origin-boot: bench build: after ExitBootServices the UART read IER 0x00, LCR 0x03, MCR 0x0b, LSR 0x60, MSR 0xb0, scratch 0x00, divisor 0x0001; the firmware's values are written back"
+        );
+        assert!(BEFORE_CALL.starts_with(PREFIX));
+        assert!(NOT_RESET.starts_with(PREFIX));
+        assert_eq!((MARK_FIRST, MARK_RETRY), ("X", "Y"));
+    }
+
+    #[test]
+    fn the_after_switch() {
+        assert_eq!(After::from_contents(b"kernel\n"), Some(After::Kernel));
+        assert_eq!(After::from_contents(b" fadt "), Some(After::Fadt));
+        assert_eq!(After::from_contents(b"disturb\r\n"), Some(After::Disturb));
+        for other in [&b""[..], b"reset", b"Kernel", b"kernel fadt", b"1"] {
+            assert_eq!(After::from_contents(other), None, "{other:?}");
+        }
+        assert!(After::Kernel.enters_kernel());
+        for mode in [After::Reset, After::Fadt, After::Disturb] {
+            assert!(!mode.enters_kernel(), "{mode:?}");
+        }
+        assert!(After::said(None).starts_with("no BENCH-AFTER: "));
+        assert!(After::said(Some(None)).contains("not understood"));
+        assert!(After::said(Some(Some(After::Kernel))).contains("enters the kernel"));
+    }
+
+    #[test]
+    fn the_counter_rate_and_the_runtime_table() {
+        assert_eq!(ticks_per_ms(Some(76_000_000)), (3_800_000, true));
+        assert_eq!(ticks_per_ms(None), (ASSUMED_TICKS_PER_MS, false));
+        assert_eq!(ticks_per_ms(Some(5)), (ASSUMED_TICKS_PER_MS, false));
+        assert_eq!(&RUNTIME_SERVICES_SIGNATURE.to_le_bytes(), b"RUNTSERV");
+        assert_eq!(RESET_SYSTEM_OFFSET, 104);
+        let plan = ResetPlan {
+            reset_system: Ok(0x7F00_1000),
+            ticks_per_ms: 3_800_000,
+            counted: true,
+        };
+        assert_eq!(
+            plan.to_string(),
+            "origin-boot: bench build: ResetSystem is at 0x7f001000; the time-stamp counter counted, over the firmware's Stall, 3800000 ticks a millisecond"
+        );
+    }
+
+    const RSDP_AT: u64 = 0x9000_0014;
+    const XSDT_AT: u64 = 0x9000_1000;
+    const FADT_AT: u64 = 0x9000_2000;
+    const OTHER_AT: u64 = 0x9000_3000;
+
+    fn seal(t: &mut [u8], at: usize) {
+        t[at] = 0;
+        let sum = t.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+        t[at] = 0u8.wrapping_sub(sum);
+    }
+
+    fn rsdp(xsdt: u64) -> Vec<u8> {
+        let mut r = vec![0u8; 36];
+        r[..8].copy_from_slice(b"RSD PTR ");
+        r[9..15].copy_from_slice(b"ORIGIN");
+        r[15] = 2;
+        r[20..24].copy_from_slice(&36u32.to_le_bytes());
+        r[24..32].copy_from_slice(&xsdt.to_le_bytes());
+        let first = r[..20].iter().fold(0u8, |s, &b| s.wrapping_add(b));
+        r[8] = 0u8.wrapping_sub(first);
+        let all = r.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+        r[32] = 0u8.wrapping_sub(all);
+        r
+    }
+
+    fn xsdt(entries: &[u64]) -> Vec<u8> {
+        let mut t = vec![0u8; 36];
+        t[..4].copy_from_slice(b"XSDT");
+        t[8] = 1;
+        t[10..16].copy_from_slice(b"ORIGIN");
+        t.extend(entries.iter().flat_map(|e| e.to_le_bytes()));
+        let len = t.len() as u32;
+        t[4..8].copy_from_slice(&len.to_le_bytes());
+        seal(&mut t, 9);
+        t
+    }
+
+    fn gas(space: u8, width: u8, offset: u8, access: u8, address: u64) -> [u8; 12] {
+        let mut g = [0u8; 12];
+        g[..4].copy_from_slice(&[space, width, offset, access]);
+        g[4..].copy_from_slice(&address.to_le_bytes());
+        g
+    }
+
+    /// An ACPI 6.6 FADT of 276 bytes with a DSDT, `flags`, and the reset register and value.
+    fn fadt(flags: u32, reset: [u8; 12], value: u8) -> Vec<u8> {
+        let mut t = vec![0u8; 276];
+        t[..4].copy_from_slice(b"FACP");
+        t[4..8].copy_from_slice(&276u32.to_le_bytes());
+        t[8] = 6;
+        t[10..16].copy_from_slice(b"ORIGIN");
+        t[40..44].copy_from_slice(&0x7FF0_0000u32.to_le_bytes());
+        t[112..116].copy_from_slice(&flags.to_le_bytes());
+        t[116..128].copy_from_slice(&reset);
+        t[128] = value;
+        seal(&mut t, 9);
+        t
+    }
+
+    const RESET_REG_SUP: u32 = 1 << 10;
+
+    /// Reads `[at, at + out.len())` from `memory`, as the loader's `read` does from described
+    /// memory.
+    fn read_from(memory: &[(u64, Vec<u8>)], at: u64, out: &mut [u8]) -> bool {
+        memory.iter().any(|(base, bytes)| {
+            let src = at
+                .checked_sub(*base)
+                .and_then(|o| usize::try_from(o).ok())
+                .and_then(|o| bytes.get(o..o.checked_add(out.len())?));
+            src.map(|src| out.copy_from_slice(src)).is_some()
+        })
+    }
+
+    fn reset_of(fadt_bytes: Vec<u8>) -> Result<ResetRegister, NoReset> {
+        let memory = vec![
+            (RSDP_AT, rsdp(XSDT_AT)),
+            (XSDT_AT, xsdt(&[OTHER_AT, FADT_AT])),
+            (OTHER_AT, xsdt(&[])),
+            (FADT_AT, fadt_bytes),
+        ];
+        find_reset(
+            RSDP_AT,
+            &mut |at, out| read_from(&memory, at, out),
+            |at| (0xFED0_0000..0xFED0_1000).contains(&at),
+        )
+    }
+
+    #[test]
+    fn the_reset_register_of_qemu_and_of_the_rented_board() {
+        // QEMU's q35: system I/O 0xCF9, the value 6.
+        assert_eq!(
+            reset_of(fadt(RESET_REG_SUP, gas(1, 8, 0, 1, 0xCF9), 6)),
+            Ok(ResetRegister::Io {
+                port: 0xCF9,
+                value: 6
+            })
+        );
+        // The rented board's shape (rental D's findings): system I/O 0xB2, the value 0xBE, the
+        // access size left undefined.
+        let board = reset_of(fadt(RESET_REG_SUP, gas(1, 8, 0, 0, 0xB2), 0xBE));
+        assert_eq!(
+            board,
+            Ok(ResetRegister::Io {
+                port: 0xB2,
+                value: 0xBE
+            })
+        );
+        assert_eq!(
+            ResetLine(board).to_string(),
+            "origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2"
+        );
+        // Memory-mapped I/O the map describes.
+        assert_eq!(
+            reset_of(fadt(RESET_REG_SUP, gas(0, 8, 0, 1, 0xFED0_0080), 0x0E)),
+            Ok(ResetRegister::Memory {
+                address: 0xFED0_0080,
+                value: 0x0E
+            })
+        );
+    }
+
+    #[test]
+    fn a_reset_register_that_breaks_a_rule_is_not_written() {
+        let refused = [
+            (fadt(0, gas(1, 8, 0, 1, 0xCF9), 6), NoReset::NotSupported),
+            (
+                fadt(RESET_REG_SUP, gas(1, 16, 0, 2, 0xCF9), 6),
+                NoReset::Breaks,
+            ),
+            (
+                fadt(RESET_REG_SUP, gas(1, 8, 1, 1, 0xCF9), 6),
+                NoReset::Breaks,
+            ),
+            (
+                fadt(RESET_REG_SUP, gas(3, 8, 0, 1, 0x66), 6),
+                NoReset::Breaks,
+            ),
+            (
+                fadt(RESET_REG_SUP, gas(2, 8, 0, 1, 0x0001_0000_0064), 6),
+                NoReset::Space(AddressSpace::PciConfig),
+            ),
+            (
+                fadt(RESET_REG_SUP, gas(1, 8, 0, 1, 0x1_0000), 6),
+                NoReset::Port(0x1_0000),
+            ),
+            (
+                fadt(RESET_REG_SUP, gas(0, 8, 0, 1, 0x8000_0000), 6),
+                NoReset::NotMmio(0x8000_0000),
+            ),
+            (
+                fadt(RESET_REG_SUP, gas(0, 8, 0, 1, 0), 6),
+                NoReset::NotMmio(0),
+            ),
+        ];
+        for (table, want) in refused {
+            assert_eq!(reset_of(table), Err(want), "{want:?}");
+        }
+        // A FADT that does not sum to zero is refused by the shared parser.
+        let mut bad = fadt(RESET_REG_SUP, gas(1, 8, 0, 1, 0xCF9), 6);
+        bad[200] ^= 1;
+        assert_eq!(reset_of(bad), Err(NoReset::Table(ErrorKind::Checksum)));
+        // A FADT declaring more than the loader reads.
+        let mut long = fadt(RESET_REG_SUP, gas(1, 8, 0, 1, 0xCF9), 6);
+        long[4..8].copy_from_slice(&2048u32.to_le_bytes());
+        assert_eq!(reset_of(long), Err(NoReset::TooLong(2048)));
+    }
+
+    #[test]
+    fn no_fadt_no_register() {
+        let memory = vec![(RSDP_AT, rsdp(XSDT_AT)), (XSDT_AT, xsdt(&[OTHER_AT]))];
+        let mut read = |at, out: &mut [u8]| read_from(&memory, at, out);
+        assert_eq!(
+            find_reset(RSDP_AT, &mut read, |_| false),
+            Err(NoReset::Missing(Missing::EntryUnreadable(OTHER_AT)))
+        );
+        let memory = vec![
+            (RSDP_AT, rsdp(XSDT_AT)),
+            (XSDT_AT, xsdt(&[OTHER_AT])),
+            (OTHER_AT, xsdt(&[])),
+        ];
+        let mut read = |at, out: &mut [u8]| read_from(&memory, at, out);
+        let none = find_reset(RSDP_AT, &mut read, |_| false);
+        assert_eq!(none, Err(NoReset::Missing(Missing::NotListed)));
+        assert_eq!(
+            ResetLine(none).to_string(),
+            "origin-boot: bench build: the FADT gives no usable reset register: the XSDT lists no FADT"
+        );
+        assert_eq!(
+            find_reset(0, &mut read, |_| false),
+            Err(NoReset::Missing(Missing::NoRsdp))
+        );
+    }
+
+    #[test]
+    fn memory_mapped_io_is_what_the_map_says_it_is() {
+        let region = |base: u64, pages: u64, kind: RegionKind| MemoryRegion {
+            base,
+            pages,
+            kind: kind as u32,
+            reserved: 0,
+        };
+        let map = [
+            region(0x1000, 0x10, RegionKind::Usable),
+            region(0xFED0_0000, 1, RegionKind::Mmio),
+        ];
+        assert!(in_mmio(&map, 0xFED0_0000));
+        assert!(in_mmio(&map, 0xFED0_0FFF));
+        assert!(!in_mmio(&map, 0xFED0_1000));
+        assert!(!in_mmio(&map, 0x2000));
+        assert!(!in_mmio(&map, 0));
+    }
+
+    #[test]
+    fn the_reset_lines() {
+        assert_eq!(
+            ResetSoon { reset_system: true }.to_string(),
+            "origin-boot: bench build: a cold reset through the firmware's ResetSystem in 5 s, and the FADT's reset register 2 s later if the machine still runs"
+        );
+        assert_eq!(
+            ResetSoon {
+                reset_system: false
+            }
+            .to_string(),
+            "origin-boot: bench build: a reset through the FADT's reset register in 7 s: ResetSystem is not called"
+        );
+        let register = Ok(ResetRegister::Io {
+            port: 0xCF9,
+            value: 6,
+        });
+        assert_eq!(
+            Fallback {
+                tried: Tried::NotCalled,
+                register
+            }
+            .to_string(),
+            "origin-boot: bench build: ResetSystem was not called (BENCH-AFTER fadt): writing 0x6 to I/O port 0xcf9, the FADT's reset register"
+        );
+        assert_eq!(
+            Fallback {
+                tried: Tried::Returned,
+                register: Err(NoReset::NotSupported)
+            }
+            .to_string(),
+            "origin-boot: bench build: ResetSystem returned, and the FADT gives no usable reset register (the FADT's flags give no reset register (RESET_REG_SUP clear)): halting"
+        );
     }
 }

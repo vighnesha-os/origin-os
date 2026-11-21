@@ -227,8 +227,9 @@ fn walk(rsdp: u64, read: &mut impl FnMut(u64, &mut [u8]) -> bool) -> Result<Foun
     })
 }
 
-/// The RSDP's checks, as the kernel's `parse_rsdp`: the XSDT's address.
-fn parse_rsdp(b: &[u8; RSDP_LENGTH]) -> Result<u64, RsdpError> {
+/// The RSDP's checks, as the kernel's `parse_rsdp`: the XSDT's address. The bench loader's walk
+/// to the FADT uses it too (TASKS item 116).
+pub(crate) fn parse_rsdp(b: &[u8; RSDP_LENGTH]) -> Result<u64, RsdpError> {
     let sums_to_zero = |b: &[u8]| b.iter().fold(0u8, |s, &x| s.wrapping_add(x)) == 0;
     if b.get(..8) != Some(&b"RSD PTR "[..]) {
         return Err(RsdpError::Signature);
@@ -252,8 +253,8 @@ fn parse_rsdp(b: &[u8; RSDP_LENGTH]) -> Result<u64, RsdpError> {
 }
 
 /// Checks the XSDT at `xsdt` (signature, length, whole-table checksum) and returns how many
-/// entries it lists.
-fn check_xsdt(xsdt: u64, read: &mut impl FnMut(u64, &mut [u8]) -> bool) -> Result<u32, Missing> {
+/// entries it lists. The bench loader's walk to the FADT uses it too (TASKS item 116).
+pub(crate) fn check_xsdt(xsdt: u64, read: &mut impl FnMut(u64, &mut [u8]) -> bool) -> Result<u32, Missing> {
     let mut header = [0u8; HEADER_LENGTH];
     if !read(xsdt, &mut header) {
         return Err(Missing::XsdtUnreadable(xsdt));
