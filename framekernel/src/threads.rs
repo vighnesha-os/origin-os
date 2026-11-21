@@ -38,7 +38,7 @@ use origin_frame::sync::SpinLock;
 use origin_frame::sync::exits::Mark;
 use origin_frame::sync::threads::{Block, Empty, Record};
 
-use crate::cpu::{CpuIndex, without_interrupts};
+use crate::cpu::{CpuIndex, ThisCpu, without_interrupts};
 use crate::process::UserContext;
 use crate::runqueue::CAPACITY;
 
@@ -52,6 +52,13 @@ const _: () = assert!(
 
 // A record's location names its slot in 16 bits (`origin_sync::threads::Location`).
 const _: () = assert!(CAPACITY <= u16::MAX as usize, "a slot fits a location");
+
+// A record is two 64-byte lines, as TASKS item 92 measured it: its pin count (TASKS item 93) took
+// room that was there, and did not grow it (the coordinating session's ruling Q9).
+const _: () = assert!(
+    core::mem::size_of::<Record<State>>() == 128,
+    "a record is 128 bytes, its pin count included"
+);
 
 /// What a record holds: everything a thread owns from its spawn to its reap.
 pub(crate) struct State {
@@ -117,6 +124,12 @@ pub(crate) static THREADS: PerCpu<Processor> = PerCpu::new(
 /// Processor `cpu`'s [`Table`].
 pub(crate) fn table(cpu: usize) -> Option<&'static SpinLock<Table>> {
     Some(&THREADS.get(cpu)?.table)
+}
+
+/// This processor's [`Table`], lent for the life of the witness `me` was read under (ADR-0020 S3;
+/// TASKS item 93).
+pub(crate) fn table_here(me: ThisCpu<'_>) -> Option<&SpinLock<Table>> {
+    Some(&THREADS.this(me)?.table)
 }
 
 /// What a run-queue slot holds of its thread's record (`RunQueue<Placed>`): its number, for the
