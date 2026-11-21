@@ -144,8 +144,8 @@ pub mod originfs;
 pub mod pin;
 pub mod program;
 pub use origin_frame::{
-    acpi, amdvi, apic, apstart, bitmap, boot, clock, cpumap, descriptors, dmar, features, frames,
-    heap, ivrs, pci, topology, unwind, usercopy, vtd,
+    acpi, amdvi, apic, apstart, bitmap, boot, capacity, clock, cpumap, descriptors, dmar, domains,
+    features, frames, heap, ivrs, pci, topology, unwind, usercopy, vtd,
 };
 pub use origin_paging as paging;
 pub mod ps2;
