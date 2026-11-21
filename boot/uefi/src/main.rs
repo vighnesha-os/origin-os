@@ -1391,8 +1391,9 @@ fn rdmsr(msr: u32) -> u64 {
 }
 
 /// Reads a bench switch, [`bench::STALE_KEY_PATH`], [`bench::AFTER_PATH`] or
-/// [`fch::SWITCH_PATH`], from the loader's volume, in a bench build: `None` if there is no such file, else its first bytes and how many
-/// were read. Reads at most 32 bytes into the stack: nothing is allocated.
+/// [`fch::SWITCH_PATH`], from the loader's volume, in a bench build: `None` if there is no such
+/// file, else its first bytes and how many were read. Reads at most 32 bytes into the stack:
+/// nothing is allocated.
 #[cfg(origin_bench)]
 fn read_bench_file(image: Handle, bs: &BootServices, name: &str) -> Option<([u8; 32], usize)> {
     let loaded = protocol::<LoadedImageProtocol>(bs, image, &LOADED_IMAGE_PROTOCOL).ok()?;

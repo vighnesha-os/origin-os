@@ -364,9 +364,9 @@ const FRAME_2M: u64 = 0x000F_FFFF_FFE0_0000;
 /// A 1 GiB leaf's frame bits.
 const FRAME_1G: u64 = 0x000F_FFFF_C000_0000;
 
-/// Walks the four-level page tables at `cr3` for `va`, following 1 GiB and 2 MiB pages (Intel SDM
-/// Volume 3A, §4.5; AMD64 APM Volume 2, §5.3), to the physical address the leaf gives. Every entry
-/// is read through `read`.
+/// Walks the four-level page tables at `cr3` for `va`, following 1 GiB and 2 MiB pages (Intel
+/// SDM Volume 3A, §4.5; AMD64 APM Volume 2, §5.3), to the physical address the leaf gives. Every
+/// entry is read through `read`.
 pub fn walk(
     cr3: u64,
     la57: bool,
@@ -893,7 +893,7 @@ impl fmt::Display for DecisionLine {
                 match layout {
                     Layout::AllOnes(name) => write!(f, "{name} reads all ones")?,
                     Layout::SeveralCauses(status) => {
-                        write!(f, "PMxC0 {status:#010x} names more than one reset cause")
+                        write!(f, "PMxC0 {status:#010x} names more than one reset cause")?
                     }
                     Layout::Pm1Differs { block, fadt } => write!(
                         f,
