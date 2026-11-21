@@ -1047,6 +1047,30 @@ def scope_verdict(lscpu):
     return f"{vendor}: outside the scope; bench equipment"
 
 
+BENCH_LINE = "origin-boot: bench build:"
+CRUMB_BYTES = "RS12345678"
+
+
+def breadcrumbs(text):
+    """A bench build's breadcrumbs in one boot's console text (TASKS item 112): the bytes the
+    entry stub and the kernel wrote between the loader's last line and the kernel's first,
+    `RS12345678` when every step passed, so the last one names the step the boot stopped after.
+    None for a boot that was not a bench build's (no bench loader line), "" for one that wrote
+    none."""
+    if BENCH_LINE not in text:
+        return None
+    after = text[text.rfind(LOADER_LINE):]
+    after = after[after.find("\n") + 1:] if "\n" in after else ""
+    # Only the run that starts right after the loader's line: a firmware's text after a reset,
+    # or another system's, may hold the same letters (TASKS item 112's review, R112-6).
+    run = ""
+    for c in after.lstrip("\r\n"):
+        if c not in CRUMB_BYTES:
+            break
+        run += c
+    return run
+
+
 def boot_result(text):
     """What one boot showed on the console: the kernel's verdict or refusal, the line it halted
     on, or how far it got. `loader` and `kernel` say whether each printed anything: the loader
@@ -1055,16 +1079,20 @@ def boot_result(text):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     seen = {"loader": any(LOADER_LINE in l for l in lines),
             "kernel": any(KERNEL_LINE in l for l in lines)}
+    crumbs = breadcrumbs(text)
+    if crumbs is not None:
+        seen["breadcrumbs"] = crumbs
+    said = "" if crumbs is None else f"; breadcrumbs: {crumbs or 'none'}"
     verdict = next((l for l in lines if VERDICT_LINE in l or REFUSED_LINE in l), None)
     halted = next((l for l in lines if KERNEL_LINE in l and any(h in l for h in HALTED_LINES)), None)
     origin = [l for l in lines if KERNEL_LINE in l or LOADER_LINE in l]
     if verdict or halted:
         line = verdict or halted
-        return {"ended": True, "summary": line[line.find(KERNEL_LINE):], **seen}
+        return {"ended": True, "summary": line[line.find(KERNEL_LINE):] + said, **seen}
     if any("login:" in l for l in lines):
         return {"ended": True, "summary": "a system other than Origin started (a login prompt)", **seen}
     last = origin[-1] if origin else (lines[-1] if lines else "nothing on the console")
-    return {"ended": False, "summary": f"no verdict; last line: {last[:200]}", **seen}
+    return {"ended": False, "summary": f"no verdict; last line: {last[:200]}{said}", **seen}
 
 
 def last_boot(result):
@@ -1127,7 +1155,9 @@ def cmd_rental_b(args):
         rental.ssh("rm -rf /tmp/origin && mkdir -m 700 /tmp/origin", check=True, timeout=60)
         subprocess.run(["scp", "-q"] + ssh_base(rental.dir)[1:] + [str(loader), str(kernel),
                        f"{OS_USER}@{rental.ip}:/tmp/origin/"], check=True, timeout=300)
-        install = (f"set -eu; test -f '{target}'; "
+        # TASKS item 112: a bench loader's stale-key switch is for QEMU scenarios only; the rented
+        # ESP never holds it, so the board takes its natural path through ExitBootServices.
+        install = (f"set -eu; test -f '{target}'; test ! -e /boot/efi/EFI/ORIGIN/BENCH-STALE-KEY; "
                    f"install -D -m 0644 /tmp/origin/KERNEL.ONBF /boot/efi/EFI/ORIGIN/KERNEL.ONBF; "
                    f"cp /tmp/origin/BOOTX64.EFI '{target}'; sync; "
                    f"sha256sum '{target}' /boot/efi/EFI/ORIGIN/KERNEL.ONBF")
@@ -1137,7 +1167,7 @@ def cmd_rental_b(args):
             raise RuntimeError("the files on the ESP do not match the image")
         (rental.dir / "installed.txt").write_text(f"{entry} {path}; {last}\n{' '.join(sums)}\n")
         print(f"{stamp()} Origin's loader is {path}, and its kernel \\EFI\\ORIGIN\\KERNEL.ONBF; "
-              "no UEFI variable was written")
+              "no UEFI variable was written, and the ESP holds no BENCH-STALE-KEY")
         console = rental.console
         if not console:
             raise RuntimeError("no serial console: a boot would show nothing")
