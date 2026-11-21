@@ -115,6 +115,12 @@ pub(crate) enum Topology {
     Many,
     /// The discovery machine: 2 processors of the 4096 the MADT lists.
     Listed,
+    /// The SMT machine of ADR-0020 S23: one package of four two-thread cores, two NUMA nodes of
+    /// two cores each (TASKS item 97).
+    Smt,
+    /// The two-package machine of ADR-0020 S23: two packages of four single-thread cores, a
+    /// NUMA node each (TASKS item 97).
+    Packages,
 }
 
 /// A machine's RAM, in MiB (TASKS item 83): at least 512, and even, so its two NUMA nodes each
@@ -408,6 +414,8 @@ impl Topology {
             Topology::Sparse => Some("sparse"),
             Topology::Many => Some("many"),
             Topology::Listed => Some("listed"),
+            Topology::Smt => Some("smt"),
+            Topology::Packages => Some("packages"),
         }
     }
 }
@@ -456,9 +464,11 @@ fn topology(name: Option<&str>, smp: Option<&str>) -> Result<Topology> {
         Some("sparse") => Topology::Sparse,
         Some("many") => Topology::Many,
         Some("listed") => Topology::Listed,
+        Some("smt") => Topology::Smt,
+        Some("packages") => Topology::Packages,
         Some(other) => {
             return Err(format!(
-                "{TOPOLOGY} must be x2apic, sparse, many or listed, or unset for the plain machine of {SMP} processors, not {other:?}"
+                "{TOPOLOGY} must be x2apic, sparse, many, listed, smt or packages, or unset for the plain machine of {SMP} processors, not {other:?}"
             ));
         }
     };

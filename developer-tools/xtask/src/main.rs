@@ -98,6 +98,9 @@ commands:
               under QEMU's software processor: measured and recorded, outside the gate
   boot-listed boot-test with 2 processors enabled of the 4096 the MADT lists
               (ADR-0008 Amendment 1, D7)
+  boot-domains boot-test on ADR-0020 S23's two machines: one package of four two-thread
+              cores in two NUMA nodes, and two packages of four cores, a node each, with a
+              PPTT; each prints its scheduling domains (TASKS item 97; part of boot-matrix)
   boot-console the kernel's console on machines without a 16550 at 0x3F8 (ADR-0010): a UART
               named by an ACPI SPCR table, a table that must be refused, no display, and no
               UART at all (with a framebuffer the only way to see the boot)
@@ -210,7 +213,8 @@ environment:
                                       (default: the EDK2 files installed next to QEMU)
   ORIGIN_BOOT_MATRIX_ANY_COUNT        on or off: in CI (GITHUB_ACTIONS=true), whether
                                       boot-matrix runs the 3- and 65-processor machines, the
-                                      67-processor sparse machine and the discovery machine;
+                                      67-processor sparse machine, the discovery machine,
+                                      the SMT machine and the two-package machine;
                                       elsewhere they always run
   ORIGIN_BOOT_TEST_TIMEOUT            boot-test timeout in seconds (default 120)
   ORIGIN_BOOT_TEST_ONLY               run only the boot-test or boot-console scenarios whose
@@ -224,9 +228,12 @@ environment:
                                       processors, 64 in package 0 and three at APIC IDs 256,
                                       300 and 412; many: two packages of 144 cores, 288
                                       processors with APIC IDs 0-143 and 256-399; listed: 2
-                                      processors of 4096 the MADT lists (ORIGIN_QEMU_SMP is
-                                      refused with any of them; ADR-0008 Amendment 1, D7);
-                                      unset: the plain machine of ORIGIN_QEMU_SMP processors
+                                      processors of 4096 the MADT lists; smt: one package
+                                      of four two-thread cores in two nodes; packages: two
+                                      packages of four cores, a node each (ORIGIN_QEMU_SMP is
+                                      refused with any of them; ADR-0008 Amendment 1, D7;
+                                      ADR-0020 S23); unset: the plain machine of
+                                      ORIGIN_QEMU_SMP processors
   ORIGIN_QEMU_CPU                     the QEMU CPU model (default max), e.g. max,-avx2 or
                                       max,vendor=GenuineIntel (which exposes leaf 1Fh on
                                       the boot-x2apic machine)
@@ -489,8 +496,14 @@ fn acpi_machine_args(cpus: u32) -> Vec<String> {
 /// names its processor, if it has one, and the initiator nearest its memory, which the HMAT
 /// needs: QEMU spreads processors over the nodes itself only after it has read the HMAT's
 /// options, which refuse an initiator with no processor yet.
-fn numa_node(id: u32, cpus: u32, acpi: bool) -> String {
+fn numa_node(id: u32, machine: &Machine, acpi: bool) -> String {
+    let cpus = machine.cpus();
     let node = format!("node,nodeid={id},memdev=onuma{id}");
+    if let Some(ranges) = machine.node_cpus
+        && let Some(range) = ranges.get(id as usize)
+    {
+        return format!("{node},cpus={range}");
+    }
     if !acpi {
         return node;
     }
@@ -717,6 +730,167 @@ struct Machine {
     highest: u32,
     /// How `-smp` lays out the topology, for the proof of it.
     geometry: Geometry,
+    /// The NUMA node of each CPU index: QEMU's own placement, a package's index modulo the two
+    /// nodes (measured with QMP's `query-cpus-fast` on QEMU 11.1.3, 2026-11-21: every processor
+    /// of a one-socket machine in node 0), unless `node_cpus` names them.
+    nodes: Vec<u32>,
+    /// The `cpus=` of each of the two `-numa node`s, where the machine places its processors
+    /// itself (TASKS item 97, ruling Q5: the SMT and two-package machines).
+    node_cpus: Option<[&'static str; 2]>,
+    /// A PPTT the machine's firmware is given (`-acpitable`), and how it groups the L3.
+    pptt: Option<Pptt>,
+}
+
+/// A PPTT the machine's firmware is given (TASKS item 97; the coordinating session's ruling Q6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pptt {
+    /// Which processors its L3 is shared by.
+    l3: L3,
+    /// Whether its L3s carry valid Cache IDs (control C3 takes them away).
+    cache_ids: bool,
+}
+
+/// Which processors a PPTT's L3 is shared by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum L3 {
+    /// A package's, as CPUID says on every machine here (`SMP_CACHE`).
+    Package,
+    /// A NUMA node's: what control C2 plants on the SMT machine, where CPUID says a package's.
+    /// Built only by the control's one-line edit and by the host test of the table.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "control C2's table: built by its edit and its host test")
+    )]
+    Node,
+}
+
+/// Processor hierarchy node flags and cache attributes of ACPI 6.6 §5.2.31 (Tables 5.190 to
+/// 5.192): a physical package, a valid processor ID, a thread, a leaf; every cache property
+/// valid, and the Cache ID too; unified, data and instruction caches.
+const PPTT_PACKAGE: u32 = 1;
+const PPTT_ID_VALID: u32 = 2;
+const PPTT_THREAD: u32 = 4;
+const PPTT_LEAF: u32 = 8;
+const PPTT_PROPERTIES: u32 = 0x7F;
+const PPTT_CACHE_ID: u32 = 0x80;
+const PPTT_UNIFIED: u8 = 0b1000;
+const PPTT_DATA: u8 = 0b0000;
+const PPTT_INSTRUCTION: u8 = 0b0100;
+
+/// `machine`'s PPTT, revision 3, built here from ACPI 6.6 §5.2.31's layouts and independently of
+/// the kernel's reading of it. A node for each package (and, for [`L3::Node`], one for each NUMA
+/// node in it, which holds the L3), one for each core, and a leaf for each processor, named by
+/// its CPU index, which is QEMU's ACPI processor ID in its MADT (measured: TASKS item 97's
+/// records). One L1 instruction, one L1 data and one L2 structure are listed under every core,
+/// which ACPI reads as one cache of each per core ("for compactness"); each L3 is a structure of
+/// its own.
+fn pptt_table(machine: &Machine, plan: Pptt) -> Vec<u8> {
+    fn add(table: &mut Vec<u8>, structure: Vec<u8>) -> u32 {
+        let at = table.len() as u32;
+        table.extend(structure);
+        at
+    }
+    fn cache(flags: u32, attributes: u8, next: u32, id: u32) -> Vec<u8> {
+        let mut c = vec![1, 28, 0, 0];
+        c.extend(flags.to_le_bytes());
+        c.extend(next.to_le_bytes());
+        c.extend((1u32 << 20).to_le_bytes());
+        c.extend(1024u32.to_le_bytes());
+        c.extend([16, attributes, 64, 0]);
+        c.extend(id.to_le_bytes());
+        c
+    }
+    fn node(flags: u32, parent: u32, uid: u32, resources: &[u32]) -> Vec<u8> {
+        let mut n = vec![0, (20 + 4 * resources.len()) as u8, 0, 0];
+        n.extend(flags.to_le_bytes());
+        n.extend(parent.to_le_bytes());
+        n.extend(uid.to_le_bytes());
+        n.extend((resources.len() as u32).to_le_bytes());
+        for r in resources {
+            n.extend(r.to_le_bytes());
+        }
+        n
+    }
+    let mut t = vec![0u8; 36];
+    t[..4].copy_from_slice(b"PPTT");
+    t[8] = 3;
+    t[10..16].copy_from_slice(b"ORIGIN");
+    t[16..24].copy_from_slice(b"ORIGPPTT");
+    t[24..28].copy_from_slice(&1u32.to_le_bytes());
+    t[28..32].copy_from_slice(b"ORIG");
+    t[32..36].copy_from_slice(&1u32.to_le_bytes());
+    let l2 = add(&mut t, cache(PPTT_PROPERTIES, PPTT_UNIFIED, 0, 0));
+    let l1i = add(&mut t, cache(PPTT_PROPERTIES, PPTT_INSTRUCTION, l2, 0));
+    let l1d = add(&mut t, cache(PPTT_PROPERTIES, PPTT_DATA, l2, 0));
+    let g = machine.geometry;
+    let (threads, package_at) = (Geometry::bits(g.threads), g.package_at());
+    let mut next_id = 1;
+    let mut l3 = |t: &mut Vec<u8>| {
+        let (flags, id) = if plan.cache_ids {
+            (PPTT_PROPERTIES | PPTT_CACHE_ID, next_id)
+        } else {
+            (PPTT_PROPERTIES, 0)
+        };
+        next_id += 1;
+        add(t, cache(flags, PPTT_UNIFIED, 0, id))
+    };
+    for package in 0..g.packages {
+        let in_package: Vec<(u32, u32)> = (0..machine.cpus())
+            .map(|index| (index, machine.apic_ids[index as usize]))
+            .filter(|&(_, id)| id >> package_at == package)
+            .collect();
+        let package_node = match plan.l3 {
+            L3::Package => {
+                let cache = l3(&mut t);
+                add(&mut t, node(PPTT_PACKAGE, 0, package, &[cache]))
+            }
+            L3::Node => add(&mut t, node(PPTT_PACKAGE, 0, package, &[])),
+        };
+        // The node each processor's L3 hangs from: the package, or its NUMA node's group.
+        let mut groups: Vec<(u32, u32)> = Vec::new();
+        let mut parent_of = |t: &mut Vec<u8>, index: u32| -> u32 {
+            if plan.l3 == L3::Package {
+                return package_node;
+            }
+            let numa = machine.nodes[index as usize];
+            if let Some(&(_, at)) = groups.iter().find(|&&(n, _)| n == numa) {
+                return at;
+            }
+            let cache = l3(t);
+            let at = add(t, node(0, package_node, 0, &[cache]));
+            groups.push((numa, at));
+            at
+        };
+        let mut cores: Vec<(u32, u32)> = Vec::new();
+        for &(index, id) in &in_package {
+            let core_key = id >> threads;
+            let parent = parent_of(&mut t, index);
+            if g.threads == 1 {
+                add(
+                    &mut t,
+                    node(PPTT_ID_VALID | PPTT_LEAF, parent, index, &[l1i, l1d]),
+                );
+                continue;
+            }
+            let core = match cores.iter().find(|&&(k, _)| k == core_key) {
+                Some(&(_, at)) => at,
+                None => {
+                    let at = add(&mut t, node(0, parent, 0, &[l1i, l1d]));
+                    cores.push((core_key, at));
+                    at
+                }
+            };
+            add(
+                &mut t,
+                node(PPTT_ID_VALID | PPTT_THREAD | PPTT_LEAF, core, index, &[]),
+            );
+        }
+    }
+    let len = t.len() as u32;
+    t[4..8].copy_from_slice(&len.to_le_bytes());
+    let sum = t.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+    t[9] = 0u8.wrapping_sub(sum);
+    t
 }
 
 /// How many of each topology domain `-smp` builds, per parent.
@@ -764,6 +938,15 @@ impl Geometry {
         ids
     }
 
+    /// The bits of an APIC ID below the package's: the package's index is the ID shifted by
+    /// this many.
+    fn package_at(&self) -> u32 {
+        Self::bits(self.threads)
+            + Self::bits(self.cores)
+            + Self::bits(self.modules)
+            + Self::bits(self.dies)
+    }
+
     /// Whether the machine has a level CPUID leaf 1Fh describes (QEMU exposes the leaf only
     /// for die or module levels).
     fn has_extended_levels(&self) -> bool {
@@ -784,6 +967,29 @@ impl Machine {
     }
 }
 
+/// The machine the boot uses ([`machine_shape`]), with each CPU index's NUMA node: QEMU places a
+/// processor in its package's index modulo the two nodes unless the machine names them; on the
+/// ACPI machine each `-numa node` names its processor ([`numa_node`]).
+fn machine(settings: &Settings) -> Machine {
+    let mut machine = machine_shape(settings);
+    if machine.nodes.is_empty() {
+        let package_at = machine.geometry.package_at();
+        machine.nodes = machine
+            .apic_ids
+            .iter()
+            .enumerate()
+            .map(|(index, &id)| {
+                if settings.acpi && index < 2 {
+                    index as u32
+                } else {
+                    (id >> package_at) % 2
+                }
+            })
+            .collect();
+    }
+    machine
+}
+
 /// The machine the boot uses: `-smp N` (QEMU numbers the processors 0 to N-1), or with
 /// `ORIGIN_QEMU_TOPOLOGY=x2apic` a sparse one. There, 2 packages of 3 dies × 5 modules × 5
 /// cores take 2 + 3 + 3 bits of the APIC ID below the package, so package 1 starts at APIC
@@ -791,7 +997,7 @@ impl Machine {
 /// package 1 (APIC ID 256, docs/research/2026-11-08-x2apic-above-255.md) and one at package 1,
 /// die 2, module 3, core 4 (APIC ID 412): its die, module and core are all non-zero, so a
 /// decoder that confuses them shows (docs/research/2026-11-08-cpu-topology-leaf-1fh.md).
-fn machine(settings: &Settings) -> Machine {
+fn machine_shape(settings: &Settings) -> Machine {
     let cpus = match settings.topology {
         Topology::Plain(cpus) => cpus,
         Topology::X2apic => {
@@ -799,6 +1005,9 @@ fn machine(settings: &Settings) -> Machine {
             // type after the model (`max` -> `max-x86_64-cpu`) and applies `-cpu`'s features.
             let base = settings.cpu.split(',').next().unwrap_or("max");
             return Machine {
+                nodes: Vec::new(),
+                node_cpus: None,
+                pptt: None,
                 smp: "1,maxcpus=150,sockets=2,dies=3,modules=5,cores=5,threads=1".into(),
                 devices: vec![
                     format!(
@@ -838,6 +1047,9 @@ fn machine(settings: &Settings) -> Machine {
             let mut apic_ids: Vec<u32> = (0..SPARSE_PRESENT).collect();
             apic_ids.extend(plugged.iter().map(|core| 256 + core));
             return Machine {
+                nodes: Vec::new(),
+                node_cpus: None,
+                pptt: None,
                 smp: format!(
                     "{SPARSE_PRESENT},maxcpus={},sockets=2,cores={SPARSE_CORES},threads=1",
                     2 * SPARSE_CORES
@@ -864,6 +1076,9 @@ fn machine(settings: &Settings) -> Machine {
             };
             let apic_ids = geometry.ids();
             return Machine {
+                nodes: Vec::new(),
+                node_cpus: None,
+                pptt: None,
                 smp: format!("{0},sockets=2,cores={MANY_CORES},threads=1", 2 * MANY_CORES),
                 devices: Vec::new(),
                 listed: apic_ids.len() as u32,
@@ -872,10 +1087,46 @@ fn machine(settings: &Settings) -> Machine {
                 geometry,
             };
         }
+        Topology::Smt | Topology::Packages => {
+            // ADR-0020 S23 (TASKS item 97): eight processors, two NUMA nodes each. The SMT
+            // machine is one package of four two-thread cores, its nodes two cores each, siblings
+            // never split (ruling Q5); the two-package machine is two packages of four
+            // single-thread cores, a node each, with a PPTT that agrees with CPUID (ruling Q6).
+            let smt = settings.topology == Topology::Smt;
+            let geometry = Geometry {
+                packages: if smt { 1 } else { 2 },
+                dies: 1,
+                modules: 1,
+                cores: 4,
+                threads: if smt { 2 } else { 1 },
+            };
+            let apic_ids = geometry.ids();
+            return Machine {
+                smp: if smt {
+                    "8,sockets=1,cores=4,threads=2".into()
+                } else {
+                    "8,sockets=2,cores=4,threads=1".into()
+                },
+                devices: Vec::new(),
+                listed: 8,
+                highest: 7,
+                nodes: (0..8).map(|i| i / 4).collect(),
+                node_cpus: Some(["0-3", "4-7"]),
+                pptt: (!smt).then_some(Pptt {
+                    l3: L3::Package,
+                    cache_ids: true,
+                }),
+                apic_ids,
+                geometry,
+            };
+        }
         Topology::Listed => {
             // ADR-0008 Amendment 1, D7: the discovery machine. The MADT lists every processor q35
             // allows, 4096, in one package; two are present and enabled.
             return Machine {
+                nodes: Vec::new(),
+                node_cpus: None,
+                pptt: None,
                 smp: format!("2,maxcpus={LISTED},sockets=1,cores={LISTED},threads=1"),
                 devices: Vec::new(),
                 apic_ids: vec![0, 1],
@@ -892,6 +1143,9 @@ fn machine(settings: &Settings) -> Machine {
         }
     };
     Machine {
+        nodes: Vec::new(),
+        node_cpus: None,
+        pptt: None,
         smp: cpus.to_string(),
         devices: Vec::new(),
         apic_ids: (0..cpus).collect(),
@@ -974,6 +1228,187 @@ fn topology_markers(machine: &Machine, leaf_1f: bool) -> Vec<String> {
         1u32 << package_at
     ));
     markers
+}
+
+/// The cache leaf the guest reports its caches' sharing in, as `cargo xtask` sets the machine up
+/// (TASKS item 97): leaf 04H on an Intel guest; Fn8000_001D on an AMD guest under KVM whose host
+/// has TopologyExtensions (QEMU's software processor refuses it, measured with QEMU 11.1.3 on
+/// 2026-11-21); otherwise none, an AMD guest's leaf 04H being zero.
+fn cache_leaf(settings: &Settings) -> Option<&'static str> {
+    if guest_is_intel(&settings.cpu, settings.accel, host_is_intel()) {
+        Some("leaf 04H")
+    } else if settings.accel == Accel::Kvm
+        && !settings.cpu_lacks("topoext")
+        && host_has_flag("topoext")
+    {
+        Some("leaf 8000001DH")
+    } else {
+        None
+    }
+}
+
+/// Whether this host's processor lists `flag` (read only for KVM, which needs a Linux host).
+fn host_has_flag(flag: &str) -> bool {
+    fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| {
+        info.lines()
+            .filter(|l| l.starts_with("flags"))
+            .any(|l| l.split_whitespace().any(|f| f == flag))
+    })
+}
+
+/// The scheduling domains the kernel must report (ADR-0020 S8, S23; TASKS item 97), computed here
+/// from the `-smp` fields, the NUMA placement and the caches `SMP_CACHE` pins, never from the
+/// kernel's view: each level's groups, narrowest first, a level equal to the one below merged and
+/// named after both, a level of single processors left out. `cache_leaf` is the leaf the guest
+/// reports its caches in, if any: the L2 is then a core's and the last level a package's.
+/// `leaf_1f` as [`topology_markers`]: only leaf 1Fh enumerates dies.
+fn domain_tree(machine: &Machine, cache_leaf: bool, leaf_1f: bool) -> String {
+    let g = machine.geometry;
+    let threads = Geometry::bits(g.threads);
+    let package_at = g.package_at();
+    let die_at = package_at - Geometry::bits(g.dies);
+    let ids = &machine.apic_ids;
+    let n = ids.len();
+    let keyed = |key: &dyn Fn(usize) -> u64| -> Vec<usize> {
+        (0..n)
+            .map(|i| (0..n).find(|&j| key(j) == key(i)).unwrap_or(i))
+            .collect()
+    };
+    let mut levels: Vec<(Vec<&str>, Vec<usize>)> = Vec::new();
+    let mut add = |name: &'static str, groups: Vec<usize>| {
+        levels.push((vec![name], groups));
+    };
+    add("core", keyed(&|i| u64::from(ids[i] >> threads)));
+    if cache_leaf {
+        add("L2", keyed(&|i| u64::from(ids[i] >> threads)));
+        add(
+            "last-level cache",
+            keyed(&|i| u64::from(ids[i] >> package_at)),
+        );
+    }
+    if leaf_1f && g.dies > 1 {
+        add("die", keyed(&|i| u64::from(ids[i] >> die_at)));
+    }
+    add("package", keyed(&|i| u64::from(ids[i] >> package_at)));
+    add("node", keyed(&|i| u64::from(machine.nodes[i])));
+    let count = |groups: &[usize]| (0..n).filter(|&i| groups[i] == i).count();
+    // Narrowest first; a stable sort keeps the names in the kernel's order within one size.
+    levels.sort_by_key(|(_, groups)| std::cmp::Reverse(count(groups)));
+    let mut merged: Vec<(Vec<&str>, Vec<usize>)> = Vec::new();
+    for (names, groups) in levels {
+        match merged.last_mut() {
+            Some((top, same)) if *same == groups => top.extend(names),
+            _ => merged.push((names, groups)),
+        }
+    }
+    let order = ["core", "L2", "last-level cache", "die", "package", "node"];
+    let lines: Vec<String> = merged
+        .into_iter()
+        .filter(|(_, groups)| n == 1 || count(groups) != n)
+        .map(|(mut names, groups)| {
+            names.sort_by_key(|name| order.iter().position(|o| o == name));
+            let mut members: Vec<Vec<usize>> = Vec::new();
+            for i in 0..n {
+                match members.iter_mut().find(|m| groups[m[0]] == groups[i]) {
+                    Some(m) => m.push(i),
+                    None => members.push(vec![i]),
+                }
+            }
+            let size = members[0].len();
+            let shape = if members.iter().all(|m| m.len() == size) {
+                format!("{}x{size}", members.len())
+            } else {
+                format!("{} groups", members.len())
+            };
+            let ranges: Vec<String> = members.iter().map(|m| index_ranges(m)).collect();
+            format!("{} {shape} [{}]", names.join(", "), ranges.join("|"))
+        })
+        .collect();
+    format!(
+        "origin-kernel: domains: {n} processors: {}",
+        lines.join("; ")
+    )
+}
+
+/// `0-3,8-11`: ascending indexes as ranges.
+fn index_ranges(sorted: &[usize]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let start = sorted[i];
+        while i + 1 < sorted.len() && sorted[i + 1] == sorted[i] + 1 {
+            i += 1;
+        }
+        out.push(if sorted[i] == start {
+            start.to_string()
+        } else {
+            format!("{start}-{}", sorted[i])
+        });
+        i += 1;
+    }
+    out.join(",")
+}
+
+/// The scheduling-domains proof's lines (TASKS item 97): the tree; where its claims came from,
+/// exactly under QEMU's software processor and only its start under KVM, where the host's
+/// processor decides the leaf; that nothing disagreed; and every processor at capacity 1024. With
+/// `-cpu host` QEMU may hand the guest the host's own cache leaves, which `SMP_CACHE` does not
+/// pin, so there only the tree's start is held.
+fn domain_markers(machine: &Machine, settings: &Settings, leaf_1f: bool) -> Vec<String> {
+    let n = machine.cpus();
+    let leaf = cache_leaf(settings);
+    let tree = domain_tree(machine, leaf.is_some(), leaf_1f);
+    let host = settings.cpu.split(',').next() == Some("host");
+    let mut nodes: Vec<u32> = machine.nodes.clone();
+    nodes.sort_unstable();
+    nodes.dedup();
+    // Two nodes at distance 21 (`-numa dist`), the ACPI machine's third holding no processor.
+    let order: Vec<String> = nodes
+        .iter()
+        .map(|&from| {
+            let others: Vec<String> = nodes
+                .iter()
+                .filter(|&&to| to != from)
+                .map(u32::to_string)
+                .collect();
+            format!("{from} [{}]", others.join(","))
+        })
+        .collect();
+    let pptt = match machine.pptt {
+        None => "PPTT none".to_string(),
+        Some(plan) => {
+            let l3s = match plan.l3 {
+                L3::Package => machine.geometry.packages,
+                L3::Node => nodes.len() as u32,
+            };
+            format!(
+                "PPTT {} caches, {} with IDs",
+                3 + l3s,
+                if plan.cache_ids { l3s } else { 0 }
+            )
+        }
+    };
+    let from = format!(
+        "origin-kernel: domains: from: caches by {} on {n} of {n}; {pptt}; nodes by the SRAT, nearest first: {}",
+        leaf.unwrap_or("no cache leaf"),
+        order.join(", ")
+    );
+    vec![
+        if host {
+            format!("origin-kernel: domains: {n} processors: ")
+        } else {
+            tree
+        },
+        if settings.accel == Accel::Tcg {
+            from
+        } else {
+            "origin-kernel: domains: from: caches by ".into()
+        },
+        "origin-kernel: domains: 0 claims cut, 0 differing from the PPTT, 0 in no node, 0 recorded nothing; levels crossing: none".into(),
+        format!(
+            "origin-kernel: domains: capacity 1024 on {n} of {n} processors (ADR-0020 S9 source 5: no hardware source is read before TASKS item 106); consistent true"
+        ),
+    ]
 }
 
 /// The kernel boot on the machine `settings` describe, with its markers for that machine.
@@ -2124,6 +2559,13 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             "origin-kernel: slit: ".into(),
             "; consistent true".into(),
         ])
+        // The scheduling domains (ADR-0020 S8; TASKS item 97).
+        .chain(domain_markers(
+            machine,
+            settings,
+            machine.geometry.has_extended_levels()
+                && guest_is_intel(&settings.cpu, settings.accel, host_is_intel()),
+        ))
         .chain(acpi_markers(settings.acpi))
         .chain(measured_stack_markers())
         .chain(aml_markers(settings.acpi))
@@ -4088,6 +4530,7 @@ fn main() -> ExitCode {
         ["boot-sparse"] => in_turn_with_settings("boot-sparse", boot_sparse),
         ["boot-many"] => in_turn_with_settings("boot-many", boot_many),
         ["boot-listed"] => in_turn_with_settings("boot-listed", boot_listed),
+        ["boot-domains"] => in_turn_with_settings("boot-domains", boot_domains),
         ["boot-console"] => in_turn_with_settings("boot-console", boot_console),
         ["boot-bridge"] => in_turn_with_settings("boot-bridge", boot_bridge),
         ["boot-reserved"] => in_turn_with_settings("boot-reserved", boot_reserved),
@@ -4154,8 +4597,8 @@ fn entry_settings(command: &str, settings: Settings) -> Result<Settings> {
 /// reserved memory, ACPI tables, RAM and table shapes itself (the coordinating session's ruling R5
 /// of 2026-11-19; TASKS item 83). The list is of names, so a new scenario command of
 /// `boot-matrix`'s belongs here, by hand; the host test
-/// `each_kind_of_command_takes_or_refuses_the_person_s_machine_at_entry` holds these thirteen.
-const SETS_ITS_MACHINES: [&str; 13] = [
+/// `each_kind_of_command_takes_or_refuses_the_person_s_machine_at_entry` holds these fourteen.
+const SETS_ITS_MACHINES: [&str; 14] = [
     "boot-matrix",
     "boot-x2apic",
     "boot-bridge",
@@ -4167,6 +4610,7 @@ const SETS_ITS_MACHINES: [&str; 13] = [
     "boot-sparse",
     "boot-many",
     "boot-listed",
+    "boot-domains",
     "boot-large",
     "boot-rented",
 ];
@@ -4228,6 +4672,15 @@ fn boot_matrix(base: &Settings) -> Result {
         boot_machine(&run)?;
         check_stack_bases_so_far(&bases)?;
     }
+    // ADR-0020 S23's machines (TASKS item 97), held out of CI as D7's are until a CI run with
+    // them on shows their proofs pass under KVM at two guest processors a host processor (the
+    // coordinating session's ruling Q9 of 2026-11-21).
+    if any_count {
+        for run in domain_runs(base) {
+            boot_machine(&run)?;
+            check_stack_bases_so_far(&bases)?;
+        }
+    }
     boot_x2apic(base)?;
     boot_bridge(base)?;
     boot_reserved(base)?;
@@ -4248,7 +4701,7 @@ fn boot_matrix(base: &Settings) -> Result {
         boot_listed(base)?;
     } else {
         println!(
-            "xtask: boot-matrix: the machines of ADR-0008 Amendment 1, D7 (3 and 65 processors, the 67-processor sparse machine, the discovery machine) are not run in CI until each one's time has been measured and accepted (set ORIGIN_BOOT_MATRIX_ANY_COUNT=on to run them)"
+            "xtask: boot-matrix: the machines of ADR-0008 Amendment 1, D7 (3 and 65 processors, the 67-processor sparse machine, the discovery machine) and of ADR-0020 S23 (the SMT machine, the two-package machine) are not run in CI until each one's time has been measured and accepted (set ORIGIN_BOOT_MATRIX_ANY_COUNT=on to run them)"
         );
     }
     // ADR-0004 Amendment 2, A6.4: the boots placed the kernel stacks' region apart.
@@ -4266,7 +4719,7 @@ fn boot_matrix(base: &Settings) -> Result {
         },
         base.large_memory().qemu(),
         if any_count {
-            ", the 67-processor sparse machine, the discovery machine"
+            ", the 67-processor sparse machine, the discovery machine, the SMT machine, the two-package machine"
         } else {
             ""
         }
@@ -4374,6 +4827,56 @@ fn many_runs(base: &Settings) -> Vec<MachineRun> {
         },
         failed: "boot-test on the large sparse machine".into(),
     }]
+}
+
+/// `boot-test` on ADR-0020 S23's two machines (TASKS item 97): the SMT machine under Intel VT-d
+/// and the two-package machine under AMD-Vi (the coordinating session's ruling Q8), the kernel
+/// boot alone on each.
+fn boot_domains(base: &Settings) -> Result {
+    boot_machines(domain_runs(base))?;
+    println!(
+        "xtask: boot-domains passed (the SMT machine under VT-d, the two-package machine under AMD-Vi)"
+    );
+    Ok(())
+}
+
+/// [`boot_domains`]'s machines. Under QEMU's software processor each is an Intel guest, whose leaf
+/// 04H reports which processors share its caches (ruling Q4 (a)); under KVM the guest is the
+/// host's vendor.
+fn domain_runs(base: &Settings) -> Vec<MachineRun> {
+    let cpu = if base.accel == Accel::Tcg && !base.cpu.contains("vendor=") {
+        format!("{},vendor=GenuineIntel", base.cpu)
+    } else {
+        base.cpu.clone()
+    };
+    [
+        (
+            Topology::Smt,
+            Iommu::Intel,
+            "the SMT machine, one package of four two-thread cores in two NUMA nodes",
+            "intel",
+        ),
+        (
+            Topology::Packages,
+            Iommu::Amd,
+            "the two-package machine, four cores and a NUMA node a package, with a PPTT",
+            "amd",
+        ),
+    ]
+    .into_iter()
+    .map(|(topology, iommu, what, name)| MachineRun {
+        said: format!("xtask: boot-domains: {what}, the {name} IOMMU"),
+        settings: Settings {
+            topology,
+            iommu,
+            cpu: cpu.clone(),
+            only: KERNEL_BOOT.into(),
+            timeout: Some(timeout_for(base, 8)),
+            ..base.clone()
+        },
+        failed: format!("boot-test on {what}"),
+    })
+    .collect()
 }
 
 /// `boot-test` on the discovery machine (ADR-0008 Amendment 1, D7): the MADT lists the 4096
@@ -6849,13 +7352,21 @@ fn qemu_path_arg(options: &str, path: &Path) -> Result<String> {
     Ok(format!("{options}{}", p.replace(',', ",,")))
 }
 
+/// Which processors share each cache, pinned on every machine (TASKS item 97; the coordinating
+/// session's ruling Q4 (b)): L1 data and instructions and L2 per core, L3 per package. The
+/// scheduling-domains proof's expected tree then follows from `cargo xtask`'s own options, under
+/// QEMU's software processor and KVM alike, wherever the guest reports its caches at all (leaf 04H
+/// on an Intel guest, Fn8000_001D on an AMD guest with TopologyExtensions, which TCG does not
+/// emulate). QEMU 11.1.3 accepted it on every machine of `boot-matrix` (checked 2026-11-21).
+const SMP_CACHE: &str = "smp-cache.0.cache=l1d,smp-cache.0.topology=core,smp-cache.1.cache=l1i,smp-cache.1.topology=core,smp-cache.2.cache=l2,smp-cache.2.topology=core,smp-cache.3.cache=l3,smp-cache.3.topology=socket";
+
 /// The machine every boot uses: q35 (the only machine type the Secure Boot firmware
 /// supports), x86-64 with every feature TCG can emulate, and no network or display.
 fn qemu_command(s: &Staged, settings: &Settings) -> Result<Command> {
     let machine = machine(settings);
     let mut c = Command::new(QEMU);
     c.arg("-machine")
-        .arg(settings.machine_options(settings.accel.machine()))
+        .arg(settings.machine_options(&format!("{},{SMP_CACHE}", settings.accel.machine())))
         .arg("-cpu")
         .arg(&settings.cpu)
         .arg("-m")
@@ -6875,6 +7386,12 @@ fn qemu_command(s: &Staged, settings: &Settings) -> Result<Command> {
     for cpu in &machine.devices {
         c.args(["-device", cpu]);
     }
+    if let Some(plan) = machine.pptt {
+        let path = target_dir().join("xtask").join("pptt.bin");
+        fs::write(&path, pptt_table(&machine, plan))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        c.args(["-acpitable", &qemu_path_arg("file=", &path)?]);
+    }
     c
         // Two NUMA nodes so the ACPI SRAT is populated (CLAUDE.md §24, §28). The two halves'
         // backends sum to -m, and QEMU auto-distributes the vCPUs across the nodes, so this
@@ -6891,8 +7408,8 @@ fn qemu_command(s: &Staged, settings: &Settings) -> Result<Command> {
             settings.memory.node()
         ))
         // With the ACPI machine's HMAT, each node names the initiator nearest its memory.
-        .args(["-numa", &numa_node(0, machine.cpus(), settings.acpi)])
-        .args(["-numa", &numa_node(1, machine.cpus(), settings.acpi)])
+        .args(["-numa", &numa_node(0, &machine, settings.acpi)])
+        .args(["-numa", &numa_node(1, &machine, settings.acpi)])
         // A cross-node distance so the ACPI SLIT is populated too (QEMU mirrors 1->0).
         .args(["-numa", "dist,src=0,dst=1,val=21"])
         .arg("-drive")
@@ -8191,6 +8708,9 @@ mod nvme_marker_tests {
         Machine {
             smp: cpus.to_string(),
             devices: Vec::new(),
+            nodes: Vec::new(),
+            node_cpus: None,
+            pptt: None,
             apic_ids: (0..cpus).collect(),
             listed: cpus,
             highest: cpus - 1,
@@ -8715,6 +9235,137 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
         assert_eq!(off.device_args(), ["-device", "intel-iommu,intremap=off"]);
     }
 
+    /// The scheduling-domains lines expected of each kind of machine (TASKS item 97), from the
+    /// machine alone: the trees the kernel's host tests build from the same shapes.
+    #[test]
+    fn the_domain_trees_follow_the_machines() {
+        let tree = |topology: Topology, acpi: bool, caches: bool| {
+            let settings = Settings {
+                topology,
+                acpi,
+                ..Settings::default()
+            };
+            domain_tree(&machine(&settings), caches, false)
+        };
+        assert_eq!(
+            tree(Topology::Smt, false, true),
+            "origin-kernel: domains: 8 processors: core, L2 4x2 [0-1|2-3|4-5|6-7]; node 2x4 [0-3|4-7]; last-level cache, package 1x8 [0-7]"
+        );
+        assert_eq!(
+            tree(Topology::Smt, false, false),
+            "origin-kernel: domains: 8 processors: core 4x2 [0-1|2-3|4-5|6-7]; node 2x4 [0-3|4-7]; package 1x8 [0-7]"
+        );
+        assert_eq!(
+            tree(Topology::Packages, false, true),
+            "origin-kernel: domains: 8 processors: last-level cache, package, node 2x4 [0-3|4-7]"
+        );
+        assert_eq!(
+            tree(Topology::Plain(1), false, false),
+            "origin-kernel: domains: 1 processors: core, package, node 1x1 [0]"
+        );
+        assert_eq!(
+            tree(Topology::Plain(4), false, true),
+            "origin-kernel: domains: 4 processors: last-level cache, package, node 1x4 [0-3]"
+        );
+        // The ACPI machine names each processor's node: a node each, so no node level.
+        assert_eq!(
+            tree(Topology::Plain(2), true, false),
+            "origin-kernel: domains: 2 processors: package 1x2 [0-1]"
+        );
+        assert_eq!(
+            tree(Topology::X2apic, false, false),
+            "origin-kernel: domains: 3 processors: package, node 2 groups [0|1-2]"
+        );
+        assert_eq!(
+            tree(Topology::Sparse, false, false),
+            "origin-kernel: domains: 67 processors: package, node 2 groups [0-63|64-66]"
+        );
+        assert_eq!(
+            tree(Topology::Many, false, false),
+            "origin-kernel: domains: 288 processors: package, node 2x144 [0-143|144-287]"
+        );
+        assert_eq!(
+            tree(Topology::Listed, false, false),
+            "origin-kernel: domains: 2 processors: package, node 1x2 [0-1]"
+        );
+        // Leaf 1Fh shows the x2APIC machine's dies, one processor each: no die level.
+        let x2apic = machine(&Settings {
+            topology: Topology::X2apic,
+            ..Settings::default()
+        });
+        assert_eq!(
+            domain_tree(&x2apic, true, true),
+            "origin-kernel: domains: 3 processors: last-level cache, package, node 2 groups [0|1-2]"
+        );
+        assert_eq!(index_ranges(&[0, 1, 2, 5, 7, 8]), "0-2,5,7-8");
+    }
+
+    /// The two-package machine's PPTT, as `cargo xtask` plants it: a valid table whose leaves are
+    /// the CPU indexes, with one L3 a package (ruling Q6), and control C2's on the SMT machine, an
+    /// L3 a node.
+    #[test]
+    fn the_planted_pptts_are_well_formed() {
+        let packages = machine(&Settings {
+            topology: Topology::Packages,
+            ..Settings::default()
+        });
+        let plan = packages
+            .pptt
+            .expect("the two-package machine carries a PPTT");
+        let table = pptt_table(&packages, plan);
+        assert_eq!(&table[..4], b"PPTT");
+        assert_eq!(
+            u32::from_le_bytes(table[4..8].try_into().unwrap()) as usize,
+            table.len()
+        );
+        assert_eq!(table.iter().fold(0u8, |s, &b| s.wrapping_add(b)), 0);
+        // The kernel's own reading of it: the leaves are the CPU indexes, the L2 a core's and the
+        // L3 a package's, two L3s with IDs among five caches.
+        let madt: Vec<(u32, bool)> = (0..8).map(|uid| (uid, true)).collect();
+        let asked: Vec<u32> = (0..8).collect();
+        let read = framekernel::acpi::pptt_caches(&table, &madt, &asked)
+            .expect("the kernel reads it")
+            .expect("it has caches");
+        assert_eq!((read.caches, read.with_id), (5, 2));
+        let first = |v: &[Option<u64>]| -> Vec<usize> {
+            v.iter()
+                .map(|x| v.iter().position(|y| y == x).unwrap())
+                .collect()
+        };
+        assert_eq!(first(&read.second_level), [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(first(&read.last_level), [0, 0, 0, 0, 4, 4, 4, 4]);
+        // Control C3's: the same table without IDs.
+        let no_ids = pptt_table(
+            &packages,
+            Pptt {
+                cache_ids: false,
+                ..plan
+            },
+        );
+        let read = framekernel::acpi::pptt_caches(&no_ids, &madt, &asked)
+            .unwrap()
+            .unwrap();
+        assert_eq!((read.caches, read.with_id), (5, 0));
+        assert_eq!(first(&read.last_level), [0, 0, 0, 0, 4, 4, 4, 4]);
+        // Control C2's on the SMT machine: an L3 a node, the threads of a core sharing its L2.
+        let smt = machine(&Settings {
+            topology: Topology::Smt,
+            ..Settings::default()
+        });
+        let c2 = pptt_table(
+            &smt,
+            Pptt {
+                l3: L3::Node,
+                cache_ids: true,
+            },
+        );
+        let read = framekernel::acpi::pptt_caches(&c2, &madt, &asked)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first(&read.second_level), [0, 0, 2, 2, 4, 4, 6, 6]);
+        assert_eq!(first(&read.last_level), [0, 0, 0, 0, 4, 4, 4, 4]);
+    }
+
     /// The expected topology lines, computed from the `-smp` fields alone: what QEMU's
     /// machine must decode to under each leaf.
     #[test]
@@ -8722,6 +9373,9 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
         let sparse = Machine {
             smp: String::new(),
             devices: Vec::new(),
+            nodes: Vec::new(),
+            node_cpus: None,
+            pptt: None,
             apic_ids: vec![0, 256, 412],
             listed: 150,
             highest: 420,
@@ -8774,6 +9428,9 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
         let plain = Machine {
             smp: String::new(),
             devices: Vec::new(),
+            nodes: Vec::new(),
+            node_cpus: None,
+            pptt: None,
             apic_ids: vec![0, 1, 2, 3],
             listed: 4,
             highest: 3,
