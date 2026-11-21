@@ -177,6 +177,17 @@ const EXITS_EARLY: &[&str] = &[
     "Causality violation",
 ];
 
+/// What the moves models report (`moves_models.rs`; TASKS item 95, ADR-0020 S4 and S5): a frame
+/// taken twice, a frame a refused move did not give back, a frame resumed on another processor
+/// before its own had left its stack, and a scan past its bound. A home a scan missed is
+/// `CTX_UNCOVERED`.
+const MOVE_TAKEN_TWICE: &[&str] =
+    &["a frame was taken twice: by a move and a switch, or by two switches"];
+const MOVE_NOT_GIVEN_BACK: &[&str] =
+    &["a frame back from a full destination could not be resumed at its source"];
+const MOVE_RESUMED_TOO_SOON: &[&str] =
+    &["a frame was resumed on another processor before its own had left its stack"];
+
 /// What `threads_a_stale_name_wakes_nobody` reports (TASKS item 92): a wake-up by a stale name
 /// reached the record's next thread.
 const STALE_WOKE: &[&str] = &["a stale name woke the record's next thread"];
@@ -212,6 +223,11 @@ const SPIN_LOCK: &str = "framekernel/frame/sync/src/lib.rs";
 const WAIT: &str = "framekernel/frame/sync/src/wait.rs";
 const RUN_QUEUE: &str = "framekernel/src/runqueue.rs";
 const MODELS: &str = "framekernel/frame/sync/src/models.rs";
+/// The models of moving a context between tables (TASKS item 95), the module `models::moves`,
+/// in a file of its own beside `MODELS`. Its models are named `moves::<function>`.
+const MOVES_MODELS: &str = "framekernel/frame/sync/src/moves_models.rs";
+/// The module path of `MOVES_MODELS` under `models`, as its models report themselves.
+const MOVES_MODULE: &str = "moves::";
 const FLOOR: &str = "framekernel/frame/sync/src/floor.rs";
 const SHOOTDOWN: &str = "framekernel/frame/sync/src/shootdown.rs";
 const REFCOUNT: &str = "framekernel/frame/sync/src/refcount.rs";
@@ -1895,6 +1911,223 @@ const CONTROLS: &[Control] = &[
             "exits_an_exit_without_a_mark_cannot_stand_for_one",
             EXITS_EARLY,
         )],
+    },    Control {
+        // MX1 (TASKS item 95; ADR-0020 S4's control for MV1): no move sequence. A pass that found
+        // nothing is believed at once, as a scan of claim-before-retire alone would be: a pass that
+        // reads the destination before the claim and the source after the forget misses the home.
+        name: "moves_no_move_sequence",
+        file: CONTEXTS,
+        from: "        finished == begun && self.begun.load(Acquire) == begun
+",
+        to: "        let _ = (finished, begun);
+        true
+",
+        models: &[("moves::mv1_a_scan_reading_the_destination_first_finds_a_moving_home", CTX_UNCOVERED)],
+    },
+    Control {
+        // MX2 (MV2's control): `lend` takes the frame by a plain store, not by the compare-and-swap a
+        // switch also makes: the source's switch and the move can both take it.
+        name: "moves_lend_by_a_plain_store",
+        file: CONTEXTS,
+        from: "            if context
+                .frame
+                .compare_exchange(frame, 0, AcqRel, Acquire)
+                .is_ok()
+            {
+                return Ok(Lent {
+",
+        to: "            if {
+                context.frame.store(0, Release);
+                true
+            } {
+                return Ok(Lent {
+",
+        models: &[("moves::mv2_a_move_and_the_source_switch_take_a_frame_once", MOVE_TAKEN_TWICE)],
+    },
+    Control {
+        // MX3 (MV3's control): the destination adopts the context before the source lends it, so for a
+        // moment both tables hold the frame and both processors can resume it.
+        name: "moves_adopt_before_lend",
+        file: CONTEXTS,
+        from: "        let lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
+        if let Err(refused) = destination.adopt(&moving, &lent) {
+",
+        to: "        let adopted = destination.adopt(
+            &moving,
+            &Lent {
+                table: source,
+                slot: usize::MAX,
+                home: frame,
+                frame,
+            },
+        );
+        let lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
+        if let Err(refused) = adopted {
+",
+        models: &[("moves::mv3_only_one_processor_resumes_a_moving_context", MOVE_TAKEN_TWICE)],
+    },
+    Control {
+        // MX4a (MV4's control; the coordinating session's ruling on Q6 of TASKS item 95): a claim made by
+        // a Relaxed load and a store, not a compare-and-swap. A scan that reads the new claim in the
+        // freed slot is then not ordered after the forget, so its last reading of begun may miss the
+        // move. The ADR's own control for MV4, finished raised before forget, was run and not caught
+        // (TASKS item 95's entry says why).
+        name: "moves_claim_checked_by_a_relaxed_load",
+        file: CONTEXTS,
+        from: "        if self
+            .home
+            .compare_exchange(0, home, AcqRel, Acquire)
+            .is_err()
+        {
+            return false;
+        }
+",
+        to: "        if self.home.load(Relaxed) != 0 {
+            return false;
+        }
+        self.home.store(home, Release);
+",
+        models: &[("moves::mv4_a_forgotten_slot_claimed_again_hides_no_moved_home", CTX_UNCOVERED)],
+    },
+    Control {
+        // MX4b (MV4's control, as MX4a): `forget` clears the home with a Relaxed store, so a scan that
+        // finds the home gone is not ordered after the move's raise of begun.
+        name: "moves_forget_relaxed",
+        file: CONTEXTS,
+        from: "        if let Some(slot) = self.table.slots.get(self.slot) {
+            slot.home.store(0, Release);
+        }
+",
+        to: "        if let Some(slot) = self.table.slots.get(self.slot) {
+            slot.home.store(0, Relaxed);
+        }
+",
+        models: &[("moves::mv4_a_forgotten_slot_claimed_again_hides_no_moved_home", CTX_UNCOVERED)],
+    },
+    Control {
+        // MX5 (MV5's control): a refused adoption does not restore the frame: its context can never be
+        // resumed, at its source or anywhere.
+        name: "moves_restore_omitted",
+        file: CONTEXTS,
+        from: "            return if lent.restore() {
+",
+        to: "            return if {
+                let _ = lent;
+                true
+            } {
+",
+        models: &[("moves::mv5_a_full_destination_gives_the_frame_back", MOVE_NOT_GIVEN_BACK)],
+    },
+    Control {
+        // MX6 (MV6's control): one counter whose parity marks a move under way, raised before the gate
+        // is taken. Two movers raise it to an even value together, and a scan then believes a pass
+        // that missed the home the first one moved.
+        name: "moves_one_counter_by_parity",
+        file: CONTEXTS,
+        from: "    /// A move's start: the gate, then begun.
+    fn enter(&self) -> SpinGuard<'_, ()> {
+        let gate = self.gate.lock();
+        let _ = self.begun.fetch_add(1, Relaxed);
+        gate
+    }
+
+    /// A move's end, before the gate is released: finished, with Release.
+    fn raise_finished(&self) {
+        let _ = self.finished.fetch_add(1, Release);
+    }
+
+    /// What a scan reads before its pass: finished, then begun.
+    fn readings(&self) -> (u64, u64) {
+        (self.finished.load(Acquire), self.begun.load(Acquire))
+    }
+
+    /// Whether a pass that found nothing can be believed: no move was under way when it began
+    /// (finished and begun equal), and none began during it (begun unchanged).
+    fn settled(&self, (finished, begun): (u64, u64)) -> bool {
+        finished == begun && self.begun.load(Acquire) == begun
+    }
+",
+        to: "    /// A move's start: the counter, then the gate.
+    fn enter(&self) -> SpinGuard<'_, ()> {
+        let _ = self.begun.fetch_add(1, Relaxed);
+        self.gate.lock()
+    }
+
+    /// A move's end: the same counter again.
+    fn raise_finished(&self) {
+        let _ = self.begun.fetch_add(1, Release);
+    }
+
+    /// One counter.
+    fn readings(&self) -> (u64, u64) {
+        (0, self.begun.load(Acquire))
+    }
+
+    /// Even: no move under way.
+    fn settled(&self, (_, begun): (u64, u64)) -> bool {
+        begun % 2 == 0 && self.begun.load(Acquire) == begun
+    }
+",
+        models: &[("moves::mv6_two_movers_and_a_scan_miss_neither_home", CTX_UNCOVERED)],
+    },
+    Control {
+        // MX7 (MV7's control): the scan's pass under the gate removed. After its fast passes have all
+        // overlapped a move, it gives up and answers "not covered" for a home it never saw.
+        name: "moves_scan_without_its_gated_pass",
+        file: CONTEXTS,
+        from: "        let covered = quiet.quietly(|| {
+            let _gate = self.gate.lock();
+            pass()
+        });
+",
+        to: "        let _ = quiet;
+        let covered = false;
+",
+        models: &[("moves::mv7_a_scan_racing_back_to_back_moves_ends_and_finds_the_home", CTX_UNCOVERED)],
+    },
+    Control {
+        // LX1 (LV1's control; ADR-0020 S5): the outgoing frame stored in its slot at the switch, as before
+        // TASKS item 95. Another processor can then take and resume it while its own processor still
+        // returns along its stack.
+        name: "moves_frame_published_at_the_switch",
+        file: CONTEXTS,
+        from: "            Some(_) => self.record_leaving(outgoing, here),
+",
+        to: "            Some(slot) => slot.frame.store(here, Release),
+",
+        models: &[("moves::lv1_a_frame_is_resumed_elsewhere_only_after_its_processor_left_the_stack", MOVE_RESUMED_TOO_SOON)],
+    },
+    Control {
+        // LX2a (LV2's control; the boot control C95-B1 plants the same): `covers` does not read the
+        // leaving record, so a frame on a stack that is not its home is uncovered from its switch-out
+        // to its publication.
+        name: "moves_covers_skips_the_leaving_record",
+        file: CONTEXTS,
+        from: "        if inside(self.leaving.load(Acquire)) {
+            return true;
+        }
+",
+        to: "",
+        models: &[("moves::lv2_a_frame_is_covered_while_its_processor_publishes_it", CTX_UNCOVERED)],
+    },
+    Control {
+        // LX2b (LV2's control): `covers` reads the leaving record after the slots: a publication between
+        // the two reads moves the frame from the record to its slot behind the reader.
+        name: "moves_covers_reads_the_leaving_record_last",
+        file: CONTEXTS,
+        from: "        if inside(self.leaving.load(Acquire)) {
+            return true;
+        }
+        self.slots
+            .iter()
+            .any(|slot| inside(slot.home.load(Acquire)) || inside(slot.frame.load(Acquire)))
+",
+        to: "        self.slots
+            .iter()
+            .any(|slot| inside(slot.home.load(Acquire)) || inside(slot.frame.load(Acquire)))
+            || inside(self.leaving.load(Acquire))
+",
+        models: &[("moves::lv2_a_frame_is_covered_while_its_processor_publishes_it", CTX_UNCOVERED)],
     },
 ];
 
@@ -2011,7 +2244,14 @@ pub(crate) fn run() -> Result {
     }
     let path = scratch.join(MODELS);
     let source = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let models = model_names(&source);
+    let path = scratch.join(MOVES_MODELS);
+    let moves = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let moves: Vec<String> = model_names(&moves)
+        .into_iter()
+        .map(|name| format!("{MOVES_MODULE}{name}"))
+        .collect();
+    let mut models = model_names(&source);
+    models.extend(moves.iter().map(String::as_str));
     require_complete(&models, &report)?;
     controls(&root, &scratch, models.len())
 }
@@ -2128,7 +2368,8 @@ fn run_models(scratch: &Path, search: Search) -> Result<String> {
     }
 }
 
-/// The models `models.rs` defines: the name of the function after each `#[test]`.
+/// The models a models file defines: the name of the function after each `#[test]`. Those of
+/// `MOVES_MODELS` are reported, and named in controls, with `MOVES_MODULE` before them.
 fn model_names(source: &str) -> Vec<&str> {
     let mut names = Vec::new();
     let mut lines = source.lines().map(str::trim);
@@ -2174,8 +2415,8 @@ fn require_complete(models: &[&str], report: &str) -> Result {
         .collect();
     if !extra.is_empty() {
         return Err(format!(
-            "these names in the Loom report are not models in models.rs (a model reporting under \
-             another's name?): {}",
+            "these names in the Loom report are not models in models.rs or moves_models.rs (a \
+             model reporting under another's name?): {}",
             extra.join(", ")
         ));
     }
