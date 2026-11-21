@@ -32,7 +32,10 @@ pub struct Switch {
 }
 
 impl Switch {
-    /// For the trap entry only (which exists on the kernel's target only).
+    /// For the trap entry only (which exists on the kernel's target only). It is `pub(crate)`
+    /// because the trap entry, `cpu::dispatch`, is in another module; that is its one caller,
+    /// which the host test `only_the_trap_entry_makes_a_switch` holds (review finding R93-2), since
+    /// a `Switch` made anywhere else would give a [`Here`] with interrupts on.
     #[cfg(target_os = "none")]
     pub(crate) const fn new() -> Self {
         Self { _here: PhantomData }
@@ -61,8 +64,10 @@ impl Switch {
 /// - [`Pinned::here`].
 ///
 /// Its field and its constructor are private to this module, so no other module, in this crate or
-/// another, can make one. It is zero-sized and `Copy`, and neither `Send` nor `Sync`, so it never
-/// reaches another thread.
+/// another, can make one but through these makers. Of them only [`Switch::new`] is open to the
+/// rest of this crate, for the trap entry, its one caller (a host test holds it; review finding
+/// R93-2). It is zero-sized and `Copy`, and neither `Send` nor `Sync`, so it never reaches another
+/// thread.
 ///
 /// **What a section's or the trap entry's witness rests on.** It holds only while nothing its
 /// holder runs switches the holder out. Code holding one never enables interrupts, opens an
@@ -632,6 +637,102 @@ mod tests {
         );
         assert_eq!(table.running_home(), Some(BOOT_FLOW));
         assert!(runs_a_flow(table.running_home()), "the flow's own home");
+    }
+
+    /// What the scan below looks for, built so that this file does not hold it.
+    const SWITCH_NEW: &str = concat!("Switch", "::new(");
+
+    /// The function enclosing each call of `Switch::new` in `text`: the nearest `fn` line above it
+    /// that no `}` at its indentation or less has closed. Comment lines do not count.
+    fn switch_makers(text: &str) -> alloc::vec::Vec<alloc::string::String> {
+        fn fn_name(mut line: &str) -> Option<&str> {
+            loop {
+                let before = line;
+                for qualifier in [
+                    "pub(crate) ",
+                    "pub(super) ",
+                    "pub ",
+                    "const ",
+                    "unsafe ",
+                    "async ",
+                ] {
+                    line = line.strip_prefix(qualifier).unwrap_or(line);
+                }
+                if let Some(abi) = line.strip_prefix("extern \"")
+                    && let Some(end) = abi.find("\" ")
+                {
+                    line = &abi[end + 2..];
+                }
+                if line == before {
+                    break;
+                }
+            }
+            let name = line.strip_prefix("fn ")?;
+            let end = name
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(name.len());
+            (end > 0).then(|| &name[..end])
+        }
+        let mut within: alloc::vec::Vec<(usize, &str)> = alloc::vec::Vec::new();
+        let mut makers = alloc::vec::Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let indent = line.len() - trimmed.len();
+            if let Some(name) = fn_name(trimmed) {
+                within.retain(|&(at, _)| at < indent);
+                within.push((indent, name));
+            }
+            if line.contains(SWITCH_NEW) {
+                makers.push(alloc::string::String::from(
+                    within.last().map_or("(none)", |&(_, name)| name),
+                ));
+            }
+            if trimmed.starts_with('}') {
+                within.retain(|&(at, _)| at < indent);
+            }
+        }
+        makers
+    }
+
+    /// The scan finds a call in a function, in an `extern` function's closure, and outside any
+    /// function, and skips a comment: what the test below rests on.
+    #[test]
+    fn the_switch_scan_finds_each_call() {
+        let text = format!(
+            "fn a() {{\n    {SWITCH_NEW}).here();\n}}\n// {SWITCH_NEW})\nextern \"sysv64\" fn b() {{\n    let c = || {SWITCH_NEW});\n}}\nstatic S: () = {SWITCH_NEW});\n"
+        );
+        assert_eq!(switch_makers(&text), ["a", "b", "(none)"]);
+    }
+
+    /// `Switch::new` is `pub(crate)`, so any module of this crate could build a `Switch`, and from
+    /// it a `Here` with interrupts on (review finding R93-2). Every source file of this crate is
+    /// read, and the trap entry, `cpu::dispatch`, is the only function that calls it.
+    #[test]
+    fn only_the_trap_entry_makes_a_switch() {
+        let mut found = alloc::vec::Vec::new();
+        let mut paths = alloc::vec![std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src"
+        ))];
+        while let Some(path) = paths.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(&path).expect("the crate's sources") {
+                    paths.push(entry.expect("a source entry").path());
+                }
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("a source file");
+                let file = path.file_name().map(|f| f.to_string_lossy().into_owned());
+                for maker in switch_makers(&text) {
+                    found.push(format!("{}: {maker}", file.clone().unwrap_or_default()));
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        assert_eq!(found, ["cpu.rs: dispatch"]);
     }
 
     /// A holder that kept the mint lends it, and the witnesses carry no state.
