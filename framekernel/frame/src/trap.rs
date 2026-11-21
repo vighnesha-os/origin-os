@@ -718,10 +718,8 @@ mod tests {
     #[test]
     fn only_the_trap_entry_makes_a_switch() {
         let mut found = alloc::vec::Vec::new();
-        let mut paths = alloc::vec![std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src"
-        ))];
+        let src = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut paths = alloc::vec![src.clone()];
         while let Some(path) = paths.pop() {
             if path.is_dir() {
                 for entry in std::fs::read_dir(path.as_path()).expect("the crate's sources") {
@@ -729,8 +727,10 @@ mod tests {
                 }
             } else if path.extension().is_some_and(|e| e == "rs") {
                 let text = std::fs::read_to_string(&path).expect("a source file");
+                // The path under `src`, so that a file of the same name elsewhere is told apart
+                // (the addendum review's A93-2).
                 let file = path
-                    .file_name()
+                    .strip_prefix(&src)
                     .map(|f| f.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 for maker in switch_makers(&text) {
