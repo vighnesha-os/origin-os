@@ -550,7 +550,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 93. **The processor-index witness and the pin (ADR-0020 S2, S3). Plan P2, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 92.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Converts the 74 sites that read the processor index.
 
-94. **Every processor's FPU format checked (ADR-0020 S6). Plan P3, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after the records are on `main`; beside TASKS item 92.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
+94. **Every processor's FPU format checked (ADR-0020 S6). Plan P3, batch 9. Numbered by the coordinating session on 2026-11-20. Built on 2026-11-21 on `claude/t94-fpu-format-18ed6a`; its entry is at the end of this file.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Follow-up: TASKS item 111, every FPU area shrunk to the boot processor's enabled size.
 
 95. **Moves between the tables of contexts: lend, adopt, forget, the move gate and deferred publication (ADR-0020 S4, S5). Plan P4, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after the eighth batch and the records are on `main`; beside TASKS item 92.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Loom models MV1 to MV7 and LV1.
 
@@ -3728,3 +3728,73 @@ Every finding is answered in a commit naming it, or left as a follow-up named th
 - **Run the kernel's own spawn and exit record steps in the Loom models** (R92-3). They are hand copies in the models today. This moves code from `sched` into `origin_sync::threads`, which TASKS items 93 and 96 change next.
 - **A second check of the slot's generation** beside the record's location, for when S6's `depart` frees slots (R92-4). This belongs to TASKS item 96.
 - **The design branch `claude/m3-scheduling-design-a5598a`** is kept until `land/batch-9` reaches `main` (the coordinating session).
+
+### 94. Every processor's FPU format checked against the boot processor's (ADR-0020 S6, N9; plan P3)
+
+Assigned by the coordinating session on 2026-11-20, on the owner's word ("Start all four": items 93, 94, 95 and 97). The contract went to the coordinating session before any code (the coordination notes' `t94-contract.md`, written against `land/batch-9` at `a25228c9`). It was accepted on 2026-11-21 with the recommendations of Q1 to Q10 and these conditions:
+
+- **Q1:** compare XCR0 as XGETBV reads it back and CPUID.0DH.00H:EBX read after XSETBV. Each component's offset and size in the standard format is in the Platform domain (Intel SDM Vol. 1, Table 21 for leaf 0DH), so a difference there is not one the documents allow, and it is not compared.
+- **Q2:** the area stays the boot processor's CPUID.0DH.00H:ECX, written by it alone before the first area. Shrinking every area to the boot processor's enabled size is **TASKS item 111**, a follow-up.
+- **Q3:** an AP whose enabled state is larger than the area refuses before its handshake and is parked (`LACKS_FPU_ROOM`), its line naming both sizes.
+- **Q4:** the flag beside the control state in one byte, `CPU_STATE`, written by each processor on itself in one Release store before its handshake answer, with no read-modify-write and no second writer. The renamed references are listed below for TASKS item 93.
+- **Q5:** the boot's memory figures, base against tip, reported and not judged; every leak line's before and after equal within each boot.
+- **Q6:** a new Report row, `FpuFormat` "FPU format"; QEMU's verdict becomes "degraded: 71 of 72 proofs passed; failed: speculation controls" (it was 70 of 71: the rental readiness notes quote the old count).
+- **Q7:** the line as the contract wrote it.
+- **Q8:** controls C94-1 to C94-3; for C94-2, the line counts only processors online and the parked AP never takes part.
+- **Q9:** one sentence in CL40; the per-AP start figure reported, base against tip.
+- **Q10:** no B1 round and no large-machine round; the switch path shown unchanged with `llvm-objdump`.
+
+Built on `claude/t94-fpu-format-18ed6a`, cut from `land/batch-9` at `a25228c9` (`main` `fc96834d` and TASKS item 92), checked with `git log -1` before the first commit.
+
+**As built**, in order:
+
+- `b2727b55`: `features::FpuFormat`, `FpuFit` and `fpu_fit`, with host tests.
+- `89cd4e8d`: `cpu::enable_simd` returns the format; `record_boot_fpu`; `CPU_STATE`; each AP's comparison, refusal and record; the "FPU format" line.
+- `5453b12f`: the verdict's row and its record in `kernel.rs`; xtask's marker.
+- `112c47c9`: R94-1, `bootproof`'s host tests count 72 proofs.
+- `045d50b8`: R94-3 and R94-4.
+- `d9d6f95b`: R94-5 and R94-6.
+- `b2cf1631`: R94-7.
+- The records: this entry, ADR-0020 S6's dated note, ADR-0013's row and controls, CL40, the provenance entry and `REVIEW_T94_2026-11-21.md`.
+
+**The design as it lands:**
+
+- **What a processor reports.** `cpu::enable_simd` sets CR0, CR4 and XCR0 as before and returns `FpuFormat { xcr0, enabled_size }`: XCR0 read back with XGETBV, and CPUID.0DH.00H:EBX read after XSETBV. Without XSAVE, or without leaf 0DH to size it (`features::xsave_usable`, R94-6), XCR0 is 0 and the size the FXSAVE area's 512 bytes, and the baseline refuses the processor. It writes no global: every processor used to overwrite the area size, the last to start winning.
+- **The boot processor's, once.** `Early::enable_simd`, on the boot processor alone, calls `cpu::record_boot_fpu` before any area is allocated. It records, in one `SetOnce`, the boot processor's format and the area size: its CPUID.0DH.00H:ECX (the size for every supported component), never less than its own enabled size; then `USE_XSAVE`, the save method every processor uses (R94-5). A second call changes nothing.
+- **Each AP's comparison** (`smp::ap_entry`), right after `enable_simd`: `features::fpu_fit(boot, own, area)`, room first, then equality:
+  - **Alike:** the boot processor's XCR0 and enabled size. It takes part in moves.
+  - **Differs**, but its state fits the area: it comes online, runs its own threads, and takes no part in moves, as source or destination.
+  - **Too large** for the area: `features::ap_lacks` names it after SMEP/SMAP and the baseline (R94-7), and it refuses before its handshake: `LACKS_FPU_ROOM`, parked by INIT, its line naming both sizes.
+- **The record** (`cpu::CPU_STATE`, one byte per processor, in place of `CPU_STATE_HOLDS`): bit 0 the control state holds, bit 1 the format is alike. Each processor writes both in one Release store on itself: the boot processor in `smp::start`, each AP only after every check before its handshake has passed, so a refused AP records nothing. The table's element is still one byte, so the boot's "27 per-CPU tables … 7938 bytes per index" is unchanged.
+- **Who takes part** is asked through the processors online: `smp::Online::takes_part_in_moves(index)`, online and recorded alike (R94-3). An AP whose answer came after the boot processor stopped waiting is parked with its record standing, and is never online. TASKS item 96's mover reads it.
+- **The line**, after the control-state line: `origin-kernel: FPU format: the boot processor's XCR0 0x7 and 832 bytes of enabled XSAVE state, in areas of 2696 bytes; 2 of 2 processors alike, every one taking part in moves` on QEMU's `max` processor. One that differs is named with its own XCR0 and size, and the line ends `: FPU format failed`. xtask requires the frame of the line and "N of N processors alike" on every machine.
+- **The verdict:** a new row, `FpuFormat` "FPU format", Report by ADR-0013 R3, recorded from every online processor's record. TASKS item 96 makes it Withdraw when its mover withholds such a processor.
+- **N9** ("an FPU area is restored only under the XCR0 and size it was saved under") holds by construction while nothing moves: each processor's XCR0 is written once, before any thread runs there, and every area is saved and restored on one processor. After this task, a processor whose format differs is marked, so the mover can refuse it at both ends. Equality, not inclusion, is the rule: XSAVE leaves a header bit outside XCR0 as it was (SDM Vol. 1 §13.7), and the standard form of XRSTOR faults on one (§13.8.1), so an area once saved under a larger XCR0 can fault under a smaller one. Nothing is added to the switch path.
+
+**Renamed references, for TASKS item 93** (which converts `this_cpu` calls after this lands; this task adds no `this_cpu` site):
+
+| Before | After | Where |
+|---|---|---|
+| `cpu::CPU_STATE_HOLDS: PerCpu<AtomicBool>` | `cpu::CPU_STATE: PerCpu<AtomicU8>`, bits `STATE_HOLDS` and `FPU_ALIKE` | `cpu.rs`; `percpu.rs`'s `size_per_cpu` (`sizing.table(&crate::cpu::CPU_STATE)`) |
+| `cpu::record_cpu_state()` | `cpu::record_cpu_state(fpu_alike: bool)`, its one `this_cpu()` call unchanged | `cpu.rs`; called in `smp::start` (the boot processor) and `smp::ap_entry`, now after `record_topology` |
+| `cpu::enable_simd(&Cpuid) -> u64` | `-> features::FpuFormat` | `cpu.rs`; `early.rs`, `smp.rs` |
+| `FPU_AREA_SIZE: AtomicU64` | `BOOT_FPU: SetOnce<BootFpu>`; `fpu_area_size()` unchanged in signature | `cpu.rs` |
+| (new) | `cpu::record_boot_fpu`, `boot_fpu_format`, `fpu_formats_alike`, `fpu_alike` (crate-private); `smp::Online::takes_part_in_moves`; `features::FpuFormat`, `FpuFit`, `fpu_fit`, `ApLacks`, `ap_lacks`, `xsave_usable` | |
+
+**Changed from the contract, and why:**
+
+- **The AP records later than today.** It used to record its control state right after `enable_simd`, before the check that its CPU index is its own. It now records after every check, just before its answer, so a refused AP records nothing and the record cannot land in another index's slot (the review's I4).
+- **"Takes part" is a method of `Online`** (R94-3), not `cpu::takes_part_in_moves`: the one-store rule leaves a late-answering AP's record standing.
+- **`USE_XSAVE` is the boot processor's too** (R94-5), and **XSAVE needs leaf 0DH** (R94-6): the review's two Info findings, beyond the contract.
+- **A fourth control, C94-2b**: xtask stops a boot at once on `: AP start-up failed`, so C94-2 could not show the ruling's two points; C94-2b takes that one string out of xtask's list in the export and lets the boot reach its verdict.
+
+**The controls** (ADR-0013's controls of TASKS item 94), each planted in a `git archive` export of `5453b12f` by the script `plant94.py`, booted with `cargo xtask boot-test` on the default 2-processor machine and the AMD-IOMMU 3-processor machine. QEMU's `max` processor took XCR0 bit 9 (PKRU), so no fallback was needed.
+
+| Control | Plant | Result |
+|---|---|---|
+| C94-1 | CPU 1 adds PKRU to its XCR0 | Caught on both: `1 of 2 processors alike; CPU 1 (XCR0 0x207, 2696 bytes) takes no part in moves: FPU format failed` (`2 of 3` on 3 processors); verdict `70 of 72 …; failed: FPU format, speculation controls`; every other kernel line the clean boot's, digits aside |
+| C94-2 | C94-1, and the area at the boot processor's 832 bytes | Caught on both, at once: `CPU 1 (APIC ID 1): its enabled XSAVE state needs 2696 bytes, more than the kernel's 832-byte areas; parked by INIT: AP start-up failed` |
+| C94-2b | C94-2, with xtask not stopping at `: AP start-up failed` | `SMP: 1 of 2 enabled processors online` (`2 of 3`); `1 of 1 processors alike, every one taking part in moves` (`2 of 2`): only processors online counted, the parked AP never taking part; verdict `70 of 72 …; failed: application processors (fewer processors), speculation controls` |
+| C94-3 | C94-1, the comparison always "alike", and CPU 1's line printing its format | Not a gate: `boot-test` passed, 11 of 11, while CPU 1 read back `XCR0 0x207, 2696 bytes` and the line said `2 of 2 processors alike`: the line follows the comparison, and nothing else catches the difference |
+
+**The switch path (Q10).** `llvm-objdump` of the base's (`a25228c9`) and the tip's (`b2cf1631`) kernel images, from `sched::on_yield` through every call, direct or through the GOT, two levels down: 15 functions, among them `on_yield`, `RunQueue::switch`, `follow_thread`, `FpuArea::save` and `FpuArea::restore` (where `fpu_save` and `fpu_restore` are inlined), `UserSpace::activate` and `vm::activate_kernel_space`. Every instruction is the same once each address, call target and RIP-relative displacement is named by what it reaches (a function, a GOT slot's target, an object and offset, or the 32 bytes at it); opcodes, registers, immediates and memory offsets are compared as they are. 0 of 15 differ, and 0 of 18 three levels down. The control: one bit changed in `on_yield`'s code is reported (`DIFFERS: … on_yield`). The script, `switch_path.py`, is kept with the session's evidence.
