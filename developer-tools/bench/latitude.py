@@ -89,6 +89,15 @@ CONFIRMED = ("gone", "deleted", "deleting", "disk_erasing")
 # Methods that are safe to repeat. A repeated POST could create a second server.
 IDEMPOTENT = ("GET", "DELETE")
 
+# The bench loader's switches (TASKS items 112 and 116), each a file in \EFI\ORIGIN\ that only
+# QEMU scenarios write. The install refuses an ESP that holds any of them.
+BENCH_SWITCHES = ("BENCH-STALE-KEY", "BENCH-AFTER")
+
+
+def refuse_bench_switches():
+    """The shell tests that fail the install if the ESP holds a bench switch."""
+    return "".join(f"test ! -e /boot/efi/EFI/ORIGIN/{name}; " for name in BENCH_SWITCHES)
+
 
 def die(message):
     print(f"latitude: {message}", file=sys.stderr)
@@ -1155,9 +1164,10 @@ def cmd_rental_b(args):
         rental.ssh("rm -rf /tmp/origin && mkdir -m 700 /tmp/origin", check=True, timeout=60)
         subprocess.run(["scp", "-q"] + ssh_base(rental.dir)[1:] + [str(loader), str(kernel),
                        f"{OS_USER}@{rental.ip}:/tmp/origin/"], check=True, timeout=300)
-        # TASKS item 112: a bench loader's stale-key switch is for QEMU scenarios only; the rented
-        # ESP never holds it, so the board takes its natural path through ExitBootServices.
-        install = (f"set -eu; test -f '{target}'; test ! -e /boot/efi/EFI/ORIGIN/BENCH-STALE-KEY; "
+        # TASKS items 112 and 116: a bench loader's switches are for QEMU scenarios only; the
+        # rented ESP never holds one, so the board takes the rental's path: its own key in
+        # ExitBootServices, and the reset afterwards.
+        install = (f"set -eu; test -f '{target}'; {refuse_bench_switches()}"
                    f"install -D -m 0644 /tmp/origin/KERNEL.ONBF /boot/efi/EFI/ORIGIN/KERNEL.ONBF; "
                    f"cp /tmp/origin/BOOTX64.EFI '{target}'; sync; "
                    f"sha256sum '{target}' /boot/efi/EFI/ORIGIN/KERNEL.ONBF")
@@ -1167,7 +1177,7 @@ def cmd_rental_b(args):
             raise RuntimeError("the files on the ESP do not match the image")
         (rental.dir / "installed.txt").write_text(f"{entry} {path}; {last}\n{' '.join(sums)}\n")
         print(f"{stamp()} Origin's loader is {path}, and its kernel \\EFI\\ORIGIN\\KERNEL.ONBF; "
-              "no UEFI variable was written, and the ESP holds no BENCH-STALE-KEY")
+              f"no UEFI variable was written, and the ESP holds no {' and no '.join(BENCH_SWITCHES)}")
         console = rental.console
         if not console:
             raise RuntimeError("no serial console: a boot would show nothing")

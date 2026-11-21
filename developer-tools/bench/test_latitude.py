@@ -401,6 +401,18 @@ class Guards(unittest.TestCase):
         self.assertNotIn("sv_te", out)
         self.assertEqual(self.lat.clean("\x1b[1;31mred\x1b[0m\r\n\x1b[?25l"), "red\n")
 
+    def test_the_install_refuses_every_switch_the_bench_loader_reads(self):
+        # TASKS items 112 and 116: each \\EFI\\ORIGIN\\BENCH-* path the bench loader names is
+        # refused on the rented ESP, so a rental takes its own key and the reset.
+        import re
+        source = (HERE.parent.parent / "boot" / "uefi" / "src" / "bench.rs").read_text()
+        named = set(re.findall(r'"\\\\EFI\\\\ORIGIN\\\\(BENCH-[A-Z-]+)"', source))
+        self.assertEqual(named, {"BENCH-STALE-KEY", "BENCH-AFTER"})
+        self.assertEqual(set(self.lat.BENCH_SWITCHES), named)
+        tests = self.lat.refuse_bench_switches()
+        for name in named:
+            self.assertIn(f"test ! -e /boot/efi/EFI/ORIGIN/{name}; ", tests)
+
     def test_redact_removes_mac_addresses_and_the_guid(self):
         text = ("Boot0003* UEFI PXE IPv4: Intel(R) Ethernet Controller X550(MAC:020000000001)\n"
                 "CLIENT MAC ADDR: 02 00 00 00 00 02  GUID: C0FFEE00-0000-4000-8000-0000000000A1\n"
