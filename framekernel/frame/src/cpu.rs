@@ -635,31 +635,63 @@ fn cpu_state_holds() -> bool {
         && sysenter_cs == 0
 }
 
-/// Each CPU index whose processor passed [`cpu_state_holds`] on itself.
-pub(crate) static CPU_STATE_HOLDS: PerCpu<core::sync::atomic::AtomicBool> = PerCpu::new(
-    "origin_frame::cpu::CPU_STATE_HOLDS",
-    core::sync::atomic::AtomicBool::new(false),
-    || core::sync::atomic::AtomicBool::new(false),
+/// What each processor found about itself as it started, by CPU index: [`STATE_HOLDS`] and
+/// [`FPU_ALIKE`]. Written once, by the processor itself, in one store ([`record_cpu_state`]).
+pub(crate) static CPU_STATE: PerCpu<core::sync::atomic::AtomicU8> = PerCpu::new(
+    "origin_frame::cpu::CPU_STATE",
+    core::sync::atomic::AtomicU8::new(0),
+    || core::sync::atomic::AtomicU8::new(0),
 );
 
-/// Records whether this processor's control state holds, after `enable_simd`. The boot
-/// processor and every AP do it on themselves; an AP before its handshake, which orders the
-/// mark before the boot processor sees it online.
-pub fn record_cpu_state() {
-    if let Some(holds) = CPU_STATE_HOLDS.get(this_cpu().get()) {
-        holds.store(cpu_state_holds(), Ordering::Relaxed);
+/// [`CPU_STATE`]'s bit: the processor passed [`cpu_state_holds`] on itself.
+const STATE_HOLDS: u8 = 1 << 0;
+/// [`CPU_STATE`]'s bit: its FPU format is the boot processor's, so it takes part in moves
+/// (ADR-0020 S6).
+const FPU_ALIKE: u8 = 1 << 1;
+
+/// Records, in one store, whether this processor's control state holds (checked here, after
+/// `enable_simd`) and whether its FPU format is the boot processor's. The boot processor and
+/// every AP do it on themselves, once; an AP before its handshake, whose answer then orders
+/// the record before the boot processor sees it online.
+pub fn record_cpu_state(fpu_alike: bool) {
+    if let Some(state) = CPU_STATE.get(this_cpu().get()) {
+        let holds = if cpu_state_holds() { STATE_HOLDS } else { 0 };
+        let alike = if fpu_alike { FPU_ALIKE } else { 0 };
+        state.store(holds | alike, Ordering::Release);
     }
+}
+
+/// How many of `cpus` recorded the bit `bit` of [`CPU_STATE`].
+fn recorded(cpus: &[CpuIndex], bit: u8) -> usize {
+    cpus.iter()
+        .filter(|c| {
+            CPU_STATE
+                .get(c.get())
+                .is_some_and(|s| s.load(Ordering::Acquire) & bit != 0)
+        })
+        .count()
 }
 
 /// How many of `cpus` recorded a control state that holds.
 pub fn cpu_states_holding(cpus: &[CpuIndex]) -> usize {
-    cpus.iter()
-        .filter(|c| {
-            CPU_STATE_HOLDS
-                .get(c.get())
-                .is_some_and(|h| h.load(Ordering::Relaxed))
-        })
-        .count()
+    recorded(cpus, STATE_HOLDS)
+}
+
+/// How many of `cpus` recorded an FPU format alike the boot processor's.
+pub fn fpu_formats_alike(cpus: &[CpuIndex]) -> usize {
+    recorded(cpus, FPU_ALIKE)
+}
+
+/// Whether processor `index` recorded an FPU format alike the boot processor's (ADR-0020 S6,
+/// N9). `false` for a processor that recorded nothing: an AP records only once every check
+/// before its handshake has passed, so one refused for any reason never says alike.
+///
+/// Not the whole answer to whether it takes part in moves: an AP whose answer came after the
+/// boot processor stopped waiting is parked with its record standing, and nothing writes it
+/// again. So the question is asked through the processors online,
+/// `smp::Online::takes_part_in_moves` (the review of TASKS item 94, R94-3).
+pub(crate) fn fpu_alike(index: CpuIndex) -> bool {
+    recorded(&[index], FPU_ALIKE) == 1
 }
 
 /// IA32_STAR, IA32_LSTAR and IA32_FMASK.
@@ -2254,10 +2286,20 @@ const CR4_OSFXSR: u64 = 1 << 9;
 const CR4_OSXMMEXCPT: u64 = 1 << 10;
 const CR4_OSXSAVE: u64 = 1 << 18;
 
-/// Whether this processor's SIMD state is managed with XSAVE (else FXSAVE).
+/// Whether SIMD state is managed with XSAVE (else FXSAVE): the boot processor's, recorded once
+/// with its format ([`record_boot_fpu`]).
 static USE_XSAVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// The XSAVE/FXSAVE area size the kernel allocates per thread, once known.
-static FPU_AREA_SIZE: AtomicU64 = AtomicU64::new(crate::features::FXSAVE_SIZE as u64);
+
+/// The boot processor's FPU format and the size of every thread's FPU area, recorded once by
+/// the boot processor before the first area is allocated (ADR-0020 S6; TASKS item 94).
+/// Application processors read it and never write it.
+#[derive(Clone, Copy, Debug)]
+struct BootFpu {
+    format: crate::features::FpuFormat,
+    area: usize,
+}
+
+static BOOT_FPU: crate::once::SetOnce<BootFpu> = crate::once::SetOnce::new();
 
 /// Gathers the CPUID leaves `features` decodes.
 pub fn gather_cpuid() -> crate::features::Cpuid {
@@ -2297,8 +2339,10 @@ unsafe fn xsetbv(reg: u32, value: u64) {
     }
 }
 
-/// Enables SSE (and AVX where present) on this processor and sets the per-thread FPU-area
-/// size from `features`. Returns the XCR0 value in force (0 if XSAVE is not used).
+/// Enables SSE (and AVX where present) on this processor. Returns its FPU format as the
+/// processor reports it once XCR0 is set: XCR0 read back, and CPUID.0DH.00H:EBX, the bytes
+/// XSAVE then needs (ADR-0020 S6). Without XSAVE, XCR0 0 and the FXSAVE area's 512 bytes. It
+/// sets no area size: the boot processor records its own once ([`record_boot_fpu`]).
 ///
 /// The kernel's own code is soft-float (the `x86_64-unknown-none` ABI uses no XMM), so this
 /// adds a capability for explicit SIMD and for user programs; it does not change how kernel
@@ -2307,9 +2351,11 @@ unsafe fn xsetbv(reg: u32, value: u64) {
 /// # Safety
 ///
 /// CPL 0. Must run once per processor before any code on it uses SSE or XSAVE.
-pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
-    use crate::features::{Features, wanted_xcr0, xsave_area_size};
+pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> crate::features::FpuFormat {
+    use crate::features::{FXSAVE_SIZE, Features, FpuFormat, wanted_xcr0, xsave_usable};
     let features = Features::decode(id);
+    // XSAVE only with leaf 0DH to size it (R94-6).
+    let xsave = xsave_usable(id);
     // CR0: clear EM and TS, set MP, so SSE instructions run and do not fault to an
     // emulator or a (nonexistent) lazy-FPU handler; set NE, so an x87 error raises #MF
     // (INIT leaves it clear on an AP).
@@ -2329,7 +2375,7 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
     }
     // CR4: OSFXSR and OSXMMEXCPT for SSE; OSXSAVE when the CPU has XSAVE.
     let mut cr4_bits = CR4_OSFXSR | CR4_OSXMMEXCPT;
-    if features.xsave {
+    if xsave {
         cr4_bits |= CR4_OSXSAVE;
     }
     // SAFETY: the caller's contract; these CR4 bits enable FXSAVE/SSE and XSAVE. The flags are
@@ -2344,26 +2390,65 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
             options(nomem, nostack),
         );
     }
-    let mut xcr0 = 0;
-    if features.xsave {
-        xcr0 = wanted_xcr0(&features);
-        // SAFETY: CR4.OSXSAVE was just set; `xcr0` has x87 and SSE (required) and AVX only
-        // when the CPU reports it, so it is a legal XCR0.
-        unsafe { xsetbv(0, xcr0) };
-        USE_XSAVE.store(true, core::sync::atomic::Ordering::Relaxed);
-        if let Some(size) = xsave_area_size(id) {
-            // The area must hold every enabled component; take the maximum CPUID reports.
-            FPU_AREA_SIZE.store(size as u64, core::sync::atomic::Ordering::Relaxed);
-        }
-        // SAFETY: OSXSAVE is set.
-        let _ = unsafe { xgetbv(0) };
+    if !xsave {
+        return FpuFormat {
+            xcr0: 0,
+            enabled_size: FXSAVE_SIZE as u32,
+        };
     }
-    xcr0
+    let wanted = wanted_xcr0(&features);
+    // SAFETY: CR4.OSXSAVE was just set; `wanted` has x87 and SSE (required) and AVX only
+    // when the CPU reports it, so it is a legal XCR0.
+    unsafe { xsetbv(0, wanted) };
+    FpuFormat {
+        // SAFETY: OSXSAVE is set.
+        xcr0: unsafe { xgetbv(0) },
+        // Read after XSETBV: EBX follows the XCR0 in force on this processor.
+        enabled_size: cpuid_subleaf(0x0D, 0)[1],
+    }
 }
 
-/// The per-thread FPU save area size (bytes) and alignment (64).
+/// Records the boot processor's FPU format, from what [`enable_simd`] returned there, and the
+/// size of every thread's FPU area: CPUID.0DH.00H:ECX, the size for every component the
+/// processor supports, and never less than what one save in the format writes
+/// ([`crate::features::fpu_bytes`]), so the boot processor's state always fits. Returns `false`, and changes nothing, if they were recorded
+/// already.
+///
+/// Called by `Early::enable_simd` alone: once, on the boot processor, before any area is
+/// allocated (ADR-0020 S6: the kernel's area size is the boot processor's).
+pub(crate) fn record_boot_fpu(
+    id: &crate::features::Cpuid,
+    format: crate::features::FpuFormat,
+) -> bool {
+    use crate::features::{FXSAVE_SIZE, xsave_area_size};
+    let supported = if format.xcr0 == 0 {
+        FXSAVE_SIZE
+    } else {
+        xsave_area_size(id).unwrap_or(FXSAVE_SIZE)
+    };
+    // Never less than what one save in its own format writes (R94-10).
+    let area = supported.max(crate::features::fpu_bytes(format));
+    if BOOT_FPU.set(BootFpu { format, area }).is_err() {
+        return false;
+    }
+    // How every processor saves and restores, from the boot processor alone: an AP that
+    // could not use XSAVE is refused below the baseline (`smp::ap_entry`) and never saves
+    // (the review of TASKS item 94, R94-5).
+    USE_XSAVE.store(format.xcr0 != 0, core::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// The boot processor's FPU format, once it has recorded it.
+pub fn boot_fpu_format() -> Option<crate::features::FpuFormat> {
+    BOOT_FPU.get().map(|b| b.format)
+}
+
+/// The per-thread FPU save area size (bytes) and alignment (64): the boot processor's, or the
+/// FXSAVE area's 512 bytes before it recorded one.
 pub fn fpu_area_size() -> usize {
-    FPU_AREA_SIZE.load(core::sync::atomic::Ordering::Relaxed) as usize
+    BOOT_FPU
+        .get()
+        .map_or(crate::features::FXSAVE_SIZE, |b| b.area)
 }
 
 /// Prepares a fresh thread's FPU area so a restore from it yields a clean FPU: default

@@ -242,6 +242,98 @@ pub fn xsave_area_size(id: &Cpuid) -> Option<usize> {
 /// 16-byte aligned).
 pub const FXSAVE_SIZE: usize = 512;
 
+/// Whether the kernel can manage state with XSAVE: the processor has it (CPUID.1:ECX.XSAVE)
+/// and reports leaf 0DH, whose sizes the kernel reads. Asked for a leaf above its largest,
+/// CPUID answers with another leaf's values, which would be read as those sizes (the review of
+/// TASKS item 94, R94-6). Without it the kernel uses FXSAVE, and the baseline, which needs AVX
+/// state in XCR0, is not met.
+pub fn xsave_usable(id: &Cpuid) -> bool {
+    Features::decode(id).xsave && id.max_basic >= 0x0D
+}
+
+/// How a processor saves its FPU and SIMD state, as it reports it once its XCR0 is set
+/// (ADR-0020 S6, N9): an area saved under one format may be restored only under the same.
+///
+/// Intel SDM Vol. 1 §13.7 and §13.8.1: XSAVE leaves a header bit outside XCR0 as it was, and
+/// the standard form of XRSTOR raises #GP on a header bit that is not in XCR0, so an area once
+/// saved under a larger XCR0 can fault under a smaller one. Equality is the rule, not inclusion.
+/// Each component's offset and size in the standard format are in the Platform domain (SDM
+/// Vol. 1, Table 21 for leaf 0DH): the documents allow no difference there between logical
+/// processors, so they are not compared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FpuFormat {
+    /// XCR0 as XGETBV reads it back after XSETBV; 0 where XSAVE is not used.
+    pub xcr0: u64,
+    /// CPUID.0DH.00H:EBX read after XCR0 was set: the bytes XSAVE needs for the components
+    /// XCR0 enables (Logical Processor domain); [`FXSAVE_SIZE`] where XSAVE is not used.
+    pub enabled_size: u32,
+}
+
+/// What an application processor's [`FpuFormat`] means for it (ADR-0020 S6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FpuFit {
+    /// The boot processor's format: it may take part in moves.
+    Alike,
+    /// Another format whose state still fits the kernel's areas: it runs its own threads and
+    /// takes no part in moves, as source or destination.
+    Differs,
+    /// Its enabled state is larger than the kernel's areas, so saving it would write past
+    /// every area: it must not run threads at all.
+    TooLarge,
+}
+
+/// Why an application processor refuses to come online, from what it checked on itself before
+/// its handshake (ADR-0003, CLAUDE.md §14, ADR-0020 S6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApLacks {
+    /// No SMEP or no SMAP.
+    SmepSmap,
+    /// Below the x86-64-v3 baseline, or without the AVX state XCR0 must hold.
+    Baseline,
+    /// Its enabled XSAVE state is larger than every thread's FPU area.
+    FpuRoom,
+}
+
+/// What an AP lacks, if anything, in the order it is named: SMEP and SMAP, then the baseline,
+/// then room for its FPU state. Only the first is named, as the AP has one word to say it in
+/// (the review of TASKS item 94, R94-7).
+pub fn ap_lacks(smep_and_smap: bool, baseline: bool, fit: FpuFit) -> Option<ApLacks> {
+    if !smep_and_smap {
+        Some(ApLacks::SmepSmap)
+    } else if !baseline {
+        Some(ApLacks::Baseline)
+    } else if fit == FpuFit::TooLarge {
+        Some(ApLacks::FpuRoom)
+    } else {
+        None
+    }
+}
+
+/// The bytes one save in `format` may write: [`FXSAVE_SIZE`] without XSAVE; with it, the
+/// enabled size CPUID reports, but never less than the legacy region and the XSAVE header that
+/// every XSAVE writes (576 bytes, Intel SDM Vol. 1 §13.4), whatever CPUID says (the delta
+/// review of TASKS item 94, R94-10).
+pub fn fpu_bytes(format: FpuFormat) -> usize {
+    if format.xcr0 == 0 {
+        FXSAVE_SIZE
+    } else {
+        (format.enabled_size as usize).max(FXSAVE_SIZE + 64)
+    }
+}
+
+/// Judges a processor's format `own` against the boot processor's, `boot` (`None` until the
+/// boot processor has recorded it), when every FPU area is `area` bytes. Room comes first: a
+/// state that does not fit ([`fpu_bytes`]) is refused whatever else it matches.
+pub fn fpu_fit(boot: Option<FpuFormat>, own: FpuFormat, area: usize) -> FpuFit {
+    if fpu_bytes(own) > area {
+        FpuFit::TooLarge
+    } else if boot == Some(own) {
+        FpuFit::Alike
+    } else {
+        FpuFit::Differs
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,11 +550,151 @@ mod tests {
     }
 
     #[test]
+    fn xsave_is_used_only_with_leaf_0dh() {
+        let mut id = modern();
+        assert!(xsave_usable(&id));
+        id.max_basic = 0x0C;
+        assert!(!xsave_usable(&id), "no leaf 0DH to size it");
+        let mut id = modern();
+        id.leaf1[2] &= !(1 << 26);
+        assert!(!xsave_usable(&id), "no XSAVE");
+    }
+
+    #[test]
     fn xsave_size_rejects_nonsense() {
         let mut id = modern();
         id.leaf_d0[2] = 100; // below the 576-byte minimum
         assert_eq!(xsave_area_size(&id), None);
         id.leaf_d0[2] = 576;
         assert_eq!(xsave_area_size(&id), Some(576));
+    }
+
+    /// x87, SSE and AVX: what `wanted_xcr0` enables on every baseline processor, and the
+    /// standard format's size for it (AVX's 256 bytes at offset 576).
+    const BOOT: FpuFormat = FpuFormat {
+        xcr0: 0x7,
+        enabled_size: 832,
+    };
+    /// QEMU's `max` processor's area: CPUID.0DH.00H:ECX, PKRU's end.
+    const AREA: usize = 2696;
+
+    #[test]
+    fn the_boot_processors_format_is_alike() {
+        assert_eq!(fpu_fit(Some(BOOT), BOOT, AREA), FpuFit::Alike);
+        // The area exactly as large as the state still holds it.
+        assert_eq!(fpu_fit(Some(BOOT), BOOT, 832), FpuFit::Alike);
+    }
+
+    #[test]
+    fn a_different_xcr0_differs_even_at_the_same_size() {
+        let own = FpuFormat { xcr0: 0x3, ..BOOT };
+        assert_eq!(fpu_fit(Some(BOOT), own, AREA), FpuFit::Differs);
+    }
+
+    #[test]
+    fn a_different_size_differs_even_with_the_same_xcr0() {
+        let own = FpuFormat {
+            enabled_size: 1088,
+            ..BOOT
+        };
+        assert_eq!(fpu_fit(Some(BOOT), own, AREA), FpuFit::Differs);
+    }
+
+    #[test]
+    fn a_larger_xcr0_that_fits_differs() {
+        // C94-1's plant: PKRU added, on a processor that supports it.
+        let own = FpuFormat {
+            xcr0: 0x207,
+            enabled_size: 2696,
+        };
+        assert_eq!(fpu_fit(Some(BOOT), own, AREA), FpuFit::Differs);
+    }
+
+    #[test]
+    fn a_state_larger_than_the_area_is_refused() {
+        let own = FpuFormat {
+            xcr0: 0x207,
+            enabled_size: 2696,
+        };
+        // C94-2's plant: the area planted at the boot processor's enabled size.
+        assert_eq!(fpu_fit(Some(BOOT), own, 832), FpuFit::TooLarge);
+        // Room is judged first: even the boot processor's own format, in a smaller area.
+        assert_eq!(fpu_fit(Some(BOOT), BOOT, 831), FpuFit::TooLarge);
+        assert_eq!(fpu_fit(None, BOOT, 0), FpuFit::TooLarge);
+    }
+
+    #[test]
+    fn an_ap_names_the_first_thing_it_lacks() {
+        use FpuFit::{Alike, Differs, TooLarge};
+        for fit in [Alike, Differs, TooLarge] {
+            assert_eq!(ap_lacks(false, false, fit), Some(ApLacks::SmepSmap));
+            assert_eq!(ap_lacks(false, true, fit), Some(ApLacks::SmepSmap));
+            assert_eq!(ap_lacks(true, false, fit), Some(ApLacks::Baseline));
+        }
+        assert_eq!(ap_lacks(true, true, TooLarge), Some(ApLacks::FpuRoom));
+        // A format that differs but fits comes online, and takes no part in moves.
+        assert_eq!(ap_lacks(true, true, Differs), None);
+        assert_eq!(ap_lacks(true, true, Alike), None);
+    }
+
+    #[test]
+    fn an_xsave_writes_at_least_its_header_whatever_cpuid_says() {
+        // A hypervisor that reports an enabled size below the legacy region and the header.
+        let small = FpuFormat {
+            xcr0: 0x7,
+            enabled_size: 100,
+        };
+        assert_eq!(fpu_bytes(small), 576);
+        assert_eq!(fpu_fit(Some(small), small, 512), FpuFit::TooLarge);
+        assert_eq!(fpu_fit(Some(small), small, 576), FpuFit::Alike);
+        assert_eq!(fpu_bytes(BOOT), 832);
+        // Without XSAVE, the FXSAVE area's 512 bytes.
+        let fxsave = FpuFormat {
+            xcr0: 0,
+            enabled_size: 512,
+        };
+        assert_eq!(fpu_bytes(fxsave), FXSAVE_SIZE);
+    }
+
+    #[test]
+    fn nothing_is_alike_before_the_boot_processor_records_its_format() {
+        assert_eq!(fpu_fit(None, BOOT, AREA), FpuFit::Differs);
+    }
+
+    /// Arbitrary formats and areas: alike only when equal to the boot processor's and fitting,
+    /// refused exactly when the state is larger than the area (CLAUDE.md §72).
+    #[test]
+    fn any_format_is_judged_by_equality_and_room() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x4650_5546);
+        for case in 0..crate::testing::cases(20_000) {
+            let format = |rng: &mut Rng| FpuFormat {
+                xcr0: rng.edge_u64(),
+                enabled_size: rng.edge_u32(),
+            };
+            let boot = (rng.below(8) != 0).then(|| format(&mut rng));
+            // Often the boot processor's own format, or one field of it changed.
+            let own = match (boot, rng.below(3)) {
+                (Some(b), 0) => b,
+                (Some(b), 1) => FpuFormat {
+                    xcr0: b.xcr0 ^ (1 << rng.below(64)),
+                    ..b
+                },
+                _ => format(&mut rng),
+            };
+            let area = rng.edge_u32() as usize;
+            let fit = fpu_fit(boot, own, area);
+            assert!(fpu_bytes(own) >= own.enabled_size as usize || own.xcr0 == 0);
+            assert_eq!(
+                fit == FpuFit::TooLarge,
+                fpu_bytes(own) > area,
+                "case {case}"
+            );
+            assert_eq!(
+                fit == FpuFit::Alike,
+                boot == Some(own) && fpu_bytes(own) <= area,
+                "case {case}"
+            );
+        }
     }
 }
