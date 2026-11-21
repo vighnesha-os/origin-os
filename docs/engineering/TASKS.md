@@ -3962,6 +3962,7 @@ Every finding is answered in the review's resolution:
 
 **Follow-ups:**
 - **TASKS item 113:** under KVM every calibration discards all 1,024 windows and keeps the least disturbed one, probably about 10 s of each KVM boot (arithmetic, not measured).
+
 - **TASKS item 115:** the review's guard for a count that pauses at 0 (T78-R7). The rule would set aside a pair whose lower slope exceeds the least upper slope of its single steps. Build it if a log ever shows a correct timer judged slow, after measuring how a count that moves in coarse steps fares under it.
 - **The 8370C's figures:** they go in this entry whenever a CI run draws that processor.
 
@@ -4048,3 +4049,97 @@ Asked for by the owner on 2026-11-21 ("Start breadcrumbs"), from rental C's find
 **Follow-ups:**
 - `onbf-sign`'s own command line does not refuse a bench kernel (R112-5 covers `xtask` only).
 - The correction to TASKS item 84's D1 sentence, in its records.
+
+### 95. Moves between the processors' tables of contexts (ADR-0020 S4 and S5; plan P4)
+
+Assigned by the coordinating session on 2026-11-20, on the owner's word ("Start all four", items 93, 94, 95 and 97). The contract went to the coordinating session before any code (the coordination notes' `t95-contract.md`, written against `land/batch-9` at `a25228c9`). It was accepted on 2026-11-21 at 00:20 UTC, with the recommendations of Q1 to Q12 and these changes:
+
+- **Q1:** `Moving`'s drop raises finished and then frees the gate, also on a panic, and the record says that a panic under the gate halts the kernel anyway.
+- **Q2:** begun raised before `lend`; a dated note in S4; the empty move a refused `lend` costs, in CL48.
+- **Q3:** publication at the top of every switch, before `next` is taken, and in `stack_in_use`; the idle loop's call left to item 98; a host test of a switch straight back to the leaving context.
+- **Q6:** the ADR's control for MV4 run first; if not caught, recorded with its reason and two controls of mine added, both caught; the reviewer asked the same question independently.
+- **Q8:** B1 paired by item 92's final rule.
+- **Q9 (changed):** a fresh comparison on the 65- and 67-processor machines, three boots each of base and tip alternating, judged by item 92's rules (a) to (c).
+- **Q11 (changed):** a boot control, C95-B1, `covers` planted to skip the leaving record, on 1 and 4 processors and the AMD-IOMMU 3-processor machine.
+- **Q12:** `FAST_TRIES` 2 under Loom, 4 in real builds, with a host test of the kernel's 4 + 1.
+
+Built on `claude/t95-context-moves-20031f`, cut from `land/batch-9` at `a25228c9` (checked with `git log -1` before the first commit).
+
+**Result (2026-11-21): built, reviewed and gated; not landed and not pushed.** Nothing in the kernel moves a thread yet: TASKS item 96 calls what this builds. The evidence is in `SOURCE_PROVENANCE.md`, under "TASKS item 95", and in `REVIEW_T95_2026-11-21.md`.
+
+**As built**, in order:
+
+- `fc1eba26`: S5, the leaving record. `switch` records the outgoing frame and its slot as leaving; `publish_leaving` stores the frame in its slot (Release), then clears the record (Release); `covers` reads the record before the slots. C3's texts rewritten around the record, its bug and model unchanged (Q7).
+- `c38d566a`: S4, `Moves` (the gate and the begun and finished counters), `Moving`, `lend`, `adopt`, `restore`, `forget`, `relocate` and the bounded `scan`.
+- `caf69588`: `cpu::MOVES` and `Quietly`; `contexts_cover` and `stack_in_use` scan every table through the move sequence, and `stack_in_use` publishes its own leaving frame first.
+- `ed73b872`: the Loom module `models::moves` (`moves_models.rs`), MV1 to MV7, LV1 and LV2, and their controls.
+- `d6be4eaf`, `52ead180`, `9f0535ff`, `f5d7ceaa`: the review's answers (R95-1 to R95-12, Q6).
+- `1ce800ce`: `land/batch-9` at `7b67be0b` merged (TASKS items 94 and 78's figures line), as ruled; it compiled at once, and the host tests passed (`origin-sync` 146, `origin-frame` 328, the kernel's library 566, xtask 397).
+- `2af004ca`: `moves_models.rs` forbids `unsafe`, as the unsafe gate requires.
+- `a0ee3c15`: xtask's Loom report read a `moves::` model's name whole (it stopped at the first colon, so the first full `cargo xtask loom` after the merge failed with the models passing).
+- `36610070`, `629bca7c`: the delta review's answers (D95-1 to D95-8).
+- `a66985f8`: `publish_leaving` and `record_leaving` `#[inline]`, so the switch path calls no `origin_sync` function the base did not (the first comparison; the coordinating session's ruling on Q9, option 1).
+- The records: this entry, ADR-0020 S4's and S5's dated notes, ADR-0013's control, CL48 and CL49, the provenance entry and `REVIEW_T95_2026-11-21.md`.
+
+**The design as it lands:**
+
+- **Publication (S5).** At the top of every `switch`, before `next` is taken, so a switch straight back to the leaving context publishes it and then takes it (a host test), and in `stack_in_use`, with interrupts off. Not from the idle loop (item 98), nor from any handler that can interrupt a switch.
+- **The move gate is a ticket lock** (R95-2): a waiter waits for at most one critical section per processor ahead of it, each with interrupts off. A mover turns interrupts off before it takes its ticket (D95-3).
+- **The witnesses (Q1, R95-1).** `lend`, `adopt` and `restore` take a `Moving`, which only `Moves::begin` makes. `lend` answers a `Lent` naming its slot; `adopt` consumes it and answers an `Adopted`, or hands it back with the refusal; `Lent::restore` consumes it; `forget` is on `Adopted` alone. A `Lent` dropped unsettled restores itself, and stops a debug build if it cannot (D95-4); an `Adopted` dropped forgets. Three doctests show what does not compile (E0382, E0599, E0505). Leaking a token with `core::mem::forget` defeats them, and the kernel may not (D95-5).
+- **Begun is raised before `lend`** (Q2), so a refused `lend` costs an empty move (CL48).
+- **`lend`'s refusals (Q4):** `Leaving`, `BootFlow` and `NotHere`, the record read first.
+- **The scan:** `FAST_TRIES` fast passes (4; 2 under Loom, Q12), each reading finished, then begun, then the pass, then begun again; then one pass under the gate inside `Quiet`. A host test shows the kernel's four and one.
+
+**Changed from the contract, and why:**
+
+- **The gate** is a ticket lock, not a `SpinLock<()>`: a test-and-set lock did not bound a scanner's wait (R95-2).
+- **`forget` is on `Adopted`, not `Lent`**, and `adopt` consumes the `Lent` (R95-1): with `adopt(&Lent)` safe code could adopt twice, or adopt and restore.
+- **Two more models and a variant:** MV2b (a switch straight back to the leaving context, racing a lend; R95-5), MV8 (a frame saved on a measured stack, which only the frame word covers; R95-7 (e)) and MV9 (the gate admits one holder at a time, a scan's last pass among them; D95-2). MV5 races a publication for the destination's last slot (R95-8).
+- **MV4's control (Q6):** the ADR's control was run and not caught, and the reviewer said the same independently; MV4's controls are MX4a, MX4b and MX4c (S4's dated note).
+- **The comparison's base is `7b67be0b`, not `a25228c9`:** after the merge the tip holds TASKS item 94 and item 78's figures line, so only the batch's tip measures this change alone.
+
+**The controls.** Of the base's 111 Loom controls only C3 changed (Q7). The moves models have 20, each caught: MX1 (MV1), MX2 (MV2 and MV2b), MX3 (MV3), MX4a, MX4b and MX4c (MV4), MX5 (MV5), MX6 (MV6), MX7 (MV7), MX8 and MX9 (MV1), MX10 (MV8), MX11 to MX13 (MV9), LX1 and LX4 (LV1), LX2a, LX2b and LX3 (LV2).
+
+**Loom on `629bca7c`:** all 91 models passed and all 140 controls were caught (183 model runs), in 652 s; again on `a66985f8`, with host tests, Clippy and `boot-test` (11 of 11), in 651 s. MV7, with `FAST_TRIES` 2 (Q12): 288,528 executions at four preemptions, 41.3 s, and its control MX7 caught. Every moves model's figures are in the review's record.
+
+**The boot control C95-B1 (Q11),** `covers` planted to skip the leaving record, in an export of `629bca7c`, on 1 and 4 processors and the AMD-IOMMU 3-processor machine: nothing failed (`boot-test` 11 of 11 on each, 71 of 72 proofs, speculation controls the one failure, as on the base). Two counters show what it reached: one switch-out per boot left a frame on a stack not its home (the measured-stack proof's yield), and no scan found a stack only through the leaving record, so the window was not crossed. No proof asks another processor about a non-home stack between its switch-out and that processor's next call into its table; same-processor scans publish first. Run on 1, 4 and the AMD-IOMMU 3-processor machine, not caught: no scan yet depends on the leaving record alone (no moves); carried to TASKS item 96 (the coordinating session's ruling, 2026-11-21, recorded in ADR-0013). The evidence here is Loom's (LX2a, the same edit, caught by LV2; LV1 for the publication's order) and the host tests of `covers` with a leaving frame.
+
+**The comparison with `7b67be0b` (Q8, Q9; the coordinating session's rulings of 2026-11-21).** Every boot ran from a `git archive` export, inside `cargo xtask exclusive`, base and tip alternating in three rounds, one turn each, under QEMU 11.1.3 TCG on the development Mac. Judged by item 92's rules (a) to (c) (`judge95.py`, in the session's scratchpad with the logs). The base is `7b67be0b`, not the contract's `a25228c9`: after the merge this branch holds TASKS items 94 and 78, so only the batch's tip measures this change alone.
+
+- **First, on `629bca7c`** (07:11 to 07:46 UTC): (a) nothing new, (b) no window re-run, but (c) fired on the 65-processor machine. The wait-queue ping-pong was 27, 30 and 38 µs (mean 31.7) against the base's 16, 28 and 28; the IPC round trip 87,876, 97,247 and 105,866 ns (mean 96,996) against 76,604, 93,088 and 85,897. The static counts named the cause: `cpu::resume` had 749 instructions and 42 call sites against the base's 718 and 40, the two new ones `publish_leaving` and `record_leaving`, out of line through the GOT, where CL49 budgets loads and stores. The coordinating session ruled option 1 (ADR-0018 V1): inline them, review the change (section 4 of the review's record), and compare afresh, with the acceptance rule fixed beforehand.
+- **Then, on `a66985f8`** (08:13 to 09:56 UTC): no rule fired. (a) Nothing new. (b) One stalled window, in one tip boot of three on 65 processors, passed on its re-run; the base had none, and the rule needs two. (c) Every figure passed, the 50 ms wait by the tick rule:
+
+| Figure | Machine | Base | Tip |
+|---|---|---|---|
+| Switches per CPU | 65 | 63.8, 67.0, 64.1 | 59.7, 67.8, 64.2 |
+| | 67 | 64.8, 60.5, 72.5 | 73.1, 66.2, 72.5 |
+| Counts per CPU (M) | 65 | 107.7, 119.8, 87.9 | 110.3, 113.8, 122.9 |
+| | 67 | 104.5, 99.7, 122.4 | 113.7, 132.2, 114.6 |
+| Ping-pong (µs) | 65 | 24, 28, 31 | 20, 25, 22 |
+| | 67 | 32, 25, 25 | 26, 18, 18 |
+| IPC round trip (ns) | 65 | 92442, 84422, 102632 | 79250, 83274, 90910 |
+| | 67 | 84766, 85856, 101055 | 87861, 91841, 83386 |
+| 50 ms timed wait (ms) | 65 | 59, 58, 50 | 59, 60, 59 |
+| | 67 | 60, 61, 58 | 52, 59, 61 |
+| TSC handoffs (not judged) | 65 | 11896, 11979, 12170 | 12753, 11268, 11833 |
+| | 67 | 10552, 11889, 11940 | 11911, 11428, 12806 |
+
+- **B1, paired (Q8),** the default machine's "TSC cycles per context switch": on `629bca7c`, base 1795, 1837 and 2007, tip 1913, 1887 and 1872 (means 1880 and 1891); on `a66985f8`, base 1977, 1847 and 1832, tip 1956, 1945 and 1975 (means 1885 and 1959). Each tip mean lies within its base's range: no further pairs.
+- **The same line on the large machines** (reported, not judged): on `629bca7c`, means of 2015 (base) and 2120 (tip) on 65 processors, 2080 and 2130 on 67; on `a66985f8`, 2040 and 1966 on 65, 2026 and 1951 on 67.
+- **The switch path's static counts** (`llvm-objdump` of the built images): `on_yield` 239 instructions and 7 calls on all three. `resume` on `a66985f8` makes 40 calls, the base's by target (32 to `Context::claim`, on the boot or idle flow's first switch-out, 4 to `panic_fmt`, `phys::told` and 3 to `PerCpu::not_held`), with 35 locked instructions as the base's, in 777 instructions against 718. On every switch: one load of the leaving record, a test and a branch (+3); when a frame is leaving, the load of its slot index, `slots.get`'s bounds check (a compare and a branch), a shift and the two stores (+6); the first check again on the second path to the table (+4). Once per processor per boot: the boot or idle flow's claim loop, unrolled over 32 slots, sets each slot's number for the leaving record (+31). Never run: 12 bytes of padding. The other three are register moves.
+
+**The gates on `d424d0c6`** (the code at `a66985f8`, `land/batch-9` merged at `ca22c5f5` and then `a2898d14` as the coordinating session asked, and every record but these results), in one turn of the machine on a clean tree, 2026-11-21 from 10:45 to 12:03 UTC, under Rust 1.100.0 with QEMU 11.1.3 TCG and OVMF:
+
+- `cargo xtask build` and `cargo clippy --locked --all-targets -- -D warnings` found nothing; `check` runs Clippy on the kernel for its target. The compiler's `harden-sls-ret` notice is printed, as everywhere since ADR-0017 Amendment 2.
+- `check` passed in 890 s: 2,520 host tests passed, 0 failed, 30 ignored; Loom's 91 models passed and its 140 negative controls were caught; every document gate.
+- `boot-test` passed, 11 of 11, in 56 s.
+- `boot-matrix` passed three times in a row, in 1,254, 1,233 and 1,231 s, each with 41 kernel verdicts: 35, 35 and 36 boots `degraded: 71 of 72 proofs passed; failed: speculation controls`, 3, 3 and 2 with scheduler fairness too, and in each run the three machines built to lack something with their verdicts naming it.
+- Before them, on `153e51e2` (`ca22c5f5` merged): the build, the host tests (`origin-sync` 147, `origin-frame` 334, the kernel's library 566, xtask 401), Clippy and Loom (91 and 140) passed.
+
+**Follow-ups and limits:**
+
+- **For TASKS item 96 (the hand-over, `t95-handover.md`):** the mover holds both queue locks, in index order, with interrupts off from before the gate's ticket; lends only a thread ready in its source's queue; drops no stack and takes no other lock under the gate; asks `smp::Online::takes_part_in_moves` for both processors, which `relocate` does not; and treats `NotHere` as S20's inconsistency only once its own checks say the frame was published (S5's dated note). Requiring S3's interrupts-off witness in `begin` (R95-12, D95-3) and an owner check on the gate (R95-4) are left to items 93 and 96.
+- **C95-B1 for TASKS item 96:** item 96 boots the plant once moves exist, and it must fail there.
+- **The gated pass's cost** on the 65- and 67-processor machines, and the FIFO wait's (R95-10, D95-8), are owed in CL48 to item 96, when something moves.
+- **Not tested:** `relocate`'s mapping of a failed restore to `NotRestored`; an ABA race in a model (a sequential host test shows the case).
+
