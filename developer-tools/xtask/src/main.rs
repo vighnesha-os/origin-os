@@ -8,6 +8,7 @@
 
 mod amlalloc;
 mod asmflags;
+mod bench;
 mod corestubs;
 mod costs;
 mod disk;
@@ -62,7 +63,8 @@ commands:
               signature and tampered content, each with its own message
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
               one after another, then boot-x2apic, boot-bridge, boot-legacy-free,
-              boot-random, boot-identity, boot-console, boot-large and boot-rented
+              boot-random, boot-identity, boot-console, boot-large, boot-rented and
+              boot-bench
   boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
               cleared on the bridge too and opened again above the device its driver attached
   boot-reserved  the kernel boot with firmware-reserved memory (RMRRs, IVMDs) a TEST ONLY UEFI
@@ -101,6 +103,15 @@ commands:
   boot-console the kernel's console on machines without a 16550 at 0x3F8 (ADR-0010): a UART
               named by an ACPI SPCR table, a table that must be refused, no display, and no
               UART at all (with a framebuffer the only way to see the boot)
+  bench-build the bench build (TASKS item 112): the developer-mode loader and the kernel with
+              breadcrumbs on the SPCR's UART, into target/bench; prints each image's size and
+              SHA-256 (target/bench/xtask/BOOTX64.EFI and KERNEL.ONBF), for a rental. Never
+              signed, never shipped
+  boot-bench  Clippy over the bench code, bench-build, and four boots with the SPCR naming
+              COM2: ExitBootServices given the firmware's key, a stale key once (the retry),
+              twice (the halt, which says why and then nothing), and the bench kernel under the
+              normal loader (no breadcrumbs); part of boot-matrix
+  bench-gate  only the gate on which files may name the bench build's flag (part of check)
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
   reproducible-gate only the gate on reproducible builds: the loader, each way it is built,
               and the kernel are built twice from nothing in two target directories; the
@@ -336,13 +347,16 @@ enum Loader {
     /// `test-trust-store` only: developer mode is off, so only a signed kernel boots. This is
     /// what a release build does, but with the test key in place of Origin's own.
     Verifying,
+    /// The bench build (TASKS item 112): `developer-mode`, and the bench flag only
+    /// `bench::build_loader` gives, into `target/bench`.
+    Bench,
 }
 
 impl Loader {
     /// The Cargo feature this build needs.
     fn feature(self) -> &'static str {
         match self {
-            Self::Developer => "developer-mode",
+            Self::Developer | Self::Bench => "developer-mode",
             Self::Verifying => "test-trust-store",
         }
     }
@@ -367,6 +381,9 @@ struct Scenario {
     /// Stages what the scenario needs under the work directory and gives QEMU's extra
     /// arguments for it.
     qemu_args: Option<QemuArgs>,
+    /// How long the output is read on once every marker has appeared, so the check sees
+    /// whatever followed: a halt that must say nothing more (TASKS item 112).
+    quiet: Option<Duration>,
 }
 
 /// A function that stages a scenario's files and returns its extra QEMU arguments.
@@ -1928,6 +1945,7 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
     // one after the boot processor, if any.
     let target = machine.named(cpus.min(2) - 1);
     Scenario {
+        quiet: None,
         label: "kernel boot",
         // Developer mode off: the signed kernel of `boot_test`, against the test key.
         loader: Loader::Verifying,
@@ -3553,6 +3571,7 @@ fn settled_screen(monitor: &mut ChildStdin, path: &Path, serial: &str) -> Result
 fn developer_scenario() -> Scenario {
     use origin_version::{BUILD, PRODUCT, VERSION};
     Scenario {
+        quiet: None,
         label: "developer mode unsigned kernel",
         loader: Loader::Developer,
         markers: vec![
@@ -3583,6 +3602,7 @@ fn refusal_scenario(
     ];
     markers.extend(details.iter().map(|d| (*d).to_string()));
     Scenario {
+        quiet: None,
         label,
         loader,
         markers,
@@ -3909,6 +3929,7 @@ fn memory_markers() -> Vec<String> {
 /// still verifies what it can.
 fn tamper_scenario() -> Scenario {
     Scenario {
+        quiet: None,
         label: "tampered kernel",
         loader: Loader::Developer,
         markers: vec![
@@ -4089,6 +4110,9 @@ fn main() -> ExitCode {
         ["boot-many"] => in_turn_with_settings("boot-many", boot_many),
         ["boot-listed"] => in_turn_with_settings("boot-listed", boot_listed),
         ["boot-console"] => in_turn_with_settings("boot-console", boot_console),
+        ["boot-bench"] => in_turn_with_settings("boot-bench", bench::boot),
+        ["bench-build"] => in_turn("bench-build", || bench::build().map(|_| ())),
+        ["bench-gate"] => bench::gate(),
         ["boot-bridge"] => in_turn_with_settings("boot-bridge", boot_bridge),
         ["boot-reserved"] => in_turn_with_settings("boot-reserved", boot_reserved),
         ["boot-large"] => in_turn_with_settings("boot-large", boot_large),
@@ -4240,6 +4264,7 @@ fn boot_matrix(base: &Settings) -> Result {
     // size on a developer's machine and 8 GiB in CI (`Settings::large_memory`).
     boot_large(base)?;
     boot_rented(base)?;
+    bench::boot(base)?;
     // ADR-0008 D7 as decision item 294 has it: the large sparse machine of 67 processors, and
     // the discovery machine. The 288-processor run (`boot-many`) is outside the gate: on the
     // development Mac QEMU disturbs the guest's timing at 288 processors before any AP starts.
@@ -4458,6 +4483,7 @@ fn console_scenario(
     check: Option<Check>,
 ) -> Scenario {
     Scenario {
+        quiet: None,
         label,
         loader: Loader::Verifying,
         markers,
@@ -5503,6 +5529,8 @@ fn check() -> Result {
     progress::gate()?;
     costs::gate()?;
     unsafety::gate()?;
+    // Which files may name the bench build's flag (TASKS item 112, F1).
+    bench::gate()?;
     // Who may make a proof process, and which ring-3 files may name the call numbers.
     listed_names::gate()?;
     // Only the AML interpreter's `mem.rs` may allocate (TASKS item 63).
@@ -6334,7 +6362,10 @@ fn collect_files(
 /// Builds the EFI application with `loader`'s feature and returns the path of
 /// `origin-boot.efi`.
 fn build_loader(loader: Loader) -> Result<PathBuf> {
-    build_loader_in(Some(loader.feature()), None)
+    match loader {
+        Loader::Bench => bench::build_loader(),
+        _ => build_loader_in(Some(loader.feature()), None),
+    }
 }
 
 /// Builds the TEST ONLY application that plants firmware-reserved memory, and returns the path
@@ -6372,6 +6403,16 @@ fn build_reserved_fixture() -> Result<PathBuf> {
 /// target directory, and returns the path of `origin-boot.efi`. With no feature the trust
 /// store is empty: the loader a release builds, until Origin has keys of its own.
 fn build_loader_in(feature: Option<&str>, target: Option<&Path>) -> Result<PathBuf> {
+    build_loader_with(feature, target, &toolchain::image_config()?)
+}
+
+/// [`build_loader_in`] with the `--config` arguments `config` in place of
+/// [`toolchain::image_config`]'s (the bench build's, TASKS item 112).
+fn build_loader_with(
+    feature: Option<&str>,
+    target: Option<&Path>,
+    config: &[String],
+) -> Result<PathBuf> {
     let mut build = cargo();
     build.args([
         "build",
@@ -6389,7 +6430,7 @@ fn build_loader_in(feature: Option<&str>, target: Option<&Path>) -> Result<PathB
     if let Some(target) = target {
         build.arg("--target-dir").arg(target);
     }
-    build.args(toolchain::image_config()?);
+    build.args(config);
     run_step(&mut build)?;
     let efi = target
         .map_or_else(target_dir, Path::to_path_buf)
@@ -6414,6 +6455,12 @@ fn build_kernel() -> Result<PathBuf> {
 /// Builds the Framekernel ELF into `target`, or into Cargo's own target directory, and returns
 /// its path.
 fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
+    build_kernel_with(target, &toolchain::image_config()?)
+}
+
+/// [`build_kernel_in`] with the `--config` arguments `config` in place of
+/// [`toolchain::image_config`]'s (the bench build's, TASKS item 112).
+fn build_kernel_with(target: Option<&Path>, config: &[String]) -> Result<PathBuf> {
     let mut build = cargo();
     build.args([
         "build",
@@ -6428,7 +6475,7 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
     if let Some(target) = target {
         build.arg("--target-dir").arg(target);
     }
-    build.args(toolchain::image_config()?);
+    build.args(config);
     let elf = target
         .map_or_else(target_dir, Path::to_path_buf)
         .join(KERNEL_TARGET)
@@ -6468,6 +6515,10 @@ const KERNEL_IMAGE: &str = "KERNEL.ONBF";
 /// the baseline, no flags, and the toolchain `rustc -vV` reports from the repository's root
 /// (ADR-0011 Amendment 4, T1). The image is written through a rename, so it is never partial.
 fn pack_kernel_to(elf: &Path, out: &Path) -> Result<PathBuf> {
+    // A bench build's kernel is packed only for a bench boot (TASKS item 112).
+    if !bench::is_bench(out) {
+        bench::refuse(elf, "packing a kernel image outside target/bench")?;
+    }
     if let Some(dir) = out.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -6607,12 +6658,22 @@ fn test_keys() -> Result<(onbf_pack::HostKey, onbf_pack::HostKey)> {
 /// returns the signed bytes.
 fn sign_kernel(input: &Path, key: &onbf_pack::HostKey, output: &str) -> Result<Vec<u8>> {
     use onbf_pack::Signer as _;
+    // A bench build's kernel is never signed (TASKS item 112; ADR-0002 B8).
+    bench::refuse(input, "signing")?;
     let out = target_dir().join("xtask").join(output);
     let signing_time = TEST_SIGNING_TIME
         .parse()
         .map_err(|_| format!("the test signing time {TEST_SIGNING_TIME:?} is not a number"))?;
+    let bytes = read_file(input)?;
+    // ... nor a copy of one: its bytes say "bench build" (TASKS item 112's review, R112-5).
+    if bench::holds(&bytes, bench::MARKER) {
+        return Err(format!(
+            "signing: {} holds the text \"bench build\": a bench build's kernel is never signed (TASKS item 112)",
+            input.display()
+        ));
+    }
     let signed = onbf_pack::sign::sign_krn(
-        &read_file(input)?,
+        &bytes,
         key,
         &onbf_pack::SignOptions {
             claimed_signing_time: signing_time,
@@ -7289,6 +7350,15 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
             }
         }
     };
+    // A scenario that must say nothing more is read on for its quiet time (TASKS item 112).
+    if verdict.is_ok()
+        && let Some(quiet) = scenario.quiet
+    {
+        let until = Instant::now() + quiet;
+        while let Ok(chunk) = rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            raw.extend_from_slice(&chunk);
+        }
+    }
     let elapsed = started.elapsed();
 
     // What the markers were found in, before any monitor output joins the stream.
