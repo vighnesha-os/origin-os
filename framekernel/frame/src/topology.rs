@@ -488,6 +488,16 @@ pub const MAX_CACHE_SUBLEAVES: u32 = 32;
 /// §E.4.15).
 const TOPOLOGY_EXTENSIONS: u32 = 1 << 22;
 
+/// "GenuineIntel" in leaf 0's EBX, EDX and ECX. Leaf 04H is Intel's; AMD reserves functions 2h to
+/// 4h (APM Vol. 3, §E.3.3), so it is read only where the vendor is Intel (the review of TASKS item
+/// 97, R97-12).
+const GENUINE_INTEL: [u32; 3] = [0x756E_6547, 0x4965_6E69, 0x6C65_746E];
+
+/// Whether leaf 0's vendor string, `[eax, ebx, ecx, edx]`, is Intel's.
+const fn is_intel(leaf_0: [u32; 4]) -> bool {
+    leaf_0[1] == GENUINE_INTEL[0] && leaf_0[3] == GENUINE_INTEL[1] && leaf_0[2] == GENUINE_INTEL[2]
+}
+
 /// The caches one processor reports, read on itself (leaf 04H's fields are in Intel's Logical
 /// Processor domain, so they may differ between processors).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -512,11 +522,12 @@ impl Caches {
     };
 
     /// Reads them: Fn8000_001D where TopologyExtensions says it exists and it lists a cache,
-    /// else leaf 04H where it lists one, else none. Each leaf only below its maximum, which
-    /// QEMU and the SDM answer above with the highest basic leaf's data. `cpuid(leaf, sub)`
-    /// must run on the processor whose caches these are.
+    /// else, on an Intel processor, leaf 04H where it lists one, else none. Each leaf only below
+    /// its maximum, which QEMU and the SDM answer above with the highest basic leaf's data.
+    /// `cpuid(leaf, sub)` must run on the processor whose caches these are.
     pub fn detect(cpuid: impl Fn(u32, u32) -> [u32; 4]) -> Caches {
-        let max_basic = cpuid(0, 0)[0];
+        let leaf_0 = cpuid(0, 0);
+        let max_basic = leaf_0[0];
         let max_extended = cpuid(0x8000_0000, 0)[0];
         let listed = |leaf: u32| cpuid(leaf, 0)[0] & 0x1F != 0;
         if max_extended >= 0x8000_001D
@@ -524,7 +535,7 @@ impl Caches {
             && listed(0x8000_001D)
         {
             Caches::decode(CacheLeaf::Leaf8000001D, |sub| cpuid(0x8000_001D, sub))
-        } else if max_basic >= 4 && listed(4) {
+        } else if is_intel(leaf_0) && max_basic >= 4 && listed(4) {
             Caches::decode(CacheLeaf::Leaf04, |sub| cpuid(4, sub))
         } else {
             Caches::NONE
@@ -944,6 +955,7 @@ mod tests {
     struct FakeCpu {
         max_basic: u32,
         max_extended: u32,
+        vendor: [u32; 3],
         leaves: Vec<((u32, u32), [u32; 4])>,
     }
 
@@ -952,8 +964,15 @@ mod tests {
             Self {
                 max_basic,
                 max_extended,
+                vendor: [0; 3],
                 leaves: Vec::new(),
             }
+        }
+
+        /// An Intel processor: leaf 0 says "GenuineIntel".
+        fn intel(mut self) -> Self {
+            self.vendor = GENUINE_INTEL;
+            self
         }
 
         fn with(mut self, leaf: u32, subleaves: &[[u32; 4]]) -> Self {
@@ -965,7 +984,8 @@ mod tests {
 
         fn cpuid(&self, leaf: u32, sub: u32) -> [u32; 4] {
             if leaf == 0 {
-                return [self.max_basic, 0, 0, 0];
+                let [ebx, edx, ecx] = self.vendor;
+                return [self.max_basic, ebx, ecx, edx];
             }
             if leaf == 0x8000_0000 {
                 return [self.max_extended, 0, 0, 0];
@@ -1912,9 +1932,13 @@ mod tests {
             cache(3, 2, 2, 8),
             cache(3, 3, 16, 8),
         ]);
-        let cpu = FakeCpu::new(0x0D, 0).with(4, &subs);
+        let cpu = FakeCpu::new(0x0D, 0).intel().with(4, &subs);
         let caches = cpu.detect().caches;
         assert_eq!(caches.leaf(), CacheLeaf::Leaf04);
+        // AMD reserves leaf 04H (APM Vol. 3, §E.3.3): on another vendor it is not read, whatever
+        // it holds (R97-12).
+        let other = FakeCpu::new(0x0D, 0).with(4, &subs);
+        assert_eq!(other.detect().caches, Caches::NONE);
         assert_eq!(caches.problem(), None);
         assert_eq!(caches.all().len(), 4);
         assert_eq!(
@@ -2001,8 +2025,9 @@ mod tests {
             .with(0x8000_0001, &[[0; 4]])
             .with(0x8000_001D, &amd);
         assert_eq!(without.detect().caches, Caches::NONE);
-        // Both: Fn8000_001D is taken.
+        // Both, on a processor that also says it is Intel's: Fn8000_001D is taken.
         let both = FakeCpu::new(0x10, 0x8000_0026)
+            .intel()
             .with(4, &ended(&[cache(3, 3, 8, 1)]))
             .with(0x8000_0001, &[[0, 0, TOPOLOGY_EXTENSIONS, 0]])
             .with(0x8000_001D, &amd);
@@ -2019,6 +2044,7 @@ mod tests {
     #[test]
     fn leaf_04h_above_the_maximum_is_not_believed() {
         let cpu = FakeCpu::new(3, 0)
+            .intel()
             .with(3, &[cache(3, 2, 2, 1)])
             .with(4, &ended(&[cache(3, 2, 2, 1)]));
         assert_eq!(cpu.detect().caches, Caches::NONE);
@@ -2105,8 +2131,20 @@ mod tests {
                     assert!(c.level <= 3, "case {case}: {c:?}");
                 }
             }
-            if let (Some(l2), Some(last)) = (caches.second_level(), caches.last_level()) {
-                assert!(l2.level <= last.level, "case {case}");
+            if let Some(l2) = caches.second_level() {
+                assert_eq!(l2.level, 2, "case {case}");
+                assert!(l2.holds_data(), "case {case}");
+            }
+            if let Some(last) = caches.last_level() {
+                assert!(last.holds_data(), "case {case}");
+                assert!(
+                    caches
+                        .all()
+                        .iter()
+                        .filter(|c| c.holds_data())
+                        .all(|c| c.level <= last.level),
+                    "case {case}"
+                );
             }
         }
     }
