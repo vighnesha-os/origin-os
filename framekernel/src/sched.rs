@@ -792,22 +792,41 @@ pub(crate) fn block_until(deadline: u64) {
     cpu::thread_block(ticks);
 }
 
-/// The processors' run queues, as `origin_sync::threads::wake` locks them: each under its lock,
-/// with interrupts off, as everywhere else.
-struct KernelQueues;
+/// The processors' run queues as `sched::wake` hands them to `origin_sync::threads::wake`, inside
+/// the one interrupts-off section `wake` runs in (TASKS item 93, the judge's stop of 2026-11-21 and
+/// the coordinating session's ruling; ADR-0018 V1). Each queue is locked in that section, so
+/// `locked` opens none of its own, and `wake` reads the processor index under the same section's
+/// witness: one flag save, `cli` and restore for a wake-up, as before TASKS item 93.
+mod waking {
+    use super::{Placed, QUEUES, Queues, RunQueue, without_interrupts_here};
+    use origin_frame::trap::Here;
 
-impl Queues for KernelQueues {
-    type Queue = RunQueue<Placed>;
-
-    fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut RunQueue<Placed>) -> R) -> Option<R> {
-        let queue = QUEUES.get(usize::try_from(cpu).ok()?)?;
-        Some(without_interrupts(|| f(&mut queue.lock())))
+    /// The run queues, lent for the life of the section [`within`] opens. Its field is private to
+    /// this module, so only `within` makes one, and its `locked` always runs with interrupts off.
+    pub(super) struct KernelQueues<'a> {
+        _section: Here<'a>,
     }
 
-    fn wake_slot(queue: &mut RunQueue<Placed>, slot: u16) -> bool {
-        let slot = usize::from(slot);
-        let generation = queue.generation(slot);
-        queue.wake(slot, generation)
+    /// Runs `f` in one interrupts-off section, with the run queues as `origin_sync::threads::wake`
+    /// takes them and the section's witness.
+    pub(super) fn within<T>(f: impl for<'a> FnOnce(&KernelQueues<'a>, Here<'a>) -> T) -> T {
+        without_interrupts_here(|here| f(&KernelQueues { _section: here }, here))
+    }
+
+    impl Queues for KernelQueues<'_> {
+        type Queue = RunQueue<Placed>;
+
+        fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut RunQueue<Placed>) -> R) -> Option<R> {
+            let queue = QUEUES.get(usize::try_from(cpu).ok()?)?;
+            // Interrupts are off: only `within`'s section makes `self`.
+            Some(f(&mut queue.lock()))
+        }
+
+        fn wake_slot(queue: &mut RunQueue<Placed>, slot: u16) -> bool {
+            let slot = usize::from(slot);
+            let generation = queue.generation(slot);
+            queue.wake(slot, generation)
+        }
     }
 }
 
@@ -830,19 +849,20 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
     let Some(record) = threads::record(thread.record) else {
         return false;
     };
-    let woke = origin_frame::sync::threads::wake(&KernelQueues, record, thread.generation);
-    if woke.retries != 0 {
-        WAKES_FOLLOWED.fetch_add(u64::from(woke.retries), Ordering::Relaxed);
-    }
-    match woke.outcome {
-        Outcome::Reached { ready: true, cpu } => {
-            let Some(cpu) = usize::try_from(cpu).ok().and_then(CpuIndex::new) else {
-                return false;
-            };
-            // The compare and the IPI in one section (TASKS item 93, the ruling's Q8): with a
-            // stale index, a waker that had left `cpu` would send no IPI, and the woken thread
-            // would wait for that processor's next tick.
-            without_interrupts_here(|here| {
+    // The wake-up, the compare and the IPI in one section (TASKS item 93, the ruling's Q8, and
+    // the judge's stop): with a stale index, a waker that had left `cpu` would send no IPI, and
+    // the woken thread would wait for that processor's next tick. The queues are locked in the
+    // same section (`waking`), so a wake-up opens one section, as before TASKS item 93.
+    waking::within(|queues, here| {
+        let woke = origin_frame::sync::threads::wake(queues, record, thread.generation);
+        if woke.retries != 0 {
+            WAKES_FOLLOWED.fetch_add(u64::from(woke.retries), Ordering::Relaxed);
+        }
+        match woke.outcome {
+            Outcome::Reached { ready: true, cpu } => {
+                let Some(cpu) = usize::try_from(cpu).ok().and_then(CpuIndex::new) else {
+                    return false;
+                };
                 let me = cpu::this_cpu(here);
                 if cpu != me.index()
                     && let Some(apic_id) = cpu.apic_id()
@@ -851,16 +871,16 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
                     return true;
                 }
                 false
-            })
+            }
+            // Never while no thread moves. Until ADR-0020 S20's pinned mode (TASKS item 96), the
+            // kernel stops rather than lose a wake-up (the coordinating session's ruling Q4).
+            Outcome::Exhausted => panic!(
+                "a wake-up followed its thread {} times",
+                origin_frame::sync::threads::WAKE_TRIES
+            ),
+            Outcome::Reached { ready: false, .. } | Outcome::Stale | Outcome::Gone => false,
         }
-        // Never while no thread moves. Until ADR-0020 S20's pinned mode (TASKS item 96), the
-        // kernel stops rather than lose a wake-up (the coordinating session's ruling Q4).
-        Outcome::Exhausted => panic!(
-            "a wake-up followed its thread {} times",
-            origin_frame::sync::threads::WAKE_TRIES
-        ),
-        Outcome::Reached { ready: false, .. } | Outcome::Stale | Outcome::Gone => false,
-    }
+    })
 }
 
 /// `EXIT_VECTOR`: the running thread ends. Its record, holding its stack, becomes a zombie, which
@@ -1156,7 +1176,8 @@ pub(crate) static PROGRESS: PerCpu<[AtomicU64; 2]> = PerCpu::new(
     [const { AtomicU64::new(0) }; 2],
     || [const { AtomicU64::new(0) }; 2],
 );
-/// The CPU index each worker last ran on, plus one (0: never ran), as [`PROGRESS`].
+/// The CPU index each worker last ran on, plus one (0: never ran, or no location), as
+/// [`PROGRESS`]: the location in the worker's own thread record, as it read it while running.
 pub(crate) static RAN_ON: PerCpu<[AtomicU64; 2]> = PerCpu::new(
     "framekernel::sched::RAN_ON",
     [const { AtomicU64::new(0) }; 2],
@@ -1186,6 +1207,12 @@ const fn worker_arg(run: u64, slot: usize) -> u64 {
 extern "sysv64" fn worker(arg: u64) -> ! {
     let (run, slot) = (arg >> 32, (arg & 0xFFFF_FFFF) as usize);
     let limit = RUNNING_STEP.load(Ordering::Relaxed);
+    // Where the worker runs, from its own thread record's location (ADR-0020 S1), which the
+    // scheduler keeps under the queue locks: no read of the processor index, so no section in the
+    // loop (TASKS item 93, the judge's stop of 2026-11-21 and the coordinating session's ruling).
+    // A running thread's location is the processor it runs on: it changes only while the thread
+    // is switched out, before it runs again. Read live, every iteration, as `RAN_ON` was.
+    let mine = current_thread().and_then(|thread| threads::record(thread.record));
     let mut last = rdtsc();
     while !STOP.load(Ordering::Relaxed) {
         let now = rdtsc();
@@ -1197,15 +1224,11 @@ extern "sysv64" fn worker(arg: u64) -> ! {
             if step < limit {
                 p.fetch_add(step, Ordering::Relaxed);
             }
-            // Read live, in a section of its own (TASKS item 93, the ruling's Q8): a stale index
-            // would record a processor the worker had left, and the fair-share proof reads where
-            // each worker ran from it.
-            without_interrupts_here(|here| {
-                r.store(
-                    cpu::this_cpu(here).index().get() as u64 + 1,
-                    Ordering::Relaxed,
-                );
-            });
+            let at = mine.and_then(|record| record.location());
+            r.store(
+                at.map_or(0, |at| u64::from(at.cpu()) + 1),
+                Ordering::Relaxed,
+            );
         }
         core::hint::spin_loop();
     }
