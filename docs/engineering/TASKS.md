@@ -3915,7 +3915,7 @@ Asked for by the owner on 2026-11-21 ("Start breadcrumbs"), from rental C's find
 - **Q11:** the record names the breadcrumbs, with an offline test.
 - **Gates:** `check`, `boot-test`, and `boot-matrix` three times in a row, in one turn on a clean tree.
 
-**Item 342 (2026-11-21, ~01:45 UTC).** The owner accepted Q6 ("Yes, keep it"): every loader, not only a bench build, writes one line to the UART boot info would name before it halts after a failed `ExitBootServices`. Its text is ADR-0002 Amendment 2 and ADR-0010 Amendment 4, which the owner accepted as drafted and which reached `main` in records PR 52 (`f8204f1e`). Their status lines and matrix rows A02-Am2 and A10-Am4 change to "built" once `land/batch-9` holds that `main`. Item 343 (a second plan, `m4.metal.large`) was accepted and then withdrawn by the owner the same morning, before anything was added: `PLANS` is unchanged.
+**Item 342 (2026-11-21, ~01:45 UTC).** The owner accepted Q6 ("Yes, keep it"): every loader, not only a bench build, writes one line to the UART boot info would name before it halts after a failed `ExitBootServices`. Its text is ADR-0002 Amendment 2 and ADR-0010 Amendment 4, which the owner accepted as drafted and which reached `main` in records PR 52 (`f8204f1e`). `land/batch-9` holds that `main` since `d81ca5b7`, merged here after the gates below: the two status lines now say "built by TASKS item 112, under QEMU only", and rows A02-Am2 and A10-Am4 are `built` (`emu`, `agent`). Item 343 (a second plan, `m4.metal.large`) was accepted and then withdrawn by the owner the same morning, before anything was added: `PLANS` is unchanged.
 
 **As built (2026-11-21).** On `claude/t112-breadcrumbs`: `b7a57f0c` (the loader and the kernel), `0a4ebefc` (xtask), `c0e626b0` (the rental tool), and the records.
 - **Every loader:** `boot/uefi/src/uart.rs` (forbids `unsafe`): `Uart`, a 16550 writer through a port trait, each byte after a wait of at most 100,000 line-status reads; `ExitCalls`, each call's status; `Halting`, the line. `main.rs` records each call and, on `ExitOutcome::Halt`, writes `origin-boot: ExitBootServices failed (first call …, retry …): halting` to boot info's UART before `halt()`.
@@ -3950,6 +3950,14 @@ Asked for by the owner on 2026-11-21 ("Start breadcrumbs"), from rental C's find
   - BC-5, every loader's halting line silenced: the halt scenario's marker missing, COM2 ending at the loader's last line.
 
   The first runs of BC-2 and BC-5 were set aside. BC-2 ran on BC-1's kernel, because the first restore kept the old modification time and Cargo reused the planted build. BC-5's first plant left a function unused, which failed the compile instead of the scenario. Both were run again with the fix.
+
+**The gates on `54911a0d`** (the code and records above, with `land/batch-9` at `7b67be0b` merged in), under Rust 1.100.0 on the development Mac with QEMU 11.1.3 TCG and OVMF, in one turn of the machine (2026-11-21, 05:45 to 07:00 UTC, after 750 s waiting for two other sessions' runs), the worktree clean before and after. The quick gates had passed on `6e8184e1`.
+- `cargo xtask check` passed in 733 s (Loom: all 79 models passed and all 120 negative controls were caught).
+- `cargo xtask boot-test` passed in 53 s.
+- `cargo xtask boot-matrix` passed three times in a row: 1,245 s, 1,224 s and 1,232 s. Its `boot-bench` step passed 4 of 4 each time, in 81 s, 63 s and 62 s: the time it adds to `boot-matrix` (Q9), about 5 % of a run.
+- `cargo xtask bench-build` after them: `BOOTX64.EFI` 214,016 bytes, SHA-256 `1bea897c4d5530ce3eb2a056c1f0ec9f6709a0e6bf8758f38ba2db3387665457` (the same bytes as the code commits'); `KERNEL.ONBF` 1,965,312 bytes, SHA-256 `e39518f6c37348ba8453548f7cc1c76f9571cbe4d5709434a8813c863b4407d1` (TASKS items 94 and 78 changed the kernel). These are the images the hand-over names.
+
+`land/batch-9` at `d81ca5b7` (main's records PRs 51 and 52, documents only) was merged after the gates; no boot was run again for it.
 
 **The review** (`REVIEW_T112_2026-11-21.md`): one independent AI reviewer; no High or Medium; R112-1 to -6 and -9 answered in the code commits; R112-7, -8 and -10 kept, with reasons.
 

@@ -24,6 +24,8 @@ On `claude/t112-breadcrumbs`, from `land/batch-9`; not yet in a batch. Rentals B
 
 Controls BC-1 to BC-5 each fail. The independent AI review found no High or Medium issue.
 
+`check`, `boot-test` and `boot-matrix` three times in a row passed on `54911a0d`, in one turn on a clean tree; `boot-bench` adds 62 to 81 s to a `boot-matrix` of about 1,230 s.
+
 **Not shown:** anything on a physical machine; the shadow-stack reads, which QEMU's software processor never takes. The next rental (about $0.81, on the owner's word) is what it is for.
 
 ## Rental B: Origin's loader on a rented bare-metal server (2026-11-20)

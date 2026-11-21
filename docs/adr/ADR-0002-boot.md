@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). B5 gained one line on the SPCR's UART before a halt after a failed `ExitBootServices` by Amendment 2, accepted by the owner on 2026-11-21 (decision sheet item 342). |
+| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). B5 gained one line on the SPCR's UART before a halt after a failed `ExitBootServices` by Amendment 2, accepted by the owner on 2026-11-21 (decision sheet item 342) and built by TASKS item 112 the same day, under QEMU only. |
 | Date | 2026-11-07; Amendment 1 2026-11-10; Amendment 2 2026-11-21; boot info 0.6 accepted 2026-11-10 and built 2026-11-11 (B4) |
 | Owner decisions still open | None. B7, carried over from ADR-0001, was decided on 2026-11-07 and amended on 2026-11-10. |
 | Implements | CLAUDE.md §19 (UEFI boot chain), §20 (boot manager, later), §58 (Secure Boot), ONBF §8.1 (chain of trust) |
@@ -144,7 +144,7 @@ The 2011 CA expired in June 2026, so only the 2023 CA matters ([Microsoft](https
 
 ## Amendment 2 (2026-11-21): one line on the SPCR's UART before a halt after `ExitBootServices`
 
-*Accepted by the owner on 2026-11-21 ("Yes, keep it"; decision sheet item 342). Proposed by TASKS item 112's contract (Q6). TASKS item 112 builds it, in the ninth batch (`land/batch-9`); until that lands, nothing here is built.*
+*Accepted by the owner on 2026-11-21 ("Yes, keep it"; decision sheet item 342). Proposed by TASKS item 112's contract (Q6). Built by TASKS item 112 the same day, under QEMU only.*
 
 **Change to B5.** After the first `ExitBootServices` call the loader still calls nothing in the firmware. If that call and its one retry both fail, or the retry cannot be made, the loader now does one more thing before it halts: it writes one line to the UART boot info would name (Amendment 3 of ADR-0010: the SPCR's 16550 in I/O space, as the loader's walk found it before the call), and then halts as before. The line names each call's status, or why there was no retry:
 
@@ -171,4 +171,4 @@ origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry EF
 
 **Threat model (§58).** The write goes only to the port the SPCR named and the shared parser accepted (ADR-0010 Amendment 3), never to a guessed one. It happens after the firmware stopped driving the UART, and the loader halts right after it.
 
-**Code (to come with TASKS item 112).** `boot/uefi/src/uart.rs` (the bounded writer and the line, host-tested through a port trait) and `boot/uefi/src/main.rs` (the calls' statuses and the port instructions).
+**Code (built by TASKS item 112, under QEMU only).** `boot/uefi/src/uart.rs` (the bounded writer and the line, host-tested through a port trait) and `boot/uefi/src/main.rs` (the calls' statuses and the port instructions).
