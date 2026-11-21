@@ -1176,8 +1176,8 @@ pub(crate) static PROGRESS: PerCpu<[AtomicU64; 2]> = PerCpu::new(
     [const { AtomicU64::new(0) }; 2],
     || [const { AtomicU64::new(0) }; 2],
 );
-/// The CPU index each worker last ran on, plus one (0: never ran, or no location), as
-/// [`PROGRESS`]: the location in the worker's own thread record, as it read it while running.
+/// The CPU index each worker last ran on, plus one (0: never ran), as [`PROGRESS`]: read by the
+/// worker under its own section once it stops, which is where it last ran.
 pub(crate) static RAN_ON: PerCpu<[AtomicU64; 2]> = PerCpu::new(
     "framekernel::sched::RAN_ON",
     [const { AtomicU64::new(0) }; 2],
@@ -1207,30 +1207,32 @@ const fn worker_arg(run: u64, slot: usize) -> u64 {
 extern "sysv64" fn worker(arg: u64) -> ! {
     let (run, slot) = (arg >> 32, (arg & 0xFFFF_FFFF) as usize);
     let limit = RUNNING_STEP.load(Ordering::Relaxed);
-    // Where the worker runs, from its own thread record's location (ADR-0020 S1), which the
-    // scheduler keeps under the queue locks: no read of the processor index, so no section in the
-    // loop (TASKS item 93, the judge's stop of 2026-11-21 and the coordinating session's ruling).
-    // A running thread's location is the processor it runs on: it changes only while the thread
-    // is switched out, before it runs again. Read live, every iteration, as `RAN_ON` was.
-    let mine = current_thread().and_then(|thread| threads::record(thread.record));
     let mut last = rdtsc();
     while !STOP.load(Ordering::Relaxed) {
         let now = rdtsc();
         let step = now.wrapping_sub(last);
         last = now;
-        if let (Some(p), Some(r)) = (worker_entry(&PROGRESS, slot), worker_entry(&RAN_ON, slot))
+        if let Some(p) = worker_entry(&PROGRESS, slot)
             && RUN.load(Ordering::Relaxed) == run
+            && step < limit
         {
-            if step < limit {
-                p.fetch_add(step, Ordering::Relaxed);
-            }
-            let at = mine.and_then(|record| record.location());
-            r.store(
-                at.map_or(0, |at| u64::from(at.cpu()) + 1),
-                Ordering::Relaxed,
-            );
+            p.fetch_add(step, Ordering::Relaxed);
         }
         core::hint::spin_loop();
+    }
+    // Where it stopped, which is where it last ran: the processor's own index, read once, in a
+    // section of its own, after the measured window (TASKS item 93: the judge's stop of
+    // 2026-11-21 found a section in every iteration lowered the window's switches, and the delta
+    // review's D93-1 asked for the processor's own view, not the scheduler's record).
+    if let Some(r) = worker_entry(&RAN_ON, slot)
+        && RUN.load(Ordering::Relaxed) == run
+    {
+        without_interrupts_here(|here| {
+            r.store(
+                cpu::this_cpu(here).index().get() as u64 + 1,
+                Ordering::Relaxed,
+            );
+        });
     }
     // Counted only for its own run.
     finish(|| {
