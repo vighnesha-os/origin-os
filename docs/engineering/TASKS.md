@@ -3757,6 +3757,7 @@ Built on `claude/t94-fpu-format-18ed6a`, cut from `land/batch-9` at `a25228c9` (
 - `b2cf1631`: R94-7.
 - `0e8670a4`, `203c398e`, `f4c4eb68`: the delta review's R94-9, R94-10 and R94-11 (R94-8 is a follow-up, R94-12 needs no change).
 - The records: this entry, ADR-0020 S6's dated note, ADR-0013's row and controls, CL40, the provenance entry and `REVIEW_T94_2026-11-21.md`.
+- The gates' results, in this entry.
 
 **The design as it lands:**
 
@@ -3800,3 +3801,29 @@ Built on `claude/t94-fpu-format-18ed6a`, cut from `land/batch-9` at `a25228c9` (
 | C94-3 | C94-1, the comparison always "alike", and CPU 1's line printing its format | Not a gate: `boot-test` passed, 11 of 11, while CPU 1 read back `XCR0 0x207, 2696 bytes` and the line said `2 of 2 processors alike`: the line follows the comparison, and nothing else catches the difference |
 
 **The switch path (Q10).** `llvm-objdump` of the base's (`a25228c9`) and the tip's (`b2cf1631`) kernel images, from `sched::on_yield` through every call, direct or through the GOT, two levels down: 15 functions, among them `on_yield`, `RunQueue::switch`, `follow_thread`, `FpuArea::save` and `FpuArea::restore` (where `fpu_save` and `fpu_restore` are inlined), `UserSpace::activate` and `vm::activate_kernel_space`. Every instruction is the same once each address, call target and RIP-relative displacement is named by what it reaches (a function, a GOT slot's target, an object and offset, or the 32 bytes at it); opcodes, registers, immediates and memory offsets are compared as they are. 0 of 15 differ, and 0 of 18 three levels down. The control: one bit changed in `on_yield`'s code is reported (`DIFFERS: … on_yield`). The script, `switch_path.py`, is kept with the session's evidence.
+
+**The gates on `78dc2200`** (the code at `f4c4eb68` with every record but these results), under Rust 1.100.0 on the development Mac with QEMU 11.1.3 TCG and OVMF, in one turn of the machine (2026-11-21, 01:35 to 02:48 UTC, after 618 s waiting for TASKS item 93's Loom run), the worktree clean before and after:
+
+- `cargo clippy --locked --all-targets -- -D warnings` on the default members, and Clippy on the kernel for its target, found nothing. The compiler's `harden-sls-ret` notice (ADR-0017 Amendment 2) is printed as on the base.
+- `check` passed in 793 s: 2,557 host tests passed (TASKS item 92's 2,547 and this task's 10), 0 failed, 30 ignored; Loom 79 models passed and 120 negative controls caught; every document gate.
+- `boot-test` passed, 11 of 11, in 56 s.
+- `boot-matrix` passed three times in a row, in 1,185, 1,166 and 1,166 s, 30 kernel boots each, with no empty log in any of them.
+
+**What the gates' boots show**, against the base's one `boot-matrix` run on `a25228c9` (Q5, Q6, Q9: reported, not judged):
+
+- **The FPU-format line:** 37 times in each run, every one `the boot processor's XCR0 0x7 and 832 bytes of enabled XSAVE state, in areas of 2696 bytes; N of N processors alike, every one taking part in moves`, N from 1 to 67; and once in `boot-test`'s boot.
+  - One boot prints no line, at base and tip alike: `boot-rented`'s boot whose reading of every table is refused. There processor discovery fails, and `smp::start` returns with the boot processor alone before the control-state line or this one. That scenario's expected lines leave out the MADT's, the control state's and this one, so xtask requires this line on every boot that reads a MADT.
+  - That boot's verdict counts the FPU format passed, 1 of 1.
+- **The verdicts:** one more proof in each, and it passed.
+  - 34, 33 and 32 boots in the three runs at `71 of 72` (the base: `70 of 71`), failing speculation controls (decision item 154).
+  - 1, 2 and 3 boots at `70 of 72`: the oversubscribed machines (65 or 67 guest processors on 10 host threads) also failing scheduler fairness, forgiven by name (ADR-0013 Amendment 2), as the base's two 65-processor machines did. Which of them fails varies from run to run.
+  - The three boots with proofs that did not run: `56 of 66`, `62 of 67` and `64 of 66` (the base: `55 of 65`, `61 of 66`, `63 of 65`), the same proofs not run and the same failed.
+  - The rental readiness notes' "70 of 71" is now "71 of 72" (Q6).
+- **Leak lines:** 375 in each run, as in the base's; every one's before and after equal, and every heap figure the base's, machine by machine.
+- **Per-CPU tables:** 7938 bytes per index on every machine, as the base.
+- **Free frames and the root:** tip minus base from −28 to +29 free frames, and from −46 to +68 KiB in the root, across every machine and run; the tip's own three runs differ among themselves by up to 39 frames.
+- **Each AP's start** (the boot's "us each on average"; `emu`, a trend, not a measurement of the comparison's cost):
+  - 2 to 4 processors: the base 13.1 to 15.0 ms (median 14.4, 24 boots); the tip 12.7 to 15.1 ms (median 14.4) in 71 of 72 boots, and one of 26.1 ms (`boot-random` without RDSEED, run 1; 14.7 and 14.9 ms in runs 2 and 3).
+  - 65 and 67 processors: the base 28.7 to 29.8 ms (3 boots); the tip 24.9 to 30.4 ms (median 28.3, 9 boots).
+- **One preemption window run again:** on the 67-processor sparse machine in run 3, `window of 1372 ms, run 1, 1 s of 120 spent: … stalled, run again`, then passing on its second run (4 s of 120 spent). That is ADR-0013's repeat (TASKS item 66), on an oversubscribed machine; the base's one run has none. Under Q10 there was no large-machine round to weigh it against, and the switch path below is unchanged.
+- **The switch path on the final image** (Q10): the base's kernel against the one `boot-test` built from `78dc2200` (the reproducible-build gate's kernel ELF, SHA-256 `b03e921c…`): 0 of 15 functions differ two levels down, and 0 of 18 three levels down.
