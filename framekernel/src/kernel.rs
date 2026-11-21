@@ -1389,6 +1389,7 @@ fn prove_domains(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -
         .map(|&c| {
             let apic_id = c.apic_id().unwrap_or(u32::MAX);
             Processor {
+                cpu: u32::try_from(c.get()).unwrap_or(u32::MAX),
                 apic_id,
                 topology: smp::topology_of(c),
                 node: affinities
@@ -1516,9 +1517,10 @@ fn prove_domains(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -
     let f = *tree.findings();
     let _ = write!(
         com1,
-        "origin-kernel: domains: {} claims cut, {} differing from the PPTT, {} in no node, {} recorded nothing; levels crossing: ",
+        "origin-kernel: domains: {} claims cut, {} differing from the PPTT, {} naming another cache level than CPUID, {} in no node, {} recorded nothing; levels crossing: ",
         f.cuts(),
         f.differences(),
+        f.level_mismatches(),
         f.unplaced,
         f.unrecorded
     );

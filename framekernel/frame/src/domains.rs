@@ -29,10 +29,15 @@
 //!
 //! The levels are ordered by refinement, narrowest first, not by a fixed list: a NUMA node may
 //! sit inside a package or hold several. A level equal to the one below it is merged into it, its
-//! names joined; a level of single processors, and the whole machine, are left out (S8: "a level
-//! whose groups each hold one child is dropped"). If the levels do not nest, the crossing is
-//! named and the tree is built from the processors' own core, die and package levels alone
-//! (ruling Q3), or from as many of those as nest.
+//! names joined; a level of single processors is left out (S8: "a level whose groups each hold
+//! one child is dropped"). The whole machine is the root; a level is kept where a kind's one group
+//! holds every processor, since it says what they all share. If the levels do not nest, the
+//! crossing is named and the tree is built from the processors' own core, die and package levels
+//! alone (ruling Q3), or from as many of those as nest.
+//!
+//! Every list here is in the order of the online processors, ascending CPU indexes; the processors'
+//! own CPU indexes are kept beside it, so a processor that did not start leaves a gap, not a
+//! shifted name (the review of TASKS item 97, R97-1).
 #![forbid(unsafe_code)]
 
 use alloc::vec;
@@ -87,7 +92,7 @@ impl Kind {
     }
 
     /// The kinds the processors' own layouts give, which the tree falls back to.
-    const fn from_layout(self) -> bool {
+    const fn is_from_layout(self) -> bool {
         matches!(self, Kind::Core | Kind::Die | Kind::Package)
     }
 }
@@ -240,7 +245,9 @@ fn write_ranges(f: &mut fmt::Formatter<'_>, sorted: &[u32]) -> fmt::Result {
 
 /// The aligned-block rule (the module comment): each processor's group from its APIC ID and its
 /// claim, the low bits its group may differ in (`None`: only itself). Returns the partition and
-/// how many processors' claims were cut.
+/// how many processors' claims were cut: those whose group holds fewer of the processors than
+/// their claim covers (R97-10). Two processors with one APIC ID never share a group by that alone:
+/// at width 0 each is its own (R97-9).
 pub fn aligned(claims: &[(u32, Option<u8>)]) -> (Partition, usize) {
     let n = claims.len();
     let claim = |i: usize| u32::from(claims[i].1.unwrap_or(0)).min(32);
@@ -270,14 +277,29 @@ pub fn aligned(claims: &[(u32, Option<u8>)]) -> (Partition, usize) {
             i = j;
         }
     }
-    let keys: Vec<(u32, u64)> = (0..n).map(|i| (best[i], key(i, best[i]))).collect();
-    let cut = (0..n).filter(|&i| best[i] < claim(i)).count();
-    (Partition::from_keys(&keys), cut)
+    let keys: Vec<(u32, u64, usize)> = (0..n)
+        .map(|i| (best[i], key(i, best[i]), if best[i] == 0 { i } else { 0 }))
+        .collect();
+    let partition = Partition::from_keys(&keys);
+    // How many processors each claim covers: the run of sorted IDs inside its block.
+    let ids: Vec<u64> = order.iter().map(|&i| u64::from(claims[i].0)).collect();
+    let covered = |i: usize| {
+        let s = claim(i);
+        let block = u64::from(claims[i].0) >> s;
+        let first = ids.partition_point(|&id| id >> s < block);
+        let past = ids.partition_point(|&id| id >> s <= block);
+        past - first
+    };
+    let sizes = partition.sizes();
+    let cut = (0..n).filter(|&i| (sizes[i] as usize) < covered(i)).count();
+    (partition, cut)
 }
 
 /// One processor's reports, in CPU-index order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Processor {
+    /// Its CPU index.
+    pub cpu: u32,
     /// Its x2APIC ID, as the MADT lists it.
     pub apic_id: u32,
     /// What it recorded about itself, if it did.
@@ -292,8 +314,9 @@ pub struct Processor {
 pub struct PpttClaims {
     /// The level-2 cache that holds data.
     pub second_level: Vec<Option<u64>>,
-    /// The highest-level cache that holds data.
-    pub last_level: Vec<Option<u64>>,
+    /// The highest-level cache that holds data: its level, counted from the processor's own
+    /// first cache, and its instance.
+    pub last_level: Vec<Option<(u8, u64)>>,
 }
 
 /// What the tree is built from.
@@ -312,6 +335,8 @@ pub struct Input<'a> {
 pub struct Level {
     kinds: [bool; KINDS],
     partition: Partition,
+    /// The CPU index of each processor the partition numbers.
+    cpus: Vec<u32>,
 }
 
 impl Level {
@@ -320,9 +345,22 @@ impl Level {
         self.kinds[kind.index()]
     }
 
-    /// Its groups.
+    /// Its groups, over the processors' positions in the input.
     pub fn partition(&self) -> &Partition {
         &self.partition
+    }
+
+    /// The CPU indexes of the processors in each group, the groups in order of their first.
+    pub fn groups(&self) -> Vec<Vec<u32>> {
+        self.partition
+            .members()
+            .into_iter()
+            .map(|m| {
+                m.into_iter()
+                    .map(|i| self.cpus.get(i as usize).copied().unwrap_or(u32::MAX))
+                    .collect()
+            })
+            .collect()
     }
 }
 
@@ -337,7 +375,20 @@ impl fmt::Display for Level {
             f.write_str(kind.name())?;
             first = false;
         }
-        write!(f, " {}", self.partition)
+        let groups = self.groups();
+        let size = groups.first().map_or(0, Vec::len);
+        if groups.iter().all(|g| g.len() == size) {
+            write!(f, " {}x{size} [", groups.len())?;
+        } else {
+            write!(f, " {} groups [", groups.len())?;
+        }
+        for (g, group) in groups.iter().enumerate() {
+            if g > 0 {
+                f.write_str("|")?;
+            }
+            write_ranges(f, group)?;
+        }
+        f.write_str("]")
     }
 }
 
@@ -351,6 +402,10 @@ pub struct Findings {
     pub cut: [usize; KINDS],
     /// For each cache kind, processors whose group CPUID or the PPTT would have made larger.
     pub pptt_differs: [usize; KINDS],
+    /// For each cache kind, processors whose PPTT and CPUID name different caches at that level:
+    /// one names a level-2 cache and the other none, or their last levels differ in number. The
+    /// PPTT's claims on that kind are then not used (R97-3).
+    pub pptt_levels: [usize; KINDS],
     /// Processors the SRAT does not place, while it exists.
     pub unplaced: usize,
     /// Two levels that did not nest, the first such pair: the tree then fell back.
@@ -368,11 +423,17 @@ impl Findings {
         self.pptt_differs.iter().sum()
     }
 
+    /// Processors whose CPUID and PPTT name different caches, over every kind.
+    pub fn level_mismatches(&self) -> usize {
+        self.pptt_levels.iter().sum()
+    }
+
     /// Whether everything agreed.
     pub fn agree(&self) -> bool {
         self.unrecorded == 0
             && self.cuts() == 0
             && self.differences() == 0
+            && self.level_mismatches() == 0
             && self.unplaced == 0
             && self.crossing.is_none()
     }
@@ -383,7 +444,7 @@ impl Findings {
 /// (a package, a node, a cache), which says what the machine's processors share.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tree {
-    processors: usize,
+    cpus: Vec<u32>,
     levels: Vec<Level>,
     findings: Findings,
 }
@@ -392,6 +453,7 @@ impl Tree {
     /// Builds the tree (the module comment).
     pub fn build(input: &Input<'_>) -> Tree {
         let n = input.processors.len();
+        let cpus: Vec<u32> = input.processors.iter().map(|p| p.cpu).collect();
         let mut findings = Findings {
             unrecorded: input
                 .processors
@@ -406,19 +468,19 @@ impl Tree {
                 candidates.push((kind, partition));
             }
         }
-        let levels = match chain(&candidates) {
+        let levels = match chain(&candidates, &cpus) {
             Ok(levels) => levels,
             Err(crossing) => {
                 findings.crossing = Some(crossing);
                 let own: Vec<(Kind, Partition)> = candidates
                     .into_iter()
-                    .filter(|(kind, _)| kind.from_layout())
+                    .filter(|(kind, _)| kind.is_from_layout())
                     .collect();
-                longest_chain(&own)
+                longest_chain(&own, &cpus)
             }
         };
         Tree {
-            processors: n,
+            cpus,
             // A level of single processors is the processors themselves; on one processor the
             // only level is both.
             levels: levels
@@ -431,7 +493,12 @@ impl Tree {
 
     /// The processors it covers.
     pub fn processors(&self) -> usize {
-        self.processors
+        self.cpus.len()
+    }
+
+    /// Their CPU indexes, in the input's order: position `i` of every partition is `cpus()[i]`.
+    pub fn cpus(&self) -> &[u32] {
+        &self.cpus
     }
 
     /// Its levels, narrowest first.
@@ -507,27 +574,53 @@ fn level(input: &Input<'_>, kind: Kind, findings: &mut Findings) -> Option<Parti
                 findings.cut[kind.index()] = cut;
                 partition
             });
-            // The PPTT's claim, where it names a cache at this level for any processor. One it
-            // names none for is alone: nothing says it shares that cache.
-            let pptt = input
+            // The PPTT's claim, where it names a cache at this level for any processor: each
+            // processor's cache there with its level. One it names none for is alone: nothing says
+            // it shares that cache.
+            let mut pptt: Option<Vec<Option<(u8, u64)>>> = input
                 .pptt
                 .map(|p| {
                     if kind == Kind::Cluster {
-                        &p.second_level
+                        p.second_level.iter().map(|x| x.map(|i| (2, i))).collect()
                     } else {
-                        &p.last_level
+                        p.last_level.clone()
                     }
                 })
-                .filter(|instances| instances.iter().any(Option::is_some))
-                .map(|instances| {
-                    let keys: Vec<(bool, u64)> = (0..ps.len())
-                        .map(|i| match instances.get(i).copied().flatten() {
-                            Some(instance) => (false, instance),
-                            None => (true, i as u64),
+                .filter(|levels: &Vec<Option<(u8, u64)>>| levels.iter().any(Option::is_some));
+            // Where both speak they must name the same cache: a level-2 cache for both, or last
+            // levels of one number. Where they do not, the PPTT is not used for this kind, and
+            // every such processor is counted (R97-3).
+            if let (true, Some(levels)) = (reported, &pptt) {
+                let cpuid_level = |i: usize| {
+                    ps[i]
+                        .topology
+                        .as_ref()
+                        .and_then(|t| {
+                            if kind == Kind::Cluster {
+                                t.caches.second_level()
+                            } else {
+                                t.caches.last_level()
+                            }
                         })
-                        .collect();
-                    Partition::from_keys(&keys)
-                });
+                        .map(|c| c.level)
+                };
+                let mismatched = (0..ps.len())
+                    .filter(|&i| levels.get(i).copied().flatten().map(|(l, _)| l) != cpuid_level(i))
+                    .count();
+                if mismatched > 0 {
+                    findings.pptt_levels[kind.index()] = mismatched;
+                    pptt = None;
+                }
+            }
+            let pptt = pptt.map(|levels| {
+                let keys: Vec<(bool, u64)> = (0..ps.len())
+                    .map(|i| match levels.get(i).copied().flatten() {
+                        Some((_, instance)) => (false, instance),
+                        None => (true, i as u64),
+                    })
+                    .collect();
+                Partition::from_keys(&keys)
+            });
             match (cpuid, pptt) {
                 (Some(cpuid), Some(pptt)) => {
                     let meet = cpuid.meet(&pptt);
@@ -546,7 +639,7 @@ fn level(input: &Input<'_>, kind: Kind, findings: &mut Findings) -> Option<Parti
 
 /// The candidates ordered into a chain, narrowest first, equal partitions merged; or the first
 /// pair that crosses.
-fn chain(candidates: &[(Kind, Partition)]) -> Result<Vec<Level>, (Kind, Kind)> {
+fn chain(candidates: &[(Kind, Partition)], cpus: &[u32]) -> Result<Vec<Level>, (Kind, Kind)> {
     let mut sorted: Vec<&(Kind, Partition)> = candidates.iter().collect();
     sorted.sort_by_key(|(kind, p)| (core::cmp::Reverse(p.groups()), *kind));
     let mut levels: Vec<Level> = Vec::new();
@@ -563,6 +656,7 @@ fn chain(candidates: &[(Kind, Partition)]) -> Result<Vec<Level>, (Kind, Kind)> {
                 levels.push(Level {
                     kinds,
                     partition: partition.clone(),
+                    cpus: cpus.to_vec(),
                 });
             }
         }
@@ -574,9 +668,9 @@ fn chain(candidates: &[(Kind, Partition)]) -> Result<Vec<Level>, (Kind, Kind)> {
 /// The longest chain the candidates give, taken narrowest first: the fallback when the levels
 /// cross. The processors' own core, die and package levels nest whenever their layouts agree;
 /// where even they cross, the chain stops before the first that does.
-fn longest_chain(candidates: &[(Kind, Partition)]) -> Vec<Level> {
+fn longest_chain(candidates: &[(Kind, Partition)], cpus: &[u32]) -> Vec<Level> {
     for take in (0..=candidates.len()).rev() {
-        if let Ok(levels) = chain(&candidates[..take]) {
+        if let Ok(levels) = chain(&candidates[..take], cpus) {
             return levels;
         }
     }
@@ -610,7 +704,8 @@ pub struct Domains {
     pub tree: Tree,
     /// Each node's others, nearest first.
     pub node_order: Vec<(u32, Vec<u32>)>,
-    /// Each processor's capacity, from 0 to [`crate::capacity::FULL`].
+    /// Each processor's capacity, from 0 to [`crate::capacity::FULL`], in the order of
+    /// `tree.cpus()`.
     pub capacity: Vec<u16>,
 }
 
@@ -625,8 +720,9 @@ mod tests {
     use crate::topology::{CacheLeaf, Caches};
     use std::string::ToString;
 
-    /// Brute force: P's group is the largest aligned block inside every member's claim.
-    fn model(claims: &[(u32, Option<u8>)]) -> Vec<(u32, u64)> {
+    /// Brute force: P's group is the largest aligned block inside every member's claim, and two
+    /// processors with one APIC ID stand apart at width 0.
+    fn model(claims: &[(u32, Option<u8>)]) -> Vec<(u32, u64, usize)> {
         let claim = |i: usize| u32::from(claims[i].1.unwrap_or(0)).min(32);
         (0..claims.len())
             .map(|p| {
@@ -637,7 +733,7 @@ mod tests {
                         .filter(|&q| u64::from(claims[q].0) >> s == block)
                         .all(|q| claim(q) >= s);
                     if ok {
-                        return (s, block);
+                        return (s, block, if s == 0 { p } else { 0 });
                     }
                     s -= 1;
                 }
@@ -681,7 +777,13 @@ mod tests {
                 }
             }
             let expect_cut = (0..n)
-                .filter(|&i| model[i].0 < u32::from(claims[i].1.unwrap_or(0)).min(32))
+                .filter(|&i| {
+                    let s = u32::from(claims[i].1.unwrap_or(0)).min(32);
+                    let covered = (0..n)
+                        .filter(|&j| u64::from(claims[j].0) >> s == u64::from(claims[i].0) >> s)
+                        .count();
+                    (0..n).filter(|&j| model[j] == model[i]).count() < covered
+                })
                 .count();
             assert_eq!(cut, expect_cut, "case {case}");
         }
@@ -743,6 +845,7 @@ mod tests {
     fn smt_machine(l3: impl Fn(u32) -> u32) -> Vec<Processor> {
         (0..8)
             .map(|id| Processor {
+                cpu: id,
                 apic_id: id,
                 topology: Some(cpu(id, 1, 2, l3(id))),
                 node: Some(id / 4),
@@ -812,7 +915,7 @@ mod tests {
         let ps = smt_machine(|_| 8);
         let pptt = PpttClaims {
             second_level: (0..8).map(|i| Some(100 + i / 2)).collect(),
-            last_level: (0..8).map(|i| Some(200 + i / 4)).collect(),
+            last_level: (0..8).map(|i| Some((3, 200 + i / 4))).collect(),
         };
         let tree = Tree::build(&Input {
             processors: &ps,
@@ -832,7 +935,7 @@ mod tests {
         // An agreeing PPTT changes nothing.
         let agreeing = PpttClaims {
             second_level: (0..8).map(|i| Some(100 + i / 2)).collect(),
-            last_level: (0..8).map(|_| Some(7)).collect(),
+            last_level: (0..8).map(|_| Some((3, 7))).collect(),
         };
         let tree = Tree::build(&Input {
             processors: &ps,
@@ -864,7 +967,7 @@ mod tests {
         );
         let pptt = PpttClaims {
             second_level: vec![None; 8],
-            last_level: (0..8).map(|i| Some(i / 4)).collect(),
+            last_level: (0..8).map(|i| Some((3, i / 4))).collect(),
         };
         let tree = Tree::build(&Input {
             processors: &ps,
@@ -891,6 +994,7 @@ mod tests {
                 let mut own = cpu(i, 0, 1, 4);
                 own.apic_id = i;
                 Processor {
+                    cpu: i,
                     apic_id: i,
                     topology: Some(own),
                     node: Some(i / 4),
@@ -957,8 +1061,8 @@ mod tests {
         let mut rng = Rng::new(0x5452_4545);
         for case in 0..cases(1500) {
             let n = 1 + rng.below(20);
-            let ps: Vec<Processor> = (0..n)
-                .map(|_| {
+            let ps: Vec<Processor> = (0..n as u32)
+                .map(|index| {
                     let id = rng.below(64) as u32;
                     let topology = (rng.below(8) != 0).then(|| {
                         cpu(
@@ -969,6 +1073,7 @@ mod tests {
                         )
                     });
                     Processor {
+                        cpu: index,
                         apic_id: id,
                         topology,
                         node: (rng.below(6) != 0).then(|| rng.below(3) as u32),
@@ -980,7 +1085,9 @@ mod tests {
                     .map(|_| (rng.below(4) != 0).then(|| rng.below(4) as u64))
                     .collect(),
                 last_level: (0..n)
-                    .map(|_| (rng.below(4) != 0).then(|| rng.below(3) as u64))
+                    .map(|_| {
+                        (rng.below(4) != 0).then(|| (2 + rng.below(2) as u8, rng.below(3) as u64))
+                    })
                     .collect(),
             });
             let tree = Tree::build(&Input {
@@ -999,7 +1106,128 @@ mod tests {
                 assert!(w[0].partition().refines(w[1].partition()), "case {case}");
                 assert_ne!(w[0].partition(), w[1].partition(), "case {case}");
             }
+            // Invariant 1: two processors share a group only where every claim on each kind the
+            // level names holds the other: CPUID's both ways, the PPTT's equal where it was used,
+            // and the SRAT's node.
+            let f = *tree.findings();
+            let claim = |p: &Processor, kind: Kind| -> Option<u32> {
+                let t = p.topology.as_ref()?;
+                match kind {
+                    Kind::Core => Some(t.layout.shift(Domain::Core)),
+                    Kind::Die => Some(t.layout.shift(Domain::Die)),
+                    Kind::Package => Some(t.layout.shift(Domain::Package)),
+                    Kind::Cluster => t.caches.second_level().map(|c| u32::from(c.shift)),
+                    Kind::LastCache => t.caches.last_level().map(|c| u32::from(c.shift)),
+                    Kind::Node => None,
+                }
+            };
+            let covers = |a: &Processor, b: &Processor, kind: Kind| {
+                claim(a, kind)
+                    .is_some_and(|s| u64::from(a.apic_id) >> s == u64::from(b.apic_id) >> s)
+            };
+            for l in levels {
+                let members = l.partition().members();
+                for kind in Kind::ALL.iter().copied().filter(|&k| l.is(k)) {
+                    let cpuid_reports = ps.iter().any(|p| claim(p, kind).is_some());
+                    let pptt_used = pptt.as_ref().filter(|_| f.pptt_levels[kind.index()] == 0);
+                    for group in members.iter().filter(|g| g.len() > 1) {
+                        for &i in group {
+                            for &j in group {
+                                let (a, b) = (&ps[i as usize], &ps[j as usize]);
+                                if kind == Kind::Node {
+                                    assert!(a.node.is_some() && a.node == b.node, "case {case}");
+                                    continue;
+                                }
+                                if cpuid_reports {
+                                    assert!(
+                                        covers(a, b, kind) && covers(b, a, kind),
+                                        "case {case}"
+                                    );
+                                }
+                                if let Some(p) = pptt_used
+                                    .filter(|_| matches!(kind, Kind::Cluster | Kind::LastCache))
+                                {
+                                    let at = |x: u32| match kind {
+                                        Kind::Cluster => p.second_level[x as usize],
+                                        _ => p.last_level[x as usize].map(|(_, inst)| inst),
+                                    };
+                                    let named = if kind == Kind::Cluster {
+                                        p.second_level.iter().any(Option::is_some)
+                                    } else {
+                                        p.last_level.iter().any(Option::is_some)
+                                    };
+                                    if named {
+                                        assert!(at(i).is_some() && at(i) == at(j), "case {case}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    /// A processor that did not start leaves a gap in the CPU indexes, and the tree names the
+    /// others by their own (R97-1): the SMT machine without CPU 3.
+    #[test]
+    fn the_tree_names_processors_by_their_cpu_index() {
+        let ps: Vec<Processor> = smt_machine(|_| 8)
+            .into_iter()
+            .filter(|p| p.cpu != 3)
+            .collect();
+        let tree = Tree::build(&Input {
+            processors: &ps,
+            srat: true,
+            pptt: None,
+        });
+        assert_eq!(
+            lines(&tree),
+            [
+                "core, L2 4 groups [0-1|2|4-5|6-7]",
+                "node 2 groups [0-2|4-7]",
+                "last-level cache, package 1x7 [0-2,4-7]"
+            ]
+        );
+        assert_eq!(tree.cpus(), [0, 1, 2, 4, 5, 6, 7]);
+        assert!(tree.findings().agree());
+    }
+
+    /// A PPTT whose last level is an L2 where CPUID's is an L3 names another cache, not another
+    /// sharing: it is not used for that level, and each processor is counted (R97-3).
+    #[test]
+    fn a_pptt_describing_another_last_level_is_not_met() {
+        let ps = smt_machine(|_| 8);
+        let pptt = PpttClaims {
+            second_level: (0..8).map(|i| Some(100 + i / 2)).collect(),
+            last_level: (0..8).map(|i| Some((2, 100 + i / 2))).collect(),
+        };
+        let tree = Tree::build(&Input {
+            processors: &ps,
+            srat: true,
+            pptt: Some(&pptt),
+        });
+        let f = tree.findings();
+        assert_eq!(f.pptt_levels[Kind::LastCache.index()], 8);
+        assert_eq!(f.pptt_differs[Kind::LastCache.index()], 0);
+        assert!(!f.agree());
+        // The last level is CPUID's alone: the package's.
+        assert_eq!(lines(&tree)[2], "last-level cache, package 1x8 [0-7]");
+    }
+
+    /// R97-9 and R97-10: one APIC ID twice is two groups, not one; a claim wider than any
+    /// processor it would add is not cut.
+    #[test]
+    fn duplicates_stand_apart_and_cuts_are_counted_by_membership() {
+        let (partition, cut) = aligned(&[(5, None), (5, None)]);
+        assert_eq!(partition.groups(), 2);
+        assert_eq!(
+            cut, 2,
+            "each claims a block holding both, and has itself alone"
+        );
+        let (partition, cut) = aligned(&[(0, Some(2)), (1, Some(1))]);
+        assert_eq!(partition.to_string(), "1x2 [0-1]");
+        assert_eq!(cut, 0);
     }
 
     #[test]
