@@ -2495,11 +2495,12 @@ fn model_names(source: &str) -> Vec<&str> {
     names
 }
 
-/// The models that printed a search report (`check` in `models.rs`).
+/// The models that printed a search report (`check` in `models.rs`): the name ends at the first
+/// colon and space, since a model of `MOVES_MODELS` is named with its module's path, `moves::`.
 fn reported_models(report: &str) -> Vec<&str> {
     report
         .lines()
-        .filter_map(|line| line.split_once("loom model ")?.1.split_once(':'))
+        .filter_map(|line| line.split_once("loom model ")?.1.split_once(": "))
         .map(|(name, _)| name)
         .collect()
 }
@@ -2774,6 +2775,11 @@ mod tests {
                 .unwrap_err()
                 .contains("elsewhere")
         );
+        let moved =
+            format!("{MOVES_MODULE}mv1_a_scan_reading_the_destination_first_finds_a_moving_home");
+        let report = format!("loom model {moved}: 1802 executions, at most 3 preemptions\n");
+        assert_eq!(reported_models(&report), [moved.as_str()]);
+        assert!(require_complete(&[moved.as_str()], &report).is_ok());
         let uncontrolled = "loom model not_a_control: 1 executions\n";
         assert!(
             require_complete(&["not_a_control"], uncontrolled)
