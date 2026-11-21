@@ -13,11 +13,14 @@
 //! - [`refuse`]: no signing path takes a file from [`target`], and a bench kernel is packed only
 //!   into it.
 //!
-//! [`boot`] boots the bench pair under QEMU four ways, the SPCR naming COM2 and OVMF's console on
-//! COM1: `ExitBootServices` given the firmware's key, a stale key once (the retry path, under
-//! real firmware code), a stale key twice (the halt, which must say why and then nothing), and
-//! the bench kernel under the normal developer-mode loader (no magic in RSI: no breadcrumbs, and
-//! the boot otherwise unchanged).
+//! [`boot`] boots the bench pair under QEMU seven ways, the SPCR naming COM2 and OVMF's console on
+//! COM1. With `BENCH-AFTER` asking for the kernel (TASKS item 112's path): `ExitBootServices`
+//! given the firmware's key, a stale key once (the retry path, under real firmware code), a stale
+//! key twice (the halt, which must say why and then nothing), and the bench kernel under the
+//! normal developer-mode loader (no magic in RSI: no breadcrumbs, and the boot otherwise
+//! unchanged). Without it, as a rental runs (TASKS item 116): the reset through `ResetSystem`,
+//! the reset through the FADT's register with `ResetSystem` not called, and a UART disturbed as
+//! the call returns and written back. QEMU runs with `-no-reboot`, so a reset is QEMU exiting.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -278,6 +281,35 @@ const SAID_NONE: &str =
 /// How long the halting scenario's UART must stay silent after its line.
 const QUIET: Duration = Duration::from_secs(20);
 
+// TASKS item 116's lines.
+/// On the loader's console: no `BENCH-AFTER`, as on a rental; and each mode a QEMU scenario asks
+/// for.
+const NO_AFTER: &str = "origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered";
+const AFTER_KERNEL: &str = "origin-boot: bench build: BENCH-AFTER kernel: after ExitBootServices the loader enters the kernel, or halts after a failed call";
+const AFTER_FADT: &str = "origin-boot: bench build: BENCH-AFTER fadt: after ExitBootServices the loader resets the machine through the FADT's reset register, without calling ResetSystem";
+const AFTER_DISTURB: &str = "origin-boot: bench build: BENCH-AFTER disturb: after ExitBootServices the loader turns the UART's loopback on and changes its divisor, then writes the firmware's values back, then resets the machine";
+/// On the loader's console, before the call: how the reset will go, the FADT's register, and
+/// the UART as the firmware left it.
+const RESET_PLAN: &str = "origin-boot: bench build: ResetSystem is at 0x";
+const RESET_REGISTER: &str = "origin-boot: bench build: the FADT's reset register: write ";
+const UNDER_FIRMWARE: &str =
+    "origin-boot: bench build: the UART at I/O port 0x2f8 under the firmware: ";
+/// Straight to the SPCR's UART: before the call, the marks before each call, after it, and the
+/// reset's lines.
+const BEFORE_CALL: &str =
+    "origin-boot: bench build: this line went straight to the UART, before ExitBootServices";
+const MARK_FIRST: &str = "X";
+const MARK_RETRY: &str = "Y";
+const AFTER_CALL: &str = "origin-boot: bench build: after ExitBootServices the UART read ";
+const WRITTEN_BACK: &str = "; the firmware's values are written back";
+const RESET_SOON: &str = "origin-boot: bench build: a cold reset through the firmware's ResetSystem in 5 s, and the FADT's reset register 2 s later if the machine still runs";
+const FADT_SOON: &str = "origin-boot: bench build: a reset through the FADT's reset register in 7 s: ResetSystem is not called";
+const FADT_WRITE: &str =
+    "origin-boot: bench build: ResetSystem was not called (BENCH-AFTER fadt): writing ";
+/// How long a reset scenario waits, after its last marker, for QEMU to exit: the loader's 5 s or
+/// 7 s, and room for a slow host.
+const RESET_WITHIN: Duration = Duration::from_secs(30);
+
 /// The SPCR naming COM2, as `boot-console`'s scenario gives it.
 fn spcr(work: &Path) -> Result<Vec<String>> {
     crate::spcr_args(
@@ -287,23 +319,47 @@ fn spcr(work: &Path) -> Result<Vec<String>> {
     )
 }
 
-/// Writes `BENCH-STALE-KEY` with `contents` on the ESP `stage` has just laid out.
-fn switch(work: &Path, contents: &[u8]) -> Result {
-    let path = work
-        .join("esp")
-        .join("EFI")
-        .join("ORIGIN")
-        .join("BENCH-STALE-KEY");
+/// Writes the switch `name` with `contents` on the ESP `stage` has just laid out.
+fn write_switch(work: &Path, name: &str, contents: &[u8]) -> Result {
+    let path = work.join("esp").join("EFI").join("ORIGIN").join(name);
     fs::write(&path, contents).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// `BENCH-STALE-KEY` with `contents`.
+fn switch(work: &Path, contents: &[u8]) -> Result {
+    write_switch(work, "BENCH-STALE-KEY", contents)
+}
+
+/// `BENCH-AFTER` with `mode` (TASKS item 116).
+fn after(work: &Path, mode: &[u8]) -> Result {
+    write_switch(work, "BENCH-AFTER", mode)
+}
+
+/// TASKS item 112's path: the kernel after a successful call.
+fn spcr_kernel(work: &Path) -> Result<Vec<String>> {
+    after(work, b"kernel\n")?;
+    spcr(work)
 }
 
 fn stale_once(work: &Path) -> Result<Vec<String>> {
     switch(work, b"1\n")?;
-    spcr(work)
+    spcr_kernel(work)
 }
 
 fn stale_twice(work: &Path) -> Result<Vec<String>> {
     switch(work, b"2\n")?;
+    spcr_kernel(work)
+}
+
+/// The FADT's register, with `ResetSystem` not called.
+fn spcr_fadt(work: &Path) -> Result<Vec<String>> {
+    after(work, b"fadt\n")?;
+    spcr(work)
+}
+
+/// The UART disturbed as the call returns.
+fn spcr_disturb(work: &Path) -> Result<Vec<String>> {
+    after(work, b"disturb\n")?;
     spcr(work)
 }
 
@@ -340,19 +396,24 @@ fn scenario(
     }
 }
 
-/// The four scenarios of [`boot`].
+/// The seven scenarios of [`boot`].
 fn scenarios() -> Vec<Scenario> {
     let with_crumbs = |first: &str| {
-        let mut m = vec![first.to_string(), CRUMBS.to_string()];
+        let mut m = vec![
+            first.to_string(),
+            AFTER_CALL.to_string(),
+            CRUMBS.to_string(),
+        ];
         m.extend(kernel_markers(SAID_PORT));
         m
     };
+    let lines = |lines: &[&str]| lines.iter().map(ToString::to_string).collect::<Vec<_>>();
     vec![
         scenario(
             "bench: the firmware's key",
             Loader::Bench,
             with_crumbs(FIRST_CALL),
-            spcr,
+            spcr_kernel,
             check_first_call,
             None,
         ),
@@ -367,10 +428,34 @@ fn scenarios() -> Vec<Scenario> {
         scenario(
             "bench: a stale key twice, the halt",
             Loader::Bench,
-            vec![HALTING_START.to_string()],
+            lines(&[HALTING_START, AFTER_CALL]),
             stale_twice,
             check_halt,
             Some(QUIET),
+        ),
+        scenario(
+            "bench: no switch, the reset through ResetSystem",
+            Loader::Bench,
+            lines(&[FIRST_CALL, AFTER_CALL, RESET_SOON]),
+            spcr,
+            check_reset_system,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: ResetSystem not called, the reset through the FADT's register",
+            Loader::Bench,
+            lines(&[FIRST_CALL, AFTER_CALL, FADT_SOON, FADT_WRITE]),
+            spcr_fadt,
+            check_reset_fadt,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: a UART disturbed as the call returns, written back",
+            Loader::Bench,
+            lines(&[AFTER_CALL, RESET_SOON]),
+            spcr_disturb,
+            check_disturbed,
+            Some(RESET_WITHIN),
         ),
         scenario(
             "bench: the bench kernel under the normal loader",
@@ -383,13 +468,23 @@ fn scenarios() -> Vec<Scenario> {
     ]
 }
 
-/// The loader's console (COM1) holds `switch_line`, the state line and `LOADER_NAMES_COM2`, all
-/// before its last line.
-fn check_loader_console(done: &Completed, switch_line: &str) -> Result {
+/// The loader's console (COM1) holds `switch_line`, `after_line`, the state line,
+/// `LOADER_NAMES_COM2`, and TASKS item 116's lines about the reset and the UART, all before its
+/// last line; and the line straight to the UART before the call is on the SPCR's UART only, before
+/// the loader's last line there.
+fn check_loader_console(done: &Completed, switch_line: &str, after_line: &str) -> Result {
     let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
     let at = |needle: &str| com1.find(needle);
     let last = at(LAST_LOADER_LINE).ok_or("COM1 lacks the loader's last line")?;
-    for needle in [switch_line, STATE, LOADER_NAMES_COM2] {
+    for needle in [
+        switch_line,
+        after_line,
+        STATE,
+        LOADER_NAMES_COM2,
+        RESET_PLAN,
+        RESET_REGISTER,
+        UNDER_FIRMWARE,
+    ] {
         match at(needle) {
             Some(i) if i < last => {}
             _ => {
@@ -406,6 +501,74 @@ fn check_loader_console(done: &Completed, switch_line: &str) -> Result {
     if !(state.contains(", EFER 0x") && state.contains("; shadow stacks: ")) {
         return Err(format!("the state line is not whole: {state:?}"));
     }
+    if com1.contains(BEFORE_CALL) {
+        return Err(format!(
+            "COM1, the firmware's console, holds {BEFORE_CALL:?}, which goes straight to the SPCR's UART only"
+        ));
+    }
+    let uart = serial::clean(done.serial.as_bytes());
+    match (uart.find(BEFORE_CALL), uart.find(LAST_LOADER_LINE)) {
+        (Some(before), Some(last)) if before < last => Ok(()),
+        _ => Err(format!(
+            "the SPCR's UART lacks {BEFORE_CALL:?} before the loader's last line"
+        )),
+    }
+}
+
+/// The lines on the SPCR's UART after the loader's last line, empty ones left out.
+fn after_last_line(done: &Completed) -> Result<Vec<String>> {
+    let uart = serial::clean(done.serial.as_bytes());
+    let lines: Vec<&str> = uart.lines().filter(|l| !l.is_empty()).collect();
+    let last = lines
+        .iter()
+        .position(|l| *l == LAST_LOADER_LINE)
+        .ok_or("the SPCR's UART lacks the loader's last line")?;
+    Ok(lines[last + 1..].iter().map(ToString::to_string).collect())
+}
+
+/// Whether `line` is the line after the call, with the firmware's values written back.
+fn is_after_call(line: &str) -> bool {
+    line.starts_with(AFTER_CALL) && line.ends_with(WRITTEN_BACK)
+}
+
+/// The value after `name` in a register line: `"MCR 0x1b"` gives 0x1b.
+fn register(line: &str, name: &str) -> Option<u32> {
+    let rest = line.split(&format!("{name} 0x")).nth(1)?;
+    let hex: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+    u32::from_str_radix(&hex, 16).ok()
+}
+
+/// After the loader's last line, on the SPCR's UART: exactly `want`, each a line that starts with
+/// it; and QEMU exited by itself (`reset`) or did not.
+fn check_after(done: &Completed, want: &[&str], reset: bool) -> Result {
+    let after = after_last_line(done)?;
+    let fits = after.len() == want.len()
+        && after.iter().zip(want).all(|(line, w)| {
+            if *w == AFTER_CALL {
+                is_after_call(line)
+            } else {
+                line.starts_with(w)
+            }
+        });
+    if !fits {
+        return Err(format!(
+            "after the loader's last line the SPCR's UART should hold lines starting {want:?}; it holds {after:?}"
+        ));
+    }
+    if done.exited != reset {
+        return Err(if reset {
+            format!(
+                "QEMU did not exit within {} s of the reset line: the machine was not reset",
+                RESET_WITHIN.as_secs()
+            )
+        } else {
+            "QEMU exited, though nothing should have reset the machine".into()
+        });
+    }
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    if reset && (done.serial.contains("origin-kernel:") || com1.contains("origin-kernel:")) {
+        return Err("a kernel line was written, though the loader resets the machine".into());
+    }
     Ok(())
 }
 
@@ -413,21 +576,29 @@ fn check_loader_console(done: &Completed, switch_line: &str) -> Result {
 /// the kernel's first line, with no kernel line before it; and `boot-console`'s SPCR checks hold.
 /// (OVMF writes its console, and so the loader's earlier lines, to every serial port: COM2 holds
 /// those first.)
-fn check_crumbs(done: &Completed, settings: &Settings, first: &str) -> Result {
+fn check_crumbs(done: &Completed, settings: &Settings, first: &str, marks: &[&str]) -> Result {
     let uart = serial::clean(done.serial.as_bytes());
     let lines: Vec<&str> = uart.lines().filter(|l| !l.is_empty()).collect();
     let at = lines
         .iter()
         .position(|l| *l == first)
         .ok_or_else(|| format!("the SPCR's UART lacks the bench loader's line {first:?}"))?;
-    let next = lines.get(at + 1..(at + 3).min(lines.len())).unwrap_or(&[]);
-    if next.first() != Some(&CRUMBS)
+    // TASKS item 116: the marks before each call, after the loader's last line.
+    let last = lines.iter().position(|l| *l == LAST_LOADER_LINE);
+    if last.and_then(|last| lines.get(last + 1..at)) != Some(marks) {
+        return Err(format!(
+            "on the SPCR's UART, between the loader's last line and {first:?}, the marks should be {marks:?}"
+        ));
+    }
+    let next = lines.get(at + 1..(at + 4).min(lines.len())).unwrap_or(&[]);
+    if !next.first().is_some_and(|l| is_after_call(l))
+        || next.get(1) != Some(&CRUMBS)
         || !next
-            .get(1)
+            .get(2)
             .is_some_and(|l| l.starts_with("origin-kernel: console: framebuffer "))
     {
         return Err(format!(
-            "on the SPCR's UART the loader's line {first:?} should be followed by {CRUMBS:?} on its own, then the kernel's first line; it is followed by {next:?}"
+            "on the SPCR's UART the loader's line {first:?} should be followed by the line after the call, {CRUMBS:?} on its own, then the kernel's first line; it is followed by {next:?}"
         ));
     }
     if let Some(early) = lines[..at].iter().find(|l| l.starts_with("origin-kernel:")) {
@@ -439,35 +610,82 @@ fn check_crumbs(done: &Completed, settings: &Settings, first: &str) -> Result {
 }
 
 fn check_first_call(done: &Completed, settings: &Settings) -> Result {
-    check_loader_console(done, NO_SWITCH)?;
-    check_crumbs(done, settings, FIRST_CALL)
+    check_loader_console(done, NO_SWITCH, AFTER_KERNEL)?;
+    check_crumbs(done, settings, FIRST_CALL, &[MARK_FIRST])
 }
 
 fn check_retry(done: &Completed, settings: &Settings) -> Result {
-    check_loader_console(done, SWITCH_ONCE)?;
-    check_crumbs(done, settings, RETRY)
+    check_loader_console(done, SWITCH_ONCE, AFTER_KERNEL)?;
+    check_crumbs(done, settings, RETRY, &[MARK_FIRST, MARK_RETRY])
 }
 
-/// Both calls failed: on the SPCR's UART the halting line follows the loader's last line and,
-/// [`QUIET`] later, nothing follows it; and no kernel line was written anywhere.
+/// Both calls failed: on the SPCR's UART the marks, the halting line and the line after the call
+/// follow the loader's last line and, [`QUIET`] later, nothing follows them; QEMU did not exit;
+/// and no kernel line was written anywhere.
 fn check_halt(done: &Completed, _settings: &Settings) -> Result {
-    check_loader_console(done, SWITCH_TWICE)?;
-    let uart = serial::clean(done.serial.as_bytes());
-    let lines: Vec<&str> = uart.lines().filter(|l| !l.is_empty()).collect();
-    let last = lines
-        .iter()
-        .position(|l| *l == LAST_LOADER_LINE)
-        .ok_or("the SPCR's UART lacks the loader's last line")?;
-    let after = &lines[last + 1..];
-    if after != [HALTING] {
+    check_loader_console(done, SWITCH_TWICE, AFTER_KERNEL)?;
+    let after = after_last_line(done)?;
+    if after.len() != 4
+        || after[..3] != [MARK_FIRST, MARK_RETRY, HALTING]
+        || !is_after_call(&after[3])
+    {
         return Err(format!(
-            "after both calls failed, the SPCR's UART should hold the halting line after the loader's last line and nothing more for {} s; it holds {after:?}",
+            "after both calls failed, the SPCR's UART should hold the marks, the halting line and the line after the call after the loader's last line, and nothing more for {} s; it holds {after:?}",
             QUIET.as_secs()
         ));
     }
+    if done.exited {
+        return Err("QEMU exited, though the loader halts".into());
+    }
+    let uart = serial::clean(done.serial.as_bytes());
     let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
     if uart.contains("origin-kernel:") || com1.contains("origin-kernel:") {
         return Err("a kernel line was written, though the loader halted".into());
+    }
+    Ok(())
+}
+
+/// No switch, as a rental runs: the mark, the line after the call, the reset line, and QEMU
+/// exiting within [`RESET_WITHIN`], with nothing after the reset line: `ResetSystem` reset the
+/// machine before the FADT's register was reached.
+fn check_reset_system(done: &Completed, _settings: &Settings) -> Result {
+    check_loader_console(done, NO_SWITCH, NO_AFTER)?;
+    check_after(
+        done,
+        &[MARK_FIRST, FIRST_CALL, AFTER_CALL, RESET_SOON],
+        true,
+    )
+}
+
+/// `ResetSystem` not called: the FADT's register written, and QEMU exiting.
+fn check_reset_fadt(done: &Completed, _settings: &Settings) -> Result {
+    check_loader_console(done, NO_SWITCH, AFTER_FADT)?;
+    check_after(
+        done,
+        &[MARK_FIRST, FIRST_CALL, AFTER_CALL, FADT_SOON, FADT_WRITE],
+        true,
+    )
+}
+
+/// The UART disturbed as the call returns: the line written as it then is never reaches the
+/// line (loopback), the line after the call names the loopback and the changed divisor, so the
+/// firmware's values were written back before it, and the reset follows.
+fn check_disturbed(done: &Completed, _settings: &Settings) -> Result {
+    check_loader_console(done, NO_SWITCH, AFTER_DISTURB)?;
+    check_after(done, &[MARK_FIRST, AFTER_CALL, RESET_SOON], true)?;
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    let under = com1
+        .lines()
+        .find(|l| l.starts_with(UNDER_FIRMWARE))
+        .and_then(|l| register(l, "divisor"))
+        .ok_or("the loader's console lacks the UART's divisor under the firmware")?;
+    let after = after_last_line(done)?;
+    let line = after.get(1).map_or("", String::as_str);
+    let (mcr, divisor) = (register(line, "MCR"), register(line, "divisor"));
+    if !mcr.is_some_and(|m| m & 0x10 != 0) || divisor == Some(under) || divisor.is_none() {
+        return Err(format!(
+            "the line after the call should name the loopback and a divisor other than the firmware's {under:#06x}: {line:?}"
+        ));
     }
     Ok(())
 }
@@ -514,7 +732,7 @@ pub(crate) fn boot(settings: &Settings) -> Result {
         run_scenario(scenario, kernel, settings)?;
     }
     println!(
-        "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, and the bench kernel under the normal loader) in {} s",
+        "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, the bench kernel under the normal loader, the reset through ResetSystem, through the FADT's register, and a disturbed UART written back) in {} s",
         chosen.len(),
         all.len(),
         started.elapsed().as_secs()

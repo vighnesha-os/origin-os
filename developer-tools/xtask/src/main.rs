@@ -414,6 +414,9 @@ struct Completed {
     screen: Option<screen::Image>,
     /// What COM1 wrote to its file, for [`Capture::SpcrUart`].
     com1: Option<String>,
+    /// Whether QEMU exited by itself before the test stopped it. Under `-no-reboot` that is the
+    /// guest resetting the machine (TASKS item 116).
+    exited: bool,
 }
 
 /// The IOMMU QEMU emulates (`ORIGIN_QEMU_IOMMU`, [`Settings::iommu`]): Intel VT-d or AMD-Vi,
@@ -7283,6 +7286,8 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
     let deadline = started + timeout;
     let mut raw = Vec::new();
     let screen_path = work.join("screen.ppm");
+    // Whether QEMU closed its output: it exited by itself (TASKS item 116).
+    let mut closed = false;
     let mut verdict: Result = if scenario.capture == Capture::Screen {
         let monitor = stdin.as_mut().ok_or("QEMU stdin was not captured")?;
         wait_for_screen(
@@ -7347,6 +7352,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
                     ));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    closed = true;
                     if let Some(verdict) = judge(&raw) {
                         break verdict;
                     }
@@ -7360,8 +7366,16 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
         && let Some(quiet) = scenario.quiet
     {
         let until = Instant::now() + quiet;
-        while let Ok(chunk) = rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
-            raw.extend_from_slice(&chunk);
+        loop {
+            match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(chunk) => raw.extend_from_slice(&chunk),
+                Err(RecvTimeoutError::Timeout) => break,
+                // QEMU exited, so the quiet time is over: a reset under `-no-reboot`.
+                Err(RecvTimeoutError::Disconnected) => {
+                    closed = true;
+                    break;
+                }
+            }
         }
     }
     let elapsed = started.elapsed();
@@ -7409,6 +7423,8 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
     }
     drop(stdin);
 
+    // Whether QEMU had exited by itself before it is stopped (TASKS item 116).
+    let exited = closed || matches!(child.try_wait(), Ok(Some(_)));
     // QEMU keeps running after the scenario ends (the kernel halts; a rejecting loader hands
     // back to the firmware), so the test stops it. (QEMU does not exit on SIGALRM.)
     let _ = child.kill();
@@ -7432,6 +7448,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
         serial: text.clone(),
         screen,
         com1,
+        exited,
     };
     let verdict = verdict
         .and_then(|()| match stack_window_lines(&done.serial).first() {
