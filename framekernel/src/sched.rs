@@ -124,14 +124,25 @@ impl Drop for PinGuard {
 /// interrupts-off section: it takes this processor's queue lock, finds the running slot's record,
 /// and raises that thread's pin count (two plain moves, CL47). On the boot or idle flow, whose slot
 /// has no record, it raises nothing. Not for the trap entry, which has its own witness.
+///
+/// Only slot 0, the boot or idle flow, runs without a record: every spawn queues one. A thread
+/// in any other slot without one would hold a pin's witness that pinned nothing, so the kernel
+/// stops (review finding R93-8).
 pub(crate) fn pin() -> PinGuard {
     let record = without_interrupts_here(|here| {
         let me = cpu::this_cpu(here);
-        let record = {
+        let (running, placed) = {
             let q = QUEUES.this(me)?.lock();
-            q.record(q.current())
-        }?
-        .record();
+            (q.current(), q.record(q.current()))
+        };
+        let Some(placed) = placed else {
+            assert!(
+                running == 0,
+                "a thread without a record asked for a processor pin"
+            );
+            return None;
+        };
+        let record = placed.record();
         raise_pin(record);
         Some(record)
     });
