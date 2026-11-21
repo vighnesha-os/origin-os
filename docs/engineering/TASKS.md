@@ -4082,3 +4082,28 @@ The coordinating session gave the design in its brief and asked for the contract
 - **R116-3 (Medium):** the rental tool samples the console's arrival times into `sol-times.log`. For a reset build, each boot's record counts the loader's runs and gives the seconds from the loader's last line to the next byte and to the next loader: seconds mean B, nothing within the boot means A, about five minutes would point to the firmware's watchdog. A reset build reports no breadcrumbs, and the record names the loader as the bench loader.
 - **R116-4:** a counted rate is capped at the assumed 6,000,000 ticks a millisecond. **R116-5:** interrupts are masked as soon as the call returns, either way, and again if `ResetSystem` returns. **R116-6:** the register read under the firmware runs with interrupts masked. **R116-7:** the marks are written only if the line before the call went out whole and the UART then emptied. **R116-8:** I/O port 0 is refused. **R116-9:** the reset line is formatted from the delays and says when there is no usable register. **R116-11:** a switch's name must leave room for its NUL. **R116-12:** the port writer's and reader's SAFETY comments are exact.
 - **R116-10:** a reset is now QEMU exiting with a success status, waited for after its output closes, and the normal-loader scenario refuses a bare mark. Kept as limits: a triple fault is a reset to QEMU too, which the scenarios tell apart only by their lines (the reset line, then nothing); and QEMU's UART ignores the divisor, so the disturbed scenario shows the loopback written back, and only the host test shows the divisor.
+
+**As built (2026-11-21).** On `claude/t116-reset-diagnostic`: `58c5c63c` (the loader), `2d23f28a` (xtask), `dc9b4ba8` (the rental tool), `a4dadf49` (the review's answers), `722e1141` (one `unsafe` operation per block, which the bench Clippy run asked for), `cc6d47a0` (rustfmt), and the records. `land/batch-9` at `a2898d14` (TASKS item 78, and main's PR 53 with ADR-0002 Amendment 3 and this item's list entry) merged in at `5b4e8cb0`.
+- **`boot/uefi/src/bench.rs`** (no `unsafe`): `After` and the `BENCH-AFTER` switch; `UartState` (`read`, `write_back`), `drain`, `disturb`; `UnderFirmware`, `BEFORE_CALL`, the marks, `AfterCall`; `find_reset` and its rules, `in_mmio`, `ResetLine`; the runtime table's constants; `ticks_per_ms`, `ResetPlan`, `ResetSoon`, `Tried`, `Fallback`, `NOT_RESET`.
+- **`boot/uefi/src/main.rs`**, under the flag: the switch read (`read_bench_file`, which `BENCH-STALE-KEY` now shares), the FADT's register read in the SPCR's walk, `bench_before_call`, `count_ticks` (over `Stall`), `runtime_reset_system`, the marks in the call's closure, `bench_disturb`, `bench_after_call`, `bench_reset`, `write_reset_register`, `wait_ms`, `mask_interrupts`, `with_interrupts_masked`. **`spcr.rs`:** `parse_rsdp` and `check_xsdt` crate-visible.
+- **xtask:** `Completed::exited`; the quiet period ended by QEMU's exit; `boot-bench`'s seven scenarios and their checks.
+- **The rental tool:** `BENCH_SWITCHES` and the install's refusal of each; `sol-times.log`; a reset build's loader runs and timing (`after_last_line`, `read_times`); `loader_kind`.
+
+**What ran (QEMU 11.1.3's software processor on the development Mac, 2026-11-21, inside `cargo xtask exclusive`).**
+- **Host tests:** the loader's library 78 (16 of them `bench.rs`'s: the 16550 model, the FADT walk's twelve cases, the lines, the switch); xtask's bench and toolchain tests; the rental tool's 36.
+- **The normal images, 10:29 to 10:31 UTC:** the reproducible gate's 40 kept files, from both of its builds (the loader each way it is built, the kernel, its image and the carried programs), are the same bytes on `land/batch-9` at `843ef415` and on this branch at `39bf8b0b` (`cargo xtask reproducible-compare`).
+- **`boot-bench` on `722e1141`, 10:32 to 10:33 UTC: 7 of 7 in 91 s**, Clippy and the bench builds included:
+
+| Scenario | Time | After the loader's last line, on the SPCR's UART |
+|---|---|---|
+| the firmware's key (`kernel`) | 13.4 s | `X`, `… exited on the first call`, `… after ExitBootServices (first call EFI_SUCCESS) the UART read …`, `RS12345678`, the kernel's lines |
+| a stale key once (`kernel`) | 13.5 s | `X`, `Y`, the retry's line, the after-call line, `RS12345678`, the kernel's lines |
+| a stale key twice (`kernel`) | 22.6 s | `X`, `Y`, the halting line, the after-call line with both statuses, then nothing for 20 s; QEMU still running |
+| no switch, as a rental | 7.7 s | `X`, `… exited on the first call`, the after-call line, the reset's line; QEMU exited (the reset through `ResetSystem`) |
+| `fadt` | 9.8 s | as above, then `ResetSystem was not called (BENCH-AFTER fadt): writing 0xf to I/O port 0xcf9, the FADT's reset register`; QEMU exited |
+| `disturb` | 7.7 s | `X`, then the after-call line reading `MCR 0x10, LSR 0x63, MSR 0x00, … divisor 0x000c`, the reset's line; the line written before the values went back never reached the console |
+| the bench kernel under the normal loader | 13.1 s | no bench line, no mark, no breadcrumb |
+
+  On the loader's console under OVMF: the counter counted at 1,001,150 to 1,001,650 ticks a millisecond over `Stall`; `ResetSystem` found; the FADT's register `0xf` to I/O port `0xcf9`; COM2 under the firmware `IER 0x00, LCR 0x03, MCR 0x00, LSR 0x60, MSR 0xb0, scratch 0x00, divisor 0x0001`.
+- **Found on the way:** OVMF leaves COM2's modem control at 0 (no DTR, RTS or OUT2), and QEMU's UART sends regardless. On rental E the line before the call shows whether the rented firmware's settings carry a raw write.
+
