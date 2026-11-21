@@ -750,10 +750,12 @@ extern "sysv64" fn syscall_entry() {
     );
 }
 
-/// This processor's CPU-local area, lent for the life of the witness `me` was read under
-/// (ADR-0020 S3; TASKS item 93).
-fn local(me: ThisCpu<'_>) -> &'_ CpuLocal {
-    CPU_LOCAL.this(me).unwrap_or(&OUT_OF_RANGE)
+/// This processor's CPU-local area, lent for the life of the witness `here` (ADR-0020 S3; TASKS
+/// item 93). The index is read inside this function under that witness, not by its caller, as
+/// before TASKS item 93, so `dispatch`'s code stays the base's (TASKS item 93's static counts of
+/// 2026-11-21 found the read moved into the caller).
+fn local(here: crate::trap::Here<'_>) -> &'_ CpuLocal {
+    CPU_LOCAL.this(this_cpu(here)).unwrap_or(&OUT_OF_RANGE)
 }
 
 /// Names the stack the running context's interrupts and system calls from ring 3 land on: this
@@ -1432,13 +1434,11 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     // A page fault at the exact instruction a probe armed: record it and resume at
     // `probe_recover`, which returns the error code to the probe's caller.
     if frame.vector == 14 {
-        // Two reads of the index, each under the trap entry's witness: as the code read it before
-        // TASKS item 93, so what is built here does not change.
-        let armed = local(this_cpu(Switch::new().here()))
-            .probe_rip
-            .load(Ordering::SeqCst);
+        // Two reads of the index, each inside `local` under the trap entry's witness: as the code
+        // read it before TASKS item 93, so what is built here does not change.
+        let armed = local(Switch::new().here()).probe_rip.load(Ordering::SeqCst);
         if armed != 0 && frame.rip == armed {
-            local(this_cpu(Switch::new().here()))
+            local(Switch::new().here())
                 .probe_address
                 .store(read_cr2(), Ordering::SeqCst);
             frame.rax = frame.error_code;
@@ -2193,7 +2193,7 @@ impl core::fmt::Debug for Probe {
 fn run_probe(fault_rip: u64, access: impl FnOnce() -> u64) -> Probe {
     // Per CPU: probes and user copies on different processors never disarm each other.
     without_interrupts_here(|at| {
-        let here = local(this_cpu(at));
+        let here = local(at);
         here.probe_rip.store(fault_rip, Ordering::SeqCst);
         let result = access();
         here.probe_rip.store(0, Ordering::SeqCst);
