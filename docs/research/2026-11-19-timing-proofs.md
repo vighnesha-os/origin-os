@@ -142,6 +142,6 @@ Before the rate's verdict moved to the timer's count, a temporary build on `2364
 - Anything under KVM, in CI or on a physical machine (CLAUDE.md §74).
 - The cause of the calibration's spoiled windows on the large machines.
 - A rate within 3 % of nominal: the tick proof passes it, by its tolerance.
-- A timer over 5 times fast whose reload a stall inside an intermediate read of its count hides: the count passes it, and its delivery fails it as too fast in total unless recurring stalls also make that total look normal in the same run (the second addendum review's T66-R17; TASKS item 78).
+- A timer over 5 times fast *(from about 3.4 times fast: TASKS item 78's correction of 2026-11-21, in ADR-0013)* whose reload a stall inside an intermediate read of its count hides: the count passes it, and its delivery fails it as too fast in total unless recurring stalls also make that total look normal in the same run (the second addendum review's T66-R17; TASKS item 78).
 - A processor whose timer reads back as the boot processor's but ticks slower, its own timer clock being wrong, between about 30 Hz and 100 Hz: only the preemption proof's floor of 15 switches in 500 ms catches it, below that. One whose own timer clock runs fast: nothing catches it, the count's period being measured on the boot processor alone; on the platforms in scope one clock drives every core's APIC timer.
 - Why the 67-processor machine's preemption workers did not exit within 10 s at ten busy loops.
