@@ -3755,13 +3755,14 @@ Built on `claude/t94-fpu-format-18ed6a`, cut from `land/batch-9` at `a25228c9` (
 - `045d50b8`: R94-3 and R94-4.
 - `d9d6f95b`: R94-5 and R94-6.
 - `b2cf1631`: R94-7.
+- `0e8670a4`, `203c398e`, `f4c4eb68`: the delta review's R94-9, R94-10 and R94-11 (R94-8 is a follow-up, R94-12 needs no change).
 - The records: this entry, ADR-0020 S6's dated note, ADR-0013's row and controls, CL40, the provenance entry and `REVIEW_T94_2026-11-21.md`.
 
 **The design as it lands:**
 
 - **What a processor reports.** `cpu::enable_simd` sets CR0, CR4 and XCR0 as before and returns `FpuFormat { xcr0, enabled_size }`: XCR0 read back with XGETBV, and CPUID.0DH.00H:EBX read after XSETBV. Without XSAVE, or without leaf 0DH to size it (`features::xsave_usable`, R94-6), XCR0 is 0 and the size the FXSAVE area's 512 bytes, and the baseline refuses the processor. It writes no global: every processor used to overwrite the area size, the last to start winning.
-- **The boot processor's, once.** `Early::enable_simd`, on the boot processor alone, calls `cpu::record_boot_fpu` before any area is allocated. It records, in one `SetOnce`, the boot processor's format and the area size: its CPUID.0DH.00H:ECX (the size for every supported component), never less than its own enabled size; then `USE_XSAVE`, the save method every processor uses (R94-5). A second call changes nothing.
-- **Each AP's comparison** (`smp::ap_entry`), right after `enable_simd`: `features::fpu_fit(boot, own, area)`, room first, then equality:
+- **The boot processor's, once.** `Early::enable_simd`, on the boot processor alone, calls `cpu::record_boot_fpu` before any area is allocated. It records, in one `SetOnce`, the boot processor's format and the area size: its CPUID.0DH.00H:ECX (the size for every supported component), never less than what one save in its format writes (`features::fpu_bytes`: the enabled size, and with XSAVE never under the 576 bytes of the legacy region and header, R94-10); then `USE_XSAVE`, the save method every processor uses (R94-5). A second call changes nothing, and the heap does not start before it (R94-9).
+- **Each AP's comparison** (`smp::ap_entry`), right after `enable_simd`: `features::fpu_fit(boot, own, area)`, room first (`fpu_bytes`), then equality:
   - **Alike:** the boot processor's XCR0 and enabled size. It takes part in moves.
   - **Differs**, but its state fits the area: it comes online, runs its own threads, and takes no part in moves, as source or destination.
   - **Too large** for the area: `features::ap_lacks` names it after SMEP/SMAP and the baseline (R94-7), and it refuses before its handshake: `LACKS_FPU_ROOM`, parked by INIT, its line naming both sizes.
@@ -3779,16 +3780,17 @@ Built on `claude/t94-fpu-format-18ed6a`, cut from `land/batch-9` at `a25228c9` (
 | `cpu::record_cpu_state()` | `cpu::record_cpu_state(fpu_alike: bool)`, its one `this_cpu()` call unchanged | `cpu.rs`; called in `smp::start` (the boot processor) and `smp::ap_entry`, now after `record_topology` |
 | `cpu::enable_simd(&Cpuid) -> u64` | `-> features::FpuFormat` | `cpu.rs`; `early.rs`, `smp.rs` |
 | `FPU_AREA_SIZE: AtomicU64` | `BOOT_FPU: SetOnce<BootFpu>`; `fpu_area_size()` unchanged in signature | `cpu.rs` |
-| (new) | `cpu::record_boot_fpu`, `boot_fpu_format`, `fpu_formats_alike`, `fpu_alike` (crate-private); `smp::Online::takes_part_in_moves`; `features::FpuFormat`, `FpuFit`, `fpu_fit`, `ApLacks`, `ap_lacks`, `xsave_usable` | |
+| (new) | `cpu::record_boot_fpu`, `boot_fpu_format`, `fpu_formats_alike`, `fpu_alike` (crate-private); `smp::Online::takes_part_in_moves`; `features::FpuFormat`, `FpuFit`, `fpu_fit`, `fpu_bytes`, `ApLacks`, `ap_lacks`, `xsave_usable` | |
 
 **Changed from the contract, and why:**
 
 - **The AP records later than today.** It used to record its control state right after `enable_simd`, before the check that its CPU index is its own. It now records after every check, just before its answer, so a refused AP records nothing and the record cannot land in another index's slot (the review's I4).
 - **"Takes part" is a method of `Online`** (R94-3), not `cpu::takes_part_in_moves`: the one-store rule leaves a late-answering AP's record standing.
 - **`USE_XSAVE` is the boot processor's too** (R94-5), and **XSAVE needs leaf 0DH** (R94-6): the review's two Info findings, beyond the contract.
+- **The heap waits for the format** (R94-9), and **an XSAVE area is never under 576 bytes** (R94-10): the delta review's, beyond the contract. Neither changes anything on a machine whose CPUID tells the truth.
 - **A fourth control, C94-2b**: xtask stops a boot at once on `: AP start-up failed`, so C94-2 could not show the ruling's two points; C94-2b takes that one string out of xtask's list in the export and lets the boot reach its verdict.
 
-**The controls** (ADR-0013's controls of TASKS item 94), each planted in a `git archive` export of `5453b12f` by the script `plant94.py`, booted with `cargo xtask boot-test` on the default 2-processor machine and the AMD-IOMMU 3-processor machine. QEMU's `max` processor took XCR0 bit 9 (PKRU), so no fallback was needed.
+**The controls** (ADR-0013's controls of TASKS item 94), each planted in a `git archive` export of `5453b12f` by the script `plant94.py`, booted with `cargo xtask boot-test` on the default 2-processor machine and the AMD-IOMMU 3-processor machine, and all four again on `f4c4eb68`, the code after both reviews' answers, with the same lines word for word. QEMU's `max` processor took XCR0 bit 9 (PKRU), so no fallback was needed.
 
 | Control | Plant | Result |
 |---|---|---|

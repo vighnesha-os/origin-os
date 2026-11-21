@@ -920,7 +920,7 @@ Control RB-1 of TASKS item 83, an RSDP in loader data, is now a machine of its o
 | C94-2b | C94-2, with only `: AP start-up failed` taken out of xtask's list of lines that stop a boot at once, so the boot runs to its verdict | `SMP: 1 of 2 enabled processors online` (`2 of 3`); the FPU format line counts only the processors online, `1 of 1 processors alike, every one taking part in moves` (`2 of 2`), so the parked AP never takes part; the verdict `degraded: 70 of 72 proofs passed; failed: application processors (fewer processors), speculation controls` |
 | C94-3 | C94-1, `features::fpu_fit` planted to answer "alike" always, and each AP's online line printing the format it read back (default machine only) | Not a gate: a check of the line. `boot-test` passed, 11 of 11, while CPU 1's line read `XCR0 0x207, 2696 bytes` and the FPU format line said `2 of 2 processors alike`: the line follows the comparison, and nothing else in the boot catches the difference |
 
-The record's two bits are told apart in C94-1's boot: the control-state line reads 2 of 2 processors and the FPU format line 1 of 2.
+The record's two bits are told apart in C94-1's boot: the control-state line reads 2 of 2 processors and the FPU format line 1 of 2. All four ran again on `f4c4eb68`, the code after both reviews' answers (the area's floor among them), on the same machines: every line quoted above came back word for word.
 ## Alternatives
 
 | Alternative | For | Against |
