@@ -759,7 +759,10 @@ enum L3 {
     /// Built only by the control's one-line edit and by the host test of the table.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "control C2's table: built by its edit and its host test")
+        expect(
+            dead_code,
+            reason = "control C2's table: built by its edit and its host test"
+        )
     )]
     Node,
 }
@@ -1279,11 +1282,26 @@ fn domain_tree(machine: &Machine, cache_leaf: bool, leaf_1f: bool) -> String {
         levels.push((vec![name], groups));
     };
     add("core", keyed(&|i| u64::from(ids[i] >> threads)));
-    if cache_leaf {
-        add("L2", keyed(&|i| u64::from(ids[i] >> threads)));
+    // The caches: CPUID's (`SMP_CACHE`: the L2 a core's, the L3 a package's) where the guest
+    // reports them, the planted PPTT's (its L2 a core's, its L3 a package's or a node's), and
+    // where both speak, their meet, as the kernel combines them (the review's R97-2).
+    let core_key = |i: usize| u64::from(ids[i] >> threads);
+    let pptt_l3 = |i: usize| match machine.pptt.map(|p| p.l3) {
+        Some(L3::Node) => u64::from(machine.nodes[i]),
+        _ => u64::from(ids[i] >> package_at),
+    };
+    let both = |cpuid: &dyn Fn(usize) -> u64, pptt: &dyn Fn(usize) -> u64| -> Vec<usize> {
+        match (cache_leaf, machine.pptt.is_some()) {
+            (true, true) => keyed(&|i| cpuid(i) << 32 | pptt(i)),
+            (true, false) => keyed(cpuid),
+            (false, _) => keyed(pptt),
+        }
+    };
+    if cache_leaf || machine.pptt.is_some() {
+        add("L2", both(&core_key, &core_key));
         add(
             "last-level cache",
-            keyed(&|i| u64::from(ids[i] >> package_at)),
+            both(&|i| u64::from(ids[i] >> package_at), &pptt_l3),
         );
     }
     if leaf_1f && g.dies > 1 {
@@ -1349,11 +1367,12 @@ fn index_ranges(sorted: &[usize]) -> String {
     out.join(",")
 }
 
-/// The scheduling-domains proof's lines (TASKS item 97): the tree; where its claims came from,
-/// exactly under QEMU's software processor and only its start under KVM, where the host's
-/// processor decides the leaf; that nothing disagreed; and every processor at capacity 1024. With
-/// `-cpu host` QEMU may hand the guest the host's own cache leaves, which `SMP_CACHE` does not
-/// pin, so there only the tree's start is held.
+/// The scheduling-domains proof's lines (TASKS item 97): the tree and where its claims came from,
+/// exactly under QEMU's software processor and only their starts under KVM; that nothing
+/// disagreed; and every processor at capacity 1024. Under KVM the host's processor decides the
+/// guest's cache leaf, and how QEMU encodes `SMP_CACHE` there, or passes the host's own leaves
+/// with `-cpu host`, has not been measured: until a CI run shows the trees, the tree line is held
+/// to its start there (the review's R97-16), and a difference shows in CI's log, not as a failure.
 fn domain_markers(machine: &Machine, settings: &Settings, leaf_1f: bool) -> Vec<String> {
     let n = machine.cpus();
     let leaf = cache_leaf(settings);
@@ -1394,7 +1413,10 @@ fn domain_markers(machine: &Machine, settings: &Settings, leaf_1f: bool) -> Vec<
         order.join(", ")
     );
     vec![
-        if host {
+        // R97-16 (the coordinating session's ruling of 2026-11-21): under KVM the tree line is held
+        // to its start; no KVM tree has been measured yet. The findings and capacity lines below
+        // stay exact under KVM, and every line is exact under QEMU's software processor.
+        if host || settings.accel == Accel::Kvm {
             format!("origin-kernel: domains: {n} processors: ")
         } else {
             tree
@@ -1404,7 +1426,7 @@ fn domain_markers(machine: &Machine, settings: &Settings, leaf_1f: bool) -> Vec<
         } else {
             "origin-kernel: domains: from: caches by ".into()
         },
-        "origin-kernel: domains: 0 claims cut, 0 differing from the PPTT, 0 in no node, 0 recorded nothing; levels crossing: none".into(),
+        "origin-kernel: domains: 0 claims cut, 0 differing from the PPTT, 0 naming another cache level than CPUID, 0 in no node, 0 recorded nothing; levels crossing: none".into(),
         format!(
             "origin-kernel: domains: capacity 1024 on {n} of {n} processors (ADR-0020 S9 source 5: no hardware source is read before TASKS item 106); consistent true"
         ),
@@ -4593,7 +4615,7 @@ fn entry_settings(command: &str, settings: Settings) -> Result<Settings> {
     Ok(settings)
 }
 
-/// `boot-matrix` and its twelve scenario commands: each sets every machine's topology, bridge,
+/// `boot-matrix` and its thirteen scenario commands: each sets every machine's topology, bridge,
 /// reserved memory, ACPI tables, RAM and table shapes itself (the coordinating session's ruling R5
 /// of 2026-11-19; TASKS item 83). The list is of names, so a new scenario command of
 /// `boot-matrix`'s belongs here, by hand; the host test
@@ -9259,6 +9281,25 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
             tree(Topology::Packages, false, true),
             "origin-kernel: domains: 8 processors: last-level cache, package, node 2x4 [0-3|4-7]"
         );
+        // With no cache leaf (an AMD guest under QEMU's software processor) its PPTT alone gives
+        // the caches (the review's R97-2).
+        assert_eq!(
+            tree(Topology::Packages, false, false),
+            "origin-kernel: domains: 8 processors: last-level cache, package, node 2x4 [0-3|4-7]"
+        );
+        // Control C2's PPTT on the SMT machine: an L3 a node, met with CPUID's L3 a package.
+        let mut c2 = machine(&Settings {
+            topology: Topology::Smt,
+            ..Settings::default()
+        });
+        c2.pptt = Some(Pptt {
+            l3: L3::Node,
+            cache_ids: true,
+        });
+        assert_eq!(
+            domain_tree(&c2, true, false),
+            "origin-kernel: domains: 8 processors: core, L2 4x2 [0-1|2-3|4-5|6-7]; last-level cache, node 2x4 [0-3|4-7]; package 1x8 [0-7]"
+        );
         assert_eq!(
             tree(Topology::Plain(1), false, false),
             "origin-kernel: domains: 1 processors: core, package, node 1x1 [0]"
@@ -9332,8 +9373,19 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
                 .map(|x| v.iter().position(|y| y == x).unwrap())
                 .collect()
         };
+        // The last levels, each the third level from the processor's own first cache.
+        let last = |v: &[Option<(u8, u64)>]| -> Vec<usize> {
+            let instances: Vec<Option<u64>> = v
+                .iter()
+                .map(|l| {
+                    assert_eq!(l.map(|(level, _)| level), Some(3));
+                    l.map(|(_, instance)| instance)
+                })
+                .collect();
+            first(&instances)
+        };
         assert_eq!(first(&read.second_level), [0, 1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(first(&read.last_level), [0, 0, 0, 0, 4, 4, 4, 4]);
+        assert_eq!(last(&read.last_level), [0, 0, 0, 0, 4, 4, 4, 4]);
         // Control C3's: the same table without IDs.
         let no_ids = pptt_table(
             &packages,
@@ -9346,7 +9398,7 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
             .unwrap()
             .unwrap();
         assert_eq!((read.caches, read.with_id), (5, 0));
-        assert_eq!(first(&read.last_level), [0, 0, 0, 0, 4, 4, 4, 4]);
+        assert_eq!(last(&read.last_level), [0, 0, 0, 0, 4, 4, 4, 4]);
         // Control C2's on the SMT machine: an L3 a node, the threads of a core sharing its L2.
         let smt = machine(&Settings {
             topology: Topology::Smt,
@@ -9363,7 +9415,7 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
             .unwrap()
             .unwrap();
         assert_eq!(first(&read.second_level), [0, 0, 2, 2, 4, 4, 6, 6]);
-        assert_eq!(first(&read.last_level), [0, 0, 0, 0, 4, 4, 4, 4]);
+        assert_eq!(last(&read.last_level), [0, 0, 0, 0, 4, 4, 4, 4]);
     }
 
     /// The expected topology lines, computed from the `-smp` fields alone: what QEMU's

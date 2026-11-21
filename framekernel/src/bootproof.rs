@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn the_table_has_one_row_per_proof_in_order() {
-        assert_eq!(Proof::ALL.len(), 71);
+        assert_eq!(Proof::ALL.len(), 72);
         for (i, &proof) in Proof::ALL.iter().enumerate() {
             assert_eq!(proof as usize, i, "{proof:?} is out of order");
             assert!(!proof.name().is_empty(), "{proof:?} has no name");
@@ -373,7 +373,7 @@ mod tests {
         assert!(!tally.must_stop());
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 64 of 65 proofs passed; 6 did not run; failed: random-number generator (no randomness)\n"
+            "origin-kernel: boot verdict: degraded: 65 of 66 proofs passed; 6 did not run; failed: random-number generator (no randomness)\n"
         );
     }
 
@@ -424,7 +424,7 @@ mod tests {
     fn the_verdict_of_a_clean_boot_is_exact() {
         assert_eq!(
             verdict(passed_all()),
-            "origin-kernel: boot verdict: 71 of 71 proofs passed\n"
+            "origin-kernel: boot verdict: 72 of 72 proofs passed\n"
         );
     }
 
@@ -436,7 +436,7 @@ mod tests {
         tally.record(Proof::Nvme, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 68 of 71 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
+            "origin-kernel: boot verdict: degraded: 69 of 72 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
         );
     }
 
@@ -447,7 +447,7 @@ mod tests {
         tally.record(Proof::PageTables, true);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 69 did not run\n"
+            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 70 did not run\n"
         );
     }
 
@@ -458,7 +458,7 @@ mod tests {
         tally.record(Proof::Raster, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 70 of 71 proofs passed; failed: rasterizer\n"
+            "origin-kernel: boot verdict: degraded: 71 of 72 proofs passed; failed: rasterizer\n"
         );
     }
 
