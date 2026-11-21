@@ -14,7 +14,11 @@
 //!   free slot.
 //! - **`frame`**: the frame the trap entry may resume, while the context is suspended (a published
 //!   context waits for its first run suspended at its first frame), and 0 while it runs, after it
-//!   ended, and while a withdrawal is under way.
+//!   ended, while a withdrawal is under way, and from its switch-out until its processor publishes
+//!   the frame it left (below).
+//!
+//! Each table also has a **leaving record**: the frame the processor's last switch-out left and
+//! its slot, until the processor publishes it there.
 //!
 //! # What covers a stack, and why no switch uncovers one
 //!
@@ -26,8 +30,9 @@
 //! running thread and one for a suspended one, would not allow that. A switch-out hands a stack
 //! from the first to the second and a switch-in hands one back, so a reader that reads the two in
 //! a fixed order misses one direction. This was T68-2, in the review of TASKS item 68. The `frame`
-//! word still covers a stack a context is suspended on that is not its home: a measured stack
-//! (`origin_frame::stack::with_measured_stack`), or the boot flow's stack.
+//! word, or the leaving record until the frame is published, still covers a stack a context is
+//! suspended on that is not its home: a measured stack (`origin_frame::stack::with_measured_stack`),
+//! or the boot flow's stack.
 //!
 //! # The orderings
 //!
@@ -40,9 +45,9 @@
 //!   takes a given frame: a context withdrawn is never resumed, and one resumed is never
 //!   withdrawn. Nothing else writes a nonzero frame to 0. A frame is written into a slot whose
 //!   `frame` is 0 only by a claimer that has just taken it while free, or by this processor's
-//!   switch-out of the context it runs (`current`); a context being withdrawn never ran, so it
-//!   was never `current`, and no switch-out writes its slot (the review of TASKS items 75, 77
-//!   and 81, R75-3).
+//!   publication of the frame its switch-out of the running context (`current`) left; a context
+//!   being withdrawn never ran, so it was never `current`, and no publication writes its slot
+//!   (the review of TASKS items 75, 77 and 81, R75-3).
 //! - A home leaves the table by a Release store of 0, in one of two ways:
 //!   - **retired** on the context's own processor, only after that processor has left the stack
 //!     ([`Contexts::retire_ended`]);
@@ -97,8 +102,43 @@
 //!   plain stores and read-modify-writes gets that C++20 check before the code changes for it.
 //! - A retirement with nothing ended costs one plain load (T70-2), so a tick that switches
 //!   nothing executes no locked instruction.
-//! - [`Contexts::covers`]: any processor. It never waits and takes no lock, so a stack may still
-//!   be dropped under any lock.
+//! - [`Contexts::publish_leaving`]: this processor only, **with interrupts off**, as a
+//!   retirement. `switch` calls it first; a stack's drop calls it beside its retirement. A
+//!   publication interrupted between its two stores by a switch would then clear the record that
+//!   switch wrote, and the frame it named would never be published: its context lost.
+//! - [`Contexts::covers`]: any processor. It never waits and takes no lock. A scan of every
+//!   processor's table goes through [`Moves::scan`], which may wait once for the move gate, with
+//!   interrupts off, after its fast passes: so a stack may still be dropped under any lock but
+//!   the move gate, and a mover holding the gate drops none.
+//! - [`Moves::relocate`], or [`Moves::begin`] with [`Contexts::lend`], [`Contexts::adopt`] and
+//!   [`Lent::restore`] or [`Adopted::forget`]: a mover, on any processor, with both queue locks
+//!   held and interrupts off, lending only a thread its source queue says is ready
+//!   ([`Moves::relocate`], "What the caller must hold").
+//!
+//! # A frame is published only after its processor has left the stack (ADR-0020 S5)
+//!
+//! A switch-out's frame lies on the stack the trap entry is still running on: after
+//! [`Contexts::switch`] returns, the entry returns along that stack, and only then loads the
+//! incoming frame's stack pointer (`origin_frame::cpu`, `exception_saved`: `call dispatch`, then
+//! `mov rsp, rax`). Once another processor may resume a frame, that frame must not be resumable
+//! before its processor has left the stack, or two processors would run on one stack. So
+//! `switch` does not store the outgoing frame in its slot: it records it, with its slot, as
+//! **leaving**, and the processor publishes it ([`Contexts::publish_leaving`]) at its next call
+//! into the table, which runs on another stack: the top of its next `switch`, before `next` is
+//! taken (so a switch straight back to that context finds it), or a stack's drop, which runs on
+//! the processor's current context. Until it is published nobody can take the frame, this
+//! processor included; this processor's own next switch publishes it before it takes anything.
+//!
+//! - **Publication** stores the frame in its slot (Release), then clears the record (Release).
+//!   Only this processor writes the record, with interrupts off, and never from a handler that
+//!   can interrupt a switch: an NMI, a machine check, a debug exception or a double fault.
+//! - **A reader** ([`Contexts::covers`]) reads the record (Acquire) before the slots. One that
+//!   finds the record clear has read the clear or a later value, so it sees the store into the
+//!   slot that came before the clear, or a later value of that slot. One that finds a frame there
+//!   covers the stack that frame is on. So no frame is missed between the two stores.
+//! - **The cost:** one plain load at each call with nothing leaving; when a frame is published,
+//!   two plain stores, on lines the processor owns; the switch-out writes two words of the record
+//!   where it wrote one into the slot.
 //!
 //! # The stack a processor names for ring 3 (TASKS item 77)
 //!
@@ -110,14 +150,89 @@
 //! table, not the scheduler, says whose frame was resumed. [`Contexts::running_home`] reads the
 //! same home back for the entry's check that an entry from ring 3 landed on it.
 //!
-//! # A context never moves between processors
+//! # Moves between processors (ADR-0020 S4)
 //!
-//! A frame is resumed only by the processor whose table holds it, and the frames a context saves
-//! later are recorded in that same table, so a context stays on the processor it was published
-//! to. Nothing moves a thread today. A future move (CLAUDE.md §26, load balancing) must claim the
-//! context's home in the new processor's table before it retires the home in the old one, so that
-//! the stack is never uncovered, and it must be shown under a Loom model of its own. A move that
-//! retires first, or that moves only the frame, reopens the gap this table closes.
+//! A context moves from one processor's table (the **source**) to another's (the
+//! **destination**) by three operations, in this order, under the machine's move gate
+//! ([`Moves`]). `lend` and `adopt` take a witness that the gate is held ([`Moving`]); each step
+//! hands the next a token it consumes ([`Lent`], then [`Adopted`]), so a frame is adopted at most
+//! once, never both adopted and restored, and a home is forgotten only after an adoption:
+//!
+//! 1. [`Contexts::lend`], on the source: takes the frame of a suspended context by the same
+//!    compare-and-swap a switch or a withdrawal makes, so at most one of them takes it. The home
+//!    stays, so the stack stays covered here.
+//! 2. [`Contexts::adopt`], on the destination: claims a free slot with the home and stores the
+//!    frame (Release), as a publication does. From here the destination may resume it. If the
+//!    destination is full, [`Lent::restore`] puts the frame back in its source slot instead.
+//! 3. [`Adopted::forget`], on the source: clears the home (Release).
+//!
+//! [`Moves::relocate`] runs the three in that order, with the caller's own work between `adopt`
+//! and `forget`. So the home is claimed in the destination before it is retired in the source:
+//! claim before retire. That alone does not stop a reader from missing it: a scan of every
+//! table that reads the destination before the claim and the source after the clear finds the
+//! home in neither (ADR-0020 N4 (a)).
+//!
+//! **The move sequence closes that.** Two machine-wide counters, both raised by
+//! read-modify-writes under the gate: **begun**, before `lend`; **finished**, with Release, after
+//! `forget` or `restore`. A scan ([`Moves::scan`]) reads finished, then begun (Acquire), makes its
+//! pass, and reads begun again. A pass that found what it asked about is believed. One that found
+//! nothing is believed only if the first two readings are equal and the third equals them;
+//! otherwise it tries again. Why that is enough, in outline (Loom decides it, in
+//! `models::moves`):
+//!
+//! - A pass that misses a moving home read the source's home word after the move's `forget`: the
+//!   forget's store of 0, or a later write to the word. Every write to a home word happens after
+//!   the write before it, and is a Release store or a compare-and-swap: a claim's
+//!   compare-and-swap reads the word it replaces; a withdrawal follows its own claim; a
+//!   retirement follows its switch's take of a frame stored after the claim; a forget follows a
+//!   lend's take of a frame stored after the claim or adoption. So the pass's Acquire load of any
+//!   value from the forget on happens after the forget, and the move's raise of begun, sequenced
+//!   before the forget, happens before the scan's last reading of begun, which therefore counts
+//!   it. (A first draft of this outline said every later write was in the forget's release
+//!   sequence; a plain store is not, but the ordering above holds; the review of TASKS item 95,
+//!   R95-6.)
+//! - If the scan's first reading of begun did not count that raise, the last reading differs from
+//!   it. If it did, the reading of finished before it must have counted the same move's finish,
+//!   or the two differ: and a reading that counts the finish (Release) sees everything the move
+//!   did before it, the destination's claim included, so the pass would have found the home
+//!   there, or wherever a later move took it, which raised begun again. What this needs is that
+//!   finished is raised after `adopt` (or `restore`); where it falls against `forget` does not
+//!   matter. That is why ADR-0020 S4's control for MV4, finished raised before `forget`, is not a
+//!   bug, and no model catches it (S4's dated note of 2026-11-21); finished raised before `adopt`
+//!   is one, and MV4 catches it.
+//! - Begun is raised before `lend` (not only before `adopt`; the coordinating session's ruling on
+//!   Q2 of TASKS item 95), so a pass that reads the source's frame word after `lend` has taken it
+//!   also counts the move. That covers a suspended frame on a stack that is not its home, which
+//!   is in no `frame` word between `lend` and `adopt`. ADR-0020 S2 keeps such contexts from
+//!   moving, and the sequence covers them anyway.
+//! - One counter whose parity says "a move is under way" is not enough: two moves begun at once
+//!   leave it even. With the gate taken first, moves do not overlap, and the two counters say
+//!   whether one began or finished during the pass.
+//!
+//! **A scan always ends.** After [`FAST_TRIES`] passes that each overlapped a move, the scan makes
+//! one last pass under the gate, with interrupts off ([`Quiet`]): no move is then under way, and
+//! every move that finished before it released the gate is visible to it. So a scan ends after
+//! at most `FAST_TRIES + 1` passes and one wait for the gate. The gate is a ticket lock, which
+//! serves its waiters in the order they came, and each processor holds at most one ticket at a
+//! time, with interrupts off: so that wait is at most one critical section for each other
+//! processor waiting ahead of it, whatever the rate of moves. (A test-and-set lock would let a
+//! waiter lose to every newcomer in turn; ADR-0020 S4's "one move's critical section" holds only
+//! when no other processor waits for the gate; the review of TASKS item 95, R95-2.) Loom cannot
+//! show the wait ends: an execution that spins past its bound is not explored further. The lock
+//! order is always queue locks, then the gate: a mover holds both queue locks first, and a
+//! scanner may hold one (a stack dropped under it).
+//!
+//! **Begun is Relaxed.** Nothing reads it to learn what came before it: the scan's argument above
+//! rests on happens-before carried by the forget's Release store (or a later write to the home
+//! word, each ordered after it) and by finished's Release, with begun sequenced before both.
+//! Finished is raised with Release, and every reading is Acquire, which on x86-64 is a plain load.
+//! Each counter's raise is one `lock xadd` per move.
+//!
+//! **What a move does not touch.** `current` and `ended` are this processor's; a lent context is
+//! neither (it is suspended), and the leaving record names only a frame not yet in its slot,
+//! which `lend` refuses ([`LendRefused::Leaving`]). The boot or idle flow never moves
+//! ([`LendRefused::BootFlow`]; ADR-0020 S2, point 4). [`Contexts::withdraw`] keeps its meaning:
+//! only a spawner calls it, for a context it never queued, which was never moved.
 //!
 //! # Capacity
 //!
@@ -129,6 +244,12 @@
 //! is 17 of 32. If a table were ever full, [`Contexts::publish`] returns `false`, and the kernel
 //! refuses the spawn. A boot flow's first switch-out that found no slot would be refused by
 //! [`Contexts::switch`] with [`Refused::Full`], and the trap entry halts.
+//!
+//! **Moves** (ADR-0020 S4, N13). A context being moved holds a slot in both tables from its
+//! `adopt` to its `forget`. The mover adopts only after it has found a free slot in the
+//! destination's run queue, under that queue's lock, and holds both queue locks until the source's
+//! `forget`, so neither table holds more than its queue's contexts, one ended, and spawns in
+//! flight. A destination that is full all the same refuses the adoption ([`AdoptRefused::Full`]).
 //!
 //! **Spawns in flight** (TASKS item 75; the review of TASKS items 75, 77 and 81, R75-2). A spawn
 //! publishes before it queues, so the table also holds, for a moment, every spawn to this
@@ -222,6 +343,14 @@ pub struct Contexts {
     current: prim::AtomicUsize,
     /// The slot of a context that ended and whose home is not yet retired, or `NONE`.
     ended: prim::AtomicUsize,
+    /// The frame of the context this processor last switched out, while it is not yet
+    /// published in its slot, or 0 (ADR-0020 S5; the module documentation, "A frame is
+    /// published only after its processor has left the stack"). Written only by this
+    /// processor, with interrupts off; read by any processor.
+    leaving: prim::AtomicU64,
+    /// The slot that frame belongs to. Written and read only by this processor, with
+    /// interrupts off.
+    leaving_slot: prim::AtomicUsize,
 }
 
 impl core::fmt::Debug for Contexts {
@@ -257,6 +386,8 @@ impl Contexts {
             slots: [const { Context::new() }; SLOTS],
             current: prim::AtomicUsize::new(NONE),
             ended: prim::AtomicUsize::new(NONE),
+            leaving: prim::AtomicU64::new(0),
+            leaving_slot: prim::AtomicUsize::new(NONE),
         }
     }
 
@@ -267,6 +398,8 @@ impl Contexts {
             slots: core::array::from_fn(|_| Context::new()),
             current: prim::AtomicUsize::new(NONE),
             ended: prim::AtomicUsize::new(NONE),
+            leaving: prim::AtomicU64::new(0),
+            leaving_slot: prim::AtomicUsize::new(NONE),
         }
     }
 
@@ -315,14 +448,16 @@ impl Contexts {
     /// What the trap entry resumes after a scheduler upcall, which the scheduler answered with
     /// `next` for the context interrupted at `here`. This processor only, interrupts off.
     ///
-    /// First it retires a context that ended earlier ([`Self::retire_ended`]). Unless `next`
-    /// is `here`, `next` must be a frame saved in this table. It is taken, so it cannot be resumed
-    /// twice, and its context becomes the running one. The context that was running keeps its
-    /// home and saves `here` as its frame, or, if `exiting`, is recorded as ended and saves
-    /// nothing. The boot or idle flow's first switch-out claims a slot for it. No `home` is
-    /// written. The answer carries the incoming context's home, read from the slot whose frame
-    /// was taken, which the trap entry names as the stack ring 3 lands on (TASKS item 77); with
-    /// nothing switched it carries none.
+    /// First it publishes the frame its last switch-out left ([`Self::publish_leaving`]), and
+    /// retires a context that ended earlier ([`Self::retire_ended`]). Unless `next` is `here`,
+    /// `next` must be a frame saved in this table. It is taken, so it cannot be resumed twice, and
+    /// its context becomes the running one. The context that was running keeps its home and
+    /// leaves `here` as its frame, which is published only at this processor's next call into the
+    /// table (ADR-0020 S5), or, if `exiting`, is recorded as ended and saves nothing. The boot or
+    /// idle flow's first switch-out claims a slot for it. No `home` is written. The answer carries
+    /// the incoming context's home, read from the slot whose frame was taken, which the trap
+    /// entry names as the stack ring 3 lands on (TASKS item 77); with nothing switched it carries
+    /// none.
     ///
     /// `running_on(address)` says whether this processor runs on the stack holding `address`.
     pub fn switch(
@@ -332,6 +467,9 @@ impl Contexts {
         exiting: bool,
         running_on: impl Fn(u64) -> bool,
     ) -> Result<Switched, Refused> {
+        // Before `next` is taken: a context switched out by the last switch, and switched back
+        // to now, is in its slot again to be taken.
+        self.publish_leaving();
         self.retire_ended(running_on)?;
         if next == here {
             return Ok(Switched {
@@ -365,13 +503,15 @@ impl Contexts {
             Some(_) if exiting => {
                 let _ = self.ended.swap(outgoing, AcqRel);
             }
-            Some(slot) => slot.frame.store(here, Release),
+            Some(_) => self.record_leaving(outgoing, here),
             // The boot or idle flow, switched out for the first time; it never ends.
             None if exiting => {}
             None => {
-                if !self.slots.iter().any(|slot| slot.claim(BOOT_FLOW, here)) {
+                // Its slot is claimed with no frame, which it leaves like any other.
+                let Some(slot) = self.slots.iter().position(|slot| slot.claim(BOOT_FLOW, 0)) else {
                     return Err(Refused::Full);
-                }
+                };
+                self.record_leaving(slot, here);
             }
         }
         self.current.store(incoming, Relaxed);
@@ -421,10 +561,47 @@ impl Contexts {
         Ok(())
     }
 
+    /// Records `frame` as the frame the context in slot `slot` leaves: published in that slot
+    /// only at this processor's next call into the table ([`Self::publish_leaving`]). This
+    /// processor only, interrupts off, in its switch, which has just published the previous one.
+    #[inline]
+    fn record_leaving(&self, slot: usize, frame: u64) {
+        self.leaving_slot.store(slot, Relaxed);
+        self.leaving.store(frame, Release);
+    }
+
+    /// Publishes the frame this processor's last switch-out left, if it has not been: the frame
+    /// is stored in its context's slot (Release), where it may be resumed, and only then is the
+    /// leaving record cleared (Release), so a reader that finds the record clear finds the frame
+    /// in the slot (ADR-0020 S5). This processor only, with interrupts off, at a call into the
+    /// table that runs after the switch-out has left the stack the frame is on: the top of the
+    /// next [`Self::switch`], or a caller such as a stack's drop. Never from a handler that can
+    /// interrupt a switch (an NMI, a machine check, a debug exception or a double fault). With
+    /// nothing leaving it costs one plain load.
+    #[inline]
+    pub fn publish_leaving(&self) {
+        // Only this processor writes `leaving`: a plain load sees its own last write.
+        let frame = self.leaving.load(Relaxed);
+        if frame == 0 {
+            return;
+        }
+        if let Some(slot) = self.slots.get(self.leaving_slot.load(Relaxed)) {
+            slot.frame.store(frame, Release);
+        }
+        self.leaving.store(0, Release);
+    }
+
     /// Whether any context's home or saved frame lies in `[low, top)`: a stack a context of this
     /// processor may still use. Any processor may ask. It never waits.
+    ///
+    /// The leaving record is read before the slots: a frame published between the two reads is
+    /// in the slot by the time the slot is read, since the reader that finds the record clear
+    /// sees the store into the slot that came before the clear (ADR-0020 S5).
     pub fn covers(&self, low: u64, top: u64) -> bool {
         let inside = |at: u64| at >= low && at < top;
+        if inside(self.leaving.load(Acquire)) {
+            return true;
+        }
         self.slots
             .iter()
             .any(|slot| inside(slot.home.load(Acquire)) || inside(slot.frame.load(Acquire)))
@@ -434,6 +611,557 @@ impl Contexts {
 impl Default for Contexts {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Why [`Contexts::lend`] refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LendRefused {
+    /// The frame is the one this table's processor last switched out, not yet published: it
+    /// may still be returning along the frame's stack (ADR-0020 S5). Try later.
+    Leaving,
+    /// The frame is the boot or idle flow's, which never moves (ADR-0020 S2, point 4).
+    BootFlow,
+    /// No slot holds the frame suspended: it is 0 or [`BOOT_FLOW`], was never saved here, was
+    /// taken already (resumed, withdrawn or lent), or has not been switched out yet.
+    NotHere,
+}
+
+/// Why [`Contexts::adopt`] refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdoptRefused {
+    /// The destination table has no free slot.
+    Full,
+    /// The destination is the table the frame was lent from.
+    SameTable,
+}
+
+/// Why [`Moves::relocate`] moved nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveRefused {
+    /// The source would not lend the frame; nothing was taken.
+    Lend(LendRefused),
+    /// The destination would not adopt it; the frame is back in its source slot, resumable
+    /// there as before.
+    Adopt(AdoptRefused),
+    /// The destination would not adopt it, and the frame could not be put back: its slot's
+    /// frame word was no longer 0. Nothing in the protocol writes it while the frame is lent,
+    /// so this is an inconsistency, and the context cannot be resumed (ADR-0020 S20).
+    NotRestored,
+}
+
+/// How many passes [`Moves::scan`] makes with no lock before it makes one under the move gate
+/// (ADR-0020 S4: at most four tries on the fast path, then one under the gate).
+#[cfg(not(all(test, loom)))]
+pub const FAST_TRIES: u32 = 4;
+/// The Loom models' count: two, so that a model can make both fast tries miss with three moves
+/// (TASKS item 95, the coordinating session's ruling on Q12). Nothing in the code depends on the
+/// count; the host test `a_scan_makes_its_fast_passes_then_one_under_the_gate` shows the
+/// kernel's four and one.
+#[cfg(all(test, loom))]
+pub const FAST_TRIES: u32 = 2;
+
+/// Runs a closure with interrupts off on the calling processor. [`Moves::scan`] takes the move
+/// gate inside it: a mover holds the gate with interrupts off, and may be an interrupt handler
+/// of the scanner's own processor, so a scanner holding the gate with interrupts on could be
+/// interrupted by a mover that then spins on it for ever. The kernel implements it with
+/// `cpu::without_interrupts`.
+pub trait Quiet {
+    /// Runs `f` with interrupts off, and restores their state after.
+    fn quietly<R>(&self, f: impl FnOnce() -> R) -> R;
+}
+
+/// What [`Moves::scan`] answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scanned {
+    /// Whether the pass found what it looked for.
+    pub covered: bool,
+    /// How many passes it made: at most [`FAST_TRIES`] with no lock, then one under the gate.
+    pub passes: u32,
+}
+
+impl Scanned {
+    /// Whether the last pass was made under the move gate.
+    pub fn gated(&self) -> bool {
+        self.passes > FAST_TRIES
+    }
+}
+
+/// The move gate: a ticket lock, so that whoever waits for it is served in the order it came
+/// (the review of TASKS item 95, R95-2). A test-and-set lock lets a waiter lose to every newcomer
+/// in turn, so a scan's last pass could wait as long as moves keep coming. Each processor holds at
+/// most one ticket at a time, with interrupts off, so a waiter waits for at most one critical
+/// section per other processor, whatever the rate of moves.
+struct Gate {
+    /// The next ticket to hand out.
+    next: prim::AtomicU32,
+    /// The ticket allowed in.
+    serving: prim::AtomicU32,
+}
+
+/// Holding the gate: dropping it lets the next ticket in (Release).
+struct GateGuard<'g> {
+    gate: &'g Gate,
+    ticket: u32,
+}
+
+impl Gate {
+    #[cfg(not(all(test, loom)))]
+    const fn new() -> Self {
+        Self {
+            next: prim::AtomicU32::new(0),
+            serving: prim::AtomicU32::new(0),
+        }
+    }
+
+    #[cfg(all(test, loom))]
+    fn new() -> Self {
+        Self {
+            next: prim::AtomicU32::new(0),
+            serving: prim::AtomicU32::new(0),
+        }
+    }
+
+    /// Takes a ticket and waits for its turn. The Acquire load that sees the turn reads the last
+    /// holder's Release store, so everything the holders before did is visible.
+    fn lock(&self) -> GateGuard<'_> {
+        let ticket = self.next.fetch_add(1, Relaxed);
+        while self.serving.load(Acquire) != ticket {
+            prim::spin_loop();
+        }
+        GateGuard { gate: self, ticket }
+    }
+
+    /// Whether nobody holds or waits for the gate: for the host tests.
+    #[cfg(all(test, not(loom)))]
+    fn is_free(&self) -> bool {
+        self.next.load(Relaxed) == self.serving.load(Relaxed)
+    }
+}
+
+impl Drop for GateGuard<'_> {
+    fn drop(&mut self) {
+        self.gate
+            .serving
+            .store(self.ticket.wrapping_add(1), Release);
+    }
+}
+
+/// The machine's move sequence (ADR-0020 S4): the move gate and the two counters, **begun** and
+/// **finished**. The module documentation, "Moves between processors", says what each is for.
+pub struct Moves {
+    /// Held by a move from before its `lend` to after its `forget`, with interrupts off, after
+    /// both queue locks; whoever holds it takes no other lock and drops no stack. A scan's last
+    /// pass holds it too.
+    gate: Gate,
+    /// Raised by each move, under the gate, before its `lend`.
+    begun: prim::AtomicU64,
+    /// Raised by each move (Release), under the gate, after its `forget` or `restore`.
+    finished: prim::AtomicU64,
+}
+
+impl core::fmt::Debug for Moves {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Moves")
+    }
+}
+
+impl Moves {
+    /// No move made yet.
+    #[cfg(not(all(test, loom)))]
+    pub const fn new() -> Self {
+        Self {
+            gate: Gate::new(),
+            begun: prim::AtomicU64::new(0),
+            finished: prim::AtomicU64::new(0),
+        }
+    }
+
+    /// No move made yet.
+    #[cfg(all(test, loom))]
+    pub fn new() -> Self {
+        Self {
+            gate: Gate::new(),
+            begun: prim::AtomicU64::new(0),
+            finished: prim::AtomicU64::new(0),
+        }
+    }
+
+    /// Begins a move: takes the gate, then raises begun. The caller already holds the source's
+    /// and the destination's queue locks, with interrupts off, and takes no other lock, and drops
+    /// no stack, until the move ends, when the [`Moving`] is dropped: a stack's drop scans, and a
+    /// scan's last pass waits for the gate, which this move holds.
+    ///
+    /// Interrupts must be off from before the ticket is taken, not only once the gate is held: the
+    /// gate serves its tickets in order, so an interrupt on this processor that takes a later
+    /// ticket for a scan's last pass would wait, with interrupts off, for this caller, which
+    /// cannot run again until it returns; and every later holder of the gate would wait behind
+    /// it (the delta review of TASKS item 95, D95-3). Nothing here checks it: S3's
+    /// interrupts-off witness, which TASKS items 93 and 96 bring, is to be required here (R95-12).
+    pub fn begin(&self) -> Moving<'_> {
+        Moving {
+            moves: self,
+            _gate: self.enter(),
+        }
+    }
+
+    /// Moves the context suspended at `frame` from `source` to `destination`, in the order
+    /// ADR-0020 S4 sets: under the gate, `lend` from the source, `adopt` into the destination (or
+    /// `restore` and give up), `between` with the context's home, then `forget` in the source.
+    /// So the home is in the source's table until the destination's holds it. `between` is where
+    /// the caller passes the thread's run-queue entry and record (ADR-0020 S6); it runs under the
+    /// gate, so it takes no lock and drops no stack.
+    ///
+    /// **What the caller must hold** (TASKS item 96; the review of TASKS item 95, R95-5): both
+    /// queue locks, from before this call until after it, with interrupts off; and the thread must
+    /// be ready in the source's queue, not its current one, under that lock. Then the source's
+    /// scheduler cannot have named `frame` as the next frame to resume, which it does under its
+    /// queue lock before its switch takes the frame: so the source's switch never races the move
+    /// for the frame, and never finds it gone, which halts the kernel (`Refused::NeverSaved`). It
+    /// must also have found a free slot in the destination's run queue, under that lock (N13).
+    pub fn relocate<R>(
+        &self,
+        source: &Contexts,
+        destination: &Contexts,
+        frame: u64,
+        between: impl FnOnce(u64) -> R,
+    ) -> Result<(u64, R), MoveRefused> {
+        let moving = self.begin();
+        let lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
+        let adopted = match destination.adopt(&moving, lent) {
+            Ok(adopted) => adopted,
+            Err((refused, lent)) => {
+                return if lent.restore() {
+                    Err(MoveRefused::Adopt(refused))
+                } else {
+                    Err(MoveRefused::NotRestored)
+                };
+            }
+        };
+        let home = adopted.home();
+        let value = between(home);
+        adopted.forget();
+        drop(moving);
+        Ok((home, value))
+    }
+
+    /// Scans every table with `pass`, which answers whether some table covers what the caller
+    /// asks about, and does not let a move hide a home from it (ADR-0020 S4).
+    ///
+    /// A pass that finds it is believed at once: what it read was there. One that finds nothing
+    /// is believed only if no move began or finished across it: finished, then begun, read before
+    /// the pass, equal, and begun read again after it unchanged. Otherwise the scan tries again,
+    /// at most [`FAST_TRIES`] times, and then makes one last pass under the move gate, inside
+    /// `quiet`, with no move under way. So it ends after at most `FAST_TRIES + 1` passes and one
+    /// wait for the gate, during which at most one critical section per other processor runs
+    /// before it, whatever the rate of moves (the gate serves its waiters in order).
+    ///
+    /// The caller may hold a queue lock, which a mover takes before the gate: the order is
+    /// always queue locks, then the gate. It must not hold the gate itself: a mover that dropped a
+    /// stack would wait here for its own gate.
+    pub fn scan(&self, pass: impl Fn() -> bool, quiet: &impl Quiet) -> Scanned {
+        let mut passes = 0;
+        while passes < FAST_TRIES {
+            passes += 1;
+            let readings = self.readings();
+            if pass() {
+                return Scanned {
+                    covered: true,
+                    passes,
+                };
+            }
+            if self.settled(readings) {
+                return Scanned {
+                    covered: false,
+                    passes,
+                };
+            }
+        }
+        let covered = quiet.quietly(|| {
+            let _gate = self.gate.lock();
+            pass()
+        });
+        Scanned {
+            covered,
+            passes: FAST_TRIES + 1,
+        }
+    }
+
+    // The move sequence: every raise and every read of the two counters is in the four functions
+    // below (the module documentation, "Moves between processors", says why each ordering is
+    // enough).
+
+    /// A move's start: the gate, then begun.
+    fn enter(&self) -> GateGuard<'_> {
+        let gate = self.gate.lock();
+        let _ = self.begun.fetch_add(1, Relaxed);
+        gate
+    }
+
+    /// A move's end, before the gate is released: finished, with Release.
+    fn raise_finished(&self) {
+        let _ = self.finished.fetch_add(1, Release);
+    }
+
+    /// What a scan reads before its pass: finished, then begun.
+    fn readings(&self) -> (u64, u64) {
+        (self.finished.load(Acquire), self.begun.load(Acquire))
+    }
+
+    /// Whether a pass that found nothing can be believed: no move was under way when it began
+    /// (finished and begun equal), and none began during it (begun unchanged).
+    fn settled(&self, (finished, begun): (u64, u64)) -> bool {
+        finished == begun && self.begun.load(Acquire) == begun
+    }
+}
+
+impl Default for Moves {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A move under way: holding it is holding the move gate ([`Moves::begin`]). Dropping it raises
+/// finished (Release), then releases the gate, also when a panic unwinds through it. On the
+/// kernel a panic under the gate halts the machine anyway (its panic policy), so this matters to
+/// the host tests and the models, not to recovery.
+///
+/// It is a witness only of holding a gate: that the caller holds both queue locks with
+/// interrupts off is its documented duty, not checked here (the review of TASKS item 95, R95-12).
+///
+/// Safe code can leak it (`core::mem::forget`), and the types do not stop that: the gate then
+/// stays held and begun stays ahead of finished, so every later scan's last pass waits for ever
+/// with interrupts off. Nothing in the kernel may forget one (the delta review, D95-5).
+#[must_use = "a move holds the gate until this is dropped"]
+pub struct Moving<'m> {
+    moves: &'m Moves,
+    /// Dropped after `Drop::drop` has raised finished.
+    _gate: GateGuard<'m>,
+}
+
+impl Drop for Moving<'_> {
+    fn drop(&mut self) {
+        self.moves.raise_finished();
+    }
+}
+
+impl core::fmt::Debug for Moving<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Moving")
+    }
+}
+
+/// A frame taken from its slot by [`Contexts::lend`], under a [`Moving`] it borrows. It is
+/// settled in one of two ways, each of which consumes it: [`Contexts::adopt`] records it in the
+/// destination and gives back an [`Adopted`], whose `forget` clears the home in the source; or
+/// [`Lent::restore`] puts the frame back in its slot. One dropped unsettled restores itself. So a
+/// frame is never adopted twice, nor adopted and restored, and a home is forgotten only after an
+/// adoption (the review of TASKS item 95, R95-1). Its `Debug` writes its name alone: its words
+/// are addresses in the kernel stacks' region.
+///
+/// Leaking it (`core::mem::forget`), which safe code can, loses its context: the frame is in no
+/// slot, and nothing will put it back. Nothing in the kernel may forget one (the delta review,
+/// D95-5).
+///
+/// What the types refuse to compile:
+///
+/// ```compile_fail,E0382
+/// use origin_sync::contexts::{Contexts, Moves};
+/// let (source, a, b, moves) = (Contexts::new(), Contexts::new(), Contexts::new(), Moves::new());
+/// let moving = moves.begin();
+/// let lent = source.lend(&moving, 0x1_0000).unwrap();
+/// let _ = a.adopt(&moving, lent);
+/// let _ = b.adopt(&moving, lent); // adopted twice: `lent` was moved
+/// ```
+///
+/// ```compile_fail,E0599
+/// use origin_sync::contexts::{Contexts, Moves};
+/// let (source, moves) = (Contexts::new(), Moves::new());
+/// let moving = moves.begin();
+/// let lent = source.lend(&moving, 0x1_0000).unwrap();
+/// lent.forget(); // a home forgotten with no adoption: no such method
+/// ```
+///
+/// ```compile_fail,E0505
+/// use origin_sync::contexts::{Contexts, Moves};
+/// let (source, moves) = (Contexts::new(), Moves::new());
+/// let moving = moves.begin();
+/// let lent = source.lend(&moving, 0x1_0000).unwrap();
+/// drop(moving); // the move ended with the frame still lent
+/// let _ = lent.restore();
+/// ```
+#[must_use = "a lent frame is in no slot until it is adopted or restored"]
+pub struct Lent<'t> {
+    table: &'t Contexts,
+    slot: usize,
+    home: u64,
+    frame: u64,
+    /// Whether it was adopted or restored, so its drop does nothing more.
+    settled: bool,
+}
+
+impl core::fmt::Debug for Lent<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Lent")
+    }
+}
+
+impl Lent<'_> {
+    /// The lent context's home.
+    pub fn home(&self) -> u64 {
+        self.home
+    }
+
+    /// The lent frame.
+    pub fn frame(&self) -> u64 {
+        self.frame
+    }
+
+    /// Puts the frame back in its slot, after a refused `adopt`: a compare-and-swap of the slot's
+    /// frame word from 0, so it is resumable at its source again. `false` if the word was not 0,
+    /// which nothing in the protocol does while the frame is lent.
+    pub fn restore(mut self) -> bool {
+        self.settled = true;
+        self.put_back()
+    }
+
+    fn put_back(&self) -> bool {
+        self.table.slots.get(self.slot).is_some_and(|slot| {
+            slot.frame
+                .compare_exchange(0, self.frame, AcqRel, Acquire)
+                .is_ok()
+        })
+    }
+}
+
+impl Drop for Lent<'_> {
+    /// Puts an unsettled frame back in its slot. That cannot fail while the protocol holds (see
+    /// [`Lent::restore`]); if it did, the context would be in no table and could never run again,
+    /// so a debug build stops at once rather than lose it unseen (the delta review of TASKS item
+    /// 95, D95-4). A release build has no panic to stop with (the no-panic check): `relocate`
+    /// settles every frame it lends itself, and answers [`MoveRefused::NotRestored`] there.
+    fn drop(&mut self) {
+        if !self.settled {
+            let put_back = self.put_back();
+            debug_assert!(put_back, "a lent frame could not be put back in its slot");
+        }
+    }
+}
+
+/// A context adopted by its destination ([`Contexts::adopt`]), whose home is still in its source
+/// until [`Adopted::forget`]: dropping it forgets too, since the destination holds the context.
+/// Its `Debug` writes its name alone, as [`Lent`]'s does. Leaking it (`core::mem::forget`) leaves
+/// the home in the source for ever, a slot no context will free (N13) and a stack no scan will
+/// give back. Nothing in the kernel may forget one (the delta review of TASKS item 95, D95-5).
+#[must_use = "an adopted context's home stays in its source until it is forgotten"]
+pub struct Adopted<'t> {
+    source: &'t Contexts,
+    slot: usize,
+    home: u64,
+}
+
+impl core::fmt::Debug for Adopted<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Adopted")
+    }
+}
+
+impl Adopted<'_> {
+    /// The moved context's home.
+    pub fn home(&self) -> u64 {
+        self.home
+    }
+
+    /// Clears the home in the source, now that the destination holds the context (its drop).
+    pub fn forget(self) {}
+}
+
+impl Drop for Adopted<'_> {
+    /// The forget: a Release store of 0 to the source slot's home, so a reader that no longer
+    /// finds it there has read that store or a later write to the word, each ordered after it,
+    /// and so sees the move's raise of begun (the module documentation, "Moves between
+    /// processors"). The slot is free for a new claim.
+    fn drop(&mut self) {
+        if let Some(slot) = self.source.slots.get(self.slot) {
+            slot.home.store(0, Release);
+        }
+    }
+}
+
+impl Contexts {
+    /// Takes the frame `frame` of a suspended context of this table for a move, under the move
+    /// gate (`moving`): the same compare-and-swap of the frame word from the frame to 0 that a
+    /// switch or a withdrawal makes, so at most one of them takes it (ADR-0020 S4). The home
+    /// stays, so the stack stays covered here until the move's [`Adopted::forget`].
+    ///
+    /// The leaving record is read first: a frame not yet published is refused as
+    /// [`LendRefused::Leaving`], and one published meanwhile is in its slot by the time the
+    /// slots are read (the publication stores the slot before it clears the record).
+    pub fn lend<'t>(
+        &'t self,
+        _moving: &'t Moving<'_>,
+        frame: u64,
+    ) -> Result<Lent<'t>, LendRefused> {
+        if frame <= BOOT_FLOW {
+            return Err(LendRefused::NotHere);
+        }
+        if self.leaving.load(Acquire) == frame {
+            return Err(LendRefused::Leaving);
+        }
+        for (slot, context) in self.slots.iter().enumerate() {
+            if context.frame.load(Relaxed) != frame {
+                continue;
+            }
+            // The boot or idle flow's slot keeps `BOOT_FLOW` for the table's life.
+            if context.home.load(Acquire) == BOOT_FLOW {
+                return Err(LendRefused::BootFlow);
+            }
+            // The take. While the frame word is not 0 no home is cleared: a retirement clears
+            // only an ended context's, a withdrawal takes the frame first, and a forget follows
+            // a lend; so the home read after it is this context's.
+            if context
+                .frame
+                .compare_exchange(frame, 0, AcqRel, Acquire)
+                .is_ok()
+            {
+                return Ok(Lent {
+                    table: self,
+                    slot,
+                    home: context.home.load(Acquire),
+                    frame,
+                    settled: false,
+                });
+            }
+        }
+        Err(LendRefused::NotHere)
+    }
+
+    /// Records a lent context in this table, under the move gate: claims a free slot with its
+    /// home (a compare-and-swap from 0) and stores its frame (Release), as a publication does
+    /// with a home that need not equal the frame. Before the source forgets the home, so the
+    /// stack is never in neither table. The context is resumable here from the store on. A
+    /// refusal hands the `Lent` back, for the caller to restore.
+    pub fn adopt<'t>(
+        &self,
+        _moving: &Moving<'_>,
+        mut lent: Lent<'t>,
+    ) -> Result<Adopted<'t>, (AdoptRefused, Lent<'t>)> {
+        if core::ptr::eq(self, lent.table) {
+            return Err((AdoptRefused::SameTable, lent));
+        }
+        if !self
+            .slots
+            .iter()
+            .any(|slot| slot.claim(lent.home, lent.frame))
+        {
+            return Err((AdoptRefused::Full, lent));
+        }
+        lent.settled = true;
+        Ok(Adopted {
+            source: lent.table,
+            slot: lent.slot,
+            home: lent.home,
+        })
     }
 }
 
@@ -636,7 +1364,13 @@ mod tests {
             !covered(&table, 5),
             "running: no stack of its own in the table"
         );
-        assert!(table.covers(0, 2), "its home is BOOT_FLOW, 1");
+        // Its home is BOOT_FLOW, 1: a range holding 1 and not 0, which a free slot's words and an
+        // empty leaving record hold (the review of TASKS item 95, R95-9).
+        assert!(
+            table.covers(BOOT_FLOW, BOOT_FLOW + 1),
+            "its home is BOOT_FLOW"
+        );
+        assert!(!Contexts::new().covers(BOOT_FLOW, BOOT_FLOW + 1));
     }
 
     #[test]
@@ -873,6 +1607,600 @@ mod tests {
             !covered(&table, 1),
             "retired once the interrupted call finishes"
         );
+    }
+
+    /// The frames in the table's slots, in slot order: what a switch or a lend could take.
+    fn resumable(table: &Contexts) -> Vec<u64> {
+        table
+            .slots
+            .iter()
+            .map(|slot| slot.frame.load(Relaxed))
+            .filter(|&frame| frame != 0)
+            .collect()
+    }
+
+    /// ADR-0020 S5: a switch-out leaves its frame in the leaving record, in no slot, and covered;
+    /// the next call into the table publishes it in its context's slot.
+    #[test]
+    fn a_switched_out_frame_is_leaving_until_the_next_call() {
+        let table = Contexts::new();
+        assert!(table.publish(first_frame(1)));
+        assert!(table.publish(first_frame(2)));
+        let boot = stack(9).1 - 0x40;
+        assert_eq!(
+            switch_to(&table, boot, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        // The boot flow's first switch-out: its slot is claimed with no frame, the frame leaves.
+        assert_eq!(table.leaving.load(Relaxed), boot);
+        assert_eq!(resumable(&table), [first_frame(2)]);
+        assert!(covered(&table, 9), "covered by the leaving record");
+        // Context 1 is switched out on a measured stack: the next switch publishes the boot
+        // flow's frame, and context 1's frame leaves.
+        let on_measured = stack(7).1 - 0x100;
+        assert_eq!(
+            switch_to(&table, on_measured, first_frame(2), false, not_on_it),
+            Ok(first_frame(2))
+        );
+        assert_eq!(table.leaving.load(Relaxed), on_measured);
+        assert_eq!(resumable(&table), [boot], "published at the switch's top");
+        assert!(
+            covered(&table, 7),
+            "the measured stack, by the leaving record"
+        );
+        table.publish_leaving();
+        assert_eq!(table.leaving.load(Relaxed), 0);
+        assert!(resumable(&table).contains(&on_measured));
+        assert!(covered(&table, 7), "the measured stack, by its slot");
+        // Nothing left: a second publication changes nothing.
+        let before = resumable(&table);
+        table.publish_leaving();
+        assert_eq!(resumable(&table), before);
+    }
+
+    /// The coordinating session's condition on Q3 (TASKS item 95): a switch whose `next` is the
+    /// context that is leaving publishes it first and then takes it, so it is neither lost nor
+    /// taken twice.
+    #[test]
+    fn a_switch_back_to_the_leaving_context_publishes_it_then_takes_it() {
+        let table = Contexts::new();
+        assert!(table.publish(first_frame(1)));
+        assert!(table.publish(first_frame(2)));
+        assert_eq!(
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        let at_1 = first_frame(1) - 0x200;
+        assert_eq!(
+            switch_to(&table, at_1, first_frame(2), false, not_on_it),
+            Ok(first_frame(2))
+        );
+        assert_eq!(table.leaving.load(Relaxed), at_1);
+        // Straight back to context 1, before anything else called into the table.
+        let at_2 = first_frame(2) - 0x200;
+        assert_eq!(switch_to(&table, at_2, at_1, false, not_on_it), Ok(at_1));
+        assert_eq!(table.running_home(), Some(first_frame(1)));
+        assert_eq!(table.leaving.load(Relaxed), at_2, "context 2 leaves now");
+        assert!(!resumable(&table).contains(&at_1), "taken once");
+        // A second resume of the same frame is refused; context 2's frame is not lost.
+        assert_eq!(
+            switch_to(&table, at_1 - 0x100, at_1, false, not_on_it),
+            Err(Refused::NeverSaved)
+        );
+        assert_eq!(
+            switch_to(&table, at_1 - 0x100, at_2, false, not_on_it),
+            Ok(at_2)
+        );
+    }
+
+    /// A tick that switches nothing (`next == here`) still publishes what the last switch left:
+    /// a switched-out context becomes resumable elsewhere within one tick (ADR-0020 S5).
+    #[test]
+    fn a_switch_that_changes_nothing_still_publishes() {
+        let table = Contexts::new();
+        assert!(table.publish(first_frame(1)));
+        assert!(table.publish(first_frame(2)));
+        assert_eq!(
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        let at_1 = first_frame(1) - 0x200;
+        assert_eq!(
+            switch_to(&table, at_1, first_frame(2), false, not_on_it),
+            Ok(first_frame(2))
+        );
+        let at_2 = first_frame(2) - 0x200;
+        assert_eq!(switch_to(&table, at_2, at_2, false, not_on_it), Ok(at_2));
+        assert_eq!(table.leaving.load(Relaxed), 0);
+        assert!(resumable(&table).contains(&at_1));
+    }
+
+    /// An exit leaves nothing to publish: its frame is never saved, as before ADR-0020 S5.
+    #[test]
+    fn an_exit_leaves_no_frame() {
+        let table = Contexts::new();
+        assert!(table.publish(first_frame(1)));
+        assert!(table.publish(first_frame(2)));
+        assert_eq!(
+            switch_to(&table, 0x9000, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        // The boot flow's frame leaves; context 1's exit publishes it and leaves nothing itself.
+        let at_exit = first_frame(1) - 0x300;
+        assert_eq!(
+            switch_to(&table, at_exit, first_frame(2), true, not_on_it),
+            Ok(first_frame(2))
+        );
+        assert_eq!(table.leaving.load(Relaxed), 0);
+        assert_eq!(resumable(&table), [0x9000]);
+    }
+
+    /// A `Quiet` that counts how often it is asked to turn interrupts off (the review of TASKS
+    /// item 95's host-test gaps).
+    struct Counting(core::cell::Cell<u32>);
+
+    impl Quiet for Counting {
+        fn quietly<R>(&self, f: impl FnOnce() -> R) -> R {
+            self.0.set(self.0.get() + 1);
+            f()
+        }
+    }
+
+    /// A host stands in for a processor with interrupts off: nothing interrupts it.
+    struct Plain;
+
+    impl Quiet for Plain {
+        fn quietly<R>(&self, f: impl FnOnce() -> R) -> R {
+            f()
+        }
+    }
+
+    /// Two tables, each running its boot flow; `source` also has context `n` published and
+    /// never run. Returns the boot flows' frames.
+    fn two_processors(source: &Contexts, destination: &Contexts, n: u64) -> (u64, u64) {
+        assert!(source.publish(first_frame(n)));
+        assert!(source.publish(first_frame(20)));
+        assert!(destination.publish(first_frame(21)));
+        // Each boot flow switches to a thread of its own and back, so it has a slot and its
+        // frame is published.
+        let (boot_s, boot_d) = (stack(30).1 - 0x40, stack(31).1 - 0x40);
+        for (table, boot, own) in [(source, boot_s, 20), (destination, boot_d, 21)] {
+            assert_eq!(
+                switch_to(table, boot, first_frame(own), false, not_on_it),
+                Ok(first_frame(own))
+            );
+            assert_eq!(
+                switch_to(table, first_frame(own) - 0x100, boot, false, not_on_it),
+                Ok(boot)
+            );
+            table.publish_leaving();
+        }
+        (boot_s, boot_d)
+    }
+
+    /// ADR-0020 S4: a move takes the frame from the source, records it in the destination, and
+    /// clears the home in the source, in that order; the destination resumes it, the source no
+    /// longer can, and the counters say one move began and finished.
+    #[test]
+    fn a_move_lends_adopts_and_forgets() {
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (boot_s, boot_d) = two_processors(&source, &destination, 1);
+        let seen = core::cell::Cell::new(None);
+        let moved = moves.relocate(&source, &destination, first_frame(1), |home| {
+            // Between `adopt` and `forget`: both tables cover the stack.
+            seen.set(Some((covered(&source, 1), covered(&destination, 1))));
+            home
+        });
+        assert_eq!(moved, Ok((first_frame(1), first_frame(1))));
+        assert_eq!(seen.get(), Some((true, true)));
+        assert!(!covered(&source, 1), "forgotten in the source");
+        assert!(covered(&destination, 1));
+        assert_eq!(moves.readings(), (1, 1));
+        assert_eq!(
+            switch_to(&source, boot_s - 0x100, first_frame(1), false, not_on_it),
+            Err(Refused::NeverSaved),
+            "the source cannot resume it"
+        );
+        let switched = destination
+            .switch(boot_d - 0x100, first_frame(1), false, not_on_it)
+            .unwrap();
+        assert_eq!(
+            (switched.frame, switched.home),
+            (first_frame(1), Some(first_frame(1)))
+        );
+        // The source's freed slot takes a new context.
+        assert!(source.publish(first_frame(2)));
+    }
+
+    /// A context that has run and was switched out moves with its saved frame, which is not its
+    /// home: the destination resumes the saved frame and names the home's stack.
+    #[test]
+    fn a_context_that_ran_moves_with_its_saved_frame() {
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (boot_s, boot_d) = two_processors(&source, &destination, 1);
+        assert_eq!(
+            switch_to(&source, boot_s - 0x100, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        let at_1 = first_frame(1) - 0x200;
+        assert_eq!(
+            switch_to(&source, at_1, boot_s - 0x100, false, not_on_it),
+            Ok(boot_s - 0x100)
+        );
+        // Leaving: not yet movable.
+        assert_eq!(
+            moves.relocate(&source, &destination, at_1, |_| ()),
+            Err(MoveRefused::Lend(LendRefused::Leaving))
+        );
+        assert_eq!(moves.readings(), (1, 1), "a refused lend is an empty move");
+        source.publish_leaving();
+        assert_eq!(
+            moves.relocate(&source, &destination, at_1, |home| home),
+            Ok((first_frame(1), first_frame(1)))
+        );
+        let switched = destination
+            .switch(boot_d - 0x100, at_1, false, not_on_it)
+            .unwrap();
+        assert_eq!(
+            (switched.frame, switched.home),
+            (at_1, Some(first_frame(1)))
+        );
+        assert_eq!(destination.running_home(), Some(first_frame(1)));
+    }
+
+    /// Every refusal of `lend`: a leaving frame, the boot or idle flow's, and frames no slot holds
+    /// suspended (0, `BOOT_FLOW`, unknown, running, ended, already lent).
+    #[test]
+    fn a_lend_refuses_what_it_may_not_take() {
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (boot_s, _) = two_processors(&source, &destination, 1);
+        assert!(source.publish(first_frame(2)));
+        assert!(source.publish(first_frame(3)));
+        let moving = moves.begin();
+        for frame in [0, BOOT_FLOW, first_frame(9)] {
+            assert_eq!(
+                source.lend(&moving, frame).map(|l| l.frame()),
+                Err(LendRefused::NotHere)
+            );
+        }
+        // One lent: a second lend of the same frame finds nothing.
+        let lent = source.lend(&moving, first_frame(2)).unwrap();
+        assert_eq!(
+            source.lend(&moving, first_frame(2)).map(|l| l.frame()),
+            Err(LendRefused::NotHere)
+        );
+        assert!(lent.restore());
+        drop(moving);
+        // Context 1 runs, context 3 ends: neither is suspended.
+        assert_eq!(
+            switch_to(&source, boot_s - 0x100, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        let moving = moves.begin();
+        assert_eq!(
+            source.lend(&moving, first_frame(1)).map(|l| l.frame()),
+            Err(LendRefused::NotHere),
+            "running"
+        );
+        assert_eq!(
+            source.lend(&moving, boot_s - 0x100).map(|l| l.frame()),
+            Err(LendRefused::Leaving),
+            "the boot flow's frame, leaving"
+        );
+        source.publish_leaving();
+        assert_eq!(
+            source.lend(&moving, boot_s - 0x100).map(|l| l.frame()),
+            Err(LendRefused::BootFlow),
+            "the boot flow's frame, published"
+        );
+        drop(moving);
+        assert_eq!(
+            switch_to(
+                &source,
+                first_frame(1) - 8,
+                first_frame(3),
+                false,
+                not_on_it
+            ),
+            Ok(first_frame(3))
+        );
+        assert_eq!(
+            switch_to(&source, first_frame(3) - 8, first_frame(2), true, not_on_it),
+            Ok(first_frame(2))
+        );
+        let moving = moves.begin();
+        assert_eq!(
+            source.lend(&moving, first_frame(3) - 8).map(|l| l.frame()),
+            Err(LendRefused::NotHere),
+            "an exit saves no frame"
+        );
+        drop(moving);
+        assert_eq!(moves.readings(), (3, 3));
+    }
+
+    /// N13: a full destination refuses the adoption, and the frame goes back to its source,
+    /// which resumes it; a table never adopts what it lent.
+    #[test]
+    fn a_full_destination_refuses_and_the_source_gets_its_frame_back() {
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (boot_s, _) = two_processors(&source, &destination, 1);
+        while destination.publish(first_frame(40)) {}
+        assert_eq!(
+            moves.relocate(&source, &destination, first_frame(1), |_| ()),
+            Err(MoveRefused::Adopt(AdoptRefused::Full))
+        );
+        assert_eq!(
+            moves.relocate(&source, &source, first_frame(1), |_| ()),
+            Err(MoveRefused::Adopt(AdoptRefused::SameTable))
+        );
+        assert!(covered(&source, 1));
+        assert_eq!(moves.readings(), (2, 2));
+        assert_eq!(
+            switch_to(&source, boot_s - 0x100, first_frame(1), false, not_on_it),
+            Ok(first_frame(1)),
+            "restored, so the source resumes it"
+        );
+    }
+
+    /// The witnesses by hand: `restore` puts a lent frame back; `forget` after `adopt` clears the
+    /// source's home; a refused `adopt` hands the `Lent` back; a `Lent` dropped unsettled restores
+    /// itself, and an `Adopted` dropped forgets (R95-1); a `restore` that finds the frame word
+    /// taken reports it.
+    #[test]
+    fn restore_and_forget_settle_a_lent_frame() {
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        two_processors(&source, &destination, 1);
+        let moving = moves.begin();
+        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        assert_eq!(
+            (lent.home(), lent.frame()),
+            (first_frame(1), first_frame(1))
+        );
+        assert!(covered(&source, 1), "the home stays while lent");
+        assert!(!resumable(&source).contains(&first_frame(1)));
+        assert!(lent.restore());
+        assert!(resumable(&source).contains(&first_frame(1)));
+        // Dropped unsettled: restored.
+        drop(source.lend(&moving, first_frame(1)).unwrap());
+        assert!(resumable(&source).contains(&first_frame(1)));
+        // Refused by its own table: handed back, then restored.
+        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        let Err((refused, lent)) = source.adopt(&moving, lent) else {
+            panic!("a table adopted what it lent");
+        };
+        assert_eq!(refused, AdoptRefused::SameTable);
+        assert!(lent.restore());
+        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        let adopted = destination.adopt(&moving, lent).unwrap();
+        assert_eq!(adopted.home(), first_frame(1));
+        assert!(covered(&source, 1), "until it is forgotten");
+        adopted.forget();
+        assert!(!covered(&source, 1));
+        assert!(resumable(&destination).contains(&first_frame(1)));
+        // Back again, the `Adopted` simply dropped: its drop forgets.
+        let lent = destination.lend(&moving, first_frame(1)).unwrap();
+        drop(source.adopt(&moving, lent).unwrap());
+        assert!(!covered(&destination, 1));
+        assert!(covered(&source, 1));
+        // A lent frame whose slot was written meanwhile, which nothing in the protocol does.
+        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        source.slots[lent.slot].frame.store(0x77, Release);
+        assert!(!lent.restore());
+        drop(moving);
+        assert_eq!(moves.readings(), (1, 1));
+    }
+
+    /// The delta review's D95-4: a lent frame dropped unsettled, whose slot was written meanwhile,
+    /// cannot be put back; a debug build stops at once rather than lose the context unseen.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a lent frame could not be put back in its slot")]
+    fn a_lent_frame_that_cannot_be_put_back_stops_a_debug_build() {
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        two_processors(&source, &destination, 1);
+        let moving = moves.begin();
+        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        source.slots[lent.slot].frame.store(0x77, Release);
+        drop(lent);
+    }
+
+    /// The review's ABA case (TASKS item 95): a context resumed and switched out again at the same
+    /// address is lent as it is now, once; the destination resumes it and the source cannot.
+    #[test]
+    fn a_frame_saved_again_at_the_same_address_is_lent_once() {
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (boot_s, boot_d) = two_processors(&source, &destination, 1);
+        let at_1 = first_frame(1) - 0x200;
+        // Run context 1, and switch it out at `at_1`, twice.
+        let (boot_here, boot_again) = (boot_s - 0x100, boot_s - 0x180);
+        assert_eq!(
+            switch_to(&source, boot_here, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        assert_eq!(
+            switch_to(&source, at_1, boot_here, false, not_on_it),
+            Ok(boot_here)
+        );
+        source.publish_leaving();
+        assert_eq!(
+            switch_to(&source, boot_again, at_1, false, not_on_it),
+            Ok(at_1)
+        );
+        assert_eq!(
+            switch_to(&source, at_1, boot_again, false, not_on_it),
+            Ok(boot_again)
+        );
+        source.publish_leaving();
+        let moving = moves.begin();
+        let lent = source.lend(&moving, at_1).unwrap();
+        assert_eq!(
+            source.lend(&moving, at_1).map(|l| l.frame()),
+            Err(LendRefused::NotHere),
+            "lent once"
+        );
+        let adopted = destination.adopt(&moving, lent).unwrap();
+        adopted.forget();
+        drop(moving);
+        assert_eq!(
+            switch_to(&source, boot_again - 0x80, at_1, false, not_on_it),
+            Err(Refused::NeverSaved)
+        );
+        let switched = destination
+            .switch(boot_d - 0x100, at_1, false, not_on_it)
+            .unwrap();
+        assert_eq!(
+            (switched.frame, switched.home),
+            (at_1, Some(first_frame(1)))
+        );
+    }
+
+    /// The coordinating session's ruling on Q1: dropping a `Moving`, also in a panic, raises
+    /// finished and then frees the gate.
+    #[test]
+    fn a_move_that_panics_still_finishes_and_frees_the_gate() {
+        let moves = Moves::new();
+        let unwound = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            let _moving = moves.begin();
+            panic!("a panic under the gate");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(moves.readings(), (1, 1));
+        assert!(moves.gate.is_free(), "the gate is free");
+    }
+
+    /// ADR-0020 S4, the bound: a scan makes at most `FAST_TRIES` passes with no lock, then one
+    /// under the gate. Context 1 is moved from table 1 to table 0 inside each of the first
+    /// `misses` passes, between its reads of the two tables, and back up at the start of the
+    /// next, so each of those passes misses it; the next pass finds it.
+    fn scan_with_misses(misses: u32) -> Scanned {
+        let tables = [Contexts::new(), Contexts::new()];
+        let moves = Moves::new();
+        let quiet = Counting(core::cell::Cell::new(0));
+        two_processors(&tables[1], &tables[0], 1);
+        let passes = core::cell::Cell::new(0u32);
+        let scanned = moves.scan(
+            || {
+                passes.set(passes.get() + 1);
+                // Never in the gated pass, which holds the gate a move would wait for.
+                let moving = passes.get() <= misses.min(FAST_TRIES);
+                if moving && covered(&tables[0], 1) {
+                    assert!(
+                        moves
+                            .relocate(&tables[0], &tables[1], first_frame(1), |_| ())
+                            .is_ok()
+                    );
+                }
+                let in_0 = covered(&tables[0], 1);
+                if moving {
+                    assert!(
+                        moves
+                            .relocate(&tables[1], &tables[0], first_frame(1), |_| ())
+                            .is_ok()
+                    );
+                }
+                in_0 || covered(&tables[1], 1)
+            },
+            &quiet,
+        );
+        assert_eq!(scanned.passes, passes.get());
+        assert_eq!(
+            quiet.0.get(),
+            u32::from(scanned.gated()),
+            "interrupts turned off once, for the gated pass alone"
+        );
+        scanned
+    }
+
+    #[test]
+    fn a_scan_makes_its_fast_passes_then_one_under_the_gate() {
+        assert_eq!(FAST_TRIES, 4);
+        let scanned = scan_with_misses(FAST_TRIES);
+        assert_eq!(
+            scanned,
+            Scanned {
+                covered: true,
+                passes: 5
+            }
+        );
+        assert!(scanned.gated());
+        // Fewer misses: found on the next fast pass.
+        for misses in 0..FAST_TRIES {
+            let scanned = scan_with_misses(misses);
+            assert_eq!(
+                scanned,
+                Scanned {
+                    covered: true,
+                    passes: misses + 1
+                }
+            );
+            assert!(!scanned.gated());
+        }
+    }
+
+    /// A stack no table covers: believed after one pass with no move under way, and after the
+    /// gated pass when every fast pass overlaps a move of another context.
+    #[test]
+    fn a_scan_believes_nothing_found_only_with_no_move_across_it() {
+        let tables = [Contexts::new(), Contexts::new()];
+        let moves = Moves::new();
+        two_processors(&tables[1], &tables[0], 1);
+        let asked = |_: ()| tables.iter().any(|t| covered(t, 5));
+        assert_eq!(
+            moves.scan(|| asked(()), &Plain),
+            Scanned {
+                covered: false,
+                passes: 1
+            }
+        );
+        let passes = core::cell::Cell::new(0u32);
+        let scanned = moves.scan(
+            || {
+                passes.set(passes.get() + 1);
+                if passes.get() <= FAST_TRIES {
+                    let (from, to) = if covered(&tables[1], 1) {
+                        (1, 0)
+                    } else {
+                        (0, 1)
+                    };
+                    assert!(
+                        moves
+                            .relocate(&tables[from], &tables[to], first_frame(1), |_| ())
+                            .is_ok()
+                    );
+                }
+                asked(())
+            },
+            &Plain,
+        );
+        assert_eq!(
+            scanned,
+            Scanned {
+                covered: false,
+                passes: FAST_TRIES + 1
+            }
+        );
+        // A move under way when the pass began (finished behind begun) is not believed either,
+        // nor one that began during it (begun changed).
+        let readings = moves.readings();
+        assert!(moves.settled(readings));
+        let moving = moves.begin();
+        assert!(!moves.settled(readings), "begun changed");
+        assert!(!moves.settled(moves.readings()), "a move under way");
+        drop(moving);
+        assert!(moves.settled(moves.readings()));
+    }
+
+    #[test]
+    fn the_move_types_name_no_address() {
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        two_processors(&source, &destination, 1);
+        assert_eq!(format!("{moves:?}"), "Moves");
+        let moving = moves.begin();
+        assert_eq!(format!("{moving:?}"), "Moving");
+        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        assert_eq!(format!("{lent:?}"), "Lent");
+        let adopted = destination.adopt(&moving, lent).unwrap();
+        assert_eq!(format!("{adopted:?}"), "Adopted");
     }
 
     /// T70-6: a refused retirement does not overwrite a newer exit's record.

@@ -1,0 +1,150 @@
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (1969408 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x32000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e068000, virtual 0xffffffffd1800000 (512 pages, 1395 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5548 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffd1800000, direct map at 0xffff9ac740000000 (two requests to the loader's generator)
+origin-boot: page tables built: 95 tables, 64614 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800015 ticks a millisecond
+origin-boot: bench build: the UART at I/O port 0x2f8 under the firmware: IER 0x00, LCR 0x03, MCR 0x03, LSR 0x00, MSR 0xb0, scratch 0xaa, divisor 0x0001
+origin-boot: bench build: this line went straight to the UART, before ExitBootServices
+origin-boot: exiting boot services; entering the Framekernel
+X
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (1969408 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x32000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e068000, virtual 0xffffffffeca00000 (512 pages, 1395 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 6536 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffeca00000, direct map at 0xffff95ff00000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64614 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800013 ticks a millisecond
+origin-boot: bench build: the UART at I/O port 0x2f8 under the firmware: IER 0x00, LCR 0x03, MCR 0x03, LSR 0x00, MSR 0xb0, scratch 0xaa, divisor 0x0001
+origin-boot: bench build: this line went straight to the UART, before ExitBootServices
+origin-boot: exiting boot services; entering the Framekernel
+X
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (1969408 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x32000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e068000, virtual 0xffffffff87800000 (512 pages, 1395 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5206 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffff87800000, direct map at 0xffff9900c0000000 (two requests to the loader's generator)
+origin-boot: page tables built: 95 tables, 64614 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800015 ticks a millisecond
+origin-boot: bench build: the UART at I/O port 0x2f8 under the firmware: IER 0x00, LCR 0x03, MCR 0x03, LSR 0x00, MSR 0xb0, scratch 0xaa, divisor 0x0001
+origin-boot: bench build: this line went straight to the UART, before ExitBootServices
+origin-boot: exiting boot services; entering the Framekernel
+X
+Error: No response to keepalive - Terminating session
+Error: No response de-activating SOL payload
+[SOL Session operational.  Use ~? for help]

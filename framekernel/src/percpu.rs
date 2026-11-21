@@ -11,7 +11,7 @@ pub(crate) fn size_per_cpu(sizing: &mut Sizing) {
     sizing.table(&crate::irq::IOAPIC_IRQS_ON);
     sizing.table(&crate::sched::QUEUES);
     sizing.table(&crate::sched::ACTIVE);
-    sizing.table(&crate::sched::THREADS);
+    sizing.table(&crate::threads::THREADS);
     sizing.table(&crate::sched::EXITS);
     sizing.table(&crate::sched::PROGRESS);
     sizing.table(&crate::sched::RAN_ON);

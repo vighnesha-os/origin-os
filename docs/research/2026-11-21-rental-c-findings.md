@@ -1,0 +1,144 @@
+# Rental C: boot info 0.8 on the rented server, and still no kernel line
+
+| | |
+|---|---|
+| Date | 2026-11-21 |
+| Kind | Research ledger (CLAUDE.md §16). Rental C of `docs/research/2026-11-12-first-bare-metal-boot.md`, after rental B (`docs/research/2026-11-20-rental-b-findings.md`) |
+| Decided by | Items 224–236 and 317 (boot info 0.8, TASKS item 84); the owner approved this rental's cost in chat on 2026-11-20 |
+| Ran | Origin's developer-mode loader and Framekernel at `1c9c7a96` (`main` after PR 47), three boots |
+| Tool | `developer-tools/bench/latitude.py rental-b`, at `1c9c7a96` |
+| Record | `docs/hardware/records/2026-11-21-latitude-m4-metal-small.md`, with Origin's serial log beside it |
+| Raw data | Kept off the repository (item 232), under the owner's `~/.local/state/origin-bench/`. No IP address, MAC address, serial number, GUID or server ID is written here |
+| Sources read | Origin's own code at `1c9c7a96`, and the machine's own output: its serial console and the provider's system's `dmesg`, serial-port list and ACPI tables from the private dump. No operating system's source (CLAUDE.md §3) |
+
+**The machine is bench equipment.** It is outside ADR-0009 Amendment 1's scope: its cores are Zen 4. It qualifies nothing (item 233).
+
+## The rental
+
+| | |
+|---|---|
+| Provider, plan, site | Latitude.sh, `m4-metal-small`, Amsterdam (`AMS`), $0.81 an hour |
+| Deployed, deleted | 00:00:36 and 00:25:52 UTC: 25 minutes 16 seconds, inside one clock hour. The deletion was confirmed by the API, and a preflight afterwards listed no bench server |
+| Cost | One hour, **$0.81**, as the tool's ledger counts it (the bill itself was not read). With rentals A and B the ledger holds **$2.43** of item 225's $10 cap |
+| Deploy | Instant: the server was on 21 seconds after the request and answered SSH 3 seconds later |
+| The ledger | Latitude gave this rental the server ID it had given rental A, and the tool's ledger was keyed by server ID: rental C got no row, and rental A's row took C's watchdog and deletion time, so the cap counted A as nine days long ($175.77). That failed safe but was wrong. Each rental is now a row of its own, keyed by hostname and server ID, with offline tests of a reused ID; the ledger was repaired from the run logs, and a preflight reads 3 rentals, $2.43 |
+
+## What the machine is
+
+Very likely **rental A's machine** again: the same server ID, the same firmware (American Megatrends **2.5a, 2025-12-08**), and a DSDT byte-identical to rental A's (rental B's machine had 2.4 and another DSDT). The SPCR, IVRS, MADT, FADT and FPDT are byte-identical across all three rentals. Otherwise as rental B describes it: AMD EPYC 4244P (family 19h, model 61h), 12 logical processors, 64 GiB mostly above 4 GiB, COM1 at `0x3F8` and COM2 at `0x2F8`, the serial-over-LAN console on COM2, and the firmware's framebuffer on the BMC's graphics device (ASPEED), 1024×768 at `0xF4000000`.
+
+The SPCR: revision 2, 80 bytes, a 16550 (interface 0) at I/O port `0x2F8` with 8-bit registers, IRQ 3, 115 200 baud, 8N1, no flow control, an ANSI terminal; no clock field (that comes with revision 3).
+
+## The console, boot by boot
+
+One serial-over-LAN session lasted the whole rental; the BMC kept it open through all three resets. Each boot showed the same sequence (boot 1 began with the provider's system shutting down):
+
+1. The firmware's progress text, "Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5a", "Ready to Boot".
+2. Origin's loader, through the firmware's console, as on rental B and now with boot info 0.8:
+   - `kernel verified: 10 sections, boot info 0.8, entry RVA 0x32000`
+   - the generator's known-answer test and RDSEED and RDRAND health tests passed
+   - `kernel placed at 0x7e061000`, at a different virtual address each boot (KASLR)
+   - **`console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line`**
+   - **`console: the walk read 908 bytes of firmware memory in 31 reads`**, in 5,396 to 5,814 time-stamp counter ticks (cost ledger row CL46): the first figure for the walk on a physical machine
+   - `framebuffer: 1024x768 at 0xf4000000`; `page tables built: 97 tables, 64614 MiB direct map`
+   - `exiting boot services; entering the Framekernel`
+3. Then nothing, for the 8 minutes each boot was given, until the tool restarted the machine. In the raw console each boot's window holds one firmware start and one loader run, and **not one byte after the loader's last line**: the next firmware start is the tool's restart.
+
+## What it proves
+
+- **TASKS item 84's loader half works on this firmware.** The loader's walk found the SPCR among AMI's tables through the UEFI configuration table and the memory map, three times, and named the UART the firmware's console uses.
+- **The loader ran to its last line three more times**, on newer firmware than rental B's.
+- **The kernel wrote nothing to `0x2F8`.** The UART works for an operating system after boot services end, the table and the speed are handled as intended, and nothing else writes to that port after the loader's last line; see below.
+
+## What it does not prove
+
+- Whether the kernel was entered at all, or how far it ran. No boot proof ran that anyone saw.
+- Anything about the declared scope (ADR-0009 A1): bench equipment, item 233. No requirements row changes.
+
+## Where it stops
+
+### What excludes the console
+
+- **E1. The UART carries an operating system's writes after boot services end.** Minutes before boot 1, the provider's system had its console on that UART (kernel command line `console=ttyS1,115200n8`; its serial driver found a 16550A at I/O `0x2F8` and had sent 28,856 bytes through it), and its shutdown messages, up to its last line before the reset, are in the raw console. Its framebuffer driver also used the firmware's framebuffer after boot services ended.
+- **E2. The table and the speed.** The same images, booted under QEMU with this board's own SPCR bytes given to the firmware as an extra table (2026-11-21, local, under the turn lock; the table stays in the private folder): the loader names `0x2f8`; the kernel says `the loader named the SPCR's UART at I/O port 0x2f8 (interface 0x0): written to from the first line, beside COM1, as the firmware set it`, so it keeps the divisor the firmware left, the one that carried the loader's lines; and 387 kernel lines reach that UART, to `boot verdict: degraded: 70 of 71 proofs passed; failed: speculation controls`. The kernel programs it plainly: interrupts off, FIFOs on, DTR, RTS and OUT2, 8N1, no automatic flow control.
+- **E3. No reset reached the firmware** in 8 minutes, three times: no second firmware start in any boot's window.
+- **E4. Nothing else writes there.** The loader prints only through the firmware's console, before `ExitBootServices`; after its last line the first direct write to `0x2F8` is meant to be the kernel's.
+
+So the kernel never wrote its first line to `0x2F8`. The only other way to that silence, the kernel attaching nothing at `0x2F8` and its later SPCR move failing too, needs the port claim or the status probe to fail on a UART that E1 shows answering; it is not credible.
+
+**This also settles rental B's ranking.** Rental B's first three causes (the SPCR move, the frame allocator and kernel tables over AMI's map, the speculation controls' first writes) all lie after the kernel's first line, which since boot info 0.8 goes to `0x2F8`. The stop is earlier.
+
+### The steps from the loader's last line to the kernel's first byte on `0x2F8`
+
+At `1c9c7a96`, in order. Nothing in this span prints anything this console shows.
+
+| # | Step | Where | How it could end silently here |
+|---|---|---|---|
+| L1 | The memory map read into the boot info's regions (`read_memory_map`, then the kernel image carved out), the boot info written, `ExitBootServices` called | `boot/uefi/src/main.rs:583` | A failure before the first call is reported on the firmware's console (not seen) |
+| L2 | If the first call fails with a changed map key, one retry (UEFI 2.11 §7.4): the map read again into the same buffer (32 spare descriptors) and the call made again. Any other failure of the first call, and any failure of the retry, ends in `halt()`: `cli; hlt`, nothing printed | `boot/uefi/src/uefi.rs:377`, `main.rs:641`, `main.rs:709` | **A silent halt, by design**: after a failed `ExitBootServices` the loader may not use the firmware's console |
+| L3 | `enter_kernel`: interrupts off, EFER.NXE and CR0.WP set, CR3 loaded with the loader's tables, the kernel stack, `call` the entry with the boot info | `main.rs:637`, `main.rs:1027` | A fault from the CR3 load on runs through the firmware's IDT, which the new tables do not map: a triple fault |
+| K1 | `_start`: RBP cleared, the stack aligned, `call kernel_main` (the first write to the kernel stack, in the direct map) | `framekernel/frame/entry/main.rs` | A fault: a triple fault |
+| K2 | `time::mark_entry` (RDTSC) | `framekernel/src/kernel.rs:38` | — |
+| K3 | COM1 (`0x3F8`, a real 16550A here): its latch read, then programmed after a wait for the transmitter of at most 100,000 status reads | `kernel.rs:41–43`, `serial.rs:64` | Bounded: a fraction of a second to about a second on this bus |
+| K4 | The relocation probe | `kernel.rs:45` | A refusal goes to COM1 only, then a halt |
+| K5 | The console's state set up | `kernel.rs:52` | — |
+| K6 | The boot info read and checked: header, version 0.8, regions sorted, disjoint and page-aligned, kernel segments, the seed's place | `kernel.rs:57`, `framekernel/frame/src/early.rs`, `boot.rs` | A refusal goes to COM1 only, then a halt |
+| K7 | The loader's UART: the structure checked, ports `0x2F8` claimed, its status probed, its latch kept (E2), programmed after the same bounded wait, made the second sink | `kernel.rs:75`, `console.rs:1101` | Excluded by E1 and E2 |
+| K8 | The framebuffer checked, then the whole 1024×768 screen cleared: 786,432 uncached 4-byte stores to the BMC's graphics memory through the loader's mapping | `kernel.rs:76`, `console.rs:947` | Slow is possible; seconds at most, not 8 minutes |
+| K9 | The framebuffer's line queued, and COM1's and `0x2F8`'s first sections written in turn: **the first byte on `0x2F8`** | `console.rs` (`send_and_draw`) | — |
+
+### The causes, ranked (Reasoning, from the code and the machine's output)
+
+1. **`ExitBootServices` on AMI's firmware (L2).** The loader's one silent end is here, and the only path that OVMF, in every QEMU and CI boot, may never have taken: the loader says nothing about whether its first call failed or retried. A first call refused for a changed key can happen on any firmware, since an event between the map and the call can allocate (UEFI 2.11 §7.4 provides the retry for it); the retry then reads the map again into a buffer with 32 spare descriptors, and fails silently if the firmware's partial shutdown left more changes than that, or refuses the second call. Fits everything seen: no line, no reset, three times alike, on two firmware versions (rentals B and C).
+2. **A fault from L3 to K8, if this board does not reset on a triple fault.** Rental B's ledger assumed a triple fault would reset the machine and show the firmware's start again; that is not established for this board. If it stops in a processor shutdown instead, every fault in this span looks exactly like what was seen. What real firmware could leave that OVMF does not is processor state the kernel inherits: CR4 bits (a supervisor shadow stack left on would fault at `enter_kernel`'s `call` into the kernel, its shadow stack no longer mapped), PAT, MTRRs. None is known to be set; none was read.
+3. **A refusal printed on COM1 only (K4, K6).** The loader built the boot info with the same crate the kernel checks it with, so a refusal needs the two to disagree about AMI's map; nothing points to it, and QEMU's boots with 64 GiB pass.
+4. **A slow step (K3, K8).** Bounded at seconds.
+
+Excluded: the UART, the table and the speed (E1, E2); a reset loop (E3); everything after the kernel's first line, rental B's causes 1 to 3; the network-boot entry (every reset started Origin's loader).
+
+## The next diagnostic, ranked
+
+Each needs one rental: **$0.81** if it starts at the top of a clock hour, **$1.62** at the tool's planned worst case. The ledger holds $2.43 of $10.
+
+| Rank | Way | What it changes | Cost | What it shows |
+|---|---|---|---|---|
+| 1 | **Breadcrumbs on the SPCR's UART, loader and kernel, in a bench build.** The loader prints the processor state the kernel inherits (CR0, CR4, EFER, PAT and, if CPUID reports CET, the supervisor shadow-stack MSRs) through the firmware's console before it leaves; after `ExitBootServices` returns it writes straight to the UART it named which call succeeded (first or retry), and before its silent halt why it halts. `enter_kernel` writes one byte after the CR3 load and one after the stack switch; the kernel one byte after each of K1 to K8 | The loader and the entry stub (the port passed in a spare register), a few writes in `kernel_main`; a QEMU scenario that checks the bytes in order, and a check that a release image has none | One task, then one rental | **The step it stops at, whichever cause it is**, in one rental |
+| 2 | The loader half of 1 alone: the state line, the line after `ExitBootServices`, the line before the halt | Loader only | One small task, then one rental | Settles cause 1 and gives cause 2's processor state; if the loader hands over, the kernel step stays unknown and may need a second rental |
+| 3 | With 1, a switch that faults on purpose after the last byte on the third boot | Bench build only | No extra rental | Whether this board resets on a triple fault, which decides how every later silent boot is read |
+| 4 | Free, before any rental: a development hook that makes the loader's first `ExitBootServices` fail under OVMF (a stale map key), so the retry path runs on real firmware code at least once | Loader, development builds | No rental | Whether the retry path works at all; not AMI's behaviour |
+| — | Port 0x80 codes | — | — | Not reachable as far as known: the board's code display is physical, and neither the console the tool reads nor the provider's API calls it makes show the BMC's capture of it |
+
+A line that says why the loader halts after a failed `ExitBootServices` would be worth keeping beyond the bench build: it is the loader's only silent end. Writing to the SPCR's UART after boot services end uses no boot service. That is a decision for ADR-0002 and ADR-0010, through the coordinating session.
+
+## What this rental cannot show
+
+- Anything about Origin's kernel on this machine.
+- Whether the stop is in the loader or the kernel: no byte separates them.
+
+## Vendor documents read for TASKS item 112 (2026-11-21)
+
+TASKS item 112's bench loader reads the processor state the kernel inherits, and the coordinating session made one condition of it (P0 for the next rental): every model-specific register the loader reads must exist on both vendors whenever the bit it is gated on is set. A read of a register that does not exist takes a #GP under the firmware's IDT, which would end the boot before any breadcrumb. Both documents were read on 2026-11-21, in memory, nothing saved, and are paraphrased here.
+
+| | Document | Revision, file |
+|---|---|---|
+| I | Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 4 (model-specific registers) | Order 335592-093, September 2026; 3,008,109 bytes, SHA-256 `79f54b67b9bb3836856f04e0c45f50406c4d4b932c64800eb788b6b705a83dbd` |
+| A | AMD64 Architecture Programmer's Manual, Volume 2 (publication 24593) | Revision 3.46, October 2026; 15,813,681 bytes, SHA-256 `e4130d5aa26227b6a116d75af9e0f6e5adb4c034ff0d49a3c0fe73c3f49794cf`, the same file as A1 of `docs/research/2026-11-10-speculation-processor-hardening.md` |
+
+**What each register is tied to:**
+
+| Register | Intel (I, Table 2-2) | AMD (A) |
+|---|---|---|
+| PAT, 0x277 | present when CPUID 01H:EDX[16] (PAT) is 1 | the same bit, read from leaf 0000_0001h or 8000_0001h (§7.8.3); listed at 0277h in the MSR cross-reference |
+| S_CET, 0x6A2 | the same layout as U_CET (0x6A0), whose shadow-stack bits exist when CPUID 07H.0:ECX[7] (CET_SS) is 1, and whose branch-tracking bits exist when CPUID 07H.0:EDX[20] (CET_IBT) is 1 | defined when CET_SS is 1 (§18.12) |
+| PL0_SSP, 0x6A4 | present when CET_SS is 1 | defined when CET_SS is 1 (§18.12) |
+| The interrupt SSP table address, 0x6A8 (Intel's `IA32_INTERRUPT_SSP_TABLE_ADDR`, AMD's `ISST_ADDR`) | present when CET_SS is 1, and only on processors with Intel 64 | defined when CET_SS is 1 (§18.12) |
+| EFER, 0xC000_0080 | every processor that runs in long mode has it | the same (the MSR cross-reference; §3.1.7) |
+
+So no vendor ties any of the three shadow-stack registers to a bit other than CET_SS. Intel also defines S_CET when only CET_IBT is set, but not the other two, so the bench loader reads all three only when CET_SS is 1, and PAT only when CPUID 01H:EDX[16] is 1 (`boot/uefi/src/bench.rs`, `reads`, with host tests for each vendor). On the rented board, CPUID 07H.0:ECX is `0x00405FDE` (bit 7 set) and 01H:EDX is `0x178BFBFF` (bit 16 set), from rental C's private dump, so the bench loader will read all five there.
+
+**What AMD says about a shutdown (A, §8.2.9, and the opening of Chapter 9):**
+- A third interrupting event while the processor is passing control to the double-fault handler makes the processor shut down.
+- In the shutdown state the core executes no instructions. Only an NMI, a RESET or an INIT restarts it. If it shut down while running an NMI handler, only a RESET or an INIT does.
+- The manual does not say what the platform does when a core shuts down: whether the chipset or the firmware then resets the machine is left to them. §15.27 adds that a shutdown with the global interrupt flag clear can be left only by RESET.
+
+So "no reset in 8 minutes" on rentals B and C excludes a triple fault only if this board resets on a shutdown, which the document does not settle. TASKS item 112's breadcrumbs make the question smaller: they name the step after which the boot went silent.
