@@ -20,7 +20,7 @@ On `claude/t116-reset-diagnostic`, with `land/batch-9` at `0e4f99f9` merged in; 
 
 **What is shown, under QEMU 11.1.3's software processor on the development Mac only:** `boot-bench`, 7 of 7: TASKS item 112's four scenarios with the new lines; the reset through `ResetSystem`; the reset through the FADT's register; and a UART disturbed as the call returns, whose line appears only once the firmware's values are written back. Each of its seven controls fails, and `check`, `boot-test` and `boot-matrix` three times pass on `8ff56bd9`. One independent AI review: no High; its Medium and Low findings answered or kept as limits.
 
-**Not shown:** anything on a physical machine. A `ResetSystem` that hangs would read like a call that never returns (R116-1, kept for the coordinating session). Rental E (about $0.81, on the owner's word) is what it is for.
+**Rental E** (2026-11-21, $0.81; `docs/hardware/records/2026-11-21-latitude-m4-metal-small-e.md`, `docs/research/2026-11-21-rental-e-findings.md`): three boots alike. The line straight to the UART and the mark before the call arrived; nothing came after the call, and the machine did not reset. That is the reading table's A row: `ExitBootServices` does not return on the rented firmware, or it returned and both the console's path and `ResetSystem` failed after it. Item 344's order was kept for the rental (the coordinating session's ruling on R116-1); the step that separates the two goes to the owner.
 
 ## Breadcrumbs on the SPCR's UART: a bench build (TASKS item 112; 2026-11-21)
 

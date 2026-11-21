@@ -4224,8 +4224,10 @@ The coordinating session gave the design in its brief and asked for the contract
 `land/batch-9` at `0e4f99f9` (TASKS item 95) was merged after the gates, at `cbc68e1b`. No file is changed by both sides. `TASKS.md` conflicted only because each adds a section at its end; both were kept, 95's first. The quick gates ran again on the merge; no boot ran again for it.
 
 **Follow-ups:**
-- **R116-1, for the coordinating session:** keep item 344's order with the reading rule; or write the FADT's register first; or add a boot that calls `ResetSystem` before `ExitBootServices`, as a positive control the rental tool would then have to allow.
+- **R116-1, ruled by the coordinating session on 2026-11-21, before rental E:** item 344's order is kept: `ResetSystem`, then the FADT's register. The A-pattern reads as "A, or `ResetSystem` hung after a call that returned". Changing the order or adding a positive control would change the owner's item 344, or need a switch on the ESP, which the rental tool refuses. If rental E shows the A-pattern, the step that separates the two is put to the owner then: the FADT's register first, or the positive control.
 - `onbf-sign`'s own command line still does not refuse a bench kernel (TASKS item 112's follow-up).
 - TASKS item 84's D1 sentence about COM2 under OVMF still needs correcting (TASKS item 112's follow-up).
-- Done here, on the coordinating session's word: cost ledger row CL46 now holds rentals C's and D's walk figures (`hw`): 1.4 to 1.5 µs and 4.3 to 4.4 µs, once a boot.
+- Done here, on the coordinating session's word: cost ledger row CL46 now holds rentals C's, D's and E's walk figures (`hw`): 1.4 to 1.5 µs, 4.3 to 4.4 µs and 1.4 to 1.7 µs, once a boot.
+
+**Rental E (2026-11-21, on the owner's "Rent it"; the coordinating session's guarded run, 14:00:36 to 14:25:54 UTC, $0.81; the ledger now 5 rentals, $4.05):** the images above, from `8ff56bd9`. Record `docs/hardware/records/2026-11-21-latitude-m4-metal-small-e.md` and its log; findings `docs/research/2026-11-21-rental-e-findings.md`. Three boots alike, one loader run in each: every line before the call arrived, the line straight to the UART and `X` included; nothing after it, no `Y` and no reset, for 6 to 7.4 minutes. That is the A-pattern of this entry's reading table: `ExitBootServices` does not return, or it returned and both the console's path and `ResetSystem` failed after it (R116-1). TASKS item 116's build did what it was for on the machine; the reading it gives is the A row's.
 
