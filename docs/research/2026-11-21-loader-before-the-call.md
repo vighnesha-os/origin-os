@@ -51,7 +51,7 @@ Line numbers are `boot/uefi/src/main.rs` unless named otherwise.
 
 Rentals B and C ran the normal loader and stopped in the same place, so none of these can be the cause on its own.
 
-- **Each switch file** is read with the same calls as the kernel file (`read_bench_file`, 1369–1422): 16 bytes into the stack, both handles closed, nothing allocated. On a rental the `Open` fails.
+- **Each switch file** is read with the same calls as the kernel file (`read_bench_file`, 1369–1422): 16 bytes into the stack at `c8ecfc9d` (32 since TASKS item 121), both handles closed, nothing allocated. On a rental the `Open` fails.
 - **TASKS item 116's walk to the FADT** (`bench::find_reset`, `bench.rs` 499–580), as item 10's.
 - **The entry state** (1324–1339): CPUID leaves 0, 1 and 7; CR0 and CR4; `RDMSR` of `0xC0000080` and `0x277`, and of `0x6A2`, `0x6A4` and `0x6A8` when CET's shadow stacks are reported. Reads only.
 - **Before the call** (`bench_before_call`, 1457–1503):
@@ -60,6 +60,19 @@ Rentals B and C ran the normal loader and stopped in the same place, so none of 
   - the UART's registers read with interrupts masked, toggling DLAB in LCR and setting it back (`bench.rs` 292–314);
   - a line written straight to the UART, then up to 100,000 status reads while it empties.
 - **Between the last memory map and the call,** in bench builds only, the mark (`X`, or `Y` before a retry) goes straight to the UART, with up to 100,000 status reads a byte (694–703; `uart.rs` 70–83).
+
+## What TASKS item 121 adds before the call, in rental F's loader
+
+The list above is the loader at `c8ecfc9d`, rental E's. Rental F's bench loader (TASKS item 121) also does these before the call (TASKS item 121's review, R121-11):
+
+- a third switch file, `BENCH-FCH`, opened as the others;
+- CPUID leaf 0, for the vendor;
+- a third walk from the RSDP through the XSDT to the FADT (`bench::with_fadt`, as TASKS item 116's), then the DSDT's scan: about 470 KB on the rented board, read 4 KiB at a time into a stack buffer that sits inside the walk's 1 KiB FADT buffer's frame, so the stack is deeper there than anywhere in rental E's loader;
+- CR3 read, and up to eight page-table entries read from the firmware's tables;
+- the six loads from the FCH's power-management block, only where the checks allow them;
+- in a boot's first run, the control: `0x06` to port `0xCF9`, after the UART has emptied, and no call.
+
+So rental F's loader is not rental E's plus a reset alone. If rental F shows reading 1 again, these are on the list too, and candidate 2 below, the stack's depth, weighs more.
 
 ## What is left as the firmware left it
 

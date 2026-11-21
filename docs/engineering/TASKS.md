@@ -4263,12 +4263,58 @@ Assigned by the coordinating session on 2026-11-21, after the owner accepted ite
   If the vendor, the DSDT or the walk says no, nothing is read, the control is skipped, and the run makes the call and takes Amendment 3's path after it (TASKS item 116's behaviour).
 - **D2, the reads,** each at its documented width, volatile: the decode-enable register (`PMx00`; bit 1 says whether `0xCF9` is decoded), the PCI control register (`PMx08`; bit 20, shutdown as a PCI reset), the PM1 event block's base (`PMx60`), the ACPI configuration register (`PMx74`; bit 17, the shutdown message), the cause of the last reset (`PMxC0`), and the debug register (`PMxD2`; bit 6 stops a reset through `0xCF9`). Their raw values are printed.
 - **D3, the layout check.** A value that contradicts the documents' layout makes the loader say so, skip the control and make the call, taking Amendment 3's path: any 32-bit read all ones, or a PM1 event block base that is not the FADT's PM1a event block.
-- **D4, the branch.** `PMxC0` bit 19 (a `0x06` command to `0xCF9`) set means the last reset was the loader's own: the run makes the call, and D5 follows it. Anything else means the run is the boot's first: the control. The loader prints which branch it took and why.
+- **D4, the branch.** `PMxC0` bit 19 (a `0x06` command to `0xCF9`) set means the last reset was the loader's own: the run makes the call, and D5 follows it. Anything else means the run is the boot's first: the control. The loader prints which branch it took and why. *Amended by the ruling on R121-2, below: a `PMxC0` naming no reset cause sends the run to the call.*
 - **D5, the control, before the call:** a line, then `0x06` to `0xCF9`, and a 100 ms wait. If the machine still runs, a line saying so; the run then makes the call and takes Amendment 3's path, since its last reset was not the loader's.
-- **D6, after the call, in a run D4 marks as the loader's:** the first instructions after `ExitBootServices` returns, whatever its status, before the status is recorded: `0x06` to `0xCF9`; interrupts masked; 100 ms by the time-stamp counter, at the rate counted over `Stall` before the call; a zero-limit IDT and `int3`. If the machine is still running after that, TASKS item 116's path follows: the line after the call, the write-back, then Amendment 3's order.
+- **D6, after the call, in a run D4 marks as the loader's:** the first instructions after `ExitBootServices` returns, whatever its status, before the status is recorded: `0x06` to `0xCF9`; interrupts masked; 100 ms by the time-stamp counter, at the rate counted over `Stall` before the call; a zero-limit IDT and `int3`. If the machine is still running after that, TASKS item 116's path follows: the line after the call, the write-back, then Amendment 3's order. *Amended by the review, below: only after `EFI_SUCCESS` (the ruling on R121-3), and the triple fault only with `PMx74` bit 17 set (R121-4).*
 - **D7, QEMU.** QEMU has no AMD FCH: its DSDT describes no region at `0xFED80300`, so a QEMU boot takes D1's "no" and TASKS item 116's seven scenarios keep their paths. A switch only QEMU's ESP may hold, `\EFI\ORIGIN\BENCH-FCH`, gives values in place of the reads, and the loader says the values are the switch's:
   - `first` (the control),
   - `mine` (D6),
   - `bad` (D3);
   - and, after one of those, `nocf9` (D6 without the `0xCF9` write, to show the triple fault), `noshutdown` (D6 without the triple fault, to show the fall-through), and `slow` (5 s in place of 100 ms, so that a scenario tells from QEMU's exit time which method reset it).
   The rental tool refuses it as it refuses `BENCH-AFTER`, tied by a test.
+
+**The review and its answers** (`docs/engineering/REVIEW_T121_2026-11-21.md`; one independent AI reviewer, no person; no High, four Medium, eight Low):
+- **R121-1 (Medium), fixed.** `PMxC0` bit 19 records any `0x06` to `0xCF9`, the firmware's own reset among them, so the decision line no longer says the reset was the loader's: it says "a `0x06` to `0xCF9` … as the control writes". **Reading rule:** a run that makes the call counts as evidence only after a control run in the same boot.
+- **R121-2 (Medium): the coordinating session's ruling, 2026-11-21.** D4 is amended: a `PMxC0` that names no reset cause holds no record, and the run makes the call and D6 follows it, with no control in that boot. Otherwise a firmware that clears the register at start-up would make every run a control, and the call would never be made.
+  - **No record:** none of the reset causes AMD's documents name: bits 16, 18 to 27, 29 and 30. Bits 0 to 9 name why the machine last shut down, not why it reset, and 28 and 31 are not named.
+  - **Bit 20** (`0x0E` to `0xCF9`) counts as a record. Only software clears it, so a later reset leaves it set beside its own bit. Alone, it says the last reset was a `0x0E`, and the run is the control. Beside bit 19, the run follows a `0x06`.
+  - The line prints the branch and the raw value.
+  - **Reading rule (the ruling's):** a boot whose first run found no record has no control. Its result rests on the printed `0xCF9` decode, trap and shutdown bits. A single run in such a boot reads "A, or neither reset works with these bits", and the findings must say so.
+- **R121-3 (Medium): the coordinating session's ruling, 2026-11-21.** D6 is amended: `0x06` goes to `0xCF9` only after a call that returned `EFI_SUCCESS`.
+  - After an error, the loader's retry runs as in every build, with its `Y` mark, and its return gets the same check.
+  - After a second error, the existing path runs: Amendment 2's line, then Amendment 3's order.
+  - The check is a compare of the status in RAX. No port, no call, and no memory the call gave back is touched, which the ruling holds to be within Amendment 4's "very first thing".
+  - `boot-bench`'s machine-code check allows that branch and nothing else (R121-8 below).
+- **R121-4 (Medium), fixed.** The triple fault follows the wait only where `PMx74` bit 17 (the shutdown message) is set. Otherwise the run skips it and goes on to Amendment 3's order: a shutdown nothing acts on would hang where `ResetSystem` and the FADT's register could still reset the machine. **Reading rule:** with bit 17 clear, a run that makes the call and shows nothing more reads "A, or `0xCF9` did not reset and Amendment 3's order did not either".
+- **R121-5 (Low), fixed:** the walk returns the leaf's physical address (2 MiB and 1 GiB frames masked, the large leaf's PAT bit left out), and the gate requires it to be the address read.
+- **R121-6 (Low), fixed:** the line saying where the registers are, and which checks passed, is printed before they are read.
+- **R121-7 (Low), fixed:** the reads are `unsafe fn`s with a `# Safety` section naming the gate.
+- **R121-8 (Low), fixed:** `nomem` is gone from the `0xCF9` write. `boot-bench` reads the bench loader's machine code with the pinned toolchain's `llvm-objdump`. It requires a path from an indirect call to `out dx, al`, with AL `0x06` and DX `0xCF9`, that holds nothing but reads into registers, compares, and branches to fixed addresses: the plan's checks and the status's. A store, a port instruction, a call, or any other instruction on the way fails it.
+- **R121-9 (Low), fixed:** the vendor, DSDT and walk checks are one host-tested function, `fch::gate`, each planted out on its own (BC-11, BC-11a, BC-11b).
+- **R121-10 (Low), fixed:** a `PMxC0` naming more than one reset cause contradicts the documents (D3).
+- **R121-11 (Low), fixed:** the research list has a section on what this item adds before the call.
+- **R121-12 (Low), fixed:** the module comment and the switch file's comment.
+
+**The scenarios** (`boot-bench`, sixteen): TASKS item 112's four and item 116's three, unchanged, and this item's nine, each with `BENCH-FCH`:
+- `first`: the control; QEMU exits at the `0xCF9` write, and the call is never made.
+- `mine`: the call, then `0xCF9` at once (QEMU exits within 2.5 s of the mark, where the triple fault would take 5 s).
+- `mine nocf9`: the triple fault after the wait.
+- `mine nocf9 noshutdown`: the fall-through to Amendment 3's order.
+- `norecord`: no control, the call, `0xCF9` at once (R121-2's ruling).
+- `mine`, with a stale key once: no reset after the failed call, the retry's mark, then `0xCF9` at once (R121-3's ruling).
+- `mine`, with a stale key twice: Amendment 2's line, the line after the calls, and `ResetSystem` (R121-3's ruling).
+- `bad`: no control, Amendment 3's path.
+- `first nocf9`: a control that does not reset; the line saying so, then the call.
+
+**The planted controls,** each to fail its scenario or test. TASKS item 116's BC-1 to BC-7, and:
+- **BC-8:** `0xCF9` skipped after the call (the triple fault resets, too late);
+- **BC-9:** both skipped (lines after the mark);
+- **BC-10:** bit 19 read the wrong way round;
+- **BC-11:** the DSDT's region not checked;
+- **BC-11a:** the vendor not checked (a host test);
+- **BC-11b:** the walk not made (a host test);
+- **BC-12:** the layout check removed;
+- **BC-13:** a port read before the reset (the machine-code check);
+- **BC-14:** the triple fault whatever `PMx74` bit 17 (a host test);
+- **BC-15:** the reset after any status (the stale-key-once scenario);
+- **BC-16:** no record taken as another cause (a host test and the `norecord` scenario).
