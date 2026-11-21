@@ -789,6 +789,13 @@ impl Moves {
     /// and the destination's queue locks, with interrupts off, and takes no other lock, and drops
     /// no stack, until the move ends, when the [`Moving`] is dropped: a stack's drop scans, and a
     /// scan's last pass waits for the gate, which this move holds.
+    ///
+    /// Interrupts must be off from before the ticket is taken, not only once the gate is held: the
+    /// gate serves its tickets in order, so an interrupt on this processor that takes a later
+    /// ticket for a scan's last pass would wait, with interrupts off, for this caller, which
+    /// cannot run again until it returns; and every later holder of the gate would wait behind
+    /// it (the delta review of TASKS item 95, D95-3). Nothing here checks it: S3's
+    /// interrupts-off witness, which TASKS items 93 and 96 bring, is to be required here (R95-12).
     pub fn begin(&self) -> Moving<'_> {
         Moving {
             moves: self,
@@ -919,6 +926,10 @@ impl Default for Moves {
 ///
 /// It is a witness only of holding a gate: that the caller holds both queue locks with
 /// interrupts off is its documented duty, not checked here (the review of TASKS item 95, R95-12).
+///
+/// Safe code can leak it (`core::mem::forget`), and the types do not stop that: the gate then
+/// stays held and begun stays ahead of finished, so every later scan's last pass waits for ever
+/// with interrupts off. Nothing in the kernel may forget one (the delta review, D95-5).
 #[must_use = "a move holds the gate until this is dropped"]
 pub struct Moving<'m> {
     moves: &'m Moves,
@@ -946,9 +957,13 @@ impl core::fmt::Debug for Moving<'_> {
 /// adoption (the review of TASKS item 95, R95-1). Its `Debug` writes its name alone: its words
 /// are addresses in the kernel stacks' region.
 ///
+/// Leaking it (`core::mem::forget`), which safe code can, loses its context: the frame is in no
+/// slot, and nothing will put it back. Nothing in the kernel may forget one (the delta review,
+/// D95-5).
+///
 /// What the types refuse to compile:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0382
 /// use origin_sync::contexts::{Contexts, Moves};
 /// let (source, a, b, moves) = (Contexts::new(), Contexts::new(), Contexts::new(), Moves::new());
 /// let moving = moves.begin();
@@ -957,7 +972,7 @@ impl core::fmt::Debug for Moving<'_> {
 /// let _ = b.adopt(&moving, lent); // adopted twice: `lent` was moved
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use origin_sync::contexts::{Contexts, Moves};
 /// let (source, moves) = (Contexts::new(), Moves::new());
 /// let moving = moves.begin();
@@ -965,7 +980,7 @@ impl core::fmt::Debug for Moving<'_> {
 /// lent.forget(); // a home forgotten with no adoption: no such method
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0505
 /// use origin_sync::contexts::{Contexts, Moves};
 /// let (source, moves) = (Contexts::new(), Moves::new());
 /// let moving = moves.begin();
@@ -1018,16 +1033,24 @@ impl Lent<'_> {
 }
 
 impl Drop for Lent<'_> {
+    /// Puts an unsettled frame back in its slot. That cannot fail while the protocol holds (see
+    /// [`Lent::restore`]); if it did, the context would be in no table and could never run again,
+    /// so a debug build stops at once rather than lose it unseen (the delta review of TASKS item
+    /// 95, D95-4). A release build has no panic to stop with (the no-panic check): `relocate`
+    /// settles every frame it lends itself, and answers [`MoveRefused::NotRestored`] there.
     fn drop(&mut self) {
         if !self.settled {
-            let _ = self.put_back();
+            let put_back = self.put_back();
+            debug_assert!(put_back, "a lent frame could not be put back in its slot");
         }
     }
 }
 
 /// A context adopted by its destination ([`Contexts::adopt`]), whose home is still in its source
 /// until [`Adopted::forget`]: dropping it forgets too, since the destination holds the context.
-/// Its `Debug` writes its name alone, as [`Lent`]'s does.
+/// Its `Debug` writes its name alone, as [`Lent`]'s does. Leaking it (`core::mem::forget`) leaves
+/// the home in the source for ever, a slot no context will free (N13) and a stack no scan will
+/// give back. Nothing in the kernel may forget one (the delta review of TASKS item 95, D95-5).
 #[must_use = "an adopted context's home stays in its source until it is forgotten"]
 pub struct Adopted<'t> {
     source: &'t Contexts,
@@ -1963,6 +1986,20 @@ mod tests {
         assert!(!lent.restore());
         drop(moving);
         assert_eq!(moves.readings(), (1, 1));
+    }
+
+    /// The delta review's D95-4: a lent frame dropped unsettled, whose slot was written meanwhile,
+    /// cannot be put back; a debug build stops at once rather than lose the context unseen.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a lent frame could not be put back in its slot")]
+    fn a_lent_frame_that_cannot_be_put_back_stops_a_debug_build() {
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        two_processors(&source, &destination, 1);
+        let moving = moves.begin();
+        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        source.slots[lent.slot].frame.store(0x77, Release);
+        drop(lent);
     }
 
     /// The review's ABA case (TASKS item 95): a context resumed and switched out again at the same
