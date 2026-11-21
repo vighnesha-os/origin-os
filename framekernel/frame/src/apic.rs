@@ -398,8 +398,12 @@ pub const PERIOD_SHARE: u64 = 100;
 /// pair, and how many pairs were tried; `None` after [`PERIOD_PAIRS`].
 ///
 /// **A stated limit** (the second addendum review's T66-R17; the coordinating session's ruling
-/// (a)): a stall inside an intermediate read's own bracket is not counted, so on a timer over 5
-/// times fast it can hide a reload and give a clean pair near nominal. Delivery then fails such a
+/// (a)): a stall inside an intermediate read's own bracket is not counted, so on a timer from
+/// about 3.4 times fast it can hide a reload and give a clean pair near nominal. An intermediate
+/// read's middle lies within a fifth of a period of the pair's first, so its bracket can stay
+/// open to about 0.4 of a period; with the gap between reads allowed, that hides one reload of a
+/// timer 3.42 times fast (TASKS item 78's correction of "over 5 times"; the host test
+/// `today_s_rule_hides_a_reload_from_about_3_4_times_fast` shows the edge). Delivery then fails such a
 /// timer as too fast in total, unless recurring stalls also mask its total in the same run.
 /// Counting those stalls too, across the brackets, left the 65- and 67-processor software-processor
 /// machines undecided after 64 pairs in 8 of 10 idle boots, where intermediate reads seem to stall
@@ -1151,6 +1155,77 @@ mod tests {
             "origin-kernel: APIC timer: run 1 count: no reads, steps up to 0 us; spoiled: 0 gap, \
              0 short, 0 wide, 0 flat; best none"
         );
+    }
+
+    /// Reads of a timer `fast_x100` / 100 times fast, reloaded at TSC 0: the first at once; the
+    /// second opening right after it and sampling its count at once, its bracket then held open
+    /// to `held_to`; then reads every 1.2 µs with 200-tick brackets, the first `gap` ticks after.
+    fn held_open(fast_x100: u64, held_to: u64, gap: u64) -> impl FnMut() -> CountRead {
+        let period = PERIOD * 100 / fast_x100;
+        let count = move |t: u64| 625_000 - 625_000 * (t % period) / period;
+        let mut n = 0;
+        let mut at = held_to + gap;
+        move || {
+            n += 1;
+            match n {
+                1 => CountRead {
+                    before: 0,
+                    count: count(100),
+                    after: 200,
+                },
+                2 => CountRead {
+                    before: 250,
+                    count: count(260),
+                    after: held_to,
+                },
+                _ => {
+                    let before = at;
+                    at += 1_200;
+                    CountRead {
+                        before,
+                        count: count(before + 100),
+                        after: before + 200,
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn today_s_rule_hides_a_reload_from_about_3_4_times_fast() {
+        // TASKS item 78's correction of the stated limit (ADR-0013), "over 5 times fast" before:
+        // a read held open to about 0.4 of a period, its count sampled at its start, hides one
+        // reload; the pair closes at the next read with clean end brackets. Each figure was
+        // found first by an independent model of the sampler (TASKS item 78's evidence).
+        let in_bounds = |fast_x100, held_to, gap| {
+            let (sample, _, _) = sample_period(625_000, PERIOD, held_open(fast_x100, held_to, gap));
+            sample
+                .filter(|s| judge_period(Some(*s), PERIOD) == RateVerdict::InBounds)
+                .map(|s| s.ppm_of(PERIOD))
+        };
+        // 3.42 times fast, with the gap the rule allows after the held read; 3.5 without one.
+        assert_eq!(in_bounds(342, 3_984_000, PERIOD / 100), Some(1_029_420));
+        assert_eq!(in_bounds(350, 3_954_000, 50), Some(1_029_919));
+        // At 3.4 times no read held open from 0.3 to 0.42 of a period gives a pair in bounds.
+        for held_to in (3_000_000..4_200_000).step_by(1_000) {
+            for gap in [50, PERIOD / 100] {
+                assert_eq!(
+                    in_bounds(340, held_to, gap),
+                    None,
+                    "held to {held_to}, gap {gap}"
+                );
+            }
+        }
+        // A correct timer read the same way is never judged fast or slow (TASKS item 78's
+        // invariant I2): its reload needs a whole period between two reads.
+        for held_to in (3_000_000..4_200_000).step_by(1_000) {
+            let (sample, _, _) = sample_period(625_000, PERIOD, held_open(100, held_to, 50));
+            assert_eq!(
+                judge_period(sample, PERIOD),
+                RateVerdict::InBounds,
+                "held to {held_to}"
+            );
+        }
     }
 
     #[test]
