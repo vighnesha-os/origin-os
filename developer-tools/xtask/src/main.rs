@@ -2105,6 +2105,11 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             format!(
                 "origin-kernel: CPU state: machine checks raise #MC, x87 errors raise #MF, ring 3 has no RDPMC, FSGSBASE or SYSENTER, no debug breakpoint armed: {cpus} of {cpus} processors"
             ),
+            // ADR-0020 S6 (TASKS item 94): every processor saves its FPU state as the boot
+            // processor does, and so takes part in moves. The XCR0, the sizes and the area
+            // depend on the processor model, so only the line's frame is fixed.
+            "origin-kernel: FPU format: the boot processor's XCR0 ".into(),
+            format!("; {cpus} of {cpus} processors alike, every one taking part in moves"),
             // ADR-0017: what the processors reported and set as they started (which controls
             // depends on the machine, so only the line's start is fixed), and the lookup
             // that every index and address from ring 3 goes through, in both its forms.
