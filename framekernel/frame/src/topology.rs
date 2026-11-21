@@ -31,6 +31,16 @@
 //! does, that it returns the highest basic leaf's data. On QEMU's Intel-vendor model, 80000026h
 //! then reads as a valid-looking 1Fh list. Every leaf here is read only below its maximum.
 //!
+//! Which processors share each cache (ADR-0020 S8; TASKS item 97): **leaf 04H** (Intel SDM Vol. 1,
+//! Table 21-14) and **Fn8000_001D** (AMD APM Vol. 3, §E.4.15, which exists only with
+//! TopologyExtensions, CPUID.80000001H:ECX\[22\]) give each cache's type and level and, in
+//! EAX\[25:14\] plus one rounded up to a power of two, how many APIC IDs are set aside for its
+//! sharers: processors whose IDs agree above that many low bits share it. Every field of leaf 04H
+//! but the line size is in Intel's Logical Processor domain, so each processor reads its own
+//! ([`Caches`]); `origin_frame::domains` turns the claims into the tree, reading any disagreement
+//! as "not shared". AMD notes a sub-leaf's index need not be its cache's level; the level is
+//! EAX\[7:5\].
+//!
 //! Core types (leaf 1Ah; AMD's EBX\[31:16\]) are recorded as raw codes. Intel's text says a
 //! core type's numeric value "has no significance, neither large nor small", and that it
 //! implies no other attribute: capacity must come from elsewhere (§24: capabilities, never
@@ -390,6 +400,226 @@ pub struct CoreIdentity {
     pub efficiency_rank: Option<u8>,
 }
 
+/// What a cache holds: EAX\[4:0\] of leaf 04H and of Fn8000_001D (Intel SDM Vol. 1, Table 21-14;
+/// AMD APM Vol. 3, §E.4.15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheKind {
+    /// Data only.
+    Data,
+    /// Instructions only.
+    Instruction,
+    /// Both.
+    Unified,
+}
+
+/// One cache a processor reports, and which processors share it: those whose APIC IDs agree
+/// above the low `shift` bits (ADR-0020 S8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedCache {
+    /// Its level, from 1.
+    pub level: u8,
+    /// What it holds.
+    pub kind: CacheKind,
+    /// The low APIC-ID bits its sharers may differ in: EAX\[25:14\] plus one, rounded up to a
+    /// power of two, as a power of two. At most 12.
+    pub shift: u8,
+}
+
+impl SharedCache {
+    /// Whether it holds data, so that it counts for the cache levels of the tree.
+    pub const fn holds_data(&self) -> bool {
+        !matches!(self.kind, CacheKind::Instruction)
+    }
+}
+
+/// The CPUID leaf a processor's caches came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheLeaf {
+    /// Leaf 04H, Intel's deterministic cache parameters.
+    Leaf04,
+    /// Fn8000_001D, AMD's cache topology, which exists only with TopologyExtensions.
+    Leaf8000001D,
+    /// Neither: the processor reports nothing about which processors share its caches.
+    None,
+}
+
+impl fmt::Display for CacheLeaf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            CacheLeaf::Leaf04 => "leaf 04H",
+            CacheLeaf::Leaf8000001D => "leaf 8000001DH",
+            CacheLeaf::None => "no cache leaf",
+        })
+    }
+}
+
+/// Why some of a cache leaf's sub-leaves were not used. The rest were.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheProblem {
+    /// A cache type the leaf reserves (4 to 31).
+    ReservedType,
+    /// A level the leaf reserves: 0 on either leaf, and above 3 on Fn8000_001D.
+    ReservedLevel,
+    /// More caches than [`MAX_CACHES`].
+    TooMany,
+    /// No type-0 sub-leaf within [`MAX_CACHE_SUBLEAVES`].
+    Unterminated,
+}
+
+impl fmt::Display for CacheProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            CacheProblem::ReservedType => "a reserved cache type",
+            CacheProblem::ReservedLevel => "a reserved cache level",
+            CacheProblem::TooMany => "more caches than recorded",
+            CacheProblem::Unterminated => "no terminating sub-leaf",
+        })
+    }
+}
+
+/// The caches a processor records. Real processors report four or five (L1 data and
+/// instructions, L2, L3, sometimes L4).
+pub const MAX_CACHES: usize = 8;
+
+/// Sub-leaves read from a cache leaf before it is declared unterminated.
+pub const MAX_CACHE_SUBLEAVES: u32 = 32;
+
+/// CPUID.80000001H:ECX\[22\], TopologyExtensions: without it Fn8000_001D is reserved (APM Vol. 3,
+/// §E.4.15).
+const TOPOLOGY_EXTENSIONS: u32 = 1 << 22;
+
+/// The caches one processor reports, read on itself (leaf 04H's fields are in Intel's Logical
+/// Processor domain, so they may differ between processors).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caches {
+    leaf: CacheLeaf,
+    count: u8,
+    list: [SharedCache; MAX_CACHES],
+    problem: Option<CacheProblem>,
+}
+
+impl Caches {
+    /// No cache leaf.
+    pub const NONE: Caches = Caches {
+        leaf: CacheLeaf::None,
+        count: 0,
+        list: [SharedCache {
+            level: 0,
+            kind: CacheKind::Data,
+            shift: 0,
+        }; MAX_CACHES],
+        problem: None,
+    };
+
+    /// Reads them: Fn8000_001D where TopologyExtensions says it exists and it lists a cache,
+    /// else leaf 04H where it lists one, else none. Each leaf only below its maximum, which
+    /// QEMU and the SDM answer above with the highest basic leaf's data. `cpuid(leaf, sub)`
+    /// must run on the processor whose caches these are.
+    pub fn detect(cpuid: impl Fn(u32, u32) -> [u32; 4]) -> Caches {
+        let max_basic = cpuid(0, 0)[0];
+        let max_extended = cpuid(0x8000_0000, 0)[0];
+        let listed = |leaf: u32| cpuid(leaf, 0)[0] & 0x1F != 0;
+        if max_extended >= 0x8000_001D
+            && cpuid(0x8000_0001, 0)[2] & TOPOLOGY_EXTENSIONS != 0
+            && listed(0x8000_001D)
+        {
+            Caches::decode(CacheLeaf::Leaf8000001D, |sub| cpuid(0x8000_001D, sub))
+        } else if max_basic >= 4 && listed(4) {
+            Caches::decode(CacheLeaf::Leaf04, |sub| cpuid(4, sub))
+        } else {
+            Caches::NONE
+        }
+    }
+
+    /// Decodes `leaf`'s sub-leaves, `read(n)` giving sub-leaf `n` as `[eax, ebx, ecx, edx]`,
+    /// up to the first of type 0. A sub-leaf of a reserved type or level is skipped and named.
+    pub fn decode(leaf: CacheLeaf, read: impl Fn(u32) -> [u32; 4]) -> Caches {
+        let mut caches = Caches {
+            leaf,
+            ..Caches::NONE
+        };
+        let highest_level = match leaf {
+            CacheLeaf::Leaf04 => 7,
+            CacheLeaf::Leaf8000001D => 3,
+            CacheLeaf::None => return caches,
+        };
+        for sub in 0..MAX_CACHE_SUBLEAVES {
+            let eax = read(sub)[0];
+            let kind = match eax & 0x1F {
+                0 => return caches,
+                1 => CacheKind::Data,
+                2 => CacheKind::Instruction,
+                3 => CacheKind::Unified,
+                _ => {
+                    caches.note(CacheProblem::ReservedType);
+                    continue;
+                }
+            };
+            let level = ((eax >> 5) & 0x7) as u8;
+            if level == 0 || level > highest_level {
+                caches.note(CacheProblem::ReservedLevel);
+                continue;
+            }
+            let sharers = ((eax >> 14) & 0xFFF) + 1;
+            let shift = sharers.next_power_of_two().trailing_zeros() as u8;
+            match caches.list.get_mut(usize::from(caches.count)) {
+                Some(slot) => {
+                    *slot = SharedCache { level, kind, shift };
+                    caches.count += 1;
+                }
+                None => caches.note(CacheProblem::TooMany),
+            }
+        }
+        caches.note(CacheProblem::Unterminated);
+        caches
+    }
+
+    fn note(&mut self, problem: CacheProblem) {
+        self.problem.get_or_insert(problem);
+    }
+
+    /// The leaf they came from.
+    pub const fn leaf(&self) -> CacheLeaf {
+        self.leaf
+    }
+
+    /// Every cache recorded, in the leaf's order.
+    pub fn all(&self) -> &[SharedCache] {
+        self.list.get(..usize::from(self.count)).unwrap_or(&[])
+    }
+
+    /// The first sub-leaf that was not used, and why.
+    pub const fn problem(&self) -> Option<CacheProblem> {
+        self.problem
+    }
+
+    /// The level-2 cache that holds data. Of two, the one shared more narrowly: the reading
+    /// that claims less sharing.
+    pub fn second_level(&self) -> Option<SharedCache> {
+        self.all()
+            .iter()
+            .filter(|c| c.level == 2 && c.holds_data())
+            .min_by_key(|c| c.shift)
+            .copied()
+    }
+
+    /// The highest-level cache that holds data. Of two at that level, the one shared more
+    /// narrowly.
+    pub fn last_level(&self) -> Option<SharedCache> {
+        let top = self
+            .all()
+            .iter()
+            .filter(|c| c.holds_data())
+            .map(|c| c.level)
+            .max()?;
+        self.all()
+            .iter()
+            .filter(|c| c.level == top && c.holds_data())
+            .min_by_key(|c| c.shift)
+            .copied()
+    }
+}
+
 /// What one processor says about itself, read on that processor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuTopology {
@@ -406,6 +636,8 @@ pub struct CpuTopology {
     pub core: Option<CoreIdentity>,
     /// A leaf it claims to implement that could not be decoded, the fallback taken instead.
     pub problem: Option<LayoutError>,
+    /// Its caches, and which processors share each (ADR-0020 S8).
+    pub caches: Caches,
 }
 
 /// What leaf 80000026h adds to a layout and the processor's ID.
@@ -615,6 +847,7 @@ impl CpuTopology {
             hybrid,
             core,
             problem,
+            caches: Caches::detect(cpuid),
         }
     }
 
@@ -1649,6 +1882,232 @@ mod tests {
                 distinct(layout.shift(Domain::Package)),
                 "case {case}"
             );
+        }
+    }
+
+    /// A cache sub-leaf of leaf 04H or Fn8000_001D: `kind`, `level`, and `sharers` logical
+    /// processors (EAX\[25:14\] is one less), with `cores` in EAX\[31:26\] as leaf 04H has it.
+    fn cache(kind: u32, level: u32, sharers: u32, cores: u32) -> [u32; 4] {
+        [
+            kind | level << 5 | (sharers - 1) << 14 | (cores - 1) << 26,
+            0x01C0_003F,
+            0x3F,
+            0,
+        ]
+    }
+
+    /// A list of cache sub-leaves with its type-0 end.
+    fn ended(subs: &[[u32; 4]]) -> Vec<[u32; 4]> {
+        let mut out = subs.to_vec();
+        out.push([0; 4]);
+        out
+    }
+
+    #[test]
+    fn leaf_04h_gives_each_caches_sharers() {
+        // A two-thread core: L1 data and instructions and L2 per core, L3 per 16 threads.
+        let subs = ended(&[
+            cache(1, 1, 2, 8),
+            cache(2, 1, 2, 8),
+            cache(3, 2, 2, 8),
+            cache(3, 3, 16, 8),
+        ]);
+        let cpu = FakeCpu::new(0x0D, 0).with(4, &subs);
+        let caches = cpu.detect().caches;
+        assert_eq!(caches.leaf(), CacheLeaf::Leaf04);
+        assert_eq!(caches.problem(), None);
+        assert_eq!(caches.all().len(), 4);
+        assert_eq!(
+            caches.second_level(),
+            Some(SharedCache {
+                level: 2,
+                kind: CacheKind::Unified,
+                shift: 1
+            })
+        );
+        assert_eq!(
+            caches.last_level(),
+            Some(SharedCache {
+                level: 3,
+                kind: CacheKind::Unified,
+                shift: 4
+            })
+        );
+    }
+
+    #[test]
+    fn sharers_round_up_to_a_power_of_two() {
+        for (sharers, shift) in [
+            (1, 0),
+            (2, 1),
+            (3, 2),
+            (6, 3),
+            (8, 3),
+            (9, 4),
+            (4095, 12),
+            (4096, 12),
+        ] {
+            let caches = Caches::decode(CacheLeaf::Leaf04, |sub| {
+                if sub == 0 {
+                    cache(3, 3, sharers, 1)
+                } else {
+                    [0; 4]
+                }
+            });
+            assert_eq!(
+                caches.last_level().map(|c| c.shift),
+                Some(shift),
+                "{sharers}"
+            );
+        }
+    }
+
+    /// EAX\[31:26\] may be saturated where leaf 0Bh or 1Fh exists (SDM Table 21-14): it is not read.
+    #[test]
+    fn the_cores_field_changes_nothing() {
+        for cores in [1, 2, 63, 64] {
+            let caches = Caches::decode(CacheLeaf::Leaf04, |sub| {
+                if sub == 0 {
+                    cache(3, 2, 4, cores)
+                } else {
+                    [0; 4]
+                }
+            });
+            assert_eq!(caches.second_level().map(|c| c.shift), Some(2), "{cores}");
+        }
+    }
+
+    #[test]
+    fn fn8000_001d_is_read_only_with_topology_extensions() {
+        // An AMD part: leaf 04H reads zero, Fn8000_001D lists L1d, L1i, L2 (2 threads) and an
+        // L3 shared by 16.
+        let amd = ended(&[
+            cache(1, 1, 2, 1),
+            cache(2, 1, 2, 1),
+            cache(3, 2, 2, 1),
+            cache(3, 3, 16, 1),
+        ]);
+        let with = FakeCpu::new(0x10, 0x8000_0026)
+            .with(0x8000_0001, &[[0, 0, TOPOLOGY_EXTENSIONS, 0]])
+            .with(0x8000_001D, &amd);
+        let caches = with.detect().caches;
+        assert_eq!(caches.leaf(), CacheLeaf::Leaf8000001D);
+        assert_eq!(
+            caches.last_level().map(|c| (c.level, c.shift)),
+            Some((3, 4))
+        );
+        // Without TopologyExtensions the leaf is reserved, and leaf 04H lists nothing.
+        let without = FakeCpu::new(0x10, 0x8000_0026)
+            .with(0x8000_0001, &[[0; 4]])
+            .with(0x8000_001D, &amd);
+        assert_eq!(without.detect().caches, Caches::NONE);
+        // Both: Fn8000_001D is taken.
+        let both = FakeCpu::new(0x10, 0x8000_0026)
+            .with(4, &ended(&[cache(3, 3, 8, 1)]))
+            .with(0x8000_0001, &[[0, 0, TOPOLOGY_EXTENSIONS, 0]])
+            .with(0x8000_001D, &amd);
+        assert_eq!(both.detect().caches.leaf(), CacheLeaf::Leaf8000001D);
+        // Above the extended maximum, Fn8000_001D is not believed.
+        let low = FakeCpu::new(0x10, 0x8000_0008)
+            .with(0x8000_0001, &[[0, 0, TOPOLOGY_EXTENSIONS, 0]])
+            .with(0x8000_001D, &amd);
+        assert_eq!(low.detect().caches, Caches::NONE);
+    }
+
+    /// A leaf above the basic maximum returns the highest basic leaf's data (QEMU 11.1, the SDM):
+    /// leaf 04H is not read below maximum 4, even where that data looks like a cache.
+    #[test]
+    fn leaf_04h_above_the_maximum_is_not_believed() {
+        let cpu = FakeCpu::new(3, 0)
+            .with(3, &[cache(3, 2, 2, 1)])
+            .with(4, &ended(&[cache(3, 2, 2, 1)]));
+        assert_eq!(cpu.detect().caches, Caches::NONE);
+    }
+
+    #[test]
+    fn reserved_sub_leaves_are_skipped_and_named() {
+        let caches = Caches::decode(CacheLeaf::Leaf04, |sub| {
+            ended(&[cache(5, 1, 2, 1), cache(3, 2, 2, 1), cache(3, 0, 2, 1)])
+                .get(sub as usize)
+                .copied()
+                .unwrap_or([0; 4])
+        });
+        assert_eq!(caches.problem(), Some(CacheProblem::ReservedType));
+        assert_eq!(caches.all().len(), 1);
+        // Fn8000_001D reserves levels above 3; leaf 04H does not.
+        let four = |leaf| {
+            Caches::decode(
+                leaf,
+                |sub| if sub == 0 { cache(3, 4, 32, 1) } else { [0; 4] },
+            )
+        };
+        assert_eq!(
+            four(CacheLeaf::Leaf04).last_level().map(|c| c.level),
+            Some(4)
+        );
+        let amd = four(CacheLeaf::Leaf8000001D);
+        assert_eq!(amd.problem(), Some(CacheProblem::ReservedLevel));
+        assert_eq!(amd.last_level(), None);
+    }
+
+    #[test]
+    fn too_many_or_unterminated_lists_keep_what_fits_and_say_so() {
+        let many = Caches::decode(CacheLeaf::Leaf04, |sub| {
+            if sub < 12 {
+                cache(3, 1 + sub % 7, 2, 1)
+            } else {
+                [0; 4]
+            }
+        });
+        assert_eq!(many.all().len(), MAX_CACHES);
+        assert_eq!(many.problem(), Some(CacheProblem::TooMany));
+        let endless = Caches::decode(CacheLeaf::Leaf04, |_| cache(1, 1, 1, 1));
+        assert_eq!(endless.problem(), Some(CacheProblem::TooMany));
+        let endless_reserved = Caches::decode(CacheLeaf::Leaf04, |_| cache(9, 1, 1, 1));
+        assert_eq!(endless_reserved.problem(), Some(CacheProblem::ReservedType));
+        assert!(endless_reserved.all().is_empty());
+    }
+
+    #[test]
+    fn an_instruction_cache_is_never_a_cache_level() {
+        let caches = Caches::decode(CacheLeaf::Leaf04, |sub| {
+            ended(&[cache(1, 1, 1, 1), cache(2, 2, 4, 1), cache(2, 3, 8, 1)])
+                .get(sub as usize)
+                .copied()
+                .unwrap_or([0; 4])
+        });
+        assert_eq!(caches.second_level(), None);
+        assert_eq!(caches.last_level().map(|c| c.level), Some(1));
+    }
+
+    /// Any words a hypervisor or a broken part returns decode to a bounded list of valid caches,
+    /// without a panic (CLAUDE.md §72).
+    #[test]
+    fn hostile_cache_leaves_decode_to_valid_caches() {
+        let mut rng = Rng::new(0x4341_4348_4553);
+        for case in 0..cases(20_000) {
+            let words: Vec<[u32; 4]> = (0..rng.below(40))
+                .map(|_| core::array::from_fn(|_| rng.edge_u32()))
+                .collect();
+            let leaf = if rng.below(2) == 0 {
+                CacheLeaf::Leaf04
+            } else {
+                CacheLeaf::Leaf8000001D
+            };
+            let caches = Caches::decode(leaf, |sub| {
+                words.get(sub as usize).copied().unwrap_or([0; 4])
+            });
+            assert!(caches.all().len() <= MAX_CACHES, "case {case}");
+            for c in caches.all() {
+                assert!(c.shift <= 12, "case {case}: {c:?}");
+                assert!((1..=7).contains(&c.level), "case {case}: {c:?}");
+                if leaf == CacheLeaf::Leaf8000001D {
+                    assert!(c.level <= 3, "case {case}: {c:?}");
+                }
+            }
+            if let (Some(l2), Some(last)) = (caches.second_level(), caches.last_level()) {
+                assert!(l2.level <= last.level, "case {case}");
+            }
         }
     }
 }
