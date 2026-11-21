@@ -92,8 +92,36 @@
 - the fence first (§2);
 - CL20 in ADR-0018 V3's form, its worst case unchanged.
 
+### 3.1 The fence changes no decision (2026-11-21, 07:00 to 07:11 UTC)
+
+The fence's commit (`946269e4`), with the round's diagnostic stream patched in again and today's rule still live, in one turn: Clippy of the framework (host and kernel target) and its `apic::` host tests passed, then three idle boots each of the 65- and 67-processor machines and (p1) at 60 µs. The host's load average was 5.7 at the start and 14 to 26 during the boots, from this turn alone.
+- **The six idle boots** passed at their first run: `period 999941` to `1003178 ppm`, from 1 to 11 pairs. C0, C2, C3/20B and C4/20B each decided every run in bounds, at 996,038 to 1,003,474 ppm, within 33 ms. Rounds 1 and 2 had the same (17 boots).
+- **(p1) at 60 µs:** C0 undecided in all four runs, and the boot refused with the 8370C's lines, as in rounds 1 and 2. C2, C3/20B and C4/20B decided all four in bounds, at 999,998 to 1,000,249 ppm, ±2.6 % to ±3.0 %. Round 2 decided 4 of 4 with them; round 1, before C4, 3 of 4 with C2 and C3/20B.
+
+### 3.2 The first figures under KVM (CI run 44872241571, `land/batch-9` at `d81ca5b7`, 2026-11-21 05:44 UTC)
+
+The first CI run to carry the figures line (`fcef041d`, merged into the batch). Both real-processor jobs passed, and neither drew the 8370C:
+
+| Processor (the `processor-*` artifact) | Boots | Read's bracket, least of each run (ns) | Widest step (µs) | Best (ppm) | Spoiled | Period (ppm of nominal) |
+|---|---|---|---|---|---|---|
+| AMD EPYC 7763 (family 19h), ubuntu-24.04 | 31 | 6,836 to 7,376 | 21 to 47 | ±3,468 to ±3,783 | 0 | 1,000,351 to 1,000,976, 1 pair each |
+| AMD EPYC 9V45 (family 1Ah), ubuntu-26.04 | 31 | 7,689 to 8,861 | 21 to 40 | ±3,911 to ±4,471 | 0 | 1,000,368 to 1,001,007, 1 pair each |
+
+- Every read under KVM takes about 7 to 9 µs on these hosts. That would fit a read the hypervisor serves each time; it is an inference from the figures, not something read.
+- The rule before this item took a pair whose two end brackets together were at most 1 % of its span, a best of ±5,000 ppm or less. These hosts passed with little room: the 9V45's worst boot was at ±4,471. End brackets about 12 % wider would have left that rule undecided, which fits the 8370C's refusal. Its own figures are still to come.
+- Under the new rule such a pair decides with room, since C2 judges it against the whole 97 % to 103 %; a pair still undecided at a fifth of a period goes on, up to 0.9 of one.
+
+### 3.3 The built rule's controls (2026-11-21, 07:46 to 08:25 UTC)
+
+Boot controls of the final code (`79d02aa7`) and of `fcef041d`, listed with their lines in ADR-0013's "controls of TASKS item 78":
+- **Correct timers decide.** Every bracket held 30 µs (the count taken at its end), 60 µs or 120 µs; and a read held to 0.38 of a period. Each passed at its first pair, with no pair set aside. TASKS item 66's T66-30, 30 µs brackets, now passes.
+- **A hidden reload is set aside.** At 10 and 3.6 times fast, with the hold aimed so that the old rule would read the pair in bounds, the new code set the pair aside and refused at once on the true period, in 6 of 6 boots. The old code passed the 3.6-times timer in 3 of 3 boots, at 993,150 to 997,231 ppm.
+- **Beyond the rule's reach.** 1.04 times fast with 200 µs brackets, and a correct timer with 300 µs brackets: undecided in every run and refused at run 4.
+- **A first-run translation under TCG.** A gap over a hundredth of the period opened right after the planted read in every first-round boot, until the plant ran the sampler once on made-up reads first. Most likely the software processor translating code that runs for the first time; not shown. On idle boots the figures line's gap count, often 1 in a run, may have the same cause; it never kept a run from deciding.
+
 ## 4. What this does not show
 
-- The 8370C's own figures under KVM, until a CI run of the batch draws it with the figures line. Slow reads as the cause there is the (p1) model reproducing its lines, not a measurement.
+- The 8370C's own figures under KVM, until a CI run of the batch draws it with the figures line. Slow reads as the cause there is the (p1) model reproducing its lines, not a measurement. The coordinating session ruled that the rule's acceptance does not wait for that draw, with §3.2's figures as the KVM baseline.
 - How far a processor reorders an unfenced RDTSC around an RDMSR: no document read gives a figure.
+- A count that pauses at 0 after an expiry before it reloads, outside the rule's model, can be judged slow (the review's T78-R7). The host test `a_count_that_pauses_at_zero_can_be_judged_slow` shows it. No hypervisor was seen to do it, and none was read. The guard is TASKS item 115.
 - Anything on a physical machine (CLAUDE.md §74).
