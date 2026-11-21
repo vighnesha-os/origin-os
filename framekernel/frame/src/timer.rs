@@ -14,7 +14,7 @@
 //!    polling with interrupt windows (never halting, so a lost interrupt cannot hang the
 //!    check past its two-second deadline), and check the TSC-measured time ([`apic::judge_ticks`]);
 //!    then read the timer's count against the TSC for its period ([`apic::judge_period`]). A
-//!    run a stall made slow, or with no clean pair of count reads, is measured again, up to
+//!    run a stall made slow, or with no pair of count reads that decides, is measured again, up to
 //!    [`PROOF_ATTEMPTS`] runs ([`apic::tick_verdict`]);
 //! 5. mask the timer again: nothing schedules on it yet (M3).
 
@@ -545,9 +545,9 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
     // nominal, whatever the interrupts did (the addendum review's T66-R13). The interrupts'
     // delivery from their stamps: all 50 within the 2 s limit, not under 95 % of their nominal
     // time in total, and at most 50 % slower (an emulator may coalesce late expiries; physical
-    // hardware qualification will tighten that, CLAUDE.md §74). A run with no clean pair of
-    // count reads, or whose delivery a stall made slow, and only such a run, is measured again
-    // against the same bounds (`apic::tick_verdict`).
+    // hardware qualification will tighten that, CLAUDE.md §74). A run with no pair of count
+    // reads that decides, or whose delivery a stall made slow, and only such a run, is measured
+    // again against the same bounds (`apic::tick_verdict`).
     let period = tsc_hz / HZ;
     let micros = |ticks: u64| ticks.saturating_mul(1_000_000) / tsc_hz.max(1);
     let expected = PROOF_TICKS * 1_000_000 / HZ;
@@ -691,7 +691,7 @@ struct TimedRun {
     end: u64,
     /// The timer's initial count, divide configuration and LVT entry as the run held them.
     registers: [u64; 3],
-    /// The first clean pair of reads of its count, if one came, and the pairs tried.
+    /// The first pair of reads of its count that decided, if one did, and the pairs tried.
     sample: Option<apic::PeriodSample>,
     tries: u32,
     /// What the count reads showed, for the run's figures line (TASKS item 78).

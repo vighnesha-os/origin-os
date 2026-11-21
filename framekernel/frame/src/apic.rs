@@ -382,29 +382,29 @@ pub const RATE_LOW_PPM: u64 = 970_000;
 /// (−0.45 % to +0.55 % in TASKS item 66's diagnostic, uncertainty included), and a 1.1× fast
 /// timer is outside it (the coordinating session's ruling on the addendum review's T66-R13).
 pub const RATE_HIGH_PPM: u64 = 1_030_000;
-/// Pairs of count reads a run may try for a clean one before it is undecided.
+/// Pairs of count reads a run may try for one that decides before it is undecided.
 pub const PERIOD_PAIRS: u32 = 64;
-/// A pair of count reads is clean when its two brackets together are within this share of its
-/// interval: 1 % (the addendum review's T66-R13).
-pub const PERIOD_SHARE: u64 = 100;
 
 /// Measures a running periodic timer's period from its count, reloaded with `initial`, in pairs
 /// of reads within one period (the addendum review's T66-R13), each read taken by `read`: from
 /// one read until a fifth of the `nominal` period has passed, or to the read before the next
-/// reload if that comes first. A pair is read again if its brackets together are wider than
-/// 1/[`PERIOD_SHARE`] of its interval, if it is shorter than a twentieth of the nominal period,
-/// or if the time between two consecutive reads, from the first's bracket's end to the second's
-/// start, is over a hundredth of it: time in which a reload could pass unseen. The first clean
-/// pair, and how many pairs were tried; `None` after [`PERIOD_PAIRS`].
+/// reload if that comes first. A pair is read again if the period its reads allow straddles
+/// either bound, between the shortest and the longest time they can be apart and a fall of one
+/// count more and one less ([`PeriodSample::verdict`]; TASKS item 78), if it is shorter than a
+/// twentieth of the nominal period, or if the time between two consecutive reads, from the
+/// first's bracket's end to the second's start, is over a hundredth of it: time in which a
+/// reload could pass unseen. The first pair that decides, and how many pairs were tried; `None`
+/// after [`PERIOD_PAIRS`].
 ///
 /// **A stated limit** (the second addendum review's T66-R17; the coordinating session's ruling
 /// (a)): a stall inside an intermediate read's own bracket is not counted, so on a timer from
-/// about 3.4 times fast it can hide a reload and give a clean pair near nominal. An intermediate
-/// read's middle lies within a fifth of a period of the pair's first, so its bracket can stay
-/// open to about 0.4 of a period; with the gap between reads allowed, that hides one reload of a
-/// timer 3.42 times fast (TASKS item 78's correction of "over 5 times"; the host test
-/// `today_s_rule_hides_a_reload_from_about_3_4_times_fast` shows the edge). Delivery then fails such a
-/// timer as too fast in total, unless recurring stalls also mask its total in the same run.
+/// about 3.4 times fast it can hide a reload and give a pair that decides near nominal. An
+/// intermediate read's middle lies within a fifth of a period of the pair's first, so its bracket
+/// can stay open to about 0.4 of a period; with the gap between reads allowed, that hides one
+/// reload of a timer 3.42 times fast (TASKS item 78's correction of "over 5 times"; the host test
+/// `today_s_rule_hides_a_reload_from_about_3_4_times_fast` shows the edge). Delivery then fails
+/// such a timer as too fast in total, unless recurring stalls also mask its total in the same
+/// run.
 /// Counting those stalls too, across the brackets, left the 65- and 67-processor software-processor
 /// machines undecided after 64 pairs in 8 of 10 idle boots, where intermediate reads seem to stall
 /// inside their brackets; a check that tolerates stalls is TASKS item 78.
@@ -443,7 +443,7 @@ pub fn sample_period(
                 figures.short += 1;
             } else if let Some(sample) = PeriodSample::from_reads(initial, first, last) {
                 figures.closed(&sample);
-                if sample.clean(PERIOD_SHARE) {
+                if sample.verdict(nominal) != RateVerdict::Undecided {
                     return (Some(sample), tried, figures);
                 }
                 figures.wide += 1;
@@ -473,12 +473,13 @@ pub struct CountFigures {
     /// Pairs ended by a rise of the count (a reload, or a count that jumps back) before they
     /// spanned a twentieth of the period.
     pub short: u32,
-    /// Pairs whose end brackets were too wide for [`PERIOD_SHARE`].
+    /// Pairs whose period's bounds straddled 97 % or 103 %: their end brackets too wide, or the
+    /// timer too near a bound, for the pair to decide ([`PeriodSample::verdict`]).
     pub wide: u32,
     /// Pairs over which the count did not fall.
     pub flat: u32,
     /// The least uncertainty of a pair that spanned enough, in parts per million of its period
-    /// ([`PeriodSample::uncertainty_ppm`]): the clean pair's, if one came.
+    /// ([`PeriodSample::uncertainty_ppm`]): the deciding pair's, if one came.
     pub best_ppm: Option<u64>,
 }
 
@@ -583,21 +584,17 @@ pub enum RateVerdict {
     Fast,
     /// Longer: it runs slow.
     Slow,
-    /// No clean pair of reads: nothing is known.
+    /// No pair of reads decided: nothing is known.
     Undecided,
 }
 
-/// Judges the timer's rate from a clean pair of reads of its count, `None` if none came, against
-/// the `nominal` period in TSC ticks. The count falls at the timer's own rate whatever its
-/// interrupts do, so neither their delivery nor a host's stalls move this verdict.
+/// Judges the timer's rate from the pair of reads of its count that decided, `None` if none did,
+/// against the `nominal` period in TSC ticks ([`PeriodSample::verdict`]). The count falls at the
+/// timer's own rate whatever its interrupts do, so neither their delivery nor a host's stalls
+/// move this verdict.
 #[must_use]
 pub fn judge_period(sample: Option<PeriodSample>, nominal: u64) -> RateVerdict {
-    match sample.map(|s| s.ppm_of(nominal)) {
-        None => RateVerdict::Undecided,
-        Some(ppm) if ppm < RATE_LOW_PPM => RateVerdict::Fast,
-        Some(ppm) if ppm > RATE_HIGH_PPM => RateVerdict::Slow,
-        Some(_) => RateVerdict::InBounds,
-    }
+    sample.map_or(RateVerdict::Undecided, |s| s.verdict(nominal))
 }
 
 /// A run's verdict: a wrong rate fails at once, whatever the interrupts did; then a fault in
@@ -644,6 +641,13 @@ pub struct PeriodSample {
     pub spread: u64,
     /// The period in TSC ticks: the initial count at the measured rate.
     pub period: u64,
+    /// The least period the reads allow, in TSC ticks: the shortest time they can be apart, from
+    /// the first's bracket's end to the last's start, over a fall of one count more.
+    pub period_low: u64,
+    /// The most: the longest time, from the first's start to the last's end, over a fall of one
+    /// count less; `u64::MAX` for a fall of one count. Each read's count is the whole count at
+    /// some instant inside its bracket, so the fall is known to within one count.
+    pub period_high: u64,
 }
 
 impl PeriodSample {
@@ -661,17 +665,50 @@ impl PeriodSample {
             .saturating_add(last.after.saturating_sub(last.before));
         let period =
             u64::try_from(u128::from(initial) * u128::from(interval) / u128::from(fall)).ok()?;
+        let shortest = last.before.saturating_sub(first.after);
+        let longest = last.after.saturating_sub(first.before);
+        // Rounded down and up, so the bounds hold the period the reads allow.
+        let period_low =
+            u64::try_from(u128::from(initial) * u128::from(shortest) / (u128::from(fall) + 1))
+                .unwrap_or(u64::MAX);
+        let period_high = match fall - 1 {
+            0 => u64::MAX,
+            less => u64::try_from(
+                (u128::from(initial) * u128::from(longest)).div_ceil(u128::from(less)),
+            )
+            .unwrap_or(u64::MAX),
+        };
         Some(Self {
             interval,
             fall,
             spread,
             period,
+            period_low,
+            period_high,
         })
     }
 
-    /// Whether its brackets together are within `1/share` of its interval.
-    pub const fn clean(&self, share: u64) -> bool {
-        self.spread.saturating_mul(share) <= self.interval
+    /// What its reads decide of the rate against the `nominal` period in TSC ticks (TASKS item
+    /// 78): in bounds only when the whole span from [`Self::period_low`] to
+    /// [`Self::period_high`] lies within [`RATE_LOW_PPM`] to [`RATE_HIGH_PPM`] of nominal; fast
+    /// or slow only when all of it lies beyond a bound; otherwise undecided. A timer exactly at a
+    /// bound is never decided, so it is measured again and never passes.
+    pub fn verdict(&self, nominal: u64) -> RateVerdict {
+        let at_least = |period: u64, ppm: u64| {
+            u128::from(period) * 1_000_000 >= u128::from(nominal) * u128::from(ppm)
+        };
+        let at_most = |period: u64, ppm: u64| {
+            u128::from(period) * 1_000_000 <= u128::from(nominal) * u128::from(ppm)
+        };
+        if at_least(self.period_low, RATE_LOW_PPM) && at_most(self.period_high, RATE_HIGH_PPM) {
+            RateVerdict::InBounds
+        } else if !at_least(self.period_high, RATE_LOW_PPM) {
+            RateVerdict::Fast
+        } else if !at_most(self.period_low, RATE_HIGH_PPM) {
+            RateVerdict::Slow
+        } else {
+            RateVerdict::Undecided
+        }
     }
 
     /// Its period in parts per million of `nominal` TSC ticks.
@@ -850,8 +887,9 @@ mod tests {
         );
     }
 
-    /// A clean pair of count reads of a timer whose period is exactly `percent` % of nominal:
-    /// 125 000 of its 625 000 counts fall over a fifth of that period.
+    /// A pair of count reads, 5 µs brackets, of a timer whose period is exactly `percent` % of
+    /// nominal: 125 000 of its 625 000 counts fall over a fifth of that period. Its period's
+    /// bounds reach about 0.25 % either side, so it decides from 98 % to 102 %.
     fn sample_at(percent: u64) -> Option<PeriodSample> {
         let interval = PERIOD / 5 * percent / 100;
         PeriodSample::from_reads(
@@ -1035,18 +1073,32 @@ mod tests {
                 }
             )
         );
-        // Every read 30 µs wide, as a slow read under a hypervisor would be: no pair is clean,
-        // every one too wide by about three times the 1 % allowed.
+        // Every read 30 µs wide, as a slow read under a hypervisor would be: the first pair's
+        // period lies between about 98.5 % and 101.5 %, and decides.
         assert_eq!(
             figures(30_000, 600, correct),
+            (
+                Some(1_000_000),
+                1,
+                CountFigures {
+                    least_bracket: Some(30_000),
+                    longest_step: 60_600,
+                    best_ppm: Some(14_854),
+                    ..none
+                }
+            )
+        );
+        // Every read 120 µs wide: every pair's bounds reach past 97 % and 103 %.
+        assert_eq!(
+            figures(120_000, 600, correct),
             (
                 None,
                 PERIOD_PAIRS,
                 CountFigures {
-                    least_bracket: Some(30_000),
-                    longest_step: 60_600,
+                    least_bracket: Some(120_000),
+                    longest_step: 240_600,
                     wide: 64,
-                    best_ppm: Some(14_854),
+                    best_ppm: Some(58_530),
                     ..none
                 }
             )
@@ -1231,10 +1283,26 @@ mod tests {
     #[test]
     fn the_count_judges_the_rate_at_its_edges() {
         assert_eq!(judge_period(sample_at(100), PERIOD), RateVerdict::InBounds);
-        assert_eq!(judge_period(sample_at(97), PERIOD), RateVerdict::InBounds);
-        assert_eq!(judge_period(sample_at(103), PERIOD), RateVerdict::InBounds);
+        assert_eq!(judge_period(sample_at(98), PERIOD), RateVerdict::InBounds);
+        assert_eq!(judge_period(sample_at(102), PERIOD), RateVerdict::InBounds);
+        // At a bound the period's bounds straddle it: undecided, so measured again and never
+        // passed (TASKS item 78).
+        assert_eq!(judge_period(sample_at(97), PERIOD), RateVerdict::Undecided);
+        assert_eq!(judge_period(sample_at(103), PERIOD), RateVerdict::Undecided);
         assert_eq!(judge_period(sample_at(96), PERIOD), RateVerdict::Fast);
         assert_eq!(judge_period(sample_at(104), PERIOD), RateVerdict::Slow);
+        // The exact edges, with brackets of no width, so only the fall's one count is uncertain:
+        // the least interval whose bounds lie within 97 %, and the most within 103 %, and one
+        // tick beyond each (derived apart, with exact fractions: TASKS item 78's `figures_c2.py`).
+        let pair = |interval| {
+            PeriodSample::from_reads(625_000, read(0, 600_000, 0), read(interval, 475_000, 0))
+                .unwrap()
+                .verdict(PERIOD)
+        };
+        assert_eq!(pair(1_940_015), RateVerdict::Undecided);
+        assert_eq!(pair(1_940_016), RateVerdict::InBounds);
+        assert_eq!(pair(2_059_983), RateVerdict::InBounds);
+        assert_eq!(pair(2_059_984), RateVerdict::Undecided);
         // 1.1 times fast is a period of 90.9 %.
         let fast = PeriodSample::from_reads(
             625_000,
@@ -1252,8 +1320,8 @@ mod tests {
         .unwrap();
         assert_eq!(fast.ppm_of(PERIOD), 909_090);
         assert_eq!(judge_period(Some(fast), PERIOD), RateVerdict::Fast);
-        // No clean pair: undecided, which is measured again and never passes, whatever the
-        // interrupts did.
+        // No pair that decides: undecided, which is measured again and never passes, whatever
+        // the interrupts did.
         assert_eq!(judge_period(None, PERIOD), RateVerdict::Undecided);
         for delivery in [
             TickVerdict::InBounds,
@@ -1341,7 +1409,10 @@ mod tests {
         assert_eq!(s.period, 10_000_000);
         assert_eq!(s.ppm_of(10_000_000), 1_000_000);
         assert_eq!(s.uncertainty_ppm(), 1_000);
-        assert!(s.clean(100));
+        // Its period's bounds: 1,998,000 ticks at the least over 125,001 counts, 2,002,000 at the
+        // most over 124,999.
+        assert_eq!((s.period_low, s.period_high), (9_989_920, 10_010_081));
+        assert_eq!(s.verdict(10_000_000), RateVerdict::InBounds);
         // Twice the rate: the same fall in half the time.
         let fast = PeriodSample::from_reads(
             625_000,
@@ -1350,14 +1421,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fast.ppm_of(10_000_000), 500_000);
-        // A bracket a stall widened is not clean.
-        let wide = PeriodSample::from_reads(
-            625_000,
-            read(0, 600_000, 30_000),
-            read(2_000_000, 475_000, 1_000),
-        )
-        .unwrap();
-        assert!(!wide.clean(100));
+        // A bracket a stall widened widens the period's bounds: at 30 µs they still lie within
+        // 97 % to 103 %; at 120 µs they reach below 97 %, and the pair decides nothing.
+        let wide = |width| {
+            PeriodSample::from_reads(
+                625_000,
+                read(0, 600_000, width),
+                read(2_000_000, 475_000, 1_000),
+            )
+            .unwrap()
+            .verdict(10_000_000)
+        };
+        assert_eq!(wide(30_000), RateVerdict::InBounds);
+        assert_eq!(wide(120_000), RateVerdict::Undecided);
         // A count that did not fall, or rose (a reload between), gives nothing.
         assert_eq!(
             PeriodSample::from_reads(625_000, read(0, 5, 1), read(10, 5, 1)),
@@ -1376,10 +1452,10 @@ mod tests {
     #[test]
     fn over_a_grid_only_an_in_bounds_run_passes() {
         // Every rate from 50 % to 300 % of the period, with stalls of 0 to 1.5 s at three
-        // places, its count read as that rate: InBounds only with the count's period within
-        // 97 % to 103 % and the whole run within 95 % to 150 %; Stalled only with the count's
-        // period in bounds and a gap of two periods; a period out of bounds fails, whatever the
-        // stalls.
+        // places, its count read as that rate: InBounds only with the count's period decided
+        // within 97 % to 103 % and the whole run within 95 % to 150 %; Stalled only with the
+        // count's period in bounds and a gap of two periods, or undecided, at a bound; a period
+        // out of bounds fails, whatever the stalls.
         for percent in (50..=300).step_by(1) {
             let gap = PERIOD * percent / 100;
             let rate = judge_period(sample_at(percent), PERIOD);
@@ -1391,13 +1467,19 @@ mod tests {
                     let elapsed = *s.last().unwrap();
                     let nominal = PERIOD * WANTED as u64;
                     let rate_in = (97..=103).contains(&percent);
+                    // `sample_at`'s bounds straddle 97 % and 103 % themselves.
+                    let at_bound = percent == 97 || percent == 103;
+                    assert_eq!(rate == RateVerdict::Undecided, at_bound, "{percent}%");
                     match verdict {
                         TickVerdict::InBounds => assert!(
-                            rate_in && elapsed >= nominal / 100 * 95 && elapsed <= nominal / 2 * 3,
+                            rate_in
+                                && !at_bound
+                                && elapsed >= nominal / 100 * 95
+                                && elapsed <= nominal / 2 * 3,
                             "{percent}% +{extra} at {at}: {run:?}"
                         ),
                         TickVerdict::Stalled => assert!(
-                            rate_in && run.longest_gap >= 2 * PERIOD,
+                            at_bound || (rate_in && run.longest_gap >= 2 * PERIOD),
                             "{percent}% +{extra} at {at}: {run:?}"
                         ),
                         TickVerdict::TooFast => assert!(
