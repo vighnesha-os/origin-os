@@ -4446,6 +4446,13 @@ Assigned by the coordinating session on 2026-11-21, after the owner accepted ite
 - **R121-11 (Low), fixed:** the research list has a section on what this item adds before the call.
 - **R121-12 (Low), fixed:** the module comment and the switch file's comment.
 
+**Against Amendment 4's accepted text** (checked 2026-11-21, before marking it built): three of these answers change what the text says the loader does.
+- **R121-2:** step 2 sends every run not following a `0xCF9` reset to the control, and "a run that finds no record of its own reset can only count runs".
+- **R121-3:** step 3 writes `0xCF9` as the very first thing after the call returns, whatever its status.
+- **R121-4:** step 3 always triple-faults.
+
+They go to the owner through the coordinating session (`t121-amendment-4-refinements.md` in its notes). Until the owner answers, Amendment 4's Code paragraph and row A02-Am4 are not marked built. If any one is declined, the build reverts to the text for it.
+
 **The scenarios** (`boot-bench`, sixteen): TASKS item 112's four and item 116's three, unchanged, and this item's nine, each with `BENCH-FCH`:
 - `first`: the control; QEMU exits at the `0xCF9` write, and the call is never made.
 - `mine`: the call, then `0xCF9` at once (QEMU exits within 2.5 s of the mark, where the triple fault would take 5 s).
