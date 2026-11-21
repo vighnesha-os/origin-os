@@ -242,6 +242,15 @@ pub fn xsave_area_size(id: &Cpuid) -> Option<usize> {
 /// 16-byte aligned).
 pub const FXSAVE_SIZE: usize = 512;
 
+/// Whether the kernel can manage state with XSAVE: the processor has it (CPUID.1:ECX.XSAVE)
+/// and reports leaf 0DH, whose sizes the kernel reads. Asked for a leaf above its largest,
+/// CPUID answers with another leaf's values, which would be read as those sizes (the review of
+/// TASKS item 94, R94-6). Without it the kernel uses FXSAVE, and the baseline, which needs AVX
+/// state in XCR0, is not met.
+pub fn xsave_usable(id: &Cpuid) -> bool {
+    Features::decode(id).xsave && id.max_basic >= 0x0D
+}
+
 /// How a processor saves its FPU and SIMD state, as it reports it once its XCR0 is set
 /// (ADR-0020 S6, N9): an area saved under one format may be restored only under the same.
 ///
@@ -524,6 +533,17 @@ mod tests {
         assert_eq!(fpu_fit(Some(BOOT), BOOT, AREA), FpuFit::Alike);
         // The area exactly as large as the state still holds it.
         assert_eq!(fpu_fit(Some(BOOT), BOOT, 832), FpuFit::Alike);
+    }
+
+    #[test]
+    fn xsave_is_used_only_with_leaf_0dh() {
+        let mut id = modern();
+        assert!(xsave_usable(&id));
+        id.max_basic = 0x0C;
+        assert!(!xsave_usable(&id), "no leaf 0DH to size it");
+        let mut id = modern();
+        id.leaf1[2] &= !(1 << 26);
+        assert!(!xsave_usable(&id), "no XSAVE");
     }
 
     #[test]

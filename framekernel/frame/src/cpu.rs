@@ -2245,7 +2245,8 @@ const CR4_OSFXSR: u64 = 1 << 9;
 const CR4_OSXMMEXCPT: u64 = 1 << 10;
 const CR4_OSXSAVE: u64 = 1 << 18;
 
-/// Whether this processor's SIMD state is managed with XSAVE (else FXSAVE).
+/// Whether SIMD state is managed with XSAVE (else FXSAVE): the boot processor's, recorded once
+/// with its format ([`record_boot_fpu`]).
 static USE_XSAVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The boot processor's FPU format and the size of every thread's FPU area, recorded once by
@@ -2310,8 +2311,10 @@ unsafe fn xsetbv(reg: u32, value: u64) {
 ///
 /// CPL 0. Must run once per processor before any code on it uses SSE or XSAVE.
 pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> crate::features::FpuFormat {
-    use crate::features::{FXSAVE_SIZE, Features, FpuFormat, wanted_xcr0};
+    use crate::features::{FXSAVE_SIZE, Features, FpuFormat, wanted_xcr0, xsave_usable};
     let features = Features::decode(id);
+    // XSAVE only with leaf 0DH to size it (R94-6).
+    let xsave = xsave_usable(id);
     // CR0: clear EM and TS, set MP, so SSE instructions run and do not fault to an
     // emulator or a (nonexistent) lazy-FPU handler; set NE, so an x87 error raises #MF
     // (INIT leaves it clear on an AP).
@@ -2331,7 +2334,7 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> crate::features::FpuFo
     }
     // CR4: OSFXSR and OSXMMEXCPT for SSE; OSXSAVE when the CPU has XSAVE.
     let mut cr4_bits = CR4_OSFXSR | CR4_OSXMMEXCPT;
-    if features.xsave {
+    if xsave {
         cr4_bits |= CR4_OSXSAVE;
     }
     // SAFETY: the caller's contract; these CR4 bits enable FXSAVE/SSE and XSAVE. The flags are
@@ -2346,7 +2349,7 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> crate::features::FpuFo
             options(nomem, nostack),
         );
     }
-    if !features.xsave {
+    if !xsave {
         return FpuFormat {
             xcr0: 0,
             enabled_size: FXSAVE_SIZE as u32,
@@ -2356,7 +2359,6 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> crate::features::FpuFo
     // SAFETY: CR4.OSXSAVE was just set; `wanted` has x87 and SSE (required) and AVX only
     // when the CPU reports it, so it is a legal XCR0.
     unsafe { xsetbv(0, wanted) };
-    USE_XSAVE.store(true, core::sync::atomic::Ordering::Relaxed);
     FpuFormat {
         // SAFETY: OSXSAVE is set.
         xcr0: unsafe { xgetbv(0) },
@@ -2384,7 +2386,14 @@ pub(crate) fn record_boot_fpu(
         xsave_area_size(id).unwrap_or(FXSAVE_SIZE)
     };
     let area = supported.max(format.enabled_size as usize);
-    BOOT_FPU.set(BootFpu { format, area }).is_ok()
+    if BOOT_FPU.set(BootFpu { format, area }).is_err() {
+        return false;
+    }
+    // How every processor saves and restores, from the boot processor alone: an AP that
+    // could not use XSAVE is refused below the baseline (`smp::ap_entry`) and never saves
+    // (the review of TASKS item 94, R94-5).
+    USE_XSAVE.store(format.xcr0 != 0, core::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// The boot processor's FPU format, once it has recorded it.
