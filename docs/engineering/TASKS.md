@@ -4201,3 +4201,31 @@ The coordinating session gave the design in its brief and asked for the contract
   On the loader's console under OVMF: the counter counted at 1,001,150 to 1,001,650 ticks a millisecond over `Stall`; `ResetSystem` found; the FADT's register `0xf` to I/O port `0xcf9`; COM2 under the firmware `IER 0x00, LCR 0x03, MCR 0x00, LSR 0x60, MSR 0xb0, scratch 0x00, divisor 0x0001`.
 - **Found on the way:** OVMF leaves COM2's modem control at 0 (no DTR, RTS or OUT2), and QEMU's UART sends regardless. On rental E the line before the call shows whether the rented firmware's settings carry a raw write.
 
+**Controls and gates on `8ff56bd9`** (the code of `cc6d47a0` and the records; `land/batch-9` at `a2898d14` merged in), under Rust 1.100.0 on the development Mac with QEMU 11.1.3 TCG and OVMF, in one turn of the machine (12:07 to 13:31 UTC). The tree was clean before the controls, after them and after the gates.
+- **The batch's normal images:** the reproducible gate on `a2898d14`, in a separate checkout, kept its 40 files for the comparison below.
+- **Controls, each planted, run and restored; each failed:**
+
+| Control | What was planted | How it failed |
+|---|---|---|
+| BC-1 | the kernel's breadcrumbs 2 and 3 swapped | `boot-bench`'s firmware's-key scenario: first missing marker `RS12345678` |
+| BC-2 | the first call given the firmware's key despite `BENCH-STALE-KEY` | the stale-key-once scenario: the retry's line missing |
+| BC-3 | the bench build's settings added to the normal build's | the reproducible gate: the loader as a release builds it holds the text "bench build" (F2) |
+| BC-4 | the bench flag named in `framekernel/src/console.rs` | `bench-gate`: only listed files may name it (F1) |
+| BC-5 | the halting line silenced | the stale-key-twice scenario: its `ExitBootServices failed` line missing |
+| BC-6 | `ResetSystem`'s call and the FADT register's write both silenced | the no-switch scenario: the console ends with `the FADT's reset register did not reset the machine: halting`, and QEMU did not exit (stopped after 120 s) |
+| BC-7 | the write-back skipped | the disturbed scenario: loopback stayed on, so no line after the call reached the console; QEMU exited on the reset before the loader's output was complete |
+
+- **Gates:** `cargo xtask check` passed (710 s; Loom's 79 models and 120 controls among it). `reproducible-compare` against `a2898d14`'s files: all 40 the same bytes. `boot-test` passed (53 s). `boot-matrix` passed three times in a row, in 1,263, 1,259 and 1,250 s, each with `boot-bench` 7 of 7 (89, 88 and 88 s) and 41 kernel verdicts:
+  - 35 at `71 of 72`: speculation controls, as under QEMU always (item 154);
+  - 3 at `70 of 72`: the oversubscribed machines also failing scheduler fairness, forgiven by name (ADR-0013 Amendment 2);
+  - the three machines with proofs that do not run, as on the base.
+- **`cargo xtask bench-build` after them, the images for rental E:** `BOOTX64.EFI` 242,176 bytes, SHA-256 `68a0addf6d0a8f59bb1ca0b39585bd17beaa44903375a8f4b7319d50e6d8cd5d`; `KERNEL.ONBF` 1,969,408 bytes, SHA-256 `f65400db6d1e47e982a6a5f8688f709b4655454e9397e33d66cc9334b6d90097`. With no `BENCH-AFTER` the loader never enters that kernel; it still checks the kernel image before the call.
+
+`land/batch-9` at `0e4f99f9` (TASKS item 95) was merged after the gates, at `cbc68e1b`. No file is changed by both sides. `TASKS.md` conflicted only because each adds a section at its end; both were kept, 95's first. The quick gates ran again on the merge; no boot ran again for it.
+
+**Follow-ups:**
+- **R116-1, for the coordinating session:** keep item 344's order with the reading rule; or write the FADT's register first; or add a boot that calls `ResetSystem` before `ExitBootServices`, as a positive control the rental tool would then have to allow.
+- `onbf-sign`'s own command line still does not refuse a bench kernel (TASKS item 112's follow-up).
+- TASKS item 84's D1 sentence about COM2 under OVMF still needs correcting (TASKS item 112's follow-up).
+- CL46 can take rentals C's and D's walk figures.
+

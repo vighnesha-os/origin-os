@@ -9,7 +9,7 @@
 
 ## The reset diagnostic: a bench loader for rental E (TASKS item 116; 2026-11-21)
 
-On `claude/t116-reset-diagnostic`, from `land/batch-9`; not yet in a batch. Rental D showed nothing after the loader's last line (`docs/research/2026-11-21-rental-d-findings.md`): either `ExitBootServices` does not return on the rented firmware, or nothing written straight to the SPCR's UART after it reaches the console.
+On `claude/t116-reset-diagnostic`, with `land/batch-9` at `0e4f99f9` merged in; not yet in the batch. Rental D showed nothing after the loader's last line (`docs/research/2026-11-21-rental-d-findings.md`): either `ExitBootServices` does not return on the rented firmware, or nothing written straight to the SPCR's UART after it reaches the console.
 
 - **The bench loader, unless a QEMU scenario's `BENCH-AFTER` asks otherwise:**
   - **before the call:** the UART's registers through the firmware's console, then a line straight to the UART, and a mark before each call;
@@ -18,7 +18,7 @@ On `claude/t116-reset-diagnostic`, from `land/batch-9`; not yet in a batch. Rent
 - **The rental tool** refuses an ESP that holds a bench switch, counts the loader's runs in each boot, and records when the console's bytes arrived.
 - **Normal images are unchanged:** the reproducible gate's 40 files are the same bytes as the batch's.
 
-**What is shown, under QEMU 11.1.3's software processor on the development Mac only:** `boot-bench`, 7 of 7: TASKS item 112's four scenarios with the new lines; the reset through `ResetSystem`; the reset through the FADT's register; and a UART disturbed as the call returns, whose line appears only once the firmware's values are written back. One independent AI review: no High; its Medium and Low findings answered or kept as limits.
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:** `boot-bench`, 7 of 7: TASKS item 112's four scenarios with the new lines; the reset through `ResetSystem`; the reset through the FADT's register; and a UART disturbed as the call returns, whose line appears only once the firmware's values are written back. Each of its seven controls fails, and `check`, `boot-test` and `boot-matrix` three times pass on `8ff56bd9`. One independent AI review: no High; its Medium and Low findings answered or kept as limits.
 
 **Not shown:** anything on a physical machine. A `ResetSystem` that hangs would read like a call that never returns (R116-1, kept for the coordinating session). Rental E (about $0.81, on the owner's word) is what it is for.
 

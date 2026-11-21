@@ -5587,7 +5587,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Dependencies:** none new; `origin-acpi-tables`' FADT parser, which the loader already depended on; `core`; Rust 1.100.0, the pin.
 - **Licensing:** MIT OR Apache-2.0 (the workspace's `license`).
 - **Firmware and data:** none.
-- **Test evidence:** host tests (the loader's library 78, 16 of them `bench.rs`'s; xtask's bench and toolchain tests; the rental tool's 36); `boot-bench`, 7 of 7 under QEMU 11.1.3's software processor (the reset through `ResetSystem`, through the FADT's register, and a disturbed UART written back among them); the normal images the same bytes as the batch's (`reproducible-compare`); controls and gates in TASKS item 116's entry.
+- **Test evidence:** host tests (the loader's library 78, 16 of them `bench.rs`'s; xtask's bench and toolchain tests; the rental tool's 36); `boot-bench`, 7 of 7 under QEMU 11.1.3's software processor (the reset through `ResetSystem`, through the FADT's register, and a disturbed UART written back among them); the normal images the same bytes as the batch's (`reproducible-compare` against `a2898d14`); controls BC-1 to BC-7, each failed; `check`, `boot-test` and `boot-matrix` three times on `8ff56bd9`, in one turn of the machine (TASKS item 116's entry).
 - **Review:** one independent AI review, `docs/engineering/REVIEW_T116_2026-11-21.md`: no High, three Medium, nine Low, answered in `a4dadf49` or kept as limits. No person has reviewed it.
 - **Known limits:** shown under QEMU only; nothing has run on a physical machine. A `ResetSystem` that neither resets nor returns reads as reading A (R116-1, kept); a triple fault is a reset to QEMU too (R116-10); QEMU's UART ignores the divisor.
 
