@@ -1032,10 +1032,17 @@ pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
 ///
 /// Private (ADR-0020 S3; TASKS item 93): [`this_cpu`] is its one caller, under a witness that the
 /// reader cannot leave the processor. A read without one does not build.
+///
+/// The witness does not show that GS's base is set (review finding R93-3): a section's witness,
+/// and the boot flow's, exist before `load_tables` runs. What does is the boot's order. On the
+/// boot processor every step that reads the index comes after `Early::load_cpu_tables` in
+/// `Early`'s order or checks [`tables_ready`] first (`timer::init`); on an AP, `ap_entry` reads it
+/// only after `init_ap`.
 fn read_index() -> CpuIndex {
     let id: u64;
-    // SAFETY: `load_tables` set GS's base to a live `CpuLocal` on every processor before
-    // any code that calls this runs, and offset 0 is its `id`, a `u64`.
+    // SAFETY: `load_tables` set GS's base to a live `CpuLocal` on every processor before any code
+    // that calls this runs (the boot's order, above, not the witness), and offset 0 is its `id`,
+    // a `u64`.
     unsafe { asm!("mov {}, gs:[0]", out(reg) id, options(nostack, readonly, preserves_flags)) };
     CpuIndex(usize::try_from(id).unwrap_or(usize::MAX))
 }

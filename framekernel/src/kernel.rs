@@ -64,6 +64,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
     // The boot flow's witness (ADR-0020 S2, point 4; TASKS item 93, the coordinating session's
     // ruling Q6): this flow never moves and never becomes a thread, so the witness holds for the
     // rest of the boot. Taken once, here, and passed down to what reads the processor index.
+    // It exists before GS's base is set (`early.load_cpu_tables()`, below): nothing reads the
+    // index before that, by `Early`'s order and `timer::init`'s check, which the witness does not
+    // show (review finding R93-3).
     let Some(flow) = cpu::flow() else {
         let _ = writeln!(
             com1,
