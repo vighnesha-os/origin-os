@@ -454,7 +454,7 @@ fn boot(
                     &mut |at, bytes| read_described(described, at, bytes),
                     |at| bench::in_mmio(described, at),
                 );
-                fch_seen = bench_fch_read(rsdp, described, pretend);
+                fch_seen = bench_fch_read(rsdp, described, pretend, out);
             }
             found.early_uart()
         }
@@ -720,11 +720,16 @@ fn boot(
             // SAFETY: valid `ExitBootServices` with this image's handle and the key of the map
             // just obtained; nothing has been allocated since `GetMemoryMap`.
             let status = unsafe { exit(image, key) };
-            // TASKS item 121 (decision item 345, ADR-0002 Amendment 4): in a run whose last reset
-            // was the loader's own, nothing comes before this reset: no line, no register read,
-            // no write-back, whatever the call returned.
+            // TASKS item 121 (decision item 345, ADR-0002 Amendment 4): in a run the FCH's record
+            // sends to the call, a call that returned EFI_SUCCESS is followed by this reset and
+            // nothing before it: no line, no register read, no write-back. The one thing between
+            // is a compare of the status in RAX. After an error, the loader's retry, with this
+            // same check after it; after a second error, its normal path (the coordinating
+            // session's ruling on R121-3).
             #[cfg(origin_bench)]
-            if let Some(free) = plan.free {
+            if status == Status::SUCCESS
+                && let Some(free) = plan.free
+            {
                 reset_without_firmware(free);
             }
             calls.record(status);
@@ -1385,8 +1390,8 @@ fn rdmsr(msr: u32) -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
-/// Reads a bench switch, [`bench::STALE_KEY_PATH`] or [`bench::AFTER_PATH`], from the loader's
-/// volume, in a bench build: `None` if there is no such file, else its first bytes and how many
+/// Reads a bench switch, [`bench::STALE_KEY_PATH`], [`bench::AFTER_PATH`] or
+/// [`fch::SWITCH_PATH`], from the loader's volume, in a bench build: `None` if there is no such file, else its first bytes and how many
 /// were read. Reads at most 32 bytes into the stack: nothing is allocated.
 #[cfg(origin_bench)]
 fn read_bench_file(image: Handle, bs: &BootServices, name: &str) -> Option<([u8; 32], usize)> {
@@ -1470,8 +1475,8 @@ struct BenchPlan {
     /// out whole and the UART then emptied, so a mark never waits between `GetMemoryMap` and
     /// `ExitBootServices` (TASKS item 116's review, R116-7).
     marks: bool,
-    /// TASKS item 121: the reset with no firmware code after the call, in a run whose last reset
-    /// was the loader's own.
+    /// TASKS item 121: the reset with no firmware code after a call that returns `EFI_SUCCESS`, in
+    /// a run whose last reset was a `0x06` to `0xCF9` or that finds no record of it.
     free: Option<fch::Free>,
 }
 
@@ -1501,7 +1506,7 @@ fn bench_before_call(
         }
     );
     // TASKS item 121: the FCH's registers, the control in a boot's first run, or the reset after
-    // the call in a run that follows the loader's own.
+    // the call in a run that follows a `0x06` to `0xCF9` or finds no record.
     let free = bench_fch_decide(fch_seen, ticks_per_ms, early_uart, out);
     // With interrupts masked: a firmware timer callback that wrote the UART while DLAB is set
     // would change its divisor (TASKS item 116's review, R116-6).
@@ -1748,52 +1753,72 @@ impl FchSeen {
 }
 
 /// TASKS item 121 (decision item 345, ADR-0002 Amendment 4), under boot services: the FCH's
-/// power-management registers, read only on an AMD processor, only where the firmware's DSDT
-/// describes a system-memory region holding them and its page tables map them, and only through
-/// loads; or `BENCH-FCH`'s values in their place. Every table and page-table byte is read from
-/// memory the firmware's map describes.
+/// power-management registers, read only where [`fch::gate`] allows it (an AMD processor, a
+/// region of the firmware's DSDT holding them, and its page tables mapping them to themselves),
+/// and only through loads; or `BENCH-FCH`'s values in their place. Every table and page-table byte
+/// is read from memory the firmware's map describes. The line saying where they are, and which
+/// check failed if one did, is written before any register is read (TASKS item 121's review,
+/// R121-6).
 #[cfg(origin_bench)]
-fn bench_fch_read(rsdp: u64, described: &[MemoryRegion], pretend: Option<fch::Pretend>) -> FchSeen {
-    if pretend.is_none() && !is_amd() {
-        return FchSeen::not_read(fch::NotRead::NotAmd);
-    }
-    let mut read = |at: u64, bytes: &mut [u8]| read_described(described, at, bytes);
-    let located = fch::locate(rsdp, &mut read);
-    let pm1a_event = located.ok().and_then(|l| l.pm1a_event);
-    if let Some(p) = pretend {
+fn bench_fch_read(
+    rsdp: u64,
+    described: &[MemoryRegion],
+    pretend: Option<fch::Pretend>,
+    out: &mut ConOut,
+) -> FchSeen {
+    let [_, ebx, ecx, edx] = cpuid(0);
+    let amd = fch::is_amd_vendor(ebx, ecx, edx);
+    let seen = if pretend.is_none() && !amd {
+        // The DSDT is not scanned for a processor that has no AMD FCH.
+        FchSeen::not_read(fch::NotRead::NotAmd)
+    } else {
+        let mut read = |at: u64, bytes: &mut [u8]| read_described(described, at, bytes);
+        let located = fch::locate(rsdp, &mut read);
+        let pm1a_event = located.ok().and_then(|l| l.pm1a_event);
+        if let Some(p) = pretend {
+            FchSeen {
+                where_line: fch::WhereLine::Switch,
+                registers: Some(p.values(pm1a_event)),
+                pm1a_event,
+                pretend,
+            }
+        } else {
+            let la57 = read_cr4() & (1 << 12) != 0;
+            let cr3 = read_cr3();
+            match fch::gate(amd, located, &mut |at| fch::walk(cr3, la57, at, &mut read)) {
+                Ok(region) => FchSeen {
+                    where_line: fch::WhereLine::Read(
+                        region,
+                        fch::map_says(described, fch::PM_BLOCK),
+                    ),
+                    registers: None,
+                    pm1a_event,
+                    pretend: None,
+                },
+                Err(why) => FchSeen::not_read(why),
+            }
+        }
+    };
+    let _ = writeln!(out, "{}", seen.where_line);
+    if matches!(seen.where_line, fch::WhereLine::Read(..)) {
+        // SAFETY: `fch::gate` passed: the processor is AMD's, the firmware's DSDT describes a
+        // system-memory region holding every register read, and the firmware's page tables, still
+        // loaded, map its first and last byte to themselves.
+        let registers = unsafe { read_fch_registers() };
         return FchSeen {
-            where_line: fch::WhereLine::Switch,
-            registers: Some(p.values(pm1a_event)),
-            pm1a_event,
-            pretend,
+            registers: Some(registers),
+            ..seen
         };
     }
-    let region = match located.map(|l| l.region) {
-        Err(why) => return FchSeen::not_read(fch::NotRead::NoFadt(why)),
-        Ok(Err(why)) => return FchSeen::not_read(fch::NotRead::NoRegion(why)),
-        Ok(Ok(region)) => region,
-    };
-    let la57 = read_cr4() & (1 << 12) != 0;
-    let cr3 = read_cr3();
-    for at in [fch::PM_BLOCK, fch::PM_BLOCK + fch::SPAN - 1] {
-        match fch::walk(cr3, la57, at, &mut read) {
-            fch::Mapping::Mapped => {}
-            other => return FchSeen::not_read(fch::NotRead::NotMapped(other)),
-        }
-    }
-    FchSeen {
-        where_line: fch::WhereLine::Read(region, fch::map_says(described, fch::PM_BLOCK)),
-        registers: Some(read_fch_registers()),
-        pm1a_event,
-        pretend: None,
-    }
+    seen
 }
 
 /// TASKS item 121, before the call, on the firmware's console: where the FCH's registers are,
 /// their values, and what the run does. In a boot's first run, the control: `0x06` to `0xCF9`
 /// once the UART has emptied, and if the machine still runs after the wait, a line saying so; the
-/// run then makes the call and takes Amendment 3's path. In a run whose last reset was the
-/// loader's own, what [`reset_without_firmware`] does after the call.
+/// run then makes the call and takes Amendment 3's path. In a run whose last reset was a `0x06` to
+/// `0xCF9`, or that finds no record of the last reset, what [`reset_without_firmware`] does after
+/// a call that returns `EFI_SUCCESS`.
 #[cfg(origin_bench)]
 fn bench_fch_decide(
     seen: FchSeen,
@@ -1801,7 +1826,6 @@ fn bench_fch_decide(
     early_uart: EarlyUart,
     out: &mut ConOut,
 ) -> Option<fch::Free> {
-    let _ = writeln!(out, "{}", seen.where_line);
     let pretend = seen.pretend;
     let Some(registers) = seen.registers else {
         let _ = writeln!(
@@ -1822,15 +1846,7 @@ fn bench_fch_decide(
             read: pretend.is_none(),
         }
     );
-    let layout = fch::Layout::check(&registers, seen.pm1a_event);
-    let decision = if layout.fits() {
-        match fch::Branch::of(registers.reset_status) {
-            fch::Branch::First => fch::Decision::Control(registers.reset_status),
-            fch::Branch::Mine => fch::Decision::AfterCall,
-        }
-    } else {
-        fch::Decision::Contradicts(layout)
-    };
+    let decision = fch::Decision::of(&registers, seen.pm1a_event);
     let _ = writeln!(out, "{}", fch::DecisionLine { decision, pretend });
     let wait = pretend.map_or(fch::WAIT_MS, fch::Pretend::wait_ms);
     let cf9 = !pretend.is_some_and(|p| p.no_cf9);
@@ -1847,20 +1863,20 @@ fn bench_fch_decide(
             let _ = writeln!(out, "{}", fch::ControlFailed(wait));
             None
         }
-        fch::Decision::AfterCall => Some(fch::Free {
+        fch::Decision::AfterCall { shutdown, .. } => Some(fch::Free {
             cf9,
-            shutdown: !pretend.is_some_and(|p| p.no_shutdown),
+            shutdown: shutdown && !pretend.is_some_and(|p| p.no_shutdown),
             wait_ticks: ticks_per_ms.saturating_mul(wait),
         }),
         fch::Decision::NotRead | fch::Decision::Contradicts(_) => None,
     }
 }
 
-/// TASKS item 121, after `ExitBootServices` returned, whatever its status, in a run whose last
-/// reset was the loader's own: `0x06` to `0xCF9` before anything else; interrupts masked; the wait
-/// by the time-stamp counter; then a triple fault. If the machine is still running after that
-/// (only when `BENCH-FCH` leaves the triple fault out), the caller goes on to TASKS item 116's path
-/// and Amendment 3's order.
+/// TASKS item 121, after `ExitBootServices` returned `EFI_SUCCESS`, in a run the FCH's record
+/// sends to the call: `0x06` to `0xCF9` before anything else; interrupts masked; the wait by the
+/// time-stamp counter; then a triple fault where the shutdown message reaches the FCH. If the
+/// machine is still running after that (with the shutdown message off, or when `BENCH-FCH` leaves
+/// the triple fault out), the caller goes on to TASKS item 116's path and Amendment 3's order.
 #[cfg(origin_bench)]
 #[inline(always)]
 fn reset_without_firmware(free: fch::Free) {
@@ -1880,10 +1896,11 @@ fn reset_without_firmware(free: fch::Free) {
 fn write_cf9() {
     // SAFETY: CPL 0; port 0xCF9 is the FCH's reset control register, and 0x06 its documented
     // warm-reset command (AMD's FCH documents, TASKS item 121), written only to end a diagnostic
-    // run on a bench machine (decision item 345). It touches no memory, and OUT leaves the flags
-    // as they were.
+    // run on a bench machine (decision item 345). OUT leaves the flags as they were. The block is
+    // not `nomem`, so the compiler moves no memory access across it (TASKS item 121's review,
+    // R121-8).
     unsafe {
-        core::arch::asm!("out dx, al", in("dx") fch::RESET_PORT, in("al") fch::WARM_RESET, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("out dx, al", in("dx") fch::RESET_PORT, in("al") fch::WARM_RESET, options(nostack, preserves_flags));
     }
 }
 
@@ -1916,13 +1933,6 @@ fn wait_ticks(ticks: u64) {
     }
 }
 
-/// Whether CPUID's vendor is AMD's: `AuthenticAMD` in EBX, EDX and ECX.
-#[cfg(origin_bench)]
-fn is_amd() -> bool {
-    let [_, ebx, ecx, edx] = cpuid(0);
-    (ebx, edx, ecx) == (0x6874_7541, 0x6974_6E65, 0x444D_4163)
-}
-
 /// CR3: the firmware's page tables, which stay loaded until the kernel is entered.
 #[cfg(origin_bench)]
 fn read_cr3() -> u64 {
@@ -1936,43 +1946,65 @@ fn read_cr3() -> u64 {
 
 /// The FCH's power-management registers, each one volatile load of its documented width
 /// ([`fch::Registers`]).
+///
+/// # Safety
+///
+/// [`fch::gate`] has passed: the processor is AMD's, the firmware's DSDT describes a system-memory
+/// region holding every register read, and the firmware's page tables, still loaded, map its first
+/// and last byte to themselves (TASKS item 121's review, R121-7).
 #[cfg(origin_bench)]
-fn read_fch_registers() -> fch::Registers {
+unsafe fn read_fch_registers() -> fch::Registers {
     fch::Registers {
-        decode_en: fch_read32(fch::DECODE_EN),
-        pci_control: fch_read32(fch::PCI_CONTROL),
-        pm1_evt_blk: fch_read16(fch::PM1_EVT_BLK),
-        acpi_config: fch_read32(fch::ACPI_CONFIG),
-        reset_status: fch_read32(fch::RESET_STATUS),
-        pmio_debug: fch_read8(fch::PMIO_DEBUG),
+        // SAFETY: as above; `PMx00` is 32 bits, 4-aligned.
+        decode_en: unsafe { fch_read32(fch::DECODE_EN) },
+        // SAFETY: as above; `PMx08` is 32 bits, 4-aligned.
+        pci_control: unsafe { fch_read32(fch::PCI_CONTROL) },
+        // SAFETY: as above; `PMx60` is 16 bits, 2-aligned.
+        pm1_evt_blk: unsafe { fch_read16(fch::PM1_EVT_BLK) },
+        // SAFETY: as above; `PMx74` is 32 bits, 4-aligned.
+        acpi_config: unsafe { fch_read32(fch::ACPI_CONFIG) },
+        // SAFETY: as above; `PMxC0` is 32 bits, 4-aligned.
+        reset_status: unsafe { fch_read32(fch::RESET_STATUS) },
+        // SAFETY: as above; `PMxD2` is 8 bits.
+        pmio_debug: unsafe { fch_read8(fch::PMIO_DEBUG) },
     }
 }
 
 /// The 32-bit register at `offset` in the FCH's power-management block.
+///
+/// # Safety
+///
+/// As for [`read_fch_registers`], and `offset` is a documented 32-bit register's, 4-aligned.
 #[cfg(origin_bench)]
-fn fch_read32(offset: u64) -> u32 {
-    // SAFETY: the FCH's power-management block, which the firmware's DSDT describes as system
-    // memory and its page tables, still loaded, map (`bench_fch_read` checked both before calling
-    // this); `offset` is a documented 32-bit register's, 4-aligned; one volatile load, with no
-    // effect AMD's documents name.
+unsafe fn fch_read32(offset: u64) -> u32 {
+    // SAFETY: the caller's contract: memory-mapped I/O the firmware maps to itself; one volatile
+    // load, with no effect AMD's documents name.
     unsafe {
         ptr::with_exposed_provenance::<u32>((fch::PM_BLOCK + offset) as usize).read_volatile()
     }
 }
 
 /// The 16-bit register at `offset`.
+///
+/// # Safety
+///
+/// As for [`read_fch_registers`], and `offset` is a documented 16-bit register's, 2-aligned.
 #[cfg(origin_bench)]
-fn fch_read16(offset: u64) -> u16 {
-    // SAFETY: as for `fch_read32`, for a documented 16-bit register, 2-aligned.
+unsafe fn fch_read16(offset: u64) -> u16 {
+    // SAFETY: as for `fch_read32`, for a 16-bit register.
     unsafe {
         ptr::with_exposed_provenance::<u16>((fch::PM_BLOCK + offset) as usize).read_volatile()
     }
 }
 
 /// The 8-bit register at `offset`.
+///
+/// # Safety
+///
+/// As for [`read_fch_registers`], and `offset` is a documented 8-bit register's.
 #[cfg(origin_bench)]
-fn fch_read8(offset: u64) -> u8 {
-    // SAFETY: as for `fch_read32`, for a documented 8-bit register.
+unsafe fn fch_read8(offset: u64) -> u8 {
+    // SAFETY: as for `fch_read32`, for an 8-bit register.
     unsafe { ptr::with_exposed_provenance::<u8>((fch::PM_BLOCK + offset) as usize).read_volatile() }
 }
 

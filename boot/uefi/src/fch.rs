@@ -10,14 +10,24 @@
 //! Before the call the bench loader reads the FCH's power-management registers, and writes none:
 //! - only on an AMD processor, at the address AMD's documents give ([`PM_BLOCK`]), where the
 //!   firmware's DSDT describes a system-memory region holding the registers read
-//!   ([`describes`]) and the firmware's page tables map them ([`walk`]);
+//!   ([`scan_dsdt`]) and the firmware's page tables map them to themselves ([`walk`]), all checked
+//!   by [`gate`];
 //! - their raw values, printed, with what each bit says ([`Registers`]);
 //! - a value that contradicts the documents' layout ([`Layout`]) ends the matter: no control, and
 //!   the run takes Amendment 3's path after the call.
 //!
-//! The control ([`Branch`]): if the last reset was not the loader's own `0x06` to `0xCF9`, the
-//! run is the boot's first. The loader writes `0x06` to `0xCF9` and makes no call, and the FCH's
-//! record of that reset marks the next run, which makes the call and resets after it.
+//! The control ([`Branch`]): if the last reset had another documented cause, the run is the boot's
+//! first. The loader writes `0x06` to `0xCF9` and makes no call, and the FCH's record of that reset
+//! marks the next run, which makes the call and resets after it. A `0x06` to `0xCF9` may also be
+//! someone else's (the firmware's own reset, for one), so a run of the second kind is evidence only
+//! after a control run in the same boot (TASKS item 121's review, R121-1). A register that names
+//! no reset cause at all holds no record: the run makes the call and resets after it, with no
+//! control in that boot (the coordinating session's ruling on R121-2).
+//!
+//! After the call, the reset follows only a call that returned `EFI_SUCCESS`, the one thing before
+//! it a compare of the status in RAX. After an error the loader's retry runs, with the same check
+//! after it, and after a second error its normal path (the coordinating session's ruling on
+//! R121-3).
 //!
 //! The registers come from AMD's FCH documents for related parts, PPR 55901 (family 19h model
 //! 11h) and PPR 57238 (family 1Ah models 00h to 0Fh), which agree at every offset used here. PPR
@@ -69,8 +79,30 @@ pub const SHUTDOWN_MESSAGE: u32 = 1 << 17;
 pub const CF9_RESET_STOPPED: u8 = 1 << 6;
 /// `PMxC0` bit 19: the last reset was a `0x06` written to `0xCF9`.
 pub const LAST_RESET_CF9_WARM: u32 = 1 << 19;
+/// `PMxC0` bit 20: a `0x0E` written to `0xCF9`. Only software clears it, so a later reset leaves
+/// it set beside its own bit.
+pub const LAST_RESET_CF9_COLD: u32 = 1 << 20;
 /// `PMx60`'s address bits.
 pub const PM1_ADDRESS_MASK: u16 = 0xFFFC;
+/// The reset causes of `PMxC0` that each new reset clears before it sets its own: bits 16, 18,
+/// 19 and 21 to 30 but 20 (which only software clears) and 28 (which AMD's documents do not name).
+/// Two of them set at once contradict the documents (TASKS item 121's review, R121-10).
+pub const RESET_CAUSES: u32 = (1 << 16)
+    | (1 << 18)
+    | (1 << 19)
+    | (1 << 21)
+    | (1 << 22)
+    | (1 << 23)
+    | (1 << 24)
+    | (1 << 25)
+    | (1 << 26)
+    | (1 << 27)
+    | (1 << 29)
+    | (1 << 30);
+/// Every reset cause AMD's documents name in `PMxC0`: [`RESET_CAUSES`] and bit 20. Bits 0 to 9
+/// name why the machine last shut down, not why it reset. With none of these set, the register
+/// holds no record of the last reset (the coordinating session's ruling on R121-2).
+pub const RESET_RECORD: u32 = RESET_CAUSES | LAST_RESET_CF9_COLD;
 
 /// The FCH's reset control port.
 pub const RESET_PORT: u16 = 0xCF9;
@@ -315,8 +347,8 @@ fn constant(bytes: &[u8], i: usize) -> Option<(u64, usize)> {
 /// What the firmware's page tables say of an address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mapping {
-    /// A present entry maps it.
-    Mapped,
+    /// A present entry maps it, to this physical address.
+    Mapped(u64),
     /// The entry at this level (4 for the PML4, down to 1) is not present.
     NotPresent(u8),
     /// CR4 says five-level paging, which this walk does not follow.
@@ -327,9 +359,14 @@ pub enum Mapping {
 
 /// A page-table entry's address bits.
 const ADDRESS: u64 = 0x000F_FFFF_FFFF_F000;
+/// A 2 MiB leaf's frame bits (bit 12 is its PAT bit).
+const FRAME_2M: u64 = 0x000F_FFFF_FFE0_0000;
+/// A 1 GiB leaf's frame bits.
+const FRAME_1G: u64 = 0x000F_FFFF_C000_0000;
 
 /// Walks the four-level page tables at `cr3` for `va`, following 1 GiB and 2 MiB pages (Intel SDM
-/// Volume 3A, §4.5; AMD64 APM Volume 2, §5.3). Every entry is read through `read`.
+/// Volume 3A, §4.5; AMD64 APM Volume 2, §5.3), to the physical address the leaf gives. Every entry
+/// is read through `read`.
 pub fn walk(
     cr3: u64,
     la57: bool,
@@ -350,12 +387,45 @@ pub fn walk(
         if entry & 1 == 0 {
             return Mapping::NotPresent(level);
         }
-        if level == 1 || ((level == 3 || level == 2) && entry & (1 << 7) != 0) {
-            return Mapping::Mapped;
+        let large = entry & (1 << 7) != 0;
+        match level {
+            1 => return Mapping::Mapped((entry & ADDRESS) | (va & 0xFFF)),
+            2 if large => return Mapping::Mapped((entry & FRAME_2M) | (va & 0x1F_FFFF)),
+            3 if large => return Mapping::Mapped((entry & FRAME_1G) | (va & 0x3FFF_FFFF)),
+            _ => table = entry & ADDRESS,
         }
-        table = entry & ADDRESS;
     }
-    Mapping::Mapped
+    Mapping::NotPresent(1)
+}
+
+/// Whether CPUID leaf 0's vendor is AMD's: `AuthenticAMD` across EBX, EDX and ECX.
+pub const fn is_amd_vendor(ebx: u32, ecx: u32, edx: u32) -> bool {
+    ebx == 0x6874_7541 && edx == 0x6974_6E65 && ecx == 0x444D_4163
+}
+
+/// D1's checks, in order, before any register is read: the processor is AMD's; the walk found
+/// the FADT; its DSDT describes a region holding the registers; and the firmware's page tables map
+/// the first and the last byte read to themselves (`walk_at`). The region, or why not.
+pub fn gate(
+    amd: bool,
+    located: Result<Located, NoReset>,
+    walk_at: &mut dyn FnMut(u64) -> Mapping,
+) -> Result<Region, NotRead> {
+    if !amd {
+        return Err(NotRead::NotAmd);
+    }
+    let region = located
+        .map_err(NotRead::NoFadt)?
+        .region
+        .map_err(NotRead::NoRegion)?;
+    for at in [PM_BLOCK, PM_BLOCK + SPAN - 1] {
+        match walk_at(at) {
+            Mapping::Mapped(phys) if phys == at => {}
+            Mapping::Mapped(phys) => return Err(NotRead::Elsewhere { at, phys }),
+            other => return Err(NotRead::NotMapped(other)),
+        }
+    }
+    Ok(region)
 }
 
 /// What the firmware's memory map says of an address: printed, not required.
@@ -421,6 +491,8 @@ pub enum Layout {
     Fits(Option<u16>),
     /// This register reads all ones: nothing answered there.
     AllOnes(&'static str),
+    /// `PMxC0` names more than one of [`RESET_CAUSES`].
+    SeveralCauses(u32),
     /// `PMx60`'s address is not the FADT's PM1a event block.
     Pm1Differs {
         /// `PMx60`'s address bits.
@@ -443,6 +515,9 @@ impl Layout {
                 return Self::AllOnes(name);
             }
         }
+        if (r.reset_status & RESET_CAUSES).count_ones() > 1 {
+            return Self::SeveralCauses(r.reset_status);
+        }
         let block = r.pm1_evt_blk & PM1_ADDRESS_MASK;
         match pm1a_event {
             Some(fadt) if fadt & PM1_ADDRESS_MASK != block => Self::Pm1Differs { block, fadt },
@@ -460,9 +535,15 @@ impl Layout {
 /// Which run this is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Branch {
-    /// The last reset was the loader's own `0x06` to `0xCF9`: make the call, and reset after it.
+    /// The last reset was a `0x06` to `0xCF9`, as the control writes: make the call, and reset
+    /// after it.
     Mine,
-    /// Anything else: the boot's first run, the control.
+    /// `PMxC0` names no reset cause ([`RESET_RECORD`]): the firmware cleared it, or it keeps no
+    /// record. Make the call, and reset after it; this boot has no control (the coordinating
+    /// session's ruling on R121-2). Otherwise such a firmware would make every run a control, and
+    /// the call would never be made.
+    NoRecord,
+    /// Another reset cause: the boot's first run, the control.
     First,
 }
 
@@ -471,6 +552,8 @@ impl Branch {
     pub const fn of(reset_status: u32) -> Self {
         if reset_status & LAST_RESET_CF9_WARM != 0 {
             Self::Mine
+        } else if reset_status & RESET_RECORD == 0 {
+            Self::NoRecord
         } else {
             Self::First
         }
@@ -497,13 +580,20 @@ pub enum Kind {
     First,
     /// `mine`: a layout that fits, and a last reset through `0x06` to `0xCF9`.
     Mine,
+    /// `norecord`: a layout that fits, and `PMxC0` at its documented reset value, which names no
+    /// reset cause.
+    NoRecord,
     /// `bad`: every register all ones.
     Bad,
 }
 
+/// `PMxC0`'s value after a power-on reset (AMD's FCH documents): bit 11 only, no reset cause.
+pub const RESET_STATUS_AT_POWER_ON: u32 = 0x800;
+
 impl Pretend {
-    /// The words of [`SWITCH_PATH`]: exactly one of `first`, `mine` and `bad`, and any of
-    /// `nocf9`, `noshutdown` and `slow`, separated by whitespace. `None` for anything else.
+    /// The words of [`SWITCH_PATH`]: exactly one of `first`, `mine`, `norecord` and `bad`, and
+    /// any of `nocf9`, `noshutdown` and `slow`, separated by whitespace. `None` for anything
+    /// else.
     pub fn from_contents(contents: &[u8]) -> Option<Self> {
         let mut kind = None;
         let (mut no_cf9, mut no_shutdown, mut slow) = (false, false, false);
@@ -514,6 +604,7 @@ impl Pretend {
             let k = match word {
                 b"first" => Some(Kind::First),
                 b"mine" => Some(Kind::Mine),
+                b"norecord" => Some(Kind::NoRecord),
                 b"bad" => Some(Kind::Bad),
                 b"nocf9" if !no_cf9 => {
                     no_cf9 = true;
@@ -551,6 +642,7 @@ impl Pretend {
         let reset_status = match self.kind {
             Kind::First => 1 << 16,
             Kind::Mine => LAST_RESET_CF9_WARM,
+            Kind::NoRecord => RESET_STATUS_AT_POWER_ON,
             Kind::Bad => u32::MAX,
         };
         if matches!(self.kind, Kind::Bad) {
@@ -598,8 +690,8 @@ impl Pretend {
     }
 }
 
-/// What a run does after `ExitBootServices` returns, in a run [`Branch::Mine`] marks, settled
-/// before the call.
+/// What a run does after `ExitBootServices` returns `EFI_SUCCESS`, in a run [`Branch::Mine`] or
+/// [`Branch::NoRecord`] sends to the call, settled before the call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Free {
     /// Whether `0x06` goes to `0xCF9` first.
@@ -621,6 +713,14 @@ pub enum NotRead {
     NoRegion(NoRegion),
     /// The firmware's page tables do not map them.
     NotMapped(Mapping),
+    /// The firmware's page tables map `at` to another physical address (TASKS item 121's review,
+    /// R121-5).
+    Elsewhere {
+        /// The address checked.
+        at: u64,
+        /// Where the tables map it.
+        phys: u64,
+    },
 }
 
 /// The loader's line about where the registers are, and whether they were read.
@@ -644,7 +744,7 @@ impl fmt::Display for WhereLine {
             Self::Read(region, says) => {
                 write!(
                     f,
-                    "an AMD processor; the DSDT describes a system-memory region at {:#x}, {} bytes, that holds it; the firmware's page tables map it; the firmware's memory map: ",
+                    "an AMD processor; the DSDT describes a system-memory region at {:#x}, {} bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: ",
                     region.base, region.length
                 )?;
                 match says {
@@ -686,7 +786,11 @@ impl fmt::Display for WhereLine {
                         f,
                         "a page-table entry at {at:#x} is not in memory the firmware's map describes"
                     ),
-                    NotRead::NotMapped(Mapping::Mapped) => f.write_str("mapped"),
+                    NotRead::NotMapped(Mapping::Mapped(phys)) => write!(f, "mapped to {phys:#x}"),
+                    NotRead::Elsewhere { at, phys } => write!(
+                        f,
+                        "the firmware's page tables map {at:#x} to {phys:#x}, not to itself"
+                    ),
                 }
             }
             Self::Switch => f.write_str("not read; BENCH-FCH's values stand in"),
@@ -735,8 +839,36 @@ pub enum Decision {
     Contradicts(Layout),
     /// The control, before the call.
     Control(u32),
-    /// The call, then the reset with no firmware code.
-    AfterCall,
+    /// The call, then, once a call returns `EFI_SUCCESS`, the reset with no firmware code; with
+    /// the triple fault only when the shutdown message is on (`PMx74` bit 17; TASKS item 121's
+    /// review, R121-4).
+    AfterCall {
+        /// `PMxC0`, which names a `0x06` to `0xCF9` ([`Branch::Mine`]) or no reset cause
+        /// ([`Branch::NoRecord`]).
+        status: u32,
+        /// Whether the triple fault follows the wait.
+        shutdown: bool,
+    },
+}
+
+impl Decision {
+    /// What a run with `registers`, read or given, does: D3's check, then D4's branch, with the
+    /// triple fault only where the shutdown message reaches the FCH (`PMx74` bit 17): a shutdown
+    /// nothing acts on would hang where Amendment 3's order could still reset the machine (TASKS
+    /// item 121's review, R121-4).
+    pub fn of(registers: &Registers, pm1a_event: Option<u16>) -> Self {
+        let layout = Layout::check(registers, pm1a_event);
+        if !layout.fits() {
+            return Self::Contradicts(layout);
+        }
+        match Branch::of(registers.reset_status) {
+            Branch::First => Self::Control(registers.reset_status),
+            Branch::Mine | Branch::NoRecord => Self::AfterCall {
+                status: registers.reset_status,
+                shutdown: registers.acpi_config & SHUTDOWN_MESSAGE != 0,
+            },
+        }
+    }
 }
 
 /// The loader's decision line, with the switch's flags if any.
@@ -760,6 +892,9 @@ impl fmt::Display for DecisionLine {
                 f.write_str("the FCH's registers contradict AMD's documents (")?;
                 match layout {
                     Layout::AllOnes(name) => write!(f, "{name} reads all ones")?,
+                    Layout::SeveralCauses(status) => {
+                        write!(f, "PMxC0 {status:#010x} names more than one reset cause")
+                    }
                     Layout::Pm1Differs { block, fadt } => write!(
                         f,
                         "PMx60 names the PM1 event block at {block:#x}, the FADT at {fadt:#x}"
@@ -770,13 +905,31 @@ impl fmt::Display for DecisionLine {
             }
             Decision::Control(status) => write!(
                 f,
-                "the last reset was not this loader's ({}): the boot's first run, the control: {WARM_RESET:#04x} to {RESET_PORT:#x} now, and ExitBootServices is not called",
+                "the last reset was not a {WARM_RESET:#04x} to {RESET_PORT:#x} ({}): the boot's first run, the control: {WARM_RESET:#04x} to {RESET_PORT:#x} now, and ExitBootServices is not called",
                 Causes(status)
             ),
-            Decision::AfterCall => write!(
-                f,
-                "the last reset was this loader's own, {WARM_RESET:#04x} to {RESET_PORT:#x} (PMxC0 bit 19): ExitBootServices is called, then {WARM_RESET:#04x} to {RESET_PORT:#x} as the first thing after it returns, then a triple fault"
-            ),
+            Decision::AfterCall { status, shutdown } => {
+                if Branch::of(status) == Branch::Mine {
+                    write!(
+                        f,
+                        "the last reset was a {WARM_RESET:#04x} to {RESET_PORT:#x} (PMxC0 bit 19), as the control writes"
+                    )?;
+                } else {
+                    write!(
+                        f,
+                        "PMxC0 {status:#010x} names no reset cause: no record of the last reset, and no control in this boot"
+                    )?;
+                }
+                write!(
+                    f,
+                    ": ExitBootServices is called; when a call returns EFI_SUCCESS, {WARM_RESET:#04x} to {RESET_PORT:#x} is the first thing after it, then "
+                )?;
+                f.write_str(if shutdown {
+                    "a triple fault"
+                } else {
+                    "no triple fault, since the shutdown message is off (PMx74 bit 17), but Amendment 3's order"
+                })
+            }
         }?;
         if let Some(p) = self.pretend {
             if p.no_cf9 {
@@ -1063,7 +1216,7 @@ mod tests {
         ];
         assert_eq!(
             walk(pml4 | 0x18, false, va, &mut tables(&four)),
-            Mapping::Mapped
+            Mapping::Mapped(va)
         );
         // 2 MiB and 1 GiB pages.
         let two = [
@@ -1071,12 +1224,35 @@ mod tests {
             (pdpt + l3 * 8, pd | 3),
             (pd + l2 * 8, 0xFEC0_0000 | 0x83),
         ];
-        assert_eq!(walk(pml4, false, va, &mut tables(&two)), Mapping::Mapped);
+        assert_eq!(
+            walk(pml4, false, va, &mut tables(&two)),
+            Mapping::Mapped(va)
+        );
+        // A 2 MiB leaf's bit 12 is its PAT bit, not an address bit.
+        let pat = [
+            (pml4 + l4 * 8, pdpt | 3),
+            (pdpt + l3 * 8, pd | 3),
+            (pd + l2 * 8, 0xFEC0_1000 | 0x83),
+        ];
+        assert_eq!(
+            walk(pml4, false, va, &mut tables(&pat)),
+            Mapping::Mapped(va)
+        );
         let one = [
             (pml4 + l4 * 8, pdpt | 3),
             (pdpt + l3 * 8, 0xC000_0000 | 0x83),
         ];
-        assert_eq!(walk(pml4, false, va, &mut tables(&one)), Mapping::Mapped);
+        assert_eq!(
+            walk(pml4, false, va, &mut tables(&one)),
+            Mapping::Mapped(va)
+        );
+        // A leaf elsewhere.
+        let mut away = four;
+        away[3].1 = 0x1234_5000 | 3;
+        assert_eq!(
+            walk(pml4, false, va, &mut tables(&away)),
+            Mapping::Mapped(0x1234_5300)
+        );
         // Not present at each level.
         for level in 1..=4u8 {
             let mut e = four;
@@ -1089,12 +1265,71 @@ mod tests {
         // A PS bit at the PML4 is not a large page: the walk goes on through it.
         let mut e = four;
         e[0].1 |= 0x80;
-        assert_eq!(walk(pml4, false, va, &mut tables(&e)), Mapping::Mapped);
+        assert_eq!(walk(pml4, false, va, &mut tables(&e)), Mapping::Mapped(va));
         // Five levels, and an entry outside described memory.
         assert_eq!(walk(pml4, true, va, &mut tables(&four)), Mapping::FiveLevel);
         assert_eq!(
             walk(0x9000, false, va, &mut tables(&four)),
             Mapping::Unreadable(0x9000 + l4 * 8)
+        );
+    }
+
+    #[test]
+    fn the_vendor_is_amds_only_for_authenticamd() {
+        assert!(is_amd_vendor(0x6874_7541, 0x444D_4163, 0x6974_6E65));
+        // GenuineIntel, and AMD's words in the wrong registers.
+        assert!(!is_amd_vendor(0x756E_6547, 0x6C65_746E, 0x4965_6E69));
+        assert!(!is_amd_vendor(0x6874_7541, 0x6974_6E65, 0x444D_4163));
+    }
+
+    #[test]
+    fn the_gate_checks_vendor_region_and_identity_in_order() {
+        let region = Region {
+            base: PM_BLOCK,
+            length: 0x100,
+        };
+        let found = Ok(Located {
+            region: Ok(region),
+            pm1a_event: Some(0x800),
+        });
+        let identity = &mut |at: u64| Mapping::Mapped(at);
+        assert_eq!(gate(true, found, identity), Ok(region));
+        assert_eq!(gate(false, found, identity), Err(NotRead::NotAmd));
+        assert_eq!(
+            gate(true, Err(NoReset::NoMap), identity),
+            Err(NotRead::NoFadt(NoReset::NoMap))
+        );
+        let none = Ok(Located {
+            region: Err(NoRegion::NotDescribed),
+            pm1a_event: None,
+        });
+        assert_eq!(
+            gate(true, none, identity),
+            Err(NotRead::NoRegion(NoRegion::NotDescribed))
+        );
+        assert_eq!(
+            gate(true, found, &mut |_| Mapping::NotPresent(2)),
+            Err(NotRead::NotMapped(Mapping::NotPresent(2)))
+        );
+        assert_eq!(
+            gate(true, found, &mut |at| Mapping::Mapped(at + 0x1000)),
+            Err(NotRead::Elsewhere {
+                at: PM_BLOCK,
+                phys: PM_BLOCK + 0x1000
+            })
+        );
+        // The last byte read is checked as well as the first.
+        let last = PM_BLOCK + SPAN - 1;
+        let mut only_first = |at: u64| {
+            if at == last {
+                Mapping::NotPresent(1)
+            } else {
+                Mapping::Mapped(at)
+            }
+        };
+        assert_eq!(
+            gate(true, found, &mut only_first),
+            Err(NotRead::NotMapped(Mapping::NotPresent(1)))
         );
     }
 
@@ -1160,6 +1395,23 @@ mod tests {
             assert_eq!(Layout::check(&r, Some(0x800)), Layout::AllOnes(name));
             assert!(!Layout::check(&r, Some(0x800)).fits());
         }
+        // Two reset causes at once contradict the documents; a shut-down cause or bit 20 beside
+        // one does not.
+        let two = Registers {
+            reset_status: (1 << 16) | (1 << 19),
+            ..r
+        };
+        assert_eq!(
+            Layout::check(&two, Some(0x800)),
+            Layout::SeveralCauses((1 << 16) | (1 << 19))
+        );
+        for fine in [(1 << 19) | (1 << 20), (1 << 19) | 1, (1 << 16) | 0x800] {
+            let r = Registers {
+                reset_status: fine,
+                ..r
+            };
+            assert!(Layout::check(&r, Some(0x800)).fits(), "{fine:#x}");
+        }
         // QEMU's unassigned memory, were it read: zeros contradict the FADT's block.
         let zeros = Registers {
             decode_en: 0,
@@ -1173,11 +1425,99 @@ mod tests {
     }
 
     #[test]
-    fn only_bit_19_marks_the_loaders_own_reset() {
+    fn bit_19_marks_a_cf9_reset_another_cause_the_control_and_none_no_record() {
         assert_eq!(Branch::of(LAST_RESET_CF9_WARM), Branch::Mine);
         assert_eq!(Branch::of(LAST_RESET_CF9_WARM | 0x800), Branch::Mine);
-        for other in [0, 0x800, 1 << 16, 1 << 18, 1 << 20, 1 << 23, 1 << 25] {
+        // Bit 20 stays set from an older 0x0E, beside the new reset's own bit.
+        assert_eq!(
+            Branch::of(LAST_RESET_CF9_WARM | LAST_RESET_CF9_COLD),
+            Branch::Mine
+        );
+        for other in [1 << 16, 1 << 18, 1 << 20, 1 << 23, 1 << 25, 1 << 30] {
             assert_eq!(Branch::of(other), Branch::First, "{other:#x}");
+        }
+        // No reset cause: zero, the power-on value, a shutdown's causes only, and bits 28 and 31,
+        // which AMD's documents do not name as reset causes (R121-2's ruling).
+        for none in [
+            0,
+            RESET_STATUS_AT_POWER_ON,
+            1,
+            (1 << 4) | (1 << 9) | 0x800,
+            1 << 28,
+            1 << 31,
+        ] {
+            assert_eq!(Branch::of(none), Branch::NoRecord, "{none:#x}");
+        }
+        // Every bit of RESET_RECORD is one the cause table names.
+        for bit in 0..32 {
+            if RESET_RECORD & (1 << bit) != 0 {
+                assert!(CAUSES.iter().any(|&(b, _)| b == bit), "bit {bit}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_decision_follows_the_layout_the_branch_and_the_shutdown_message() {
+        assert_eq!(
+            Decision::of(&fitting(1 << 16), Some(0x800)),
+            Decision::Control(1 << 16)
+        );
+        let mine = fitting(LAST_RESET_CF9_WARM);
+        assert_eq!(
+            Decision::of(&mine, Some(0x800)),
+            Decision::AfterCall {
+                status: LAST_RESET_CF9_WARM,
+                shutdown: false
+            }
+        );
+        let on = Registers {
+            acpi_config: mine.acpi_config | SHUTDOWN_MESSAGE,
+            ..mine
+        };
+        assert_eq!(
+            Decision::of(&on, Some(0x800)),
+            Decision::AfterCall {
+                status: LAST_RESET_CF9_WARM,
+                shutdown: true
+            }
+        );
+        // No record: the call, not the control (R121-2's ruling).
+        assert_eq!(
+            Decision::of(&fitting(0), Some(0x800)),
+            Decision::AfterCall {
+                status: 0,
+                shutdown: false
+            }
+        );
+        assert_eq!(
+            Decision::of(&mine, Some(0x600)),
+            Decision::Contradicts(Layout::Pm1Differs {
+                block: 0x800,
+                fadt: 0x600
+            })
+        );
+        // The switch's values: the control, the reset after the call with the triple fault, and
+        // a contradiction.
+        for (words, want) in [
+            (&b"first"[..], Decision::Control(1 << 16)),
+            (
+                b"mine",
+                Decision::AfterCall {
+                    status: LAST_RESET_CF9_WARM,
+                    shutdown: true,
+                },
+            ),
+            (
+                b"norecord",
+                Decision::AfterCall {
+                    status: RESET_STATUS_AT_POWER_ON,
+                    shutdown: true,
+                },
+            ),
+            (b"bad", Decision::Contradicts(Layout::AllOnes("PMx00"))),
+        ] {
+            let p = Pretend::from_contents(words).unwrap();
+            assert_eq!(Decision::of(&p.values(Some(0x600)), Some(0x600)), want);
         }
     }
 
@@ -1211,6 +1551,7 @@ mod tests {
             b"mine nocf9 nocf9",
             b"MINE",
             b"mine x",
+            b"norecord mine",
         ] {
             assert_eq!(Pretend::from_contents(bad), None, "{bad:?}");
         }
@@ -1223,6 +1564,11 @@ mod tests {
         let mine = Pretend::from_contents(b"mine").unwrap().values(Some(0x600));
         assert!(Layout::check(&mine, Some(0x600)).fits());
         assert_eq!(Branch::of(mine.reset_status), Branch::Mine);
+        let none = Pretend::from_contents(b"norecord")
+            .unwrap()
+            .values(Some(0x600));
+        assert!(Layout::check(&none, Some(0x600)).fits());
+        assert_eq!(Branch::of(none.reset_status), Branch::NoRecord);
         let bad = Pretend::from_contents(b"bad").unwrap().values(Some(0x600));
         assert_eq!(Layout::check(&bad, Some(0x600)), Layout::AllOnes("PMx00"));
     }
@@ -1247,7 +1593,7 @@ mod tests {
                 MapSays::Absent
             )
         );
-        assert!(line.ends_with("the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it; the firmware's memory map: not described"));
+        assert!(line.ends_with("the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: not described"));
         let line = format!(
             "{}",
             RegistersLine {
@@ -1268,17 +1614,45 @@ mod tests {
         );
         assert_eq!(
             line,
-            "origin-boot: bench build: the last reset was not this loader's (the reset pin (bit 16)): the boot's first run, the control: 0x06 to 0xcf9 now, and ExitBootServices is not called"
+            "origin-boot: bench build: the last reset was not a 0x06 to 0xcf9 (the reset pin (bit 16)): the boot's first run, the control: 0x06 to 0xcf9 now, and ExitBootServices is not called"
         );
         let p = Pretend::from_contents(b"mine nocf9 noshutdown slow").unwrap();
         let line = format!(
             "{}",
             DecisionLine {
-                decision: Decision::AfterCall,
+                decision: Decision::AfterCall {
+                    status: LAST_RESET_CF9_WARM,
+                    shutdown: true
+                },
                 pretend: Some(p)
             }
         );
-        assert!(line.starts_with("origin-boot: bench build: the last reset was this loader's own, 0x06 to 0xcf9 (PMxC0 bit 19): ExitBootServices is called, then 0x06 to 0xcf9 as the first thing after it returns, then a triple fault"));
+        assert!(line.starts_with("origin-boot: bench build: the last reset was a 0x06 to 0xcf9 (PMxC0 bit 19), as the control writes: ExitBootServices is called; when a call returns EFI_SUCCESS, 0x06 to 0xcf9 is the first thing after it, then a triple fault"));
+        let none = format!(
+            "{}",
+            DecisionLine {
+                decision: Decision::AfterCall {
+                    status: RESET_STATUS_AT_POWER_ON,
+                    shutdown: true
+                },
+                pretend: None
+            }
+        );
+        assert_eq!(
+            none,
+            "origin-boot: bench build: PMxC0 0x00000800 names no reset cause: no record of the last reset, and no control in this boot: ExitBootServices is called; when a call returns EFI_SUCCESS, 0x06 to 0xcf9 is the first thing after it, then a triple fault"
+        );
+        let off = format!(
+            "{}",
+            DecisionLine {
+                decision: Decision::AfterCall {
+                    status: LAST_RESET_CF9_WARM,
+                    shutdown: false
+                },
+                pretend: None
+            }
+        );
+        assert!(off.ends_with("then no triple fault, since the shutdown message is off (PMx74 bit 17), but Amendment 3's order"));
         assert!(line.ends_with(" [BENCH-FCH nocf9: no write to 0xCF9] [BENCH-FCH noshutdown: no triple fault] [BENCH-FCH slow: waits of 5000 ms]"));
         let line = format!(
             "{}",
