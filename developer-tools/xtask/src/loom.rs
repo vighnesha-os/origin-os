@@ -179,14 +179,18 @@ const EXITS_EARLY: &[&str] = &[
 
 /// What the moves models report (`moves_models.rs`; TASKS item 95, ADR-0020 S4 and S5): a frame
 /// taken twice, a frame a refused move did not give back, a frame resumed on another processor
-/// before its own had left its stack, and a scan past its bound. A home a scan missed is
-/// `CTX_UNCOVERED`.
+/// before its own had left its stack, and two holders of the move gate overlapping or missing
+/// each other's writes. A home a scan missed is `CTX_UNCOVERED`.
 const MOVE_TAKEN_TWICE: &[&str] =
     &["a frame was taken twice: by a move and a switch, or by two switches"];
 const MOVE_NOT_GIVEN_BACK: &[&str] =
     &["a frame back from a full destination could not be resumed at its source"];
 const MOVE_RESUMED_TOO_SOON: &[&str] =
     &["a frame was resumed on another processor before its own had left its stack"];
+const MOVE_GATE: &[&str] = &[
+    "two holders of the move gate at once",
+    "a holder of the move gate missed the one before it",
+];
 
 /// What `threads_a_stale_name_wakes_nobody` reports (TASKS item 92): a wake-up by a stale name
 /// reached the record's next thread.
@@ -1924,7 +1928,10 @@ const CONTROLS: &[Control] = &[
         to: "        let _ = (finished, begun);
         true
 ",
-        models: &[("moves::mv1_a_scan_reading_the_destination_first_finds_a_moving_home", CTX_UNCOVERED)],
+        models: &[(
+            "moves::mv1_a_scan_reading_the_destination_first_finds_a_moving_home",
+            CTX_UNCOVERED,
+        )],
     },
     Control {
         // MX2 (MV2's and MV2b's control): `lend` takes the frame by a plain store, not by the
@@ -1967,7 +1974,11 @@ const CONTROLS: &[Control] = &[
                 } else {
                     Err(MoveRefused::NotRestored)
                 };
+            }
+        };
 ",
+        // The frame is adopted as if lent (a home equal to the frame: the model's context never
+        // ran), and only then lent; the source's home is forgotten as `relocate` does.
         to: "        let early = Lent {
             table: source,
             slot: usize::MAX,
@@ -1975,12 +1986,17 @@ const CONTROLS: &[Control] = &[
             frame,
             settled: true,
         };
-        let adopted = match destination.adopt(&moving, early) {
-            Ok(adopted) => adopted,
-            Err(_) => return Err(MoveRefused::NotRestored),
+        let Ok(early) = destination.adopt(&moving, early) else {
+            return Err(MoveRefused::NotRestored);
         };
         let mut lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
         lent.settled = true;
+        let adopted = Adopted {
+            source,
+            slot: lent.slot,
+            home: lent.home,
+        };
+        drop((early, lent));
 ",
         models: &[("moves::mv3_only_one_processor_resumes_a_moving_context", MOVE_TAKEN_TWICE)],
     },
@@ -2122,7 +2138,10 @@ const CONTROLS: &[Control] = &[
         to: "        let _ = quiet;
         let covered = false;
 ",
-        models: &[("moves::mv7_a_scan_racing_back_to_back_moves_ends_and_finds_the_home", CTX_UNCOVERED)],
+        models: &[(
+            "moves::mv7_a_scan_racing_back_to_back_moves_ends_and_finds_the_home",
+            CTX_UNCOVERED,
+        )],
     },
     Control {
         // MX8 (the review of TASKS item 95, R95-7 (c)): finished raised with Relaxed. A scan that
@@ -2133,7 +2152,10 @@ const CONTROLS: &[Control] = &[
 ",
         to: "        let _ = self.finished.fetch_add(1, Relaxed);
 ",
-        models: &[("moves::mv1_a_scan_reading_the_destination_first_finds_a_moving_home", CTX_UNCOVERED)],
+        models: &[(
+            "moves::mv1_a_scan_reading_the_destination_first_finds_a_moving_home",
+            CTX_UNCOVERED,
+        )],
     },
     Control {
         // MX9 (R95-7 (d)): a pass believed whenever begun did not change across it, finished
@@ -2146,7 +2168,10 @@ const CONTROLS: &[Control] = &[
         to: "        let _ = finished;
         self.begun.load(Acquire) == begun
 ",
-        models: &[("moves::mv1_a_scan_reading_the_destination_first_finds_a_moving_home", CTX_UNCOVERED)],
+        models: &[(
+            "moves::mv1_a_scan_reading_the_destination_first_finds_a_moving_home",
+            CTX_UNCOVERED,
+        )],
     },
     Control {
         // MX10 (R95-7 (e)): begun raised after `lend` rather than before it. A frame on a stack
@@ -2174,7 +2199,10 @@ const CONTROLS: &[Control] = &[
 ",
         to: "            Some(slot) => slot.frame.store(here, Release),
 ",
-        models: &[("moves::lv1_a_frame_is_resumed_elsewhere_only_after_its_processor_left_the_stack", MOVE_RESUMED_TOO_SOON)],
+        models: &[(
+            "moves::lv1_a_frame_is_resumed_elsewhere_only_after_its_processor_left_the_stack",
+            MOVE_RESUMED_TOO_SOON,
+        )],
     },
     Control {
         // LX4 (R95-7 (b)): the publication stores the frame in its slot with Relaxed: a mover that
@@ -2189,7 +2217,10 @@ const CONTROLS: &[Control] = &[
             slot.frame.store(frame, Relaxed);
         }
 ",
-        models: &[("moves::lv1_a_frame_is_resumed_elsewhere_only_after_its_processor_left_the_stack", MOVE_RESUMED_TOO_SOON)],
+        models: &[(
+            "moves::lv1_a_frame_is_resumed_elsewhere_only_after_its_processor_left_the_stack",
+            MOVE_RESUMED_TOO_SOON,
+        )],
     },
     Control {
         // LX2a (LV2's control; the boot control C95-B1 plants the same): `covers` does not read the
@@ -2202,7 +2233,10 @@ const CONTROLS: &[Control] = &[
         }
 ",
         to: "",
-        models: &[("moves::lv2_a_frame_is_covered_while_its_processor_publishes_it", CTX_UNCOVERED)],
+        models: &[(
+            "moves::lv2_a_frame_is_covered_while_its_processor_publishes_it",
+            CTX_UNCOVERED,
+        )],
     },
     Control {
         // LX2b (LV2's control): `covers` reads the leaving record after the slots: a publication
@@ -2221,7 +2255,10 @@ const CONTROLS: &[Control] = &[
             .any(|slot| inside(slot.home.load(Acquire)) || inside(slot.frame.load(Acquire)))
             || inside(self.leaving.load(Acquire))
 ",
-        models: &[("moves::lv2_a_frame_is_covered_while_its_processor_publishes_it", CTX_UNCOVERED)],
+        models: &[(
+            "moves::lv2_a_frame_is_covered_while_its_processor_publishes_it",
+            CTX_UNCOVERED,
+        )],
     },
     Control {
         // LX3 (R95-7 (a)): the publication clears the leaving record before it stores the frame in
@@ -2238,7 +2275,53 @@ const CONTROLS: &[Control] = &[
             slot.frame.store(frame, Release);
         }
 ",
-        models: &[("moves::lv2_a_frame_is_covered_while_its_processor_publishes_it", CTX_UNCOVERED)],
+        models: &[(
+            "moves::lv2_a_frame_is_covered_while_its_processor_publishes_it",
+            CTX_UNCOVERED,
+        )],
+    },
+    Control {
+        // MX11 (D95-2): a scan's last pass without the gate: it may overlap a move.
+        name: "moves_last_pass_without_the_gate",
+        file: CONTEXTS,
+        from: "            let _gate = self.gate.lock();
+            pass()
+",
+        to: "            pass()
+",
+        models: &[(
+            "moves::mv9_the_gate_admits_one_holder_at_a_time_and_a_scans_last_pass_is_one",
+            MOVE_GATE,
+        )],
+    },
+    Control {
+        // MX12 (D95-2): the gate's waiter reads the ticket served with Relaxed: admitted, it need
+        // not see what the holder before it wrote.
+        name: "moves_gate_served_relaxed",
+        file: CONTEXTS,
+        from: "        while self.serving.load(Acquire) != ticket {
+",
+        to: "        while self.serving.load(Relaxed) != ticket {
+",
+        models: &[(
+            "moves::mv9_the_gate_admits_one_holder_at_a_time_and_a_scans_last_pass_is_one",
+            MOVE_GATE,
+        )],
+    },
+    Control {
+        // MX13 (D95-2): a ticket taken by a load and a store, not one fetch-and-add: two takers
+        // can hold the same ticket, and both are admitted.
+        name: "moves_gate_ticket_not_atomic",
+        file: CONTEXTS,
+        from: "        let ticket = self.next.fetch_add(1, Relaxed);
+",
+        to: "        let ticket = self.next.load(Relaxed);
+        self.next.store(ticket.wrapping_add(1), Relaxed);
+",
+        models: &[(
+            "moves::mv9_the_gate_admits_one_holder_at_a_time_and_a_scans_last_pass_is_one",
+            MOVE_GATE,
+        )],
     },
 ];
 

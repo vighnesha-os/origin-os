@@ -4,7 +4,7 @@
 //!
 //! The real code, compiled in unchanged: `contexts::Moves` (the move gate, the begun and finished
 //! counters, `relocate` and the bounded `scan`) and `contexts::Contexts` (`lend`, `adopt`,
-//! `Lent::restore`, `Lent::forget`, `switch` with its deferred publication, and `covers`), with
+//! `Lent::restore`, `Adopted::forget`, `switch` with its deferred publication, and `covers`), with
 //! four slots per table and two fast tries per scan in place of 32 and four (`SLOTS` and
 //! `FAST_TRIES` under `cfg(all(test, loom))`). What stands in for the machine:
 //!
@@ -47,6 +47,10 @@
 //! - MV8: a context suspended on a stack that is not its home (a measured stack) moves; a scan
 //!   asking about that stack, which only the frame word covers, finds it. Begun is raised before
 //!   `lend` for this: between `lend` and `adopt` the frame is in neither table.
+//! - MV9: the gate admits one holder at a time, and a scan's last pass is one of them: two moves
+//!   and a scan whose passes find nothing are never inside the gate together, and each holder
+//!   sees what those before it wrote. In the other models a scan's last pass finds the home
+//!   whether or not it holds the gate (the delta review of TASKS item 95, D95-2).
 //! - LV1: a frame switched out on one processor is resumed by another only after the first
 //!   processor's last use of the stack it was saved on (N4 (b); ADR-0020 S5).
 //! - LV2: a frame on a stack that is not its context's home is covered while its processor
@@ -60,7 +64,7 @@
 
 use super::*;
 
-use crate::contexts::{AdoptRefused, LendRefused, MoveRefused, Moves, Quiet, Scanned};
+use crate::contexts::{AdoptRefused, FAST_TRIES, LendRefused, MoveRefused, Moves, Quiet, Scanned};
 
 /// What MV2 and MV3 report when one frame was taken twice.
 const TAKEN_TWICE: &str = "a frame was taken twice: by a move and a switch, or by two switches";
@@ -71,6 +75,10 @@ const NOT_GIVEN_BACK: &str =
 /// stack was visible.
 const RESUMED_TOO_SOON: &str =
     "a frame was resumed on another processor before its own had left its stack";
+/// What MV9 reports when two holders of the move gate were inside it at once.
+const GATE_SHARED: &str = "two holders of the move gate at once";
+/// What MV9 reports when a holder of the move gate did not see what the one before it wrote.
+const GATE_UNORDERED: &str = "a holder of the move gate missed the one before it";
 
 /// A host thread stands in for a processor with interrupts off: nothing interrupts it.
 struct Plain;
@@ -404,6 +412,63 @@ fn mv8_a_frame_off_its_home_stack_is_found_while_it_moves() {
             assert!(scan_for(&moves, &tables, 7).covered, "{UNCOVERED}");
             mover.join().unwrap();
             assert!(ctx_covered(&tables[0], 7), "{UNCOVERED}");
+        },
+    );
+}
+
+/// MV9's critical section: no other holder inside, and the count of the holders before it read
+/// and written back one more, by a Relaxed load and store, so that only the gate orders them.
+fn hold_the_gate(inside: &AtomicU64, holders: &AtomicU64) {
+    assert_eq!(inside.fetch_add(1, Relaxed), 0, "{GATE_SHARED}");
+    let before = holders.load(Relaxed);
+    holders.store(before + 1, Relaxed);
+    assert_eq!(inside.fetch_sub(1, Relaxed), 1, "{GATE_SHARED}");
+}
+
+/// MV9: two movers each hold a move (`Moves::begin`) with nothing in it but the critical
+/// section, while a scan whose pass finds nothing makes its passes. While a move is under way the
+/// fast passes cannot settle, so the scan makes its last pass, under the gate, and that pass
+/// holds the same critical section. No two of the three are ever inside at once, and each sees
+/// every holder before it.
+#[test]
+fn mv9_the_gate_admits_one_holder_at_a_time_and_a_scans_last_pass_is_one() {
+    check(
+        "moves::mv9_the_gate_admits_one_holder_at_a_time_and_a_scans_last_pass_is_one",
+        preempted(3, SPINS),
+        EXHAUSTIVE,
+        || {
+            let moves = Arc::new(Moves::new());
+            let inside = Arc::new(AtomicU64::new(0));
+            let holders = Arc::new(AtomicU64::new(0));
+            let movers = [0, 1].map(|_| {
+                let (moves, inside, holders) = (
+                    Arc::clone(&moves),
+                    Arc::clone(&inside),
+                    Arc::clone(&holders),
+                );
+                thread::spawn(move || {
+                    let moving = moves.begin();
+                    hold_the_gate(&inside, &holders);
+                    drop(moving);
+                })
+            });
+            let passes = Cell::new(0);
+            let scanned = moves.scan(
+                || {
+                    passes.set(passes.get() + 1);
+                    if passes.get() > FAST_TRIES {
+                        hold_the_gate(&inside, &holders);
+                    }
+                    false
+                },
+                &Plain,
+            );
+            for mover in movers {
+                mover.join().unwrap();
+            }
+            assert!(!scanned.covered);
+            let gated = u64::from(scanned.passes > FAST_TRIES);
+            assert_eq!(holders.load(Relaxed), 2 + gated, "{GATE_UNORDERED}");
         },
     );
 }
