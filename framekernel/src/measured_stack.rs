@@ -132,10 +132,15 @@ fn sampled_depth(sampled: usize) -> Option<usize> {
 }
 
 /// The proof at boot (see the module docs): the boot flow, with interrupts off, before any
-/// thread exists.
-pub(crate) fn prove_at_boot(com1: &mut Console, tsc_hz: u64) -> bool {
+/// thread exists. `flow` is its witness, which a measured stack asks for (ADR-0020 S2; TASKS
+/// item 93).
+pub(crate) fn prove_at_boot(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    tsc_hz: u64,
+) -> bool {
     let began = rdtsc();
-    let empty = stack::with_measured_stack(BOOT_STACK, || ());
+    let empty = stack::with_measured_stack(flow, BOOT_STACK, || ());
     let call_ticks = rdtsc().wrapping_sub(began);
     let Some(empty) = empty else {
         let _ = writeln!(
@@ -156,7 +161,7 @@ pub(crate) fn prove_at_boot(com1: &mut Console, tsc_hz: u64) -> bool {
             value: found,
             depth,
             size,
-        }) = stack::with_measured_stack(BOOT_STACK, || level(levels, None))
+        }) = stack::with_measured_stack(flow, BOOT_STACK, || level(levels, None))
         else {
             let _ = writeln!(com1, "no stack for {levels} levels: measured stack failed");
             return false;
@@ -235,8 +240,12 @@ extern "sysv64" fn worker(_: u64) -> ! {
         }
         AT_DEPTH.store(false, Ordering::Release);
     };
-    let measured =
-        stack::with_measured_stack(STACK, || level(THREAD_LEVELS, Some(&mut at_deepest)));
+    // Pinned while it runs on the measured stack, which it yields on (ADR-0020 S2; TASKS item 93).
+    let pin = crate::sched::pin();
+    let measured = stack::with_measured_stack(pin.pinned(), STACK, || {
+        level(THREAD_LEVELS, Some(&mut at_deepest))
+    });
+    drop(pin);
     if let Some(Measured {
         value: found,
         depth,

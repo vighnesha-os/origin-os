@@ -998,13 +998,14 @@ fn resume(at: crate::trap::Here<'_>, here: u64, next: u64, exiting: bool) -> u64
 /// between its take and its clear would leave the ended stack in no record that retires it, and a
 /// reap then would leak it (the review of TASKS item 70, T70-1); one that interrupted the
 /// publication between its two stores would have its own leaving record cleared. The processor's
-/// index is read inside that section too, so the table is this processor's own even once a
-/// thread can be moved between a read and its use (the review of TASKS item 95, R95-3).
+/// index is read inside that section too, under its witness, so the table is this processor's
+/// own even once a thread can be moved between a read and its use (the review of TASKS item 95,
+/// R95-3; ADR-0020 S3, TASKS item 93).
 pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
     let used = |value: u64| value >= start && value < end;
     if tables_ready()
-        && without_interrupts(|| {
-            CONTEXTS.get(this_cpu().get()).map(|table| {
+        && without_interrupts_here(|at| {
+            CONTEXTS.this(this_cpu_at(at)).map(|table| {
                 table.publish_leaving();
                 table.retire_ended(running_on)
             })

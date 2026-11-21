@@ -407,7 +407,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         // painted stack, must equal the depth it sampled, to the byte.
         proofs.record(
             Proof::MeasuredStackBoot,
-            crate::measured_stack::prove_at_boot(&mut com1, tsc_hz),
+            crate::measured_stack::prove_at_boot(flow, &mut com1, tsc_hz),
         );
         // The AML interpreter over QEMU's DSDT and SSDTs, against a host that refuses every access
         // to hardware (ADR-0019 A3; TASKS item 63, step B3); on any other firmware it runs no AML
