@@ -664,9 +664,9 @@ mod tests {
                     line = line.strip_prefix(qualifier).unwrap_or(line);
                 }
                 if let Some(abi) = line.strip_prefix("extern \"")
-                    && let Some(end) = abi.find("\" ")
+                    && let Some((_, rest)) = abi.split_once("\" ")
                 {
-                    line = &abi[end + 2..];
+                    line = rest;
                 }
                 if line == before {
                     break;
@@ -676,7 +676,7 @@ mod tests {
             let end = name
                 .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .unwrap_or(name.len());
-            (end > 0).then(|| &name[..end])
+            name.get(..end).filter(|name| !name.is_empty())
         }
         let mut within: alloc::vec::Vec<(usize, &str)> = alloc::vec::Vec::new();
         let mut makers = alloc::vec::Vec::new();
@@ -724,14 +724,17 @@ mod tests {
         ))];
         while let Some(path) = paths.pop() {
             if path.is_dir() {
-                for entry in std::fs::read_dir(&path).expect("the crate's sources") {
+                for entry in std::fs::read_dir(path.as_path()).expect("the crate's sources") {
                     paths.push(entry.expect("a source entry").path());
                 }
             } else if path.extension().is_some_and(|e| e == "rs") {
                 let text = std::fs::read_to_string(&path).expect("a source file");
-                let file = path.file_name().map(|f| f.to_string_lossy().into_owned());
+                let file = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 for maker in switch_makers(&text) {
-                    found.push(format!("{}: {maker}", file.clone().unwrap_or_default()));
+                    found.push(format!("{file}: {maker}"));
                 }
             }
         }
