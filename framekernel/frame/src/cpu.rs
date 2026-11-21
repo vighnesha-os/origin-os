@@ -823,7 +823,9 @@ pub fn landings_checked() -> u64 {
 /// a frame recorded here is ever resumed, so a wrong answer from the scheduler above cannot make
 /// the trap entry load anything else. A context's home stays recorded from its publication until
 /// its processor has left its stack after it ended, and no switch writes it, so a stack a
-/// context may still use is always in this table for any processor's `stack_in_use`.
+/// context may still use is always in some processor's table for any processor's `stack_in_use`:
+/// in this one, or, while it moves (ADR-0020 S4), in its destination's before it leaves this one,
+/// which the scans through [`MOVES`] cannot miss.
 ///
 /// It replaces `SAVED_FRAMES`, whose 32 slots held only suspended threads' frames. A slot is now
 /// held from a thread's publication until it has ended and its processor has left its stack, so
@@ -942,8 +944,10 @@ fn resume(here: u64, next: u64, exiting: bool) -> u64 {
 
 /// Whether a processor may be using the kernel stack `[start, end)`, whose top is `top`: the
 /// caller's own stack pointer is on it, a processor's kernel-stack record names it, or a
-/// context's home or saved frame is on it (TASKS item 70). Only a stack in none of them can be
-/// freed. It never waits and takes no lock.
+/// context's home, saved frame or leaving frame is on it (TASKS item 70; ADR-0020 S5). Only a
+/// stack in none of them can be freed. It takes no lock but the move gate, and that only in a
+/// scan's last pass, after its fast passes each overlapped a move (ADR-0020 S4; [`MOVES`]): so a
+/// stack may be dropped under any lock but the gate, and a mover holding the gate must drop none.
 ///
 /// It first publishes the frame this processor's last switch-out left, and retires its own ended
 /// context, if any: this processor has left both stacks, since any code it runs after a switch
@@ -952,15 +956,18 @@ fn resume(here: u64, next: u64, exiting: bool) -> u64 {
 /// Both run with interrupts off, as the table asks: a switch that interrupted the retirement
 /// between its take and its clear would leave the ended stack in no record that retires it, and a
 /// reap then would leak it (the review of TASKS item 70, T70-1); one that interrupted the
-/// publication between its two stores would have its own leaving record cleared.
+/// publication between its two stores would have its own leaving record cleared. The processor's
+/// index is read inside that section too, so the table is this processor's own even once a
+/// thread can be moved between a read and its use (the review of TASKS item 95, R95-3).
 pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
     let used = |value: u64| value >= start && value < end;
     if tables_ready()
-        && let Some(table) = CONTEXTS.get(this_cpu().get())
         && without_interrupts(|| {
-            table.publish_leaving();
-            table.retire_ended(running_on)
-        }) == Err(Refused::StillOnIt)
+            CONTEXTS.get(this_cpu().get()).map(|table| {
+                table.publish_leaving();
+                table.retire_ended(running_on)
+            })
+        }) == Some(Err(Refused::StillOnIt))
     {
         panic!("an ended thread's stack was to be retired while this processor still ran on it");
     }
