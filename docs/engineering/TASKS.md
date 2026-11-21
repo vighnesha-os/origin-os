@@ -556,7 +556,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 96. **The move, its proofs and pinned mode (ADR-0020 S6, S20, S23). Plan P5, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 93, 94 and 95.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
 
-97. **Scheduling domains, equal capacity and the SMT and two-package machines (ADR-0020 S8, S9, S23). Plan P6, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after the records are on `main`; beside TASKS item 92.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
+97. **Scheduling domains, equal capacity and the SMT and two-package machines (ADR-0020 S8, S9, S23). Plan P6, batch 9. Numbered by the coordinating session on 2026-11-20; built on `claude/t97-domains-21554f` (2026-11-21), its contract, controls, comparison and review in its entry under "Task contracts"; lands after TASKS items 94 and 95.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
 
 98. **The idle pull and the idle kick (ADR-0020 S7, S10). Plan P7, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 96 and 97.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
 
@@ -3728,3 +3728,127 @@ Every finding is answered in a commit naming it, or left as a follow-up named th
 - **Run the kernel's own spawn and exit record steps in the Loom models** (R92-3). They are hand copies in the models today. This moves code from `sched` into `origin_sync::threads`, which TASKS items 93 and 96 change next.
 - **A second check of the slot's generation** beside the record's location, for when S6's `depart` frees slots (R92-4). This belongs to TASKS item 96.
 - **The design branch `claude/m3-scheduling-design-a5598a`** is kept until `land/batch-9` reaches `main` (the coordinating session).
+
+### 97. Scheduling domains, equal capacity and the SMT and two-package machines (ADR-0020 S8, S9, S23; plan P6)
+
+Assigned by the coordinating session on 2026-11-20, on the owner's word ("Start all four"), beside TASKS items 93, 94 and 95. The contract went to the coordinating session before any code (the coordination notes' `t97-contract.md`, written against `land/batch-9` at `a25228c9` on 2026-11-21 between 23:53 and 00:45 UTC). It was accepted at 00:50 UTC with the recommendations of Q1 to Q13 and these conditions:
+
+- **Q1:** the PPTT's claims and CPUID's are combined by their meet. This is a reading of S8, recorded as a dated note in it citing ACPI 6.6 §5.2.31.2; no owner item. The proof is Report class.
+- **Q2:** the aligned-block rule, with a host test on a hybrid layout.
+- **Q4:** `-cpu max,vendor=GenuineIntel` for the new machines under TCG; `-machine smp-cache` pinned on every machine, after checking that QEMU accepts it on each; every existing machine's log shown unchanged apart from cache and domain lines (base against tip, on the Mac); under KVM the "from" line held to its start.
+- **Q6:** QEMU's MADT IDs measured before the PPTT was planted.
+- **Q9:** the two machines held out of CI behind `ORIGIN_BOOT_MATRIX_ANY_COUNT` until a CI run with it on passes at two guest processors per host processor.
+- **Q10:** a host test for each source that is missing one processor.
+- **Q11:** `cache.rs` left alone.
+- **Q13:** no new per-CPU table.
+- **Landing:** after TASKS items 94 and 95.
+
+Built on `claude/t97-domains-21554f`, cut from `land/batch-9` at `a25228c9` (`main` `fc96834d` plus TASKS item 92), checked with `git log -1` before the first commit.
+
+**As built**, in order:
+
+- `dfa9e28d`: `topology`: each processor reads which processors share its caches (leaf 04H, Fn8000_001D).
+- `66feaa16`: `capacity`: S9's sources as pure functions over synthetic inputs.
+- `b636882d`: `domains`: the tree, with disagreements read as "not shared".
+- `f5c68123`: `acpi`: the PPTT's shared caches, and the rules the reading rests on.
+- `b48748e7`: `numa::node_order`; the kernel crate re-exports `capacity` and `domains`.
+- `ed8e7f43`: the kernel's proof, "scheduling domains" (Report).
+- `f428e579`: xtask: the two machines, the pinned caches, the PPTT and the expected trees.
+- `bf509791`: ADR-0020 S8's dated note (Q1).
+- `edffc8ed`, `21d6ba7c`, `ad3aa081`, `9b4bcc8a`: the answers to the independent review (R97-1 to R97-17; `REVIEW_T97_2026-11-21.md`).
+- The records: this entry, ADR-0013's row and controls, the provenance entry, CL20, the research ledger `docs/research/2026-11-21-scheduling-domains.md` and `REVIEW_T97_2026-11-21.md`.
+- To come: `land/batch-9` merged once TASKS item 95 is in it, with bootproof's counts at 73, then the gates.
+
+**The design as it lands:**
+
+- **Shared caches (`origin_frame::topology::Caches`).**
+  - Each processor reads its own caches: Fn8000_001D where TopologyExtensions says it exists, else leaf 04H on an Intel processor (AMD reserves leaf 04H).
+  - For each cache it records the level, the type and the sharing shift: EAX\[25:14\] plus one, rounded up to a power of two.
+  - Reserved types and levels are skipped and named. At most 8 caches and 32 sub-leaves are read.
+- **The tree (`origin_frame::domains`).**
+  - Each processor claims an aligned block of APIC IDs for each level: core, L2, last-level cache, die (only where a leaf enumerates dies) and package.
+  - A processor's group is the largest aligned block inside its own claim and inside the claim of every member. A claim cut because a member claims less is counted.
+  - The PPTT's cache claims are met with CPUID's. Each processor where they differ is counted. A PPTT claim is used only where it names the same level as CPUID's; otherwise the processor is counted as naming another level.
+  - The SRAT gives the node level. Levels are ordered by refinement; equal levels are merged under joined names, and single processors are left out. Levels that cross fall back to core, die and package.
+  - Each node's other nodes are listed in ascending SLIT distance.
+  - Processors are named by CPU index.
+  - All of it is kept in `DOMAINS`, a `SetOnce` on the heap with no new per-CPU table, which items 98 and 100 read.
+- **The PPTT's reading (`origin_frame::acpi::pptt_caches`).**
+  - It walks from each leaf up through its parents, along each node's data chain.
+  - One structure listed by several nodes is one cache per node, unless its Cache ID is valid.
+  - Rules that leave the table unused:
+    - a leaf the MADT does not list, or lists twice;
+    - an enabled processor with no leaf;
+    - a leaf without an ID;
+    - an ID asked about twice;
+    - a chain entering a cache listed at another depth;
+    - two data chains on one node.
+  - Every lookup is a binary search over arrays sorted once.
+- **Capacity (`origin_frame::capacity`).** These are pure functions:
+  - HFI and Thread Director rows and flags;
+  - `_CPC`'s Highest Performance, as an Integer or as the field of a register;
+  - HWP's and AMD CPPC's Highest;
+  - AMD's ranking, which orders cores within one core type only.
+
+  `choose` takes the first source that gives every processor a value. No source reads a core type (S27-10). At boot every processor is 1024; TASKS item 106 reads the hardware.
+- **The proof.**
+  - `prove_domains` prints four lines:
+    - the tree;
+    - where its claims came from;
+    - what disagreed;
+    - the capacity.
+  - It fails, as a Report (ADR-0013 R3), on any finding.
+  - `bootproof` has 72 rows on this branch, and 73 after the merge with TASKS item 94.
+- **xtask.**
+  - `SMP_CACHE` pins QEMU's caches on every machine.
+  - Two new machines, as `boot-domains`:
+    - `ORIGIN_QEMU_TOPOLOGY=smt` and `packages`, each with explicit `cpus=` nodes;
+    - a PPTT planted on the two-package machine;
+    - expected lines computed from each machine's definition alone;
+    - run in `boot-matrix` on the Mac, and in CI only with `ORIGIN_BOOT_MATRIX_ANY_COUNT=on`.
+  - Under KVM the tree line and the "from" line are held to their starts. **No KVM tree has been measured.**
+
+**Measured:**
+
+- **QEMU 11.1.3 on the Mac**, guests paused:
+  - TCG's `max` is AuthenticAMD and refuses `topoext`;
+  - `smp-cache` is accepted on every machine;
+  - QEMU's default node placement puts a processor in its package's node (package index mod 2).
+- **QEMU's MADT ACPI processor IDs:** CPU 0 to 7 = ACPI IDs 0 to 7 on both new machines (a temporary print in `prove_domains`, booted once and reverted, 01:24 UTC). So the PPTT's leaves are named by CPU index.
+- **Boot times on the Mac** (`kernel boot: passed in`):
+  - first boots: SMT machine 15.1 s, two-package machine 14.7 s, default machine 13.1 s;
+  - in the control run: 15.3 s and 13.7 s;
+  - in the tip's full `boot-matrix` (04:55 to 05:15 UTC): 15.4 s and 15.0 s, against 13.2 to 13.4 s for the 4-processor machines and 76.9 to 78.8 s for the 65-processor ones;
+  - the three runs of the gates: in the gates' record below.
+- **CI** (2026-11-20, five runs): the real-processor `boot-matrix` step takes 14.7 to 19.2 minutes, 19.2 on an EPYC 7763. A kernel boot under KVM takes 24 to 27 s. Estimated share of the two new machines under KVM: 1 to 2 minutes, about 1 % of the 180-minute limit. **Held out of CI until measured there (Q9).**
+
+**Controls.** Each was a scripted edit, booted once with `cargo xtask boot-domains` at `9b4bcc8a` (04:49 to 04:55 UTC), the tree clean before and after; ADR-0013 has the table:
+- **C1, a narrower last-level-cache shift on CPU 3:** caught. `7 claims cut`, the tree changed, `consistent false: scheduling domains failed`, exit 1.
+- **C2, a PPTT on the SMT machine whose L3 is a node's:** caught. `8 differing from the PPTT`, the meet as the tree, the proof failed, exit 1.
+- **C3, the two-package machine's PPTT without Cache IDs:** passes as planned. `PPTT 5 caches, 0 with IDs`, with the same tree.
+
+**Base against tip (Q4 (b)).**
+- **The two runs:**
+  - The base is a full `boot-matrix` of `a25228c9` that TASKS item 94's session ran from an export, ending 00:55 UTC. Its export was compared file by file with this task's own export of `a25228c9` (`diff -rq`, nothing differed), so this task's queued run of the same commit was stopped rather than repeated.
+  - The tip is `9b4bcc8a`'s full `boot-matrix`, 04:55 to 05:15 UTC: `boot-matrix passed`.
+- **The method:** a script compared each of the 200 existing boots, as multisets of line forms (digits and hex masked, so the order processors interleave their lines does not count), with the cache and domain lines set aside.
+- **Unchanged:** 184 boots.
+- **The 16 that differ**, in two kinds of line only, each a run-to-run variation of host timing, not this change:
+  - the APIC timer's calibration line with or without `(1 disturbed window discarded)` (14 boots);
+  - on the two 65-processor machines, which of their boots carry the uneven fair-share lines ADR-0013 Amendment 2 reports (5 in each run, spread differently).
+- **Everything else matched:** the census, topology and NUMA lines, and every other proof's line. The verdict's count moved by the one new row.
+
+**Follow-ups** (for the coordinating session to number):
+
+1. Merge the two readers of leaf 04H: `cache.rs`'s sizes on the boot processor, and `topology`'s sharing on each processor (ruling Q11).
+2. Once the batch's first CI runs show the KVM tree lines on two or more runner processors, make them exact under KVM or record why they vary (ruling on R97-16).
+3. A CI run with `ORIGIN_BOOT_MATRIX_ANY_COUNT=on`, to measure the two new machines under KVM at two guest processors per host processor (ruling Q9). The hand-over says how.
+4. **No KVM tree has been measured** (ruling on R97-16): under KVM the tree line is held to its start until follow-up 2 is done.
+
+**Not shown:**
+
+- hybrid capacity, and any hardware capacity source at boot (ADR-0009 H4's machines; M3-6);
+- a cache-cluster level distinct from the core at boot: the machines S23 names have no modules (host tests only);
+- Fn8000_001D at boot (KVM on AMD only);
+- anything under KVM until CI runs it;
+- **no person has reviewed it.**
