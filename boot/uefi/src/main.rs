@@ -692,14 +692,16 @@ fn boot(
             let key = bench::key_for(calls.made(), stale, key);
             // TASKS item 116: the map was read and this call is being made.
             #[cfg(origin_bench)]
-            say_on_uart(
-                early_uart,
-                if calls.made() == 0 {
-                    bench::MARK_FIRST
-                } else {
-                    bench::MARK_RETRY
-                },
-            );
+            if plan.marks {
+                say_on_uart(
+                    early_uart,
+                    if calls.made() == 0 {
+                        bench::MARK_FIRST
+                    } else {
+                        bench::MARK_RETRY
+                    },
+                );
+            }
             // SAFETY: valid `ExitBootServices` with this image's handle and the key of the map
             // just obtained; nothing has been allocated since `GetMemoryMap`.
             let status = unsafe { exit(image, key) };
@@ -712,11 +714,12 @@ fn boot(
             let stack_top = direct_map_base + stack + (STACK_PAGES * PAGE) as u64;
             #[cfg(origin_bench)]
             {
+                mask_interrupts();
                 bench_disturb(early_uart, &plan);
                 let port = bench_exited(early_uart, bench::Exited { calls, stale });
                 // TASKS item 116: the registers again, the firmware's values written back, and,
                 // unless BENCH-AFTER asks for the kernel, the reset.
-                bench_after_call(early_uart, &plan);
+                bench_after_call(early_uart, &plan, calls);
                 // SAFETY: as for `enter_kernel` below; `crumbs` names a port the SPCR named
                 // and the shared parser accepted, or is 0.
                 unsafe {
@@ -742,12 +745,14 @@ fn boot(
         ExitOutcome::NotAttempted(failure) => Err(failure.report(out)),
         ExitOutcome::Halt => {
             #[cfg(origin_bench)]
+            mask_interrupts();
+            #[cfg(origin_bench)]
             bench_disturb(early_uart, &plan);
             // Decision item 342: why, on the UART boot info would name, before it halts.
             say_halting(early_uart, calls);
             // TASKS item 116: in a bench build, as after a successful call.
             #[cfg(origin_bench)]
-            bench_after_call(early_uart, &plan);
+            bench_after_call(early_uart, &plan, calls);
             halt()
         }
     }
@@ -1268,8 +1273,8 @@ impl uart::Port for LoaderPorts {
         // SAFETY: CPL 0; the port is one of the eight registers of the UART the SPCR named and
         // the shared parser accepted (`port_block_allowed`): its line status, and in a bench
         // build (TASKS item 116) the others but the receive buffer, so no byte is taken. Reading
-        // the modem status clears its change bits and nothing else. IN leaves the flags as they
-        // were.
+        // the line status clears its error bits and reading the modem status its change bits;
+        // nothing else changes. IN leaves the flags as they were.
         unsafe {
             core::arch::asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack, preserves_flags));
         }
@@ -1279,9 +1284,10 @@ impl uart::Port for LoaderPorts {
     fn write(&mut self, port: u16, value: u8) {
         // SAFETY: CPL 0; the port is the transmit register of that UART, written after
         // `ExitBootServices` was called, when the firmware no longer drives it. In a bench build
-        // (TASKS item 116) also before the call, between the firmware's own writes, and its line
-        // control, divisor, interrupt enable, modem control and FIFO control, each put back to
-        // what was read under the firmware. OUT leaves the flags as they were.
+        // (TASKS item 116) also before the call, between the firmware's own writes, and its other
+        // registers: its line control, divisor, interrupt enable and modem control, set to what was
+        // read under the firmware (or, in the QEMU-only `disturb` mode, to loopback and another
+        // divisor), and its FIFO control, written 0x07. OUT leaves the flags as they were.
         unsafe {
             core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
         }
@@ -1375,6 +1381,10 @@ fn read_bench_file(image: Handle, bs: &BootServices, name: &str) -> Option<([u8;
         return None;
     }
     let mut path = [0u16; 64];
+    // The array must end in a NUL after the name (TASKS item 116's review, R116-11).
+    if name.len() >= path.len() {
+        return None;
+    }
     for (dst, b) in path.iter_mut().zip(name.bytes()) {
         *dst = u16::from(b);
     }
@@ -1434,6 +1444,10 @@ struct BenchPlan {
     register: Result<bench::ResetRegister, bench::NoReset>,
     /// The time-stamp counter's ticks a millisecond, for the waits.
     ticks_per_ms: u64,
+    /// Whether the marks before each call are written: only when the line before the call went
+    /// out whole and the UART then emptied, so a mark never waits between `GetMemoryMap` and
+    /// `ExitBootServices` (TASKS item 116's review, R116-7).
+    marks: bool,
 }
 
 /// TASKS item 116, before `ExitBootServices`, under the firmware: the counter's rate over the
@@ -1460,9 +1474,11 @@ fn bench_before_call(
             counted,
         }
     );
+    // With interrupts masked: a firmware timer callback that wrote the UART while DLAB is set
+    // would change its divisor (TASKS item 116's review, R116-6).
     let under = early_uart
         .is_present()
-        .then(|| bench::UartState::read(&mut LoaderPorts, early_uart.port));
+        .then(|| with_interrupts_masked(|| bench::UartState::read(&mut LoaderPorts, early_uart.port)));
     let _ = writeln!(
         out,
         "{}",
@@ -1471,14 +1487,46 @@ fn bench_before_call(
             state: under,
         }
     );
-    say_on_uart(early_uart, bench::BEFORE_CALL);
+    let marks = early_uart.is_present() && {
+        let mut io = LoaderPorts;
+        let mut uart = uart::Uart::new(&mut io, early_uart.port);
+        let whole = writeln!(uart, "{}", bench::BEFORE_CALL).is_ok();
+        whole && bench::drain(&mut io, early_uart.port)
+    };
     BenchPlan {
         after,
         under,
         reset_system: reset_system.ok(),
         register,
         ticks_per_ms,
+        marks,
     }
+}
+
+/// Masks interrupts: once `ExitBootServices` has returned, nothing of the firmware's may take one
+/// (TASKS item 116's review, R116-5).
+#[cfg(origin_bench)]
+fn mask_interrupts() {
+    // SAFETY: CPL 0; masking interrupts touches no memory. CLI changes the flags, so the block does
+    // not claim to keep them.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+}
+
+/// Runs `f` with interrupts masked, then unmasks them if they were on before.
+#[cfg(origin_bench)]
+fn with_interrupts_masked<T>(f: impl FnOnce() -> T) -> T {
+    let flags: u64;
+    // SAFETY: CPL 0; PUSHFQ and POP read the flags through the stack, which the block uses and
+    // leaves as it found it.
+    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };
+    mask_interrupts();
+    let value = f();
+    if flags & (1 << 9) != 0 {
+        // SAFETY: CPL 0; interrupts were on before, under the firmware, and are turned on again.
+        // STI changes the flags, so the block does not claim to keep them.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    }
+    value
 }
 
 /// The time-stamp counter's ticks over [`bench::CALIBRATION_US`] of the firmware's `Stall`, or
@@ -1539,7 +1587,7 @@ fn bench_disturb(early_uart: EarlyUart, plan: &BenchPlan) {
 /// registers read again, the values read under the firmware written back, and a line naming what
 /// was read; then the reset, unless `BENCH-AFTER` asks for the kernel.
 #[cfg(origin_bench)]
-fn bench_after_call(early_uart: EarlyUart, plan: &BenchPlan) {
+fn bench_after_call(early_uart: EarlyUart, plan: &BenchPlan, calls: uart::ExitCalls) {
     if early_uart.is_present() {
         let mut io = LoaderPorts;
         let read = bench::UartState::read(&mut io, early_uart.port);
@@ -1549,6 +1597,7 @@ fn bench_after_call(early_uart: EarlyUart, plan: &BenchPlan) {
         say_on_uart(
             early_uart,
             bench::AfterCall {
+                calls,
                 read,
                 wrote_back: plan.under.is_some(),
             },
@@ -1565,9 +1614,7 @@ fn bench_after_call(early_uart: EarlyUart, plan: &BenchPlan) {
 /// first. A reset shows on a rented console as a new firmware start, which needs no UART.
 #[cfg(origin_bench)]
 fn bench_reset(early_uart: EarlyUart, plan: &BenchPlan) -> ! {
-    // SAFETY: CPL 0; masking interrupts touches no memory. After `ExitBootServices` nothing of the
-    // firmware's may take one. CLI changes the flags, so the block does not claim to keep them.
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    mask_interrupts();
     let call = plan
         .reset_system
         .filter(|_| plan.after != bench::After::Fadt);
@@ -1575,6 +1622,7 @@ fn bench_reset(early_uart: EarlyUart, plan: &BenchPlan) -> ! {
         early_uart,
         bench::ResetSoon {
             reset_system: call.is_some(),
+            register: plan.register.is_ok(),
         },
     );
     wait_ms(plan.ticks_per_ms, bench::RESET_DELAY_MS);
@@ -1585,6 +1633,8 @@ fn bench_reset(early_uart: EarlyUart, plan: &BenchPlan) -> ! {
             // physical addresses are what it was built for (UEFI 2.11 §4.5, §8.5.1.1). No reset
             // data is passed.
             unsafe { reset_system(bench::RESET_COLD, Status::SUCCESS, 0, ptr::null()) };
+            // It returned, which it should not: whatever it turned on, interrupts stay off.
+            mask_interrupts();
             bench::Tried::Returned
         }
         None if plan.after == bench::After::Fadt => bench::Tried::NotCalled,

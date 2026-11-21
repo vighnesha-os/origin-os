@@ -300,7 +300,12 @@ const BEFORE_CALL: &str =
     "origin-boot: bench build: this line went straight to the UART, before ExitBootServices";
 const MARK_FIRST: &str = "X";
 const MARK_RETRY: &str = "Y";
-const AFTER_CALL: &str = "origin-boot: bench build: after ExitBootServices the UART read ";
+const AFTER_CALL: &str = "origin-boot: bench build: after ExitBootServices (";
+/// How the line after the call begins, for each way the calls ended in the scenarios.
+const AFTER_FIRST: &str =
+    "origin-boot: bench build: after ExitBootServices (first call EFI_SUCCESS) the UART read ";
+const AFTER_RETRY: &str = "origin-boot: bench build: after ExitBootServices (first call EFI_INVALID_PARAMETER, retry EFI_SUCCESS) the UART read ";
+const AFTER_BOTH_FAILED: &str = "origin-boot: bench build: after ExitBootServices (first call EFI_INVALID_PARAMETER, retry EFI_INVALID_PARAMETER) the UART read ";
 const WRITTEN_BACK: &str = "; the firmware's values are written back";
 const RESET_SOON: &str = "origin-boot: bench build: a cold reset through the firmware's ResetSystem in 5 s, and the FADT's reset register 2 s later if the machine still runs";
 const FADT_SOON: &str = "origin-boot: bench build: a reset through the FADT's reset register in 7 s: ResetSystem is not called";
@@ -526,9 +531,10 @@ fn after_last_line(done: &Completed) -> Result<Vec<String>> {
     Ok(lines[last + 1..].iter().map(ToString::to_string).collect())
 }
 
-/// Whether `line` is the line after the call, with the firmware's values written back.
-fn is_after_call(line: &str) -> bool {
-    line.starts_with(AFTER_CALL) && line.ends_with(WRITTEN_BACK)
+/// Whether `line` is the line after the call that begins `start`, with the firmware's values
+/// written back.
+fn is_after_call(line: &str, start: &str) -> bool {
+    line.starts_with(start) && line.ends_with(WRITTEN_BACK)
 }
 
 /// The value after `name` in a register line: `"MCR 0x1b"` gives 0x1b.
@@ -544,8 +550,8 @@ fn check_after(done: &Completed, want: &[&str], reset: bool) -> Result {
     let after = after_last_line(done)?;
     let fits = after.len() == want.len()
         && after.iter().zip(want).all(|(line, w)| {
-            if *w == AFTER_CALL {
-                is_after_call(line)
+            if w.starts_with(AFTER_CALL) {
+                is_after_call(line, w)
             } else {
                 line.starts_with(w)
             }
@@ -558,7 +564,7 @@ fn check_after(done: &Completed, want: &[&str], reset: bool) -> Result {
     if done.exited != reset {
         return Err(if reset {
             format!(
-                "QEMU did not exit within {} s of the reset line: the machine was not reset",
+                "QEMU did not exit within {} s of the reset line, with a success status: the machine was not reset",
                 RESET_WITHIN.as_secs()
             )
         } else {
@@ -576,7 +582,13 @@ fn check_after(done: &Completed, want: &[&str], reset: bool) -> Result {
 /// the kernel's first line, with no kernel line before it; and `boot-console`'s SPCR checks hold.
 /// (OVMF writes its console, and so the loader's earlier lines, to every serial port: COM2 holds
 /// those first.)
-fn check_crumbs(done: &Completed, settings: &Settings, first: &str, marks: &[&str]) -> Result {
+fn check_crumbs(
+    done: &Completed,
+    settings: &Settings,
+    first: &str,
+    marks: &[&str],
+    after_call: &str,
+) -> Result {
     let uart = serial::clean(done.serial.as_bytes());
     let lines: Vec<&str> = uart.lines().filter(|l| !l.is_empty()).collect();
     let at = lines
@@ -591,7 +603,7 @@ fn check_crumbs(done: &Completed, settings: &Settings, first: &str, marks: &[&st
         ));
     }
     let next = lines.get(at + 1..(at + 4).min(lines.len())).unwrap_or(&[]);
-    if !next.first().is_some_and(|l| is_after_call(l))
+    if !next.first().is_some_and(|l| is_after_call(l, after_call))
         || next.get(1) != Some(&CRUMBS)
         || !next
             .get(2)
@@ -611,12 +623,18 @@ fn check_crumbs(done: &Completed, settings: &Settings, first: &str, marks: &[&st
 
 fn check_first_call(done: &Completed, settings: &Settings) -> Result {
     check_loader_console(done, NO_SWITCH, AFTER_KERNEL)?;
-    check_crumbs(done, settings, FIRST_CALL, &[MARK_FIRST])
+    check_crumbs(done, settings, FIRST_CALL, &[MARK_FIRST], AFTER_FIRST)
 }
 
 fn check_retry(done: &Completed, settings: &Settings) -> Result {
     check_loader_console(done, SWITCH_ONCE, AFTER_KERNEL)?;
-    check_crumbs(done, settings, RETRY, &[MARK_FIRST, MARK_RETRY])
+    check_crumbs(
+        done,
+        settings,
+        RETRY,
+        &[MARK_FIRST, MARK_RETRY],
+        AFTER_RETRY,
+    )
 }
 
 /// Both calls failed: on the SPCR's UART the marks, the halting line and the line after the call
@@ -627,7 +645,7 @@ fn check_halt(done: &Completed, _settings: &Settings) -> Result {
     let after = after_last_line(done)?;
     if after.len() != 4
         || after[..3] != [MARK_FIRST, MARK_RETRY, HALTING]
-        || !is_after_call(&after[3])
+        || !is_after_call(&after[3], AFTER_BOTH_FAILED)
     {
         return Err(format!(
             "after both calls failed, the SPCR's UART should hold the marks, the halting line and the line after the call after the loader's last line, and nothing more for {} s; it holds {after:?}",
@@ -652,7 +670,7 @@ fn check_reset_system(done: &Completed, _settings: &Settings) -> Result {
     check_loader_console(done, NO_SWITCH, NO_AFTER)?;
     check_after(
         done,
-        &[MARK_FIRST, FIRST_CALL, AFTER_CALL, RESET_SOON],
+        &[MARK_FIRST, FIRST_CALL, AFTER_FIRST, RESET_SOON],
         true,
     )
 }
@@ -662,7 +680,7 @@ fn check_reset_fadt(done: &Completed, _settings: &Settings) -> Result {
     check_loader_console(done, NO_SWITCH, AFTER_FADT)?;
     check_after(
         done,
-        &[MARK_FIRST, FIRST_CALL, AFTER_CALL, FADT_SOON, FADT_WRITE],
+        &[MARK_FIRST, FIRST_CALL, AFTER_FIRST, FADT_SOON, FADT_WRITE],
         true,
     )
 }
@@ -672,7 +690,7 @@ fn check_reset_fadt(done: &Completed, _settings: &Settings) -> Result {
 /// firmware's values were written back before it, and the reset follows.
 fn check_disturbed(done: &Completed, _settings: &Settings) -> Result {
     check_loader_console(done, NO_SWITCH, AFTER_DISTURB)?;
-    check_after(done, &[MARK_FIRST, AFTER_CALL, RESET_SOON], true)?;
+    check_after(done, &[MARK_FIRST, AFTER_FIRST, RESET_SOON], true)?;
     let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
     let under = com1
         .lines()
@@ -706,6 +724,11 @@ fn check_normal_loader(done: &Completed, settings: &Settings) -> Result {
                 "{name} holds a bench loader's line under the normal loader"
             ));
         }
+        if text.lines().any(|l| l == MARK_FIRST || l == MARK_RETRY) {
+            return Err(format!(
+                "{name} holds a bench loader's mark before ExitBootServices under the normal loader"
+            ));
+        }
     }
     check_spcr_console(done, settings)
 }
@@ -715,7 +738,7 @@ fn is_crumb_line(line: &str) -> bool {
     !line.is_empty() && line.bytes().all(|b| CRUMBS.as_bytes().contains(&b))
 }
 
-/// `cargo xtask boot-bench`: Clippy over the bench code, the bench pair built, and the four
+/// `cargo xtask boot-bench`: Clippy over the bench code, the bench pair built, and the seven
 /// scenarios booted (part of `boot-matrix`).
 pub(crate) fn boot(settings: &Settings) -> Result {
     let started = Instant::now();

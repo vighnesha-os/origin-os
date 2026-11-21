@@ -414,8 +414,9 @@ struct Completed {
     screen: Option<screen::Image>,
     /// What COM1 wrote to its file, for [`Capture::SpcrUart`].
     com1: Option<String>,
-    /// Whether QEMU exited by itself before the test stopped it. Under `-no-reboot` that is the
-    /// guest resetting the machine (TASKS item 116).
+    /// Whether QEMU exited by itself, with a success status, before the test stopped it. Under
+    /// `-no-reboot` that is the guest resetting the machine (TASKS item 116); a triple fault is
+    /// a reset to QEMU too, which the scenarios' lines tell apart.
     exited: bool,
 }
 
@@ -7423,8 +7424,19 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
     }
     drop(stdin);
 
-    // Whether QEMU had exited by itself before it is stopped (TASKS item 116).
-    let exited = closed || matches!(child.try_wait(), Ok(Some(_)));
+    // Whether QEMU had exited by itself, with a success status, before it is stopped (TASKS item
+    // 116): under `-no-reboot`, a guest's reset. Closed output alone is not enough (a reader's
+    // error closes it too), so the process's own status is waited for, a few seconds at most.
+    let exited = closed && {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if Instant::now() < until => thread::sleep(Duration::from_millis(100)),
+                _ => break false,
+            }
+        }
+    };
     // QEMU keeps running after the scenario ends (the kernel halts; a rejecting loader hands
     // back to the firmware), so the test stops it. (QEMU does not exit on SIGALRM.)
     let _ = child.kill();
