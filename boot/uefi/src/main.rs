@@ -1562,14 +1562,13 @@ fn runtime_reset_system(st: &SystemTable) -> Result<ResetSystemFn, &'static str>
     if (hdr.header_size as usize) < bench::RESET_SYSTEM_OFFSET + size_of::<usize>() {
         return Err("the runtime services table is too short to hold ResetSystem");
     }
-    // SAFETY: inside the table, as its `HeaderSize` says, and 8-byte aligned (an aligned table and
-    // an offset that is a multiple of 8); an optional function pointer is valid for any bits, null
-    // being `None`.
-    let f = unsafe {
-        p.add(bench::RESET_SYSTEM_OFFSET)
-            .cast::<Option<ResetSystemFn>>()
-            .read()
-    };
+    let at = p
+        .wrapping_add(bench::RESET_SYSTEM_OFFSET)
+        .cast::<Option<ResetSystemFn>>();
+    // SAFETY: `at` is inside the table, as its `HeaderSize` says, and 8-byte aligned (an aligned
+    // table and an offset that is a multiple of 8); an optional function pointer is valid for any
+    // bits, null being `None`.
+    let f = unsafe { at.read() };
     f.ok_or("the runtime services table's ResetSystem is null")
 }
 
