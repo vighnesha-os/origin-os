@@ -4227,5 +4227,5 @@ The coordinating session gave the design in its brief and asked for the contract
 - **R116-1, for the coordinating session:** keep item 344's order with the reading rule; or write the FADT's register first; or add a boot that calls `ResetSystem` before `ExitBootServices`, as a positive control the rental tool would then have to allow.
 - `onbf-sign`'s own command line still does not refuse a bench kernel (TASKS item 112's follow-up).
 - TASKS item 84's D1 sentence about COM2 under OVMF still needs correcting (TASKS item 112's follow-up).
-- CL46 can take rentals C's and D's walk figures.
+- Done here, on the coordinating session's word: cost ledger row CL46 now holds rentals C's and D's walk figures (`hw`): 1.4 to 1.5 µs and 4.3 to 4.4 µs, once a boot.
 
