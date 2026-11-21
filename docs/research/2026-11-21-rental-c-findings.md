@@ -114,3 +114,31 @@ A line that says why the loader halts after a failed `ExitBootServices` would be
 
 - Anything about Origin's kernel on this machine.
 - Whether the stop is in the loader or the kernel: no byte separates them.
+
+## Vendor documents read for TASKS item 112 (2026-11-21)
+
+TASKS item 112's bench loader reads the processor state the kernel inherits, and the coordinating session made one condition of it (P0 for the next rental): every model-specific register the loader reads must exist on both vendors whenever the bit it is gated on is set. A read of a register that does not exist takes a #GP under the firmware's IDT, which would end the boot before any breadcrumb. Both documents were read on 2026-11-21, in memory, nothing saved, and are paraphrased here.
+
+| | Document | Revision, file |
+|---|---|---|
+| I | Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 4 (model-specific registers) | Order 335592-093, September 2026; 3,008,109 bytes, SHA-256 `79f54b67b9bb3836856f04e0c45f50406c4d4b932c64800eb788b6b705a83dbd` |
+| A | AMD64 Architecture Programmer's Manual, Volume 2 (publication 24593) | Revision 3.46, October 2026; 15,813,681 bytes, SHA-256 `e4130d5aa26227b6a116d75af9e0f6e5adb4c034ff0d49a3c0fe73c3f49794cf`, the same file as A1 of `docs/research/2026-11-10-speculation-processor-hardening.md` |
+
+**What each register is tied to:**
+
+| Register | Intel (I, Table 2-2) | AMD (A) |
+|---|---|---|
+| PAT, 0x277 | present when CPUID 01H:EDX[16] (PAT) is 1 | the same bit, read from leaf 0000_0001h or 8000_0001h (§7.8.3); listed at 0277h in the MSR cross-reference |
+| S_CET, 0x6A2 | the same layout as U_CET (0x6A0), whose shadow-stack bits exist when CPUID 07H.0:ECX[7] (CET_SS) is 1, and whose branch-tracking bits exist when CPUID 07H.0:EDX[20] (CET_IBT) is 1 | defined when CET_SS is 1 (§18.12) |
+| PL0_SSP, 0x6A4 | present when CET_SS is 1 | defined when CET_SS is 1 (§18.12) |
+| The interrupt SSP table address, 0x6A8 (Intel's `IA32_INTERRUPT_SSP_TABLE_ADDR`, AMD's `ISST_ADDR`) | present when CET_SS is 1, and only on processors with Intel 64 | defined when CET_SS is 1 (§18.12) |
+| EFER, 0xC000_0080 | every processor that runs in long mode has it | the same (the MSR cross-reference; §3.1.7) |
+
+So no vendor ties any of the three shadow-stack registers to a bit other than CET_SS. Intel also defines S_CET when only CET_IBT is set, but not the other two, so the bench loader reads all three only when CET_SS is 1, and PAT only when CPUID 01H:EDX[16] is 1 (`boot/uefi/src/bench.rs`, `reads`, with host tests for each vendor). On the rented board, CPUID 07H.0:ECX is `0x00405FDE` (bit 7 set) and 01H:EDX is `0x178BFBFF` (bit 16 set), from rental C's private dump, so the bench loader will read all five there.
+
+**What AMD says about a shutdown (A, §8.2.9, and the opening of Chapter 9):**
+- A third interrupting event while the processor is passing control to the double-fault handler makes the processor shut down.
+- In the shutdown state the core executes no instructions. Only an NMI, a RESET or an INIT restarts it. If it shut down while running an NMI handler, only a RESET or an INIT does.
+- The manual does not say what the platform does when a core shuts down: whether the chipset or the firmware then resets the machine is left to them. §15.27 adds that a shutdown with the global interrupt flag clear can be left only by RESET.
+
+So "no reset in 8 minutes" on rentals B and C excludes a triple fault only if this board resets on a shutdown, which the document does not settle. TASKS item 112's breadcrumbs make the question smaller: they name the step after which the boot went silent.
