@@ -219,6 +219,9 @@ impl Online {
     }
 
     fn add(&mut self, index: CpuIndex) {
+        // Ascending, as `takes_part_in_moves`' binary search needs (R94-11): the boot
+        // processor is index 0, and the APs are started and added in the order of their indexes.
+        debug_assert!(self.cpus.last().is_none_or(|last| last.get() < index.get()));
         self.cpus.push(index);
         self.count = self.cpus.len();
     }
