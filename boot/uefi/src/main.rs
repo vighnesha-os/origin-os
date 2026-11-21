@@ -154,7 +154,9 @@ fn boot(
     // rented machine's volume never holds the file, so its boots take their natural path.
     #[cfg(origin_bench)]
     let stale = {
-        let (stale, said) = match read_bench_switch(image, &bs) {
+        let switch = read_bench_file(image, &bs, bench::STALE_KEY_PATH)
+            .map(|(contents, len)| bench::stale_calls(contents.get(..len).unwrap_or(&[])));
+        let (stale, said) = match switch {
             None => (
                 0,
                 "no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key",
@@ -174,6 +176,16 @@ fn boot(
         };
         let _ = writeln!(out, "{}{said}", bench::PREFIX);
         stale
+    };
+    // TASKS item 116: what a bench loader does once `ExitBootServices` has returned. A rented
+    // machine's volume never holds the file, so a rental resets the machine and never enters the
+    // kernel (`bench::After::Reset`).
+    #[cfg(origin_bench)]
+    let after = {
+        let found = read_bench_file(image, &bs, bench::AFTER_PATH)
+            .map(|(contents, len)| bench::After::from_contents(contents.get(..len).unwrap_or(&[])));
+        let _ = writeln!(out, "{}{}", bench::PREFIX, bench::After::said(found));
+        found.flatten().unwrap_or(bench::After::Reset)
     };
 
     // B2: verify it.
@@ -396,6 +408,9 @@ fn boot(
             format_args!("the processor has no NX bit"),
         ));
     }
+    // TASKS item 116: the FADT's reset register, read in the same walk in a bench build.
+    #[cfg(origin_bench)]
+    let mut reset_register = Err(bench::NoReset::NoMap);
     // ADR-0010 Amendment 3 (decision item 317; TASKS item 84): the UART the firmware's SPCR
     // names, for the kernel's first line. Read under boot services, only from memory the map
     // describes; no outcome stops the boot (ADR-0010 E5).
@@ -417,6 +432,14 @@ fn boot(
                 out,
                 "origin-boot: console: the walk read {read} bytes of firmware memory in {reads} reads, {cycles} time-stamp counter ticks (cost ledger row CL46)"
             );
+            #[cfg(origin_bench)]
+            {
+                reset_register = bench::find_reset(
+                    rsdp,
+                    &mut |at, bytes| read_described(described, at, bytes),
+                    |at| bench::in_mmio(described, at),
+                );
+            }
             found.early_uart()
         }
         Err(_) => {
@@ -427,6 +450,8 @@ fn boot(
             EarlyUart::NONE
         }
     };
+    #[cfg(origin_bench)]
+    let _ = writeln!(out, "{}", bench::ResetLine(reset_register));
     // The table pool, sized from the memory map as it stands: the last allocation before the
     // tables are built, so the map they are built from differs from this one by very little.
     let (_, n) = read_memory_map(get_map, map, regions).map_err(|e| e.report(out))?;
@@ -608,6 +633,10 @@ fn boot(
     // TASKS item 112: the processor state the kernel inherits, in a bench build.
     #[cfg(origin_bench)]
     say_entry_state(out);
+    // TASKS item 116: the UART as the firmware left it, a line straight to it, and how the reset
+    // will go.
+    #[cfg(origin_bench)]
+    let plan = bench_before_call(st, &bs, early_uart, after, reset_register, out);
     let _ = writeln!(
         out,
         "origin-boot: exiting boot services; entering the Framekernel"
@@ -660,6 +689,18 @@ fn boot(
             // A bench build gives the first `stale` calls a stale key (QEMU scenarios only).
             #[cfg(origin_bench)]
             let key = bench::key_for(calls.made(), stale, key);
+            // TASKS item 116: the map was read and this call is being made.
+            #[cfg(origin_bench)]
+            if plan.marks {
+                say_on_uart(
+                    early_uart,
+                    if calls.made() == 0 {
+                        bench::MARK_FIRST
+                    } else {
+                        bench::MARK_RETRY
+                    },
+                );
+            }
             // SAFETY: valid `ExitBootServices` with this image's handle and the key of the map
             // just obtained; nothing has been allocated since `GetMemoryMap`.
             let status = unsafe { exit(image, key) };
@@ -672,7 +713,12 @@ fn boot(
             let stack_top = direct_map_base + stack + (STACK_PAGES * PAGE) as u64;
             #[cfg(origin_bench)]
             {
+                mask_interrupts();
+                bench_disturb(early_uart, &plan);
                 let port = bench_exited(early_uart, bench::Exited { calls, stale });
+                // TASKS item 116: the registers again, the firmware's values written back, and,
+                // unless BENCH-AFTER asks for the kernel, the reset.
+                bench_after_call(early_uart, &plan, calls);
                 // SAFETY: as for `enter_kernel` below; `crumbs` names a port the SPCR named
                 // and the shared parser accepted, or is 0.
                 unsafe {
@@ -697,8 +743,15 @@ fn boot(
         // `ExitBootServices` has not been called, so the firmware's console may still be used.
         ExitOutcome::NotAttempted(failure) => Err(failure.report(out)),
         ExitOutcome::Halt => {
+            #[cfg(origin_bench)]
+            mask_interrupts();
+            #[cfg(origin_bench)]
+            bench_disturb(early_uart, &plan);
             // Decision item 342: why, on the UART boot info would name, before it halts.
             say_halting(early_uart, calls);
+            // TASKS item 116: in a bench build, as after a successful call.
+            #[cfg(origin_bench)]
+            bench_after_call(early_uart, &plan, calls);
             halt()
         }
     }
@@ -1216,9 +1269,11 @@ struct LoaderPorts;
 impl uart::Port for LoaderPorts {
     fn read(&mut self, port: u16) -> u8 {
         let value: u8;
-        // SAFETY: CPL 0; the port is the line-status register of the UART the SPCR named and the
-        // shared parser accepted, and reading it has no side effect. IN leaves the flags as they
-        // were.
+        // SAFETY: CPL 0; the port is one of the eight registers of the UART the SPCR named and
+        // the shared parser accepted (`port_block_allowed`): its line status, and in a bench
+        // build (TASKS item 116) the others but the receive buffer, so no byte is taken. Reading
+        // the line status clears its error bits and reading the modem status its change bits;
+        // nothing else changes. IN leaves the flags as they were.
         unsafe {
             core::arch::asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack, preserves_flags));
         }
@@ -1226,9 +1281,12 @@ impl uart::Port for LoaderPorts {
     }
 
     fn write(&mut self, port: u16, value: u8) {
-        // SAFETY: CPL 0; the port is the transmit register of that UART, written only after
-        // `ExitBootServices` was called, when the firmware no longer drives it. OUT leaves the
-        // flags as they were.
+        // SAFETY: CPL 0; the port is the transmit register of that UART, written after
+        // `ExitBootServices` was called, when the firmware no longer drives it. In a bench build
+        // (TASKS item 116) also before the call, between the firmware's own writes, and its other
+        // registers: its line control, divisor, interrupt enable and modem control, set to what was
+        // read under the firmware (or, in the QEMU-only `disturb` mode, to loopback and another
+        // divisor), and its FIFO control, written 0x07. OUT leaves the flags as they were.
         unsafe {
             core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
         }
@@ -1304,12 +1362,11 @@ fn rdmsr(msr: u32) -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
-/// Reads [`bench::STALE_KEY_PATH`] from the loader's volume, in a bench build: `None` if there
-/// is no such file, `Some(None)` if its contents ask for nothing [`bench::stale_calls`] knows,
-/// `Some(Some(n))` for `n` stale keys. Reads at most 16 bytes into the stack: nothing is
-/// allocated.
+/// Reads a bench switch, [`bench::STALE_KEY_PATH`] or [`bench::AFTER_PATH`], from the loader's
+/// volume, in a bench build: `None` if there is no such file, else its first bytes and how many
+/// were read. Reads at most 16 bytes into the stack: nothing is allocated.
 #[cfg(origin_bench)]
-fn read_bench_switch(image: Handle, bs: &BootServices) -> Option<Option<u8>> {
+fn read_bench_file(image: Handle, bs: &BootServices, name: &str) -> Option<([u8; 16], usize)> {
     let loaded = protocol::<LoadedImageProtocol>(bs, image, &LOADED_IMAGE_PROTOCOL).ok()?;
     // SAFETY: `HandleProtocol` returned a live `EFI_LOADED_IMAGE_PROTOCOL` for this image.
     let device = unsafe { (*loaded).device_handle };
@@ -1323,7 +1380,11 @@ fn read_bench_switch(image: Handle, bs: &BootServices) -> Option<Option<u8>> {
         return None;
     }
     let mut path = [0u16; 64];
-    for (dst, b) in path.iter_mut().zip(bench::STALE_KEY_PATH.bytes()) {
+    // The array must end in a NUL after the name (TASKS item 116's review, R116-11).
+    if name.len() >= path.len() {
+        return None;
+    }
+    for (dst, b) in path.iter_mut().zip(name.bytes()) {
         *dst = u16::from(b);
     }
     let mut contents = [0u8; 16];
@@ -1357,7 +1418,275 @@ fn read_bench_switch(image: Handle, bs: &BootServices) -> Option<Option<u8>> {
         // SAFETY: closing the handle this function opened; it is not used afterwards.
         let _ = unsafe { close(root) };
     }
-    found.then(|| bench::stale_calls(contents.get(..len.min(contents.len())).unwrap_or(&[])))
+    found.then_some((contents, len.min(contents.len())))
+}
+
+/// `EFI_STALL` (UEFI 2.11 §7.5.2).
+#[cfg(origin_bench)]
+type StallFn = unsafe extern "efiapi" fn(microseconds: usize) -> Status;
+/// `EFI_RESET_SYSTEM` (UEFI 2.11 §8.5.1.1). It does not return; a firmware whose does is what the
+/// FADT's register is for.
+#[cfg(origin_bench)]
+type ResetSystemFn =
+    unsafe extern "efiapi" fn(reset_type: u32, status: Status, size: usize, data: *const c_void);
+
+/// What a bench loader does after `ExitBootServices` (TASKS item 116), settled before the call.
+#[cfg(origin_bench)]
+struct BenchPlan {
+    /// The mode `BENCH-AFTER` asked for.
+    after: bench::After,
+    /// The UART's registers under the firmware, if the SPCR named one in I/O space.
+    under: Option<bench::UartState>,
+    /// The firmware's `ResetSystem`, if its runtime services table checks.
+    reset_system: Option<ResetSystemFn>,
+    /// The FADT's reset register.
+    register: Result<bench::ResetRegister, bench::NoReset>,
+    /// The time-stamp counter's ticks a millisecond, for the waits.
+    ticks_per_ms: u64,
+    /// Whether the marks before each call are written: only when the line before the call went
+    /// out whole and the UART then emptied, so a mark never waits between `GetMemoryMap` and
+    /// `ExitBootServices` (TASKS item 116's review, R116-7).
+    marks: bool,
+}
+
+/// TASKS item 116, before `ExitBootServices`, under the firmware: the counter's rate over the
+/// firmware's `Stall`, `ResetSystem` from the runtime services table, and the UART the SPCR named
+/// read as the firmware left it, all said on the firmware's console; then one line straight to
+/// that UART.
+#[cfg(origin_bench)]
+fn bench_before_call(
+    st: &SystemTable,
+    bs: &BootServices,
+    early_uart: EarlyUart,
+    after: bench::After,
+    register: Result<bench::ResetRegister, bench::NoReset>,
+    out: &mut ConOut,
+) -> BenchPlan {
+    let (ticks_per_ms, counted) = bench::ticks_per_ms(count_ticks(bs));
+    let reset_system = runtime_reset_system(st);
+    let _ = writeln!(
+        out,
+        "{}",
+        bench::ResetPlan {
+            reset_system: reset_system.map(|f| f as usize as u64),
+            ticks_per_ms,
+            counted,
+        }
+    );
+    // With interrupts masked: a firmware timer callback that wrote the UART while DLAB is set
+    // would change its divisor (TASKS item 116's review, R116-6).
+    let under = early_uart.is_present().then(|| {
+        with_interrupts_masked(|| bench::UartState::read(&mut LoaderPorts, early_uart.port))
+    });
+    let _ = writeln!(
+        out,
+        "{}",
+        bench::UnderFirmware {
+            port: early_uart.port,
+            state: under,
+        }
+    );
+    let marks = early_uart.is_present() && {
+        let mut io = LoaderPorts;
+        let mut uart = uart::Uart::new(&mut io, early_uart.port);
+        let whole = writeln!(uart, "{}", bench::BEFORE_CALL).is_ok();
+        whole && bench::drain(&mut io, early_uart.port)
+    };
+    BenchPlan {
+        after,
+        under,
+        reset_system: reset_system.ok(),
+        register,
+        ticks_per_ms,
+        marks,
+    }
+}
+
+/// Masks interrupts: once `ExitBootServices` has returned, nothing of the firmware's may take one
+/// (TASKS item 116's review, R116-5).
+#[cfg(origin_bench)]
+fn mask_interrupts() {
+    // SAFETY: CPL 0; masking interrupts touches no memory. CLI changes the flags, so the block does
+    // not claim to keep them.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+}
+
+/// Runs `f` with interrupts masked, then unmasks them if they were on before.
+#[cfg(origin_bench)]
+fn with_interrupts_masked<T>(f: impl FnOnce() -> T) -> T {
+    let flags: u64;
+    // SAFETY: CPL 0; PUSHFQ and POP read the flags through the stack, which the block uses and
+    // leaves as it found it.
+    unsafe {
+        core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags))
+    };
+    mask_interrupts();
+    let value = f();
+    if flags & (1 << 9) != 0 {
+        // SAFETY: CPL 0; interrupts were on before, under the firmware, and are turned on again.
+        // STI changes the flags, so the block does not claim to keep them.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    }
+    value
+}
+
+/// The time-stamp counter's ticks over [`bench::CALIBRATION_US`] of the firmware's `Stall`, or
+/// `None` if there is no `Stall` or it fails.
+#[cfg(origin_bench)]
+fn count_ticks(bs: &BootServices) -> Option<u64> {
+    // SAFETY: `misc[1]` is `Stall` in the validated boot services table (UEFI 2.11 §4.4, whose
+    // `HeaderSize` covers it); a raw pointer and an optional function pointer have the same size,
+    // and null is `None`.
+    let stall = unsafe { core::mem::transmute::<*const c_void, Option<StallFn>>(bs.misc[1]) }?;
+    let start = random::rdtsc();
+    // SAFETY: valid `Stall` from the validated boot services, which are active.
+    let status = unsafe { stall(bench::CALIBRATION_US) };
+    let ticks = random::rdtsc().wrapping_sub(start);
+    (!status.is_error()).then_some(ticks)
+}
+
+/// `ResetSystem` from the system table's runtime services table, checked: aligned, signed
+/// "RUNTSERV", long enough to hold it, and not null (UEFI 2.11 §4.5.1).
+#[cfg(origin_bench)]
+fn runtime_reset_system(st: &SystemTable) -> Result<ResetSystemFn, &'static str> {
+    let p = st.runtime_services.cast::<u8>().cast_const();
+    if p.is_null() || !p.cast::<TableHeader>().is_aligned() {
+        return Err("the system table names no runtime services table, or a misaligned one");
+    }
+    // SAFETY: non-null and aligned, from the validated system table; the runtime services table
+    // lies in runtime memory, readable before and after `ExitBootServices` (UEFI 2.11 §4.5).
+    // Every field of the header is an integer, so any bit pattern is valid.
+    let hdr = unsafe { p.cast::<TableHeader>().read() };
+    if hdr.signature != bench::RUNTIME_SERVICES_SIGNATURE {
+        return Err("the runtime services table's signature is not RUNTSERV");
+    }
+    if (hdr.header_size as usize) < bench::RESET_SYSTEM_OFFSET + size_of::<usize>() {
+        return Err("the runtime services table is too short to hold ResetSystem");
+    }
+    let at = p
+        .wrapping_add(bench::RESET_SYSTEM_OFFSET)
+        .cast::<Option<ResetSystemFn>>();
+    // SAFETY: `at` is inside the table, as its `HeaderSize` says, and 8-byte aligned (an aligned
+    // table and an offset that is a multiple of 8); an optional function pointer is valid for any
+    // bits, null being `None`.
+    let f = unsafe { at.read() };
+    f.ok_or("the runtime services table's ResetSystem is null")
+}
+
+/// [`bench::After::Disturb`]: right after the call returns, what a firmware might do to the UART.
+#[cfg(origin_bench)]
+fn bench_disturb(early_uart: EarlyUart, plan: &BenchPlan) {
+    if plan.after == bench::After::Disturb
+        && let Some(under) = plan.under
+    {
+        bench::disturb(&mut LoaderPorts, early_uart.port, &under);
+    }
+}
+
+/// TASKS item 116, after `ExitBootServices` returned, either way, and after its line: the UART's
+/// registers read again, the values read under the firmware written back, and a line naming what
+/// was read; then the reset, unless `BENCH-AFTER` asks for the kernel.
+#[cfg(origin_bench)]
+fn bench_after_call(early_uart: EarlyUart, plan: &BenchPlan, calls: uart::ExitCalls) {
+    if early_uart.is_present() {
+        let mut io = LoaderPorts;
+        let read = bench::UartState::read(&mut io, early_uart.port);
+        if let Some(under) = plan.under {
+            let _ = under.write_back(&mut io, early_uart.port);
+        }
+        say_on_uart(
+            early_uart,
+            bench::AfterCall {
+                calls,
+                read,
+                wrote_back: plan.under.is_some(),
+            },
+        );
+    }
+    if !plan.after.enters_kernel() {
+        bench_reset(early_uart, plan)
+    }
+}
+
+/// TASKS item 116: the reset, whatever the call did. A cold `ResetSystem` about 5 s after its
+/// line (decision item 344, ADR-0002 Amendment 3: a bench-only exception to B5); if the machine
+/// still runs 2 s later, the FADT's reset register; then the halt. Each step is said on the UART
+/// first. A reset shows on a rented console as a new firmware start, which needs no UART.
+#[cfg(origin_bench)]
+fn bench_reset(early_uart: EarlyUart, plan: &BenchPlan) -> ! {
+    mask_interrupts();
+    let call = plan
+        .reset_system
+        .filter(|_| plan.after != bench::After::Fadt);
+    say_on_uart(
+        early_uart,
+        bench::ResetSoon {
+            reset_system: call.is_some(),
+            register: plan.register.is_ok(),
+        },
+    );
+    wait_ms(plan.ticks_per_ms, bench::RESET_DELAY_MS);
+    let tried = match call {
+        Some(reset_system) => {
+            // SAFETY: `ResetSystem` from the checked runtime services table, which stays callable
+            // after `ExitBootServices`; the firmware's own page tables are still loaded, so its
+            // physical addresses are what it was built for (UEFI 2.11 §4.5, §8.5.1.1). No reset
+            // data is passed.
+            unsafe { reset_system(bench::RESET_COLD, Status::SUCCESS, 0, ptr::null()) };
+            // It returned, which it should not: whatever it turned on, interrupts stay off.
+            mask_interrupts();
+            bench::Tried::Returned
+        }
+        None if plan.after == bench::After::Fadt => bench::Tried::NotCalled,
+        None => bench::Tried::Unavailable,
+    };
+    wait_ms(plan.ticks_per_ms, bench::FALLBACK_DELAY_MS);
+    say_on_uart(
+        early_uart,
+        bench::Fallback {
+            tried,
+            register: plan.register,
+        },
+    );
+    if let Ok(register) = plan.register {
+        write_reset_register(register);
+        wait_ms(plan.ticks_per_ms, bench::AFTER_REGISTER_MS);
+        say_on_uart(early_uart, bench::NOT_RESET);
+    }
+    halt()
+}
+
+/// Writes the FADT's reset value to its reset register (ACPI 6.6 §4.8.3.6).
+#[cfg(origin_bench)]
+fn write_reset_register(register: bench::ResetRegister) {
+    match register {
+        bench::ResetRegister::Io { port, value } => {
+            // SAFETY: CPL 0; the port is the FADT's reset register, which `bench::find_reset`
+            // checked (system I/O, 8 bits at bit 0, a 16-bit port), and writing its value is
+            // meant to reset the machine. OUT leaves the flags as they were.
+            unsafe {
+                core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
+            }
+        }
+        bench::ResetRegister::Memory { address, value } => {
+            // SAFETY: the FADT's reset register, a byte of memory-mapped I/O the firmware's map
+            // describes (`bench::find_reset`), so the firmware's page tables, still loaded, map it
+            // at its physical address; one volatile byte store, as §4.8.3.6 asks.
+            unsafe {
+                ptr::with_exposed_provenance_mut::<u8>(address as usize).write_volatile(value)
+            };
+        }
+    }
+}
+
+/// Spins until `ms` milliseconds have passed by the time-stamp counter.
+#[cfg(origin_bench)]
+fn wait_ms(ticks_per_ms: u64, ms: u64) {
+    let goal = ticks_per_ms.saturating_mul(ms);
+    let start = random::rdtsc();
+    while random::rdtsc().wrapping_sub(start) < goal {
+        core::hint::spin_loop();
+    }
 }
 
 /// CPUID `leaf`, sub-leaf 0: `[eax, ebx, ecx, edx]`.

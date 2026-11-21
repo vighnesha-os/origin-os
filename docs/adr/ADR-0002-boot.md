@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). B5 gained one line on the SPCR's UART before a halt after a failed `ExitBootServices` by Amendment 2, accepted by the owner on 2026-11-21 (decision sheet item 342) and built by TASKS item 112 the same day, under QEMU only. Amendment 3, accepted by the owner on 2026-11-21 (decision sheet item 344), lets a bench build, and only a bench build, call `ResetSystem` after `ExitBootServices`. |
+| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). B5 gained one line on the SPCR's UART before a halt after a failed `ExitBootServices` by Amendment 2, accepted by the owner on 2026-11-21 (decision sheet item 342) and built by TASKS item 112 the same day, under QEMU only. Amendment 3, accepted by the owner on 2026-11-21 (decision sheet item 344), lets a bench build, and only a bench build, call `ResetSystem` after `ExitBootServices`; built by TASKS item 116 the same day, under QEMU only. |
 | Date | 2026-11-07; Amendment 1 2026-11-10; Amendment 2 2026-11-21; Amendment 3 2026-11-21; boot info 0.6 accepted 2026-11-10 and built 2026-11-11 (B4) |
 | Owner decisions still open | None. B7, carried over from ADR-0001, was decided on 2026-11-07 and amended on 2026-11-10. |
 | Implements | CLAUDE.md §19 (UEFI boot chain), §20 (boot manager, later), §58 (Secure Boot), ONBF §8.1 (chain of trust) |
@@ -175,7 +175,7 @@ origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry EF
 
 ## Amendment 3 (2026-11-21): a bench build may call `ResetSystem` after `ExitBootServices`
 
-*Accepted by the owner on 2026-11-21 ("Allow in test builds"; decision sheet item 344). Proposed by rental D's findings (`docs/research/2026-11-21-rental-d-findings.md`, rank 1). TASKS item 116 builds it, in the ninth batch. Until that lands, nothing here is built.*
+*Accepted by the owner on 2026-11-21 ("Allow in test builds"; decision sheet item 344). Proposed by rental D's findings (`docs/research/2026-11-21-rental-d-findings.md`, rank 1). Built by TASKS item 116 the same day, under QEMU only.*
 
 **Change to B5, for bench builds only.** A loader built with `--cfg origin_bench` (TASKS item 112) may make one call into the firmware after `ExitBootServices`: the runtime service `ResetSystem`, with a cold reset. It makes the call only to end a diagnostic boot on a rented bench machine. If the machine is still running two seconds after the call, the loader writes the reset register that the FADT names, which it read and checked as untrusted input during its table walk before the call. Then it halts.
 
@@ -193,4 +193,6 @@ origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry EF
 **Performance cost (ADR-0018 V3).** None, by construction: only bench builds contain the code, and none ships.
 
 **Threat model (§58).** Only bench builds, which are never signed, contain the call. The FADT is parsed as untrusted input, and a register that fails the check is not written.
+
+**Code (built by TASKS item 116, under QEMU only).** `boot/uefi/src/bench.rs` (the UART's registers and their write-back, the FADT's reset register checked as untrusted input, and the lines; host-tested through a port trait and FADTs built in the tests) and `boot/uefi/src/main.rs` (the counter's rate over the firmware's `Stall`, `ResetSystem` from the runtime services table, the waits and the writes), all under `--cfg origin_bench`. Under QEMU, `cargo xtask boot-bench` shows the reset through `ResetSystem`, and through the FADT's register when `ResetSystem` is not called; control BC-6, both silenced, fails it.
 
