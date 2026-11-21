@@ -3769,5 +3769,30 @@ Started on 2026-11-21 by a session of its own, at the owner's word ("Start it no
 - **Compared by script with the base,** CI's software-processor `boot-matrix` at `a25228c9` (job 136637172378), machine by machine. On the 6 numbered machines and the 24 named ones that both ran, every scenario's result and every boot verdict is the same. The machines CI does not run (ADR-0008 Amendment 1, D7) passed all 11 scenarios each: those of 3 processors fail speculation controls only (decision item 154); those of 65, and the 67-processor sparse machine, also fail scheduler fairness, which ADR-0013 Amendment 2 excuses there, as other sessions' local runs of the same day show (1 to 15 of those lines a run). No serial line of the base's is missing.
 - **The figures lines:** 38, one per boot, every boot decided at its first run. The longest is 139 bytes, and none holds "failed" or "0x". On 34 boots nothing was spoiled, steps reached 57 to 211 µs and the best pair was within ±2,000 to ±5,000 ppm. The 4 others: the 65-processor machines (Intel: 2 gap and 1 wide, steps to 328 µs; AMD: 1 gap and 3 wide, steps to 3,080 µs), the 67-processor sparse machine (2 gap, 1 short and 22 wide, steps to 2,709 µs) and two small ones (1 gap and 1 wide each). Brackets reached 0 ns, since QEMU's software processor often gives the same TSC either side of a read, so "best" can read ±0 ppm. That figure is the TSC brackets' spread only, without the count's own step.
 
+**The diagnostic round (Q3; 2026-11-21, 03:35 to 04:44 UTC).** 33 boots in three turns of the machine, in an export of the branch's code, patched and never committed. The live verdict was today's rule throughout, and no other session's QEMU ran in any boot. Every candidate rule was fed the same 128 ms stream of reads. The figures are in `docs/research/2026-11-21-apic-timer-period.md` §3; the coordinating session's notes hold the report and every boot's lines (`t78-round-report.md`, `t78-evidence/`).
+- **Idle machines (17 boots, ten of 65 or 67 processors, with steps across brackets up to 15.6 ms).** Every candidate but the C1 family decided every run in bounds. C2 and C3 decided the same pair, at the same value, as today's rule every time.
+- **(p1), every read's bracket held open (the 8370C's model).** Today's rule refused the correct timer with that runner's lines. C2 decided brackets of 30 µs and most of 60 µs. C4/20B decided brackets up to 200 µs.
+- **(p2), a hidden reload.** In one boot of round 3, today's rule passed a timer 3.6 times fast: `period 972763 ppm from 1 pairs`, against its true 277,816 ppm.
+- **(p3), a correct timer with a held read:** in bounds for every candidate.
+
+**The coordinating session's rulings on the round (2026-11-21, 04:48 UTC).**
+- Build C2, then C4/20B with budget B, as separate commits that land together after one set of gates. C2 may go first alone only if a CI run brings the 8370C's figures, with its best ± under 25,000 ppm, before the gates.
+- Q7, the fence, comes before either.
+- Budget B is accepted, with CL20's text in V3's form and the worst case unchanged.
+- The controls in boot form: (p1) at 120 µs, a 3.6× and a 10× fast timer with a hidden reload, planted so that the tick proof's own verdict is judged, and (p3). The randomized model stands in below 2.2×, and the sweep becomes host tests.
+- No class change, and no owner item.
+- "From about 3.4 times fast" accepted, in place of the ruling's 3.5.
+
+**Built (2026-11-21).**
+- **`946269e4`, Q7: the fence.**
+  - **What the documents say** (paraphrased in the ledger §2): neither RDTSC nor RDMSR of an x2APIC register is serializing, on Intel (SDM -093: Vol. 2B, RDTSC and RDTSCP; Vol. 3A §13.12.3; Vol. 3B §20.17) or on AMD (APM Vol. 2 rev. 3.46 §16.11.2; Vol. 3 rev. 3.39, RDTSC). So a bracket of two plain RDTSCs need not enclose the count's read.
+  - **What was built:** `cpu::TscFence`, chosen once from CPUID, since CPUID leaves the guest under a hypervisor. The first reading is RDTSCP then LFENCE, the second RDTSCP. Where there is no RDTSCP, LFENCE goes beside RDTSC.
+  - **No processor setting is relied on with RDTSCP:** Intel's LFENCE is always a barrier, and AMD's RDTSCP retires every older instruction and is dispatch serializing (white paper 70628).
+  - **Without RDTSCP** the order needs LFENCE to be a barrier. On AMD it is where CPUID Fn8000_0021_EAX[2] says so; the Family 1Ah Model 51h PPR, rev. 0.50 of 2026-11-05, has it fixed at 1. Or it is where the kernel set MSR C001_1029 bit 1: ADR-0017's `KernelSets`, written in `load_tables` before `timer::init` can run. Under a hypervisor it is not written, so such an AMD guest keeps unordered brackets, as before.
+- **`11f21f8e`, C2.** A pair decides by its period's bounds, between the shortest and the longest time its reads can be apart and a fall of one count more and one less. A timer at a bound is never decided, and so never passes. The exact edges are pinned by host tests, derived apart with exact fractions.
+- **`05165dec`, C4/20B with budget B.** The rule and its host tests are as the provenance entry lists. All 28 `apic::` tests passed in an export, and Clippy was clean on the kernel's target. The host Clippy's one finding, `is_multiple_of` in a test, was fixed before the commit.
+  - **The figures line** gained `aside`, the pairs set aside. To keep five counts under 160 bytes it now reads `run N:` and `steps to`, every count capped at 99, and `PROOF_ATTEMPTS < 10` is asserted.
+  - **T66-30's control** (30 µs brackets, undecided) no longer holds: C2 decides such reads.
+
 **Follow-ups:**
 - **TASKS item 113:** under KVM every calibration discards all 1,024 windows and keeps the least disturbed one, probably about 10 s of each KVM boot (arithmetic, not measured).

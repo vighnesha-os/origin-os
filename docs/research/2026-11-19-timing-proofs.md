@@ -120,6 +120,8 @@ The 67-processor machine's preemption workers did not exit within 10 s at load 1
 
 ### 3.3 The timer's period from its count (the addendum review's T66-R13, diagnostic of 2026-11-19)
 
+*(The rule this section led to, one pair whose end brackets are within 1 % of its interval, was replaced by TASKS item 78 on 2026-11-21: fenced reads, a period's bounds, stretches, longer pairs and a time budget. See `docs/research/2026-11-21-apic-timer-period.md`.)*
+
 Before the rate's verdict moved to the timer's count, a temporary build on `2364d3af` measured it in every run of the tick proof without judging it.
 - **How:** while the periodic timer ran, it read the timer's current count back to back, each read bracketed by RDTSC. A pair was two reads within one period: 2 ms apart (a fifth of the nominal period), or up to the read before the next reload if that came first, and at least 0.5 ms. A pair was read again if its two brackets together exceeded 1 % of its interval, or if two consecutive reads were more than 100 µs apart (time in which a reload could pass unseen). The period was the initial count times the interval over the count's fall. Each run took up to 8 clean pairs, at most 32 tries each.
 - **Boots:** the series of §3.1, 2026-11-19 13:17 to 13:38 UTC, in one turn: 26 runs of the tick proof. Logs: `t66-evidence/r13-diagnostic.tar.gz` in the coordination notes, with the patch and the summariser.
@@ -142,6 +144,6 @@ Before the rate's verdict moved to the timer's count, a temporary build on `2364
 - Anything under KVM, in CI or on a physical machine (CLAUDE.md §74).
 - The cause of the calibration's spoiled windows on the large machines.
 - A rate within 3 % of nominal: the tick proof passes it, by its tolerance.
-- A timer over 5 times fast *(from about 3.4 times fast: TASKS item 78's correction of 2026-11-21, in ADR-0013)* whose reload a stall inside an intermediate read of its count hides: the count passes it, and its delivery fails it as too fast in total unless recurring stalls also make that total look normal in the same run (the second addendum review's T66-R17; TASKS item 78).
+- A timer over 5 times fast *(from about 3.4 times fast: TASKS item 78's correction of 2026-11-21, in ADR-0013)* whose reload a stall inside an intermediate read of its count hides: the count passes it, and its delivery fails it as too fast in total unless recurring stalls also make that total look normal in the same run (the second addendum review's T66-R17; TASKS item 78). *(Closed by TASKS item 78 on 2026-11-21, below 20 times fast: a pair whose slope is not its stretches' is set aside. See `docs/research/2026-11-21-apic-timer-period.md`.)*
 - A processor whose timer reads back as the boot processor's but ticks slower, its own timer clock being wrong, between about 30 Hz and 100 Hz: only the preemption proof's floor of 15 switches in 500 ms catches it, below that. One whose own timer clock runs fast: nothing catches it, the count's period being measured on the boot processor alone; on the platforms in scope one clock drives every core's APIC timer.
 - Why the 67-processor machine's preemption workers did not exit within 10 s at ten busy loops.

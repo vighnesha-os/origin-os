@@ -5565,11 +5565,49 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Specifications:** none new. The Intel SDM's APIC chapter, as `apic.rs` already cites it.
 - **Architecture:** ADR-0013 R1(a), R8 and "Timing proofs that judge the kernel" (unchanged rules; a dated note on the APIC timer row, the stated limit corrected, the new line recorded).
 - **Unsafe:** none added. The reads go through the existing `X2Apic::read`.
-- **Tests:** `apic::tests`: `the_count_figures_say_why_no_pair_was_clean`, `the_count_figures_line_is_pinned_and_short_and_names_no_failure` and `today_s_rule_hides_a_reload_from_about_3_4_times_fast`, their figures found first by an independent model of the sampler (`figures.py` and `edge.py` in TASKS item 78's evidence). The gates' results are in TASKS item 78's entry.
+- **Tests:** `apic::tests`: `the_count_figures_say_why_no_pair_was_clean`, `the_count_figures_line_is_pinned_and_short_and_names_no_failure` and `today_s_rule_hides_a_reload_from_about_3_4_times_fast`, their figures found first by an independent model of the sampler (`figures.py` and `edge.py` in TASKS item 78's evidence). The gates' results are in TASKS item 78's entry. *(The rule's commit, in the next entry, renamed the first and replaced the third.)*
 - **Review:** the task's independent AI review reads it with the rule that follows. No person.
 - **Open-source references consulted (§3, §6):** none. No operating system's or other project's source was read, QEMU's and KVM's included.
 - **Dependencies:** none new. **Licence:** MIT OR Apache-2.0. **Firmware and data:** none.
 - **Known limits:** QEMU only, and CI's KVM as it draws runners (CLAUDE.md §74). A timer from about 3.4 times fast whose reload a stall inside an intermediate read hides still passes the count; delivery fails it unless recurring stalls also mask its total (ADR-0013's stated limit, now corrected). The rest of TASKS item 78 is to follow.
+
+## TASKS item 78: the APIC timer's period check, the rule (ADR-0013; 2026-11-21)
+
+- **What:**
+  - **`origin-frame`, `cpu.rs`:** `TscFence`, TSC readings fenced to enclose what runs between them. The first reading is RDTSCP then LFENCE, or RDTSC then LFENCE; the second is RDTSCP, or LFENCE then RDTSC. `ordered_tsc` keeps its behaviour on the same code (Q7; `946269e4`).
+  - **`origin-frame`, `apic.rs`:**
+    - `PeriodSample::verdict`: a pair decides by its period's bounds, not a 1 % share (C2; `11f21f8e`).
+    - `sample_period` with `Slope`, `Stretches` and `judge_pair`: a pair whose slope misses its stretches' is set aside, and one undecided at a fifth of the period goes on to 0.9 of it.
+    - A run is bounded by 64 fifths of the period and a cap on reads (C4/20B and budget B; `05165dec`).
+    - `CountFigures::aside`, and a figures line that fits five counts in 160 bytes.
+  - **`origin-frame`, `timer.rs`:** `read_count` takes the fence, chosen once a proof.
+- **Why:** under KVM on a Xeon 8370C (CI run 44837410914) the 1 % rule found no pair in 64 tries while the interrupts came on time. And the rule passed a timer whose reload a stall inside a read hid, from about 3.4 times fast (the second addendum review's T66-R17); TASKS item 78's diagnostic showed it on a boot at 3.6 times. The coordinating session ruled C2, then C4/20B with B, after the diagnostic round's figures, and the fence after Q7's reading.
+- **Authoring agent:** the same side session as the entry above (Claude Opus 5.5).
+- **Specifications:** read on 2026-11-21 at today's revisions, in memory, paraphrased in `docs/research/2026-11-21-apic-timer-period.md` §2:
+  - the Intel SDM (325383-093: LFENCE, RDTSC, RDTSCP; 325384-093: §13.12.3 and §20.17);
+  - AMD's APM Volumes 2 (24593 rev. 3.46: §7.6.4, §16.11.2) and 3 (24594 rev. 3.39: LFENCE, RDTSC, RDTSCP, CPUID Fn8000_0021_EAX);
+  - AMD's white paper 70628 (mitigation G-2);
+  - the Family 1Ah Model 51h PPR (58264 rev. 0.50).
+- **Architecture:** ADR-0013 R1(a) and "Timing proofs that judge the kernel": the APIC timer row's dated note, the rule, the stated limit and the controls; ADR-0017 (the LFENCE setting it relies on only where there is no RDTSCP); ADR-0018 V3 (CL20's text).
+- **Unsafe:** in `cpu.rs` only, which may hold it: the two new readings' `asm!` blocks, each with its invariant. No `preserves_flags` where LFENCE is in the block.
+- **Tests:** `apic::tests`, 28, all passed (export of the tree, 2026-11-21). New or rewritten:
+  - `a_stall_inside_a_read_that_hides_a_reload_is_set_aside`;
+  - `a_held_read_no_longer_hides_a_reload`;
+  - `no_hidden_reload_passes_below_twenty_times_fast` (2.2 to 19 times fast, 351 hold placements each);
+  - `wide_reads_decide_and_a_rate_six_percent_out_never_passes`;
+  - `no_correct_timer_is_judged_wrong_under_stalls`;
+  - `a_randomized_model_never_judges_a_rate_wrong` (1,500 cases, 20 times fast to 2.5 times slow);
+  - `the_count_figures_say_why_no_pair_decided`;
+  - `two_count_reads_give_the_period`, `the_count_judges_the_rate_at_its_edges` (its exact edges) and the grid.
+
+  Their figures were derived first by independent models with exact fractions (`figures_c2.py` and `c4.py` in TASKS item 78's evidence). The boot controls and the gates are in TASKS item 78's entry.
+- **Review:** an independent AI review, `docs/engineering/REVIEW_T78_2026-11-21.md`. No person.
+- **Open-source references consulted (§3, §6):** none. No operating system's or other project's source was read, QEMU's and KVM's included.
+- **Dependencies:** none new. **Licence:** MIT OR Apache-2.0. **Firmware and data:** none.
+- **Known limits:**
+  - QEMU only, and CI's KVM as it draws runners (CLAUDE.md §74). The 8370C's own figures are owed until a CI run draws it.
+  - A timer 20 times fast or more can pass the count if a stall inside a stretch hides its reload; delivery then fails it unless the same run's interrupts are held off for over 475 ms.
+  - An AMD guest with neither RDTSCP nor LFenceAlwaysSerializing keeps unordered brackets, as before.
 
 ## TASKS item 92: thread records and names that survive moves (ADR-0020 S1; 2026-11-20)
 
