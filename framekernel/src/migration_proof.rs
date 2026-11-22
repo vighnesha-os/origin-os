@@ -27,6 +27,15 @@
 //! and forth in pairs through a wait queue, and yield instead in one iteration in four, so that
 //! they block, are woken and yield while the boot flow moves them.
 //!
+//! **At capacity** (ADR-0020 N13; the coordinating session's ruling on the review of TASKS item 96,
+//! R96-13). After the moves, on the first two processors that take part, the others' threads left
+//! as they are: one integrity thread is placed on the source; the destination's queue is filled to
+//! its capacity with pinned fillers, and moves of the thread into it must each be refused as full
+//! ("queue full", the run queue filling before the table of contexts does), the thread staying on
+//! its source, alive; the destination's fillers end; then the source's queue is filled, and the
+//! thread must move out of it. Its own line, "thread migration: at capacity", and a pass
+//! condition of integrity.
+//!
 //! **Delivery.** Two movable receivers per processor that takes part, one pinned sender per such
 //! processor. A sender posts a token to a receiver (Release) and wakes it, by its name directly and
 //! through the receiver's own wait queue. A receiver takes its tokens and waits, in turn by its
@@ -85,6 +94,11 @@ const COVER_SECONDS: u64 = 30;
 const DRAIN_SECONDS: u64 = 2;
 /// An iteration in this many yields instead of passing the turn (integrity).
 const YIELD_EVERY: u64 = 4;
+/// The capacity phase's budget, in seconds, for each of its waits: a thread placed, fillers
+/// started or ended, moves answered (R96-13).
+const PHASE_SECONDS: u64 = 10;
+/// Moves the capacity phase tries into a full queue, each answered "queue full" or made.
+const INTO_FULL: u64 = 8;
 
 /// What the proofs' threads share with the boot flow, through [`SHARED`]: made before the first
 /// spawn, cloned by each thread at its start and dropped before it ends, and dropped by the proof
@@ -111,6 +125,12 @@ struct Shared {
     ended: AtomicU64,
     /// Threads that have started, for the boot flow to wait on before it moves any.
     started: AtomicU64,
+    /// Integrity's capacity phase (R96-13): raised to end the fillers, where they wait, and the
+    /// fillers that have started and ended.
+    fill_release: AtomicBool,
+    fill_queue: WaitQueue,
+    fill_up: AtomicU64,
+    fill_ended: AtomicU64,
     /// The TSC rate, for the senders' measures in ticks.
     tsc_hz: u64,
 }
@@ -610,6 +630,158 @@ extern "sysv64" fn integrity_thread(index: u64) -> ! {
     })
 }
 
+/// The capacity phase's filler: a pinned thread that only takes a slot, waiting until released.
+extern "sysv64" fn filler(_: u64) -> ! {
+    let Some(shared) = shared() else {
+        sched::finish(|| {});
+    };
+    shared.fill_up.fetch_add(1, Ordering::AcqRel);
+    shared
+        .fill_queue
+        .wait_until(|| shared.fill_release.load(Ordering::Acquire));
+    sched::finish(move || {
+        shared.fill_ended.fetch_add(1, Ordering::AcqRel);
+        drop(shared);
+    })
+}
+
+/// What integrity's capacity phase found (ADR-0020 N13, "integrity runs at the queue's capacity";
+/// the coordinating session's ruling on the review of TASKS item 96, R96-13).
+#[derive(Default)]
+struct Capacity {
+    /// Fillers spawned on the destination, and whether its queue was then full.
+    filled: usize,
+    full: bool,
+    /// Moves into the full destination refused as full, and made (none may be).
+    refused_full: u64,
+    made_into_full: u64,
+    /// Whether the thread tried stayed on its source, alive, through those moves.
+    stayed: bool,
+    /// Fillers spawned on the source, whether its queue was then full, and whether the thread then
+    /// moved out of it.
+    filled_source: usize,
+    source_full: bool,
+    moved_out: bool,
+    /// Whether every filler ended.
+    ended: bool,
+    /// The phase's time, in TSC ticks of the boot processor.
+    ticks: u64,
+}
+
+impl Capacity {
+    fn ok(&self) -> bool {
+        self.full
+            && self.refused_full != 0
+            && self.made_into_full == 0
+            && self.stayed
+            && self.source_full
+            && self.moved_out
+            && self.ended
+    }
+}
+
+/// Runs `step` until it answers, yielding between tries, for at most [`PHASE_SECONDS`]: `None`
+/// if it never did.
+fn within<T>(tsc_hz: u64, mut step: impl FnMut() -> Option<T>) -> Option<T> {
+    let start = rdtsc();
+    while rdtsc().wrapping_sub(start) < tsc_hz.saturating_mul(PHASE_SECONDS) {
+        if let Some(answer) = step() {
+            return Some(answer);
+        }
+        sched::yield_now();
+        cpu::interrupt_window();
+        let _ = sched::reap();
+    }
+    None
+}
+
+/// Spawns fillers on `cpu` until its queue refuses one, and waits for them to have started: how
+/// many it spawned.
+fn fill(shared: &Shared, cpu: CpuIndex, tsc_hz: u64) -> usize {
+    let up = shared.fill_up.load(Ordering::Acquire);
+    let spawned = (0..crate::runqueue::CAPACITY)
+        .take_while(|_| sched::spawn(cpu, filler, 0).is_ok())
+        .count();
+    let wanted = up.saturating_add(u64::try_from(spawned).unwrap_or(u64::MAX));
+    let _ = within(tsc_hz, || {
+        (shared.fill_up.load(Ordering::Acquire) >= wanted).then_some(())
+    });
+    spawned
+}
+
+/// Releases every filler and waits for them to have ended and been reaped: whether they all ended.
+fn release(shared: &Shared, tsc_hz: u64) -> bool {
+    shared.fill_release.store(true, Ordering::Release);
+    shared.fill_queue.wake_all();
+    let ended = within(tsc_hz, || {
+        (shared.fill_ended.load(Ordering::Acquire) == shared.fill_up.load(Ordering::Acquire))
+            .then_some(())
+    })
+    .is_some();
+    // Every filler so far has ended: the next fill's wait for its release again.
+    shared.fill_release.store(false, Ordering::Release);
+    ended
+}
+
+/// Integrity's capacity phase, on the first two processors that take part, the others' threads
+/// left as they are: one integrity thread is placed on the source; the destination's queue is
+/// filled to its capacity with fillers, and moves of the thread into it must each be refused as
+/// full, the thread staying on its source, alive; the destination's fillers end; the source's
+/// queue is filled, and the thread must then move out of it, to the destination. The integrity
+/// thread's own canaries and word go on being checked throughout (R96-13).
+fn capacity_phase(shared: &Shared, cpus: &[CpuIndex], online: &Online, tsc_hz: u64) -> Capacity {
+    let start = rdtsc();
+    let mut found = Capacity::default();
+    let (Some(&source), Some(&destination), Some(thread)) = (
+        cpus.first(),
+        cpus.get(1),
+        shared.threads.first().and_then(Movable::name),
+    ) else {
+        return found;
+    };
+    // A move answered "not ready" or "being switched out" is tried again.
+    let again = |refused: Unmoved| {
+        matches!(
+            refused,
+            Unmoved::NotReady | Unmoved::TryLater | Unmoved::Moving
+        )
+    };
+    let placed = within(tsc_hz, || match sched::migrate(thread, source, online) {
+        Ok(_) | Err(Unmoved::AlreadyThere) => Some(true),
+        Err(refused) if again(refused) => None,
+        Err(_) => Some(false),
+    }) == Some(true);
+    found.filled = fill(shared, destination, tsc_hz);
+    found.full = !sched::has_room(destination);
+    if placed && found.full {
+        let _ = within(tsc_hz, || {
+            match sched::migrate(thread, destination, online) {
+                Ok(_) => found.made_into_full += 1,
+                Err(Unmoved::QueueFull) => found.refused_full += 1,
+                Err(refused) if again(refused) => {}
+                Err(_) => return Some(()),
+            }
+            (found.refused_full + found.made_into_full >= INTO_FULL).then_some(())
+        });
+        found.stayed = sched::queued_on(thread, source);
+    }
+    let destination_ended = release(shared, tsc_hz);
+    found.filled_source = fill(shared, source, tsc_hz);
+    found.source_full = !sched::has_room(source);
+    if found.stayed && found.source_full {
+        found.moved_out = within(tsc_hz, || {
+            match sched::migrate(thread, destination, online) {
+                Ok(_) => Some(true),
+                Err(refused) if again(refused) => None,
+                Err(_) => Some(false),
+            }
+        }) == Some(true);
+    }
+    found.ended = destination_ended && release(shared, tsc_hz);
+    found.ticks = rdtsc().wrapping_sub(start);
+    found
+}
+
 /// "thread migration: integrity" (Refuse; the contract's §3.1). See the module documentation.
 pub(crate) fn prove_integrity(
     flow: Pinned<'_>,
@@ -646,6 +818,10 @@ pub(crate) fn prove_integrity(
         canaries_changed: AtomicU64::new(0),
         ended: AtomicU64::new(0),
         started: AtomicU64::new(0),
+        fill_release: AtomicBool::new(false),
+        fill_queue: WaitQueue::new(),
+        fill_up: AtomicU64::new(0),
+        fill_ended: AtomicU64::new(0),
         tsc_hz,
     });
     set_shared(Some(Arc::clone(&shared)));
@@ -656,11 +832,14 @@ pub(crate) fn prove_integrity(
         tsc_hz,
         2,
     );
-    // Their own end, past the mover's longest run: the mover's stop ends them first.
-    shared.run_for(COVER_SECONDS + SECONDS);
+    // Their own end, past the mover's longest run and the capacity phase's: the boot flow's stop
+    // ends them first.
+    shared.run_for(COVER_SECONDS + SECONDS + 6 * PHASE_SECONDS);
     let mut moves = Moves::new(online.cpus().iter().map(|c| c.get() + 1).max().unwrap_or(0));
+    let mut capacity = Capacity::default();
     if spawned {
         move_for(flow, &shared, &cpus, online, tsc_hz, true, &mut moves);
+        capacity = capacity_phase(&shared, &cpus, online, tsc_hz);
     }
     shared.stop.store(true, Ordering::Release);
     for pair in &shared.pairs {
@@ -692,7 +871,12 @@ pub(crate) fn prove_integrity(
         && unready == 0
         && back
         && reached
+        && capacity.ok()
         && pinned_mode.is_none();
+    let (source, destination) = (
+        cpus.first().map_or(0, |c| c.get()),
+        cpus.get(1).map_or(0, |c| c.get()),
+    );
     let _ = writeln!(
         com1,
         "origin-kernel: scheduler: thread migration: integrity: {threads} movable threads on {} processors, {made} moves, refused: {refusals}; a second processor in a context {failed_swaps} times, canaries changed {changed} times, threads run before their state existed {unready}; every processor a source and a destination: {}; a move's critical section: median {median} ticks ({} ns), largest {largest} ticks ({} ns); scans that made the gated pass {}, the longest {longest_gate} ticks ({} ns); spawned {spawned}; ended {ended}; heap, frames and stacks back {back}{}{}{}",
@@ -711,6 +895,25 @@ pub(crate) fn prove_integrity(
         },
         unsettled,
         if ok { "" } else { ": scheduler failed" }
+    );
+    let _ = writeln!(
+        com1,
+        "origin-kernel: scheduler: thread migration: at capacity: CPU {destination} filled with {} threads, full {}; {} moves into it refused as full, {} made; the thread stayed on CPU {source} {}; CPU {source} filled with {}, full {}; the move out of it made {}; every filler ended {}; in {} ms{}",
+        capacity.filled,
+        capacity.full,
+        capacity.refused_full,
+        capacity.made_into_full,
+        capacity.stayed,
+        capacity.filled_source,
+        capacity.source_full,
+        capacity.moved_out,
+        capacity.ended,
+        nanos(capacity.ticks, tsc_hz) / 1_000_000,
+        if capacity.ok() {
+            ""
+        } else {
+            ": scheduler failed"
+        }
     );
     ok
 }
@@ -924,6 +1127,10 @@ pub(crate) fn prove_delivery(
         canaries_changed: AtomicU64::new(0),
         ended: AtomicU64::new(0),
         started: AtomicU64::new(0),
+        fill_release: AtomicBool::new(false),
+        fill_queue: WaitQueue::new(),
+        fill_up: AtomicU64::new(0),
+        fill_ended: AtomicU64::new(0),
         tsc_hz,
     });
     set_shared(Some(Arc::clone(&shared)));

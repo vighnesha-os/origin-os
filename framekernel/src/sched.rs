@@ -1294,6 +1294,25 @@ pub(crate) struct Moved {
     pub(crate) ticks: u64,
 }
 
+/// Whether processor `cpu`'s run queue has a free slot: the integrity proof's capacity phase
+/// fills a queue and checks it is full (ADR-0020 N13; the review of TASKS item 96, R96-13).
+pub(crate) fn has_room(cpu: CpuIndex) -> bool {
+    QUEUES
+        .get(cpu.get())
+        .is_some_and(|queue| without_interrupts(|| queue.lock().has_room()))
+}
+
+/// Whether the thread `thread` names is alive and queued on processor `cpu`: the capacity phase's
+/// check that a refused move left it where it was (R96-13).
+pub(crate) fn queued_on(thread: ThreadRef, cpu: CpuIndex) -> bool {
+    threads::record(thread.record).is_some_and(|record| {
+        record.generation() == thread.generation
+            && record
+                .location()
+                .is_some_and(|at| usize::try_from(at.cpu()).ok() == Some(cpu.get()))
+    })
+}
+
 /// Moves `thread` to processor `to` (ADR-0020 S6; TASKS item 96): a movable thread, ready and not
 /// running, whose pin count is 0, between two processors that take part in moves (`online`).
 ///
