@@ -1415,3 +1415,18 @@ TASKS item 128's review found that Amendment 5 (item 347), as accepted, contradi
 - **The recommendation put** was the firmware fallback; the owner chose the other option.
 - **What it changes:** after `EFI_SUCCESS` the minimal mode always triple-faults. Refinement 3 still decides the control in a boot's first run. On rental F's board both bits are set, so the case does not arise there.
 - **Where it is written:** ADR-0002 Amendment 5's "Clarification" paragraph and its list of differences; row A02-Am5, now decided by 347 and 349; TASKS item 128's entry.
+
+### The rental policy: one more, then pause (item 350): Answered 2026-11-22
+
+Six bench rentals (A to F, 2026-11-12 to 2026-11-22) cost $4.86 of item 225's $10 cap. Each answered one question, in about 25 minutes of a paid hour. The rented server's processor (Zen 4) is outside the declared hardware scope (ADR-0009 Amendment 1), so it stands in for real firmware and qualifies nothing.
+
+| # | Question | Answer |
+|---|---|---|
+| 350, answered | How should rentals go from now on: one more (rental G, the minimal program of item 347) using the whole paid hour, then a pause; stop renting now; or keep one rental per question? | **One more, then pause** |
+
+- **What it means:**
+  - Rental G runs once TASKS item 128 is built and gated, and is still put to the owner for its cost (item 235). It uses the paid hour fully: about six boots instead of three, with the per-boot wait shortened for the minimal image, inside the tool's 50-minute deletion limit.
+  - After rental G, no rental is put to the owner until at least two questions that free testing (QEMU, CI's KVM runners) cannot answer can share one rental, or until a machine in the declared scope is available.
+  - Free testing always comes first.
+- **The alternatives put:** stop renting now, keeping the bench work on QEMU and CI until a test machine is bought; or keep the current pace.
+- **Where it is written:** this sheet, TASKS item 128's entry, and the coordinating session's rental notes.
