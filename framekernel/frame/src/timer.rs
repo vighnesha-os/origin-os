@@ -19,6 +19,7 @@
 //! 5. mask the timer again: nothing schedules on it yet (M3).
 
 use core::fmt::Write;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::acpi;
@@ -90,18 +91,24 @@ enum ApicWrite {
 
 /// The local APIC, in x2APIC mode: holding one proves the mode switch happened, so its
 /// register MSRs exist.
+///
+/// It is this processor's, so it lives no longer than the witness its processor was read under
+/// (`'a`; ADR-0020 S3), and is neither `Send` nor `Sync` (TASKS item 93, review finding R93-4).
+/// Kept past that witness, or sent to another thread, it would program the local APIC of whatever
+/// processor its holder ran on by then.
 #[derive(Debug)]
-pub struct X2Apic(());
+pub struct X2Apic<'a>(PhantomData<crate::trap::Here<'a>>);
 
-impl X2Apic {
+impl<'a> X2Apic<'a> {
     /// Switches the local APIC to x2APIC mode through the legal transitions and
-    /// software-enables it with [`SPURIOUS_VECTOR`].
+    /// software-enables it with [`SPURIOUS_VECTOR`]. `me` is this processor, read under its
+    /// start-up flow's witness (ADR-0020 S3; TASKS item 93): the mode is marked ready under it.
     ///
     /// # Safety
     ///
     /// CPL 0, boot processor only, interrupts disabled, and x2APIC supported
     /// ([`cpu::x2apic_supported`]); the spurious vector must have an IDT gate.
-    pub unsafe fn enable() -> Self {
+    pub unsafe fn enable(me: crate::cpu::ThisCpu<'a>) -> Self {
         // SAFETY: the caller's contract; IA32_APIC_BASE exists on every x86-64 processor.
         let current = unsafe { rdmsr(IA32_APIC_BASE) };
         let (writes, count) = apic::x2apic_transition(current);
@@ -110,21 +117,22 @@ impl X2Apic {
             // disabled → xAPIC → x2APIC sequence, keeping every other bit as it was.
             unsafe { wrmsr(IA32_APIC_BASE, value) };
         }
-        let apic = Self(());
+        let apic = Self(PhantomData);
         apic.write(ApicWrite::SpuriousVector, apic::svr(SPURIOUS_VECTOR));
-        if let Some(ready) = X2APIC_READY.get(crate::cpu::this_cpu().get()) {
+        if let Some(ready) = X2APIC_READY.this(me) {
             ready.store(true, core::sync::atomic::Ordering::Release);
         }
         apic
     }
 
     /// This processor's handle, if its local APIC has been switched to x2APIC mode
-    /// ([`X2Apic::enable`] has run here): the safe way to get one.
-    pub fn this_cpu() -> Option<Self> {
+    /// ([`X2Apic::enable`] has run here): the safe way to get one, for the processor `me` names,
+    /// read under a witness (ADR-0020 S3; TASKS item 93). Its uses stay in that witness's life.
+    pub fn here(me: crate::cpu::ThisCpu<'a>) -> Option<Self> {
         X2APIC_READY
-            .get(crate::cpu::this_cpu().get())
+            .this(me)
             .is_some_and(|ready| ready.load(core::sync::atomic::Ordering::Acquire))
-            .then_some(Self(()))
+            .then_some(Self(PhantomData))
     }
 
     /// The handle for a processor whose local APIC is already in x2APIC mode, without
@@ -132,9 +140,12 @@ impl X2Apic {
     ///
     /// # Safety
     ///
-    /// CPL 0, and [`X2Apic::enable`] has run on this processor.
+    /// CPL 0, and [`X2Apic::enable`] has run on this processor. And the handle is used only while
+    /// its holder cannot leave this processor: with interrupts off, or in a witness's life (ADR-0020
+    /// S3). The caller chooses its lifetime, `'static` included, so the type does not hold that
+    /// part (TASKS item 93, the addendum review's A93-1).
     pub unsafe fn assume_enabled() -> Self {
-        Self(())
+        Self(PhantomData)
     }
 
     pub fn read(&self, reg: ApicRead) -> u64 {
@@ -204,11 +215,11 @@ pub(crate) static X2APIC_READY: crate::percpu::PerCpu<core::sync::atomic::Atomic
 /// APIC is not in x2APIC mode yet. Safe: an IPI with this fixed vector does nothing a timer
 /// interrupt could not do, and the destination cannot be harmed by a stray one (its handler
 /// only reschedules).
-pub fn send_reschedule_ipi(apic_id: u32) {
-    if let Some(lapic) = X2Apic::this_cpu() {
+pub fn send_reschedule_ipi(me: crate::cpu::ThisCpu<'_>, apic_id: u32) {
+    if let Some(lapic) = X2Apic::here(me) {
         let value = (u64::from(apic_id) << 32)
             | u64::from(ICR_ASSERT | u32::from(crate::cpu::RESCHEDULE_VECTOR));
-        // SAFETY: x2APIC mode is on (`this_cpu`), so the ICR exists; a fixed IPI with the
+        // SAFETY: x2APIC mode is on (`here`), so the ICR exists; a fixed IPI with the
         // reschedule vector only reschedules its destination.
         unsafe { crate::cpu::wrmsr(X2APIC_ICR, value) };
         let _ = lapic;
@@ -221,10 +232,10 @@ const ICR_NMI: u64 = 0x4400;
 
 /// Sends this processor an NMI (x2APIC ICR, NMI delivery, addressed to its own APIC ID).
 /// Nothing happens if its APIC is not in x2APIC mode. Safe: the NMI handler only records it.
-pub fn send_nmi_to_self() {
-    if let Some(lapic) = X2Apic::this_cpu() {
+pub fn send_nmi_to_self(me: crate::cpu::ThisCpu<'_>) {
+    if let Some(lapic) = X2Apic::here(me) {
         let own = lapic.read(ApicRead::Id);
-        // SAFETY: x2APIC mode is on (`this_cpu`), so the ICR exists; an NMI to this
+        // SAFETY: x2APIC mode is on (`here`), so the ICR exists; an NMI to this
         // processor runs the kernel's NMI handler, which only counts it.
         unsafe { crate::cpu::wrmsr(X2APIC_ICR, (own << 32) | ICR_NMI) };
     }
@@ -235,8 +246,8 @@ pub fn send_nmi_to_self() {
 /// proof can see where it is taken: with interrupts off, it waits until something lets it in.
 /// Nothing happens if this processor's APIC is not in x2APIC mode. Safe: the vector has a gate
 /// and its handler is safe code, so this is no more than a device can do at any moment.
-pub fn interrupt_self() {
-    if let Some(lapic) = X2Apic::this_cpu() {
+pub fn interrupt_self(me: crate::cpu::ThisCpu<'_>) {
+    if let Some(lapic) = X2Apic::here(me) {
         // SAFETY: fixed delivery of a vector with an IDT gate, to this processor alone: the
         // same as the device behind that vector interrupting it.
         unsafe {
@@ -367,8 +378,8 @@ pub fn timed_programming() -> Option<apic::TimerProgramming> {
 /// This processor's timer as programmed, read back from its x2APIC through [`X2Apic::read`];
 /// `None` if x2APIC mode is not on. For the preemption proof's check that every processor
 /// ticks as the boot processor's proof timed (TASKS item 66, the review's T66-R1).
-pub fn programmed() -> Option<apic::TimerProgramming> {
-    let lapic = X2Apic::this_cpu()?;
+pub fn programmed(here: crate::trap::Here<'_>) -> Option<apic::TimerProgramming> {
+    let lapic = X2Apic::here(crate::cpu::this_cpu(here))?;
     Some(apic::TimerProgramming::from_registers(
         lapic.read(ApicRead::TimerInitial),
         lapic.read(ApicRead::TimerDivide),
@@ -395,7 +406,7 @@ pub fn start_periodic(lapic: &X2Apic) -> bool {
     true
 }
 
-impl X2Apic {
+impl X2Apic<'_> {
     /// Stops this processor's APIC timer.
     pub fn stop(&self) {
         self.stop_timer();
@@ -487,8 +498,8 @@ fn pm_timer(rsdp: u64) -> Option<Reference> {
 
 /// Brings up the local APIC and proves its timer, with the ACPI tables at `rsdp` for a
 /// reference other than the PIT if it does not count. Returns the TSC rate in Hz if every
-/// step passed.
-pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
+/// step passed. `flow` is the boot flow's witness (ADR-0020 S3; TASKS item 93).
+pub fn init(flow: crate::trap::Pinned<'_>, com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
     // Every vector this can make arrive needs the kernel's own IDT.
     if !cpu::tables_ready() {
         let _ = writeln!(
@@ -505,8 +516,9 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
     let mut ports = unsafe { LegacyPorts::new() };
     ports.mask_pics();
     // SAFETY: CPL 0, boot processor, interrupts disabled, x2APIC supported (checked), and
-    // `cpu::init` installed a gate for the spurious vector.
-    let lapic = unsafe { X2Apic::enable() };
+    // `cpu::init` installed a gate for the spurious vector. The index is read under the boot
+    // flow's witness, after the check above that the CPU's tables (and so GS) are live.
+    let lapic = unsafe { X2Apic::enable(crate::cpu::this_cpu(flow.here())) };
     let version = lapic.read(ApicRead::Version);
     let _ = writeln!(
         com1,

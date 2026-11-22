@@ -1676,7 +1676,11 @@ extern "sysv64" fn printer(_: u64) -> ! {
     while !PRINT_GO.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
-    print_lines(&mut Console::new(), crate::cpu::this_cpu().get() as u64);
+    // Its processor, as the label of its lines, pinned while it prints them (TASKS item 93).
+    let pin = crate::sched::pin();
+    let me = crate::cpu::this_cpu(pin.pinned().here());
+    print_lines(&mut Console::new(), me.index().get() as u64);
+    drop(pin);
     crate::sched::finish(|| {
         PRINTERS_DONE.fetch_add(1, Ordering::AcqRel);
     })
@@ -1824,7 +1828,10 @@ fn uart_is_on() -> bool {
 /// the middle of the next line tests the urgent path the same way. The sections' sizes are
 /// counted at the sink. QEMU's UART takes bytes instantly, so what this proves is the bound in
 /// bytes, the windows and the order: what a section costs on a real UART it cannot show.
-pub(crate) fn prove_uart_sections(com1: &mut Console) -> bool {
+pub(crate) fn prove_uart_sections(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+) -> bool {
     use core::fmt::Write as _;
     if !WINDOWS_ALLOWED.load(Ordering::Acquire) {
         return true;
@@ -1851,10 +1858,12 @@ pub(crate) fn prove_uart_sections(com1: &mut Console) -> bool {
     let whole_line = (PLAIN.len() + PROOF_FILL + 2) as u64 * live;
     let on_the_uart = written >= whole_line;
 
-    let bsp = crate::cpu::this_cpu();
+    // The boot flow's processor, read under its witness (TASKS item 93).
+    let me = crate::cpu::this_cpu(flow.here());
+    let bsp = me.index();
     let irqs = crate::irq::ioapic_irqs_on(bsp);
     PRINT_IN_INTERRUPT.store(true, Ordering::Release);
-    crate::timer::interrupt_self();
+    crate::timer::interrupt_self(me);
     let (mut taken_after, mut sections) = (None, 0);
     print_long(
         com1,
@@ -1923,12 +1932,14 @@ pub(crate) fn prove_uart_sections(com1: &mut Console) -> bool {
 /// being drawn. Its handler prints a line from interrupt context, which must queue behind that
 /// line and leave the painting to the writer that can wait. A breakpoint in the middle of the
 /// next line tests the urgent path the same way. The sections' sizes are counted at the sink.
-pub(crate) fn prove_sections(com1: &mut Console) -> bool {
+pub(crate) fn prove_sections(flow: origin_frame::trap::Pinned<'_>, com1: &mut Console) -> bool {
     use core::fmt::Write as _;
     if !has_screen() || !WINDOWS_ALLOWED.load(Ordering::Acquire) {
         return true;
     }
-    let bsp = crate::cpu::this_cpu();
+    // The boot flow's processor, read under its witness (TASKS item 93).
+    let me = crate::cpu::this_cpu(flow.here());
+    let bsp = me.index();
     let irqs = crate::irq::ioapic_irqs_on(bsp);
     let (mut taken_after, mut sections) = (None, 0);
     print_long(
@@ -1940,7 +1951,7 @@ pub(crate) fn prove_sections(com1: &mut Console) -> bool {
             }
             if section == 1 {
                 PRINT_IN_INTERRUPT.store(true, Ordering::Release);
-                crate::timer::interrupt_self();
+                crate::timer::interrupt_self(me);
             }
             sections = section;
             if taken_after.is_none() && crate::irq::ioapic_irqs_on(bsp) > irqs {

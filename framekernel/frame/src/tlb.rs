@@ -79,8 +79,10 @@ pub static GLOBAL_PAGES: PerCpu<AtomicBool> = PerCpu::new(
 struct Hardware;
 
 impl TlbHardware for Hardware {
-    fn this_cpu(&self) -> usize {
-        cpu::this_cpu().get()
+    type Here<'a> = crate::trap::Here<'a>;
+
+    fn this_cpu(&self, here: crate::trap::Here<'_>) -> usize {
+        cpu::this_cpu(here).index().get()
     }
 
     fn invalidate(&self, request: Request) {
@@ -110,8 +112,8 @@ impl TlbHardware for Hardware {
         unsafe { lapic.send_ipi(apic_id, ICR_ASSERT | u32::from(SHOOTDOWN_VECTOR)) };
     }
 
-    fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
-        cpu::without_interrupts(f)
+    fn without_interrupts<R>(&self, f: impl for<'a> FnOnce(crate::trap::Here<'a>) -> R) -> R {
+        cpu::without_interrupts_here(f)
     }
 
     fn now(&self) -> u64 {
@@ -129,28 +131,26 @@ impl TlbHardware for Hardware {
     }
 }
 
-fn this_cpu() -> usize {
-    cpu::this_cpu().get()
-}
-
 /// Turns on global pages on this processor and marks its CPU index, for the boot report.
 /// The proof counts only the processors online, so an AP that got this far but never came
-/// online (it was parked, `smp::park`) is not counted.
+/// online (it was parked, `smp::park`) is not counted. `me` is this processor, read under its
+/// start-up flow's witness (ADR-0020 S3; TASKS item 93).
 ///
 /// # Safety
 ///
 /// As for `cpu::enable_global_pages`.
-pub unsafe fn enable_global_pages() -> bool {
+pub unsafe fn enable_global_pages(me: cpu::ThisCpu<'_>) -> bool {
     // SAFETY: the caller's contract.
     let on = unsafe { cpu::enable_global_pages() };
-    if on && let Some(global) = GLOBAL_PAGES.get(this_cpu()) {
+    if on && let Some(global) = GLOBAL_PAGES.this(me) {
         global.store(true, Ordering::Relaxed);
     }
     on
 }
 
-/// Makes this processor a shootdown target, then flushes its whole TLB. Returns whether it has a
-/// record; one that has none is not made a target and must stay out (review finding F6).
+/// Makes this processor a shootdown target, then flushes its whole TLB, in one interrupts-off
+/// section (TASKS item 93, review finding R93-1). Returns whether it has a record; one that has
+/// none is not made a target and must stay out (review finding F6).
 pub fn mark_online() -> bool {
     SHOOTDOWN.mark_online(&Hardware)
 }
@@ -201,16 +201,24 @@ pub fn service() {
 /// one's processors and wait (TASKS item 66; the record is `stalls`, tested on the host).
 static STALLS: crate::stalls::StallLog = crate::stalls::StallLog::new();
 
-/// Notes a shootdown that gave up on a processor, asked at TSC `asked_at`.
+/// Notes a shootdown that gave up on a processor, asked at TSC `asked_at`. The asker is read
+/// in a section of its own (TASKS item 93, the ruling's Q8): a stale index would name the wrong
+/// processor as the asker in the stall's record.
 fn note(outcome: &Result<Completed, Stalled>, asked_at: u64) {
     if let Err(Stalled { cpu, .. }) = outcome {
-        STALLS.note(*cpu, this_cpu(), asked_at, rdtsc());
+        cpu::without_interrupts_here(|here| {
+            STALLS.note(*cpu, cpu::this_cpu(here).index().get(), asked_at, rdtsc());
+        });
     }
 }
 
-/// On the processor the last stall gave up on, notes when it next served a shootdown.
+/// On the processor the last stall gave up on, notes when it next served a shootdown. Read in a
+/// section of its own (the ruling's Q8): with a stale index, the processor named might be marked
+/// as having answered when it had not, or the one that had answered not marked.
 fn note_answer() {
-    STALLS.answered(this_cpu(), rdtsc());
+    cpu::without_interrupts_here(|here| {
+        STALLS.answered(cpu::this_cpu(here).index().get(), rdtsc());
+    });
 }
 
 pub use crate::stalls::Stall;
@@ -226,9 +234,9 @@ pub(crate) static INTERRUPTS: PerCpu<AtomicU64> =
         AtomicU64::new(0)
     });
 
-/// The shootdown interrupt.
-pub(crate) fn interrupted() {
-    if let Some(taken) = INTERRUPTS.get(this_cpu()) {
+/// The shootdown interrupt, under the trap entry's witness (ADR-0020 S3; TASKS item 93).
+pub(crate) fn interrupted(here: crate::trap::Here<'_>) {
+    if let Some(taken) = INTERRUPTS.this(cpu::this_cpu(here)) {
         taken.fetch_add(1, Ordering::Relaxed);
     }
     service();

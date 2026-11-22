@@ -1975,7 +1975,9 @@ fn tlb_cpu(world: &Arc<TlbWorld>, id: usize) -> TlbCpu {
 }
 
 impl TlbHardware for TlbCpu {
-    fn this_cpu(&self) -> usize {
+    type Here<'a> = ();
+
+    fn this_cpu(&self, (): ()) -> usize {
         self.id
     }
 
@@ -1998,8 +2000,8 @@ impl TlbHardware for TlbCpu {
         self.world.kick[cpu].notify();
     }
 
-    fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
-        f()
+    fn without_interrupts<R>(&self, f: impl for<'a> FnOnce(Self::Here<'a>) -> R) -> R {
+        f(())
     }
 
     /// The clock moves only as it is read, so an initiator's wait is counted in its polls.
@@ -2557,8 +2559,10 @@ fn deferred_free_of_a_frame_shared_by_two_spaces() {
 struct IrqCpu(TlbCpu);
 
 impl TlbHardware for IrqCpu {
-    fn this_cpu(&self) -> usize {
-        self.0.this_cpu()
+    type Here<'a> = ();
+
+    fn this_cpu(&self, here: ()) -> usize {
+        self.0.this_cpu(here)
     }
 
     fn invalidate(&self, request: Request) {
@@ -2569,9 +2573,9 @@ impl TlbHardware for IrqCpu {
         self.0.send_ipi(cpu);
     }
 
-    fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
+    fn without_interrupts<R>(&self, f: impl for<'a> FnOnce(Self::Here<'a>) -> R) -> R {
         let _off = self.0.world.interrupts[self.0.id].lock();
-        f()
+        f(())
     }
 
     fn now(&self) -> u64 {
@@ -3134,8 +3138,10 @@ const IMPATIENCE: u64 = 2;
 struct ImpatientCpu(TlbCpu);
 
 impl TlbHardware for ImpatientCpu {
-    fn this_cpu(&self) -> usize {
-        self.0.this_cpu()
+    type Here<'a> = ();
+
+    fn this_cpu(&self, here: ()) -> usize {
+        self.0.this_cpu(here)
     }
 
     fn invalidate(&self, request: Request) {
@@ -3146,7 +3152,7 @@ impl TlbHardware for ImpatientCpu {
         self.0.send_ipi(cpu);
     }
 
-    fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
+    fn without_interrupts<R>(&self, f: impl for<'a> FnOnce(Self::Here<'a>) -> R) -> R {
         self.0.without_interrupts(f)
     }
 

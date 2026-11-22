@@ -1022,8 +1022,8 @@ const CONTROLS: &[Control] = &[
         // A processor comes online and walks tables without ordering that after the flag.
         name: "online_no_fence_before_the_first_flush",
         file: SHOOTDOWN,
-        from: "        prim::fence(Ordering::SeqCst);\n        hardware.invalidate(Request::Everything);\n",
-        to: "        hardware.invalidate(Request::Everything);\n",
+        from: "            prim::fence(Ordering::SeqCst);\n            hardware.invalidate(Request::Everything);\n",
+        to: "            hardware.invalidate(Request::Everything);\n",
         models: &[("shootdown_and_a_processor_coming_online", STALE)],
     },
     Control {
@@ -1079,8 +1079,8 @@ const CONTROLS: &[Control] = &[
         // interrupt on the same processor, can land between them (review finding 1).
         name: "a_switch_that_can_be_interrupted",
         file: SHOOTDOWN,
-        from: "        hardware.without_interrupts(|| self.switch_here(hardware, to, load));\n",
-        to: "        self.switch_here(hardware, to, load);\n",
+        from: "        hardware.without_interrupts(|here| {\n            self.switch_here(hardware, hardware.this_cpu(here), to, load);\n        });\n",
+        to: "        let me = hardware.without_interrupts(|here| hardware.this_cpu(here));\n        self.switch_here(hardware, me, to, load);\n",
         models: &[(
             "a_switch_and_the_scheduler_on_one_processor",
             &["the record names a space this processor has left"],

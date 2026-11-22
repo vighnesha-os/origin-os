@@ -139,8 +139,15 @@ impl Request {
 
 /// What the protocol needs from a processor, in the calling processor's view.
 pub trait TlbHardware {
-    /// This processor's index into the protocol's per-processor tables.
-    fn this_cpu(&self) -> usize;
+    /// A witness that its holder cannot leave its processor while it lives (ADR-0020 S3; TASKS
+    /// item 93, the coordinating session's ruling Q5). The kernel's is an interrupts-off section's
+    /// (`origin_frame::trap::Here`). [`TlbHardware::without_interrupts`] hands one to its closure
+    /// for any lifetime it is given, so the processor index the closure reads under it is read
+    /// where the protocol uses it, and nothing bound to the witness leaves the section.
+    type Here<'a>: Copy;
+
+    /// This processor's index into the protocol's per-processor tables, read under `here`.
+    fn this_cpu(&self, here: Self::Here<'_>) -> usize;
 
     /// Drops what `request` names from this processor's TLB.
     fn invalidate(&self, request: Request);
@@ -148,8 +155,8 @@ pub trait TlbHardware {
     /// Interrupts processor `cpu`, whose handler calls [`Shootdown::service`].
     fn send_ipi(&self, cpu: usize);
 
-    /// Runs `f` with interrupts disabled on this processor.
-    fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R;
+    /// Runs `f` with interrupts disabled on this processor, with the section's witness.
+    fn without_interrupts<R>(&self, f: impl for<'a> FnOnce(Self::Here<'a>) -> R) -> R;
 
     /// The root of the address space this processor runs on now (CR3).
     fn current_root(&self) -> u64;
@@ -576,14 +583,22 @@ impl<S: Records> Shootdown<S> {
     /// Returns whether it has a record. One that has none cannot be made a target, so it would
     /// never be asked to flush and an address space could be freed under it: nothing is done,
     /// and the caller must keep it out (review finding F6 of 2026-11-14).
+    ///
+    /// All of it in one interrupts-off section (ADR-0020 S3; TASKS item 93, review finding R93-1):
+    /// the processor whose flag it sets is the one whose TLB it flushes, whoever calls it. Read in
+    /// one section and used after it, a caller moved in between would mark one processor online
+    /// and flush another. Its callers today are the processors' boot and idle flows, which never
+    /// move (ADR-0020 S2, point 4).
     pub fn mark_online(&self, hardware: &impl TlbHardware) -> bool {
-        let Some(online) = self.online(hardware.this_cpu()) else {
-            return false;
-        };
-        online.store(true, Ordering::Release);
-        prim::fence(Ordering::SeqCst);
-        hardware.invalidate(Request::Everything);
-        true
+        hardware.without_interrupts(|here| {
+            let Some(online) = self.online(hardware.this_cpu(here)) else {
+                return false;
+            };
+            online.store(true, Ordering::Release);
+            prim::fence(Ordering::SeqCst);
+            hardware.invalidate(Request::Everything);
+            true
+        })
     }
 
     /// Moves this processor to the address space `to`, by running `load` (the CR3 write), and
@@ -601,12 +616,14 @@ impl<S: Records> Shootdown<S> {
     /// is changing: this processor's page walks start after the fence, so if the initiator
     /// read the old `loaded`, its own fence came first, and the walks see its change.
     pub fn switch_space(&self, hardware: &impl TlbHardware, to: u64, load: impl FnOnce()) {
-        hardware.without_interrupts(|| self.switch_here(hardware, to, load));
+        hardware.without_interrupts(|here| {
+            self.switch_here(hardware, hardware.this_cpu(here), to, load);
+        });
     }
 
-    /// [`switch_space`](Self::switch_space)'s work, with interrupts already off.
-    fn switch_here(&self, hardware: &impl TlbHardware, to: u64, load: impl FnOnce()) {
-        let me = hardware.this_cpu();
+    /// [`switch_space`](Self::switch_space)'s work, with interrupts already off, on processor `me`,
+    /// read in the same section.
+    fn switch_here(&self, hardware: &impl TlbHardware, me: usize, to: u64, load: impl FnOnce()) {
         let from = hardware.current_root();
         if from == to {
             return;
@@ -641,12 +658,12 @@ impl<S: Records> Shootdown<S> {
         load: impl Fn(u64),
         f: impl FnOnce() -> R,
     ) -> R {
-        hardware.without_interrupts(|| {
+        hardware.without_interrupts(|here| {
             let home = hardware.current_root();
             if home == visiting {
                 return f();
             }
-            let slot = self.visiting(hardware.this_cpu());
+            let slot = self.visiting(hardware.this_cpu(here));
             if let Some(slot) = slot {
                 slot.store(visiting, Ordering::Release);
             }
@@ -689,8 +706,8 @@ impl<S: Records> Shootdown<S> {
     pub fn service(&self, hardware: &impl TlbHardware) {
         // With interrupts off, so that the record below only ever goes forward: a request's
         // interrupt arriving between the comparison and the store would otherwise be overwritten.
-        hardware.without_interrupts(|| {
-            let Some(served) = self.served(hardware.this_cpu()) else {
+        hardware.without_interrupts(|here| {
+            let Some(served) = self.served(hardware.this_cpu(here)) else {
                 return;
             };
             // Acquire: the request read below is the one this generation published (its
@@ -726,7 +743,7 @@ impl<S: Records> Shootdown<S> {
         request: Request,
         scope: Scope,
     ) -> Result<Completed, Stalled> {
-        hardware.without_interrupts(|| {
+        hardware.without_interrupts(|here| {
             let turn = loop {
                 if let Some(turn) = self.turn.try_lock() {
                     break turn;
@@ -736,7 +753,7 @@ impl<S: Records> Shootdown<S> {
             };
             let start = hardware.now();
             hardware.invalidate(request);
-            let me = hardware.this_cpu();
+            let me = hardware.this_cpu(here);
             self.request.store(request.encode(), Ordering::Relaxed);
             let generation = self.generation.fetch_add(1, Ordering::Release) + 1;
             // The caller's page-table change and this request must be visible before anyone is
@@ -903,7 +920,9 @@ mod tests {
     }
 
     impl TlbHardware for Cpu<'_> {
-        fn this_cpu(&self) -> usize {
+        type Here<'a> = ();
+
+        fn this_cpu(&self, (): ()) -> usize {
             self.id
         }
 
@@ -919,8 +938,8 @@ mod tests {
             self.machine.ipis.lock().unwrap().push((self.id, cpu));
         }
 
-        fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
-            f()
+        fn without_interrupts<R>(&self, f: impl for<'a> FnOnce(Self::Here<'a>) -> R) -> R {
+            f(())
         }
 
         fn now(&self) -> u64 {
@@ -1066,7 +1085,8 @@ mod tests {
             saw_online: &'a AtomicBool,
         }
         impl TlbHardware for Watching<'_> {
-            fn this_cpu(&self) -> usize {
+            type Here<'a> = ();
+            fn this_cpu(&self, (): ()) -> usize {
                 1
             }
             fn invalidate(&self, _: Request) {
@@ -1074,8 +1094,8 @@ mod tests {
                 self.saw_online.store(online, Ordering::Relaxed);
             }
             fn send_ipi(&self, _: usize) {}
-            fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
-                f()
+            fn without_interrupts<R>(&self, f: impl for<'a> FnOnce(Self::Here<'a>) -> R) -> R {
+                f(())
             }
             fn now(&self) -> u64 {
                 0

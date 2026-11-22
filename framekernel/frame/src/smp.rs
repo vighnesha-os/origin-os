@@ -64,6 +64,7 @@ use crate::percpu::{PerCpu, Sizing};
 use crate::stack::GuardedStack;
 use crate::timer::{ApicRead, X2Apic};
 use crate::topology::CpuTopology;
+use crate::trap::Pinned;
 use crate::vm;
 
 /// Physical address of the trampoline code; the start-up IPI vector is `TRAMPOLINE >> 12`.
@@ -178,7 +179,7 @@ struct ApStart {
     /// The CPU index the AP takes; discovery assigned it the AP's APIC ID.
     index: CpuIndex,
     /// Where the AP goes once it is online: the layers above's scheduler.
-    main: fn(&X2Apic) -> !,
+    main: fn(Pinned<'static>, &X2Apic) -> !,
     /// What the AP found it lacks, set before it refuses (`Refusal` has room only for its
     /// x2APIC), so the boot processor can name it: 0, [`LACKS_SMEP_SMAP`],
     /// [`LACKS_BASELINE`] or [`LACKS_FPU_ROOM`].
@@ -262,9 +263,13 @@ impl Online {
 /// indexes the MADT gave (ADR-0008 Amendment 1, D1): the framework's
 /// ([`crate::percpu::size_per_cpu`]), then the kernel's, through `size_kernel`, its crate's one
 /// sizing function. No AP whose index a table does not hold is started.
+///
+/// `flow` is the boot flow's witness (ADR-0020 S3; TASKS item 93). Each AP's own flow is made
+/// in its entry and handed to `ap_main` with its local APIC.
 pub fn start(
+    flow: Pinned<'_>,
     com1: &mut dyn Write,
-    ap_main: fn(&X2Apic) -> !,
+    ap_main: fn(Pinned<'static>, &X2Apic) -> !,
     size_kernel: fn(&mut Sizing),
 ) -> Online {
     let mut online = Online::one();
@@ -279,8 +284,10 @@ pub fn start(
         return online;
     };
     let (info, regions) = (boot.info(), boot.regions());
+    // The boot flow's index (ADR-0020 S3; TASKS item 93): it never moves.
+    let me = cpu::this_cpu(flow.here());
     // The timer bring-up switched this APIC to x2APIC mode; without it no AP is started.
-    let Some(lapic) = X2Apic::this_cpu() else {
+    let Some(lapic) = X2Apic::here(me) else {
         let _ = writeln!(
             com1,
             "origin-kernel: the local APIC is not in x2APIC mode: AP start-up failed"
@@ -288,11 +295,11 @@ pub fn start(
         return online;
     };
     let bsp = lapic.read(ApicRead::Id) as u32;
-    if cpu::this_cpu() != CpuIndex::BOOT || CpuIndex::BOOT.apic_id() != Some(bsp) {
+    if me.index() != CpuIndex::BOOT || CpuIndex::BOOT.apic_id() != Some(bsp) {
         let _ = writeln!(
             com1,
             "origin-kernel: the CPU-local area names {}, not APIC ID {bsp}: AP start-up failed",
-            cpu::this_cpu().named()
+            me.index().named()
         );
         return online;
     }
@@ -307,7 +314,7 @@ pub fn start(
     }
     // The boot processor's FPU format is the one every AP is held to, and its area holds it
     // by construction (`cpu::record_boot_fpu`): alike once it has been recorded.
-    cpu::record_cpu_state(cpu::boot_fpu_format().is_some());
+    cpu::record_cpu_state(me, cpu::boot_fpu_format().is_some());
     // The boot processor's interrupt stacks are in the kernel's image; nothing could guard
     // them before the kernel's own tables were live.
     // SAFETY: the boot processor's interrupt stacks lie above their guard pages and have not
@@ -637,10 +644,11 @@ pub(crate) static TOPOLOGY: PerCpu<crate::sync::SpinLock<Option<CpuTopology>>> =
 );
 
 /// Reads this processor's topology from CPUID and records it under its CPU index. The
-/// boot processor and every AP call this once, on themselves.
-pub fn record_topology() {
+/// boot processor and every AP call this once, on themselves, with `me` read under their
+/// start-up flow's witness (ADR-0020 S3; TASKS item 93).
+pub fn record_topology(me: cpu::ThisCpu<'_>) {
     let own = CpuTopology::detect(cpu::cpuid_subleaf);
-    if let Some(slot) = TOPOLOGY.get(cpu::this_cpu().get()) {
+    if let Some(slot) = TOPOLOGY.this(me) {
         *slot.lock() = Some(own);
     }
 }
@@ -876,7 +884,7 @@ fn start_one(
     index: CpuIndex,
     apic_id: u32,
     tsc_hz: u64,
-    main: fn(&X2Apic) -> !,
+    main: fn(Pinned<'static>, &X2Apic) -> !,
 ) -> Result<(u64, FpuFormat), NotStarted> {
     // Every allocation here fails as `NotStarted::Memory`, and what was taken before it is freed
     // as it returns, so a processor short of memory stays in firmware, counted (ADR-0008
@@ -1092,11 +1100,24 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // interrupt stacks are four stacks of `IST_STACK_SIZE` bytes in the stack region that the
     // boot processor made for this AP alone and keeps for ever (`start_one`).
     unsafe { cpu::init_ap(start.tables, start.index, start.interrupt_stacks) };
+    // This AP's start-up flow, and its witness (ADR-0020 S3; TASKS item 93, the coordinating
+    // session's ruling Q6): taken once, through the same check as the boot flow's
+    // (`cpu::flow`), once `cpu::init_ap` has set the CPU-local area it reads, and passed down
+    // to the scheduler. Interrupts have been off since the trampoline and stay off until its
+    // scheduler's idle loop, which is this same flow, so nothing has switched a thread in here
+    // and the check holds. If it did not, this processor's table would name a thread running,
+    // so the index in its CPU-local area would be one already running threads, not the one it
+    // was given: it refuses as `NotMine`, and the boot processor parks it.
+    let Some(flow) = cpu::flow() else {
+        let _ = start.handshake.refuse(Refusal::NotMine);
+        cpu::halt();
+    };
+    let me = cpu::this_cpu(flow.here());
     // SAFETY: CPL 0; the kernel has no user mappings. Every processor enforces SMEP and SMAP.
-    let (smep, smap) = unsafe { cpu::enable_smep_smap() };
+    let (smep, smap) = unsafe { cpu::enable_smep_smap(me) };
     // SAFETY: CPL 0; the kernel's tables mark only the kernel half global.
-    let _ = unsafe { crate::tlb::enable_global_pages() };
-    cpu::check_pat();
+    let _ = unsafe { crate::tlb::enable_global_pages(me) };
+    cpu::check_pat(me);
     let cpuid = cpu::gather_cpuid();
     // SAFETY: CPL 0, this AP, once, before any SIMD runs on it.
     let format = unsafe { cpu::enable_simd(&cpuid) };
@@ -1130,12 +1151,12 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     }
     // SAFETY: CPL 0, this AP only, interrupts disabled, x2APIC supported, and the spurious
     // vector has a gate in the shared IDT.
-    let lapic = unsafe { X2Apic::enable() };
+    let lapic = unsafe { X2Apic::enable(me) };
     let id = lapic.read(ApicRead::Id) as u32;
     // The CPU-local area (GS) must hold the index this processor was given, and that index
     // must be this processor's APIC ID, or its scheduler would use another processor's
     // queue: otherwise answer with a value the boot processor rejects.
-    let mine = cpu::this_cpu() == start.index && start.index.apic_id() == Some(id);
+    let mine = me.index() == start.index && start.index.apic_id() == Some(id);
     if !mine {
         // Not the processor this index was given to: refuse, and do nothing more (no
         // timer, no scheduler; interrupts stay disabled) until the boot processor parks it.
@@ -1143,11 +1164,11 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
         cpu::halt();
     }
     // This processor's topology, read on itself: its leaves are its own (CLAUDE.md §24, §27).
-    record_topology();
+    record_topology(me);
     // What it found about itself, in one store, once every check above has passed: so a
     // processor refused for any reason records nothing, and never takes part in moves. The
     // answer below orders the record before the boot processor sees it online.
-    cpu::record_cpu_state(fit == FpuFit::Alike);
+    cpu::record_cpu_state(me, fit == FpuFit::Alike);
     // Join only if this answer settles the start-up. If the boot processor stopped waiting
     // first, CPU `index` stays offline and this processor is being parked: do nothing more.
     if !start.handshake.answer(id) {
@@ -1155,7 +1176,7 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     }
     // This processor's random-number generator (ADR-0016 R5): its instructions' start-up tests
     // and a first seed from the root, before anything can run here that asks for a value.
-    crate::random::start_this_processor();
-    // M3: this processor's scheduler.
-    (start.main)(&lapic)
+    crate::random::start_this_processor(me);
+    // M3: this processor's scheduler, on this same flow.
+    (start.main)(flow, &lapic)
 }

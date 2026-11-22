@@ -116,10 +116,11 @@ pub(crate) fn ioapic_irqs_on(cpu: CpuIndex) -> u64 {
         .map_or(0, |n| n.load(Ordering::Relaxed))
 }
 
-/// An I/O APIC-routed interrupt: counted, and the interrupted context resumes.
-fn on_interrupt() -> Action {
+/// An I/O APIC-routed interrupt: counted, and the interrupted context resumes. Its processor's
+/// count is read under the trap entry's witness (ADR-0020 S3; TASKS item 93).
+fn on_interrupt(here: origin_frame::trap::Here<'_>) -> Action {
     IOAPIC_IRQS.fetch_add(1, Ordering::Relaxed);
-    if let Some(n) = IOAPIC_IRQS_ON.get(cpu::this_cpu().get()) {
+    if let Some(n) = IOAPIC_IRQS_ON.this(cpu::this_cpu(here)) {
         n.fetch_add(1, Ordering::Relaxed);
     }
     // The console's boot proof prints from this handler once.
@@ -393,7 +394,12 @@ fn probe(
 /// After each probe the IRTE is restored and interrupts must arrive again. Then the entry is
 /// masked, the PIT stopped and the IRTE released. Returns whether everything held; without
 /// interrupt remapping, or without an I/O APIC, there is nothing to prove.
-pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
+pub(crate) fn prove_remapped(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    tsc_hz: u64,
+) -> bool {
     let Some(pin) = cpu::without_interrupts(|| *PIT_PIN.lock()) else {
         let _ = writeln!(
             com1,
@@ -422,7 +428,8 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
         );
         return true;
     }
-    let bsp = cpu::this_cpu();
+    // The boot flow's processor, a value read under its witness (TASKS item 93).
+    let bsp = cpu::this_cpu(flow.here()).index();
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let mut ids = cpus.to_vec();
     if !ids.contains(&target) {

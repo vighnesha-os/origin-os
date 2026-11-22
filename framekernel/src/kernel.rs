@@ -61,6 +61,19 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
     let mut com1 = console::Console::boot_flow();
     // What each boot proof found, and what that means for this boot (ADR-0013).
     let mut proofs = Tally::new();
+    // The boot flow's witness (ADR-0020 S2, point 4; TASKS item 93, the coordinating session's
+    // ruling Q6): this flow never moves and never becomes a thread, so the witness holds for the
+    // rest of the boot. Taken once, here, and passed down to what reads the processor index.
+    // It exists before GS's base is set (`early.load_cpu_tables()`, below): nothing reads the
+    // index before that, by `Early`'s order and `timer::init`'s check, which the witness does not
+    // show (review finding R93-3).
+    let Some(flow) = cpu::flow() else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: the kernel did not start on the boot flow"
+        );
+        halt();
+    };
 
     let mut early = match entry.read_boot_info() {
         Ok(early) => early,
@@ -113,9 +126,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
     // Out of turn the boot steps do nothing, whoever calls them (`Early`): proven here, before
     // any of them has run, and below for a second run of each.
     let out_of_turn = !early.start_heap(&mut com1)
-        && !early.prove_user_isolation(&mut com1)
+        && !early.prove_user_isolation(flow, &mut com1)
         && early.build_kernel_tables(&mut com1).is_none()
-        && timer::init(&mut com1, info.acpi_rsdp).is_none();
+        && timer::init(flow, &mut com1, info.acpi_rsdp).is_none();
 
     // The trap entry (in `cpu`) knows the layers above only through these upcalls.
     origin_frame::trap::install(origin_frame::trap::Hooks {
@@ -129,6 +142,8 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         user_fault: syscall::user_fault,
         report_exception: console::report_exception,
     });
+    // The pin's mint, to the scheduler, before any thread exists (TASKS item 93, the ruling's Q3).
+    sched::take_pin_mint();
     // M2, first step: the kernel's own GDT, TSS and IDT, proven with a breakpoint whose
     // handler reports it and resumes here.
     early.load_cpu_tables();
@@ -196,7 +211,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
     // M2, third step: the kernel's own page tables, proven with deliberate faults; then
     // the frame allocator is proven again through the new direct map.
     let mut heap_ok = false;
-    let paging = init_paging(&mut com1, &mut early);
+    let paging = init_paging(flow, &mut com1, &mut early);
     // The kernel's own tables are loaded, so firmware tables can be mapped: the console's
     // UART is the one the firmware names, if it names one (ADR-0010).
     console::adopt_firmware_uart(&mut com1, info.acpi_rsdp, regions);
@@ -216,6 +231,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
             early.frames_proven(),
         );
         quiesced = pcie::quiesce(
+            flow,
             &mut com1,
             info.acpi_rsdp,
             regions,
@@ -228,7 +244,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         );
         heap_ok = prove_heap(&mut com1);
         record_or_stop(&mut com1, &mut proofs, Proof::Heap, heap_ok);
-        if heap_ok && !early.prove_user_isolation(&mut com1) {
+        if heap_ok && !early.prove_user_isolation(flow, &mut com1) {
             // Ring 3 comes next: a kernel that cannot keep itself from user pages must not
             // run it, any more than a processor below the baseline (and `prove_user_isolation`
             // has said why).
@@ -242,7 +258,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
 
     // M2, fourth step: interrupts. The local APIC in x2APIC mode, its timer calibrated
     // against the PIT and proven by taking periodic interrupts.
-    let tsc_hz = timer::init(&mut com1, info.acpi_rsdp);
+    let tsc_hz = timer::init(flow, &mut com1, info.acpi_rsdp);
     record_or_stop(&mut com1, &mut proofs, Proof::ApicTimer, tsc_hz.is_some());
     if let Some(hz) = tsc_hz {
         // The timer runs and every vector that can arrive has a gate: from here on, the
@@ -251,7 +267,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         if let Some(q) = quiesced.as_mut() {
             proofs.record(Proof::BusMastersSettled, pcie::settle(&mut com1, q, hz));
         }
-        let nmi = prove_nmi_ist(&mut com1, hz);
+        let nmi = prove_nmi_ist(flow, &mut com1, hz);
         proofs.record(Proof::NmiDelivery, nmi.delivered);
         if nmi.delivered {
             record_or_stop(&mut com1, &mut proofs, Proof::NmiStack, nmi.on_own_stack);
@@ -260,8 +276,8 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         // clock from the RTC (CLAUDE.md §68).
         proofs.record(Proof::Clocks, time::init(&mut com1, hz, info.acpi_rsdp));
         // I/O APIC interrupt routing, proven by routing the PIT's IRQ0 (CLAUDE.md §24).
-        let bsp =
-            timer::X2Apic::this_cpu().map_or(u32::MAX, |l| l.read(timer::ApicRead::Id) as u32);
+        let bsp = timer::X2Apic::here(cpu::this_cpu(flow.here()))
+            .map_or(u32::MAX, |l| l.read(timer::ApicRead::Id) as u32);
         proofs.record(
             Proof::IoApic,
             irq::prove(&mut com1, info.acpi_rsdp, bsp, hz),
@@ -309,8 +325,11 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         // Boot info 0.6 (decision item 166): the loader's value for the kernel stacks' region
         // can be taken once, and only before the generator's start overwrites it with the seed.
         let stack_value = prove_stack_value(&mut com1, info.boot_seed != 0);
-        report_random_start(&mut com1, origin_frame::random::start_boot());
-        let online = smp::start(&mut com1, sched::run_ap, crate::percpu::size_per_cpu);
+        report_random_start(
+            &mut com1,
+            origin_frame::random::start_boot(cpu::this_cpu(flow.here())),
+        );
+        let online = smp::start(flow, &mut com1, sched::run_ap, crate::percpu::size_per_cpu);
         proofs.record(Proof::Processors, online.complete());
         // What each processor put in its own control registers, which ring 3 relies on.
         let held = cpu::cpu_states_holding(online.cpus()) == online.cpus().len();
@@ -340,14 +359,14 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         }
         // Every boot step, and the two that bring up hardware for good, run once: a repeat
         // changes nothing (`smp::start` would otherwise reset running processors).
-        let again = smp::start(&mut com1, sched::run_ap, crate::percpu::size_per_cpu);
+        let again = smp::start(flow, &mut com1, sched::run_ap, crate::percpu::size_per_cpu);
         let once = again.cpus().len() == 1
             && !again.complete()
             && early.reclaim_loader_memory(&online).is_none()
             && !early.init_memory(&mut com1)
             && early.build_kernel_tables(&mut com1).is_none()
             && !early.start_heap(&mut com1)
-            && !early.prove_user_isolation(&mut com1)
+            && !early.prove_user_isolation(flow, &mut com1)
             && early.enable_simd() == xcr0
             && !iommu::init(
                 &mut com1,
@@ -374,7 +393,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         // CPU topology from CPUID, each processor's on itself, checked against the MADT
         // (CLAUDE.md §24, §27).
         let apic_ids = online.apic_ids();
-        let topology = prove_topology(&mut com1, info.acpi_rsdp, &online);
+        let topology = prove_topology(flow, &mut com1, info.acpi_rsdp, &online);
         proofs.record(Proof::Topology, topology);
         // NUMA affinities from the ACPI SRAT (CLAUDE.md §24, §28).
         let numa = prove_numa(&mut com1, info.acpi_rsdp, &apic_ids);
@@ -397,7 +416,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         // painted stack, must equal the depth it sampled, to the byte.
         proofs.record(
             Proof::MeasuredStackBoot,
-            crate::measured_stack::prove_at_boot(&mut com1, tsc_hz),
+            crate::measured_stack::prove_at_boot(flow, &mut com1, tsc_hz),
         );
         // The AML interpreter over QEMU's DSDT and SSDTs, against a host that refuses every access
         // to hardware (ADR-0019 A3; TASKS item 63, step B3); on any other firmware it runs no AML
@@ -414,7 +433,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         // The random-number generator on every processor (CLAUDE.md §59; ADR-0016). If the
         // proof fails, randomness is withheld from here on (ADR-0013 R2, Amendment 1): nothing
         // is launched and nothing is placed at a random address.
-        let random = prove_random(&mut com1, online.cpus(), tsc_hz) && stack_value;
+        let random = prove_random(flow, &mut com1, online.cpus(), tsc_hz) && stack_value;
         if !random {
             origin_frame::random::withhold();
         }
@@ -428,9 +447,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         // M3, second step: preemptive kernel threads on every online processor. Its proofs
         // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
         // use only the kernel's fixed programs, and the operator sees every result.
-        sched::prove(&mut com1, online.cpus(), tsc_hz, &mut proofs);
+        sched::prove(flow, &mut com1, online.cpus(), tsc_hz, &mut proofs);
         // ADR-0017 Z3, after the proofs above have run several processes in ring 3.
-        proofs.record(Proof::Ibpb, prove_ibpb(&mut com1, online.cpus()));
+        proofs.record(Proof::Ibpb, prove_ibpb(flow, &mut com1, online.cpus()));
         stop_if_refused(&mut com1, proofs);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
         if let Some(q) = quiesced.as_mut()
@@ -445,7 +464,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
                         .filter(|r| r.verdict.is_ok())
                         .filter_map(|r| r.range.as_ref()),
                 ));
-                pcie::init(&mut com1, q, online.cpus(), regions, &reserved)
+                pcie::init(flow, &mut com1, q, online.cpus(), regions, &reserved)
             }
         {
             proofs.record(Proof::Pcie, true);
@@ -453,20 +472,23 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
             // attaches.
             proofs.record(Proof::BusMastersQuiet, pcie::check_quiet(&mut com1, q));
             // M5: the NVMe driver and block I/O, polled and then interrupt-driven.
-            proofs.record(Proof::Nvme, storage::init(&mut com1, online.cpus(), tsc_hz));
+            proofs.record(
+                Proof::Nvme,
+                storage::init(flow, &mut com1, online.cpus(), tsc_hz),
+            );
             // M10: bring up the virtio-net NIC; an interrupt-driven receive thread takes the
             // OS onto the network (CLAUDE.md §31, §54). The one proof not in the verdict yet
             // (ADR-0013): `virtionet` returns nothing, and it prints each failure itself.
-            virtionet::prove(&mut com1, online.cpus(), tsc_hz);
+            virtionet::prove(flow, &mut com1, online.cpus(), tsc_hz);
             // The IOMMU's own proofs, through the bound NVMe controller: translated DMA, a
             // blocked and recorded DMA, remapped and blocked interrupts.
-            let devices = storage::prove_iommu(&mut com1, online.cpus(), tsc_hz);
+            let devices = storage::prove_iommu(flow, &mut com1, online.cpus(), tsc_hz);
             proofs.record(Proof::IommuDevices, devices);
             // Legacy interrupts under interrupt remapping: the PIT's IRQ0 through the I/O
             // APIC in remappable format and an IRTE that checks the I/O APIC's source ID,
             // with the IRTE made not present and given a wrong source ID (CLAUDE.md §24,
             // §32; ADR-0007 I8).
-            let remapped = irq::prove_remapped(&mut com1, online.cpus(), tsc_hz);
+            let remapped = irq::prove_remapped(flow, &mut com1, online.cpus(), tsc_hz);
             proofs.record(Proof::IoApicRemapped, remapped);
             // Bus mastering is on exactly for what the drivers attached to a domain.
             let mastering = pcie::prove_bus_mastering(&mut com1, q);
@@ -474,7 +496,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         } else {
             proofs.record(Proof::Pcie, false);
         }
-        sched::stop_boot_processor();
+        sched::stop_boot_processor(flow);
     }
 
     // M8/M9 groundwork: the in-memory VFS (paths, directories, files).
@@ -496,9 +518,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
     proofs.record(Proof::Sysfs, prove_sysfs(&mut com1));
     // The console's sending and drawing in sections, proven last so that what it prints is
     // still on the screen when the boot test compares the screen with the serial log.
-    let uart = console::prove_uart_sections(&mut com1);
+    let uart = console::prove_uart_sections(flow, &mut com1);
     proofs.record(Proof::ConsoleUartSections, uart);
-    let screen = console::prove_sections(&mut com1);
+    let screen = console::prove_sections(flow, &mut com1);
     proofs.record(Proof::ConsoleSections, screen);
 
     // The operator's summary: everything above scrolls past on a real machine's screen.
@@ -668,7 +690,11 @@ fn prove_nospec(com1: &mut Console) -> bool {
 /// ADR-0017 Z3: on every processor, one IBPB for each change of the process it runs in
 /// ring 3 where the processor has the command, and none where it has not; and the scheduler
 /// did note the processes the proofs before this one ran. Prints what one IBPB costs.
-fn prove_ibpb(com1: &mut Console, cpus: &[cpu::CpuIndex]) -> bool {
+fn prove_ibpb(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[cpu::CpuIndex],
+) -> bool {
     use origin_frame::speculation;
     let mut sound = true;
     let (mut changes, mut barriers, mut resumes) = (0u64, 0u64, 0u64);
@@ -693,7 +719,7 @@ fn prove_ibpb(com1: &mut Console, cpus: &[cpu::CpuIndex]) -> bool {
     let start = time::monotonic_nanos();
     let mut issued = 0;
     for _ in 0..SAMPLES {
-        issued += u64::from(cpu::issue_ibpb());
+        issued += u64::from(cpu::issue_ibpb(cpu::this_cpu(flow.here())));
     }
     let taken = time::monotonic_nanos().saturating_sub(start);
     let _ = if issued == SAMPLES {
@@ -1099,11 +1125,16 @@ pub(crate) fn check_initramfs(image: &[u8]) -> InitramfsCheck {
 ///   the resulting package, die, module and core counts with the machine it asked QEMU for.
 ///
 /// None of this reads the QEMU machine definition; the counts are only printed here.
-fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -> bool {
+fn prove_topology(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut console::Console,
+    rsdp: u64,
+    online: &smp::Online,
+) -> bool {
     use crate::topology::{self, CpuTopology, Layout, Source};
 
     // The boot processor's own record; every AP wrote its own before it came online.
-    smp::record_topology();
+    smp::record_topology(cpu::this_cpu(flow.here()));
     // The cache hierarchy from leaf 04h.
     let mut caches = [crate::cache::Cache {
         level: 0,
@@ -1694,7 +1725,12 @@ fn ticks_to_nanos(ticks: u64, tsc_hz: u64) -> u64 {
 /// requests are answered with values that differ, the generator's stack holds only zeros after
 /// a request (R9 Z3), and what a request costs and how long a step kept interrupts off
 /// (R12; rules 21 and 22). With no generator it says so and fails: randomness is withheld.
-fn prove_random(com1: &mut Console, cpus: &[cpu::CpuIndex], tsc_hz: u64) -> bool {
+fn prove_random(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[cpu::CpuIndex],
+    tsc_hz: u64,
+) -> bool {
     use origin_frame::random::{self, Condition, Error};
 
     // Every processor started its generator as it came up; give the last of them a moment.
@@ -1765,7 +1801,8 @@ fn prove_random(com1: &mut Console, cpus: &[cpu::CpuIndex], tsc_hz: u64) -> bool
     const FRESH_ASKS: u32 = 3;
     // The rest after a "not now" is one second (TASKS 18b S3).
     const FRESH_WAIT_NANOS: u64 = 1_100_000_000;
-    let here = random::processor(cpu::this_cpu());
+    // The boot flow's own processor (TASKS item 93): a value, read under the flow's witness.
+    let here = random::processor(cpu::this_cpu(flow.here()).index());
     let rdseed = here.is_some_and(|p| p.rdseed == Condition::Healthy);
     let mut fresh = [0u8; 32];
     let mut fresh_result = random::fill_fresh(&mut fresh);
@@ -1899,7 +1936,11 @@ fn prove_backtrace(com1: &mut Console, info: &BootInfo) -> bool {
 
 /// The kernel's page tables, built, the framebuffer kept, loaded and proven. Returns whether
 /// the kernel now runs on them.
-fn init_paging(com1: &mut Console, early: &mut Early) -> bool {
+fn init_paging(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    early: &mut Early,
+) -> bool {
     let Some(mut tables) = early.build_kernel_tables(com1) else {
         return false;
     };
@@ -1908,7 +1949,7 @@ fn init_paging(com1: &mut Console, early: &mut Early) -> bool {
     if console::has_screen() && !early.map_framebuffer(&mut tables) {
         console::withdraw_framebuffer(com1);
     }
-    early.load_kernel_tables(com1, tables)
+    early.load_kernel_tables(flow, com1, tables)
 }
 
 /// Writes `origin.core` into its frames, once, and says what it took: every process that is
@@ -2038,9 +2079,13 @@ struct NmiProof {
 
 /// Sends this processor an NMI and checks where it was taken. An NMI that does not arrive
 /// says nothing about the stack: that case, and a wrong stack, stay apart in the result.
-fn prove_nmi_ist(com1: &mut Console, tsc_hz: u64) -> NmiProof {
+fn prove_nmi_ist(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    tsc_hz: u64,
+) -> NmiProof {
     let (before, _) = cpu::nmis();
-    timer::send_nmi_to_self();
+    timer::send_nmi_to_self(cpu::this_cpu(flow.here()));
     let start = cpu::rdtsc();
     while cpu::nmis().0 == before && cpu::rdtsc().wrapping_sub(start) < tsc_hz {
         core::hint::spin_loop();

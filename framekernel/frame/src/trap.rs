@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::once::SetOnce;
 use crate::told::Shown;
@@ -17,6 +18,8 @@ use origin_paging::layout::Told;
 /// The scheduler's switch point: the moment, inside the trap entry with interrupts off, when
 /// it chooses what this processor runs next. Only the trap entry makes one, for the scheduling
 /// hooks, and only for the length of the call (it is not `Send`, and the hooks get a borrow).
+/// The trap entry also takes its witness, [`Switch::here`], for the code it runs itself and for
+/// the device handlers (ADR-0020 S3; TASKS item 93): `Switch::new` is its one caller.
 ///
 /// What is loaded with it stays: the address space for the thread about to resume
 /// (`UserSpace::activate`). Anywhere else, a space loaded on a processor would be undone the
@@ -29,11 +32,299 @@ pub struct Switch {
 }
 
 impl Switch {
-    /// For the trap entry only (which exists on the kernel's target only).
+    /// For the trap entry only (which exists on the kernel's target only). It is `pub(crate)`
+    /// because the trap entry, `cpu::dispatch`, is in another module; that is its one caller,
+    /// which the host test `only_the_trap_entry_makes_a_switch` holds (review finding R93-2), since
+    /// a `Switch` made anywhere else would give a [`Here`] with interrupts on.
     #[cfg(target_os = "none")]
     pub(crate) const fn new() -> Self {
         Self { _here: PhantomData }
     }
+
+    /// The witness of this switch point (ADR-0020 S3): the trap entry runs with interrupts off,
+    /// and a scheduling hook chooses what this processor runs next without leaving the processor
+    /// itself, so nothing that holds this borrow can be moved before the hook returns.
+    ///
+    /// `#[inline]`: the scheduler's hooks, in another crate, call it on the switch path, where an
+    /// out-of-line call would be one the base does not make (review finding R93-9).
+    #[inline]
+    pub fn here(&self) -> Here<'_> {
+        Here { _here: PhantomData }
+    }
+}
+
+/// A witness that the code holding it runs on one processor, and cannot leave it while the witness
+/// lives (ADR-0020 S3; TASKS item 93). The processor index is read only under one
+/// (`cpu::this_cpu`), and this processor's entry of a per-processor table is lent only for its
+/// life (`PerCpu::this`).
+///
+/// **Who makes one.** Three makers, each in this module, and nothing else (TASKS item 93, the
+/// coordinating session's ruling on `cba7462b`):
+/// - An interrupts-off section, `section` (which `cpu::without_interrupts_here` forwards to). Its
+///   closure takes the witness for any lifetime it is given, so nothing bound to that lifetime can
+///   be returned from it.
+/// - The trap entry, through its [`Switch`]: [`Switch::here`], for the scheduling hooks, the
+///   device handlers and its own checks.
+/// - [`Pinned::here`].
+///
+/// Its field and its constructor are private to this module, so no other module, in this crate or
+/// another, can make one but through these makers. Of them only [`Switch::new`] is open to the
+/// rest of this crate, for the trap entry, its one caller (a host test holds it; review finding
+/// R93-2). It is zero-sized and `Copy`, and neither `Send` nor `Sync`, so it never reaches another
+/// thread.
+///
+/// **What a section's or the trap entry's witness rests on.** It holds only while nothing its
+/// holder runs switches the holder out. Code holding one never enables interrupts, opens an
+/// interrupt window, idles, yields, sleeps, blocks or exits. A software interrupt is not masked by
+/// the interrupt flag, so a yield inside a section would still switch the thread out. Code whose
+/// body may be switched out takes a [`Pinned`] instead (the coordinating session's ruling Q2).
+///
+/// The witness is valid inside its section:
+///
+/// ```
+/// let read = origin_frame::trap::host_section(|here| {
+///     let _ = here;
+///     1
+/// });
+/// assert_eq!(read, 1);
+/// ```
+///
+/// It cannot be returned from it:
+///
+/// ```compile_fail
+/// let escaped = origin_frame::trap::host_section(|here| here);
+/// ```
+///
+/// Nor sent to another thread:
+///
+/// ```compile_fail,E0277
+/// fn send<T: Send>(_: T) {}
+/// origin_frame::trap::host_section(|here| send(here));
+/// ```
+#[derive(Clone, Copy)]
+pub struct Here<'a> {
+    _here: PhantomData<(*const (), &'a ())>,
+}
+
+// Never an address or an index: there is nothing in it to show.
+impl core::fmt::Debug for Here<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Here")
+    }
+}
+
+impl Here<'_> {
+    /// For [`section`] only (the kernel's target only, where it exists). Private: a call from any
+    /// other module does not build.
+    #[cfg(target_os = "none")]
+    const fn new() -> Self {
+        Self { _here: PhantomData }
+    }
+}
+
+/// A witness that the code holding it stays on its processor while the witness lives, **even if it
+/// is switched out meanwhile** (ADR-0020 S2; TASKS item 93, the coordinating session's ruling Q2).
+///
+/// Two things give one:
+/// - **a pin the running thread holds** (`sched::pin`), turned into a witness only through the
+///   [`PinMint`];
+/// - **the boot or idle flow** (`flow`, which `cpu::flow` forwards to), only once its check has
+///   found the processor running its flow. A flow has no record, and never moves (S2, point 4).
+///
+/// Its field and its constructor are private to this module, so no other module, in this crate or
+/// another, can make one any other way (TASKS item 93, the coordinating session's ruling on
+/// `cba7462b`).
+///
+/// It gives a [`Here`] for the same life. A function whose body may be switched out takes a
+/// `Pinned`, never a `Here`.
+///
+/// It cannot outlive the pin it was made from:
+///
+/// ```compile_fail,E0505
+/// struct Guard;
+/// let mint = origin_frame::trap::host_mint();
+/// let guard = Guard;
+/// let pinned = mint.pinned(&guard);
+/// drop(guard);
+/// let _ = pinned.here();
+/// ```
+///
+/// Nor be sent to another thread:
+///
+/// ```compile_fail,E0277
+/// fn send<T: Send>(_: T) {}
+/// struct Guard;
+/// let mint = origin_frame::trap::host_mint();
+/// let guard = Guard;
+/// send(mint.pinned(&guard));
+/// ```
+#[derive(Clone, Copy)]
+pub struct Pinned<'a> {
+    _here: PhantomData<(*const (), &'a ())>,
+}
+
+// As `Here`'s.
+impl core::fmt::Debug for Pinned<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Pinned")
+    }
+}
+
+impl<'a> Pinned<'a> {
+    /// For [`flow`] only, once its check has passed (the kernel's target only). Private: a call
+    /// from any other module does not build.
+    #[cfg(target_os = "none")]
+    const fn new() -> Self {
+        Self { _here: PhantomData }
+    }
+
+    /// The same witness, for what a section's witness reads. `#[inline]`, as [`Switch::here`].
+    #[inline]
+    pub fn here(self) -> Here<'a> {
+        Here { _here: PhantomData }
+    }
+}
+
+/// The right to turn the running thread's pin into a [`Pinned`] (ADR-0020 S2 and S3; TASKS item
+/// 93, the coordinating session's ruling Q3).
+///
+/// Exactly one is ever made:
+/// - [`take_pin_mint`] hands it out once, to the scheduler, before any thread exists.
+/// - The scheduler keeps it in a `static` of its own, a [`MintHolder`] that no other module names.
+/// - A second take stops the kernel, and so does a pin asked for before the mint was kept.
+///
+/// So the only witnesses that survive a switch are the scheduler's pins and the flows'. The
+/// scheduler raises the running thread's pin count before it asks for a witness, on every path.
+#[derive(Debug)]
+pub struct PinMint {
+    _one: (),
+}
+
+impl PinMint {
+    /// The witness of a pin that the caller raised on the running thread and holds as `pin`, for
+    /// as long as `pin` is borrowed.
+    pub fn pinned<'a, G>(&self, _pin: &'a G) -> Pinned<'a> {
+        Pinned { _here: PhantomData }
+    }
+
+    /// The witness of a pin that the caller raised on the running thread and never lowers: an
+    /// ending thread's (ADR-0020 S2, point 2).
+    pub fn pinned_for_good(&self) -> Pinned<'static> {
+        Pinned { _here: PhantomData }
+    }
+}
+
+/// Whether the kernel's one [`PinMint`] has been handed out.
+static PIN_MINT_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// The kernel's one [`PinMint`]. The scheduler takes it, before any thread exists. A second call
+/// stops the kernel: the mint is the scheduler's alone.
+pub fn take_pin_mint() -> PinMint {
+    take_mint_from(&PIN_MINT_TAKEN)
+}
+
+/// The mint `taken` says has not been handed out yet, or a stop.
+fn take_mint_from(taken: &AtomicBool) -> PinMint {
+    assert!(
+        !taken.swap(true, Ordering::AcqRel),
+        "the pin's mint was taken twice"
+    );
+    PinMint { _one: () }
+}
+
+/// Where the scheduler keeps the [`PinMint`]: one `static` of its own (the ruling's Q3).
+#[derive(Debug)]
+pub struct MintHolder(SetOnce<PinMint>);
+
+impl MintHolder {
+    /// A holder with no mint yet.
+    pub const fn new() -> Self {
+        Self(SetOnce::new())
+    }
+
+    /// Keeps `mint`. The kernel stops if this holder already holds one.
+    pub fn keep(&self, mint: PinMint) {
+        assert!(self.0.set(mint).is_ok(), "a second pin mint was kept");
+    }
+
+    /// The mint. The kernel stops if none was kept: a pin was asked for before the scheduler had
+    /// taken the mint.
+    pub fn mint(&self) -> &PinMint {
+        match self.0.get() {
+            Some(mint) => mint,
+            None => panic!("a pin was asked for before the scheduler took the pin's mint"),
+        }
+    }
+}
+
+impl Default for MintHolder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Runs `f` with interrupts off on this processor, with the section's witness (ADR-0020 S3; TASKS
+/// item 93). `f` reads the processor index, and this processor's entries of per-processor tables,
+/// under it. The closure takes the witness for any lifetime it is given, so nothing bound to that
+/// lifetime can leave it. `cpu::without_interrupts_here` forwards here.
+///
+/// `f` must not enable interrupts, open an interrupt window, idle, yield, sleep, block or exit.
+/// Any of those would let the thread be switched out inside the section, where the witness says it
+/// cannot be ([`Here`]).
+#[cfg(target_os = "none")]
+pub(crate) fn section<T>(f: impl for<'a> FnOnce(Here<'a>) -> T) -> T {
+    crate::cpu::without_interrupts(|| f(Here::new()))
+}
+
+/// The boot or idle flow's witness (ADR-0020 S2, point 4; TASKS item 93, the coordinating
+/// session's rulings Q6 and on `cba7462b`): `Some` if the context running on this processor is the
+/// processor's boot or idle flow, `None` on a thread. `cpu::flow` forwards here, and this is the
+/// only place a flow's [`Pinned`] is made.
+///
+/// A flow has no record and never moves, and it never becomes a thread. So the witness holds for
+/// the flow's whole life. Each flow takes it once, at its entry, and passes it down.
+///
+/// It is the flow if:
+/// - the descriptor tables are not loaded yet, so nothing but the boot flow has run;
+/// - this processor has no table of contexts, so no thread can have been switched in;
+/// - or its table names no running home (no switch yet) or the flow's own ([`runs_a_flow`]).
+///
+/// It is read in a [`section`], since only this processor's switches write the running slot.
+#[cfg(target_os = "none")]
+pub(crate) fn flow() -> Option<Pinned<'static>> {
+    let runs = section(|here| {
+        !crate::cpu::tables_ready()
+            || crate::cpu::CONTEXTS
+                .this(crate::cpu::this_cpu(here))
+                .is_none_or(|table| runs_a_flow(table.running_home()))
+    });
+    runs.then(Pinned::new)
+}
+
+/// Whether a processor whose table of contexts names `running_home` as its running context's home
+/// runs its boot or idle flow ([`flow`]; TASKS item 93, the coordinating session's ruling Q6):
+/// - `None`: no switch yet, so the flow is the only context that has run;
+/// - the flow's own home, `BOOT_FLOW`.
+///
+/// A thread's home is refused.
+#[cfg(any(test, target_os = "none"))]
+pub(crate) fn runs_a_flow(running_home: Option<u64>) -> bool {
+    running_home.is_none_or(|home| home == crate::sync::contexts::BOOT_FLOW)
+}
+
+/// For the host's tests and doctests only, where there is no processor index: runs `f` with a
+/// [`Here`], as an interrupts-off section does on the kernel's target. It is absent from the
+/// kernel's build, so no kernel code can make a witness this way.
+#[cfg(not(target_os = "none"))]
+pub fn host_section<T>(f: impl for<'a> FnOnce(Here<'a>) -> T) -> T {
+    f(Here { _here: PhantomData })
+}
+
+/// For the host's tests and doctests only: a [`PinMint`] apart from the kernel's one. It is absent
+/// from the kernel's build.
+#[cfg(not(target_os = "none"))]
+pub fn host_mint() -> PinMint {
+    PinMint { _one: () }
 }
 
 /// What a system call's upcall asks for.
@@ -291,5 +582,178 @@ mod tests {
             assert!(!holds(&text, addr as u64), "{text} holds {addr:#x}");
         }
         assert!(!text.contains("0x"), "{text}");
+    }
+
+    /// The mint is handed out once; a second take stops the kernel (the ruling's Q3).
+    #[test]
+    #[should_panic(expected = "the pin's mint was taken twice")]
+    fn the_pin_mint_taken_twice_stops() {
+        let taken = AtomicBool::new(false);
+        let first = take_mint_from(&taken);
+        let _ = first.pinned_for_good();
+        let _second = take_mint_from(&taken);
+    }
+
+    /// A holder that never kept the mint stops the kernel when a pin asks for it: the scheduler
+    /// had not taken it (the ruling's Q3, "not at all").
+    #[test]
+    #[should_panic(expected = "a pin was asked for before the scheduler took the pin's mint")]
+    fn a_pin_without_the_mint_stops() {
+        let holder = MintHolder::new();
+        let _ = holder.mint();
+    }
+
+    /// A holder keeps one mint: a second stops the kernel.
+    #[test]
+    #[should_panic(expected = "a second pin mint was kept")]
+    fn a_second_mint_kept_stops() {
+        let holder = MintHolder::new();
+        holder.keep(host_mint());
+        holder.keep(host_mint());
+    }
+
+    /// The flow check over a real table of contexts (the ruling's Q6): no running home, then a
+    /// thread's home, which is refused, then the flow's own.
+    #[test]
+    fn only_a_flow_passes_the_flow_check() {
+        use crate::sync::contexts::{BOOT_FLOW, Contexts};
+        let table = Contexts::new();
+        assert_eq!(table.running_home(), None);
+        assert!(runs_a_flow(table.running_home()), "no switch yet");
+        // A thread's first frame, inside a stack of the region's kind: its home is that frame.
+        let thread = 0xffff_c000_0001_ff40;
+        assert!(table.publish(thread));
+        let boot_flow_frame = 0x9000;
+        let on_nothing = |_| false;
+        assert!(
+            table
+                .switch(boot_flow_frame, thread, false, on_nothing)
+                .is_ok()
+        );
+        assert_eq!(table.running_home(), Some(thread));
+        assert!(
+            !runs_a_flow(table.running_home()),
+            "a thread's home is refused"
+        );
+        assert!(
+            table
+                .switch(thread - 0x200, boot_flow_frame, false, on_nothing)
+                .is_ok()
+        );
+        assert_eq!(table.running_home(), Some(BOOT_FLOW));
+        assert!(runs_a_flow(table.running_home()), "the flow's own home");
+    }
+
+    /// What the scan below looks for, built so that this file does not hold it.
+    const SWITCH_NEW: &str = concat!("Switch", "::new(");
+
+    /// The function enclosing each call of `Switch::new` in `text`: the nearest `fn` line above it
+    /// that no `}` at its indentation or less has closed. Comment lines do not count.
+    fn switch_makers(text: &str) -> alloc::vec::Vec<alloc::string::String> {
+        fn fn_name(mut line: &str) -> Option<&str> {
+            loop {
+                let before = line;
+                for qualifier in [
+                    "pub(crate) ",
+                    "pub(super) ",
+                    "pub ",
+                    "const ",
+                    "unsafe ",
+                    "async ",
+                ] {
+                    line = line.strip_prefix(qualifier).unwrap_or(line);
+                }
+                if let Some(abi) = line.strip_prefix("extern \"")
+                    && let Some((_, rest)) = abi.split_once("\" ")
+                {
+                    line = rest;
+                }
+                if line == before {
+                    break;
+                }
+            }
+            let name = line.strip_prefix("fn ")?;
+            let end = name
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(name.len());
+            name.get(..end).filter(|name| !name.is_empty())
+        }
+        let mut within: alloc::vec::Vec<(usize, &str)> = alloc::vec::Vec::new();
+        let mut makers = alloc::vec::Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let indent = line.len() - trimmed.len();
+            if let Some(name) = fn_name(trimmed) {
+                within.retain(|&(at, _)| at < indent);
+                within.push((indent, name));
+            }
+            if line.contains(SWITCH_NEW) {
+                makers.push(alloc::string::String::from(
+                    within.last().map_or("(none)", |&(_, name)| name),
+                ));
+            }
+            if trimmed.starts_with('}') {
+                within.retain(|&(at, _)| at < indent);
+            }
+        }
+        makers
+    }
+
+    /// The scan finds a call in a function, in an `extern` function's closure, and outside any
+    /// function, and skips a comment: what the test below rests on.
+    #[test]
+    fn the_switch_scan_finds_each_call() {
+        let text = format!(
+            "fn a() {{\n    {SWITCH_NEW}).here();\n}}\n// {SWITCH_NEW})\nextern \"sysv64\" fn b() {{\n    let c = || {SWITCH_NEW});\n}}\nstatic S: () = {SWITCH_NEW});\n"
+        );
+        assert_eq!(switch_makers(&text), ["a", "b", "(none)"]);
+    }
+
+    /// `Switch::new` is `pub(crate)`, so any module of this crate could build a `Switch`, and from
+    /// it a `Here` with interrupts on (review finding R93-2). Every source file of this crate is
+    /// read, and the trap entry, `cpu::dispatch`, is the only function that calls it.
+    #[test]
+    fn only_the_trap_entry_makes_a_switch() {
+        let mut found = alloc::vec::Vec::new();
+        let src = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut paths = alloc::vec![src.clone()];
+        while let Some(path) = paths.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(path.as_path()).expect("the crate's sources") {
+                    paths.push(entry.expect("a source entry").path());
+                }
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("a source file");
+                // The path under `src`, so that a file of the same name elsewhere is told apart
+                // (the addendum review's A93-2).
+                let file = path
+                    .strip_prefix(&src)
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                for maker in switch_makers(&text) {
+                    found.push(format!("{file}: {maker}"));
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        assert_eq!(found, ["cpu.rs: dispatch"]);
+    }
+
+    /// A holder that kept the mint lends it, and the witnesses carry no state.
+    #[test]
+    fn a_kept_mint_is_lent() {
+        let taken = AtomicBool::new(false);
+        let holder = MintHolder::new();
+        holder.keep(take_mint_from(&taken));
+        let pin = ();
+        let pinned = holder.mint().pinned(&pin);
+        let _ = pinned.here();
+        assert_eq!(core::mem::size_of::<Here<'_>>(), 0);
+        assert_eq!(core::mem::size_of::<Pinned<'_>>(), 0);
+        assert_eq!(format!("{:?} {pinned:?}", pinned.here()), "Here Pinned");
     }
 }

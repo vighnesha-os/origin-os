@@ -26,6 +26,13 @@
 //! location names reads the generation of the thread that is there, and a name kept past its
 //! thread's reap never names the record's next thread.
 //!
+//! # The pin
+//!
+//! A record also holds the thread's **pin count** (ADR-0020 S2). While it is above zero, the
+//! thread never moves. Only the thread itself raises and lowers it, while it runs
+//! ([`Record::pin`]). [`Block::take`] resets it for the record's next thread. Nothing reads it
+//! yet: the mover that will (ADR-0020 S6) is not built.
+//!
 //! # Locks
 //!
 //! In this order, and never the other way: a processor's run queue (two, in index order, for a
@@ -111,6 +118,9 @@ pub trait Empty {
 pub struct Record<S> {
     /// Changed only by [`Block::take`], while the location is clear.
     generation: prim::AtomicU32,
+    /// The thread's pin count ([`Record::pin`]; ADR-0020 S2), in the room after the generation:
+    /// the record's size does not change.
+    pins: prim::AtomicU32,
     /// A packed [`Location`], or [`CLEAR`].
     location: prim::AtomicU64,
     state: SpinLock<S>,
@@ -128,6 +138,7 @@ impl<S: Empty> Record<S> {
     const fn new() -> Self {
         Self {
             generation: prim::AtomicU32::new(0),
+            pins: prim::AtomicU32::new(0),
             location: prim::AtomicU64::new(CLEAR),
             state: SpinLock::new(S::EMPTY),
         }
@@ -138,6 +149,7 @@ impl<S: Empty> Record<S> {
     fn new() -> Self {
         Self {
             generation: prim::AtomicU32::new(0),
+            pins: prim::AtomicU32::new(0),
             location: prim::AtomicU64::new(CLEAR),
             state: SpinLock::new(S::EMPTY),
         }
@@ -182,6 +194,51 @@ impl<S> Record<S> {
     /// The thread's state, behind the record's own lock (see "Locks").
     pub fn state(&self) -> &SpinLock<S> {
         &self.state
+    }
+
+    /// Raises the thread's pin count (ADR-0020 S2, "The pin"). While it is above zero the thread
+    /// never moves: a mover reads it under the owning queue's lock (S6) and leaves a pinned thread
+    /// where it is.
+    ///
+    /// Only the thread the record names calls it, while it runs. So a plain load and a plain store
+    /// do (Relaxed, no read-modify-write): no one else writes the count meanwhile. A mover sees the
+    /// count through the lock the thread's last switch-out released after its last write. The one
+    /// other writer is [`Block::take`], while no thread holds the record.
+    ///
+    /// That rule is the callers', not the type's (review finding R93-7): the method is open to any
+    /// holder of a `&Record`, and another thread's records are reachable. In the kernel only
+    /// `sched::pin` and `sched::end_with` call it, and `sched::PinGuard`'s drop calls
+    /// [`Record::unpin`], each on the running thread's own record. Anything else that pinned or
+    /// unpinned another thread, a mover included (ADR-0020 S6), would race that thread's own
+    /// update, and an unpin could lower an ending thread's pin, which is kept for good (N5).
+    ///
+    /// Returns `false`, and raises nothing, if the count is at its largest. The kernel stops then,
+    /// as for [`Record::unpin`]'s refusal.
+    pub fn pin(&self) -> bool {
+        let Some(raised) = self.pins.load(Relaxed).checked_add(1) else {
+            return false;
+        };
+        self.pins.store(raised, Relaxed);
+        true
+    }
+
+    /// Lowers the thread's pin count, as [`Record::pin`] raised it, by the same thread.
+    ///
+    /// Returns `false`, and lowers nothing, if the count is 0: a pin lowered that was never raised.
+    /// The kernel stops then, since a thread that thinks itself pinned when it is not could act on
+    /// another processor's state.
+    pub fn unpin(&self) -> bool {
+        let Some(lowered) = self.pins.load(Relaxed).checked_sub(1) else {
+            return false;
+        };
+        self.pins.store(lowered, Relaxed);
+        true
+    }
+
+    /// The thread's pin count. The thread itself, or a mover (ADR-0020 S6) under the owning queue's
+    /// lock.
+    pub fn pins(&self) -> u32 {
+        self.pins.load(Relaxed)
     }
 }
 
@@ -258,6 +315,10 @@ impl<S, const N: usize> Block<S, N> {
         // name's either way, the old value or the new (the review of TASKS item 92, R92-7).
         let generation = record.generation.load(Relaxed).wrapping_add(1);
         record.generation.store(generation, Relaxed);
+        // A new thread starts unpinned. The last one's pin may still be raised: an ending thread
+        // never lowers its own (ADR-0020 S2, point 2). No thread holds the record now, so this is
+        // the one write of the count that is not its running thread's (TASKS item 93, ruling Q9).
+        record.pins.store(0, Relaxed);
         Some((index, generation))
     }
 
@@ -503,6 +564,78 @@ mod tests {
         record.clear_location();
         assert_eq!(record.location(), None);
         assert!(block.get(2).is_none());
+    }
+
+    /// The pin count (ADR-0020 S2; TASKS item 93): raised and lowered by its own thread, nested,
+    /// and never below 0. A lowering at 0 is refused and changes nothing; the kernel stops on the
+    /// refusal (`sched::PinGuard`'s drop).
+    #[test]
+    fn a_pin_count_rises_nests_falls_and_never_goes_below_zero() {
+        let block = Block::<u32, 2>::new();
+        let record = block.get(0).expect("two records");
+        assert_eq!(record.pins(), 0);
+        assert!(!record.unpin(), "a pin lowered that was never raised");
+        assert_eq!(record.pins(), 0);
+        assert!(record.pin());
+        assert!(record.pin());
+        assert_eq!(record.pins(), 2);
+        assert!(record.unpin());
+        assert_eq!(record.pins(), 1);
+        assert!(record.unpin());
+        assert_eq!(record.pins(), 0);
+        assert!(!record.unpin());
+        assert_eq!(record.pins(), 0);
+        // The pin count is not the location, the generation or the state.
+        assert_eq!(record.location(), None);
+        assert_eq!(record.generation(), 0);
+        assert_eq!(*record.state().lock(), 0);
+    }
+
+    /// At its largest, a raise is refused and changes nothing.
+    #[test]
+    fn a_pin_count_at_its_largest_refuses_a_raise() {
+        let block = Block::<u32, 1>::new();
+        let record = block.get(0).expect("one record");
+        record.pins.store(u32::MAX, Relaxed);
+        assert!(!record.pin());
+        assert_eq!(record.pins(), u32::MAX);
+        assert!(record.unpin());
+        assert_eq!(record.pins(), u32::MAX - 1);
+    }
+
+    /// An ending thread never lowers its pin (ADR-0020 S2, point 2), so the record comes back
+    /// pinned. Its next thread starts unpinned: `take` resets the count with the generation.
+    #[test]
+    fn a_record_taken_again_starts_unpinned() {
+        let block = Block::<u32, 1>::new();
+        let (index, first) = block.take().expect("a free record");
+        let record = block.get(index).expect("the record taken");
+        assert!(record.pin());
+        assert!(record.pin());
+        record.set_location(Location::new(0, 1));
+        record.clear_location();
+        assert!(block.give_back(index));
+        assert_eq!(record.pins(), 2, "given back as its thread left it");
+        let (again, second) = block.take().expect("the record again");
+        assert_eq!(again, index);
+        assert_ne!(second, first);
+        assert_eq!(record.pins(), 0);
+    }
+
+    /// The pin count takes the room after the generation (TASKS item 93, ruling Q9): the record's
+    /// first words, the generation, the pin count and the location, fit the 16 bytes the
+    /// generation and the location took alone. So the record keeps its size: one 64-byte line for a
+    /// small state here, and 128 bytes in the kernel, which the kernel asserts at compile time
+    /// (`framekernel::threads`).
+    #[test]
+    fn the_pin_count_does_not_grow_a_record() {
+        use core::mem::size_of;
+        assert_eq!(
+            size_of::<(prim::AtomicU32, prim::AtomicU64)>(),
+            size_of::<(prim::AtomicU32, prim::AtomicU32, prim::AtomicU64)>()
+        );
+        assert_eq!(size_of::<Record<u32>>(), 64);
+        assert_eq!(core::mem::align_of::<Record<u32>>(), 64);
     }
 
     #[test]

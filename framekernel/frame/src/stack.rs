@@ -732,11 +732,14 @@ pub struct Measured<R> {
 /// **Where it may be called** (Q4):
 /// - in the boot flow on the boot processor, before any thread exists;
 /// - in the kernel code of any thread, with interrupts on or off: the thread may be switched
-///   out while `f` runs and resumed on this stack, on another processor if the scheduler ever
-///   moves it (today's does not). The thread's own stack stays in use meanwhile, by its home in
-///   its processor's table of contexts (the module docs; TASKS item 70, which replaced the table
-///   of stacks left that TASKS item 68's ruling A1 added), so dropping it leaks it rather than
-///   freeing it.
+///   out while `f` runs and resumed on this stack. The thread's own stack stays in use meanwhile,
+///   by its home in its processor's table of contexts (the module docs; TASKS item 70, which
+///   replaced the table of stacks left that TASKS item 68's ruling A1 added), so dropping it
+///   leaks it rather than freeing it.
+///
+/// **It never moves meanwhile** (ADR-0020 S2: a thread on a borrowed stack never moves; TASKS item
+/// 93): `pinned` is the caller's pin, or its flow's witness, held for the whole call. So a thread
+/// switched out while `f` runs is resumed on this stack on the same processor.
 ///
 /// Not in an interrupt or exception handler or on an interrupt stack, not with a spin lock held
 /// (it maps pages and takes the region's slot table, as [`GuardedStack::new`] does), and not
@@ -748,7 +751,13 @@ pub struct Measured<R> {
 ///
 /// The stack's contents are not wiped when it is given back: like any kernel stack, it is zeroed
 /// before its next holder gets it.
-pub fn with_measured_stack<R>(bytes: usize, f: impl FnOnce() -> R) -> Option<Measured<R>> {
+pub fn with_measured_stack<R>(
+    pinned: crate::trap::Pinned<'_>,
+    bytes: usize,
+    f: impl FnOnce() -> R,
+) -> Option<Measured<R>> {
+    // The witness is the caller's pin, borrowed for the whole call by its life; nothing reads it.
+    let _ = pinned;
     let stack = GuardedStack::new(bytes)?;
     let size = stack.bytes();
     let words = size / 8;

@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 use core::fmt::Write;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bootproof::{Proof, Tally};
@@ -26,7 +27,7 @@ use crate::runqueue::{
 };
 
 use crate::console::Console;
-use crate::cpu::{self, CpuIndex, rdtsc};
+use crate::cpu::{self, CpuIndex, ThisCpu, rdtsc};
 use crate::process::UserContext;
 use crate::threads::{self, Placed};
 use crate::timer::{self, X2Apic};
@@ -36,7 +37,7 @@ use origin_frame::stack::{FpuArea, GuardedStack, StackSlot, State as SlotState, 
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::exits::{Exits, Pending};
 use origin_frame::sync::threads::{Empty, Location, Outcome, Queues, Record};
-use origin_frame::trap::Switch;
+use origin_frame::trap::{MintHolder, Pinned, Switch};
 
 /// Each kernel thread's stack.
 pub(crate) const THREAD_STACK: usize = 16 * 1024;
@@ -63,20 +64,109 @@ pub(crate) static ACTIVE: PerCpu<AtomicBool> =
 /// Set by the boot processor once every AP's threads are queued.
 static GO: AtomicBool = AtomicBool::new(false);
 
-/// This processor's CPU index, as a queue index (from its GS-based CPU-local area).
-fn this_cpu() -> usize {
-    cpu::this_cpu().get()
+use crate::cpu::{without_interrupts, without_interrupts_here};
+
+/// The scheduler's [`origin_frame::trap::PinMint`] (ADR-0020 S2, S3; TASKS item 93, the
+/// coordinating session's ruling Q3). It is kept here, in a `static` no other module can name,
+/// from before any thread exists ([`take_pin_mint`]), and is used only by [`PinGuard`], after the
+/// running thread's pin is raised.
+static PIN_MINT: MintHolder = MintHolder::new();
+
+/// Takes the pin's mint. The kernel's entry calls this once, before any thread exists:
+/// - a second take, by anyone, stops the kernel;
+/// - so does a spawn or a pin before this (`MintHolder::mint`).
+pub(crate) fn take_pin_mint() {
+    PIN_MINT.keep(origin_frame::trap::take_pin_mint());
 }
 
-use crate::cpu::without_interrupts;
+/// A pin of the running context to its processor (ADR-0020 S2, "The pin"): until it is dropped,
+/// the context never moves, whatever it runs and however often it is switched out.
+///
+/// It is not the per-call pin of ADR-0005 Amendment 8, which `crate::pin` judges.
+///
+/// On a thread, it holds the count it raised in the thread's record, and lowers it when dropped.
+/// On the boot or idle flow it holds nothing, since a flow never moves (S2, point 4).
+///
+/// It is not `Send`, so the thread that raised the pin is the one that lowers it. Its witness,
+/// [`PinGuard::pinned`], is what a function whose body may be switched out asks for. Only
+/// [`pin`] and [`end_with`] make one, each after raising the count.
+pub(crate) struct PinGuard {
+    /// The running thread's record, whose pin count this raised; `None` on the boot or idle flow.
+    record: Option<&'static Record<threads::State>>,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl PinGuard {
+    /// The pin's witness, for as long as the guard is borrowed.
+    pub(crate) fn pinned(&self) -> Pinned<'_> {
+        PIN_MINT.mint().pinned(self)
+    }
+
+    /// Keeps the pin for good, never lowered: an ending thread's (ADR-0020 S2, point 2).
+    fn keep(self) -> Pinned<'static> {
+        let pinned = PIN_MINT.mint().pinned_for_good();
+        core::mem::forget(self);
+        pinned
+    }
+}
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        if let Some(record) = self.record
+            && !record.unpin()
+        {
+            panic!("a processor pin was lowered that was never raised");
+        }
+    }
+}
+
+/// Pins the running context to its processor until the guard is dropped (ADR-0020 S2). One
+/// interrupts-off section: it takes this processor's queue lock, finds the running slot's record,
+/// and raises that thread's pin count (two plain moves, CL47). On the boot or idle flow, whose slot
+/// has no record, it raises nothing. Not for the trap entry, which has its own witness.
+///
+/// Only slot 0, the boot or idle flow, runs without a record: every spawn queues one. A thread
+/// in any other slot without one would hold a pin's witness that pinned nothing, so the kernel
+/// stops (review finding R93-8).
+pub(crate) fn pin() -> PinGuard {
+    let record = without_interrupts_here(|here| {
+        let me = cpu::this_cpu(here);
+        let (running, placed) = {
+            let q = QUEUES.this(me)?.lock();
+            (q.current(), q.record(q.current()))
+        };
+        let Some(placed) = placed else {
+            assert!(
+                running == 0,
+                "a thread without a record asked for a processor pin"
+            );
+            return None;
+        };
+        let record = placed.record();
+        raise_pin(record);
+        Some(record)
+    });
+    PinGuard {
+        record,
+        _not_send: PhantomData,
+    }
+}
+
+/// Raises `record`'s pin count; the kernel stops at its largest, as a thread that thinks itself
+/// pinned when it is not could act on another processor's state.
+fn raise_pin(record: &Record<threads::State>) {
+    assert!(record.pin(), "a processor pin count at its largest");
+}
 
 /// The timer interrupted the context whose frame is at `interrupted`; returns the frame to
 /// resume. Processors without an active queue keep running what they were running.
 pub(crate) fn on_tick(interrupted: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q| {
-        // The preemption proof's watch (TASKS item 66): the TSC only while it is armed.
+    with_queue(interrupted, switch, |q, here| {
+        // The preemption proof's watch (TASKS item 66): the TSC only while it is armed. The read
+        // back takes the trap entry's witness by value, which is zero-sized, so the closure is as
+        // the function item it replaces (review finding R93-9).
         if q.watching() {
-            q.note_tick(rdtsc(), timer_read_back);
+            q.note_tick(rdtsc(), move || timer_read_back(here));
         }
         Some(q.tick(interrupted))
     })
@@ -85,8 +175,8 @@ pub(crate) fn on_tick(interrupted: u64, switch: &Switch) -> u64 {
 /// This processor's timer, read back and compared with the boot processor's registers as its
 /// timed proof ran them (TASKS item 66, ruling A on the review's T66-R1; the addendum review's
 /// T66-R14). Unread if either cannot be had.
-fn timer_read_back() -> ReadBack {
-    match (timer::programmed(), timer::timed_programming()) {
+fn timer_read_back(here: origin_frame::trap::Here<'_>) -> ReadBack {
+    match (timer::programmed(here), timer::timed_programming()) {
         (Some(read), Some(timed)) => match read.first_difference(&timed) {
             None => ReadBack::AsTimed,
             Some((register, got, timed)) => ReadBack::Otherwise(register, got, timed),
@@ -142,11 +232,11 @@ fn running(q: &RunQueue<Placed>, slot: usize) -> Running {
 /// framework's trap entry names the incoming context's own stack from its home in the processor's
 /// table of contexts, whatever this scheduler answered (TASKS item 77).
 #[inline]
-fn follow_thread(id: usize, new: Running, restore: bool, switch: &Switch) {
+fn follow_thread(me: ThisCpu<'_>, new: Running, restore: bool, switch: &Switch) {
     let record = match new {
         Running::Flow => {
             if restore
-                && let Some(table) = threads::table(id)
+                && let Some(table) = threads::table_here(me)
                 && let Some(area) = table.lock().idle_fpu.as_ref()
             {
                 area.restore();
@@ -217,22 +307,34 @@ fn exits_pending() -> Pending {
 /// that read, in the same thread. A Relaxed end or a Relaxed wait leaves the settle unordered with
 /// the count, which the hardware happens to order on x86-64 and the compiler need not.
 pub(crate) fn end_with<R>(publish: impl FnOnce() -> R) -> R {
-    let id = this_cpu();
-    let (Some(queue), Some(exits)) = (QUEUES.get(id), EXITS.get(id)) else {
-        return publish();
-    };
-    // The running thread's record, if it has not counted itself already. No other thread can take
-    // the record or its mark while this one runs, so the mark is stored after `publish`.
-    let record = without_interrupts(|| {
+    // The running thread's record, if it has not counted itself already, pinned for good in the
+    // same section (ADR-0020 S2, point 2; N5): from here the thread never leaves this processor, so
+    // both of its counts are this processor's. No other thread can take the record or its mark
+    // while this one runs, so the mark is stored after `publish`.
+    let record = without_interrupts_here(|here| {
+        let me = cpu::this_cpu(here);
+        EXITS.this(me)?;
         let record = {
-            let q = queue.lock();
+            let q = QUEUES.this(me)?.lock();
             q.record(q.current())
         }?
         .record();
-        let counted = record.state().lock().ending.is_some();
-        (!counted).then_some(record)
+        if record.state().lock().ending.is_some() {
+            return None;
+        }
+        raise_pin(record);
+        Some(record)
     });
     let Some(record) = record else {
+        return publish();
+    };
+    let pinned = PinGuard {
+        record: Some(record),
+        _not_send: PhantomData,
+    }
+    .keep();
+    let Some(exits) = EXITS.this(cpu::this_cpu(pinned.here())) else {
+        // The section found this processor's exits, and the thread has not moved since.
         return publish();
     };
     let (mark, published) = exits.end(publish);
@@ -248,8 +350,31 @@ pub(crate) fn end_with<R>(publish: impl FnOnce() -> R) -> R {
 ///
 /// Then it gives back what retired stacks hold (`stack::reclaim`): here, with no lock held, as
 /// the shootdown that must come first waits for every processor (ADR-0004 Amendment 1, A2).
+///
+/// A caller with no witness of its own: a thread, in a system call's epilogue or a proof. Whether
+/// this processor has a zombie is read in a section of its own (TASKS item 93, the ruling's Q8: a
+/// stale index there would reap another processor's zombies, which only that processor may do);
+/// only if it has one is the thread pinned, for the loop. The boot or idle flow calls
+/// [`reap_with`] with its own witness.
 pub(crate) fn reap() -> usize {
-    let freed = reap_zombies();
+    let any = without_interrupts_here(|here| {
+        EXITS
+            .this(cpu::this_cpu(here))
+            .is_some_and(|exits| exits.zombies() != 0)
+    });
+    let freed = if any {
+        let pin = pin();
+        reap_zombies(pin.pinned())
+    } else {
+        0
+    };
+    reclaim_stacks();
+    freed
+}
+
+/// [`reap`], for a caller that stays on its processor while it runs: the boot or idle flow.
+pub(crate) fn reap_with(pinned: Pinned<'_>) -> usize {
+    let freed = reap_zombies(pinned);
     reclaim_stacks();
     freed
 }
@@ -330,7 +455,18 @@ fn report_given_back(back: origin_frame::stack::GivenBack) {
 /// interrupts off and may wait for the UART, gets its own kind, so that the line is not dropped
 /// (the review's T66-R7); anywhere else, the ordinary one.
 fn here_console() -> Console {
-    if !cpu::interrupts_enabled() && current_thread().is_none() && cpu::this_cpu().get() == 0 {
+    // The running slot and the processor read in the section that reads the slot (TASKS item 93).
+    let boot_flow = || {
+        without_interrupts_here(|here| {
+            let me = cpu::this_cpu(here);
+            // As `current_thread().is_none()` read it: no queue, or no record in the running slot.
+            QUEUES.this(me).is_none_or(|queue| {
+                let q = queue.lock();
+                q.record(q.current()).is_none()
+            }) && me.index() == CpuIndex::BOOT
+        })
+    };
+    if !cpu::interrupts_enabled() && boot_flow() {
         Console::boot_flow()
     } else {
         Console::new()
@@ -486,9 +622,10 @@ fn settle_pass(tsc_hz: u64) -> usize {
     drained.get()
 }
 
-/// [`reap`]'s own processor's exited threads.
-fn reap_zombies() -> usize {
-    let (Some(table), Some(exits)) = (threads::table(this_cpu()), EXITS.get(this_cpu())) else {
+/// [`reap`]'s own processor's exited threads, while `pinned` keeps the caller on it.
+fn reap_zombies(pinned: Pinned<'_>) -> usize {
+    let me = cpu::this_cpu(pinned.here());
+    let (Some(table), Some(exits)) = (threads::table_here(me), EXITS.this(me)) else {
         return 0;
     };
     if exits.zombies() == 0 {
@@ -538,14 +675,14 @@ fn reap_zombies() -> usize {
 fn with_queue(
     interrupted: u64,
     switch: &Switch,
-    f: impl FnOnce(&mut RunQueue<Placed>) -> Option<u64>,
+    f: impl FnOnce(&mut RunQueue<Placed>, origin_frame::trap::Here<'_>) -> Option<u64>,
 ) -> u64 {
-    let id = this_cpu();
-    match (ACTIVE.get(id), QUEUES.get(id)) {
+    let me = cpu::this_cpu(switch.here());
+    match (ACTIVE.this(me), QUEUES.this(me)) {
         (Some(active), Some(queue)) if active.load(Ordering::Acquire) => {
             let mut q = queue.lock();
             let old = q.current();
-            let next = f(&mut q).unwrap_or(interrupted);
+            let next = f(&mut q, switch.here()).unwrap_or(interrupted);
             // The preemption proof's rounds clause stamps its 15th switch after the step that
             // made it (TASKS item 66, the addendum review's T66-R15).
             if q.watching() {
@@ -562,7 +699,7 @@ fn with_queue(
             if switched {
                 match running(&q, old) {
                     Running::Flow => {
-                        if let Some(table) = threads::table(id)
+                        if let Some(table) = threads::table_here(me)
                             && let Some(area) = table.lock().idle_fpu.as_mut()
                         {
                             area.save();
@@ -576,7 +713,7 @@ fn with_queue(
                     Running::Exited => {}
                 }
             }
-            follow_thread(id, running(&q, new), switched, switch);
+            follow_thread(me, running(&q, new), switched, switch);
             next
         }
         _ => interrupted,
@@ -585,12 +722,12 @@ fn with_queue(
 
 /// `YIELD_VECTOR`: the running context gives up the processor.
 pub(crate) fn on_yield(interrupted: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q| Some(q.yield_now(interrupted)))
+    with_queue(interrupted, switch, |q, _| Some(q.yield_now(interrupted)))
 }
 
 /// `SLEEP_VECTOR`: the running thread sleeps for `ticks` timer ticks.
 pub(crate) fn on_sleep(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
-    let next = with_queue(interrupted, switch, |q| q.sleep(interrupted, ticks).ok());
+    let next = with_queue(interrupted, switch, |q, _| q.sleep(interrupted, ticks).ok());
     // The kernel stacks proof holds one thread here, in its switch-out window (TASKS item 70).
     crate::stacks::hold_in_window(interrupted, next);
     next
@@ -600,7 +737,7 @@ pub(crate) fn on_sleep(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
 /// already pending).
 /// RDI holds the most ticks to wait (0: no limit).
 pub(crate) fn on_block(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q| {
+    with_queue(interrupted, switch, |q, _| {
         q.block_for(interrupted, (ticks != 0).then_some(ticks)).ok()
     })
 }
@@ -610,7 +747,7 @@ pub(crate) fn on_block(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
 /// switches only if a thread that was woken should run now
 /// ([`RunQueue::preempt_for_wake`]), and otherwise resumes what the interrupt interrupted.
 pub(crate) fn on_reschedule(interrupted: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q| {
+    with_queue(interrupted, switch, |q, _| {
         Some(q.preempt_for_wake(interrupted))
     })
 }
@@ -626,9 +763,8 @@ pub(crate) struct ThreadRef {
 
 /// The running thread, or `None` for the boot or idle flow (which cannot block).
 pub(crate) fn current_thread() -> Option<ThreadRef> {
-    let queue = QUEUES.get(this_cpu())?;
-    without_interrupts(|| {
-        let q = queue.lock();
+    without_interrupts_here(|here| {
+        let q = QUEUES.this(cpu::this_cpu(here))?.lock();
         // Read under the queue's lock, as `origin_sync::threads::Record::generation` asks.
         let placed = q.record(q.current())?;
         Some(ThreadRef {
@@ -656,22 +792,41 @@ pub(crate) fn block_until(deadline: u64) {
     cpu::thread_block(ticks);
 }
 
-/// The processors' run queues, as `origin_sync::threads::wake` locks them: each under its lock,
-/// with interrupts off, as everywhere else.
-struct KernelQueues;
+/// The processors' run queues as `sched::wake` hands them to `origin_sync::threads::wake`, inside
+/// the one interrupts-off section `wake` runs in (TASKS item 93, the judge's stop of 2026-11-21 and
+/// the coordinating session's ruling; ADR-0018 V1). Each queue is locked in that section, so
+/// `locked` opens none of its own, and `wake` reads the processor index under the same section's
+/// witness: one flag save, `cli` and restore for a wake-up, as before TASKS item 93.
+mod waking {
+    use super::{Placed, QUEUES, Queues, RunQueue, without_interrupts_here};
+    use origin_frame::trap::Here;
 
-impl Queues for KernelQueues {
-    type Queue = RunQueue<Placed>;
-
-    fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut RunQueue<Placed>) -> R) -> Option<R> {
-        let queue = QUEUES.get(usize::try_from(cpu).ok()?)?;
-        Some(without_interrupts(|| f(&mut queue.lock())))
+    /// The run queues, lent for the life of the section [`within`] opens. Its field is private to
+    /// this module, so only `within` makes one, and its `locked` always runs with interrupts off.
+    pub(super) struct KernelQueues<'a> {
+        _section: Here<'a>,
     }
 
-    fn wake_slot(queue: &mut RunQueue<Placed>, slot: u16) -> bool {
-        let slot = usize::from(slot);
-        let generation = queue.generation(slot);
-        queue.wake(slot, generation)
+    /// Runs `f` in one interrupts-off section, with the run queues as `origin_sync::threads::wake`
+    /// takes them and the section's witness.
+    pub(super) fn within<T>(f: impl for<'a> FnOnce(&KernelQueues<'a>, Here<'a>) -> T) -> T {
+        without_interrupts_here(|here| f(&KernelQueues { _section: here }, here))
+    }
+
+    impl Queues for KernelQueues<'_> {
+        type Queue = RunQueue<Placed>;
+
+        fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut RunQueue<Placed>) -> R) -> Option<R> {
+            let queue = QUEUES.get(usize::try_from(cpu).ok()?)?;
+            // Interrupts are off: only `within`'s section makes `self`.
+            Some(f(&mut queue.lock()))
+        }
+
+        fn wake_slot(queue: &mut RunQueue<Placed>, slot: u16) -> bool {
+            let slot = usize::from(slot);
+            let generation = queue.generation(slot);
+            queue.wake(slot, generation)
+        }
     }
 }
 
@@ -694,41 +849,48 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
     let Some(record) = threads::record(thread.record) else {
         return false;
     };
-    let woke = origin_frame::sync::threads::wake(&KernelQueues, record, thread.generation);
-    if woke.retries != 0 {
-        WAKES_FOLLOWED.fetch_add(u64::from(woke.retries), Ordering::Relaxed);
-    }
-    match woke.outcome {
-        Outcome::Reached { ready: true, cpu } => {
-            let Some(cpu) = usize::try_from(cpu).ok().and_then(CpuIndex::new) else {
-                return false;
-            };
-            if cpu != cpu::this_cpu()
-                && let Some(apic_id) = cpu.apic_id()
-            {
-                timer::send_reschedule_ipi(apic_id);
-                return true;
-            }
-            false
+    // The wake-up, the compare and the IPI in one section (TASKS item 93, the ruling's Q8, and
+    // the judge's stop): with a stale index, a waker that had left `cpu` would send no IPI, and
+    // the woken thread would wait for that processor's next tick. The queues are locked in the
+    // same section (`waking`), so a wake-up opens one section, as before TASKS item 93.
+    waking::within(|queues, here| {
+        let woke = origin_frame::sync::threads::wake(queues, record, thread.generation);
+        if woke.retries != 0 {
+            WAKES_FOLLOWED.fetch_add(u64::from(woke.retries), Ordering::Relaxed);
         }
-        // Never while no thread moves. Until ADR-0020 S20's pinned mode (TASKS item 96), the
-        // kernel stops rather than lose a wake-up (the coordinating session's ruling Q4).
-        Outcome::Exhausted => panic!(
-            "a wake-up followed its thread {} times",
-            origin_frame::sync::threads::WAKE_TRIES
-        ),
-        Outcome::Reached { ready: false, .. } | Outcome::Stale | Outcome::Gone => false,
-    }
+        match woke.outcome {
+            Outcome::Reached { ready: true, cpu } => {
+                let Some(cpu) = usize::try_from(cpu).ok().and_then(CpuIndex::new) else {
+                    return false;
+                };
+                let me = cpu::this_cpu(here);
+                if cpu != me.index()
+                    && let Some(apic_id) = cpu.apic_id()
+                {
+                    timer::send_reschedule_ipi(me, apic_id);
+                    return true;
+                }
+                false
+            }
+            // Never while no thread moves. Until ADR-0020 S20's pinned mode (TASKS item 96), the
+            // kernel stops rather than lose a wake-up (the coordinating session's ruling Q4).
+            Outcome::Exhausted => panic!(
+                "a wake-up followed its thread {} times",
+                origin_frame::sync::threads::WAKE_TRIES
+            ),
+            Outcome::Reached { ready: false, .. } | Outcome::Stale | Outcome::Gone => false,
+        }
+    })
 }
 
 /// `EXIT_VECTOR`: the running thread ends. Its record, holding its stack, becomes a zombie, which
 /// [`reap`] empties and gives back later on this processor.
 pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
-    let id = this_cpu();
-    let next = with_queue(interrupted, switch, |q| {
+    let me = cpu::this_cpu(switch.here());
+    let next = with_queue(interrupted, switch, |q, _| {
         let placed = q.record(q.current());
         let next = q.exit(interrupted).ok()?;
-        if let (Some(table), Some(placed)) = (threads::table(id), placed) {
+        if let (Some(table), Some(placed)) = (threads::table_here(me), placed) {
             let (number, record) = (placed.number(), placed.record());
             let mut t = table.lock();
             let mut state = record.state().lock();
@@ -744,7 +906,7 @@ pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
                     // `settle` never finds it in neither (TASKS item 79; `Exits::queued`).
                     // Every processor has its counts. A mark not consumed keeps its count raised:
                     // never lowered early.
-                    if let Some(exits) = EXITS.get(id) {
+                    if let Some(exits) = EXITS.this(me) {
                         exits.queued(mark);
                     }
                 }
@@ -799,19 +961,21 @@ pub(crate) fn finish(signal: impl FnOnce()) -> ! {
 
 /// What the running thread runs in, or `None` for a kernel thread.
 pub(crate) fn current_user() -> Option<ObjectRef<UserContext>> {
-    let queue = QUEUES.get(this_cpu())?;
-    without_interrupts(|| {
+    without_interrupts_here(|here| {
         let placed = {
-            let q = queue.lock();
+            let q = QUEUES.this(cpu::this_cpu(here))?.lock();
             q.record(q.current())
         };
         placed?.record().state().lock().user.clone()
     })
 }
 
-/// This CPU's tick count, as its run queue sees it.
-pub(crate) fn queue_ticks() -> u64 {
-    queue_ticks_of(this_cpu())
+/// This CPU's tick count, as its run queue sees it. A caller that reads it before and after a
+/// sleep or a wait holds a pin across both (TASKS item 93): the two counts are then one processor's.
+pub(crate) fn queue_ticks(me: ThisCpu<'_>) -> u64 {
+    QUEUES
+        .this(me)
+        .map_or(0, |q| without_interrupts(|| q.lock().ticks()))
 }
 
 /// Processor `cpu`'s tick count, as its run queue sees it.
@@ -972,7 +1136,10 @@ fn spawn_with_parts(
 /// An application processor's scheduler: waits until the boot processor has queued its
 /// threads, then starts its own timer and idles with interrupts on; the timer preempts the
 /// idle loop to run the queue's threads.
-pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
+pub(crate) fn run_ap(flow: Pinned<'static>, lapic: &X2Apic) -> ! {
+    // This processor's idle flow, which never moves (ADR-0020 S2, point 4): its witness, made
+    // in `smp::ap_entry` with interrupts off and passed down (TASKS item 93).
+    let me = cpu::this_cpu(flow.here());
     while !GO.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
@@ -984,15 +1151,15 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
         crate::cpu::halt();
     }
     // This flow is the processor's idle context: it runs only when no thread is ready.
-    if let Some(queue) = QUEUES.get(this_cpu()) {
+    if let Some(queue) = QUEUES.this(me) {
         without_interrupts(|| queue.lock().set_idle(true));
     }
-    if let Some(active) = ACTIVE.get(this_cpu()) {
+    if let Some(active) = ACTIVE.this(me) {
         active.store(true, Ordering::Release);
     }
     timer::start_periodic(lapic);
     loop {
-        reap();
+        reap_with(flow);
         // Halting with interrupts on just waits for the next timer tick, which may switch to
         // a thread.
         cpu::idle();
@@ -1009,7 +1176,8 @@ pub(crate) static PROGRESS: PerCpu<[AtomicU64; 2]> = PerCpu::new(
     [const { AtomicU64::new(0) }; 2],
     || [const { AtomicU64::new(0) }; 2],
 );
-/// The CPU index each worker last ran on, plus one (0: never ran), as [`PROGRESS`].
+/// The CPU index each worker last ran on, plus one (0: never ran), as [`PROGRESS`]: read by the
+/// worker under its own section once it stops, which is where it last ran.
 pub(crate) static RAN_ON: PerCpu<[AtomicU64; 2]> = PerCpu::new(
     "framekernel::sched::RAN_ON",
     [const { AtomicU64::new(0) }; 2],
@@ -1044,15 +1212,27 @@ extern "sysv64" fn worker(arg: u64) -> ! {
         let now = rdtsc();
         let step = now.wrapping_sub(last);
         last = now;
-        if let (Some(p), Some(r)) = (worker_entry(&PROGRESS, slot), worker_entry(&RAN_ON, slot))
+        if let Some(p) = worker_entry(&PROGRESS, slot)
             && RUN.load(Ordering::Relaxed) == run
+            && step < limit
         {
-            if step < limit {
-                p.fetch_add(step, Ordering::Relaxed);
-            }
-            r.store(this_cpu() as u64 + 1, Ordering::Relaxed);
+            p.fetch_add(step, Ordering::Relaxed);
         }
         core::hint::spin_loop();
+    }
+    // Where it stopped, which is where it last ran: the processor's own index, read once, in a
+    // section of its own, after the measured window (TASKS item 93: the judge's stop of
+    // 2026-11-21 found a section in every iteration lowered the window's switches, and the delta
+    // review's D93-1 asked for the processor's own view, not the scheduler's record).
+    if let Some(r) = worker_entry(&RAN_ON, slot)
+        && RUN.load(Ordering::Relaxed) == run
+    {
+        without_interrupts_here(|here| {
+            r.store(
+                cpu::this_cpu(here).index().get() as u64 + 1,
+                Ordering::Relaxed,
+            );
+        });
     }
     // Counted only for its own run.
     finish(|| {
@@ -1089,9 +1269,13 @@ extern "sysv64" fn pinger(me: u64) -> ! {
 
 /// Sleeps [`SLEEP_TICKS`] and records how long that took in ticks.
 extern "sysv64" fn sleeper(_: u64) -> ! {
-    let before = queue_ticks();
+    // Pinned across the sleep, so both counts are this processor's (TASKS item 93).
+    let pin = pin();
+    let me = cpu::this_cpu(pin.pinned().here());
+    let before = queue_ticks(me);
     sleep(SLEEP_TICKS);
-    SLEPT.store(queue_ticks() - before + 1, Ordering::Relaxed);
+    SLEPT.store(queue_ticks(me) - before + 1, Ordering::Relaxed);
+    drop(pin);
     // AcqRel, read with Acquire: a waiter that settles after seeing it is ordered after
     // `finish`'s count of this thread as ending (TASKS item 79).
     finish(|| {
@@ -1924,7 +2108,13 @@ fn say_window(
 /// `proofs`, and `kernel_main` decides what they mean (ADR-0013). Fairness counts loop
 /// iterations, which a processor sharing a physical core skews with nothing wrong, so it is a
 /// separate result from preemption.
-pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: &mut Tally) {
+pub(crate) fn prove(
+    flow: Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    tsc_hz: u64,
+    proofs: &mut Tally,
+) {
     // Give every online processor's boot/idle context an FPU area before the baseline is
     // measured, so the first switch on it can save its state and the leak check is fair.
     for &id in cpus {
@@ -1951,7 +2141,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
             }
         }
     }
-    let Some(lapic) = X2Apic::this_cpu() else {
+    // The boot flow, which never moves: its witness serves the whole proof (TASKS item 93).
+    let me = cpu::this_cpu(flow.here());
+    let Some(lapic) = X2Apic::here(me) else {
         let _ = writeln!(
             com1,
             "origin-kernel: the local APIC is not in x2APIC mode: scheduler failed"
@@ -1959,9 +2151,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         proofs.record(Proof::Preemption, false);
         return;
     };
-    let bsp = cpu::this_cpu();
+    let bsp = me.index();
     GO.store(true, Ordering::Release);
-    if let Some(active) = ACTIVE.get(bsp.get()) {
+    if let Some(active) = ACTIVE.this(me) {
         active.store(true, Ordering::Release);
     }
     // Index 0's record is in the kernel's image, so this holds (review finding F6).
@@ -2216,11 +2408,12 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
 
 /// Stops the boot processor's scheduler and timer once the boot proofs are done, so the
 /// boot flow can halt.
-pub(crate) fn stop_boot_processor() {
-    if let Some(lapic) = X2Apic::this_cpu() {
+pub(crate) fn stop_boot_processor(flow: Pinned<'_>) {
+    let me = cpu::this_cpu(flow.here());
+    if let Some(lapic) = X2Apic::here(me) {
         lapic.stop();
     }
-    if let Some(active) = ACTIVE.get(this_cpu()) {
+    if let Some(active) = ACTIVE.this(me) {
         active.store(false, Ordering::Release);
     }
 }

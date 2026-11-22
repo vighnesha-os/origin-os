@@ -345,7 +345,9 @@ unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex, interrupt_stacks:
     // GS was just reloaded (base 0): point it at this processor's CPU-local area.
     init_cpu_local(tss_field.addr() as u64, index);
     init_cpu_state();
-    init_speculation();
+    // The index just set, read in a section (ADR-0020 S3; TASKS item 93): interrupts are already
+    // off here, as the caller's contract says, so the section only gives the witness.
+    without_interrupts_here(|at| init_speculation(this_cpu(at)));
 }
 
 /// The processor indexes the kernel has: 1, the boot processor's, until the processors are
@@ -652,9 +654,10 @@ const FPU_ALIKE: u8 = 1 << 1;
 /// Records, in one store, whether this processor's control state holds (checked here, after
 /// `enable_simd`) and whether its FPU format is the boot processor's. The boot processor and
 /// every AP do it on themselves, once; an AP before its handshake, whose answer then orders
-/// the record before the boot processor sees it online.
-pub fn record_cpu_state(fpu_alike: bool) {
-    if let Some(state) = CPU_STATE.get(this_cpu().get()) {
+/// the record before the boot processor sees it online. `me` is the index its flow read
+/// (ADR-0020 S3; TASKS item 93).
+pub fn record_cpu_state(me: ThisCpu<'_>, fpu_alike: bool) {
+    if let Some(state) = CPU_STATE.this(me) {
         let holds = if cpu_state_holds() { STATE_HOLDS } else { 0 };
         let alike = if fpu_alike { FPU_ALIKE } else { 0 };
         state.store(holds | alike, Ordering::Release);
@@ -747,9 +750,12 @@ extern "sysv64" fn syscall_entry() {
     );
 }
 
-/// This processor's CPU-local area.
-fn local() -> &'static CpuLocal {
-    CPU_LOCAL.get(this_cpu().0).unwrap_or(&OUT_OF_RANGE)
+/// This processor's CPU-local area, lent for the life of the witness `here` (ADR-0020 S3; TASKS
+/// item 93). The index is read inside this function under that witness, not by its caller, as
+/// before TASKS item 93, so `dispatch`'s code stays the base's (TASKS item 93's static counts of
+/// 2026-11-21 found the read moved into the caller).
+fn local(here: crate::trap::Here<'_>) -> &'_ CpuLocal {
+    CPU_LOCAL.this(this_cpu(here)).unwrap_or(&OUT_OF_RANGE)
 }
 
 /// Names the stack the running context's interrupts and system calls from ring 3 land on: this
@@ -768,7 +774,10 @@ fn local() -> &'static CpuLocal {
 /// placed at least 2 MiB below the window's top (`layout::place`), and its guard pages are
 /// unmapped ones. So the delivery would fault into #DF, on its own stack, rather than write
 /// anywhere (the review of TASKS items 75, 77 and 81, R77-3).
-fn name_kernel_stack(home: u64) {
+///
+/// `at` is the trap entry's witness ([`resume`]'s), under which the index is read (ADR-0020 S3;
+/// TASKS item 93).
+fn name_kernel_stack(at: crate::trap::Here<'_>, home: u64) {
     let top = if home == BOOT_FLOW {
         0
     } else {
@@ -776,19 +785,19 @@ fn name_kernel_stack(home: u64) {
             Some(top) => top,
             None => panic!(
                 "the context resumed {} has its home in no kernel stack",
-                this_cpu().named()
+                this_cpu(at).index().named()
             ),
         }
     };
-    let local = this_cpu().0;
-    let Some(tss) = CPU_LOCAL.get(local).map(|l| l.tss.load(Ordering::Relaxed)) else {
+    let local = this_cpu(at);
+    let Some(tss) = CPU_LOCAL.this(local).map(|l| l.tss.load(Ordering::Relaxed)) else {
         return;
     };
     if tss == 0 {
         return;
     }
     let field = ptr::with_exposed_provenance_mut::<u32>(tss as usize + d::TSS_RSP0_OFFSET);
-    if let Some(l) = CPU_LOCAL.get(local) {
+    if let Some(l) = CPU_LOCAL.this(local) {
         // Release, read with Acquire by `stack_in_use` (TASKS item 70, Q2).
         l.kernel_stack.store(top, Ordering::Release);
     }
@@ -823,16 +832,23 @@ const fn ist_of(vector: u64) -> u8 {
 /// at the start of [`dispatch`], is also the first thing the system-call path does in Rust (the
 /// addition (d)). A frame elsewhere was pushed onto another stack, perhaps over a suspended
 /// context's frame: the processor halts, as the trap entry does for a frame it never saved.
-fn check_landing(here: u64, vector: u64) {
-    let me = this_cpu();
-    let home = CONTEXTS.get(me.get()).and_then(Contexts::running_home);
+///
+/// `at` is the trap entry's witness, under which the index is read (ADR-0020 S3; TASKS item 93).
+/// The count's plain load and store rest on more than any `Here` says: that interrupts are off.
+/// A `Here` from [`crate::trap::Pinned::here`] holds with interrupts on, and an interrupt between
+/// the load and the store would lose its own count (review finding R93-10). So this stays
+/// private, and [`dispatch`], which runs with interrupts off, is its one caller; an interrupts-off
+/// token of its own is TASKS item 96's (R95-12).
+fn check_landing(at: crate::trap::Here<'_>, here: u64, vector: u64) {
+    let me = this_cpu(at);
+    let home = CONTEXTS.this(me).and_then(Contexts::running_home);
     if !home.is_some_and(|home| crate::stack::same_slot(home, here)) {
         panic!(
             "an entry from ring 3 (vector {vector}) {} landed on a stack not the running context's own",
-            me.named()
+            me.index().named()
         );
     }
-    if let Some(l) = CPU_LOCAL.get(me.0) {
+    if let Some(l) = CPU_LOCAL.this(me) {
         // Only this processor writes it, with interrupts off: a plain load and store.
         l.landings.store(
             l.landings.load(Ordering::Relaxed).wrapping_add(1),
@@ -947,24 +963,24 @@ fn running_on(address: u64) -> bool {
 /// returns along the outgoing stack after this, until its `mov rsp, rax`, so the frame must not
 /// be resumable anywhere before then (ADR-0020 S5). No address is printed (ADR-0004 Amendment 2,
 /// A6.2): a frame is told as an offset in its window.
-fn resume(here: u64, next: u64, exiting: bool) -> u64 {
-    let me = this_cpu();
-    let outcome = CONTEXTS
-        .get(me.get())
-        .map_or(Err(Refused::NeverSaved), |table| {
-            table.switch(here, next, exiting, running_on)
-        });
+///
+/// `at` is the trap entry's witness, under which the index is read (ADR-0020 S3; TASKS item 93).
+fn resume(at: crate::trap::Here<'_>, here: u64, next: u64, exiting: bool) -> u64 {
+    let me = this_cpu(at);
+    let outcome = CONTEXTS.this(me).map_or(Err(Refused::NeverSaved), |table| {
+        table.switch(here, next, exiting, running_on)
+    });
     match outcome {
         Ok(Switched { frame, home }) => {
             // The incoming context's own stack, from its home, unless nothing switched.
             if let Some(home) = home {
-                name_kernel_stack(home);
+                name_kernel_stack(at, home);
             }
             frame
         }
         Err(Refused::NeverSaved) => panic!(
             "the scheduler returned a frame {} never saved: {}",
-            me.named(),
+            me.index().named(),
             crate::phys::told(next)
         ),
         Err(Refused::Full) => panic!("too many saved thread frames on this processor"),
@@ -989,13 +1005,14 @@ fn resume(here: u64, next: u64, exiting: bool) -> u64 {
 /// between its take and its clear would leave the ended stack in no record that retires it, and a
 /// reap then would leak it (the review of TASKS item 70, T70-1); one that interrupted the
 /// publication between its two stores would have its own leaving record cleared. The processor's
-/// index is read inside that section too, so the table is this processor's own even once a
-/// thread can be moved between a read and its use (the review of TASKS item 95, R95-3).
+/// index is read inside that section too, under its witness, so the table is this processor's
+/// own even once a thread can be moved between a read and its use (the review of TASKS item 95,
+/// R95-3; ADR-0020 S3, TASKS item 93).
 pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
     let used = |value: u64| value >= start && value < end;
     if tables_ready()
-        && without_interrupts(|| {
-            CONTEXTS.get(this_cpu().get()).map(|table| {
+        && without_interrupts_here(|at| {
+            CONTEXTS.this(this_cpu(at)).map(|table| {
                 table.publish_leaving();
                 table.retire_ended(running_on)
             })
@@ -1019,10 +1036,20 @@ pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
 
 /// This processor's CPU index: one GS-relative load from its CPU-local area. On a
 /// processor without one ([`OUT_OF_RANGE`]) it is an index no array has.
-pub fn this_cpu() -> CpuIndex {
+///
+/// Private (ADR-0020 S3; TASKS item 93): [`this_cpu`] is its one caller, under a witness that the
+/// reader cannot leave the processor. A read without one does not build.
+///
+/// The witness does not show that GS's base is set (review finding R93-3): a section's witness,
+/// and the boot flow's, exist before `load_tables` runs. What does is the boot's order. On the
+/// boot processor every step that reads the index comes after `Early::load_cpu_tables` in
+/// `Early`'s order or checks [`tables_ready`] first (`timer::init`); on an AP, `ap_entry` reads it
+/// only after `init_ap`.
+fn read_index() -> CpuIndex {
     let id: u64;
-    // SAFETY: `load_tables` set GS's base to a live `CpuLocal` on every processor before
-    // any code that calls this runs, and offset 0 is its `id`, a `u64`.
+    // SAFETY: `load_tables` set GS's base to a live `CpuLocal` on every processor before any code
+    // that calls this runs (the boot's order, above, not the witness), and offset 0 is its `id`,
+    // a `u64`.
     unsafe { asm!("mov {}, gs:[0]", out(reg) id, options(nostack, readonly, preserves_flags)) };
     CpuIndex(usize::try_from(id).unwrap_or(usize::MAX))
 }
@@ -1223,7 +1250,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     let here = ptr::from_mut(frame).addr() as u64;
     // An entry from ring 3 must have landed on the running context's own stack (TASKS item 77).
     if frame.cs & 3 == 3 && ist_of(frame.vector) == 0 {
-        check_landing(here, frame.vector);
+        check_landing(Switch::new().here(), here, frame.vector);
     }
     // A program can set RFLAGS.AC; the entry path must have cleared it for the kernel.
     if frame.cs & 3 == 3 && SMAP_ON.load(Ordering::Relaxed) && read_rflags() & RFLAGS_AC != 0 {
@@ -1238,7 +1265,12 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // writing 0 to the EOI register only acknowledges the interrupt in service.
         unsafe { wrmsr(X2APIC_EOI, 0) };
         return hooks.map_or(here, |h| {
-            resume(here, (h.tick)(here, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.tick)(here, &Switch::new()),
+                false,
+            )
         });
     }
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
@@ -1252,10 +1284,15 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // SAFETY: as for the timer: interrupt messages are only routed to processors whose
         // APIC is in x2APIC mode; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
-        return match irq::run(vector) {
+        return match irq::run(vector, Switch::new().here()) {
             Action::Resume => here,
             Action::Reschedule => hooks.map_or(here, |h| {
-                resume(here, (h.reschedule)(here, &Switch::new()), false)
+                resume(
+                    Switch::new().here(),
+                    here,
+                    (h.reschedule)(here, &Switch::new()),
+                    false,
+                )
             }),
         };
     }
@@ -1266,12 +1303,17 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // vector, so x2APIC mode is on; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
         return hooks.map_or(here, |h| {
-            resume(here, (h.reschedule)(here, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.reschedule)(here, &Switch::new()),
+                false,
+            )
         });
     }
     // Another processor changed a kernel mapping: invalidate it here, then acknowledge.
     if frame.vector == u64::from(crate::tlb::SHOOTDOWN_VECTOR) {
-        crate::tlb::interrupted();
+        crate::tlb::interrupted(Switch::new().here());
         // SAFETY: as for the timer: x2APIC mode is on (only processors with an active
         // scheduler are sent this vector), and the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
@@ -1286,20 +1328,42 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     // Scheduler requests from kernel threads (`sched::yield_now`, `sleep`, `exit`).
     if frame.vector == u64::from(YIELD_VECTOR) {
         return hooks.map_or(here, |h| {
-            resume(here, (h.yield_now)(here, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.yield_now)(here, &Switch::new()),
+                false,
+            )
         });
     }
     if frame.vector == u64::from(SLEEP_VECTOR) {
         return hooks.map_or(here, |h| {
-            resume(here, (h.sleep)(here, frame.rdi, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.sleep)(here, frame.rdi, &Switch::new()),
+                false,
+            )
         });
     }
     if frame.vector == u64::from(EXIT_VECTOR) {
-        return hooks.map_or(here, |h| resume(here, (h.exit)(here, &Switch::new()), true));
+        return hooks.map_or(here, |h| {
+            resume(
+                Switch::new().here(),
+                here,
+                (h.exit)(here, &Switch::new()),
+                true,
+            )
+        });
     }
     if frame.vector == u64::from(BLOCK_VECTOR) {
         return hooks.map_or(here, |h| {
-            resume(here, (h.block)(here, frame.rdi, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.block)(here, frame.rdi, &Switch::new()),
+                false,
+            )
         });
     }
     if frame.vector == u64::from(SYSCALL_VECTOR) {
@@ -1314,9 +1378,12 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
                 frame.rax = status as u64;
                 here
             }
-            crate::trap::SyscallOutcome::ThreadExit => {
-                resume(here, (hooks.exit)(here, &Switch::new()), true)
-            }
+            crate::trap::SyscallOutcome::ThreadExit => resume(
+                Switch::new().here(),
+                here,
+                (hooks.exit)(here, &Switch::new()),
+                true,
+            ),
         };
     }
     // A machine check is the hardware reporting on itself: it says nothing about the program
@@ -1345,7 +1412,12 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             halt();
         };
         (hooks.user_fault)(frame.vector, frame.error_code, address, on_exception_stack);
-        return resume(here, (hooks.exit)(here, &Switch::new()), true);
+        return resume(
+            Switch::new().here(),
+            here,
+            (hooks.exit)(here, &Switch::new()),
+            true,
+        );
     }
     // A page fault at the user-copy instruction, on a user address: resume at
     // `probe_recover`, which returns "failed" to `copy_user`'s caller.
@@ -1362,9 +1434,13 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     // A page fault at the exact instruction a probe armed: record it and resume at
     // `probe_recover`, which returns the error code to the probe's caller.
     if frame.vector == 14 {
-        let armed = local().probe_rip.load(Ordering::SeqCst);
+        // Two reads of the index, each inside `local` under the trap entry's witness: as the code
+        // read it before TASKS item 93, so what is built here does not change.
+        let armed = local(Switch::new().here()).probe_rip.load(Ordering::SeqCst);
         if armed != 0 && frame.rip == armed {
-            local().probe_address.store(read_cr2(), Ordering::SeqCst);
+            local(Switch::new().here())
+                .probe_address
+                .store(read_cr2(), Ordering::SeqCst);
             frame.rax = frame.error_code;
             frame.rip = (probe_recover as *const ()).addr() as u64;
             return here;
@@ -1691,7 +1767,7 @@ pub fn read_speculation() -> crate::speculation::Reported {
 /// Each register is written only where `Plan::decide` found the bit that says the
 /// processor has it, and is read back: a processor whose registers do not hold what was
 /// written says so in its record.
-fn init_speculation() {
+fn init_speculation(me: ThisCpu<'_>) {
     use crate::speculation::{self, Lfence, Plan};
     let plan = Plan::decide(&read_speculation());
     let mut held = true;
@@ -1722,7 +1798,7 @@ fn init_speculation() {
         // SAFETY: as above.
         held &= unsafe { rdmsr(DE_CFG) } & DE_CFG_LFENCE != 0;
     }
-    let cpu = this_cpu().get();
+    let cpu = me.index().get();
     if cpu == CpuIndex::BOOT.get() {
         // The maker and family are the machine's: the boot processor chooses for all.
         crate::nospec::set_form(plan.form);
@@ -1734,8 +1810,8 @@ fn init_speculation() {
 /// issues an IBPB if that is not the process it ran there last (ADR-0017 Z3). Only at the
 /// scheduler's switch point, which has interrupts off, so nothing else on this processor
 /// runs between the note and the barrier.
-pub fn entering_process(process: u64, _switch: &Switch) {
-    if crate::speculation::enters(this_cpu().get(), process) {
+pub fn entering_process(process: u64, switch: &Switch) {
+    if crate::speculation::enters(this_cpu(switch.here()).index().get(), process) {
         // SAFETY: CPL 0; `enters` says yes only where this processor recorded that it has
         // the IBPB command, so the register exists. Bit 0 is the command, and it changes
         // nothing but what the branch predictors hold.
@@ -1745,8 +1821,9 @@ pub fn entering_process(process: u64, _switch: &Switch) {
 
 /// Issues one IBPB on this processor if it has the command, and says whether it did. For
 /// the boot's measurement of what one costs; the scheduler's own are [`entering_process`]'s.
-pub fn issue_ibpb() -> bool {
-    let offered = crate::speculation::recorded(this_cpu().get()).is_some_and(|(plan, _)| plan.ibpb);
+/// `me` is the index the boot flow read (ADR-0020 S3; TASKS item 93).
+pub fn issue_ibpb(me: ThisCpu<'_>) -> bool {
+    let offered = crate::speculation::recorded(me.index().get()).is_some_and(|(plan, _)| plan.ibpb);
     if offered {
         // SAFETY: as in `entering_process`.
         unsafe { wrmsr(PRED_CMD, 1) };
@@ -1770,6 +1847,62 @@ pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
         unsafe { asm!("sti", options(nostack)) };
     }
     result
+}
+
+/// [`without_interrupts`], with the section's witness (ADR-0020 S3; TASKS item 93): `trap::section`,
+/// which makes the witness, as its documentation says. `f` must not enable interrupts, open an
+/// interrupt window, idle, yield, sleep, block or exit.
+pub fn without_interrupts_here<T>(f: impl for<'a> FnOnce(crate::trap::Here<'a>) -> T) -> T {
+    crate::trap::section(f)
+}
+
+/// This processor's CPU index, read under a witness that the reader cannot leave the processor
+/// (ADR-0020 S3; TASKS item 93), and branded with the witness's life ([`ThisCpu`]). It is the only
+/// way to read the index: a call without a witness does not build.
+pub fn this_cpu(here: crate::trap::Here<'_>) -> ThisCpu<'_> {
+    ThisCpu {
+        index: read_index(),
+        here,
+    }
+}
+
+/// This processor's CPU index, read once under a witness and branded with its life (ADR-0020 S3;
+/// TASKS item 93, the coordinating session's ruling Q4).
+///
+/// Every lookup of this processor's own entry of a per-processor table goes through it
+/// (`PerCpu::this`), and is lent for that life. So no such entry is used after its reader might
+/// have left the processor, and one read of the index serves every lookup under one witness, as
+/// one read served them before.
+///
+/// [`ThisCpu::index`] gives the plain index, as a value only: one to compare, print or record as
+/// a fact about the moment it was read.
+#[derive(Clone, Copy, Debug)]
+pub struct ThisCpu<'a> {
+    index: CpuIndex,
+    here: crate::trap::Here<'a>,
+}
+
+impl<'a> ThisCpu<'a> {
+    /// The index, as a value (see the type's documentation).
+    #[inline]
+    pub fn index(self) -> CpuIndex {
+        self.index
+    }
+
+    /// The witness it was read under.
+    #[inline]
+    pub fn here(self) -> crate::trap::Here<'a> {
+        self.here
+    }
+}
+
+/// The boot or idle flow's witness (ADR-0020 S2, point 4; TASKS item 93, the coordinating
+/// session's rulings Q6 and on `cba7462b`): `trap::flow`, which makes the check and the witness,
+/// as its documentation says. `Some` if the context running on this processor is the processor's
+/// boot or idle flow, `None` on a thread. Each flow takes it once, at its entry, and passes it
+/// down.
+pub fn flow() -> Option<crate::trap::Pinned<'static>> {
+    crate::trap::flow()
 }
 
 /// CR3: the physical address of the live PML4 (and, with PCIDs off, nothing else).
@@ -2051,20 +2184,28 @@ impl core::fmt::Debug for Probe {
 }
 
 /// Arms the probe for a fault at `fault_rip`, runs `access`, and disarms it.
+///
+/// The three run in one interrupts-off section, and the processor's CPU-local area is read under
+/// its witness (ADR-0020 S3; TASKS item 93): the fault `access` may take is taken on the processor
+/// that armed the probe, whose trap entry reads the same area, and the record read back is that
+/// processor's. Before TASKS item 93 interrupts stayed as the caller had them; now they are off
+/// for the one access and its fault.
 fn run_probe(fault_rip: u64, access: impl FnOnce() -> u64) -> Probe {
     // Per CPU: probes and user copies on different processors never disarm each other.
-    let here = local();
-    here.probe_rip.store(fault_rip, Ordering::SeqCst);
-    let result = access();
-    here.probe_rip.store(0, Ordering::SeqCst);
-    if result == COMPLETED {
-        Probe::Completed
-    } else {
-        Probe::Faulted {
-            error: result,
-            address: here.probe_address.load(Ordering::SeqCst),
+    without_interrupts_here(|at| {
+        let here = local(at);
+        here.probe_rip.store(fault_rip, Ordering::SeqCst);
+        let result = access();
+        here.probe_rip.store(0, Ordering::SeqCst);
+        if result == COMPLETED {
+            Probe::Completed
+        } else {
+            Probe::Faulted {
+                error: result,
+                address: here.probe_address.load(Ordering::SeqCst),
+            }
         }
-    }
+    })
 }
 
 /// Reads the byte at `addr` through a fault-tolerant instruction and reports what happened.
@@ -2213,14 +2354,14 @@ pub(crate) static PAT_READY: PerCpu<core::sync::atomic::AtomicBool> = PerCpu::ne
 /// Table 11-10), and marks this processor's CPU index if so. These are the architectural
 /// reset values; a firmware that changed them would make uncached mappings cacheable, so the
 /// kernel then refuses to map device registers rather than reprogramming caches it cannot
-/// see. Returns the PAT.
-pub fn check_pat() -> u64 {
+/// see. Returns the PAT. `me` is the index its flow read (ADR-0020 S3; TASKS item 93).
+pub fn check_pat(me: ThisCpu<'_>) -> u64 {
     // SAFETY: CPL 0; IA32_PAT exists on every x86-64 processor (CPUID 1 EDX bit 16) and
     // reading it has no side effect.
     let pat = unsafe { rdmsr(IA32_PAT) };
     if pat & 0xFF == 0x06
         && (pat >> 24) & 0xFF == 0x00
-        && let Some(ready) = PAT_READY.get(this_cpu().get())
+        && let Some(ready) = PAT_READY.this(me)
     {
         ready.store(true, Ordering::Relaxed);
     }
@@ -2602,17 +2743,19 @@ pub unsafe fn fpu_restore(area: u64) {
 ///
 /// CPL 0. The kernel must not rely on executing or accessing user pages from supervisor
 /// mode (it has none; a future user-copy path must set RFLAGS.AC around its accesses).
-pub unsafe fn enable_smep_smap() -> (bool, bool) {
+///
+/// `me` is the index its flow read (ADR-0020 S3; TASKS item 93).
+pub unsafe fn enable_smep_smap(me: ThisCpu<'_>) -> (bool, bool) {
     let (smep, smap) = smep_smap_supported();
     // The boot processor's answer decides what the kernel assumes: an AP that lacks SMAP
     // refuses to start (`smp::ap_entry`) and must not turn it off for everyone else.
-    if this_cpu() == CpuIndex::BOOT {
+    if me.index() == CpuIndex::BOOT {
         SMAP_ON.store(smap, Ordering::Relaxed);
     }
     // UMIP (CPUID.7.0:ECX bit 2): `sidt` from ring 3 would otherwise reveal the kernel's
     // descriptor-table addresses, and with them the KASLR slide (ADR-0004 H3).
     let umip = cpuid(0)[0] >= 7 && cpuid(7)[2] & (1 << 2) != 0;
-    if umip && this_cpu() == CpuIndex::BOOT {
+    if umip && me.index() == CpuIndex::BOOT {
         UMIP_ON.store(true, Ordering::Relaxed);
     }
     let bits = if smep { CR4_SMEP } else { 0 }
