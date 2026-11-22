@@ -650,6 +650,15 @@ impl<R: Copy> RunQueue<R> {
         }
     }
 
+    /// The record `slot` holds, read without its state: a free slot's is `None` by construction
+    /// (a push sets it, and an exit or a departure clears it), and so is slot 0's. For a wake-up's
+    /// check that the slot holds its thread (ADR-0020 S20, trigger 3), where the state is read
+    /// after it.
+    #[inline]
+    pub fn held(&self, slot: usize) -> Option<R> {
+        self.record.get(slot).copied().flatten()
+    }
+
     /// Whether `slot`'s thread holds a wake-up that came before it blocked, which its next
     /// [`RunQueue::block`] consumes. Read only: a thread that leaves this queue for another
     /// carries it ([`RunQueue::depart`], ADR-0020 S6).
@@ -1751,6 +1760,7 @@ mod tests {
         let b = q.push(0x2000).unwrap();
         assert_eq!((q.record(a), q.record(b)), (Some(7), None));
         assert_eq!(q.record(5), None, "a free slot");
+        assert_eq!((q.held(0), q.held(a), q.held(5)), (None, Some(7), None));
         assert_eq!(q.record(CAPACITY), None, "no such slot");
         // `a` runs and exits: from the critical section that freed its slot on, nothing finds
         // its record through the slot.
@@ -1758,6 +1768,8 @@ mod tests {
         assert_eq!(q.current(), a);
         q.exit(0x1000).unwrap();
         assert_eq!(q.record(a), None);
+        // Read without the state, it answers the same: an exit clears it (TASKS item 96).
+        assert_eq!(q.held(a), None);
         // The slot's next thread has its own.
         let c = q.push_weighted(0x3000, DEFAULT_WEIGHT, Some(40)).unwrap();
         assert_eq!(c, a, "the lowest free slot is reused");
@@ -1829,7 +1841,7 @@ mod tests {
         let departed = source.depart(1).unwrap();
         assert_eq!((departed.lag(), departed.record()), (0, Some(7)));
         assert_eq!(source.live(), 1);
-        assert_eq!(source.record(1), None);
+        assert_eq!((source.record(1), source.held(1)), (None, None));
         let mut destination = RunQueue::new();
         for _ in 0..40 {
             assert_eq!(destination.tick(0x2000), 0x2000);

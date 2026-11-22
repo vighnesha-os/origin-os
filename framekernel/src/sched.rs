@@ -826,11 +826,23 @@ mod waking {
             Some(f(&mut queue.lock()))
         }
 
-        fn holder(queue: &RunQueue<Placed>, slot: u16) -> Option<u32> {
-            // ADR-0020 S20, trigger 3 (TASKS item 96, the coordinating session's ruling Q6):
-            // `origin_sync::threads::wake` compares it with the name's number before it wakes the
-            // slot. On a wake-up that meets no inconsistency, that check is all it adds (CL47).
-            queue.record(usize::from(slot)).map(Placed::number)
+        #[inline(always)]
+        fn holds<S>(
+            queue: &RunQueue<Placed>,
+            slot: u16,
+            _number: u32,
+            record: &origin_frame::sync::threads::Record<S>,
+        ) -> bool {
+            // ADR-0020 S20, trigger 3 (TASKS item 96, the coordinating session's ruling Q6): the
+            // slot holds this very record, compared by address with the one the wake-up has, read
+            // without the slot's state (`RunQueue::held`). On a wake-up that meets no
+            // inconsistency, that load and compare and their branch are all it adds (CL47).
+            queue.held(usize::from(slot)).is_some_and(|placed| {
+                core::ptr::eq(
+                    core::ptr::from_ref(placed.record()).cast::<()>(),
+                    core::ptr::from_ref(record).cast::<()>(),
+                )
+            })
         }
 
         fn wake_slot(queue: &mut RunQueue<Placed>, slot: u16) -> bool {
@@ -1053,53 +1065,90 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
     // the woken thread would wait for that processor's next tick. The queues are locked in the
     // same section (`waking`), so a wake-up opens one section, as before TASKS item 93.
     waking::within(|queues, here| {
-        // Pinned mode's two hooks run only on an inconsistency, out of line in
-        // `origin_sync::threads`: the line is written there, inside this section, as an interrupt
-        // handler's line is (`pinned::line`), so that a wake-up that meets none tests for nothing
-        // more than Q6's record check (the coordinating session's ruling, ADR-0018 V1).
-        let woke = origin_frame::sync::threads::wake(
-            queues,
-            record,
-            thread.record,
-            thread.generation,
-            |met| pinned::enter(met.into()),
-            |met, outcome| {
-                pinned::line(
-                    met.into(),
-                    cpu::this_cpu(here).index(),
-                    pinned::then_woke(met, outcome),
-                );
-            },
-        );
+        // Only the location loop is on this path (TASKS item 96, the coordinating session's
+        // ruling, ADR-0018 V1): an inconsistency goes on out of line, in `wake_inconsistent`, so
+        // that no answer of the out-of-line paths merges into this one's.
+        let woke =
+            origin_frame::sync::threads::follow(queues, record, thread.record, thread.generation);
+        if matches!(woke.outcome, Outcome::Exhausted | Outcome::Misplaced) {
+            return wake_inconsistent(queues, record, thread, woke, here);
+        }
         if woke.retries != 0 {
             followed(record, woke.retries, here);
         }
         match woke.outcome {
-            Outcome::Reached { ready: true, cpu } => {
-                let Some(cpu) = usize::try_from(cpu).ok().and_then(CpuIndex::new) else {
-                    return false;
-                };
-                let me = cpu::this_cpu(here);
-                if cpu != me.index()
-                    && let Some(apic_id) = cpu.apic_id()
-                {
-                    timer::send_reschedule_ipi(me, apic_id);
-                    return true;
-                }
-                false
-            }
-            // A second exhaustion, with moves withdrawn: the flag itself failed (the ruling's Q17).
-            Outcome::Exhausted => panic!(
-                "a wake-up followed its thread {} times, {} of them with moves withdrawn",
-                woke.retries,
-                origin_frame::sync::threads::WAKE_TRIES
-            ),
+            Outcome::Reached { ready: true, cpu } => ipi_if_elsewhere(cpu, here),
             Outcome::Reached { ready: false, .. }
             | Outcome::Stale
             | Outcome::Gone
+            | Outcome::Exhausted
             | Outcome::Misplaced => false,
         }
     })
+}
+
+/// The reschedule IPI to processor `cpu`, which a wake-up made a thread ready on, if it is not
+/// this one: whether one was sent.
+#[inline(always)]
+fn ipi_if_elsewhere(cpu: u32, here: origin_frame::trap::Here<'_>) -> bool {
+    let Some(cpu) = usize::try_from(cpu).ok().and_then(CpuIndex::new) else {
+        return false;
+    };
+    let me = cpu::this_cpu(here);
+    if cpu != me.index()
+        && let Some(apic_id) = cpu.apic_id()
+    {
+        timer::send_reschedule_ipi(me, apic_id);
+        return true;
+    }
+    false
+}
+
+/// [`wake`] after its location loop met an inconsistency (ADR-0020 S20, triggers 3 and 4), out of
+/// line and in its section: pinned mode's two hooks, the retry or the search
+/// (`origin_sync::threads::after_inconsistency`), the moves followed, and the IPI. The line that
+/// names the trigger is written there, inside the section, as an interrupt handler's line is
+/// (`pinned::line`). A second exhaustion, with moves withdrawn, means the flag itself failed, and
+/// the kernel stops (the ruling's Q17).
+#[cold]
+#[inline(never)]
+fn wake_inconsistent<'a>(
+    queues: &waking::KernelQueues<'a>,
+    record: &Record<threads::State>,
+    thread: ThreadRef,
+    first: origin_frame::sync::threads::Wake,
+    here: origin_frame::trap::Here<'a>,
+) -> bool {
+    let woke = origin_frame::sync::threads::after_inconsistency(
+        queues,
+        record,
+        thread.record,
+        thread.generation,
+        first,
+        |met| pinned::enter(met.into()),
+        |met, outcome| {
+            pinned::line(
+                met.into(),
+                cpu::this_cpu(here).index(),
+                pinned::then_woke(met, outcome),
+            );
+        },
+    );
+    if woke.retries != 0 {
+        followed(record, woke.retries, here);
+    }
+    match woke.outcome {
+        Outcome::Reached { ready: true, cpu } => ipi_if_elsewhere(cpu, here),
+        Outcome::Exhausted => panic!(
+            "a wake-up followed its thread {} times, {} of them with moves withdrawn",
+            woke.retries,
+            origin_frame::sync::threads::WAKE_TRIES
+        ),
+        Outcome::Reached { ready: false, .. }
+        | Outcome::Stale
+        | Outcome::Gone
+        | Outcome::Misplaced => false,
+    }
 }
 
 /// The moves a wake-up followed, out of line (TASKS item 96, the coordinating session's rulings Q8

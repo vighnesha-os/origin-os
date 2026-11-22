@@ -436,11 +436,13 @@ pub trait Queues {
     /// interrupts off), or returns `None` if there is no such processor.
     fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut Self::Queue) -> R) -> Option<R>;
 
-    /// The number of the record whose thread `slot` of `queue` holds, or `None` for a slot that
-    /// holds no record (free, or the boot or idle flow's). [`wake`] checks it before it wakes the
-    /// slot, so that a location naming a slot that does not hold its thread wakes no one there
-    /// (ADR-0020 S20, trigger 3; TASKS item 96, the coordinating session's ruling Q6).
-    fn holder(queue: &Self::Queue, slot: u16) -> Option<u32>;
+    /// Whether `slot` of `queue` holds the thread of `record`, whose number is `number`. [`wake`]
+    /// checks it before it wakes the slot, so that a location naming a slot that does not hold its
+    /// thread wakes no one there (ADR-0020 S20, trigger 3; TASKS item 96, the coordinating
+    /// session's ruling Q6). An implementation may compare the record itself, by address, or its
+    /// number: the kernel compares the address, one load and one compare on the path of every
+    /// wake-up (the coordinating session's ruling, ADR-0018 V1).
+    fn holds<S>(queue: &Self::Queue, slot: u16, number: u32, record: &Record<S>) -> bool;
 
     /// Wakes the thread in `slot` of `queue`, as `RunQueue::wake` does for the slot's own
     /// generation: whether a blocked thread became ready. A thread not blocked keeps the wake-up
@@ -599,6 +601,30 @@ pub fn wake<S, Q: Queues>(
 ) -> Wake {
     let first = follow(queues, record, number, generation);
     match first.outcome {
+        Outcome::Exhausted | Outcome::Misplaced => {
+            after_inconsistency(queues, record, number, generation, first, pin, report)
+        }
+        Outcome::Reached { .. } | Outcome::Stale | Outcome::Gone => first,
+    }
+}
+
+/// [`wake`]'s out-of-line continuation, for a caller that runs [`follow`] itself and keeps the
+/// two apart, as the kernel does: `first` is what `follow` answered, `Exhausted` or `Misplaced`,
+/// and this enters pinned mode through `pin` and goes on as [`wake`] says. Any other `first` is
+/// answered as it is. Out of line, so that nothing of it, and no merge of its answer with
+/// `follow`'s, is on the path of a wake-up that meets no inconsistency.
+#[cold]
+#[inline(never)]
+pub fn after_inconsistency<S, Q: Queues>(
+    queues: &Q,
+    record: &Record<S>,
+    number: u32,
+    generation: u32,
+    first: Wake,
+    pin: impl FnOnce(Met) -> bool,
+    report: impl FnOnce(Met, Outcome),
+) -> Wake {
+    match first.outcome {
         Outcome::Exhausted => {
             after_exhausted(queues, record, number, generation, first, pin, report)
         }
@@ -611,10 +637,11 @@ pub fn wake<S, Q: Queues>(
 
 /// The location loop: at most [`WAKE_TRIES`] looks. It ends [`Outcome::Exhausted`] when every look
 /// found the thread moved, and [`Outcome::Misplaced`] when the unchanged location's slot did not
-/// hold record `number`. Inlined, so the wake-up that meets no inconsistency runs it as before
-/// TASKS item 96, with the record check alone added.
+/// hold record `number`, for which a caller goes on with [`after_inconsistency`] ([`wake`] does).
+/// Inlined, so the wake-up that meets no inconsistency runs it as before TASKS item 96, with the
+/// record check alone added.
 #[inline(always)]
-fn follow<S, Q: Queues>(queues: &Q, record: &Record<S>, number: u32, generation: u32) -> Wake {
+pub fn follow<S, Q: Queues>(queues: &Q, record: &Record<S>, number: u32, generation: u32) -> Wake {
     let mut retries = 0;
     while retries < WAKE_TRIES {
         let Some(at) = record.location() else {
@@ -631,7 +658,7 @@ fn follow<S, Q: Queues>(queues: &Q, record: &Record<S>, number: u32, generation:
             }
             Look::Ends(if record.generation() == generation {
                 // ADR-0020 S20, trigger 3 (the ruling's Q6): the slot must hold this record.
-                if Q::holder(queue, at.slot()) == Some(number) {
+                if Q::holds(queue, at.slot(), number, record) {
                     Outcome::Reached {
                         ready: Q::wake_slot(queue, at.slot()),
                         cpu: at.cpu(),
@@ -670,8 +697,6 @@ fn follow<S, Q: Queues>(queues: &Q, record: &Record<S>, number: u32, generation:
 }
 
 /// [`WAKE_TRIES`] follows: pinned mode, then the loop once more ([`wake`]).
-#[cold]
-#[inline(never)]
 fn after_exhausted<S, Q: Queues>(
     queues: &Q,
     record: &Record<S>,
@@ -699,8 +724,6 @@ fn after_exhausted<S, Q: Queues>(
 }
 
 /// A misplaced location: pinned mode, then the one search ([`wake`]).
-#[cold]
-#[inline(never)]
 fn after_misplaced<S, Q: Queues>(
     queues: &Q,
     record: &Record<S>,
@@ -1117,13 +1140,10 @@ mod tests {
             Some(result)
         }
 
-        fn holder(queue: &Calls, slot: u16) -> Option<u32> {
+        fn holds<S>(queue: &Calls, slot: u16, number: u32, _: &Record<S>) -> bool {
+            assert_eq!(number, NUMBER, "the name's number");
             // Another record wherever a planted misplacement says the record is not.
-            if queue.held.is_some_and(|held| held != (queue.cpu, slot)) {
-                Some(NUMBER + 1)
-            } else {
-                Some(NUMBER)
-            }
+            !queue.held.is_some_and(|held| held != (queue.cpu, slot))
         }
 
         fn wake_slot(queue: &mut Calls, slot: u16) -> bool {

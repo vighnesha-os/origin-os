@@ -704,8 +704,8 @@ impl Queues for World {
         Some(f(&mut cpu.queue.lock()))
     }
 
-    fn holder(queue: &RunQueue, slot: u16) -> Option<u32> {
-        queue.record(usize::from(slot))
+    fn holds<S>(queue: &RunQueue, slot: u16, number: u32, _: &Record<S>) -> bool {
+        queue.record(usize::from(slot)) == Some(number)
     }
 
     fn wake_slot(queue: &mut RunQueue, slot: u16) -> bool {

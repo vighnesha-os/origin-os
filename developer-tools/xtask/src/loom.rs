@@ -517,7 +517,7 @@ const CONTROLS: &[Control] = &[
         // wakes that thread, and the named one is never woken.
         name: "wake_without_the_record_check",
         file: THREADS,
-        from: "                if Q::holder(queue, at.slot()) == Some(number) {\n",
+        from: "                if Q::holds(queue, at.slot(), number, record) {\n",
         to: "                if true {\n",
         models: &[("threads_a_misplaced_location_wakes_only_its_thread", MISPLACED_WOKE)],
     },
