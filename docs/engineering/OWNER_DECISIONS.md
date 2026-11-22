@@ -1372,3 +1372,75 @@ TASKS item 121 builds item 345's bench reset. Its independent review found three
   - row A02-Am4, which now names items 345 and 346;
   - TASKS item 121's entry, which names this item beside the coordinating session's rulings R121-2 and R121-3.
 
+### A bench build's minimal-program mode (item 347): Accepted 2026-11-22
+
+Rental F (2026-11-22) showed `ExitBootServices` not returning on the rented server, beside a positive control in the same boot. Its findings also showed that this board's `0xCF9` reset runs through the firmware's code, so only Amendment 4's triple fault was free of firmware code. TASKS item 127 then measured the loader's stack under QEMU at no more than 7.9% of the 128 KiB UEFI promises on the rented runs' path, so the stack is very unlikely to be the cause.
+
+| # | Question | Answer |
+|---|---|---|
+| 347, answered | May a bench build have a minimal-program mode, chosen when the image is built? It reads the memory map and does only the FCH reads its control needs, with no kernel read, verification, allocation or page tables. Then it writes its mark and calls `ExitBootServices` through the live table, and if the call returns it resets by a triple fault, with no `0xCF9`. Its control in a boot's first run is a triple fault. It tells whether the cause is in what Origin's loader does before the call or in starting any program on this firmware. | **Allow it** |
+
+- **The alternatives put:**
+  - the mode chosen by a switch file, which would add the file-protocol calls the mode is meant to leave out;
+  - no more rentals for now.
+- **The evidence:** rental F's findings, `docs/research/2026-11-22-rental-f-findings.md`, rank 3 (on `land/batch-10` until it lands), and TASKS item 127's measurement.
+- **Performance cost** (ADR-0018 V3): none, by construction. Only bench builds contain it.
+- **Where it is written:**
+  - ADR-0002 Amendment 5;
+  - the matrix row A02-Am5, placed in M1;
+  - TASKS item 128, which builds it with item 348.
+- **The next rental** (rental G, $0.81 expected, $1.62 at worst; the ledger at $4.86 would reach at most $6.48 of item 225's $10) is put to the owner separately, once TASKS item 128 is built.
+
+### Two further reads before the call, and one line reworded (item 348): Accepted 2026-11-22
+
+| # | Question | Answer |
+|---|---|---|
+| 348, answered | May the bench loader also read before the call, and print: (1) the live boot services table compared byte for byte with its own copy; (2) the FCH's SMI control for `0xCF9` writes (`SMIxC0` bits 27:26), behind the same gate as Amendment 4's reads? (3) And may the line about `PMxD2` bit 6 say that the FCH's own reset is off so the firmware can trap the write, instead of "its reset stopped"? | **Allow all three** |
+
+- **The alternative put:** only the rewording, with no new reads.
+- **Performance cost** (ADR-0018 V3): none, by construction. Only bench builds contain them.
+- **Where it is written:**
+  - ADR-0002 Amendment 4's "Addition" paragraph;
+  - the matrix row A02-Am4, which now names item 348 beside 345 and 346;
+  - TASKS item 128.
+
+### Amendment 5 after a successful call (item 349): Answered 2026-11-22
+
+TASKS item 128's review found that Amendment 5 (item 347), as accepted, contradicted itself in one case: a successful call where the FCH's shutdown bits are clear. It kept Amendment 4's refinement 3 after the call, which falls back to the firmware's reset methods, and it also said the mode calls nothing in the firmware after a successful call.
+
+| # | Question | Answer |
+|---|---|---|
+| 349, answered | In the minimal mode, after a successful call with a shutdown bit clear, should the loader use the firmware's reset methods (`ResetSystem`, then the FADT's register, never `0xCF9`), so the run ends visibly, with a note on Amendment 5's "no firmware call"? Or keep "no firmware call" literally and triple-fault anyway, though the machine may stop silently, since the line printed before the call already says the bits were clear? | **Forced fault anyway** |
+
+- **The recommendation put** was the firmware fallback; the owner chose the other option.
+- **What it changes:** after `EFI_SUCCESS` the minimal mode always triple-faults. Refinement 3 still decides the control in a boot's first run. On rental F's board both bits are set, so the case does not arise there.
+- **Where it is written:** ADR-0002 Amendment 5's "Clarification" paragraph and its list of differences; row A02-Am5, now decided by 347 and 349; TASKS item 128's entry.
+
+### The rental policy: one more, then pause (item 350): Answered 2026-11-22
+
+Six bench rentals (A to F, 2026-11-12 to 2026-11-22) cost $4.86 of item 225's $10 cap. Each answered one question, in about 25 minutes of a paid hour. The rented server's processor (Zen 4) is outside the declared hardware scope (ADR-0009 Amendment 1), so it stands in for real firmware and qualifies nothing.
+
+| # | Question | Answer |
+|---|---|---|
+| 350, answered | How should rentals go from now on: one more (rental G, the minimal program of item 347) using the whole paid hour, then a pause; stop renting now; or keep one rental per question? | **One more, then pause** |
+
+- **What it means:**
+  - Rental G runs once TASKS item 128 is built and gated, and is still put to the owner for its cost (item 235). It uses the paid hour fully: about six boots instead of three, with the per-boot wait shortened for the minimal image, inside the tool's 50-minute deletion limit.
+  - After rental G, no rental is put to the owner until at least two questions that free testing (QEMU, CI's KVM runners) cannot answer can share one rental, or until a machine in the declared scope is available.
+  - Free testing always comes first.
+- **The alternatives put:** stop renting now, keeping the bench work on QEMU and CI until a test machine is bought; or keep the current pace.
+- **Where it is written:** this sheet, TASKS item 128's entry, and the coordinating session's rental notes.
+
+### Vendor driver code used directly? (item 351): Answered 2026-11-22, reference only
+
+The owner asked whether driver code that vendors themselves contribute to Linux (Intel, AMD, NVIDIA and others) could be used directly where no specification can be downloaded, instead of only being read as a reference. Two limits were put with it:
+- GPL-only code cannot be used in a repository licensed MIT OR Apache-2.0;
+- Linux driver code is C written against Linux's internals, so using it directly needs a compatibility layer and a C compiler in the build.
+
+| # | Question | Answer |
+|---|---|---|
+| 351, answered | Should vendor-written driver code be usable directly, under a compatible licence only, each use a CLAUDE.md §5 runtime-dependency exception approved per driver, running only in user mode behind the IOMMU? Or keep today's rule, reference only? | **Reference only** |
+
+- **The recommendation put** was to allow it within those limits; the owner chose to keep today's rule.
+- **What it confirms:** CLAUDE.md §3 and decision items 91 to 97 stand. Where no free official specification or vendor document exists, Linux and other open-source code, the vendors' own contributions included, may be read only as a reference, under §3's separate-session process, and never copied, translated or reproduced in structure. Origin writes every driver itself. Vendor firmware stays usable as §4 and §38 allow, subject to its licence.
+- **Where it is written:** this sheet, and the requirements README's table of items without rows.
