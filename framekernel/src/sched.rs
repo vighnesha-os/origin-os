@@ -1305,8 +1305,12 @@ pub(crate) fn has_room(cpu: CpuIndex) -> bool {
 /// The state of the thread `thread` names, for a migration proof's line when it fails (TASKS
 /// item 96; the coordinating session's ruling on the gates' stop of 2026-11-22): its record's
 /// number and generation against the name's, whether it is movable, its pin count, its location,
-/// and its slot as the queue there holds it (`RunQueue::describe`). No address. Read only, under
-/// the queue's lock; no path but a failing proof's calls it.
+/// and its slot as the queue there holds it (`RunQueue::describe`), with whether that slot holds
+/// this very record (`RunQueue::held`, compared by address as `KernelQueues::holds` compares it):
+/// "held matches", "held is" another record's number, or "held none". That tells a line read while
+/// a hand-off is in flight from a thread that is stuck where it is (the coordinating session's
+/// ruling on the second stop, 2026-11-22). No address. Read only, under the queue's lock; no path
+/// but a failing proof's calls it.
 pub(crate) fn describe_thread(thread: ThreadRef) -> alloc::string::String {
     let Some(record) = threads::record(thread.record) else {
         return alloc::format!("record {} none", thread.record);
@@ -1324,19 +1328,36 @@ pub(crate) fn describe_thread(thread: ThreadRef) -> alloc::string::String {
         Some(at) => {
             let slot = QUEUES
                 .get(usize::try_from(at.cpu()).unwrap_or(usize::MAX))
-                .map(|queue| without_interrupts(|| queue.lock().describe(usize::from(at.slot()))));
+                .map(|queue| {
+                    without_interrupts(|| {
+                        let queue = queue.lock();
+                        let slot = usize::from(at.slot());
+                        (queue.describe(slot), queue.held(slot))
+                    })
+                });
             match slot {
-                Some(s) => out.push_str(&alloc::format!(
-                    ", on CPU {} slot {}: {}, pending {}, woken {}, pass {}, floor {}, current slot {}",
-                    at.cpu(),
-                    at.slot(),
-                    s.state,
-                    s.pending,
-                    s.woken,
-                    s.pass,
-                    s.floor,
-                    s.current
-                )),
+                Some((s, held)) => {
+                    out.push_str(&alloc::format!(
+                        ", on CPU {} slot {}: {}, pending {}, woken {}, pass {}, floor {}, current slot {}",
+                        at.cpu(),
+                        at.slot(),
+                        s.state,
+                        s.pending,
+                        s.woken,
+                        s.pass,
+                        s.floor,
+                        s.current
+                    ));
+                    match held {
+                        Some(placed) if core::ptr::eq(placed.record(), record) => {
+                            out.push_str(", held matches");
+                        }
+                        Some(placed) => {
+                            out.push_str(&alloc::format!(", held is {}", placed.number()));
+                        }
+                        None => out.push_str(", held none"),
+                    }
+                }
                 None => out.push_str(&alloc::format!(", on CPU {} (no such queue)", at.cpu())),
             }
         }
