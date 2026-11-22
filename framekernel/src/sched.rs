@@ -1013,7 +1013,7 @@ pub(crate) mod pinned {
     pub(crate) fn then_woke(met: Met, outcome: Outcome) -> &'static str {
         match (met, outcome) {
             (Met::Misplaced, Outcome::Reached { .. }) => {
-                "; the search found the thread in another queue and woke it there"
+                "; the search found the slot that holds the thread and woke it there"
             }
             (Met::Misplaced, Outcome::Stale) => "; the search found the record with another thread",
             (Met::Misplaced, _) => "; the search found the record in no queue",
