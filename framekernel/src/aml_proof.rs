@@ -104,7 +104,7 @@ impl Firmware for Boot {
 #[cfg(target_os = "none")]
 pub(crate) fn prove(com1: &mut crate::console::Console, rsdp_addr: u64, stack_floor: u64) -> bool {
     let mut heap = || crate::memory::stats().map(|(h, _)| h.bytes_in_use);
-    run(
+    let found = run(
         com1,
         &mut Boot,
         rsdp_addr,
@@ -112,8 +112,12 @@ pub(crate) fn prove(com1: &mut crate::console::Console, rsdp_addr: u64, stack_fl
         Limits::BOOT_PROOF,
         &mut heap,
         usize::try_from(stack_floor).ok(),
-    )
-    .passed()
+    );
+    // What `_CPC` gave on QEMU's processors, for the hardware capacity proof (TASKS item 106).
+    if !found.not_run {
+        let _ = crate::cpc::FOUND.set(found.walked.cpc);
+    }
+    found.passed()
 }
 
 /// The boot proof's host (the contract of step B3, §4): everything that reaches hardware or a
@@ -519,6 +523,9 @@ pub struct Walked {
     pub links: u32,
     /// Of them, those whose `_STA` was refused in PCI_Config.
     pub links_refused: u32,
+    /// What the processors' `_CPC` gave (ADR-0020 S9, source 2; TASKS item 106): counted, never
+    /// used, since ADR-0019 A2 keeps it from the kernel's capacity.
+    pub cpc: crate::cpc::Found,
 }
 
 impl Walked {
@@ -1320,6 +1327,18 @@ fn is_processor<H: Host>(i: &Interpreter<H>, node: Node) -> bool {
     false
 }
 
+/// `node`'s child named `name`, if it has one. Nothing is run.
+fn child_named<H: Host>(i: &Interpreter<H>, node: Node, name: [u8; 4]) -> Option<Node> {
+    let mut child = i.first_child(node);
+    while let Some(c) = child {
+        if i.name_of(c).is_ok_and(|n| n == name) {
+            return Some(c);
+        }
+        child = i.next_sibling(c);
+    }
+    None
+}
+
 /// Whether `node` is a PCI interrupt link as QEMU names them: `\_SB.LNKx`.
 fn is_link<H: Host>(i: &Interpreter<H>, node: Node, sb: Option<Node>) -> bool {
     sb.is_some() && i.parent(node) == sb && i.name_of(node).is_ok_and(|n| n.starts_with(b"LNK"))
@@ -1418,6 +1437,16 @@ fn walk<H: Host>(
             if refused_in == Some(1) {
                 w.processors_refused = w.processors_refused.saturating_add(1);
             }
+            let cpc = child_named(i, node, *b"_CPC").map(|c| {
+                let result = i.evaluate_node(c, &[]);
+                crate::cpc::outcome(
+                    result
+                        .as_ref()
+                        .map(Option::as_ref)
+                        .map_err(|e| allowed(e, &seen)),
+                )
+            });
+            w.cpc.count(cpc);
         }
         if is_link(i, node, sb) {
             w.links = w.links.saturating_add(1);
@@ -1460,6 +1489,12 @@ fn walk<H: Host>(
         w.processors_as_required(),
         w.links,
         w.links_as_required(),
+    );
+    let c = w.cpc;
+    let _ = writeln!(
+        out,
+        "{LINE}walk: _CPC on {} of {} processors: {} with an Integer Highest, {} with a register (not read: ADR-0019 A2), {} refused, {} not read otherwise",
+        c.with_cpc, c.processors, c.integer, c.register, c.refused, c.malformed,
     );
     result.walked = w;
     result
