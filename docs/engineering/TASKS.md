@@ -4853,7 +4853,7 @@ Assigned by the coordinating session on 2026-11-22, after TASKS item 127 and the
 **The turn** (2026-11-22, the development Mac, QEMU 11.1.3 TCG with OVMF, Rust 1.100.0), on `32b6e043`:
 - **07:07:04 to 07:48:23 UTC:**
   - fmt and F1 passed;
-  - the ten control runs, listed below;
+  - the nine control runs, listed below;
   - `check` passed in 899 s: 2,735 host tests passed, 0 failed, 30 ignored; Loom 91 models and 140 negative controls caught; every gate;
   - `reproducible-compare`: all 40 files the same bytes as `953cda2c`'s, the batch's (TASKS item 127 showed `a1069e45`'s the same);
   - `boot-test` passed 11 of 11 in 54 s;
@@ -4880,8 +4880,17 @@ Assigned by the coordinating session on 2026-11-22, after TASKS item 127 and the
 
 **Not shown:**
 - anything on an AMD FCH: QEMU has none, so the stand-in table that `xtask` plants in QEMU's firmware tables supplies the values. A real board's firmware holds no such table, so there the mode reads the FCH;
-- the minimal mode on the rented board: that is rental G;
+- the minimal mode on the rented board: that is rental G, below;
 - `BitsClear`, `Contradicts` and a first map that does not fit, which are host-tested only;
 - **no person has reviewed it.**
 
-**For the records PR:** ADR-0002 Amendment 5's status line and rows A02-Am5 and A02-Am4 are in PR 58's text, not on this branch; marking them built is the coordinating session's or the keeper's.
+**For the records PR:** ADR-0002 Amendment 5's status line and rows A02-Am5 and A02-Am4 are in PR 58's text, not on this branch; marking them built is the coordinating session's or the keeper's. *(Done in rental G's records commit, on `land/batch-10` at `aac803ed`: both rows built, and the ADR's status line and Amendment 5's note.)*
+
+**Rental G (2026-11-22, on the owner's "Rent it"; the coordinating session's guarded run, 09:00:36 to 09:30:35 UTC, $0.81; the ledger now 7 rentals, $5.67):** the minimal images above, from `32b6e043`. Record `docs/hardware/records/2026-11-22-latitude-m4-metal-small-g.md` and its log; findings `docs/research/2026-11-22-rental-g-findings.md`. Firmware 2.4a (2025-08-29), rental E's revision. Six boots, thirteen runs.
+- **The FCH's checks passed in every run,** with rental F's register values but `PMxC0`, and `SMIxC0` read `0x04000000`: the firmware's `0xCF9` trap is an SMI.
+- **The control worked in all six boots:** the first run (bit 19 after the provider's restart, bit 21 after the tool's) triple-faulted, the firmware started again 48.3 to 48.9 s later, and the next run read bit 23, a shutdown. A triple fault resets this board.
+- **Each call was followed by a reset** where the tool's restart did not interrupt it (runs 2, 7, 9, 11 and 13): the firmware's first byte 48.8 to 48.9 s after `X`, 29 to 47 s before the tool's next restart. Run 3, after run 2's reset, read bit 23 and made the call again. No `Y` and no Amendment 2 line in any run.
+- **The reading:** R, the call returned `EFI_SUCCESS` and item 349's triple fault reset the machine, ranked well ahead of S, the firmware's own exit shutting the processor down, which item 349's silence after a successful call leaves open. Under R the stop is in what Origin's loaders add, as Amendment 5's "if the call returns" says, since rental E's bench loader stopped on the same revision.
+- **The tool's summaries are wrong for this image,** and the fault is in item 350's change above: a minimal boot ends only on loader runs, the five-minute boot was sized from rental F's revision (7 s from a reset to the firmware's first line, against about 49 s on 2.4a), and the next byte is measured from the call's line, not from `X`. Boot 2's "reset itself after the first call" was the tool's own restart, issued 5.6 s before that call.
+- **`PMxC0` bit 20** stays set beside each cause: AMD's document says hardware never clears it. It changes no run's branch.
+- **Next, ranked in the findings:** the tool's fix, tested on a fixture shaped like rental G's console (free); the full bench image staged (free); then, when item 350's pause lifts, one rental with two questions, the copied table's compare and the OS-defined memory types as `EfiLoaderData` (an owner item); last, a mark after a successful call, which would change item 349.
