@@ -4446,6 +4446,7 @@ Built on `claude/t93-witness-pin-333af7`, cut from `land/batch-9` at `a25228c9`.
   - It was reviewed by the same reviewer as a delta: 0 High, 0 Medium, 1 Low (D93-1), 5 Info.
 - `87673b7e`: D93-1's answer. The worker reads the index once it stops, under its own section, not the record's location in every iteration. That gives the "ran there" clause back the processor's own view, and closes D93-3 and D93-4.
 - `1544128e`: `land/batch-9` at `144e0cfa` merged after the gates (`main`'s PR 54: owner item 345 and TASKS items 117 to 124, records only). Its code is `87673b7e`'s: the diff outside `docs` is empty.
+- `5e059b50`: `land/batch-9` at `d0376076`, the batch's pushed tip, merged after the records (`main`'s PR 55: owner item 346, records only). Its code is still `87673b7e`'s.
 - **The records:**
   - this entry;
   - ADR-0020 S3's dated note;
