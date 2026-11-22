@@ -200,10 +200,9 @@ const MOVE_GATE: &[&str] = &[
 const STALE_WOKE: &[&str] = &["a stale name woke the record's next thread"];
 
 /// What the move models report when a wake-up trusts a location it did not read again under the
-/// lock: the wake-up lost ("deadlock"), or, since TASKS item 96's record check, the slot it reaches
-/// found to hold another record or none, which enters pinned mode (ADR-0020 S20, trigger 3) and,
-/// in these models, which plant no inconsistency, fails as one.
-const LOST_OR_PINNED: &[&str] = &["deadlock", "a wake-up met an inconsistency"];
+/// lock (TASKS item 96): the slot it reaches holds no record, which enters pinned mode (ADR-0020
+/// S20, trigger 3) and, in these models, which plant no inconsistency, fails as one.
+const STALE_SLOT_MET: &[&str] = &["a wake-up met an inconsistency: Misplaced"];
 
 /// What `threads_a_misplaced_location_wakes_only_its_thread` reports (TASKS item 96): a wake-up by
 /// a misplaced location woke the thread the slot holds.
@@ -478,7 +477,14 @@ const CONTROLS: &[Control] = &[
     },
     Control {
         // The location read once and trusted: a move that completes between the read and the
-        // lock leaves the wake-up at the slot the thread left.
+        // lock leaves the wake-up at the slot the thread left. Before TASKS item 96 that slot's
+        // wake was lost (a deadlock). Since its record check, every failing interleaving is the
+        // same one: the wake-up reads the location before the move, the move departs the thread
+        // from processor 0's slot 1 (which nothing takes again in these models), and the wake-up
+        // then locks processor 0 and finds slot 1 holding no record: S20's trigger 3, which the
+        // models' hook reports as an inconsistency. An interleaving whose lock comes before the
+        // move reaches the thread there, and its pending wake-up travels with it: no failure.
+        // Unplanted, both models pass.
         name: "location_not_read_again_under_the_lock",
         file: THREADS,
         from: "            if now != Some(at) {
@@ -488,8 +494,8 @@ const CONTROLS: &[Control] = &[
         to: "            let _ = now;
 ",
         models: &[
-            ("threads_a_wake_follows_a_move", LOST_OR_PINNED),
-            ("threads_a_timed_wake_follows_a_move", LOST_OR_PINNED),
+            ("threads_a_wake_follows_a_move", STALE_SLOT_MET),
+            ("threads_a_timed_wake_follows_a_move", STALE_SLOT_MET),
         ],
     },
     Control {
