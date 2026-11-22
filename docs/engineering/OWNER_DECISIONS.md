@@ -1372,3 +1372,34 @@ TASKS item 121 builds item 345's bench reset. Its independent review found three
   - row A02-Am4, which now names items 345 and 346;
   - TASKS item 121's entry, which names this item beside the coordinating session's rulings R121-2 and R121-3.
 
+### A bench build's minimal-program mode (item 347): Accepted 2026-11-22
+
+Rental F (2026-11-22) showed `ExitBootServices` not returning on the rented server, beside a positive control in the same boot. Its findings also showed that this board's `0xCF9` reset runs through the firmware's code, so only Amendment 4's triple fault was free of firmware code. TASKS item 127 then measured the loader's stack under QEMU at no more than 7.9% of the 128 KiB UEFI promises on the rented runs' path, so the stack is very unlikely to be the cause.
+
+| # | Question | Answer |
+|---|---|---|
+| 347, answered | May a bench build have a minimal-program mode, chosen when the image is built? It reads the memory map and does only the FCH reads its control needs, with no kernel read, verification, allocation or page tables. Then it writes its mark and calls `ExitBootServices` through the live table, and if the call returns it resets by a triple fault, with no `0xCF9`. Its control in a boot's first run is a triple fault. It tells whether the cause is in what Origin's loader does before the call or in starting any program on this firmware. | **Allow it** |
+
+- **The alternatives put:**
+  - the mode chosen by a switch file, which would add the file-protocol calls the mode is meant to leave out;
+  - no more rentals for now.
+- **The evidence:** rental F's findings, `docs/research/2026-11-22-rental-f-findings.md`, rank 3 (on `land/batch-10` until it lands), and TASKS item 127's measurement.
+- **Performance cost** (ADR-0018 V3): none, by construction. Only bench builds contain it.
+- **Where it is written:**
+  - ADR-0002 Amendment 5;
+  - the matrix row A02-Am5, placed in M1;
+  - TASKS item 128, which builds it with item 348.
+- **The next rental** (rental G, $0.81 expected, $1.62 at worst; the ledger at $4.86 would reach at most $6.48 of item 225's $10) is put to the owner separately, once TASKS item 128 is built.
+
+### Two further reads before the call, and one line reworded (item 348): Accepted 2026-11-22
+
+| # | Question | Answer |
+|---|---|---|
+| 348, answered | May the bench loader also read before the call, and print: (1) the live boot services table compared byte for byte with its own copy; (2) the FCH's SMI control for `0xCF9` writes (`SMIxC0` bits 27:26), behind the same gate as Amendment 4's reads? (3) And may the line about `PMxD2` bit 6 say that the FCH's own reset is off so the firmware can trap the write, instead of "its reset stopped"? | **Allow all three** |
+
+- **The alternative put:** only the rewording, with no new reads.
+- **Performance cost** (ADR-0018 V3): none, by construction. Only bench builds contain them.
+- **Where it is written:**
+  - ADR-0002 Amendment 4's "Addition" paragraph;
+  - the matrix row A02-Am4, which now names item 348 beside 345 and 346;
+  - TASKS item 128.
