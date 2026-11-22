@@ -200,6 +200,11 @@ impl HfiShape {
         Some((self.capabilities & (mask - 1)).count_ones() as usize)
     }
 
+    /// Whether the table reports efficiency (CPUID.06H:EDX\[1\]) beside performance.
+    pub const fn reports_efficiency(&self) -> bool {
+        self.capabilities & EFFICIENCY != 0
+    }
+
     /// Bytes of class 0's cells: what is read of the change indications ([`HFI_FLAGS_AT`]) and of
     /// a row ([`HfiShape::row_offset`]).
     pub const fn cells(&self) -> usize {
@@ -252,14 +257,24 @@ impl HfiRow {
     }
 }
 
-/// The flags at the table's start, if `table` holds its header.
+/// The flags at the table's start, if `table` holds class 0's change indications whole.
 pub fn hfi_flags(table: &[u8], shape: HfiShape) -> Option<HfiFlags> {
-    hfi_flags_from(table.get(HFI_FLAGS_AT..)?, shape)
+    hfi_flags_from(class_cells(table, HFI_FLAGS_AT, shape)?, shape)
+}
+
+/// Class 0's [`HfiShape::cells`] bytes at `at`, if `table` holds them all: the one rule both the
+/// whole-table readers and the kernel's copy follow, so that no reader takes a row or the flags
+/// from a table that ends inside them (the coordinating session's ruling on the review's R106-1,
+/// 2026-11-22; TASKS item 106 changed TASKS item 97's readers to it).
+fn class_cells(table: &[u8], at: usize, shape: HfiShape) -> Option<&[u8]> {
+    table.get(at..at.checked_add(shape.cells())?)
 }
 
 /// The flags in `cells`, class 0's change indications, read from [`HFI_FLAGS_AT`]: what the kernel
-/// copies out of the table (TASKS item 106), [`HfiShape::cells`] bytes of it.
+/// copies out of the table (TASKS item 106). `None` unless `cells` holds all [`HfiShape::cells`]
+/// bytes.
 pub fn hfi_flags_from(cells: &[u8], shape: HfiShape) -> Option<HfiFlags> {
+    let cells = cells.get(..shape.cells())?;
     let byte = |mask| -> Option<u8> { cells.get(shape.place(mask)?).copied() };
     let performance = cells.get(shape.place(PERFORMANCE)?).copied()?;
     let efficiency = byte(EFFICIENCY).unwrap_or(0);
@@ -272,14 +287,15 @@ pub fn hfi_flags_from(cells: &[u8], shape: HfiShape) -> Option<HfiFlags> {
 }
 
 /// Row `row`'s class-0 capabilities (CPUID.06H:EDX\[31:16\] on that processor), if `table` holds
-/// it: at [`HfiShape::row_offset`].
+/// them whole: at [`HfiShape::row_offset`].
 pub fn hfi_row(table: &[u8], shape: HfiShape, row: u16) -> Option<HfiRow> {
-    hfi_row_from(table.get(shape.row_offset(row)?..)?, shape)
+    hfi_row_from(class_cells(table, shape.row_offset(row)?, shape)?, shape)
 }
 
 /// The class-0 capabilities in `cells`, a row's first [`HfiShape::cells`] bytes: what the kernel
-/// copies out of the table (TASKS item 106).
+/// copies out of the table (TASKS item 106). `None` unless `cells` holds all of them.
 pub fn hfi_row_from(cells: &[u8], shape: HfiShape) -> Option<HfiRow> {
+    let cells = cells.get(..shape.cells())?;
     let cell = |mask| -> Option<u8> { cells.get(shape.place(mask)?).copied() };
     Some(HfiRow {
         performance: cell(PERFORMANCE)?,
@@ -566,6 +582,11 @@ pub static LIVE: Store = Store::new();
 /// placement reads it (the coordinating session's ruling Q6 of 2026-11-21). [`FULL`] before the
 /// boot publishes the store, and for an index it does not hold. A placement hint: see the module's
 /// documentation on the mixed view a rescale may show.
+///
+/// **Capacity 0 is S17's "avoid"**: no movable thread is placed there. That is the rule placement
+/// follows. [`avoid`] is Intel's stricter "avoid altogether", every class-0 cell 0 (SDM Vol. 3,
+/// §17.6.7), kept for the power modes (TASKS items 99 and 107): a row with performance 0 and an
+/// efficiency above 0 has capacity 0 without it (the review's R106-16).
 pub fn current(cpu: usize) -> u16 {
     LIVE.current(cpu)
 }
@@ -868,10 +889,11 @@ mod tests {
         }
     }
 
-    /// What the kernel copies out of the table, `cells()` bytes at the flags and at a row, reads
-    /// as the whole table does (TASKS item 106).
+    /// One rule for a row and the flags, whichever reads them (the coordinating session's ruling on
+    /// the review's R106-1): the whole-table readers and the kernel's copy of `cells()` bytes accept
+    /// exactly the same rows and flags, and read the same values from them.
     #[test]
-    fn a_rows_cells_read_as_the_whole_table() {
+    fn the_whole_table_and_the_copy_accept_the_same_rows() {
         let mut rng = Rng::new(0x0106_CE11);
         for case in 0..cases(5_000) {
             let shape = HfiShape::from_cpuid(
@@ -887,39 +909,44 @@ mod tests {
             let table: Vec<u8> = (0..rng.below(600)).map(|_| rng.byte()).collect();
             let row = rng.below(40) as u16;
             let cells = shape.cells();
+            // The kernel's copy: `cells` bytes, all inside the table, or nothing.
             let copied = |at: usize| table.get(at..at + cells).map(<[u8]>::to_vec);
-            match shape.row_offset(row).and_then(copied) {
-                Some(c) => assert_eq!(
-                    hfi_row_from(&c, shape),
-                    hfi_row(&table, shape, row),
-                    "case {case}"
-                ),
-                // The kernel copies a row's class-0 cells whole, so it refuses a row the table does
-                // not hold whole, where the whole-table reading may still find the cells it reads
-                // (the review's R106-1): the kernel's reading is the stricter.
-                None => assert!(
-                    shape
-                        .row_offset(row)
-                        .is_none_or(|at| at + cells > table.len()),
-                    "case {case}"
-                ),
-            }
-            if let Some(c) = copied(HFI_FLAGS_AT) {
-                assert_eq!(
-                    hfi_flags_from(&c, shape),
-                    hfi_flags(&table, shape),
-                    "case {case}"
-                );
-            }
+            let copy = shape.row_offset(row).and_then(copied);
+            assert_eq!(
+                copy.as_deref().and_then(|c| hfi_row_from(c, shape)),
+                hfi_row(&table, shape, row),
+                "case {case}"
+            );
+            assert_eq!(
+                copy.is_some(),
+                hfi_row(&table, shape, row).is_some(),
+                "case {case}: one accepts what the other refuses"
+            );
+            assert_eq!(
+                copied(HFI_FLAGS_AT)
+                    .as_deref()
+                    .and_then(|c| hfi_flags_from(c, shape)),
+                hfi_flags(&table, shape),
+                "case {case}"
+            );
         }
-        // A table that ends inside a row's cells, after the two it reads (R106-1's case 67):
-        // Thread Director, capabilities 0b10111, 11 classes, 107 bytes, the row at byte 104.
+        // A table that ends inside a row's cells, after the two the row's values sit in (the
+        // review's case 67): Thread Director, capabilities 0b10111, 11 classes, 107 bytes, the row
+        // at byte 104. Both readers refuse it.
         let td = HfiShape::from_cpuid(HFI | THREAD_DIRECTOR, 11 << 8, 0b10111).unwrap();
         let table = vec![7u8; 107];
         let at = (0..40).find(|&r| td.row_offset(r) == Some(104)).unwrap();
         assert_eq!(td.cells(), 4);
-        assert!(hfi_row(&table, td, at).is_some());
+        assert_eq!(hfi_row(&table, td, at), None);
         assert_eq!(table.get(104..104 + td.cells()), None);
+        assert_eq!(hfi_row_from(&table[104..], td), None);
+        // With one byte more it holds the cells, and both read the row.
+        let longer = vec![7u8; 108];
+        assert!(hfi_row(&longer, td, at).is_some());
+        assert_eq!(
+            hfi_row_from(&longer[104..108], td),
+            hfi_row(&longer, td, at)
+        );
         // The offsets Table 17-4 and Table 17-7 give.
         let hfi = HfiShape::from_cpuid(HFI, 0, 0b11).unwrap();
         assert_eq!(
