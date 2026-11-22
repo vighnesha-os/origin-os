@@ -1450,17 +1450,15 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             return here;
         }
     }
-    // A #GP at the instruction an MSR probe armed, RDMSR or WRMSR on a register that does not
-    // exist (TASKS item 106; the coordinating session's ruling Q4): resume at `probe_recover`,
-    // which returns the error code to the probe's caller. Only on #GP's branch, and only at an MSR
-    // probe's instruction, so no other vector's path and no other probe changes.
-    if frame.vector == 13 {
-        let armed = local(Switch::new().here()).probe_rip.load(Ordering::SeqCst);
-        if armed != 0 && frame.rip == armed && is_msr_probe(armed) {
-            frame.rax = frame.error_code;
-            frame.rip = (probe_recover as *const ()).addr() as u64;
-            return here;
-        }
+    // A #GP at the instruction an MSR probe armed (TASKS item 106; the coordinating session's
+    // ruling Q4), recovered by `recover_msr_probe`, cold and out of line, which tests the vector
+    // itself, on the fatal and #BP tail alone. A guard comparing the vector here would join the
+    // compiler's chain of compares and move the blocks above. Measured path by path against the
+    // base, no listed path runs more instructions but the exit software interrupt's, by one jump,
+    // once in a thread's life (ADR-0018 V1; the coordinating session's ruling of 2026-11-22; TASKS
+    // item 106's entry).
+    if recover_msr_probe(frame, Switch::new().here()) {
+        return here;
     }
     // A report must get out even if this processor faulted inside the console (the hook,
     // `console::report_exception`, uses the console's urgent path). Only #BP resumes.
@@ -2296,6 +2294,26 @@ pub unsafe fn probe_wrmsr(msr: u32, value: u64) -> bool {
         || unsafe { write_msr(value & 0xFFFF_FFFF, 0, value >> 32, u64::from(msr)) },
     );
     probe == Probe::Completed
+}
+
+/// `dispatch`'s #GP branch (TASKS item 106): a #GP (vector 13) at the instruction an armed MSR probe
+/// expects, RDMSR or WRMSR on a register that does not exist, resumes at `probe_recover`, which
+/// returns the error code to the probe's caller. Only at an MSR probe's instruction, so no other
+/// probe and no other #GP changes; the address is compared first, so no other #GP reads CPU-local
+/// data through GS (the review's R106-6). `here` is the trap entry's witness, which the CPU-local
+/// area is read under. Cold and out of line, on `dispatch`'s fatal and #BP tail.
+#[cold]
+#[inline(never)]
+fn recover_msr_probe(frame: &mut ExceptionFrame, here: crate::trap::Here<'_>) -> bool {
+    if frame.vector != 13
+        || !is_msr_probe(frame.rip)
+        || local(here).probe_rip.load(Ordering::SeqCst) != frame.rip
+    {
+        return false;
+    }
+    frame.rax = frame.error_code;
+    frame.rip = (probe_recover as *const ()).addr() as u64;
+    true
 }
 
 /// Whether `rip` is an MSR probe's instruction: the only probes `dispatch` recovers a #GP for.
