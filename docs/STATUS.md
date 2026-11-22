@@ -38,6 +38,12 @@ On `claude/t131-bisect-mode`, cut at TASKS item 130's tip `970cfca2`, with PR 59
 - **Rental H's images** are staged (loader `ce53da4c…`, kernel `3bb1f2a5…`). The rental tool's dry run shows six boots, $0.81 an hour and $1.62 at worst; nothing was bought.
 - **The full bench loader's bytes moved** to `0451f7a7…` from `32b6e043`'s `57a1bbb1…`, since a line of shared reset code changed (R131-1). The kernel is unchanged.
 
+**Rental H** (2026-11-22, $0.81, the ledger now 8 rentals and $6.48; `docs/hardware/records/2026-11-22-latitude-m4-metal-small-h.md`, `docs/research/2026-11-22-rental-h-findings.md`), firmware 2.5a, rental C's revision:
+- **The boot services table did not change after the copy,** in all twenty-two runs: the copy is not the cause.
+- **Neither call hung.** Both calls (runs 3 and 6) were followed by a reset 5.5 s and 6.1 s after `X`, the delay after every control's triple fault, with a shutdown's start after each. So the call most likely returned, on the revision where rental C's normal loader, with the OS-defined types, stopped. The firmware's exit shutting the processor down is still open.
+- **The control mostly loops on 2.5a.** After most shutdowns this firmware resets the machine itself, twice, and the FCH then records that reset (bit 19), not the shutdown (bit 23). Twenty of twenty-two runs took the control, and Amendment 6's bit-23 confirmation after the calls did not come.
+- **Next, ranked in the findings:** an owner decision on ADR-0002 B3, the normal loader's memory types. It would be confirmed by one rental of the normal loader with the boot info and stack as `EfiLoaderData`, entering the bench kernel with its breadcrumbs.
+
 ## The minimal-program mode and Amendment 4's addition, in the bench loader (TASKS item 128; 2026-11-22)
 
 On `claude/t128-minimal-mode`, cut from TASKS item 127's tip `a1069e45`, and in `land/batch-10` since `aac803ed`. Rentals E and F saw nothing after the mark before `ExitBootServices` and no reset after it. Owner items 347 and 348 (ADR-0002 Amendment 5, Amendment 4's addition) add a loader that does almost nothing before the call, to tell Origin's loader apart from the firmware. Item 349 makes it triple-fault after any successful call. Item 350 makes rental G the last rental for a while.
