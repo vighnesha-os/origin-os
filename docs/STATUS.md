@@ -7,6 +7,30 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** On a physical machine only Origin's loader has run: a rented bench server, outside the declared scope, on 2026-11-20 (see the next section). |
 
+## The boot info and the kernel stack as loader data (TASKS item 133; 2026-11-22)
+
+On `claude/t133-loader-data`, cut from `land/batch-10` at `f1a4d882`; not landed. Rental H's findings put Origin's OS-defined memory types first among the likely causes of the stop at `ExitBootServices`, and the owner changed B3 for every loader (item 353, ADR-0002 Amendment 7).
+
+- **Every loader** now allocates the boot info and the kernel stack as `EfiLoaderData`, and names them by address in both maps it translates, as it already named the kernel image. The kernel sees the same region kinds and is unchanged.
+  - A region the firmware did not give as loader data is refused.
+  - A firmware region of either old type is never read as boot info.
+  - A machine-code check refuses any loader that uses either old type.
+- **A kernel-entry bench mode** (`bench-build --kernel`), never signed or shipped:
+  - it does the full bench loader's work, with no reset of any kind;
+  - after a successful call it enters the bench kernel with its breadcrumbs;
+  - it was built for the rental that would have confirmed the change.
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:**
+- **The turn on `1dd96c44` (17:28 to 19:04 UTC):** every gate passed:
+  - `check`;
+  - `reproducible-compare`, file by file: only the three loaders differ from the batch, and every kernel file is the same bytes;
+  - `boot-test`;
+  - three `boot-matrix` runs, with `boot-bench` 36 of 36 each time;
+  - all four bench builds.
+- **All seven planted controls fail for their own reason.**
+- **One independent AI review:** no High, one Medium and six Low, all answered. No person has reviewed it.
+- **Not on hardware:** the confirming rental, rental I, was cancelled by the owner before it ran (item 354), and nothing was bought. The change rests on rentals G and H's evidence alone.
+
 ## A bench build's bisection mode (TASKS item 131; 2026-11-22)
 
 On `claude/t131-bisect-mode`, cut at TASKS item 130's tip `970cfca2`, with PR 59's records merged in from `land/batch-10` at `140c467b`; not landed. Rental G's minimal program returned from `ExitBootServices` on the firmware revision where rental E's full loader stopped. Owner item 352 (ADR-0002 Amendment 6) therefore bisects what Origin's loader adds, starting with its OS-defined memory types.

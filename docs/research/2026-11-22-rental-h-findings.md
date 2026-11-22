@@ -200,7 +200,7 @@ The full bench loader's other additions are in this loader too, and so are clear
 
 ## The next step, ranked
 
-1. **An owner decision on ADR-0002 B3 itself: the normal loader's memory types.**
+1. **An owner decision on ADR-0002 B3 itself: the normal loader's memory types.** *(2026-11-22: accepted as owner item 353, ADR-0002 Amendment 7, and built by TASKS item 133 under QEMU. The confirming rental below, rental I, was cancelled by the owner before it ran, and no further rental is to be made (item 354).)*
    - **The change:** every loader would allocate the boot info and the kernel stack as `EfiLoaderData`, not as the OS-defined types `0x80000002` and `0x80000003`. Origin's own translated map would name them by address, as `memmap::carve` already names the kernel image, whose type cannot mark it (B3's own reason).
    - **The kernel would be unchanged:** it reads Origin's region kinds, not the firmware's types.
    - **What B3 gives up:** that the firmware's map identifies the two regions.

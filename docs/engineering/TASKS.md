@@ -623,7 +623,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 130. **The rental tool's reading of a minimal-program boot (rental G's findings). Numbered by the coordinating session on 2026-11-22; built the same day on `claude/t130-minimal-reading`; not landed.** Rental G's per-boot summaries counted loader runs, not firmware starts, and ended each boot before the firmware's start delay on revision 2.4a had passed, so they read a reset after each call as none. The tool now judges each run by the firmware's next byte, measures each machine's own delays, never reports "no reset" while a restart of its own is in flight, and has a replay test on rental G's real console. It also stages the full bench image.
 131. **A bench build's bisection mode (ADR-0002 Amendment 6; owner item 352). Numbered by the coordinating session on 2026-11-22; built and gated the same day on `claude/t131-bisect-mode`, and run on rental H the same day; not landed.** It builds the mode, chosen by `cargo xtask bench-build --bisect`, as Amendment 6 lists it: the full bench loader's work with the kernel stack and boot info as `EfiLoaderData`, a line that the loader's map holds no OS-defined region, Amendment 5's resets, and the live table's compare. It extends the machine-code checks and the rental tool's image kinds to it, adds QEMU scenarios and planted controls, and prepares rental H's images and dry run. Rental H goes to the owner only through the coordinating session.
 132. **A boot that prints nothing at all (TASKS item 96's turn 25). Numbered by the coordinating session on 2026-11-22; not started.** Twice, a boot of the Intel IOMMU 4-processor machine's signature scenarios gave an empty serial log and an empty QEMU stderr, with not even the loader's banner, while the same scenario passed on the 1- to 3-processor machines of the same run: TASKS item 92's run 3 and TASKS item 96's turn 25. No Origin code had run. This item finds whether it is QEMU, OVMF or `xtask`'s staging, and makes such a boot say what it saw.
-133. **The boot info and the kernel stack allocated as loader data (ADR-0002 Amendment 7; owner item 353). Numbered by the coordinating session on 2026-11-22; not started; after TASKS item 131.** Every loader allocates the boot info and the kernel stack as `EfiLoaderData`, and the translated map names them by address as boot info and kernel stack, so the kernel sees the same region kinds. It shows under QEMU that the kernel boots unchanged and that the normal images change only by this, and it prepares rental I: a bench build of the normal loader with the change, entering the bench kernel with TASKS item 112's breadcrumbs. Rental I goes to the owner only through the coordinating session.
+133. **The boot info and the kernel stack allocated as loader data (ADR-0002 Amendment 7; owner item 353). Numbered by the coordinating session on 2026-11-22; built and gated the same day on `claude/t133-loader-data`; its rental (rental I) cancelled by the owner before it ran; not landed.** Every loader allocates the boot info and the kernel stack as `EfiLoaderData`, and the translated map names them by address as boot info and kernel stack, so the kernel sees the same region kinds. It shows under QEMU that the kernel boots unchanged and that the normal images change only by this, and it prepares rental I: a bench build of the normal loader with the change, entering the bench kernel with TASKS item 112's breadcrumbs. Rental I goes to the owner only through the coordinating session.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
@@ -5110,3 +5110,79 @@ Assigned by the coordinating session on 2026-11-22, after TASKS item 130 and the
   2. the tool counting the firmware's openings (free);
   3. a control cue that survives the firmware's resets, only if another control-based run is made on 2.5a;
   4. a mark after a successful call, which rank 1's breadcrumbs make unneeded.
+
+### 133. The boot info and the kernel stack as loader data, in every loader (owner item 353; ADR-0002 Amendment 7)
+
+Assigned by the coordinating session on 2026-11-22, after the owner's "Change B3" (item 353). Built word for word against PR 61's text at `6482535a`, on `claude/t133-loader-data`, cut from `land/batch-10` at `f1a4d882` (rental H's records). The contract and its questions are in the coordination notes (`t133-contract.md`). The coordinating session ruled:
+- **Q1 (a):** a region is named by address only inside the firmware's loader data (`LoaderReclaimable` once translated); otherwise the loader refuses.
+- **Q2 (a):** firmware descriptors of `0x80000002` and `0x80000003` translate as `FirmwareOther`, so no firmware region is read as boot info and gives up its secret area, with a host test holding such a descriptor.
+- **Q3 (a):** the tables the loader builds, used until the kernel switches to its own, need no boot-time check of the guard page; the shared helper's host test covers them.
+- **Q4 (a):** a machine-code check that no loader passes either type to `AllocatePages`, with the batch's loader as its positive control.
+- **Q5 (a), within accepted text:** a kernel-entry bench flavour for the confirming rental. It has a fifth F1 flag, and no switch file decides anything on the board. The rental tool knows the image and reads a line after `X` as the call returning (R), a firmware start as its exit shutting down (S), and silence as a hang.
+- **Q6 (a):** the paired negative control, the types kept, to be decided after rental I.
+- **Q7 (a):** "the normal images change only by this" is shown by the source diff, `reproducible-compare` read file by file, `reproducible-gate`, and `boot-test` and `boot-matrix` unchanged.
+- **Q8:** three `boot-matrix` runs.
+- **Q9 (a):** one independent AI review before the turn.
+- **Q10 (a):** A02-Am7 is marked built once PR 61 is in the batch. Amendment 6's now-stale text is the coordinating session's to word.
+- **Rental I's plan:** owner item 350's, about six boots, each ending at its answer.
+
+**What was built.**
+- **The loader** (`boot/uefi/src/main.rs`, `memmap.rs`, `bench.rs`):
+  - every loader allocates the boot info and the kernel stack as `EfiLoaderData` (`STACK_TYPE`, `BOOT_INFO_TYPE`, no longer split by the bisection mode);
+  - `memmap::carve_loader_regions` names the kernel image, the kernel stack from its guard page, and the boot info by address, each only inside `LoaderReclaimable` (`carve_within`, `MapError::NotLoaderData`). It does so in both maps the loader translates: the one the page tables are built from, whose guard page they then leave unmapped, and the one boot info hands the kernel, in which the kernel looks for its secret area;
+  - `LoaderRegions::new` computes the stack's range from its base, and its `stack_guard()` is the page tables' guard, so the two cannot disagree (R133-6);
+  - a failure names the region (`MapFailure::LoaderRegion`, `CarveFailure`), before the call or inside the exit closure, where only the pure carve runs;
+  - `kind_of` translates `0x80000002` and `0x80000003` as `FirmwareOther`;
+  - **the kernel-entry mode**, `cfg(origin_bench_kernel)` (`mod kernel_entry`):
+    - before the call it does the full bench loader's work, and prints the FCH's lines without deciding anything on them;
+    - no control and no reset of Amendment 3 or 4 is compiled in (`bench_fch_decide`, `reset_without_firmware`, `write_cf9`, `bench_reset` and `triple_fault` are all left out);
+    - it reads `BENCH-AFTER` and ignores it, with a line of its own (R133-4);
+    - after `EFI_SUCCESS` it takes TASKS item 112's path into the bench kernel. After two failed calls it writes Amendment 2's line and halts, with no UART register written back (R133-3).
+- **`developer-tools/xtask`:**
+  - **`check_no_os_types`:** any instruction with either old type as an operand refuses the image. It runs first on `OLD_ALLOCATIONS`, the batch's loader's own instructions, as its control (R133-5). It runs in the reproducible gate on every normal loader, in every bench build, and on both stack-measurement loaders;
+  - **`bench-build --kernel`** into `target/bench-kernel`. It refuses the other modes' text and runs `check_kernel_code` (no `0xCF9`, with the full bench loader as its control);
+  - F1's fifth flag, Clippy for the flavour, and the signing refusal;
+  - **five kernel-entry scenarios under `boot-bench`**, 36 in all: no switch; the retry; both calls failing, then the halt; `BENCH-AFTER fadt` ignored; and `BENCH-FCH first`, read and with no control. Every scenario that enters the kernel requires the breadcrumbs.
+- **`developer-tools/bench/latitude.py`:**
+  - it names the kernel-entry image, never reads it as a reset image, and reads and keeps its boots' runs (`reads_runs`);
+  - a call reads as `returned` or `failed` from any of the loader's three lines after it: the success line, the line after the call, or Amendment 2's line. What followed is kept as `then` (R133-1, R133-2);
+  - the image takes owner item 350's six-boot plan. A returned call followed by the kernel's lines runs on to the kernel's verdict or its window.
+
+**The review.** One independent AI review of `d12f6ecf` (`docs/engineering/REVIEW_T133_2026-11-22.md`).
+- **What it was given:** the code, Amendment 7 as PR 61 words it, the rulings, and the kernel's files that read the region kinds. It was not given the author's argument.
+- **The kernel claim:** confirmed. For any layout, the carved regions are those the old types gave.
+- **The findings:** no High; one Medium (R133-1: only the success line read as a return); six Low. All are answered at `69f4c126`.
+
+**The turn** (2026-11-22, the development Mac, QEMU 11.1.3 TCG with OVMF, Rust 1.100.0), on `1dd96c44`, 17:28:18 to 19:04:28 UTC:
+- fmt and F1 passed;
+- the seven control runs, below, and Q4's control on `953cda2c`'s own loader, which the check refuses;
+- `check` passed in 864 s: 2,747 host tests passed, 0 failed, 31 ignored; Loom ran 91 models and caught 140 negative controls; every gate passed. The reproducible gate's normal loaders:
+  - the release loader, 208,384 bytes, `aa2a3fcf21f1d9d142cd524239731cdb2bbc538166c14a84f59981c16354ebfb`;
+  - `test-trust-store`, 211,456 bytes, `b77bbf262206212d1ab45d9db6fb30fce62c140fadebef09eecbe56972986e80`;
+  - `developer-mode`, 211,456 bytes, `0fe6de2ab280d94f83cfac0346dcb996a4d8002b866ef0e298831d3e797e7ffe`;
+- `reproducible-compare` against `953cda2c`'s files, the batch's, read file by file (ruling Q7): exactly the six loader files differ (the three loaders, in both builds), and the other 34, every kernel file among them, are the same bytes;
+- `boot-test` passed 11 of 11;
+- `boot-matrix` passed three times (1,550, 1,543 and 1,540 s), with its `boot-bench` 36 of 36 each time (355, 352 and 351 s);
+- `bench-build`, four ways, each with the bench kernel unchanged (2,116,880 bytes, `3bb1f2a57245b28d6f28eedddb30a06261725d7447149384b40b4827280f111f`):
+  - the full bench loader, 265,216 bytes, `c4386fb2…`;
+  - the minimal loader, 74,240 bytes, `8673f32f…`;
+  - the bisection loader, 265,216 bytes, `f3b2af38…`;
+  - the kernel-entry loader, 259,072 bytes, `a18fea7cf5b43ff257a2c0ff2f1045b7f7a05480b8ca3dd6af93847d03f655ac`;
+- rental I's images staged, and its dry run, GET requests only: six boots of 5.8 minutes, `m4-metal-small` at AMS, $0.81/h, worst case $1.62, the ledger at $6.48; nothing bought.
+
+**The controls,** each planted, run and restored, each failing for its own reason:
+- **KC-1:** the boot info not named by address. The kernel refused the loader's secret area ("not inside the boot-info region"), and `boot-test`'s marker for the loader's value was missing. The kernel still seeded its generator from RDSEED, so the contract's "the generator's proofs do not run" did not happen.
+- **KC-2:** the stack's region named from its base, not its guard page. The kernel reported "page protection violated: read of the boot stack's guard page".
+- **KC-3:** the kernel stack allocated as `0x80000003` again. `bench-build` refused the full bench loader for `mov edx, 0x80000003`.
+- **KC-4:** `0x80000002` translated as boot info again. Two host tests failed.
+- **KC-5:** the loader-data check left out. A host test failed.
+- **KC-6:** Amendment 3's reset back in the kernel-entry mode. In "bench: kernel, no switch", QEMU exited after the loader's last line: a reset where the kernel should run.
+- **KC-7:** the FCH decision, control and reset back in the kernel-entry mode. `bench-build --kernel` found `0xCF9` in DX.
+
+**Rental I: not run.** The owner said "Rent it" on 2026-11-22. Then, at about 19:44 UTC, before the coordinating session's guarded run had started, the owner said "Don't take for rentals anymore" (item 354). The run was stopped while it waited for 20:00 UTC; nothing was bought, and the ledger stays at 8 rentals, $6.48. Its staged images (`~/.local/state/origin-bench/rental-i-bench-kernel-image-1dd96c44/`, loader `a18fea7c…`, kernel `3bb1f2a5…`) stay unused and read-only.
+
+**Not shown:**
+- **the change on any machine:** Amendment 7 rests on rentals G and H, two bench modes that allocated no OS-defined type and got through the call. It does not rest on a loader with the change entering the kernel on the rented board;
+- **the paired negative control** (ruling Q6), which waited on rental I;
+- **R against S;**
+- **no person has reviewed it.**
