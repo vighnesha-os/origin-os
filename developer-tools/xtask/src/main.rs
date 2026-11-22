@@ -1468,7 +1468,7 @@ fn domain_markers(machine: &Machine, settings: &Settings, leaf_1f: bool) -> Vec<
 /// absence paths run; its tables have no `_CPC`. The round's vector is taken on every processor,
 /// and the MSR probe recovers the #GP of a reserved x2APIC address. Under KVM the host's processor
 /// decides what CPUID reports, which no CI run has shown yet: the lines are held to their starts,
-/// and the round and the probe exactly.
+/// the probe's too, and the round's processors exactly.
 fn capacity_markers(machine: &Machine, settings: &Settings) -> Vec<String> {
     let n = machine.cpus();
     let probe = "origin-kernel: capacity: MSR probe: RDMSR of the reserved x2APIC address 0x80e raised #GP and was recovered";
@@ -1478,7 +1478,9 @@ fn capacity_markers(machine: &Machine, settings: &Settings) -> Vec<String> {
             "origin-kernel: capacity: thermal LVT free on ".into(),
             "origin-kernel: capacity: HWP on ".into(),
             "origin-kernel: capacity: _CPC not read in the kernel (ADR-0019 A2); in QEMU's tables on 0 of ".into(),
-            probe.into(),
+            // Whether KVM faults on 80EH has not been seen: "not run" there is no failure (the
+            // coordinating session's ruling of 2026-11-22), so only the line's start is held.
+            "origin-kernel: capacity: MSR probe: ".into(),
             "origin-kernel: capacity: the round waited ".into(),
             format!(
                 "origin-kernel: capacity: thermal vector 0x44 sent to {n} of {n} processors, taken by {n}, "
