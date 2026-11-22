@@ -723,7 +723,7 @@ fn nvme_queued_for(cpus: u32, pairs: u32) -> u32 {
 
 /// The per-CPU tables the kernel sizes at discovery, the framework's and the kernel crate's
 /// (ADR-0008 Amendment 1, D1; `per_cpu` checks that each is sized).
-const PER_CPU_TABLES: u32 = 27;
+const PER_CPU_TABLES: u32 = 28;
 
 /// The cores of each package of the 288-processor run (`ORIGIN_QEMU_TOPOLOGY=many`, outside the
 /// gate since decision item 294).
@@ -1462,19 +1462,24 @@ fn domain_markers(machine: &Machine, settings: &Settings, leaf_1f: bool) -> Vec<
     ]
 }
 
-/// The hardware capacity proof's lines (TASKS item 106): exact under QEMU's software processor,
-/// whose CPUID reports none of the HFI, the thermal registers, HWP or AMD's CPPC, so only the
-/// absence paths run, and QEMU's tables have no `_CPC`; the thermal round taken on every processor.
-/// Under KVM the host's processor decides what CPUID reports, which no CI run has shown yet: the
-/// lines are held to their starts, and the round to every processor taking the vector.
+/// The hardware capacity proof's lines (TASKS item 106). Exact under QEMU 11.1.3's software
+/// processor, which reports the thermal registers (CPUID.01H:EDX\[22\]) and a thermal LVT entry,
+/// masked, but no thermal sensor, HFI, HWP or AMD CPPC, so no source wants the LVT and only the
+/// absence paths run; its tables have no `_CPC`. The round's vector is taken on every processor,
+/// and the MSR probe recovers the #GP of a reserved x2APIC address. Under KVM the host's processor
+/// decides what CPUID reports, which no CI run has shown yet: the lines are held to their starts,
+/// and the round and the probe exactly.
 fn capacity_markers(machine: &Machine, settings: &Settings) -> Vec<String> {
     let n = machine.cpus();
+    let probe = "origin-kernel: capacity: MSR probe: RDMSR of the reserved x2APIC address 0x80e raised #GP and was recovered";
     if settings.accel == Accel::Kvm {
         return vec![
             "origin-kernel: capacity: HFI on ".into(),
-            "origin-kernel: capacity: thermal LVT taken on ".into(),
+            "origin-kernel: capacity: thermal LVT free on ".into(),
             "origin-kernel: capacity: HWP on ".into(),
             "origin-kernel: capacity: _CPC not read in the kernel (ADR-0019 A2); in QEMU's tables on 0 of ".into(),
+            probe.into(),
+            "origin-kernel: capacity: the round waited ".into(),
             format!(
                 "origin-kernel: capacity: thermal vector 0x44 sent to {n} of {n} processors, taken by {n}, "
             ),
@@ -1483,17 +1488,19 @@ fn capacity_markers(machine: &Machine, settings: &Settings) -> Vec<String> {
     let packages = machine.geometry.packages;
     vec![
         format!(
-            "origin-kernel: capacity: HFI on 0 of {n} processors, 0 reading a row (0 past their table); {packages} packages: 0 enabled, 0 written, 0 enabled by the firmware, 0 without the thermal LVT, 0 disagreeing"
+            "origin-kernel: capacity: HFI on 0 of {n} processors, 0 reading a row of a table in use (0 past their table); packages: {packages}, taken 0, HFI enabled 0, written 0, enabled by the firmware 0, disagreeing 0, an LVT the firmware's 0"
         ),
         format!(
-            "origin-kernel: capacity: thermal LVT taken on 0 of {n} (0 the firmware's; CPUID.01H:EDX[22] on 0); heat: Intel thermal status on 0, 0 hot; AMD heat not supported at M3"
+            "origin-kernel: capacity: thermal LVT free on {n} of {n}, the firmware's on 0, taken on 0 (0 with other enables the firmware set; CPUID.01H:EDX[22] on {n}, with a sensor on 0); heat: not supported: no thermal sensor; AMD heat not supported at M3"
         ),
         format!(
             "origin-kernel: capacity: HWP on 0 of {n}, on from the firmware on 0, Highest-change interrupt on 0; AMD CPPC on 0 of {n}, on from the firmware on 0; neither is enabled here (power management's, M10)"
         ),
         "origin-kernel: capacity: _CPC not read in the kernel (ADR-0019 A2); in QEMU's tables on 0 of ".into(),
+        probe.into(),
+        "origin-kernel: capacity: the round waited ".into(),
         format!(
-            "origin-kernel: capacity: thermal vector 0x44 sent to {n} of {n} processors, taken by {n}, 0 with a source; 0 of 0 packages read back, 0 enabled again; 0 table updates; registers that faulted 0, enables not read back 0; source 5, capacity 1024 on {n} of {n}; consistent true"
+            "origin-kernel: capacity: thermal vector 0x44 sent to {n} of {n} processors, taken by {n}, 0 with a source, 0 quiet; 0 packages asked to enable the HFI, 0 answered; 0 table updates; processors with a register that faulted 0, with an enable not read back 0; source 5, capacity 1024 on {n} of {n}; consistent true"
         ),
     ]
 }

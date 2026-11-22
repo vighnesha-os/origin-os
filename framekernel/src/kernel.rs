@@ -746,8 +746,9 @@ fn prove_ibpb(
 /// A Report proof (ADR-0013 R3): it fails, and the boot goes on, when a register CPUID claims
 /// raised #GP, an enable did not read back, a package's processors disagree on its table or its
 /// HFI failed or found no memory, a row lies past its table, an acknowledgement faulted, a
-/// processor recorded no topology, or a processor did not take the round's vector within a second.
-/// Under QEMU only the absence paths run.
+/// processor recorded no topology, a processor did not take the round's vector or a package's
+/// first processor did not answer within ten seconds, or the MSR probe did not recover the #GP of
+/// a reserved x2APIC address. Under QEMU only the absence paths run.
 fn prove_capacity(
     flow: origin_frame::trap::Pinned<'_>,
     com1: &mut Console,
@@ -755,25 +756,35 @@ fn prove_capacity(
 ) -> bool {
     use origin_frame::hfi;
     let n = cpus.len();
-    let round = hfi::round(flow, cpus, time::monotonic_nanos, 1_000_000_000);
+    // Ten seconds, as the generator's proof waits for every processor: the wait ends as soon as
+    // each has taken the vector, so a correct boot pays nothing for it (the review's R106-3).
+    let round = hfi::round(flow, cpus, time::monotonic_nanos, 10_000_000_000);
+    let probe = hfi::reserved_x2apic_read_faults(cpu::this_cpu(flow.here()));
     let c = hfi::census(cpus);
     let _ = writeln!(
         com1,
-        "origin-kernel: capacity: HFI on {} of {n} processors, {} reading a row ({} past their table); {} packages: {} enabled, {} written, {} enabled by the firmware, {} without the thermal LVT, {} disagreeing",
+        "origin-kernel: capacity: HFI on {} of {n} processors, {} reading a row of a table in use ({} past their table); packages: {}, taken {}, HFI enabled {}, written {}, enabled by the firmware {}, disagreeing {}, an LVT the firmware's {}",
         c.hfi,
         c.hfi_members,
         c.rows_past,
         c.packages,
+        c.taken,
         c.enabled,
         c.written,
         c.firmware_hfi,
-        c.no_lvt,
         c.disagree,
+        c.no_lvt,
     );
     let _ = writeln!(
         com1,
-        "origin-kernel: capacity: thermal LVT taken on {} of {n} ({} the firmware's; CPUID.01H:EDX[22] on {}); heat: Intel thermal status on {}, {} hot; AMD heat not supported at M3",
-        c.lvt_taken, c.lvt_firmware, c.thermal_registers, c.heat, c.hot,
+        "origin-kernel: capacity: thermal LVT free on {} of {n}, the firmware's on {}, taken on {} ({} with other enables the firmware set; CPUID.01H:EDX[22] on {}, with a sensor on {}); {}; AMD heat not supported at M3",
+        c.lvt_free,
+        c.lvt_firmware,
+        c.lvt_taken,
+        c.other_enables,
+        c.thermal_registers,
+        c.sensors,
+        hfi::HeatClause(&c),
     );
     let _ = writeln!(
         com1,
@@ -791,6 +802,22 @@ fn prove_capacity(
             "origin-kernel: capacity: _CPC not read in the kernel (ADR-0019 A2); the AML proof ran no AML on these tables"
         ),
     };
+    // The #GP path shown where the processor faults there; a read without a fault is not run,
+    // never failed (the coordinating session's ruling of 2026-11-22).
+    let _ = writeln!(
+        com1,
+        "origin-kernel: capacity: MSR probe: {}",
+        match probe {
+            Some(true) => "RDMSR of the reserved x2APIC address 0x80e raised #GP and was recovered",
+            Some(false) => "#GP path not shown: 0x80e read without a fault (not run)",
+            None => "#GP path not shown: the local APIC is not in x2APIC mode (not run)",
+        }
+    );
+    let _ = writeln!(
+        com1,
+        "origin-kernel: capacity: the round waited {} ms",
+        round.waited_ns / 1_000_000
+    );
     let capacity: alloc::vec::Vec<u16> = cpus
         .iter()
         .map(|i| crate::capacity::current(i.get()))
@@ -800,29 +827,36 @@ fn prove_capacity(
         capacity.iter().copied().max().unwrap_or(0),
     );
     let consistent = c.sound()
+        && round.registered
         && round.sent as usize == n
         && round.handled as usize == n
-        && round.read_back == round.asked;
+        && round.answered == round.asked;
     let _ = write!(
         com1,
-        "origin-kernel: capacity: thermal vector {:#x} sent to {} of {n} processors, taken by {}, {} with a source; {} of {} packages read back, {} enabled again; {} table updates; registers that faulted {}",
+        "origin-kernel: capacity: thermal vector {:#x} sent to {} of {n} processors, taken by {}, {} with a source, {} quiet; {} packages asked to enable the HFI, {} answered; {} table updates; processors with a register that faulted {}",
         cpu::THERMAL_VECTOR,
         round.sent,
         round.handled,
         round.sourced,
-        round.read_back,
+        c.quiet,
         round.asked,
-        c.reenabled,
+        round.answered,
         c.updates,
         c.faulted,
     );
+    if let Some(id) = round.unanswered {
+        let _ = write!(
+            com1,
+            " (package {id}'s first processor did not answer: its HFI stays off)"
+        );
+    }
     if let Some(msr) = c.first_fault {
         let _ = write!(com1, " (first {msr:#x})");
     }
     let (number, _) = source_named(hfi::source());
     let _ = write!(
         com1,
-        ", enables not read back {}; source {number}, capacity {low}",
+        ", with an enable not read back {}; source {number}, capacity {low}",
         c.mismatched
     );
     if high != low {
@@ -1704,7 +1738,10 @@ fn prove_domains(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -
     // TASKS item 106): an HFI row counts only once its package's table has been read, so at boot
     // the source is a register or none. The domains keep this boot value; placement reads
     // `capacity::current`, which the thermal interrupt keeps live.
-    let source = origin_frame::hfi::start_capacity().unwrap_or_else(origin_frame::hfi::source);
+    // It first waits, as the generator's proof does, for every processor to have read its sources
+    // (the review's R106-8).
+    let started = origin_frame::hfi::start_capacity(cpus, time::monotonic_nanos, 10_000_000_000);
+    let source = started.map_or_else(origin_frame::hfi::source, |(s, _)| s);
     let capacity: Vec<u16> = cpus
         .iter()
         .map(|c| crate::capacity::current(c.get()))
@@ -1719,6 +1756,9 @@ fn prove_domains(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -
         let _ = write!(com1, " to {high}");
     }
     let (number, why) = source_named(source);
+    if let Some((_, k)) = started.filter(|&(_, k)| k < n) {
+        let _ = write!(com1, " ({k} of {n} had read their sources)");
+    }
     let _ = writeln!(
         com1,
         " on {n} of {n} processors at boot (ADR-0020 S9 source {number}: {why}); consistent {consistent}{}",

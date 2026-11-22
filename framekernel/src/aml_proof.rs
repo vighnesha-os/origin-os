@@ -1439,12 +1439,17 @@ fn walk<H: Host>(
             }
             let cpc = child_named(i, node, *b"_CPC").map(|c| {
                 let result = i.evaluate_node(c, &[]);
-                crate::cpc::outcome(
-                    result
-                        .as_ref()
-                        .map(Option::as_ref)
-                        .map_err(|e| allowed(e, &seen)),
-                )
+                // Any refused region counts as a refusal here, PCC's among them, not only the
+                // spaces the walk allows (the review's R106-17).
+                crate::cpc::outcome(result.as_ref().map(Option::as_ref).map_err(|e| {
+                    matches!(
+                        e.kind,
+                        ErrorKind::Region {
+                            cause: HostError::Refused,
+                            ..
+                        }
+                    ) || allowed(e, &seen)
+                }))
             });
             w.cpc.count(cpc);
         }
