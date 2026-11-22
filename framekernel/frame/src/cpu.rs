@@ -972,11 +972,18 @@ impl Quiet for Quietly {
     fn quietly<R>(&self, f: impl FnOnce() -> R) -> R {
         let start = rdtsc();
         let result = without_interrupts(f);
-        let took = rdtsc().saturating_sub(start);
-        GATED_SCANS.fetch_add(1, Ordering::Relaxed);
-        GATED_LONGEST.fetch_max(took, Ordering::Relaxed);
+        note_gated(rdtsc().saturating_sub(start));
         result
     }
+}
+
+/// Counts one gated pass that took `took` TSC ticks. Not generic and not inlined: `quietly` is
+/// generic, and a static it named directly would be exported and reached through the GOT
+/// (`contexts_cover`'s count in TASKS item 96's recount turn).
+#[inline(never)]
+fn note_gated(took: u64) {
+    GATED_SCANS.fetch_add(1, Ordering::Relaxed);
+    GATED_LONGEST.fetch_max(took, Ordering::Relaxed);
 }
 
 /// How many scans made their pass under the move gate, and the longest of them in TSC ticks, its

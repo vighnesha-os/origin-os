@@ -816,6 +816,10 @@ mod waking {
     impl Queues for KernelQueues<'_> {
         type Queue = RunQueue<Placed>;
 
+        // Inlined into the location loop, as before TASKS item 96: with the loop also in the
+        // out-of-line retry after pinned mode, LLVM would otherwise make it a call on every
+        // wake-up's look (the recount turn's figures).
+        #[inline(always)]
         fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut RunQueue<Placed>) -> R) -> Option<R> {
             let queue = QUEUES.get(usize::try_from(cpu).ok()?)?;
             // Interrupts are off: only `within`'s section makes `self`.
