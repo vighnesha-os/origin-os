@@ -1297,6 +1297,9 @@ def loader_kind(path):
     """What the image directory's loader is: a bench build's says so in its own bytes (TASKS
     items 112 and 116, F2's text)."""
     data = Path(path).read_bytes() if Path(path).exists() else b""
+    if b"bench build: minimal" in data:
+        return ("the minimal-mode bench loader (ADR-0002 Amendment 5; developer-mode, the TEST "
+                "trust store; never signed or shipped)")
     if b"bench build" in data:
         return "the bench loader (developer-mode, the TEST trust store; never signed or shipped)"
     return "developer-mode loader"

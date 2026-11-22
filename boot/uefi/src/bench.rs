@@ -1714,4 +1714,48 @@ mod tests {
                 .contains("does not check, so it was not compared")
         );
     }
+
+    /// An ACPI table with `signature` and `body`.
+    fn table(signature: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut t = vec![0u8; 36];
+        t[..4].copy_from_slice(signature);
+        t[8] = 1;
+        t[10..16].copy_from_slice(b"ORIGIN");
+        t.extend_from_slice(body);
+        let len = t.len() as u32;
+        t[4..8].copy_from_slice(&len.to_le_bytes());
+        seal(&mut t, 9);
+        t
+    }
+
+    #[test]
+    fn the_stand_in_table_is_found_by_its_signature_and_bounded() {
+        use crate::fch::{STAND_IN_MAX, find_stand_in};
+        const TABLE_AT: u64 = 0x9000_4000;
+        let found = |entries: &[u64], body: &[u8]| {
+            let memory = vec![
+                (RSDP_AT, rsdp(XSDT_AT)),
+                (XSDT_AT, xsdt(entries)),
+                (OTHER_AT, table(b"SSDT", b"x")),
+                (TABLE_AT, table(b"OXFC", body)),
+            ];
+            find_stand_in(RSDP_AT, &mut |at, out| read_from(&memory, at, out))
+                .map(|(bytes, n)| bytes[..n].to_vec())
+        };
+        assert_eq!(
+            found(&[OTHER_AT, TABLE_AT], b"mine stale1"),
+            Some(b"mine stale1".to_vec())
+        );
+        assert_eq!(found(&[OTHER_AT], b"mine"), None, "not listed");
+        assert_eq!(
+            found(&[OTHER_AT, TABLE_AT], &[b'x'; STAND_IN_MAX + 1]),
+            None,
+            "too long"
+        );
+        assert_eq!(
+            found(&[TABLE_AT], &[b'y'; STAND_IN_MAX]).map(|b| b.len()),
+            Some(STAND_IN_MAX)
+        );
+        assert_eq!(find_stand_in(0, &mut |_, _| true), None, "no RSDP");
+    }
 }

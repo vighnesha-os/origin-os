@@ -738,11 +738,16 @@ impl Pretend {
     }
 
     /// [`Pretend::values`] for the minimal mode (ADR-0002 Amendment 5): `mine` names the minimal
-    /// mode's own record, a shutdown (`PMxC0` bit 23), not a `0x06` to `0xCF9`.
+    /// mode's own record, a shutdown (`PMxC0` bit 23), not a `0x06` to `0xCF9`; and `noshutdown`
+    /// clears the shutdown message (`PMx74` bit 17), so the decision itself takes Amendment 3's
+    /// order after the call, and says so.
     pub const fn values_minimal(self, pm1a_event: Option<u16>) -> Registers {
         let mut r = self.values(pm1a_event);
         if matches!(self.kind, Kind::Mine) {
             r.reset_status = LAST_RESET_SHUTDOWN;
+        }
+        if self.no_shutdown && !matches!(self.kind, Kind::Bad) {
+            r.acpi_config &= !SHUTDOWN_MESSAGE;
         }
         r
     }
@@ -2289,6 +2294,18 @@ mod tests {
         );
         let first = Pretend::from_contents(b"first").unwrap();
         assert_eq!(first.values_minimal(Some(0x800)), first.values(Some(0x800)));
+        let quiet = Pretend::from_contents(b"norecord noshutdown").unwrap();
+        assert_eq!(
+            quiet.values_minimal(Some(0x800)).acpi_config & SHUTDOWN_MESSAGE,
+            0
+        );
+        assert_eq!(
+            MinimalDecision::of(Some(&quiet.values_minimal(Some(0x800))), Some(0x800)),
+            MinimalDecision::Call {
+                why: CallWhy::NoRecord(RESET_STATUS_AT_POWER_ON),
+                shutdown: false
+            }
+        );
         assert_eq!(
             Branch::of_mine(LAST_RESET_SHUTDOWN, LAST_RESET_SHUTDOWN),
             Branch::Mine

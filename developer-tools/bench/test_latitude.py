@@ -450,6 +450,9 @@ class Guards(unittest.TestCase):
         self.assertIn("the bench loader", self.lat.loader_kind(bench))
         bench.write_bytes(b"MZ...origin-boot: ...")
         self.assertEqual(self.lat.loader_kind(bench), "developer-mode loader")
+        # TASKS item 128: the minimal mode names itself.
+        bench.write_bytes(b"MZ...origin-boot: bench build: minimal: the minimal-program mode")
+        self.assertIn("the minimal-mode bench loader", self.lat.loader_kind(bench))
 
     def test_redact_removes_mac_addresses_and_the_guid(self):
         text = ("Boot0003* UEFI PXE IPv4: Intel(R) Ethernet Controller X550(MAC:020000000001)\n"

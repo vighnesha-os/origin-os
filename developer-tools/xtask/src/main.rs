@@ -110,7 +110,10 @@ commands:
   bench-build the bench build (TASKS item 112): the developer-mode loader and the kernel with
               breadcrumbs on the SPCR's UART, into target/bench; prints each image's size and
               SHA-256 (target/bench/xtask/BOOTX64.EFI and KERNEL.ONBF), for a rental. Never
-              signed, never shipped
+              signed, never shipped. With --minimal, also the loader's minimal-program mode
+              (ADR-0002 Amendment 5; TASKS item 128), staged with the bench kernel in
+              target/bench-minimal/xtask, and its machine code checked: no 0xCF9 anywhere,
+              and only the status compare and branches between the call and the triple fault
   boot-bench  Clippy over the bench code, bench-build, and four boots with the SPCR naming
               COM2: ExitBootServices given the firmware's key, a stale key once (the retry),
               twice (the halt, which says why and then nothing), and the bench kernel under the
@@ -370,15 +373,20 @@ enum Loader {
     MeasureNormal,
     /// The same of the bench loader, into `target/stack-measure/bench`.
     MeasureBench,
+    /// TASKS item 128: the bench loader's minimal-program mode (ADR-0002 Amendment 5), into
+    /// `target/bench-minimal` (`bench::build_minimal_loader`).
+    BenchMinimal,
 }
 
 impl Loader {
     /// The Cargo feature this build needs.
     fn feature(self) -> &'static str {
         match self {
-            Self::Developer | Self::Bench | Self::MeasureNormal | Self::MeasureBench => {
-                "developer-mode"
-            }
+            Self::Developer
+            | Self::Bench
+            | Self::BenchMinimal
+            | Self::MeasureNormal
+            | Self::MeasureBench => "developer-mode",
             Self::Verifying => "test-trust-store",
         }
     }
@@ -4605,6 +4613,9 @@ fn main() -> ExitCode {
         ["boot-console"] => in_turn_with_settings("boot-console", boot_console),
         ["boot-bench"] => in_turn_with_settings("boot-bench", bench::boot),
         ["bench-build"] => in_turn("bench-build", || bench::build().map(|_| ())),
+        ["bench-build", "--minimal"] => in_turn("bench-build --minimal", || {
+            bench::build_minimal().map(|_| ())
+        }),
         ["bench-gate"] => bench::gate(),
         ["stack-depth"] => in_turn_with_settings("stack-depth", stack_depth::run),
         ["boot-bridge"] => in_turn_with_settings("boot-bridge", boot_bridge),
@@ -6918,6 +6929,7 @@ fn collect_files(
 fn build_loader(loader: Loader) -> Result<PathBuf> {
     match loader {
         Loader::Bench => bench::build_loader(),
+        Loader::BenchMinimal => bench::build_minimal_loader(),
         Loader::MeasureNormal => stack_depth::build_loader(false),
         Loader::MeasureBench => stack_depth::build_loader(true),
         _ => build_loader_in(Some(loader.feature()), None),
