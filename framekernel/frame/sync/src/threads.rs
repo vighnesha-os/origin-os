@@ -271,9 +271,12 @@ impl<S> Record<S> {
 
     /// Whether the thread was declared movable. A mover, under the lock of the queue that holds
     /// the thread, which orders it after the spawner's declaration; anyone else, as a fact about
-    /// the thread that does not change while it lives.
+    /// the thread that does not change while it lives. Acquire, paired with [`Block::take`]'s
+    /// Release store of a new thread's flag, so a reader that finds the new thread's flag also
+    /// finds its new generation (the kernel's `sched::followed`; the review of TASKS item 96,
+    /// R96-5).
     pub fn movable(&self) -> bool {
-        self.movable.load(Relaxed)
+        self.movable.load(Acquire)
     }
 }
 
@@ -364,7 +367,9 @@ impl<S, const N: usize> Block<S, N> {
         // the one write of the count that is not its running thread's (TASKS item 93, ruling Q9).
         record.pins.store(0, Relaxed);
         // Pinned, as every thread is unless its spawner declares it movable (TASKS item 96).
-        record.movable.store(false, Relaxed);
+        // Release, after the new generation: a reader whose Acquire load finds this value also
+        // finds the generation that goes with it (`Record::movable`; R96-5).
+        record.movable.store(false, Release);
         Some((index, generation))
     }
 

@@ -1041,6 +1041,17 @@ pub(crate) fn wakes_followed() -> u64 {
     WAKES_FOLLOWED.load(Ordering::Relaxed)
 }
 
+/// Moves wake-ups followed of threads that ended, their records going to new threads, before the
+/// follows were counted ([`followed`]): neither a movable thread's nor another's, since only the
+/// followed thread's own generation tells which it was (the review of TASKS item 96, R96-5). The
+/// delivery proof reports them; no settle judges them.
+static FOLLOWS_UNCLASSED: AtomicU64 = AtomicU64::new(0);
+
+/// How many follows were of threads gone before they were counted ([`FOLLOWS_UNCLASSED`]).
+pub(crate) fn follows_unclassed() -> u64 {
+    FOLLOWS_UNCLASSED.load(Ordering::Relaxed)
+}
+
 /// Makes `thread` ready, wherever it is (`origin_sync::threads::wake`). If it was blocked on
 /// another processor, that processor is sent a reschedule IPI (to its APIC ID), so it switches to
 /// the thread now rather than at its next timer tick. Returns whether an IPI was sent, so a
@@ -1097,7 +1108,7 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
             Outcome::Reached { .. } | Outcome::Stale | Outcome::Gone => {}
         }
         if woke.retries != 0 {
-            followed(record, woke.retries, here);
+            followed(record, thread.generation, woke.retries, here, true);
         }
         match woke.outcome {
             Outcome::Reached { ready: true, cpu } => ipi_if_elsewhere(cpu, here),
@@ -1168,7 +1179,7 @@ fn wake_inconsistent<'a>(
         },
     );
     if woke.retries != 0 {
-        followed(record, woke.retries, here);
+        followed(record, generation, woke.retries, here, false);
     }
     match woke.outcome {
         Outcome::Reached { ready: true, cpu } => ipi_if_elsewhere(cpu, here),
@@ -1184,24 +1195,50 @@ fn wake_inconsistent<'a>(
     }
 }
 
-/// The moves a wake-up followed, out of line (TASKS item 96, the coordinating session's rulings Q8
-/// and Q13): of a movable thread, by this processor's count (`threads::Follows`), which the
-/// delivery proof reports; of any other, [`WAKES_FOLLOWED`], an inconsistency the settles judge.
-/// In the wake-up's section, under its witness. A debug build also stops on more than 8 follows
-/// of a movable thread, which pacing rules out; every build reports them.
+/// The moves a wake-up of the thread `record` and `generation` name followed, out of line (TASKS
+/// item 96, the coordinating session's rulings Q8 and Q13): of a movable thread, by this
+/// processor's count (`threads::Follows`), which the delivery proof reports; of any other,
+/// [`WAKES_FOLLOWED`], an inconsistency the settles judge. In the wake-up's section, under its
+/// witness.
+///
+/// **Whose flag** (the review of TASKS item 96, R96-5). Read after the location loop, with no
+/// lock, the movable flag may already be a new thread's: the followed one may have ended and its
+/// record gone to another. So the generation is read before the flag and after it, and both must
+/// be the name's. `Block::take` stores a new thread's flag with Release after its new generation,
+/// and `Record::movable` loads it with Acquire, so a flag read from a new thread comes with the new
+/// generation. Follows whose thread is gone are counted apart ([`FOLLOWS_UNCLASSED`]).
+///
+/// **Pacing.** On a wake-up's common path (`paced`), a debug build also stops on more than 8
+/// follows of a movable thread, which pacing rules out; every build reports them. Not after an
+/// inconsistency, where the loop has run its `WAKE_TRIES` and S20 goes on pinned (R96-7).
 #[cold]
 #[inline(never)]
-fn followed(record: &Record<threads::State>, retries: u32, here: origin_frame::trap::Here<'_>) {
-    if record.movable() {
-        debug_assert!(
-            retries <= 8,
-            "a wake-up followed a movable thread {retries} times: moves were not paced"
-        );
-        if let Some(follows) = threads::follows_here(cpu::this_cpu(here)) {
-            follows.note(retries);
+fn followed(
+    record: &Record<threads::State>,
+    generation: u32,
+    retries: u32,
+    here: origin_frame::trap::Here<'_>,
+    paced: bool,
+) {
+    let movable = (record.generation() == generation)
+        .then(|| record.movable())
+        .filter(|_| record.generation() == generation);
+    match movable {
+        Some(true) => {
+            debug_assert!(
+                !paced || retries <= 8,
+                "a wake-up followed a movable thread {retries} times: moves were not paced"
+            );
+            if let Some(follows) = threads::follows_here(cpu::this_cpu(here)) {
+                follows.note(retries);
+            }
         }
-    } else {
-        WAKES_FOLLOWED.fetch_add(u64::from(retries), Ordering::Relaxed);
+        Some(false) => {
+            WAKES_FOLLOWED.fetch_add(u64::from(retries), Ordering::Relaxed);
+        }
+        None => {
+            FOLLOWS_UNCLASSED.fetch_add(u64::from(retries), Ordering::Relaxed);
+        }
     }
 }
 

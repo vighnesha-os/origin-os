@@ -899,6 +899,7 @@ pub(crate) fn prove_delivery(
     let settled_before = sched::settle(tsc_hz);
     let before = counts();
     let follows_before = crate::threads::follows();
+    let unclassed_before = sched::follows_unclassed();
     let receivers = cpus.len() * PER_CPU;
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
@@ -1008,6 +1009,7 @@ pub(crate) fn prove_delivery(
             o.wrapping_sub(follows_before.2),
         )
     };
+    let unclassed = sched::follows_unclassed().wrapping_sub(unclassed_before);
     // The path the proof is for: a token's wake-up carried across a move (R96-2).
     let reached = moves.carried_token != 0;
     let (made, carried, carried_token, refused) = (
@@ -1039,7 +1041,7 @@ pub(crate) fn prove_delivery(
     let pinned_mode = pinned::entered();
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: thread migration: delivery: {receivers} movable receivers and {} pinned senders, {posted} tokens posted, {taken} taken, {short} receivers short; spawned {spawned}; ended {ended}; heap, frames and stacks back {back}; {made} moves, {carried} carrying a pending wake-up, {carried_token} of them with a token not yet taken, refused: {refusals}; wake-ups followed {follows} moves of movable threads, the most one followed {most}, {over_eight} followed more than 8; a sender's wake-up that followed a move: longest {} ticks ({} ns) with {} follows; one that followed none: longest {} ticks ({} ns); senders' wake-up sections: {wakes}; their null sections, each as long as their wake-ups' recent median: {nulls}{}{}{}",
+        "origin-kernel: scheduler: thread migration: delivery: {receivers} movable receivers and {} pinned senders, {posted} tokens posted, {taken} taken, {short} receivers short; spawned {spawned}; ended {ended}; heap, frames and stacks back {back}; {made} moves, {carried} carrying a pending wake-up, {carried_token} of them with a token not yet taken, refused: {refusals}; wake-ups followed {follows} moves of movable threads, the most one followed {most}, {over_eight} followed more than 8, {unclassed} of threads gone before they were counted; a sender's wake-up that followed a move: longest {} ticks ({} ns) with {} follows; one that followed none: longest {} ticks ({} ns); senders' wake-up sections: {wakes}; their null sections, each as long as their wake-ups' recent median: {nulls}{}{}{}",
         cpus.len(),
         spans.0,
         nanos(spans.0, tsc_hz),
