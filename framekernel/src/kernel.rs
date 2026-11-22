@@ -335,7 +335,8 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         let held = cpu::cpu_states_holding(online.cpus()) == online.cpus().len();
         record_or_stop(&mut com1, &mut proofs, Proof::CpuState, held);
         // ADR-0020 S6: every processor online saves its FPU state as the boot processor does,
-        // and so may take part in moves. Report until a mover reads it (TASKS item 96).
+        // and so may take part in moves. A failure withdraws moves to and from a processor that
+        // does not, which the mover withholds (TASKS item 96; its review's R96-14).
         proofs.record(
             Proof::FpuFormat,
             cpu::fpu_formats_alike(online.cpus()) == online.cpus().len(),

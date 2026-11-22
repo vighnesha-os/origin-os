@@ -83,7 +83,7 @@ proofs! {
     Iommu "IOMMU bring-up" => Withdraw("no device drivers");
     Processors "application processors" => Withdraw("fewer processors");
     CpuState "per-processor control state" => Refuse;
-    FpuFormat "FPU format" => Report;
+    FpuFormat "FPU format" => Withdraw("thread moves to or from that processor");
     SpeculationControls "speculation controls" => Report;
     Nospec "index and address clamps" => Refuse;
     BootSteps "boot steps run once" => Refuse;
@@ -284,10 +284,11 @@ mod tests {
     ];
 
     /// Every proof whose failure withholds a capability (ADR-0013 R2, Amendment 1).
-    const WITHDRAWING: [Proof; 8] = [
+    const WITHDRAWING: [Proof; 9] = [
         Proof::BusMasterQuiesce,
         Proof::Iommu,
         Proof::Processors,
+        Proof::FpuFormat,
         Proof::Random,
         Proof::MigrationDelivery,
         Proof::Pcie,
@@ -362,8 +363,13 @@ mod tests {
             Consequence::Withdraw("no thread moves")
         );
         assert_eq!(Proof::MigrationIntegrity.consequence(), Consequence::Refuse);
-        // ADR-0020 S6 (TASKS item 94): reported until a mover reads the flag, by R3.
-        assert_eq!(Proof::FpuFormat.consequence(), Consequence::Report);
+        // ADR-0020 S6 (TASKS items 94 and 96): the mover withholds a processor whose FPU format
+        // differs (`sched::Unmoved::FpuFormat`), so a failure withdraws moves to and from it, as
+        // ADR-0013's row foresaw (the review of TASKS item 96, R96-14).
+        assert_eq!(
+            Proof::FpuFormat.consequence(),
+            Consequence::Withdraw("thread moves to or from that processor")
+        );
         assert_eq!(Proof::FpuFormat.name(), "FPU format");
     }
 
