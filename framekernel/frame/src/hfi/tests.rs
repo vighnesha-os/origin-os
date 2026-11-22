@@ -204,7 +204,8 @@ impl PackageHardware for Model {
         (!self.fault_status).then_some(self.status)
     }
 
-    fn write_status(&mut self, value: u64) -> bool {
+    fn acknowledge(&mut self, status: u64) -> bool {
+        let value = acknowledgement(status);
         if self.fault_ack {
             return false;
         }
@@ -268,7 +269,10 @@ fn rows_now(table: &[u8], shape: HfiShape, members: &[(usize, u16)], n: usize) -
 /// A table of `shape` with `rows` rows of random cells, and random flags.
 fn random_table(rng: &mut Rng, shape: HfiShape, rows: usize) -> Vec<u8> {
     let len = shape.row_offset(rows as u16).unwrap_or(0);
-    (0..len).map(|_| rng.byte()).collect()
+    let mut t: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+    // A table the processor wrote has a timestamp.
+    t[0] |= 1;
+    t
 }
 
 /// A package not yet written gives no value: the table is all zero and bit 26 clear, so nothing
@@ -291,6 +295,7 @@ fn two_processors_take_one_notification() {
     let shape = HfiShape::from_cpuid(eax(false), 0, 0b11).unwrap();
     let members = [(0, 0), (1, 1)];
     let mut table = vec![0u8; 32];
+    table[0] = 1;
     table[16] = 200;
     table[17] = 100;
     table[24] = 0;
@@ -327,7 +332,9 @@ fn two_processors_take_one_notification() {
 #[test]
 fn faults_and_rows_past_the_table() {
     let shape = HfiShape::from_cpuid(eax(false), 0, 0b11).unwrap();
-    let mut hw = Model::new(vec![0; 24]);
+    let mut written = vec![0; 24];
+    written[0] = 1;
+    let mut hw = Model::new(written);
     hw.status = STATUS_CHANGED;
     hw.fault_status = true;
     let mut view: View = vec![None; 3];
@@ -342,7 +349,7 @@ fn faults_and_rows_past_the_table() {
     assert_eq!(view[1], Some(None), "row 5 lies past a 24-byte table");
     assert!(view[0].unwrap().is_some());
     // A table too short for its flags.
-    let mut short = Model::new(vec![0; 8]);
+    let mut short = Model::new(vec![1; 8]);
     short.status = STATUS_CHANGED;
     assert_eq!(
         serve(&mut short, shape, &[(0, 0)], &mut view),
@@ -548,5 +555,128 @@ fn handler_model() {
         at(99),
         samples[samples.len() - 1],
         samples.len()
+    );
+}
+
+/// A bit 26 set over a table whose timestamp is still 0, as a bit left by a firmware's disable
+/// would be: nothing is read, nothing reads as "avoid", and the bit is acknowledged so that the
+/// processor can write (the review's R106-7).
+#[test]
+fn a_set_bit_over_an_unwritten_table_reads_nothing() {
+    let shape = HfiShape::from_cpuid(eax(false), 0, 0b11).unwrap();
+    let mut hw = Model::new(vec![0; 32]);
+    hw.status = STATUS_CHANGED | (1 << 1);
+    let mut view: View = vec![None; 2];
+    let (out, ran) = serve(&mut hw, shape, &[(0, 0), (1, 1)], &mut view);
+    assert_eq!((out, ran), (Serviced::Unwritten, false));
+    assert_eq!(view, vec![None, None]);
+    assert_eq!(hw.status & STATUS_CHANGED, 0, "acknowledged");
+    assert_eq!(hw.status & (1 << 1), 1 << 1, "the log kept");
+    // The processor's first write then follows, and is read.
+    let mut table = vec![0u8; 32];
+    table[0] = 9;
+    table[16] = 100;
+    hw.pending = Some(table.clone());
+    hw.hardware();
+    let (out, _) = serve(&mut hw, shape, &[(0, 0), (1, 1)], &mut view);
+    assert!(matches!(out, Serviced::Updated(_)));
+    assert_eq!(view, rows_now(&table, shape, &[(0, 0), (1, 1)], 2));
+}
+
+/// Idle is forced only with bit 1 in every class-0 capability's flag the table reports (SDM Vol.
+/// 3, §17.6.7; the review's R106-11).
+#[test]
+fn force_idle_needs_every_capability() {
+    let both = HfiShape::from_cpuid(eax(false), 0, 0b11).unwrap();
+    let performance = HfiShape::from_cpuid(eax(false), 0, 0b01).unwrap();
+    let flags = |p: bool, e: bool| HfiFlags {
+        performance_force_idle: p,
+        efficiency_force_idle: e,
+        ..HfiFlags::default()
+    };
+    assert!(force_idle(flags(true, true), both));
+    assert!(!force_idle(flags(true, false), both));
+    assert!(!force_idle(flags(false, true), both));
+    assert!(force_idle(flags(true, false), performance));
+    assert!(!force_idle(flags(false, false), performance));
+}
+
+/// Heat needs a sensor beside the registers, and the LVT is wanted only by a source that would use
+/// it: under QEMU 11.1.3's software processor, which reports CPUID.01H:EDX[22] and neither sensor,
+/// nothing wants it.
+#[test]
+fn heat_needs_a_sensor_and_the_lvt_a_source() {
+    let qemu = Words {
+        edx1: ACPI,
+        eax6: 1 << 2,
+        ..Words::default()
+    };
+    assert!(qemu.thermal_registers() && !qemu.thermal_sensor() && !qemu.heat());
+    assert!(!qemu.wants_lvt(false) && !qemu.wants_lvt(true));
+    let tm1 = Words {
+        edx1: ACPI | (1 << 29),
+        ..Words::default()
+    };
+    let dts = Words {
+        edx1: ACPI,
+        eax6: 1,
+        ..Words::default()
+    };
+    assert!(tm1.heat() && dts.heat() && tm1.wants_lvt(false) && dts.wants_lvt(false));
+    // A sensor without the registers is no heat.
+    assert!(
+        !Words {
+            edx1: 1 << 29,
+            ..Words::default()
+        }
+        .heat()
+    );
+    // HWP's interrupt wants the LVT only where the firmware has HWP on.
+    let hwp = Words {
+        edx1: ACPI,
+        eax6: (1 << 7) | (1 << 8) | (1 << 15),
+        ..Words::default()
+    };
+    assert!(!hwp.wants_lvt(false) && hwp.wants_lvt(true));
+    // The HFI wants it.
+    let hfi = Words {
+        edx1: ACPI,
+        eax6: eax(false),
+        edx6: 0b11,
+        ..Words::default()
+    };
+    assert!(hfi.wants_lvt(false));
+    // Without the registers nothing does.
+    assert!(!Words { edx1: 0, ..hfi }.wants_lvt(true));
+}
+
+/// Heat's clause on the proof's line: under QEMU's software processor, which has the registers and
+/// no sensor, it says heat is not supported and why, never a silent 0 (the coordinating session's
+/// ruling of 2026-11-22).
+#[test]
+fn heat_without_a_sensor_says_it_is_not_supported() {
+    let clause = |c: Census| alloc::format!("{}", HeatClause(&c));
+    let qemu = Census {
+        processors: 4,
+        started: 4,
+        thermal_registers: 4,
+        ..Census::default()
+    };
+    assert_eq!(clause(qemu), "heat: not supported: no thermal sensor");
+    assert_eq!(
+        clause(Census {
+            thermal_registers: 0,
+            ..qemu
+        }),
+        "heat: not supported: no thermal registers"
+    );
+    assert_eq!(
+        clause(Census {
+            sensors: 4,
+            heat: 3,
+            hot: 1,
+            ..qemu
+        }),
+        "heat on 3 of 4 with a sensor, 1 hot"
     );
 }

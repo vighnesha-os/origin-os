@@ -199,19 +199,16 @@ impl<'a> X2Apic<'a> {
         unsafe { cpu::probe_rdmsr(apic::X2APIC_LVT_THERMAL) }
     }
 
-    /// Points this processor's thermal LVT entry at `vector`, fixed delivery, unmasked, and says
-    /// whether it reads back so (TASKS item 106). For an entry the firmware left free
-    /// ([`apic::lvt_thermal_free`]), which the caller has read, and for a device vector only, whose
-    /// gate exists and whose handler, registered or not, is the kernel's (`irq::run`). `false` for
-    /// any other vector, or if the write or the read back faulted.
-    pub fn take_thermal(&self, vector: u8) -> bool {
-        if !crate::irq::is_device_vector(vector) {
-            return false;
-        }
-        let entry = apic::lvt_thermal(vector, false);
-        // SAFETY: x2APIC mode is on (type invariant). Fixed delivery of a device vector to this
-        // processor does no more than a device interrupting it can; a register that does not exist
-        // raises a #GP the probe recovers from.
+    /// Points this processor's thermal LVT entry at `cpu::THERMAL_VECTOR`, fixed delivery, unmasked,
+    /// and says whether it reads back so (TASKS item 106). For an entry the firmware left free
+    /// ([`apic::lvt_thermal_free`]), which the caller has read; `crate::hfi`'s alone (the review's
+    /// R106-10). `false` if the write or the read back faulted.
+    pub(crate) fn take_thermal(&self) -> bool {
+        let entry = apic::lvt_thermal(cpu::THERMAL_VECTOR, false);
+        // SAFETY: x2APIC mode is on (type invariant). Fixed delivery of the thermal vector, a
+        // device vector with a gate and the kernel's handler, to this processor does no more than
+        // a device interrupting it can; a register that does not exist raises a #GP the probe
+        // recovers from.
         let written = unsafe { cpu::probe_wrmsr(apic::X2APIC_LVT_THERMAL, entry) };
         written
             && self
@@ -289,21 +286,18 @@ pub fn interrupt_self(me: crate::cpu::ThisCpu<'_>) {
     }
 }
 
-/// Sends device vector `vector` to the processor with APIC ID `apic_id` (x2APIC ICR, fixed
-/// delivery, no shorthand), as that vector's device could: the thermal round's way into each
-/// processor's thermal handler (TASKS item 106). `false`, and nothing sent, if `vector` is not a
-/// device vector or this processor's APIC is not in x2APIC mode. Safe: a device vector has a gate,
-/// and its handler, registered or not, is the kernel's.
-pub fn send_device_vector(me: crate::cpu::ThisCpu<'_>, apic_id: u32, vector: u8) -> bool {
-    if !crate::irq::is_device_vector(vector) {
-        return false;
-    }
+/// Sends the thermal vector (`cpu::THERMAL_VECTOR`) to the processor with APIC ID `apic_id` (x2APIC
+/// ICR, fixed delivery, no shorthand): the thermal round's way into each processor's thermal
+/// handler (TASKS item 106), and `crate::hfi`'s alone (the review's R106-10). `false`, and nothing
+/// sent, if this processor's APIC is not in x2APIC mode. A device vector has a gate, and its
+/// handler is the kernel's.
+pub(crate) fn send_thermal_vector(me: crate::cpu::ThisCpu<'_>, apic_id: u32) -> bool {
     let Some(lapic) = X2Apic::here(me) else {
         return false;
     };
-    // SAFETY: fixed delivery of a device vector, which has a gate: the same as its device
+    // SAFETY: fixed delivery of the thermal vector, which has a gate: the same as a thermal event
     // interrupting the destination.
-    unsafe { lapic.send_ipi(apic_id, ICR_ASSERT | u32::from(vector)) };
+    unsafe { lapic.send_ipi(apic_id, ICR_ASSERT | u32::from(crate::cpu::THERMAL_VECTOR)) };
     true
 }
 
