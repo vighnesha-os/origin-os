@@ -1377,10 +1377,11 @@ mod tests {
         let mut more = measure.clone();
         more.push("boot/uefi/src/kernel.rs".into());
         let err = check_found(flag, files, &more).unwrap_err();
+        // The flag's name is not written here: F1 would find it in this file.
         assert!(
-            err.contains(
-                "boot/uefi/src/kernel.rs names the stack measurement's flag `origin_stack_measure`"
-            ),
+            err.contains(&format!(
+                "boot/uefi/src/kernel.rs names the stack measurement's flag `{flag}`"
+            )),
             "{err}"
         );
         assert!(
