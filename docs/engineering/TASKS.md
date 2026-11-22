@@ -4714,10 +4714,84 @@ Assigned by the coordinating session on 2026-11-21. The contract went to the coo
 
 **The turn after the answers** (`b1f1e528`, 06:34 to 07:05 UTC): the static counts and wake's traces as before; fmt, progress, the build and both Clippy runs clean; 564 host tests (origin-frame, origin-sync) and 574 (the kernel's library) passed, none failed; all 93 Loom models passed and all 144 controls were caught; `boot-test` passed, integrity covering both processors after 1 ms, the capacity phase in 2 ms (13 fillers each side, 8 moves refused as full, 0 made), delivery's carried wake-ups 215, 155 of them with a token.
 
-**The gates on the final tip:** FIG.
+**The stops and their cause (TASKS item 129; 2026-11-22).**
+- **The stops.** Two boot-matrix runs of the gates stopped in integrity:
+  - on `0dd31ba1`, at the SPCR-refused machine (the AMD IOMMU, 2 processors, 64G), an integrity thread did not end;
+  - on `78bb464b`, at the Intel IOMMU's 4-processor machine, a capacity wait ran out.
+
+  180 diagnostic boots did not stop: those two machines in isolated loops, and stop 1's six 64G scenarios in the matrix's order.
+- **The reproduction.** The state lines (`0c91f310`) and the held-record check (`d4e67dd3`) were in the proof. The event ring, in a planted export, went through the whole boot-matrix. It reproduced the stop in its second run, at boot-random's 2-processor machine:
+  - thread 3 ready on CPU 0, its pair's turn its own, "held matches";
+  - its pass 27,844,456,218,624 against CPU 0's floor of 1,012,902,133,760;
+  - CPU 0's last 64 events all the boot flow yielding to itself, about every 1.7 µs;
+  - CPU 1 only idling.
+- **The cause** (the planted pass check, turn 22):
+  - with nothing ready on an application processor, `RunQueue::floor` took the running slot's pass, the idle flow's, which is charged only for ticks;
+  - a newcomer joined there, while a thread that had blocked kept its higher pass;
+  - `depart` carried the gap as lag, `arrive` added it to CPU 0's floor, and every round trip added it again.
+
+  In one passing run, the largest lag at a move was 10 thousand to 4.06 billion strides on the 2-processor machines, at most 7,178 on 3 and 4 processors, and at most 668 on 65 and 67. A thread left on CPU 0 after the last move waited behind the boot flow's yield loop past the proof's patience. Stop 1 is the same shape.
+- **The fix** (`2cc397b7`; ADR-0020 S6's note, `aa8ed613`, a reading, not an amendment): the floor counts threads and the boot flow, never the idle flow. With none of them ready, it holds its last value (`kept_floor`).
+  - Tests: the case in small, with its control. The randomized model keeps its floor by brute force and checks after every step that no floor falls and that no departing lag exceeds one stride.
+  - The controls C96-7 and C96-8 are in ADR-0013. C96-8's first plant was a planting error: it restored the old fallback in `floor` alone, but `switch` no longer calls `floor`.
+- **The recount** (turns 23 and 24):
+  - resume and dispatch are the base's; on_yield has the base's instructions, with field offsets moved by 8;
+  - `switch`'s floor section is shorter on the common path: 116 against 123 instructions on CPU 0 and 109 against 115 on an idle AP, with the same jumps. Its new test is only on the no-one-ready arm;
+  - wake: the smaller floor had made `wake_slot` a GOT call (blocked 243, pending 153, on an idle AP's queue with callees). The form with `wake_slot` alone inlined left a call (pending 152).
+  - Form C, `KernelQueues::wake_slot` and `RunQueue::wake` always inlined (`9c1ca986`), was shorter by static count: a blocked thread's wake-up 224 instructions and 48 conditional jumps against `d4e67dd3`'s 241 and 48, a pending one 132 and 21 against 134 and 21. It was withdrawn on its measured cost (the gates paragraph below).
+  - Form B, `floor` out of line (`f38c92a7`), gives `d4e67dd3`'s wake-up, with `floor` reached through the GOT.
+- **Stops in the gates turns, neither in this item's code:**
+  - Turn 25, boot-matrix 1 (14:02 UTC): the Intel IOMMU's 4-processor machine, the "tampered statement" scenario, printed nothing for 120 s, not even the loader's banner. It is the shape of TASKS item 92's run 3, counted as a stall, and the three-in-a-row sequence started again (the coordinating session's ruling; TASKS item 132).
+  - Turn 25b, the planted pass-check run (16:13 UTC): the AMD IOMMU's 4-processor machine, the IPC proof's `exit_closes` "faults" case, "0 wake-ups crossed processors". The peer saw PEER_CLOSED and nothing was lost. The check counts only a wake-up that makes a blocked thread ready by IPI, and the proof starts the ender once the waiter is in `wait_one`, before it blocks. A close in that window keeps the wake-up pending and sends no IPI. Every earlier boot with the peer on another processor counted 1. Numbered TASKS item 134; the planted run was taken again.
+- **Stop 2's shape is not this cause.** Threads were ready at the floor and not picked, and a ready, woken thread sat on an idle CPU 2. It stays open under TASKS item 129, with the state lines and the held-record check in the proofs.
+
+**The gates on the final tip.**
+- **On `9c1ca986`** (turns 25 and 25b, 2026-11-22 13:41 to 16:05 UTC):
+  - the static counts: resume and dispatch the base's, on_yield the base's but for field offsets, wake form C's;
+  - fmt, progress, the document, provenance, cost, requirements and settle gates, the build, and Clippy for the host crates and the kernel's target;
+  - check, 878 s: 2,712 host tests passed, 0 failed, 30 ignored; all 93 Loom models passed and all 144 controls were caught;
+  - boot-test, 11 of 11;
+  - boot-matrix three times in a row (15:17, 15:41 and 16:05 UTC, about 1,460 s each), with no file holding a state line, after the stall described above.
+- **The planted pass check** (turn 26, 16:17 to 16:42 UTC, on `9c1ca986` with the event ring): the whole boot-matrix passed with no state line. In all 40 boots with moves, the largest lag at a move was one stride (131,072 at weight 8), and none was over 64 strides. On the same machines before the fix: 2,871,919 strides on the Intel IOMMU's 2-processor machine, 328,332 on the AMD IOMMU's, 3,169 to 7,178 on 3 and 4 processors, 668 on 65.
+- **The comparison on `9c1ca986` stopped** (turn 26, 16:42 to 17:11 UTC). judge96's rule (c), the wait-queue ping-pong: on 65 processors, base 26, 30 and 29 µs against tip 47, 44 and 43; on 67, base 28, 39 and 26 against 34, 50 and 49. B1 was 2,143 to 2,372 TSC cycles against 1,736 to 1,860. Every boot passed. The fairness counts and the IPC round trip were as good as the base's or better.
+- **Form C's cost, found and withdrawn** (turns 27 and 28, 17:16 to 17:27 UTC; three boots each, rotated, on the default machine, the kernel boot alone; B1 in TSC cycles and the ping-pong in µs):
+  - `d4e67dd3`: 1,712 to 1,901, and 19 to 27;
+  - `aa8ed613`, the fix alone: 1,721 to 1,839, and 22 to 30;
+  - `9c1ca986`, form C: 2,111 to 2,353, and 46 to 51;
+  - an unused u64 in the run queue changed neither `d4e67dd3` (1,707 to 1,955, and 19 to 28) nor `9c1ca986` (2,090 to 2,376, and 43 to 53);
+  - form B (`floor` out of line): 1,694 to 1,710, and 22 to 26.
+
+  So the fix alone equals the base. Form C, which executes no more instructions on the yield path than the fix alone, raised B1 by about 25% and doubled the ping-pong under QEMU's software processor. The reading that this comes from where the code sits (every function after the grown `wake` moved) is not shown. Form C was reverted (`b06dc6e8`) and form B taken (`f38c92a7`; the coordinating session's rule: measured first, inside or below the base's range, then the smaller wake-up with callees, a GOT call counted as its instructions plus the indirect call). Form B's wake-up is `d4e67dd3`'s: a blocked thread 163 instructions plus `floor`'s 78, now reached through the GOT, and a pending one 134.
+- **On `f38c92a7`, form B** (turn 29, 2026-11-22 19:07 to 20:03 UTC):
+  - the static counts: resume and dispatch the base's, on_yield the base's but for field offsets, wake form B's measured export;
+  - fmt, progress, the document, provenance, cost, requirements and settle gates, the build and both Clippy runs, clean;
+  - boot-test, 41 s; one boot-matrix, 1,470 s, with no file holding a state line and the tree clean. check and the three runs in a row stand from `9c1ca986` (the coordinating session's ruling: the kernel changed by one attribute);
+  - the comparison against `0ebef78b`, at a load of 7 to 19:
+    - B1 on the default machine: base 1,705, 1,753 and 1,847; tip 1,720, 1,854 and 1,836 (mean 1,803, inside).
+    - 67 processors, every rule ok: ping-pong base 37, 31 and 29 µs, tip 34, 36 and 34; the IPC round trip base 100,598, 93,797 and 106,316 ns, tip 125,622, 90,186 and 93,886; the 50 ms wait base 52, 51 and 59, tip 50, 58 and 51.
+    - 65 processors, **STOP**. Rule (a): one tip boot printed "waited 5953 ms for the clock cost's readers to finish, past the former 2000 ms". Rule (c): the IPC round trip, tip 81,705, 99,459 and 104,550 ns (mean 95,238) against the base's worst of 93,865. The 50 ms tick rule: the tip's worst 62 against 60. The ping-pong was ok (base 35, 26 and 29; tip 28, 24 and 32).
+- **The 65-processor rounds again** (turn 30, 20:07 to 20:19 UTC; ruling R96-turn29: the rerun replaces turn 29's 65-processor rounds, is judged alone under unchanged rules, and is run once). Each boot below gives the host's load before it (1 and 5 minutes) and its busiest process, then the ping-pong, the IPC round trip and the 50 ms wait:
+  - base 65-1: load 2.83 and 9.47 (Claude Helper 123%, XprotectService 27%, Mole 21%). Failed: xtask's marker wants exactly 20 PIT interrupts, and the kernel counted 21, which its own proof passes on 20 or more. The judge read none of it;
+  - tip 65-1: load 11.49 and 13.78 (Mole 34%); 29 µs, 87,635 ns, 61 ms;
+  - tip 65-2: load 14.61 and 17.52 (Mole 28%); 29 µs, 91,254 ns, 59 ms;
+  - base 65-2: load 13.50 and 18.94 (Mole 32%); 29 µs, 97,265 ns, 51 ms;
+  - base 65-3: load 12.62 and 19.34 (Mole 30%); 27 µs, 90,033 ns, 58 ms;
+  - tip 65-3: load 14.30 and 20.54 (Mole 35%); 34 µs, 86,147 ns, 58 ms.
+
+  The judge: **STOP** on the ping-pong (tip mean 30.7 against the base's worst of 29) and on the 50 ms tick rule (the tip's worst 61 against 60). The IPC round trip was ok (mean 88,345 against 97,265). Its tick rule left out turn 29's 67-processor base figures (52, 51 and 59), which the ruling kept; with them, the tip's 61 still exceeds 60.
+- **Ruling R96-turn30 closed the comparison for form B, with no further run.** The 65-processor STOPs of turns 29 and 30 stand as STOPs, answered by the ruling:
+  - the null section, which does no kernel work, showed the host descheduling the virtual processors on every 65-processor tip boot: 1,541 to 2,112 spans over 400 µs in about 8 s. The longest were 116.4, 71.1 and 58.7 ms in turn 29, and 88.4, 85.8 and 117.5 ms in turn 30. That is far beyond the margins judged: 1 to 2 ms, 1.7 µs and 1.5%;
+  - form B's change is one call boundary;
+  - the STOP items moved between the two runs, and the base failed a boot at the same load;
+  - everything else passed;
+  - the 50 ms wait is the one figure with a steady direction (over 60 in 3 of 9 tip boots, 0 of 8 base boots). It is read as TASKS item 92's third ruling reads it: the tick's phase moved, and the host's latency shows as overshoot;
+  - ADR-0018 V1: no cheaper correct design is known. The base starves a thread, and form C was slower.
 
 **Follow-ups and limits:**
 - **For TASKS item 98:** Item 98's contract must re-check the bound on a wake-up's follows (S1's note of 2026-11-22) when it adds run-time movers with S10's rate, and take Q18 (b), leaving the section after every 8 follows, if any unpaced caller can exist. Its run-time movers also meet ADR-0020 S23's note on the "running on" word and N13's capacity paths at run time.
 - **Register canaries** (the review's R96-8): a framework helper with `asm!` that holds values in named callee-saved registers across a yield, so integrity checks the general registers themselves. Numbered by the coordinating session with the hand-over.
 - **TASKS item 126:** the three older `#[inline]` items that name statics (`cpu::count`, `monotonic::monotonic_reading`, `nospec::form`).
+- **TASKS item 129, stop 2's shape:** threads were ready at the floor and not picked, and a ready, woken thread sat on an idle CPU 2. It stays open, with the state lines and the held-record check in the proofs.
+- **Not this item's:** TASKS item 132, a boot that prints nothing at all on the Intel IOMMU's 4-processor machine's signature scenarios (turn 25's stall, and TASKS item 92's run 3). TASKS item 134, the IPC proof's `exit_closes` "faults" check, whose crossing count depends on whether the close lands before the waiter blocks (turn 25b). xtask's I/O APIC marker, which wants exactly 20 PIT interrupts where the kernel's proof passes on 20 or more: turn 30's base 65-1 counted 21 and failed (the coordinating session numbers it).
+- **Form C's reading:** that its cost under TCG comes from where code sits is not shown. A hardware figure (§74) would say whether either form costs anything on silicon.
 - **Not shown:** C96-1, C96-4 and C96-6 at boot (recorded as not observable, with their reasons), C95-B1 (unreachable by construction); anything under KVM until CI runs it; anything on hardware. No person has reviewed the code.

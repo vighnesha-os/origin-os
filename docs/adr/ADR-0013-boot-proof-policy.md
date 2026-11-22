@@ -996,6 +996,7 @@ T78-1b's unwarmed base boots are the boot evidence that the rule before this ite
 - Three turns: 04:55 to 05:08 UTC at `2038e494` (all twelve); 05:32 to 05:38 UTC at `9056f679` (C96-1b's pattern, C96-1c, C96-2 after the receiver's change, and C96-5, P1 and P2, whose first plant did not build); 05:43 to 05:48 UTC at `66ee0032`, with xtask's stop at the pinned-mode line taken out of each export (C96-1c, C96-5, P1, P2), so their boots ran on to show what came after the line.
 - The lines quoted are as those commits printed them, before the review's R96-9 shortened the pinned-mode texts.
 - The first summary marked C96-1b "shown" because its pattern `panic` matched the Rust-program proof's "a panic ended it"; every pattern names `origin-kernel: panic: ` since.
+- C96-7 and C96-8 are host tests, not boots (turn 23, 2026-11-22 12:35 UTC at `aa8ed613`; C96-8's corrected plant at 12:43 UTC): each plants the old floor reading in a `git archive` export and runs `cargo test --package framekernel --lib runqueue` there.
 
 | Control | Edit | Result |
 |---|---|---|
@@ -1011,6 +1012,8 @@ T78-1b's unwarmed base boots are the boot evidence that the rule before this ite
 | C95-B1 | `covers` skips the leaving record | Not caught, as predicted (the coordinating session's Q12 (a)): unreachable by construction, a measured stack's thread being pinned |
 | P1 | A blocked thread's location planted naming a free slot of its queue, then woken (after the proofs) | Trigger 3's line, "the search found the slot that holds the thread and woke it there"; run on, the planted thread ended, the verdict and the halt line followed |
 | P2 | P1, and a panic right after the line in the report hook | The line on line 511, the planted panic (`sched.rs:1168`) on line 512 |
+| C96-7 | The floor's old reading in the queue: with nothing that counts ready, `RunQueue::floor` takes the running slot's pass (`runqueue.rs`; a host test, TASKS item 129's fix) | Caught by two host tests: `the_floor_holds_under_a_blocked_thread_so_a_newcomer_leaves_it_no_lag` ("the floor holds T's pass", 131072 against T's 131072000) and the randomized test against the model ("the floor" differs, seed 0x9e3779b97f4a7c15, step 5). The control `without_a_newcomer_a_woken_thread_s_move_carries_no_lag` passed |
+| C96-8 | The old reading in the queue's `floor`, in `switch`'s floor and in the model's `floor`, so that the queue and the model agree (a host test) | Caught by the randomized test's own property: "queue 1's floor fell from 1310720 to 1179648" (seed 0x9e3779b97f4a7c15, step 85); and by the held-floor test. Its first plant was a planting error: it restored the old fallback in `floor` alone, but `switch` no longer calls `floor`, so the queue and the model still differed and the floor comparison failed first ("the floor", step 64) |
 
 ## Alternatives
 
