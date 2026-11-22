@@ -4426,17 +4426,17 @@ Assigned by the coordinating session on 2026-11-21, after the owner accepted ite
 
 **The review and its answers** (`docs/engineering/REVIEW_T121_2026-11-21.md`; one independent AI reviewer, no person; no High, four Medium, eight Low):
 - **R121-1 (Medium), fixed.** `PMxC0` bit 19 records any `0x06` to `0xCF9`, the firmware's own reset among them, so the decision line no longer says the reset was the loader's: it says "a `0x06` to `0xCF9` … as the control writes". **Reading rule:** a run that makes the call counts as evidence only after a control run in the same boot.
-- **R121-2 (Medium): the coordinating session's ruling, 2026-11-21.** D4 is amended: a `PMxC0` that names no reset cause holds no record, and the run makes the call and D6 follows it, with no control in that boot. Otherwise a firmware that clears the register at start-up would make every run a control, and the call would never be made.
+- **R121-2 (Medium): the coordinating session's ruling, 2026-11-21; the owner's item 346 (1).** D4 is amended: a `PMxC0` that names no reset cause holds no record, and the run makes the call and D6 follows it, with no control in that boot. Otherwise a firmware that clears the register at start-up would make every run a control, and the call would never be made.
   - **No record:** none of the reset causes AMD's documents name: bits 16, 18 to 27, 29 and 30. Bits 0 to 9 name why the machine last shut down, not why it reset, and 28 and 31 are not named.
   - **Bit 20** (`0x0E` to `0xCF9`) counts as a record. Only software clears it, so a later reset leaves it set beside its own bit. Alone, it says the last reset was a `0x0E`, and the run is the control. Beside bit 19, the run follows a `0x06`.
   - The line prints the branch and the raw value.
   - **Reading rule (the ruling's):** a boot whose first run found no record has no control. Its result rests on the printed `0xCF9` decode, trap and shutdown bits. A single run in such a boot reads "A, or neither reset works with these bits", and the findings must say so.
-- **R121-3 (Medium): the coordinating session's ruling, 2026-11-21.** D6 is amended: `0x06` goes to `0xCF9` only after a call that returned `EFI_SUCCESS`.
+- **R121-3 (Medium): the coordinating session's ruling, 2026-11-21; the owner's item 346 (2).** D6 is amended: `0x06` goes to `0xCF9` only after a call that returned `EFI_SUCCESS`.
   - After an error, the loader's retry runs as in every build, with its `Y` mark, and its return gets the same check.
   - After a second error, the existing path runs: Amendment 2's line, then Amendment 3's order.
   - The check is a compare of the status in RAX. No port, no call, and no memory the call gave back is touched, which the ruling holds to be within Amendment 4's "very first thing".
   - `boot-bench`'s machine-code check allows that branch and nothing else (R121-8 below).
-- **R121-4 (Medium), fixed.** The triple fault follows the wait only where `PMx74` bit 17 (the shutdown message) is set. Otherwise the run skips it and goes on to Amendment 3's order: a shutdown nothing acts on would hang where `ResetSystem` and the FADT's register could still reset the machine. **Reading rule:** with bit 17 clear, a run that makes the call and shows nothing more reads "A, or `0xCF9` did not reset and Amendment 3's order did not either".
+- **R121-4 (Medium), fixed; the owner's item 346 (3).** The triple fault follows the wait only where `PMx74` bit 17 (the shutdown message) is set. Otherwise the run skips it and goes on to Amendment 3's order: a shutdown nothing acts on would hang where `ResetSystem` and the FADT's register could still reset the machine. **Reading rule:** with bit 17 clear, a run that makes the call and shows nothing more reads "A, or `0xCF9` did not reset and Amendment 3's order did not either".
 - **R121-5 (Low), fixed:** the walk returns the leaf's physical address (2 MiB and 1 GiB frames masked, the large leaf's PAT bit left out), and the gate requires it to be the address read.
 - **R121-6 (Low), fixed:** the line saying where the registers are, and which checks passed, is printed before they are read.
 - **R121-7 (Low), fixed:** the reads are `unsafe fn`s with a `# Safety` section naming the gate.
@@ -4451,7 +4451,7 @@ Assigned by the coordinating session on 2026-11-21, after the owner accepted ite
 - **R121-3:** step 3 writes `0xCF9` as the very first thing after the call returns, whatever its status.
 - **R121-4:** step 3 always triple-faults.
 
-They go to the owner through the coordinating session (`t121-amendment-4-refinements.md` in its notes). Until the owner answers, Amendment 4's Code paragraph and row A02-Am4 are not marked built. If any one is declined, the build reverts to the text for it.
+The owner accepted all three on 2026-11-22 at about 00:05 UTC ("Accept all"; decision sheet item 346), and Amendment 4's "Refinements" paragraph replaces the text where they differ (records PR 55). The amendment's Code paragraph and row A02-Am4 are marked built against it.
 
 **The scenarios** (`boot-bench`, sixteen): TASKS item 112's four and item 116's three, unchanged, and this item's nine, each with `BENCH-FCH`:
 - `first`: the control; QEMU exits at the `0xCF9` write, and the call is never made.

@@ -198,7 +198,7 @@ origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry EF
 
 ## Amendment 4 (2026-11-21): a bench build may reset the machine with no firmware code
 
-*Accepted by the owner on 2026-11-21 ("Allow it"; decision sheet item 345). Proposed by rental E's findings (`docs/research/2026-11-21-rental-e-findings.md`, rank 1, on `land/batch-9` until it lands). TASKS item 121 builds it. Until that lands, nothing here is built.*
+*Accepted by the owner on 2026-11-21 ("Allow it"; decision sheet item 345). Proposed by rental E's findings (`docs/research/2026-11-21-rental-e-findings.md`, rank 1, on `land/batch-9` until it lands). Built by TASKS item 121 the same day, with item 346's refinements, under QEMU only.*
 
 **Change to B5 and to Amendment 3, for bench builds only.** A loader built with `--cfg origin_bench` may, in addition to Amendment 3's two methods, reset the machine in ways that run no firmware code:
 
@@ -230,4 +230,21 @@ origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry EF
 - Only bench builds, which are never signed, contain the code.
 - Before the call, the loader only reads the FCH's registers, at the address the firmware's DSDT describes.
 - The only writes are the documented warm-reset command to `0xCF9` and the loader's own IDT, made to end a diagnostic boot on a rented bench machine.
+
+**Code (built by TASKS item 121, with item 346's refinements, under QEMU only).** All under `--cfg origin_bench`:
+- `boot/uefi/src/fch.rs`, with no `unsafe`: the FCH's registers; the DSDT's region, found by a bounded scan; the walk of the firmware's page tables; the layout check; the branch; the lines. It is host-tested.
+- `boot/uefi/src/main.rs`: the reads, the control, the compare of the returned status, the `0xCF9` write after the call, the wait and the triple fault.
+
+QEMU has no AMD FCH. `BENCH-FCH`, which only QEMU's ESP may hold and the rental tool refuses, stands in for the reads. Under QEMU, `cargo xtask boot-bench` shows each path:
+- the control;
+- `0xCF9` after the call;
+- the triple fault;
+- the fall-through to Amendment 3's order;
+- no record;
+- the reset only after the retry succeeds;
+- the normal path after both calls fail;
+- a contradicting layout;
+- a control that does not reset.
+
+It also reads the bench loader's machine code. Between the call and the `0xCF9` write it allows only the status's compare, the plan's loads and compares, and branches. The planted controls, each of which must fail, are in TASKS item 121's entry.
 

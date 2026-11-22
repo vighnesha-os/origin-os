@@ -31,7 +31,7 @@ On `claude/t121-firmware-free-reset`, cut from TASKS item 116's branch, with `la
 - a contradicting layout;
 - a control that does not reset.
 
-Its new controls BC-13, BC-15 and BC-16 each fail. One independent AI review: no High, four Medium and eight Low, all answered (`docs/engineering/REVIEW_T121_2026-11-21.md`). The full gates and the remaining controls are still to run. Three of the answers refine Amendment 4's accepted text and wait for the owner's word.
+Its new controls BC-13, BC-15 and BC-16 each fail. One independent AI review: no High, four Medium and eight Low, all answered (`docs/engineering/REVIEW_T121_2026-11-21.md`). The full gates and the remaining controls are still to run. Three of the answers refine Amendment 4's text; the owner accepted them as decision sheet item 346.
 
 ## The reset diagnostic: a bench loader for rental E (TASKS item 116; 2026-11-21)
 
