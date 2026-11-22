@@ -257,6 +257,33 @@ fn bench_entries() -> Vec<String> {
     entries_for(&[UEFI_TARGET, KERNEL_TARGET], r#"["--cfg","origin_bench"]"#)
 }
 
+/// [`image_config`] and, for the UEFI target only, the stack-measurement build of the loader
+/// (TASKS item 127): `--cfg origin_stack_measure`, with `bench` `--cfg origin_bench` too, and a
+/// link map written to `map` for the static chain. Only `stack_depth::build_loader` and its Clippy
+/// run use it, into `target/stack-measure`.
+pub(crate) fn stack_measure_config(bench: bool, map: &Path) -> Result<Vec<String>> {
+    let mut config = image_config()?;
+    config.extend(stack_measure_entries(bench, map));
+    Ok(config)
+}
+
+/// The stack-measurement build's own entries, joined by Cargo to the remap and to
+/// `.cargo/config.toml`'s flags.
+fn stack_measure_entries(bench: bool, map: &Path) -> Vec<String> {
+    let link_map = format!("link-arg=/MAP:{}", map.display());
+    let mut flags: Vec<&str> = Vec::new();
+    if bench {
+        flags.extend(["--cfg", "origin_bench"]);
+    }
+    flags.extend(["--cfg", "origin_stack_measure", "-C", &link_map]);
+    let array = flags
+        .iter()
+        .map(|flag| format!("\"{}\"", flag.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(",");
+    entries_for(&[UEFI_TARGET], &format!("[{array}]"))
+}
+
 /// The same for a ring-3 build, whose target is the userspace triple. Given after
 /// `.cargo/userspace.toml`, it is joined to that file's flags. It is not part of
 /// [`image_config`]: on CI the userspace triple is the host's own.
@@ -419,7 +446,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_bench_build_gives_a_cfg() {
+    fn only_the_bench_and_measurement_builds_give_a_cfg() {
         // What `image_config` adds to the remap, for any remap: no `--cfg` (TASKS item 112, F1).
         let normal = entries_for(
             &[UEFI_TARGET, KERNEL_TARGET],
@@ -440,6 +467,27 @@ mod tests {
             ]
         );
         assert_eq!(bench.iter().filter(|arg| arg.contains("--cfg")).count(), 2);
+        // TASKS item 127: the loader's target only, the measurement flag, the bench flag only
+        // when asked, and the link map.
+        let map = Path::new("/w/target/stack-measure/normal/origin-boot.map");
+        assert_eq!(
+            stack_measure_entries(false, map),
+            [
+                "--config",
+                &format!(
+                    r#"target.{UEFI_TARGET}.rustflags=["--cfg","origin_stack_measure","-C","link-arg=/MAP:/w/target/stack-measure/normal/origin-boot.map"]"#
+                ),
+            ]
+        );
+        let both = stack_measure_entries(true, Path::new("/m\\\"q"));
+        assert_eq!(both.len(), 2);
+        assert!(
+            both[1].starts_with(&format!(
+                r#"target.{UEFI_TARGET}.rustflags=["--cfg","origin_bench","--cfg","origin_stack_measure","#
+            )),
+            "{both:?}"
+        );
+        assert!(both[1].ends_with(r#""link-arg=/MAP:/m\\\"q"]"#), "{both:?}");
     }
 
     const REPORT: &str = "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: aarch64-apple-darwin\nrelease: 1.99.1\nLLVM version: 23.1.1\n";

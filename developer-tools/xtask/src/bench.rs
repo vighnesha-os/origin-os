@@ -83,6 +83,13 @@ const FILES: &[(&str, &str)] = &[
     ("developer-tools/xtask/src/bench.rs", "this gate"),
 ];
 
+/// The flags F1 holds to their listed files: the bench build's, and TASKS item 127's stack
+/// measurement, whose rule is the same (the coordinating session's ruling on TASKS item 127, Q1).
+const FLAGS: [(&str, &[(&str, &str)]); 2] = [
+    (CFG, FILES),
+    (crate::stack_depth::CFG, crate::stack_depth::FILES),
+];
+
 /// The extensions of the files F1 reads: code, build configuration and CI.
 const SCANNED: &[&str] = &["rs", "toml", "yml", "yaml", "sh", "py", "json"];
 
@@ -91,7 +98,8 @@ pub(crate) fn target() -> PathBuf {
     crate::target_dir().join("bench")
 }
 
-/// F1: the bench flag's name appears only in [`FILES`], and in each of them.
+/// F1: the bench flag's name appears only in [`FILES`], and in each of them; and the
+/// measurement flag's only in its own list ([`FLAGS`]).
 pub(crate) fn gate() -> Result {
     let root = repo_root();
     let mut files = Vec::new();
@@ -113,7 +121,7 @@ pub(crate) fn gate() -> Result {
                 .map_err(|e| format!("bench gate: {e}"))?;
         }
     }
-    let found = files
+    let texts: Vec<(String, String)> = files
         .iter()
         .filter_map(|path| {
             let text = fs::read_to_string(path).ok()?;
@@ -122,25 +130,39 @@ pub(crate) fn gate() -> Result {
                 .ok()?
                 .to_string_lossy()
                 .replace('\\', "/");
-            text.contains(CFG).then_some(rel)
+            Some((rel, text))
         })
-        .collect::<Vec<_>>();
-    check_found(&found)?;
+        .collect();
+    let mut counts = Vec::new();
+    for (flag, listed) in FLAGS {
+        let found: Vec<String> = texts
+            .iter()
+            .filter(|(_, text)| text.contains(flag))
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        check_found(flag, listed, &found)?;
+        counts.push(found.len());
+    }
     println!(
-        "xtask: bench gate (TASKS item 112, F1): the bench flag is named in {} listed files and nowhere else",
-        found.len()
+        "xtask: bench gate (TASKS item 112, F1): the bench flag is named in {} listed files and nowhere else, and the stack measurement's flag (TASKS item 127) in {}",
+        counts[0], counts[1]
     );
     Ok(())
 }
 
-/// The heart of [`gate`]: `found` are the files that name the flag.
-fn check_found(found: &[String]) -> Result {
-    let listed: Vec<&str> = FILES.iter().map(|(path, _)| *path).collect();
+/// The heart of [`gate`]: `found` are the files that name `flag`, which only `files` may.
+fn check_found(flag: &str, files: &[(&str, &str)], found: &[String]) -> Result {
+    let which = if flag == CFG {
+        "the bench flag"
+    } else {
+        "the stack measurement's flag"
+    };
+    let listed: Vec<&str> = files.iter().map(|(path, _)| *path).collect();
     let mut problems: Vec<String> = found
         .iter()
         .filter(|path| !listed.contains(&path.as_str()))
         .map(|path| {
-            format!("{path} names the bench flag `{CFG}`, and only listed files may (TASKS item 112, F1)")
+            format!("{path} names {which} `{flag}`, and only listed files may (TASKS item 112, F1)")
         })
         .collect();
     problems.extend(
@@ -149,7 +171,7 @@ fn check_found(found: &[String]) -> Result {
             .filter(|path| !found.iter().any(|f| f == *path))
             .map(|path| {
                 format!(
-                    "{path} is on the bench gate's list and no longer names `{CFG}`: take it off"
+                    "{path} is on the bench gate's list and no longer names `{flag}`: take it off"
                 )
             }),
     );
@@ -170,8 +192,15 @@ pub(crate) fn is_bench(path: &Path) -> bool {
             .is_some_and(|(path, root)| path.starts_with(root))
 }
 
-/// Fails if `path` is a bench build's file: no signing path takes one (TASKS item 112, ruling Q1).
+/// Fails if `path` is a bench build's file, or a stack measurement's (TASKS item 127): no signing
+/// path takes one (TASKS item 112, ruling Q1).
 pub(crate) fn refuse(path: &Path, what: &str) -> Result {
+    if crate::stack_depth::is_measure(path) {
+        return Err(format!(
+            "{what}: {} is a stack measurement's file (target/stack-measure): a measurement image is never signed (TASKS item 127)",
+            path.display()
+        ));
+    }
     if is_bench(path) {
         Err(format!(
             "{what}: {} is a bench build's file (target/bench): a bench image is never signed, and is packed only for a bench boot (TASKS item 112)",
@@ -207,6 +236,12 @@ pub(crate) fn build() -> Result<(PathBuf, PathBuf)> {
         if !holds(&bytes, MARKER) {
             return Err(format!(
                 "{} is a bench image without the text \"bench build\": F2's search in the normal images could not see a bench build's code",
+                path.display()
+            ));
+        }
+        if holds(&bytes, crate::stack_depth::MARKER) {
+            return Err(format!(
+                "{} holds the text \"stack measure\": the stack measurement's code reached a bench image (TASKS item 127, F2)",
                 path.display()
             ));
         }
@@ -256,13 +291,13 @@ const AFTER_CALL_WINDOW: usize = 64;
 
 /// One instruction of `llvm-objdump`'s Intel listing: its address, and its text with single
 /// spaces and no `#` comment.
-struct Insn {
-    at: u64,
-    text: String,
+pub(crate) struct Insn {
+    pub(crate) at: u64,
+    pub(crate) text: String,
 }
 
 /// The instructions of `listing`; label, section and file lines are left out.
-fn instructions(listing: &str) -> Vec<Insn> {
+pub(crate) fn instructions(listing: &str) -> Vec<Insn> {
     listing
         .lines()
         .filter_map(|line| {
@@ -500,7 +535,7 @@ const CF9_AT_ONCE: Duration = Duration::from_millis(2_500);
 const AFTER_THE_WAIT: Duration = Duration::from_secs(4);
 
 /// The SPCR naming COM2, as `boot-console`'s scenario gives it.
-fn spcr(work: &Path) -> Result<Vec<String>> {
+pub(crate) fn spcr(work: &Path) -> Result<Vec<String>> {
     crate::spcr_args(
         work,
         &crate::spcr_table(0, crate::gas_io(SPCR_PORT), 7),
@@ -562,7 +597,7 @@ fn fch_first(work: &Path) -> Result<Vec<String>> {
     fch(work, b"first\n")
 }
 
-fn fch_mine(work: &Path) -> Result<Vec<String>> {
+pub(crate) fn fch_mine(work: &Path) -> Result<Vec<String>> {
     fch(work, b"mine slow\n")
 }
 
@@ -1321,19 +1356,38 @@ mod tests {
     #[test]
     fn f1_takes_the_listed_files_and_refuses_others() {
         let listed: Vec<String> = FILES.iter().map(|(p, _)| (*p).to_string()).collect();
-        assert_eq!(check_found(&listed), Ok(()));
+        assert_eq!(check_found(CFG, FILES, &listed), Ok(()));
         let mut more = listed.clone();
         more.push("framekernel/src/console.rs".into());
-        let err = check_found(&more).unwrap_err();
+        let err = check_found(CFG, FILES, &more).unwrap_err();
         assert!(
             err.contains("framekernel/src/console.rs names the bench flag"),
             "{err}"
         );
         let fewer = &listed[1..];
-        let err = check_found(fewer).unwrap_err();
+        let err = check_found(CFG, FILES, fewer).unwrap_err();
         assert!(
             err.contains("Cargo.toml is on the bench gate's list"),
             "{err}"
+        );
+        // TASKS item 127, SD-3: the measurement flag in a file not on its own list.
+        let (flag, files) = FLAGS[1];
+        let measure: Vec<String> = files.iter().map(|(p, _)| (*p).to_string()).collect();
+        assert_eq!(check_found(flag, files, &measure), Ok(()));
+        let mut more = measure.clone();
+        more.push("boot/uefi/src/kernel.rs".into());
+        let err = check_found(flag, files, &more).unwrap_err();
+        assert!(
+            err.contains(
+                "boot/uefi/src/kernel.rs names the stack measurement's flag `origin_stack_measure`"
+            ),
+            "{err}"
+        );
+        assert!(
+            !FILES
+                .iter()
+                .any(|(p, _)| *p == "developer-tools/xtask/src/stack_depth.rs"),
+            "each flag has its own list"
         );
     }
 
@@ -1341,6 +1395,12 @@ mod tests {
     fn no_signing_path_takes_a_bench_file() {
         let bench_kernel = target().join("xtask").join("KERNEL.ONBF");
         assert!(refuse(&bench_kernel, "signing").is_err());
+        // TASKS item 127: nor a stack measurement's.
+        let measured = crate::stack_depth::target()
+            .join("normal")
+            .join("origin-boot.efi");
+        let err = refuse(&measured, "signing").unwrap_err();
+        assert!(err.contains("stack measurement"), "{err}");
         assert!(
             refuse(
                 &crate::target_dir().join("xtask").join("KERNEL.ONBF"),

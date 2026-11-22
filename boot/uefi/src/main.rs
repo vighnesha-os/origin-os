@@ -72,6 +72,10 @@ const DEVELOPER_MODE: bool = cfg!(feature = "developer-mode");
 /// the firmware passes there; the loader validates the table before use.
 #[unsafe(no_mangle)]
 pub unsafe extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> Status {
+    // TASKS item 127, a measurement build only: the stack UEFI promises is painted first, from
+    // this function's own RSP, and calibrated.
+    #[cfg(origin_stack_measure)]
+    measure::begin(measure::rsp());
     // SAFETY: the caller contract above is exactly `read_system_table`'s precondition;
     // the function checks null, alignment, signature, revision and size before use.
     let st = match unsafe { uefi::read_system_table(system_table) } {
@@ -87,6 +91,8 @@ pub unsafe extern "efiapi" fn efi_main(image: Handle, system_table: *const Syste
     if report_firmware(&st, &mut out).is_err() {
         return out.last_error().unwrap_or(Status::DEVICE_ERROR);
     }
+    #[cfg(origin_stack_measure)]
+    measure::say_calibration(&mut out);
     match boot(image, system_table, &st, &mut out) {
         Ok(never) => match never {},
         Err(status) => status,
@@ -200,6 +206,8 @@ fn boot(
         found.flatten()
     };
 
+    #[cfg(origin_stack_measure)]
+    measure::phase_end(measure::Phase::Read, out);
     // B2: verify it.
     if DEVELOPER_MODE {
         let _ = writeln!(
@@ -237,6 +245,8 @@ fn boot(
         v.manifest.entry
     );
 
+    #[cfg(origin_stack_measure)]
+    measure::phase_end(measure::Phase::Verify, out);
     // B3: place it.
     let span =
         place::span(&v.image).map_err(|e| fail(out, Status::LOAD_ERROR, format_args!("{e:?}")))?;
@@ -310,6 +320,8 @@ fn boot(
         .checked_add(v.manifest.entry)
         .ok_or(Status::LOAD_ERROR)?;
 
+    #[cfg(origin_stack_measure)]
+    measure::phase_end(measure::Phase::Place, out);
     // B4 (boot info 0.2): the kernel's segment table, so it can map its own image with the
     // permissions the verified image declares.
     let mut segments = [KernelSegment {
@@ -367,6 +379,8 @@ fn boot(
     // The memory map says below whether it can be used; missing or unusable, the boot goes on.
     let mut framebuffer = find_framebuffer(&bs, out);
 
+    #[cfg(origin_stack_measure)]
+    measure::phase_end(measure::Phase::Allocate, out);
     // B5: final memory map, translation, ExitBootServices (one retry, UEFI 2.11 §7.4).
     // Layout: BootInfo, then MAX_KERNEL_SEGMENTS segment slots, then the region array.
     let segments_addr = info_addr + size_of::<BootInfo>() as u64;
@@ -646,6 +660,8 @@ fn boot(
             "64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info"
         }
     );
+    #[cfg(origin_stack_measure)]
+    measure::phase_end(measure::Phase::Walks, out);
     // TASKS item 112: the processor state the kernel inherits, in a bench build.
     #[cfg(origin_bench)]
     say_entry_state(out);
@@ -716,6 +732,13 @@ fn boot(
                         bench::MARK_RETRY
                     },
                 );
+            }
+            // TASKS item 127, a measurement build only: the last phase's depth, straight to the
+            // SPCR's UART (port writes leave the map, and its key, as they were), before the
+            // first call.
+            #[cfg(origin_stack_measure)]
+            if calls.made() == 0 {
+                measure::before_call(early_uart);
             }
             // SAFETY: valid `ExitBootServices` with this image's handle and the key of the map
             // just obtained; nothing has been allocated since `GetMemoryMap`.
@@ -2045,5 +2068,166 @@ fn panic(info: &PanicInfo) -> ! {
     }
     loop {
         core::hint::spin_loop();
+    }
+}
+
+/// TASKS item 127: how deep the stack goes before `ExitBootServices`, by paint, in a measurement
+/// build only (`cargo xtask stack-depth`, into `target/stack-measure`; never signed and never
+/// rented). The rules and the lines are `stackdepth`'s; this holds the volatile accesses to the
+/// stack and the state between phases. The loader has one thread, so the atomics only hold state
+/// between calls.
+#[cfg(origin_stack_measure)]
+mod measure {
+    use core::fmt::Write;
+    use core::ptr;
+    use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+    use origin_boot_info::EarlyUart;
+    use origin_boot_uefi::console::ConOut;
+    pub(super) use origin_boot_uefi::stackdepth::Phase;
+    use origin_boot_uefi::stackdepth::{
+        self, CALIBRATION_BYTES, Calibration, Depth, PAINT, Painted, PhaseLine, Record, Summary,
+    };
+
+    /// The entry RSP, 0 until [`begin`].
+    static TOP: AtomicU64 = AtomicU64::new(0);
+    /// The current paint's end, 0 while nothing is painted.
+    static END: AtomicU64 = AtomicU64::new(0);
+    /// The calibration array's depth below [`TOP`], 0 until calibrated.
+    static CALIBRATED: AtomicU64 = AtomicU64::new(0);
+    /// What the calibration's scan found, [`Depth::encode`]d.
+    static CALIBRATION_FOUND: AtomicU64 = AtomicU64::new(0);
+    /// The deepest phase so far ([`Phase::number`], 0 for none) and its depth, encoded.
+    static DEEPEST_PHASE: AtomicU8 = AtomicU8::new(0);
+    static DEEPEST: AtomicU64 = AtomicU64::new(0);
+
+    /// RSP, where this is inlined.
+    #[inline(always)]
+    pub(super) fn rsp() -> u64 {
+        let rsp: u64;
+        // SAFETY: copies RSP into a register; touches no memory and leaves the flags as they were.
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+        }
+        rsp
+    }
+
+    /// At entry, `top` being `efi_main`'s RSP: paints the stack UEFI promises, calibrates the
+    /// scan on a known array, and paints again for the first phase.
+    pub(super) fn begin(top: u64) {
+        TOP.store(top, Ordering::Relaxed);
+        if paint().is_none() {
+            return;
+        }
+        let array = calibrate();
+        let found = scan().unwrap_or(Depth::Above(0));
+        CALIBRATED.store(top.wrapping_sub(array), Ordering::Relaxed);
+        CALIBRATION_FOUND.store(found.encode(), Ordering::Relaxed);
+        let _ = paint();
+    }
+
+    /// The calibration's line, through the firmware's console.
+    pub(super) fn say_calibration(out: &mut ConOut) {
+        let expected = CALIBRATED.load(Ordering::Relaxed);
+        if expected == 0 {
+            let _ = writeln!(out, "{}", Summary::NotPainted);
+        } else {
+            let found = Depth::decode(CALIBRATION_FOUND.load(Ordering::Relaxed));
+            let _ = writeln!(out, "{}", Calibration { expected, found });
+        }
+    }
+
+    /// The end of `phase`: its depth, its line through the firmware's console, and a fresh paint
+    /// below the current RSP for the next phase. The line is written before the paint, so its
+    /// own stack is not counted in the next phase.
+    pub(super) fn phase_end(phase: Phase, out: &mut ConOut) {
+        let Some(depth) = scan() else {
+            return;
+        };
+        note(phase, depth);
+        let _ = writeln!(out, "{}", PhaseLine { phase, depth });
+        let _ = paint();
+    }
+
+    /// The last phase, just before the first call: its line and the summary go straight to the
+    /// SPCR's UART, after the last memory map, so no firmware call changes the map's key.
+    pub(super) fn before_call(early_uart: EarlyUart) {
+        if let Some(depth) = scan() {
+            note(Phase::Call, depth);
+            super::say_on_uart(
+                early_uart,
+                PhaseLine {
+                    phase: Phase::Call,
+                    depth,
+                },
+            );
+        }
+        super::say_on_uart(early_uart, record().summary());
+    }
+
+    fn record() -> Record {
+        let deepest = Phase::from_number(DEEPEST_PHASE.load(Ordering::Relaxed))
+            .map(|phase| (phase, Depth::decode(DEEPEST.load(Ordering::Relaxed))));
+        Record::of(deepest)
+    }
+
+    fn note(phase: Phase, depth: Depth) {
+        if let Some((phase, depth)) = record().note(phase, depth).deepest() {
+            DEEPEST_PHASE.store(phase.number(), Ordering::Relaxed);
+            DEEPEST.store(depth.encode(), Ordering::Relaxed);
+        }
+    }
+
+    /// The paint as it stands, `None` while nothing is painted.
+    fn painted() -> Option<Painted> {
+        Painted::with_end(TOP.load(Ordering::Relaxed), END.load(Ordering::Relaxed))
+    }
+
+    /// Writes [`PAINT`] into every word from the promise's bottom up to [`stackdepth::MARGIN`]
+    /// below this function's own RSP. No call is made while it paints, so nothing of its own lies
+    /// below that RSP.
+    #[inline(never)]
+    fn paint() -> Option<Painted> {
+        let painted = Painted::new(TOP.load(Ordering::Relaxed), rsp())?;
+        for i in 0..painted.words() {
+            let at = ptr::with_exposed_provenance_mut::<u64>(painted.word_address(i) as usize);
+            // SAFETY: the word lies in the stack UEFI promises this image while boot services run
+            // (UEFI 2.11 §2.3.4: 128 KiB or more below the entry RSP, `Painted::new`'s bottom),
+            // and at least `MARGIN` bytes below this function's own RSP, so below every live
+            // frame: the x64 calling convention has no red zone, and what an interrupt pushes
+            // there is dead once it returns. It is 8-byte aligned (`Painted::new`).
+            unsafe { at.write_volatile(PAINT) };
+        }
+        END.store(painted.end, Ordering::Relaxed);
+        Some(painted)
+    }
+
+    /// The current paint's depth, scanned from its lowest word up.
+    #[inline(never)]
+    fn scan() -> Option<Depth> {
+        let painted = painted()?;
+        Some(stackdepth::scan(painted, |at| {
+            let at = ptr::with_exposed_provenance::<u64>(at as usize);
+            // SAFETY: `at` is a word of the paint [`paint`] wrote, inside the stack UEFI promises,
+            // 8-byte aligned; reading it changes nothing.
+            unsafe { at.read_volatile() }
+        }))
+    }
+
+    /// Writes every word of a [`CALIBRATION_BYTES`] array on this function's own frame and
+    /// returns the address of its lowest word: the calibration's known depth.
+    #[inline(never)]
+    fn calibrate() -> u64 {
+        const WORDS: usize = CALIBRATION_BYTES / 8;
+        let mut array = core::mem::MaybeUninit::<[u64; WORDS]>::uninit();
+        let base = array.as_mut_ptr().cast::<u64>();
+        for i in 0..WORDS {
+            // SAFETY: `base` is the start of the local array, and `i` is below its length.
+            let word = unsafe { base.add(i) };
+            // SAFETY: `word` is a valid, aligned element of the local array; a volatile write so
+            // the compiler keeps every one.
+            unsafe { word.write_volatile(i as u64) };
+        }
+        base.addr() as u64
     }
 }

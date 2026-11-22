@@ -103,7 +103,10 @@ unreachable_pub = "warn"
 # `cfg(origin_bench)`: the bench build of the loader and the kernel, with breadcrumbs on the
 # SPCR's UART (TASKS item 112). Only `cargo xtask bench-build` and `boot-bench` set it, into
 # `target/bench`; no image a normal build makes holds any of it (`cargo xtask check`, F1 and F2).
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(origin_bench)'] }
+# `cfg(origin_stack_measure)`: the loader's stack measured by paint before `ExitBootServices`
+# (TASKS item 127). Only `cargo xtask stack-depth` sets it, into `target/stack-measure`; no normal
+# or bench image holds any of it (the same F1 and F2).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(origin_bench)', 'cfg(origin_stack_measure)'] }
 
 [workspace.lints.clippy]
 # CLAUDE.md §13 and final rule 5: every unsafe boundary documents its invariants.

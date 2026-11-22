@@ -515,6 +515,14 @@ fn check_pair(
             first.name
         ));
     }
+    // TASKS item 127: nor a stack measurement's, whose lines all say "stack measure"
+    // (`stack_depth::build_loader` requires the text in both measurement loaders).
+    if crate::bench::holds(&first.bytes, crate::stack_depth::MARKER) {
+        return Err(format!(
+            "{} holds the text \"stack measure\": a stack measurement's code reached an image a normal build makes (TASKS item 127, F2)",
+            first.name
+        ));
+    }
     if let Some((path, at)) = toolchain::host_path_in(&first.bytes, host_paths) {
         return Err(format!(
             "{} holds a path of the machine that built it (CLAUDE.md §75, §60): {}, `{}`, at offset {at:#x}\n  the text there: `{}`\n  `xtask` remaps the toolchain's source directory in every image build (`toolchain::image_config`, `toolchain::userspace_config`). A path that still reaches an image needs a remap of its own, or must not be compiled in",

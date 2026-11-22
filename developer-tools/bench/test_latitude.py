@@ -351,6 +351,10 @@ class Guards(unittest.TestCase):
             bad[at:at + 2] = value.to_bytes(2, "little")
             self.assertIn(word, self.lat.image_fault(bytes(bad), bytes(kernel)))
         self.assertIn("not a PE", self.lat.image_fault(b"MZ" + bytes(10), bytes(kernel)))
+        # TASKS item 127: a stack measurement build is never rented; a bench build may be.
+        measured = bytes(loader) + b"origin-boot: stack measure: P1 "
+        self.assertIn("stack measurement", self.lat.image_fault(measured, bytes(kernel)))
+        self.assertIsNone(self.lat.image_fault(bytes(loader) + b"origin-boot: bench build:", bytes(kernel)))
 
     def test_a_wrong_image_is_refused_before_any_request(self):
         image = self.home / "image"
