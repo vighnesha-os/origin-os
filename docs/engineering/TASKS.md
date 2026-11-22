@@ -4795,7 +4795,7 @@ Assigned by the coordinating session on 2026-11-22, after rental F. Built on `cl
 
 **The figures** (bytes below `efi_main`'s RSP; `docs/research/2026-11-22-loader-stack-depth.md`):
 - **The rentals' path,** an unsigned kernel: deepest 5,976 (normal) and 6,432 (bench). The largest seen in either run is 8,264; with `efi_main`'s 2,048, that is 10,312 bytes, 7.9% of 128 KiB.
-- **The shipping path,** a signed kernel (Ed25519 and ML-DSA-87): P2 at 20,032 to 21,352. With `efi_main`'s 1,888, that is 23,240 bytes at most, 17.7%.
+- **The shipping path,** a signed kernel (Ed25519 and ML-DSA-87): P2 at 20,032 to 21,352. With `efi_main`'s 1,888, that is 23,240 bytes at most, 17.7%. The keeper's run of `stack-depth` when it landed this item (2026-11-22, 06:23 to 06:27 UTC) reached 21,912 in P2, so 23,800 bytes, 18.2%: the shipping path's range is 23,240 to 23,800 bytes, 17.7% to 18.2%.
 - **The static chain:** 21,920 bytes, through `mldsa87_verify`'s 13,312. It equals the quietest signed boot plus `efi_main`'s frame, to the byte.
 
 **The coordinating session's ruling** under Q6 (a), 2026-11-22: the stack drops to the bottom of the candidates. Rental F's findings and the rank-2 list say so.
@@ -4811,3 +4811,75 @@ Assigned by the coordinating session on 2026-11-22, after rental F. Built on `cl
 - `ExitBootServices`'s own;
 - anything under KVM or on a physical machine;
 - **no person has reviewed it.**
+
+### 128. The minimal-program mode and Amendment 4's addition, in the bench loader (owner items 347 to 350; ADR-0002 Amendment 5 and Amendment 4's addition)
+
+Assigned by the coordinating session on 2026-11-22, after TASKS item 127 and the owner's acceptance of items 347 and 348. Built word for word against PR 58's text at `30b8f3cb`, on `claude/t128-minimal-mode`, cut from `a1069e45` (TASKS item 127's tip). The contract and its questions are in the coordination notes (`t128-contract.md`). The coordinating session ruled:
+- **Q1 (b):** cut from `a1069e45`, so the branch lands after TASKS item 127 as a fast-forward;
+- **Q2 (a):** a cfg of its own, `origin_bench_minimal`, given only by `bench-build --minimal` and `boot-bench`, with its own target directory and a third entry in F1's list;
+- **Q3 (a):** refinement 3 decides the control. In the minimal mode, Amendment 3's FADT step is skipped when its register is I/O port `0xCF9`, since Amendment 5 forbids any `0xCF9` write. Owner item 349 ("Forced fault anyway") then replaced the part about after the call: after `EFI_SUCCESS` the mode triple-faults whatever the shutdown bits say;
+- **Q4 (a):** a stand-in table, signature `OXFC`, carrying `BENCH-FCH`'s words with `mine` meaning bit 23, plus `smi=<hex>`. The departure, accepted: the image check and a full-mode scenario show that non-minimal builds ignore it, in place of a host test;
+- **Q5 (a):** a 64 KiB map buffer and 1,024 regions;
+- **Q6:** the turn as TASKS item 121's, with one `boot-matrix` if the normal images are the batch's bytes, `bench-build` both ways, and a GET-only dry run;
+- **R128-2:** the rental tool reads a minimal image's runs as it reads a `BENCH-AFTER` image's;
+- **R128-4:** ruling Q4 extends to the stand-in table's `stale1`, `stale2` and `noreset`;
+- **owner item 350** ("One more, then pause"): rental G is the last rental for a while, so it takes about six boots in the hour.
+
+**What was built.**
+- **The minimal mode** (`boot/uefi/src/main.rs`, `mod minimal`, under `cfg(origin_bench_minimal)` only), Amendment 5's steps:
+  - the first memory map into a static 64 KiB buffer, no allocation;
+  - `spcr::find`, the FADT's reset register, the stand-in table (QEMU only), and the FCH read behind Amendment 4's gate, with `SMIxC0` behind its own;
+  - the lines: the reset register (with `0xCF9` named as skipped), `SMIxC0`, the registers, and the decision;
+  - **the control,** only where both shutdown bits are set and the last reset was not a shutdown: 50 ms, then a triple fault, and no call;
+  - **the call,** through the live boot services table, read with volatile loads: `X` (or `Y` for the retry) straight before it. After `EFI_SUCCESS`, a triple fault and nothing before it (item 349). After an error, Amendment 2's line, then Amendment 3's order with the FADT step skipped at `0xCF9`. A status that is neither halts with a line.
+- **Amendment 4's addition** (`fch.rs`, `bench.rs`, `main.rs`):
+  - `SMIxC0` (SMICONTROL8 at `0xFED802C0`) read through `gate_smi`, whose DSDT region must hold it, and its routing of the `0xCF9` trap printed, in both bench modes (Amendment 5, step 3);
+  - in the full bench mode only, since the minimal mode makes no copy: the live boot services table compared byte for byte with the loader's copy before the call, with the first difference and both tables' `ExitBootServices` and CRC printed;
+  - the `PMxD2` line reworded: "the FCH's own reset at 0xCF9 off, for the firmware to trap".
+- **`developer-tools/xtask`:**
+  - `bench-build --minimal` builds the full bench pair first, then the minimal loader into `target/bench-minimal`, and requires its text and the stand-in's signature. `bench-build` refuses a full bench loader holding either;
+  - **the machine-code checks** (`writes_cf9`, `triple_fault_after_call`) take the full bench loader as their positive and negative controls;
+  - **six minimal scenarios:** the control; a returning call; no record; a stale key once (the retry); a stale key twice (Amendment 2's line, the FADT step skipped, the halt); the shutdown bits clear and the triple fault anyway. A full-mode scenario plants the stand-in table and shows it ignored. The full-mode scenarios now require the `SMIxC0` and table lines;
+  - F1 holds three flags; Clippy covers the minimal flavour.
+- **`developer-tools/bench/latitude.py`:**
+  - `loader_kind` names the minimal loader;
+  - **R128-2:** a minimal image's runs and timings are read as a `BENCH-AFTER` image's, with no breadcrumbs, anchored on its own last line; its summary counts the calls and says whether a loader followed the first;
+  - **item 350:** the image sets the plan. A minimal loader gets 6 boots of up to 5 minutes, and any other 3 of 8. A minimal boot ends when a run after a reset reaches its own call, or 3 minutes after its last call with no loader since. Before anything is bought, the plan must fit: 5 minutes of setup plus the boots, ending 10 minutes before the deadline.
+
+**The review.** One independent AI review of `f993eb12` and `0bc58f0a`: no High, five Medium and twelve Low (`docs/engineering/REVIEW_T128_2026-11-22.md`). Every finding is answered there, and the coordinating session's rulings on R128-2, R128-4 and R128-17 are recorded beside the answers. R128-17 became owner item 349.
+
+**The turn** (2026-11-22, the development Mac, QEMU 11.1.3 TCG with OVMF, Rust 1.100.0), on `32b6e043`:
+- **07:07:04 to 07:48:23 UTC:**
+  - fmt and F1 passed;
+  - the ten control runs, listed below;
+  - `check` passed in 899 s: 2,735 host tests passed, 0 failed, 30 ignored; Loom 91 models and 140 negative controls caught; every gate;
+  - `reproducible-compare`: all 40 files the same bytes as `953cda2c`'s, the batch's (TASKS item 127 showed `a1069e45`'s the same);
+  - `boot-test` passed 11 of 11 in 54 s;
+  - `boot-matrix` passed once, by ruling Q6, in 1,418 s. Its `boot-bench` passed 22 of 22 in 221 s: TASKS items 112, 116 and 121's sixteen, and the minimal mode's six;
+  - `bench-build`: the bench loader, now with Amendment 4's addition, 264,192 bytes, SHA-256 `57a1bbb1fdb8a0010857177928a7b3d2cbf680ee3c448ef4acfcbeca5bdef27b`; the bench kernel 2,116,880 bytes, `3bb1f2a57245b28d6f28eedddb30a06261725d7447149384b40b4827280f111f`;
+  - `bench-build --minimal`: the minimal loader, 73,216 bytes, `e2ae973c4c74559942855249b94737a12e2e458a391e950f265559e49226c858`, with the same bench kernel;
+  - the rental tool's dry run on the staged images, GET requests only, in 4 s: "boots: 6, each ending at a verdict or after 5 minutes, or when a run after a reset reaches its own call, or 3 minutes after the last call with no loader since (owner item 350); 35 minutes at most with the setup, inside the 40 before the boots stop"; then `m4-metal-small` at AMS, $0.81/h, deleted within 50 minutes, worst case $1.62, the ledger so far $4.86 against the $10 cap; nothing bought.
+- **07:48:44 to 07:50:46 UTC, a follow-on with the coordinating session's leave:** MC-3 and MC-5 again, in their second form (below), each restored after its run, the tree clean before and after.
+
+**The controls,** each planted, run and restored, and each failing for its own reason:
+- **MC-1:** a `0xCF9` write before the minimal mode's triple fault. `bench-build --minimal` refused it: "the minimal-mode loader puts 0xCF9 in DX".
+- **MC-2:** the minimal decision keyed on bit 19, not bit 23. In the scenario "minimal, a returning call", whose stand-in table gives bit 23, the run took the control and made no call.
+- **MC-3:** the FADT's register at `0xCF9` not skipped. In the turn it was stopped by Clippy before any boot: removing the skip's arm left a `match` with one arm. Its second form has the skip look for port `0xCF8`. In the follow-on, the scenario "minimal, a stale key twice" saw the loader write `0xF` to I/O port `0xCF9` through the FADT's register, and QEMU reset before the halt's line.
+- **MC-4:** the stand-in table's code ungated and called in the full mode's FCH read. `bench-build` refused the full bench loader for holding "OXFC".
+- **MC-5:** the minimal mode's retry marked `X`. In the turn it was stopped by Clippy before any boot: an `if` with two identical branches. Its second form counts the retry as a first call (`calls.made() < 2`). In the follow-on, the scenario "minimal, a stale key once" found `X`, `X` on the SPCR's UART, and no `Y`.
+- **MC-6:** the boot services table's line not written. The full-mode scenario "the stand-in table ignored" lacked it.
+- **MC-7:** `triple_fault` out of line. `bench-build --minimal` found no path from the call to the triple fault holding only register reads, compares and branches.
+- **MC-8:** the gate's page walk skipped. Two host tests of the gates failed.
+- **MC-9:** no triple fault after a successful call (item 349). The scenario "the shutdown bits clear, the triple fault anyway" found the halt line after `X`.
+
+**Rental G's images,** staged read-only under `~/.local/state/origin-bench/` (item 232) from `32b6e043`:
+- `~/.local/state/origin-bench/rental-g-bench-minimal-image-32b6e043/BOOTX64.EFI`, `e2ae973c…`, and `KERNEL.ONBF`, `3bb1f2a5…`, both mode 444;
+- the dry run above was made on them.
+
+**Not shown:**
+- anything on an AMD FCH: QEMU has none, so the stand-in table that `xtask` plants in QEMU's firmware tables supplies the values. A real board's firmware holds no such table, so there the mode reads the FCH;
+- the minimal mode on the rented board: that is rental G;
+- `BitsClear`, `Contradicts` and a first map that does not fit, which are host-tested only;
+- **no person has reviewed it.**
+
+**For the records PR:** ADR-0002 Amendment 5's status line and rows A02-Am5 and A02-Am4 are in PR 58's text, not on this branch; marking them built is the coordinating session's or the keeper's.
