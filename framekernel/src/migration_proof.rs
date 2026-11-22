@@ -28,6 +28,14 @@
 //! the window in which it is registered, preempted, moved, woken and then blocks (N1). After 2 s
 //! the senders stop, and every token posted must be taken within 2 s more.
 //!
+//! **A null section beside each wake-up** (report only; the coordinating session's ruling on the
+//! first boot's 1.1 ms wake-up, 2026-11-22). After each timed wake-up, a sender spins on the TSC
+//! with interrupts off for the median of its last [`WINDOW`] wake-up spans, the same exposure to
+//! the host as a wake-up's section without its locks. The line prints, for both kinds of section,
+//! the ticks spent in all, how many spans passed B18's 50 µs and how many passed 400 µs, and the
+//! longest. Similar rates of long spans per tick spent mean the host descheduled a virtual
+//! processor; a rate clearly higher for the wake-ups means they waited on a lock.
+//!
 //! On fewer than two processors taking part, each proof says so on its line and counts as passed
 //! (ADR-0013 R6's convention). Nothing here prints an address (ADR-0004 Amendment 2, A6).
 #![forbid(unsafe_code)]
@@ -131,6 +139,73 @@ struct Sender {
     longest_followed_follows: AtomicU64,
     /// Its longest span around a wake-up that followed none, for scale.
     longest_plain: AtomicU64,
+    /// Its wake-ups' interrupts-off sections, every one.
+    wake: Spans,
+    /// Its null sections, each spinning for its wake-ups' recent median span.
+    null: Spans,
+}
+
+/// The wake-up spans whose median a null section spins for: a sender's last few.
+const WINDOW: usize = 15;
+
+/// B18 (an interrupts-off section's budget, 50 µs) and a far mark, 400 µs, in microseconds.
+const B18_MICROS: u64 = 50;
+const FAR_MICROS: u64 = 400;
+
+/// One kind of interrupts-off section a sender timed: the ticks spent in all, the spans past
+/// B18 and past the far mark, and the longest. Written only by its sender.
+struct Spans {
+    ticks: AtomicU64,
+    over_b18: AtomicU64,
+    over_far: AtomicU64,
+    longest: AtomicU64,
+}
+
+impl Spans {
+    const fn new() -> Self {
+        Self {
+            ticks: AtomicU64::new(0),
+            over_b18: AtomicU64::new(0),
+            over_far: AtomicU64::new(0),
+            longest: AtomicU64::new(0),
+        }
+    }
+
+    /// Notes one span of `took` ticks, against the marks `b18` and `far` in ticks.
+    fn note(&self, took: u64, b18: u64, far: u64) {
+        self.ticks.fetch_add(took, Ordering::Relaxed);
+        if took > b18 {
+            self.over_b18.fetch_add(1, Ordering::Relaxed);
+        }
+        if took > far {
+            self.over_far.fetch_add(1, Ordering::Relaxed);
+        }
+        self.longest.fetch_max(took, Ordering::Relaxed);
+    }
+
+    /// Every sender's spans of one kind, summed (the longest, the largest): ticks, past B18,
+    /// past the far mark, longest.
+    fn total<'a>(spans: impl Iterator<Item = &'a Spans>) -> (u64, u64, u64, u64) {
+        spans.fold((0, 0, 0, 0), |(t, b, f, l), s| {
+            (
+                t.saturating_add(s.ticks.load(Ordering::Relaxed)),
+                b.saturating_add(s.over_b18.load(Ordering::Relaxed)),
+                f.saturating_add(s.over_far.load(Ordering::Relaxed)),
+                l.max(s.longest.load(Ordering::Relaxed)),
+            )
+        })
+    }
+}
+
+/// The median of `spans`, 0 if there are none.
+fn median(spans: &[u64]) -> u64 {
+    let mut sorted = [0u64; WINDOW];
+    let Some(sorted) = sorted.get_mut(..spans.len()) else {
+        return 0;
+    };
+    sorted.copy_from_slice(spans);
+    sorted.sort_unstable();
+    sorted.get(sorted.len() / 2).copied().unwrap_or(0)
 }
 
 /// The current proof's shared state, while its threads live.
@@ -631,6 +706,9 @@ extern "sysv64" fn sender(index: u64) -> ! {
         .get(usize::try_from(index).unwrap_or(usize::MAX));
     let mut choice = Choice(0x9e37_79b9_7f4a_7c15 ^ index.wrapping_add(1));
     let mut sent = 0u64;
+    let micros = |us: u64| shared.tsc_hz.saturating_mul(us) / 1_000_000;
+    let (b18, far) = (micros(B18_MICROS), micros(FAR_MICROS));
+    let (mut window, mut filled, mut next) = ([0u64; WINDOW], 0usize, 0usize);
     while let Some(me) = me
         && !shared.stop.load(Ordering::Acquire)
         && rdtsc() < shared.deadline
@@ -647,7 +725,7 @@ extern "sysv64" fn sender(index: u64) -> ! {
         // The wake-up in an interrupts-off section of the sender's own: the span holds `wake`'s
         // whole section, and the count's change on this processor is this wake-up's follows
         // (D93-2; the contract's "Additions", B).
-        cpu::without_interrupts_here(|here| {
+        let took = cpu::without_interrupts_here(|here| {
             let follows =
                 || crate::threads::follows_here(cpu::this_cpu(here)).map_or(0, |f| f.read().0);
             let (count, start) = (follows(), rdtsc());
@@ -665,7 +743,26 @@ extern "sysv64" fn sender(index: u64) -> ! {
             } else if took > me.longest_plain.load(Ordering::Relaxed) {
                 me.longest_plain.store(took, Ordering::Relaxed);
             }
+            took
         });
+        me.wake.note(took, b18, far);
+        // The null section: as long as the recent wake-ups' median, with interrupts off and no
+        // lock, so that its long spans are the host's alone (report only).
+        if let Some(slot) = window.get_mut(next) {
+            *slot = took;
+        }
+        next = (next + 1) % WINDOW;
+        filled = (filled + 1).min(WINDOW);
+        let target = median(window.get(..filled).unwrap_or(&[]));
+        let spun = cpu::without_interrupts_here(|_| {
+            let start = rdtsc();
+            let until = start.saturating_add(target);
+            while rdtsc() < until {
+                core::hint::spin_loop();
+            }
+            rdtsc().saturating_sub(start)
+        });
+        me.null.note(spun, b18, far);
         to.queue.wake_one();
         sent += 1;
         if sent.is_multiple_of(8) {
@@ -720,6 +817,8 @@ pub(crate) fn prove_delivery(
                 longest_followed: AtomicU64::new(0),
                 longest_followed_follows: AtomicU64::new(0),
                 longest_plain: AtomicU64::new(0),
+                wake: Spans::new(),
+                null: Spans::new(),
             })
             .collect(),
         swaps_failed: AtomicU64::new(0),
@@ -801,6 +900,8 @@ pub(crate) fn prove_delivery(
             (f, ff, p.max(s.longest_plain.load(Ordering::Relaxed)))
         }
     });
+    let wakes = Spans::total(shared.senders.iter().map(|s| &s.wake));
+    let nulls = Spans::total(shared.senders.iter().map(|s| &s.null));
     drop(shared);
     let (follows, most, over_eight) = {
         let (a, m, o) = crate::threads::follows();
@@ -815,6 +916,17 @@ pub(crate) fn prove_delivery(
     drop(moves);
     let (back, unsettled) = bracket_after(settled_before, before, tsc_hz);
     let refusals = refusals(&refused);
+    // Made after the compare, as `refusals` is: no text is on the heap while it is compared.
+    let sections = |(ticks, over_b18, over_far, longest): (u64, u64, u64, u64)| {
+        alloc::format!(
+            "{ticks} ticks ({} ns) in all, {over_b18} over B18's {} ns, {over_far} over {} ns, longest {longest} ticks ({} ns)",
+            nanos(ticks, tsc_hz),
+            B18_MICROS * 1000,
+            FAR_MICROS * 1000,
+            nanos(longest, tsc_hz)
+        )
+    };
+    let (wakes, nulls) = (sections(wakes), sections(nulls));
     let pinned_mode = pinned::entered();
     let ok = spawned
         && delivered
@@ -825,7 +937,7 @@ pub(crate) fn prove_delivery(
         && pinned_mode.is_none();
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: thread migration: delivery: {receivers} movable receivers and {} pinned senders, {posted} tokens posted, {taken} taken, {short} receivers short; spawned {spawned}; ended {ended}; heap, frames and stacks back {back}; {made} moves, {carried} carrying a pending wake-up, refused: {refusals}; wake-ups followed {follows} moves of movable threads, the most one followed {most}, {over_eight} followed more than 8; a sender's wake-up that followed a move: longest {} ticks ({} ns) with {} follows; one that followed none: longest {} ticks ({} ns){}{}{}",
+        "origin-kernel: scheduler: thread migration: delivery: {receivers} movable receivers and {} pinned senders, {posted} tokens posted, {taken} taken, {short} receivers short; spawned {spawned}; ended {ended}; heap, frames and stacks back {back}; {made} moves, {carried} carrying a pending wake-up, refused: {refusals}; wake-ups followed {follows} moves of movable threads, the most one followed {most}, {over_eight} followed more than 8; a sender's wake-up that followed a move: longest {} ticks ({} ns) with {} follows; one that followed none: longest {} ticks ({} ns); senders' wake-up sections: {wakes}; their null sections, each as long as their wake-ups' recent median: {nulls}{}{}{}",
         cpus.len(),
         spans.0,
         nanos(spans.0, tsc_hz),
