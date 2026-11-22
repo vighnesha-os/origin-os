@@ -35,6 +35,9 @@ pub const X2APIC_TIMER_INITIAL: u32 = 0x838;
 pub const X2APIC_TIMER_CURRENT: u32 = 0x839;
 /// x2APIC timer divide-configuration register.
 pub const X2APIC_TIMER_DIVIDE: u32 = 0x83E;
+/// x2APIC LVT thermal-sensor register (APIC offset 330H): present where CPUID.01H:EDX\[22\] says
+/// the thermal monitor's registers are (Intel SDM Vol. 3, §17.8.4; TASKS item 106).
+pub const X2APIC_LVT_THERMAL: u32 = 0x833;
 
 /// LVT mask bit.
 pub const LVT_MASKED: u64 = 1 << 16;
@@ -64,6 +67,31 @@ pub const fn x2apic_transition(current: u64) -> ([u64; 2], usize) {
         ([enabled & !APIC_X2APIC, x2], 2)
     }
 }
+
+/// An LVT entry's delivery mode, bits 10:8.
+const LVT_DELIVERY: u64 = 0b111 << 8;
+/// SMI delivery: the firmware's System Management Mode takes the interrupt.
+const DELIVERY_SMI: u64 = 0b010 << 8;
+
+/// The LVT thermal entry for `vector`, with fixed delivery (mode 000), masked or not. Intel names
+/// fixed, SMI and NMI the delivery modes the thermal entry takes; fixed is the only one the kernel
+/// writes (TASKS item 106).
+pub const fn lvt_thermal(vector: u8, masked: bool) -> u64 {
+    let mask = if masked { LVT_MASKED } else { 0 };
+    vector as u64 | mask
+}
+
+/// Whether the firmware left the thermal LVT entry `entry` to the operating system: masked, and
+/// not set for SMI delivery. Intel says the thermal interrupt is handled either by the operating
+/// system or by SMM; an entry the firmware unmasked, or pointed at SMM, is the firmware's, and the
+/// kernel leaves it as it is (the coordinating session's ruling Q5 of 2026-11-21).
+pub const fn lvt_thermal_free(entry: u64) -> bool {
+    entry & LVT_MASKED != 0 && entry & LVT_DELIVERY != DELIVERY_SMI
+}
+
+/// The bits of the LVT thermal entry the kernel writes and reads back: the vector, the delivery
+/// mode and the mask. Bit 12, the delivery status, is the hardware's.
+pub const LVT_THERMAL_BITS: u64 = 0xFF | LVT_DELIVERY | LVT_MASKED;
 
 /// Spurious-interrupt vector register: APIC software-enabled, with `vector` for spurious
 /// interrupts.
@@ -951,6 +979,27 @@ pub const fn initial_count(rate: u64, hz: u64) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The thermal LVT entry (TASKS item 106): fixed delivery to the vector, masked or not, and
+    /// which entries the firmware left free.
+    #[test]
+    fn the_thermal_entry_is_fixed_delivery_and_taken_only_where_free() {
+        assert_eq!(lvt_thermal(0x44, false), 0x44);
+        assert_eq!(lvt_thermal(0x44, true), 0x1_0044);
+        assert_eq!(lvt_thermal(0x44, false) & LVT_DELIVERY, 0, "fixed delivery");
+        assert_eq!(lvt_thermal(0x44, true) & !LVT_THERMAL_BITS, 0);
+        // The reset value, masked with nothing else, is free.
+        assert!(lvt_thermal_free(0x1_0000));
+        // Unmasked, whatever its mode: the firmware's.
+        assert!(!lvt_thermal_free(0x0000));
+        assert!(!lvt_thermal_free(0x0044));
+        // SMI delivery, masked or not: the firmware's.
+        assert!(!lvt_thermal_free(0x1_0200));
+        assert!(!lvt_thermal_free(0x0200));
+        // Masked with NMI delivery, or with the delivery-status bit: free.
+        assert!(lvt_thermal_free(0x1_0400));
+        assert!(lvt_thermal_free(0x1_1000));
+    }
 
     #[test]
     fn a_timer_s_programming_keeps_only_the_bits_that_set_the_rate_and_the_interrupt() {
