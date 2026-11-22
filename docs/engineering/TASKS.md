@@ -4891,7 +4891,7 @@ Assigned by the coordinating session on 2026-11-22, after TASKS item 127 and the
 - **The control worked in all six boots:** the first run (bit 19 after the provider's restart, bit 21 after the tool's) triple-faulted, the firmware started again 48.3 to 48.9 s later, and the next run read bit 23, a shutdown. A triple fault resets this board.
 - **Each call was followed by a reset** where the tool's restart did not interrupt it (runs 2, 7, 9, 11 and 13): the firmware's first byte 48.8 to 48.9 s after `X`, 29 to 47 s before the tool's next restart. Run 3, after run 2's reset, read bit 23 and made the call again. No `Y` and no Amendment 2 line in any run.
 - **The reading:** R, the call returned `EFI_SUCCESS` and item 349's triple fault reset the machine, ranked well ahead of S, the firmware's own exit shutting the processor down, which item 349's silence after a successful call leaves open. Under R the stop is in what Origin's loaders add, as Amendment 5's "if the call returns" says, since rental E's bench loader stopped on the same revision.
-- **The tool's summaries are wrong for this image,** and the fault is in item 350's change above: a minimal boot ends only on loader runs, the five-minute boot was sized from rental F's revision (7 s from a reset to the firmware's first line, against about 49 s on 2.4a), and the next byte is measured from the call's line, not from `X`. Boot 2's "reset itself after the first call" was the tool's own restart, issued 5.6 s before that call.
+- **The tool's summaries are wrong for this image,** and the fault is in item 350's change above: a minimal boot ends only on loader runs, the five-minute boot was sized from rental F's revision (3.5 s from a reset to the firmware's first byte, against about 49 s on 2.4a), and the next byte is measured from the call's line, not from `X`. Boot 2's "reset itself after the first call" was the tool's own restart, issued 5.6 s before that call.
 - **`PMxC0` bit 20** stays set beside each cause: AMD's document says hardware never clears it. It changes no run's branch.
 - **Next, ranked in the findings:** the tool's fix, tested on a fixture shaped like rental G's console (free); the full bench image staged (free); then, when item 350's pause lifts, one rental with two questions, the copied table's compare and the OS-defined memory types as `EfiLoaderData` (an owner item); last, a mark after a successful call, which would change item 349.
 
@@ -4931,7 +4931,7 @@ Built on `claude/t130-minimal-reading`, cut from `claude/t128-rental-g-records` 
 - **`after_last_line`** measures from the mark that follows the last line, not from the line: rental G's "next byte after 0.0 s" was the mark itself.
 - **`reread DIR [--restarts F] [--until T]`** reads a rental's runs again from its directory, and sends no request.
 
-**The tests** (`developer-tools/bench/test_latitude.py`, `python3 -I`): 45 pass.
+**The tests** (`developer-tools/bench/test_latitude.py`, `python3 -I`): 45 passed at `c01b98e2`, and 50 pass with the review's answers (below).
 - **Five are new:**
   - the runs read from the firmware's starts, with the client's lines skipped;
   - a restart in flight before and after the mark, never "no reset";
@@ -4969,7 +4969,29 @@ Built on `claude/t130-minimal-reading`, cut from `claude/t128-rental-g-records` 
 - item 348's table compare.
 Its two questions are whether the firmware changes its boot services table after the copy, and whether the call returns without Origin's OS-defined memory types. It quotes the accepted text it changes, the code it was checked against at `a9f72dd0`, and the rental's cost: $6.48 expected and $7.29 at worst on the ledger.
 
+**The review.** One independent AI review of `c01b98e2` (`docs/engineering/REVIEW_T130_2026-11-22.md`). It was given the code and the raw consoles of rentals E, F and G, not the author's reading, and its own reading of rental G agrees with the tool's on every run. It found one High, five Medium and seven Low, all answered in the working tree after `c01b98e2`:
+- **R130-1 (High):** a `Y` after `X` was read as the firmware. A run's marks are now taken together, and the answer is measured from the last.
+- **R130-2:** output counts as a start only if it comes at least 1 s after the run's last byte, before the hang's wait, and opens as the controls' starts did. Otherwise it is `other`, quoted. Output only after the wait is `none`, with when it came.
+- **R130-3:** a call is known by its last line before the call as well as by its mark.
+- **R130-4:** each restart's time goes into `restarts.log` before the restart is asked for.
+- **R130-5:** `after_last_line` and its figures are removed.
+- **R130-6:** the reviewer's four mutants now each fail a test.
+- **The Lows:**
+  - a hang says what it rules out;
+  - untimed bytes and a cut-short last run are no answer;
+  - the client's messages are found over the whole capture;
+  - a console closed for 5 s or more of a hang's wait leaves it `unwatched`;
+  - the planning window rounds up, and the plan no longer calls it "at most";
+  - rental F's figure is its first byte, 3.5 s.
+- **The same slip** (rental F's first line beside rental G's first byte) is corrected in rental G's findings and in TASKS item 128's rental G paragraph.
+- **A limit the reviewer found** is added to the findings: only run 2's reset had its cause read.
+- **After the answers:**
+  - 50 tests pass;
+  - twenty planted faults, among them the reviewer's four, each fail at least one;
+  - rental G re-reads the same;
+  - the money guards are still untouched.
+
 **Not shown:**
 - the new loop on a rented machine;
 - a window measured on another firmware revision than rental G's;
-- **no independent review, and no person has reviewed it.**
+- **no person has reviewed it.**

@@ -30,7 +30,8 @@ On `claude/t128-minimal-mode`, cut from TASKS item 127's tip `a1069e45`, and in 
 - **TASKS item 130** (`claude/t130-minimal-reading`): the tool now reads each run from the firmware's starts, never says "no reset" while one of its own restarts is in flight, and sizes a minimal boot's window from the firmware's measured delays.
   - A replay test on rental G's own console reads a reset after 5 of the 5 calls the restarts did not overtake.
   - The full bench image of `32b6e043` is staged, and its GET-only dry run bought nothing.
-  - The owner item for the two-question rental is drafted for the coordinating session.
+  - The owner item for the two-question rental is drafted for the coordinating session. The owner accepted it as item 352 (ADR-0002 Amendment 6, PR 59), and TASKS item 131 builds it.
+  - One independent AI review: one High (a retry's `Y` read as the firmware), five Medium and seven Low, all answered. 50 tests pass, and twenty planted faults each fail one. No person has reviewed it.
 
 ## The loader's stack depth before `ExitBootServices` (TASKS item 127; 2026-11-22)
 

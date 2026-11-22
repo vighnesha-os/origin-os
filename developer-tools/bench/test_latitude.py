@@ -434,15 +434,19 @@ class Guards(unittest.TestCase):
         twice = self.lat.boot_result(self.lat.clean(loader + "\x1b[2JPre-memory NB Initialization\r\n" + loader))
         self.assertEqual(twice["loader_runs"], 2)
         self.assertNotIn("reset", twice["summary"].split("; loader runs")[1])
-        # The timing: the loader's last line arrived at t=100, the firmware's next byte at
-        # t=107.5, the next loader at t=170; with nothing after the line, neither.
+        # The timing, now read by `read_runs` (TASKS item 130): the full mode's last line before
+        # the call makes the run a call, mark or no mark (R130-3); the firmware's next byte 7.5 s
+        # after it; with nothing after the line, no answer yet.
         raw = (loader + "\x1b[2JPre-memory\r\n" + loader).encode()
         line_end = raw.find(b"Framekernel") + len(b"Framekernel\r\n")
         times = [(90.0, line_end - 10), (100.0, line_end), (107.5, line_end + 5),
                  (170.0, len(raw))]
-        self.assertEqual(self.lat.after_last_line(raw, times), (7.5, 70.0))
-        self.assertEqual(self.lat.after_last_line(raw[:line_end], times[:2]), (None, None))
-        self.assertEqual(self.lat.after_last_line(b"no loader here", times), (None, None))
+        run = self.lat.read_runs(raw, times, [0.0], 170.0)[0]
+        self.assertEqual((run["branch"], run["marks"], run["end_kind"]), ("call", "", "line"))
+        self.assertEqual((run["answer"], run["after_s"]), ("reset", 7.5))
+        self.assertIn("a call, no mark, then the firmware again 7.5 s after its line", self.lat.describe(run))
+        self.assertEqual(self.lat.read_runs(raw[:line_end], times[:2], [0.0], 120.0)[0]["answer"], "pending")
+        self.assertEqual(self.lat.read_runs(b"no loader here", times, [0.0], 170.0), [])
         path = self.home / "times.log"
         path.write_text("10.0 500\nx y\n11.5 900\n")
         self.assertEqual(self.lat.read_times(path, 600), [(11.5, 300)])
@@ -486,7 +490,9 @@ class Guards(unittest.TestCase):
         raw = (loader + "\x1b[2JPre-memory\r\n" + loader).encode()
         line_end = raw.find(b"services table") + len(b"services table\r\n")
         times = [(100.0, line_end), (100.5, line_end + 3), (108.0, line_end + 5), (170.0, len(raw))]
-        self.assertEqual(self.lat.after_last_line(raw, times), (7.5, 69.5))
+        run = self.lat.read_runs(raw, times, [0.0], 170.0)[0]
+        self.assertEqual((run["end"], run["end_kind"], run["answer"], run["after_s"]),
+                         (100.5, "mark", "reset", 7.5))
 
     def test_the_boot_plan_follows_the_image_and_fits_the_rental(self):
         # Owner item 350 and TASKS item 130: six boots for the minimal mode, each within its window
@@ -544,12 +550,89 @@ class Guards(unittest.TestCase):
         raw, times = self.pieces((50.0, self.CONTROL), (98.5, self.FIRMWARE), (150.0, self.CALL))
         self.assertEqual(read(raw, times, [0.0], 243.4)[1]["answer"], "pending")
         hung = read(raw, times, [0.0], 243.5)[1]
-        self.assertEqual((hung["answer"], hung["waited_s"]), ("none", 93.5))
-        self.assertIn("then nothing for 93.5 s: no reset", self.lat.describe(hung))
+        self.assertEqual((hung["answer"], hung["waited_s"], hung["ruled_out_s"]), ("none", 93.5, 45.0))
+        # R130-7: nothing for 93.5 s rules out a reset only within 45 s of the mark, since this
+        # firmware prints 48.5 s after one.
+        self.assertIn("then nothing for 93.5 s: no reset within 45 s of its mark", self.lat.describe(hung))
         # The client's lines after the mark are not the firmware's.
         raw, times = self.pieces((50.0, self.CONTROL), (98.5, self.FIRMWARE), (150.0, self.CALL),
                                  (170.0, self.CLIENT))
         self.assertEqual(read(raw, times, [0.0], 300.0)[1]["answer"], "none")
+
+    def test_a_retrys_marks_are_the_runs_own(self):
+        # R130-1: X, then Y a second later when the first call fails, belong to the run; the
+        # answer is measured from the last mark, and the Y is never the firmware.
+        read = self.lat.read_runs
+        control = ((50.0, self.CONTROL), (98.5, self.FIRMWARE))
+        raw, times = self.pieces(*control, (150.0, self.CALL), (151.0, b"Y\r\n"))
+        run = read(raw, times, [0.0], 200.0)[1]
+        self.assertEqual((run["marks"], run["end"], run["answer"]), ("XY", 151.0, "pending"))
+        run = read(raw, times, [0.0], 245.0)[1]
+        self.assertEqual((run["answer"], run["waited_s"]), ("none", 94.0))
+        raw, times = self.pieces(*control, (150.0, self.CALL), (151.0, b"Y\r\n"), (200.0, self.FIRMWARE))
+        run = read(raw, times, [0.0], 300.0)[1]
+        self.assertEqual((run["marks"], run["answer"], run["after_s"]), ("XY", "reset", 49.0))
+        # Both calls failed: Amendment 2's line after the Y ends the run, which is still a call.
+        raw, times = self.pieces(*control, (150.0, self.CALL), (151.0, b"Y\r\n"),
+                                 (151.5, b"origin-boot: ExitBootServices failed twice\r\n"))
+        run = read(raw, times, [0.0], 200.0)[1]
+        self.assertEqual((run["branch"], run["marks"], run["end_kind"], run["end"]), ("call", "XY", "line", 151.5))
+
+    def test_output_that_is_not_a_start_is_not_a_reset(self):
+        # R130-2: text right after the mark, or output that opens unlike the controls' starts,
+        # is other output, quoted, never a reset; R130-3: a call line with no mark is a call.
+        read = self.lat.read_runs
+        control = ((50.0, self.CONTROL), (98.5, self.FIRMWARE))
+        raw, times = self.pieces(*control, (150.0, self.CALL), (150.5, b"!!!! X64 Exception Type - 0D !!!!\r\n"))
+        run = read(raw, times, [0.0], 300.0)[1]
+        self.assertEqual((run["answer"], run["text"]), ("other", "!!!! X64 Exception Type - 0D !!!!"))
+        self.assertIn('then other output 0.5 s after its mark: "!!!! X64 Exception Type - 0D !!!!"',
+                      self.lat.describe(run))
+        raw, times = self.pieces(*control, (150.0, self.CALL), (170.0, b"RIP 0000000000001234\r\n"))
+        self.assertEqual(read(raw, times, [0.0], 300.0)[1]["answer"], "other")
+        # Before any control has shown how a start opens, timing alone decides.
+        raw, times = self.pieces((150.0, self.CALL), (170.0, b"RIP 0000000000001234\r\n"))
+        self.assertEqual(read(raw, times, [0.0], 300.0)[0]["answer"], "reset")
+        no_mark = self.CALL.replace(b"\r\nX\r\n", b"\r\n")
+        raw, times = self.pieces(*control, (150.0, no_mark), (199.0, self.FIRMWARE))
+        run = read(raw, times, [0.0], 300.0)[1]
+        self.assertEqual((run["branch"], run["marks"], run["answer"]), ("call", "", "reset"))
+        self.assertIn("a call (PMxC0 0x00900800), no mark, then the firmware again 49 s after its line",
+                      self.lat.describe(run))
+
+    def test_what_the_reading_cannot_see_is_not_an_answer(self):
+        # R130-6 (M4): with no control measured, the hang's wait is rental G's start delay and
+        # 45 s; R130-8: bytes logged but not yet timed are no answer; R130-13: the console's last
+        # run, cut short before its decision, is no answer until the hang's wait has passed.
+        read = self.lat.read_runs
+        raw, times = self.pieces((150.0, self.CALL))
+        self.assertEqual(read(raw, times, [0.0], 210.0)[0]["answer"], "pending")
+        self.assertEqual(read(raw, times, [0.0], 244.0)[0]["answer"], "none")
+        raw, times = self.pieces((50.0, self.CONTROL), (98.5, self.FIRMWARE), (150.0, self.CALL))
+        self.assertEqual(read(raw + self.FIRMWARE, times, [0.0], 400.0)[1]["answer"], "pending")
+        partial = self.BANNER + b"origin-boot: bench build: minimal: the minimal-program mode\r\norigin-bo"
+        raw, times = self.pieces((50.0, self.CONTROL), (98.5, self.FIRMWARE), (150.0, partial))
+        run = read(raw, times, [0.0], 160.0)[1]
+        self.assertEqual((run["answer"], run["cut_short"]), ("pending", True))
+        self.assertEqual(self.lat.describe(run), "a run cut short before its decision")
+        self.assertEqual(read(raw, times, [0.0], 400.0)[1]["answer"], "other")
+
+    def test_a_closed_console_leaves_a_hang_unwatched(self):
+        # R130-10: from the client's failure to its reopening, or from sol-events.log's "ended" to
+        # "opened", the console carried nothing; a hang's wait with 5 s or more of it is unwatched.
+        read = self.lat.read_runs
+        control = ((50.0, self.CONTROL), (98.5, self.FIRMWARE), (150.0, self.CALL))
+        raw, times = self.pieces(*control, (170.0, b"Error: No response to keepalive - Terminating session\r\n"),
+                                 (182.0, b"[SOL Session operational.  Use ~? for help]\r\n"))
+        run = read(raw, times, [0.0], 300.0)[1]
+        self.assertEqual((run["answer"], run["closed_s"]), ("unwatched", 12.0))
+        self.assertIn("but the console was closed for 12 s of it: unwatched", self.lat.describe(run))
+        raw, times = self.pieces(*control)
+        events = "1970-01-01T00:02:40Z console session ended (exit 1) at byte 900\n1970-01-01T00:02:50Z console session opened at byte 900\n"
+        self.assertEqual(read(raw, times, [0.0], 300.0, events)[1]["answer"], "unwatched")
+        self.assertEqual(read(raw, times, [0.0], 300.0)[1]["answer"], "none")
+        brief = events.replace("00:02:50Z", "00:02:42Z")
+        self.assertEqual(read(raw, times, [0.0], 300.0, brief)[1]["answer"], "none")
 
     def test_a_restart_in_flight_is_never_read_as_no_reset(self):
         # TASKS item 130: rental G's boot 2. A restart of the tool's issued after the run's firmware
@@ -567,33 +650,56 @@ class Guards(unittest.TestCase):
             quiet = read(raw[:times[2][1]], times[:3], [0.0, restart], 900.0)[1]
             self.assertEqual(quiet["answer"], "overtaken")
         # A restart before the run's firmware began, or after its answer, overtakes nothing.
+        prompt, prompt_times = self.pieces((50.0, self.CONTROL), (98.5, self.FIRMWARE),
+                                           (150.0, self.CALL), (199.0, self.FIRMWARE))
         for restart in (40.0, 270.0):
-            self.assertEqual(read(raw, times, [0.0, restart], 400.0)[1]["answer"], "reset")
+            self.assertEqual(read(prompt, prompt_times, [0.0, restart], 400.0)[1]["answer"], "reset")
+        # R130-2: output only after the hang's wait is not the call's reset (a watchdog's, say).
+        late = read(raw, times, [0.0], 400.0)[1]
+        self.assertEqual((late["answer"], late["later_s"]), ("none", 110.0))
+        self.assertIn("(output again 110 s after it)", self.lat.describe(late))
+        # R130-6 (M3): a restart 40 s after the mark, then the firmware 49 s after it: overtaken.
+        raw2, times2 = self.pieces((50.0, self.CONTROL), (98.5, self.FIRMWARE), (150.0, self.CALL),
+                                   (199.0, self.FIRMWARE))
+        self.assertEqual(read(raw2, times2, [0.0, 190.0], 400.0)[1]["answer"], "overtaken")
         summary = self.lat.runs_summary(read(raw, times, [0.0, 145.0], 400.0))
-        self.assertIn("calls: 1: a reset after 0 of the 0 the tool's restarts did not overtake; "
-                      "1 overtaken by the tool's restart, undetermined", summary)
+        self.assertIn("calls: 1: of the 0 judged, a reset after 0; 1 overtaken by the tool's "
+                      "restarts, undetermined; controls: 1, a reset after 1, 48.5 s after the line",
+                      summary)
 
     def test_a_restarts_start_is_after_the_longest_silence(self):
         # TASKS item 130: a restart lands seconds after it is issued, and the start it cuts short
         # prints until then (rental G's boots 5 and 6); the restart's own start comes after the
         # silence, and the firmware's delays are read from that.
+        # The restart's delay, 63 s, differs from the planning figure, so a reading that never
+        # measured it would show (R130-6, M1).
         raw, times = self.pieces((50.0, self.CONTROL), (98.5, self.FIRMWARE), (150.0, self.CALL),
                                  (198.8, self.FIRMWARE), (230.0, b"Connecting Drivers.91\r\n"),
-                                 (241.5, b"B3\r\n"), (306.0, self.FIRMWARE), (360.0, self.CONTROL))
-        runs = self.lat.read_runs(raw, times, [0.0, 238.0], 400.0)
+                                 (241.5, b"B3\r\n"), (301.0, self.FIRMWARE), (355.0, self.CONTROL))
+        runs = self.lat.read_runs(raw, times, [0.0, 238.0], 380.0)
         self.assertEqual([r["answer"] for r in runs], ["reset", "reset", "pending"])
-        self.assertEqual((runs[2]["start"], runs[2]["restarted"]), (306.0, 238.0))
-        fig = self.lat.figures(runs, [0.0, 238.0])
-        self.assertEqual(fig, {"start": 48.5, "load": 54.0, "restart": 68.0})
+        self.assertEqual((runs[2]["start"], runs[2]["restarted"]), (301.0, 238.0))
+        fig = self.lat.figures(runs)
+        self.assertEqual(fig, {"start": 48.5, "load": 54.0, "restart": 63.0})
         # A restart that overtook a run measures nothing.
         runs = self.lat.read_runs(raw, times, [0.0, 152.0], 500.0)
-        self.assertEqual(self.lat.figures(runs, [0.0, 152.0])["restart"], self.lat.PLAN_RESTART_S)
+        self.assertEqual(self.lat.figures(runs)["restart"], self.lat.PLAN_RESTART_S)
+        # R130-9: a client message split across two samples is still the client's, and the
+        # restart's start is still after the silence.
+        msg = b"ERROR: Received message with invalid authcode!\r\n"
+        raw, times = self.pieces((50.0, self.CONTROL), (98.5, self.FIRMWARE), (150.0, self.CALL),
+                                 (198.8, self.FIRMWARE), (241.5, b"B3\r\n"), (252.0, msg[:10]),
+                                 (252.5, msg[10:]), (301.0, self.FIRMWARE), (355.0, self.CONTROL))
+        runs = self.lat.read_runs(raw, times, [0.0, 238.0], 380.0)
+        self.assertEqual(runs[2]["start"], 301.0)
 
     def test_the_window_follows_the_firmwares_own_delays(self):
-        # TASKS item 130: rental F's 2.5 is quicker than rental G's 2.4a, and the window says so.
+        # TASKS item 130: rental F's 2.5 is quicker than rental G's 2.4a, and the window says so
+        # (rental F's reset to the first byte and first byte to banner as `reread` measures them;
+        # its restart delay, which no run measured, taken as 20 s).
         window = self.lat.window_s
         self.assertAlmostEqual(window({"start": 48.9, "load": 54.4, "restart": 68.0}), 344.0)
-        self.assertAlmostEqual(window({"start": 7.1, "load": 41.0, "restart": 20.0}), 176.2)
+        self.assertAlmostEqual(window({"start": 3.5, "load": 43.6, "restart": 20.0}), 174.2)
 
     def test_rental_gs_console_reads_a_reset_after_every_call_it_can_judge(self):
         # TASKS item 130's replay: rental G's own console (developer-tools/bench/fixtures: the
@@ -616,19 +722,26 @@ class Guards(unittest.TestCase):
         self.assertEqual([r["after_s"] for r in runs if r["branch"] == "control"],
                          [48.5, 48.3, 48.3, 48.8, 48.4, 48.9])
         self.assertTrue(all(r["pmxc0"] == "0x00900800" for r in calls))
-        self.assertEqual(lat.figures(runs, restarts), {"start": 48.9, "load": 54.4, "restart": 68.0})
+        self.assertEqual(lat.figures(runs), {"start": 48.9, "load": 54.4, "restart": 68.0})
+        # The restart figure is the planning one by chance; each restart's own start is read
+        # (R130-6, M1): runs 8, 10 and 12, 68.0, 67.1 and 67.9 s after their restarts.
+        self.assertEqual([(r["restarted"], round(r["start"] - r["restarted"], 1)) for r in runs if "restarted" in r],
+                         [(restarts[3], 68.0), (restarts[4], 67.1), (restarts[5], 67.9)])
         self.assertEqual(lat.runs_summary(runs),
-                         "calls: 7: a reset after 5 of the 5 the tool's restarts did not overtake, "
-                         "48.8 to 48.9 s after the mark; 2 overtaken by the tool's restart, "
-                         "undetermined; none hung; controls: 6, a reset after 6, 48.3 to 48.9 s "
-                         "after the line")
+                         "calls: 7: of the 5 judged, a reset after 5, 48.8 to 48.9 s after the mark; "
+                         "2 overtaken by the tool's restarts, undetermined; controls: 6, a reset "
+                         "after 6, 48.3 to 48.9 s after the line")
+        # Without restart 2, run 3's restart bytes would read as its own reset (R130-4): the
+        # record and `reread` need every restart, so the tool writes each before asking for it.
+        lost = lat.read_runs(raw, times, restarts[:1] + restarts[2:], lat.when("2026-11-22T09:30:35Z"))
+        self.assertEqual((lost[2]["answer"], lost[2]["after_s"]), ("reset", 61.5))
         # Rental G's boot 3 under the new rule: at the old five-minute end the firmware had
         # started again after the call, and the boot waits for the next run's registers, up to the
         # measured load delay and 15 s after that start, inside this firmware's 344 s window.
         self.assertFalse(lat.boot_over(runs[:7], 5, restarts[2] + 300))
         self.assertFalse(lat.boot_over(runs[:7], 5, runs[6]["next"] + 69.0))
         self.assertTrue(lat.boot_over(runs[:7], 5, runs[6]["next"] + 69.5))
-        self.assertLess(runs[6]["next"] + 69.5, restarts[2] + lat.window_s(lat.figures(runs, restarts)))
+        self.assertLess(runs[6]["next"] + 69.5, restarts[2] + lat.window_s(lat.figures(runs)))
         self.assertFalse(lat.boot_over(runs[:6], 5, lat.when("2026-11-22T09:12:31Z")))  # control only
         # `reread` prints the same from a rental's directory, and sends no request.
         d = self.home / "g"
@@ -731,27 +844,27 @@ class Guards(unittest.TestCase):
                       boots[0]["summary"])
         self.assertEqual([r["answer"] for r in boots[0]["runs"]], ["reset", "reset", "pending"])
         for b in boots[1:]:
-            self.assertIn("then nothing for 60 s: no reset", b["summary"])
+            self.assertIn("then nothing for 60 s: no reset within 53 s of its mark", b["summary"])
             self.assertEqual([r["answer"] for r in b["runs"]], ["reset", "none"])
         # The firmware's delays as the loop measured them: the control's reset 7 s, the load 43 s
         # (57 to 100), and the restart 50 s, read after the hangs.
+        self.assertEqual(lat.restart_times(d), restarts)  # R130-4: each written before it was asked for
         fig = lat.figures(lat.read_runs((d / "sol.log").read_bytes(), lat.read_times(d / lat.TIMES_FILE, 0),
-                                        restarts, clock[0]), restarts)
+                                        restarts, clock[0]))
         self.assertEqual(fig, {"start": 7.0, "load": 43.0, "restart": 50.0})
         lengths = [b - a for a, b in zip(restarts, restarts[1:] + [clock[0]])]
         self.assertEqual(lengths[0], 150)              # ends at the next run's call
         self.assertTrue(all(n == 160 for n in lengths[1:]), lengths)  # 7 + 45 s after the mark
         self.assertIn("boots: 6, each ending at a verdict or after 5.8 minutes, or at its answer",
                       self.rental_b_out)
-        self.assertIn("39.8 minutes at most with the setup, inside the 40 before the boots stop",
-                      self.rental_b_out)
+        self.assertIn("39.8 minutes at rental G's delays with the setup, inside the 40 before the "
+                      "boots stop; a slower firmware's own windows are longer", self.rental_b_out)
         record = (d / "record-draft.md").read_text()
         # Across the rental: boot 1's call, and the five that hung before the next restart; the
         # run after boot 1's reset is overtaken by boot 2's restart, as the loop means it to be.
-        self.assertIn("| Runs | calls: 7: a reset after 1 of the 6 the tool's restarts did not "
-                      "overtake, 7.5 s after the mark; 1 overtaken by the tool's restart, "
-                      "undetermined; 5 with nothing after them; controls: 6, a reset after 6, 7 s "
-                      "after the line |", record)
+        self.assertIn("| Runs | calls: 7: of the 6 judged, a reset after 1, 7.5 s after the mark, "
+                      "nothing after 5; 1 overtaken by the tool's restarts, undetermined; controls: "
+                      "6, a reset after 6, 7 s after the line |", record)
 
     def test_redact_removes_mac_addresses_and_the_guid(self):
         text = ("Boot0003* UEFI PXE IPv4: Intel(R) Ethernet Controller X550(MAC:020000000001)\n"
@@ -923,6 +1036,19 @@ class Guards(unittest.TestCase):
         d = self.home / "rental"
         record = (d / "record-draft.md").read_text()
         self.assertIn("boot 1: origin-kernel: boot verdict: degraded: 60 of 71 proofs passed", record)
+        self.assertEqual(len(json.loads((d / "boots.json").read_text())), 1)
+
+    def test_a_refused_restart_is_still_kept(self):
+        # R130-4: the restart's time is written before it is asked for, so a boot that never
+        # completes (a refused power action, a signal) still has it for the record and `reread`.
+        def api(method, path, body=None, ok=None):
+            raise self.lat.ApiError(422, f"{method} {path}: HTTP 422: busy")
+
+        verdict = lambda start=0: "origin-kernel: boot verdict: degraded: 60 of 71 proofs passed\n"
+        with self.assertRaises(self.lat.ApiError):
+            self.run_rental_b(api, verdict)
+        d = self.home / "rental"
+        self.assertEqual(len(self.lat.restart_times(d)), 2)
         self.assertEqual(len(json.loads((d / "boots.json").read_text())), 1)
 
     def test_three_boots_when_each_ends_in_a_verdict(self):
