@@ -289,6 +289,21 @@ What it carries:
 - **No rate of its own** (Q13). Its callers pace themselves; S10's rate is TASKS item 98's.
 - **A full destination** refuses the move ("queue full") with nothing lost, and a full source can move a thread out: "thread migration: integrity" shows both at boot (N13; the review's R96-13).
 
+**Note (2026-11-22, TASKS item 96; the coordinating session's ruling on TASKS item 129's reproduction, a reading of this decision, not an amendment).** The floor this decision names, "the lowest pass among its ready contexts", is read as follows:
+- **What counts.** The contexts that take part in the share: threads, and slot 0 where it is the boot flow, which yields in the race. Never the idle flow, which "stays apart" (S12).
+- **With none of them ready, the floor holds its last value.** It never falls. `push`, `admit` and `arrive` never place a pass below it, so it only rises, and "a move earns no credit and loses none" holds: with all weights equal, a thread departs with a lag of at most one of its strides.
+- **Why the reading was needed.** Before it, a queue with nothing ready took the running context's pass. On an application processor that is the idle flow's, which is charged only for the quanta nothing else wanted. So:
+  - a thread that blocked there was left far above the next newcomer;
+  - its next move carried the difference as lag, and every round trip added it again;
+  - on the two-processor machines, lags at a move reached 4.06 billion strides;
+  - one thread left on CPU 0 with 212 million of them waited past the integrity proof's patience behind the boot flow's yields (TASKS item 129, reproduced with the event ring on 2026-11-22).
+- **As built.** `RunQueue` keeps the value (`kept_floor`). It is raised:
+  - to the running context's pass when that context was the last ready one that counts (it blocked, slept or exited);
+  - at a departure;
+  - when slot 0 becomes the idle flow.
+
+  A host test holds the case in small, against a control that plants the old fallback. The randomized model holds two properties over every step: no floor falls, and no departing lag exceeds one stride.
+
 ### Part B. Who moves threads, and where to
 
 ### S7. Load balancing: idle processors pull; busy ones only kick
