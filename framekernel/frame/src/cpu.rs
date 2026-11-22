@@ -833,14 +833,13 @@ const fn ist_of(vector: u64) -> u8 {
 /// addition (d)). A frame elsewhere was pushed onto another stack, perhaps over a suspended
 /// context's frame: the processor halts, as the trap entry does for a frame it never saved.
 ///
-/// `at` is the trap entry's witness, under which the index is read (ADR-0020 S3; TASKS item 93).
-/// The count's plain load and store rest on more than any `Here` says: that interrupts are off.
-/// A `Here` from [`crate::trap::Pinned::here`] holds with interrupts on, and an interrupt between
-/// the load and the store would lose its own count (review finding R93-10). So this stays
-/// private, and [`dispatch`], which runs with interrupts off, is its one caller; an interrupts-off
-/// token of its own is TASKS item 96's (R95-12).
-fn check_landing(at: crate::trap::Here<'_>, here: u64, vector: u64) {
-    let me = this_cpu(at);
+/// `off` is the trap entry's token that interrupts are off, under which the index is read
+/// (ADR-0020 S3; TASKS items 93 and 96). The count's plain load and store rest on it: a `Here`
+/// alone would not do, since one from [`crate::trap::Pinned::here`] holds with interrupts on, and
+/// an interrupt between the load and the store would lose its own count (review finding R93-10,
+/// closed by TASKS item 96). [`dispatch`] is its one caller.
+fn check_landing(off: crate::trap::InterruptsOff<'_>, here: u64, vector: u64) {
+    let me = this_cpu(off.here());
     let home = CONTEXTS.this(me).and_then(Contexts::running_home);
     if !home.is_some_and(|home| crate::stack::same_slot(home, here)) {
         panic!(
@@ -1250,7 +1249,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     let here = ptr::from_mut(frame).addr() as u64;
     // An entry from ring 3 must have landed on the running context's own stack (TASKS item 77).
     if frame.cs & 3 == 3 && ist_of(frame.vector) == 0 {
-        check_landing(Switch::new().here(), here, frame.vector);
+        check_landing(Switch::new().interrupts_off(), here, frame.vector);
     }
     // A program can set RFLAGS.AC; the entry path must have cleared it for the kernel.
     if frame.cs & 3 == 3 && SMAP_ON.load(Ordering::Relaxed) && read_rflags() & RFLAGS_AC != 0 {
@@ -1854,6 +1853,13 @@ pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
 /// interrupt window, idle, yield, sleep, block or exit.
 pub fn without_interrupts_here<T>(f: impl for<'a> FnOnce(crate::trap::Here<'a>) -> T) -> T {
     crate::trap::section(f)
+}
+
+/// [`without_interrupts`], with the section's token that interrupts are off (TASKS item 96, the
+/// coordinating session's ruling Q1): `trap::section_off`, which makes the token, as its
+/// documentation says. Its rules are [`without_interrupts_here`]'s.
+pub fn without_interrupts_off<T>(f: impl for<'a> FnOnce(crate::trap::InterruptsOff<'a>) -> T) -> T {
+    crate::trap::section_off(f)
 }
 
 /// This processor's CPU index, read under a witness that the reader cannot leave the processor

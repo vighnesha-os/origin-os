@@ -51,6 +51,83 @@ impl Switch {
     pub fn here(&self) -> Here<'_> {
         Here { _here: PhantomData }
     }
+
+    /// The token that interrupts are off for this switch point (ADR-0020 S3; TASKS item 96, the
+    /// coordinating session's ruling Q1): the trap entry runs with interrupts off from its first
+    /// instruction to its last, and a scheduling hook never enables them.
+    #[inline]
+    pub fn interrupts_off(&self) -> InterruptsOff<'_> {
+        InterruptsOff { _off: PhantomData }
+    }
+}
+
+/// A token that interrupts are off on the processor running the code that holds it, and stay off
+/// while it lives (TASKS item 96, the coordinating session's ruling Q1; the review of TASKS item
+/// 95, R95-12 and D95-3; the review of TASKS item 93, R93-10). Code that needs interrupts off, not
+/// only to stay on one processor, takes this and not a [`Here`]: a `Here` from [`Pinned::here`]
+/// holds with interrupts on.
+///
+/// **Who makes one.** Two makers, each in this module, and nothing else:
+/// - an interrupts-off section, `section_off` (which `cpu::without_interrupts_off` forwards to),
+///   whose closure takes the token for any lifetime it is given;
+/// - the trap entry, through its [`Switch`]: [`Switch::interrupts_off`].
+///
+/// A [`Pinned`] gives none. Its field and its constructor are private to this module. It is
+/// zero-sized and `Copy`, and neither `Send` nor `Sync`. What a section's token rests on is what a
+/// section's [`Here`] rests on: nothing its holder runs enables interrupts, opens an interrupt
+/// window, idles, yields, sleeps, blocks or exits.
+///
+/// It gives a [`Here`] for the same life ([`InterruptsOff::here`]), so a section that holds it
+/// reads the processor index too.
+///
+/// The token is valid inside its section:
+///
+/// ```
+/// let read = origin_frame::trap::host_section_off(|off| {
+///     let _ = off.here();
+///     1
+/// });
+/// assert_eq!(read, 1);
+/// ```
+///
+/// It cannot be returned from it:
+///
+/// ```compile_fail
+/// let escaped = origin_frame::trap::host_section_off(|off| off);
+/// ```
+///
+/// Nor sent to another thread:
+///
+/// ```compile_fail,E0277
+/// fn send<T: Send>(_: T) {}
+/// origin_frame::trap::host_section_off(|off| send(off));
+/// ```
+#[derive(Clone, Copy)]
+pub struct InterruptsOff<'a> {
+    _off: PhantomData<(*const (), &'a ())>,
+}
+
+// As `Here`'s.
+impl core::fmt::Debug for InterruptsOff<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("InterruptsOff")
+    }
+}
+
+impl<'a> InterruptsOff<'a> {
+    /// For `section_off` only (the kernel's target only, where it exists). Private: a call from
+    /// any other module does not build.
+    #[cfg(target_os = "none")]
+    const fn new() -> Self {
+        Self { _off: PhantomData }
+    }
+
+    /// The witness that the holder stays on its processor, for the same life: with interrupts off
+    /// nothing can switch it out. `#[inline]`, as [`Switch::here`].
+    #[inline]
+    pub fn here(self) -> Here<'a> {
+        Here { _here: PhantomData }
+    }
 }
 
 /// A witness that the code holding it runs on one processor, and cannot leave it while the witness
@@ -58,7 +135,7 @@ impl Switch {
 /// (`cpu::this_cpu`), and this processor's entry of a per-processor table is lent only for its
 /// life (`PerCpu::this`).
 ///
-/// **Who makes one.** Three makers, each in this module, and nothing else (TASKS item 93, the
+/// **Who makes one.** Four makers, each in this module, and nothing else (TASKS item 93, the
 /// coordinating session's ruling on `cba7462b`):
 /// - An interrupts-off section, `section` (which `cpu::without_interrupts_here` forwards to). Its
 ///   closure takes the witness for any lifetime it is given, so nothing bound to that lifetime can
@@ -66,6 +143,8 @@ impl Switch {
 /// - The trap entry, through its [`Switch`]: [`Switch::here`], for the scheduling hooks, the
 ///   device handlers and its own checks.
 /// - [`Pinned::here`].
+/// - [`InterruptsOff::here`], for the life of a token that only the first two kinds of maker give
+///   (TASKS item 96).
 ///
 /// Its field and its constructor are private to this module, so no other module, in this crate or
 /// another, can make one but through these makers. Of them only [`Switch::new`] is open to the
@@ -276,6 +355,16 @@ pub(crate) fn section<T>(f: impl for<'a> FnOnce(Here<'a>) -> T) -> T {
     crate::cpu::without_interrupts(|| f(Here::new()))
 }
 
+/// Runs `f` with interrupts off on this processor, with the section's [`InterruptsOff`] token
+/// (TASKS item 96, the coordinating session's ruling Q1). As [`section`], whose rules it keeps: the
+/// closure takes the token for any lifetime it is given, so nothing bound to that lifetime can
+/// leave it, and `f` must not enable interrupts, open an interrupt window, idle, yield, sleep,
+/// block or exit. `cpu::without_interrupts_off` forwards here.
+#[cfg(target_os = "none")]
+pub(crate) fn section_off<T>(f: impl for<'a> FnOnce(InterruptsOff<'a>) -> T) -> T {
+    crate::cpu::without_interrupts(|| f(InterruptsOff::new()))
+}
+
 /// The boot or idle flow's witness (ADR-0020 S2, point 4; TASKS item 93, the coordinating
 /// session's rulings Q6 and on `cba7462b`): `Some` if the context running on this processor is the
 /// processor's boot or idle flow, `None` on a thread. `cpu::flow` forwards here, and this is the
@@ -318,6 +407,13 @@ pub(crate) fn runs_a_flow(running_home: Option<u64>) -> bool {
 #[cfg(not(target_os = "none"))]
 pub fn host_section<T>(f: impl for<'a> FnOnce(Here<'a>) -> T) -> T {
     f(Here { _here: PhantomData })
+}
+
+/// For the host's tests and doctests only: runs `f` with an [`InterruptsOff`], as `section_off`
+/// does on the kernel's target. It is absent from the kernel's build.
+#[cfg(not(target_os = "none"))]
+pub fn host_section_off<T>(f: impl for<'a> FnOnce(InterruptsOff<'a>) -> T) -> T {
+    f(InterruptsOff { _off: PhantomData })
 }
 
 /// For the host's tests and doctests only: a [`PinMint`] apart from the kernel's one. It is absent
@@ -647,9 +743,15 @@ mod tests {
     /// What the scan below looks for, built so that this file does not hold it.
     const SWITCH_NEW: &str = concat!("Switch", "::new(");
 
-    /// The function enclosing each call of `Switch::new` in `text`: the nearest `fn` line above it
-    /// that no `}` at its indentation or less has closed. Comment lines do not count.
+    /// The function enclosing each call of `Switch::new` in `text` ([`callers`]).
     fn switch_makers(text: &str) -> alloc::vec::Vec<alloc::string::String> {
+        callers(text, &[SWITCH_NEW])
+    }
+
+    /// The function enclosing each line of `text` that holds one of `needles`: the nearest `fn`
+    /// line above it that no `}` at its indentation or less has closed. Comment lines do not
+    /// count.
+    fn callers(text: &str, needles: &[&str]) -> alloc::vec::Vec<alloc::string::String> {
         fn fn_name(mut line: &str) -> Option<&str> {
             loop {
                 let before = line;
@@ -690,7 +792,7 @@ mod tests {
                 within.retain(|&(at, _)| at < indent);
                 within.push((indent, name));
             }
-            if line.contains(SWITCH_NEW) {
+            if needles.iter().any(|needle| line.contains(needle)) {
                 makers.push(alloc::string::String::from(
                     within.last().map_or("(none)", |&(_, name)| name),
                 ));
@@ -717,6 +819,12 @@ mod tests {
     /// read, and the trap entry, `cpu::dispatch`, is the only function that calls it.
     #[test]
     fn only_the_trap_entry_makes_a_switch() {
+        assert_eq!(callers_in_crate(&[SWITCH_NEW]), ["cpu.rs: dispatch"]);
+    }
+
+    /// Every function of this crate's sources, as `file: function`, that holds one of `needles`
+    /// ([`callers`]): every source file is read, sorted, with repeats removed.
+    fn callers_in_crate(needles: &[&str]) -> alloc::vec::Vec<alloc::string::String> {
         let mut found = alloc::vec::Vec::new();
         let src = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
         let mut paths = alloc::vec![src.clone()];
@@ -733,14 +841,24 @@ mod tests {
                     .strip_prefix(&src)
                     .map(|f| f.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                for maker in switch_makers(&text) {
+                for maker in callers(&text, needles) {
                     found.push(format!("{file}: {maker}"));
                 }
             }
         }
         found.sort();
         found.dedup();
-        assert_eq!(found, ["cpu.rs: dispatch"]);
+        found
+    }
+
+    /// The token carries no state, prints its name alone, and gives a [`Here`].
+    #[test]
+    fn the_interrupts_off_token_gives_a_witness() {
+        host_section_off(|off| {
+            let _ = off.here();
+            assert_eq!(core::mem::size_of::<InterruptsOff<'_>>(), 0);
+            assert_eq!(format!("{off:?} {:?}", off.here()), "InterruptsOff Here");
+        });
     }
 
     /// A holder that kept the mint lends it, and the witnesses carry no state.
