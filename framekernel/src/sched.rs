@@ -917,12 +917,14 @@ pub(crate) mod pinned {
             }
         }
 
-        /// What the line calls it, with no address (ADR-0004 Amendment 2, A6).
+        /// What the line calls it, with no address (ADR-0004 Amendment 2, A6). Short enough that
+        /// every line, with its longest `then`, fits the console's line of 160 bytes (the review
+        /// of TASKS item 96, R96-9): at most 153 with a CPU of three digits.
         const fn named(self) -> &'static str {
             match self {
                 Self::DeliveryFailed => "thread migration: delivery failed",
-                Self::LendLost => "a move's lend found no frame its checks had found published",
-                Self::Misplaced => "a wake-up's location named a slot that did not hold its thread",
+                Self::LendLost => "a move's lend found no published frame",
+                Self::Misplaced => "a wake-up's location named the wrong slot",
                 Self::Exhausted => "a wake-up followed its thread 64 times",
             }
         }
@@ -976,7 +978,9 @@ pub(crate) mod pinned {
     /// A wake-up writes it inside its interrupts-off section, out of line (a change from TASKS item
     /// 96's contract, §2, which had it after the section; ruled by the coordinating session): the
     /// console queues a line written with interrupts off and pumps the UART once, as it does for
-    /// an interrupt handler's line, so the line is not lost and nothing waits.
+    /// an interrupt handler's line, so nothing waits. A full queue drops it, as it drops any line
+    /// written so, and counts the bytes it dropped (`console`'s `note_lost`; R96-9): the line is
+    /// kept short, within the console's line, so it goes in one send.
     ///
     /// **Nesting** (the ruling's first condition). No run-queue lock is held here:
     /// `origin_sync::threads::wake` calls its `report` hook after its retry or its search has
@@ -1012,16 +1016,14 @@ pub(crate) mod pinned {
     /// What a wake-up that met `met` did next, for its line: where it reached its thread, if it did.
     pub(crate) fn then_woke(met: Met, outcome: Outcome) -> &'static str {
         match (met, outcome) {
-            (Met::Misplaced, Outcome::Reached { .. }) => {
-                "; the search found the slot that holds the thread and woke it there"
-            }
-            (Met::Misplaced, Outcome::Stale) => "; the search found the record with another thread",
-            (Met::Misplaced, _) => "; the search found the record in no queue",
+            (Met::Misplaced, Outcome::Reached { .. }) => "; the search woke it in its slot",
+            (Met::Misplaced, Outcome::Stale) => "; the search found its record reused",
+            (Met::Misplaced, _) => "; the search found its record in no queue",
             (Met::Exhausted, Outcome::Reached { .. }) => {
                 "; with moves withdrawn it reached the thread"
             }
             (Met::Exhausted, Outcome::Exhausted) => {
-                "; it followed 64 more with moves withdrawn: the flag failed, and the kernel stops"
+                "; 64 more with moves withdrawn: the kernel stops"
             }
             // The second loop met a misplaced location, and the search found the record nowhere
             // (R96-10).
