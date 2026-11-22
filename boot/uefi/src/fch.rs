@@ -1346,47 +1346,127 @@ pub struct MinimalDecisionLine(pub MinimalDecision);
 
 impl fmt::Display for MinimalDecisionLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(PREFIX)?;
-        f.write_str("minimal: ")?;
-        let shutdown = match self.0 {
-            MinimalDecision::Control(status) => {
-                return write!(
-                    f,
-                    "the last reset was not a shutdown ({}): the boot's first run, the control: a triple fault now, and ExitBootServices is not called",
-                    Causes(status)
-                );
-            }
-            MinimalDecision::Call { why, shutdown } => {
-                match why {
-                    CallWhy::Mine(_) => f.write_str(
-                        "the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes",
-                    )?,
-                    CallWhy::NoRecord(status) => write!(
-                        f,
-                        "PMxC0 {status:#010x} names no reset cause: no record of the last reset, and no control in this boot"
-                    )?,
-                    CallWhy::BitsClear(status) => write!(
-                        f,
-                        "the last reset was {}, but a shutdown cannot reset this system (PMx74 bit 17 and PMx08 bit 20 are not both set): no control in this boot",
-                        Causes(status)
-                    )?,
-                    CallWhy::Contradicts(_) => f.write_str(
-                        "the FCH's registers contradict AMD's documents: no control in this boot",
-                    )?,
-                    CallWhy::NotRead => f.write_str(
-                        "the FCH's registers were not read: no control in this boot",
-                    )?,
-                }
-                shutdown
-            }
-        };
-        f.write_str(": ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it")?;
-        if !shutdown {
-            f.write_str(
-                ", though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)",
-            )?;
+        write_decision(
+            f,
+            self.0,
+            "minimal: ",
+            "ExitBootServices is called through the live boot services table",
+        )
+    }
+}
+
+/// The bisection mode's decision line (ADR-0002 Amendment 6, step 3): the minimal mode's
+/// decision, made on the same record, with the call through the loader's copy of the table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BisectDecisionLine(pub MinimalDecision);
+
+impl fmt::Display for BisectDecisionLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_decision(
+            f,
+            self.0,
+            "bisect: ",
+            "ExitBootServices is called through the loader's copy of the boot services table",
+        )
+    }
+}
+
+/// A decision line of a mode that triple-faults after every successful call: `mode` after the
+/// prefix, and `call`, how the call is made.
+fn write_decision(
+    f: &mut fmt::Formatter<'_>,
+    decision: MinimalDecision,
+    mode: &str,
+    call: &str,
+) -> fmt::Result {
+    f.write_str(PREFIX)?;
+    f.write_str(mode)?;
+    let shutdown = match decision {
+        MinimalDecision::Control(status) => {
+            return write!(
+                f,
+                "the last reset was not a shutdown ({}): the boot's first run, the control: a triple fault now, and ExitBootServices is not called",
+                Causes(status)
+            );
         }
-        Ok(())
+        MinimalDecision::Call { why, shutdown } => {
+            match why {
+                CallWhy::Mine(_) => f.write_str(
+                    "the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes",
+                )?,
+                CallWhy::NoRecord(status) => write!(
+                    f,
+                    "PMxC0 {status:#010x} names no reset cause: no record of the last reset, and no control in this boot"
+                )?,
+                CallWhy::BitsClear(status) => write!(
+                    f,
+                    "the last reset was {}, but a shutdown cannot reset this system (PMx74 bit 17 and PMx08 bit 20 are not both set): no control in this boot",
+                    Causes(status)
+                )?,
+                CallWhy::Contradicts(_) => f.write_str(
+                    "the FCH's registers contradict AMD's documents: no control in this boot",
+                )?,
+                CallWhy::NotRead => f.write_str(
+                    "the FCH's registers were not read: no control in this boot",
+                )?,
+            }
+            shutdown
+        }
+    };
+    write!(
+        f,
+        ": {call}; after EFI_SUCCESS, a triple fault and nothing before it"
+    )?;
+    if !shutdown {
+        f.write_str(
+            ", though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)",
+        )?;
+    }
+    Ok(())
+}
+
+/// `BENCH-FCH` as the bisection mode reads it, which only QEMU's ESP may hold (ADR-0002 Amendment
+/// 6; ruling Q2 of TASKS item 131): [`Pretend`]'s words, with `mine` naming a shutdown (bit 23),
+/// and `noreset` (Amendment 3's order calls no `ResetSystem`, so its FADT step is reached). `nocf9`
+/// and `slow` mean nothing in a mode with no `0xCF9` write and no wait of `Pretend`'s, so they
+/// are not understood. Compiled only into a bisection-mode build and the host tests.
+#[cfg(any(test, origin_bench_bisect))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BisectSwitch {
+    /// The values.
+    pub pretend: Pretend,
+    /// `noreset`: no `ResetSystem` in Amendment 3's order.
+    pub no_reset_system: bool,
+}
+
+#[cfg(any(test, origin_bench_bisect))]
+impl BisectSwitch {
+    /// The switch's contents; `None` for words not understood.
+    pub fn from_contents(contents: &[u8]) -> Option<Self> {
+        let mut no_reset_system = false;
+        let mut rest: [u8; 32] = [b' '; 32];
+        let mut n = 0;
+        for word in contents
+            .split(u8::is_ascii_whitespace)
+            .filter(|w| !w.is_empty())
+        {
+            match word {
+                b"noreset" if !no_reset_system => no_reset_system = true,
+                b"noreset" | b"nocf9" | b"slow" => return None,
+                other => {
+                    let end = n + other.len() + 1;
+                    if end > rest.len() {
+                        return None;
+                    }
+                    rest[n..n + other.len()].copy_from_slice(other);
+                    n = end;
+                }
+            }
+        }
+        Some(Self {
+            pretend: Pretend::from_contents(&rest[..n])?,
+            no_reset_system,
+        })
     }
 }
 
@@ -2401,6 +2481,53 @@ mod tests {
                 shutdown: false
             }
         );
+    }
+
+    #[test]
+    fn the_bisection_modes_switch_and_lines() {
+        let switch = |words: &[u8]| BisectSwitch::from_contents(words);
+        let mine = switch(b"mine").unwrap();
+        assert_eq!(
+            (mine.pretend.kind, mine.no_reset_system),
+            (Kind::Mine, false)
+        );
+        // `mine` names a shutdown, as in the minimal mode.
+        assert_eq!(
+            mine.pretend.values_minimal(None).reset_status,
+            LAST_RESET_SHUTDOWN
+        );
+        let noreset = switch(b"mine\nnoreset").unwrap();
+        assert!(noreset.no_reset_system);
+        assert_eq!(noreset.pretend, mine.pretend);
+        let clear = switch(b"norecord noshutdown").unwrap();
+        assert!(clear.pretend.no_shutdown);
+        for refused in [
+            &b"mine noreset noreset"[..],
+            b"mine nocf9",
+            b"mine slow",
+            b"noreset",
+            b"mine first",
+            b"",
+        ] {
+            assert_eq!(switch(refused), None, "{:?}", core::str::from_utf8(refused));
+        }
+        let line = |d| BisectDecisionLine(d).to_string();
+        assert_eq!(
+            line(MinimalDecision::Control(1 << 16)),
+            "origin-boot: bench build: bisect: the last reset was not a shutdown (the reset pin (bit 16)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called"
+        );
+        assert_eq!(
+            line(MinimalDecision::Call {
+                why: CallWhy::Mine(LAST_RESET_SHUTDOWN),
+                shutdown: true
+            }),
+            "origin-boot: bench build: bisect: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the loader's copy of the boot services table; after EFI_SUCCESS, a triple fault and nothing before it"
+        );
+        assert!(line(MinimalDecision::Call {
+            why: CallWhy::NotRead,
+            shutdown: false
+        })
+        .ends_with("through the loader's copy of the boot services table; after EFI_SUCCESS, a triple fault and nothing before it, though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)"));
     }
 
     #[test]

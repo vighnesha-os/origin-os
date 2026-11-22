@@ -113,7 +113,10 @@ commands:
               signed, never shipped. With --minimal, also the loader's minimal-program mode
               (ADR-0002 Amendment 5; TASKS item 128), staged with the bench kernel in
               target/bench-minimal/xtask, and its machine code checked: no 0xCF9 anywhere,
-              and only the status compare and branches between the call and the triple fault
+              and only the status compare and branches between the call and the triple fault.
+              With --bisect, the loader's bisection mode (ADR-0002 Amendment 6; TASKS item
+              131) in target/bench-bisect/xtask, with the same checks and one more: the call's
+              target is not loaded through the live boot services table
   boot-bench  Clippy over the bench code, bench-build, and four boots with the SPCR naming
               COM2: ExitBootServices given the firmware's key, a stale key once (the retry),
               twice (the halt, which says why and then nothing), and the bench kernel under the
@@ -376,6 +379,9 @@ enum Loader {
     /// TASKS item 128: the bench loader's minimal-program mode (ADR-0002 Amendment 5), into
     /// `target/bench-minimal` (`bench::build_minimal_loader`).
     BenchMinimal,
+    /// TASKS item 131: the bench loader's bisection mode (ADR-0002 Amendment 6), into
+    /// `target/bench-bisect` (`bench::build_bisect_loader`).
+    BenchBisect,
 }
 
 impl Loader {
@@ -385,6 +391,7 @@ impl Loader {
             Self::Developer
             | Self::Bench
             | Self::BenchMinimal
+            | Self::BenchBisect
             | Self::MeasureNormal
             | Self::MeasureBench => "developer-mode",
             Self::Verifying => "test-trust-store",
@@ -4616,6 +4623,9 @@ fn main() -> ExitCode {
         ["bench-build", "--minimal"] => in_turn("bench-build --minimal", || {
             bench::build_minimal().map(|_| ())
         }),
+        ["bench-build", "--bisect"] => {
+            in_turn("bench-build --bisect", || bench::build_bisect().map(|_| ()))
+        }
         ["bench-gate"] => bench::gate(),
         ["stack-depth"] => in_turn_with_settings("stack-depth", stack_depth::run),
         ["boot-bridge"] => in_turn_with_settings("boot-bridge", boot_bridge),
@@ -6930,6 +6940,7 @@ fn build_loader(loader: Loader) -> Result<PathBuf> {
     match loader {
         Loader::Bench => bench::build_loader(),
         Loader::BenchMinimal => bench::build_minimal_loader(),
+        Loader::BenchBisect => bench::build_bisect_loader(),
         Loader::MeasureNormal => stack_depth::build_loader(false),
         Loader::MeasureBench => stack_depth::build_loader(true),
         _ => build_loader_in(Some(loader.feature()), None),

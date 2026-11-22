@@ -1085,6 +1085,10 @@ RESET_BUILD_LINE = "BENCH-AFTER"
 # call, whose loader runs are the experiment's answer. Its last line before the call.
 MINIMAL_BUILD_LINE = "bench build: minimal"
 MINIMAL_LAST_LINE = b"ExitBootServices next, through the live boot services table"
+# TASKS item 131 (ADR-0002 Amendment 6): the bisection-mode bench loader, the full loader's work
+# with the minimal mode's resets; its text, and its last line before the call.
+BISECT_BUILD_LINE = "bench build: bisect"
+BISECT_LAST_LINE = b"ExitBootServices next, through the loader's copy of the boot services table"
 LOADER_START = "UEFI loader (build"
 TIMES_FILE = "sol-times.log"
 # How many boots a rental B makes and how long each may take, unless the command line says.
@@ -1124,6 +1128,7 @@ CONTROL_TEXT = b"the control:"
 # The last line a bench loader prints before the call: the minimal mode's, and the full bench
 # mode's (TASKS items 116 and 121). A run that printed one made the call, mark or no mark (R130-3).
 CALL_LINES = (b"ExitBootServices next, through the live boot services table",
+              b"ExitBootServices next, through the loader's copy of the boot services table",
               b"exiting boot services")
 # Output after a run's last byte is the firmware starting again only if it comes at least FLOOR_S
 # later, before the hang's wait, and, once the controls have shown how this firmware's starts
@@ -1134,9 +1139,10 @@ RESTARTS_FILE = "restarts.log"
 
 
 def minimal_image(data):
-    """Whether a loader's bytes are the minimal-mode bench build's (TASKS item 128): its lines say
-    so, as F2 checks."""
-    return MINIMAL_BUILD_LINE.encode() in data
+    """Whether a loader's bytes are a bench build that triple-faults after every successful call
+    and whose boots end at their answer: the minimal mode's (TASKS item 128) or the bisection
+    mode's (TASKS item 131). Their lines say so, as F2 checks."""
+    return MINIMAL_BUILD_LINE.encode() in data or BISECT_BUILD_LINE.encode() in data
 
 
 def plain(x):
@@ -1465,7 +1471,7 @@ def resets_after_call(text):
     """Whether one boot's console text is a bench loader's that resets the machine after the call,
     instead of entering the kernel: TASKS item 116's (it says whether BENCH-AFTER is there) or the
     minimal mode's (TASKS item 128)."""
-    return RESET_BUILD_LINE in text or MINIMAL_BUILD_LINE in text
+    return RESET_BUILD_LINE in text or MINIMAL_BUILD_LINE in text or BISECT_BUILD_LINE in text
 
 
 def breadcrumbs(text):
@@ -1510,8 +1516,8 @@ def boot_result(text):
         # TASKS item 130: loader runs alone never say that no reset came: the firmware prints for
         # a minute or more after a reset before the next banner, and one of the tool's restarts
         # may come first. Whether one came is read from the firmware's starts (`read_runs`).
-        if MINIMAL_BUILD_LINE in text:
-            calls = text.count(MINIMAL_LAST_LINE.decode())
+        if MINIMAL_BUILD_LINE in text or BISECT_BUILD_LINE in text:
+            calls = text.count(MINIMAL_LAST_LINE.decode()) + text.count(BISECT_LAST_LINE.decode())
             seen["calls"] = calls
             said += f", calls: {calls}"
     verdict = next((l for l in lines if VERDICT_LINE in l or REFUSED_LINE in l), None)
@@ -1713,6 +1719,9 @@ def loader_kind(path):
     """What the image directory's loader is: a bench build's says so in its own bytes (TASKS
     items 112 and 116, F2's text)."""
     data = Path(path).read_bytes() if Path(path).exists() else b""
+    if BISECT_BUILD_LINE.encode() in data:
+        return ("the bisection-mode bench loader (ADR-0002 Amendment 6; developer-mode, the TEST "
+                "trust store; never signed or shipped)")
     if minimal_image(data):
         return ("the minimal-mode bench loader (ADR-0002 Amendment 5; developer-mode, the TEST "
                 "trust store; never signed or shipped)")

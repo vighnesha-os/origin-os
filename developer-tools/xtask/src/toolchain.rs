@@ -275,6 +275,24 @@ fn bench_minimal_entries() -> Vec<String> {
     )
 }
 
+/// [`image_config`] and, for the UEFI target only, `--cfg origin_bench` and `--cfg
+/// origin_bench_bisect`: the bench loader's bisection mode (ADR-0002 Amendment 6; TASKS item
+/// 131). Only `bench::build_bisect_loader` and the bench Clippy run use it, into
+/// `target/bench-bisect`; the kernel it is staged with is the bench kernel.
+pub(crate) fn bench_bisect_config() -> Result<Vec<String>> {
+    let mut config = image_config()?;
+    config.extend(bench_bisect_entries());
+    Ok(config)
+}
+
+/// The bisection mode's own entries.
+fn bench_bisect_entries() -> Vec<String> {
+    entries_for(
+        &[UEFI_TARGET],
+        r#"["--cfg","origin_bench","--cfg","origin_bench_bisect"]"#,
+    )
+}
+
 /// [`image_config`] and, for the UEFI target only, the stack-measurement build of the loader
 /// (TASKS item 127): `--cfg origin_stack_measure`, with `bench` `--cfg origin_bench` too, and a
 /// link map written to `map` for the static chain. Only `stack_depth::build_loader` and its Clippy
@@ -513,6 +531,16 @@ mod tests {
                 "--config",
                 &format!(
                     r#"target.{UEFI_TARGET}.rustflags=["--cfg","origin_bench","--cfg","origin_bench_minimal"]"#
+                ),
+            ]
+        );
+        // TASKS item 131: the bisection mode, the same way.
+        assert_eq!(
+            bench_bisect_entries(),
+            [
+                "--config",
+                &format!(
+                    r#"target.{UEFI_TARGET}.rustflags=["--cfg","origin_bench","--cfg","origin_bench_bisect"]"#
                 ),
             ]
         );

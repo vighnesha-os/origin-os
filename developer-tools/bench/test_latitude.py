@@ -458,6 +458,10 @@ class Guards(unittest.TestCase):
         # TASKS item 128: the minimal mode names itself.
         bench.write_bytes(b"MZ...origin-boot: bench build: minimal: the minimal-program mode")
         self.assertIn("the minimal-mode bench loader", self.lat.loader_kind(bench))
+        # TASKS item 131: so does the bisection mode, and its boots end at their answer too.
+        bench.write_bytes(b"MZ...origin-boot: bench build: bisect: the bisection mode")
+        self.assertIn("the bisection-mode bench loader", self.lat.loader_kind(bench))
+        self.assertTrue(self.lat.minimal_image(bench.read_bytes()))
 
     def test_a_minimal_build_counts_the_loaders_runs_and_times_them(self):
         # TASKS item 128 (ruling R128-2): the minimal mode never says BENCH-AFTER; its own text
@@ -558,6 +562,26 @@ class Guards(unittest.TestCase):
         raw, times = self.pieces((50.0, self.CONTROL), (98.5, self.FIRMWARE), (150.0, self.CALL),
                                  (170.0, self.CLIENT))
         self.assertEqual(read(raw, times, [0.0], 300.0)[1]["answer"], "none")
+
+    def test_a_bisection_runs_are_read_as_the_minimal_modes(self):
+        # TASKS item 131: the bisection mode's control and call, its own last line before the
+        # call, and its calls counted.
+        banner = self.BANNER
+        control = banner + (b"origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6)\r\n"
+                            b"origin-boot: bench build: bisect: the last reset was not a shutdown (the reset pin (bit 16)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called\r\n")
+        call = banner + (b"origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6)\r\n"
+                         b"origin-boot: bench build: the FCH's registers (read): PMxC0 0x00900800\r\n"
+                         b"origin-boot: bench build: bisect: ExitBootServices next, through the loader's copy of the boot services table\r\nX\r\n")
+        raw, times = self.pieces((50.0, control), (98.5, self.FIRMWARE), (150.0, call), (199.0, self.FIRMWARE))
+        runs = self.lat.read_runs(raw, times, [0.0], 300.0)
+        self.assertEqual([(r["branch"], r["answer"]) for r in runs], [("control", "reset"), ("call", "reset")])
+        self.assertEqual(runs[1]["pmxc0"], "0x00900800")
+        result = self.lat.boot_result(self.lat.clean(raw.decode()))
+        self.assertEqual((result["loader_runs"], result["calls"]), (2, 1))
+        # A call line with its mark lost is still a call (R130-3).
+        no_mark = call.replace(b"\r\nX\r\n", b"\r\n")
+        raw, times = self.pieces((50.0, control), (98.5, self.FIRMWARE), (150.0, no_mark))
+        self.assertEqual(self.lat.read_runs(raw, times, [0.0], 160.0)[1]["branch"], "call")
 
     def test_a_retrys_marks_are_the_runs_own(self):
         # R130-1: X, then Y a second later when the first call fails, belong to the run; the

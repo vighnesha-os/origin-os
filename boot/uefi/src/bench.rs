@@ -204,6 +204,9 @@ pub enum After {
     /// [`After::Fadt`], `ResetSystem` is not called, so the FADT's step is reached. Never read from
     /// [`AFTER_PATH`].
     StandInNoReset,
+    /// The bisection mode's `BENCH-FCH` word `noreset` (ADR-0002 Amendment 6, QEMU only): as
+    /// [`After::StandInNoReset`]. Never read from [`AFTER_PATH`].
+    SwitchNoReset,
 }
 
 impl After {
@@ -225,7 +228,10 @@ impl After {
 
     /// Whether Amendment 3's order calls no `ResetSystem` in this mode.
     pub const fn skips_reset_system(self) -> bool {
-        matches!(self, Self::Fadt | Self::StandInNoReset)
+        matches!(
+            self,
+            Self::Fadt | Self::StandInNoReset | Self::SwitchNoReset
+        )
     }
 
     /// The loader's line on its console about the switch: `found` is `None` with no
@@ -252,6 +258,9 @@ impl After {
             }
             Some(Some(Self::StandInNoReset)) => {
                 "the stand-in table's noreset: Amendment 3's order calls no ResetSystem"
+            }
+            Some(Some(Self::SwitchNoReset)) => {
+                "BENCH-FCH's noreset: Amendment 3's order calls no ResetSystem"
             }
         }
     }
@@ -501,6 +510,9 @@ pub enum NoReset {
     /// 128's Q3). Under QEMU the FADT's reset register is that port; on the rented board it is
     /// the SMI command port `0xB2`.
     Cf9InMinimal,
+    /// I/O port `0xCF9`, which the bisection mode never writes either (ADR-0002 Amendment 6, step
+    /// 5: "with the FADT step skipped where its register is I/O port `0xCF9`").
+    Cf9InBisect,
 }
 
 /// The FADT's reset register as the minimal mode may use it in Amendment 3's order: the same,
@@ -512,6 +524,55 @@ pub const fn minimal_register(
     match register {
         Ok(ResetRegister::Io { port: 0xCF9, .. }) => Err(NoReset::Cf9InMinimal),
         other => other,
+    }
+}
+
+/// [`minimal_register`] for the bisection mode (ADR-0002 Amendment 6, step 5).
+pub const fn bisect_register(
+    register: Result<ResetRegister, NoReset>,
+) -> Result<ResetRegister, NoReset> {
+    match register {
+        Ok(ResetRegister::Io { port: 0xCF9, .. }) => Err(NoReset::Cf9InBisect),
+        other => other,
+    }
+}
+
+/// The bisection mode's first line, after the banner (ADR-0002 Amendment 6; ruling Q8 of TASKS
+/// item 131). The rental tool tells a bisection-mode image by its text, `bench build: bisect`.
+pub const BISECT_LINE: &str = "origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write";
+
+/// The bisection mode's line about `BENCH-AFTER`, which it reads as the full loader does and
+/// whose value it ignores (ruling Q3 of TASKS item 131).
+pub const BISECT_AFTER_IGNORED: &str = "origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults";
+
+/// The bisection mode's last line through the firmware's console, in place of the full loader's
+/// "exiting boot services; entering the Framekernel".
+pub const BISECT_LAST_LINE: &str = "origin-boot: bench build: bisect: ExitBootServices next, through the loader's copy of the boot services table";
+
+/// What the bisection mode counted in the last memory map it translated before its last line
+/// (ADR-0002 Amendment 6, step 2; rulings Q6 and Q7 of TASKS item 131): the descriptors of an
+/// OS-defined type, `0x8000_0000` or above, and the first such type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OsTypesLine(pub Option<crate::memmap::OsTypes>);
+
+impl fmt::Display for OsTypesLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("origin-boot: bench build: bisect: ")?;
+        match self.0 {
+            None => f.write_str(
+                "the memory map the page tables were built from was not read, so its types were not counted; this run does not show that the map holds no OS-defined type",
+            ),
+            Some(t) if t.count == 0 => write!(
+                f,
+                "the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in {} descriptors",
+                t.descriptors
+            ),
+            Some(t) => write!(
+                f,
+                "the memory map the page tables were built from holds {} region(s) of an OS-defined type (0x80000000 and above), the first {:#010x}, in {} descriptors: this run does not answer whether the call returns without Origin's OS-defined types",
+                t.count, t.first, t.descriptors
+            ),
+        }
     }
 }
 
@@ -761,6 +822,9 @@ impl fmt::Display for NoReset {
             Self::Cf9InMinimal => f.write_str(
                 "RESET_REG is I/O port 0xcf9, which the minimal mode never writes (ADR-0002 Amendment 5)",
             ),
+            Self::Cf9InBisect => f.write_str(
+                "RESET_REG is I/O port 0xcf9, which the bisection mode never writes (ADR-0002 Amendment 6)",
+            ),
         }
     }
 }
@@ -907,6 +971,8 @@ pub enum Tried {
     NotCalled,
     /// The minimal mode's stand-in table asked for it not to be called ([`After::StandInNoReset`]).
     NotCalledStandIn,
+    /// The bisection mode's `BENCH-FCH` asked for it not to be called ([`After::SwitchNoReset`]).
+    NotCalledSwitch,
     /// There was none to call.
     Unavailable,
 }
@@ -928,6 +994,7 @@ impl fmt::Display for Fallback {
             Tried::Returned => "ResetSystem returned",
             Tried::NotCalled => "ResetSystem was not called (BENCH-AFTER fadt)",
             Tried::NotCalledStandIn => "ResetSystem was not called (the stand-in table's noreset)",
+            Tried::NotCalledSwitch => "ResetSystem was not called (BENCH-FCH's noreset)",
             Tried::Unavailable => "there was no ResetSystem to call",
         })?;
         match self.register {
@@ -1636,6 +1703,54 @@ mod tests {
     }
 
     // TASKS item 128.
+
+    #[test]
+    fn the_bisection_mode_skips_0xcf9_and_counts_os_types() {
+        let cf9 = Ok(ResetRegister::Io {
+            port: 0xCF9,
+            value: 0x06,
+        });
+        assert_eq!(bisect_register(cf9), Err(NoReset::Cf9InBisect));
+        let smi = Ok(ResetRegister::Io {
+            port: 0xB2,
+            value: 0xBE,
+        });
+        assert_eq!(bisect_register(smi), smi);
+        let line = Fallback {
+            tried: Tried::NotCalledSwitch,
+            register: bisect_register(cf9),
+        }
+        .to_string();
+        assert_eq!(
+            line,
+            "origin-boot: bench build: ResetSystem was not called (BENCH-FCH's noreset), and the FADT gives no usable reset register (RESET_REG is I/O port 0xcf9, which the bisection mode never writes (ADR-0002 Amendment 6)): halting"
+        );
+        assert!(After::SwitchNoReset.skips_reset_system() && !After::SwitchNoReset.enters_kernel());
+        let none = crate::memmap::OsTypes {
+            descriptors: 61,
+            count: 0,
+            first: 0,
+        };
+        assert_eq!(
+            OsTypesLine(Some(none)).to_string(),
+            "origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 61 descriptors"
+        );
+        let some = crate::memmap::OsTypes {
+            descriptors: 61,
+            count: 2,
+            first: 0x8000_0003,
+        };
+        // Ruling Q7 of TASKS item 131: a count above zero is printed, and voids the second
+        // question's answer for that run.
+        assert!(OsTypesLine(Some(some)).to_string().ends_with(
+            "holds 2 region(s) of an OS-defined type (0x80000000 and above), the first 0x80000003, in 61 descriptors: this run does not answer whether the call returns without Origin's OS-defined types"
+        ));
+        assert!(OsTypesLine(None).to_string().contains("was not read"));
+        assert!(
+            BISECT_LINE.contains("bench build: bisect")
+                && BISECT_LAST_LINE.contains("bench build: bisect")
+        );
+    }
 
     #[test]
     fn the_minimal_mode_skips_a_reset_register_at_0xcf9_and_keeps_any_other() {
