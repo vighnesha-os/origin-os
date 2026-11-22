@@ -1430,3 +1430,17 @@ Six bench rentals (A to F, 2026-11-12 to 2026-11-22) cost $4.86 of item 225's $1
   - Free testing always comes first.
 - **The alternatives put:** stop renting now, keeping the bench work on QEMU and CI until a test machine is bought; or keep the current pace.
 - **Where it is written:** this sheet, TASKS item 128's entry, and the coordinating session's rental notes.
+
+### Vendor driver code used directly? (item 351): Answered 2026-11-22, reference only
+
+The owner asked whether driver code that vendors themselves contribute to Linux (Intel, AMD, NVIDIA and others) could be used directly where no specification can be downloaded, instead of only being read as a reference. Two limits were put with it:
+- GPL-only code cannot be used in a repository licensed MIT OR Apache-2.0;
+- Linux driver code is C written against Linux's internals, so using it directly needs a compatibility layer and a C compiler in the build.
+
+| # | Question | Answer |
+|---|---|---|
+| 351, answered | Should vendor-written driver code be usable directly, under a compatible licence only, each use a CLAUDE.md §5 runtime-dependency exception approved per driver, running only in user mode behind the IOMMU? Or keep today's rule, reference only? | **Reference only** |
+
+- **The recommendation put** was to allow it within those limits; the owner chose to keep today's rule.
+- **What it confirms:** CLAUDE.md §3 and decision items 91 to 97 stand. Where no free official specification or vendor document exists, Linux and other open-source code, the vendors' own contributions included, may be read only as a reference, under §3's separate-session process, and never copied, translated or reproduced in structure. Origin writes every driver itself. Vendor firmware stays usable as §4 and §38 allow, subject to its licence.
+- **Where it is written:** this sheet, and the requirements README's table of items without rows.
