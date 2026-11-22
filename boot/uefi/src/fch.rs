@@ -1427,9 +1427,11 @@ fn write_decision(
 
 /// `BENCH-FCH` as the bisection mode reads it, which only QEMU's ESP may hold (ADR-0002 Amendment
 /// 6; ruling Q2 of TASKS item 131): [`Pretend`]'s words, with `mine` naming a shutdown (bit 23),
-/// and `noreset` (Amendment 3's order calls no `ResetSystem`, so its FADT step is reached). `nocf9`
-/// and `slow` mean nothing in a mode with no `0xCF9` write and no wait of `Pretend`'s, so they
-/// are not understood. Compiled only into a bisection-mode build and the host tests.
+/// and `noreset` (Amendment 3's order calls no `ResetSystem`, so its FADT step is reached).
+/// `noshutdown` clears the shutdown message (`PMx74` bit 17), as in the minimal mode, so the
+/// decision withholds the control and the line says a shutdown may not reset. `nocf9` and `slow`
+/// mean nothing in a mode with no `0xCF9` write and no wait of `Pretend`'s, so they are not
+/// understood. Compiled only into a bisection-mode build and the host tests.
 #[cfg(any(test, origin_bench_bisect))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BisectSwitch {
@@ -1453,12 +1455,15 @@ impl BisectSwitch {
             match word {
                 b"noreset" if !no_reset_system => no_reset_system = true,
                 b"noreset" | b"nocf9" | b"slow" => return None,
+                // A space between kept words only, so the 32 bytes the loader reads always fit
+                // (TASKS item 131's review, R131-8).
                 other => {
-                    let end = n + other.len() + 1;
+                    let at = if n == 0 { 0 } else { n + 1 };
+                    let end = at + other.len();
                     if end > rest.len() {
                         return None;
                     }
-                    rest[n..n + other.len()].copy_from_slice(other);
+                    rest[at..end].copy_from_slice(other);
                     n = end;
                 }
             }
@@ -2501,6 +2506,10 @@ mod tests {
         assert_eq!(noreset.pretend, mine.pretend);
         let clear = switch(b"norecord noshutdown").unwrap();
         assert!(clear.pretend.no_shutdown);
+        // R131-8: a full 32-byte switch with no trailing space still fits.
+        let full = b"norecord noshutdown smi=04000000";
+        assert_eq!(full.len(), 32);
+        assert!(switch(full).is_some_and(|s| s.pretend.smi == Some(0x0400_0000)));
         for refused in [
             &b"mine noreset noreset"[..],
             b"mine nocf9",
@@ -2528,6 +2537,20 @@ mod tests {
             shutdown: false
         })
         .ends_with("through the loader's copy of the boot services table; after EFI_SUCCESS, a triple fault and nothing before it, though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)"));
+        // R131-5: the two lines `boot-bench`'s scenarios for the rental's path and for the control
+        // withheld wait for, whole, from the decision their inputs give.
+        assert_eq!(
+            line(MinimalDecision::of(None, None)),
+            "origin-boot: bench build: bisect: the FCH's registers were not read: no control in this boot: ExitBootServices is called through the loader's copy of the boot services table; after EFI_SUCCESS, a triple fault and nothing before it, though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)"
+        );
+        let withheld = switch(b"first noshutdown").unwrap().pretend;
+        assert_eq!(
+            line(MinimalDecision::of(
+                Some(&withheld.values_minimal(None)),
+                None
+            )),
+            "origin-boot: bench build: bisect: the last reset was the reset pin (bit 16), but a shutdown cannot reset this system (PMx74 bit 17 and PMx08 bit 20 are not both set): no control in this boot: ExitBootServices is called through the loader's copy of the boot services table; after EFI_SUCCESS, a triple fault and nothing before it, though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)"
+        );
     }
 
     #[test]

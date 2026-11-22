@@ -562,6 +562,10 @@ impl fmt::Display for OsTypesLine {
             None => f.write_str(
                 "the memory map the page tables were built from was not read, so its types were not counted; this run does not show that the map holds no OS-defined type",
             ),
+            // R131-4: a map of no descriptors shows nothing.
+            Some(t) if t.descriptors == 0 => f.write_str(
+                "the memory map the page tables were built from held no descriptor to count, so its types were not counted; this run does not show that the map holds no OS-defined type",
+            ),
             Some(t) if t.count == 0 => write!(
                 f,
                 "the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in {} descriptors",
@@ -975,6 +979,19 @@ pub enum Tried {
     NotCalledSwitch,
     /// There was none to call.
     Unavailable,
+}
+
+impl Tried {
+    /// Why `ResetSystem` was not called in `after`'s mode: the mode asked for it not to be, or
+    /// there was none to call (TASKS item 131's review, R131-1).
+    pub const fn not_called(after: After) -> Self {
+        match after {
+            After::Fadt => Self::NotCalled,
+            After::StandInNoReset => Self::NotCalledStandIn,
+            After::SwitchNoReset => Self::NotCalledSwitch,
+            After::Reset | After::Kernel | After::Disturb => Self::Unavailable,
+        }
+    }
 }
 
 /// The line straight to the UART when `ResetSystem` did not reset the machine: the FADT's
@@ -1726,6 +1743,23 @@ mod tests {
             "origin-boot: bench build: ResetSystem was not called (BENCH-FCH's noreset), and the FADT gives no usable reset register (RESET_REG is I/O port 0xcf9, which the bisection mode never writes (ADR-0002 Amendment 6)): halting"
         );
         assert!(After::SwitchNoReset.skips_reset_system() && !After::SwitchNoReset.enters_kernel());
+        // R131-1: each mode that skips `ResetSystem` names itself in the fallback's line, and every
+        // other says there was none to call.
+        for (after, tried) in [
+            (After::Fadt, Tried::NotCalled),
+            (After::StandInNoReset, Tried::NotCalledStandIn),
+            (After::SwitchNoReset, Tried::NotCalledSwitch),
+            (After::Reset, Tried::Unavailable),
+            (After::Kernel, Tried::Unavailable),
+            (After::Disturb, Tried::Unavailable),
+        ] {
+            assert_eq!(Tried::not_called(after), tried, "{after:?}");
+            assert_eq!(
+                after.skips_reset_system(),
+                tried != Tried::Unavailable,
+                "{after:?}"
+            );
+        }
         let none = crate::memmap::OsTypes {
             descriptors: 61,
             count: 0,
@@ -1746,6 +1780,17 @@ mod tests {
             "holds 2 region(s) of an OS-defined type (0x80000000 and above), the first 0x80000003, in 61 descriptors: this run does not answer whether the call returns without Origin's OS-defined types"
         ));
         assert!(OsTypesLine(None).to_string().contains("was not read"));
+        let empty = crate::memmap::OsTypes::default();
+        assert!(
+            OsTypesLine(Some(empty))
+                .to_string()
+                .contains("held no descriptor to count")
+        );
+        assert!(
+            !OsTypesLine(Some(empty))
+                .to_string()
+                .contains("holds no region")
+        );
         assert!(
             BISECT_LINE.contains("bench build: bisect")
                 && BISECT_LAST_LINE.contains("bench build: bisect")

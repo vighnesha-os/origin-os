@@ -503,7 +503,9 @@ class Guards(unittest.TestCase):
         # at rental G's delays (5.8 minutes), three of eight otherwise; every plan must end its
         # boots before the loop stops, setup included.
         plan = self.lat.boot_plan
-        self.assertAlmostEqual(self.lat.window_s(self.lat.PLAN_FIGURES), 346.0)
+        # R131-9: with the loader's own time, three runs of 0.6 s, the window is 347.8 s, still
+        # 5.8 minutes when rounded up.
+        self.assertAlmostEqual(self.lat.window_s(self.lat.PLAN_FIGURES), 347.8)
         self.assertEqual(plan(True, None, None, 50), (6, 5.8, None))   # 5 + 34.8 = 39.8
         self.assertEqual(plan(False, None, None, 50), (3, 8, None))
         self.assertEqual(plan(True, 7, 5, 50), (7, 5, None))            # 5 + 35 = 40, just inside
@@ -582,6 +584,21 @@ class Guards(unittest.TestCase):
         no_mark = call.replace(b"\r\nX\r\n", b"\r\n")
         raw, times = self.pieces((50.0, control), (98.5, self.FIRMWARE), (150.0, no_mark))
         self.assertEqual(self.lat.read_runs(raw, times, [0.0], 160.0)[1]["branch"], "call")
+        # R131-9: the bisection mode does the full loader's work before its decision and its
+        # call. A boot waits for it, here 20 s from each banner to the run's last byte, longer
+        # than SLACK_S, so the next run's registers would otherwise be missed on a slow console.
+        mode = b"origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6)\r\n"
+        head = len(banner + mode)
+        raw, times = self.pieces((30.0, banner + mode), (50.0, control[head:]), (98.5, self.FIRMWARE),
+                                 (150.0, banner + mode), (170.0, call[head:]), (219.0, self.FIRMWARE))
+        runs = self.lat.read_runs(raw, times, [0.0], 300.0)
+        self.assertEqual([(r["branch"], r["answer"]) for r in runs], [("control", "reset"), ("call", "reset")])
+        fig = self.lat.figures(runs)
+        self.assertEqual((fig["load"], fig["work"]), (51.5, 20.0))
+        self.assertFalse(self.lat.boot_over(runs, 0, 219.0 + 51.5 + 20.0 + self.lat.SLACK_S - 0.5))
+        self.assertTrue(self.lat.boot_over(runs, 0, 219.0 + 51.5 + 20.0 + self.lat.SLACK_S))
+        # Three runs' work in the window: the control's, the call's and the next run's.
+        self.assertAlmostEqual(self.lat.window_s(fig) - self.lat.window_s(dict(fig, work=0.0)), 60.0)
 
     def test_a_retrys_marks_are_the_runs_own(self):
         # R130-1: X, then Y a second later when the first call fails, belong to the run; the
@@ -704,7 +721,7 @@ class Guards(unittest.TestCase):
         self.assertEqual([r["answer"] for r in runs], ["reset", "reset", "pending"])
         self.assertEqual((runs[2]["start"], runs[2]["restarted"]), (301.0, 238.0))
         fig = self.lat.figures(runs)
-        self.assertEqual(fig, {"start": 48.5, "load": 54.0, "restart": 63.0})
+        self.assertEqual(fig, {"start": 48.5, "load": 54.0, "restart": 63.0, "work": 0.0})
         # A restart that overtook a run measures nothing.
         runs = self.lat.read_runs(raw, times, [0.0, 152.0], 500.0)
         self.assertEqual(self.lat.figures(runs)["restart"], self.lat.PLAN_RESTART_S)
@@ -721,9 +738,12 @@ class Guards(unittest.TestCase):
         # TASKS item 130: rental F's 2.5 is quicker than rental G's 2.4a, and the window says so
         # (rental F's reset to the first byte and first byte to banner as `reread` measures them;
         # its restart delay, which no run measured, taken as 20 s).
+        # R131-9: with the loader's own time, three times in a boot: rental G's minimal program's
+        # 0.5 s (345.5 s), and rental F's full bench loader's 1.0 s, twice there, as the hang's wait is the
+        # longer (176.2 s).
         window = self.lat.window_s
-        self.assertAlmostEqual(window({"start": 48.9, "load": 54.4, "restart": 68.0}), 344.0)
-        self.assertAlmostEqual(window({"start": 3.5, "load": 43.6, "restart": 20.0}), 174.2)
+        self.assertAlmostEqual(window({"start": 48.9, "load": 54.4, "restart": 68.0, "work": 0.5}), 345.5)
+        self.assertAlmostEqual(window({"start": 3.5, "load": 43.6, "restart": 20.0, "work": 1.0}), 176.2)
 
     def test_rental_gs_console_reads_a_reset_after_every_call_it_can_judge(self):
         # TASKS item 130's replay: rental G's own console (developer-tools/bench/fixtures: the
@@ -746,7 +766,7 @@ class Guards(unittest.TestCase):
         self.assertEqual([r["after_s"] for r in runs if r["branch"] == "control"],
                          [48.5, 48.3, 48.3, 48.8, 48.4, 48.9])
         self.assertTrue(all(r["pmxc0"] == "0x00900800" for r in calls))
-        self.assertEqual(lat.figures(runs), {"start": 48.9, "load": 54.4, "restart": 68.0})
+        self.assertEqual(lat.figures(runs), {"start": 48.9, "load": 54.4, "restart": 68.0, "work": 0.5})
         # The restart figure is the planning one by chance; each restart's own start is read
         # (R130-6, M1): runs 8, 10 and 12, 68.0, 67.1 and 67.9 s after their restarts.
         self.assertEqual([(r["restarted"], round(r["start"] - r["restarted"], 1)) for r in runs if "restarted" in r],
@@ -761,11 +781,12 @@ class Guards(unittest.TestCase):
         self.assertEqual((lost[2]["answer"], lost[2]["after_s"]), ("reset", 61.5))
         # Rental G's boot 3 under the new rule: at the old five-minute end the firmware had
         # started again after the call, and the boot waits for the next run's registers, up to the
-        # measured load delay and 15 s after that start, inside this firmware's 344 s window.
+        # measured load delay, the loader's own time and 15 s after that start, inside this
+        # firmware's 345.5 s window.
         self.assertFalse(lat.boot_over(runs[:7], 5, restarts[2] + 300))
-        self.assertFalse(lat.boot_over(runs[:7], 5, runs[6]["next"] + 69.0))
-        self.assertTrue(lat.boot_over(runs[:7], 5, runs[6]["next"] + 69.5))
-        self.assertLess(runs[6]["next"] + 69.5, restarts[2] + lat.window_s(lat.figures(runs)))
+        self.assertFalse(lat.boot_over(runs[:7], 5, runs[6]["next"] + 69.5))
+        self.assertTrue(lat.boot_over(runs[:7], 5, runs[6]["next"] + 70.0))
+        self.assertLess(runs[6]["next"] + 70.0, restarts[2] + lat.window_s(lat.figures(runs)))
         self.assertFalse(lat.boot_over(runs[:6], 5, lat.when("2026-11-22T09:12:31Z")))  # control only
         # `reread` prints the same from a rental's directory, and sends no request.
         d = self.home / "g"
@@ -780,7 +801,7 @@ class Guards(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("run 3 (09:06:53.1): a call (PMxC0 0x00900800), X; the tool's restart came "
                       "5.6 s before its mark, before anything followed it: undetermined", text)
-        self.assertIn("a minimal-mode boot's window 5.7 minutes", text)
+        self.assertIn("the loader's own 0.5 s; a minimal or bisection boot's window 5.8 minutes", text)
 
     def test_a_minimal_boot_ends_at_its_answer(self):
         # Owner item 350, TASKS item 130: when the firmware started again after the call and the
@@ -875,7 +896,7 @@ class Guards(unittest.TestCase):
         self.assertEqual(lat.restart_times(d), restarts)  # R130-4: each written before it was asked for
         fig = lat.figures(lat.read_runs((d / "sol.log").read_bytes(), lat.read_times(d / lat.TIMES_FILE, 0),
                                         restarts, clock[0]))
-        self.assertEqual(fig, {"start": 7.0, "load": 43.0, "restart": 50.0})
+        self.assertEqual(fig, {"start": 7.0, "load": 43.0, "restart": 50.0, "work": 0.0})
         lengths = [b - a for a, b in zip(restarts, restarts[1:] + [clock[0]])]
         self.assertEqual(lengths[0], 150)              # ends at the next run's call
         self.assertTrue(all(n == 160 for n in lengths[1:]), lengths)  # 7 + 45 s after the mark

@@ -412,17 +412,21 @@ fn check_bisect_code(loader: &Path, full_loader: &Path, minimal_loader: &Path) -
     let minimal = instructions(&disassemble(minimal_loader)?);
     let full_calls = reset_calls(&full);
     let minimal_calls = triple_fault_calls(&minimal);
+    let one =
+        |calls: &[usize], insns: &[Insn]| calls.len() == 1 && takes_exit_arguments(insns, calls[0]);
     if !full.iter().any(|i| is_cf9_load(&i.text))
         || !triple_fault_calls(&full).is_empty()
-        || full_calls.is_empty()
+        || !one(&full_calls, &full)
         || full_calls.iter().any(|&i| through_live_table(&full, i))
-        || minimal_calls.is_empty()
+        || !live_exit_loads(&full).is_empty()
+        || !one(&minimal_calls, &minimal)
         || !minimal_calls
             .iter()
             .all(|&i| through_live_table(&minimal, i))
+        || live_exit_loads(&minimal).is_empty()
     {
         return Err(format!(
-            "{} and {}: the full bench loader and the minimal-mode loader do not serve as the machine-code checks' controls (the full one: 0xCF9 in DX, no triple fault right after a call, a call through its copy; the minimal one: a call through the live table), so their verdict on the bisection-mode loader cannot be trusted",
+            "{} and {}: the full bench loader and the minimal-mode loader do not serve as the machine-code checks' controls (the full one: 0xCF9 in DX, no triple fault right after a call, one ExitBootServices-like call, through its copy, and no read of ExitBootServices from the live table; the minimal one: one such call, through the live table), so their verdict on the bisection-mode loader cannot be trusted",
             full_loader.display(),
             minimal_loader.display()
         ));
@@ -441,13 +445,79 @@ fn check_bisect_code(loader: &Path, full_loader: &Path, minimal_loader: &Path) -
             loader.display()
         ));
     }
-    if calls.iter().any(|&i| through_live_table(&insns, i)) {
+    // R131-3: the call found must be ExitBootServices itself, and the only one, so that no other
+    // firmware call (a `ResetSystem`, say) can stand between the call and the triple fault and be
+    // taken for it.
+    if calls.len() != 1 || !takes_exit_arguments(&insns, calls[0]) {
         return Err(format!(
-            "{}: the call before the triple fault takes its target through the live boot services table, not the loader's copy (ADR-0002 Amendment 6, step 4)",
+            "{}: {} indirect calls reach the triple fault, and ExitBootServices' must be the only one, with its image handle and map key from memory or registers, not constants: another call stands before the triple fault (ADR-0002 Amendment 6, step 5)",
+            loader.display(),
+            calls.len()
+        ));
+    }
+    if calls.iter().any(|&i| through_live_table(&insns, i)) || !live_exit_loads(&insns).is_empty() {
+        return Err(format!(
+            "{}: ExitBootServices is read from the live boot services table, for the call or anywhere else in the image, not taken from the loader's copy (ADR-0002 Amendment 6, step 4)",
             loader.display()
         ));
     }
     Ok(())
+}
+
+/// Every `mov <r>, qword ptr [<b> + 0xe8]` of `insns` whose `<b>` was itself loaded from
+/// `[<s> + 0x60]`: `ExitBootServices` read through the live boot services table, wherever the
+/// pointer then goes (TASKS item 131's review, R131-2). A spill of the table's address between the
+/// two loads would hide one; the controls in [`check_bisect_code`] show the shape the loaders
+/// compile to.
+fn live_exit_loads(insns: &[Insn]) -> Vec<usize> {
+    (0..insns.len())
+        .filter(|&k| {
+            qword_load(&insns[k].text).is_some_and(|(_, base, disp)| {
+                disp == EXIT_BOOT_SERVICES_AT
+                    && last_load(insns, k, base).is_some_and(|(_, _, d)| d == BOOT_SERVICES_AT)
+            })
+        })
+        .collect()
+}
+
+/// Whether `mnemonic` only reads its first operand and writes none.
+fn reads_only(mnemonic: &str) -> bool {
+    matches!(mnemonic, "test" | "cmp" | "push" | "nop" | "bt")
+        || mnemonic.starts_with('j')
+        || mnemonic.starts_with("call")
+}
+
+/// Whether the indirect call at `insns[i]` takes arguments as `ExitBootServices(ImageHandle,
+/// MapKey)` does: RCX and RDX last written from memory or another register, not set to a
+/// constant (TASKS item 131's review, R131-3). `ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL)`,
+/// the firmware call most likely to be put before the triple fault, takes constants in both.
+fn takes_exit_arguments(insns: &[Insn], i: usize) -> bool {
+    let constant = |reg64: &str, reg32: &str| {
+        let from = i.saturating_sub(LOAD_WINDOW);
+        let last = (from..i).rev().find_map(|k| {
+            let text = insns.get(k)?.text.as_str();
+            let (mnemonic, operands) = text.split_once(' ')?;
+            let dest = operands.split(", ").next()?;
+            (!reads_only(mnemonic) && (dest == reg64 || dest == reg32))
+                .then_some((mnemonic, operands))
+        });
+        match last {
+            // Not written in the window: whatever the caller left, not a constant set here.
+            None => false,
+            Some(("xor", operands)) => {
+                let mut ops = operands.split(", ");
+                ops.next() == ops.next()
+            }
+            Some(("mov", operands)) => operands
+                .split(", ")
+                .nth(1)
+                .is_some_and(|source| source.starts_with("0x") || source.parse::<i64>().is_ok()),
+            Some(_) => false,
+        }
+    };
+    insns.get(i).is_some_and(|c| c.text.starts_with("call "))
+        && !constant("rcx", "ecx")
+        && !constant("rdx", "edx")
 }
 
 /// Where the system table holds its boot services table's address (UEFI 2.11 §4.3: the header's
@@ -476,11 +546,7 @@ fn last_load<'a>(insns: &'a [Insn], before: usize, reg: &str) -> Option<(usize, 
     (from..before).rev().find_map(|k| {
         let text = insns.get(k)?.text.as_str();
         let (mnemonic, operands) = text.split_once(' ')?;
-        // These read their first operand and write none.
-        let reads_only = matches!(mnemonic, "test" | "cmp" | "push" | "nop" | "bt")
-            || mnemonic.starts_with('j')
-            || mnemonic.starts_with("call");
-        let writes = !reads_only && operands.split(", ").next() == Some(reg);
+        let writes = !reads_only(mnemonic) && operands.split(", ").next() == Some(reg);
         if !writes {
             return None;
         }
@@ -551,6 +617,20 @@ fn check_minimal_code(loader: &Path, full_loader: &Path) -> Result {
         return Err(format!(
             "{}: no path from an indirect call to the triple fault holds only reads into registers, compares and branches: the triple fault is not the first thing after ExitBootServices (ADR-0002 Amendment 5, step 6)",
             loader.display()
+        ));
+    }
+    // TASKS item 131's review, R131-3: that call must be ExitBootServices itself, through the live
+    // table, and the only one.
+    let insns = instructions(&listing);
+    let calls = triple_fault_calls(&insns);
+    if calls.len() != 1
+        || !takes_exit_arguments(&insns, calls[0])
+        || !through_live_table(&insns, calls[0])
+    {
+        return Err(format!(
+            "{}: {} indirect calls reach the triple fault, and ExitBootServices' through the live table must be the only one: another call stands before the triple fault (ADR-0002 Amendment 5, step 6)",
+            loader.display(),
+            calls.len()
         ));
     }
     Ok(())
@@ -1012,6 +1092,10 @@ const BIS_MINE: &str = "origin-boot: bench build: bisect: the last reset was a s
 const BIS_NO_RECORD: &str = "origin-boot: bench build: bisect: PMxC0 0x00000800 names no reset cause: no record of the last reset, and no control in this boot: ExitBootServices is called through the loader's copy of the boot services table; after EFI_SUCCESS, a triple fault and nothing before it";
 const BIS_NO_RECORD_BITS_CLEAR: &str = "origin-boot: bench build: bisect: PMxC0 0x00000800 names no reset cause: no record of the last reset, and no control in this boot: ExitBootServices is called through the loader's copy of the boot services table; after EFI_SUCCESS, a triple fault and nothing before it, though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)";
 const BIS_LAST: &str = "origin-boot: bench build: bisect: ExitBootServices next, through the loader's copy of the boot services table";
+const BIS_NOT_READ: &str = "origin-boot: bench build: bisect: the FCH's registers were not read: no control in this boot: ExitBootServices is called through the loader's copy of the boot services table; after EFI_SUCCESS, a triple fault and nothing before it, though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)";
+const BIS_BITS_CLEAR: &str = "origin-boot: bench build: bisect: the last reset was the reset pin (bit 16), but a shutdown cannot reset this system (PMx74 bit 17 and PMx08 bit 20 are not both set): no control in this boot: ExitBootServices is called through the loader's copy of the boot services table; after EFI_SUCCESS, a triple fault and nothing before it, though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)";
+const BIS_NO_RESET: &str =
+    "origin-boot: bench build: BENCH-FCH's noreset: Amendment 3's order calls no ResetSystem";
 const BIS_NO_OS_TYPE: &str = "origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in ";
 const BIS_CF9_SKIPPED: &str = "origin-boot: bench build: ResetSystem was not called (BENCH-FCH's noreset), and the FADT gives no usable reset register (RESET_REG is I/O port 0xcf9, which the bisection mode never writes (ADR-0002 Amendment 6)): halting";
 /// The full loader's lines before the call that the bisection mode keeps (Amendment 6, step 1).
@@ -1217,6 +1301,18 @@ fn bisect_stale_twice(work: &Path) -> Result<Vec<String>> {
     fch(work, b"mine noreset\n")
 }
 
+/// No `BENCH-FCH`: the rental's path, where QEMU's processor has no FCH, so its registers are not
+/// read and the call is made with no control (R131-5).
+fn bisect_no_switch(work: &Path) -> Result<Vec<String>> {
+    spcr(work)
+}
+
+/// `first noshutdown`: another cause, but the shutdown message off, so the control is withheld
+/// (R131-5).
+fn bisect_first_noshutdown(work: &Path) -> Result<Vec<String>> {
+    fch(work, b"first noshutdown\n")
+}
+
 /// `BENCH-AFTER kernel`, which the bisection mode reads and ignores (ruling Q3).
 fn bisect_after_kernel(work: &Path) -> Result<Vec<String>> {
     after(work, b"kernel\n")?;
@@ -1262,8 +1358,8 @@ fn scenario(
     }
 }
 
-/// The twenty-nine scenarios of [`boot`]: TASKS item 112's four, TASKS item 116's three, TASKS
-/// item 121's nine, TASKS item 128's six of the minimal mode, and TASKS item 131's seven of the
+/// The thirty-one scenarios of [`boot`]: TASKS item 112's four, TASKS item 116's three, TASKS
+/// item 121's nine, TASKS item 128's six of the minimal mode, and TASKS item 131's nine of the
 /// bisection mode.
 fn scenarios() -> Vec<Scenario> {
     let with_crumbs = |first: &str| {
@@ -1523,6 +1619,22 @@ fn scenarios() -> Vec<Scenario> {
             lines(&[BIS_NO_RECORD_BITS_CLEAR, BIS_LAST, MARK_FIRST]),
             bisect_bits_clear,
             check_bisect_bits_clear,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: bisect, no BENCH-FCH, the rental's path, no control, the triple fault at once",
+            Loader::BenchBisect,
+            lines(&[BIS_START, NO_FCH, BIS_NOT_READ, BIS_LAST, MARK_FIRST]),
+            bisect_no_switch,
+            check_bisect_no_switch,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: bisect, FCH first noshutdown, the control withheld, the triple fault at once",
+            Loader::BenchBisect,
+            lines(&[BIS_BITS_CLEAR, BIS_LAST, MARK_FIRST]),
+            bisect_first_noshutdown,
+            check_bisect_first_noshutdown,
             Some(RESET_WITHIN),
         ),
         scenario(
@@ -2119,13 +2231,38 @@ fn check_minimal_bits_clear(done: &Completed, _settings: &Settings) -> Result {
 /// table's line, the no-OS-type line and `decision`; the full loader's work before the call
 /// (Amendment 6, step 1); and not the full loader's last line, since the kernel is never entered.
 fn check_bisect_console(done: &Completed, decision: &str) -> Result {
+    check_bisect_console_with(done, decision, true)
+}
+
+/// [`check_bisect_console`], with `BENCH-FCH` (`switch`) or without it, the rental's path, where
+/// QEMU's processor has no FCH: then the lines say no switch and the registers not read.
+fn check_bisect_console_with(done: &Completed, decision: &str, switch: bool) -> Result {
     let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    let fch: &[&str] = if switch {
+        &[FCH_SWITCH, FCH_REGISTERS, SMI_GIVEN]
+    } else {
+        &[NO_FCH, SMI_LINE]
+    };
+    if !switch && com1.contains(FCH_REGISTERS) {
+        return Err("with no BENCH-FCH, the bisection mode printed BENCH-FCH's registers".into());
+    }
+    // R131-4: the no-OS-type line must have counted at least one descriptor.
+    let counted = com1
+        .find(BIS_NO_OS_TYPE)
+        .map(|i| &com1[i + BIS_NO_OS_TYPE.len()..])
+        .and_then(|rest| {
+            rest.split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u32>().ok())
+        });
+    if !counted.is_some_and(|n| n > 0) {
+        return Err(format!(
+            "the bisection mode's no-OS-type line counted no descriptor: {counted:?}"
+        ));
+    }
     for needle in [
         BIS_START,
         BIS_AFTER_IGNORED,
-        FCH_SWITCH,
-        FCH_REGISTERS,
-        SMI_GIVEN,
         TABLE_LINE,
         BIS_NO_OS_TYPE,
         STATE,
@@ -2133,6 +2270,7 @@ fn check_bisect_console(done: &Completed, decision: &str) -> Result {
         decision,
     ]
     .iter()
+    .chain(fch.iter())
     .chain(FULL_WORK.iter())
     {
         if !com1.contains(needle) {
@@ -2194,7 +2332,17 @@ fn check_bisect_control(done: &Completed, _settings: &Settings) -> Result {
 /// `marks` and nothing more; and QEMU exits within [`CF9_AT_ONCE`] of the last mark: the triple
 /// fault, the first thing after the call.
 fn check_bisect_call(done: &Completed, decision: &str, marks: &[&str]) -> Result {
-    check_bisect_console(done, decision)?;
+    check_bisect_call_with(done, decision, marks, true)
+}
+
+/// [`check_bisect_call`], with `BENCH-FCH` (`switch`) or without it.
+fn check_bisect_call_with(
+    done: &Completed,
+    decision: &str,
+    marks: &[&str],
+    switch: bool,
+) -> Result {
+    check_bisect_console_with(done, decision, switch)?;
     let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
     if !com1.contains(UNDER_FIRMWARE) || !com1.contains(BIS_LAST) {
         return Err(format!(
@@ -2244,6 +2392,22 @@ fn check_bisect_bits_clear(done: &Completed, _settings: &Settings) -> Result {
     check_bisect_call(done, BIS_NO_RECORD_BITS_CLEAR, &[MARK_FIRST])
 }
 
+/// R131-5: the rental's path, with no `BENCH-FCH`.
+fn check_bisect_no_switch(done: &Completed, _settings: &Settings) -> Result {
+    check_bisect_call_with(done, BIS_NOT_READ, &[MARK_FIRST], false)
+}
+
+/// R131-5: the control withheld, as the shutdown message is off; the call, and the triple fault
+/// after it (QEMU resets on one whatever the FCH's bits).
+fn check_bisect_first_noshutdown(done: &Completed, _settings: &Settings) -> Result {
+    check_bisect_call(done, BIS_BITS_CLEAR, &[MARK_FIRST])?;
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    if com1.contains(BIS_CONTROL) || com1.contains("the boot's first run, the control") {
+        return Err("the control ran though the shutdown message is off".into());
+    }
+    Ok(())
+}
+
 /// `BENCH-AFTER kernel` read and said, its value ignored: the triple fault after the call, and
 /// no kernel line (ruling Q3).
 fn check_bisect_after_kernel(done: &Completed, _settings: &Settings) -> Result {
@@ -2260,6 +2424,12 @@ fn check_bisect_after_kernel(done: &Completed, _settings: &Settings) -> Result {
 /// call, and QEMU runs on.
 fn check_bisect_both_failed(done: &Completed, _settings: &Settings) -> Result {
     check_bisect_console(done, BIS_MINE)?;
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    if !com1.contains(BIS_NO_RESET) {
+        return Err(format!(
+            "COM1 lacks {BIS_NO_RESET:?}: noreset was not taken"
+        ));
+    }
     let after = after_bisect_last(done)?;
     let want = [
         MARK_FIRST,
@@ -2331,7 +2501,7 @@ pub(crate) fn boot(settings: &Settings) -> Result {
         run_scenario(scenario, kernel, settings)?;
     }
     println!(
-        "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, the bench kernel under the normal loader, the reset through ResetSystem, through the FADT's register, a disturbed UART written back, and the FCH's nine: the control, 0xCF9 after the call, the triple fault, the fall-through, no record, 0xCF9 only after the retry succeeds, the normal path after both calls fail, a contradicting layout, and a control that does not reset; and the minimal mode's six: the control, a returning call, no record, the retry, both calls failing with the FADT's write to 0xCF9 skipped, and the triple fault with the shutdown bits clear; and the bisection mode's seven: the control, a returning call through the copy, no record, the retry, both calls failing with the FADT's write to 0xCF9 skipped, the shutdown bits clear, and BENCH-AFTER kernel ignored) in {} s",
+        "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, the bench kernel under the normal loader, the reset through ResetSystem, through the FADT's register, a disturbed UART written back, and the FCH's nine: the control, 0xCF9 after the call, the triple fault, the fall-through, no record, 0xCF9 only after the retry succeeds, the normal path after both calls fail, a contradicting layout, and a control that does not reset; and the minimal mode's six: the control, a returning call, no record, the retry, both calls failing with the FADT's write to 0xCF9 skipped, and the triple fault with the shutdown bits clear; and the bisection mode's nine: the control, a returning call through the copy, no record, the retry, both calls failing with the FADT's write to 0xCF9 skipped, the shutdown bits clear, no BENCH-FCH, the control withheld, and BENCH-AFTER kernel ignored) in {} s",
         chosen.len(),
         all.len(),
         started.elapsed().as_secs()
@@ -2440,6 +2610,9 @@ mod tests {
         // TASKS item 128: nor a minimal-mode build's.
         let minimal = minimal_target().join("xtask").join("KERNEL.ONBF");
         assert!(refuse(&minimal, "signing").is_err());
+        // TASKS item 131 (R131-11): nor a bisection-mode build's.
+        let bisect = bisect_target().join("xtask").join("BOOTX64.EFI");
+        assert!(refuse(&bisect, "signing").is_err());
         // TASKS item 127: nor a stack measurement's.
         let measured = crate::stack_depth::target()
             .join("normal")
@@ -2643,6 +2816,26 @@ mod tests {
         ));
         assert!(!through_live_table(&rewritten, call_at(&rewritten)));
         assert!(!through_live_table(&[], 0));
+        // R131-2: a live read of ExitBootServices anywhere, spilled before its call, is found.
+        let spilled = instructions(&format!(
+            "{}140001800:\tmov\tqword ptr [rsp + 0x40], r8\n140001900:\tmov\trax, qword ptr [rsp + 0x40]\n140001904:\tcall\tqword ptr [rax]\n",
+            LIVE_CALL.replace("1400017cc:\tcall\tr8\n", "")
+        ));
+        assert!(!through_live_table(&spilled, call_at(&spilled)));
+        assert_eq!(live_exit_loads(&spilled).len(), 1);
+        assert_eq!(live_exit_loads(&copy), Vec::<usize>::new());
+        // R131-3: ExitBootServices' arguments come from memory or registers; ResetSystem's first
+        // two are constants, so a ResetSystem put before the triple fault is not taken for it.
+        assert!(takes_exit_arguments(&live, call_at(&live)));
+        assert!(takes_exit_arguments(&copy, call_at(&copy)));
+        let reset = instructions(
+            "140002000:\tmov\trax, qword ptr [rsi + 0x10]\n140002004:\txor\tecx, ecx\n140002006:\txor\tedx, edx\n140002008:\txor\tr8d, r8d\n14000200b:\txor\tr9d, r9d\n14000200e:\tcall\tqword ptr [rax]\n",
+        );
+        assert!(!takes_exit_arguments(&reset, call_at(&reset)));
+        let one_constant = instructions(
+            "140002000:\tmov\trax, qword ptr [rsi + 0x10]\n140002004:\tmov\trcx, qword ptr [rsi + 0x8]\n140002006:\tmov\tedx, 0x0\n14000200e:\tcall\tqword ptr [rax]\n",
+        );
+        assert!(!takes_exit_arguments(&one_constant, call_at(&one_constant)));
         // Instructions that only read the register do not stand for its load.
         let read = instructions(
             &LIVE_CALL.replace("1400017c9:\tmov\trdx, rsi", "1400017c9:\tcmp\tr8, rdx"),

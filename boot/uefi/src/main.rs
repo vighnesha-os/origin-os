@@ -14,10 +14,12 @@
 #![no_std]
 #![no_main]
 // TASKS item 128 (ADR-0002 Amendment 5): a minimal-mode bench build never reaches the full path
-// (`boot` and what only it calls), which the linker then leaves out of the image. TASKS item 131
-// (ADR-0002 Amendment 6): a bisection-mode build never reaches the full mode's paths after the
-// call (`bench_after_call` and what only it calls).
-#![cfg_attr(any(origin_bench_minimal, origin_bench_bisect), allow(dead_code))]
+// (`boot` and what only it calls), which the linker then leaves out of the image.
+#![cfg_attr(origin_bench_minimal, allow(dead_code))]
+
+// TASKS item 131's review, R131-11: the two modes are one or the other, never both.
+#[cfg(all(origin_bench_minimal, origin_bench_bisect))]
+compile_error!("a bench loader is built in the minimal mode or the bisection mode, not both");
 
 use core::ffi::c_void;
 use core::fmt::Write;
@@ -244,14 +246,20 @@ fn boot(
         let _ = writeln!(out, "{}{}", bench::PREFIX, fch::Pretend::said(said));
         let switch = found.flatten();
         let _ = after;
-        (
-            switch.map(|s| s.pretend),
-            if switch.is_some_and(|s| s.no_reset_system) {
-                bench::After::SwitchNoReset
-            } else {
-                bench::After::Reset
-            },
-        )
+        let after = if switch.is_some_and(|s| s.no_reset_system) {
+            bench::After::SwitchNoReset
+        } else {
+            bench::After::Reset
+        };
+        if after == bench::After::SwitchNoReset {
+            let _ = writeln!(
+                out,
+                "{}{}",
+                bench::PREFIX,
+                bench::After::said(Some(Some(after)))
+            );
+        }
+        (switch.map(|s| s.pretend), after)
     };
 
     #[cfg(origin_stack_measure)]
@@ -1467,8 +1475,10 @@ fn say_halting(early_uart: EarlyUart, calls: uart::ExitCalls) {
     say_on_uart(early_uart, calls.halting());
 }
 
-/// TASKS item 112, a bench build: which call succeeded, on the SPCR's UART. Returns its port.
-#[cfg(origin_bench)]
+/// TASKS item 112, a bench build: which call succeeded, on the SPCR's UART. Returns its port. Not
+/// compiled into the bisection mode, which triple-faults after a successful call (TASKS item 131's
+/// review, R131-10).
+#[cfg(all(origin_bench, not(origin_bench_bisect)))]
 fn bench_exited(early_uart: EarlyUart, exited: bench::Exited) -> u16 {
     say_on_uart(early_uart, exited)
 }
@@ -1593,7 +1603,9 @@ type ResetSystemFn =
 struct BenchPlan {
     /// The mode `BENCH-AFTER` asked for.
     after: bench::After,
-    /// The UART's registers under the firmware, if the SPCR named one in I/O space.
+    /// The UART's registers under the firmware, if the SPCR named one in I/O space. Read only
+    /// after the call, which the bisection mode does not do (R131-10).
+    #[cfg_attr(origin_bench_bisect, allow(dead_code))]
     under: Option<bench::UartState>,
     /// The firmware's `ResetSystem`, if its runtime services table checks.
     reset_system: Option<ResetSystemFn>,
@@ -1606,7 +1618,9 @@ struct BenchPlan {
     /// `ExitBootServices` (TASKS item 116's review, R116-7).
     marks: bool,
     /// TASKS item 121: the reset with no firmware code after a call that returns `EFI_SUCCESS`, in
-    /// a run whose last reset was a `0x06` to `0xCF9` or that finds no record of it.
+    /// a run whose last reset was a `0x06` to `0xCF9` or that finds no record of it. Always `None`
+    /// in the bisection mode, which never reads it (R131-10).
+    #[cfg_attr(origin_bench_bisect, allow(dead_code))]
     free: Option<fch::Free>,
 }
 
@@ -1812,7 +1826,8 @@ fn bench_table_line(
 }
 
 /// [`bench::After::Disturb`]: right after the call returns, what a firmware might do to the UART.
-#[cfg(origin_bench)]
+/// Not compiled into the bisection mode (R131-10).
+#[cfg(all(origin_bench, not(origin_bench_bisect)))]
 fn bench_disturb(early_uart: EarlyUart, plan: &BenchPlan) {
     if plan.after == bench::After::Disturb
         && let Some(under) = plan.under
@@ -1823,8 +1838,10 @@ fn bench_disturb(early_uart: EarlyUart, plan: &BenchPlan) {
 
 /// TASKS item 116, after `ExitBootServices` returned, either way, and after its line: the UART's
 /// registers read again, the values read under the firmware written back, and a line naming what
-/// was read; then the reset, unless `BENCH-AFTER` asks for the kernel.
-#[cfg(origin_bench)]
+/// was read; then the reset, unless `BENCH-AFTER` asks for the kernel. Not compiled into the
+/// bisection mode, whose path after a second failed call is the minimal mode's, with no UART
+/// register read or write-back (ADR-0002 Amendment 6, step 5; ruling Q5 of TASKS item 131; R131-10).
+#[cfg(all(origin_bench, not(origin_bench_bisect)))]
 fn bench_after_call(early_uart: EarlyUart, plan: &BenchPlan, calls: uart::ExitCalls) {
     if early_uart.is_present() {
         let mut io = LoaderPorts;
@@ -1875,9 +1892,7 @@ fn bench_reset(early_uart: EarlyUart, plan: &BenchPlan) -> ! {
             mask_interrupts();
             bench::Tried::Returned
         }
-        None if plan.after == bench::After::Fadt => bench::Tried::NotCalled,
-        None if plan.after == bench::After::StandInNoReset => bench::Tried::NotCalledStandIn,
-        None => bench::Tried::Unavailable,
+        None => bench::Tried::not_called(plan.after),
     };
     wait_ms(plan.ticks_per_ms, bench::FALLBACK_DELAY_MS);
     say_on_uart(
@@ -2196,8 +2211,10 @@ fn triple_fault() -> ! {
     }
 }
 
-/// Spins until `ticks` time-stamp counter ticks have passed.
+/// Spins until `ticks` time-stamp counter ticks have passed. The bisection mode, which has no
+/// Amendment 4 reset, does not use it (R131-10).
 #[cfg(origin_bench)]
+#[cfg_attr(origin_bench_bisect, allow(dead_code))]
 fn wait_ticks(ticks: u64) {
     let start = random::rdtsc();
     while random::rdtsc().wrapping_sub(start) < ticks {

@@ -109,6 +109,10 @@ unreachable_pub = "warn"
 # `cfg(origin_bench_minimal)`: with `origin_bench`, the bench loader's minimal-program mode
 # (ADR-0002 Amendment 5; TASKS item 128). Only `cargo xtask bench-build --minimal` and
 # `boot-bench` set it, into `target/bench-minimal`; F1 holds its name as it holds the bench flag's.
+# `cfg(origin_bench_bisect)`: with `origin_bench`, the bench loader's bisection mode (ADR-0002
+# Amendment 6; TASKS item 131). Only `cargo xtask bench-build --bisect` and `boot-bench` set it,
+# into `target/bench-bisect`; F1 holds its name the same way, and it is never set with
+# `origin_bench_minimal`.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(origin_bench)', 'cfg(origin_bench_minimal)', 'cfg(origin_bench_bisect)', 'cfg(origin_stack_measure)'] }
 
 [workspace.lints.clippy]
