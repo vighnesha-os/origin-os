@@ -22,10 +22,13 @@
 //!   current one, so equal weights are exactly round-robin and over any long stretch each
 //!   context's share of the processor is its share of the weights;
 //! - a context that becomes ready (new, woken, or due after a sleep) starts at no less than
-//!   the lowest pass among the ready ones: sleeping earns no credit, so it can neither
-//!   starve the others nor be starved;
+//!   the queue's **floor**, the lowest pass among the ready ones: sleeping earns no credit, so
+//!   it can neither starve the others nor be starved;
 //! - slot 0 can be the processor's idle context ([`RunQueue::set_idle`]), which runs only
-//!   when nothing else is ready.
+//!   when nothing else is ready, and never counts toward the floor;
+//! - with nothing ready that counts, the floor holds its last value: it never falls (ADR-0020
+//!   S6, the note of 2026-11-22). Every pass placed in the queue is at least the floor, so the
+//!   floor only rises, and a thread that blocked is never left far above it.
 //!
 //! Blocking: a thread [`RunQueue::block`]s until another [`RunQueue::wake`]s it. A wake-up
 //! names its thread by slot and the slot's generation (bumped by every [`RunQueue::push`]),
@@ -428,6 +431,9 @@ pub struct RunQueue<R = u32> {
     pass: [u64; CAPACITY],
     /// Slot 0 is the idle context: it runs only when nothing else is ready.
     idle: bool,
+    /// The floor while no context that counts toward it is ready: its last value
+    /// ([`RunQueue::floor`]; ADR-0020 S6, the note of 2026-11-22).
+    kept_floor: u64,
     current: usize,
     ticks: u64,
     switches: u64,
@@ -511,6 +517,7 @@ impl<R: Copy> RunQueue<R> {
             weight: [DEFAULT_WEIGHT; CAPACITY],
             pass: [0; CAPACITY],
             idle: false,
+            kept_floor: 0,
             current: 0,
             ticks: 0,
             switches: 0,
@@ -602,6 +609,10 @@ impl<R: Copy> RunQueue<R> {
     /// Makes slot 0 the idle context (it runs only when nothing else is ready), or a
     /// context like any other.
     pub fn set_idle(&mut self, idle: bool) {
+        if !self.idle && idle {
+            // Slot 0 stops counting toward the floor: the floor keeps the value it has now.
+            self.kept_floor = self.kept_floor.max(self.floor());
+        }
         if self.idle && !idle {
             // The idle context was charged only for the quanta nothing else wanted: it
             // joins the others at the floor, without credit.
@@ -629,14 +640,23 @@ impl<R: Copy> RunQueue<R> {
         STRIDE_ONE / u64::from(self.weight(slot))
     }
 
-    /// The lowest pass among the ready contexts (the idle one aside), or the running one's
-    /// if none is ready: where a context that becomes ready starts at the earliest.
+    /// The floor: the lowest pass among the ready contexts that count toward it (threads, and
+    /// slot 0 unless it is the idle flow), or, with none of them ready, the floor's last value
+    /// (`kept_floor`): where a context that becomes ready starts at the earliest. It never falls
+    /// (ADR-0020 S6, the note of 2026-11-22). Before that reading, a queue with nothing ready took
+    /// the running one's pass, the idle flow's, which is charged only for the quanta nothing else
+    /// wanted: a thread that blocked there was then left far above the next newcomer, and a move
+    /// carried the difference as lag (TASKS item 129).
     fn floor(&self) -> u64 {
-        let ready = (0..CAPACITY)
+        self.lowest_ready().unwrap_or(self.kept_floor)
+    }
+
+    /// The lowest pass among the ready contexts that count toward the floor, if one is ready.
+    fn lowest_ready(&self) -> Option<u64> {
+        (0..CAPACITY)
             .filter(|&i| !(self.idle && i == 0) && self.state.get(i) == Some(&State::Ready))
             .filter_map(|i| self.pass.get(i).copied())
-            .min();
-        ready.unwrap_or_else(|| self.pass.get(self.current).copied().unwrap_or(0))
+            .min()
     }
 
     /// Raises `slot`'s pass to at least `floor`: it is becoming ready.
@@ -736,7 +756,20 @@ impl<R: Copy> RunQueue<R> {
             }
         }
         let now = self.ticks;
-        let floor = self.floor();
+        let floor = match self.lowest_ready() {
+            Some(lowest) => lowest,
+            None => {
+                // Nothing that counts is ready: the context that ran was the last of them to be
+                // (it blocked, slept or exited), unless it is the idle flow, and the floor's last
+                // value was its pass (ADR-0020 S6, the note of 2026-11-22).
+                if !(self.idle && self.current == 0)
+                    && let Some(&pass) = self.pass.get(self.current)
+                {
+                    self.kept_floor = self.kept_floor.max(pass);
+                }
+                self.kept_floor
+            }
+        };
         for i in 0..CAPACITY {
             let due = match self.state.get(i) {
                 Some(&State::Sleeping(until) | &State::Blocked(Some(until))) => until <= now,
@@ -961,6 +994,8 @@ impl<R: Copy> RunQueue<R> {
     pub fn depart(&mut self, slot: usize) -> Option<Departed<R>> {
         let frame = self.frame(slot)?;
         let floor = self.floor();
+        // If it was the last ready context that counts, the floor keeps the value it has now.
+        self.kept_floor = self.kept_floor.max(floor);
         let departed = Departed {
             frame,
             weight: self.weight(slot),
@@ -1993,6 +2028,65 @@ mod tests {
         assert!(destination.pass[slot] >= destination.floor());
     }
 
+    /// The case of TASKS item 129, in small (ADR-0020 S6, the note of 2026-11-22). On a queue
+    /// whose slot 0 is the idle flow, T runs alone for 1000 quanta and blocks, and nothing that
+    /// counts is ready: the floor holds T's pass, never falling to the idle flow's, which was
+    /// charged one quantum. A newcomer joins at it, T wakes beside it, and T's move carries no
+    /// lag: at its destination the boot flow runs at most one quantum before it. Under the old
+    /// reading the newcomer joined at the idle flow's pass, T left with 999 strides of lag, and
+    /// the boot flow ran 999 quanta first (TASKS item 96's control C96-7).
+    #[test]
+    fn the_floor_holds_under_a_blocked_thread_so_a_newcomer_leaves_it_no_lag() {
+        let stride = STRIDE_ONE / u64::from(DEFAULT_WEIGHT);
+        let mut ap: RunQueue<u32> = RunQueue::empty();
+        ap.set_idle(true);
+        let t = ap.push_weighted(0x1000, DEFAULT_WEIGHT, Some(1)).unwrap();
+        assert_eq!(ap.tick(0x8000), 0x1000, "the tick runs T");
+        for _ in 0..1000 {
+            assert_eq!(ap.yield_now(0x1000), 0x1000, "T alone keeps the processor");
+        }
+        let passed = ap.pass[t];
+        assert_eq!(passed, 1000 * stride);
+        assert_eq!(ap.pass[0], stride, "the idle flow was charged one quantum");
+        assert!(ap.block(0x1000).is_ok());
+        assert_eq!(ap.floor(), passed, "the floor holds T's pass");
+        let u = ap.push_weighted(0x2000, DEFAULT_WEIGHT, Some(2)).unwrap();
+        assert_eq!(ap.pass[u], passed, "the newcomer joins at the floor");
+        assert!(ap.wake(t, ap.generation(t)));
+        let departed = ap.depart(t).unwrap();
+        let lag = departed.lag();
+        assert!(lag <= stride, "lag {lag}");
+        let mut boot: RunQueue<u32> = RunQueue::empty();
+        for _ in 0..10 {
+            let _ = boot.yield_now(0x9000);
+        }
+        let floor = boot.floor();
+        let slot = boot.arrive(departed).unwrap();
+        assert_eq!(boot.pass[slot], floor + lag);
+        let mut yields = 0;
+        while boot.current() == 0 && yields < 10_000 {
+            let _ = boot.yield_now(0x9000);
+            yields += 1;
+        }
+        assert!(yields <= 1, "the boot flow ran {yields} quanta first");
+    }
+
+    /// The control of the test above: with no newcomer, T is its queue's floor when it wakes,
+    /// and its move carries no lag, under either reading.
+    #[test]
+    fn without_a_newcomer_a_woken_thread_s_move_carries_no_lag() {
+        let mut ap: RunQueue<u32> = RunQueue::empty();
+        ap.set_idle(true);
+        let t = ap.push_weighted(0x1000, DEFAULT_WEIGHT, Some(1)).unwrap();
+        assert_eq!(ap.tick(0x8000), 0x1000);
+        for _ in 0..1000 {
+            let _ = ap.yield_now(0x1000);
+        }
+        assert!(ap.block(0x1000).is_ok());
+        assert!(ap.wake(t, ap.generation(t)));
+        assert_eq!(ap.depart(t).unwrap().lag(), 0, "alone, T is the floor");
+    }
+
     /// A pending wake-up travels with its thread and is consumed by its next block there (N1);
     /// the source keeps none.
     #[test]
@@ -2111,6 +2205,10 @@ mod tests {
             current: usize,
             idle: bool,
             ticks: u64,
+            /// The floor at the end of the last step ([`Model::settle`]): the value it holds while
+            /// nothing that counts toward it is ready. Written after every step by brute force,
+            /// not at the moments the queue's own code keeps it.
+            last: u64,
         }
 
         impl Model {
@@ -2132,7 +2230,13 @@ mod tests {
                     current: 0,
                     idle,
                     ticks: 0,
+                    last: 0,
                 }
+            }
+
+            /// The end of a step: the floor's value now is the one it holds next.
+            fn settle(&mut self) {
+                self.last = self.floor();
             }
 
             /// Whether slot `i` counts toward the floor: ready, and not the idle context.
@@ -2140,14 +2244,15 @@ mod tests {
                 self.slots[i].is == Is::Ready && !(self.idle && i == 0)
             }
 
-            /// The lowest pass among the ready contexts, the idle one aside, else the running
-            /// one's: every slot looked at.
+            /// The lowest pass among the ready contexts, the idle one aside, else the floor at
+            /// the end of the last step (ADR-0020 S6, the note of 2026-11-22): every slot looked
+            /// at.
             fn floor(&self) -> u64 {
                 (0..CAPACITY)
                     .filter(|&i| self.counts(i))
                     .map(|i| self.slots[i].pass)
                     .min()
-                    .unwrap_or(self.slots[self.current].pass)
+                    .unwrap_or(self.last)
             }
 
             /// Of the slots `eligible` admits, the lowest pass, and of those the first after the
@@ -2283,6 +2388,7 @@ mod tests {
         /// The queue's state, slot by slot, as the model's.
         fn same(q: &RunQueue, m: &Model, at: &str) {
             assert_eq!(q.current, m.current, "{at}: the running slot");
+            assert_eq!(q.floor(), m.floor(), "{at}: the floor");
             // Slot 0, the boot or idle flow's, never holds a record (`RunQueue::held`).
             assert_eq!(q.record[0], None, "{at}: slot 0 holds a record");
             assert_eq!(q.ticks, m.ticks, "{at}: ticks");
@@ -2340,7 +2446,10 @@ mod tests {
         /// One seed's run: two to four queues, up to 15 threads in all, `steps` random operations
         /// (push, tick, yield, sleep, block, block with a timeout, wake, a stale wake, exit, the
         /// IPI's `preempt_for_wake`, and a move by `depart` and `arrive`), and after each the
-        /// queues equal to the model, and every choice the model's.
+        /// queues equal to the model, and every choice the model's. Two properties too (ADR-0020
+        /// S6, the note of 2026-11-22; TASKS item 129): no queue's floor ever falls, and every
+        /// thread that departs carries a lag of at most one of its own strides, all weights here
+        /// being equal.
         fn run(seed: u64, steps: usize) -> u64 {
             let mut rng = Rng(seed | 1);
             let n = 2 + rng.below(3);
@@ -2354,6 +2463,7 @@ mod tests {
                 models.push(Model::new(idle));
             }
             let (mut threads, mut moves) = (0u32, 0u64);
+            let mut floors = alloc::vec![0u64; n];
             for step in 0..steps {
                 let at = alloc::format!("seed {seed:#x}, step {step}");
                 let c = rng.below(n);
@@ -2443,6 +2553,11 @@ mod tests {
                                     (md.2, md.3, md.4),
                                     "{at}: what departs"
                                 );
+                                assert!(
+                                    d.lag <= STRIDE_ONE / u64::from(d.weight),
+                                    "{at}: a lag of {} over one stride",
+                                    d.lag
+                                );
                                 if queues[to].has_room() {
                                     moves += 1;
                                     let arrived = queues[to].arrive(d).ok();
@@ -2462,8 +2577,16 @@ mod tests {
                     }
                     _ => {}
                 }
-                for (q, m) in queues.iter().zip(&models) {
+                for (k, (q, m)) in queues.iter().zip(models.iter_mut()).enumerate() {
+                    m.settle();
                     same(q, m, &at);
+                    let floor = q.floor();
+                    assert!(
+                        floor >= floors[k],
+                        "{at}: queue {k}'s floor fell from {} to {floor}",
+                        floors[k]
+                    );
+                    floors[k] = floor;
                 }
             }
             moves
