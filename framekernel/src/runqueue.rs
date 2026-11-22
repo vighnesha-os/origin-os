@@ -445,6 +445,17 @@ impl Default for RunQueue {
 /// destination's [`RunQueue::arrive`] (ADR-0020 S6; TASKS item 96). It is in no queue until it
 /// arrives. Its `Debug` writes its name alone: its frame is an address in the kernel stacks'
 /// region, which nothing prints (ADR-0004 Amendment 2, A6).
+/// One slot, as [`RunQueue::describe`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotState {
+    pub state: &'static str,
+    pub pending: bool,
+    pub woken: bool,
+    pub pass: u64,
+    pub floor: u64,
+    pub current: usize,
+}
+
 #[must_use = "a departed thread is in no queue until it arrives"]
 pub struct Departed<R> {
     frame: u64,
@@ -903,6 +914,37 @@ impl<R: Copy> RunQueue<R> {
 
     /// Whether a thread could arrive here: a slot is free (N13). A mover asks under this queue's
     /// lock, before it takes anything, so that [`RunQueue::arrive`] cannot then be refused.
+    /// What a slot holds, for a proof's line when it fails (TASKS item 96, the migration proofs'
+    /// state lines): its state, whether it holds a pending wake-up, whether it is marked woken, its
+    /// pass, and this queue's floor and current slot. Read only; no path but a failing proof's calls
+    /// it.
+    pub fn describe(&self, slot: usize) -> SlotState {
+        SlotState {
+            state: match self.state.get(slot) {
+                Some(State::Free) | None => "free",
+                Some(State::Ready) => "ready",
+                Some(State::Sleeping(_)) => "sleeping",
+                Some(State::Blocked(_)) => "blocked",
+            },
+            pending: self.wake_pending.get(slot).copied().unwrap_or(false),
+            woken: self.woken.get(slot).copied().unwrap_or(false),
+            pass: self.pass.get(slot).copied().unwrap_or(0),
+            floor: self.floor(),
+            current: self.current,
+        }
+    }
+
+    /// How many slots are ready, the current slot, whether slot 0 is the idle flow, and how many
+    /// contexts the queue holds, for a failing proof's line ([`RunQueue::describe`]).
+    pub fn describe_queue(&self) -> (usize, usize, bool, usize) {
+        let ready = self
+            .state
+            .iter()
+            .filter(|state| matches!(state, State::Ready))
+            .count();
+        (ready, self.current, self.idle, self.live())
+    }
+
     pub fn has_room(&self) -> bool {
         (1..CAPACITY).any(|i| self.state.get(i) == Some(&State::Free))
     }
@@ -1773,6 +1815,25 @@ mod tests {
             alloc::format!("{:?}", QueueError::BootContext),
             "BootContext"
         );
+    }
+
+    /// What a failing proof's line reads of a slot and a queue (TASKS item 96's state lines).
+    #[test]
+    fn a_slot_and_a_queue_are_described_as_they_are() {
+        let mut q = RunQueue::new();
+        let a = q.push_weighted(0x1000, DEFAULT_WEIGHT, Some(7)).unwrap();
+        let b = q.push(0x2000).unwrap();
+        assert_eq!(q.describe(a).state, "ready");
+        assert_eq!(q.describe(5).state, "free");
+        assert_eq!(q.describe(CAPACITY).state, "free", "past the queue");
+        assert_eq!(q.describe(a).current, 0);
+        assert_eq!(q.tick(0x9000), 0x1000);
+        assert!(q.block(0x1000).is_ok());
+        let blocked = q.describe(a);
+        assert_eq!((blocked.state, blocked.pending), ("blocked", false));
+        let (ready, current, _, live) = q.describe_queue();
+        assert_eq!((ready, live), (2, 3), "slot 0 and b ready, a blocked");
+        assert!(current == 0 || current == b, "one of the ready two runs");
     }
 
     /// `held` hands back the very record a slot was given, not one equal to it, so the kernel's

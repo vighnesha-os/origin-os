@@ -1302,6 +1302,65 @@ pub(crate) fn has_room(cpu: CpuIndex) -> bool {
         .is_some_and(|queue| without_interrupts(|| queue.lock().has_room()))
 }
 
+/// The state of the thread `thread` names, for a migration proof's line when it fails (TASKS
+/// item 96; the coordinating session's ruling on the gates' stop of 2026-11-22): its record's
+/// number and generation against the name's, whether it is movable, its pin count, its location,
+/// and its slot as the queue there holds it (`RunQueue::describe`). No address. Read only, under
+/// the queue's lock; no path but a failing proof's calls it.
+pub(crate) fn describe_thread(thread: ThreadRef) -> alloc::string::String {
+    let Some(record) = threads::record(thread.record) else {
+        return alloc::format!("record {} none", thread.record);
+    };
+    let at = record.location();
+    let mut out = alloc::format!(
+        "record {} generation {} (named {}), movable {}, pins {}",
+        thread.record,
+        record.generation(),
+        thread.generation,
+        record.movable(),
+        record.pins()
+    );
+    match at {
+        Some(at) => {
+            let slot = QUEUES
+                .get(usize::try_from(at.cpu()).unwrap_or(usize::MAX))
+                .map(|queue| without_interrupts(|| queue.lock().describe(usize::from(at.slot()))));
+            match slot {
+                Some(s) => out.push_str(&alloc::format!(
+                    ", on CPU {} slot {}: {}, pending {}, woken {}, pass {}, floor {}, current slot {}",
+                    at.cpu(),
+                    at.slot(),
+                    s.state,
+                    s.pending,
+                    s.woken,
+                    s.pass,
+                    s.floor,
+                    s.current
+                )),
+                None => out.push_str(&alloc::format!(", on CPU {} (no such queue)", at.cpu())),
+            }
+        }
+        None => out.push_str(", located nowhere"),
+    }
+    out
+}
+
+/// Every processor's run queue, for the same lines ([`describe_thread`]): its ready slots, its
+/// current slot, whether slot 0 is its idle flow, and the contexts it holds. Read only.
+pub(crate) fn describe_cpus() -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    for cpu in 0..QUEUES.indexes() {
+        if let Some(queue) = QUEUES.get(cpu) {
+            let (ready, current, idle, live) = without_interrupts(|| queue.lock().describe_queue());
+            out.push_str(&alloc::format!(
+                "{}CPU {cpu}: {ready} ready, current slot {current}, idle {idle}, {live} contexts",
+                if out.is_empty() { "" } else { "; " }
+            ));
+        }
+    }
+    out
+}
+
 /// Whether the thread `thread` names is alive and queued on processor `cpu`: the capacity phase's
 /// check that a refused move left it where it was (R96-13).
 pub(crate) fn queued_on(thread: ThreadRef, cpu: CpuIndex) -> bool {

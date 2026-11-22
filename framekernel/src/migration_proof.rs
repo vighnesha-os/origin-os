@@ -645,6 +645,36 @@ extern "sysv64" fn filler(_: u64) -> ! {
     })
 }
 
+/// Lines naming every movable thread's state, each pair's turn and every processor's run queue,
+/// written when a capacity wait runs out or a proof's threads do not end (the coordinating
+/// session's ruling on the gates' stop of 2026-11-22): report only, so that such a failure
+/// explains itself. No address (ADR-0004 Amendment 2, A6).
+fn describe_stuck(shared: &Shared, why: &str) {
+    for (i, thread) in shared.threads.iter().enumerate() {
+        let state = thread.name().map_or_else(
+            || alloc::string::String::from("no name"),
+            sched::describe_thread,
+        );
+        let _ = writeln!(
+            Console::new(),
+            "origin-kernel: scheduler: thread migration: state when {why}: thread {i}: {state}; running on {}",
+            thread.running_on.load(Ordering::Relaxed)
+        );
+    }
+    for (i, pair) in shared.pairs.iter().enumerate() {
+        let _ = writeln!(
+            Console::new(),
+            "origin-kernel: scheduler: thread migration: state when {why}: pair {i}: turn {}",
+            pair.turn.load(Ordering::Relaxed)
+        );
+    }
+    let _ = writeln!(
+        Console::new(),
+        "origin-kernel: scheduler: thread migration: state when {why}: {}",
+        sched::describe_cpus()
+    );
+}
+
 /// What integrity's capacity phase found (ADR-0020 N13, "integrity runs at the queue's capacity";
 /// the coordinating session's ruling on the review of TASKS item 96, R96-13).
 #[derive(Default)]
@@ -764,6 +794,9 @@ fn capacity_phase(shared: &Shared, cpus: &[CpuIndex], online: &Online, tsc_hz: u
             (found.refused_full + found.made_into_full >= INTO_FULL).then_some(())
         });
         found.stayed = sched::queued_on(thread, source);
+        if found.refused_full + found.made_into_full == 0 {
+            describe_stuck(shared, "no move into the full queue was answered");
+        }
     }
     let destination_ended = release(shared, tsc_hz);
     found.filled_source = fill(shared, source, tsc_hz);
@@ -776,6 +809,9 @@ fn capacity_phase(shared: &Shared, cpus: &[CpuIndex], online: &Online, tsc_hz: u
                 Err(_) => Some(false),
             }
         }) == Some(true);
+    }
+    if !found.moved_out {
+        describe_stuck(shared, "the move out of the full queue was not made");
     }
     found.ended = destination_ended && release(shared, tsc_hz);
     found.ticks = rdtsc().wrapping_sub(start);
@@ -851,6 +887,9 @@ pub(crate) fn prove_integrity(
         sched::OTHERS_PATIENCE,
     );
     let ended = shared.ended.load(Ordering::Acquire) == shared.started.load(Ordering::Acquire);
+    if !ended {
+        describe_stuck(&shared, "threads did not end");
+    }
     let failed_swaps = shared.swaps_failed.load(Ordering::Relaxed);
     let changed = shared.canaries_changed.load(Ordering::Relaxed);
     drop(shared);
@@ -1197,6 +1236,9 @@ pub(crate) fn prove_delivery(
         sched::OTHERS_PATIENCE,
     );
     let ended = shared.ended.load(Ordering::Acquire) == shared.started.load(Ordering::Acquire);
+    if !ended {
+        describe_stuck(&shared, "threads did not end");
+    }
     let spans = shared.senders.iter().fold((0, 0, 0), |(f, ff, p), s| {
         let sf = s.longest_followed.load(Ordering::Relaxed);
         if sf > f {
