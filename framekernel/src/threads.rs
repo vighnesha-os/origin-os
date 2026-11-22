@@ -248,6 +248,17 @@ pub(crate) fn record(number: u32) -> Option<&'static Record<State>> {
     THREADS.get(block)?.records.get(index)
 }
 
+/// The number of `record` ([`record`]'s inverse), found by its address in each processor's block
+/// in turn (`Block::index_of`): `None` if no block holds it. Out of line only: a wake-up that met
+/// an inconsistency finds its thread's number this way (`sched::wake_inconsistent`; TASKS item
+/// 96), so that the wake-up's location loop keeps no register for the number.
+pub(crate) fn number_of(record: &Record<State>) -> Option<u32> {
+    (0..THREADS.indexes()).find_map(|block| {
+        let index = THREADS.get(block)?.records.index_of(record)?;
+        Block::<State, PER_CPU>::number(block, index)
+    })
+}
+
 /// A record for a new thread on processor `cpu`, from that processor's block or, if it is used up,
 /// from the next block round that has one (`origin_sync::threads::take_from_any`; TASKS item 96),
 /// given its next generation (`Block::take`), and resolved for its run-queue slot ([`Placed`]).

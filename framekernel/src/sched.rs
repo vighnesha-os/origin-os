@@ -1068,6 +1068,9 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
         // Only the location loop is on this path (TASKS item 96, the coordinating session's
         // ruling, ADR-0018 V1): an inconsistency goes on out of line, in `wake_inconsistent`, so
         // that no answer of the out-of-line paths merges into this one's.
+        // The record's number goes to `follow` and no further: the kernel's queues compare the
+        // record by address (`KernelQueues::holds`), and the out-of-line path finds the number
+        // from the record, so no register keeps it through the loop.
         let woke =
             origin_frame::sync::threads::follow(queues, record, thread.record, thread.generation);
         match woke.outcome {
@@ -1075,7 +1078,7 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
                 return wake_inconsistent(
                     queues,
                     record,
-                    thread,
+                    thread.generation,
                     Met::Exhausted,
                     woke.retries,
                     here,
@@ -1085,7 +1088,7 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
                 return wake_inconsistent(
                     queues,
                     record,
-                    thread,
+                    thread.generation,
                     Met::Misplaced,
                     woke.retries,
                     here,
@@ -1130,21 +1133,29 @@ fn ipi_if_elsewhere(cpu: u32, here: origin_frame::trap::Here<'_>) -> bool {
 /// names the trigger is written there, inside the section, as an interrupt handler's line is
 /// (`pinned::line`). A second exhaustion, with moves withdrawn, means the flag itself failed, and
 /// the kernel stops (the ruling's Q17).
+///
+/// It is given the record and the generation, and finds the record's number from the record
+/// (`threads::number_of`), so that [`wake`]'s location loop keeps no register for the number. A
+/// record is always one block's, since [`wake`] has it from `threads::record`; one that is not
+/// stops the kernel.
 #[cold]
 #[inline(never)]
 fn wake_inconsistent<'a>(
     queues: &waking::KernelQueues<'a>,
     record: &Record<threads::State>,
-    thread: ThreadRef,
+    generation: u32,
     met: Met,
     retries: u32,
     here: origin_frame::trap::Here<'a>,
 ) -> bool {
+    let Some(number) = threads::number_of(record) else {
+        panic!("a wake-up's record is in no processor's block");
+    };
     let woke = origin_frame::sync::threads::after_inconsistency(
         queues,
         record,
-        thread.record,
-        thread.generation,
+        number,
+        generation,
         met,
         retries,
         |met| pinned::enter(met.into()),

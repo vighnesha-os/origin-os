@@ -335,6 +335,15 @@ impl<S, const N: usize> Block<S, N> {
         self.records.get(index)
     }
 
+    /// The index of `record` in this block ([`Block::get`]'s inverse), found by its address:
+    /// `None` if it is not one of this block's records. Records never move, so an address names
+    /// one record of one block. A search of `N` records, for a path that is out of line (TASKS
+    /// item 96: a wake-up that met an inconsistency finds its record's number from the record,
+    /// so that its location loop keeps no register for the number).
+    pub fn index_of(&self, record: &Record<S>) -> Option<usize> {
+        self.records.iter().position(|r| core::ptr::eq(r, record))
+    }
+
     /// A free record for a new thread, with its next generation: its index and that generation.
     /// `None` if every record is held. The record's location is clear (a record is given back
     /// only with its location clear) and its state is what its last thread's reap left; the
@@ -1053,6 +1062,27 @@ mod tests {
         assert_eq!(B::number(134_217_728, 0), None);
         assert_eq!(B::number(usize::MAX, 0), None, "no overflow");
         assert_eq!(Block::<u32, 0>::split(5), None);
+    }
+
+    #[test]
+    fn a_block_finds_its_own_records_by_address_and_no_other() {
+        let block = Block::<u32, 4>::new();
+        let other = Block::<u32, 4>::new();
+        for index in 0..4 {
+            let record = block.get(index).expect("one of the block's");
+            assert_eq!(
+                block.index_of(record),
+                Some(index),
+                "its own record {index}"
+            );
+            assert_eq!(
+                other.index_of(record),
+                None,
+                "another block's record {index}"
+            );
+        }
+        let alone = Record::<u32>::new();
+        assert_eq!(block.index_of(&alone), None, "a record of no block");
     }
 
     #[test]
