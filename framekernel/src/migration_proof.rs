@@ -15,7 +15,10 @@
 //! them: for 2 s, and on until every processor has been a source and a destination of a move,
 //! within a budget of 30 s, so that how many moves a loaded machine allows in 2 s cannot fail it
 //! (ADR-0013 R1 (b); the review of TASKS item 96, R96-4). Each holds six
-//! register canaries, 256 bytes of stack canary and four XMM canaries, and a "running on" word
+//! canary values kept across its loop, which the compiler may hold in registers or spill to the
+//! stack (so they are a second check of the restored stack, not of the general registers, which
+//! only an `asm!` helper could pin; R96-8), 256 bytes of stack canary and four XMM canaries, which
+//! only the thread's FPU area holds, and a "running on" word
 //! that it takes by compare-and-swap first thing after each return from a yield or block, and
 //! releases by compare-and-swap last thing before the next one, running with interrupts off in
 //! between, so that nothing switches it out while it holds the word: S23's "set at switch-in,
@@ -472,8 +475,9 @@ fn bracket_after(
 
 // ---------------------------------------------------------------------------------- integrity
 
-/// The register canaries of integrity's thread `index`.
-fn register_canaries(index: u64) -> [u64; 6] {
+/// The six canary values integrity's thread `index` keeps across its loop, wherever the compiler
+/// keeps them (R96-8).
+fn kept_canaries(index: u64) -> [u64; 6] {
     [
         index ^ 0x0123_4567_89ab_cdef,
         index.wrapping_mul(0x9e37_79b9_7f4a_7c15),
@@ -552,7 +556,7 @@ extern "sysv64" fn integrity_thread(index: u64) -> ! {
     cpu::without_interrupts(|| {
         // The canaries: six values kept across the loop, in registers or spilled; 256 bytes in
         // this frame; four XMM registers, which only this thread's FPU area holds.
-        let registers = core::hint::black_box(register_canaries(index));
+        let kept = core::hint::black_box(kept_canaries(index));
         let stack: [u8; 256] =
             core::hint::black_box(core::array::from_fn(|k| stack_byte(index, k)));
         cpu::xmm_load(xmm_canaries(index));
@@ -563,7 +567,7 @@ extern "sysv64" fn integrity_thread(index: u64) -> ! {
                 .iter()
                 .enumerate()
                 .all(|(k, &b)| b == stack_byte(index, k));
-            if core::hint::black_box(registers) != register_canaries(index)
+            if core::hint::black_box(kept) != kept_canaries(index)
                 || !stack_ok
                 || cpu::xmm_read() != xmm_canaries(index)
             {
