@@ -471,7 +471,10 @@ fn spawn_movable(cpus: &[CpuIndex], entry: extern "sysv64" fn(u64) -> !) -> bool
 }
 
 /// What a proof's bracket compares before and after: the heap in use, the free frames and the
-/// stacks held.
+/// stacks held. The settle gate lists this function, since it reads `memory::stats` without
+/// settling itself: in `prove_integrity` and `prove_delivery`, `sched::settle` is called just
+/// before the first read, and `bracket_after` calls it again before the second; a new caller of
+/// `counts` must settle first (TASKS item 96).
 fn counts() -> (Option<(u64, u64)>, usize) {
     (
         memory::stats().map(|(h, f)| (h.bytes_in_use, f)),

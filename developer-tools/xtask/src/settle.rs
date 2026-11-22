@@ -67,7 +67,7 @@ const EXEMPT: &[(&str, &str, &str)] = &[
     (
         "framekernel/src/migration_proof.rs",
         "counts",
-        "reads the counts for each migration proof's bracket: the proof calls `sched::settle` just before the first read, and `bracket_after` calls it again before the second (TASKS item 96)",
+        "reads the counts for each migration proof's bracket: in `prove_integrity` and `prove_delivery`, `sched::settle` is called just before the first read, and `bracket_after` calls it again before the second; a new caller of `counts` must settle first (TASKS item 96)",
     ),
     (
         "framekernel/src/aml_proof.rs",
