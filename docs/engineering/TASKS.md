@@ -617,6 +617,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 124. **One CI run of TASKS item 97's two new machines (its ruling Q9). Numbered by the coordinating session on 2026-11-21; not started.** CI holds the SMT and two-package machines out. One run of `cargo xtask boot-domains` in the real-processor job, on a commit reverted before the merge, records their boot times and tree lines on both runner images. The coordinating session then decides whether they join CI.
 125. **GS's base set at the kernel's entry (TASKS item 93's review, R93-3). Numbered by the coordinating session on 2026-11-22; not started.** A witness (`Here` or `Pinned`, ADR-0020 S3) promises that `read_index` may load the processor index from GS, but on the boot processor that rests on the boot's order: nothing makes a witness before GS's base is set. Set GS's base to the boot processor's `CpuLocal` at the kernel's entry, before anything can make a witness, so that every witness implies `read_index`'s precondition by construction. TASKS item 93's entry and its follow-ups name it.
 126. **Statics read by `#[inline]` origin-frame functions, reached through the GOT (TASKS item 96's audit). Numbered by the coordinating session on 2026-11-22; not started.** A public generic or `#[inline]` function in origin-frame that names a static is compiled into the calling crate, so the static becomes an exported symbol, and in the position-independent kernel every access to it, in every crate, loads its address from the GOT first. TASKS item 96 found this when `cpu::move_context` put `cpu::CONTEXTS` behind the GOT in `resume` and `dispatch`, and fixed it there. Its audit found three older such functions: `cpu::count` (`COUNT`), `monotonic::monotonic_reading` (`ENTRY_TSC`, `SCALE`, `FLOOR`) and `nospec::form` (`FORM`). None of them adds a GOT load to `resume` or `dispatch` at `0ebef78b`. This item lists where their GOT loads land, by the per-function list of GOT loads that TASKS item 96 added to its count tool. Where one lands on a hot path (the tick, the clock's reads, a trap's entry), it removes the load: a non-inline accessor, or a different form that keeps the static internal. It records the static counts before and after, and adds a gate if one can hold the rule.
+127. **The loader's stack depth before `ExitBootServices`, under QEMU (rental F's findings, rank 1; the rank-2 list's candidate 2). Numbered by the coordinating session on 2026-11-22; done the same day on `claude/t127-stack-depth`, cut from `land/batch-10` at `953cda2c`.** A measurement build paints the 128 KiB UEFI promises and finds the deepest point each phase writes, with the longest chain of the loader's own frames as a cross-check. The deepest is 7.9% of the promise on the rentals' path and 17.7% on the shipping path, so the stack drops to the bottom of the candidates.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
@@ -4760,3 +4761,54 @@ The owner accepted all three on 2026-11-22 at about 00:05 UTC ("Accept all"; dec
 - **What weakens it:** `PMxD2` bit 6 is set. By AMD's document that bit turns the FCH's own `0xCF9` reset off so that the firmware can trap the write, so the control's reset came through firmware code, most likely an SMI. On this board the first reset after the call is therefore firmware code; only the triple fault behind it is not, and it runs only if the trapped write returns. The objective's "neither the console nor any firmware reset in the way" holds for the console, and for the reset only up to that trap. The findings weigh A′ (the trap never returns after the call) and 2′ (two failures) and rank A well ahead: one fault covers five rentals on four firmware revisions, and A′ needs rental C's console to fail too.
 - **The line "its reset stopped (`PMxD2` bit 6)"** says too much: the bit stops the FCH's own reset, not the firmware's. To be reworded in the next bench build.
 - **Next, ranked in the findings:** the stack's depth under QEMU (free); the live and copied `ExitBootServices` and the `0xCF9` trap's route (`SMIxC0`) read before the call (free); then a minimal program with the triple fault first after the call and a triple-fault control, which needs an owner item.
+
+### 127. The loader's stack depth before `ExitBootServices`, under QEMU (rental F's findings, rank 1; the rank-2 list's candidate 2)
+
+Assigned by the coordinating session on 2026-11-22, after rental F. Built on `claude/t127-stack-depth`, cut from `land/batch-10` at `953cda2c`. The contract and its questions are in the coordination notes (`t127-contract.md`). The coordinating session ruled the same day:
+- **Q1:** a cfg of its own and `cargo xtask stack-depth`, with TASKS item 112's F1 and F2 extended to name it, not new gates;
+- **Q2:** paint exactly the 128 KiB UEFI promises;
+- **Q3:** six phases, repainted at each boundary;
+- **Q4:** three scenarios of three boots, and the static chain from the measurement build's own symbols;
+- **Q5:** on demand only;
+- **Q6:** decide after the QEMU figure;
+- **the turn:** a failed measurement ends it at once.
+
+**What was built.**
+- **`boot/uefi/src/stackdepth.rs`** (new, no `unsafe`, host-tested): the paint's range, the scan, the phases, the calibration and the lines.
+- **`boot/uefi/src/main.rs`**, under `cfg(origin_stack_measure)` only: the paint at `efi_main`'s entry, the calibration on a 64 KiB array, a scan and repaint at the end of each phase, and P6's line straight to the SPCR's UART before the first call. The hooks are kept out of line.
+- **`developer-tools/xtask`:**
+  - `stack_depth.rs` (the command, its scenarios and checks, the static chain from the link map and `llvm-objdump`, with a reader of v0 symbol names);
+  - the flag in `toolchain.rs`, with a link map;
+  - F1 holding both flags, and F2 refusing "stack measure" in normal and bench images;
+  - no signing path taking a file from `target/stack-measure`.
+- **`developer-tools/bench/latitude.py`:** the rental tool refuses a measurement image.
+
+**The turns (2026-11-22, the development Mac, QEMU 11.1.3 TCG with OVMF, Rust 1.100.0):**
+- **05:13:31 to 05:13:37 on `5f05a518`:** it stopped at the quick gate F1, which found the new flag's name in F1's own test. Fixed in `cad07768`.
+- **05:14:35 to 05:31:27 on `cad07768`:**
+  - `stack-depth` passed in 71 s (three scenarios, 9 boots, the calibration exact in each);
+  - the controls SD-1 to SD-4 each failed for their own reason;
+  - `land/batch-10`'s normal images were built at `953cda2c`;
+  - `check` passed in 869 s: 2,718 host tests passed, 0 failed, 30 ignored; Loom 91 models and 140 negative controls caught; every gate;
+  - `reproducible-compare`: all 40 files the same bytes as `953cda2c`'s;
+  - `bench-build`: the bench loader still rental F's `7a3a7d64…`.
+- **05:41:28 to 05:42:22 on `d1c63ef4`:** `stack-depth` passed in 52 s, with four scenarios and 12 boots. This run added the signed-kernel scenario, the static chain without the measurement's own frames, and the hooks out of line. The loader change is inside `mod measure` only, so no compare was added (the coordinating session's condition).
+
+**The figures** (bytes below `efi_main`'s RSP; `docs/research/2026-11-22-loader-stack-depth.md`):
+- **The rentals' path,** an unsigned kernel: deepest 5,976 (normal) and 6,432 (bench). The largest seen in either run is 8,264; with `efi_main`'s 2,048, that is 10,312 bytes, 7.9% of 128 KiB.
+- **The shipping path,** a signed kernel (Ed25519 and ML-DSA-87): P2 at 20,032 to 21,352. With `efi_main`'s 1,888, that is 23,240 bytes at most, 17.7%.
+- **The static chain:** 21,920 bytes, through `mldsa87_verify`'s 13,312. It equals the quietest signed boot plus `efi_main`'s frame, to the byte.
+
+**The coordinating session's ruling** under Q6 (a), 2026-11-22: the stack drops to the bottom of the candidates. Rental F's findings and the rank-2 list say so.
+
+**The controls,** each planted and restored, and each failing:
+- **SD-1:** the paint writes another value, so the calibration finds the bottom.
+- **SD-2:** the measurement's text in a bench image, which `bench-build`'s F2 refuses.
+- **SD-3:** the flag named in an unlisted file, which F1 refuses.
+- **SD-4:** the scan from the top down, so the calibration finds 552 bytes against 65,552.
+
+**Not shown:**
+- AMI's frames;
+- `ExitBootServices`'s own;
+- anything under KVM or on a physical machine;
+- **no person has reviewed it.**

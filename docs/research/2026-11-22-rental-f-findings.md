@@ -130,7 +130,10 @@ Rental F's DSDT is rental C's, and its SSDT1 is new. The normal loader reads the
 
 The list of what Origin's loader does before the call that a minimal program does not (`docs/research/2026-11-21-loader-before-the-call.md`) names the candidates under A. Ranked with this rental's two new points:
 
-1. **The stack's depth on the firmware's stack, measured under QEMU (that list's candidate 2; free).** Paint the stack below RSP at entry, and find the deepest change just before the call, for the normal loader and for rental F's bench loader (whose DSDT scan is its deepest path). UEFI promises an application 128 KiB. A depth near or past it makes this the next rental's subject. One session, no rental.
+1. **The stack's depth on the firmware's stack, measured under QEMU (that list's candidate 2; free). Done by TASKS item 127 the same day, and ranked last since** (`docs/research/2026-11-22-loader-stack-depth.md`).
+   - **The rentals' path** (an unsigned kernel): at most 10,312 bytes of the 128 KiB UEFI promises, 7.9%.
+   - **The shipping path** (a signed kernel): at most 23,240 bytes, 17.7%.
+   - OVMF's own frames are in both figures, and the firmware's would need over 100 KiB more to matter. So the stack drops to the bottom of the candidates (the coordinating session's ruling, 2026-11-22). Ranks 2 and 3 below are now first and second.
 2. **Reads before the call in the next bench build (free, riding with any rental):**
    - the live boot services table's `ExitBootServices` pointer and the table's CRC32, compared with the loader's copy, just before the call (that list's candidate 3);
    - `SMIxC0` bits 27:26, the route of the `0xCF9` trap, through the same checks as the PM block (the DSDT's region at `0xFED80000` covers it).
