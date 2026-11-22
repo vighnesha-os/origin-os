@@ -5,8 +5,9 @@
 //! and keeps one block of records per processor.
 //!
 //! **Numbers.** Record `index` of processor `cpu`'s block is number `cpu` × [`PER_CPU`] +
-//! `index`. A spawn takes a record from the block of the processor it queues the thread on, and
-//! the thread's reap gives it back there.
+//! `index`. A spawn takes a record from the block of the processor it queues the thread on, or,
+//! if that block is used up, from the next block round that has one (TASKS item 96: [`take`]), and
+//! the thread's reap gives it back to the block it came from, by its number.
 //!
 //! **Enough.** While no thread moves, a processor's records are held by the threads of its run
 //! queue (at most `CAPACITY` − 1: slot 0 is the boot or idle flow, which has none, ADR-0020 S2,
@@ -17,6 +18,14 @@
 //! full holds one more for a moment: 2 × `CAPACITY` = 32 = [`PER_CPU`], so a block never runs out
 //! before its queue does (the review of TASKS item 92, R92-7). A spawn that finds none is still
 //! refused safely, as a full queue refuses it (`QueueError::Full`).
+//!
+//! **With moves** (ADR-0020 S6; TASKS item 96), a processor's records can be held by threads that
+//! moved to others, so the count above no longer holds block by block. It holds for the machine:
+//! every held record belongs to a queued thread (at most `CAPACITY` − 1 per processor) or a
+//! zombie (at most `CAPACITY` per processor), wherever it came from, so at most 31 × P are held
+//! of the 32 × P there are. [`take`] looks in every block before it refuses, so a spawn fails for
+//! want of a record only if none is free anywhere. Its search past the own block runs only when
+//! that block is used up, which no boot does today.
 //!
 //! **Accounted for.** Every settle checks, processor by processor, that the records its block
 //! holds are its queued threads' and its zombies', and that no record's give-back has been refused
@@ -36,7 +45,7 @@ use origin_frame::percpu::PerCpu;
 use origin_frame::stack::{FpuArea, GuardedStack};
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::exits::Mark;
-use origin_frame::sync::threads::{Block, Empty, Record};
+use origin_frame::sync::threads::{Block, Empty, Record, take_from_any};
 
 use crate::cpu::{CpuIndex, ThisCpu, without_interrupts};
 use crate::process::UserContext;
@@ -53,11 +62,12 @@ const _: () = assert!(
 // A record's location names its slot in 16 bits (`origin_sync::threads::Location`).
 const _: () = assert!(CAPACITY <= u16::MAX as usize, "a slot fits a location");
 
-// A record is two 64-byte lines, as TASKS item 92 measured it: its pin count (TASKS item 93) took
-// room that was there, and did not grow it (the coordinating session's ruling Q9).
+// A record is two 64-byte lines, as TASKS item 92 measured it: its pin count (TASKS item 93) and
+// its movable flag (TASKS item 96) took room that was there, and did not grow it (the
+// coordinating session's rulings Q9 of TASKS item 93 and Q3 of TASKS item 96).
 const _: () = assert!(
     core::mem::size_of::<Record<State>>() == 128,
-    "a record is 128 bytes, its pin count included"
+    "a record is 128 bytes, its pin count and movable flag included"
 );
 
 /// What a record holds: everything a thread owns from its spawn to its reap.
@@ -167,13 +177,16 @@ pub(crate) fn record(number: u32) -> Option<&'static Record<State>> {
     THREADS.get(block)?.records.get(index)
 }
 
-/// A record for a new thread on processor `cpu`, from that processor's block, given its next
-/// generation (`Block::take`), and resolved for its run-queue slot ([`Placed`]). `None` if the
-/// block holds no free record (the review's R92-18).
+/// A record for a new thread on processor `cpu`, from that processor's block or, if it is used up,
+/// from the next block round that has one (`origin_sync::threads::take_from_any`; TASKS item 96),
+/// given its next generation (`Block::take`), and resolved for its run-queue slot ([`Placed`]).
+/// `None` if no block holds a free record (the review's R92-18).
 pub(crate) fn take(cpu: CpuIndex) -> Option<Placed> {
-    let block = &THREADS.get(cpu.get())?.records;
-    let (index, _) = block.take()?;
-    let placed = Block::<State, PER_CPU>::number(cpu.get(), index)
+    let (from, index, _) = take_from_any(cpu.get(), THREADS.indexes(), |b| {
+        THREADS.get(b).map(|processor| &processor.records)
+    })?;
+    let block = &THREADS.get(from)?.records;
+    let placed = Block::<State, PER_CPU>::number(from, index)
         .zip(block.get(index))
         .map(|(number, record)| Placed { number, record });
     if placed.is_none() {

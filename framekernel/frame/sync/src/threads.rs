@@ -30,8 +30,18 @@
 //!
 //! A record also holds the thread's **pin count** (ADR-0020 S2). While it is above zero, the
 //! thread never moves. Only the thread itself raises and lowers it, while it runs
-//! ([`Record::pin`]). [`Block::take`] resets it for the record's next thread. Nothing reads it
-//! yet: the mover that will (ADR-0020 S6) is not built.
+//! ([`Record::pin`]). [`Block::take`] resets it for the record's next thread. The mover
+//! (ADR-0020 S6; TASKS item 96) reads it under the lock of the queue that holds the thread.
+//!
+//! # Movable
+//!
+//! A thread moves only if its spawner declared it **movable** ([`Record::set_movable`]; ADR-0020
+//! S2, point 1, and TASKS item 96, the coordinating session's ruling Q3). The spawner declares it
+//! after [`Block::take`] and before it queues the thread, while no thread runs on the record, and
+//! nothing changes it for the thread's life: [`Block::take`] resets it for the record's next
+//! thread. A thread not declared movable is pinned to the processor it was queued on, as every
+//! thread was before TASKS item 96. An affinity (ADR-0020 S11, TASKS item 100) will replace the
+//! flag.
 //!
 //! # Locks
 //!
@@ -124,6 +134,9 @@ pub struct Record<S> {
     /// A packed [`Location`], or [`CLEAR`].
     location: prim::AtomicU64,
     state: SpinLock<S>,
+    /// Whether the thread may move ([`Record::set_movable`]; the module documentation,
+    /// "Movable"). One byte, in room the record had: its size does not change.
+    movable: prim::AtomicBool,
 }
 
 impl<S> core::fmt::Debug for Record<S> {
@@ -141,6 +154,7 @@ impl<S: Empty> Record<S> {
             pins: prim::AtomicU32::new(0),
             location: prim::AtomicU64::new(CLEAR),
             state: SpinLock::new(S::EMPTY),
+            movable: prim::AtomicBool::new(false),
         }
     }
 
@@ -152,6 +166,7 @@ impl<S: Empty> Record<S> {
             pins: prim::AtomicU32::new(0),
             location: prim::AtomicU64::new(CLEAR),
             state: SpinLock::new(S::EMPTY),
+            movable: prim::AtomicBool::new(false),
         }
     }
 }
@@ -237,8 +252,28 @@ impl<S> Record<S> {
 
     /// The thread's pin count. The thread itself, or a mover (ADR-0020 S6) under the owning queue's
     /// lock.
+    ///
+    /// Why a mover's read under that lock sees the count's last value (the review of TASKS item 93,
+    /// R93-7): only the running thread writes it, and a mover acts only on a thread that is ready
+    /// and not running under that lock. The thread's last write came before its switch-out, whose
+    /// scheduler hook took and released that lock as it named the thread's frame; so the mover's
+    /// acquire of the lock comes after the write, and no write comes while the thread does not run.
     pub fn pins(&self) -> u32 {
         self.pins.load(Relaxed)
+    }
+
+    /// Declares the thread movable (the module documentation, "Movable"). Its spawner only, after
+    /// [`Block::take`] and before it queues the thread, while no thread runs on the record. The
+    /// queue lock the spawner's push takes then orders it before any mover's read.
+    pub fn set_movable(&self) {
+        self.movable.store(true, Relaxed);
+    }
+
+    /// Whether the thread was declared movable. A mover, under the lock of the queue that holds
+    /// the thread, which orders it after the spawner's declaration; anyone else, as a fact about
+    /// the thread that does not change while it lives.
+    pub fn movable(&self) -> bool {
+        self.movable.load(Relaxed)
     }
 }
 
@@ -319,6 +354,8 @@ impl<S, const N: usize> Block<S, N> {
         // never lowers its own (ADR-0020 S2, point 2). No thread holds the record now, so this is
         // the one write of the count that is not its running thread's (TASKS item 93, ruling Q9).
         record.pins.store(0, Relaxed);
+        // Pinned, as every thread is unless its spawner declares it movable (TASKS item 96).
+        record.movable.store(false, Relaxed);
         Some((index, generation))
     }
 
@@ -361,6 +398,30 @@ impl<S, const N: usize> Block<S, N> {
         let number = usize::try_from(number).ok()?;
         Some((number.checked_div(N)?, number.checked_rem(N)?))
     }
+}
+
+/// A free record for a new thread on processor `cpu`, from the blocks `block` gives by processor
+/// index, `count` of them: from `cpu`'s own block first, then from each other block in index
+/// order from `cpu + 1`, wrapping round (TASKS item 96; the coordinating session's second ruling
+/// on Q6 of TASKS item 92, "item 96 lets a spawn take a record from any block"). Its block, its
+/// index there and its generation ([`Block::take`]); `None` only if no block has a free record.
+///
+/// Once threads move, a processor's records can be held by threads that left for other
+/// processors, so a processor that keeps spawning could use up its own block while records are
+/// free elsewhere. With the fallback a spawn is refused for want of a record only if the whole
+/// machine has none. The search past the own block runs only when that block is used up.
+pub fn take_from_any<'b, S: 'b, const N: usize>(
+    cpu: usize,
+    count: usize,
+    block: impl Fn(usize) -> Option<&'b Block<S, N>>,
+) -> Option<(usize, usize, u32)> {
+    let start = cpu.checked_rem(count)?;
+    (0..count)
+        .map(|k| start.wrapping_add(k) % count)
+        .find_map(|b| {
+            let (index, generation) = block(b)?.take()?;
+            Some((b, index, generation))
+        })
 }
 
 /// The most times [`wake`] looks for its thread under a queue's lock (ADR-0020 S1).
@@ -622,6 +683,62 @@ mod tests {
         assert_eq!(record.pins(), 0);
     }
 
+    /// A spawn takes from its own processor's block first, then from the next block round, and is
+    /// refused only when every block is used up (TASKS item 96).
+    #[test]
+    fn a_spawn_takes_from_its_own_block_then_from_the_next_ones_round() {
+        let blocks = [Block::<u32, 2>::new(), Block::new(), Block::new()];
+        let block = |b: usize| blocks.get(b);
+        assert_eq!(
+            take_from_any(1, 3, block),
+            Some((1, 0, 1)),
+            "its own block first"
+        );
+        assert_eq!(take_from_any(1, 3, block), Some((1, 1, 1)));
+        assert_eq!(
+            take_from_any(1, 3, block),
+            Some((2, 0, 1)),
+            "then the next one"
+        );
+        assert_eq!(take_from_any(1, 3, block), Some((2, 1, 1)));
+        assert_eq!(
+            take_from_any(1, 3, block),
+            Some((0, 0, 1)),
+            "wrapping round"
+        );
+        assert_eq!(take_from_any(1, 3, block), Some((0, 1, 1)));
+        assert_eq!(take_from_any(1, 3, block), None, "a full machine refuses");
+        assert_eq!(take_from_any(0, 3, block), None);
+        assert!(blocks[2].give_back(1));
+        assert_eq!(
+            take_from_any(0, 3, block),
+            Some((2, 1, 2)),
+            "the one free record, wherever it is, with its next generation"
+        );
+        assert_eq!(take_from_any(0, 0, block), None, "no blocks");
+        assert_eq!(
+            take_from_any(usize::MAX, 3, block),
+            None,
+            "full, and no overflow"
+        );
+    }
+
+    /// A record starts pinned to its processor; its spawner may declare it movable; its next thread
+    /// starts pinned again (TASKS item 96).
+    #[test]
+    fn a_record_starts_pinned_and_its_next_thread_does_too() {
+        let block = Block::<u32, 1>::new();
+        let (index, _) = block.take().expect("a free record");
+        let record = block.get(index).expect("the record taken");
+        assert!(!record.movable());
+        record.set_movable();
+        assert!(record.movable());
+        assert!(block.give_back(index));
+        assert!(record.movable(), "given back as its thread left it");
+        let _ = block.take().expect("the record again");
+        assert!(!record.movable());
+    }
+
     /// The pin count takes the room after the generation (TASKS item 93, ruling Q9): the record's
     /// first words, the generation, the pin count and the location, fit the 16 bytes the
     /// generation and the location took alone. So the record keeps its size: one 64-byte line for a
@@ -636,6 +753,9 @@ mod tests {
         );
         assert_eq!(size_of::<Record<u32>>(), 64);
         assert_eq!(core::mem::align_of::<Record<u32>>(), 64);
+        // The movable flag (TASKS item 96) is one byte after them: the same line here, and the
+        // kernel's assertion of 128 bytes holds it to its two lines.
+        assert_eq!(size_of::<prim::AtomicBool>(), 1);
     }
 
     #[test]
