@@ -9,7 +9,7 @@
 
 ## A bench reset with no firmware code: a bench loader for rental F (TASKS item 121; 2026-11-21)
 
-On `claude/t121-firmware-free-reset`, cut from TASKS item 116's branch, with `land/batch-9` at `144e0cfa` merged in; not yet in the batch. Rental E showed nothing after the mark before `ExitBootServices`, and no reset (`docs/research/2026-11-21-rental-e-findings.md`): either the call never returns, or it returned and both the console's path and the firmware's reset failed after it. This loader separates the two with a reset that runs no firmware code (decision item 345, ADR-0002 Amendment 4).
+On `claude/t121-firmware-free-reset`, cut from TASKS item 116's branch, with `land/batch-9` at `d0376076` merged in; not yet in the batch. Rental E showed nothing after the mark before `ExitBootServices`, and no reset (`docs/research/2026-11-21-rental-e-findings.md`): either the call never returns, or it returned and both the console's path and the firmware's reset failed after it. This loader separates the two with a reset that runs no firmware code (decision item 345, ADR-0002 Amendment 4).
 
 - **Before the call, on an AMD processor:** the bench loader reads the FCH's power-management registers and writes none. It reads them only where the firmware's DSDT describes a system-memory region holding them, and where the firmware's page tables map them to themselves. It prints their values: the decode of port `0xCF9`, the bit that stops its reset, the two shutdown bits, the PM1 event block and the cause of the last reset.
 - **The branch:**
@@ -31,7 +31,15 @@ On `claude/t121-firmware-free-reset`, cut from TASKS item 116's branch, with `la
 - a contradicting layout;
 - a control that does not reset.
 
-Its new controls BC-13, BC-15 and BC-16 each fail. One independent AI review: no High, four Medium and eight Low, all answered (`docs/engineering/REVIEW_T121_2026-11-21.md`). The full gates and the remaining controls are still to run. Three of the answers refine Amendment 4's text; the owner accepted them as decision sheet item 346.
+Its new controls BC-13, BC-15 and BC-16 each fail. One independent AI review: no High, four Medium and eight Low, all answered (`docs/engineering/REVIEW_T121_2026-11-21.md`). Three of the answers refine Amendment 4's text; the owner accepted them as decision sheet item 346.
+
+**The full gates passed on `12a4e081`** (2026-11-22):
+- all 19 control runs failed, each for its own reason;
+- `check` and `boot-test` passed;
+- `boot-matrix` passed once, by the coordinating session's ruling;
+- the normal images are the same bytes as the batch's.
+
+The bench images are staged for rental F, which waits on the owner's yes.
 
 ## The reset diagnostic: a bench loader for rental E (TASKS item 116; 2026-11-21)
 

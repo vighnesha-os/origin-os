@@ -4476,3 +4476,41 @@ The owner accepted all three on 2026-11-22 at about 00:05 UTC ("Accept all"; dec
 - **BC-14:** the triple fault whatever `PMx74` bit 17 (a host test);
 - **BC-15:** the reset after any status (the stale-key-once scenario);
 - **BC-16:** no record taken as another cause (a host test and the `norecord` scenario).
+
+**The gates on `12a4e081`** (the code at `c066fc90`; `land/batch-9` merged at `d0376076`, records only since `0b90dea8`), in one turn of the machine on a clean tree, 2026-11-22 from 02:19:18 to 03:07:28 UTC, under Rust 1.100.0 with QEMU 11.1.3 TCG and OVMF:
+
+- **The short compile turn:**
+  - `cargo fmt --check` found nothing;
+  - host tests: the loader's library 92 passed, xtask 404 passed with 1 ignored, and the rental tool's passed;
+  - Clippy found nothing in either crate.
+- **The planted controls,** 19 runs, each failing for its own reason:
+  - BC-1 and BC-2: their scenarios' markers missing;
+  - BC-3: F2, the text "bench build" in the loader a release builds;
+  - BC-4: F1, the bench flag named outside the listed files;
+  - BC-5, BC-6 and BC-7: their scenarios' lines missing, as in TASKS item 116;
+  - BC-8, BC-9 and BC-13: the machine-code check finds no path from the call to the write of `0x06` to `0xCF9` that holds only reads into registers, compares and branches;
+  - BC-10 and BC-12: QEMU ends before the scenario's lines, with the loader's line before the call as its last;
+  - BC-11: the block read under QEMU with no `BENCH-FCH`;
+  - BC-11a, BC-11b, BC-14 and BC-16's host part: a named host test panics;
+  - BC-15: the UART holds `X` alone, where `X` and `Y` are due;
+  - BC-16's scenario: the run takes the control, where a run with no record makes the call.
+- **`check`** passed in 873 s:
+  - the test harness's result lines sum to 2,683 passed, 0 failed, 30 ignored;
+  - Loom's 91 models passed, and its 140 negative controls were caught;
+  - every document gate passed.
+- **`reproducible-compare`:** all 40 files from both builds are the same bytes as `0b90dea8`'s normal images, built in the same turn. Among them: the loader, 207,872 bytes (SHA-256 `9f8c416e…`), and the kernel image, 2,108,688 bytes (`3e02f71a…`).
+- **`boot-test`** passed, 11 of 11, in 54 s.
+- **`boot-matrix` passed once,** in 1,350 s, by the coordinating session's ruling of 2026-11-22. With the normal images identical, the kernel and the normal loader are the batch's, which its gates ran three times. One run shows that xtask's changes drive the matrix and `boot-bench`.
+  - 43 kernel verdicts: 37 `degraded: 72 of 73 proofs passed; failed: speculation controls`, 3 with scheduler fairness too, and the three machines built to lack something, each verdict naming it.
+  - The kernel stacks' region was at 27 distinct bases in 27 kernel boots.
+  - `boot-bench` inside it passed 16 of 16, with the machine-code check.
+- **`bench-build`:**
+  - `BOOTX64.EFI`: 259,584 bytes, SHA-256 `7a3a7d64e00eb701f952bbd183d4dbe4bcdac15b02f9a7696f99e4a916d37384`;
+  - `KERNEL.ONBF`: 2,108,688 bytes, SHA-256 `3b240652b5928c2bc2c32115ce43054b65dd1d921bcf542e7d0220347d447d8e`.
+- **The machine code after the call** is `c066fc90`'s sequence at the same addresses: `call qword ptr [rax]` at `0x140003e9e`, and the `out` at `0x140003ec6` (`REVIEW_T121_2026-11-21.md`, last section).
+
+**Not shown:**
+
+- any read of an FCH register on a physical machine; QEMU has no FCH;
+- anything under KVM, until CI runs the branch;
+- **no person has reviewed it.**

@@ -5587,7 +5587,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Dependencies:** none new; `origin-acpi-tables`' FADT parser; `core`; Rust 1.100.0, the pin.
 - **Licensing:** MIT OR Apache-2.0 (the workspace's `license`).
 - **Firmware and data:** none.
-- **Test evidence:** at `7761ceb1`, before the review: host tests (the loader's library 89, 11 of them `fch.rs`'s; xtask's bench tests; the rental tool's 36) and `boot-bench`, 13 of 13 under QEMU 11.1.3's software processor, in a development turn. After the review, at `c066fc90` in a development turn: host tests (the loader's library 92, xtask 404, the rental tool's), Clippy, `boot-bench` 16 of 16 with the machine-code check, and the new controls BC-13, BC-15 and BC-16 each failing. The full gates are in TASKS item 121's entry.
+- **Test evidence:** at `7761ceb1`, before the review: host tests (the loader's library 89, 11 of them `fch.rs`'s; xtask's bench tests; the rental tool's 36) and `boot-bench`, 13 of 13 under QEMU 11.1.3's software processor, in a development turn. After the review, at `c066fc90` in a development turn: host tests (the loader's library 92, xtask 404, the rental tool's), Clippy, `boot-bench` 16 of 16 with the machine-code check, and the new controls BC-13, BC-15 and BC-16 each failing. The full gates passed at `12a4e081` on 2026-11-22, in one turn of the machine; TASKS item 121's entry lists them.
 - **Review:** one independent AI review (TASKS item 121's entry). No person has reviewed it.
 - **Known limits:** shown under QEMU only, where no FCH exists and `BENCH-FCH` stands in for the reads; nothing has run on a physical machine. The registers come from documents for related parts, not this processor's own.
 
