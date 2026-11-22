@@ -55,6 +55,10 @@
 //!   processor's last use of the stack it was saved on (N4 (b); ADR-0020 S5).
 //! - LV2: a frame on a stack that is not its context's home is covered while its processor
 //!   publishes it, by the leaving record or by its slot (ADR-0020 S5).
+//! - LV3: a frame its processor's scheduler has named as the one its running context leaves, and
+//!   that the processor is still switching out, is never answered `NotHere` by a mover that found
+//!   it named under the queue lock: `lend` reads `current` first and refuses `NotYet` (TASKS item
+//!   96; ADR-0020 S5's dated note).
 //!
 //! **Not proved:** the kernel's mover (TASKS item 96), its queue locks and the run-queue entry it
 //! passes; more than two tables, or more than the moves each model makes; that the gate's wait
@@ -64,7 +68,9 @@
 
 use super::*;
 
-use crate::contexts::{AdoptRefused, FAST_TRIES, LendRefused, MoveRefused, Moves, Quiet, Scanned};
+use crate::contexts::{
+    AdoptRefused, FAST_TRIES, LendRefused, MoveRefused, MoveWitness, Moves, Quiet, Scanned,
+};
 
 /// What MV2 and MV3 report when one frame was taken twice.
 const TAKEN_TWICE: &str = "a frame was taken twice: by a move and a switch, or by two switches";
@@ -79,6 +85,16 @@ const RESUMED_TOO_SOON: &str =
 const GATE_SHARED: &str = "two holders of the move gate at once";
 /// What MV9 reports when a holder of the move gate did not see what the one before it wrote.
 const GATE_UNORDERED: &str = "a holder of the move gate missed the one before it";
+/// What LV3 reports when a frame its processor was still switching out was found in no record.
+const CALLED_LOST: &str = "a frame being switched out was called lost";
+
+/// The models' witness that interrupts are off, which `Moves::begin` asks for (TASKS item 96):
+/// `()`, since a host thread stands in for a processor with interrupts off.
+struct Model;
+
+impl MoveWitness for Model {
+    type Off<'a> = ();
+}
 
 /// A host thread stands in for a processor with interrupts off: nothing interrupts it.
 struct Plain;
@@ -89,13 +105,29 @@ impl Quiet for Plain {
     }
 }
 
+/// `lend`'s same-stack check answering "not the same stack" for any two addresses, which the
+/// models written before `LendRefused::NotYet` pass (TASKS item 96): with it `lend` reads `current`
+/// and the running home as the kernel does, and answers as before. The check can only add the
+/// refusal `NotYet`, never a take, so the properties those models prove hold with the kernel's
+/// check too; LV3 runs it.
+fn apart(_: u64, _: u64) -> bool {
+    false
+}
+
+/// `lend`'s same-stack check for the contexts models' stacks (`ctx_stack`): two addresses in one
+/// 64 KiB window of the stacks' area, as `origin_frame::stack::same_slot` answers for the kernel's.
+fn one_stack(a: u64, b: u64) -> bool {
+    let window = |at: u64| at.checked_sub(0x10_0000).map(|offset| offset / 0x1_0000);
+    window(a).is_some() && window(a) == window(b)
+}
+
 /// Two tables, index order 0 then 1, shared with the model's threads.
 fn two_tables() -> Arc<[Contexts; 2]> {
     Arc::new([Contexts::new(), Contexts::new()])
 }
 
 /// A scan of both tables, in index order, for stack `n`, through `moves`' sequence.
-fn scan_for(moves: &Moves, tables: &[Contexts; 2], n: u64) -> Scanned {
+fn scan_for(moves: &Moves<Model>, tables: &[Contexts; 2], n: u64) -> Scanned {
     moves.scan(|| tables.iter().any(|table| ctx_covered(table, n)), &Plain)
 }
 
@@ -110,12 +142,13 @@ fn mv1_a_scan_reading_the_destination_first_finds_a_moving_home() {
         EXHAUSTIVE,
         EXHAUSTIVE,
         || {
-            let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
+            let (tables, moves) = (two_tables(), Arc::new(Moves::<Model>::new()));
             assert!(tables[1].publish(ctx_frame(1)));
             let mover = {
                 let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
                 thread::spawn(move || {
-                    let moved = moves.relocate(&tables[1], &tables[0], ctx_frame(1), |_| ());
+                    let moved =
+                        moves.relocate((), &tables[1], &tables[0], ctx_frame(1), apart, |_| ());
                     assert_eq!(moved, Ok((ctx_frame(1), ())));
                 })
             };
@@ -140,11 +173,13 @@ fn mv2_a_move_and_the_source_switch_take_a_frame_once() {
         EXHAUSTIVE,
         EXHAUSTIVE,
         || {
-            let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
+            let (tables, moves) = (two_tables(), Arc::new(Moves::<Model>::new()));
             assert!(tables[0].publish(ctx_frame(1)));
             let mover = {
                 let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
-                thread::spawn(move || moves.relocate(&tables[0], &tables[1], ctx_frame(1), |_| ()))
+                thread::spawn(move || {
+                    moves.relocate((), &tables[0], &tables[1], ctx_frame(1), apart, |_| ())
+                })
             };
             let switched = ctx_switch(&tables[0], ctx_frame(9), ctx_frame(1), false, ctx_off);
             let moved = mover.join().unwrap();
@@ -177,7 +212,7 @@ fn mv2b_a_move_and_a_switch_back_to_the_leaving_context_take_a_frame_once() {
         EXHAUSTIVE,
         EXHAUSTIVE,
         || {
-            let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
+            let (tables, moves) = (two_tables(), Arc::new(Moves::<Model>::new()));
             assert!(tables[0].publish(ctx_frame(1)));
             assert_eq!(
                 ctx_switch(&tables[0], ctx_frame(9), ctx_frame(1), false, ctx_off),
@@ -186,7 +221,9 @@ fn mv2b_a_move_and_a_switch_back_to_the_leaving_context_take_a_frame_once() {
             let at_1 = ctx_frame(1) - 0x100;
             let mover = {
                 let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
-                thread::spawn(move || moves.relocate(&tables[0], &tables[1], at_1, |_| ()))
+                thread::spawn(move || {
+                    moves.relocate((), &tables[0], &tables[1], at_1, apart, |_| ())
+                })
             };
             assert_eq!(
                 ctx_switch(&tables[0], at_1, ctx_frame(9), false, ctx_off),
@@ -213,11 +250,13 @@ fn mv3_only_one_processor_resumes_a_moving_context() {
         preempted(3, SPINS),
         EXHAUSTIVE,
         || {
-            let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
+            let (tables, moves) = (two_tables(), Arc::new(Moves::<Model>::new()));
             assert!(tables[0].publish(ctx_frame(1)));
             let mover = {
                 let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
-                thread::spawn(move || moves.relocate(&tables[0], &tables[1], ctx_frame(1), |_| ()))
+                thread::spawn(move || {
+                    moves.relocate((), &tables[0], &tables[1], ctx_frame(1), apart, |_| ())
+                })
             };
             let source = {
                 let tables = Arc::clone(&tables);
@@ -253,7 +292,7 @@ fn mv4_a_forgotten_slot_claimed_again_hides_no_moved_home() {
         preempted(3, SPINS),
         EXHAUSTIVE,
         || {
-            let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
+            let (tables, moves) = (two_tables(), Arc::new(Moves::<Model>::new()));
             assert!(tables[1].publish(ctx_frame(1)));
             for n in 5..8 {
                 assert!(tables[1].publish(ctx_frame(n)));
@@ -261,7 +300,8 @@ fn mv4_a_forgotten_slot_claimed_again_hides_no_moved_home() {
             let mover = {
                 let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
                 thread::spawn(move || {
-                    let moved = moves.relocate(&tables[1], &tables[0], ctx_frame(1), |_| ());
+                    let moved =
+                        moves.relocate((), &tables[1], &tables[0], ctx_frame(1), apart, |_| ());
                     assert_eq!(moved, Ok((ctx_frame(1), ())));
                 })
             };
@@ -288,14 +328,16 @@ fn mv5_a_full_destination_gives_the_frame_back() {
         EXHAUSTIVE,
         EXHAUSTIVE,
         || {
-            let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
+            let (tables, moves) = (two_tables(), Arc::new(Moves::<Model>::new()));
             assert!(tables[0].publish(ctx_frame(1)));
             for n in 4..7 {
                 assert!(tables[1].publish(ctx_frame(n)));
             }
             let mover = {
                 let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
-                thread::spawn(move || moves.relocate(&tables[0], &tables[1], ctx_frame(1), |_| ()))
+                thread::spawn(move || {
+                    moves.relocate((), &tables[0], &tables[1], ctx_frame(1), apart, |_| ())
+                })
             };
             let published = tables[1].publish(ctx_frame(7));
             let moved = mover.join().unwrap();
@@ -327,13 +369,14 @@ fn mv6_two_movers_and_a_scan_miss_neither_home() {
         preempted(3, SPINS),
         EXHAUSTIVE,
         || {
-            let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
+            let (tables, moves) = (two_tables(), Arc::new(Moves::<Model>::new()));
             assert!(tables[1].publish(ctx_frame(1)));
             assert!(tables[1].publish(ctx_frame(2)));
             let movers = [1, 2].map(|n| {
                 let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
                 thread::spawn(move || {
-                    let moved = moves.relocate(&tables[1], &tables[0], ctx_frame(n), |_| ());
+                    let moved =
+                        moves.relocate((), &tables[1], &tables[0], ctx_frame(n), apart, |_| ());
                     assert_eq!(moved, Ok((ctx_frame(n), ())));
                 })
             });
@@ -359,14 +402,20 @@ fn mv7_a_scan_racing_back_to_back_moves_ends_and_finds_the_home() {
         preempted(4, SPINS),
         preempted(5, SPINS),
         || {
-            let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
+            let (tables, moves) = (two_tables(), Arc::new(Moves::<Model>::new()));
             assert!(tables[1].publish(ctx_frame(1)));
             let mover = {
                 let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
                 thread::spawn(move || {
                     for (from, to) in [(1, 0), (0, 1), (1, 0)] {
-                        let moved =
-                            moves.relocate(&tables[from], &tables[to], ctx_frame(1), |_| ());
+                        let moved = moves.relocate(
+                            (),
+                            &tables[from],
+                            &tables[to],
+                            ctx_frame(1),
+                            apart,
+                            |_| (),
+                        );
                         assert_eq!(moved, Ok((ctx_frame(1), ())));
                     }
                 })
@@ -388,7 +437,7 @@ fn mv8_a_frame_off_its_home_stack_is_found_while_it_moves() {
         EXHAUSTIVE,
         EXHAUSTIVE,
         || {
-            let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
+            let (tables, moves) = (two_tables(), Arc::new(Moves::<Model>::new()));
             let _ = running_context_1(&tables[1]);
             let on_measured = ctx_stack(7).1 - 0x100;
             assert_eq!(
@@ -405,7 +454,8 @@ fn mv8_a_frame_off_its_home_stack_is_found_while_it_moves() {
             let mover = {
                 let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
                 thread::spawn(move || {
-                    let moved = moves.relocate(&tables[1], &tables[0], on_measured, |_| ());
+                    let moved =
+                        moves.relocate((), &tables[1], &tables[0], on_measured, apart, |_| ());
                     assert_eq!(moved, Ok((ctx_frame(1), ())));
                 })
             };
@@ -437,7 +487,7 @@ fn mv9_the_gate_admits_one_holder_at_a_time_and_a_scans_last_pass_is_one() {
         preempted(3, SPINS),
         EXHAUSTIVE,
         || {
-            let moves = Arc::new(Moves::new());
+            let moves = Arc::new(Moves::<Model>::new());
             let inside = Arc::new(AtomicU64::new(0));
             let holders = Arc::new(AtomicU64::new(0));
             let movers = [0, 1].map(|_| {
@@ -447,7 +497,7 @@ fn mv9_the_gate_admits_one_holder_at_a_time_and_a_scans_last_pass_is_one() {
                     Arc::clone(&holders),
                 );
                 thread::spawn(move || {
-                    let moving = moves.begin();
+                    let moving = moves.begin(());
                     hold_the_gate(&inside, &holders);
                     drop(moving);
                 })
@@ -505,7 +555,7 @@ fn lv1_a_frame_is_resumed_elsewhere_only_after_its_processor_left_the_stack() {
         EXHAUSTIVE,
         EXHAUSTIVE,
         || {
-            let (tables, moves) = (two_tables(), Arc::new(Moves::new()));
+            let (tables, moves) = (two_tables(), Arc::new(Moves::<Model>::new()));
             let at_1 = running_context_1(&tables[0]);
             let here = at_1 - 0x100;
             let last_use = Arc::new(AtomicU64::new(0));
@@ -522,7 +572,9 @@ fn lv1_a_frame_is_resumed_elsewhere_only_after_its_processor_left_the_stack() {
             };
             let mover = {
                 let (tables, moves) = (Arc::clone(&tables), Arc::clone(&moves));
-                thread::spawn(move || moves.relocate(&tables[0], &tables[1], here, |_| ()))
+                thread::spawn(move || {
+                    moves.relocate((), &tables[0], &tables[1], here, apart, |_| ())
+                })
             };
             if mover.join().unwrap().is_ok() {
                 assert_eq!(
@@ -566,6 +618,61 @@ fn lv2_a_frame_is_covered_while_its_processor_publishes_it() {
             tables[0].publish_leaving();
             reader.join().unwrap();
             assert!(ctx_covered(&tables[0], 7), "{UNCOVERED}");
+        },
+    );
+}
+
+/// LV3 (ADR-0020 S5's dated note; TASKS item 96, the coordinating session's ruling Q2): processor
+/// 0 runs context 1. Its scheduler names the frame context 1 leaves, under its queue lock (a spin
+/// lock here), and its switch then records the frame as leaving, and its next call into the table
+/// publishes it. A mover takes the lock and, if it finds the frame named, lends it under the gate
+/// with the real same-stack check, still holding the lock, as the kernel's mover does (ADR-0020
+/// S6). Between the naming and the switch the processor still runs on the frame's stack, so the
+/// mover may be told `NotYet`, `Leaving`, or be lent the frame, and never `NotHere`: the kernel's
+/// mover, which has seen the thread ready and not current under that lock, takes `NotHere` for a
+/// lost frame (ADR-0020 S20). A frame lent is put back when its `Lent` is dropped.
+#[test]
+fn lv3_a_frame_being_switched_out_is_never_called_lost() {
+    check(
+        "moves::lv3_a_frame_being_switched_out_is_never_called_lost",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let (tables, moves) = (two_tables(), Arc::new(Moves::<Model>::new()));
+            let at_1 = running_context_1(&tables[0]);
+            let here = at_1 - 0x100;
+            // The frame the scheduler named as context 1's, under its queue lock; 0 until then.
+            let named = Arc::new(SpinLock::new(0u64));
+            let source = {
+                let (tables, named) = (Arc::clone(&tables), Arc::clone(&named));
+                thread::spawn(move || {
+                    *named.lock() = here;
+                    assert_eq!(
+                        ctx_switch(&tables[0], here, ctx_frame(9) - 0x100, false, ctx_off),
+                        Ok(ctx_frame(9) - 0x100)
+                    );
+                    tables[0].publish_leaving();
+                })
+            };
+            let mover = {
+                let (tables, moves, named) =
+                    (Arc::clone(&tables), Arc::clone(&moves), Arc::clone(&named));
+                thread::spawn(move || {
+                    let named = named.lock();
+                    if *named == 0 {
+                        return;
+                    }
+                    let moving = moves.begin(());
+                    let lent = tables[0].lend(&moving, *named, one_stack);
+                    assert_ne!(
+                        lent.as_ref().err(),
+                        Some(&LendRefused::NotHere),
+                        "{CALLED_LOST}"
+                    );
+                })
+            };
+            mover.join().unwrap();
+            source.join().unwrap();
         },
     );
 }

@@ -113,7 +113,8 @@
 //! - [`Moves::relocate`], or [`Moves::begin`] with [`Contexts::lend`], [`Contexts::adopt`] and
 //!   [`Lent::restore`] or [`Adopted::forget`]: a mover, on any processor, with both queue locks
 //!   held and interrupts off, lending only a thread its source queue says is ready
-//!   ([`Moves::relocate`], "What the caller must hold").
+//!   ([`Moves::relocate`], "What the caller must hold"). `begin` takes the witness that interrupts
+//!   are off ([`MoveWitness`]; TASKS item 96).
 //!
 //! # A frame is published only after its processor has left the stack (ADR-0020 S5)
 //!
@@ -230,7 +231,11 @@
 //!
 //! **What a move does not touch.** `current` and `ended` are this processor's; a lent context is
 //! neither (it is suspended), and the leaving record names only a frame not yet in its slot,
-//! which `lend` refuses ([`LendRefused::Leaving`]). The boot or idle flow never moves
+//! which `lend` refuses ([`LendRefused::Leaving`]). A mover reads `current` (Acquire) first, and
+//! refuses a frame on the stack the processor still runs on ([`LendRefused::NotYet`]): the window
+//! between a scheduler naming the frame its running context leaves, under its queue lock, and the
+//! switch that records it (ADR-0020 S5's dated note; TASKS item 96). `switch` stores `current`
+//! with Release for that reader. The boot or idle flow never moves
 //! ([`LendRefused::BootFlow`]; ADR-0020 S2, point 4). [`Contexts::withdraw`] keeps its meaning:
 //! only a spawner calls it, for a context it never queued, which was never moved.
 //!
@@ -339,7 +344,8 @@ impl Context {
 pub struct Contexts {
     slots: [Context; SLOTS],
     /// The slot of the context this processor runs, or `NONE` before its boot or idle flow's
-    /// first switch-out. Written only by this processor, with interrupts off.
+    /// first switch-out. Written only by this processor, with interrupts off, with Release; read
+    /// by this processor, and by a mover with Acquire ([`Contexts::lend`]).
     current: prim::AtomicUsize,
     /// The slot of a context that ended and whose home is not yet retired, or `NONE`.
     ended: prim::AtomicUsize,
@@ -514,7 +520,11 @@ impl Contexts {
                 self.record_leaving(slot, here);
             }
         }
-        self.current.store(incoming, Relaxed);
+        // Release (TASKS item 96, the coordinating session's ruling Q2): a mover that reads
+        // `current` naming another slot ([`Self::lend`]) then also sees the leaving record written
+        // above, or its later publication, and does not call the frame lost. On x86-64 a Release
+        // store is the same plain move as a Relaxed one.
+        self.current.store(incoming, Release);
         // The slot whose frame this switch took: its home is the incoming context's (its claim,
         // AcqRel, came before the Release store of the frame the take read with Acquire).
         let home = self.slots.get(incoming).map(|slot| slot.home.load(Acquire));
@@ -617,6 +627,11 @@ impl Default for Contexts {
 /// Why [`Contexts::lend`] refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LendRefused {
+    /// This table's processor still runs the context on whose stack the frame lies: its
+    /// scheduler has named the frame as the one its running context leaves, and its switch has not
+    /// yet run (ADR-0020 S5's dated note; TASKS item 96). Try later. Told apart from
+    /// [`LendRefused::NotHere`], so a frame in that window is never taken for a lost one.
+    NotYet,
     /// The frame is the one this table's processor last switched out, not yet published: it
     /// may still be returning along the frame's stack (ADR-0020 S5). Try later.
     Leaving,
@@ -747,9 +762,25 @@ impl Drop for GateGuard<'_> {
     }
 }
 
+/// What stands for "interrupts are off on the calling processor" where [`Moves::begin`] asks for
+/// it (TASKS item 96, the coordinating session's ruling Q1; the review of TASKS item 95, R95-12 and
+/// D95-3). This crate cannot name the framework's types, so `Moves` is generic over the witness,
+/// as `shootdown::TlbHardware` is over its `Here`.
+///
+/// The kernel's is `origin_frame::trap::InterruptsOff`, which only an interrupts-off section and
+/// the trap entry make; and the kernel's one `Moves`, over its processors' tables, is private to
+/// the framework, whose one caller of `begin` is `cpu::move_context`. A host test or a model gives
+/// a witness of its own (`()`): its `Moves` reaches only the tables it made.
+pub trait MoveWitness {
+    /// The token, branded with the life of the section that made it, so that the [`Moving`] made
+    /// under it cannot outlive the section.
+    type Off<'a>: Copy;
+}
+
 /// The machine's move sequence (ADR-0020 S4): the move gate and the two counters, **begun** and
 /// **finished**. The module documentation, "Moves between processors", says what each is for.
-pub struct Moves {
+/// `W` is the witness [`Moves::begin`] asks for ([`MoveWitness`]).
+pub struct Moves<W: MoveWitness> {
     /// Held by a move from before its `lend` to after its `forget`, with interrupts off, after
     /// both queue locks; whoever holds it takes no other lock and drops no stack. A scan's last
     /// pass holds it too.
@@ -758,15 +789,17 @@ pub struct Moves {
     begun: prim::AtomicU64,
     /// Raised by each move (Release), under the gate, after its `forget` or `restore`.
     finished: prim::AtomicU64,
+    /// The witness `begin` asks for; `fn() -> W` keeps `Moves` `Send` and `Sync` whatever `W` is.
+    witness: core::marker::PhantomData<fn() -> W>,
 }
 
-impl core::fmt::Debug for Moves {
+impl<W: MoveWitness> core::fmt::Debug for Moves<W> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("Moves")
     }
 }
 
-impl Moves {
+impl<W: MoveWitness> Moves<W> {
     /// No move made yet.
     #[cfg(not(all(test, loom)))]
     pub const fn new() -> Self {
@@ -774,6 +807,7 @@ impl Moves {
             gate: Gate::new(),
             begun: prim::AtomicU64::new(0),
             finished: prim::AtomicU64::new(0),
+            witness: core::marker::PhantomData,
         }
     }
 
@@ -784,6 +818,7 @@ impl Moves {
             gate: Gate::new(),
             begun: prim::AtomicU64::new(0),
             finished: prim::AtomicU64::new(0),
+            witness: core::marker::PhantomData,
         }
     }
 
@@ -796,9 +831,24 @@ impl Moves {
     /// gate serves its tickets in order, so an interrupt on this processor that takes a later
     /// ticket for a scan's last pass would wait, with interrupts off, for this caller, which
     /// cannot run again until it returns; and every later holder of the gate would wait behind
-    /// it (the delta review of TASKS item 95, D95-3). Nothing here checks it: S3's
-    /// interrupts-off witness, which TASKS items 93 and 96 bring, is to be required here (R95-12).
-    pub fn begin(&self) -> Moving<'_> {
+    /// it (the delta review of TASKS item 95, D95-3). So `begin` takes the witness of it, `off`
+    /// ([`MoveWitness`]; R95-12, closed by TASKS item 96), and the [`Moving`] it gives cannot
+    /// outlive the section that made `off`. That the caller holds both queue locks stays its
+    /// documented duty.
+    ///
+    /// A call without the witness does not build:
+    ///
+    /// ```compile_fail,E0061
+    /// use origin_sync::contexts::{MoveWitness, Moves};
+    /// struct Off;
+    /// impl MoveWitness for Off {
+    ///     type Off<'a> = ();
+    /// }
+    /// let moves = Moves::<Off>::new();
+    /// let _moving = moves.begin();
+    /// ```
+    pub fn begin<'a>(&'a self, off: W::Off<'a>) -> Moving<'a, W> {
+        let _ = off;
         Moving {
             moves: self,
             _gate: self.enter(),
@@ -819,15 +869,22 @@ impl Moves {
     /// queue lock before its switch takes the frame: so the source's switch never races the move
     /// for the frame, and never finds it gone, which halts the kernel (`Refused::NeverSaved`). It
     /// must also have found a free slot in the destination's run queue, under that lock (N13).
-    pub fn relocate<R>(
-        &self,
+    ///
+    /// `off` is the witness that interrupts are off ([`Moves::begin`]); `same_stack` is
+    /// [`Contexts::lend`]'s.
+    pub fn relocate<'a, R>(
+        &'a self,
+        off: W::Off<'a>,
         source: &Contexts,
         destination: &Contexts,
         frame: u64,
+        same_stack: impl Fn(u64, u64) -> bool,
         between: impl FnOnce(u64) -> R,
     ) -> Result<(u64, R), MoveRefused> {
-        let moving = self.begin();
-        let lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
+        let moving = self.begin(off);
+        let lent = source
+            .lend(&moving, frame, same_stack)
+            .map_err(MoveRefused::Lend)?;
         let adopted = match destination.adopt(&moving, lent) {
             Ok(adopted) => adopted,
             Err((refused, lent)) => {
@@ -915,7 +972,7 @@ impl Moves {
     }
 }
 
-impl Default for Moves {
+impl<W: MoveWitness> Default for Moves<W> {
     fn default() -> Self {
         Self::new()
     }
@@ -926,26 +983,27 @@ impl Default for Moves {
 /// kernel a panic under the gate halts the machine anyway (its panic policy), so this matters to
 /// the host tests and the models, not to recovery.
 ///
-/// It is a witness only of holding a gate: that the caller holds both queue locks with
-/// interrupts off is its documented duty, not checked here (the review of TASKS item 95, R95-12).
+/// It is a witness of holding the gate, and was made under the witness that interrupts are off
+/// ([`Moves::begin`]), whose life it cannot outlive. That the caller holds both queue locks is its
+/// documented duty, not checked here (the review of TASKS item 95, R95-12).
 ///
 /// Safe code can leak it (`core::mem::forget`), and the types do not stop that: the gate then
 /// stays held and begun stays ahead of finished, so every later scan's last pass waits for ever
 /// with interrupts off. Nothing in the kernel may forget one (the delta review, D95-5).
 #[must_use = "a move holds the gate until this is dropped"]
-pub struct Moving<'m> {
-    moves: &'m Moves,
+pub struct Moving<'m, W: MoveWitness> {
+    moves: &'m Moves<W>,
     /// Dropped after `Drop::drop` has raised finished.
     _gate: GateGuard<'m>,
 }
 
-impl Drop for Moving<'_> {
+impl<W: MoveWitness> Drop for Moving<'_, W> {
     fn drop(&mut self) {
         self.moves.raise_finished();
     }
 }
 
-impl core::fmt::Debug for Moving<'_> {
+impl<W: MoveWitness> core::fmt::Debug for Moving<'_, W> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("Moving")
     }
@@ -966,27 +1024,40 @@ impl core::fmt::Debug for Moving<'_> {
 /// What the types refuse to compile:
 ///
 /// ```compile_fail,E0382
-/// use origin_sync::contexts::{Contexts, Moves};
-/// let (source, a, b, moves) = (Contexts::new(), Contexts::new(), Contexts::new(), Moves::new());
-/// let moving = moves.begin();
-/// let lent = source.lend(&moving, 0x1_0000).unwrap();
+/// use origin_sync::contexts::{Contexts, MoveWitness, Moves};
+/// # struct Off;
+/// # impl MoveWitness for Off {
+/// #     type Off<'a> = ();
+/// # }
+/// let (source, a, b) = (Contexts::new(), Contexts::new(), Contexts::new());
+/// let moves = Moves::<Off>::new();
+/// let moving = moves.begin(());
+/// let lent = source.lend(&moving, 0x1_0000, |_, _| false).unwrap();
 /// let _ = a.adopt(&moving, lent);
 /// let _ = b.adopt(&moving, lent); // adopted twice: `lent` was moved
 /// ```
 ///
 /// ```compile_fail,E0599
-/// use origin_sync::contexts::{Contexts, Moves};
-/// let (source, moves) = (Contexts::new(), Moves::new());
-/// let moving = moves.begin();
-/// let lent = source.lend(&moving, 0x1_0000).unwrap();
+/// use origin_sync::contexts::{Contexts, MoveWitness, Moves};
+/// # struct Off;
+/// # impl MoveWitness for Off {
+/// #     type Off<'a> = ();
+/// # }
+/// let (source, moves) = (Contexts::new(), Moves::<Off>::new());
+/// let moving = moves.begin(());
+/// let lent = source.lend(&moving, 0x1_0000, |_, _| false).unwrap();
 /// lent.forget(); // a home forgotten with no adoption: no such method
 /// ```
 ///
 /// ```compile_fail,E0505
-/// use origin_sync::contexts::{Contexts, Moves};
-/// let (source, moves) = (Contexts::new(), Moves::new());
-/// let moving = moves.begin();
-/// let lent = source.lend(&moving, 0x1_0000).unwrap();
+/// use origin_sync::contexts::{Contexts, MoveWitness, Moves};
+/// # struct Off;
+/// # impl MoveWitness for Off {
+/// #     type Off<'a> = ();
+/// # }
+/// let (source, moves) = (Contexts::new(), Moves::<Off>::new());
+/// let moving = moves.begin(());
+/// let lent = source.lend(&moving, 0x1_0000, |_, _| false).unwrap();
 /// drop(moving); // the move ended with the frame still lent
 /// let _ = lent.restore();
 /// ```
@@ -1094,16 +1165,41 @@ impl Contexts {
     /// switch or a withdrawal makes, so at most one of them takes it (ADR-0020 S4). The home
     /// stays, so the stack stays covered here until the move's [`Adopted::forget`].
     ///
-    /// The leaving record is read first: a frame not yet published is refused as
-    /// [`LendRefused::Leaving`], and one published meanwhile is in its slot by the time the
-    /// slots are read (the publication stores the slot before it clears the record).
-    pub fn lend<'t>(
+    /// It reads, in this order (TASKS item 96, the coordinating session's ruling Q2):
+    ///
+    /// 1. **`current`** (Acquire), and the running context's home. If that home lies in the same
+    ///    stack as `frame` (`same_stack(home, frame)`), the processor still runs on the frame's
+    ///    stack: its scheduler has named the frame under its queue lock and its switch has not yet
+    ///    recorded it, so the frame is refused as [`LendRefused::NotYet`]. Once the switch has run,
+    ///    `current` names another slot, and its Release store makes the leaving record it wrote
+    ///    before visible to this reader.
+    /// 2. **The leaving record** (Acquire): a frame not yet published is refused as
+    ///    [`LendRefused::Leaving`].
+    /// 3. **The slots:** one published meanwhile is in its slot by the time the slots are read
+    ///    (the publication stores the slot before it clears the record).
+    ///
+    /// Read the other way round, the record could be older than `current`, and a frame between
+    /// its switch and its publication would be found in neither: [`LendRefused::NotHere`] for a
+    /// frame that is not lost. So a mover that has seen, under its source's queue lock, that the
+    /// thread is ready and not current, takes `NotHere` as an inconsistency (ADR-0020 S20).
+    ///
+    /// `same_stack(a, b)` says whether two addresses lie in one kernel stack: the kernel passes
+    /// `origin_frame::stack::same_slot`.
+    pub fn lend<'t, W: MoveWitness>(
         &'t self,
-        _moving: &'t Moving<'_>,
+        _moving: &'t Moving<'_, W>,
         frame: u64,
+        same_stack: impl Fn(u64, u64) -> bool,
     ) -> Result<Lent<'t>, LendRefused> {
         if frame <= BOOT_FLOW {
             return Err(LendRefused::NotHere);
+        }
+        if self
+            .slots
+            .get(self.current.load(Acquire))
+            .is_some_and(|running| same_stack(running.home.load(Acquire), frame))
+        {
+            return Err(LendRefused::NotYet);
         }
         if self.leaving.load(Acquire) == frame {
             return Err(LendRefused::Leaving);
@@ -1141,9 +1237,9 @@ impl Contexts {
     /// with a home that need not equal the frame. Before the source forgets the home, so the
     /// stack is never in neither table. The context is resumable here from the store on. A
     /// refusal hands the `Lent` back, for the caller to restore.
-    pub fn adopt<'t>(
+    pub fn adopt<'t, W: MoveWitness>(
         &self,
-        _moving: &Moving<'_>,
+        _moving: &Moving<'_, W>,
         mut lent: Lent<'t>,
     ) -> Result<Adopted<'t>, (AdoptRefused, Lent<'t>)> {
         if core::ptr::eq(self, lent.table) {
@@ -1169,6 +1265,14 @@ impl Contexts {
 mod tests {
     use super::*;
 
+    /// The host's stand-in for the interrupts-off witness ([`MoveWitness`]): a host thread is never
+    /// interrupted.
+    struct Off;
+
+    impl MoveWitness for Off {
+        type Off<'a> = ();
+    }
+
     /// Stacks of 16 KiB at `0x1_0000` apart, each with its first frame near its top.
     fn stack(n: u64) -> (u64, u64) {
         let low = 0x10_0000 + n * 0x1_0000;
@@ -1181,6 +1285,19 @@ mod tests {
 
     fn not_on_it(_: u64) -> bool {
         false
+    }
+
+    /// `lend`'s same-stack check, answering "not the same stack" for any two addresses: the tests
+    /// written before `LendRefused::NotYet` existed keep their meaning with it.
+    fn apart(_: u64, _: u64) -> bool {
+        false
+    }
+
+    /// `lend`'s same-stack check for the stacks of [`stack`]: two addresses in one 64 KiB window
+    /// of the stacks' area.
+    fn one_stack(a: u64, b: u64) -> bool {
+        let window = |at: u64| at.checked_sub(0x10_0000).map(|offset| offset / 0x1_0000);
+        window(a).is_some() && window(a) == window(b)
     }
 
     /// The frame a switch resumes, which is what these tests compare.
@@ -1783,10 +1900,10 @@ mod tests {
     /// longer can, and the counters say one move began and finished.
     #[test]
     fn a_move_lends_adopts_and_forgets() {
-        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::<Off>::new());
         let (boot_s, boot_d) = two_processors(&source, &destination, 1);
         let seen = core::cell::Cell::new(None);
-        let moved = moves.relocate(&source, &destination, first_frame(1), |home| {
+        let moved = moves.relocate((), &source, &destination, first_frame(1), apart, |home| {
             // Between `adopt` and `forget`: both tables cover the stack.
             seen.set(Some((covered(&source, 1), covered(&destination, 1))));
             home
@@ -1816,7 +1933,7 @@ mod tests {
     /// home: the destination resumes the saved frame and names the home's stack.
     #[test]
     fn a_context_that_ran_moves_with_its_saved_frame() {
-        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::<Off>::new());
         let (boot_s, boot_d) = two_processors(&source, &destination, 1);
         assert_eq!(
             switch_to(&source, boot_s - 0x100, first_frame(1), false, not_on_it),
@@ -1829,13 +1946,13 @@ mod tests {
         );
         // Leaving: not yet movable.
         assert_eq!(
-            moves.relocate(&source, &destination, at_1, |_| ()),
+            moves.relocate((), &source, &destination, at_1, apart, |_| ()),
             Err(MoveRefused::Lend(LendRefused::Leaving))
         );
         assert_eq!(moves.readings(), (1, 1), "a refused lend is an empty move");
         source.publish_leaving();
         assert_eq!(
-            moves.relocate(&source, &destination, at_1, |home| home),
+            moves.relocate((), &source, &destination, at_1, apart, |home| home),
             Ok((first_frame(1), first_frame(1)))
         );
         let switched = destination
@@ -1852,21 +1969,23 @@ mod tests {
     /// suspended (0, `BOOT_FLOW`, unknown, running, ended, already lent).
     #[test]
     fn a_lend_refuses_what_it_may_not_take() {
-        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::<Off>::new());
         let (boot_s, _) = two_processors(&source, &destination, 1);
         assert!(source.publish(first_frame(2)));
         assert!(source.publish(first_frame(3)));
-        let moving = moves.begin();
+        let moving = moves.begin(());
         for frame in [0, BOOT_FLOW, first_frame(9)] {
             assert_eq!(
-                source.lend(&moving, frame).map(|l| l.frame()),
+                source.lend(&moving, frame, apart).map(|l| l.frame()),
                 Err(LendRefused::NotHere)
             );
         }
         // One lent: a second lend of the same frame finds nothing.
-        let lent = source.lend(&moving, first_frame(2)).unwrap();
+        let lent = source.lend(&moving, first_frame(2), apart).unwrap();
         assert_eq!(
-            source.lend(&moving, first_frame(2)).map(|l| l.frame()),
+            source
+                .lend(&moving, first_frame(2), apart)
+                .map(|l| l.frame()),
             Err(LendRefused::NotHere)
         );
         assert!(lent.restore());
@@ -1876,20 +1995,26 @@ mod tests {
             switch_to(&source, boot_s - 0x100, first_frame(1), false, not_on_it),
             Ok(first_frame(1))
         );
-        let moving = moves.begin();
+        let moving = moves.begin(());
         assert_eq!(
-            source.lend(&moving, first_frame(1)).map(|l| l.frame()),
+            source
+                .lend(&moving, first_frame(1), apart)
+                .map(|l| l.frame()),
             Err(LendRefused::NotHere),
             "running"
         );
         assert_eq!(
-            source.lend(&moving, boot_s - 0x100).map(|l| l.frame()),
+            source
+                .lend(&moving, boot_s - 0x100, apart)
+                .map(|l| l.frame()),
             Err(LendRefused::Leaving),
             "the boot flow's frame, leaving"
         );
         source.publish_leaving();
         assert_eq!(
-            source.lend(&moving, boot_s - 0x100).map(|l| l.frame()),
+            source
+                .lend(&moving, boot_s - 0x100, apart)
+                .map(|l| l.frame()),
             Err(LendRefused::BootFlow),
             "the boot flow's frame, published"
         );
@@ -1908,9 +2033,11 @@ mod tests {
             switch_to(&source, first_frame(3) - 8, first_frame(2), true, not_on_it),
             Ok(first_frame(2))
         );
-        let moving = moves.begin();
+        let moving = moves.begin(());
         assert_eq!(
-            source.lend(&moving, first_frame(3) - 8).map(|l| l.frame()),
+            source
+                .lend(&moving, first_frame(3) - 8, apart)
+                .map(|l| l.frame()),
             Err(LendRefused::NotHere),
             "an exit saves no frame"
         );
@@ -1918,19 +2045,82 @@ mod tests {
         assert_eq!(moves.readings(), (3, 3));
     }
 
+    /// ADR-0020 S5's window, told apart from a lost frame (TASKS item 96, the ruling's Q2): while
+    /// the source still runs the context whose stack the frame is on, `lend` answers `NotYet`;
+    /// once the switch has recorded the frame, `Leaving`; once it is published, the frame is
+    /// lent. A frame on another stack, the boot or idle flow's, and frames no slot holds keep
+    /// their answers with the real same-stack check.
+    #[test]
+    fn a_frame_its_processor_still_runs_on_is_not_yet_lendable() {
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::<Off>::new());
+        let (boot_s, _) = two_processors(&source, &destination, 1);
+        assert!(source.publish(first_frame(2)));
+        assert_eq!(
+            switch_to(&source, boot_s - 0x100, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        source.publish_leaving();
+        // Context 1 runs. Its scheduler has named the frame it leaves, under its queue lock; the
+        // switch has not run.
+        let leaves = first_frame(1) - 0x200;
+        let moving = moves.begin(());
+        assert_eq!(
+            source.lend(&moving, leaves, one_stack).map(|l| l.frame()),
+            Err(LendRefused::NotYet)
+        );
+        // Without the check the same frame looks lost: what `NotYet` is for.
+        assert_eq!(
+            source.lend(&moving, leaves, apart).map(|l| l.frame()),
+            Err(LendRefused::NotHere)
+        );
+        // Context 2's first frame, on another stack, is lent while context 1 runs.
+        let lent = source.lend(&moving, first_frame(2), one_stack).unwrap();
+        assert!(lent.restore());
+        // The boot flow's frame, published: still the boot flow's, with the real check.
+        assert_eq!(
+            source
+                .lend(&moving, boot_s - 0x100, one_stack)
+                .map(|l| l.frame()),
+            Err(LendRefused::BootFlow)
+        );
+        for frame in [0, BOOT_FLOW, first_frame(9)] {
+            assert_eq!(
+                source.lend(&moving, frame, one_stack).map(|l| l.frame()),
+                Err(LendRefused::NotHere)
+            );
+        }
+        drop(moving);
+        // The switch records the frame as leaving: `current` now names the boot flow.
+        assert_eq!(
+            switch_to(&source, leaves, boot_s - 0x100, false, not_on_it),
+            Ok(boot_s - 0x100)
+        );
+        let moving = moves.begin(());
+        assert_eq!(
+            source.lend(&moving, leaves, one_stack).map(|l| l.frame()),
+            Err(LendRefused::Leaving)
+        );
+        // Published: lent.
+        source.publish_leaving();
+        let lent = source.lend(&moving, leaves, one_stack).unwrap();
+        assert_eq!((lent.frame(), lent.home()), (leaves, first_frame(1)));
+        assert!(lent.restore());
+        drop(moving);
+    }
+
     /// N13: a full destination refuses the adoption, and the frame goes back to its source,
     /// which resumes it; a table never adopts what it lent.
     #[test]
     fn a_full_destination_refuses_and_the_source_gets_its_frame_back() {
-        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::<Off>::new());
         let (boot_s, _) = two_processors(&source, &destination, 1);
         while destination.publish(first_frame(40)) {}
         assert_eq!(
-            moves.relocate(&source, &destination, first_frame(1), |_| ()),
+            moves.relocate((), &source, &destination, first_frame(1), apart, |_| ()),
             Err(MoveRefused::Adopt(AdoptRefused::Full))
         );
         assert_eq!(
-            moves.relocate(&source, &source, first_frame(1), |_| ()),
+            moves.relocate((), &source, &source, first_frame(1), apart, |_| ()),
             Err(MoveRefused::Adopt(AdoptRefused::SameTable))
         );
         assert!(covered(&source, 1));
@@ -1948,10 +2138,10 @@ mod tests {
     /// taken reports it.
     #[test]
     fn restore_and_forget_settle_a_lent_frame() {
-        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::<Off>::new());
         two_processors(&source, &destination, 1);
-        let moving = moves.begin();
-        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        let moving = moves.begin(());
+        let lent = source.lend(&moving, first_frame(1), apart).unwrap();
         assert_eq!(
             (lent.home(), lent.frame()),
             (first_frame(1), first_frame(1))
@@ -1961,16 +2151,16 @@ mod tests {
         assert!(lent.restore());
         assert!(resumable(&source).contains(&first_frame(1)));
         // Dropped unsettled: restored.
-        drop(source.lend(&moving, first_frame(1)).unwrap());
+        drop(source.lend(&moving, first_frame(1), apart).unwrap());
         assert!(resumable(&source).contains(&first_frame(1)));
         // Refused by its own table: handed back, then restored.
-        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        let lent = source.lend(&moving, first_frame(1), apart).unwrap();
         let Err((refused, lent)) = source.adopt(&moving, lent) else {
             panic!("a table adopted what it lent");
         };
         assert_eq!(refused, AdoptRefused::SameTable);
         assert!(lent.restore());
-        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        let lent = source.lend(&moving, first_frame(1), apart).unwrap();
         let adopted = destination.adopt(&moving, lent).unwrap();
         assert_eq!(adopted.home(), first_frame(1));
         assert!(covered(&source, 1), "until it is forgotten");
@@ -1978,12 +2168,12 @@ mod tests {
         assert!(!covered(&source, 1));
         assert!(resumable(&destination).contains(&first_frame(1)));
         // Back again, the `Adopted` simply dropped: its drop forgets.
-        let lent = destination.lend(&moving, first_frame(1)).unwrap();
+        let lent = destination.lend(&moving, first_frame(1), apart).unwrap();
         drop(source.adopt(&moving, lent).unwrap());
         assert!(!covered(&destination, 1));
         assert!(covered(&source, 1));
         // A lent frame whose slot was written meanwhile, which nothing in the protocol does.
-        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        let lent = source.lend(&moving, first_frame(1), apart).unwrap();
         source.slots[lent.slot].frame.store(0x77, Release);
         assert!(!lent.restore());
         drop(moving);
@@ -1996,10 +2186,10 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "a lent frame could not be put back in its slot")]
     fn a_lent_frame_that_cannot_be_put_back_stops_a_debug_build() {
-        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::<Off>::new());
         two_processors(&source, &destination, 1);
-        let moving = moves.begin();
-        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        let moving = moves.begin(());
+        let lent = source.lend(&moving, first_frame(1), apart).unwrap();
         source.slots[lent.slot].frame.store(0x77, Release);
         drop(lent);
     }
@@ -2008,7 +2198,7 @@ mod tests {
     /// address is lent as it is now, once; the destination resumes it and the source cannot.
     #[test]
     fn a_frame_saved_again_at_the_same_address_is_lent_once() {
-        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::<Off>::new());
         let (boot_s, boot_d) = two_processors(&source, &destination, 1);
         let at_1 = first_frame(1) - 0x200;
         // Run context 1, and switch it out at `at_1`, twice.
@@ -2031,10 +2221,10 @@ mod tests {
             Ok(boot_again)
         );
         source.publish_leaving();
-        let moving = moves.begin();
-        let lent = source.lend(&moving, at_1).unwrap();
+        let moving = moves.begin(());
+        let lent = source.lend(&moving, at_1, apart).unwrap();
         assert_eq!(
-            source.lend(&moving, at_1).map(|l| l.frame()),
+            source.lend(&moving, at_1, apart).map(|l| l.frame()),
             Err(LendRefused::NotHere),
             "lent once"
         );
@@ -2058,9 +2248,9 @@ mod tests {
     /// finished and then frees the gate.
     #[test]
     fn a_move_that_panics_still_finishes_and_frees_the_gate() {
-        let moves = Moves::new();
+        let moves = Moves::<Off>::new();
         let unwound = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
-            let _moving = moves.begin();
+            let _moving = moves.begin(());
             panic!("a panic under the gate");
         }));
         assert!(unwound.is_err());
@@ -2074,7 +2264,7 @@ mod tests {
     /// next, so each of those passes misses it; the next pass finds it.
     fn scan_with_misses(misses: u32) -> Scanned {
         let tables = [Contexts::new(), Contexts::new()];
-        let moves = Moves::new();
+        let moves = Moves::<Off>::new();
         let quiet = Counting(core::cell::Cell::new(0));
         two_processors(&tables[1], &tables[0], 1);
         let passes = core::cell::Cell::new(0u32);
@@ -2086,7 +2276,7 @@ mod tests {
                 if moving && covered(&tables[0], 1) {
                     assert!(
                         moves
-                            .relocate(&tables[0], &tables[1], first_frame(1), |_| ())
+                            .relocate((), &tables[0], &tables[1], first_frame(1), apart, |_| ())
                             .is_ok()
                     );
                 }
@@ -2094,7 +2284,7 @@ mod tests {
                 if moving {
                     assert!(
                         moves
-                            .relocate(&tables[1], &tables[0], first_frame(1), |_| ())
+                            .relocate((), &tables[1], &tables[0], first_frame(1), apart, |_| ())
                             .is_ok()
                     );
                 }
@@ -2142,7 +2332,7 @@ mod tests {
     #[test]
     fn a_scan_believes_nothing_found_only_with_no_move_across_it() {
         let tables = [Contexts::new(), Contexts::new()];
-        let moves = Moves::new();
+        let moves = Moves::<Off>::new();
         two_processors(&tables[1], &tables[0], 1);
         let asked = |_: ()| tables.iter().any(|t| covered(t, 5));
         assert_eq!(
@@ -2164,7 +2354,14 @@ mod tests {
                     };
                     assert!(
                         moves
-                            .relocate(&tables[from], &tables[to], first_frame(1), |_| ())
+                            .relocate(
+                                (),
+                                &tables[from],
+                                &tables[to],
+                                first_frame(1),
+                                apart,
+                                |_| ()
+                            )
                             .is_ok()
                     );
                 }
@@ -2183,7 +2380,7 @@ mod tests {
         // nor one that began during it (begun changed).
         let readings = moves.readings();
         assert!(moves.settled(readings));
-        let moving = moves.begin();
+        let moving = moves.begin(());
         assert!(!moves.settled(readings), "begun changed");
         assert!(!moves.settled(moves.readings()), "a move under way");
         drop(moving);
@@ -2192,12 +2389,12 @@ mod tests {
 
     #[test]
     fn the_move_types_name_no_address() {
-        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::new());
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::<Off>::new());
         two_processors(&source, &destination, 1);
         assert_eq!(format!("{moves:?}"), "Moves");
-        let moving = moves.begin();
+        let moving = moves.begin(());
         assert_eq!(format!("{moving:?}"), "Moving");
-        let lent = source.lend(&moving, first_frame(1)).unwrap();
+        let lent = source.lend(&moving, first_frame(1), apart).unwrap();
         assert_eq!(format!("{lent:?}"), "Lent");
         let adopted = destination.adopt(&moving, lent).unwrap();
         assert_eq!(format!("{adopted:?}"), "Adopted");

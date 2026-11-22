@@ -77,6 +77,19 @@
 
 **Threats.** A stale name cannot wake another thread (the generation). No program can name a record: handles name thread objects (ADR-0005 P1).
 
+**Note, 2026-11-22: records from any block, and how long a wake-up keeps interrupts off (TASKS item 96; the coordinating session's rulings Q4 and Q18, its second ruling on Q6 of TASKS item 92, and its rulings on the review of TASKS item 96; no decision changes).**
+- **Taking and giving back, with moves.** A spawn takes its record from the block of the processor it queues the thread on, or, if that block is used up, from the next block round that has one (`origin_sync::threads::take_from_any`). The reap still gives a record back to its own block, by its number.
+  - **Why it is needed.** With moves, a processor's records can be held by threads that left it, so the count of 32 per block no longer holds block by block.
+  - **Why it is enough.** The count holds for the machine: every held record belongs to a queued thread (at most 15 per processor) or a zombie (at most 16 per processor), wherever it came from, so at most 31 × P are held of the 32 × P there are. The settles' check of the records counts them for the machine for the same reason (the review's R96-3).
+  - **Cost.** The search past the own block runs only when that block is used up, which no boot does.
+- **The record check** (S20, trigger 3) is made before a slot is woken: the kernel compares the record the slot holds with the wake-up's by address (`KernelQueues::holds`, through `RunQueue::held`), after the generation compare, under the same lock. Records never move, so an address names one record. A wake-up that met an inconsistency finds the record's number from the record (`threads::number_of`), so the location loop keeps no register for it.
+- **How long a wake-up keeps interrupts off (D93-2).** `sched::wake` runs the location loop, the compare and the IPI in one interrupts-off section (TASKS item 93). Each move it follows adds at most the rest of one move's critical section (B20, a hypothesis of 2 µs) and one look under a queue lock: about 2.5 µs on the budgets' figures.
+  - **Paced** at S10's rate, or at the migration proofs' one move per thread per tick, a wake-up follows at most one move. Every proof boot of TASKS item 96 saw at most one follow per wake-up.
+  - **Unpaced,** a caller that broke `migrate`'s documented rule could make one follow 64: about 160 µs, which **exceeds B18's 50 µs**.
+  - **No such caller exists** in TASKS item 96. "thread migration: delivery" measures the longest span of a sender's wake-up that followed a move, `emu`: 162 µs on the default machine, 3.7 to 8.8 ms on the 65- and 67-processor machines; and, for scale, of one that followed none: 62 µs and 46 to 117 ms. Those long spans are the host descheduling a virtual processor, not the wake-up: a section with no lock, spun for the wake-ups' recent median, shows long spans at the same rate per second spent within about 10% on every large-machine boot (PERFORMANCE_BUDGETS.md, B18's note).
+  - TASKS item 98's contract must re-check this bound when it adds run-time movers, and leave the section after every 8 follows if any unpaced caller can exist (Q18 (b)).
+- **Past 64 retries** (Q17): the wake-up enters S20's pinned mode and follows again with moves withdrawn, as this decision says. A second exhaustion stops the kernel: the flag itself failed.
+
 ### S2. Threads are pinned unless declared movable, and some never move
 
 **Decision.** Every kernel thread is created pinned to the processor its spawner names, exactly as today. A spawner may declare a kernel thread movable. User threads become movable when the task that finishes S3's conversion of the system-call paths lands; until then they are pinned. These never move:
@@ -99,6 +112,12 @@
 **Migration consequences.** Existing threads keep their behaviour. A thread type that becomes movable says so at its spawn, reviewed with S3's conversion of its code.
 
 **Threats.** Pins are the kernel's; a program cannot pin itself except through hard affinity (S11), which gives it no share.
+
+**Note, 2026-11-22: the movable declaration, as built (TASKS item 96; the coordinating session's ruling Q3; no decision changes).** A record holds a `movable` flag, one byte in room the record had, so the kernel's record stays 128 bytes.
+- **Who sets it.** The spawner, through `sched::spawn_movable`, after `Block::take` and before its push, while no thread runs on the record. `Block::take` resets it for the record's next thread, with a Release store after the new generation.
+- **Who reads it.** A mover reads it, with the pin count, under the owning queue's lock (the review of TASKS item 93, R93-7). A wake-up that followed moves reads it after its loop, with no lock, between two reads of the generation, both the name's (Acquire, paired with `take`'s Release; the review of TASKS item 96, R96-5); a mismatch counts the follows apart.
+- **Who is movable.** Every thread is pinned unless so declared. In TASKS item 96 only the migration proofs' threads are.
+- **Later.** TASKS item 100's affinity replaces the flag (S11).
 
 ### S3. The processor index is read only under a witness that the thread cannot move
 
@@ -177,6 +196,12 @@ Why the fast path is enough when it answers, in outline: a scan that misses a mo
 - **MV4's control (Q6).** Run first, as the ruling asked, and not caught: with finished raised before `forget`, MV4 passed at three preemptions (5,859 executions) and exhaustively (1,363,402 executions, 82 s on the development Mac). It is not a bug. What the scan needs is finished raised after `adopt` (or `restore`): a pass that reads the source's home word from the forget on happens after the forget, so it counts the move's raise of begun, and a reading of finished that counts the move sees the destination's claim. Where finished falls against `forget` does not matter (the outline in `contexts.rs`, "Moves between processors"). An independent reviewer, given the code and the invariants and not this answer, said the same, and named the control that is a bug: finished raised before `adopt`. MV4 catches that at three preemptions and exhaustively ("a live context's stack was in no record"). The control column above is kept as accepted; MV4's controls in `cargo xtask loom` are MX4a (a claim by a Relaxed load and a store, not a compare-and-swap), MX4b (the forget's store Relaxed) and MX4c (finished raised before `adopt`, the reviewer's). The two answers agree, so nothing waited for a ruling (`docs/engineering/REVIEW_T95_2026-11-21.md`, section 1). The control column above is kept as accepted; MV4's controls are MX4a (a claim made by a Relaxed load and a store), MX4b (the forget's store Relaxed) and MX4c (finished raised before `adopt`), each caught, and the column's own control is recorded as run and not caught.
 - **The gate's wait (the review of TASKS item 95, R95-2).** "It waits at most for one move's critical section", above, holds only while no other processor waits for the gate too. The gate is built as a ticket lock, which serves waiters in the order they came, so a scanner's wait is at most one critical section for each processor waiting ahead of it, each with interrupts off: still bounded whatever the rate of moves, but by the number of processors, not by one. A test-and-set lock would not bound it at all: a waiter could lose to every newcomer in turn. Loom cannot show the wait ends, since it does not explore an execution that spins past its bound; MV7 shows the scan answers, and finds the home, when the gate is won, and MV9 that the gate admits one holder at a time, a scan's last pass among them, each seeing the writes of those before it (the delta review's D95-2, with three controls). The order has two costs the old lock did not (the delta review's D95-3 and D95-8). A mover must turn interrupts off before it takes its ticket, not only once it holds the gate: an interrupt on its processor whose scan takes a later ticket would wait for ever for a caller that cannot run, and every later holder behind it; S3's interrupts-off witness, required in `begin`, is left to TASKS items 93 and 96. And a scanner may wait, with interrupts off, for one critical section per processor ahead of it, each possibly another scan's whole pass, during which it answers no interrupt; on the oversubscribed emulated machines a processor descheduled while it holds a ticket stalls everyone behind it. That cost is measured when moves exist (CL48, TASKS item 96).
 
+**Note, 2026-11-22: the gate requires interrupts off, by type (TASKS item 96; the coordinating session's ruling Q1; the review of TASKS item 95, R95-12 and D95-3; no decision changes).**
+- **The token.** `Moves::begin` takes `trap::InterruptsOff`, made only by an interrupts-off section (`trap::section_off`) and by the trap entry (`Switch::interrupts_off`). `Moves` is generic over a `MoveWitness`, so origin-sync need not name the framework's types.
+- **The kernel's entry.** The kernel's one `Moves` is `cpu::MOVES`, over its tables. Its one caller of `begin` is `cpu::move_context`, which a host test holds. `move_context` passes `stack::same_slot` itself as `lend`'s same-stack check: a change from TASKS item 96's contract, which had a closure there, accepted by the coordinating session.
+- **Non-generic, out of line.** `move_context` was first written public and generic; the kernel crate then instantiated it, exported `CONTEXTS` and `MOVES`, and the position-independent kernel reached them through the GOT in `resume` and `dispatch`. Non-generic and `#[inline(never)]`, it leaves those two exactly as before; only the mover pays an indirect call, under the gate.
+- **`check_landing`.** It takes the same token (R93-10).
+
 ### S5. A frame becomes resumable elsewhere only after its processor has left the stack
 
 **Decision.** `Contexts::switch` no longer stores the outgoing context's frame in its slot. It records the slot and the frame as **leaving**. The processor publishes them, storing the frame in the slot (Release) and then clearing the leaving record (Release), at its next call into the table: the top of its next `switch`, beside `retire_ended`, or the idle loop's and the tick's entry. Both run on another stack. Until published, nobody can take the frame, the source included; the source's own next switch publishes before it chooses. `covers` reads the leaving record before the slots, so that a scan cannot miss a frame between the two stores.
@@ -202,6 +227,14 @@ A thread is therefore movable from its source's next trap entry after it was swi
 - **Never from a handler that can interrupt a switch** (an NMI, a machine check, a debug exception, a double fault), nor from the other vectors' handlers.
 - **The boot or idle flow's first switch-out** claims its slot with no frame and leaves its frame like any other.
 - **A window for TASKS item 96.** The scheduler's hook stores the outgoing thread's frame in its run queue under the queue lock; the switch records it as leaving only after that lock is released, on the way out of the trap entry. A mover that takes the source's queue lock in between sees a ready thread whose frame its table has not yet seen, and `lend` answers `NotHere`. So `NotHere` alone is not S20's inconsistency ("a `lend` that fails where its checks said the frame was published"): item 96's checks must establish that the frame was published, for example by the source's table answering whether the frame is in a slot, or by the run queue marking a thread switched out since the source's last call into its table.
+
+**Note, 2026-11-22: the window between naming a frame and switching it out, told from a lost frame (TASKS item 96; the coordinating session's ruling Q2; no decision changes).**
+- **The window.** A scheduler names the frame its running context leaves under its queue lock. Its switch records the frame as leaving only after that lock is released.
+- **What a mover sees in it.** A mover that takes the lock in between finds the thread ready and not running, but its frame in no record.
+- **How `lend` tells the window apart.** It reads `current` first (Acquire). If the running context's home lies in the frame's stack, it refuses `NotYet`. Only then does it read the leaving record and the slots.
+- **The ordering.** `switch` stores `current` with Release, the same plain move on x86-64: the static counts of `resume`, `on_yield` and `dispatch` equal those before TASKS item 96, their disassembly included.
+- **What follows.** `NotHere` and `BootFlow` after the mover's checks are now S20's inconsistency (trigger 2).
+- **The evidence.** Loom's LV3, with LX5 (`current` stored Relaxed) and LX6 (the leaving record read first), each caught. At boot, control C96-1b (the running slot's frame handed to the mover) is refused by `NotYet`, and C96-1c (with `NotYet` gone too) by the published-frame check and trigger 2's withdrawal (ADR-0013, TASKS item 96's controls).
 
 ### S6. What a move carries, and what stays where it is
 
@@ -231,6 +264,45 @@ What stays: zombies and the exit counts (N5, N6), and so TASKS item 79's settle;
 **Migration consequences.** `RunQueue` gains `depart` and `arrive`, host-tested as the rest of it is.
 
 **Threats.** The FPU area holds a thread's data and is restored only on its own thread, as today; a move copies neither the area nor the stack.
+
+**Note, 2026-11-22: the move, as built (TASKS item 96; no decision changes).** `sched::migrate(thread, to, online)`, in one interrupts-off section:
+1. the location read;
+2. both queue locks, in index order;
+3. the location read again, and the generation compared;
+4. pinned mode checked under the source's lock;
+5. eligibility:
+   - the slot holds this record;
+   - the thread is ready and not running (`RunQueue::frame`);
+   - it is declared movable, and its pin count is 0;
+   - both processors take part in moves;
+   - the destination's queue has room;
+6. `cpu::move_context`, under the gate. It publishes the mover's own leaving frame if the source is its processor, then:
+   - lends the frame;
+   - the destination adopts it;
+   - `RunQueue::depart`, then `arrive`, then the location;
+   - the source forgets the home;
+7. the locks released, and one reschedule IPI to a destination that is not the mover's processor.
+
+What it carries:
+- **The lag.** A thread departs with its pass less its source's floor, and arrives at its destination's floor plus that lag: no credit, no loss.
+- **A pending wake-up** is carried. `arrive` marks the slot woken, so the IPI's `preempt_for_wake` runs the arrival where a woken thread would run (the ruling's Q11).
+- **No rate of its own** (Q13). Its callers pace themselves; S10's rate is TASKS item 98's.
+- **A full destination** refuses the move ("queue full") with nothing lost, and a full source can move a thread out: "thread migration: integrity" shows both at boot (N13; the review's R96-13).
+
+**Note (2026-11-22, TASKS item 96; the coordinating session's ruling on TASKS item 129's reproduction, a reading of this decision, not an amendment).** The floor this decision names, "the lowest pass among its ready contexts", is read as follows:
+- **What counts.** The contexts that take part in the share: threads, and slot 0 where it is the boot flow, which yields in the race. Never the idle flow, which "stays apart" (S12).
+- **With none of them ready, the floor holds its last value.** It never falls. `push`, `admit` and `arrive` never place a pass below it, so it only rises, and "a move earns no credit and loses none" holds: with all weights equal, a thread departs with a lag of at most one of its strides.
+- **Why the reading was needed.** Before it, a queue with nothing ready took the running context's pass. On an application processor that is the idle flow's, which is charged only for the quanta nothing else wanted. So:
+  - a thread that blocked there was left far above the next newcomer;
+  - its next move carried the difference as lag, and every round trip added it again;
+  - on the two-processor machines, lags at a move reached 4.06 billion strides;
+  - one thread left on CPU 0 with 212 million of them waited past the integrity proof's patience behind the boot flow's yields (TASKS item 129, reproduced with the event ring on 2026-11-22).
+- **As built.** `RunQueue` keeps the value (`kept_floor`). It is raised:
+  - to the running context's pass when that context was the last ready one that counts (it blocked, slept or exited);
+  - at a departure;
+  - when slot 0 becomes the idle flow.
+
+  A host test holds the case in small, against a control that plants the old fallback. The randomized model holds two properties over every step: no floor falls, and no departing lag exceeds one stride.
 
 ### Part B. Who moves threads, and where to
 
@@ -536,6 +608,16 @@ So pinned mode is a recovery only where nobody is proving anything; wherever a p
 
 **Threats.** A machine that falls back loses balancing, not isolation.
 
+**Note, 2026-11-22: pinned mode, as built, and its cost (TASKS item 96; the coordinating session's rulings Q5, Q6, Q17 and A, and its rulings on the review; no decision changes).**
+- **The flag.** One machine-wide flag, entered by compare-and-swap from 0, so the first trigger is the one named. Every later inconsistency is counted, a wake-up's second one included (the review's R96-10). The flag is never left.
+- **The triggers:**
+  1. "thread migration: delivery" failed, for any reason (R96-1);
+  2. a `lend` that found no frame after the mover's checks (`NotHere`, `BootFlow`);
+  3. a location naming a slot that holds another record or none. The record is checked by address under the queue's lock before the slot is woken, in `wake` and in `migrate`. After it, every queue is searched, each under its own lock; if none holds the record, the location is followed once more, and searched once more, so that a thread a move in flight carried past the search is still woken (R96-6);
+  4. a wake-up past 64 retries, which then follows again with moves withdrawn. A second exhaustion stops the kernel (Q17).
+- **The line.** `origin-kernel: scheduler: pinned mode: moves withdrawn: <trigger> on CPU <n><what it did next>`, at most 153 bytes, within the console's line (R96-9). A wake-up writes it out of line inside its interrupts-off section, through the console's queue, as an interrupt handler's line is written (a change from TASKS item 96's contract, which had it after the section); a mover after its locks are released. It is a failure in every `cargo xtask` scenario. Entered before the boot's verdict, it fails "thread migration: delivery" (Q5).
+- **Against "None, by construction":** the record check of trigger 3 is on every wake-up's path. Traced instruction by instruction against the code before TASKS item 96, a wake-up of a blocked thread runs the same 163 instructions with the same two calls, and one of a thread not yet blocked runs 134 against 132 (PERFORMANCE_BUDGETS.md, CL47's note). A move adds one flag read. Everything else is out of line, reached only by an inconsistency.
+
 ### S21. Processors offline and back: in M3, after moves, in its own amendment
 
 **Decision.** S24-14 is part of M3 (M3-1 names it), but it is not built with this ADR. It needs moves first, and then touches what this ADR does not: device interrupts aimed at the processor (IRTEs, MSI-X, the NVMe per-processor queues, ADR-0008 Amendment 1 D6), its timers, its membership of TLB shootdowns (`tlb::mark_online`), the park (ADR-0008 C7), the restart with ADR-0017's controls applied again, and HFI's enables, which INIT and SIPI clear (S9). **Recommended: ADR-0008 Amendment 2**, written after the move task lands. ADR-0020 gives it only **evacuation**: every movable thread of a processor moved away by directed moves; refused while a pinned thread other than the processor's own per-processor workers remains. **Exit test M3-1 names processors taken offline and back, so M3-1 stays partial until that amendment is built**, whatever else of M3 is done (`docs/ROADMAP.md`, M3).
@@ -593,6 +675,15 @@ Each has negative controls (`docs/engineering/M3_SCHEDULING_PLAN.md`).
 **New machines:** an SMT machine (`-smp 8,sockets=1,cores=4,threads=2`, two NUMA nodes) and a two-package machine (`-smp 8,sockets=2,cores=4,threads=1`, a node per package). As ADR-0008 Amendment 1 D7 requires, each is measured on the development Mac first, and joins CI's required jobs only if the real-processor boot job stays well inside its 180-minute limit on the slowest runner.
 
 **Cost.** Owed, under ADR-0018's ledger row CL20 (the boot proofs' waits): about 2 s of moves and 2 s of balancing per boot, and the new machines' boots in `boot-matrix`.
+
+**Note, 2026-11-22: the migration proofs, as built (TASKS item 96; the coordinating session's rulings Q9 and Q10, and its rulings on the review; an implementation, not a weakening).**
+- **The mover.** The boot flow, which never moves (S2, point 4), not a mover thread: it runs both proofs' moves, paced at one per thread per tick of its own processor.
+- **The "running on" word.** The integrity proof's threads hold their word themselves, not the switch path. Each runs its whole loop with interrupts off, so only its own yields and blocks switch it out. It takes the word by compare-and-swap first thing after each return from one, and releases it by compare-and-swap last thing before the next: for the only threads that move, "set at switch-in, cleared at switch-out", at no cost to the switch path. The word is not held from its release to the trap of the switch, nor from the switch's return to the take: a few instructions each. TASKS item 100, which makes other threads movable, revisits it.
+- **The canaries.** Six values kept across each thread's loop, which the compiler may hold in registers or spill, so they check the restored stack a second time rather than the general registers; 256 bytes of stack; four XMM registers, which only the thread's FPU area holds. Pinning general registers needs an `asm!` helper in the framework (the review's R96-8; a follow-up).
+- **Coverage as a progress wait.** "Every processor a source and a destination" is reached by moving until it holds, for at least 2 s and within 30 s, not judged inside a fixed 2 s: ADR-0013 R1 (b) lets a Refuse proof wait with a budget of seconds, not depend on load (R96-4). One boot of the 67-processor machine, judged the old way, made 276 moves while the host's load rose from 9.9 to 25.4, and missed it.
+- **At the queue's capacity.** On two processors, a destination filled to its capacity refuses 8 moves as full with nothing lost, and a full source moves a thread out (N13's row; R96-13): 2 ms on the default machine, 141 ms to 1.5 s on the 67-processor machine.
+- **A safe stop during integrity fails it** (R96-12). Integrity is a Refuse proof of a P0 property, and a correct kernel meets no S20 trigger, so meeting one fails the proof. The kernel itself goes on pinned, as S20 says; ADR-0013 R4 and R5 then stop the boot. The proof's verdict and the run-time behaviour are separate.
+- **Delivery's path.** It counts the carried wake-ups whose receiver held a token it had not taken, before and after the move, and requires one (R96-2): 155 of 215 on the default machine, about 1300 to 1900 on the 67-processor machine.
 
 ## Invariants, and what shows each holds
 

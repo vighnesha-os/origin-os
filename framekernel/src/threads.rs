@@ -5,8 +5,9 @@
 //! and keeps one block of records per processor.
 //!
 //! **Numbers.** Record `index` of processor `cpu`'s block is number `cpu` × [`PER_CPU`] +
-//! `index`. A spawn takes a record from the block of the processor it queues the thread on, and
-//! the thread's reap gives it back there.
+//! `index`. A spawn takes a record from the block of the processor it queues the thread on, or,
+//! if that block is used up, from the next block round that has one (TASKS item 96: [`take`]), and
+//! the thread's reap gives it back to the block it came from, by its number.
 //!
 //! **Enough.** While no thread moves, a processor's records are held by the threads of its run
 //! queue (at most `CAPACITY` − 1: slot 0 is the boot or idle flow, which has none, ADR-0020 S2,
@@ -18,9 +19,19 @@
 //! before its queue does (the review of TASKS item 92, R92-7). A spawn that finds none is still
 //! refused safely, as a full queue refuses it (`QueueError::Full`).
 //!
-//! **Accounted for.** Every settle checks, processor by processor, that the records its block
-//! holds are its queued threads' and its zombies', and that no record's give-back has been refused
-//! ([`unaccounted`]; the review's R92-2).
+//! **With moves** (ADR-0020 S6; TASKS item 96), a processor's records can be held by threads that
+//! moved to others, so the count above no longer holds block by block. It holds for the machine:
+//! every held record belongs to a queued thread (at most `CAPACITY` − 1 per processor) or a
+//! zombie (at most `CAPACITY` per processor), wherever it came from, so at most 31 × P are held
+//! of the 32 × P there are. [`take`] looks in every block before it refuses, so a spawn fails for
+//! want of a record only if none is free anywhere. Its search past the own block runs only when
+//! that block is used up, which no boot does today.
+//!
+//! **Accounted for.** Every settle checks that the records the blocks hold are the queued threads'
+//! and the zombies', counted for the machine, and that no record's give-back has been refused
+//! ([`unaccounted`]; the review's R92-2). For the machine, not block by block: a thread that moved,
+//! or took its record from another processor's block, is queued or listed on one processor with
+//! a record of another's (the review of TASKS item 96, R96-3).
 //!
 //! **Memory.** Every block is made when the processors are discovered (`percpu::size_per_cpu`;
 //! ADR-0008 Amendment 1, D1), never moved and never freed: the boot processor's is static, and the
@@ -36,7 +47,7 @@ use origin_frame::percpu::PerCpu;
 use origin_frame::stack::{FpuArea, GuardedStack};
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::exits::Mark;
-use origin_frame::sync::threads::{Block, Empty, Record};
+use origin_frame::sync::threads::{Block, Empty, Record, take_from_any};
 
 use crate::cpu::{CpuIndex, ThisCpu, without_interrupts};
 use crate::process::UserContext;
@@ -53,11 +64,12 @@ const _: () = assert!(
 // A record's location names its slot in 16 bits (`origin_sync::threads::Location`).
 const _: () = assert!(CAPACITY <= u16::MAX as usize, "a slot fits a location");
 
-// A record is two 64-byte lines, as TASKS item 92 measured it: its pin count (TASKS item 93) took
-// room that was there, and did not grow it (the coordinating session's ruling Q9).
+// A record is two 64-byte lines, as TASKS item 92 measured it: its pin count (TASKS item 93) and
+// its movable flag (TASKS item 96) took room that was there, and did not grow it (the
+// coordinating session's rulings Q9 of TASKS item 93 and Q3 of TASKS item 96).
 const _: () = assert!(
     core::mem::size_of::<Record<State>>() == 128,
-    "a record is 128 bytes, its pin count included"
+    "a record is 128 bytes, its pin count and movable flag included"
 );
 
 /// What a record holds: everything a thread owns from its spawn to its reap.
@@ -83,10 +95,64 @@ impl Empty for State {
     };
 }
 
-/// One processor's threads: its block of records, and its [`Table`].
+/// One processor's threads: its block of records, its [`Table`], and the moves its wake-ups
+/// followed ([`Follows`]).
 pub(crate) struct Processor {
     records: Block<State, PER_CPU>,
     table: SpinLock<Table>,
+    follows: Follows,
+}
+
+/// The moves of movable threads that this processor's wake-ups followed (ADR-0020 S1; TASKS item
+/// 96, the coordinating session's rulings Q8 and Q13, and D93-2), by the waker's processor. Only
+/// this processor writes them, inside a wake-up's interrupts-off section, out of line
+/// (`sched::wake`), with plain loads and stores; any processor reads them, for the delivery
+/// proof's line. A wake-up that follows nothing touches none of them.
+pub(crate) struct Follows {
+    /// Moves followed, in all.
+    all: AtomicU64,
+    /// The most one wake-up followed.
+    most: AtomicU64,
+    /// Wake-ups that followed more than 8: with moves paced (S10, and `sched::migrate`'s rule),
+    /// none should.
+    over_eight: AtomicU64,
+}
+
+impl Follows {
+    const fn new() -> Self {
+        Self {
+            all: AtomicU64::new(0),
+            most: AtomicU64::new(0),
+            over_eight: AtomicU64::new(0),
+        }
+    }
+
+    /// Notes a wake-up that followed `follows` moves. This processor only, interrupts off.
+    pub(crate) fn note(&self, follows: u32) {
+        let follows = u64::from(follows);
+        self.all.store(
+            self.all.load(Ordering::Relaxed).saturating_add(follows),
+            Ordering::Relaxed,
+        );
+        if follows > self.most.load(Ordering::Relaxed) {
+            self.most.store(follows, Ordering::Relaxed);
+        }
+        if follows > 8 {
+            self.over_eight.store(
+                self.over_eight.load(Ordering::Relaxed).saturating_add(1),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Moves followed, the most one wake-up followed, and the wake-ups that followed more than 8.
+    pub(crate) fn read(&self) -> (u64, u64, u64) {
+        (
+            self.all.load(Ordering::Relaxed),
+            self.most.load(Ordering::Relaxed),
+            self.over_eight.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// One processor's threads that are not in a record: the exited ones awaiting their reap
@@ -110,6 +176,7 @@ impl Processor {
                 zombies: [None; CAPACITY],
                 idle_fpu: None,
             }),
+            follows: Follows::new(),
         }
     }
 }
@@ -130,6 +197,22 @@ pub(crate) fn table(cpu: usize) -> Option<&'static SpinLock<Table>> {
 /// TASKS item 93).
 pub(crate) fn table_here(me: ThisCpu<'_>) -> Option<&SpinLock<Table>> {
     Some(&THREADS.this(me)?.table)
+}
+
+/// This processor's [`Follows`], lent for the life of the witness `me` was read under.
+pub(crate) fn follows_here(me: ThisCpu<'_>) -> Option<&Follows> {
+    Some(&THREADS.this(me)?.follows)
+}
+
+/// The follows of every processor's wake-ups, summed, with the most one wake-up followed anywhere:
+/// moves followed, the most, and the wake-ups past 8.
+pub(crate) fn follows() -> (u64, u64, u64) {
+    THREADS
+        .iter()
+        .map(|processor| processor.follows.read())
+        .fold((0, 0, 0), |(all, most, over), (a, m, o)| {
+            (all.saturating_add(a), most.max(m), over.saturating_add(o))
+        })
 }
 
 /// What a run-queue slot holds of its thread's record (`RunQueue<Placed>`): its number, for the
@@ -167,13 +250,27 @@ pub(crate) fn record(number: u32) -> Option<&'static Record<State>> {
     THREADS.get(block)?.records.get(index)
 }
 
-/// A record for a new thread on processor `cpu`, from that processor's block, given its next
-/// generation (`Block::take`), and resolved for its run-queue slot ([`Placed`]). `None` if the
-/// block holds no free record (the review's R92-18).
+/// The number of `record` ([`record`]'s inverse), found by its address in each processor's block
+/// in turn (`Block::index_of`): `None` if no block holds it. Out of line only: a wake-up that met
+/// an inconsistency finds its thread's number this way (`sched::wake_inconsistent`; TASKS item
+/// 96), so that the wake-up's location loop keeps no register for the number.
+pub(crate) fn number_of(record: &Record<State>) -> Option<u32> {
+    (0..THREADS.indexes()).find_map(|block| {
+        let index = THREADS.get(block)?.records.index_of(record)?;
+        Block::<State, PER_CPU>::number(block, index)
+    })
+}
+
+/// A record for a new thread on processor `cpu`, from that processor's block or, if it is used up,
+/// from the next block round that has one (`origin_sync::threads::take_from_any`; TASKS item 96),
+/// given its next generation (`Block::take`), and resolved for its run-queue slot ([`Placed`]).
+/// `None` if no block holds a free record (the review's R92-18).
 pub(crate) fn take(cpu: CpuIndex) -> Option<Placed> {
-    let block = &THREADS.get(cpu.get())?.records;
-    let (index, _) = block.take()?;
-    let placed = Block::<State, PER_CPU>::number(cpu.get(), index)
+    let (from, index, _) = take_from_any(cpu.get(), THREADS.indexes(), |b| {
+        THREADS.get(b).map(|processor| &processor.records)
+    })?;
+    let block = &THREADS.get(from)?.records;
+    let placed = Block::<State, PER_CPU>::number(from, index)
         .zip(block.get(index))
         .map(|(number, record)| Placed { number, record });
     if placed.is_none() {
@@ -208,22 +305,25 @@ pub(crate) fn give_back(number: u32) {
     }
 }
 
-/// The records out of place: those whose give-back was refused since the boot began, and, on each
-/// processor, the difference between the records its block holds and its threads (queued, or
-/// zombies awaiting their reap). 0 while every thread has its one record and every reaped thread
-/// gave its record back (the review of TASKS item 92, R92-2).
+/// The records out of place: those whose give-back was refused since the boot began, and the
+/// difference between the records every block holds and the machine's threads (queued, or zombies
+/// awaiting their reap). 0 while every thread has its one record and every reaped thread gave its
+/// record back (the review of TASKS item 92, R92-2). Summed over the machine, since a thread's
+/// record may be another processor's (R96-3).
 ///
 /// Each processor is read under its run queue's lock and then its table's, so no spawn, exit or
 /// reap there is half done: a spawn takes its record and queues the thread under the queue's lock,
 /// an exit lists its zombie or gives its record back under both, and a reap takes a zombie off
-/// the list and gives its record back under the table's.
+/// the list and gives its record back under the table's. The processors are read one after
+/// another, so a move during the reading could count its thread twice or not at all: a settle
+/// runs on the boot flow, which is the only mover, so none is under way then.
 pub(crate) fn unaccounted() -> u64 {
-    let mut off = REFUSED.load(Ordering::Relaxed);
+    let (mut held, mut threads) = (0u64, 0u64);
     for (cpu, processor) in THREADS.iter().enumerate() {
         let Some(queue) = crate::sched::QUEUES.get(cpu) else {
             continue;
         };
-        let (held, threads) = without_interrupts(|| {
+        let (here_held, here_threads) = without_interrupts(|| {
             let queue = queue.lock();
             let table = processor.table.lock();
             let zombies = table.zombies.iter().flatten().count();
@@ -232,8 +332,10 @@ pub(crate) fn unaccounted() -> u64 {
                 queue.live().saturating_sub(1).saturating_add(zombies),
             )
         });
-        let threads = u64::try_from(threads).unwrap_or(u64::MAX);
-        off = off.saturating_add(u64::from(held).abs_diff(threads));
+        held = held.saturating_add(u64::from(here_held));
+        threads = threads.saturating_add(u64::try_from(here_threads).unwrap_or(u64::MAX));
     }
-    off
+    REFUSED
+        .load(Ordering::Relaxed)
+        .saturating_add(held.abs_diff(threads))
 }
