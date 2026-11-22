@@ -1471,3 +1471,25 @@ Rental H (2026-11-22) ran ADR-0002 Amendment 6's bisection mode on firmware revi
 - **Performance cost** (ADR-0018 V3): none.
 - **Where it is written:** ADR-0002 Amendment 7; the matrix row A02-Am7, placed in M1; TASKS item 133, which builds it.
 - **The confirming rental** (rental I, $0.81 expected and $1.62 at worst; the ledger at $6.48 would reach at most $8.10 of item 225's $10) is put to the owner separately, once TASKS item 133 is built. Under item 350 it carries two questions: B3, and whether the call returns or the firmware's exit shuts down by itself.
+
+### No more bench rentals (item 354): 2026-11-22
+
+On 2026-11-22, at about 19:44 UTC, you wrote: "Don't take for rentals anymore". That is item 354: your instruction, not an answer to a question. Rental I, TASKS item 133's confirming boot of item 353, had your "Rent it" and was waiting for its start at 20:00 UTC. The coordinating session stopped it at 19:44 UTC, before anything was bought.
+
+| # | Question | Answer |
+|---|---|---|
+| 354, answered | Are bench machines still rented? | **No: "Don't take for rentals anymore" (your instruction, 2026-11-22)** |
+
+- **What it means:**
+  - No rental is put to you, and no session stages images for one, or runs the rental tool against the provider, dry runs and read-only price checks included.
+  - It replaces item 350's pause, which waited for two questions that could share one rental.
+  - If you raise rentals again, the question is put afresh.
+- **The ledger stays at eight rentals,** A to H (2026-11-12 to 2026-11-22), $6.48 of item 225's $10 cap. Each server was deleted the same hour.
+- **What stays open without a rental:**
+  - Item 353 (ADR-0002 Amendment 7) is built by TASKS item 133 and checked under QEMU only, on its branch until it lands. The rented board has not entered the kernel, so the change stands on rentals G and H's evidence alone.
+  - Reading S, the firmware's exit ending in a shutdown by itself, is not excluded.
+  - Both wait for a machine in the declared scope (ADR-0009 Amendment 1), or one you provide.
+  - CI's KVM runners are a virtual machine. They are a declared scope of their own, not hardware qualification (CLAUDE.md §74).
+- **What is kept:** the rental tool (`developer-tools/bench/latitude.py`), its tests, and the bench build's modes (ADR-0002 Amendments 3 to 6) stay in the tree. They are host-side and bench-only, none ships, and they serve a bench machine that is not rented. The kept raw data stays where item 232 put it.
+- **Performance cost** (ADR-0018 V3): none, by construction.
+- **Where it is written:** this sheet; the requirements README's table of items without rows; a dated note on ADR-0002 Amendment 7.
