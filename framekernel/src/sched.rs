@@ -1459,6 +1459,10 @@ fn move_once(
         }
         Some(Err(MoveRefused::Adopt(AdoptRefused::Full))) => Err(Unmoved::TableFull),
         // ADR-0020 S20, trigger 2: its checks found the frame published, and `lend` did not.
+        // `SameTable` and `None` (no table for a processor) cannot happen, since `from` and `to`
+        // differ and every processor has a table; were one met, it is answered as the same safe
+        // stop rather than a panic, though the line then names trigger 2 for it (the review of
+        // TASKS item 96, R96-16).
         Some(Err(
             MoveRefused::Lend(LendRefused::NotHere | LendRefused::BootFlow)
             | MoveRefused::Adopt(AdoptRefused::SameTable),
