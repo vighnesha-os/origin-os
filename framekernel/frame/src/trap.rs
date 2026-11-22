@@ -851,6 +851,20 @@ mod tests {
         found
     }
 
+    /// What the test below looks for, built so that this file does not hold it: a call of the
+    /// move gate's `begin`, or of `relocate`, which takes it.
+    const MOVE_BEGINS: [&str; 2] = [concat!(".", "begin("), concat!(".", "relocate(")];
+
+    /// The kernel's one entry to a move between processors' tables is `cpu::move_context`
+    /// (TASKS item 96, the coordinating session's ruling Q1): no other function of this crate
+    /// begins a move. `cpu::MOVES` and `cpu::CONTEXTS` are `pub(crate)`, so no other crate reaches
+    /// the tables a move lends from; and `Moves::begin` takes the interrupts-off token
+    /// ([`InterruptsOff`]), so no caller here begins one with interrupts on.
+    #[test]
+    fn only_move_context_begins_a_move() {
+        assert_eq!(callers_in_crate(&MOVE_BEGINS), ["cpu.rs: move_context"]);
+    }
+
     /// The token carries no state, prints its name alone, and gives a [`Here`].
     #[test]
     fn the_interrupts_off_token_gives_a_witness() {

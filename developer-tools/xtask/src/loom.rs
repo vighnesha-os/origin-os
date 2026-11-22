@@ -187,6 +187,9 @@ const MOVE_NOT_GIVEN_BACK: &[&str] =
     &["a frame back from a full destination could not be resumed at its source"];
 const MOVE_RESUMED_TOO_SOON: &[&str] =
     &["a frame was resumed on another processor before its own had left its stack"];
+/// LV3's report (TASKS item 96): a frame its processor was still switching out was answered
+/// `NotHere`, which the kernel's mover takes for a lost frame.
+const MOVE_CALLED_LOST: &[&str] = &["a frame being switched out was called lost"];
 const MOVE_GATE: &[&str] = &[
     "two holders of the move gate at once",
     "a holder of the move gate missed the one before it",
@@ -1965,7 +1968,9 @@ const CONTROLS: &[Control] = &[
         // for a moment both tables hold the frame and both processors can resume it.
         name: "moves_adopt_before_lend",
         file: CONTEXTS,
-        from: "        let lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
+        from: "        let lent = source
+            .lend(&moving, frame, same_stack)
+            .map_err(MoveRefused::Lend)?;
         let adopted = match destination.adopt(&moving, lent) {
             Ok(adopted) => adopted,
             Err((refused, lent)) => {
@@ -1989,7 +1994,9 @@ const CONTROLS: &[Control] = &[
         let Ok(early) = destination.adopt(&moving, early) else {
             return Err(MoveRefused::NotRestored);
         };
-        let mut lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
+        let mut lent = source
+            .lend(&moving, frame, same_stack)
+            .map_err(MoveRefused::Lend)?;
         lent.settled = true;
         let adopted = Adopted {
             source,
@@ -2179,12 +2186,16 @@ const CONTROLS: &[Control] = &[
         // reads the source's frame word after the take is then not ordered after the raise.
         name: "moves_begun_after_lend",
         file: CONTEXTS,
-        from: "        let moving = self.begin();
-        let lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
+        from: "        let moving = self.begin(off);
+        let lent = source
+            .lend(&moving, frame, same_stack)
+            .map_err(MoveRefused::Lend)?;
 ",
-        to: "        let moving = self.begin();
+        to: "        let moving = self.begin(off);
         let _ = self.begun.fetch_sub(1, Relaxed);
-        let lent = source.lend(&moving, frame).map_err(MoveRefused::Lend)?;
+        let lent = source
+            .lend(&moving, frame, same_stack)
+            .map_err(MoveRefused::Lend)?;
         let _ = self.begun.fetch_add(1, Relaxed);
 ",
         models: &[("moves::mv8_a_frame_off_its_home_stack_is_found_while_it_moves", CTX_UNCOVERED)],
@@ -2278,6 +2289,56 @@ const CONTROLS: &[Control] = &[
         models: &[(
             "moves::lv2_a_frame_is_covered_while_its_processor_publishes_it",
             CTX_UNCOVERED,
+        )],
+    },
+    Control {
+        // LX5 (LV3's control; TASKS item 96, the coordinating session's ruling Q2): the switch
+        // stores `current` Relaxed. A mover that reads the new `current` is not ordered after the
+        // leaving record the switch wrote before it, so it can find the frame in neither the
+        // record nor its slot.
+        name: "moves_current_stored_relaxed",
+        file: CONTEXTS,
+        from: "        self.current.store(incoming, Release);
+",
+        to: "        self.current.store(incoming, Relaxed);
+",
+        models: &[(
+            "moves::lv3_a_frame_being_switched_out_is_never_called_lost",
+            MOVE_CALLED_LOST,
+        )],
+    },
+    Control {
+        // LX6 (LV3's control): `lend` reads the leaving record before `current`. The record can
+        // then be older than `current`: read before the switch, with `current` read after it, the
+        // frame is in neither the record it read nor its slot.
+        name: "moves_lend_reads_the_leaving_record_first",
+        file: CONTEXTS,
+        from: "        if self
+            .slots
+            .get(self.current.load(Acquire))
+            .is_some_and(|running| same_stack(running.home.load(Acquire), frame))
+        {
+            return Err(LendRefused::NotYet);
+        }
+        if self.leaving.load(Acquire) == frame {
+            return Err(LendRefused::Leaving);
+        }
+",
+        to: "        let leaving = self.leaving.load(Acquire);
+        if self
+            .slots
+            .get(self.current.load(Acquire))
+            .is_some_and(|running| same_stack(running.home.load(Acquire), frame))
+        {
+            return Err(LendRefused::NotYet);
+        }
+        if leaving == frame {
+            return Err(LendRefused::Leaving);
+        }
+",
+        models: &[(
+            "moves::lv3_a_frame_being_switched_out_is_never_called_lost",
+            MOVE_CALLED_LOST,
         )],
     },
     Control {

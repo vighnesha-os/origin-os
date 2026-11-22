@@ -29,7 +29,9 @@ use crate::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
     TSS, TSS_SIZE,
 };
-use origin_sync::contexts::{BOOT_FLOW, Contexts, Moves, Quiet, Refused, Switched};
+use origin_sync::contexts::{
+    BOOT_FLOW, Contexts, MoveRefused, MoveWitness, Moves, Quiet, Refused, Switched,
+};
 
 use crate::percpu::PerCpu;
 use crate::trap::Switch;
@@ -893,9 +895,50 @@ pub(crate) static CONTEXTS: PerCpu<Contexts> = PerCpu::new(
 /// The machine's move sequence (ADR-0020 S4; `origin_sync::contexts`, "Moves between
 /// processors"): the move gate and the begun and finished counters. A move of a context between
 /// two processors' tables of contexts holds the gate, and every scan of all the tables goes
-/// through [`Moves::scan`], so that a move cannot hide a home from it. Nothing moves a context
-/// yet: TASKS item 96 makes the first move.
-pub(crate) static MOVES: Moves = Moves::new();
+/// through [`Moves::scan`], so that a move cannot hide a home from it. Its `begin` takes the
+/// interrupts-off token ([`KernelOff`]), and [`move_context`] is the one function that begins a
+/// move (TASKS item 96; a host test in `trap` holds it).
+pub(crate) static MOVES: Moves<KernelOff> = Moves::new();
+
+/// The kernel's witness for [`MOVES`]' `begin` (TASKS item 96, the coordinating session's ruling
+/// Q1): [`crate::trap::InterruptsOff`], which only an interrupts-off section and the trap entry
+/// make.
+pub(crate) struct KernelOff;
+
+impl MoveWitness for KernelOff {
+    type Off<'a> = crate::trap::InterruptsOff<'a>;
+}
+
+/// Moves the context suspended at `frame` from processor `from`'s table of contexts to `to`'s,
+/// with `between` run under the move gate between the adoption and the source's forget
+/// (`Moves::relocate`, which says what the caller must hold: both run-queue locks, the thread
+/// ready and not current in `from`'s queue, a free slot in `to`'s). `off` is the token that
+/// interrupts are off. The kernel's one entry to a move (TASKS item 96, the coordinating
+/// session's ruling Q1): `MOVES` and `CONTEXTS` are private to this crate.
+///
+/// The source's `lend` is given [`crate::stack::same_slot`] as its same-stack check, so a frame
+/// its processor still runs on is refused as `NotYet`, not taken for a lost one (ADR-0020 S5's
+/// dated note; the ruling's Q2). The caller cannot pass another.
+///
+/// `None` if either processor has no table; a refusal otherwise says why nothing moved.
+pub fn move_context<R>(
+    off: crate::trap::InterruptsOff<'_>,
+    from: CpuIndex,
+    to: CpuIndex,
+    frame: u64,
+    between: impl FnOnce(u64) -> R,
+) -> Option<Result<(u64, R), MoveRefused>> {
+    let source = CONTEXTS.get(from.get())?;
+    let destination = CONTEXTS.get(to.get())?;
+    Some(MOVES.relocate(
+        off,
+        source,
+        destination,
+        frame,
+        crate::stack::same_slot,
+        between,
+    ))
+}
 
 /// What a scan's pass under the move gate runs in: interrupts off on this processor, since a
 /// mover holds the gate with interrupts off and may be this processor's own interrupt handler.
