@@ -17,6 +17,10 @@
 // (`boot` and what only it calls), which the linker then leaves out of the image.
 #![cfg_attr(origin_bench_minimal, allow(dead_code))]
 
+// TASKS item 131's review, R131-11: the two modes are one or the other, never both.
+#[cfg(all(origin_bench_minimal, origin_bench_bisect))]
+compile_error!("a bench loader is built in the minimal mode or the bisection mode, not both");
+
 use core::ffi::c_void;
 use core::fmt::Write;
 use core::mem::size_of;
@@ -65,6 +69,16 @@ const STACK_PAGES: usize = 16;
 const MAP_SLACK: usize = 32;
 const PAGE: usize = 4096;
 const DEVELOPER_MODE: bool = cfg!(feature = "developer-mode");
+/// The kernel stack's and the boot info's memory types: B3's OS-defined types, or, in the
+/// bisection mode only, `EfiLoaderData` (ADR-0002 Amendment 6, step 2).
+#[cfg(not(origin_bench_bisect))]
+const STACK_TYPE: u32 = memory_type::OS_KERNEL_STACK;
+#[cfg(not(origin_bench_bisect))]
+const BOOT_INFO_TYPE: u32 = memory_type::OS_BOOT_INFO;
+#[cfg(origin_bench_bisect)]
+const STACK_TYPE: u32 = memory_type::LOADER_DATA;
+#[cfg(origin_bench_bisect)]
+const BOOT_INFO_TYPE: u32 = memory_type::LOADER_DATA;
 
 /// Image entry point; the `x86_64-unknown-uefi` target links it as the PE entry.
 ///
@@ -149,6 +163,9 @@ fn boot(
 ) -> Result<core::convert::Infallible, Status> {
     let bs = boot_services(st)
         .map_err(|s| fail(out, s, format_args!("boot services table is invalid")))?;
+    // TASKS item 131 (decision item 352, ADR-0002 Amendment 6): the bisection mode says so first.
+    #[cfg(origin_bench_bisect)]
+    let _ = writeln!(out, "{}", bench::BISECT_LINE);
 
     // B1: read the kernel image.
     let file = read_kernel(image, &bs).map_err(|s| {
@@ -202,17 +219,47 @@ fn boot(
         let found = read_bench_file(image, &bs, bench::AFTER_PATH)
             .map(|(contents, len)| bench::After::from_contents(contents.get(..len).unwrap_or(&[])));
         let _ = writeln!(out, "{}{}", bench::PREFIX, bench::After::said(found));
+        // The bisection mode reads it as the full loader does, and ignores its value (ruling Q3 of
+        // TASKS item 131).
+        #[cfg(origin_bench_bisect)]
+        let _ = writeln!(out, "{}", bench::BISECT_AFTER_IGNORED);
         found.flatten().unwrap_or(bench::After::Reset)
     };
     // TASKS item 121: values in place of the FCH's registers, for QEMU scenarios only. A rented
     // machine's volume never holds the file, so a rental reads the registers where the firmware's
     // tables allow it.
-    #[cfg(origin_bench)]
+    #[cfg(all(origin_bench, not(origin_bench_bisect)))]
     let pretend = {
         let found = read_bench_file(image, &bs, fch::SWITCH_PATH)
             .map(|(contents, len)| fch::Pretend::from_contents(contents.get(..len).unwrap_or(&[])));
         let _ = writeln!(out, "{}{}", bench::PREFIX, fch::Pretend::said(found));
         found.flatten()
+    };
+    // The bisection mode reads the same file with the same calls; its `mine` names a shutdown,
+    // and `noreset` keeps `ResetSystem` out of Amendment 3's order (ruling Q2 of TASKS item 131).
+    #[cfg(origin_bench_bisect)]
+    let (pretend, after) = {
+        let found = read_bench_file(image, &bs, fch::SWITCH_PATH).map(|(contents, len)| {
+            fch::BisectSwitch::from_contents(contents.get(..len).unwrap_or(&[]))
+        });
+        let said = found.map(|s| s.map(|s| s.pretend));
+        let _ = writeln!(out, "{}{}", bench::PREFIX, fch::Pretend::said(said));
+        let switch = found.flatten();
+        let _ = after;
+        let after = if switch.is_some_and(|s| s.no_reset_system) {
+            bench::After::SwitchNoReset
+        } else {
+            bench::After::Reset
+        };
+        if after == bench::After::SwitchNoReset {
+            let _ = writeln!(
+                out,
+                "{}{}",
+                bench::PREFIX,
+                bench::After::said(Some(Some(after)))
+            );
+        }
+        (switch.map(|s| s.pretend), after)
     };
 
     #[cfg(origin_stack_measure)]
@@ -358,7 +405,7 @@ fn boot(
     // B4: stack, boot info and memory-map buffer, all allocated before the final map.
     // One extra page below the stack, in the same KernelStack region: the kernel leaves it
     // unmapped as a guard (boot info 0.2).
-    let stack = allocate(&bs, memory_type::OS_KERNEL_STACK, STACK_PAGES + 1)
+    let stack = allocate(&bs, STACK_TYPE, STACK_PAGES + 1)
         .map_err(|s| fail(out, s, format_args!("cannot allocate the kernel stack")))?;
     let stack = stack + PAGE as u64;
     let (probe_size, descriptor_size) = probe_memory_map(&bs)
@@ -372,7 +419,7 @@ fn boot(
         + capacity * size_of::<MemoryRegion>()
         + BOOT_SECRET_LEN as usize;
     let info_pages = info_bytes.div_ceil(PAGE);
-    let info_addr = allocate(&bs, memory_type::OS_BOOT_INFO, info_pages)
+    let info_addr = allocate(&bs, BOOT_INFO_TYPE, info_pages)
         .map_err(|s| fail(out, s, format_args!("cannot allocate the boot info")))?;
     let map_bytes = probe_size + MAP_SLACK * descriptor_size;
     let map_pages = map_bytes.div_ceil(PAGE);
@@ -478,6 +525,11 @@ fn boot(
                     |at| bench::in_mmio(described, at),
                 );
                 fch_seen = bench_fch_read(rsdp, described, pretend, false, out);
+                // The bisection mode's `mine` names a shutdown (bit 23), as the minimal mode's.
+                #[cfg(origin_bench_bisect)]
+                if let Some(p) = fch_seen.pretend {
+                    fch_seen.registers = Some(p.values_minimal(fch_seen.pm1a_event));
+                }
             }
             found.early_uart()
         }
@@ -489,6 +541,9 @@ fn boot(
             EarlyUart::NONE
         }
     };
+    // The bisection mode names a register at port 0xCF9 as skipped (Amendment 6, step 5).
+    #[cfg(origin_bench_bisect)]
+    let reset_register = bench::bisect_register(reset_register);
     #[cfg(origin_bench)]
     let _ = writeln!(out, "{}", bench::ResetLine(reset_register));
     // The table pool, sized from the memory map as it stands: the last allocation before the
@@ -513,8 +568,20 @@ fn boot(
         )
     })?;
     let seed_addr = regions_addr + (capacity * size_of::<MemoryRegion>()) as u64;
+    // The bisection mode counts this map's OS-defined types: the last it translates before its
+    // last line (Amendment 6, step 2; ruling Q6 of TASKS item 131).
+    #[cfg(origin_bench_bisect)]
+    let os_types;
     let (root, direct_map_base, table_count, kaslr) = {
+        #[cfg(not(origin_bench_bisect))]
         let (_, n) = read_memory_map(get_map, map, regions).map_err(|e| e.report(out))?;
+        #[cfg(origin_bench_bisect)]
+        let n = {
+            let (n, types) = bisect::read_memory_map_counting(get_map, map, regions)
+                .map_err(|e| e.report(out))?;
+            os_types = Some(types);
+            n
+        };
         let n = memmap::carve(
             regions,
             n,
@@ -680,12 +747,17 @@ fn boot(
     // before the last line.
     #[cfg(origin_bench)]
     let _ = writeln!(out, "{}", bench_table_line(system_table, st, &bs));
+    #[cfg(origin_bench_bisect)]
+    let _ = writeln!(out, "{}", bench::OsTypesLine(os_types));
     #[cfg(origin_bench)]
     let plan = bench_before_call(st, &bs, early_uart, after, reset_register, fch_seen, out);
+    #[cfg(not(origin_bench_bisect))]
     let _ = writeln!(
         out,
         "origin-boot: exiting boot services; entering the Framekernel"
     );
+    #[cfg(origin_bench_bisect)]
+    let _ = writeln!(out, "{}", bench::BISECT_LAST_LINE);
     PANIC_CONSOLE.store(ptr::null_mut(), Ordering::Release);
     // Each call's status, for the line the loader writes if it halts (decision item 342).
     let mut calls = uart::ExitCalls::default();
@@ -762,17 +834,36 @@ fn boot(
             // is a compare of the status in RAX. After an error, the loader's retry, with this
             // same check after it; after a second error, its normal path (the coordinating
             // session's ruling on R121-3).
-            #[cfg(origin_bench)]
+            #[cfg(all(origin_bench, not(origin_bench_bisect)))]
             if status == Status::SUCCESS
                 && let Some(free) = plan.free
             {
                 reset_without_firmware(free);
+            }
+            // ADR-0002 Amendment 6, step 5, as Amendment 5's step 6 and item 349: after
+            // EFI_SUCCESS, the status compare, then the triple fault, with nothing between them.
+            #[cfg(origin_bench_bisect)]
+            if status == Status::SUCCESS {
+                triple_fault();
             }
             calls.record(status);
             status
         },
     );
     match outcome {
+        // The bisection mode, as the minimal mode: a status that is neither EFI_SUCCESS nor an
+        // error, which UEFI 2.11 §7.4 does not give; no firmware call (item 349), a line, the halt.
+        #[cfg(origin_bench_bisect)]
+        ExitOutcome::Exited => {
+            let _ = (direct_map_base, stack, root, entry, info_addr);
+            mask_interrupts();
+            say_on_uart(
+                early_uart,
+                "origin-boot: bench build: bisect: ExitBootServices returned neither EFI_SUCCESS nor an error: halting",
+            );
+            halt()
+        }
+        #[cfg(not(origin_bench_bisect))]
         ExitOutcome::Exited => {
             let stack_top = direct_map_base + stack + (STACK_PAGES * PAGE) as u64;
             #[cfg(origin_bench)]
@@ -806,6 +897,16 @@ fn boot(
         }
         // `ExitBootServices` has not been called, so the firmware's console may still be used.
         ExitOutcome::NotAttempted(failure) => Err(failure.report(out)),
+        // The bisection mode, as the minimal mode (Amendment 6, step 5; ruling Q5 of TASKS item
+        // 131): Amendment 2's line, then Amendment 3's order, with the FADT step skipped at port
+        // 0xCF9; no UART register read or write-back after the call.
+        #[cfg(origin_bench_bisect)]
+        ExitOutcome::Halt => {
+            mask_interrupts();
+            say_halting(early_uart, calls);
+            bench_reset(early_uart, &plan)
+        }
+        #[cfg(not(origin_bench_bisect))]
         ExitOutcome::Halt => {
             #[cfg(origin_bench)]
             mask_interrupts();
@@ -1374,8 +1475,10 @@ fn say_halting(early_uart: EarlyUart, calls: uart::ExitCalls) {
     say_on_uart(early_uart, calls.halting());
 }
 
-/// TASKS item 112, a bench build: which call succeeded, on the SPCR's UART. Returns its port.
-#[cfg(origin_bench)]
+/// TASKS item 112, a bench build: which call succeeded, on the SPCR's UART. Returns its port. Not
+/// compiled into the bisection mode, which triple-faults after a successful call (TASKS item 131's
+/// review, R131-10).
+#[cfg(all(origin_bench, not(origin_bench_bisect)))]
 fn bench_exited(early_uart: EarlyUart, exited: bench::Exited) -> u16 {
     say_on_uart(early_uart, exited)
 }
@@ -1500,7 +1603,9 @@ type ResetSystemFn =
 struct BenchPlan {
     /// The mode `BENCH-AFTER` asked for.
     after: bench::After,
-    /// The UART's registers under the firmware, if the SPCR named one in I/O space.
+    /// The UART's registers under the firmware, if the SPCR named one in I/O space. Read only
+    /// after the call, which the bisection mode does not do (R131-10).
+    #[cfg_attr(origin_bench_bisect, allow(dead_code))]
     under: Option<bench::UartState>,
     /// The firmware's `ResetSystem`, if its runtime services table checks.
     reset_system: Option<ResetSystemFn>,
@@ -1513,7 +1618,9 @@ struct BenchPlan {
     /// `ExitBootServices` (TASKS item 116's review, R116-7).
     marks: bool,
     /// TASKS item 121: the reset with no firmware code after a call that returns `EFI_SUCCESS`, in
-    /// a run whose last reset was a `0x06` to `0xCF9` or that finds no record of it.
+    /// a run whose last reset was a `0x06` to `0xCF9` or that finds no record of it. Always `None`
+    /// in the bisection mode, which never reads it (R131-10).
+    #[cfg_attr(origin_bench_bisect, allow(dead_code))]
     free: Option<fch::Free>,
 }
 
@@ -1544,7 +1651,12 @@ fn bench_before_call(
     );
     // TASKS item 121: the FCH's registers, the control in a boot's first run, or the reset after
     // the call in a run that follows a `0x06` to `0xCF9` or finds no record.
+    #[cfg(not(origin_bench_bisect))]
     let free = bench_fch_decide(fch_seen, ticks_per_ms, early_uart, out);
+    // The bisection mode's decision and control are the minimal mode's (Amendment 6, step 3), and
+    // no reset of Amendment 4's follows the call.
+    #[cfg(origin_bench_bisect)]
+    let free = bisect::decide(fch_seen, early_uart, out);
     // With interrupts masked: a firmware timer callback that wrote the UART while DLAB is set
     // would change its divisor (TASKS item 116's review, R116-6).
     let under = early_uart.is_present().then(|| {
@@ -1714,7 +1826,8 @@ fn bench_table_line(
 }
 
 /// [`bench::After::Disturb`]: right after the call returns, what a firmware might do to the UART.
-#[cfg(origin_bench)]
+/// Not compiled into the bisection mode (R131-10).
+#[cfg(all(origin_bench, not(origin_bench_bisect)))]
 fn bench_disturb(early_uart: EarlyUart, plan: &BenchPlan) {
     if plan.after == bench::After::Disturb
         && let Some(under) = plan.under
@@ -1725,8 +1838,10 @@ fn bench_disturb(early_uart: EarlyUart, plan: &BenchPlan) {
 
 /// TASKS item 116, after `ExitBootServices` returned, either way, and after its line: the UART's
 /// registers read again, the values read under the firmware written back, and a line naming what
-/// was read; then the reset, unless `BENCH-AFTER` asks for the kernel.
-#[cfg(origin_bench)]
+/// was read; then the reset, unless `BENCH-AFTER` asks for the kernel. Not compiled into the
+/// bisection mode, whose path after a second failed call is the minimal mode's, with no UART
+/// register read or write-back (ADR-0002 Amendment 6, step 5; ruling Q5 of TASKS item 131; R131-10).
+#[cfg(all(origin_bench, not(origin_bench_bisect)))]
 fn bench_after_call(early_uart: EarlyUart, plan: &BenchPlan, calls: uart::ExitCalls) {
     if early_uart.is_present() {
         let mut io = LoaderPorts;
@@ -1777,9 +1892,7 @@ fn bench_reset(early_uart: EarlyUart, plan: &BenchPlan) -> ! {
             mask_interrupts();
             bench::Tried::Returned
         }
-        None if plan.after == bench::After::Fadt => bench::Tried::NotCalled,
-        None if plan.after == bench::After::StandInNoReset => bench::Tried::NotCalledStandIn,
-        None => bench::Tried::Unavailable,
+        None => bench::Tried::not_called(plan.after),
     };
     wait_ms(plan.ticks_per_ms, bench::FALLBACK_DELAY_MS);
     say_on_uart(
@@ -1985,7 +2098,7 @@ unsafe fn read_smi_control() -> u32 {
 /// run then makes the call and takes Amendment 3's path. In a run whose last reset was a `0x06` to
 /// `0xCF9`, or that finds no record of the last reset, what [`reset_without_firmware`] does after
 /// a call that returns `EFI_SUCCESS`.
-#[cfg(origin_bench)]
+#[cfg(all(origin_bench, not(origin_bench_bisect)))]
 fn bench_fch_decide(
     seen: FchSeen,
     ticks_per_ms: u64,
@@ -2044,7 +2157,7 @@ fn bench_fch_decide(
 /// time-stamp counter; then a triple fault where the shutdown message reaches the FCH. If the
 /// machine is still running after that (with the shutdown message off, or when `BENCH-FCH` leaves
 /// the triple fault out), the caller goes on to TASKS item 116's path and Amendment 3's order.
-#[cfg(origin_bench)]
+#[cfg(all(origin_bench, not(origin_bench_bisect)))]
 #[inline(always)]
 fn reset_without_firmware(free: fch::Free) {
     if free.cf9 {
@@ -2057,8 +2170,9 @@ fn reset_without_firmware(free: fch::Free) {
     }
 }
 
-/// `0x06`, a warm reset, to the FCH's reset control port `0xCF9`.
-#[cfg(origin_bench)]
+/// `0x06`, a warm reset, to the FCH's reset control port `0xCF9`. Not compiled into the bisection
+/// mode, which writes nothing there (ADR-0002 Amendment 6, step 5).
+#[cfg(all(origin_bench, not(origin_bench_bisect)))]
 #[inline(always)]
 fn write_cf9() {
     // SAFETY: CPL 0; port 0xCF9 is the FCH's reset control register, and 0x06 its documented
@@ -2076,11 +2190,11 @@ fn write_cf9() {
 #[cfg(origin_bench)]
 #[inline(always)]
 fn triple_fault() -> ! {
-    // SAFETY: CPL 0, and only to end a diagnostic run (decision items 345 and 347): after
-    // `ExitBootServices` in the full mode (interrupts masked); in the minimal mode either before
-    // the call, as the control (interrupts masked, boot services live), or right after a successful
-    // call, with interrupts as the firmware left them, since nothing may come between (Amendment
-    // 5, step 6; TASKS item 128's review, R128-5). Whatever arrives once the zero-limit IDT is
+    // SAFETY: CPL 0, and only to end a diagnostic run (decision items 345, 347 and 352): after
+    // `ExitBootServices` in the full mode (interrupts masked); in the minimal and bisection modes
+    // either before the call, as the control (interrupts masked, boot services live), or right
+    // after a successful call, with interrupts as the firmware left them, since nothing may come
+    // between (Amendment 5, step 6; Amendment 6, step 5; TASKS item 128's review, R128-5). Whatever arrives once the zero-limit IDT is
     // loaded faults too and ends in the same shutdown; before it, the firmware's IDT takes it. The
     // block pushes 16 zero bytes and loads them as the IDT: limit 0, base 0. `int3` then finds no gate within the limit, nor do the #GP and the double fault that
     // follow, so the processor shuts down (AMD64 APM Volume 2 §8.2.9). It does not return; `ud2`
@@ -2097,8 +2211,10 @@ fn triple_fault() -> ! {
     }
 }
 
-/// Spins until `ticks` time-stamp counter ticks have passed.
+/// Spins until `ticks` time-stamp counter ticks have passed. The bisection mode, which has no
+/// Amendment 4 reset, does not use it (R131-10).
 #[cfg(origin_bench)]
+#[cfg_attr(origin_bench_bisect, allow(dead_code))]
 fn wait_ticks(ticks: u64) {
     let start = random::rdtsc();
     while random::rdtsc().wrapping_sub(start) < ticks {
@@ -2658,5 +2774,97 @@ mod minimal {
                 halt()
             }
         }
+    }
+}
+
+/// TASKS item 131 (decision item 352, ADR-0002 Amendment 6): the bisection mode, a bench build
+/// made only by `cargo xtask bench-build --bisect` (`cfg(origin_bench_bisect)`, beside
+/// `origin_bench`). It is the full bench loader's path, `boot`, with five changes, each at its own
+/// `cfg` there:
+/// 1. the kernel stack and the boot info allocated as `EfiLoaderData` ([`STACK_TYPE`],
+///    [`BOOT_INFO_TYPE`]);
+/// 2. a line, before the last one, counting the OS-defined types in the memory map the page tables
+///    were built from ([`read_memory_map_counting`]);
+/// 3. the minimal mode's decision and control on the FCH's record ([`decide`]), with
+///    `BENCH-FCH`'s `mine` naming a shutdown;
+/// 4. after `EFI_SUCCESS`, the triple fault and nothing before it; after a second error, Amendment
+///    2's line and Amendment 3's order, with the FADT step skipped at port `0xCF9`;
+/// 5. `BENCH-AFTER` read and its value ignored.
+///
+/// The call is made through the loader's copy of the boot services table, as every loader that
+/// stopped made it. Nothing writes `0xCF9`: the full mode's control and reset are not compiled in.
+#[cfg(origin_bench_bisect)]
+mod bisect {
+    use core::fmt::Write;
+
+    use origin_boot_info::{EarlyUart, MemoryRegion};
+    use origin_boot_uefi::console::ConOut;
+    use origin_boot_uefi::protocols::GetMemoryMapFn;
+    use origin_boot_uefi::{bench, fch, memmap};
+
+    use super::{FchSeen, LoaderPorts, MapFailure, mask_interrupts, triple_fault};
+
+    /// `GetMemoryMap` into `map` and its translation into `regions`, as `read_memory_map` makes
+    /// them, the same one firmware call; and a count of the raw map's descriptors of an OS-defined
+    /// type, read from `map` alone (Amendment 6, step 2; ruling Q6 of TASKS item 131). Returns the
+    /// number of regions and the count.
+    pub(super) fn read_memory_map_counting(
+        get_map: GetMemoryMapFn,
+        map: &mut [u8],
+        regions: &mut [MemoryRegion],
+    ) -> Result<(usize, memmap::OsTypes), MapFailure> {
+        let mut size = map.len();
+        let (mut key, mut dsize, mut dversion) = (0usize, 0usize, 0u32);
+        // SAFETY: as in `read_memory_map`: a valid `GetMemoryMap` from the validated boot services,
+        // still active; every pointer is to a live local or to the `map` buffer of `size` bytes.
+        let status = unsafe {
+            get_map(
+                &mut size,
+                map.as_mut_ptr(),
+                &mut key,
+                &mut dsize,
+                &mut dversion,
+            )
+        };
+        if status.is_error() {
+            return Err(MapFailure::Firmware(status));
+        }
+        let raw = map.get(..size).unwrap_or(&[]);
+        let n = memmap::translate(raw, dsize, regions).map_err(MapFailure::Rejected)?;
+        Ok((n, memmap::os_defined(raw, dsize)))
+    }
+
+    /// Amendment 6, step 3, as Amendment 5's step 4: the FCH's lines and the decision on its record
+    /// of the last reset. In the boot's first run, the control: the decision line on the wire,
+    /// interrupts masked and a triple fault, and no call. Otherwise nothing of Amendment 4's follows
+    /// the call, so there is no plan for it.
+    pub(super) fn decide(
+        seen: FchSeen,
+        early_uart: EarlyUart,
+        out: &mut ConOut,
+    ) -> Option<fch::Free> {
+        let _ = writeln!(out, "{}", fch::SmiLine(seen.smi));
+        if let Some(registers) = seen.registers {
+            let _ = writeln!(
+                out,
+                "{}",
+                fch::RegistersLine {
+                    registers,
+                    source: seen.source,
+                }
+            );
+        }
+        let decision = fch::MinimalDecision::of(seen.registers.as_ref(), seen.pm1a_event);
+        let _ = writeln!(out, "{}", fch::BisectDecisionLine(decision));
+        if let fch::MinimalDecision::Control(_) = decision {
+            // The line just written is on the wire before the reset can cut it, as the full mode's
+            // control waits for it.
+            if early_uart.is_present() {
+                let _ = bench::drain(&mut LoaderPorts, early_uart.port);
+            }
+            mask_interrupts();
+            triple_fault()
+        }
+        None
     }
 }

@@ -1085,6 +1085,10 @@ RESET_BUILD_LINE = "BENCH-AFTER"
 # call, whose loader runs are the experiment's answer. Its last line before the call.
 MINIMAL_BUILD_LINE = "bench build: minimal"
 MINIMAL_LAST_LINE = b"ExitBootServices next, through the live boot services table"
+# TASKS item 131 (ADR-0002 Amendment 6): the bisection-mode bench loader, the full loader's work
+# with the minimal mode's resets; its text, and its last line before the call.
+BISECT_BUILD_LINE = "bench build: bisect"
+BISECT_LAST_LINE = b"ExitBootServices next, through the loader's copy of the boot services table"
 LOADER_START = "UEFI loader (build"
 TIMES_FILE = "sol-times.log"
 # How many boots a rental B makes and how long each may take, unless the command line says.
@@ -1100,6 +1104,14 @@ BOOTS, BOOT_MINUTES = 3, 8
 # restart to the firmware's first byte (PLAN_RESTART_S).
 MINIMAL_BOOTS = 6
 PLAN_START_S, PLAN_LOAD_S, PLAN_RESTART_S = 49.0, 55.0, 68.0
+# TASKS item 131's review, R131-9: the loader's own time, its banner to its last byte, which a
+# boot holds three times (the control, the call, and the next run up to its registers). The
+# minimal program took up to 0.5 s on rental G's 2.4a; the full bench loader, whose work the
+# bisection mode keeps, 0.5 to 0.6 s on rental E's 2.4a and 0.5 to 1.0 s on rental F's 2.5, as
+# the console's arrival times show them, about half a second apart. The plan takes the full
+# loader's on 2.4a, the revision whose delays it plans with; in the rental each boot takes the
+# longest its own runs showed.
+PLAN_WORK_S = 0.6
 # A call with no firmware byte after its mark is a hang once the firmware's measured start delay
 # and HANG_EXTRA_S more have passed. SLACK_S closes a boot's window. A run whose banner comes
 # less than RESTART_BANNER_MIN_S after one of the tool's restarts cannot be that restart's: no
@@ -1121,9 +1133,11 @@ MARK_AT = re.compile(rb"[ \t\r\n]*([XY])\r?\n")
 MARK_LINES = re.compile(rb"(?m)^([XY])\r?$")
 PMXC0 = re.compile(rb"PMxC0 (0x[0-9a-fA-F]{8})")
 CONTROL_TEXT = b"the control:"
-# The last line a bench loader prints before the call: the minimal mode's, and the full bench
-# mode's (TASKS items 116 and 121). A run that printed one made the call, mark or no mark (R130-3).
+# The last line a bench loader prints before the call: the minimal mode's, the bisection mode's
+# (the copy's, as the full bench mode's of TASKS item 121), and the full bench mode's of TASKS
+# item 116. A run that printed one made the call, mark or no mark (R130-3).
 CALL_LINES = (b"ExitBootServices next, through the live boot services table",
+              b"ExitBootServices next, through the loader's copy of the boot services table",
               b"exiting boot services")
 # Output after a run's last byte is the firmware starting again only if it comes at least FLOOR_S
 # later, before the hang's wait, and, once the controls have shown how this firmware's starts
@@ -1134,9 +1148,10 @@ RESTARTS_FILE = "restarts.log"
 
 
 def minimal_image(data):
-    """Whether a loader's bytes are the minimal-mode bench build's (TASKS item 128): its lines say
-    so, as F2 checks."""
-    return MINIMAL_BUILD_LINE.encode() in data
+    """Whether a loader's bytes are a bench build that triple-faults after every successful call
+    and whose boots end at their answer: the minimal mode's (TASKS item 128) or the bisection
+    mode's (TASKS item 131). Their lines say so, as F2 checks."""
+    return MINIMAL_BUILD_LINE.encode() in data or BISECT_BUILD_LINE.encode() in data
 
 
 def plain(x):
@@ -1145,20 +1160,23 @@ def plain(x):
 
 
 def window_s(fig):
-    """TASKS item 130: the longest a minimal-mode boot needs from the tool's restart, from the
-    firmware's delays `fig`: the restart to the first run's banner, the control's reset to the
-    second run's, then either the call's reset to a third run's banner or the wait that calls the
-    call a hang, whichever is longer, and SLACK_S."""
-    d, l, r = fig["start"], fig["load"], fig["restart"]
-    return r + l + (d + l) + max(d + l, d + HANG_EXTRA_S) + SLACK_S
+    """TASKS item 130: the longest a boot of an image that triple-faults after its call (the
+    minimal mode's or the bisection mode's) needs from the tool's restart, from the firmware's
+    delays and the loader's own time `fig`: the restart to the first run's banner and that run's
+    work to its control, the control's reset to the second run's banner and its work to the call,
+    then either the call's reset to a third run's banner and its work to its registers, or the wait
+    that calls the call a hang, whichever is longer, and SLACK_S (R131-9)."""
+    d, l, r, w = fig["start"], fig["load"], fig["restart"], fig["work"]
+    return r + l + w + (d + l + w) + max(d + l + w, d + HANG_EXTRA_S) + SLACK_S
 
 
-PLAN_FIGURES = {"start": PLAN_START_S, "load": PLAN_LOAD_S, "restart": PLAN_RESTART_S}
+PLAN_FIGURES = {"start": PLAN_START_S, "load": PLAN_LOAD_S, "restart": PLAN_RESTART_S,
+                "work": PLAN_WORK_S}
 
 
 def boot_plan(minimal, boots, boot_minutes, max_minutes):
     """Rental B's boots and each boot's limit in minutes, from the image and the command line
-    (None where it gave none), and why they do not fit, or None. A minimal-mode image's limit is
+    (None where it gave none), and why they do not fit, or None. A minimal or bisection image's limit is
     its window at the planning figures (TASKS item 130); in the rental each boot's window is then
     the firmware's own. Every boot must end before the loop stops starting boots,
     LOOP_STOP_MINUTES before the deadline, with SETUP_MINUTES before boot 1; the deletion then
@@ -1367,7 +1385,8 @@ def figures(runs):
     """The firmware's own delays as the runs show them, each the longest seen, or the planning
     figure where none was (TASKS item 130): `start`, a control's last byte to the firmware's next;
     `load`, the firmware's first byte to the loader's banner; `restart`, one of the tool's restarts
-    to the firmware's first byte, where that restart overtook no run."""
+    to the firmware's first byte, where that restart overtook no run; and the loader's own time,
+    `work`, a control's or a call's banner to its last byte (R131-9)."""
     start = [r["after_s"] for r in runs if r["branch"] == "control" and r.get("answer") == "reset"]
     load = [round(r["banner"] - r["start"], 1) for r in runs
             if r.get("start") is not None and r["banner"] is not None]
@@ -1377,8 +1396,11 @@ def figures(runs):
     # After a hang the restart's start is the next run's: nothing else was running.
     restart += [round(r["start"] - before["then_restarted"], 1) for before, r in zip(runs, runs[1:])
                 if "then_restarted" in before and r["start"] is not None]
+    work = [round(r["end"] - r["banner"], 1) for r in runs
+            if r["branch"] in ("control", "call") and r["banner"] is not None
+            and r.get("end") is not None]
     return {"start": max(start, default=PLAN_START_S), "load": max(load, default=PLAN_LOAD_S),
-            "restart": max(restart, default=PLAN_RESTART_S)}
+            "restart": max(restart, default=PLAN_RESTART_S), "work": max(work, default=PLAN_WORK_S)}
 
 
 def describe(run):
@@ -1439,11 +1461,12 @@ def runs_summary(runs):
 
 
 def boot_over(runs, first, at):
-    """TASKS item 130: whether a minimal-mode boot, whose runs are `runs[first:]`, has its answer
-    at time `at`: its call hung, or showed other output and the hang's wait has passed, or the
-    firmware started again after its call and the next run has read its registers, or that next
-    run has not come within the measured load delay and SLACK_S of that start. The control's reset
-    alone answers nothing."""
+    """TASKS item 130: whether a boot of an image that triple-faults after its call (the minimal
+    mode's or the bisection mode's), whose runs are `runs[first:]`, has its answer at time `at`:
+    its call hung, or showed other output and the hang's wait has passed, or the firmware started
+    again after its call and the next run has read its registers, or that next run has not done so
+    within the measured load delay, the loader's own time and SLACK_S of that start (R131-9). The
+    control's reset alone answers nothing."""
     mine = runs[first:]
     call = next((r for r in mine if r["branch"] == "call"), None)
     if call is None:
@@ -1458,14 +1481,15 @@ def boot_over(runs, first, at):
     later = mine[mine.index(call) + 1:]
     if any(r["branch"] in ("control", "call") for r in later):
         return True
-    return at - call["next"] >= fig["load"] + SLACK_S
+    return at - call["next"] >= fig["load"] + fig["work"] + SLACK_S
 
 
 def resets_after_call(text):
     """Whether one boot's console text is a bench loader's that resets the machine after the call,
-    instead of entering the kernel: TASKS item 116's (it says whether BENCH-AFTER is there) or the
-    minimal mode's (TASKS item 128)."""
-    return RESET_BUILD_LINE in text or MINIMAL_BUILD_LINE in text
+    instead of entering the kernel: TASKS item 116's (it says whether BENCH-AFTER is there), the
+    minimal mode's (TASKS item 128) or the bisection mode's (TASKS item 131, which reads
+    BENCH-AFTER and ignores it)."""
+    return RESET_BUILD_LINE in text or MINIMAL_BUILD_LINE in text or BISECT_BUILD_LINE in text
 
 
 def breadcrumbs(text):
@@ -1510,8 +1534,8 @@ def boot_result(text):
         # TASKS item 130: loader runs alone never say that no reset came: the firmware prints for
         # a minute or more after a reset before the next banner, and one of the tool's restarts
         # may come first. Whether one came is read from the firmware's starts (`read_runs`).
-        if MINIMAL_BUILD_LINE in text:
-            calls = text.count(MINIMAL_LAST_LINE.decode())
+        if MINIMAL_BUILD_LINE in text or BISECT_BUILD_LINE in text:
+            calls = text.count(MINIMAL_LAST_LINE.decode()) + text.count(BISECT_LAST_LINE.decode())
             seen["calls"] = calls
             said += f", calls: {calls}"
     verdict = next((l for l in lines if VERDICT_LINE in l or REFUSED_LINE in l), None)
@@ -1652,8 +1676,8 @@ def cmd_rental_b(args):
                          and (r["start"] is None or r["start"] >= restarted)), len(runs))
 
         def look(start):
-            """One boot's result so far; a minimal-mode boot ends at its answer (owner item 350,
-            TASKS item 130)."""
+            """One boot's result so far; a minimal or bisection boot ends at its answer (owner
+            item 350, TASKS items 130 and 131)."""
             result = boot_result(console.text(start))
             if minimal and not result["ended"]:
                 runs = reading()
@@ -1687,7 +1711,8 @@ def cmd_rental_b(args):
                     result = look(start)
                 result.update(boot=boot, start=start, end=console.size(), restarted_at=restarts[-1])
                 # TASKS item 130: every bench image that resets after its call is read from the
-                # firmware's starts; only the minimal mode's boots end at their answer.
+                # firmware's starts; only the minimal and bisection modes' boots end at their
+                # answer.
                 if minimal or resets_after_call(console.text(start)):
                     runs = reading()
                     mine = runs[first_run(runs, restarts[-1]):]
@@ -1713,6 +1738,9 @@ def loader_kind(path):
     """What the image directory's loader is: a bench build's says so in its own bytes (TASKS
     items 112 and 116, F2's text)."""
     data = Path(path).read_bytes() if Path(path).exists() else b""
+    if BISECT_BUILD_LINE.encode() in data:
+        return ("the bisection-mode bench loader (ADR-0002 Amendment 6; developer-mode, the TEST "
+                "trust store; never signed or shipped)")
     if minimal_image(data):
         return ("the minimal-mode bench loader (ADR-0002 Amendment 5; developer-mode, the TEST "
                 "trust store; never signed or shipped)")
@@ -1728,7 +1756,7 @@ def sha256(path):
 
 def runs_row(rental, results):
     """TASKS item 130: the record's sentence on every run of the rental, read from the
-    firmware's starts, for a minimal-mode image's boots."""
+    firmware's starts, for a minimal or bisection image's boots."""
     if not rental.console or not any("runs" in r for r in results):
         return []
     runs = read_runs(rental.console.path.read_bytes(), read_times(rental.dir / TIMES_FILE, 0),
@@ -1834,7 +1862,8 @@ def cmd_reread(args):
     print(runs_summary(runs))
     print(f"the firmware's delays: a reset to its first byte {plain(fig['start'])} s, that byte to "
           f"the banner {plain(fig['load'])} s, a restart to its first byte {plain(fig['restart'])} s; "
-          f"a minimal-mode boot's window {plain(window_s(fig) / 60)} minutes")
+          f"the loader's own {plain(fig['work'])} s; a minimal or bisection boot's window "
+          f"{plain(window_s(fig) / 60)} minutes")
 
 
 def main():

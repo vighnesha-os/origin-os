@@ -95,6 +95,41 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(v)
 }
 
+/// The first type UEFI leaves to OS loaders (UEFI 2.11 §7.2.1, `0x8000_0000` to `0xFFFF_FFFF`).
+pub const OS_TYPES_FROM: u32 = 0x8000_0000;
+
+/// A count of a raw memory map's descriptors of an OS-defined type (ADR-0002 Amendment 6, step
+/// 2): the bisection mode's line that the map holds none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OsTypes {
+    /// The descriptors read.
+    pub descriptors: u32,
+    /// Those of an OS-defined type, pages or none.
+    pub count: u32,
+    /// The first such type, or 0.
+    pub first: u32,
+}
+
+/// Counts `map`'s descriptors (stride `descriptor_size`) whose type is [`OS_TYPES_FROM`] or above.
+/// Reads only `map`; a stride the map cannot have counts nothing.
+pub fn os_defined(map: &[u8], descriptor_size: usize) -> OsTypes {
+    let mut t = OsTypes::default();
+    if descriptor_size < DESCRIPTOR_MIN_SIZE || !descriptor_size.is_multiple_of(8) {
+        return t;
+    }
+    for desc in map.chunks_exact(descriptor_size) {
+        t.descriptors = t.descriptors.saturating_add(1);
+        let uefi_type = u32_at(desc, 0);
+        if uefi_type >= OS_TYPES_FROM {
+            if t.count == 0 {
+                t.first = uefi_type;
+            }
+            t.count = t.count.saturating_add(1);
+        }
+    }
+    t
+}
+
 /// Translates the raw memory map `map` (stride `descriptor_size`) into `out`, sorted by
 /// base, with adjacent regions of the same kind merged. Returns the number of regions.
 pub fn translate(
@@ -325,6 +360,41 @@ mod tests {
                 region(0x24_0000, 0x40, RegionKind::Usable),
             ]
         );
+    }
+
+    #[test]
+    fn os_defined_types_are_counted_from_0x80000000() {
+        let map = [
+            desc(48, memory_type::LOADER_CODE, 0x10_0000, 4),
+            desc(48, memory_type::LOADER_DATA, 0x20_0000, 2),
+            desc(48, memory_type::OS_KERNEL_STACK, 0x30_0000, 17),
+            desc(48, memory_type::OS_BOOT_INFO, 0x40_0000, 1),
+            desc(48, 0x7FFF_FFFF, 0x50_0000, 1),
+        ]
+        .concat();
+        assert_eq!(
+            os_defined(&map, 48),
+            OsTypes {
+                descriptors: 5,
+                count: 2,
+                first: memory_type::OS_KERNEL_STACK
+            }
+        );
+        let none = [
+            desc(48, memory_type::LOADER_DATA, 0x10_0000, 4),
+            desc(48, memory_type::LOADER_DATA, 0x30_0000, 17),
+        ]
+        .concat();
+        assert_eq!(
+            os_defined(&none, 48),
+            OsTypes {
+                descriptors: 2,
+                count: 0,
+                first: 0
+            }
+        );
+        // A stride the map cannot have counts nothing, rather than reading across descriptors.
+        assert_eq!(os_defined(&map, 44), OsTypes::default());
     }
 
     #[test]

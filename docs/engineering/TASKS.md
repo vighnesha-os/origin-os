@@ -621,7 +621,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 128. **A bench build's minimal-program mode and two further reads before the call (ADR-0002 Amendment 5 and Amendment 4's addition; owner items 347 and 348). Numbered by the coordinating session on 2026-11-22; not started.** It builds the minimal-program mode, chosen by `cargo xtask bench-build --minimal`, as Amendment 5 lists it, with `xtask`'s stand-in ACPI table for QEMU. It also builds the full bench mode's two new reads, the live boot services table compared with the copy and `SMIxC0`'s route, and the reworded `PMxD2` line. It extends `boot-bench`'s machine-code check to the minimal mode, so that only the status compare and branches stand between the call and the triple fault. It adds QEMU scenarios for the control, a returning call, no record and the retry, with planted controls. It prepares rental G's images and dry run, for about six boots in the paid hour with the per-boot wait shortened for the minimal image (owner item 350), and rental G goes to the owner only through the coordinating session.
 129. **TASKS item 96's single stop of its move proofs, explained if it recurs (TASKS item 96's gates). Numbered by the coordinating session on 2026-11-22; open.** Twice in `boot-matrix`, on a different two- and four-processor machine each time, a thread of TASKS item 96's integrity proof stayed blocked for the capacity phase's whole wait. The state lines that proof now prints point at a lost wake-up. TASKS item 96 is finding the interleaving with an event ring on planted exports and a Loom model, before any fix. This item stays open until the cause is named and fixed with a model that fails without the fix, or until it is shown to be the host's.
 130. **The rental tool's reading of a minimal-program boot (rental G's findings). Numbered by the coordinating session on 2026-11-22; built the same day on `claude/t130-minimal-reading`; not landed.** Rental G's per-boot summaries counted loader runs, not firmware starts, and ended each boot before the firmware's start delay on revision 2.4a had passed, so they read a reset after each call as none. The tool now judges each run by the firmware's next byte, measures each machine's own delays, never reports "no reset" while a restart of its own is in flight, and has a replay test on rental G's real console. It also stages the full bench image.
-131. **A bench build's bisection mode (ADR-0002 Amendment 6; owner item 352). Numbered by the coordinating session on 2026-11-22; not started; after TASKS item 130.** It builds the mode, chosen by `cargo xtask bench-build --bisect`, as Amendment 6 lists it: the full bench loader's work with the kernel stack and boot info as `EfiLoaderData`, a line that the loader's map holds no OS-defined region, Amendment 5's resets, and the live table's compare. It extends the machine-code checks and the rental tool's image kinds to it, adds QEMU scenarios and planted controls, and prepares rental H's images and dry run. Rental H goes to the owner only through the coordinating session.
+131. **A bench build's bisection mode (ADR-0002 Amendment 6; owner item 352). Numbered by the coordinating session on 2026-11-22; built and gated the same day on `claude/t131-bisect-mode`; not landed.** It builds the mode, chosen by `cargo xtask bench-build --bisect`, as Amendment 6 lists it: the full bench loader's work with the kernel stack and boot info as `EfiLoaderData`, a line that the loader's map holds no OS-defined region, Amendment 5's resets, and the live table's compare. It extends the machine-code checks and the rental tool's image kinds to it, adds QEMU scenarios and planted controls, and prepares rental H's images and dry run. Rental H goes to the owner only through the coordinating session.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
@@ -4997,4 +4997,102 @@ Its two questions are whether the firmware changes its boot services table after
 **Not shown:**
 - the new loop on a rented machine;
 - a window measured on another firmware revision than rental G's;
+- **no person has reviewed it.**
+
+### 131. A bench build's bisection mode (owner item 352; ADR-0002 Amendment 6)
+
+Assigned by the coordinating session on 2026-11-22, after TASKS item 130 and the owner's acceptance of item 352 ("Allow it"). Built word for word against PR 59's text, on `claude/t131-bisect-mode`, cut at `970cfca2` (TASKS item 130's tip after its review's answers). The contract and its questions are in the coordination notes (`t131-contract.md`). The coordinating session ruled:
+- **Q1 (a):** a cfg of its own, `origin_bench_bisect` beside `origin_bench`, given only by `bench-build --bisect` and `boot-bench`, with its own target directory and a fourth entry in F1's list;
+- **Q2 (a):** QEMU's values come from `BENCH-FCH`, the full mode's switch, read with the same calls, with `mine` naming a shutdown (bit 23) in this mode;
+- **Q3 (a):** `BENCH-AFTER` is read, as the full loader reads it, and its value ignored, with a line saying so;
+- **Q5 (a):** after a second error, the minimal mode's path: Amendment 2's line, then Amendment 3's order with the FADT step skipped at I/O port `0xCF9`, and no UART register read or write-back;
+- **Q6 (a):** the no-OS-type line counts the raw descriptors of the map the page tables were built from, in the loader's own buffer, with no firmware call;
+- **Q7:** a count above zero is printed, not a gate, and the line says that it voids the second question's answer for that run;
+- **Q8:** the lines' prefix is `bench build: bisect:`;
+- **Q9:** a static check that the call's target comes from the copy, not the live table, if it is a few lines;
+- **Q10 (a):** the marks keep the full mode's condition;
+- **Q11:** the turn as TASKS item 128's, about an hour, on the coordinating session's word;
+- **Q12:** one independent AI review before the turn;
+- **Q13 (a):** A02-Am6 is marked built only once PR 59 is in the batch. It was merged into this branch at `21852528`, from `land/batch-10` at `140c467b`.
+
+**What was built.**
+- **The loader** (`boot/uefi/src/main.rs`, `fch.rs`, `bench.rs`, `memmap.rs`), each change at its own `cfg(origin_bench_bisect)` on the full bench loader's path:
+  - a first line naming the mode (`bench::BISECT_LINE`);
+  - **step 1, the full bench loader's work, unchanged and in its own order,** so that the UART register reads and the line before the call follow the decision, as in the full mode, and a control run prints neither (R131-6);
+  - **step 2:** the kernel stack and the boot info allocated as `EfiLoaderData` (`STACK_TYPE`, `BOOT_INFO_TYPE`), and a line from the map the page tables were built from: the count of its descriptors and of those of an OS-defined type (`0x80000000` and above; `bisect::read_memory_map_counting`, `memmap::os_defined`). A map of no descriptors is said not to have been counted (R131-4);
+  - **step 3:** the minimal mode's decision (`fch::MinimalDecision`, with its line `BisectDecisionLine` through the shared `write_decision`). The control is the decision line on the wire, interrupts masked and a triple fault, with no call (`bisect::decide`). `BENCH-FCH` is read as `fch::BisectSwitch`: `mine` (bit 23), `noreset`, and `noshutdown` (the control withheld); `nocf9` and `slow` are refused;
+  - **step 4:** the call through the loader's copy of the boot services table, as every loader that stopped made it;
+  - **step 5:** after `EFI_SUCCESS`, the status compare and the triple fault, with nothing between. After a second error, Amendment 2's line, then Amendment 3's order with the FADT's register skipped at `0xCF9` (`bench::bisect_register`); `noreset` keeps `ResetSystem` out, and the line says so (`Tried::not_called`, R131-1). A status that is neither halts with a line;
+  - **nothing writes `0xCF9`:** the full mode's control and reset (`bench_fch_decide`, `reset_without_firmware`, `write_cf9`) and its after-call functions (`bench_exited`, `bench_disturb`, `bench_after_call`) are not compiled in (R131-10). A build with both `origin_bench_minimal` and `origin_bench_bisect` is a `compile_error!`.
+- **`developer-tools/xtask`:**
+  - `bench-build --bisect` builds the full bench pair, the minimal loader, then the bisection loader into `target/bench-bisect`, with the bench kernel. Each image refuses the other modes' text;
+  - **the machine-code checks** on the bisection loader, with the full and minimal loaders as their controls:
+    - no `0xCF9` in DX;
+    - exactly one indirect call reaches the triple fault through register reads, compares and branches alone, and it takes `ExitBootServices`' arguments, not constants (R131-3);
+    - that call's target is not read through the live table (`through_live_table`), and no read of `ExitBootServices` from the live table is anywhere in the image (`live_exit_loads`, R131-2): ruling Q9. The minimal image's check gains the same first two conditions;
+  - **nine bisection scenarios under `boot-bench`:**
+    - the control;
+    - a returning call through the copy;
+    - no record;
+    - a stale key once;
+    - a stale key twice, with Amendment 2's line and the FADT's register skipped;
+    - the shutdown bits clear, and the triple fault anyway;
+    - no `BENCH-FCH`, the rental's path;
+    - `first noshutdown`, the control withheld;
+    - `BENCH-AFTER kernel` ignored.
+
+    Each requires the full loader's work, the table line, the no-OS-type line with at least one descriptor counted, and no kernel line. `boot-bench` now has 31;
+  - F1 holds four flags; Clippy covers the flavour; the signing refusal covers its target.
+- **`developer-tools/bench/latitude.py`:**
+  - `loader_kind` names the bisection loader, and `minimal_image` takes it, so its boots end at their answer and take the firmware's measured windows;
+  - its last line is one of `CALL_LINES`;
+  - each boot's window and wait add the loader's own measured work, the longest banner to last byte of a control or a call (R131-9). The plan takes 0.6 s, the full loader's on rental E's 2.4a, and keeps six boots of 5.8 minutes, by the coordinating session's ruling: a longer real window costs boots, never time or money past the cap.
+
+**The review.** One independent AI review of `7f669805` (`docs/engineering/REVIEW_T131_2026-11-22.md`), given the code, Amendment 6 as PR 59 words it, the rulings and the `32b6e043` images as the checks' controls, not the author's argument.
+- **The findings:** no High; R131-1 to R131-3 Medium; R131-4 to R131-11 Low. All are answered at `0beac4d4`.
+- **R131-6:** kept as the full loader's order.
+- **R131-7:** the coordinating session ruled that the code follows Amendment 6's steps 1 and 5 rightly. The threat model's list of writes is a summary that left some out, and that session corrects it with a dated note and tells the owner as information. Recorded at `4165ecfb`.
+
+**The turn** (2026-11-22, the development Mac, QEMU 11.1.3 TCG with OVMF, Rust 1.100.0), on `4165ecfb`, 12:47:02 to 13:32:28 UTC:
+- fmt and F1 passed;
+- the eleven control runs, listed below;
+- `check` passed in 878 s: 2,740 host tests passed, 0 failed, 30 ignored; Loom 91 models and 140 negative controls caught; every gate;
+- `reproducible-compare`: all 40 files the same bytes as `953cda2c`'s, the batch's;
+- `boot-test` passed 11 of 11 in 54 s;
+- `boot-matrix` passed once in 1,465 s. Its `boot-bench` passed 31 of 31 in 276 s: TASKS items 112, 116 and 121's sixteen, the minimal mode's six, and the bisection mode's nine;
+- `bench-build`: the full bench loader, 264,192 bytes, SHA-256 `0451f7a7520e7a5e7f1d02b010751111e0f4cc51a4ddef0dc86511086f66b96c`. It is not `32b6e043`'s `57a1bbb1…`, since R131-1's `Tried::not_called` is compiled into every bench mode. The bench kernel is 2,116,880 bytes, `3bb1f2a57245b28d6f28eedddb30a06261725d7447149384b40b4827280f111f`, `32b6e043`'s;
+- `bench-build --minimal`: 74,240 bytes, `6b91df3ebc1bcebb663955855119294daf1ac62f2a6335ce171b18f85a342e54`;
+- `bench-build --bisect`: 265,216 bytes, `ce53da4cd9dbf2a170fd9f1dc712c13d6be7614a9eec380af634d2f34eec89db`, with the same bench kernel;
+- the rental tool's dry run on the staged images, GET requests only, in 3 s: "boots: 6, each ending at a verdict or after 5.8 minutes, or at its answer"; `m4-metal-small` at AMS, $0.81/h, deleted within 50 minutes, worst case $1.62, the ledger $5.67 against the $10 cap; nothing bought.
+
+**A rerun** with the coordinating session's leave, on `60b36a9d`, 13:37:00 to 13:40:18 UTC:
+- BC-1, BC-6, BC-7 and BC-9, rewritten after the turn (below), each restored after its run;
+- the nine bisection scenarios on the clean tree, which passed in 59 s, since `60b36a9d` reorders the console check;
+- the tree clean before and after. `60b36a9d` changes only `xtask`'s check order and adds its test.
+
+**The controls,** each planted, run and restored, and each failing for its own reason:
+- **BC-1:** the kernel stack kept at `0x80000003`. The loader printed one region of an OS-defined type, the first `0x80000003`, in 135 descriptors. In the turn, the count was checked before the line, so the error named the count. After `60b36a9d` the scenario lacks the no-OS-type line.
+- **BC-2:** a `0xCF9` write before the triple fault after a successful call. `bench-build --bisect`: "puts 0xCF9 in DX".
+- **BC-3:** `mine` left at bit 19. The returning-call scenario took the control.
+- **BC-4:** no triple fault after a successful call. `bench-build`'s static check, before its scenario: no path from the call to the triple fault.
+- **BC-5:** the table line not written. The first scenario it ran, the control's, lacked it.
+- **BC-6:** the triple fault out of line, in the bisection mode alone. In the turn the plant also moved the minimal loader's, so only the controls' clause caught it. In the rerun the bisection check found no path from the call to the triple fault.
+- **BC-7:** the call's target read from the live table, in the bisection mode alone. In the turn the plant also changed the full loader, so only the controls' clause caught it. In the rerun the bisection check found `ExitBootServices` read from the live table.
+- **BC-8:** `noreset` read as no `ResetSystem` at all. The stale-key-twice scenario lacked the line that `noreset` kept it out.
+- **BC-9:** `noreset` not taken. In the turn Clippy stopped the plant (an unused `mut`). In its second form, in the rerun, `ResetSystem` reset QEMU in the stale-key-twice scenario before its lines.
+- **BC-10:** the live-table check never firing. A host test failed.
+- **BC-11:** `ResetSystem` called with constants between a successful call and the triple fault. `bench-build --bisect`: two indirect calls reach the triple fault.
+
+`ORIGIN_BOOT_TEST_ONLY` splits on commas, so the filter `"bisect, a returning call"` selected every bisection scenario through its first word. Each plant ran them in order to its first failure.
+
+**Rental H's images,** staged read-only (mode 444) under `~/.local/state/origin-bench/` (item 232) from `4165ecfb`:
+- `rental-h-bench-bisect-image-4165ecfb/BOOTX64.EFI`, `ce53da4c…`;
+- `KERNEL.ONBF`, `3bb1f2a5…`;
+- the dry run above was made on them. Rental H goes to the owner only through the coordinating session.
+
+**Not shown:**
+- anything on an AMD FCH: QEMU has none, and `BENCH-FCH` supplies its values;
+- the call through the copy by a boot: under QEMU the two tables are the same, so the machine-code checks show it;
+- the mode on any machine: that is rental H, if the owner allows it;
+- a triple fault told from a firmware reset under QEMU by QEMU's own logging (R131-3's last suggestion; not looked into);
 - **no person has reviewed it.**
