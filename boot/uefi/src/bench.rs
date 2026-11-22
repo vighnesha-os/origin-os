@@ -517,12 +517,13 @@ pub const fn minimal_register(
 
 /// The line the minimal-mode loader writes first, after the banner (ADR-0002 Amendment 5). The
 /// rental tool and the records tell a minimal-mode image by its text, `bench build: minimal`.
-pub const MINIMAL_LINE: &str = "origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault";
+pub const MINIMAL_LINE: &str = "origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault where both shutdown bits are set, else Amendment 3's order (TASKS item 128's review, R128-1)";
 
-/// The time-stamp counter's ticks a millisecond the minimal mode assumes for Amendment 3's waits,
-/// since it calls no `Stall` to count them: 4 GHz, above the rented board's 3.8 GHz, so each wait
-/// is at least as long as its figure there (ADR-0002 Amendment 5, "no `Stall`").
-pub const MINIMAL_TICKS_PER_MS: u64 = 4_000_000;
+/// The time-stamp counter's ticks a millisecond the minimal mode takes for its waits, since it
+/// calls no `Stall` to count them (ADR-0002 Amendment 5, "no `Stall`"): [`ASSUMED_TICKS_PER_MS`],
+/// above any rate a processor's counter runs at, so each wait is at least as long as its figure
+/// (TASKS item 128's review, R128-7). Under QEMU, whose counter is slower, the waits are longer.
+pub const MINIMAL_TICKS_PER_MS: u64 = ASSUMED_TICKS_PER_MS;
 
 /// Amendment 4's addition (item 348), the full mode: the live boot services table against the
 /// loader's copy, before its last line. The minimal mode makes no copy, so it has no such line.
@@ -584,7 +585,7 @@ impl fmt::Display for TableLine {
         match self.live {
             Live::Unchecked => write!(
                 f,
-                "; its signature or size does not check, so it was not compared; the copy's ExitBootServices {:#x}, header CRC32 {:#010x}",
+                "; the pointer is null or misaligned, or the table's signature or size does not check, so it was not compared; the copy's ExitBootServices {:#x}, header CRC32 {:#010x}",
                 self.copy_exit, self.copy_crc
             ),
             Live::Read {

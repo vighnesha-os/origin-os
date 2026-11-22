@@ -2076,9 +2076,13 @@ fn write_cf9() {
 #[cfg(origin_bench)]
 #[inline(always)]
 fn triple_fault() -> ! {
-    // SAFETY: CPL 0, interrupts masked, after `ExitBootServices`, and only to end a diagnostic
-    // run (decision item 345). The block pushes 16 zero bytes and loads them as the IDT: limit 0,
-    // base 0. `int3` then finds no gate within the limit, nor do the #GP and the double fault that
+    // SAFETY: CPL 0, and only to end a diagnostic run (decision items 345 and 347): after
+    // `ExitBootServices` in the full mode (interrupts masked); in the minimal mode either before
+    // the call, as the control (interrupts masked, boot services live), or right after a successful
+    // call, with interrupts as the firmware left them, since nothing may come between (Amendment
+    // 5, step 6; TASKS item 128's review, R128-5). Whatever arrives once the zero-limit IDT is
+    // loaded faults too and ends in the same shutdown; before it, the firmware's IDT takes it. The
+    // block pushes 16 zero bytes and loads them as the IDT: limit 0, base 0. `int3` then finds no gate within the limit, nor do the #GP and the double fault that
     // follow, so the processor shuts down (AMD64 APM Volume 2 §8.2.9). It does not return; `ud2`
     // is never reached.
     unsafe {
@@ -2397,7 +2401,8 @@ mod measure {
 ///
 /// It reads no kernel file, verifies nothing, starts no generator, allocates nothing, builds no
 /// page tables, searches for no framebuffer, copies no boot services table, calls no `Stall`,
-/// reads no UART register but the line status the marks wait on, and writes nothing to `0xCF9`.
+/// reads no UART register but the line status its lines wait on (the marks, and Amendment 3's
+/// lines after the call), and writes nothing to `0xCF9`.
 #[cfg(origin_bench_minimal)]
 mod minimal {
     use core::fmt::Write;
@@ -2518,17 +2523,18 @@ mod minimal {
                     bench::find_reset(rsdp, &mut read, |at| bench::in_mmio(described, at));
                 // Under QEMU only: the stand-in table (the coordinating session's ruling Q4).
                 let table = fch::find_stand_in(rsdp, &mut read);
-                let stand_in = table
-                    .map(|(body, n)| fch::StandIn::from_table(body.get(..n).unwrap_or(&[]), true));
+                let stand_in =
+                    table.map(|(body, n)| fch::StandIn::from_table(body.get(..n).unwrap_or(&[])));
                 let _ = writeln!(out, "{}", fch::stand_in_said(stand_in));
                 let stand_in = stand_in.flatten();
                 let seen = bench_fch_read(rsdp, described, stand_in.map(|s| s.pretend), true, out);
                 (found.early_uart(), register, seen, stand_in)
             }
-            Err(_) => {
+            Err(failure) => {
+                let _ = failure.report(out);
                 let _ = writeln!(
                     out,
-                    "origin-boot: bench build: minimal: the first memory map does not fit the static buffer, or cannot be read: nothing is read, and the call is made with no control"
+                    "origin-boot: bench build: minimal: no first memory map (R128-13): no table walk and no FCH read, and the call is made with no control"
                 );
                 (
                     EarlyUart::NONE,
@@ -2538,7 +2544,12 @@ mod minimal {
                 )
             }
         };
-        let _ = writeln!(out, "{}", bench::ResetLine(register));
+        // The register as this mode may use it: one at port 0xCF9 is named as skipped (R128-6).
+        let _ = writeln!(
+            out,
+            "{}",
+            bench::ResetLine(bench::minimal_register(register))
+        );
         // Step 3: the branch.
         let _ = writeln!(out, "{}", fch::SmiLine(seen.smi));
         if let Some(registers) = seen.registers {
@@ -2572,7 +2583,9 @@ mod minimal {
             reset_system: runtime_reset_system(st).ok(),
             register: bench::minimal_register(register),
             ticks_per_ms: bench::MINIMAL_TICKS_PER_MS,
-            marks: early_uart.is_present(),
+            // Not read in this mode: Amendment 5, step 5, writes `X` straight before the call, with
+            // no drain first, since the mode reads no UART register to drain it (R128-12).
+            marks: false,
             free: None,
         };
         let _ = writeln!(out, "{LAST_LINE}");
@@ -2581,6 +2594,8 @@ mod minimal {
         let mut calls = uart::ExitCalls::default();
         let outcome: ExitOutcome<MapFailure> = uefi::exit_boot_services(
             || {
+                // No key without a live table whose `ExitBootServices` is there to call (R128-11).
+                live_exit(system_table).ok_or(MapFailure::Firmware(Status::UNSUPPORTED))?;
                 let get_map = live_get_memory_map(system_table)
                     .ok_or(MapFailure::Firmware(Status::UNSUPPORTED))?;
                 read_memory_map(get_map, map, regions).map(|(key, _)| key)
@@ -2629,7 +2644,7 @@ mod minimal {
                 let _ = failure.report(out);
                 let _ = writeln!(
                     out,
-                    "origin-boot: bench build: minimal: the last memory map does not fit the static buffer, or cannot be read, so there is no key: halting"
+                    "origin-boot: bench build: minimal: no last memory map, or no live ExitBootServices, so no call can be made: halting"
                 );
                 halt()
             }

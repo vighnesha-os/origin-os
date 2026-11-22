@@ -64,7 +64,8 @@ pub const PM1_EVT_BLK: u64 = 0x60;
 pub const ACPI_CONFIG: u64 = 0x74;
 /// `PMxC0`, S5_RESET_STATUS, 32 bits: the cause of the last reset, one bit set by each reset.
 pub const RESET_STATUS: u64 = 0xC0;
-/// `PMxD2`, PMIODEBUG, 8 bits: bit 6 (`cf9rstdisable`) stops a write to `0xCF9` from resetting.
+/// `PMxD2`, PMIODEBUG, 8 bits: bit 6 (`cf9rstdisable`) turns the FCH's own reset at `0xCF9` off,
+/// so that the firmware can trap the write (Amendment 4's addition, item 348).
 pub const PMIO_DEBUG: u64 = 0xD2;
 /// The bytes of the block the reads touch: from `PMx00` to `PMxD2` inclusive.
 pub const SPAN: u64 = PMIO_DEBUG + 1;
@@ -1158,6 +1159,10 @@ pub const STAND_IN_MAX: usize = 64;
 /// `mine` naming a shutdown (bit 23), and three more the minimal mode's QEMU scenarios need,
 /// since it reads no switch file: `stale1` or `stale2` (that many calls are given a stale key),
 /// and `noreset` (Amendment 3's order calls no `ResetSystem`, so the FADT's step is reached).
+/// Compiled only into a minimal-mode build and the host tests, so no other build holds it (TASKS
+/// item 128's review, R128-3; `bench-build` refuses a full bench loader holding the table's
+/// signature).
+#[cfg(any(test, origin_bench_minimal))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StandIn {
     /// The values.
@@ -1168,14 +1173,11 @@ pub struct StandIn {
     pub no_reset_system: bool,
 }
 
+#[cfg(any(test, origin_bench_minimal))]
 impl StandIn {
-    /// The stand-in table's body as a minimal-mode build reads it; `None` in every other build,
-    /// which ignores the table (the coordinating session's ruling Q4), and for words not
-    /// understood.
-    pub fn from_table(body: &[u8], minimal: bool) -> Option<Self> {
-        if !minimal {
-            return None;
-        }
+    /// The stand-in table's body; `None` for words not understood, and for `nocf9` and `slow`,
+    /// which mean nothing in a mode with no `0xCF9` write and no wait of `Pretend`'s (R128-15).
+    pub fn from_table(body: &[u8]) -> Option<Self> {
         let mut stale = 0u8;
         let mut no_reset_system = false;
         let mut rest: [u8; STAND_IN_MAX] = [b' '; STAND_IN_MAX];
@@ -1188,7 +1190,7 @@ impl StandIn {
                 b"stale1" if stale == 0 => stale = 1,
                 b"stale2" if stale == 0 => stale = 2,
                 b"noreset" if !no_reset_system => no_reset_system = true,
-                b"stale1" | b"stale2" | b"noreset" => return None,
+                b"stale1" | b"stale2" | b"noreset" | b"nocf9" | b"slow" => return None,
                 other => {
                     let end = n + other.len() + 1;
                     if end > STAND_IN_MAX {
@@ -1211,6 +1213,7 @@ impl StandIn {
 /// [`STAND_IN_MAX`] bytes, read through `read` as the FADT's walk reads (`bench::with_fadt`'s
 /// RSDP and XSDT checks). `None` if there is none, or it cannot be read whole. Only a
 /// minimal-mode build looks (ADR-0002 Amendment 5, step 3; the coordinating session's ruling Q4).
+#[cfg(any(test, origin_bench_minimal))]
 pub fn find_stand_in(
     rsdp: u64,
     read: &mut impl FnMut(u64, &mut [u8]) -> bool,
@@ -1253,6 +1256,7 @@ pub fn find_stand_in(
 
 /// The minimal mode's line about the stand-in table: `found` is `None` with no table, `Some(None)`
 /// for words not understood.
+#[cfg(any(test, origin_bench_minimal))]
 pub const fn stand_in_said(found: Option<Option<StandIn>>) -> &'static str {
     match found {
         None => {
@@ -1355,7 +1359,7 @@ impl fmt::Display for MinimalDecisionLine {
             MinimalDecision::Call { why, shutdown } => {
                 match why {
                     CallWhy::Mine(_) => f.write_str(
-                        "the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault records",
+                        "the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes",
                     )?,
                     CallWhy::NoRecord(status) => write!(
                         f,
@@ -2248,26 +2252,29 @@ mod tests {
     }
 
     #[test]
-    fn the_stand_in_table_is_ignored_by_every_build_that_is_not_the_minimal_mode() {
-        // The coordinating session's ruling Q4.
+    fn the_stand_in_table_takes_whole_bodies_only() {
+        // That no other build takes the table is a property of the build, not of this function:
+        // the stand-in code is compiled only under `origin_bench_minimal` (and here), and
+        // `bench-build` refuses a full bench loader holding its signature (R128-3).
+        for body in [&b"mine nocf9"[..], b"first slow"] {
+            assert_eq!(StandIn::from_table(body), None, "{body:?}");
+        }
         for body in [
             &b"first"[..],
             b"mine",
             b"mine stale1 noreset",
             b"norecord smi=0",
         ] {
-            assert_eq!(StandIn::from_table(body, false), None, "{body:?}");
-            assert!(StandIn::from_table(body, true).is_some(), "{body:?}");
+            assert!(StandIn::from_table(body).is_some(), "{body:?}");
         }
     }
 
     #[test]
     fn the_stand_in_table_takes_the_switchs_words_and_its_own() {
-        let s = StandIn::from_table(b"mine stale1", true).unwrap();
+        let s = StandIn::from_table(b"mine stale1").unwrap();
         assert_eq!(s.pretend.kind, Kind::Mine);
         assert_eq!((s.stale, s.no_reset_system), (1, false));
-        let s = StandIn::from_table(b"norecord noshutdown noreset stale2 smi=0x08000000", true)
-            .unwrap();
+        let s = StandIn::from_table(b"norecord noshutdown noreset stale2 smi=0x08000000").unwrap();
         assert_eq!(s.pretend.kind, Kind::NoRecord);
         assert!(s.pretend.no_shutdown);
         assert_eq!(s.pretend.smi, Some(0x0800_0000));
@@ -2280,7 +2287,7 @@ mod tests {
             b"mine first",
             b"mine what",
         ] {
-            assert_eq!(StandIn::from_table(bad, true), None, "{bad:?}");
+            assert_eq!(StandIn::from_table(bad), None, "{bad:?}");
         }
     }
 
@@ -2406,7 +2413,7 @@ mod tests {
                 why: CallWhy::Mine(LAST_RESET_SHUTDOWN),
                 shutdown: true
             }),
-            "origin-boot: bench build: minimal: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault records: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it"
+            "origin-boot: bench build: minimal: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it"
         );
         assert!(line(MinimalDecision::Call {
             why: CallWhy::NotRead,
