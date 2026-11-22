@@ -7,6 +7,37 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** On a physical machine only Origin's loader has run: a rented bench server, outside the declared scope, on 2026-11-20 (see the next section). |
 
+## A bench build's bisection mode (TASKS item 131; 2026-11-22)
+
+On `claude/t131-bisect-mode`, cut at TASKS item 130's tip `970cfca2`, with PR 59's records merged in from `land/batch-10` at `140c467b`; not landed. Rental G's minimal program returned from `ExitBootServices` on the firmware revision where rental E's full loader stopped. Owner item 352 (ADR-0002 Amendment 6) therefore bisects what Origin's loader adds, starting with its OS-defined memory types.
+
+- **The bisection mode,** a bench build of its own (`bench-build --bisect`), never signed or shipped:
+  - it does the full bench loader's work before the call, unchanged and in its own order, but allocates the kernel stack and the boot info as `EfiLoaderData`;
+  - from the map the page tables were built from, it prints how many descriptors it counted and how many are of an OS-defined type;
+  - it uses the minimal mode's decision and control: a triple fault and no call in the boot's first run, where both shutdown bits are set;
+  - it makes the call through the loader's copy of the boot services table, as every loader that stopped made it, after the live table's compare;
+  - after `EFI_SUCCESS` comes a triple fault and nothing else. After a second error, Amendment 2's line and Amendment 3's order, never writing `0xCF9`.
+- **`xtask`'s machine-code checks** show, on the image itself, that:
+  - no `0xCF9` is in DX;
+  - the only call that reaches the triple fault is `ExitBootServices'`, by its arguments;
+  - it is not read from the live table, there or anywhere in the image.
+
+  Their controls are the full and minimal loaders.
+- **The rental tool** reads the mode's runs from the firmware's starts. Each boot's window now adds the loader's own measured work. The plan stays at six boots of 5.8 minutes.
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:**
+- **The turn on `4165ecfb` (12:47 to 13:32 UTC):** every gate passed:
+  - `check`;
+  - the normal images the batch's bytes;
+  - `boot-test`;
+  - one `boot-matrix`, whose `boot-bench` passed 31 of 31, the bisection mode's nine among them;
+  - all three bench builds.
+- **QEMU has no AMD FCH,** so the `BENCH-FCH` switch supplies its values. Under QEMU the live table and the copy are the same, so only the machine-code checks show the call goes through the copy.
+- **All eleven planted controls fail for their own reason.** BC-1, BC-6, BC-7 and BC-9 did so only in a rerun on `60b36a9d`, which changes only `xtask`'s check order and its test.
+- **The review:** one independent AI review, no High, three Medium and eight Low, all answered. No person has reviewed it.
+- **Rental H's images** are staged (loader `ce53da4c…`, kernel `3bb1f2a5…`). The rental tool's dry run shows six boots, $0.81 an hour and $1.62 at worst; nothing was bought.
+- **The full bench loader's bytes moved** to `0451f7a7…` from `32b6e043`'s `57a1bbb1…`, since a line of shared reset code changed (R131-1). The kernel is unchanged.
+
 ## The minimal-program mode and Amendment 4's addition, in the bench loader (TASKS item 128; 2026-11-22)
 
 On `claude/t128-minimal-mode`, cut from TASKS item 127's tip `a1069e45`, and in `land/batch-10` since `aac803ed`. Rentals E and F saw nothing after the mark before `ExitBootServices` and no reset after it. Owner items 347 and 348 (ADR-0002 Amendment 5, Amendment 4's addition) add a loader that does almost nothing before the call, to tell Origin's loader apart from the firmware. Item 349 makes it triple-fault after any successful call. Item 350 makes rental G the last rental for a while.
