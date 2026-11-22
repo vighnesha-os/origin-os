@@ -980,7 +980,9 @@ impl Quiet for Quietly {
 }
 
 /// How many scans made their pass under the move gate, and the longest of them in TSC ticks, its
-/// wait for the gate included, since the boot began (CL48).
+/// wait for the gate included, since the boot began (CL48). Not inlined across crates, so that the
+/// two statics it reads stay internal to this one (as `move_context`'s do).
+#[inline(never)]
 pub fn gated_scans() -> (u64, u64) {
     (
         GATED_SCANS.load(Ordering::Relaxed),

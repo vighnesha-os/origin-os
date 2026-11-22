@@ -960,10 +960,29 @@ pub(crate) mod pinned {
     /// A wake-up writes it inside its interrupts-off section, out of line (a change from TASKS item
     /// 96's contract, §2, which had it after the section; ruled by the coordinating session): the
     /// console queues a line written with interrupts off and pumps the UART once, as it does for
-    /// an interrupt handler's line, so the line is not lost and nothing waits. The console's lock
-    /// is a leaf, held only with interrupts off, and the console wakes no thread, so a wake-up is
-    /// never entered with it held. `Console::new`, never the boot flow's writer, which may open
-    /// an interrupt window between sections: that must not happen inside the section.
+    /// an interrupt handler's line, so the line is not lost and nothing waits.
+    ///
+    /// **Nesting** (the ruling's first condition). No run-queue lock is held here:
+    /// `origin_sync::threads::wake` calls its `report` hook after its retry or its search has
+    /// returned, and each queue lock is taken and released inside one `Queues::locked` call. The
+    /// console's lock (`console::SINKS`) is a leaf:
+    /// - every holder takes it with interrupts off, so no interrupt handler on the same
+    ///   processor runs while it is held;
+    /// - every holder does only the console's own work under it (its queues, its UARTs, its
+    ///   framebuffer), and never takes a run-queue lock or calls `wake` there. That covers the
+    ///   ordinary writers, the urgent writer of panics and exception reports, and `init`, the
+    ///   SPCR move and the loader's UART, which run before any thread exists.
+    ///
+    /// So neither lock is ever taken inside the other, in either order.
+    ///
+    /// **The writer.** `Console::new`, never `here_console`: on the boot flow with interrupts off,
+    /// `here_console` gives the boot flow's writer, which may open an interrupt window between a
+    /// line's sections, and that must not happen inside the wake-up's section.
+    ///
+    /// **A panic right after** (the ruling's second condition). The panic handler's urgent writer
+    /// hands its bytes to the same queue behind this line and pumps the UART until its own bytes
+    /// are out, so this line goes out first. Only a holder stuck with the lock makes it write
+    /// around the queue.
     #[cold]
     #[inline(never)]
     pub(crate) fn line(trigger: Trigger, on: CpuIndex, then: &str) {
