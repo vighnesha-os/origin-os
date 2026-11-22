@@ -113,7 +113,10 @@ unreachable_pub = "warn"
 # Amendment 6; TASKS item 131). Only `cargo xtask bench-build --bisect` and `boot-bench` set it,
 # into `target/bench-bisect`; F1 holds its name the same way, and it is never set with
 # `origin_bench_minimal`.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(origin_bench)', 'cfg(origin_bench_minimal)', 'cfg(origin_bench_bisect)', 'cfg(origin_stack_measure)'] }
+# `cfg(origin_bench_kernel)`: with `origin_bench`, the bench loader's kernel-entry mode (ADR-0002
+# Amendment 7; TASKS item 133). Only `cargo xtask bench-build --kernel` and `boot-bench` set it,
+# into `target/bench-kernel`; F1 holds its name the same way, and it is never set with another mode.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(origin_bench)', 'cfg(origin_bench_minimal)', 'cfg(origin_bench_bisect)', 'cfg(origin_bench_kernel)', 'cfg(origin_stack_measure)'] }
 
 [workspace.lints.clippy]
 # CLAUDE.md §13 and final rule 5: every unsafe boundary documents its invariants.

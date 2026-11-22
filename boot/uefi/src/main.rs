@@ -20,6 +20,9 @@
 // TASKS item 131's review, R131-11: the two modes are one or the other, never both.
 #[cfg(all(origin_bench_minimal, origin_bench_bisect))]
 compile_error!("a bench loader is built in the minimal mode or the bisection mode, not both");
+// TASKS item 133: the kernel-entry mode is a mode of its own as well.
+#[cfg(all(origin_bench_kernel, any(origin_bench_minimal, origin_bench_bisect)))]
+compile_error!("a bench loader is built in the kernel-entry mode alone, not with another mode");
 
 use core::ffi::c_void;
 use core::fmt::Write;
@@ -69,15 +72,10 @@ const STACK_PAGES: usize = 16;
 const MAP_SLACK: usize = 32;
 const PAGE: usize = 4096;
 const DEVELOPER_MODE: bool = cfg!(feature = "developer-mode");
-/// The kernel stack's and the boot info's memory types: B3's OS-defined types, or, in the
-/// bisection mode only, `EfiLoaderData` (ADR-0002 Amendment 6, step 2).
-#[cfg(not(origin_bench_bisect))]
-const STACK_TYPE: u32 = memory_type::OS_KERNEL_STACK;
-#[cfg(not(origin_bench_bisect))]
-const BOOT_INFO_TYPE: u32 = memory_type::OS_BOOT_INFO;
-#[cfg(origin_bench_bisect)]
+/// The kernel stack's and the boot info's memory type in every loader: `EfiLoaderData`, not B3's
+/// OS-defined types (ADR-0002 Amendment 7; owner item 353). The translated map names both by
+/// address instead, as it names the kernel image (`memmap::carve_loader_regions`).
 const STACK_TYPE: u32 = memory_type::LOADER_DATA;
-#[cfg(origin_bench_bisect)]
 const BOOT_INFO_TYPE: u32 = memory_type::LOADER_DATA;
 
 /// Image entry point; the `x86_64-unknown-uefi` target links it as the PE entry.
@@ -166,6 +164,9 @@ fn boot(
     // TASKS item 131 (decision item 352, ADR-0002 Amendment 6): the bisection mode says so first.
     #[cfg(origin_bench_bisect)]
     let _ = writeln!(out, "{}", bench::BISECT_LINE);
+    // TASKS item 133: the kernel-entry mode says so first too.
+    #[cfg(origin_bench_kernel)]
+    let _ = writeln!(out, "{}", bench::KERNEL_LINE);
 
     // B1: read the kernel image.
     let file = read_kernel(image, &bs).map_err(|s| {
@@ -218,11 +219,27 @@ fn boot(
     let after = {
         let found = read_bench_file(image, &bs, bench::AFTER_PATH)
             .map(|(contents, len)| bench::After::from_contents(contents.get(..len).unwrap_or(&[])));
+        #[cfg(not(origin_bench_kernel))]
         let _ = writeln!(out, "{}{}", bench::PREFIX, bench::After::said(found));
         // The bisection mode reads it as the full loader does, and ignores its value (ruling Q3 of
         // TASKS item 131).
         #[cfg(origin_bench_bisect)]
         let _ = writeln!(out, "{}", bench::BISECT_AFTER_IGNORED);
+        // The kernel-entry mode reads it too, and enters the kernel whatever it says (TASKS item
+        // 133's ruling Q5): no switch file decides anything on a rented board. Its line is its own,
+        // since the full mode's would say the kernel is not entered (R133-4).
+        #[cfg(origin_bench_kernel)]
+        let _ = writeln!(
+            out,
+            "{}",
+            if found.is_some() {
+                bench::KERNEL_AFTER_IGNORED
+            } else {
+                bench::KERNEL_NO_AFTER
+            }
+        );
+        #[cfg(origin_bench_kernel)]
+        let found: Option<Option<bench::After>> = Some(Some(bench::After::Kernel));
         found.flatten().unwrap_or(bench::After::Reset)
     };
     // TASKS item 121: values in place of the FCH's registers, for QEMU scenarios only. A rented
@@ -430,6 +447,15 @@ fn boot(
             format_args!("cannot allocate the memory-map buffer"),
         )
     })?;
+    // ADR-0002 B3 and Amendment 7: the three allocations the kernel must tell from the loader's
+    // other data, named by address in every map the loader translates. The stack's is named from
+    // its guard page, so the page tables leave that page unmapped.
+    let loader_regions = memmap::LoaderRegions::new(
+        (base, span_pages as u64),
+        stack,
+        STACK_PAGES as u64,
+        (info_addr, info_pages as u64),
+    );
     let rsdp = find_rsdp(st);
     // The firmware's framebuffer, for the kernel's console from its first line on (ADR-0010).
     // The memory map says below whether it can be used; missing or unusable, the boot goes on.
@@ -582,20 +608,8 @@ fn boot(
             os_types = Some(types);
             n
         };
-        let n = memmap::carve(
-            regions,
-            n,
-            base,
-            span_pages as u64,
-            origin_boot_info::RegionKind::KernelImage,
-        )
-        .map_err(|e| {
-            fail(
-                out,
-                Status::LOAD_ERROR,
-                format_args!("memory map rejected: {e:?}"),
-            )
-        })?;
+        let n = memmap::carve_loader_regions(regions, n, &loader_regions)
+            .map_err(|e| MapFailure::LoaderRegion(e).report(out))?;
         let regions = regions.get(..n).unwrap_or(&[]);
         let max_physical = regions
             .iter()
@@ -634,7 +648,8 @@ fn boot(
             direct_map_base: direct,
             kernel_virtual_base: kernel_virtual,
             kernel_physical_base: base,
-            stack_guard: stack - PAGE as u64,
+            // The page the carved kernel-stack region starts at (TASKS item 133's review, R133-6).
+            stack_guard: loader_regions.stack_guard(),
         };
         let (mut space, stats) = layout::build(&mut pool, &at, regions, segments)
             .map_err(|e| fail(out, Status::LOAD_ERROR, format_args!("page tables: {e:?}")))?;
@@ -764,16 +779,11 @@ fn boot(
     let outcome: ExitOutcome<MapFailure> = uefi::exit_boot_services(
         || {
             let (key, n) = read_memory_map(get_map, map, regions)?;
-            // The kernel image is EfiLoaderCode (executable under the firmware's NX policy), so
-            // it is marked as KernelImage by address (ADR-0002 B3).
-            let n = memmap::carve(
-                regions,
-                n,
-                base,
-                span_pages as u64,
-                origin_boot_info::RegionKind::KernelImage,
-            )
-            .map_err(MapFailure::KernelRegion)?;
+            // The kernel image is EfiLoaderCode (executable under the firmware's NX policy), and
+            // the kernel stack and the boot info are EfiLoaderData, so the three are marked by
+            // address (ADR-0002 B3 and Amendment 7): pure computation, no firmware call.
+            let n = memmap::carve_loader_regions(regions, n, &loader_regions)
+                .map_err(MapFailure::LoaderRegion)?;
             let info = BootInfo {
                 magic: origin_boot_info::MAGIC,
                 version_major: origin_boot_info::VERSION.0,
@@ -834,7 +844,7 @@ fn boot(
             // is a compare of the status in RAX. After an error, the loader's retry, with this
             // same check after it; after a second error, its normal path (the coordinating
             // session's ruling on R121-3).
-            #[cfg(all(origin_bench, not(origin_bench_bisect)))]
+            #[cfg(all(origin_bench, not(origin_bench_bisect), not(origin_bench_kernel)))]
             if status == Status::SUCCESS
                 && let Some(free) = plan.free
             {
@@ -914,8 +924,10 @@ fn boot(
             bench_disturb(early_uart, &plan);
             // Decision item 342: why, on the UART boot info would name, before it halts.
             say_halting(early_uart, calls);
-            // TASKS item 116: in a bench build, as after a successful call.
-            #[cfg(origin_bench)]
+            // TASKS item 116: in a bench build, as after a successful call. Not in the kernel-entry
+            // mode, whose path after two failed calls is Amendment 2's line and the halt, with no
+            // UART register written back (ruling Q5 of TASKS item 133; its review, R133-3).
+            #[cfg(all(origin_bench, not(origin_bench_kernel)))]
             bench_after_call(early_uart, &plan, calls);
             halt()
         }
@@ -929,8 +941,9 @@ enum MapFailure {
     Firmware(Status),
     /// The map does not translate into boot-info regions.
     Rejected(memmap::MapError),
-    /// The kernel image is not inside a single region.
-    KernelRegion(memmap::MapError),
+    /// The kernel image, the kernel stack or the boot info is not inside one region of the
+    /// firmware's loader data (ADR-0002 B3 and Amendment 7).
+    LoaderRegion(memmap::CarveFailure),
 }
 
 impl MapFailure {
@@ -945,10 +958,13 @@ impl MapFailure {
                 Status::LOAD_ERROR,
                 format_args!("memory map rejected: {e:?}"),
             ),
-            Self::KernelRegion(e) => fail(
+            Self::LoaderRegion(e) => fail(
                 out,
                 Status::LOAD_ERROR,
-                format_args!("kernel region: {e:?}"),
+                format_args!(
+                    "{:?} is not inside one region of the firmware's loader data: {:?}",
+                    e.region, e.error
+                ),
             ),
         }
     }
@@ -1608,10 +1624,13 @@ struct BenchPlan {
     #[cfg_attr(origin_bench_bisect, allow(dead_code))]
     under: Option<bench::UartState>,
     /// The firmware's `ResetSystem`, if its runtime services table checks.
+    #[cfg_attr(origin_bench_kernel, allow(dead_code))]
     reset_system: Option<ResetSystemFn>,
     /// The FADT's reset register.
+    #[cfg_attr(origin_bench_kernel, allow(dead_code))]
     register: Result<bench::ResetRegister, bench::NoReset>,
     /// The time-stamp counter's ticks a millisecond, for the waits.
+    #[cfg_attr(origin_bench_kernel, allow(dead_code))]
     ticks_per_ms: u64,
     /// Whether the marks before each call are written: only when the line before the call went
     /// out whole and the UART then emptied, so a mark never waits between `GetMemoryMap` and
@@ -1620,7 +1639,7 @@ struct BenchPlan {
     /// TASKS item 121: the reset with no firmware code after a call that returns `EFI_SUCCESS`, in
     /// a run whose last reset was a `0x06` to `0xCF9` or that finds no record of it. Always `None`
     /// in the bisection mode, which never reads it (R131-10).
-    #[cfg_attr(origin_bench_bisect, allow(dead_code))]
+    #[cfg_attr(any(origin_bench_bisect, origin_bench_kernel), allow(dead_code))]
     free: Option<fch::Free>,
 }
 
@@ -1651,8 +1670,12 @@ fn bench_before_call(
     );
     // TASKS item 121: the FCH's registers, the control in a boot's first run, or the reset after
     // the call in a run that follows a `0x06` to `0xCF9` or finds no record.
-    #[cfg(not(origin_bench_bisect))]
+    #[cfg(all(not(origin_bench_bisect), not(origin_bench_kernel)))]
     let free = bench_fch_decide(fch_seen, ticks_per_ms, early_uart, out);
+    // The kernel-entry mode prints the FCH's lines and decides nothing on them: no control, and
+    // no reset after the call (TASKS item 133's ruling Q5).
+    #[cfg(origin_bench_kernel)]
+    let free = kernel_entry::fch_lines(fch_seen, out);
     // The bisection mode's decision and control are the minimal mode's (Amendment 6, step 3), and
     // no reset of Amendment 4's follows the call.
     #[cfg(origin_bench_bisect)]
@@ -1858,6 +1881,7 @@ fn bench_after_call(early_uart: EarlyUart, plan: &BenchPlan, calls: uart::ExitCa
             },
         );
     }
+    #[cfg(not(origin_bench_kernel))]
     if !plan.after.enters_kernel() {
         bench_reset(early_uart, plan)
     }
@@ -1867,7 +1891,7 @@ fn bench_after_call(early_uart: EarlyUart, plan: &BenchPlan, calls: uart::ExitCa
 /// line (decision item 344, ADR-0002 Amendment 3: a bench-only exception to B5); if the machine
 /// still runs 2 s later, the FADT's reset register; then the halt. Each step is said on the UART
 /// first. A reset shows on a rented console as a new firmware start, which needs no UART.
-#[cfg(origin_bench)]
+#[cfg(all(origin_bench, not(origin_bench_kernel)))]
 fn bench_reset(early_uart: EarlyUart, plan: &BenchPlan) -> ! {
     mask_interrupts();
     let call = plan
@@ -1911,7 +1935,7 @@ fn bench_reset(early_uart: EarlyUart, plan: &BenchPlan) -> ! {
 }
 
 /// Writes the FADT's reset value to its reset register (ACPI 6.6 §4.8.3.6).
-#[cfg(origin_bench)]
+#[cfg(all(origin_bench, not(origin_bench_kernel)))]
 fn write_reset_register(register: bench::ResetRegister) {
     match register {
         bench::ResetRegister::Io { port, value } => {
@@ -1934,7 +1958,7 @@ fn write_reset_register(register: bench::ResetRegister) {
 }
 
 /// Spins until `ms` milliseconds have passed by the time-stamp counter.
-#[cfg(origin_bench)]
+#[cfg(all(origin_bench, not(origin_bench_kernel)))]
 fn wait_ms(ticks_per_ms: u64, ms: u64) {
     let goal = ticks_per_ms.saturating_mul(ms);
     let start = random::rdtsc();
@@ -1953,9 +1977,13 @@ struct FchSeen {
     where_line: fch::WhereLine,
     /// The registers, read or given by `BENCH-FCH`.
     registers: Option<fch::Registers>,
-    /// The FADT's PM1a event block, in system I/O.
+    /// The FADT's PM1a event block, in system I/O. The kernel-entry mode decides nothing on the
+    /// FCH's record, so it does not read this (TASKS item 133).
+    #[cfg_attr(origin_bench_kernel, allow(dead_code))]
     pm1a_event: Option<u16>,
-    /// `BENCH-FCH`, which only QEMU's ESP may hold, or the minimal mode's stand-in table.
+    /// `BENCH-FCH`, which only QEMU's ESP may hold, or the minimal mode's stand-in table. Not read
+    /// by the kernel-entry mode either.
+    #[cfg_attr(origin_bench_kernel, allow(dead_code))]
     pretend: Option<fch::Pretend>,
     /// `SMIxC0` (ADR-0002 Amendment 4's addition, item 348).
     smi: fch::Smi,
@@ -2098,7 +2126,7 @@ unsafe fn read_smi_control() -> u32 {
 /// run then makes the call and takes Amendment 3's path. In a run whose last reset was a `0x06` to
 /// `0xCF9`, or that finds no record of the last reset, what [`reset_without_firmware`] does after
 /// a call that returns `EFI_SUCCESS`.
-#[cfg(all(origin_bench, not(origin_bench_bisect)))]
+#[cfg(all(origin_bench, not(origin_bench_bisect), not(origin_bench_kernel)))]
 fn bench_fch_decide(
     seen: FchSeen,
     ticks_per_ms: u64,
@@ -2157,7 +2185,7 @@ fn bench_fch_decide(
 /// time-stamp counter; then a triple fault where the shutdown message reaches the FCH. If the
 /// machine is still running after that (with the shutdown message off, or when `BENCH-FCH` leaves
 /// the triple fault out), the caller goes on to TASKS item 116's path and Amendment 3's order.
-#[cfg(all(origin_bench, not(origin_bench_bisect)))]
+#[cfg(all(origin_bench, not(origin_bench_bisect), not(origin_bench_kernel)))]
 #[inline(always)]
 fn reset_without_firmware(free: fch::Free) {
     if free.cf9 {
@@ -2172,7 +2200,7 @@ fn reset_without_firmware(free: fch::Free) {
 
 /// `0x06`, a warm reset, to the FCH's reset control port `0xCF9`. Not compiled into the bisection
 /// mode, which writes nothing there (ADR-0002 Amendment 6, step 5).
-#[cfg(all(origin_bench, not(origin_bench_bisect)))]
+#[cfg(all(origin_bench, not(origin_bench_bisect), not(origin_bench_kernel)))]
 #[inline(always)]
 fn write_cf9() {
     // SAFETY: CPL 0; port 0xCF9 is the FCH's reset control register, and 0x06 its documented
@@ -2187,7 +2215,7 @@ fn write_cf9() {
 
 /// A triple fault: an IDT with a zero limit, then a breakpoint. Always inlined, so the minimal
 /// mode's path from the call to it holds no `call` (ADR-0002 Amendment 5, step 6).
-#[cfg(origin_bench)]
+#[cfg(all(origin_bench, not(origin_bench_kernel)))]
 #[inline(always)]
 fn triple_fault() -> ! {
     // SAFETY: CPL 0, and only to end a diagnostic run (decision items 345, 347 and 352): after
@@ -2213,7 +2241,7 @@ fn triple_fault() -> ! {
 
 /// Spins until `ticks` time-stamp counter ticks have passed. The bisection mode, which has no
 /// Amendment 4 reset, does not use it (R131-10).
-#[cfg(origin_bench)]
+#[cfg(all(origin_bench, not(origin_bench_kernel)))]
 #[cfg_attr(origin_bench_bisect, allow(dead_code))]
 fn wait_ticks(ticks: u64) {
     let start = random::rdtsc();
@@ -2779,17 +2807,18 @@ mod minimal {
 
 /// TASKS item 131 (decision item 352, ADR-0002 Amendment 6): the bisection mode, a bench build
 /// made only by `cargo xtask bench-build --bisect` (`cfg(origin_bench_bisect)`, beside
-/// `origin_bench`). It is the full bench loader's path, `boot`, with five changes, each at its own
+/// `origin_bench`). It is the full bench loader's path, `boot`, with four changes, each at its own
 /// `cfg` there:
-/// 1. the kernel stack and the boot info allocated as `EfiLoaderData` ([`STACK_TYPE`],
-///    [`BOOT_INFO_TYPE`]);
-/// 2. a line, before the last one, counting the OS-defined types in the memory map the page tables
+/// 1. a line, before the last one, counting the OS-defined types in the memory map the page tables
 ///    were built from ([`read_memory_map_counting`]);
-/// 3. the minimal mode's decision and control on the FCH's record ([`decide`]), with
+/// 2. the minimal mode's decision and control on the FCH's record ([`decide`]), with
 ///    `BENCH-FCH`'s `mine` naming a shutdown;
-/// 4. after `EFI_SUCCESS`, the triple fault and nothing before it; after a second error, Amendment
+/// 3. after `EFI_SUCCESS`, the triple fault and nothing before it; after a second error, Amendment
 ///    2's line and Amendment 3's order, with the FADT step skipped at port `0xCF9`;
-/// 5. `BENCH-AFTER` read and its value ignored.
+/// 4. `BENCH-AFTER` read and its value ignored.
+///
+/// Amendment 6's own step 2, the kernel stack and the boot info allocated as `EfiLoaderData`
+/// ([`STACK_TYPE`], [`BOOT_INFO_TYPE`]), is every loader's since Amendment 7 (owner item 353).
 ///
 /// The call is made through the loader's copy of the boot services table, as every loader that
 /// stopped made it. Nothing writes `0xCF9`: the full mode's control and reset are not compiled in.
@@ -2865,6 +2894,48 @@ mod bisect {
             mask_interrupts();
             triple_fault()
         }
+        None
+    }
+}
+
+/// TASKS item 133 (ADR-0002 Amendment 7; the coordinating session's ruling Q5): the kernel-entry
+/// mode, a bench build made only by `cargo xtask bench-build --kernel` (`cfg(origin_bench_kernel)`,
+/// beside `origin_bench`), for the rental that confirms Amendment 7. It is the full bench loader's
+/// path, `boot`, with the bench kernel entered after a successful call, TASKS item 112's path, and
+/// three things left out:
+/// - the FCH's decision: its lines are printed, and nothing is decided on them;
+/// - Amendment 4's control and its reset after the call (`bench_fch_decide`,
+///   `reset_without_firmware`, `write_cf9`), so nothing writes `0xCF9`;
+/// - Amendment 3's reset (`bench_reset`): after two failed calls, Amendment 2's line and the halt,
+///   with no UART register read or written back (its review, R133-3).
+///
+/// `BENCH-AFTER` is read and its value ignored, with a line of the mode's own (R133-4). After
+/// `EFI_SUCCESS` the line naming the call that
+/// succeeded goes straight to the UART, so a rented console shows that the call returned even if
+/// the kernel then says nothing.
+#[cfg(origin_bench_kernel)]
+mod kernel_entry {
+    use core::fmt::Write;
+
+    use origin_boot_uefi::console::ConOut;
+    use origin_boot_uefi::{bench, fch};
+
+    use super::FchSeen;
+
+    /// The FCH's lines, as the full mode prints them, and the line that they decide nothing.
+    pub(super) fn fch_lines(seen: FchSeen, out: &mut ConOut) -> Option<fch::Free> {
+        let _ = writeln!(out, "{}", fch::SmiLine(seen.smi));
+        if let Some(registers) = seen.registers {
+            let _ = writeln!(
+                out,
+                "{}",
+                fch::RegistersLine {
+                    registers,
+                    source: seen.source,
+                }
+            );
+        }
+        let _ = writeln!(out, "{}", bench::KERNEL_FCH_LINE);
         None
     }
 }

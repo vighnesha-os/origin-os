@@ -253,6 +253,11 @@ pub(crate) fn gate() -> Result {
         for (first, second) in first.iter().zip(&second) {
             check_pair(first, second, &kept, &host_paths)?;
             check_linker_line(first, &linker_text)?;
+            // ADR-0002 Amendment 7 (TASKS item 133's ruling Q4): no loader a normal build makes
+            // asks for one of B3's old OS-defined types, read from the first build's kept copy.
+            if matches!(image, Image::Loader(_)) {
+                crate::bench::check_no_os_types(&kept.join(BUILDS[0]).join(&first.file_name))?;
+            }
         }
         if image == Image::Kernel {
             let segments: Vec<&Built> = first_builds

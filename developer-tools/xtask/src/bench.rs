@@ -83,6 +83,28 @@ const BISECT_FILES: &[(&str, &str)] = &[
     ("developer-tools/xtask/src/bench.rs", "this gate"),
 ];
 
+/// The kernel-entry mode's flag (ADR-0002 Amendment 7; TASKS item 133), given with [`CFG`]; only
+/// [`KERNEL_FILES`] may hold it (F1; the coordinating session's ruling Q5).
+const KERNEL_CFG: &str = "origin_bench_kernel";
+
+/// The text every kernel-entry image holds, beside [`MARKER`], and no other image may.
+pub(crate) const KERNEL_MARKER: &[u8] = b"bench build: kernel";
+
+/// The files that may name the kernel-entry mode's flag. Each also names the bench flag, which its
+/// name begins with, so each is on [`FILES`] too.
+const KERNEL_FILES: &[(&str, &str)] = &[
+    ("Cargo.toml", "the flag's check-cfg declaration"),
+    (
+        "boot/uefi/src/main.rs",
+        "the kernel-entry mode's branches and module (TASKS item 133)",
+    ),
+    (
+        "developer-tools/xtask/src/toolchain.rs",
+        "the one place the flag is given",
+    ),
+    ("developer-tools/xtask/src/bench.rs", "this gate"),
+];
+
 /// The files that may name the minimal mode's flag. Each also names the bench flag, which its name
 /// begins with, so each is on [`FILES`] too.
 const MINIMAL_FILES: &[(&str, &str)] = &[
@@ -141,10 +163,11 @@ const FILES: &[(&str, &str)] = &[
 
 /// The flags F1 holds to their listed files: the bench build's, and TASKS item 127's stack
 /// measurement, whose rule is the same (the coordinating session's ruling on TASKS item 127, Q1).
-const FLAGS: [(&str, &[(&str, &str)]); 4] = [
+const FLAGS: [(&str, &[(&str, &str)]); 5] = [
     (CFG, FILES),
     (MINIMAL_CFG, MINIMAL_FILES),
     (BISECT_CFG, BISECT_FILES),
+    (KERNEL_CFG, KERNEL_FILES),
     (crate::stack_depth::CFG, crate::stack_depth::FILES),
 ];
 
@@ -164,6 +187,11 @@ pub(crate) fn minimal_target() -> PathBuf {
 /// Where bisection-mode builds go (TASKS item 131), apart from every other build.
 pub(crate) fn bisect_target() -> PathBuf {
     crate::target_dir().join("bench-bisect")
+}
+
+/// Where kernel-entry builds go (TASKS item 133), apart from every other build.
+pub(crate) fn kernel_target() -> PathBuf {
+    crate::target_dir().join("bench-kernel")
 }
 
 /// F1: the bench flag's name appears only in [`FILES`], and in each of them; and the
@@ -212,8 +240,8 @@ pub(crate) fn gate() -> Result {
         counts.push(found.len());
     }
     println!(
-        "xtask: bench gate (TASKS item 112, F1): the bench flag is named in {} listed files and nowhere else, the minimal mode's flag (TASKS item 128) in {}, the bisection mode's (TASKS item 131) in {}, and the stack measurement's flag (TASKS item 127) in {}",
-        counts[0], counts[1], counts[2], counts[3]
+        "xtask: bench gate (TASKS item 112, F1): the bench flag is named in {} listed files and nowhere else, the minimal mode's flag (TASKS item 128) in {}, the bisection mode's (TASKS item 131) in {}, the kernel-entry mode's (TASKS item 133) in {}, and the stack measurement's flag (TASKS item 127) in {}",
+        counts[0], counts[1], counts[2], counts[3], counts[4]
     );
     Ok(())
 }
@@ -224,6 +252,7 @@ fn check_found(flag: &str, files: &[(&str, &str)], found: &[String]) -> Result {
         CFG => "the bench flag",
         MINIMAL_CFG => "the minimal mode's flag",
         BISECT_CFG => "the bisection mode's flag",
+        KERNEL_CFG => "the kernel-entry mode's flag",
         _ => "the stack measurement's flag",
     };
     let listed: Vec<&str> = files.iter().map(|(path, _)| *path).collect();
@@ -251,9 +280,10 @@ fn check_found(flag: &str, files: &[(&str, &str)], found: &[String]) -> Result {
     }
 }
 
-/// Whether `path` is under [`target`], [`minimal_target`] or [`bisect_target`].
+/// Whether `path` is under [`target`], [`minimal_target`], [`bisect_target`] or
+/// [`kernel_target`].
 pub(crate) fn is_bench(path: &Path) -> bool {
-    [target(), minimal_target(), bisect_target()]
+    [target(), minimal_target(), bisect_target(), kernel_target()]
         .iter()
         .any(|root| {
             path.starts_with(root)
@@ -312,6 +342,16 @@ pub(crate) fn build_bisect_loader() -> Result<PathBuf> {
     )
 }
 
+/// The kernel-entry bench loader (ADR-0002 Amendment 7; TASKS item 133): the developer-mode loader
+/// with the bench flag and the kernel-entry mode's, into [`kernel_target`].
+pub(crate) fn build_kernel_loader() -> Result<PathBuf> {
+    crate::build_loader_with(
+        Some(Loader::Developer.feature()),
+        Some(&kernel_target()),
+        &toolchain::bench_kernel_config()?,
+    )
+}
+
 /// `cargo xtask bench-build --minimal` (TASKS item 128): the full bench images first, then the
 /// minimal-mode loader, staged with the bench kernel (which it never reads; the rental tool needs
 /// one) as `target/bench-minimal/xtask/BOOTX64.EFI` and `KERNEL.ONBF` for a rental's
@@ -338,13 +378,14 @@ pub(crate) fn build_minimal() -> Result<(PathBuf, PathBuf)> {
             loader.display()
         ));
     }
-    if holds(&bytes, BISECT_MARKER) {
+    if holds(&bytes, BISECT_MARKER) || holds(&bytes, KERNEL_MARKER) {
         return Err(format!(
-            "{} holds the text \"bench build: bisect\": the bisection mode's code reached the minimal-mode image (TASKS item 131)",
+            "{} holds the text \"bench build: bisect\" or \"bench build: kernel\": another mode's code reached the minimal-mode image (TASKS items 131 and 133)",
             loader.display()
         ));
     }
     check_minimal_code(&loader, &full_loader)?;
+    check_no_os_types(&loader)?;
     for path in [&loader, &kernel] {
         let bytes = read_file(path)?;
         println!(
@@ -387,7 +428,14 @@ pub(crate) fn build_bisect() -> Result<(PathBuf, PathBuf)> {
             loader.display()
         ));
     }
+    if holds(&bytes, KERNEL_MARKER) {
+        return Err(format!(
+            "{} holds the text \"bench build: kernel\": the kernel-entry mode's code reached the bisection-mode image (TASKS item 133)",
+            loader.display()
+        ));
+    }
     check_bisect_code(&loader, &full_loader, &minimal_loader)?;
+    check_no_os_types(&loader)?;
     for path in [&loader, &kernel] {
         let bytes = read_file(path)?;
         println!(
@@ -398,6 +446,128 @@ pub(crate) fn build_bisect() -> Result<(PathBuf, PathBuf)> {
         );
     }
     Ok((loader, kernel))
+}
+
+/// `cargo xtask bench-build --kernel` (TASKS item 133): the full bench images first (the
+/// machine-code check's control), then the kernel-entry loader, staged with the bench kernel it
+/// enters as `target/bench-kernel/xtask/BOOTX64.EFI` and `KERNEL.ONBF` for a rental's
+/// `--image-dir`. Fails unless the loader holds [`MARKER`] and [`KERNEL_MARKER`], holds no other
+/// mode's text, puts `0xCF9` in no port register (no control and no reset of Amendment 4's is
+/// compiled in), and allocates none of B3's old OS-defined types.
+pub(crate) fn build_kernel() -> Result<(PathBuf, PathBuf)> {
+    let (full_loader, bench_kernel) = build()?;
+    let efi = build_kernel_loader()?;
+    let out = kernel_target().join("xtask");
+    fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let loader = out.join("BOOTX64.EFI");
+    let kernel = out.join(crate::KERNEL_IMAGE);
+    fs::copy(&efi, &loader).map_err(|e| format!("copy {}: {e}", efi.display()))?;
+    fs::copy(&bench_kernel, &kernel)
+        .map_err(|e| format!("copy {}: {e}", bench_kernel.display()))?;
+    let bytes = read_file(&loader)?;
+    if !holds(&bytes, MARKER) || !holds(&bytes, KERNEL_MARKER) {
+        return Err(format!(
+            "{} is a kernel-entry image without the texts \"bench build\" and \"bench build: kernel\"",
+            loader.display()
+        ));
+    }
+    if holds(&bytes, MINIMAL_MARKER)
+        || holds(&bytes, STAND_IN_SIGNATURE)
+        || holds(&bytes, BISECT_MARKER)
+    {
+        return Err(format!(
+            "{} holds another mode's text (\"bench build: minimal\", \"OXFC\" or \"bench build: bisect\"): its code reached the kernel-entry image (TASKS item 133)",
+            loader.display()
+        ));
+    }
+    check_kernel_code(&loader, &full_loader)?;
+    check_no_os_types(&loader)?;
+    for path in [&loader, &kernel] {
+        let bytes = read_file(path)?;
+        println!(
+            "xtask: bench-build --kernel: {}: {} bytes, SHA-256 {}",
+            path.display(),
+            bytes.len(),
+            crate::reproducible::hex(&origin_crypto::Sha256::digest(&bytes), "")
+        );
+    }
+    Ok((loader, kernel))
+}
+
+/// The kernel-entry loader's machine code (TASKS item 133's ruling Q5): no `0xCF9` in a port
+/// register anywhere, since the mode has no control and no reset of Amendment 4's. The full bench
+/// loader, which writes `0xCF9`, is the check's control.
+fn check_kernel_code(loader: &Path, full_loader: &Path) -> Result {
+    let full = instructions(&disassemble(full_loader)?);
+    if !full.iter().any(|i| is_cf9_load(&i.text)) {
+        return Err(format!(
+            "{}: the full bench loader puts no 0xCF9 in DX, so it cannot serve as the kernel-entry check's control",
+            full_loader.display()
+        ));
+    }
+    let insns = instructions(&disassemble(loader)?);
+    if insns.iter().any(|i| is_cf9_load(&i.text)) {
+        return Err(format!(
+            "{}: the kernel-entry loader puts 0xCF9 in DX: Amendment 4's control or reset reached a mode that has neither (TASKS item 133)",
+            loader.display()
+        ));
+    }
+    Ok(())
+}
+
+/// B3's old OS-defined types, which no loader allocates since ADR-0002 Amendment 7.
+const OLD_OS_TYPES: [&str; 2] = ["0x80000002", "0x80000003"];
+
+/// The instructions of `insns` with one of [`OLD_OS_TYPES`] as an operand, matched as a whole
+/// immediate (TASKS item 133's ruling Q4; its review, R133-5). Before Amendment 7 the loaders held
+/// them in two shapes: `mov edx, 0x80000003` and `mov edx, 0x80000002`, `AllocatePages`'
+/// `MemoryType` for the kernel stack and the boot info, and `cmp eax, …`, the translation of a
+/// descriptor's type. Since Amendment 7 a loader holds neither constant at all, so any instruction
+/// with either is one too many: kept in another register, stored, or compared.
+pub(crate) fn os_type_allocations(insns: &[Insn]) -> Vec<usize> {
+    (0..insns.len())
+        .filter(|&i| {
+            insns[i].text.split_once(' ').is_some_and(|(_, operands)| {
+                operands
+                    .split([',', ' ', '[', ']', '+'])
+                    .any(|word| OLD_OS_TYPES.contains(&word))
+            })
+        })
+        .collect()
+}
+
+/// The full bench loader's two allocations at `32b6e043`, before ADR-0002 Amendment 7, as
+/// `llvm-objdump` printed them: the kernel stack (`0x80000003`, 17 pages) and the boot info
+/// (`0x80000002`), each `AllocatePages(AllocateAnyPages, type, pages, &address)`; then the
+/// translation's compares of a descriptor's type. [`check_no_os_types`] runs its matcher on this
+/// first, so every gate shows the check can see the old loaders' instructions (R133-5).
+const OLD_ALLOCATIONS: &str = "14000a010:\tlea\tr9, [rbp + 0x760]\n14000a017:\tmov\tr8d, 0x11\n14000a01d:\txor\tecx, ecx\n14000a01f:\tmov\tedx, 0x80000003\n14000a024:\tcall\tqword ptr [rbp + 0x868]\n14000a13a:\tlea\tr9, [rbp + 0x760]\n14000a141:\txor\tecx, ecx\n14000a143:\tmov\tedx, 0x80000002\n14000a148:\tmov\tr8, qword ptr [rbp + 0x700]\n14000a14f:\tcall\tqword ptr [rbp + 0x868]\n140011c24:\tcmp\teax, 0x80000002\n140011c2b:\tcmp\teax, 0x80000003\n";
+
+/// Fails if the loader image at `image` allocates one of B3's old OS-defined types
+/// ([`os_type_allocations`]): ADR-0002 Amendment 7, so that a later change cannot bring them back
+/// unseen, since the translated map names the regions by address either way.
+pub(crate) fn check_no_os_types(image: &Path) -> Result {
+    // The control first: the batch's own loader's instructions, which the check must find.
+    if os_type_allocations(&instructions(OLD_ALLOCATIONS)).len() != 4 {
+        return Err(
+            "the check for B3's old OS-defined types does not find them in the loader they were taken from (OLD_ALLOCATIONS), so its verdict on any image cannot be trusted (TASKS item 133, R133-5)"
+                .into(),
+        );
+    }
+    let insns = instructions(&disassemble(image)?);
+    let found = os_type_allocations(&insns);
+    if found.is_empty() {
+        return Ok(());
+    }
+    let at: Vec<String> = found
+        .iter()
+        .map(|&i| format!("{:#x}: {}", insns[i].at, insns[i].text))
+        .collect();
+    Err(format!(
+        "{}: the loader asks AllocatePages for one of B3's old OS-defined types, which ADR-0002 Amendment 7 replaced by EfiLoaderData: {}",
+        image.display(),
+        at.join("; ")
+    ))
 }
 
 /// The bisection-mode loader's machine code (ADR-0002 Amendment 6; TASKS item 131): no `0xCF9` in
@@ -752,6 +922,12 @@ pub(crate) fn build() -> Result<(PathBuf, PathBuf)> {
                 path.display()
             ));
         }
+        if holds(&bytes, KERNEL_MARKER) {
+            return Err(format!(
+                "{} holds the text \"bench build: kernel\": the kernel-entry mode's code reached the full bench image (TASKS item 133)",
+                path.display()
+            ));
+        }
         println!(
             "xtask: bench-build: {}: {} bytes, SHA-256 {}",
             path.display(),
@@ -759,6 +935,8 @@ pub(crate) fn build() -> Result<(PathBuf, PathBuf)> {
             crate::reproducible::hex(&origin_crypto::Sha256::digest(&bytes), "")
         );
     }
+    // ADR-0002 Amendment 7 (TASKS item 133's ruling Q4): the full bench loader, like every other.
+    check_no_os_types(&loader)?;
     Ok((loader, kernel))
 }
 
@@ -963,6 +1141,16 @@ fn clippy() -> Result {
         .args(toolchain::bench_bisect_config()?)
         .args(["--", "-D", "warnings"]);
     run_step(&mut bisect)?;
+    // TASKS item 133: the kernel-entry mode's loader, likewise.
+    let mut kernel_entry = cargo();
+    kernel_entry
+        .args(["clippy", "--package", crate::LOADER_PACKAGE, "--target"])
+        .arg(crate::UEFI_TARGET)
+        .args(["--features", Loader::Developer.feature(), "--target-dir"])
+        .arg(kernel_target())
+        .args(toolchain::bench_kernel_config()?)
+        .args(["--", "-D", "warnings"]);
+    run_step(&mut kernel_entry)?;
     let config = toolchain::bench_config()?;
     let dir = target();
     let mut loader = cargo();
@@ -1098,6 +1286,11 @@ const BIS_NO_RESET: &str =
     "origin-boot: bench build: BENCH-FCH's noreset: Amendment 3's order calls no ResetSystem";
 const BIS_NO_OS_TYPE: &str = "origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in ";
 const BIS_CF9_SKIPPED: &str = "origin-boot: bench build: ResetSystem was not called (BENCH-FCH's noreset), and the FADT gives no usable reset register (RESET_REG is I/O port 0xcf9, which the bisection mode never writes (ADR-0002 Amendment 6)): halting";
+// TASKS item 133: the kernel-entry mode's three lines.
+const KER_START: &str = "origin-boot: bench build: kernel: the kernel-entry mode (TASKS item 133, ADR-0002 Amendment 7)";
+const KER_AFTER_IGNORED: &str = "origin-boot: bench build: kernel: BENCH-AFTER's value is ignored: this mode enters the kernel after a successful call, and halts after two failed calls";
+const KER_NO_AFTER: &str = "origin-boot: bench build: kernel: no BENCH-AFTER; this mode enters the kernel after a successful call, and halts after two failed calls";
+const KER_FCH: &str = "origin-boot: bench build: kernel: the FCH's record decides nothing in this mode: no control, and no reset after the call";
 /// The full loader's lines before the call that the bisection mode keeps (Amendment 6, step 1).
 const FULL_WORK: [&str; 4] = [
     "origin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF",
@@ -1313,6 +1506,19 @@ fn bisect_first_noshutdown(work: &Path) -> Result<Vec<String>> {
     fch(work, b"first noshutdown\n")
 }
 
+/// TASKS item 133: a stale key once, with no `BENCH-AFTER`: the kernel-entry mode enters the
+/// kernel after the retry.
+fn kernel_stale_once(work: &Path) -> Result<Vec<String>> {
+    switch(work, b"1\n")?;
+    spcr(work)
+}
+
+/// TASKS item 133: a stale key twice, with no `BENCH-AFTER`: Amendment 2's line and the halt.
+fn kernel_stale_twice(work: &Path) -> Result<Vec<String>> {
+    switch(work, b"2\n")?;
+    spcr(work)
+}
+
 /// `BENCH-AFTER kernel`, which the bisection mode reads and ignores (ruling Q3).
 fn bisect_after_kernel(work: &Path) -> Result<Vec<String>> {
     after(work, b"kernel\n")?;
@@ -1358,9 +1564,9 @@ fn scenario(
     }
 }
 
-/// The thirty-one scenarios of [`boot`]: TASKS item 112's four, TASKS item 116's three, TASKS
-/// item 121's nine, TASKS item 128's six of the minimal mode, and TASKS item 131's nine of the
-/// bisection mode.
+/// The thirty-six scenarios of [`boot`]: TASKS item 112's four, TASKS item 116's three, TASKS
+/// item 121's nine, TASKS item 128's six of the minimal mode, TASKS item 131's nine of the
+/// bisection mode, and TASKS item 133's five of the kernel-entry mode.
 fn scenarios() -> Vec<Scenario> {
     let with_crumbs = |first: &str| {
         let mut m = vec![
@@ -1651,6 +1857,48 @@ fn scenarios() -> Vec<Scenario> {
             check_bisect_after_kernel,
             Some(RESET_WITHIN),
         ),
+        // TASKS item 133: the kernel-entry mode, as rental I would run it and against the switches
+        // that would make the full mode reset.
+        scenario(
+            "bench: kernel, no switch, the bench kernel entered with its breadcrumbs",
+            Loader::BenchKernel,
+            with_crumbs(FIRST_CALL),
+            spcr,
+            check_kernel_first_call,
+            None,
+        ),
+        scenario(
+            "bench: kernel, a stale key once, the bench kernel entered after the retry",
+            Loader::BenchKernel,
+            with_crumbs(RETRY),
+            kernel_stale_once,
+            check_kernel_retry,
+            None,
+        ),
+        scenario(
+            "bench: kernel, a stale key twice, Amendment 2's line and the halt, no reset",
+            Loader::BenchKernel,
+            lines(&[HALTING_START]),
+            kernel_stale_twice,
+            check_kernel_halt,
+            Some(QUIET),
+        ),
+        scenario(
+            "bench: kernel, BENCH-AFTER fadt ignored, the bench kernel entered",
+            Loader::BenchKernel,
+            with_crumbs(FIRST_CALL),
+            spcr_fadt,
+            check_kernel_after_ignored,
+            None,
+        ),
+        scenario(
+            "bench: kernel, BENCH-FCH first, no control, the bench kernel entered",
+            Loader::BenchKernel,
+            with_crumbs(FIRST_CALL),
+            fch_first,
+            check_kernel_fch_first,
+            None,
+        ),
     ]
 }
 
@@ -1659,9 +1907,34 @@ fn scenarios() -> Vec<Scenario> {
 /// last line; and the line straight to the UART before the call is on the SPCR's UART only, before
 /// the loader's last line there.
 fn check_loader_console(done: &Completed, switch_line: &str, after_line: &str) -> Result {
+    check_loader_console_in(done, switch_line, after_line, false)
+}
+
+/// TASKS item 133: [`check_loader_console`] for the kernel-entry mode, whose console also holds its
+/// three lines, and no FCH decision.
+fn check_kernel_console(done: &Completed, switch_line: &str, after_line: &str) -> Result {
+    check_loader_console_in(done, switch_line, after_line, true)
+}
+
+/// [`check_loader_console`], for the full mode or (`kernel`) the kernel-entry mode.
+fn check_loader_console_in(
+    done: &Completed,
+    switch_line: &str,
+    after_line: &str,
+    kernel: bool,
+) -> Result {
     let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
     let at = |needle: &str| com1.find(needle);
     let last = at(LAST_LOADER_LINE).ok_or("COM1 lacks the loader's last line")?;
+    let own: &[&str] = if kernel { &[KER_START] } else { &[] };
+    // R133-4: the kernel-entry mode writes its own line about BENCH-AFTER, never the full mode's,
+    // which would say the kernel is not entered.
+    if kernel && com1.contains("the kernel is not entered") {
+        return Err(
+            "the kernel-entry mode's console says the kernel is not entered (TASKS item 133, R133-4)"
+                .into(),
+        );
+    }
     for needle in [
         switch_line,
         after_line,
@@ -1672,7 +1945,10 @@ fn check_loader_console(done: &Completed, switch_line: &str, after_line: &str) -
         UNDER_FIRMWARE,
         SMI_LINE,
         TABLE_LINE,
-    ] {
+    ]
+    .iter()
+    .chain(own.iter())
+    {
         match at(needle) {
             Some(i) if i < last => {}
             _ => {
@@ -1682,7 +1958,7 @@ fn check_loader_console(done: &Completed, switch_line: &str, after_line: &str) -
             }
         }
     }
-    check_fch_lines(&com1, last)?;
+    check_fch_lines_in(&com1, last, kernel)?;
     let state = com1
         .lines()
         .find(|l| l.starts_with(STATE))
@@ -1821,18 +2097,83 @@ fn check_retry(done: &Completed, settings: &Settings) -> Result {
     )
 }
 
+/// TASKS item 133: the kernel-entry mode with no switch, as a rental runs it: the bench kernel
+/// entered after the first call, with its breadcrumbs.
+fn check_kernel_first_call(done: &Completed, settings: &Settings) -> Result {
+    check_kernel_console(done, NO_SWITCH, KER_NO_AFTER)?;
+    check_crumbs(done, settings, FIRST_CALL, &[MARK_FIRST], AFTER_FIRST)
+}
+
+/// TASKS item 133: the retry, then the bench kernel.
+fn check_kernel_retry(done: &Completed, settings: &Settings) -> Result {
+    check_kernel_console(done, SWITCH_ONCE, KER_NO_AFTER)?;
+    check_crumbs(
+        done,
+        settings,
+        RETRY,
+        &[MARK_FIRST, MARK_RETRY],
+        AFTER_RETRY,
+    )
+}
+
+/// TASKS item 133: `BENCH-AFTER fadt`, which would make the full mode reset through the FADT's
+/// register, ignored: the bench kernel entered.
+fn check_kernel_after_ignored(done: &Completed, settings: &Settings) -> Result {
+    check_kernel_console(done, NO_SWITCH, KER_AFTER_IGNORED)?;
+    check_crumbs(done, settings, FIRST_CALL, &[MARK_FIRST], AFTER_FIRST)
+}
+
+/// TASKS item 133: `BENCH-FCH first`, which would make the full mode's boot a control, read for the
+/// FCH's lines only: no control, and the bench kernel entered.
+fn check_kernel_fch_first(done: &Completed, settings: &Settings) -> Result {
+    check_kernel_console(done, NO_SWITCH, KER_NO_AFTER)?;
+    // R133-7: the switch read, as the full mode reads it, so its values are on the console.
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    for needle in [FCH_SWITCH, FCH_REGISTERS, SMI_GIVEN] {
+        if !com1.contains(needle) {
+            return Err(format!(
+                "COM1, the kernel-entry loader's console, lacks {needle:?}: BENCH-FCH was not read as the full mode reads it"
+            ));
+        }
+    }
+    check_crumbs(done, settings, FIRST_CALL, &[MARK_FIRST], AFTER_FIRST)
+}
+
 /// Both calls failed: on the SPCR's UART the marks, the halting line and the line after the call
 /// follow the loader's last line and, [`QUIET`] later, nothing follows them; QEMU did not exit;
 /// and no kernel line was written anywhere.
 fn check_halt(done: &Completed, _settings: &Settings) -> Result {
-    check_loader_console(done, SWITCH_TWICE, AFTER_KERNEL)?;
+    check_halt_in(done, AFTER_KERNEL, false)
+}
+
+/// TASKS item 133: [`check_halt`] for the kernel-entry mode, which halts after both calls fail
+/// whatever `BENCH-AFTER` says, with no reset.
+fn check_kernel_halt(done: &Completed, _settings: &Settings) -> Result {
+    check_halt_in(done, KER_NO_AFTER, true)
+}
+
+/// [`check_halt`], with `after_line` and the full mode's or (`kernel`) the kernel-entry mode's
+/// console.
+fn check_halt_in(done: &Completed, after_line: &str, kernel: bool) -> Result {
+    check_loader_console_in(done, SWITCH_TWICE, after_line, kernel)?;
     let after = after_last_line(done)?;
-    if after.len() != 4
-        || after[..3] != [MARK_FIRST, MARK_RETRY, HALTING]
-        || !is_after_call(&after[3], AFTER_BOTH_FAILED)
-    {
+    // The kernel-entry mode writes no line after the call once both have failed, and writes no
+    // UART register back (ruling Q5; R133-3): the marks and Amendment 2's line, then nothing.
+    let whole = if kernel {
+        after == [MARK_FIRST, MARK_RETRY, HALTING]
+    } else {
+        after.len() == 4
+            && after[..3] == [MARK_FIRST, MARK_RETRY, HALTING]
+            && is_after_call(&after[3], AFTER_BOTH_FAILED)
+    };
+    if !whole {
         return Err(format!(
-            "after both calls failed, the SPCR's UART should hold the marks, the halting line and the line after the call after the loader's last line, and nothing more for {} s; it holds {after:?}",
+            "after both calls failed, the SPCR's UART should hold the marks, the halting line{} after the loader's last line, and nothing more for {} s; it holds {after:?}",
+            if kernel {
+                ""
+            } else {
+                " and the line after the call"
+            },
             QUIET.as_secs()
         ));
     }
@@ -1911,7 +2252,10 @@ fn check_disturbed(done: &Completed, _settings: &Settings) -> Result {
 /// no `BENCH-FCH`, the line saying so, the FCH's block not read under QEMU (no region in its DSDT,
 /// or not an AMD processor), and no control; with it, the switch's values and the registers'
 /// line.
-fn check_fch_lines(com1: &str, before: usize) -> Result {
+///
+/// In the kernel-entry mode (`kernel`, TASKS item 133) the FCH's lines end in its own line, and
+/// hold no decision of the full mode's.
+fn check_fch_lines_in(com1: &str, before: usize, kernel: bool) -> Result {
     let line_at = |start: &str| {
         com1.find(start)
             .filter(|&i| i < before)
@@ -1926,15 +2270,29 @@ fn check_fch_lines(com1: &str, before: usize) -> Result {
                 "with BENCH-FCH the FCH's line should say {FCH_BY_SWITCH:?}: {where_line:?}"
             ));
         }
-        &[FCH_REGISTERS]
+        if kernel {
+            &[FCH_REGISTERS, KER_FCH]
+        } else {
+            &[FCH_REGISTERS]
+        }
     } else {
         if !FCH_QEMU_NOT_READ.contains(&tail) {
             return Err(format!(
                 "under QEMU, with no BENCH-FCH, the FCH's block is not read: {where_line:?}"
             ));
         }
-        &[NO_FCH, FCH_NO_CONTROL]
+        if kernel {
+            &[NO_FCH, KER_FCH]
+        } else {
+            &[NO_FCH, FCH_NO_CONTROL]
+        }
     };
+    if kernel && (com1.contains(FCH_NO_CONTROL) || com1.contains("the control:")) {
+        return Err(
+            "the kernel-entry mode printed a decision of the full mode's on the FCH's record (TASKS item 133)"
+                .into(),
+        );
+    }
     for needle in wanted {
         if line_at(needle).is_none() {
             return Err(format!(
@@ -2491,6 +2849,8 @@ pub(crate) fn boot(settings: &Settings) -> Result {
     build_minimal()?;
     // TASKS item 131: the bisection-mode loader, with its machine-code checks.
     build_bisect()?;
+    // TASKS item 133: the kernel-entry loader, with its machine-code checks.
+    build_kernel()?;
     let kernel = read_file(&kernel)?;
     let all: Vec<(Scenario, Vec<u8>)> = scenarios()
         .into_iter()
@@ -2502,7 +2862,7 @@ pub(crate) fn boot(settings: &Settings) -> Result {
         run_scenario(scenario, kernel, settings)?;
     }
     println!(
-        "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, the bench kernel under the normal loader, the reset through ResetSystem, through the FADT's register, a disturbed UART written back, and the FCH's nine: the control, 0xCF9 after the call, the triple fault, the fall-through, no record, 0xCF9 only after the retry succeeds, the normal path after both calls fail, a contradicting layout, and a control that does not reset; and the minimal mode's six: the control, a returning call, no record, the retry, both calls failing with the FADT's write to 0xCF9 skipped, and the triple fault with the shutdown bits clear; and the bisection mode's nine: the control, a returning call through the copy, no record, the retry, both calls failing with the FADT's write to 0xCF9 skipped, the shutdown bits clear, no BENCH-FCH, the control withheld, and BENCH-AFTER kernel ignored) in {} s",
+        "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, the bench kernel under the normal loader, the reset through ResetSystem, through the FADT's register, a disturbed UART written back, and the FCH's nine: the control, 0xCF9 after the call, the triple fault, the fall-through, no record, 0xCF9 only after the retry succeeds, the normal path after both calls fail, a contradicting layout, and a control that does not reset; and the minimal mode's six: the control, a returning call, no record, the retry, both calls failing with the FADT's write to 0xCF9 skipped, and the triple fault with the shutdown bits clear; and the bisection mode's nine: the control, a returning call through the copy, no record, the retry, both calls failing with the FADT's write to 0xCF9 skipped, the shutdown bits clear, no BENCH-FCH, the control withheld, and BENCH-AFTER kernel ignored; and the kernel-entry mode's five: the bench kernel entered with no switch, after the retry, with BENCH-AFTER fadt ignored and with BENCH-FCH's first ignored, and the halt after both calls fail) in {} s",
         chosen.len(),
         all.len(),
         started.elapsed().as_secs()
@@ -2583,7 +2943,7 @@ mod tests {
             "{err}"
         );
         // TASKS item 127, SD-3: the measurement flag in a file not on its own list.
-        let (flag, files) = FLAGS[3];
+        let (flag, files) = FLAGS[4];
         let measure: Vec<String> = files.iter().map(|(p, _)| (*p).to_string()).collect();
         assert_eq!(check_found(flag, files, &measure), Ok(()));
         let mut more = measure.clone();
@@ -2614,6 +2974,9 @@ mod tests {
         // TASKS item 131 (R131-11): nor a bisection-mode build's.
         let bisect = bisect_target().join("xtask").join("BOOTX64.EFI");
         assert!(refuse(&bisect, "signing").is_err());
+        // TASKS item 133: nor a kernel-entry build's.
+        let kernel_entry = kernel_target().join("xtask").join("BOOTX64.EFI");
+        assert!(refuse(&kernel_entry, "signing").is_err());
         // TASKS item 127: nor a stack measurement's.
         let measured = crate::stack_depth::target()
             .join("normal")
@@ -2768,6 +3131,78 @@ mod tests {
         for (path, _) in BISECT_FILES {
             assert!(FILES.iter().any(|(p, _)| p == path), "{path}");
         }
+    }
+
+    #[test]
+    fn f1_holds_the_kernel_entry_flag_to_its_own_list() {
+        let (flag, files) = FLAGS[3];
+        assert_eq!(flag, KERNEL_CFG);
+        let listed: Vec<String> = files.iter().map(|(p, _)| (*p).to_string()).collect();
+        assert_eq!(check_found(flag, files, &listed), Ok(()));
+        let mut more = listed.clone();
+        more.push("boot/uefi/src/bench.rs".into());
+        let err = check_found(flag, files, &more).unwrap_err();
+        assert!(
+            err.contains("boot/uefi/src/bench.rs names the kernel-entry mode's flag"),
+            "{err}"
+        );
+        for (path, _) in KERNEL_FILES {
+            assert!(FILES.iter().any(|(p, _)| p == path), "{path}");
+        }
+    }
+
+    #[test]
+    fn an_allocation_of_an_old_os_defined_type_is_found() {
+        let insns = instructions(OLD_ALLOCATIONS);
+        let found = os_type_allocations(&insns);
+        assert_eq!(
+            found.iter().map(|&i| insns[i].at).collect::<Vec<_>>(),
+            [0x1_4000_a01f, 0x1_4000_a143, 0x1_4001_1c24, 0x1_4001_1c2b]
+        );
+        // As Amendment 7 compiles them, `EfiLoaderData` (2), and no translation of the old types:
+        // nothing found.
+        let now: String = OLD_ALLOCATIONS
+            .replace("mov\tedx, 0x80000003", "mov\tedx, 0x2")
+            .replace("mov\tedx, 0x80000002", "mov\tedx, 0x2")
+            .lines()
+            .filter(|l| !l.contains("cmp"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            os_type_allocations(&instructions(&now)),
+            Vec::<usize>::new()
+        );
+        // R133-5's other shapes: another register, a store, an address; and longer numbers that
+        // only begin with the type (an EFI status, say), which are not it.
+        for (shape, found) in [
+            ("mov\tebx, 0x80000003", 1),
+            ("mov\tdword ptr [rbp - 0x20], 0x80000002", 1),
+            ("lea\trdx, [rbx + 0x80000003]", 1),
+            ("mov\trax, 0x8000000200000000", 0),
+            ("mov\trax, 0x800000030", 0),
+        ] {
+            let listing = format!("140001000:\t{shape}\n");
+            assert_eq!(
+                os_type_allocations(&instructions(&listing)).len(),
+                found,
+                "{shape}"
+            );
+        }
+    }
+
+    /// TASKS item 133's ruling Q4, the positive control on a real image: the batch's loader before
+    /// Amendment 7, whose path `ORIGIN_OS_TYPES_CONTROL` names, is refused. Run by hand in the
+    /// task's turn: `ORIGIN_OS_TYPES_CONTROL=<loader> cargo test -p xtask -- --ignored
+    /// the_batch_s_loader_is_refused_for_its_old_types`.
+    #[test]
+    #[ignore = "needs a loader built before ADR-0002 Amendment 7, named by ORIGIN_OS_TYPES_CONTROL"]
+    fn the_batch_s_loader_is_refused_for_its_old_types() {
+        let path = std::env::var("ORIGIN_OS_TYPES_CONTROL").expect("ORIGIN_OS_TYPES_CONTROL");
+        let err = check_no_os_types(Path::new(&path)).unwrap_err();
+        assert!(
+            err.contains("0x80000003") && err.contains("0x80000002"),
+            "{err}"
+        );
     }
 
     /// TASKS item 131, ruling Q9: the minimal-mode loader's call, as `llvm-objdump` printed it at

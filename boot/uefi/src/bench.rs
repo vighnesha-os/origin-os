@@ -580,6 +580,22 @@ impl fmt::Display for OsTypesLine {
     }
 }
 
+/// The line the kernel-entry bench loader writes first, after the banner (TASKS item 133; ADR-0002
+/// Amendment 7). The rental tool and the records tell a kernel-entry image by its text,
+/// `bench build: kernel`.
+pub const KERNEL_LINE: &str = "origin-boot: bench build: kernel: the kernel-entry mode (TASKS item 133, ADR-0002 Amendment 7): the full bench loader's work before the call, with the boot info and the kernel stack as EfiLoaderData; no FCH decision, no control and no reset; after a successful call, the bench kernel with its breadcrumbs";
+
+/// The kernel-entry mode's line when `BENCH-AFTER` is there: it reads and ignores it. It writes
+/// this, or [`KERNEL_NO_AFTER`], in place of the full mode's line, which would say the kernel is
+/// not entered (TASKS item 133's review, R133-4).
+pub const KERNEL_AFTER_IGNORED: &str = "origin-boot: bench build: kernel: BENCH-AFTER's value is ignored: this mode enters the kernel after a successful call, and halts after two failed calls";
+
+/// The kernel-entry mode's line when no `BENCH-AFTER` is there, as on a rented board.
+pub const KERNEL_NO_AFTER: &str = "origin-boot: bench build: kernel: no BENCH-AFTER; this mode enters the kernel after a successful call, and halts after two failed calls";
+
+/// The kernel-entry mode's line after the FCH's: no control, and no reset after the call.
+pub const KERNEL_FCH_LINE: &str = "origin-boot: bench build: kernel: the FCH's record decides nothing in this mode: no control, and no reset after the call";
+
 /// The line the minimal-mode loader writes first, after the banner (ADR-0002 Amendment 5). The
 /// rental tool and the records tell a minimal-mode image by its text, `bench build: minimal`.
 pub const MINIMAL_LINE: &str = "origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)";
