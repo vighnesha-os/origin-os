@@ -43,6 +43,7 @@ pub mod domains;
 pub mod features;
 pub mod frames;
 pub mod heap;
+pub mod hfi;
 pub mod irq;
 pub mod ivrs;
 pub mod limits;
