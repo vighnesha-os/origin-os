@@ -1621,20 +1621,32 @@ fn threads_a_timed_wake_follows_a_move() {
 const MISPLACED_WOKE: &str = "a misplaced location woke the slot's other thread";
 
 /// ADR-0020 S20, trigger 3 (TASKS item 96, the coordinating session's ruling Q6): a thread's
-/// location is planted naming a slot of another processor that holds another thread, blocked for
-/// good. A wake-up by the thread's name, racing the thread's block on its own processor, must not
-/// wake that other thread: it enters pinned mode (the hook) and finds the thread where it is, by
-/// the one search, and wakes it there. A lost wake-up leaves the thread blocked: a deadlock.
+/// location is planted naming a slot of another processor that holds another thread, with a
+/// record of its own, blocked for good. A wake-up by the thread's name, racing the thread's block
+/// on its own processor, must not wake that other thread: it enters pinned mode (the hook) and
+/// finds the thread where it is, by the one search, and wakes it there. A lost wake-up leaves the
+/// thread blocked: a deadlock. The other thread holds a record, not none, so a check that asked
+/// only whether the slot holds some record would wake it (the review of TASKS item 96, R96-11).
 fn a_misplaced_location_wakes_only_its_thread() {
+    /// The other thread's record: any number but the named thread's.
+    const OTHER_RECORD: u32 = 7;
     let world = Kernel::with_threads_on(&[true, false]);
     let kernel = Arc::clone(&world.0);
     {
         let mut q = kernel.cpus[1].queue.lock();
-        assert_eq!(q.push(OTHER_FRAME).unwrap(), 1);
+        assert_eq!(
+            q.push_weighted(OTHER_FRAME, DEFAULT_WEIGHT, Some(OTHER_RECORD))
+                .unwrap(),
+            1
+        );
         assert_eq!(q.tick(IDLE_FRAME), OTHER_FRAME);
         assert_eq!(q.block(OTHER_FRAME).unwrap(), IDLE_FRAME);
     }
     let name = world.thread_on(0).current_thread().unwrap();
+    assert_ne!(
+        name.record, OTHER_RECORD,
+        "the other thread's record is another"
+    );
     kernel.record(name.record).set_location(Location::new(1, 1));
     let thread = world.spawn(0, |me| me.block());
     let waker = thread::spawn(move || {

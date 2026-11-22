@@ -1775,6 +1775,37 @@ mod tests {
         );
     }
 
+    /// `held` hands back the very record a slot was given, not one equal to it, so the kernel's
+    /// record check, which compares the record's address (`sched::KernelQueues::holds`), tells
+    /// apart two records that compare equal in value (the review of TASKS item 96, R96-11).
+    #[test]
+    fn held_hands_back_the_record_itself() {
+        static MINE: u32 = 7;
+        static OTHER: u32 = 7;
+        let mut q: RunQueue<&'static u32> = RunQueue::empty();
+        let mine = q
+            .push_weighted(0x1000, DEFAULT_WEIGHT, Some(&MINE))
+            .unwrap();
+        let other = q
+            .push_weighted(0x2000, DEFAULT_WEIGHT, Some(&OTHER))
+            .unwrap();
+        let is = |slot: usize, record: &'static u32| {
+            q.held(slot).is_some_and(|held| core::ptr::eq(held, record))
+        };
+        assert!(
+            is(mine, &MINE) && is(other, &OTHER),
+            "each slot's own record"
+        );
+        assert!(
+            !is(mine, &OTHER) && !is(other, &MINE),
+            "equal in value, not the same"
+        );
+        assert!(
+            !is(0, &MINE) && !is(5, &MINE),
+            "slot 0 and a free slot hold none"
+        );
+    }
+
     /// Each slot answers the record its thread was pushed with (ADR-0020 S1, TASKS item 92);
     /// slot 0, a free slot and a thread pushed without one answer none.
     #[test]
