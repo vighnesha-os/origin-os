@@ -225,7 +225,7 @@ fn read_boot(label: &'static str, texts: &[&str]) -> Result<Boot> {
     )?;
     if !calibration.ends_with(CALIBRATION_HOLDS) {
         return Err(format!(
-            "the calibration does not hold (TASKS item 127, SD-4): {CALIBRATION}{calibration}"
+            "the calibration, the measurement's positive control, does not hold (TASKS item 127): {CALIBRATION}{calibration}"
         ));
     }
     let calibration_below = calibration
@@ -274,12 +274,31 @@ fn check_fch(done: &Completed, settings: &Settings) -> Result {
     check(done, settings, FCH)
 }
 
+fn check_signed(done: &Completed, settings: &Settings) -> Result {
+    check(done, settings, SIGNED)
+}
+
 const NORMAL: &str = "the normal loader";
 const RENTAL: &str = "the bench loader as a rental runs it (rental A's EPYC reported)";
 const FCH: &str = "the bench loader with BENCH-FCH's values (a run that makes the call)";
+const SIGNED: &str =
+    "the normal loader with a signed kernel (Ed25519 and ML-DSA-87 verified, as on a real boot)";
 
-/// The three scenarios (ruling Q4), each with the loader it boots and whether the bench kernel.
-fn scenarios() -> [(Scenario, bool); 3] {
+/// Which kernel a scenario boots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kernel {
+    /// The normal kernel, unsigned: developer mode accepts it and verifies what it can, as on
+    /// every rental.
+    Unsigned,
+    /// The normal kernel signed with the test key: developer mode verifies both signatures.
+    Signed,
+    /// The bench kernel, never signed.
+    Bench,
+}
+
+/// The scenarios: ruling Q4's three, each run as the rentals run (an unsigned kernel), and the
+/// normal loader with a signed kernel, the path a real boot takes, which verifies the signatures.
+fn scenarios() -> [(Scenario, Kernel); 4] {
     let scenario = |label: &'static str,
                     loader: Loader,
                     qemu_args: crate::QemuArgs,
@@ -297,15 +316,19 @@ fn scenarios() -> [(Scenario, bool); 3] {
     [
         (
             scenario(NORMAL, Loader::MeasureNormal, bench::spcr, check_normal),
-            false,
+            Kernel::Unsigned,
         ),
         (
             scenario(RENTAL, Loader::MeasureBench, bench::spcr, check_rental),
-            true,
+            Kernel::Bench,
         ),
         (
             scenario(FCH, Loader::MeasureBench, bench::fch_mine, check_fch),
-            true,
+            Kernel::Bench,
+        ),
+        (
+            scenario(SIGNED, Loader::MeasureNormal, bench::spcr, check_signed),
+            Kernel::Signed,
         ),
     ]
 }
@@ -365,9 +388,19 @@ fn map_symbols(map: &str) -> Vec<(u64, String)> {
     out
 }
 
-/// A legacy Rust symbol's path, `_ZN` segments joined by `::` with the hash dropped; other names
-/// as they are.
+/// A Rust symbol's path: a v0 symbol's (`_R`) through [`V0`], or a legacy one's (`_ZN`)
+/// segments joined by `::` with the hash dropped; any other name, or a v0 symbol whose grammar
+/// [`V0`] does not cover, as it is.
 fn demangle(name: &str) -> String {
+    if let Some(v0) = name.strip_prefix("_R").or_else(|| name.strip_prefix("__R")) {
+        let mut p = V0 {
+            s: v0.as_bytes(),
+            at: 0,
+        };
+        return p
+            .path()
+            .map_or_else(|| name.to_string(), |parts| parts.join("::"));
+    }
     let Some(mut rest) = name
         .strip_prefix("_ZN")
         .or_else(|| name.strip_prefix("__ZN"))
@@ -412,6 +445,103 @@ fn demangle(name: &str) -> String {
         .replace("..", "::")
 }
 
+/// A reader of the part of Rust's v0 mangling a report needs: crate roots (`C`), nested paths
+/// (`N`), inherent and trait impls (`M`, `X`) and back-references (`B`, shown as `…`). Generic
+/// arguments, punycode and the rest give `None`, and the name is shown mangled.
+struct V0<'a> {
+    s: &'a [u8],
+    at: usize,
+}
+
+impl V0<'_> {
+    fn next(&mut self) -> Option<u8> {
+        let c = *self.s.get(self.at)?;
+        self.at += 1;
+        Some(c)
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.s.get(self.at).copied()
+    }
+
+    /// A base-62 number up to its `_`.
+    fn base62(&mut self) -> Option<()> {
+        loop {
+            match self.next()? {
+                b'_' => return Some(()),
+                c if c.is_ascii_alphanumeric() => {}
+                _ => return None,
+            }
+        }
+    }
+
+    /// An optional disambiguator, `s` and a base-62 number.
+    fn disambiguator(&mut self) -> Option<()> {
+        if self.peek() == Some(b's') {
+            self.at += 1;
+            self.base62()?;
+        }
+        Some(())
+    }
+
+    /// An identifier: its disambiguator, its length, an `_` if the bytes start with a digit or
+    /// `_`, and the bytes.
+    fn ident(&mut self) -> Option<String> {
+        self.disambiguator()?;
+        let start = self.at;
+        while self.peek()?.is_ascii_digit() {
+            self.at += 1;
+        }
+        let len: usize = std::str::from_utf8(&self.s[start..self.at])
+            .ok()?
+            .parse()
+            .ok()?;
+        if self.peek() == Some(b'_') {
+            self.at += 1;
+        }
+        let bytes = self.s.get(self.at..self.at + len)?;
+        self.at += len;
+        String::from_utf8(bytes.to_vec()).ok()
+    }
+
+    /// A path, as its segments.
+    fn path(&mut self) -> Option<Vec<String>> {
+        match self.next()? {
+            b'C' => Some(vec![self.ident()?]),
+            b'N' => {
+                let namespace = self.next()?;
+                let mut parts = self.path()?;
+                let ident = self.ident()?;
+                parts.push(match namespace {
+                    b'C' => "{closure}".to_string(),
+                    _ if ident.is_empty() => format!("{{{}}}", namespace as char),
+                    _ => ident,
+                });
+                Some(parts)
+            }
+            b'M' => {
+                self.disambiguator()?;
+                let mut parts = self.path()?;
+                let ty = self.path()?;
+                parts.push(format!("<{}>", ty.join("::")));
+                Some(parts)
+            }
+            b'X' => {
+                self.disambiguator()?;
+                let _impl_parent = self.path()?;
+                let ty = self.path()?;
+                let tr = self.path()?;
+                Some(vec![format!("<{} as {}>", ty.join("::"), tr.join("::"))])
+            }
+            b'B' => {
+                self.base62()?;
+                Some(vec!["…".to_string()])
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The immediate a `sub rsp, …` or `mov eax, …` holds.
 fn immediate(operand: &str) -> Option<u64> {
     let operand = operand.trim();
@@ -453,7 +583,22 @@ fn direct_target(operands: &str) -> Option<u64> {
     u64::from_str_radix(hex, 16).ok()
 }
 
-/// The loader's functions, from its link map's symbols and its disassembly.
+/// Whether the function named `mangled` is the measurement's own (the loader's `measure` module
+/// and the `stackdepth` rules), which the normal and bench loaders do not hold: its frames, the
+/// calibration's 64 KiB among them, are left out of the chain.
+fn is_measurement(mangled: &str) -> bool {
+    mangled.contains("11origin_boot7measure") || mangled.contains("16origin_boot_uefi10stackdepth")
+}
+
+/// Whether the function named `mangled` is a stack probe: it walks down a frame its caller is
+/// about to take, and puts nothing of its own below it, so its frame counts as none.
+fn is_probe(mangled: &str) -> bool {
+    mangled.contains("probestack") || mangled.contains("chkstk")
+}
+
+/// The loader's functions, from its link map's symbols and its disassembly. The measurement's own
+/// functions keep their place, so no instruction is given to another function, but have no frame
+/// and no calls.
 fn functions(symbols: &[(u64, String)], insns: &[Insn]) -> Vec<Function> {
     let starts: Vec<u64> = symbols.iter().map(|(a, _)| *a).collect();
     let index_of = |at: u64| match starts.binary_search(&at) {
@@ -496,13 +641,18 @@ fn functions(symbols: &[(u64, String)], insns: &[Insn]) -> Vec<Function> {
             calls.dedup();
             tails.sort_unstable();
             tails.dedup();
+            let measurement = is_measurement(name);
             Function {
                 name: demangle(name),
                 start: *start,
-                frame: 8 + prologue(&body),
-                calls,
-                tails,
-                indirect,
+                frame: if measurement || is_probe(name) {
+                    0
+                } else {
+                    8 + prologue(&body)
+                },
+                calls: if measurement { Vec::new() } else { calls },
+                tails: if measurement { Vec::new() } else { tails },
+                indirect: indirect && !measurement,
             }
         })
         .collect()
@@ -651,7 +801,10 @@ fn static_chain(efi: &Path, map: &Path) -> Result<Chain> {
 pub(crate) fn run(settings: &Settings) -> Result {
     let started = Instant::now();
     clippy()?;
-    let normal_kernel = read_file(&crate::pack_kernel(&crate::build_kernel()?)?)?;
+    let unsigned = crate::pack_kernel(&crate::build_kernel()?)?;
+    let normal_kernel = read_file(&unsigned)?;
+    let (trusted, _) = crate::test_keys()?;
+    let signed_kernel = crate::sign_kernel(&unsigned, &trusted, "KERNEL.signed.ONBF")?;
     let (_, bench_kernel) = bench::build()?;
     let bench_kernel = read_file(&bench_kernel)?;
     let mut chains = Vec::new();
@@ -665,11 +818,11 @@ pub(crate) fn run(settings: &Settings) -> Result {
         .clear();
     let mut rented = settings.clone();
     rented.cpu = RENTED_CPU.to_string();
-    for (scenario, is_bench) in scenarios() {
-        let kernel = if is_bench {
-            &bench_kernel
-        } else {
-            &normal_kernel
+    for (scenario, which) in scenarios() {
+        let kernel = match which {
+            Kernel::Unsigned => &normal_kernel,
+            Kernel::Signed => &signed_kernel,
+            Kernel::Bench => &bench_kernel,
         };
         let settings = if scenario.label == RENTAL {
             &rented
@@ -758,7 +911,7 @@ fn report(boots: &[Boot], chains: &[(bool, Chain)]) -> Vec<String> {
             .map(|(name, frame)| format!("{name} {frame}"))
             .collect();
         lines.push(format!(
-            "xtask: stack-depth: static, the {} measurement loader: efi_main's own frame {} bytes (above the paint's top); the longest chain of its own frames over direct calls {} bytes in {} functions (those of 512 bytes or more: {}); its deepest indirect call (the firmware, or a function pointer) at {} bytes, through {} functions; {}",
+            "xtask: stack-depth: static, the {} measurement loader: efi_main's own frame {} bytes (above the paint's top); the longest chain of the loader's own frames as their prologues reserve them, over direct calls and with the measurement's own functions left out, {} bytes in {} functions (those of 512 bytes or more: {}); the deepest of its indirect calls (into the firmware, or through a function pointer) {} bytes down, through {} functions; {}",
             if *bench { "bench" } else { "normal" },
             chain.entry_frame,
             chain.longest,
@@ -834,7 +987,7 @@ origin-boot: stack measure: P5 the page tables and the table walks: 9000 bytes o
             ": WRONG",
         );
         let err = read_boot(NORMAL, &[&wrong, com2]).unwrap_err();
-        assert!(err.contains("SD-4"), "{err}");
+        assert!(err.contains("positive control"), "{err}");
         // SD-1: no paint, no calibration line.
         let err = read_boot(NORMAL, &[&com1.replace("calibration", "x"), com2]).unwrap_err();
         assert!(err.contains("no calibration line"), "{err}");
@@ -877,6 +1030,32 @@ origin-boot: stack measure: P5 the page tables and the table walks: 9000 bytes o
             "<T as core::convert::Into<U>>::into"
         );
         assert_eq!(demangle("efi_main"), "efi_main");
+        // v0, as the pinned toolchain mangles (TASKS item 127's first run's map).
+        assert_eq!(
+            demangle("_RNvNtCs4M7Mb8By6Ar_13origin_crypto5mldsa14mldsa87_verify"),
+            "origin_crypto::mldsa::mldsa87_verify"
+        );
+        assert_eq!(
+            demangle("_RNvMs0_NtCs8DCFvQcYz5U_11onbf_format9signatureNtB5_14SignatureBlock5parse"),
+            "onbf_format::signature::<…::SignatureBlock>::parse"
+        );
+        assert_eq!(
+            demangle("_RNvCs5WqGp7zLRnA_7___rustc17___rust_probestack"),
+            "__rustc::__rust_probestack"
+        );
+        // Generic arguments are not read: the name stays mangled.
+        let generic = "_RINvNtCsf2a0OcjqUyK_16origin_boot_uefi4spcr4walkNCNvCs1crPuf7B2wz_11origin_boot4bootsd_0EBO_";
+        assert_eq!(demangle(generic), generic);
+        assert!(is_measurement(
+            "_RNvNtCs1crPuf7B2wz_11origin_boot7measure9calibrate"
+        ));
+        assert!(is_measurement(
+            "_RNvNtCsf2a0OcjqUyK_16origin_boot_uefi10stackdepth4scan"
+        ));
+        assert!(!is_measurement(
+            "_RNvCs1crPuf7B2wz_11origin_boot16find_framebuffer"
+        ));
+        assert!(is_probe("_RNvCs5WqGp7zLRnA_7___rustc17___rust_probestack"));
     }
 
     #[test]

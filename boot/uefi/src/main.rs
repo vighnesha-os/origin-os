@@ -2113,7 +2113,10 @@ mod measure {
     }
 
     /// At entry, `top` being `efi_main`'s RSP: paints the stack UEFI promises, calibrates the
-    /// scan on a known array, and paints again for the first phase.
+    /// scan on a known array, and paints again for the first phase. Each hook is kept out of line,
+    /// so the frames of the functions that call it are those of the normal loader as nearly as
+    /// a build with calls in them can be.
+    #[inline(never)]
     pub(super) fn begin(top: u64) {
         TOP.store(top, Ordering::Relaxed);
         if paint().is_none() {
@@ -2127,6 +2130,7 @@ mod measure {
     }
 
     /// The calibration's line, through the firmware's console.
+    #[inline(never)]
     pub(super) fn say_calibration(out: &mut ConOut) {
         let expected = CALIBRATED.load(Ordering::Relaxed);
         if expected == 0 {
@@ -2140,6 +2144,7 @@ mod measure {
     /// The end of `phase`: its depth, its line through the firmware's console, and a fresh paint
     /// below the current RSP for the next phase. The line is written before the paint, so its
     /// own stack is not counted in the next phase.
+    #[inline(never)]
     pub(super) fn phase_end(phase: Phase, out: &mut ConOut) {
         let Some(depth) = scan() else {
             return;
@@ -2151,6 +2156,7 @@ mod measure {
 
     /// The last phase, just before the first call: its line and the summary go straight to the
     /// SPCR's UART, after the last memory map, so no firmware call changes the map's key.
+    #[inline(never)]
     pub(super) fn before_call(early_uart: EarlyUart) {
         if let Some(depth) = scan() {
             note(Phase::Call, depth);
