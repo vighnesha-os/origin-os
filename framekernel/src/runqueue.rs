@@ -656,7 +656,15 @@ impl<R: Copy> RunQueue<R> {
     /// after it.
     #[inline]
     pub fn held(&self, slot: usize) -> Option<R> {
-        self.record.get(slot).copied().flatten()
+        let held = self.record.get(slot).copied().flatten();
+        // What makes the read without the state right: every path that frees a slot clears its
+        // record (an exit, a departure), a push fills both together, and a refused push or arrival
+        // changes neither. The randomized test against a model holds it after every step.
+        debug_assert!(
+            held.is_none() || self.state.get(slot) != Some(&State::Free),
+            "a free slot kept a record"
+        );
+        held
     }
 
     /// Whether `slot`'s thread holds a wake-up that came before it blocked, which its next
@@ -2177,8 +2185,16 @@ mod tests {
                 assert_eq!(is, s.is, "{at}: slot {i}'s state");
                 if s.is == Is::Free {
                     assert_eq!(q.record(i), None, "{at}: free slot {i}'s record");
+                    // Read without the state too, as a wake-up's record check reads it (TASKS
+                    // item 96): every path that frees a slot clears its record.
+                    assert_eq!(q.held(i), None, "{at}: free slot {i} kept a record");
                     continue;
                 }
+                assert_eq!(
+                    q.held(i),
+                    s.record,
+                    "{at}: slot {i}'s record, read without its state"
+                );
                 assert_eq!(q.pass[i], s.pass, "{at}: slot {i}'s pass");
                 assert_eq!(q.weight[i], s.weight, "{at}: slot {i}'s weight");
                 assert_eq!(
