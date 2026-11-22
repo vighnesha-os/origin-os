@@ -5571,6 +5571,29 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Dependencies:** none new. **Licence:** MIT OR Apache-2.0. **Firmware and data:** none.
 - **Known limits:** QEMU only, and CI's KVM as it draws runners (CLAUDE.md §74). A timer from about 3.4 times fast whose reload a stall inside an intermediate read hides still passes the count; delivery fails it unless recurring stalls also mask its total (ADR-0013's stated limit, now corrected). The rest of TASKS item 78 is to follow.
 
+## TASKS item 130: the rental tool reads a minimal boot from the firmware's starts (2026-11-22)
+
+- **What:**
+  - **`developer-tools/bench/latitude.py`:**
+    - `read_runs`, `firmware_after`, `restart_start`, `figures`, `window_s`, `boot_over`, `describe` and `runs_summary`: a bench image's runs read from the firmware's starts, with each restart of the tool's own accounted for;
+    - the loop's windows from the firmware's measured delays, and `restarted_at` recorded;
+    - the record draft's "Runs" row;
+    - `boot_result` and `after_last_line` corrected;
+    - the `reread` command.
+  - **`developer-tools/bench/test_latitude.py`:** five new tests, three rewritten, two adjusted.
+  - **`developer-tools/bench/fixtures/`:** rental G's console, its arrival times and the tool's restart times, for the replay test.
+- **Authoring agent:** the Claude Code session that wrote TASKS items 127 and 128 and rental G's findings (Claude Opus 5.5), a side session of the coordinating session, on its brief of 2026-11-22.
+- **Sources:** Origin's own tool and rental G's console, with rentals E's and F's for comparison. Python's standard library only. No API page was read: nothing that talks to the API changed.
+- **The fixture's data:** the machine's own output on rental G (2026-11-22), the AMI firmware's text and Origin's loader's lines, as the record's log carries them, with the terminal's control sequences kept.
+  - The provider's own system's output is blanked to spaces, byte for byte, and one NUL the firmware sent is a space.
+  - The scan found no IP or MAC address, GUID, server ID or serial (item 232).
+  - The arrival times are the capture's own; the restart times are from the coordinating session's run log.
+- **Open-source references consulted (§3, §6):** none. No operating system's or other project's source was read.
+- **Dependencies:** none new; Python's standard library.
+- **Licensing:** MIT OR Apache-2.0 (the workspace's).
+- **Test evidence:** 45 offline tests under `python3 -I`, none of which sends a request. Eight planted faults each failed at least one (TASKS item 130's entry).
+- **Review:** none yet. No person has reviewed it.
+
 ## TASKS item 128: the minimal-program mode and Amendment 4's addition, in the bench loader (2026-11-22)
 
 - **What:**

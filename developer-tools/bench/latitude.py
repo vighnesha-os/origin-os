@@ -44,6 +44,7 @@ Commands:
                              rental B: put Origin's loader where the firmware's first boot
                              entry points, boot it, capture each boot's verdict, delete it.
                              C must contain IDENTITY_MAPS_COMMIT (item 229)
+  reread DIR [--restarts F]  read a rental's runs again from its console; no request
   status                     the bench servers that exist now, and the ledger
   delete SERVER_ID           delete one server
   reap [--yes]               delete every server whose hostname starts with origin-bench-
@@ -1088,16 +1089,33 @@ LOADER_START = "UEFI loader (build"
 TIMES_FILE = "sol-times.log"
 # How many boots a rental B makes and how long each may take, unless the command line says.
 BOOTS, BOOT_MINUTES = 3, 8
-# Owner item 350 ("One more, then pause"): rental G, the minimal mode's, is the last rental for a
-# while, so it uses the paid hour for about six boots. A minimal-mode boot resets within seconds
-# of its call or hangs: on rental F the firmware's first line came 6.6 to 7.1 s after the control's
-# reset, and the call came 87 s (boot 3) to about 110 s (boot 2) after the tool's restart, the
-# control first. So it ends when a run after a reset reaches its own call, or MINIMAL_HANG_MINUTES
-# after its last call with no loader since (a hang), or at MINIMAL_BOOT_MINUTES.
-MINIMAL_BOOTS, MINIMAL_BOOT_MINUTES, MINIMAL_HANG_MINUTES = 6, 5, 3
+# Owner item 350 ("One more, then pause") gave the minimal mode about six boots in the paid hour,
+# each ending at its answer. TASKS item 130: a boot's window comes from the firmware's own
+# delays, not a fixed five minutes, since they differ by revision: from a reset to the firmware's
+# first byte, 6.6 to 7.1 s on rental F's 2.5 and 48.3 to 48.9 s on rental G's 2.4a, where a
+# five-minute boot ended before the run after each call's reset. Until a rental has measured its
+# own, the plan and the first boot take rental G's, the slowest seen: a reset to the firmware's
+# first byte (PLAN_START_S), that byte to the loader's banner (PLAN_LOAD_S), and the tool's
+# restart to the firmware's first byte (PLAN_RESTART_S).
+MINIMAL_BOOTS = 6
+PLAN_START_S, PLAN_LOAD_S, PLAN_RESTART_S = 49.0, 55.0, 68.0
+# A call with no firmware byte after its mark is a hang once the firmware's measured start delay
+# and HANG_EXTRA_S more have passed. SLACK_S closes a boot's window. A run whose banner comes
+# less than RESTART_BANNER_MIN_S after one of the tool's restarts cannot be that restart's: no
+# firmware seen starts a program that soon (rental F's took about a minute, rental G's two).
+HANG_EXTRA_S, SLACK_S, RESTART_BANNER_MIN_S = 45.0, 15.0, 30.0
 # What the boots leave of --max-minutes: the setup before boot 1 (rental F's took 75 s; the console
 # alone may wait five minutes), and the time before the deadline after which no boot starts.
 SETUP_MINUTES, LOOP_STOP_MINUTES = 5, 10
+# TASKS item 130: what the serial-over-LAN client itself writes into the capture when its session
+# fails and is opened again (rentals E and G). It is never the machine's.
+CLIENT = re.compile(rb"\[SOL Session operational[^\]\r\n]*\]|Error: No response[^\r\n]*"
+                    rb"|ERROR: Received message[^\r\n]*")
+# A bench loader's mark, straight to the UART before the call: X, or Y before a retry.
+MARK_AT = re.compile(rb"[ \t]*([XY])\r?\n")
+MARKS = re.compile(rb"\n([XY])\r?\n")
+PMXC0 = re.compile(rb"PMxC0 (0x[0-9a-fA-F]{8})")
+CONTROL_TEXT = b"the control:"
 
 
 def minimal_image(data):
@@ -1106,38 +1124,243 @@ def minimal_image(data):
     return MINIMAL_BUILD_LINE.encode() in data
 
 
+def plain(x):
+    """A figure as the plan prints it: 40, or 39.8."""
+    return f"{round(x, 1):g}"
+
+
+def window_s(fig):
+    """TASKS item 130: the longest a minimal-mode boot needs from the tool's restart, from the
+    firmware's delays `fig`: the restart to the first run's banner, the control's reset to the
+    second run's, then either the call's reset to a third run's banner or the wait that calls the
+    call a hang, whichever is longer, and SLACK_S."""
+    d, l, r = fig["start"], fig["load"], fig["restart"]
+    return r + l + (d + l) + max(d + l, d + HANG_EXTRA_S) + SLACK_S
+
+
+PLAN_FIGURES = {"start": PLAN_START_S, "load": PLAN_LOAD_S, "restart": PLAN_RESTART_S}
+
+
 def boot_plan(minimal, boots, boot_minutes, max_minutes):
-    """Owner item 350: rental B's boots and each boot's limit in minutes, from the image and the
-    command line (None where it gave none), and why they do not fit, or None. Every boot must end
-    before the loop stops starting boots, LOOP_STOP_MINUTES before the deadline, with
-    SETUP_MINUTES before boot 1; the deletion then comes well inside --max-minutes."""
+    """Rental B's boots and each boot's limit in minutes, from the image and the command line
+    (None where it gave none), and why they do not fit, or None. A minimal-mode image's limit is
+    its window at the planning figures (TASKS item 130); in the rental each boot's window is then
+    the firmware's own. Every boot must end before the loop stops starting boots,
+    LOOP_STOP_MINUTES before the deadline, with SETUP_MINUTES before boot 1; the deletion then
+    comes well inside --max-minutes (owner item 350)."""
     boots = boots or (MINIMAL_BOOTS if minimal else BOOTS)
-    boot_minutes = boot_minutes or (MINIMAL_BOOT_MINUTES if minimal else BOOT_MINUTES)
+    boot_minutes = boot_minutes or (round(window_s(PLAN_FIGURES) / 60, 1) if minimal else BOOT_MINUTES)
     need, room = SETUP_MINUTES + boots * boot_minutes, max_minutes - LOOP_STOP_MINUTES
-    if need > room:
-        return boots, boot_minutes, (f"{boots} boots of up to {boot_minutes} minutes, with "
-                                     f"{SETUP_MINUTES} for the setup, need {need} minutes; "
+    if need > room + 1e-9:
+        return boots, boot_minutes, (f"{boots} boots of up to {plain(boot_minutes)} minutes, with "
+                                     f"{SETUP_MINUTES} for the setup, need {plain(need)} minutes; "
                                      f"--max-minutes {max_minutes} leaves {room} before the boots stop")
     return boots, boot_minutes, None
 
 
-def minimal_boot_over(raw, times, at):
-    """Owner item 350: whether a minimal-mode boot has shown its answer by time `at`, from its raw
-    console bytes and their arrival times `[(time, size)]`: a run after a reset reached its own
-    call, so the reset came and that run read its registers; or MINIMAL_HANG_MINUTES have passed
-    since the boot's last call with no loader started since, a hang. The control's run makes no
-    call, so its reset counts for neither."""
-    calls = raw.count(MINIMAL_LAST_LINE)
-    if calls >= 2:
+def arrival(times, offset):
+    """When the console's byte at `offset` arrived, from `[(time, size)]`, or None."""
+    return next((t for t, size in times if size > offset), None)
+
+
+def firmware_after(raw, offset, limit=None):
+    """The offset of the first byte from `offset` on, and before `limit`, that is neither white
+    space nor the serial-over-LAN client's own message, or None. After a run's last byte, Origin's
+    loader writes nothing more, so this is the firmware starting again (TASKS item 130)."""
+    pos, limit = offset, len(raw) if limit is None else min(limit, len(raw))
+    while pos < limit:
+        if raw[pos] in b" \t\r\n\x00":
+            pos += 1
+            continue
+        client = CLIENT.match(raw, pos)
+        if client:
+            pos = client.end()
+            continue
+        return pos
+    return None
+
+
+def restart_start(raw, times, restarted, banner):
+    """When the firmware began after one of the tool's restarts, for the run whose banner came at
+    `banner`: the first byte after the longest silence that ends between the restart and the
+    banner. A restart lands some seconds after it is issued, and a start it cuts short may print
+    until then (rental G's boots 5 and 6); the machine is then silent for the firmware's whole
+    start delay, longer than any pause inside a start."""
+    seen, prev = [], 0
+    for t, size in times:
+        if t > banner:
+            break
+        if firmware_after(raw, prev, size) is not None:
+            seen.append(t)
+        prev = size
+    gaps = [(b - a, b) for a, b in zip(seen, seen[1:]) if b > restarted]
+    return max(gaps)[1] if gaps else None
+
+
+def read_runs(raw, times, restarts=(), until=None):
+    """TASKS item 130: a bench image's loader runs, read from the console's raw bytes, their
+    arrival times `[(time, size)]` and the times the tool restarted the machine, the first of
+    them the restart before the first run. The firmware's starts carry the answer, not the
+    loader's: after a reset the firmware prints for a minute or more before the next banner, so
+    counting banners misses a reset that came late in a boot (rental G).
+
+    Each run is a dict: `banner` (when its banner came), `pmxc0` (as it printed it), `branch`
+    (`control`, `call` with its `marks`, or `other`), `end` (when its last byte came: the mark,
+    for a call), `start` (when the firmware start it ran in began, if seen), `next` (when the
+    firmware's next byte came) and `answer`:
+    - `reset`, with `after_s`: the firmware started again that long after the run's last byte;
+    - `overtaken`, with `restart_s` (negative: before the last byte): the first of the tool's
+      restarts since the run's firmware began came before anything followed the run, and before
+      the firmware's measured start delay and HANG_EXTRA_S had passed, so whose reset came first
+      cannot be told. Never read as a reset or as none;
+    - `none`, with `waited_s`: nothing for the firmware's measured start delay and HANG_EXTRA_S
+      after the last byte, before that restart or by `until`;
+    - `pending`: not yet."""
+    restarts = sorted(restarts)
+    banners = [m.start() for m in re.finditer(re.escape(LOADER_START.encode()), raw)]
+    runs = []
+    for i, at in enumerate(banners):
+        stop = banners[i + 1] if i + 1 < len(banners) else len(raw)
+        last = raw.rfind(LOADER_LINE.encode(), at, stop)
+        end = raw.find(b"\n", last if last >= 0 else at, stop)
+        end = stop if end < 0 else end + 1
+        mark = MARK_AT.match(raw, end)
+        if mark and mark.end() <= stop:
+            end = mark.end()
+        text = raw[at:end]
+        marks = "".join(m.group(1).decode() for m in MARKS.finditer(raw, max(at - 1, 0), end))
+        cause = PMXC0.search(text)
+        nxt = firmware_after(raw, end)
+        runs.append({"banner": arrival(times, at), "pmxc0": cause.group(1).decode() if cause else None,
+                     "branch": "call" if marks else "control" if CONTROL_TEXT in text else "other",
+                     "marks": marks, "end": arrival(times, end - 1),
+                     "next": None if nxt is None else arrival(times, nxt)})
+    # Where each run's firmware began: after the previous run's reset, or after a restart of the
+    # tool's that came between that reset and this banner, early enough to have started it.
+    for i, run in enumerate(runs):
+        if i == 0:
+            run["start"] = None
+            continue
+        run["start"] = runs[i - 1]["next"]
+        later = [r for r in restarts if run["start"] is not None and run["banner"] is not None
+                 and run["start"] <= r <= run["banner"] - RESTART_BANNER_MIN_S]
+        if later:
+            run["start"] = restart_start(raw, times, later[-1], run["banner"])
+            run["restarted"] = later[-1]
+    # The first restart of the tool's since the run's firmware began decides what may be read:
+    # a firmware byte before it is the run's own reset; nothing before it is a hang only if the
+    # restart came after the firmware's start delay and HANG_EXTRA_S had passed, and is otherwise
+    # overtaken, never "none".
+    firsts = []
+    for i, run in enumerate(runs):
+        since = run["start"] if i else run["banner"]
+        firsts.append(next((r for r in restarts if since is not None and r >= since), None))
+
+    def own_reset(run, first):
+        return run["next"] is not None and run["end"] is not None and (
+            first is None or run["next"] <= first)
+
+    delays = [run["next"] - run["end"] for run, first in zip(runs, firsts)
+              if run["branch"] == "control" and own_reset(run, first)]
+    hang = max(delays, default=PLAN_START_S) + HANG_EXTRA_S
+    for run, first in zip(runs, firsts):
+        end = run["end"]
+        if end is None:
+            run["answer"] = "pending"
+        elif own_reset(run, first):
+            run["answer"], run["after_s"] = "reset", round(run["next"] - end, 1)
+        elif first is not None and first - end >= hang:
+            run["answer"], run["waited_s"] = "none", round(first - end, 1)
+            run["then_restarted"] = first
+        elif first is not None:
+            run["answer"], run["by"] = "overtaken", first
+            run["restart_s"] = round(first - end, 1)
+        elif until is not None and until - end >= hang:
+            run["answer"], run["waited_s"] = "none", round(until - end, 1)
+        else:
+            run["answer"] = "pending"
+    return runs
+
+
+def figures(runs, restarts=()):
+    """The firmware's own delays as the runs show them, each the longest seen, or the planning
+    figure where none was (TASKS item 130): `start`, a control's last byte to the firmware's next;
+    `load`, the firmware's first byte to the loader's banner; `restart`, one of the tool's restarts
+    to the firmware's first byte, where that restart overtook no run."""
+    start = [r["after_s"] for r in runs if r["branch"] == "control" and r.get("answer") == "reset"]
+    load = [round(r["banner"] - r["start"], 1) for r in runs
+            if r.get("start") is not None and r["banner"] is not None]
+    overtaking = {r["by"] for r in runs if "by" in r}
+    restart = [round(r["start"] - r["restarted"], 1) for r in runs
+               if "restarted" in r and r["start"] is not None and r["restarted"] not in overtaking]
+    # After a hang the restart's start is the next run's: nothing else was running.
+    restart += [round(r["start"] - before["then_restarted"], 1) for before, r in zip(runs, runs[1:])
+                if "then_restarted" in before and r["start"] is not None]
+    return {"start": max(start, default=PLAN_START_S), "load": max(load, default=PLAN_LOAD_S),
+            "restart": max(restart, default=PLAN_RESTART_S)}
+
+
+def describe(run):
+    """One run, as a boot's summary and `reread` print it."""
+    seen = f" (PMxC0 {run['pmxc0']})" if run["pmxc0"] else ""
+    what = {"control": f"the control{seen}", "call": f"a call{seen}, {run['marks']}",
+            "other": f"a run with neither control nor call{seen}"}[run["branch"]]
+    after = "its line" if run["branch"] != "call" else "its mark"
+    answer = run["answer"]
+    if answer == "reset":
+        return f"{what}, then the firmware again {plain(run['after_s'])} s after {after}"
+    if answer == "overtaken":
+        s = run["restart_s"]
+        return (f"{what}; the tool's restart came {plain(abs(s))} s {'before' if s < 0 else 'after'} "
+                f"{after}, before anything followed it: undetermined")
+    if answer == "none":
+        return f"{what}, then nothing for {plain(run['waited_s'])} s: no reset"
+    return f"{what}; no answer yet"
+
+
+def runs_summary(runs):
+    """The whole rental's runs in a sentence: how many calls the firmware followed with a reset,
+    how many the tool's own restarts overtook, how many hung, and the controls' delays."""
+    def spread(values):
+        return (f"{plain(min(values))} to {plain(max(values))} s" if len(set(values)) > 1
+                else f"{plain(values[0])} s")
+    calls = [r for r in runs if r["branch"] == "call"]
+    controls = [r for r in runs if r["branch"] == "control"]
+    judged = [r for r in calls if r["answer"] in ("reset", "none")]
+    reset = [r["after_s"] for r in calls if r["answer"] == "reset"]
+    out = [f"calls: {len(calls)}: a reset after {len(reset)} of the {len(judged)} the tool's "
+           f"restarts did not overtake" + (f", {spread(reset)} after the mark" if reset else "")]
+    overtaken = sum(r["answer"] == "overtaken" for r in calls)
+    if overtaken:
+        out.append(f"{overtaken} overtaken by the tool's restart, undetermined")
+    hung = sum(r["answer"] == "none" for r in calls)
+    out.append(f"{hung} with nothing after {'them' if hung != 1 else 'it'}" if hung else "none hung")
+    waiting = sum(r["answer"] == "pending" for r in calls)
+    if waiting:
+        out.append(f"{waiting} with no answer yet")
+    done = [r["after_s"] for r in controls if r["answer"] == "reset"]
+    out.append(f"controls: {len(controls)}" + (f", a reset after {len(done)}, {spread(done)} after "
+                                               f"the line" if done else ""))
+    return "; ".join(out)
+
+
+def boot_over(runs, first, at):
+    """TASKS item 130: whether a minimal-mode boot, whose runs are `runs[first:]`, has its answer
+    at time `at`: its call hung, or the firmware started again after its call and the next run
+    has read its registers, or that next run has not come within the measured load delay and
+    SLACK_S of the restart. The control's reset alone answers nothing."""
+    mine = runs[first:]
+    call = next((r for r in mine if r["branch"] == "call"), None)
+    if call is None:
+        return False
+    if call["answer"] == "none":
         return True
-    if calls == 0:
+    if call["answer"] != "reset":
         return False
-    mark = raw.rfind(MINIMAL_LAST_LINE)
-    if raw.find(LOADER_START.encode(), mark) >= 0:
-        return False
-    end = mark + len(MINIMAL_LAST_LINE)
-    arrived = next((t for t, size in times if size >= end), None)
-    return arrived is not None and at - arrived >= MINIMAL_HANG_MINUTES * 60
+    later = mine[mine.index(call) + 1:]
+    if any(r["branch"] in ("control", "call") for r in later):
+        return True
+    return at - call["next"] >= figures(runs)["load"] + SLACK_S
 
 
 def resets_after_call(text):
@@ -1185,19 +1408,14 @@ def boot_result(text):
     if resets_after_call(text):
         runs = text.count(LOADER_START)
         seen["loader_runs"] = runs
-        said = (f"; loader runs: {runs}, " +
-                ("so the machine reset itself after the loader's last line" if runs > 1
-                 else "with no reset of its own"))
-        # The minimal mode's control resets the machine before any call, so its runs alone do not
-        # say whether a call was followed by a reset: a loader after the boot's first call does.
+        said = f"; loader runs: {runs}"
+        # TASKS item 130: loader runs alone never say that no reset came: the firmware prints for
+        # a minute or more after a reset before the next banner, and one of the tool's restarts
+        # may come first. Whether one came is read from the firmware's starts (`read_runs`).
         if MINIMAL_BUILD_LINE in text:
-            mark = MINIMAL_LAST_LINE.decode()
-            calls, first = text.count(mark), text.find(mark)
+            calls = text.count(MINIMAL_LAST_LINE.decode())
             seen["calls"] = calls
-            said = (f"; loader runs: {runs}, calls: {calls}, " +
-                    ("so the machine reset itself after the first call"
-                     if first >= 0 and text.find(LOADER_START, first) >= 0
-                     else "with no reset after the call" if calls else "and no call"))
+            said += f", calls: {calls}"
     verdict = next((l for l in lines if VERDICT_LINE in l or REFUSED_LINE in l), None)
     halted = next((l for l in lines if KERNEL_LINE in l and any(h in l for h in HALTED_LINES)), None)
     origin = [l for l in lines if KERNEL_LINE in l or LOADER_LINE in l]
@@ -1212,8 +1430,9 @@ def boot_result(text):
 
 def after_last_line(raw, times):
     """TASKS item 116: in one boot's raw console bytes, how many seconds after the loader's first
-    `exiting boot services` line (or the minimal mode's last line, TASKS item 128) the next byte
-    arrived, and the next loader's banner, from the
+    `exiting boot services` line (or the minimal mode's last line, TASKS item 128), and after the
+    mark that follows it (TASKS item 130), the next byte arrived, and the next loader's banner,
+    from the
     arrival times `[(time, size)]` (the console's size from the boot's start). None for what did
     not arrive within the boot. Times are good to the half second the console is sampled at."""
     end = raw.find(b"entering the Framekernel")
@@ -1223,6 +1442,11 @@ def after_last_line(raw, times):
         return None, None
     end = raw.find(b"\n", end)
     end = len(raw) if end < 0 else end + 1
+    # TASKS item 130: a bench loader's mark follows its last line at once; the next byte after
+    # the line was the mark itself ("0.0 s" on rental G), so it is measured from the mark.
+    mark = MARK_AT.match(raw, end)
+    if mark:
+        end = mark.end()
 
     def arrived(offset):
         return next((t for t, size in times if size > offset), None)
@@ -1293,16 +1517,21 @@ def cmd_rental_b(args):
         print(f"image: {args.source_revision}; loader SHA-256 {sha256(loader)}; "
               f"kernel SHA-256 {sha256(kernel)}; identity maps {IDENTITY_MAPS_COMMIT[:12]} included")
         minimal = minimal_image(loader.read_bytes())
+        args.window_given = args.boot_minutes is not None
         args.boots, args.boot_minutes, misfit = boot_plan(minimal, args.boots, args.boot_minutes,
                                                           args.max_minutes)
         if misfit:
             die(misfit)
-        print(f"boots: {args.boots}, each ending at a verdict or after {args.boot_minutes} minutes"
-              + (f", or when a run after a reset reaches its own call, or {MINIMAL_HANG_MINUTES} "
-                 f"minutes after the last call with no loader since (owner item 350)"
+        print(f"boots: {args.boots}, each ending at a verdict or after {plain(args.boot_minutes)} minutes"
+              + (f", or at its answer: the firmware starting again after the call and the next "
+                 f"run's registers read, or no firmware byte for the measured start delay and "
+                 f"{plain(HANG_EXTRA_S)} s more (owner item 350; TASKS item 130)"
+                 + ("" if args.window_given else
+                    f"; {plain(args.boot_minutes)} minutes is the window at rental G's delays, and "
+                    f"each boot's is then this firmware's own")
                  if minimal else "")
-              + f"; {SETUP_MINUTES + args.boots * args.boot_minutes} minutes at most with the setup, "
-                f"inside the {args.max_minutes - LOOP_STOP_MINUTES} before the boots stop")
+              + f"; {plain(SETUP_MINUTES + args.boots * args.boot_minutes)} minutes at most with the "
+                f"setup, inside the {args.max_minutes - LOOP_STOP_MINUTES} before the boots stop")
 
     def work(rental):
         read_machine(rental)
@@ -1343,14 +1572,33 @@ def cmd_rental_b(args):
             raise RuntimeError("no serial console: a boot would show nothing")
         results = []
         minimal = minimal_image(loader.read_bytes())
+        restarts = []
+
+        def reading():
+            """Every run so far, read from the firmware's starts (TASKS item 130)."""
+            return read_runs(console.path.read_bytes(), read_times(rental.dir / TIMES_FILE, 0),
+                             restarts, now())
+
+        def first_run(runs, restarted):
+            """The index of the boot's first run: the first whose firmware began after its restart."""
+            return next((i for i, r in enumerate(runs) if r["banner"] is not None
+                         and r["banner"] >= restarted + RESTART_BANNER_MIN_S
+                         and (r["start"] is None or r["start"] >= restarted)), len(runs))
 
         def look(start):
-            """One boot's result so far; a minimal-mode boot ends at its answer (owner item 350)."""
+            """One boot's result so far; a minimal-mode boot ends at its answer (owner item 350,
+            TASKS item 130)."""
             result = boot_result(console.text(start))
             if minimal and not result["ended"]:
-                result["ended"] = minimal_boot_over(console.path.read_bytes()[start:],
-                                                    read_times(rental.dir / TIMES_FILE, start), now())
+                runs = reading()
+                result["ended"] = boot_over(runs, first_run(runs, restarts[-1]), now())
             return result
+
+        def window():
+            """This boot's limit in seconds: the command line's, or the firmware's own delays."""
+            if not minimal or args.window_given:
+                return args.boot_minutes * 60
+            return window_s(figures(reading(), restarts))
 
         try:
             for boot in range(1, args.boots + 1):
@@ -1360,13 +1608,21 @@ def cmd_rental_b(args):
                 else:
                     api("POST", f"/servers/{rental.server_id}/actions",
                         {"data": {"type": "actions", "attributes": {"action": "reboot"}}})
+                restarts.append(now())
                 print(f"{stamp()} boot {boot} of {args.boots}: restarting")
-                limit = min(now() + args.boot_minutes * 60, rental.deadline - 300)
+                limit = min(now() + window(), rental.deadline - 300)
                 result = look(start)
                 while not result["ended"] and now() < limit:
                     time.sleep(10)
                     result = look(start)
-                result.update(boot=boot, start=start, end=console.size())
+                result.update(boot=boot, start=start, end=console.size(), restarted_at=restarts[-1])
+                # TASKS item 130: every bench image that resets after its call is read from the
+                # firmware's starts; only the minimal mode's boots end at their answer.
+                if minimal or resets_after_call(console.text(start)):
+                    runs = reading()
+                    mine = runs[first_run(runs, restarts[-1]):]
+                    result["runs"] = mine
+                    result["summary"] += "; runs: " + ("; ".join(describe(r) for r in mine) or "none")
                 if resets_after_call(console.text(start)):
                     raw = console.path.read_bytes()[start:result["end"]]
                     first, loader_again = after_last_line(raw, read_times(rental.dir / TIMES_FILE, start))
@@ -1408,6 +1664,17 @@ def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def runs_row(rental, results):
+    """TASKS item 130: the record's sentence on every run of the rental, read from the
+    firmware's starts, for a minimal-mode image's boots."""
+    if not rental.console or not any("runs" in r for r in results):
+        return []
+    restarts = [r["restarted_at"] for r in results if "restarted_at" in r]
+    runs = read_runs(rental.console.path.read_bytes(), read_times(rental.dir / TIMES_FILE, 0),
+                     restarts, now())
+    return [("Runs", runs_summary(runs))]
+
+
 def write_record(args, rental, results):
     """A draft of the hardware record (the requirements gate's form) and a redacted console log,
     both in the rental's directory and both redacted (item 232). A person reads them before
@@ -1436,6 +1703,7 @@ def write_record(args, rental, results):
                             f"{sha256(Path(args.image_dir) / 'KERNEL.ONBF')}"),
         ("Date", date),
         ("Result", "; ".join(f"boot {r['boot']}: {r['summary']}" for r in results) or "no boot ran"),
+        *runs_row(rental, results),
         ("Scope", scope_row(origin, lscpu) + ". Bench equipment: it qualifies nothing and "
                   "supports no hardware claim (CLAUDE.md §74, §76, rules 30 and 40; item 233)"),
         ("Environment", "A physical machine with no hypervisor; the provider's firmware and BMC"),
@@ -1454,6 +1722,40 @@ def write_record(args, rental, results):
     # address and MAC, say.
     (rental.dir / "record-draft.md").write_text(redact(draft, rental.server_id, [rental.ip]))
     print(f"{stamp()} record draft: {rental.dir / 'record-draft.md'}")
+
+
+def when(text):
+    """A time as `reread` takes it: Unix seconds, or UTC as 2026-11-22T09:06:48Z."""
+    try:
+        return float(text)
+    except ValueError:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+
+
+def cmd_reread(args):
+    """TASKS item 130: reads a rental's runs again from its directory, and sends no request:
+    the console, its arrival times, and the tool's restarts from `boots.json`, or from
+    `--restarts` (one time a line) for a rental whose `boots.json` predates them."""
+    d = Path(args.dir)
+    raw, times = (d / "sol.log").read_bytes(), read_times(d / TIMES_FILE, 0)
+    if args.restarts:
+        restarts = [when(t) for t in Path(args.restarts).read_text().split()]
+    else:
+        restarts = [b["restarted_at"] for b in json.loads((d / "boots.json").read_text())
+                    if "restarted_at" in b]
+        if not restarts:
+            die(f"{d / 'boots.json'} holds no restart times: give them with --restarts")
+    until = when(args.until) if args.until else (times[-1][0] if times else None)
+    runs = read_runs(raw, times, restarts, until)
+    for i, run in enumerate(runs, 1):
+        banner = ("-" if run["banner"] is None else
+                  datetime.fromtimestamp(run["banner"], timezone.utc).strftime("%H:%M:%S.%f")[:-5])
+        print(f"run {i} ({banner}): {describe(run)}")
+    fig = figures(runs, restarts)
+    print(runs_summary(runs))
+    print(f"the firmware's delays: a reset to its first byte {plain(fig['start'])} s, that byte to "
+          f"the banner {plain(fig['load'])} s, a restart to its first byte {plain(fig['restart'])} s; "
+          f"a minimal-mode boot's window {plain(window_s(fig) / 60)} minutes")
 
 
 def main():
@@ -1487,8 +1789,13 @@ def main():
                            help=f"how many boots (default {BOOTS}; {MINIMAL_BOOTS} for the minimal "
                                 f"mode, owner item 350)")
             p.add_argument("--boot-minutes", type=int, choices=range(1, 31),
-                           help=f"how long one boot may take (default {BOOT_MINUTES}; "
-                                f"{MINIMAL_BOOT_MINUTES} for the minimal mode)")
+                           help=f"how long one boot may take (default {BOOT_MINUTES}; for the "
+                                f"minimal mode, the firmware's own delays, TASKS item 130)")
+    p = sub.add_parser("reread")
+    p.add_argument("dir", help="a rental's directory under ~/.local/state/origin-bench")
+    p.add_argument("--restarts", help="a file of the tool's restart times, one a line")
+    p.add_argument("--until", help="when the console was last watched (default: its last byte)")
+    p.set_defaults(run=cmd_reread)
     p = sub.add_parser("watchdog")
     p.add_argument("--server-id", required=True)
     p.add_argument("--rental", required=True, help="the ledger row that records the deletion")

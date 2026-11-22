@@ -4894,3 +4894,82 @@ Assigned by the coordinating session on 2026-11-22, after TASKS item 127 and the
 - **The tool's summaries are wrong for this image,** and the fault is in item 350's change above: a minimal boot ends only on loader runs, the five-minute boot was sized from rental F's revision (7 s from a reset to the firmware's first line, against about 49 s on 2.4a), and the next byte is measured from the call's line, not from `X`. Boot 2's "reset itself after the first call" was the tool's own restart, issued 5.6 s before that call.
 - **`PMxC0` bit 20** stays set beside each cause: AMD's document says hardware never clears it. It changes no run's branch.
 - **Next, ranked in the findings:** the tool's fix, tested on a fixture shaped like rental G's console (free); the full bench image staged (free); then, when item 350's pause lifts, one rental with two questions, the copied table's compare and the OS-defined memory types as `EfiLoaderData` (an owner item); last, a mark after a successful call, which would change item 349.
+
+### 130. The rental tool reads a minimal boot from the firmware's starts (rental G's findings, next steps rank 1 and 2)
+
+Assigned by the coordinating session on 2026-11-22, after rental G, whose tool summaries said "with no reset after the call" in five boots while the firmware had started again after every call the tool's restarts did not overtake (`docs/research/2026-11-22-rental-g-findings.md`, "The tool's reading"). The brief:
+- count firmware starts, not loader runs;
+- size each boot's window from the firmware's own measured start delay, not a fixed five minutes;
+- never report "no reset" while a restart of the tool's own is in flight;
+- a replay test on rental G's real console log that gives the right answer, a reset after 5 of the 5 calls;
+- stage the full bench image of `32b6e043`;
+- draft the owner item for the next rental's two questions.
+
+Built on `claude/t130-minimal-reading`, cut from `claude/t128-rental-g-records` at `a9f72dd0` (rental G's records, cleared to the keeper), so it lands after them as a fast-forward.
+
+**What was built** (`developer-tools/bench/latitude.py`):
+- **`read_runs`:** a bench image's loader runs, read from the console's raw bytes, their arrival times and the tool's restarts. Each run has its banner's time, `PMxC0` as printed, its branch (the control, a call with its marks, or neither), and when its last byte came: the mark, for a call. Its answer is the firmware's next byte after that, skipping the serial-over-LAN client's own lines (`firmware_after`).
+  - **`reset`:** that byte came before any restart of the tool's since the run's firmware began.
+  - **`overtaken`:** that restart came first, and before the hang's wait had passed. It is never read as a reset or as none.
+  - **`none`:** nothing for the measured start delay and 45 s more, before that restart or by the time given.
+  - **`pending`:** not yet.
+- **Where a run's firmware began:**
+  - after the previous run's reset;
+  - or, for a run whose banner came at least 30 s after one of the tool's restarts, after the longest silence that ends between that restart and the banner (`restart_start`). A restart lands seconds after it is issued, and the start it cuts short may print until then (rental G's boots 5 and 6).
+- **`figures`:** the firmware's own delays, each the longest seen, or rental G's where none was:
+  - a reset to its first byte;
+  - that byte to the banner;
+  - a restart to its first byte, never from a restart that overtook a run.
+- **`window_s`:** a minimal boot's window from those figures. It is 346 s at rental G's planning figures, so the plan is six boots of 5.8 minutes, 39.8 with the setup, inside the 40 before the boots stop. Rental G's measured figures give 344 s; rental F's revision would give about 176 s.
+- **`boot_over`:** a minimal boot ends when its call hung, or when the firmware started again after the call and the next run has read its registers. Failing that, it ends the measured load delay and 15 s after the firmware's start.
+- **The loop:**
+  - records each restart's time in `boots.json` (`restarted_at`);
+  - gives each boot its window from the figures measured so far;
+  - attaches each boot's runs and their reading to its summary, for every bench image that resets after its call;
+  - adds a "Runs" row to the record draft with the whole rental's reading.
+- **`boot_result`** no longer says "no reset" or "reset itself" from loader runs.
+- **`after_last_line`** measures from the mark that follows the last line, not from the line: rental G's "next byte after 0.0 s" was the mark itself.
+- **`reread DIR [--restarts F] [--until T]`** reads a rental's runs again from its directory, and sends no request.
+
+**The tests** (`developer-tools/bench/test_latitude.py`, `python3 -I`): 45 pass.
+- **Five are new:**
+  - the runs read from the firmware's starts, with the client's lines skipped;
+  - a restart in flight before and after the mark, never "no reset";
+  - a restart's start after the longest silence;
+  - the window by revision;
+  - **the replay on rental G's console.**
+- **Three were rewritten:** the boot plan, a minimal boot's end, and six minimal boots through the tool's own loop on a fake clock.
+- **Two were adjusted:** loader runs claim nothing, and the timing from the mark.
+- **The replay's fixture** (`developer-tools/bench/fixtures/rental-g-*`): rental G's raw console, every byte in place but the provider's own system's (blanked to spaces) and one NUL the firmware sent (a space). With it come its arrival times and the tool's six restart times from the coordinating session's run log. It gives:
+  - 13 runs;
+  - a reset after 5 of the 5 calls the restarts did not overtake, 48.8 to 48.9 s after the mark;
+  - runs 3 and 5 overtaken (5.6 s before and 3.8 s after the mark);
+  - six controls reset 48.3 to 48.9 s after the line;
+  - the figures 48.9 s, 54.4 s and 68 s, so a 5.7-minute window.
+  - The identifier scan of the fixture found no IP or MAC address, GUID, server ID or serial.
+- **Eight planted faults** each failed at least one test:
+  - a restart never overtaking;
+  - an overtaken call read as none;
+  - a restart's start taken right after it;
+  - the client's lines taken for the firmware's;
+  - timing from the line;
+  - the window from the plan alone;
+  - a boot ending at the call's reset;
+  - loader runs claiming no reset.
+
+**The full bench image, staged:**
+- `~/.local/state/origin-bench/bench-full-image-32b6e043/` holds `BOOTX64.EFI` (`57a1bbb1…`) and `KERNEL.ONBF` (`3bb1f2a5…`), mode 444. Both are copied from the TASKS item 128 turn's `target/bench`, whose hashes they match.
+- The dry run with the fixed tool, GET requests only, 10:07:39 to 10:07:42 UTC: three boots of up to 8 minutes, `m4-metal-small` at AMS for $0.81 an hour, $1.62 at worst, the ledger $5.67; nothing bought.
+- It is not the next rental's image. That image is item C's build, below.
+
+**The owner item's draft:** `rental-h-owner-item-draft.md` in the coordination notes, for the coordinating session to number and put. It proposes a bench build's bisection mode (ADR-0002 Amendment 6):
+- the full bench loader's work before the call;
+- the kernel stack and the boot info as `EfiLoaderData`;
+- Amendment 5's resets;
+- item 348's table compare.
+Its two questions are whether the firmware changes its boot services table after the copy, and whether the call returns without Origin's OS-defined memory types. It quotes the accepted text it changes, the code it was checked against at `a9f72dd0`, and the rental's cost: $6.48 expected and $7.29 at worst on the ledger.
+
+**Not shown:**
+- the new loop on a rented machine;
+- a window measured on another firmware revision than rental G's;
+- **no independent review, and no person has reviewed it.**

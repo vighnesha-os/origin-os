@@ -27,6 +27,10 @@ On `claude/t128-minimal-mode`, cut from TASKS item 127's tip `a1069e45`, and in 
 - **The rental tool's summaries said the opposite** ("with no reset after the call") and are wrong: it counts loader runs, not firmware starts, and its five-minute boot, set from rental F's faster firmware, ended before the run after each call's reset. Fixing that is the first, free, next step.
 - **`SMIxC0` reads `0x04000000`:** the firmware's `0xCF9` trap is an SMI. `PMxC0` holds bit 20 beside each cause, which AMD's document says hardware never clears.
 - **Next, ranked in the findings:** the tool's fix; the full bench image staged (its table compare has not run on a machine); then, when item 350's pause lifts, one rental with two questions: the copied table's compare and Origin's OS-defined memory types as `EfiLoaderData`.
+- **TASKS item 130** (`claude/t130-minimal-reading`): the tool now reads each run from the firmware's starts, never says "no reset" while one of its own restarts is in flight, and sizes a minimal boot's window from the firmware's measured delays.
+  - A replay test on rental G's own console reads a reset after 5 of the 5 calls the restarts did not overtake.
+  - The full bench image of `32b6e043` is staged, and its GET-only dry run bought nothing.
+  - The owner item for the two-question rental is drafted for the coordinating session.
 
 ## The loader's stack depth before `ExitBootServices` (TASKS item 127; 2026-11-22)
 
