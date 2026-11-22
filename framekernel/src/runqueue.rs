@@ -647,6 +647,13 @@ impl<R: Copy> RunQueue<R> {
     /// the running one's pass, the idle flow's, which is charged only for the quanta nothing else
     /// wanted: a thread that blocked there was then left far above the next newcomer, and a move
     /// carried the difference as lag (TASKS item 129).
+    ///
+    /// Out of line, as it was before that reading (TASKS item 96's recount): inlined, it made
+    /// `KernelQueues::wake_slot` too large to inline, a GOT call on every wake-up; and inlining the
+    /// wake-up's queue calls instead doubled the wait-queue ping-pong under QEMU's software
+    /// processor (turn 27). `switch` reads [`RunQueue::lowest_ready`] inline, so its path keeps
+    /// the inlined search.
+    #[inline(never)]
     fn floor(&self) -> u64 {
         self.lowest_ready().unwrap_or(self.kept_floor)
     }
