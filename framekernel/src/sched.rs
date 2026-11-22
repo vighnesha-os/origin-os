@@ -1018,12 +1018,19 @@ pub(crate) mod pinned {
             (Met::Misplaced, Outcome::Stale) => "; the search found the record with another thread",
             (Met::Misplaced, _) => "; the search found the record in no queue",
             (Met::Exhausted, Outcome::Reached { .. }) => {
-                "; with moves withdrawn its next look reached the thread"
+                "; with moves withdrawn it reached the thread"
             }
             (Met::Exhausted, Outcome::Exhausted) => {
                 "; it followed 64 more with moves withdrawn: the flag failed, and the kernel stops"
             }
-            (Met::Exhausted, _) => "; with moves withdrawn its thread had gone",
+            // The second loop met a misplaced location, and the search found the record nowhere
+            // (R96-10).
+            (Met::Exhausted, Outcome::Misplaced) => {
+                "; with moves withdrawn its record was in no queue"
+            }
+            (Met::Exhausted, Outcome::Stale | Outcome::Gone) => {
+                "; with moves withdrawn its thread had gone"
+            }
         }
     }
 }
