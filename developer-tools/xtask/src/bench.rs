@@ -2246,20 +2246,6 @@ fn check_bisect_console_with(done: &Completed, decision: &str, switch: bool) -> 
     if !switch && com1.contains(FCH_REGISTERS) {
         return Err("with no BENCH-FCH, the bisection mode printed BENCH-FCH's registers".into());
     }
-    // R131-4: the no-OS-type line must have counted at least one descriptor.
-    let counted = com1
-        .find(BIS_NO_OS_TYPE)
-        .map(|i| &com1[i + BIS_NO_OS_TYPE.len()..])
-        .and_then(|rest| {
-            rest.split_whitespace()
-                .next()
-                .and_then(|n| n.parse::<u32>().ok())
-        });
-    if !counted.is_some_and(|n| n > 0) {
-        return Err(format!(
-            "the bisection mode's no-OS-type line counted no descriptor: {counted:?}"
-        ));
-    }
     for needle in [
         BIS_START,
         BIS_AFTER_IGNORED,
@@ -2279,6 +2265,14 @@ fn check_bisect_console_with(done: &Completed, decision: &str, switch: bool) -> 
             ));
         }
     }
+    // R131-4: the no-OS-type line, found above, must have counted at least one descriptor. Checked
+    // after the line itself, so a run whose line names an OS-defined type is refused for that.
+    let counted = no_os_type_count(&com1);
+    if !counted.is_some_and(|n| n > 0) {
+        return Err(format!(
+            "the bisection mode's no-OS-type line counted no descriptor: {counted:?}"
+        ));
+    }
     if com1.contains(LAST_LOADER_LINE) {
         return Err(format!(
             "the bisection-mode loader wrote {LAST_LOADER_LINE:?}: it never enters the kernel"
@@ -2288,6 +2282,13 @@ fn check_bisect_console_with(done: &Completed, decision: &str, switch: bool) -> 
         return Err("a kernel line was written: the bisection mode never enters the kernel".into());
     }
     Ok(())
+}
+
+/// How many descriptors the bisection mode's no-OS-type line says it counted, or `None` with no
+/// such line or no number after it (TASKS item 131's review, R131-4).
+fn no_os_type_count(com1: &str) -> Option<u32> {
+    let at = com1.find(BIS_NO_OS_TYPE)? + BIS_NO_OS_TYPE.len();
+    com1.get(at..)?.split_whitespace().next()?.parse().ok()
 }
 
 /// The lines on the SPCR's UART after the bisection mode's last line, empty ones left out.
@@ -2841,6 +2842,21 @@ mod tests {
             &LIVE_CALL.replace("1400017c9:\tmov\trdx, rsi", "1400017c9:\tcmp\tr8, rdx"),
         );
         assert!(through_live_table(&read, call_at(&read)));
+    }
+
+    #[test]
+    fn the_no_os_type_lines_count_is_read() {
+        let line = |rest: &str| format!("x\n{BIS_NO_OS_TYPE}{rest}\ny\n");
+        assert_eq!(no_os_type_count(&line("135 descriptors")), Some(135));
+        assert_eq!(no_os_type_count(&line("0 descriptors")), Some(0));
+        assert_eq!(no_os_type_count(&line("")), None);
+        // The line a planted OS-defined type gives (BC-1) is not the no-OS-type line.
+        assert_eq!(
+            no_os_type_count(
+                "origin-boot: bench build: bisect: the memory map the page tables were built from holds 1 region(s) of an OS-defined type (0x80000000 and above), the first 0x80000003, in 135 descriptors"
+            ),
+            None
+        );
     }
 
     #[test]
