@@ -235,6 +235,11 @@ fn set_shared(value: Option<Arc<Shared>>) {
 struct Moves {
     made: u64,
     carried_wake: u64,
+    /// Delivery: moves that carried a pending wake-up of a receiver holding a token it had not
+    /// taken, both before and after the move: a token's wake-up carried across a move (S6, N1), the
+    /// path the proof is for (the review of TASKS item 96, R96-2). A pending wake-up alone may be
+    /// the stale one a sender's second wake-up, through the receiver's queue, leaves.
+    carried_token: u64,
     /// Refusals by reason, in [`REASONS`]' order.
     refused: [u64; REASONS.len()],
     /// Each move's critical section, in TSC ticks (B20).
@@ -355,10 +360,14 @@ fn move_for(
             let Some(&to) = cpus.get(choice.next(cpus.len())) else {
                 continue;
             };
+            let outstanding =
+                || thread.posted.load(Ordering::Acquire) > thread.taken.load(Ordering::Acquire);
+            let before = outstanding();
             match sched::migrate(name, to, online) {
                 Ok(moved) => {
                     moves.made += 1;
                     moves.carried_wake += u64::from(moved.carried_wake);
+                    moves.carried_token += u64::from(moved.carried_wake && before && outstanding());
                     moves.ticks.push(moved.ticks);
                     if let Some(s) = moves.source.get_mut(moved.from.get()) {
                         *s = true;
@@ -945,8 +954,14 @@ pub(crate) fn prove_delivery(
             o.wrapping_sub(follows_before.2),
         )
     };
-    let reached = moves.carried_wake != 0;
-    let (made, carried, refused) = (moves.made, moves.carried_wake, moves.refused);
+    // The path the proof is for: a token's wake-up carried across a move (R96-2).
+    let reached = moves.carried_token != 0;
+    let (made, carried, carried_token, refused) = (
+        moves.made,
+        moves.carried_wake,
+        moves.carried_token,
+        moves.refused,
+    );
     drop(moves);
     let (back, unsettled) = bracket_after(settled_before, before, tsc_hz);
     let refusals = refusals(&refused);
@@ -970,7 +985,7 @@ pub(crate) fn prove_delivery(
     let pinned_mode = pinned::entered();
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: thread migration: delivery: {receivers} movable receivers and {} pinned senders, {posted} tokens posted, {taken} taken, {short} receivers short; spawned {spawned}; ended {ended}; heap, frames and stacks back {back}; {made} moves, {carried} carrying a pending wake-up, refused: {refusals}; wake-ups followed {follows} moves of movable threads, the most one followed {most}, {over_eight} followed more than 8; a sender's wake-up that followed a move: longest {} ticks ({} ns) with {} follows; one that followed none: longest {} ticks ({} ns); senders' wake-up sections: {wakes}; their null sections, each as long as their wake-ups' recent median: {nulls}{}{}{}",
+        "origin-kernel: scheduler: thread migration: delivery: {receivers} movable receivers and {} pinned senders, {posted} tokens posted, {taken} taken, {short} receivers short; spawned {spawned}; ended {ended}; heap, frames and stacks back {back}; {made} moves, {carried} carrying a pending wake-up, {carried_token} of them with a token not yet taken, refused: {refusals}; wake-ups followed {follows} moves of movable threads, the most one followed {most}, {over_eight} followed more than 8; a sender's wake-up that followed a move: longest {} ticks ({} ns) with {} follows; one that followed none: longest {} ticks ({} ns); senders' wake-up sections: {wakes}; their null sections, each as long as their wake-ups' recent median: {nulls}{}{}{}",
         cpus.len(),
         spans.0,
         nanos(spans.0, tsc_hz),
