@@ -1357,3 +1357,18 @@ Both of item 344's reset methods run firmware code on this board. Rental E's fin
   - TASKS item 121, which builds it and also lists what Origin's loader does before the call that a minimal UEFI program does not.
 - **The next rental** (rental F, about $0.81) is put to the owner separately, once TASKS item 121 is built.
 
+### Three refinements to ADR-0002 Amendment 4 (item 346): Accepted 2026-11-21
+
+TASKS item 121 builds item 345's bench reset. Its independent review found three places where the accepted text would make rental F answer less, or nothing. The coordinating session had ruled two of them, and the session itself fixed the third. The session caught that all three depart from the accepted text before it marked the amendment built, so they went to the owner.
+
+| # | Question | Answer |
+|---|---|---|
+| 346, answered | Accept three refinements to ADR-0002 Amendment 4, built and tested under QEMU? (1) A run that finds no record of the last reset makes the call and resets after it, instead of only resetting as the control. (2) The `0xCF9` reset follows only a successful call; after an error, the normal retry runs with the same check. (3) The triple fault is used only when the FCH's shutdown-message bit is set; otherwise the loader goes straight to Amendment 3's order. | **Accept all** |
+
+- **The alternative put:** keep the original text, so TASKS item 121 reverts all three.
+- **Performance cost** (ADR-0018 V3): none, by construction. Only bench builds contain it.
+- **Where it is written:**
+  - ADR-0002 Amendment 4's "Refinements" paragraph;
+  - row A02-Am4, which now names items 345 and 346;
+  - TASKS item 121's entry, which names this item beside the coordinating session's rulings R121-2 and R121-3.
+
