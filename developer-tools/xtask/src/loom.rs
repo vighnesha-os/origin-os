@@ -199,6 +199,10 @@ const MOVE_GATE: &[&str] = &[
 /// reached the record's next thread.
 const STALE_WOKE: &[&str] = &["a stale name woke the record's next thread"];
 
+/// What `threads_a_misplaced_location_wakes_only_its_thread` reports (TASKS item 96): a wake-up by
+/// a misplaced location woke the thread the slot holds.
+const MISPLACED_WOKE: &[&str] = &["a misplaced location woke the slot's other thread"];
+
 /// What `threads_a_wake_racing_an_exit_follows_nothing` reports (TASKS item 92): a wake-up
 /// followed an exit, or a new thread in the record, as if it were a move.
 const EXIT_FOLLOWED: &[&str] = &["a wake-up counted an exit or a new thread as a move"];
@@ -439,7 +443,15 @@ const CONTROLS: &[Control] = &[
         name: "wake_to_the_stale_slot",
         file: MODELS,
         from: "        let record = self.world.record(thread.record);
-        match threads::wake(&*self.world, record, thread.generation).outcome {
+        match threads::wake(
+            &*self.world,
+            record,
+            thread.record,
+            thread.generation,
+            no_inconsistency,
+        )
+        .outcome
+        {
 ",
         to: "        let (cpu, slot) = (self.world.cpus.iter().enumerate())
             .find_map(|(cpu, c)| c.home.filter(|h| h.0 == thread.record).map(|h| (cpu, h.1)))
@@ -479,8 +491,31 @@ const CONTROLS: &[Control] = &[
         // slot 1 and arrives in slot 2, beside a blocked thread in slot 1.
         name: "wake_to_the_slot_it_left",
         file: THREADS,
-        from: "                    ready: Q::wake_slot(queue, at.slot()),\n",
-        to: "                    ready: Q::wake_slot(queue, at.slot().min(1)),\n",
+        from: "                        ready: Q::wake_slot(queue, at.slot()),\n",
+        to: "                        ready: Q::wake_slot(queue, at.slot().min(1)),\n",
+        models: &[
+            ("threads_a_wake_follows_a_move", DEADLOCK),
+            ("threads_a_timed_wake_follows_a_move", DEADLOCK),
+        ],
+    },
+    Control {
+        // TASKS item 96 (ADR-0020 S20, trigger 3; the coordinating session's ruling Q6): the
+        // record check removed. A location planted naming a slot that holds another thread then
+        // wakes that thread, and the named one is never woken.
+        name: "wake_without_the_record_check",
+        file: THREADS,
+        from: "                if Q::holder(queue, at.slot()) == Some(number) {\n",
+        to: "                if true {\n",
+        models: &[("threads_a_misplaced_location_wakes_only_its_thread", MISPLACED_WOKE)],
+    },
+    Control {
+        // TASKS item 96 (ADR-0020 S6, N1): a move that does not carry the pending wake-up. A
+        // wake-up that reached the thread before its move is lost with it, and the thread blocks
+        // for good on its new processor.
+        name: "move_drops_the_pending_wake_up",
+        file: RUN_QUEUE,
+        from: "            *p = wake_pending;\n",
+        to: "            let _ = wake_pending;\n            *p = false;\n",
         models: &[
             ("threads_a_wake_follows_a_move", DEADLOCK),
             ("threads_a_timed_wake_follows_a_move", DEADLOCK),

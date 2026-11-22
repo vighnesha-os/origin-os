@@ -93,10 +93,64 @@ impl Empty for State {
     };
 }
 
-/// One processor's threads: its block of records, and its [`Table`].
+/// One processor's threads: its block of records, its [`Table`], and the moves its wake-ups
+/// followed ([`Follows`]).
 pub(crate) struct Processor {
     records: Block<State, PER_CPU>,
     table: SpinLock<Table>,
+    follows: Follows,
+}
+
+/// The moves of movable threads that this processor's wake-ups followed (ADR-0020 S1; TASKS item
+/// 96, the coordinating session's rulings Q8 and Q13, and D93-2), by the waker's processor. Only
+/// this processor writes them, inside a wake-up's interrupts-off section, out of line
+/// (`sched::wake`), with plain loads and stores; any processor reads them, for the delivery
+/// proof's line. A wake-up that follows nothing touches none of them.
+pub(crate) struct Follows {
+    /// Moves followed, in all.
+    all: AtomicU64,
+    /// The most one wake-up followed.
+    most: AtomicU64,
+    /// Wake-ups that followed more than 8: with moves paced (S10, and `sched::migrate`'s rule),
+    /// none should.
+    over_eight: AtomicU64,
+}
+
+impl Follows {
+    const fn new() -> Self {
+        Self {
+            all: AtomicU64::new(0),
+            most: AtomicU64::new(0),
+            over_eight: AtomicU64::new(0),
+        }
+    }
+
+    /// Notes a wake-up that followed `follows` moves. This processor only, interrupts off.
+    pub(crate) fn note(&self, follows: u32) {
+        let follows = u64::from(follows);
+        self.all.store(
+            self.all.load(Ordering::Relaxed).saturating_add(follows),
+            Ordering::Relaxed,
+        );
+        if follows > self.most.load(Ordering::Relaxed) {
+            self.most.store(follows, Ordering::Relaxed);
+        }
+        if follows > 8 {
+            self.over_eight.store(
+                self.over_eight.load(Ordering::Relaxed).saturating_add(1),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Moves followed, the most one wake-up followed, and the wake-ups that followed more than 8.
+    pub(crate) fn read(&self) -> (u64, u64, u64) {
+        (
+            self.all.load(Ordering::Relaxed),
+            self.most.load(Ordering::Relaxed),
+            self.over_eight.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// One processor's threads that are not in a record: the exited ones awaiting their reap
@@ -120,6 +174,7 @@ impl Processor {
                 zombies: [None; CAPACITY],
                 idle_fpu: None,
             }),
+            follows: Follows::new(),
         }
     }
 }
@@ -140,6 +195,22 @@ pub(crate) fn table(cpu: usize) -> Option<&'static SpinLock<Table>> {
 /// TASKS item 93).
 pub(crate) fn table_here(me: ThisCpu<'_>) -> Option<&SpinLock<Table>> {
     Some(&THREADS.this(me)?.table)
+}
+
+/// This processor's [`Follows`], lent for the life of the witness `me` was read under.
+pub(crate) fn follows_here(me: ThisCpu<'_>) -> Option<&Follows> {
+    Some(&THREADS.this(me)?.follows)
+}
+
+/// The follows of every processor's wake-ups, summed, with the most one wake-up followed anywhere:
+/// moves followed, the most, and the wake-ups past 8.
+pub(crate) fn follows() -> (u64, u64, u64) {
+    THREADS
+        .iter()
+        .map(|processor| processor.follows.read())
+        .fold((0, 0, 0), |(all, most, over), (a, m, o)| {
+            (all.saturating_add(a), most.max(m), over.saturating_add(o))
+        })
 }
 
 /// What a run-queue slot holds of its thread's record (`RunQueue<Placed>`): its number, for the
