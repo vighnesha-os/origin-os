@@ -11,7 +11,10 @@
 //! (`smp::Online::takes_part_in_moves`), at most once per thread per tick of its own processor:
 //! S10's rate stands in until TASKS item 98 builds it (the coordinating session's ruling Q13).
 //!
-//! **Integrity.** Two movable threads per processor that takes part run for 2 s. Each holds six
+//! **Integrity.** Two movable threads per processor that takes part run while the boot flow moves
+//! them: for 2 s, and on until every processor has been a source and a destination of a move,
+//! within a budget of 30 s, so that how many moves a loaded machine allows in 2 s cannot fail it
+//! (ADR-0013 R1 (b); the review of TASKS item 96, R96-4). Each holds six
 //! register canaries, 256 bytes of stack canary and four XMM canaries, and a "running on" word
 //! that it takes by compare-and-swap first thing after each return from a yield or block, and
 //! releases by compare-and-swap last thing before the next one, running with interrupts off in
@@ -26,7 +29,9 @@
 //! through the receiver's own wait queue. A receiver takes its tokens and waits, in turn by its
 //! wait queue's `wait_until` and by blocking directly after a spin to its processor's next tick,
 //! the window in which it is registered, preempted, moved, woken and then blocks (N1). After 2 s
-//! the senders stop, and every token posted must be taken within 2 s more.
+//! the senders stop, and every token posted must be taken within 2 s more. Each proof's run is
+//! timed from when every one of its threads has started (R96-4), on the monotonic clock, since
+//! the movable threads read it on whichever processor they run on (ADR-0020 N10; R96-15).
 //!
 //! **What makes a lost wake-up fail it** (the coordinating session's ruling on control C96-2,
 //! 2026-11-22). In the direct form the receiver reads its tokens once, before the spin, and blocks
@@ -68,6 +73,11 @@ use crate::wait::WaitQueue;
 const PER_CPU: usize = 2;
 /// How long each proof moves threads, in seconds (Q10).
 const SECONDS: u64 = 2;
+/// Integrity's budget, in seconds, for every processor to have been a source and a destination: its
+/// mover goes on past [`SECONDS`] until they have, or this runs out (ADR-0013 R1 (b)'s "a budget of
+/// seconds"; the coordinating session's ruling on the review of TASKS item 96, R96-4). Running out
+/// means moves did not progress, which a correct kernel on a loaded machine does not cause.
+const COVER_SECONDS: u64 = 30;
 /// How long the delivery proof waits for every token to be taken after the senders stop.
 const DRAIN_SECONDS: u64 = 2;
 /// An iteration in this many yields instead of passing the turn (integrity).
@@ -79,8 +89,11 @@ const YIELD_EVERY: u64 = 4;
 struct Shared {
     /// Raised to end the threads' loops.
     stop: AtomicBool,
-    /// The TSC at which the threads' loops end on their own.
-    deadline: u64,
+    /// The monotonic clock's reading, in nanoseconds, at which the threads' loops end on their own:
+    /// `u64::MAX` until every thread has started, so the time spent starting them takes none of
+    /// their run (R96-4). On the monotonic clock, since the movable threads read it on whichever
+    /// processor they run on (ADR-0020 N10; R96-15).
+    deadline: AtomicU64,
     /// One entry per movable thread.
     threads: Vec<Movable>,
     /// Integrity: the passes of a turn, one per pair of threads.
@@ -95,8 +108,22 @@ struct Shared {
     ended: AtomicU64,
     /// Threads that have started, for the boot flow to wait on before it moves any.
     started: AtomicU64,
-    /// The TSC rate, for the receivers' spin to the next tick.
+    /// The TSC rate, for the senders' measures in ticks.
     tsc_hz: u64,
+}
+
+impl Shared {
+    /// Whether the threads' run is over ([`Shared::deadline`]).
+    fn past(&self) -> bool {
+        crate::time::monotonic_nanos() >= self.deadline.load(Ordering::Acquire)
+    }
+
+    /// Starts the threads' run: it ends `seconds` from now.
+    fn run_for(&self, seconds: u64) {
+        let ends =
+            crate::time::monotonic_nanos().saturating_add(seconds.saturating_mul(1_000_000_000));
+        self.deadline.store(ends, Ordering::Release);
+    }
 }
 
 /// One movable thread of either proof.
@@ -247,6 +274,8 @@ struct Moves {
     /// By processor index: whether it was a source, and a destination, at least once.
     source: Vec<bool>,
     destination: Vec<bool>,
+    /// Integrity: the mover's TSC ticks from its start until every processor had been both.
+    covered_after: Option<u64>,
 }
 
 /// The refusals the lines name, in order.
@@ -336,19 +365,34 @@ fn nanos(ticks: u64, tsc_hz: u64) -> u64 {
 }
 
 /// The boot flow's mover: for [`SECONDS`], round-robin over `shared`'s threads, it moves each to a
-/// processor of `cpus` chosen by `choice`, at most once per tick of its own processor.
+/// processor of `cpus` chosen by `choice`, at most once per tick of its own processor. With
+/// `cover`, it goes on past [`SECONDS`] until every processor of `cpus` has been a source and a
+/// destination, within [`COVER_SECONDS`] (integrity; R96-4). On the boot processor's TSC alone.
 fn move_for(
     flow: Pinned<'_>,
     shared: &Shared,
     cpus: &[CpuIndex],
     online: &Online,
     tsc_hz: u64,
+    cover: bool,
     moves: &mut Moves,
 ) {
     let me = cpu::this_cpu(flow.here());
     let mut choice = Choice(0x2545_f491_4f6c_dd1d);
     let start = rdtsc();
-    while rdtsc().wrapping_sub(start) < tsc_hz.saturating_mul(SECONDS) {
+    let (window, budget) = (
+        tsc_hz.saturating_mul(SECONDS),
+        tsc_hz.saturating_mul(COVER_SECONDS),
+    );
+    loop {
+        let elapsed = rdtsc().wrapping_sub(start);
+        if cover && moves.covered_after.is_none() && moves.reached_every(cpus) {
+            moves.covered_after = Some(elapsed);
+        }
+        let covering = cover && moves.covered_after.is_none() && elapsed < budget;
+        if elapsed >= window && !covering {
+            break;
+        }
         for thread in &shared.threads {
             let Some(name) = thread.name() else {
                 continue;
@@ -526,7 +570,7 @@ extern "sysv64" fn integrity_thread(index: u64) -> ! {
                 shared.canaries_changed.fetch_add(1, Ordering::Relaxed);
             }
             iteration += 1;
-            let ending = shared.stop.load(Ordering::Acquire) || rdtsc() >= shared.deadline;
+            let ending = shared.stop.load(Ordering::Acquire) || shared.past();
             match pair {
                 _ if ending => {
                     // Leave the partner nothing to wait for.
@@ -546,7 +590,7 @@ extern "sysv64" fn integrity_thread(index: u64) -> ! {
                     pair.queue.wait_until(|| {
                         pair.turn.load(Ordering::Acquire) == mine
                             || shared.stop.load(Ordering::Acquire)
-                            || rdtsc() >= shared.deadline
+                            || shared.past()
                     });
                 }
                 _ => {
@@ -585,7 +629,7 @@ pub(crate) fn prove_integrity(
     let threads = cpus.len() * PER_CPU;
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
-        deadline: rdtsc().saturating_add(tsc_hz.saturating_mul(SECONDS + 1)),
+        deadline: AtomicU64::new(u64::MAX),
         threads: (0..threads).map(|_| Movable::new()).collect(),
         pairs: (0..threads / 2)
             .map(|_| Pair {
@@ -608,9 +652,11 @@ pub(crate) fn prove_integrity(
         tsc_hz,
         2,
     );
+    // Their own end, past the mover's longest run: the mover's stop ends them first.
+    shared.run_for(COVER_SECONDS + SECONDS);
     let mut moves = Moves::new(online.cpus().iter().map(|c| c.get() + 1).max().unwrap_or(0));
     if spawned {
-        move_for(flow, &shared, &cpus, online, tsc_hz, &mut moves);
+        move_for(flow, &shared, &cpus, online, tsc_hz, true, &mut moves);
     }
     shared.stop.store(true, Ordering::Release);
     for pair in &shared.pairs {
@@ -627,6 +673,7 @@ pub(crate) fn prove_integrity(
     drop(shared);
     let unready = sched::unready_switches().wrapping_sub(unready_before);
     let reached = moves.reached_every(&cpus);
+    let covered_after = moves.covered_after;
     let (median, largest) = moves.sections();
     let (gated_after, longest_gate) = cpu::gated_scans();
     let (made, refused) = (moves.made, moves.refused);
@@ -646,7 +693,10 @@ pub(crate) fn prove_integrity(
         com1,
         "origin-kernel: scheduler: thread migration: integrity: {threads} movable threads on {} processors, {made} moves, refused: {refusals}; a second processor in a context {failed_swaps} times, canaries changed {changed} times, threads run before their state existed {unready}; every processor a source and a destination: {}; a move's critical section: median {median} ticks ({} ns), largest {largest} ticks ({} ns); scans that made the gated pass {}, the longest {longest_gate} ticks ({} ns); spawned {spawned}; ended {ended}; heap, frames and stacks back {back}{}{}{}",
         cpus.len(),
-        if reached { "yes" } else { "no" },
+        match covered_after {
+            Some(after) => alloc::format!("yes, after {} ms", nanos(after, tsc_hz) / 1_000_000),
+            None => alloc::format!("no, in {COVER_SECONDS} s"),
+        },
         nanos(median, tsc_hz),
         nanos(largest, tsc_hz),
         gated_after.wrapping_sub(gated_before.0),
@@ -673,7 +723,9 @@ extern "sysv64" fn receiver(index: u64) -> ! {
         let named = sched::current_thread();
         cpu::without_interrupts(|| *me.name.lock() = named);
         shared.started.fetch_add(1, Ordering::AcqRel);
-        let period = shared.tsc_hz / crate::timer::HZ;
+        // A tick, in nanoseconds of the monotonic clock: the receiver may be moved mid-spin, and
+        // no TSC reading is compared across processors (ADR-0020 N10; R96-15).
+        let period = 1_000_000_000 / crate::timer::HZ;
         let mut taken = 0u64;
         let mut direct = false;
         loop {
@@ -694,8 +746,8 @@ extern "sysv64" fn receiver(index: u64) -> ! {
                 // spin must reach the receiver through the pending wake-up alone, which is what
                 // this proof tests (the module's documentation; control C96-2).
                 let before = me.posted.load(Ordering::Acquire);
-                let start = rdtsc();
-                while rdtsc().wrapping_sub(start) < period {
+                let start = crate::time::monotonic_nanos();
+                while crate::time::monotonic_nanos().saturating_sub(start) < period {
                     core::hint::spin_loop();
                 }
                 if before == taken && !shared.stop.load(Ordering::Acquire) {
@@ -731,7 +783,7 @@ extern "sysv64" fn sender(index: u64) -> ! {
     let (mut window, mut filled, mut next) = ([0u64; WINDOW], 0usize, 0usize);
     while let Some(me) = me
         && !shared.stop.load(Ordering::Acquire)
-        && rdtsc() < shared.deadline
+        && !shared.past()
     {
         let receivers = shared.threads.len();
         let first = choice.next(receivers);
@@ -850,7 +902,7 @@ pub(crate) fn prove_delivery(
     let receivers = cpus.len() * PER_CPU;
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
-        deadline: rdtsc().saturating_add(tsc_hz.saturating_mul(SECONDS)),
+        deadline: AtomicU64::new(u64::MAX),
         threads: (0..receivers).map(|_| Movable::new()).collect(),
         pairs: Vec::new(),
         senders: (0..cpus.len())
@@ -880,9 +932,11 @@ pub(crate) fn prove_delivery(
         tsc_hz,
         2,
     );
+    // The senders' run, from now that every thread has started (R96-4).
+    shared.run_for(SECONDS);
     let mut moves = Moves::new(online.cpus().iter().map(|c| c.get() + 1).max().unwrap_or(0));
     if spawned {
-        move_for(flow, &shared, &cpus, online, tsc_hz, &mut moves);
+        move_for(flow, &shared, &cpus, online, tsc_hz, false, &mut moves);
     }
     // The senders stop at their deadline; then every token posted must be taken.
     sched::yield_until(
