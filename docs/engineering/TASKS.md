@@ -4664,15 +4664,16 @@ Assigned by the coordinating session on 2026-11-21. The contract went to the coo
 - **A mover reads the pin count under the owning queue's lock** (R93-7), with the movable flag, both after the spawner's and the thread's own writes by the chain of queue locks.
 - **D93-2** (how long a wake-up keeps interrupts off): ADR-0020 S1's note of 2026-11-22. Paced, a wake-up follows at most one move; every proof boot saw at most one.
 - **D93-6** (`Exhausted`): it enters pinned mode and follows again with moves withdrawn; a second exhaustion stops the kernel (Q17).
-- **CL60's candidate** (the IPI decision inside the section's closure, so the wake-up returns the target): it is `wake`'s shape as built. The decision and the IPI run inside `waking::within`, which returns only whether one was sent. Its count is `wake`'s: 262 instructions in all (the base's 266), and the traced common path below.
+- **CL60's candidate** (the IPI decision inside the section's closure, so the wake-up returns the target): closed by this item. `wake`'s final shape decides and sends the IPI inside `waking::within`'s section and returns only whether one was sent. Its count is `wake`'s: 262 instructions in all against the base's 266, and the traced common path +0 and +2 (below).
 
 **As built** (the branch `claude/t96-the-move-cef44b`, from `land/batch-9` with `0ebef78b` merged; the commits in order on the branch, the early ones marked "WIP"):
 - **The token** (`7b4ba428`): `trap::InterruptsOff`, `section_off`, `Switch::interrupts_off`; `check_landing` taking it.
 - **The gate takes the token, and `NotYet`** (`331e0c23`): `Moves<W: MoveWitness>`, `begin` and `relocate`; `lend` reading `current` first; `switch`'s Release store; LV3 and its controls LX5 and LX6.
 - **`depart` and `arrive`** (`bf3a75df`), with host tests and the randomized test against a model.
 - **The movable flag and records from any block** (`b4dfcd33`).
-- **Then, in WIP commits:** the record check and its Loom model; pinned mode; `migrate` and `move_once`; `spawn_movable`; the two proofs; `move_context` non-generic; wake's common path brought within 3 instructions (the fifth to the eighth turns; F1 `e8139e04`); the null section (`2038e494`); the delivery receiver's change (`9056f679`); the pinned-mode wording (`66ee0032`).
+- **Then, in commits marked "WIP" (18, from `7ba8f3f4` to `66ee0032`):** the record check and its Loom model; pinned mode; `migrate` and `move_once`; `spawn_movable`; the two proofs; `move_context` non-generic; wake's common path brought within 3 instructions (the fifth to the eighth turns; F1 `e8139e04`); the null section (`2038e494`); the delivery receiver's change (`9056f679`); the pinned-mode wording (`66ee0032`).
 - **The review's answers**, one commit per finding (REVIEW_T96_2026-11-22.md, section 2), on top of `66ee0032`, to `b1f1e528`.
+- **The WIP commits are kept as they are, on purpose** (the coordinating session's ruling): each is a small, real, buildable step, and the review's range, the controls, the comparison and the answers name commits by hash, which a rewrite would break. The "(to be folded)" or "(to be completed and reworded)" at the end of their messages is out of date.
 - **The records:** ADR-0013's rows and controls, ADR-0020's notes, PERFORMANCE_BUDGETS.md, provenance, the review record and this entry.
 
 **The design as it lands** is in ADR-0020's dated notes of 2026-11-22 on S1, S2, S4, S5, S6, S20 and S23, and ADR-0013's rows for "thread migration: integrity" (Refuse), "thread migration: delivery" (Withdraw "no thread moves") and FPU format (now Withdraw "thread moves to or from that processor").
