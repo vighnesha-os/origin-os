@@ -27,9 +27,11 @@
 //! want of a record only if none is free anywhere. Its search past the own block runs only when
 //! that block is used up, which no boot does today.
 //!
-//! **Accounted for.** Every settle checks, processor by processor, that the records its block
-//! holds are its queued threads' and its zombies', and that no record's give-back has been refused
-//! ([`unaccounted`]; the review's R92-2).
+//! **Accounted for.** Every settle checks that the records the blocks hold are the queued threads'
+//! and the zombies', counted for the machine, and that no record's give-back has been refused
+//! ([`unaccounted`]; the review's R92-2). For the machine, not block by block: a thread that moved,
+//! or took its record from another processor's block, is queued or listed on one processor with
+//! a record of another's (the review of TASKS item 96, R96-3).
 //!
 //! **Memory.** Every block is made when the processors are discovered (`percpu::size_per_cpu`;
 //! ADR-0008 Amendment 1, D1), never moved and never freed: the boot processor's is static, and the
@@ -303,22 +305,25 @@ pub(crate) fn give_back(number: u32) {
     }
 }
 
-/// The records out of place: those whose give-back was refused since the boot began, and, on each
-/// processor, the difference between the records its block holds and its threads (queued, or
-/// zombies awaiting their reap). 0 while every thread has its one record and every reaped thread
-/// gave its record back (the review of TASKS item 92, R92-2).
+/// The records out of place: those whose give-back was refused since the boot began, and the
+/// difference between the records every block holds and the machine's threads (queued, or zombies
+/// awaiting their reap). 0 while every thread has its one record and every reaped thread gave its
+/// record back (the review of TASKS item 92, R92-2). Summed over the machine, since a thread's
+/// record may be another processor's (R96-3).
 ///
 /// Each processor is read under its run queue's lock and then its table's, so no spawn, exit or
 /// reap there is half done: a spawn takes its record and queues the thread under the queue's lock,
 /// an exit lists its zombie or gives its record back under both, and a reap takes a zombie off
-/// the list and gives its record back under the table's.
+/// the list and gives its record back under the table's. The processors are read one after
+/// another, so a move during the reading could count its thread twice or not at all: a settle
+/// runs on the boot flow, which is the only mover, so none is under way then.
 pub(crate) fn unaccounted() -> u64 {
-    let mut off = REFUSED.load(Ordering::Relaxed);
+    let (mut held, mut threads) = (0u64, 0u64);
     for (cpu, processor) in THREADS.iter().enumerate() {
         let Some(queue) = crate::sched::QUEUES.get(cpu) else {
             continue;
         };
-        let (held, threads) = without_interrupts(|| {
+        let (here_held, here_threads) = without_interrupts(|| {
             let queue = queue.lock();
             let table = processor.table.lock();
             let zombies = table.zombies.iter().flatten().count();
@@ -327,8 +332,10 @@ pub(crate) fn unaccounted() -> u64 {
                 queue.live().saturating_sub(1).saturating_add(zombies),
             )
         });
-        let threads = u64::try_from(threads).unwrap_or(u64::MAX);
-        off = off.saturating_add(u64::from(held).abs_diff(threads));
+        held = held.saturating_add(u64::from(here_held));
+        threads = threads.saturating_add(u64::try_from(here_threads).unwrap_or(u64::MAX));
     }
-    off
+    REFUSED
+        .load(Ordering::Relaxed)
+        .saturating_add(held.abs_diff(threads))
 }
