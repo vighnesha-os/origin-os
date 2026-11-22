@@ -4511,6 +4511,14 @@ The owner accepted all three on 2026-11-22 at about 00:05 UTC ("Accept all"; dec
 
 **Not shown:**
 
-- any read of an FCH register on a physical machine; QEMU has no FCH;
+- any read of an FCH register on a physical machine; QEMU has no FCH (rental F has since read them);
 - anything under KVM, until CI runs the branch;
 - **no person has reviewed it.**
+
+**Rental F (2026-11-22, on the owner's "Rent it"; the coordinating session's guarded run, 04:00:33 to 04:25:50 UTC, $0.81; the ledger now 6 rentals, $4.86):** the bench images above, from `12a4e081`. Record `docs/hardware/records/2026-11-22-latitude-m4-metal-small-f.md` and its log; findings `docs/research/2026-11-22-rental-f-findings.md`. Firmware 2.5 (2025-11-18), a fourth revision.
+- **The FCH's checks passed in all five runs,** and its registers have the documents' layout: `0xCF9` decoded, both shutdown bits set, the PM1 block the FADT's, one reset cause at a time.
+- **The control worked:** in boots 2 and 3 the first run (`PMxC0` bit 21, the tool's restart through a sleep state) wrote `0x06` to `0xCF9`, the firmware started again within 7.1 s, and the next run read bit 19. `PMxC0` survives a firmware start.
+- **The run after each control made the call:** `X`, then nothing for 6.2 to 6.6 minutes; no `Y`, no `0xCF9` reset, no triple fault. Boot 1's single run (bit 19 from the provider's own restart, so no control in its boot) did the same. That is the hand-over's row 2: **A, `ExitBootServices` does not return**, now beside a positive control.
+- **What weakens it:** `PMxD2` bit 6 is set. By AMD's document that bit turns the FCH's own `0xCF9` reset off so that the firmware can trap the write, so the control's reset came through firmware code, most likely an SMI. On this board the first reset after the call is therefore firmware code; only the triple fault behind it is not, and it runs only if the trapped write returns. The objective's "neither the console nor any firmware reset in the way" holds for the console, and for the reset only up to that trap. The findings weigh A′ (the trap never returns after the call) and 2′ (two failures) and rank A well ahead: one fault covers five rentals on four firmware revisions, and A′ needs rental C's console to fail too.
+- **The line "its reset stopped (`PMxD2` bit 6)"** says too much: the bit stops the FCH's own reset, not the firmware's. To be reworded in the next bench build.
+- **Next, ranked in the findings:** the stack's depth under QEMU (free); the live and copied `ExitBootServices` and the `0xCF9` trap's route (`SMIxC0`) read before the call (free); then a minimal program with the triple fault first after the call and a triple-fault control, which needs an owner item.

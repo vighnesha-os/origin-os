@@ -39,7 +39,10 @@ Its new controls BC-13, BC-15 and BC-16 each fail. One independent AI review: no
 - `boot-matrix` passed once, by the coordinating session's ruling;
 - the normal images are the same bytes as the batch's.
 
-The bench images are staged for rental F, which waits on the owner's yes.
+**Rental F** (2026-11-22, $0.81; `docs/hardware/records/2026-11-22-latitude-m4-metal-small-f.md`, `docs/research/2026-11-22-rental-f-findings.md`):
+- **The control worked:** in two boots, the run before the call wrote `0x06` to `0xCF9`, the firmware started again within 7.1 s, and the next run found the reset recorded in the FCH.
+- **That next run made the call,** and then nothing: no `0xCF9` reset, no triple fault, for over six minutes. That is reading A, `ExitBootServices` does not return, now beside a positive control in the same boot, on a fourth firmware revision.
+- **One limit:** the firmware has the FCH's own `0xCF9` reset turned off (`PMxD2` bit 6) and resets through its own code when the port is written, most likely in SMM. So the first reset after the call was firmware code, and only the triple fault behind it was not. The findings still rank A well ahead, and name the next steps: the stack's depth under QEMU, two free reads before the call, and a minimal program with the triple fault first.
 
 ## The reset diagnostic: a bench loader for rental E (TASKS item 116; 2026-11-21)
 
