@@ -650,20 +650,33 @@ impl<R: Copy> RunQueue<R> {
         }
     }
 
-    /// The record `slot` holds, read without its state: a free slot's is `None` by construction
-    /// (a push sets it, and an exit or a departure clears it), and slot 0's, the boot or idle
-    /// flow's, is `None` too. For a wake-up's check that the slot holds its thread (ADR-0020 S20,
-    /// trigger 3), where the state is read after it. Slot 0 is answered without a read, so that
-    /// the check and [`RunQueue::wake`]'s own refusal of slot 0 come to one compare of the slot.
+    /// The record `slot` holds, read without its state, for a wake-up's check that the slot holds
+    /// its thread (ADR-0020 S20, trigger 3), where the state is read after it.
+    ///
+    /// - **A free slot's record is `None`** by construction: a push or an arrival fills the record
+    ///   with the slot, an exit and a departure clear it as they free the slot, and a refused push
+    ///   or arrival changes neither.
+    /// - **Slot 0 never holds a record.** It is the processor's boot or idle flow, which has none
+    ///   (ADR-0020 S2, point 4). Nothing places a record there:
+    ///   - [`RunQueue::empty`] makes it `None`;
+    ///   - a push and an arrival take only slots 1 and up;
+    ///   - a departure refuses slot 0, and so do an exit, a sleep and a block (`BootContext`).
+    ///
+    ///   So slot 0 is answered without a read, and the check and [`RunQueue::wake`]'s own refusal
+    ///   of slot 0 come to one compare of the slot on a wake-up's path.
+    ///
+    /// Both facts are held by the randomized test against a model after every step, and by a debug
+    /// assertion here.
     #[inline]
     pub fn held(&self, slot: usize) -> Option<R> {
         if slot == 0 {
+            debug_assert!(
+                self.record.first().copied().flatten().is_none(),
+                "slot 0 holds a record"
+            );
             return None;
         }
         let held = self.record.get(slot).copied().flatten();
-        // What makes the read without the state right: every path that frees a slot clears its
-        // record (an exit, a departure), a push fills both together, and a refused push or arrival
-        // changes neither. The randomized test against a model holds it after every step.
         debug_assert!(
             held.is_none() || self.state.get(slot) != Some(&State::Free),
             "a free slot kept a record"
@@ -2178,6 +2191,8 @@ mod tests {
         /// The queue's state, slot by slot, as the model's.
         fn same(q: &RunQueue, m: &Model, at: &str) {
             assert_eq!(q.current, m.current, "{at}: the running slot");
+            // Slot 0, the boot or idle flow's, never holds a record (`RunQueue::held`).
+            assert_eq!(q.record[0], None, "{at}: slot 0 holds a record");
             assert_eq!(q.ticks, m.ticks, "{at}: ticks");
             for (i, s) in m.slots.iter().enumerate() {
                 let is = match q.state[i] {
