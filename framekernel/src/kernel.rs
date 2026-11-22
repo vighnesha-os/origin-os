@@ -33,14 +33,20 @@ static PANICKING: AtomicBool = AtomicBool::new(false);
 
 /// The kernel's Rust entry: `_start` jumps here with RBP zero, the stack aligned, and the
 /// loader's boot-info pointer as the [`Entry`] in RDI.
-pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
+pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u64) -> ! {
+    // TASKS item 112: a bench build's breadcrumbs, one byte after each step to the first line.
+    #[cfg(origin_bench)]
+    origin_frame::bench::start(crumbs);
+    crumb!(b"1");
     // The monotonic clock's zero (CLAUDE.md §68).
     time::mark_entry();
+    crumb!(b"2");
     // COM1 is the UART of last resort: nothing better is known until the ACPI tables can
     // be read, which `console::adopt_firmware_uart` does.
     let mut uart = Uart16550::new(console::KernelUart::com1());
     let firmware_line = uart.line_settings();
     uart.init();
+    crumb!(b"3");
 
     if !entry.relocations_applied() {
         // `core::fmt` would call through unrelocated vtables. `write_str` on the concrete
@@ -48,11 +54,26 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         let _ = uart.write_str(report::RELOCATIONS_NOT_APPLIED);
         halt();
     }
+    crumb!(b"4");
     // From here on every processor prints through the console, a line at a time.
     console::init(uart, firmware_line);
+    crumb!(b"5");
     let mut com1 = console::Console::boot_flow();
     // What each boot proof found, and what that means for this boot (ADR-0013).
     let mut proofs = Tally::new();
+    // The boot flow's witness (ADR-0020 S2, point 4; TASKS item 93, the coordinating session's
+    // ruling Q6): this flow never moves and never becomes a thread, so the witness holds for the
+    // rest of the boot. Taken once, here, and passed down to what reads the processor index.
+    // It exists before GS's base is set (`early.load_cpu_tables()`, below): nothing reads the
+    // index before that, by `Early`'s order and `timer::init`'s check, which the witness does not
+    // show (review finding R93-3).
+    let Some(flow) = cpu::flow() else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: the kernel did not start on the boot flow"
+        );
+        halt();
+    };
 
     let mut early = match entry.read_boot_info() {
         Ok(early) => early,
@@ -61,6 +82,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             halt();
         }
     };
+    crumb!(b"6");
     let data = early.data();
     let (info, regions, segments, memory) = (
         *data.info(),
@@ -73,8 +95,15 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     // from here on (ADR-0010): the framebuffer's line is the first on both. The earlier lines of
     // a boot this far can only have been a report of an invalid boot info, on COM1.
     let loader_uart = console::attach_loader_uart(&info);
+    crumb!(b"7");
     console::attach_framebuffer(&mut com1, &info, regions);
     let _ = writeln!(com1, "origin-kernel: console: {}", loader_uart.now());
+    #[cfg(origin_bench)]
+    let _ = writeln!(
+        com1,
+        "origin-kernel: bench build: {}",
+        origin_frame::bench::Said
+    );
     let _ = report::write_report(&mut com1, &info, &memory);
     for (i, s) in segments.iter().enumerate() {
         let access = match (
@@ -97,9 +126,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     // Out of turn the boot steps do nothing, whoever calls them (`Early`): proven here, before
     // any of them has run, and below for a second run of each.
     let out_of_turn = !early.start_heap(&mut com1)
-        && !early.prove_user_isolation(&mut com1)
+        && !early.prove_user_isolation(flow, &mut com1)
         && early.build_kernel_tables(&mut com1).is_none()
-        && timer::init(&mut com1, info.acpi_rsdp).is_none();
+        && timer::init(flow, &mut com1, info.acpi_rsdp).is_none();
 
     // The trap entry (in `cpu`) knows the layers above only through these upcalls.
     origin_frame::trap::install(origin_frame::trap::Hooks {
@@ -113,6 +142,8 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         user_fault: syscall::user_fault,
         report_exception: console::report_exception,
     });
+    // The pin's mint, to the scheduler, before any thread exists (TASKS item 93, the ruling's Q3).
+    sched::take_pin_mint();
     // M2, first step: the kernel's own GDT, TSS and IDT, proven with a breakpoint whose
     // handler reports it and resumes here.
     early.load_cpu_tables();
@@ -180,7 +211,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     // M2, third step: the kernel's own page tables, proven with deliberate faults; then
     // the frame allocator is proven again through the new direct map.
     let mut heap_ok = false;
-    let paging = init_paging(&mut com1, &mut early);
+    let paging = init_paging(flow, &mut com1, &mut early);
     // The kernel's own tables are loaded, so firmware tables can be mapped: the console's
     // UART is the one the firmware names, if it names one (ADR-0010).
     console::adopt_firmware_uart(&mut com1, info.acpi_rsdp, regions);
@@ -200,6 +231,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             early.frames_proven(),
         );
         quiesced = pcie::quiesce(
+            flow,
             &mut com1,
             info.acpi_rsdp,
             regions,
@@ -212,7 +244,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         );
         heap_ok = prove_heap(&mut com1);
         record_or_stop(&mut com1, &mut proofs, Proof::Heap, heap_ok);
-        if heap_ok && !early.prove_user_isolation(&mut com1) {
+        if heap_ok && !early.prove_user_isolation(flow, &mut com1) {
             // Ring 3 comes next: a kernel that cannot keep itself from user pages must not
             // run it, any more than a processor below the baseline (and `prove_user_isolation`
             // has said why).
@@ -226,7 +258,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
 
     // M2, fourth step: interrupts. The local APIC in x2APIC mode, its timer calibrated
     // against the PIT and proven by taking periodic interrupts.
-    let tsc_hz = timer::init(&mut com1, info.acpi_rsdp);
+    let tsc_hz = timer::init(flow, &mut com1, info.acpi_rsdp);
     record_or_stop(&mut com1, &mut proofs, Proof::ApicTimer, tsc_hz.is_some());
     if let Some(hz) = tsc_hz {
         // The timer runs and every vector that can arrive has a gate: from here on, the
@@ -235,7 +267,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         if let Some(q) = quiesced.as_mut() {
             proofs.record(Proof::BusMastersSettled, pcie::settle(&mut com1, q, hz));
         }
-        let nmi = prove_nmi_ist(&mut com1, hz);
+        let nmi = prove_nmi_ist(flow, &mut com1, hz);
         proofs.record(Proof::NmiDelivery, nmi.delivered);
         if nmi.delivered {
             record_or_stop(&mut com1, &mut proofs, Proof::NmiStack, nmi.on_own_stack);
@@ -244,8 +276,8 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // clock from the RTC (CLAUDE.md §68).
         proofs.record(Proof::Clocks, time::init(&mut com1, hz, info.acpi_rsdp));
         // I/O APIC interrupt routing, proven by routing the PIT's IRQ0 (CLAUDE.md §24).
-        let bsp =
-            timer::X2Apic::this_cpu().map_or(u32::MAX, |l| l.read(timer::ApicRead::Id) as u32);
+        let bsp = timer::X2Apic::here(cpu::this_cpu(flow.here()))
+            .map_or(u32::MAX, |l| l.read(timer::ApicRead::Id) as u32);
         proofs.record(
             Proof::IoApic,
             irq::prove(&mut com1, info.acpi_rsdp, bsp, hz),
@@ -293,12 +325,21 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // Boot info 0.6 (decision item 166): the loader's value for the kernel stacks' region
         // can be taken once, and only before the generator's start overwrites it with the seed.
         let stack_value = prove_stack_value(&mut com1, info.boot_seed != 0);
-        report_random_start(&mut com1, origin_frame::random::start_boot());
-        let online = smp::start(&mut com1, sched::run_ap, crate::percpu::size_per_cpu);
+        report_random_start(
+            &mut com1,
+            origin_frame::random::start_boot(cpu::this_cpu(flow.here())),
+        );
+        let online = smp::start(flow, &mut com1, sched::run_ap, crate::percpu::size_per_cpu);
         proofs.record(Proof::Processors, online.complete());
         // What each processor put in its own control registers, which ring 3 relies on.
         let held = cpu::cpu_states_holding(online.cpus()) == online.cpus().len();
         record_or_stop(&mut com1, &mut proofs, Proof::CpuState, held);
+        // ADR-0020 S6: every processor online saves its FPU state as the boot processor does,
+        // and so may take part in moves. Report until a mover reads it (TASKS item 96).
+        proofs.record(
+            Proof::FpuFormat,
+            cpu::fpu_formats_alike(online.cpus()) == online.cpus().len(),
+        );
         // ADR-0017: what each processor reported and set as it started, and the two forms
         // of the lookup every index and address from ring 3 goes through.
         let controls = prove_speculation(&mut com1, online.cpus());
@@ -318,14 +359,14 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         }
         // Every boot step, and the two that bring up hardware for good, run once: a repeat
         // changes nothing (`smp::start` would otherwise reset running processors).
-        let again = smp::start(&mut com1, sched::run_ap, crate::percpu::size_per_cpu);
+        let again = smp::start(flow, &mut com1, sched::run_ap, crate::percpu::size_per_cpu);
         let once = again.cpus().len() == 1
             && !again.complete()
             && early.reclaim_loader_memory(&online).is_none()
             && !early.init_memory(&mut com1)
             && early.build_kernel_tables(&mut com1).is_none()
             && !early.start_heap(&mut com1)
-            && !early.prove_user_isolation(&mut com1)
+            && !early.prove_user_isolation(flow, &mut com1)
             && early.enable_simd() == xcr0
             && !iommu::init(
                 &mut com1,
@@ -352,13 +393,19 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // CPU topology from CPUID, each processor's on itself, checked against the MADT
         // (CLAUDE.md §24, §27).
         let apic_ids = online.apic_ids();
-        let topology = prove_topology(&mut com1, info.acpi_rsdp, &online);
+        let topology = prove_topology(flow, &mut com1, info.acpi_rsdp, &online);
         proofs.record(Proof::Topology, topology);
         // NUMA affinities from the ACPI SRAT (CLAUDE.md §24, §28).
         let numa = prove_numa(&mut com1, info.acpi_rsdp, &apic_ids);
         proofs.record(Proof::Numa, numa);
         // Inter-node distances from the ACPI SLIT (CLAUDE.md §27, §28).
         proofs.record(Proof::NumaDistances, prove_slit(&mut com1, info.acpi_rsdp));
+        // The scheduling domains from those reports, the SRAT and any PPTT (ADR-0020 S8, S9;
+        // TASKS item 97).
+        proofs.record(
+            Proof::Domains,
+            prove_domains(&mut com1, info.acpi_rsdp, &online),
+        );
         // Every ACPI table the firmware gives, checked whole (ADR-0019 A6, area A; TASKS item 62).
         proofs.record(
             Proof::AcpiTables,
@@ -369,7 +416,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // painted stack, must equal the depth it sampled, to the byte.
         proofs.record(
             Proof::MeasuredStackBoot,
-            crate::measured_stack::prove_at_boot(&mut com1, tsc_hz),
+            crate::measured_stack::prove_at_boot(flow, &mut com1, tsc_hz),
         );
         // The AML interpreter over QEMU's DSDT and SSDTs, against a host that refuses every access
         // to hardware (ADR-0019 A3; TASKS item 63, step B3); on any other firmware it runs no AML
@@ -386,7 +433,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // The random-number generator on every processor (CLAUDE.md §59; ADR-0016). If the
         // proof fails, randomness is withheld from here on (ADR-0013 R2, Amendment 1): nothing
         // is launched and nothing is placed at a random address.
-        let random = prove_random(&mut com1, online.cpus(), tsc_hz) && stack_value;
+        let random = prove_random(flow, &mut com1, online.cpus(), tsc_hz) && stack_value;
         if !random {
             origin_frame::random::withhold();
         }
@@ -400,9 +447,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // M3, second step: preemptive kernel threads on every online processor. Its proofs
         // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
         // use only the kernel's fixed programs, and the operator sees every result.
-        sched::prove(&mut com1, online.cpus(), tsc_hz, &mut proofs);
+        sched::prove(flow, &mut com1, online.cpus(), tsc_hz, &mut proofs);
         // ADR-0017 Z3, after the proofs above have run several processes in ring 3.
-        proofs.record(Proof::Ibpb, prove_ibpb(&mut com1, online.cpus()));
+        proofs.record(Proof::Ibpb, prove_ibpb(flow, &mut com1, online.cpus()));
         stop_if_refused(&mut com1, proofs);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
         if let Some(q) = quiesced.as_mut()
@@ -417,7 +464,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
                         .filter(|r| r.verdict.is_ok())
                         .filter_map(|r| r.range.as_ref()),
                 ));
-                pcie::init(&mut com1, q, online.cpus(), regions, &reserved)
+                pcie::init(flow, &mut com1, q, online.cpus(), regions, &reserved)
             }
         {
             proofs.record(Proof::Pcie, true);
@@ -425,20 +472,23 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             // attaches.
             proofs.record(Proof::BusMastersQuiet, pcie::check_quiet(&mut com1, q));
             // M5: the NVMe driver and block I/O, polled and then interrupt-driven.
-            proofs.record(Proof::Nvme, storage::init(&mut com1, online.cpus(), tsc_hz));
+            proofs.record(
+                Proof::Nvme,
+                storage::init(flow, &mut com1, online.cpus(), tsc_hz),
+            );
             // M10: bring up the virtio-net NIC; an interrupt-driven receive thread takes the
             // OS onto the network (CLAUDE.md §31, §54). The one proof not in the verdict yet
             // (ADR-0013): `virtionet` returns nothing, and it prints each failure itself.
-            virtionet::prove(&mut com1, online.cpus(), tsc_hz);
+            virtionet::prove(flow, &mut com1, online.cpus(), tsc_hz);
             // The IOMMU's own proofs, through the bound NVMe controller: translated DMA, a
             // blocked and recorded DMA, remapped and blocked interrupts.
-            let devices = storage::prove_iommu(&mut com1, online.cpus(), tsc_hz);
+            let devices = storage::prove_iommu(flow, &mut com1, online.cpus(), tsc_hz);
             proofs.record(Proof::IommuDevices, devices);
             // Legacy interrupts under interrupt remapping: the PIT's IRQ0 through the I/O
             // APIC in remappable format and an IRTE that checks the I/O APIC's source ID,
             // with the IRTE made not present and given a wrong source ID (CLAUDE.md §24,
             // §32; ADR-0007 I8).
-            let remapped = irq::prove_remapped(&mut com1, online.cpus(), tsc_hz);
+            let remapped = irq::prove_remapped(flow, &mut com1, online.cpus(), tsc_hz);
             proofs.record(Proof::IoApicRemapped, remapped);
             // Bus mastering is on exactly for what the drivers attached to a domain.
             let mastering = pcie::prove_bus_mastering(&mut com1, q);
@@ -446,7 +496,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         } else {
             proofs.record(Proof::Pcie, false);
         }
-        sched::stop_boot_processor();
+        sched::stop_boot_processor(flow);
     }
 
     // M8/M9 groundwork: the in-memory VFS (paths, directories, files).
@@ -468,9 +518,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     proofs.record(Proof::Sysfs, prove_sysfs(&mut com1));
     // The console's sending and drawing in sections, proven last so that what it prints is
     // still on the screen when the boot test compares the screen with the serial log.
-    let uart = console::prove_uart_sections(&mut com1);
+    let uart = console::prove_uart_sections(flow, &mut com1);
     proofs.record(Proof::ConsoleUartSections, uart);
-    let screen = console::prove_sections(&mut com1);
+    let screen = console::prove_sections(flow, &mut com1);
     proofs.record(Proof::ConsoleSections, screen);
 
     // The operator's summary: everything above scrolls past on a real machine's screen.
@@ -640,7 +690,11 @@ fn prove_nospec(com1: &mut Console) -> bool {
 /// ADR-0017 Z3: on every processor, one IBPB for each change of the process it runs in
 /// ring 3 where the processor has the command, and none where it has not; and the scheduler
 /// did note the processes the proofs before this one ran. Prints what one IBPB costs.
-fn prove_ibpb(com1: &mut Console, cpus: &[cpu::CpuIndex]) -> bool {
+fn prove_ibpb(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[cpu::CpuIndex],
+) -> bool {
     use origin_frame::speculation;
     let mut sound = true;
     let (mut changes, mut barriers, mut resumes) = (0u64, 0u64, 0u64);
@@ -665,7 +719,7 @@ fn prove_ibpb(com1: &mut Console, cpus: &[cpu::CpuIndex]) -> bool {
     let start = time::monotonic_nanos();
     let mut issued = 0;
     for _ in 0..SAMPLES {
-        issued += u64::from(cpu::issue_ibpb());
+        issued += u64::from(cpu::issue_ibpb(cpu::this_cpu(flow.here())));
     }
     let taken = time::monotonic_nanos().saturating_sub(start);
     let _ = if issued == SAMPLES {
@@ -1071,11 +1125,16 @@ pub(crate) fn check_initramfs(image: &[u8]) -> InitramfsCheck {
 ///   the resulting package, die, module and core counts with the machine it asked QEMU for.
 ///
 /// None of this reads the QEMU machine definition; the counts are only printed here.
-fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -> bool {
+fn prove_topology(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut console::Console,
+    rsdp: u64,
+    online: &smp::Online,
+) -> bool {
     use crate::topology::{self, CpuTopology, Layout, Source};
 
     // The boot processor's own record; every AP wrote its own before it came online.
-    smp::record_topology();
+    smp::record_topology(cpu::this_cpu(flow.here()));
     // The cache hierarchy from leaf 04h.
     let mut caches = [crate::cache::Cache {
         level: 0,
@@ -1349,6 +1408,209 @@ fn prove_slit(com1: &mut console::Console, rsdp: u64) -> bool {
     consistent
 }
 
+/// Builds the scheduling domains (ADR-0020 S8; TASKS item 97) from what each processor recorded
+/// about itself, the SRAT's nodes and the PPTT's caches where the firmware has one, keeps them in
+/// `domains::DOMAINS` for the balancer, and prints them, so `cargo xtask` can compare the tree with
+/// the machine it booted. Every processor's capacity is the same (S9's source 5): no hardware
+/// source is read before TASKS item 106.
+///
+/// A Report proof (ADR-0013 R3): it fails, and the boot goes on, when a processor recorded
+/// nothing, a claim was cut because two processors disagree about sharing, the PPTT and CPUID
+/// disagree or the PPTT breaks a rule its reading needs, a processor is in no node while the SRAT
+/// exists, or the levels do not nest. Each is read the conservative way, as "not shared".
+fn prove_domains(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -> bool {
+    use crate::acpi::{self, CpuAffinity, Processor as Listed};
+    use crate::domains::{self, Domains, Input, Processor, Tree};
+    use crate::topology::CacheLeaf;
+    use alloc::vec::Vec;
+
+    let cpus = online.cpus();
+    let n = cpus.len();
+
+    // The SRAT's nodes, as the NUMA proof reads them.
+    let srat = crate::firmware::acpi_table(rsdp, b"SRAT").ok();
+    let affinities: Option<Vec<CpuAffinity>> = srat.and_then(|t| {
+        let mut out = alloc::vec![CpuAffinity::default(); t.len() / 16];
+        let count = acpi::srat_cpu_affinities(t, &mut out).ok()?;
+        out.truncate(count);
+        Some(out)
+    });
+
+    // Each online processor's own reports.
+    let processors: Vec<Processor> = cpus
+        .iter()
+        .map(|&c| {
+            let apic_id = c.apic_id().unwrap_or(u32::MAX);
+            Processor {
+                cpu: u32::try_from(c.get()).unwrap_or(u32::MAX),
+                apic_id,
+                topology: smp::topology_of(c),
+                node: affinities
+                    .as_deref()
+                    .and_then(|a| crate::numa::node_of_cpu(a, apic_id)),
+            }
+        })
+        .collect();
+
+    // The PPTT, where the firmware has one: its processors are named by the MADT's ACPI
+    // processor IDs.
+    let madt: Vec<Listed> = crate::firmware::acpi_table(rsdp, b"APIC")
+        .ok()
+        .and_then(|t| {
+            let mut out = alloc::vec![Listed::default(); t.len() / 8];
+            let count = acpi::madt_processors(t, &mut out).ok()?;
+            out.truncate(count);
+            Some(out)
+        })
+        .unwrap_or_default();
+    let pptt_bytes = crate::firmware::acpi_table(rsdp, b"PPTT").ok();
+    let pptt = pptt_bytes.map(|t| {
+        let listed: Vec<(u32, bool)> = madt.iter().map(|p| (p.uid, p.enabled)).collect();
+        let asked: Vec<u32> = processors
+            .iter()
+            .map(|p| {
+                madt.iter()
+                    .find(|l| l.apic_id == p.apic_id)
+                    .map_or(u32::MAX, |l| l.uid)
+            })
+            .collect();
+        acpi::pptt_caches(t, &listed, &asked)
+    });
+    let claims = match &pptt {
+        Some(Ok(Some(c))) => Some(domains::PpttClaims {
+            second_level: c.second_level.clone(),
+            last_level: c.last_level.clone(),
+        }),
+        _ => None,
+    };
+
+    let tree = Tree::build(&Input {
+        processors: &processors,
+        srat: affinities.is_some(),
+        pptt: claims.as_ref(),
+    });
+
+    let _ = write!(com1, "origin-kernel: domains: {n} processors: ");
+    for (i, level) in tree.levels().iter().enumerate() {
+        let _ = write!(com1, "{}{level}", if i == 0 { "" } else { "; " });
+    }
+    let _ = writeln!(com1);
+
+    // Where the claims came from.
+    let recorded: Vec<_> = processors.iter().filter_map(|p| p.topology).collect();
+    let _ = write!(com1, "origin-kernel: domains: from: caches by ");
+    let mut first = true;
+    for leaf in [CacheLeaf::Leaf04, CacheLeaf::Leaf8000001D, CacheLeaf::None] {
+        let k = recorded.iter().filter(|t| t.caches.leaf() == leaf).count();
+        if k > 0 {
+            let _ = write!(
+                com1,
+                "{}{leaf} on {k} of {n}",
+                if first { "" } else { ", " }
+            );
+            first = false;
+        }
+    }
+    if first {
+        let _ = write!(com1, "nothing recorded");
+    }
+    let unused = recorded
+        .iter()
+        .filter(|t| t.caches.problem().is_some())
+        .count();
+    if unused > 0 {
+        let _ = write!(com1, " ({unused} with a sub-leaf not used)");
+    }
+    let pptt_ok = match &pptt {
+        None => {
+            let _ = write!(com1, "; PPTT none");
+            true
+        }
+        Some(Ok(None)) => {
+            let _ = write!(com1, "; PPTT without caches");
+            true
+        }
+        Some(Ok(Some(c))) => {
+            let _ = write!(com1, "; PPTT {} caches, {} with IDs", c.caches, c.with_id);
+            true
+        }
+        Some(Err(rule)) => {
+            let _ = write!(com1, "; PPTT not used: {rule}");
+            false
+        }
+    };
+    let nodes: Vec<u32> = processors.iter().filter_map(|p| p.node).collect();
+    let order = match &affinities {
+        None => Vec::new(),
+        Some(_) => {
+            let slit = crate::firmware::acpi_table(rsdp, b"SLIT")
+                .ok()
+                .and_then(|t| acpi::parse_slit(t).ok());
+            crate::numa::node_order(slit.as_ref(), &nodes)
+        }
+    };
+    match &affinities {
+        None => {
+            let _ = writeln!(com1, "; no SRAT");
+        }
+        Some(_) => {
+            let _ = write!(com1, "; nodes by the SRAT, nearest first:");
+            for (i, (node, others)) in order.iter().enumerate() {
+                let _ = write!(com1, "{} {node} [", if i == 0 { "" } else { "," });
+                for (j, other) in others.iter().enumerate() {
+                    let _ = write!(com1, "{}{other}", if j == 0 { "" } else { "," });
+                }
+                let _ = write!(com1, "]");
+            }
+            let _ = writeln!(com1);
+        }
+    }
+
+    // What disagreed, each read as "not shared".
+    let f = *tree.findings();
+    let _ = write!(
+        com1,
+        "origin-kernel: domains: {} claims cut, {} differing from the PPTT, {} naming another cache level than CPUID, {} in no node, {} recorded nothing; levels crossing: ",
+        f.cuts(),
+        f.differences(),
+        f.level_mismatches(),
+        f.unplaced,
+        f.unrecorded
+    );
+    match f.crossing {
+        None => {
+            let _ = writeln!(com1, "none");
+        }
+        Some((a, b)) => {
+            let _ = writeln!(
+                com1,
+                "{} and {}, so only the processors' own core, die and package are used",
+                a.name(),
+                b.name()
+            );
+        }
+    }
+
+    let capacity = crate::capacity::equal(n);
+    let consistent = f.agree() && pptt_ok;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: domains: capacity {} on {n} of {n} processors (ADR-0020 S9 source 5: no hardware source is read before TASKS item 106); consistent {consistent}{}",
+        crate::capacity::FULL,
+        if consistent {
+            ""
+        } else {
+            ": scheduling domains failed"
+        }
+    );
+    let _ = domains::DOMAINS.set(Domains {
+        tree,
+        node_order: order,
+        capacity,
+    });
+    consistent
+}
+
 /// How an instruction stands, as the generator's lines give it.
 fn condition_name(condition: origin_frame::random::Condition) -> &'static str {
     use origin_frame::random::Condition;
@@ -1463,7 +1725,12 @@ fn ticks_to_nanos(ticks: u64, tsc_hz: u64) -> u64 {
 /// requests are answered with values that differ, the generator's stack holds only zeros after
 /// a request (R9 Z3), and what a request costs and how long a step kept interrupts off
 /// (R12; rules 21 and 22). With no generator it says so and fails: randomness is withheld.
-fn prove_random(com1: &mut Console, cpus: &[cpu::CpuIndex], tsc_hz: u64) -> bool {
+fn prove_random(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[cpu::CpuIndex],
+    tsc_hz: u64,
+) -> bool {
     use origin_frame::random::{self, Condition, Error};
 
     // Every processor started its generator as it came up; give the last of them a moment.
@@ -1534,7 +1801,8 @@ fn prove_random(com1: &mut Console, cpus: &[cpu::CpuIndex], tsc_hz: u64) -> bool
     const FRESH_ASKS: u32 = 3;
     // The rest after a "not now" is one second (TASKS 18b S3).
     const FRESH_WAIT_NANOS: u64 = 1_100_000_000;
-    let here = random::processor(cpu::this_cpu());
+    // The boot flow's own processor (TASKS item 93): a value, read under the flow's witness.
+    let here = random::processor(cpu::this_cpu(flow.here()).index());
     let rdseed = here.is_some_and(|p| p.rdseed == Condition::Healthy);
     let mut fresh = [0u8; 32];
     let mut fresh_result = random::fill_fresh(&mut fresh);
@@ -1668,7 +1936,11 @@ fn prove_backtrace(com1: &mut Console, info: &BootInfo) -> bool {
 
 /// The kernel's page tables, built, the framebuffer kept, loaded and proven. Returns whether
 /// the kernel now runs on them.
-fn init_paging(com1: &mut Console, early: &mut Early) -> bool {
+fn init_paging(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    early: &mut Early,
+) -> bool {
     let Some(mut tables) = early.build_kernel_tables(com1) else {
         return false;
     };
@@ -1677,7 +1949,7 @@ fn init_paging(com1: &mut Console, early: &mut Early) -> bool {
     if console::has_screen() && !early.map_framebuffer(&mut tables) {
         console::withdraw_framebuffer(com1);
     }
-    early.load_kernel_tables(com1, tables)
+    early.load_kernel_tables(flow, com1, tables)
 }
 
 /// Writes `origin.core` into its frames, once, and says what it took: every process that is
@@ -1807,9 +2079,13 @@ struct NmiProof {
 
 /// Sends this processor an NMI and checks where it was taken. An NMI that does not arrive
 /// says nothing about the stack: that case, and a wrong stack, stay apart in the result.
-fn prove_nmi_ist(com1: &mut Console, tsc_hz: u64) -> NmiProof {
+fn prove_nmi_ist(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    tsc_hz: u64,
+) -> NmiProof {
     let (before, _) = cpu::nmis();
-    timer::send_nmi_to_self();
+    timer::send_nmi_to_self(cpu::this_cpu(flow.here()));
     let start = cpu::rdtsc();
     while cpu::nmis().0 == before && cpu::rdtsc().wrapping_sub(start) < tsc_hz {
         core::hint::spin_loop();

@@ -25,8 +25,10 @@ pub enum Action {
     Reschedule,
 }
 
-/// A device interrupt handler.
-pub type Handler = fn() -> Action;
+/// A device interrupt handler. It runs in the trap entry, with interrupts off, and takes the trap
+/// entry's witness (ADR-0020 S3; TASKS item 93): what it reads of the processor index, and of
+/// this processor's entries of per-processor tables, it reads under it.
+pub type Handler = fn(crate::trap::Here<'_>) -> Action;
 
 /// Why [`register`] refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,10 +66,10 @@ pub const fn is_device_vector(vector: u8) -> bool {
     vector >= FIRST && vector <= LAST
 }
 
-/// Runs `vector`'s handler if it has one; a vector no driver claimed resumes what it
-/// interrupted (a device that interrupts before its driver registers is lost, as an
-/// interrupt with no handler always is).
-pub fn run(vector: u8) -> Action {
+/// Runs `vector`'s handler if it has one, under `here`, the trap entry's witness; a vector no
+/// driver claimed resumes what it interrupted (a device that interrupts before its driver
+/// registers is lost, as an interrupt with no handler always is).
+pub fn run(vector: u8, here: crate::trap::Here<'_>) -> Action {
     let raw = index(vector)
         .and_then(|i| HANDLERS.get(i))
         .map_or(0, |slot| slot.load(Ordering::Acquire));
@@ -78,19 +80,26 @@ pub fn run(vector: u8) -> Action {
     // writes them, and it stores `handler as usize`, which round-trips for a function pointer
     // of the same type.
     let handler = unsafe { core::mem::transmute::<usize, Handler>(raw) };
-    handler()
+    handler(here)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn resume() -> Action {
+    use crate::trap::{Here, host_section};
+
+    fn resume(_: Here<'_>) -> Action {
         Action::Resume
     }
 
-    fn resched() -> Action {
+    fn resched(_: Here<'_>) -> Action {
         Action::Reschedule
+    }
+
+    /// `run`, under a host section's witness.
+    fn run_here(vector: u8) -> Action {
+        host_section(|here| run(vector, here))
     }
 
     // One test: `HANDLERS` is one global table, and vectors used here stay taken.
@@ -100,12 +109,12 @@ mod tests {
         assert_eq!(register(0x50, resume), Err(RegisterError::NotADeviceVector));
         assert_eq!(register(0x44, resched), Ok(()));
         assert_eq!(register(0x44, resume), Err(RegisterError::Taken));
-        assert_eq!(run(0x44), Action::Reschedule);
+        assert_eq!(run_here(0x44), Action::Reschedule);
         assert_eq!(register(0x4F, resume), Ok(()));
-        assert_eq!(run(0x4F), Action::Resume);
+        assert_eq!(run_here(0x4F), Action::Resume);
         // A vector no driver claimed resumes what it interrupted.
-        assert_eq!(run(0x45), Action::Resume);
-        assert_eq!(run(0x20), Action::Resume);
+        assert_eq!(run_here(0x45), Action::Resume);
+        assert_eq!(run_here(0x20), Action::Resume);
         assert!(is_device_vector(FIRST) && is_device_vector(LAST));
         assert!(!is_device_vector(FIRST - 1) && !is_device_vector(LAST + 1));
     }

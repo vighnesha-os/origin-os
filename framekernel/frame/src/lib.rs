@@ -33,11 +33,13 @@ pub mod apic;
 pub mod apstart;
 pub mod bitmap;
 pub mod boot;
+pub mod capacity;
 pub mod clock;
 pub mod cpuident;
 pub mod cpumap;
 pub mod descriptors;
 pub mod dmar;
+pub mod domains;
 pub mod features;
 pub mod frames;
 pub mod heap;
@@ -65,6 +67,8 @@ pub mod vtd;
 #[cfg(test)]
 mod testing;
 
+#[cfg(all(origin_bench, target_os = "none"))]
+pub mod bench;
 #[cfg(target_os = "none")]
 pub mod cpu;
 #[cfg(target_os = "none")]

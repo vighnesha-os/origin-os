@@ -11,6 +11,8 @@
 //! (CLAUDE.md §3, §5).
 #![cfg_attr(not(test), no_std)]
 
+#[cfg(any(test, origin_bench))]
+pub mod bench;
 pub mod console;
 pub mod framebuffer;
 pub mod kernel;
@@ -20,4 +22,5 @@ pub mod protocols;
 pub mod spcr;
 pub mod text;
 pub mod trust;
+pub mod uart;
 pub mod uefi;

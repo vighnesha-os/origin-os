@@ -507,6 +507,14 @@ fn check_pair(
             copies.join("\n"),
         ));
     }
+    // TASKS item 112, F2: no image a normal build makes holds a bench build's code, whose lines
+    // all say "bench build" (`bench::build` requires the text in both bench images).
+    if crate::bench::holds(&first.bytes, crate::bench::MARKER) {
+        return Err(format!(
+            "{} holds the text \"bench build\": a bench build's code reached an image a normal build makes (TASKS item 112, F2)",
+            first.name
+        ));
+    }
     if let Some((path, at)) = toolchain::host_path_in(&first.bytes, host_paths) {
         return Err(format!(
             "{} holds a path of the machine that built it (CLAUDE.md §75, §60): {}, `{}`, at offset {at:#x}\n  the text there: `{}`\n  `xtask` remaps the toolchain's source directory in every image build (`toolchain::image_config`, `toolchain::userspace_config`). A path that still reaches an image needs a remap of its own, or must not be compiled in",
@@ -642,7 +650,7 @@ fn pe_time_stamp(image: &[u8]) -> Option<Range<usize>> {
 }
 
 /// `bytes` in hexadecimal, two digits each, with `between` between them.
-fn hex(bytes: &[u8], between: &str) -> String {
+pub(crate) fn hex(bytes: &[u8], between: &str) -> String {
     bytes
         .iter()
         .map(|byte| format!("{byte:02x}"))

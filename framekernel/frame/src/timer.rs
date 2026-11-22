@@ -14,11 +14,12 @@
 //!    polling with interrupt windows (never halting, so a lost interrupt cannot hang the
 //!    check past its two-second deadline), and check the TSC-measured time ([`apic::judge_ticks`]);
 //!    then read the timer's count against the TSC for its period ([`apic::judge_period`]). A
-//!    run a stall made slow, or with no clean pair of count reads, is measured again, up to
+//!    run a stall made slow, or with no pair of count reads that decides, is measured again, up to
 //!    [`PROOF_ATTEMPTS`] runs ([`apic::tick_verdict`]);
 //! 5. mask the timer again: nothing schedules on it yet (M3).
 
 use core::fmt::Write;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::acpi;
@@ -42,6 +43,9 @@ const PROOF_TICKS: u64 = 50;
 /// ([`apic::TickVerdict::Stalled`]), each against the same bounds. Each run is at most 2 s, so
 /// a boot pays for more only while disturbed (TASKS item 66).
 const PROOF_ATTEMPTS: u32 = 4;
+// The count's figures line stays under 160 bytes only while a run's number has one digit
+// (`apic::CountFigures::line`).
+const _: () = assert!(PROOF_ATTEMPTS < 10);
 /// Calibration window.
 const CALIBRATION_MICROS: u64 = 10_000;
 /// APIC timer divisor during calibration and afterwards.
@@ -87,18 +91,24 @@ enum ApicWrite {
 
 /// The local APIC, in x2APIC mode: holding one proves the mode switch happened, so its
 /// register MSRs exist.
+///
+/// It is this processor's, so it lives no longer than the witness its processor was read under
+/// (`'a`; ADR-0020 S3), and is neither `Send` nor `Sync` (TASKS item 93, review finding R93-4).
+/// Kept past that witness, or sent to another thread, it would program the local APIC of whatever
+/// processor its holder ran on by then.
 #[derive(Debug)]
-pub struct X2Apic(());
+pub struct X2Apic<'a>(PhantomData<crate::trap::Here<'a>>);
 
-impl X2Apic {
+impl<'a> X2Apic<'a> {
     /// Switches the local APIC to x2APIC mode through the legal transitions and
-    /// software-enables it with [`SPURIOUS_VECTOR`].
+    /// software-enables it with [`SPURIOUS_VECTOR`]. `me` is this processor, read under its
+    /// start-up flow's witness (ADR-0020 S3; TASKS item 93): the mode is marked ready under it.
     ///
     /// # Safety
     ///
     /// CPL 0, boot processor only, interrupts disabled, and x2APIC supported
     /// ([`cpu::x2apic_supported`]); the spurious vector must have an IDT gate.
-    pub unsafe fn enable() -> Self {
+    pub unsafe fn enable(me: crate::cpu::ThisCpu<'a>) -> Self {
         // SAFETY: the caller's contract; IA32_APIC_BASE exists on every x86-64 processor.
         let current = unsafe { rdmsr(IA32_APIC_BASE) };
         let (writes, count) = apic::x2apic_transition(current);
@@ -107,21 +117,22 @@ impl X2Apic {
             // disabled → xAPIC → x2APIC sequence, keeping every other bit as it was.
             unsafe { wrmsr(IA32_APIC_BASE, value) };
         }
-        let apic = Self(());
+        let apic = Self(PhantomData);
         apic.write(ApicWrite::SpuriousVector, apic::svr(SPURIOUS_VECTOR));
-        if let Some(ready) = X2APIC_READY.get(crate::cpu::this_cpu().get()) {
+        if let Some(ready) = X2APIC_READY.this(me) {
             ready.store(true, core::sync::atomic::Ordering::Release);
         }
         apic
     }
 
     /// This processor's handle, if its local APIC has been switched to x2APIC mode
-    /// ([`X2Apic::enable`] has run here): the safe way to get one.
-    pub fn this_cpu() -> Option<Self> {
+    /// ([`X2Apic::enable`] has run here): the safe way to get one, for the processor `me` names,
+    /// read under a witness (ADR-0020 S3; TASKS item 93). Its uses stay in that witness's life.
+    pub fn here(me: crate::cpu::ThisCpu<'a>) -> Option<Self> {
         X2APIC_READY
-            .get(crate::cpu::this_cpu().get())
+            .this(me)
             .is_some_and(|ready| ready.load(core::sync::atomic::Ordering::Acquire))
-            .then_some(Self(()))
+            .then_some(Self(PhantomData))
     }
 
     /// The handle for a processor whose local APIC is already in x2APIC mode, without
@@ -129,9 +140,12 @@ impl X2Apic {
     ///
     /// # Safety
     ///
-    /// CPL 0, and [`X2Apic::enable`] has run on this processor.
+    /// CPL 0, and [`X2Apic::enable`] has run on this processor. And the handle is used only while
+    /// its holder cannot leave this processor: with interrupts off, or in a witness's life (ADR-0020
+    /// S3). The caller chooses its lifetime, `'static` included, so the type does not hold that
+    /// part (TASKS item 93, the addendum review's A93-1).
     pub unsafe fn assume_enabled() -> Self {
-        Self(())
+        Self(PhantomData)
     }
 
     pub fn read(&self, reg: ApicRead) -> u64 {
@@ -201,11 +215,11 @@ pub(crate) static X2APIC_READY: crate::percpu::PerCpu<core::sync::atomic::Atomic
 /// APIC is not in x2APIC mode yet. Safe: an IPI with this fixed vector does nothing a timer
 /// interrupt could not do, and the destination cannot be harmed by a stray one (its handler
 /// only reschedules).
-pub fn send_reschedule_ipi(apic_id: u32) {
-    if let Some(lapic) = X2Apic::this_cpu() {
+pub fn send_reschedule_ipi(me: crate::cpu::ThisCpu<'_>, apic_id: u32) {
+    if let Some(lapic) = X2Apic::here(me) {
         let value = (u64::from(apic_id) << 32)
             | u64::from(ICR_ASSERT | u32::from(crate::cpu::RESCHEDULE_VECTOR));
-        // SAFETY: x2APIC mode is on (`this_cpu`), so the ICR exists; a fixed IPI with the
+        // SAFETY: x2APIC mode is on (`here`), so the ICR exists; a fixed IPI with the
         // reschedule vector only reschedules its destination.
         unsafe { crate::cpu::wrmsr(X2APIC_ICR, value) };
         let _ = lapic;
@@ -218,10 +232,10 @@ const ICR_NMI: u64 = 0x4400;
 
 /// Sends this processor an NMI (x2APIC ICR, NMI delivery, addressed to its own APIC ID).
 /// Nothing happens if its APIC is not in x2APIC mode. Safe: the NMI handler only records it.
-pub fn send_nmi_to_self() {
-    if let Some(lapic) = X2Apic::this_cpu() {
+pub fn send_nmi_to_self(me: crate::cpu::ThisCpu<'_>) {
+    if let Some(lapic) = X2Apic::here(me) {
         let own = lapic.read(ApicRead::Id);
-        // SAFETY: x2APIC mode is on (`this_cpu`), so the ICR exists; an NMI to this
+        // SAFETY: x2APIC mode is on (`here`), so the ICR exists; an NMI to this
         // processor runs the kernel's NMI handler, which only counts it.
         unsafe { crate::cpu::wrmsr(X2APIC_ICR, (own << 32) | ICR_NMI) };
     }
@@ -232,8 +246,8 @@ pub fn send_nmi_to_self() {
 /// proof can see where it is taken: with interrupts off, it waits until something lets it in.
 /// Nothing happens if this processor's APIC is not in x2APIC mode. Safe: the vector has a gate
 /// and its handler is safe code, so this is no more than a device can do at any moment.
-pub fn interrupt_self() {
-    if let Some(lapic) = X2Apic::this_cpu() {
+pub fn interrupt_self(me: crate::cpu::ThisCpu<'_>) {
+    if let Some(lapic) = X2Apic::here(me) {
         // SAFETY: fixed delivery of a vector with an IDT gate, to this processor alone: the
         // same as the device behind that vector interrupting it.
         unsafe {
@@ -364,8 +378,8 @@ pub fn timed_programming() -> Option<apic::TimerProgramming> {
 /// This processor's timer as programmed, read back from its x2APIC through [`X2Apic::read`];
 /// `None` if x2APIC mode is not on. For the preemption proof's check that every processor
 /// ticks as the boot processor's proof timed (TASKS item 66, the review's T66-R1).
-pub fn programmed() -> Option<apic::TimerProgramming> {
-    let lapic = X2Apic::this_cpu()?;
+pub fn programmed(here: crate::trap::Here<'_>) -> Option<apic::TimerProgramming> {
+    let lapic = X2Apic::here(crate::cpu::this_cpu(here))?;
     Some(apic::TimerProgramming::from_registers(
         lapic.read(ApicRead::TimerInitial),
         lapic.read(ApicRead::TimerDivide),
@@ -392,7 +406,7 @@ pub fn start_periodic(lapic: &X2Apic) -> bool {
     true
 }
 
-impl X2Apic {
+impl X2Apic<'_> {
     /// Stops this processor's APIC timer.
     pub fn stop(&self) {
         self.stop_timer();
@@ -484,8 +498,8 @@ fn pm_timer(rsdp: u64) -> Option<Reference> {
 
 /// Brings up the local APIC and proves its timer, with the ACPI tables at `rsdp` for a
 /// reference other than the PIT if it does not count. Returns the TSC rate in Hz if every
-/// step passed.
-pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
+/// step passed. `flow` is the boot flow's witness (ADR-0020 S3; TASKS item 93).
+pub fn init(flow: crate::trap::Pinned<'_>, com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
     // Every vector this can make arrive needs the kernel's own IDT.
     if !cpu::tables_ready() {
         let _ = writeln!(
@@ -502,8 +516,9 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
     let mut ports = unsafe { LegacyPorts::new() };
     ports.mask_pics();
     // SAFETY: CPL 0, boot processor, interrupts disabled, x2APIC supported (checked), and
-    // `cpu::init` installed a gate for the spurious vector.
-    let lapic = unsafe { X2Apic::enable() };
+    // `cpu::init` installed a gate for the spurious vector. The index is read under the boot
+    // flow's witness, after the check above that the CPU's tables (and so GS) are live.
+    let lapic = unsafe { X2Apic::enable(crate::cpu::this_cpu(flow.here())) };
     let version = lapic.read(ApicRead::Version);
     let _ = writeln!(
         com1,
@@ -542,17 +557,19 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
     // nominal, whatever the interrupts did (the addendum review's T66-R13). The interrupts'
     // delivery from their stamps: all 50 within the 2 s limit, not under 95 % of their nominal
     // time in total, and at most 50 % slower (an emulator may coalesce late expiries; physical
-    // hardware qualification will tighten that, CLAUDE.md §74). A run with no clean pair of
-    // count reads, or whose delivery a stall made slow, and only such a run, is measured again
-    // against the same bounds (`apic::tick_verdict`).
+    // hardware qualification will tighten that, CLAUDE.md §74). A run with no pair of count
+    // reads that decides, or whose delivery a stall made slow, and only such a run, is measured
+    // again against the same bounds (`apic::tick_verdict`).
     let period = tsc_hz / HZ;
     let micros = |ticks: u64| ticks.saturating_mul(1_000_000) / tsc_hz.max(1);
     let expected = PROOF_TICKS * 1_000_000 / HZ;
     let mut stamps = [0u64; PROOF_TICKS as usize];
+    // How each count read's TSC readings are fenced, chosen once (TASKS item 78, Q7).
+    let fence = cpu::TscFence::detect();
     let mut attempts = 0;
     let (run, verdict, seen_period, timed, lasted) = loop {
         attempts += 1;
-        let timed = take_ticks(&lapic, count, tsc_hz, &mut stamps);
+        let timed = take_ticks(&lapic, fence, count, tsc_hz, &mut stamps);
         let seen = stamps.get(..timed.taken).unwrap_or(&[]);
         let run = apic::judge_ticks(timed.start, seen, PROOF_TICKS as usize, period);
         let verdict = apic::tick_verdict(run.verdict, apic::judge_period(timed.sample, period));
@@ -560,6 +577,9 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
             ppm: timed.sample.map(|sample| sample.ppm_of(period)),
             tries: timed.tries,
         };
+        // What the count reads showed, on every run and before its verdict's line: it judges
+        // nothing, and says why a run's period was or was not decided (TASKS item 78).
+        let _ = writeln!(com1, "{}", timed.figures.line(attempts, tsc_hz));
         if verdict != TickVerdict::Stalled || attempts == PROOF_ATTEMPTS {
             // A short run lasted until its limit, not until its last interrupt.
             let lasted = if (timed.taken as u64) < PROOF_TICKS {
@@ -620,7 +640,13 @@ pub fn init(com1: &mut dyn Write, rsdp: u64) -> Option<u64> {
 /// poll that saw it, until `stamps` is full or two seconds pass, polling with interrupt windows
 /// (never halting, so a lost interrupt cannot hang the check). Returns the TSC at the start and
 /// how many interrupts were stamped, and the TSC at the end. The timer is stopped again.
-fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> TimedRun {
+fn take_ticks(
+    lapic: &X2Apic,
+    fence: cpu::TscFence,
+    count: u32,
+    tsc_hz: u64,
+    stamps: &mut [u64],
+) -> TimedRun {
     // An expiry a stopped run left pending is taken here, before the count starts, so that a
     // repeated run cannot begin one interrupt ahead (the review's T66-R6).
     cpu::interrupt_window();
@@ -656,7 +682,7 @@ fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> Ti
     ];
     // The timer's period from its count, still running as timed (the addendum review's
     // T66-R13).
-    let (sample, tries) = sample_period(lapic, registers[0], tsc_hz / HZ);
+    let (sample, tries, figures) = sample_period(lapic, fence, registers[0], tsc_hz / HZ);
     lapic.stop_timer();
     TimedRun {
         start,
@@ -665,6 +691,7 @@ fn take_ticks(lapic: &X2Apic, count: u32, tsc_hz: u64, stamps: &mut [u64]) -> Ti
         registers,
         sample,
         tries,
+        figures,
     }
 }
 
@@ -676,9 +703,11 @@ struct TimedRun {
     end: u64,
     /// The timer's initial count, divide configuration and LVT entry as the run held them.
     registers: [u64; 3],
-    /// The first clean pair of reads of its count, if one came, and the pairs tried.
+    /// The first pair of reads of its count that decided, if one did, and the pairs tried.
     sample: Option<apic::PeriodSample>,
     tries: u32,
+    /// What the count reads showed, for the run's figures line (TASKS item 78).
+    figures: apic::CountFigures,
 }
 
 /// How a run's count showed its period, for the proof's lines (the coordinating session's
@@ -716,11 +745,13 @@ impl core::fmt::Display for PeriodShort {
     }
 }
 
-/// One read of the timer's current count, bracketed by the TSC.
-fn read_count(lapic: &X2Apic) -> apic::CountRead {
-    let before = rdtsc();
+/// One read of the timer's current count, bracketed by the TSC: the first reading taken before
+/// the count's RDMSR can start, the second only once it has executed (`fence`; TASKS item 78,
+/// Q7), so that the bracket encloses the instant the count was taken.
+fn read_count(lapic: &X2Apic, fence: cpu::TscFence) -> apic::CountRead {
+    let before = fence.before();
     let count = lapic.read(ApicRead::TimerCurrent);
-    let after = rdtsc();
+    let after = fence.after();
     apic::CountRead {
         before,
         count,
@@ -730,8 +761,13 @@ fn read_count(lapic: &X2Apic) -> apic::CountRead {
 
 /// Measures the running periodic timer's period from its count, reloaded with `initial`
 /// ([`apic::sample_period`], which judges the reads).
-fn sample_period(lapic: &X2Apic, initial: u64, nominal: u64) -> (Option<apic::PeriodSample>, u32) {
-    apic::sample_period(initial, nominal, || read_count(lapic))
+fn sample_period(
+    lapic: &X2Apic,
+    fence: cpu::TscFence,
+    initial: u64,
+    nominal: u64,
+) -> (Option<apic::PeriodSample>, u32, apic::CountFigures) {
+    apic::sample_period(initial, nominal, || read_count(lapic, fence))
 }
 
 /// One PIT channel-2 one-shot of `pit` input clocks, with the APIC timer counting down and

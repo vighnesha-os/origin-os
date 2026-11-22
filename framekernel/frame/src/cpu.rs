@@ -29,7 +29,7 @@ use crate::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
     TSS, TSS_SIZE,
 };
-use origin_sync::contexts::{BOOT_FLOW, Contexts, Refused, Switched};
+use origin_sync::contexts::{BOOT_FLOW, Contexts, Moves, Quiet, Refused, Switched};
 
 use crate::percpu::PerCpu;
 use crate::trap::Switch;
@@ -345,7 +345,9 @@ unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex, interrupt_stacks:
     // GS was just reloaded (base 0): point it at this processor's CPU-local area.
     init_cpu_local(tss_field.addr() as u64, index);
     init_cpu_state();
-    init_speculation();
+    // The index just set, read in a section (ADR-0020 S3; TASKS item 93): interrupts are already
+    // off here, as the caller's contract says, so the section only gives the witness.
+    without_interrupts_here(|at| init_speculation(this_cpu(at)));
 }
 
 /// The processor indexes the kernel has: 1, the boot processor's, until the processors are
@@ -635,31 +637,64 @@ fn cpu_state_holds() -> bool {
         && sysenter_cs == 0
 }
 
-/// Each CPU index whose processor passed [`cpu_state_holds`] on itself.
-pub(crate) static CPU_STATE_HOLDS: PerCpu<core::sync::atomic::AtomicBool> = PerCpu::new(
-    "origin_frame::cpu::CPU_STATE_HOLDS",
-    core::sync::atomic::AtomicBool::new(false),
-    || core::sync::atomic::AtomicBool::new(false),
+/// What each processor found about itself as it started, by CPU index: [`STATE_HOLDS`] and
+/// [`FPU_ALIKE`]. Written once, by the processor itself, in one store ([`record_cpu_state`]).
+pub(crate) static CPU_STATE: PerCpu<core::sync::atomic::AtomicU8> = PerCpu::new(
+    "origin_frame::cpu::CPU_STATE",
+    core::sync::atomic::AtomicU8::new(0),
+    || core::sync::atomic::AtomicU8::new(0),
 );
 
-/// Records whether this processor's control state holds, after `enable_simd`. The boot
-/// processor and every AP do it on themselves; an AP before its handshake, which orders the
-/// mark before the boot processor sees it online.
-pub fn record_cpu_state() {
-    if let Some(holds) = CPU_STATE_HOLDS.get(this_cpu().get()) {
-        holds.store(cpu_state_holds(), Ordering::Relaxed);
+/// [`CPU_STATE`]'s bit: the processor passed [`cpu_state_holds`] on itself.
+const STATE_HOLDS: u8 = 1 << 0;
+/// [`CPU_STATE`]'s bit: its FPU format is the boot processor's, so it takes part in moves
+/// (ADR-0020 S6).
+const FPU_ALIKE: u8 = 1 << 1;
+
+/// Records, in one store, whether this processor's control state holds (checked here, after
+/// `enable_simd`) and whether its FPU format is the boot processor's. The boot processor and
+/// every AP do it on themselves, once; an AP before its handshake, whose answer then orders
+/// the record before the boot processor sees it online. `me` is the index its flow read
+/// (ADR-0020 S3; TASKS item 93).
+pub fn record_cpu_state(me: ThisCpu<'_>, fpu_alike: bool) {
+    if let Some(state) = CPU_STATE.this(me) {
+        let holds = if cpu_state_holds() { STATE_HOLDS } else { 0 };
+        let alike = if fpu_alike { FPU_ALIKE } else { 0 };
+        state.store(holds | alike, Ordering::Release);
     }
+}
+
+/// How many of `cpus` recorded the bit `bit` of [`CPU_STATE`].
+fn recorded(cpus: &[CpuIndex], bit: u8) -> usize {
+    cpus.iter()
+        .filter(|c| {
+            CPU_STATE
+                .get(c.get())
+                .is_some_and(|s| s.load(Ordering::Acquire) & bit != 0)
+        })
+        .count()
 }
 
 /// How many of `cpus` recorded a control state that holds.
 pub fn cpu_states_holding(cpus: &[CpuIndex]) -> usize {
-    cpus.iter()
-        .filter(|c| {
-            CPU_STATE_HOLDS
-                .get(c.get())
-                .is_some_and(|h| h.load(Ordering::Relaxed))
-        })
-        .count()
+    recorded(cpus, STATE_HOLDS)
+}
+
+/// How many of `cpus` recorded an FPU format alike the boot processor's.
+pub fn fpu_formats_alike(cpus: &[CpuIndex]) -> usize {
+    recorded(cpus, FPU_ALIKE)
+}
+
+/// Whether processor `index` recorded an FPU format alike the boot processor's (ADR-0020 S6,
+/// N9). `false` for a processor that recorded nothing: an AP records only once every check
+/// before its handshake has passed, so one refused for any reason never says alike.
+///
+/// Not the whole answer to whether it takes part in moves: an AP whose answer came after the
+/// boot processor stopped waiting is parked with its record standing, and nothing writes it
+/// again. So the question is asked through the processors online,
+/// `smp::Online::takes_part_in_moves` (the review of TASKS item 94, R94-3).
+pub(crate) fn fpu_alike(index: CpuIndex) -> bool {
+    recorded(&[index], FPU_ALIKE) == 1
 }
 
 /// IA32_STAR, IA32_LSTAR and IA32_FMASK.
@@ -715,9 +750,12 @@ extern "sysv64" fn syscall_entry() {
     );
 }
 
-/// This processor's CPU-local area.
-fn local() -> &'static CpuLocal {
-    CPU_LOCAL.get(this_cpu().0).unwrap_or(&OUT_OF_RANGE)
+/// This processor's CPU-local area, lent for the life of the witness `here` (ADR-0020 S3; TASKS
+/// item 93). The index is read inside this function under that witness, not by its caller, as
+/// before TASKS item 93, so `dispatch`'s code stays the base's (TASKS item 93's static counts of
+/// 2026-11-21 found the read moved into the caller).
+fn local(here: crate::trap::Here<'_>) -> &'_ CpuLocal {
+    CPU_LOCAL.this(this_cpu(here)).unwrap_or(&OUT_OF_RANGE)
 }
 
 /// Names the stack the running context's interrupts and system calls from ring 3 land on: this
@@ -736,7 +774,10 @@ fn local() -> &'static CpuLocal {
 /// placed at least 2 MiB below the window's top (`layout::place`), and its guard pages are
 /// unmapped ones. So the delivery would fault into #DF, on its own stack, rather than write
 /// anywhere (the review of TASKS items 75, 77 and 81, R77-3).
-fn name_kernel_stack(home: u64) {
+///
+/// `at` is the trap entry's witness ([`resume`]'s), under which the index is read (ADR-0020 S3;
+/// TASKS item 93).
+fn name_kernel_stack(at: crate::trap::Here<'_>, home: u64) {
     let top = if home == BOOT_FLOW {
         0
     } else {
@@ -744,19 +785,19 @@ fn name_kernel_stack(home: u64) {
             Some(top) => top,
             None => panic!(
                 "the context resumed {} has its home in no kernel stack",
-                this_cpu().named()
+                this_cpu(at).index().named()
             ),
         }
     };
-    let local = this_cpu().0;
-    let Some(tss) = CPU_LOCAL.get(local).map(|l| l.tss.load(Ordering::Relaxed)) else {
+    let local = this_cpu(at);
+    let Some(tss) = CPU_LOCAL.this(local).map(|l| l.tss.load(Ordering::Relaxed)) else {
         return;
     };
     if tss == 0 {
         return;
     }
     let field = ptr::with_exposed_provenance_mut::<u32>(tss as usize + d::TSS_RSP0_OFFSET);
-    if let Some(l) = CPU_LOCAL.get(local) {
+    if let Some(l) = CPU_LOCAL.this(local) {
         // Release, read with Acquire by `stack_in_use` (TASKS item 70, Q2).
         l.kernel_stack.store(top, Ordering::Release);
     }
@@ -791,16 +832,23 @@ const fn ist_of(vector: u64) -> u8 {
 /// at the start of [`dispatch`], is also the first thing the system-call path does in Rust (the
 /// addition (d)). A frame elsewhere was pushed onto another stack, perhaps over a suspended
 /// context's frame: the processor halts, as the trap entry does for a frame it never saved.
-fn check_landing(here: u64, vector: u64) {
-    let me = this_cpu();
-    let home = CONTEXTS.get(me.get()).and_then(Contexts::running_home);
+///
+/// `at` is the trap entry's witness, under which the index is read (ADR-0020 S3; TASKS item 93).
+/// The count's plain load and store rest on more than any `Here` says: that interrupts are off.
+/// A `Here` from [`crate::trap::Pinned::here`] holds with interrupts on, and an interrupt between
+/// the load and the store would lose its own count (review finding R93-10). So this stays
+/// private, and [`dispatch`], which runs with interrupts off, is its one caller; an interrupts-off
+/// token of its own is TASKS item 96's (R95-12).
+fn check_landing(at: crate::trap::Here<'_>, here: u64, vector: u64) {
+    let me = this_cpu(at);
+    let home = CONTEXTS.this(me).and_then(Contexts::running_home);
     if !home.is_some_and(|home| crate::stack::same_slot(home, here)) {
         panic!(
             "an entry from ring 3 (vector {vector}) {} landed on a stack not the running context's own",
-            me.named()
+            me.index().named()
         );
     }
-    if let Some(l) = CPU_LOCAL.get(me.0) {
+    if let Some(l) = CPU_LOCAL.this(me) {
         // Only this processor writes it, with interrupts off: a plain load and store.
         l.landings.store(
             l.landings.load(Ordering::Relaxed).wrapping_add(1),
@@ -823,7 +871,9 @@ pub fn landings_checked() -> u64 {
 /// a frame recorded here is ever resumed, so a wrong answer from the scheduler above cannot make
 /// the trap entry load anything else. A context's home stays recorded from its publication until
 /// its processor has left its stack after it ended, and no switch writes it, so a stack a
-/// context may still use is always in this table for any processor's `stack_in_use`.
+/// context may still use is always in some processor's table for any processor's `stack_in_use`:
+/// in this one, or, while it moves (ADR-0020 S4), in its destination's before it leaves this one,
+/// which the scans through [`MOVES`] cannot miss.
 ///
 /// It replaces `SAVED_FRAMES`, whose 32 slots held only suspended threads' frames. A slot is now
 /// held from a thread's publication until it has ended and its processor has left its stack, so
@@ -841,6 +891,23 @@ pub(crate) static CONTEXTS: PerCpu<Contexts> = PerCpu::new(
     Contexts::new,
 );
 
+/// The machine's move sequence (ADR-0020 S4; `origin_sync::contexts`, "Moves between
+/// processors"): the move gate and the begun and finished counters. A move of a context between
+/// two processors' tables of contexts holds the gate, and every scan of all the tables goes
+/// through [`Moves::scan`], so that a move cannot hide a home from it. Nothing moves a context
+/// yet: TASKS item 96 makes the first move.
+pub(crate) static MOVES: Moves = Moves::new();
+
+/// What a scan's pass under the move gate runs in: interrupts off on this processor, since a
+/// mover holds the gate with interrupts off and may be this processor's own interrupt handler.
+struct Quietly;
+
+impl Quiet for Quietly {
+    fn quietly<R>(&self, f: impl FnOnce() -> R) -> R {
+        without_interrupts(f)
+    }
+}
+
 /// Records a new thread on processor `cpu`, whose first frame is `frame`, on its own stack: the
 /// frame becomes its home and the frame to resume. `false` if the table is full or `cpu` has
 /// none.
@@ -850,11 +917,18 @@ pub(crate) fn publish_context(cpu: CpuIndex, frame: u64) -> bool {
         .is_some_and(|table| table.publish(frame))
 }
 
-/// Whether some processor's table of contexts covers `[start, end)`: a context's home or saved
-/// frame there. Part of what [`stack_in_use`] asks, without the caller's stack pointer and the
-/// kernel-stack records (`stack::slot_in_contexts`).
+/// Whether some processor's table of contexts covers `[start, end)`: a context's home, saved
+/// frame or leaving frame there. Part of what [`stack_in_use`] asks, without the caller's stack
+/// pointer and the kernel-stack records (`stack::slot_in_contexts`). It scans every table through
+/// the move sequence ([`MOVES`]), so a context moving between two tables is not missed: at most
+/// four passes with no lock, then one under the move gate with interrupts off (ADR-0020 S4).
 pub(crate) fn contexts_cover(start: u64, end: u64) -> bool {
-    CONTEXTS.iter().any(|table| table.covers(start, end))
+    MOVES
+        .scan(
+            || CONTEXTS.iter().any(|table| table.covers(start, end)),
+            &Quietly,
+        )
+        .covered
 }
 
 /// Withdraws the context published on processor `cpu` at `frame`, which its spawner never made
@@ -883,27 +957,30 @@ fn running_on(address: u64) -> bool {
 
 /// What the trap entry resumes after a scheduler upcall: `next`, the frame the scheduler
 /// answered for the interrupted context at `here` (`Contexts::switch`). Unless they are the same,
-/// `next` must be a frame this processor saved, and the context at `here` saves it as its frame,
-/// unless it is ending (`exiting`). No address is printed (ADR-0004 Amendment 2, A6.2): a frame
-/// is told as an offset in its window.
-fn resume(here: u64, next: u64, exiting: bool) -> u64 {
-    let me = this_cpu();
-    let outcome = CONTEXTS
-        .get(me.get())
-        .map_or(Err(Refused::NeverSaved), |table| {
-            table.switch(here, next, exiting, running_on)
-        });
+/// `next` must be a frame this processor saved, and the context at `here` leaves `here` as its
+/// frame, unless it is ending (`exiting`). The table publishes that frame only at this
+/// processor's next call into it, the next switch or a stack's drop: [`exception_saved`] still
+/// returns along the outgoing stack after this, until its `mov rsp, rax`, so the frame must not
+/// be resumable anywhere before then (ADR-0020 S5). No address is printed (ADR-0004 Amendment 2,
+/// A6.2): a frame is told as an offset in its window.
+///
+/// `at` is the trap entry's witness, under which the index is read (ADR-0020 S3; TASKS item 93).
+fn resume(at: crate::trap::Here<'_>, here: u64, next: u64, exiting: bool) -> u64 {
+    let me = this_cpu(at);
+    let outcome = CONTEXTS.this(me).map_or(Err(Refused::NeverSaved), |table| {
+        table.switch(here, next, exiting, running_on)
+    });
     match outcome {
         Ok(Switched { frame, home }) => {
             // The incoming context's own stack, from its home, unless nothing switched.
             if let Some(home) = home {
-                name_kernel_stack(home);
+                name_kernel_stack(at, home);
             }
             frame
         }
         Err(Refused::NeverSaved) => panic!(
             "the scheduler returned a frame {} never saved: {}",
-            me.named(),
+            me.index().named(),
             crate::phys::told(next)
         ),
         Err(Refused::Full) => panic!("too many saved thread frames on this processor"),
@@ -915,20 +992,31 @@ fn resume(here: u64, next: u64, exiting: bool) -> u64 {
 
 /// Whether a processor may be using the kernel stack `[start, end)`, whose top is `top`: the
 /// caller's own stack pointer is on it, a processor's kernel-stack record names it, or a
-/// context's home or saved frame is on it (TASKS item 70). Only a stack in none of them can be
-/// freed. It never waits and takes no lock.
+/// context's home, saved frame or leaving frame is on it (TASKS item 70; ADR-0020 S5). Only a
+/// stack in none of them can be freed. It takes no lock but the move gate, and that only in a
+/// scan's last pass, after its fast passes each overlapped a move (ADR-0020 S4; [`MOVES`]): so a
+/// stack may be dropped under any lock but the gate, and a mover holding the gate must drop none.
 ///
-/// It first retires this processor's own ended context, if any: this processor has left that
-/// stack, since any code it runs after the exit's switch runs on another context's stack
-/// (`Contexts::retire_ended`). So a stack reaped here before this processor's next switch is
-/// given back, not leaked. The retirement runs with interrupts off, as the table asks: a switch
-/// that interrupted it between its take and its clear would leave the ended stack in no record
-/// that retires it, and a reap then would leak it (the review of TASKS item 70, T70-1).
+/// It first publishes the frame this processor's last switch-out left, and retires its own ended
+/// context, if any: this processor has left both stacks, since any code it runs after a switch
+/// runs on another context's stack (`Contexts::publish_leaving`, `Contexts::retire_ended`; ADR-0020
+/// S5). So a stack reaped here before this processor's next switch is given back, not leaked.
+/// Both run with interrupts off, as the table asks: a switch that interrupted the retirement
+/// between its take and its clear would leave the ended stack in no record that retires it, and a
+/// reap then would leak it (the review of TASKS item 70, T70-1); one that interrupted the
+/// publication between its two stores would have its own leaving record cleared. The processor's
+/// index is read inside that section too, under its witness, so the table is this processor's
+/// own even once a thread can be moved between a read and its use (the review of TASKS item 95,
+/// R95-3; ADR-0020 S3, TASKS item 93).
 pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
     let used = |value: u64| value >= start && value < end;
     if tables_ready()
-        && let Some(table) = CONTEXTS.get(this_cpu().get())
-        && without_interrupts(|| table.retire_ended(running_on)) == Err(Refused::StillOnIt)
+        && without_interrupts_here(|at| {
+            CONTEXTS.this(this_cpu(at)).map(|table| {
+                table.publish_leaving();
+                table.retire_ended(running_on)
+            })
+        }) == Some(Err(Refused::StillOnIt))
     {
         panic!("an ended thread's stack was to be retired while this processor still ran on it");
     }
@@ -941,15 +1029,27 @@ pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
         || CPU_LOCAL
             .iter()
             .any(|l| l.kernel_stack.load(Ordering::Acquire) == top)
-        || CONTEXTS.iter().any(|table| table.covers(start, end))
+        // Last, through the move sequence: neither of the records above can name a context that
+        // is moving, which is suspended and not running.
+        || contexts_cover(start, end)
 }
 
 /// This processor's CPU index: one GS-relative load from its CPU-local area. On a
 /// processor without one ([`OUT_OF_RANGE`]) it is an index no array has.
-pub fn this_cpu() -> CpuIndex {
+///
+/// Private (ADR-0020 S3; TASKS item 93): [`this_cpu`] is its one caller, under a witness that the
+/// reader cannot leave the processor. A read without one does not build.
+///
+/// The witness does not show that GS's base is set (review finding R93-3): a section's witness,
+/// and the boot flow's, exist before `load_tables` runs. What does is the boot's order. On the
+/// boot processor every step that reads the index comes after `Early::load_cpu_tables` in
+/// `Early`'s order or checks [`tables_ready`] first (`timer::init`); on an AP, `ap_entry` reads it
+/// only after `init_ap`.
+fn read_index() -> CpuIndex {
     let id: u64;
-    // SAFETY: `load_tables` set GS's base to a live `CpuLocal` on every processor before
-    // any code that calls this runs, and offset 0 is its `id`, a `u64`.
+    // SAFETY: `load_tables` set GS's base to a live `CpuLocal` on every processor before any code
+    // that calls this runs (the boot's order, above, not the witness), and offset 0 is its `id`,
+    // a `u64`.
     unsafe { asm!("mov {}, gs:[0]", out(reg) id, options(nostack, readonly, preserves_flags)) };
     CpuIndex(usize::try_from(id).unwrap_or(usize::MAX))
 }
@@ -1150,7 +1250,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     let here = ptr::from_mut(frame).addr() as u64;
     // An entry from ring 3 must have landed on the running context's own stack (TASKS item 77).
     if frame.cs & 3 == 3 && ist_of(frame.vector) == 0 {
-        check_landing(here, frame.vector);
+        check_landing(Switch::new().here(), here, frame.vector);
     }
     // A program can set RFLAGS.AC; the entry path must have cleared it for the kernel.
     if frame.cs & 3 == 3 && SMAP_ON.load(Ordering::Relaxed) && read_rflags() & RFLAGS_AC != 0 {
@@ -1165,7 +1265,12 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // writing 0 to the EOI register only acknowledges the interrupt in service.
         unsafe { wrmsr(X2APIC_EOI, 0) };
         return hooks.map_or(here, |h| {
-            resume(here, (h.tick)(here, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.tick)(here, &Switch::new()),
+                false,
+            )
         });
     }
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
@@ -1179,10 +1284,15 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // SAFETY: as for the timer: interrupt messages are only routed to processors whose
         // APIC is in x2APIC mode; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
-        return match irq::run(vector) {
+        return match irq::run(vector, Switch::new().here()) {
             Action::Resume => here,
             Action::Reschedule => hooks.map_or(here, |h| {
-                resume(here, (h.reschedule)(here, &Switch::new()), false)
+                resume(
+                    Switch::new().here(),
+                    here,
+                    (h.reschedule)(here, &Switch::new()),
+                    false,
+                )
             }),
         };
     }
@@ -1193,12 +1303,17 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // vector, so x2APIC mode is on; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
         return hooks.map_or(here, |h| {
-            resume(here, (h.reschedule)(here, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.reschedule)(here, &Switch::new()),
+                false,
+            )
         });
     }
     // Another processor changed a kernel mapping: invalidate it here, then acknowledge.
     if frame.vector == u64::from(crate::tlb::SHOOTDOWN_VECTOR) {
-        crate::tlb::interrupted();
+        crate::tlb::interrupted(Switch::new().here());
         // SAFETY: as for the timer: x2APIC mode is on (only processors with an active
         // scheduler are sent this vector), and the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
@@ -1213,20 +1328,42 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     // Scheduler requests from kernel threads (`sched::yield_now`, `sleep`, `exit`).
     if frame.vector == u64::from(YIELD_VECTOR) {
         return hooks.map_or(here, |h| {
-            resume(here, (h.yield_now)(here, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.yield_now)(here, &Switch::new()),
+                false,
+            )
         });
     }
     if frame.vector == u64::from(SLEEP_VECTOR) {
         return hooks.map_or(here, |h| {
-            resume(here, (h.sleep)(here, frame.rdi, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.sleep)(here, frame.rdi, &Switch::new()),
+                false,
+            )
         });
     }
     if frame.vector == u64::from(EXIT_VECTOR) {
-        return hooks.map_or(here, |h| resume(here, (h.exit)(here, &Switch::new()), true));
+        return hooks.map_or(here, |h| {
+            resume(
+                Switch::new().here(),
+                here,
+                (h.exit)(here, &Switch::new()),
+                true,
+            )
+        });
     }
     if frame.vector == u64::from(BLOCK_VECTOR) {
         return hooks.map_or(here, |h| {
-            resume(here, (h.block)(here, frame.rdi, &Switch::new()), false)
+            resume(
+                Switch::new().here(),
+                here,
+                (h.block)(here, frame.rdi, &Switch::new()),
+                false,
+            )
         });
     }
     if frame.vector == u64::from(SYSCALL_VECTOR) {
@@ -1241,9 +1378,12 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
                 frame.rax = status as u64;
                 here
             }
-            crate::trap::SyscallOutcome::ThreadExit => {
-                resume(here, (hooks.exit)(here, &Switch::new()), true)
-            }
+            crate::trap::SyscallOutcome::ThreadExit => resume(
+                Switch::new().here(),
+                here,
+                (hooks.exit)(here, &Switch::new()),
+                true,
+            ),
         };
     }
     // A machine check is the hardware reporting on itself: it says nothing about the program
@@ -1272,7 +1412,12 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             halt();
         };
         (hooks.user_fault)(frame.vector, frame.error_code, address, on_exception_stack);
-        return resume(here, (hooks.exit)(here, &Switch::new()), true);
+        return resume(
+            Switch::new().here(),
+            here,
+            (hooks.exit)(here, &Switch::new()),
+            true,
+        );
     }
     // A page fault at the user-copy instruction, on a user address: resume at
     // `probe_recover`, which returns "failed" to `copy_user`'s caller.
@@ -1289,9 +1434,13 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     // A page fault at the exact instruction a probe armed: record it and resume at
     // `probe_recover`, which returns the error code to the probe's caller.
     if frame.vector == 14 {
-        let armed = local().probe_rip.load(Ordering::SeqCst);
+        // Two reads of the index, each inside `local` under the trap entry's witness: as the code
+        // read it before TASKS item 93, so what is built here does not change.
+        let armed = local(Switch::new().here()).probe_rip.load(Ordering::SeqCst);
         if armed != 0 && frame.rip == armed {
-            local().probe_address.store(read_cr2(), Ordering::SeqCst);
+            local(Switch::new().here())
+                .probe_address
+                .store(read_cr2(), Ordering::SeqCst);
             frame.rax = frame.error_code;
             frame.rip = (probe_recover as *const ()).addr() as u64;
             return here;
@@ -1618,7 +1767,7 @@ pub fn read_speculation() -> crate::speculation::Reported {
 /// Each register is written only where `Plan::decide` found the bit that says the
 /// processor has it, and is read back: a processor whose registers do not hold what was
 /// written says so in its record.
-fn init_speculation() {
+fn init_speculation(me: ThisCpu<'_>) {
     use crate::speculation::{self, Lfence, Plan};
     let plan = Plan::decide(&read_speculation());
     let mut held = true;
@@ -1649,7 +1798,7 @@ fn init_speculation() {
         // SAFETY: as above.
         held &= unsafe { rdmsr(DE_CFG) } & DE_CFG_LFENCE != 0;
     }
-    let cpu = this_cpu().get();
+    let cpu = me.index().get();
     if cpu == CpuIndex::BOOT.get() {
         // The maker and family are the machine's: the boot processor chooses for all.
         crate::nospec::set_form(plan.form);
@@ -1661,8 +1810,8 @@ fn init_speculation() {
 /// issues an IBPB if that is not the process it ran there last (ADR-0017 Z3). Only at the
 /// scheduler's switch point, which has interrupts off, so nothing else on this processor
 /// runs between the note and the barrier.
-pub fn entering_process(process: u64, _switch: &Switch) {
-    if crate::speculation::enters(this_cpu().get(), process) {
+pub fn entering_process(process: u64, switch: &Switch) {
+    if crate::speculation::enters(this_cpu(switch.here()).index().get(), process) {
         // SAFETY: CPL 0; `enters` says yes only where this processor recorded that it has
         // the IBPB command, so the register exists. Bit 0 is the command, and it changes
         // nothing but what the branch predictors hold.
@@ -1672,8 +1821,9 @@ pub fn entering_process(process: u64, _switch: &Switch) {
 
 /// Issues one IBPB on this processor if it has the command, and says whether it did. For
 /// the boot's measurement of what one costs; the scheduler's own are [`entering_process`]'s.
-pub fn issue_ibpb() -> bool {
-    let offered = crate::speculation::recorded(this_cpu().get()).is_some_and(|(plan, _)| plan.ibpb);
+/// `me` is the index the boot flow read (ADR-0020 S3; TASKS item 93).
+pub fn issue_ibpb(me: ThisCpu<'_>) -> bool {
+    let offered = crate::speculation::recorded(me.index().get()).is_some_and(|(plan, _)| plan.ibpb);
     if offered {
         // SAFETY: as in `entering_process`.
         unsafe { wrmsr(PRED_CMD, 1) };
@@ -1697,6 +1847,62 @@ pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
         unsafe { asm!("sti", options(nostack)) };
     }
     result
+}
+
+/// [`without_interrupts`], with the section's witness (ADR-0020 S3; TASKS item 93): `trap::section`,
+/// which makes the witness, as its documentation says. `f` must not enable interrupts, open an
+/// interrupt window, idle, yield, sleep, block or exit.
+pub fn without_interrupts_here<T>(f: impl for<'a> FnOnce(crate::trap::Here<'a>) -> T) -> T {
+    crate::trap::section(f)
+}
+
+/// This processor's CPU index, read under a witness that the reader cannot leave the processor
+/// (ADR-0020 S3; TASKS item 93), and branded with the witness's life ([`ThisCpu`]). It is the only
+/// way to read the index: a call without a witness does not build.
+pub fn this_cpu(here: crate::trap::Here<'_>) -> ThisCpu<'_> {
+    ThisCpu {
+        index: read_index(),
+        here,
+    }
+}
+
+/// This processor's CPU index, read once under a witness and branded with its life (ADR-0020 S3;
+/// TASKS item 93, the coordinating session's ruling Q4).
+///
+/// Every lookup of this processor's own entry of a per-processor table goes through it
+/// (`PerCpu::this`), and is lent for that life. So no such entry is used after its reader might
+/// have left the processor, and one read of the index serves every lookup under one witness, as
+/// one read served them before.
+///
+/// [`ThisCpu::index`] gives the plain index, as a value only: one to compare, print or record as
+/// a fact about the moment it was read.
+#[derive(Clone, Copy, Debug)]
+pub struct ThisCpu<'a> {
+    index: CpuIndex,
+    here: crate::trap::Here<'a>,
+}
+
+impl<'a> ThisCpu<'a> {
+    /// The index, as a value (see the type's documentation).
+    #[inline]
+    pub fn index(self) -> CpuIndex {
+        self.index
+    }
+
+    /// The witness it was read under.
+    #[inline]
+    pub fn here(self) -> crate::trap::Here<'a> {
+        self.here
+    }
+}
+
+/// The boot or idle flow's witness (ADR-0020 S2, point 4; TASKS item 93, the coordinating
+/// session's rulings Q6 and on `cba7462b`): `trap::flow`, which makes the check and the witness,
+/// as its documentation says. `Some` if the context running on this processor is the processor's
+/// boot or idle flow, `None` on a thread. Each flow takes it once, at its entry, and passes it
+/// down.
+pub fn flow() -> Option<crate::trap::Pinned<'static>> {
+    crate::trap::flow()
 }
 
 /// CR3: the physical address of the live PML4 (and, with PCIDs off, nothing else).
@@ -1776,24 +1982,97 @@ pub fn capture_backtrace(out: &mut [u64]) -> usize {
 /// taken before the lock that orders it is held: RDTSCP (Intel SDM Vol. 2B, RDTSCP; AMD
 /// APM Vol. 3) if `use_rdtscp` and this processor has it, else LFENCE then RDTSC.
 pub fn ordered_tsc(use_rdtscp: bool) -> u64 {
-    let has_rdtscp = use_rdtscp
-        && cpuid(0x8000_0000)[0] >= 0x8000_0001
-        && cpuid(0x8000_0001)[3] & (1 << 27) != 0;
-    let (low, high): (u32, u32);
-    if has_rdtscp {
-        // SAFETY: RDTSCP exists on this processor (just checked); it writes EDX:EAX and ECX
-        // (IA32_TSC_AUX, unused here) and reads no memory.
-        unsafe {
-            asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
-        }
+    let fence = if use_rdtscp {
+        TscFence::detect()
     } else {
-        // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory. No
-        // `preserves_flags`: Intel's entry for LFENCE does not say what it does to the flags.
-        unsafe {
-            asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
+        TscFence::LFENCE
+    };
+    fence.after()
+}
+
+/// How two TSC readings are ordered around what runs between them, so that they enclose it
+/// (TASKS item 78, `docs/research/2026-11-21-apic-timer-period.md` §2). Neither RDTSC nor
+/// RDMSR is serializing on either maker's processors, an x2APIC register's RDMSR included
+/// (Intel SDM Vol. 3A §13.12.3; AMD APM Vol. 2 §16.11.2): unfenced, a reading may be taken
+/// after the instruction it should precede, or before the one it should follow.
+///
+/// The form is private, so the RDTSCP form comes only from [`TscFence::detect`], which found
+/// RDTSCP on this processor: safe code cannot ask for an instruction the processor lacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TscFence(Fence);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fence {
+    /// RDTSCP, the first reading followed by LFENCE. Intel: LFENCE is always a barrier, and
+    /// RDTSCP waits for every earlier instruction. AMD: RDTSCP retires every older instruction
+    /// before it reads and is dispatch serializing, whatever MSR C001_1029 holds.
+    Rdtscp,
+    /// No RDTSCP: LFENCE beside RDTSC. Ordered where LFENCE is a barrier: on Intel always; on
+    /// AMD where CPUID Fn8000_0021_EAX[2] says so, or where the kernel set MSR C001_1029 bit 1
+    /// (ADR-0017, `Lfence::KernelSets`). Under a hypervisor on AMD without either, unordered.
+    Lfence,
+}
+
+impl TscFence {
+    /// LFENCE beside RDTSC, which every x86-64 processor has.
+    pub const LFENCE: Self = Self(Fence::Lfence);
+
+    /// RDTSCP where CPUID Fn8000_0001_EDX[27] reports it, else LFENCE. Read once, not for each
+    /// reading: CPUID leaves the guest under a hypervisor.
+    pub fn detect() -> Self {
+        if cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpuid(0x8000_0001)[3] & (1 << 27) != 0 {
+            Self(Fence::Rdtscp)
+        } else {
+            Self::LFENCE
         }
     }
-    (u64::from(high) << 32) | u64::from(low)
+
+    /// The TSC, read before any later instruction starts: RDTSCP or RDTSC, then LFENCE.
+    pub fn before(self) -> u64 {
+        let (low, high): (u32, u32);
+        match self.0 {
+            Fence::Rdtscp => {
+                // SAFETY: `Fence::Rdtscp` is private and made only by `detect`, which found
+                // RDTSCP on this processor; RDTSCP writes EDX:EAX and ECX (IA32_TSC_AUX, unused here) and
+                // reads no memory, and LFENCE reads and writes nothing. No `preserves_flags`:
+                // Intel's entry for LFENCE does not say what it does to the flags.
+                unsafe {
+                    asm!("rdtscp", "lfence", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack));
+                }
+            }
+            Fence::Lfence => {
+                // SAFETY: RDTSC and LFENCE exist on every x86-64 processor and read no memory.
+                // No `preserves_flags`, as above.
+                unsafe {
+                    asm!("rdtsc", "lfence", out("eax") low, out("edx") high, options(nomem, nostack));
+                }
+            }
+        }
+        (u64::from(high) << 32) | u64::from(low)
+    }
+
+    /// The TSC, read once every earlier instruction has executed: RDTSCP, or LFENCE then
+    /// RDTSC.
+    pub fn after(self) -> u64 {
+        let (low, high): (u32, u32);
+        match self.0 {
+            Fence::Rdtscp => {
+                // SAFETY: as in `before`; RDTSCP alone changes no flag.
+                unsafe {
+                    asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
+                }
+            }
+            Fence::Lfence => {
+                // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory.
+                // No `preserves_flags`: Intel's entry for LFENCE does not say what it does to
+                // the flags.
+                unsafe {
+                    asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
+                }
+            }
+        }
+        (u64::from(high) << 32) | u64::from(low)
+    }
 }
 
 /// The time-stamp counter.
@@ -1905,20 +2184,28 @@ impl core::fmt::Debug for Probe {
 }
 
 /// Arms the probe for a fault at `fault_rip`, runs `access`, and disarms it.
+///
+/// The three run in one interrupts-off section, and the processor's CPU-local area is read under
+/// its witness (ADR-0020 S3; TASKS item 93): the fault `access` may take is taken on the processor
+/// that armed the probe, whose trap entry reads the same area, and the record read back is that
+/// processor's. Before TASKS item 93 interrupts stayed as the caller had them; now they are off
+/// for the one access and its fault.
 fn run_probe(fault_rip: u64, access: impl FnOnce() -> u64) -> Probe {
     // Per CPU: probes and user copies on different processors never disarm each other.
-    let here = local();
-    here.probe_rip.store(fault_rip, Ordering::SeqCst);
-    let result = access();
-    here.probe_rip.store(0, Ordering::SeqCst);
-    if result == COMPLETED {
-        Probe::Completed
-    } else {
-        Probe::Faulted {
-            error: result,
-            address: here.probe_address.load(Ordering::SeqCst),
+    without_interrupts_here(|at| {
+        let here = local(at);
+        here.probe_rip.store(fault_rip, Ordering::SeqCst);
+        let result = access();
+        here.probe_rip.store(0, Ordering::SeqCst);
+        if result == COMPLETED {
+            Probe::Completed
+        } else {
+            Probe::Faulted {
+                error: result,
+                address: here.probe_address.load(Ordering::SeqCst),
+            }
         }
-    }
+    })
 }
 
 /// Reads the byte at `addr` through a fault-tolerant instruction and reports what happened.
@@ -2067,14 +2354,14 @@ pub(crate) static PAT_READY: PerCpu<core::sync::atomic::AtomicBool> = PerCpu::ne
 /// Table 11-10), and marks this processor's CPU index if so. These are the architectural
 /// reset values; a firmware that changed them would make uncached mappings cacheable, so the
 /// kernel then refuses to map device registers rather than reprogramming caches it cannot
-/// see. Returns the PAT.
-pub fn check_pat() -> u64 {
+/// see. Returns the PAT. `me` is the index its flow read (ADR-0020 S3; TASKS item 93).
+pub fn check_pat(me: ThisCpu<'_>) -> u64 {
     // SAFETY: CPL 0; IA32_PAT exists on every x86-64 processor (CPUID 1 EDX bit 16) and
     // reading it has no side effect.
     let pat = unsafe { rdmsr(IA32_PAT) };
     if pat & 0xFF == 0x06
         && (pat >> 24) & 0xFF == 0x00
-        && let Some(ready) = PAT_READY.get(this_cpu().get())
+        && let Some(ready) = PAT_READY.this(me)
     {
         ready.store(true, Ordering::Relaxed);
     }
@@ -2213,10 +2500,20 @@ const CR4_OSFXSR: u64 = 1 << 9;
 const CR4_OSXMMEXCPT: u64 = 1 << 10;
 const CR4_OSXSAVE: u64 = 1 << 18;
 
-/// Whether this processor's SIMD state is managed with XSAVE (else FXSAVE).
+/// Whether SIMD state is managed with XSAVE (else FXSAVE): the boot processor's, recorded once
+/// with its format ([`record_boot_fpu`]).
 static USE_XSAVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// The XSAVE/FXSAVE area size the kernel allocates per thread, once known.
-static FPU_AREA_SIZE: AtomicU64 = AtomicU64::new(crate::features::FXSAVE_SIZE as u64);
+
+/// The boot processor's FPU format and the size of every thread's FPU area, recorded once by
+/// the boot processor before the first area is allocated (ADR-0020 S6; TASKS item 94).
+/// Application processors read it and never write it.
+#[derive(Clone, Copy, Debug)]
+struct BootFpu {
+    format: crate::features::FpuFormat,
+    area: usize,
+}
+
+static BOOT_FPU: crate::once::SetOnce<BootFpu> = crate::once::SetOnce::new();
 
 /// Gathers the CPUID leaves `features` decodes.
 pub fn gather_cpuid() -> crate::features::Cpuid {
@@ -2256,8 +2553,10 @@ unsafe fn xsetbv(reg: u32, value: u64) {
     }
 }
 
-/// Enables SSE (and AVX where present) on this processor and sets the per-thread FPU-area
-/// size from `features`. Returns the XCR0 value in force (0 if XSAVE is not used).
+/// Enables SSE (and AVX where present) on this processor. Returns its FPU format as the
+/// processor reports it once XCR0 is set: XCR0 read back, and CPUID.0DH.00H:EBX, the bytes
+/// XSAVE then needs (ADR-0020 S6). Without XSAVE, XCR0 0 and the FXSAVE area's 512 bytes. It
+/// sets no area size: the boot processor records its own once ([`record_boot_fpu`]).
 ///
 /// The kernel's own code is soft-float (the `x86_64-unknown-none` ABI uses no XMM), so this
 /// adds a capability for explicit SIMD and for user programs; it does not change how kernel
@@ -2266,9 +2565,11 @@ unsafe fn xsetbv(reg: u32, value: u64) {
 /// # Safety
 ///
 /// CPL 0. Must run once per processor before any code on it uses SSE or XSAVE.
-pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
-    use crate::features::{Features, wanted_xcr0, xsave_area_size};
+pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> crate::features::FpuFormat {
+    use crate::features::{FXSAVE_SIZE, Features, FpuFormat, wanted_xcr0, xsave_usable};
     let features = Features::decode(id);
+    // XSAVE only with leaf 0DH to size it (R94-6).
+    let xsave = xsave_usable(id);
     // CR0: clear EM and TS, set MP, so SSE instructions run and do not fault to an
     // emulator or a (nonexistent) lazy-FPU handler; set NE, so an x87 error raises #MF
     // (INIT leaves it clear on an AP).
@@ -2288,7 +2589,7 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
     }
     // CR4: OSFXSR and OSXMMEXCPT for SSE; OSXSAVE when the CPU has XSAVE.
     let mut cr4_bits = CR4_OSFXSR | CR4_OSXMMEXCPT;
-    if features.xsave {
+    if xsave {
         cr4_bits |= CR4_OSXSAVE;
     }
     // SAFETY: the caller's contract; these CR4 bits enable FXSAVE/SSE and XSAVE. The flags are
@@ -2303,26 +2604,65 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
             options(nomem, nostack),
         );
     }
-    let mut xcr0 = 0;
-    if features.xsave {
-        xcr0 = wanted_xcr0(&features);
-        // SAFETY: CR4.OSXSAVE was just set; `xcr0` has x87 and SSE (required) and AVX only
-        // when the CPU reports it, so it is a legal XCR0.
-        unsafe { xsetbv(0, xcr0) };
-        USE_XSAVE.store(true, core::sync::atomic::Ordering::Relaxed);
-        if let Some(size) = xsave_area_size(id) {
-            // The area must hold every enabled component; take the maximum CPUID reports.
-            FPU_AREA_SIZE.store(size as u64, core::sync::atomic::Ordering::Relaxed);
-        }
-        // SAFETY: OSXSAVE is set.
-        let _ = unsafe { xgetbv(0) };
+    if !xsave {
+        return FpuFormat {
+            xcr0: 0,
+            enabled_size: FXSAVE_SIZE as u32,
+        };
     }
-    xcr0
+    let wanted = wanted_xcr0(&features);
+    // SAFETY: CR4.OSXSAVE was just set; `wanted` has x87 and SSE (required) and AVX only
+    // when the CPU reports it, so it is a legal XCR0.
+    unsafe { xsetbv(0, wanted) };
+    FpuFormat {
+        // SAFETY: OSXSAVE is set.
+        xcr0: unsafe { xgetbv(0) },
+        // Read after XSETBV: EBX follows the XCR0 in force on this processor.
+        enabled_size: cpuid_subleaf(0x0D, 0)[1],
+    }
 }
 
-/// The per-thread FPU save area size (bytes) and alignment (64).
+/// Records the boot processor's FPU format, from what [`enable_simd`] returned there, and the
+/// size of every thread's FPU area: CPUID.0DH.00H:ECX, the size for every component the
+/// processor supports, and never less than what one save in the format writes
+/// ([`crate::features::fpu_bytes`]), so the boot processor's state always fits. Returns `false`, and changes nothing, if they were recorded
+/// already.
+///
+/// Called by `Early::enable_simd` alone: once, on the boot processor, before any area is
+/// allocated (ADR-0020 S6: the kernel's area size is the boot processor's).
+pub(crate) fn record_boot_fpu(
+    id: &crate::features::Cpuid,
+    format: crate::features::FpuFormat,
+) -> bool {
+    use crate::features::{FXSAVE_SIZE, xsave_area_size};
+    let supported = if format.xcr0 == 0 {
+        FXSAVE_SIZE
+    } else {
+        xsave_area_size(id).unwrap_or(FXSAVE_SIZE)
+    };
+    // Never less than what one save in its own format writes (R94-10).
+    let area = supported.max(crate::features::fpu_bytes(format));
+    if BOOT_FPU.set(BootFpu { format, area }).is_err() {
+        return false;
+    }
+    // How every processor saves and restores, from the boot processor alone: an AP that
+    // could not use XSAVE is refused below the baseline (`smp::ap_entry`) and never saves
+    // (the review of TASKS item 94, R94-5).
+    USE_XSAVE.store(format.xcr0 != 0, core::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// The boot processor's FPU format, once it has recorded it.
+pub fn boot_fpu_format() -> Option<crate::features::FpuFormat> {
+    BOOT_FPU.get().map(|b| b.format)
+}
+
+/// The per-thread FPU save area size (bytes) and alignment (64): the boot processor's, or the
+/// FXSAVE area's 512 bytes before it recorded one.
 pub fn fpu_area_size() -> usize {
-    FPU_AREA_SIZE.load(core::sync::atomic::Ordering::Relaxed) as usize
+    BOOT_FPU
+        .get()
+        .map_or(crate::features::FXSAVE_SIZE, |b| b.area)
 }
 
 /// Prepares a fresh thread's FPU area so a restore from it yields a clean FPU: default
@@ -2403,17 +2743,19 @@ pub unsafe fn fpu_restore(area: u64) {
 ///
 /// CPL 0. The kernel must not rely on executing or accessing user pages from supervisor
 /// mode (it has none; a future user-copy path must set RFLAGS.AC around its accesses).
-pub unsafe fn enable_smep_smap() -> (bool, bool) {
+///
+/// `me` is the index its flow read (ADR-0020 S3; TASKS item 93).
+pub unsafe fn enable_smep_smap(me: ThisCpu<'_>) -> (bool, bool) {
     let (smep, smap) = smep_smap_supported();
     // The boot processor's answer decides what the kernel assumes: an AP that lacks SMAP
     // refuses to start (`smp::ap_entry`) and must not turn it off for everyone else.
-    if this_cpu() == CpuIndex::BOOT {
+    if me.index() == CpuIndex::BOOT {
         SMAP_ON.store(smap, Ordering::Relaxed);
     }
     // UMIP (CPUID.7.0:ECX bit 2): `sidt` from ring 3 would otherwise reveal the kernel's
     // descriptor-table addresses, and with them the KASLR slide (ADR-0004 H3).
     let umip = cpuid(0)[0] >= 7 && cpuid(7)[2] & (1 << 2) != 0;
-    if umip && this_cpu() == CpuIndex::BOOT {
+    if umip && me.index() == CpuIndex::BOOT {
         UMIP_ON.store(true, Ordering::Relaxed);
     }
     let bits = if smep { CR4_SMEP } else { 0 }

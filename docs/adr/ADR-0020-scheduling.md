@@ -59,6 +59,22 @@
 
 **Migration consequences.** No ABI: `ThreadRef` never crosses the system-call boundary. The Loom models' copy of `sched::wake` (`OnCpu::wake` in `models.rs`) gains the location loop. ADR-0005's thread object (`ThreadObject`) can later name the record for SDK operations on a thread.
 
+**Note, 2026-11-20: the loop is real code in the models (TASKS item 92; the coordinating session's ruling Q1; no decision changes).**
+- **One loop.** The location loop is `origin_sync::threads::wake`. The kernel instantiates it over its run queues (`sched::wake`) and the Loom models over theirs, so the models run the loop itself, not a copy; `OnCpu::wake` only calls it. The record and its block are the same code in both.
+- **What a changed location says.** Under the lock the loop took, a location found changed is one of three things:
+  - clear: the thread has exited, and there is nothing to wake;
+  - set, with another generation: the record holds a new thread, and the name is stale;
+  - set, with the same generation: the thread moved. Only this is followed, and only this counts towards the 64.
+- **Why the three are told apart.** Without that, a wake-up racing its thread's exit, or a reuse of its record, would count as a move although nothing moved.
+- **The count.** No thread moves until S6 is built. The kernel counts the moves wake-ups follow, and its boot proofs require that count to be 0 (the IPC proof's condition and every settle's verdict, with no line of their own).
+
+**Note, 2026-11-20: how S1's storage is built, and where a record's state is kept (TASKS item 92; the coordinating session's rulings Q2 and Q3).** The storage is built as the decision says. Where the state is kept refines the Ownership bullet above, as ruling Q3 accepted (the review of TASKS item 92, R92-10).
+- **The table.** One block of 32 records per processor, in the per-processor table that also holds its zombies (`framekernel::threads::THREADS`). Each block is a chunk published once, when the processors are discovered (`percpu::size_per_cpu`; ADR-0008 Amendment 1, D1), and never moved or freed.
+- **Taking and giving back.** A spawn takes its record from the block of the processor it queues the thread on. The thread's reap gives it back there, as it takes the zombie's state out.
+- **Why 32 is enough.** While no thread moves, a processor's records belong to the threads of its run queue (at most 15) and its zombies awaiting their reap (at most 16). So 31 × the processor count covers every thread the run queues and zombie lists can hold, and S1's growth path applies only if a queue's capacity ever grows. A spawn takes its record before its push, so one about to find its queue full holds a 32nd for a moment.
+- **The memory.** It is counted in the boot-time sizing, before the root is sized, and nothing is allocated when a thread starts. So ADR-0005 G5's per-thread figure is unchanged.
+- **Where the state is kept (ruling Q3, refining the Ownership bullet).** Each record's state (stack, FPU area, user context, exit mark) is read and written under a lock of the record's own, not under the owning queue's. That lock is taken after the owning queue's lock and the processor's thread table, and before a block's allocator. The location and the generation are kept as the decision above says.
+
 **Threats.** A stale name cannot wake another thread (the generation). No program can name a record: handles name thread objects (ADR-0005 P1).
 
 ### S2. Threads are pinned unless declared movable, and some never move
@@ -97,6 +113,20 @@
 **Migration consequences.** An interface change inside the kernel and the framework, converted call site by call site; S2's pinned default keeps every caller right meanwhile.
 
 **Threats.** A confused index is how one thread would act on another's state (mark it ending, register it with a wait queue). The type closes it when the code is built (ADR-0018 V4, step 1).
+
+**Note, 2026-11-22: how S3 and S2's pin are built, and what S3 costs (TASKS item 93; the coordinating session's rulings Q2, Q3 and Q8; no decision changes).**
+- **S3's cost is not "none, by construction" at five sites** that read the index with no section before S3: `here_console`, `reap`'s check, `tlb::note`, `tlb::note_answer` and `run_probe`.
+  - Each read the index in the very way S3 forbids, so each now opens an interrupts-off section: one flag save, a `cli` and a restore. The section is P0, not a choice (ADR-0018 V1, point 1).
+  - Ledger row CL60 holds the cost's model and the static counts.
+- **Two more sites, `wake` and the fair-share proof's worker, had sections of their own as first built.** The comparison with the base showed what they cost, so both changed (TASKS item 93's entry):
+  - `wake` takes one section, as the base took one, now around the wake-up and its IPI decision. Its calls, locked instructions and GS load are the base's, with 19 more instructions (CL60).
+  - The worker's measured loop has no section. It reads the index once, under one section, after it stops.
+- **Everywhere else the cost is as stated.** The switch path's code equals the base's, instruction for instruction (TASKS item 93's entry).
+- **As built, the witness is two types,** both made only in `origin_frame::trap`:
+  - `Here`, from an interrupts-off section or the trap entry. Its holder cannot leave the processor while nothing it runs switches it out.
+  - `Pinned`, from S2's pin or from the boot or idle flow, checked once at the flow's entry. Its holder stays on the processor even when switched out, and it gives a `Here`.
+- **The pin guard's `Pinned`** comes through a one-time mint that `sched` holds. S2's pin, as built, costs more than S2's Cost paragraph says: `sched::pin()` takes this processor's queue lock in a section to find the running record (CL47's note of this date).
+- **The index the witness gives** (`ThisCpu`) can be copied out as a plain value. The types stop a per-processor entry (`PerCpu::this`) from outliving its witness, but not a plain index from being used afterwards. Each such use is named in `REVIEW_T93_2026-11-21.md`.
 
 ### S4. A context moves between tables by lend, adopt and forget, under a move sequence
 
@@ -139,6 +169,14 @@ Why the fast path is enough when it answers, in outline: a scan that misses a mo
 
 **Threats.** A double resume, two processors on one stack, is memory corruption; the compare-and-swap on the frame word rules it out by construction. The move sequence keeps a stack from being given back while a context may run on it.
 
+**Note, 2026-11-21: how S4 is built (TASKS item 95; the coordinating session's rulings Q1, Q2, Q4, Q6 and Q12; no decision changes).**
+- **The witnesses (Q1).** `lend`, `adopt`, `restore` and `forget` take a `Moving`, which only `Moves::begin` makes, by taking the gate and then raising begun. Dropping it raises finished (Release) and then frees the gate, also on a panic. A panic under the gate halts the kernel anyway (its panic policy), so that matters to the host tests and the models, not to recovery. `lend` returns a `Lent` that names its slot. `adopt` consumes it and answers an `Adopted`, or hands it back with the refusal; `Lent::restore` consumes it too; `forget` is on `Adopted` alone. So a frame is never adopted twice, nor adopted and restored, and a home is forgotten only after an adoption (the review's R95-1; three doctests show what does not compile). A `Lent` dropped unsettled restores itself, and an `Adopted` dropped forgets. `Moves::relocate` runs the four in the order above, with the mover's own work (S6) between `adopt` and `forget`. Leaking a token with `core::mem::forget`, which safe code can, defeats this (the delta review's D95-5): nothing in the kernel may.
+- **Begun is raised before `lend` (Q2),** not only before `adopt`. A pass that reads the source's frame word after `lend` took it then counts the move too, which covers a suspended frame on a stack that is not its home (S2 keeps such threads from moving anyway). A refused `lend` is therefore an empty move: both counters raised, nothing taken (CL48).
+- **`lend`'s refusals (Q4).** It reads the leaving record (S5) before the slots and answers `Leaving` (not yet published: try later), `BootFlow` (the boot or idle flow's slot, which never moves) or `NotHere` (no slot holds the frame suspended). See S5's note for why `NotHere` alone is not yet S20's inconsistency.
+- **The scan's fast tries (Q12).** `FAST_TRIES` is 4 in every real build and 2 in the Loom models, as the table's 32 slots are 4 there. A host test shows the kernel's four fast passes and one gated pass, deterministically.
+- **MV4's control (Q6).** Run first, as the ruling asked, and not caught: with finished raised before `forget`, MV4 passed at three preemptions (5,859 executions) and exhaustively (1,363,402 executions, 82 s on the development Mac). It is not a bug. What the scan needs is finished raised after `adopt` (or `restore`): a pass that reads the source's home word from the forget on happens after the forget, so it counts the move's raise of begun, and a reading of finished that counts the move sees the destination's claim. Where finished falls against `forget` does not matter (the outline in `contexts.rs`, "Moves between processors"). An independent reviewer, given the code and the invariants and not this answer, said the same, and named the control that is a bug: finished raised before `adopt`. MV4 catches that at three preemptions and exhaustively ("a live context's stack was in no record"). The control column above is kept as accepted; MV4's controls in `cargo xtask loom` are MX4a (a claim by a Relaxed load and a store, not a compare-and-swap), MX4b (the forget's store Relaxed) and MX4c (finished raised before `adopt`, the reviewer's). The two answers agree, so nothing waited for a ruling (`docs/engineering/REVIEW_T95_2026-11-21.md`, section 1). The control column above is kept as accepted; MV4's controls are MX4a (a claim made by a Relaxed load and a store), MX4b (the forget's store Relaxed) and MX4c (finished raised before `adopt`), each caught, and the column's own control is recorded as run and not caught.
+- **The gate's wait (the review of TASKS item 95, R95-2).** "It waits at most for one move's critical section", above, holds only while no other processor waits for the gate too. The gate is built as a ticket lock, which serves waiters in the order they came, so a scanner's wait is at most one critical section for each processor waiting ahead of it, each with interrupts off: still bounded whatever the rate of moves, but by the number of processors, not by one. A test-and-set lock would not bound it at all: a waiter could lose to every newcomer in turn. Loom cannot show the wait ends, since it does not explore an execution that spins past its bound; MV7 shows the scan answers, and finds the home, when the gate is won, and MV9 that the gate admits one holder at a time, a scan's last pass among them, each seeing the writes of those before it (the delta review's D95-2, with three controls). The order has two costs the old lock did not (the delta review's D95-3 and D95-8). A mover must turn interrupts off before it takes its ticket, not only once it holds the gate: an interrupt on its processor whose scan takes a later ticket would wait for ever for a caller that cannot run, and every later holder behind it; S3's interrupts-off witness, required in `begin`, is left to TASKS items 93 and 96. And a scanner may wait, with interrupts off, for one critical section per processor ahead of it, each possibly another scan's whole pass, during which it answers no interrupt; on the oversubscribed emulated machines a processor descheduled while it holds a ticket stalls everyone behind it. That cost is measured when moves exist (CL48, TASKS item 96).
+
 ### S5. A frame becomes resumable elsewhere only after its processor has left the stack
 
 **Decision.** `Contexts::switch` no longer stores the outgoing context's frame in its slot. It records the slot and the frame as **leaving**. The processor publishes them, storing the frame in the slot (Release) and then clearing the leaving record (Release), at its next call into the table: the top of its next `switch`, beside `retire_ended`, or the idle loop's and the tick's entry. Both run on another stack. Until published, nobody can take the frame, the source included; the source's own next switch publishes before it chooses. `covers` reads the leaving record before the slots, so that a scan cannot miss a frame between the two stores.
@@ -157,6 +195,14 @@ A thread is therefore movable from its source's next trap entry after it was swi
 
 **Threats.** Without this, a move could put two processors on one kernel stack: memory corruption and a route from one thread's data to another's.
 
+**Note, 2026-11-21: where a frame is published, as built (TASKS item 95; the coordinating session's ruling Q3; no decision changes).**
+- **At the top of every `switch`,** before `next` is taken, so a switch straight back to the context that is leaving publishes it and then takes it (a host test). Every scheduler upcall, the tick's included, reaches `switch` whether or not it changes the running context, so a switched-out frame is published within one tick.
+- **In `cpu::stack_in_use`,** beside its retirement, with interrupts off.
+- **Not yet from the idle loop:** TASKS item 98 adds that call with the idle pull, the first code that needs a frame sooner than the next tick.
+- **Never from a handler that can interrupt a switch** (an NMI, a machine check, a debug exception, a double fault), nor from the other vectors' handlers.
+- **The boot or idle flow's first switch-out** claims its slot with no frame and leaves its frame like any other.
+- **A window for TASKS item 96.** The scheduler's hook stores the outgoing thread's frame in its run queue under the queue lock; the switch records it as leaving only after that lock is released, on the way out of the trap entry. A mover that takes the source's queue lock in between sees a ready thread whose frame its table has not yet seen, and `lend` answers `NotHere`. So `NotHere` alone is not S20's inconsistency ("a `lend` that fails where its checks said the frame was published"): item 96's checks must establish that the frame was published, for example by the source's table answering whether the frame is in a slot, or by the run queue marking a thread switched out since the source's last call into its table.
+
 ### S6. What a move carries, and what stays where it is
 
 **Decision.** A thread is moved only if it is ready, not running, its frame published (S5), movable and not pinned (S2), allowed on the destination by its affinity (S11), within its move rate (S10), and both processors' FPU format is the boot processor's (below). The mover holds both queue locks, in CPU-index order, with interrupts off, then the move gate (S4), and in one critical section: `lend`; `adopt` (or `restore` and give up); `RunQueue::depart` on the source and `RunQueue::arrive` on the destination; the record's location; `forget`. What passes:
@@ -167,6 +213,12 @@ A thread is therefore movable from its source's next trap entry after it was swi
 What stays: zombies and the exit counts (N5, N6), and so TASKS item 79's settle; sleeping and blocked threads (N10); TASKS item 73's reclaim (N7: the stack region is mapped alike everywhere, and every reclaim's shootdown reaches every processor); the address space (N11: the destination loads it at the switch, and PCIDs are off); ADR-0017 Z3's barrier, decided on the destination by its own last process (N12).
 
 **The FPU format** (N9). Each application processor, at start, compares its XCR0 and the size of its enabled XSAVE state (CPUID.0DH.00H:EBX) with the boot processor's. One that differs never takes part in a move, as source or destination, and the boot says so. The SDM puts the supported-XCR0 bitmap and every component's offset in its Platform domain and checks a standard-format image only against XCR0 and its header (I1 §21.1.4, §13.4.3, §13.8.1), but never says outright that an image moves between logical processors (ledger §2.10), and AMD reports the same values for Zen 5 and Zen 5c without saying so either (§2.7). So it is checked, not assumed. The kernel's area size becomes the boot processor's, and each processor checks against it.
+
+*Note, 2026-11-21 (TASKS item 94, as built, on the coordinating session's rulings on its contract; not an amendment).*
+- **What is compared:** XCR0 as XGETBV reads it back, and CPUID.0DH.00H:EBX read after XCR0 is set: equal both, or the processor takes no part. Each component's offset and size in the standard format is in the Platform domain (SDM Vol. 1, Table 21 for leaf 0DH), so a difference there is not one the documents allow, and it is not compared.
+- **The area:** the boot processor's CPUID.0DH.00H:ECX, never less than its own enabled size, recorded once by the boot processor before the first area is allocated. Shrinking it to the enabled size is TASKS item 111.
+- **An AP whose enabled state is larger than the area** would write past every area its threads save into. It does not come online: it refuses before its handshake and is parked, as one below the baseline is.
+- **The flag** is written by each processor on itself, with its control state, in one store before its handshake answer. It is asked through the processors online (`smp::Online::takes_part_in_moves`), so a processor parked after a late answer never takes part. The boot prints one line ("FPU format: … N of N processors alike, every one taking part in moves"), and ADR-0013 records it as a Report proof, until the mover of TASKS item 96 withholds such a processor.
 
 **Evidence.** N2, N5 to N12.
 
@@ -230,6 +282,12 @@ A level whose groups each hold one child is dropped. Where ACPI's PPTT is presen
 **Migration consequences.** `framekernel::numa`'s map gains its first user. Hot-added processors (ADR-0008 Amendment 1, D2) join the tree with S21's work.
 
 **Threats.** The reports are the processor's and the firmware's (AC1). A malformed table (PPTT, SRAT, SLIT) is parsed as untrusted input, as every ACPI table is (ADR-0019).
+
+**Note (2026-11-21, TASKS item 97; the coordinating session's ruling Q1 on its contract, a reading of this decision, not an amendment).**
+- **What "its cache structures take precedence, as ACPI says" means.** It is read with ACPI 6.6 §5.2.31.2. That section gives precedence to a cache's properties flagged valid in the table (its size, sets, ways, line size and type) over the processor's own discovery. Which processors share a cache is not among them: the PPTT's cache structures complement or replace that discovery.
+- **How sharing is decided.** The PPTT's claims and CPUID's are both claims, combined conservatively, as the build plan's invariant has it ("a disagreement about sharing a cache is read as 'not shared' and reported"). Each group is split wherever either claim splits it. Every processor whose group either claim would have made larger is counted, and the "scheduling domains" proof fails. Where CPUID reports no sharing, the PPTT's claim stands alone.
+- **A PPTT that breaks a rule of §5.2.31 its reading rests on** is not used for sharing at all. Examples are a cache chain entering a cache that another level's node lists, or a processor the PPTT and the MADT do not both name.
+- **No boot stops on this.** The proof is Report class (ADR-0013 R3), so on a real machine whose firmware disagrees it degrades the verdict, and the boot goes on.
 
 ### S9. Capacity and load, only from what the hardware reports
 

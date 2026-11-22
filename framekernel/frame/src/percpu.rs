@@ -98,6 +98,16 @@ impl<T> PerCpu<T> {
         }
     }
 
+    /// This processor's element, lent for the life of the witness `me` was read under (ADR-0020
+    /// S3; TASKS item 93, the coordinating session's ruling Q4). It cannot be kept past the
+    /// witness, so it is never used after its reader might have left the processor. `None` where
+    /// [`PerCpu::get`] gives none.
+    #[cfg(target_os = "none")]
+    #[inline]
+    pub fn this<'a>(&'a self, me: crate::cpu::ThisCpu<'a>) -> Option<&'a T> {
+        self.get(me.index().get())
+    }
+
     /// The table's name.
     pub fn name(&self) -> &'static str {
         self.name
@@ -293,7 +303,7 @@ impl Sizing {
 pub(crate) fn size_per_cpu(sizing: &mut Sizing) {
     sizing.table(&crate::cpu::APIC_IDS);
     sizing.table(&crate::cpu::CPU_LOCAL);
-    sizing.table(&crate::cpu::CPU_STATE_HOLDS);
+    sizing.table(&crate::cpu::CPU_STATE);
     sizing.table(&crate::cpu::CONTEXTS);
     sizing.table(&crate::cpu::PAT_READY);
     sizing.table(&crate::random::SLOTS);

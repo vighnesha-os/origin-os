@@ -11,6 +11,11 @@
 //! A thread blocked on another processor is woken with a reschedule IPI (`sched::wake`),
 //! so it runs within microseconds instead of at that processor's next timer tick (10 ms).
 //!
+//! A queue keeps its waiters' names, `sched::ThreadRef`: each thread's record and the record's
+//! generation, not where the thread runs. A wake-up finds the thread through its record's location
+//! (`origin_frame::sync::threads::wake`; ADR-0020 S1, TASKS item 92), so a name stays good if the
+//! thread moves, and a name kept past its thread's reap wakes no one.
+//!
 //! Lock order: a wait queue's lock, then whatever its condition reads. A waker never holds
 //! a wait queue's lock while it takes another one.
 //!
@@ -244,8 +249,11 @@ const LONG_MS: u64 = 2000;
 const TIMED_ATTEMPTS: u32 = 8;
 
 extern "sysv64" fn timed_waiter(which: u64) -> ! {
+    // Pinned across the wait, so both tick counts are this processor's (TASKS item 93).
+    let pin = sched::pin();
+    let me = cpu::this_cpu(pin.pinned().here());
     let start = crate::time::monotonic_nanos();
-    let ticks_at_start = sched::queue_ticks();
+    let ticks_at_start = sched::queue_ticks(me);
     let (queue, flag, ms) = if which == 0 {
         (&NEVER, &NEVER_SET, SHORT_MS)
     } else {
@@ -253,7 +261,8 @@ extern "sysv64" fn timed_waiter(which: u64) -> ! {
     };
     let result = queue.wait_until_deadline(|| flag.load(Ordering::Acquire), start + ms * 1_000_000);
     let waited = (crate::time::monotonic_nanos() - start) / 1_000_000;
-    let ticks = sched::queue_ticks().wrapping_sub(ticks_at_start);
+    let ticks = sched::queue_ticks(me).wrapping_sub(ticks_at_start);
+    drop(pin);
     if let Some(slot) = TIMED_TICKS.get(which as usize) {
         slot.store(ticks, Ordering::Relaxed);
     }
@@ -286,7 +295,7 @@ struct TimedRun {
 
 /// Starts the two timed waiters on `far`, signals the second after about 20 ms, and waits
 /// for both, at most [`sched::OTHERS_PATIENCE`] seconds; `None` if one could not be spawned.
-fn run_timed(far: CpuIndex, tsc_hz: u64) -> Option<TimedRun> {
+fn run_timed(far: CpuIndex, bsp: CpuIndex, tsc_hz: u64) -> Option<TimedRun> {
     for slot in TIMED.iter().chain(&TIMED_TICKS) {
         slot.store(0, Ordering::Relaxed);
     }
@@ -319,8 +328,9 @@ fn run_timed(far: CpuIndex, tsc_hz: u64) -> Option<TimedRun> {
         long,
         short_wait: wait_of(short, 0),
         long_wait: wait_of(long, 1),
-        // The boot flow runs on the processor this runs on.
-        away: if far == cpu::this_cpu() {
+        // The boot flow runs on the processor this runs on: `bsp`, read under the boot flow's
+        // witness by `sched::prove` (TASKS item 93), a flow that never moves.
+        away: if far == bsp {
             0
         } else {
             per_mille(away, elapsed)
@@ -338,12 +348,12 @@ fn run_timed(far: CpuIndex, tsc_hz: u64) -> Option<TimedRun> {
 /// at most [`TIMED_ATTEMPTS`] runs in all, each against the same bounds
 /// (`runqueue::judge_timed_waits`). A late run whose processor took its ticks fails at once,
 /// and so does an early one. Whether each wait timed out as it must is judged on every run.
-fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> Results {
+fn prove_timed(com1: &mut Console, far: CpuIndex, bsp: CpuIndex, tsc_hz: u64) -> Results {
     let hz = crate::timer::HZ;
     let mut attempts = 0;
     let (run, correct, timely) = loop {
         attempts += 1;
-        let Some(run) = run_timed(far, tsc_hz) else {
+        let Some(run) = run_timed(far, bsp, tsc_hz) else {
             let _ = writeln!(
                 com1,
                 "origin-kernel: wait queues: cannot spawn: wait queues failed"
@@ -584,7 +594,7 @@ pub(crate) fn prove(
         }
     );
     let ping = prove_ping_pong(com1, bsp, far, tsc_hz);
-    let timed = prove_timed(com1, far, tsc_hz);
+    let timed = prove_timed(com1, far, bsp, tsc_hz);
     proofs.record(
         Proof::WaitQueues,
         transfer_ok && ping.correct && timed.correct,

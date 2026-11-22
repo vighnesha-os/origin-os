@@ -346,7 +346,8 @@ fn reclaimed_out_of_reach(
             (
                 faulted,
                 CACHED_PAGES as u64 - faulted,
-                cpu::this_cpu().named(),
+                // The boot flow's own processor, read under its witness by `sched::prove`.
+                bsp.named(),
             )
         }
     };

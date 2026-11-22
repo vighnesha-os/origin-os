@@ -111,6 +111,17 @@
 
 extern crate alloc;
 
+/// TASKS item 112: in a bench build, `$bytes` to the UART the bench loader handed over, the
+/// breadcrumb after one step of the boot (`origin_frame::bench`); in any other build, nothing.
+/// Only the kernel's own target has the boot flow that uses it.
+#[cfg_attr(not(target_os = "none"), allow(unused_macros))]
+macro_rules! crumb {
+    ($bytes:expr) => {
+        #[cfg(origin_bench)]
+        origin_frame::bench::crumb($bytes);
+    };
+}
+
 pub mod acpi_census;
 pub mod acpi_text;
 pub mod aml_proof;
@@ -144,8 +155,8 @@ pub mod originfs;
 pub mod pin;
 pub mod program;
 pub use origin_frame::{
-    acpi, amdvi, apic, apstart, bitmap, boot, clock, cpumap, descriptors, dmar, features, frames,
-    heap, ivrs, pci, topology, unwind, usercopy, vtd,
+    acpi, amdvi, apic, apstart, bitmap, boot, capacity, clock, cpumap, descriptors, dmar, domains,
+    features, frames, heap, ivrs, pci, topology, unwind, usercopy, vtd,
 };
 pub use origin_paging as paging;
 pub mod ps2;
@@ -220,6 +231,8 @@ mod stacks;
 mod storage;
 #[cfg(target_os = "none")]
 mod syscall;
+#[cfg(target_os = "none")]
+mod threads;
 #[cfg(target_os = "none")]
 mod time;
 #[cfg(target_os = "none")]

@@ -267,8 +267,9 @@ impl Early {
         unsafe { cpu::init() };
     }
 
-    /// Enables SSE and AVX state on the boot processor, from what its CPUID reports; returns
-    /// XCR0. Only the first call does anything.
+    /// Enables SSE and AVX state on the boot processor, from what its CPUID reports, and records
+    /// its FPU format and the size of every thread's FPU area, which application processors are
+    /// held to (ADR-0020 S6); returns XCR0 as read back. Only the first call does anything.
     pub fn enable_simd(&mut self) -> u64 {
         if let Some(xcr0) = self.xcr0 {
             return xcr0;
@@ -277,9 +278,11 @@ impl Early {
         // SAFETY: CPL 0, the boot processor, once (`xcr0` above). No code on it uses SSE or
         // XSAVE yet: the kernel is soft-float, and no thread has been started. `cpuid` is what
         // this processor reports: it is read here and passed to nobody else.
-        let xcr0 = unsafe { cpu::enable_simd(&cpuid) };
-        self.xcr0 = Some(xcr0);
-        xcr0
+        let format = unsafe { cpu::enable_simd(&cpuid) };
+        // Before any FPU area is allocated: no thread has been started.
+        let _ = cpu::record_boot_fpu(&cpuid, format);
+        self.xcr0 = Some(format.xcr0);
+        format.xcr0
     }
 
     /// Builds the frame allocator, with its bitmap and then the page-table pool at the start
@@ -442,8 +445,14 @@ impl Early {
     }
 
     /// Loads `kernel` and proves its protections on the processor. Returns whether the kernel
-    /// now runs on its own tables, proven.
-    pub fn load_kernel_tables(&mut self, com1: &mut dyn Write, kernel: KernelTables) -> bool {
+    /// now runs on its own tables, proven. `flow` is the boot flow's witness (ADR-0020 S3;
+    /// TASKS item 93).
+    pub fn load_kernel_tables(
+        &mut self,
+        flow: crate::trap::Pinned<'_>,
+        com1: &mut dyn Write,
+        kernel: KernelTables,
+    ) -> bool {
         let KernelTables {
             space,
             tables,
@@ -462,7 +471,7 @@ impl Early {
         unsafe { cpu::load_page_tables(space.root()) };
         // SAFETY: CPL 0; the tables just loaded mark only the kernel half global (`layout`).
         // Toggling CR4.PGE also drops every translation cached under the loader's tables.
-        let global = unsafe { tlb::enable_global_pages() };
+        let global = unsafe { tlb::enable_global_pages(cpu::this_cpu(flow.here())) };
         let used = tables.used();
         // SAFETY: once (`KernelTables` is made once and consumed here), with the tables
         // `load_page_tables` just loaded: they map everything running now, and from here on
@@ -498,7 +507,9 @@ impl Early {
     /// heap, which starts the `alloc` crate. Does nothing unless the kernel's own tables are
     /// live and proven. Returns whether the heap has started.
     pub fn start_heap(&mut self, com1: &mut dyn Write) -> bool {
-        if self.heap || !self.paged {
+        // Not before `enable_simd`: every FPU area is sized from what it records, and the heap
+        // is where areas come from (the delta review of TASKS item 94, R94-9).
+        if self.heap || !self.paged || self.xcr0.is_none() {
             return false;
         }
         let Some(mut boot) = self.memory.take() else {
@@ -518,14 +529,19 @@ impl Early {
     /// Enables SMEP and SMAP on the boot processor and proves both, on a temporary user page
     /// holding `mov rax, -1; ret`, which a supervisor fetch (SMEP) and a supervisor read
     /// (SMAP) must both fault on. The page is removed afterwards. Runs once, once the heap has
-    /// started; returns whether both protections hold.
-    pub fn prove_user_isolation(&mut self, com1: &mut dyn Write) -> bool {
+    /// started; returns whether both protections hold. `flow` is the boot flow's witness, under
+    /// which the index is read (ADR-0020 S3; TASKS item 93).
+    pub fn prove_user_isolation(
+        &mut self,
+        flow: crate::trap::Pinned<'_>,
+        com1: &mut dyn Write,
+    ) -> bool {
         if self.user_isolation || !self.heap {
             return false;
         }
         self.user_isolation = true;
         // SAFETY: CPL 0, and the kernel has no user mappings yet.
-        let (smep, smap) = unsafe { cpu::enable_smep_smap() };
+        let (smep, smap) = unsafe { cpu::enable_smep_smap(cpu::this_cpu(flow.here())) };
         if !(smep && smap) {
             let _ = writeln!(
                 com1,

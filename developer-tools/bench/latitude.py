@@ -24,6 +24,8 @@ Money is guarded these ways, because a forgotten server bills every hour:
   Mac itself leave it to the watchdog.
 - A deletion counts only when the API confirms it. Until then the ledger and `status` show the
   server as not deleted.
+- Every rental is a ledger row of its own, keyed by its hostname and server ID, never by the
+  server ID alone: Latitude gives a server ID again (rental C had rental A's).
 
 What it cannot guard: the watchdog runs on this Mac. Latitude's API has no way to set a deletion
 time (the dashboard's scheduled deletion takes one; the API's "schedule deletion" removes a
@@ -86,6 +88,15 @@ MARGIN_MINUTES = 10
 CONFIRMED = ("gone", "deleted", "deleting", "disk_erasing")
 # Methods that are safe to repeat. A repeated POST could create a second server.
 IDEMPOTENT = ("GET", "DELETE")
+
+# The bench loader's switches (TASKS items 112 and 116), each a file in \EFI\ORIGIN\ that only
+# QEMU scenarios write. The install refuses an ESP that holds any of them.
+BENCH_SWITCHES = ("BENCH-STALE-KEY", "BENCH-AFTER")
+
+
+def refuse_bench_switches():
+    """The shell tests that fail the install if the ESP holds a bench switch."""
+    return "".join(f"test ! -e /boot/efi/EFI/ORIGIN/{name}; " for name in BENCH_SWITCHES)
 
 
 def die(message):
@@ -288,23 +299,64 @@ def planned_worst_case(max_minutes, usd_per_hour):
     return (math.ceil((max_minutes + MARGIN_MINUTES) / 60) + 1) * usd_per_hour
 
 
+def rental_key(row):
+    """What tells one ledger row from another: its `rental` key, or, for a row written before
+    rows had keys, its hostname and server ID, which also name its folder. Never the server ID
+    alone: Latitude gave rental C (2026-11-21) the server ID it had given rental A."""
+    return row.get("rental") or f"{row.get('hostname')}-{row['server_id']}"
+
+
+def append_rental(book, rental):
+    """Appends `rental` to `book` as a row of its own, whatever server ID earlier rows share,
+    and returns its key: its hostname and server ID, with a count after them if a row has that
+    key already."""
+    taken = {rental_key(r) for r in book["rentals"]}
+    base = f"{rental.get('hostname')}-{rental['server_id']}"
+    key, n = base, 1
+    while key in taken:
+        n += 1
+        key = f"{base}-{n}"
+    book["rentals"].append({**rental, "rental": key})
+    return key
+
+
 def add_rental(rental):
+    """A new rental: always a row of its own. Returns its key."""
     with ledger_for_update() as book:
-        if not any(r["server_id"] == rental["server_id"] for r in book["rentals"]):
-            book["rentals"].append(rental)
+        return append_rental(book, rental)
 
 
-def update_rental(server_id, **fields):
+def open_rental(book, server_id):
+    """The key of the latest row for `server_id` not confirmed deleted, or None. An older open
+    row with that ID stays open, counted at its worst case, until someone looks at it."""
+    rows = [r for r in book["rentals"] if r["server_id"] == server_id and not r.get("deleted_at")]
+    return rental_key(max(rows, key=lambda r: r.get("deployed_at", 0))) if rows else None
+
+
+def add_found_rental(rental):
+    """A server found through the API: the open row that already has its ID, or a new row if
+    every row with that ID is deleted (a reused ID is a new rental). Returns the row's key."""
+    with ledger_for_update() as book:
+        return open_rental(book, rental["server_id"]) or append_rental(book, rental)
+
+
+def update_rental(key, **fields):
+    """Updates the row with `key`. Returns whether there was one."""
     with ledger_for_update() as book:
         for r in book["rentals"]:
-            if r["server_id"] == server_id:
+            if rental_key(r) == key:
                 r.update(fields)
+                return True
+    return False
 
 
-def confirm_deleted(server_id, result, by):
-    """Records the deletion only if the API confirmed it. Returns whether it did."""
+def confirm_deleted(key, result, by):
+    """Records the deletion on the row with `key` (none if `key` is None) only if the API
+    confirmed it. Returns whether the API did."""
     if result in CONFIRMED:
-        update_rental(server_id, deleted_at=now(), deleted_by=by)
+        if key is not None and not update_rental(key, deleted_at=now(), deleted_by=by):
+            print(f"{stamp()} the ledger has no row {key}: the deletion is not recorded",
+                  file=sys.stderr)
         return True
     return False
 
@@ -467,34 +519,35 @@ def cmd_status(args):
         print(f"{s['id']} {a.get('hostname')} {a.get('status')} {a.get('primary_ipv4')}")
     for r in ledger()["rentals"]:
         state = f"deleted {stamp(r['deleted_at'])}" if r.get("deleted_at") else "NOT DELETED"
-        print(f"{r['server_id']} {r['plan']} {r['site']} ${r['usd_per_hour']:.2f}/h "
+        print(f"{rental_key(r)} {r['plan']} {r['site']} ${r['usd_per_hour']:.2f}/h "
               f"from {stamp(r['deployed_at'])}: {state}; worst case ${worst_case(r):.2f}")
 
 
 def cmd_delete(args):
     result = delete_server(args.server_id)
     print(f"{args.server_id}: {result}")
-    if not confirm_deleted(args.server_id, result, "delete"):
+    if not confirm_deleted(open_rental(ledger(), args.server_id), result, "delete"):
         die(f"{args.server_id}: deletion not confirmed; it may still bill. Run delete again")
 
 
 def reap(servers, by):
-    """Deletes each server, recording it in the ledger first if it is not there. Returns the
-    IDs whose deletion the API did not confirm."""
+    """Deletes each server, recording it in the ledger first if no open row has it. Returns the
+    server ID and ledger key of each whose deletion the API did not confirm."""
     unconfirmed = []
     for s in servers:
         a = s["attributes"]
-        add_rental({"server_id": s["id"], "plan": (a.get("plan") or {}).get("slug", "?"),
-                    "site": ((a.get("region") or {}).get("site") or {}).get("slug", "?"),
-                    "usd_per_hour": offers_price_or_cap(a), "deployed_at": now(),
-                    "deadline": now(), "hostname": a.get("hostname"), "found_by": by})
+        key = add_found_rental({
+            "server_id": s["id"], "plan": (a.get("plan") or {}).get("slug", "?"),
+            "site": ((a.get("region") or {}).get("site") or {}).get("slug", "?"),
+            "usd_per_hour": offers_price_or_cap(a), "deployed_at": now(), "deadline": now(),
+            "hostname": a.get("hostname"), "found_by": by})
         try:
             result = delete_server(s["id"])
         except Exception as e:
             result = f"failed ({e})"
         print(f"{s['id']} {a.get('hostname')}: {result}")
-        if not confirm_deleted(s["id"], result, by):
-            unconfirmed.append(s["id"])
+        if not confirm_deleted(key, result, by):
+            unconfirmed.append((s["id"], key))
     return unconfirmed
 
 
@@ -519,7 +572,8 @@ def cmd_reap(args):
         return
     unconfirmed = reap(servers, "reap")
     if unconfirmed:
-        die(f"deletion not confirmed for {', '.join(unconfirmed)}; they may still bill. Run reap again")
+        die(f"deletion not confirmed for {', '.join(s for s, _ in unconfirmed)}; they may still "
+            "bill. Run reap again")
 
 
 def cmd_watchdog(args):
@@ -542,16 +596,17 @@ def cmd_watchdog(args):
         except Exception as e:
             result = f"failed ({e})"
         print(f"{stamp()} deadline: deleting {args.server_id}: {result}", flush=True)
-        if confirm_deleted(args.server_id, result, "watchdog"):
+        if confirm_deleted(args.rental, result, "watchdog"):
             return
         time.sleep(60)
 
 
-def start_watchdog(server_id, deadline, rental_dir):
+def start_watchdog(server_id, key, deadline, rental_dir):
+    """Starts the watchdog of `server_id`, which records its deletion on the ledger row `key`."""
     log = open(rental_dir / "watchdog.log", "a")
     process = subprocess.Popen(
         ["caffeinate", "-i", sys.executable, "-I", str(Path(__file__).resolve()), "watchdog",
-         "--server-id", server_id, "--deadline", str(deadline)],
+         "--server-id", server_id, "--rental", key, "--deadline", str(deadline)],
         stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
     return process.pid
 
@@ -641,22 +696,24 @@ def buy_and_run(args, kind, work, project, site, hour):
             seen.update(s["id"] for s in found_now)
             unconfirmed += reap(found_now, "failed-create")
             time.sleep(20)
-        for server in unconfirmed:
-            start_watchdog(server, now(), private_dir(STATE / f"failed-create-{server}"))
+        for server, key in unconfirmed:
+            start_watchdog(server, key, now(), private_dir(STATE / f"failed-create-{server}"))
         die(f"no rental: {len(seen)} server(s) found and deleted"
-            + (f"; {', '.join(unconfirmed)} not confirmed, watchdogs started" if unconfirmed else ""))
+            + (f"; {', '.join(s for s, _ in unconfirmed)} not confirmed, watchdogs started"
+               if unconfirmed else ""))
     deployed = now()
     deadline = deployed + args.max_minutes * 60
     rental_dir = STATE / f"{hostname}-{server_id}"
     watchdog = None
     console = None
+    key = None
     try:
         private_dir(rental_dir)
-        add_rental({"server_id": server_id, "plan": args.plan, "site": site, "usd_per_hour": hour,
-                    "deployed_at": deployed, "deadline": deadline, "hostname": hostname,
-                    "dir": str(rental_dir)})
-        watchdog = start_watchdog(server_id, deadline, rental_dir)
-        update_rental(server_id, watchdog_pid=watchdog)
+        key = add_rental({"server_id": server_id, "plan": args.plan, "site": site,
+                          "usd_per_hour": hour, "deployed_at": deployed, "deadline": deadline,
+                          "hostname": hostname, "dir": str(rental_dir)})
+        watchdog = start_watchdog(server_id, key, deadline, rental_dir)
+        update_rental(key, watchdog_pid=watchdog)
         print(f"{stamp()} deployed {server_id} ({hostname}); the watchdog (pid {watchdog}) deletes "
               f"it at {stamp(deadline)}")
         ip = None
@@ -685,7 +742,7 @@ def buy_and_run(args, kind, work, project, site, hour):
         except Exception as e:
             result = f"failed ({e})"
         print(f"{stamp()} deleting {server_id}: {result}")
-        if confirm_deleted(server_id, result, "rental"):
+        if confirm_deleted(key, result, "rental"):
             if watchdog:
                 try:
                     os.killpg(watchdog, 15)
@@ -693,7 +750,9 @@ def buy_and_run(args, kind, work, project, site, hour):
                     pass
         else:
             if not watchdog:
-                watchdog = start_watchdog(server_id, now(), private_dir(rental_dir))
+                # The key `add_rental` gives, if it never ran.
+                watchdog = start_watchdog(server_id, key or f"{hostname}-{server_id}", now(),
+                                          private_dir(rental_dir))
             print(f"{stamp()} deletion not confirmed: the watchdog (pid {watchdog}) keeps trying, "
                   f"and `status` shows the server; or run `delete {server_id}`", file=sys.stderr)
         print(f"files: {rental_dir}")
@@ -751,6 +810,11 @@ class Console:
         self.command, self.reopen = command, reopen
         self.path = rental_dir / "sol.log"
         self.events = open(rental_dir / "sol-events.log", "a")
+        # When the console's bytes arrived, sampled every half second: "<time> <size>" whenever
+        # the size changed (TASKS item 116: how long after the loader's last line the machine
+        # started again).
+        self.times = open(rental_dir / TIMES_FILE, "a")
+        self.last_size = None
         self.log = open(self.path, "ab")
         self.process = None
         self.stopping = threading.Event()
@@ -785,6 +849,7 @@ class Console:
             self.note(f"console session opened at byte {self.size()}")
             while self.process.poll() is None and not self.stopping.is_set():
                 time.sleep(0.5)
+                self.mark_time()
             if self.stopping.is_set():
                 break
             self.note(f"console session ended (exit {self.process.returncode}) at byte {self.size()}")
@@ -796,6 +861,13 @@ class Console:
                     self.command = command
                 quick_failures = 0
             time.sleep(1 if quick_failures == 0 else 2)
+
+    def mark_time(self):
+        size = self.size()
+        if size != self.last_size and not self.times.closed:
+            self.times.write(f"{now():.1f} {size}\n")
+            self.times.flush()
+            self.last_size = size
 
     def flush(self):
         if not self.log.closed:
@@ -819,6 +891,7 @@ class Console:
         self.thread.join(timeout=15)
         self.log.close()
         self.events.close()
+        self.times.close()
 
 
 def out_of_band(server_id, key_id, deadline):
@@ -997,6 +1070,35 @@ def scope_verdict(lscpu):
     return f"{vendor}: outside the scope; bench equipment"
 
 
+BENCH_LINE = "origin-boot: bench build:"
+CRUMB_BYTES = "RS12345678"
+# TASKS item 116: every bench loader that resets after ExitBootServices says whether BENCH-AFTER
+# is there, and each start of a loader prints its banner. The file of the console's arrival times.
+RESET_BUILD_LINE = "BENCH-AFTER"
+LOADER_START = "UEFI loader (build"
+TIMES_FILE = "sol-times.log"
+
+
+def breadcrumbs(text):
+    """A bench build's breadcrumbs in one boot's console text (TASKS item 112): the bytes the
+    entry stub and the kernel wrote between the loader's last line and the kernel's first,
+    `RS12345678` when every step passed, so the last one names the step the boot stopped after.
+    None for a boot that was not a bench build's (no bench loader line), "" for one that wrote
+    none."""
+    if BENCH_LINE not in text or RESET_BUILD_LINE in text:
+        return None
+    after = text[text.rfind(LOADER_LINE):]
+    after = after[after.find("\n") + 1:] if "\n" in after else ""
+    # Only the run that starts right after the loader's line: a firmware's text after a reset,
+    # or another system's, may hold the same letters (TASKS item 112's review, R112-6).
+    run = ""
+    for c in after.lstrip("\r\n"):
+        if c not in CRUMB_BYTES:
+            break
+        run += c
+    return run
+
+
 def boot_result(text):
     """What one boot showed on the console: the kernel's verdict or refusal, the line it halted
     on, or how far it got. `loader` and `kernel` say whether each printed anything: the loader
@@ -1005,16 +1107,69 @@ def boot_result(text):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     seen = {"loader": any(LOADER_LINE in l for l in lines),
             "kernel": any(KERNEL_LINE in l for l in lines)}
+    crumbs = breadcrumbs(text)
+    if crumbs is not None:
+        seen["breadcrumbs"] = crumbs
+    said = "" if crumbs is None else f"; breadcrumbs: {crumbs or 'none'}"
+    # TASKS item 116: a bench loader that resets the machine starts again within the boot's
+    # window if ExitBootServices returned (reading B), and never does if it did not (reading A, or
+    # a ResetSystem that hung).
+    if RESET_BUILD_LINE in text:
+        runs = text.count(LOADER_START)
+        seen["loader_runs"] = runs
+        said = (f"; loader runs: {runs}, " +
+                ("so the machine reset itself after the loader's last line" if runs > 1
+                 else "with no reset of its own"))
     verdict = next((l for l in lines if VERDICT_LINE in l or REFUSED_LINE in l), None)
     halted = next((l for l in lines if KERNEL_LINE in l and any(h in l for h in HALTED_LINES)), None)
     origin = [l for l in lines if KERNEL_LINE in l or LOADER_LINE in l]
     if verdict or halted:
         line = verdict or halted
-        return {"ended": True, "summary": line[line.find(KERNEL_LINE):], **seen}
+        return {"ended": True, "summary": line[line.find(KERNEL_LINE):] + said, **seen}
     if any("login:" in l for l in lines):
         return {"ended": True, "summary": "a system other than Origin started (a login prompt)", **seen}
     last = origin[-1] if origin else (lines[-1] if lines else "nothing on the console")
-    return {"ended": False, "summary": f"no verdict; last line: {last[:200]}", **seen}
+    return {"ended": False, "summary": f"no verdict; last line: {last[:200]}{said}", **seen}
+
+
+def after_last_line(raw, times):
+    """TASKS item 116: in one boot's raw console bytes, how many seconds after the loader's first
+    `exiting boot services` line the next byte arrived, and the next loader's banner, from the
+    arrival times `[(time, size)]` (the console's size from the boot's start). None for what did
+    not arrive within the boot. Times are good to the half second the console is sampled at."""
+    end = raw.find(b"entering the Framekernel")
+    if end < 0 or not times:
+        return None, None
+    end = raw.find(b"\n", end)
+    end = len(raw) if end < 0 else end + 1
+
+    def arrived(offset):
+        return next((t for t, size in times if size > offset), None)
+
+    last = arrived(end - 1)
+
+    def after(offset):
+        if offset is None or offset >= len(raw) or last is None:
+            return None
+        when = arrived(offset)
+        return None if when is None else round(when - last, 1)
+
+    loader = raw.find(LOADER_START.encode(), end)
+    return after(end), after(loader if loader >= 0 else None)
+
+
+def read_times(path, start):
+    """The console's arrival times from `path`, as sizes counted from byte `start`."""
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        t, _, size = line.partition(" ")
+        try:
+            out.append((float(t), int(size) - start))
+        except ValueError:
+            continue
+    return [(t, size) for t, size in out if size > 0]
 
 
 def last_boot(result):
@@ -1077,7 +1232,10 @@ def cmd_rental_b(args):
         rental.ssh("rm -rf /tmp/origin && mkdir -m 700 /tmp/origin", check=True, timeout=60)
         subprocess.run(["scp", "-q"] + ssh_base(rental.dir)[1:] + [str(loader), str(kernel),
                        f"{OS_USER}@{rental.ip}:/tmp/origin/"], check=True, timeout=300)
-        install = (f"set -eu; test -f '{target}'; "
+        # TASKS items 112 and 116: a bench loader's switches are for QEMU scenarios only; the
+        # rented ESP never holds one, so the board takes the rental's path: its own key in
+        # ExitBootServices, and the reset afterwards.
+        install = (f"set -eu; test -f '{target}'; {refuse_bench_switches()}"
                    f"install -D -m 0644 /tmp/origin/KERNEL.ONBF /boot/efi/EFI/ORIGIN/KERNEL.ONBF; "
                    f"cp /tmp/origin/BOOTX64.EFI '{target}'; sync; "
                    f"sha256sum '{target}' /boot/efi/EFI/ORIGIN/KERNEL.ONBF")
@@ -1087,7 +1245,7 @@ def cmd_rental_b(args):
             raise RuntimeError("the files on the ESP do not match the image")
         (rental.dir / "installed.txt").write_text(f"{entry} {path}; {last}\n{' '.join(sums)}\n")
         print(f"{stamp()} Origin's loader is {path}, and its kernel \\EFI\\ORIGIN\\KERNEL.ONBF; "
-              "no UEFI variable was written")
+              f"no UEFI variable was written, and the ESP holds no {' and no '.join(BENCH_SWITCHES)}")
         console = rental.console
         if not console:
             raise RuntimeError("no serial console: a boot would show nothing")
@@ -1107,6 +1265,14 @@ def cmd_rental_b(args):
                     time.sleep(10)
                     result = boot_result(console.text(start))
                 result.update(boot=boot, start=start, end=console.size())
+                if RESET_BUILD_LINE in console.text(start):
+                    raw = console.path.read_bytes()[start:result["end"]]
+                    first, loader_again = after_last_line(raw, read_times(rental.dir / TIMES_FILE, start))
+                    result.update(next_byte_s=first, next_loader_s=loader_again)
+                    result["summary"] += (f"; after the loader's last line the next byte came "
+                                          f"{'after ' + str(first) + ' s' if first is not None else 'never, within the boot'}"
+                                          f", the next loader "
+                                          f"{'after ' + str(loader_again) + ' s' if loader_again is not None else 'never'}")
                 results.append(result)
                 print(f"{stamp()} boot {boot}: {result['summary']}")
                 (rental.dir / "boots.json").write_text(json.dumps(results, indent=2))
@@ -1121,6 +1287,15 @@ def cmd_rental_b(args):
                 print(f"{stamp()} the record draft could not be written: {e!r}", file=sys.stderr)
 
     rent(args, "b", work, check)
+
+
+def loader_kind(path):
+    """What the image directory's loader is: a bench build's says so in its own bytes (TASKS
+    items 112 and 116, F2's text)."""
+    data = Path(path).read_bytes() if Path(path).exists() else b""
+    if b"bench build" in data:
+        return "the bench loader (developer-mode, the TEST trust store; never signed or shipped)"
+    return "developer-mode loader"
 
 
 def sha256(path):
@@ -1151,7 +1326,7 @@ def write_record(args, rental, results):
                     f"{dmi.get('board_name', '?')}; {cpu.get('CPU(s)', '?')} logical processors"),
         ("Firmware", f"{dmi.get('bios_vendor', '?')} {dmi.get('bios_version', '?')} "
                      f"({dmi.get('bios_date', '?')}); {read('boot-mode.txt').strip()}; Secure Boot off"),
-        ("Source revision", f"`{args.source_revision}`; developer-mode loader; `BOOTX64.EFI` SHA-256 "
+        ("Source revision", f"`{args.source_revision}`; {loader_kind(Path(args.image_dir) / 'BOOTX64.EFI')}; `BOOTX64.EFI` SHA-256 "
                             f"{sha256(Path(args.image_dir) / 'BOOTX64.EFI')}; `KERNEL.ONBF` SHA-256 "
                             f"{sha256(Path(args.image_dir) / 'KERNEL.ONBF')}"),
         ("Date", date),
@@ -1207,6 +1382,7 @@ def main():
             p.add_argument("--boot-minutes", type=int, default=8, help="how long one boot may take")
     p = sub.add_parser("watchdog")
     p.add_argument("--server-id", required=True)
+    p.add_argument("--rental", required=True, help="the ledger row that records the deletion")
     p.add_argument("--deadline", type=float, required=True)
     p.set_defaults(run=cmd_watchdog)
     args = parser.parse_args()
