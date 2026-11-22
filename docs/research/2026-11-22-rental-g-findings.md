@@ -72,7 +72,7 @@ No run wrote `Y` or Amendment 2's line. Between `X` and the firmware's next byte
 
 From the first byte to the loader's first line took 48.3 to 54.4 s. A boot of item 350's plan on this revision therefore runs: the tool's restart, the first run about 120 s later (119.0 to 122.4 s), the control's reset, the call about 99 s after the control (96.7 to 101.2 s), and, if the call is followed by a reset, the next run about 101 s after `X` (run 3: 101.2 s), so about 320 s after the restart.
 
-On rental F's revision 2.5 the firmware's first line came 6.6 to 7.1 s after a reset. On 2.4a it comes after about 49 s, for every reset of the processor seen here.
+On rental F's revision 2.5 the firmware's first byte came 3.5 s after a reset, and its first line 6.6 to 7.1 s. On 2.4a the first byte comes after about 49 s, for every reset of the processor seen here. *(Corrected 2026-11-22 by TASKS item 130's review, R130-11: this paragraph first compared rental F's first line with rental G's first byte.)*
 
 ## Reading the calls
 
@@ -140,6 +140,7 @@ It changes no run's reading. The loader's layout check accepts bit 20 beside one
 ## What it does not prove
 
 - **That the call returned `EFI_SUCCESS`.** By item 349 nothing is written after a successful call, so R rests on the reset's timing and one read of `PMxC0`, and S is not excluded.
+- **What kind of reset followed runs 7, 9, 11 and 13.** Their firmware starts were cut short by the tool's restarts and by the deletion, so no run read their cause. Only run 2's reset had its cause read, by run 3: a shutdown (TASKS item 130's review).
 - **That the same holds on another revision:** rental F's 2.5 and rental C's 2.5a were not run with this program.
 - **Which of the loaders' additions stops their call.** The minimal mode makes no copy of the boot services table, so it does not read whether the firmware changed the table after a copy.
 - Anything about the kernel, which was not entered, and anything on a processor in the declared scope (Zen 5 or newer).
@@ -148,7 +149,7 @@ It changes no run's reading. The loader's layout check accepts bit 20 beside one
 
 The tool's summaries are wrong for this image, and the change that made them is owner item 350's, built in TASKS item 128:
 - **It counts loader runs, not firmware starts.** A minimal boot "ends at its answer" only when a run after a reset reaches its own call, or three minutes after the last call with no loader since. A reset after the call shows first as the firmware's bytes, about 49 s after it on this revision, and the next loader comes about 52 s after those.
-- **The plan was set from rental F's revision,** where the firmware's first line came 7 s after a reset. On 2.4a it comes after about 49 s, so the call came about 220 s into each boot and the run after its reset would have come at about 320 s: past the five-minute end by 6 to about 25 s. Neither early end fired except in boot 2, whose window held boot 1's sequel and so a second call.
+- **The plan was set from rental F's revision,** where the firmware's first line came 7 s after a reset (its first byte 3.5 s). On 2.4a the first byte comes after about 49 s, so the call came about 220 s into each boot and the run after its reset would have come at about 320 s: past the five-minute end by 6 to about 25 s. Neither early end fired except in boot 2, whose window held boot 1's sequel and so a second call.
 - **"After the loader's last line the next byte came after 0.0 s"** measures from the call's line to `X`, which arrives with it. Measured from `X`, it would have read 48.8 s, and shown the reset.
 
 A fix is free, and is the first of the next steps.
@@ -176,8 +177,8 @@ The bench loaders' own additions (`Stall`, the UART's registers, the runtime tab
 
 Item 350's pause holds: no further rental is put to the owner unless two questions batch, or a machine in the declared scope appears.
 
-1. **The tool's reading of a minimal image (free; now).** Measure the next byte from the mark, not from the call's line; count the firmware's bytes after a call's mark as that call's reset; and end a minimal boot when they come, or give it time for this revision's cycle (a run about 101 s after `X`). Test it on a fixture shaped like rental G's console and times, with no identifier in it, and re-read rental G's raw data with the fixed tool: it should report a reset after runs 2, 7, 9, 11 and 13.
-2. **Stage the full bench image of `32b6e043` for a rental (free).** It holds Amendment 4's addition: the live table compared with the copy, both `ExitBootServices` pointers and both CRCs printed, before a call made through the copy.
+1. **The tool's reading of a minimal image (free; now). *Done by TASKS item 130 the same day: its replay of rental G's console reads a reset after 5 of the 5 calls, with runs 3 and 5 overtaken.*** Measure the next byte from the mark, not from the call's line; count the firmware's bytes after a call's mark as that call's reset; and end a minimal boot when they come, or give it time for this revision's cycle (a run about 101 s after `X`). Test it on a fixture shaped like rental G's console and times, with no identifier in it, and re-read rental G's raw data with the fixed tool: it should report a reset after runs 2, 7, 9, 11 and 13.
+2. **Stage the full bench image of `32b6e043` for a rental (free). *Staged by TASKS item 130.*** It holds Amendment 4's addition: the live table compared with the copy, both `ExitBootServices` pointers and both CRCs printed, before a call made through the copy.
 3. **The next rental, two questions in one (when the pause lifts):** the full bench loader with the table's compare, and Origin's OS-defined memory types allocated as `EfiLoaderData` (an owner item and an amendment).
    - **If the call returns:** the memory types were the cause, and the table's line is read besides.
    - **If it hangs and the table differs:** the memory types are cleared, and the stale copy is the first suspect, tested next by calling through the live table.
