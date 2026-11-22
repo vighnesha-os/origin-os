@@ -33,6 +33,7 @@ mod screen;
 mod serial;
 mod settings;
 mod settle;
+mod stack_depth;
 mod targetcfg;
 mod toolchain;
 mod turns;
@@ -114,7 +115,14 @@ commands:
               COM2: ExitBootServices given the firmware's key, a stale key once (the retry),
               twice (the halt, which says why and then nothing), and the bench kernel under the
               normal loader (no breadcrumbs); part of boot-matrix
-  bench-gate  only the gate on which files may name the bench build's flag (part of check)
+  bench-gate  only the gate on which files may name the bench build's flag, or the stack
+              measurement's (part of check)
+  stack-depth how deep the loader's stack goes before ExitBootServices, under QEMU (TASKS
+              item 127): the 128 KiB UEFI promises painted at entry and scanned after each of
+              six phases, in a measurement build of the normal and the bench loader into
+              target/stack-measure (never signed, never rented), three scenarios three boots
+              each, and the longest chain of the loader's own frames its disassembly allows.
+              On demand: not part of check or boot-matrix
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
   reproducible-gate only the gate on reproducible builds: the loader, each way it is built,
               and the kernel are built twice from nothing in two target directories; the
@@ -357,13 +365,20 @@ enum Loader {
     /// The bench build (TASKS item 112): `developer-mode`, and the bench flag only
     /// `bench::build_loader` gives, into `target/bench`.
     Bench,
+    /// TASKS item 127's stack measurement of the developer-mode loader, into
+    /// `target/stack-measure/normal` (`stack_depth::build_loader`).
+    MeasureNormal,
+    /// The same of the bench loader, into `target/stack-measure/bench`.
+    MeasureBench,
 }
 
 impl Loader {
     /// The Cargo feature this build needs.
     fn feature(self) -> &'static str {
         match self {
-            Self::Developer | Self::Bench => "developer-mode",
+            Self::Developer | Self::Bench | Self::MeasureNormal | Self::MeasureBench => {
+                "developer-mode"
+            }
             Self::Verifying => "test-trust-store",
         }
     }
@@ -4591,6 +4606,7 @@ fn main() -> ExitCode {
         ["boot-bench"] => in_turn_with_settings("boot-bench", bench::boot),
         ["bench-build"] => in_turn("bench-build", || bench::build().map(|_| ())),
         ["bench-gate"] => bench::gate(),
+        ["stack-depth"] => in_turn_with_settings("stack-depth", stack_depth::run),
         ["boot-bridge"] => in_turn_with_settings("boot-bridge", boot_bridge),
         ["boot-reserved"] => in_turn_with_settings("boot-reserved", boot_reserved),
         ["boot-large"] => in_turn_with_settings("boot-large", boot_large),
@@ -6902,6 +6918,8 @@ fn collect_files(
 fn build_loader(loader: Loader) -> Result<PathBuf> {
     match loader {
         Loader::Bench => bench::build_loader(),
+        Loader::MeasureNormal => stack_depth::build_loader(false),
+        Loader::MeasureBench => stack_depth::build_loader(true),
         _ => build_loader_in(Some(loader.feature()), None),
     }
 }

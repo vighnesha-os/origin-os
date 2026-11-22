@@ -979,7 +979,8 @@ def image_fault(loader, kernel):
 
     The kernel: an ONBF container, format 1, profile 6 (KRN), architecture 1 (x86-64)
     (`docs/spec/ONBF.md` §1 and §4.2). The loader: a PE32+ image for x86-64 whose subsystem is
-    10, an EFI application (the PE format's optional header)."""
+    10, an EFI application (the PE format's optional header), and not a stack measurement build,
+    whose lines say "stack measure" (TASKS item 127)."""
     u16 = lambda b, at: int.from_bytes(b[at:at + 2], "little")
     k = kernel[:128]
     if len(k) < 128 or k[:8] != b"\x89ONBF\r\n\x1a":
@@ -996,6 +997,9 @@ def image_fault(loader, kernel):
     if (machine, magic, subsystem) != (0x8664, 0x20B, 10):
         return (f"BOOTX64.EFI is machine {machine:#x}, optional header {magic:#x}, subsystem "
                 f"{subsystem}; a UEFI loader is 0x8664, 0x20b (PE32+), 10 (EFI application)")
+    if b"stack measure" in loader:
+        return ("BOOTX64.EFI is a stack measurement build (TASKS item 127): it paints the firmware's "
+                "stack and runs under QEMU only; it is never rented")
     return None
 
 

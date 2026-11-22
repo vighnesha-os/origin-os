@@ -19,7 +19,7 @@ Line numbers are `boot/uefi/src/main.rs` unless named otherwise.
 2. **The console:** every line goes out through `OutputString`, in chunks of 128 characters (`console.rs` 28–40; `text.rs` 7). `Reset`, `SetMode`, `SetAttribute` and `ClearScreen` are never called.
 3. **The boot services table is copied** (`boot_services`, 833–849). Every later service, `GetMemoryMap` and `ExitBootServices` among them, is called through the copy. If the firmware changed a pointer in its own table after the loader copied it, the loader would still call the old one.
 4. **The kernel file** (`read_kernel`, 886–978): `HandleProtocol` (loaded image), `HandleProtocol` (simple file system, on the image's device), `OpenVolume`, `Open`, `GetInfo`, `AllocatePages` (`EfiLoaderData`), a `Read` loop, `Close` on the file and on the volume. No protocol is closed with `CloseProtocol`, which `HandleProtocol` does not need.
-5. **The kernel is verified:** SHA-512, Ed25519 and ML-DSA-87, and SHA-256 Merkle checks of each section (`kernel.rs` 133–185). This uses only the processor, on the firmware's own stack. **How deep that stack goes has not been measured,** for ML-DSA-87 in particular.
+5. **The kernel is verified:** SHA-512, Ed25519 and ML-DSA-87, and SHA-256 Merkle checks of each section (`kernel.rs` 133–185). This uses only the processor, on the firmware's own stack. During a signed kernel's verification the stack reaches 20 to 21 KiB below `efi_main`, and during an unsigned kernel's, as the rentals ran it, 6 KiB (TASKS item 127).
 6. **Pages allocated:**
    - `EfiLoaderCode` for the kernel (233);
    - `EfiLoaderData`, 15 pages, for the random-number generator (252);
@@ -72,7 +72,7 @@ The list above is the loader at `c8ecfc9d`, rental E's. Rental F's bench loader 
 - the six loads from the FCH's power-management block, only where the checks allow them;
 - in a boot's first run, the control: `0x06` to port `0xCF9`, after the UART has emptied, and no call.
 
-So rental F's loader is not rental E's plus a reset alone. If rental F shows reading 1 again, these are on the list too, and candidate 2 below, the stack's depth, weighs more.
+So rental F's loader is not rental E's plus a reset alone. If rental F shows reading 1 again, these are on the list too, and candidate 2 below, the stack's depth, weighs more. *(Rental F did show it, and TASKS item 127 then measured the stack: far within the promise, now candidate 5.)*
 
 ## What is left as the firmware left it
 
@@ -86,17 +86,21 @@ So rental F's loader is not rental E's plus a reset alone. If rental F shows rea
 
 ## The candidates, under reading 1
 
-Ranked by how directly each could make the firmware's own exit handling hang, and so how soon a bench loader that leaves it out should be tried:
+Ranked by how directly each could make the firmware's own exit handling hang, and so how soon a bench loader that leaves it out should be tried. *Re-ranked on 2026-11-22: TASKS item 127 measured the stack (candidate 2, now last), and the coordinating session ruled it to the bottom.*
 
 1. **The two OS-defined memory types** (`0x80000002`, `0x80000003`). They are allowed, but the firmware's exit handling walks its memory map, and a minimal program never gives it these types. A bench loader that allocates both as `EfiLoaderData` tests it; the kernel's boot info would then name them by address, as the kernel image already is.
-2. **The stack's depth on the firmware's stack.** UEFI guarantees an application at least 128 KiB. ML-DSA-87's verification and the walks' 1 KiB buffers run on that stack, and the depth has not been measured. An overflow would corrupt firmware memory silently, and the exit handling could be the first code to trip on it. A free measurement: under QEMU, paint the stack below RSP before verification and find the deepest change after the call's preparation.
-3. **The copied boot services table.** It holds only if the firmware's table was not changed after the copy, for example by a driver loaded during the loader's run. Comparing the copy's `ExitBootServices` with the live table's just before the call is a read.
-4. **The generator's thousands of steps on its own stack,** with interrupts masked inside each. They end before the call, and nothing seen points at them.
-5. **The ACPI walk's reads of reserved and NVS memory.** Reads only, of tables the firmware lists.
+2. **The copied boot services table.** It holds only if the firmware's table was not changed after the copy, for example by a driver loaded during the loader's run. Comparing the copy's `ExitBootServices` with the live table's just before the call is a read.
+3. **The generator's thousands of steps on its own stack,** with interrupts masked inside each. They end before the call, and nothing seen points at them.
+4. **The ACPI walk's reads of reserved and NVS memory.** Reads only, of tables the firmware lists.
+5. **The stack's depth on the firmware's stack** (formerly 2). UEFI promises an application at least 128 KiB (UEFI 2.11 §2.3.4). TASKS item 127 measured it under QEMU on 2026-11-22, by painting that promise (`docs/research/2026-11-22-loader-stack-depth.md`):
+   - **the rentals' path** (an unsigned kernel): at most 10,312 bytes, 7.9%;
+   - **the shipping path** (a signed kernel, ML-DSA-87 verified): at most 23,240 bytes, 17.7%.
+
+   OVMF's own frames are in both. The firmware's would need over 100 KiB more to overflow it.
 
 ## What the code does not settle
 
 - What the firmware does inside `OutputString`, `HandleProtocol`, `LocateHandle`, the file reads and `Stall`.
-- How deep the stack goes (candidate 2), and how long the loader takes from entry to the call.
+- How long the loader takes from entry to the call. (How deep the stack goes is measured now: candidate 5.)
 - Whether the boot manager armed a watchdog. The interrupt flag's value at entry.
 - Whether a driver changed the boot services table after the copy (candidate 3).

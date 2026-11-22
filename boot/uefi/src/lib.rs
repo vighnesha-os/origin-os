@@ -22,6 +22,8 @@ pub mod memmap;
 pub mod place;
 pub mod protocols;
 pub mod spcr;
+#[cfg(any(test, origin_stack_measure))]
+pub mod stackdepth;
 pub mod text;
 pub mod trust;
 pub mod uart;

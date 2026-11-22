@@ -7,6 +7,17 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** On a physical machine only Origin's loader has run: a rented bench server, outside the declared scope, on 2026-11-20 (see the next section). |
 
+## The loader's stack depth before `ExitBootServices` (TASKS item 127; 2026-11-22)
+
+On `claude/t127-stack-depth`, cut from `land/batch-10` at `953cda2c`; not yet in the batch. Rental F's findings ranked first a free measurement: how deep the loader's stack goes before the call, against the 128 KiB UEFI promises (`docs/research/2026-11-22-loader-stack-depth.md`).
+
+- **How:** a measurement build of its own, never signed or rented, paints exactly the promised 128 KiB at entry. After each of six phases it finds the deepest word written, calibrated on a known 64 KiB array. A static chain from the build's link map and disassembly cross-checks it.
+- **The rentals' path** (an unsigned kernel): at most 10,312 bytes, 7.9%.
+- **The shipping path** (a signed kernel, ML-DSA-87 verified): at most 23,240 bytes, 17.7%. The static chain matches the quietest boot to the byte.
+- **So the stack drops to the bottom of the candidates** (the coordinating session's ruling). OVMF's own frames are in the figure; AMI's are not.
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:** `stack-depth`, 12 boots; its four planted controls fail; `check` passes; the normal images are the batch's bytes.
+
 ## A bench reset with no firmware code: a bench loader for rental F (TASKS item 121; 2026-11-21)
 
 On `claude/t121-firmware-free-reset`, cut from TASKS item 116's branch, with `land/batch-9` at `d0376076` merged in; not yet in the batch. Rental E showed nothing after the mark before `ExitBootServices`, and no reset (`docs/research/2026-11-21-rental-e-findings.md`): either the call never returns, or it returned and both the console's path and the firmware's reset failed after it. This loader separates the two with a reset that runs no firmware code (decision item 345, ADR-0002 Amendment 4).
