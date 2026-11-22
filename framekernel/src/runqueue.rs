@@ -651,11 +651,15 @@ impl<R: Copy> RunQueue<R> {
     }
 
     /// The record `slot` holds, read without its state: a free slot's is `None` by construction
-    /// (a push sets it, and an exit or a departure clears it), and so is slot 0's. For a wake-up's
-    /// check that the slot holds its thread (ADR-0020 S20, trigger 3), where the state is read
-    /// after it.
+    /// (a push sets it, and an exit or a departure clears it), and slot 0's, the boot or idle
+    /// flow's, is `None` too. For a wake-up's check that the slot holds its thread (ADR-0020 S20,
+    /// trigger 3), where the state is read after it. Slot 0 is answered without a read, so that
+    /// the check and [`RunQueue::wake`]'s own refusal of slot 0 come to one compare of the slot.
     #[inline]
     pub fn held(&self, slot: usize) -> Option<R> {
+        if slot == 0 {
+            return None;
+        }
         let held = self.record.get(slot).copied().flatten();
         // What makes the read without the state right: every path that frees a slot clears its
         // record (an exit, a departure), a push fills both together, and a refused push or arrival

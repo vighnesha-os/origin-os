@@ -601,37 +601,52 @@ pub fn wake<S, Q: Queues>(
 ) -> Wake {
     let first = follow(queues, record, number, generation);
     match first.outcome {
-        Outcome::Exhausted | Outcome::Misplaced => {
-            after_inconsistency(queues, record, number, generation, first, pin, report)
-        }
+        Outcome::Exhausted => after_inconsistency(
+            queues,
+            record,
+            number,
+            generation,
+            Met::Exhausted,
+            first.retries,
+            pin,
+            report,
+        ),
+        Outcome::Misplaced => after_inconsistency(
+            queues,
+            record,
+            number,
+            generation,
+            Met::Misplaced,
+            first.retries,
+            pin,
+            report,
+        ),
         Outcome::Reached { .. } | Outcome::Stale | Outcome::Gone => first,
     }
 }
 
 /// [`wake`]'s out-of-line continuation, for a caller that runs [`follow`] itself and keeps the
-/// two apart, as the kernel does: `first` is what `follow` answered, `Exhausted` or `Misplaced`,
-/// and this enters pinned mode through `pin` and goes on as [`wake`] says. Any other `first` is
-/// answered as it is. Out of line, so that nothing of it, and no merge of its answer with
-/// `follow`'s, is on the path of a wake-up that meets no inconsistency.
+/// two apart, as the kernel does: `met` is the inconsistency `follow` ended with (`Exhausted` or
+/// `Misplaced`), and `retries` the moves it followed. This enters pinned mode through `pin` and
+/// goes on as [`wake`] says. Out of line, and given what it needs in registers rather than
+/// `follow`'s whole answer, so that nothing of it, and no copy of that answer to memory, is on the
+/// path of a wake-up that meets no inconsistency (the coordinating session's ruling, ADR-0018 V1).
 #[cold]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 pub fn after_inconsistency<S, Q: Queues>(
     queues: &Q,
     record: &Record<S>,
     number: u32,
     generation: u32,
-    first: Wake,
+    met: Met,
+    retries: u32,
     pin: impl FnOnce(Met) -> bool,
     report: impl FnOnce(Met, Outcome),
 ) -> Wake {
-    match first.outcome {
-        Outcome::Exhausted => {
-            after_exhausted(queues, record, number, generation, first, pin, report)
-        }
-        Outcome::Misplaced => {
-            after_misplaced(queues, record, number, generation, first, pin, report)
-        }
-        Outcome::Reached { .. } | Outcome::Stale | Outcome::Gone => first,
+    match met {
+        Met::Exhausted => after_exhausted(queues, record, number, generation, retries, pin, report),
+        Met::Misplaced => after_misplaced(queues, record, number, generation, retries, pin, report),
     }
 }
 
@@ -702,7 +717,7 @@ fn after_exhausted<S, Q: Queues>(
     record: &Record<S>,
     number: u32,
     generation: u32,
-    first: Wake,
+    first: u32,
     pin: impl FnOnce(Met) -> bool,
     report: impl FnOnce(Met, Outcome),
 ) -> Wake {
@@ -717,7 +732,7 @@ fn after_exhausted<S, Q: Queues>(
         report(Met::Exhausted, again.outcome);
     }
     Wake {
-        retries: first.retries.saturating_add(again.retries),
+        retries: first.saturating_add(again.retries),
         met: entered.then_some(Met::Exhausted),
         ..again
     }
@@ -729,12 +744,12 @@ fn after_misplaced<S, Q: Queues>(
     record: &Record<S>,
     number: u32,
     generation: u32,
-    first: Wake,
+    first: u32,
     pin: impl FnOnce(Met) -> bool,
     report: impl FnOnce(Met, Outcome),
 ) -> Wake {
     let entered = pin(Met::Misplaced);
-    let found = search(queues, record, number, generation, first.retries);
+    let found = search(queues, record, number, generation, first);
     if entered {
         report(Met::Misplaced, found.outcome);
     }

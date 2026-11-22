@@ -36,7 +36,7 @@ use origin_frame::percpu::PerCpu;
 use origin_frame::stack::{FpuArea, GuardedStack, StackSlot, State as SlotState, ThreadStart};
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::exits::{Exits, Pending};
-use origin_frame::sync::threads::{Empty, Location, Outcome, Queues, Record};
+use origin_frame::sync::threads::{Empty, Location, Met, Outcome, Queues, Record};
 use origin_frame::trap::{MintHolder, Pinned, Switch};
 
 /// Each kernel thread's stack.
@@ -1070,8 +1070,28 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
         // that no answer of the out-of-line paths merges into this one's.
         let woke =
             origin_frame::sync::threads::follow(queues, record, thread.record, thread.generation);
-        if matches!(woke.outcome, Outcome::Exhausted | Outcome::Misplaced) {
-            return wake_inconsistent(queues, record, thread, woke, here);
+        match woke.outcome {
+            Outcome::Exhausted => {
+                return wake_inconsistent(
+                    queues,
+                    record,
+                    thread,
+                    Met::Exhausted,
+                    woke.retries,
+                    here,
+                );
+            }
+            Outcome::Misplaced => {
+                return wake_inconsistent(
+                    queues,
+                    record,
+                    thread,
+                    Met::Misplaced,
+                    woke.retries,
+                    here,
+                );
+            }
+            Outcome::Reached { .. } | Outcome::Stale | Outcome::Gone => {}
         }
         if woke.retries != 0 {
             followed(record, woke.retries, here);
@@ -1116,7 +1136,8 @@ fn wake_inconsistent<'a>(
     queues: &waking::KernelQueues<'a>,
     record: &Record<threads::State>,
     thread: ThreadRef,
-    first: origin_frame::sync::threads::Wake,
+    met: Met,
+    retries: u32,
     here: origin_frame::trap::Here<'a>,
 ) -> bool {
     let woke = origin_frame::sync::threads::after_inconsistency(
@@ -1124,7 +1145,8 @@ fn wake_inconsistent<'a>(
         record,
         thread.record,
         thread.generation,
-        first,
+        met,
+        retries,
         |met| pinned::enter(met.into()),
         |met, outcome| {
             pinned::line(
