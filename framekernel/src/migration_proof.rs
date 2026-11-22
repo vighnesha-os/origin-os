@@ -183,21 +183,24 @@ impl Moves {
             ..Self::default()
         }
     }
+}
 
-    /// The refusals, as `reason n` pairs for a line, the reasons never met left out.
-    fn refusals(&self) -> alloc::string::String {
-        let mut out = alloc::string::String::new();
-        for ((_, named), &n) in REASONS.iter().zip(&self.refused) {
-            if n != 0 {
-                let _ = write!(out, "{}{named} {n}", if out.is_empty() { "" } else { ", " });
-            }
+/// The refusals `refused` counts, as `reason n` pairs for a line, the reasons never met left out.
+/// Made after the proof's compare of the heap, so that its own allocation is not in it.
+fn refusals(refused: &[u64; REASONS.len()]) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    for ((_, named), &n) in REASONS.iter().zip(refused) {
+        if n != 0 {
+            let _ = write!(out, "{}{named} {n}", if out.is_empty() { "" } else { ", " });
         }
-        if out.is_empty() {
-            out.push_str("none");
-        }
-        out
     }
+    if out.is_empty() {
+        out.push_str("none");
+    }
+    out
+}
 
+impl Moves {
     /// Whether every processor in `cpus` was a source and a destination at least once.
     fn reached_every(&self, cpus: &[CpuIndex]) -> bool {
         cpus.iter().all(|cpu| {
@@ -441,7 +444,7 @@ extern "sysv64" fn integrity_thread(index: u64) -> ! {
                     release_word(&shared, &me.running_on, on);
                     break;
                 }
-                Some(pair) if iteration % YIELD_EVERY != 0 => {
+                Some(pair) if !iteration.is_multiple_of(YIELD_EVERY) => {
                     // Pass the turn and wake the partner, holding the word; release it, and wait
                     // for the turn back.
                     pair.turn.store(1 - mine, Ordering::Release);
@@ -533,10 +536,10 @@ pub(crate) fn prove_integrity(
     let reached = moves.reached_every(&cpus);
     let (median, largest) = moves.sections();
     let (gated_after, longest_gate) = cpu::gated_scans();
-    let refusals = moves.refusals();
-    let made = moves.made;
+    let (made, refused) = (moves.made, moves.refused);
     drop(moves);
     let (back, unsettled) = bracket_after(settled_before, before, tsc_hz);
+    let refusals = refusals(&refused);
     let pinned_mode = pinned::entered();
     let ok = spawned
         && ended
@@ -548,7 +551,7 @@ pub(crate) fn prove_integrity(
         && pinned_mode.is_none();
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: thread migration: integrity: {threads} movable threads on {} processors, {made} moves, refused: {refusals}; a second processor in a context {failed_swaps} times, canaries changed {changed} times, threads run before their state existed {unready}; every processor a source and a destination: {}; a move's critical section: median {median} ticks ({} ns), largest {largest} ticks ({} ns); scans that made the gated pass {}, the longest {longest_gate} ticks ({} ns){}{}{}",
+        "origin-kernel: scheduler: thread migration: integrity: {threads} movable threads on {} processors, {made} moves, refused: {refusals}; a second processor in a context {failed_swaps} times, canaries changed {changed} times, threads run before their state existed {unready}; every processor a source and a destination: {}; a move's critical section: median {median} ticks ({} ns), largest {largest} ticks ({} ns); scans that made the gated pass {}, the longest {longest_gate} ticks ({} ns); spawned {spawned}; ended {ended}; heap, frames and stacks back {back}{}{}{}",
         cpus.len(),
         if reached { "yes" } else { "no" },
         nanos(median, tsc_hz),
@@ -665,7 +668,7 @@ extern "sysv64" fn sender(index: u64) -> ! {
         });
         to.queue.wake_one();
         sent += 1;
-        if sent % 8 == 0 {
+        if sent.is_multiple_of(8) {
             sched::sleep(1);
         } else {
             sched::yield_now();
@@ -808,11 +811,10 @@ pub(crate) fn prove_delivery(
         )
     };
     let reached = moves.carried_wake != 0;
-    let made = moves.made;
-    let carried = moves.carried_wake;
-    let refusals = moves.refusals();
+    let (made, carried, refused) = (moves.made, moves.carried_wake, moves.refused);
     drop(moves);
     let (back, unsettled) = bracket_after(settled_before, before, tsc_hz);
+    let refusals = refusals(&refused);
     let pinned_mode = pinned::entered();
     let ok = spawned
         && delivered
@@ -823,7 +825,7 @@ pub(crate) fn prove_delivery(
         && pinned_mode.is_none();
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: thread migration: delivery: {receivers} movable receivers and {} pinned senders, {posted} tokens posted, {taken} taken, {short} receivers short; {made} moves, {carried} carrying a pending wake-up, refused: {refusals}; wake-ups followed {follows} moves of movable threads, the most one followed {most}, {over_eight} followed more than 8; a sender's wake-up that followed a move: longest {} ticks ({} ns) with {} follows; one that followed none: longest {} ticks ({} ns){}{}{}",
+        "origin-kernel: scheduler: thread migration: delivery: {receivers} movable receivers and {} pinned senders, {posted} tokens posted, {taken} taken, {short} receivers short; spawned {spawned}; ended {ended}; heap, frames and stacks back {back}; {made} moves, {carried} carrying a pending wake-up, refused: {refusals}; wake-ups followed {follows} moves of movable threads, the most one followed {most}, {over_eight} followed more than 8; a sender's wake-up that followed a move: longest {} ticks ({} ns) with {} follows; one that followed none: longest {} ticks ({} ns){}{}{}",
         cpus.len(),
         spans.0,
         nanos(spans.0, tsc_hz),
