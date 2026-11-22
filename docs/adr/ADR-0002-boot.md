@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). B5 gained one line on the SPCR's UART before a halt after a failed `ExitBootServices` by Amendment 2, accepted by the owner on 2026-11-21 (decision sheet item 342) and built by TASKS item 112 the same day, under QEMU only. Amendment 3, accepted by the owner on 2026-11-21 (decision sheet item 344), lets a bench build, and only a bench build, call `ResetSystem` after `ExitBootServices`; built by TASKS item 116 the same day, under QEMU only. |
-| Date | 2026-11-07; Amendment 1 2026-11-10; Amendment 2 2026-11-21; Amendment 3 2026-11-21; boot info 0.6 accepted 2026-11-10 and built 2026-11-11 (B4) |
+| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). B5 gained one line on the SPCR's UART before a halt after a failed `ExitBootServices` by Amendment 2, accepted by the owner on 2026-11-21 (decision sheet item 342) and built by TASKS item 112 the same day, under QEMU only. Amendment 3, accepted by the owner on 2026-11-21 (decision sheet item 344), lets a bench build, and only a bench build, call `ResetSystem` after `ExitBootServices`; built by TASKS item 116 the same day, under QEMU only. Amendment 4, accepted by the owner on 2026-11-21 (decision sheet item 345), lets a bench build also reset the machine through the FCH's reset port and a triple fault, with no firmware code. |
+| Date | 2026-11-07; Amendment 1 2026-11-10; Amendment 2 2026-11-21; Amendment 3 2026-11-21; Amendment 4 2026-11-21; boot info 0.6 accepted 2026-11-10 and built 2026-11-11 (B4) |
 | Owner decisions still open | None. B7, carried over from ADR-0001, was decided on 2026-11-07 and amended on 2026-11-10. |
 | Implements | CLAUDE.md §19 (UEFI boot chain), §20 (boot manager, later), §58 (Secure Boot), ONBF §8.1 (chain of trust) |
 | Code | `boot/info` (`origin-boot-info`), `boot/uefi` (`origin-boot-uefi`), `framekernel/`, `developer-tools/onbf-pack` |
@@ -195,4 +195,39 @@ origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry EF
 **Threat model (§58).** Only bench builds, which are never signed, contain the call. The FADT is parsed as untrusted input, and a register that fails the check is not written.
 
 **Code (built by TASKS item 116, under QEMU only).** `boot/uefi/src/bench.rs` (the UART's registers and their write-back, the FADT's reset register checked as untrusted input, and the lines; host-tested through a port trait and FADTs built in the tests) and `boot/uefi/src/main.rs` (the counter's rate over the firmware's `Stall`, `ResetSystem` from the runtime services table, the waits and the writes), all under `--cfg origin_bench`. Under QEMU, `cargo xtask boot-bench` shows the reset through `ResetSystem`, and through the FADT's register when `ResetSystem` is not called; control BC-6, both silenced, fails it.
+
+## Amendment 4 (2026-11-21): a bench build may reset the machine with no firmware code
+
+*Accepted by the owner on 2026-11-21 ("Allow it"; decision sheet item 345). Proposed by rental E's findings (`docs/research/2026-11-21-rental-e-findings.md`, rank 1, on `land/batch-9` until it lands). TASKS item 121 builds it. Until that lands, nothing here is built.*
+
+**Change to B5 and to Amendment 3, for bench builds only.** A loader built with `--cfg origin_bench` may, in addition to Amendment 3's two methods, reset the machine in ways that run no firmware code:
+
+1. **Before the call, it reads and prints, and writes nothing:**
+   - the FCH power-management block's decode-enable register, which says whether port `0xCF9` is decoded;
+   - the bit that stops a write to `0xCF9` from resetting;
+   - the two bits that let a processor shutdown reset the system;
+   - the register that names the cause of the last reset.
+
+   The block is at the address the firmware's own DSDT describes. A value that contradicts the documents' layout makes the loader say so, and then skip the control in step 2.
+2. **The control, before the call:** if the last reset was not the loader's own `0xCF9` reset, the run is the boot's first. The loader writes `0x06` (a warm reset) to port `0xCF9` and makes no call. The FCH's own record of that reset then marks the next run.
+3. **After the call:** in a run whose last reset was the loader's `0xCF9` reset, the loader writes `0x06` to `0xCF9` as the very first thing after `ExitBootServices` returns, before any line, register read or write-back. If no reset has come 100 ms later by the time-stamp counter, it loads an IDT with a zero limit and executes `int3`, a triple fault. If it is still running after that, it falls through to Amendment 3's order: `ResetSystem`, then the FADT's register, then the halt.
+
+- **Why:** on rental E, three boots ended at the marker before the call, with no reset. That reads two ways: the call never returns, or it returned and both the console's path and the firmware's reset failed. Each reset of Amendment 3 runs firmware code (`ResetSystem`; on this board the FADT's register is an SMI command port). A reset with no firmware code, made before anything else after the call, separates the two. A second run in the boot proves the call returned.
+- **What must hold on the machine:** whether `0xCF9` or a shutdown resets the machine depends on FCH bits the firmware sets. Step 1 prints them, and step 2's control shows `0xCF9` resetting before anything rests on it. The registers come from AMD's FCH documents for related parts, not from this processor's own. A run that finds no record of its own reset can only count runs.
+- **Every loader that is not a bench build is unchanged,** as for Amendment 3. A bench loader is never signed or packaged (TASKS item 112's F1 to F3), and the reproducible gate shows that no normal image contains this code.
+
+**Alternatives.**
+
+| | Why not |
+|---|---|
+| Swap Amendment 3's order: the FADT's register first, then `ResetSystem` | Stays within item 344, but the FADT's register still runs firmware code on this board, so a silent boot would still read two ways |
+| No more rentals: only the free comparison with a minimal UEFI program, and the COM port's ACPI objects read offline | Separates nothing by itself. The comparison is done anyway, in TASKS item 121 |
+| A triple fault alone | Whether a shutdown resets this board depends on two FCH bits nothing has read. With `0xCF9` first and the control, a run that is not reset says which method failed |
+
+**Performance cost (ADR-0018 V3).** None, by construction: only bench builds contain the code, and none ships.
+
+**Threat model (§58).**
+- Only bench builds, which are never signed, contain the code.
+- Before the call, the loader only reads the FCH's registers, at the address the firmware's DSDT describes.
+- The only writes are the documented warm-reset command to `0xCF9` and the loader's own IDT, made to end a diagnostic boot on a rented bench machine.
 
