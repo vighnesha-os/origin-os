@@ -1086,6 +1086,58 @@ MINIMAL_BUILD_LINE = "bench build: minimal"
 MINIMAL_LAST_LINE = b"ExitBootServices next, through the live boot services table"
 LOADER_START = "UEFI loader (build"
 TIMES_FILE = "sol-times.log"
+# How many boots a rental B makes and how long each may take, unless the command line says.
+BOOTS, BOOT_MINUTES = 3, 8
+# Owner item 350 ("One more, then pause"): rental G, the minimal mode's, is the last rental for a
+# while, so it uses the paid hour for about six boots. A minimal-mode boot resets within seconds
+# of its call or hangs: on rental F the firmware's first line came 6.6 to 7.1 s after the control's
+# reset, and the call came 87 s (boot 3) to about 110 s (boot 2) after the tool's restart, the
+# control first. So it ends when a run after a reset reaches its own call, or MINIMAL_HANG_MINUTES
+# after its last call with no loader since (a hang), or at MINIMAL_BOOT_MINUTES.
+MINIMAL_BOOTS, MINIMAL_BOOT_MINUTES, MINIMAL_HANG_MINUTES = 6, 5, 3
+# What the boots leave of --max-minutes: the setup before boot 1 (rental F's took 75 s; the console
+# alone may wait five minutes), and the time before the deadline after which no boot starts.
+SETUP_MINUTES, LOOP_STOP_MINUTES = 5, 10
+
+
+def minimal_image(data):
+    """Whether a loader's bytes are the minimal-mode bench build's (TASKS item 128): its lines say
+    so, as F2 checks."""
+    return MINIMAL_BUILD_LINE.encode() in data
+
+
+def boot_plan(minimal, boots, boot_minutes, max_minutes):
+    """Owner item 350: rental B's boots and each boot's limit in minutes, from the image and the
+    command line (None where it gave none), and why they do not fit, or None. Every boot must end
+    before the loop stops starting boots, LOOP_STOP_MINUTES before the deadline, with
+    SETUP_MINUTES before boot 1; the deletion then comes well inside --max-minutes."""
+    boots = boots or (MINIMAL_BOOTS if minimal else BOOTS)
+    boot_minutes = boot_minutes or (MINIMAL_BOOT_MINUTES if minimal else BOOT_MINUTES)
+    need, room = SETUP_MINUTES + boots * boot_minutes, max_minutes - LOOP_STOP_MINUTES
+    if need > room:
+        return boots, boot_minutes, (f"{boots} boots of up to {boot_minutes} minutes, with "
+                                     f"{SETUP_MINUTES} for the setup, need {need} minutes; "
+                                     f"--max-minutes {max_minutes} leaves {room} before the boots stop")
+    return boots, boot_minutes, None
+
+
+def minimal_boot_over(raw, times, at):
+    """Owner item 350: whether a minimal-mode boot has shown its answer by time `at`, from its raw
+    console bytes and their arrival times `[(time, size)]`: a run after a reset reached its own
+    call, so the reset came and that run read its registers; or MINIMAL_HANG_MINUTES have passed
+    since the boot's last call with no loader started since, a hang. The control's run makes no
+    call, so its reset counts for neither."""
+    calls = raw.count(MINIMAL_LAST_LINE)
+    if calls >= 2:
+        return True
+    if calls == 0:
+        return False
+    mark = raw.rfind(MINIMAL_LAST_LINE)
+    if raw.find(LOADER_START.encode(), mark) >= 0:
+        return False
+    end = mark + len(MINIMAL_LAST_LINE)
+    arrived = next((t for t, size in times if size >= end), None)
+    return arrived is not None and at - arrived >= MINIMAL_HANG_MINUTES * 60
 
 
 def resets_after_call(text):
@@ -1136,6 +1188,16 @@ def boot_result(text):
         said = (f"; loader runs: {runs}, " +
                 ("so the machine reset itself after the loader's last line" if runs > 1
                  else "with no reset of its own"))
+        # The minimal mode's control resets the machine before any call, so its runs alone do not
+        # say whether a call was followed by a reset: a loader after the boot's first call does.
+        if MINIMAL_BUILD_LINE in text:
+            mark = MINIMAL_LAST_LINE.decode()
+            calls, first = text.count(mark), text.find(mark)
+            seen["calls"] = calls
+            said = (f"; loader runs: {runs}, calls: {calls}, " +
+                    ("so the machine reset itself after the first call"
+                     if first >= 0 and text.find(LOADER_START, first) >= 0
+                     else "with no reset after the call" if calls else "and no call"))
     verdict = next((l for l in lines if VERDICT_LINE in l or REFUSED_LINE in l), None)
     halted = next((l for l in lines if KERNEL_LINE in l and any(h in l for h in HALTED_LINES)), None)
     origin = [l for l in lines if KERNEL_LINE in l or LOADER_LINE in l]
@@ -1230,6 +1292,17 @@ def cmd_rental_b(args):
                 f"of {args.source_revision}: item 229 forbids this boot")
         print(f"image: {args.source_revision}; loader SHA-256 {sha256(loader)}; "
               f"kernel SHA-256 {sha256(kernel)}; identity maps {IDENTITY_MAPS_COMMIT[:12]} included")
+        minimal = minimal_image(loader.read_bytes())
+        args.boots, args.boot_minutes, misfit = boot_plan(minimal, args.boots, args.boot_minutes,
+                                                          args.max_minutes)
+        if misfit:
+            die(misfit)
+        print(f"boots: {args.boots}, each ending at a verdict or after {args.boot_minutes} minutes"
+              + (f", or when a run after a reset reaches its own call, or {MINIMAL_HANG_MINUTES} "
+                 f"minutes after the last call with no loader since (owner item 350)"
+                 if minimal else "")
+              + f"; {SETUP_MINUTES + args.boots * args.boot_minutes} minutes at most with the setup, "
+                f"inside the {args.max_minutes - LOOP_STOP_MINUTES} before the boots stop")
 
     def work(rental):
         read_machine(rental)
@@ -1269,6 +1342,16 @@ def cmd_rental_b(args):
         if not console:
             raise RuntimeError("no serial console: a boot would show nothing")
         results = []
+        minimal = minimal_image(loader.read_bytes())
+
+        def look(start):
+            """One boot's result so far; a minimal-mode boot ends at its answer (owner item 350)."""
+            result = boot_result(console.text(start))
+            if minimal and not result["ended"]:
+                result["ended"] = minimal_boot_over(console.path.read_bytes()[start:],
+                                                    read_times(rental.dir / TIMES_FILE, start), now())
+            return result
+
         try:
             for boot in range(1, args.boots + 1):
                 start = console.size()
@@ -1279,10 +1362,10 @@ def cmd_rental_b(args):
                         {"data": {"type": "actions", "attributes": {"action": "reboot"}}})
                 print(f"{stamp()} boot {boot} of {args.boots}: restarting")
                 limit = min(now() + args.boot_minutes * 60, rental.deadline - 300)
-                result = boot_result(console.text(start))
+                result = look(start)
                 while not result["ended"] and now() < limit:
                     time.sleep(10)
-                    result = boot_result(console.text(start))
+                    result = look(start)
                 result.update(boot=boot, start=start, end=console.size())
                 if resets_after_call(console.text(start)):
                     raw = console.path.read_bytes()[start:result["end"]]
@@ -1295,7 +1378,7 @@ def cmd_rental_b(args):
                 results.append(result)
                 print(f"{stamp()} boot {boot}: {result['summary']}")
                 (rental.dir / "boots.json").write_text(json.dumps(results, indent=2))
-                if last_boot(result) or now() > rental.deadline - 600:
+                if last_boot(result) or now() > rental.deadline - LOOP_STOP_MINUTES * 60:
                     break
         finally:
             # The boots that ran are evidence even if a later one could not start (a refused
@@ -1312,7 +1395,7 @@ def loader_kind(path):
     """What the image directory's loader is: a bench build's says so in its own bytes (TASKS
     items 112 and 116, F2's text)."""
     data = Path(path).read_bytes() if Path(path).exists() else b""
-    if b"bench build: minimal" in data:
+    if minimal_image(data):
         return ("the minimal-mode bench loader (ADR-0002 Amendment 5; developer-mode, the TEST "
                 "trust store; never signed or shipped)")
     if b"bench build" in data:
@@ -1400,8 +1483,12 @@ def main():
             p.add_argument("--image-dir", required=True,
                            help="holds BOOTX64.EFI (the developer-mode loader) and KERNEL.ONBF")
             p.add_argument("--source-revision", required=True, help="the commit the image was built from")
-            p.add_argument("--boots", type=int, default=3, choices=range(1, 6))
-            p.add_argument("--boot-minutes", type=int, default=8, help="how long one boot may take")
+            p.add_argument("--boots", type=int, choices=range(1, 9),
+                           help=f"how many boots (default {BOOTS}; {MINIMAL_BOOTS} for the minimal "
+                                f"mode, owner item 350)")
+            p.add_argument("--boot-minutes", type=int, choices=range(1, 31),
+                           help=f"how long one boot may take (default {BOOT_MINUTES}; "
+                                f"{MINIMAL_BOOT_MINUTES} for the minimal mode)")
     p = sub.add_parser("watchdog")
     p.add_argument("--server-id", required=True)
     p.add_argument("--rental", required=True, help="the ledger row that records the deletion")

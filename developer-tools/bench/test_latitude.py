@@ -466,13 +466,137 @@ class Guards(unittest.TestCase):
         self.assertEqual(once["loader_runs"], 1)
         self.assertNotIn("breadcrumbs", once)
         self.assertIsNone(self.lat.breadcrumbs(self.lat.clean(loader)))
-        self.assertTrue(once["summary"].endswith("loader runs: 1, with no reset of its own"), once["summary"])
+        self.assertTrue(once["summary"].endswith("loader runs: 1, calls: 1, with no reset after the call"),
+                        once["summary"])
         twice = self.lat.boot_result(self.lat.clean(loader + "\x1b[2JPre-memory NB Initialization\r\n" + loader))
-        self.assertEqual(twice["loader_runs"], 2)
+        self.assertEqual((twice["loader_runs"], twice["calls"]), (2, 2))
+        self.assertIn("so the machine reset itself after the first call", twice["summary"])
+        # The control's run makes no call: its reset says nothing about the call's.
+        control = (banner + "origin-boot: bench build: minimal: the minimal-program mode\r\n"
+                   "origin-boot: bench build: minimal: the control\r\n")
+        both = self.lat.boot_result(self.lat.clean(control + "\x1b[2JPre-memory\r\n" + loader))
+        self.assertEqual((both["loader_runs"], both["calls"]), (2, 1))
+        self.assertTrue(both["summary"].endswith("calls: 1, with no reset after the call"), both["summary"])
+        alone = self.lat.boot_result(self.lat.clean(control))
+        self.assertTrue(alone["summary"].endswith("calls: 0, and no call"), alone["summary"])
         raw = (loader + "\x1b[2JPre-memory\r\n" + loader).encode()
         line_end = raw.find(b"services table") + len(b"services table\r\n")
         times = [(100.0, line_end), (100.5, line_end + 3), (108.0, line_end + 5), (170.0, len(raw))]
         self.assertEqual(self.lat.after_last_line(raw, times), (0.5, 70.0))
+
+    def test_the_boot_plan_follows_the_image_and_fits_the_rental(self):
+        # Owner item 350: six boots of up to five minutes for the minimal mode, three of eight
+        # otherwise; every plan must end its boots before the loop stops, setup included.
+        plan = self.lat.boot_plan
+        self.assertEqual(plan(True, None, None, 50), (6, 5, None))
+        self.assertEqual(plan(False, None, None, 50), (3, 8, None))
+        self.assertEqual(plan(True, 7, None, 50), (7, 5, None))  # 5 + 35 = 40, just inside
+        self.assertEqual(plan(False, 4, 6, 50), (4, 6, None))
+        boots, minutes, misfit = plan(False, 6, None, 50)
+        self.assertEqual((boots, minutes), (6, 8))
+        self.assertEqual(misfit, "6 boots of up to 8 minutes, with 5 for the setup, need 53 minutes; "
+                                 "--max-minutes 50 leaves 40 before the boots stop")
+        self.assertIsNotNone(plan(True, 8, None, 50)[2])
+        self.assertIsNotNone(plan(True, None, None, 44)[2])
+        self.assertIsNone(plan(True, None, None, 45)[2])
+
+    def test_a_minimal_boot_ends_at_its_answer(self):
+        # Owner item 350: at a run's call after a reset, or three minutes after the last call with
+        # no loader since; never on the control's reset alone.
+        banner = b"Origin OS 0.1.0-dev UEFI loader (build 0)\r\n"
+        mark = self.lat.MINIMAL_LAST_LINE + b"\r\n"
+        control = banner + b"origin-boot: bench build: minimal: the control\r\n"
+        call = banner + b"origin-boot: bench build: minimal: " + mark + b"X\r\n"
+        over = self.lat.minimal_boot_over
+        hang = control + b"Pre-memory\r\n" + call
+        end = hang.find(mark) + len(self.lat.MINIMAL_LAST_LINE)
+        times = [(50.0, len(control)), (110.0, end), (110.5, len(hang))]
+        self.assertFalse(over(control, times[:1], 1000.0))  # no call yet
+        self.assertFalse(over(hang, times, 289.0))
+        self.assertTrue(over(hang, times, 290.0))
+        self.assertFalse(over(hang, [], 9999.0))  # no arrival time: the boot's limit decides
+        started = hang + b"Pre-memory\r\n" + banner
+        self.assertFalse(over(started, times, 9999.0))  # a run after the call: wait for its call
+        self.assertTrue(over(started + b"origin-boot: bench build: minimal: " + mark, times, 111.0))
+
+    def test_six_minimal_boots_fit_the_rental(self):
+        # Owner item 350 through rental B's own loop: a minimal image gets six boots; a boot that
+        # hangs after its call ends three minutes after it, one that resets at the next run's call,
+        # and all six end well inside the 40 minutes before the boots stop.
+        lat = self.lat
+        clock = [1_000_000.0]
+        d = self.home / "rental"
+        banner = "Origin OS 0.1.0-dev UEFI loader (build 0)\r\n"
+        minimal = banner + "origin-boot: bench build: minimal: the minimal-program mode\r\n"
+        control = minimal + "origin-boot: bench build: minimal: the control\r\n"
+        call = minimal + "origin-boot: bench build: minimal: " + lat.MINIMAL_LAST_LINE.decode() + "\r\n"
+        kinds = iter(["reset", "hang", "hang", "hang", "hang", "hang", "hang"])
+        restarts = []
+
+        class Console:
+            """The console as the tool reads it: bytes appear when the clock reaches them, and the
+            arrival-times file is written then, as the real console's thread writes it."""
+            file = d / "sol.log"
+            pending = []
+
+            @property
+            def path(self):
+                self.arrive()
+                return self.file
+
+            def arrive(self):
+                self.file.touch()  # the real console opens its file before the first restart
+                while self.pending and self.pending[0][0] <= clock[0]:
+                    when, piece = self.pending.pop(0)
+                    with open(self.file, "ab") as f:
+                        f.write(piece.encode())
+                    with open(d / lat.TIMES_FILE, "a") as times:
+                        times.write(f"{when} {self.file.stat().st_size}\n")
+
+            def size(self):
+                return self.path.stat().st_size if self.path.exists() else 0
+
+            def text(self, start=0):
+                return lat.clean(self.path.read_bytes()[start:].decode()) if self.path.exists() else ""
+
+            def restart(self):
+                # After a restart: the control at 50 s, the call at 110 s and its X at once, and,
+                # after a reset, the firmware at 117 s and the next run's call at 157 s.
+                t = clock[0]
+                restarts.append(t)
+                pieces = [(50.0, control + "Pre-memory\r\n"), (110.0, call), (110.5, "X\r\n")]
+                if next(kinds) == "reset":
+                    pieces += [(117.0, "Pre-memory\r\n"), (157.0, call)]
+                self.pending += [(t + after, piece) for after, piece in pieces]
+
+        console = Console()
+
+        def api(method, path, body=None, ok=None):
+            console.restart()
+            return {}
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with mock.patch.object(lat, "now", lambda: clock[0]):
+            self.run_rental_b(api, None, loader_tail=b"origin-boot: bench build: minimal: the minimal",
+                              console=console, boots=None, boot_minutes=None, sleep=sleep,
+                              on_reboot=console.restart)
+        boots = json.loads((d / "boots.json").read_text())
+        self.assertEqual(len(boots), 6)
+        self.assertTrue(all(b["ended"] for b in boots))
+        self.assertIn("so the machine reset itself after the first call", boots[0]["summary"])
+        self.assertEqual((boots[0]["next_byte_s"], boots[0]["next_loader_s"]), (0.5, 47.0))
+        for b in boots[1:]:
+            self.assertIn("calls: 1, with no reset after the call", b["summary"])
+            self.assertIn("the next loader never", b["summary"])
+        lengths = [b - a for a, b in zip(restarts, restarts[1:] + [clock[0]])]
+        self.assertEqual(lengths[0], 160)              # ends at the next run's call
+        self.assertTrue(all(290 <= n <= 300 for n in lengths[1:]), lengths)  # 3 min after the call
+        self.assertLessEqual(clock[0] - restarts[0], 30 * 60)
+        self.assertIn("boots: 6, each ending at a verdict or after 5 minutes", self.rental_b_out)
+        self.assertIn("35 minutes at most with the setup, inside the 40 before the boots stop",
+                      self.rental_b_out)
 
     def test_redact_removes_mac_addresses_and_the_guid(self):
         text = ("Boot0003* UEFI PXE IPv4: Intel(R) Ethernet Controller X550(MAC:020000000001)\n"
@@ -571,12 +695,13 @@ class Guards(unittest.TestCase):
         self.assertNotIn("by hand", row)
         self.assertIn("by hand", self.lat.scope_row(["origin-kernel: Origin OS"], lscpu))
 
-    def run_rental_b(self, api, console_text):
+    def run_rental_b(self, api, console_text, loader_tail=b"", console=None, boots=3, boot_minutes=8,
+                     sleep=None, on_reboot=None):
         """Runs rental B's work against a pretend machine: no request, no SSH, no copy."""
         image = self.home / "image"
         image.mkdir()
         loader, kernel = self.images()
-        (image / "BOOTX64.EFI").write_bytes(bytes(loader))
+        (image / "BOOTX64.EFI").write_bytes(bytes(loader) + loader_tail)
         (image / "KERNEL.ONBF").write_bytes(bytes(kernel))
         d = self.home / "rental"
         d.mkdir()
@@ -594,17 +719,20 @@ class Guards(unittest.TestCase):
                    "blkid": self.PARTUUID, "sha256sum": sums}
 
         def ssh(command, **kwargs):
+            if on_reboot and "systemctl reboot" in command:
+                on_reboot()
             out = next((v for k, v in replies.items() if k in command), "")
             return mock.Mock(stdout=out, returncode=0)
 
-        console = mock.Mock()
-        sizes = iter(range(0, 10_000, 100))
-        console.size.side_effect = lambda: next(sizes)
-        console.text.side_effect = console_text
+        if console is None:
+            console = mock.Mock()
+            sizes = iter(range(0, 10_000, 100))
+            console.size.side_effect = lambda: next(sizes)
+            console.text.side_effect = console_text
         rental = self.lat.Rental("sv_x", "192.0.2.3", d, self.lat.now() + 3000, "key", console)
         rental.ssh = ssh
-        args = mock.Mock(plan="m4-metal-small", max_minutes=50, image_dir=str(image), boots=3,
-                         boot_minutes=8, source_revision=self.AFTER_IDENTITY_MAPS, yes=True)
+        args = mock.Mock(plan="m4-metal-small", max_minutes=50, image_dir=str(image), boots=boots,
+                         boot_minutes=boot_minutes, source_revision=self.AFTER_IDENTITY_MAPS, yes=True)
 
         def rent(args, kind, work, check=None):
             check()
@@ -622,9 +750,12 @@ class Guards(unittest.TestCase):
                 mock.patch.object(self.lat, "read_machine", read_machine), \
                 mock.patch.object(self.lat, "api", api), \
                 mock.patch.object(self.lat.subprocess, "run", side_effect=run), \
-                mock.patch.object(self.lat.time, "sleep"), \
-                mock.patch("sys.stdout", new_callable=io.StringIO):
-            self.lat.cmd_rental_b(args)
+                mock.patch.object(self.lat.time, "sleep", side_effect=sleep), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            try:
+                self.lat.cmd_rental_b(args)
+            finally:
+                self.rental_b_out = out.getvalue()
         return d
 
     def test_a_refused_power_action_keeps_the_first_boots_record(self):
