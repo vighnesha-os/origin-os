@@ -554,7 +554,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 95. **Moves between the tables of contexts: lend, adopt, forget, the move gate and deferred publication (ADR-0020 S4, S5). Plan P4, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after the eighth batch and the records are on `main`; beside TASKS item 92.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Loom models MV1 to MV7 and LV1.
 
-96. **The move, its proofs and pinned mode (ADR-0020 S6, S20, S23). Plan P5, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 93, 94 and 95.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
+96. **The move, its proofs and pinned mode (ADR-0020 S6, S20, S23). Plan P5, batch 10. Numbered by the coordinating session on 2026-11-20. Built, reviewed and compared on 2026-11-22 on `claude/t96-the-move-cef44b`; not landed; its entry is at the end of this file.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
 
 97. **Scheduling domains, equal capacity and the SMT and two-package machines (ADR-0020 S8, S9, S23). Plan P6, batch 9. Numbered by the coordinating session on 2026-11-20; built on `claude/t97-domains-21554f` (2026-11-21), its contract, controls, comparison and review in its entry under "Task contracts"; lands after TASKS items 94 and 95.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
 
@@ -4618,3 +4618,105 @@ The host tests' counts at the turn's start were 566 for the kernel's library, 38
 - **The `NotMine` path** has no boot that reaches it.
 - **What the types do not check:** the types check where an index is read, not how a plain index is used afterwards; the review record names each such use.
 - **Not shown:** a pin holding a thread that would otherwise move, since nothing moves until TASKS item 96; anything under KVM until CI runs it; anything on hardware. No person has reviewed it.
+
+### 96. The move between processors, its proofs and pinned mode (ADR-0020 S6, S20 and S23; plan P5)
+
+Assigned by the coordinating session on 2026-11-21. The contract went to the coordinating session before any code was written (the coordination notes' `t96-contract.md`, against `land/batch-9` at `144e0cfa`). It was accepted on 2026-11-21 with the recommendations of Q1 to Q16, and amended on 2026-11-22 by Q17 and Q18 (TASKS item 93's delta review, D93-2 and D93-6) and by the rulings below.
+
+**Rulings during the build (2026-11-22):**
+- **`cpu::move_context`** takes no same-stack closure: it passes `stack::same_slot` itself. This is a change from the contract's §1.4, accepted because it narrows the kernel's one entry to a move, and ADR-0020 names no closure there. `lend` in origin-sync keeps its closure, for the host tests and Loom.
+- **The first step-3 turn's stop.** `move_context` was first written public and generic. That made the kernel crate instantiate it, exporting `cpu::CONTEXTS` and `MOVES`, and the position-independent kernel then reached them through the GOT in `resume` and `dispatch`. The counts showed it:
+  - `resume`: 777 → 773 instructions;
+  - `dispatch`: 443 → 442 instructions, 23 → 21 calls;
+  - each with a GOT load of `CONTEXTS` that the base does not have.
+
+  The fix: `move_context` is non-generic and `#[inline(never)]`, taking `&mut dyn FnMut(u64) -> bool`. The recount of `1c16492e` (step 3 with that fix) equals `0ebef78b` exactly, its GOT loads included. Only the mover pays the indirect call, under the gate. `gated_scans` and `note_gated` are `#[inline(never)]` for the same reason.
+- **The pinned-mode line from `wake`** is written by origin-sync's `report` hook, out of line and inside wake's interrupts-off section, through `Console::new()`. This is a change from the contract's §2, which had the line after the section; it was accepted so that a wake-up meeting no inconsistency tests for nothing beyond Q6's record check (ADR-0018 V1).
+  - **The writer.** `Console::new()` queues a line written with interrupts off, as it queues an interrupt handler's. `here_console()` cannot be used there: on the boot flow with interrupts off it gives the boot flow's writer, which may open an interrupt window between a line's sections, inside the section.
+  - **The nesting proof** (`pinned::line`'s documentation). No run-queue lock is held when the hook runs. The console's lock is a leaf: every holder takes it with interrupts off, does only console work under it, and never takes a run-queue lock or calls `wake`. That holds for the ordinary writers, the urgent writer of panics and exception reports, and `init`, the SPCR move and the loader's UART.
+  - **Before a panic.** The panic handler's urgent writer queues its bytes behind the line and sends until its own are out, so the line goes out first. Controls P1 and P2 show it.
+- **The stale-location Loom control** (`location_not_read_again_under_the_lock`) now fails as S20's trigger 3, the slot holding no record, in every failing interleaving. It accepts only that message, and unplanted its models pass.
+- **TASKS 126** (the coordinating session's numbering) takes the three older `#[inline]` items that name statics: `cpu::count`, `monotonic::monotonic_reading` and `nospec::form`.
+- **Wake's common path.** The rule: each traced case within 3 instructions of `0ebef78b`, with the base's calls, or stop. The base: a blocked thread 163 instructions, calling `RunQueue::floor` and `CpuIndex::new`; a thread not yet blocked 132, with no call.
+  - **Five turns stopped on it.** The first versions were +21. The record check by address and the out-of-line continuation brought it to +11/+10, `held(0)` and the inconsistency's tag in registers to +4/+6.
+  - **F1, kept** (the sixth turn, build only, 2026-11-22 04:30–04:33 UTC): `wake_inconsistent` takes the record and the generation, and finds the number from the record (`threads::number_of`, a cold search of each processor's block with `Block::index_of`). The loop then keeps no register for the number. Blocked: 163, equal to the base, with its calls. Ready: 134 (+2). `resume`, `on_yield` and `dispatch` equal the base, GOT loads and disassembly included.
+  - **F2, measured and rejected:** one call, `Queues::wake_held(queue, slot, number, record) -> Option<bool>`, in place of `holds` and `wake_slot`. `RunQueue::wake_held` read the slot's state before the check, so that slot × 16 would be computed once. LLVM moved the state read past the check anyway, split slot 0's test from the bound (+2) and added a test for a missing state (+2). Blocked 169 (+6), ready 140 (+8). It stays on the local branch `t96-f2-rejected`; the `Queues` trait and the record check's Loom controls are as before it. The coordinating session had accepted, with F2, a change to TASKS 92's control `wake_to_the_slot_it_left` (expecting `STALE_SLOT_MET`); with F2 dropped, that control is unchanged.
+  - **What each extra instruction is** (CL47's note), against `0ebef78b`:
+
+    | | Blocked (+0) | Ready (+2) |
+    |---|---|---|
+    | The record check: `movl`, `shll $4` (slot × 16 again, for the record's array), `cmpq %r10, 0x248(..)`, `jne` | +4 | +4 |
+    | Misplaced's tag, `movb $4, %cl`, set before the bound's branch that shares its exit | +1 | +1 |
+    | The location's processor zero-extended (`movq`, `movl $-1`, `andq` for the base's `testl`, `movl`) | +1 | +1 |
+    | The saved flags spilled once at `cli` and tested from memory | +1 | +1 |
+    | The flags no longer saved around `floor`, or moved around `CpuIndex::new`, and the jump after the test gone | −3 | — |
+    | The outcome's decode at the loop's exit, with the inconsistency's test (`cmpb $3; jae`) in it | −4 | −3 |
+    | Jumps laid out differently | 0 | −2 |
+
+    The record check itself is at least its compare and branch; the second slot × 16 and the tag are LLVM's placement, which neither F2 nor the earlier turns could remove.
+
+
+**Result (2026-11-22): built, reviewed and gated; not landed and not pushed.** Only the two migration proofs move threads: S10's rate and the run-time movers are TASKS item 98's. Every boot runs both proofs, and every processor that takes part in moves is a source and a destination of moves in each.
+
+**TASKS item 93's hand-over for this item, each taken:**
+- **The interrupts-off token** (R95-12, R93-10): `Moves::begin` requires `trap::InterruptsOff`, and `check_landing` takes it too.
+- **The movable declaration** (Q7): `sched::spawn_movable`, a flag in the record.
+- **A mover reads the pin count under the owning queue's lock** (R93-7), with the movable flag, both after the spawner's and the thread's own writes by the chain of queue locks.
+- **D93-2** (how long a wake-up keeps interrupts off): ADR-0020 S1's note of 2026-11-22. Paced, a wake-up follows at most one move; every proof boot saw at most one.
+- **D93-6** (`Exhausted`): it enters pinned mode and follows again with moves withdrawn; a second exhaustion stops the kernel (Q17).
+- **CL60's candidate** (the IPI decision inside the section's closure, so the wake-up returns the target): it is `wake`'s shape as built. The decision and the IPI run inside `waking::within`, which returns only whether one was sent. Its count is `wake`'s: 262 instructions in all (the base's 266), and the traced common path below.
+
+**As built** (the branch `claude/t96-the-move-cef44b`, from `land/batch-9` with `0ebef78b` merged; the commits in order on the branch, the early ones marked "WIP"):
+- **The token** (`7b4ba428`): `trap::InterruptsOff`, `section_off`, `Switch::interrupts_off`; `check_landing` taking it.
+- **The gate takes the token, and `NotYet`** (`331e0c23`): `Moves<W: MoveWitness>`, `begin` and `relocate`; `lend` reading `current` first; `switch`'s Release store; LV3 and its controls LX5 and LX6.
+- **`depart` and `arrive`** (`bf3a75df`), with host tests and the randomized test against a model.
+- **The movable flag and records from any block** (`b4dfcd33`).
+- **Then, in WIP commits:** the record check and its Loom model; pinned mode; `migrate` and `move_once`; `spawn_movable`; the two proofs; `move_context` non-generic; wake's common path brought within 3 instructions (the fifth to the eighth turns; F1 `e8139e04`); the null section (`2038e494`); the delivery receiver's change (`9056f679`); the pinned-mode wording (`66ee0032`).
+- **The review's answers**, one commit per finding (REVIEW_T96_2026-11-22.md, section 2), on top of `66ee0032`, to `b1f1e528`.
+- **The records:** ADR-0013's rows and controls, ADR-0020's notes, PERFORMANCE_BUDGETS.md, provenance, the review record and this entry.
+
+**The design as it lands** is in ADR-0020's dated notes of 2026-11-22 on S1, S2, S4, S5, S6, S20 and S23, and ADR-0013's rows for "thread migration: integrity" (Refuse), "thread migration: delivery" (Withdraw "no thread moves") and FPU format (now Withdraw "thread moves to or from that processor").
+
+**Changes of behaviour, all accepted:**
+- Two new boot proofs, 75 in all, and two more lines a boot, three with the capacity phase's.
+- A wake-up checks that the slot holds its record before waking it, and an inconsistency enters pinned mode (S20) and prints one line; the kernel stops only on a second exhaustion.
+- A spawn takes its record from another processor's block when its own is used up.
+- The FPU format proof is Withdraw.
+- The settles' record check sums over the machine.
+- About 4 s more of proof time a boot (CL20's note).
+
+**The static counts of the switch path** (`llvm-objdump` of the images built from `0ebef78b` and each tip): `resume` 777 instructions, `on_yield` 239, `dispatch` 443, their calls and their targets, locked instructions and GOT loads, and their normalized disassembly, equal the base's on every turn after `move_context` was made non-generic (`1c16492e`, `e8139e04`, `66ee0032`, `b1f1e528`). `wake`: 262 instructions in all at `b1f1e528` (the base's 266).
+
+**The null section (2026-11-22; the coordinating session's ruling on the first full turn's 1.1 ms wake-up).** The full turn on `e8139e04` measured a sender's longest wake-up that followed no move at 1115979 ns, `emu`, over B18's 50 µs. Beside B20's 488 µs, it is probably a virtual processor descheduled by the host, but with interrupts off a wake-up can also spend that long spinning on a queue lock held by a mover. To tell the two apart, the delivery proof now times a second interrupts-off section after each wake-up. It has no lock and spins on the TSC for the median of the sender's last 15 wake-up spans, so its exposure to the host matches a wake-up's. For both kinds of section the line prints the ticks spent in all, the spans over 50 µs and over 400 µs, and the longest. Similar rates of long spans per tick spent mean descheduling; a clearly higher rate for the wake-ups means lock waiting, which is then traced to its lock. Report only: no pass condition, no kernel path changed. B18's note in PERFORMANCE_BUDGETS records the method beside the figures (FIG). **The result:** on every large-machine boot, long spans per second spent in the wake-ups and in the null section agree within about 10%, so the long spans are the host descheduling a virtual processor, not lock waiting. The table is beside B18 in PERFORMANCE_BUDGETS.md. The first boot's 1.1 ms on the default machine did not come back: later default boots had at most 3 spans over 50 µs and none over 400 µs.
+
+**The controls** (step 9; the coordinating session's rulings of 2026-11-22), each planted in a `git archive` export and booted once; the table is in ADR-0013, "The controls of TASKS item 96".
+- **C96-1b, not observable on its own.** With `RunQueue::frame` handing out the running slot's frame, lend's NotYet refuses that frame, so nothing fails. Its sign is the rise in the integrity proof's "being switched out" refusals: 1237, against 310–421 in the other ten 2-processor boots of the same turn (delivery: 23913 against 16372–21339). That is the evidence that NotYet does its job. The turn's first summary marked it "shown" only because its pattern `|panic` matched the Rust-program proof's "a panic ended it"; the pattern is `origin-kernel: panic: ` since.
+- **C96-1c**, added: C96-1b's plant with NotYet's check removed too. Ruled to fail integrity; it was caught, safely, by S20's trigger 2 before any second processor ran the context (the bullets below).
+- **C96-2, and why the receiver does not read its tokens again after the spin.** Before the ruling, the direct-form receiver re-read its tokens after its one-tick spin. A sender posts before it wakes, so a wake-up landing in the spin was always seen as a token and the pending flag was never needed; a lost one would also be recovered by the next token's wake-up. C96-2, a move that drops the pending wake-up, passed (1002 of 1002). Now the receiver reads once, before the spin, and a sender posts only to a receiver holding no untaken token (claimed by a compare and swap), so a lost wake-up leaves its receiver short and the drain fails. The proof's comment says so, so that no later change restores the re-read and blinds the control again.
+- **C96-6-65's "scheduler fairness" failure** (CPUs 26, 49 and 51) is the known failure ADR-0013 forgives by name on the 65- and 67-processor machines, as in the ninth batch's matrix; fairness runs before any movable thread exists. It is not C96-6's effect; the comparison reads it against the unplanted 65-processor boot.
+- **C96-5, P1 and P2** first failed to build: their plant ran after the verdict, out of `online`'s scope. They now run before `sched::stop_boot_processor`.
+- **The rerun (2026-11-22 05:32:51–05:38:59 UTC, on 9056f679).** The plain boot passed: delivery 766 of 766 tokens, 276 moves, 270 of them carrying a pending wake-up (246 of 251 before the change), so the proof still tests S6. C96-1b: not caught, "being switched out" 1216 against 362–422. C96-2: caught, 405 posted, 402 taken, 3 receivers short, and the stuck receivers cut the moves to 4. C96-5: caught, trigger 2's line. P1 and P2: trigger 3's line in the log. C96-1c: caught by S20's trigger 2 during integrity, not by integrity's own checks: without NotYet, lend looked for the running slot's frame among the slots' published frames, found none (a running context's frame is not published) and answered Lost, so the move was refused before any second processor ran the context. NotYet and that check each stop C96-1b's frame alone. FIG: the run-on boots (xtask's stop at the pinned-mode line removed in the export) of C96-5, P1, P2 and C96-1c.
+- **Wording:** trigger 3's line said "the search found the thread in another queue"; in P1's boot the thread was in the same queue at another slot. It now says "the search found the slot that holds the thread and woke it there" (66ee0032). The review's R96-9 later shortened every pinned-mode text, to "the search woke it in its slot" here.
+- **Three layers stop C96-1b's frame, each alone** (the coordinating session's ruling, 2026-11-22): lend's NotYet (C96-1b); the published-frame check, which finds no slot publishing a running context's frame; and S20's trigger 2, which then withdraws moves (C96-1c). The controls go no further: removing the third would plant out S20 itself.
+- **The run-on boots (2026-11-22 05:43:16–05:48:21 UTC, on 66ee0032;** xtask's stop at the pinned-mode line removed in each planted export only). C96-5: trigger 2's line, "the move answered Some(Inconsistent)", the verdict and the halt line. P1: trigger 3's line, the planted thread ended, the verdict and the halt line. P2: trigger 3's line on line 511, then the planted panic (`sched.rs:1168`, the report hook's planted `panic!`) on line 512. C96-1c: trigger 2's line, then integrity failed on the withdrawal: 1 move, refused "pinned" 592612 times and "inconsistent" once, 0 second processors in a context, 0 canaries changed, every processor a source and a destination: no, pinned mode entered: LendLost. The plain boot: delivery 787 of 787, 299 moves, 287 carrying a pending wake-up.
+
+**The comparison with `0ebef78b`** (the contract's §6; TASKS item 92's rules (a) to (c), with the third ruling's reading of the 50 ms wait; `judge96.py`, TASKS item 93's judge with its rules unchanged):
+- **First, at `66ee0032`** (05:52 to 06:21 UTC): three rounds of B1, `ORIGIN_QEMU_SMP=65 boot-test` and `boot-sparse`, base and tip alternating which went first.
+  - (a) and (b) passed; every (c) figure passed on 65.
+  - **Two rules fired on 67.** One tip boot missed integrity's coverage: 276 moves in a fixed 2 s while the host's load rose from 9.9 to 25.4, nothing else failing (the review's R96-4 case, answered by the progress wait). And the 50 ms wait's tick rule: the tip's worst 61 ms against 60.
+  - **The IPC round trip** was not slower at the tip: 65, base 84,909, 97,125 and 89,947 ns against 81,308, 83,181 and 81,231; 67, base 99,460, 113,703 and 90,463 against 96,521 and 97,463. TASKS item 93's unexplained rise is not reproduced (CL60's note).
+- **Rerun of the 67 rounds on the answered tip `b1f1e528`** (06:48 to 07:01 UTC), nothing else on the machine, each boot's load recorded (5.0 to 17.5 at the starts): no stop. The 50 ms wait: base 50, 60 and 50; tip 59, 60 and 50. Every tip covered every processor (after 144, 502 and 706 ms).
+- **B1, six pairs** (three at `66ee0032`, three at `b1f1e528`; the switch path identical): base 1829, 1850, 1886, 1885, 1912 and 1880 (mean 1874, range 1829 to 1912); tip 1944, 2010, 1832, 1740, 1726 and 1899, mean 1858, inside the range: passes. The first three pairs alone put the tip's mean (1929) above the base's range; by TASKS items 95's and 93's precedent three more pairs were run.
+- **The new proofs' figures** on 65 and 67, reported and not judged: a move's critical section, median 4 to 29 µs, largest 30 to 166 ms; delivery, every token taken, 825 to 1979 moves carrying a pending wake-up, most of them with a token; the capacity phase, 141 ms to 1.5 s.
+
+**The review:** one AI reviewer, given the code and ADR-0020's properties, not this session's argument: 1 defect, 5 risks and 10 notes, every one answered in a commit naming it (`docs/engineering/REVIEW_T96_2026-11-22.md`). The reviewer found no path by which two processors run one context, no move made outside both queue locks in index order, and no lost wake-up on a path a consistent kernel takes.
+
+**The turn after the answers** (`b1f1e528`, 06:34 to 07:05 UTC): the static counts and wake's traces as before; fmt, progress, the build and both Clippy runs clean; 564 host tests (origin-frame, origin-sync) and 574 (the kernel's library) passed, none failed; all 93 Loom models passed and all 144 controls were caught; `boot-test` passed, integrity covering both processors after 1 ms, the capacity phase in 2 ms (13 fillers each side, 8 moves refused as full, 0 made), delivery's carried wake-ups 215, 155 of them with a token.
+
+**The gates on the final tip:** FIG.
+
+**Follow-ups and limits:**
+- **For TASKS item 98:** Item 98's contract must re-check the bound on a wake-up's follows (S1's note of 2026-11-22) when it adds run-time movers with S10's rate, and take Q18 (b), leaving the section after every 8 follows, if any unpaced caller can exist. Its run-time movers also meet ADR-0020 S23's note on the "running on" word and N13's capacity paths at run time.
+- **Register canaries** (the review's R96-8): a framework helper with `asm!` that holds values in named callee-saved registers across a yield, so integrity checks the general registers themselves. Numbered by the coordinating session with the hand-over.
+- **TASKS item 126:** the three older `#[inline]` items that name statics (`cpu::count`, `monotonic::monotonic_reading`, `nospec::form`).
+- **Not shown:** C96-1, C96-4 and C96-6 at boot (recorded as not observable, with their reasons), C95-B1 (unreachable by construction); anything under KVM until CI runs it; anything on hardware. No person has reviewed the code.
