@@ -1,0 +1,586 @@
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00180800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19), 0x0E to 0xCF9 (bit 20)
+origin-boot: bench build: minimal: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19), 0x0E to 0xCF9 (bit 20)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00900800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x0E to 0xCF9 (bit 20), a shutdown (bit 23)
+origin-boot: bench build: minimal: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it
+origin-boot: bench build: minimal: ExitBootServices next, through the live boot services table
+X
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00900800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x0E to 0xCF9 (bit 20), a shutdown (bit 23)
+origin-boot: bench build: minimal: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it
+origin-boot: bench build: minimal: ExitBootServices next, through the live boot services table
+X
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00300800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x0E to 0xCF9 (bit 20), a sleep state (bit 21)
+origin-boot: bench build: minimal: the last reset was not a shutdown (0x0E to 0xCF9 (bit 20), a sleep state (bit 21)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00900800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x0E to 0xCF9 (bit 20), a shutdown (bit 23)
+origin-boot: bench build: minimal: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it
+origin-boot: bench build: minimal: ExitBootServices next, through the live boot services table
+X
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00300800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x0E to 0xCF9 (bit 20), a sleep state (bit 21)
+origin-boot: bench build: minimal: the last reset was not a shutdown (0x0E to 0xCF9 (bit 20), a sleep state (bit 21)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00900800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x0E to 0xCF9 (bit 20), a shutdown (bit 23)
+origin-boot: bench build: minimal: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it
+origin-boot: bench build: minimal: ExitBootServices next, through the live boot services table
+X
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+Error: No response to keepalive - Terminating session
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+Error: No response de-activating SOL payload
+[SOL Session operational.  Use ~? for help]
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00300800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x0E to 0xCF9 (bit 20), a sleep state (bit 21)
+origin-boot: bench build: minimal: the last reset was not a shutdown (0x0E to 0xCF9 (bit 20), a sleep state (bit 21)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00900800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x0E to 0xCF9 (bit 20), a shutdown (bit 23)
+origin-boot: bench build: minimal: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it
+origin-boot: bench build: minimal: ExitBootServices next, through the live boot services table
+X
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99B3
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00300800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x0E to 0xCF9 (bit 20), a sleep state (bit 21)
+origin-boot: bench build: minimal: the last reset was not a shutdown (0x0E to 0xCF9 (bit 20), a sleep state (bit 21)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00900800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x0E to 0xCF9 (bit 20), a shutdown (bit 23)
+origin-boot: bench build: minimal: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it
+origin-boot: bench build: minimal: ExitBootServices next, through the live boot services table
+X
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00300800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x0E to 0xCF9 (bit 20), a sleep state (bit 21)
+origin-boot: bench build: minimal: the last reset was not a shutdown (0x0E to 0xCF9 (bit 20), a sleep state (bit 21)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00900800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x0E to 0xCF9 (bit 20), a shutdown (bit 23)
+origin-boot: bench build: minimal: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it
+origin-boot: bench build: minimal: ExitBootServices next, through the live boot services table
+X
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:08/29/2025 Rev:2.4aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92

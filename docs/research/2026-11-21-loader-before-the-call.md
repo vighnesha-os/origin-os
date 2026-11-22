@@ -86,7 +86,7 @@ So rental F's loader is not rental E's plus a reset alone. If rental F shows rea
 
 ## The candidates, under reading 1
 
-Ranked by how directly each could make the firmware's own exit handling hang, and so how soon a bench loader that leaves it out should be tried. *Re-ranked on 2026-11-22: TASKS item 127 measured the stack (candidate 2, now last), and the coordinating session ruled it to the bottom.*
+Ranked by how directly each could make the firmware's own exit handling hang, and so how soon a bench loader that leaves it out should be tried. *Re-ranked on 2026-11-22: TASKS item 127 measured the stack (candidate 2, now last), and the coordinating session ruled it to the bottom.* *Rental G (2026-11-22) then ran a minimal program on rental E's firmware revision, and its call most likely returned (`docs/research/2026-11-22-rental-g-findings.md`, reading R). It does items 1, 2, 10 and 14, the bench loaders' FCH reads and the mark straight before the call, so none of those is the cause alone, candidate 4 among them. It calls through the live table and allocates nothing, so candidates 2 and 1 are first; the findings rank them and what is left.*
 
 1. **The two OS-defined memory types** (`0x80000002`, `0x80000003`). They are allowed, but the firmware's exit handling walks its memory map, and a minimal program never gives it these types. A bench loader that allocates both as `EfiLoaderData` tests it; the kernel's boot info would then name them by address, as the kernel image already is.
 2. **The copied boot services table.** It holds only if the firmware's table was not changed after the copy, for example by a driver loaded during the loader's run. Comparing the copy's `ExitBootServices` with the live table's just before the call is a read.
