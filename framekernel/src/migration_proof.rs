@@ -309,7 +309,7 @@ fn spawn_movable(cpus: &[CpuIndex], entry: extern "sysv64" fn(u64) -> !) -> bool
 
 /// What a proof's bracket compares before and after: the heap in use, the free frames and the
 /// stacks held.
-fn counts() -> (Option<(u64, u64)>, u64) {
+fn counts() -> (Option<(u64, u64)>, usize) {
     (
         memory::stats().map(|(h, f)| (h.bytes_in_use, f)),
         origin_frame::stack::counts().live,
@@ -320,7 +320,7 @@ fn counts() -> (Option<(u64, u64)>, u64) {
 /// shared state is dropped first.
 fn bracket_after(
     settled_before: Result<(), sched::Unsettled>,
-    before: (Option<(u64, u64)>, u64),
+    before: (Option<(u64, u64)>, usize),
     tsc_hz: u64,
 ) -> (bool, alloc::string::String) {
     set_shared(None);
@@ -770,7 +770,7 @@ pub(crate) fn prove_delivery(
         .map(|t| t.taken.load(Ordering::Acquire))
         .sum();
     // S20, case 1: a failure withdraws moves for the rest of the boot.
-    let entered_here = !delivered && pinned::enter(pinned::Trigger::DeliveryFailed, CpuIndex::BOOT);
+    let entered_here = !delivered && pinned::enter(pinned::Trigger::DeliveryFailed);
     // Every receiver ends: woken by name and through its queue, with moves withdrawn if they
     // failed, so the wake-ups reach them.
     shared.stop.store(true, Ordering::Release);

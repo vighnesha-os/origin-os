@@ -925,14 +925,22 @@ impl MoveWitness for KernelOff {
 /// of the context it last switched out, and a thread switched out here just before the mover ran
 /// is lendable at once, as `stack_in_use` publishes it.
 ///
+/// `between` answers what the caller passes back (in the kernel, whether the thread carried a
+/// pending wake-up). It is a `dyn` closure, and this function is neither generic nor inlined, so
+/// that its body, and the statics it names, stay in this crate: a public generic function would
+/// export `CONTEXTS` and `MOVES`, and the position-independent kernel would then reach them
+/// through the GOT everywhere, `resume` and `dispatch` included (step 3's static counts of TASKS
+/// item 96). The indirect call is the mover's, under the gate, off every hot path.
+///
 /// `None` if either processor has no table; a refusal otherwise says why nothing moved.
-pub fn move_context<R>(
+#[inline(never)]
+pub fn move_context(
     off: crate::trap::InterruptsOff<'_>,
     from: CpuIndex,
     to: CpuIndex,
     frame: u64,
-    between: impl FnOnce(u64) -> R,
-) -> Option<Result<(u64, R), MoveRefused>> {
+    between: &mut dyn FnMut(u64) -> bool,
+) -> Option<Result<(u64, bool), MoveRefused>> {
     let source = CONTEXTS.get(from.get())?;
     let destination = CONTEXTS.get(to.get())?;
     if this_cpu(off.here()).index() == from {
@@ -944,7 +952,7 @@ pub fn move_context<R>(
         destination,
         frame,
         crate::stack::same_slot,
-        between,
+        |home| between(home),
     ))
 }
 

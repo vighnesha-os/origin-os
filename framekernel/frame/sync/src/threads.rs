@@ -577,7 +577,10 @@ fn changed(now: Option<Location>, same_generation: bool) -> Look {
 ///   [`WAKE_TRIES`].
 ///
 /// `pin` runs under no queue's lock, at most once per wake-up, and answers whether its call entered
-/// pinned mode (the first trigger), which [`Wake::met`] then carries.
+/// pinned mode (the first trigger), which [`Wake::met`] then carries. If it did, `report` is called
+/// once the retry or the search has ended, under no queue's lock, with what it found: the kernel
+/// writes the line that names the trigger there, so that nothing on the path of a wake-up that met
+/// no inconsistency tests for a line owed (the coordinating session's ruling, ADR-0018 V1).
 ///
 /// **How long it holds interrupts off** (ADR-0020 S1's note of 2026-11-22; the ruling's Q18): the
 /// kernel runs it in one interrupts-off section. Each follow adds at most the rest of one move's
@@ -592,11 +595,16 @@ pub fn wake<S, Q: Queues>(
     number: u32,
     generation: u32,
     pin: impl FnOnce(Met) -> bool,
+    report: impl FnOnce(Met, Outcome),
 ) -> Wake {
     let first = follow(queues, record, number, generation);
     match first.outcome {
-        Outcome::Exhausted => after_exhausted(queues, record, number, generation, first, pin),
-        Outcome::Misplaced => after_misplaced(queues, record, number, generation, first, pin),
+        Outcome::Exhausted => {
+            after_exhausted(queues, record, number, generation, first, pin, report)
+        }
+        Outcome::Misplaced => {
+            after_misplaced(queues, record, number, generation, first, pin, report)
+        }
         Outcome::Reached { .. } | Outcome::Stale | Outcome::Gone => first,
     }
 }
@@ -671,6 +679,7 @@ fn after_exhausted<S, Q: Queues>(
     generation: u32,
     first: Wake,
     pin: impl FnOnce(Met) -> bool,
+    report: impl FnOnce(Met, Outcome),
 ) -> Wake {
     let entered = pin(Met::Exhausted);
     let again = follow(queues, record, number, generation);
@@ -679,6 +688,9 @@ fn after_exhausted<S, Q: Queues>(
     } else {
         again
     };
+    if entered {
+        report(Met::Exhausted, again.outcome);
+    }
     Wake {
         retries: first.retries.saturating_add(again.retries),
         met: entered.then_some(Met::Exhausted),
@@ -696,11 +708,16 @@ fn after_misplaced<S, Q: Queues>(
     generation: u32,
     first: Wake,
     pin: impl FnOnce(Met) -> bool,
+    report: impl FnOnce(Met, Outcome),
 ) -> Wake {
     let entered = pin(Met::Misplaced);
+    let found = search(queues, record, number, generation, first.retries);
+    if entered {
+        report(Met::Misplaced, found.outcome);
+    }
     Wake {
         met: entered.then_some(Met::Misplaced),
-        ..search(queues, record, number, generation, first.retries)
+        ..found
     }
 }
 
@@ -1130,11 +1147,27 @@ mod tests {
     /// `wake` with the stub's number, and a hook that keeps what it was told.
     fn woken(stub: &Stub<'_>, record: &Record<u32>, generation: u32) -> (Wake, Vec<Met>) {
         let met = RefCell::new(Vec::new());
-        let woke = wake(stub, record, NUMBER, generation, |m| {
-            met.borrow_mut().push(m);
-            true
-        });
-        (woke, met.into_inner())
+        let reported = RefCell::new(Vec::new());
+        let woke = wake(
+            stub,
+            record,
+            NUMBER,
+            generation,
+            |m| {
+                met.borrow_mut().push(m);
+                true
+            },
+            |m, outcome| reported.borrow_mut().push((m, outcome)),
+        );
+        let met = met.into_inner();
+        // The line is reported once, after the retry or the search, with what it ended with.
+        let expected: Vec<(Met, Outcome)> = met.iter().map(|&m| (m, woke.outcome)).collect();
+        assert_eq!(
+            reported.into_inner(),
+            expected,
+            "reported once, with the end"
+        );
+        (woke, met)
     }
 
     /// A record taken from a block and located at slot 5 of processor 2, and its generation.
@@ -1276,11 +1309,18 @@ mod tests {
         let stub = Stub::new(record);
         stub.moving.set(true);
         let met = RefCell::new(Vec::new());
-        let woke = wake(&stub, record, NUMBER, generation, |m| {
-            stub.moving.set(false);
-            met.borrow_mut().push(m);
-            true
-        });
+        let woke = wake(
+            &stub,
+            record,
+            NUMBER,
+            generation,
+            |m| {
+                stub.moving.set(false);
+                met.borrow_mut().push(m);
+                true
+            },
+            |_, _| {},
+        );
         let landed = 2 + WAKE_TRIES;
         assert_eq!(
             woke,
@@ -1342,7 +1382,14 @@ mod tests {
         let (record, generation) = located(&block);
         let stub = Stub::new(record);
         stub.held.set(Some((4, 1)));
-        let woke = wake(&stub, record, NUMBER, generation, |_| false);
+        let woke = wake(
+            &stub,
+            record,
+            NUMBER,
+            generation,
+            |_| false,
+            |_, _| panic!("a wake-up that did not enter pinned mode reported a line"),
+        );
         assert_eq!(
             woke,
             Wake {

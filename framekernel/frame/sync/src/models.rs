@@ -731,6 +731,11 @@ fn no_inconsistency(met: threads::Met) -> bool {
     panic!("a wake-up met an inconsistency: {met:?}")
 }
 
+/// The line such a wake-up would report: never reached in a model that plants no inconsistency.
+fn no_line(met: threads::Met, _: Outcome) {
+    panic!("a wake-up reported pinned mode: {met:?}")
+}
+
 /// A handle on the [`World`] that makes kernel threads in it.
 struct Kernel(Arc<World>);
 
@@ -971,6 +976,7 @@ impl Scheduler for OnCpu {
             thread.record,
             thread.generation,
             no_inconsistency,
+            no_line,
         )
         .outcome
         {
@@ -1641,6 +1647,13 @@ fn a_misplaced_location_wakes_only_its_thread() {
                 assert_eq!(met, threads::Met::Misplaced);
                 true
             },
+            |met, outcome| {
+                assert_eq!(met, threads::Met::Misplaced);
+                assert!(
+                    matches!(outcome, Outcome::Reached { cpu: 0, .. }),
+                    "{MISPLACED_WOKE}: the search did not find the thread"
+                );
+            },
         );
         {
             let q = kernel.cpus[1].queue.lock();
@@ -1718,6 +1731,7 @@ fn a_stale_name_wakes_nobody() {
             old.record,
             old.generation,
             no_inconsistency,
+            no_line,
         );
         assert!(woke.outcome == Outcome::Stale, "{STALE_WOKE}");
         assert!(
@@ -1784,6 +1798,7 @@ fn a_wake_racing_an_exit_follows_nothing() {
                 name.record,
                 name.generation,
                 no_inconsistency,
+                no_line,
             );
             assert_eq!(woke.retries, 0, "{EXIT_FOLLOWED}");
             if let Outcome::Reached { cpu, .. } = woke.outcome {

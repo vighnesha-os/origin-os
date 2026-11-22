@@ -36,7 +36,7 @@ use origin_frame::percpu::PerCpu;
 use origin_frame::stack::{FpuArea, GuardedStack, StackSlot, State as SlotState, ThreadStart};
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::exits::{Exits, Pending};
-use origin_frame::sync::threads::{Empty, Location, Met, Outcome, Queues, Record};
+use origin_frame::sync::threads::{Empty, Location, Outcome, Queues, Record};
 use origin_frame::trap::{MintHolder, Pinned, Switch};
 
 /// Each kernel thread's stack.
@@ -923,23 +923,17 @@ pub(crate) mod pinned {
 
     /// 0 while moves are on; otherwise the first trigger's code.
     static FIRST: AtomicU8 = AtomicU8::new(0);
-    /// The processor the first trigger was met on.
-    static ON: AtomicU64 = AtomicU64::new(0);
     /// Triggers met after the first.
     static LATER: AtomicU64 = AtomicU64::new(0);
 
-    /// Enters pinned mode for `trigger`, met on processor `on`: `true` if this call entered it, and
-    /// so owes the line ([`line`]); `false` if it was entered already, and the trigger is counted.
-    /// A compare-and-swap from 0, so the first trigger is the one named.
-    pub(crate) fn enter(trigger: Trigger, on: CpuIndex) -> bool {
+    /// Enters pinned mode for `trigger`: `true` if this call entered it, and so owes the line
+    /// ([`line`]); `false` if it was entered already, and the trigger is counted. A
+    /// compare-and-swap from 0, so the first trigger is the one named.
+    pub(crate) fn enter(trigger: Trigger) -> bool {
         if FIRST
             .compare_exchange(0, trigger.code(), Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            ON.store(
-                u64::try_from(on.get()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
             true
         } else {
             LATER.fetch_add(1, Ordering::Relaxed);
@@ -953,28 +947,28 @@ pub(crate) mod pinned {
         FIRST.load(Ordering::Acquire) != 0
     }
 
-    /// The processor the first trigger was met on, if pinned mode was entered.
-    pub(crate) fn on() -> Option<CpuIndex> {
-        entered()?;
-        usize::try_from(ON.load(Ordering::Relaxed))
-            .ok()
-            .and_then(CpuIndex::new)
-    }
-
     /// The first trigger, if pinned mode was entered, and the triggers met after it.
     pub(crate) fn entered() -> Option<(Trigger, u64)> {
         Trigger::from_code(FIRST.load(Ordering::Acquire))
             .map(|trigger| (trigger, LATER.load(Ordering::Relaxed)))
     }
 
-    /// The line that names the first trigger, by the caller that entered pinned mode, after every
-    /// lock it took is released and with interrupts as its caller had them. `then` says what the
-    /// wake-up did next: for a misplaced location, what the one search found.
+    /// The line that names the first trigger, by the caller that entered pinned mode, after the
+    /// queue locks it took are released. `then` says what it did next: for a misplaced location,
+    /// what the one search found.
+    ///
+    /// A wake-up writes it inside its interrupts-off section, out of line (a change from TASKS item
+    /// 96's contract, §2, which had it after the section; ruled by the coordinating session): the
+    /// console queues a line written with interrupts off and pumps the UART once, as it does for
+    /// an interrupt handler's line, so the line is not lost and nothing waits. The console's lock
+    /// is a leaf, held only with interrupts off, and the console wakes no thread, so a wake-up is
+    /// never entered with it held. `Console::new`, never the boot flow's writer, which may open
+    /// an interrupt window between sections: that must not happen inside the section.
     #[cold]
     #[inline(never)]
     pub(crate) fn line(trigger: Trigger, on: CpuIndex, then: &str) {
         let _ = writeln!(
-            crate::sched::here_console(),
+            crate::console::Console::new(),
             "origin-kernel: scheduler: pinned mode: moves withdrawn: {} on CPU {on}{then}",
             trigger.named()
         );
@@ -990,6 +984,9 @@ pub(crate) mod pinned {
             (Met::Misplaced, _) => "; the search found the record in no queue",
             (Met::Exhausted, Outcome::Reached { .. }) => {
                 "; with moves withdrawn its next look reached the thread"
+            }
+            (Met::Exhausted, Outcome::Exhausted) => {
+                "; it followed 64 more with moves withdrawn: the flag failed, and the kernel stops"
             }
             (Met::Exhausted, _) => "; with moves withdrawn its thread had gone",
         }
@@ -1032,32 +1029,41 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
     // the judge's stop): with a stale index, a waker that had left `cpu` would send no IPI, and
     // the woken thread would wait for that processor's next tick. The queues are locked in the
     // same section (`waking`), so a wake-up opens one section, as before TASKS item 93.
-    let (sent, owed) = waking::within(|queues, here| {
+    waking::within(|queues, here| {
+        // Pinned mode's two hooks run only on an inconsistency, out of line in
+        // `origin_sync::threads`: the line is written there, inside this section, as an interrupt
+        // handler's line is (`pinned::line`), so that a wake-up that meets none tests for nothing
+        // more than Q6's record check (the coordinating session's ruling, ADR-0018 V1).
         let woke = origin_frame::sync::threads::wake(
             queues,
             record,
             thread.record,
             thread.generation,
-            |met| pinned::enter(met.into(), cpu::this_cpu(here).index()),
+            |met| pinned::enter(met.into()),
+            |met, outcome| {
+                pinned::line(
+                    met.into(),
+                    cpu::this_cpu(here).index(),
+                    pinned::then_woke(met, outcome),
+                );
+            },
         );
         if woke.retries != 0 {
             followed(record, woke.retries, here);
         }
-        let owed = woke.met.map(|met| (met, woke.outcome));
-        let sent = match woke.outcome {
+        match woke.outcome {
             Outcome::Reached { ready: true, cpu } => {
                 let Some(cpu) = usize::try_from(cpu).ok().and_then(CpuIndex::new) else {
-                    return (false, owed);
+                    return false;
                 };
                 let me = cpu::this_cpu(here);
                 if cpu != me.index()
                     && let Some(apic_id) = cpu.apic_id()
                 {
                     timer::send_reschedule_ipi(me, apic_id);
-                    true
-                } else {
-                    false
+                    return true;
                 }
+                false
             }
             // A second exhaustion, with moves withdrawn: the flag itself failed (the ruling's Q17).
             Outcome::Exhausted => panic!(
@@ -1069,22 +1075,8 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
             | Outcome::Stale
             | Outcome::Gone
             | Outcome::Misplaced => false,
-        };
-        (sent, owed)
-    });
-    if let Some((met, outcome)) = owed {
-        owe_line(met, outcome);
-    }
-    sent
-}
-
-/// The line a wake-up that entered pinned mode owes ([`pinned::line`]), after its section: `met`
-/// is the first trigger, since this wake-up's call entered pinned mode.
-#[cold]
-#[inline(never)]
-fn owe_line(met: Met, outcome: Outcome) {
-    let on = pinned::on().unwrap_or(CpuIndex::BOOT);
-    pinned::line(met.into(), on, pinned::then_woke(met, outcome));
+        }
+    })
 }
 
 /// The moves a wake-up followed, out of line (TASKS item 96, the coordinating session's rulings Q8
@@ -1227,7 +1219,7 @@ fn move_once(
 
     let me = cpu::this_cpu(off.here()).index();
     let mut enter = |trigger| {
-        if pinned::enter(trigger, me) {
+        if pinned::enter(trigger) {
             *owed = Some((trigger, me));
         }
         Err(Unmoved::Inconsistent)
@@ -1288,7 +1280,7 @@ fn move_once(
     if !destination.has_room() {
         return Err(Unmoved::QueueFull);
     }
-    let moved = cpu::move_context(off, from, to, frame, |_home| {
+    let moved = cpu::move_context(off, from, to, frame, &mut |_home| {
         // Under both queue locks and the gate: nothing has changed since the checks above.
         let Some(departed) = source.depart(slot) else {
             panic!("a thread checked ready under its queue's lock could not depart");
