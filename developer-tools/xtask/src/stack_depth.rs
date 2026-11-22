@@ -511,16 +511,24 @@ fn functions(symbols: &[(u64, String)], insns: &[Insn]) -> Vec<Function> {
 /// The longest chains from the function named `entry` ([`Chain`]). A call that would close a
 /// cycle is left out and named.
 fn chain(functions: &[Function], entry: &str) -> Option<Chain> {
+    /// What lies below one function: the longest chain, and the deepest indirect call (none if no
+    /// chain below it makes one), each with the next function on its chain.
+    #[derive(Clone, Copy)]
+    struct Below {
+        longest: u64,
+        longest_next: Option<usize>,
+        indirect: Option<u64>,
+        indirect_next: Option<usize>,
+    }
     struct Walk<'a> {
         functions: &'a [Function],
-        /// For each function: the longest chain below it and the deepest indirect call below it,
-        /// each with the next function on it.
-        done: HashMap<usize, ((u64, Option<usize>), (Option<u64>, Option<usize>))>,
+        /// What lies below each function visited.
+        done: HashMap<usize, Below>,
         on_path: HashSet<usize>,
         cycles: Vec<String>,
     }
     impl Walk<'_> {
-        fn visit(&mut self, f: usize) -> ((u64, Option<usize>), (Option<u64>, Option<usize>)) {
+        fn visit(&mut self, f: usize) -> Below {
             if let Some(&known) = self.done.get(&f) {
                 return known;
             }
@@ -529,8 +537,12 @@ fn chain(functions: &[Function], entry: &str) -> Option<Chain> {
             let frame = function.frame;
             // Through a call, the callee's frame is below this one's; through a tail jump, it
             // takes this one's place.
-            let mut longest = (frame, None);
-            let mut indirect = (function.indirect.then_some(frame), None);
+            let mut below = Below {
+                longest: frame,
+                longest_next: None,
+                indirect: function.indirect.then_some(frame),
+                indirect_next: None,
+            };
             let edges: Vec<(usize, bool)> = function
                 .calls
                 .iter()
@@ -545,20 +557,22 @@ fn chain(functions: &[Function], entry: &str) -> Option<Chain> {
                     ));
                     continue;
                 }
-                let ((below, _), (below_indirect, _)) = self.visit(callee);
+                let callee_below = self.visit(callee);
                 let base = if is_call { frame } else { 0 };
-                if base + below > longest.0 {
-                    longest = (base + below, Some(callee));
+                if base + callee_below.longest > below.longest {
+                    below.longest = base + callee_below.longest;
+                    below.longest_next = Some(callee);
                 }
-                if let Some(d) = below_indirect
-                    && indirect.0.is_none_or(|known| base + d > known)
+                if let Some(d) = callee_below.indirect
+                    && below.indirect.is_none_or(|known| base + d > known)
                 {
-                    indirect = (Some(base + d), Some(callee));
+                    below.indirect = Some(base + d);
+                    below.indirect_next = Some(callee);
                 }
             }
             self.on_path.remove(&f);
-            self.done.insert(f, (longest, indirect));
-            (longest, indirect)
+            self.done.insert(f, below);
+            below
         }
 
         fn path(&self, from: usize, indirect: bool) -> Vec<(String, u64)> {
@@ -566,8 +580,12 @@ fn chain(functions: &[Function], entry: &str) -> Option<Chain> {
             let mut at = Some(from);
             while let Some(f) = at {
                 out.push((self.functions[f].name.clone(), self.functions[f].frame));
-                let (longest, deepest) = self.done[&f];
-                at = if indirect { deepest.1 } else { longest.1 };
+                let below = self.done[&f];
+                at = if indirect {
+                    below.indirect_next
+                } else {
+                    below.longest_next
+                };
                 if out.len() > self.functions.len() {
                     break;
                 }
@@ -582,15 +600,15 @@ fn chain(functions: &[Function], entry: &str) -> Option<Chain> {
         on_path: HashSet::new(),
         cycles: Vec::new(),
     };
-    let ((longest, _), (to_indirect, _)) = walk.visit(start);
+    let below = walk.visit(start);
     let mut cycles = walk.cycles.clone();
     cycles.sort();
     cycles.dedup();
     Some(Chain {
         entry_frame: functions[start].frame,
-        longest,
+        longest: below.longest,
         path: walk.path(start, false),
-        to_indirect: to_indirect.unwrap_or(0),
+        to_indirect: below.indirect.unwrap_or(0),
         indirect_path: walk.path(start, true),
         cycles,
     })
