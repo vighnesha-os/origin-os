@@ -1160,10 +1160,13 @@ RESTARTS_FILE = "restarts.log"
 
 
 def minimal_image(data):
-    """Whether a loader's bytes are a bench build that triple-faults after every successful call
-    and whose boots end at their answer: the minimal mode's (TASKS item 128) or the bisection
-    mode's (TASKS item 131). Their lines say so, as F2 checks."""
-    return MINIMAL_BUILD_LINE.encode() in data or BISECT_BUILD_LINE.encode() in data
+    """Whether a loader's bytes are a bench build whose boots end at their answer, and so take
+    owner item 350's plan of about six boots in the paid hour: the minimal mode's (TASKS item 128)
+    and the bisection mode's (TASKS item 131), which triple-fault after every successful call, and
+    the kernel-entry mode's (TASKS item 133; the coordinating session's ruling on its plan), which
+    enters the kernel. Their lines say so, as F2 checks."""
+    return (MINIMAL_BUILD_LINE.encode() in data or BISECT_BUILD_LINE.encode() in data
+            or KERNEL_BUILD_LINE.encode() in data)
 
 
 def plain(x):
@@ -1524,22 +1527,32 @@ def runs_summary(runs):
 
 
 def boot_over(runs, first, at):
-    """TASKS item 130: whether a boot of an image that triple-faults after its call (the minimal
-    mode's or the bisection mode's), whose runs are `runs[first:]`, has its answer at time `at`:
+    """TASKS item 130: whether a boot of an image whose boots end at their answer (the minimal and
+    bisection modes', which triple-fault after their call, and the kernel-entry mode's, TASKS item
+    133), whose runs are `runs[first:]`, has its answer at time `at`:
     its call hung, or showed other output and the hang's wait has passed, or the firmware started
     again after its call and the next run has read its registers, or that next run has not done so
     within the measured load delay, the loader's own time and SLACK_S of that start (R131-9). The
-    control's reset alone answers nothing."""
+    control's reset alone answers nothing. A call the loader said returned, or failed twice, is
+    judged by what came next; with the kernel's lines after it the boot runs on to the kernel's
+    verdict or its window."""
     mine = runs[first:]
     call = next((r for r in mine if r["branch"] == "call"), None)
     if call is None:
         return False
     fig = figures(runs)
-    if call["answer"] in ("none", "unwatched"):
+    # TASKS item 133: a call the loader said returned is judged by what came next. With the
+    # kernel's lines after it, the boot runs on to the kernel's verdict, or to its window.
+    answer = call["answer"]
+    if answer in ("returned", "failed"):
+        if answer == "returned" and call.get("then") == "other":
+            return False
+        answer = call.get("then")
+    if answer in ("none", "unwatched"):
         return True
-    if call["answer"] == "other":
+    if answer == "other":
         return at - call["end"] >= fig["start"] + HANG_EXTRA_S
-    if call["answer"] != "reset":
+    if answer != "reset":
         return False
     later = mine[mine.index(call) + 1:]
     if any(r["branch"] in ("control", "call") for r in later):
@@ -1784,9 +1797,9 @@ def cmd_rental_b(args):
                     result = look(start)
                 result.update(boot=boot, start=start, end=console.size(), restarted_at=restarts[-1])
                 # TASKS item 130: every bench image that resets after its call is read from the
-                # firmware's starts; only the minimal and bisection modes' boots end at their
-                # answer. TASKS item 133: so is the kernel-entry mode's, whose calls read as
-                # returned, reset (the firmware's exit shutting down) or a hang.
+                # firmware's starts; the minimal, bisection and kernel-entry modes' boots end at
+                # their answer. TASKS item 133: the kernel-entry mode's calls read as returned,
+                # reset (the firmware's exit shutting down) or a hang.
                 if reads_runs(minimal, console.text(start)):
                     runs = reading()
                     mine = runs[first_run(runs, restarts[-1]):]

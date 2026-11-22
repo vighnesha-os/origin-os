@@ -639,6 +639,23 @@ class Guards(unittest.TestCase):
         image = self.home / "kernel-entry.efi"
         image.write_bytes(b"MZ" + lat.KERNEL_BUILD_LINE.encode())
         self.assertIn("kernel-entry bench loader", lat.loader_kind(image))
+        # The coordinating session's ruling on its plan (owner item 350): about six boots in the
+        # paid hour, each ending at its answer, as the minimal and bisection images.
+        self.assertTrue(lat.minimal_image(image.read_bytes()))
+        over = lambda pieces, at: lat.boot_over(lat.read_runs(*self.pieces(*pieces), [0.0], at), 0, at)
+        # The kernel's lines after the call: the boot runs on to the verdict or the window.
+        self.assertFalse(over([(50.0, loader), (50.1, returned), (50.2, kernel)], 400.0))
+        # The loader's line that the call returned, then silence past the hang's wait: answered.
+        self.assertTrue(over([(50.0, loader), (50.1, returned)], 400.0))
+        # Returned, then a reset: answered once the next run's load has had its time.
+        self.assertFalse(over([(50.0, loader), (50.1, returned), (56.0, self.FIRMWARE)], 60.0))
+        self.assertTrue(over([(50.0, loader), (50.1, returned), (56.0, self.FIRMWARE)], 400.0))
+        # Both calls failed, then the halt: answered once the hang's wait has passed.
+        halted = b"Y\r\norigin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry EFI_INVALID_PARAMETER): halting\r\n"
+        self.assertTrue(over([(50.0, loader), (51.0, halted)], 400.0))
+        # A hang after X, and S, a reset after X, answered as for the other images.
+        self.assertTrue(over([(50.0, loader)], 400.0))
+        self.assertTrue(over([(50.0, loader), (55.5, self.FIRMWARE)], 400.0))
         # R133-6: such a boot's runs are read and kept with its result, as a reset image's are.
         self.assertTrue(lat.reads_runs(False, text))
         self.assertFalse(lat.reads_runs(False, "origin-boot: exiting boot services; entering the Framekernel"))
