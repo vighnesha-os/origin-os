@@ -28,6 +28,15 @@
 //! the window in which it is registered, preempted, moved, woken and then blocks (N1). After 2 s
 //! the senders stop, and every token posted must be taken within 2 s more.
 //!
+//! **What makes a lost wake-up fail it** (the coordinating session's ruling on control C96-2,
+//! 2026-11-22). In the direct form the receiver reads its tokens once, before the spin, and blocks
+//! after the spin on that reading, without reading again: a token posted during the spin reaches it
+//! only through the pending wake-up its sender's wake-up left, which a move must carry (S6, N1).
+//! A sender posts only to a receiver holding no token it has not taken, so a receiver whose
+//! wake-up was lost is posted nothing more and stays short, which the drain fails. Reading the
+//! tokens again after the spin, or posting to a receiver that holds one, would hide a lost
+//! wake-up from this proof: C96-2, a move that drops the pending wake-up, then passed it.
+//!
 //! **A null section beside each wake-up** (report only; the coordinating session's ruling on the
 //! first boot's 1.1 ms wake-up, 2026-11-22). After each timed wake-up, a sender spins on the TSC
 //! with interrupts off for the median of its last [`WINDOW`] wake-up spans, the same exposure to
@@ -671,14 +680,16 @@ extern "sysv64" fn receiver(index: u64) -> ! {
             direct = !direct;
             if direct {
                 // Registered (its name, from its start), then a spin to the next tick: the window
-                // in which it can be preempted, moved and woken before it blocks (N1).
+                // in which it can be preempted, moved and woken before it blocks (N1). The tokens
+                // are read once, before the spin, and not again after it: a token posted in the
+                // spin must reach the receiver through the pending wake-up alone, which is what
+                // this proof tests (the module's documentation; control C96-2).
+                let before = me.posted.load(Ordering::Acquire);
                 let start = rdtsc();
                 while rdtsc().wrapping_sub(start) < period {
                     core::hint::spin_loop();
                 }
-                if me.posted.load(Ordering::Acquire) == taken
-                    && !shared.stop.load(Ordering::Acquire)
-                {
+                if before == taken && !shared.stop.load(Ordering::Acquire) {
                     sched::block();
                 }
             } else {
@@ -713,14 +724,34 @@ extern "sysv64" fn sender(index: u64) -> ! {
         && !shared.stop.load(Ordering::Acquire)
         && rdtsc() < shared.deadline
     {
-        let Some(to) = shared.threads.get(choice.next(shared.threads.len())) else {
-            break;
-        };
-        let Some(name) = to.name() else {
+        let receivers = shared.threads.len();
+        let first = choice.next(receivers);
+        // One token at most outstanding per receiver (the module's documentation; control
+        // C96-2): a receiver that has taken every token posted to it, claimed by a compare and
+        // swap of its count, so no two senders post to it at once.
+        let claimed = (0..receivers)
+            .filter_map(|k| {
+                shared
+                    .threads
+                    .get(first.wrapping_add(k).checked_rem(receivers)?)
+            })
+            .find(|to| {
+                to.name().is_some() && {
+                    let taken = to.taken.load(Ordering::Acquire);
+                    to.posted
+                        .compare_exchange(
+                            taken,
+                            taken.wrapping_add(1),
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                }
+            });
+        let Some((to, name)) = claimed.and_then(|to| to.name().map(|name| (to, name))) else {
             sched::yield_now();
             continue;
         };
-        to.posted.fetch_add(1, Ordering::Release);
         me.posted.fetch_add(1, Ordering::Relaxed);
         // The wake-up in an interrupts-off section of the sender's own: the span holds `wake`'s
         // whole section, and the count's change on this processor is this wake-up's follows
