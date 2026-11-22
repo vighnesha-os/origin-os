@@ -809,10 +809,12 @@ extern "sysv64" fn sender(index: u64) -> ! {
 }
 
 /// "thread migration: delivery" (Withdraw: "no thread moves"; the contract's §3.2). See the
-/// module documentation. On a failure it enters pinned mode (S20, case 1; trigger 1), so the
-/// boot goes on with moves withdrawn, and wakes every receiver again so that they end; an entry
-/// into pinned mode before it, during the boot's proofs, fails it too, naming the trigger (the
-/// ruling's Q5).
+/// module documentation. On any failure it enters pinned mode (S20, case 1; trigger 1), so the
+/// boot goes on with moves withdrawn as its verdict says (ADR-0013 R2): undelivered tokens enter
+/// it before the receivers are woken a last time, so that those wake-ups reach them with moves
+/// withdrawn, and every other failure once it is known, after the compare (the review of TASKS
+/// item 96, R96-1). An entry into pinned mode before it, during the boot's proofs, fails it too,
+/// naming the trigger (the ruling's Q5).
 pub(crate) fn prove_delivery(
     flow: Pinned<'_>,
     com1: &mut Console,
@@ -902,8 +904,9 @@ pub(crate) fn prove_delivery(
         .iter()
         .map(|t| t.taken.load(Ordering::Acquire))
         .sum();
-    // S20, case 1: a failure withdraws moves for the rest of the boot.
-    let entered_here = !delivered && pinned::enter(pinned::Trigger::DeliveryFailed);
+    // S20, case 1: a failure withdraws moves for the rest of the boot. Undelivered tokens now;
+    // any other failure below, once it is known (R96-1).
+    let mut entered_here = !delivered && pinned::enter(pinned::Trigger::DeliveryFailed);
     // Every receiver ends: woken by name and through its queue, with moves withdrawn if they
     // failed, so the wake-ups reach them.
     shared.stop.store(true, Ordering::Release);
@@ -958,14 +961,13 @@ pub(crate) fn prove_delivery(
         )
     };
     let (wakes, nulls) = (sections(wakes), sections(nulls));
+    // Pinned mode entered by anything but this proof's own failure fails it (Q5).
+    let entered_before = pinned::entered().is_some() && !entered_here;
+    let ok = spawned && delivered && posted == taken && ended && back && reached && !entered_before;
+    if !ok && !entered_here {
+        entered_here = pinned::enter(pinned::Trigger::DeliveryFailed);
+    }
     let pinned_mode = pinned::entered();
-    let ok = spawned
-        && delivered
-        && posted == taken
-        && ended
-        && back
-        && reached
-        && pinned_mode.is_none();
     let _ = writeln!(
         com1,
         "origin-kernel: scheduler: thread migration: delivery: {receivers} movable receivers and {} pinned senders, {posted} tokens posted, {taken} taken, {short} receivers short; spawned {spawned}; ended {ended}; heap, frames and stacks back {back}; {made} moves, {carried} carrying a pending wake-up, refused: {refusals}; wake-ups followed {follows} moves of movable threads, the most one followed {most}, {over_eight} followed more than 8; a sender's wake-up that followed a move: longest {} ticks ({} ns) with {} follows; one that followed none: longest {} ticks ({} ns); senders' wake-up sections: {wakes}; their null sections, each as long as their wake-ups' recent median: {nulls}{}{}{}",
