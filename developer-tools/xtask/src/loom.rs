@@ -199,6 +199,12 @@ const MOVE_GATE: &[&str] = &[
 /// reached the record's next thread.
 const STALE_WOKE: &[&str] = &["a stale name woke the record's next thread"];
 
+/// What the move models report when a wake-up trusts a location it did not read again under the
+/// lock: the wake-up lost ("deadlock"), or, since TASKS item 96's record check, the slot it reaches
+/// found to hold another record or none, which enters pinned mode (ADR-0020 S20, trigger 3) and,
+/// in these models, which plant no inconsistency, fails as one.
+const LOST_OR_PINNED: &[&str] = &["deadlock", "a wake-up met an inconsistency"];
+
 /// What `threads_a_misplaced_location_wakes_only_its_thread` reports (TASKS item 96): a wake-up by
 /// a misplaced location woke the thread the slot holds.
 const MISPLACED_WOKE: &[&str] = &["a misplaced location woke the slot's other thread"];
@@ -482,8 +488,8 @@ const CONTROLS: &[Control] = &[
         to: "            let _ = now;
 ",
         models: &[
-            ("threads_a_wake_follows_a_move", DEADLOCK),
-            ("threads_a_timed_wake_follows_a_move", DEADLOCK),
+            ("threads_a_wake_follows_a_move", LOST_OR_PINNED),
+            ("threads_a_timed_wake_follows_a_move", LOST_OR_PINNED),
         ],
     },
     Control {

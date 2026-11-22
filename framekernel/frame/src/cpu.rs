@@ -952,7 +952,7 @@ pub fn move_context(
         destination,
         frame,
         crate::stack::same_slot,
-        |home| between(home),
+        between,
     ))
 }
 
