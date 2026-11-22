@@ -920,6 +920,11 @@ impl MoveWitness for KernelOff {
 /// its processor still runs on is refused as `NotYet`, not taken for a lost one (ADR-0020 S5's
 /// dated note; the ruling's Q2). The caller cannot pass another.
 ///
+/// If `from` is the processor the mover runs on, its own leaving frame is published first (the
+/// contract's §1.1, step 6): the mover runs on its own stack, so this processor has left the stack
+/// of the context it last switched out, and a thread switched out here just before the mover ran
+/// is lendable at once, as `stack_in_use` publishes it.
+///
 /// `None` if either processor has no table; a refusal otherwise says why nothing moved.
 pub fn move_context<R>(
     off: crate::trap::InterruptsOff<'_>,
@@ -930,6 +935,9 @@ pub fn move_context<R>(
 ) -> Option<Result<(u64, R), MoveRefused>> {
     let source = CONTEXTS.get(from.get())?;
     let destination = CONTEXTS.get(to.get())?;
+    if this_cpu(off.here()).index() == from {
+        source.publish_leaving();
+    }
     Some(MOVES.relocate(
         off,
         source,

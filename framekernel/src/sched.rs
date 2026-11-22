@@ -1108,6 +1108,223 @@ fn followed(record: &Record<threads::State>, retries: u32, here: origin_frame::t
     }
 }
 
+/// Why [`migrate`] moved nothing (TASKS item 96; the contract's §1.1 and §1.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unmoved {
+    /// The thread is on the destination already.
+    AlreadyThere,
+    /// Its record's location is clear: it has exited, or was never queued.
+    Gone,
+    /// The record holds another thread: the name's has been reaped.
+    Stale,
+    /// Moves are withdrawn (pinned mode), or the thread may not move: not declared movable, or its
+    /// pin count is above 0 (ADR-0020 S2, S20).
+    Pinned,
+    /// It is running, asleep, blocked or exiting: only a ready thread that is not running moves
+    /// (the review of TASKS item 95, R95-5).
+    NotReady,
+    /// A processor does not take part in moves: not online, or its FPU format differs (ADR-0020
+    /// S6, N9).
+    FpuFormat,
+    /// The destination's run queue has no free slot (N13).
+    QueueFull,
+    /// The destination's table of contexts had no free slot: the frame went back to its source.
+    TableFull,
+    /// Its frame is still being switched out (`NotYet` or `Leaving`; ADR-0020 S5): try later.
+    TryLater,
+    /// Its location changed at each of `WAKE_TRIES` looks, another mover moving it: try later.
+    Moving,
+    /// An inconsistency (ADR-0020 S20, triggers 2 and 3): pinned mode was entered, and the thread
+    /// stays where it is.
+    Inconsistent,
+}
+
+/// What a [`migrate`] did, for the proofs' counts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Moved {
+    /// Whether the thread carried a pending wake-up (N1).
+    pub(crate) carried_wake: bool,
+    /// The move's critical section in TSC ticks, from before its first queue lock to after its
+    /// last unlock (B20, a hypothesis of 2 µs; measured by the integrity proof).
+    pub(crate) ticks: u64,
+}
+
+/// Moves `thread` to processor `to` (ADR-0020 S6; TASKS item 96): a movable thread, ready and not
+/// running, whose pin count is 0, between two processors that take part in moves (`online`).
+///
+/// **The order** (S6; the contract's §1.1), in one interrupts-off section whose token the move gate
+/// requires: the location read; both queue locks, in index order; the location read again (a move
+/// in between is followed, at most `WAKE_TRIES` times); pinned mode checked under the source's
+/// lock; eligibility; the gate (`cpu::move_context`), under which the frame is lent from the
+/// source's table of contexts, adopted by the destination's, the thread departs its source queue
+/// with its lag and pending wake-up, arrives at the destination's, and its location follows, and
+/// the source forgets the home; the locks released; one reschedule IPI to a destination that is
+/// not this processor (the ruling's Q11). Under the gate it takes no lock and drops no stack.
+///
+/// **Why the reads under the source's lock suffice** (the review of TASKS item 93, R93-7): the pin
+/// count and the movable flag are written only by the running thread and by its spawner before its
+/// first push, and the mover acts only on a thread ready and not running under that lock, whose
+/// last write came before the switch-out its scheduler made under the same lock.
+///
+/// **Pacing** (S1, S10; the coordinating session's rulings Q13 and Q18): a caller moves a thread at
+/// most once per tick of the processor it runs on. S1's bound of 64 follows on a wake-up rests on
+/// that rate: paced, a wake-up follows at most one move, about 2.5 µs with interrupts off; a
+/// caller that broke the rule could make one follow 64, about 160 µs, over B18's 50 µs. TASKS item
+/// 96 gives `migrate` no rate of its own; its only callers, the migration proofs, pace themselves.
+///
+/// An inconsistency met (S20, triggers 2 and 3) enters pinned mode, and its line is printed after
+/// the section; `NotRestored`, a frame that could not be put back, stops the kernel (the ruling's
+/// Q7: two processors could have run one context). Called from thread context or the boot flow,
+/// with interrupts on.
+pub(crate) fn migrate(
+    thread: ThreadRef,
+    to: CpuIndex,
+    online: &crate::smp::Online,
+) -> Result<Moved, Unmoved> {
+    let Some(record) = threads::record(thread.record) else {
+        return Err(Unmoved::Gone);
+    };
+    let (result, owed) = cpu::without_interrupts_off(|off| {
+        let mut owed = None;
+        let mut result = Err(Unmoved::Moving);
+        for _ in 0..origin_frame::sync::threads::WAKE_TRIES {
+            match move_once(off, record, thread, to, online, &mut owed) {
+                Err(Unmoved::Moving) => {}
+                done => {
+                    result = done;
+                    break;
+                }
+            }
+        }
+        if result.is_ok() {
+            let me = cpu::this_cpu(off.here());
+            if to != me.index()
+                && let Some(apic_id) = to.apic_id()
+            {
+                timer::send_reschedule_ipi(me, apic_id);
+            }
+        }
+        (result, owed)
+    });
+    if let Some((trigger, on)) = owed {
+        pinned::line(trigger, on, "; the thread stays where it is");
+    }
+    result
+}
+
+/// One try of [`migrate`]: `Moving` if the location changed between its read and the locks.
+fn move_once(
+    off: origin_frame::trap::InterruptsOff<'_>,
+    record: &'static Record<threads::State>,
+    thread: ThreadRef,
+    to: CpuIndex,
+    online: &crate::smp::Online,
+    owed: &mut Option<(pinned::Trigger, CpuIndex)>,
+) -> Result<Moved, Unmoved> {
+    use origin_frame::sync::contexts::{AdoptRefused, LendRefused, MoveRefused};
+
+    let me = cpu::this_cpu(off.here()).index();
+    let mut enter = |trigger| {
+        if pinned::enter(trigger, me) {
+            *owed = Some((trigger, me));
+        }
+        Err(Unmoved::Inconsistent)
+    };
+    let at = record.location().ok_or(Unmoved::Gone)?;
+    let from = usize::try_from(at.cpu())
+        .ok()
+        .and_then(CpuIndex::new)
+        .ok_or(Unmoved::Gone)?;
+    if from == to {
+        return Err(Unmoved::AlreadyThere);
+    }
+    let to_index = u32::try_from(to.get()).map_err(|_| Unmoved::Gone)?;
+    let (source_queue, destination_queue) = (
+        QUEUES.get(from.get()).ok_or(Unmoved::Gone)?,
+        QUEUES.get(to.get()).ok_or(Unmoved::Gone)?,
+    );
+    let start = rdtsc();
+    // Both queue locks, in index order (`origin_sync::threads`, "Locks").
+    let (mut low, mut high) = if from.get() < to.get() {
+        (source_queue.lock(), destination_queue.lock())
+    } else {
+        (destination_queue.lock(), source_queue.lock())
+    };
+    let (source, destination) = if from.get() < to.get() {
+        (&mut *low, &mut *high)
+    } else {
+        (&mut *high, &mut *low)
+    };
+    if record.location() != Some(at) {
+        return Err(Unmoved::Moving);
+    }
+    if record.generation() != thread.generation {
+        return Err(Unmoved::Stale);
+    }
+    // Under the source's lock (S20; the contract's §1.1, step 4).
+    if pinned::withdrawn() {
+        return Err(Unmoved::Pinned);
+    }
+    let slot = usize::from(at.slot());
+    // (a) The slot holds this thread: otherwise S20's trigger 3.
+    if source.record(slot).map(Placed::number) != Some(thread.record) {
+        return enter(pinned::Trigger::Misplaced);
+    }
+    // (b) Ready and not running (R95-5): its frame, which the source's scheduler cannot have named.
+    let Some(frame) = source.frame(slot) else {
+        return Err(Unmoved::NotReady);
+    };
+    // (c) Declared movable, and not pinned (S2; R93-7).
+    if !record.movable() || record.pins() != 0 {
+        return Err(Unmoved::Pinned);
+    }
+    // (d) Both processors take part (N9).
+    if !(online.takes_part_in_moves(from) && online.takes_part_in_moves(to)) {
+        return Err(Unmoved::FpuFormat);
+    }
+    // (e) The destination has room (N13), so `arrive` cannot be refused once the frame is adopted.
+    if !destination.has_room() {
+        return Err(Unmoved::QueueFull);
+    }
+    let moved = cpu::move_context(off, from, to, frame, |_home| {
+        // Under both queue locks and the gate: nothing has changed since the checks above.
+        let Some(departed) = source.depart(slot) else {
+            panic!("a thread checked ready under its queue's lock could not depart");
+        };
+        let carried = departed.wake_pending();
+        let Ok(arrived) = destination.arrive(departed) else {
+            panic!("a thread could not arrive at a queue checked to have room");
+        };
+        let Ok(arrived) = u16::try_from(arrived) else {
+            panic!("a run-queue slot past a location's 16 bits");
+        };
+        record.set_location(Location::new(to_index, arrived));
+        carried
+    });
+    drop((low, high));
+    let ticks = rdtsc().saturating_sub(start);
+    match moved {
+        Some(Ok((_, carried_wake))) => Ok(Moved {
+            carried_wake,
+            ticks,
+        }),
+        Some(Err(MoveRefused::Lend(LendRefused::NotYet | LendRefused::Leaving))) => {
+            Err(Unmoved::TryLater)
+        }
+        Some(Err(MoveRefused::Adopt(AdoptRefused::Full))) => Err(Unmoved::TableFull),
+        // ADR-0020 S20, trigger 2: its checks found the frame published, and `lend` did not.
+        Some(Err(
+            MoveRefused::Lend(LendRefused::NotHere | LendRefused::BootFlow)
+            | MoveRefused::Adopt(AdoptRefused::SameTable),
+        ))
+        | None => enter(pinned::Trigger::LendLost),
+        // The ruling's Q7: the frame is in no table, and two processors could have run it.
+        Some(Err(MoveRefused::NotRestored)) => {
+            panic!("a lent frame could not be put back in its source's table")
+        }
+    }
+}
+
 /// `EXIT_VECTOR`: the running thread ends. Its record, holding its stack, becomes a zombie, which
 /// [`reap`] empties and gives back later on this processor.
 pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
@@ -1243,6 +1460,25 @@ pub(crate) fn spawn_user(
     )
 }
 
+/// As [`spawn`], declaring the thread movable (ADR-0020 S2, point 1; TASKS item 96, the coordinating
+/// session's ruling Q3): [`migrate`] may move it, while its pin count is 0. Nothing else declares a
+/// thread movable: in TASKS item 96 only the migration proofs' threads are.
+pub(crate) fn spawn_movable(
+    cpu: CpuIndex,
+    entry: extern "sysv64" fn(u64) -> !,
+    arg: u64,
+) -> Result<usize, QueueError> {
+    spawn_with_parts(
+        cpu,
+        ThreadStart::Kernel { entry, arg },
+        crate::runqueue::DEFAULT_WEIGHT,
+        None,
+        true,
+        FpuArea::new,
+        GuardedStack::publish_first_frame,
+    )
+}
+
 /// As [`spawn`], with a scheduling weight (stride scheduling: the thread's share of its
 /// processor is its share of the weights there).
 pub(crate) fn spawn_weighted(
@@ -1265,6 +1501,7 @@ fn spawn_with(
         start,
         weight,
         user,
+        false,
         FpuArea::new,
         GuardedStack::publish_first_frame,
     )
@@ -1295,6 +1532,7 @@ fn spawn_with_parts(
     start: ThreadStart,
     weight: u32,
     user: Option<ObjectRef<UserContext>>,
+    movable: bool,
     fpu_area: impl FnOnce() -> Option<FpuArea>,
     publish: impl FnOnce(&mut GuardedStack, CpuIndex) -> bool,
 ) -> Result<usize, QueueError> {
@@ -1319,6 +1557,10 @@ fn spawn_with_parts(
         let mut queue = queue.lock();
         // Resolved once, here, for the slot to hold (`threads::Placed`).
         let placed = threads::take(cpu).ok_or(QueueError::Full)?;
+        // Before the push, while no thread runs on the record (`origin_sync::threads`, "Movable").
+        if movable {
+            placed.record().set_movable();
+        }
         let slot = match queue.push_weighted(frame_at, weight, Some(placed)) {
             Ok(slot) => slot,
             Err(refused) => {
@@ -2011,6 +2253,7 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         quitting(),
         crate::runqueue::DEFAULT_WEIGHT,
         None,
+        false,
         || None,
         GuardedStack::publish_first_frame,
     );
@@ -2022,6 +2265,7 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         quitting(),
         crate::runqueue::DEFAULT_WEIGHT,
         None,
+        false,
         FpuArea::new,
         |stack, _| {
             unpublished_slot.set(Some(stack.slot()));
@@ -2047,6 +2291,7 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         quitting(),
         crate::runqueue::DEFAULT_WEIGHT,
         None,
+        false,
         FpuArea::new,
         |stack, cpu| {
             full_slot.set(Some(stack.slot()));
