@@ -293,6 +293,24 @@ fn bench_bisect_entries() -> Vec<String> {
     )
 }
 
+/// [`image_config`] and, for the UEFI target only, `--cfg origin_bench` and `--cfg
+/// origin_bench_kernel`: the bench loader's kernel-entry mode (ADR-0002 Amendment 7; TASKS item
+/// 133). Only `bench::build_kernel_loader` and the bench Clippy run use it, into
+/// `target/bench-kernel`; the kernel it is staged with, and enters, is the bench kernel.
+pub(crate) fn bench_kernel_config() -> Result<Vec<String>> {
+    let mut config = image_config()?;
+    config.extend(bench_kernel_entries());
+    Ok(config)
+}
+
+/// The kernel-entry mode's own entries.
+fn bench_kernel_entries() -> Vec<String> {
+    entries_for(
+        &[UEFI_TARGET],
+        r#"["--cfg","origin_bench","--cfg","origin_bench_kernel"]"#,
+    )
+}
+
 /// [`image_config`] and, for the UEFI target only, the stack-measurement build of the loader
 /// (TASKS item 127): `--cfg origin_stack_measure`, with `bench` `--cfg origin_bench` too, and a
 /// link map written to `map` for the static chain. Only `stack_depth::build_loader` and its Clippy
@@ -541,6 +559,16 @@ mod tests {
                 "--config",
                 &format!(
                     r#"target.{UEFI_TARGET}.rustflags=["--cfg","origin_bench","--cfg","origin_bench_bisect"]"#
+                ),
+            ]
+        );
+        // TASKS item 133: the kernel-entry mode, the same way.
+        assert_eq!(
+            bench_kernel_entries(),
+            [
+                "--config",
+                &format!(
+                    r#"target.{UEFI_TARGET}.rustflags=["--cfg","origin_bench","--cfg","origin_bench_kernel"]"#
                 ),
             ]
         );

@@ -600,6 +600,46 @@ class Guards(unittest.TestCase):
         # Three runs' work in the window: the control's, the call's and the next run's.
         self.assertAlmostEqual(self.lat.window_s(fig) - self.lat.window_s(dict(fig, work=0.0)), 60.0)
 
+    def test_a_kernel_entry_images_calls_read_returned_reset_or_hang(self):
+        # TASKS item 133, ruling Q5: the kernel-entry mode resets nothing, so a line after X is the
+        # call returning (R), the firmware starting again is its exit shutting down (S), and
+        # silence is a hang.
+        lat, banner = self.lat, self.BANNER
+        loader = banner + (b"origin-boot: bench build: kernel: the kernel-entry mode (TASKS item 133, ADR-0002 Amendment 7)\r\n"
+                           b"origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered\r\n"
+                           b"origin-boot: bench build: kernel: BENCH-AFTER's value is ignored: this mode enters the kernel after a successful call, and halts after two failed calls\r\n"
+                           b"origin-boot: exiting boot services; entering the Framekernel\r\nX\r\n")
+        returned = (b"origin-boot: bench build: boot services exited on the first call\r\n"
+                    b"origin-boot: bench build: after ExitBootServices (first call EFI_SUCCESS) the UART read IER 0x00\r\n")
+        kernel = b"RS12345678\r\norigin-kernel: console: framebuffer 1024x768\r\n"
+        raw, times = self.pieces((50.0, loader), (50.1, returned), (50.2, kernel))
+        run = lat.read_runs(raw, times, [0.0], 400.0)[0]
+        self.assertEqual((run["branch"], run["answer"], run["kernel"]), ("call", "returned", True))
+        self.assertIn("then the loader's line that the call returned; the kernel's lines followed",
+                      lat.describe(run))
+        self.assertIn("returned after 1 (the loader's line after the mark; the kernel's lines after 1)",
+                      lat.runs_summary([run]))
+        # Returned, and then nothing from the kernel: still R, and the record says no kernel line.
+        raw, times = self.pieces((50.0, loader), (50.1, returned))
+        run = lat.read_runs(raw, times, [0.0], 400.0)[0]
+        self.assertEqual((run["answer"], run["kernel"]), ("returned", False))
+        self.assertIn("no kernel line followed", lat.describe(run))
+        # S: X, then the firmware again with no line of the loader's.
+        raw, times = self.pieces((50.0, loader), (55.5, self.FIRMWARE))
+        run = lat.read_runs(raw, times, [0.0], 400.0)[0]
+        self.assertEqual((run["answer"], run["after_s"]), ("reset", 5.5))
+        # A hang: X, then nothing past the hang's wait.
+        raw, times = self.pieces((50.0, loader))
+        run = lat.read_runs(raw, times, [0.0], 400.0)[0]
+        self.assertEqual(run["answer"], "none")
+        # The image's kind, and its boots read for breadcrumbs, never as a reset image's.
+        text = lat.clean((loader + returned + kernel).decode())
+        self.assertFalse(lat.resets_after_call(text))
+        self.assertEqual(lat.breadcrumbs(text), "RS12345678")
+        image = self.home / "kernel-entry.efi"
+        image.write_bytes(b"MZ" + lat.KERNEL_BUILD_LINE.encode())
+        self.assertIn("kernel-entry bench loader", lat.loader_kind(image))
+
     def test_a_retrys_marks_are_the_runs_own(self):
         # R130-1: X, then Y a second later when the first call fails, belong to the run; the
         # answer is measured from the last mark, and the Y is never the firmware.

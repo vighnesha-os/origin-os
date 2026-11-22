@@ -1089,6 +1089,12 @@ MINIMAL_LAST_LINE = b"ExitBootServices next, through the live boot services tabl
 # with the minimal mode's resets; its text, and its last line before the call.
 BISECT_BUILD_LINE = "bench build: bisect"
 BISECT_LAST_LINE = b"ExitBootServices next, through the loader's copy of the boot services table"
+# TASKS item 133 (ADR-0002 Amendment 7): the kernel-entry bench loader, the full loader's work with
+# the bench kernel entered after a successful call and no reset at all. It reads BENCH-AFTER and
+# ignores it, so its text, not "BENCH-AFTER", says what it is. A bench loader writes RETURNED_LINE
+# straight to the UART only once ExitBootServices has returned EFI_SUCCESS (`bench::Exited`).
+KERNEL_BUILD_LINE = "bench build: kernel"
+RETURNED_LINE = b"origin-boot: bench build: boot services exited"
 LOADER_START = "UEFI loader (build"
 TIMES_FILE = "sol-times.log"
 # How many boots a rental B makes and how long each may take, unless the command line says.
@@ -1306,6 +1312,8 @@ def read_runs(raw, times, restarts=(), until=None, events=""):
         text = raw[at:end]
         cause = PMXC0.search(text)
         called = bool(marks) or any(line in text for line in CALL_LINES)
+        # TASKS item 133: the loader's own line after the call says it returned (reading R).
+        returned = called and RETURNED_LINE in text
         nxt = firmware_after(raw, end, None, mask)
         runs.append({"banner": arrival(times, at), "pmxc0": cause.group(1).decode() if cause else None,
                      "branch": "call" if called else "control" if CONTROL_TEXT in text else "other",
@@ -1314,7 +1322,8 @@ def read_runs(raw, times, restarts=(), until=None, events=""):
                      "unsampled": nxt is not None and arrival(times, nxt) is None,
                      "opening": b"" if nxt is None else raw[nxt:nxt + OPENING_BYTES],
                      "sample": b"" if nxt is None else raw[nxt:nxt + 120],
-                     "cut_short": i + 1 == len(banners) and not called and CONTROL_TEXT not in text})
+                     "cut_short": i + 1 == len(banners) and not called and CONTROL_TEXT not in text,
+                     "returned": returned, "kernel": KERNEL_LINE.encode() in raw[end:stop]})
     # Where each run's firmware began: after the previous run's reset, or after a restart of the
     # tool's that came between that reset and this banner, early enough to have started it.
     for i, run in enumerate(runs):
@@ -1347,6 +1356,11 @@ def read_runs(raw, times, restarts=(), until=None, events=""):
     opening = openings.pop() if len(openings) == 1 else None
     for run, first in zip(runs, firsts):
         end = run["end"]
+        if run["returned"]:
+            # The loader's line after the call: the call returned, whatever followed (TASKS item
+            # 133's ruling Q5: a line after X is R).
+            run["answer"] = "returned"
+            continue
         if end is None or run["unsampled"] or (run["cut_short"] and (until is None or until - end < hang)):
             run["answer"] = "pending"
             continue
@@ -1411,6 +1425,9 @@ def describe(run):
             "other": f"a run with neither control nor call{seen}"}[run["branch"]]
     after = f"its {run['end_kind']}"
     answer = run["answer"]
+    if answer == "returned":
+        return (f"{what}, then the loader's line that the call returned"
+                + ("; the kernel's lines followed" if run["kernel"] else "; no kernel line followed"))
     if answer == "reset":
         return f"{what}, then the firmware again {plain(run['after_s'])} s after {after}"
     if answer == "other":
@@ -1442,8 +1459,12 @@ def runs_summary(runs):
     calls = [r for r in runs if r["branch"] == "call"]
     count = lambda answer: sum(r["answer"] == answer for r in calls)
     reset = [r["after_s"] for r in calls if r["answer"] == "reset"]
-    judged = sum(count(a) for a in ("reset", "none", "other"))
-    out = [f"calls: {len(calls)}: of the {judged} judged, a reset after {len(reset)}"
+    judged = sum(count(a) for a in ("returned", "reset", "none", "other"))
+    kernel = sum(r["answer"] == "returned" and r["kernel"] for r in calls)
+    out = [f"calls: {len(calls)}: of the {judged} judged, "
+           + (f"returned after {count('returned')} (the loader's line after the mark; the kernel's "
+              f"lines after {kernel}), " if count("returned") else "")
+           + f"a reset after {len(reset)}"
            + (f", {spread(reset)} after the mark" if reset else "")
            + (f", nothing after {count('none')}" if count("none") else "")
            + (f", other output after {count('other')}" if count("other") else "")]
@@ -1488,7 +1509,10 @@ def resets_after_call(text):
     """Whether one boot's console text is a bench loader's that resets the machine after the call,
     instead of entering the kernel: TASKS item 116's (it says whether BENCH-AFTER is there), the
     minimal mode's (TASKS item 128) or the bisection mode's (TASKS item 131, which reads
-    BENCH-AFTER and ignores it)."""
+    BENCH-AFTER and ignores it). Never the kernel-entry mode's (TASKS item 133), which reads
+    BENCH-AFTER too but enters the kernel after a successful call and resets nothing."""
+    if KERNEL_BUILD_LINE in text:
+        return False
     return RESET_BUILD_LINE in text or MINIMAL_BUILD_LINE in text or BISECT_BUILD_LINE in text
 
 
@@ -1712,8 +1736,10 @@ def cmd_rental_b(args):
                 result.update(boot=boot, start=start, end=console.size(), restarted_at=restarts[-1])
                 # TASKS item 130: every bench image that resets after its call is read from the
                 # firmware's starts; only the minimal and bisection modes' boots end at their
-                # answer.
-                if minimal or resets_after_call(console.text(start)):
+                # answer. TASKS item 133: so is the kernel-entry mode's, whose calls read as
+                # returned, reset (the firmware's exit shutting down) or a hang.
+                text = console.text(start)
+                if minimal or resets_after_call(text) or KERNEL_BUILD_LINE in text:
                     runs = reading()
                     mine = runs[first_run(runs, restarts[-1]):]
                     result["runs"] = mine
@@ -1738,6 +1764,9 @@ def loader_kind(path):
     """What the image directory's loader is: a bench build's says so in its own bytes (TASKS
     items 112 and 116, F2's text)."""
     data = Path(path).read_bytes() if Path(path).exists() else b""
+    if KERNEL_BUILD_LINE.encode() in data:
+        return ("the kernel-entry bench loader (ADR-0002 Amendment 7; developer-mode, the TEST "
+                "trust store; never signed or shipped)")
     if BISECT_BUILD_LINE.encode() in data:
         return ("the bisection-mode bench loader (ADR-0002 Amendment 6; developer-mode, the TEST "
                 "trust store; never signed or shipped)")
