@@ -44,6 +44,14 @@
 //! An interrupt or IPI that may have woken a thread goes through
 //! [`RunQueue::preempt_for_wake`]: it charges nothing, and switches only if a thread woken
 //! since the last choice should run now.
+//!
+//! A thread moves between two processors' queues (ADR-0020 S6; TASKS item 96) by
+//! [`RunQueue::depart`] from its source and [`RunQueue::arrive`] at its destination, under both
+//! queues' locks. What passes is its saved frame, its weight, a pending wake-up and its record,
+//! and its **lag**: how far its pass lies above its source's floor. It arrives at its
+//! destination's floor plus that lag, so a move gives it no credit and takes none from it, as
+//! "sleeping earns no credit" does. Only a ready thread that is not running moves: the source's
+//! scheduler then cannot have named its frame (the review of TASKS item 95, R95-5).
 
 /// Contexts one queue holds, its boot context included.
 pub const CAPACITY: usize = 16;
@@ -433,6 +441,43 @@ impl Default for RunQueue {
     }
 }
 
+/// A thread taken out of its source queue by [`RunQueue::depart`], to be given to its
+/// destination's [`RunQueue::arrive`] (ADR-0020 S6; TASKS item 96). It is in no queue until it
+/// arrives. Its `Debug` writes its name alone: its frame is an address in the kernel stacks'
+/// region, which nothing prints (ADR-0004 Amendment 2, A6).
+#[must_use = "a departed thread is in no queue until it arrives"]
+pub struct Departed<R> {
+    frame: u64,
+    weight: u32,
+    wake_pending: bool,
+    lag: u64,
+    record: Option<R>,
+}
+
+impl<R> core::fmt::Debug for Departed<R> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Departed")
+    }
+}
+
+impl<R: Copy> Departed<R> {
+    /// Whether it carries a wake-up that came before it blocked (N1): its next block on its
+    /// destination returns at once.
+    pub const fn wake_pending(&self) -> bool {
+        self.wake_pending
+    }
+
+    /// How far its pass lay above its source's floor when it departed.
+    pub const fn lag(&self) -> u64 {
+        self.lag
+    }
+
+    /// The record its slot held.
+    pub const fn record(&self) -> Option<R> {
+        self.record
+    }
+}
+
 impl RunQueue {
     /// A queue holding only the running (boot) context, its slots holding record numbers.
     pub const fn new() -> Self {
@@ -607,7 +652,7 @@ impl<R: Copy> RunQueue<R> {
 
     /// Whether `slot`'s thread holds a wake-up that came before it blocked, which its next
     /// [`RunQueue::block`] consumes. Read only: a thread that leaves this queue for another
-    /// carries it (ADR-0020 S6), as the Loom models' stand-in for a move does.
+    /// carries it ([`RunQueue::depart`], ADR-0020 S6).
     pub fn wake_pending(&self, slot: usize) -> bool {
         self.wake_pending.get(slot).copied().unwrap_or(false)
     }
@@ -810,6 +855,87 @@ impl<R: Copy> RunQueue<R> {
             *r = None;
         }
         Ok(self.switch(interrupted, false))
+    }
+
+    /// The saved frame of the thread in `slot`, if that thread may move: it is ready and not the
+    /// running one, and not slot 0 (ADR-0020 S6, R95-5). A mover reads it under this queue's
+    /// lock, to lend that frame from the processor's table of contexts.
+    pub fn frame(&self, slot: usize) -> Option<u64> {
+        if slot == 0 || slot == self.current || self.state.get(slot) != Some(&State::Ready) {
+            return None;
+        }
+        self.saved.get(slot).copied()
+    }
+
+    /// Whether a thread could arrive here: a slot is free (N13). A mover asks under this queue's
+    /// lock, before it takes anything, so that [`RunQueue::arrive`] cannot then be refused.
+    pub fn has_room(&self) -> bool {
+        (1..CAPACITY).any(|i| self.state.get(i) == Some(&State::Free))
+    }
+
+    /// Takes the thread in `slot` out of this queue, for another's [`RunQueue::arrive`] (ADR-0020
+    /// S6; TASKS item 96). Only a thread [`RunQueue::frame`] answers for: ready, not running, not
+    /// slot 0. `None`, and nothing changed, for any other: the running one, a sleeper, a blocked
+    /// thread, a free slot, slot 0.
+    ///
+    /// Its lag is its pass less this queue's floor, the lowest pass among the ready contexts, its
+    /// own included: at least 0. Its slot is freed, with no record, its pending wake-up and its
+    /// woken mark cleared, so [`RunQueue::preempt_for_wake`] never names it. The caller moves the
+    /// record's location in the same critical section (the module documentation).
+    pub fn depart(&mut self, slot: usize) -> Option<Departed<R>> {
+        let frame = self.frame(slot)?;
+        let floor = self.floor();
+        let departed = Departed {
+            frame,
+            weight: self.weight(slot),
+            wake_pending: self.wake_pending(slot),
+            lag: self.pass.get(slot).copied()?.saturating_sub(floor),
+            record: self.record(slot),
+        };
+        if let Some(s) = self.state.get_mut(slot) {
+            *s = State::Free;
+        }
+        if let Some(r) = self.record.get_mut(slot) {
+            *r = None;
+        }
+        if let Some(w) = self.woken.get_mut(slot) {
+            *w = false;
+        }
+        if let Some(p) = self.wake_pending.get_mut(slot) {
+            *p = false;
+        }
+        Some(departed)
+    }
+
+    /// Places a thread that departed from another queue in the lowest free slot here, ready
+    /// (ADR-0020 S6; TASKS item 96), and returns the slot. As a push, it gets a new generation and
+    /// keeps its weight and record; it also keeps its pending wake-up, which its next block
+    /// consumes (N1). Its pass is this queue's floor, read before it joins, plus its lag: no
+    /// credit, no loss. It is marked woken, so a reschedule IPI to this processor runs it now if
+    /// [`RunQueue::preempt_for_wake`] would run a thread woken here (the coordinating session's
+    /// ruling Q11).
+    ///
+    /// [`QueueError::Full`] if no slot is free, and the thread is dropped with its `Departed`: a
+    /// mover asks [`RunQueue::has_room`] under this queue's lock first, so it never meets that.
+    pub fn arrive(&mut self, departed: Departed<R>) -> Result<usize, QueueError> {
+        let Departed {
+            frame,
+            weight,
+            wake_pending,
+            lag,
+            record,
+        } = departed;
+        let slot = self.push_weighted(frame, weight, record)?;
+        if let Some(p) = self.pass.get_mut(slot) {
+            *p = p.saturating_add(lag);
+        }
+        if let Some(p) = self.wake_pending.get_mut(slot) {
+            *p = wake_pending;
+        }
+        if let Some(w) = self.woken.get_mut(slot) {
+            *w = true;
+        }
+        Ok(slot)
     }
 }
 
@@ -1656,5 +1782,562 @@ mod tests {
         assert_eq!(q.block(0x1000), Ok(0x1000), "the block returns at once");
         assert!(!q.wake_pending(slot));
         assert!(!q.wake_pending(0) && !q.wake_pending(CAPACITY));
+    }
+
+    /// A queue whose slot 1 holds a thread that is ready and not running, after `ticks` of its
+    /// own and the boot context's: with equal weights its pass is then level with or above the
+    /// floor. Returns the queue and the thread's frame.
+    fn one_ready(record: u32) -> (RunQueue, u64) {
+        let mut q = RunQueue::new();
+        assert_eq!(q.push_weighted(0xA000, DEFAULT_WEIGHT, Some(record)), Ok(1));
+        assert_eq!(q.tick(0x1000), 0xA000);
+        assert_eq!(q.tick(0xA100), 0x1000, "slot 1 is ready and not running");
+        (q, 0xA100)
+    }
+
+    /// Only a ready thread that is not running moves (ADR-0020 S6, R95-5): `frame` and `depart`
+    /// answer nothing, and change nothing, for slot 0, the running slot, a sleeper, a blocked
+    /// thread, a free slot and a slot past the end.
+    #[test]
+    fn depart_takes_only_a_ready_thread_that_is_not_running() {
+        let mut q = RunQueue::new();
+        let sleeper = q.push(0xA000).unwrap();
+        let blocked = q.push(0xB000).unwrap();
+        let running = q.push(0xC000).unwrap();
+        assert_eq!(q.tick(0x1000), 0xA000);
+        assert_eq!(q.sleep(0xA100, 5), Ok(0xB000));
+        assert_eq!(q.block(0xB100), Ok(0xC000));
+        assert_eq!(q.current(), running);
+        let before = q;
+        for slot in [0, running, sleeper, blocked, 9, CAPACITY] {
+            assert_eq!(q.frame(slot), None, "slot {slot}");
+            assert!(q.depart(slot).is_none(), "slot {slot}");
+        }
+        assert_eq!(q, before, "nothing changed");
+        // The boot context, ready and not running, is still slot 0: it never moves.
+        assert_eq!(q.frame(0), None);
+    }
+
+    /// A move keeps the lag, at 0 and above, and the arrival is never below the destination's
+    /// floor: no credit, no loss (ADR-0020 S6).
+    #[test]
+    fn a_move_keeps_the_lag_and_arrives_at_the_destination_s_floor() {
+        // Lag 0: slot 1 is level with the boot context.
+        let (mut source, frame) = one_ready(7);
+        assert_eq!(source.pass[1], source.pass[0]);
+        assert_eq!(source.frame(1), Some(frame));
+        let departed = source.depart(1).unwrap();
+        assert_eq!((departed.lag(), departed.record()), (0, Some(7)));
+        assert_eq!(source.live(), 1);
+        assert_eq!(source.record(1), None);
+        let mut destination = RunQueue::new();
+        for _ in 0..40 {
+            assert_eq!(destination.tick(0x2000), 0x2000);
+        }
+        let floor = destination.floor();
+        assert!(floor > source.pass[0], "the destination's floor is higher");
+        let slot = destination.arrive(departed).unwrap();
+        assert_eq!(destination.pass[slot], floor, "at the floor, with lag 0");
+        assert_eq!(destination.record(slot), Some(7));
+        assert_eq!(destination.generation(slot), 1);
+        assert_eq!(destination.saved[slot], frame);
+
+        // Lag above 0: the boot context's stride is tiny, so after one quantum each, slot 1's
+        // pass lies above it by the difference of the two strides.
+        let mut source = RunQueue::new();
+        source.set_weight(0, MAX_WEIGHT);
+        source
+            .push_weighted(0xA000, DEFAULT_WEIGHT, Some(8))
+            .unwrap();
+        assert_eq!(source.tick(0x1000), 0xA000);
+        assert_eq!(source.tick(0xA100), 0x1000);
+        assert_eq!(source.floor(), source.pass[0]);
+        let lag = STRIDE_ONE / u64::from(DEFAULT_WEIGHT) - STRIDE_ONE / u64::from(MAX_WEIGHT);
+        assert_eq!(source.pass[1] - source.floor(), lag);
+        let departed = source.depart(1).unwrap();
+        assert_eq!(departed.lag(), lag);
+        let mut destination = RunQueue::new();
+        destination.push(0xC000).unwrap();
+        let floor = destination.floor();
+        let slot = destination.arrive(departed).unwrap();
+        assert_eq!(destination.pass[slot], floor + lag);
+        assert!(destination.pass[slot] >= destination.floor());
+    }
+
+    /// A pending wake-up travels with its thread and is consumed by its next block there (N1);
+    /// the source keeps none.
+    #[test]
+    fn a_pending_wake_up_is_carried_and_consumed_by_the_next_block() {
+        let (mut source, frame) = one_ready(3);
+        assert!(!source.wake(1, source.generation(1)), "ready: kept");
+        assert!(source.wake_pending(1));
+        let departed = source.depart(1).unwrap();
+        assert!(departed.wake_pending());
+        assert!(!source.wake_pending(1), "the source keeps none");
+        let mut destination = RunQueue::new();
+        let slot = destination.arrive(departed).unwrap();
+        assert!(destination.wake_pending(slot));
+        assert_eq!(destination.tick(0x2000), frame, "it runs there");
+        assert_eq!(
+            destination.block(frame - 0x100),
+            Ok(frame - 0x100),
+            "consumed: no block"
+        );
+        assert!(!destination.wake_pending(slot));
+        assert_eq!(
+            destination.block(frame - 0x200),
+            Ok(0x2000),
+            "the next block blocks"
+        );
+    }
+
+    /// A departed slot is no longer woken, so the source's `preempt_for_wake` never names it; an
+    /// arrival is woken, so the destination's does (the coordinating session's ruling Q11).
+    #[test]
+    fn a_departure_clears_its_woken_mark_and_an_arrival_sets_one() {
+        let mut source = RunQueue::new();
+        let slot = source.push(0xA000).unwrap();
+        assert_eq!(source.tick(0x1000), 0xA000);
+        assert_eq!(source.block(0xA100), Ok(0x1000));
+        assert!(source.wake(slot, source.generation(slot)), "woken");
+        assert!(source.woken[slot]);
+        let departed = source.depart(slot).unwrap();
+        assert!(!source.woken[slot]);
+        assert_eq!(
+            source.preempt_for_wake(0x1100),
+            0x1100,
+            "nothing to run here"
+        );
+        let mut destination = RunQueue::new();
+        destination.set_idle(true);
+        let arrived = destination.arrive(departed).unwrap();
+        assert!(destination.woken[arrived]);
+        assert_eq!(
+            destination.preempt_for_wake(0x2000),
+            0xA100,
+            "an idle destination runs the arrival at the IPI"
+        );
+    }
+
+    /// `arrive` is refused by a full queue, which `has_room` says beforehand.
+    #[test]
+    fn a_full_queue_has_no_room_and_refuses_an_arrival() {
+        let (mut source, _) = one_ready(1);
+        let mut destination = RunQueue::new();
+        for i in 1..CAPACITY as u64 {
+            assert!(destination.has_room());
+            destination.push(i * 0x1000).unwrap();
+        }
+        assert!(!destination.has_room());
+        let departed = source.depart(1).unwrap();
+        assert_eq!(destination.arrive(departed), Err(QueueError::Full));
+    }
+
+    /// `Departed`'s `Debug` prints its name alone, never its frame (ADR-0004 Amendment 2, A6).
+    #[test]
+    fn a_departed_thread_s_debug_prints_no_frame() {
+        let (mut source, frame) = one_ready(1);
+        let departed = source.depart(1).unwrap();
+        let text = alloc::format!("{departed:?}");
+        assert_eq!(text, "Departed");
+        assert!(!text.contains(alloc::format!("{frame:x}").as_str()));
+        let mut destination = RunQueue::new();
+        assert!(destination.arrive(departed).is_ok());
+    }
+
+    /// The randomized test of moves against a brute-force model (TASKS item 96, the contract's
+    /// §1.5): what a run queue should hold, written out slot by slot, with its floor, its lag and
+    /// its next choice computed by brute force rather than by the queue's own code.
+    mod against_a_model {
+        use super::super::*;
+
+        /// A model slot's state, as `State`.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Is {
+            Free,
+            Ready,
+            Sleeping(u64),
+            Blocked(Option<u64>),
+        }
+
+        /// One slot of the model.
+        #[derive(Clone, Copy, Debug)]
+        struct Slot {
+            is: Is,
+            frame: u64,
+            pass: u64,
+            weight: u32,
+            generation: u32,
+            pending: bool,
+            woken: bool,
+            record: Option<u32>,
+        }
+
+        /// What departs, in the model: frame, weight, pending wake-up, lag and record.
+        type Leaving = (u64, u32, bool, u64, Option<u32>);
+
+        /// One queue of the model.
+        struct Model {
+            slots: [Slot; CAPACITY],
+            current: usize,
+            idle: bool,
+            ticks: u64,
+        }
+
+        impl Model {
+            fn new(idle: bool) -> Self {
+                let free = Slot {
+                    is: Is::Free,
+                    frame: 0,
+                    pass: 0,
+                    weight: DEFAULT_WEIGHT,
+                    generation: 0,
+                    pending: false,
+                    woken: false,
+                    record: None,
+                };
+                let mut slots = [free; CAPACITY];
+                slots[0].is = Is::Ready;
+                Self {
+                    slots,
+                    current: 0,
+                    idle,
+                    ticks: 0,
+                }
+            }
+
+            /// Whether slot `i` counts toward the floor: ready, and not the idle context.
+            fn counts(&self, i: usize) -> bool {
+                self.slots[i].is == Is::Ready && !(self.idle && i == 0)
+            }
+
+            /// The lowest pass among the ready contexts, the idle one aside, else the running
+            /// one's: every slot looked at.
+            fn floor(&self) -> u64 {
+                (0..CAPACITY)
+                    .filter(|&i| self.counts(i))
+                    .map(|i| self.slots[i].pass)
+                    .min()
+                    .unwrap_or(self.slots[self.current].pass)
+            }
+
+            /// Of the slots `eligible` admits, the lowest pass, and of those the first after the
+            /// current one, going round: the least distance forward from it, counted for each.
+            fn choose(&self, eligible: impl Fn(usize) -> bool) -> Option<usize> {
+                let low = (0..CAPACITY)
+                    .filter(|&i| eligible(i))
+                    .map(|i| self.slots[i].pass)
+                    .min()?;
+                (0..CAPACITY)
+                    .filter(|&i| eligible(i) && self.slots[i].pass == low)
+                    .min_by_key(|&i| (i + CAPACITY - self.current - 1) % CAPACITY)
+            }
+
+            fn switch(&mut self, interrupted: u64, charge: bool) -> u64 {
+                let cur = self.current;
+                self.slots[cur].frame = interrupted;
+                if charge {
+                    let stride = STRIDE_ONE / u64::from(self.slots[cur].weight);
+                    self.slots[cur].pass = self.slots[cur].pass.saturating_add(stride);
+                }
+                let (floor, now) = (self.floor(), self.ticks);
+                for slot in &mut self.slots {
+                    let due = match slot.is {
+                        Is::Sleeping(until) | Is::Blocked(Some(until)) => until <= now,
+                        _ => false,
+                    };
+                    if due {
+                        slot.is = Is::Ready;
+                        slot.pass = slot.pass.max(floor);
+                    }
+                }
+                let others = (1..CAPACITY).any(|i| self.slots[i].is == Is::Ready);
+                let next = self
+                    .choose(|i| self.slots[i].is == Is::Ready && !(self.idle && i == 0 && others))
+                    .unwrap_or(0);
+                for slot in &mut self.slots {
+                    slot.woken = false;
+                }
+                self.current = next;
+                self.slots[next].frame
+            }
+
+            fn push(&mut self, frame: u64, record: u32) -> Option<usize> {
+                let slot = (1..CAPACITY).find(|&i| self.slots[i].is == Is::Free)?;
+                let floor = self.floor();
+                let s = &mut self.slots[slot];
+                *s = Slot {
+                    is: Is::Ready,
+                    frame,
+                    pass: floor,
+                    weight: DEFAULT_WEIGHT,
+                    generation: s.generation.wrapping_add(1),
+                    pending: false,
+                    woken: s.woken,
+                    record: Some(record),
+                };
+                Some(slot)
+            }
+
+            fn wake(&mut self, slot: usize, generation: u32) -> bool {
+                if slot == 0 || self.slots[slot].generation != generation {
+                    return false;
+                }
+                match self.slots[slot].is {
+                    Is::Blocked(_) => {
+                        let floor = self.floor();
+                        let s = &mut self.slots[slot];
+                        s.is = Is::Ready;
+                        s.pass = s.pass.max(floor);
+                        s.woken = true;
+                        true
+                    }
+                    Is::Ready | Is::Sleeping(_) => {
+                        self.slots[slot].pending = true;
+                        false
+                    }
+                    Is::Free => false,
+                }
+            }
+
+            fn preempt(&mut self, interrupted: u64) -> u64 {
+                let woken: [bool; CAPACITY] = core::array::from_fn(|i| self.slots[i].woken);
+                for slot in &mut self.slots {
+                    slot.woken = false;
+                }
+                let running = self.slots[self.current].pass;
+                let idle = self.idle && self.current == 0;
+                let next = self
+                    .choose(|i| woken[i] && self.slots[i].is == Is::Ready)
+                    .filter(|&i| idle || self.slots[i].pass <= running);
+                let Some(next) = next else {
+                    return interrupted;
+                };
+                self.slots[self.current].frame = interrupted;
+                self.current = next;
+                self.slots[next].frame
+            }
+
+            /// What departs from `slot`: (frame, weight, pending, lag, record), if it may.
+            fn depart(&mut self, slot: usize) -> Option<Leaving> {
+                if slot == 0 || slot == self.current || self.slots[slot].is != Is::Ready {
+                    return None;
+                }
+                let lag = self.slots[slot].pass - self.floor();
+                let s = &mut self.slots[slot];
+                let out = (s.frame, s.weight, s.pending, lag, s.record);
+                s.is = Is::Free;
+                s.record = None;
+                s.pending = false;
+                s.woken = false;
+                Some(out)
+            }
+
+            fn arrive(&mut self, (frame, weight, pending, lag, record): Leaving) -> Option<usize> {
+                let slot = (1..CAPACITY).find(|&i| self.slots[i].is == Is::Free)?;
+                let floor = self.floor();
+                let s = &mut self.slots[slot];
+                *s = Slot {
+                    is: Is::Ready,
+                    frame,
+                    pass: floor + lag,
+                    weight,
+                    generation: s.generation.wrapping_add(1),
+                    pending,
+                    woken: true,
+                    record,
+                };
+                Some(slot)
+            }
+        }
+
+        /// The queue's state, slot by slot, as the model's.
+        fn same(q: &RunQueue, m: &Model, at: &str) {
+            assert_eq!(q.current, m.current, "{at}: the running slot");
+            assert_eq!(q.ticks, m.ticks, "{at}: ticks");
+            for (i, s) in m.slots.iter().enumerate() {
+                let is = match q.state[i] {
+                    State::Free => Is::Free,
+                    State::Ready => Is::Ready,
+                    State::Sleeping(until) => Is::Sleeping(until),
+                    State::Blocked(until) => Is::Blocked(until),
+                };
+                assert_eq!(is, s.is, "{at}: slot {i}'s state");
+                if s.is == Is::Free {
+                    assert_eq!(q.record(i), None, "{at}: free slot {i}'s record");
+                    continue;
+                }
+                assert_eq!(q.pass[i], s.pass, "{at}: slot {i}'s pass");
+                assert_eq!(q.weight[i], s.weight, "{at}: slot {i}'s weight");
+                assert_eq!(
+                    q.wake_pending[i], s.pending,
+                    "{at}: slot {i}'s pending wake-up"
+                );
+                assert_eq!(q.woken[i], s.woken, "{at}: slot {i}'s woken mark");
+                assert_eq!(q.record(i), s.record, "{at}: slot {i}'s record");
+                assert_eq!(q.generation[i], s.generation, "{at}: slot {i}'s generation");
+                if i != q.current {
+                    assert_eq!(q.saved[i], s.frame, "{at}: slot {i}'s saved frame");
+                }
+            }
+        }
+
+        /// xorshift64*, seeded: the same sequence for the same seed on every host.
+        struct Rng(u64);
+
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 >> 12;
+                self.0 ^= self.0 << 25;
+                self.0 ^= self.0 >> 27;
+                self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+            }
+
+            fn below(&mut self, n: usize) -> usize {
+                usize::try_from(self.next() % u64::try_from(n).unwrap()).unwrap()
+            }
+        }
+
+        /// One seed's run: two to four queues, up to 15 threads in all, `steps` random operations
+        /// (push, tick, yield, sleep, block, block with a timeout, wake, a stale wake, exit, the
+        /// IPI's `preempt_for_wake`, and a move by `depart` and `arrive`), and after each the
+        /// queues equal to the model, and every choice the model's.
+        fn run(seed: u64, steps: usize) -> u64 {
+            let mut rng = Rng(seed | 1);
+            let n = 2 + rng.below(3);
+            let mut queues: alloc::vec::Vec<RunQueue> = alloc::vec::Vec::new();
+            let mut models: alloc::vec::Vec<Model> = alloc::vec::Vec::new();
+            for _ in 0..n {
+                let idle = rng.below(2) == 0;
+                let mut q = RunQueue::new();
+                q.set_idle(idle);
+                queues.push(q);
+                models.push(Model::new(idle));
+            }
+            let (mut threads, mut moves) = (0u32, 0u64);
+            for step in 0..steps {
+                let at = alloc::format!("seed {seed:#x}, step {step}");
+                let c = rng.below(n);
+                // A frame for whatever is interrupted now: 8-aligned, never 0, never repeated.
+                let here = 0x10_0000 + u64::try_from(step).unwrap() * 0x40;
+                // Threads in all the queues, the boot or idle contexts aside: at most 15.
+                let live: usize = models
+                    .iter()
+                    .map(|m| m.slots.iter().skip(1).filter(|s| s.is != Is::Free).count())
+                    .sum();
+                let (q, m) = (&mut queues[c], &mut models[c]);
+                match rng.below(12) {
+                    0 if live < 15 => {
+                        threads += 1;
+                        let frame = 0x8000_0000 + u64::from(threads) * 0x1000;
+                        let pushed = q.push_weighted(frame, DEFAULT_WEIGHT, Some(threads)).ok();
+                        assert_eq!(pushed, m.push(frame, threads), "{at}: push");
+                    }
+                    1 | 2 => {
+                        m.ticks += 1;
+                        assert_eq!(q.tick(here), m.switch(here, true), "{at}: tick");
+                    }
+                    3 => assert_eq!(q.yield_now(here), m.switch(here, true), "{at}: yield"),
+                    4 if m.current != 0 => {
+                        let t = 1 + u64::try_from(rng.below(3)).unwrap();
+                        m.slots[m.current].is = Is::Sleeping(m.ticks + t);
+                        assert_eq!(q.sleep(here, t), Ok(m.switch(here, false)), "{at}: sleep");
+                    }
+                    5 | 6 if m.current != 0 => {
+                        let ticks =
+                            (rng.below(3) == 0).then(|| 1 + u64::try_from(rng.below(3)).unwrap());
+                        let expected = if m.slots[m.current].pending {
+                            m.slots[m.current].pending = false;
+                            here
+                        } else {
+                            m.slots[m.current].is = Is::Blocked(ticks.map(|t| m.ticks + t));
+                            m.switch(here, false)
+                        };
+                        assert_eq!(q.block_for(here, ticks), Ok(expected), "{at}: block");
+                    }
+                    7 | 8 => {
+                        // A wake-up of a thread wherever it is, by its slot and generation; one
+                        // time in four by a stale generation.
+                        let found = (0..n)
+                            .flat_map(|k| (1..CAPACITY).map(move |i| (k, i)))
+                            .filter(|&(k, i)| models[k].slots[i].is != Is::Free)
+                            .collect::<alloc::vec::Vec<_>>();
+                        if !found.is_empty() {
+                            let (k, i) = found[rng.below(found.len())];
+                            let stale = rng.below(4) == 0;
+                            let generation =
+                                models[k].slots[i].generation.wrapping_sub(u32::from(stale));
+                            assert_eq!(
+                                queues[k].wake(i, generation),
+                                models[k].wake(i, generation),
+                                "{at}: wake"
+                            );
+                        }
+                    }
+                    9 if m.current != 0 => {
+                        m.slots[m.current].is = Is::Free;
+                        m.slots[m.current].record = None;
+                        assert_eq!(q.exit(here), Ok(m.switch(here, false)), "{at}: exit");
+                    }
+                    10 => assert_eq!(q.preempt_for_wake(here), m.preempt(here), "{at}: preempt"),
+                    11 => {
+                        let to = rng.below(n);
+                        // Half the time any slot, so that every refusal is tried; half the time
+                        // one the model says may move, if there is one.
+                        let movable = (1..CAPACITY)
+                            .filter(|&i| {
+                                i != models[c].current && models[c].slots[i].is == Is::Ready
+                            })
+                            .collect::<alloc::vec::Vec<_>>();
+                        let slot = if rng.below(2) == 0 || movable.is_empty() {
+                            1 + rng.below(CAPACITY - 1)
+                        } else {
+                            movable[rng.below(movable.len())]
+                        };
+                        if to != c {
+                            let departed = queues[c].depart(slot);
+                            let modelled = models[c].depart(slot);
+                            assert_eq!(departed.is_some(), modelled.is_some(), "{at}: depart");
+                            if let (Some(d), Some(md)) = (departed, modelled) {
+                                assert_eq!(
+                                    (d.wake_pending, d.lag, d.record),
+                                    (md.2, md.3, md.4),
+                                    "{at}: what departs"
+                                );
+                                if queues[to].has_room() {
+                                    moves += 1;
+                                    let arrived = queues[to].arrive(d).ok();
+                                    assert_eq!(arrived, models[to].arrive(md), "{at}: arrive");
+                                    let slot = arrived.unwrap();
+                                    assert!(
+                                        queues[to].pass[slot] >= queues[to].floor(),
+                                        "{at}: below the floor"
+                                    );
+                                } else {
+                                    // A mover asks first and would not have taken it: put it back.
+                                    let back = queues[c].arrive(d).ok();
+                                    assert_eq!(back, models[c].arrive(md), "{at}: back");
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for (q, m) in queues.iter().zip(&models) {
+                    same(q, m, &at);
+                }
+            }
+            moves
+        }
+
+        /// Fixed seeds, printed in every failure: run one again by its seed.
+        #[test]
+        fn moves_agree_with_the_model_over_random_sequences() {
+            let mut moves = 0;
+            for seed in 0..64u64 {
+                moves += run(0x9e37_79b9_7f4a_7c15u64.wrapping_mul(seed + 1), 3000);
+            }
+            assert!(moves > 1000, "the sequences made {moves} moves");
+        }
     }
 }
