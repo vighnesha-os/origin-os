@@ -4594,7 +4594,10 @@ The baseline, the export with nothing planted, built (exit 0). Beside them, the 
 **The gates on `87673b7e`.** They ran in the same turn of the machine, on a clean tree, on 2026-11-22 from 00:52 to 02:13 UTC, under Rust 1.100.0 (`rustc` at the pinned commit `0ef1bc38`) with QEMU 11.1.3 TCG and OVMF. The quick gates had passed at the turn's start: fmt and the document, provenance, cost and requirements gates.
 
 - **`cargo clippy --locked --all-targets -- -D warnings`** found nothing.
-- **`cargo xtask check`** passed in 903 s.
+- **`cargo xtask check`** passed in 903 s:
+  - 2,684 host tests passed, 0 failed, 30 ignored, summed over every `test result` line of its log, doctests among them;
+  - Loom: all 91 models passed and all 140 negative controls were caught;
+  - every document gate.
 - **`cargo xtask boot-test`** passed, 11 of 11, in 56 s, with the verdict `degraded: 72 of 73 proofs passed; failed: speculation controls`.
 - **`cargo xtask boot-matrix`** passed three times in a row, in 1,305, 1,285 and 1,284 s:
   - each run's other boots gave `degraded: 72 of 73 proofs passed; failed: speculation controls`;
