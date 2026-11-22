@@ -845,9 +845,6 @@ mod waking {
             })
         }
 
-        // Inlined into the wake-up, with `RunQueue::wake` (TASKS item 96, the recount of the floor's
-        // reading): out of line, it was reached through the GOT on every wake-up.
-        #[inline(always)]
         fn wake_slot(queue: &mut RunQueue<Placed>, slot: u16) -> bool {
             let slot = usize::from(slot);
             let generation = queue.generation(slot);

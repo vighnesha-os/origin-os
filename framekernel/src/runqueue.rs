@@ -894,12 +894,6 @@ impl<R: Copy> RunQueue<R> {
     /// thread becomes ready, and `true` is returned: the processor running this queue
     /// should reschedule. Any other live thread keeps the wake-up for its next
     /// [`RunQueue::block`]. A stale or free slot is left alone.
-    ///
-    /// Inlined into the kernel's wake-up with `KernelQueues::wake_slot` (TASKS item 96): once the
-    /// floor kept its last value (ADR-0020 S6, the note of 2026-11-22), LLVM would otherwise call
-    /// it, or `wake_slot`, out of line on every wake-up, a pending one included (the recount turn's
-    /// traces).
-    #[inline(always)]
     pub fn wake(&mut self, slot: usize, generation: u32) -> bool {
         if slot == 0 || self.generation.get(slot) != Some(&generation) {
             return false;
