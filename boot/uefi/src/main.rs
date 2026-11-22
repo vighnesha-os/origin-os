@@ -219,17 +219,25 @@ fn boot(
     let after = {
         let found = read_bench_file(image, &bs, bench::AFTER_PATH)
             .map(|(contents, len)| bench::After::from_contents(contents.get(..len).unwrap_or(&[])));
+        #[cfg(not(origin_bench_kernel))]
         let _ = writeln!(out, "{}{}", bench::PREFIX, bench::After::said(found));
         // The bisection mode reads it as the full loader does, and ignores its value (ruling Q3 of
         // TASKS item 131).
         #[cfg(origin_bench_bisect)]
         let _ = writeln!(out, "{}", bench::BISECT_AFTER_IGNORED);
         // The kernel-entry mode reads it too, and enters the kernel whatever it says (TASKS item
-        // 133's ruling Q5): no switch file decides anything on a rented board.
+        // 133's ruling Q5): no switch file decides anything on a rented board. Its line is its own,
+        // since the full mode's would say the kernel is not entered (R133-4).
         #[cfg(origin_bench_kernel)]
-        let _ = writeln!(out, "{}", bench::KERNEL_AFTER_IGNORED);
-        #[cfg(origin_bench_kernel)]
-        let _ = found;
+        let _ = writeln!(
+            out,
+            "{}",
+            if found.is_some() {
+                bench::KERNEL_AFTER_IGNORED
+            } else {
+                bench::KERNEL_NO_AFTER
+            }
+        );
         #[cfg(origin_bench_kernel)]
         let found: Option<Option<bench::After>> = Some(Some(bench::After::Kernel));
         found.flatten().unwrap_or(bench::After::Reset)
@@ -442,11 +450,12 @@ fn boot(
     // ADR-0002 B3 and Amendment 7: the three allocations the kernel must tell from the loader's
     // other data, named by address in every map the loader translates. The stack's is named from
     // its guard page, so the page tables leave that page unmapped.
-    let loader_regions = memmap::LoaderRegions {
-        kernel: (base, span_pages as u64),
-        stack: (stack - PAGE as u64, (STACK_PAGES + 1) as u64),
-        info: (info_addr, info_pages as u64),
-    };
+    let loader_regions = memmap::LoaderRegions::new(
+        (base, span_pages as u64),
+        stack,
+        STACK_PAGES as u64,
+        (info_addr, info_pages as u64),
+    );
     let rsdp = find_rsdp(st);
     // The firmware's framebuffer, for the kernel's console from its first line on (ADR-0010).
     // The memory map says below whether it can be used; missing or unusable, the boot goes on.
@@ -639,7 +648,8 @@ fn boot(
             direct_map_base: direct,
             kernel_virtual_base: kernel_virtual,
             kernel_physical_base: base,
-            stack_guard: stack - PAGE as u64,
+            // The page the carved kernel-stack region starts at (TASKS item 133's review, R133-6).
+            stack_guard: loader_regions.stack_guard(),
         };
         let (mut space, stats) = layout::build(&mut pool, &at, regions, segments)
             .map_err(|e| fail(out, Status::LOAD_ERROR, format_args!("page tables: {e:?}")))?;
@@ -914,8 +924,10 @@ fn boot(
             bench_disturb(early_uart, &plan);
             // Decision item 342: why, on the UART boot info would name, before it halts.
             say_halting(early_uart, calls);
-            // TASKS item 116: in a bench build, as after a successful call.
-            #[cfg(origin_bench)]
+            // TASKS item 116: in a bench build, as after a successful call. Not in the kernel-entry
+            // mode, whose path after two failed calls is Amendment 2's line and the halt, with no
+            // UART register written back (ruling Q5 of TASKS item 133; its review, R133-3).
+            #[cfg(all(origin_bench, not(origin_bench_kernel)))]
             bench_after_call(early_uart, &plan, calls);
             halt()
         }
@@ -2894,9 +2906,11 @@ mod bisect {
 /// - the FCH's decision: its lines are printed, and nothing is decided on them;
 /// - Amendment 4's control and its reset after the call (`bench_fch_decide`,
 ///   `reset_without_firmware`, `write_cf9`), so nothing writes `0xCF9`;
-/// - Amendment 3's reset (`bench_reset`): after two failed calls, Amendment 2's line and the halt.
+/// - Amendment 3's reset (`bench_reset`): after two failed calls, Amendment 2's line and the halt,
+///   with no UART register read or written back (its review, R133-3).
 ///
-/// `BENCH-AFTER` is read and its value ignored. After `EFI_SUCCESS` the line naming the call that
+/// `BENCH-AFTER` is read and its value ignored, with a line of the mode's own (R133-4). After
+/// `EFI_SUCCESS` the line naming the call that
 /// succeeded goes straight to the UART, so a rented console shows that the call returned even if
 /// the kernel then says nothing.
 #[cfg(origin_bench_kernel)]

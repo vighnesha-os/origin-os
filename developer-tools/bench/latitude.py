@@ -1095,6 +1095,12 @@ BISECT_LAST_LINE = b"ExitBootServices next, through the loader's copy of the boo
 # straight to the UART only once ExitBootServices has returned EFI_SUCCESS (`bench::Exited`).
 KERNEL_BUILD_LINE = "bench build: kernel"
 RETURNED_LINE = b"origin-boot: bench build: boot services exited"
+# TASKS item 133's review, R133-1: the other two lines a loader writes only once a call has
+# returned: TASKS item 116's line after the call, which names both statuses, and Amendment 2's
+# halting line, after two failed calls. The success line may arrive garbled, since it is written
+# before the UART's registers are put back; the line after the call is written after.
+AFTER_CALL_PREFIX = b"origin-boot: bench build: after ExitBootServices ("
+HALTING_PREFIX = b"origin-boot: ExitBootServices failed ("
 LOADER_START = "UEFI loader (build"
 TIMES_FILE = "sol-times.log"
 # How many boots a rental B makes and how long each may take, unless the command line says.
@@ -1312,8 +1318,9 @@ def read_runs(raw, times, restarts=(), until=None, events=""):
         text = raw[at:end]
         cause = PMXC0.search(text)
         called = bool(marks) or any(line in text for line in CALL_LINES)
-        # TASKS item 133: the loader's own line after the call says it returned (reading R).
-        returned = called and RETURNED_LINE in text
+        # TASKS item 133: the loader's own line after the call says it returned (reading R), with
+        # success or with errors (R133-1).
+        returned = call_returned(text) if called else None
         nxt = firmware_after(raw, end, None, mask)
         runs.append({"banner": arrival(times, at), "pmxc0": cause.group(1).decode() if cause else None,
                      "branch": "call" if called else "control" if CONTROL_TEXT in text else "other",
@@ -1356,11 +1363,6 @@ def read_runs(raw, times, restarts=(), until=None, events=""):
     opening = openings.pop() if len(openings) == 1 else None
     for run, first in zip(runs, firsts):
         end = run["end"]
-        if run["returned"]:
-            # The loader's line after the call: the call returned, whatever followed (TASKS item
-            # 133's ruling Q5: a line after X is R).
-            run["answer"] = "returned"
-            continue
         if end is None or run["unsampled"] or (run["cut_short"] and (until is None or until - end < hang)):
             run["answer"] = "pending"
             continue
@@ -1389,6 +1391,13 @@ def read_runs(raw, times, restarts=(), until=None, events=""):
             shut = sum(max(0.0, min(b, end + run["waited_s"]) - max(a, end)) for a, b in closed)
             if shut >= CLOSED_S:
                 run.update(answer="unwatched", closed_s=round(shut, 1))
+    # TASKS item 133: a call whose loader said it returned is R, or both calls failed, whatever
+    # came next; what came next is kept as `then`, so a reset after a returned call is still read
+    # (its review, R133-2).
+    for run in runs:
+        if run["returned"]:
+            run["then"] = run["answer"]
+            run["answer"] = "returned" if run["returned"] == "success" else "failed"
     for run in runs:
         for key in ("opening", "sample", "unsampled"):
             run.pop(key)
@@ -1417,6 +1426,25 @@ def figures(runs):
             "restart": max(restart, default=PLAN_RESTART_S), "work": max(work, default=PLAN_WORK_S)}
 
 
+def call_returned(text):
+    """TASKS item 133's review, R133-1: from a run's text, whether its call returned, read from
+    the loader's own lines after the call: "success" (`EFI_SUCCESS`: the success line, or the line
+    after the call naming it), "failed" (both calls returned an error: Amendment 2's halting line,
+    or the line after the call naming no success), or None, when no such line came."""
+    starts = [text.find(line) for line in CALL_LINES if line in text]
+    mark = MARK_LINES.search(text)
+    if mark:
+        starts.append(mark.start())
+    tail = text[min(starts):] if starts else b""
+    after = tail.find(AFTER_CALL_PREFIX)
+    statuses = tail[after:tail.find(b")", after)] if after >= 0 else b""
+    if RETURNED_LINE in tail or b"EFI_SUCCESS" in statuses:
+        return "success"
+    if HALTING_PREFIX in tail or after >= 0:
+        return "failed"
+    return None
+
+
 def describe(run):
     """One run, as a boot's summary and `reread` print it."""
     seen = f" (PMxC0 {run['pmxc0']})" if run["pmxc0"] else ""
@@ -1425,9 +1453,17 @@ def describe(run):
             "other": f"a run with neither control nor call{seen}"}[run["branch"]]
     after = f"its {run['end_kind']}"
     answer = run["answer"]
-    if answer == "returned":
-        return (f"{what}, then the loader's line that the call returned"
-                + ("; the kernel's lines followed" if run["kernel"] else "; no kernel line followed"))
+    if answer in ("returned", "failed"):
+        said = ("the loader's line that the call returned" if answer == "returned"
+                else "the loader's line that both calls failed")
+        then = run["then"]
+        text = f"{what}, then {said}"
+        text += "; the kernel's lines followed" if run["kernel"] else "; no kernel line followed"
+        if then == "reset":
+            text += f"; then the firmware again {plain(run['after_s'])} s after its {run['end_kind']}"
+        elif then in ("none", "unwatched"):
+            text += f"; then nothing for {plain(run['waited_s'])} s"
+        return text
     if answer == "reset":
         return f"{what}, then the firmware again {plain(run['after_s'])} s after {after}"
     if answer == "other":
@@ -1459,11 +1495,17 @@ def runs_summary(runs):
     calls = [r for r in runs if r["branch"] == "call"]
     count = lambda answer: sum(r["answer"] == answer for r in calls)
     reset = [r["after_s"] for r in calls if r["answer"] == "reset"]
-    judged = sum(count(a) for a in ("returned", "reset", "none", "other"))
+    judged = sum(count(a) for a in ("returned", "failed", "reset", "none", "other"))
     kernel = sum(r["answer"] == "returned" and r["kernel"] for r in calls)
+    then_reset = [r["after_s"] for r in calls
+                  if r["answer"] in ("returned", "failed") and r.get("then") == "reset"]
     out = [f"calls: {len(calls)}: of the {judged} judged, "
            + (f"returned after {count('returned')} (the loader's line after the mark; the kernel's "
               f"lines after {kernel}), " if count("returned") else "")
+           + (f"both calls failed after {count('failed')} (Amendment 2's line), "
+              if count("failed") else "")
+           + (f"the firmware again after {len(then_reset)} of those, {spread(then_reset)} after "
+              f"the loader's line, " if then_reset else "")
            + f"a reset after {len(reset)}"
            + (f", {spread(reset)} after the mark" if reset else "")
            + (f", nothing after {count('none')}" if count("none") else "")
@@ -1503,6 +1545,13 @@ def boot_over(runs, first, at):
     if any(r["branch"] in ("control", "call") for r in later):
         return True
     return at - call["next"] >= fig["load"] + fig["work"] + SLACK_S
+
+
+def reads_runs(minimal, text):
+    """TASKS items 130 and 133: whether a boot's runs are read from the firmware's starts and kept
+    with its result: every image that resets after its call, and the kernel-entry image, whose
+    calls read as returned, reset or a hang (its review, R133-6)."""
+    return minimal or resets_after_call(text) or KERNEL_BUILD_LINE in text
 
 
 def resets_after_call(text):
@@ -1738,8 +1787,7 @@ def cmd_rental_b(args):
                 # firmware's starts; only the minimal and bisection modes' boots end at their
                 # answer. TASKS item 133: so is the kernel-entry mode's, whose calls read as
                 # returned, reset (the firmware's exit shutting down) or a hang.
-                text = console.text(start)
-                if minimal or resets_after_call(text) or KERNEL_BUILD_LINE in text:
+                if reads_runs(minimal, console.text(start)):
                     runs = reading()
                     mine = runs[first_run(runs, restarts[-1]):]
                     result["runs"] = mine

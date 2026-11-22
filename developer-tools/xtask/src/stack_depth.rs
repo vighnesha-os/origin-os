@@ -127,6 +127,9 @@ pub(crate) fn build_loader(bench: bool) -> Result<PathBuf> {
             if bench { "lacks" } else { "holds" }
         ));
     }
+    // ADR-0002 Amendment 7 (TASKS item 133's ruling Q4; its review, R133-5): a measurement
+    // loader is a loader too.
+    bench::check_no_os_types(&efi)?;
     Ok(efi)
 }
 

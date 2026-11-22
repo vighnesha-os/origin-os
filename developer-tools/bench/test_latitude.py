@@ -639,6 +639,53 @@ class Guards(unittest.TestCase):
         image = self.home / "kernel-entry.efi"
         image.write_bytes(b"MZ" + lat.KERNEL_BUILD_LINE.encode())
         self.assertIn("kernel-entry bench loader", lat.loader_kind(image))
+        # R133-6: such a boot's runs are read and kept with its result, as a reset image's are.
+        self.assertTrue(lat.reads_runs(False, text))
+        self.assertFalse(lat.reads_runs(False, "origin-boot: exiting boot services; entering the Framekernel"))
+
+    def test_a_call_that_returned_is_read_from_any_of_the_loaders_lines_after_it(self):
+        # TASKS item 133's review, R133-1 and R133-2: the success line, the line after the call and
+        # Amendment 2's halting line are each written only once a call has returned.
+        lat, banner = self.lat, self.BANNER
+        before = banner + b"origin-boot: exiting boot services; entering the Framekernel\r\nX\r\n"
+        after_ok = b"origin-boot: bench build: after ExitBootServices (first call EFI_SUCCESS) the UART read IER 0x00\r\n"
+        kernel = b"RS12345678\r\norigin-kernel: console: framebuffer 1024x768\r\n"
+        # The success line lost, the line after the call whole, then the kernel: still R.
+        raw, times = self.pieces((50.0, before), (50.1, after_ok), (50.2, kernel))
+        run = lat.read_runs(raw, times, [0.0], 400.0)[0]
+        self.assertEqual((run["answer"], run["kernel"]), ("returned", True))
+        # The same, then the machine starting again 5.9 s later: R, with the reset kept.
+        raw, times = self.pieces((50.0, before), (50.1, after_ok), (56.0, self.FIRMWARE))
+        run = lat.read_runs(raw, times, [0.0], 400.0)[0]
+        self.assertEqual((run["answer"], run["then"], run["after_s"]), ("returned", "reset", 5.9))
+        self.assertIn("then the firmware again 5.9 s after its line", lat.describe(run))
+        self.assertIn("the firmware again after 1 of those, 5.9 s after the loader's line, a reset after 0",
+                      lat.runs_summary([run]))
+        # Both calls failed: Y, Amendment 2's line, then nothing. Not a hang.
+        failed = (b"Y\r\norigin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry "
+                  b"EFI_INVALID_PARAMETER): halting\r\n")
+        raw, times = self.pieces((50.0, before), (51.0, failed))
+        run = lat.read_runs(raw, times, [0.0], 400.0)[0]
+        self.assertEqual((run["answer"], run["then"]), ("failed", "none"))
+        self.assertIn("then the loader's line that both calls failed", lat.describe(run))
+        self.assertIn("both calls failed after 1 (Amendment 2's line), a reset after 0",
+                      lat.runs_summary([run]))
+        # Amendment 2's line lost, the line after the call naming two errors whole: still both
+        # failed, as the full mode writes it.
+        both = (b"Y\r\norigin-boot: bench build: after ExitBootServices (first call EFI_INVALID_PARAMETER, "
+                b"retry EFI_INVALID_PARAMETER) the UART read IER 0x00\r\n")
+        raw, times = self.pieces((50.0, before), (51.0, both))
+        self.assertEqual(lat.read_runs(raw, times, [0.0], 400.0)[0]["answer"], "failed")
+        # The full bench image (TASKS item 116): returned, then its own reset through ResetSystem,
+        # which is still read (R133-2).
+        full = (b"origin-boot: bench build: boot services exited on the first call\r\n" + after_ok
+                + b"origin-boot: bench build: a cold reset through the firmware's ResetSystem in 5 s\r\n")
+        raw, times = self.pieces((50.0, before), (50.1, full), (56.0, self.FIRMWARE))
+        run = lat.read_runs(raw, times, [0.0], 400.0)[0]
+        self.assertEqual((run["answer"], run["then"], run["after_s"]), ("returned", "reset", 5.9))
+        # Lines only before the call say nothing: no line after it, then the firmware, is S.
+        raw, times = self.pieces((50.0, before), (55.5, self.FIRMWARE))
+        self.assertEqual(lat.read_runs(raw, times, [0.0], 400.0)[0]["answer"], "reset")
 
     def test_a_retrys_marks_are_the_runs_own(self):
         # R130-1: X, then Y a second later when the first call fails, belong to the run; the

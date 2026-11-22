@@ -314,6 +314,30 @@ pub struct LoaderRegions {
     pub info: (u64, u64),
 }
 
+impl LoaderRegions {
+    /// The three allocations from the kernel image's base and pages, the stack's lowest address
+    /// and pages, with its guard page the one below it, and the boot info's base and pages.
+    pub const fn new(
+        kernel: (u64, u64),
+        stack_base: u64,
+        stack_pages: u64,
+        info: (u64, u64),
+    ) -> Self {
+        Self {
+            kernel,
+            stack: (stack_base.wrapping_sub(PAGE), stack_pages.wrapping_add(1)),
+            info,
+        }
+    }
+
+    /// The boot stack's guard page: the page the kernel-stack region starts at, which the page
+    /// tables are told to leave unmapped (`origin_paging::layout::Placement::stack_guard`), the
+    /// loader's and the kernel's alike (TASKS item 133's review, R133-6).
+    pub const fn stack_guard(&self) -> u64 {
+        self.stack.0
+    }
+}
+
 /// Which allocation could not be named, and why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CarveFailure {
@@ -658,11 +682,8 @@ mod tests {
         .concat()
     }
 
-    const AT: LoaderRegions = LoaderRegions {
-        kernel: (0x20_0000, 4),
-        stack: (0x30_0000, 17),
-        info: (0x31_1000, 2),
-    };
+    /// The stack's 16 pages at `0x30_1000`, so its guard page and region start at `0x30_0000`.
+    const AT: LoaderRegions = LoaderRegions::new((0x20_0000, 4), 0x30_1000, 16, (0x31_1000, 2));
 
     #[test]
     fn the_loader_regions_are_named_by_address_inside_loader_data() {
@@ -729,6 +750,18 @@ mod tests {
             CarveFailure {
                 region: LoaderRegion::BootInfo,
                 error: MapError::NotLoaderData(0x40_0000)
+            }
+        );
+        // The kernel image in conventional memory: refused too, as the review's R133-6 asked.
+        let at = LoaderRegions {
+            kernel: (0x10_0000, 4),
+            ..AT
+        };
+        assert_eq!(
+            fails(amendment_7_map(), at),
+            CarveFailure {
+                region: LoaderRegion::KernelImage,
+                error: MapError::NotLoaderData(0x10_0000)
             }
         );
         // The kernel image outside every region, as before.
@@ -802,5 +835,40 @@ mod tests {
             origin_boot_info::boot_seed(&info(0x31_1800), 0x31_1000, &out[..n]),
             Some(0x31_1800)
         );
+    }
+
+    #[test]
+    fn the_page_tables_leave_the_carved_stack_s_guard_page_unmapped() {
+        // TASKS item 133's review, R133-6: the carved map, built into page tables as the loader
+        // builds them, with the guard the loader passes: the guard page is not mapped, the stack's
+        // pages and the boot info are, in the direct map.
+        use core::sync::atomic::AtomicU64;
+        use origin_paging::layout::{self, Placement};
+        const DIRECT: u64 = 0xFFFF_8040_0000_0000;
+        let mut out = [region(0, 0, RegionKind::Reserved); 12];
+        let n = translate(&amendment_7_map(), 48, &mut out).unwrap();
+        let n = carve_loader_regions(&mut out, n, &AT).unwrap();
+        let tables: Vec<origin_paging::Table> = (0..64)
+            .map(|_| core::array::from_fn(|_| AtomicU64::new(0)))
+            .collect();
+        let mut mem = origin_paging::TablePool::new(&tables, 0x80_0000);
+        let at = Placement {
+            direct_map_base: DIRECT,
+            kernel_virtual_base: 0xFFFF_FFFF_8460_0000,
+            kernel_physical_base: AT.kernel.0,
+            stack_guard: AT.stack_guard(),
+        };
+        let segments = [origin_boot_info::KernelSegment {
+            rva: 0,
+            pages: 4,
+            access: origin_boot_info::SEGMENT_READ,
+            reserved: 0,
+        }];
+        let (space, _) = layout::build(&mut mem, &at, &out[..n], &segments).unwrap();
+        let mapped = |phys: u64| space.translate(&mem, DIRECT + phys).is_some();
+        assert_eq!(AT.stack_guard(), 0x30_0000);
+        assert!(!mapped(0x30_0000), "the boot stack's guard page");
+        assert!(mapped(0x30_1000) && mapped(0x31_0000), "the stack's pages");
+        assert!(mapped(0x31_1000), "the boot info");
     }
 }

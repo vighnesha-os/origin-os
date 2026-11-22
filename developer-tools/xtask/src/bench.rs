@@ -518,29 +518,42 @@ fn check_kernel_code(loader: &Path, full_loader: &Path) -> Result {
 /// B3's old OS-defined types, which no loader allocates since ADR-0002 Amendment 7.
 const OLD_OS_TYPES: [&str; 2] = ["0x80000002", "0x80000003"];
 
-/// The instructions of `insns` that set `AllocatePages`' `MemoryType`, its second argument, in
-/// RDX, to one of [`OLD_OS_TYPES`]: `mov edx, 0x80000002` or `0x80000003`, as the loaders before
-/// Amendment 7 compiled their allocations of the boot info and the kernel stack (TASKS item 133's
-/// ruling Q4). The translation's compares of a descriptor's type are not moves, so they are not
-/// found.
+/// The instructions of `insns` with one of [`OLD_OS_TYPES`] as an operand, matched as a whole
+/// immediate (TASKS item 133's ruling Q4; its review, R133-5). Before Amendment 7 the loaders held
+/// them in two shapes: `mov edx, 0x80000003` and `mov edx, 0x80000002`, `AllocatePages`'
+/// `MemoryType` for the kernel stack and the boot info, and `cmp eax, …`, the translation of a
+/// descriptor's type. Since Amendment 7 a loader holds neither constant at all, so any instruction
+/// with either is one too many: kept in another register, stored, or compared.
 pub(crate) fn os_type_allocations(insns: &[Insn]) -> Vec<usize> {
     (0..insns.len())
         .filter(|&i| {
-            insns[i]
-                .text
-                .strip_prefix("mov ")
-                .and_then(|ops| ops.split_once(", "))
-                .is_some_and(|(dest, src)| {
-                    matches!(dest, "edx" | "rdx") && OLD_OS_TYPES.contains(&src)
-                })
+            insns[i].text.split_once(' ').is_some_and(|(_, operands)| {
+                operands
+                    .split([',', ' ', '[', ']', '+'])
+                    .any(|word| OLD_OS_TYPES.contains(&word))
+            })
         })
         .collect()
 }
+
+/// The full bench loader's two allocations at `32b6e043`, before ADR-0002 Amendment 7, as
+/// `llvm-objdump` printed them: the kernel stack (`0x80000003`, 17 pages) and the boot info
+/// (`0x80000002`), each `AllocatePages(AllocateAnyPages, type, pages, &address)`; then the
+/// translation's compares of a descriptor's type. [`check_no_os_types`] runs its matcher on this
+/// first, so every gate shows the check can see the old loaders' instructions (R133-5).
+const OLD_ALLOCATIONS: &str = "14000a010:\tlea\tr9, [rbp + 0x760]\n14000a017:\tmov\tr8d, 0x11\n14000a01d:\txor\tecx, ecx\n14000a01f:\tmov\tedx, 0x80000003\n14000a024:\tcall\tqword ptr [rbp + 0x868]\n14000a13a:\tlea\tr9, [rbp + 0x760]\n14000a141:\txor\tecx, ecx\n14000a143:\tmov\tedx, 0x80000002\n14000a148:\tmov\tr8, qword ptr [rbp + 0x700]\n14000a14f:\tcall\tqword ptr [rbp + 0x868]\n140011c24:\tcmp\teax, 0x80000002\n140011c2b:\tcmp\teax, 0x80000003\n";
 
 /// Fails if the loader image at `image` allocates one of B3's old OS-defined types
 /// ([`os_type_allocations`]): ADR-0002 Amendment 7, so that a later change cannot bring them back
 /// unseen, since the translated map names the regions by address either way.
 pub(crate) fn check_no_os_types(image: &Path) -> Result {
+    // The control first: the batch's own loader's instructions, which the check must find.
+    if os_type_allocations(&instructions(OLD_ALLOCATIONS)).len() != 4 {
+        return Err(
+            "the check for B3's old OS-defined types does not find them in the loader they were taken from (OLD_ALLOCATIONS), so its verdict on any image cannot be trusted (TASKS item 133, R133-5)"
+                .into(),
+        );
+    }
     let insns = instructions(&disassemble(image)?);
     let found = os_type_allocations(&insns);
     if found.is_empty() {
@@ -1276,6 +1289,7 @@ const BIS_CF9_SKIPPED: &str = "origin-boot: bench build: ResetSystem was not cal
 // TASKS item 133: the kernel-entry mode's three lines.
 const KER_START: &str = "origin-boot: bench build: kernel: the kernel-entry mode (TASKS item 133, ADR-0002 Amendment 7)";
 const KER_AFTER_IGNORED: &str = "origin-boot: bench build: kernel: BENCH-AFTER's value is ignored: this mode enters the kernel after a successful call, and halts after two failed calls";
+const KER_NO_AFTER: &str = "origin-boot: bench build: kernel: no BENCH-AFTER; this mode enters the kernel after a successful call, and halts after two failed calls";
 const KER_FCH: &str = "origin-boot: bench build: kernel: the FCH's record decides nothing in this mode: no control, and no reset after the call";
 /// The full loader's lines before the call that the bisection mode keeps (Amendment 6, step 1).
 const FULL_WORK: [&str; 4] = [
@@ -1864,7 +1878,7 @@ fn scenarios() -> Vec<Scenario> {
         scenario(
             "bench: kernel, a stale key twice, Amendment 2's line and the halt, no reset",
             Loader::BenchKernel,
-            lines(&[HALTING_START, AFTER_CALL]),
+            lines(&[HALTING_START]),
             kernel_stale_twice,
             check_kernel_halt,
             Some(QUIET),
@@ -1912,11 +1926,15 @@ fn check_loader_console_in(
     let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
     let at = |needle: &str| com1.find(needle);
     let last = at(LAST_LOADER_LINE).ok_or("COM1 lacks the loader's last line")?;
-    let own: &[&str] = if kernel {
-        &[KER_START, KER_AFTER_IGNORED]
-    } else {
-        &[]
-    };
+    let own: &[&str] = if kernel { &[KER_START] } else { &[] };
+    // R133-4: the kernel-entry mode writes its own line about BENCH-AFTER, never the full mode's,
+    // which would say the kernel is not entered.
+    if kernel && com1.contains("the kernel is not entered") {
+        return Err(
+            "the kernel-entry mode's console says the kernel is not entered (TASKS item 133, R133-4)"
+                .into(),
+        );
+    }
     for needle in [
         switch_line,
         after_line,
@@ -2082,13 +2100,13 @@ fn check_retry(done: &Completed, settings: &Settings) -> Result {
 /// TASKS item 133: the kernel-entry mode with no switch, as a rental runs it: the bench kernel
 /// entered after the first call, with its breadcrumbs.
 fn check_kernel_first_call(done: &Completed, settings: &Settings) -> Result {
-    check_kernel_console(done, NO_SWITCH, NO_AFTER)?;
+    check_kernel_console(done, NO_SWITCH, KER_NO_AFTER)?;
     check_crumbs(done, settings, FIRST_CALL, &[MARK_FIRST], AFTER_FIRST)
 }
 
 /// TASKS item 133: the retry, then the bench kernel.
 fn check_kernel_retry(done: &Completed, settings: &Settings) -> Result {
-    check_kernel_console(done, SWITCH_ONCE, NO_AFTER)?;
+    check_kernel_console(done, SWITCH_ONCE, KER_NO_AFTER)?;
     check_crumbs(
         done,
         settings,
@@ -2101,14 +2119,23 @@ fn check_kernel_retry(done: &Completed, settings: &Settings) -> Result {
 /// TASKS item 133: `BENCH-AFTER fadt`, which would make the full mode reset through the FADT's
 /// register, ignored: the bench kernel entered.
 fn check_kernel_after_ignored(done: &Completed, settings: &Settings) -> Result {
-    check_kernel_console(done, NO_SWITCH, AFTER_FADT)?;
+    check_kernel_console(done, NO_SWITCH, KER_AFTER_IGNORED)?;
     check_crumbs(done, settings, FIRST_CALL, &[MARK_FIRST], AFTER_FIRST)
 }
 
 /// TASKS item 133: `BENCH-FCH first`, which would make the full mode's boot a control, read for the
 /// FCH's lines only: no control, and the bench kernel entered.
 fn check_kernel_fch_first(done: &Completed, settings: &Settings) -> Result {
-    check_kernel_console(done, NO_SWITCH, NO_AFTER)?;
+    check_kernel_console(done, NO_SWITCH, KER_NO_AFTER)?;
+    // R133-7: the switch read, as the full mode reads it, so its values are on the console.
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    for needle in [FCH_SWITCH, FCH_REGISTERS, SMI_GIVEN] {
+        if !com1.contains(needle) {
+            return Err(format!(
+                "COM1, the kernel-entry loader's console, lacks {needle:?}: BENCH-FCH was not read as the full mode reads it"
+            ));
+        }
+    }
     check_crumbs(done, settings, FIRST_CALL, &[MARK_FIRST], AFTER_FIRST)
 }
 
@@ -2122,7 +2149,7 @@ fn check_halt(done: &Completed, _settings: &Settings) -> Result {
 /// TASKS item 133: [`check_halt`] for the kernel-entry mode, which halts after both calls fail
 /// whatever `BENCH-AFTER` says, with no reset.
 fn check_kernel_halt(done: &Completed, _settings: &Settings) -> Result {
-    check_halt_in(done, NO_AFTER, true)
+    check_halt_in(done, KER_NO_AFTER, true)
 }
 
 /// [`check_halt`], with `after_line` and the full mode's or (`kernel`) the kernel-entry mode's
@@ -2130,12 +2157,23 @@ fn check_kernel_halt(done: &Completed, _settings: &Settings) -> Result {
 fn check_halt_in(done: &Completed, after_line: &str, kernel: bool) -> Result {
     check_loader_console_in(done, SWITCH_TWICE, after_line, kernel)?;
     let after = after_last_line(done)?;
-    if after.len() != 4
-        || after[..3] != [MARK_FIRST, MARK_RETRY, HALTING]
-        || !is_after_call(&after[3], AFTER_BOTH_FAILED)
-    {
+    // The kernel-entry mode writes no line after the call once both have failed, and writes no
+    // UART register back (ruling Q5; R133-3): the marks and Amendment 2's line, then nothing.
+    let whole = if kernel {
+        after == [MARK_FIRST, MARK_RETRY, HALTING]
+    } else {
+        after.len() == 4
+            && after[..3] == [MARK_FIRST, MARK_RETRY, HALTING]
+            && is_after_call(&after[3], AFTER_BOTH_FAILED)
+    };
+    if !whole {
         return Err(format!(
-            "after both calls failed, the SPCR's UART should hold the marks, the halting line and the line after the call after the loader's last line, and nothing more for {} s; it holds {after:?}",
+            "after both calls failed, the SPCR's UART should hold the marks, the halting line{} after the loader's last line, and nothing more for {} s; it holds {after:?}",
+            if kernel {
+                ""
+            } else {
+                " and the line after the call"
+            },
             QUIET.as_secs()
         ));
     }
@@ -3113,31 +3151,43 @@ mod tests {
         }
     }
 
-    /// TASKS item 133's ruling Q4: the full bench loader's two allocations at `32b6e043`, before
-    /// ADR-0002 Amendment 7, as `llvm-objdump` printed them: the kernel stack (`0x80000003`, 17
-    /// pages) and the boot info (`0x80000002`), each `AllocatePages(AllocateAnyPages, type, pages,
-    /// &address)`; and the translation's compares of a descriptor's type.
-    const OLD_ALLOCATIONS: &str = "14000a010:\tlea\tr9, [rbp + 0x760]\n14000a017:\tmov\tr8d, 0x11\n14000a01d:\txor\tecx, ecx\n14000a01f:\tmov\tedx, 0x80000003\n14000a024:\tcall\tqword ptr [rbp + 0x868]\n14000a13a:\tlea\tr9, [rbp + 0x760]\n14000a141:\txor\tecx, ecx\n14000a143:\tmov\tedx, 0x80000002\n14000a148:\tmov\tr8, qword ptr [rbp + 0x700]\n14000a14f:\tcall\tqword ptr [rbp + 0x868]\n140011c24:\tcmp\teax, 0x80000002\n140011c2b:\tcmp\teax, 0x80000003\n";
-
     #[test]
     fn an_allocation_of_an_old_os_defined_type_is_found() {
         let insns = instructions(OLD_ALLOCATIONS);
         let found = os_type_allocations(&insns);
         assert_eq!(
             found.iter().map(|&i| insns[i].at).collect::<Vec<_>>(),
-            [0x1_4000_a01f, 0x1_4000_a143]
+            [0x1_4000_a01f, 0x1_4000_a143, 0x1_4001_1c24, 0x1_4001_1c2b]
         );
-        // As Amendment 7 compiles them, `EfiLoaderData` (2), and the compares: nothing found.
-        let now = OLD_ALLOCATIONS
+        // As Amendment 7 compiles them, `EfiLoaderData` (2), and no translation of the old types:
+        // nothing found.
+        let now: String = OLD_ALLOCATIONS
             .replace("mov\tedx, 0x80000003", "mov\tedx, 0x2")
-            .replace("mov\tedx, 0x80000002", "mov\tedx, 0x2");
+            .replace("mov\tedx, 0x80000002", "mov\tedx, 0x2")
+            .lines()
+            .filter(|l| !l.contains("cmp"))
+            .map(|l| format!("{l}\n"))
+            .collect();
         assert_eq!(
             os_type_allocations(&instructions(&now)),
             Vec::<usize>::new()
         );
-        // The type set in RDX's full width is found too.
-        let wide = OLD_ALLOCATIONS.replace("mov\tedx, 0x80000003", "mov\trdx, 0x80000003");
-        assert_eq!(os_type_allocations(&instructions(&wide)).len(), 2);
+        // R133-5's other shapes: another register, a store, an address; and longer numbers that
+        // only begin with the type (an EFI status, say), which are not it.
+        for (shape, found) in [
+            ("mov\tebx, 0x80000003", 1),
+            ("mov\tdword ptr [rbp - 0x20], 0x80000002", 1),
+            ("lea\trdx, [rbx + 0x80000003]", 1),
+            ("mov\trax, 0x8000000200000000", 0),
+            ("mov\trax, 0x800000030", 0),
+        ] {
+            let listing = format!("140001000:\t{shape}\n");
+            assert_eq!(
+                os_type_allocations(&instructions(&listing)).len(),
+                found,
+                "{shape}"
+            );
+        }
     }
 
     /// TASKS item 133's ruling Q4, the positive control on a real image: the batch's loader before
