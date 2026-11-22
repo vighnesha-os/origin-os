@@ -449,6 +449,7 @@ const CONTROLS: &[Control] = &[
             thread.record,
             thread.generation,
             no_inconsistency,
+            no_line,
         )
         .outcome
         {
