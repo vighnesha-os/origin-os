@@ -1457,3 +1457,17 @@ Rental G (2026-11-22) ran ADR-0002 Amendment 5's minimal program on firmware 2.4
 - **Performance cost** (ADR-0018 V3): none, by construction. Only bench builds contain it.
 - **Where it is written:** ADR-0002 Amendment 6; the matrix row A02-Am6, placed in M1; TASKS item 131, which builds it.
 - **The next rental** (rental H, $0.81 expected and $1.62 at worst; the ledger at $5.67 would reach at most $7.29 of item 225's $10) is put to the owner separately, once TASKS item 131 is built.
+
+### The boot info and the kernel stack as loader data (item 353): Accepted 2026-11-22
+
+Rental H (2026-11-22) ran ADR-0002 Amendment 6's bisection mode on firmware revision 2.5a: the full bench loader's work with the boot info and the kernel stack allocated as `EfiLoaderData`. Both of its calls were followed by the firmware starting again, with the same shape and delay as after each control's triple fault, so the call most likely returned. On the same revision, rental C's loader, with Origin's OS-defined types, had stopped at the call. The firmware's boot services table equalled the loader's copy in every run.
+
+| # | Question | Answer |
+|---|---|---|
+| 353, answered | May every loader, not only bench builds, allocate the boot info and the kernel stack as `EfiLoaderData` instead of B3's OS-defined types, with the loader's translated map still naming them by address so the kernel is unchanged? A later rental would confirm it by entering the kernel on the rented board. | **Change B3** |
+
+- **The alternatives put:** the change in bench builds only, with B3 kept for shipped loaders until a rental confirms it; or no change.
+- **What stays open:** no rental has paired one loader with and without the types, and rental H rests on two calls.
+- **Performance cost** (ADR-0018 V3): none.
+- **Where it is written:** ADR-0002 Amendment 7; the matrix row A02-Am7, placed in M1; TASKS item 133, which builds it.
+- **The confirming rental** (rental I, $0.81 expected and $1.62 at worst; the ledger at $6.48 would reach at most $8.10 of item 225's $10) is put to the owner separately, once TASKS item 133 is built. Under item 350 it carries two questions: B3, and whether the call returns or the firmware's exit shuts down by itself.
