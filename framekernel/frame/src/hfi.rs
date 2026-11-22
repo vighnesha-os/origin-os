@@ -1205,13 +1205,16 @@ mod kernel {
             let base =
                 core::ptr::with_exposed_provenance::<u8>(crate::phys::to_virt(self.table) as usize);
             for (i, byte) in out.iter_mut().enumerate() {
-                // SAFETY: `at + i` lies inside the table (checked above), a run of frames this
-                // module holds for ever and the direct map maps. The processor writes it only while
-                // bit 26 is clear, and this reads it only after the status read found bit 26 set:
-                // RDMSR does not serialize, but the probe's disarm after it is a sequentially
-                // consistent store (a locked exchange) that waits for RDMSR's result, so no load
-                // here passes it (the review's R106-15).
-                *byte = unsafe { base.add(at + i).read_volatile() };
+                // SAFETY: `at + i` lies inside the table (checked above), so the offset stays
+                // within the one run of frames the direct map maps at `base`.
+                let cell = unsafe { base.add(at + i) };
+                // SAFETY: the cell is inside the table, a run of frames this module holds for ever
+                // and the direct map maps. The processor writes it only while bit 26 is clear, and
+                // this reads it only after the status read found bit 26 set: RDMSR does not
+                // serialize, but the probe's disarm after it is a sequentially consistent store (a
+                // locked exchange) that waits for RDMSR's result, so no load here passes it (the
+                // review's R106-15).
+                *byte = unsafe { cell.read_volatile() };
             }
             true
         }
