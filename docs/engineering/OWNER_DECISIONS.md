@@ -1444,3 +1444,16 @@ The owner asked whether driver code that vendors themselves contribute to Linux 
 - **The recommendation put** was to allow it within those limits; the owner chose to keep today's rule.
 - **What it confirms:** CLAUDE.md §3 and decision items 91 to 97 stand. Where no free official specification or vendor document exists, Linux and other open-source code, the vendors' own contributions included, may be read only as a reference, under §3's separate-session process, and never copied, translated or reproduced in structure. Origin writes every driver itself. Vendor firmware stays usable as §4 and §38 allow, subject to its licence.
 - **Where it is written:** this sheet, and the requirements README's table of items without rows.
+
+### A bench build's bisection mode (item 352): Accepted 2026-11-22
+
+Rental G (2026-11-22) ran ADR-0002 Amendment 5's minimal program on firmware 2.4a. After each call the firmware started again about 49 seconds later, the same delay as after the control's reset, and the next run read a shutdown. So the call most likely returned, and the cause of the stop most likely lies in what Origin's loader does before the call. On the same revision, rental E's loader stopped at the call. (The rental tool's own summaries first read it the other way; TASKS item 130 fixes that reading.)
+
+| # | Question | Answer |
+|---|---|---|
+| 352, answered | May a bench build have a third mode, chosen when the image is built: everything the full bench loader does before the call, but with the kernel stack and the boot info allocated as `EfiLoaderData` instead of Origin's OS-defined types; Amendment 5's resets (a triple-fault control, and a triple fault after every successful call, never `0xCF9`); and Amendment 4's addition's compare of the live boot services table with the copy? One rental then answers two questions, which item 350 asks for. | **Allow it** |
+
+- **The alternatives put:** no rental, so the pause continues; or the full bench image as it stands, which answers one question and whose `0xCF9` reset is an SMI on this board.
+- **Performance cost** (ADR-0018 V3): none, by construction. Only bench builds contain it.
+- **Where it is written:** ADR-0002 Amendment 6; the matrix row A02-Am6, placed in M1; TASKS item 131, which builds it.
+- **The next rental** (rental H, $0.81 expected and $1.62 at worst; the ledger at $5.67 would reach at most $7.29 of item 225's $10) is put to the owner separately, once TASKS item 131 is built.
