@@ -1403,3 +1403,15 @@ Rental F (2026-11-22) showed `ExitBootServices` not returning on the rented serv
   - ADR-0002 Amendment 4's "Addition" paragraph;
   - the matrix row A02-Am4, which now names item 348 beside 345 and 346;
   - TASKS item 128.
+
+### Amendment 5 after a successful call (item 349): Answered 2026-11-22
+
+TASKS item 128's review found that Amendment 5 (item 347), as accepted, contradicted itself in one case: a successful call where the FCH's shutdown bits are clear. It kept Amendment 4's refinement 3 after the call, which falls back to the firmware's reset methods, and it also said the mode calls nothing in the firmware after a successful call.
+
+| # | Question | Answer |
+|---|---|---|
+| 349, answered | In the minimal mode, after a successful call with a shutdown bit clear, should the loader use the firmware's reset methods (`ResetSystem`, then the FADT's register, never `0xCF9`), so the run ends visibly, with a note on Amendment 5's "no firmware call"? Or keep "no firmware call" literally and triple-fault anyway, though the machine may stop silently, since the line printed before the call already says the bits were clear? | **Forced fault anyway** |
+
+- **The recommendation put** was the firmware fallback; the owner chose the other option.
+- **What it changes:** after `EFI_SUCCESS` the minimal mode always triple-faults. Refinement 3 still decides the control in a boot's first run. On rental F's board both bits are set, so the case does not arise there.
+- **Where it is written:** ADR-0002 Amendment 5's "Clarification" paragraph and its list of differences; row A02-Am5, now decided by 347 and 349; TASKS item 128's entry.
