@@ -1293,13 +1293,13 @@ pub enum MinimalDecision {
     /// The boot's first run, the control: a triple fault before the call. `PMxC0` named this
     /// other cause.
     Control(u32),
-    /// The call; after `EFI_SUCCESS`, the triple fault where `shutdown` (both shutdown bits read
-    /// before the call), else Amendment 3's order (refinement 3, which holds after the call too:
-    /// the coordinating session's ruling Q3).
+    /// The call; after `EFI_SUCCESS`, the triple fault, whatever the shutdown bits say (owner item
+    /// 349, "Forced fault anyway"). Refinement 3 decides only the control.
     Call {
         /// Why the call is made.
         why: CallWhy,
-        /// Whether the triple fault follows a successful call.
+        /// Whether both shutdown bits were read set, so the triple fault is known to reset this
+        /// system; the line says when they are not.
         shutdown: bool,
     },
 }
@@ -1380,12 +1380,13 @@ impl fmt::Display for MinimalDecisionLine {
                 shutdown
             }
         };
-        f.write_str(": ExitBootServices is called through the live boot services table; after EFI_SUCCESS, ")?;
-        f.write_str(if shutdown {
-            "a triple fault and nothing before it"
-        } else {
-            "Amendment 3's order, since no shutdown is known to reset this system"
-        })
+        f.write_str(": ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it")?;
+        if !shutdown {
+            f.write_str(
+                ", though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)",
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -2325,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn the_minimal_decision_follows_amendment_5_step_4_and_ruling_q3() {
+    fn the_minimal_decision_follows_amendment_5_step_4_and_item_349() {
         let both = |status| {
             let mut r = fitting(status);
             r.acpi_config |= SHUTDOWN_MESSAGE;
@@ -2368,7 +2369,8 @@ mod tests {
                 "{bits:?}"
             );
         }
-        // No record: the call; the triple fault only with both bits (ruling Q3).
+        // No record: the call; `shutdown` says whether both bits are set (the triple fault follows
+        // a successful call either way: item 349).
         assert_eq!(
             of(&both(RESET_STATUS_AT_POWER_ON)),
             MinimalDecision::Call {
@@ -2419,6 +2421,6 @@ mod tests {
             why: CallWhy::NotRead,
             shutdown: false
         })
-        .ends_with("after EFI_SUCCESS, Amendment 3's order, since no shutdown is known to reset this system"));
+        .ends_with("after EFI_SUCCESS, a triple fault and nothing before it, though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)"));
     }
 }

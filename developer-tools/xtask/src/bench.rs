@@ -765,7 +765,7 @@ const MIN_STAND_IN: &str = "origin-boot: bench build: minimal: the stand-in tabl
 const MIN_CONTROL: &str = "origin-boot: bench build: minimal: the last reset was not a shutdown (the reset pin (bit 16)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called";
 const MIN_MINE: &str = "origin-boot: bench build: minimal: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it";
 const MIN_NO_RECORD: &str = "origin-boot: bench build: minimal: PMxC0 0x00000800 names no reset cause: no record of the last reset, and no control in this boot: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it";
-const MIN_NO_RECORD_QUIET: &str = "origin-boot: bench build: minimal: PMxC0 0x00000800 names no reset cause: no record of the last reset, and no control in this boot: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, Amendment 3's order, since no shutdown is known to reset this system";
+const MIN_NO_RECORD_BITS_CLEAR: &str = "origin-boot: bench build: minimal: PMxC0 0x00000800 names no reset cause: no record of the last reset, and no control in this boot: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it, though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)";
 const MIN_LAST: &str = "origin-boot: bench build: minimal: ExitBootServices next, through the live boot services table";
 const MIN_HALT_SOON: &str = "origin-boot: bench build: no reset: ResetSystem is not called and the FADT gives no usable reset register; a halt in 7 s";
 const MIN_CF9_SKIPPED: &str = "origin-boot: bench build: ResetSystem was not called (the stand-in table's noreset), and the FADT gives no usable reset register (RESET_REG is I/O port 0xcf9, which the minimal mode never writes (ADR-0002 Amendment 5)): halting";
@@ -922,8 +922,8 @@ fn minimal_stale_once(work: &Path) -> Result<Vec<String>> {
     stand_in(work, b"mine stale1")
 }
 
-fn minimal_fadt_skipped(work: &Path) -> Result<Vec<String>> {
-    stand_in(work, b"norecord noshutdown noreset")
+fn minimal_bits_clear(work: &Path) -> Result<Vec<String>> {
+    stand_in(work, b"norecord noshutdown")
 }
 
 fn minimal_stale_twice(work: &Path) -> Result<Vec<String>> {
@@ -1167,17 +1167,12 @@ fn scenarios() -> Vec<Scenario> {
             Some(QUIET),
         ),
         scenario(
-            "bench: minimal, Amendment 3's order, the FADT's register at 0xCF9 skipped",
+            "bench: minimal, the shutdown bits clear, the triple fault anyway",
             Loader::BenchMinimal,
-            lines(&[
-                MIN_NO_RECORD_QUIET,
-                MIN_LAST,
-                MIN_HALT_SOON,
-                MIN_CF9_SKIPPED,
-            ]),
-            minimal_fadt_skipped,
-            check_minimal_fadt_skipped,
-            Some(QUIET),
+            lines(&[MIN_NO_RECORD_BITS_CLEAR, MIN_LAST, MARK_FIRST]),
+            minimal_bits_clear,
+            check_minimal_bits_clear,
+            Some(RESET_WITHIN),
         ),
     ]
 }
@@ -1723,11 +1718,10 @@ fn check_minimal_retry(done: &Completed, _settings: &Settings) -> Result {
     check_minimal_call(done, MIN_MINE, &[MARK_FIRST, MARK_RETRY])
 }
 
-/// With the shutdown message off, a successful call is followed by Amendment 3's order with no
-/// `ResetSystem` (`noreset`), whose FADT step the mode skips, since the register is port `0xCF9`
-/// under QEMU (the coordinating session's addition to ruling Q3): the halt, and QEMU runs on.
 /// Both calls given a stale key (R128-10): `X`, `Y`, Amendment 2's line, then Amendment 3's order
-/// with no `ResetSystem` (`noreset`), whose FADT step at `0xCF9` the mode skips: the halt.
+/// with no `ResetSystem` (`noreset`), whose FADT step the mode skips, since the register is port
+/// `0xCF9` under QEMU (the coordinating session's addition to ruling Q3, kept for the error path
+/// by item 349): the halt, and QEMU runs on.
 fn check_minimal_both_failed(done: &Completed, _settings: &Settings) -> Result {
     check_minimal_console(done, MIN_MINE)?;
     let after = after_minimal_last(done)?;
@@ -1749,19 +1743,11 @@ fn check_minimal_both_failed(done: &Completed, _settings: &Settings) -> Result {
     Ok(())
 }
 
-fn check_minimal_fadt_skipped(done: &Completed, _settings: &Settings) -> Result {
-    check_minimal_console(done, MIN_NO_RECORD_QUIET)?;
-    let after = after_minimal_last(done)?;
-    let want = [MARK_FIRST, MIN_HALT_SOON, MIN_CF9_SKIPPED];
-    if after.iter().map(String::as_str).ne(want) {
-        return Err(format!(
-            "after the minimal mode's last line the SPCR's UART should hold {want:?}; it holds {after:?}"
-        ));
-    }
-    if done.exited {
-        return Err("QEMU exited: something reset the machine, though the mode skips the FADT's write to 0xCF9 and halts".into());
-    }
-    Ok(())
+/// The shutdown bits read clear (owner item 349, "Forced fault anyway"): the line says a shutdown
+/// may not reset this system, no control is made, and a successful call is still followed by the
+/// triple fault at once, with no firmware call.
+fn check_minimal_bits_clear(done: &Completed, _settings: &Settings) -> Result {
+    check_minimal_call(done, MIN_NO_RECORD_BITS_CLEAR, &[MARK_FIRST])
 }
 
 /// A bench kernel under the normal loader: no breadcrumb anywhere, the line saying so, and the
@@ -1814,7 +1800,7 @@ pub(crate) fn boot(settings: &Settings) -> Result {
         run_scenario(scenario, kernel, settings)?;
     }
     println!(
-        "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, the bench kernel under the normal loader, the reset through ResetSystem, through the FADT's register, a disturbed UART written back, and the FCH's nine: the control, 0xCF9 after the call, the triple fault, the fall-through, no record, 0xCF9 only after the retry succeeds, the normal path after both calls fail, a contradicting layout, and a control that does not reset; and the minimal mode's six: the control, a returning call, no record, the retry, both calls failing, and Amendment 3's order with the FADT's write to 0xCF9 skipped) in {} s",
+        "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, the bench kernel under the normal loader, the reset through ResetSystem, through the FADT's register, a disturbed UART written back, and the FCH's nine: the control, 0xCF9 after the call, the triple fault, the fall-through, no record, 0xCF9 only after the retry succeeds, the normal path after both calls fail, a contradicting layout, and a control that does not reset; and the minimal mode's six: the control, a returning call, no record, the retry, both calls failing with the FADT's write to 0xCF9 skipped, and the triple fault with the shutdown bits clear) in {} s",
         chosen.len(),
         all.len(),
         started.elapsed().as_secs()

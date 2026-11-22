@@ -454,6 +454,26 @@ class Guards(unittest.TestCase):
         bench.write_bytes(b"MZ...origin-boot: bench build: minimal: the minimal-program mode")
         self.assertIn("the minimal-mode bench loader", self.lat.loader_kind(bench))
 
+    def test_a_minimal_build_counts_the_loaders_runs_and_times_them(self):
+        # TASKS item 128 (ruling R128-2): the minimal mode never says BENCH-AFTER; its own text
+        # marks a build that resets after the call, with no breadcrumbs.
+        banner = "Origin OS 0.1.0-dev UEFI loader (build 0)\r\n"
+        loader = (banner + "origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 "
+                  "Amendment 5): no kernel read\r\n"
+                  "origin-boot: bench build: minimal: ExitBootServices next, through the live boot "
+                  "services table\r\nX\r\n")
+        once = self.lat.boot_result(self.lat.clean(loader))
+        self.assertEqual(once["loader_runs"], 1)
+        self.assertNotIn("breadcrumbs", once)
+        self.assertIsNone(self.lat.breadcrumbs(self.lat.clean(loader)))
+        self.assertTrue(once["summary"].endswith("loader runs: 1, with no reset of its own"), once["summary"])
+        twice = self.lat.boot_result(self.lat.clean(loader + "\x1b[2JPre-memory NB Initialization\r\n" + loader))
+        self.assertEqual(twice["loader_runs"], 2)
+        raw = (loader + "\x1b[2JPre-memory\r\n" + loader).encode()
+        line_end = raw.find(b"services table") + len(b"services table\r\n")
+        times = [(100.0, line_end), (100.5, line_end + 3), (108.0, line_end + 5), (170.0, len(raw))]
+        self.assertEqual(self.lat.after_last_line(raw, times), (0.5, 70.0))
+
     def test_redact_removes_mac_addresses_and_the_guid(self):
         text = ("Boot0003* UEFI PXE IPv4: Intel(R) Ethernet Controller X550(MAC:020000000001)\n"
                 "CLIENT MAC ADDR: 02 00 00 00 00 02  GUID: C0FFEE00-0000-4000-8000-0000000000A1\n"

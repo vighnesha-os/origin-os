@@ -2395,9 +2395,9 @@ mod measure {
 ///    addition's `SMIxC0`, behind the same gate; under QEMU, the stand-in table's values;
 /// 3. the branch on `PMxC0`: the control (a triple fault, no call), or the call;
 /// 4. the call through the live boot services table, after `X`;
-/// 5. after `EFI_SUCCESS`, the status compare, then the triple fault where both shutdown bits
-///    were read set, else Amendment 3's order with no `0xCF9` write; after an error, the retry
-///    with `Y`; after a second, Amendment 2's line and Amendment 3's order.
+/// 5. after `EFI_SUCCESS`, the status compare, then the triple fault, whatever the shutdown bits
+///    say (owner item 349); after an error, the retry with `Y`; after a second, Amendment 2's
+///    line and Amendment 3's order, with no `0xCF9` write.
 ///
 /// It reads no kernel file, verifies nothing, starts no generator, allocates nothing, builds no
 /// page tables, searches for no framebuffer, copies no boot services table, calls no `Stall`,
@@ -2564,14 +2564,13 @@ mod minimal {
         }
         let decision = fch::MinimalDecision::of(seen.registers.as_ref(), seen.pm1a_event);
         let _ = writeln!(out, "{}", fch::MinimalDecisionLine(decision));
-        let shutdown = match decision {
-            fch::MinimalDecision::Control(_) => {
-                wait_ticks(CONTROL_SPIN);
-                mask_interrupts();
-                triple_fault()
-            }
-            fch::MinimalDecision::Call { shutdown, .. } => shutdown,
-        };
+        // The control only where both shutdown bits let a shutdown reset the system (refinement
+        // 3); otherwise the call, whose triple fault follows whatever the bits say (item 349).
+        if let fch::MinimalDecision::Control(_) = decision {
+            wait_ticks(CONTROL_SPIN);
+            mask_interrupts();
+            triple_fault()
+        }
         let stale = stand_in.map_or(0, |s| s.stale);
         let plan = BenchPlan {
             after: if stand_in.is_some_and(|s| s.no_reset_system) {
@@ -2619,9 +2618,9 @@ mod minimal {
                 // since `GetMemoryMap`.
                 let status = unsafe { exit(image, key) };
                 // Amendment 5, step 6: after EFI_SUCCESS, the status compare, then the triple
-                // fault; nothing comes between them. Only where both shutdown bits were read set
-                // (refinement 3, which holds after the call too: ruling Q3).
-                if status == Status::SUCCESS && shutdown {
+                // fault; nothing comes between them, whatever the shutdown bits say (owner item
+                // 349, "Forced fault anyway": no firmware call after a successful call).
+                if status == Status::SUCCESS {
                     triple_fault();
                 }
                 calls.record(status);
@@ -2629,13 +2628,23 @@ mod minimal {
             },
         );
         match outcome {
+            // A call that returned a status that is neither EFI_SUCCESS nor an error, which UEFI
+            // 2.11 §7.4 does not give: boot services are gone, so no firmware call either (item
+            // 349); a line, and the halt. Only EFI_SUCCESS is followed by the triple fault, so a
+            // lost triple fault after a successful call shows as this halt (control MC-9).
             ExitOutcome::Exited => {
                 mask_interrupts();
-                bench_reset(early_uart, &plan)
+                say_on_uart(
+                    early_uart,
+                    "origin-boot: bench build: minimal: ExitBootServices returned neither EFI_SUCCESS nor an error: halting",
+                );
+                halt()
             }
             ExitOutcome::Halt => {
                 mask_interrupts();
-                // Decision item 342: why, on the UART, then Amendment 3's order.
+                // Decision item 342: why, on the UART, then Amendment 3's order, with the FADT's
+                // step skipped at port 0xCF9 (the coordinating session's addition to Q3, which item
+                // 349 keeps for the error path).
                 say_halting(early_uart, calls);
                 bench_reset(early_uart, &plan)
             }

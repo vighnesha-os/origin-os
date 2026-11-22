@@ -517,7 +517,7 @@ pub const fn minimal_register(
 
 /// The line the minimal-mode loader writes first, after the banner (ADR-0002 Amendment 5). The
 /// rental tool and the records tell a minimal-mode image by its text, `bench build: minimal`.
-pub const MINIMAL_LINE: &str = "origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault where both shutdown bits are set, else Amendment 3's order (TASKS item 128's review, R128-1)";
+pub const MINIMAL_LINE: &str = "origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)";
 
 /// The time-stamp counter's ticks a millisecond the minimal mode takes for its waits, since it
 /// calls no `Stall` to count them (ADR-0002 Amendment 5, "no `Stall`"): [`ASSUMED_TICKS_PER_MS`],

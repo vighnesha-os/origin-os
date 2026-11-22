@@ -1079,8 +1079,20 @@ CRUMB_BYTES = "RS12345678"
 # TASKS item 116: every bench loader that resets after ExitBootServices says whether BENCH-AFTER
 # is there, and each start of a loader prints its banner. The file of the console's arrival times.
 RESET_BUILD_LINE = "BENCH-AFTER"
+# TASKS item 128 (the coordinating session's ruling on R128-2): the minimal-mode bench loader reads
+# no switch file, so it never says "BENCH-AFTER"; its own text marks a build that resets after the
+# call, whose loader runs are the experiment's answer. Its last line before the call.
+MINIMAL_BUILD_LINE = "bench build: minimal"
+MINIMAL_LAST_LINE = b"ExitBootServices next, through the live boot services table"
 LOADER_START = "UEFI loader (build"
 TIMES_FILE = "sol-times.log"
+
+
+def resets_after_call(text):
+    """Whether one boot's console text is a bench loader's that resets the machine after the call,
+    instead of entering the kernel: TASKS item 116's (it says whether BENCH-AFTER is there) or the
+    minimal mode's (TASKS item 128)."""
+    return RESET_BUILD_LINE in text or MINIMAL_BUILD_LINE in text
 
 
 def breadcrumbs(text):
@@ -1089,7 +1101,7 @@ def breadcrumbs(text):
     `RS12345678` when every step passed, so the last one names the step the boot stopped after.
     None for a boot that was not a bench build's (no bench loader line), "" for one that wrote
     none."""
-    if BENCH_LINE not in text or RESET_BUILD_LINE in text:
+    if BENCH_LINE not in text or resets_after_call(text):
         return None
     after = text[text.rfind(LOADER_LINE):]
     after = after[after.find("\n") + 1:] if "\n" in after else ""
@@ -1118,7 +1130,7 @@ def boot_result(text):
     # TASKS item 116: a bench loader that resets the machine starts again within the boot's
     # window if ExitBootServices returned (reading B), and never does if it did not (reading A, or
     # a ResetSystem that hung).
-    if RESET_BUILD_LINE in text:
+    if resets_after_call(text):
         runs = text.count(LOADER_START)
         seen["loader_runs"] = runs
         said = (f"; loader runs: {runs}, " +
@@ -1138,10 +1150,13 @@ def boot_result(text):
 
 def after_last_line(raw, times):
     """TASKS item 116: in one boot's raw console bytes, how many seconds after the loader's first
-    `exiting boot services` line the next byte arrived, and the next loader's banner, from the
+    `exiting boot services` line (or the minimal mode's last line, TASKS item 128) the next byte
+    arrived, and the next loader's banner, from the
     arrival times `[(time, size)]` (the console's size from the boot's start). None for what did
     not arrive within the boot. Times are good to the half second the console is sampled at."""
     end = raw.find(b"entering the Framekernel")
+    if end < 0:
+        end = raw.find(MINIMAL_LAST_LINE)
     if end < 0 or not times:
         return None, None
     end = raw.find(b"\n", end)
@@ -1269,7 +1284,7 @@ def cmd_rental_b(args):
                     time.sleep(10)
                     result = boot_result(console.text(start))
                 result.update(boot=boot, start=start, end=console.size())
-                if RESET_BUILD_LINE in console.text(start):
+                if resets_after_call(console.text(start)):
                     raw = console.path.read_bytes()[start:result["end"]]
                     first, loader_again = after_last_line(raw, read_times(rental.dir / TIMES_FILE, start))
                     result.update(next_byte_s=first, next_loader_s=loader_again)
