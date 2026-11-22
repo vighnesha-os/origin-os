@@ -14,12 +14,16 @@
 #[cfg(any(test, origin_bench))]
 pub mod bench;
 pub mod console;
+#[cfg(any(test, origin_bench))]
+pub mod fch;
 pub mod framebuffer;
 pub mod kernel;
 pub mod memmap;
 pub mod place;
 pub mod protocols;
 pub mod spcr;
+#[cfg(any(test, origin_stack_measure))]
+pub mod stackdepth;
 pub mod text;
 pub mod trust;
 pub mod uart;

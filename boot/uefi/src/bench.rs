@@ -200,6 +200,13 @@ pub enum After {
     /// Rental D's reading B1, made under QEMU, so that writing the firmware's values back is
     /// seen to matter.
     Disturb,
+    /// The minimal mode's stand-in table's `noreset` (ADR-0002 Amendment 5, QEMU only): as
+    /// [`After::Fadt`], `ResetSystem` is not called, so the FADT's step is reached. Never read from
+    /// [`AFTER_PATH`].
+    StandInNoReset,
+    /// The bisection mode's `BENCH-FCH` word `noreset` (ADR-0002 Amendment 6, QEMU only): as
+    /// [`After::StandInNoReset`]. Never read from [`AFTER_PATH`].
+    SwitchNoReset,
 }
 
 impl After {
@@ -217,6 +224,14 @@ impl After {
     /// Whether the kernel is entered after a successful call.
     pub const fn enters_kernel(self) -> bool {
         matches!(self, Self::Kernel)
+    }
+
+    /// Whether Amendment 3's order calls no `ResetSystem` in this mode.
+    pub const fn skips_reset_system(self) -> bool {
+        matches!(
+            self,
+            Self::Fadt | Self::StandInNoReset | Self::SwitchNoReset
+        )
     }
 
     /// The loader's line on its console about the switch: `found` is `None` with no
@@ -240,6 +255,12 @@ impl After {
             }
             Some(Some(Self::Disturb)) => {
                 "BENCH-AFTER disturb: after ExitBootServices the loader turns the UART's loopback on and changes its divisor, then writes the firmware's values back, then resets the machine"
+            }
+            Some(Some(Self::StandInNoReset)) => {
+                "the stand-in table's noreset: Amendment 3's order calls no ResetSystem"
+            }
+            Some(Some(Self::SwitchNoReset)) => {
+                "BENCH-FCH's noreset: Amendment 3's order calls no ResetSystem"
             }
         }
     }
@@ -484,23 +505,222 @@ pub enum NoReset {
     /// A memory address the firmware's map does not describe as memory-mapped I/O, so the
     /// firmware's page tables may not map it.
     NotMmio(u64),
+    /// I/O port `0xCF9`, which the minimal mode never writes (ADR-0002 Amendment 5: "there is no
+    /// `0xCF9` write anywhere in this mode"; the coordinating session's ruling on TASKS item
+    /// 128's Q3). Under QEMU the FADT's reset register is that port; on the rented board it is
+    /// the SMI command port `0xB2`.
+    Cf9InMinimal,
+    /// I/O port `0xCF9`, which the bisection mode never writes either (ADR-0002 Amendment 6, step
+    /// 5: "with the FADT step skipped where its register is I/O port `0xCF9`").
+    Cf9InBisect,
+}
+
+/// The FADT's reset register as the minimal mode may use it in Amendment 3's order: the same,
+/// unless it is I/O port `0xCF9`, which the mode skips ([`NoReset::Cf9InMinimal`]), going
+/// straight to the halt.
+pub const fn minimal_register(
+    register: Result<ResetRegister, NoReset>,
+) -> Result<ResetRegister, NoReset> {
+    match register {
+        Ok(ResetRegister::Io { port: 0xCF9, .. }) => Err(NoReset::Cf9InMinimal),
+        other => other,
+    }
+}
+
+/// [`minimal_register`] for the bisection mode (ADR-0002 Amendment 6, step 5).
+pub const fn bisect_register(
+    register: Result<ResetRegister, NoReset>,
+) -> Result<ResetRegister, NoReset> {
+    match register {
+        Ok(ResetRegister::Io { port: 0xCF9, .. }) => Err(NoReset::Cf9InBisect),
+        other => other,
+    }
+}
+
+/// The bisection mode's first line, after the banner (ADR-0002 Amendment 6; ruling Q8 of TASKS
+/// item 131). The rental tool tells a bisection-mode image by its text, `bench build: bisect`.
+pub const BISECT_LINE: &str = "origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write";
+
+/// The bisection mode's line about `BENCH-AFTER`, which it reads as the full loader does and
+/// whose value it ignores (ruling Q3 of TASKS item 131).
+pub const BISECT_AFTER_IGNORED: &str = "origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults";
+
+/// The bisection mode's last line through the firmware's console, in place of the full loader's
+/// "exiting boot services; entering the Framekernel".
+pub const BISECT_LAST_LINE: &str = "origin-boot: bench build: bisect: ExitBootServices next, through the loader's copy of the boot services table";
+
+/// What the bisection mode counted in the last memory map it translated before its last line
+/// (ADR-0002 Amendment 6, step 2; rulings Q6 and Q7 of TASKS item 131): the descriptors of an
+/// OS-defined type, `0x8000_0000` or above, and the first such type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OsTypesLine(pub Option<crate::memmap::OsTypes>);
+
+impl fmt::Display for OsTypesLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("origin-boot: bench build: bisect: ")?;
+        match self.0 {
+            None => f.write_str(
+                "the memory map the page tables were built from was not read, so its types were not counted; this run does not show that the map holds no OS-defined type",
+            ),
+            // R131-4: a map of no descriptors shows nothing.
+            Some(t) if t.descriptors == 0 => f.write_str(
+                "the memory map the page tables were built from held no descriptor to count, so its types were not counted; this run does not show that the map holds no OS-defined type",
+            ),
+            Some(t) if t.count == 0 => write!(
+                f,
+                "the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in {} descriptors",
+                t.descriptors
+            ),
+            Some(t) => write!(
+                f,
+                "the memory map the page tables were built from holds {} region(s) of an OS-defined type (0x80000000 and above), the first {:#010x}, in {} descriptors: this run does not answer whether the call returns without Origin's OS-defined types",
+                t.count, t.first, t.descriptors
+            ),
+        }
+    }
+}
+
+/// The line the kernel-entry bench loader writes first, after the banner (TASKS item 133; ADR-0002
+/// Amendment 7). The rental tool and the records tell a kernel-entry image by its text,
+/// `bench build: kernel`.
+pub const KERNEL_LINE: &str = "origin-boot: bench build: kernel: the kernel-entry mode (TASKS item 133, ADR-0002 Amendment 7): the full bench loader's work before the call, with the boot info and the kernel stack as EfiLoaderData; no FCH decision, no control and no reset; after a successful call, the bench kernel with its breadcrumbs";
+
+/// The kernel-entry mode's line when `BENCH-AFTER` is there: it reads and ignores it. It writes
+/// this, or [`KERNEL_NO_AFTER`], in place of the full mode's line, which would say the kernel is
+/// not entered (TASKS item 133's review, R133-4).
+pub const KERNEL_AFTER_IGNORED: &str = "origin-boot: bench build: kernel: BENCH-AFTER's value is ignored: this mode enters the kernel after a successful call, and halts after two failed calls";
+
+/// The kernel-entry mode's line when no `BENCH-AFTER` is there, as on a rented board.
+pub const KERNEL_NO_AFTER: &str = "origin-boot: bench build: kernel: no BENCH-AFTER; this mode enters the kernel after a successful call, and halts after two failed calls";
+
+/// The kernel-entry mode's line after the FCH's: no control, and no reset after the call.
+pub const KERNEL_FCH_LINE: &str = "origin-boot: bench build: kernel: the FCH's record decides nothing in this mode: no control, and no reset after the call";
+
+/// The line the minimal-mode loader writes first, after the banner (ADR-0002 Amendment 5). The
+/// rental tool and the records tell a minimal-mode image by its text, `bench build: minimal`.
+pub const MINIMAL_LINE: &str = "origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault, whatever the shutdown bits say (decision item 349)";
+
+/// The time-stamp counter's ticks a millisecond the minimal mode takes for its waits, since it
+/// calls no `Stall` to count them (ADR-0002 Amendment 5, "no `Stall`"): [`ASSUMED_TICKS_PER_MS`],
+/// above any rate a processor's counter runs at, so each wait is at least as long as its figure
+/// (TASKS item 128's review, R128-7). Under QEMU, whose counter is slower, the waits are longer.
+pub const MINIMAL_TICKS_PER_MS: u64 = ASSUMED_TICKS_PER_MS;
+
+/// Amendment 4's addition (item 348), the full mode: the live boot services table against the
+/// loader's copy, before its last line. The minimal mode makes no copy, so it has no such line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableLine {
+    /// Where the system table says the live table is, now.
+    pub live_at: u64,
+    /// Where the loader's copy was taken from.
+    pub copied_from: u64,
+    /// The copy's size, over which the two are compared.
+    pub size: usize,
+    /// How the live table compares.
+    pub live: Live,
+    /// The copy's `ExitBootServices`.
+    pub copy_exit: u64,
+    /// The copy's header CRC32 field.
+    pub copy_crc: u32,
+}
+
+/// The live boot services table, as [`TableLine`] found it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Live {
+    /// Its signature or `HeaderSize` does not check, so its bytes were not read.
+    Unchecked,
+    /// Read over the copy's size: the first byte that differs, if one does, its
+    /// `ExitBootServices` and its header CRC32 field.
+    Read {
+        /// The first byte that differs from the copy.
+        first_difference: Option<usize>,
+        /// Its `ExitBootServices`.
+        exit: u64,
+        /// Its header CRC32 field.
+        crc: u32,
+    },
+}
+
+/// The first of `copy.len()` bytes where `live(i)` differs from `copy[i]`.
+pub fn first_difference(copy: &[u8], mut live: impl FnMut(usize) -> u8) -> Option<usize> {
+    copy.iter()
+        .enumerate()
+        .find(|&(i, &b)| live(i) != b)
+        .map(|(i, _)| i)
+}
+
+impl fmt::Display for TableLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{PREFIX}the boot services table (ADR-0002 Amendment 4's addition): the system table names it at {:#x}",
+            self.live_at
+        )?;
+        if self.live_at != self.copied_from {
+            write!(
+                f,
+                ", not at {:#x}, where the loader's copy was taken from",
+                self.copied_from
+            )?;
+        }
+        match self.live {
+            Live::Unchecked => write!(
+                f,
+                "; the pointer is null or misaligned, or the table's signature or size does not check, so it was not compared; the copy's ExitBootServices {:#x}, header CRC32 {:#010x}",
+                self.copy_exit, self.copy_crc
+            ),
+            Live::Read {
+                first_difference,
+                exit,
+                crc,
+            } => {
+                match first_difference {
+                    None => write!(
+                        f,
+                        "; the same as the loader's copy, byte for byte over its {} bytes",
+                        self.size
+                    )?,
+                    Some(at) => write!(
+                        f,
+                        "; it differs from the loader's copy from byte {at} of {}",
+                        self.size
+                    )?,
+                }
+                write!(
+                    f,
+                    "; ExitBootServices live {exit:#x}, copy {:#x}; header CRC32 live {crc:#010x}, copy {:#010x}",
+                    self.copy_exit, self.copy_crc
+                )
+            }
+        }
+    }
 }
 
 /// The longest FADT read: ACPI 6.6's is 276 bytes.
 pub const MAX_FADT_LENGTH: usize = 1024;
 
-/// The FADT's reset register (ACPI 6.6 §4.8.3.6, §5.2.9), checked as untrusted input: the RSDP
-/// and XSDT as the SPCR's walk checks them; the first FADT the XSDT lists, passed over only when
-/// the shared parser refuses it, and the end of the walk when it is longer than
-/// [`MAX_FADT_LENGTH`] or cannot be read whole, as the SPCR's walk does (T84-8); the kernel's own
-/// parser (`RESET_REG_SUP`, 8 bits at bit 0, the value present); then system I/O or system memory
-/// only, an I/O port from 1 to `0xFFFF`, and memory only where `is_mmio` says the firmware's map
-/// describes memory-mapped I/O. Every byte is read through `read`, as in `spcr::find`.
+/// The FADT's reset register (ACPI 6.6 §4.8.3.6, §5.2.9), checked as untrusted input: the FADT
+/// as [`with_fadt`] finds it; the kernel's own parser (`RESET_REG_SUP`, 8 bits at bit 0, the
+/// value present); then system I/O or system memory only, an I/O port from 1 to `0xFFFF`, and
+/// memory only where `is_mmio` says the firmware's map describes memory-mapped I/O.
 pub fn find_reset(
     rsdp: u64,
     read: &mut impl FnMut(u64, &mut [u8]) -> bool,
     is_mmio: impl Fn(u64) -> bool,
 ) -> Result<ResetRegister, NoReset> {
+    with_fadt(rsdp, read, |fadt, _| register(fadt, &is_mmio))?
+}
+
+/// The FADT, handed to `f` with `read` (TASKS items 116 and 121): the RSDP and XSDT as the SPCR's
+/// walk checks them; the first FADT the XSDT lists, passed over only when the shared parser
+/// refuses it, and the end of the walk when it is longer than [`MAX_FADT_LENGTH`] or cannot be
+/// read whole, as the SPCR's walk does (T84-8). Every byte is read through `read`, as in
+/// `spcr::find`.
+pub fn with_fadt<T>(
+    rsdp: u64,
+    read: &mut impl FnMut(u64, &mut [u8]) -> bool,
+    f: impl FnOnce(&Fadt<'_>, &mut dyn FnMut(u64, &mut [u8]) -> bool) -> T,
+) -> Result<T, NoReset> {
     let missing = |m| NoReset::Missing(m);
     if rsdp == 0 {
         return Err(missing(Missing::NoRsdp));
@@ -543,7 +763,7 @@ pub fn find_reset(
             return Err(NoReset::Unreadable(table));
         }
         match Fadt::parse(whole) {
-            Ok(fadt) => return register(&fadt, &is_mmio),
+            Ok(fadt) => return Ok(f(&fadt, read)),
             // A header that does not check: a later FADT may.
             Err(e) => {
                 refused.get_or_insert(NoReset::Table(e.kind));
@@ -618,6 +838,12 @@ impl fmt::Display for NoReset {
             Self::NotMmio(at) => write!(
                 f,
                 "RESET_REG names memory at {at:#x}, which the firmware's map does not describe as memory-mapped I/O"
+            ),
+            Self::Cf9InMinimal => f.write_str(
+                "RESET_REG is I/O port 0xcf9, which the minimal mode never writes (ADR-0002 Amendment 5)",
+            ),
+            Self::Cf9InBisect => f.write_str(
+                "RESET_REG is I/O port 0xcf9, which the bisection mode never writes (ADR-0002 Amendment 6)",
             ),
         }
     }
@@ -763,8 +989,25 @@ pub enum Tried {
     Returned,
     /// [`After::Fadt`] asked for it not to be called.
     NotCalled,
+    /// The minimal mode's stand-in table asked for it not to be called ([`After::StandInNoReset`]).
+    NotCalledStandIn,
+    /// The bisection mode's `BENCH-FCH` asked for it not to be called ([`After::SwitchNoReset`]).
+    NotCalledSwitch,
     /// There was none to call.
     Unavailable,
+}
+
+impl Tried {
+    /// Why `ResetSystem` was not called in `after`'s mode: the mode asked for it not to be, or
+    /// there was none to call (TASKS item 131's review, R131-1).
+    pub const fn not_called(after: After) -> Self {
+        match after {
+            After::Fadt => Self::NotCalled,
+            After::StandInNoReset => Self::NotCalledStandIn,
+            After::SwitchNoReset => Self::NotCalledSwitch,
+            After::Reset | After::Kernel | After::Disturb => Self::Unavailable,
+        }
+    }
 }
 
 /// The line straight to the UART when `ResetSystem` did not reset the machine: the FADT's
@@ -783,6 +1026,8 @@ impl fmt::Display for Fallback {
         f.write_str(match self.tried {
             Tried::Returned => "ResetSystem returned",
             Tried::NotCalled => "ResetSystem was not called (BENCH-AFTER fadt)",
+            Tried::NotCalledStandIn => "ResetSystem was not called (the stand-in table's noreset)",
+            Tried::NotCalledSwitch => "ResetSystem was not called (BENCH-FCH's noreset)",
             Tried::Unavailable => "there was no ResetSystem to call",
         })?;
         match self.register {
@@ -1488,5 +1733,206 @@ mod tests {
             .to_string(),
             "origin-boot: bench build: ResetSystem returned, and the FADT gives no usable reset register (the FADT's flags give no reset register (RESET_REG_SUP clear)): halting"
         );
+    }
+
+    // TASKS item 128.
+
+    #[test]
+    fn the_bisection_mode_skips_0xcf9_and_counts_os_types() {
+        let cf9 = Ok(ResetRegister::Io {
+            port: 0xCF9,
+            value: 0x06,
+        });
+        assert_eq!(bisect_register(cf9), Err(NoReset::Cf9InBisect));
+        let smi = Ok(ResetRegister::Io {
+            port: 0xB2,
+            value: 0xBE,
+        });
+        assert_eq!(bisect_register(smi), smi);
+        let line = Fallback {
+            tried: Tried::NotCalledSwitch,
+            register: bisect_register(cf9),
+        }
+        .to_string();
+        assert_eq!(
+            line,
+            "origin-boot: bench build: ResetSystem was not called (BENCH-FCH's noreset), and the FADT gives no usable reset register (RESET_REG is I/O port 0xcf9, which the bisection mode never writes (ADR-0002 Amendment 6)): halting"
+        );
+        assert!(After::SwitchNoReset.skips_reset_system() && !After::SwitchNoReset.enters_kernel());
+        // R131-1: each mode that skips `ResetSystem` names itself in the fallback's line, and every
+        // other says there was none to call.
+        for (after, tried) in [
+            (After::Fadt, Tried::NotCalled),
+            (After::StandInNoReset, Tried::NotCalledStandIn),
+            (After::SwitchNoReset, Tried::NotCalledSwitch),
+            (After::Reset, Tried::Unavailable),
+            (After::Kernel, Tried::Unavailable),
+            (After::Disturb, Tried::Unavailable),
+        ] {
+            assert_eq!(Tried::not_called(after), tried, "{after:?}");
+            assert_eq!(
+                after.skips_reset_system(),
+                tried != Tried::Unavailable,
+                "{after:?}"
+            );
+        }
+        let none = crate::memmap::OsTypes {
+            descriptors: 61,
+            count: 0,
+            first: 0,
+        };
+        assert_eq!(
+            OsTypesLine(Some(none)).to_string(),
+            "origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 61 descriptors"
+        );
+        let some = crate::memmap::OsTypes {
+            descriptors: 61,
+            count: 2,
+            first: 0x8000_0003,
+        };
+        // Ruling Q7 of TASKS item 131: a count above zero is printed, and voids the second
+        // question's answer for that run.
+        assert!(OsTypesLine(Some(some)).to_string().ends_with(
+            "holds 2 region(s) of an OS-defined type (0x80000000 and above), the first 0x80000003, in 61 descriptors: this run does not answer whether the call returns without Origin's OS-defined types"
+        ));
+        assert!(OsTypesLine(None).to_string().contains("was not read"));
+        let empty = crate::memmap::OsTypes::default();
+        assert!(
+            OsTypesLine(Some(empty))
+                .to_string()
+                .contains("held no descriptor to count")
+        );
+        assert!(
+            !OsTypesLine(Some(empty))
+                .to_string()
+                .contains("holds no region")
+        );
+        assert!(
+            BISECT_LINE.contains("bench build: bisect")
+                && BISECT_LAST_LINE.contains("bench build: bisect")
+        );
+    }
+
+    #[test]
+    fn the_minimal_mode_skips_a_reset_register_at_0xcf9_and_keeps_any_other() {
+        let cf9 = Ok(ResetRegister::Io {
+            port: 0xCF9,
+            value: 0x06,
+        });
+        assert_eq!(minimal_register(cf9), Err(NoReset::Cf9InMinimal));
+        // The rented board's: the SMI command port.
+        let smi = Ok(ResetRegister::Io {
+            port: 0xB2,
+            value: 0xBE,
+        });
+        assert_eq!(minimal_register(smi), smi);
+        let memory = Ok(ResetRegister::Memory {
+            address: 0xFED8_0000,
+            value: 0x06,
+        });
+        assert_eq!(minimal_register(memory), memory);
+        assert_eq!(
+            minimal_register(Err(NoReset::NotSupported)),
+            Err(NoReset::NotSupported)
+        );
+        let line = Fallback {
+            tried: Tried::NotCalled,
+            register: minimal_register(cf9),
+        }
+        .to_string();
+        assert!(
+            line.ends_with("(RESET_REG is I/O port 0xcf9, which the minimal mode never writes (ADR-0002 Amendment 5)): halting"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_table_line_says_same_or_where_it_differs() {
+        let copy = [1u8, 2, 3, 4];
+        assert_eq!(first_difference(&copy, |i| copy[i]), None);
+        assert_eq!(
+            first_difference(&copy, |i| if i == 2 { 9 } else { copy[i] }),
+            Some(2)
+        );
+        let same = TableLine {
+            live_at: 0x9F00_0000,
+            copied_from: 0x9F00_0000,
+            size: 192,
+            live: Live::Read {
+                first_difference: None,
+                exit: 0x9E00_1234,
+                crc: 0xDEAD_BEEF,
+            },
+            copy_exit: 0x9E00_1234,
+            copy_crc: 0xDEAD_BEEF,
+        };
+        assert_eq!(
+            same.to_string(),
+            "origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x9f000000; the same as the loader's copy, byte for byte over its 192 bytes; ExitBootServices live 0x9e001234, copy 0x9e001234; header CRC32 live 0xdeadbeef, copy 0xdeadbeef"
+        );
+        let moved = TableLine {
+            live_at: 0x9F10_0000,
+            live: Live::Read {
+                first_difference: Some(160),
+                exit: 0x9E00_5678,
+                crc: 0x1234_5678,
+            },
+            ..same
+        };
+        let line = moved.to_string();
+        assert!(line.contains("at 0x9f100000, not at 0x9f000000, where the loader's copy was taken from; it differs from the loader's copy from byte 160 of 192; ExitBootServices live 0x9e005678, copy 0x9e001234"), "{line}");
+        let unchecked = TableLine {
+            live: Live::Unchecked,
+            ..moved
+        };
+        assert!(
+            unchecked
+                .to_string()
+                .contains("does not check, so it was not compared")
+        );
+    }
+
+    /// An ACPI table with `signature` and `body`.
+    fn table(signature: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut t = vec![0u8; 36];
+        t[..4].copy_from_slice(signature);
+        t[8] = 1;
+        t[10..16].copy_from_slice(b"ORIGIN");
+        t.extend_from_slice(body);
+        let len = t.len() as u32;
+        t[4..8].copy_from_slice(&len.to_le_bytes());
+        seal(&mut t, 9);
+        t
+    }
+
+    #[test]
+    fn the_stand_in_table_is_found_by_its_signature_and_bounded() {
+        use crate::fch::{STAND_IN_MAX, find_stand_in};
+        const TABLE_AT: u64 = 0x9000_4000;
+        let found = |entries: &[u64], body: &[u8]| {
+            let memory = vec![
+                (RSDP_AT, rsdp(XSDT_AT)),
+                (XSDT_AT, xsdt(entries)),
+                (OTHER_AT, table(b"SSDT", b"x")),
+                (TABLE_AT, table(b"OXFC", body)),
+            ];
+            find_stand_in(RSDP_AT, &mut |at, out| read_from(&memory, at, out))
+                .map(|(bytes, n)| bytes[..n].to_vec())
+        };
+        assert_eq!(
+            found(&[OTHER_AT, TABLE_AT], b"mine stale1"),
+            Some(b"mine stale1".to_vec())
+        );
+        assert_eq!(found(&[OTHER_AT], b"mine"), None, "not listed");
+        assert_eq!(
+            found(&[OTHER_AT, TABLE_AT], &[b'x'; STAND_IN_MAX + 1]),
+            None,
+            "too long"
+        );
+        assert_eq!(
+            found(&[TABLE_AT], &[b'y'; STAND_IN_MAX]).map(|b| b.len()),
+            Some(STAND_IN_MAX)
+        );
+        assert_eq!(find_stand_in(0, &mut |_, _| true), None, "no RSDP");
     }
 }

@@ -5,8 +5,6 @@
 
 use origin_boot_info::{MemoryRegion, RegionKind};
 
-use crate::protocols::memory_type;
-
 /// Smallest `EFI_MEMORY_DESCRIPTOR` (§7.2); firmware may report a larger stride.
 pub const DESCRIPTOR_MIN_SIZE: usize = 40;
 const PAGE: u64 = 4096;
@@ -26,6 +24,9 @@ pub enum MapError {
     Capacity,
     /// A range to carve out is not inside a single region.
     NotContained(u64),
+    /// A range the loader names by address lies in a region that is not the firmware's loader
+    /// data, at the range's base (ADR-0002 Amendment 7; TASKS item 133's ruling Q1).
+    NotLoaderData(u64),
 }
 
 /// `EFI_MEMORY_SP` (UEFI 2.8): specific-purpose memory, not for general use.
@@ -63,14 +64,15 @@ pub const fn kind_of(uefi_type: u32) -> RegionKind {
         10 => RegionKind::AcpiNvs,
         11 | 12 => RegionKind::Mmio,
         14 => RegionKind::Persistent,
-        memory_type::OS_BOOT_INFO => RegionKind::BootInfo,
-        memory_type::OS_KERNEL_STACK => RegionKind::KernelStack,
         // `EfiReservedMemoryType` alone (boot info 0.7, decision item 293).
         0 => RegionKind::Reserved,
         // `EfiUnacceptedMemoryType`: RAM, once accepted.
         15 => RegionKind::Unaccepted,
-        // PalCode (13), the OEM and the other OS types, and every type this loader does not
-        // know: firmware memory the kernel never uses, and never one an RMRR or IVMD may name.
+        // PalCode (13), the OEM and the OS types, and every type this loader does not know:
+        // firmware memory the kernel never uses, and never one an RMRR or IVMD may name. Since
+        // ADR-0002 Amendment 7 no Origin loader allocates `0x8000_0002` or `0x8000_0003`, so a
+        // descriptor of either is the firmware's, and is never boot info or a kernel stack: the
+        // kernel takes its secret area only from boot info (TASKS item 133's ruling Q2).
         _ => RegionKind::FirmwareOther,
     }
 }
@@ -93,6 +95,41 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
         }
     }
     u64::from_le_bytes(v)
+}
+
+/// The first type UEFI leaves to OS loaders (UEFI 2.11 §7.2.1, `0x8000_0000` to `0xFFFF_FFFF`).
+pub const OS_TYPES_FROM: u32 = 0x8000_0000;
+
+/// A count of a raw memory map's descriptors of an OS-defined type (ADR-0002 Amendment 6, step
+/// 2): the bisection mode's line that the map holds none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OsTypes {
+    /// The descriptors read.
+    pub descriptors: u32,
+    /// Those of an OS-defined type, pages or none.
+    pub count: u32,
+    /// The first such type, or 0.
+    pub first: u32,
+}
+
+/// Counts `map`'s descriptors (stride `descriptor_size`) whose type is [`OS_TYPES_FROM`] or above.
+/// Reads only `map`; a stride the map cannot have counts nothing.
+pub fn os_defined(map: &[u8], descriptor_size: usize) -> OsTypes {
+    let mut t = OsTypes::default();
+    if descriptor_size < DESCRIPTOR_MIN_SIZE || !descriptor_size.is_multiple_of(8) {
+        return t;
+    }
+    for desc in map.chunks_exact(descriptor_size) {
+        t.descriptors = t.descriptors.saturating_add(1);
+        let uefi_type = u32_at(desc, 0);
+        if uefi_type >= OS_TYPES_FROM {
+            if t.count == 0 {
+                t.first = uefi_type;
+            }
+            t.count = t.count.saturating_add(1);
+        }
+    }
+    t
 }
 
 /// Translates the raw memory map `map` (stride `descriptor_size`) into `out`, sorted by
@@ -181,6 +218,18 @@ pub fn carve(
     pages: u64,
     kind: RegionKind,
 ) -> Result<usize, MapError> {
+    carve_within(out, count, base, pages, kind, None)
+}
+
+/// [`carve`], refused unless the region holding the range is of kind `within`, when given.
+fn carve_within(
+    out: &mut [MemoryRegion],
+    count: usize,
+    base: u64,
+    pages: u64,
+    kind: RegionKind,
+    within: Option<RegionKind>,
+) -> Result<usize, MapError> {
     let end = pages
         .checked_mul(PAGE)
         .and_then(|len| base.checked_add(len))
@@ -195,6 +244,9 @@ pub fn carve(
             r.base <= base && end <= r_end
         })
         .ok_or(MapError::NotContained(base))?;
+    if within.is_some_and(|k| r.kind != k as u32) {
+        return Err(MapError::NotLoaderData(base));
+    }
     let r_end = r.base.saturating_add(r.pages.saturating_mul(PAGE));
     let left = (base > r.base).then(|| MemoryRegion {
         base: r.base,
@@ -227,9 +279,108 @@ pub fn carve(
     Ok(new_count)
 }
 
+/// One of the loader's allocations the kernel must tell apart from the loader's other data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoaderRegion {
+    /// The kernel image, `EfiLoaderCode`, which firmware keeps executable (ADR-0002 B3).
+    KernelImage,
+    /// The kernel stack and the guard page below it, `EfiLoaderData` (ADR-0002 Amendment 7).
+    KernelStack,
+    /// The boot info, `EfiLoaderData` (ADR-0002 Amendment 7).
+    BootInfo,
+}
+
+impl LoaderRegion {
+    /// The region kind the translated map names it by.
+    const fn kind(self) -> RegionKind {
+        match self {
+            Self::KernelImage => RegionKind::KernelImage,
+            Self::KernelStack => RegionKind::KernelStack,
+            Self::BootInfo => RegionKind::BootInfo,
+        }
+    }
+}
+
+/// Where the loader's three allocations are, each as its base and its pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoaderRegions {
+    /// The kernel image.
+    pub kernel: (u64, u64),
+    /// The kernel stack's allocation: the guard page's base, and the stack's pages with the
+    /// guard's. The page tables leave the first page of a kernel-stack region unmapped only when
+    /// the region starts at the guard (`origin_paging::layout`), so it is named from there.
+    pub stack: (u64, u64),
+    /// The boot info: the header, the region and segment arrays, and the secret area.
+    pub info: (u64, u64),
+}
+
+impl LoaderRegions {
+    /// The three allocations from the kernel image's base and pages, the stack's lowest address
+    /// and pages, with its guard page the one below it, and the boot info's base and pages.
+    pub const fn new(
+        kernel: (u64, u64),
+        stack_base: u64,
+        stack_pages: u64,
+        info: (u64, u64),
+    ) -> Self {
+        Self {
+            kernel,
+            stack: (stack_base.wrapping_sub(PAGE), stack_pages.wrapping_add(1)),
+            info,
+        }
+    }
+
+    /// The boot stack's guard page: the page the kernel-stack region starts at, which the page
+    /// tables are told to leave unmapped (`origin_paging::layout::Placement::stack_guard`), the
+    /// loader's and the kernel's alike (TASKS item 133's review, R133-6).
+    pub const fn stack_guard(&self) -> u64 {
+        self.stack.0
+    }
+}
+
+/// Which allocation could not be named, and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CarveFailure {
+    /// The allocation.
+    pub region: LoaderRegion,
+    /// Why.
+    pub error: MapError,
+}
+
+/// Names the loader's three allocations by address in the first `count` regions of `out`, each
+/// inside a region the firmware gave as loader data (`LoaderReclaimable` once translated), as
+/// ADR-0002 B3 names the kernel image and Amendment 7 the boot info and the kernel stack. Used on
+/// every map the loader translates: the one the page tables are built from and the one boot info
+/// hands the kernel. Pure computation: it may run between `GetMemoryMap` and `ExitBootServices`.
+/// Returns the new count.
+pub fn carve_loader_regions(
+    out: &mut [MemoryRegion],
+    count: usize,
+    at: &LoaderRegions,
+) -> Result<usize, CarveFailure> {
+    let mut n = count;
+    for (region, (base, pages)) in [
+        (LoaderRegion::KernelImage, at.kernel),
+        (LoaderRegion::KernelStack, at.stack),
+        (LoaderRegion::BootInfo, at.info),
+    ] {
+        n = carve_within(
+            out,
+            n,
+            base,
+            pages,
+            region.kind(),
+            Some(RegionKind::LoaderReclaimable),
+        )
+        .map_err(|error| CarveFailure { region, error })?;
+    }
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::memory_type;
 
     fn desc(stride: usize, ty: u32, base: u64, pages: u64) -> Vec<u8> {
         desc_attr(stride, ty, base, pages, 0xF) // UC, WC, WT and WB: cacheable RAM
@@ -257,8 +408,8 @@ mod tests {
     #[test]
     fn translates_sorts_and_merges() {
         // Out of order, with OVMF's 48-byte stride, adjacent Loader/BootServices ranges
-        // that merge, an OS-defined kernel range, and a zero-page descriptor that is
-        // dropped.
+        // that merge, a range of the type B3 gave the kernel stack before Amendment 7 (now the
+        // firmware's), and a zero-page descriptor that is dropped.
         let map = [
             desc(48, 7, 0x10_0000, 0x100), // conventional
             desc(48, 2, 0x1000, 1),        // loader data
@@ -275,7 +426,7 @@ mod tests {
             &[
                 region(0x1000, 3, RegionKind::LoaderReclaimable),
                 region(0x10_0000, 0x100, RegionKind::Usable),
-                region(0x20_0000, 3, RegionKind::KernelStack),
+                region(0x20_0000, 3, RegionKind::FirmwareOther),
                 region(0xFEC0_0000, 1, RegionKind::Mmio),
             ]
         );
@@ -328,6 +479,41 @@ mod tests {
     }
 
     #[test]
+    fn os_defined_types_are_counted_from_0x80000000() {
+        let map = [
+            desc(48, memory_type::LOADER_CODE, 0x10_0000, 4),
+            desc(48, memory_type::LOADER_DATA, 0x20_0000, 2),
+            desc(48, memory_type::OS_KERNEL_STACK, 0x30_0000, 17),
+            desc(48, memory_type::OS_BOOT_INFO, 0x40_0000, 1),
+            desc(48, 0x7FFF_FFFF, 0x50_0000, 1),
+        ]
+        .concat();
+        assert_eq!(
+            os_defined(&map, 48),
+            OsTypes {
+                descriptors: 5,
+                count: 2,
+                first: memory_type::OS_KERNEL_STACK
+            }
+        );
+        let none = [
+            desc(48, memory_type::LOADER_DATA, 0x10_0000, 4),
+            desc(48, memory_type::LOADER_DATA, 0x30_0000, 17),
+        ]
+        .concat();
+        assert_eq!(
+            os_defined(&none, 48),
+            OsTypes {
+                descriptors: 2,
+                count: 0,
+                first: 0
+            }
+        );
+        // A stride the map cannot have counts nothing, rather than reading across descriptors.
+        assert_eq!(os_defined(&map, 44), OsTypes::default());
+    }
+
+    #[test]
     fn every_uefi_type_has_a_kind() {
         assert_eq!(kind_of(7), RegionKind::Usable);
         assert_eq!(kind_of(10), RegionKind::AcpiNvs);
@@ -373,10 +559,15 @@ mod tests {
             assert_eq!(kind_of(t as u32), kind, "type {t}");
         }
         assert_eq!(kind_of(1), RegionKind::LoaderReclaimable); // LoaderCode, incl. the kernel image before carving
-        assert_eq!(kind_of(memory_type::OS_BOOT_INFO), RegionKind::BootInfo);
+        // ADR-0002 Amendment 7: no Origin loader allocates these any more, so they are the
+        // firmware's (TASKS item 133's ruling Q2).
+        assert_eq!(
+            kind_of(memory_type::OS_BOOT_INFO),
+            RegionKind::FirmwareOther
+        );
         assert_eq!(
             kind_of(memory_type::OS_KERNEL_STACK),
-            RegionKind::KernelStack
+            RegionKind::FirmwareOther
         );
     }
 
@@ -477,5 +668,207 @@ mod tests {
             carve(&mut full, 1, 0x10_1000, 1, RegionKind::KernelImage),
             Err(MapError::Capacity)
         );
+    }
+
+    /// A firmware map as the loader sees it at the call under ADR-0002 Amendment 7: the kernel
+    /// image as `EfiLoaderCode`, and the kernel stack (with its guard page) and the boot info as
+    /// `EfiLoaderData`, inside one block with more loader data after them.
+    fn amendment_7_map() -> Vec<u8> {
+        [
+            desc(48, 7, 0x10_0000, 0x100),                       // conventional
+            desc(48, memory_type::LOADER_CODE, 0x20_0000, 4),    // the kernel image
+            desc(48, memory_type::LOADER_DATA, 0x30_0000, 0x20), // stack, boot info, more
+        ]
+        .concat()
+    }
+
+    /// The stack's 16 pages at `0x30_1000`, so its guard page and region start at `0x30_0000`.
+    const AT: LoaderRegions = LoaderRegions::new((0x20_0000, 4), 0x30_1000, 16, (0x31_1000, 2));
+
+    #[test]
+    fn the_loader_regions_are_named_by_address_inside_loader_data() {
+        let mut out = [region(0, 0, RegionKind::Reserved); 12];
+        let n = translate(&amendment_7_map(), 48, &mut out).unwrap();
+        let n = carve_loader_regions(&mut out, n, &AT).unwrap();
+        assert_eq!(
+            &out[..n],
+            &[
+                region(0x10_0000, 0x100, RegionKind::Usable),
+                region(0x20_0000, 4, RegionKind::KernelImage),
+                region(0x30_0000, 17, RegionKind::KernelStack),
+                region(0x31_1000, 2, RegionKind::BootInfo),
+                region(0x31_3000, 13, RegionKind::LoaderReclaimable),
+            ]
+        );
+        // The kernel-stack region starts at the guard page, which is what makes the page tables
+        // leave that page unmapped (`origin_paging::layout`, its `stack_guard`), the loader's
+        // tables and the kernel's alike (TASKS item 133's ruling Q3).
+        let stack = out[..n]
+            .iter()
+            .find(|r| r.kind == RegionKind::KernelStack as u32)
+            .unwrap();
+        assert_eq!(stack.base, AT.stack.0);
+        // Naming them again, as the retry after a failed call does on a fresh map, gives the same.
+        let mut again = [region(0, 0, RegionKind::Reserved); 12];
+        let m = translate(&amendment_7_map(), 48, &mut again).unwrap();
+        let m = carve_loader_regions(&mut again, m, &AT).unwrap();
+        assert_eq!(&again[..m], &out[..n]);
+    }
+
+    #[test]
+    fn a_loader_region_outside_the_firmware_s_loader_data_is_refused() {
+        // TASKS item 133's ruling Q1: each region is named only inside loader data.
+        let fails = |map: Vec<u8>, at: LoaderRegions| {
+            let mut out = [region(0, 0, RegionKind::Reserved); 12];
+            let n = translate(&map, 48, &mut out).unwrap();
+            carve_loader_regions(&mut out, n, &at).unwrap_err()
+        };
+        // The stack in conventional memory.
+        let at = LoaderRegions {
+            stack: (0x10_0000, 17),
+            ..AT
+        };
+        assert_eq!(
+            fails(amendment_7_map(), at),
+            CarveFailure {
+                region: LoaderRegion::KernelStack,
+                error: MapError::NotLoaderData(0x10_0000)
+            }
+        );
+        // The boot info in a region of the type B3 gave it before Amendment 7: the firmware's.
+        let map = [
+            amendment_7_map(),
+            desc(48, memory_type::OS_BOOT_INFO, 0x40_0000, 2),
+        ]
+        .concat();
+        let at = LoaderRegions {
+            info: (0x40_0000, 2),
+            ..AT
+        };
+        assert_eq!(
+            fails(map, at),
+            CarveFailure {
+                region: LoaderRegion::BootInfo,
+                error: MapError::NotLoaderData(0x40_0000)
+            }
+        );
+        // The kernel image in conventional memory: refused too, as the review's R133-6 asked.
+        let at = LoaderRegions {
+            kernel: (0x10_0000, 4),
+            ..AT
+        };
+        assert_eq!(
+            fails(amendment_7_map(), at),
+            CarveFailure {
+                region: LoaderRegion::KernelImage,
+                error: MapError::NotLoaderData(0x10_0000)
+            }
+        );
+        // The kernel image outside every region, as before.
+        let at = LoaderRegions {
+            kernel: (0x90_0000, 4),
+            ..AT
+        };
+        assert_eq!(
+            fails(amendment_7_map(), at),
+            CarveFailure {
+                region: LoaderRegion::KernelImage,
+                error: MapError::NotContained(0x90_0000)
+            }
+        );
+    }
+
+    #[test]
+    fn a_firmware_region_of_the_old_boot_info_type_gives_no_secret_area() {
+        // TASKS item 133's ruling Q2: a firmware descriptor of `0x8000_0002` is never boot info,
+        // so the kernel never takes a secret area from inside it; a region the loader named as
+        // boot info is the positive control.
+        let map = [
+            amendment_7_map(),
+            desc(48, memory_type::OS_BOOT_INFO, 0x40_0000, 1),
+            desc(48, memory_type::OS_KERNEL_STACK, 0x41_0000, 1),
+        ]
+        .concat();
+        let mut out = [region(0, 0, RegionKind::Reserved); 12];
+        let n = translate(&map, 48, &mut out).unwrap();
+        let kinds: Vec<u32> = out[..n]
+            .iter()
+            .filter(|r| r.base >= 0x40_0000)
+            .map(|r| r.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                RegionKind::FirmwareOther as u32,
+                RegionKind::FirmwareOther as u32
+            ]
+        );
+        let info = |seed| origin_boot_info::BootInfo {
+            magic: origin_boot_info::MAGIC,
+            version_major: origin_boot_info::VERSION.0,
+            version_minor: origin_boot_info::VERSION.1,
+            size: core::mem::size_of::<origin_boot_info::BootInfo>() as u32,
+            regions: 0x1000,
+            region_count: n as u64,
+            kernel_base: 0x20_0000,
+            kernel_span: 0x4000,
+            acpi_rsdp: 0,
+            uefi_system_table: 0,
+            stack_base: 0x30_1000,
+            stack_size: 0x1_0000,
+            kernel_segments: 0x1800,
+            kernel_segment_count: 3,
+            page_table_root: 0x9_0000,
+            direct_map_base: 0xFFFF_8000_0000_0000,
+            kernel_virtual_base: 0xFFFF_FFFF_8000_0000,
+            flags: 0,
+            framebuffer: origin_boot_info::Framebuffer::NONE,
+            boot_seed: seed,
+            early_uart: origin_boot_info::EarlyUart::NONE,
+        };
+        assert_eq!(
+            origin_boot_info::boot_seed(&info(0x40_0100), 0x31_1000, &out[..n]),
+            None
+        );
+        let n = carve_loader_regions(&mut out, n, &AT).unwrap();
+        assert_eq!(
+            origin_boot_info::boot_seed(&info(0x31_1800), 0x31_1000, &out[..n]),
+            Some(0x31_1800)
+        );
+    }
+
+    #[test]
+    fn the_page_tables_leave_the_carved_stack_s_guard_page_unmapped() {
+        // TASKS item 133's review, R133-6: the carved map, built into page tables as the loader
+        // builds them, with the guard the loader passes: the guard page is not mapped, the stack's
+        // pages and the boot info are, in the direct map.
+        use core::sync::atomic::AtomicU64;
+        use origin_paging::layout::{self, Placement};
+        const DIRECT: u64 = 0xFFFF_8040_0000_0000;
+        let mut out = [region(0, 0, RegionKind::Reserved); 12];
+        let n = translate(&amendment_7_map(), 48, &mut out).unwrap();
+        let n = carve_loader_regions(&mut out, n, &AT).unwrap();
+        let tables: Vec<origin_paging::Table> = (0..64)
+            .map(|_| core::array::from_fn(|_| AtomicU64::new(0)))
+            .collect();
+        let mut mem = origin_paging::TablePool::new(&tables, 0x80_0000);
+        let at = Placement {
+            direct_map_base: DIRECT,
+            kernel_virtual_base: 0xFFFF_FFFF_8460_0000,
+            kernel_physical_base: AT.kernel.0,
+            stack_guard: AT.stack_guard(),
+        };
+        let segments = [origin_boot_info::KernelSegment {
+            rva: 0,
+            pages: 4,
+            access: origin_boot_info::SEGMENT_READ,
+            reserved: 0,
+        }];
+        let (space, _) = layout::build(&mut mem, &at, &out[..n], &segments).unwrap();
+        let mapped = |phys: u64| space.translate(&mem, DIRECT + phys).is_some();
+        assert_eq!(AT.stack_guard(), 0x30_0000);
+        assert!(!mapped(0x30_0000), "the boot stack's guard page");
+        assert!(mapped(0x30_1000) && mapped(0x31_0000), "the stack's pages");
+        assert!(mapped(0x31_1000), "the boot info");
     }
 }

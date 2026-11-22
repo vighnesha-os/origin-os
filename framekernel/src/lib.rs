@@ -214,6 +214,8 @@ mod measured_stack;
 #[cfg(target_os = "none")]
 mod memory_object;
 #[cfg(target_os = "none")]
+mod migration_proof;
+#[cfg(target_os = "none")]
 mod pcie;
 #[cfg(target_os = "none")]
 mod percpu;

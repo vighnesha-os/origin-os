@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). B5 gained one line on the SPCR's UART before a halt after a failed `ExitBootServices` by Amendment 2, accepted by the owner on 2026-11-21 (decision sheet item 342) and built by TASKS item 112 the same day, under QEMU only. Amendment 3, accepted by the owner on 2026-11-21 (decision sheet item 344), lets a bench build, and only a bench build, call `ResetSystem` after `ExitBootServices`; built by TASKS item 116 the same day, under QEMU only. Amendment 4, accepted by the owner on 2026-11-21 (decision sheet item 345), lets a bench build also reset the machine through the FCH's reset port and a triple fault, with no firmware code; three refinements to it were accepted the same day (decision sheet item 346). |
+| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). B5 gained one line on the SPCR's UART before a halt after a failed `ExitBootServices` by Amendment 2, accepted by the owner on 2026-11-21 (decision sheet item 342) and built by TASKS item 112 the same day, under QEMU only. Amendment 3, accepted by the owner on 2026-11-21 (decision sheet item 344), lets a bench build, and only a bench build, call `ResetSystem` after `ExitBootServices`; built by TASKS item 116 the same day, under QEMU only. Amendment 4, accepted by the owner on 2026-11-21 (decision sheet item 345), lets a bench build also reset the machine through the FCH's reset port and a triple fault, with no firmware code; three refinements to it were accepted the same day (decision sheet item 346); built by TASKS item 121 the same day, with item 346's refinements, under QEMU only. Two further reads before the call and one reworded line were added to Amendment 4 on 2026-11-22 (decision sheet item 348). Amendment 5, accepted by the owner on 2026-11-22 (decision sheet item 347), gives a bench build a minimal-program mode whose only reset after the call is a triple fault; the owner clarified the same day that it triple-faults after every successful call (decision sheet item 349). Both were built by TASKS item 128 the same day, under QEMU only, and rental G ran the minimal mode on a bench server the same day (`docs/research/2026-11-22-rental-g-findings.md`). Amendment 6, accepted by the owner on 2026-11-22 (decision sheet item 352), gives a bench build a bisection mode: the full loader's work with the OS-defined memory types left out, and Amendment 5's resets. It was built by TASKS item 131 the same day, under QEMU only, and rental H ran it on a bench server the same day (`docs/research/2026-11-22-rental-h-findings.md`). Amendment 7, accepted by the owner on 2026-11-22 (decision sheet item 353), changes B3 for every loader: the boot info and the kernel stack are allocated as `EfiLoaderData`, and the loader's translated map still names them. It was built by TASKS item 133 the same day, under QEMU only, and has not run on a machine (item 354). |
 | Date | 2026-11-07; Amendment 1 2026-11-10; Amendment 2 2026-11-21; Amendment 3 2026-11-21; Amendment 4 2026-11-21; boot info 0.6 accepted 2026-11-10 and built 2026-11-11 (B4) |
 | Owner decisions still open | None. B7, carried over from ADR-0001, was decided on 2026-11-07 and amended on 2026-11-10. |
 | Implements | CLAUDE.md §19 (UEFI boot chain), §20 (boot manager, later), §58 (Secure Boot), ONBF §8.1 (chain of trust) |
@@ -198,7 +198,7 @@ origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry EF
 
 ## Amendment 4 (2026-11-21): a bench build may reset the machine with no firmware code
 
-*Accepted by the owner on 2026-11-21 ("Allow it"; decision sheet item 345). Proposed by rental E's findings (`docs/research/2026-11-21-rental-e-findings.md`, rank 1, on `land/batch-9` until it lands). TASKS item 121 builds it. Until that lands, nothing here is built.*
+*Accepted by the owner on 2026-11-21 ("Allow it"; decision sheet item 345). Proposed by rental E's findings (`docs/research/2026-11-21-rental-e-findings.md`, rank 1, on `land/batch-9` until it lands). Built by TASKS item 121 the same day, with item 346's refinements, under QEMU only.*
 
 **Change to B5 and to Amendment 3, for bench builds only.** A loader built with `--cfg origin_bench` may, in addition to Amendment 3's two methods, reset the machine in ways that run no firmware code:
 
@@ -237,3 +237,147 @@ origin-boot: ExitBootServices failed (first call EFI_INVALID_PARAMETER, retry EF
 - Before the call, the loader only reads the FCH's registers, at the address the firmware's DSDT describes.
 - The only writes are the documented warm-reset command to `0xCF9` and the loader's own IDT, made to end a diagnostic boot on a rented bench machine.
 
+**Code (built by TASKS item 121, with item 346's refinements, under QEMU only).** All under `--cfg origin_bench`:
+- `boot/uefi/src/fch.rs`, with no `unsafe`: the FCH's registers; the DSDT's region, found by a bounded scan; the walk of the firmware's page tables; the layout check; the branch; the lines. It is host-tested.
+- `boot/uefi/src/main.rs`: the reads, the control, the compare of the returned status, the `0xCF9` write after the call, the wait and the triple fault.
+
+QEMU has no AMD FCH. `BENCH-FCH`, which only QEMU's ESP may hold and the rental tool refuses, stands in for the reads. Under QEMU, `cargo xtask boot-bench` shows each path:
+- the control;
+- `0xCF9` after the call;
+- the triple fault;
+- the fall-through to Amendment 3's order;
+- no record;
+- the reset only after the retry succeeds;
+- the normal path after both calls fail;
+- a contradicting layout;
+- a control that does not reset.
+
+It also reads the bench loader's machine code. Between the call and the `0xCF9` write it allows only the status's compare, the plan's loads and compares, and branches. The planted controls, each of which must fail, are in TASKS item 121's entry.
+
+**Addition (2026-11-22, decision sheet item 348).** Rental F (2026-11-22) showed that this board keeps the FCH's own reset at `0xCF9` off and resets through the firmware's code when the port is written (`docs/research/2026-11-22-rental-f-findings.md`). The owner accepted three changes to step 1, for bench builds only:
+
+1. **The live boot services table.** Before its last line, the loader reads the system table's boot services pointer again, compares the live table byte for byte with its own copy over the copy's size, and prints whether they are the same, both `ExitBootServices` pointers and both header CRC32 fields. A byte compare is exact, and needs no CRC-32 in the loader. It runs in the full bench mode. Amendment 5's minimal mode uses the live table, so it has nothing to compare.
+2. **Where the firmware's `0xCF9` trap goes.** One more FCH register is read and printed: `SMIxC0` bits 27:26, which route a write of bit 2 to `0xCF9` to nothing, an SMI, an NMI or IRQ13. It is read behind the same gate as the power-management block: an AMD processor, a DSDT system-memory region that holds it, and the firmware's page tables mapping it to itself.
+3. **One line reworded.** The bit step 1 calls "the bit that stops a write to `0xCF9` from resetting" (`PMxD2` bit 6) is printed as the FCH's own reset at `0xCF9` turned off, so that the firmware can trap the write. On rental F the bit was set, and `0xCF9` still reset the machine through the firmware.
+
+These are reads only: one FCH register behind the gate that already admits the power-management block, and the firmware's own boot services table through the pointer the system table holds. No write and no firmware call is added. Performance cost (ADR-0018 V3): none, by construction; only bench builds contain them. They were built with Amendment 5 by TASKS item 128 the same day.
+
+## Amendment 5 (2026-11-22): a bench build's minimal-program mode
+
+*Accepted by the owner on 2026-11-22 ("Allow it"; decision sheet item 347). Proposed by rental F's findings (`docs/research/2026-11-22-rental-f-findings.md`, rank 3). TASKS item 128 built it the same day, at `32b6e043`, under QEMU only; rental G ran it on a bench server the same day (`docs/research/2026-11-22-rental-g-findings.md`).*
+
+**Change to Amendment 4, for bench builds only.** A bench loader may be built, with `cargo xtask bench-build --minimal`, in a minimal-program mode. The mode is chosen when the image is built, not by a switch file, so that the rented run makes no file-protocol call before the call it tests. In that mode the loader does, in order:
+
+1. **Its first lines:** the system table checked, the console opened and the banner printed, as now.
+2. **The memory map,** read into a buffer that is static in the image and translated into regions in another static array. It makes no `AllocatePages` or `AllocatePool` call.
+3. **Only the walks Amendment 4 needs:** the RSDP and XSDT to the SPCR, the FADT and the DSDT; then Amendment 4's step 1 and its addition's `SMIxC0` read, behind the same gate. Under QEMU, which has no FCH, stand-in values come from a small ACPI table with an Origin signature that only `xtask` plants; the loader finds it in the same walk, with reads only.
+4. **The branch, on the FCH's record of the last reset (`PMxC0`):**
+   - **A shutdown** (bit 23): the run makes the call.
+   - **Another cause:** the boot's first run, the control. It prints a line, masks interrupts and triple-faults, and makes no call. This needs both bits that let a shutdown reset the system (`PMx74` bit 17 and `PMx08` bit 20). With either clear, the run says so and makes the call with no control.
+   - **No record, or a layout that contradicts the documents:** the call, with no control, as Amendment 4's refinement 1 and step 1 say.
+5. **The call:** the memory map read again into the static buffer, `X` written straight to the UART, and `ExitBootServices` called through the pointer in the live boot services table, read from the system table there and then.
+6. **After the call:**
+   - after `EFI_SUCCESS`, the status compare, then the triple fault. Nothing comes between them: no line, no load, no store, no port. There is no `0xCF9` write anywhere in this mode;
+   - after an error, the loader's retry, with `Y` and the same check after it;
+   - after a second error, Amendment 2's line, then Amendment 3's order.
+
+**What it does not do:**
+- no kernel file read, and no verification;
+- no random-number generator;
+- no allocation at all, and so no pages of Origin's OS-defined memory types;
+- no page tables, and no framebuffer search;
+- no copy of the boot services table;
+- no `Stall`, no UART register reads or write-back, and no line written straight to the UART but the marks.
+
+**Where it differs from Amendment 4's accepted text:**
+- **Step 2's control** is a triple fault, not `0x06` to `0xCF9`, and the record that marks the next run is `PMxC0` bit 23, not bit 19.
+- **Step 3's first reset** is the triple fault, with no `0xCF9` and no 100 ms wait.
+- **"What must hold on the machine":** the control shows the shutdown path resetting, not `0xCF9`.
+- **Refinement 2:** it is the triple fault that follows only `EFI_SUCCESS`.
+- **Refinement 3** decides the control, with `PMx08` bit 20 also required, since AMD's documents record bit 23 only with both set. After a successful call it does not apply in this mode: the triple fault follows `EFI_SUCCESS` whatever the two bits say (decision sheet item 349).
+- **B5** is unchanged: after a successful call, the mode calls nothing in the firmware.
+
+- **Why:** five rentals, four firmware revisions and two loaders gave the same stop. Rental F showed it beside a positive control in the same boot: `ExitBootServices` does not return. TASKS item 127 measured the loader's stack under QEMU at no more than 10.1 KiB on the rented runs' unsigned path (7.9% of the 128 KiB UEFI promises) and about 23 KiB on the signed path (17.7% to 18.2% over the runs), so the stack is very unlikely to be the cause. What is left is whether the cause is in what Origin's loader does before the call, or in starting any program this way on this firmware. A program that does almost nothing, with a reset after the call that runs no firmware code, answers it either way. If the call returns, the list of what Origin's loader adds is bisected, a rental each, starting with the OS-defined memory types.
+- **What must hold on the machine:** a shutdown resets the system only with the two FCH bits the loader prints. Whether the firmware's exit turns the shutdown message off is not known, and the findings weigh it low.
+- **Every loader that is not a bench build is unchanged,** and so is the full bench mode, apart from Amendment 4's addition. A minimal-mode image is never signed or packaged, and the reproducible gate shows that no normal image contains this code.
+
+**Clarification (2026-11-22, decision sheet item 349).** As first accepted, this text kept refinement 3 after the call, which would send a run whose shutdown bits are clear to Amendment 3's order and so into the firmware. It also said that, after a successful call, the mode calls nothing in the firmware. TASKS item 128's review found the conflict, and the owner chose the second: after `EFI_SUCCESS` the minimal mode always triple-faults, and makes no firmware call. Where a shutdown bit is clear, the machine may stop without a reset. The line the run prints before the call already says the bits were clear, and the findings must read such a run as unresolved. After an error, Amendment 2's line and Amendment 3's order still follow; there the FADT step is skipped when its register is I/O port `0xCF9`, since this mode writes nothing there.
+
+**Alternatives.**
+
+| | Why not |
+|---|---|
+| The mode chosen by a switch file (`BENCH-MINIMAL`) | One bench image would serve both modes, but every rented run would first make the switch file's firmware calls, the same ones the kernel's read makes, and a hang there would read like the stop under test |
+| No more rentals for now: only Amendment 4's addition, at no cost | Leaves open whether the cause is in Origin's loader or in the firmware's exit |
+
+**Performance cost (ADR-0018 V3).** None, by construction: only bench builds contain it, and none ships.
+
+**Threat model (§58).**
+- Only bench builds, which are never signed, contain it.
+- Before the call, it reads only memory the firmware's map describes, the FCH's registers behind Amendment 4's gate, and its own static buffers.
+- Its only writes are the loader's own IDT, with a zero limit, for the triple fault, and the `X` and `Y` bytes to the UART the SPCR names. It writes nothing to `0xCF9` and nothing to the FCH.
+
+## Amendment 6 (2026-11-22): a bench build's bisection mode
+
+*Accepted by the owner on 2026-11-22 ("Allow it"; decision sheet item 352). Proposed by rental G's findings (`docs/research/2026-11-22-rental-g-findings.md`, on `land/batch-10` until it lands), whose reading R puts the cause of the stop most likely in what Origin's loader does before the call. TASKS item 131 built it the same day, under QEMU only (`claude/t131-bisect-mode`, gated at `4165ecfb`), and rental H ran it on a bench server the same day, on firmware 2.5a (`docs/research/2026-11-22-rental-h-findings.md`).*
+
+**Change for bench builds only.** A bench loader may be built, with `cargo xtask bench-build --bisect`, in a third mode, chosen when the image is built like Amendment 5's. It does, in order:
+
+1. **The full bench loader's work before the call, unchanged:** the system table and console; the kernel's read and verification; the random-number generator; the framebuffer search; the copy of the boot services table; the memory map, the page tables built in memory and the SPCR; the FADT and the DSDT; Amendment 4's FCH reads, with `SMIxC0` behind its gate; the live table's compare of Amendment 4's addition; the entry state's reads, the `Stall` and the UART register reads.
+2. **One change before the call:** the kernel stack and the boot info are allocated as `EfiLoaderData`, not as B3's OS-defined types `0x8000_0003` and `0x8000_0002`. The loader prints, from its own last translated map and with no firmware call, that the map holds no region of an OS-defined type.
+3. **The branch, on the FCH's record of the last reset,** as Amendment 5's step 4: a shutdown (bit 23) makes the call; another cause makes the boot's first run the control, a triple fault and no call, with both shutdown bits required; no record, or a layout that contradicts the documents, makes the call with no control.
+4. **The call** through the copied table, as every loader that stopped made it, with `X` written straight to the UART before it.
+5. **After the call,** as Amendment 5's step 6 and item 349: after `EFI_SUCCESS`, the status compare, then the triple fault, with nothing between them; after an error, the retry with `Y`; after a second error, Amendment 2's line, then Amendment 3's order, with the FADT step skipped where its register is I/O port `0xCF9`. There is no `0xCF9` write anywhere in this mode.
+
+The kernel is never entered, as in every bench mode, so no kernel reads a boot info whose pages the firmware's map calls loader data.
+
+**Where it differs from accepted text:**
+- **B3:** in this mode only, the boot info and the kernel stack are `EfiLoaderData`, so the firmware's map does not identify them. Every loader that is not this mode's is unchanged.
+- **Amendment 4, steps 2 and 3, and refinement 2:** as in Amendment 5, the control is a triple fault recorded as bit 23, and after `EFI_SUCCESS` the triple fault is the first thing, with no `0xCF9` and no wait, whatever the shutdown bits say (item 349).
+- **Amendment 4's addition, item 1:** the live table's compare runs in this mode too.
+- **Amendment 5, "What it does not do":** this mode does all of those but the OS-defined types. It borrows only Amendment 5's resets, and the minimal mode is unchanged.
+- **B5** is unchanged: after a successful call, the mode calls nothing in the firmware.
+
+- **Why:** rental G ran Amendment 5's minimal program on firmware 2.4a. After each call the firmware started again about 49 seconds later, the same delay as after the control's own reset, and the run after it read a shutdown, so the call most likely returned. On the same revision, rental E's bench loader made the same call and nothing followed. Amendment 5's "Why" names the next step: bisect what Origin's loader adds, starting with the OS-defined memory types. Item 350 pauses rentals until two questions share one, and this mode puts two: whether the firmware changes its boot services table after the loader copies it, and whether the call returns without the OS-defined types.
+- **What each outcome means:** a reset after each call, with the next run reading bit 23, means the OS-defined types stop the call. `X` and nothing more, with the table's line saying it did not change, means neither is the cause, and the bisection goes on. `X` and nothing more, with the table changed, makes the stale copy the first suspect. A hang reads cleanly only on 2.4a, where the minimal program returned; the record names the revision.
+- **Every loader that is not a bench build is unchanged.** A bisection-mode image is never signed or packaged, and the reproducible gate shows that no normal image contains this code.
+
+**Alternatives.**
+
+| | Why not |
+|---|---|
+| The full bench image as it stands | One question only, the table's; and its first reset after the call is `0xCF9`, which on this board is an SMI into firmware code, so a returning call could read as a hang |
+| Calling through the live table, in place of the memory types | If the table's line says it did not change, a call through the live table is the same call; it comes next only if the table differs |
+| Leaving out half the list at once | A return would not say which of the parts left out was the cause |
+| No rental: the pause continues | The bisection waits |
+
+**Performance cost (ADR-0018 V3).** None, by construction: only bench builds contain it, and none ships.
+
+**Threat model (§58).**
+- Only bench builds, which are never signed, contain it.
+- Before the call, it reads what the full bench mode reads, and allocates what it allocates, of another type.
+- Its writes are the full bench mode's own pages, the loader's own IDT for the triple fault, and the `X` and `Y` bytes to the UART the SPCR names. It writes nothing to `0xCF9` and nothing to the FCH.
+
+**Note (2026-11-22, TASKS item 131's review, R131-7; the coordinating session's reading, not an amendment).** The threat model's list of writes above is narrower than this amendment's own steps, which the owner accepted. Step 1 keeps the full bench loader's work before the call unchanged, and that work includes its UART line and register writes before the call: the line written straight to the UART, and the UART's line-control setting. Step 5 keeps, after a second error, Amendment 2's line and Amendment 3's order: `ResetSystem`, then the FADT's reset register where it is not I/O port `0xCF9`. The steps decide, and the list above is to be read as including those writes. The mode still writes nothing to `0xCF9` and nothing to the FCH, and after a successful call it writes nothing before its triple fault (item 349).
+
+## Amendment 7 (2026-11-22): the boot info and the kernel stack allocated as loader data
+
+*Accepted by the owner on 2026-11-22 ("Change B3"; decision sheet item 353). Proposed by rental H's findings (`docs/research/2026-11-22-rental-h-findings.md`, on `land/batch-10` until it lands). TASKS item 133 built it the same day, under QEMU only (`claude/t133-loader-data`, gated at `1dd96c44`); it has not run on a machine (item 354).*
+
+**Change to B3, for every loader.** The boot info and the kernel stack are allocated as `EfiLoaderData`, not as the OS-defined types `0x8000_0002` and `0x8000_0003`. The firmware's own memory map no longer identifies them. The loader's translated map, the one boot info hands to the kernel, still names them by address as boot info and kernel stack, as it already names the kernel image (`memmap::carve`), so the kernel sees the same region kinds and is unchanged. Every other part of B3 stands.
+
+- **Why:** the loaders that allocated the OS-defined types stopped at `ExitBootServices` on four firmware revisions of the rented board (rentals B to F). Two bench modes that allocated none most likely got through the call: Amendment 5's minimal program on revision 2.4a (rental G), and Amendment 6's bisection mode on revision 2.5a (rental H), where rental C's loader, with the OS-defined types, had stopped. In rental H the firmware's boot services table equalled the loader's copy byte for byte in all 22 runs, so the copy is not the cause. UEFI reserves `0x8000_0000` and above for OS loaders, so the types are within the specification; the firmware's handling of them is not something Origin can change, and Origin must boot on it.
+- **What remains open:** no rental has paired one loader with and without the OS-defined types, and rental H rests on two calls. The firmware's exit ending in a shutdown by itself (reading S) is not excluded. The confirmation is a rental of a bench build of the normal loader with this change, entering the bench kernel with TASKS item 112's breadcrumbs: a kernel line after the call settles both questions. It is put to the owner separately.
+
+**Alternatives.**
+
+| | Why not |
+|---|---|
+| The change in bench builds only, B3 kept for shipped loaders until a rental confirms it | Shipped loaders would keep a placement every rented board so far has stopped on, and the bench build would test a loader that does not ship |
+| No change | The kernel does not start on the rented board, and the most likely cause stays in every loader |
+
+**Performance cost (ADR-0018 V3).** None, by construction: the same pages are allocated, of another type, and the translated map's naming by address is the same work `carve` already does for the kernel image, once at boot.
+
+**Threat model (§58).**
+- The kernel sees the same region kinds as before, so it reclaims neither the boot info nor its own stack.
+- The firmware's map, read by no part of Origin after the call, no longer tells these pages from the loader's other data; firmware runtime services never own them in either case.

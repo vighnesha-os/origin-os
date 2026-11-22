@@ -33,6 +33,7 @@ mod screen;
 mod serial;
 mod settings;
 mod settle;
+mod stack_depth;
 mod targetcfg;
 mod toolchain;
 mod turns;
@@ -109,12 +110,29 @@ commands:
   bench-build the bench build (TASKS item 112): the developer-mode loader and the kernel with
               breadcrumbs on the SPCR's UART, into target/bench; prints each image's size and
               SHA-256 (target/bench/xtask/BOOTX64.EFI and KERNEL.ONBF), for a rental. Never
-              signed, never shipped
+              signed, never shipped. With --minimal, also the loader's minimal-program mode
+              (ADR-0002 Amendment 5; TASKS item 128), staged with the bench kernel in
+              target/bench-minimal/xtask, and its machine code checked: no 0xCF9 anywhere,
+              and only the status compare and branches between the call and the triple fault.
+              With --bisect, the loader's bisection mode (ADR-0002 Amendment 6; TASKS item
+              131) in target/bench-bisect/xtask, with the same checks and one more: the call's
+              target is not loaded through the live boot services table. With --kernel, the
+              loader's kernel-entry mode (ADR-0002 Amendment 7; TASKS item 133) in
+              target/bench-kernel/xtask: the full bench loader's work, no FCH decision and no
+              reset, and the bench kernel entered after a successful call; no 0xCF9 anywhere.
+              Every bench loader is checked to allocate none of B3's old OS-defined types
   boot-bench  Clippy over the bench code, bench-build, and four boots with the SPCR naming
               COM2: ExitBootServices given the firmware's key, a stale key once (the retry),
               twice (the halt, which says why and then nothing), and the bench kernel under the
               normal loader (no breadcrumbs); part of boot-matrix
-  bench-gate  only the gate on which files may name the bench build's flag (part of check)
+  bench-gate  only the gate on which files may name the bench build's flag, or the stack
+              measurement's (part of check)
+  stack-depth how deep the loader's stack goes before ExitBootServices, under QEMU (TASKS
+              item 127): the 128 KiB UEFI promises painted at entry and scanned after each of
+              six phases, in a measurement build of the normal and the bench loader into
+              target/stack-measure (never signed, never rented), three scenarios three boots
+              each, and the longest chain of the loader's own frames its disassembly allows.
+              On demand: not part of check or boot-matrix
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
   reproducible-gate only the gate on reproducible builds: the loader, each way it is built,
               and the kernel are built twice from nothing in two target directories; the
@@ -357,13 +375,33 @@ enum Loader {
     /// The bench build (TASKS item 112): `developer-mode`, and the bench flag only
     /// `bench::build_loader` gives, into `target/bench`.
     Bench,
+    /// TASKS item 127's stack measurement of the developer-mode loader, into
+    /// `target/stack-measure/normal` (`stack_depth::build_loader`).
+    MeasureNormal,
+    /// The same of the bench loader, into `target/stack-measure/bench`.
+    MeasureBench,
+    /// TASKS item 128: the bench loader's minimal-program mode (ADR-0002 Amendment 5), into
+    /// `target/bench-minimal` (`bench::build_minimal_loader`).
+    BenchMinimal,
+    /// TASKS item 131: the bench loader's bisection mode (ADR-0002 Amendment 6), into
+    /// `target/bench-bisect` (`bench::build_bisect_loader`).
+    BenchBisect,
+    /// TASKS item 133: the bench loader's kernel-entry mode (ADR-0002 Amendment 7), into
+    /// `target/bench-kernel` (`bench::build_kernel_loader`).
+    BenchKernel,
 }
 
 impl Loader {
     /// The Cargo feature this build needs.
     fn feature(self) -> &'static str {
         match self {
-            Self::Developer | Self::Bench => "developer-mode",
+            Self::Developer
+            | Self::Bench
+            | Self::BenchMinimal
+            | Self::BenchBisect
+            | Self::BenchKernel
+            | Self::MeasureNormal
+            | Self::MeasureBench => "developer-mode",
             Self::Verifying => "test-trust-store",
         }
     }
@@ -425,6 +463,10 @@ struct Completed {
     /// `-no-reboot` that is the guest resetting the machine (TASKS item 116); a triple fault is
     /// a reset to QEMU too, which the scenarios' lines tell apart.
     exited: bool,
+    /// When QEMU exited by itself: the time from the last byte it sent to its output closing, to
+    /// within the reader's latency. TASKS item 121's scenarios tell a reset through `0xCF9` (at
+    /// once) from the triple fault (after the loader's wait) by it.
+    quiet_before_exit: Option<Duration>,
 }
 
 /// The IOMMU QEMU emulates (`ORIGIN_QEMU_IOMMU`, [`Settings::iommu`]): Intel VT-d or AMD-Vi,
@@ -2785,6 +2827,13 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
         ])
         .chain(kernel_bound_markers(true))
         .chain([
+            // ADR-0020 S6, S20 and S23 (TASKS item 96): the two migration proofs, on every
+            // machine; on one with fewer than two processors taking part, each says so and passes.
+            // A failure ends its line ": scheduler failed", a boot failure below.
+            "origin-kernel: scheduler: thread migration: integrity: ".into(),
+            "origin-kernel: scheduler: thread migration: delivery: ".into(),
+        ])
+        .chain([
             // ADR-0017 Z3: the scheduler noted each change of process, with one barrier for
             // each where the processor has IBPB and none where it has not.
             "origin-kernel: ibpb: ".into(),
@@ -3746,6 +3795,9 @@ fn boot_failures() -> Vec<&'static str> {
         ": AP start-up failed",
         ": boot steps failed",
         ": scheduler failed",
+        // ADR-0020 S20 (TASKS item 96): moves withdrawn after an inconsistency, during the proofs
+        // or after them. The kernel goes on, and the scenario fails, under QEMU or on a machine.
+        "origin-kernel: scheduler: pinned mode:",
         ": topology failed",
         ": CPU baseline failed",
         ": numa failed",
@@ -4648,7 +4700,17 @@ fn main() -> ExitCode {
         ["boot-console"] => in_turn_with_settings("boot-console", boot_console),
         ["boot-bench"] => in_turn_with_settings("boot-bench", bench::boot),
         ["bench-build"] => in_turn("bench-build", || bench::build().map(|_| ())),
+        ["bench-build", "--minimal"] => in_turn("bench-build --minimal", || {
+            bench::build_minimal().map(|_| ())
+        }),
+        ["bench-build", "--bisect"] => {
+            in_turn("bench-build --bisect", || bench::build_bisect().map(|_| ()))
+        }
+        ["bench-build", "--kernel"] => {
+            in_turn("bench-build --kernel", || bench::build_kernel().map(|_| ()))
+        }
         ["bench-gate"] => bench::gate(),
+        ["stack-depth"] => in_turn_with_settings("stack-depth", stack_depth::run),
         ["boot-bridge"] => in_turn_with_settings("boot-bridge", boot_bridge),
         ["boot-reserved"] => in_turn_with_settings("boot-reserved", boot_reserved),
         ["boot-large"] => in_turn_with_settings("boot-large", boot_large),
@@ -6960,6 +7022,11 @@ fn collect_files(
 fn build_loader(loader: Loader) -> Result<PathBuf> {
     match loader {
         Loader::Bench => bench::build_loader(),
+        Loader::BenchMinimal => bench::build_minimal_loader(),
+        Loader::BenchBisect => bench::build_bisect_loader(),
+        Loader::BenchKernel => bench::build_kernel_loader(),
+        Loader::MeasureNormal => stack_depth::build_loader(false),
+        Loader::MeasureBench => stack_depth::build_loader(true),
         _ => build_loader_in(Some(loader.feature()), None),
     }
 }
@@ -7890,6 +7957,10 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
     let screen_path = work.join("screen.ppm");
     // Whether QEMU closed its output: it exited by itself (TASKS item 116).
     let mut closed = false;
+    // When the last byte came, and when QEMU's output closed (TASKS item 121): a scenario tells
+    // from the time between them which reset ended the boot.
+    let mut last_byte: Option<Instant> = None;
+    let mut closed_at: Option<Instant> = None;
     let mut verdict: Result = if scenario.capture == Capture::Screen {
         let monitor = stdin.as_mut().ok_or("QEMU stdin was not captured")?;
         wait_for_screen(
@@ -7930,6 +8001,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(chunk) => {
                     raw.extend_from_slice(&chunk);
+                    last_byte = Some(Instant::now());
                     // Judged only once a line has ended: QEMU hands the serial port's output
                     // over a few bytes at a time, and judging the whole log for each chunk is
                     // quadratic in its length. A 65-processor log took 48 minutes to judge
@@ -7955,6 +8027,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     closed = true;
+                    closed_at = Some(Instant::now());
                     if let Some(verdict) = judge(&raw) {
                         break verdict;
                     }
@@ -7970,11 +8043,15 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
         let until = Instant::now() + quiet;
         loop {
             match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
-                Ok(chunk) => raw.extend_from_slice(&chunk),
+                Ok(chunk) => {
+                    raw.extend_from_slice(&chunk);
+                    last_byte = Some(Instant::now());
+                }
                 Err(RecvTimeoutError::Timeout) => break,
                 // QEMU exited, so the quiet time is over: a reset under `-no-reboot`.
                 Err(RecvTimeoutError::Disconnected) => {
                     closed = true;
+                    closed_at = Some(Instant::now());
                     break;
                 }
             }
@@ -8062,6 +8139,10 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
         screen,
         com1,
         exited,
+        quiet_before_exit: match (last_byte, closed_at) {
+            (Some(byte), Some(closed)) if exited => Some(closed.saturating_duration_since(byte)),
+            _ => None,
+        },
     };
     let verdict = verdict
         .and_then(|()| match stack_window_lines(&done.serial).first() {
