@@ -126,6 +126,10 @@ proofs! {
     ThreadsReaped "thread reaping" => Report;
     MeasuredStackThread "measured stack in a thread" => Report;
     KernelBound "the kernel-wide bound" => Refuse;
+    // Moves between processors (ADR-0020 S6, S20, S23; TASKS item 96), after every proof above,
+    // whose threads never move.
+    MigrationIntegrity "thread migration: integrity" => Refuse;
+    MigrationDelivery "thread migration: delivery" => Withdraw("no thread moves");
     Ibpb "IBPB at each change of process" => Refuse;
     // Devices.
     Pcie "PCIe enumeration" => Withdraw("no device drivers");
@@ -247,7 +251,7 @@ mod tests {
 
     /// Every proof whose failure stops the boot (ADR-0013 R1). Changing this list changes
     /// what a real machine does: change the ADR with it.
-    const REFUSING: [Proof; 28] = [
+    const REFUSING: [Proof; 29] = [
         Proof::PageTables,
         Proof::FrameAllocator,
         Proof::Heap,
@@ -275,15 +279,17 @@ mod tests {
         Proof::EventsPorts,
         Proof::Stacks,
         Proof::KernelBound,
+        Proof::MigrationIntegrity,
         Proof::Ibpb,
     ];
 
     /// Every proof whose failure withholds a capability (ADR-0013 R2, Amendment 1).
-    const WITHDRAWING: [Proof; 7] = [
+    const WITHDRAWING: [Proof; 8] = [
         Proof::BusMasterQuiesce,
         Proof::Iommu,
         Proof::Processors,
         Proof::Random,
+        Proof::MigrationDelivery,
         Proof::Pcie,
         Proof::BusMastersQuiet,
         Proof::Nvme,
@@ -311,7 +317,7 @@ mod tests {
 
     #[test]
     fn the_table_has_one_row_per_proof_in_order() {
-        assert_eq!(Proof::ALL.len(), 73);
+        assert_eq!(Proof::ALL.len(), 75);
         for (i, &proof) in Proof::ALL.iter().enumerate() {
             assert_eq!(proof as usize, i, "{proof:?} is out of order");
             assert!(!proof.name().is_empty(), "{proof:?} has no name");
@@ -350,6 +356,12 @@ mod tests {
             Consequence::Withdraw("no randomness")
         );
         assert_eq!(Proof::Random.name(), "random-number generator");
+        // ADR-0020 S20 (TASKS item 96): a failed delivery withdraws moves, and the boot goes on.
+        assert_eq!(
+            Proof::MigrationDelivery.consequence(),
+            Consequence::Withdraw("no thread moves")
+        );
+        assert_eq!(Proof::MigrationIntegrity.consequence(), Consequence::Refuse);
         // ADR-0020 S6 (TASKS item 94): reported until a mover reads the flag, by R3.
         assert_eq!(Proof::FpuFormat.consequence(), Consequence::Report);
         assert_eq!(Proof::FpuFormat.name(), "FPU format");

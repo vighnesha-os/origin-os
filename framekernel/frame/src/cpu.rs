@@ -950,12 +950,34 @@ pub fn move_context<R>(
 
 /// What a scan's pass under the move gate runs in: interrupts off on this processor, since a
 /// mover holds the gate with interrupts off and may be this processor's own interrupt handler.
+/// It also counts those passes and keeps the longest, wait for the gate and pass together, in TSC
+/// ticks (the review of TASKS item 95, R95-10 and D95-8; CL48's owed cells, which TASKS item 96's
+/// integrity proof reports). Only a scan whose fast passes all overlapped a move gets here.
 struct Quietly;
+
+/// Scans that made their pass under the move gate.
+static GATED_SCANS: AtomicU64 = AtomicU64::new(0);
+/// The longest of them, its wait for the gate included, in TSC ticks.
+static GATED_LONGEST: AtomicU64 = AtomicU64::new(0);
 
 impl Quiet for Quietly {
     fn quietly<R>(&self, f: impl FnOnce() -> R) -> R {
-        without_interrupts(f)
+        let start = rdtsc();
+        let result = without_interrupts(f);
+        let took = rdtsc().saturating_sub(start);
+        GATED_SCANS.fetch_add(1, Ordering::Relaxed);
+        GATED_LONGEST.fetch_max(took, Ordering::Relaxed);
+        result
     }
+}
+
+/// How many scans made their pass under the move gate, and the longest of them in TSC ticks, its
+/// wait for the gate included, since the boot began (CL48).
+pub fn gated_scans() -> (u64, u64) {
+    (
+        GATED_SCANS.load(Ordering::Relaxed),
+        GATED_LONGEST.load(Ordering::Relaxed),
+    )
 }
 
 /// Records a new thread on processor `cpu`, whose first frame is `frame`, on its own stack: the

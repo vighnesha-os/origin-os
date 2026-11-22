@@ -1142,6 +1142,8 @@ pub(crate) enum Unmoved {
 /// What a [`migrate`] did, for the proofs' counts.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Moved {
+    /// The processor it left.
+    pub(crate) from: CpuIndex,
     /// Whether the thread carried a pending wake-up (N1).
     pub(crate) carried_wake: bool,
     /// The move's critical section in TSC ticks, from before its first queue lock to after its
@@ -1174,8 +1176,8 @@ pub(crate) struct Moved {
 ///
 /// An inconsistency met (S20, triggers 2 and 3) enters pinned mode, and its line is printed after
 /// the section; `NotRestored`, a frame that could not be put back, stops the kernel (the ruling's
-/// Q7: two processors could have run one context). Called from thread context or the boot flow,
-/// with interrupts on.
+/// Q7: two processors could have run one context). Called from thread context, with interrupts on,
+/// or from the boot flow, with them off: its section saves and restores them.
 pub(crate) fn migrate(
     thread: ThreadRef,
     to: CpuIndex,
@@ -1305,6 +1307,7 @@ fn move_once(
     let ticks = rdtsc().saturating_sub(start);
     match moved {
         Some(Ok((_, carried_wake))) => Ok(Moved {
+            from,
             carried_wake,
             ticks,
         }),
@@ -2581,10 +2584,11 @@ fn say_window(
 pub(crate) fn prove(
     flow: Pinned<'_>,
     com1: &mut Console,
-    cpus: &[CpuIndex],
+    online: &crate::smp::Online,
     tsc_hz: u64,
     proofs: &mut Tally,
 ) {
+    let cpus = online.cpus();
     // Give every online processor's boot/idle context an FPU area before the baseline is
     // measured, so the first switch on it can save its state and the leak check is fair.
     for &id in cpus {
@@ -2873,6 +2877,17 @@ pub(crate) fn prove(
     proofs.record(
         Proof::KernelBound,
         crate::ipc_proof::prove_kernel_bound(com1, cpus, bsp, tsc_hz),
+    );
+    // Moves between processors (TASKS item 96; the contract's §3, the ruling's Q10), last: their
+    // threads are the only movable ones, and every one has ended and been reaped before the next
+    // proof starts. The processors online and their FPU flags come with `online` (Q16).
+    proofs.record(
+        Proof::MigrationIntegrity,
+        crate::migration_proof::prove_integrity(flow, com1, online, tsc_hz),
+    );
+    proofs.record(
+        Proof::MigrationDelivery,
+        crate::migration_proof::prove_delivery(flow, com1, online, tsc_hz),
     );
 }
 

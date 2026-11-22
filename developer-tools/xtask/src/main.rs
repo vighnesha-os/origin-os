@@ -2732,6 +2732,13 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
         ])
         .chain(kernel_bound_markers(true))
         .chain([
+            // ADR-0020 S6, S20 and S23 (TASKS item 96): the two migration proofs, on every
+            // machine; on one with fewer than two processors taking part, each says so and passes.
+            // A failure ends its line ": scheduler failed", a boot failure below.
+            "origin-kernel: scheduler: thread migration: integrity: ".into(),
+            "origin-kernel: scheduler: thread migration: delivery: ".into(),
+        ])
+        .chain([
             // ADR-0017 Z3: the scheduler noted each change of process, with one barrier for
             // each where the processor has IBPB and none where it has not.
             "origin-kernel: ibpb: ".into(),
@@ -3687,6 +3694,9 @@ fn boot_failures() -> Vec<&'static str> {
         ": AP start-up failed",
         ": boot steps failed",
         ": scheduler failed",
+        // ADR-0020 S20 (TASKS item 96): moves withdrawn after an inconsistency, during the proofs
+        // or after them. The kernel goes on, and the scenario fails, under QEMU or on a machine.
+        "origin-kernel: scheduler: pinned mode:",
         ": topology failed",
         ": CPU baseline failed",
         ": numa failed",

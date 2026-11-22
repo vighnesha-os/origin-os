@@ -447,7 +447,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         // M3, second step: preemptive kernel threads on every online processor. Its proofs
         // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
         // use only the kernel's fixed programs, and the operator sees every result.
-        sched::prove(flow, &mut com1, online.cpus(), tsc_hz, &mut proofs);
+        sched::prove(flow, &mut com1, &online, tsc_hz, &mut proofs);
         // ADR-0017 Z3, after the proofs above have run several processes in ring 3.
         proofs.record(Proof::Ibpb, prove_ibpb(flow, &mut com1, online.cpus()));
         stop_if_refused(&mut com1, proofs);
