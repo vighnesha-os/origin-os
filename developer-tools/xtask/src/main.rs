@@ -425,6 +425,10 @@ struct Completed {
     /// `-no-reboot` that is the guest resetting the machine (TASKS item 116); a triple fault is
     /// a reset to QEMU too, which the scenarios' lines tell apart.
     exited: bool,
+    /// When QEMU exited by itself: the time from the last byte it sent to its output closing, to
+    /// within the reader's latency. TASKS item 121's scenarios tell a reset through `0xCF9` (at
+    /// once) from the triple fault (after the loader's wait) by it.
+    quiet_before_exit: Option<Duration>,
 }
 
 /// The IOMMU QEMU emulates (`ORIGIN_QEMU_IOMMU`, [`Settings::iommu`]): Intel VT-d or AMD-Vi,
@@ -7828,6 +7832,10 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
     let screen_path = work.join("screen.ppm");
     // Whether QEMU closed its output: it exited by itself (TASKS item 116).
     let mut closed = false;
+    // When the last byte came, and when QEMU's output closed (TASKS item 121): a scenario tells
+    // from the time between them which reset ended the boot.
+    let mut last_byte: Option<Instant> = None;
+    let mut closed_at: Option<Instant> = None;
     let mut verdict: Result = if scenario.capture == Capture::Screen {
         let monitor = stdin.as_mut().ok_or("QEMU stdin was not captured")?;
         wait_for_screen(
@@ -7868,6 +7876,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(chunk) => {
                     raw.extend_from_slice(&chunk);
+                    last_byte = Some(Instant::now());
                     // Judged only once a line has ended: QEMU hands the serial port's output
                     // over a few bytes at a time, and judging the whole log for each chunk is
                     // quadratic in its length. A 65-processor log took 48 minutes to judge
@@ -7893,6 +7902,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     closed = true;
+                    closed_at = Some(Instant::now());
                     if let Some(verdict) = judge(&raw) {
                         break verdict;
                     }
@@ -7908,11 +7918,15 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
         let until = Instant::now() + quiet;
         loop {
             match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
-                Ok(chunk) => raw.extend_from_slice(&chunk),
+                Ok(chunk) => {
+                    raw.extend_from_slice(&chunk);
+                    last_byte = Some(Instant::now());
+                }
                 Err(RecvTimeoutError::Timeout) => break,
                 // QEMU exited, so the quiet time is over: a reset under `-no-reboot`.
                 Err(RecvTimeoutError::Disconnected) => {
                     closed = true;
+                    closed_at = Some(Instant::now());
                     break;
                 }
             }
@@ -8000,6 +8014,10 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
         screen,
         com1,
         exited,
+        quiet_before_exit: match (last_byte, closed_at) {
+            (Some(byte), Some(closed)) if exited => Some(closed.saturating_duration_since(byte)),
+            _ => None,
+        },
     };
     let verdict = verdict
         .and_then(|()| match stack_window_lines(&done.serial).first() {

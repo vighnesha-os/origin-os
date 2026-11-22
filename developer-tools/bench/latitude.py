@@ -89,9 +89,9 @@ CONFIRMED = ("gone", "deleted", "deleting", "disk_erasing")
 # Methods that are safe to repeat. A repeated POST could create a second server.
 IDEMPOTENT = ("GET", "DELETE")
 
-# The bench loader's switches (TASKS items 112 and 116), each a file in \EFI\ORIGIN\ that only
-# QEMU scenarios write. The install refuses an ESP that holds any of them.
-BENCH_SWITCHES = ("BENCH-STALE-KEY", "BENCH-AFTER")
+# The bench loader's switches (TASKS items 112, 116 and 121), each a file in \EFI\ORIGIN\ that
+# only QEMU scenarios write. The install refuses an ESP that holds any of them.
+BENCH_SWITCHES = ("BENCH-STALE-KEY", "BENCH-AFTER", "BENCH-FCH")
 
 
 def refuse_bench_switches():

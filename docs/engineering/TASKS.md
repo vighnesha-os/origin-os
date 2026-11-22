@@ -4620,3 +4620,143 @@ The host tests' counts at the turn's start were 566 for the kernel's library, 38
 - **The `NotMine` path** has no boot that reaches it.
 - **What the types do not check:** the types check where an index is read, not how a plain index is used afterwards; the review record names each such use.
 - **Not shown:** a pin holding a thread that would otherwise move, since nothing moves until TASKS item 96; anything under KVM until CI runs it; anything on hardware. No person has reviewed it.
+
+### 121. A bench loader that resets the machine with no firmware code (rental E's findings, rank 1; owner item 345, ADR-0002 Amendment 4)
+
+Assigned by the coordinating session on 2026-11-21, after the owner accepted item 345 ("Allow it"). Built on `claude/t121-firmware-free-reset`, cut from `claude/t116-reset-diagnostic` at `c8ecfc9d`. Amendment 4's text is on the records branch `docs/tasks-117-120` (`d0fc7bcb`, records PR 54) and is this contract's architecture.
+
+**Contract.**
+- **Task ID:** TASKS item 121.
+- **Objective:** one rental tells whether `ExitBootServices` returns on the rented firmware, with neither the console nor any firmware reset in the way. It also gives, free, the list of what Origin's loader does before the call that a minimal UEFI program does not (rental E's findings, rank 2).
+- **Source ownership:** `boot/uefi/src/fch.rs` (new: the FCH's registers, the DSDT's region, the page walk, the lines; no `unsafe`); `boot/uefi/src/main.rs` under the bench flag; `boot/uefi/src/lib.rs` (the module, under the flag); `developer-tools/xtask` (`boot-bench`'s scenarios, a quiet time before QEMU's exit); `developer-tools/bench/latitude.py` (the refusal of the new switch); the research ledger.
+- **Architecture contract:** ADR-0002 B5, Amendments 3 and 4 (items 344 and 345); TASKS item 112's F1 to F3; ADR-0010 E5 (no outcome of a bench read stops the boot).
+- **Specifications:** AMD's FCH register documents for related parts (PPR 55901 and 57238; PPR 56713, this processor's own, has no FCH chapter); the AMD64 Architecture Programmer's Manual, Volume 2, §8.2.9 (shutdown); ACPI 6.6 §5.2.9 (the FADT's DSDT and PM1 event block), §19.6.100 (`OperationRegion`) and §20.2.2 to §20.2.5.2 (its encoding in AML: names, constants, package lengths, `DefOpRegion`); UEFI 2.11 §7.4, §7.5.2. Paraphrased; no other project's source.
+- **Dependencies:** none new.
+- **Security invariants:**
+  - Bench builds only, under `--cfg origin_bench`; the normal images byte-identical to the batch's; F1 to F3 hold.
+  - Before the call the loader reads the FCH's registers and writes none: only on an AMD processor, only at the address AMD's documents give, only where the firmware's DSDT describes a system-memory region there, and only where the firmware's page tables map it.
+  - The only writes are the documented warm-reset command (`0x06`) to port `0xCF9`, and the loader's own zero-limit IDT.
+  - After the call, in a run the FCH's record marks as following the loader's own reset, nothing comes before the `0xCF9` write: no line, no register read, no write-back.
+  - The rental tool refuses every switch only QEMU's ESP may hold.
+- **Performance constraints:** none in normal images. In a bench build: the DSDT's bounded scan once a boot, six register reads, and the waits.
+- **Tests:** host tests of every rule (the region's scan, the page walk, the layout checks, the branch, the lines); `boot-bench` scenarios for each path; planted controls, each failing its scenario (TASKS item 116's BC set, and those listed below); `check`, `boot-test`, and `boot-matrix` three times with `boot-bench`, in one turn of the machine.
+- **Deliverables:** the code, the scenarios and controls, one independent review, the gates, the bench images staged, the hand-over `t121-handover.md` with rental F's readiness, and the rank-2 list in the research ledger.
+- **Acceptance:** each scenario passes and each control fails it; the normal images are the batch's bytes; the review's findings are answered or kept as limits.
+
+**Design.**
+- **D1, where the FCH's power-management block is.** At `0xFED80300`: the FCH's ACPI MMIO base `0xFED80000` plus `0x300`, from AMD's documents. Before any read the loader checks, and prints each check:
+  - the processor is AMD's (CPUID's vendor);
+  - the firmware's DSDT describes a system-memory region that holds the registers read. The region is found by a bounded scan of the DSDT for an `OperationRegion` whose offset and length are constants. The DSDT comes from the FADT the table walk already reads, from memory the firmware's map describes;
+  - the firmware's page tables map the block: a walk from CR3, four levels, large pages followed;
+  - what the firmware's memory map says of the address, which is printed and not required.
+  If the vendor, the DSDT or the walk says no, nothing is read, the control is skipped, and the run makes the call and takes Amendment 3's path after it (TASKS item 116's behaviour).
+- **D2, the reads,** each at its documented width, volatile: the decode-enable register (`PMx00`; bit 1 says whether `0xCF9` is decoded), the PCI control register (`PMx08`; bit 20, shutdown as a PCI reset), the PM1 event block's base (`PMx60`), the ACPI configuration register (`PMx74`; bit 17, the shutdown message), the cause of the last reset (`PMxC0`), and the debug register (`PMxD2`; bit 6 stops a reset through `0xCF9`). Their raw values are printed.
+- **D3, the layout check.** A value that contradicts the documents' layout makes the loader say so, skip the control and make the call, taking Amendment 3's path: any 32-bit read all ones, or a PM1 event block base that is not the FADT's PM1a event block.
+- **D4, the branch.** `PMxC0` bit 19 (a `0x06` command to `0xCF9`) set means the last reset was the loader's own: the run makes the call, and D5 follows it. Anything else means the run is the boot's first: the control. The loader prints which branch it took and why. *Amended by the ruling on R121-2, below: a `PMxC0` naming no reset cause sends the run to the call.*
+- **D5, the control, before the call:** a line, then `0x06` to `0xCF9`, and a 100 ms wait. If the machine still runs, a line saying so; the run then makes the call and takes Amendment 3's path, since its last reset was not the loader's.
+- **D6, after the call, in a run D4 marks as the loader's:** the first instructions after `ExitBootServices` returns, whatever its status, before the status is recorded: `0x06` to `0xCF9`; interrupts masked; 100 ms by the time-stamp counter, at the rate counted over `Stall` before the call; a zero-limit IDT and `int3`. If the machine is still running after that, TASKS item 116's path follows: the line after the call, the write-back, then Amendment 3's order. *Amended by the review, below: only after `EFI_SUCCESS` (the ruling on R121-3), and the triple fault only with `PMx74` bit 17 set (R121-4).*
+- **D7, QEMU.** QEMU has no AMD FCH: its DSDT describes no region at `0xFED80300`, so a QEMU boot takes D1's "no" and TASKS item 116's seven scenarios keep their paths. A switch only QEMU's ESP may hold, `\EFI\ORIGIN\BENCH-FCH`, gives values in place of the reads, and the loader says the values are the switch's:
+  - `first` (the control),
+  - `mine` (D6),
+  - `bad` (D3);
+  - and, after one of those, `nocf9` (D6 without the `0xCF9` write, to show the triple fault), `noshutdown` (D6 without the triple fault, to show the fall-through), and `slow` (5 s in place of 100 ms, so that a scenario tells from QEMU's exit time which method reset it).
+  The rental tool refuses it as it refuses `BENCH-AFTER`, tied by a test.
+
+**The review and its answers** (`docs/engineering/REVIEW_T121_2026-11-21.md`; one independent AI reviewer, no person; no High, four Medium, eight Low):
+- **R121-1 (Medium), fixed.** `PMxC0` bit 19 records any `0x06` to `0xCF9`, the firmware's own reset among them, so the decision line no longer says the reset was the loader's: it says "a `0x06` to `0xCF9` … as the control writes". **Reading rule:** a run that makes the call counts as evidence only after a control run in the same boot.
+- **R121-2 (Medium): the coordinating session's ruling, 2026-11-21; the owner's item 346 (1).** D4 is amended: a `PMxC0` that names no reset cause holds no record, and the run makes the call and D6 follows it, with no control in that boot. Otherwise a firmware that clears the register at start-up would make every run a control, and the call would never be made.
+  - **No record:** none of the reset causes AMD's documents name: bits 16, 18 to 27, 29 and 30. Bits 0 to 9 name why the machine last shut down, not why it reset, and 28 and 31 are not named.
+  - **Bit 20** (`0x0E` to `0xCF9`) counts as a record. Only software clears it, so a later reset leaves it set beside its own bit. Alone, it says the last reset was a `0x0E`, and the run is the control. Beside bit 19, the run follows a `0x06`.
+  - The line prints the branch and the raw value.
+  - **Reading rule (the ruling's):** a boot whose first run found no record has no control. Its result rests on the printed `0xCF9` decode, trap and shutdown bits. A single run in such a boot reads "A, or neither reset works with these bits", and the findings must say so.
+- **R121-3 (Medium): the coordinating session's ruling, 2026-11-21; the owner's item 346 (2).** D6 is amended: `0x06` goes to `0xCF9` only after a call that returned `EFI_SUCCESS`.
+  - After an error, the loader's retry runs as in every build, with its `Y` mark, and its return gets the same check.
+  - After a second error, the existing path runs: Amendment 2's line, then Amendment 3's order.
+  - The check is a compare of the status in RAX. No port, no call, and no memory the call gave back is touched, which the ruling holds to be within Amendment 4's "very first thing".
+  - `boot-bench`'s machine-code check allows that branch and nothing else (R121-8 below).
+- **R121-4 (Medium), fixed; the owner's item 346 (3).** The triple fault follows the wait only where `PMx74` bit 17 (the shutdown message) is set. Otherwise the run skips it and goes on to Amendment 3's order: a shutdown nothing acts on would hang where `ResetSystem` and the FADT's register could still reset the machine. **Reading rule:** with bit 17 clear, a run that makes the call and shows nothing more reads "A, or `0xCF9` did not reset and Amendment 3's order did not either".
+- **R121-5 (Low), fixed:** the walk returns the leaf's physical address (2 MiB and 1 GiB frames masked, the large leaf's PAT bit left out), and the gate requires it to be the address read.
+- **R121-6 (Low), fixed:** the line saying where the registers are, and which checks passed, is printed before they are read.
+- **R121-7 (Low), fixed:** the reads are `unsafe fn`s with a `# Safety` section naming the gate.
+- **R121-8 (Low), fixed:** `nomem` is gone from the `0xCF9` write. `boot-bench` reads the bench loader's machine code with the pinned toolchain's `llvm-objdump`. It requires a path from an indirect call to `out dx, al`, with AL `0x06` and DX `0xCF9`, that holds nothing but reads into registers, compares, and branches to fixed addresses: the plan's checks and the status's. A store, a port instruction, a call, or any other instruction on the way fails it.
+- **R121-9 (Low), fixed:** the vendor, DSDT and walk checks are one host-tested function, `fch::gate`, each planted out on its own (BC-11, BC-11a, BC-11b).
+- **R121-10 (Low), fixed:** a `PMxC0` naming more than one reset cause contradicts the documents (D3).
+- **R121-11 (Low), fixed:** the research list has a section on what this item adds before the call.
+- **R121-12 (Low), fixed:** the module comment and the switch file's comment.
+
+**Against Amendment 4's accepted text** (checked 2026-11-21, before marking it built): three of these answers change what the text says the loader does.
+- **R121-2:** step 2 sends every run not following a `0xCF9` reset to the control, and "a run that finds no record of its own reset can only count runs".
+- **R121-3:** step 3 writes `0xCF9` as the very first thing after the call returns, whatever its status.
+- **R121-4:** step 3 always triple-faults.
+
+The owner accepted all three on 2026-11-22 at about 00:05 UTC ("Accept all"; decision sheet item 346), and Amendment 4's "Refinements" paragraph replaces the text where they differ (records PR 55). The amendment's Code paragraph and row A02-Am4 are marked built against it.
+
+**The scenarios** (`boot-bench`, sixteen): TASKS item 112's four and item 116's three, unchanged, and this item's nine, each with `BENCH-FCH`:
+- `first`: the control; QEMU exits at the `0xCF9` write, and the call is never made.
+- `mine`: the call, then `0xCF9` at once (QEMU exits within 2.5 s of the mark, where the triple fault would take 5 s).
+- `mine nocf9`: the triple fault after the wait.
+- `mine nocf9 noshutdown`: the fall-through to Amendment 3's order.
+- `norecord`: no control, the call, `0xCF9` at once (R121-2's ruling).
+- `mine`, with a stale key once: no reset after the failed call, the retry's mark, then `0xCF9` at once (R121-3's ruling).
+- `mine`, with a stale key twice: Amendment 2's line, the line after the calls, and `ResetSystem` (R121-3's ruling).
+- `bad`: no control, Amendment 3's path.
+- `first nocf9`: a control that does not reset; the line saying so, then the call.
+
+**The planted controls,** each to fail its scenario or test. TASKS item 116's BC-1 to BC-7, and:
+- **BC-8:** `0xCF9` skipped after the call (the triple fault resets, too late);
+- **BC-9:** both skipped (lines after the mark);
+- **BC-10:** bit 19 read the wrong way round;
+- **BC-11:** the DSDT's region not checked;
+- **BC-11a:** the vendor not checked (a host test);
+- **BC-11b:** the walk not made (a host test);
+- **BC-12:** the layout check removed;
+- **BC-13:** a port read before the reset (the machine-code check);
+- **BC-14:** the triple fault whatever `PMx74` bit 17 (a host test);
+- **BC-15:** the reset after any status (the stale-key-once scenario);
+- **BC-16:** no record taken as another cause (a host test and the `norecord` scenario).
+
+**The gates on `12a4e081`** (the code at `c066fc90`; `land/batch-9` merged at `d0376076`, records only since `0b90dea8`), in one turn of the machine on a clean tree, 2026-11-22 from 02:19:18 to 03:07:28 UTC, under Rust 1.100.0 with QEMU 11.1.3 TCG and OVMF:
+
+- **The short compile turn:**
+  - `cargo fmt --check` found nothing;
+  - host tests: the loader's library 92 passed, xtask 404 passed with 1 ignored, and the rental tool's passed;
+  - Clippy found nothing in either crate.
+- **The planted controls,** 19 runs, each failing for its own reason:
+  - BC-1 and BC-2: their scenarios' markers missing;
+  - BC-3: F2, the text "bench build" in the loader a release builds;
+  - BC-4: F1, the bench flag named outside the listed files;
+  - BC-5, BC-6 and BC-7: their scenarios' lines missing, as in TASKS item 116;
+  - BC-8, BC-9 and BC-13: the machine-code check finds no path from the call to the write of `0x06` to `0xCF9` that holds only reads into registers, compares and branches;
+  - BC-10 and BC-12: QEMU ends before the scenario's lines, with the loader's line before the call as its last;
+  - BC-11: the block read under QEMU with no `BENCH-FCH`;
+  - BC-11a, BC-11b, BC-14 and BC-16's host part: a named host test panics;
+  - BC-15: the UART holds `X` alone, where `X` and `Y` are due;
+  - BC-16's scenario: the run takes the control, where a run with no record makes the call.
+- **`check`** passed in 873 s:
+  - the test harness's result lines sum to 2,683 passed, 0 failed, 30 ignored;
+  - Loom's 91 models passed, and its 140 negative controls were caught;
+  - every document gate passed.
+- **`reproducible-compare`:** all 40 files from both builds are the same bytes as `0b90dea8`'s normal images, built in the same turn. Among them: the loader, 207,872 bytes (SHA-256 `9f8c416e…`), and the kernel image, 2,108,688 bytes (`3e02f71a…`).
+- **`boot-test`** passed, 11 of 11, in 54 s.
+- **`boot-matrix` passed once,** in 1,350 s, by the coordinating session's ruling of 2026-11-22. With the normal images identical, the kernel and the normal loader are the batch's, which its gates ran three times. One run shows that xtask's changes drive the matrix and `boot-bench`.
+  - 43 kernel verdicts: 37 `degraded: 72 of 73 proofs passed; failed: speculation controls`, 3 with scheduler fairness too, and the three machines built to lack something, each verdict naming it.
+  - The kernel stacks' region was at 27 distinct bases in 27 kernel boots.
+  - `boot-bench` inside it passed 16 of 16, with the machine-code check.
+- **`bench-build`:**
+  - `BOOTX64.EFI`: 259,584 bytes, SHA-256 `7a3a7d64e00eb701f952bbd183d4dbe4bcdac15b02f9a7696f99e4a916d37384`;
+  - `KERNEL.ONBF`: 2,108,688 bytes, SHA-256 `3b240652b5928c2bc2c32115ce43054b65dd1d921bcf542e7d0220347d447d8e`.
+- **The machine code after the call** is `c066fc90`'s sequence at the same addresses: `call qword ptr [rax]` at `0x140003e9e`, and the `out` at `0x140003ec6` (`REVIEW_T121_2026-11-21.md`, last section).
+
+**Not shown:**
+
+- any read of an FCH register on a physical machine; QEMU has no FCH (rental F has since read them);
+- anything under KVM, until CI runs the branch;
+- **no person has reviewed it.**
+
+**Rental F (2026-11-22, on the owner's "Rent it"; the coordinating session's guarded run, 04:00:33 to 04:25:50 UTC, $0.81; the ledger now 6 rentals, $4.86):** the bench images above, from `12a4e081`. Record `docs/hardware/records/2026-11-22-latitude-m4-metal-small-f.md` and its log; findings `docs/research/2026-11-22-rental-f-findings.md`. Firmware 2.5 (2025-11-18), a fourth revision.
+- **The FCH's checks passed in all five runs,** and its registers have the documents' layout: `0xCF9` decoded, both shutdown bits set, the PM1 block the FADT's, one reset cause at a time.
+- **The control worked:** in boots 2 and 3 the first run (`PMxC0` bit 21, the tool's restart through a sleep state) wrote `0x06` to `0xCF9`, the firmware started again within 7.1 s, and the next run read bit 19. `PMxC0` survives a firmware start.
+- **The run after each control made the call:** `X`, then nothing for 6.2 to 6.6 minutes; no `Y`, no `0xCF9` reset, no triple fault. Boot 1's single run (bit 19 from the provider's own restart, so no control in its boot) did the same. That is the hand-over's row 2: **A, `ExitBootServices` does not return**, now beside a positive control.
+- **What weakens it:** `PMxD2` bit 6 is set. By AMD's document that bit turns the FCH's own `0xCF9` reset off so that the firmware can trap the write, so the control's reset came through firmware code, most likely an SMI. On this board the first reset after the call is therefore firmware code; only the triple fault behind it is not, and it runs only if the trapped write returns. The objective's "neither the console nor any firmware reset in the way" holds for the console, and for the reset only up to that trap. The findings weigh A′ (the trap never returns after the call) and 2′ (two failures) and rank A well ahead: one fault covers five rentals on four firmware revisions, and A′ needs rental C's console to fail too.
+- **The line "its reset stopped (`PMxD2` bit 6)"** says too much: the bit stops the FCH's own reset, not the firmware's. To be reworded in the next bench build.
+- **Next, ranked in the findings:** the stack's depth under QEMU (free); the live and copied `ExitBootServices` and the `0xCF9` trap's route (`SMIxC0`) read before the call (free); then a minimal program with the triple fault first after the call and a triple-fault control, which needs an owner item.

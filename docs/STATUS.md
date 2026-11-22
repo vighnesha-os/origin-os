@@ -7,6 +7,43 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** On a physical machine only Origin's loader has run: a rented bench server, outside the declared scope, on 2026-11-20 (see the next section). |
 
+## A bench reset with no firmware code: a bench loader for rental F (TASKS item 121; 2026-11-21)
+
+On `claude/t121-firmware-free-reset`, cut from TASKS item 116's branch, with `land/batch-9` at `d0376076` merged in; not yet in the batch. Rental E showed nothing after the mark before `ExitBootServices`, and no reset (`docs/research/2026-11-21-rental-e-findings.md`): either the call never returns, or it returned and both the console's path and the firmware's reset failed after it. This loader separates the two with a reset that runs no firmware code (decision item 345, ADR-0002 Amendment 4).
+
+- **Before the call, on an AMD processor:** the bench loader reads the FCH's power-management registers and writes none. It reads them only where the firmware's DSDT describes a system-memory region holding them, and where the firmware's page tables map them to themselves. It prints their values: the decode of port `0xCF9`, the bit that stops its reset, the two shutdown bits, the PM1 event block and the cause of the last reset.
+- **The branch:**
+  - **another reset cause:** the boot's first run, the control: `0x06` to `0xCF9`, and no call;
+  - **a `0x06` to `0xCF9`, or no record at all:** the call. After a call that returns `EFI_SUCCESS`, `0x06` to `0xCF9` is the first thing, then 100 ms, then a triple fault where the shutdown message is on, then Amendment 3's order. After an error, the loader's retry with the same check;
+  - **a layout that contradicts AMD's documents:** no control, and Amendment 3's path.
+- **The machine code after the call** holds only the status's compare, the plan's loads and compares, and branches before the `out`; `boot-bench` refuses anything else.
+- **Normal images are unchanged,** checked by the reproducible gate against the batch's bytes.
+- **The list of what Origin's loader does before the call that a minimal UEFI program does not** is in `docs/research/2026-11-21-loader-before-the-call.md`.
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:** `boot-bench`, 16 of 16. QEMU has no AMD FCH, so a switch only QEMU's ESP may hold stands in for the reads, and the rental tool refuses it. The FCH's nine scenarios:
+- the control;
+- `0xCF9` after the call;
+- the triple fault;
+- the fall-through;
+- no record;
+- the reset only after the retry succeeds;
+- the normal path after both calls fail;
+- a contradicting layout;
+- a control that does not reset.
+
+Its new controls BC-13, BC-15 and BC-16 each fail. One independent AI review: no High, four Medium and eight Low, all answered (`docs/engineering/REVIEW_T121_2026-11-21.md`). Three of the answers refine Amendment 4's text; the owner accepted them as decision sheet item 346.
+
+**The full gates passed on `12a4e081`** (2026-11-22):
+- all 19 control runs failed, each for its own reason;
+- `check` and `boot-test` passed;
+- `boot-matrix` passed once, by the coordinating session's ruling;
+- the normal images are the same bytes as the batch's.
+
+**Rental F** (2026-11-22, $0.81; `docs/hardware/records/2026-11-22-latitude-m4-metal-small-f.md`, `docs/research/2026-11-22-rental-f-findings.md`):
+- **The control worked:** in two boots, the run before the call wrote `0x06` to `0xCF9`, the firmware started again within 7.1 s, and the next run found the reset recorded in the FCH.
+- **That next run made the call,** and then nothing: no `0xCF9` reset, no triple fault, for over six minutes. That is reading A, `ExitBootServices` does not return, now beside a positive control in the same boot, on a fourth firmware revision.
+- **One limit:** the firmware has the FCH's own `0xCF9` reset turned off (`PMxD2` bit 6) and resets through its own code when the port is written, most likely in SMM. So the first reset after the call was firmware code, and only the triple fault behind it was not. The findings still rank A well ahead, and name the next steps: the stack's depth under QEMU, two free reads before the call, and a minimal program with the triple fault first.
+
 ## The reset diagnostic: a bench loader for rental E (TASKS item 116; 2026-11-21)
 
 On `claude/t116-reset-diagnostic`, with `land/batch-9` at `0e4f99f9` merged in; not yet in the batch. Rental D showed nothing after the loader's last line (`docs/research/2026-11-21-rental-d-findings.md`): either `ExitBootServices` does not return on the rented firmware, or nothing written straight to the SPCR's UART after it reaches the console.

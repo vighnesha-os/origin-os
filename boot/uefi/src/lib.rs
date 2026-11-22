@@ -14,6 +14,8 @@
 #[cfg(any(test, origin_bench))]
 pub mod bench;
 pub mod console;
+#[cfg(any(test, origin_bench))]
+pub mod fch;
 pub mod framebuffer;
 pub mod kernel;
 pub mod memmap;
