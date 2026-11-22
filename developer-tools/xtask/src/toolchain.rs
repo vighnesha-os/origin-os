@@ -257,6 +257,24 @@ fn bench_entries() -> Vec<String> {
     entries_for(&[UEFI_TARGET, KERNEL_TARGET], r#"["--cfg","origin_bench"]"#)
 }
 
+/// [`image_config`] and, for the UEFI target only, `--cfg origin_bench` and `--cfg
+/// origin_bench_minimal`: the bench loader's minimal-program mode (ADR-0002 Amendment 5; TASKS
+/// item 128). Only `bench::build_minimal_loader` and the bench Clippy run use it, into
+/// `target/bench-minimal`; the kernel it is staged with is the bench kernel.
+pub(crate) fn bench_minimal_config() -> Result<Vec<String>> {
+    let mut config = image_config()?;
+    config.extend(bench_minimal_entries());
+    Ok(config)
+}
+
+/// The minimal mode's own entries.
+fn bench_minimal_entries() -> Vec<String> {
+    entries_for(
+        &[UEFI_TARGET],
+        r#"["--cfg","origin_bench","--cfg","origin_bench_minimal"]"#,
+    )
+}
+
 /// [`image_config`] and, for the UEFI target only, the stack-measurement build of the loader
 /// (TASKS item 127): `--cfg origin_stack_measure`, with `bench` `--cfg origin_bench` too, and a
 /// link map written to `map` for the static chain. Only `stack_depth::build_loader` and its Clippy
@@ -488,6 +506,16 @@ mod tests {
             "{both:?}"
         );
         assert!(both[1].ends_with(r#""link-arg=/MAP:/m\\\"q"]"#), "{both:?}");
+        // TASKS item 128: the minimal mode, on the loader's target only, with the bench flag.
+        assert_eq!(
+            bench_minimal_entries(),
+            [
+                "--config",
+                &format!(
+                    r#"target.{UEFI_TARGET}.rustflags=["--cfg","origin_bench","--cfg","origin_bench_minimal"]"#
+                ),
+            ]
+        );
     }
 
     const REPORT: &str = "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: aarch64-apple-darwin\nrelease: 1.99.1\nLLVM version: 23.1.1\n";

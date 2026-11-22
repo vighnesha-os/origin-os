@@ -7,13 +7,26 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** On a physical machine only Origin's loader has run: a rented bench server, outside the declared scope, on 2026-11-20 (see the next section). |
 
+## The minimal-program mode and Amendment 4's addition, in the bench loader (TASKS item 128; 2026-11-22)
+
+On `claude/t128-minimal-mode`, cut from TASKS item 127's tip `a1069e45`; not yet in the batch. Rentals E and F saw nothing after the mark before `ExitBootServices` and no reset after it. Owner items 347 and 348 (ADR-0002 Amendment 5, Amendment 4's addition) add a loader that does almost nothing before the call, to tell Origin's loader apart from the firmware. Item 349 makes it triple-fault after any successful call. Item 350 makes rental G the last rental for a while.
+
+- **The minimal mode,** a bench build of its own (`bench-build --minimal`), never signed or shipped:
+  - before the call it reads the memory map into a static buffer, the SPCR, the FADT's reset register, and the FCH's registers and `SMIxC0` behind Amendment 4's gate, and nothing else: no kernel read, no verification, no generator, no allocation, no page tables, no copy of the boot services table;
+  - where the last reset was not a shutdown and both shutdown bits are set, the boot's first run is the control, a triple fault and no call;
+  - otherwise the call, through the live boot services table, with `X` straight before it. After `EFI_SUCCESS`, a triple fault and nothing else (item 349). After an error, Amendment 2's line and Amendment 3's order, never writing `0xCF9`.
+- **Amendment 4's addition:** `SMIxC0`'s routing of the `0xCF9` trap, read behind its own gate in both bench modes; and, in the full bench mode, the live boot services table compared byte for byte with the loader's copy before the call.
+- **The rental tool** reads a minimal image's runs and timings, and gives it six boots of up to five minutes, each ending at its answer (item 350). It refuses, before buying, a plan that does not end its boots 10 minutes before the deadline.
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:** every gate passed on `32b6e043`, in one turn (07:07 to 07:48 UTC): `check`; the normal images the batch's bytes; `boot-test`; one `boot-matrix`, whose `boot-bench` passed 22 of 22, the minimal mode's six among them; both bench builds. QEMU has no AMD FCH, so a stand-in table only QEMU's firmware tables hold supplies its values. All ten planted controls fail for their own reason: MC-3 and MC-5 only in a follow-on, since Clippy stopped their first plants. One independent AI review: no High, five Medium and twelve Low, all answered. Rental G's images are staged, and the rental tool's dry run shows six boots, $0.81 an hour and $1.62 at worst; nothing bought.
+
 ## The loader's stack depth before `ExitBootServices` (TASKS item 127; 2026-11-22)
 
 On `claude/t127-stack-depth`, cut from `land/batch-10` at `953cda2c`; not yet in the batch. Rental F's findings ranked first a free measurement: how deep the loader's stack goes before the call, against the 128 KiB UEFI promises (`docs/research/2026-11-22-loader-stack-depth.md`).
 
 - **How:** a measurement build of its own, never signed or rented, paints exactly the promised 128 KiB at entry. After each of six phases it finds the deepest word written, calibrated on a known 64 KiB array. A static chain from the build's link map and disassembly cross-checks it.
 - **The rentals' path** (an unsigned kernel): at most 10,312 bytes, 7.9%.
-- **The shipping path** (a signed kernel, ML-DSA-87 verified): at most 23,240 bytes, 17.7%. The static chain matches the quietest boot to the byte.
+- **The shipping path** (a signed kernel, ML-DSA-87 verified): 23,240 to 23,800 bytes, 17.7% to 18.2%, the higher figure from the keeper's run when it landed the item. The static chain matches the quietest boot to the byte.
 - **So the stack drops to the bottom of the candidates** (the coordinating session's ruling). OVMF's own frames are in the figure; AMI's are not.
 
 **What is shown, under QEMU 11.1.3's software processor on the development Mac only:** `stack-depth`, 12 boots; its four planted controls fail; `check` passes; the normal images are the batch's bytes.

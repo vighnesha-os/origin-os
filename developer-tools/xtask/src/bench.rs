@@ -46,6 +46,36 @@ pub(crate) const MARKER: &[u8] = b"bench build";
 /// The flag's name, which only [`FILES`] may hold (F1).
 const CFG: &str = "origin_bench";
 
+/// The minimal mode's flag (ADR-0002 Amendment 5; TASKS item 128), given with [`CFG`]; only
+/// [`MINIMAL_FILES`] may hold it (F1, the coordinating session's ruling Q2).
+const MINIMAL_CFG: &str = "origin_bench_minimal";
+
+/// The text every minimal-mode image holds, beside [`MARKER`], and no full bench image may.
+pub(crate) const MINIMAL_MARKER: &[u8] = b"bench build: minimal";
+
+/// The stand-in table's signature (ADR-0002 Amendment 5; ruling Q4): the minimal-mode loader holds
+/// it, and no other image may, so no other build can take the table (R128-3).
+const STAND_IN_SIGNATURE: &[u8] = b"OXFC";
+
+/// The files that may name the minimal mode's flag. Each also names the bench flag, which its name
+/// begins with, so each is on [`FILES`] too.
+const MINIMAL_FILES: &[(&str, &str)] = &[
+    ("Cargo.toml", "the flag's check-cfg declaration"),
+    (
+        "boot/uefi/src/fch.rs",
+        "the stand-in table's code, compiled only in the minimal mode (R128-3)",
+    ),
+    (
+        "boot/uefi/src/main.rs",
+        "the minimal mode's entry and module (TASKS item 128)",
+    ),
+    (
+        "developer-tools/xtask/src/toolchain.rs",
+        "the one place the flag is given",
+    ),
+    ("developer-tools/xtask/src/bench.rs", "this gate"),
+];
+
 /// The files that may name the bench flag, each for a reason (F1). A file leaves the list when its
 /// last mention goes: the gate fails on a listed file that holds none.
 const FILES: &[(&str, &str)] = &[
@@ -85,8 +115,9 @@ const FILES: &[(&str, &str)] = &[
 
 /// The flags F1 holds to their listed files: the bench build's, and TASKS item 127's stack
 /// measurement, whose rule is the same (the coordinating session's ruling on TASKS item 127, Q1).
-const FLAGS: [(&str, &[(&str, &str)]); 2] = [
+const FLAGS: [(&str, &[(&str, &str)]); 3] = [
     (CFG, FILES),
+    (MINIMAL_CFG, MINIMAL_FILES),
     (crate::stack_depth::CFG, crate::stack_depth::FILES),
 ];
 
@@ -96,6 +127,11 @@ const SCANNED: &[&str] = &["rs", "toml", "yml", "yaml", "sh", "py", "json"];
 /// Where bench builds go, apart from every other build.
 pub(crate) fn target() -> PathBuf {
     crate::target_dir().join("bench")
+}
+
+/// Where minimal-mode builds go (TASKS item 128), apart from every other build.
+pub(crate) fn minimal_target() -> PathBuf {
+    crate::target_dir().join("bench-minimal")
 }
 
 /// F1: the bench flag's name appears only in [`FILES`], and in each of them; and the
@@ -144,18 +180,18 @@ pub(crate) fn gate() -> Result {
         counts.push(found.len());
     }
     println!(
-        "xtask: bench gate (TASKS item 112, F1): the bench flag is named in {} listed files and nowhere else, and the stack measurement's flag (TASKS item 127) in {}",
-        counts[0], counts[1]
+        "xtask: bench gate (TASKS item 112, F1): the bench flag is named in {} listed files and nowhere else, the minimal mode's flag (TASKS item 128) in {}, and the stack measurement's flag (TASKS item 127) in {}",
+        counts[0], counts[1], counts[2]
     );
     Ok(())
 }
 
 /// The heart of [`gate`]: `found` are the files that name `flag`, which only `files` may.
 fn check_found(flag: &str, files: &[(&str, &str)], found: &[String]) -> Result {
-    let which = if flag == CFG {
-        "the bench flag"
-    } else {
-        "the stack measurement's flag"
+    let which = match flag {
+        CFG => "the bench flag",
+        MINIMAL_CFG => "the minimal mode's flag",
+        _ => "the stack measurement's flag",
     };
     let listed: Vec<&str> = files.iter().map(|(path, _)| *path).collect();
     let mut problems: Vec<String> = found
@@ -182,14 +218,15 @@ fn check_found(flag: &str, files: &[(&str, &str)], found: &[String]) -> Result {
     }
 }
 
-/// Whether `path` is under [`target`].
+/// Whether `path` is under [`target`] or [`minimal_target`].
 pub(crate) fn is_bench(path: &Path) -> bool {
-    let root = target();
-    path.starts_with(&root)
-        || fs::canonicalize(path)
-            .ok()
-            .zip(fs::canonicalize(&root).ok())
-            .is_some_and(|(path, root)| path.starts_with(root))
+    [target(), minimal_target()].iter().any(|root| {
+        path.starts_with(root)
+            || fs::canonicalize(path)
+                .ok()
+                .zip(fs::canonicalize(root).ok())
+                .is_some_and(|(path, root)| path.starts_with(root))
+    })
 }
 
 /// Fails if `path` is a bench build's file, or a stack measurement's (TASKS item 127): no signing
@@ -220,6 +257,161 @@ pub(crate) fn build_loader() -> Result<PathBuf> {
     )
 }
 
+/// The minimal-mode bench loader (ADR-0002 Amendment 5): the developer-mode loader with the bench
+/// flag and the minimal mode's, into [`minimal_target`].
+pub(crate) fn build_minimal_loader() -> Result<PathBuf> {
+    crate::build_loader_with(
+        Some(Loader::Developer.feature()),
+        Some(&minimal_target()),
+        &toolchain::bench_minimal_config()?,
+    )
+}
+
+/// `cargo xtask bench-build --minimal` (TASKS item 128): the full bench images first, then the
+/// minimal-mode loader, staged with the bench kernel (which it never reads; the rental tool needs
+/// one) as `target/bench-minimal/xtask/BOOTX64.EFI` and `KERNEL.ONBF` for a rental's
+/// `--image-dir`. Fails unless the loader holds [`MARKER`], [`MINIMAL_MARKER`] and the stand-in
+/// table's signature (the positive control of `build`'s refusal of it, R128-3), writes `0xCF9`
+/// nowhere, and holds the triple fault right after the call ([`check_minimal_code`]).
+pub(crate) fn build_minimal() -> Result<(PathBuf, PathBuf)> {
+    let (full_loader, bench_kernel) = build()?;
+    let efi = build_minimal_loader()?;
+    let out = minimal_target().join("xtask");
+    fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let loader = out.join("BOOTX64.EFI");
+    let kernel = out.join(crate::KERNEL_IMAGE);
+    fs::copy(&efi, &loader).map_err(|e| format!("copy {}: {e}", efi.display()))?;
+    fs::copy(&bench_kernel, &kernel)
+        .map_err(|e| format!("copy {}: {e}", bench_kernel.display()))?;
+    let bytes = read_file(&loader)?;
+    if !holds(&bytes, MARKER)
+        || !holds(&bytes, MINIMAL_MARKER)
+        || !holds(&bytes, STAND_IN_SIGNATURE)
+    {
+        return Err(format!(
+            "{} is a minimal-mode image without the texts \"bench build\", \"bench build: minimal\" and \"OXFC\"",
+            loader.display()
+        ));
+    }
+    check_minimal_code(&loader, &full_loader)?;
+    for path in [&loader, &kernel] {
+        let bytes = read_file(path)?;
+        println!(
+            "xtask: bench-build --minimal: {}: {} bytes, SHA-256 {}",
+            path.display(),
+            bytes.len(),
+            crate::reproducible::hex(&origin_crypto::Sha256::digest(&bytes), "")
+        );
+    }
+    Ok((loader, kernel))
+}
+
+/// The minimal-mode loader's machine code, as the pinned toolchain's `llvm-objdump` prints it
+/// (TASKS item 128): no `0xCF9` in a port register anywhere ("there is no `0xCF9` write anywhere in
+/// this mode"), and a path from an indirect call to the triple fault with nothing on it but reads
+/// into registers, compares and branches (Amendment 5, step 6: "nothing comes between them").
+fn check_minimal_code(loader: &Path, full_loader: &Path) -> Result {
+    // The checks' controls, on the full bench loader (R128-8, R128-9): it writes `0xCF9`, so
+    // `writes_cf9` sees that form; and its triple fault comes after `out`, `cli` and a wait, so
+    // `triple_fault_after_call` must not find it.
+    let full = disassemble(full_loader)?;
+    if !writes_cf9(&full) || triple_fault_after_call(&full) {
+        return Err(format!(
+            "{}: the full bench loader does not serve as the machine-code checks' control (0xCF9 in DX: {}; a triple fault right after a call: {}), so their verdict on the minimal loader cannot be trusted",
+            full_loader.display(),
+            writes_cf9(&full),
+            triple_fault_after_call(&full)
+        ));
+    }
+    let listing = disassemble(loader)?;
+    if writes_cf9(&listing) {
+        return Err(format!(
+            "{}: the minimal-mode loader puts 0xCF9 in DX: it would write port 0xCF9, which ADR-0002 Amendment 5 forbids in this mode",
+            loader.display()
+        ));
+    }
+    if !triple_fault_after_call(&listing) {
+        return Err(format!(
+            "{}: no path from an indirect call to the triple fault holds only reads into registers, compares and branches: the triple fault is not the first thing after ExitBootServices (ADR-0002 Amendment 5, step 6)",
+            loader.display()
+        ));
+    }
+    Ok(())
+}
+
+/// `llvm-objdump`'s Intel listing of `image`.
+fn disassemble(image: &Path) -> Result<String> {
+    let objdump = crate::llvm_tool("llvm-objdump")?;
+    let out = Command::new(&objdump)
+        .args(["-d", "--no-show-raw-insn", "--x86-asm-syntax=intel"])
+        .arg(image)
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", objdump.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "{} failed on {}: {}",
+            objdump.display(),
+            image.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Whether `listing` puts `0xCF9` in DX, the only way to address the port.
+fn writes_cf9(listing: &str) -> bool {
+    instructions(listing)
+        .iter()
+        .any(|i| matches!(i.text.as_str(), "mov dx, 0xcf9" | "mov edx, 0xcf9"))
+}
+
+/// Whether `listing` holds an indirect call and, within [`AFTER_CALL_WINDOW`] instructions along
+/// some path from it, the triple fault's first instruction (`push 0x0`, `push 0x0`,
+/// `lidt [rsp]`), every instruction before it on the path one [`step`] allows.
+fn triple_fault_after_call(listing: &str) -> bool {
+    let insns = instructions(listing);
+    let mut index = HashMap::new();
+    for (i, insn) in insns.iter().enumerate() {
+        index.entry(insn.at).or_insert(i);
+    }
+    let is_triple_fault = |i: usize| {
+        [i, i + 1, i + 2]
+            .iter()
+            .map(|&k| insns.get(k).map(|insn| insn.text.as_str()))
+            .eq([Some("push 0x0"), Some("push 0x0"), Some("lidt [rsp]")])
+    };
+    let reaches = |from: usize| {
+        let mut queue = VecDeque::from([(from, 0)]);
+        let mut seen = HashSet::new();
+        while let Some((i, n)) = queue.pop_front() {
+            if n > AFTER_CALL_WINDOW || !seen.insert(i) {
+                continue;
+            }
+            if is_triple_fault(i) {
+                return true;
+            }
+            let Some(step) = insns.get(i).and_then(|insn| step(&insn.text)) else {
+                continue;
+            };
+            let (fall, to) = match step {
+                Step::Next => (true, None),
+                Step::Branch(at) => (true, index.get(&at).copied()),
+                Step::Jump(at) => (false, index.get(&at).copied()),
+            };
+            for j in fall.then_some(i + 1).into_iter().chain(to) {
+                queue.push_back((j, n + 1));
+            }
+        }
+        false
+    };
+    insns.iter().enumerate().any(|(i, insn)| {
+        insn.text
+            .strip_prefix("call ")
+            .is_some_and(|op| !op.starts_with("0x"))
+            && reaches(i + 1)
+    })
+}
+
 /// `cargo xtask bench-build`: builds the bench loader and kernel into [`target`], copies them to
 /// `target/bench/xtask/BOOTX64.EFI` and `KERNEL.ONBF` for a rental's `--image-dir`, and prints
 /// each file's size and SHA-256. Fails unless both hold [`MARKER`] (F2's control).
@@ -242,6 +434,12 @@ pub(crate) fn build() -> Result<(PathBuf, PathBuf)> {
         if holds(&bytes, crate::stack_depth::MARKER) {
             return Err(format!(
                 "{} holds the text \"stack measure\": the stack measurement's code reached a bench image (TASKS item 127, F2)",
+                path.display()
+            ));
+        }
+        if holds(&bytes, MINIMAL_MARKER) || holds(&bytes, STAND_IN_SIGNATURE) {
+            return Err(format!(
+                "{} holds the text \"bench build: minimal\" or the stand-in table's signature \"OXFC\": the minimal mode's code reached the full bench image (TASKS item 128, ruling Q4 and R128-3)",
                 path.display()
             ));
         }
@@ -336,13 +534,30 @@ fn step(text: &str) -> Option<Step> {
     match mnemonic {
         "mov" | "movzx" | "movsx" | "movsxd" => {
             let dest = operands.split(", ").next().unwrap_or_default();
-            (!dest.is_empty() && !dest.contains('[') && !dest.contains("ptr")).then_some(Step::Next)
+            is_general_register(dest).then_some(Step::Next)
         }
         "cmp" | "test" | "nop" => Some(Step::Next),
         "jmp" => target().map(Step::Jump),
         m if m.starts_with('j') => target().map(Step::Branch),
         _ => None,
     }
+}
+
+/// Whether `name` is a general-purpose register other than the stack pointer, so a `mov` into it
+/// only reads (TASKS item 128's review, R128-8): not memory, and not a control, debug or segment
+/// register, nor RSP.
+fn is_general_register(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "eax", "ebx", "ecx", "edx", "esi", "edi",
+        "ebp", "ax", "bx", "cx", "dx", "si", "di", "bp", "al", "bl", "cl", "dl", "ah", "bh", "ch",
+        "dh", "sil", "dil", "bpl",
+    ];
+    NAMES.contains(&name)
+        || name
+            .strip_prefix('r')
+            .map(|rest| rest.trim_end_matches(['d', 'w', 'b']))
+            .and_then(|n| n.parse::<u8>().ok())
+            .is_some_and(|n| (8..=15).contains(&n))
 }
 
 /// Whether AL holds `0x06` and DX `0xCF9` after `text`, given whether they did before: a write to
@@ -416,6 +631,16 @@ pub(crate) fn holds(bytes: &[u8], needle: &[u8]) -> bool {
 /// Clippy over the bench flag's code, which no other Clippy run sees: the loader on its target,
 /// and the kernel with the framework and boot info on theirs, into [`target`].
 fn clippy() -> Result {
+    // TASKS item 128: the minimal mode's loader, which no other Clippy run sees either.
+    let mut minimal = cargo();
+    minimal
+        .args(["clippy", "--package", crate::LOADER_PACKAGE, "--target"])
+        .arg(crate::UEFI_TARGET)
+        .args(["--features", Loader::Developer.feature(), "--target-dir"])
+        .arg(minimal_target())
+        .args(toolchain::bench_minimal_config()?)
+        .args(["--", "-D", "warnings"]);
+    run_step(&mut minimal)?;
     let config = toolchain::bench_config()?;
     let dir = target();
     let mut loader = cargo();
@@ -532,6 +757,21 @@ const FCH_CONTRADICTS: &str = "origin-boot: bench build: the FCH's registers con
 const FCH_CONTROL_FAILED: &str = "origin-boot: bench build: 0xcf9 did not reset the machine within 100 ms: ExitBootServices is called, and Amendment 3's path follows it";
 /// A reset through `0xCF9` ends QEMU at once; the triple fault comes after `slow`'s 5 s wait.
 const CF9_AT_ONCE: Duration = Duration::from_millis(2_500);
+
+// TASKS item 128: the minimal mode's lines (ADR-0002 Amendment 5) and Amendment 4's addition's.
+const MIN_START: &str =
+    "origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5)";
+const MIN_STAND_IN: &str = "origin-boot: bench build: minimal: the stand-in table (OXFC): the FCH's registers are not read; its values stand in for them (QEMU only)";
+const MIN_CONTROL: &str = "origin-boot: bench build: minimal: the last reset was not a shutdown (the reset pin (bit 16)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called";
+const MIN_MINE: &str = "origin-boot: bench build: minimal: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it";
+const MIN_NO_RECORD: &str = "origin-boot: bench build: minimal: PMxC0 0x00000800 names no reset cause: no record of the last reset, and no control in this boot: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it";
+const MIN_NO_RECORD_BITS_CLEAR: &str = "origin-boot: bench build: minimal: PMxC0 0x00000800 names no reset cause: no record of the last reset, and no control in this boot: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it, though PMx74 bit 17 and PMx08 bit 20 are not both set, so a shutdown may not reset this system (decision item 349)";
+const MIN_LAST: &str = "origin-boot: bench build: minimal: ExitBootServices next, through the live boot services table";
+const MIN_HALT_SOON: &str = "origin-boot: bench build: no reset: ResetSystem is not called and the FADT gives no usable reset register; a halt in 7 s";
+const MIN_CF9_SKIPPED: &str = "origin-boot: bench build: ResetSystem was not called (the stand-in table's noreset), and the FADT gives no usable reset register (RESET_REG is I/O port 0xcf9, which the minimal mode never writes (ADR-0002 Amendment 5)): halting";
+const SMI_LINE: &str = "origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): ";
+const SMI_GIVEN: &str = "origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (a stand-in's): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it";
+const TABLE_LINE: &str = "origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at ";
 const AFTER_THE_WAIT: Duration = Duration::from_secs(4);
 
 /// The SPCR naming COM2, as `boot-console`'s scenario gives it.
@@ -635,6 +875,67 @@ fn fch_first_nocf9(work: &Path) -> Result<Vec<String>> {
     fch(work, b"first nocf9\n")
 }
 
+/// An ACPI table with the minimal mode's stand-in signature (TASKS item 128) and `words` as its
+/// body: the stand-in values under QEMU, which has no FCH. Only `xtask` plants it.
+fn stand_in_table(words: &[u8]) -> Vec<u8> {
+    let len = 36 + words.len();
+    let mut table = vec![0u8; len];
+    table[..4].copy_from_slice(b"OXFC");
+    table[4..8].copy_from_slice(&u32::try_from(len).unwrap_or(u32::MAX).to_le_bytes());
+    table[8] = 1;
+    table[10..16].copy_from_slice(b"ORIGIN");
+    table[16..24].copy_from_slice(b"ORIGOXFC");
+    table[24..28].copy_from_slice(&1u32.to_le_bytes());
+    table[28..32].copy_from_slice(b"ORIG");
+    table[32..36].copy_from_slice(&1u32.to_le_bytes());
+    table[36..].copy_from_slice(words);
+    let sum = table.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+    table[9] = 0u8.wrapping_sub(sum);
+    table
+}
+
+/// The SPCR scenario's table, and the stand-in table with `words`.
+fn stand_in(work: &Path, words: &[u8]) -> Result<Vec<String>> {
+    let path = work.join("oxfc.bin");
+    fs::write(&path, stand_in_table(words)).map_err(|e| format!("{}: {e}", path.display()))?;
+    let table = crate::qemu_path_arg("file=", &path)?;
+    crate::spcr_args(
+        work,
+        &crate::spcr_table(0, crate::gas_io(SPCR_PORT), 7),
+        &["-acpitable", &table],
+    )
+}
+
+fn minimal_first(work: &Path) -> Result<Vec<String>> {
+    stand_in(work, b"first")
+}
+
+fn minimal_mine(work: &Path) -> Result<Vec<String>> {
+    stand_in(work, b"mine")
+}
+
+fn minimal_no_record(work: &Path) -> Result<Vec<String>> {
+    stand_in(work, b"norecord")
+}
+
+fn minimal_stale_once(work: &Path) -> Result<Vec<String>> {
+    stand_in(work, b"mine stale1")
+}
+
+fn minimal_bits_clear(work: &Path) -> Result<Vec<String>> {
+    stand_in(work, b"norecord noshutdown")
+}
+
+fn minimal_stale_twice(work: &Path) -> Result<Vec<String>> {
+    stand_in(work, b"mine stale2 noreset")
+}
+
+/// The SPCR scenario with the stand-in table planted, which the full mode must ignore (the
+/// coordinating session's ruling Q4).
+fn spcr_stand_in_ignored(work: &Path) -> Result<Vec<String>> {
+    stand_in(work, b"first")
+}
+
 /// The kernel's markers on the SPCR's UART, as `boot-console`'s SPCR scenario has them, with the
 /// bench kernel's line after the line naming the UART.
 fn kernel_markers(said: &str) -> Vec<String> {
@@ -668,8 +969,8 @@ fn scenario(
     }
 }
 
-/// The sixteen scenarios of [`boot`]: TASKS item 112's four, TASKS item 116's three, and TASKS
-/// item 121's nine.
+/// The twenty-two scenarios of [`boot`]: TASKS item 112's four, TASKS item 116's three, TASKS
+/// item 121's nine, and TASKS item 128's six of the minimal mode.
 fn scenarios() -> Vec<Scenario> {
     let with_crumbs = |first: &str| {
         let mut m = vec![
@@ -707,10 +1008,10 @@ fn scenarios() -> Vec<Scenario> {
             Some(QUIET),
         ),
         scenario(
-            "bench: no switch, the reset through ResetSystem",
+            "bench: no switch, the reset through ResetSystem, the stand-in table ignored",
             Loader::Bench,
             lines(&[FIRST_CALL, AFTER_CALL, RESET_SOON]),
-            spcr,
+            spcr_stand_in_ignored,
             check_reset_system,
             Some(RESET_WITHIN),
         ),
@@ -816,6 +1117,63 @@ fn scenarios() -> Vec<Scenario> {
             check_fch_control_failed,
             Some(RESET_WITHIN),
         ),
+        // TASKS item 128 (ADR-0002 Amendment 5): the minimal mode.
+        scenario(
+            "bench: minimal, the control, a triple fault before the call",
+            Loader::BenchMinimal,
+            lines(&[MIN_START, MIN_CONTROL]),
+            minimal_first,
+            check_minimal_control,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: minimal, a returning call, the triple fault at once",
+            Loader::BenchMinimal,
+            lines(&[MIN_MINE, MIN_LAST, MARK_FIRST]),
+            minimal_mine,
+            check_minimal_mine,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: minimal, no record, no control, the triple fault at once",
+            Loader::BenchMinimal,
+            lines(&[MIN_NO_RECORD, MIN_LAST, MARK_FIRST]),
+            minimal_no_record,
+            check_minimal_no_record,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: minimal, a stale key once, the triple fault only after the retry succeeds",
+            Loader::BenchMinimal,
+            lines(&[MIN_MINE, MIN_LAST, MARK_FIRST, MARK_RETRY]),
+            minimal_stale_once,
+            check_minimal_retry,
+            Some(RESET_WITHIN),
+        ),
+        scenario(
+            "bench: minimal, a stale key twice, Amendment 2's line, then the FADT's register skipped",
+            Loader::BenchMinimal,
+            lines(&[
+                MIN_MINE,
+                MIN_LAST,
+                MARK_FIRST,
+                MARK_RETRY,
+                HALTING,
+                MIN_HALT_SOON,
+                MIN_CF9_SKIPPED,
+            ]),
+            minimal_stale_twice,
+            check_minimal_both_failed,
+            Some(QUIET),
+        ),
+        scenario(
+            "bench: minimal, the shutdown bits clear, the triple fault anyway",
+            Loader::BenchMinimal,
+            lines(&[MIN_NO_RECORD_BITS_CLEAR, MIN_LAST, MARK_FIRST]),
+            minimal_bits_clear,
+            check_minimal_bits_clear,
+            Some(RESET_WITHIN),
+        ),
     ]
 }
 
@@ -835,6 +1193,8 @@ fn check_loader_console(done: &Completed, switch_line: &str, after_line: &str) -
         RESET_PLAN,
         RESET_REGISTER,
         UNDER_FIRMWARE,
+        SMI_LINE,
+        TABLE_LINE,
     ] {
         match at(needle) {
             Some(i) if i < last => {}
@@ -1015,6 +1375,21 @@ fn check_halt(done: &Completed, _settings: &Settings) -> Result {
 /// machine before the FADT's register was reached.
 fn check_reset_system(done: &Completed, _settings: &Settings) -> Result {
     check_loader_console(done, NO_SWITCH, NO_AFTER)?;
+    // The stand-in table is planted, and the full mode ignores it (ruling Q4): its FCH's lines are
+    // those of a QEMU boot with no BENCH-FCH (`check_fch_lines`), and none names the table.
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    if com1.contains("stand-in table") || com1.contains("bench build: minimal") {
+        return Err("the full bench loader took the stand-in table, which only the minimal mode reads (TASKS item 128, ruling Q4)".into());
+    }
+    let table = com1
+        .lines()
+        .find(|l| l.starts_with(TABLE_LINE))
+        .unwrap_or_default();
+    if !table.contains("; the same as the loader's copy") && !table.contains("; it differs from") {
+        return Err(format!(
+            "the boot services table's line does not say how the live table compares: {table:?}"
+        ));
+    }
     check_after(
         done,
         &[MARK_FIRST, FIRST_CALL, AFTER_FIRST, RESET_SOON],
@@ -1096,7 +1471,7 @@ fn check_fch_lines(com1: &str, before: usize) -> Result {
 /// The registers' line and `decision` on COM1, the loader's console; and QEMU exited by itself.
 fn check_fch_decided(done: &Completed, decision: &str) -> Result {
     let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
-    for needle in [FCH_SWITCH, FCH_REGISTERS, decision] {
+    for needle in [FCH_SWITCH, FCH_REGISTERS, SMI_GIVEN, decision] {
         if !com1.contains(needle) {
             return Err(format!(
                 "COM1, the bench loader's console, lacks {needle:?}"
@@ -1242,6 +1617,139 @@ fn check_fch_control_failed(done: &Completed, _settings: &Settings) -> Result {
     )
 }
 
+/// The minimal mode's console (COM1): its own line, the stand-in table's, the SMI line given, and
+/// `decision`; and none of the full path's lines: no switch file read, no kernel read or
+/// verification, no generator, no page tables, no framebuffer, no table compare.
+fn check_minimal_console(done: &Completed, decision: &str) -> Result {
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    for needle in [MIN_START, MIN_STAND_IN, SMI_GIVEN, decision] {
+        if !com1.contains(needle) {
+            return Err(format!(
+                "COM1, the minimal-mode loader's console, lacks {needle:?}"
+            ));
+        }
+    }
+    for absent in [
+        "BENCH-",
+        "origin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF",
+        "origin-boot: kernel verified",
+        "origin-boot: random:",
+        "origin-boot: page tables built",
+        "origin-boot: framebuffer:",
+        TABLE_LINE,
+        LAST_LOADER_LINE,
+    ] {
+        if com1.contains(absent) {
+            return Err(format!(
+                "the minimal-mode loader wrote {absent:?}, which only the full path writes (ADR-0002 Amendment 5)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The lines on the SPCR's UART after the minimal mode's last line, empty ones left out.
+fn after_minimal_last(done: &Completed) -> Result<Vec<String>> {
+    let uart = serial::clean(done.serial.as_bytes());
+    let lines: Vec<&str> = uart.lines().filter(|l| !l.is_empty()).collect();
+    let last = lines
+        .iter()
+        .position(|l| *l == MIN_LAST)
+        .ok_or("the SPCR's UART lacks the minimal mode's last line")?;
+    Ok(lines[last + 1..].iter().map(ToString::to_string).collect())
+}
+
+/// The minimal mode's control: its line is the loader's last, and QEMU exits; no mark is written.
+fn check_minimal_control(done: &Completed, _settings: &Settings) -> Result {
+    check_minimal_console(done, MIN_CONTROL)?;
+    let com1 = serial::clean(done.com1.as_deref().unwrap_or("").as_bytes());
+    let last = com1.lines().rev().find(|l| l.starts_with("origin-boot:"));
+    if last != Some(MIN_CONTROL) {
+        return Err(format!(
+            "the loader's last line should be the control's: {last:?}"
+        ));
+    }
+    let uart = serial::clean(done.serial.as_bytes());
+    if uart.contains(MIN_LAST) || uart.lines().any(|l| l == MARK_FIRST) {
+        return Err(
+            "the minimal mode's last line or its mark was written: the call was made".into(),
+        );
+    }
+    if !done.exited {
+        return Err(
+            "QEMU did not exit after the control: the triple fault did not reset the machine"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// `decision` on the console; after the mode's last line, `marks` and nothing more; and QEMU exits
+/// within [`CF9_AT_ONCE`] of the last mark: the triple fault, the first thing after the call.
+fn check_minimal_call(done: &Completed, decision: &str, marks: &[&str]) -> Result {
+    check_minimal_console(done, decision)?;
+    let after = after_minimal_last(done)?;
+    if after.iter().map(String::as_str).ne(marks.iter().copied()) {
+        return Err(format!(
+            "after the minimal mode's last line the SPCR's UART should hold {marks:?}; it holds {after:?}"
+        ));
+    }
+    if !done.exited {
+        return Err("QEMU did not exit after the call: no triple fault reset the machine".into());
+    }
+    match done.quiet_before_exit {
+        Some(quiet) if quiet < CF9_AT_ONCE => Ok(()),
+        other => Err(format!(
+            "QEMU should exit within {} ms of the last mark, by the triple fault; it took {other:?}",
+            CF9_AT_ONCE.as_millis()
+        )),
+    }
+}
+
+fn check_minimal_mine(done: &Completed, _settings: &Settings) -> Result {
+    check_minimal_call(done, MIN_MINE, &[MARK_FIRST])
+}
+
+fn check_minimal_no_record(done: &Completed, _settings: &Settings) -> Result {
+    check_minimal_call(done, MIN_NO_RECORD, &[MARK_FIRST])
+}
+
+fn check_minimal_retry(done: &Completed, _settings: &Settings) -> Result {
+    check_minimal_call(done, MIN_MINE, &[MARK_FIRST, MARK_RETRY])
+}
+
+/// Both calls given a stale key (R128-10): `X`, `Y`, Amendment 2's line, then Amendment 3's order
+/// with no `ResetSystem` (`noreset`), whose FADT step the mode skips, since the register is port
+/// `0xCF9` under QEMU (the coordinating session's addition to ruling Q3, kept for the error path
+/// by item 349): the halt, and QEMU runs on.
+fn check_minimal_both_failed(done: &Completed, _settings: &Settings) -> Result {
+    check_minimal_console(done, MIN_MINE)?;
+    let after = after_minimal_last(done)?;
+    let want = [
+        MARK_FIRST,
+        MARK_RETRY,
+        HALTING,
+        MIN_HALT_SOON,
+        MIN_CF9_SKIPPED,
+    ];
+    if after.iter().map(String::as_str).ne(want) {
+        return Err(format!(
+            "after the minimal mode's last line the SPCR's UART should hold {want:?}; it holds {after:?}"
+        ));
+    }
+    if done.exited {
+        return Err("QEMU exited: something reset the machine, though the mode skips the FADT's write to 0xCF9 and halts".into());
+    }
+    Ok(())
+}
+
+/// The shutdown bits read clear (owner item 349, "Forced fault anyway"): the line says a shutdown
+/// may not reset this system, no control is made, and a successful call is still followed by the
+/// triple fault at once, with no firmware call.
+fn check_minimal_bits_clear(done: &Completed, _settings: &Settings) -> Result {
+    check_minimal_call(done, MIN_NO_RECORD_BITS_CLEAR, &[MARK_FIRST])
+}
+
 /// A bench kernel under the normal loader: no breadcrumb anywhere, the line saying so, and the
 /// boot otherwise as `boot-console`'s SPCR scenario requires.
 fn check_normal_loader(done: &Completed, settings: &Settings) -> Result {
@@ -1272,13 +1780,15 @@ fn is_crumb_line(line: &str) -> bool {
     !line.is_empty() && line.bytes().all(|b| CRUMBS.as_bytes().contains(&b))
 }
 
-/// `cargo xtask boot-bench`: Clippy over the bench code, the bench pair built, and the seven
-/// scenarios booted (part of `boot-matrix`).
+/// `cargo xtask boot-bench`: Clippy over the bench code, the bench pair and the minimal-mode loader
+/// built with their machine-code checks, and the scenarios booted (part of `boot-matrix`).
 pub(crate) fn boot(settings: &Settings) -> Result {
     let started = Instant::now();
     clippy()?;
     let (loader, kernel) = build()?;
     check_reset_after_call(&loader)?;
+    // TASKS item 128: the minimal-mode loader, with its machine-code checks.
+    build_minimal()?;
     let kernel = read_file(&kernel)?;
     let all: Vec<(Scenario, Vec<u8>)> = scenarios()
         .into_iter()
@@ -1290,7 +1800,7 @@ pub(crate) fn boot(settings: &Settings) -> Result {
         run_scenario(scenario, kernel, settings)?;
     }
     println!(
-        "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, the bench kernel under the normal loader, the reset through ResetSystem, through the FADT's register, a disturbed UART written back, and the FCH's nine: the control, 0xCF9 after the call, the triple fault, the fall-through, no record, 0xCF9 only after the retry succeeds, the normal path after both calls fail, a contradicting layout, and a control that does not reset) in {} s",
+        "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, the bench kernel under the normal loader, the reset through ResetSystem, through the FADT's register, a disturbed UART written back, and the FCH's nine: the control, 0xCF9 after the call, the triple fault, the fall-through, no record, 0xCF9 only after the retry succeeds, the normal path after both calls fail, a contradicting layout, and a control that does not reset; and the minimal mode's six: the control, a returning call, no record, the retry, both calls failing with the FADT's write to 0xCF9 skipped, and the triple fault with the shutdown bits clear) in {} s",
         chosen.len(),
         all.len(),
         started.elapsed().as_secs()
@@ -1371,7 +1881,7 @@ mod tests {
             "{err}"
         );
         // TASKS item 127, SD-3: the measurement flag in a file not on its own list.
-        let (flag, files) = FLAGS[1];
+        let (flag, files) = FLAGS[2];
         let measure: Vec<String> = files.iter().map(|(p, _)| (*p).to_string()).collect();
         assert_eq!(check_found(flag, files, &measure), Ok(()));
         let mut more = measure.clone();
@@ -1396,6 +1906,9 @@ mod tests {
     fn no_signing_path_takes_a_bench_file() {
         let bench_kernel = target().join("xtask").join("KERNEL.ONBF");
         assert!(refuse(&bench_kernel, "signing").is_err());
+        // TASKS item 128: nor a minimal-mode build's.
+        let minimal = minimal_target().join("xtask").join("KERNEL.ONBF");
+        assert!(refuse(&minimal, "signing").is_err());
         // TASKS item 127: nor a stack measurement's.
         let measured = crate::stack_depth::target()
             .join("normal")
@@ -1447,5 +1960,101 @@ mod tests {
         assert!(holds(b"origin-boot: bench build: x", MARKER));
         assert!(!holds(b"origin-boot: benchbuild", MARKER));
         assert!(HALTING.starts_with(HALTING_START));
+    }
+
+    // TASKS item 128.
+
+    #[test]
+    fn the_triple_fault_is_found_only_right_after_an_indirect_call() {
+        let good = "140003e4e:\tcall\trax\n140003e50:\ttest\trax, rax\n140003e53:\tjne\t0x140003e70 <.text+0x2e70>\n140003e55:\tcmp\tbyte ptr [rsp + 0x7], 0x0\n140003e5a:\tje\t0x140003e70 <.text+0x2e70>\n140003e5c:\tpush\t0x0\n140003e5e:\tpush\t0x0\n140003e60:\tlidt\t[rsp]\n140003e64:\tint3\n";
+        assert!(triple_fault_after_call(good));
+        assert!(triple_fault_after_call(
+            &good.replace("call\trax", "call\tqword ptr [rax + 0xe8]")
+        ));
+        // A direct call is not the firmware's.
+        assert!(!triple_fault_after_call(
+            &good.replace("call\trax", "call\t0x140001000 <.text>")
+        ));
+        // Anything else between: a store, a port, a call, another instruction.
+        for between in [
+            "mov\tqword ptr [rsp + 0x8], rax",
+            "out\tdx, al",
+            "call\t0x140017630 <.text+0x16630>",
+            "cli",
+            "xor\tecx, ecx",
+        ] {
+            let listing = good.replace(
+                "140003e5c:\tpush",
+                &format!("140003e5b:\t{between}\n140003e5c:\tpush"),
+            );
+            assert!(!triple_fault_after_call(&listing), "{between}");
+        }
+        // A write to a control register or the stack pointer is no read (R128-8).
+        for write in [
+            "mov\tcr3, rax",
+            "mov\trsp, rbp",
+            "mov\tdr7, rax",
+            "mov\tss, ax",
+        ] {
+            let listing = good.replace(
+                "140003e5c:\tpush",
+                &format!("140003e5b:\t{write}\n140003e5c:\tpush"),
+            );
+            assert!(!triple_fault_after_call(&listing), "{write}");
+        }
+        assert!(
+            is_general_register("r12d") && is_general_register("rax") && is_general_register("dil")
+        );
+        assert!(
+            !is_general_register("rsp")
+                && !is_general_register("r16")
+                && !is_general_register("cr0")
+        );
+        // Not the triple fault's three instructions.
+        assert!(!triple_fault_after_call(
+            &good.replace("lidt\t[rsp]", "lgdt\t[rsp]")
+        ));
+        assert!(!triple_fault_after_call(""));
+    }
+
+    #[test]
+    fn a_port_0xcf9_in_dx_is_found_anywhere() {
+        assert!(writes_cf9(
+            "1000:\tmov\tdx, 0xcf9\n1004:\tmov\tal, 0x6\n1006:\tout\tdx, al\n"
+        ));
+        assert!(writes_cf9("1000:\tmov\tedx, 0xcf9\n"));
+        assert!(!writes_cf9("1000:\tmov\tdx, 0x2f8\n1004:\tout\tdx, al\n"));
+        assert!(!writes_cf9(""));
+    }
+
+    #[test]
+    fn f1_holds_the_minimal_flag_to_its_own_list() {
+        let (flag, files) = FLAGS[1];
+        assert_eq!(flag, MINIMAL_CFG);
+        let listed: Vec<String> = files.iter().map(|(p, _)| (*p).to_string()).collect();
+        assert_eq!(check_found(flag, files, &listed), Ok(()));
+        let mut more = listed.clone();
+        more.push("boot/uefi/src/kernel.rs".into());
+        let err = check_found(flag, files, &more).unwrap_err();
+        assert!(
+            err.contains("boot/uefi/src/kernel.rs names the minimal mode's flag"),
+            "{err}"
+        );
+        // Each file naming the minimal flag names the bench flag too, so the bench list holds it.
+        for (path, _) in MINIMAL_FILES {
+            assert!(FILES.iter().any(|(p, _)| p == path), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_stand_in_table_checks_and_carries_its_words() {
+        let table = stand_in_table(b"mine stale1");
+        assert_eq!(&table[..4], b"OXFC");
+        assert_eq!(
+            u32::from_le_bytes([table[4], table[5], table[6], table[7]]) as usize,
+            table.len()
+        );
+        assert_eq!(table.iter().fold(0u8, |s, &b| s.wrapping_add(b)), 0);
+        assert_eq!(&table[36..], b"mine stale1");
     }
 }
