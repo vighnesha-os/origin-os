@@ -200,6 +200,10 @@ pub enum After {
     /// Rental D's reading B1, made under QEMU, so that writing the firmware's values back is
     /// seen to matter.
     Disturb,
+    /// The minimal mode's stand-in table's `noreset` (ADR-0002 Amendment 5, QEMU only): as
+    /// [`After::Fadt`], `ResetSystem` is not called, so the FADT's step is reached. Never read from
+    /// [`AFTER_PATH`].
+    StandInNoReset,
 }
 
 impl After {
@@ -217,6 +221,11 @@ impl After {
     /// Whether the kernel is entered after a successful call.
     pub const fn enters_kernel(self) -> bool {
         matches!(self, Self::Kernel)
+    }
+
+    /// Whether Amendment 3's order calls no `ResetSystem` in this mode.
+    pub const fn skips_reset_system(self) -> bool {
+        matches!(self, Self::Fadt | Self::StandInNoReset)
     }
 
     /// The loader's line on its console about the switch: `found` is `None` with no
@@ -240,6 +249,9 @@ impl After {
             }
             Some(Some(Self::Disturb)) => {
                 "BENCH-AFTER disturb: after ExitBootServices the loader turns the UART's loopback on and changes its divisor, then writes the firmware's values back, then resets the machine"
+            }
+            Some(Some(Self::StandInNoReset)) => {
+                "the stand-in table's noreset: Amendment 3's order calls no ResetSystem"
             }
         }
     }
@@ -484,6 +496,122 @@ pub enum NoReset {
     /// A memory address the firmware's map does not describe as memory-mapped I/O, so the
     /// firmware's page tables may not map it.
     NotMmio(u64),
+    /// I/O port `0xCF9`, which the minimal mode never writes (ADR-0002 Amendment 5: "there is no
+    /// `0xCF9` write anywhere in this mode"; the coordinating session's ruling on TASKS item
+    /// 128's Q3). Under QEMU the FADT's reset register is that port; on the rented board it is
+    /// the SMI command port `0xB2`.
+    Cf9InMinimal,
+}
+
+/// The FADT's reset register as the minimal mode may use it in Amendment 3's order: the same,
+/// unless it is I/O port `0xCF9`, which the mode skips ([`NoReset::Cf9InMinimal`]), going
+/// straight to the halt.
+pub const fn minimal_register(
+    register: Result<ResetRegister, NoReset>,
+) -> Result<ResetRegister, NoReset> {
+    match register {
+        Ok(ResetRegister::Io { port: 0xCF9, .. }) => Err(NoReset::Cf9InMinimal),
+        other => other,
+    }
+}
+
+/// The line the minimal-mode loader writes first, after the banner (ADR-0002 Amendment 5). The
+/// rental tool and the records tell a minimal-mode image by its text, `bench build: minimal`.
+pub const MINIMAL_LINE: &str = "origin-boot: bench build: minimal: the minimal-program mode (ADR-0002 Amendment 5): no kernel read, no verification, no generator, no allocation, no page tables, no framebuffer search, no copy of the boot services table; after a successful call, a triple fault";
+
+/// The time-stamp counter's ticks a millisecond the minimal mode assumes for Amendment 3's waits,
+/// since it calls no `Stall` to count them: 4 GHz, above the rented board's 3.8 GHz, so each wait
+/// is at least as long as its figure there (ADR-0002 Amendment 5, "no `Stall`").
+pub const MINIMAL_TICKS_PER_MS: u64 = 4_000_000;
+
+/// Amendment 4's addition (item 348), the full mode: the live boot services table against the
+/// loader's copy, before its last line. The minimal mode makes no copy, so it has no such line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableLine {
+    /// Where the system table says the live table is, now.
+    pub live_at: u64,
+    /// Where the loader's copy was taken from.
+    pub copied_from: u64,
+    /// The copy's size, over which the two are compared.
+    pub size: usize,
+    /// How the live table compares.
+    pub live: Live,
+    /// The copy's `ExitBootServices`.
+    pub copy_exit: u64,
+    /// The copy's header CRC32 field.
+    pub copy_crc: u32,
+}
+
+/// The live boot services table, as [`TableLine`] found it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Live {
+    /// Its signature or `HeaderSize` does not check, so its bytes were not read.
+    Unchecked,
+    /// Read over the copy's size: the first byte that differs, if one does, its
+    /// `ExitBootServices` and its header CRC32 field.
+    Read {
+        /// The first byte that differs from the copy.
+        first_difference: Option<usize>,
+        /// Its `ExitBootServices`.
+        exit: u64,
+        /// Its header CRC32 field.
+        crc: u32,
+    },
+}
+
+/// The first of `copy.len()` bytes where `live(i)` differs from `copy[i]`.
+pub fn first_difference(copy: &[u8], mut live: impl FnMut(usize) -> u8) -> Option<usize> {
+    copy.iter()
+        .enumerate()
+        .find(|&(i, &b)| live(i) != b)
+        .map(|(i, _)| i)
+}
+
+impl fmt::Display for TableLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{PREFIX}the boot services table (ADR-0002 Amendment 4's addition): the system table names it at {:#x}",
+            self.live_at
+        )?;
+        if self.live_at != self.copied_from {
+            write!(
+                f,
+                ", not at {:#x}, where the loader's copy was taken from",
+                self.copied_from
+            )?;
+        }
+        match self.live {
+            Live::Unchecked => write!(
+                f,
+                "; its signature or size does not check, so it was not compared; the copy's ExitBootServices {:#x}, header CRC32 {:#010x}",
+                self.copy_exit, self.copy_crc
+            ),
+            Live::Read {
+                first_difference,
+                exit,
+                crc,
+            } => {
+                match first_difference {
+                    None => write!(
+                        f,
+                        "; the same as the loader's copy, byte for byte over its {} bytes",
+                        self.size
+                    )?,
+                    Some(at) => write!(
+                        f,
+                        "; it differs from the loader's copy from byte {at} of {}",
+                        self.size
+                    )?,
+                }
+                write!(
+                    f,
+                    "; ExitBootServices live {exit:#x}, copy {:#x}; header CRC32 live {crc:#010x}, copy {:#010x}",
+                    self.copy_exit, self.copy_crc
+                )
+            }
+        }
+    }
 }
 
 /// The longest FADT read: ACPI 6.6's is 276 bytes.
@@ -629,6 +757,9 @@ impl fmt::Display for NoReset {
                 f,
                 "RESET_REG names memory at {at:#x}, which the firmware's map does not describe as memory-mapped I/O"
             ),
+            Self::Cf9InMinimal => f.write_str(
+                "RESET_REG is I/O port 0xcf9, which the minimal mode never writes (ADR-0002 Amendment 5)",
+            ),
         }
     }
 }
@@ -773,6 +904,8 @@ pub enum Tried {
     Returned,
     /// [`After::Fadt`] asked for it not to be called.
     NotCalled,
+    /// The minimal mode's stand-in table asked for it not to be called ([`After::StandInNoReset`]).
+    NotCalledStandIn,
     /// There was none to call.
     Unavailable,
 }
@@ -793,6 +926,7 @@ impl fmt::Display for Fallback {
         f.write_str(match self.tried {
             Tried::Returned => "ResetSystem returned",
             Tried::NotCalled => "ResetSystem was not called (BENCH-AFTER fadt)",
+            Tried::NotCalledStandIn => "ResetSystem was not called (the stand-in table's noreset)",
             Tried::Unavailable => "there was no ResetSystem to call",
         })?;
         match self.register {
@@ -1497,6 +1631,87 @@ mod tests {
             }
             .to_string(),
             "origin-boot: bench build: ResetSystem returned, and the FADT gives no usable reset register (the FADT's flags give no reset register (RESET_REG_SUP clear)): halting"
+        );
+    }
+
+    // TASKS item 128.
+
+    #[test]
+    fn the_minimal_mode_skips_a_reset_register_at_0xcf9_and_keeps_any_other() {
+        let cf9 = Ok(ResetRegister::Io {
+            port: 0xCF9,
+            value: 0x06,
+        });
+        assert_eq!(minimal_register(cf9), Err(NoReset::Cf9InMinimal));
+        // The rented board's: the SMI command port.
+        let smi = Ok(ResetRegister::Io {
+            port: 0xB2,
+            value: 0xBE,
+        });
+        assert_eq!(minimal_register(smi), smi);
+        let memory = Ok(ResetRegister::Memory {
+            address: 0xFED8_0000,
+            value: 0x06,
+        });
+        assert_eq!(minimal_register(memory), memory);
+        assert_eq!(
+            minimal_register(Err(NoReset::NotSupported)),
+            Err(NoReset::NotSupported)
+        );
+        let line = Fallback {
+            tried: Tried::NotCalled,
+            register: minimal_register(cf9),
+        }
+        .to_string();
+        assert!(
+            line.ends_with("(RESET_REG is I/O port 0xcf9, which the minimal mode never writes (ADR-0002 Amendment 5)): halting"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_table_line_says_same_or_where_it_differs() {
+        let copy = [1u8, 2, 3, 4];
+        assert_eq!(first_difference(&copy, |i| copy[i]), None);
+        assert_eq!(
+            first_difference(&copy, |i| if i == 2 { 9 } else { copy[i] }),
+            Some(2)
+        );
+        let same = TableLine {
+            live_at: 0x9F00_0000,
+            copied_from: 0x9F00_0000,
+            size: 192,
+            live: Live::Read {
+                first_difference: None,
+                exit: 0x9E00_1234,
+                crc: 0xDEAD_BEEF,
+            },
+            copy_exit: 0x9E00_1234,
+            copy_crc: 0xDEAD_BEEF,
+        };
+        assert_eq!(
+            same.to_string(),
+            "origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x9f000000; the same as the loader's copy, byte for byte over its 192 bytes; ExitBootServices live 0x9e001234, copy 0x9e001234; header CRC32 live 0xdeadbeef, copy 0xdeadbeef"
+        );
+        let moved = TableLine {
+            live_at: 0x9F10_0000,
+            live: Live::Read {
+                first_difference: Some(160),
+                exit: 0x9E00_5678,
+                crc: 0x1234_5678,
+            },
+            ..same
+        };
+        let line = moved.to_string();
+        assert!(line.contains("at 0x9f100000, not at 0x9f000000, where the loader's copy was taken from; it differs from the loader's copy from byte 160 of 192; ExitBootServices live 0x9e005678, copy 0x9e001234"), "{line}");
+        let unchecked = TableLine {
+            live: Live::Unchecked,
+            ..moved
+        };
+        assert!(
+            unchecked
+                .to_string()
+                .contains("does not check, so it was not compared")
         );
     }
 }

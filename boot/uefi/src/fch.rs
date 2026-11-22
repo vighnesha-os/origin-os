@@ -75,7 +75,9 @@ pub const CF9_DECODED: u32 = 1 << 1;
 pub const SHUTDOWN_PCI_RESET: u32 = 1 << 20;
 /// `PMx74` bit 17.
 pub const SHUTDOWN_MESSAGE: u32 = 1 << 17;
-/// `PMxD2` bit 6.
+/// `PMxD2` bit 6 (`cf9rstdisable`): the FCH's own reset at `0xCF9` turned off, so that the
+/// firmware can trap the write (PPR 55901, volume 5, p. 330). On rental F it was set, and `0xCF9`
+/// still reset the machine through the firmware (Amendment 4's addition, item 348).
 pub const CF9_RESET_STOPPED: u8 = 1 << 6;
 /// `PMxC0` bit 19: the last reset was a `0x06` written to `0xCF9`.
 pub const LAST_RESET_CF9_WARM: u32 = 1 << 19;
@@ -103,6 +105,26 @@ pub const RESET_CAUSES: u32 = (1 << 16)
 /// name why the machine last shut down, not why it reset. With none of these set, the register
 /// holds no record of the last reset (the coordinating session's ruling on R121-2).
 pub const RESET_RECORD: u32 = RESET_CAUSES | LAST_RESET_CF9_COLD;
+
+/// `PMxC0` bit 23: the last reset was a processor shutdown, the triple fault's record. AMD's
+/// documents record it only with `PMx08` bit 20 and `PMx74` bit 17 set (PPR 55901, volume 5,
+/// p. 326). The minimal mode's control writes it (ADR-0002 Amendment 5).
+pub const LAST_RESET_SHUTDOWN: u32 = 1 << 23;
+
+/// The FCH's SMI block: its ACPI MMIO base `0xFED80000` plus `0x200` (PPR 55901, volume 5, the SMI
+/// registers' `SMI=FED8_0200h`).
+pub const SMI_BLOCK: u64 = 0xFED8_0200;
+/// `SMIxC0`, SMICONTROL8, 32 bits: bits 27:26 route a write of bit 2 to `0xCF9` to nothing, an
+/// SMI, an NMI or IRQ13 (PPR 55901, volume 5, p. 119; Amendment 4's addition, item 348).
+pub const SMI_CONTROL8: u64 = 0xC0;
+/// The address of [`SMI_CONTROL8`].
+pub const SMI_CF9_CONTROL: u64 = SMI_BLOCK + SMI_CONTROL8;
+/// The bytes the `SMIxC0` read touches.
+pub const SMI_SPAN: u64 = 4;
+/// `SMIxC0`'s field for a write to `0xCF9`, after a shift right by [`SMI_CF9_SHIFT`].
+pub const SMI_CF9_MASK: u32 = 0b11;
+/// Where that field starts.
+pub const SMI_CF9_SHIFT: u32 = 26;
 
 /// The FCH's reset control port.
 pub const RESET_PORT: u16 = 0xCF9;
@@ -179,6 +201,8 @@ pub enum NoRegion {
 pub struct Located {
     /// The DSDT's region holding the registers.
     pub region: Result<Region, NoRegion>,
+    /// The DSDT's region holding `SMIxC0` (Amendment 4's addition, item 348).
+    pub smi_region: Result<Region, NoRegion>,
     /// The FADT's PM1a event block, if it is in system I/O.
     pub pm1a_event: Option<u16>,
 }
@@ -193,6 +217,9 @@ pub fn locate(
         region: fadt
             .dsdt_address()
             .map_or(Err(NoRegion::NoDsdt), |at| scan_dsdt(at, read)),
+        smi_region: fadt.dsdt_address().map_or(Err(NoRegion::NoDsdt), |at| {
+            scan_dsdt_for(at, read, SMI_CF9_CONTROL, SMI_SPAN)
+        }),
         pm1a_event: pm1a_port(fadt),
     })
 }
@@ -205,12 +232,23 @@ fn pm1a_port(fadt: &Fadt<'_>) -> Option<u16> {
         .flatten()
 }
 
-/// Scans the DSDT at `at`, `CHUNK` bytes at a time, for an `OperationRegion` that [`holds`] the
-/// registers; each found is read again in a window of its own, so one that crosses two chunks is
-/// read whole.
+/// Scans the DSDT at `at` for an `OperationRegion` that [`holds`] the power-management block's
+/// registers ([`scan_dsdt_for`]).
 pub fn scan_dsdt(
     at: u64,
     read: &mut dyn FnMut(u64, &mut [u8]) -> bool,
+) -> Result<Region, NoRegion> {
+    scan_dsdt_for(at, read, PM_BLOCK, SPAN)
+}
+
+/// Scans the DSDT at `at`, `CHUNK` bytes at a time, for an `OperationRegion` that holds the `len`
+/// bytes from `start` ([`holds_range`]); each found is read again in a window of its own, so one
+/// that crosses two chunks is read whole.
+pub fn scan_dsdt_for(
+    at: u64,
+    read: &mut dyn FnMut(u64, &mut [u8]) -> bool,
+    start_at: u64,
+    len: u64,
 ) -> Result<Region, NoRegion> {
     let mut header = [0u8; HEADER_LEN];
     if !read(at, &mut header) {
@@ -248,7 +286,9 @@ pub fn scan_dsdt(
             if !read(at.wrapping_add(from as u64), window) {
                 return Err(NoRegion::Unreadable(at.wrapping_add(from as u64)));
             }
-            if let Some(region) = operation_region(window).filter(|r| holds(*r)) {
+            if let Some(region) =
+                operation_region(window).filter(|r| holds_range(*r, start_at, len))
+            {
                 return Ok(region);
             }
         }
@@ -257,13 +297,19 @@ pub fn scan_dsdt(
     Err(NoRegion::NotDescribed)
 }
 
-/// Whether `region` holds every byte the loader reads.
+/// Whether `region` holds every byte the loader reads from the power-management block.
 pub fn holds(region: Region) -> bool {
-    region.base <= PM_BLOCK
+    holds_range(region, PM_BLOCK, SPAN)
+}
+
+/// Whether `region` holds the `len` bytes from `start`.
+pub fn holds_range(region: Region, start: u64, len: u64) -> bool {
+    region.base <= start
         && region
             .base
             .checked_add(region.length)
-            .is_some_and(|end| end >= PM_BLOCK + SPAN)
+            .zip(start.checked_add(len))
+            .is_some_and(|(end, wanted)| end >= wanted)
 }
 
 /// A system-memory `OperationRegion` whose offset and length are constants, at the start of
@@ -411,14 +457,41 @@ pub fn gate(
     located: Result<Located, NoReset>,
     walk_at: &mut dyn FnMut(u64) -> Mapping,
 ) -> Result<Region, NotRead> {
+    gate_for(amd, located.map(|l| l.region), PM_BLOCK, SPAN, walk_at)
+}
+
+/// The same checks for `SMIxC0` (Amendment 4's addition, item 348): an AMD processor, the FADT,
+/// a DSDT region holding its four bytes, and the firmware's page tables mapping them to
+/// themselves.
+pub fn gate_smi(
+    amd: bool,
+    located: Result<Located, NoReset>,
+    walk_at: &mut dyn FnMut(u64) -> Mapping,
+) -> Result<Region, NotRead> {
+    gate_for(
+        amd,
+        located.map(|l| l.smi_region),
+        SMI_CF9_CONTROL,
+        SMI_SPAN,
+        walk_at,
+    )
+}
+
+/// [`gate`]'s checks for the `len` bytes from `start`, whose region the walk found as `region`.
+fn gate_for(
+    amd: bool,
+    region: Result<Result<Region, NoRegion>, NoReset>,
+    start: u64,
+    len: u64,
+    walk_at: &mut dyn FnMut(u64) -> Mapping,
+) -> Result<Region, NotRead> {
     if !amd {
         return Err(NotRead::NotAmd);
     }
-    let region = located
+    let region = region
         .map_err(NotRead::NoFadt)?
-        .region
         .map_err(NotRead::NoRegion)?;
-    for at in [PM_BLOCK, PM_BLOCK + SPAN - 1] {
+    for at in [start, start + len - 1] {
         match walk_at(at) {
             Mapping::Mapped(phys) if phys == at => {}
             Mapping::Mapped(phys) => return Err(NotRead::Elsewhere { at, phys }),
@@ -550,7 +623,13 @@ pub enum Branch {
 impl Branch {
     /// The branch `PMxC0` gives.
     pub const fn of(reset_status: u32) -> Self {
-        if reset_status & LAST_RESET_CF9_WARM != 0 {
+        Self::of_mine(reset_status, LAST_RESET_CF9_WARM)
+    }
+
+    /// The branch `PMxC0` gives when `mine` is the record of the mode's own reset: bit 19 in the
+    /// full mode, bit 23 in the minimal mode (ADR-0002 Amendment 5).
+    pub const fn of_mine(reset_status: u32, mine: u32) -> Self {
+        if reset_status & mine != 0 {
             Self::Mine
         } else if reset_status & RESET_RECORD == 0 {
             Self::NoRecord
@@ -571,7 +650,13 @@ pub struct Pretend {
     pub no_shutdown: bool,
     /// `slow`: waits of [`SLOW_WAIT_MS`].
     pub slow: bool,
+    /// `smi=<hex>`: the value that stands in for `SMIxC0` (Amendment 4's addition, item 348);
+    /// [`SMI_STAND_IN`] without it.
+    pub smi: Option<u32>,
 }
+
+/// `SMIxC0`'s stand-in without `smi=`: a write to `0xCF9` raises an SMI (bits 27:26 = 01).
+pub const SMI_STAND_IN: u32 = 1 << SMI_CF9_SHIFT;
 
 /// The values [`Pretend`] gives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -592,15 +677,23 @@ pub const RESET_STATUS_AT_POWER_ON: u32 = 0x800;
 
 impl Pretend {
     /// The words of [`SWITCH_PATH`]: exactly one of `first`, `mine`, `norecord` and `bad`, and
-    /// any of `nocf9`, `noshutdown` and `slow`, separated by whitespace. `None` for anything
-    /// else.
+    /// any of `nocf9`, `noshutdown`, `slow` and `smi=<hex>`, separated by whitespace. `None` for
+    /// anything else.
     pub fn from_contents(contents: &[u8]) -> Option<Self> {
         let mut kind = None;
         let (mut no_cf9, mut no_shutdown, mut slow) = (false, false, false);
+        let mut smi = None;
         for word in contents
             .split(u8::is_ascii_whitespace)
             .filter(|w| !w.is_empty())
         {
+            if let Some(hex) = word.strip_prefix(b"smi=") {
+                if smi.is_some() {
+                    return None;
+                }
+                smi = Some(parse_hex(hex)?);
+                continue;
+            }
             let k = match word {
                 b"first" => Some(Kind::First),
                 b"mine" => Some(Kind::Mine),
@@ -632,7 +725,26 @@ impl Pretend {
             no_cf9,
             no_shutdown,
             slow,
+            smi,
         })
+    }
+
+    /// `SMIxC0`'s stand-in value.
+    pub const fn smi_value(self) -> u32 {
+        match self.smi {
+            Some(v) => v,
+            None => SMI_STAND_IN,
+        }
+    }
+
+    /// [`Pretend::values`] for the minimal mode (ADR-0002 Amendment 5): `mine` names the minimal
+    /// mode's own record, a shutdown (`PMxC0` bit 23), not a `0x06` to `0xCF9`.
+    pub const fn values_minimal(self, pm1a_event: Option<u16>) -> Registers {
+        let mut r = self.values(pm1a_event);
+        if matches!(self.kind, Kind::Mine) {
+            r.reset_status = LAST_RESET_SHUTDOWN;
+        }
+        r
     }
 
     /// The values that stand in for the reads: the documents' layout, with `0xCF9` decoded and its
@@ -690,6 +802,18 @@ impl Pretend {
     }
 }
 
+/// A 32-bit value from hexadecimal ASCII, with or without `0x`; at most eight digits.
+fn parse_hex(bytes: &[u8]) -> Option<u32> {
+    let digits = bytes.strip_prefix(b"0x").unwrap_or(bytes);
+    if digits.is_empty() || digits.len() > 8 {
+        return None;
+    }
+    digits.iter().try_fold(0u32, |v, &b| {
+        let d = (b as char).to_digit(16)?;
+        Some((v << 4) | d)
+    })
+}
+
 /// What a run does after `ExitBootServices` returns `EFI_SUCCESS`, in a run [`Branch::Mine`] or
 /// [`Branch::NoRecord`] sends to the call, settled before the call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -723,6 +847,44 @@ pub enum NotRead {
     },
 }
 
+impl fmt::Display for NotRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NotRead::NotAmd => f.write_str("the processor is not AMD's"),
+            NotRead::NoFadt(why) => write!(f, "no FADT: {why}"),
+            NotRead::NoRegion(NoRegion::NoDsdt) => f.write_str("the FADT names no DSDT"),
+            NotRead::NoRegion(NoRegion::Unreadable(at)) => write!(
+                f,
+                "the DSDT's bytes at {at:#x} are not in memory the firmware's map describes"
+            ),
+            NotRead::NoRegion(NoRegion::NotDsdt) => f.write_str("the FADT's DSDT is not a DSDT"),
+            NotRead::NoRegion(NoRegion::TooLong(n)) => write!(
+                f,
+                "the DSDT declares {n} bytes, more than the loader scans ({MAX_DSDT_LENGTH})"
+            ),
+            NotRead::NoRegion(NoRegion::NotDescribed) => f.write_str(
+                "the DSDT describes no system-memory region with constant bounds that holds it",
+            ),
+            NotRead::NotMapped(Mapping::NotPresent(level)) => write!(
+                f,
+                "the firmware's page tables do not map it (no entry at level {level})"
+            ),
+            NotRead::NotMapped(Mapping::FiveLevel) => {
+                f.write_str("five-level paging, which the loader does not walk")
+            }
+            NotRead::NotMapped(Mapping::Unreadable(at)) => write!(
+                f,
+                "a page-table entry at {at:#x} is not in memory the firmware's map describes"
+            ),
+            NotRead::NotMapped(Mapping::Mapped(phys)) => write!(f, "mapped to {phys:#x}"),
+            NotRead::Elsewhere { at, phys } => write!(
+                f,
+                "the firmware's page tables map {at:#x} to {phys:#x}, not to itself"
+            ),
+        }
+    }
+}
+
 /// The loader's line about where the registers are, and whether they were read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WhereLine {
@@ -732,6 +894,8 @@ pub enum WhereLine {
     NotRead(NotRead),
     /// The switch's values stand in.
     Switch,
+    /// The minimal mode's stand-in table's values stand in (ADR-0002 Amendment 5; QEMU only).
+    StandIn,
 }
 
 impl fmt::Display for WhereLine {
@@ -755,45 +919,9 @@ impl fmt::Display for WhereLine {
                     },
                 }
             }
-            Self::NotRead(why) => {
-                f.write_str("not read, ")?;
-                match why {
-                    NotRead::NotAmd => f.write_str("the processor is not AMD's"),
-                    NotRead::NoFadt(why) => write!(f, "no FADT: {why}"),
-                    NotRead::NoRegion(NoRegion::NoDsdt) => f.write_str("the FADT names no DSDT"),
-                    NotRead::NoRegion(NoRegion::Unreadable(at)) => write!(
-                        f,
-                        "the DSDT's bytes at {at:#x} are not in memory the firmware's map describes"
-                    ),
-                    NotRead::NoRegion(NoRegion::NotDsdt) => {
-                        f.write_str("the FADT's DSDT is not a DSDT")
-                    }
-                    NotRead::NoRegion(NoRegion::TooLong(n)) => write!(
-                        f,
-                        "the DSDT declares {n} bytes, more than the loader scans ({MAX_DSDT_LENGTH})"
-                    ),
-                    NotRead::NoRegion(NoRegion::NotDescribed) => f.write_str(
-                        "the DSDT describes no system-memory region with constant bounds that holds it",
-                    ),
-                    NotRead::NotMapped(Mapping::NotPresent(level)) => write!(
-                        f,
-                        "the firmware's page tables do not map it (no entry at level {level})"
-                    ),
-                    NotRead::NotMapped(Mapping::FiveLevel) => {
-                        f.write_str("five-level paging, which the loader does not walk")
-                    }
-                    NotRead::NotMapped(Mapping::Unreadable(at)) => write!(
-                        f,
-                        "a page-table entry at {at:#x} is not in memory the firmware's map describes"
-                    ),
-                    NotRead::NotMapped(Mapping::Mapped(phys)) => write!(f, "mapped to {phys:#x}"),
-                    NotRead::Elsewhere { at, phys } => write!(
-                        f,
-                        "the firmware's page tables map {at:#x} to {phys:#x}, not to itself"
-                    ),
-                }
-            }
+            Self::NotRead(why) => write!(f, "not read, {why}"),
             Self::Switch => f.write_str("not read; BENCH-FCH's values stand in"),
+            Self::StandIn => f.write_str("not read; the stand-in table's values stand in"),
         }
     }
 }
@@ -803,8 +931,19 @@ impl fmt::Display for WhereLine {
 pub struct RegistersLine {
     /// The values.
     pub registers: Registers,
-    /// Whether they were read, or given by the switch.
-    pub read: bool,
+    /// Where they came from.
+    pub source: Source,
+}
+
+/// Where the registers' values came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// Read from the FCH.
+    Read,
+    /// Given by `BENCH-FCH`, under QEMU.
+    Switch,
+    /// Given by the minimal mode's stand-in table, under QEMU.
+    Table,
 }
 
 impl fmt::Display for RegistersLine {
@@ -813,8 +952,12 @@ impl fmt::Display for RegistersLine {
         let yes = |b: bool| if b { "yes" } else { "no" };
         write!(
             f,
-            "{PREFIX}the FCH's registers ({}): PMx00 {:#010x}, PMx08 {:#010x}, PMx60 {:#06x}, PMx74 {:#010x}, PMxC0 {:#010x}, PMxD2 {:#04x}; 0xCF9 decoded (PMx00 bit 1): {}; its reset stopped (PMxD2 bit 6): {}; the shutdown message (PMx74 bit 17): {}; a shutdown as a PCI reset (PMx08 bit 20): {}; the last reset: {}",
-            if self.read { "read" } else { "BENCH-FCH's" },
+            "{PREFIX}the FCH's registers ({}): PMx00 {:#010x}, PMx08 {:#010x}, PMx60 {:#06x}, PMx74 {:#010x}, PMxC0 {:#010x}, PMxD2 {:#04x}; 0xCF9 decoded (PMx00 bit 1): {}; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): {}; the shutdown message (PMx74 bit 17): {}; a shutdown as a PCI reset (PMx08 bit 20): {}; the last reset: {}",
+            match self.source {
+                Source::Read => "read",
+                Source::Switch => "BENCH-FCH's",
+                Source::Table => "the stand-in table's",
+            },
             r.decode_en,
             r.pci_control,
             r.pm1_evt_blk,
@@ -957,6 +1100,283 @@ impl fmt::Display for ControlFailed {
             "{PREFIX}{RESET_PORT:#x} did not reset the machine within {} ms: {AMENDMENT_3}",
             self.0
         )
+    }
+}
+
+/// `SMIxC0` as a run saw it (Amendment 4's addition, item 348): read, given by a stand-in, or
+/// not read and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Smi {
+    /// Read behind [`gate_smi`].
+    Read(u32),
+    /// Given by `BENCH-FCH` or the minimal mode's stand-in table, under QEMU.
+    Given(u32),
+    /// Not read.
+    NotRead(NotRead),
+}
+
+/// The loader's line about `SMIxC0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SmiLine(pub Smi);
+
+impl fmt::Display for SmiLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{PREFIX}the FCH's SMI control for a write to 0xCF9 (SMIxC0 at {SMI_CF9_CONTROL:#x}, bits 27:26; ADR-0002 Amendment 4's addition): "
+        )?;
+        let (value, whose) = match self.0 {
+            Smi::Read(v) => (v, "read"),
+            Smi::Given(v) => (v, "a stand-in's"),
+            Smi::NotRead(why) => return write!(f, "not read, {why}"),
+        };
+        let route = match (value >> SMI_CF9_SHIFT) & SMI_CF9_MASK {
+            0 => "nothing: the FCH raises no event",
+            1 => "an SMI, so the firmware's SMM code handles it",
+            2 => "an NMI",
+            _ => "IRQ13",
+        };
+        write!(
+            f,
+            "{value:#010x} ({whose}): a write of bit 2 to 0xCF9 raises {route}"
+        )
+    }
+}
+
+/// The stand-in table's signature: an ACPI table only `xtask` plants under QEMU, which no ACPI 6.6
+/// signature (§5.2.6) takes (ADR-0002 Amendment 5; the coordinating session's ruling Q4).
+pub const STAND_IN_SIGNATURE: [u8; 4] = *b"OXFC";
+/// The longest stand-in table body read.
+pub const STAND_IN_MAX: usize = 64;
+
+/// The minimal mode's stand-in values under QEMU, which has no FCH: [`Pretend`]'s words, with
+/// `mine` naming a shutdown (bit 23), and three more the minimal mode's QEMU scenarios need,
+/// since it reads no switch file: `stale1` or `stale2` (that many calls are given a stale key),
+/// and `noreset` (Amendment 3's order calls no `ResetSystem`, so the FADT's step is reached).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StandIn {
+    /// The values.
+    pub pretend: Pretend,
+    /// Calls given a stale key: 0, 1 or 2.
+    pub stale: u8,
+    /// `noreset`: no `ResetSystem` in Amendment 3's order.
+    pub no_reset_system: bool,
+}
+
+impl StandIn {
+    /// The stand-in table's body as a minimal-mode build reads it; `None` in every other build,
+    /// which ignores the table (the coordinating session's ruling Q4), and for words not
+    /// understood.
+    pub fn from_table(body: &[u8], minimal: bool) -> Option<Self> {
+        if !minimal {
+            return None;
+        }
+        let mut stale = 0u8;
+        let mut no_reset_system = false;
+        let mut rest: [u8; STAND_IN_MAX] = [b' '; STAND_IN_MAX];
+        let mut n = 0;
+        for word in body
+            .split(u8::is_ascii_whitespace)
+            .filter(|w| !w.is_empty())
+        {
+            match word {
+                b"stale1" if stale == 0 => stale = 1,
+                b"stale2" if stale == 0 => stale = 2,
+                b"noreset" if !no_reset_system => no_reset_system = true,
+                b"stale1" | b"stale2" | b"noreset" => return None,
+                other => {
+                    let end = n + other.len() + 1;
+                    if end > STAND_IN_MAX {
+                        return None;
+                    }
+                    rest[n..n + other.len()].copy_from_slice(other);
+                    n = end;
+                }
+            }
+        }
+        Some(Self {
+            pretend: Pretend::from_contents(&rest[..n])?,
+            stale,
+            no_reset_system,
+        })
+    }
+}
+
+/// The body of the first table the XSDT lists with [`STAND_IN_SIGNATURE`], at most
+/// [`STAND_IN_MAX`] bytes, read through `read` as the FADT's walk reads (`bench::with_fadt`'s
+/// RSDP and XSDT checks). `None` if there is none, or it cannot be read whole. Only a
+/// minimal-mode build looks (ADR-0002 Amendment 5, step 3; the coordinating session's ruling Q4).
+pub fn find_stand_in(
+    rsdp: u64,
+    read: &mut impl FnMut(u64, &mut [u8]) -> bool,
+) -> Option<([u8; STAND_IN_MAX], usize)> {
+    if rsdp == 0 {
+        return None;
+    }
+    let mut bytes = [0u8; crate::spcr::RSDP_LENGTH];
+    if !read(rsdp, &mut bytes) {
+        return None;
+    }
+    let xsdt = crate::spcr::parse_rsdp(&bytes).ok()?;
+    let entries = crate::spcr::check_xsdt(xsdt, read).ok()?;
+    for i in 0..entries {
+        let mut entry = [0u8; 8];
+        if !read(
+            xsdt.wrapping_add(HEADER_LEN as u64 + 8 * u64::from(i)),
+            &mut entry,
+        ) {
+            continue;
+        }
+        let table = u64::from_le_bytes(entry);
+        let mut header = [0u8; HEADER_LEN];
+        if table == 0 || !read(table, &mut header) || header[..4] != STAND_IN_SIGNATURE {
+            continue;
+        }
+        let declared = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let n = declared.checked_sub(HEADER_LEN)?;
+        if n > STAND_IN_MAX {
+            return None;
+        }
+        let mut body = [0u8; STAND_IN_MAX];
+        if !read(table.wrapping_add(HEADER_LEN as u64), &mut body[..n]) {
+            return None;
+        }
+        return Some((body, n));
+    }
+    None
+}
+
+/// The minimal mode's line about the stand-in table: `found` is `None` with no table, `Some(None)`
+/// for words not understood.
+pub const fn stand_in_said(found: Option<Option<StandIn>>) -> &'static str {
+    match found {
+        None => {
+            "origin-boot: bench build: minimal: no stand-in table: the FCH's registers are read where the firmware's tables allow it"
+        }
+        Some(None) => {
+            "origin-boot: bench build: minimal: the stand-in table (OXFC) is not understood: the FCH's registers are read where the firmware's tables allow it"
+        }
+        Some(Some(_)) => {
+            "origin-boot: bench build: minimal: the stand-in table (OXFC): the FCH's registers are not read; its values stand in for them (QEMU only)"
+        }
+    }
+}
+
+/// Why a minimal-mode run makes the call (ADR-0002 Amendment 5, step 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallWhy {
+    /// `PMxC0` names a shutdown (bit 23): the control's record, or a call's.
+    Mine(u32),
+    /// `PMxC0` names no reset cause: no record, and no control in this boot.
+    NoRecord(u32),
+    /// Another reset cause, but a shutdown bit is clear, so a triple fault could not reset: no
+    /// control.
+    BitsClear(u32),
+    /// The layout contradicts AMD's documents: no control.
+    Contradicts(Layout),
+    /// The registers were not read: no control.
+    NotRead,
+}
+
+/// What a minimal-mode run does (ADR-0002 Amendment 5, step 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MinimalDecision {
+    /// The boot's first run, the control: a triple fault before the call. `PMxC0` named this
+    /// other cause.
+    Control(u32),
+    /// The call; after `EFI_SUCCESS`, the triple fault where `shutdown` (both shutdown bits read
+    /// before the call), else Amendment 3's order (refinement 3, which holds after the call too:
+    /// the coordinating session's ruling Q3).
+    Call {
+        /// Why the call is made.
+        why: CallWhy,
+        /// Whether the triple fault follows a successful call.
+        shutdown: bool,
+    },
+}
+
+impl MinimalDecision {
+    /// What a minimal-mode run with `registers` (read or given; `None` when not read) does.
+    pub fn of(registers: Option<&Registers>, pm1a_event: Option<u16>) -> Self {
+        let Some(r) = registers else {
+            return Self::Call {
+                why: CallWhy::NotRead,
+                shutdown: false,
+            };
+        };
+        let layout = Layout::check(r, pm1a_event);
+        if !layout.fits() {
+            return Self::Call {
+                why: CallWhy::Contradicts(layout),
+                shutdown: false,
+            };
+        }
+        let shutdown =
+            r.acpi_config & SHUTDOWN_MESSAGE != 0 && r.pci_control & SHUTDOWN_PCI_RESET != 0;
+        match Branch::of_mine(r.reset_status, LAST_RESET_SHUTDOWN) {
+            Branch::Mine => Self::Call {
+                why: CallWhy::Mine(r.reset_status),
+                shutdown,
+            },
+            Branch::NoRecord => Self::Call {
+                why: CallWhy::NoRecord(r.reset_status),
+                shutdown,
+            },
+            Branch::First if shutdown => Self::Control(r.reset_status),
+            Branch::First => Self::Call {
+                why: CallWhy::BitsClear(r.reset_status),
+                shutdown: false,
+            },
+        }
+    }
+}
+
+/// The minimal mode's decision line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MinimalDecisionLine(pub MinimalDecision);
+
+impl fmt::Display for MinimalDecisionLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(PREFIX)?;
+        f.write_str("minimal: ")?;
+        let shutdown = match self.0 {
+            MinimalDecision::Control(status) => {
+                return write!(
+                    f,
+                    "the last reset was not a shutdown ({}): the boot's first run, the control: a triple fault now, and ExitBootServices is not called",
+                    Causes(status)
+                );
+            }
+            MinimalDecision::Call { why, shutdown } => {
+                match why {
+                    CallWhy::Mine(_) => f.write_str(
+                        "the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault records",
+                    )?,
+                    CallWhy::NoRecord(status) => write!(
+                        f,
+                        "PMxC0 {status:#010x} names no reset cause: no record of the last reset, and no control in this boot"
+                    )?,
+                    CallWhy::BitsClear(status) => write!(
+                        f,
+                        "the last reset was {}, but a shutdown cannot reset this system (PMx74 bit 17 and PMx08 bit 20 are not both set): no control in this boot",
+                        Causes(status)
+                    )?,
+                    CallWhy::Contradicts(_) => f.write_str(
+                        "the FCH's registers contradict AMD's documents: no control in this boot",
+                    )?,
+                    CallWhy::NotRead => f.write_str(
+                        "the FCH's registers were not read: no control in this boot",
+                    )?,
+                }
+                shutdown
+            }
+        };
+        f.write_str(": ExitBootServices is called through the live boot services table; after EFI_SUCCESS, ")?;
+        f.write_str(if shutdown {
+            "a triple fault and nothing before it"
+        } else {
+            "Amendment 3's order, since no shutdown is known to reset this system"
+        })
     }
 }
 
@@ -1290,6 +1710,7 @@ mod tests {
         };
         let found = Ok(Located {
             region: Ok(region),
+            smi_region: Err(NoRegion::NotDescribed),
             pm1a_event: Some(0x800),
         });
         let identity = &mut |at: u64| Mapping::Mapped(at);
@@ -1301,6 +1722,7 @@ mod tests {
         );
         let none = Ok(Located {
             region: Err(NoRegion::NotDescribed),
+            smi_region: Err(NoRegion::NotDescribed),
             pm1a_event: None,
         });
         assert_eq!(
@@ -1598,12 +2020,12 @@ mod tests {
             "{}",
             RegistersLine {
                 registers: fitting(1 << 16),
-                read: true
+                source: Source::Read
             }
         );
         assert_eq!(
             line,
-            "origin-boot: bench build: the FCH's registers (read): PMx00 0xe3020b12, PMx08 0x00000000, PMx60 0x0800, PMx74 0x10000140, PMxC0 0x00010000, PMxD2 0x00; 0xCF9 decoded (PMx00 bit 1): yes; its reset stopped (PMxD2 bit 6): no; the shutdown message (PMx74 bit 17): no; a shutdown as a PCI reset (PMx08 bit 20): no; the last reset: the reset pin (bit 16)"
+            "origin-boot: bench build: the FCH's registers (read): PMx00 0xe3020b12, PMx08 0x00000000, PMx60 0x0800, PMx74 0x10000140, PMxC0 0x00010000, PMxD2 0x00; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): no; the shutdown message (PMx74 bit 17): no; a shutdown as a PCI reset (PMx08 bit 20): no; the last reset: the reset pin (bit 16)"
         );
         let line = format!(
             "{}",
@@ -1669,5 +2091,310 @@ mod tests {
             format!("{}", ControlFailed(100)),
             "origin-boot: bench build: 0xcf9 did not reset the machine within 100 ms: ExitBootServices is called, and Amendment 3's path follows it"
         );
+    }
+
+    // TASKS item 128 (ADR-0002 Amendment 4's addition, item 348, and Amendment 5, item 347).
+
+    #[test]
+    fn smi_control_is_found_in_the_boards_4_kib_region_and_gated_like_the_block() {
+        // Rental F's board: GSMM, 4 KiB at 0xFED80000, holds SMIxC0; PMRG (0xFED80300, 256
+        // bytes) holds the PM block but not SMIxC0.
+        let gsmm = Region {
+            base: 0xFED8_0000,
+            length: 0x1000,
+        };
+        let pmrg = Region {
+            base: PM_BLOCK,
+            length: 0x100,
+        };
+        assert!(holds_range(gsmm, SMI_CF9_CONTROL, SMI_SPAN));
+        assert!(!holds_range(pmrg, SMI_CF9_CONTROL, SMI_SPAN));
+        assert!(holds(pmrg) && holds(gsmm));
+        assert!(!holds_range(
+            Region {
+                base: u64::MAX - 1,
+                length: 2
+            },
+            u64::MAX - 1,
+            4
+        ));
+        let located = Ok(Located {
+            region: Ok(pmrg),
+            smi_region: Ok(gsmm),
+            pm1a_event: Some(0x800),
+        });
+        let identity = &mut |at: u64| Mapping::Mapped(at);
+        assert_eq!(gate_smi(true, located, identity), Ok(gsmm));
+        assert_eq!(gate_smi(false, located, identity), Err(NotRead::NotAmd));
+        let mut seen = Vec::new();
+        let _ = gate_smi(true, located, &mut |at| {
+            seen.push(at);
+            Mapping::Mapped(at)
+        });
+        assert_eq!(seen, [SMI_CF9_CONTROL, SMI_CF9_CONTROL + 3]);
+        let without = Ok(Located {
+            region: Ok(pmrg),
+            smi_region: Err(NoRegion::NotDescribed),
+            pm1a_event: None,
+        });
+        assert_eq!(
+            gate_smi(true, without, identity),
+            Err(NotRead::NoRegion(NoRegion::NotDescribed))
+        );
+        // The PM block's gate is unchanged by it.
+        assert_eq!(gate(true, without, identity), Ok(pmrg));
+    }
+
+    #[test]
+    fn the_dsdt_scan_finds_each_range_in_its_own_region() {
+        let mut body = region(
+            b"PMRG",
+            0x00,
+            &[0x0C, 0x00, 0x03, 0xD8, 0xFE],
+            &[0x0B, 0x00, 0x01],
+        );
+        body.extend(region(
+            b"GSMM",
+            0x00,
+            &[0x0C, 0x00, 0x00, 0xD8, 0xFE],
+            &[0x0B, 0x00, 0x10],
+        ));
+        let at = 0x7000_0000;
+        let mut read = reader(at, dsdt(&body));
+        assert_eq!(
+            scan_dsdt(at, &mut read),
+            Ok(Region {
+                base: PM_BLOCK,
+                length: 0x100
+            })
+        );
+        assert_eq!(
+            scan_dsdt_for(at, &mut read, SMI_CF9_CONTROL, SMI_SPAN),
+            Ok(Region {
+                base: 0xFED8_0000,
+                length: 0x1000
+            })
+        );
+    }
+
+    #[test]
+    fn the_smi_line_names_each_route() {
+        let line = |v| SmiLine(Smi::Read(v)).to_string();
+        assert!(line(0).ends_with(
+            "0x00000000 (read): a write of bit 2 to 0xCF9 raises nothing: the FCH raises no event"
+        ));
+        assert!(line(1 << 26).ends_with("raises an SMI, so the firmware's SMM code handles it"));
+        assert!(line(2 << 26).ends_with("raises an NMI"));
+        assert!(line(3 << 26).ends_with("raises IRQ13"));
+        assert!(
+            SmiLine(Smi::Given(SMI_STAND_IN))
+                .to_string()
+                .contains("0x04000000 (a stand-in's): a write of bit 2 to 0xCF9 raises an SMI")
+        );
+        assert!(
+            SmiLine(Smi::NotRead(NotRead::NotAmd))
+                .to_string()
+                .ends_with("not read, the processor is not AMD's")
+        );
+        assert!(line(0).starts_with(
+            "origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26"
+        ));
+    }
+
+    #[test]
+    fn the_switch_takes_smi_once_in_hex() {
+        let p = Pretend::from_contents(b"first smi=0x0c000000").unwrap();
+        assert_eq!(p.smi, Some(0x0C00_0000));
+        assert_eq!(p.smi_value(), 0x0C00_0000);
+        assert_eq!(
+            Pretend::from_contents(b"mine").unwrap().smi_value(),
+            SMI_STAND_IN
+        );
+        assert_eq!(
+            Pretend::from_contents(b"mine smi=ffffffff").unwrap().smi,
+            Some(u32::MAX)
+        );
+        for bad in [
+            &b"mine smi="[..],
+            b"mine smi=0x123456789",
+            b"mine smi=0xzz",
+            b"mine smi=1 smi=2",
+        ] {
+            assert_eq!(Pretend::from_contents(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_registers_line_says_the_fchs_own_reset_is_off_not_that_it_stopped() {
+        let mut r = fitting(LAST_RESET_CF9_WARM);
+        r.pmio_debug = CF9_RESET_STOPPED;
+        let line = RegistersLine {
+            registers: r,
+            source: Source::Read,
+        }
+        .to_string();
+        assert!(
+            line.contains(
+                "the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("its reset stopped"), "{line}");
+    }
+
+    #[test]
+    fn the_stand_in_table_is_ignored_by_every_build_that_is_not_the_minimal_mode() {
+        // The coordinating session's ruling Q4.
+        for body in [
+            &b"first"[..],
+            b"mine",
+            b"mine stale1 noreset",
+            b"norecord smi=0",
+        ] {
+            assert_eq!(StandIn::from_table(body, false), None, "{body:?}");
+            assert!(StandIn::from_table(body, true).is_some(), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn the_stand_in_table_takes_the_switchs_words_and_its_own() {
+        let s = StandIn::from_table(b"mine stale1", true).unwrap();
+        assert_eq!(s.pretend.kind, Kind::Mine);
+        assert_eq!((s.stale, s.no_reset_system), (1, false));
+        let s = StandIn::from_table(b"norecord noshutdown noreset stale2 smi=0x08000000", true)
+            .unwrap();
+        assert_eq!(s.pretend.kind, Kind::NoRecord);
+        assert!(s.pretend.no_shutdown);
+        assert_eq!(s.pretend.smi, Some(0x0800_0000));
+        assert_eq!((s.stale, s.no_reset_system), (2, true));
+        for bad in [
+            &b""[..],
+            b"stale1",
+            b"mine stale1 stale2",
+            b"mine noreset noreset",
+            b"mine first",
+            b"mine what",
+        ] {
+            assert_eq!(StandIn::from_table(bad, true), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn mine_is_a_shutdown_in_the_minimal_mode_and_a_cf9_reset_in_the_full_one() {
+        let p = Pretend::from_contents(b"mine").unwrap();
+        assert_eq!(p.values(Some(0x800)).reset_status, LAST_RESET_CF9_WARM);
+        assert_eq!(
+            p.values_minimal(Some(0x800)).reset_status,
+            LAST_RESET_SHUTDOWN
+        );
+        let first = Pretend::from_contents(b"first").unwrap();
+        assert_eq!(first.values_minimal(Some(0x800)), first.values(Some(0x800)));
+        assert_eq!(
+            Branch::of_mine(LAST_RESET_SHUTDOWN, LAST_RESET_SHUTDOWN),
+            Branch::Mine
+        );
+        assert_eq!(Branch::of(LAST_RESET_SHUTDOWN), Branch::First);
+        assert_eq!(
+            Branch::of_mine(LAST_RESET_CF9_WARM, LAST_RESET_SHUTDOWN),
+            Branch::First
+        );
+    }
+
+    #[test]
+    fn the_minimal_decision_follows_amendment_5_step_4_and_ruling_q3() {
+        let both = |status| {
+            let mut r = fitting(status);
+            r.acpi_config |= SHUTDOWN_MESSAGE;
+            r.pci_control |= SHUTDOWN_PCI_RESET;
+            r
+        };
+        let clear = |status, bits: (bool, bool)| {
+            let mut r = both(status);
+            if !bits.0 {
+                r.acpi_config &= !SHUTDOWN_MESSAGE;
+            }
+            if !bits.1 {
+                r.pci_control &= !SHUTDOWN_PCI_RESET;
+            }
+            r
+        };
+        let of = |r: &Registers| MinimalDecision::of(Some(r), Some(0x800));
+        // A shutdown: the call, and the triple fault after it.
+        assert_eq!(
+            of(&both(LAST_RESET_SHUTDOWN)),
+            MinimalDecision::Call {
+                why: CallWhy::Mine(LAST_RESET_SHUTDOWN),
+                shutdown: true
+            }
+        );
+        // Another cause with both bits: the control.
+        assert_eq!(of(&both(1 << 21)), MinimalDecision::Control(1 << 21));
+        assert_eq!(
+            of(&both(LAST_RESET_CF9_WARM)),
+            MinimalDecision::Control(LAST_RESET_CF9_WARM)
+        );
+        // Another cause with either bit clear: the call, no control, Amendment 3's order after.
+        for bits in [(false, true), (true, false), (false, false)] {
+            assert_eq!(
+                of(&clear(1 << 21, bits)),
+                MinimalDecision::Call {
+                    why: CallWhy::BitsClear(1 << 21),
+                    shutdown: false
+                },
+                "{bits:?}"
+            );
+        }
+        // No record: the call; the triple fault only with both bits (ruling Q3).
+        assert_eq!(
+            of(&both(RESET_STATUS_AT_POWER_ON)),
+            MinimalDecision::Call {
+                why: CallWhy::NoRecord(RESET_STATUS_AT_POWER_ON),
+                shutdown: true
+            }
+        );
+        assert_eq!(
+            of(&clear(RESET_STATUS_AT_POWER_ON, (true, false))),
+            MinimalDecision::Call {
+                why: CallWhy::NoRecord(RESET_STATUS_AT_POWER_ON),
+                shutdown: false
+            }
+        );
+        // A contradicting layout, or nothing read: the call, Amendment 3's order after.
+        let bad = Pretend::from_contents(b"bad").unwrap().values(Some(0x800));
+        assert!(matches!(
+            of(&bad),
+            MinimalDecision::Call {
+                why: CallWhy::Contradicts(_),
+                shutdown: false
+            }
+        ));
+        assert_eq!(
+            MinimalDecision::of(None, Some(0x800)),
+            MinimalDecision::Call {
+                why: CallWhy::NotRead,
+                shutdown: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_minimal_lines() {
+        let line = |d| MinimalDecisionLine(d).to_string();
+        assert_eq!(
+            line(MinimalDecision::Control(1 << 21)),
+            "origin-boot: bench build: minimal: the last reset was not a shutdown (a sleep state (bit 21)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called"
+        );
+        assert_eq!(
+            line(MinimalDecision::Call {
+                why: CallWhy::Mine(LAST_RESET_SHUTDOWN),
+                shutdown: true
+            }),
+            "origin-boot: bench build: minimal: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault records: ExitBootServices is called through the live boot services table; after EFI_SUCCESS, a triple fault and nothing before it"
+        );
+        assert!(line(MinimalDecision::Call {
+            why: CallWhy::NotRead,
+            shutdown: false
+        })
+        .ends_with("after EFI_SUCCESS, Amendment 3's order, since no shutdown is known to reset this system"));
     }
 }

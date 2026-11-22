@@ -13,6 +13,9 @@
 //! the kernel's serial output in QEMU.
 #![no_std]
 #![no_main]
+// TASKS item 128 (ADR-0002 Amendment 5): a minimal-mode bench build never reaches the full path
+// (`boot` and what only it calls), which the linker then leaves out of the image.
+#![cfg_attr(origin_bench_minimal, allow(dead_code))]
 
 use core::ffi::c_void;
 use core::fmt::Write;
@@ -93,10 +96,16 @@ pub unsafe extern "efiapi" fn efi_main(image: Handle, system_table: *const Syste
     }
     #[cfg(origin_stack_measure)]
     measure::say_calibration(&mut out);
-    match boot(image, system_table, &st, &mut out) {
+    // TASKS item 128 (decision item 347, ADR-0002 Amendment 5): a minimal-mode bench build does
+    // only what the mode lists.
+    #[cfg(origin_bench_minimal)]
+    let status = minimal::run(image, system_table, &st, &mut out);
+    #[cfg(not(origin_bench_minimal))]
+    let status = match boot(image, system_table, &st, &mut out) {
         Ok(never) => match never {},
         Err(status) => status,
-    }
+    };
+    status
 }
 
 /// Prints the loader banner and the firmware's identity.
@@ -468,7 +477,7 @@ fn boot(
                     &mut |at, bytes| read_described(described, at, bytes),
                     |at| bench::in_mmio(described, at),
                 );
-                fch_seen = bench_fch_read(rsdp, described, pretend, out);
+                fch_seen = bench_fch_read(rsdp, described, pretend, false, out);
             }
             found.early_uart()
         }
@@ -667,6 +676,10 @@ fn boot(
     say_entry_state(out);
     // TASKS item 116: the UART as the firmware left it, a line straight to it, and how the reset
     // will go.
+    // ADR-0002 Amendment 4's addition (item 348): the live boot services table against the copy,
+    // before the last line.
+    #[cfg(origin_bench)]
+    let _ = writeln!(out, "{}", bench_table_line(system_table, st, &bs));
     #[cfg(origin_bench)]
     let plan = bench_before_call(st, &bs, early_uart, after, reset_register, fch_seen, out);
     let _ = writeln!(
@@ -1633,6 +1646,73 @@ fn runtime_reset_system(st: &SystemTable) -> Result<ResetSystemFn, &'static str>
     f.ok_or("the runtime services table's ResetSystem is null")
 }
 
+/// ADR-0002 Amendment 4's addition (item 348): the boot services table the firmware's system table
+/// names now, compared byte for byte with the loader's copy over the copy's size, once its
+/// signature and `HeaderSize` check.
+#[cfg(origin_bench)]
+fn bench_table_line(
+    system_table: *const SystemTable,
+    st: &SystemTable,
+    bs: &BootServices,
+) -> bench::TableLine {
+    let size = size_of::<BootServices>();
+    let exit_at = core::mem::offset_of!(BootServices, exit_boot_services);
+    let crc_at = core::mem::offset_of!(TableHeader, crc32);
+    // SAFETY: `bs` is the loader's own copy, a `#[repr(C)]` struct of a header of integers and
+    // pointer-sized members, with no padding; its `size` bytes are initialized.
+    let copy = unsafe { core::slice::from_raw_parts(ptr::from_ref(bs).cast::<u8>(), size) };
+    let word = |bytes: &[u8], at: usize| {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(bytes.get(at..at + 8).unwrap_or(&[0; 8]));
+        u64::from_le_bytes(w)
+    };
+    let copy_crc = bs.hdr.crc32;
+    // SAFETY: `system_table` is the firmware's own table, checked at entry (`read_system_table`);
+    // only the member's address is formed.
+    let member = unsafe { &raw const (*system_table).boot_services };
+    // SAFETY: that member, in a table that stays readable while boot services run; one volatile
+    // pointer-sized load.
+    let live = unsafe { member.read_volatile() }.cast::<u8>().cast_const();
+    let mut line = bench::TableLine {
+        live_at: live as u64,
+        copied_from: st.boot_services as u64,
+        size,
+        live: bench::Live::Unchecked,
+        copy_exit: word(copy, exit_at),
+        copy_crc,
+    };
+    if live.is_null() || !live.cast::<TableHeader>().is_aligned() {
+        return line;
+    }
+    // SAFETY: non-null and aligned; the firmware's boot services table stays readable while boot
+    // services run, and its header's members are integers, valid for any bits.
+    let hdr = unsafe { live.cast::<TableHeader>().read_volatile() };
+    if hdr.signature != BOOT_SERVICES_SIGNATURE || (hdr.header_size as usize) < size {
+        return line;
+    }
+    let byte = |i: usize| {
+        // SAFETY: `i` is below `size`, which the live table's `HeaderSize` covers; one volatile
+        // byte load of firmware memory, with no reference held to it.
+        unsafe { live.wrapping_add(i).read_volatile() }
+    };
+    let mut exit = [0u8; 8];
+    for (k, b) in exit.iter_mut().enumerate() {
+        *b = byte(exit_at + k);
+    }
+    line.live = bench::Live::Read {
+        first_difference: bench::first_difference(copy, byte),
+        exit: u64::from_le_bytes(exit),
+        crc: {
+            let mut c = [0u8; 4];
+            for (k, b) in c.iter_mut().enumerate() {
+                *b = byte(crc_at + k);
+            }
+            u32::from_le_bytes(c)
+        },
+    };
+    line
+}
+
 /// [`bench::After::Disturb`]: right after the call returns, what a firmware might do to the UART.
 #[cfg(origin_bench)]
 fn bench_disturb(early_uart: EarlyUart, plan: &BenchPlan) {
@@ -1677,7 +1757,7 @@ fn bench_reset(early_uart: EarlyUart, plan: &BenchPlan) -> ! {
     mask_interrupts();
     let call = plan
         .reset_system
-        .filter(|_| plan.after != bench::After::Fadt);
+        .filter(|_| !plan.after.skips_reset_system());
     say_on_uart(
         early_uart,
         bench::ResetSoon {
@@ -1698,6 +1778,7 @@ fn bench_reset(early_uart: EarlyUart, plan: &BenchPlan) -> ! {
             bench::Tried::Returned
         }
         None if plan.after == bench::After::Fadt => bench::Tried::NotCalled,
+        None if plan.after == bench::After::StandInNoReset => bench::Tried::NotCalledStandIn,
         None => bench::Tried::Unavailable,
     };
     wait_ms(plan.ticks_per_ms, bench::FALLBACK_DELAY_MS);
@@ -1761,8 +1842,12 @@ struct FchSeen {
     registers: Option<fch::Registers>,
     /// The FADT's PM1a event block, in system I/O.
     pm1a_event: Option<u16>,
-    /// `BENCH-FCH`, which only QEMU's ESP may hold.
+    /// `BENCH-FCH`, which only QEMU's ESP may hold, or the minimal mode's stand-in table.
     pretend: Option<fch::Pretend>,
+    /// `SMIxC0` (ADR-0002 Amendment 4's addition, item 348).
+    smi: fch::Smi,
+    /// Where the registers' values came from.
+    source: fch::Source,
 }
 
 #[cfg(origin_bench)]
@@ -1773,6 +1858,8 @@ impl FchSeen {
             registers: None,
             pm1a_event: None,
             pretend: None,
+            smi: fch::Smi::NotRead(why),
+            source: fch::Source::Read,
         }
     }
 }
@@ -1789,10 +1876,14 @@ fn bench_fch_read(
     rsdp: u64,
     described: &[MemoryRegion],
     pretend: Option<fch::Pretend>,
+    minimal: bool,
     out: &mut ConOut,
 ) -> FchSeen {
     let [_, ebx, ecx, edx] = cpuid(0);
     let amd = fch::is_amd_vendor(ebx, ecx, edx);
+    // Amendment 4's addition (item 348): whether `SMIxC0` passed its own gate; it is read once the
+    // line about the power-management block is out.
+    let mut smi_gated = false;
     let seen = if pretend.is_none() && !amd {
         // The DSDT is not scanned for a processor that has no AMD FCH.
         FchSeen::not_read(fch::NotRead::NotAmd)
@@ -1801,15 +1892,38 @@ fn bench_fch_read(
         let located = fch::locate(rsdp, &mut read);
         let pm1a_event = located.ok().and_then(|l| l.pm1a_event);
         if let Some(p) = pretend {
+            // The minimal mode's stand-in table (ADR-0002 Amendment 5), or `BENCH-FCH`.
             FchSeen {
-                where_line: fch::WhereLine::Switch,
-                registers: Some(p.values(pm1a_event)),
+                where_line: if minimal {
+                    fch::WhereLine::StandIn
+                } else {
+                    fch::WhereLine::Switch
+                },
+                registers: Some(if minimal {
+                    p.values_minimal(pm1a_event)
+                } else {
+                    p.values(pm1a_event)
+                }),
                 pm1a_event,
                 pretend,
+                smi: fch::Smi::Given(p.smi_value()),
+                source: if minimal {
+                    fch::Source::Table
+                } else {
+                    fch::Source::Switch
+                },
             }
         } else {
             let la57 = read_cr4() & (1 << 12) != 0;
             let cr3 = read_cr3();
+            let smi =
+                match fch::gate_smi(amd, located, &mut |at| fch::walk(cr3, la57, at, &mut read)) {
+                    Ok(_) => {
+                        smi_gated = true;
+                        fch::Smi::NotRead(fch::NotRead::NotAmd)
+                    }
+                    Err(why) => fch::Smi::NotRead(why),
+                };
             match fch::gate(amd, located, &mut |at| fch::walk(cr3, la57, at, &mut read)) {
                 Ok(region) => FchSeen {
                     where_line: fch::WhereLine::Read(
@@ -1819,12 +1933,25 @@ fn bench_fch_read(
                     registers: None,
                     pm1a_event,
                     pretend: None,
+                    smi,
+                    source: fch::Source::Read,
                 },
-                Err(why) => FchSeen::not_read(why),
+                Err(why) => FchSeen {
+                    smi,
+                    ..FchSeen::not_read(why)
+                },
             }
         }
     };
     let _ = writeln!(out, "{}", seen.where_line);
+    let smi = if smi_gated {
+        // SAFETY: `fch::gate_smi` passed: the processor is AMD's, the firmware's DSDT describes a
+        // system-memory region holding `SMIxC0`'s four bytes, and the firmware's page tables, still
+        // loaded, map its first and last byte to themselves.
+        fch::Smi::Read(unsafe { read_smi_control() })
+    } else {
+        seen.smi
+    };
     if matches!(seen.where_line, fch::WhereLine::Read(..)) {
         // SAFETY: `fch::gate` passed: the processor is AMD's, the firmware's DSDT describes a
         // system-memory region holding every register read, and the firmware's page tables, still
@@ -1832,10 +1959,24 @@ fn bench_fch_read(
         let registers = unsafe { read_fch_registers() };
         return FchSeen {
             registers: Some(registers),
+            smi,
             ..seen
         };
     }
-    seen
+    FchSeen { smi, ..seen }
+}
+
+/// `SMIxC0` (ADR-0002 Amendment 4's addition, item 348).
+///
+/// # Safety
+///
+/// [`fch::gate_smi`] must have passed: an AMD processor, a DSDT region holding the register, and
+/// the firmware's page tables, still loaded, mapping it to itself.
+#[cfg(origin_bench)]
+unsafe fn read_smi_control() -> u32 {
+    // SAFETY: the caller's contract: memory-mapped I/O the firmware maps to itself; one volatile
+    // 32-bit load of a read-write control register, with no effect AMD's documents name.
+    unsafe { ptr::with_exposed_provenance::<u32>(fch::SMI_CF9_CONTROL as usize).read_volatile() }
 }
 
 /// TASKS item 121, before the call, on the firmware's console: where the FCH's registers are,
@@ -1852,6 +1993,7 @@ fn bench_fch_decide(
     out: &mut ConOut,
 ) -> Option<fch::Free> {
     let pretend = seen.pretend;
+    let _ = writeln!(out, "{}", fch::SmiLine(seen.smi));
     let Some(registers) = seen.registers else {
         let _ = writeln!(
             out,
@@ -1868,7 +2010,7 @@ fn bench_fch_decide(
         "{}",
         fch::RegistersLine {
             registers,
-            read: pretend.is_none(),
+            source: seen.source,
         }
     );
     let decision = fch::Decision::of(&registers, seen.pm1a_event);
@@ -1929,8 +2071,10 @@ fn write_cf9() {
     }
 }
 
-/// A triple fault: an IDT with a zero limit, then a breakpoint.
+/// A triple fault: an IDT with a zero limit, then a breakpoint. Always inlined, so the minimal
+/// mode's path from the call to it holds no `call` (ADR-0002 Amendment 5, step 6).
 #[cfg(origin_bench)]
+#[inline(always)]
 fn triple_fault() -> ! {
     // SAFETY: CPL 0, interrupts masked, after `ExitBootServices`, and only to end a diagnostic
     // run (decision item 345). The block pushes 16 zero bytes and loads them as the IDT: limit 0,
@@ -2235,5 +2379,260 @@ mod measure {
             unsafe { word.write_volatile(i as u64) };
         }
         base.addr() as u64
+    }
+}
+
+/// TASKS item 128 (decision item 347, ADR-0002 Amendment 5): a bench build's minimal-program mode,
+/// built only by `cargo xtask bench-build --minimal` (`cfg(origin_bench_minimal)`, beside
+/// `origin_bench`). In order, after the first lines `efi_main` already wrote:
+/// 1. the memory map, into a buffer static in the image, translated into a static region array:
+///    no `AllocatePages` or `AllocatePool`;
+/// 2. only the walks Amendment 4 needs (the SPCR, the FADT, the DSDT), its step 1 and its
+///    addition's `SMIxC0`, behind the same gate; under QEMU, the stand-in table's values;
+/// 3. the branch on `PMxC0`: the control (a triple fault, no call), or the call;
+/// 4. the call through the live boot services table, after `X`;
+/// 5. after `EFI_SUCCESS`, the status compare, then the triple fault where both shutdown bits
+///    were read set, else Amendment 3's order with no `0xCF9` write; after an error, the retry
+///    with `Y`; after a second, Amendment 2's line and Amendment 3's order.
+///
+/// It reads no kernel file, verifies nothing, starts no generator, allocates nothing, builds no
+/// page tables, searches for no framebuffer, copies no boot services table, calls no `Stall`,
+/// reads no UART register but the line status the marks wait on, and writes nothing to `0xCF9`.
+#[cfg(origin_bench_minimal)]
+mod minimal {
+    use core::fmt::Write;
+    use core::mem::size_of;
+    use core::ptr;
+    use core::sync::atomic::Ordering;
+
+    use origin_boot_info::{EarlyUart, MemoryRegion};
+    use origin_boot_uefi::console::ConOut;
+    use origin_boot_uefi::protocols::{
+        BOOT_SERVICES_SIGNATURE, BootServices, ExitBootServicesFn, GetMemoryMapFn,
+    };
+    use origin_boot_uefi::uefi::{self, ExitOutcome, Handle, Status, SystemTable, TableHeader};
+    use origin_boot_uefi::{bench, fch, spcr, uart};
+
+    use super::{
+        BenchPlan, FchSeen, MapFailure, PANIC_CONSOLE, bench_fch_read, bench_reset, find_rsdp,
+        halt, mask_interrupts, read_described, read_memory_map, runtime_reset_system, say_halting,
+        say_on_uart, triple_fault, wait_ticks,
+    };
+
+    /// The memory map's buffer, in 8-byte words: 64 KiB, static in the image (the coordinating
+    /// session's ruling Q5).
+    const MAP_WORDS: usize = 64 * 1024 / 8;
+    /// The regions it is translated into.
+    const REGIONS: usize = 1024;
+    /// The control's spin after its line, so the line leaves the UART before the reset: 50 ms at
+    /// [`bench::MINIMAL_TICKS_PER_MS`], by the counter, with no `Stall`.
+    const CONTROL_SPIN: u64 = 50 * bench::MINIMAL_TICKS_PER_MS;
+    /// The line before the call, the mode's last through the firmware's console.
+    const LAST_LINE: &str = "origin-boot: bench build: minimal: ExitBootServices next, through the live boot services table";
+
+    static mut MAP: [u64; MAP_WORDS] = [0; MAP_WORDS];
+    static mut REGION_ARRAY: [MemoryRegion; REGIONS] = [MemoryRegion {
+        base: 0,
+        pages: 0,
+        kind: 0,
+        reserved: 0,
+    }; REGIONS];
+
+    /// The boot services table the firmware's system table names now, if its signature and
+    /// `HeaderSize` check. Read each time it is needed: the mode keeps no copy.
+    fn live(system_table: *const SystemTable) -> Option<*const BootServices> {
+        // SAFETY: `system_table` is the firmware's own table, checked at entry; only the member's
+        // address is formed.
+        let member = unsafe { &raw const (*system_table).boot_services };
+        // SAFETY: that member, in a table readable while boot services run; one volatile
+        // pointer-sized load.
+        let p = unsafe { member.read_volatile() }
+            .cast::<BootServices>()
+            .cast_const();
+        if p.is_null() || !p.is_aligned() {
+            return None;
+        }
+        // SAFETY: non-null and aligned; the firmware's table is readable while boot services run,
+        // and its header's members are integers, valid for any bits.
+        let hdr = unsafe { p.cast::<TableHeader>().read_volatile() };
+        (hdr.signature == BOOT_SERVICES_SIGNATURE
+            && hdr.header_size as usize >= size_of::<BootServices>())
+        .then_some(p)
+    }
+
+    /// The live table's `GetMemoryMap`.
+    fn live_get_memory_map(system_table: *const SystemTable) -> Option<GetMemoryMapFn> {
+        let p = live(system_table)?;
+        // SAFETY: inside the table `live` checked; only the member's address is formed.
+        let member = unsafe { &raw const (*p).get_memory_map };
+        // SAFETY: that member; an optional function pointer is valid for any bits, null being
+        // `None`.
+        unsafe { member.read_volatile() }
+    }
+
+    /// The live table's `ExitBootServices`.
+    fn live_exit(system_table: *const SystemTable) -> Option<ExitBootServicesFn> {
+        let p = live(system_table)?;
+        // SAFETY: as for `live_get_memory_map`.
+        let member = unsafe { &raw const (*p).exit_boot_services };
+        // SAFETY: as for `live_get_memory_map`.
+        unsafe { member.read_volatile() }
+    }
+
+    /// The mode, from its first map to the reset or the halt. Returns only if the boot services
+    /// table does not check at the start, as `boot` does.
+    pub(super) fn run(
+        image: Handle,
+        system_table: *const SystemTable,
+        st: &SystemTable,
+        out: &mut ConOut,
+    ) -> Status {
+        let _ = writeln!(out, "{}", bench::MINIMAL_LINE);
+        if live(system_table).is_none() {
+            let _ = writeln!(
+                out,
+                "origin-boot: bench build: minimal: the boot services table does not check"
+            );
+            return Status::INCOMPATIBLE_VERSION;
+        }
+        // SAFETY: the loader has one thread and `run` runs once, so these are the only references
+        // to the two statics.
+        let map =
+            unsafe { core::slice::from_raw_parts_mut((&raw mut MAP).cast::<u8>(), MAP_WORDS * 8) };
+        // SAFETY: as above.
+        let regions = unsafe {
+            core::slice::from_raw_parts_mut((&raw mut REGION_ARRAY).cast::<MemoryRegion>(), REGIONS)
+        };
+        let rsdp = find_rsdp(st);
+        // Step 2: the first map.
+        let first = live_get_memory_map(system_table)
+            .ok_or(MapFailure::Firmware(Status::UNSUPPORTED))
+            .and_then(|get_map| read_memory_map(get_map, map, regions));
+        let (early_uart, register, seen, stand_in) = match first {
+            Ok((_, n)) => {
+                let described = regions.get(..n).unwrap_or(&[]);
+                let mut read = |at: u64, bytes: &mut [u8]| read_described(described, at, bytes);
+                let found = spcr::find(rsdp, &mut read);
+                let _ = writeln!(out, "origin-boot: console: {found}");
+                let register =
+                    bench::find_reset(rsdp, &mut read, |at| bench::in_mmio(described, at));
+                // Under QEMU only: the stand-in table (the coordinating session's ruling Q4).
+                let table = fch::find_stand_in(rsdp, &mut read);
+                let stand_in = table
+                    .map(|(body, n)| fch::StandIn::from_table(body.get(..n).unwrap_or(&[]), true));
+                let _ = writeln!(out, "{}", fch::stand_in_said(stand_in));
+                let stand_in = stand_in.flatten();
+                let seen = bench_fch_read(rsdp, described, stand_in.map(|s| s.pretend), true, out);
+                (found.early_uart(), register, seen, stand_in)
+            }
+            Err(_) => {
+                let _ = writeln!(
+                    out,
+                    "origin-boot: bench build: minimal: the first memory map does not fit the static buffer, or cannot be read: nothing is read, and the call is made with no control"
+                );
+                (
+                    EarlyUart::NONE,
+                    Err(bench::NoReset::NoMap),
+                    FchSeen::not_read(fch::NotRead::NoFadt(bench::NoReset::NoMap)),
+                    None,
+                )
+            }
+        };
+        let _ = writeln!(out, "{}", bench::ResetLine(register));
+        // Step 3: the branch.
+        let _ = writeln!(out, "{}", fch::SmiLine(seen.smi));
+        if let Some(registers) = seen.registers {
+            let _ = writeln!(
+                out,
+                "{}",
+                fch::RegistersLine {
+                    registers,
+                    source: seen.source,
+                }
+            );
+        }
+        let decision = fch::MinimalDecision::of(seen.registers.as_ref(), seen.pm1a_event);
+        let _ = writeln!(out, "{}", fch::MinimalDecisionLine(decision));
+        let shutdown = match decision {
+            fch::MinimalDecision::Control(_) => {
+                wait_ticks(CONTROL_SPIN);
+                mask_interrupts();
+                triple_fault()
+            }
+            fch::MinimalDecision::Call { shutdown, .. } => shutdown,
+        };
+        let stale = stand_in.map_or(0, |s| s.stale);
+        let plan = BenchPlan {
+            after: if stand_in.is_some_and(|s| s.no_reset_system) {
+                bench::After::StandInNoReset
+            } else {
+                bench::After::Reset
+            },
+            under: None,
+            reset_system: runtime_reset_system(st).ok(),
+            register: bench::minimal_register(register),
+            ticks_per_ms: bench::MINIMAL_TICKS_PER_MS,
+            marks: early_uart.is_present(),
+            free: None,
+        };
+        let _ = writeln!(out, "{LAST_LINE}");
+        PANIC_CONSOLE.store(ptr::null_mut(), Ordering::Release);
+        // Step 4: the call; step 5, after it.
+        let mut calls = uart::ExitCalls::default();
+        let outcome: ExitOutcome<MapFailure> = uefi::exit_boot_services(
+            || {
+                let get_map = live_get_memory_map(system_table)
+                    .ok_or(MapFailure::Firmware(Status::UNSUPPORTED))?;
+                read_memory_map(get_map, map, regions).map(|(key, _)| key)
+            },
+            |key| {
+                // A stale key for the first `stale` calls (the stand-in table's, QEMU only).
+                let key = bench::key_for(calls.made(), stale, key);
+                say_on_uart(
+                    early_uart,
+                    if calls.made() == 0 {
+                        bench::MARK_FIRST
+                    } else {
+                        bench::MARK_RETRY
+                    },
+                );
+                let Some(exit) = live_exit(system_table) else {
+                    return Status::UNSUPPORTED;
+                };
+                // SAFETY: valid `ExitBootServices` from the live boot services table, with this
+                // image's handle and the key of the map just obtained; nothing has been allocated
+                // since `GetMemoryMap`.
+                let status = unsafe { exit(image, key) };
+                // Amendment 5, step 6: after EFI_SUCCESS, the status compare, then the triple
+                // fault; nothing comes between them. Only where both shutdown bits were read set
+                // (refinement 3, which holds after the call too: ruling Q3).
+                if status == Status::SUCCESS && shutdown {
+                    triple_fault();
+                }
+                calls.record(status);
+                status
+            },
+        );
+        match outcome {
+            ExitOutcome::Exited => {
+                mask_interrupts();
+                bench_reset(early_uart, &plan)
+            }
+            ExitOutcome::Halt => {
+                mask_interrupts();
+                // Decision item 342: why, on the UART, then Amendment 3's order.
+                say_halting(early_uart, calls);
+                bench_reset(early_uart, &plan)
+            }
+            // `ExitBootServices` was not called, so the firmware's console may still be used.
+            ExitOutcome::NotAttempted(failure) => {
+                let _ = failure.report(out);
+                let _ = writeln!(
+                    out,
+                    "origin-boot: bench build: minimal: the last memory map does not fit the static buffer, or cannot be read, so there is no key: halting"
+                );
+                halt()
+            }
+        }
     }
 }
