@@ -101,7 +101,7 @@ M1-5 needs the prerequisites in "Before a first boot on a machine in scope".
 | Rows | Subject |
 |---|---|
 | S82-02 | The milestone's own sentence |
-| A02-B1 to A02-B6, A02-B8, A02-Am2 to A02-Am5 | ADR-0002's boot decisions: where the kernel comes from, the order of verification, placement, boot info, leaving the firmware, entering the kernel, developer mode; the loader's line before a halt after a failed `ExitBootServices` (Amendment 2, item 342); a bench build's reset after it (Amendment 3, item 344); a bench build's reset with no firmware code (Amendment 4, item 345), with two further reads before the call (item 348); and a bench build's minimal-program mode (Amendment 5, item 347) |
+| A02-B1 to A02-B6, A02-B8, A02-Am2 to A02-Am6 | ADR-0002's boot decisions: where the kernel comes from, the order of verification, placement, boot info, leaving the firmware, entering the kernel, developer mode; the loader's line before a halt after a failed `ExitBootServices` (Amendment 2, item 342); a bench build's reset after it (Amendment 3, item 344); a bench build's reset with no firmware code (Amendment 4, item 345), with two further reads before the call (item 348); a bench build's minimal-program mode (Amendment 5, item 347); and a bench build's bisection mode (Amendment 6, item 352) |
 | A01-def5 | Merkle-SHA256-4K, which the loader verifies |
 | A04-H3, A04-H4 | KASLR; the loader builds the first page tables |
 | A09-H6 | Before the first boot (ADR-0009) |
