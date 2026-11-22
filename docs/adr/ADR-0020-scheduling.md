@@ -114,6 +114,20 @@
 
 **Threats.** A confused index is how one thread would act on another's state (mark it ending, register it with a wait queue). The type closes it when the code is built (ADR-0018 V4, step 1).
 
+**Note, 2026-11-22: how S3 and S2's pin are built, and what S3 costs (TASKS item 93; the coordinating session's rulings Q2, Q3 and Q8; no decision changes).**
+- **S3's cost is not "none, by construction" at five sites** that read the index with no section before S3: `here_console`, `reap`'s check, `tlb::note`, `tlb::note_answer` and `run_probe`.
+  - Each read the index in the very way S3 forbids, so each now opens an interrupts-off section: one flag save, a `cli` and a restore. The section is P0, not a choice (ADR-0018 V1, point 1).
+  - Ledger row CL60 holds the cost's model and the static counts.
+- **Two more sites, `wake` and the fair-share proof's worker, had sections of their own as first built.** The comparison with the base showed what they cost, so both changed (TASKS item 93's entry):
+  - `wake` takes one section, as the base took one, now around the wake-up and its IPI decision. Its calls, locked instructions and GS load are the base's, with 19 more instructions (CL60).
+  - The worker's measured loop has no section. It reads the index once, under one section, after it stops.
+- **Everywhere else the cost is as stated.** The switch path's code equals the base's, instruction for instruction (TASKS item 93's entry).
+- **As built, the witness is two types,** both made only in `origin_frame::trap`:
+  - `Here`, from an interrupts-off section or the trap entry. Its holder cannot leave the processor while nothing it runs switches it out.
+  - `Pinned`, from S2's pin or from the boot or idle flow, checked once at the flow's entry. Its holder stays on the processor even when switched out, and it gives a `Here`.
+- **The pin guard's `Pinned`** comes through a one-time mint that `sched` holds. S2's pin, as built, costs more than S2's Cost paragraph says: `sched::pin()` takes this processor's queue lock in a section to find the running record (CL47's note of this date).
+- **The index the witness gives** (`ThisCpu`) can be copied out as a plain value. The types stop a per-processor entry (`PerCpu::this`) from outliving its witness, but not a plain index from being used afterwards. Each such use is named in `REVIEW_T93_2026-11-21.md`.
+
 ### S4. A context moves between tables by lend, adopt and forget, under a move sequence
 
 **Decision.** `origin_sync::contexts` gains four operations, safe code modelled by Loom:

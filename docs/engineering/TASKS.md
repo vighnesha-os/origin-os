@@ -548,7 +548,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 92. **Thread records and names that survive moves (ADR-0020 S1). Plan P1, batch 9. Numbered by the coordinating session on 2026-11-20; contract accepted the same day; built on `claude/t92-thread-records` from `main` at `1c9c7a96` the same day ("As built" below).** Every thread's state is in a record of its own, which names it (`{ record, generation }`) and through which a wake-up finds it wherever it runs. Lands with no change of behaviour: no thread moves. The contract, its rulings, the comparison on the large machines under three rulings, three reviews and the gates are under "Task contracts", 92.
 
-93. **The processor-index witness and the pin (ADR-0020 S2, S3). Plan P2, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 92.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Converts the 74 sites that read the processor index.
+93. **The processor-index witness and the pin (ADR-0020 S2, S3). Plan P2, batch 9. Numbered by the coordinating session on 2026-11-20. Built and reviewed on 2026-11-21 on `claude/t93-witness-pin-333af7`, gated on 2026-11-22; not landed; its entry is at the end of this file.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. The plan counted 74 sites that read the processor index. Every site is converted, and the read without a witness is gone. Follow-up: TASKS item 125, GS's base set before anything can make a witness.
 
 94. **Every processor's FPU format checked (ADR-0020 S6). Plan P3, batch 9. Numbered by the coordinating session on 2026-11-20. Built on 2026-11-21 on `claude/t94-fpu-format-18ed6a`; its entry is at the end of this file.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Follow-up: TASKS item 111, every FPU area shrunk to the boot processor's enabled size.
 
@@ -4382,3 +4382,235 @@ Built on `claude/t97-domains-21554f`, cut from `land/batch-9` at `a25228c9` (`ma
 - Fn8000_001D at boot (KVM on AMD only);
 - anything under KVM until CI runs it;
 - **no person has reviewed it.**
+
+### 93. The processor-index witness and the pin (ADR-0020 S2 and S3; plan P2)
+
+Assigned by the coordinating session on 2026-11-20, on the owner's word ("Start all four", items 93, 94, 95 and 97). The contract went to the coordinating session before any code was written (the coordination notes' `t93-contract.md`, against `land/batch-9` at `a25228c9`). It was accepted on 2026-11-21 at 00:35 UTC, with the recommendations of Q1 to Q11 and these conditions:
+
+- **Q1:** the witness types live in `trap.rs`, beside `Switch`, with host `compile_fail` doctests that `cargo xtask check` runs. The host-only constructors exist only under `cfg(not(target_os = "none"))`, and a check shows the kernel's build has none (controls e and e2 below).
+- **Q2:** two witnesses, `Here` and `Pinned`. A function whose body may be switched out takes `Pinned`, never `Here`.
+- **Q3 (a):** a one-time mint, taken by `sched` before any thread exists.
+  - Taken twice, or not at all, it stops the kernel, as a host test shows.
+  - The only path from a `PinGuard` to a `Pinned` raises the count first.
+  - Its holder is a `static` no other module can name.
+- **Q4:** `PerCpu::this(here)` for every lookup of this processor's own entry. The plain index is for values only, and each such use is named in the review with why a stale value there is harmless.
+- **Q5 (a):** a witness in `origin_sync`'s `TlbHardware`, with Loom re-run.
+- **Q6 (a):** `cpu::flow()`, checked once at each flow's entry, with a host test of the check over three tables.
+- **Q7:** the "movable" declaration goes to TASKS item 96.
+- **Q8:** the new interrupts-off sections are accepted, with S3's cost recorded truthfully: ledger row CL60 and a dated note in S3. For each one, the review says what a stale index there would do.
+- **Q9:** the pin count lives in `Record`, which stays 128 bytes. `Block::take` resets it, and going below zero stops the kernel.
+- **Q10:** after TASKS item 97 lands, only the gates are re-run, unless 97 touched a converted site or the switch path.
+- **Q11:** the files beyond the plan's 15.
+- **Controls:** an old call refused (E0061), and a `Here` returned from its section refused, as a host doctest.
+
+**Later rulings:**
+
+- **On `cba7462b`:**
+  - the makers move into `trap.rs`, their constructors private to it;
+  - a failed flow check at an AP's entry refuses the start as `NotMine`;
+  - the planted controls are accepted;
+  - `Switch::new` stays `pub(crate)`, its one caller named.
+- **On `ba69370d` (12:21 UTC):**
+  - R95-12 goes to TASKS item 96;
+  - the `run_probe` change is accepted on two conditions (below).
+- **On the count stop (22:09 UTC):** the recommended fix, then the main turn again.
+- **On the judge's stop:**
+  - **At about 22:55 UTC:** a diagnostic turn, alternating base, tip and a diagnostic tip whose worker loop is the base's. If the diagnostic shows the worker loop (#14) is the cause, the worker reads its record's `Location`, pre-approved under a delta review by the same reviewer. If `wake`'s new section can merge into the section it already has, and the ping-pong follows #8, that goes in the same commit (ADR-0018 V1).
+  - **After the compile turns on `f8604f7e` and `87673b7e`:** both changes accepted. `KernelQueues` must let no queue lock be taken with interrupts on anywhere: only `waking::within`, inside its section, makes one. For the main turn, the stop covers `resume`, `on_yield` and `dispatch`; `wake`'s count is reported, not a stop, and its +19 instructions are S3's cost on the wake path, recorded in CL60 with a candidate to try. A ping-pong that fires rule (c) again stops the turn. D93-1's answer is accepted, and `87673b7e` is the final tip. D93-2 and D93-6 pass to TASKS item 96.
+
+Built on `claude/t93-witness-pin-333af7`, cut from `land/batch-9` at `a25228c9`.
+
+**Result (2026-11-22): built, reviewed and gated; not landed and not pushed.** Nothing moves a thread yet, so every thread stays pinned by construction until TASKS item 96. The evidence is in `SOURCE_PROVENANCE.md`, under "TASKS item 93", and in `REVIEW_T93_2026-11-21.md`.
+
+**As built**, in order:
+
+- `1a53a2f6`: the witnesses `Here` and `Pinned`, and the pin's mint, in `trap.rs`, with their doctests.
+- `58885432`: a thread's pin count in its `Record`, with its host tests.
+- `fc2799c0`: the shootdown protocol reads the index under its section's witness (Q5 (a)); the three Loom-model implementations follow.
+- `4db8b5f1`: `sched::pin` and `PinGuard`; the mint taken before any thread.
+- `76793313`: the sites outside the shared files.
+- `c7f0ad80`: `land/batch-9` at `7b67be0b` merged (TASKS items 94 and 78's figures line).
+- `352fc198`, `cba7462b`: the start-up sites outside `cpu.rs` and `stack.rs` under the flow; each AP takes its flow's witness through `cpu::flow`'s check.
+- `935f4a8a`: `land/batch-9` at `0e4f99f9` merged (TASKS items 95, 78 and 112, rental D, `main`'s PR 53).
+- `abfcc02e`: the makers moved into `trap.rs` (`trap::section`, `trap::flow`), their constructors private to it.
+- `16e2d06e`: the trap entry, its device handlers (`irq::Handler` takes the `Here`) and the shootdown IPI read under the trap entry's witness.
+- `cf1490a9`: the start-up steps in `cpu.rs` read the index their flow gives them.
+- `bda20622`: a thread on a measured stack is pinned (`with_measured_stack` demands a `Pinned`), and `stack_in_use` reads under its section.
+- `ba69370d`: `cpu::this_cpu` takes a witness; the read without one is gone, the GS load private (`read_index`).
+- `d60e9b3c`: `land/batch-9` at `0b90dea8` merged (TASKS items 116 and 97, rental E). Clean. TASKS item 97 added no read of the index.
+- `8bc2ea77` to `548c0e4d`: the review's answers (R93-1 to R93-10, A93-1, A93-2).
+- `9ebb9bc1`: the count stop's answer: `cpu::local` takes the `Here` and reads the index itself, so `dispatch`'s code is the base's.
+- `f8604f7e`: the judge's stop's answer.
+  - The fair-share worker records where it runs from its own thread record's `Location`, with no index read and no section (#14).
+  - `wake` runs the wake-up, the compare and the IPI in one interrupts-off section. `KernelQueues`, made only inside that section by `waking::within`, takes each queue lock without a section of its own (#8).
+  - It was reviewed by the same reviewer as a delta: 0 High, 0 Medium, 1 Low (D93-1), 5 Info.
+- `87673b7e`: D93-1's answer. The worker reads the index once it stops, under its own section, not the record's location in every iteration. That gives the "ran there" clause back the processor's own view, and closes D93-3 and D93-4.
+- `1544128e`: `land/batch-9` at `144e0cfa` merged after the gates (`main`'s PR 54: owner item 345 and TASKS items 117 to 124, records only). Its code is `87673b7e`'s: the diff outside `docs` is empty.
+- **The records:**
+  - this entry;
+  - ADR-0020 S3's dated note;
+  - CL47's pin cell and CL60;
+  - the provenance entry;
+  - `REVIEW_T93_2026-11-21.md`.
+
+**The design as it lands:**
+
+- **The witnesses.** `Here<'a>` says the holder cannot leave its processor while the witness lives, provided nothing it runs switches it out. `Pinned<'a>` says the holder stays even if it is switched out, and gives a `Here`. Both are zero-sized and `Copy`, neither `Send` nor `Sync`. They are made only in `trap.rs`:
+  - `section(|here| …)`, an interrupts-off closure over `for<'a>`, so nothing bound to its witness can be returned;
+  - `Switch::here`, the trap entry's;
+  - `flow()`, checked once at each flow's entry: the processor's table of contexts has no running home, or has `BOOT_FLOW`;
+  - the one `PinMint`, which `sched` holds. It turns a live `PinGuard` into a `Pinned`, or, for `end_with`, into a `Pinned<'static>`.
+- **Reading the index.** `cpu::this_cpu(here) -> ThisCpu<'a>`: the index and the witness it was read under. The GS load itself, `read_index`, is private. `PerCpu::this(me) -> Option<&'a T>` lends this processor's own entry for the witness's life. `ThisCpu::index` gives the plain value, for comparing, printing or recording only.
+- **The pin (S2).** `Record`'s `pins`, an `AtomicU32` in the padding after `generation`, so the record stays 128 bytes:
+  - Only the running thread raises and lowers it, with a Relaxed load and store.
+  - `Block::take` resets it with the new generation.
+  - Raising it at its largest, or lowering it below zero, stops the kernel.
+  - `sched::pin()` raises it in one section under this processor's queue lock. On the boot or idle flow it raises nothing. A slot other than 0 with no record stops the kernel (R93-8).
+  - `end_with` raises it in the section it already takes and keeps it for good (N5).
+  - `with_measured_stack` demands a `Pinned`, so a thread on a measured stack never moves.
+- **The conversion list, as built:**
+  - **The trap entry and the hooks:** `with_queue` and `on_exit` (T); `resume`, `name_kernel_stack`, `check_landing` and `entering_process`; `dispatch`'s probe check through `local`; `tlb::interrupted`; and the device handlers in `irq`, `storage` and `virtionet`.
+  - **Existing sections:** `current_thread`, `current_user`, `random::step_here`, `prove_stack`, `stack_in_use`'s own-table step, and the shootdown protocol's own sections.
+  - **New sections (S+):** `here_console`, `reap`'s check, `tlb::note`, `tlb::note_answer` and `run_probe`. `init_speculation` reads inside `load_tables`, where interrupts are already off.
+  - **`wake` (#8)** has one section for the wake-up, the compare and the IPI, where the base had one for the wake-up's queue lock: no new section.
+  - **The fair-share worker (#14)** stores only its counted time in the loop. Once it stops, it reads the index in one section and stores it in `RAN_ON`, outside the measured window. The contract's §2 had a new section at each of these two. The judge's stop showed the cost of #14's (`f8604f7e` and `87673b7e`; the comparison below).
+  - **Under the boot or idle flow's `Pinned<'static>`:** every boot proof and start-up step, and each AP's flow from `ap_entry` through `run_ap`.
+  - **Under a pin:** `reap_zombies`; `sleeper` and `timed_waiter` across `queue_ticks`; storage's `io_thread` and `cpu_io_thread`; the console's `printer`; and `time`'s `turn_taker`.
+
+  The review record lists every function that takes a `Pinned`, every new section with what a stale index would do there, and every use of a plain index.
+- **`Switch::new`** stays `pub(crate)`. Its one caller is `cpu::dispatch`, and a host test that scans the crate's source holds it there (R93-2).
+
+**Changes of behaviour, all accepted:**
+
+- **`run_probe`** now has interrupts off across the probe's access and its fault; before, they were as the caller had them. It was accepted on two conditions:
+  1. **A check that nothing on the page fault's path assumes interrupts are on.** The author made it by reading the code at `ba69370d`:
+     - the exception entry and return neither set nor read the flag;
+     - `dispatch` reads only `trap::hooks()`, lock-free, before the probe's recovery;
+     - `probe_recover` is a bare `ret`;
+     - each probe is one instruction taking no lock;
+     - `UserSpace::probe_read` already ran with interrupts off;
+     - callers that probe in a loop hold the section for one probe at a time.
+  2. **This paragraph,** with `boot-test` and `boot-matrix` below as its evidence.
+- **The new sections above:** each adds a flag save, a `cli` and a restore (CL60).
+- **`wake`** holds interrupts off across the whole wake-up: the location read, the queue lock, the retries and the IPI. The base held them off only under the queue lock (`f8604f7e`).
+- **The fair-share proof's placement clause** ("both workers last ran on id") rests on the processor index each worker reads once it stops, where before it read the index each iteration. Where it stopped is where it last ran (`87673b7e`; the delta review, D93-1).
+- **`mark_online`:** its store, fence and flush now run in the section that read the index (R93-1).
+- **The stops:** the pin count's, the mint's and `pin()`'s.
+- **The flow check:** at the kernel's entry it halts, unreachable there. At each AP's entry a failed check refuses the start as `NotMine`. That path should never fire: it would mean the CPU-local index already names a processor that runs threads. It prints the existing line `CPU n (APIC ID m): a different processor answered; parked by INIT: AP start-up failed`, which xtask stops a boot on. ADR-0013's "Application processors" row lists no refusal reasons, so it is not edited. No log of the final main turn prints the line: not its comparison boots, and not its gates.
+
+**R95-12** (requiring S3's witness in `Moves::begin`) is not taken here and goes to TASKS item 96. S3's `Here` means its holder cannot leave the processor, not that interrupts are off: a pinned thread holds one through `Pinned::here` with interrupts on, so it cannot prove what D95-3 needs. TASKS item 96 needs a separate interrupts-off token, made only by `trap::section` and the trap entry.
+
+**The controls.** Each control below was planted in a `git archive` export, against its own carried programs, and built for the kernel's target, never booted (`plant_t93.py`). All twelve were refused with the error each names in every main turn: in the export of `9ebb9bc1` on 2026-11-21 at 22:11 UTC, and in the export of `87673b7e`, the final tip, on 2026-11-22 at 00:11 UTC.
+
+| Control | Planted | Refused with |
+|---|---|---|
+| a | a `Pinned` made outside `origin_frame` by its constructor | E0624 |
+| b | a `Pinned` made outside `origin_frame` by a literal | E0451 |
+| c | a `Pinned` made in `origin_frame` outside `trap.rs` | E0624 |
+| c2 | a `Here` made in `origin_frame` outside `trap.rs` | E0624 |
+| d | the old call, `cpu::this_cpu()` | E0061 |
+| e | the host's section, from the kernel | E0425 |
+| e2 | the host's mint, from the kernel | E0425 |
+| f | a `ThisCpu` returned from its section | "lifetime may not live long enough" |
+| g | a `PerCpu::this` reference returned from its section | "lifetime may not live long enough" |
+| h | a `ThisCpu` sent to another thread | E0277 |
+| k | a `Switch` made outside `origin_frame` | E0624 |
+| l | a second `PinMint`, by a literal | E0451 |
+
+The baseline, the export with nothing planted, built (exit 0). Beside them, the host doctests: a `Here` returned from its section, a `Pinned` used after its pin's drop (E0505), and `Here` and `Pinned` sent to another thread (E0277).
+
+**The static counts of the switch path** (`llvm-objdump` of the images built from the base `0b90dea8` and the tip):
+
+- **First, on `548c0e4d`:** the turn stopped at its own check. `resume` (777 instructions, 40 call sites, 35 locked) and `on_yield` (239, 7, 3) equalled the base's, with the same 40 call targets. `dispatch` had 446 instructions against 443. With `local` taking a `ThisCpu`, its GS load had moved into `dispatch`, on the branch for a kernel page fault at an armed probe, adding three register moves. The coordinating session chose the fix by ADR-0018 V1: `local` takes the `Here` (`9ebb9bc1`).
+- **Then, on `9ebb9bc1`:** every count equals the base's: `resume` 777, 40 and 35; `on_yield` 239, 7 and 3; `dispatch` 443, 23 and 3. In the wider set, `on_tick`, `on_reschedule`, `on_sleep`, `on_block`, `on_exit`, `with_queue`, `follow_thread`, `entering_process` and `check_landing` also equal the base's, each inlined where the base's is. The normalized disassembly diffs of both sets against the base are empty.
+- **Last, on `87673b7e`** (2026-11-22, 00:11 UTC): the same. `resume` 777, 40 and 35; `on_yield` 239, 7 and 3; `dispatch` 443, 23 and 3, with the same call targets. Both normalized disassembly diffs are empty.
+
+**CL60's counts** on `87673b7e`. Each figure is a function's instructions, then its flag saves, `cli` and `sti`, from the same images:
+
+| Function | Base `0b90dea8` | Tip `87673b7e` |
+|---|---|---|
+| `sched::here_console` | 89 (2, 1, 1) | 93 (2, 1, 1) |
+| `sched::reap` | 344 (2, 2, 2), `reap_zombies` inlined | 66 (1, 1, 2) |
+| `sched::reap_zombies` | inlined in `reap` | 339 (2, 2, 2) |
+| `sched::wake` | 244 (1, 1, 1) | 263 (1, 1, 1) |
+| the fair-share `worker` | 292 (2, 2, 2), 4 calls | 316 (3, 3, 3), 7 calls |
+| `tlb::service`, which holds `note_answer` | 108 (3, 3, 3) | 112 (4, 4, 4) |
+| `cpu::probe_read`, which holds `run_probe` | 58 (0, 0, 0) | 69 (1, 1, 1) |
+
+`tlb::note`, `note_answer`, `run_probe`, `probe_write`, `probe_execute` and the shootdowns are inlined in both images. `tlb::note`'s callers are not counted here. `wake`'s call targets, locked instructions, GS load, spills and reloads are the base's (the coordinating session's ruling). The worker's extra section and calls come after its measured loop; the loop has no section (checked in the disassembly).
+
+**The comparison with `0b90dea8`** (§5 of the contract; the coordinating session's rulings).
+
+**How it ran:**
+- Every boot ran from a `git archive` export, inside `cargo xtask exclusive`, under QEMU 11.1.3 TCG on the development Mac.
+- A turn has three rounds. Each round is a B1 pair, then base, tip, base on the 65-processor machine, then the same on the 67.
+- The boots are judged by item 92's rules (a) to (c) (`judge93.py`, in the session's scratchpad with the logs).
+
+**The results:**
+
+- **First, on `9ebb9bc1`** (22:11 to 22:52 UTC): rule (a) found nothing new, and rule (b) found no window re-run. Rule (c) fired twice:
+  - **Switches per CPU on the 67-processor machine:** the tip's 60.7, 57.0 and 59.0 (mean 58.9) against the base's worst of 61.6. On the 65 it passed by 0.2.
+  - **The wait-queue ping-pong on the 65:** the tip's 24, 32 and 29 µs (mean 28.3) against the base's worst of 25.
+
+  The tip's B1 was above the base's in all three pairs (1839, 1853 and 1870 against 1724, 1798 and 1736), though every function on B1's path matched the base's instruction for instruction.
+- **The diagnostic** (22:56 to 23:39 UTC; the coordinating session's ruling). Each round booted B1's machine, the 67-processor machine and the 65-processor machine as base, tip, and diag, in rotated order. Diag is the tip with its worker loop made the base's, never committed. Pooled with the first turn (base 9, tip 6 and diag 3 boots on each large machine):
+
+| Figure | Machine | Base | Tip `9ebb9bc1` | Diag |
+|---|---|---|---|---|
+| Switches per CPU | 67 | 58.5–66.3, mean 63.4 | 57.0–62.0, mean 59.0 | 60.6–62.9, mean 61.7 |
+| | 65 | 59.4–73.1, mean 64.3 | 58.9–62.6, mean 61.4 | 64.3–73.9, mean 69.0 |
+| Ping-pong (µs) | 65 | 15–30, mean 21.1 | 24–32, mean 28.7 | 23–29, mean 26.3 |
+| | 67 | 23–40, mean 30.3 | 19–31, mean 25.3 | 18–34, mean 26.3 |
+| B1 | default | 1706–1826, mean 1757 | 1704–1901, mean 1814 | 1703–1864, mean 1759 |
+
+  - **Switches per CPU followed the worker's section (#14):** without it they recovered into the base's range.
+  - **The 65-processor ping-pong** kept most of its gap without #14, so it sat with `wake`'s second section (#8). On the 67 neither tip was above the base.
+  - **B1:** in this turn the tip's mean, 1774, lay inside the base's range.
+
+  So came `f8604f7e`.
+- **Then, on `87673b7e`** (2026-11-22, 00:11 to 00:52 UTC; base 6 boots and tip 3 on each large machine, 3 B1 pairs): no stop.
+  - **Rule (a):** nothing new. The fairness proof's uneven shares were forgiven on the oversubscribed machines, as ADR-0013 names, in 10 of the base's 12 large boots and 5 of the tip's 6.
+  - **Rule (b):** window re-runs in 2 of the base's 6 boots on the 67, none on the tip's.
+  - **Rule (c):** no figure fired. The tick rule held on both machines.
+
+| Figure | Machine | Base `0b90dea8`, 6 boots | Tip `87673b7e`, 3 boots |
+|---|---|---|---|
+| Switches per CPU | 65 | 58.0–67.6, worst 58.0 | 60.9–63.8, mean 62.1 |
+| | 67 | 60.2–71.2, worst 60.2 | 65.0–67.7, mean 66.2 |
+| Counts per CPU (millions) | 65 | 91.6–118.5, worst 91.6 | 93.3–116.2, mean 107.9 |
+| | 67 | 101.6–127.4, worst 101.6 | 110.4–114.4, mean 112.0 |
+| Ping-pong (µs) | 65 | 13–29, worst 29 | 19–28, mean 23.7 |
+| | 67 | 21–36, worst 36 | 22–28, mean 24.7 |
+| IPC round trip (ns) | 65 | 78,184–99,171, worst 99,171 | 82,825–99,964, mean 93,937 |
+| | 67 | 84,121–123,365, worst 123,365 | 92,252–116,558, mean 108,443 |
+| 50 ms timed wait (ms) | 65 | 50–62, worst 62 | 51–60, mean 56.3 |
+| | 67 | 50–60, worst 60 | 50–59, mean 55.7 |
+| B1, TSC cycles per switch | default | 1,720–1,854, mean 1,801 | 1,703–1,745, mean 1,724 |
+
+  - **The 65-processor ping-pong**, which fired rule (c) on `9ebb9bc1` (mean 28.3 against a worst of 25), came back inside the base's range once `wake` took one section.
+  - **The IPC round trip's means** lie above the base's means on both machines: 93,937 against 87,342 on the 65, and 108,443 against 97,350 on the 67. They are inside rule (c). One tip boot on the 65, at 99,964, lies above the base's worst. The round trip's processes block and are woken across processors, so it runs through `sched::wake`, which has 19 more instructions than the base's (CL60). Whether that is the cause is not measured.
+  - **Switches per CPU** is weaker evidence than before (the delta review's D93-8, and the coordinating session's note). The tip's worker loop is lighter than the base's: no GS load and no `RAN_ON` store per iteration. So a pass there shows less than it did. The evidence for the switch path is the static counts: `resume`, `on_yield` and `dispatch` equal the base's.
+
+**The gates on `87673b7e`.** They ran in the same turn of the machine, on a clean tree, on 2026-11-22 from 00:52 to 02:13 UTC, under Rust 1.100.0 (`rustc` at the pinned commit `0ef1bc38`) with QEMU 11.1.3 TCG and OVMF. The quick gates had passed at the turn's start: fmt and the document, provenance, cost and requirements gates.
+
+- **`cargo clippy --locked --all-targets -- -D warnings`** found nothing.
+- **`cargo xtask check`** passed in 903 s.
+- **`cargo xtask boot-test`** passed, 11 of 11, in 56 s, with the verdict `degraded: 72 of 73 proofs passed; failed: speculation controls`.
+- **`cargo xtask boot-matrix`** passed three times in a row, in 1,305, 1,285 and 1,284 s:
+  - each run's other boots gave `degraded: 72 of 73 proofs passed; failed: speculation controls`;
+  - the 65-processor machines and the 67-processor sparse machine had the fairness proof's uneven shares forgiven, as ADR-0013 names them (65 or 67 guest processors on 10 host threads), in 2, 2 and 3 of their boots;
+  - the three machines built to lack something each named it: `57 of 67` with 6 not run, `63 of 68` with 5 not run, and `65 of 67` with 6 not run.
+- **No log** of the turn prints "a different processor answered", and the tree was clean after the gates.
+
+The host tests' counts at the turn's start were 566 for the kernel's library, 385 for `origin-frame` and 151 for `origin-sync`, all passing.
+
+**Follow-ups and limits:**
+
+- **TASKS item 125** (numbered by the coordinating session, from R93-3): set GS's base to the boot processor's CpuLocal at the kernel's entry, before anything can make a witness, so that a witness implies the precondition. Today `read_index` rests on the boot's order.
+- **For TASKS item 96:**
+  - the interrupts-off token (R95-12, R93-10): `check_landing`'s count rests on interrupts being off, which `Here` does not show;
+  - the spawner's "movable" declaration (Q7);
+  - a mover's reading of the pin count under the owning queue's lock (R93-7: only the running thread's own `pin` and `unpin` touch it).
+- **The `NotMine` path** has no boot that reaches it.
+- **What the types do not check:** the types check where an index is read, not how a plain index is used afterwards; the review record names each such use.
+- **Not shown:** a pin holding a thread that would otherwise move, since nothing moves until TASKS item 96; anything under KVM until CI runs it; anything on hardware. No person has reviewed it.
