@@ -4424,7 +4424,8 @@ fn object_markers(far: &str) -> Vec<String> {
     for how in ["exits", "faults"] {
         markers.extend([
             "origin-kernel: ipc: the waiter on a process that: woken -> OK, observed -> 0x10, and it stays raised -> OK".to_string(),
-            format!("origin-kernel: ipc: when a process {how}: TERMINATED reached the thread waiting on it on {far}, blocked "),
+            // TASKS item 134, as the channel's case: the waiter is seen blocked first.
+            format!("origin-kernel: ipc: when a process {how}: TERMINATED reached the thread waiting on it on {far}, seen blocked in wait_one before the process started: true, blocked "),
         ]);
     }
     markers.extend([

@@ -2422,10 +2422,13 @@ fn process_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_
             return false;
         };
         let wakes_before = ipc::cross_cpu_wakes();
-        if Process::start_thread(&waiter, far, CODE, STACK + PAGE, SCRIPT).is_err() {
+        let Ok(waiting) = Process::start_thread(&waiter, far, CODE, STACK + PAGE, SCRIPT) else {
             return false;
-        }
-        sched::yield_until(|| waiter.waiting.load(Ordering::Acquire) > 0, tsc_hz, 5);
+        };
+        // As `exit_closes` (TASKS item 134): the waiter must be blocked in `wait_one` before the
+        // process it waits on starts, so that `TERMINATED`'s wake-up, raised where that process's
+        // last thread is reaped, on the boot processor, crosses processors on every schedule.
+        let waiter_blocked = blocked_in_wait(&waiter, &waiting, far, tsc_hz);
         if Process::start_thread(&ender, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
             return false;
         }
@@ -2440,11 +2443,12 @@ fn process_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_
             (exit_step.is_some(), ender.ending()),
             (false, Some(Ending::Exited(0))) | (true, Some(Ending::Faulted { vector: 6, .. }))
         );
-        let right = done && right_reports && ender_ok && (far == bsp || wakes > 0);
+        let right =
+            done && right_reports && ender_ok && waiter_blocked && (far == bsp || wakes > 0);
         ok &= right;
         let _ = writeln!(
             com1,
-            "origin-kernel: ipc: when a process {label}: TERMINATED reached the thread waiting on it on {}, blocked {} times; {} wake-ups crossed processors{}",
+            "origin-kernel: ipc: when a process {label}: TERMINATED reached the thread waiting on it on {}, seen blocked in wait_one before the process started: {waiter_blocked}, blocked {} times; {} wake-ups crossed processors{}",
             far.named(),
             waiter.blocked(),
             wakes,
