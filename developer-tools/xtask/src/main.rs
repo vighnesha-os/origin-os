@@ -2730,6 +2730,11 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             "origin-kernel: kernel bound: the root holds ".into(),
             " KiB of free frames less a reserve of ".into(),
             " KiB kept for the kernel's own use; a second sizing is refused and changes nothing: true".into(),
+            // ADR-0020 S7 (TASKS item 98): balancing was set up, on every machine, before the
+            // scheduler's first proof. Without this line no processor pulls, and with two or more
+            // processors the migration proofs' pulled phases fail (the review of TASKS item 98,
+            // R98-3).
+            "origin-kernel: balancing: idle pull and idle kick set up: ".into(),
             // The guard is in the kernel stacks' region, whose addresses the boot never prints
             // (ADR-0004 Amendment 2, A6.3).
             "origin-kernel: page protection: the first thread's stack guard page faulted (#PF error 0x0)".into(),
@@ -2827,10 +2832,6 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
         ])
         .chain(kernel_bound_markers(true))
         .chain([
-            // ADR-0020 S7 (TASKS item 98): balancing was set up, on every machine. Without this
-            // line no processor pulls, and with two or more processors the pulled phases below
-            // fail (the review of TASKS item 98, R98-3).
-            "origin-kernel: balancing: idle pull and idle kick set up: ".into(),
             // ADR-0020 S6, S20 and S23 (TASKS item 96): the two migration proofs, on every
             // machine; on one with fewer than two processors taking part, each says so and passes.
             // A failure ends its line ": scheduler failed", a boot failure below. Each has a second

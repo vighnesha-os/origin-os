@@ -75,7 +75,12 @@
 //!   under it: the tick's kick, the upcall's kick and the ask then act on a thread that the same
 //!   trap switched out, which threads that run with interrupts off never show (the review of
 //!   TASKS item 98, R98-3). A thread's word stays its own while it is switched out, so a second
-//!   processor that ran its context would still fail the word's swap.
+//!   processor that ran its context would still fail the word's swap. They pass no turn and wait
+//!   for nobody: each yields between its iterations and sleeps two ticks in every fourth, so
+//!   that most of them are runnable at any moment, the start processor stays crowded, and a
+//!   processor that holds one alone idles when it sleeps and pulls another. (With the first
+//!   phase's pairs, half of them were blocked at any moment and the boot flow's own yields ran
+//!   the rest at once: a boot of the two-processor machine saw no pull in 30 s.)
 //! - **delivery, pulled:** the same receivers, declared for balancing and started together on one
 //!   processor, with one pinned sender beside them.
 //!
@@ -784,7 +789,13 @@ extern "sysv64" fn integrity_thread(index: u64) -> ! {
                 }
                 _ => {
                     release_word(&shared, &me.running_on, on);
-                    sched::yield_now();
+                    if shared.pulled.is_some() && iteration.is_multiple_of(YIELD_EVERY) {
+                        // A pulled phase's thread leaves its processor for two ticks, so that a
+                        // processor it was alone on idles and pulls another.
+                        sched::sleep(2);
+                    } else {
+                        sched::yield_now();
+                    }
                 }
             }
         }
@@ -998,6 +1009,8 @@ pub(crate) fn prove_integrity(
 ) -> bool {
     let moved = integrity_by_moves(flow, com1, online, tsc_hz);
     let pulled = integrity_by_pulls(flow, com1, online, tsc_hz);
+    // Every count of the balancer so far, report only (the review of TASKS item 98, D98-6).
+    pull::report(com1, tsc_hz);
     moved && pulled
 }
 
@@ -1149,8 +1162,10 @@ extern "sysv64" fn receiver(index: u64) -> ! {
         cpu::without_interrupts(|| *me.name.lock() = named);
         shared.started.fetch_add(1, Ordering::AcqRel);
         // A tick, in nanoseconds of the monotonic clock: the receiver may be moved mid-spin, and
-        // no TSC reading is compared across processors (ADR-0020 N10; R96-15).
-        let period = 1_000_000_000 / crate::timer::HZ;
+        // no TSC reading is compared across processors (ADR-0020 N10; R96-15). Two ticks in a
+        // pulled phase, so that a tick finds the receiver in its spin, another thread posts to it
+        // while it waits, and an idle processor takes it before the spin is over.
+        let period = if shared.pulled.is_some() { 2 } else { 1 } * 1_000_000_000 / crate::timer::HZ;
         let mut taken = 0u64;
         let mut direct = false;
         loop {
@@ -1819,7 +1834,8 @@ fn integrity_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc
     let settled_before = sched::settle(tsc_hz);
     let before = counts();
     let unready_before = sched::unready_switches();
-    let shared = Shared::for_pulled(threads, threads / 2, 0, source, tsc_hz);
+    // No pairs: these threads wait for nobody (the module documentation, "Pulled").
+    let shared = Shared::for_pulled(threads, 0, 0, source, tsc_hz);
     let (occupants, occupied) = occupy(&shared, &cpus, source, tsc_hz);
     let spawned = occupied
         && (0..threads).all(|i| {
@@ -1842,6 +1858,10 @@ fn integrity_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc
         pull_back_for(flow, &shared, source, online, tsc_hz, &mut pulled, |c| {
             c.again >= 1
         });
+    }
+    if spawned && pulled.reached_after.is_none() {
+        // Report only, so that the failure explains itself: where every thread is.
+        describe_stuck(&shared, "no pull of a thread moved before was seen");
     }
     shared.stop.store(true, Ordering::Release);
     for pair in &shared.pairs {
@@ -1943,6 +1963,9 @@ fn delivery_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc_
         pull_back_for(flow, &shared, source, online, tsc_hz, &mut pulled, |_| {
             crossed() >= 1
         });
+    }
+    if spawned && pulled.reached_after.is_none() {
+        describe_stuck(&shared, "no wake-up that crossed a pull was seen");
     }
     // The sender stops; then every token posted must be taken.
     shared.deadline.store(0, Ordering::Release);

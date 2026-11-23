@@ -243,6 +243,11 @@ pub(crate) struct Counts {
     pub(crate) pulls_hot: AtomicU64,
     pub(crate) pulls_carrying: AtomicU64,
     pub(crate) pulls_again: AtomicU64,
+    /// Idle passes made; those that found no crowded processor to look at; and those that found
+    /// a thread of the processor's own ready.
+    pub(crate) passes: AtomicU64,
+    pub(crate) no_victim: AtomicU64,
+    pub(crate) own: AtomicU64,
     /// Looks under a victim's lock that took nothing, and looks given up because a queue lock
     /// was held.
     pub(crate) nothing: AtomicU64,
@@ -285,6 +290,9 @@ pub(crate) static COUNTS: Counts = Counts {
     pulls_hot: AtomicU64::new(0),
     pulls_carrying: AtomicU64::new(0),
     pulls_again: AtomicU64::new(0),
+    passes: AtomicU64::new(0),
+    no_victim: AtomicU64::new(0),
+    own: AtomicU64::new(0),
     nothing: AtomicU64::new(0),
     contended: AtomicU64::new(0),
     pinned: AtomicU64::new(0),
@@ -339,15 +347,18 @@ pub(crate) fn is_set_up() -> bool {
 }
 
 /// One line of every count since the boot began, report only: what a boot's reader needs to
-/// see why pulls were or were not made (the review's D98-6). `tsc_hz` turns the longest pass
-/// into nanoseconds.
+/// see why pulls were or were not made (the review's D98-6). Written after each pulled phase of
+/// the migration proofs. `tsc_hz` turns the longest pass into nanoseconds.
 pub(crate) fn report(com1: &mut Console, tsc_hz: u64) {
     let of = |counter: &AtomicU64| counter.load(Relaxed);
     let c = &COUNTS;
     let nanos = u128::from(of(&c.longest_pass)) * 1_000_000_000 / u128::from(tsc_hz.max(1));
     let _ = writeln!(
         com1,
-        "origin-kernel: balancing: counts since boot: pulls {} ({} cache-hot, {} carrying a pending wake-up, {} of a thread moved before); looks that took nothing {}, given up at a held queue lock {}; threads passed over: pinned {}, moved too recently {}, cache-hot {}, not published {}; moves refused {}, passes stopped {}; kicks {} at ticks, {} at reschedule upcalls, {} at wake-ups or spawns, not sent: {} over the rate, {} with nobody idle; asks {} sent, not sent: {} with the source asked already, {} over the rate; longest idle pass {nanos} ns",
+        "origin-kernel: balancing: counts since boot: idle passes {}, {} with no crowded processor to look at, {} with a thread of their own ready; pulls {} ({} cache-hot, {} carrying a pending wake-up, {} of a thread moved before); looks that took nothing {}, given up at a held queue lock {}; threads passed over: pinned {}, moved too recently {}, cache-hot {}, not published {}; moves refused {}, passes stopped {}; kicks {} at ticks, {} at reschedule upcalls, {} at wake-ups or spawns, not sent: {} over the rate, {} with nobody idle; asks {} sent, not sent: {} with the source asked already, {} over the rate; longest idle pass {nanos} ns",
+        of(&c.passes),
+        of(&c.no_victim),
+        of(&c.own),
         of(&c.pulls),
         of(&c.pulls_hot),
         of(&c.pulls_carrying),
@@ -462,6 +473,7 @@ fn pass(
     {
         return Passed::Halt;
     }
+    count(&COUNTS.passes, 1);
     let mut tried = [u32::MAX; TRIES];
     let (mut looked, mut first, mut cleared) = (0, true, false);
     while looked < TRIES {
@@ -484,6 +496,7 @@ fn pass(
                 cleared = true;
                 continue;
             }
+            count(&COUNTS.no_victim, u64::from(looked == 0));
             return Passed::Halt;
         };
         if let Some(slot) = tried.get_mut(looked) {
@@ -497,6 +510,7 @@ fn pass(
                 return Passed::Run;
             }
             Pull::Own => {
+                count(&COUNTS.own, 1);
                 own.leave_idle();
                 return Passed::Run;
             }
