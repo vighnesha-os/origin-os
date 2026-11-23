@@ -977,9 +977,10 @@ pub fn frame_published(cpu: CpuIndex, frame: u64) -> bool {
 /// before it tells an idle one that a thread waits).
 ///
 /// `here` is a witness that interrupts are off on this processor. **Only from thread context in
-/// an interrupts-off section, or from the scheduler's own upcalls** (the tick, the reschedule
-/// interrupt): either runs after the switch-out has left the stack the frame is on, since the
-/// trap entry that made the switch has returned and this is a later entry or the thread it
+/// an interrupts-off section, from the scheduler's own upcalls** (the tick, the reschedule
+/// interrupt), **or from the handler of a maskable interrupt** (a wake-up made from one): each
+/// runs after the switch-out has left the stack the frame is on, since a switch runs with
+/// interrupts off from its trap's entry to its return, so this is a later entry or the thread it
 /// resumed. Never from a handler that can interrupt a switch (an NMI, a machine check, a debug
 /// exception, a double fault), as [`stack_in_use`] and [`move_context`] say of the same call.
 ///

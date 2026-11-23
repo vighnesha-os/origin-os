@@ -611,8 +611,17 @@ impl Contexts {
     /// Only this processor's switch to the thread, another mover, or a withdrawal takes a frame,
     /// and each of those needs that lock or a thread that was never queued. A frame not yet
     /// published may become so at any moment, by this processor's next call into the table.
+    ///
+    /// The leaving record is read before the slots, as [`Self::lend`] reads them: a publication
+    /// stores the slot and only then clears the record, so between its two stores the frame is
+    /// in both, and `lend` would still answer `Leaving`. Read in this order, "published" means the
+    /// record did not hold the frame, and then `lend` finds it, but for one case: this processor
+    /// recorded the frame as leaving after that read and is between the two stores of its
+    /// publication when `lend` reads. `lend` then answers `Leaving`, and the mover tries later
+    /// (the reviews of TASKS item 98, R98-6 and D98-12).
     pub fn published(&self, frame: u64) -> bool {
         frame > BOOT_FLOW
+            && self.leaving.load(Acquire) != frame
             && self
                 .slots
                 .iter()
