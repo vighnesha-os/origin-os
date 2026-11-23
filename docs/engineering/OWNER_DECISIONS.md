@@ -1509,3 +1509,42 @@ TASKS item 98 (the idle pull and the idle kick, ADR-0020 S7 and S10) found, befo
 - **What stays open:** nothing of it is built or measured. TASKS item 98 builds it and counts the asks at boot, under QEMU only.
 - **Performance cost** (ADR-0018 V3): unmeasured, owed (CL62). On a busy processor: one interrupt taken, one publication and one IPI sent, at most once a tick, and only while an idle processor waits for one of its threads. Nothing on the switch path.
 - **Where it is written:** ADR-0020 Amendment 1; the matrix row A20-Am1, placed in M3; the cost ledger's row CL62; TASKS item 98, which builds it.
+
+### The progress page at the repository root, linked from the README (item 356): Accepted 2026-11-23
+
+On 2026-11-23 you proposed keeping `PROGRESS.md` in the repository root, updated whenever `main` changes, and linked from `README.md` for tracking progress. The coordinating session checked the tree and put two forms of it: link the page where it is, or link it and move it to the root. You answered "Link and move to root".
+
+| # | Question | Answer |
+|---|---|---|
+| 356, answered | Is the progress page linked from the README where it is, in `docs/`, or linked and moved to the repository root? | **Link and move to root** |
+
+- **What was found first:**
+  - The page is already current on `main` at every merge: `cargo xtask progress` generates it from the requirements matrix, and `cargo xtask check` refuses a pull request whose page is not the one its tree generates. So no bot or extra step commits to `main`, and none is added.
+  - `README.md` did not link the page, and its status line was stale: it said "There is no kernel yet".
+  - `CLAUDE.md` does not name the page, so the directive does not change.
+- **What it changes:**
+  - **Now, in this records pull request:** the README's status line is replaced by a link to the page, with no hand-written figures.
+  - **With the next code batch (TASKS item 137):** the page moves to `PROGRESS.md` at the root. The generator, its gate and its tests change the path they use, and the README's link and the references that name the page's place follow. It waits for a batch because it changes `xtask` (item 70).
+- **The alternative put** was the link alone, which was the recommendation: the other status pages stay under `docs/`, and it needs no code change.
+- **Performance cost** (ADR-0018 V3): none, by construction: documents and a host tool.
+- **Where it is written:** this sheet; the requirements README's table of items without rows; `README.md`; TASKS item 137's line.
+
+### The progress page made clean and clear (item 357): 2026-11-23
+
+On 2026-11-23 you wrote: "Can you make PROGRESS.MD clean and clear". That is item 357: your instruction, not an answer to a question. Earlier the same day you had found the page's "% done or built" column confusing, and found four separate percentages clear.
+
+| # | Question | Answer |
+|---|---|---|
+| 357, answered | How is the progress page laid out? | **Clean and clear: "Can you make PROGRESS.MD clean and clear" (your instruction, 2026-11-23)** |
+
+- **The layout the coordinating session set from it,** for TASKS item 137 to build with item 356's move:
+  - every table shows the four states as percentages that add up to 100%: done, built, in progress, not started;
+  - no column or sentence adds two states together, so "% done or built" goes;
+  - the page opens with one sentence, the overall table, and a short table of what each state means, in plain words;
+  - then the milestones and the feature areas;
+  - the long tables (each area's sections, the ADR decisions, the standing rules, the exact counts) sit in sections a reader opens;
+  - how the page is made comes last.
+- **What does not change:** the page is still generated and held by `cargo xtask check`; items 193 and 221 stand, so only done counts as complete; every figure is still a count of the matrix's rows.
+- **If you want the layout changed** once you see it, say so, and the generator is changed: nothing in it is a decision of yours except that it be clean and clear.
+- **Performance cost** (ADR-0018 V3): none, by construction: a generated document and a host tool.
+- **Where it is written:** this sheet; the requirements README's table of items without rows; TASKS item 137's line.
