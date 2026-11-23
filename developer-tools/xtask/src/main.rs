@@ -3903,9 +3903,11 @@ const PIT_PROOF_TICKS: u64 = 20;
 const PIT_ROUTED_HEAD: &str = "origin-kernel: I/O APIC: ";
 /// The I/O APIC proof's line after its count, which is that line's marker (TASKS item 135;
 /// ADR-0013 R1(b)). The kernel's proof passes on [`PIT_PROOF_TICKS`] interrupts or more
-/// (`taken >= PROOF_TICKS`) and prints the count it took, and one more can land before the entry
-/// is masked: the 65-processor machine under host load printed 21 on a boot that passed. So the
-/// count is no part of the marker, and [`pit_routed`] reads it.
+/// (`taken >= PROOF_TICKS`) and prints the count it took. Its loop reads the count before each
+/// interrupt window, and a window can take more than one interrupt, so the count can pass the
+/// bound: the 65-processor machine under host load printed 21, its proof passed, and the marker,
+/// which then held "20", failed the boot. So the count is no part of the marker, and
+/// [`pit_routed`] reads it.
 const PIT_ROUTED: &str = " PIT interrupts routed through the I/O APIC in ";
 
 /// The count on the I/O APIC proof's line in `text`, a boot's output: how many PIT interrupts the
@@ -3951,6 +3953,34 @@ fn pit_routed(text: &str) -> Result<u64> {
 fn counts_hold(text: &str, markers: &[&str]) -> Result {
     if markers.contains(&PIT_ROUTED) {
         pit_routed(text)?;
+    }
+    Ok(())
+}
+
+/// The verdict on a boot's serial output so far, or `None` while there is none (TASKS item 135;
+/// its review, R135-1: a function, so that a host test holds what `run_scenario` judges by):
+///
+/// - a failure message in `judged`, the output's complete lines less what the checker forgives,
+///   fails the boot;
+/// - otherwise, with every marker in `text` in order, the boot passes if the counts its markers
+///   leave out hold ([`counts_hold`]), and fails on the count if not.
+fn verdict_so_far(judged: &str, text: &str, failures: &[&str], markers: &[&str]) -> Option<Result> {
+    if let Some(m) = failures.iter().find(|m| judged.contains(**m)) {
+        return Some(Err(format!("the serial output contains {m:?}")));
+    }
+    serial::contains_in_order(text, markers).then(|| counts_hold(text, markers))
+}
+
+/// Whether a scenario read from the screen may hold `markers`: not one whose count is read from
+/// its line ([`PIT_ROUTED`]). [`pit_routed`] wants the kernel's whole line, and the screen gives
+/// rows, which wrap a line longer than the console is wide: a correct boot's line could be
+/// refused as malformed there. So such a scenario is refused before it boots, rather than its
+/// count left unread or misread (the review of TASKS item 135, R135-3). None holds one today.
+fn screen_can_hold(markers: &[&str]) -> Result {
+    if markers.contains(&PIT_ROUTED) {
+        return Err(format!(
+            "a scenario read from the screen holds the marker {PIT_ROUTED:?}, whose count is read from a whole line; the screen gives rows"
+        ));
     }
     Ok(())
 }
@@ -8057,11 +8087,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
             } else {
                 accel.judged(complete)
             };
-            if let Some(m) = scenario.failures.iter().find(|m| judged.contains(**m)) {
-                return Some(Err(format!("the serial output contains {m:?}")));
-            }
-            // Every marker, and then the counts the markers leave out (TASKS item 135).
-            serial::contains_in_order(&text, &markers).then(|| counts_hold(&text, &markers))
+            verdict_so_far(&judged, &text, &scenario.failures, &markers)
         };
         loop {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -8307,6 +8333,7 @@ fn wait_for_screen(
     failures: &[&'static str],
     deadline: Instant,
 ) -> Result {
+    screen_can_hold(markers)?;
     let mut rows = Vec::new();
     while Instant::now() < deadline {
         thread::sleep(Duration::from_millis(1500));
@@ -8318,7 +8345,7 @@ fn wait_for_screen(
             return Err(format!("the screen shows {m:?}"));
         }
         if serial::contains_in_order(&text, markers) {
-            return counts_hold(&text, markers);
+            return Ok(());
         }
     }
     Err(format!(
@@ -9098,8 +9125,9 @@ mod nvme_marker_tests {
 #[cfg(test)]
 mod pit_routed_tests {
     use super::{
-        PIT_PROOF_TICKS, PIT_ROUTED, Settings, boot_scenario_markers, counts_hold, machine,
-        no_pit_markers, pit_routed, repo_root, serial,
+        Capture, PIT_PROOF_TICKS, PIT_ROUTED, Settings, boot_scenario_markers, console_scenarios,
+        counts_hold, machine, no_pit_markers, pit_routed, repo_root, screen_can_hold, serial,
+        verdict_so_far,
     };
 
     /// The I/O APIC proof's line as the kernel prints it for `count` interrupts.
@@ -9222,10 +9250,96 @@ mod pit_routed_tests {
         assert!(counts_hold(boot, &[PIT_ROUTED]).is_err());
     }
 
-    /// `xtask`'s bound is the kernel's: `PROOF_TICKS` in `framekernel/src/irq.rs`, which is the
-    /// kernel binary's and not the library's, so its source line is read. The proof's condition
-    /// and its line are read with it: a count of the bound or more passes, and the count printed
-    /// is the count judged.
+    /// The review's R135-1: what `run_scenario` judges a boot by. A failure message fails the
+    /// boot at once, whatever the markers; a marker still missing gives no verdict; with every
+    /// marker there, a count the kernel takes passes and a lower one fails on the count, on a
+    /// line that says nothing of a failure.
+    #[test]
+    fn the_verdict_holds_the_count_once_every_marker_is_there() {
+        let routing = "origin-kernel: I/O APIC: id 0";
+        let markers = [routing, PIT_ROUTED, "origin-kernel: IOMMU: "];
+        let failures = [": I/O APIC failed", "origin-kernel: panic:"];
+        let boot = |count: &str, tail: &str| format!("{routing}\n{}\n{tail}", line(count));
+        // The last marker has not come: no verdict yet, whatever the count.
+        for count in ["19", "20", "21"] {
+            let so_far = boot(count, "");
+            assert_eq!(verdict_so_far(&so_far, &so_far, &failures, &markers), None);
+        }
+        let whole = |count: &str| boot(count, "origin-kernel: IOMMU: DMAR\n");
+        for count in ["20", "21", "4000"] {
+            let text = whole(count);
+            assert_eq!(
+                verdict_so_far(&text, &text, &failures, &markers),
+                Some(Ok(())),
+                "{count}"
+            );
+        }
+        let text = whole("19");
+        let refused = verdict_so_far(&text, &text, &failures, &markers);
+        assert!(
+            matches!(&refused, Some(Err(e)) if e.contains("gives 19 PIT interrupts, below the 20 ")),
+            "{refused:?}"
+        );
+        // The kernel's own failure comes first, before the markers are complete and after.
+        let failed = format!("{routing}\n{}: I/O APIC failed\n", line("19"));
+        assert_eq!(
+            verdict_so_far(&failed, &failed, &failures, &markers),
+            Some(Err(
+                "the serial output contains \": I/O APIC failed\"".to_string()
+            ))
+        );
+        let failed = format!("{}origin-kernel: panic: x\n", whole("21"));
+        assert!(matches!(
+            verdict_so_far(&failed, &failed, &failures, &markers),
+            Some(Err(e)) if e.contains("origin-kernel: panic:")
+        ));
+        // A failure only in the line not yet complete is not judged: `judged` leaves it out.
+        let text = whole("21");
+        assert_eq!(
+            verdict_so_far(
+                &text,
+                &format!("{text}origin-kernel: panic:"),
+                &failures,
+                &markers
+            ),
+            Some(Ok(()))
+        );
+        // A scenario without the counted marker is held to no count.
+        let plain = [routing, "origin-kernel: IOMMU: "];
+        let text = whole("19");
+        assert_eq!(
+            verdict_so_far(&text, &text, &failures, &plain),
+            Some(Ok(()))
+        );
+    }
+
+    /// The review's R135-3: the count is read from a whole line, and the screen gives rows, so a
+    /// scenario read from the screen that held the counted marker is refused before it boots.
+    /// None of the console's scenarios holds it.
+    #[test]
+    fn a_scenario_read_from_the_screen_holds_no_counted_marker() {
+        assert!(screen_can_hold(&[PIT_ROUTED]).is_err());
+        assert!(screen_can_hold(&["origin-kernel: I/O APIC: id 0", PIT_ROUTED]).is_err());
+        assert_eq!(
+            screen_can_hold(&["origin-kernel: sysfs: built /sys with 4 facts"]),
+            Ok(())
+        );
+        assert_eq!(screen_can_hold(&[]), Ok(()));
+        let mut on_screen = 0;
+        for scenario in console_scenarios() {
+            if scenario.capture == Capture::Screen {
+                on_screen += 1;
+                let markers: Vec<&str> = scenario.markers.iter().map(String::as_str).collect();
+                assert_eq!(screen_can_hold(&markers), Ok(()), "{}", scenario.label);
+            }
+        }
+        assert!(on_screen >= 2, "{on_screen}");
+    }
+
+    /// `xtask`'s bound is the kernel's: `PROOF_TICKS` in `framekernel/src/irq.rs`, a private
+    /// constant of a module compiled only for the kernel's target, which a host test cannot name,
+    /// so its source line is read. The proof's condition and its line's format are read with it,
+    /// as text: a count of the bound or more passes, and the count printed is the count judged.
     #[test]
     fn the_bound_is_the_kernels_own() {
         let path = repo_root().join("framekernel/src/irq.rs");

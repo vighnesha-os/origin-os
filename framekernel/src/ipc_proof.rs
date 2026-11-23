@@ -518,6 +518,13 @@ fn await_end(process: &Process, tsc_hz: u64, seconds: u64) -> bool {
 /// another processor makes it ready and sends the IPI on every schedule
 /// (`sched::user_thread_blocked`): nothing else wakes a thread whose wait has no deadline and
 /// whose object no one else signals, and a thread not declared movable stays on its processor.
+///
+/// **For a process with one thread, whose first call is the wait** (the review of TASKS item
+/// 134, R134-1). The two reads are of different things: the count is the process's, of its
+/// threads in `wait_one` or in a port's wait, and the look is at this thread, blocked anywhere.
+/// With one thread and one wait they name the same wait. In a process with a second thread, one
+/// could be counted and not yet blocked while the other, the one named, is blocked elsewhere,
+/// and this would answer true in the very stretch it exists to close.
 fn blocked_in_wait(
     process: &Process,
     thread: &ObjectRef<ThreadObject>,
