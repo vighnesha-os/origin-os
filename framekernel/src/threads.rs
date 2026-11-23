@@ -315,8 +315,11 @@ pub(crate) fn give_back(number: u32) {
 /// reap there is half done: a spawn takes its record and queues the thread under the queue's lock,
 /// an exit lists its zombie or gives its record back under both, and a reap takes a zombie off
 /// the list and gives its record back under the table's. The processors are read one after
-/// another, so a move during the reading could count its thread twice or not at all: a settle
-/// runs on the boot flow, which is the only mover, so none is under way then.
+/// another, so a move during the reading could count its thread twice or not at all. A settle
+/// runs on the boot flow, the only caller of `sched::migrate`, so no directed move is under way
+/// then. An idle pull (TASKS item 98) could be: it takes only a thread declared for balancing,
+/// and every proof that spawns such threads waits for them all to end before it settles, so no
+/// thread a pull may take exists while a settle reads.
 pub(crate) fn unaccounted() -> u64 {
     let (mut held, mut threads) = (0u64, 0u64);
     for (cpu, processor) in THREADS.iter().enumerate() {

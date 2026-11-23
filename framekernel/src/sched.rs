@@ -35,6 +35,7 @@ use origin_frame::objref::ObjectRef;
 use origin_frame::percpu::PerCpu;
 use origin_frame::stack::{FpuArea, GuardedStack, StackSlot, State as SlotState, ThreadStart};
 use origin_frame::sync::SpinLock;
+use origin_frame::sync::balance::Element;
 use origin_frame::sync::exits::{Exits, Pending};
 use origin_frame::sync::threads::{Empty, Location, Met, Outcome, Queues, Record};
 use origin_frame::trap::{MintHolder, Pinned, Switch};
@@ -61,8 +62,15 @@ pub(crate) static ACTIVE: PerCpu<AtomicBool> =
     PerCpu::new("framekernel::sched::ACTIVE", AtomicBool::new(false), || {
         AtomicBool::new(false)
     });
+/// What each processor publishes for load balancing (`origin_sync::balance`; ADR-0020 S7, TASKS
+/// item 98): whether its idle flow is idle, and its queue's last census. One cache line a
+/// processor. [`pull`] writes and reads it.
+pub(crate) static BALANCE: PerCpu<Element> =
+    PerCpu::new("framekernel::sched::BALANCE", Element::new(), Element::new);
 /// Set by the boot processor once every AP's threads are queued.
 static GO: AtomicBool = AtomicBool::new(false);
+
+pub(crate) mod pull;
 
 use crate::cpu::{without_interrupts, without_interrupts_here};
 
@@ -168,7 +176,8 @@ pub(crate) fn on_tick(interrupted: u64, switch: &Switch) -> u64 {
         if q.watching() {
             q.note_tick(rdtsc(), move || timer_read_back(here));
         }
-        Some(q.tick(interrupted))
+        // The queue's step, and what balancing does at a tick (TASKS item 98).
+        Some(pull::tick(q, interrupted, here))
     })
 }
 
@@ -747,8 +756,9 @@ pub(crate) fn on_block(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
 /// switches only if a thread that was woken should run now
 /// ([`RunQueue::preempt_for_wake`]), and otherwise resumes what the interrupt interrupted.
 pub(crate) fn on_reschedule(interrupted: u64, switch: &Switch) -> u64 {
-    with_queue(interrupted, switch, |q, _| {
-        Some(q.preempt_for_wake(interrupted))
+    // `preempt_for_wake`, and what balancing does at this upcall (TASKS item 98).
+    with_queue(interrupted, switch, |q, here| {
+        Some(pull::rescheduled(q, interrupted, here))
     })
 }
 
@@ -1120,7 +1130,16 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
             followed(record, thread.generation, woke.retries, here, true);
         }
         match woke.outcome {
-            Outcome::Reached { ready: true, cpu } => ipi_if_elsewhere(cpu, here),
+            Outcome::Reached { ready: true, cpu } => {
+                let sent = ipi_if_elsewhere(cpu, here);
+                // The idle kick (ADR-0020 S7.2; TASKS item 98): a thread balancing may take,
+                // made ready here beside what this processor runs. Only the declaration is read
+                // on this path; the rest is out of line and looks again under the queue's lock.
+                if !sent && record.balanced() {
+                    pull::made_ready_here(cpu, here);
+                }
+                sent
+            }
             Outcome::Reached { ready: false, .. }
             | Outcome::Stale
             | Outcome::Gone
@@ -1465,14 +1484,11 @@ fn move_once(
     online: &crate::smp::Online,
     owed: &mut Option<(pinned::Trigger, CpuIndex)>,
 ) -> Result<Moved, Unmoved> {
-    use origin_frame::sync::contexts::{AdoptRefused, LendRefused, MoveRefused};
-
     let me = cpu::this_cpu(off.here()).index();
     let mut enter = |trigger| {
         if pinned::enter(trigger) {
             *owed = Some((trigger, me));
         }
-        Err(Unmoved::Inconsistent)
     };
     let at = record.location().ok_or(Unmoved::Gone)?;
     let from = usize::try_from(at.cpu())
@@ -1482,7 +1498,6 @@ fn move_once(
     if from == to {
         return Err(Unmoved::AlreadyThere);
     }
-    let to_index = u32::try_from(to.get()).map_err(|_| Unmoved::Gone)?;
     let (source_queue, destination_queue) = (
         QUEUES.get(from.get()).ok_or(Unmoved::Gone)?,
         QUEUES.get(to.get()).ok_or(Unmoved::Gone)?,
@@ -1512,7 +1527,8 @@ fn move_once(
     let slot = usize::from(at.slot());
     // (a) The slot holds this thread: otherwise S20's trigger 3.
     if source.record(slot).map(Placed::number) != Some(thread.record) {
-        return enter(pinned::Trigger::Misplaced);
+        enter(pinned::Trigger::Misplaced);
+        return Err(Unmoved::Inconsistent);
     }
     // (b) Ready and not running (R95-5): its frame, which the source's scheduler cannot have named.
     let Some(frame) = source.frame(slot) else {
@@ -1530,8 +1546,43 @@ fn move_once(
     if !destination.has_room() {
         return Err(Unmoved::QueueFull);
     }
-    let moved = cpu::move_context(off, from, to, frame, &mut |_home| {
-        // Under both queue locks and the gate: nothing has changed since the checks above.
+    let moved = carry(off, record, slot, frame, (from, source), (to, destination));
+    drop((low, high));
+    let ticks = rdtsc().saturating_sub(start);
+    moved_or_why(moved, enter).map(|carried_wake| Moved {
+        from,
+        carried_wake,
+        ticks,
+    })
+}
+
+/// The move itself (ADR-0020 S6), for [`migrate`] and for the idle pull ([`pull`]; TASKS item 98):
+/// under the move gate (`cpu::move_context`), the frame is lent from the source's table of
+/// contexts and adopted by the destination's, the thread departs its source queue with its lag and
+/// pending wake-up, arrives at the destination's, and its record's location follows; then the
+/// source forgets the home.
+///
+/// **What the caller holds and has checked:** both queues' locks, taken in index order, with
+/// interrupts off (`off`); the thread in `slot` of the source ready and not running, `frame` its
+/// saved frame and `record` its record; that it may move; both processors taking part in moves;
+/// and a free slot in the destination's queue. Under the gate this takes no lock and drops no
+/// stack.
+///
+/// The answer is `cpu::move_context`'s, for [`moved_or_why`]; a successful move's `bool` is
+/// whether the thread carried a pending wake-up.
+fn carry(
+    off: origin_frame::trap::InterruptsOff<'_>,
+    record: &'static Record<threads::State>,
+    slot: usize,
+    frame: u64,
+    (from, source): (CpuIndex, &mut RunQueue<Placed>),
+    (to, destination): (CpuIndex, &mut RunQueue<Placed>),
+) -> Option<Result<(u64, bool), origin_frame::sync::contexts::MoveRefused>> {
+    // A processor index past a location's 32 bits has no location to move to: answered as a
+    // processor with no table is.
+    let to_index = u32::try_from(to.get()).ok()?;
+    cpu::move_context(off, from, to, frame, &mut |_home| {
+        // Under both queue locks and the gate: nothing has changed since the caller's checks.
         let Some(departed) = source.depart(slot) else {
             panic!("a thread checked ready under its queue's lock could not depart");
         };
@@ -1544,15 +1595,20 @@ fn move_once(
         };
         record.set_location(Location::new(to_index, arrived));
         carried
-    });
-    drop((low, high));
-    let ticks = rdtsc().saturating_sub(start);
+    })
+}
+
+/// What [`carry`]'s answer means, after the queue locks are released: whether the thread carried
+/// a pending wake-up, or why nothing moved. An inconsistency (ADR-0020 S20, trigger 2) is given
+/// to `enter`, which enters pinned mode and keeps the line its caller owes.
+fn moved_or_why(
+    moved: Option<Result<(u64, bool), origin_frame::sync::contexts::MoveRefused>>,
+    enter: impl FnOnce(pinned::Trigger),
+) -> Result<bool, Unmoved> {
+    use origin_frame::sync::contexts::{AdoptRefused, LendRefused, MoveRefused};
+
     match moved {
-        Some(Ok((_, carried_wake))) => Ok(Moved {
-            from,
-            carried_wake,
-            ticks,
-        }),
+        Some(Ok((_, carried_wake))) => Ok(carried_wake),
         Some(Err(MoveRefused::Lend(LendRefused::NotYet | LendRefused::Leaving))) => {
             Err(Unmoved::TryLater)
         }
@@ -1566,7 +1622,10 @@ fn move_once(
             MoveRefused::Lend(LendRefused::NotHere | LendRefused::BootFlow)
             | MoveRefused::Adopt(AdoptRefused::SameTable),
         ))
-        | None => enter(pinned::Trigger::LendLost),
+        | None => {
+            enter(pinned::Trigger::LendLost);
+            Err(Unmoved::Inconsistent)
+        }
         // The ruling's Q7: the frame is in no table, and two processors could have run it.
         Some(Err(MoveRefused::NotRestored)) => {
             panic!("a lent frame could not be put back in its source's table")
@@ -1722,10 +1781,51 @@ pub(crate) fn spawn_movable(
         ThreadStart::Kernel { entry, arg },
         crate::runqueue::DEFAULT_WEIGHT,
         None,
-        true,
+        Declared::Movable,
         FpuArea::new,
         GuardedStack::publish_first_frame,
     )
+}
+
+/// As [`spawn_movable`], declaring the thread one that balancing may take (ADR-0020 S7; TASKS
+/// item 98, the coordinating session's ruling Q10): an idle processor may pull it, and the
+/// processor that holds it kicks one when it waits ([`pull`]). In TASKS item 98 only the proofs'
+/// own threads are; TASKS item 100's affinity replaces both declarations.
+///
+/// Spawned onto the spawner's own processor, it may wait there at once, so that processor looks
+/// for an idle one to kick (k4).
+#[expect(
+    dead_code,
+    reason = "its first callers are TASKS item 98's proofs, written after its diagnostic round"
+)]
+pub(crate) fn spawn_balanced(
+    cpu: CpuIndex,
+    entry: extern "sysv64" fn(u64) -> !,
+    arg: u64,
+) -> Result<usize, QueueError> {
+    let slot = spawn_with_parts(
+        cpu,
+        ThreadStart::Kernel { entry, arg },
+        crate::runqueue::DEFAULT_WEIGHT,
+        None,
+        Declared::Balanced,
+        FpuArea::new,
+        GuardedStack::publish_first_frame,
+    )?;
+    if let Ok(index) = u32::try_from(cpu.get()) {
+        without_interrupts_here(|here| pull::made_ready_here(index, here));
+    }
+    Ok(slot)
+}
+
+/// What a spawner declares of its thread (ADR-0020 S2 and S7): pinned to its processor, as every
+/// thread is unless declared otherwise; movable, by a directed move alone (TASKS item 96); or one
+/// that balancing may take, and so movable too (TASKS item 98).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Declared {
+    Pinned,
+    Movable,
+    Balanced,
 }
 
 /// As [`spawn`], with a scheduling weight (stride scheduling: the thread's share of its
@@ -1750,7 +1850,7 @@ fn spawn_with(
         start,
         weight,
         user,
-        false,
+        Declared::Pinned,
         FpuArea::new,
         GuardedStack::publish_first_frame,
     )
@@ -1781,7 +1881,7 @@ fn spawn_with_parts(
     start: ThreadStart,
     weight: u32,
     user: Option<ObjectRef<UserContext>>,
-    movable: bool,
+    declared: Declared,
     fpu_area: impl FnOnce() -> Option<FpuArea>,
     publish: impl FnOnce(&mut GuardedStack, CpuIndex) -> bool,
 ) -> Result<usize, QueueError> {
@@ -1807,8 +1907,10 @@ fn spawn_with_parts(
         // Resolved once, here, for the slot to hold (`threads::Placed`).
         let placed = threads::take(cpu).ok_or(QueueError::Full)?;
         // Before the push, while no thread runs on the record (`origin_sync::threads`, "Movable").
-        if movable {
-            placed.record().set_movable();
+        match declared {
+            Declared::Pinned => {}
+            Declared::Movable => placed.record().set_movable(),
+            Declared::Balanced => placed.record().set_balanced(),
         }
         let slot = match queue.push_weighted(frame_at, weight, Some(placed)) {
             Ok(slot) => slot,
@@ -1817,6 +1919,10 @@ fn spawn_with_parts(
                 return Err(refused);
             }
         };
+        // The queue's own copy of the declaration, which a move carries (TASKS item 98).
+        if declared == Declared::Balanced {
+            queue.set_balanced(slot);
+        }
         let record = placed.record();
         // A slot fits a location (`threads`'s assertion): neither `if` below can fail (the review
         // of TASKS item 92, R92-5).
@@ -1876,9 +1982,10 @@ pub(crate) fn run_ap(flow: Pinned<'static>, lapic: &X2Apic) -> ! {
     timer::start_periodic(lapic);
     loop {
         reap_with(flow);
-        // Halting with interrupts on just waits for the next timer tick, which may switch to
-        // a thread.
-        cpu::idle();
+        // The idle pull (ADR-0020 S7.1; TASKS item 98), then the halt: with interrupts on again
+        // the next timer tick or reschedule interrupt may switch to a thread, and when this flow
+        // next runs it reaps, and looks for a thread to pull, before it halts again.
+        pull::idle(flow);
     }
 }
 
@@ -2502,7 +2609,7 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         quitting(),
         crate::runqueue::DEFAULT_WEIGHT,
         None,
-        false,
+        Declared::Pinned,
         || None,
         GuardedStack::publish_first_frame,
     );
@@ -2514,7 +2621,7 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         quitting(),
         crate::runqueue::DEFAULT_WEIGHT,
         None,
-        false,
+        Declared::Pinned,
         FpuArea::new,
         |stack, _| {
             unpublished_slot.set(Some(stack.slot()));
@@ -2540,7 +2647,7 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         quitting(),
         crate::runqueue::DEFAULT_WEIGHT,
         None,
-        false,
+        Declared::Pinned,
         FpuArea::new,
         |stack, cpu| {
             full_slot.set(Some(stack.slot()));
@@ -2835,6 +2942,9 @@ pub(crate) fn prove(
     proofs: &mut Tally,
 ) {
     let cpus = online.cpus();
+    // Balancing is set up before any count is taken: what it allocates is kept for good (TASKS
+    // item 98). No thread that balancing may take exists yet.
+    pull::set_up(com1, online, tsc_hz);
     // Give every online processor's boot/idle context an FPU area before the baseline is
     // measured, so the first switch on it can save its state and the leak check is fair.
     for &id in cpus {
