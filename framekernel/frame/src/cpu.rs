@@ -29,7 +29,9 @@ use crate::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
     TSS, TSS_SIZE,
 };
-use origin_sync::contexts::{BOOT_FLOW, Contexts, Moves, Quiet, Refused, Switched};
+use origin_sync::contexts::{
+    BOOT_FLOW, Contexts, MoveRefused, MoveWitness, Moves, Quiet, Refused, Switched,
+};
 
 use crate::percpu::PerCpu;
 use crate::trap::Switch;
@@ -203,7 +205,7 @@ pub unsafe fn init() {
     for (vector, (gate, stub)) in idt.0.iter_mut().zip(STUBS.iter()).enumerate() {
         *gate = d::interrupt_gate(*stub as usize as u64, KERNEL_CODE, ist_of(vector as u64));
     }
-    let interrupts: [(u8, extern "sysv64" fn()); 12] = [
+    let interrupts: [(u8, extern "sysv64" fn()); 13] = [
         (TIMER_VECTOR, timer_stub),
         (SPURIOUS_VECTOR, spurious_stub),
         (YIELD_VECTOR, yield_stub),
@@ -216,6 +218,7 @@ pub unsafe fn init() {
         (NET_VECTOR, net_stub),
         (NET_TX_VECTOR, net_tx_stub),
         (IOAPIC_VECTOR, ioapic_stub),
+        (THERMAL_VECTOR, thermal_stub),
     ];
     for (vector, stub) in interrupts {
         if let Some(gate) = idt.0.get_mut(usize::from(vector)) {
@@ -833,14 +836,13 @@ const fn ist_of(vector: u64) -> u8 {
 /// addition (d)). A frame elsewhere was pushed onto another stack, perhaps over a suspended
 /// context's frame: the processor halts, as the trap entry does for a frame it never saved.
 ///
-/// `at` is the trap entry's witness, under which the index is read (ADR-0020 S3; TASKS item 93).
-/// The count's plain load and store rest on more than any `Here` says: that interrupts are off.
-/// A `Here` from [`crate::trap::Pinned::here`] holds with interrupts on, and an interrupt between
-/// the load and the store would lose its own count (review finding R93-10). So this stays
-/// private, and [`dispatch`], which runs with interrupts off, is its one caller; an interrupts-off
-/// token of its own is TASKS item 96's (R95-12).
-fn check_landing(at: crate::trap::Here<'_>, here: u64, vector: u64) {
-    let me = this_cpu(at);
+/// `off` is the trap entry's token that interrupts are off, under which the index is read
+/// (ADR-0020 S3; TASKS items 93 and 96). The count's plain load and store rest on it: a `Here`
+/// alone would not do, since one from [`crate::trap::Pinned::here`] holds with interrupts on, and
+/// an interrupt between the load and the store would lose its own count (review finding R93-10,
+/// closed by TASKS item 96). [`dispatch`] is its one caller.
+fn check_landing(off: crate::trap::InterruptsOff<'_>, here: u64, vector: u64) {
+    let me = this_cpu(off.here());
     let home = CONTEXTS.this(me).and_then(Contexts::running_home);
     if !home.is_some_and(|home| crate::stack::same_slot(home, here)) {
         panic!(
@@ -894,18 +896,106 @@ pub(crate) static CONTEXTS: PerCpu<Contexts> = PerCpu::new(
 /// The machine's move sequence (ADR-0020 S4; `origin_sync::contexts`, "Moves between
 /// processors"): the move gate and the begun and finished counters. A move of a context between
 /// two processors' tables of contexts holds the gate, and every scan of all the tables goes
-/// through [`Moves::scan`], so that a move cannot hide a home from it. Nothing moves a context
-/// yet: TASKS item 96 makes the first move.
-pub(crate) static MOVES: Moves = Moves::new();
+/// through [`Moves::scan`], so that a move cannot hide a home from it. Its `begin` takes the
+/// interrupts-off token ([`KernelOff`]), and [`move_context`] is the one function that begins a
+/// move (TASKS item 96; a host test in `trap` holds it).
+pub(crate) static MOVES: Moves<KernelOff> = Moves::new();
+
+/// The kernel's witness for [`MOVES`]' `begin` (TASKS item 96, the coordinating session's ruling
+/// Q1): [`crate::trap::InterruptsOff`], which only an interrupts-off section and the trap entry
+/// make.
+pub(crate) struct KernelOff;
+
+impl MoveWitness for KernelOff {
+    type Off<'a> = crate::trap::InterruptsOff<'a>;
+}
+
+/// Moves the context suspended at `frame` from processor `from`'s table of contexts to `to`'s,
+/// with `between` run under the move gate between the adoption and the source's forget
+/// (`Moves::relocate`, which says what the caller must hold: both run-queue locks, the thread
+/// ready and not current in `from`'s queue, a free slot in `to`'s). `off` is the token that
+/// interrupts are off. The kernel's one entry to a move (TASKS item 96, the coordinating
+/// session's ruling Q1): `MOVES` and `CONTEXTS` are private to this crate.
+///
+/// The source's `lend` is given [`crate::stack::same_slot`] as its same-stack check, so a frame
+/// its processor still runs on is refused as `NotYet`, not taken for a lost one (ADR-0020 S5's
+/// dated note; the ruling's Q2). The caller cannot pass another.
+///
+/// If `from` is the processor the mover runs on, its own leaving frame is published first (the
+/// contract's §1.1, step 6): the mover runs on its own stack, so this processor has left the stack
+/// of the context it last switched out, and a thread switched out here just before the mover ran
+/// is lendable at once, as `stack_in_use` publishes it.
+///
+/// `between` answers what the caller passes back (in the kernel, whether the thread carried a
+/// pending wake-up). It is a `dyn` closure, and this function is neither generic nor inlined, so
+/// that its body, and the statics it names, stay in this crate: a public generic function would
+/// export `CONTEXTS` and `MOVES`, and the position-independent kernel would then reach them
+/// through the GOT everywhere, `resume` and `dispatch` included (step 3's static counts of TASKS
+/// item 96). The indirect call is the mover's, under the gate, off every hot path.
+///
+/// `None` if either processor has no table; a refusal otherwise says why nothing moved.
+#[inline(never)]
+pub fn move_context(
+    off: crate::trap::InterruptsOff<'_>,
+    from: CpuIndex,
+    to: CpuIndex,
+    frame: u64,
+    between: &mut dyn FnMut(u64) -> bool,
+) -> Option<Result<(u64, bool), MoveRefused>> {
+    let source = CONTEXTS.get(from.get())?;
+    let destination = CONTEXTS.get(to.get())?;
+    if this_cpu(off.here()).index() == from {
+        source.publish_leaving();
+    }
+    Some(MOVES.relocate(
+        off,
+        source,
+        destination,
+        frame,
+        crate::stack::same_slot,
+        between,
+    ))
+}
 
 /// What a scan's pass under the move gate runs in: interrupts off on this processor, since a
 /// mover holds the gate with interrupts off and may be this processor's own interrupt handler.
+/// It also counts those passes and keeps the longest, wait for the gate and pass together, in TSC
+/// ticks (the review of TASKS item 95, R95-10 and D95-8; CL48's owed cells, which TASKS item 96's
+/// integrity proof reports). Only a scan whose fast passes all overlapped a move gets here.
 struct Quietly;
+
+/// Scans that made their pass under the move gate.
+static GATED_SCANS: AtomicU64 = AtomicU64::new(0);
+/// The longest of them, its wait for the gate included, in TSC ticks.
+static GATED_LONGEST: AtomicU64 = AtomicU64::new(0);
 
 impl Quiet for Quietly {
     fn quietly<R>(&self, f: impl FnOnce() -> R) -> R {
-        without_interrupts(f)
+        let start = rdtsc();
+        let result = without_interrupts(f);
+        note_gated(rdtsc().saturating_sub(start));
+        result
     }
+}
+
+/// Counts one gated pass that took `took` TSC ticks. Not generic and not inlined: `quietly` is
+/// generic, and a static it named directly would be exported and reached through the GOT
+/// (`contexts_cover`'s count in TASKS item 96's recount turn).
+#[inline(never)]
+fn note_gated(took: u64) {
+    GATED_SCANS.fetch_add(1, Ordering::Relaxed);
+    GATED_LONGEST.fetch_max(took, Ordering::Relaxed);
+}
+
+/// How many scans made their pass under the move gate, and the longest of them in TSC ticks, its
+/// wait for the gate included, since the boot began (CL48). Not inlined across crates, so that the
+/// two statics it reads stay internal to this one (as `move_context`'s do).
+#[inline(never)]
+pub fn gated_scans() -> (u64, u64) {
+    (
+        GATED_SCANS.load(Ordering::Relaxed),
+        GATED_LONGEST.load(Ordering::Relaxed),
+    )
 }
 
 /// Records a new thread on processor `cpu`, whose first frame is `frame`, on its own stack: the
@@ -1072,6 +1162,9 @@ pub const IOAPIC_VECTOR: u8 = 0x41;
 pub const NET_VECTOR: u8 = 0x42;
 /// The virtio-net NIC's transmit-completion interrupt (an MSI-X message).
 pub const NET_TX_VECTOR: u8 = 0x43;
+/// The thermal LVT's interrupt: the HFI's notifications, core thermal transitions and HWP's
+/// (`crate::hfi`; TASKS item 106).
+pub const THERMAL_VECTOR: u8 = 0x44;
 
 /// The vector in a system call's frame (no gate has it: `syscall` builds the frame itself,
 /// and `int 0x80` from ring 3 faults).
@@ -1250,7 +1343,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     let here = ptr::from_mut(frame).addr() as u64;
     // An entry from ring 3 must have landed on the running context's own stack (TASKS item 77).
     if frame.cs & 3 == 3 && ist_of(frame.vector) == 0 {
-        check_landing(Switch::new().here(), here, frame.vector);
+        check_landing(Switch::new().interrupts_off(), here, frame.vector);
     }
     // A program can set RFLAGS.AC; the entry path must have cleared it for the kernel.
     if frame.cs & 3 == 3 && SMAP_ON.load(Ordering::Relaxed) && read_rflags() & RFLAGS_AC != 0 {
@@ -1445,6 +1538,16 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             frame.rip = (probe_recover as *const ()).addr() as u64;
             return here;
         }
+    }
+    // A #GP at the instruction an MSR probe armed (TASKS item 106; the coordinating session's
+    // ruling Q4), recovered by `recover_msr_probe`, cold and out of line, which tests the vector
+    // itself, on the fatal and #BP tail alone. A guard comparing the vector here would join the
+    // compiler's chain of compares and move the blocks above. Measured path by path against the
+    // base, no listed path runs more instructions but the exit software interrupt's, by one jump,
+    // once in a thread's life (ADR-0018 V1; the coordinating session's ruling of 2026-11-22; TASKS
+    // item 106's entry).
+    if recover_msr_probe(frame, Switch::new().here()) {
+        return here;
     }
     // A report must get out even if this processor faulted inside the console (the hook,
     // `console::report_exception`, uses the console's urgent path). Only #BP resumes.
@@ -1856,6 +1959,13 @@ pub fn without_interrupts_here<T>(f: impl for<'a> FnOnce(crate::trap::Here<'a>) 
     crate::trap::section(f)
 }
 
+/// [`without_interrupts`], with the section's token that interrupts are off (TASKS item 96, the
+/// coordinating session's ruling Q1): `trap::section_off`, which makes the token, as its
+/// documentation says. Its rules are [`without_interrupts_here`]'s.
+pub fn without_interrupts_off<T>(f: impl for<'a> FnOnce(crate::trap::InterruptsOff<'a>) -> T) -> T {
+    crate::trap::section_off(f)
+}
+
 /// This processor's CPU index, read under a witness that the reader cannot leave the processor
 /// (ADR-0020 S3; TASKS item 93), and branded with the witness's life ([`ThisCpu`]). It is the only
 /// way to read the index: a call without a witness does not build.
@@ -2243,6 +2353,69 @@ pub fn probe_execute_data() -> (u64, Probe) {
     // SAFETY: `PROBE_CODE` holds `mov rax, -1; ret`, so the jump either faults or runs it.
     let probe = unsafe { probe_execute(target) };
     (target, probe)
+}
+
+/// Reads model-specific register `msr` through a probe: `None` if RDMSR raised #GP, as it does for
+/// a register the processor does not implement, or one a hypervisor does not emulate although
+/// CPUID claims it (TASKS item 106; the coordinating session's ruling Q4).
+///
+/// # Safety
+///
+/// CPL 0, and reading `msr`, where it exists, has no side effect the caller does not intend.
+pub unsafe fn probe_rdmsr(msr: u32) -> Option<u64> {
+    let mut value = 0u64;
+    let out = &raw mut value;
+    // SAFETY: the caller's contract. `read_msr` raises #GP at its first instruction, RDMSR, which
+    // `dispatch` recovers from for an armed MSR probe, or stores the register in `value` through
+    // `out`, a live local, and returns.
+    let probe = run_probe((read_msr as *const ()).addr() as u64, || unsafe {
+        read_msr(out, 0, 0, u64::from(msr))
+    });
+    (probe == Probe::Completed).then_some(value)
+}
+
+/// Writes `value` to model-specific register `msr` through a probe: `false` if WRMSR raised #GP,
+/// as it does for a register the processor does not implement or a value it refuses (TASKS item
+/// 106).
+///
+/// # Safety
+///
+/// CPL 0, and the write's effect, where it is taken, is one the caller intends and keeps
+/// memory-safe.
+pub unsafe fn probe_wrmsr(msr: u32, value: u64) -> bool {
+    // SAFETY: the caller's contract. `write_msr` raises #GP at WRMSR, [`WRMSR_AT`] bytes in, which
+    // `dispatch` recovers from for an armed MSR probe, or writes the register and returns.
+    let probe = run_probe(
+        (write_msr as *const ()).addr() as u64 + WRMSR_AT,
+        || unsafe { write_msr(value & 0xFFFF_FFFF, 0, value >> 32, u64::from(msr)) },
+    );
+    probe == Probe::Completed
+}
+
+/// `dispatch`'s #GP branch (TASKS item 106): a #GP (vector 13) at the instruction an armed MSR probe
+/// expects, RDMSR or WRMSR on a register that does not exist, resumes at `probe_recover`, which
+/// returns the error code to the probe's caller. Only at an MSR probe's instruction, so no other
+/// probe and no other #GP changes; the address is compared first, so no other #GP reads CPU-local
+/// data through GS (the review's R106-6). `here` is the trap entry's witness, which the CPU-local
+/// area is read under. Cold and out of line, on `dispatch`'s fatal and #BP tail.
+#[cold]
+#[inline(never)]
+fn recover_msr_probe(frame: &mut ExceptionFrame, here: crate::trap::Here<'_>) -> bool {
+    if frame.vector != 13
+        || !is_msr_probe(frame.rip)
+        || local(here).probe_rip.load(Ordering::SeqCst) != frame.rip
+    {
+        return false;
+    }
+    frame.rax = frame.error_code;
+    frame.rip = (probe_recover as *const ()).addr() as u64;
+    true
+}
+
+/// Whether `rip` is an MSR probe's instruction: the only probes `dispatch` recovers a #GP for.
+fn is_msr_probe(rip: u64) -> bool {
+    rip == (read_msr as *const ()).addr() as u64
+        || rip == (write_msr as *const ()).addr() as u64 + WRMSR_AT
 }
 
 /// Whether SMAP is enabled (so user accesses need `stac`/`clac`).
@@ -2789,6 +2962,39 @@ unsafe extern "sysv64" fn write_byte(_addr: u64, _value: u8) -> u64 {
     naked_asm!("mov byte ptr [rdi], sil", "mov rax, -1", "ret", "int3");
 }
 
+/// RDMSR of the register in ECX (the fourth argument) as the first instruction, so a #GP has RIP =
+/// `read_msr`; the value goes to `out` (the first), and the return is [`COMPLETED`].
+#[unsafe(naked)]
+unsafe extern "sysv64" fn read_msr(_out: *mut u64, _: u64, _: u64, _msr: u64) -> u64 {
+    naked_asm!(
+        "rdmsr",
+        "mov dword ptr [rdi], eax",
+        "mov dword ptr [rdi + 4], edx",
+        "mov rax, -1",
+        "ret",
+        "int3"
+    );
+}
+
+/// Where WRMSR is in [`write_msr`]: after `mov eax, edi`, spelled as its two bytes so that the
+/// offset does not rest on how an assembler encodes it.
+const WRMSR_AT: u64 = 2;
+
+/// WRMSR of EDX:EAX to the register in ECX: the low half is the first argument, moved to EAX by the
+/// first instruction ([`WRMSR_AT`] bytes), the high half the third (RDX), the register the fourth
+/// (RCX). So a #GP has RIP = `write_msr` + [`WRMSR_AT`], and the return is [`COMPLETED`].
+#[unsafe(naked)]
+unsafe extern "sysv64" fn write_msr(_low: u64, _: u64, _high: u64, _msr: u64) -> u64 {
+    naked_asm!(
+        // mov eax, edi
+        ".byte 0x89, 0xf8",
+        "wrmsr",
+        "mov rax, -1",
+        "ret",
+        "int3"
+    );
+}
+
 /// Jumps to `addr` with the caller's return address on the stack.
 #[unsafe(naked)]
 unsafe extern "sysv64" fn jump(_addr: u64) -> u64 {
@@ -2917,6 +3123,7 @@ soft_stub!(device_stub, DEVICE_VECTOR);
 soft_stub!(net_stub, NET_VECTOR);
 soft_stub!(net_tx_stub, NET_TX_VECTOR);
 soft_stub!(ioapic_stub, IOAPIC_VECTOR);
+soft_stub!(thermal_stub, THERMAL_VECTOR);
 
 /// Entry stub of the spurious-interrupt vector.
 #[unsafe(naked)]

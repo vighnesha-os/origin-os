@@ -21,15 +21,26 @@
 //! type's value implies no attribute, and AMD's native model ID does not even tell Zen 5 from Zen
 //! 5c. A core type is used here only for equality, to say which processors a ranking compares.
 //!
-//! Everything here is a pure function over values given to it. Reading the HFI table, evaluating
-//! `_CPC`, reading the registers and taking the thermal interrupt are TASKS item 106's; until it
-//! lands, the kernel gives every processor [`FULL`] (source 5), which is all QEMU can show.
+//! Everything here but the live store is a pure function over values given to it. Reading the HFI
+//! table, the registers and taking the thermal interrupt are `crate::hfi`'s (TASKS item 106);
+//! `_CPC` is evaluated only in the AML proof, on QEMU's tables, since ADR-0019 A2 keeps the
+//! firmware's AML out of the kernel, so source 2 is empty at boot.
+//!
+//! **The live store** ([`LIVE`], read through [`current`]) holds each processor's capacity and
+//! flags as the hardware last reported them. Until the boot publishes it, and for an index it does
+//! not hold, every processor reads [`FULL`]. Capacity is a placement hint: a rescale publishes it
+//! processor by processor, so a reader may briefly see some processors' new capacities beside
+//! others' old ones, and that mixed view is harmless, since a reader only compares loads with it
+//! and nothing's correctness rests on it (the coordinating session's ruling Q14 of 2026-11-21).
 #![forbid(unsafe_code)]
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering as Memory};
 
+use crate::once::SetOnce;
 use crate::topology::CoreIdentity;
 
 /// The most capable processor's capacity.
@@ -53,34 +64,38 @@ pub fn equal(processors: usize) -> Vec<u16> {
     vec![FULL; processors]
 }
 
-/// Scales `values` so the largest is [`FULL`]. A value of 0 stays 0; any other is at least 1.
-fn scale(values: &[u32]) -> Option<Vec<u16>> {
-    let top = u64::from(*values.iter().max()?);
+/// Writes `values` into `out`, scaled so the largest is [`FULL`], if `values` gives each of the
+/// `out.len()` processors a value, above 0 for every one where `positive`, and the largest is above
+/// 0; otherwise writes nothing and says so. A value of 0 stays 0; any other is at least 1.
+fn scale_into(values: Option<&[Option<u32>]>, positive: bool, out: &mut [u16]) -> bool {
+    let Some(values) = values else {
+        return false;
+    };
+    if values.len() != out.len() || out.is_empty() {
+        return false;
+    }
+    let mut top = 0u32;
+    for value in values {
+        match *value {
+            None => return false,
+            Some(0) if positive => return false,
+            Some(v) => top = top.max(v),
+        }
+    }
     if top == 0 {
-        return None;
+        return false;
     }
-    Some(
-        values
-            .iter()
-            .map(|&v| {
-                let scaled = u64::from(v) * u64::from(FULL) / top;
-                match (v, scaled) {
-                    (0, _) => 0,
-                    (_, 0) => 1,
-                    (_, s) => s as u16,
-                }
-            })
-            .collect(),
-    )
-}
-
-/// Every processor's value, if the source gives one for each of the `n` processors.
-fn whole(n: usize, values: Option<&[Option<u32>]>) -> Option<Vec<u32>> {
-    let values = values?;
-    if values.len() != n || n == 0 {
-        return None;
+    for (slot, value) in out.iter_mut().zip(values) {
+        let v = value.unwrap_or(0);
+        let scaled = u64::from(v) * u64::from(FULL) / u64::from(top);
+        *slot = match (v, scaled) {
+            (0, _) => 0,
+            (_, 0) => 1,
+            // At most FULL: `v` is at most `top`.
+            (_, s) => s as u16,
+        };
     }
-    values.iter().copied().collect()
+    true
 }
 
 /// What each source gives each processor, in CPU-index order; a source a processor gives
@@ -107,23 +122,26 @@ pub struct Reports<'a> {
 /// - **`_CPC` and the register:** a Highest of 0 is no value; that processor has none, and the
 ///   source is passed over.
 pub fn choose(n: usize, reports: &Reports<'_>) -> (Source, Vec<u16>) {
-    if let Some(values) = whole(n, reports.hfi).and_then(|v| scale(&v)) {
-        return (Source::Hfi, values);
+    let mut out = vec![0; n];
+    let source = choose_into(reports, &mut out);
+    (source, out)
+}
+
+/// [`choose`] for `out.len()` processors, into `out`, without allocating: what the thermal
+/// interrupt's handler runs after a change (TASKS item 106; ADR-0018 V1). The same sources in the
+/// same order, the same "every processor or none" rule and the same scaling.
+pub fn choose_into(reports: &Reports<'_>, out: &mut [u16]) -> Source {
+    if scale_into(reports.hfi, false, out) {
+        return Source::Hfi;
     }
-    let positive = |v: Vec<u32>| v.iter().all(|&x| x > 0).then_some(v);
-    if let Some(values) = whole(n, reports.cpc)
-        .and_then(positive)
-        .and_then(|v| scale(&v))
-    {
-        return (Source::Cpc, values);
+    if scale_into(reports.cpc, true, out) {
+        return Source::Cpc;
     }
-    if let Some(values) = whole(n, reports.register)
-        .and_then(positive)
-        .and_then(|v| scale(&v))
-    {
-        return (Source::Register, values);
+    if scale_into(reports.register, true, out) {
+        return Source::Register;
     }
-    (Source::Equal, equal(n))
+    out.fill(FULL);
+    Source::Equal
 }
 
 /// The shape of a package's HFI or Thread Director table, from CPUID.06H (SDM Vol. 1, Table 21-16;
@@ -181,7 +199,29 @@ impl HfiShape {
         }
         Some((self.capabilities & (mask - 1)).count_ones() as usize)
     }
+
+    /// Whether the table reports efficiency (CPUID.06H:EDX\[1\]) beside performance.
+    pub const fn reports_efficiency(&self) -> bool {
+        self.capabilities & EFFICIENCY != 0
+    }
+
+    /// Bytes of class 0's cells: what is read of the change indications ([`HFI_FLAGS_AT`]) and of
+    /// a row ([`HfiShape::row_offset`]).
+    pub const fn cells(&self) -> usize {
+        self.per_class()
+    }
+
+    /// Where row `row` starts in the table: 8 + (row + 1) × stride (Table 17-7's note 3, which for
+    /// the HFI's one class and two capabilities is Table 17-4's 16 + 8 × row). `None` past `usize`.
+    pub fn row_offset(&self, row: u16) -> Option<usize> {
+        (usize::from(row) + 1)
+            .checked_mul(self.stride())?
+            .checked_add(HFI_FLAGS_AT)
+    }
 }
+
+/// Where class 0's change indications start: after the 8-byte timestamp (Tables 17-4 and 17-7).
+pub const HFI_FLAGS_AT: usize = 8;
 
 /// The table's global flags for class 0 (Table 17-5, 17-8).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -217,10 +257,26 @@ impl HfiRow {
     }
 }
 
-/// The flags at the table's start, if `table` holds its header.
+/// The flags at the table's start, if `table` holds class 0's change indications whole.
 pub fn hfi_flags(table: &[u8], shape: HfiShape) -> Option<HfiFlags> {
-    let byte = |mask| -> Option<u8> { table.get(8 + shape.place(mask)?).copied() };
-    let performance = table.get(8 + shape.place(PERFORMANCE)?).copied()?;
+    hfi_flags_from(class_cells(table, HFI_FLAGS_AT, shape)?, shape)
+}
+
+/// Class 0's [`HfiShape::cells`] bytes at `at`, if `table` holds them all: the one rule both the
+/// whole-table readers and the kernel's copy follow, so that no reader takes a row or the flags
+/// from a table that ends inside them (the coordinating session's ruling on the review's R106-1,
+/// 2026-11-22; TASKS item 106 changed TASKS item 97's readers to it).
+fn class_cells(table: &[u8], at: usize, shape: HfiShape) -> Option<&[u8]> {
+    table.get(at..at.checked_add(shape.cells())?)
+}
+
+/// The flags in `cells`, class 0's change indications, read from [`HFI_FLAGS_AT`]: what the kernel
+/// copies out of the table (TASKS item 106). `None` unless `cells` holds all [`HfiShape::cells`]
+/// bytes.
+pub fn hfi_flags_from(cells: &[u8], shape: HfiShape) -> Option<HfiFlags> {
+    let cells = cells.get(..shape.cells())?;
+    let byte = |mask| -> Option<u8> { cells.get(shape.place(mask)?).copied() };
+    let performance = cells.get(shape.place(PERFORMANCE)?).copied()?;
     let efficiency = byte(EFFICIENCY).unwrap_or(0);
     Some(HfiFlags {
         performance_changed: performance & 1 != 0,
@@ -231,13 +287,16 @@ pub fn hfi_flags(table: &[u8], shape: HfiShape) -> Option<HfiFlags> {
 }
 
 /// Row `row`'s class-0 capabilities (CPUID.06H:EDX\[31:16\] on that processor), if `table` holds
-/// it: at 8 + (row + 1) × stride (Table 17-7's note 3, which for the HFI's one class and two
-/// capabilities is Table 17-4's 16 + 8 × row).
+/// them whole: at [`HfiShape::row_offset`].
 pub fn hfi_row(table: &[u8], shape: HfiShape, row: u16) -> Option<HfiRow> {
-    let start = (usize::from(row) + 1)
-        .checked_mul(shape.stride())?
-        .checked_add(8)?;
-    let cell = |mask| -> Option<u8> { table.get(start.checked_add(shape.place(mask)?)?).copied() };
+    hfi_row_from(class_cells(table, shape.row_offset(row)?, shape)?, shape)
+}
+
+/// The class-0 capabilities in `cells`, a row's first [`HfiShape::cells`] bytes: what the kernel
+/// copies out of the table (TASKS item 106). `None` unless `cells` holds all of them.
+pub fn hfi_row_from(cells: &[u8], shape: HfiShape) -> Option<HfiRow> {
+    let cells = cells.get(..shape.cells())?;
+    let cell = |mask| -> Option<u8> { cells.get(shape.place(mask)?).copied() };
     Some(HfiRow {
         performance: cell(PERFORMANCE)?,
         efficiency: match shape.place(EFFICIENCY) {
@@ -412,6 +471,142 @@ impl Ranking {
     }
 }
 
+/// What [`LIVE`] keeps of a processor besides its capacity: a row the HFI asks to be avoided, or
+/// consolidated on, or idled by force, and a core that reports itself hot. Set and cleared by the
+/// thermal interrupt's handler (`crate::hfi`), read by placement (TASKS items 98, 99 and 107).
+pub mod flags {
+    /// Every class-0 cell of its HFI row is 0: no movable thread is placed there (SDM Vol. 3,
+    /// §17.6.7).
+    pub const AVOID: u8 = 1;
+    /// Its HFI row's efficiency is 255: consolidate work there (S17).
+    pub const CONSOLIDATE: u8 = 2;
+    /// Its package's table asks for idle to be forced, and its row is all 0 (S9: no idle is
+    /// injected at M3).
+    pub const FORCE_IDLE: u8 = 4;
+}
+
+/// One processor's live capacity and flags.
+#[derive(Debug)]
+pub struct Live {
+    capacity: AtomicU16,
+    flags: AtomicU8,
+    throttled: AtomicBool,
+}
+
+impl Live {
+    const fn new(capacity: u16) -> Self {
+        Self {
+            capacity: AtomicU16::new(capacity),
+            flags: AtomicU8::new(0),
+            throttled: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Each processor's live capacity and flags, by CPU index, published once and then only updated
+/// in place: no lock, no allocation after [`Store::start`].
+#[derive(Debug)]
+pub struct Store {
+    slots: SetOnce<Box<[Live]>>,
+}
+
+impl Store {
+    /// A store not started: every processor reads [`FULL`] and no flag.
+    pub const fn new() -> Self {
+        Self {
+            slots: SetOnce::new(),
+        }
+    }
+
+    /// Starts the store with `boot`, each CPU index's capacity at boot. `false`, and nothing
+    /// changed, if it was started already.
+    pub fn start(&self, boot: &[u16]) -> bool {
+        let slots: Box<[Live]> = boot.iter().map(|&c| Live::new(c)).collect();
+        self.slots.set(slots).is_ok()
+    }
+
+    /// Whether [`Store::start`] has run.
+    pub fn started(&self) -> bool {
+        self.slots.get().is_some()
+    }
+
+    fn slot(&self, cpu: usize) -> Option<&Live> {
+        self.slots.get()?.get(cpu)
+    }
+
+    /// Processor `cpu`'s capacity: [`FULL`] before the store starts, and for an index it does not
+    /// hold.
+    pub fn current(&self, cpu: usize) -> u16 {
+        self.slot(cpu)
+            .map_or(FULL, |s| s.capacity.load(Memory::Relaxed))
+    }
+
+    /// Processor `cpu`'s [`flags`]: none before the store starts.
+    pub fn flags(&self, cpu: usize) -> u8 {
+        self.slot(cpu).map_or(0, |s| s.flags.load(Memory::Relaxed))
+    }
+
+    /// Whether processor `cpu` reported itself hot at its last thermal transition.
+    pub fn throttled(&self, cpu: usize) -> bool {
+        self.slot(cpu)
+            .is_some_and(|s| s.throttled.load(Memory::Relaxed))
+    }
+
+    /// Publishes processor `cpu`'s capacity and [`flags`]. Nothing if the store holds no such
+    /// index.
+    pub fn publish(&self, cpu: usize, capacity: u16, flags: u8) {
+        if let Some(s) = self.slot(cpu) {
+            s.capacity.store(capacity, Memory::Relaxed);
+            s.flags.store(flags, Memory::Relaxed);
+        }
+    }
+
+    /// Records whether processor `cpu` reports itself hot.
+    pub fn set_throttled(&self, cpu: usize, hot: bool) {
+        if let Some(s) = self.slot(cpu) {
+            s.throttled.store(hot, Memory::Relaxed);
+        }
+    }
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The kernel's live store (TASKS item 106).
+pub static LIVE: Store = Store::new();
+
+/// Processor `cpu`'s capacity, from 0 to [`FULL`], as the hardware last reported it: the one way
+/// placement reads it (the coordinating session's ruling Q6 of 2026-11-21). [`FULL`] before the
+/// boot publishes the store, and for an index it does not hold. A placement hint: see the module's
+/// documentation on the mixed view a rescale may show.
+///
+/// **Capacity 0 is S17's "avoid"**: no movable thread is placed there. That is the rule placement
+/// follows. [`avoid`] is Intel's stricter "avoid altogether", every class-0 cell 0 (SDM Vol. 3,
+/// §17.6.7), kept for the power modes (TASKS items 99 and 107): a row with performance 0 and an
+/// efficiency above 0 has capacity 0 without it (the review's R106-16).
+pub fn current(cpu: usize) -> u16 {
+    LIVE.current(cpu)
+}
+
+/// Whether the HFI asks that no movable thread be placed on processor `cpu` ([`flags::AVOID`]).
+pub fn avoid(cpu: usize) -> bool {
+    LIVE.flags(cpu) & flags::AVOID != 0
+}
+
+/// Whether the HFI asks that work be consolidated on processor `cpu` ([`flags::CONSOLIDATE`]).
+pub fn consolidate(cpu: usize) -> bool {
+    LIVE.flags(cpu) & flags::CONSOLIDATE != 0
+}
+
+/// Whether processor `cpu` reported itself hot at its last thermal transition (S17: skipped as a
+/// destination until it reports normal again).
+pub fn throttled(cpu: usize) -> bool {
+    LIVE.throttled(cpu)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,6 +778,222 @@ mod tests {
             .map(|r| r.efficiency),
             Some(None)
         );
+    }
+
+    /// TASKS item 97's `choose`, as it was before `choose_into`: the model the allocation-free
+    /// form is held to (TASKS item 106; the S27-10 property extended to the live path).
+    fn reference_choose(n: usize, reports: &Reports<'_>) -> (Source, Vec<u16>) {
+        fn scale(values: &[u32]) -> Option<Vec<u16>> {
+            let top = u64::from(*values.iter().max()?);
+            if top == 0 {
+                return None;
+            }
+            Some(
+                values
+                    .iter()
+                    .map(|&v| {
+                        let scaled = u64::from(v) * u64::from(FULL) / top;
+                        match (v, scaled) {
+                            (0, _) => 0,
+                            (_, 0) => 1,
+                            (_, s) => s as u16,
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        fn whole(n: usize, values: Option<&[Option<u32>]>) -> Option<Vec<u32>> {
+            let values = values?;
+            if values.len() != n || n == 0 {
+                return None;
+            }
+            values.iter().copied().collect()
+        }
+        if let Some(values) = whole(n, reports.hfi).and_then(|v| scale(&v)) {
+            return (Source::Hfi, values);
+        }
+        let positive = |v: Vec<u32>| v.iter().all(|&x| x > 0).then_some(v);
+        if let Some(values) = whole(n, reports.cpc)
+            .and_then(positive)
+            .and_then(|v| scale(&v))
+        {
+            return (Source::Cpc, values);
+        }
+        if let Some(values) = whole(n, reports.register)
+            .and_then(positive)
+            .and_then(|v| scale(&v))
+        {
+            return (Source::Register, values);
+        }
+        (Source::Equal, equal(n))
+    }
+
+    /// A source's list for `n` processors, as hostile as the generator makes it: absent, of
+    /// another length, with gaps, zeros, and values at the edges.
+    fn hostile_list(rng: &mut Rng, n: usize) -> Option<Vec<Option<u32>>> {
+        if rng.below(5) == 0 {
+            return None;
+        }
+        let len = match rng.below(8) {
+            0 => rng.below(n + 2),
+            _ => n,
+        };
+        Some(
+            (0..len)
+                .map(|_| match rng.below(10) {
+                    0 => None,
+                    1 => Some(0),
+                    2 => Some(rng.edge_u32()),
+                    _ => Some(rng.below(256) as u32),
+                })
+                .collect(),
+        )
+    }
+
+    /// `choose_into` makes the choice `choose` made before it, on any input, without allocating
+    /// (TASKS item 106): same source, same capacities, and every capacity at most FULL.
+    #[test]
+    fn choose_into_is_the_choice_without_allocating() {
+        let mut rng = Rng::new(0x0106_C401);
+        for case in 0..cases(20_000) {
+            let n = rng.below(70);
+            let (hfi, cpc, register) = (
+                hostile_list(&mut rng, n),
+                hostile_list(&mut rng, n),
+                hostile_list(&mut rng, n),
+            );
+            let reports = Reports {
+                hfi: hfi.as_deref(),
+                cpc: cpc.as_deref(),
+                register: register.as_deref(),
+            };
+            let expected = reference_choose(n, &reports);
+            let mut out = vec![7u16; n];
+            let source = choose_into(&reports, &mut out);
+            assert_eq!((source, out.clone()), expected, "case {case}");
+            assert_eq!(choose(n, &reports), expected, "case {case}");
+            assert!(out.iter().all(|&c| c <= FULL), "case {case}");
+            // The S27-10 property: a capacity comes from the reports alone, so equal reports give
+            // equal capacities.
+            if source == Source::Hfi
+                && let Some(h) = &hfi
+            {
+                for i in 0..n {
+                    for j in 0..n {
+                        if h[i] == h[j] {
+                            assert_eq!(out[i], out[j], "case {case}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One rule for a row and the flags, whichever reads them (the coordinating session's ruling on
+    /// the review's R106-1): the whole-table readers and the kernel's copy of `cells()` bytes accept
+    /// exactly the same rows and flags, and read the same values from them.
+    #[test]
+    fn the_whole_table_and_the_copy_accept_the_same_rows() {
+        let mut rng = Rng::new(0x0106_CE11);
+        for case in 0..cases(5_000) {
+            let shape = HfiShape::from_cpuid(
+                HFI | if rng.below(2) == 0 {
+                    THREAD_DIRECTOR
+                } else {
+                    0
+                },
+                (rng.below(12) as u32) << 8,
+                rng.below(256) as u32 | 1,
+            )
+            .unwrap();
+            let table: Vec<u8> = (0..rng.below(600)).map(|_| rng.byte()).collect();
+            let row = rng.below(40) as u16;
+            let cells = shape.cells();
+            // The kernel's copy: `cells` bytes, all inside the table, or nothing.
+            let copied = |at: usize| table.get(at..at + cells).map(<[u8]>::to_vec);
+            let copy = shape.row_offset(row).and_then(copied);
+            assert_eq!(
+                copy.as_deref().and_then(|c| hfi_row_from(c, shape)),
+                hfi_row(&table, shape, row),
+                "case {case}"
+            );
+            assert_eq!(
+                copy.is_some(),
+                hfi_row(&table, shape, row).is_some(),
+                "case {case}: one accepts what the other refuses"
+            );
+            assert_eq!(
+                copied(HFI_FLAGS_AT)
+                    .as_deref()
+                    .and_then(|c| hfi_flags_from(c, shape)),
+                hfi_flags(&table, shape),
+                "case {case}"
+            );
+        }
+        // A table that ends inside a row's cells, after the two the row's values sit in (the
+        // review's case 67): Thread Director, capabilities 0b10111, 11 classes, 107 bytes, the row
+        // at byte 104. Both readers refuse it.
+        let td = HfiShape::from_cpuid(HFI | THREAD_DIRECTOR, 11 << 8, 0b10111).unwrap();
+        let table = vec![7u8; 107];
+        let at = (0..40).find(|&r| td.row_offset(r) == Some(104)).unwrap();
+        assert_eq!(td.cells(), 4);
+        assert_eq!(hfi_row(&table, td, at), None);
+        assert_eq!(table.get(104..104 + td.cells()), None);
+        assert_eq!(hfi_row_from(&table[104..], td), None);
+        // With one byte more it holds the cells, and both read the row.
+        let longer = vec![7u8; 108];
+        assert!(hfi_row(&longer, td, at).is_some());
+        assert_eq!(
+            hfi_row_from(&longer[104..108], td),
+            hfi_row(&longer, td, at)
+        );
+        // The offsets Table 17-4 and Table 17-7 give.
+        let hfi = HfiShape::from_cpuid(HFI, 0, 0b11).unwrap();
+        assert_eq!(
+            (hfi.cells(), hfi.row_offset(0), hfi.row_offset(3)),
+            (2, Some(16), Some(40))
+        );
+        let td = HfiShape::from_cpuid(HFI | THREAD_DIRECTOR, 9 << 8, 0b11).unwrap();
+        assert_eq!(
+            (td.cells(), td.row_offset(0), td.row_offset(1)),
+            (2, Some(32), Some(56))
+        );
+    }
+
+    /// The live store: FULL and no flag before it starts and past its indexes; once started, what
+    /// was published; started once only.
+    #[test]
+    fn the_live_store_reads_full_until_started() {
+        let store = Store::new();
+        assert!(!store.started());
+        assert_eq!(
+            (store.current(0), store.flags(0), store.throttled(0)),
+            (FULL, 0, false)
+        );
+        store.publish(0, 3, flags::AVOID);
+        store.set_throttled(0, true);
+        assert_eq!(
+            (store.current(0), store.flags(0), store.throttled(0)),
+            (FULL, 0, false)
+        );
+        assert!(store.start(&[FULL, 512, 0]));
+        assert!(!store.start(&[1]), "started once only");
+        assert_eq!(
+            (store.current(0), store.current(1), store.current(2)),
+            (FULL, 512, 0)
+        );
+        assert_eq!(store.current(3), FULL, "an index the store does not hold");
+        store.publish(1, 256, flags::CONSOLIDATE);
+        store.set_throttled(2, true);
+        assert_eq!(
+            (store.current(1), store.flags(1)),
+            (256, flags::CONSOLIDATE)
+        );
+        assert!(store.throttled(2) && !store.throttled(1));
+        store.set_throttled(2, false);
+        assert!(!store.throttled(2));
+        store.publish(9, 1, flags::AVOID);
+        assert_eq!(store.flags(9), 0);
     }
 
     #[test]

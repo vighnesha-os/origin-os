@@ -131,6 +131,7 @@ pub mod bootproof;
 pub mod cache;
 pub mod channel;
 pub mod core_image;
+pub mod cpc;
 pub mod deflate;
 pub mod dhcp;
 pub mod dns;
@@ -212,6 +213,8 @@ mod launch;
 mod measured_stack;
 #[cfg(target_os = "none")]
 mod memory_object;
+#[cfg(target_os = "none")]
+mod migration_proof;
 #[cfg(target_os = "none")]
 mod pcie;
 #[cfg(target_os = "none")]

@@ -1177,6 +1177,9 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // This processor's random-number generator (ADR-0016 R5): its instructions' start-up tests
     // and a first seed from the root, before anything can run here that asks for a value.
     crate::random::start_this_processor(me);
+    // Its thermal LVT's sources, read on itself once it is online (ADR-0020 S9 and S17; TASKS item
+    // 106, the coordinating session's ruling Q7): after its topology, which names its package.
+    crate::hfi::start_this_processor(me);
     // M3: this processor's scheduler, on this same flow.
     (start.main)(flow, &lapic)
 }

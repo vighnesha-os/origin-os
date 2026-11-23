@@ -70,6 +70,33 @@ fn cpu(n: &str, uid: u8) -> B {
     )
 }
 
+/// A processor as [`cpu`] makes one, with `more` in it: a `_CPC`, for TASKS item 106.
+fn cpu_with(n: &str, uid: u8, more: &[B]) -> B {
+    let mut body = vec![
+        name("_HID", string("ACPI0007")),
+        name("_UID", byte(uid)),
+        method("_STA", 0, &[ret(call("\\_SB_.CPUS.CSTA", &[byte(uid)]))]),
+    ];
+    body.extend_from_slice(more);
+    device(n, &body)
+}
+
+/// A `_CPC` package of revision 4, its 25 entries (ACPI 6.6 Table 8.23), Highest Performance
+/// `highest` and every other entry 0.
+fn cpc_package(highest: B) -> B {
+    let mut entries = vec![byte(25), byte(4), highest];
+    entries.resize(25, zero());
+    package(25, &entries)
+}
+
+/// A Generic Register Descriptor in `space` and the end tag, as a resource template's buffer.
+fn register_template(space: u8) -> B {
+    let mut d = vec![0x82, 12, 0, space, 8, 0, 4];
+    d.extend_from_slice(&0x1000u64.to_le_bytes());
+    d.extend_from_slice(&[0x79, 0]);
+    buffer(byte(17), &d)
+}
+
 /// What QEMU's DSDT holds that the proof reads: `\_S5_`, `\PICF` and `\_PIC`, the root bridge
 /// with its `_HID` and `_CRS`, an HPET whose `_STA` reads its registers under the Global Lock,
 /// four links and two processors; then `extra`. Revision 1, as QEMU's: 32-bit integers.
@@ -1628,4 +1655,60 @@ fn qemu_dsdts_pass_the_proof() {
         checked += 1;
     }
     assert!(checked > 0, "no DSDT in {dir:?}");
+}
+
+/// `_CPC` on QEMU-shaped processors (TASKS item 106; ADR-0019 A2): counted through the interpreter,
+/// an Integer Highest read, a register never read, a method that reaches a region refused, and a
+/// package of the wrong shape not read. The proof's verdict does not rest on it.
+#[test]
+fn cpc_is_counted_and_never_read_from_a_register() {
+    let dsdt = qemu_dsdt(&[scope(
+        "\\_SB_.CPUS",
+        &[
+            cpu_with("C002", 2, &[name("_CPC", cpc_package(dword(200)))]),
+            cpu_with(
+                "C003",
+                3,
+                &[name("_CPC", cpc_package(register_template(0x7F)))],
+            ),
+            cpu_with("C004", 4, &[method("_CPC", 0, &[ret(nm("\\_SB_.CPEN"))])]),
+            cpu_with(
+                "C005",
+                5,
+                &[name("_CPC", package(3, &[byte(25), byte(4), dword(1)]))],
+            ),
+            cpu_with(
+                "C006",
+                6,
+                &[method("_CPC", 0, &[ret(cpc_package(dword(90)))])],
+            ),
+        ],
+    )]);
+    let (found, out) = Machine::new(dsdt).run();
+    assert!(found.passed(), "{out}");
+    assert_eq!(
+        found.walked.cpc,
+        crate::cpc::Found {
+            processors: 7,
+            with_cpc: 5,
+            integer: 2,
+            register: 1,
+            refused: 1,
+            malformed: 1,
+        },
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "origin-kernel: aml: walk: _CPC on 5 of 7 processors: 2 with an Integer Highest, 1 with a register (not read: ADR-0019 A2), 1 refused, 1 not read otherwise"
+        ),
+        "{out}"
+    );
+    // QEMU's own shape has none.
+    let (plain, out) = Machine::new(qemu_dsdt(&[])).run();
+    assert_eq!(
+        (plain.walked.cpc.with_cpc, plain.walked.cpc.processors),
+        (0, 2),
+        "{out}"
+    );
 }

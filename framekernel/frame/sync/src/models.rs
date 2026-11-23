@@ -217,10 +217,11 @@
 //! - The slots of a region beyond a reclaim and a take: a slot kept with its mapping for reuse,
 //!   `abandon`, `leak`, `trim`, and a reclaim whose shootdown stalls are tested on the host only
 //!   (`slots.rs`), and so is more than one slot.
-//! - Moves beyond one: the move in the thread-record models stands for ADR-0020 S6's, which is not
-//!   built (`OnCpu::move_if_asked` frees the source slot by `RunQueue::exit` and lets the
-//!   destination's tick pick the thread). A thread moved more than once, a wake-up that follows
-//!   several moves, and `Exhausted` are tested on the host only (`threads.rs`).
+//! - Moves beyond one: the move in the thread-record models is ADR-0020 S6's run-queue half, the
+//!   real `RunQueue::depart` and `RunQueue::arrive` (`OnCpu::move_if_asked`; TASKS item 96), with
+//!   the tables of contexts modelled apart (`moves_models.rs`). A thread moved more than once, a
+//!   wake-up that follows several moves, `Exhausted` and pinned mode's second loop are tested on
+//!   the host only (`threads.rs`): 64 follows are too many executions.
 //! - `RwLock` writer starvation, which its documentation accepts; a timed waiter that finds the
 //!   queue full (the other way to reach `Step::Poll`, the same loop as the boot flow's); and what
 //!   callers must uphold themselves: the state changes before `wake_one`, and one condition per
@@ -269,7 +270,7 @@ use crate::exits::Exits;
 use crate::floor::MonotonicFloor;
 use crate::ports::{self, Kind, Packet, Port, Reservation, Source, Storage, TakeError, Unreserved};
 use crate::refcount::RefCount;
-use crate::runqueue::{DEFAULT_WEIGHT, RunQueue};
+use crate::runqueue::{CAPACITY, DEFAULT_WEIGHT, RunQueue};
 use crate::shootdown::{
     Confirmation, Held, Request, Rounds, Scope, Shootdown, Stalled, TlbHardware,
 };
@@ -703,11 +704,36 @@ impl Queues for World {
         Some(f(&mut cpu.queue.lock()))
     }
 
+    fn holds<S>(queue: &RunQueue, slot: u16, number: u32, _: &Record<S>) -> bool {
+        queue.record(usize::from(slot)) == Some(number)
+    }
+
     fn wake_slot(queue: &mut RunQueue, slot: u16) -> bool {
         let slot = usize::from(slot);
         let generation = queue.generation(slot);
         queue.wake(slot, generation)
     }
+
+    fn find(queue: &RunQueue, number: u32) -> Option<u16> {
+        (1..CAPACITY)
+            .find(|&slot| queue.record(slot) == Some(number))
+            .and_then(|slot| u16::try_from(slot).ok())
+    }
+
+    fn count(&self) -> u32 {
+        u32::try_from(self.cpus.len()).unwrap()
+    }
+}
+
+/// What a model's wake-up does on an inconsistency (ADR-0020 S20): in a model that plants none,
+/// meeting one is the failure.
+fn no_inconsistency(met: threads::Met) -> bool {
+    panic!("a wake-up met an inconsistency: {met:?}")
+}
+
+/// The line such a wake-up would report: never reached in a model that plants no inconsistency.
+fn no_line(met: threads::Met, _: Outcome) {
+    panic!("a wake-up reported pinned mode: {met:?}")
 }
 
 /// A handle on the [`World`] that makes kernel threads in it.
@@ -843,12 +869,19 @@ impl OnCpu {
         self.this_cpu().kick.notify();
     }
 
-    /// If a model asked, moves this thread to another processor, standing for ADR-0020 S6's move
-    /// of a preempted thread, made by another processor: under both queues' locks, taken in index
-    /// order, the thread's slot leaves the source queue and a slot of the destination's takes it,
-    /// carrying its pending wake-up, and its record's location follows. It then runs there. A
-    /// copy of a move not yet built: the source frees the slot by `RunQueue::exit`, which S6's
-    /// `depart` will replace, and the destination's next tick picks it.
+    /// If a model asked, moves this thread to another processor, as ADR-0020 S6's mover does
+    /// (TASKS item 96), with the real `RunQueue::depart` and `RunQueue::arrive`. Under both
+    /// queues' locks, taken in index order: the source's tick preempts this thread for another
+    /// thread queued there, so it is ready and not running, which is all a mover moves (R95-5);
+    /// `depart` takes it out of its slot with its pending wake-up, `arrive` places it in a slot of
+    /// the destination's, woken, and its record's location follows; the reschedule IPI's
+    /// `preempt_for_wake` on the idle destination then runs it. The tables of contexts the
+    /// kernel's mover also passes the frame between (`origin_frame::cpu::move_context`) are
+    /// modelled in `moves_models.rs`, not here.
+    ///
+    /// The mover is this model thread itself, while its thread is preempted: what matters to a
+    /// wake-up, the queues and the location, changes in one critical section under both locks,
+    /// as the kernel's mover changes it.
     fn move_if_asked(&self) {
         let Some(to) = self.moves_to.take() else {
             return;
@@ -863,21 +896,19 @@ impl OnCpu {
             (second, first)
         };
         let left = source.current();
-        let pending = source.wake_pending(left);
-        assert_eq!(source.exit(THREAD_FRAME).unwrap(), IDLE_FRAME);
-        let arrived = destination
-            .push_weighted(THREAD_FRAME, DEFAULT_WEIGHT, Some(record))
-            .unwrap();
-        if pending {
-            let generation = destination.generation(arrived);
-            // Ready there, so it keeps the wake-up for its block.
-            assert!(!destination.wake(arrived, generation));
-        }
-        assert_eq!(destination.tick(IDLE_FRAME), THREAD_FRAME);
+        // Preempted for another thread queued on the source, which runs there from now on.
+        assert_eq!(source.push(OTHER_FRAME).unwrap(), left + 1);
+        assert_eq!(source.tick(THREAD_FRAME), OTHER_FRAME);
+        assert!(destination.has_room());
+        let departed = source.depart(left).unwrap();
+        assert_eq!(departed.record(), Some(record));
+        let arrived = destination.arrive(departed).unwrap();
         self.world.record(record).set_location(Location::new(
             to.try_into().unwrap(),
             arrived.try_into().unwrap(),
         ));
+        // The mover's reschedule IPI to the idle destination, which runs the arrival.
+        assert_eq!(destination.preempt_for_wake(IDLE_FRAME), THREAD_FRAME);
         drop((source, destination));
         self.cpu.set(to);
     }
@@ -939,14 +970,23 @@ impl Scheduler for OnCpu {
 
     fn wake(&self, thread: ThreadName) {
         let record = self.world.record(thread.record);
-        match threads::wake(&*self.world, record, thread.generation).outcome {
+        match threads::wake(
+            &*self.world,
+            record,
+            thread.record,
+            thread.generation,
+            no_inconsistency,
+            no_line,
+        )
+        .outcome
+        {
             // `sched::wake`: the IPI goes only to another processor. A thread woken from its own
             // processor runs at that processor's next timer tick.
             Outcome::Reached { ready: true, cpu } if cpu as usize != self.cpu.get() => {
                 self.world.cpus[cpu as usize].kick.notify();
             }
             Outcome::Exhausted => panic!("a wake-up followed its thread {WAKE_TRIES} times"),
-            Outcome::Reached { .. } | Outcome::Stale | Outcome::Gone => {}
+            Outcome::Reached { .. } | Outcome::Stale | Outcome::Gone | Outcome::Misplaced => {}
         }
     }
 
@@ -1577,6 +1617,82 @@ fn threads_a_timed_wake_follows_a_move() {
     );
 }
 
+/// What a wake-up by a location that names a slot holding another thread must not do.
+const MISPLACED_WOKE: &str = "a misplaced location woke the slot's other thread";
+
+/// ADR-0020 S20, trigger 3 (TASKS item 96, the coordinating session's ruling Q6): a thread's
+/// location is planted naming a slot of another processor that holds another thread, with a
+/// record of its own, blocked for good. A wake-up by the thread's name, racing the thread's block
+/// on its own processor, must not wake that other thread: it enters pinned mode (the hook) and
+/// finds the thread where it is, by the one search, and wakes it there. A lost wake-up leaves the
+/// thread blocked: a deadlock. The other thread holds a record, not none, so a check that asked
+/// only whether the slot holds some record would wake it (the review of TASKS item 96, R96-11).
+fn a_misplaced_location_wakes_only_its_thread() {
+    /// The other thread's record: any number but the named thread's.
+    const OTHER_RECORD: u32 = 7;
+    let world = Kernel::with_threads_on(&[true, false]);
+    let kernel = Arc::clone(&world.0);
+    {
+        let mut q = kernel.cpus[1].queue.lock();
+        assert_eq!(
+            q.push_weighted(OTHER_FRAME, DEFAULT_WEIGHT, Some(OTHER_RECORD))
+                .unwrap(),
+            1
+        );
+        assert_eq!(q.tick(IDLE_FRAME), OTHER_FRAME);
+        assert_eq!(q.block(OTHER_FRAME).unwrap(), IDLE_FRAME);
+    }
+    let name = world.thread_on(0).current_thread().unwrap();
+    assert_ne!(
+        name.record, OTHER_RECORD,
+        "the other thread's record is another"
+    );
+    kernel.record(name.record).set_location(Location::new(1, 1));
+    let thread = world.spawn(0, |me| me.block());
+    let waker = thread::spawn(move || {
+        let woke = threads::wake(
+            &*kernel,
+            kernel.record(name.record),
+            name.record,
+            name.generation,
+            |met| {
+                assert_eq!(met, threads::Met::Misplaced);
+                true
+            },
+            |met, outcome| {
+                assert_eq!(met, threads::Met::Misplaced);
+                assert!(
+                    matches!(outcome, Outcome::Reached { cpu: 0, .. }),
+                    "{MISPLACED_WOKE}: the search did not find the thread"
+                );
+            },
+        );
+        {
+            let q = kernel.cpus[1].queue.lock();
+            assert!(
+                q.frame(1).is_none() && !q.wake_pending(1),
+                "{MISPLACED_WOKE}"
+            );
+        }
+        assert_eq!(woke.met, Some(threads::Met::Misplaced));
+        if let Outcome::Reached { ready: true, cpu } = woke.outcome {
+            kernel.cpus[cpu as usize].kick.notify();
+        }
+    });
+    thread.join().unwrap();
+    waker.join().unwrap();
+}
+
+#[test]
+fn threads_a_misplaced_location_wakes_only_its_thread() {
+    check(
+        "threads_a_misplaced_location_wakes_only_its_thread",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        a_misplaced_location_wakes_only_its_thread,
+    );
+}
+
 /// What a wake-up by a stale name must not do.
 const STALE_WOKE: &str = "a stale name woke the record's next thread";
 
@@ -1621,7 +1737,14 @@ fn a_stale_name_wakes_nobody() {
         }
     });
     let waker = world.spawn(1, move |me| {
-        let woke = threads::wake(&*me.world, me.world.record(old.record), old.generation);
+        let woke = threads::wake(
+            &*me.world,
+            me.world.record(old.record),
+            old.record,
+            old.generation,
+            no_inconsistency,
+            no_line,
+        );
         assert!(woke.outcome == Outcome::Stale, "{STALE_WOKE}");
         assert!(
             !me.world.cpus[0].queue.lock().wake_pending(slot),
@@ -1681,7 +1804,14 @@ fn a_wake_racing_an_exit_follows_nothing() {
     let waker = thread::spawn({
         let kernel = Arc::clone(&kernel);
         move || {
-            let woke = threads::wake(&*kernel, kernel.record(name.record), name.generation);
+            let woke = threads::wake(
+                &*kernel,
+                kernel.record(name.record),
+                name.record,
+                name.generation,
+                no_inconsistency,
+                no_line,
+            );
             assert_eq!(woke.retries, 0, "{EXIT_FOLLOWED}");
             if let Outcome::Reached { cpu, .. } = woke.outcome {
                 assert_eq!(cpu, 0, "{EXIT_FOLLOWED}: it reached the new thread");

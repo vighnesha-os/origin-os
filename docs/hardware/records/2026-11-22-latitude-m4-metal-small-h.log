@@ -1,0 +1,2077 @@
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the krel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffd8a00000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 6232 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffd8a00000, direct map at 0xffffbe3e00000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 69 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800015 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffbba00000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 6802 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffbba00000, direct map at 0xffffaa6380000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 69 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800013 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffff8f400000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 6916 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffff8f400000, direct map at 0xffff8dd540000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 71 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800015 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00800800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: a shutdown (bit 23)
+origin-boot: bench build: bisect: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the loader's copy of the boot services table; after EFI_SUCCESS, a triple fault and nothing before it
+origin-boot: bench build: the UART at I/O port 0x2f8 under the firmware: IER 0x00, LCR 0x03, MCR 0x03, LSR 0x00, MSR 0xb0, scratch 0xaa, divisor 0x0001
+origin-boot: bench build: this line went straight to the UART, before ExitBootServices
+origin-boot: bench build: bisect: ExitBootServices next, through the loader's copy of the boot services table
+X
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xfffffffff2e00000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5244 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xfffffffff2e00000, direct map at 0xffff948940000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 73 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800013 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xfffffffff5e00000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 6042 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xfffffffff5e00000, direct map at 0xffffac07c0000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:EC]
+origin-boot: bench build: the boot serviceDR-0002 Amendmentenames it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 26ies live 0x98d26a20, copy 098d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 71 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800015 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffd5200000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5282 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffd5200000, direct map at 0xffffbf5800000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 69 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800013 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00800800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: a shutdown (bit 23)
+origin-boot: bench build: bisect: the last reset was a shutdown (PMxC0 bit 23), as the control's triple fault writes: ExitBootServices is called through the loader's copy of the boot services table; after EFI_SUCCESS, a triple fault and nothing before it
+origin-boot: bench build: the UART at I/O port 0x2f8 under the firmware: IER 0x00, LCR 0x03, MCR 0x03, LSR 0x00, MSR 0xb0, scratch 0xaa, divisor 0x0001
+origin-boot: bench build: this line went straight to the UART, before ExitBootServices
+origin-boot: bench build: bisect: ExitBootServices next, through the loader's copy of the boot services table
+X
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffad200000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5054 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffad200000, direct map at 0xffff826740000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 71 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800015 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffba200000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5320 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffba200000, direct map at 0xffff9a2a80000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 69 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800011 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffe1c00000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5130 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffe1c00000, direct map at 0xffffbafbc0000000 (two requests to the loader's generator)
+origin-boot: page tables built: 97 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 71 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800013 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffce400000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5586 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffce400000, direct map at 0xffffaa8280000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 69 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800013 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffff8ea00000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 6650 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffff8ea00000, direct map at 0xffffad6dc0000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 69 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800015 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+Error: No response to keepalive - Terminating session
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+Error: No response de-activating SOL payload
+[SOL Session operational.  Use ~? for help]
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffe6400000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5320 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffe6400000, direct map at 0xffff8d2ac0000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 69 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800013 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00200800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: a sleep state (bit 21)
+origin-boot: bench build: bisect: the last reset was not a shutdown (a sleep state (bit 21)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffff82000000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5396 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffff82000000, direct map at 0xffff9ae7c0000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 71 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800011 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServicestthe firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffff87a00000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5700 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffff87a00000, direct map at 0xffff8461c0000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 71 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800017 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffe7a00000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 6460 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffe7a00000, direct map at 0xffff9cc1c0000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 69 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800013 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+Error: No response to keepalive - Terminating session
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+ERROR: Received message with invalid authcode!
+Error: No response de-activating SOL payload
+[SOL Session operational.  Use ~? for help]
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+Error: No response to keepalive - Terminating session
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+ERROR: Received an Unexpected message ID
+Error: No response de-activating SOL payload
+[SOL Session operational.  Use ~? for help]
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffa7400000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 6498 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffa7400000, direct map at 0xffff941580000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 71 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800015 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffc0c00000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5054 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffc0c00000, direct map at 0xffff972580000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 65 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800015 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffde400000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5016 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffde400000, direct map at 0xffff94a2c0000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 71 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800015 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00200800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: a sleep state (bit 21)
+origin-boot: bench build: bisect: the last reset was not a shutdown (a sleep state (bit 21)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffcf600000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5244 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffcf600000, direct map at 0xffff93b640000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 69 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800017 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffff8ca00000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5548 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffff8ca00000, direct map at 0xffff9d4c00000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 69 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800013 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffff81c00000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5586 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffff81c00000, direct map at 0xffff961240000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 71 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800015 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+USB Hot Plug.B4
+Console input devices connect.98
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Hot Plug.B4
+USB Enable.9D
+USB Initialization.9A
+USB Detect.9C
+USB Hot Plug.B4
+Console Output devices connect.97
+DXE--Console In Device Connect..98
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99
+DXE--SuperIO Initialization..99Supermicro H13SRE-F BIOS Date:12/08/2025 Rev:2.5aCPU : AMD EPYC 4244P 6-Core Processor Speed : 3.80 GHzPress DEL to run SetupPress F11 to invoke Boot MenuPress F12 to boot from PXE/LANThe IMC is operating with DDR5 5600 MT/s
+DXE--BIOS PCI Bus Enumeration..92
+DXE--AHCI Initialization..A0
+DXE--AHCI Initialization..A0
+DXE--SuperIO Initialization..99
+DXE--Ready to Boot..Origin OS 0.1.0-dev UEFI loader (build 0)
+origin-boot: UEFI 2.9 system table
+origin-boot: firmware American Megatrends, revision 0x00050023
+origin-boot: bench build: bisect: the bisection mode (ADR-0002 Amendment 6): the full bench loader's work before the call, with the kernel stack and the boot info allocated as EfiLoaderData, not Origin's OS-defined types; the call through the loader's copy of the boot services table; a triple-fault control; after a successful call, a triple fault and nothing before it; no 0xCF9 write
+origin-boot: read \EFI\ORIGIN\KERNEL.ONBF (2116880 bytes)
+origin-boot: bench build: no BENCH-STALE-KEY: ExitBootServices gets the firmware's own key
+origin-boot: bench build: no BENCH-AFTER: after ExitBootServices the loader resets the machine, and the kernel is not entered
+origin-boot: bench build: bisect: BENCH-AFTER's value is ignored: this mode never enters the kernel, and after a successful call it triple-faults
+origin-boot: bench build: no BENCH-FCH: the FCH's registers are read where the firmware's tables allow it
+origin-boot: developer mode: unsigned kernel images are accepted
+origin-boot: TEST trust store: this loader trusts a development key and must never ship
+origin-boot: kernel verified: 10 sections, boot info 0.8, entry RVA 0x33000
+origin-boot: random: known-answer test passed; RDSEED healthy, RDRAND healthy; the loader's generator is seeded; the firmware's generator is not asked in this build
+origin-boot: kernel placed at 0x7e01c000, virtual 0xffffffffacc00000 (548 pages, 1480 relocations)
+origin-boot: console: the SPCR names a UART at I/O port 0x2f8 (interface 0x0, 115200 baud): the kernel writes to it from its first line
+origin-boot: console: the walk read 908 bytes of firmware memory in 31 reads, 5358 time-stamp counter ticks (cost ledger row CL46)
+origin-boot: bench build: the FCH's power-management block at 0xfed80300 (AMD's documents; TASKS item 121): an AMD processor; the DSDT describes a system-memory region at 0xfed80300, 256 bytes, that holds it; the firmware's page tables map it to itself; the firmware's memory map: Mmio
+origin-boot: bench build: the FADT's reset register: write 0xbe to I/O port 0xb2
+origin-boot: framebuffer: 1024x768 at 0xf4000000, stride 4096, red 0xff0000 green 0xff00 blue 0xff; mapped at 0xffffe00000000000
+origin-boot: KASLR: kernel at 0xffffffffacc00000, direct map at 0xffffa9ac40000000 (two requests to the loader's generator)
+origin-boot: page tables built: 96 tables, 64613 MiB direct map
+origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten
+origin-boot: bench build: entry state: CR0 0x80010011, CR4 0x628, EFER 0xd00, PAT 0x7040600070406; shadow stacks: S_CET 0x0, PL0_SSP 0x0, SSP table 0x0 (CPUID 07H.0:ECX[7] = 1)
+origin-boot: bench build: the boot services table (ADR-0002 Amendment 4's addition): the system table names it at 0x98d3ca80; the same as the loader's copy, byte for byte over its 264 bytes; ExitBootServices live 0x98d26a20, copy 0x98d26a20; header CRC32 live 0xb4b91c57, copy 0xb4b91c57
+origin-boot: bench build: bisect: the memory map the page tables were built from holds no region of an OS-defined type (0x80000000 and above), in 67 descriptors
+origin-boot: bench build: ResetSystem is at 0x985969e8; the time-stamp counter counted, over the firmware's Stall, 3800015 ticks a millisecond
+origin-boot: bench build: the FCH's SMI control for a write to 0xCF9 (SMIxC0 at 0xfed802c0, bits 27:26; ADR-0002 Amendment 4's addition): 0x04000000 (read): a write of bit 2 to 0xCF9 raises an SMI, so the firmware's SMM code handles it
+origin-boot: bench build: the FCH's registers (read): PMx00 0xe3070bf7, PMx08 0x021c0514, PMx60 0x0800, PMx74 0x1e060117, PMxC0 0x00080800, PMxD2 0x40; 0xCF9 decoded (PMx00 bit 1): yes; the FCH's own reset at 0xCF9 off, for the firmware to trap (PMxD2 bit 6): yes; the shutdown message (PMx74 bit 17): yes; a shutdown as a PCI reset (PMx08 bit 20): yes; the last reset: 0x06 to 0xCF9 (bit 19)
+origin-boot: bench build: bisect: the last reset was not a shutdown (0x06 to 0xCF9 (bit 19)): the boot's first run, the control: a triple fault now, and ExitBootServices is not called
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Pre-memory NB Initialization.15
+Connecting Drivers.91
+PCI Bus Initialization.92

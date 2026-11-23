@@ -103,7 +103,20 @@ unreachable_pub = "warn"
 # `cfg(origin_bench)`: the bench build of the loader and the kernel, with breadcrumbs on the
 # SPCR's UART (TASKS item 112). Only `cargo xtask bench-build` and `boot-bench` set it, into
 # `target/bench`; no image a normal build makes holds any of it (`cargo xtask check`, F1 and F2).
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(origin_bench)'] }
+# `cfg(origin_stack_measure)`: the loader's stack measured by paint before `ExitBootServices`
+# (TASKS item 127). Only `cargo xtask stack-depth` sets it, into `target/stack-measure`; no normal
+# or bench image holds any of it (the same F1 and F2).
+# `cfg(origin_bench_minimal)`: with `origin_bench`, the bench loader's minimal-program mode
+# (ADR-0002 Amendment 5; TASKS item 128). Only `cargo xtask bench-build --minimal` and
+# `boot-bench` set it, into `target/bench-minimal`; F1 holds its name as it holds the bench flag's.
+# `cfg(origin_bench_bisect)`: with `origin_bench`, the bench loader's bisection mode (ADR-0002
+# Amendment 6; TASKS item 131). Only `cargo xtask bench-build --bisect` and `boot-bench` set it,
+# into `target/bench-bisect`; F1 holds its name the same way, and it is never set with
+# `origin_bench_minimal`.
+# `cfg(origin_bench_kernel)`: with `origin_bench`, the bench loader's kernel-entry mode (ADR-0002
+# Amendment 7; TASKS item 133). Only `cargo xtask bench-build --kernel` and `boot-bench` set it,
+# into `target/bench-kernel`; F1 holds its name the same way, and it is never set with another mode.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(origin_bench)', 'cfg(origin_bench_minimal)', 'cfg(origin_bench_bisect)', 'cfg(origin_bench_kernel)', 'cfg(origin_stack_measure)'] }
 
 [workspace.lints.clippy]
 # CLAUDE.md §13 and final rule 5: every unsafe boundary documents its invariants.

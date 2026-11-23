@@ -83,7 +83,7 @@ proofs! {
     Iommu "IOMMU bring-up" => Withdraw("no device drivers");
     Processors "application processors" => Withdraw("fewer processors");
     CpuState "per-processor control state" => Refuse;
-    FpuFormat "FPU format" => Report;
+    FpuFormat "FPU format" => Withdraw("thread moves to or from that processor");
     SpeculationControls "speculation controls" => Report;
     Nospec "index and address clamps" => Refuse;
     BootSteps "boot steps run once" => Refuse;
@@ -126,7 +126,12 @@ proofs! {
     ThreadsReaped "thread reaping" => Report;
     MeasuredStackThread "measured stack in a thread" => Report;
     KernelBound "the kernel-wide bound" => Refuse;
+    // Moves between processors (ADR-0020 S6, S20, S23; TASKS item 96), after every proof above,
+    // whose threads never move.
+    MigrationIntegrity "thread migration: integrity" => Refuse;
+    MigrationDelivery "thread migration: delivery" => Withdraw("no thread moves");
     Ibpb "IBPB at each change of process" => Refuse;
+    HardwareCapacity "hardware capacity" => Report;
     // Devices.
     Pcie "PCIe enumeration" => Withdraw("no device drivers");
     BusMastersQuiet "bus masters quiet" => Withdraw("no device drivers");
@@ -247,7 +252,7 @@ mod tests {
 
     /// Every proof whose failure stops the boot (ADR-0013 R1). Changing this list changes
     /// what a real machine does: change the ADR with it.
-    const REFUSING: [Proof; 28] = [
+    const REFUSING: [Proof; 29] = [
         Proof::PageTables,
         Proof::FrameAllocator,
         Proof::Heap,
@@ -275,15 +280,18 @@ mod tests {
         Proof::EventsPorts,
         Proof::Stacks,
         Proof::KernelBound,
+        Proof::MigrationIntegrity,
         Proof::Ibpb,
     ];
 
     /// Every proof whose failure withholds a capability (ADR-0013 R2, Amendment 1).
-    const WITHDRAWING: [Proof; 7] = [
+    const WITHDRAWING: [Proof; 9] = [
         Proof::BusMasterQuiesce,
         Proof::Iommu,
         Proof::Processors,
+        Proof::FpuFormat,
         Proof::Random,
+        Proof::MigrationDelivery,
         Proof::Pcie,
         Proof::BusMastersQuiet,
         Proof::Nvme,
@@ -311,7 +319,7 @@ mod tests {
 
     #[test]
     fn the_table_has_one_row_per_proof_in_order() {
-        assert_eq!(Proof::ALL.len(), 73);
+        assert_eq!(Proof::ALL.len(), 76);
         for (i, &proof) in Proof::ALL.iter().enumerate() {
             assert_eq!(proof as usize, i, "{proof:?} is out of order");
             assert!(!proof.name().is_empty(), "{proof:?} has no name");
@@ -350,8 +358,19 @@ mod tests {
             Consequence::Withdraw("no randomness")
         );
         assert_eq!(Proof::Random.name(), "random-number generator");
-        // ADR-0020 S6 (TASKS item 94): reported until a mover reads the flag, by R3.
-        assert_eq!(Proof::FpuFormat.consequence(), Consequence::Report);
+        // ADR-0020 S20 (TASKS item 96): a failed delivery withdraws moves, and the boot goes on.
+        assert_eq!(
+            Proof::MigrationDelivery.consequence(),
+            Consequence::Withdraw("no thread moves")
+        );
+        assert_eq!(Proof::MigrationIntegrity.consequence(), Consequence::Refuse);
+        // ADR-0020 S6 (TASKS items 94 and 96): the mover withholds a processor whose FPU format
+        // differs (`sched::Unmoved::FpuFormat`), so a failure withdraws moves to and from it, as
+        // ADR-0013's row foresaw (the review of TASKS item 96, R96-14).
+        assert_eq!(
+            Proof::FpuFormat.consequence(),
+            Consequence::Withdraw("thread moves to or from that processor")
+        );
         assert_eq!(Proof::FpuFormat.name(), "FPU format");
     }
 
@@ -377,7 +396,7 @@ mod tests {
         assert!(!tally.must_stop());
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 66 of 67 proofs passed; 6 did not run; failed: random-number generator (no randomness)\n"
+            "origin-kernel: boot verdict: degraded: 69 of 70 proofs passed; 6 did not run; failed: random-number generator (no randomness)\n"
         );
     }
 
@@ -428,7 +447,7 @@ mod tests {
     fn the_verdict_of_a_clean_boot_is_exact() {
         assert_eq!(
             verdict(passed_all()),
-            "origin-kernel: boot verdict: 73 of 73 proofs passed\n"
+            "origin-kernel: boot verdict: 76 of 76 proofs passed\n"
         );
     }
 
@@ -440,7 +459,7 @@ mod tests {
         tally.record(Proof::Nvme, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 70 of 73 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
+            "origin-kernel: boot verdict: degraded: 73 of 76 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
         );
     }
 
@@ -451,7 +470,7 @@ mod tests {
         tally.record(Proof::PageTables, true);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 71 did not run\n"
+            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 74 did not run\n"
         );
     }
 
@@ -462,7 +481,7 @@ mod tests {
         tally.record(Proof::Raster, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 72 of 73 proofs passed; failed: rasterizer\n"
+            "origin-kernel: boot verdict: degraded: 75 of 76 proofs passed; failed: rasterizer\n"
         );
     }
 

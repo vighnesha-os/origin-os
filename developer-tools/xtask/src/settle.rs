@@ -65,6 +65,11 @@ const EXEMPT: &[(&str, &str, &str)] = &[
         "reads the counts for clauses that call `sched::settle` just before it",
     ),
     (
+        "framekernel/src/migration_proof.rs",
+        "counts",
+        "reads the counts for each migration proof's bracket: in `prove_integrity` and `prove_delivery`, `sched::settle` is called just before the first read, and `bracket_after` calls it again before the second; a new caller of `counts` must settle first (TASKS item 96)",
+    ),
+    (
         "framekernel/src/aml_proof.rs",
         "prove",
         "runs on the loader's stack before the first thread exists, the other processors started and idle: nothing reaps, retires a stack or allocates while it runs, so the heap moves with the proof alone; it compares the heap's bytes only, not the free frames (TASKS item 63, step B3, and the coordinating session's ruling on its heap check)",

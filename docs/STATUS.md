@@ -7,6 +7,141 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** On a physical machine only Origin's loader has run: a rented bench server, outside the declared scope, on 2026-11-20 (see the next section). |
 
+## The boot info and the kernel stack as loader data (TASKS item 133; 2026-11-22)
+
+On `claude/t133-loader-data`, cut from `land/batch-10` at `f1a4d882`; not landed. Rental H's findings put Origin's OS-defined memory types first among the likely causes of the stop at `ExitBootServices`, and the owner changed B3 for every loader (item 353, ADR-0002 Amendment 7).
+
+- **Every loader** now allocates the boot info and the kernel stack as `EfiLoaderData`, and names them by address in both maps it translates, as it already named the kernel image. The kernel sees the same region kinds and is unchanged.
+  - A region the firmware did not give as loader data is refused.
+  - A firmware region of either old type is never read as boot info.
+  - A machine-code check refuses any loader that uses either old type.
+- **A kernel-entry bench mode** (`bench-build --kernel`), never signed or shipped:
+  - it does the full bench loader's work, with no reset of any kind;
+  - after a successful call it enters the bench kernel with its breadcrumbs;
+  - it was built for the rental that would have confirmed the change.
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:**
+- **The turn on `1dd96c44` (17:28 to 19:04 UTC):** every gate passed:
+  - `check`;
+  - `reproducible-compare`, file by file: only the three loaders differ from the batch, and every kernel file is the same bytes;
+  - `boot-test`;
+  - three `boot-matrix` runs, with `boot-bench` 36 of 36 each time;
+  - all four bench builds.
+- **All seven planted controls fail for their own reason.**
+- **One independent AI review:** no High, one Medium and six Low, all answered. No person has reviewed it.
+- **Not on hardware:** the confirming rental, rental I, was cancelled by the owner before it ran (item 354), and nothing was bought. The change rests on rentals G and H's evidence alone.
+
+## A bench build's bisection mode (TASKS item 131; 2026-11-22)
+
+On `claude/t131-bisect-mode`, cut at TASKS item 130's tip `970cfca2`, with PR 59's records merged in from `land/batch-10` at `140c467b`; not landed. Rental G's minimal program returned from `ExitBootServices` on the firmware revision where rental E's full loader stopped. Owner item 352 (ADR-0002 Amendment 6) therefore bisects what Origin's loader adds, starting with its OS-defined memory types.
+
+- **The bisection mode,** a bench build of its own (`bench-build --bisect`), never signed or shipped:
+  - it does the full bench loader's work before the call, unchanged and in its own order, but allocates the kernel stack and the boot info as `EfiLoaderData`;
+  - from the map the page tables were built from, it prints how many descriptors it counted and how many are of an OS-defined type;
+  - it uses the minimal mode's decision and control: a triple fault and no call in the boot's first run, where both shutdown bits are set;
+  - it makes the call through the loader's copy of the boot services table, as every loader that stopped made it, after the live table's compare;
+  - after `EFI_SUCCESS` comes a triple fault and nothing else. After a second error, Amendment 2's line and Amendment 3's order, never writing `0xCF9`.
+- **`xtask`'s machine-code checks** show, on the image itself, that:
+  - no `0xCF9` is in DX;
+  - the only call that reaches the triple fault is `ExitBootServices'`, by its arguments;
+  - it is not read from the live table, there or anywhere in the image.
+
+  Their controls are the full and minimal loaders.
+- **The rental tool** reads the mode's runs from the firmware's starts. Each boot's window now adds the loader's own measured work. The plan stays at six boots of 5.8 minutes.
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:**
+- **The turn on `4165ecfb` (12:47 to 13:32 UTC):** every gate passed:
+  - `check`;
+  - the normal images the batch's bytes;
+  - `boot-test`;
+  - one `boot-matrix`, whose `boot-bench` passed 31 of 31, the bisection mode's nine among them;
+  - all three bench builds.
+- **QEMU has no AMD FCH,** so the `BENCH-FCH` switch supplies its values. Under QEMU the live table and the copy are the same, so only the machine-code checks show the call goes through the copy.
+- **All eleven planted controls fail for their own reason.** BC-1, BC-6, BC-7 and BC-9 did so only in a rerun on `60b36a9d`, which changes only `xtask`'s check order and its test.
+- **The review:** one independent AI review, no High, three Medium and eight Low, all answered. No person has reviewed it.
+- **Rental H's images** are staged (loader `ce53da4c…`, kernel `3bb1f2a5…`). The rental tool's dry run shows six boots, $0.81 an hour and $1.62 at worst; nothing was bought.
+- **The full bench loader's bytes moved** to `0451f7a7…` from `32b6e043`'s `57a1bbb1…`, since a line of shared reset code changed (R131-1). The kernel is unchanged.
+
+**Rental H** (2026-11-22, $0.81, the ledger now 8 rentals and $6.48; `docs/hardware/records/2026-11-22-latitude-m4-metal-small-h.md`, `docs/research/2026-11-22-rental-h-findings.md`), firmware 2.5a, rental C's revision:
+- **The boot services table did not change after the copy,** in all twenty-two runs: the copy is not the cause.
+- **Neither call hung.** Both calls (runs 3 and 6) were followed by a reset 5.5 s and 6.1 s after `X`, the delay after every control's triple fault, with a shutdown's start after each. So the call most likely returned, on the revision where rental C's normal loader, with the OS-defined types, stopped. The firmware's exit shutting the processor down is still open.
+- **The control mostly loops on 2.5a.** After most shutdowns this firmware resets the machine itself, twice, and the FCH then records that reset (bit 19), not the shutdown (bit 23). Twenty of twenty-two runs took the control, and Amendment 6's bit-23 confirmation after the calls did not come.
+- **Next, ranked in the findings:** an owner decision on ADR-0002 B3, the normal loader's memory types. It would be confirmed by one rental of the normal loader with the boot info and stack as `EfiLoaderData`, entering the bench kernel with its breadcrumbs.
+
+## The minimal-program mode and Amendment 4's addition, in the bench loader (TASKS item 128; 2026-11-22)
+
+On `claude/t128-minimal-mode`, cut from TASKS item 127's tip `a1069e45`, and in `land/batch-10` since `aac803ed`. Rentals E and F saw nothing after the mark before `ExitBootServices` and no reset after it. Owner items 347 and 348 (ADR-0002 Amendment 5, Amendment 4's addition) add a loader that does almost nothing before the call, to tell Origin's loader apart from the firmware. Item 349 makes it triple-fault after any successful call. Item 350 makes rental G the last rental for a while.
+
+- **The minimal mode,** a bench build of its own (`bench-build --minimal`), never signed or shipped:
+  - before the call it reads the memory map into a static buffer, the SPCR, the FADT's reset register, and the FCH's registers and `SMIxC0` behind Amendment 4's gate, and nothing else: no kernel read, no verification, no generator, no allocation, no page tables, no copy of the boot services table;
+  - where the last reset was not a shutdown and both shutdown bits are set, the boot's first run is the control, a triple fault and no call;
+  - otherwise the call, through the live boot services table, with `X` straight before it. After `EFI_SUCCESS`, a triple fault and nothing else (item 349). After an error, Amendment 2's line and Amendment 3's order, never writing `0xCF9`.
+- **Amendment 4's addition:** `SMIxC0`'s routing of the `0xCF9` trap, read behind its own gate in both bench modes; and, in the full bench mode, the live boot services table compared byte for byte with the loader's copy before the call.
+- **The rental tool** reads a minimal image's runs and timings, and gives it six boots of up to five minutes, each ending at its answer (item 350). It refuses, before buying, a plan that does not end its boots 10 minutes before the deadline.
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:** every gate passed on `32b6e043`, in one turn (07:07 to 07:48 UTC): `check`; the normal images the batch's bytes; `boot-test`; one `boot-matrix`, whose `boot-bench` passed 22 of 22, the minimal mode's six among them; both bench builds. QEMU has no AMD FCH, so a stand-in table only QEMU's firmware tables hold supplies its values. All nine planted controls fail for their own reason: MC-3 and MC-5 only in a follow-on, since Clippy stopped their first plants. One independent AI review: no High, five Medium and twelve Low, all answered. Rental G's images are staged, and the rental tool's dry run shows six boots, $0.81 an hour and $1.62 at worst; nothing bought.
+
+**Rental G** (2026-11-22, $0.81, the ledger now 7 rentals and $5.67; `docs/hardware/records/2026-11-22-latitude-m4-metal-small-g.md`, `docs/research/2026-11-22-rental-g-findings.md`), firmware 2.4a, rental E's revision:
+- **The control worked in all six boots:** a triple fault reset the board, and the next run read a shutdown in `PMxC0` (bit 23). Rental F could not show that a triple fault resets this board.
+- **A reset followed every call the tool did not interrupt,** five of seven: the firmware started again 48.8 to 48.9 s after `X`, the delay it showed after each triple fault (48.3 to 48.9 s) and after the provider's own restart. The one run that came before the tool's next restart read a shutdown and made the call again. No `Y`, no line.
+- **So the minimal program's `ExitBootServices` most likely returned,** and the triple fault behind it reset the machine, on the revision where rental E's bench loader stopped at the call. That is Amendment 5's "if the call returns": the stop is most likely in what Origin's loaders do before the call. The firmware's exit shutting the processor down itself fits too, and is ranked well below, since by item 349 nothing is written after a successful call.
+- **The rental tool's summaries said the opposite** ("with no reset after the call") and are wrong: it counts loader runs, not firmware starts, and its five-minute boot, set from rental F's faster firmware, ended before the run after each call's reset. Fixing that is the first, free, next step.
+- **`SMIxC0` reads `0x04000000`:** the firmware's `0xCF9` trap is an SMI. `PMxC0` holds bit 20 beside each cause, which AMD's document says hardware never clears.
+- **Next, ranked in the findings:** the tool's fix; the full bench image staged (its table compare has not run on a machine); then, when item 350's pause lifts, one rental with two questions: the copied table's compare and Origin's OS-defined memory types as `EfiLoaderData`.
+- **TASKS item 130** (`claude/t130-minimal-reading`): the tool now reads each run from the firmware's starts, never says "no reset" while one of its own restarts is in flight, and sizes a minimal boot's window from the firmware's measured delays.
+  - A replay test on rental G's own console reads a reset after 5 of the 5 calls the restarts did not overtake.
+  - The full bench image of `32b6e043` is staged, and its GET-only dry run bought nothing.
+  - The owner item for the two-question rental is drafted for the coordinating session. The owner accepted it as item 352 (ADR-0002 Amendment 6, PR 59), and TASKS item 131 builds it.
+  - One independent AI review: one High (a retry's `Y` read as the firmware), five Medium and seven Low, all answered. 50 tests pass, and twenty planted faults each fail one. No person has reviewed it.
+
+## The loader's stack depth before `ExitBootServices` (TASKS item 127; 2026-11-22)
+
+On `claude/t127-stack-depth`, cut from `land/batch-10` at `953cda2c`, and in the batch since. Rental F's findings ranked first a free measurement: how deep the loader's stack goes before the call, against the 128 KiB UEFI promises (`docs/research/2026-11-22-loader-stack-depth.md`).
+
+- **How:** a measurement build of its own, never signed or rented, paints exactly the promised 128 KiB at entry. After each of six phases it finds the deepest word written, calibrated on a known 64 KiB array. A static chain from the build's link map and disassembly cross-checks it.
+- **The rentals' path** (an unsigned kernel): at most 10,312 bytes, 7.9%.
+- **The shipping path** (a signed kernel, ML-DSA-87 verified): 23,240 to 23,800 bytes, 17.7% to 18.2%, the higher figure from the keeper's run when it landed the item. The static chain matches the quietest boot to the byte.
+- **So the stack drops to the bottom of the candidates** (the coordinating session's ruling). OVMF's own frames are in the figure; AMI's are not.
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:** `stack-depth`, 12 boots; its four planted controls fail; `check` passes; the normal images are the batch's bytes.
+
+## A bench reset with no firmware code: a bench loader for rental F (TASKS item 121; 2026-11-21)
+
+On `claude/t121-firmware-free-reset`, cut from TASKS item 116's branch, with `land/batch-9` at `d0376076` merged in; not yet in the batch. Rental E showed nothing after the mark before `ExitBootServices`, and no reset (`docs/research/2026-11-21-rental-e-findings.md`): either the call never returns, or it returned and both the console's path and the firmware's reset failed after it. This loader separates the two with a reset that runs no firmware code (decision item 345, ADR-0002 Amendment 4).
+
+- **Before the call, on an AMD processor:** the bench loader reads the FCH's power-management registers and writes none. It reads them only where the firmware's DSDT describes a system-memory region holding them, and where the firmware's page tables map them to themselves. It prints their values: the decode of port `0xCF9`, the bit that stops its reset, the two shutdown bits, the PM1 event block and the cause of the last reset.
+- **The branch:**
+  - **another reset cause:** the boot's first run, the control: `0x06` to `0xCF9`, and no call;
+  - **a `0x06` to `0xCF9`, or no record at all:** the call. After a call that returns `EFI_SUCCESS`, `0x06` to `0xCF9` is the first thing, then 100 ms, then a triple fault where the shutdown message is on, then Amendment 3's order. After an error, the loader's retry with the same check;
+  - **a layout that contradicts AMD's documents:** no control, and Amendment 3's path.
+- **The machine code after the call** holds only the status's compare, the plan's loads and compares, and branches before the `out`; `boot-bench` refuses anything else.
+- **Normal images are unchanged,** checked by the reproducible gate against the batch's bytes.
+- **The list of what Origin's loader does before the call that a minimal UEFI program does not** is in `docs/research/2026-11-21-loader-before-the-call.md`.
+
+**What is shown, under QEMU 11.1.3's software processor on the development Mac only:** `boot-bench`, 16 of 16. QEMU has no AMD FCH, so a switch only QEMU's ESP may hold stands in for the reads, and the rental tool refuses it. The FCH's nine scenarios:
+- the control;
+- `0xCF9` after the call;
+- the triple fault;
+- the fall-through;
+- no record;
+- the reset only after the retry succeeds;
+- the normal path after both calls fail;
+- a contradicting layout;
+- a control that does not reset.
+
+Its new controls BC-13, BC-15 and BC-16 each fail. One independent AI review: no High, four Medium and eight Low, all answered (`docs/engineering/REVIEW_T121_2026-11-21.md`). Three of the answers refine Amendment 4's text; the owner accepted them as decision sheet item 346.
+
+**The full gates passed on `12a4e081`** (2026-11-22):
+- all 19 control runs failed, each for its own reason;
+- `check` and `boot-test` passed;
+- `boot-matrix` passed once, by the coordinating session's ruling;
+- the normal images are the same bytes as the batch's.
+
+**Rental F** (2026-11-22, $0.81; `docs/hardware/records/2026-11-22-latitude-m4-metal-small-f.md`, `docs/research/2026-11-22-rental-f-findings.md`):
+- **The control worked:** in two boots, the run before the call wrote `0x06` to `0xCF9`, the firmware started again within 7.1 s, and the next run found the reset recorded in the FCH.
+- **That next run made the call,** and then nothing: no `0xCF9` reset, no triple fault, for over six minutes. That is reading A, `ExitBootServices` does not return, now beside a positive control in the same boot, on a fourth firmware revision.
+- **One limit:** the firmware has the FCH's own `0xCF9` reset turned off (`PMxD2` bit 6) and resets through its own code when the port is written, most likely in SMM. So the first reset after the call was firmware code, and only the triple fault behind it was not. The findings still rank A well ahead, and name the next steps: the stack's depth under QEMU, two free reads before the call, and a minimal program with the triple fault first.
+
 ## The reset diagnostic: a bench loader for rental E (TASKS item 116; 2026-11-21)
 
 On `claude/t116-reset-diagnostic`, with `land/batch-9` at `0e4f99f9` merged in; not yet in the batch. Rental D showed nothing after the loader's last line (`docs/research/2026-11-21-rental-d-findings.md`): either `ExitBootServices` does not return on the rented firmware, or nothing written straight to the SPCR's UART after it reaches the console.

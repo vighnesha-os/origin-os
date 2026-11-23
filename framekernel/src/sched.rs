@@ -36,7 +36,7 @@ use origin_frame::percpu::PerCpu;
 use origin_frame::stack::{FpuArea, GuardedStack, StackSlot, State as SlotState, ThreadStart};
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::exits::{Exits, Pending};
-use origin_frame::sync::threads::{Empty, Location, Outcome, Queues, Record};
+use origin_frame::sync::threads::{Empty, Location, Met, Outcome, Queues, Record};
 use origin_frame::trap::{MintHolder, Pinned, Switch};
 
 /// Each kernel thread's stack.
@@ -816,10 +816,33 @@ mod waking {
     impl Queues for KernelQueues<'_> {
         type Queue = RunQueue<Placed>;
 
+        // Inlined into the location loop, as before TASKS item 96: with the loop also in the
+        // out-of-line retry after pinned mode, LLVM would otherwise make it a call on every
+        // wake-up's look (the recount turn's figures).
+        #[inline(always)]
         fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut RunQueue<Placed>) -> R) -> Option<R> {
             let queue = QUEUES.get(usize::try_from(cpu).ok()?)?;
             // Interrupts are off: only `within`'s section makes `self`.
             Some(f(&mut queue.lock()))
+        }
+
+        #[inline(always)]
+        fn holds<S>(
+            queue: &RunQueue<Placed>,
+            slot: u16,
+            _number: u32,
+            record: &origin_frame::sync::threads::Record<S>,
+        ) -> bool {
+            // ADR-0020 S20, trigger 3 (TASKS item 96, the coordinating session's ruling Q6): the
+            // slot holds this very record, compared by address with the one the wake-up has, read
+            // without the slot's state (`RunQueue::held`). On a wake-up that meets no
+            // inconsistency, that load and compare and their branch are all it adds (CL47).
+            queue.held(usize::from(slot)).is_some_and(|placed| {
+                core::ptr::eq(
+                    core::ptr::from_ref(placed.record()).cast::<()>(),
+                    core::ptr::from_ref(record).cast::<()>(),
+                )
+            })
         }
 
         fn wake_slot(queue: &mut RunQueue<Placed>, slot: u16) -> bool {
@@ -827,13 +850,199 @@ mod waking {
             let generation = queue.generation(slot);
             queue.wake(slot, generation)
         }
+
+        fn find(queue: &RunQueue<Placed>, number: u32) -> Option<u16> {
+            (1..crate::runqueue::CAPACITY)
+                .find(|&slot| {
+                    queue
+                        .record(slot)
+                        .is_some_and(|placed| placed.number() == number)
+                })
+                .and_then(|slot| u16::try_from(slot).ok())
+        }
+
+        fn count(&self) -> u32 {
+            u32::try_from(QUEUES.indexes()).unwrap_or(u32::MAX)
+        }
     }
 }
 
-/// Moves a wake-up followed: times it found, under the lock of the queue it had read, its
-/// thread's location changed to another slot with the same generation. No thread moves yet
-/// (ADR-0003 K7 still holds; ADR-0020 S6 is not built), so the boot proofs require 0 (TASKS item
-/// 92, the coordinating session's ruling Q5).
+/// ADR-0020 S20's pinned mode (TASKS item 96; the contract's §2): once an inconsistency is met
+/// that a move or a wake-up can stop safely at, moves are withdrawn for the rest of the boot.
+/// Nothing leaves it. Every mover reads [`withdrawn`] under its source's queue lock, and the
+/// first trigger is named on one line, by whoever entered it, after its locks are released, with
+/// interrupts as its caller had them. Later triggers are counted.
+///
+/// The kernel stops only for what S20 keeps the stop for: an inconsistency that could have let
+/// two processors run one context, or given back a stack in use. A wake-up exhausted a second
+/// time, with moves withdrawn, means the flag itself failed, and stops too (the ruling's Q17).
+pub(crate) mod pinned {
+    use core::fmt::Write;
+    use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+    use origin_frame::sync::threads::{Met, Outcome};
+
+    use crate::cpu::CpuIndex;
+
+    /// What entered pinned mode (S20's triggers; the contract's §2).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Trigger {
+        /// "thread migration: delivery" failed (trigger 1).
+        DeliveryFailed,
+        /// A move's `lend` found no frame where its checks had found it published (trigger 2).
+        LendLost,
+        /// A location named a queue whose slot did not hold its thread (trigger 3).
+        Misplaced,
+        /// A wake-up followed its thread `WAKE_TRIES` times (trigger 4).
+        Exhausted,
+    }
+
+    impl Trigger {
+        const fn code(self) -> u8 {
+            match self {
+                Self::DeliveryFailed => 1,
+                Self::LendLost => 2,
+                Self::Misplaced => 3,
+                Self::Exhausted => 4,
+            }
+        }
+
+        const fn from_code(code: u8) -> Option<Self> {
+            match code {
+                1 => Some(Self::DeliveryFailed),
+                2 => Some(Self::LendLost),
+                3 => Some(Self::Misplaced),
+                4 => Some(Self::Exhausted),
+                _ => None,
+            }
+        }
+
+        /// What the line calls it, with no address (ADR-0004 Amendment 2, A6). Short enough that
+        /// every line, with its longest `then`, fits the console's line of 160 bytes (the review
+        /// of TASKS item 96, R96-9): at most 153 with a CPU of three digits.
+        const fn named(self) -> &'static str {
+            match self {
+                Self::DeliveryFailed => "thread migration: delivery failed",
+                Self::LendLost => "a move's lend found no published frame",
+                Self::Misplaced => "a wake-up's location named the wrong slot",
+                Self::Exhausted => "a wake-up followed its thread 64 times",
+            }
+        }
+    }
+
+    impl From<Met> for Trigger {
+        fn from(met: Met) -> Self {
+            match met {
+                Met::Exhausted => Self::Exhausted,
+                Met::Misplaced => Self::Misplaced,
+            }
+        }
+    }
+
+    /// 0 while moves are on; otherwise the first trigger's code.
+    static FIRST: AtomicU8 = AtomicU8::new(0);
+    /// Triggers met after the first.
+    static LATER: AtomicU64 = AtomicU64::new(0);
+
+    /// Enters pinned mode for `trigger`: `true` if this call entered it, and so owes the line
+    /// ([`line`]); `false` if it was entered already, and the trigger is counted. A
+    /// compare-and-swap from 0, so the first trigger is the one named.
+    pub(crate) fn enter(trigger: Trigger) -> bool {
+        if FIRST
+            .compare_exchange(0, trigger.code(), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            true
+        } else {
+            LATER.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
+    /// Whether moves are withdrawn. A mover reads it under its source's queue lock, and holds that
+    /// lock to its move's end (`sched::migrate`).
+    pub(crate) fn withdrawn() -> bool {
+        FIRST.load(Ordering::Acquire) != 0
+    }
+
+    /// The first trigger, if pinned mode was entered, and the triggers met after it.
+    pub(crate) fn entered() -> Option<(Trigger, u64)> {
+        Trigger::from_code(FIRST.load(Ordering::Acquire))
+            .map(|trigger| (trigger, LATER.load(Ordering::Relaxed)))
+    }
+
+    /// The line that names the first trigger, by the caller that entered pinned mode, after the
+    /// queue locks it took are released. `then` says what it did next: for a misplaced location,
+    /// what the one search found.
+    ///
+    /// A wake-up writes it inside its interrupts-off section, out of line (a change from TASKS item
+    /// 96's contract, §2, which had it after the section; ruled by the coordinating session): the
+    /// console queues a line written with interrupts off and pumps the UART once, as it does for
+    /// an interrupt handler's line, so nothing waits. A full queue drops it, as it drops any line
+    /// written so, and counts the bytes it dropped (`console`'s `note_lost`; R96-9): the line is
+    /// kept short, within the console's line, so it goes in one send.
+    ///
+    /// **Nesting** (the ruling's first condition). No run-queue lock is held here:
+    /// `origin_sync::threads::wake` calls its `report` hook after its retry or its search has
+    /// returned, and each queue lock is taken and released inside one `Queues::locked` call. The
+    /// console's lock (`console::SINKS`) is a leaf:
+    /// - every holder takes it with interrupts off, so no interrupt handler on the same
+    ///   processor runs while it is held;
+    /// - every holder does only the console's own work under it (its queues, its UARTs, its
+    ///   framebuffer), and never takes a run-queue lock or calls `wake` there. That covers the
+    ///   ordinary writers, the urgent writer of panics and exception reports, and `init`, the
+    ///   SPCR move and the loader's UART, which run before any thread exists.
+    ///
+    /// So neither lock is ever taken inside the other, in either order.
+    ///
+    /// **The writer.** `Console::new`, never `here_console`: on the boot flow with interrupts off,
+    /// `here_console` gives the boot flow's writer, which may open an interrupt window between a
+    /// line's sections, and that must not happen inside the wake-up's section.
+    ///
+    /// **A panic right after** (the ruling's second condition). The panic handler's urgent writer
+    /// hands its bytes to the same queue behind this line and pumps the UART until its own bytes
+    /// are out, so this line goes out first. Only a holder stuck with the lock makes it write
+    /// around the queue.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn line(trigger: Trigger, on: CpuIndex, then: &str) {
+        let _ = writeln!(
+            crate::console::Console::new(),
+            "origin-kernel: scheduler: pinned mode: moves withdrawn: {} on CPU {on}{then}",
+            trigger.named()
+        );
+    }
+
+    /// What a wake-up that met `met` did next, for its line: where it reached its thread, if it did.
+    pub(crate) fn then_woke(met: Met, outcome: Outcome) -> &'static str {
+        match (met, outcome) {
+            (Met::Misplaced, Outcome::Reached { .. }) => "; the search woke it in its slot",
+            (Met::Misplaced, Outcome::Stale) => "; the search found its record reused",
+            (Met::Misplaced, _) => "; the search found its record in no queue",
+            (Met::Exhausted, Outcome::Reached { .. }) => {
+                "; with moves withdrawn it reached the thread"
+            }
+            (Met::Exhausted, Outcome::Exhausted) => {
+                "; 64 more with moves withdrawn: the kernel stops"
+            }
+            // The second loop met a misplaced location, and the search found the record nowhere
+            // (R96-10).
+            (Met::Exhausted, Outcome::Misplaced) => {
+                "; with moves withdrawn its record was in no queue"
+            }
+            (Met::Exhausted, Outcome::Stale | Outcome::Gone) => {
+                "; with moves withdrawn its thread had gone"
+            }
+        }
+    }
+}
+
+/// Moves a wake-up followed of threads not declared movable: times it found, under the lock of the
+/// queue it had read, its thread's location changed to another slot with the same generation.
+/// Such a thread never moves (TASKS item 96: only a movable thread does), so a follow of one is an
+/// inconsistency, and the IPC proof and every settle require 0 (TASKS item 92, the coordinating
+/// session's ruling Q5; TASKS item 96's Q8). Follows of movable threads are counted by the waker's
+/// processor (`threads::Follows`).
 static WAKES_FOLLOWED: AtomicU64 = AtomicU64::new(0);
 
 /// How many moves wake-ups have followed ([`WAKES_FOLLOWED`]).
@@ -841,10 +1050,32 @@ pub(crate) fn wakes_followed() -> u64 {
     WAKES_FOLLOWED.load(Ordering::Relaxed)
 }
 
+/// Moves wake-ups followed of threads that ended, their records going to new threads, before the
+/// follows were counted ([`followed`]): neither a movable thread's nor another's, since only the
+/// followed thread's own generation tells which it was (the review of TASKS item 96, R96-5). The
+/// delivery proof reports them; no settle judges them.
+static FOLLOWS_UNCLASSED: AtomicU64 = AtomicU64::new(0);
+
+/// How many follows were of threads gone before they were counted ([`FOLLOWS_UNCLASSED`]).
+pub(crate) fn follows_unclassed() -> u64 {
+    FOLLOWS_UNCLASSED.load(Ordering::Relaxed)
+}
+
 /// Makes `thread` ready, wherever it is (`origin_sync::threads::wake`). If it was blocked on
 /// another processor, that processor is sent a reschedule IPI (to its APIC ID), so it switches to
 /// the thread now rather than at its next timer tick. Returns whether an IPI was sent, so a
 /// wake-up across processors can be counted.
+///
+/// An inconsistency it meets enters pinned mode ([`pinned`]; ADR-0020 S20): a location that named
+/// a slot not holding its thread (trigger 3), or 64 follows (trigger 4), after which it looks again
+/// with moves withdrawn; a second exhaustion stops the kernel. A wake-up that meets none pays the
+/// record check alone (CL47); the rest is out of line.
+///
+/// **Interrupts off** (ADR-0020 S1's note of 2026-11-22; the coordinating session's ruling Q18):
+/// the wake-up, the compare and the IPI run in one interrupts-off section. Each move it follows
+/// adds about 2.5 µs on the budgets' figures (the rest of one move, B20, and one look). Paced as
+/// `migrate` requires, a wake-up follows at most one; a caller that broke that rule could make it
+/// follow 64, about 160 µs, which exceeds B18's 50 µs. The delivery proof measures the longest.
 pub(crate) fn wake(thread: ThreadRef) -> bool {
     let Some(record) = threads::record(thread.record) else {
         return false;
@@ -854,33 +1085,493 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
     // the woken thread would wait for that processor's next tick. The queues are locked in the
     // same section (`waking`), so a wake-up opens one section, as before TASKS item 93.
     waking::within(|queues, here| {
-        let woke = origin_frame::sync::threads::wake(queues, record, thread.generation);
+        // Only the location loop is on this path (TASKS item 96, the coordinating session's
+        // ruling, ADR-0018 V1): an inconsistency goes on out of line, in `wake_inconsistent`, so
+        // that no answer of the out-of-line paths merges into this one's.
+        // The record's number goes to `follow` and no further: the kernel's queues compare the
+        // record by address (`KernelQueues::holds`), and the out-of-line path finds the number
+        // from the record, so no register keeps it through the loop.
+        let woke =
+            origin_frame::sync::threads::follow(queues, record, thread.record, thread.generation);
+        match woke.outcome {
+            Outcome::Exhausted => {
+                return wake_inconsistent(
+                    queues,
+                    record,
+                    thread.generation,
+                    Met::Exhausted,
+                    woke.retries,
+                    here,
+                );
+            }
+            Outcome::Misplaced => {
+                return wake_inconsistent(
+                    queues,
+                    record,
+                    thread.generation,
+                    Met::Misplaced,
+                    woke.retries,
+                    here,
+                );
+            }
+            Outcome::Reached { .. } | Outcome::Stale | Outcome::Gone => {}
+        }
         if woke.retries != 0 {
-            WAKES_FOLLOWED.fetch_add(u64::from(woke.retries), Ordering::Relaxed);
+            followed(record, thread.generation, woke.retries, here, true);
         }
         match woke.outcome {
-            Outcome::Reached { ready: true, cpu } => {
-                let Some(cpu) = usize::try_from(cpu).ok().and_then(CpuIndex::new) else {
-                    return false;
-                };
-                let me = cpu::this_cpu(here);
-                if cpu != me.index()
-                    && let Some(apic_id) = cpu.apic_id()
-                {
-                    timer::send_reschedule_ipi(me, apic_id);
-                    return true;
-                }
-                false
-            }
-            // Never while no thread moves. Until ADR-0020 S20's pinned mode (TASKS item 96), the
-            // kernel stops rather than lose a wake-up (the coordinating session's ruling Q4).
-            Outcome::Exhausted => panic!(
-                "a wake-up followed its thread {} times",
-                origin_frame::sync::threads::WAKE_TRIES
-            ),
-            Outcome::Reached { ready: false, .. } | Outcome::Stale | Outcome::Gone => false,
+            Outcome::Reached { ready: true, cpu } => ipi_if_elsewhere(cpu, here),
+            Outcome::Reached { ready: false, .. }
+            | Outcome::Stale
+            | Outcome::Gone
+            | Outcome::Exhausted
+            | Outcome::Misplaced => false,
         }
     })
+}
+
+/// The reschedule IPI to processor `cpu`, which a wake-up made a thread ready on, if it is not
+/// this one: whether one was sent.
+#[inline(always)]
+fn ipi_if_elsewhere(cpu: u32, here: origin_frame::trap::Here<'_>) -> bool {
+    let Some(cpu) = usize::try_from(cpu).ok().and_then(CpuIndex::new) else {
+        return false;
+    };
+    let me = cpu::this_cpu(here);
+    if cpu != me.index()
+        && let Some(apic_id) = cpu.apic_id()
+    {
+        timer::send_reschedule_ipi(me, apic_id);
+        return true;
+    }
+    false
+}
+
+/// [`wake`] after its location loop met an inconsistency (ADR-0020 S20, triggers 3 and 4), out of
+/// line and in its section: pinned mode's two hooks, the retry or the search
+/// (`origin_sync::threads::after_inconsistency`), the moves followed, and the IPI. The line that
+/// names the trigger is written there, inside the section, as an interrupt handler's line is
+/// (`pinned::line`). A second exhaustion, with moves withdrawn, means the flag itself failed, and
+/// the kernel stops (the ruling's Q17).
+///
+/// It is given the record and the generation, and finds the record's number from the record
+/// (`threads::number_of`), so that [`wake`]'s location loop keeps no register for the number. A
+/// record is always one block's, since [`wake`] has it from `threads::record`; one that is not
+/// stops the kernel.
+#[cold]
+#[inline(never)]
+fn wake_inconsistent<'a>(
+    queues: &waking::KernelQueues<'a>,
+    record: &Record<threads::State>,
+    generation: u32,
+    met: Met,
+    retries: u32,
+    here: origin_frame::trap::Here<'a>,
+) -> bool {
+    let Some(number) = threads::number_of(record) else {
+        panic!("a wake-up's record is in no processor's block");
+    };
+    let woke = origin_frame::sync::threads::after_inconsistency(
+        queues,
+        record,
+        number,
+        generation,
+        met,
+        retries,
+        |met| pinned::enter(met.into()),
+        |met, outcome| {
+            pinned::line(
+                met.into(),
+                cpu::this_cpu(here).index(),
+                pinned::then_woke(met, outcome),
+            );
+        },
+    );
+    if woke.retries != 0 {
+        followed(record, generation, woke.retries, here, false);
+    }
+    match woke.outcome {
+        Outcome::Reached { ready: true, cpu } => ipi_if_elsewhere(cpu, here),
+        Outcome::Exhausted => panic!(
+            "a wake-up followed its thread {} times, {} of them with moves withdrawn",
+            woke.retries,
+            origin_frame::sync::threads::WAKE_TRIES
+        ),
+        Outcome::Reached { ready: false, .. }
+        | Outcome::Stale
+        | Outcome::Gone
+        | Outcome::Misplaced => false,
+    }
+}
+
+/// The moves a wake-up of the thread `record` and `generation` name followed, out of line (TASKS
+/// item 96, the coordinating session's rulings Q8 and Q13): of a movable thread, by this
+/// processor's count (`threads::Follows`), which the delivery proof reports; of any other,
+/// [`WAKES_FOLLOWED`], an inconsistency the settles judge. In the wake-up's section, under its
+/// witness.
+///
+/// **Whose flag** (the review of TASKS item 96, R96-5). Read after the location loop, with no
+/// lock, the movable flag may already be a new thread's: the followed one may have ended and its
+/// record gone to another. So the generation is read before the flag and after it, and both must
+/// be the name's. `Block::take` stores a new thread's flag with Release after its new generation,
+/// and `Record::movable` loads it with Acquire, so a flag read from a new thread comes with the new
+/// generation. Follows whose thread is gone are counted apart ([`FOLLOWS_UNCLASSED`]).
+///
+/// **Pacing.** On a wake-up's common path (`paced`), a debug build also stops on more than 8
+/// follows of a movable thread, which pacing rules out; every build reports them. Not after an
+/// inconsistency, where the loop has run its `WAKE_TRIES` and S20 goes on pinned (R96-7).
+#[cold]
+#[inline(never)]
+fn followed(
+    record: &Record<threads::State>,
+    generation: u32,
+    retries: u32,
+    here: origin_frame::trap::Here<'_>,
+    paced: bool,
+) {
+    let movable = (record.generation() == generation)
+        .then(|| record.movable())
+        .filter(|_| record.generation() == generation);
+    match movable {
+        Some(true) => {
+            debug_assert!(
+                !paced || retries <= 8,
+                "a wake-up followed a movable thread {retries} times: moves were not paced"
+            );
+            if let Some(follows) = threads::follows_here(cpu::this_cpu(here)) {
+                follows.note(retries);
+            }
+        }
+        Some(false) => {
+            WAKES_FOLLOWED.fetch_add(u64::from(retries), Ordering::Relaxed);
+        }
+        None => {
+            FOLLOWS_UNCLASSED.fetch_add(u64::from(retries), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Why [`migrate`] moved nothing (TASKS item 96; the contract's §1.1 and §1.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unmoved {
+    /// The thread is on the destination already.
+    AlreadyThere,
+    /// Its record's location is clear: it has exited, or was never queued.
+    Gone,
+    /// The record holds another thread: the name's has been reaped.
+    Stale,
+    /// Moves are withdrawn (pinned mode), or the thread may not move: not declared movable, or its
+    /// pin count is above 0 (ADR-0020 S2, S20).
+    Pinned,
+    /// It is running, asleep, blocked or exiting: only a ready thread that is not running moves
+    /// (the review of TASKS item 95, R95-5).
+    NotReady,
+    /// A processor does not take part in moves: not online, or its FPU format differs (ADR-0020
+    /// S6, N9).
+    FpuFormat,
+    /// The destination's run queue has no free slot (N13).
+    QueueFull,
+    /// The destination's table of contexts had no free slot: the frame went back to its source.
+    TableFull,
+    /// Its frame is still being switched out (`NotYet` or `Leaving`; ADR-0020 S5): try later.
+    TryLater,
+    /// Its location changed at each of `WAKE_TRIES` looks, another mover moving it: try later.
+    Moving,
+    /// An inconsistency (ADR-0020 S20, triggers 2 and 3): pinned mode was entered, and the thread
+    /// stays where it is.
+    Inconsistent,
+}
+
+/// What a [`migrate`] did, for the proofs' counts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Moved {
+    /// The processor it left.
+    pub(crate) from: CpuIndex,
+    /// Whether the thread carried a pending wake-up (N1).
+    pub(crate) carried_wake: bool,
+    /// The move's critical section in TSC ticks, from before its first queue lock to after its
+    /// last unlock (B20, a hypothesis of 2 µs; measured by the integrity proof).
+    pub(crate) ticks: u64,
+}
+
+/// Whether processor `cpu`'s run queue has a free slot: the integrity proof's capacity phase
+/// fills a queue and checks it is full (ADR-0020 N13; the review of TASKS item 96, R96-13).
+pub(crate) fn has_room(cpu: CpuIndex) -> bool {
+    QUEUES
+        .get(cpu.get())
+        .is_some_and(|queue| without_interrupts(|| queue.lock().has_room()))
+}
+
+/// The state of the thread `thread` names, for a migration proof's line when it fails (TASKS
+/// item 96; the coordinating session's ruling on the gates' stop of 2026-11-22): its record's
+/// number and generation against the name's, whether it is movable, its pin count, its location,
+/// and its slot as the queue there holds it (`RunQueue::describe`), with whether that slot holds
+/// this very record (`RunQueue::held`, compared by address as `KernelQueues::holds` compares it):
+/// "held matches", "held is" another record's number, or "held none". That tells a line read while
+/// a hand-off is in flight from a thread that is stuck where it is (the coordinating session's
+/// ruling on the second stop, 2026-11-22). No address. Read only, under the queue's lock; no path
+/// but a failing proof's calls it.
+pub(crate) fn describe_thread(thread: ThreadRef) -> alloc::string::String {
+    let Some(record) = threads::record(thread.record) else {
+        return alloc::format!("record {} none", thread.record);
+    };
+    let at = record.location();
+    let mut out = alloc::format!(
+        "record {} generation {} (named {}), movable {}, pins {}",
+        thread.record,
+        record.generation(),
+        thread.generation,
+        record.movable(),
+        record.pins()
+    );
+    match at {
+        Some(at) => {
+            let slot = QUEUES
+                .get(usize::try_from(at.cpu()).unwrap_or(usize::MAX))
+                .map(|queue| {
+                    without_interrupts(|| {
+                        let queue = queue.lock();
+                        let slot = usize::from(at.slot());
+                        (queue.describe(slot), queue.held(slot))
+                    })
+                });
+            match slot {
+                Some((s, held)) => {
+                    out.push_str(&alloc::format!(
+                        ", on CPU {} slot {}: {}, pending {}, woken {}, pass {}, floor {}, current slot {}",
+                        at.cpu(),
+                        at.slot(),
+                        s.state,
+                        s.pending,
+                        s.woken,
+                        s.pass,
+                        s.floor,
+                        s.current
+                    ));
+                    match held {
+                        Some(placed) if core::ptr::eq(placed.record(), record) => {
+                            out.push_str(", held matches");
+                        }
+                        Some(placed) => {
+                            out.push_str(&alloc::format!(", held is {}", placed.number()));
+                        }
+                        None => out.push_str(", held none"),
+                    }
+                }
+                None => out.push_str(&alloc::format!(", on CPU {} (no such queue)", at.cpu())),
+            }
+        }
+        None => out.push_str(", located nowhere"),
+    }
+    out
+}
+
+/// Every processor's run queue, for the same lines ([`describe_thread`]): its ready slots, its
+/// current slot, whether slot 0 is its idle flow, and the contexts it holds. Read only.
+pub(crate) fn describe_cpus() -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    for cpu in 0..QUEUES.indexes() {
+        if let Some(queue) = QUEUES.get(cpu) {
+            let (ready, current, idle, live) = without_interrupts(|| queue.lock().describe_queue());
+            out.push_str(&alloc::format!(
+                "{}CPU {cpu}: {ready} ready, current slot {current}, idle {idle}, {live} contexts",
+                if out.is_empty() { "" } else { "; " }
+            ));
+        }
+    }
+    out
+}
+
+/// Whether the thread `thread` names is alive and queued on processor `cpu`: the capacity phase's
+/// check that a refused move left it where it was (R96-13).
+pub(crate) fn queued_on(thread: ThreadRef, cpu: CpuIndex) -> bool {
+    threads::record(thread.record).is_some_and(|record| {
+        record.generation() == thread.generation
+            && record
+                .location()
+                .is_some_and(|at| usize::try_from(at.cpu()).ok() == Some(cpu.get()))
+    })
+}
+
+/// Moves `thread` to processor `to` (ADR-0020 S6; TASKS item 96): a movable thread, ready and not
+/// running, whose pin count is 0, between two processors that take part in moves (`online`).
+///
+/// **The order** (S6; the contract's §1.1), in one interrupts-off section whose token the move gate
+/// requires: the location read; both queue locks, in index order; the location read again (a move
+/// in between is followed, at most `WAKE_TRIES` times); pinned mode checked under the source's
+/// lock; eligibility; the gate (`cpu::move_context`), under which the frame is lent from the
+/// source's table of contexts, adopted by the destination's, the thread departs its source queue
+/// with its lag and pending wake-up, arrives at the destination's, and its location follows, and
+/// the source forgets the home; the locks released; one reschedule IPI to a destination that is
+/// not this processor (the ruling's Q11). Under the gate it takes no lock and drops no stack.
+///
+/// **Why the reads under the source's lock suffice** (the review of TASKS item 93, R93-7): the pin
+/// count and the movable flag are written only by the running thread and by its spawner before its
+/// first push, and the mover acts only on a thread ready and not running under that lock, whose
+/// last write came before the switch-out its scheduler made under the same lock.
+///
+/// **Pacing** (S1, S10; the coordinating session's rulings Q13 and Q18): a caller moves a thread at
+/// most once per tick of the processor it runs on. S1's bound of 64 follows on a wake-up rests on
+/// that rate: paced, a wake-up follows at most one move, about 2.5 µs with interrupts off; a
+/// caller that broke the rule could make one follow 64, about 160 µs, over B18's 50 µs. TASKS item
+/// 96 gives `migrate` no rate of its own; its only callers, the migration proofs, pace themselves.
+///
+/// An inconsistency met (S20, triggers 2 and 3) enters pinned mode, and its line is printed after
+/// the section; `NotRestored`, a frame that could not be put back, stops the kernel (the ruling's
+/// Q7: two processors could have run one context). Called from thread context, with interrupts on,
+/// or from the boot flow, with them off: its section saves and restores them.
+pub(crate) fn migrate(
+    thread: ThreadRef,
+    to: CpuIndex,
+    online: &crate::smp::Online,
+) -> Result<Moved, Unmoved> {
+    let Some(record) = threads::record(thread.record) else {
+        return Err(Unmoved::Gone);
+    };
+    let (result, owed) = cpu::without_interrupts_off(|off| {
+        let mut owed = None;
+        let mut result = Err(Unmoved::Moving);
+        for _ in 0..origin_frame::sync::threads::WAKE_TRIES {
+            match move_once(off, record, thread, to, online, &mut owed) {
+                Err(Unmoved::Moving) => {}
+                done => {
+                    result = done;
+                    break;
+                }
+            }
+        }
+        if result.is_ok() {
+            let me = cpu::this_cpu(off.here());
+            if to != me.index()
+                && let Some(apic_id) = to.apic_id()
+            {
+                timer::send_reschedule_ipi(me, apic_id);
+            }
+        }
+        (result, owed)
+    });
+    if let Some((trigger, on)) = owed {
+        pinned::line(trigger, on, "; the thread stays where it is");
+    }
+    result
+}
+
+/// One try of [`migrate`]: `Moving` if the location changed between its read and the locks.
+fn move_once(
+    off: origin_frame::trap::InterruptsOff<'_>,
+    record: &'static Record<threads::State>,
+    thread: ThreadRef,
+    to: CpuIndex,
+    online: &crate::smp::Online,
+    owed: &mut Option<(pinned::Trigger, CpuIndex)>,
+) -> Result<Moved, Unmoved> {
+    use origin_frame::sync::contexts::{AdoptRefused, LendRefused, MoveRefused};
+
+    let me = cpu::this_cpu(off.here()).index();
+    let mut enter = |trigger| {
+        if pinned::enter(trigger) {
+            *owed = Some((trigger, me));
+        }
+        Err(Unmoved::Inconsistent)
+    };
+    let at = record.location().ok_or(Unmoved::Gone)?;
+    let from = usize::try_from(at.cpu())
+        .ok()
+        .and_then(CpuIndex::new)
+        .ok_or(Unmoved::Gone)?;
+    if from == to {
+        return Err(Unmoved::AlreadyThere);
+    }
+    let to_index = u32::try_from(to.get()).map_err(|_| Unmoved::Gone)?;
+    let (source_queue, destination_queue) = (
+        QUEUES.get(from.get()).ok_or(Unmoved::Gone)?,
+        QUEUES.get(to.get()).ok_or(Unmoved::Gone)?,
+    );
+    let start = rdtsc();
+    // Both queue locks, in index order (`origin_sync::threads`, "Locks").
+    let (mut low, mut high) = if from.get() < to.get() {
+        (source_queue.lock(), destination_queue.lock())
+    } else {
+        (destination_queue.lock(), source_queue.lock())
+    };
+    let (source, destination) = if from.get() < to.get() {
+        (&mut *low, &mut *high)
+    } else {
+        (&mut *high, &mut *low)
+    };
+    if record.location() != Some(at) {
+        return Err(Unmoved::Moving);
+    }
+    if record.generation() != thread.generation {
+        return Err(Unmoved::Stale);
+    }
+    // Under the source's lock (S20; the contract's §1.1, step 4).
+    if pinned::withdrawn() {
+        return Err(Unmoved::Pinned);
+    }
+    let slot = usize::from(at.slot());
+    // (a) The slot holds this thread: otherwise S20's trigger 3.
+    if source.record(slot).map(Placed::number) != Some(thread.record) {
+        return enter(pinned::Trigger::Misplaced);
+    }
+    // (b) Ready and not running (R95-5): its frame, which the source's scheduler cannot have named.
+    let Some(frame) = source.frame(slot) else {
+        return Err(Unmoved::NotReady);
+    };
+    // (c) Declared movable, and not pinned (S2; R93-7).
+    if !record.movable() || record.pins() != 0 {
+        return Err(Unmoved::Pinned);
+    }
+    // (d) Both processors take part (N9).
+    if !(online.takes_part_in_moves(from) && online.takes_part_in_moves(to)) {
+        return Err(Unmoved::FpuFormat);
+    }
+    // (e) The destination has room (N13), so `arrive` cannot be refused once the frame is adopted.
+    if !destination.has_room() {
+        return Err(Unmoved::QueueFull);
+    }
+    let moved = cpu::move_context(off, from, to, frame, &mut |_home| {
+        // Under both queue locks and the gate: nothing has changed since the checks above.
+        let Some(departed) = source.depart(slot) else {
+            panic!("a thread checked ready under its queue's lock could not depart");
+        };
+        let carried = departed.wake_pending();
+        let Ok(arrived) = destination.arrive(departed) else {
+            panic!("a thread could not arrive at a queue checked to have room");
+        };
+        let Ok(arrived) = u16::try_from(arrived) else {
+            panic!("a run-queue slot past a location's 16 bits");
+        };
+        record.set_location(Location::new(to_index, arrived));
+        carried
+    });
+    drop((low, high));
+    let ticks = rdtsc().saturating_sub(start);
+    match moved {
+        Some(Ok((_, carried_wake))) => Ok(Moved {
+            from,
+            carried_wake,
+            ticks,
+        }),
+        Some(Err(MoveRefused::Lend(LendRefused::NotYet | LendRefused::Leaving))) => {
+            Err(Unmoved::TryLater)
+        }
+        Some(Err(MoveRefused::Adopt(AdoptRefused::Full))) => Err(Unmoved::TableFull),
+        // ADR-0020 S20, trigger 2: its checks found the frame published, and `lend` did not.
+        // `SameTable` and `None` (no table for a processor) cannot happen, since `from` and `to`
+        // differ and every processor has a table; were one met, it is answered as the same safe
+        // stop rather than a panic, though the line then names trigger 2 for it (the review of
+        // TASKS item 96, R96-16).
+        Some(Err(
+            MoveRefused::Lend(LendRefused::NotHere | LendRefused::BootFlow)
+            | MoveRefused::Adopt(AdoptRefused::SameTable),
+        ))
+        | None => enter(pinned::Trigger::LendLost),
+        // The ruling's Q7: the frame is in no table, and two processors could have run it.
+        Some(Err(MoveRefused::NotRestored)) => {
+            panic!("a lent frame could not be put back in its source's table")
+        }
+    }
 }
 
 /// `EXIT_VECTOR`: the running thread ends. Its record, holding its stack, becomes a zombie, which
@@ -1018,6 +1709,25 @@ pub(crate) fn spawn_user(
     )
 }
 
+/// As [`spawn`], declaring the thread movable (ADR-0020 S2, point 1; TASKS item 96, the coordinating
+/// session's ruling Q3): [`migrate`] may move it, while its pin count is 0. Nothing else declares a
+/// thread movable: in TASKS item 96 only the migration proofs' threads are.
+pub(crate) fn spawn_movable(
+    cpu: CpuIndex,
+    entry: extern "sysv64" fn(u64) -> !,
+    arg: u64,
+) -> Result<usize, QueueError> {
+    spawn_with_parts(
+        cpu,
+        ThreadStart::Kernel { entry, arg },
+        crate::runqueue::DEFAULT_WEIGHT,
+        None,
+        true,
+        FpuArea::new,
+        GuardedStack::publish_first_frame,
+    )
+}
+
 /// As [`spawn`], with a scheduling weight (stride scheduling: the thread's share of its
 /// processor is its share of the weights there).
 pub(crate) fn spawn_weighted(
@@ -1040,6 +1750,7 @@ fn spawn_with(
         start,
         weight,
         user,
+        false,
         FpuArea::new,
         GuardedStack::publish_first_frame,
     )
@@ -1070,6 +1781,7 @@ fn spawn_with_parts(
     start: ThreadStart,
     weight: u32,
     user: Option<ObjectRef<UserContext>>,
+    movable: bool,
     fpu_area: impl FnOnce() -> Option<FpuArea>,
     publish: impl FnOnce(&mut GuardedStack, CpuIndex) -> bool,
 ) -> Result<usize, QueueError> {
@@ -1094,6 +1806,10 @@ fn spawn_with_parts(
         let mut queue = queue.lock();
         // Resolved once, here, for the slot to hold (`threads::Placed`).
         let placed = threads::take(cpu).ok_or(QueueError::Full)?;
+        // Before the push, while no thread runs on the record (`origin_sync::threads`, "Movable").
+        if movable {
+            placed.record().set_movable();
+        }
         let slot = match queue.push_weighted(frame_at, weight, Some(placed)) {
             Ok(slot) => slot,
             Err(refused) => {
@@ -1786,6 +2502,7 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         quitting(),
         crate::runqueue::DEFAULT_WEIGHT,
         None,
+        false,
         || None,
         GuardedStack::publish_first_frame,
     );
@@ -1797,6 +2514,7 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         quitting(),
         crate::runqueue::DEFAULT_WEIGHT,
         None,
+        false,
         FpuArea::new,
         |stack, _| {
             unpublished_slot.set(Some(stack.slot()));
@@ -1822,6 +2540,7 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         quitting(),
         crate::runqueue::DEFAULT_WEIGHT,
         None,
+        false,
         FpuArea::new,
         |stack, cpu| {
             full_slot.set(Some(stack.slot()));
@@ -2111,10 +2830,11 @@ fn say_window(
 pub(crate) fn prove(
     flow: Pinned<'_>,
     com1: &mut Console,
-    cpus: &[CpuIndex],
+    online: &crate::smp::Online,
     tsc_hz: u64,
     proofs: &mut Tally,
 ) {
+    let cpus = online.cpus();
     // Give every online processor's boot/idle context an FPU area before the baseline is
     // measured, so the first switch on it can save its state and the leak check is fair.
     for &id in cpus {
@@ -2403,6 +3123,17 @@ pub(crate) fn prove(
     proofs.record(
         Proof::KernelBound,
         crate::ipc_proof::prove_kernel_bound(com1, cpus, bsp, tsc_hz),
+    );
+    // Moves between processors (TASKS item 96; the contract's §3, the ruling's Q10), last: their
+    // threads are the only movable ones, and every one has ended and been reaped before the next
+    // proof starts. The processors online and their FPU flags come with `online` (Q16).
+    proofs.record(
+        Proof::MigrationIntegrity,
+        crate::migration_proof::prove_integrity(flow, com1, online, tsc_hz),
+    );
+    proofs.record(
+        Proof::MigrationDelivery,
+        crate::migration_proof::prove_delivery(flow, com1, online, tsc_hz),
     );
 }
 

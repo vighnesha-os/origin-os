@@ -335,7 +335,8 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         let held = cpu::cpu_states_holding(online.cpus()) == online.cpus().len();
         record_or_stop(&mut com1, &mut proofs, Proof::CpuState, held);
         // ADR-0020 S6: every processor online saves its FPU state as the boot processor does,
-        // and so may take part in moves. Report until a mover reads it (TASKS item 96).
+        // and so may take part in moves. A failure withdraws moves to and from a processor that
+        // does not, which the mover withholds (TASKS item 96; its review's R96-14).
         proofs.record(
             Proof::FpuFormat,
             cpu::fpu_formats_alike(online.cpus()) == online.cpus().len(),
@@ -447,9 +448,15 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
         // M3, second step: preemptive kernel threads on every online processor. Its proofs
         // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
         // use only the kernel's fixed programs, and the operator sees every result.
-        sched::prove(flow, &mut com1, online.cpus(), tsc_hz, &mut proofs);
+        sched::prove(flow, &mut com1, &online, tsc_hz, &mut proofs);
         // ADR-0017 Z3, after the proofs above have run several processes in ring 3.
         proofs.record(Proof::Ibpb, prove_ibpb(flow, &mut com1, online.cpus()));
+        // ADR-0020 S9 and S17 (TASKS item 106): what the hardware reports of capacity and heat, and
+        // the thermal round, once every processor's scheduler runs and takes interrupts.
+        proofs.record(
+            Proof::HardwareCapacity,
+            prove_capacity(flow, &mut com1, online.cpus()),
+        );
         stop_if_refused(&mut com1, proofs);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
         if let Some(q) = quiesced.as_mut()
@@ -731,6 +738,141 @@ fn prove_ibpb(
         let _ = writeln!(com1, "origin-kernel: ibpb failed");
     }
     sound
+}
+
+/// The hardware's capacity and heat (ADR-0020 S9 sources 1 to 3, S17; TASKS item 106): what each
+/// processor reported and took as it started, what `_CPC` gave in QEMU's tables, and the thermal
+/// round, in which every processor takes the thermal vector once (`hfi::round`).
+///
+/// A Report proof (ADR-0013 R3): it fails, and the boot goes on, when a register CPUID claims
+/// raised #GP, an enable did not read back, a package's processors disagree on its table or its
+/// HFI failed or found no memory, a row lies past its table, an acknowledgement faulted, a
+/// processor recorded no topology, a processor did not take the round's vector or a package's
+/// first processor did not answer within ten seconds, or the MSR probe did not recover the #GP of
+/// a reserved x2APIC address. Under QEMU only the absence paths run.
+fn prove_capacity(
+    flow: origin_frame::trap::Pinned<'_>,
+    com1: &mut Console,
+    cpus: &[cpu::CpuIndex],
+) -> bool {
+    use origin_frame::hfi;
+    let n = cpus.len();
+    // Ten seconds, as the generator's proof waits for every processor: the wait ends as soon as
+    // each has taken the vector, so a correct boot pays nothing for it (the review's R106-3).
+    let round = hfi::round(flow, cpus, time::monotonic_nanos, 10_000_000_000);
+    let probe = hfi::reserved_x2apic_read_faults(cpu::this_cpu(flow.here()));
+    let c = hfi::census(cpus);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: capacity: HFI on {} of {n} processors, {} reading a row of a table in use ({} past their table); packages: {}, taken {}, HFI enabled {}, written {}, enabled by the firmware {}, disagreeing {}, an LVT the firmware's {}",
+        c.hfi,
+        c.hfi_members,
+        c.rows_past,
+        c.packages,
+        c.taken,
+        c.enabled,
+        c.written,
+        c.firmware_hfi,
+        c.disagree,
+        c.no_lvt,
+    );
+    let _ = writeln!(
+        com1,
+        "origin-kernel: capacity: thermal LVT free on {} of {n}, the firmware's on {}, taken on {} ({} with other enables the firmware set; CPUID.01H:EDX[22] on {}, with a sensor on {}); {}; AMD heat not supported at M3",
+        c.lvt_free,
+        c.lvt_firmware,
+        c.lvt_taken,
+        c.other_enables,
+        c.thermal_registers,
+        c.sensors,
+        hfi::HeatClause(&c),
+    );
+    let _ = writeln!(
+        com1,
+        "origin-kernel: capacity: HWP on {} of {n}, on from the firmware on {}, Highest-change interrupt on {}; AMD CPPC on {} of {n}, on from the firmware on {}; neither is enabled here (power management's, M10)",
+        c.hwp, c.hwp_on, c.hwp_notify, c.cppc, c.cppc_on,
+    );
+    let _ = match crate::cpc::FOUND.get() {
+        Some(f) => writeln!(
+            com1,
+            "origin-kernel: capacity: _CPC not read in the kernel (ADR-0019 A2); in QEMU's tables on {} of {} processors",
+            f.with_cpc, f.processors
+        ),
+        None => writeln!(
+            com1,
+            "origin-kernel: capacity: _CPC not read in the kernel (ADR-0019 A2); the AML proof ran no AML on these tables"
+        ),
+    };
+    // The #GP path shown where the processor faults there; a read without a fault is not run,
+    // never failed (the coordinating session's ruling of 2026-11-22).
+    let _ = writeln!(
+        com1,
+        "origin-kernel: capacity: MSR probe: {}",
+        match probe {
+            Some(true) => "RDMSR of the reserved x2APIC address 0x80e raised #GP and was recovered",
+            Some(false) => "#GP path not shown: 0x80e read without a fault (not run)",
+            None => "#GP path not shown: the local APIC is not in x2APIC mode (not run)",
+        }
+    );
+    let _ = writeln!(
+        com1,
+        "origin-kernel: capacity: the round waited {} ms",
+        round.waited_ns / 1_000_000
+    );
+    let capacity: alloc::vec::Vec<u16> = cpus
+        .iter()
+        .map(|i| crate::capacity::current(i.get()))
+        .collect();
+    let (low, high) = (
+        capacity.iter().copied().min().unwrap_or(0),
+        capacity.iter().copied().max().unwrap_or(0),
+    );
+    let consistent = c.sound()
+        && round.registered
+        && round.sent as usize == n
+        && round.handled as usize == n
+        && round.answered == round.asked;
+    let _ = write!(
+        com1,
+        "origin-kernel: capacity: thermal vector {:#x} sent to {} of {n} processors, taken by {}, {} with a source, {} quiet; {} packages asked to enable the HFI, {} answered; {} table updates; processors with a register that faulted {}",
+        cpu::THERMAL_VECTOR,
+        round.sent,
+        round.handled,
+        round.sourced,
+        c.quiet,
+        round.asked,
+        round.answered,
+        c.updates,
+        c.faulted,
+    );
+    if let Some(id) = round.unanswered {
+        let _ = write!(
+            com1,
+            " (package {id}'s first processor did not answer: its HFI stays off)"
+        );
+    }
+    if let Some(msr) = c.first_fault {
+        let _ = write!(com1, " (first {msr:#x})");
+    }
+    let (number, _) = source_named(hfi::source());
+    let _ = write!(
+        com1,
+        ", with an enable not read back {}; source {number}, capacity {low}",
+        c.mismatched
+    );
+    if high != low {
+        let _ = write!(com1, " to {high}");
+    }
+    let _ = writeln!(
+        com1,
+        " on {n} of {n}; consistent {consistent}{}",
+        if consistent {
+            ""
+        } else {
+            ": hardware capacity failed"
+        }
+    );
+    consistent
 }
 
 /// Builds a read-only `/sys`-style tree in the VFS from facts several subsystems
@@ -1135,6 +1277,8 @@ fn prove_topology(
 
     // The boot processor's own record; every AP wrote its own before it came online.
     smp::record_topology(cpu::this_cpu(flow.here()));
+    // Its thermal LVT's sources, as every AP read its own (TASKS item 106, ruling Q7).
+    origin_frame::hfi::start_this_processor(cpu::this_cpu(flow.here()));
     // The cache hierarchy from leaf 04h.
     let mut caches = [crate::cache::Cache {
         level: 0,
@@ -1411,8 +1555,8 @@ fn prove_slit(com1: &mut console::Console, rsdp: u64) -> bool {
 /// Builds the scheduling domains (ADR-0020 S8; TASKS item 97) from what each processor recorded
 /// about itself, the SRAT's nodes and the PPTT's caches where the firmware has one, keeps them in
 /// `domains::DOMAINS` for the balancer, and prints them, so `cargo xtask` can compare the tree with
-/// the machine it booted. Every processor's capacity is the same (S9's source 5): no hardware
-/// source is read before TASKS item 106.
+/// the machine it booted. It starts the live capacity store (TASKS item 106) and keeps its boot
+/// value in the domains.
 ///
 /// A Report proof (ADR-0013 R3): it fails, and the boot goes on, when a processor recorded
 /// nothing, a claim was cut because two processors disagree about sharing, the PPTT and CPUID
@@ -1591,12 +1735,34 @@ fn prove_domains(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -
         }
     }
 
-    let capacity = crate::capacity::equal(n);
+    // The live store starts here, with what each processor reported as it started (ADR-0020 S9;
+    // TASKS item 106): an HFI row counts only once its package's table has been read, so at boot
+    // the source is a register or none. The domains keep this boot value; placement reads
+    // `capacity::current`, which the thermal interrupt keeps live.
+    // It first waits, as the generator's proof does, for every processor to have read its sources
+    // (the review's R106-8).
+    let started = origin_frame::hfi::start_capacity(cpus, time::monotonic_nanos, 10_000_000_000);
+    let source = started.map_or_else(origin_frame::hfi::source, |(s, _)| s);
+    let capacity: Vec<u16> = cpus
+        .iter()
+        .map(|c| crate::capacity::current(c.get()))
+        .collect();
     let consistent = f.agree() && pptt_ok;
+    let (low, high) = (
+        capacity.iter().copied().min().unwrap_or(0),
+        capacity.iter().copied().max().unwrap_or(0),
+    );
+    let _ = write!(com1, "origin-kernel: domains: capacity {low}");
+    if high != low {
+        let _ = write!(com1, " to {high}");
+    }
+    let (number, why) = source_named(source);
+    if let Some((_, k)) = started.filter(|&(_, k)| k < n) {
+        let _ = write!(com1, " ({k} of {n} had read their sources)");
+    }
     let _ = writeln!(
         com1,
-        "origin-kernel: domains: capacity {} on {n} of {n} processors (ADR-0020 S9 source 5: no hardware source is read before TASKS item 106); consistent {consistent}{}",
-        crate::capacity::FULL,
+        " on {n} of {n} processors at boot (ADR-0020 S9 source {number}: {why}); consistent {consistent}{}",
         if consistent {
             ""
         } else {
@@ -1609,6 +1775,17 @@ fn prove_domains(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -
         capacity,
     });
     consistent
+}
+
+/// ADR-0020 S9's number for `source`, and what it is or why it was taken.
+fn source_named(source: crate::capacity::Source) -> (u8, &'static str) {
+    use crate::capacity::Source;
+    match source {
+        Source::Hfi => (1, "the HFI's rows"),
+        Source::Cpc => (2, "_CPC's Highest"),
+        Source::Register => (3, "HWP's or CPPC's Highest"),
+        Source::Equal => (5, "no source reports every processor"),
+    }
 }
 
 /// How an instruction stands, as the generator's lines give it.

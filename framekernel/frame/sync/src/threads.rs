@@ -30,8 +30,18 @@
 //!
 //! A record also holds the thread's **pin count** (ADR-0020 S2). While it is above zero, the
 //! thread never moves. Only the thread itself raises and lowers it, while it runs
-//! ([`Record::pin`]). [`Block::take`] resets it for the record's next thread. Nothing reads it
-//! yet: the mover that will (ADR-0020 S6) is not built.
+//! ([`Record::pin`]). [`Block::take`] resets it for the record's next thread. The mover
+//! (ADR-0020 S6; TASKS item 96) reads it under the lock of the queue that holds the thread.
+//!
+//! # Movable
+//!
+//! A thread moves only if its spawner declared it **movable** ([`Record::set_movable`]; ADR-0020
+//! S2, point 1, and TASKS item 96, the coordinating session's ruling Q3). The spawner declares it
+//! after [`Block::take`] and before it queues the thread, while no thread runs on the record, and
+//! nothing changes it for the thread's life: [`Block::take`] resets it for the record's next
+//! thread. A thread not declared movable is pinned to the processor it was queued on, as every
+//! thread was before TASKS item 96. An affinity (ADR-0020 S11, TASKS item 100) will replace the
+//! flag.
 //!
 //! # Locks
 //!
@@ -124,6 +134,9 @@ pub struct Record<S> {
     /// A packed [`Location`], or [`CLEAR`].
     location: prim::AtomicU64,
     state: SpinLock<S>,
+    /// Whether the thread may move ([`Record::set_movable`]; the module documentation,
+    /// "Movable"). One byte, in room the record had: its size does not change.
+    movable: prim::AtomicBool,
 }
 
 impl<S> core::fmt::Debug for Record<S> {
@@ -141,6 +154,7 @@ impl<S: Empty> Record<S> {
             pins: prim::AtomicU32::new(0),
             location: prim::AtomicU64::new(CLEAR),
             state: SpinLock::new(S::EMPTY),
+            movable: prim::AtomicBool::new(false),
         }
     }
 
@@ -152,6 +166,7 @@ impl<S: Empty> Record<S> {
             pins: prim::AtomicU32::new(0),
             location: prim::AtomicU64::new(CLEAR),
             state: SpinLock::new(S::EMPTY),
+            movable: prim::AtomicBool::new(false),
         }
     }
 }
@@ -237,8 +252,31 @@ impl<S> Record<S> {
 
     /// The thread's pin count. The thread itself, or a mover (ADR-0020 S6) under the owning queue's
     /// lock.
+    ///
+    /// Why a mover's read under that lock sees the count's last value (the review of TASKS item 93,
+    /// R93-7): only the running thread writes it, and a mover acts only on a thread that is ready
+    /// and not running under that lock. The thread's last write came before its switch-out, whose
+    /// scheduler hook took and released that lock as it named the thread's frame; so the mover's
+    /// acquire of the lock comes after the write, and no write comes while the thread does not run.
     pub fn pins(&self) -> u32 {
         self.pins.load(Relaxed)
+    }
+
+    /// Declares the thread movable (the module documentation, "Movable"). Its spawner only, after
+    /// [`Block::take`] and before it queues the thread, while no thread runs on the record. The
+    /// queue lock the spawner's push takes then orders it before any mover's read.
+    pub fn set_movable(&self) {
+        self.movable.store(true, Relaxed);
+    }
+
+    /// Whether the thread was declared movable. A mover, under the lock of the queue that holds
+    /// the thread, which orders it after the spawner's declaration; anyone else, as a fact about
+    /// the thread that does not change while it lives. Acquire, paired with [`Block::take`]'s
+    /// Release store of a new thread's flag, so a reader that finds the new thread's flag also
+    /// finds its new generation (the kernel's `sched::followed`; the review of TASKS item 96,
+    /// R96-5).
+    pub fn movable(&self) -> bool {
+        self.movable.load(Acquire)
     }
 }
 
@@ -300,6 +338,15 @@ impl<S, const N: usize> Block<S, N> {
         self.records.get(index)
     }
 
+    /// The index of `record` in this block ([`Block::get`]'s inverse), found by its address:
+    /// `None` if it is not one of this block's records. Records never move, so an address names
+    /// one record of one block. A search of `N` records, for a path that is out of line (TASKS
+    /// item 96: a wake-up that met an inconsistency finds its record's number from the record,
+    /// so that its location loop keeps no register for the number).
+    pub fn index_of(&self, record: &Record<S>) -> Option<usize> {
+        self.records.iter().position(|r| core::ptr::eq(r, record))
+    }
+
     /// A free record for a new thread, with its next generation: its index and that generation.
     /// `None` if every record is held. The record's location is clear (a record is given back
     /// only with its location clear) and its state is what its last thread's reap left; the
@@ -319,6 +366,10 @@ impl<S, const N: usize> Block<S, N> {
         // never lowers its own (ADR-0020 S2, point 2). No thread holds the record now, so this is
         // the one write of the count that is not its running thread's (TASKS item 93, ruling Q9).
         record.pins.store(0, Relaxed);
+        // Pinned, as every thread is unless its spawner declares it movable (TASKS item 96).
+        // Release, after the new generation: a reader whose Acquire load finds this value also
+        // finds the generation that goes with it (`Record::movable`; R96-5).
+        record.movable.store(false, Release);
         Some((index, generation))
     }
 
@@ -363,6 +414,30 @@ impl<S, const N: usize> Block<S, N> {
     }
 }
 
+/// A free record for a new thread on processor `cpu`, from the blocks `block` gives by processor
+/// index, `count` of them: from `cpu`'s own block first, then from each other block in index
+/// order from `cpu + 1`, wrapping round (TASKS item 96; the coordinating session's second ruling
+/// on Q6 of TASKS item 92, "item 96 lets a spawn take a record from any block"). Its block, its
+/// index there and its generation ([`Block::take`]); `None` only if no block has a free record.
+///
+/// Once threads move, a processor's records can be held by threads that left for other
+/// processors, so a processor that keeps spawning could use up its own block while records are
+/// free elsewhere. With the fallback a spawn is refused for want of a record only if the whole
+/// machine has none. The search past the own block runs only when that block is used up.
+pub fn take_from_any<'b, S: 'b, const N: usize>(
+    cpu: usize,
+    count: usize,
+    block: impl Fn(usize) -> Option<&'b Block<S, N>>,
+) -> Option<(usize, usize, u32)> {
+    let start = cpu.checked_rem(count)?;
+    (0..count)
+        .map(|k| start.wrapping_add(k) % count)
+        .find_map(|b| {
+            let (index, generation) = block(b)?.take()?;
+            Some((b, index, generation))
+        })
+}
+
 /// The most times [`wake`] looks for its thread under a queue's lock (ADR-0020 S1).
 pub const WAKE_TRIES: u32 = 64;
 
@@ -375,10 +450,25 @@ pub trait Queues {
     /// interrupts off), or returns `None` if there is no such processor.
     fn locked<R>(&self, cpu: u32, f: impl FnOnce(&mut Self::Queue) -> R) -> Option<R>;
 
+    /// Whether `slot` of `queue` holds the thread of `record`, whose number is `number`. [`wake`]
+    /// checks it before it wakes the slot, so that a location naming a slot that does not hold its
+    /// thread wakes no one there (ADR-0020 S20, trigger 3; TASKS item 96, the coordinating
+    /// session's ruling Q6). An implementation may compare the record itself, by address, or its
+    /// number: the kernel compares the address, one load and one compare on the path of every
+    /// wake-up (the coordinating session's ruling, ADR-0018 V1).
+    fn holds<S>(queue: &Self::Queue, slot: u16, number: u32, record: &Record<S>) -> bool;
+
     /// Wakes the thread in `slot` of `queue`, as `RunQueue::wake` does for the slot's own
     /// generation: whether a blocked thread became ready. A thread not blocked keeps the wake-up
     /// for its next block.
     fn wake_slot(queue: &mut Self::Queue, slot: u16) -> bool;
+
+    /// The slot of `queue` that holds record `number`, if one does: for the one search a wake-up
+    /// makes after a location that named the wrong slot ([`Outcome::Misplaced`]).
+    fn find(queue: &Self::Queue, number: u32) -> Option<u16>;
+
+    /// How many processors there are, by CPU index from 0: the search looks in each queue.
+    fn count(&self) -> u32;
 }
 
 /// How a [`wake`] ended.
@@ -397,11 +487,29 @@ pub enum Outcome {
     Stale,
     /// The record's location is clear: its thread has exited, and has no wake-up to keep.
     Gone,
-    /// The location had changed at each of [`WAKE_TRIES`] looks under the lock it named.
+    /// The location had changed at each of [`WAKE_TRIES`] looks under the lock it named, and again
+    /// at each of as many more after pinned mode was entered: the flag itself failed (TASKS item
+    /// 96, the coordinating session's ruling Q17). The kernel stops.
     Exhausted,
+    /// The location named a slot that held another record or none, and the one search of every
+    /// queue that followed found the record in none (ADR-0020 S20, trigger 3; the ruling's Q6).
+    Misplaced,
 }
 
-/// What a [`wake`] did: how it ended, and how many moves of its thread it followed.
+/// An inconsistency a wake-up met (ADR-0020 S20, point 2), for which it entered pinned mode
+/// through the hook [`wake`] takes, before it went on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Met {
+    /// Its thread moved at each of [`WAKE_TRIES`] looks (trigger 4; the ruling's Q17). It then
+    /// looked as many times again, with moves withdrawn.
+    Exhausted,
+    /// Its location named a slot that held another record or none (trigger 3; the ruling's Q6). It
+    /// then searched every queue once, each under its own lock, and woke the record where found.
+    Misplaced,
+}
+
+/// What a [`wake`] did: how it ended, how many moves of its thread it followed, and the
+/// inconsistency it met, if any.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Wake {
     /// How it ended.
@@ -409,6 +517,9 @@ pub struct Wake {
     /// How many times it found, under the lock of the queue it had read, that its thread had
     /// moved to another slot, and followed it there.
     pub retries: u32,
+    /// The inconsistency it met, if it met one and its call of the hook entered pinned mode: it
+    /// then owes the line that names it (ADR-0020 S20). `None` if pinned mode was entered already.
+    pub met: Option<Met>,
 }
 
 // Only their names, as for `Location`.
@@ -419,6 +530,7 @@ impl core::fmt::Debug for Outcome {
             Self::Stale => "Stale",
             Self::Gone => "Gone",
             Self::Exhausted => "Exhausted",
+            Self::Misplaced => "Misplaced",
         })
     }
 }
@@ -452,26 +564,122 @@ fn changed(now: Option<Location>, same_generation: bool) -> Look {
     }
 }
 
-/// Wakes the thread `record` and `generation` name, wherever it is.
+/// Wakes the thread `record`, `number` and `generation` name, wherever it is. `number` is the
+/// record's number, which the slot holding the thread holds.
 ///
 /// It reads the location, takes the lock of the queue that location names, and reads the
 /// location again. Unchanged, the thread is in that slot and cannot leave it while the lock is
 /// held: the generation is compared under the lock, and the slot is woken as `RunQueue::wake`
-/// wakes it, with its pending wake-up for a thread not yet blocked. Changed, the thread exited, or
-/// the record went to another thread, or the thread moved: a clear location is [`Outcome::Gone`],
-/// a new generation [`Outcome::Stale`], and a move is followed, the lock released and the new
-/// location read, at most [`WAKE_TRIES`] times. A location clear at the first read is a thread
-/// that has exited: it waits for nothing.
+/// wakes it, with its pending wake-up for a thread not yet blocked, if it holds record `number`.
+/// Changed, the thread exited, or the record went to another thread, or the thread moved: a clear
+/// location is [`Outcome::Gone`], a new generation [`Outcome::Stale`], and a move is followed, the
+/// lock released and the new location read, at most [`WAKE_TRIES`] times. A location clear at
+/// the first read is a thread that has exited: it waits for nothing.
 ///
-/// So a wake-up follows nothing but moves. While no thread moves (ADR-0003 K7 still holds), it
-/// follows none, and the kernel's boot proofs require that (TASKS item 92).
-pub fn wake<S, Q: Queues>(queues: &Q, record: &Record<S>, generation: u32) -> Wake {
+/// **What enters pinned mode** (ADR-0020 S20, point 2; TASKS item 96). Two inconsistencies, each
+/// handled out of line, so that a wake-up that meets neither pays only the record check:
+/// - **A misplaced location** ([`Met::Misplaced`]): the slot the unchanged location names holds
+///   another record or none. `pin` is called, and every queue is searched once, each under its
+///   own lock and never two at once, for the slot that holds record `number`: woken there if its
+///   generation is the name's, [`Outcome::Stale`] if not, [`Outcome::Misplaced`] if no queue holds
+///   it.
+/// - **[`WAKE_TRIES`] follows** ([`Met::Exhausted`]; the coordinating session's ruling Q17): `pin`
+///   is called, and the location is followed again with the same bound. With moves withdrawn the
+///   second loop reaches the thread: a mover checks the flag under its source's lock and holds
+///   that lock to its move's end, so at most the one move in flight when `pin` returned can still
+///   complete (on x86-64, whose locked instructions are in one total order with every load). A
+///   second exhaustion means the flag itself failed: [`Outcome::Exhausted`], on which the kernel
+///   stops. The Rust memory model alone does not give the bound of one, so the second loop keeps
+///   [`WAKE_TRIES`].
+///
+/// `pin` runs under no queue's lock, once for each inconsistency the wake-up meets, and answers
+/// whether its call entered pinned mode (the first trigger), which [`Wake::met`] then carries; a
+/// second one, met after the first, is counted by it the same way (the review of TASKS item 96,
+/// R96-10). If the first entered pinned mode, `report` is called
+/// once the retry or the search has ended, under no queue's lock, with what it found: the kernel
+/// writes the line that names the trigger there, so that nothing on the path of a wake-up that met
+/// no inconsistency tests for a line owed (the coordinating session's ruling, ADR-0018 V1).
+///
+/// **How long it holds interrupts off** (ADR-0020 S1's note of 2026-11-22; the ruling's Q18): the
+/// kernel runs it in one interrupts-off section. Each follow adds at most the rest of one move's
+/// critical section and one look: about 2.5 µs on the budgets' figures (B20 and a look) when moves
+/// are paced as S10 and `migrate`'s documentation require, so a paced wake-up follows at most one
+/// move; up to 64 of them, about 160 µs, if a caller broke that rule, which exceeds B18's 50 µs.
+/// No caller breaks it in TASKS item 96, where only the proofs move threads, at one move per
+/// thread per tick.
+pub fn wake<S, Q: Queues>(
+    queues: &Q,
+    record: &Record<S>,
+    number: u32,
+    generation: u32,
+    pin: impl Fn(Met) -> bool,
+    report: impl FnOnce(Met, Outcome),
+) -> Wake {
+    let first = follow(queues, record, number, generation);
+    match first.outcome {
+        Outcome::Exhausted => after_inconsistency(
+            queues,
+            record,
+            number,
+            generation,
+            Met::Exhausted,
+            first.retries,
+            pin,
+            report,
+        ),
+        Outcome::Misplaced => after_inconsistency(
+            queues,
+            record,
+            number,
+            generation,
+            Met::Misplaced,
+            first.retries,
+            pin,
+            report,
+        ),
+        Outcome::Reached { .. } | Outcome::Stale | Outcome::Gone => first,
+    }
+}
+
+/// [`wake`]'s out-of-line continuation, for a caller that runs [`follow`] itself and keeps the
+/// two apart, as the kernel does: `met` is the inconsistency `follow` ended with (`Exhausted` or
+/// `Misplaced`), and `retries` the moves it followed. This enters pinned mode through `pin` and
+/// goes on as [`wake`] says. Out of line, and given what it needs in registers rather than
+/// `follow`'s whole answer, so that nothing of it, and no copy of that answer to memory, is on the
+/// path of a wake-up that meets no inconsistency (the coordinating session's ruling, ADR-0018 V1).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn after_inconsistency<S, Q: Queues>(
+    queues: &Q,
+    record: &Record<S>,
+    number: u32,
+    generation: u32,
+    met: Met,
+    retries: u32,
+    pin: impl Fn(Met) -> bool,
+    report: impl FnOnce(Met, Outcome),
+) -> Wake {
+    match met {
+        Met::Exhausted => after_exhausted(queues, record, number, generation, retries, pin, report),
+        Met::Misplaced => after_misplaced(queues, record, number, generation, retries, pin, report),
+    }
+}
+
+/// The location loop: at most [`WAKE_TRIES`] looks. It ends [`Outcome::Exhausted`] when every look
+/// found the thread moved, and [`Outcome::Misplaced`] when the unchanged location's slot did not
+/// hold record `number`, for which a caller goes on with [`after_inconsistency`] ([`wake`] does).
+/// Inlined, so the wake-up that meets no inconsistency runs it as before TASKS item 96, with the
+/// record check alone added.
+#[inline(always)]
+pub fn follow<S, Q: Queues>(queues: &Q, record: &Record<S>, number: u32, generation: u32) -> Wake {
     let mut retries = 0;
     while retries < WAKE_TRIES {
         let Some(at) = record.location() else {
             return Wake {
                 outcome: Outcome::Gone,
                 retries,
+                met: None,
             };
         };
         let looked = queues.locked(at.cpu(), |queue| {
@@ -480,22 +688,34 @@ pub fn wake<S, Q: Queues>(queues: &Q, record: &Record<S>, generation: u32) -> Wa
                 return changed(now, record.generation() == generation);
             }
             Look::Ends(if record.generation() == generation {
-                Outcome::Reached {
-                    ready: Q::wake_slot(queue, at.slot()),
-                    cpu: at.cpu(),
+                // ADR-0020 S20, trigger 3 (the ruling's Q6): the slot must hold this record.
+                if Q::holds(queue, at.slot(), number, record) {
+                    Outcome::Reached {
+                        ready: Q::wake_slot(queue, at.slot()),
+                        cpu: at.cpu(),
+                    }
+                } else {
+                    Outcome::Misplaced
                 }
             } else {
                 Outcome::Stale
             })
         });
         match looked {
-            Some(Look::Ends(outcome)) => return Wake { outcome, retries },
+            Some(Look::Ends(outcome)) => {
+                return Wake {
+                    outcome,
+                    retries,
+                    met: None,
+                };
+            }
             Some(Look::Moved) => retries = retries.saturating_add(1),
             // A location names only a processor the kernel queued the thread on.
             None => {
                 return Wake {
                     outcome: Outcome::Gone,
                     retries,
+                    met: None,
                 };
             }
         }
@@ -503,6 +723,121 @@ pub fn wake<S, Q: Queues>(queues: &Q, record: &Record<S>, generation: u32) -> Wa
     Wake {
         outcome: Outcome::Exhausted,
         retries,
+        met: None,
+    }
+}
+
+/// [`WAKE_TRIES`] follows: pinned mode, then the loop once more ([`wake`]). A misplaced location
+/// met by that loop is a second inconsistency: counted through `pin`, then searched for
+/// ([`search_settled`]; R96-10).
+fn after_exhausted<S, Q: Queues>(
+    queues: &Q,
+    record: &Record<S>,
+    number: u32,
+    generation: u32,
+    first: u32,
+    pin: impl Fn(Met) -> bool,
+    report: impl FnOnce(Met, Outcome),
+) -> Wake {
+    let entered = pin(Met::Exhausted);
+    let again = follow(queues, record, number, generation);
+    let again = if again.outcome == Outcome::Misplaced {
+        let _ = pin(Met::Misplaced);
+        search_settled(queues, record, number, generation, again.retries, &pin)
+    } else {
+        again
+    };
+    if entered {
+        report(Met::Exhausted, again.outcome);
+    }
+    Wake {
+        retries: first.saturating_add(again.retries),
+        met: entered.then_some(Met::Exhausted),
+        ..again
+    }
+}
+
+/// A misplaced location: pinned mode, then the search ([`wake`], [`search_settled`]).
+fn after_misplaced<S, Q: Queues>(
+    queues: &Q,
+    record: &Record<S>,
+    number: u32,
+    generation: u32,
+    first: u32,
+    pin: impl Fn(Met) -> bool,
+    report: impl FnOnce(Met, Outcome),
+) -> Wake {
+    let entered = pin(Met::Misplaced);
+    let found = search_settled(queues, record, number, generation, first, &pin);
+    if entered {
+        report(Met::Misplaced, found.outcome);
+    }
+    Wake {
+        met: entered.then_some(Met::Misplaced),
+        ..found
+    }
+}
+
+/// The search after pinned mode was entered ([`search`]), and, if it finds the record in no queue,
+/// the location followed once more and, if it still names a slot that does not hold the record,
+/// one more search, that second inconsistency counted through `pin` (the review of TASKS item 96,
+/// R96-6). With moves withdrawn, a mover that read the flag before `pin` set it may still
+/// complete its one move, and carry the thread from a queue the search had not reached to one it
+/// had passed; that move set the location to the thread's new slot, which the follow reaches.
+fn search_settled<S, Q: Queues>(
+    queues: &Q,
+    record: &Record<S>,
+    number: u32,
+    generation: u32,
+    retries: u32,
+    pin: &impl Fn(Met) -> bool,
+) -> Wake {
+    let found = search(queues, record, number, generation, retries);
+    if found.outcome != Outcome::Misplaced {
+        return found;
+    }
+    let again = follow(queues, record, number, generation);
+    let retries = retries.saturating_add(again.retries);
+    if again.outcome == Outcome::Misplaced {
+        let _ = pin(Met::Misplaced);
+        return search(queues, record, number, generation, retries);
+    }
+    Wake { retries, ..again }
+}
+
+/// One search of every queue for the slot holding record `number`, each queue under its own lock
+/// and never two at once: woken where found if the generation is the name's ([`wake`]).
+fn search<S, Q: Queues>(
+    queues: &Q,
+    record: &Record<S>,
+    number: u32,
+    generation: u32,
+    retries: u32,
+) -> Wake {
+    for cpu in 0..queues.count() {
+        let found = queues.locked(cpu, |queue| {
+            let slot = Q::find(queue, number)?;
+            Some(if record.generation() == generation {
+                Outcome::Reached {
+                    ready: Q::wake_slot(queue, slot),
+                    cpu,
+                }
+            } else {
+                Outcome::Stale
+            })
+        });
+        if let Some(Some(outcome)) = found {
+            return Wake {
+                outcome,
+                retries,
+                met: None,
+            };
+        }
+    }
+    Wake {
+        outcome: Outcome::Misplaced,
+        retries,
+        met: None,
     }
 }
 
@@ -622,6 +957,62 @@ mod tests {
         assert_eq!(record.pins(), 0);
     }
 
+    /// A spawn takes from its own processor's block first, then from the next block round, and is
+    /// refused only when every block is used up (TASKS item 96).
+    #[test]
+    fn a_spawn_takes_from_its_own_block_then_from_the_next_ones_round() {
+        let blocks = [Block::<u32, 2>::new(), Block::new(), Block::new()];
+        let block = |b: usize| blocks.get(b);
+        assert_eq!(
+            take_from_any(1, 3, block),
+            Some((1, 0, 1)),
+            "its own block first"
+        );
+        assert_eq!(take_from_any(1, 3, block), Some((1, 1, 1)));
+        assert_eq!(
+            take_from_any(1, 3, block),
+            Some((2, 0, 1)),
+            "then the next one"
+        );
+        assert_eq!(take_from_any(1, 3, block), Some((2, 1, 1)));
+        assert_eq!(
+            take_from_any(1, 3, block),
+            Some((0, 0, 1)),
+            "wrapping round"
+        );
+        assert_eq!(take_from_any(1, 3, block), Some((0, 1, 1)));
+        assert_eq!(take_from_any(1, 3, block), None, "a full machine refuses");
+        assert_eq!(take_from_any(0, 3, block), None);
+        assert!(blocks[2].give_back(1));
+        assert_eq!(
+            take_from_any(0, 3, block),
+            Some((2, 1, 2)),
+            "the one free record, wherever it is, with its next generation"
+        );
+        assert_eq!(take_from_any(0, 0, block), None, "no blocks");
+        assert_eq!(
+            take_from_any(usize::MAX, 3, block),
+            None,
+            "full, and no overflow"
+        );
+    }
+
+    /// A record starts pinned to its processor; its spawner may declare it movable; its next thread
+    /// starts pinned again (TASKS item 96).
+    #[test]
+    fn a_record_starts_pinned_and_its_next_thread_does_too() {
+        let block = Block::<u32, 1>::new();
+        let (index, _) = block.take().expect("a free record");
+        let record = block.get(index).expect("the record taken");
+        assert!(!record.movable());
+        record.set_movable();
+        assert!(record.movable());
+        assert!(block.give_back(index));
+        assert!(record.movable(), "given back as its thread left it");
+        let _ = block.take().expect("the record again");
+        assert!(!record.movable());
+    }
+
     /// The pin count takes the room after the generation (TASKS item 93, ruling Q9): the record's
     /// first words, the generation, the pin count and the location, fit the 16 bytes the
     /// generation and the location took alone. So the record keeps its size: one 64-byte line for a
@@ -636,6 +1027,9 @@ mod tests {
         );
         assert_eq!(size_of::<Record<u32>>(), 64);
         assert_eq!(core::mem::align_of::<Record<u32>>(), 64);
+        // The movable flag (TASKS item 96) is one byte after them: the same line here, and the
+        // kernel's assertion of 128 bytes holds it to its two lines.
+        assert_eq!(size_of::<prim::AtomicBool>(), 1);
     }
 
     #[test]
@@ -708,6 +1102,27 @@ mod tests {
     }
 
     #[test]
+    fn a_block_finds_its_own_records_by_address_and_no_other() {
+        let block = Block::<u32, 4>::new();
+        let other = Block::<u32, 4>::new();
+        for index in 0..4 {
+            let record = block.get(index).expect("one of the block's");
+            assert_eq!(
+                block.index_of(record),
+                Some(index),
+                "its own record {index}"
+            );
+            assert_eq!(
+                other.index_of(record),
+                None,
+                "another block's record {index}"
+            );
+        }
+        let alone = Record::<u32>::new();
+        assert_eq!(block.index_of(&alone), None, "a record of no block");
+    }
+
+    #[test]
     fn a_block_of_sixty_four_uses_every_bit() {
         let block = Block::<u32, 64>::new();
         for i in 0..64 {
@@ -721,10 +1136,15 @@ mod tests {
     /// Processors the stub has: a location past them names no queue.
     const CPUS: u32 = 1000;
 
-    /// What a stub queue was asked: its processor, and every slot woken there so far.
+    /// The record's number in the stub's queues.
+    const NUMBER: u32 = 9;
+
+    /// What a stub queue was asked: its processor, and every slot woken there so far; and where the
+    /// record really is, if a model put it elsewhere than its location says.
     struct Calls {
         cpu: u32,
         woken: Vec<(u32, u16)>,
+        held: Option<(u32, u16)>,
     }
 
     /// Queues that count their locks and wake-ups, and can change the record's location as a lock
@@ -741,6 +1161,15 @@ mod tests {
         replaced: Cell<bool>,
         locks: Cell<u32>,
         woken: RefCell<Vec<(u32, u16)>>,
+        /// Whether the record moves to the next processor before every lock, until cleared (by the
+        /// hook that enters pinned mode, in a test).
+        moving: Cell<bool>,
+        /// Where the record really is, its location aside: `Some` plants a misplaced location
+        /// (ADR-0020 S20, trigger 3). `Some((CPUS, 0))` is a record that no queue holds.
+        held: Cell<Option<(u32, u16)>>,
+        /// A move in flight that completes just before the lock of this count: the record is then
+        /// held, and located, at that processor and slot (R96-6).
+        carry: Cell<Option<(u32, (u32, u16))>>,
     }
 
     impl<'a> Stub<'a> {
@@ -752,6 +1181,9 @@ mod tests {
                 replaced: Cell::new(false),
                 locks: Cell::new(0),
                 woken: RefCell::new(Vec::new()),
+                moving: Cell::new(false),
+                held: Cell::new(None),
+                carry: Cell::new(None),
             }
         }
     }
@@ -764,6 +1196,13 @@ mod tests {
                 return None;
             }
             self.locks.set(self.locks.get() + 1);
+            if let Some((at, (to_cpu, to_slot))) = self.carry.get()
+                && self.locks.get() == at
+            {
+                self.carry.set(None);
+                self.held.set(Some((to_cpu, to_slot)));
+                self.record.set_location(Location::new(to_cpu, to_slot));
+            }
             if self.exits.replace(false) {
                 self.record.clear_location();
             } else if self.replaced.replace(false) {
@@ -772,6 +1211,10 @@ mod tests {
                 // `Block::take`'s new generation, then the spawn's location.
                 let next = self.record.generation().wrapping_add(1);
                 self.record.generation.store(next, Relaxed);
+                self.record
+                    .set_location(Location::new(at.cpu() + 1, at.slot()));
+            } else if self.moving.get() {
+                let at = self.record.location().expect("a located thread moves");
                 self.record
                     .set_location(Location::new(at.cpu() + 1, at.slot()));
             } else if self.moves.get() > 0 {
@@ -783,16 +1226,66 @@ mod tests {
             let mut calls = Calls {
                 cpu,
                 woken: self.woken.take(),
+                held: self.held.get(),
             };
             let result = f(&mut calls);
             self.woken.replace(calls.woken);
             Some(result)
         }
 
+        fn holds<S>(queue: &Calls, slot: u16, number: u32, _: &Record<S>) -> bool {
+            assert_eq!(number, NUMBER, "the name's number");
+            // Another record wherever a planted misplacement says the record is not.
+            !queue.held.is_some_and(|held| held != (queue.cpu, slot))
+        }
+
         fn wake_slot(queue: &mut Calls, slot: u16) -> bool {
             queue.woken.push((queue.cpu, slot));
             true
         }
+
+        fn find(queue: &Calls, number: u32) -> Option<u16> {
+            assert_eq!(number, NUMBER, "the name's number");
+            queue
+                .held
+                .filter(|&(cpu, _)| cpu == queue.cpu)
+                .map(|(_, slot)| slot)
+        }
+
+        fn count(&self) -> u32 {
+            CPUS
+        }
+    }
+
+    /// `wake` with the stub's number, and a hook that keeps what it was told.
+    fn woken(stub: &Stub<'_>, record: &Record<u32>, generation: u32) -> (Wake, Vec<Met>) {
+        let met = RefCell::new(Vec::new());
+        let reported = RefCell::new(Vec::new());
+        let woke = wake(
+            stub,
+            record,
+            NUMBER,
+            generation,
+            |m| {
+                met.borrow_mut().push(m);
+                true
+            },
+            |m, outcome| reported.borrow_mut().push((m, outcome)),
+        );
+        let met = met.into_inner();
+        // The line is reported once, for the first inconsistency, after the retry or the search,
+        // with what it ended with; later ones are only counted (R96-10).
+        let expected: Vec<(Met, Outcome)> = met
+            .first()
+            .map(|&m| (m, woke.outcome))
+            .into_iter()
+            .collect();
+        assert_eq!(
+            reported.into_inner(),
+            expected,
+            "reported once, with the end"
+        );
+        (woke, met)
     }
 
     /// A record taken from a block and located at slot 5 of processor 2, and its generation.
@@ -807,6 +1300,7 @@ mod tests {
         Wake {
             outcome: Outcome::Reached { ready: true, cpu },
             retries,
+            met: None,
         }
     }
 
@@ -815,7 +1309,7 @@ mod tests {
         let block = Block::new();
         let (record, generation) = located(&block);
         let stub = Stub::new(record);
-        assert_eq!(wake(&stub, record, generation), reached(2, 0));
+        assert_eq!(woken(&stub, record, generation).0, reached(2, 0));
         assert_eq!(stub.locks.get(), 1);
         assert_eq!(*stub.woken.borrow(), [(2, 5)]);
     }
@@ -826,7 +1320,7 @@ mod tests {
         let (record, generation) = located(&block);
         let stub = Stub::new(record);
         stub.moves.set(1);
-        assert_eq!(wake(&stub, record, generation), reached(3, 1));
+        assert_eq!(woken(&stub, record, generation).0, reached(3, 1));
         assert_eq!(stub.locks.get(), 2);
         assert_eq!(*stub.woken.borrow(), [(3, 5)], "woken where it went, once");
     }
@@ -840,8 +1334,9 @@ mod tests {
         let gone = Wake {
             outcome: Outcome::Gone,
             retries: 0,
+            met: None,
         };
-        assert_eq!(wake(&stub, record, generation), gone);
+        assert_eq!(woken(&stub, record, generation).0, gone);
         assert_eq!(
             stub.locks.get(),
             0,
@@ -851,7 +1346,7 @@ mod tests {
         // the location cleared under the lock: the thread is gone, and nothing is followed.
         record.set_location(Location::new(2, 5));
         stub.exits.set(true);
-        assert_eq!(wake(&stub, record, generation), gone);
+        assert_eq!(woken(&stub, record, generation).0, gone);
         assert_eq!(stub.locks.get(), 1);
         assert!(stub.woken.borrow().is_empty());
     }
@@ -867,8 +1362,9 @@ mod tests {
         let stale = Wake {
             outcome: Outcome::Stale,
             retries: 0,
+            met: None,
         };
-        assert_eq!(wake(&stub, record, generation), stale);
+        assert_eq!(woken(&stub, record, generation).0, stale);
         assert_eq!(stub.locks.get(), 1);
         assert!(stub.woken.borrow().is_empty());
     }
@@ -881,25 +1377,34 @@ mod tests {
         let stale = Wake {
             outcome: Outcome::Stale,
             retries: 0,
+            met: None,
         };
-        assert_eq!(wake(&stub, record, generation.wrapping_sub(1)), stale);
-        assert_eq!(wake(&stub, record, generation.wrapping_add(1)), stale);
+        assert_eq!(woken(&stub, record, generation.wrapping_sub(1)).0, stale);
+        assert_eq!(woken(&stub, record, generation.wrapping_add(1)).0, stale);
         assert_eq!(stub.locks.get(), 2, "compared under the lock");
         assert!(stub.woken.borrow().is_empty(), "the slot is never woken");
     }
 
+    /// A thread that moves at every look, even with moves withdrawn: the flag itself failed. The
+    /// wake-up enters pinned mode after the first [`WAKE_TRIES`] looks, looks as many times again,
+    /// and ends `Exhausted`, on which the kernel stops (the ruling's Q17). One move fewer than the
+    /// tries: the last look of the first loop finds it, and pinned mode is not entered.
     #[test]
-    fn a_wake_up_whose_thread_moves_at_every_look_gives_up_after_the_last_try() {
+    fn a_wake_up_whose_thread_moves_at_every_look_gives_up_after_its_second_loop() {
         let block = Block::new();
         let (record, generation) = located(&block);
         let stub = Stub::new(record);
         stub.moves.set(u32::MAX);
         let exhausted = Wake {
             outcome: Outcome::Exhausted,
-            retries: WAKE_TRIES,
+            retries: 2 * WAKE_TRIES,
+            met: Some(Met::Exhausted),
         };
-        assert_eq!(wake(&stub, record, generation), exhausted);
-        assert_eq!(stub.locks.get(), WAKE_TRIES);
+        assert_eq!(
+            woken(&stub, record, generation),
+            (exhausted, vec![Met::Exhausted])
+        );
+        assert_eq!(stub.locks.get(), 2 * WAKE_TRIES);
         assert!(stub.woken.borrow().is_empty());
         // One move fewer than the tries: the last look finds it.
         let block = Block::new();
@@ -907,8 +1412,175 @@ mod tests {
         let stub = Stub::new(record);
         stub.moves.set(WAKE_TRIES - 1);
         assert_eq!(
-            wake(&stub, record, generation),
-            reached(2 + WAKE_TRIES - 1, WAKE_TRIES - 1)
+            woken(&stub, record, generation),
+            (reached(2 + WAKE_TRIES - 1, WAKE_TRIES - 1), vec![])
+        );
+    }
+
+    /// A thread that moves at every look until pinned mode is entered (the hook stops the moves):
+    /// the wake-up's first loop ends `Exhausted`, the hook is called once, and the second loop
+    /// reaches the thread at its first look (the ruling's Q17), with every follow counted.
+    #[test]
+    fn a_wake_up_past_its_tries_enters_pinned_mode_and_then_reaches_its_thread() {
+        let block = Block::new();
+        let (record, generation) = located(&block);
+        let stub = Stub::new(record);
+        stub.moving.set(true);
+        let met = RefCell::new(Vec::new());
+        let woke = wake(
+            &stub,
+            record,
+            NUMBER,
+            generation,
+            |m| {
+                stub.moving.set(false);
+                met.borrow_mut().push(m);
+                true
+            },
+            |_, _| {},
+        );
+        let landed = 2 + WAKE_TRIES;
+        assert_eq!(
+            woke,
+            Wake {
+                outcome: Outcome::Reached {
+                    ready: true,
+                    cpu: landed,
+                },
+                retries: WAKE_TRIES,
+                met: Some(Met::Exhausted),
+            }
+        );
+        assert_eq!(met.into_inner(), [Met::Exhausted], "the hook, once");
+        assert_eq!(stub.locks.get(), WAKE_TRIES + 1);
+        assert_eq!(
+            *stub.woken.borrow(),
+            [(landed, 5)],
+            "woken where it stopped"
+        );
+    }
+
+    /// A location whose slot holds another record (ADR-0020 S20, trigger 3; the ruling's Q6): no
+    /// one is woken there; the hook is called; the one search finds the record in another queue
+    /// and wakes it there.
+    #[test]
+    fn a_misplaced_location_enters_pinned_mode_and_the_search_wakes_the_thread() {
+        let block = Block::new();
+        let (record, generation) = located(&block);
+        let stub = Stub::new(record);
+        stub.held.set(Some((7, 3)));
+        assert_eq!(
+            woken(&stub, record, generation),
+            (
+                Wake {
+                    outcome: Outcome::Reached {
+                        ready: true,
+                        cpu: 7
+                    },
+                    retries: 0,
+                    met: Some(Met::Misplaced),
+                },
+                vec![Met::Misplaced]
+            )
+        );
+        assert_eq!(*stub.woken.borrow(), [(7, 3)], "woken where it is, only");
+        assert_eq!(
+            stub.locks.get(),
+            1 + 8,
+            "the look, then queues 0 to 7 in turn"
+        );
+    }
+
+    /// A wake-up that meets an inconsistency after pinned mode was entered by another: the hook
+    /// answers that it did not enter it, and the wake-up owes no line (`met` is `None`), but goes on
+    /// as one that entered it does.
+    #[test]
+    fn a_wake_up_that_did_not_enter_pinned_mode_owes_no_line() {
+        let block = Block::new();
+        let (record, generation) = located(&block);
+        let stub = Stub::new(record);
+        stub.held.set(Some((4, 1)));
+        let woke = wake(
+            &stub,
+            record,
+            NUMBER,
+            generation,
+            |_| false,
+            |_, _| panic!("a wake-up that did not enter pinned mode reported a line"),
+        );
+        assert_eq!(
+            woke,
+            Wake {
+                outcome: Outcome::Reached {
+                    ready: true,
+                    cpu: 4
+                },
+                retries: 0,
+                met: None,
+            }
+        );
+    }
+
+    /// A misplaced location whose record no queue holds: the search looks in every queue, finds
+    /// nothing, follows the location once more, which is still misplaced, a second inconsistency
+    /// counted, and searches every queue once more (R96-6); it wakes no one, and ends `Misplaced`.
+    #[test]
+    fn a_misplaced_record_no_queue_holds_wakes_no_one() {
+        let block = Block::new();
+        let (record, generation) = located(&block);
+        let stub = Stub::new(record);
+        stub.held.set(Some((CPUS, 0)));
+        assert_eq!(
+            woken(&stub, record, generation),
+            (
+                Wake {
+                    outcome: Outcome::Misplaced,
+                    retries: 0,
+                    met: Some(Met::Misplaced),
+                },
+                vec![Met::Misplaced, Met::Misplaced]
+            )
+        );
+        assert!(stub.woken.borrow().is_empty());
+        assert_eq!(
+            stub.locks.get(),
+            2 + 2 * CPUS,
+            "a look, a search of every queue, a look and a search again"
+        );
+    }
+
+    /// The review of TASKS item 96, R96-6: a misplaced location, and a move in flight that carries
+    /// the thread, while the search runs, from a queue it had not reached to one it had passed.
+    /// The search finds it nowhere; the location, followed once more, names its new slot, where it
+    /// is woken. One inconsistency, counted once.
+    #[test]
+    fn a_thread_carried_past_the_search_is_found_by_the_next_look() {
+        let block = Block::new();
+        let (record, generation) = located(&block);
+        let stub = Stub::new(record);
+        // Really at processor 3 when the location at 2 is looked at; carried to processor 0 just
+        // before the search locks processor 1, its third lock in all.
+        stub.held.set(Some((3, 7)));
+        stub.carry.set(Some((3, (0, 4))));
+        assert_eq!(
+            woken(&stub, record, generation),
+            (
+                Wake {
+                    met: Some(Met::Misplaced),
+                    ..reached(0, 0)
+                },
+                vec![Met::Misplaced]
+            )
+        );
+        assert_eq!(
+            *stub.woken.borrow(),
+            [(0, 4)],
+            "woken in its new slot alone"
+        );
+        assert_eq!(
+            stub.locks.get(),
+            2 + CPUS,
+            "a look, the search, the look that finds it"
         );
     }
 
@@ -921,7 +1593,8 @@ mod tests {
         let gone = Wake {
             outcome: Outcome::Gone,
             retries: 0,
+            met: None,
         };
-        assert_eq!(wake(&stub, record, generation), gone);
+        assert_eq!(woken(&stub, record, generation).0, gone);
     }
 }
