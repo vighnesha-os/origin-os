@@ -4385,7 +4385,9 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
     for how in ["exits", "faults"] {
         markers.extend([
             "origin-kernel: ipc: the peer of a process that: woken -> OK, observed -> 0x4, write -> PEER_CLOSED, read -> PEER_CLOSED".to_string(),
-            format!("origin-kernel: ipc: when a process {how}: its handles close (0 left), and its peer on {far}, blocked "),
+            // TASKS item 134: the process starts only once its peer is seen blocked, so the
+            // wake-up crosses processors on every schedule.
+            format!("origin-kernel: ipc: when a process {how}: its handles close (0 left), and its peer on {far}, seen blocked in wait_one before the process started: true, blocked "),
             "woke and saw PEER_CLOSED".into(),
         ]);
     }
