@@ -16,7 +16,13 @@ cargo xtask run                                      # same, with the serial con
 
 The release version is written only in `origin-version.toml`; every module reads it through the generated `origin-version` crate, and `cargo xtask check` rejects a version in any Cargo manifest.
 
-Status: M0 (toolchain) and the first step of M1 (a UEFI loader that reports itself and returns to the firmware). There is no kernel yet. QEMU results are not hardware qualification.
+## Progress
+
+[`docs/PROGRESS.md`](docs/PROGRESS.md) shows how much of Origin OS is done, built, in progress and not started: overall, by milestone and by feature. It is generated from the requirements matrix by `cargo xtask progress`. `cargo xtask check` refuses a pull request whose page is not the one its tree generates, so the page on `main` is always current.
+
+[`docs/ROADMAP.md`](docs/ROADMAP.md) lists the milestones and their exit tests, and [`docs/STATUS.md`](docs/STATUS.md) says what each task built.
+
+No requirement has evidence from physical hardware yet. Results come from the development host, from QEMU, and from virtual machines on real processors, and none of those is hardware qualification.
 
 ## Licence
 

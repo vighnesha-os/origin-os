@@ -1509,3 +1509,22 @@ TASKS item 98 (the idle pull and the idle kick, ADR-0020 S7 and S10) found, befo
 - **What stays open:** nothing of it is built or measured. TASKS item 98 builds it and counts the asks at boot, under QEMU only.
 - **Performance cost** (ADR-0018 V3): unmeasured, owed (CL62). On a busy processor: one interrupt taken, one publication and one IPI sent, at most once a tick, and only while an idle processor waits for one of its threads. Nothing on the switch path.
 - **Where it is written:** ADR-0020 Amendment 1; the matrix row A20-Am1, placed in M3; the cost ledger's row CL62; TASKS item 98, which builds it.
+
+### The progress page at the repository root, linked from the README (item 356): Accepted 2026-11-23
+
+On 2026-11-23 you proposed keeping `PROGRESS.md` in the repository root, updated whenever `main` changes, and linked from `README.md` for tracking progress. The coordinating session checked the tree and put two forms of it: link the page where it is, or link it and move it to the root. You answered "Link and move to root".
+
+| # | Question | Answer |
+|---|---|---|
+| 356, answered | Is the progress page linked from the README where it is, in `docs/`, or linked and moved to the repository root? | **Link and move to root** |
+
+- **What was found first:**
+  - The page is already current on `main` at every merge: `cargo xtask progress` generates it from the requirements matrix, and `cargo xtask check` refuses a pull request whose page is not the one its tree generates. So no bot or extra step commits to `main`, and none is added.
+  - `README.md` did not link the page, and its status line was stale: it said "There is no kernel yet".
+  - `CLAUDE.md` does not name the page, so the directive does not change.
+- **What it changes:**
+  - **Now, in this records pull request:** the README's status line is replaced by a link to the page, with no hand-written figures.
+  - **With the next code batch (TASKS item 137):** the page moves to `PROGRESS.md` at the root. The generator, its gate and its tests change the path they use, and the README's link and the references that name the page's place follow. It waits for a batch because it changes `xtask` (item 70).
+- **The alternative put** was the link alone, which was the recommendation: the other status pages stay under `docs/`, and it needs no code change.
+- **Performance cost** (ADR-0018 V3): none, by construction: documents and a host tool.
+- **Where it is written:** this sheet; the requirements README's table of items without rows; `README.md`; TASKS item 137's line.
