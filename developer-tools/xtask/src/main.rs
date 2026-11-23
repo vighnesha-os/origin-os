@@ -3903,11 +3903,11 @@ const PIT_PROOF_TICKS: u64 = 20;
 const PIT_ROUTED_HEAD: &str = "origin-kernel: I/O APIC: ";
 /// The I/O APIC proof's line after its count, which is that line's marker (TASKS item 135;
 /// ADR-0013 R1(b)). The kernel's proof passes on [`PIT_PROOF_TICKS`] interrupts or more
-/// (`taken >= PROOF_TICKS`) and prints the count it took. Its loop reads the count before each
-/// interrupt window, and a window can take more than one interrupt, so the count can pass the
-/// bound: the 65-processor machine under host load printed 21, its proof passed, and the marker,
-/// which then held "20", failed the boot. So the count is no part of the marker, and
-/// [`pit_routed`] reads it.
+/// (`taken >= PROOF_TICKS`) and prints the count it took, which can pass the bound: the
+/// 65-processor machine under host load printed 21, its proof passed, and the marker, which then
+/// held "20", failed the boot. (The proof's loop reads the count before each interrupt window; a
+/// window that took two interrupts would give 21. Which path that boot took is not shown.) So the
+/// count is no part of the marker, and [`pit_routed`] reads it.
 const PIT_ROUTED: &str = " PIT interrupts routed through the I/O APIC in ";
 
 /// The count on the I/O APIC proof's line in `text`, a boot's output: how many PIT interrupts the
