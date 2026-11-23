@@ -1493,3 +1493,19 @@ On 2026-11-22, at about 19:44 UTC, you wrote: "Don't take for rentals anymore". 
 - **What is kept:** the rental tool (`developer-tools/bench/latitude.py`), its tests, and the bench build's modes (ADR-0002 Amendments 3 to 6) stay in the tree. They are host-side and bench-only, none ships, and they serve a bench machine that is not rented. The kept raw data stays where item 232 put it.
 - **Performance cost** (ADR-0018 V3): none, by construction.
 - **Where it is written:** this sheet; the requirements README's table of items without rows; a dated note on ADR-0002 Amendment 7.
+
+### An idle processor may ask a busy one to release a waiting thread (item 355): Accepted 2026-11-23
+
+TASKS item 98 (the idle pull and the idle kick, ADR-0020 S7 and S10) found, before writing code, a case the accepted design cannot serve. When a processor runs exactly two threads that never yield, the one that is waiting is always the thread most recently switched out, and S5 lets nobody take such a thread until its processor next calls into its table. Each tick's switch makes that call and takes the thread back at once. So an idle processor can never take it, and S7's work conservation fails in its plainest case: two threads on one processor while another idles. A host test showed it: a mover looking between 64 switches was refused 64 times.
+
+| # | Question | Answer |
+|---|---|---|
+| 355, answered | May ADR-0020 be amended so that an idle processor may send a busy one a single reschedule interrupt, at most one per tick per busy processor, asking it to publish the waiting thread's frame? It adds a small cost to the busy processor, which the accepted design said would be none. | **Allow it** |
+
+- **The alternatives put:**
+  - change the switch path: publish every thread's frame as it is switched out, in the kernel's assembly. Every switch then pays, and that code is outside what Loom can check. S5 names it as its fallback;
+  - leave it unfixed: a processor with exactly two runnable threads is not relieved while another idles, recorded as a limitation.
+- **What it changes:** S7 gains a fourth message, the ask. Every move is still made by the idle processor that will run the thread, and a frame is still published only by its own processor (S5).
+- **What stays open:** nothing of it is built or measured. TASKS item 98 builds it and counts the asks at boot, under QEMU only.
+- **Performance cost** (ADR-0018 V3): unmeasured, owed (CL62). On a busy processor: one interrupt taken, one publication and one IPI sent, at most once a tick, and only while an idle processor waits for one of its threads. Nothing on the switch path.
+- **Where it is written:** ADR-0020 Amendment 1; the matrix row A20-Am1, placed in M3; the cost ledger's row CL62; TASKS item 98, which builds it.

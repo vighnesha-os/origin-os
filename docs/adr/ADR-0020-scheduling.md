@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-20 ("Accept all 24"), every decision as proposed: decision-sheet items 318 to 340, its questions 1 to 23 (CLAUDE.md §18, §84). Written by TASKS item 90; the coordinating session ruled on its outline the same day before it was put: the identity refactor first, with no change of behaviour (S1); processors offline and back in an ADR-0008 amendment, with M3-1 partial until it is built (S21); lending across calls in ADR-0005, as its Amendment 11, accepted beside this ADR as item 341 (S16); and additions in S4, S6, S9, S11, S12, S20 and S23. **Nothing in it is built.** No person has reviewed it. Every figure in it is a hypothesis (§53, decision item 115, ADR-0018 V6) |
+| Status | **Accepted** by the owner on 2026-11-20 ("Accept all 24"), every decision as proposed: decision-sheet items 318 to 340, its questions 1 to 23 (CLAUDE.md §18, §84). Written by TASKS item 90; the coordinating session ruled on its outline the same day before it was put: the identity refactor first, with no change of behaviour (S1); processors offline and back in an ADR-0008 amendment, with M3-1 partial until it is built (S21); lending across calls in ADR-0005, as its Amendment 11, accepted beside this ADR as item 341 (S16); and additions in S4, S6, S9, S11, S12, S20 and S23. **Nothing in it is built.** No person has reviewed it. Every figure in it is a hypothesis (§53, decision item 115, ADR-0018 V6). Amendment 1, accepted by the owner on 2026-11-23 (decision sheet item 355), lets an idle processor ask a busy one, by one reschedule IPI, to publish a waiting thread's frame |
 | Decides | How a thread moves between processors without breaking what the kernel's proofs rest on today; who moves threads, when and where (load balancing and placement by topology, capacity, migration cost, power and heat); affinity; scheduling classes and priorities; CPU accounting; CPU quotas; priority-inversion mitigation; EEVDF's place; the safe fallback; where CPU offline and online belongs |
 | Requires | CLAUDE.md P0, P1, P2, P8; §1 (roles 3, 4, 5, 6, 16, 23, 33, 35, 53; "Specify operation semantics", "Discover and report capabilities truthfully", "Deny by default", "Establish performance budgets before measurement"); §2, §16, §18, §24 to §27, §53, §58, §61, §66, §67, §73, §74, §83; final rules 6 to 9, 16, 21, 29, 30 |
-| Performance cost | None, by construction: S2, S3, S6, S8, S13 and S18 to S21. Unmeasured, owed, each with its model below and its row in the cost ledger (ADR-0018 V5): S1 (CL47), S4 (CL48), S5 (CL49), S7 (CL50), S9 (CL51), S10 (CL52), S11 (CL53), S12 (CL54), S14 (CL55), S15 (CL56), S16 (CL57) and S17 (CL58); and S23, under the existing row CL20 (the boot proofs' waits). S22 is the budgets themselves, B20 to B26 |
+| Performance cost | None, by construction: S2, S3, S6, S8, S13 and S18 to S21. Unmeasured, owed, each with its model below and its row in the cost ledger (ADR-0018 V5): S1 (CL47), S4 (CL48), S5 (CL49), S7 (CL50), S9 (CL51), S10 (CL52), S11 (CL53), S12 (CL54), S14 (CL55), S15 (CL56), S16 (CL57) and S17 (CL58); and S23, under the existing row CL20 (the boot proofs' waits). S22 is the budgets themselves, B20 to B26. Amendment 1: unmeasured, owed (CL62) |
 | Code | None changed. The build plan (`docs/engineering/M3_SCHEDULING_PLAN.md`) splits the work into TASKS items 92 to 109 |
 | Evidence | `docs/research/2026-11-20-m3-scheduling.md` (the ledger: sources I1 to I4, A2, A3, the PPRs, ACPI66, P1 to P4, and §6's table N1 to N13 of what the code rests on), read 2026-11-20; the kernel on `land/batch-8` at `fa88211a`, whose TASKS items 70, 73, 75, 77 and 79 (the table of contexts, the reclaim, the exits counts) were not yet on `main` when this ADR was accepted |
 | Builds on | ADR-0003 K6 and K7; ADR-0005 P8 and P11; ADR-0008 and its Amendment 1; ADR-0009 Amendment 1; ADR-0011 N6; ADR-0012; ADR-0013 and its Amendment 2; ADR-0017 Z3 and Z5; ADR-0018; ADR-0019 (`_CPC` needs the AML interpreter) |
@@ -786,3 +786,52 @@ The owner answered "Accept all 24" on 2026-11-20. The coordinating session numbe
 | 22 | 339 | Record S22's budgets as hypotheses (S22)? | **Accept** | Accepted |
 | 23 | 340 | Adopt S23's proofs and classes, the diagnostic round on the 65- and 67-processor machines (balancing on and off, idle and beside load) before any task that turns balancing on or changes what a proof accepts sets a proof, a bound or a reported row, and an SMT machine and a two-package machine in `boot-matrix` under ADR-0008 Amendment 1 D7's CI condition (S23)? | **Accept** | Accepted |
 | 24 | 341 | Taken alongside: amend ADR-0005 so that a client waiting on a call lends its class and weight to the server thread that read its message, until the reply, the client's stop or its deadline, built after the M3 core (ADR-0005 Amendment 11, J1 to J6)? | **Accept** | Accepted |
+
+## Amendment 1 (2026-11-23): an idle processor asks a busy one to publish a waiting frame
+
+*Accepted by the owner on 2026-11-23 ("Allow it"; decision sheet item 355). Proposed by TASKS item 98's contract (its question Q2), which found the case below on `27699a39`. TASKS item 98 builds it. Until that lands, nothing here is built.*
+
+**The finding.** S5 publishes a switched-out frame at its processor's next call into the table, and says the thread "is therefore movable from its source's next trap entry after it was switched out: within one tick, sooner on any interrupt". That does not hold when a processor runs exactly two threads that never yield:
+- each tick's switch publishes the waiting thread's frame and takes it at once, and the thread switched out becomes the leaving one;
+- so between two ticks the only waiting thread is always in the leaving record, `lend` refuses it, and an idle processor can never take it;
+- S7's work conservation then fails in its plainest case: two threads on one processor while another idles.
+
+With three or more threads, all but the last one switched out can be lent. The evidence is `Contexts::switch` and `lend` in `framekernel/frame/sync/src/contexts.rs`, and a host test of TASKS item 98: a mover looking between 64 switches was refused 64 times, and after one call into the table that switches nothing, the frame was lent.
+
+**Change to S7: a fourth message, the ask.**
+
+1. An idle processor whose pull (S7, path 1) finds a thread it could otherwise take, but whose frame its source has not published, may send that source one reschedule IPI. It then idles.
+2. The source's reschedule upcall runs as any other. In it the source publishes its leaving frame, as S5's "next call into the table" does, and then kicks the nearest idle processor, as S7's path 2 does.
+3. The kicked processor's idle flow runs path 1 and pulls the published frame.
+
+**Its bounds.**
+- A processor sends at most one balancing IPI a tick, kicks and asks together. This is S7's "at most one kick per tick per processor".
+- A processor takes at most one ask a tick, however many processors are idle. An asker sends only if it is the first to mark the source as asked, and the source clears the mark when it publishes, or at its tick.
+- An ask is sent only for a thread that every other check of the pull would take: declared for balancing, ready, not running, not pinned, within S10's rate and cache-hot rule, with room at the destination.
+
+**What does not change.**
+- Every move is still a pull: the processor that will run the thread is the one that moves it. A busy processor never moves a thread.
+- S5 stands: a frame is published only by its own processor, after it has left the stack. The ask adds no publication point, because a reschedule upcall is a scheduler upcall, which already reaches the table (S5's note of 2026-11-21).
+- The switch path, the trap entry's assembly and the tick's step are unchanged.
+- Every step waits on an event, and none on a time.
+
+**Where it differs from accepted text:**
+- **S7's decision** lists three paths, with busy processors only kicking. The ask is a message from an idle processor to a busy one, which S7 did not have.
+- **S7's cost row** says the idle pull "costs only idle processors", and its evidence says balancing started by idle processors "costs the busy ones nothing". With the ask, a busy processor takes one interrupt and sends one IPI, at most once a tick, and only while an idle processor waits for one of its threads.
+- **S5's sentence** quoted above is narrowed: with exactly two alternating threads, the waiting one becomes movable only after an ask, or after its processor publishes for a kick of its own.
+
+**Alternatives.**
+
+| | Why not |
+|---|---|
+| S5's alternative (a): publish from the trap stub, right after the new stack pointer is loaded | Every switch pays one or two stores, in the framework's assembly and outside Rust's memory model, so Loom cannot check it. S5 names it as the next step only if B21 is missed because of this delay |
+| No ask | A processor with exactly two runnable threads is never relieved while another idles: in TASKS item 98, and in item 99, whose periodic pull needs the same frame |
+| The source holds the waiting thread back at its tick until an idle processor has taken it | No interrupt on the busy processor, but it changes the tick's step, delays the pull by up to a tick, and adds a state that step must honour |
+
+**Performance cost (ADR-0018 V3).** Unmeasured, owed (CL62): on a busy processor, one reschedule interrupt taken, one publication (two plain stores on lines the processor owns) and one IPI sent, at most once a tick, and only while an idle processor waits for one of its threads; on the idle processor, one IPI sent. Nothing on the switch path. TASKS item 98 counts the asks at boot and prints them.
+
+**Threat model (§58).**
+- An ask is the reschedule vector: it names no thread and carries no data. No program can send one; only a processor's idle flow does.
+- A program that keeps exactly two threads runnable on a processor causes at most one ask a tick there, and what it gains is a processor that would otherwise idle.
+- Many idle processors cannot flood one busy processor: it takes at most one ask a tick.
+- S20 stands: with moves withdrawn, no ask is sent.
