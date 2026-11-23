@@ -765,7 +765,7 @@ fn nvme_queued_for(cpus: u32, pairs: u32) -> u32 {
 
 /// The per-CPU tables the kernel sizes at discovery, the framework's and the kernel crate's
 /// (ADR-0008 Amendment 1, D1; `per_cpu` checks that each is sized).
-const PER_CPU_TABLES: u32 = 27;
+const PER_CPU_TABLES: u32 = 28;
 
 /// The cores of each package of the 288-processor run (`ORIGIN_QEMU_TOPOLOGY=many`, outside the
 /// gate since decision item 294).
@@ -1432,7 +1432,8 @@ fn index_ranges(sorted: &[usize]) -> String {
 
 /// The scheduling-domains proof's lines (TASKS item 97): the tree and where its claims came from,
 /// exactly under QEMU's software processor and only their starts under KVM; that nothing
-/// disagreed; and every processor at capacity 1024. Under KVM the host's processor decides the
+/// disagreed; and every processor at capacity 1024 under QEMU's software processor (TASKS item 106:
+/// no source reports every processor there). Under KVM the host's processor decides the
 /// guest's cache leaf, and how QEMU encodes `SMP_CACHE` there, or passes the host's own leaves
 /// with `-cpu host`, has not been measured: until a CI run shows the trees, the tree line is held
 /// to its start there (the review's R97-16), and a difference shows in CI's log, not as a failure.
@@ -1490,8 +1491,60 @@ fn domain_markers(machine: &Machine, settings: &Settings, leaf_1f: bool) -> Vec<
             "origin-kernel: domains: from: caches by ".into()
         },
         "origin-kernel: domains: 0 claims cut, 0 differing from the PPTT, 0 naming another cache level than CPUID, 0 in no node, 0 recorded nothing; levels crossing: none".into(),
+        // TASKS item 106: under QEMU's software processor no source reports every processor, so
+        // every capacity is 1024 (source 5). Under KVM the host's leaf 06H decides, which no CI run
+        // has shown yet: held to its start there, as the tree line is.
+        if settings.accel == Accel::Tcg {
+            format!(
+                "origin-kernel: domains: capacity 1024 on {n} of {n} processors at boot (ADR-0020 S9 source 5: no source reports every processor); consistent true"
+            )
+        } else {
+            "origin-kernel: domains: capacity ".into()
+        },
+    ]
+}
+
+/// The hardware capacity proof's lines (TASKS item 106). Exact under QEMU 11.1.3's software
+/// processor, which reports the thermal registers (CPUID.01H:EDX\[22\]) and a thermal LVT entry,
+/// masked, but no thermal sensor, HFI, HWP or AMD CPPC, so no source wants the LVT and only the
+/// absence paths run; its tables have no `_CPC`. The round's vector is taken on every processor,
+/// and the MSR probe recovers the #GP of a reserved x2APIC address. Under KVM the host's processor
+/// decides what CPUID reports, which no CI run has shown yet: the lines are held to their starts,
+/// the probe's too, and the round's processors exactly.
+fn capacity_markers(machine: &Machine, settings: &Settings) -> Vec<String> {
+    let n = machine.cpus();
+    let probe = "origin-kernel: capacity: MSR probe: RDMSR of the reserved x2APIC address 0x80e raised #GP and was recovered";
+    if settings.accel == Accel::Kvm {
+        return vec![
+            "origin-kernel: capacity: HFI on ".into(),
+            "origin-kernel: capacity: thermal LVT free on ".into(),
+            "origin-kernel: capacity: HWP on ".into(),
+            "origin-kernel: capacity: _CPC not read in the kernel (ADR-0019 A2); in QEMU's tables on 0 of ".into(),
+            // Whether KVM faults on 80EH has not been seen: "not run" there is no failure (the
+            // coordinating session's ruling of 2026-11-22), so only the line's start is held.
+            "origin-kernel: capacity: MSR probe: ".into(),
+            "origin-kernel: capacity: the round waited ".into(),
+            format!(
+                "origin-kernel: capacity: thermal vector 0x44 sent to {n} of {n} processors, taken by {n}, "
+            ),
+        ];
+    }
+    let packages = machine.geometry.packages;
+    vec![
         format!(
-            "origin-kernel: domains: capacity 1024 on {n} of {n} processors (ADR-0020 S9 source 5: no hardware source is read before TASKS item 106); consistent true"
+            "origin-kernel: capacity: HFI on 0 of {n} processors, 0 reading a row of a table in use (0 past their table); packages: {packages}, taken 0, HFI enabled 0, written 0, enabled by the firmware 0, disagreeing 0, an LVT the firmware's 0"
+        ),
+        format!(
+            "origin-kernel: capacity: thermal LVT free on {n} of {n}, the firmware's on 0, taken on 0 (0 with other enables the firmware set; CPUID.01H:EDX[22] on {n}, with a sensor on 0); heat: not supported: no thermal sensor; AMD heat not supported at M3"
+        ),
+        format!(
+            "origin-kernel: capacity: HWP on 0 of {n}, on from the firmware on 0, Highest-change interrupt on 0; AMD CPPC on 0 of {n}, on from the firmware on 0; neither is enabled here (power management's, M10)"
+        ),
+        "origin-kernel: capacity: _CPC not read in the kernel (ADR-0019 A2); in QEMU's tables on 0 of ".into(),
+        probe.into(),
+        "origin-kernel: capacity: the round waited ".into(),
+        format!(
+            "origin-kernel: capacity: thermal vector 0x44 sent to {n} of {n} processors, taken by {n}, 0 with a source, 0 quiet; 0 packages asked to enable the HFI, 0 answered; 0 table updates; processors with a register that faulted 0, with an enable not read back 0; source 5, capacity 1024 on {n} of {n}; consistent true"
         ),
     ]
 }
@@ -2788,6 +2841,9 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
                 " changes of process on {cpus} processor{}, ",
                 if cpus == 1 { "" } else { "s" }
             ),
+        ])
+        .chain(capacity_markers(machine, settings))
+        .chain([
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
             "origin-kernel: PCIe: 00:00.0 8086:29c0 class 06:00:00 host bridge".into(),
             "origin-kernel: PCIe: 00:01.0 1234:1111 class 03:00:00 VGA-compatible display controller; BAR0 mem32 prefetchable 16 MiB at ".into(),
@@ -3103,6 +3159,9 @@ fn aml_markers(acpi: bool) -> Vec<String> {
             " 0 failed otherwise; HPET's _STA refused in SystemMemory true; ",
             " processors, each _STA refused in SystemIO true; ",
             " links (LNKx), each _STA refused in PCI_Config true",
+            // TASKS item 106: QEMU's processors have no `_CPC` (M2).
+            "origin-kernel: aml: walk: _CPC on 0 of ",
+            " processors: 0 with an Integer Highest, 0 with a register (not read: ADR-0019 A2), 0 refused, 0 not read otherwise",
             "origin-kernel: aml: the host: ",
             "; answered otherwise 0; Global Lock taken ",
             "origin-kernel: aml: ",
@@ -3802,6 +3861,9 @@ fn boot_failures() -> Vec<&'static str> {
         "left no record of its controls",
         ": nospec failed",
         ": ibpb failed",
+        // TASKS item 106: a register CPUID claims that faulted, an enable that did not read back, a
+        // round not taken everywhere.
+        ": hardware capacity failed",
     ]
 }
 

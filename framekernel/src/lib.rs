@@ -131,6 +131,7 @@ pub mod bootproof;
 pub mod cache;
 pub mod channel;
 pub mod core_image;
+pub mod cpc;
 pub mod deflate;
 pub mod dhcp;
 pub mod dns;

@@ -205,7 +205,7 @@ pub unsafe fn init() {
     for (vector, (gate, stub)) in idt.0.iter_mut().zip(STUBS.iter()).enumerate() {
         *gate = d::interrupt_gate(*stub as usize as u64, KERNEL_CODE, ist_of(vector as u64));
     }
-    let interrupts: [(u8, extern "sysv64" fn()); 12] = [
+    let interrupts: [(u8, extern "sysv64" fn()); 13] = [
         (TIMER_VECTOR, timer_stub),
         (SPURIOUS_VECTOR, spurious_stub),
         (YIELD_VECTOR, yield_stub),
@@ -218,6 +218,7 @@ pub unsafe fn init() {
         (NET_VECTOR, net_stub),
         (NET_TX_VECTOR, net_tx_stub),
         (IOAPIC_VECTOR, ioapic_stub),
+        (THERMAL_VECTOR, thermal_stub),
     ];
     for (vector, stub) in interrupts {
         if let Some(gate) = idt.0.get_mut(usize::from(vector)) {
@@ -1161,6 +1162,9 @@ pub const IOAPIC_VECTOR: u8 = 0x41;
 pub const NET_VECTOR: u8 = 0x42;
 /// The virtio-net NIC's transmit-completion interrupt (an MSI-X message).
 pub const NET_TX_VECTOR: u8 = 0x43;
+/// The thermal LVT's interrupt: the HFI's notifications, core thermal transitions and HWP's
+/// (`crate::hfi`; TASKS item 106).
+pub const THERMAL_VECTOR: u8 = 0x44;
 
 /// The vector in a system call's frame (no gate has it: `syscall` builds the frame itself,
 /// and `int 0x80` from ring 3 faults).
@@ -1534,6 +1538,16 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             frame.rip = (probe_recover as *const ()).addr() as u64;
             return here;
         }
+    }
+    // A #GP at the instruction an MSR probe armed (TASKS item 106; the coordinating session's
+    // ruling Q4), recovered by `recover_msr_probe`, cold and out of line, which tests the vector
+    // itself, on the fatal and #BP tail alone. A guard comparing the vector here would join the
+    // compiler's chain of compares and move the blocks above. Measured path by path against the
+    // base, no listed path runs more instructions but the exit software interrupt's, by one jump,
+    // once in a thread's life (ADR-0018 V1; the coordinating session's ruling of 2026-11-22; TASKS
+    // item 106's entry).
+    if recover_msr_probe(frame, Switch::new().here()) {
+        return here;
     }
     // A report must get out even if this processor faulted inside the console (the hook,
     // `console::report_exception`, uses the console's urgent path). Only #BP resumes.
@@ -2341,6 +2355,69 @@ pub fn probe_execute_data() -> (u64, Probe) {
     (target, probe)
 }
 
+/// Reads model-specific register `msr` through a probe: `None` if RDMSR raised #GP, as it does for
+/// a register the processor does not implement, or one a hypervisor does not emulate although
+/// CPUID claims it (TASKS item 106; the coordinating session's ruling Q4).
+///
+/// # Safety
+///
+/// CPL 0, and reading `msr`, where it exists, has no side effect the caller does not intend.
+pub unsafe fn probe_rdmsr(msr: u32) -> Option<u64> {
+    let mut value = 0u64;
+    let out = &raw mut value;
+    // SAFETY: the caller's contract. `read_msr` raises #GP at its first instruction, RDMSR, which
+    // `dispatch` recovers from for an armed MSR probe, or stores the register in `value` through
+    // `out`, a live local, and returns.
+    let probe = run_probe((read_msr as *const ()).addr() as u64, || unsafe {
+        read_msr(out, 0, 0, u64::from(msr))
+    });
+    (probe == Probe::Completed).then_some(value)
+}
+
+/// Writes `value` to model-specific register `msr` through a probe: `false` if WRMSR raised #GP,
+/// as it does for a register the processor does not implement or a value it refuses (TASKS item
+/// 106).
+///
+/// # Safety
+///
+/// CPL 0, and the write's effect, where it is taken, is one the caller intends and keeps
+/// memory-safe.
+pub unsafe fn probe_wrmsr(msr: u32, value: u64) -> bool {
+    // SAFETY: the caller's contract. `write_msr` raises #GP at WRMSR, [`WRMSR_AT`] bytes in, which
+    // `dispatch` recovers from for an armed MSR probe, or writes the register and returns.
+    let probe = run_probe(
+        (write_msr as *const ()).addr() as u64 + WRMSR_AT,
+        || unsafe { write_msr(value & 0xFFFF_FFFF, 0, value >> 32, u64::from(msr)) },
+    );
+    probe == Probe::Completed
+}
+
+/// `dispatch`'s #GP branch (TASKS item 106): a #GP (vector 13) at the instruction an armed MSR probe
+/// expects, RDMSR or WRMSR on a register that does not exist, resumes at `probe_recover`, which
+/// returns the error code to the probe's caller. Only at an MSR probe's instruction, so no other
+/// probe and no other #GP changes; the address is compared first, so no other #GP reads CPU-local
+/// data through GS (the review's R106-6). `here` is the trap entry's witness, which the CPU-local
+/// area is read under. Cold and out of line, on `dispatch`'s fatal and #BP tail.
+#[cold]
+#[inline(never)]
+fn recover_msr_probe(frame: &mut ExceptionFrame, here: crate::trap::Here<'_>) -> bool {
+    if frame.vector != 13
+        || !is_msr_probe(frame.rip)
+        || local(here).probe_rip.load(Ordering::SeqCst) != frame.rip
+    {
+        return false;
+    }
+    frame.rax = frame.error_code;
+    frame.rip = (probe_recover as *const ()).addr() as u64;
+    true
+}
+
+/// Whether `rip` is an MSR probe's instruction: the only probes `dispatch` recovers a #GP for.
+fn is_msr_probe(rip: u64) -> bool {
+    rip == (read_msr as *const ()).addr() as u64
+        || rip == (write_msr as *const ()).addr() as u64 + WRMSR_AT
+}
+
 /// Whether SMAP is enabled (so user accesses need `stac`/`clac`).
 static SMAP_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Whether UMIP is on (ring 3 cannot read the descriptor-table registers).
@@ -2885,6 +2962,39 @@ unsafe extern "sysv64" fn write_byte(_addr: u64, _value: u8) -> u64 {
     naked_asm!("mov byte ptr [rdi], sil", "mov rax, -1", "ret", "int3");
 }
 
+/// RDMSR of the register in ECX (the fourth argument) as the first instruction, so a #GP has RIP =
+/// `read_msr`; the value goes to `out` (the first), and the return is [`COMPLETED`].
+#[unsafe(naked)]
+unsafe extern "sysv64" fn read_msr(_out: *mut u64, _: u64, _: u64, _msr: u64) -> u64 {
+    naked_asm!(
+        "rdmsr",
+        "mov dword ptr [rdi], eax",
+        "mov dword ptr [rdi + 4], edx",
+        "mov rax, -1",
+        "ret",
+        "int3"
+    );
+}
+
+/// Where WRMSR is in [`write_msr`]: after `mov eax, edi`, spelled as its two bytes so that the
+/// offset does not rest on how an assembler encodes it.
+const WRMSR_AT: u64 = 2;
+
+/// WRMSR of EDX:EAX to the register in ECX: the low half is the first argument, moved to EAX by the
+/// first instruction ([`WRMSR_AT`] bytes), the high half the third (RDX), the register the fourth
+/// (RCX). So a #GP has RIP = `write_msr` + [`WRMSR_AT`], and the return is [`COMPLETED`].
+#[unsafe(naked)]
+unsafe extern "sysv64" fn write_msr(_low: u64, _: u64, _high: u64, _msr: u64) -> u64 {
+    naked_asm!(
+        // mov eax, edi
+        ".byte 0x89, 0xf8",
+        "wrmsr",
+        "mov rax, -1",
+        "ret",
+        "int3"
+    );
+}
+
 /// Jumps to `addr` with the caller's return address on the stack.
 #[unsafe(naked)]
 unsafe extern "sysv64" fn jump(_addr: u64) -> u64 {
@@ -3013,6 +3123,7 @@ soft_stub!(device_stub, DEVICE_VECTOR);
 soft_stub!(net_stub, NET_VECTOR);
 soft_stub!(net_tx_stub, NET_TX_VECTOR);
 soft_stub!(ioapic_stub, IOAPIC_VECTOR);
+soft_stub!(thermal_stub, THERMAL_VECTOR);
 
 /// Entry stub of the spurious-interrupt vector.
 #[unsafe(naked)]

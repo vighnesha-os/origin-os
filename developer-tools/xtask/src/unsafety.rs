@@ -87,6 +87,10 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
         "early boot: the loader's boot information, read through the pointer it hands over",
     ),
     (
+        "framekernel/frame/src/hfi.rs",
+        "the thermal LVT's sources: HFI, thermal and performance-capability MSRs, and the table the processor writes",
+    ),
+    (
         "framekernel/frame/src/iommu.rs",
         "Intel VT-d: remapping structures the hardware reads, and their cache-line flushes",
     ),

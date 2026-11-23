@@ -306,6 +306,7 @@ pub(crate) fn size_per_cpu(sizing: &mut Sizing) {
     sizing.table(&crate::cpu::CPU_STATE);
     sizing.table(&crate::cpu::CONTEXTS);
     sizing.table(&crate::cpu::PAT_READY);
+    sizing.table(&crate::hfi::SLOTS);
     sizing.table(&crate::random::SLOTS);
     sizing.table(&crate::smp::TOPOLOGY);
     sizing.table(&crate::speculation::RECORDS);
