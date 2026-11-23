@@ -1,0 +1,28 @@
+# Code owners (CLAUDE.md §6 and §78; decision item 79).
+#
+# GitHub asks the owner named on the last matching line for a review when a pull request
+# touches a path below. The order matters: a later line overrides an earlier one.
+# Merging to `main` takes the owner's approval in every case (CLAUDE.md §1).
+
+# The kernel: the Framekernel, its privileged framework and its generated system-call code.
+/framekernel/                           @vighnesha-os
+
+# The SDK's interfaces: their definitions, and the crates that carry the binary interface
+# between programs and the kernel.
+/sdk/                                   @vighnesha-os
+/runtime/abi/                           @vighnesha-os
+/runtime/core/                          @vighnesha-os
+/runtime/kernel-client/                 @vighnesha-os
+
+# What the loader hands to the kernel: an interface between two images.
+/boot/info/                             @vighnesha-os
+
+# The directive, the decisions and the specifications Origin defines: the owner's to change
+# (CLAUDE.md §1, "Reserve the owner's decisions").
+/CLAUDE.md                              @vighnesha-os
+/docs/adr/                              @vighnesha-os
+/docs/spec/                             @vighnesha-os
+/docs/engineering/OWNER_DECISIONS.md    @vighnesha-os
+
+# This file.
+/CODEOWNERS                             @vighnesha-os
