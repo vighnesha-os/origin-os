@@ -323,6 +323,12 @@ impl Rate {
         true
     }
 
+    /// Whether this processor has sent its one balancing interrupt for this tick: what a caller
+    /// asks that must decide something else before it sends.
+    pub fn spent(&self) -> bool {
+        self.sent.load(Relaxed)
+    }
+
     /// Counts one balancing interrupt sent. Apart from [`Rate::take`]'s flag, so that the count
     /// would show a second one in a tick if the flag ever failed to stop it.
     fn note_sent(&self) {
@@ -564,7 +570,9 @@ mod tests {
         let rate = Rate::new();
         assert_eq!(rate.read(), (0, 0));
         rate.tick();
+        assert!(!rate.spent());
         assert!(rate.take());
+        assert!(rate.spent());
         assert!(!rate.take() && !rate.take(), "a second in the same tick");
         assert_eq!(rate.read(), (1, 1));
         rate.tick();

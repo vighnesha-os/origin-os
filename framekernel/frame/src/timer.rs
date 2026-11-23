@@ -282,6 +282,16 @@ pub fn send_balance_ipi(me: crate::cpu::ThisCpu<'_>, apic_id: u32) -> bool {
     true
 }
 
+/// Whether this processor has sent its one balancing interrupt for this tick, so that
+/// [`send_balance_ipi`] would refuse: for a caller that must mark something as asked before it
+/// sends (ADR-0020 Amendment 1), and must not mark it and then find it cannot send. `me` is this
+/// processor, read with interrupts off, which stay off until the send.
+pub fn balance_spent(me: crate::cpu::ThisCpu<'_>) -> bool {
+    BALANCE_SENT
+        .this(me)
+        .is_none_or(crate::sync::balance::Rate::spent)
+}
+
 /// This processor's tick, for [`send_balance_ipi`]'s rate: it may send one balancing interrupt
 /// again. The scheduler's tick upcall calls it. With none sent since the last tick it costs two
 /// plain loads.

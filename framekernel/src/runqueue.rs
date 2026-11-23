@@ -65,7 +65,9 @@
 //!   ([`RunQueue::settled`]);
 //! - which waiting threads are not cache-hot ([`RunQueue::quiet`], [`RunQueue::judge`],
 //!   [`RunQueue::cold`]): judged by this queue's own processor from its own TSC, never by a
-//!   reader on another.
+//!   reader on another;
+//! - whether this queue's processor has been asked, in its present tick, to publish a waiting
+//!   thread's frame ([`RunQueue::take_ask`]; ADR-0020 Amendment 1): at most one ask a tick.
 
 /// Contexts one queue holds, its boot context included.
 pub const CAPACITY: usize = 16;
@@ -464,6 +466,15 @@ pub struct RunQueue<R = u32> {
     /// [`RunQueue::switches`] when they were.
     cold: u16,
     cold_switches: u64,
+    /// [`RunQueue::ticks`] when this queue's processor was last asked to publish
+    /// ([`RunQueue::take_ask`]; ADR-0020 Amendment 1).
+    asked_at: Option<u64>,
+    /// The asks sent to this queue's processor, counted apart from `asked_at`
+    /// ([`RunQueue::note_ask`]): in all, in the tick `asks_counted_at`, and the most in one tick.
+    asks: u64,
+    asks_counted_at: Option<u64>,
+    asks_in_tick: u32,
+    asks_most: u32,
 }
 
 // A mask of slots is 16 bits.
@@ -579,6 +590,11 @@ impl<R: Copy> RunQueue<R> {
             mark_ticks: 0,
             cold: 0,
             cold_switches: 0,
+            asked_at: None,
+            asks: 0,
+            asks_counted_at: None,
+            asks_in_tick: 0,
+            asks_most: 0,
         }
     }
 
@@ -1249,6 +1265,36 @@ impl<R: Copy> RunQueue<R> {
             0
         };
         self.cold_switches = self.switches;
+    }
+
+    /// Whether this queue's processor may be asked now to publish a waiting thread's frame
+    /// (ADR-0020 Amendment 1: "a processor takes at most one ask a tick, however many processors
+    /// are idle"): `true` for the first asker in each tick of this queue, which then sends the ask.
+    /// The mark is the tick's number, so the next tick ends it and the processor has nothing to
+    /// clear. An asker holds this queue's lock, as it does to find the thread it asks for.
+    pub fn take_ask(&mut self) -> bool {
+        if self.asked_at == Some(self.ticks) {
+            return false;
+        }
+        self.asked_at = Some(self.ticks);
+        true
+    }
+
+    /// Counts one ask sent to this queue's processor, apart from [`RunQueue::take_ask`]'s mark, so
+    /// that the count would show a second ask in a tick if the mark ever failed to stop it.
+    pub fn note_ask(&mut self) {
+        if self.asks_counted_at != Some(self.ticks) {
+            self.asks_counted_at = Some(self.ticks);
+            self.asks_in_tick = 0;
+        }
+        self.asks_in_tick = self.asks_in_tick.saturating_add(1);
+        self.asks_most = self.asks_most.max(self.asks_in_tick);
+        self.asks = self.asks.saturating_add(1);
+    }
+
+    /// The asks sent to this queue's processor in all, and the most in one of its ticks.
+    pub const fn asks(&self) -> (u64, u32) {
+        (self.asks, self.asks_most)
     }
 
     /// The waiting threads that are not cache-hot, a bit a slot, as this queue's processor last
@@ -2542,10 +2588,39 @@ mod tests {
         assert!(!q.quiet(39_000, H));
     }
 
+    /// ADR-0020 Amendment 1: a processor takes at most one ask in each of its ticks, however many
+    /// ask; the next tick allows one again; and the count is kept apart from the mark.
+    #[test]
+    fn a_queue_takes_one_ask_a_tick() {
+        let mut q = RunQueue::new();
+        assert_eq!(q.asks(), (0, 0));
+        assert!(q.take_ask());
+        q.note_ask();
+        assert!(
+            !q.take_ask() && !q.take_ask(),
+            "a second asker in the same tick"
+        );
+        assert_eq!(q.asks(), (1, 1));
+        q.tick(0x9000);
+        assert!(q.take_ask(), "the first after a tick");
+        q.note_ask();
+        assert!(!q.take_ask());
+        q.tick(0x9008);
+        q.tick(0x9010);
+        assert_eq!(q.asks(), (2, 1));
+        // Were the mark ignored, the count would say so (the boot control plants that).
+        q.note_ask();
+        q.note_ask();
+        assert_eq!(q.asks(), (4, 2));
+        q.tick(0x9018);
+        q.note_ask();
+        assert_eq!(q.asks(), (5, 2));
+    }
+
     /// The balancing state against a brute-force model (TASKS item 98), over random sequences on
     /// two to three queues: which threads are balanced, wherever they moved; each one's ticks
-    /// since it arrived; the census; and the cache-hot rule's one promise, that no thread named
-    /// cold has run within the window. The model keeps each thread's true last moment on a
+    /// since it arrived; the census; the cache-hot rule's one promise, that no thread named cold
+    /// has run within the window; and one ask a tick for each queue. The model keeps each thread's true last moment on a
     /// processor, on one clock for the whole machine, which the queues never see.
     mod balancing_against_a_model {
         use super::super::*;
@@ -2583,8 +2658,8 @@ mod tests {
             queues.iter().map(|q| q.record(q.current())).collect()
         }
 
-        /// One seed's run; returns how many times a thread was named cold.
-        fn run(seed: u64, steps: usize) -> u64 {
+        /// One seed's run; returns how many times a thread was named cold, and the asks sent.
+        fn run(seed: u64, steps: usize) -> (u64, u64) {
             let mut rng = Rng(seed | 1);
             let n = 2 + rng.below(2);
             let mut queues: alloc::vec::Vec<RunQueue> = (0..n)
@@ -2596,6 +2671,9 @@ mod tests {
                 .collect();
             let mut threads: alloc::vec::Vec<Thread> = alloc::vec![Thread::default()];
             let (mut now, mut named_cold) = (0u64, 0u64);
+            // The tick each queue was last asked in, and the asks sent in all.
+            let mut asked: alloc::vec::Vec<Option<u64>> = alloc::vec![None; n];
+            let mut asks = 0u64;
             for step in 0..steps {
                 let at = alloc::format!("seed {seed:#x}, step {step}");
                 now += 1 + rng.next() % 600;
@@ -2606,7 +2684,7 @@ mod tests {
                 let c = rng.below(n);
                 let here = 0x10_0000 + u64::try_from(step).unwrap() * 0x40;
                 let q = &mut queues[c];
-                match rng.below(12) {
+                match rng.below(13) {
                     0 | 1 => {
                         let id = u32::try_from(threads.len()).unwrap();
                         let frame = 0x8000_0000 + u64::from(id) * 0x1000;
@@ -2649,6 +2727,17 @@ mod tests {
                     9 => {
                         let quiet = q.quiet(now, H);
                         q.judge(quiet, q.current());
+                    }
+                    10 => {
+                        // An asker: the first in each of this queue's ticks sends, no other.
+                        let first = asked[c] != Some(q.ticks());
+                        assert_eq!(q.take_ask(), first, "{at}: queue {c}'s ask");
+                        if first {
+                            asked[c] = Some(q.ticks());
+                            q.note_ask();
+                            asks += 1;
+                        }
+                        assert!(q.asks().1 <= 1, "{at}: queue {c} took two asks in a tick");
                     }
                     _ => {
                         let to = rng.below(n);
@@ -2712,20 +2801,25 @@ mod tests {
                     }
                 }
             }
-            named_cold
+            let counted: u64 = queues.iter().map(|q| q.asks().0).sum();
+            assert_eq!(counted, asks, "seed {seed:#x}: the asks counted");
+            (named_cold, asks)
         }
 
         /// Fixed seeds, printed in every failure.
         #[test]
         fn the_balancing_state_agrees_with_the_model_over_random_sequences() {
-            let mut named_cold = 0;
+            let (mut named_cold, mut asks) = (0, 0);
             for seed in 0..64u64 {
-                named_cold += run(0xd1b5_4a32_d192_ed03u64.wrapping_mul(seed + 1), 3000);
+                let (cold, asked) = run(0xd1b5_4a32_d192_ed03u64.wrapping_mul(seed + 1), 3000);
+                named_cold += cold;
+                asks += asked;
             }
             assert!(
                 named_cold > 1000,
                 "the sequences named a thread cold {named_cold} times"
             );
+            assert!(asks > 1000, "the sequences sent {asks} asks");
         }
     }
 

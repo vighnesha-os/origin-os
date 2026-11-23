@@ -29,11 +29,22 @@
 //! those threads, one that is not cache-hot before one that is, then the lowest pass
 //! (`balance::pick`).
 //!
-//! **A thread whose frame is not published is passed over.** With exactly two threads that never
+//! # The ask (ADR-0020 Amendment 1; owner item 355)
+//!
+//! A thread whose frame is not published cannot be lent. With exactly two threads that never
 //! yield on a processor, the waiting one's frame is always its table's leaving record's between
-//! two ticks (`Contexts::switch` publishes it and takes it in one call), so no pull takes it. An
-//! idle processor that asks the source to publish it is ADR-0020's Amendment 1, if the owner
-//! accepts it (owner item 355); until then this module only counts those threads.
+//! two ticks (`Contexts::switch` publishes it and takes it in one call), so no pull would ever
+//! take it. So an idle processor that finds a thread it could otherwise take, unpublished, sends
+//! its source one reschedule interrupt, the **ask**, and halts. The source's reschedule upcall
+//! switches nothing; it publishes its leaving frame and kicks the nearest idle processor
+//! ([`kick`], as at any of its upcalls), whose idle flow then pulls the published frame. Every
+//! step waits on an event, none on a time.
+//!
+//! Its bounds: a processor sends at most one balancing interrupt a tick, kicks and asks
+//! together (`timer::send_balance_ipi`); a processor takes at most one ask in each of its ticks,
+//! however many are idle (`RunQueue::take_ask`, a mark an asker sets under the source's queue
+//! lock, which it holds already, and the source's next tick ends); and an ask is sent only for a
+//! thread that every other check of the pull would take. With moves withdrawn, none is sent.
 //!
 //! # Locks
 //!
@@ -173,6 +184,11 @@ pub(crate) struct Counts {
     /// Kicks not sent: the processor had sent its one for this tick, or nobody was idle.
     pub(crate) kicks_over_rate: AtomicU64,
     pub(crate) kicks_nobody_idle: AtomicU64,
+    /// Asks sent (ADR-0020 Amendment 1), and asks not sent: the source had been asked in its
+    /// present tick, or this processor had sent its one balancing interrupt for this tick.
+    pub(crate) asks: AtomicU64,
+    pub(crate) asks_not_first: AtomicU64,
+    pub(crate) asks_over_rate: AtomicU64,
     /// A pull of a thread that was not settled, and of a cache-hot thread by a processor outside
     /// its cache: counted apart from the tests that refuse them, and 0 unless one of those is
     /// broken.
@@ -199,6 +215,9 @@ pub(crate) static COUNTS: Counts = Counts {
     kicks_here: AtomicU64::new(0),
     kicks_over_rate: AtomicU64::new(0),
     kicks_nobody_idle: AtomicU64::new(0),
+    asks: AtomicU64::new(0),
+    asks_not_first: AtomicU64::new(0),
+    asks_over_rate: AtomicU64::new(0),
     too_soon: AtomicU64::new(0),
     hot_across: AtomicU64::new(0),
     longest_pass: AtomicU64::new(0),
@@ -300,6 +319,9 @@ fn pass(
                 count(&COUNTS.stopped, 1);
                 return false;
             }
+            // The source was asked to publish, or could not be: this processor idles, and the
+            // source's kick wakes it (ADR-0020 Amendment 1, step 1: "it then idles").
+            Pull::Asked => return false,
             Pull::Nothing => {
                 count(&COUNTS.nothing, 1);
                 if let Some(slot) = tried.get_mut(attempt) {
@@ -320,6 +342,9 @@ enum Pull {
     /// This pass is over: moves are withdrawn, this queue has work of its own or no room, or a
     /// move was refused.
     Stop,
+    /// A thread this processor could otherwise take is not published: the ask (ADR-0020
+    /// Amendment 1), sent or held by its bounds. This pass is over.
+    Asked,
 }
 
 /// Pulls one thread from `victim` to this processor, if it holds one this processor may take.
@@ -405,7 +430,29 @@ fn pull_from(
     let Some((candidate, placed, frame)) = chosen else {
         // What the victim's queue holds now, so that a word gone stale stops naming it.
         publish(from.get(), source, setup);
-        return Pull::Nothing;
+        if unpublished == 0 {
+            return Pull::Nothing;
+        }
+        // The ask (ADR-0020 Amendment 1): a thread passed every other check and is not
+        // published. This processor's own rate first, so that the source is not marked as asked
+        // by a processor that then cannot send; then the source's mark, under its lock.
+        let ask = if timer::balance_spent(me) {
+            count(&COUNTS.asks_over_rate, 1);
+            None
+        } else if !source.take_ask() {
+            count(&COUNTS.asks_not_first, 1);
+            None
+        } else {
+            source.note_ask();
+            from.apic_id()
+        };
+        drop((low, high));
+        if let Some(apic_id) = ask
+            && timer::send_balance_ipi(me, apic_id)
+        {
+            count(&COUNTS.asks, 1);
+        }
+        return Pull::Asked;
     };
     // Counted apart from the tests above: what a proof holds at 0.
     if !source.settled(candidate.slot, step.period) {
