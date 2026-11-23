@@ -360,6 +360,8 @@ The kernel is never entered, as in every bench mode, so no kernel reads a boot i
 
 **Note (2026-11-22, TASKS item 131's review, R131-7; the coordinating session's reading, not an amendment).** The threat model's list of writes above is narrower than this amendment's own steps, which the owner accepted. Step 1 keeps the full bench loader's work before the call unchanged, and that work includes its UART line and register writes before the call: the line written straight to the UART, and the UART's line-control setting. Step 5 keeps, after a second error, Amendment 2's line and Amendment 3's order: `ResetSystem`, then the FADT's reset register where it is not I/O port `0xCF9`. The steps decide, and the list above is to be read as including those writes. The mode still writes nothing to `0xCF9` and nothing to the FCH, and after a successful call it writes nothing before its triple fault (item 349).
 
+**Note (2026-11-22, after Amendment 7; the coordinating session's reading, not an amendment).** Amendment 7 (item 353) makes step 2's change every loader's: every loader now allocates the boot info and the kernel stack as `EfiLoaderData`. So the first bullet under "Where it differs from accepted text", "in this mode only" and "Every loader that is not this mode's is unchanged", describes B3 before Amendment 7. What still sets this mode apart from the full bench mode is step 2's line about the map, and Amendment 5's resets in steps 3 and 5. No word of the steps changes.
+
 ## Amendment 7 (2026-11-22): the boot info and the kernel stack allocated as loader data
 
 *Accepted by the owner on 2026-11-22 ("Change B3"; decision sheet item 353). Proposed by rental H's findings (`docs/research/2026-11-22-rental-h-findings.md`, on `land/batch-10` until it lands). TASKS item 133 built it the same day, under QEMU only (`claude/t133-loader-data`, gated at `1dd96c44`); it has not run on a machine (item 354).*
@@ -381,3 +383,5 @@ The kernel is never entered, as in every bench mode, so no kernel reads a boot i
 **Threat model (§58).**
 - The kernel sees the same region kinds as before, so it reclaims neither the boot info nor its own stack.
 - The firmware's map, read by no part of Origin after the call, no longer tells these pages from the loader's other data; firmware runtime services never own them in either case.
+
+**Note (2026-11-22, item 354).** On 2026-11-22 the owner stopped all bench rentals ("Don't take for rentals anymore"). The confirming rental named under "What remains open", rental I, had been approved and was stopped before anything was bought. So the confirmation waits for a machine in the declared scope (ADR-0009 Amendment 1), or one the owner provides. Until then no hardware has run this amendment, and reading S is not excluded.
