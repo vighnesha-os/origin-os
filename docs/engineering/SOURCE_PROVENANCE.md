@@ -6104,6 +6104,8 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - **host tests:** `runqueue::tests::is_blocked_is_the_state_a_wake_up_makes_ready`; `xtask`'s seven `pit_routed_tests`;
   - **under QEMU 11.1.3:** the two cases' four lines on every multi-processor boot, "seen blocked in wait_one before the process started: true … 1 wake-ups crossed processors";
   - **the static counts:** 13 functions on the switch, wake-up and block paths the same as `27699a39`'s;
+  - **the figures** of the base and the tip, three boots each, alternating: B1 and the wait queues' ping-pong inside the base's range by TASKS item 92's final rule;
+  - **the gates on `87b9ed36`:** `cargo xtask check` (2,806 host tests, 93 Loom models, 144 controls), `boot-test` 11 of 11, and `boot-matrix` three times in a row, in which every line of the two cases said `true`, with 1 crossing wherever the peer was on another processor;
   - **the controls:** 25 at `b7654252`, in ADR-0013: orders A, B and C for both cases, the "faults" iteration alone, the waiter never seen, the look given another thread, the three item 135 boots and six host controls.
 
   TASKS items 134 and 135's entry lists them and the gates.

@@ -5452,6 +5452,7 @@ Assigned by the coordinating session on 2026-11-23, both found in TASKS item 96'
 - **Q3 (a):** a host test holds `xtask`'s bound to the kernel's by reading `PROOF_TICKS` from `irq.rs`'s source.
 - **The two additions to `sched.rs` and `runqueue.rs`** are accepted as read-only additions, with `resume`, `on_yield`, `dispatch` and the wake-up shown unchanged against `27699a39` by static counts.
 - **Each control must reach its own line:** a plant is scoped to its case by a flag the case sets for its own window.
+- **The review's R134-2:** the base and the tip are booted three times each, alternating, and B1 and the wait queues' ping-pong judged by TASKS item 92's final rule; the IPC round trip is recorded and not judged.
 
 **Item 134: what was wrong.** `exit_closes` and `process_terminated` start a waiter on another processor, then a process whose end must wake it, and require at least one wake-up that crossed processors. They started the second process as soon as the waiter's process counted a thread in `wait_one`. That count rises before the thread registers on the wait queue and before it blocks, so the wake-up could find the waiter in three places:
 
@@ -5491,9 +5492,28 @@ In B and C the waiter wakes, sees what it must and nothing is lost, and the case
 - `aba432fd`: `RunQueue::is_blocked` and its host test;
 - `438073dc`: `exit_closes` starts the ender once its peer is seen blocked (`sched::user_thread_blocked`, `blocked_in_wait`), and its marker;
 - `07f35f84`: `process_terminated` the same (ruling Q1);
-- `b7654252`: the review's R134-1, R135-1, R135-2 and R135-3 (xtask and one doc paragraph; no kernel code).
+- `b7654252`: the review's R134-1, R135-1, R135-2 and R135-3 (xtask and one doc paragraph; no kernel code);
+- `38f9f55d`: one doc comment in `xtask` (how the 21st interrupt arose is read from the code, not shown);
+- `87b9ed36`: the records.
 
-**The static counts** (the ruling; `llvm-objdump`, by TASKS item 96's method, from `git archive` exports of `27699a39` and `b7654252`, each built with `cargo xtask build`). 13 functions are the same, instruction for instruction once addresses, targets and RIP displacements are dropped, with the same call targets: `resume` (777 instructions), `on_yield` (239), `dispatch` (442), `sched::wake` (262), `wake_inconsistent` (413), `on_tick` (308), `on_block` (286), `on_reschedule` (664), `on_exit` (604), `follow_thread` (116), `reap` (66), `RunQueue::floor` (150) and `RunQueue::switch` (602). `RunQueue::wake`, `wake_slot`, `block_for`, `with_queue`, `block` and `block_until` have no symbol in either image: they are inlined into those. `user_thread_blocked` is one new symbol, and `is_blocked` is inlined into it. A count cannot see where code sits (the review's R134-2); the figures below are what was measured of that.
+**The static counts** (the ruling; `llvm-objdump`, by TASKS item 96's method, from `git archive` exports of `27699a39` and the tip, each built with `cargo xtask build`; taken at `07f35f84` on seven functions, and at `b7654252` and `87b9ed36` on these thirteen, with the same result each time). 13 functions are the same, instruction for instruction once addresses, targets and RIP displacements are dropped, with the same call targets: `resume` (777 instructions), `on_yield` (239), `dispatch` (442), `sched::wake` (262), `wake_inconsistent` (413), `on_tick` (308), `on_block` (286), `on_reschedule` (664), `on_exit` (604), `follow_thread` (116), `reap` (66), `RunQueue::floor` (150) and `RunQueue::switch` (602). `RunQueue::wake`, `wake_slot`, `block_for`, `with_queue`, `block` and `block_until` have no symbol in either image: they are inlined into those. `user_thread_blocked` is one new symbol, and `is_blocked` is inlined into it. A count cannot see where code sits (the review's R134-2); the figures are what was measured of that.
+
+**The figures** (the coordinating session's ruling on R134-2: measured, and judged by TASKS item 92's final rule, the tip's mean against the base's range, a stop above the base's worst). Six boots of the kernel boot alone on the default machine (2 processors, Intel VT-d, QEMU 11.1.3's software processor), the base `27699a39` and the tip `87b9ed36` from the static counts' exports, alternating, 2026-11-23 04:12:17 to 04:14:11 UTC, on AC power. The load is the host's 1-, 5- and 15-minute average before each boot:
+
+| Boot | Image | Load before | B1, a context switch (TSC cycles) | Wait queues' ping-pong (µs) | IPC round trip (ns) |
+|---|---|---|---|---|---|
+| 1 | base | 4.77 4.41 4.67 | 1,889 | 27 | 125,891 |
+| 2 | tip | 4.19 4.30 4.63 | 1,731 | 30 | 124,327 |
+| 3 | tip | 3.57 4.15 4.57 | 1,711 | 27 | 121,683 |
+| 4 | base | 3.65 4.12 4.55 | 1,840 | 28 | 123,180 |
+| 5 | base | 4.30 4.25 4.58 | 1,720 | 29 | 118,133 |
+| 6 | tip | 4.29 4.25 4.58 | 1,733 | 29 | 120,175 |
+
+- **B1:** the tip's mean is 1,725 against the base's 1,720 to 1,889. Inside.
+- **The ping-pong:** the tip's mean is 28.7 µs against the base's 27 to 29. Inside, and close to its worst: one tip boot read 30, above any single base boot.
+- **The IPC round trip** is recorded and not judged (the ruling: the change alters what the IPC proof waits for before it, so the line is not comparable). Base mean 122,401 ns, tip mean 122,062.
+- **The power source** was read at the turn's start (04:11:09) and after the sixth boot (04:14:11), AC both times, not at each boot: the ruling arrived after the script had started. `pmset -g log` shows no change of source in between.
+- The figures' environment is `emu`. A hardware figure (§74) would say whether anything here costs on silicon.
 
 **The controls** are in ADR-0013 ("The controls of TASKS items 134 and 135"), 25 of them at `b7654252`, each planted, linted, run once and put back, each kernel plant scoped to its case's own window:
 - **an unplanted boot** beside them: all four lines "true, blocked 1 times … 1 wake-ups crossed processors";
@@ -5505,6 +5525,22 @@ In B and C the waiter wakes, sees what it must and nothing is lost, and the case
 - **six host controls,** one for each thing a host test holds: `is_blocked`'s state, the refusal, the two bounds held together, the line's shape, the judge reading the count, and the screen's refusal.
 
 Three faults of the first controls script are recorded there and in the review (an unused planted function that did not pass Clippy, a judge that asked for a line after the boot was stopped, and a control that did not reach its line), and two wrong expectations of the final run (a waiter that waits twice is held twice; both cases share the look). None was a fault of the tree.
+
+**The gates,** on `87b9ed36`, in one `cargo xtask exclusive` turn, 2026-11-23 04:11:09 to 06:00:21 UTC, the tree clean before and after. Each gate's own line was read:
+- **the static counts** against `27699a39`: 13 functions the same, 0 differences;
+- **fmt, progress,** and the document, provenance, cost, requirements, roadmap, progress, names and settle gates: passed;
+- **the build, and Clippy with `-D warnings`:** `xtask` with all targets, the kernel's library on the host with its tests, and the kernel on its target: clean;
+- **host tests:** `xtask` 426 passed, 0 failed, 2 ignored; the kernel's library 582 passed, 0 failed, 1 ignored;
+- **`cargo xtask check`,** 972 s: "check passed"; 2,806 host tests passed, 0 failed, 32 ignored; all 93 Loom models passed and all 144 negative controls were caught;
+- **`cargo xtask boot-test`:** passed, 11 of 11 scenarios;
+- **`cargo xtask boot-matrix` three times in a row:** passed each time (1,806 s, 1,755 s and 1,746 s). In each run's output:
+  - 188 lines of the two cases, every one "seen blocked in wait_one before the process started: true" and "blocked 1 times", none "ipc failed";
+  - 176 of them with 1 crossing;
+  - 12 with 0 crossings, all 12 on one-processor machines, where the peer is on the boot processor and no crossing is owed;
+  - the I/O APIC proof's line 45 times, with 20 each time. No boot of this turn took a 21st interrupt, so that path is shown by control C135-21 alone.
+- **The power source** (CLAUDE.md §1, "Measure reproducibly"; from the turn's own readings and `pmset -g log`): AC at 04:11:09 and 04:14:11; on battery at 04:17:07 and at 04:31:54; AC again at 04:38:25, 05:02:00, 05:31:15 and 06:00:21. So `check` for most of its run, `boot-test`, and the first minutes of the first `boot-matrix` ran on battery; the second and third `boot-matrix` ran on AC. No sleep or wake is logged in the turn. These gates are pass or fail, and none failed; the judged figures above were taken on AC.
+
+The short turns before it, as each commit was built (2026-11-23, 03:13 to 03:17 UTC): the build, the kernel library's and `xtask`'s host tests, both Clippy runs and `boot-test` 11 of 11, at `818b4e30` with `aba432fd` and `438073dc`'s changes in the tree, and at `438073dc` with `07f35f84`'s.
 
 **The review.** One independent AI reviewer, on `27699a39..07f35f84`, recorded in `docs/engineering/REVIEW_T134_135_2026-11-23.md` with every finding answered. It found no false failure and no false pass in the kernel change or in `xtask`'s count check: 0 High, 4 Medium, 5 Low and 4 Info. All four Medium findings were in the controls script. **No person has reviewed it.**
 
