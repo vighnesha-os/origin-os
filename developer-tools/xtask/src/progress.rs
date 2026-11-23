@@ -10,9 +10,15 @@
 //! merge with a stale page.
 //!
 //! **What the page claims:** counts of rows of the matrix, each row counted once, whatever its
-//! state (no weighting), and two percentages, each labelled: done, and done or built. Nothing on
-//! it depends on the clock, the host, a path or a commit hash, so one tree gives one page
-//! (CLAUDE.md §75).
+//! state (no weighting), and for each line the four states' shares, which add up to 100.0%
+//! (owner item 357: no figure adds two states together; only done counts as complete, decision
+//! items 193 and 221). Nothing on it depends on the clock, the host, a path or a commit hash, so
+//! one tree gives one page (CLAUDE.md §75).
+//!
+//! **Its layout** (TASKS item 137): a title and one line; the overall table; what the states
+//! mean; where the evidence ran; the milestones; the feature areas; the details, each closed
+//! until a reader opens it; and how the page is made. A reader sees "requirements" and "feature
+//! areas"; "rows" and "groups" are this module's words for the same things.
 //!
 //! **What it refuses, failing closed:** a matrix it cannot read; a roadmap the roadmap gate
 //! refuses; a milestone that gives no state word, or two; a section of a feature group with no
@@ -29,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 
-use crate::requirements::{self, Env, Kind, Row, State, percent};
+use crate::requirements::{self, Env, Kind, Row, State};
 use crate::roadmap;
 use crate::{Result, repo_root};
 
@@ -56,6 +62,24 @@ const GROUPS: [(&str, u8, u8); 14] = [
     ("Performance, power, time and reliability", 66, 69),
     ("Developer platform", 70, 71),
     ("Testing, hardware qualification and release", 72, 76),
+];
+
+/// The four states, in the page's order, each with what it means in one plain sentence (owner
+/// item 357; the coordinating session's contract for TASKS item 137 gives the sentences).
+const MEANINGS: [(&str, &str); 4] = [
+    (
+        "Done",
+        "Its acceptance tests pass in the environment the requirement asks for.",
+    ),
+    (
+        "Built",
+        "It is written and tested, but in a weaker environment than it asks for, usually an emulator where it asks for a real machine.",
+    ),
+    (
+        "In progress",
+        "Part of it is written and tested, or something is written with no test evidence yet.",
+    ),
+    ("Not started", "Nothing for it is in the tree."),
 ];
 
 /// What a line of a table counts: rows in each of the four states.
@@ -92,33 +116,82 @@ impl Tally {
         self.done + self.built + self.in_progress + self.not_started
     }
 
-    /// The table cells: rows, the four counts, % done, % done or built.
-    fn cells(self) -> String {
-        let rows = self.rows();
-        let share = |part: usize| {
-            if rows == 0 {
-                "-".to_string()
-            } else {
-                percent(part, rows)
-            }
-        };
+    /// The four counts, in the page's order: done, built, in progress, not started.
+    fn parts(self) -> [usize; 4] {
+        [self.done, self.built, self.in_progress, self.not_started]
+    }
+
+    /// The four states' shares in tenths of a percent, which sum to exactly 1,000, or `None`
+    /// for a line with no requirement (owner item 357: four percentages that add up to 100).
+    ///
+    /// Largest remainder: each share is rounded down, and the tenths still owed go to the
+    /// states with the largest remainders, one each. Where two remainders are equal, the less
+    /// complete state takes the tenth, so that done is never rounded up on a tie. Every share is
+    /// within a tenth of its exact value.
+    fn shares(self) -> Option<[usize; 4]> {
+        let whole = self.rows();
+        if whole == 0 {
+            return None;
+        }
+        let parts = self.parts();
+        let mut shares = parts.map(|part| part * 1000 / whole);
+        let owed = 1000 - shares.iter().sum::<usize>();
+        // The states by remainder, largest first; among equals, the less complete first.
+        let mut order = [3, 2, 1, 0];
+        order.sort_by_key(|&state| std::cmp::Reverse(parts[state] * 1000 % whole));
+        for &state in order.iter().take(owed) {
+            shares[state] += 1;
+        }
+        Some(shares)
+    }
+
+    /// The table cells of a line of percentages: its requirements, then each state's share, or
+    /// "-" in each state's cell for a line with no requirement.
+    fn share_cells(self) -> String {
+        let shares = self.shares().map_or_else(
+            || ["-".to_string(), "-".into(), "-".into(), "-".into()],
+            |shares| shares.map(tenths),
+        );
+        format!("{} | {}", count(self.rows()), shares.join(" | "))
+    }
+
+    /// The table cells of a line of counts: its requirements, then each state's count.
+    fn count_cells(self) -> String {
         format!(
-            "{} | {} | {} | {} | {} | {} | {}",
-            rows,
-            self.done,
-            self.built,
-            self.in_progress,
-            self.not_started,
-            share(self.done),
-            share(self.done + self.built)
+            "{} | {}",
+            count(self.rows()),
+            self.parts().map(count).join(" | ")
         )
     }
 }
 
-/// The header of every table of counts, after its first column.
-const COUNTS: &str = "Rows | Done | Built | In progress | Not started | % done | % done or built";
-/// Its rule, after the first column's.
-const COUNTS_RULE: &str = "--:|--:|--:|--:|--:|--:|--:";
+/// The header of every table of percentages or of counts, after its first columns.
+const STATES: &str = "Requirements | Done | Built | In progress | Not started";
+/// Its rule, after the first columns'.
+const STATES_RULE: &str = "--:|--:|--:|--:|--:";
+
+/// `tenths` of a percent, as a percentage with one decimal.
+fn tenths(tenths: usize) -> String {
+    format!("{}.{}%", tenths / 10, tenths % 10)
+}
+
+/// A count as the page writes it: a thousand or more with commas.
+fn count(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// `n` of a thing, as the page writes it: "1 requirement", "1,008 requirements".
+fn requirements_of(n: usize) -> String {
+    format!("{} requirement{}", count(n), if n == 1 { "" } else { "s" })
+}
 
 /// The row's state if it is counted: not `info` (no state) and not `removed`.
 fn counted(row: &Row) -> Option<State> {
@@ -134,11 +207,16 @@ fn section_of(row: &Row) -> Option<u8> {
     prefix.strip_prefix('S')?.parse().ok()
 }
 
-/// Where a directive row outside the numbered sections is: its ID's prefix (`H`, `P9`, `F`).
+/// Where a directive row outside the numbered sections is, as a reader would name it: the
+/// directive's header (`H`) or its final rules (`F`); any other by its ID's prefix (`P9`).
 fn place_of(row: &Row) -> String {
     match section_of(row) {
         Some(section) => format!("§{section}"),
-        None => row.id.split_once('-').map_or("?", |(p, _)| p).to_string(),
+        None => match row.id.split_once('-').map_or("?", |(p, _)| p) {
+            "H" => "the header".to_string(),
+            "F" => "the final rules".to_string(),
+            other => other.to_string(),
+        },
     }
 }
 
@@ -176,57 +254,46 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
 
     let mut out = String::new();
     let w = &mut out;
-    let _ = writeln!(w, "# Progress");
+
+    // 1. The title and one line.
+    let _ = writeln!(w, "# Origin OS progress");
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "Generated by `{COMMAND}` from the requirements matrix (`docs/requirements/`), the headings of `CLAUDE.md` and of the ADRs, and `docs/ROADMAP.md`. Do not edit it by hand: `cargo xtask check` fails on any pull request whose page differs from the one its tree generates, so the page on `main` is current after every merge. Every figure is a count of rows of the matrix, and every row counts as one, whatever its state."
-    );
-    let _ = writeln!(w);
-    let _ = writeln!(
-        w,
-        "**What the states mean.** A requirement is one row of the matrix: one statement of `CLAUDE.md`, or one decision of an accepted ADR. **Done** means its acceptance criteria pass within its declared scope, on evidence from an environment at least as strong as that scope; only done counts toward the completion target (decision item 193). **Built** means it is implemented, with evidence, but short of its scope or of its acceptance criteria: for example, it passes under QEMU and its scope asks for a physical machine. **In progress** means part of it is implemented with evidence (`partial`), or something for it is in the tree with no evidence yet (`not-verified`). **Not started** means nothing for it is in the tree. Neither built nor in progress counts as coverage (decision items 193 and 221). Rows that only inform, and rows a decision removed from scope, are not counted."
+        "**{} of {} are done.** Done is the only state that counts as complete.",
+        all.shares()
+            .map_or_else(|| "-".to_string(), |s| tenths(s[0])),
+        requirements_of(all.rows())
     );
 
-    // Overall.
+    // 2. Overall.
     let _ = writeln!(w);
     let _ = writeln!(w, "## Overall");
     let _ = writeln!(w);
-    let counted_rows = all.rows();
-    let share = |part: usize| percent(part, counted_rows);
-    let _ = writeln!(w, "| Counted requirements | Rows | Share |");
+    let _ = writeln!(w, "| State | Requirements | Share |");
     let _ = writeln!(w, "|---|--:|--:|");
-    for (name, part) in [
-        ("Done", all.done),
-        ("Built", all.built),
-        ("In progress", all.in_progress),
-        ("Not started", all.not_started),
-    ] {
-        let _ = writeln!(w, "| {name} | {part} | {} |", share(part));
+    let overall = all.shares().unwrap_or([0; 4]);
+    for ((name, _), (part, share)) in MEANINGS.iter().zip(all.parts().into_iter().zip(overall)) {
+        let _ = writeln!(w, "| {name} | {} | {} |", count(part), tenths(share));
     }
     let _ = writeln!(
         w,
-        "| All counted | {counted_rows} | {} |",
-        share(counted_rows)
+        "| **Total** | **{}** | **{}** |",
+        count(all.rows()),
+        tenths(overall.iter().sum())
     );
+
+    // 3. What the states mean.
     let _ = writeln!(w);
-    let _ = writeln!(
-        w,
-        "**Done: {}.** **Done or built: {}.**",
-        share(all.done),
-        share(all.done + all.built)
-    );
-    let information = rows.iter().filter(|r| r.state.is_none()).count();
-    let removed = rows
-        .iter()
-        .filter(|r| r.state == Some(State::Removed))
-        .count();
+    let _ = writeln!(w, "## What the states mean");
     let _ = writeln!(w);
-    let _ = writeln!(
-        w,
-        "Not counted: {information} rows that only inform and {removed} removed from scope, of {} rows in all.",
-        rows.len()
-    );
+    let _ = writeln!(w, "| State | Meaning |");
+    let _ = writeln!(w, "|---|---|");
+    for (name, meaning) in MEANINGS {
+        let _ = writeln!(w, "| {name} | {meaning} |");
+    }
+
+    // 4. Where the evidence ran.
     let mut ran = [0usize; 4];
     let mut no_evidence = 0;
     for row in rows.iter().filter(|r| counted(r).is_some()) {
@@ -236,35 +303,36 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
         }
     }
     let _ = writeln!(w);
-    let _ = writeln!(w, "Where the counted rows' evidence ran:");
+    let _ = writeln!(w, "## Where the evidence ran");
     let _ = writeln!(w);
-    let _ = writeln!(
-        w,
-        "| On the development host | Under emulation (QEMU) | In a virtual machine on a real processor | On physical hardware | No evidence |"
-    );
-    let _ = writeln!(w, "|--:|--:|--:|--:|--:|");
-    let _ = writeln!(
-        w,
-        "| {} | {} | {} | {} | {} |",
-        ran[Env::Host as usize],
-        ran[Env::Emulation as usize],
-        ran[Env::Virtual as usize],
-        ran[Env::Hardware as usize],
-        no_evidence
-    );
+    let _ = writeln!(w, "| Environment | Requirements |");
+    let _ = writeln!(w, "|---|--:|");
+    for (name, n) in [
+        ("The development host", ran[Env::Host as usize]),
+        ("An emulator (QEMU)", ran[Env::Emulation as usize]),
+        (
+            "A virtual machine on a real processor",
+            ran[Env::Virtual as usize],
+        ),
+        ("Physical hardware", ran[Env::Hardware as usize]),
+        ("No evidence yet", no_evidence),
+    ] {
+        let _ = writeln!(w, "| {name} | {} |", count(n));
+    }
 
-    // By milestone.
+    // 5. By milestone. The lines are kept for the table of exact counts under "Details".
     let _ = writeln!(w);
     let _ = writeln!(w, "## By milestone");
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "The counted rows `docs/ROADMAP.md` places in each milestone: its exit tests and the further rows placed there. The state is the milestone's own, as the roadmap gives it; a milestone is done only when every one of its accepted exit tests passes in its declared scope (decision items 255 and 256)."
+        "Each milestone counts the requirements that [`docs/ROADMAP.md`](docs/ROADMAP.md) places in it. The state is the milestone's own, as the roadmap gives it. A milestone is done only when every one of its exit tests passes (decision items 255 and 256)."
     );
     let _ = writeln!(w);
-    let _ = writeln!(w, "| Milestone | State in the roadmap | {COUNTS} |");
-    let _ = writeln!(w, "|---|---|{COUNTS_RULE}|");
+    let _ = writeln!(w, "| Milestone | State in the roadmap | {STATES} |");
+    let _ = writeln!(w, "|---|---|{STATES_RULE}|");
     let mut in_milestones: BTreeSet<usize> = BTreeSet::new();
+    let mut milestones: Vec<(String, Tally)> = Vec::new();
     for (name, title) in &found.headings {
         let placed: Vec<&Row> = found
             .placed_in
@@ -280,11 +348,9 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
                 .map(|(&i, _)| i),
         );
         let state = states.get(name).map_or("-", String::as_str);
-        let _ = writeln!(
-            w,
-            "| {name}. {title} | {state} | {} |",
-            Tally::of(placed).cells()
-        );
+        let tally = Tally::of(placed);
+        let _ = writeln!(w, "| {name}. {title} | {state} | {} |", tally.share_cells());
+        milestones.push((format!("{name}. {title}"), tally));
     }
     let listed = Tally::of(
         found
@@ -303,18 +369,19 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "In no milestone: {} counted rows the roadmap lists under \"Rows in no milestone\", with its reasons, and {} counted rows it does not place ({unplaced_rules} of them standing rules, which belong to no milestone by decision item 256).",
-        listed.rows(),
-        unplaced.len()
+        "In no milestone: {} that the roadmap lists as in none, with its reasons, and {} that it does not place. Of those it does not place, {} are standing rules, which belong to no milestone (decision item 256).",
+        requirements_of(listed.rows()),
+        count(unplaced.len()),
+        count(unplaced_rules)
     );
 
-    // By feature group.
+    // 6. By feature area.
     let _ = writeln!(w);
-    let _ = writeln!(w, "## By feature group");
+    let _ = writeln!(w, "## By feature area");
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "The counted `build` rows of `CLAUDE.md`, grouped by the section they are in. Standing rules are counted below, and the ADRs' rows by ADR."
+        "The requirements of [`CLAUDE.md`](CLAUDE.md) that ask for something to be built, by the section they are in. Standing rules and ADR decisions are under \"Details\"."
     );
     let _ = writeln!(w);
     let build: Vec<&Row> = rows
@@ -327,10 +394,11 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
             .copied()
             .filter(move |r| section_of(r) == Some(section))
     };
-    let _ = writeln!(w, "| Group | Sections | {COUNTS} |");
-    let _ = writeln!(w, "|---|---|{COUNTS_RULE}|");
+    let _ = writeln!(w, "| Feature area | Sections | {STATES} |");
+    let _ = writeln!(w, "|---|---|{STATES_RULE}|");
     let mut grouped: BTreeSet<u8> = BTreeSet::new();
     let mut total = Tally::default();
+    let mut areas: Vec<(String, Tally)> = Vec::new();
     for (name, first, last) in GROUPS {
         let tally = Tally::of((first..=last).flat_map(in_section));
         total.done += tally.done;
@@ -338,9 +406,15 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
         total.in_progress += tally.in_progress;
         total.not_started += tally.not_started;
         grouped.extend(first..=last);
-        let _ = writeln!(w, "| {name} | §{first} to §{last} | {} |", tally.cells());
+        let _ = writeln!(
+            w,
+            "| {name} | §{first} to §{last} | {} |",
+            tally.share_cells()
+        );
+        areas.push((format!("{name} | §{first} to §{last}"), tally));
     }
-    let _ = writeln!(w, "| All fourteen groups | | {} |", total.cells());
+    let _ = writeln!(w, "| **All fourteen areas** | | {} |", total.share_cells());
+    areas.push(("**All fourteen areas** |".to_string(), total));
     let mut outside: BTreeMap<(u8, String), usize> = BTreeMap::new();
     for row in build.iter().filter(|r| counted(r).is_some()) {
         if section_of(row).is_none_or(|section| !grouped.contains(&section)) {
@@ -356,45 +430,58 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "Outside these groups: {outside_rows} counted `build` rows of `CLAUDE.md`, in {}. They are counted in \"Overall\" and in the milestones.",
+        "Outside these areas: {} of that kind, in {}. They are counted in \"Overall\" and in the milestones.",
+        requirements_of(outside_rows),
         if places.is_empty() {
             "no section".to_string()
         } else {
             places.join(", ")
         }
     );
+
+    // 7. Details, each closed until a reader opens it, so the page opens short.
+    let _ = writeln!(w);
+    let _ = writeln!(w, "## Details");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "<details>");
+    let _ = writeln!(
+        w,
+        "<summary>Each feature area, section by section</summary>"
+    );
     for (name, first, last) in GROUPS {
         let _ = writeln!(w);
-        let _ = writeln!(w, "### {name} (§{first} to §{last})");
+        let _ = writeln!(w, "**{name} (§{first} to §{last})**");
         let _ = writeln!(w);
-        let _ = writeln!(w, "| Section | {COUNTS} |");
-        let _ = writeln!(w, "|---|{COUNTS_RULE}|");
+        let _ = writeln!(w, "| Section | {STATES} |");
+        let _ = writeln!(w, "|---|{STATES_RULE}|");
         for section in first..=last {
             let Some(title) = inputs.titles.get(&section) else {
                 problems.push(format!(
-                    "CLAUDE.md has no heading `## {section}. …`, which the group \"{name}\" needs"
+                    "CLAUDE.md has no heading `## {section}. …`, which the feature area \"{name}\" needs"
                 ));
                 continue;
             };
             let _ = writeln!(
                 w,
                 "| §{section}. {title} | {} |",
-                Tally::of(in_section(section)).cells()
+                Tally::of(in_section(section)).share_cells()
             );
         }
     }
-
-    // ADR decisions.
     let _ = writeln!(w);
-    let _ = writeln!(w, "## ADR decisions");
+    let _ = writeln!(w, "</details>");
+
+    let _ = writeln!(w);
+    let _ = writeln!(w, "<details>");
+    let _ = writeln!(w, "<summary>ADR decisions</summary>");
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "The counted rows of each accepted ADR, one row for each of its decisions, of every kind."
+        "The requirements of each accepted ADR: one for each of its decisions, of every kind."
     );
     let _ = writeln!(w);
-    let _ = writeln!(w, "| ADR | {COUNTS} |");
-    let _ = writeln!(w, "|---|{COUNTS_RULE}|");
+    let _ = writeln!(w, "| ADR | {STATES} |");
+    let _ = writeln!(w, "|---|{STATES_RULE}|");
     let numbers: BTreeSet<u16> = rows.iter().filter_map(adr_of).collect();
     for number in numbers {
         let title = match inputs.adrs.get(&number) {
@@ -407,24 +494,75 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
             }
         };
         let tally = Tally::of(rows.iter().filter(|r| adr_of(r) == Some(number)));
-        let _ = writeln!(w, "| ADR-{number:04}: {title} | {} |", tally.cells());
+        let _ = writeln!(w, "| ADR-{number:04}: {title} | {} |", tally.share_cells());
     }
-
-    // Standing rules.
     let _ = writeln!(w);
-    let _ = writeln!(w, "## Standing rules");
+    let _ = writeln!(w, "</details>");
+
+    let _ = writeln!(w);
+    let _ = writeln!(w, "<details>");
+    let _ = writeln!(w, "<summary>Standing rules</summary>");
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "The counted rows of kind `rule`, of `CLAUDE.md` and of the ADRs: rules on how the work is done, which hold at every milestone."
+        "Rules on how the work is done, of `CLAUDE.md` and of the ADRs. They hold at every milestone."
     );
     let _ = writeln!(w);
-    let _ = writeln!(w, "| | {COUNTS} |");
-    let _ = writeln!(w, "|---|{COUNTS_RULE}|");
+    let _ = writeln!(w, "| | {STATES} |");
+    let _ = writeln!(w, "|---|{STATES_RULE}|");
     let _ = writeln!(
         w,
         "| Standing rules | {} |",
-        Tally::of(rows.iter().filter(|r| r.kind == Kind::Rule)).cells()
+        Tally::of(rows.iter().filter(|r| r.kind == Kind::Rule)).share_cells()
+    );
+    let _ = writeln!(w);
+    let _ = writeln!(w, "</details>");
+
+    let _ = writeln!(w);
+    let _ = writeln!(w, "<details>");
+    let _ = writeln!(w, "<summary>Exact counts</summary>");
+    let _ = writeln!(w);
+    let _ = writeln!(
+        w,
+        "The two tables above, with the number of requirements in each state in place of its share."
+    );
+    let _ = writeln!(w);
+    let _ = writeln!(w, "| Milestone | {STATES} |");
+    let _ = writeln!(w, "|---|{STATES_RULE}|");
+    for (name, tally) in &milestones {
+        let _ = writeln!(w, "| {name} | {} |", tally.count_cells());
+    }
+    let _ = writeln!(w);
+    let _ = writeln!(w, "| Feature area | Sections | {STATES} |");
+    let _ = writeln!(w, "|---|---|{STATES_RULE}|");
+    for (name, tally) in &areas {
+        let _ = writeln!(w, "| {name} | {} |", tally.count_cells());
+    }
+    let _ = writeln!(w);
+    let _ = writeln!(w, "</details>");
+
+    // 8. How this page is made.
+    let information = rows.iter().filter(|r| r.state.is_none()).count();
+    let removed = rows
+        .iter()
+        .filter(|r| r.state == Some(State::Removed))
+        .count();
+    let _ = writeln!(w);
+    let _ = writeln!(w, "## How this page is made");
+    let _ = writeln!(w);
+    let _ = writeln!(
+        w,
+        "- **From the records.** `{COMMAND}` writes it from three of them. They are the requirements matrix ([`docs/requirements/`](docs/requirements/README.md)), the headings of `CLAUDE.md` and of the ADRs, and `docs/ROADMAP.md`. Every figure is a count of requirements, and each counts as one."
+    );
+    let _ = writeln!(
+        w,
+        "- **Not by hand.** `cargo xtask check` refuses a tree whose page differs from the one it generates, so the page on `main` is current after every merge."
+    );
+    let _ = writeln!(
+        w,
+        "- **Not counted:** {} kept for information only, and {} removed from scope. Only done counts as complete, and neither built nor in progress counts as coverage (decision items 193 and 221).",
+        requirements_of(information),
+        count(removed)
     );
 
     if problems.is_empty() {
@@ -574,33 +712,47 @@ mod tests {
     }
 
     #[test]
-    fn the_counts_of_a_small_matrix() {
+    fn the_figures_of_a_small_matrix() {
         let page = generated(ROADMAP, &titles()).expect("the fixture's page");
         for want in [
-            // Overall: nine counted rows; S8-07 informs and S8-08 is removed.
+            // The one line, and overall: nine counted requirements; S8-07 informs and S8-08 is
+            // removed. Two ninths are 22.2% three times and three ninths 33.3%, which is 99.9%:
+            // the tenth still owed goes to the largest remainder, not started's.
+            "**22.2% of 9 requirements are done.** Done is the only state that counts as complete.",
             "| Done | 2 | 22.2% |",
             "| Built | 2 | 22.2% |",
             "| In progress | 2 | 22.2% |",
-            "| Not started | 3 | 33.3% |",
-            "| All counted | 9 | 100.0% |",
-            "**Done: 22.2%.** **Done or built: 44.4%.**",
-            "Not counted: 1 rows that only inform and 1 removed from scope, of 11 rows in all.",
-            "| 3 | 1 | 1 | 0 | 4 |",
+            "| Not started | 3 | 33.4% |",
+            "| **Total** | **9** | **100.0%** |",
+            // Where the evidence ran, one environment a line.
+            "| The development host | 3 |",
+            "| An emulator (QEMU) | 1 |",
+            "| A virtual machine on a real processor | 1 |",
+            "| Physical hardware | 0 |",
+            "| No evidence yet | 4 |",
             // Milestones, with their state words in both of the roadmap's forms.
-            "| M0. First | built | 3 | 1 | 1 | 1 | 0 | 33.3% | 66.7% |",
-            "| M1. Second | not started | 3 | 0 | 1 | 1 | 1 | 0.0% | 33.3% |",
-            "In no milestone: 1 counted rows the roadmap lists under \"Rows in no milestone\", with its reasons, and 2 counted rows it does not place (2 of them standing rules",
-            // Groups: §8's build rows; the rule and the removed row are not among them.
-            "| Toolchain, build and CI | §8 to §15 | 5 | 1 | 1 | 2 | 1 | 20.0% | 40.0% |",
-            "| Kernel core | §24 to §30 | 0 | 0 | 0 | 0 | 0 | - | - |",
-            "| All fourteen groups | | 5 | 1 | 1 | 2 | 1 | 20.0% | 40.0% |",
-            "Outside these groups: 1 counted `build` rows of `CLAUDE.md`, in §1 (1).",
-            "### Toolchain, build and CI (§8 to §15)",
-            "| §8. Section 8 | 5 | 1 | 1 | 2 | 1 | 20.0% | 40.0% |",
-            "| §9. Section 9 | 0 | 0 | 0 | 0 | 0 | - | - |",
-            // ADRs: every kind; rules: of every file.
-            "| ADR-0017: Hardening | 2 | 0 | 1 | 0 | 1 | 0.0% | 50.0% |",
-            "| Standing rules | 2 | 1 | 0 | 0 | 1 | 50.0% | 50.0% |",
+            "| M0. First | built | 3 | 33.3% | 33.3% | 33.4% | 0.0% |",
+            "| M1. Second | not started | 3 | 0.0% | 33.3% | 33.3% | 33.4% |",
+            "In no milestone: 1 requirement that the roadmap lists as in none, with its reasons, and 2 that it does not place. Of those it does not place, 2 are standing rules",
+            // Feature areas: §8's build requirements; the rule and the removed one are not among
+            // them. An area with no requirement shows "-" in each state's cell.
+            "| Toolchain, build and CI | §8 to §15 | 5 | 20.0% | 20.0% | 40.0% | 20.0% |",
+            "| Kernel core | §24 to §30 | 0 | - | - | - | - |",
+            "| **All fourteen areas** | | 5 | 20.0% | 20.0% | 40.0% | 20.0% |",
+            "Outside these areas: 1 requirement of that kind, in §1 (1).",
+            // The details: sections, ADRs (every kind), rules (of every file), exact counts.
+            "**Toolchain, build and CI (§8 to §15)**",
+            "| §8. Section 8 | 5 | 20.0% | 20.0% | 40.0% | 20.0% |",
+            "| §9. Section 9 | 0 | - | - | - | - |",
+            "| ADR-0017: Hardening | 2 | 0.0% | 50.0% | 0.0% | 50.0% |",
+            "| Standing rules | 2 | 50.0% | 0.0% | 0.0% | 50.0% |",
+            "| M0. First | 3 | 1 | 1 | 1 | 0 |",
+            "| M1. Second | 3 | 0 | 1 | 1 | 1 |",
+            "| Toolchain, build and CI | §8 to §15 | 5 | 1 | 1 | 2 | 1 |",
+            "| Kernel core | §24 to §30 | 0 | 0 | 0 | 0 | 0 |",
+            "| **All fourteen areas** | | 5 | 1 | 1 | 2 | 1 |",
+            // What is not counted, with the two decision items.
+            "- **Not counted:** 1 requirement kept for information only, and 1 removed from scope. Only done counts as complete, and neither built nor in progress counts as coverage (decision items 193 and 221).",
         ] {
             assert!(page.contains(want), "missing {want:?} in\n{page}");
         }
@@ -609,6 +761,302 @@ mod tests {
             generated(ROADMAP, &titles()).ok(),
             "one tree, one page"
         );
+    }
+
+    /// Owner item 357: the four percentages of a line add up to exactly 100.0. Every tally of up
+    /// to 40 requirements: the shares sum to 1,000 tenths, each is within a tenth of its exact
+    /// value, a state with no requirement has no share, and equal counts differ by at most the
+    /// one tenth a tie gives away.
+    #[test]
+    fn the_four_shares_of_a_line_sum_to_one_hundred() {
+        let mut lines = 0;
+        for done in 0..=40usize {
+            for built in 0..=40 - done {
+                for in_progress in 0..=40 - done - built {
+                    for not_started in 0..=40 - done - built - in_progress {
+                        let tally = Tally {
+                            done,
+                            built,
+                            in_progress,
+                            not_started,
+                        };
+                        let whole = tally.rows();
+                        let Some(shares) = tally.shares() else {
+                            assert_eq!(whole, 0);
+                            continue;
+                        };
+                        lines += 1;
+                        assert_eq!(shares.iter().sum::<usize>(), 1000, "{tally:?}");
+                        for (part, share) in tally.parts().into_iter().zip(shares) {
+                            // Within a tenth: share - 1 < exact < share + 1, in tenths.
+                            assert!(share * whole < part * 1000 + whole, "{tally:?}");
+                            assert!(part * 1000 < (share + 1) * whole, "{tally:?}");
+                            assert_eq!(part == 0, share == 0, "{tally:?}");
+                        }
+                        for a in 0..4 {
+                            for b in 0..4 {
+                                if tally.parts()[a] == tally.parts()[b] {
+                                    assert!(shares[a].abs_diff(shares[b]) <= 1, "{tally:?}");
+                                }
+                                if tally.parts()[a] < tally.parts()[b] {
+                                    assert!(shares[a] <= shares[b], "{tally:?}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(lines > 100_000, "{lines}");
+        let shares = |done, built, in_progress, not_started| {
+            Tally {
+                done,
+                built,
+                in_progress,
+                not_started,
+            }
+            .shares()
+        };
+        assert_eq!(shares(0, 0, 0, 0), None);
+        assert_eq!(shares(1, 0, 0, 0), Some([1000, 0, 0, 0]));
+        // A tie goes to the less complete state: done is never rounded up on one.
+        assert_eq!(shares(1, 1, 1, 0), Some([333, 333, 334, 0]));
+        assert_eq!(shares(1, 1, 0, 1), Some([333, 333, 0, 334]));
+        assert_eq!(shares(1, 0, 0, 2), Some([333, 0, 0, 667]));
+        assert_eq!(shares(2, 0, 0, 1), Some([667, 0, 0, 333]));
+        assert_eq!(shares(1, 1, 1, 1), Some([250, 250, 250, 250]));
+        // §8 to §15 of the tree on 2026-11-23: plain rounding gave 20.8, 41.5, 5.7 and 32.1,
+        // which is 100.1.
+        assert_eq!(shares(11, 22, 3, 17), Some([207, 415, 57, 321]));
+        // The tree's own total that day.
+        assert_eq!(shares(58, 372, 248, 1008), Some([34, 221, 147, 598]));
+    }
+
+    #[test]
+    fn a_thousand_or_more_is_written_with_commas() {
+        for (n, want) in [
+            (0, "0"),
+            (7, "7"),
+            (999, "999"),
+            (1000, "1,000"),
+            (1008, "1,008"),
+            (12_345, "12,345"),
+            (123_456, "123,456"),
+            (1_234_567, "1,234,567"),
+        ] {
+            assert_eq!(count(n), want);
+        }
+        assert_eq!(requirements_of(1), "1 requirement");
+        assert_eq!(requirements_of(0), "0 requirements");
+        assert_eq!(requirements_of(1686), "1,686 requirements");
+    }
+
+    /// The lines of `page` that are headings, or that open or name a block of details.
+    fn outline(page: &str) -> Vec<&str> {
+        page.lines()
+            .filter(|l| l.starts_with('#') || l.starts_with("<summary>"))
+            .collect()
+    }
+
+    /// TASKS item 137: the page's sections, in the contract's order, and nothing else at their
+    /// level; each block of details is closed, has a one-line summary, and has the blank lines
+    /// Markdown needs to render what is inside it.
+    #[test]
+    fn the_sections_come_in_their_order_and_the_details_are_closed() {
+        for page in [
+            generated(ROADMAP, &titles()).expect("the fixture's page"),
+            generate().expect("the page of this tree"),
+        ] {
+            assert_eq!(
+                outline(&page),
+                [
+                    "# Origin OS progress",
+                    "## Overall",
+                    "## What the states mean",
+                    "## Where the evidence ran",
+                    "## By milestone",
+                    "## By feature area",
+                    "## Details",
+                    "<summary>Each feature area, section by section</summary>",
+                    "<summary>ADR decisions</summary>",
+                    "<summary>Standing rules</summary>",
+                    "<summary>Exact counts</summary>",
+                    "## How this page is made",
+                ]
+            );
+            let lines: Vec<&str> = page.lines().collect();
+            assert!(lines[2].starts_with("**") && lines[2].contains(" are done.** "));
+            let mut open = false;
+            let mut blocks = 0;
+            for (i, line) in lines.iter().enumerate() {
+                match *line {
+                    "<details>" => {
+                        assert!(!open, "line {}", i + 1);
+                        open = true;
+                        blocks += 1;
+                        assert!(lines[i + 1].starts_with("<summary>"), "line {}", i + 2);
+                        assert!(lines[i + 1].ends_with("</summary>"), "line {}", i + 2);
+                        assert_eq!(lines[i + 2], "", "line {}", i + 3);
+                        assert_eq!(lines[i - 1], "", "line {}", i);
+                    }
+                    "</details>" => {
+                        assert!(open, "line {}", i + 1);
+                        open = false;
+                        assert_eq!(lines[i - 1], "", "line {}", i);
+                    }
+                    _ => {
+                        assert!(!line.contains("details>"), "line {}: {line}", i + 1);
+                        assert!(
+                            !line.contains("<summary>") || lines[i - 1] == "<details>",
+                            "line {}",
+                            i + 1
+                        );
+                    }
+                }
+            }
+            assert!(!open);
+            assert_eq!(blocks, 4);
+            // Nothing after the last block but how the page is made: three bullets.
+            let made = lines
+                .iter()
+                .position(|l| *l == "## How this page is made")
+                .expect("the last section");
+            let after: Vec<&&str> = lines[made + 1..].iter().filter(|l| !l.is_empty()).collect();
+            assert_eq!(after.len(), 3, "{after:?}");
+            assert!(after.iter().all(|l| l.starts_with("- **")), "{after:?}");
+        }
+    }
+
+    /// Owner item 357 and decision items 193 and 221: no figure and no sentence adds two states
+    /// together, and a reader sees "requirements" and "feature areas", not "rows" and "groups".
+    #[test]
+    fn nothing_adds_two_states_together_and_the_words_are_the_readers() {
+        for page in [
+            generated(ROADMAP, &titles()).expect("the fixture's page"),
+            generate().expect("the page of this tree"),
+        ] {
+            let lower = page.to_lowercase();
+            for banned in [
+                "done or built",
+                "built or done",
+                "done and built",
+                "% done",
+                "feature group",
+                "counted rows",
+            ] {
+                assert!(!lower.contains(banned), "the page says {banned:?}");
+            }
+            for word in lower.split(|c: char| !c.is_ascii_alphabetic()) {
+                assert!(word != "row" && word != "rows", "the page says {word:?}");
+                assert!(
+                    word != "group" && word != "groups",
+                    "the page says {word:?}"
+                );
+            }
+            // The headers of every table of states name the four, and only them, after the count.
+            for line in page
+                .lines()
+                .filter(|l| l.contains("| Requirements | Done |"))
+            {
+                assert!(
+                    line.ends_with("| Requirements | Done | Built | In progress | Not started |"),
+                    "{line}"
+                );
+            }
+        }
+    }
+
+    /// The four cells after a line's count, if the line is one of a table of percentages.
+    fn percentages(line: &str) -> Option<Vec<usize>> {
+        let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+        let last = cells.len().checked_sub(4).map(|at| &cells[at..])?;
+        last.iter()
+            .map(|cell| {
+                let (whole, tenth) = cell.strip_suffix('%')?.split_once('.')?;
+                Some(whole.parse::<usize>().ok()? * 10 + tenth.parse::<usize>().ok()?)
+            })
+            .collect()
+    }
+
+    /// Every line of percentages on the page this tree generates adds up to exactly 100.0, the
+    /// line of the page's title gives the overall table's share of done, and the page has such
+    /// lines for the milestones, the areas, their sections, the ADRs and the rules.
+    #[test]
+    fn every_line_of_the_trees_page_adds_up() {
+        let page = generate().expect("the page of this tree");
+        let mut lines = 0;
+        for line in page.lines().filter(|l| l.starts_with('|')) {
+            if let Some(shares) = percentages(line) {
+                lines += 1;
+                assert_eq!(shares.iter().sum::<usize>(), 1000, "{line}");
+            }
+        }
+        assert!(lines > 14 + 14 + 59 + 1, "{lines}");
+        let done = page
+            .lines()
+            .find_map(|l| l.strip_prefix("| Done | "))
+            .and_then(|rest| rest.split(" | ").nth(1))
+            .map(|share| share.trim_end_matches(" |").to_string())
+            .expect("the overall table's line for done");
+        let title = page.lines().nth(2).expect("the one line");
+        assert!(title.starts_with(&format!("**{done} of ")), "{title}");
+    }
+
+    /// The contract's "no sentence longer than two lines", taken as 200 characters of the
+    /// page's own text: every sentence outside a table, on the page this tree generates.
+    #[test]
+    fn no_sentence_is_longer_than_two_lines() {
+        let page = generate().expect("the page of this tree");
+        for line in page.lines().filter(|l| !l.starts_with('|')) {
+            for sentence in line.split(". ") {
+                assert!(
+                    sentence.chars().count() <= 200,
+                    "{} characters: {sentence}",
+                    sentence.chars().count()
+                );
+            }
+        }
+        for (_, meaning) in MEANINGS {
+            assert!(meaning.chars().count() <= 200 && meaning.ends_with('.'));
+            assert_eq!(meaning.matches(". ").count(), 0, "one sentence: {meaning}");
+        }
+    }
+
+    /// Owner item 356: the page is at the root, so its links are written from the root. Each
+    /// names a file or directory of this tree, and none climbs out or leaves the repository.
+    #[test]
+    fn the_links_are_written_from_the_root() {
+        assert_eq!(PAGE, "PROGRESS.md");
+        let page = generate().expect("the page of this tree");
+        let mut links = 0;
+        for (at, _) in page.match_indices("](") {
+            let target = page[at + 2..].split(')').next().expect("a link's end");
+            links += 1;
+            assert!(
+                !target.starts_with('/') && !target.starts_with('.'),
+                "{target}"
+            );
+            assert!(
+                !target.contains("://") && !target.contains(".."),
+                "{target}"
+            );
+            let path = target.split('#').next().expect("a path");
+            assert!(
+                repo_root().join(path).exists(),
+                "{target} is not in the tree"
+            );
+        }
+        assert!(links >= 3, "{links}");
+        // The files it names without a link are in the tree too.
+        for named in [
+            "CLAUDE.md",
+            "docs/ROADMAP.md",
+            "docs/requirements/README.md",
+        ] {
+            assert!(page.contains(named), "{named}");
+            assert!(repo_root().join(named).exists(), "{named}");
+        }
+        assert!(!page.contains("docs/PROGRESS.md"));
     }
 
     #[test]

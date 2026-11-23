@@ -186,10 +186,11 @@ commands:
   roadmap-gate only the gate on docs/ROADMAP.md: every counted build row of the
               requirements matrix placed in one milestone or listed as in none, and
               every row it names in the matrix (part of check; CLAUDE.md §82; quick)
-  progress    writes PROGRESS.md, at the root, from the requirements matrix, CLAUDE.md's and the
-              ADRs' headings and docs/ROADMAP.md: counts of rows by state, overall, by
-              milestone, by feature group, by ADR and for the standing rules. Run it when
-              a row's state changes (TASKS item 43; quick)
+  progress    writes PROGRESS.md, at the root, from the requirements matrix, CLAUDE.md's and
+              the ADRs' headings and docs/ROADMAP.md: the share of requirements in each of
+              the four states, overall, by milestone and by feature area, with the sections,
+              the ADRs, the standing rules and the exact counts as details. Run it when a
+              row's state changes (TASKS items 43 and 137; quick)
   progress-gate only the gate on PROGRESS.md: the committed page is the one the
               tree generates, byte for byte (part of check; quick)
   cost-gate   only the gate on the cost ledger in docs/engineering/PERFORMANCE_BUDGETS.md:
