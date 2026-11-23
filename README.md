@@ -2,7 +2,7 @@
 
 Origin OS is an original-source operating system for x86-64, written in Rust. It has its own kernel (the Framekernel), its own drivers and its own native SDK. It is planned as two editions of one release, Origin Desktop and Origin Server, which share one kernel, one SDK and the native desktop.
 
-It is in early development: [`docs/PROGRESS.md`](docs/PROGRESS.md) says how much is done.
+It is in early development: [`PROGRESS.md`](PROGRESS.md) says how much is done.
 
 - **The directive.** [`CLAUDE.md`](CLAUDE.md) is the engineering directive that every change follows.
 - **Original source.** Origin's own code is written for this project from published specifications and vendor documents. No code is copied or translated from another operating system (`CLAUDE.md` §3). [`docs/engineering/SOURCE_PROVENANCE.md`](docs/engineering/SOURCE_PROVENANCE.md) records what each crate was written from.
@@ -10,11 +10,11 @@ It is in early development: [`docs/PROGRESS.md`](docs/PROGRESS.md) says how much
 
 ## Progress
 
-[`docs/PROGRESS.md`](docs/PROGRESS.md) shows how much of Origin OS is done, built, in progress and not started: overall, by milestone and by feature. It is generated from the requirements matrix by `cargo xtask progress`. `cargo xtask check` refuses a pull request whose page is not the one its tree generates, so the page on `main` is always current.
+[`PROGRESS.md`](PROGRESS.md) shows how much of Origin OS is done, built, in progress and not started: overall, by milestone and by feature. It is generated from the requirements matrix by `cargo xtask progress`. `cargo xtask check` refuses a pull request whose page is not the one its tree generates, so the page on `main` is always current.
 
 [`docs/ROADMAP.md`](docs/ROADMAP.md) lists the milestones and their exit tests, and [`docs/STATUS.md`](docs/STATUS.md) says what each task built.
 
-A result from QEMU, or from a virtual machine on a real processor, is not hardware qualification. The progress page says where each requirement's evidence ran.
+A result from QEMU, or from a virtual machine on a real processor, is not hardware qualification. The [progress page](PROGRESS.md) says where each requirement's evidence ran.
 
 ## Building and running
 

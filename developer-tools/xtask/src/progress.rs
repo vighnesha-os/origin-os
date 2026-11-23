@@ -1,4 +1,5 @@
-//! `cargo xtask progress`, which writes `docs/PROGRESS.md`, and the gate in `cargo xtask check`
+//! `cargo xtask progress`, which writes `PROGRESS.md` at the repository root (owner item 356;
+//! `docs/PROGRESS.md` until TASKS item 137), and the gate in `cargo xtask check`
 //! that keeps it current (TASKS item 43).
 //!
 //! The owner asked for "clear progress status table, which need to be updated for every PR is
@@ -33,7 +34,7 @@ use crate::roadmap;
 use crate::{Result, repo_root};
 
 /// The page this module writes and its gate reads.
-const PAGE: &str = "docs/PROGRESS.md";
+const PAGE: &str = "PROGRESS.md";
 /// The command that writes it.
 const COMMAND: &str = "cargo xtask progress";
 
