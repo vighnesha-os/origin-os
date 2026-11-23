@@ -1393,6 +1393,40 @@ pub(crate) fn queued_on(thread: ThreadRef, cpu: CpuIndex) -> bool {
     })
 }
 
+/// Whether the user thread `thread` is blocked on processor `cpu`: a slot of that processor's run
+/// queue holds it and is blocked, read under the queue's lock. That is the one state in which a
+/// wake-up makes the thread ready and, from another processor, sends `cpu` a reschedule IPI
+/// ([`wake`]). A thread that has only entered a wait, or registered for it, is not there yet: a
+/// wake-up that finds it so is kept by its queue, and no IPI is sent.
+///
+/// For a boot proof that starts a waker only once its peer has blocked, so that whether the
+/// wake-up crosses processors does not depend on the schedule (TASKS item 134; ADR-0013 R1(b)).
+/// It holds for a thread that stays on `cpu`: one not declared movable. Read only. The record's
+/// state is locked under the queue's lock, the order a spawn takes them in. No switch, wake-up or
+/// block calls it.
+pub(crate) fn user_thread_blocked(
+    cpu: CpuIndex,
+    thread: &ObjectRef<crate::process::ThreadObject>,
+) -> bool {
+    QUEUES.get(cpu.get()).is_some_and(|queue| {
+        without_interrupts(|| {
+            let queue = queue.lock();
+            (1..crate::runqueue::CAPACITY).any(|slot| {
+                queue.is_blocked(slot)
+                    && queue.record(slot).is_some_and(|placed| {
+                        placed
+                            .record()
+                            .state()
+                            .lock()
+                            .user
+                            .as_ref()
+                            .is_some_and(|user| ObjectRef::same(&user.thread, thread))
+                    })
+            })
+        })
+    })
+}
+
 /// Moves `thread` to processor `to` (ADR-0020 S6; TASKS item 96): a movable thread, ready and not
 /// running, whose pin count is 0, between two processors that take part in moves (`online`).
 ///
