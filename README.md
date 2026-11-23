@@ -65,7 +65,7 @@ The release version is written only in `origin-version.toml`; every module reads
 
 [`CONTRIBUTING.md`](CONTRIBUTING.md) says what a contribution needs: it must be original, and every commit carries a sign-off. [`CODEOWNERS`](CODEOWNERS) names the owners of the kernel and of the SDK's interfaces.
 
-Do not put the details of a vulnerability in a public issue or pull request.
+Do not put the details of a vulnerability in a public issue or pull request: [`SECURITY.md`](SECURITY.md) says how to report one privately.
 
 ## Licence
 

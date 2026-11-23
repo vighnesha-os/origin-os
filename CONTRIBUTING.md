@@ -59,7 +59,7 @@ Whatever tools you used to write it, you are the one who signs: the declaration 
 
 ## 5. Security problems
 
-Do not put the details of a vulnerability in a public issue, pull request or discussion. How to report one privately is the subject of `SECURITY.md`, which `CLAUDE.md` §6 asks for.
+Do not put the details of a vulnerability in a public issue, pull request or discussion. [`SECURITY.md`](SECURITY.md) says how to report one privately.
 
 ## 6. Licence
 
