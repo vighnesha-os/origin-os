@@ -302,14 +302,6 @@ pub fn balance_tick(me: crate::cpu::ThisCpu<'_>) {
     }
 }
 
-/// The balancing interrupts processor `cpu` has sent, and the most it sent in one tick: 1, or 0
-/// if it has sent none (TASKS item 98's proof holds it there).
-pub fn balance_sent(cpu: crate::cpu::CpuIndex) -> (u64, u32) {
-    BALANCE_SENT
-        .get(cpu.get())
-        .map_or((0, 0), crate::sync::balance::Rate::read)
-}
-
 /// The ICR's low half for an NMI, to a destination and without a shorthand: Intel's table of
 /// valid ICR combinations marks the Self shorthand with NMI delivery invalid (ADR-0013 F1).
 const ICR_NMI: u64 = 0x4400;

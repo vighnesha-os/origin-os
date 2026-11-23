@@ -1796,7 +1796,7 @@ pub(crate) fn spawn_movable(
 /// for an idle one to kick (k4).
 #[expect(
     dead_code,
-    reason = "its first callers are TASKS item 98's proofs, written after its diagnostic round"
+    reason = "its first callers are the migration proofs' pulled phases, in the next commit"
 )]
 pub(crate) fn spawn_balanced(
     cpu: CpuIndex,
@@ -1957,7 +1957,8 @@ fn spawn_with_parts(
 
 /// An application processor's scheduler: waits until the boot processor has queued its
 /// threads, then starts its own timer and idles with interrupts on; the timer preempts the
-/// idle loop to run the queue's threads.
+/// idle loop to run the queue's threads. Only the idle pull's pass, and the step from it to the
+/// halt, run with interrupts off (`pull::idle`).
 pub(crate) fn run_ap(flow: Pinned<'static>, lapic: &X2Apic) -> ! {
     // This processor's idle flow, which never moves (ADR-0020 S2, point 4): its witness, made
     // in `smp::ap_entry` with interrupts off and passed down (TASKS item 93).
@@ -1980,11 +1981,15 @@ pub(crate) fn run_ap(flow: Pinned<'static>, lapic: &X2Apic) -> ! {
         active.store(true, Ordering::Release);
     }
     timer::start_periodic(lapic);
+    // The idle flow runs with interrupts on from here, as its first halt left them before the
+    // idle pull (`cpu::idle`): a tick or a reschedule interrupt preempts its reap (the review of
+    // TASKS item 98, D98-2). The idle pull turns them off for its pass and its halt, and back on.
+    cpu::enable_interrupts();
     loop {
         reap_with(flow);
-        // The idle pull (ADR-0020 S7.1; TASKS item 98), then the halt: with interrupts on again
-        // the next timer tick or reschedule interrupt may switch to a thread, and when this flow
-        // next runs it reaps, and looks for a thread to pull, before it halts again.
+        // The idle pull (ADR-0020 S7.1; TASKS item 98), then the halt: the next timer tick or
+        // reschedule interrupt may switch to a thread, and when this flow next runs it reaps,
+        // and looks for a thread to pull, before it halts again.
         pull::idle(flow);
     }
 }

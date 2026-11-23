@@ -1,5 +1,5 @@
-//! The idle pull and the idle kick (ADR-0020 S7.1, S7.2 and S10; TASKS item 98): how a thread
-//! reaches a processor that has nothing to run.
+//! The idle pull, the idle kick and the ask (ADR-0020 S7.1, S7.2 and S10, and its Amendment 1;
+//! TASKS item 98): how a thread reaches a processor that has nothing to run.
 //!
 //! Balancing in version 1 moves a thread only by a pull: the processor that will run it is the
 //! one that moves it (S7). This module is that mover and what tells it to look:
@@ -12,10 +12,28 @@
 //!   thread balancing may take is ready beside what it runs, tells the nearest idle processor
 //!   with one reschedule interrupt, at most one in each of its ticks
 //!   (`timer::send_balance_ipi`). The idle flow that takes it makes its pass.
+//! - **The ask** (Amendment 1), below.
 //!
 //! Only threads their spawner declared for balancing are taken ([`super::spawn_balanced`]; the
-//! coordinating session's ruling Q10 on this item's contract). With none on a queue, each upcall
-//! below pays one load and one branch for all of this.
+//! coordinating session's ruling Q10 on this item's contract).
+//!
+//! # What keeps a processor from idling beside a thread it may take
+//!
+//! Two things, and the first is the one it rests on. **Every idle application processor makes a
+//! pass at each of its own ticks**: the timer's interrupt ends its halt, and its idle flow looks
+//! again before it halts again. The kick and the ask only shorten the wait to less than a tick.
+//! So a kick that is not sent (the rate was spent, the hint was stale) costs at most a tick.
+//!
+//! A pass looks at up to [`TRIES`] victims. One that gave it nothing, or that it asked, is not
+//! looked at again until every other crowded processor has had its turn: each idle flow keeps a
+//! mask of them, a bit a processor (`Setup::held`), so no number of processors it can never take
+//! from keeps it from one it can (the reviews' R98-2 and D98-1). When every crowded processor is
+//! in the mask, the mask is cleared and they are all looked at again, in the same pass if it has
+//! looks left; so a processor kicked by one it has just asked reaches it in that pass.
+//!
+//! A processor's own queue is looked at only beside a victim's, under the two locks of a look. A
+//! thread spawned onto an idle processor by another, which sends no interrupt, waits for that
+//! processor's next tick, as it did before this item (the review's D98-10).
 //!
 //! # What a pull takes
 //!
@@ -36,9 +54,10 @@
 //! two ticks (`Contexts::switch` publishes it and takes it in one call), so no pull would ever
 //! take it. So an idle processor that finds a thread it could otherwise take, unpublished, sends
 //! its source one reschedule interrupt, the **ask**, and halts. The source's reschedule upcall
-//! switches nothing; it publishes its leaving frame and kicks the nearest idle processor
-//! ([`kick`], as at any of its upcalls), whose idle flow then pulls the published frame. Every
-//! step waits on an event, none on a time.
+//! runs its step as any other (it switches only if a thread was woken since its last choice);
+//! then it publishes its leaving frame and kicks the nearest idle processor ([`kick`], as at any
+//! of its upcalls), whose idle flow then pulls the published frame. Every step waits on an
+//! event, none on a time.
 //!
 //! Its bounds: a processor sends at most one balancing interrupt a tick, kicks and asks
 //! together (`timer::send_balance_ipi`); a processor takes at most one ask in each of its ticks,
@@ -46,19 +65,52 @@
 //! lock, which it holds already, and the source's next tick ends); and an ask is sent only for a
 //! thread that every other check of the pull would take. With moves withdrawn, none is sent.
 //!
+//! **What it does not reach.** A processor outside the source's last-level cache takes only a
+//! thread that is not cache-hot. Where a processor has exactly two runnable contexts of equal
+//! stride that alternate at every tick (two balanced threads; one balanced and one pinned; on
+//! the boot processor, the boot flow and one balanced thread), the waiting one has always run
+//! within the last tick when a tick comes. It is in fact not cache-hot from one window after
+//! the tick until the next tick, but nothing judges then: only its own processor judges, at its
+//! own upcalls, the idle processors' ticks fall with it, and an ask sent at a tick finds the
+//! thread still hot. So that one thread is not taken across caches (the reviews' R98-1 and
+//! D98-5; a limit, recorded with the item).
+//!
 //! # Locks
 //!
 //! A pull takes the two run-queue locks in CPU-index order, then the move gate, inside
 //! `cpu::move_context`; it takes no other lock, frees nothing and drops no stack, so no TLB
-//! shootdown starts under a queue lock (S7, "Locks"). A kick is made under its own processor's
-//! queue lock alone. The published elements and the hints are atomics.
+//! shootdown starts under a queue lock (S7, "Locks"). It does not wait long for either queue
+//! lock: after [`LOCK_TRIES`] tries it leaves that victim for this pass, so that many idle
+//! processors that look at one crowded one at the same tick do not queue on its lock with
+//! interrupts off (the review's R98-7). A kick is made under its own processor's queue lock
+//! alone. The published elements and the hints are atomics.
 //!
 //! # Interrupts off
 //!
 //! A pass is one interrupts-off section that ends in the halt (`sti; hlt`), so no interrupt can
 //! fall between "nothing to pull" and the halt: one that arrives meanwhile ends the halt at once.
 //! The section holds at most [`TRIES`] looks under a pair of locks and one move. Its longest is
-//! kept ([`Counts::longest_pass`]) to print beside budget B18.
+//! kept ([`Counts::longest_pass`]) to print beside budget B18. Outside it the idle flow runs with
+//! interrupts on, as it did before this item: its reap is preemptible (`run_ap`; the review's
+//! D98-2).
+//!
+//! # What it costs where no thread is declared for balancing
+//!
+//! - **A switch:** nothing in `with_queue`, `RunQueue::switch` and `follow_thread`, which are
+//!   not edited. But the run queue's steps that lead to one pay for the cache-hot rule whether or
+//!   not a thread is balanced: **a block, a sleep and a wake-up's preemption** each set one bit
+//!   in a word of the queue (`RunQueue::ran`), under the lock they hold already. The static
+//!   counts and the IPC ping-pong against the base are this item's evidence for it (the review's
+//!   D98-7).
+//! - **A spawn and an exit:** a spawn writes the slot's balancing state (six words of the
+//!   queue), an exit two.
+//! - **A tick:** one test of the queue's `balanced` bits, and [`ticked`], out of line: the
+//!   rate's renewal, the idle flag, and this processor's two hint bits, about ten loads, two of
+//!   them of the shared hint words.
+//! - **A reschedule upcall:** the same test, and [`left_idle`]: one load, and one store when the
+//!   processor was idle.
+//! - **A wake-up:** in its local branch only, one load of the woken record's declaration.
+//! - **An idle pass:** the idle flag's store, a fence, and a read of the crowded hints' words.
 
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -67,7 +119,8 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 
 use origin_frame::once::SetOnce;
-use origin_frame::sync::balance::{self as published, Element, Load, Masks, Victim};
+use origin_frame::sync::balance::{self as published, Element, Hints, Load, Masks, Victim};
+use origin_frame::sync::{SpinGuard, SpinLock};
 use origin_frame::trap::{Here, InterruptsOff, Pinned};
 
 use super::{BALANCE, Placed, QUEUES, RunQueue, Unmoved, pinned};
@@ -77,8 +130,13 @@ use crate::cpu::{self, CpuIndex, ThisCpu, rdtsc};
 use crate::runqueue::{CAPACITY, Census};
 use crate::timer;
 
-/// Victims an idle pass looks at under their locks before it gives up and halts.
+/// Victims an idle pass looks at under their locks before it halts.
 const TRIES: usize = 3;
+/// Tries at one queue lock before a pass leaves that victim (the module documentation, "Locks").
+const LOCK_TRIES: u32 = 64;
+/// More levels than a processor's plan can have: one for each kind of scheduling domain, and one
+/// to spare ([`kick`]'s table of them).
+const LEVELS: usize = 8;
 
 /// What balancing is set up with, once, before any thread balancing may take exists.
 struct Setup {
@@ -90,6 +148,10 @@ struct Setup {
     levels: Vec<Vec<&'static [u32]>>,
     /// For each CPU index, whether it takes part in moves (`smp::Online::takes_part_in_moves`).
     takes_part: Vec<bool>,
+    /// For each CPU index, the victims its idle flow passes over for now, a bit a processor (the
+    /// module documentation). A row is set, read and cleared by its own processor's idle flow
+    /// alone.
+    held: Vec<Hints>,
     /// The cache-hot window, in TSC ticks.
     window: u64,
 }
@@ -106,15 +168,25 @@ static SETUP: SetOnce<Setup> = SetOnce::new();
 /// The boot flow, once, before the first thread balancing may take is spawned and before any
 /// count of the heap is taken: what it allocates is kept for good.
 ///
-/// Without the domains, or without the memory for the masks, nothing is set up: no processor
-/// pulls and none kicks, and the line says why.
+/// Without the domains, without the memory for the masks, or without a TSC rate the cache-hot
+/// window can be counted in (a rate below 1 MHz, or none measured, would make every waiting thread
+/// look cold), nothing is set up: no processor pulls and none kicks, and the line says why. The
+/// plan and the lists beside it are allocated as the rest of the boot's tables are: a heap that
+/// cannot hold them stops the kernel.
 pub(crate) fn set_up(com1: &mut Console, online: &crate::smp::Online, tsc_hz: u64) {
     let made = (|| {
         let domains = crate::domains::DOMAINS
             .get()
             .ok_or("the domains were not built")?;
+        if tsc_hz < 1_000_000 {
+            return Err("the TSC's rate is not known");
+        }
         let count = QUEUES.indexes();
         let masks = Masks::new(count).ok_or("no memory for its masks")?;
+        let held = (0..count)
+            .map(|_| Hints::new(count))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("no memory for its masks")?;
         let shapes = balance::shapes(&domains.tree);
         let plan: &'static Plan = Box::leak(Box::new(Plan::build(
             &shapes,
@@ -131,7 +203,8 @@ pub(crate) fn set_up(com1: &mut Console, online: &crate::smp::Online, tsc_hz: u6
             plan,
             levels: (0..count).map(|cpu| plan.levels(cpu)).collect(),
             takes_part,
-            window: (tsc_hz / 1_000_000).max(1) * balance::HOT_MICROS,
+            held,
+            window: (tsc_hz / 1_000_000).saturating_mul(balance::HOT_MICROS),
         })
     })();
     match made {
@@ -159,22 +232,28 @@ pub(crate) fn set_up(com1: &mut Console, online: &crate::smp::Online, tsc_hz: u6
     }
 }
 
-/// What the idle pull and the idle kick have done since the boot began: counts, each raised with
-/// a relaxed add off every hot path, and read for a proof's line.
+/// What the idle pull, the idle kick and the ask have done since the boot began: counts, each
+/// raised with a relaxed add off every hot path, and read for a proof's line.
 #[derive(Debug, Default)]
 pub(crate) struct Counts {
-    /// Threads pulled, and how many of them were cache-hot (taken inside their cache).
+    /// Threads pulled; how many of them were cache-hot (taken inside their cache); how many
+    /// carried a wake-up that had come before they blocked (N1); and how many had arrived on
+    /// their source by a move before (a thread moved, and then pulled).
     pub(crate) pulls: AtomicU64,
     pub(crate) pulls_hot: AtomicU64,
-    /// Looks under a victim's lock that took nothing.
+    pub(crate) pulls_carrying: AtomicU64,
+    pub(crate) pulls_again: AtomicU64,
+    /// Looks under a victim's lock that took nothing, and looks given up because a queue lock
+    /// was held.
     pub(crate) nothing: AtomicU64,
+    pub(crate) contended: AtomicU64,
     /// Threads passed over, by reason, each time one was looked at.
     pub(crate) pinned: AtomicU64,
     pub(crate) unsettled: AtomicU64,
     pub(crate) hot: AtomicU64,
     pub(crate) unpublished: AtomicU64,
     /// Moves a pull began that were refused, and passes stopped because moves are withdrawn, the
-    /// puller's queue had work or no room, or the table of contexts was full.
+    /// puller's queue had no room, or the table of contexts was full.
     pub(crate) refused: AtomicU64,
     pub(crate) stopped: AtomicU64,
     /// Kicks sent, by where: the tick, the reschedule upcall, a wake-up or a spawn made here.
@@ -190,8 +269,9 @@ pub(crate) struct Counts {
     pub(crate) asks_not_first: AtomicU64,
     pub(crate) asks_over_rate: AtomicU64,
     /// A pull of a thread that was not settled, and of a cache-hot thread by a processor outside
-    /// its cache: counted apart from the tests that refuse them, and 0 unless one of those is
-    /// broken.
+    /// its cache. Each asks the run queue again after the choice, so it is 0 unless the test that
+    /// refuses such a thread has been taken out; it does not show that test to be right, which
+    /// the run queue's host tests and its randomized model do (the review's R98-10).
     pub(crate) too_soon: AtomicU64,
     pub(crate) hot_across: AtomicU64,
     /// The longest idle pass, in TSC ticks of the processor that made it, from its start to its
@@ -203,7 +283,10 @@ pub(crate) struct Counts {
 pub(crate) static COUNTS: Counts = Counts {
     pulls: AtomicU64::new(0),
     pulls_hot: AtomicU64::new(0),
+    pulls_carrying: AtomicU64::new(0),
+    pulls_again: AtomicU64::new(0),
     nothing: AtomicU64::new(0),
+    contended: AtomicU64::new(0),
     pinned: AtomicU64::new(0),
     unsettled: AtomicU64::new(0),
     hot: AtomicU64::new(0),
@@ -244,49 +327,72 @@ fn element(cpu: u32) -> Option<&'static Element> {
     BALANCE.get(cpu as usize)
 }
 
+/// What a pass came to.
+enum Passed {
+    /// A thread was pulled, or one of this processor's own is ready: the idle flow yields.
+    Run,
+    /// Nothing to run: the idle flow halts.
+    Halt,
+}
+
 /// The idle flow's turn (`run_ap`'s loop): one pass of the idle pull, then the halt, or, with a
-/// thread pulled, a yield to it. `_flow` is the idle flow's witness: no thread calls this.
+/// thread to run, a yield to it. `_flow` is the idle flow's witness: no thread calls this.
+///
+/// The pass and the halt are one stretch with interrupts off (`cpu::without_interrupts`), so no
+/// interrupt falls between the pass's last look and the halt. The pass itself runs under the
+/// section's token (`cpu::without_interrupts_off`), whose closure neither halts nor yields; the
+/// halt comes after it, outside the token's life. The idle flow is called with interrupts on and
+/// goes on with them on.
 pub(super) fn idle(_flow: Pinned<'_>) {
-    let (pulled, owed) = cpu::without_interrupts_off(|off| {
-        let me = cpu::this_cpu(off.here());
-        let start = rdtsc();
-        let mut owed = None;
-        let pulled = pass(off, me, &mut owed);
-        // Both readings are this processor's.
-        COUNTS
-            .longest_pass
-            .fetch_max(rdtsc().saturating_sub(start), Relaxed);
-        if !pulled {
-            // With interrupts still off: one that came during the pass ends the halt at once.
-            cpu::idle_disabling();
+    let (run, owed) = cpu::without_interrupts(|| {
+        let (passed, owed) = cpu::without_interrupts_off(|off| {
+            let me = cpu::this_cpu(off.here());
+            let start = rdtsc();
+            let mut owed = None;
+            let passed = pass(off, me, &mut owed);
+            // Both readings are this processor's.
+            COUNTS
+                .longest_pass
+                .fetch_max(rdtsc().saturating_sub(start), Relaxed);
+            (passed, owed)
+        });
+        match passed {
+            Passed::Run => (true, owed),
+            // A line is owed: it is written before this processor halts (the review's R98-5).
+            Passed::Halt if owed.is_some() => (false, owed),
+            Passed::Halt => {
+                // With interrupts still off: one that came during the pass ends the halt at once.
+                cpu::idle_disabling();
+                (false, None)
+            }
         }
-        (pulled, owed)
     });
     if let Some((trigger, on)) = owed {
         pinned::line(trigger, on, "; the thread stays where it is");
     }
-    if pulled {
-        // The arrival is marked woken and the idle flow gives way to any ready thread.
+    if run {
+        // An arrival is marked woken, and the idle flow gives way to any ready thread.
         super::yield_now();
     }
 }
 
-/// One pass of the idle pull on this processor: `true` if it pulled a thread.
+/// One pass of the idle pull on this processor.
 fn pass(
     off: InterruptsOff<'_>,
     me: ThisCpu<'_>,
     owed: &mut Option<(pinned::Trigger, CpuIndex)>,
-) -> bool {
+) -> Passed {
     let Some(setup) = SETUP.get() else {
-        return false;
+        return Passed::Halt;
     };
     let index = me.index().get();
-    let (Some(own), Some(levels), Ok(mine)) = (
+    let (Some(own), Some(levels), Some(held), Ok(mine)) = (
         BALANCE.this(me),
         setup.levels.get(index),
+        setup.held.get(index),
         u32::try_from(index),
     ) else {
-        return false;
+        return Passed::Halt;
     };
     // A processor that takes no part in moves, or that is to be avoided (capacity 0, ADR-0020
     // S9), never says it is idle: nobody kicks it, and it pulls nothing.
@@ -295,56 +401,100 @@ fn pass(
         || crate::capacity::current(index) == 0
         || pinned::withdrawn()
     {
-        return false;
+        return Passed::Halt;
     }
     let mut tried = [u32::MAX; TRIES];
-    for attempt in 0..TRIES {
-        let allowed = |cpu: u32, _: usize| setup.takes_part(cpu as usize) && !tried.contains(&cpu);
+    let (mut looked, mut first, mut cleared) = (0, true, false);
+    while looked < TRIES {
+        let allowed = |cpu: u32, _: usize| {
+            setup.takes_part(cpu as usize) && !tried.contains(&cpu) && !held.test(cpu as usize)
+        };
         // The first look publishes that this processor is idle, and only then reads who is
         // crowded (`origin_sync::balance`, "Neither misses the other").
-        let victim = if attempt == 0 {
+        let victim = if first {
             published::idle_then_choose(mine, own, &setup.masks, levels, element, allowed)
         } else {
             published::choose(mine, &setup.masks.crowded, levels, element, allowed)
         };
+        first = false;
         let Some(victim) = victim else {
-            return false;
+            // Every crowded processor left is one this flow passes over: they all get another
+            // turn, once in a pass, and in this pass if it has looks left.
+            if !cleared && held.any() {
+                held.clear_all();
+                cleared = true;
+                continue;
+            }
+            return Passed::Halt;
         };
+        if let Some(slot) = tried.get_mut(looked) {
+            *slot = victim.cpu;
+        }
+        looked += 1;
         match pull_from(off, me, victim, setup, owed) {
             Pull::Made => {
                 own.leave_idle();
-                return true;
+                held.clear_all();
+                return Passed::Run;
+            }
+            Pull::Own => {
+                own.leave_idle();
+                return Passed::Run;
             }
             Pull::Stop => {
                 count(&COUNTS.stopped, 1);
-                return false;
+                return Passed::Halt;
             }
-            // The source was asked to publish, or could not be: this processor idles, and the
-            // source's kick wakes it (ADR-0020 Amendment 1, step 1: "it then idles").
-            Pull::Asked => return false,
+            // The source was asked to publish: this processor idles, and the source's kick wakes
+            // it (ADR-0020 Amendment 1, step 1: "it then idles"). The source is passed over
+            // until the others have had their turn, so that a processor whose asks another
+            // always answers first still reaches the rest (the review's D98-1).
+            Pull::Asked => {
+                held.set(victim.cpu as usize);
+                return Passed::Halt;
+            }
             Pull::Nothing => {
                 count(&COUNTS.nothing, 1);
-                if let Some(slot) = tried.get_mut(attempt) {
-                    *slot = victim.cpu;
-                }
+                held.set(victim.cpu as usize);
             }
+            Pull::Later => {}
         }
     }
-    false
+    Passed::Halt
 }
 
 /// What one look at a victim came to.
 enum Pull {
     /// A thread was pulled.
     Made,
-    /// Nothing there for this processor: try the next victim.
+    /// Nothing there for this processor: the next victim, and this one after the others
+    /// (`Setup::held`).
     Nothing,
-    /// This pass is over: moves are withdrawn, this queue has work of its own or no room, or a
-    /// move was refused.
+    /// Not now: a queue lock was held for longer than a pass waits, or an ask was held back by
+    /// one of its bounds. The next victim, and this one again at the next pass.
+    Later,
+    /// A thread of this processor's own became ready meanwhile: it runs that.
+    Own,
+    /// This pass is over: moves are withdrawn, this queue has no room, or a move was refused.
     Stop,
-    /// A thread this processor could otherwise take is not published: the ask (ADR-0020
-    /// Amendment 1), sent or held by its bounds. This pass is over.
+    /// A thread this processor could otherwise take is not published, and its source was asked
+    /// to publish it (ADR-0020 Amendment 1). This pass is over.
     Asked,
+}
+
+/// Takes `lock` if it comes free within [`LOCK_TRIES`] tries; counts a look given up if not.
+fn take<T>(lock: &SpinLock<T>) -> Option<SpinGuard<'_, T>> {
+    let guard = (0..LOCK_TRIES).find_map(|_| {
+        let guard = lock.try_lock();
+        if guard.is_none() {
+            core::hint::spin_loop();
+        }
+        guard
+    });
+    if guard.is_none() {
+        count(&COUNTS.contended, 1);
+    }
+    guard
 }
 
 /// Pulls one thread from `victim` to this processor, if it holds one this processor may take.
@@ -370,23 +520,36 @@ fn pull_from(
     if from == to {
         return Pull::Nothing;
     }
-    // Both queue locks, in index order (`origin_sync::threads`, "Locks"), as `migrate` takes them.
-    let (mut low, mut high) = if from.get() < to.get() {
-        (source_queue.lock(), destination_queue.lock())
+    // Both queue locks, in index order (`origin_sync::threads`, "Locks"), as `migrate` takes
+    // them, but without a long wait for either.
+    let (mut source_guard, mut destination_guard) = if from.get() < to.get() {
+        let Some(source) = take(source_queue) else {
+            return Pull::Later;
+        };
+        let Some(destination) = take(destination_queue) else {
+            return Pull::Later;
+        };
+        (source, destination)
     } else {
-        (destination_queue.lock(), source_queue.lock())
+        let Some(destination) = take(destination_queue) else {
+            return Pull::Later;
+        };
+        let Some(source) = take(source_queue) else {
+            return Pull::Later;
+        };
+        (source, destination)
     };
-    let (source, destination) = if from.get() < to.get() {
-        (&mut *low, &mut *high)
-    } else {
-        (&mut *high, &mut *low)
-    };
+    let (source, destination) = (&mut *source_guard, &mut *destination_guard);
     // Under the source's lock (S20).
     if pinned::withdrawn() {
         return Pull::Stop;
     }
-    // A thread of this processor's own became ready meanwhile, or its queue is full (N13).
-    if destination.census().runnable != 0 || !destination.has_room() {
+    // A thread of this processor's own became ready meanwhile.
+    if destination.census().runnable != 0 {
+        return Pull::Own;
+    }
+    // Its queue is full of threads that are not ready (N13).
+    if !destination.has_room() {
         return Pull::Stop;
     }
     let (waiting, cold) = (source.census().waiting, source.cold());
@@ -436,31 +599,35 @@ fn pull_from(
         // The ask (ADR-0020 Amendment 1): a thread passed every other check and is not
         // published. This processor's own rate first, so that the source is not marked as asked
         // by a processor that then cannot send; then the source's mark, under its lock.
-        let ask = if timer::balance_spent(me) {
-            count(&COUNTS.asks_over_rate, 1);
-            None
-        } else if !source.take_ask() {
-            count(&COUNTS.asks_not_first, 1);
-            None
-        } else {
-            source.note_ask();
-            from.apic_id()
+        let Some(apic_id) = from.apic_id() else {
+            return Pull::Nothing;
         };
-        drop((low, high));
-        if let Some(apic_id) = ask
-            && timer::send_balance_ipi(me, apic_id)
-        {
-            count(&COUNTS.asks, 1);
+        if timer::balance_spent(me) {
+            count(&COUNTS.asks_over_rate, 1);
+            return Pull::Later;
         }
+        if !source.take_ask() {
+            count(&COUNTS.asks_not_first, 1);
+            return Pull::Later;
+        }
+        source.note_ask();
+        // The source takes its own queue's lock in the upcall the ask causes: it is let go first.
+        drop(source_guard);
+        if !timer::send_balance_ipi(me, apic_id) {
+            return Pull::Later;
+        }
+        destination.note_sent();
+        count(&COUNTS.asks, 1);
         return Pull::Asked;
     };
-    // Counted apart from the tests above: what a proof holds at 0.
+    // Counted apart from the tests above ([`Counts::too_soon`]).
     if !source.settled(candidate.slot, step.period) {
         count(&COUNTS.too_soon, 1);
     }
     if !candidate.cold && !step.shares_cache {
         count(&COUNTS.hot_across, 1);
     }
+    let again = source.since_arrival(candidate.slot).is_some();
     let moved = super::carry(
         off,
         placed.record(),
@@ -471,20 +638,23 @@ fn pull_from(
     );
     publish(from.get(), source, setup);
     publish(to.get(), destination, setup);
-    drop((low, high));
+    drop((source_guard, destination_guard));
     let on = to;
     match super::moved_or_why(moved, |trigger| {
         if pinned::enter(trigger) {
             *owed = Some((trigger, on));
         }
     }) {
-        Ok(_) => {
+        Ok(carried_wake) => {
             count(&COUNTS.pulls, 1);
             count(&COUNTS.pulls_hot, u64::from(!candidate.cold));
+            count(&COUNTS.pulls_carrying, u64::from(carried_wake));
+            count(&COUNTS.pulls_again, u64::from(again));
             Pull::Made
         }
-        // The frame was published under the source's lock, so neither can be its answer; taken
-        // as nothing rather than trusted.
+        // The frame was published under the source's lock (`Contexts::published` reads the
+        // leaving record first, as `lend` does), so `lend` answers this only where the source
+        // is between the two stores of a later publication; taken as nothing.
         Err(Unmoved::TryLater) => Pull::Nothing,
         Err(_) => {
             count(&COUNTS.refused, 1);
@@ -512,8 +682,7 @@ fn left_idle(queue: &RunQueue<Placed>, me: ThisCpu<'_>) {
 }
 
 /// The tick's step of this processor's queue, with what balancing does at a tick (k1). With no
-/// thread on the queue that balancing may take, that is the rate's renewal, the idle flag and
-/// the hints, out of line.
+/// thread on the queue that balancing may take, that is [`ticked`] alone.
 #[inline]
 pub(super) fn tick(queue: &mut RunQueue<Placed>, interrupted: u64, here: Here<'_>) -> u64 {
     if queue.any_balanced() {
@@ -542,14 +711,15 @@ fn ticked(queue: &RunQueue<Placed>, here: Here<'_>) {
     own.settle(index, &setup.masks);
 }
 
-/// The tick on a queue that holds a thread balancing may take: the cache-hot judgement around
-/// the step, the mark, and the kick.
+/// The tick on a queue that holds a thread balancing may take: the cache-hot judgement before
+/// the step, so that a thread that waited the whole of the last tick is named; the step; the
+/// mark; and the kick.
 #[inline(never)]
 fn tick_balanced(queue: &mut RunQueue<Placed>, interrupted: u64, here: Here<'_>) -> u64 {
     let now = rdtsc();
-    let (quiet, was) = (queue.quiet(now, window()), queue.current());
+    let was = queue.current();
+    queue.judge(now, window());
     let next = queue.tick(interrupted);
-    queue.judge(quiet, was);
     queue.mark(now);
     ticked(queue, here);
     if kick(queue, here, was) {
@@ -559,7 +729,8 @@ fn tick_balanced(queue: &mut RunQueue<Placed>, interrupted: u64, here: Here<'_>)
 }
 
 /// The reschedule upcall's step (k2): `RunQueue::preempt_for_wake`, and, on a queue that holds a
-/// thread balancing may take, the cache-hot judgement and the kick.
+/// thread balancing may take, the cache-hot judgement and the kick. An ask arrives here: the
+/// step switches nothing, and the kick publishes and tells an idle processor.
 #[inline]
 pub(super) fn rescheduled(queue: &mut RunQueue<Placed>, interrupted: u64, here: Here<'_>) -> u64 {
     if queue.any_balanced() {
@@ -572,10 +743,9 @@ pub(super) fn rescheduled(queue: &mut RunQueue<Placed>, interrupted: u64, here: 
 
 #[inline(never)]
 fn rescheduled_balanced(queue: &mut RunQueue<Placed>, interrupted: u64, here: Here<'_>) -> u64 {
-    let now = rdtsc();
-    let (quiet, was) = (queue.quiet(now, window()), queue.current());
+    let was = queue.current();
     let next = queue.preempt_for_wake(interrupted);
-    queue.judge(quiet, was);
+    queue.judge(rdtsc(), window());
     left_idle(queue, cpu::this_cpu(here));
     if kick(queue, here, was) {
         count(&COUNTS.kicks_upcall, 1);
@@ -587,11 +757,16 @@ fn rescheduled_balanced(queue: &mut RunQueue<Placed>, interrupted: u64, here: He
 /// thread context or from a handler, inside an interrupts-off section (k3: a wake-up; k4: a
 /// spawn). If `cpu` is this processor, it looks for an idle one to kick. Out of line: the
 /// wake-up's own path tests the record's declaration and nothing else.
+///
+/// The rate is asked first: a processor that has sent its one balancing interrupt for this tick
+/// does none of the rest, and its next tick publishes and kicks (the review's R98-9). So a
+/// thread that makes others ready in a loop pays, each time after the first, this processor's
+/// index, a compare and one load of its rate's flag.
 #[cold]
 #[inline(never)]
 pub(super) fn made_ready_here(cpu: u32, here: Here<'_>) {
     let me = cpu::this_cpu(here);
-    if u32::try_from(me.index().get()) != Ok(cpu) {
+    if u32::try_from(me.index().get()) != Ok(cpu) || timer::balance_spent(me) {
         return;
     }
     let Some(queue) = QUEUES.this(me) else {
@@ -601,8 +776,8 @@ pub(super) fn made_ready_here(cpu: u32, here: Here<'_>) {
     if !queue.any_balanced() {
         return;
     }
-    let (quiet, was) = (queue.quiet(rdtsc(), window()), queue.current());
-    queue.judge(quiet, was);
+    let was = queue.current();
+    queue.judge(rdtsc(), window());
     if kick(&mut queue, here, was) {
         count(&COUNTS.kicks_here, 1);
     }
@@ -627,9 +802,16 @@ fn window() -> u64 {
 /// just switched out, which this trap is still on: that one is not counted, since a kick for it
 /// would spend the tick's one interrupt on a frame no puller can take.
 ///
+/// **Lendable** is judged level by level, by the tests a pull made at that level would apply
+/// (the reviews' R98-8 and D98-8): a waiting thread no count pins, settled for the level's period
+/// (S10's move rate), and not cache-hot unless the level shares this processor's last-level
+/// cache.
+///
 /// **Who is told.** The nearest processor whose idle flow has published that it is idle, that
-/// takes part in moves and has capacity; and, if every thread that waits here is cache-hot, one
-/// that shares this processor's last-level cache (S10).
+/// takes part in moves and has capacity, at a level at which some thread here is lendable.
+///
+/// The interrupt is sent under this queue's lock, which the upcall holds for its whole step: one
+/// write of a register, which waits for nothing.
 fn kick(queue: &mut RunQueue<Placed>, here: Here<'_>, was: usize) -> bool {
     let Some(setup) = SETUP.get() else {
         return false;
@@ -651,12 +833,30 @@ fn kick(queue: &mut RunQueue<Placed>, here: Here<'_>, was: usize) -> bool {
     } else {
         1u16 << was
     };
-    let lendable = census.waiting & !out;
-    if !queue.busy() || lendable == 0 || !setup.takes_part(index) || pinned::withdrawn() {
+    let unpinned = (1..CAPACITY)
+        .filter(|&slot| (census.waiting & !out) & (1 << slot) != 0)
+        .filter(|&slot| {
+            queue
+                .record(slot)
+                .is_some_and(|placed| placed.record().pins() == 0)
+        })
+        .fold(0u16, |unpinned, slot| unpinned | (1 << slot));
+    let cold = queue.cold();
+    // For each level, whether a pull made at it would take a thread from here.
+    let mut open = [false; LEVELS];
+    for (level, at_level) in open.iter_mut().enumerate().take(levels.len()) {
+        if let Some(step) = setup.plan.step(index, level) {
+            *at_level = (1..CAPACITY).any(|slot| {
+                unpinned & (1 << slot) != 0
+                    && queue.settled(slot, step.period)
+                    && (step.shares_cache || cold & (1 << slot) != 0)
+            });
+        }
+    }
+    if !queue.busy() || !open.contains(&true) || !setup.takes_part(index) || pinned::withdrawn() {
         own.publish(index, load, &setup.masks.crowded);
         return false;
     }
-    let cold = queue.cold() & lendable != 0;
     let target = published::publish_then_find_idle(
         mine,
         own,
@@ -667,11 +867,7 @@ fn kick(queue: &mut RunQueue<Placed>, here: Here<'_>, was: usize) -> bool {
         |cpu, level| {
             setup.takes_part(cpu as usize)
                 && crate::capacity::current(cpu as usize) != 0
-                && (cold
-                    || setup
-                        .plan
-                        .step(index, level)
-                        .is_some_and(|step| step.shares_cache))
+                && open.get(level).copied().unwrap_or(false)
         },
     );
     let apic_id = target
@@ -682,6 +878,7 @@ fn kick(queue: &mut RunQueue<Placed>, here: Here<'_>, was: usize) -> bool {
         return false;
     };
     if timer::send_balance_ipi(me, apic_id) {
+        queue.note_sent();
         true
     } else {
         count(&COUNTS.kicks_over_rate, 1);
