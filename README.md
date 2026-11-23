@@ -61,6 +61,12 @@ The release version is written only in `origin-version.toml`; every module reads
 - [`hardware/`](docs/hardware): records of runs on real machines, and the shortlist of test machines.
 - [`toolchain/`](docs/toolchain/VERIFICATION.md): the toolchain's verification report.
 
+## Contributing
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md) says what a contribution needs: it must be original, and every commit carries a sign-off. [`CODEOWNERS`](CODEOWNERS) names the owners of the kernel and of the SDK's interfaces.
+
+Do not put the details of a vulnerability in a public issue or pull request.
+
 ## Licence
 
 Origin OS is licensed under either of
