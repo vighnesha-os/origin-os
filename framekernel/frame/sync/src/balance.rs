@@ -188,7 +188,6 @@ impl Element {
     }
 }
 
-#[cfg(not(all(test, loom)))]
 impl Default for Element {
     fn default() -> Self {
         Self::new()
