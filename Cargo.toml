@@ -8,8 +8,10 @@
 #                           the host tests of every crate on its own target(s), the image
 #                           builds, every gate on the tree and its records, and the Loom models
 #   cargo xtask build       the UEFI loader (developer mode) and the kernel image
-#   cargo xtask boot-test   the boots under QEMU + OVMF, each judged on its serial output
-#   cargo xtask run         the developer-mode kernel under QEMU, its console on this terminal
+#   cargo xtask boot-test   the boots under QEMU + OVMF, each judged on what it prints, and the
+#                           kernel boot on its screen too
+#   cargo xtask run         the kernel under QEMU with the developer-mode loader, its console on
+#                           this terminal
 
 [workspace]
 resolver = "3"

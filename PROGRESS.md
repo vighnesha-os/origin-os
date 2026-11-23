@@ -52,7 +52,7 @@ Each milestone counts the requirements that [`docs/ROADMAP.md`](docs/ROADMAP.md)
 | M12. System updates and recovery | not started | 75 | 0.0% | 8.0% | 1.3% | 90.7% |
 | M13. Production qualification | not started | 113 | 1.8% | 4.4% | 9.7% | 84.1% |
 
-In no milestone: 68 requirements that the roadmap lists as in none, with its reasons, and 327 that it does not place. Of those it does not place, 327 are standing rules, which belong to no milestone (decision item 256).
+In no milestone: 68 requirements that the roadmap lists as in none, with its reasons, and 327 standing rules, which belong to no milestone (decision item 256).
 
 ## By feature area
 
@@ -76,7 +76,7 @@ The requirements of [`CLAUDE.md`](CLAUDE.md) that ask for something to be built,
 | Testing, hardware qualification and release | §72 to §76 | 69 | 1.5% | 13.0% | 7.2% | 78.3% |
 | **All fourteen areas** | | 834 | 2.1% | 15.2% | 9.8% | 72.9% |
 
-Outside these areas: 154 requirements of that kind, in the final rules (1), the header (7), §1 (69), §6 (17), §18 (17), §79 (12), §82 (17), §84 (14). They are counted in "Overall" and in the milestones.
+Outside these areas: 154 more of `CLAUDE.md` that ask for something to be built, in the header (7), §1 (69), §6 (17), §18 (17), §79 (12), §82 (17), §84 (14), the final rules (1). They are counted in "Overall", and in a milestone where the roadmap places them.
 
 ## Details
 
@@ -224,7 +224,7 @@ Outside these areas: 154 requirements of that kind, in the final rules (1), the 
 <details>
 <summary>ADR decisions</summary>
 
-The requirements of each accepted ADR: one for each of its decisions, of every kind.
+The requirements of each accepted ADR, one for each of its decisions.
 
 | ADR | Requirements | Done | Built | In progress | Not started |
 |---|--:|--:|--:|--:|--:|
@@ -265,7 +265,7 @@ Rules on how the work is done, of `CLAUDE.md` and of the ADRs. They hold at ever
 <details>
 <summary>Exact counts</summary>
 
-The two tables above, with the number of requirements in each state in place of its share.
+The milestone and feature-area tables, with the number of requirements in each state in place of its share.
 
 | Milestone | Requirements | Done | Built | In progress | Not started |
 |---|--:|--:|--:|--:|--:|
@@ -306,6 +306,6 @@ The two tables above, with the number of requirements in each state in place of 
 
 ## How this page is made
 
-- **From the records.** `cargo xtask progress` writes it from three of them. They are the requirements matrix ([`docs/requirements/`](docs/requirements/README.md)), the headings of `CLAUDE.md` and of the ADRs, and `docs/ROADMAP.md`. Every figure is a count of requirements, and each counts as one.
+- **From the records.** `cargo xtask progress` writes it from three of them. They are the requirements matrix ([`docs/requirements/`](docs/requirements/README.md)), the headings of `CLAUDE.md` and of the ADRs, and `docs/ROADMAP.md`. Every figure is a count of requirements or a share of one, and each requirement counts as one.
 - **Not by hand.** `cargo xtask check` refuses a tree whose page differs from the one it generates, so the page on `main` is current after every merge.
 - **Not counted:** 51 requirements kept for information only, and 3 removed from scope. Only done counts as complete, and neither built nor in progress counts as coverage (decision items 193 and 221).

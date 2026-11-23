@@ -41,6 +41,9 @@ use crate::{Result, repo_root};
 
 /// The page this module writes and its gate reads.
 const PAGE: &str = "PROGRESS.md";
+/// Where the page was until TASKS item 137 (owner item 356). A copy left there is refused
+/// ([`no_copy_at_the_old_place`]).
+const OLD_PAGE: &str = "docs/PROGRESS.md";
 /// The command that writes it.
 const COMMAND: &str = "cargo xtask progress";
 
@@ -366,13 +369,21 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
         .map(|(_, r)| r)
         .collect();
     let unplaced_rules = unplaced.iter().filter(|r| r.kind == Kind::Rule).count();
+    // What the roadmap does not place is its standing rules, and nothing else, whenever the
+    // roadmap gate passes; if it ever were more, the page says how many are not rules.
+    let others = unplaced.len() - unplaced_rules;
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "In no milestone: {} that the roadmap lists as in none, with its reasons, and {} that it does not place. Of those it does not place, {} are standing rules, which belong to no milestone (decision item 256).",
+        "In no milestone: {} that the roadmap lists as in none, with its reasons, and {} standing rule{}, which belong to no milestone (decision item 256){}.",
         requirements_of(listed.rows()),
-        count(unplaced.len()),
-        count(unplaced_rules)
+        count(unplaced_rules),
+        if unplaced_rules == 1 { "" } else { "s" },
+        if others == 0 {
+            String::new()
+        } else {
+            format!("; and {} more that it does not place", count(others))
+        }
     );
 
     // 6. By feature area.
@@ -418,20 +429,22 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
     let mut outside: BTreeMap<(u8, String), usize> = BTreeMap::new();
     for row in build.iter().filter(|r| counted(r).is_some()) {
         if section_of(row).is_none_or(|section| !grouped.contains(&section)) {
-            let order = section_of(row).unwrap_or(0);
+            // In the directive's own order: its header first, its final rules last.
+            let order =
+                section_of(row).unwrap_or(if row.id.starts_with("F-") { u8::MAX } else { 0 });
             *outside.entry((order, place_of(row))).or_default() += 1;
         }
     }
     let outside_rows: usize = outside.values().sum();
     let places: Vec<String> = outside
         .iter()
-        .map(|((_, place), n)| format!("{place} ({n})"))
+        .map(|((_, place), n)| format!("{place} ({})", count(*n)))
         .collect();
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "Outside these areas: {} of that kind, in {}. They are counted in \"Overall\" and in the milestones.",
-        requirements_of(outside_rows),
+        "Outside these areas: {} more of `CLAUDE.md` that ask for something to be built, in {}. They are counted in \"Overall\", and in a milestone where the roadmap places them.",
+        count(outside_rows),
         if places.is_empty() {
             "no section".to_string()
         } else {
@@ -477,7 +490,7 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "The requirements of each accepted ADR: one for each of its decisions, of every kind."
+        "The requirements of each accepted ADR, one for each of its decisions."
     );
     let _ = writeln!(w);
     let _ = writeln!(w, "| ADR | {STATES} |");
@@ -524,7 +537,7 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "The two tables above, with the number of requirements in each state in place of its share."
+        "The milestone and feature-area tables, with the number of requirements in each state in place of its share."
     );
     let _ = writeln!(w);
     let _ = writeln!(w, "| Milestone | {STATES} |");
@@ -552,7 +565,7 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "- **From the records.** `{COMMAND}` writes it from three of them. They are the requirements matrix ([`docs/requirements/`](docs/requirements/README.md)), the headings of `CLAUDE.md` and of the ADRs, and `docs/ROADMAP.md`. Every figure is a count of requirements, and each counts as one."
+        "- **From the records.** `{COMMAND}` writes it from three of them. They are the requirements matrix ([`docs/requirements/`](docs/requirements/README.md)), the headings of `CLAUDE.md` and of the ADRs, and `docs/ROADMAP.md`. Every figure is a count of requirements or a share of one, and each requirement counts as one."
     );
     let _ = writeln!(
         w,
@@ -624,11 +637,26 @@ fn compare(committed: Option<&str>, generated: &str) -> std::result::Result<(), 
     }
 }
 
-/// The gate: the committed page is the one the tree generates, byte for byte.
+/// Refuses a tree that still holds a page at [`OLD_PAGE`] (the review of TASKS item 137,
+/// R137-4). A branch cut before the move that regenerates the page writes it there, and a merge
+/// that kept that file would leave a second page, in the old layout, that nothing regenerates and
+/// no gate reads.
+fn no_copy_at_the_old_place(present: bool) -> std::result::Result<(), String> {
+    if present {
+        return Err(format!(
+            "{OLD_PAGE} is in the tree: the page is {PAGE}, at the repository root, since owner item 356. Remove {OLD_PAGE}; `{COMMAND}` writes the page at the root"
+        ));
+    }
+    Ok(())
+}
+
+/// The gate: the committed page is the one the tree generates, byte for byte, and there is no
+/// second page where it used to be.
 pub(crate) fn gate() -> Result {
     let generated = generate()?;
     let committed = fs::read_to_string(repo_root().join(PAGE)).ok();
     compare(committed.as_deref(), &generated)?;
+    no_copy_at_the_old_place(repo_root().join(OLD_PAGE).exists())?;
     println!(
         "xtask: progress gate: {PAGE} is the page this tree generates ({} lines)",
         generated.lines().count()
@@ -649,7 +677,7 @@ mod tests {
         )
     }
 
-    /// Three small matrix files: §1, §8 and ADR-0017.
+    /// Five small matrix files: the directive's header, §1, §8, its final rules, and ADR-0017.
     fn files() -> Vec<(String, String)> {
         let one = format!(
             "{HEADER}{}",
@@ -671,13 +699,21 @@ mod tests {
             line("A17-Z2", "rule", "both/hw", "not-started", "-"),
         ]
         .concat();
+        let unnumbered = |id: &str| {
+            format!(
+                "{HEADER}{}",
+                line(id, "build", "eng/host", "not-started", "-")
+            )
+        };
         vec![
             ("adr-0017.md".into(), format!("{HEADER}{adr}")),
+            ("directive-00-header.md".into(), unnumbered("H-01")),
             ("directive-01-authority.md".into(), one),
             (
                 "directive-03-toolchain.md".into(),
                 format!("{HEADER}{eight}"),
             ),
+            ("directive-21-final-rules.md".into(), unnumbered("F-01")),
         ]
     }
 
@@ -697,7 +733,7 @@ mod tests {
         BTreeMap::from([(17, ("Hardening".to_string(), true))])
     }
 
-    const ROADMAP: &str = "# Roadmap\n\n## M0. First\n\n**Accepted.** **State, 2026-11-12: built, not done.**\n\n| Test | Passes when | Rows |\n|---|---|---|\n| M0-1 | it does | S8-01 to S8-03 |\n\n## M1. Second\n\n**Marked against the tests, 2026-11-12: not started.**\n\n| Rows | Subject |\n|---|---|\n| S8-04, S8-05, A17-Z1 | more |\n\n## Rows in no milestone\n\n| Rows | Why |\n|---|---|\n| S1-01 | a reason |\n";
+    const ROADMAP: &str = "# Roadmap\n\n## M0. First\n\n**Accepted.** **State, 2026-11-12: built, not done.**\n\n| Test | Passes when | Rows |\n|---|---|---|\n| M0-1 | it does | S8-01 to S8-03 |\n\n## M1. Second\n\n**Marked against the tests, 2026-11-12: not started.**\n\n| Rows | Subject |\n|---|---|\n| S8-04, S8-05, A17-Z1 | more |\n\n## Rows in no milestone\n\n| Rows | Why |\n|---|---|\n| S1-01, H-01, F-01 | a reason |\n";
 
     fn generated(
         roadmap: &str,
@@ -715,31 +751,32 @@ mod tests {
     fn the_figures_of_a_small_matrix() {
         let page = generated(ROADMAP, &titles()).expect("the fixture's page");
         for want in [
-            // The one line, and overall: nine counted requirements; S8-07 informs and S8-08 is
-            // removed. Two ninths are 22.2% three times and three ninths 33.3%, which is 99.9%:
-            // the tenth still owed goes to the largest remainder, not started's.
-            "**22.2% of 9 requirements are done.** Done is the only state that counts as complete.",
-            "| Done | 2 | 22.2% |",
-            "| Built | 2 | 22.2% |",
-            "| In progress | 2 | 22.2% |",
-            "| Not started | 3 | 33.4% |",
-            "| **Total** | **9** | **100.0%** |",
+            // The one line, and overall: eleven counted requirements; S8-07 informs and S8-08 is
+            // removed. Plain rounding would give 18.2% three times and 45.5%, which is 100.1%.
+            "**18.2% of 11 requirements are done.** Done is the only state that counts as complete.",
+            "| Done | 2 | 18.2% |",
+            "| Built | 2 | 18.2% |",
+            "| In progress | 2 | 18.2% |",
+            "| Not started | 5 | 45.4% |",
+            "| **Total** | **11** | **100.0%** |",
             // Where the evidence ran, one environment a line.
             "| The development host | 3 |",
             "| An emulator (QEMU) | 1 |",
             "| A virtual machine on a real processor | 1 |",
             "| Physical hardware | 0 |",
-            "| No evidence yet | 4 |",
+            "| No evidence yet | 6 |",
             // Milestones, with their state words in both of the roadmap's forms.
             "| M0. First | built | 3 | 33.3% | 33.3% | 33.4% | 0.0% |",
             "| M1. Second | not started | 3 | 0.0% | 33.3% | 33.3% | 33.4% |",
-            "In no milestone: 1 requirement that the roadmap lists as in none, with its reasons, and 2 that it does not place. Of those it does not place, 2 are standing rules",
+            "In no milestone: 3 requirements that the roadmap lists as in none, with its reasons, and 2 standing rules, which belong to no milestone (decision item 256).",
             // Feature areas: §8's build requirements; the rule and the removed one are not among
             // them. An area with no requirement shows "-" in each state's cell.
             "| Toolchain, build and CI | §8 to §15 | 5 | 20.0% | 20.0% | 40.0% | 20.0% |",
             "| Kernel core | §24 to §30 | 0 | - | - | - | - |",
             "| **All fourteen areas** | | 5 | 20.0% | 20.0% | 40.0% | 20.0% |",
-            "Outside these areas: 1 requirement of that kind, in §1 (1).",
+            // The directive's unnumbered parts by name, in its own order: the header first, the
+            // final rules last (the review's R137-5 (b)).
+            "Outside these areas: 3 more of `CLAUDE.md` that ask for something to be built, in the header (1), §1 (1), the final rules (1). They are counted in \"Overall\", and in a milestone where the roadmap places them.",
             // The details: sections, ADRs (every kind), rules (of every file), exact counts.
             "**Toolchain, build and CI (§8 to §15)**",
             "| §8. Section 8 | 5 | 20.0% | 20.0% | 40.0% | 20.0% |",
@@ -928,9 +965,11 @@ mod tests {
     }
 
     /// Owner item 357 and decision items 193 and 221: no figure and no sentence adds two states
-    /// together, and a reader sees "requirements" and "feature areas", not "rows" and "groups".
+    /// together. On both pages the only percentage outside a table is the first line's, which is
+    /// done's alone, so no sentence can give a sum of two states (the review's R137-5 (d)); and
+    /// the old column's and sentence's words are gone.
     #[test]
-    fn nothing_adds_two_states_together_and_the_words_are_the_readers() {
+    fn nothing_adds_two_states_together() {
         for page in [
             generated(ROADMAP, &titles()).expect("the fixture's page"),
             generate().expect("the page of this tree"),
@@ -940,30 +979,91 @@ mod tests {
                 "done or built",
                 "built or done",
                 "done and built",
+                "done plus built",
                 "% done",
-                "feature group",
-                "counted rows",
             ] {
                 assert!(!lower.contains(banned), "the page says {banned:?}");
             }
-            for word in lower.split(|c: char| !c.is_ascii_alphabetic()) {
-                assert!(word != "row" && word != "rows", "the page says {word:?}");
-                assert!(
-                    word != "group" && word != "groups",
-                    "the page says {word:?}"
-                );
+            for (i, line) in page.lines().enumerate() {
+                if line.contains('%') && !line.starts_with('|') {
+                    assert_eq!(i, 2, "a percentage outside a table: {line}");
+                    assert_eq!(line.matches('%').count(), 1, "{line}");
+                    assert!(
+                        line.contains("% of ") && line.contains(" are done.**"),
+                        "{line}"
+                    );
+                }
             }
             // The headers of every table of states name the four, and only them, after the count.
+            let mut tables = 0;
             for line in page
                 .lines()
                 .filter(|l| l.contains("| Requirements | Done |"))
             {
+                tables += 1;
                 assert!(
                     line.ends_with("| Requirements | Done | Built | In progress | Not started |"),
                     "{line}"
                 );
             }
+            assert!(tables >= 2 + 14 + 2 + 2, "{tables}");
         }
+    }
+
+    /// A reader sees "requirements" and "feature areas", not "rows" and "groups". Held on the
+    /// fixture's page, whose titles are this test's own: the tree's page also carries the ADRs',
+    /// the sections' and the milestones' titles, which the generator does not write (the review's
+    /// R137-8).
+    #[test]
+    fn the_words_are_the_readers() {
+        let page = generated(ROADMAP, &titles()).expect("the fixture's page");
+        let lower = page.to_lowercase();
+        for banned in [
+            "feature group",
+            "counted rows",
+            "of that kind",
+            "of every kind",
+        ] {
+            assert!(!lower.contains(banned), "the page says {banned:?}");
+        }
+        for word in lower.split(|c: char| !c.is_ascii_alphabetic()) {
+            assert!(word != "row" && word != "rows", "the page says {word:?}");
+            assert!(
+                word != "group" && word != "groups",
+                "the page says {word:?}"
+            );
+        }
+    }
+
+    /// The review's R137-5 (c): a thousand or more has its comma wherever the page writes a
+    /// count. On the page this tree generates, which holds more than a thousand requirements, no
+    /// cell after a line's first (the first is a title, which the generator does not write) and no
+    /// sentence outside a table holds a run of four digits.
+    #[test]
+    fn every_count_on_the_trees_page_has_its_commas() {
+        let four_digits = |text: &str| {
+            text.as_bytes()
+                .windows(4)
+                .any(|run| run.iter().all(u8::is_ascii_digit))
+        };
+        let page = generate().expect("the page of this tree");
+        let mut thousands = 0;
+        for line in page.lines() {
+            let written = match line.strip_prefix('|') {
+                Some(cells) => cells.split_once('|').map_or("", |(_, rest)| rest),
+                None => line,
+            };
+            assert!(!four_digits(written), "a count without its comma: {line}");
+            thousands += written
+                .as_bytes()
+                .windows(5)
+                .filter(|w| {
+                    w[0].is_ascii_digit() && w[1] == b',' && w[2..].iter().all(u8::is_ascii_digit)
+                })
+                .count();
+        }
+        // The first line's total, the overall table's two, and the evidence table's.
+        assert!(thousands >= 4, "{thousands}");
     }
 
     /// The four cells after a line's count, if the line is one of a table of percentages.
@@ -991,7 +1091,8 @@ mod tests {
                 assert_eq!(shares.iter().sum::<usize>(), 1000, "{line}");
             }
         }
-        assert!(lines > 14 + 14 + 59 + 1, "{lines}");
+        // At least the milestones', the areas' and the rules' lines; the page has more.
+        assert!(lines > 14 + 15 + 1, "{lines}");
         let done = page
             .lines()
             .find_map(|l| l.strip_prefix("| Done | "))
@@ -1160,6 +1261,24 @@ mod tests {
         assert!(trailing.contains("differ from line 4"), "{trailing}");
         let missing = compare(None, page).expect_err("missing");
         assert!(missing.contains("is not in the tree"), "{missing}");
+    }
+
+    /// The review's R137-4: a page left where it used to be is refused, by name, and the tree
+    /// holds none ([`the_tree_passes`]).
+    #[test]
+    fn a_copy_at_the_old_place_is_refused() {
+        assert_eq!(no_copy_at_the_old_place(false), Ok(()));
+        let refused = no_copy_at_the_old_place(true).expect_err("a second page");
+        assert!(
+            refused.starts_with("docs/PROGRESS.md is in the tree"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("the page is PROGRESS.md, at the repository root"),
+            "{refused}"
+        );
+        assert!(refused.contains("Remove docs/PROGRESS.md"), "{refused}");
+        assert!(!repo_root().join(OLD_PAGE).exists());
     }
 
     #[test]
