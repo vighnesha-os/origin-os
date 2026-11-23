@@ -59,6 +59,7 @@
 //! - [`Element::publish`], [`publish_then_find_idle`]: a holder of that processor's run-queue
 //!   lock, interrupts off.
 //! - [`Element::load`], [`Element::is_idle`], [`Hints::test`]: any processor.
+//! - [`Rate::take`], [`Rate::tick`]: the processor itself, interrupts off.
 #![forbid(unsafe_code)]
 
 use alloc::boxed::Box;
@@ -279,6 +280,85 @@ impl Masks {
     }
 }
 
+/// The rate of one processor's balancing interrupts (ADR-0020 S7.2: "at most one kick per tick
+/// per processor"): it sends one only if it has sent none since its last tick. Its own processor
+/// only, with interrupts off, so plain loads and stores; any processor may read the counts.
+pub struct Rate {
+    /// Whether one was sent since the last tick.
+    sent: prim::AtomicBool,
+    /// How many were sent since the last tick, counted apart from `sent`, and the most in any one
+    /// tick: what a proof holds to 1.
+    this_tick: prim::AtomicU32,
+    most: prim::AtomicU32,
+    /// How many were sent in all.
+    total: prim::AtomicU64,
+}
+
+impl core::fmt::Debug for Rate {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Rate")
+    }
+}
+
+impl Rate {
+    /// None sent.
+    #[cfg(not(all(test, loom)))]
+    pub const fn new() -> Self {
+        Self {
+            sent: prim::AtomicBool::new(false),
+            this_tick: prim::AtomicU32::new(0),
+            most: prim::AtomicU32::new(0),
+            total: prim::AtomicU64::new(0),
+        }
+    }
+
+    /// Whether this processor may send a balancing interrupt now: `true` once a tick, and the
+    /// caller then sends it.
+    pub fn take(&self) -> bool {
+        if self.sent.load(Relaxed) {
+            return false;
+        }
+        self.sent.store(true, Relaxed);
+        self.note_sent();
+        true
+    }
+
+    /// Counts one balancing interrupt sent. Apart from [`Rate::take`]'s flag, so that the count
+    /// would show a second one in a tick if the flag ever failed to stop it.
+    fn note_sent(&self) {
+        let sent = self.this_tick.load(Relaxed).saturating_add(1);
+        self.this_tick.store(sent, Relaxed);
+        if sent > self.most.load(Relaxed) {
+            self.most.store(sent, Relaxed);
+        }
+        self.total
+            .store(self.total.load(Relaxed).saturating_add(1), Relaxed);
+    }
+
+    /// This processor's tick: it may send one again. With none sent it costs one plain load.
+    #[inline]
+    pub fn tick(&self) {
+        if self.sent.load(Relaxed) {
+            self.sent.store(false, Relaxed);
+        }
+        if self.this_tick.load(Relaxed) != 0 {
+            self.this_tick.store(0, Relaxed);
+        }
+    }
+
+    /// How many balancing interrupts this processor sent in all, and the most in one tick.
+    pub fn read(&self) -> (u64, u32) {
+        (self.total.load(Relaxed), self.most.load(Relaxed))
+    }
+}
+
+#[cfg(not(all(test, loom)))]
+impl Default for Rate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A processor to pull from, as [`choose`] found it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(test, derive(Debug))]
@@ -476,6 +556,27 @@ mod tests {
         assert!(!hints.any());
         // A mask for no processor still holds a word.
         assert!(!Hints::new(0).unwrap().any());
+    }
+
+    /// ADR-0020 S7.2: one balancing interrupt a tick, and the count that shows it.
+    #[test]
+    fn a_processor_sends_one_balancing_interrupt_a_tick() {
+        let rate = Rate::new();
+        assert_eq!(rate.read(), (0, 0));
+        rate.tick();
+        assert!(rate.take());
+        assert!(!rate.take() && !rate.take(), "a second in the same tick");
+        assert_eq!(rate.read(), (1, 1));
+        rate.tick();
+        assert!(rate.take(), "the first after a tick");
+        assert!(!rate.take());
+        rate.tick();
+        rate.tick();
+        assert_eq!(rate.read(), (2, 1));
+        // Were the flag never set, the count would say so (the boot control C98-4 plants that).
+        rate.note_sent();
+        rate.note_sent();
+        assert_eq!(rate.read(), (4, 2));
     }
 
     /// ADR-0020 S7.1: the narrowest level first; within it, the highest load with a surplus.

@@ -765,7 +765,7 @@ fn nvme_queued_for(cpus: u32, pairs: u32) -> u32 {
 
 /// The per-CPU tables the kernel sizes at discovery, the framework's and the kernel crate's
 /// (ADR-0008 Amendment 1, D1; `per_cpu` checks that each is sized).
-const PER_CPU_TABLES: u32 = 28;
+const PER_CPU_TABLES: u32 = 29;
 
 /// The cores of each package of the 288-processor run (`ORIGIN_QEMU_TOPOLOGY=many`, outside the
 /// gate since decision item 294).

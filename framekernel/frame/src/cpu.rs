@@ -957,6 +957,40 @@ pub fn move_context(
     ))
 }
 
+/// Whether processor `cpu`'s table of contexts holds `frame` published: a suspended context's
+/// saved frame, in its slot, which a move's `lend` would find (`Contexts::published`; ADR-0020 S5,
+/// TASKS item 98). A puller asks it under `cpu`'s run-queue lock, for a thread it found ready and
+/// not running there, before it begins a move: a frame still in the leaving record is not
+/// published, and a move begun for it would be an empty one. Read only.
+///
+/// Neither generic nor inlined, as [`move_context`] is, so that `CONTEXTS` stays in this crate.
+#[inline(never)]
+pub fn frame_published(cpu: CpuIndex, frame: u64) -> bool {
+    CONTEXTS
+        .get(cpu.get())
+        .is_some_and(|table| table.published(frame))
+}
+
+/// Publishes the frame this processor's last switch-out left, if it has not been
+/// (`Contexts::publish_leaving`; ADR-0020 S5), so that a thread switched out here is lendable at
+/// once and not only after this processor's next switch (TASKS item 98: a processor publishes
+/// before it tells an idle one that a thread waits).
+///
+/// `here` is a witness that interrupts are off on this processor. **Only from thread context in
+/// an interrupts-off section, or from the scheduler's own upcalls** (the tick, the reschedule
+/// interrupt): either runs after the switch-out has left the stack the frame is on, since the
+/// trap entry that made the switch has returned and this is a later entry or the thread it
+/// resumed. Never from a handler that can interrupt a switch (an NMI, a machine check, a debug
+/// exception, a double fault), as [`stack_in_use`] and [`move_context`] say of the same call.
+///
+/// Neither generic nor inlined, for `CONTEXTS`' sake, as [`frame_published`].
+#[inline(never)]
+pub fn publish_leaving_here(here: crate::trap::Here<'_>) {
+    if let Some(table) = CONTEXTS.this(this_cpu(here)) {
+        table.publish_leaving();
+    }
+}
+
 /// What a scan's pass under the move gate runs in: interrupts off on this processor, since a
 /// mover holds the gate with interrupts off and may be this processor's own interrupt handler.
 /// It also counts those passes and keeps the longest, wait for the gate and pass together, in TSC
