@@ -985,6 +985,14 @@ impl<R: Copy> RunQueue<R> {
         (ready, self.current, self.idle, self.live())
     }
 
+    /// Whether the thread in `slot` is blocked: the one state in which [`RunQueue::wake`] makes it
+    /// ready and answers that this queue's processor should reschedule. Any other live thread
+    /// keeps the wake-up for its next [`RunQueue::block`], and the waker is told nothing. For a
+    /// proof that starts a waker only once its thread has blocked (TASKS item 134). Read only.
+    pub fn is_blocked(&self, slot: usize) -> bool {
+        matches!(self.state.get(slot), Some(State::Blocked(_)))
+    }
+
     pub fn has_room(&self) -> bool {
         (1..CAPACITY).any(|i| self.state.get(i) == Some(&State::Free))
     }
@@ -1490,6 +1498,46 @@ mod tests {
             "the pending wake-up is consumed at once"
         );
         assert_eq!(q.block(0xA300), Ok(0x1200), "the next block really blocks");
+    }
+
+    /// TASKS item 134: `is_blocked` is true exactly while a wake-up would make the thread ready
+    /// and ask for a reschedule. A thread that is ready, or running with a wake-up kept for it, is
+    /// not blocked, and a block that only consumes a kept wake-up never shows as one.
+    #[test]
+    fn is_blocked_is_the_state_a_wake_up_makes_ready() {
+        let mut q = RunQueue::new();
+        let slot = q.push(0xA000).unwrap();
+        let generation = q.generation(slot);
+        assert!(!q.is_blocked(slot), "ready, never run");
+        assert_eq!(q.tick(0x1000), 0xA000);
+        assert!(!q.is_blocked(slot), "running");
+        // The close before the block: the wake-up is kept, and the block returns at once.
+        assert!(!q.wake(slot, generation), "running: the wake-up is kept");
+        assert!(!q.is_blocked(slot));
+        assert_eq!(q.block(0xA100), Ok(0xA100), "consumed at once");
+        assert!(!q.is_blocked(slot), "a block that returned at once");
+        // The block before the close: blocked, and the wake-up is the one that reschedules.
+        assert_eq!(q.block(0xA200), Ok(0x1000));
+        assert!(q.is_blocked(slot));
+        assert_eq!(q.tick(0x1100), 0x1100, "a tick leaves it blocked");
+        assert!(q.is_blocked(slot));
+        assert!(q.wake(slot, generation), "blocked: made ready, reschedule");
+        assert!(!q.is_blocked(slot), "ready again");
+        // A timed block is blocked too, until its deadline or a wake-up.
+        assert_eq!(q.tick(0x1200), 0xA200);
+        assert_eq!(q.block_for(0xA300, Some(2)), Ok(0x1200));
+        assert!(q.is_blocked(slot));
+        assert_eq!(q.tick(0x1300), 0x1300);
+        assert_eq!(q.tick(0x1400), 0xA300, "the deadline passed");
+        assert!(!q.is_blocked(slot));
+        // A sleeper keeps a wake-up as a ready thread does: it is not blocked.
+        assert_eq!(q.sleep(0xA400, 5), Ok(0x1400));
+        assert!(!q.is_blocked(slot), "sleeping");
+        assert!(!q.wake(slot, generation), "a sleeper keeps the wake-up");
+        // Slot 0, a free slot and a slot past the queue are never blocked.
+        assert!(!q.is_blocked(0));
+        assert!(!q.is_blocked(slot + 1));
+        assert!(!q.is_blocked(CAPACITY));
     }
 
     #[test]
