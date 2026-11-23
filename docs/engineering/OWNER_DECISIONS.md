@@ -1528,3 +1528,23 @@ On 2026-11-23 you proposed keeping `PROGRESS.md` in the repository root, updated
 - **The alternative put** was the link alone, which was the recommendation: the other status pages stay under `docs/`, and it needs no code change.
 - **Performance cost** (ADR-0018 V3): none, by construction: documents and a host tool.
 - **Where it is written:** this sheet; the requirements README's table of items without rows; `README.md`; TASKS item 137's line.
+
+### The progress page made clean and clear (item 357): 2026-11-23
+
+On 2026-11-23 you wrote: "Can you make PROGRESS.MD clean and clear". That is item 357: your instruction, not an answer to a question. Earlier the same day you had found the page's "% done or built" column confusing, and found four separate percentages clear.
+
+| # | Question | Answer |
+|---|---|---|
+| 357, answered | How is the progress page laid out? | **Clean and clear: "Can you make PROGRESS.MD clean and clear" (your instruction, 2026-11-23)** |
+
+- **The layout the coordinating session set from it,** for TASKS item 137 to build with item 356's move:
+  - every table shows the four states as percentages that add up to 100%: done, built, in progress, not started;
+  - no column or sentence adds two states together, so "% done or built" goes;
+  - the page opens with one sentence, the overall table, and a short table of what each state means, in plain words;
+  - then the milestones and the feature areas;
+  - the long tables (each area's sections, the ADR decisions, the standing rules, the exact counts) sit in sections a reader opens;
+  - how the page is made comes last.
+- **What does not change:** the page is still generated and held by `cargo xtask check`; items 193 and 221 stand, so only done counts as complete; every figure is still a count of the matrix's rows.
+- **If you want the layout changed** once you see it, say so, and the generator is changed: nothing in it is a decision of yours except that it be clean and clear.
+- **Performance cost** (ADR-0018 V3): none, by construction: a generated document and a host tool.
+- **Where it is written:** this sheet; the requirements README's table of items without rows; TASKS item 137's line.
