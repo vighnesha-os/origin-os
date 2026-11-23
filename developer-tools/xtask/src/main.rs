@@ -2827,11 +2827,19 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
         ])
         .chain(kernel_bound_markers(true))
         .chain([
+            // ADR-0020 S7 (TASKS item 98): balancing was set up, on every machine. Without this
+            // line no processor pulls, and with two or more processors the pulled phases below
+            // fail (the review of TASKS item 98, R98-3).
+            "origin-kernel: balancing: idle pull and idle kick set up: ".into(),
             // ADR-0020 S6, S20 and S23 (TASKS item 96): the two migration proofs, on every
             // machine; on one with fewer than two processors taking part, each says so and passes.
-            // A failure ends its line ": scheduler failed", a boot failure below.
+            // A failure ends its line ": scheduler failed", a boot failure below. Each has a second
+            // phase, in which the idle processors pull its threads (TASKS item 98), with a line of
+            // its own after the first phase's.
             "origin-kernel: scheduler: thread migration: integrity: ".into(),
+            "origin-kernel: scheduler: thread migration: integrity, pulled: ".into(),
             "origin-kernel: scheduler: thread migration: delivery: ".into(),
+            "origin-kernel: scheduler: thread migration: delivery, pulled: ".into(),
         ])
         .chain([
             // ADR-0017 Z3: the scheduler noted each change of process, with one barrier for

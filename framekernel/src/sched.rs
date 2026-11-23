@@ -1794,10 +1794,6 @@ pub(crate) fn spawn_movable(
 ///
 /// Spawned onto the spawner's own processor, it may wait there at once, so that processor looks
 /// for an idle one to kick (k4).
-#[expect(
-    dead_code,
-    reason = "its first callers are the migration proofs' pulled phases, in the next commit"
-)]
 pub(crate) fn spawn_balanced(
     cpu: CpuIndex,
     entry: extern "sysv64" fn(u64) -> !,

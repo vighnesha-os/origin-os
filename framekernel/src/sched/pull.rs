@@ -312,6 +312,65 @@ fn count(counter: &AtomicU64, by: u64) {
     }
 }
 
+/// The bounds, as every processor's run queue counted them against its own ticks
+/// (`RunQueue::sent`, `RunQueue::asks`): the balancing interrupts sent in all and the most one
+/// processor sent in one of its ticks, then the asks taken in all and the most one processor took
+/// in one of its ticks. Each "most" is 1, or 0 with none. Each queue is read under its lock.
+pub(crate) fn bounds() -> ((u64, u32), (u64, u32)) {
+    (0..QUEUES.indexes())
+        .filter_map(|cpu| QUEUES.get(cpu))
+        .map(|queue| {
+            cpu::without_interrupts(|| {
+                let queue = queue.lock();
+                (queue.sent(), queue.asks())
+            })
+        })
+        .fold(((0, 0), (0, 0)), |(sent, asks), (s, a)| {
+            (
+                (sent.0.saturating_add(s.0), sent.1.max(s.1)),
+                (asks.0.saturating_add(a.0), asks.1.max(a.1)),
+            )
+        })
+}
+
+/// Whether balancing is set up ([`set_up`]): without it no processor pulls.
+pub(crate) fn is_set_up() -> bool {
+    SETUP.get().is_some()
+}
+
+/// One line of every count since the boot began, report only: what a boot's reader needs to
+/// see why pulls were or were not made (the review's D98-6). `tsc_hz` turns the longest pass
+/// into nanoseconds.
+pub(crate) fn report(com1: &mut Console, tsc_hz: u64) {
+    let of = |counter: &AtomicU64| counter.load(Relaxed);
+    let c = &COUNTS;
+    let nanos = u128::from(of(&c.longest_pass)) * 1_000_000_000 / u128::from(tsc_hz.max(1));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: balancing: counts since boot: pulls {} ({} cache-hot, {} carrying a pending wake-up, {} of a thread moved before); looks that took nothing {}, given up at a held queue lock {}; threads passed over: pinned {}, moved too recently {}, cache-hot {}, not published {}; moves refused {}, passes stopped {}; kicks {} at ticks, {} at reschedule upcalls, {} at wake-ups or spawns, not sent: {} over the rate, {} with nobody idle; asks {} sent, not sent: {} with the source asked already, {} over the rate; longest idle pass {nanos} ns",
+        of(&c.pulls),
+        of(&c.pulls_hot),
+        of(&c.pulls_carrying),
+        of(&c.pulls_again),
+        of(&c.nothing),
+        of(&c.contended),
+        of(&c.pinned),
+        of(&c.unsettled),
+        of(&c.hot),
+        of(&c.unpublished),
+        of(&c.refused),
+        of(&c.stopped),
+        of(&c.kicks_tick),
+        of(&c.kicks_upcall),
+        of(&c.kicks_here),
+        of(&c.kicks_over_rate),
+        of(&c.kicks_nobody_idle),
+        of(&c.asks),
+        of(&c.asks_not_first),
+        of(&c.asks_over_rate),
+    );
+}
+
 /// The census of processor `cpu`'s queue as it is published: its counts, and its weights scaled
 /// by the processor's capacity as it is now (ADR-0020 S9).
 fn load_of(cpu: usize, census: &Census) -> Load {
