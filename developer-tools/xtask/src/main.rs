@@ -55,8 +55,15 @@ const USAGE: &str = "\
 usage: cargo xtask <command>
 
 commands:
-  check       rustfmt, clippy and unit tests, each crate on its own target(s);
-              the UEFI release build; the CLAUDE.md §11 cfg lint
+  check       everything a change must pass without a boot: the pinned compiler, by its
+              commit; rustfmt; Clippy with -D warnings and the host tests of every crate,
+              each on its own target(s); both loader builds and the kernel image, with the
+              image's checks; the no-panic, dependency and CLAUDE.md §11 cfg lints; every
+              gate below that says it is part of check (documents, requirements, provenance,
+              roadmap, progress page, costs, unsafe code, names, interfaces, host tools,
+              versions and the rest); the images built twice and compared byte for byte;
+              and the Loom models with their negative controls. It boots nothing: the
+              boots are boot-test and boot-matrix
   build       build the loader (developer mode) and the KRN kernel image; print their paths
   boot-test   boot under QEMU + OVMF: a signed kernel must start and report with developer
               mode off, an unsigned one in developer mode, and a loader with developer mode
