@@ -162,12 +162,17 @@ def read_safe(root, path, entry):
     return text
 
 
+def web_path(path):
+    # The Pages artifact uploader excludes dot-prefixed path components.
+    return "/".join("dot-" + part[1:] if part.startswith(".") else part for part in path.split("/"))
+
+
 def file_url(path):
-    return BASE_URL + "files/" + quote(path, safe="/") + ".html"
+    return BASE_URL + "files/" + quote(web_path(path), safe="/") + ".html"
 
 
 def tree_url(path):
-    return BASE_URL + "tree/" + quote(path, safe="/") + "/"
+    return BASE_URL + "tree/" + quote(web_path(path), safe="/") + "/"
 
 
 def page(title, description, url, body, revision, verification="", noindex=False):
@@ -208,6 +213,11 @@ def build(root, output):
             raise ValueError(f"Publication refused for {path}: {error}") from None
     if not texts:
         raise ValueError("No eligible files")
+    source_paths = set(texts)
+    for path in texts:
+        source_paths.update(str(p) for p in PurePosixPath(path).parents if str(p) != ".")
+    if len({web_path(p) for p in source_paths}) != len(source_paths):
+        raise ValueError("Publication refused: mapped URL paths collide")
     if output.exists():
         raise ValueError("Output must be a new directory; old artifacts must not be reused")
     output.mkdir(parents=True)
@@ -228,7 +238,7 @@ def build(root, output):
         body = f'<p><a href="{esc(back)}">Browse containing folder</a></p><h1>{esc(path)}</h1>'
         body += f'<p class="muted">Public repository file · <a href="{esc(source)}">View this revision on GitHub</a></p>'
         body += '<pre>' + esc(text) + '</pre>'
-        target = output / "files" / (path + ".html")
+        target = output / "files" / (web_path(path) + ".html")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(page(path, f"Read {path}, a public source or documentation file in Origin OS.", url, body, revision), encoding="utf-8")
         urls.append(url)
@@ -241,7 +251,7 @@ def build(root, output):
         return "<ul>" + "\n".join(links) + "</ul>"
 
     for folder in sorted(directories):
-        target = output / "tree" / folder / "index.html"
+        target = output / "tree" / web_path(folder) / "index.html"
         target.parent.mkdir(parents=True, exist_ok=True)
         body = f'<h1>{esc(folder)}/</h1>' + listing(folder)
         target.write_text(page(folder + "/", f"Browse public files in {folder} in Origin OS.", tree_url(folder), body, revision), encoding="utf-8")

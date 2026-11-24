@@ -111,6 +111,22 @@ class BuildTest(unittest.TestCase):
             self.build()
         self.assertFalse(self.output.exists())
 
+    def test_dot_paths_survive_pages_packaging_and_collisions_are_refused(self):
+        self.write(".github/workflows/index.yml", "name: public index")
+        self.write(".gitignore", "target/")
+        self.commit([".github/workflows/index.yml", ".gitignore"])
+        self.build()
+        self.assertTrue((self.output / "files/dot-github/workflows/index.yml.html").is_file())
+        self.assertTrue((self.output / "files/dot-gitignore.html").is_file())
+        self.assertFalse(any(part.startswith(".") for p in self.output.rglob("*.html") for part in p.relative_to(self.output).parts))
+        self.write("dot-gitignore", "collision")
+        # Use a supported extension on both sides of this collision.
+        self.write(".github/notes.md", "one")
+        self.write("dot-github/notes.md", "two")
+        self.commit([".github/notes.md", "dot-github/notes.md"])
+        with self.assertRaisesRegex(ValueError, "collide"):
+            builder.build(self.root, Path(self.temp.name) / "collision-site")
+
     def test_secret_added_to_an_approved_path_stops_the_build(self):
         self.write("README.md", "gh" + "p_" + "A" * 36)
         self.commit(["README.md"])
