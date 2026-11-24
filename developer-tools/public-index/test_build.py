@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from urllib.parse import unquote, urlsplit
+from urllib.error import HTTPError
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 
@@ -157,11 +158,51 @@ class BuildTest(unittest.TestCase):
                 opened.return_value.__enter__.return_value = io.StringIO(json.dumps(metadata))
                 with self.assertRaises(ValueError):
                     builder.check_public()
+                self.assertEqual(opened.call_count, 1)
         with patch.object(builder, "urlopen") as opened:
             opened.return_value.__enter__.return_value = io.StringIO(json.dumps({"private": False, "visibility": "public", "full_name": builder.REPOSITORY}))
             builder.check_public()
             request = opened.call_args.args[0]
             self.assertNotIn("Authorization", request.headers)
+
+    def test_rate_limit_fallback_requires_anonymous_public_page(self):
+        url = "https://github.com/" + builder.REPOSITORY
+        body = ('<html><head><meta name="octolytics-dimension-repository_nwo" content="' + builder.REPOSITORY
+                + '"><meta name="octolytics-dimension-repository_public" content="true"></head><body></body></html>')
+        for code in [403, 429]:
+            response = io.BytesIO(body.encode())
+            response.status = 200
+            response.geturl = lambda: url
+            with self.subTest(code=code), patch.object(builder, "urlopen", side_effect=[HTTPError("api", code, "rate limited", {}, None), response]) as opened:
+                with redirect_stdout(io.StringIO()):
+                    builder.check_public()
+                self.assertEqual(opened.call_count, 2)
+                self.assertTrue(all("Authorization" not in call.args[0].headers for call in opened.call_args_list))
+
+    def test_fallback_refuses_missing_private_wrong_redirected_or_duplicate_metadata(self):
+        url = "https://github.com/" + builder.REPOSITORY
+        identity = '<meta name="octolytics-dimension-repository_nwo" content="' + builder.REPOSITORY + '">'
+        public = '<meta name="octolytics-dimension-repository_public" content="true">'
+        cases = [
+            ("<head></head>", url),
+            ("<head>" + identity + public.replace("true", "false") + "</head>", url),
+            ("<head>" + identity.replace(builder.REPOSITORY, "someone/else") + public + "</head>", url),
+            ("<head>" + identity + public + public + "</head>", url),
+            ("<head></head><body>" + identity + public + "</body>", url),
+            ("<head>" + identity + public + "</head>", "https://github.com/login"),
+            ("<head>" + identity + public + "</head>" + "x" * builder.MAX_BYTES, url),
+        ]
+        for body, destination in cases:
+            response = io.BytesIO(body.encode())
+            response.status = 200
+            response.geturl = lambda: destination
+            with self.subTest(body=body[:120], destination=destination), patch.object(builder, "urlopen", side_effect=[HTTPError("api", 403, "rate limited", {}, None), response]):
+                with self.assertRaises(ValueError):
+                    builder.check_public()
+        with patch.object(builder, "urlopen", side_effect=HTTPError("api", 404, "not found", {}, None)) as opened:
+            with self.assertRaises(HTTPError):
+                builder.check_public()
+            self.assertEqual(opened.call_count, 1)
 
 
 if __name__ == "__main__":
