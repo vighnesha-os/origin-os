@@ -25,8 +25,12 @@ version or requirement-completion claim.
   already public, revoke it and remove it from both GitHub and Pages; do not rely
   on robots rules or a sitemap omission to conceal it.
 - The build and the deployment both check current repository visibility through
-  GitHub's **unauthenticated** API. Private repositories and failed visibility
-  checks refuse publication. Before making this repository private, disable or
+  GitHub's **unauthenticated** API. If a shared runner receives HTTP 403 or 429,
+  it instead checks GitHub's anonymous repository page: HTTP 200 at the exact
+  repository URL and unique head metadata naming this repository and marking it
+  public are all required. No token is used. Private repositories, redirects,
+  missing/duplicate/mismatched metadata and failed checks refuse publication.
+  Before making this repository private, disable or
   unpublish Pages separately: skipping a workflow does not remove an older site.
 - The artifact contains only generated HTML, a sitemap and `.nojekyll`. It never
   uploads the checkout. Pull requests test/build without Pages write permission;
@@ -53,7 +57,8 @@ compilation and require network access only to confirm public visibility.
 Tests exercise the actual Git-blob reader and output: unlisted/untracked/local
 files, symlinks, path restrictions, secrets, binary/oversize files, LFS pointers,
 HTML injection, URL encoding, sitemap coverage, complete internal-link reachability,
-old-artifact refusal and private/unknown repository checks.
+old-artifact refusal and private/unknown repository checks. Two additional tests
+exercise the shared-runner API-rate-limit fallback and its refusal cases.
 
 The Pages setting must use **GitHub Actions**. The existing CI and raw Markdown
 `docs/` tree are preserved. The public-index workflow runs on every `main` push,
@@ -99,6 +104,12 @@ boundary tests pass, the static link graph covers the sitemap, the Pages
 deployment succeeds, and public HTTP responses contain the intended HTML and
 sitemap. Search Console verification/submission is separate evidence from
 actual indexing. No person has reviewed this implementation yet.
+
+The first Pages build and its retry on 2026-11-24 passed the eight original tests
+but stopped at GitHub's anonymous API rate limit (HTTP 403). The fallback above
+was added for that observed failure; all ten tests pass, including rejection of
+private, missing, duplicate, redirected and mismatched page metadata. The public
+metadata fields were inspected on GitHub's anonymous repository page that day.
 
 Official documentation consulted on 2026-11-24:
 
