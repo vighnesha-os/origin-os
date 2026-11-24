@@ -1,4 +1,15 @@
-# Origin OS
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/origin-os-dark.svg">
+    <img src="assets/branding/origin-os-light.svg" alt="Origin OS" width="920">
+  </picture>
+</p>
+
+<p align="center">An original x86-64 operating system, written in Rust.</p>
+
+<p align="center">
+  <a href="https://github.com/vighnesha-os/origin-os/actions/workflows/ci.yml"><img src="https://github.com/vighnesha-os/origin-os/actions/workflows/ci.yml/badge.svg?branch=main&amp;event=push" alt="Test x86-64"></a>
+</p>
 
 [Browse the public source and documentation index](https://vighnesha-os.github.io/origin-os/).
 
