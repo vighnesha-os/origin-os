@@ -1,5 +1,7 @@
 # Origin OS
 
+[Browse the public source and documentation index](https://vighnesha-os.github.io/origin-os/).
+
 Origin OS is an original-source operating system for x86-64, written in Rust. It has its own kernel (the Framekernel), its own drivers and its own native SDK. It is planned as two editions of one release, Origin Desktop and Origin Server, which share one kernel, one SDK and the native desktop.
 
 It is in early development: [`docs/PROGRESS.md`](docs/PROGRESS.md) says how much is done.
