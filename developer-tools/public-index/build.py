@@ -8,11 +8,13 @@ no working-tree file is copied, and publication requires a live public-repo chec
 import argparse
 from collections import Counter
 import html
+from html.parser import HTMLParser
 import json
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 from urllib.parse import quote, urlsplit
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
@@ -48,12 +50,65 @@ def git(root, *args):
     return subprocess.check_output(["git", "-C", str(root), *args])
 
 
+class PublicMetadata(HTMLParser):
+    """Read GitHub's repository identity/visibility fields only in the page head."""
+
+    def __init__(self):
+        super().__init__()
+        self.in_head = False
+        self.fields = {}
+        self.duplicate = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "head":
+            self.in_head = True
+        if tag == "body":
+            self.in_head = False
+        data = dict(attrs)
+        name = data.get("name", "")
+        if tag == "meta" and self.in_head and name in {
+            "octolytics-dimension-repository_nwo", "octolytics-dimension-repository_public"
+        }:
+            self.duplicate |= name in self.fields
+            self.fields[name] = data.get("content")
+
+    def handle_endtag(self, tag):
+        if tag == "head":
+            self.in_head = False
+
+
+def check_public_page():
+    """An independent anonymous endpoint, for rate-limited shared Actions runners."""
+    url = "https://github.com/" + REPOSITORY
+    request = Request(url, headers={"User-Agent": "origin-public-file-index", "Cache-Control": "no-cache"})
+    with urlopen(request, timeout=30) as response:
+        if response.status != 200 or response.geturl() != url:
+            raise ValueError("Publication refused: public repository page is unavailable")
+        raw = response.read(MAX_BYTES + 1)
+    if len(raw) > MAX_BYTES:
+        raise ValueError("Publication refused: repository page exceeds the visibility-check bound")
+    metadata = PublicMetadata()
+    metadata.feed(raw.decode("utf-8"))
+    if metadata.duplicate or metadata.fields != {
+        "octolytics-dimension-repository_nwo": REPOSITORY,
+        "octolytics-dimension-repository_public": "true",
+    }:
+        raise ValueError("Publication refused: repository page does not confirm public visibility")
+
+
 def check_public():
-    """Use the unauthenticated API; a token must never make a private repo eligible."""
+    """Never use authentication to establish public visibility."""
     request = Request("https://api.github.com/repos/" + REPOSITORY,
                       headers={"Accept": "application/vnd.github+json", "User-Agent": "origin-public-file-index"})
-    with urlopen(request, timeout=30) as response:
-        metadata = json.load(response)
+    try:
+        with urlopen(request, timeout=30) as response:
+            metadata = json.load(response)
+    except HTTPError as error:
+        if error.code not in {403, 429}:
+            raise
+        check_public_page()
+        print("Confirmed public visibility through anonymous GitHub page metadata (API rate limited).")
+        return
     if metadata.get("private") is not False or metadata.get("visibility") != "public" or metadata.get("full_name") != REPOSITORY:
         raise ValueError("Publication refused: repository is not confirmed public")
 
