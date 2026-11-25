@@ -154,6 +154,8 @@ struct Setup {
     held: Vec<Hints>,
     /// The cache-hot window, in TSC ticks.
     window: u64,
+    /// Budget B18's 50 us, in TSC ticks: what [`Counts::over_b18_quiet`] counts passes against.
+    b18: u64,
 }
 
 impl Setup {
@@ -205,6 +207,7 @@ pub(crate) fn set_up(com1: &mut Console, online: &crate::smp::Online, tsc_hz: u6
             takes_part,
             held,
             window: (tsc_hz / 1_000_000).saturating_mul(balance::HOT_MICROS),
+            b18: (tsc_hz / 1_000_000).saturating_mul(50),
         })
     })();
     match made {
@@ -280,8 +283,17 @@ pub(crate) struct Counts {
     pub(crate) too_soon: AtomicU64,
     pub(crate) hot_across: AtomicU64,
     /// The longest idle pass, in TSC ticks of the processor that made it, from its start to its
-    /// halt or its pull.
+    /// halt or its pull; the longest of those that made no move, and of those that made one; the
+    /// longest move a pass made (`sched::carry`, under both queue locks); and the passes longer
+    /// than budget B18's 50 us, without a move and with one. So a boot tells a pass's own work
+    /// from a move's, and both from the host's stalls (the coordinating session's ruling on the
+    /// first boots' 1.05 ms pass).
     pub(crate) longest_pass: AtomicU64,
+    pub(crate) longest_quiet: AtomicU64,
+    pub(crate) longest_moving: AtomicU64,
+    pub(crate) longest_move: AtomicU64,
+    pub(crate) over_b18_quiet: AtomicU64,
+    pub(crate) over_b18_moving: AtomicU64,
 }
 
 /// The counts ([`Counts`]).
@@ -312,6 +324,11 @@ pub(crate) static COUNTS: Counts = Counts {
     too_soon: AtomicU64::new(0),
     hot_across: AtomicU64::new(0),
     longest_pass: AtomicU64::new(0),
+    longest_quiet: AtomicU64::new(0),
+    longest_moving: AtomicU64::new(0),
+    longest_move: AtomicU64::new(0),
+    over_b18_quiet: AtomicU64::new(0),
+    over_b18_moving: AtomicU64::new(0),
 };
 
 fn count(counter: &AtomicU64, by: u64) {
@@ -352,10 +369,11 @@ pub(crate) fn is_set_up() -> bool {
 pub(crate) fn report(com1: &mut Console, tsc_hz: u64) {
     let of = |counter: &AtomicU64| counter.load(Relaxed);
     let c = &COUNTS;
-    let nanos = u128::from(of(&c.longest_pass)) * 1_000_000_000 / u128::from(tsc_hz.max(1));
+    let nanos =
+        |counter: &AtomicU64| u128::from(of(counter)) * 1_000_000_000 / u128::from(tsc_hz.max(1));
     let _ = writeln!(
         com1,
-        "origin-kernel: balancing: counts since boot: idle passes {}, {} with no crowded processor to look at, {} with a thread of their own ready; pulls {} ({} cache-hot, {} carrying a pending wake-up, {} of a thread moved before); looks that took nothing {}, given up at a held queue lock {}; threads passed over: pinned {}, moved too recently {}, cache-hot {}, not published {}; moves refused {}, passes stopped {}; kicks {} at ticks, {} at reschedule upcalls, {} at wake-ups or spawns, not sent: {} over the rate, {} with nobody idle; asks {} sent, not sent: {} with the source asked already, {} over the rate; longest idle pass {nanos} ns",
+        "origin-kernel: balancing: counts since boot: idle passes {}, {} with no crowded processor to look at, {} with a thread of their own ready; pulls {} ({} cache-hot, {} carrying a pending wake-up, {} of a thread moved before); looks that took nothing {}, given up at a held queue lock {}; threads passed over: pinned {}, moved too recently {}, cache-hot {}, not published {}; moves refused {}, passes stopped {}; kicks {} at ticks, {} at reschedule upcalls, {} at wake-ups or spawns, not sent: {} over the rate, {} with nobody idle; asks {} sent, not sent: {} with the source asked already, {} over the rate; longest idle pass {} ns: without a move {} ns, with one {} ns, the move itself {} ns; passes over B18's 50 us: {} without a move, {} with one",
         of(&c.passes),
         of(&c.no_victim),
         of(&c.own),
@@ -379,6 +397,12 @@ pub(crate) fn report(com1: &mut Console, tsc_hz: u64) {
         of(&c.asks),
         of(&c.asks_not_first),
         of(&c.asks_over_rate),
+        nanos(&c.longest_pass),
+        nanos(&c.longest_quiet),
+        nanos(&c.longest_moving),
+        nanos(&c.longest_move),
+        of(&c.over_b18_quiet),
+        of(&c.over_b18_moving),
     );
 }
 
@@ -418,12 +442,10 @@ pub(super) fn idle(_flow: Pinned<'_>) {
         let (passed, owed) = cpu::without_interrupts_off(|off| {
             let me = cpu::this_cpu(off.here());
             let start = rdtsc();
-            let mut owed = None;
-            let passed = pass(off, me, &mut owed);
+            let (mut owed, mut carried) = (None, 0);
+            let passed = pass(off, me, &mut owed, &mut carried);
             // Both readings are this processor's.
-            COUNTS
-                .longest_pass
-                .fetch_max(rdtsc().saturating_sub(start), Relaxed);
+            timed(rdtsc().saturating_sub(start), carried);
             (passed, owed)
         });
         match passed {
@@ -446,11 +468,27 @@ pub(super) fn idle(_flow: Pinned<'_>) {
     }
 }
 
-/// One pass of the idle pull on this processor.
+/// Keeps a pass's time, `took` TSC ticks, of which `carried` in a move ([`Counts::longest_pass`]).
+fn timed(took: u64, carried: u64) {
+    let c = &COUNTS;
+    c.longest_pass.fetch_max(took, Relaxed);
+    let over = SETUP.get().is_some_and(|setup| took > setup.b18);
+    if carried == 0 {
+        c.longest_quiet.fetch_max(took, Relaxed);
+        count(&c.over_b18_quiet, u64::from(over));
+    } else {
+        c.longest_moving.fetch_max(took, Relaxed);
+        c.longest_move.fetch_max(carried, Relaxed);
+        count(&c.over_b18_moving, u64::from(over));
+    }
+}
+
+/// One pass of the idle pull on this processor. `carried` gains the TSC ticks of a move it makes.
 fn pass(
     off: InterruptsOff<'_>,
     me: ThisCpu<'_>,
     owed: &mut Option<(pinned::Trigger, CpuIndex)>,
+    carried: &mut u64,
 ) -> Passed {
     let Some(setup) = SETUP.get() else {
         return Passed::Halt;
@@ -503,7 +541,7 @@ fn pass(
             *slot = victim.cpu;
         }
         looked += 1;
-        match pull_from(off, me, victim, setup, owed) {
+        match pull_from(off, me, victim, setup, owed, carried) {
             Pull::Made => {
                 own.leave_idle();
                 held.clear_all();
@@ -577,6 +615,7 @@ fn pull_from(
     victim: Victim,
     setup: &Setup,
     owed: &mut Option<(pinned::Trigger, CpuIndex)>,
+    carried: &mut u64,
 ) -> Pull {
     let to = me.index();
     let (Some(from), Some(step)) = (
@@ -701,6 +740,7 @@ fn pull_from(
         count(&COUNTS.hot_across, 1);
     }
     let again = source.since_arrival(candidate.slot).is_some();
+    let began = rdtsc();
     let moved = super::carry(
         off,
         placed.record(),
@@ -709,6 +749,7 @@ fn pull_from(
         (from, &mut *source),
         (to, &mut *destination),
     );
+    *carried = carried.saturating_add(rdtsc().saturating_sub(began));
     publish(from.get(), source, setup);
     publish(to.get(), destination, setup);
     drop((source_guard, destination_guard));
