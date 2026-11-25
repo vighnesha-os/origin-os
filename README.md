@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/origin-os-dark.svg">
-    <img src="assets/branding/origin-os-light.svg" alt="Origin OS" width="920">
-  </picture>
+  <img src="assets/branding/origin-os-atom-horizontal-4k.png" alt="Origin Operating System — atom logo" width="920">
 </p>
 
 <p align="center">An original x86-64 operating system, written in Rust.</p>
