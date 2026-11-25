@@ -4,7 +4,7 @@
 
 <p align="center">An original x86-64 operating system, written in Rust.</p>
 
-<p align="center">Maintainer: <a href="https://github.com/vighnesha-os">VIGHNESHA BOJJA</a></p>
+<p align="center">Founder and Maintainer: <a href="https://github.com/vighnesha-os">VIGHNESHA BOJJA</a></p>
 
 <p align="center">
   <a href="https://github.com/vighnesha-os/origin-os/actions/workflows/ci.yml"><img src="https://github.com/vighnesha-os/origin-os/actions/workflows/ci.yml/badge.svg?branch=main&amp;event=push" alt="Test x86-64"></a>
@@ -87,5 +87,6 @@ Origin OS is licensed under either of
 - the MIT License ([LICENSE-MIT](LICENSE-MIT)),
 
 at your option. Third-party test data in this repository keeps its own licence, stated beside it.
+
 
 
