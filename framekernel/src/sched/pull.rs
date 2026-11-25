@@ -79,10 +79,10 @@
 //!
 //! A pull takes the two run-queue locks in CPU-index order, then the move gate, inside
 //! `cpu::move_context`; it takes no other lock, frees nothing and drops no stack, so no TLB
-//! shootdown starts under a queue lock (S7, "Locks"). It does not wait long for either queue
-//! lock: after [`LOCK_TRIES`] tries it leaves that victim for this pass, so that many idle
-//! processors that look at one crowded one at the same tick do not queue on its lock with
-//! interrupts off (the review's R98-7). A kick is made under its own processor's queue lock
+//! shootdown starts under a queue lock (S7, "Locks"). It does not wait for either queue lock:
+//! with one try, held, it leaves that victim for this pass, so that many idle processors that
+//! look at one crowded one at the same tick do not queue on its lock with interrupts off (the
+//! review's R98-7; the coordinating session's ruling of 2026-11-25). A kick is made under its own processor's queue lock
 //! alone. The published elements and the hints are atomics.
 //!
 //! # Interrupts off
@@ -92,7 +92,12 @@
 //! coordinating session's ruling of 2026-11-25, which found the pass first built as one section).
 //! The last section publishes that the processor is idle, reads who is crowded once more, looks
 //! at what it found, and ends in the halt (`sti; hlt`), so no interrupt can fall between that
-//! read and the halt: one that arrives meanwhile ends the halt at once. Each section's time is
+//! read and the halt: one that arrives meanwhile ends the halt at once. A look takes a queue
+//! lock with one try and no pause, and leaves a victim whose lock is held ([`LOCK_TRIES`]). An
+//! ask is decided and this processor's interrupt claimed inside a section, and sent after it,
+//! with interrupts on; the last section then looks at the asked processor once more, so that an
+//! answer that came in between is taken. No kick is sent from a pass: kicks are sent by the
+//! scheduler's upcalls and by wake-ups, inside their own sections. Each section's time is
 //! kept against budget B18, the pass's whole length as a trend ([`Counts::longest_pass`]). The
 //! idle flow runs with interrupts on outside its sections, as it did before this item: its reap is
 //! preemptible (`run_ap`; the review's D98-2).
@@ -135,8 +140,10 @@ use crate::timer;
 
 /// Victims an idle pass looks at under their locks before it halts.
 const TRIES: usize = 3;
-/// Tries at one queue lock before a pass leaves that victim (the module documentation, "Locks").
-const LOCK_TRIES: u32 = 64;
+/// Tries at one queue lock before a look leaves that victim (the module documentation, "Locks"):
+/// one, with no pause, so that a look never waits for a busy processor (the coordinating
+/// session's ruling of 2026-11-25).
+const LOCK_TRIES: u32 = 1;
 /// More levels than a processor's plan can have: one for each kind of scheduling domain, and one
 /// to spare ([`kick`]'s table of them).
 const LEVELS: usize = 8;
@@ -377,7 +384,7 @@ pub(crate) fn report(com1: &mut Console, tsc_hz: u64) {
         |counter: &AtomicU64| u128::from(of(counter)) * 1_000_000_000 / u128::from(tsc_hz.max(1));
     let _ = writeln!(
         com1,
-        "origin-kernel: balancing: counts since boot: idle passes {}, {} with no crowded processor to look at, {} with a thread of their own ready; pulls {} ({} cache-hot, {} carrying a pending wake-up, {} of a thread moved before); looks that took nothing {}, given up at a held queue lock {}; threads passed over: pinned {}, moved too recently {}, cache-hot {}, not published {}; moves refused {}, passes stopped {}; kicks {} at ticks, {} at reschedule upcalls, {} at wake-ups or spawns, not sent: {} over the rate, {} with nobody idle; asks {} sent, not sent: {} with the source asked already, {} over the rate; longest idle pass {} ns; its interrupts-off sections: the longest without a move {} ns, with one {} ns, the move itself {} ns; sections over B18's 50 us: {} without a move, {} with one",
+        "origin-kernel: balancing: counts since boot: idle passes {}, {} with no crowded processor to look at, {} with a thread of their own ready; pulls {} ({} cache-hot, {} carrying a pending wake-up, {} of a thread moved before); looks that took nothing {}, skipped as busy (its queue lock held) {}; threads passed over: pinned {}, moved too recently {}, cache-hot {}, not published {}; moves refused {}, passes stopped {}; kicks {} at ticks, {} at reschedule upcalls, {} at wake-ups or spawns, not sent: {} over the rate, {} with nobody idle; asks {} sent, not sent: {} with the source asked already, {} over the rate; longest idle pass {} ns; its interrupts-off sections: the longest without a move {} ns, with one {} ns, the move itself {} ns; sections over B18's 50 us: {} without a move, {} with one",
         of(&c.passes),
         of(&c.no_victim),
         of(&c.own),
@@ -521,6 +528,8 @@ fn pass(
     count(&COUNTS.passes, 1);
     let mut tried = [u32::MAX; TRIES];
     let (mut looked, mut cleared) = (0, false);
+    // The processor this pass asked, if it asked one: the last section looks at it again.
+    let mut asked: Option<u32> = None;
     // A look at the victim `choose` finds, in a section of its own.
     let look = |tried: &[u32; TRIES], owed: &mut Option<(pinned::Trigger, CpuIndex)>| {
         cpu::without_interrupts_off(|off| {
@@ -559,75 +568,147 @@ fn pass(
         }
         looked += 1;
         match settle_look(cpu, pulled, own, held) {
-            Some(run) => return finish(start, run, owed),
-            None => continue,
+            Then::Run => return finish(start, true, owed),
+            Then::Halt => return finish(start, false, owed),
+            Then::Next => {}
+            Then::Ask(cpu, apic_id) => {
+                // The section has ended: the ask goes out with interrupts on, and this processor
+                // then idles (ADR-0020 Amendment 1, step 1), by way of the last section.
+                timer::send_reschedule_ipi(me, apic_id);
+                asked = Some(cpu);
+                break;
+            }
         }
     }
-    // The last section: publish idle, read who is crowded once more, look at what it found, and
-    // halt, in one stretch with interrupts off.
-    cpu::without_interrupts(|| {
-        let (run, done) = cpu::without_interrupts_off(|off| {
-            let began = rdtsc();
-            let allowed = |cpu: u32, _: usize| {
-                setup.takes_part(cpu as usize) && !tried.contains(&cpu) && !held.test(cpu as usize)
-            };
-            let found =
-                published::idle_then_choose(mine, own, &setup.masks, levels, element, allowed);
-            let mut carried = 0;
-            let settled = found.map(|victim| {
-                let pulled = pull_from(off, me, victim, setup, owed, &mut carried);
-                settle_look(victim.cpu, pulled, own, held)
-            });
-            sectioned(rdtsc().saturating_sub(began), carried);
-            match settled.flatten() {
-                Some(true) => (true, true),
-                _ => (false, owed.is_some()),
+    // The last section, twice at most: a second only after the first asked a processor, whose
+    // answer the second then looks for.
+    for _ in 0..2 {
+        match last(me, setup, start, &tried, asked, owed) {
+            Last::Run => return true,
+            Last::Idled => return false,
+            Last::Ask(cpu, apic_id) => {
+                timer::send_reschedule_ipi(me, apic_id);
+                asked = Some(cpu);
             }
-        });
-        COUNTS
-            .longest_pass
-            .fetch_max(rdtsc().saturating_sub(start), Relaxed);
-        if !done {
-            // With interrupts still off: one that came since the read ends the halt at once.
-            cpu::idle_disabling();
         }
-        run
-    })
+    }
+    // Two asks in one pass: no halt this time; the idle flow's next pass halts.
+    false
 }
 
-/// What a look at victim `cpu` that came to `pulled` means for the pass: `Some(true)` to run a
-/// thread, `Some(false)` to end the pass and halt, `None` to look at the next victim.
-fn settle_look(cpu: u32, pulled: Pull, own: &Element, held: &Hints) -> Option<bool> {
+/// What a look at a victim means for the pass.
+enum Then {
+    /// Run a thread: one was pulled, or one of this processor's own is ready.
+    Run,
+    /// End the pass and halt: moves are withdrawn, or this queue has no room.
+    Halt,
+    /// Look at the next victim.
+    Next,
+    /// Ask processor `.0` to publish, by a reschedule interrupt to APIC ID `.1` that the caller
+    /// sends once its section has ended; this processor's balancing interrupt is claimed already.
+    Ask(u32, u32),
+}
+
+/// What a look at victim `cpu` that came to `pulled` means for the pass.
+fn settle_look(cpu: u32, pulled: Pull, own: &Element, held: &Hints) -> Then {
     match pulled {
         Pull::Made => {
             own.leave_idle();
             held.clear_all();
-            Some(true)
+            Then::Run
         }
         Pull::Own => {
             count(&COUNTS.own, 1);
             own.leave_idle();
-            Some(true)
+            Then::Run
         }
         Pull::Stop => {
             count(&COUNTS.stopped, 1);
-            Some(false)
+            Then::Halt
         }
-        // The source was asked to publish: this processor idles, and the source's kick wakes it
-        // (ADR-0020 Amendment 1, step 1: "it then idles"). The source is passed over until the
-        // others have had their turn, so that a processor whose asks another always answers
-        // first still reaches the rest (the review's D98-1).
-        Pull::Asked => {
+        // The source is asked to publish: this processor idles, and the source's kick wakes it
+        // (ADR-0020 Amendment 1, step 1: "it then idles"). The source is passed over in later
+        // passes until the others have had their turn, so that a processor whose asks another
+        // always answers first still reaches the rest (the review's D98-1).
+        Pull::Asked(apic_id) => {
             held.set(cpu as usize);
-            Some(false)
+            Then::Ask(cpu, apic_id)
         }
         Pull::Nothing => {
             count(&COUNTS.nothing, 1);
             held.set(cpu as usize);
-            None
+            Then::Next
         }
-        Pull::Later => None,
+        Pull::Later => Then::Next,
     }
+}
+
+/// What the last section came to.
+enum Last {
+    /// A thread to run.
+    Run,
+    /// The processor halted and has woken, or a pinned-mode line is owed and it did not halt.
+    Idled,
+    /// A processor to ask, after the section: it did not halt.
+    Ask(u32, u32),
+}
+
+/// The pass's last section (the module documentation, "Interrupts off"): this processor
+/// publishes that it is idle, reads who is crowded once more, looks at what that read found, and
+/// halts, in one stretch with interrupts off. Besides those `tried` does not hold and this flow
+/// does not pass over, the read may find `asked`, the processor this pass has just asked: its
+/// answer may have come already, and the look then takes the thread it published.
+fn last(
+    me: ThisCpu<'_>,
+    setup: &Setup,
+    start: u64,
+    tried: &[u32; TRIES],
+    asked: Option<u32>,
+    owed: &mut Option<(pinned::Trigger, CpuIndex)>,
+) -> Last {
+    let index = me.index().get();
+    let (Some(own), Some(levels), Some(held), Ok(mine)) = (
+        BALANCE.this(me),
+        setup.levels.get(index),
+        setup.held.get(index),
+        u32::try_from(index),
+    ) else {
+        halt();
+        return Last::Idled;
+    };
+    cpu::without_interrupts(|| {
+        let then = cpu::without_interrupts_off(|off| {
+            let began = rdtsc();
+            let allowed = |cpu: u32, _: usize| {
+                setup.takes_part(cpu as usize)
+                    && (asked == Some(cpu) || (!tried.contains(&cpu) && !held.test(cpu as usize)))
+            };
+            let found =
+                published::idle_then_choose(mine, own, &setup.masks, levels, element, allowed);
+            let mut carried = 0;
+            let then = found.map(|victim| {
+                let pulled = pull_from(off, me, victim, setup, owed, &mut carried);
+                settle_look(victim.cpu, pulled, own, held)
+            });
+            sectioned(rdtsc().saturating_sub(began), carried);
+            then
+        });
+        COUNTS
+            .longest_pass
+            .fetch_max(rdtsc().saturating_sub(start), Relaxed);
+        match then {
+            Some(Then::Run) => Last::Run,
+            Some(Then::Ask(cpu, apic_id)) => Last::Ask(cpu, apic_id),
+            _ => {
+                if owed.is_none() {
+                    // With interrupts still off: one that came since the read ends the halt at
+                    // once.
+                    cpu::idle_disabling();
+                }
+                Last::Idled
+            }
+        }
+    })
 }
 
 /// Ends a pass before its last section: keeps its length and, unless it is to run a thread or a
@@ -649,27 +730,23 @@ enum Pull {
     /// Nothing there for this processor: the next victim, and this one after the others
     /// (`Setup::held`).
     Nothing,
-    /// Not now: a queue lock was held for longer than a pass waits, or an ask was held back by
+    /// Not now: a queue lock was held at the look's one try, or an ask was held back by
     /// one of its bounds. The next victim, and this one again at the next pass.
     Later,
     /// A thread of this processor's own became ready meanwhile: it runs that.
     Own,
     /// This pass is over: moves are withdrawn, this queue has no room, or a move was refused.
     Stop,
-    /// A thread this processor could otherwise take is not published, and its source was asked
-    /// to publish it (ADR-0020 Amendment 1). This pass is over.
-    Asked,
+    /// A thread this processor could otherwise take is not published, and its source is to be
+    /// asked to publish it (ADR-0020 Amendment 1): this processor's balancing interrupt is
+    /// claimed, and the caller sends it to the APIC ID here once its section has ended.
+    Asked(u32),
 }
 
-/// Takes `lock` if it comes free within [`LOCK_TRIES`] tries; counts a look given up if not.
+/// Takes `lock` within [`LOCK_TRIES`] tries (`origin_sync::balance::take_within`); counts a look
+/// given up if not.
 fn take<T>(lock: &SpinLock<T>) -> Option<SpinGuard<'_, T>> {
-    let guard = (0..LOCK_TRIES).find_map(|_| {
-        let guard = lock.try_lock();
-        if guard.is_none() {
-            core::hint::spin_loop();
-        }
-        guard
-    });
+    let guard = published::take_within(lock, LOCK_TRIES);
     if guard.is_none() {
         count(&COUNTS.contended, 1);
     }
@@ -790,15 +867,16 @@ fn pull_from(
             count(&COUNTS.asks_not_first, 1);
             return Pull::Later;
         }
-        source.note_ask();
-        // The source takes its own queue's lock in the upcall the ask causes: it is let go first.
-        drop(source_guard);
-        if !timer::send_balance_ipi(me, apic_id) {
+        // This processor's interrupt is claimed with the source's mark, in the same section, so a
+        // source is never marked by a processor that then cannot send. The send itself is the
+        // caller's, after the section ends.
+        if !timer::claim_balance_ipi(me) {
             return Pull::Later;
         }
+        source.note_ask();
         destination.note_sent();
         count(&COUNTS.asks, 1);
-        return Pull::Asked;
+        return Pull::Asked(apic_id);
     };
     // Counted apart from the tests above ([`Counts::too_soon`]).
     if !source.settled(candidate.slot, step.period) {
