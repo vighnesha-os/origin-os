@@ -282,6 +282,18 @@ pub fn send_balance_ipi(me: crate::cpu::ThisCpu<'_>, apic_id: u32) -> bool {
     true
 }
 
+/// Claims this processor's one balancing interrupt for this tick without sending it, as
+/// [`send_balance_ipi`] would: `true` if it was free, and the caller then sends it with
+/// [`send_reschedule_ipi`] from this processor once its interrupts-off section has ended (ADR-0020
+/// Amendment 1's ask; the coordinating session's ruling of 2026-11-25). `false`, and nothing
+/// claimed, if this processor has sent or claimed one since its last tick. `me` is this processor,
+/// read with interrupts off.
+pub fn claim_balance_ipi(me: crate::cpu::ThisCpu<'_>) -> bool {
+    BALANCE_SENT
+        .this(me)
+        .is_some_and(crate::sync::balance::Rate::take)
+}
+
 /// Whether this processor has sent its one balancing interrupt for this tick, so that
 /// [`send_balance_ipi`] would refuse: for a caller that must mark something as asked before it
 /// sends (ADR-0020 Amendment 1), and must not mark it and then find it cannot send. `me` is this
