@@ -100,11 +100,13 @@
 //! and both movers always find a thread waiting.
 //!
 //! Each phase counts from when every one of its threads has started, runs for [`SECONDS`], and
-//! goes on until what it requires was seen, within [`COVER_SECONDS`]:
+//! goes on until what it tests was seen, within [`COVER_SECONDS`]:
 //!
-//! - for integrity, at least one pull of a thread that had been moved to its processor before:
-//!   its processor has then ticked since it arrived, so the move rate's test passed on a real
-//!   stamp, where a first pull can be of a thread that has never run;
+//! - for integrity, at least one pull of a thread that had been moved to its processor before
+//!   (its processor has then ticked since it arrived, so the move rate's test passed on a real
+//!   stamp, where a first pull can be of a thread that has never run), and at least one thread
+//!   moved while it held its word. Without both by the budget's end the phase fails as not
+//!   exercised: pullers taking threads from a crowded queue is progress the kernel must make;
 //! - for delivery, at least one **wake-up that crossed a pull with its token untaken** (the
 //!   review's D98-3), counted by the two threads that know: after its wake-up for a token, the
 //!   sender marks the receiver if it then finds it on the start processor
@@ -115,9 +117,15 @@
 //!   nothing meanwhile. If that pull dropped the wake-up, the receiver now blocks for good and
 //!   the drain fails. The kernel's own count of pulls that carried any pending wake-up
 //!   (`pull::Counts::pulls_carrying`) is printed beside it; it includes stale ones, and is not
-//!   the condition.
+//!   the condition. A crossing is a race the kernel does not promise, so a correct kernel could
+//!   reach the budget without one: the line then says "not exercised", and the phase neither
+//!   fails nor withdraws moves for it. `xtask`'s markers require "exercised" on every QEMU
+//!   machine with two or more processors, 65 and 67 included, and forgive nothing there (the
+//!   coordinating session's ruling T1-5, as the ACPI census's precedent: the kernel reports, and
+//!   `xtask` requires it on QEMU).
 //!
-//! Both phases also fail if a bound of the balancer was passed, as the run queues counted it
+//! Both phases also fail where more than [`PULLERS_MOST`] processors were left to pull, which is
+//! [`occupied`]'s construction built wrong, and if a bound of the balancer was passed, as the run queues counted it
 //! against their own ticks: more than one balancing interrupt sent by one processor in one tick,
 //! more than one ask taken by one processor in one tick (ADR-0020 Amendment 1), a thread pulled
 //! sooner than its move's period, or a cache-hot thread pulled across caches (S10). And they fail
@@ -1589,6 +1597,17 @@ fn occupied(cpus: &[CpuIndex], source: CpuIndex) -> Vec<CpuIndex> {
         .unwrap_or_default()
 }
 
+/// The processors left free to pull in a pulled phase: every one that takes part but the boot
+/// processor, `source` and the `occupants` [`occupied`] named. At most [`PULLERS_MOST`] by
+/// [`occupied`]'s construction; both phases hold it as a condition, so that a phase built with
+/// more fails as built wrong (the coordinating session's ruling R1 on the diagnostic round).
+fn pullers(cpus: &[CpuIndex], source: CpuIndex, occupants: usize) -> usize {
+    cpus.iter()
+        .filter(|&&cpu| cpu != CpuIndex::BOOT && cpu != source)
+        .count()
+        .saturating_sub(occupants)
+}
+
 /// A pulled phase's occupant: a pinned thread that keeps its processor from being idle and halts
 /// between its interrupts until released, so that it is busy to the scheduler and costs the host
 /// nothing.
@@ -1858,14 +1877,25 @@ fn integrity_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc
     );
     let mut pulled = Pulled::begin();
     shared.run_for(COVER_SECONDS + SECONDS + PHASE_SECONDS);
+    // What the phase tests, both of which must happen within its budget: a pull of a thread moved
+    // before, and a thread moved while it held its word (the coordinating session's ruling T1-5).
+    let held_and_moved = || {
+        shared
+            .pulled
+            .as_ref()
+            .is_some_and(|p| p.moved_holding.load(Ordering::Relaxed) >= 1)
+    };
     if spawned {
         pull_back_for(flow, &shared, source, online, tsc_hz, &mut pulled, |c| {
-            c.again >= 1
+            c.again >= 1 && held_and_moved()
         });
     }
     if spawned && pulled.reached_after.is_none() {
         // Report only, so that the failure explains itself: where every thread is.
-        describe_stuck(&shared, "no pull of a thread moved before was seen");
+        describe_stuck(
+            &shared,
+            "no pull of a thread moved before, or no thread moved while it held its word, was seen",
+        );
     }
     shared.stop.store(true, Ordering::Release);
     for pair in &shared.pairs {
@@ -1892,6 +1922,9 @@ fn integrity_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc
     let (did, bounds) = (pulled.counts(), Bounds::read());
     let (back, unsettled) = bracket_after(settled_before, before, tsc_hz);
     let pinned_mode = pinned::entered();
+    let free = pullers(&cpus, source, occupants);
+    // Not exercised: no pull of a thread moved before, or no thread moved while it held its word.
+    let exercised = did.again >= 1 && moved_holding >= 1;
     let ok = spawned
         && ended
         && vacated
@@ -1899,12 +1932,13 @@ fn integrity_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc
         && changed == 0
         && unready == 0
         && back
-        && did.again >= 1
+        && exercised
+        && free <= PULLERS_MOST
         && bounds.hold()
         && pinned_mode.is_none();
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: thread migration: integrity, pulled: {threads} threads declared for balancing, run with interrupts on, started on CPU {source} of {} processors, {occupants} of them occupied; {} pulls by idle processors, {} of a thread moved before, {} asks, kicks {} at ticks, {} at reschedule upcalls and {} at wake-ups or spawns, {} moves back by the boot flow ({} refused); threads moved while they held their word {moved_holding}; a second processor in a context {failed_swaps} times, canaries changed {changed} times, threads run before their state existed {unready}; a pull of a thread moved before: {}; {}; spawned {spawned}; ended {ended}; occupants ended {vacated}; heap, frames and stacks back {back}{}{}{}",
+        "origin-kernel: scheduler: thread migration: integrity, pulled: {threads} threads declared for balancing, run with interrupts on, started on CPU {source} of {} processors, {occupants} of them occupied, {free} left to pull (at most {PULLERS_MOST}); {} pulls by idle processors, {} of a thread moved before, {} asks, kicks {} at ticks, {} at reschedule upcalls and {} at wake-ups or spawns, {} moves back by the boot flow ({} refused); threads moved while they held their word {moved_holding}{}; a second processor in a context {failed_swaps} times, canaries changed {changed} times, threads run before their state existed {unready}; a pull of a thread moved before: {}; {}; spawned {spawned}; ended {ended}; occupants ended {vacated}; heap, frames and stacks back {back}{}{}{}",
         cpus.len(),
         did.pulls,
         did.again,
@@ -1914,6 +1948,7 @@ fn integrity_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc
         did.kicks_here,
         pulled.back,
         pulled.back_refused,
+        if exercised { "" } else { " (not exercised)" },
         pulled.reached(tsc_hz),
         bounds.line(tsc_hz),
         match pinned_mode {
@@ -1928,9 +1963,12 @@ fn integrity_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc
 
 /// Delivery's second phase: its receivers, declared for balancing, pulled by the idle processors
 /// while one pinned sender on their start processor posts to them (the module documentation,
-/// "Pulled"). It passes on every token posted being taken, on at least one wake-up that crossed
-/// a pull with its token untaken, and on the balancer's bounds. A failure enters pinned mode, as
-/// the first phase's does.
+/// "Pulled"). It passes on every token posted being taken and on the balancer's bounds. A failure
+/// enters pinned mode, as the first phase's does. It runs until a wake-up crosses a pull with its
+/// token untaken, or for its budget: a crossing is a race the kernel does not promise, so its
+/// line says "not exercised" without one and the phase withdraws nothing for it; `xtask`'s
+/// markers require the crossing on every QEMU machine (the coordinating session's ruling T1-5,
+/// as the ACPI census's precedent).
 fn delivery_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc_hz: u64) -> bool {
     let cpus = taking_part(online);
     if let Some(pass) = pulled_cannot_run(com1, "delivery", &cpus) {
@@ -2028,13 +2066,14 @@ fn delivery_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc_
     let (did, bounds) = (pulled.counts(), Bounds::read());
     let (back, unsettled) = bracket_after(settled_before, before, tsc_hz);
     let entered_before = pinned::entered().is_some() && !entered_here;
+    let free = pullers(&cpus, source, occupants);
     let ok = spawned
         && delivered
         && posted == taken
         && ended
         && vacated
         && back
-        && crossed >= 1
+        && free <= PULLERS_MOST
         && bounds.hold()
         && !entered_before;
     if !ok && !entered_here {
@@ -2043,7 +2082,7 @@ fn delivery_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc_
     let pinned_mode = pinned::entered();
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: thread migration: delivery, pulled: {receivers} receivers declared for balancing and one pinned sender, started on CPU {source} of {} processors, {occupants} of them occupied; {posted} tokens posted, {taken} taken, {short} receivers short; {} pulls by idle processors, {} carrying a pending wake-up, {} of a thread moved before, {} asks, kicks {} at ticks, {} at reschedule upcalls and {} at wake-ups or spawns, {} moves back by the boot flow ({} refused); wake-ups that crossed a pull with their token untaken {crossed}: {}; {}; spawned {spawned}; ended {ended}; occupants ended {vacated}; heap, frames and stacks back {back}{}{}{}",
+        "origin-kernel: scheduler: thread migration: delivery, pulled: {receivers} receivers declared for balancing and one pinned sender, started on CPU {source} of {} processors, {occupants} of them occupied, {free} left to pull (at most {PULLERS_MOST}); {posted} tokens posted, {taken} taken, {short} receivers short; {} pulls by idle processors, {} carrying a pending wake-up, {} of a thread moved before, {} asks, kicks {} at ticks, {} at reschedule upcalls and {} at wake-ups or spawns, {} moves back by the boot flow ({} refused); wake-ups that crossed a pull with their token untaken {crossed}: {}; {}; spawned {spawned}; ended {ended}; occupants ended {vacated}; heap, frames and stacks back {back}{}{}{}",
         cpus.len(),
         did.pulls,
         did.carrying,
@@ -2054,7 +2093,13 @@ fn delivery_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc_
         did.kicks_here,
         pulled.back,
         pulled.back_refused,
-        pulled.reached(tsc_hz),
+        match pulled.reached_after {
+            Some(after) => alloc::format!(
+                "exercised, after {} ms",
+                nanos(after, tsc_hz) / 1_000_000
+            ),
+            None => alloc::format!("not exercised in {COVER_SECONDS} s"),
+        },
         bounds.line(tsc_hz),
         match pinned_mode {
             Some((trigger, _)) => alloc::format!("; pinned mode entered: {trigger:?}"),

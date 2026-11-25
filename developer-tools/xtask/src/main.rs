@@ -2842,6 +2842,20 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             "origin-kernel: scheduler: thread migration: delivery: ".into(),
             "origin-kernel: scheduler: thread migration: delivery, pulled: ".into(),
         ])
+        .chain(if cpus >= 2 {
+            // Delivery's pulled phase saw a wake-up cross a pull with its token untaken. The
+            // kernel cannot promise that race, so its line says "not exercised" without one and
+            // the phase passes; on QEMU, where every machine with two or more processors has
+            // shown it, it is required here, on every one, 65 and 67 included, and nothing
+            // forgives its absence (the coordinating session's ruling T1-5 on TASKS item 98, as
+            // the ACPI census's precedent).
+            vec![
+                " with their token untaken ".into(),
+                ": exercised, after ".into(),
+            ]
+        } else {
+            Vec::new()
+        })
         .chain([
             // ADR-0017 Z3: the scheduler noted each change of process, with one barrier for
             // each where the processor has IBPB and none where it has not.
@@ -9795,6 +9809,47 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
         assert!(guest_is_intel("max", Accel::Kvm, true));
         assert!(!guest_is_intel("max", Accel::Kvm, false));
         assert!(guest_is_intel("host", Accel::Kvm, true));
+    }
+
+    /// The migration proofs and their pulled phases (TASKS items 96 and 98) are never forgiven, on
+    /// any machine, 65 and 67 included: their failures are neither KVM's allowances nor the
+    /// oversubscribed fair share (the coordinating session's rulings R1 and T1-5). And where two
+    /// or more processors take part, a delivery line that saw no wake-up cross a pull leaves the
+    /// boot's markers unmet.
+    #[test]
+    fn the_pulled_phases_are_never_forgiven() {
+        let failing = [
+            "origin-kernel: scheduler: thread migration: integrity, pulled: 12 threads declared for balancing, run with interrupts on, started on CPU 1 of 65 processors, 59 of them occupied, 4 left to pull (at most 4); 0 pulls by idle processors, 0 of a thread moved before, 0 asks, kicks 0 at ticks, 0 at reschedule upcalls and 0 at wake-ups or spawns, 0 moves back by the boot flow (0 refused); threads moved while they held their word 0 (not exercised); a second processor in a context 0 times, canaries changed 0 times, threads run before their state existed 0; a pull of a thread moved before: no, in 30 s; bounds since boot: held true; spawned true; ended true; occupants ended true; heap, frames and stacks back true: scheduler failed",
+            "origin-kernel: scheduler: thread migration: delivery, pulled: 12 receivers declared for balancing and one pinned sender, started on CPU 1 of 67 processors, 61 of them occupied, 4 left to pull (at most 4); 264 tokens posted, 263 taken, 1 receivers short: scheduler failed",
+            "origin-kernel: scheduler: thread migration: integrity: 8 movable threads on 4 processors, 1563 moves: scheduler failed",
+            "origin-kernel: scheduler: thread migration: delivery: 8 movable receivers and 4 pinned senders: scheduler failed",
+            "origin-kernel: scheduler: thread migration: integrity, pulled: balancing is not set up: nothing to pull: scheduler failed",
+        ];
+        for line in failing {
+            for accel in [Accel::Tcg, Accel::Kvm] {
+                for oversubscribed in [false, true] {
+                    assert!(!checker_forgives(line, accel, oversubscribed), "{line}");
+                }
+            }
+        }
+        let settings = Settings::default();
+        let m = machine(&settings);
+        assert!(m.cpus() >= 2);
+        let s = boot_scenario_markers(&m, &settings);
+        let at = s
+            .markers
+            .iter()
+            .position(|x| x == "origin-kernel: scheduler: thread migration: delivery, pulled: ")
+            .unwrap();
+        let window: Vec<&str> = s.markers[at..at + 3].iter().map(String::as_str).collect();
+        assert_eq!(window[1..], [" with their token untaken ", ": exercised, after "]);
+        let log = |said: &str| {
+            format!(
+                "origin-kernel: scheduler: thread migration: delivery, pulled: 12 receivers declared for balancing and one pinned sender; wake-ups that crossed a pull with their token untaken {said}; bounds since boot: held true\norigin-kernel: ibpb: \n"
+            )
+        };
+        assert!(serial::contains_in_order(&log("1: exercised, after 200 ms"), &window));
+        assert!(!serial::contains_in_order(&log("0: not exercised in 30 s"), &window));
     }
 
     /// As the kernel printed them on a real AMD EPYC (Actions run 42547942738).
