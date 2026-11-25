@@ -20,7 +20,7 @@
 #
 # Neither kind of boot below qualifies anything (§74, rule 30): the devices and the firmware are
 # QEMU's, and the processors are whatever GitHub's fleet holds, not the declared hardware.
-name: ci
+name: Test x86-64
 
 on:
   pull_request:

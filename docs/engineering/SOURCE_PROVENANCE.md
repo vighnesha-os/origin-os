@@ -1,3 +1,12 @@
+
+
+## Public source and documentation index (2026-11-24)
+
+- Task: `PUBLIC-INDEX-2026-11-24`, requested by the repository owner to publish appropriate public files through GitHub Pages and submit a sitemap in Google Search Console.
+- Source: `developer-tools/public-index/` and `.github/workflows/public-index.yml`; Codex, original host-side Python using the standard library and Git. MIT OR Apache-2.0; no copied OS source, no added crate, no shipping dependency, no OS ABI or release-version change.
+- Contract, consulted official specifications, dependencies, tests and known publication/search limits: `developer-tools/public-index/README.md`. The explicit file allowlist is committed; new files need review. The public verification tag is intended for publication.
+- Invariants: read only regular allowlisted blobs in HEAD; escape content; exclude key material, raw logs, binary archives and vector data; refuse recognizable secrets; anonymously confirm repository visibility at build and deployment; upload only generated pages. Pattern matching does not establish absence of secrets, and a private visibility change requires unpublishing the old site separately.
+- Evidence: eight Python boundary/output tests pass locally on Python 3.14.7. The production link graph and sitemap are validated separately; GitHub deployment and Google submission outcomes must be read from their actual services. No person has reviewed the implementation.
 # Source provenance
 
 | | |

@@ -192,7 +192,7 @@ M3-6 needs the prerequisites in "Before a first boot on a machine in scope".
 
 | Rows | Subject |
 |---|---|
-| A20-S1 to A20-S20, A20-S23 | Scheduling across processors (ADR-0020): threads that move, balancing and placement by topology and capacity, affinity, classes and levels, accounting, quotas, weight lending, power and heat, SMT, EEVDF's evaluation, pinned mode, and its proofs and machines |
+| A20-S1 to A20-S20, A20-S23, A20-Am1 | Scheduling across processors (ADR-0020): threads that move, balancing and placement by topology and capacity, affinity, classes and levels, accounting, quotas, weight lending, power and heat, SMT, EEVDF's evaluation, pinned mode, and its proofs and machines; an idle processor's ask that a busy one publish a waiting frame (Amendment 1, item 355) |
 
 ## M4. Processes and IPC
 

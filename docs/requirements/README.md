@@ -128,7 +128,7 @@ Two cells move the figure by themselves. A row marked `info` leaves the count, a
 | List | Rows |
 |---|---|
 | done | H-05 |
-| done | S1-03, S5-01, S5-10, S6-01, S6-02, S6-03, S6-04, S6-05, S6-06, S6-07, S6-08, S6-09, S6-10, S6-11, S6-13, S8-01, S8-02, S8-04, S8-06, S8-08, S9-11, S10-04, S10-06, S11-01, S11-02, S12-01, S13-01, S13-12, S13-14, S13-15, S17-03, S17-26, S18-16, S18-17, S59-03, S59-13, S60-03, S60-11, S62-01, S62-16, S62-17, S72-08, S79-04, S82-19, S84-07, S84-11, S84-12 |
+| done | S1-03, S5-01, S5-10, S6-01, S6-02, S6-03, S6-04, S6-05, S6-06, S6-07, S6-08, S6-09, S6-10, S6-11, S6-13, S6-17, S6-18, S6-19, S8-01, S8-02, S8-04, S8-06, S8-08, S9-11, S10-04, S10-06, S11-01, S11-02, S12-01, S13-01, S13-12, S13-14, S13-15, S17-03, S17-26, S18-16, S18-17, S59-03, S59-13, S60-03, S60-11, S62-01, S62-16, S62-17, S72-08, S79-04, S82-19, S84-07, S84-11, S84-12 |
 | done | F-01 |
 | done | A08-D5, A15-D8, A18-V2, A18-V3, A18-V5, A18-V8 |
 | info | H-01, H-02, H-03, H-04, H-09, H-10 |
@@ -151,6 +151,8 @@ Every answered item of `docs/engineering/OWNER_DECISIONS.md` is named in the "De
 | 350 | none | The rental policy after rental F: one more bench rental (rental G), then a pause until two questions free testing cannot answer can share one rental, or a machine in the declared scope is available. A rule of spending that no statement of the directive or decision of an ADR carries. |
 | 351 | none | A confirmation that CLAUDE.md §3 and items 91 to 97 stand: vendor-contributed Linux driver code is read only as a reference, never used directly. It changes no statement. |
 | 354 | none | The owner's instruction of 2026-11-22: no more bench rentals, which replaces item 350's pause. Rental I was stopped before anything was bought, and the ledger stays at eight rentals, $6.48. A rule of spending that no statement of the directive or decision of an ADR carries. |
+| 356 | none | Where the progress page lives and how it is found: linked from `README.md`, and moved to the repository root by TASKS item 137. A rule of where a generated page is kept, which no statement of the directive or decision of an ADR carries. |
+| 357 | none | How the progress page is laid out: clean and clear, with the four states as separate percentages, built by TASKS item 137. A rule of how a generated page reads, which no statement of the directive or decision of an ADR carries. |
 | 167, 190 | none | How task 18b and the randomized model of its policy land: through pull request 16. Rules of process. |
 | 224–228, 231–236, 343 | none | How rented bench machines are used: the provider, the budget cap, who signs up and holds the credentials, the order of the rentals, how Origin boots there (items 231 and 236), what is kept and where, what a bench record may claim, no self-hosted runner, and rentals through Latitude's API (`docs/research/2026-11-12-first-bare-metal-boot.md`); item 343, a second bench board, was accepted and then withdrawn the same day. Rules of process for bench equipment, which ADR-0009 A1 keeps outside the declared scope. |
 
