@@ -3246,6 +3246,12 @@ pub(crate) fn prove(
         Proof::MigrationDelivery,
         crate::migration_proof::prove_delivery(flow, com1, online, tsc_hz),
     );
+    // What balancing does with threads declared for it (TASKS item 98, the ruling R2), after the
+    // migration proofs, whose pulled phases hold its bounds.
+    proofs.record(
+        Proof::LoadBalancing,
+        crate::balance_proof::prove(com1, online, tsc_hz),
+    );
 }
 
 /// Stops the boot processor's scheduler and timer once the boot proofs are done, so the

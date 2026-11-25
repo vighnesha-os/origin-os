@@ -130,6 +130,9 @@ proofs! {
     // whose threads never move.
     MigrationIntegrity "thread migration: integrity" => Refuse;
     MigrationDelivery "thread migration: delivery" => Withdraw("no thread moves");
+    // What the idle pull, the idle kick and the ask do with threads declared for balancing
+    // (ADR-0020 S7, Amendment 1; TASKS item 98, the ruling R2): after the migration proofs.
+    LoadBalancing "load balancing" => Report;
     Ibpb "IBPB at each change of process" => Refuse;
     HardwareCapacity "hardware capacity" => Report;
     // Devices.

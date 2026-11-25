@@ -191,6 +191,8 @@ pub mod virtqueue;
 #[cfg(target_os = "none")]
 mod aspace;
 #[cfg(target_os = "none")]
+mod balance_proof;
+#[cfg(target_os = "none")]
 mod block;
 #[cfg(target_os = "none")]
 mod console;

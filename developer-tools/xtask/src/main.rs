@@ -2852,9 +2852,16 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             vec![
                 " with their token untaken ".into(),
                 ": exercised, after ".into(),
+                // "load balancing" (Report; TASKS item 98, the ruling R2): its three cases, and its
+                // verdict, every condition held. Two alone needs three processors taking part and
+                // says so otherwise.
+                "origin-kernel: scheduler: load balancing: spread: ".into(),
+                "origin-kernel: scheduler: load balancing: two alone: ".into(),
+                "origin-kernel: scheduler: load balancing: kick: ".into(),
+                "origin-kernel: scheduler: load balancing: spread true, two alone true, kick true; heap, frames and stacks back true; settled true and true".into(),
             ]
         } else {
-            Vec::new()
+            vec!["origin-kernel: scheduler: load balancing: ".into(), ": not run".into()]
         })
         .chain([
             // ADR-0017 Z3: the scheduler noted each change of process, with one barrier for
@@ -9842,14 +9849,23 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
             .position(|x| x == "origin-kernel: scheduler: thread migration: delivery, pulled: ")
             .unwrap();
         let window: Vec<&str> = s.markers[at..at + 3].iter().map(String::as_str).collect();
-        assert_eq!(window[1..], [" with their token untaken ", ": exercised, after "]);
+        assert_eq!(
+            window[1..],
+            [" with their token untaken ", ": exercised, after "]
+        );
         let log = |said: &str| {
             format!(
                 "origin-kernel: scheduler: thread migration: delivery, pulled: 12 receivers declared for balancing and one pinned sender; wake-ups that crossed a pull with their token untaken {said}; bounds since boot: held true\norigin-kernel: ibpb: \n"
             )
         };
-        assert!(serial::contains_in_order(&log("1: exercised, after 200 ms"), &window));
-        assert!(!serial::contains_in_order(&log("0: not exercised in 30 s"), &window));
+        assert!(serial::contains_in_order(
+            &log("1: exercised, after 200 ms"),
+            &window
+        ));
+        assert!(!serial::contains_in_order(
+            &log("0: not exercised in 30 s"),
+            &window
+        ));
     }
 
     /// As the kernel printed them on a real AMD EPYC (Actions run 42547942738).

@@ -2094,10 +2094,8 @@ fn delivery_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc_
         pulled.back,
         pulled.back_refused,
         match pulled.reached_after {
-            Some(after) => alloc::format!(
-                "exercised, after {} ms",
-                nanos(after, tsc_hz) / 1_000_000
-            ),
+            Some(after) =>
+                alloc::format!("exercised, after {} ms", nanos(after, tsc_hz) / 1_000_000),
             None => alloc::format!("not exercised in {COVER_SECONDS} s"),
         },
         bounds.line(tsc_hz),
