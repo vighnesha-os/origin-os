@@ -12,7 +12,8 @@
 //! **What the page claims:** counts of rows of the matrix, each row counted once, whatever its
 //! state (no weighting), and for each line the four states' shares, which add up to 100.0%
 //! (owner item 357: no figure adds two states together; only done counts as complete, decision
-//! items 193 and 221). Nothing on it depends on the clock, the host, a path or a commit hash, so
+//! items 193 and 221). Done's share is the requirements gate's own figure, rounded as the gate
+//! rounds it. Nothing on it depends on the clock, the host, a path or a commit hash, so
 //! one tree gives one page (CLAUDE.md §75).
 //!
 //! **Its layout** (TASKS item 137): a title and one line; the overall table; what the states
@@ -68,7 +69,9 @@ const GROUPS: [(&str, u8, u8); 14] = [
 ];
 
 /// The four states, in the page's order, each with what it means in one plain sentence (owner
-/// item 357; the coordinating session's contract for TASKS item 137 gives the sentences).
+/// item 357; the coordinating session's contract for TASKS item 137 gives the sentences, and its
+/// ruling of 2026-11-23 the one for built: a requirement is built for either of two reasons, and
+/// the contract's first sentence gave one. The review of TASKS item 137, R137-2).
 const MEANINGS: [(&str, &str); 4] = [
     (
         "Done",
@@ -76,7 +79,7 @@ const MEANINGS: [(&str, &str); 4] = [
     ),
     (
         "Built",
-        "It is written and tested, but in a weaker environment than it asks for, usually an emulator where it asks for a real machine.",
+        "It is written and tested, but not all of its acceptance tests pass yet, or they pass only in a weaker environment than it asks for, such as a virtual machine where it asks for a real one.",
     ),
     (
         "In progress",
@@ -127,10 +130,17 @@ impl Tally {
     /// The four states' shares in tenths of a percent, which sum to exactly 1,000, or `None`
     /// for a line with no requirement (owner item 357: four percentages that add up to 100).
     ///
-    /// Largest remainder: each share is rounded down, and the tenths still owed go to the
-    /// states with the largest remainders, one each. Where two remainders are equal, the less
-    /// complete state takes the tenth, so that done is never rounded up on a tie. Every share is
-    /// within a tenth of its exact value.
+    /// **Done is rounded to the nearest tenth, from done and the total alone,** exactly as the
+    /// requirements gate rounds it ([`requirements::percent`]). It is the one figure that counts
+    /// as complete (decision item 193), so it never moves because another state moved, and the
+    /// page never disagrees with what `cargo xtask check` prints (the review of TASKS item 137,
+    /// R137-1; the coordinating session's ruling of 2026-11-23).
+    ///
+    /// **The other three share the rest by largest remainder:** each is rounded down, and the
+    /// tenths still owed go to the largest remainders, one each. Where two remainders are equal,
+    /// the less complete state takes the tenth. Every share is within a tenth of its exact value,
+    /// and a state with no requirement has no share. The cost, accepted by that ruling: done and
+    /// a state one requirement away from it can be shown a tenth out of order.
     fn shares(self) -> Option<[usize; 4]> {
         let whole = self.rows();
         if whole == 0 {
@@ -138,9 +148,12 @@ impl Tally {
         }
         let parts = self.parts();
         let mut shares = parts.map(|part| part * 1000 / whole);
+        // As `requirements::percent`: to the nearest tenth, a half up.
+        shares[0] = (self.done * 1000 + whole / 2) / whole;
         let owed = 1000 - shares.iter().sum::<usize>();
-        // The states by remainder, largest first; among equals, the less complete first.
-        let mut order = [3, 2, 1, 0];
+        // The other three by remainder, largest first; among equals, the less complete first
+        // (the sort is stable).
+        let mut order = [3, 2, 1];
         order.sort_by_key(|&state| std::cmp::Reverse(parts[state] * 1000 % whole));
         for &state in order.iter().take(owed) {
             shares[state] += 1;
@@ -268,6 +281,11 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
             .map_or_else(|| "-".to_string(), |s| tenths(s[0])),
         requirements_of(all.rows())
     );
+    let _ = writeln!(w);
+    let _ = writeln!(
+        w,
+        "A requirement is one statement of [`CLAUDE.md`](CLAUDE.md), or one decision of an accepted ADR."
+    );
 
     // 2. Overall.
     let _ = writeln!(w);
@@ -329,7 +347,7 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "Each milestone counts the requirements that [`docs/ROADMAP.md`](docs/ROADMAP.md) places in it. The state is the milestone's own, as the roadmap gives it. A milestone is done only when every one of its exit tests passes (decision items 255 and 256)."
+        "Each milestone counts the requirements that [`docs/ROADMAP.md`](docs/ROADMAP.md) places in it. Its state is the roadmap's own word: done, built, partial or not started. That word is judged by the milestone's exit tests, not by the shares on its line. A milestone is done only when every one of its exit tests passes (decision items 255 and 256)."
     );
     let _ = writeln!(w);
     let _ = writeln!(w, "| Milestone | State in the roadmap | {STATES} |");
@@ -392,7 +410,7 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "The requirements of [`CLAUDE.md`](CLAUDE.md) that ask for something to be built, by the section they are in. Standing rules and ADR decisions are under \"Details\"."
+        "The requirements of `CLAUDE.md` that ask for something to be built, by the section they are in. Standing rules and ADR decisions are under \"Details\"."
     );
     let _ = writeln!(w);
     let build: Vec<&Row> = rows
@@ -801,9 +819,14 @@ mod tests {
     }
 
     /// Owner item 357: the four percentages of a line add up to exactly 100.0. Every tally of up
-    /// to 40 requirements: the shares sum to 1,000 tenths, each is within a tenth of its exact
-    /// value, a state with no requirement has no share, and equal counts differ by at most the
-    /// one tenth a tie gives away.
+    /// to 40 requirements:
+    /// - the shares sum to 1,000 tenths, and each is within a tenth of its exact value;
+    /// - a state with no requirement has no share;
+    /// - done's share is the requirements gate's own figure, whatever the other three are (the
+    ///   review's R137-1, as ruled);
+    /// - no two states are shown against their counts, and equal counts differ by at most the
+    ///   one tenth a tie gives away. (On a line of more than 500 requirements done and a state
+    ///   one requirement away can be a tenth out of order, as the next test shows.)
     #[test]
     fn the_four_shares_of_a_line_sum_to_one_hundred() {
         let mut lines = 0;
@@ -828,8 +851,17 @@ mod tests {
                             // Within a tenth: share - 1 < exact < share + 1, in tenths.
                             assert!(share * whole < part * 1000 + whole, "{tally:?}");
                             assert!(part * 1000 < (share + 1) * whole, "{tally:?}");
-                            assert_eq!(part == 0, share == 0, "{tally:?}");
+                            if part == 0 {
+                                assert_eq!(share, 0, "{tally:?}");
+                            }
                         }
+                        assert_eq!(
+                            tenths(shares[0]),
+                            requirements::percent(done, whole),
+                            "{tally:?}"
+                        );
+                        // Among all four here: a line of up to 500 requirements cannot show
+                        // two states out of order, since one requirement is two tenths.
                         for a in 0..4 {
                             for b in 0..4 {
                                 if tally.parts()[a] == tally.parts()[b] {
@@ -845,28 +877,74 @@ mod tests {
             }
         }
         assert!(lines > 100_000, "{lines}");
-        let shares = |done, built, in_progress, not_started| {
-            Tally {
-                done,
-                built,
-                in_progress,
-                not_started,
-            }
-            .shares()
-        };
-        assert_eq!(shares(0, 0, 0, 0), None);
-        assert_eq!(shares(1, 0, 0, 0), Some([1000, 0, 0, 0]));
-        // A tie goes to the less complete state: done is never rounded up on one.
-        assert_eq!(shares(1, 1, 1, 0), Some([333, 333, 334, 0]));
-        assert_eq!(shares(1, 1, 0, 1), Some([333, 333, 0, 334]));
-        assert_eq!(shares(1, 0, 0, 2), Some([333, 0, 0, 667]));
-        assert_eq!(shares(2, 0, 0, 1), Some([667, 0, 0, 333]));
-        assert_eq!(shares(1, 1, 1, 1), Some([250, 250, 250, 250]));
+    }
+
+    fn shares(done: usize, built: usize, in_progress: usize, not_started: usize) -> [usize; 4] {
+        Tally {
+            done,
+            built,
+            in_progress,
+            not_started,
+        }
+        .shares()
+        .expect("a line with a requirement")
+    }
+
+    /// The review's R137-1, as the coordinating session ruled it: done's share does not move
+    /// when another state does, and it is the figure `cargo xtask check` prints.
+    #[test]
+    fn dones_share_is_its_own_whatever_the_others_are() {
+        // The tree's own total on 2026-11-23, and the same with one requirement gone from not
+        // started to built. Largest remainder over all four read 3.5% for the second, with done
+        // still 58 of 1,686, which is 3.44%.
+        assert_eq!(shares(58, 372, 248, 1008), [34, 221, 147, 598]);
+        assert_eq!(shares(58, 373, 248, 1007), [34, 221, 147, 598]);
+        assert_eq!(requirements::percent(58, 1686), "3.4%");
+        // Two lines of that day's page that the first rule showed a tenth high.
+        assert_eq!(shares(1, 9, 5, 54)[0], 14);
+        assert_eq!(shares(17, 127, 82, 608)[0], 20);
+        // Done's share over every split of the other 1,628 requirements among two states.
+        for built in (0..=1628).step_by(37) {
+            assert_eq!(shares(58, built, 0, 1628 - built)[0], 34, "{built}");
+            assert_eq!(shares(58, 0, built, 1628 - built)[0], 34, "{built}");
+        }
+        // A half goes up, as the gate's does: 1 of 2,000 is 0.05%.
+        assert_eq!(shares(1, 0, 0, 1999), [1, 0, 0, 999]);
+        assert_eq!(requirements::percent(1, 2000), "0.1%");
+        // The cost the ruling accepts: done and a state one requirement away from it, shown a
+        // tenth out of order, either way. Done's own figure is the nearest tenth in both: it is
+        // the other state's share that took an owed tenth, or was rounded down. Only a line of
+        // more than 500 requirements can show it: below that, one requirement is two tenths.
+        assert_eq!(shares(1241, 1240, 203, 384), [404, 405, 66, 125]);
+        assert_eq!(shares(816, 817, 200, 1252), [265, 264, 65, 406]);
+    }
+
+    /// The other three share what done leaves, by largest remainder; a tie among them goes to
+    /// the less complete state (the review's R137-5 (a): each line here fails for another order).
+    #[test]
+    fn a_tie_among_the_other_three_goes_to_the_less_complete() {
+        assert_eq!(shares(1, 0, 0, 0), [1000, 0, 0, 0]);
+        assert_eq!(shares(0, 1, 0, 0), [0, 1000, 0, 0]);
+        assert_eq!(shares(1, 1, 1, 1), [250, 250, 250, 250]);
+        // Thirds: done is 33.3%, to the nearest; of the other two, in progress takes the tenth.
+        assert_eq!(shares(1, 1, 1, 0), [333, 333, 334, 0]);
+        assert_eq!(shares(1, 1, 0, 1), [333, 333, 0, 334]);
+        assert_eq!(shares(1, 0, 1, 1), [333, 0, 333, 334]);
+        assert_eq!(shares(0, 1, 1, 1), [0, 333, 333, 334]);
+        // Sixths: done is 16.7%, to the nearest; built and not started tie for the one tenth.
+        assert_eq!(shares(1, 1, 0, 4), [167, 166, 0, 667]);
+        assert_eq!(shares(1, 4, 0, 1), [167, 666, 0, 167]);
+        assert_eq!(shares(1, 1, 4, 0), [167, 166, 667, 0]);
+        // Two tenths owed among three equal remainders: the two less complete take them.
+        assert_eq!(shares(3, 1, 1, 1), [500, 166, 167, 167]);
+        // Not a tie: the larger remainder takes it, whichever state it is.
+        assert_eq!(shares(0, 2, 0, 1), [0, 667, 0, 333]);
+        assert_eq!(shares(0, 1, 0, 2), [0, 333, 0, 667]);
+        // Ninths: 22.2% three times and 33.3% would be 99.9%.
+        assert_eq!(shares(2, 2, 2, 3), [222, 222, 222, 334]);
         // §8 to §15 of the tree on 2026-11-23: plain rounding gave 20.8, 41.5, 5.7 and 32.1,
-        // which is 100.1.
-        assert_eq!(shares(11, 22, 3, 17), Some([207, 415, 57, 321]));
-        // The tree's own total that day.
-        assert_eq!(shares(58, 372, 248, 1008), Some([34, 221, 147, 598]));
+        // which is 100.1. Done keeps its 20.8.
+        assert_eq!(shares(11, 22, 3, 17), [208, 415, 56, 321]);
     }
 
     #[test]
@@ -1303,6 +1381,22 @@ mod tests {
             }
         }
         assert_eq!(ran, figure.5);
+        // The page's first figure is the gate's, for the same tree (the review's R137-1): the
+        // title's line and the overall table's line for done.
+        let gates = requirements::percent(figure.1, figure.0);
+        let page = generate().expect("the page of this tree");
+        let title = page.lines().nth(2).expect("the one line");
+        assert!(
+            title.starts_with(&format!(
+                "**{gates} of {} are done.**",
+                requirements_of(figure.0)
+            )),
+            "{title}"
+        );
+        assert!(
+            page.contains(&format!("| Done | {} | {gates} |", count(figure.1))),
+            "{gates}"
+        );
     }
 
     #[test]

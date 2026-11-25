@@ -2,6 +2,8 @@
 
 **3.4% of 1,686 requirements are done.** Done is the only state that counts as complete.
 
+A requirement is one statement of [`CLAUDE.md`](CLAUDE.md), or one decision of an accepted ADR.
+
 ## Overall
 
 | State | Requirements | Share |
@@ -17,7 +19,7 @@
 | State | Meaning |
 |---|---|
 | Done | Its acceptance tests pass in the environment the requirement asks for. |
-| Built | It is written and tested, but in a weaker environment than it asks for, usually an emulator where it asks for a real machine. |
+| Built | It is written and tested, but not all of its acceptance tests pass yet, or they pass only in a weaker environment than it asks for, such as a virtual machine where it asks for a real one. |
 | In progress | Part of it is written and tested, or something is written with no test evidence yet. |
 | Not started | Nothing for it is in the tree. |
 
@@ -33,7 +35,7 @@
 
 ## By milestone
 
-Each milestone counts the requirements that [`docs/ROADMAP.md`](docs/ROADMAP.md) places in it. The state is the milestone's own, as the roadmap gives it. A milestone is done only when every one of its exit tests passes (decision items 255 and 256).
+Each milestone counts the requirements that [`docs/ROADMAP.md`](docs/ROADMAP.md) places in it. Its state is the roadmap's own word: done, built, partial or not started. That word is judged by the milestone's exit tests, not by the shares on its line. A milestone is done only when every one of its exit tests passes (decision items 255 and 256).
 
 | Milestone | State in the roadmap | Requirements | Done | Built | In progress | Not started |
 |---|---|--:|--:|--:|--:|--:|
@@ -56,11 +58,11 @@ In no milestone: 68 requirements that the roadmap lists as in none, with its rea
 
 ## By feature area
 
-The requirements of [`CLAUDE.md`](CLAUDE.md) that ask for something to be built, by the section they are in. Standing rules and ADR decisions are under "Details".
+The requirements of `CLAUDE.md` that ask for something to be built, by the section they are in. Standing rules and ADR decisions are under "Details".
 
 | Feature area | Sections | Requirements | Done | Built | In progress | Not started |
 |---|---|--:|--:|--:|--:|--:|
-| Toolchain, build and CI | §8 to §15 | 53 | 20.7% | 41.5% | 5.7% | 32.1% |
+| Toolchain, build and CI | §8 to §15 | 53 | 20.8% | 41.5% | 5.6% | 32.1% |
 | Boot, installer and first-run setup | §19 to §23 | 57 | 0.0% | 19.3% | 0.0% | 80.7% |
 | Kernel core | §24 to §30 | 92 | 0.0% | 53.3% | 17.4% | 29.3% |
 | Devices | §31 to §38 | 110 | 0.0% | 15.4% | 5.5% | 79.1% |
@@ -73,8 +75,8 @@ The requirements of [`CLAUDE.md`](CLAUDE.md) that ask for something to be built,
 | Versions, updates and recovery | §62 to §65 | 48 | 4.2% | 12.5% | 0.0% | 83.3% |
 | Performance, power, time and reliability | §66 to §69 | 45 | 0.0% | 8.9% | 6.7% | 84.4% |
 | Developer platform | §70 to §71 | 27 | 0.0% | 3.7% | 7.4% | 88.9% |
-| Testing, hardware qualification and release | §72 to §76 | 69 | 1.5% | 13.0% | 7.2% | 78.3% |
-| **All fourteen areas** | | 834 | 2.1% | 15.2% | 9.8% | 72.9% |
+| Testing, hardware qualification and release | §72 to §76 | 69 | 1.4% | 13.0% | 7.3% | 78.3% |
+| **All fourteen areas** | | 834 | 2.0% | 15.2% | 9.9% | 72.9% |
 
 Outside these areas: 154 more of `CLAUDE.md` that ask for something to be built, in the header (7), §1 (69), §6 (17), §18 (17), §79 (12), §82 (17), §84 (14), the final rules (1). They are counted in "Overall", and in a milestone where the roadmap places them.
 
@@ -213,7 +215,7 @@ Outside these areas: 154 more of `CLAUDE.md` that ask for something to be built,
 
 | Section | Requirements | Done | Built | In progress | Not started |
 |---|--:|--:|--:|--:|--:|
-| §72. Required testing methods | 16 | 6.2% | 25.0% | 25.0% | 43.8% |
+| §72. Required testing methods | 16 | 6.3% | 25.0% | 25.0% | 43.7% |
 | §73. Formal methods | 11 | 0.0% | 27.3% | 0.0% | 72.7% |
 | §74. Hardware test matrix | 17 | 0.0% | 0.0% | 0.0% | 100.0% |
 | §75. Reproducibility | 9 | 0.0% | 22.2% | 11.1% | 66.7% |
