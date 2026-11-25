@@ -55,8 +55,17 @@ const USAGE: &str = "\
 usage: cargo xtask <command>
 
 commands:
-  check       rustfmt, clippy and unit tests, each crate on its own target(s);
-              the UEFI release build; the CLAUDE.md §11 cfg lint
+  check       everything a change must pass without a boot: the pinned compiler, by its
+              commit; rustfmt; Clippy with -D warnings and the host tests of every crate,
+              each on its own target(s), and the AML interpreter's two stack tests again
+              in release mode; the developer-mode and the verifying loader and the kernel
+              image, with the image's checks; the no-panic, dependency and CLAUDE.md §11
+              cfg lints, the manifests' versions and the two checks on the signing code;
+              every gate below that says it is part of check (documents, requirements,
+              provenance, roadmap, progress page, costs, unsafe code, names, interfaces,
+              host tools, versions and the rest); the images built twice and compared
+              byte for byte; and the Loom models with their negative controls. It boots
+              nothing: the boots are boot-test and boot-matrix
   build       build the loader (developer mode) and the KRN kernel image; print their paths
   boot-test   boot under QEMU + OVMF: a signed kernel must start and report with developer
               mode off, an unsigned one in developer mode, and a loader with developer mode
@@ -186,11 +195,12 @@ commands:
   roadmap-gate only the gate on docs/ROADMAP.md: every counted build row of the
               requirements matrix placed in one milestone or listed as in none, and
               every row it names in the matrix (part of check; CLAUDE.md §82; quick)
-  progress    writes docs/PROGRESS.md from the requirements matrix, CLAUDE.md's and the
-              ADRs' headings and docs/ROADMAP.md: counts of rows by state, overall, by
-              milestone, by feature group, by ADR and for the standing rules. Run it when
-              a row's state changes (TASKS item 43; quick)
-  progress-gate only the gate on docs/PROGRESS.md: the committed page is the one the
+  progress    writes PROGRESS.md, at the root, from the requirements matrix, CLAUDE.md's and
+              the ADRs' headings and docs/ROADMAP.md: the share of requirements in each of
+              the four states, overall, by milestone and by feature area, with the sections,
+              the ADRs, the standing rules and the exact counts as details. Run it when a
+              row's state changes (TASKS items 43 and 137; quick)
+  progress-gate only the gate on PROGRESS.md: the committed page is the one the
               tree generates, byte for byte (part of check; quick)
   cost-gate   only the gate on the cost ledger in docs/engineering/PERFORMANCE_BUDGETS.md:
               each row's decision and figure, the list of ADR-0001 to ADR-0017, and a
@@ -8354,8 +8364,8 @@ fn wait_for_screen(
     ))
 }
 
-/// `run`: the developer-mode kernel under QEMU, interactively, on the machine `settings`
-/// describe.
+/// `run`: the kernel under QEMU with the developer-mode loader, interactively, on the machine
+/// `settings` describe.
 fn run(settings: &Settings) -> Result {
     let krn_path = pack_kernel(&build_kernel()?)?;
     let krn = fs::read(&krn_path).map_err(|e| format!("{}: {e}", krn_path.display()))?;

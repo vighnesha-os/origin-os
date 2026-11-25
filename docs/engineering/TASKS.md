@@ -627,7 +627,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 134. **The IPC proof's `exit_closes` check made independent of timing (ADR-0013 R1(b)). Numbered by the coordinating session on 2026-11-22; built on 2026-11-23 on `claude/bold-robinson-85f8ec`, with `process_terminated`, which had the same check (its entry, "134 and 135", below); not landed.** In its "faults" case the proof requires at least one wake-up that crosses processors when the peer waits on another processor. If the ending process's close lands before the peer has blocked, the peer keeps the wake-up and no interrupt crosses, so the check fails with nothing wrong: no lost wake-up, the peer saw `PEER_CLOSED`, no handles left. Seen once, on the AMD 4-processor machine, in TASKS item 96's planted pass-check run of 2026-11-22. This item makes the pass condition the same on every schedule: the ender starts only once the peer is blocked, or a kept wake-up counts, with a planted control for each order.
 135. **`xtask`'s I/O APIC marker takes the count the kernel's proof takes (ADR-0013 R1(b)). Numbered by the coordinating session on 2026-11-22; built on 2026-11-23 on `claude/bold-robinson-85f8ec` (its entry, "134 and 135", below); not landed.** The kernel's proof passes when 20 or more PIT interrupts arrive through the I/O APIC (`framekernel/src/irq.rs`, `taken >= PROOF_TICKS`), and prints the count it took. `xtask`'s marker demands the literal text "20 PIT interrupts", in two places in `developer-tools/xtask/src/main.rs`. When one more interrupt lands before the entry is masked, the kernel prints 21 and passes, and `xtask` fails the boot as "first missing marker". Seen once, on the 65-processor Intel machine under host load: TASKS item 96's turn 30, base 65-1, on `0ebef78b`'s code. This item makes `xtask`'s check take any count the kernel's own condition takes, with a planted control for a count below 20.
 136. **The IPC ping-pong's crossing condition made independent of timing (ADR-0013 R1(b)). Numbered by the coordinating session on 2026-11-23, from TASKS item 134's contract (Q2); not started.** The ping-pong of `ipc_proof` passes only if its two processes blocked at least once between them and, on two processors, at least one wake-up crossed (`blocked.0 + blocked.1 > 0 && (far == bsp || wakes > 0)`). Both rest on the schedule: a run in which neither process ever found the other's message missing would block 0 times and cross nothing, with every one of its 1,000 round trips right. That is remote, and no boot has shown it. Its count of blocks also counts a block that returned at once on a kept wake-up. It has no single order to force, as TASKS item 134's two cases had, so its fix is its own. The independent review of items 134 and 135 lists it first among its follow-ups.
-137. **The progress page at the repository root, clean and clear (owner items 356 and 357). Numbered by the coordinating session on 2026-11-23; not started.** `docs/PROGRESS.md` moves to `PROGRESS.md` at the root. `cargo xtask progress` writes it there, and the gate in `cargo xtask check` reads it there (`developer-tools/xtask/src/progress.rs`, its help text and its tests). The README's link follows, and so does every reference that names the page's place. Records that describe the page as it was built stay as they are. The generator also gives the page a new layout: each table shows done, built, in progress and not started as percentages that add up to 100%, nothing adds two states together, the states are explained in plain words, and the long tables sit in sections a reader opens. Items 193 and 221 stand. It lands with the next code batch, since it changes `xtask`. Item 136's line comes with the records of TASKS items 134 and 135.
+137. **The progress page at the repository root, clean and clear (owner items 356 and 357). Numbered by the coordinating session on 2026-11-23; built on 2026-11-23 and 2026-11-25 on `claude/t137-progress-page` (its entry, below); not landed.** `docs/PROGRESS.md` moves to `PROGRESS.md` at the root. `cargo xtask progress` writes it there, and the gate in `cargo xtask check` reads it there (`developer-tools/xtask/src/progress.rs`, its help text and its tests). The README's link follows, and so does every reference that names the page's place. Records that describe the page as it was built stay as they are. The generator also gives the page a new layout: each table shows done, built, in progress and not started as percentages that add up to 100%, nothing adds two states together, the states are explained in plain words, and the long tables sit in sections a reader opens. Items 193 and 221 stand. It lands with the next code batch, since it changes `xtask`. Item 136's line comes with the records of TASKS items 134 and 135.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
@@ -5569,3 +5569,62 @@ The short turns before it, as each commit was built (2026-11-23, 03:13 to 03:17 
 - **the change under KVM,** until CI runs it, **or on hardware;**
 - **a plant on more than 2 processors or under AMD-Vi:** the gates boot those machines unplanted;
 - **no person has reviewed it.**
+
+### 137. The progress page at the repository root, clean and clear (owner items 356 and 357)
+
+Assigned by the coordinating session on 2026-11-23, after the owner's "Link and move to root" (item 356) and "Can you make PROGRESS.MD clean and clear" (item 357). Built on `claude/t137-progress-page`, cut from `main` at `5be0030a`, against the coordinating session's contract (`t137-contract.md` in the coordination notes), which gives the move, the layout section by section, the host tests, the review and the gates. No boot was needed: a host tool and documents change.
+
+**What does not change.** The page is generated by `cargo xtask progress`, and `cargo xtask check`'s gate refuses a tree whose page is not the one it generates. Every figure is a count of matrix rows, from the same inputs. Decision items 193 and 221 stand: only done counts as complete.
+
+**The move (item 356).**
+- `docs/PROGRESS.md` is `PROGRESS.md` at the root, by `git mv` in a commit that changes none of its bytes, so its history follows.
+- `progress.rs`'s `PAGE` and the help text of `progress` and `progress-gate` name it there.
+- `README.md`'s two links follow, and its third mention of the page is a link now. `docs/requirements/README.md`'s line on regenerating the page follows, and so do row S1-52's two mentions of the path, which the requirements gate checks.
+- `CONTRIBUTING.md` names the command and no path, so it is unchanged.
+- Records that describe the page as it was built keep the old path: reviews, the provenance narrative, old TASKS entries and the decision sheet.
+
+**The layout (item 357),** in `developer-tools/xtask/src/progress.rs`:
+- **Four percentages on every line, which add up to exactly 100.0.** Plain rounding of each share gave lines of 99.9% and 100.1%.
+- **Done is rounded on its own** (the review's R137-1; the coordinating session's ruling (a)): to the nearest tenth from done and the total alone, exactly as the requirements gate rounds it, in every line and in the title. So done never moves because another state moved, and the page never disagrees with what `cargo xtask check` prints. The other three share the rest by largest remainder: each rounded down, the tenths still owed to the largest remainders, a tie to the less complete state.
+- **The cost the ruling accepts:** on a line of more than 500 requirements, done and a state one requirement away can be shown a tenth out of order, either way. Below that one requirement is two tenths, and the order of all four is held by a host test.
+- **Nothing adds two states together.** The "% done or built" column and the "Done or built" sentence are gone. The page opens: "**3.4% of 1,686 requirements are done.** Done is the only state that counts as complete." The next sentence says what a requirement is.
+- **The order:** the title and those two lines; overall, with counts and a total; what the states mean, one plain sentence each; where the evidence ran, one environment a line; by milestone, with the roadmap's own state words and how they are judged; by feature area; the details, in four closed blocks (each area's sections, the ADR decisions, the standing rules, the exact counts); how the page is made, in three bullets with decision items 193 and 221.
+- **Built's sentence** (the review's R137-2; ruling (a)): "It is written and tested, but not all of its acceptance tests pass yet, or they pass only in a weaker environment than it asks for, such as a virtual machine where it asks for a real one." The contract's first sentence named one of the two reasons. On the tree of 2026-11-23, 88 of the 372 built requirements had evidence from the environment they ask for and were built because their acceptance tests did not all pass. Of the other 284, 173 ran in a virtual machine on a real processor and 105 in an emulator. These counts are the reviewer's, from the matrix, and are here, not on the page.
+- **A reader's words:** "requirements" and "feature areas". A line with no requirement shows "-" in each state's cell. A thousand or more has a comma. The directive's unnumbered parts are named "the header" and "the final rules", in its own order.
+- **The gate refuses a copy left at `docs/PROGRESS.md`** (the review's R137-4), with a host test. A branch cut before the move regenerates the page there, and a merge that kept it would leave a second page that nothing regenerates.
+- **`check`'s help text and `Cargo.toml`'s header** (the contract's addition) say what the commands do now, from what `fn check` runs.
+
+**Choices where the contract left room,** accepted by the coordinating session on 2026-11-23:
+- **A tie in the rounding goes to the less complete state.** Since the ruling on R137-1 it applies among built, in progress and not started.
+- **"No sentence longer than two lines" is held as 200 characters,** by a host test over the page the tree generates.
+- **The directive's unnumbered parts are named in words,** where the page gave ID prefixes.
+- **The fourteen areas' section tables are one closed block,** not fourteen.
+
+**The public file index** (owner's, added to `main` after the contract; the coordinating session's message of 2026-11-25) follows the move, and nothing else in it changes: `developer-tools/public-index/files.json`'s one entry `docs/PROGRESS.md` is now `PROGRESS.md`, kept in the list's sorted order (between `LICENSE-MIT` and `README.md`; 763 unique paths, as before), and `build.py`'s "Start here" list names `PROGRESS.md`. Its 11 tests pass; none named the old path.
+
+**The commits,** on `5be0030a`:
+- `5717b3b8`: the move, by `git mv` in a commit that changes none of the page's bytes, with every reference that names its place;
+- `fb7f061a`: the layout, and its host tests;
+- `ef3caed8`: `check`'s help text and `Cargo.toml`'s header;
+- `0386b624`: the review's R137-3 to R137-9;
+- `1c8fd95b`: the rulings on R137-1, R137-2, (c) and (d);
+- `a0ad2dbc`: `main` merged at `ebd3552d` (the public index, the README's logo and badge, a CI label, PR 66's note; no kernel code). No conflict: the README's header is `main`'s byte for byte;
+- `3fcf14ba`: the public index follows the move.
+
+The page's history follows the move commit by commit (`git log --follow PROGRESS.md`). Across the whole branch Git sees a deletion and a creation, since the layout rewrote the page, so the history holds as long as the batch lands with a merge commit, not a squash.
+
+**The review.** One independent AI reviewer, on `5be0030a..ef3caed8`, recorded in `docs/engineering/REVIEW_T137_2026-11-23.md`, every finding answered: High 0, Medium 2, Low 5, Info 3. It re-derived every figure on the page from the matrix and the roadmap, found them right, and found no count changed from the old page. Both Medium findings were against the contract's own rule and wording, and the coordinating session ruled on them. **No person has reviewed it.**
+
+**The gates,** on `3fcf14ba`, in one `cargo xtask exclusive` turn, 2026-11-25 16:07:15 to 16:22:44 UTC, the tree clean before and after; each gate's own line was read:
+- fmt; Clippy for `xtask` with all targets and `-D warnings`: clean;
+- `xtask`'s host tests: 431 passed, 0 failed, 2 ignored; the public index's tests: 11, OK;
+- `cargo xtask check`, 923 s: "check passed"; 2,810 host tests passed, 0 failed, 32 ignored; the progress gate: "PROGRESS.md is the page this tree generates (313 lines)"; all 93 Loom models passed and all 144 negative controls were caught.
+- **The power source:** on battery at the turn's start (16:07:15, 100%), on AC from 16:08:23 (`pmset -g log`) to the end (16:22:44). Pass-or-fail gates; none failed.
+- No boot was run: only a host tool and documents change (the contract).
+
+**Follow-ups, none in this change** (from the review, for the coordinating session):
+- `boot-matrix`'s usage line does not name `boot-reserved`, `boot-acpi`, `boot-listed`, `boot-sparse` or `boot-domains`, which it runs;
+- `Cargo.toml`'s `default-members` leaves out `sdk/directory` and `services/directory`, which `check` lints and tests on the host;
+- the page shows `partial` and `not-verified` as one state, as it always has, where the requirements gate prints them apart.
+
+**Not shown:** the page rendered on GitHub (its structure was read against GitHub's Markdown rules by the reviewer, and its links checked by a host test); the public index built and published (its tests ran; its workflow runs on `main`). No person has reviewed it.
