@@ -208,6 +208,12 @@ impl core::fmt::Debug for Hints {
 
 impl Hints {
     /// A mask for `processors` processors, every bit clear; `None` if the memory cannot be had.
+    ///
+    /// Inlined, so that its allocation is compiled in its caller's crate (the kernel's balancing
+    /// set-up), not in this freestanding library's object, which the no-panic check (ONBF §12)
+    /// holds to no allocator and no panic path, as the rest of `origin-sync` that allocates is
+    /// generic and compiled where it is used.
+    #[inline]
     pub fn new(processors: usize) -> Option<Self> {
         let count = processors.div_ceil(64).max(1);
         let mut words = Vec::new();
@@ -282,7 +288,8 @@ impl core::fmt::Debug for Masks {
 
 impl Masks {
     /// Both masks for `processors` processors, every bit clear; `None` if the memory cannot be
-    /// had.
+    /// had. Inlined, as [`Hints::new`] is, and for the same reason.
+    #[inline]
     pub fn new(processors: usize) -> Option<Self> {
         Some(Self {
             idle: Hints::new(processors)?,
