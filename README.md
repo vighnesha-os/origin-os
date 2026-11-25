@@ -1,4 +1,16 @@
-# Origin OS
+<p align="center">
+  <img src="assets/branding/origin-os-atom-horizontal-4k.png" alt="Origin Operating System — atom logo" width="920">
+</p>
+
+<p align="center">An original x86-64 operating system, written in Rust.</p>
+
+<p align="center">Founder and Maintainer: <a href="https://github.com/vighnesha-os">VIGHNESHA BOJJA</a></p>
+
+<p align="center">
+  <a href="https://github.com/vighnesha-os/origin-os/actions/workflows/ci.yml"><img src="https://github.com/vighnesha-os/origin-os/actions/workflows/ci.yml/badge.svg?branch=main&amp;event=push" alt="Test x86-64"></a>
+</p>
+
+[Browse the public source and documentation index](https://vighnesha-os.github.io/origin-os/).
 
 Origin OS is an original-source operating system for x86-64, written in Rust. It has its own kernel (the Framekernel), its own drivers and its own native SDK. It is planned as two editions of one release, Origin Desktop and Origin Server, which share one kernel, one SDK and the native desktop.
 
@@ -75,4 +87,6 @@ Origin OS is licensed under either of
 - the MIT License ([LICENSE-MIT](LICENSE-MIT)),
 
 at your option. Third-party test data in this repository keeps its own licence, stated beside it.
+
+
 

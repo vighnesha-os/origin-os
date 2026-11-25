@@ -809,6 +809,13 @@ With three or more threads, all but the last one switched out can be lent. The e
 - A processor takes at most one ask a tick, however many processors are idle. An asker sends only if it is the first to mark the source as asked, and the source clears the mark when it publishes, or at its tick.
 - An ask is sent only for a thread that every other check of the pull would take: declared for balancing, ready, not running, not pinned, within S10's rate and cache-hot rule, with room at the destination.
 
+**Note (2026-11-23, TASKS item 98's check of its build against this amendment; the coordinating session's reading, not an amendment).** The second bound's last clause is wrong as written, and the bound itself decides.
+- **The decision** is that a processor takes at most one ask a tick: it is what the owner was asked and answered (decision sheet item 355).
+- **The clause** says the source "clears the mark when it publishes, or at its tick". Clearing the mark at publication would let a second ask arrive in the same tick, which the bound forbids.
+- **So the mark ends at the source's next tick, and only then.** As TASKS item 98 builds it, the mark is the source's tick number, kept in its run queue under its queue lock, which the asker already holds to find the thread. No new lock-free state is added.
+- **A consequence of the first bound for step 2.** If the source has already sent its one balancing IPI in that tick, its upcall publishes the frame and sends no kick. An idle processor then takes the frame at its own next pass, which is an event and not a timed wait.
+- **Step 2's kick** goes to the nearest idle processor that S10's cache rule allows, which need not be the asker. Either way an idle processor pulls the thread.
+
 **What does not change.**
 - Every move is still a pull: the processor that will run the thread is the one that moves it. A busy processor never moves a thread.
 - S5 stands: a frame is published only by its own processor, after it has left the stack. The ask adds no publication point, because a reschedule upcall is a scheduler upcall, which already reaches the table (S5's note of 2026-11-21).
