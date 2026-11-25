@@ -345,9 +345,10 @@ const WINDOW: usize = 15;
 const B18_MICROS: u64 = 50;
 const FAR_MICROS: u64 = 400;
 
-/// One kind of interrupts-off section a sender timed: the ticks spent in all, the spans past
-/// B18 and past the far mark, and the longest. Written only by its sender.
+/// One kind of interrupts-off section a sender timed: how many, the ticks spent in all, the spans
+/// past B18 and past the far mark, and the longest. Written only by its sender.
 struct Spans {
+    count: AtomicU64,
     ticks: AtomicU64,
     over_b18: AtomicU64,
     over_far: AtomicU64,
@@ -357,6 +358,7 @@ struct Spans {
 impl Spans {
     const fn new() -> Self {
         Self {
+            count: AtomicU64::new(0),
             ticks: AtomicU64::new(0),
             over_b18: AtomicU64::new(0),
             over_far: AtomicU64::new(0),
@@ -366,6 +368,7 @@ impl Spans {
 
     /// Notes one span of `took` ticks, against the marks `b18` and `far` in ticks.
     fn note(&self, took: u64, b18: u64, far: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
         self.ticks.fetch_add(took, Ordering::Relaxed);
         if took > b18 {
             self.over_b18.fetch_add(1, Ordering::Relaxed);
@@ -376,11 +379,12 @@ impl Spans {
         self.longest.fetch_max(took, Ordering::Relaxed);
     }
 
-    /// Every sender's spans of one kind, summed (the longest, the largest): ticks, past B18,
-    /// past the far mark, longest.
-    fn total<'a>(spans: impl Iterator<Item = &'a Spans>) -> (u64, u64, u64, u64) {
-        spans.fold((0, 0, 0, 0), |(t, b, f, l), s| {
+    /// Every sender's spans of one kind, summed (the longest, the largest): how many, ticks, past
+    /// B18, past the far mark, longest.
+    fn total<'a>(spans: impl Iterator<Item = &'a Spans>) -> (u64, u64, u64, u64, u64) {
+        spans.fold((0, 0, 0, 0, 0), |(n, t, b, f, l), s| {
             (
+                n.saturating_add(s.count.load(Ordering::Relaxed)),
                 t.saturating_add(s.ticks.load(Ordering::Relaxed)),
                 b.saturating_add(s.over_b18.load(Ordering::Relaxed)),
                 f.saturating_add(s.over_far.load(Ordering::Relaxed)),
@@ -1500,9 +1504,9 @@ fn delivery_by_moves(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc_
     let (back, unsettled) = bracket_after(settled_before, before, tsc_hz);
     let refusals = refusals(&refused);
     // Made after the compare, as `refusals` is: no text is on the heap while it is compared.
-    let sections = |(ticks, over_b18, over_far, longest): (u64, u64, u64, u64)| {
+    let sections = |(count, ticks, over_b18, over_far, longest): (u64, u64, u64, u64, u64)| {
         alloc::format!(
-            "{ticks} ticks ({} ns) in all, {over_b18} over B18's {} ns, {over_far} over {} ns, longest {longest} ticks ({} ns)",
+            "{count} of them, {ticks} ticks ({} ns) in all, {over_b18} over B18's {} ns, {over_far} over {} ns, longest {longest} ticks ({} ns)",
             nanos(ticks, tsc_hz),
             B18_MICROS * 1000,
             FAR_MICROS * 1000,

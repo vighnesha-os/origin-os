@@ -296,15 +296,18 @@ pub(crate) struct Counts {
     /// halt or its pull, its sections and the gaps between them (a trend); the longest of its
     /// interrupts-off sections that made no move, and of those that made one; the longest move a
     /// section made (`sched::carry`, under both queue locks); and the sections longer than budget
-    /// B18's 50 us, without a move and with one. So a boot tells a section's own work from a
-    /// move's, and both from the host's stalls (the coordinating session's rulings on the first
-    /// boots' 1.05 ms pass).
+    /// B18's 50 us, without a move and with one, of all sections measured of each kind. So a boot
+    /// tells a section's own work from a move's, and both from the host's stalls (the
+    /// coordinating session's rulings on the first boots' 1.05 ms pass), and gives the sections'
+    /// rate past B18 beside a null section's (its ruling R5 on the diagnostic round).
     pub(crate) longest_pass: AtomicU64,
     pub(crate) longest_quiet: AtomicU64,
     pub(crate) longest_moving: AtomicU64,
     pub(crate) longest_move: AtomicU64,
     pub(crate) over_b18_quiet: AtomicU64,
     pub(crate) over_b18_moving: AtomicU64,
+    pub(crate) quiet_sections: AtomicU64,
+    pub(crate) moving_sections: AtomicU64,
 }
 
 /// The counts ([`Counts`]).
@@ -340,6 +343,8 @@ pub(crate) static COUNTS: Counts = Counts {
     longest_move: AtomicU64::new(0),
     over_b18_quiet: AtomicU64::new(0),
     over_b18_moving: AtomicU64::new(0),
+    quiet_sections: AtomicU64::new(0),
+    moving_sections: AtomicU64::new(0),
 };
 
 fn count(counter: &AtomicU64, by: u64) {
@@ -384,7 +389,7 @@ pub(crate) fn report(com1: &mut Console, tsc_hz: u64) {
         |counter: &AtomicU64| u128::from(of(counter)) * 1_000_000_000 / u128::from(tsc_hz.max(1));
     let _ = writeln!(
         com1,
-        "origin-kernel: balancing: counts since boot: idle passes {}, {} with no crowded processor to look at, {} with a thread of their own ready; pulls {} ({} cache-hot, {} carrying a pending wake-up, {} of a thread moved before); looks that took nothing {}, skipped as busy (its queue lock held) {}; threads passed over: pinned {}, moved too recently {}, cache-hot {}, not published {}; moves refused {}, passes stopped {}; kicks {} at ticks, {} at reschedule upcalls, {} at wake-ups or spawns, not sent: {} over the rate, {} with nobody idle; asks {} sent, not sent: {} with the source asked already, {} over the rate; longest idle pass {} ns; its interrupts-off sections: the longest without a move {} ns, with one {} ns, the move itself {} ns; sections over B18's 50 us: {} without a move, {} with one",
+        "origin-kernel: balancing: counts since boot: idle passes {}, {} with no crowded processor to look at, {} with a thread of their own ready; pulls {} ({} cache-hot, {} carrying a pending wake-up, {} of a thread moved before); looks that took nothing {}, skipped as busy (its queue lock held) {}; threads passed over: pinned {}, moved too recently {}, cache-hot {}, not published {}; moves refused {}, passes stopped {}; kicks {} at ticks, {} at reschedule upcalls, {} at wake-ups or spawns, not sent: {} over the rate, {} with nobody idle; asks {} sent, not sent: {} with the source asked already, {} over the rate; longest idle pass {} ns; its interrupts-off sections: the longest without a move {} ns, with one {} ns, the move itself {} ns; sections over B18's 50 us: {} of {} without a move, {} of {} with one",
         of(&c.passes),
         of(&c.no_victim),
         of(&c.own),
@@ -413,7 +418,9 @@ pub(crate) fn report(com1: &mut Console, tsc_hz: u64) {
         nanos(&c.longest_moving),
         nanos(&c.longest_move),
         of(&c.over_b18_quiet),
+        of(&c.quiet_sections),
         of(&c.over_b18_moving),
+        of(&c.moving_sections),
     );
 }
 
@@ -471,10 +478,12 @@ fn sectioned(took: u64, carried: u64) {
     let over = SETUP.get().is_some_and(|setup| took > setup.b18);
     if carried == 0 {
         c.longest_quiet.fetch_max(took, Relaxed);
+        count(&c.quiet_sections, 1);
         count(&c.over_b18_quiet, u64::from(over));
     } else {
         c.longest_moving.fetch_max(took, Relaxed);
         c.longest_move.fetch_max(carried, Relaxed);
+        count(&c.moving_sections, 1);
         count(&c.over_b18_moving, u64::from(over));
     }
 }
