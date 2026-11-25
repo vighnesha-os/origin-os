@@ -67,6 +67,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
 use crate::prim;
+use crate::{SpinGuard, SpinLock};
 
 /// What a processor's run queue held at its last census, as it publishes it.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -473,6 +474,16 @@ pub fn publish_then_find_idle<'a>(
     nearest_idle(me, &masks.idle, levels, element, allowed)
 }
 
+/// Takes `lock` with at most `tries` tries, one compare-and-swap each and no pause between them;
+/// `None` if every try found it held. A balancer's look at a busy processor's run queue does not
+/// wait for it: it goes on to its next victim, and looks again at its next pass, which a tick or a
+/// kick brings (ADR-0020 S7; the coordinating session's ruling on TASKS item 98's idle sections,
+/// 2026-11-25). It never spins: an interrupts-off section that calls it holds it for at most
+/// `tries` atomic operations.
+pub fn take_within<T>(lock: &SpinLock<T>, tries: u32) -> Option<SpinGuard<'_, T>> {
+    (0..tries).find_map(|_| lock.try_lock())
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
@@ -552,6 +563,27 @@ mod tests {
         assert!(!hints.any());
         // A mask for no processor still holds a word.
         assert!(!Hints::new(0).unwrap().any());
+    }
+
+    /// The balancer's wait at a queue lock is bounded: a held lock is given up after the tries,
+    /// and a free one is taken at the first.
+    #[test]
+    fn a_held_lock_is_given_up_after_its_tries_and_a_free_one_taken() {
+        let lock = SpinLock::new(7u32);
+        {
+            let held = lock.lock();
+            for tries in [0, 1, 4] {
+                assert!(
+                    take_within(&lock, tries).is_none(),
+                    "{tries} tries at a held lock"
+                );
+            }
+            drop(held);
+        }
+        assert!(take_within(&lock, 0).is_none(), "no try takes nothing");
+        let taken = take_within(&lock, 1).expect("a free lock, at the first try");
+        assert_eq!(*taken, 7);
+        assert!(take_within(&lock, 1).is_none(), "and it is then held");
     }
 
     /// ADR-0020 S7.2: one balancing interrupt a tick.
