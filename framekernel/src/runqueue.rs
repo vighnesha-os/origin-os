@@ -715,9 +715,10 @@ impl<R: Copy> RunQueue<R> {
         if let Some(a) = self.bal.arrived.get_mut(slot) {
             *a = NEVER_ARRIVED;
         }
-        // A thread pushed here has run nowhere yet: it has waited since before the mark, as far
-        // as any cache knows ([`RunQueue::judge`]). An arrival is not so ([`RunQueue::arrive`]).
-        self.bal.mark_waiting |= bit(slot);
+        // A spawn into a slot starts unmarked: nothing of the slot's last thread carries over, and
+        // the new thread counts as off the processor from the first mark it is here for
+        // ([`RunQueue::mark`]; the coordinating session's ruling on the gates' stop, 2026-11-25).
+        self.bal.mark_waiting &= !bit(slot);
         self.bal.ran &= !bit(slot);
         if let Some(m) = self.bal.mark_pass.get_mut(slot) {
             *m = floor;
@@ -785,10 +786,16 @@ impl<R: Copy> RunQueue<R> {
             .min()
     }
 
-    /// Raises `slot`'s pass to at least `floor`: it is becoming ready.
+    /// Raises `slot`'s pass to at least `floor`: it is becoming ready. A wake-up's admission is
+    /// not a charge, so the cache-hot rule's mark carries forward with it: the slot's pass at the
+    /// mark is the admitted one ([`RunQueue::mark`]). A thread that ran after the mark still shows
+    /// it in `ran`, which every way of leaving the processor without a charge sets.
     fn admit(&mut self, slot: usize, floor: u64) {
         if let Some(p) = self.pass.get_mut(slot) {
             *p = (*p).max(floor);
+            if let Some(m) = self.bal.mark_pass.get_mut(slot) {
+                *m = *p;
+            }
         }
     }
 
@@ -1267,19 +1274,36 @@ impl<R: Copy> RunQueue<R> {
         self.since_arrival(slot).is_none_or(|ticks| ticks > period)
     }
 
-    /// Whether the thread in `slot` has stayed off this processor since the mark: it was ready
-    /// and not running at the mark, or was pushed since; it is ready and not running now; and
-    /// nothing shows it ran in between. Every way a context leaves the processor shows: a tick or
-    /// a yield charges its pass, and a block, a sleep or a wake-up's preemption notes it in `ran`.
-    fn waited(&self, slot: usize) -> bool {
+    /// Whether the thread in `slot` has stayed off this processor since the mark: it was off it at
+    /// the mark (ready, blocked or sleeping, and not running); it is off it now; and nothing shows
+    /// it ran in between. Every way a context leaves the processor shows: a tick or a yield
+    /// charges its pass, and a block, a sleep or a wake-up's preemption notes it in `ran`. A
+    /// wake-up's admission is not a charge ([`RunQueue::admit`] carries the mark forward).
+    fn off_since_mark(&self, slot: usize) -> bool {
         let pass = self.pass.get(slot).copied();
         self.bal.mark_waiting & bit(slot) != 0
             && self.bal.ran & bit(slot) == 0
             && slot != self.current
-            && self.state.get(slot) == Some(&State::Ready)
+            && matches!(
+                self.state.get(slot),
+                Some(State::Ready | State::Blocked(_) | State::Sleeping(_))
+            )
             && pass == self.bal.mark_pass.get(slot).copied()
             // A pass at its largest cannot show a charge.
             && pass != Some(u64::MAX)
+    }
+
+    /// [`RunQueue::off_since_mark`], and ready now: a thread a pull or a kick could take.
+    fn waited(&self, slot: usize) -> bool {
+        self.state.get(slot) == Some(&State::Ready) && self.off_since_mark(slot)
+    }
+
+    /// The threads balancing may take that have stayed off the processor since the mark
+    /// ([`RunQueue::off_since_mark`]), blocked and sleeping ones included.
+    fn off_mask(&self) -> u16 {
+        (1..CAPACITY)
+            .filter(|&slot| self.is_balanced(slot) && self.off_since_mark(slot))
+            .fold(0, |off, slot| off | bit(slot))
     }
 
     /// The threads balancing may take that have waited since the mark ([`RunQueue::waited`]).
@@ -1295,30 +1319,41 @@ impl<R: Copy> RunQueue<R> {
     /// that have not run since. Its own processor only: the mark's TSC is this processor's, and no
     /// other's reading may be compared with it (N10).
     ///
-    /// At a tick it is called before the queue's step, so that a thread that waited the whole of
-    /// the last tick is named, and [`RunQueue::mark`] after the step. It never names a thread
-    /// that ran within `h`: a thread named was ready and not running from the mark to `now`, or
-    /// has run nowhere at all. It leaves out threads that have in fact been off the processor
-    /// longer: one that was blocked at the mark, and one that arrived by a move since it.
+    /// At a tick it is called before the queue's step, so that a thread that was off the
+    /// processor the whole of the last tick is judged, and [`RunQueue::mark`] after the step. A
+    /// thread blocked or sleeping is judged as a ready one is (ADR-0020 S10: "ran on its
+    /// processor less than H ago"), and keeps the judgement through its wake-up, at the same
+    /// window's resolution (the coordinating session's ruling on the gates' stop, 2026-11-25). It
+    /// never names a thread that ran within `h`: a thread judged was off the processor from the
+    /// mark to `now`. It leaves out one that arrived by a move since the mark, and one spawned
+    /// since it, until a mark finds it here.
     pub fn judge(&mut self, now: u64, h: u64) {
-        let mut cold = self.cold();
+        let off = self.off_mask();
+        let mut cold = self.bal.cold & off;
         if now.saturating_sub(self.bal.mark_tsc) >= h {
-            cold |= self.waited_since_mark();
+            cold |= off;
         }
         self.bal.cold = cold;
     }
 
-    /// Sets the mark: this processor's own TSC, `now`; the contexts that are ready and not
-    /// running; and every slot's pass. Its own processor only, at its tick, after the queue's
-    /// step. The threads judged not cache-hot stay so while they still wait.
+    /// Sets the mark: this processor's own TSC, `now`; the occupied slots off the processor
+    /// (ready, blocked or sleeping, and not running); and every slot's pass. Its own processor
+    /// only, at its tick, after the queue's step. The threads judged not cache-hot stay so while
+    /// they stay off the processor, blocked and sleeping ones included.
     pub fn mark(&mut self, now: u64) {
-        let cold = self.cold();
+        let cold = self.bal.cold & self.off_mask();
         self.bal.mark_tsc = now;
         self.bal.mark_pass = self.pass;
         self.bal.ran = 0;
         self.bal.mark_waiting = (0..CAPACITY)
-            .filter(|&slot| slot != self.current && self.state.get(slot) == Some(&State::Ready))
-            .fold(0, |waiting, slot| waiting | bit(slot));
+            .filter(|&slot| {
+                slot != self.current
+                    && matches!(
+                        self.state.get(slot),
+                        Some(State::Ready | State::Blocked(_) | State::Sleeping(_))
+                    )
+            })
+            .fold(0, |off, slot| off | bit(slot));
         self.bal.cold = cold & self.bal.mark_waiting;
     }
 
@@ -2630,9 +2665,9 @@ mod tests {
 
     /// ADR-0020 S10's cache-hot window, as built (TASKS item 98): a waiting thread is judged not
     /// cache-hot when it has stayed off the processor since the processor's mark and the mark is
-    /// the window or more behind, on the processor's own TSC. A thread pushed here has run
-    /// nowhere; one that ran since the mark, by a tick, a yield, a block or a preemption, is not
-    /// named until it has waited through a mark; an arrival neither.
+    /// the window or more behind, on the processor's own TSC. A spawn starts unmarked; one that
+    /// ran since the mark, by a tick, a yield, a block or a preemption, is not named until it has
+    /// been off the processor through a mark; an arrival neither.
     #[test]
     fn a_thread_that_has_waited_since_the_mark_is_judged_cold() {
         const H: u64 = 1000;
@@ -2649,14 +2684,18 @@ mod tests {
             q.mark(now);
             next
         };
-        // Pushed threads have run nowhere: cold once the mark, here the boot's, is a window old.
-        q.judge(999, H);
-        assert_eq!(q.cold(), 0);
+        // A spawn starts unmarked: nothing is judged until a mark has found the threads here.
         q.judge(1000, H);
-        assert_eq!(q.cold(), bit(a) | bit(b));
-        // The first tick runs `a`: `b` still waits, and stays cold across the mark.
+        assert_eq!(q.cold(), 0);
+        // The first tick runs `a` and marks `b`, waiting: not cold within the window after it.
         assert_eq!(tick(&mut q, 10_000, 0x9000), 0x1000);
-        assert_eq!(q.cold(), bit(b));
+        assert_eq!(q.cold(), 0);
+        q.judge(11_000, H);
+        assert_eq!(
+            q.cold(),
+            bit(b),
+            "off the processor for the window since the mark"
+        );
         // The next tick switches `a` out and runs `b`: `a` ran until now.
         assert_eq!(tick(&mut q, 20_000, 0x1100), 0x2000);
         assert_eq!(q.cold(), 0, "the only waiting thread has just run");
@@ -2704,6 +2743,115 @@ mod tests {
         let before = q.cold();
         q.judge(59_000, H);
         assert_eq!(q.cold(), before);
+    }
+
+    /// The cache-hot rule for threads that block or sleep (ADR-0020 S10: "ran on its processor
+    /// less than H ago"; the coordinating session's ruling on TASKS item 98's gates' stop,
+    /// 2026-11-25): blocked or sleeping at a mark counts as off the processor; a wake-up's
+    /// admission carries the mark forward; `ran` still makes a thread hot that ran after the mark;
+    /// a spawn starts unmarked. Cases (a) to (e) of the ruling.
+    mod blocked_and_sleeping_under_the_cache_hot_rule {
+        use super::super::*;
+
+        const H: u64 = 1000;
+
+        /// As the tick's upcall does: the judgement before the step, the step, then the mark.
+        fn tick(q: &mut RunQueue, now: u64, here: u64) -> u64 {
+            q.judge(now, H);
+            let next = q.tick(here);
+            q.mark(now);
+            next
+        }
+
+        /// A queue with an idle flow and one thread declared for balancing, running at `now`
+        /// 10_000 since a tick there.
+        fn one_running() -> (RunQueue, usize) {
+            let mut q = RunQueue::new();
+            q.set_idle(true);
+            let t = q.push(0x1000).unwrap();
+            q.set_balanced(t);
+            assert_eq!(tick(&mut q, 10_000, 0x9000), 0x1000);
+            assert_eq!(q.current(), t);
+            (q, t)
+        }
+
+        /// (a) Blocked for 50 windows, woken, and judged at once: cold.
+        #[test]
+        fn a_thread_woken_after_a_long_block_is_cold_at_once() {
+            let (mut q, t) = one_running();
+            assert!(q.block(0x1100).is_ok());
+            let mut now = 10_000;
+            for _ in 0..50 {
+                now += 10 * H;
+                tick(&mut q, now, 0x9100);
+            }
+            assert!(q.wake(t, q.generation(t)));
+            q.judge(now + 10, H);
+            assert_ne!(q.cold() & bit(t), 0);
+        }
+
+        /// (b) Ran after the mark, blocked, woken before the next mark: hot.
+        #[test]
+        fn a_thread_that_ran_after_the_mark_is_hot_when_woken() {
+            let (mut q, t) = one_running();
+            assert!(q.block(0x1100).is_ok());
+            assert!(q.wake(t, q.generation(t)));
+            q.judge(10_000 + 5 * H, H);
+            assert_eq!(q.cold() & bit(t), 0);
+        }
+
+        /// (c) Blocked at a mark, woken, ran, blocked again and woken before the next mark: hot.
+        #[test]
+        fn a_thread_that_ran_after_its_wake_up_is_hot() {
+            let (mut q, t) = one_running();
+            assert!(q.block(0x1100).is_ok());
+            tick(&mut q, 20_000, 0x9100);
+            assert!(q.wake(t, q.generation(t)));
+            // It runs: the idle flow yields to it.
+            assert_eq!(q.yield_now(0x9200), 0x1100);
+            assert_eq!(q.current(), t);
+            assert!(q.block(0x1200).is_ok());
+            assert!(q.wake(t, q.generation(t)));
+            q.judge(20_000 + 5 * H, H);
+            assert_eq!(q.cold() & bit(t), 0);
+        }
+
+        /// (d) A slot freed and spawned into again inherits no mark.
+        #[test]
+        fn a_spawn_into_a_freed_slot_inherits_no_mark() {
+            let (mut q, t) = one_running();
+            assert!(q.block(0x1100).is_ok());
+            tick(&mut q, 20_000, 0x9100);
+            q.judge(21_000, H);
+            assert!(q.wake(t, q.generation(t)));
+            assert_ne!(
+                q.cold() & bit(t),
+                0,
+                "the old thread, off the processor since the mark"
+            );
+            assert!(q.depart(t).is_some());
+            let u = q.push(0x2000).unwrap();
+            assert_eq!(u, t, "the freed slot");
+            q.set_balanced(u);
+            q.judge(21_500, H);
+            assert_eq!(q.cold() & bit(u), 0);
+        }
+
+        /// (e) A wake-up for a slot no mark found (spawned since the last one, it ran and blocked):
+        /// hot.
+        #[test]
+        fn a_wake_up_of_a_slot_not_marked_is_hot() {
+            let mut q = RunQueue::new();
+            q.set_idle(true);
+            tick(&mut q, 10_000, 0x9000);
+            let t = q.push(0x1000).unwrap();
+            q.set_balanced(t);
+            assert_eq!(q.yield_now(0x9100), 0x1000);
+            assert!(q.block(0x1100).is_ok());
+            assert!(q.wake(t, q.generation(t)));
+            q.judge(10_000 + 5 * H, H);
+            assert_eq!(q.cold() & bit(t), 0);
+        }
     }
 
     /// The count of balancing interrupts a processor sent is kept against its queue's own ticks,
@@ -2786,6 +2934,8 @@ mod tests {
             arrived: Option<u64>,
             /// The last moment it was running.
             ran_until: Option<u64>,
+            /// The queue and the count of its marks when a wake-up last made it ready.
+            woken_in: Option<(usize, u64)>,
         }
 
         /// The thread each queue runs, if it runs one.
@@ -2793,8 +2943,11 @@ mod tests {
             queues.iter().map(|q| q.record(q.current())).collect()
         }
 
-        /// One seed's run; returns how many times a thread was named cold, and the asks sent.
-        fn run(seed: u64, steps: usize) -> (u64, u64) {
+        /// One seed's run; returns how many times a thread was named cold, the asks sent, and how
+        /// many times a thread was named cold before any mark since a wake-up made it ready: off
+        /// the processor through its block, as ADR-0020 S10 counts it (the ruling on TASKS item
+        /// 98's gates' stop).
+        fn run(seed: u64, steps: usize) -> (u64, u64, u64) {
             let mut rng = Rng(seed | 1);
             let n = 2 + rng.below(2);
             let mut queues: alloc::vec::Vec<RunQueue> = (0..n)
@@ -2805,7 +2958,9 @@ mod tests {
                 })
                 .collect();
             let mut threads: alloc::vec::Vec<Thread> = alloc::vec![Thread::default()];
-            let (mut now, mut named_cold) = (0u64, 0u64);
+            let (mut now, mut named_cold, mut at_once) = (0u64, 0u64, 0u64);
+            // Each queue's marks, counted by the model.
+            let mut marks: alloc::vec::Vec<u64> = alloc::vec![0; n];
             // Each processor's TSC is its own: the machine's clock plus an offset no queue is
             // told. A judgement that compared two processors' readings would be off by it.
             let skew: alloc::vec::Vec<u64> = (0..n).map(|_| rng.next() % 1_000_000_000).collect();
@@ -2845,6 +3000,7 @@ mod tests {
                             q.judge(own, H);
                             q.tick(here);
                             q.mark(own);
+                            marks[c] += 1;
                         } else {
                             q.tick(here);
                         }
@@ -2866,7 +3022,11 @@ mod tests {
                     6 => {
                         let slot = 1 + rng.below(CAPACITY - 1);
                         let generation = q.generation(slot);
-                        q.wake(slot, generation);
+                        if q.wake(slot, generation)
+                            && let Some(id) = q.record(slot)
+                        {
+                            threads[id as usize].woken_in = Some((c, marks[c]));
+                        }
                     }
                     7 => {
                         q.preempt_for_wake(here);
@@ -2938,6 +3098,9 @@ mod tests {
                     for slot in (0..CAPACITY).filter(|&slot| cold & bit(slot) != 0) {
                         let id = q.record(slot).unwrap();
                         named_cold += 1;
+                        if threads[id as usize].woken_in == Some((k, marks[k])) {
+                            at_once += 1;
+                        }
                         // Never ran, or ran last a window or more ago: the rule's one promise.
                         if let Some(ran_until) = threads[id as usize].ran_until {
                             assert!(
@@ -2951,23 +3114,31 @@ mod tests {
             }
             let counted: u64 = queues.iter().map(|q| q.asks().0).sum();
             assert_eq!(counted, asks, "seed {seed:#x}: the asks counted");
-            (named_cold, asks)
+            (named_cold, asks, at_once)
         }
 
         /// Fixed seeds, printed in every failure.
         #[test]
         fn the_balancing_state_agrees_with_the_model_over_random_sequences() {
-            let (mut named_cold, mut asks) = (0, 0);
+            let (mut named_cold, mut asks, mut at_once) = (0, 0, 0);
             for seed in 0..64u64 {
-                let (cold, asked) = run(0xd1b5_4a32_d192_ed03u64.wrapping_mul(seed + 1), 3000);
+                let (cold, asked, once) =
+                    run(0xd1b5_4a32_d192_ed03u64.wrapping_mul(seed + 1), 3000);
                 named_cold += cold;
                 asks += asked;
+                at_once += once;
             }
             assert!(
                 named_cold > 1000,
                 "the sequences named a thread cold {named_cold} times"
             );
             assert!(asks > 1000, "the sequences sent {asks} asks");
+            // Woken after a block that a mark found, and named cold before the next mark: the
+            // old rule, which counted only threads ready at the mark, never did.
+            assert!(
+                at_once > 0,
+                "no thread was named cold between its wake-up and its queue's next mark"
+            );
         }
     }
 
