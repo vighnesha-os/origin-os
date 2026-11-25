@@ -87,12 +87,15 @@
 //!
 //! # Interrupts off
 //!
-//! A pass is one interrupts-off section that ends in the halt (`sti; hlt`), so no interrupt can
-//! fall between "nothing to pull" and the halt: one that arrives meanwhile ends the halt at once.
-//! The section holds at most [`TRIES`] looks under a pair of locks and one move. Its longest is
-//! kept ([`Counts::longest_pass`]) to print beside budget B18. Outside it the idle flow runs with
-//! interrupts on, as it did before this item: its reap is preemptible (`run_ap`; the review's
-//! D98-2).
+//! Each victim a pass tries is its own interrupts-off section: the search, both queue locks, the
+//! checks and at most one move. Interrupts are on between them (the contract's §2; the
+//! coordinating session's ruling of 2026-11-25, which found the pass first built as one section).
+//! The last section publishes that the processor is idle, reads who is crowded once more, looks
+//! at what it found, and ends in the halt (`sti; hlt`), so no interrupt can fall between that
+//! read and the halt: one that arrives meanwhile ends the halt at once. Each section's time is
+//! kept against budget B18, the pass's whole length as a trend ([`Counts::longest_pass`]). The
+//! idle flow runs with interrupts on outside its sections, as it did before this item: its reap is
+//! preemptible (`run_ap`; the review's D98-2).
 //!
 //! # What it costs where no thread is declared for balancing
 //!
@@ -283,11 +286,12 @@ pub(crate) struct Counts {
     pub(crate) too_soon: AtomicU64,
     pub(crate) hot_across: AtomicU64,
     /// The longest idle pass, in TSC ticks of the processor that made it, from its start to its
-    /// halt or its pull; the longest of those that made no move, and of those that made one; the
-    /// longest move a pass made (`sched::carry`, under both queue locks); and the passes longer
-    /// than budget B18's 50 us, without a move and with one. So a boot tells a pass's own work
-    /// from a move's, and both from the host's stalls (the coordinating session's ruling on the
-    /// first boots' 1.05 ms pass).
+    /// halt or its pull, its sections and the gaps between them (a trend); the longest of its
+    /// interrupts-off sections that made no move, and of those that made one; the longest move a
+    /// section made (`sched::carry`, under both queue locks); and the sections longer than budget
+    /// B18's 50 us, without a move and with one. So a boot tells a section's own work from a
+    /// move's, and both from the host's stalls (the coordinating session's rulings on the first
+    /// boots' 1.05 ms pass).
     pub(crate) longest_pass: AtomicU64,
     pub(crate) longest_quiet: AtomicU64,
     pub(crate) longest_moving: AtomicU64,
@@ -373,7 +377,7 @@ pub(crate) fn report(com1: &mut Console, tsc_hz: u64) {
         |counter: &AtomicU64| u128::from(of(counter)) * 1_000_000_000 / u128::from(tsc_hz.max(1));
     let _ = writeln!(
         com1,
-        "origin-kernel: balancing: counts since boot: idle passes {}, {} with no crowded processor to look at, {} with a thread of their own ready; pulls {} ({} cache-hot, {} carrying a pending wake-up, {} of a thread moved before); looks that took nothing {}, given up at a held queue lock {}; threads passed over: pinned {}, moved too recently {}, cache-hot {}, not published {}; moves refused {}, passes stopped {}; kicks {} at ticks, {} at reschedule upcalls, {} at wake-ups or spawns, not sent: {} over the rate, {} with nobody idle; asks {} sent, not sent: {} with the source asked already, {} over the rate; longest idle pass {} ns: without a move {} ns, with one {} ns, the move itself {} ns; passes over B18's 50 us: {} without a move, {} with one",
+        "origin-kernel: balancing: counts since boot: idle passes {}, {} with no crowded processor to look at, {} with a thread of their own ready; pulls {} ({} cache-hot, {} carrying a pending wake-up, {} of a thread moved before); looks that took nothing {}, given up at a held queue lock {}; threads passed over: pinned {}, moved too recently {}, cache-hot {}, not published {}; moves refused {}, passes stopped {}; kicks {} at ticks, {} at reschedule upcalls, {} at wake-ups or spawns, not sent: {} over the rate, {} with nobody idle; asks {} sent, not sent: {} with the source asked already, {} over the rate; longest idle pass {} ns; its interrupts-off sections: the longest without a move {} ns, with one {} ns, the move itself {} ns; sections over B18's 50 us: {} without a move, {} with one",
         of(&c.passes),
         of(&c.no_victim),
         of(&c.own),
@@ -421,44 +425,23 @@ fn element(cpu: u32) -> Option<&'static Element> {
     BALANCE.get(cpu as usize)
 }
 
-/// What a pass came to.
-enum Passed {
-    /// A thread was pulled, or one of this processor's own is ready: the idle flow yields.
-    Run,
-    /// Nothing to run: the idle flow halts.
-    Halt,
-}
-
-/// The idle flow's turn (`run_ap`'s loop): one pass of the idle pull, then the halt, or, with a
-/// thread to run, a yield to it. `_flow` is the idle flow's witness: no thread calls this.
-///
-/// The pass and the halt are one stretch with interrupts off (`cpu::without_interrupts`), so no
-/// interrupt falls between the pass's last look and the halt. The pass itself runs under the
-/// section's token (`cpu::without_interrupts_off`), whose closure neither halts nor yields; the
-/// halt comes after it, outside the token's life. The idle flow is called with interrupts on and
-/// goes on with them on.
-pub(super) fn idle(_flow: Pinned<'_>) {
-    let (run, owed) = cpu::without_interrupts(|| {
-        let (passed, owed) = cpu::without_interrupts_off(|off| {
-            let me = cpu::this_cpu(off.here());
-            let start = rdtsc();
-            let (mut owed, mut carried) = (None, 0);
-            let passed = pass(off, me, &mut owed, &mut carried);
-            // Both readings are this processor's.
-            timed(rdtsc().saturating_sub(start), carried);
-            (passed, owed)
-        });
-        match passed {
-            Passed::Run => (true, owed),
-            // A line is owed: it is written before this processor halts (the review's R98-5).
-            Passed::Halt if owed.is_some() => (false, owed),
-            Passed::Halt => {
-                // With interrupts still off: one that came during the pass ends the halt at once.
-                cpu::idle_disabling();
-                (false, None)
-            }
+/// The idle flow's turn (`run_ap`'s loop): one pass of the idle pull, which halts the processor
+/// when it finds nothing to run, or, with a thread to run, a yield to it. `flow` is the idle
+/// flow's witness: no thread calls this. The idle flow calls it with interrupts on, and goes on
+/// with them on.
+pub(super) fn idle(flow: Pinned<'_>) {
+    // The idle flow's own witness: it never moves, so its processor's index holds across the
+    // pass's sections and the interrupts between them.
+    let me = cpu::this_cpu(flow.here());
+    let start = rdtsc();
+    let mut owed = None;
+    let run = match SETUP.get() {
+        Some(setup) => pass(me, setup, start, &mut owed),
+        None => {
+            halt();
+            false
         }
-    });
+    };
     if let Some((trigger, on)) = owed {
         pinned::line(trigger, on, "; the thread stays where it is");
     }
@@ -468,10 +451,16 @@ pub(super) fn idle(_flow: Pinned<'_>) {
     }
 }
 
-/// Keeps a pass's time, `took` TSC ticks, of which `carried` in a move ([`Counts::longest_pass`]).
-fn timed(took: u64, carried: u64) {
+/// The halt with nothing to pull: `sti; hlt; cli` in a stretch with interrupts off, so that an
+/// interrupt that came before it ends it at once; interrupts on again after it.
+fn halt() {
+    cpu::without_interrupts(cpu::idle_disabling);
+}
+
+/// Keeps one section's time, `took` TSC ticks, of which `carried` in a move
+/// ([`Counts::longest_quiet`]).
+fn sectioned(took: u64, carried: u64) {
     let c = &COUNTS;
-    c.longest_pass.fetch_max(took, Relaxed);
     let over = SETUP.get().is_some_and(|setup| took > setup.b18);
     if carried == 0 {
         c.longest_quiet.fetch_max(took, Relaxed);
@@ -483,16 +472,32 @@ fn timed(took: u64, carried: u64) {
     }
 }
 
-/// One pass of the idle pull on this processor. `carried` gains the TSC ticks of a move it makes.
+/// What one section of a pass came to.
+enum Step {
+    /// No crowded processor this flow may look at.
+    None,
+    /// A look at a victim, and what it came to.
+    Looked(u32, Pull),
+}
+
+/// One pass of the idle pull on this processor: `true` if the idle flow is to run a thread. It
+/// halts the processor itself when there is none, unless a pinned-mode line is owed.
+///
+/// **Its sections** (the contract's §2; the coordinating session's ruling of 2026-11-25). Each
+/// victim tried is its own interrupts-off section: the search, both queue locks, the checks and
+/// at most one move. Interrupts are on between them, so a pass holds them off for one look at a
+/// time, which is what budget B18 bounds. The last step is one more short section: this
+/// processor publishes that it is idle, reads who is crowded once more
+/// (`origin_sync::balance::idle_then_choose`, "Neither misses the other"), looks at what that
+/// read found, if anything, and halts in the same stretch, so no interrupt falls between that
+/// read and the halt. The pass's whole length, sections and gaps, is kept as a trend
+/// ([`Counts::longest_pass`]).
 fn pass(
-    off: InterruptsOff<'_>,
     me: ThisCpu<'_>,
+    setup: &Setup,
+    start: u64,
     owed: &mut Option<(pinned::Trigger, CpuIndex)>,
-    carried: &mut u64,
-) -> Passed {
-    let Some(setup) = SETUP.get() else {
-        return Passed::Halt;
-    };
+) -> bool {
     let index = me.index().get();
     let (Some(own), Some(levels), Some(held), Ok(mine)) = (
         BALANCE.this(me),
@@ -500,7 +505,8 @@ fn pass(
         setup.held.get(index),
         u32::try_from(index),
     ) else {
-        return Passed::Halt;
+        halt();
+        return false;
     };
     // A processor that takes no part in moves, or that is to be avoided (capacity 0, ADR-0020
     // S9), never says it is idle: nobody kicks it, and it pulls nothing.
@@ -509,69 +515,131 @@ fn pass(
         || crate::capacity::current(index) == 0
         || pinned::withdrawn()
     {
-        return Passed::Halt;
+        halt();
+        return false;
     }
     count(&COUNTS.passes, 1);
     let mut tried = [u32::MAX; TRIES];
-    let (mut looked, mut first, mut cleared) = (0, true, false);
+    let (mut looked, mut cleared) = (0, false);
+    // A look at the victim `choose` finds, in a section of its own.
+    let look = |tried: &[u32; TRIES], owed: &mut Option<(pinned::Trigger, CpuIndex)>| {
+        cpu::without_interrupts_off(|off| {
+            let began = rdtsc();
+            let allowed = |cpu: u32, _: usize| {
+                setup.takes_part(cpu as usize) && !tried.contains(&cpu) && !held.test(cpu as usize)
+            };
+            let Some(victim) =
+                published::choose(mine, &setup.masks.crowded, levels, element, allowed)
+            else {
+                return Step::None;
+            };
+            let mut carried = 0;
+            let pulled = pull_from(off, me, victim, setup, owed, &mut carried);
+            sectioned(rdtsc().saturating_sub(began), carried);
+            Step::Looked(victim.cpu, pulled)
+        })
+    };
     while looked < TRIES {
-        let allowed = |cpu: u32, _: usize| {
-            setup.takes_part(cpu as usize) && !tried.contains(&cpu) && !held.test(cpu as usize)
-        };
-        // The first look publishes that this processor is idle, and only then reads who is
-        // crowded (`origin_sync::balance`, "Neither misses the other").
-        let victim = if first {
-            published::idle_then_choose(mine, own, &setup.masks, levels, element, allowed)
-        } else {
-            published::choose(mine, &setup.masks.crowded, levels, element, allowed)
-        };
-        first = false;
-        let Some(victim) = victim else {
-            // Every crowded processor left is one this flow passes over: they all get another
-            // turn, once in a pass, and in this pass if it has looks left.
-            if !cleared && held.any() {
-                held.clear_all();
-                cleared = true;
-                continue;
+        let (cpu, pulled) = match look(&tried, owed) {
+            Step::Looked(cpu, pulled) => (cpu, pulled),
+            Step::None => {
+                // Every crowded processor left is one this flow passes over: they all get
+                // another turn, once in a pass, and in this pass if it has looks left.
+                if !cleared && held.any() {
+                    held.clear_all();
+                    cleared = true;
+                    continue;
+                }
+                count(&COUNTS.no_victim, u64::from(looked == 0));
+                break;
             }
-            count(&COUNTS.no_victim, u64::from(looked == 0));
-            return Passed::Halt;
         };
         if let Some(slot) = tried.get_mut(looked) {
-            *slot = victim.cpu;
+            *slot = cpu;
         }
         looked += 1;
-        match pull_from(off, me, victim, setup, owed, carried) {
-            Pull::Made => {
-                own.leave_idle();
-                held.clear_all();
-                return Passed::Run;
-            }
-            Pull::Own => {
-                count(&COUNTS.own, 1);
-                own.leave_idle();
-                return Passed::Run;
-            }
-            Pull::Stop => {
-                count(&COUNTS.stopped, 1);
-                return Passed::Halt;
-            }
-            // The source was asked to publish: this processor idles, and the source's kick wakes
-            // it (ADR-0020 Amendment 1, step 1: "it then idles"). The source is passed over
-            // until the others have had their turn, so that a processor whose asks another
-            // always answers first still reaches the rest (the review's D98-1).
-            Pull::Asked => {
-                held.set(victim.cpu as usize);
-                return Passed::Halt;
-            }
-            Pull::Nothing => {
-                count(&COUNTS.nothing, 1);
-                held.set(victim.cpu as usize);
-            }
-            Pull::Later => {}
+        match settle_look(cpu, pulled, own, held) {
+            Some(run) => return finish(start, run, owed),
+            None => continue,
         }
     }
-    Passed::Halt
+    // The last section: publish idle, read who is crowded once more, look at what it found, and
+    // halt, in one stretch with interrupts off.
+    cpu::without_interrupts(|| {
+        let (run, done) = cpu::without_interrupts_off(|off| {
+            let began = rdtsc();
+            let allowed = |cpu: u32, _: usize| {
+                setup.takes_part(cpu as usize) && !tried.contains(&cpu) && !held.test(cpu as usize)
+            };
+            let found =
+                published::idle_then_choose(mine, own, &setup.masks, levels, element, allowed);
+            let mut carried = 0;
+            let settled = found.map(|victim| {
+                let pulled = pull_from(off, me, victim, setup, owed, &mut carried);
+                settle_look(victim.cpu, pulled, own, held)
+            });
+            sectioned(rdtsc().saturating_sub(began), carried);
+            match settled.flatten() {
+                Some(true) => (true, true),
+                _ => (false, owed.is_some()),
+            }
+        });
+        COUNTS
+            .longest_pass
+            .fetch_max(rdtsc().saturating_sub(start), Relaxed);
+        if !done {
+            // With interrupts still off: one that came since the read ends the halt at once.
+            cpu::idle_disabling();
+        }
+        run
+    })
+}
+
+/// What a look at victim `cpu` that came to `pulled` means for the pass: `Some(true)` to run a
+/// thread, `Some(false)` to end the pass and halt, `None` to look at the next victim.
+fn settle_look(cpu: u32, pulled: Pull, own: &Element, held: &Hints) -> Option<bool> {
+    match pulled {
+        Pull::Made => {
+            own.leave_idle();
+            held.clear_all();
+            Some(true)
+        }
+        Pull::Own => {
+            count(&COUNTS.own, 1);
+            own.leave_idle();
+            Some(true)
+        }
+        Pull::Stop => {
+            count(&COUNTS.stopped, 1);
+            Some(false)
+        }
+        // The source was asked to publish: this processor idles, and the source's kick wakes it
+        // (ADR-0020 Amendment 1, step 1: "it then idles"). The source is passed over until the
+        // others have had their turn, so that a processor whose asks another always answers
+        // first still reaches the rest (the review's D98-1).
+        Pull::Asked => {
+            held.set(cpu as usize);
+            Some(false)
+        }
+        Pull::Nothing => {
+            count(&COUNTS.nothing, 1);
+            held.set(cpu as usize);
+            None
+        }
+        Pull::Later => None,
+    }
+}
+
+/// Ends a pass before its last section: keeps its length and, unless it is to run a thread or a
+/// pinned-mode line is owed, halts.
+fn finish(start: u64, run: bool, owed: &Option<(pinned::Trigger, CpuIndex)>) -> bool {
+    COUNTS
+        .longest_pass
+        .fetch_max(rdtsc().saturating_sub(start), Relaxed);
+    if !run && owed.is_none() {
+        halt();
+    }
+    run
 }
 
 /// What one look at a victim came to.
