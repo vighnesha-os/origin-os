@@ -261,7 +261,7 @@ def build(root, output):
 Origin Desktop and Origin Server are planned editions sharing one kernel and native SDK. The project is in early development.</p>
 <p>Explore the public source, architecture decisions, specifications, requirements and engineering notes below.
 These static pages work without JavaScript and link to the exact source revision on GitHub.</p>'''
-    body += "<h2>Start here</h2><ul>" + "".join(f'<li><a href="{file_url(p)}">{esc(p)}</a></li>' for p in ["README.md", "docs/PROGRESS.md", "docs/ROADMAP.md", "CONTRIBUTING.md", "SECURITY.md"] if p in texts) + "</ul>"
+    body += "<h2>Start here</h2><ul>" + "".join(f'<li><a href="{file_url(p)}">{esc(p)}</a></li>' for p in ["README.md", "PROGRESS.md", "docs/ROADMAP.md", "CONTRIBUTING.md", "SECURITY.md"] if p in texts) + "</ul>"
     body += f"<h2>Browse public files</h2><p>{len(texts)} reviewed text files. New files require a publication-list review; key material, raw logs, binary archives and test vectors are excluded.</p>" + listing("")
     (output / "index.html").write_text(page("Source and documentation", "Browse Origin OS public Rust source, Framekernel documentation, architecture decisions and native SDK specifications.", BASE_URL, body, revision, verification), encoding="utf-8")
     (output / "404.html").write_text(page("File not found", "This public file page does not exist.", BASE_URL + "404.html", '<h1>File not found</h1><p><a href="' + BASE_URL + '">Browse the current file index</a>.</p>', revision, noindex=True), encoding="utf-8")
