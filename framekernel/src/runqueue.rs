@@ -72,6 +72,11 @@
 
 /// Contexts one queue holds, its boot context included.
 pub const CAPACITY: usize = 16;
+
+/// [`RunQueue`]'s mark for a slot whose thread did not arrive by a move: pushed here, or no
+/// thread. Its ticks never reach it.
+const NEVER_ARRIVED: u64 = u64::MAX;
+
 /// The pass a weight-1 context advances per quantum.
 pub const STRIDE_ONE: u64 = 1 << 20;
 /// The weight of a context nobody chose one for; the largest weight.
@@ -455,9 +460,11 @@ pub struct RunQueue<R = u32> {
     watch: TickWatch,
     /// The slots whose thread balancing may take (ADR-0020 S7; TASKS item 98), a bit a slot.
     balanced: u16,
-    /// For each slot, [`RunQueue::ticks`] when its thread arrived by a move; `None` for a thread
-    /// that was pushed here, and for a free slot.
-    arrived: [Option<u64>; CAPACITY],
+    /// For each slot, [`RunQueue::ticks`] when its thread arrived by a move; [`NEVER_ARRIVED`]
+    /// for a thread that was pushed here, and for a free slot. A plain word, not an `Option`, so
+    /// the array takes 128 bytes, not 256 (the coordinating session's ruling on TASKS item 98's
+    /// costs): this queue's ticks never reach the sentinel.
+    arrived: [u64; CAPACITY],
     /// The mark ([`RunQueue::mark`]): this processor's own TSC at its last tick; the slots that
     /// were ready and not running then, or whose thread was pushed since; and every slot's pass
     /// then, or at its push.
@@ -594,7 +601,7 @@ impl<R: Copy> RunQueue<R> {
             switches: 0,
             watch: TickWatch::new(),
             balanced: 0,
-            arrived: [None; CAPACITY],
+            arrived: [NEVER_ARRIVED; CAPACITY],
             mark_tsc: 0,
             mark_waiting: 0,
             mark_pass: [0; CAPACITY],
@@ -694,7 +701,7 @@ impl<R: Copy> RunQueue<R> {
         self.balanced &= !bit(slot);
         self.cold &= !bit(slot);
         if let Some(a) = self.arrived.get_mut(slot) {
-            *a = None;
+            *a = NEVER_ARRIVED;
         }
         // A thread pushed here has run nowhere yet: it has waited since before the mark, as far
         // as any cache knows ([`RunQueue::judge`]). An arrival is not so ([`RunQueue::arrive`]).
@@ -1046,7 +1053,7 @@ impl<R: Copy> RunQueue<R> {
         }
         self.balanced &= !bit(self.current);
         if let Some(a) = self.arrived.get_mut(self.current) {
-            *a = None;
+            *a = NEVER_ARRIVED;
         }
         Ok(self.switch(interrupted, false))
     }
@@ -1124,7 +1131,7 @@ impl<R: Copy> RunQueue<R> {
         self.cold &= !bit(slot);
         self.mark_waiting &= !bit(slot);
         if let Some(a) = self.arrived.get_mut(slot) {
-            *a = None;
+            *a = NEVER_ARRIVED;
         }
         if let Some(s) = self.state.get_mut(slot) {
             *s = State::Free;
@@ -1168,7 +1175,7 @@ impl<R: Copy> RunQueue<R> {
         self.mark_waiting &= !bit(slot);
         // Its stay here starts now, in this queue's ticks (ADR-0020 S10's move rate).
         if let Some(a) = self.arrived.get_mut(slot) {
-            *a = Some(self.ticks);
+            *a = self.ticks;
         }
         if let Some(p) = self.pass.get_mut(slot) {
             *p = p.saturating_add(lag);
@@ -1235,8 +1242,8 @@ impl<R: Copy> RunQueue<R> {
     /// The ticks of this queue since the thread in `slot` arrived by a move; `None` for a thread
     /// that was pushed here.
     pub fn since_arrival(&self, slot: usize) -> Option<u64> {
-        let arrived = self.arrived.get(slot).copied().flatten()?;
-        Some(self.ticks.saturating_sub(arrived))
+        let arrived = self.arrived.get(slot).copied()?;
+        (arrived != NEVER_ARRIVED).then(|| self.ticks.saturating_sub(arrived))
     }
 
     /// Whether the thread in `slot` has been here long enough for a move whose period is `period`
@@ -2555,6 +2562,34 @@ mod tests {
             },
             "{c} is ready and not balanced"
         );
+    }
+
+    /// `arrived` is a plain word with a sentinel (TASKS item 98): a thread that arrived at this
+    /// queue's tick 0 is not taken for one that never arrived, and one pushed here never arrived.
+    #[test]
+    fn an_arrival_at_tick_zero_is_told_apart_from_none() {
+        let mut source = RunQueue::new();
+        let mut destination = RunQueue::new();
+        assert_eq!(destination.ticks(), 0);
+        let pushed = destination
+            .push_weighted(0x5000, DEFAULT_WEIGHT, Some(9))
+            .unwrap();
+        assert_eq!(
+            destination.since_arrival(pushed),
+            None,
+            "pushed: never arrived"
+        );
+        assert!(destination.settled(pushed, 16));
+        let slot = source
+            .push_weighted(0x6000, DEFAULT_WEIGHT, Some(7))
+            .unwrap();
+        let departed = source.depart(slot).unwrap();
+        let at = destination.arrive(departed).unwrap();
+        assert_eq!(destination.since_arrival(at), Some(0), "arrived at tick 0");
+        assert!(!destination.settled(at, 1));
+        // A free slot holds no arrival.
+        assert_eq!(destination.since_arrival(CAPACITY - 1), None);
+        assert_eq!(source.since_arrival(slot), None, "the slot it left");
     }
 
     /// ADR-0020 S10's move rate: a thread that arrived by a move is settled for a level only once
