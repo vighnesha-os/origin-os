@@ -1548,3 +1548,59 @@ On 2026-11-23 you wrote: "Can you make PROGRESS.MD clean and clear". That is ite
 - **If you want the layout changed** once you see it, say so, and the generator is changed: nothing in it is a decision of yours except that it be clean and clear.
 - **Performance cost** (ADR-0018 V3): none, by construction: a generated document and a host tool.
 - **Where it is written:** this sheet; the requirements README's table of items without rows; TASKS item 137's line.
+
+### Verification tools: Kani, fuzzing, Miri, Shuttle and Proptest (items 358 to 363): Accepted 2026-11-25
+
+On 2026-11-25 you asked whether five tools could be added:
+- Miri (`cargo miri test`);
+- Kani;
+- Shuttle, randomized concurrency testing for state spaces too large for Loom's exhaustive search;
+- Proptest, for the memory allocators and binary packers;
+- cargo-fuzz harnesses for the ONBF loader and the AML interpreter.
+
+The coordinating session checked them against CLAUDE.md and the records, and put six items, with a recommendation for each. You answered "Accept all".
+
+| # | Question | Answer |
+|---|---|---|
+| 358, answered | Start Kani now, as CLAUDE.md §73 requires: the allocator's invariants first, then the ONBF parsers' bounds, then capability checks? | **Accept** |
+| 359, answered | Try cargo-fuzz on stable Rust first, with `--sanitizer none`, on the ONBF parsers and loader and the AML interpreter? | **Accept** |
+| 360, answered | Allow one pinned nightly toolchain, used only by test tools, under CLAUDE.md §12? | **Accept** |
+| 361, answered | Run Miri on the host-tested crates that hold `unsafe`, starting with `origin-sync`? | **Accept** |
+| 362, answered | Add Shuttle beside Loom, as a test-only dependency? | **Accept** |
+| 363, answered | Add Proptest, as a test-only dependency, for the allocators and the ONBF packer? | **Accept** |
+
+- **What was found first:**
+  - **Kani:** §73 already requires it, and the matrix rows S73-02 and S73-04 name it. Nothing has been written for it yet.
+  - **Fuzzing:** the records say coverage-guided fuzzing was not done because cargo-fuzz needs nightly (§12). The source of cargo-fuzz 0.13.2, read on docs.rs on 2026-11-25, skips its toolchain check and adds no `-Z` flag when it runs with `--sanitizer none`. That it builds with Rust 1.100.0 is not shown yet. ONBF §13 item 3 already asks for structure-aware fuzzing.
+  - **Miri:** it ships only with nightly Rust. §12 allows a nightly path that is pinned, kept apart and documented.
+  - **Shuttle** (awslabs, Apache-2.0): it samples schedules for many threads. It finds bugs with a probability per run and proves nothing.
+  - **Proptest:** the project's own seeded soaks have no shrinking (row S72-03's limitation).
+- **What each item decides:**
+  - **358:** Kani's first proofs, recorded with its version and its bundled compiler, which verifies and builds nothing that ships (TASKS item 143).
+  - **359:** a smoke check of cargo-fuzz on 1.100.0 first, then harnesses. If it needs nightly after all, it comes under item 360 (TASKS item 144).
+  - **360:** one nightly, pinned by date and commit, used only by test tools. A gate holds every build, check and release on 1.100.0 (TASKS item 145).
+  - **361:** Miri on the host tests of crates that hold `unsafe`. The kernel's assembly and device access stay out of reach (TASKS item 145).
+  - **362:** Shuttle beside Loom, first for ADR-0020's balancing across many processors. Its results are recorded as tested, not proved (TASKS item 146).
+  - **363:** Proptest for allocator model tests and ONBF pack-then-parse round trips (TASKS item 147).
+- **Downloads:** accepting covers each of these once, at a version read on the day:
+  - `kani-verifier` and its compiler bundle;
+  - cargo-fuzz, `libfuzzer-sys` and `arbitrary`;
+  - `shuttle` and `proptest`;
+  - one pinned nightly toolchain with Miri.
+  The two dependencies go through §5's review before they are added.
+- **Order:**
+  1. TASKS item 144's smoke check, then TASKS items 143 and 147;
+  2. TASKS item 146;
+  3. TASKS item 145.
+  Most runs are in CI, on standard runners, so the Mac stays free for timing turns.
+- **What does not change:**
+  - Every build, check and release stays on Rust 1.100.0 (§8, §12).
+  - Nothing these tools bring ships (§5).
+  - The seeded soaks and the Loom models stay.
+  - Kani proves only bounded properties. Fuzzing, Shuttle and Proptest find bugs and prove nothing, and the records say which is which (row S73-12).
+- **Performance cost** (ADR-0018 V3): none, by construction. These are host-only tools, and nothing is on the kernel's paths.
+- **Also recorded:** GitHub's private vulnerability reporting is on (checked through GitHub's API on 2026-11-25). Item 79's last step is done, so TASKS' table of what waits on you no longer lists it.
+- **Where it is written:**
+  - this sheet;
+  - the "Decided by" column of matrix rows S12-07 to S12-09, S13-06, S72-03 to S72-06, S73-02, S73-04, S73-07 and S73-08;
+  - TASKS items 143 to 147.
