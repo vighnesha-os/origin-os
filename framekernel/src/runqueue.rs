@@ -433,6 +433,10 @@ enum State {
 /// 92's Q6). The queue only stores it and hands it back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunQueue<R = u32> {
+    /// What balancing keeps (ADR-0020 S7 and S10; TASKS item 98), in a struct of its own and
+    /// first, so that the fields a switch reads keep their order at the end, next to the lock, as
+    /// before this item (the coordinating session's ruling on B1, 2026-11-25).
+    bal: Balancing,
     saved: [u64; CAPACITY],
     state: [State; CAPACITY],
     /// Bumped each time a slot gets a new thread.
@@ -458,6 +462,12 @@ pub struct RunQueue<R = u32> {
     switches: u64,
     /// What this processor's own timer does while the preemption proof watches it.
     watch: TickWatch,
+}
+
+/// A run queue's balancing state ([`RunQueue::bal`]): which threads balancing may take, the
+/// cache-hot rule's mark, the move rate's arrivals, and the bounds' counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Balancing {
     /// The slots whose thread balancing may take (ADR-0020 S7; TASKS item 98), a bit a slot.
     balanced: u16,
     /// For each slot, [`RunQueue::ticks`] when its thread arrived by a move; [`NEVER_ARRIVED`]
@@ -586,6 +596,24 @@ impl<R: Copy> RunQueue<R> {
         let mut state = [State::Free; CAPACITY];
         state[0] = State::Ready;
         Self {
+            bal: Balancing {
+                balanced: 0,
+                arrived: [NEVER_ARRIVED; CAPACITY],
+                mark_tsc: 0,
+                mark_waiting: 0,
+                mark_pass: [0; CAPACITY],
+                ran: 0,
+                cold: 0,
+                sent: 0,
+                sent_counted_at: None,
+                sent_in_tick: 0,
+                sent_most: 0,
+                asked_at: None,
+                asks: 0,
+                asks_counted_at: None,
+                asks_in_tick: 0,
+                asks_most: 0,
+            },
             saved: [0; CAPACITY],
             state,
             generation: [0; CAPACITY],
@@ -600,22 +628,6 @@ impl<R: Copy> RunQueue<R> {
             ticks: 0,
             switches: 0,
             watch: TickWatch::new(),
-            balanced: 0,
-            arrived: [NEVER_ARRIVED; CAPACITY],
-            mark_tsc: 0,
-            mark_waiting: 0,
-            mark_pass: [0; CAPACITY],
-            ran: 0,
-            cold: 0,
-            sent: 0,
-            sent_counted_at: None,
-            sent_in_tick: 0,
-            sent_most: 0,
-            asked_at: None,
-            asks: 0,
-            asks_counted_at: None,
-            asks_in_tick: 0,
-            asks_most: 0,
         }
     }
 
@@ -698,16 +710,16 @@ impl<R: Copy> RunQueue<R> {
             *r = record;
         }
         // The slot's new thread is as its spawner or its mover says, not as the last one was.
-        self.balanced &= !bit(slot);
-        self.cold &= !bit(slot);
-        if let Some(a) = self.arrived.get_mut(slot) {
+        self.bal.balanced &= !bit(slot);
+        self.bal.cold &= !bit(slot);
+        if let Some(a) = self.bal.arrived.get_mut(slot) {
             *a = NEVER_ARRIVED;
         }
         // A thread pushed here has run nowhere yet: it has waited since before the mark, as far
         // as any cache knows ([`RunQueue::judge`]). An arrival is not so ([`RunQueue::arrive`]).
-        self.mark_waiting |= bit(slot);
-        self.ran &= !bit(slot);
-        if let Some(m) = self.mark_pass.get_mut(slot) {
+        self.bal.mark_waiting |= bit(slot);
+        self.bal.ran &= !bit(slot);
+        if let Some(m) = self.bal.mark_pass.get_mut(slot) {
             *m = floor;
         }
         Ok(slot)
@@ -934,7 +946,7 @@ impl<R: Copy> RunQueue<R> {
     pub fn preempt_for_wake(&mut self, interrupted: u64) -> u64 {
         // The running context ran, and a switch away from it here charges it nothing
         // ([`RunQueue::judge`]).
-        self.ran |= bit(self.current);
+        self.bal.ran |= bit(self.current);
         let woken = core::mem::replace(&mut self.woken, [false; CAPACITY]);
         let pass = |slot: usize| self.pass.get(slot).copied().unwrap_or(u64::MAX);
         let running = pass(self.current);
@@ -978,7 +990,7 @@ impl<R: Copy> RunQueue<R> {
         if let Some(s) = self.state.get_mut(self.current) {
             *s = State::Sleeping(until);
         }
-        self.ran |= bit(self.current);
+        self.bal.ran |= bit(self.current);
         Ok(self.switch(interrupted, false))
     }
 
@@ -1005,7 +1017,7 @@ impl<R: Copy> RunQueue<R> {
         if let Some(s) = self.state.get_mut(self.current) {
             *s = State::Blocked(until);
         }
-        self.ran |= bit(self.current);
+        self.bal.ran |= bit(self.current);
         Ok(self.switch(interrupted, false))
     }
 
@@ -1051,8 +1063,8 @@ impl<R: Copy> RunQueue<R> {
         if let Some(r) = self.record.get_mut(self.current) {
             *r = None;
         }
-        self.balanced &= !bit(self.current);
-        if let Some(a) = self.arrived.get_mut(self.current) {
+        self.bal.balanced &= !bit(self.current);
+        if let Some(a) = self.bal.arrived.get_mut(self.current) {
             *a = NEVER_ARRIVED;
         }
         Ok(self.switch(interrupted, false))
@@ -1127,10 +1139,10 @@ impl<R: Copy> RunQueue<R> {
             record: self.record(slot),
             balanced: self.is_balanced(slot),
         };
-        self.balanced &= !bit(slot);
-        self.cold &= !bit(slot);
-        self.mark_waiting &= !bit(slot);
-        if let Some(a) = self.arrived.get_mut(slot) {
+        self.bal.balanced &= !bit(slot);
+        self.bal.cold &= !bit(slot);
+        self.bal.mark_waiting &= !bit(slot);
+        if let Some(a) = self.bal.arrived.get_mut(slot) {
             *a = NEVER_ARRIVED;
         }
         if let Some(s) = self.state.get_mut(slot) {
@@ -1169,12 +1181,12 @@ impl<R: Copy> RunQueue<R> {
         } = departed;
         let slot = self.push_weighted(frame, weight, record)?;
         if balanced {
-            self.balanced |= bit(slot);
+            self.bal.balanced |= bit(slot);
         }
         // It ran on the processor it left, perhaps a moment ago: it has not waited since the mark.
-        self.mark_waiting &= !bit(slot);
+        self.bal.mark_waiting &= !bit(slot);
         // Its stay here starts now, in this queue's ticks (ADR-0020 S10's move rate).
-        if let Some(a) = self.arrived.get_mut(slot) {
+        if let Some(a) = self.bal.arrived.get_mut(slot) {
             *a = self.ticks;
         }
         if let Some(p) = self.pass.get_mut(slot) {
@@ -1194,19 +1206,19 @@ impl<R: Copy> RunQueue<R> {
     /// slot's next thread starts without it. Nothing for slot 0 or a free slot.
     pub fn set_balanced(&mut self, slot: usize) {
         if slot != 0 && self.state.get(slot).is_some_and(|s| *s != State::Free) {
-            self.balanced |= bit(slot);
+            self.bal.balanced |= bit(slot);
         }
     }
 
     /// Whether balancing may take the thread in `slot`.
     pub const fn is_balanced(&self, slot: usize) -> bool {
-        self.balanced & bit(slot) != 0
+        self.bal.balanced & bit(slot) != 0
     }
 
     /// Whether any thread here is one balancing may take: what an upcall asks before it looks
     /// any further.
     pub const fn any_balanced(&self) -> bool {
-        self.balanced != 0
+        self.bal.balanced != 0
     }
 
     /// Whether this processor runs a context that counts: a thread, or slot 0 where it is the
@@ -1227,7 +1239,7 @@ impl<R: Copy> RunQueue<R> {
             census.runnable += 1;
             census.weight = census.weight.saturating_add(self.weight(slot));
             if slot != self.current {
-                census.waiting |= self.balanced & bit(slot);
+                census.waiting |= self.bal.balanced & bit(slot);
             }
         }
         census
@@ -1242,7 +1254,7 @@ impl<R: Copy> RunQueue<R> {
     /// The ticks of this queue since the thread in `slot` arrived by a move; `None` for a thread
     /// that was pushed here.
     pub fn since_arrival(&self, slot: usize) -> Option<u64> {
-        let arrived = self.arrived.get(slot).copied()?;
+        let arrived = self.bal.arrived.get(slot).copied()?;
         (arrived != NEVER_ARRIVED).then(|| self.ticks.saturating_sub(arrived))
     }
 
@@ -1261,11 +1273,11 @@ impl<R: Copy> RunQueue<R> {
     /// a yield charges its pass, and a block, a sleep or a wake-up's preemption notes it in `ran`.
     fn waited(&self, slot: usize) -> bool {
         let pass = self.pass.get(slot).copied();
-        self.mark_waiting & bit(slot) != 0
-            && self.ran & bit(slot) == 0
+        self.bal.mark_waiting & bit(slot) != 0
+            && self.bal.ran & bit(slot) == 0
             && slot != self.current
             && self.state.get(slot) == Some(&State::Ready)
-            && pass == self.mark_pass.get(slot).copied()
+            && pass == self.bal.mark_pass.get(slot).copied()
             // A pass at its largest cannot show a charge.
             && pass != Some(u64::MAX)
     }
@@ -1290,10 +1302,10 @@ impl<R: Copy> RunQueue<R> {
     /// longer: one that was blocked at the mark, and one that arrived by a move since it.
     pub fn judge(&mut self, now: u64, h: u64) {
         let mut cold = self.cold();
-        if now.saturating_sub(self.mark_tsc) >= h {
+        if now.saturating_sub(self.bal.mark_tsc) >= h {
             cold |= self.waited_since_mark();
         }
-        self.cold = cold;
+        self.bal.cold = cold;
     }
 
     /// Sets the mark: this processor's own TSC, `now`; the contexts that are ready and not
@@ -1301,13 +1313,13 @@ impl<R: Copy> RunQueue<R> {
     /// step. The threads judged not cache-hot stay so while they still wait.
     pub fn mark(&mut self, now: u64) {
         let cold = self.cold();
-        self.mark_tsc = now;
-        self.mark_pass = self.pass;
-        self.ran = 0;
-        self.mark_waiting = (0..CAPACITY)
+        self.bal.mark_tsc = now;
+        self.bal.mark_pass = self.pass;
+        self.bal.ran = 0;
+        self.bal.mark_waiting = (0..CAPACITY)
             .filter(|&slot| slot != self.current && self.state.get(slot) == Some(&State::Ready))
             .fold(0, |waiting, slot| waiting | bit(slot));
-        self.cold = cold & self.mark_waiting;
+        self.bal.cold = cold & self.bal.mark_waiting;
     }
 
     /// Whether this queue's processor may be asked now to publish a waiting thread's frame
@@ -1316,28 +1328,28 @@ impl<R: Copy> RunQueue<R> {
     /// The mark is the tick's number, so the next tick ends it and the processor has nothing to
     /// clear. An asker holds this queue's lock, as it does to find the thread it asks for.
     pub fn take_ask(&mut self) -> bool {
-        if self.asked_at == Some(self.ticks) {
+        if self.bal.asked_at == Some(self.ticks) {
             return false;
         }
-        self.asked_at = Some(self.ticks);
+        self.bal.asked_at = Some(self.ticks);
         true
     }
 
     /// Counts one ask sent to this queue's processor, apart from [`RunQueue::take_ask`]'s mark, so
     /// that the count would show a second ask in a tick if the mark ever failed to stop it.
     pub fn note_ask(&mut self) {
-        if self.asks_counted_at != Some(self.ticks) {
-            self.asks_counted_at = Some(self.ticks);
-            self.asks_in_tick = 0;
+        if self.bal.asks_counted_at != Some(self.ticks) {
+            self.bal.asks_counted_at = Some(self.ticks);
+            self.bal.asks_in_tick = 0;
         }
-        self.asks_in_tick = self.asks_in_tick.saturating_add(1);
-        self.asks_most = self.asks_most.max(self.asks_in_tick);
-        self.asks = self.asks.saturating_add(1);
+        self.bal.asks_in_tick = self.bal.asks_in_tick.saturating_add(1);
+        self.bal.asks_most = self.bal.asks_most.max(self.bal.asks_in_tick);
+        self.bal.asks = self.bal.asks.saturating_add(1);
     }
 
     /// The asks sent to this queue's processor in all, and the most in one of its ticks.
     pub const fn asks(&self) -> (u64, u32) {
-        (self.asks, self.asks_most)
+        (self.bal.asks, self.bal.asks_most)
     }
 
     /// The waiting threads that are not cache-hot, a bit a slot, as this queue's processor last
@@ -1345,26 +1357,26 @@ impl<R: Copy> RunQueue<R> {
     /// queue's lock, a puller on another processor among them. A thread judged off the processor
     /// for the window has only been off it longer.
     pub fn cold(&self) -> u16 {
-        self.cold & self.waited_since_mark()
+        self.bal.cold & self.waited_since_mark()
     }
 
     /// Counts one balancing interrupt this queue's processor sent (a kick or an ask), against
     /// this queue's own ticks and apart from the framework's rate (`origin_sync::balance::Rate`),
     /// so that the count would show a second one in a tick if the rate ever failed to stop it.
     pub fn note_sent(&mut self) {
-        if self.sent_counted_at != Some(self.ticks) {
-            self.sent_counted_at = Some(self.ticks);
-            self.sent_in_tick = 0;
+        if self.bal.sent_counted_at != Some(self.ticks) {
+            self.bal.sent_counted_at = Some(self.ticks);
+            self.bal.sent_in_tick = 0;
         }
-        self.sent_in_tick = self.sent_in_tick.saturating_add(1);
-        self.sent_most = self.sent_most.max(self.sent_in_tick);
-        self.sent = self.sent.saturating_add(1);
+        self.bal.sent_in_tick = self.bal.sent_in_tick.saturating_add(1);
+        self.bal.sent_most = self.bal.sent_most.max(self.bal.sent_in_tick);
+        self.bal.sent = self.bal.sent.saturating_add(1);
     }
 
     /// The balancing interrupts this queue's processor sent in all, and the most in one of its
     /// ticks.
     pub const fn sent(&self) -> (u64, u32) {
-        (self.sent, self.sent_most)
+        (self.bal.sent, self.bal.sent_most)
     }
 }
 
