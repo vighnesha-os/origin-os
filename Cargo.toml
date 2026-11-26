@@ -108,6 +108,9 @@ missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 # `cfg(loom)`: `cargo xtask loom` builds `origin-sync`'s tests against Loom (CLAUDE.md §73), in a
 # scratch workspace of its own: nothing in this workspace depends on Loom.
+# `cfg(kani)`: Kani's proofs (CLAUDE.md §73; owner item 358, TASKS item 143), which only `cargo kani`
+# sets, in its own build under `target/kani`: the `#[cfg(kani)] mod proofs;` lines and the files they
+# name (`cargo xtask kani-gate`). Nothing a normal build makes holds any of it.
 # `cfg(origin_bench)`: the bench build of the loader and the kernel, with breadcrumbs on the
 # SPCR's UART (TASKS item 112). Only `cargo xtask bench-build` and `boot-bench` set it, into
 # `target/bench`; no image a normal build makes holds any of it (`cargo xtask check`, F1 and F2).
@@ -124,7 +127,7 @@ unreachable_pub = "warn"
 # `cfg(origin_bench_kernel)`: with `origin_bench`, the bench loader's kernel-entry mode (ADR-0002
 # Amendment 7; TASKS item 133). Only `cargo xtask bench-build --kernel` and `boot-bench` set it,
 # into `target/bench-kernel`; F1 holds its name the same way, and it is never set with another mode.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(origin_bench)', 'cfg(origin_bench_minimal)', 'cfg(origin_bench_bisect)', 'cfg(origin_bench_kernel)', 'cfg(origin_stack_measure)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(origin_bench)', 'cfg(origin_bench_minimal)', 'cfg(origin_bench_bisect)', 'cfg(origin_bench_kernel)', 'cfg(origin_stack_measure)'] }
 
 [workspace.lints.clippy]
 # CLAUDE.md §13 and final rule 5: every unsafe boundary documents its invariants.

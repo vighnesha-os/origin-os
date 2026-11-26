@@ -661,4 +661,28 @@ else
   fi
 fi
 
+# ---------------------------------------------------------------- Kani (proofs; CLAUDE.md §73)
+# Owner item 358, TASKS item 143. The version is the one .github/ci/install-kani.sh pins. Kani is
+# asked nothing unless the pinned driver is installed and its bundle set up: `cargo kani` would
+# otherwise set itself up, which downloads.
+out="$WORK/kani.txt"
+{
+  kani_version=$(sed -n 's/^KANI_VERSION=//p' .github/ci/install-kani.sh)
+  kani_dir="$HOME/.kani/kani-$kani_version"
+  echo "pinned: $kani_version (.github/ci/install-kani.sh, with the bundles' SHA-256)"
+  installed=$(cargo install --list 2>/dev/null | sed -n 's/^kani-verifier v\([^:]*\):$/\1/p')
+  echo "installed driver: ${installed:-none} (cargo install --list)"
+  if [ "$installed" = "$kani_version" ] && [ -d "$kani_dir" ]; then
+    cargo kani --version --verbose
+    # Under the home directory, named as `~`: the report is committed, and the account's name is not.
+    echo "bundle: ~/.kani/kani-$kani_version"
+    echo "bundle's compiler: $(cat "$kani_dir/rust-toolchain-version"), $(cat "$kani_dir/rustc-version")"
+    echo "used only by cargo kani, to verify; nothing it builds ships"
+    sed -n '/^kani:/,/^License/p;/^cbmc:/,/^License/p' "$kani_dir/license-notes.txt"
+  else
+    echo "cargo kani: the pinned driver and its bundle are not both installed (bash .github/ci/install-kani.sh); not run. CI's job kani runs the proofs"
+  fi
+} > "$out" 2>&1
+record INFO "Kani, for the proofs of CLAUDE.md §73 (optional: CI's job kani runs them; install separately)" "$out"
+
 finish

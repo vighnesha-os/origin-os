@@ -19,6 +19,7 @@ mod host_tools;
 mod image;
 mod image_inputs;
 mod interfaces;
+mod kani;
 mod lex;
 mod listed_names;
 mod loom;
@@ -162,6 +163,15 @@ commands:
               (TASKS item 144): the control, then one target for a fixed time (default 60 s,
               at most 300 s unless CI is set; the long runs are CI's), or one input replayed.
               Not part of check, which replays kept crashes as host tests instead
+  kani [--harness <name>]
+              Kani's proofs of the frame allocator and the heap, then their negative controls,
+              each applied to a scratch copy of the tree (CLAUDE.md §73; owner item 358). Needs
+              Kani 0.68.0 (.github/ci/install-kani.sh); CI's job `kani` runs it all, and not
+              check. With --harness, one harness and the controls that name it, while it is
+              being written
+  kani-gate   only what can be checked of the proofs without Kani: each harness has a
+              control whose text is in its file once, and cfg(kani) is only on the proof
+              modules' lines (part of check; quick)
   unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction, on the
               `preserves_flags` option of assembly blocks, and on RDRAND and RDSEED, which
               only the kernel's generator and the loader's may run (part of check; quick)
@@ -4803,6 +4813,9 @@ fn main() -> ExitCode {
         ["check"] => in_turn("check", check),
         ["unsafe-gate"] => unsafety::gate(),
         ["names-gate"] => listed_names::gate(),
+        ["kani-gate"] => kani::gate(),
+        ["kani"] => in_turn("kani", || kani::run(None)),
+        ["kani", "--harness", name] => in_turn("kani --harness", || kani::run(Some(name))),
         ["aml-alloc-gate"] => amlalloc::gate(),
         ["percpu-gate"] => per_cpu::gate(),
         ["settle-gate"] => settle::gate(),
@@ -6335,6 +6348,9 @@ fn check() -> Result {
     bench::gate()?;
     // Who may make a proof process, and which ring-3 files may name the call numbers.
     listed_names::gate()?;
+    // Each Kani harness has a control that applies; `cfg(kani)` only on the proof modules
+    // (TASKS item 143). The proofs themselves run in CI's job `kani`, not here.
+    kani::gate()?;
     // Only the AML interpreter's `mem.rs` may allocate (TASKS item 63).
     amlalloc::gate()?;
     // Every per-processor table sized at discovery; no processor count compiled in.
