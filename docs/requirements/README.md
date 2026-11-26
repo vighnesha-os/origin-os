@@ -36,6 +36,7 @@ The specifications, the threat models and ADR-0013's list of boot proofs are cit
 | `directive-NN-<name>.md` | The statements of one PART of the directive, in the directive's order. `00` is the header and `21` the final rules. |
 | `adr-NNNN.md` | The decisions of one ADR, in the ADR's order. |
 | `README.md` | These rules, the directive's revision, the scope changes and the decision items without rows. |
+| `specifications.md` | The specifications, standards and protocols the project relies on, each with the rows that rest on it. It holds no rows of the matrix: the progress page reads it (owner item 374). |
 
 ## The columns
 

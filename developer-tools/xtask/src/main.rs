@@ -33,6 +33,7 @@ mod screen;
 mod serial;
 mod settings;
 mod settle;
+mod specifications;
 mod stack_depth;
 mod targetcfg;
 mod toolchain;

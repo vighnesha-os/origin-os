@@ -5755,3 +5755,34 @@ Sent by the coordinating session on 2026-11-23 as a side session's task; its con
 - Only the proofs' threads are declared for balancing until TASKS item 100.
 
 **Follow-ups:** TASKS item 99 (the periodic pull, "each held two", R98-1); TASKS item 129's fix (this session, after item 98 is cleared); TASKS item 141 (the switch path's placement pinned); TASKS item 142 (each per-processor table on a line of its own); the hardware figures of CL50, CL52, CL62 and B21 (V9).
+
+### 151. Specifications and standards on the progress page (owner item 374)
+
+Built by the coordinating session on 2026-11-26, at the owner's "Do it here", on `claude/t151-specifications` from `land/batch-11` at `947a504c`. The owner asked for the progress page to show every specification, standard and protocol, with what is implemented and percentages, and kept current.
+
+**What was built.**
+- **The list, `docs/requirements/specifications.md`:** 62 specifications.
+  - **CLAUDE.md §17's baseline:** all 22 statements are named, some split, such as FIPS 180-4, 202, 204 and 205 and SP 800-208.
+  - **What the records cite beside it:** PCI Firmware 3.3, VT-d 5.20, AMD IOMMU 48882 3.11, SPCR and DBG2, virtio 1.1, the ELF gABI and SemVer 2.0.0.
+  - **What the directive's sections require by name:** USB 2.0, 3.2 and xHCI, USB device classes, DisplayPort and HDMI, HD Audio, OpenType, the network protocols, NTP and the time zone database. These are marked "not pinned yet" where no revision is recorded.
+  - **The legacy PC devices the boot proofs drive:** the 16550, the 8254, the MC146818 and the 8042.
+  - **Origin's own specifications:** ONBF and OIDL.
+- **The rows:** each specification names the requirements that rest on it, by ID or by a section's or ADR's prefix, so a requirement added later there is counted with no edit to the list.
+- **The page:**
+  - a section "By specification", one line each, with the four states' shares adding up to 100.0;
+  - one closed block each, with where the specification is named, its §17 baseline, its crates and each requirement with its state;
+  - the specifications' counts under "Exact counts".
+- **What the page says the figures mean:** they count Origin's requirements, not how much of a specification is implemented, and claim no conformance (CLAUDE.md §46).
+- **The checks:** `cargo xtask progress` refuses a list that names a row the matrix lacks, or a prefix that matches none. It also refuses one that leaves one of §17's baseline statements unnamed, or names a crate with no provenance row.
+
+**Evidence,** on the Mac, at low priority beside another session's exclusive turn:
+- `xtask`'s tests of the list (10) and the page (21), and the requirements and roadmap tests (46), each passing;
+- Clippy with `-D warnings` and rustfmt, clean;
+- the requirements, roadmap, document, provenance, progress, names, host-tools and cost gates, each 0.
+- The whole `cargo xtask check` is the keeper's, at landing.
+
+**Limits:**
+- which requirements rest on a specification is the coordinating session's judgement, read in review, not by the gate;
+- no independent review yet;
+- the network protocols' RFC numbers are not yet in the project's research ledger.
+
