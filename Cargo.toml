@@ -47,6 +47,9 @@ members = [
     "tests/kernel/first-program",
     "tests/kernel/pin-program",
 ]
+# The fuzz workspace (TASKS item 144) is a workspace of its own, with its own lock, so that no
+# build of this workspace resolves `libfuzzer-sys` or `arbitrary` (CLAUDE.md §5).
+exclude = ["tests/fuzz"]
 # Host-buildable crates only. The UEFI loader's and the Framekernel's binaries cannot be
 # built for the host, and the ring-3 crates (`runtime/core`, `runtime/rt`,
 # `runtime/kernel-client`, `tests/kernel/first-program` and `tests/kernel/pin-program`) are built

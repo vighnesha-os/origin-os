@@ -32,3 +32,8 @@ __pycache__/
 # specifications/, which is never committed.
 specifications/
 *.pdf
+
+# Coverage-guided fuzzing (TASKS item 144): what libFuzzer writes as it runs. Inputs that are
+# kept become host tests in their crates instead.
+tests/fuzz/artifacts/
+tests/fuzz/corpus/

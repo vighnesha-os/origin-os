@@ -20,7 +20,8 @@
 //!   not a literal exempts nothing. The alias `xtask` is allowed where `xtask` may re-run itself
 //!   ([`SELF_RUNS`]). A literal there that defines an alias (`alias.…`, `--config=alias.…`) is
 //!   refused, and a literal beginning `CARGO_ALIAS_` is refused anywhere in `xtask`. It also
-//!   refuses `run` given to an outside program; none takes it today.
+//!   refuses `run` given to an outside program, but for cargo-fuzz's where decision item 365
+//!   allows it (below).
 //! - **A first-party program by name or path**: inside the parentheses of `Command::new(…)`, a
 //!   literal (or such a `const`) that is the name of a workspace package or of a `[[bin]]`
 //!   target, alone or as a path's last component. The names are read from every manifest in the
@@ -40,6 +41,15 @@
 //!   (`turns::tests::the_lock_goes_with_the_process_however_it_ends`) starts its test binary to
 //!   hold the lock and be killed. It stays listed in [`SELF_RUNS`], so that every exception the
 //!   gate allows is named, and it is the only place listed.
+//! - **By decision item 365** (accepted by the owner on 2026-11-26, "Accept 365"; a dated note on
+//!   T1 in ADR-0011 Amendment 4; TASKS item 144): a fuzz target is a test program, started to
+//!   test first-party libraries, as item 310 has `cargo test` start test binaries. So
+//!   cargo-fuzz's `run`, `tmin` and `cmin`, each of which starts a fuzz target, are allowed where
+//!   `fuzz` and the subcommand are adjacent literal elements of one `.args([…])` list, inside a
+//!   function [`FUZZ_RUNS`] lists (all in `src/fuzz.rs`). The same pair anywhere else is refused,
+//!   `run` in any other form stays refused there too, and a listed function that no longer
+//!   gives the pair is a stale allowance, refused. Two planted controls show it: `cargo fuzz run`
+//!   in `main.rs`, and a lone `run` inside a listed function of `fuzz.rs`.
 //! - **Ended by TASKS item 61** (2026-11-19): item 300's other case, `boot-matrix` re-running
 //!   `xtask boot-test` for each scenario with its `ORIGIN_QEMU_*` settings in the child's
 //!   environment, and items 310, 311 and 312's extension of it to the ten scenario commands
@@ -207,6 +217,47 @@ fn self_run(file: &str, function: &str) -> bool {
     SELF_RUNS
         .iter()
         .any(|(f, name, _)| *f == file && *name == function)
+}
+
+/// The fuzz targets' authority (decision item 365).
+const ITEM_365_FUZZ: &str =
+    "decision item 365: a fuzz target is a test program, started to test first-party libraries";
+
+/// cargo-fuzz's subcommands that start a fuzz target (decision item 365).
+const FUZZ_WORDS: &[&str] = &["run", "tmin", "cmin"];
+
+/// The places `xtask` may give cargo-fuzz a subcommand that starts a fuzz target, by file under
+/// `developer-tools/xtask/` and function, each with its authority (the module documentation says
+/// more). The pair anywhere else is refused, and a listed place that no longer gives it is a
+/// stale allowance, refused too.
+pub(crate) const FUZZ_RUNS: &[(&str, &str, &str)] = &[
+    ("src/fuzz.rs", "libfuzzer", ITEM_365_FUZZ),
+    ("src/fuzz.rs", "minimize", ITEM_365_FUZZ),
+];
+
+/// Whether `function` of `file` is a place [`FUZZ_RUNS`] lists.
+fn fuzz_run(file: &str, function: &str) -> bool {
+    FUZZ_RUNS
+        .iter()
+        .any(|(f, name, _)| *f == file && *name == function)
+}
+
+/// The indices in `body`, an argument list with `elements`, of each element that is a
+/// subcommand of [`FUZZ_WORDS`] standing alone right after an element that is `fuzz`.
+fn fuzz_subcommands(
+    body: &[Token<'_>],
+    elements: &[(usize, usize)],
+    consts: &BTreeMap<String, String>,
+) -> Vec<usize> {
+    let alone = |&(start, end): &(usize, usize)| end == start + 1;
+    let text = |at: usize| body.get(at).and_then(|t| text_of(t, consts));
+    elements
+        .windows(2)
+        .filter(|w| alone(&w[0]) && alone(&w[1]))
+        .filter(|w| text(w[0].0).as_deref() == Some("fuzz"))
+        .filter(|w| text(w[1].0).is_some_and(|x| FUZZ_WORDS.contains(&x.as_str())))
+        .map(|w| w[1].0)
+        .collect()
 }
 
 /// The three host tools whose libraries G2 reads, by directory.
@@ -558,10 +609,25 @@ pub(crate) fn program_hits(
                 .is_some_and(|t| t.is_ident("arg") || t.is_ident("args"));
         if argument_list && let Some(body) = parenthesised(&tokens, i + 2) {
             let elements = elements(body);
+            let fuzz_words = fuzz_subcommands(body, &elements, consts);
             for (k, t) in body.iter().enumerate() {
                 let Some(text) = text_of(t, consts) else {
                     continue;
                 };
+                // cargo-fuzz's subcommands that start a fuzz target: only where FUZZ_RUNS lists
+                // (decision item 365).
+                if fuzz_words.contains(&k) {
+                    let place = enclosing(&spans, i);
+                    if !place.is_some_and(|f| fuzz_run(file, f)) {
+                        hit(
+                            t,
+                            format!(
+                                "`fuzz {text}` given to a command: cargo-fuzz's `{text}` starts a fuzz target, which only the functions host_tools::FUZZ_RUNS lists may do (decision item 365)"
+                            ),
+                        );
+                    }
+                    continue;
+                }
                 // An alias's name is an option's value only when it is a whole element of the
                 // list and the element before it is a literal option that takes a value; an
                 // element that is not a literal is unknown and exempts nothing (the review's
@@ -678,6 +744,36 @@ fn stale_self_runs(file: &str, source: &str) -> Vec<&'static str> {
     SELF_RUNS
         .iter()
         .filter(|(f, function, _)| *f == file && !naming.contains(function))
+        .map(|(_, function, _)| *function)
+        .collect()
+}
+
+/// The listed places of `FUZZ_RUNS` in `file` that no longer give cargo-fuzz a subcommand that
+/// starts a fuzz target.
+fn stale_fuzz_runs(
+    file: &str,
+    source: &str,
+    consts: &BTreeMap<String, String>,
+) -> Vec<&'static str> {
+    let tokens = lex::tokens(source);
+    let spans = functions(&tokens);
+    let mut giving = BTreeSet::new();
+    for (i, token) in tokens.iter().enumerate() {
+        let argument_list = token.is_punct('.')
+            && tokens
+                .get(i + 1)
+                .is_some_and(|t| t.is_ident("arg") || t.is_ident("args"));
+        if argument_list
+            && let Some(body) = parenthesised(&tokens, i + 2)
+            && !fuzz_subcommands(body, &elements(body), consts).is_empty()
+            && let Some(function) = enclosing(&spans, i)
+        {
+            giving.insert(function);
+        }
+    }
+    FUZZ_RUNS
+        .iter()
+        .filter(|(f, function, _)| *f == file && !giving.contains(function))
         .map(|(_, function, _)| *function)
         .collect()
 }
@@ -1261,10 +1357,29 @@ pub fn planted_control_exists(path: &str) -> bool {
 }
 "#;
 
+/// Decision item 365 allows cargo-fuzz's `run` only in `fuzz.rs`'s listed functions: the same
+/// call from `main.rs` is refused.
+const PLANTED_FUZZ_RUN: &str = r#"
+fn planted_control_fuzz(target: &str) -> Result {
+    run_step(cargo().args(["fuzz", "run", "--sanitizer", "none", target]))
+}
+"#;
+
+/// Inside a function `FUZZ_RUNS` lists, `run` given apart from `fuzz` is still refused: the
+/// allowance is for the pair in one list, nothing else.
+const PLANTED_LONE_RUN: &str = r#"
+fn libfuzzer(root: &Path, target: &str) -> Command {
+    let mut c = cargo();
+    c.arg("fuzz").arg("run").arg(target);
+    c
+}
+"#;
+
 /// The gate's negative controls, on copies of real files with a fault planted in each: each
 /// must be refused. Returns how many were caught, or the controls that were not.
 fn controls(
     main: &str,
+    fuzz: &str,
     consts: &BTreeMap<String, String>,
     known: &Known,
     sign_lib: &str,
@@ -1295,6 +1410,11 @@ fn controls(
             "Cargo's alias `xtask` is `cargo run`",
             "`cargo xtask` after an option whose value is not a literal",
         ),
+        (
+            PLANTED_FUZZ_RUN,
+            "decision item 365",
+            "`cargo fuzz run` outside host_tools::FUZZ_RUNS",
+        ),
     ] {
         let text = format!("{main}\n{planted}");
         let hits = program_hits("src/main.rs", &text, consts, known);
@@ -1302,6 +1422,23 @@ fn controls(
         if hits.len() != real + 1 || !hits.iter().any(|h| h.what.contains(needle)) {
             missed.push(format!("{name} in developer-tools/xtask/src/main.rs"));
         }
+    }
+    // Decision item 365's allowance does not cover `run` apart from `fuzz`, even in a listed
+    // function.
+    let real = program_hits("src/fuzz.rs", fuzz, consts, known).len();
+    let hits = program_hits(
+        "src/fuzz.rs",
+        &format!("{fuzz}\n{PLANTED_LONE_RUN}"),
+        consts,
+        known,
+    );
+    if hits.len() != real + 1
+        || !hits
+            .iter()
+            .any(|h| h.what.contains("`run` given to a command"))
+    {
+        missed
+            .push("a lone `run` in a listed function of developer-tools/xtask/src/fuzz.rs".into());
     }
     let library_controls: &[(&str, &[&str], &str)] = &[
         (
@@ -1346,7 +1483,7 @@ fn controls(
         missed.push("a dependency in developer-tools/onbf-sign/Cargo.toml".into());
     }
     if missed.is_empty() {
-        Ok(8 + library_controls.len())
+        Ok(10 + library_controls.len())
     } else {
         Err(missed)
     }
@@ -1370,6 +1507,18 @@ pub(crate) fn gate() -> Result {
         for function in stale_self_runs(file, text) {
             problems.push(format!(
                 "developer-tools/xtask/{file}: `{function}` is in host_tools::SELF_RUNS but no longer names `current_exe`: remove it from the list"
+            ));
+        }
+        for function in stale_fuzz_runs(file, text, &consts) {
+            problems.push(format!(
+                "developer-tools/xtask/{file}: `{function}` is in host_tools::FUZZ_RUNS but no longer gives cargo-fuzz a subcommand that starts a fuzz target: remove it from the list"
+            ));
+        }
+    }
+    for (file, _, _) in FUZZ_RUNS {
+        if !xtask.iter().any(|(f, _)| f == file) {
+            problems.push(format!(
+                "host_tools::FUZZ_RUNS names developer-tools/xtask/{file}, which does not exist"
             ));
         }
     }
@@ -1410,10 +1559,23 @@ pub(crate) fn gate() -> Result {
         .find(|(file, _)| file == "developer-tools/onbf-sign/src/lib.rs")
         .map(|(_, text)| text.as_str())
         .ok_or("developer-tools/onbf-sign/src/lib.rs is missing")?;
+    let fuzz = xtask
+        .iter()
+        .find(|(file, _)| file == "src/fuzz.rs")
+        .map(|(_, text)| text.as_str())
+        .ok_or("developer-tools/xtask/src/fuzz.rs is missing")?;
     let pack_line = lines
         .iter()
         .find(|line| line.directory == "developer-tools/onbf-pack");
-    let caught = match controls(main, &consts, &known, sign_lib, pack_line, &sign_manifest) {
+    let caught = match controls(
+        main,
+        fuzz,
+        &consts,
+        &known,
+        sign_lib,
+        pack_line,
+        &sign_manifest,
+    ) {
         Ok(caught) => caught,
         Err(missed) => {
             problems.push(format!(
@@ -1430,11 +1592,12 @@ pub(crate) fn gate() -> Result {
         ));
     }
     println!(
-        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs, by name or through `run` and the {} Cargo aliases that run one, and re-runs itself only in the {} place(s) host_tools::SELF_RUNS lists (the turn lock's own test, by decision item 310; boot-matrix and its scenario commands boot in process since TASKS item 61); the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host by the forms the gate reads, and depend on nothing but the crates it lists; their {} command lines name no crate but their own library and the standard library's; {caught} planted controls caught",
+        "xtask: host-tools gate: xtask ({} files) starts none of the {} first-party programs, by name or through `run` and the {} Cargo aliases that run one, and re-runs itself only in the {} place(s) host_tools::SELF_RUNS lists (the turn lock's own test, by decision item 310; boot-matrix and its scenario commands boot in process since TASKS item 61); it starts a fuzz target only in the {} place(s) host_tools::FUZZ_RUNS lists (by decision item 365); the libraries of onbf-pack, onbf-sign and oidl ({} files) reach nothing of the host by the forms the gate reads, and depend on nothing but the crates it lists; their {} command lines name no crate but their own library and the standard library's; {caught} planted controls caught",
         xtask.len(),
         known.programs.len(),
         known.runs.len() - RUN_WORDS.len(),
         SELF_RUNS.len(),
+        FUZZ_RUNS.len(),
         libraries.len(),
         lines.len()
     );

@@ -646,7 +646,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **then** the ONBF parsers' bounds (ONBF §13 item 5; row S73-08);
     - **then** capability validation (row S73-07).
     - Each harness states what it proves and within which bounds (row S73-12). It runs as `cargo xtask kani` and as a CI job on standard runners.
-144. **Coverage-guided fuzzing on stable Rust (owner item 359). Numbered by the coordinating session on 2026-11-25; not started.**
+144. **Coverage-guided fuzzing on stable Rust (owner item 359). Numbered by the coordinating session on 2026-11-25; built on 2026-11-26 on `claude/t144-fuzzing-4d7ce0` (its entry, below); not landed.**
     - **First, a smoke harness** shows whether `cargo fuzz` with `--sanitizer none` builds and runs with Rust 1.100.0. cargo-fuzz 0.13.2's source skips its toolchain check and adds no `-Z` flag in that case, but that is not shown on this host yet. If it needs nightly, it falls under item 360.
     - **Then, structure-aware harnesses** (`arbitrary`): the ONBF parsers and loader (ONBF §13 item 3) and the AML interpreter; later the ACPI table parsers and OCBOR-1.
     - **What is kept:** the corpus, and every crash, minimized, as a regression test. CI runs each target for a fixed time. The seeded mutation soaks stay.
@@ -5975,3 +5975,57 @@ Numbered by the coordinating session on 2026-11-26, as a follow-up to TASKS item
 - How a move back that the boot flow tries lands among a puller's switches. The model shows a thread movable within two switches. The boot flow's try is taken under that puller's queue lock, so a puller that keeps switching gives it one window in every two or three switches; the model does not run the boot flow.
 
 **Follow-ups:** none new. R98-1, two alternating threads not movable without an ask or a kick, is TASKS item 99's.
+
+### 144. Coverage-guided fuzzing on stable Rust (owner item 359)
+
+Assigned by the coordinating session on 2026-11-25, after the owner's "Accept all" to items 358 to 363. Built on `claude/t144-fuzzing-4d7ce0`, cut from `land/batch-11` at `98e28bf7`, with `main` merged at `d611032f` (PR 72's records). The step 1 report, the step 2 contract and the coordinating session's rulings are the coordination notes' `t144-smoke.md`.
+
+**Step 1: cargo-fuzz on Rust 1.100.0 stable** (2026-11-26).
+- **Versions read on crates.io on the day,** each the newest and none yanked: cargo-fuzz 0.13.2, `libfuzzer-sys` 0.4.13, `arbitrary` 1.5.0. cargo-fuzz was installed with `cargo install --locked cargo-fuzz --version 0.13.2`, built by 1.100.0.
+- **Shown on the development Mac:** `cargo fuzz build --sanitizer none` builds with the pinned compiler, and none of its compiler command lines carries a `-Z` flag; `cargo fuzz run --sanitizer none` runs a target for a fixed time; the control `smoke_finds`, a crash behind four bytes compared one at a time, is found in under a second (coverage rising one step per byte matched) and its input kept. With the default sanitizer the build fails on stable ("the option `Z` is only accepted on the nightly compiler"): `--sanitizer none` is what makes stable work, and only AddressSanitizer would need item 360's nightly.
+- **Recorded** by a check in `developer-tools/toolchain/verify.sh` (INFO without cargo-fuzz, as QEMU is), whose result `docs/toolchain/VERIFICATION.md` shows.
+
+**The rulings** (2026-11-26). Q1 to Q15 accepted as recommended, with these additions: the root workspace excludes `tests/fuzz` (Q1); every build crate recorded by version and checksum (Q2); an input over the time limit is a finding, like a crash (Q7); the seeds at most 1 MiB per target and 4 MiB in all, with the document gate passing (Q9); a crash or timeout in CI fails the job and goes to the coordinating session, and the pull request waits for its reading (Q10); `host-tools-gate` passes (Q11). Then:
+- **Where fuzzing runs:** the runs are CI's, each target for a fixed time in a job of its own; locally only the smoke check, short trials and replays, minutes each, in a turn; minimized crashes become host tests that `check` replays. So the CI job is a matrix, four jobs at a time, 180 s each; a local run defaults to 60 s, and one over 300 s is refused unless `CI` is set.
+- **Q16:** `check` type-checks the fuzz workspace with `--cfg fuzzing`, unless that costs more than 30 s on a warm target. It costs 4.07 s cold, libFuzzer's C++ included, and 0.02 s warm, so it stays.
+- **Q17, decision item 365** (the owner's "Accept 365", option A): a fuzz target is a test program, started to test first-party libraries, as item 310 has `cargo test` start test binaries. `host-tools-gate`'s G1 allows cargo-fuzz's `run`, `tmin` and `cmin`, as one list after `fuzz`, only in the functions `FUZZ_RUNS` lists (`fuzz.rs`'s `libfuzzer` and `minimize`).
+
+**What was built.**
+- **`tests/fuzz`** (`origin-fuzz`): a workspace of its own with its own `Cargo.lock`, as Loom's scratch workspace is (decision item 20). Nine targets and the two smoke targets, each a few lines.
+- **`tests/fuzz/harness`** (`origin-fuzz-harness`), the library the targets call; it does not depend on libFuzzer, so its tests run under plain `cargo test`:
+  - **ONBF** (`onbf.rs`): a writer of images laid out as §4.1 requires with every digest sealed, mostly KRN images the loader verifies in developer mode, now and then with a signature block, flipped bytes, and the digests sealed again or not; a sealer that recomputes the section digests, Merkle trees and content digest of any bytes; an exerciser that parses under each option set, judges what is accepted against §4.1 to §4.4 and errata G4 and G5, and runs every reader of the parts; and the loader's `kernel::verify`, segment table and placement.
+  - **OCBOR-1** (`ocbor.rs`): a writer of items in the forms OCBOR-1 accepts and those it refuses, and of KRN manifests with chosen fields; an exerciser that judges a validated document (every item reads; it is exactly one item).
+  - **Signature blocks** (`signature.rs`): a writer whose entries name the test kernel key and the image's digest; an exerciser that judges what the parser accepts against §7.1 and runs `verify_entry`, `verify_krn_block`, and the Ed25519 and ML-DSA verifiers directly on each signature (a fuzzed signature never verifies, so `verify_entry` alone would never hand an ML-DSA signature to its verifier).
+  - **AML** (`aml.rs`): a host whose every answer comes from the input and whose clock is a counter, so a run can be replayed; a writer of term lists in ACPI 6.6 §20.2's encodings; an exerciser that loads under `Limits::BOOT_PROOF`, walks the namespace, evaluates two objects, and runs the initialization walk and `_REG`.
+  - Each target checks at start-up that overflow panics in its build. The writers' own tests show what reaches acceptance, of 300 inputs each: ONBF images 193 parsed and 61 verified by the loader; the sealer restored all 51 images it flipped; OCBOR-1 126 items validated and 164 manifests decoded; signature blocks 170 parsed; AML blocks 185 loaded.
+- **`tests/fuzz/seeds`**: eight seeds per target, written by the harness's writers from a fixed generator (`examples/seeds.rs`, run by hand): 681,855 bytes in all, the largest set `loader_place`'s 190,942 bytes, within the caps of 1 MiB per target and 4 MiB in all; the document gate passes with them.
+- **`cargo xtask fuzz`** (`developer-tools/xtask/src/fuzz.rs`, one dispatch line in `main.rs`): checks that the root lock names no fuzzing crate, the seeds' caps and cargo-fuzz's version; fetches the fuzz lock with `--locked`; runs the harness's tests; runs the control, which must find its crash; then the target, from a scratch corpus seeded from the committed seeds, with libFuzzer's 10 s and 2,048 MB limits. A crash or timeout is minimized, printed as hex, and fails the run. `replay` and `list` too.
+- **CI** (`.github/workflows/ci.yml`, job `fuzz`): one job per target, four at a time, each `cargo xtask fuzz <target> --seconds 180` after cargo-fuzz is installed `--locked`; the minimized findings kept 14 days. CI runs on pull requests and on `main`, so the job is first seen when the batch's pull request runs.
+
+**The trials** (2026-11-26, 02:46 to 02:57 UTC, in one turn on the development Mac; aarch64, Rust 1.100.0, cargo-fuzz 0.13.2, `--sanitizer none`): each target 60 s through `cargo xtask fuzz`, after the harness's tests and the control. Every run ended with nothing found, and the control was found in every run (at execution 20,286, the same seed each time). Coverage is libFuzzer's count of instrumented edges, from the seeds to the end of the run:
+
+| Target | Seeds' coverage | After 60 s | Corpus | Executions | Peak RSS |
+|---|---|---|---|---|---|
+| `onbf_image` | 340 | 571 | 314 | 964,548 | 38 MB |
+| `onbf_image_built` | 632 | 1,602 | 914 | 73,107 | 34 MB |
+| `loader_place` | 322 | 508 | 251 | 670,250 | 37 MB |
+| `ocbor` | 84 | 248 | 424 | 7,799,445 | 28 MB |
+| `ocbor_built` | 181 | 569 | 790 | 3,753,616 | 30 MB |
+| `signature` | 182 | 391 | 284 | 2,511,177 | 31 MB |
+| `signature_built` | 339 | 948 | 715 | 737,707 | 39 MB |
+| `aml` | 599 | 1,693 | 1,515 | 442,665 | 774 MB |
+| `aml_built` | 1,049 | 2,099 | 815 | 17,224 | 1,028 MB |
+
+**Memory in the AML targets.** The two AML targets' peak RSS reached 774 MB and 1,028 MB, where the others stayed under 40 MB. With libFuzzer's RSS limit set to 256 MB, `aml_built` stopped on an input after about 6 s. This is neither a leak nor memory beyond the interpreter's limit. It was measured on 2026-11-26 with a counting allocator around the targets' own functions, in a program not kept, and with macOS's `time -l`:
+- **Per input:** over the trials' corpora, the interpreter's peak live heap was at most 52,431,338 bytes. It went over the 32 MiB limit on 26 of the 839 `aml_built` inputs and 1 of the 1,525 `aml` inputs, and never over 64 MiB. A vector that moves when it grows holds its old and new copies for a moment, and `Limits::BOOT_PROOF`'s documentation allows for that ("up to about twice its limit"). On the input that stopped, the interpreter's own count (`memory_used`, 19,399,881 bytes) agrees with the heap actually live (19,404,066 bytes).
+- **Across runs:** five passes were made over each corpus. The heap still live after passes 2 to 5 is the same, so no run leaves memory behind.
+- **The process's resident memory grows anyway.** The fuzz binary replayed the stopped input 1, 50, 200 and 600 times, peaking at 39, 505, 647 and 648 MB. The curve levels off, so this is macOS's allocator keeping freed pages, not a leak. Linux's allocator returns memory differently, so a CI job may or may not reach the 2,048 MB limit in 180 s. If one stops with an `oom-` input, it is most likely this, and it is still a finding for the coordinating session to read (ruling Q10).
+
+**What is not shown.**
+- The CI jobs have not run: nothing was pushed. Locally, only the development Mac (aarch64-apple-darwin); the CI jobs will be the first x86-64 Linux runs.
+- Fuzzing finds bugs and proves nothing (row S73-12): a run that finds nothing says only that the inputs it reached did not fail. Sixty seconds per target is a trial, not a campaign.
+- No crash was found, so no regression test exists yet, and `check` has nothing to replay. The first finding brings its minimized input and its host test.
+- Without a sanitizer, memory errors inside `std` and `alloc` go unseen; every fuzzed crate forbids `unsafe`. A crash prints the panic but no stack trace, and only libFuzzer's polled RSS limit bounds memory.
+- Not fuzzed: the ACPI table parsers (`origin-acpi-tables`, reached here only through `Load` and `LoadTable`), IMAGE_FS (not built), the kernel's device parsers, and the ML-DSA verifier with a real key for ML-DSA-65 (a stand-in key's bytes are used).
+- The new files are not in the public file index (`developer-tools/public-index/files.json`), which is the owner's allowlist.
+- No person and no second agent has reviewed the harnesses, `fuzz.rs` or item 365's rule.

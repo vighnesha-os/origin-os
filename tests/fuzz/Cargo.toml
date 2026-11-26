@@ -1,0 +1,124 @@
+# Coverage-guided fuzzing on stable Rust (owner item 359; TASKS item 144; CLAUDE.md §72).
+#
+# A workspace of its own, as Loom's scratch workspace is (decision item 20): no build of the
+# repository's workspace resolves `libfuzzer-sys` or `arbitrary`, and nothing that ships
+# depends on them (CLAUDE.md §5). The lock file beside this one pins every crate it takes.
+# `cargo xtask fuzz` builds it with `cargo fuzz --sanitizer none`, so the pinned stable
+# compiler builds it (rust-toolchain.toml at the repository's root; CLAUDE.md §8, §12).
+#
+# This package holds only the fuzz targets, each a few lines over `harness/`, which writes
+# the inputs, plays the AML interpreter's host and judges each run. The harness does not
+# depend on libFuzzer, so its own tests and the seed writer run under plain `cargo test`.
+[package]
+name = "origin-fuzz"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+origin-fuzz-harness = { path = "harness" }
+
+[workspace]
+resolver = "3"
+members = [".", "harness"]
+
+# As in the repository's workspace: hashing and signature verification dominate the
+# harness's own tests (`cargo test`), so they are optimized in test builds too. Fuzz builds
+# are release builds and are optimized throughout.
+[profile.dev.package.origin-crypto]
+opt-level = 3
+
+[profile.dev.package.onbf-merkle]
+opt-level = 3
+
+# The control (ADR-0013's form): a planted crash behind a four-byte magic, which only coverage
+# guidance finds in a short run. `cargo xtask fuzz` runs it first and fails unless it is found.
+[[bin]]
+name = "smoke_finds"
+path = "targets/smoke_finds.rs"
+test = false
+doc = false
+bench = false
+
+# Nothing to find: the step 1 smoke check's fixed-time run (docs/toolchain/VERIFICATION.md).
+[[bin]]
+name = "smoke_clean"
+path = "targets/smoke_clean.rs"
+test = false
+doc = false
+bench = false
+
+# ONBF (docs/spec/ONBF.md §13 item 3): the container as raw bytes, and as images the harness
+# writes from the fuzzer's choices with every digest sealed.
+[[bin]]
+name = "onbf_image"
+path = "targets/onbf_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "onbf_image_built"
+path = "targets/onbf_image_built.rs"
+test = false
+doc = false
+bench = false
+
+# OCBOR-1 and the KRN manifest (ONBF §5).
+[[bin]]
+name = "ocbor"
+path = "targets/ocbor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ocbor_built"
+path = "targets/ocbor_built.rs"
+test = false
+doc = false
+bench = false
+
+# The signature block and its verifiers (ONBF §7.1).
+[[bin]]
+name = "signature"
+path = "targets/signature.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signature_built"
+path = "targets/signature_built.rs"
+test = false
+doc = false
+bench = false
+
+# The UEFI loader's paths on a KRN image (ADR-0002): raw bytes, resealed, then verified and
+# placed.
+[[bin]]
+name = "loader_place"
+path = "targets/loader_place.rs"
+test = false
+doc = false
+bench = false
+
+# The AML interpreter (ADR-0019 T1): a definition block as raw bytes, and as term lists the
+# harness writes from the fuzzer's choices.
+[[bin]]
+name = "aml"
+path = "targets/aml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aml_built"
+path = "targets/aml_built.rs"
+test = false
+doc = false
+bench = false

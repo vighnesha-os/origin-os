@@ -43,6 +43,7 @@ fn the_real_tree_passes() {
     for (file, text) in &sources {
         assert_eq!(program_hits(file, text, &consts, &programs), [], "{file}");
         assert!(stale_self_runs(file, text).is_empty(), "{file}");
+        assert!(stale_fuzz_runs(file, text, &consts).is_empty(), "{file}");
     }
     for (file, text) in library_sources(&repo_root()).unwrap() {
         assert_eq!(library_hits(&text), [], "{file}");
@@ -69,19 +70,21 @@ fn the_gate_s_own_controls_are_caught() {
     assert_eq!(
         controls(
             text_of_file(&sources, "src/main.rs"),
+            text_of_file(&sources, "src/fuzz.rs"),
             &consts,
             &programs,
             &sign_lib,
             pack_line.as_ref(),
             &sign_manifest
         ),
-        Ok(12)
+        Ok(14)
     );
     // A control is missed when the rule it tests is gone: with no first-party programs, the
     // path control finds nothing to name.
     assert!(
         controls(
             text_of_file(&sources, "src/main.rs"),
+            text_of_file(&sources, "src/fuzz.rs"),
             &consts,
             &Known::default(),
             &sign_lib,
@@ -94,6 +97,7 @@ fn the_gate_s_own_controls_are_caught() {
     assert!(
         controls(
             text_of_file(&sources, "src/main.rs"),
+            text_of_file(&sources, "src/fuzz.rs"),
             &consts,
             &programs,
             &sign_lib,
@@ -127,6 +131,65 @@ fn cargo_run_is_caught_however_it_is_spelled() {
             "{hits:?}"
         );
     }
+}
+
+/// G1's hits on `xtask`'s real `fuzz.rs` with `planted` added at its end.
+fn planted_in_fuzz(planted: &str) -> Vec<Hit> {
+    let (sources, consts, programs) = real();
+    let fuzz = text_of_file(&sources, "src/fuzz.rs");
+    program_hits(
+        "src/fuzz.rs",
+        &format!("{fuzz}\n{planted}\n"),
+        &consts,
+        &programs,
+    )
+}
+
+#[test]
+fn a_fuzz_target_is_started_only_where_item_365_allows() {
+    // The pair, in a function FUZZ_RUNS lists: allowed (a second function of that name, as the
+    // gate knows functions by name).
+    assert_eq!(
+        planted_in_fuzz(r#"fn minimize() { cargo().args(["fuzz", "cmin", "--fuzz-dir"]); }"#),
+        []
+    );
+    // Each subcommand, in main.rs or in an unlisted function of fuzz.rs: refused, once.
+    for word in ["run", "tmin", "cmin"] {
+        let planted = format!(r#"fn elsewhere() {{ cargo().args(["fuzz", "{word}", "x"]); }}"#);
+        for hits in [planted_in_main(&planted), planted_in_fuzz(&planted)] {
+            assert_eq!(hits.len(), 1, "{planted}: {hits:?}");
+            assert!(hits[0].what.contains("decision item 365"), "{hits:?}");
+        }
+    }
+    // `run` apart from `fuzz`, even in a listed function: refused as `cargo run` is.
+    let hits = planted_in_fuzz(r#"fn libfuzzer() { cargo().arg("fuzz").arg("run"); }"#);
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(
+        hits[0].what.contains("`run` given to a command"),
+        "{hits:?}"
+    );
+    // cargo-fuzz's other subcommands, and `fuzz` with `run` not next to it: not a fuzz target
+    // started, and no `run` given.
+    for planted in [
+        r#"fn a() { cargo().args(["fuzz", "--version"]); }"#,
+        r#"fn b() { cargo().args(["fuzz", "build", "--sanitizer", "none"]); }"#,
+    ] {
+        assert_eq!(planted_in_main(planted), [], "{planted}");
+    }
+}
+
+#[test]
+fn a_stale_fuzz_allowance_is_found() {
+    let (sources, consts, _) = real();
+    let fuzz = text_of_file(&sources, "src/fuzz.rs");
+    assert!(stale_fuzz_runs("src/fuzz.rs", fuzz, &consts).is_empty());
+    // With `minimize` giving cargo-fuzz no subcommand that starts a target, its entry is stale.
+    let gone = fuzz.replace(
+        r#"["fuzz", "tmin", "--fuzz-dir"]"#,
+        r#"["fuzz", "--version"]"#,
+    );
+    assert_ne!(gone, fuzz, "the planted text must change fuzz.rs");
+    assert_eq!(stale_fuzz_runs("src/fuzz.rs", &gone, &consts), ["minimize"]);
 }
 
 #[test]
