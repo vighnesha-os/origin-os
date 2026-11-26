@@ -698,6 +698,25 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **The gate:** every standard of §17 is listed, and every row ID named exists. A specification with no rows yet is still listed, and says so.
     - **The page:** `cargo xtask progress` adds a section with, for each specification, its rows by state (done, built, in progress, not started) as counts and as percentages that add up to 100%. Each specification's rows can be opened, each with its state.
     - **What the figures mean,** stated on the page: they count Origin's requirements that rest on each specification. They do not measure how much of the specification is implemented, since a specification has many parts that no requirement asks for. No figure claims conformance.
+152. **Integrity's pulled phase made structural on two processors (ADR-0013 R1(b); ADR-0020 S5). Numbered by the coordinating session on 2026-11-26; built by the TASKS item 98 session and cleared for `land/batch-11` the same day.**
+    - **Why:** PR 67's CI failed the phase on its 2-processor machines with no ask and no move back. With two contexts alternating on a processor, the waiting one is always the context just switched out, which the boot flow may not take (R98-1), so a move back waited for that processor to idle: a run order, and a proof that a correct kernel can fail.
+    - **The fix:** two pinned helper threads of the phase's own on each processor left to pull, woken while it holds a thread of the phase and only yielding, so that three or more contexts are ready there. They are not declared for balancing and hold no word.
+    - **Controls:** a plant whose integrity threads never sleep fails on the unfixed kernel and passes on the fixed one; C98-1, 9b, 11, 12, 14 and 15b are caught again; a host model on the real run queue shows no thread movable with two threads and no helper, or one of each.
+    - **Not shown:** hardware, and KVM until PR 67's CI. The entry, "### 152.", lands with the batch.
+153. **Fuzzing beyond TASKS item 144's nine targets (CLAUDE.md §72; rows S72-05 and S73-12). Numbered by the coordinating session on 2026-11-26; not started; after TASKS item 144 lands and its CI job has run.**
+    - **The targets:**
+      - the ACPI table parsers (`origin-acpi-tables`) and the SPCR's parser (`origin-spcr`), each fed directly, not only through AML's `Load` and `LoadTable`;
+      - the kernel's parsers of what a device hands it: PCIe capability lists, NVMe's Identify data and completions, and the virtio network device's descriptors;
+      - the ML-DSA-65 verifier with a real test key, in place of a stand-in key's bytes.
+    - **The first question,** for the coordinating session before any code: whether the kernel's parsers are fuzzed through the kernel library's host build, or first moved into crates of their own. Either way, nothing in the kernel gains a dependency, and every fuzzed crate keeps forbidding `unsafe`.
+    - **As in item 144:** stable Rust 1.100.0 with `--sanitizer none`, seeds generated from fixed bytes, a planted control per target, one CI job per target, and any crash reported to the coordinating session as a security finding before its fix.
+    - **Not in it:** IMAGE_FS, which is not built yet; it gets its target when it is.
+154. **A Kani proof of the frame allocator's `reclaim` (CLAUDE.md §73; rows S73-02 and S73-04). Numbered by the coordinating session on 2026-11-26; not started; after TASKS item 143 lands.**
+    - **Why:** TASKS item 143 leaves `reclaim` out of Kani's claim. It calls `allocatable`, which walks all 8 reserved-range slots, so any proof that reaches it needs an unwind bound of at least 9. At 9 its symbolic execution had not finished after 600 s on the development Mac, with 3 regions or 2; at 8 it took 267 s and 7.5 GB and failed the unwinding check. Its host tests stay.
+    - **The contract weighs, with figures:**
+      - a model with concrete region kinds, stating exactly what it narrows from "any kind";
+      - or a change to `reclaim`'s or `allocatable`'s loops that keeps their behaviour, shown by host tests of the old form against the new, and makes the walks countable. A change to the allocator's code is reviewed as one.
+    - **Within item 143's rules:** each local run under 5 minutes and 8 GB; on CI's standard runner, 15 minutes and 8 GB per harness, or the bound comes down and the records state it.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
