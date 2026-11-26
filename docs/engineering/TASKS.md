@@ -652,6 +652,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - `libfuzzer-sys` and `arbitrary` are host-only dependencies, reviewed under CLAUDE.md §5 first.
 145. **Miri, on a pinned nightly used only by test tools (owner items 360 and 361). Numbered by the coordinating session on 2026-11-25; not started.**
     - **The nightly:** a toolchain file of its own pins one nightly by date and commit (row S12-08). Only `cargo xtask miri` uses it, and a gate holds every build, check and release on 1.100.0 (row S12-09).
+    - **In CI only (owner item 364):** the nightly is installed only on CI's runners, never on the development Mac. Every Miri run, while it is built as well as after, runs in a CI job of its own. How its branch reaches CI before it lands, through the batch's pull request or a draft pull request of its own, is settled in its contract, and any push waits for the owner's word.
     - **What Miri runs:** the host tests of crates that hold `unsafe`, starting with `origin-sync` and the run queue it compiles. Code with inline assembly or device access stays out.
     - **The records** state what it found and what it cannot see (row S13-06).
 146. **Shuttle beside Loom (owner item 362). Numbered by the coordinating session on 2026-11-25; not started.** `shuttle` becomes a host-only dev-dependency once CLAUDE.md §5's review passes. Origin's sync shims map to Shuttle's types as they map to Loom's.

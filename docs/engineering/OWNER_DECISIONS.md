@@ -1604,3 +1604,25 @@ The coordinating session checked them against CLAUDE.md and the records, and put
   - this sheet;
   - the "Decided by" column of matrix rows S12-07 to S12-09, S13-06, S72-03 to S72-06, S73-02, S73-04, S73-07 and S73-08;
   - TASKS items 143 to 147.
+
+### Miri's nightly in CI only (item 364): 2026-11-26
+
+Item 360 allowed one pinned nightly toolchain, used only by test tools, and TASKS item 145 builds Miri on it. On 2026-11-26 the coordinating session asked where that nightly may be installed. It recommended the development Mac as well as CI: installed under its exact date name, never the default and never an override, called only by `cargo xtask miri`, so that a Miri finding can be reproduced and debugged in minutes. You answered "CI only".
+
+| # | Question | Answer |
+|---|---|---|
+| 364, answered | May Miri's pinned nightly be installed on the development Mac, or only on CI's runners? | **CI only** |
+
+- **What it decides:**
+  - no nightly toolchain is installed on the development Mac;
+  - every Miri run happens in a CI job of its own, on GitHub's standard runners, both while TASKS item 145 is built and afterwards;
+  - item 360's other terms stand: one nightly, pinned by date and commit, used only by test tools, with every build, check and release on Rust 1.100.0.
+- **What it costs:**
+  - debugging a Miri finding waits for a CI run each time;
+  - CI runs only for pull requests and for pushes to `main`. So how TASKS item 145's branch reaches CI while it is built, through the batch's pull request or a draft pull request of its own, is settled in its contract, and any push waits for your word.
+- **What it does not change:** Kani's compiler bundle is installed on the Mac under item 358. It is Kani's own pinned toolchain, used only by Kani, not a nightly of the project's, and this item does not cover it.
+- **Performance cost** (ADR-0018 V3): none, by construction: a test tool's place.
+- **Where it is written:**
+  - this sheet;
+  - the "Decided by" column of matrix row S12-09;
+  - TASKS item 145's line.

@@ -48,7 +48,7 @@ One row for each statement of CLAUDE.md in §8 to §15. The columns and their ru
 | S12-06 | If a feature cannot be implemented using stable 1.100.0: 3. Evaluate a stable-compatible alternative. | rule | eng/host | 2 | not-started | - | - | - | - | none | - | - |
 | S12-07 | If a feature cannot be implemented using stable 1.100.0: 4. Document the nightly dependency if unavoidable. | rule | eng/host | 2 | not-started | - | - | - | - | none | - | 360 |
 | S12-08 | If a feature cannot be implemented using stable 1.100.0: 5. Pin the exact nightly commit. | rule | eng/host | 2 | not-started | - | - | - | - | none | - | 360 |
-| S12-09 | If a feature cannot be implemented using stable 1.100.0: 6. Isolate that build path. | rule | eng/host | 2 | not-started | - | - | - | - | none | - | 360 |
+| S12-09 | If a feature cannot be implemented using stable 1.100.0: 6. Isolate that build path. | rule | eng/host | 2 | not-started | - | - | - | - | none | - | 360, 364 |
 | S12-10 | If a feature cannot be implemented using stable 1.100.0: 7. Require approval before it enters a release. | rule | eng/host | 2 | not-started | - | - | - | - | none | - | - |
 | S12-11 | If a feature cannot be implemented using stable 1.100.0: 8. Preserve stable Rust 1.100.0 as the main compiler baseline. | rule | eng/host | 2 | not-started | - | - | - | - | none | - | - |
 | S12-12 | Do not secretly build shipping artifacts with another compiler. | rule | eng/host | 2 | not-started | - | - | - | - | none | - | - |
