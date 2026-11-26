@@ -5457,7 +5457,7 @@ Sent by the coordinating session on 2026-11-23 as a side session's task; its con
 | Performance constraints | `resume` and `dispatch` held equal to the base, `on_yield` equal but for field offsets, each traced path of `wake` within 3 instructions with no new call or locked instruction (all met, P1 to P3's traces); the rest counted in the ledger (CL50, CL52, CL62). |
 | Acceptance | The round sent and read; "load balancing" passing on the machines of 2 to 8 processors in three `boot-matrix` runs in a row; Clippy, `cargo xtask check`, `boot-test`; each control caught as recorded. Rows A20-S7 and A20-S10 partial, A20-Am1 built, S26-07 partial. |
 
-**What was built** (51 commits on the branch, each compiling; the main ones):
+**What was built** (29 commits of the branch's own on `27699a39`, records among them, with `main` merged once at `ebd3552d`; the main ones):
 - `ec753b5b`, `081d1d02`, `1bf87235`, `6bde6cea`: the run queue's balancing state, what each processor publishes (`origin_sync::balance`, Loom BL1 and BL2 and their controls), the published-frame check and the declaration that balancing may take a thread, and the framework's rate and interrupt.
 - `043afab4`: the idle pull and the idle kick; `a909ef26`: the ask (owner item 355).
 - `e95c6bbf`, `1d6b5b82`: the two independent reviews' answers (a frame is published when `lend` would find it, the reviews' R98-6 and D98-12); `65bb5cb9`: the review record, `REVIEW_T98_2026-11-23.md`.
