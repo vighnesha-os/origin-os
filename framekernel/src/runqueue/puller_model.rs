@@ -1,4 +1,5 @@
-//! TASKS item 152: integrity's pulled phase's helpers modelled on the real run queue, a host test.
+//! TASKS items 152 and 155: integrity's pulled phase's helpers modelled on the real run queue, a
+//! host test.
 //!
 //! One processor left to pull, its queue as the phase leaves it: slot 0 its idle context; one or
 //! two of the phase's threads; and none, one or two of the phase's helpers, in every slot order.
@@ -19,10 +20,29 @@
 //!   the second switch after it, one of them can be moved at some point in between.
 //! - **The controls** ([`without_helpers_two_alternating_threads_are_never_movable`] and
 //!   [`one_helper_leaves_one_thread_never_movable`]): two threads that never sleep and no helper,
-//!   or one thread that never sleeps and one helper, are two contexts alternating. Every yield and every tick then
-//!   switches, so the waiting one is always the context just switched out, and no thread of the
-//!   phase can be moved at any point. That is TASKS item 152's CI failure, and why it takes two
-//!   helpers, not one.
+//!   or one thread that never sleeps and one helper, are two contexts alternating. Every yield and
+//!   every tick then switches, so the waiting one is always the context just switched out, and no
+//!   thread of the phase can be moved at any point. That is TASKS item 152's CI failure, and why it
+//!   took two helpers, not one, for a mover on another processor.
+//!
+//! **The helper's own moves** (TASKS item 155). In the kernel the helper makes the moves back, on
+//! its own processor, so its `migrate` publishes the frame that processor last switched out before
+//! it lends it (`cpu::move_context`; the contract's §1.1, step 6): at its turn, a thread of the
+//! phase that is ready and not running is movable, the one just switched out included. Its try
+//! comes at each of its turns (each switch that gives it the processor), for a thread switched out
+//! in its spin, under its word. So with one helper:
+//!
+//! - **The helper's next turn finds each switch-out in a spin**
+//!   ([`the_helper_finds_each_switch_out_in_a_spin_at_its_next_turn`]): with one or two of the
+//!   phase's threads, sleeping or not, every switch-out of a thread in its spin is followed by a
+//!   helper's turn, which finds it movable, before the thread runs again. With one thread this
+//!   follows from the queue's order: once a tick charges the spinning thread, the helper's pass is
+//!   at or below its, and ties go round-robin forward from the thread's slot, which reaches the
+//!   helper first. With two, the other thread may run between, and that the helper still runs
+//!   before the first one returns is measured, not argued: none was missed in these cases, which
+//!   the test holds. No spin goes unswitched in either.
+//! - **The control** ([`a_helper_that_never_tries_finds_nothing`]): a helper that never tries finds
+//!   no thread, though the threads are switched out in their spins as before.
 #![forbid(unsafe_code)]
 
 use super::*;
@@ -69,12 +89,21 @@ struct Seen {
     movable: u64,
     windows: u64,
     missed: u64,
+    /// TASKS item 155: helpers' turns, each a try where the helpers try; switch-outs of a thread in
+    /// its spin, under its word; those a helper's turn found it movable after, before it ran again;
+    /// those it did not, and the most in a row for one thread; and spins never switched out.
+    tried: u64,
+    held_outs: u64,
+    held_found: u64,
+    held_missed: u64,
+    held_missed_run: u64,
+    unswitched: u64,
 }
 
 /// One case: `order` gives the contexts in slot order from slot 1, `phases` the threads'
-/// iteration counts at the start, `sleeps` whether every fourth iteration sleeps, and `seed` the
-/// ticks' draw.
-fn run(order: &[Role], phases: [u64; 2], sleeps: bool, seed: u64) -> Seen {
+/// iteration counts at the start, `sleeps` whether every fourth iteration sleeps, `seed` the
+/// ticks' draw, and `tries` whether the helpers try a move at their turns (TASKS item 155).
+fn run(order: &[Role], phases: [u64; 2], sleeps: bool, seed: u64, tries: bool) -> Seen {
     let mut rng = Rng(seed);
     let mut q: RunQueue<u32> = RunQueue::new();
     q.set_idle(true);
@@ -94,6 +123,11 @@ fn run(order: &[Role], phases: [u64; 2], sleeps: bool, seed: u64) -> Seen {
         .filter(|&s| matches!(role[s], Some(Role::Thread(_))))
         .collect();
     let mut leaving: Option<usize> = None;
+    // Per thread (TASKS item 155): switched out in its spin and not yet run again; found so by a
+    // helper's turn; switched out at least once in the spin it is in; misses in a row.
+    let (mut held_pending, mut held_found, mut spin_switched) =
+        ([false; 2], [false; 2], [false; 2]);
+    let mut missed_run = [0u64; 2];
     // Switches before the queue is as the phase leaves it: every context has run and been
     // switched out once.
     let warm = order.len() + 1;
@@ -131,6 +165,9 @@ fn run(order: &[Role], phases: [u64; 2], sleeps: bool, seed: u64) -> Seen {
                     Some(_) => {
                         // The spin is over: release the word and yield.
                         t.spinning = None;
+                        if !spin_switched[i] && awake_all.len() > warm {
+                            seen.unswitched += 1;
+                        }
                         q.yield_now(f);
                     }
                     None if rng.next().is_multiple_of(TICK_IN) => {
@@ -141,6 +178,7 @@ fn run(order: &[Role], phases: [u64; 2], sleeps: bool, seed: u64) -> Seen {
                         t.iteration += 1;
                         if !t.iteration.is_multiple_of(2) {
                             // The spin begins, and the first tick comes in it.
+                            spin_switched[i] = false;
                             t.spinning = Some(rng.next() % 2);
                             q.tick(f);
                             ticked = true;
@@ -157,6 +195,44 @@ fn run(order: &[Role], phases: [u64; 2], sleeps: bool, seed: u64) -> Seen {
             leaving = Some(before);
             awake_all.push(u32::MAX);
             movable_any.push(false);
+            let past = awake_all.len() > warm;
+            // A thread switched out in its spin, holding its word.
+            if let Some(Role::Thread(i)) = role[before]
+                && threads[i].spinning.is_some()
+                && q.state[before] == State::Ready
+            {
+                (held_pending[i], held_found[i], spin_switched[i]) = (true, false, true);
+                seen.held_outs += u64::from(past);
+            }
+            // A thread runs again: was its switch-out in its spin found first?
+            if let Some(Role::Thread(i)) = role[q.current]
+                && core::mem::replace(&mut held_pending[i], false)
+                && past
+            {
+                if held_found[i] {
+                    missed_run[i] = 0;
+                } else {
+                    seen.held_missed += 1;
+                    missed_run[i] += 1;
+                    seen.held_missed_run = seen.held_missed_run.max(missed_run[i]);
+                }
+            }
+            // A helper's turn begins, and with it its try: on its own processor, a thread ready and
+            // not running is movable, the one just switched out included (step 6).
+            if role[q.current] == Some(Role::Helper) && tries {
+                seen.tried += u64::from(past);
+                for &s in &slots {
+                    if let Some(Role::Thread(i)) = role[s]
+                        && held_pending[i]
+                        && !held_found[i]
+                        && q.state[s] == State::Ready
+                        && s != q.current
+                    {
+                        held_found[i] = true;
+                        seen.held_found += u64::from(past);
+                    }
+                }
+            }
         } else if ticked {
             // A tick that switched nothing: the kick publishes what was switched out.
             leaving = None;
@@ -222,7 +298,7 @@ fn two_helpers_leave_a_thread_movable_within_two_switches() {
             for p in phases().filter(|p| threads == 2 || p[1] == 0) {
                 for sleeps in [true, false] {
                     for seed in SEEDS {
-                        let seen = run(&order, p, sleeps, seed);
+                        let seen = run(&order, p, sleeps, seed, true);
                         assert_eq!(
                             seen.missed, 0,
                             "{order:?}, phases {p:?}, sleeps {sleeps}, seed {seed}: {} of {} windows had a thread awake throughout and none movable",
@@ -240,7 +316,7 @@ fn two_helpers_leave_a_thread_movable_within_two_switches() {
     // not, with 8 seeds.
     assert_eq!(cases, (6 * 4 + 24 * 16) * 2 * 8);
     std::println!(
-        "two helpers: {cases} cases, {windows} windows with a thread awake throughout, none missed"
+        "two helpers, for a mover on another processor (TASKS item 152): {cases} cases, {windows} windows with a thread awake throughout, none missed"
     );
 }
 
@@ -250,7 +326,7 @@ fn without_helpers_two_alternating_threads_are_never_movable() {
     for order in orders(&[Role::Thread(0), Role::Thread(1)]) {
         for p in phases() {
             for seed in SEEDS {
-                let seen = run(&order, p, false, seed);
+                let seen = run(&order, p, false, seed, true);
                 assert_eq!(
                     seen.movable, 0,
                     "{order:?}, phases {p:?}, seed {seed}: a thread was movable"
@@ -265,7 +341,7 @@ fn without_helpers_two_alternating_threads_are_never_movable() {
         "the control never kept a thread awake over a window"
     );
     std::println!(
-        "no helpers, two threads that never sleep: {windows} windows, a thread movable in none"
+        "no helpers, two threads that never sleep, for a mover on another processor: {windows} windows, a thread movable in none"
     );
 }
 
@@ -275,7 +351,7 @@ fn one_helper_leaves_one_thread_never_movable() {
     for order in orders(&[Role::Thread(0), Role::Helper]) {
         for p in phases().filter(|p| p[1] == 0) {
             for seed in SEEDS {
-                let seen = run(&order, p, false, seed);
+                let seen = run(&order, p, false, seed, true);
                 assert_eq!(
                     seen.movable, 0,
                     "{order:?}, phases {p:?}, seed {seed}: the thread was movable"
@@ -289,5 +365,71 @@ fn one_helper_leaves_one_thread_never_movable() {
         windows > 0,
         "the control never kept its thread awake over a window"
     );
-    std::println!("one helper, one thread: {windows} windows, the thread movable in none");
+    std::println!(
+        "one helper, one thread, for a mover on another processor: {windows} windows, the thread movable in none"
+    );
+}
+
+/// TASKS item 155: one helper's turns, with one or two of the phase's threads (the module
+/// documentation, "The helper's own moves").
+#[test]
+fn the_helper_finds_each_switch_out_in_a_spin_at_its_next_turn() {
+    for threads in [1, 2] {
+        let mut roles: Vec<Role> = (0..threads).map(Role::Thread).collect();
+        roles.push(Role::Helper);
+        let (mut cases, mut outs, mut missed, mut most, mut unswitched, mut tried) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        for order in orders(&roles) {
+            for p in phases().filter(|p| threads == 2 || p[1] == 0) {
+                for sleeps in [true, false] {
+                    for seed in SEEDS {
+                        let seen = run(&order, p, sleeps, seed, true);
+                        assert!(seen.held_outs > 0, "{order:?}: no switch-out in a spin");
+                        assert_eq!(
+                            (seen.held_missed, seen.unswitched),
+                            (0, 0),
+                            "{order:?}, phases {p:?}, sleeps {sleeps}, seed {seed}: switch-outs in a spin the helper's next turn did not find, and spins never switched out"
+                        );
+                        (cases, outs, missed, most, unswitched, tried) = (
+                            cases + 1,
+                            outs + seen.held_outs,
+                            missed + seen.held_missed,
+                            most.max(seen.held_missed_run),
+                            unswitched + seen.unswitched,
+                            tried + seen.tried,
+                        );
+                    }
+                }
+            }
+        }
+        std::println!(
+            "one helper, {threads} thread(s): {cases} cases, {tried} helper's turns, {outs} switch-outs in a spin, {missed} not found by the helper's next turn (at most {most} in a row for one thread), {unswitched} spins never switched out"
+        );
+    }
+}
+
+/// TASKS item 155's control: a helper that never tries finds nothing, though the threads are
+/// switched out in their spins as before.
+#[test]
+fn a_helper_that_never_tries_finds_nothing() {
+    let mut outs = 0u64;
+    for order in orders(&[Role::Thread(0), Role::Helper]) {
+        for p in phases().filter(|p| p[1] == 0) {
+            for seed in SEEDS {
+                let seen = run(&order, p, true, seed, false);
+                assert_eq!(
+                    seen.held_found, 0,
+                    "{order:?}: a helper that never tries found one"
+                );
+                // Each switch-out is missed once its thread runs again; the last may be pending.
+                assert!(seen.held_missed + 1 >= seen.held_outs);
+                outs += seen.held_outs;
+            }
+        }
+    }
+    assert!(
+        outs > 0,
+        "the control's thread was never switched out in its spin"
+    );
+    std::println!("a helper that never tries: {outs} switch-outs in a spin, none found");
 }
