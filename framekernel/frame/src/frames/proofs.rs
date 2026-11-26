@@ -9,8 +9,9 @@
 //!   here, from the allocator's documentation, not from its code: a frame lies wholly in a
 //!   region the allocator owns (`Usable`, or a kind `reclaim` took over), is not frame 0, and
 //!   holds no byte of a reserved range;
-//! - *cover:* `frames` is the memory map's `covered_end` in frames, and the bitmap holds a
-//!   bit for each.
+//! - *cover:* `frames` is the end of the memory map's highest region of a kind the allocator
+//!   may ever own, in frames ([`map_end`], also written here from the documentation of
+//!   `covered_end` and not from its code), and the bitmap holds a bit for each.
 //!
 //! Accounting is checked over the whole bitmap. Ownership is a statement about every frame,
 //! so it is checked at one frame that Kani chooses freely (`frame`, `kani::any()`): since the
@@ -21,33 +22,43 @@
 //! **The method.** [`new_frees_exactly_the_owned_frames`] and
 //! [`new_refuses_a_bitmap_too_small`] prove that `new` establishes the invariant from any
 //! memory map `boot::summarize` accepts. Every other harness starts from **any** state that
-//! satisfies it ([`any_state`]: the bitmap's words, `next`, the reclaimed kinds and the
-//! reserved ranges are all `kani::any()`), runs one method on arbitrary arguments, and proves
-//! the invariant holds after it, with the method's own postcondition. By induction on the
-//! number of calls, the invariant then holds after any sequence of calls of the methods so
-//! covered, within the bounds below. Every `&mut self` method of `FrameAllocator` is covered
-//! but `reclaim`:
+//! satisfies it ([`any_state`]: the bitmap's words, `next`, the reclaimed kinds and the first
+//! 2 of the 8 reserved slots are all `kani::any()`, and the other 6 are empty, as `new` leaves
+//! them), runs one method on arbitrary arguments, and proves the invariant holds after it,
+//! with the method's own postcondition. Every `&mut self` method of `FrameAllocator` is
+//! covered but `reclaim`:
 //!
 //! | Method | Harness | Memory |
 //! |---|---|---|
 //! | `new` (establishes it) | [`new_frees_exactly_the_owned_frames`] (a bitmap of one word), [`new_refuses_a_bitmap_too_small`] (of no word), [`new_refuses_more_than_eight_ranges`] | 5 frames; 2 for the nine ranges |
-//! | `allocate` | [`allocate_hands_out_a_free_frame`] | 128 frames |
-//! | `free` | [`free_takes_back_only_what_was_handed_out`] | 128 frames |
-//! | `claim` | [`claim_takes_only_a_free_frame`] | 128 frames |
-//! | `allocate_run` | [`allocate_run_hands_out_a_free_aligned_run`] | 8 frames |
-//! | `free_run` | [`free_run_is_all_or_nothing`] | 16 frames |
+//! | `allocate` | [`allocate_hands_out_a_free_frame`] (two words), [`allocate_hands_out_a_free_frame_one_word`] | 128 frames; 64 |
+//! | `free` | [`free_takes_back_only_what_was_handed_out`] (two words), [`free_takes_back_only_what_was_handed_out_one_word`] | 128 frames; 64 |
+//! | `claim` | [`claim_takes_only_a_free_frame`] (two words), [`claim_takes_only_a_free_frame_one_word`] | 128 frames; 64 |
+//! | `allocate_run` | [`allocate_run_hands_out_a_free_aligned_run`] (one word) | 8 frames |
+//! | `free_run` | [`free_run_is_all_or_nothing`] (one word) | 16 frames |
 //! | `reclaim` | **not covered** (below) | |
 //! | `set_free` (private; called only by the above) | through each of them | |
 //!
 //! [`two_hand_outs_never_overlap`] (8 frames) states "no frame is handed out twice" directly.
 //!
-//! **`reclaim` is not proved.** Its check of each frame, `allocatable`, walks all 8 reserved
-//! slots, so Kani must unwind at least 9 times. At 9 its harness had not finished after 600
-//! seconds with a map of 3 regions or of 2; at 8 (267 seconds, 7.5 GB) it fails the unwinding
-//! check (TASKS item 143, ruling FA-7). So a sequence of calls that includes `reclaim` is
-//! covered only as far as `reclaim` keeps the invariant, which its host tests check (F-1's
-//! among them) and Kani does not. The states the other harnesses start from do include every
-//! set of kinds already reclaimed. TASKS item 154 is a Kani proof of `reclaim`.
+//! **What the induction covers.** Each row's memory is the bound of that one step, from any
+//! valid state of that size. A sequence of calls starts where `new` leaves the allocator, and
+//! `new` is proved over at most 5 frames with a bitmap of one word. Every step has a harness
+//! over one word whose bound is at least that, so, by induction on the number of calls, the
+//! invariant holds after any sequence of `allocate`, `free`, `claim`, `allocate_run` (runs of
+//! at most 4 frames) and `free_run` on an allocator `new` built over a map of at most 5
+//! frames, 3 regions and 2 reserved ranges. No sequence past 5 frames is proved. The
+//! two-word harnesses show their step across a word's boundary.
+//!
+//! **`reclaim` is not proved.** It walks every frame of every region of the kind it takes
+//! over, and checks each with `allocatable`, which walks all 8 reserved slots: walks inside
+//! walks, each of which CBMC unrolls to the bound, and which need a bound of at least 9. At 9
+//! its harness had not finished after 600 seconds with a map of 3 regions or of 2; at 8 (267
+//! seconds, 7.5 GB) it fails the unwinding check (TASKS item 143, ruling FA-7). So a sequence
+//! that includes `reclaim` is covered only as far as `reclaim` keeps the invariant, which Kani
+//! does not show; its host tests check it on examples (F-1's among them). The states the
+//! other harnesses start from do include every set of kinds already reclaimed. TASKS item 154
+//! is a Kani proof of `reclaim`.
 //!
 //! **Kani's own checks** hold in each harness too: no arithmetic overflow, no index out of
 //! bounds, no division by zero, no panic, and every loop unwound within its bound (the
@@ -68,7 +79,7 @@
 //! (`nightly-2026-08-21`) for the host it runs on.
 #![forbid(unsafe_code)]
 
-use super::{BITS, FRAME, FrameAllocator, FrameError, MAX_RESERVED, covered_end, words_for};
+use super::{BITS, FRAME, FrameAllocator, FrameError, MAX_RESERVED};
 use crate::boot::summarize;
 use origin_boot_info::{MemoryRegion, RegionKind};
 
@@ -210,11 +221,32 @@ fn owned_if_free(a: &FrameAllocator<'_>, words: &[u64], frame: u64) -> bool {
         || owned(a.regions, a.reclaimed, &a.reserved[..RESERVED], frame)
 }
 
+/// FI-3's end, written from `covered_end`'s documentation and not its code: the end of the
+/// highest region of a kind the allocator may ever own, `Usable` or `LoaderReclaimable` (which
+/// `reclaim` may return), or 0 when there is none. Every map here is one `boot::summarize`
+/// accepts within the harness's memory, so no end overflows.
+fn map_end(regions: &[MemoryRegion]) -> u64 {
+    let mut end = 0;
+    for r in regions {
+        if r.kind == RegionKind::Usable as u32 || r.kind == RegionKind::LoaderReclaimable as u32 {
+            end = end.max(r.base + r.pages * FRAME);
+        }
+    }
+    end
+}
+
+/// The bitmap words that hold a bit for each frame below `end`: a frame for each 4 KiB begun,
+/// a word for each 64 frames begun.
+fn words_needed(end: u64) -> u64 {
+    let frames = end / FRAME + u64::from(end % FRAME != 0);
+    frames / BITS + u64::from(frames % BITS != 0)
+}
+
 /// Asserts the invariant: cover and accounting over the whole bitmap, and ownership at
 /// `frame`, which the harness lets Kani choose freely.
 fn check_whole(a: &FrameAllocator<'_>, frame: u64) {
     kani::assert(
-        a.frames == covered_end(a.regions) / FRAME && a.frames <= a.bitmap.len() as u64 * BITS,
+        a.frames == map_end(a.regions) / FRAME && a.frames <= a.bitmap.len() as u64 * BITS,
         "cover: the bitmap holds a bit for every frame of the map",
     );
     kani::assert(
@@ -231,7 +263,7 @@ fn check_whole(a: &FrameAllocator<'_>, frame: u64) {
 /// with ownership assumed at `frame`. The bits at and past `frames` are left as drawn: nothing
 /// may depend on them.
 fn any_state<const N: usize>(m: &mut Model<N>, frame: u64) -> FrameAllocator<'_> {
-    let frames = covered_end(&m.regions) / FRAME;
+    let frames = map_end(&m.regions) / FRAME;
     kani::assume(frames <= N as u64 * BITS);
     let mut a = FrameAllocator {
         bitmap: &mut m.bitmap,
@@ -297,7 +329,7 @@ fn free_run(words: &[u64], frames: u64, first: u64, count: u64) -> bool {
 fn new_case<const N: usize>(limit: u64) -> NewOutcome {
     let mut m = Model::<N>::any(limit);
     let list = [m.reserved[0], m.reserved[1]];
-    let needed = words_for(covered_end(&m.regions));
+    let needed = words_needed(map_end(&m.regions));
     let frame: u64 = kani::any();
     match FrameAllocator::new(&mut m.bitmap, &m.regions, &list) {
         Err(FrameError::BitmapTooSmall {
@@ -392,23 +424,41 @@ fn new_refuses_more_than_eight_ranges() {
     );
 }
 
-/// `allocate`, from any valid state: it hands out a frame that was free, frame aligned and
-/// non-zero, marks it used and nothing else, and counts it; it returns `None` only when no
-/// frame is free. (The frame is owned because it was free: the invariant.)
+/// [`allocate_case`] over 128 frames, a bitmap of two words.
 #[kani::proof]
 #[kani::unwind(10)]
 fn allocate_hands_out_a_free_frame() {
-    let mut m = Model::<WORDS>::any(LARGE);
+    let handed = allocate_case::<WORDS>(LARGE);
+    kani::cover(
+        handed.is_some_and(|addr| addr >= BITS * FRAME),
+        "a frame of the second word",
+    );
+}
+
+/// [`allocate_case`] over 64 frames, a bitmap of one word, as `new` makes.
+#[kani::proof]
+#[kani::unwind(10)]
+fn allocate_hands_out_a_free_frame_one_word() {
+    allocate_case::<1>(BITS);
+}
+
+/// `allocate`, from any valid state with a bitmap of `N` words over `limit` frames: it hands
+/// out a frame that was free, frame aligned and non-zero, marks it used and nothing else, and
+/// counts it; it returns `None` only when no frame is free. (The frame is owned because it was
+/// free: the invariant.) Returns what `allocate` returned.
+fn allocate_case<const N: usize>(limit: u64) -> Option<u64> {
+    let mut m = Model::<N>::any(limit);
     let frame: u64 = kani::any();
     let mut a = any_state(&mut m, frame);
-    let before: [u64; WORDS] = snapshot(&a);
+    let before: [u64; N] = snapshot(&a);
     let free = a.free;
-    match a.allocate() {
+    let handed = a.allocate();
+    match handed {
         Some(addr) => {
-            kani::cover(addr >= BITS * FRAME, "a frame of the second word");
             let x = addr / FRAME;
             // The invariant held at the frame handed out too: assumed there as well.
             kani::assume(owned_if_free(&a, &before, x));
+            kani::cover(true, "a frame is handed out");
             kani::assert(
                 addr % FRAME == 0 && x != 0 && x < a.frames && clear(&before, x),
                 "a handed-out frame was free, aligned, non-zero and in the map",
@@ -434,17 +484,31 @@ fn allocate_hands_out_a_free_frame() {
         }
     }
     check_whole(&a, frame);
+    handed
 }
 
-/// `free`, from any valid state and of any address: it takes back exactly an owned frame
-/// that is in use, and refuses everything else with the right error, changing nothing.
+/// [`free_case`] over 128 frames, a bitmap of two words.
 #[kani::proof]
 #[kani::unwind(10)]
 fn free_takes_back_only_what_was_handed_out() {
-    let mut m = Model::<WORDS>::any(LARGE);
+    free_case::<WORDS>(LARGE);
+}
+
+/// [`free_case`] over 64 frames, a bitmap of one word, as `new` makes.
+#[kani::proof]
+#[kani::unwind(10)]
+fn free_takes_back_only_what_was_handed_out_one_word() {
+    free_case::<1>(BITS);
+}
+
+/// `free`, from any valid state with a bitmap of `N` words over `limit` frames, of any
+/// address: it takes back exactly an owned frame that is in use, and refuses everything else
+/// with the right error, changing nothing.
+fn free_case<const N: usize>(limit: u64) {
+    let mut m = Model::<N>::any(limit);
     let frame: u64 = kani::any();
     let mut a = any_state(&mut m, frame);
-    let before: [u64; WORDS] = snapshot(&a);
+    let before: [u64; N] = snapshot(&a);
     let free = a.free;
     let addr: u64 = kani::any();
     let x = addr / FRAME;
@@ -491,15 +555,28 @@ fn free_takes_back_only_what_was_handed_out() {
     check_whole(&a, frame);
 }
 
-/// `claim`, from any valid state and of any address: it takes exactly the frame
-/// `frame_is_free` names, owned and free, and otherwise changes nothing.
+/// [`claim_case`] over 128 frames, a bitmap of two words.
 #[kani::proof]
 #[kani::unwind(10)]
 fn claim_takes_only_a_free_frame() {
-    let mut m = Model::<WORDS>::any(LARGE);
+    claim_case::<WORDS>(LARGE);
+}
+
+/// [`claim_case`] over 64 frames, a bitmap of one word, as `new` makes.
+#[kani::proof]
+#[kani::unwind(10)]
+fn claim_takes_only_a_free_frame_one_word() {
+    claim_case::<1>(BITS);
+}
+
+/// `claim`, from any valid state with a bitmap of `N` words over `limit` frames, of any
+/// address: it takes exactly the frame `frame_is_free` names, owned and free, and otherwise
+/// changes nothing.
+fn claim_case<const N: usize>(limit: u64) {
+    let mut m = Model::<N>::any(limit);
     let frame: u64 = kani::any();
     let mut a = any_state(&mut m, frame);
-    let before: [u64; WORDS] = snapshot(&a);
+    let before: [u64; N] = snapshot(&a);
     let free = a.free;
     let addr: u64 = kani::any();
     let x = addr / FRAME;
@@ -579,9 +656,10 @@ fn allocate_run_hands_out_a_free_aligned_run() {
     check_whole(&a, frame);
 }
 
-/// `free_run`, from any valid state, of any address and count: it takes back a run only if
-/// every frame of it is owned and in use, all at once; otherwise it refuses and changes
-/// nothing.
+/// `free_run`, from any valid state, of any address and count: it takes back a run, all at
+/// once, exactly when the run is aligned, non-empty, in the map and every frame of it owned
+/// and in use; otherwise it refuses, naming a real fault of the run, and changes nothing.
+/// (Each refusal is checked against its own fault, so a run with none must be taken back.)
 #[kani::proof]
 #[kani::unwind(18)]
 fn free_run_is_all_or_nothing() {
@@ -593,6 +671,10 @@ fn free_run_is_all_or_nothing() {
     let addr: u64 = kani::any();
     let count: u64 = kani::any();
     let first = addr / FRAME;
+    let in_map = count != 0
+        && addr % FRAME == 0
+        && first != 0
+        && first.checked_add(count).is_some_and(|end| end <= a.frames);
     // A frame of the run Kani chooses freely: each must have been owned and in use.
     let member: u64 = kani::any();
     match a.free_run(addr, count) {
@@ -618,6 +700,19 @@ fn free_run_is_all_or_nothing() {
                 matches!(e, FrameError::DoubleFree(_)),
                 "a run with a free frame is refused",
             );
+            // The frame a refusal names lies in the run.
+            let names = |x: u64| x % FRAME == 0 && x / FRAME >= first && x / FRAME - first < count;
+            let real = match e {
+                FrameError::EmptyRun => count == 0,
+                FrameError::Misaligned(x) => x == addr && count != 0 && addr % FRAME != 0,
+                FrameError::OutOfRange(x) => {
+                    x == addr && count != 0 && addr % FRAME == 0 && !in_map
+                }
+                FrameError::NotAllocatable(x) => in_map && names(x) && !owns(&a, x / FRAME),
+                FrameError::DoubleFree(x) => in_map && names(x) && clear(&before, x / FRAME),
+                _ => false,
+            };
+            kani::assert(real, "a refusal names a real fault of the run");
             kani::assert(
                 unchanged(&a, &before) && a.free == free,
                 "a refused free_run changes nothing",

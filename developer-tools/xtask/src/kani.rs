@@ -21,8 +21,9 @@
 //!   text no longer matches the source exactly once stops the run.
 //! - **`cargo xtask kani-gate`**, part of `check`, needs no Kani: the harnesses the proof files
 //!   define and the controls name agree, each harness has a control, each control's text is in
-//!   its file exactly once, `cfg(kani)` appears only on the parents' `mod proofs;` lines, each
-//!   proof file forbids `unsafe`, and the CI job installs this version.
+//!   its file exactly once, the word `kani` appears outside xtask and the proof files only in
+//!   the parents' `#[cfg(kani)]` before `mod proofs;`, each proof file forbids `unsafe`, and the
+//!   CI job installs this version.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -151,7 +152,10 @@ const CONTROLS: &[Control] = &[
         file: FRAMES,
         from: "                self.free -= 1;\n",
         to: "",
-        harnesses: &["frames::proofs::allocate_hands_out_a_free_frame"],
+        harnesses: &[
+            "frames::proofs::allocate_hands_out_a_free_frame",
+            "frames::proofs::allocate_hands_out_a_free_frame_one_word",
+        ],
         expect: &[
             "allocate marks that frame used and nothing else",
             "accounting: free counts the free frames",
@@ -162,7 +166,10 @@ const CONTROLS: &[Control] = &[
         file: FRAMES,
         from: "        if self.is_free(frame) {\n            return Err(FrameError::DoubleFree(addr));\n        }\n",
         to: "",
-        harnesses: &["frames::proofs::free_takes_back_only_what_was_handed_out"],
+        harnesses: &[
+            "frames::proofs::free_takes_back_only_what_was_handed_out",
+            "frames::proofs::free_takes_back_only_what_was_handed_out_one_word",
+        ],
         expect: &["free takes back exactly an owned frame in use"],
     },
     Control {
@@ -181,7 +188,10 @@ const CONTROLS: &[Control] = &[
         file: FRAMES,
         from: "        if !self.frame_is_free(addr) {\n",
         to: "        if !addr.is_multiple_of(FRAME) {\n",
-        harnesses: &["frames::proofs::claim_takes_only_a_free_frame"],
+        harnesses: &[
+            "frames::proofs::claim_takes_only_a_free_frame",
+            "frames::proofs::claim_takes_only_a_free_frame_one_word",
+        ],
         expect: &["claim takes exactly an owned free frame"],
     },
     Control {
@@ -210,6 +220,30 @@ const CONTROLS: &[Control] = &[
             "every frame of a run taken back was owned and in use",
             "ownership: every free frame is owned",
         ],
+    },
+    Control {
+        name: "free-run-frees-as-it-checks",
+        file: FRAMES,
+        from: "        if let Some(frame) = (first..end).find(|&f| self.is_free(f)) {\n            return Err(FrameError::DoubleFree(frame * FRAME));\n        }\n        for frame in first..end {\n            self.set_free(frame, true);\n        }\n",
+        to: "        for frame in first..end {\n            if self.is_free(frame) {\n                return Err(FrameError::DoubleFree(frame * FRAME));\n            }\n            self.set_free(frame, true);\n        }\n",
+        harnesses: &["frames::proofs::free_run_is_all_or_nothing"],
+        expect: &["a refused free_run changes nothing"],
+    },
+    Control {
+        name: "free-run-refuses-the-last-frame",
+        file: FRAMES,
+        from: "        if first == 0 || end > self.frames {\n",
+        to: "        if first == 0 || end >= self.frames {\n",
+        harnesses: &["frames::proofs::free_run_is_all_or_nothing"],
+        expect: &["a refusal names a real fault of the run"],
+    },
+    Control {
+        name: "covered-end-without-loader-memory",
+        file: FRAMES,
+        from: "            r.kind == RegionKind::Usable as u32 || r.kind == RegionKind::LoaderReclaimable as u32\n",
+        to: "            r.kind == RegionKind::Usable as u32\n",
+        harnesses: &["frames::proofs::new_frees_exactly_the_owned_frames"],
+        expect: &["cover: the bitmap holds a bit for every frame of the map"],
     },
     Control {
         name: "rotation-stub-walks-no-step",
@@ -338,19 +372,53 @@ struct Outcome {
 }
 
 /// The harnesses of a proof file's source, as Kani names them: the function after each
-/// `#[kani::proof]`, with the file's module path before it.
+/// `#[kani::proof]`, with the file's module path before it. The function may be public, and
+/// it and other attributes may share the attribute's line.
 fn harness_names(source: &str, module: &str) -> Vec<String> {
     let mut names = Vec::new();
-    let mut lines = source.lines().map(str::trim);
-    while let Some(line) = lines.next() {
-        if line == "#[kani::proof]"
-            && let Some(rest) = lines.by_ref().find_map(|l| l.strip_prefix("fn "))
-            && let Some((name, _)) = rest.split_once('(')
-        {
-            names.push(format!("{module}::{name}"));
+    let mut pending = false;
+    for line in source.lines() {
+        let mut rest = line.trim();
+        if let Some(after) = rest.strip_prefix("#[kani::proof]") {
+            pending = true;
+            rest = after;
+        }
+        if !pending {
+            continue;
+        }
+        let rest = skip_attributes(rest);
+        let rest = ["pub(crate) ", "pub(super) ", "pub "]
+            .iter()
+            .find_map(|v| rest.strip_prefix(v))
+            .unwrap_or(rest);
+        if let Some(signature) = rest.strip_prefix("fn ") {
+            if let Some((name, _)) = signature.split_once('(') {
+                names.push(format!("{module}::{}", name.trim()));
+            }
+            pending = false;
         }
     }
     names
+}
+
+/// `text` after any attributes it starts with, each `#[...]` with its brackets balanced.
+fn skip_attributes(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    while let Some(inner) = rest.strip_prefix("#[") {
+        let mut depth = 1;
+        let Some(end) = inner.char_indices().find_map(|(i, c)| {
+            match c {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(i)
+        }) else {
+            return rest;
+        };
+        rest = inner[end + 1..].trim_start();
+    }
+    rest
 }
 
 /// Each harness Kani's output reports on, with what it reported, in order.
@@ -369,7 +437,7 @@ fn parse_report(output: &str) -> Vec<(String, Outcome)> {
             } else if let Some(check) = line.strip_prefix("Failed Checks: ") {
                 outcome.failed.push(check.to_string());
             } else if let Some(rest) = line.strip_prefix("** ")
-                && let Some(counts) = rest.strip_suffix(" cover properties satisfied")
+                && let Some((counts, _)) = rest.split_once(" cover properties satisfied")
                 && let Some((done, of)) = counts.split_once(" of ")
                 && let (Ok(done), Ok(of)) = (done.parse(), of.parse())
             {
@@ -766,7 +834,8 @@ pub(crate) fn gate() -> Result {
     problems.extend(control_list_problems(&names, CONTROLS, &|file| {
         fs::read_to_string(root.join(file)).ok()
     }));
-    // `cfg(kani)` only where the proof modules are declared.
+    // The word `kani` only where the proof modules are declared, outside xtask and the proof
+    // files themselves.
     let mut files = Vec::new();
     collect_files(
         &root,
@@ -777,6 +846,9 @@ pub(crate) fn gate() -> Result {
     .map_err(|e| format!("{}: {e}", root.display()))?;
     for file in files {
         let relative = file.strip_prefix(&root).unwrap_or(&file);
+        if PROOF_FILES.iter().any(|p| Path::new(p.file) == relative) {
+            continue;
+        }
         let text = fs::read_to_string(&file).unwrap_or_default();
         let allowed = PROOF_FILES.iter().any(|p| Path::new(p.parent) == relative);
         problems.extend(cfg_problems(
@@ -799,7 +871,7 @@ pub(crate) fn gate() -> Result {
     }
     if problems.is_empty() {
         println!(
-            "xtask: kani-gate: {} harnesses in {} proof files, {} controls, each harness controlled; cfg(kani) only on the proof modules' lines",
+            "xtask: kani-gate: {} harnesses in {} proof files, {} controls, each harness controlled; `kani` only on the proof modules' declarations",
             names.len(),
             PROOF_FILES.len(),
             CONTROLS.len()
@@ -889,26 +961,37 @@ fn control_list_problems(
     problems
 }
 
-/// Problems with `cfg(kani)` in `text`, the file `name`: outside a comment it may appear only
-/// on the line before `mod proofs;`, and only where `allowed`.
+/// Problems with the word `kani` in `text`, the file `name`: outside a comment it may appear
+/// only in `#[cfg(kani)]` on the line before `mod proofs;`, and only where `allowed`. Any other
+/// use, `cfg(any(kani, ..))`, `cfg_attr(kani, ..)` or `cfg!(kani)` among them, could make Kani
+/// prove code that differs from the code that ships.
 fn cfg_problems(name: &str, text: &str, allowed: bool) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
     let mut problems = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let code = line.split("//").next().unwrap_or("");
-        if !code.contains("cfg(kani") && !code.contains("cfg(not(kani") {
+        if !names_kani(code) {
             continue;
         }
         let declares = code.trim() == "#[cfg(kani)]"
             && lines.get(i + 1).is_some_and(|next| next.trim() == MOD_LINE);
         if !(allowed && declares) {
             problems.push(format!(
-                "{name}:{}: `cfg(kani)` outside a proof module's declaration",
+                "{name}:{}: `kani` outside a proof module's declaration",
                 i + 1
             ));
         }
     }
     problems
+}
+
+/// Whether `code` holds `kani` as a word: with no letter, digit or `_` either side.
+fn names_kani(code: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    code.match_indices("kani").any(|(at, found)| {
+        !code[..at].chars().next_back().is_some_and(word)
+            && !code[at + found.len()..].chars().next().is_some_and(word)
+    })
 }
 
 #[cfg(test)]
@@ -928,7 +1011,7 @@ Verification Time: 1.5s
 Checking harness frames::proofs::bad...
 SUMMARY:
  ** 1 of 20 failed
- ** 1 of 2 cover properties satisfied
+ ** 1 of 2 cover properties satisfied (1 unreachable)
 Failed Checks: accounting: free counts the free frames
  File: \"framekernel/frame/src/frames/proofs.rs\", line 1, in x
 Failed Checks: attempt to subtract with overflow
@@ -948,10 +1031,20 @@ fn helper() {}
 fn two_words() {
     let x = 1;
 }
+
+#[kani::proof]
+pub fn public() {}
+
+#[kani::proof] #[kani::stub(<[T]>::rotate_right, walk)] pub(crate) fn one_line() {}
 ";
         assert_eq!(
             harness_names(source, "frames::proofs"),
-            ["frames::proofs::one", "frames::proofs::two_words"]
+            [
+                "frames::proofs::one",
+                "frames::proofs::two_words",
+                "frames::proofs::public",
+                "frames::proofs::one_line"
+            ]
         );
     }
 
@@ -1077,6 +1170,20 @@ warning: trailing semicolon in macro used in expression position
             1
         );
         assert!(cfg_problems("p.rs", "// cfg(kani) in a comment\n", false).is_empty());
+        // Every other way of naming it, each of which could change what Kani proves.
+        for form in [
+            "#[cfg(any(kani, test))]\npub const MAX_RESERVED: usize = 2;\n",
+            "#[cfg(not(any(kani)))]\nfn other() {}\n",
+            "#[cfg(all(kani, test))]\nfn other() {}\n",
+            "#[cfg_attr(kani, inline(never))]\nfn other() {}\n",
+            "let fast = cfg!(kani);\n",
+            "#[cfg( kani )]\nmod proofs;\n",
+            "kani::assume(true);\n",
+        ] {
+            assert_eq!(cfg_problems("p.rs", form, true).len(), 1, "{form}");
+        }
+        // A longer identifier is not the word.
+        assert!(cfg_problems("p.rs", "let kani_like = 1; let pekani = 2;\n", false).is_empty());
     }
 
     #[test]

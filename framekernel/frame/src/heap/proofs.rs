@@ -30,14 +30,20 @@
 //!
 //! **Core's rotation, stubbed.** `new_slab` and `release` keep the table sorted with
 //! `rotate_right(1)` and `rotate_left(1)`. In the three harnesses that reach them, Kani stubs
-//! both with plain walks ([`rotate_right_by_walk`], [`rotate_left_by_walk`]), which
-//! [`the_rotation_stubs_equal_core_s`] proves equal to core's for tables of 1 to 3 entries. So
-//! those proofs rest on core's rotation doing what its documentation says: an assumption, not
-//! a result.
+//! both with plain walks ([`rotate_right_by_walk`], [`rotate_left_by_walk`]), because core's
+//! rotation made their formulas several times larger. [`the_rotation_stubs_equal_core_s`]
+//! proves the walks equal to core's rotation, by 0 and by 1, on tables of 1 to 3 entries of
+//! any contents. With 2 slabs the heap rotates only tables of 1 or 2 entries, by 1, so the
+//! stubbed proofs hold of core's rotation too, under the same caveat about the compiler as
+//! every proof here, and rest on no claim of core's documentation.
 //!
 //! Two pure functions are proved for **every** input, with no bound: `plan`
-//! ([`plan_fits_every_layout`]) and `take_free_bit` ([`take_free_bit_takes_the_lowest_free_bit`]).
-//! [`two_allocations_never_overlap`] states "no byte is handed out twice" directly.
+//! ([`plan_fits_every_layout`]) and `take_free_bit`
+//! ([`take_free_bit_takes_the_lowest_free_bit`]). [`two_allocations_never_overlap`] states
+//! directly that two allocations from one state never share a byte, given the source's
+//! contract with no alias (below). That a new allocation shares no byte with a block live
+//! before it is [`allocate_keeps_the_heap_whole`]'s "its bit was clear", with the table's
+//! order.
 //!
 //! **Kani's own checks** hold in each harness too: no arithmetic overflow, no index out of
 //! bounds, no panic, and every loop unwound within its bound.
@@ -45,18 +51,22 @@
 //! **The bounds:** a slab table of 2 entries. Each slab's bitmap is its whole 4 words, so a
 //! slab's size is not bounded.
 //!
-//! **Assumed, not proved: the page source's contract** ([`Source`]). It hands out frames
-//! aligned as asked, that do not wrap past the end of memory and that no large run of the
-//! heap holds, or `None`. In [`allocate_keeps_the_heap_whole`], when the heap asks for a slab's
-//! frame, it may hand out a frame the heap already holds as a slab, which the heap must refuse
-//! and give back: the one check the heap makes of its source. For a large run the heap trusts
-//! the source, and a source that broke the contract there could make a run overlap a slab. The
-//! source takes back what it gave, and takes a large run back only while the heap's count of
-//! large frames covers it. The frames the heap holds number below 2^52, as they must in a
-//! 64-bit address space. The frame allocator's own proofs (`frames::proofs`) cover the
-//! kernel's source, the frame allocator, within their bounds and except its `reclaim`; the
-//! glue between the two (`memory.rs`) is not proved. That the heap's caller frees only what
-//! it allocated, with the same layout, is `GlobalAlloc`'s contract on its caller.
+//! **Assumed, not proved: the page source's contract** ([`Source`]). It hands out `None`, or
+//! a run aligned as asked that does not wrap past the end of memory and shares no byte with a
+//! frame the heap holds as a slab or with a run it handed out earlier in the harness. The one
+//! exception: in [`allocate_keeps_the_heap_whole`], when the heap asks for a slab's frame, the
+//! source may hand out a frame the heap already holds as a slab, which the heap must refuse and
+//! give back, the one check the heap makes of its source; no other harness lets it. For a large
+//! run the heap trusts the source, and a source that broke the contract there could make a run
+//! overlap a slab. The large runs the heap holds at the start have no address the heap keeps,
+//! so the model cannot keep clear of them, and no proof here says anything of overlap with
+//! them. The source takes back what it gave, and takes a large run back only while the
+//! heap's count of large frames covers it. The frames the heap holds number below 2^52, as
+//! they must in a 64-bit address space. The frame allocator's own proofs (`frames::proofs`)
+//! cover the kernel's source, the frame allocator, within their bounds and except its
+//! `reclaim`; the glue between the two (`memory.rs`) is not proved. That the heap's caller
+//! frees only what it allocated, with the same layout, is `GlobalAlloc`'s contract on its
+//! caller.
 //!
 //! **Not proved:** tables past 2 slabs; `memory.rs` (the lock, `GlobalAlloc`, the pointers);
 //! concurrency; the machine code rustc 1.100.0 makes: Kani compiles with its own nightly
@@ -391,9 +401,9 @@ fn any_entry() -> Slab {
 }
 
 /// Core's `rotate_right` and `rotate_left`, by 0 and by 1, equal the two walks the heap's
-/// harnesses stub them with, on tables of 1 to 3 entries of any contents. The heap's proofs
-/// then rest on core's rotation being correct, as its documentation states: an assumption the
-/// records name, and not proved here for longer tables.
+/// harnesses stub them with, on tables of 1 to 3 entries of any contents: every table the
+/// heap's harnesses rotate (1 or 2 entries, since the table holds 2 slabs) and one more. Not
+/// proved for longer tables, which no harness here reaches.
 #[kani::proof]
 #[kani::unwind(5)]
 fn the_rotation_stubs_equal_core_s() {
@@ -437,6 +447,7 @@ fn plan_fits_every_layout() {
             kani::cover(true, "a block");
             kani::assert(
                 align.is_power_of_two()
+                    && size.max(align) <= 1 << 63
                     && block.is_power_of_two()
                     && (MIN_BLOCK..=MAX_BLOCK).contains(&block)
                     && block >= size
@@ -452,6 +463,7 @@ fn plan_fits_every_layout() {
             kani::assert(
                 align.is_power_of_two()
                     && size.max(align) > MAX_BLOCK
+                    && size.max(align) <= 1 << 63
                     && pages >= 1
                     && pages.checked_mul(PAGE).is_some_and(|bytes| bytes >= size)
                     && frames.is_power_of_two()
@@ -556,6 +568,10 @@ fn allocate_keeps_the_heap_whole() {
                 h.len <= len + 1 && source.out == source.back + (h.len - len) as u64,
                 "a new slab holds the one frame it took",
             );
+            kani::assert(
+                h.stats.large_pages == stats.large_pages,
+                "a block leaves the large frames alone",
+            );
         }
         (Some(Plan::Run { pages, .. }), Some(addr)) => {
             kani::cover(true, "a run");
@@ -631,6 +647,10 @@ fn free_takes_back_only_a_live_block() {
                     && at.is_some_and(|i| source.slab_back[i] == u32::from(emptied))
                     && source.back == u64::from(emptied),
                 "a slab's frame goes back once, exactly when it empties",
+            );
+            kani::assert(
+                h.stats.large_pages == stats.large_pages,
+                "a block leaves the large frames alone",
             );
         }
         (Some(Plan::Run { pages, .. }), Ok(())) => {
