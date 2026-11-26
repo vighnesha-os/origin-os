@@ -150,6 +150,39 @@ jobs:
       - name: The job left the checkout as committed
         run: bash .github/ci/checkout-unchanged.sh
 
+  # Kani's proofs and their negative controls (CLAUDE.md §73; owner item 358, TASKS item 143).
+  # The full run is here only, not in `check` (the coordinating session's ruling of 2026-11-26):
+  # the development Mac runs one harness at a time while it is written. The script installs the
+  # pinned Kani and checks its bundle against the digest GitHub publishes. A standard runner,
+  # free for a public repository (CLAUDE.md §80).
+  kani:
+    name: Kani's proofs and controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: bash .github/ci/install-rust.sh
+      - name: Install Kani
+        run: bash .github/ci/install-kani.sh
+      - run: cargo --locked xtask kani
+      # Each run's full output, harness by harness and control by control. Kept when the job
+      # fails too; this step never decides whether the job passes.
+      - name: Keep Kani's reports
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kani-reports
+          path: target/xtask/kani
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
+      - name: The job left the checkout as committed
+        run: bash .github/ci/checkout-unchanged.sh
+
   # The control: every proof, on QEMU's software CPU, as on the development Mac.
   boot-software-cpu:
     name: boots on QEMU's software CPU
