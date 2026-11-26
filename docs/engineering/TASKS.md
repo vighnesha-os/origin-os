@@ -5825,3 +5825,87 @@ Numbered by the coordinating session on 2026-11-22 as "explained if it recurs". 
 - The fix against an order the model does not cover. The model holds the five threads of T2's dump and one processor; the phase's argument, that the boot flow runs only while the phase's thread does not, holds for any order.
 
 **Follow-ups:** none new. TASKS item 148 (whether the ask is needed) is the coordinating session's.
+
+### 152. Integrity's pulled phase made structural on two processors: two helpers on each puller (ADR-0013 R1 (b); PR 67's CI at `947a504c`)
+
+Numbered by the coordinating session on 2026-11-26, as a follow-up to TASKS item 98. Its line is in the coordinating session's records pull request. TASKS item 98's session diagnosed it (`d98-findings.md` in the coordinating session's notes) and built it the same day, on `claude/t152-pulled-helper` cut from TASKS item 129's tip, `bfd4ec11`. Nothing is pushed: the keeper lands it, after TASKS item 129.
+
+**What failed.** PR 67's CI at `947a504c` (run 45739294613) failed integrity's pulled phase on every 2-processor machine of its three boot jobs: the software-CPU job's machine with reserved memory, and both KVM jobs' Intel IOMMU machine. Each line read "1 pull by idle processors, 0 of a thread moved before; 0 moves back by the boot flow", with 4.79M, 58.8M and 45.3M moves back refused, and "a pull of a thread moved before: no, in 30 s". The 4-processor machines passed in the same jobs.
+
+**Why: (b), the proof, not the kernel** (the coordinating session's ruling, 2026-11-26, 06:12 UTC).
+- **What the boot flow can move.** It can move only a thread that is ready, not running, and not the context its processor last switched out (ADR-0020 S5; `Contexts::lend` refuses `Leaving`).
+- **Two contexts give it nothing.** With two contexts on a processor, every yield and every tick switches between them, so the waiting one is always the one just switched out. A report-only diagnostic counted 0 ticks or yields, on either processor, that kept the running thread while another waited.
+- **Why two processors only.** There the source is the boot processor, and the one processor left to pull is CPU 1. Once CPU 1 held two of the phase's threads alternating, a move back waited for CPU 1 to idle, which needs their two-tick sleeps to overlap: a run order.
+- **What CI showed.** On CI's runners CPU 1 never idled again after its first pull. On the Mac it idled 44 to 95 times a phase, and the failure did not reproduce under 10 or 20 busy processes.
+- **Not a kernel defect.** The dump showed CPU 1 running thread 2, with thread 1 ready and waiting, holding no word: exactly the frame S5 does not promise movable (R98-1, TASKS item 99's).
+
+**The ruling: A, two helpers on each puller** (terms 1 to 8, 06:12 UTC; two helpers, not one, at 06:53 UTC on the session's question).
+- **One helper is not enough.** One helper with one of the phase's threads is two contexts alternating again. So under the control, which keeps a puller holding one thread, one helper could not pass. And after every move back that leaves a puller one thread, one helper never sees another move back counted.
+- **Two cover every case.** Two helpers give the puller three or more contexts ready whenever one of the phase's threads there is awake.
+
+| Field | |
+|---|---|
+| Task ID | TASKS item 152 |
+| Objective | Integrity's pulled phase moves a thread back by progress, never by a run order, on every machine, two processors included, with R1's bounds and counts unchanged. |
+| Source ownership | `framekernel/src/migration_proof.rs` (the helpers and the boot flow's use of them); `framekernel/src/runqueue.rs` (one `mod` line) and `framekernel/src/runqueue/puller_model.rs` (a host test). |
+| Architecture contract | ADR-0013 R1 (b) and its integrity row; ADR-0020 S5 and R98-1. No scheduler path changed; no ABI or format change. Existing interfaces only: `sched::spawn`, `WaitQueue`, `sched::yield_now`, `sched::queued_on`. |
+| Security invariants | None changed. The helpers are kernel threads of the proof, pinned, holding no lock across a yield. No `unsafe`, no `asm!`. |
+| Performance constraints | ADR-0018 V3: none on any scheduler path; the helpers exist only in integrity's pulled phase. |
+| Acceptance | The ruling's eight terms: the helpers, R1 unchanged, the never-sleep control, C98-1, 9b, 11, 12, 14 and 15b again, the host model, the branch, the gates, and CI after landing. |
+
+**What was built** (3 commits on `bfd4ec11`, with the records after them):
+- **`c766b1b4`, the helpers.**
+  - **What they are.** Each processor left to pull (`pulling`, the processors `pullers` counts) gets `HELPERS_EACH` = 2 threads of the phase's own, spawned pinned (`sched::spawn`) before the phase's threads. They are not declared for balancing, and hold no word and no canary.
+  - **How they wait.** Each waits on its processor's `WaitQueue` until that processor's `wanted` is raised or the proof stops, then only yields while `wanted` stays raised.
+  - **What the boot flow does with them.** Before each round of moves back, for each such processor it raises `wanted` and wakes the helpers, once, while the processor holds a thread of the phase (`queued_on`), and lowers it while the processor holds none. It also lowers it when it counts a move back from there. So the helpers wait again, and are woken at the next round if the processor still holds one.
+  - **How they end.** They end with the phase: the stop wakes them, and the phase waits for them with its threads, inside `sched::OTHERS_PATIENCE`.
+  - **What the line says.** It now says "with N helpers of the phase's own pinned to them, woken M times". `xtask`'s marker is the line's prefix, unchanged.
+  - **The bounds.** They are as before. A puller holds at most 15 of its 16 slots: at most `PULLED_MOST` (12) of the phase's threads, the 2 helpers and its idle context. The helpers are not pullers: `PULLERS_MOST` counts processors. Delivery's pulled phase has none.
+- **`0e6fe0c0`, the host model:** `runqueue/puller_model.rs`, under one `mod` line in `runqueue.rs`, beside TASKS item 129's.
+- **`da6fc211`, the model judged once every context has run.** In the first turn its three tests failed, on the model's start-up: a thread that has not yet run is movable as spawned, and the first switch count held no event. The model now counts from the point every context has been switched out once.
+
+**Why a move back is now progress** (term 5).
+- **What a move back needs.** It needs a thread that is ready, not running, and not the context just switched out.
+- **What the helpers give it.** While its helpers yield, a puller holding one of the phase's threads awake has at least three contexts ready, and every yield and tick switches. So the context switched out two switches ago is published again at the next switch, while a third runs. Within two switches, one of the phase's threads there is ready, not running and not leaving. Whether it is awake depends on the thread's own iterations, not on another processor's timing.
+- **The host model checks it on the real run queue,** with the context table's frame rule: a thread is movable if it is ready, not running and not the context last switched out, which a switch, or a tick that switches nothing, publishes.
+  - **Two helpers, with one or two of the phase's threads** (`two_helpers_leave_a_thread_movable_within_two_switches`): sleeping every fourth iteration or never, every slot order, every iteration phase, eight seeds of the ticks' draw. That is 6,528 cases and 3,359,104 windows of three consecutive switches over which a thread stayed awake. In none was no thread movable.
+  - **The controls:**
+    - Two threads that never sleep and no helper (`without_helpers_two_alternating_threads_are_never_movable`): a thread was movable in none of 152,320 windows.
+    - One thread and one helper (`one_helper_leaves_one_thread_never_movable`): none of 38,080.
+
+**Controls** (also in ADR-0013): the first turn, 2026-11-26, 06:46 to 07:02 UTC, at `0e6fe0c0`, whose kernel code is the tip's (`da6fc211` changes the model alone).
+- **The setup.** Rust 1.100.0, with QEMU 11.1.3 TCG on the development Mac, on AC power, with no sleep. Each control is one edit to an export, never to the tree (the session's `plants152.py` and `plants98b.py`). Each was built and booted once through `boot-test`'s `kernel boot`, on the machine named.
+- **The unplanted fix**, booted twice there on 2 processors, passed both:
+  - 16 and 10 pulls; 13 and 7 of a thread moved before; 16 and 10 moves back;
+  - threads moved while they held their word: 8 and 8;
+  - after 690 and 841 ms; the helpers woken 17 and 10 times.
+
+| Control | Planted | Machine | Result |
+|---|---|---|---|
+| Never-sleep (term 3), unfixed | Integrity's pulled threads yield where they slept, at `bfd4ec11` (TASKS item 129's tip) | 2 | Failed 2 of 2 in the first turn, as CI did: 0 pulls by idle processors, 0 of a thread moved before, 0 moves back (3,000 and 2,999 refused), "a pull of a thread moved before: no, in 30 s", scheduler failed |
+| Never-sleep, fixed | The same plant on the fix | 2 | Passed 2 of 2 in the first turn: 6 and 5 pulls, 3 and 3 of a thread moved before, 6 and 4 moves back, threads moved while they held their word 10 and 4, after 1,811 and 1,281 ms; the helpers woken 7 and 5 times |
+| C98-1 | The idle pass pulls nothing | 2 | Caught: integrity's pulled line, 0 pulls, "no, in 30 s", scheduler failed (the helpers woken 0 times) |
+| C98-9b | A pull of a thread moved before hands it the puller's idle FPU area, once | 2 | Caught: integrity's pulled line, "canaries changed 194 times" |
+| C98-11 | No processor occupied in a pulled phase | 8 (`boot-domains`) | Caught: integrity's pulled line, "6 left to pull (at most 4)", scheduler failed (with 12 helpers) |
+| C98-12 | No move while a thread held its word counted | 2 | Caught: integrity's pulled line, "threads moved while they held their word 0 (not exercised)", after its 30 s budget |
+| C98-14 | The cache-hot rule as before the gates' stop of item 98 | The x2APIC machine, `-cpu max,vendor=GenuineIntel`; and the host | Caught at boot by "load balancing"'s kick case: of the 8 wake-ups made on CPU 0, kicks sent 0, scheduler failed; on the host by the run queue's cache-hot tests (`a_spawn_into_a_freed_slot_inherits_no_mark`, `a_thread_woken_after_a_long_block_is_cold_at_once`, among others) |
+| C98-15b | The pull's frame-published check taken as always true, and `lend`'s check of the leaving record removed | 2 | Caught by pinned mode: "a move's lend found no published frame on CPU 0; the thread stays where it is" |
+
+**The gates** (term 7): at `da6fc211`, in one `cargo xtask exclusive` turn, 2026-11-26, 07:21 to 09:24 UTC. Rust 1.100.0, QEMU 11.1.3 TCG on the development Mac. On AC power at every step, with no sleep: the last wake, 2026-11-25 05:50 UTC, was unchanged. The tree was clean at the end.
+
+| Gate | Result |
+|---|---|
+| `cargo xtask check` | Passed in 1,028 s: 2,858 host tests by its unfiltered `test result` lines, none failed, the model's three among them; Loom: all 96 models passed and all 148 negative controls were caught |
+| `cargo xtask boot-test` | Passed 11 of 11 in 70 s. Its 2-processor integrity pulled line: 21 pulls, 18 of a thread moved before, 21 moves back, 21 threads moved while they held their word, after 220 ms |
+| `cargo xtask boot-matrix`, three runs | Each passed, in 2,065, 2,035 and 2,015 s. Each run had 47 integrity pulled lines, none failing. On the 33 two-processor machines of each run: 8 to 34 pulls, 5 to 31 of a thread moved before, 8 to 33 moves back, 2 to 30 moved holding, after 61 to 1,211 ms. The helpers ran as built: 2 on the 2- and 3-processor machines' one puller, 4 on the 4-processor machine's two, 8 on the 8-, 65- and 67-processor machines' four. The capacity lines did not fail |
+| The never-sleep control, unfixed (`bfd4ec11`) | Failed, as CI did: 0 pulls, 0 of a thread moved before, 0 moves back (2,985 refused), "no, in 30 s", scheduler failed |
+| The never-sleep control, fixed (`da6fc211`) | Passed: 4 pulls, 1 of a thread moved before, 4 moves back, 7 moved holding, after 1,835 ms; the helpers woken 5 times |
+
+**Review:** none. Neither an AI reviewer nor a person has reviewed the change.
+
+**Not shown:**
+- Anything on a physical machine, or under KVM until PR 67's CI runs it after the keeper lands it (term 8). If CI still fails there, it goes back to the coordinating session.
+- Whether CI's runners idled CPU 1 as the diagnosis infers. The diagnostic never ran there, and the Mac never reproduced the failure without the never-sleep plant.
+- How a move back that the boot flow tries lands among a puller's switches. The model shows a thread movable within two switches. The boot flow's try is taken under that puller's queue lock, so a puller that keeps switching gives it one window in every two or three switches; the model does not run the boot flow.
+
+**Follow-ups:** none new. R98-1, two alternating threads not movable without an ask or a kick, is TASKS item 99's.
