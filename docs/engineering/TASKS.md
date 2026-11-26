@@ -6029,3 +6029,111 @@ Assigned by the coordinating session on 2026-11-25, after the owner's "Accept al
 - Not fuzzed: the ACPI table parsers (`origin-acpi-tables`, reached here only through `Load` and `LoadTable`), IMAGE_FS (not built), the kernel's device parsers, and the ML-DSA verifier with a real key for ML-DSA-65 (a stand-in key's bytes are used).
 - The new files are not in the public file index (`developer-tools/public-index/files.json`), which is the owner's allowlist.
 - No person and no second agent has reviewed the harnesses, `fuzz.rs` or item 365's rule.
+
+### 155. Integrity's helper makes the moves back, at its own turns (ADR-0013 R1 (b); PR 67's CI at `1754fa08`)
+
+Numbered by the coordinating session on 2026-11-26, as a follow-up to TASKS item 152. Its line is in the coordinating session's records pull request. TASKS item 152's session diagnosed it (`ci1754-findings.md` in the coordinating session's notes) and built it the same day, on `claude/t155-helpers-move-back` cut from `land/batch-11` at `1754fa08`, which holds TASKS items 152 and 144; its `framekernel` is `6bd821b0`'s. Nothing is pushed: the keeper lands it.
+
+**What failed.** PR 67's CI at `1754fa08` (run 45801013688): TASKS item 152 held under KVM, but QEMU's software-CPU job failed integrity's pulled phase on one 2-processor machine, the NIC behind a bridge with the Intel IOMMU. Its line read: the helpers woken 2 times; 3 pulls by idle processors, 0 of a thread moved before; 1 move back by the boot flow (3,448 refused); threads moved while they held their word 0 (not exercised); "a pull of a thread moved before: no, in 30 s". Two other 2-processor lines in that job passed, after 2,696 and 17,341 ms.
+
+**Why: (b), the proof, not the kernel** (the coordinating session's ruling of 2026-11-26).
+- **No processor idled with work queued.** The dump's "CPU 1: 3 ready, current slot 1, idle true" is CPU 1 running a helper, with the other helper ready and thread 0 in its two-tick sleep. `idle` there is the queue's fixed flag that slot 0 is its idle flow.
+- **The boot flow tried about once a tick.** On two processors the start processor is the boot processor, so the boot flow shares it with the phase's threads there. They spin a tick and a half under their words, and every turn is charged one stride however long it lasts. So while one spins, the boot flow gets about one turn a tick, with one try in it: 3,448 tries in 30 s is 115 a second. The KVM jobs' slowest 2-processor lines tried at the same rate and reached after 9.9 to 27.2 s of the 30 s budget, so KVM passed without a margin. On three or more processors the start processor is an application processor, and the boot flow tries tens of thousands of times a second.
+- **A try had to land in a window.** It succeeds only while the thread on the puller is ready, not running and not the context just switched out (ADR-0020 S5): with two helpers, the second helper's turn after the thread's switch-out, microseconds long. TASKS item 152's model showed that window recurs within two switches, judged at the puller's events, not at another processor's tries. Whether the boot flow's tries met the windows was a run order. That the two processors' timers' phase decided it is inferred, not measured.
+- **The Mac.** The natural failure did not reproduce: six boots of the bridge machine, quiet and under 10 and 20 busy processes, passed after 377 to 878 ms, the boot flow trying 16,000 to 45,000 times a second. A plant giving the boot flow CI's ratio of tries to windows reproduced CI's shape once in two: 1 move back, held 0, "no, in 30 s".
+
+**The rulings.**
+- **The fix** (2026-11-26, about 12:00 UTC): the helpers make the moves back at their own turns on the puller, at most one move per tick of that processor; the boot flow keeps waking them and judging, and makes no moves back where helpers are; delivery is unchanged. `#[derive(Clone)]` on `origin_frame::smp::Online` is accepted on three conditions: a copy is documented as a snapshot of this boot's processors that CPU offlining (CLAUDE.md §24) must revisit; the only copy is the pulled phase's, dropped with it; and the change is a commit of its own, with `migrate`'s documentation naming the helpers and their pace.
+- **One helper, not two** (about 12:25 UTC, on the session's report). The proposal said the second helper's turn found the thread movable, judging a helper's try by the rule for a mover on another processor (S5's `Leaving`). The first controls, at the two-helper form, showed otherwise: the fix's every helper try was a move (122 of 122 and 121 of 121), and one helper per puller, planted as the control that was to fail, passed too (102 of 102 and 105 of 105, reached after 28 and 75 ms). A mover on the thread's own processor publishes that processor's leaving frame before it lends (`cpu::move_context`; the contract's §1.1, step 6), so the helper's first turn after the switch-out takes the thread. TASKS item 152's second helper existed to keep three contexts ready for the boot flow's tries from another processor, and the boot flow no longer moves threads where helpers are. So this item **supersedes TASKS item 152's two helpers with one** (`HELPERS_EACH` = 1), freeing a slot (§7). The one-helper control is replaced by the helpers trying nothing, which must fail; the model judges a helper's try by the same-processor rule, with a helper that never tries as its control, and item 152's controls, for a mover on another processor, stay. The session's three local commits were rewritten so that none says a second helper is needed.
+- **The rare plant** (about 13:05 UTC, on the session's report that at one round per 25 ticks the unfixed phase passed 3 of 3). The ruled condition that the unfixed phase fail at least once under it is replaced: CI's run 45801013688 is the unfixed failure, and the deterministic controls carry the causal claim. One sparser ratio, one round per 100 ticks, was run once, 3 boots unfixed and 3 fixed after the gates, and reported however they fell, with no further tuning. The fix had to pass 3 of 3 there, with figures showing that its time is set by the boot flow's round period, which sets `wanted`, and not by hitting a window.
+
+| Field | |
+|---|---|
+| Task ID | TASKS item 155 |
+| Objective | Integrity's pulled phase moves a thread back where the window is, on the puller, so that no pass condition rests on the boot flow's rate or a timer's phase; one helper per puller where TASKS item 152 had two. |
+| Source ownership | `framekernel/frame/src/smp.rs` (`Online` derives `Clone`); `framekernel/src/migration_proof.rs` (the helpers' moves back, the thread's spin state, the boot flow's skip and the line); `framekernel/src/sched.rs` (`migrate`'s documentation); `framekernel/src/runqueue/puller_model.rs` (the host model). |
+| Architecture contract | ADR-0013 R1 (b) and its integrity row; ADR-0020 S5 and S6; `sched::migrate`'s pacing (B18). No scheduler path changed; no ABI or format change. |
+| Security invariants | None changed. The helper is a kernel thread of the proof, pinned, calling `sched::migrate` from thread context with no lock held. No `unsafe`, no `asm!`. |
+| Performance constraints | ADR-0018 V3: none on any scheduler path. `Online`'s copy exists only in integrity's pulled phase. |
+| Acceptance | The rulings: the fix with one helper; `Clone` on `Online` under its three conditions; the branch; `check`, `boot-test` and `boot-matrix` three times in one turn on AC; the controls, on the final form; the figures; the records. |
+
+**What was built** (3 commits on `1754fa08`, with the records after them):
+- **`ddfac6dd`, `Online` can be copied.** `origin_frame::smp::Online` derives `Clone`, in a commit of its own (condition 3). Its documentation says a copy is a snapshot of this boot's processors, true only while none goes offline, that CPU offlining (CLAUDE.md §24) must revisit every copy, and where the one copy is (conditions 1 and 2).
+- **`669bcb91`, the helper makes the moves back.**
+  - **One helper** on each processor left to pull (`HELPERS_EACH` = 1), where TASKS item 152 had two.
+  - **Its try.** While its processor is wanted, the helper, at every return from its yield (`move_back`), tries to move back to the start processor a thread of the phase that is on its processor and was switched out in its spin, under its word, unless a move back was already made from that processor in its current tick (`Helpers::moved_at`; `migrate`'s pacing). It runs on the thread's own processor, so `migrate` publishes the frame that processor last switched out before it lends it: a thread just switched out is taken at once.
+  - **The spin state.** Each thread records whether it is in its spin (`Movable::spin`: `SPIN_IN` from just before the spin to just after it). The helper marks the thread `SPIN_MOVED` before its `migrate` and takes the mark back if the move is refused. The thread cannot run meanwhile: it is on the helper's processor, where the helper runs, unless a pull takes it, which is itself a move while it holds its word. When its spin ends, a thread counts a move while it held its word if it is on another processor, as before, or if the helper marked it: so a pull that brought it back before it ran again does not hide the move.
+  - **After a move.** A move made clears the processor's `wanted`, so the helper waits again, as in TASKS item 152; the boot flow wakes it again when the processor next holds a thread of the phase.
+  - **The boot flow** keeps waking the helpers and judging the phase, and moves back no thread on a processor with a helper; integrity's pulled phase has no other. Delivery's pulled phase is unchanged.
+  - **`Online`'s copy.** `Shared::for_pulled` keeps a copy of `Online` for the helpers' `migrate` only where the phase has helpers (`InPulled::online`); it goes with the phase's shared state when the last of its threads and helpers drops it.
+  - **The slots.** A puller holds at most 14 of its 16: at most `PULLED_MOST` (12) of the phase's threads, its helper and its idle context. Helpers are not pullers: `PULLERS_MOST` counts processors.
+  - **The line.** Integrity's pulled line now says "N moves back by the helpers in T tries, B by the boot flow (R refused)". `xtask`'s marker is the line's prefix, unchanged.
+  - **`migrate`'s documentation** names the helper and its pace beside the boot flow's (condition 3).
+- **`2f0a66e2`, the host model with the helper's own moves** (`runqueue/puller_model.rs`).
+
+**Why a move back is now progress.**
+- **Where the try is.** When a tick switches out a spinning thread, the helper's pass is at or below the thread's. The thread was the lowest when picked and was just charged one stride, and the helper's pass is at most the thread's old pass plus one stride: it stops being the lowest once its pass passes the thread's, whether the thread was rotating with it, admitted at the floor after its sleep, or arrived by a pull with its lag. Ties go round-robin forward from the current slot, which from the thread's slot reaches the helper before coming back to the thread. So with one thread of the phase there, the helper runs before the thread does, and its move, on the thread's own processor, takes the frame just switched out. With two threads there, the other may run between; that the helper still runs before the first returns is measured in the model, not argued.
+- **What the boot flow's rate still decides.** Only how soon `wanted` is raised. That is a state the helper keeps until a move is made, not a window.
+- **The pass conditions.** Every move back by a helper is a move while the thread held its word, which the thread counts. "A pull of a thread moved before" follows by the pigeonhole: after each move back the helper waits, the puller idles and pulls, and with four threads the fifth pull is of a thread moved before.
+- **The host model** (`runqueue/puller_model.rs`, on the real run queue, with one helper; one or two of the phase's threads, sleeping or not, every slot order, every iteration phase, eight seeds of the ticks' draw):
+  - **One thread** (`the_helper_finds_each_switch_out_in_a_spin_at_its_next_turn`): 128 cases, 28,802 helper's turns, 11,325 switch-outs of the thread in its spin; each found movable at the helper's next turn before the thread ran again, by the queue's order.
+  - **Two threads:** 1,536 cases, 272,220 helper's turns, 206,190 switch-outs in a spin; none missed, measured over these cases, which the test holds.
+  - **No spin went unswitched**, with one thread or two.
+  - **The control** (`a_helper_that_never_tries_finds_nothing`): a helper that never tries finds no thread, though the threads are switched out in their spins as before (3,825 switch-outs).
+  - **TASKS item 152's tests, for a mover on another processor,** still pass: two helpers, 3,359,104 windows of three switches, none missed; no helper with two threads that never sleep, no thread movable in 152,320 windows; one helper with one thread, none in 38,080.
+
+**Controls** (also in ADR-0013): 2026-11-26, from 12:38 UTC, with the rare plant at one round per 100 ticks from 15:06 UTC, at `2f0a66e2` and, unfixed, at `1754fa08` (TASKS item 152's kernel) and `bfd4ec11` (before the helpers).
+- **The setup.** Rust 1.100.0, with QEMU 11.1.3 TCG on the development Mac, on AC power, with no sleep. Each control is one edit to an export, never to the tree (the session's `plants1754.py`, `plants152.py` and `plants98b.py`), built once and booted through `boot-test`'s `kernel boot` on the machine named.
+- **The rare-round plant** is the ruling's "one round per 25 ticks", and the third ruling's one per 100: the boot flow's whole round, its waking of the helpers and its tries, at most once every 25 (or 100) ticks of its processor, in the phase with helpers, from the phase's start. On the Mac that gives the boot flow CI's ratio of tries to windows. The diagnosis's first version throttled the tries alone, and on the fix the boot flow makes none.
+- **A first controls turn** (12:16 UTC) ran at the two-helper form and was stopped once the one-helper ruling came; its rare-round boots had not run (the turn's script read `$UNFIXED:r` as a zsh modifier). Its results are the ruling's evidence above, not this table's.
+
+| Control | Planted | Machine | Result |
+|---|---|---|---|
+| The fix, unplanted | Nothing | 2 | Passed 2 of 2: 99 and 96 pulls, 96 and 93 of a thread moved before; the helper moved 99 of 99 and 95 of 95 tries; threads moved while they held their word 130 and 119; after 69 and 25 ms |
+| Rare-round at one round per 25 ticks, unfixed | The boot flow's whole round once per 25 ticks, at `1754fa08` (TASKS item 152's kernel) | 2 | **Passed 3 of 3, where the first ruling expected at least one failure**: after 2,970, 11,038 and 6,513 ms, with 3, 1 and 1 moves back by the boot flow from 14, 42 and 25 tries; and once more at the end of the gates' turn, after 19,817 ms, 1 move back from 75 tries. So at this ratio the Mac's plant did not reliably reproduce CI's failure (the coordinating session's ruling of about 13:05 UTC) |
+| Rare-round at one round per 25 ticks, fixed | The same plant on the fix | 2 | Passed 3 of 3: 10 pulls, 7 of a thread moved before, the helper's 8 moves in 8 tries, each run; after 329, 315 and 328 ms; and after 253 ms at the end of the gates' turn, 8 moves in 8 tries |
+| Rare-round at one round per 100 ticks, unfixed | The boot flow's whole round once per 100 ticks, at `1754fa08` | 2 | **Failed 2 of 3**: "a pull of a thread moved before: no, in 30 s", scheduler failed, with 0 pulls, 0 moves back and 30 tries refused, one a round, the helpers woken once; the third passed after 25,126 ms, 1 move back from 26 tries. CI's failure had 3 pulls and 1 move back; these had none |
+| Rare-round at one round per 100 ticks, fixed | The same plant on the fix | 2 | Passed 3 of 3: after 1,050, 1,058 and 1,285 ms; the helper woken twice and its 2 moves in 2 tries, each run; 4 pulls, 1 of a thread moved before |
+| Rare-round at one round per 25 ticks, fixed, the bridge machine | The same plant | 2, the NIC behind a bridge, the Intel IOMMU (the CI failure's machine) | Passed 3 of 3: the helper's 8 moves in 8 tries each run, after 394, 375 and 556 ms |
+| The helpers try nothing | `move_back`'s call never made | 2 | Failed 2 of 2: 0 moves back by the helpers and 0 by the boot flow, "a pull of a thread moved before: no, in 30 s", scheduler failed |
+| Never-sleep (TASKS item 152's), before the helpers | Integrity's pulled threads yield where they slept, at `bfd4ec11` | 2 | Failed 2 of 2: 0 pulls, 0 moves back (2,998 and 2,999 refused), "no, in 30 s" |
+| Never-sleep, fixed | The same plant on the fix | 2 | Passed 2 of 2: 141 and 146 pulls, the helper's 141 and 146 moves in as many tries, after 29 and 24 ms |
+| C98-1 | The idle pass pulls nothing | 2 | Caught: 0 pulls, "no, in 30 s", scheduler failed |
+| C98-9b | A pull of a thread moved before hands it the puller's idle FPU area, once | 2 | Caught: "canaries changed 193 times" |
+| C98-11 | No processor occupied in a pulled phase | 8 (`boot-domains`) | Caught: "6 left to pull (at most 4)", scheduler failed (6 helpers) |
+| C98-12 | No move while a thread held its word counted | 2 | Caught: "threads moved while they held their word 0 (not exercised)" after its 30 s budget, with 1,438 moves back by the helper |
+| C98-14 | The cache-hot rule as before the gates' stop of item 98 | The x2APIC machine, `-cpu max,vendor=GenuineIntel`; and the host | Caught at boot by "load balancing"'s kick case (of the 8 wake-ups made on CPU 0, kicks sent 0), and on the host by the run queue's cache-hot tests (`a_spawn_into_a_freed_slot_inherits_no_mark`, `a_thread_woken_after_a_long_block_is_cold_at_once`, among others) |
+| C98-15b | The pull's frame-published check taken as always true, and `lend`'s check of the leaving record removed | 2 | Caught by pinned mode: "a move's lend found no published frame on CPU 0; the thread stays where it is" |
+
+**The rare plant's two ratios** (the coordinating session's ruling of about 13:05 UTC). CI's own run 45801013688, on `1754fa08`, is the unfixed phase's failure. The Mac's plant did not reliably reproduce it at one round per 25 ticks: the unfixed phase passed all 4 runs there, 3 in the controls' turn at 9 to 34 times the fix's time and 1 in the gates' turn at 78 times. At one round per 100 ticks, the last ratio tried, it failed 2 of 3. The causal claim rests on the deterministic controls: the helpers trying nothing fail, and the never-sleep control fails unfixed and passes fixed.
+
+**The fix's time is set by the boot flow's round, not by a window.** The plant makes the boot flow's rounds at the phase's start and then every 25 or 100 ticks of its processor, nominally 250 ms or 1 s at `HZ` 100. Each round that finds the puller holding a thread of the phase wakes its helper (`wanted`). In every fixed run the helper made exactly as many moves as it was woken, each at its first try: 8 in 8 over the phase's 2 s at one round per 25 ticks, 2 in 2 at one per 100. The plain machine reached just after the second round: after 253 to 329 ms at a period of 250 ms (1.01 to 1.32 periods), and after 1,050 to 1,285 ms at a period of 1 s (1.05 to 1.29 periods). The bridge machine reached after 375 to 556 ms (1.50 to 2.22 periods). Quadrupling the period took the plain machine's mean from 306 ms to 1,131 ms, 3.7 times. The unfixed phase under the same plant reached after 2,970 to 25,126 ms, or not in its 30 s, with 1 to 3 moves back from 14 to 75 tries.
+
+**Gates** (2026-11-26, from 13:00 to 15:00 UTC, in one exclusive turn, on AC power, with no sleep: the last wake was the same before and after). At `2f0a66e2`, Rust 1.100.0, QEMU 11.1.3 TCG on the development Mac.
+
+| Gate | Result |
+|---|---|
+| `cargo xtask check` | Passed, in 976 s. Loom: 96 models passed and 148 negative controls caught |
+| `cargo xtask boot-test` | Passed, 11 of 11 scenarios, in 67 s. Integrity's pulled line, 2 processors: 85 pulls, 82 of a thread moved before; the helper's 85 moves in 85 tries; threads moved while they held their word 121; reached after 24 ms |
+| `cargo xtask boot-matrix`, run 1 | Passed, in 2,027 s. 47 integrity pulled lines: 44 ran and 3 had fewer than two processors, none failing. Slowest "reached": 190 ms, on 2 processors |
+| `cargo xtask boot-matrix`, run 2 | Passed, in 2,010 s, as run 1. Slowest "reached": 180 ms, on 2 processors |
+| `cargo xtask boot-matrix`, run 3 | Passed, in 2,002 s, as run 1. Slowest "reached": 209 ms, on 2 processors |
+
+- **The 33 two-processor lines of each run:**
+  - 38 to 111 pulls, 35 to 108 of a thread moved before;
+  - the helper's 39 to 111 moves, every try a move;
+  - threads moved while they held their word 56 to 150;
+  - reached after 23 to 209 ms.
+- **The boot flow** moved no thread and was refused none in any of the 132 boot-matrix lines that ran, or in boot-test's, since each of them has helpers.
+- **Every helper's try was a move** in every line but one: an 8-processor line of run 3 made 252 moves in 254 tries. A refused try takes its mark back and is tried again, so no pass condition rests on it. The line does not print why `migrate` refused those two, and that was not investigated.
+- **The rare-round pair, again,** made in the same turn after the gates: unfixed, at `1754fa08`, it passed after 19,817 ms, with 1 move back by the boot flow and 74 tries refused. Fixed, it passed after 253 ms, with the helper's 8 moves in 8 tries.
+
+**Review:** none beyond the coordinating session's of the diff before clearance, as the ruling allows. No AI reviewer and no person has reviewed the change.
+
+**Not shown:**
+- Anything on a physical machine, or under KVM until PR 67's CI runs it after the keeper lands it.
+- That the two processors' timers' phase held CI's tries off the windows. It is inferred, not measured.
+- With two of the phase's threads on a puller, that the helper's next turn comes before the first thread runs again is measured over the model's cases, not argued.
+- Why `migrate` refused two of the helper's 254 tries on one 8-processor line of the third `boot-matrix` run. The line does not print the reasons.
+
+**Follow-ups:** none new. R98-1 is TASKS item 99's.

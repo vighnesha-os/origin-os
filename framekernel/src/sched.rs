@@ -1494,7 +1494,10 @@ pub(crate) fn user_thread_blocked(
 /// most once per tick of the processor it runs on. S1's bound of 64 follows on a wake-up rests on
 /// that rate: paced, a wake-up follows at most one move, about 2.5 µs with interrupts off; a
 /// caller that broke the rule could make one follow 64, about 160 µs, over B18's 50 µs. TASKS item
-/// 96 gives `migrate` no rate of its own; its only callers, the migration proofs, pace themselves.
+/// 96 gives `migrate` no rate of its own; its only callers, the migration proofs, pace themselves:
+/// the boot flow moves a thread at most once per tick of its processor, and integrity's pulled
+/// phase's helper (TASKS item 155), pinned to a processor left to pull, makes at most one move
+/// back per tick of its own.
 ///
 /// An inconsistency met (S20, triggers 2 and 3) enters pinned mode, and its line is printed after
 /// the section; `NotRestored`, a frame that could not be put back, stops the kernel (the ruling's

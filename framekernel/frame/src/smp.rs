@@ -201,7 +201,12 @@ const LACKS_BASELINE: u64 = 2;
 const LACKS_FPU_ROOM: u64 = 3;
 
 /// The processors online, by CPU index, the boot processor first.
-#[derive(Debug)]
+///
+/// A copy (`Clone`) is a snapshot of this boot's processors as they came online. It stays true
+/// only while no processor goes offline: CPU offlining (CLAUDE.md §24) must revisit every copy.
+/// The one copy today is integrity's pulled phase's, for its helpers' moves back (TASKS item 155;
+/// `migration_proof`), and it is dropped with that phase's shared state at the phase's end.
+#[derive(Debug, Clone)]
 pub struct Online {
     cpus: Vec<CpuIndex>,
     count: usize,
