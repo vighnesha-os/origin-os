@@ -944,7 +944,8 @@ struct Capacity {
     /// Moves into the full destination refused as full, and made (none may be).
     refused_full: u64,
     made_into_full: u64,
-    /// Whether the thread tried stayed on its source, alive, through those moves.
+    /// Whether the thread tried stayed on its source, alive, through those moves: the source's
+    /// queue holds it in the slot its location names (`sched::held_on`; TASKS item 129, claim (ii)).
     stayed: bool,
     /// Fillers spawned on the source, whether its queue was then full, and whether the thread then
     /// moved out of it.
@@ -1074,7 +1075,7 @@ fn capacity_phase(
             }
             (found.refused_full + found.made_into_full >= INTO_FULL).then_some(())
         });
-        found.stayed = sched::queued_on(thread, source);
+        found.stayed = sched::held_on(thread, source);
         if found.refused_full + found.made_into_full == 0 {
             describe_stuck(shared, "no move into the full queue was answered");
         }

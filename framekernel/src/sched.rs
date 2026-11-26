@@ -1412,6 +1412,33 @@ pub(crate) fn queued_on(thread: ThreadRef, cpu: CpuIndex) -> bool {
     })
 }
 
+/// Whether processor `cpu`'s run queue holds the thread `thread` names: the thread alive at its
+/// generation, its location naming `cpu`, and the slot the location names holding its record, read
+/// under that queue's lock in one interrupts-off section, as [`migrate`]'s check (a) reads the
+/// source's slot. [`queued_on`] reads the location alone, which a thread dropped from its queue
+/// with its location left behind still passes.
+///
+/// For the boot proofs: integrity's capacity phase's check that a refused move left its thread
+/// where it was (TASKS item 129, the coordinating session's ruling on its claim (ii)). Read only:
+/// it writes nothing, and takes one queue lock, so no lock order is involved (I2). No scheduler
+/// path calls it. A move involving `cpu` changes the location only under this lock, so the
+/// location read under it is the queue's own.
+pub(crate) fn held_on(thread: ThreadRef, cpu: CpuIndex) -> bool {
+    let (Some(record), Some(queue)) = (threads::record(thread.record), QUEUES.get(cpu.get()))
+    else {
+        return false;
+    };
+    without_interrupts(|| {
+        let queue = queue.lock();
+        record.generation() == thread.generation
+            && record.location().is_some_and(|at| {
+                usize::try_from(at.cpu()).ok() == Some(cpu.get())
+                    && queue.record(usize::from(at.slot())).map(Placed::number)
+                        == Some(thread.record)
+            })
+    })
+}
+
 /// Whether the user thread `thread` is blocked on processor `cpu`: a slot of that processor's run
 /// queue holds it and is blocked, read under the queue's lock. That is the one state in which a
 /// wake-up makes the thread ready and, from another processor, sends `cpu` a reschedule IPI
