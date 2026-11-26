@@ -2,6 +2,8 @@
 
 Origin OS is developed in the open, under MIT OR Apache-2.0. This page says what a contribution from outside the project needs. It states rules that [`CLAUDE.md`](CLAUDE.md), the engineering directive, already sets; where the two differ, the directive decides.
 
+Everyone taking part, in issues, pull requests and Discussions, follows the [code of conduct](CODE_OF_CONDUCT.md).
+
 ## 1. Every contribution is original
 
 Origin OS is written from scratch (`CLAUDE.md` §3). So is every contribution.

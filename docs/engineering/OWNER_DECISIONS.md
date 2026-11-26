@@ -1731,3 +1731,15 @@ On 2026-11-26 you wrote that `PROGRESS.md` should show the specifications, such 
   - this sheet;
   - the requirements README's table of items without rows;
   - TASKS item 151's line.
+
+### The code of conduct's contact address and version (item 372): a note of 2026-11-26
+
+Item 372 waited for a contact address for conduct reports. The coordinating session advised an address used only for the project, for example an alias that forwards to your inbox, because an address in a public repository stays in its history and is harvested for spam. On 2026-11-26 you chose your own address, and gave it to be published.
+
+- **How it was added:** through GitHub's code-of-conduct template, in your browser at your word ("use google chrome and do if need or use gh tool"). It was committed to the branch `docs/code-of-conduct` and lands by pull request. `CODE_OF_CONDUCT.md` holds the address; this sheet does not repeat it.
+- **One difference from the item:** item 372 named the Contributor Covenant 2.1, but GitHub's template is version 2.0, and the file says so in its attribution.
+  - That commit's message says "2.1" by mistake. The file's own text is the record.
+  - The two versions differ mainly in wording and attribution, not in the rules. The coordinating session did not rewrite the text.
+  - Version 2.1 can replace it later, if you want it.
+- **The identifier scans:** sessions scan their commits for personal data before they push. Your address in `CODE_OF_CONDUCT.md` is there by your choice, and a scan that finds it there is not a finding.
+- **Also:** `CONTRIBUTING.md` and `README.md` link the code of conduct.
