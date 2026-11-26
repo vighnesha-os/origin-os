@@ -109,6 +109,25 @@
 //! farthest, then hold several of the phase's threads each, the start processor keeps the rest,
 //! and both movers always find a thread waiting.
 //!
+//! **Integrity's moves back rest on helpers, not on idle periods** (TASKS item 152; ADR-0013 R1
+//! (b)). The boot flow can move only a thread that is ready, not running, and not the context its
+//! processor last switched out (ADR-0020 S5). With two contexts on a processor, every yield and
+//! every tick switches between them, so the waiting one is always the one just switched out: a
+//! processor left to pull with two of the phase's threads alternating, or with one and one helper,
+//! has no thread the boot flow can take, and before this item a move back waited for that
+//! processor to idle, a run order, which PR 67's CI never got on two processors. So each processor
+//! left to pull has [`HELPERS_EACH`] (two) helpers of the phase's own, pinned there: not declared
+//! for balancing, with no word and no canary. The boot flow wakes a processor's helpers while it
+//! holds a thread of the phase, and they only yield until a move back from there is counted, or it
+//! holds none, then wait again. While they yield, the processor has three or more contexts ready
+//! whenever one of the phase's threads there is awake, so one of them is ready, not running and
+//! not the context just switched out within two switches. The host model
+//! (`runqueue/puller_model.rs`) shows that on the real run queue, and that one helper with one
+//! thread, or two threads with none, never leave a thread movable. While the helpers wait, the
+//! processor idles and pulls as before. They take two of a puller's 16 slots: with the phase's
+//! threads at most [`PULLED_MOST`] and the idle context, at most 15. They are not pullers:
+//! [`PULLERS_MOST`] counts processors.
+//!
 //! Each phase counts from when every one of its threads has started, runs for [`SECONDS`], and
 //! goes on until what it tests was seen, within [`COVER_SECONDS`]:
 //!
@@ -233,17 +252,37 @@ struct InPulled {
     /// Delivery: wake-ups that crossed a pull with their token untaken, as the receivers counted
     /// them from the sender's marks.
     crossed: AtomicU64,
+    /// Integrity: the helpers of each processor left to pull, [`HELPERS_EACH`] threads on each
+    /// (TASKS item 152; the module documentation, "Pulled"); none for delivery.
+    helpers: Vec<Helpers>,
+    /// Integrity: helper threads that have started, and that have ended.
+    helpers_up: AtomicU64,
+    helpers_ended: AtomicU64,
 }
+
+/// The helper threads integrity's pulled phase pins to one processor left to pull (TASKS item
+/// 152): raised while the boot flow wants a thread of the phase back from there, and where they
+/// wait while it does not.
+struct Helpers {
+    cpu: CpuIndex,
+    wanted: AtomicBool,
+    queue: WaitQueue,
+}
+
+/// The helper threads on each processor left to pull in integrity's pulled phase (TASKS item 152;
+/// the module documentation, "Pulled"). Two, so that the puller has three contexts ready while it
+/// holds even one of the phase's threads awake.
+const HELPERS_EACH: usize = 2;
 
 impl Shared {
     /// A pulled phase's shared state for `threads` threads declared for balancing, `pairs` pairs
-    /// and `senders` senders, started on the processor of index `source`; set as the current one
-    /// ([`SHARED`]).
+    /// and `senders` senders, started on the processor of index `source`, with helpers on each of
+    /// `helped` (integrity's; TASKS item 152); set as the current one ([`SHARED`]).
     fn for_pulled(
         threads: usize,
         pairs: usize,
         senders: usize,
-        source: CpuIndex,
+        (source, helped): (CpuIndex, &[CpuIndex]),
         tsc_hz: u64,
     ) -> Arc<Self> {
         let shared = Arc::new(Self {
@@ -281,6 +320,16 @@ impl Shared {
                 source: u64::try_from(source.get()).unwrap_or(u64::MAX),
                 moved_holding: AtomicU64::new(0),
                 crossed: AtomicU64::new(0),
+                helpers: helped
+                    .iter()
+                    .map(|&cpu| Helpers {
+                        cpu,
+                        wanted: AtomicBool::new(false),
+                        queue: WaitQueue::new(),
+                    })
+                    .collect(),
+                helpers_up: AtomicU64::new(0),
+                helpers_ended: AtomicU64::new(0),
             }),
         });
         set_shared(Some(Arc::clone(&shared)));
@@ -1747,6 +1796,119 @@ fn vacate(shared: &Shared, tsc_hz: u64) -> bool {
     ended()
 }
 
+/// The processors left to pull in a pulled phase, in index order: those [`pullers`] counts.
+fn pulling(cpus: &[CpuIndex], source: CpuIndex) -> Vec<CpuIndex> {
+    let occupants = occupied(cpus, source);
+    cpus.iter()
+        .copied()
+        .filter(|&cpu| cpu != CpuIndex::BOOT && cpu != source && !occupants.contains(&cpu))
+        .collect()
+}
+
+/// Integrity's pulled phase's helper (TASKS item 152; the module documentation, "Pulled"): a
+/// thread of the phase's own, pinned to a processor left to pull, with `index` / [`HELPERS_EACH`]
+/// its entry in [`InPulled::helpers`]. It holds no word and no canary, and is not declared for
+/// balancing. It waits until the boot flow wants a thread of the phase back from its processor,
+/// only yields while it does, and waits again once the boot flow has moved one back or found none
+/// there; it ends at the proof's stop.
+extern "sysv64" fn helper(index: u64) -> ! {
+    let Some(shared) = shared() else {
+        sched::finish(|| {});
+    };
+    let entry = usize::try_from(index).map_or(usize::MAX, |i| i / HELPERS_EACH);
+    let Some(mine) = shared.pulled.as_ref().and_then(|p| p.helpers.get(entry)) else {
+        sched::finish(|| {});
+    };
+    if let Some(pulled) = &shared.pulled {
+        pulled.helpers_up.fetch_add(1, Ordering::AcqRel);
+    }
+    let stopped = || shared.stop.load(Ordering::Acquire);
+    while !stopped() {
+        mine.queue
+            .wait_until(|| mine.wanted.load(Ordering::Acquire) || stopped());
+        while mine.wanted.load(Ordering::Acquire) && !stopped() {
+            sched::yield_now();
+        }
+    }
+    sched::finish(move || {
+        if let Some(pulled) = &shared.pulled {
+            pulled.helpers_ended.fetch_add(1, Ordering::AcqRel);
+        }
+        drop(shared);
+    })
+}
+
+/// Starts [`HELPERS_EACH`] helpers on each processor `shared` names for them and waits for them to
+/// run: whether every one started.
+fn start_helpers(shared: &Shared, tsc_hz: u64) -> bool {
+    let Some(pulled) = &shared.pulled else {
+        return true;
+    };
+    let mut spawned = true;
+    for (entry, helpers) in pulled.helpers.iter().enumerate() {
+        for k in 0..HELPERS_EACH {
+            let index = entry.saturating_mul(HELPERS_EACH).saturating_add(k);
+            spawned &= sched::spawn(
+                helpers.cpu,
+                helper,
+                u64::try_from(index).unwrap_or(u64::MAX),
+            )
+            .is_ok();
+        }
+    }
+    let want = u64::try_from(pulled.helpers.len().saturating_mul(HELPERS_EACH)).unwrap_or(u64::MAX);
+    let up = || pulled.helpers_up.load(Ordering::Acquire) == want;
+    sched::yield_until(up, tsc_hz, PHASE_SECONDS);
+    spawned && up()
+}
+
+/// What the boot flow does for the helpers before each round of moves back (TASKS item 152): a
+/// processor left to pull that holds a thread of the phase has its helpers woken, once, and one
+/// that holds none has them wait again. Returns how many processors' helpers it woke.
+fn want_helpers(shared: &Shared) -> u64 {
+    let Some(pulled) = &shared.pulled else {
+        return 0;
+    };
+    let mut woken = 0;
+    for helpers in &pulled.helpers {
+        let holds = shared.threads.iter().any(|t| {
+            t.name()
+                .is_some_and(|name| sched::queued_on(name, helpers.cpu))
+        });
+        if !holds {
+            helpers.wanted.store(false, Ordering::Release);
+        } else if !helpers.wanted.swap(true, Ordering::AcqRel) {
+            helpers.queue.wake_all();
+            woken += 1;
+        }
+    }
+    woken
+}
+
+/// The helpers of the processor left to pull that holds `thread`, if one does.
+fn helpers_holding(shared: &Shared, thread: ThreadRef) -> Option<&Helpers> {
+    shared
+        .pulled
+        .as_ref()?
+        .helpers
+        .iter()
+        .find(|helpers| sched::queued_on(thread, helpers.cpu))
+}
+
+/// Ends the helpers' waits at the proof's stop.
+fn release_helpers(shared: &Shared) {
+    for helpers in shared.pulled.iter().flat_map(|p| p.helpers.iter()) {
+        helpers.queue.wake_all();
+    }
+}
+
+/// Whether every helper that started has ended.
+fn helpers_ended(shared: &Shared) -> bool {
+    shared.pulled.as_ref().is_none_or(|p| {
+        p.helpers_ended.load(Ordering::Acquire) == p.helpers_up.load(Ordering::Acquire)
+    })
+}
+
 /// The balancer's counts a pulled phase reads twice, for what happened in between.
 #[derive(Clone, Copy, Default)]
 struct PullCounts {
@@ -1795,6 +1957,8 @@ struct Pulled {
     /// Moves the boot flow made back to the start processor, and how many it was refused.
     back: u64,
     back_refused: u64,
+    /// Times the boot flow woke a processor's helpers (TASKS item 152).
+    helped: u64,
     /// When the pulls the phase requires were first seen, in TSC ticks from its start.
     reached_after: Option<u64>,
 }
@@ -1805,6 +1969,7 @@ impl Pulled {
             before: PullCounts::read(),
             back: 0,
             back_refused: 0,
+            helped: 0,
             reached_after: None,
         }
     }
@@ -1892,6 +2057,7 @@ fn pull_back_for(
         if (elapsed >= window && pulled.reached_after.is_some()) || elapsed >= budget {
             break;
         }
+        pulled.helped += want_helpers(shared);
         for thread in &shared.threads {
             let Some(name) = thread.name() else {
                 continue;
@@ -1900,10 +2066,15 @@ fn pull_back_for(
             if thread.last_moved.load(Ordering::Relaxed) == tick || sched::queued_on(name, source) {
                 continue;
             }
+            let helpers = helpers_holding(shared, name);
             match sched::migrate(name, source, online) {
                 Ok(_) => {
                     pulled.back += 1;
                     thread.last_moved.store(tick, Ordering::Relaxed);
+                    // A move back counted: the helpers there wait again (TASKS item 152).
+                    if let Some(helpers) = helpers {
+                        helpers.wanted.store(false, Ordering::Release);
+                    }
                 }
                 Err(Unmoved::AlreadyThere) => {}
                 Err(_) => pulled.back_refused += 1,
@@ -1952,10 +2123,12 @@ fn integrity_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc
     let settled_before = sched::settle(tsc_hz);
     let before = counts();
     let unready_before = sched::unready_switches();
-    // No pairs: these threads wait for nobody (the module documentation, "Pulled").
-    let shared = Shared::for_pulled(threads, 0, 0, source, tsc_hz);
+    // No pairs: these threads wait for nobody (the module documentation, "Pulled"). Helpers on
+    // each processor left to pull (TASKS item 152).
+    let shared = Shared::for_pulled(threads, 0, 0, (source, &pulling(&cpus, source)), tsc_hz);
     let (occupants, occupied) = occupy(&shared, &cpus, source, tsc_hz);
-    let spawned = occupied
+    let helping = occupied && start_helpers(&shared, tsc_hz);
+    let spawned = helping
         && (0..threads).all(|i| {
             sched::spawn_balanced(
                 source,
@@ -1996,15 +2169,20 @@ fn integrity_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc
     for pair in &shared.pairs {
         pair.queue.wake_all();
     }
-    sched::yield_until(
-        || shared.ended.load(Ordering::Acquire) == shared.started.load(Ordering::Acquire),
-        tsc_hz,
-        sched::OTHERS_PATIENCE,
-    );
-    let ended = shared.ended.load(Ordering::Acquire) == shared.started.load(Ordering::Acquire);
+    release_helpers(&shared);
+    let all_ended = || {
+        shared.ended.load(Ordering::Acquire) == shared.started.load(Ordering::Acquire)
+            && helpers_ended(&shared)
+    };
+    sched::yield_until(all_ended, tsc_hz, sched::OTHERS_PATIENCE);
+    let ended = all_ended();
     if !ended {
-        describe_stuck(&shared, "pulled threads did not end");
+        describe_stuck(&shared, "pulled threads or their helpers did not end");
     }
+    let helpers = shared
+        .pulled
+        .as_ref()
+        .map_or(0, |p| p.helpers_up.load(Ordering::Relaxed));
     let vacated = vacate(&shared, tsc_hz);
     let failed_swaps = shared.swaps_failed.load(Ordering::Relaxed);
     let changed = shared.canaries_changed.load(Ordering::Relaxed);
@@ -2033,8 +2211,9 @@ fn integrity_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc
         && pinned_mode.is_none();
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: thread migration: integrity, pulled: {threads} threads declared for balancing, run with interrupts on, started on CPU {source} of {} processors, {occupants} of them occupied, {free} left to pull (at most {PULLERS_MOST}); {} pulls by idle processors, {} of a thread moved before, {} asks, kicks {} at ticks, {} at reschedule upcalls and {} at wake-ups or spawns, {} moves back by the boot flow ({} refused); threads moved while they held their word {moved_holding}{}; a second processor in a context {failed_swaps} times, canaries changed {changed} times, threads run before their state existed {unready}; a pull of a thread moved before: {}; {}; spawned {spawned}; ended {ended}; occupants ended {vacated}; heap, frames and stacks back {back}{}{}{}",
+        "origin-kernel: scheduler: thread migration: integrity, pulled: {threads} threads declared for balancing, run with interrupts on, started on CPU {source} of {} processors, {occupants} of them occupied, {free} left to pull (at most {PULLERS_MOST}), with {helpers} helpers of the phase's own pinned to them, woken {} times; {} pulls by idle processors, {} of a thread moved before, {} asks, kicks {} at ticks, {} at reschedule upcalls and {} at wake-ups or spawns, {} moves back by the boot flow ({} refused); threads moved while they held their word {moved_holding}{}; a second processor in a context {failed_swaps} times, canaries changed {changed} times, threads run before their state existed {unready}; a pull of a thread moved before: {}; {}; spawned {spawned}; ended {ended}; occupants ended {vacated}; heap, frames and stacks back {back}{}{}{}",
         cpus.len(),
+        pulled.helped,
         did.pulls,
         did.again,
         did.asks,
@@ -2074,7 +2253,7 @@ fn delivery_by_pulls(flow: Pinned<'_>, com1: &mut Console, online: &Online, tsc_
     };
     let settled_before = sched::settle(tsc_hz);
     let before = counts();
-    let shared = Shared::for_pulled(receivers, 0, 1, source, tsc_hz);
+    let shared = Shared::for_pulled(receivers, 0, 1, (source, &[]), tsc_hz);
     let (occupants, occupied) = occupy(&shared, &cpus, source, tsc_hz);
     let mut spawned = occupied
         && (0..receivers).all(|i| {
