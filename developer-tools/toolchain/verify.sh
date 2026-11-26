@@ -593,7 +593,8 @@ out="$WORK/kani.txt"
   echo "installed driver: ${installed:-none} (cargo install --list)"
   if [ "$installed" = "$kani_version" ] && [ -d "$kani_dir" ]; then
     cargo kani --version --verbose
-    echo "bundle: $kani_dir"
+    # Under the home directory, named as `~`: the report is committed, and the account's name is not.
+    echo "bundle: ~/.kani/kani-$kani_version"
     echo "bundle's compiler: $(cat "$kani_dir/rust-toolchain-version"), $(cat "$kani_dir/rustc-version")"
     echo "used only by cargo kani, to verify; nothing it builds ships"
     sed -n '/^kani:/,/^License/p;/^cbmc:/,/^License/p' "$kani_dir/license-notes.txt"
