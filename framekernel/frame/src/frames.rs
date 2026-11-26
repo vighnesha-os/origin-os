@@ -345,6 +345,10 @@ impl<'a> FrameAllocator<'a> {
     }
 }
 
+/// Kani's proofs of this allocator's invariant (TASKS item 143): `cargo xtask kani`.
+#[cfg(kani)]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;
