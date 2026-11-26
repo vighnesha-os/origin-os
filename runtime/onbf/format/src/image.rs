@@ -313,3 +313,8 @@ impl<'a> Image<'a> {
         }
     }
 }
+
+/// Kani's proofs of `Image::parse`, its padding check and its accessors (TASKS item 143):
+/// `cargo xtask kani`.
+#[cfg(kani)]
+mod proofs;

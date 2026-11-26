@@ -68,6 +68,20 @@ const PROOF_FILES: &[ProofFile] = &[
         module: "heap::proofs",
         parent: "framekernel/frame/src/heap.rs",
     },
+    // TASKS item 143, step 3: one entry per parent module (the coordinating session's ruling of
+    // 2026-11-26), since `check_padding` is private to `image.rs`.
+    ProofFile {
+        package: "onbf-format",
+        file: "runtime/onbf/format/src/proofs.rs",
+        module: "proofs",
+        parent: "runtime/onbf/format/src/lib.rs",
+    },
+    ProofFile {
+        package: "onbf-format",
+        file: "runtime/onbf/format/src/image/proofs.rs",
+        module: "image::proofs",
+        parent: "runtime/onbf/format/src/image.rs",
+    },
 ];
 
 /// The line a parent declares its proof module with, after `#[cfg(kani)]`.
@@ -89,6 +103,13 @@ struct Control {
 
 const FRAMES: &str = "framekernel/frame/src/frames.rs";
 const HEAP: &str = "framekernel/frame/src/heap.rs";
+const HEADER: &str = "runtime/onbf/format/src/header.rs";
+const SECTION: &str = "runtime/onbf/format/src/section.rs";
+const READ: &str = "runtime/onbf/format/src/read.rs";
+const OCBOR: &str = "runtime/onbf/format/src/ocbor.rs";
+const SIGNATURE: &str = "runtime/onbf/format/src/signature.rs";
+const IMAGE: &str = "runtime/onbf/format/src/image.rs";
+const ONBF_PROOFS: &str = "runtime/onbf/format/src/proofs.rs";
 
 /// The controls. Each harness of [`PROOF_FILES`] is named by at least one.
 const CONTROLS: &[Control] = &[
@@ -358,7 +379,98 @@ const CONTROLS: &[Control] = &[
         harnesses: &["heap::proofs::free_takes_back_only_a_live_block"],
         expect: &["a large free names a frame that is no slab"],
     },
+    // TASKS item 143, step 3: `onbf-format`.
+    Control {
+        name: "section-count-zero",
+        file: HEADER,
+        from: "        if !(1..=MAX_SECTIONS).contains(&section_count) {\n",
+        to: "        if section_count > MAX_SECTIONS {\n",
+        harnesses: &["proofs::header_parse_any_bytes"],
+        expect: &["§4.2: 1 to 256 sections"],
+    },
+    Control {
+        name: "stored-size-unlimited",
+        file: SECTION,
+        from: "        if stored_size > MAX_SECTION_CONTENT || content_size > MAX_SECTION_CONTENT {\n",
+        to: "        if content_size > MAX_SECTION_CONTENT {\n",
+        harnesses: &["proofs::section_entry_parse_any_entry"],
+        expect: &["Appendix A: a section's content is at most 1 TiB"],
+    },
+    Control {
+        name: "merkle-loop-runs-on",
+        file: SECTION,
+        from: "    while hashes > 1 {\n",
+        to: "    while hashes > 0 {\n",
+        harnesses: &["proofs::merkle_hash_blocks_any_size"],
+        // Kani names an unwinding check by the loop's place in its function: the only loop.
+        expect: &["unwinding assertion loop 0"],
+    },
+    Control {
+        name: "align-up-wraps",
+        file: READ,
+        from: "    Some(x.checked_add(mask)? & !mask)\n",
+        to: "    Some(x.wrapping_add(mask) & !mask)\n",
+        harnesses: &["proofs::align_up_any_value"],
+        expect: &["the next multiple"],
+    },
+    Control {
+        name: "slice-end-clamped",
+        file: READ,
+        from: "    bytes.get(start..end)\n",
+        to: "    bytes.get(start..end.min(bytes.len()))\n",
+        harnesses: &["proofs::slice_any_range"],
+        expect: &["Some only for a range inside the input"],
+    },
+    Control {
+        name: "ocbor-argument-indexed",
+        file: OCBOR,
+        from: "            let raw = bytes.get(next..end).ok_or(err(K::Truncated))?;\n",
+        to: "            let raw = &bytes[next..end];\n",
+        harnesses: &["proofs::ocbor_any_document"],
+        expect: &[SLICE_PANIC],
+    },
+    Control {
+        name: "ocbor-trailing-data-accepted",
+        file: OCBOR,
+        from: "    if pos != bytes.len() {\n        return Err(OcborError::at(pos, K::TrailingData));\n    }\n",
+        to: "",
+        harnesses: &["proofs::ocbor_validate_then_cursor_read"],
+        expect: &["P3: the cursor ends at the document's end"],
+    },
+    // The specification the stand-in rests on, made wrong: a 4-byte character past U+10FFFF.
+    Control {
+        name: "utf8-walk-past-u10ffff",
+        file: ONBF_PROOFS,
+        from: "            0xF4 => (4, 0x80, 0x8F),\n",
+        to: "            0xF4 => (4, 0x80, 0xBF),\n",
+        harnesses: &["proofs::utf8_walk_equals_core"],
+        expect: &["the walk refuses where core does, at the same offset"],
+    },
+    Control {
+        name: "le32-indexed",
+        file: SIGNATURE,
+        from: "    let s = b.get(at..at.checked_add(4)?)?;\n",
+        to: "    let s = &b[at..at + 4];\n",
+        harnesses: &["proofs::signature_block_any_input"],
+        expect: &[SLICE_PANIC],
+    },
+    Control {
+        name: "padding-first-byte-unchecked",
+        file: IMAGE,
+        from: "    match pad.iter().position(|&b| b != 0) {\n",
+        to: "    match pad.iter().skip(1).position(|&b| b != 0) {\n",
+        harnesses: &["image::proofs::check_padding_is_exact"],
+        expect: &[
+            "Ok only when every byte is zero",
+            "the byte named is not zero",
+        ],
+    },
 ];
+
+/// The check Kani 0.68.0 reports for a panic whose message core formats at run time, as a
+/// slice index past the end's is (seen on the first run of `le32-indexed`).
+const SLICE_PANIC: &str =
+    "This is a placeholder message; Kani doesn't support message formatted at runtime";
 
 /// What one harness reported.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -534,8 +646,9 @@ fn cargo_kani(
         }
         _ => Command::new("cargo"),
     };
-    // `-Z stubbing`: the heap's harnesses stub core's slice rotation (`heap/proofs.rs`). Kani
-    // 0.68.0 calls the feature unstable; the version is pinned.
+    // `-Z stubbing`: the heap's harnesses stub core's slice rotation (`heap/proofs.rs`), and
+    // `onbf-format`'s stub core's UTF-8 check (`proofs.rs`). Kani 0.68.0 calls the feature
+    // unstable; the version is pinned.
     command
         .current_dir(dir)
         .args(["kani", "-Z", "stubbing", "-p", package]);
@@ -855,9 +968,17 @@ fn controls(root: &Path, only: Option<&str>) -> Result {
 
 /// The package a control's file belongs to.
 fn package_of(file: &str) -> Result<&'static str> {
+    // A control may plant its bug in any file of a proof file's crate: under the directory that
+    // holds the proof module's parent (`onbf-format`'s parsers sit beside `lib.rs`).
     PROOF_FILES
         .iter()
-        .find(|p| p.parent == file || p.file == file)
+        .find(|p| {
+            p.parent == file
+                || p.file == file
+                || Path::new(p.parent)
+                    .parent()
+                    .is_some_and(|dir| Path::new(file).starts_with(dir))
+        })
         .map(|p| p.package)
         .ok_or_else(|| format!("kani: no proof file's package holds {file}"))
 }
