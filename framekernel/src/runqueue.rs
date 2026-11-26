@@ -1423,6 +1423,13 @@ impl<R: Copy> RunQueue<R> {
     }
 }
 
+// TASKS item 129: integrity's capacity phase modelled on this queue. Its own file, named by
+// `path` so that it resolves the same where `origin-sync`'s Loom build compiles this file by
+// `path`, and left out of that build.
+#[cfg(all(test, not(loom)))]
+#[path = "runqueue/capacity_model.rs"]
+mod capacity_model;
+
 #[cfg(test)]
 mod tests {
     use super::*;
