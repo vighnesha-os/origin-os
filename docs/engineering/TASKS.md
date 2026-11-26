@@ -641,7 +641,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 140. **`boot-matrix`'s usage line and `Cargo.toml`'s `default-members` (TASKS item 137's review, follow-ups 1 and 2). Numbered by the coordinating session on 2026-11-25; not started.** The usage line leaves out machines it runs: `boot-reserved`, `boot-acpi`, `boot-listed`, `boot-sparse` and `boot-domains`. `default-members` leaves out `sdk/directory` and `services/directory`, which `check` lints and tests on the host.
 141. **A placement control for B1 under emulation (TASKS item 98's turn T1). Numbered by the coordinating session on 2026-11-25; not started.** Under QEMU's software processor, B1 moved by 7 to 9 % between builds whose switch-path code is the same: a commit that added only counters off the switch path took the tip's mean on the 65-processor machine from 2,033 to 1,885 cycles. That is more than the changes TASKS item 92's rule is meant to judge. The control pins the switch path's code placement in the base's and the tip's comparison builds (for example with lld's `--symbol-ordering-file`). It shows the variation that is left, and is recorded as part of ADR-0018 V7's method. Until it lands, a scheduling item's B1 comparison still runs: a rise of more than 10 % above the base's range stops the item, and a smaller difference is judged on static counts.
 142. **Each per-processor table on a line of its own (TASKS item 98's static listing). Numbered by the coordinating session on 2026-11-25; not started.** The boot processor's run queue starts 24 bytes into a 64-byte line. The other processors' queues are consecutive elements whose stride is not a multiple of 64 (1,080 bytes at the base, 1,432 with TASKS item 98), so each queue's lock shares a line with the next queue's first fields. Each processor's element of a `PerCpu` table starts on a line of its own. First check that no assembly or fixed offset depends on today's layout. QEMU models no cache, so the figure it is judged by comes from hardware (ADR-0018 V9).
-143. **Kani's first proofs (owner item 358; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-25; not started.** `kani-verifier` is installed at a version read on the day, and it and its bundled compiler are recorded in `docs/toolchain/VERIFICATION.md`. The bundle verifies, and builds nothing that ships.
+143. **Kani's first proofs (owner item 358; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-25; its first harnesses, the frame allocator's and the heap's, built on 2026-11-26 on `claude/t143-kani-a0310d` (its entry, below); not landed.** `kani-verifier` is installed at a version read on the day, and it and its bundled compiler are recorded in `docs/toolchain/VERIFICATION.md`. The bundle verifies, and builds nothing that ships.
     - **First harnesses:** the frame allocator's and the heap's invariants (rows S73-02 and S73-04);
     - **then** the ONBF parsers' bounds (ONBF §13 item 5; row S73-08);
     - **then** capability validation (row S73-07).
@@ -5717,3 +5717,76 @@ The page's history follows the move commit by commit (`git log --follow PROGRESS
 - the page shows `partial` and `not-verified` as one state, as it always has, where the requirements gate prints them apart.
 
 **Not shown:** the page rendered on GitHub (its structure was read against GitHub's Markdown rules by the reviewer, and its links checked by a host test); the public index built and published (its tests ran; its workflow runs on `main`). No person has reviewed it.
+
+### 143. Kani's first proofs: the frame allocator and the heap (owner item 358; CLAUDE.md §73)
+
+Assigned by the coordinating session on 2026-11-26. Built on `claude/t143-kani-a0310d`, cut from `land/batch-11` at `98e28bf7`, with `main` (`68e961fd`) merged at `7b37f794` (ruling Q10). The contract and its rulings are in the coordination notes (`t143-contract.md`):
+- **Q1 (a):** F-1 fixed in a commit of its own before any proof of `reclaim`.
+- **Q2:** F-2 fixed now: reserve every frame a range touches, not refuse it; the proofs take reserved ranges of any alignment.
+- **Q3:** the heap's proofs assume the page source's contract and `GlobalAlloc`'s, named as unproved.
+- **Q4:** over 15 minutes or 8 GB for a harness on CI's standard runner, its bound comes down, and the records state the bound that ran.
+- **Q5:** "any sequence of operations" covers only the methods listed with their harnesses; a method left unproved is named and excluded.
+- **Q6:** `cargo xtask kani` stays out of `check`; the static `kani-gate` is in it; the CI job runs the proofs.
+- **Q7 to Q9:** Kani's bundle under item 358, reached only through `cargo kani`; Kani's section in `verify.sh`; the controls in a scratch copy under `target/`.
+- **Q11:** S73-04 `built`, S73-02 `partial`, S73-12's limitation naming Kani beside Loom.
+- **Q12:** one independent AI review, committed, every finding answered before clearance.
+- **Q13:** the ONBF parsers (S73-08) next, then capability validation (S73-07), each with a short contract; `origin-paging` gets an item of its own.
+- **FA-7:** `reclaim` left out of Kani's claim (TASKS item 154). **The local budget:** each local run, harness or control, under 5 minutes and 8 GB; CI's Q4 rule binds the claim.
+
+**What was built.**
+- **Two fixes to `frames.rs`, each with a host test that fails without it:**
+  - **F-1** (`9570ca05`): a second `reclaim` of a kind freed every frame of it in use, frames already handed out; a kind already taken over now returns 0 and changes nothing (`a_second_reclaim_leaves_handed_out_frames_alone`).
+  - **F-2** (`c24fd771`): `new` reserved an unaligned range from the frame holding its base for `pages` frames, so the last frame it touched stayed free and was handed out; `new` and `allocatable` now share `reserved_frames`, every frame the range touches (`an_unaligned_reserved_range_reserves_every_frame_it_touches`).
+  - The kernel passes aligned ranges and reclaims once, so no kernel run changes.
+- **`frames::proofs`** (`framekernel/frame/src/frames/proofs.rs`), 12 harnesses. The invariant: accounting, ownership (checked at a frame Kani chooses freely) and cover, with `owned`, `map_end` and `words_needed` written from the documentation, not the code. `new` establishes it; `allocate`, `free` and `claim` (each over two words and over one), `allocate_run` and `free_run` keep it from any valid state; `two_hand_outs_never_overlap`.
+- **`heap::proofs`** (`framekernel/frame/src/heap/proofs.rs`), 6 harnesses: `allocate` and `free` keep the heap's invariant from any heap of up to 2 slabs; `plan` and `take_free_bit` for every input; `two_allocations_never_overlap`; the rotation stubs equal core's rotation.
+- **`cargo xtask kani [--harness <name>]`** (`developer-tools/xtask/src/kani.rs`): every harness verified with every cover satisfied, then 27 controls in a scratch copy, each required to fail with a check it names; **`kani-gate`** in `check`; **CI's job `kani`** with `.github/ci/install-kani.sh` (the pinned driver, the bundle checked against GitHub's SHA-256); `cfg(kani)` in `check-cfg`; Kani's section in `verify.sh`.
+
+**What is proved, and within which bounds.** Each module's documentation says it in full (row S73-12):
+- **The frame allocator:** a memory map of 3 regions of any kinds that `boot::summarize` accepts, and 2 reserved ranges of any base and size (the kernel passes two). Each step from any valid state of its size: `new` over 5 frames (2 for the nine ranges), `allocate`, `free` and `claim` over 128 and over 64, `allocate_run` over 8 with runs of at most 4, `free_run` over 16, two hand-outs over 8. Composed: the invariant holds after any sequence of those methods on an allocator `new` built over at most 5 frames. No sequence past 5 frames is proved.
+- **The heap:** a table of 2 slabs, each slab's bitmap whole; the page source's contract and `GlobalAlloc`'s caller's are assumed.
+- **Not proved:** `reclaim` (TASKS item 154); sizes past the bounds; `memory.rs` and `early.rs`' use of the two; concurrency; the machine code rustc 1.100.0 makes (Kani compiles with `nightly-2026-08-21`).
+
+**The commits,** on `98e28bf7`:
+- `9570ca05` F-1, a second `reclaim` of a kind; `c24fd771` F-2, an unaligned reserved range; each with its host test.
+- `1233878e` `cfg(kani)` in the workspace's `check-cfg`.
+- `e60f35c3` the heap's proofs; `94d44ec3` the frame allocator's proofs.
+- `723e52d3` `cargo xtask kani`, `kani-gate` in `check`, and CI's job.
+- `6201e1b8` Kani's section of `verify.sh`.
+- `56e8d38c` the answers to the review.
+- `7b37f794` `main` (`68e961fd`) merged (ruling Q10).
+- `baf67a7c` `verify.sh` names Kani's bundle under `~`, so the committed record does not name the account.
+- The records' commit, with this entry, then `docs/toolchain/VERIFICATION.md` regenerated by `verify.sh` from a clean tree.
+
+**The review.** One independent AI review of `6201e1b8` (`docs/engineering/REVIEW_T143_2026-11-26.md`), given the code and the properties but not the author's argument. It found no unsound proof, no false pass in the runner and no control passing for the wrong reason. Its findings: no High; one Medium (R143-1, the induction's base and three steps on different bitmaps); six Low; six Info. All are answered at `56e8d38c`, but R143-10, which is a follow-up.
+
+**The runs.** At `56e8d38c`, on the development Mac (Apple M1 Max, 64 GB; on AC power until 15:37:52 UTC and on battery after, its power mode set to high, with no sleep in `pmset -g log`), one harness at a time, each in a turn of its own, by `cargo xtask kani --harness <name>` with Kani 0.68.0 and CBMC 6.11.0 at Kani's default solver, on 2026-11-26 from 13:44 to 16:22 UTC: each of the 18 harnesses verified with every cover satisfied, and each of the 27 controls was caught, on the check it names, by every harness it names (31 pairs). The times are Kani's verification time for the harness, then for each of its controls; the memory is the largest process of the run (`/usr/bin/time -l`), in GB of 10⁹ bytes.
+
+| Harness | Proof | Controls | Memory |
+|---|---|---|---|
+| `frames::proofs::new_frees_exactly_the_owned_frames` | 70 s | 69, 73, 73 s | 5.7 GB |
+| `frames::proofs::new_refuses_a_bitmap_too_small` | 39 s | 29 s | 3.0 GB |
+| `frames::proofs::new_refuses_more_than_eight_ranges` | 2 s | 154 s | 6.1 GB |
+| `frames::proofs::allocate_hands_out_a_free_frame` | 52 s | 16, 18 s | 1.0 GB |
+| `frames::proofs::allocate_hands_out_a_free_frame_one_word` | 19 s | 16 s | 0.9 GB |
+| `frames::proofs::free_takes_back_only_what_was_handed_out` | 51 s | 39, 36 s | 1.0 GB |
+| `frames::proofs::free_takes_back_only_what_was_handed_out_one_word` | 27 s | 27 s | 1.0 GB |
+| `frames::proofs::claim_takes_only_a_free_frame` | 47 s | 41 s | 1.1 GB |
+| `frames::proofs::claim_takes_only_a_free_frame_one_word` | 29 s | 25 s | 1.1 GB |
+| `frames::proofs::allocate_run_hands_out_a_free_aligned_run` | 99 s | 40, 123 s | 2.6 GB |
+| `frames::proofs::free_run_is_all_or_nothing` | 110 s | 24, 108, 97 s | 2.5 GB |
+| `frames::proofs::two_hand_outs_never_overlap` | 298 s | 255 s | 5.0 GB |
+| `heap::proofs::plan_fits_every_layout` | 0.5 s | 0.4 s | 0.3 GB |
+| `heap::proofs::take_free_bit_takes_the_lowest_free_bit` | 3.3 s | 2.9 s | 0.4 GB |
+| `heap::proofs::the_rotation_stubs_equal_core_s` | 11 s | 11 s | 0.5 GB |
+| `heap::proofs::allocate_keeps_the_heap_whole` | 128 s | 129, 118, 115, 119 s | 4.0 GB |
+| `heap::proofs::free_takes_back_only_a_live_block` | 135 s | 179, 119, 100, 120 s | 3.3 GB |
+| `heap::proofs::two_allocations_never_overlap` | 87 s | 57 s | 6.4 GB |
+
+Every run is inside the local budget of 5 minutes and 8 GB. `two_hand_outs_never_overlap` is inside it by 2 s: at `6201e1b8` it took 186 s and its control 206 s. The rise is not explained: `56e8d38c` changed the specifications it calls (R143-4) and the steps' bodies (R143-1), and this run was on battery; none of the three was measured apart. The run had a processor to itself (555 s of user time in 558 s). If a later local run passes 5 minutes, its bound (8 frames) comes down and the records say so. The times on CI's standard runner are not known yet.
+
+**Not shown:**
+- CI's job `kani` on a standard runner: not yet run on a pull request, so Q4's 15-minute and 8 GB rule is not yet checked there.
+- `reclaim` (TASKS item 154), with R143-11's overcount for its contract.
+- `FrameError`'s documentation of frame 0 against the code (R143-10): a follow-up.
+- No person has reviewed it.

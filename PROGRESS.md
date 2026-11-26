@@ -9,9 +9,9 @@ A requirement is one statement of [`CLAUDE.md`](CLAUDE.md), or one decision of a
 | State | Requirements | Share |
 |---|--:|--:|
 | Done | 58 | 3.4% |
-| Built | 372 | 22.1% |
-| In progress | 248 | 14.7% |
-| Not started | 1,008 | 59.8% |
+| Built | 373 | 22.1% |
+| In progress | 249 | 14.8% |
+| Not started | 1,006 | 59.7% |
 | **Total** | **1,686** | **100.0%** |
 
 ## What the states mean
@@ -27,11 +27,11 @@ A requirement is one statement of [`CLAUDE.md`](CLAUDE.md), or one decision of a
 
 | Environment | Requirements |
 |---|--:|
-| The development host | 231 |
+| The development host | 233 |
 | An emulator (QEMU) | 122 |
 | A virtual machine on a real processor | 285 |
 | Physical hardware | 0 |
-| No evidence yet | 1,048 |
+| No evidence yet | 1,046 |
 
 ## By milestone
 
@@ -41,7 +41,7 @@ Each milestone counts the requirements that [`docs/ROADMAP.md`](docs/ROADMAP.md)
 |---|---|--:|--:|--:|--:|--:|
 | M0. Toolchain and engineering foundation | built | 107 | 38.3% | 33.7% | 11.2% | 16.8% |
 | M1. Bootable Framekernel | built | 55 | 1.8% | 92.7% | 3.7% | 1.8% |
-| M2. CPU and memory | built | 44 | 0.0% | 72.7% | 20.5% | 6.8% |
+| M2. CPU and memory | built | 44 | 0.0% | 75.0% | 22.7% | 2.3% |
 | M3. SMP and scheduler | partial | 107 | 0.9% | 42.1% | 7.5% | 49.5% |
 | M4. Processes and IPC | partial | 140 | 0.7% | 69.3% | 16.4% | 13.6% |
 | M5. Storage | partial | 115 | 0.0% | 42.6% | 17.4% | 40.0% |
@@ -75,8 +75,8 @@ The requirements of `CLAUDE.md` that ask for something to be built, by the secti
 | Versions, updates and recovery | §62 to §65 | 48 | 4.2% | 12.5% | 0.0% | 83.3% |
 | Performance, power, time and reliability | §66 to §69 | 45 | 0.0% | 8.9% | 6.7% | 84.4% |
 | Developer platform | §70 to §71 | 27 | 0.0% | 3.7% | 7.4% | 88.9% |
-| Testing, hardware qualification and release | §72 to §76 | 69 | 1.4% | 13.0% | 7.3% | 78.3% |
-| **All fourteen areas** | | 834 | 2.0% | 15.2% | 9.9% | 72.9% |
+| Testing, hardware qualification and release | §72 to §76 | 69 | 1.4% | 14.5% | 8.7% | 75.4% |
+| **All fourteen areas** | | 834 | 2.0% | 15.3% | 10.0% | 72.7% |
 
 Outside these areas: 154 more of `CLAUDE.md` that ask for something to be built, in the header (7), §1 (69), §6 (17), §18 (17), §79 (12), §82 (17), §84 (14), the final rules (1). They are counted in "Overall", and in a milestone where the roadmap places them.
 
@@ -216,7 +216,7 @@ Outside these areas: 154 more of `CLAUDE.md` that ask for something to be built,
 | Section | Requirements | Done | Built | In progress | Not started |
 |---|--:|--:|--:|--:|--:|
 | §72. Required testing methods | 16 | 6.3% | 25.0% | 25.0% | 43.7% |
-| §73. Formal methods | 11 | 0.0% | 27.3% | 0.0% | 72.7% |
+| §73. Formal methods | 11 | 0.0% | 36.4% | 9.1% | 54.5% |
 | §74. Hardware test matrix | 17 | 0.0% | 0.0% | 0.0% | 100.0% |
 | §75. Reproducibility | 9 | 0.0% | 22.2% | 11.1% | 66.7% |
 | §76. Release qualification | 16 | 0.0% | 0.0% | 0.0% | 100.0% |
@@ -273,7 +273,7 @@ The milestone and feature-area tables, with the number of requirements in each s
 |---|--:|--:|--:|--:|--:|
 | M0. Toolchain and engineering foundation | 107 | 41 | 36 | 12 | 18 |
 | M1. Bootable Framekernel | 55 | 1 | 51 | 2 | 1 |
-| M2. CPU and memory | 44 | 0 | 32 | 9 | 3 |
+| M2. CPU and memory | 44 | 0 | 33 | 10 | 1 |
 | M3. SMP and scheduler | 107 | 1 | 45 | 8 | 53 |
 | M4. Processes and IPC | 140 | 1 | 97 | 23 | 19 |
 | M5. Storage | 115 | 0 | 49 | 20 | 46 |
@@ -301,8 +301,8 @@ The milestone and feature-area tables, with the number of requirements in each s
 | Versions, updates and recovery | §62 to §65 | 48 | 2 | 6 | 0 | 40 |
 | Performance, power, time and reliability | §66 to §69 | 45 | 0 | 4 | 3 | 38 |
 | Developer platform | §70 to §71 | 27 | 0 | 1 | 2 | 24 |
-| Testing, hardware qualification and release | §72 to §76 | 69 | 1 | 9 | 5 | 54 |
-| **All fourteen areas** | | 834 | 17 | 127 | 82 | 608 |
+| Testing, hardware qualification and release | §72 to §76 | 69 | 1 | 10 | 6 | 52 |
+| **All fourteen areas** | | 834 | 17 | 128 | 83 | 606 |
 
 </details>
 
