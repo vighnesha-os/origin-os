@@ -156,7 +156,7 @@ Every answered item of `docs/engineering/OWNER_DECISIONS.md` is named in the "De
 | 369 | none | GitHub milestones M0 to M13 and "Server edition", with no due dates, each linking to its exit tests in `docs/ROADMAP.md`. A view of the roadmap, which no statement of the directive or decision of an ADR carries. |
 | 370 | none | One GitHub Projects board, created by the owner, that shows the generated issues by state. A view of the backlog, which no statement of the directive or decision of an ADR carries. |
 | 371 | none | Issue forms, a pull request template and labels by type and area. A rule of how outside contributions arrive, which no statement of the directive or decision of an ADR carries. |
-| 372 | none | A code of conduct, the Contributor Covenant 2.1, published once the owner names a contact address for reports. A rule of the project's community, which no statement of the directive or decision of an ADR carries. |
+| 372 | none | A code of conduct, the Contributor Covenant 2.1, with the contact address the owner chose for reports (its note of 2026-11-26). A rule of the project's community, which no statement of the directive or decision of an ADR carries. |
 | 373 | none | GitHub Discussions switched on, for questions. A repository setting, which no statement of the directive or decision of an ADR carries. |
 | 374 | none | The progress page shows each specification, standard and protocol the project relies on, with its requirement rows by state, built by TASKS item 151. A rule of what a generated page shows, which no statement of the directive or decision of an ADR carries. |
 | 167, 190 | none | How task 18b and the randomized model of its policy land: through pull request 16. Rules of process. |
