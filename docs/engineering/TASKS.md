@@ -711,6 +711,12 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **The first question,** for the coordinating session before any code: whether the kernel's parsers are fuzzed through the kernel library's host build, or first moved into crates of their own. Either way, nothing in the kernel gains a dependency, and every fuzzed crate keeps forbidding `unsafe`.
     - **As in item 144:** stable Rust 1.100.0 with `--sanitizer none`, seeds generated from fixed bytes, a planted control per target, one CI job per target, and any crash reported to the coordinating session as a security finding before its fix.
     - **Not in it:** IMAGE_FS, which is not built yet; it gets its target when it is.
+154. **A Kani proof of the frame allocator's `reclaim` (CLAUDE.md §73; rows S73-02 and S73-04). Numbered by the coordinating session on 2026-11-26; not started; after TASKS item 143 lands.**
+    - **Why:** TASKS item 143 leaves `reclaim` out of Kani's claim. It calls `allocatable`, which walks all 8 reserved-range slots, so any proof that reaches it needs an unwind bound of at least 9. At 9 its symbolic execution had not finished after 600 s on the development Mac, with 3 regions or 2; at 8 it took 267 s and 7.5 GB and failed the unwinding check. Its host tests stay.
+    - **The contract weighs, with figures:**
+      - a model with concrete region kinds, stating exactly what it narrows from "any kind";
+      - or a change to `reclaim`'s or `allocatable`'s loops that keeps their behaviour, shown by host tests of the old form against the new, and makes the walks countable. A change to the allocator's code is reviewed as one.
+    - **Within item 143's rules:** each local run under 5 minutes and 8 GB; on CI's standard runner, 15 minutes and 8 GB per harness, or the bound comes down and the records state it.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
