@@ -650,6 +650,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **Then, structure-aware harnesses** (`arbitrary`): the ONBF parsers and loader (ONBF §13 item 3) and the AML interpreter; later the ACPI table parsers and OCBOR-1.
     - **What is kept:** the corpus, and every crash, minimized, as a regression test. CI runs each target for a fixed time. The seeded mutation soaks stay.
     - `libfuzzer-sys` and `arbitrary` are host-only dependencies, reviewed under CLAUDE.md §5 first.
+    - **Running the targets (owner item 365):** `cargo xtask fuzz` may give `run`, `tmin` and `cmin` to cargo-fuzz, in `developer-tools/xtask/src/fuzz.rs` only, named in `host-tools-gate`, with a planted control showing that `run` anywhere else is still refused (ADR-0011 Amendment 4, T1's note of 2026-11-26).
 145. **Miri, on a pinned nightly used only by test tools (owner items 360 and 361). Numbered by the coordinating session on 2026-11-25; not started.**
     - **The nightly:** a toolchain file of its own pins one nightly by date and commit (row S12-08). Only `cargo xtask miri` uses it, and a gate holds every build, check and release on 1.100.0 (row S12-09).
     - **In CI only (owner item 364):** the nightly is installed only on CI's runners, never on the development Mac. Every Miri run, while it is built as well as after, runs in a CI job of its own. How its branch reaches CI before it lands, through the batch's pull request or a draft pull request of its own, is settled in its contract, and any push waits for the owner's word.
@@ -663,6 +664,9 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **Allocators:** model-based tests of the frame allocator, the heap and the slab table, using random sequences of allocations and frees checked against a simple model and shrunk to the smallest sequence that fails.
     - **ONBF:** pack-then-parse round trips through `onbf-pack`'s library.
     - The seeded soaks stay.
+148. **Whether the ask is needed (TASKS item 98's control C98-3). Numbered by the coordinating session on 2026-11-26; not started.** A kernel that never sends ADR-0020 Amendment 1's ask passes every proof. In the "load balancing" proof, "two alone" was taken by a kick at a tick, not through an ask, so the ask is shown only by its bound (C98-8) and its counts. This item finds which is true:
+    - **A case only the ask passes:** a proof case where only the ask makes a waiting frame lendable. C98-3 must then be caught.
+    - **No such case:** a finding that no reachable case needs the ask. It goes to the owner under ADR-0018 V1, since the ask's cost (CL62) would then buy nothing, and the ask may be withdrawn.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:

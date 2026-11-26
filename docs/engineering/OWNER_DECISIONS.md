@@ -1626,3 +1626,19 @@ Item 360 allowed one pinned nightly toolchain, used only by test tools, and TASK
   - this sheet;
   - the "Decided by" column of matrix row S12-09;
   - TASKS item 145's line.
+
+### Fuzz targets started by `cargo xtask fuzz` (item 365): Accepted 2026-11-26
+
+TASKS item 144 builds coverage-guided fuzzing (item 359). It found that `host-tools-gate`'s rule G1 refuses `run` given to an outside program, and `cargo fuzz run` is exactly that: `xtask` starts cargo-fuzz, an outside program, and cargo-fuzz starts the fuzz target, which is built from first-party libraries. cargo-fuzz's `tmin` and `cmin` start the target too. The session would not get round the rule by its letter, and the coordinating session put the question to you. You answered "Accept 365".
+
+| # | Question | Answer |
+|---|---|---|
+| 365, answered | Is a fuzz target a test program, started to test first-party libraries, as item 310 has `cargo test` start test binaries, so that `cargo xtask fuzz` may give `run`, `tmin` and `cmin` to cargo-fuzz in `developer-tools/xtask/src/fuzz.rs` only, named in the gate, with a planted control showing that `run` anywhere else is still refused? | **Accept** |
+
+- **The alternative put** was that `cargo xtask fuzz` only prepares a run and prints the command, which a person runs on the Mac and CI runs as a step of its job file. No new allowance would be needed. But the planted-fault check, the time limits and crash minimizing would then live in untested shell and job-file text, and minimizing a crash would be a manual step.
+- **What does not change:** `xtask` still calls the host tools' libraries and starts no first-party program to do their work. `run` given to an outside program stays refused everywhere else, and so does Cargo's own `run`.
+- **Performance cost** (ADR-0018 V3): none, by construction: a host tool's test step.
+- **Where it is written:**
+  - ADR-0011 Amendment 4, T1's note of 2026-11-26;
+  - row A11-T1's "Decided by";
+  - TASKS item 144's line.
