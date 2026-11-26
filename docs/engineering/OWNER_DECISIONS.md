@@ -1604,3 +1604,71 @@ The coordinating session checked them against CLAUDE.md and the records, and put
   - this sheet;
   - the "Decided by" column of matrix rows S12-07 to S12-09, S13-06, S72-03 to S72-06, S73-02, S73-04, S73-07 and S73-08;
   - TASKS items 143 to 147.
+
+### Miri's nightly in CI only (item 364): 2026-11-26
+
+Item 360 allowed one pinned nightly toolchain, used only by test tools, and TASKS item 145 builds Miri on it. On 2026-11-26 the coordinating session asked where that nightly may be installed. It recommended the development Mac as well as CI: installed under its exact date name, never the default and never an override, called only by `cargo xtask miri`, so that a Miri finding can be reproduced and debugged in minutes. You answered "CI only".
+
+| # | Question | Answer |
+|---|---|---|
+| 364, answered | May Miri's pinned nightly be installed on the development Mac, or only on CI's runners? | **CI only** |
+
+- **What it decides:**
+  - no nightly toolchain is installed on the development Mac;
+  - every Miri run happens in a CI job of its own, on GitHub's standard runners, both while TASKS item 145 is built and afterwards;
+  - item 360's other terms stand: one nightly, pinned by date and commit, used only by test tools, with every build, check and release on Rust 1.100.0.
+- **What it costs:**
+  - debugging a Miri finding waits for a CI run each time;
+  - CI runs only for pull requests and for pushes to `main`. So how TASKS item 145's branch reaches CI while it is built, through the batch's pull request or a draft pull request of its own, is settled in its contract, and any push waits for your word.
+- **What it does not change:** Kani's compiler bundle is installed on the Mac under item 358. It is Kani's own pinned toolchain, used only by Kani, not a nightly of the project's, and this item does not cover it.
+- **Performance cost** (ADR-0018 V3): none, by construction: a test tool's place.
+- **Where it is written:**
+  - this sheet;
+  - the "Decided by" column of matrix row S12-09;
+  - TASKS item 145's line.
+
+### Fuzz targets started by `cargo xtask fuzz` (item 365): Accepted 2026-11-26
+
+TASKS item 144 builds coverage-guided fuzzing (item 359). It found that `host-tools-gate`'s rule G1 refuses `run` given to an outside program, and `cargo fuzz run` is exactly that: `xtask` starts cargo-fuzz, an outside program, and cargo-fuzz starts the fuzz target, which is built from first-party libraries. cargo-fuzz's `tmin` and `cmin` start the target too. The session would not get round the rule by its letter, and the coordinating session put the question to you. You answered "Accept 365".
+
+| # | Question | Answer |
+|---|---|---|
+| 365, answered | Is a fuzz target a test program, started to test first-party libraries, as item 310 has `cargo test` start test binaries, so that `cargo xtask fuzz` may give `run`, `tmin` and `cmin` to cargo-fuzz in `developer-tools/xtask/src/fuzz.rs` only, named in the gate, with a planted control showing that `run` anywhere else is still refused? | **Accept** |
+
+- **The alternative put** was that `cargo xtask fuzz` only prepares a run and prints the command, which a person runs on the Mac and CI runs as a step of its job file. No new allowance would be needed. But the planted-fault check, the time limits and crash minimizing would then live in untested shell and job-file text, and minimizing a crash would be a manual step.
+- **What does not change:** `xtask` still calls the host tools' libraries and starts no first-party program to do their work. `run` given to an outside program stays refused everywhere else, and so does Cargo's own `run`.
+- **Performance cost** (ADR-0018 V3): none, by construction: a host tool's test step.
+- **Where it is written:**
+  - ADR-0011 Amendment 4, T1's note of 2026-11-26;
+  - row A11-T1's "Decided by";
+  - TASKS item 144's line.
+
+### Verus in CI only, and its evaluation (item 366): delegated 2026-11-26
+
+On 2026-11-26 you asked whether Verus could be used. CLAUDE.md §73 already asks to evaluate it for selected high-assurance modules, as row S73-03, not started. You asked how the Asterinas project set it up, and whether Verus could run only in CI. The coordinating session's answer was that it could, but that a proof is written by trial and error: CI-only work needs the evaluation's own draft pull request, and your permission for that branch's pushes. You then delegated the decisions: "You are the chief architect and ...etc roles clearly defined, you can take decisions on your own for these". The coordinating session decided them as follows.
+
+| # | Question | Answer |
+|---|---|---|
+| 366, answered | Where does Verus run, how does its evaluation reach CI, and when does it start? | **Delegated to Claude**, and decided by the coordinating session: CI only, through the evaluation's own branch and draft pull request, after TASKS item 143's allocator proofs |
+
+- **What was found first:**
+  - **Verus's toolchain:** Verus is built against a Rust toolchain of its own. Its standard library's recent builds show a nightly compiler, and the exact pin is to be read on the day.
+  - **Verified code:** it is written inside `verus!` blocks that use Verus's crates. So annotating the kernel's real code would make the kernel's build depend on them.
+  - **Asterinas's published work** (its blog and its USENIX ATC 2025 paper, not its source) verifies a separate copy of its framework library with Verus, and reports real bugs found in concurrent page-table code.
+- **What it decides:**
+  - **Where Verus runs:** Verus and its solver are installed only on CI's runners, never on the development Mac, as item 364 decided for Miri. Each is pinned to a release and a checksum read on the day.
+  - **The evaluation** is TASKS item 149, started after TASKS item 143's allocator proofs land.
+  - **The branch permission:** for TASKS item 149 only, its session may push its own branch and keep one draft pull request open from it, so CI runs its proofs.
+    - That pull request is never merged: the work lands through the batch, as every task's does.
+    - Each push is scanned for identifiers first.
+    - No other branch is pushed under this permission.
+    - The draft pull request is closed when the task is cleared.
+- **What stays yours:**
+  - adopting Verus beyond the evaluation;
+  - any shipping build's dependency on Verus's crates, a CLAUDE.md §5 exception.
+- **What is not done:** Asterinas's source and its verification project's proofs are not read. Asterinas is not among the projects item 94 allows, and CLAUDE.md §3 forbids copying from another operating system.
+- **Performance cost** (ADR-0018 V3): none, by construction: a test tool in CI.
+- **Where it is written:**
+  - this sheet;
+  - TASKS item 149's line;
+  - the "Decided by" column of matrix row S73-03.

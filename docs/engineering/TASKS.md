@@ -650,8 +650,10 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **Then, structure-aware harnesses** (`arbitrary`): the ONBF parsers and loader (ONBF §13 item 3) and the AML interpreter; later the ACPI table parsers and OCBOR-1.
     - **What is kept:** the corpus, and every crash, minimized, as a regression test. CI runs each target for a fixed time. The seeded mutation soaks stay.
     - `libfuzzer-sys` and `arbitrary` are host-only dependencies, reviewed under CLAUDE.md §5 first.
+    - **Running the targets (owner item 365):** `cargo xtask fuzz` may give `run`, `tmin` and `cmin` to cargo-fuzz, in `developer-tools/xtask/src/fuzz.rs` only, named in `host-tools-gate`, with a planted control showing that `run` anywhere else is still refused (ADR-0011 Amendment 4, T1's note of 2026-11-26).
 145. **Miri, on a pinned nightly used only by test tools (owner items 360 and 361). Numbered by the coordinating session on 2026-11-25; not started.**
     - **The nightly:** a toolchain file of its own pins one nightly by date and commit (row S12-08). Only `cargo xtask miri` uses it, and a gate holds every build, check and release on 1.100.0 (row S12-09).
+    - **In CI only (owner item 364):** the nightly is installed only on CI's runners, never on the development Mac. Every Miri run, while it is built as well as after, runs in a CI job of its own. How its branch reaches CI before it lands, through the batch's pull request or a draft pull request of its own, is settled in its contract, and any push waits for the owner's word.
     - **What Miri runs:** the host tests of crates that hold `unsafe`, starting with `origin-sync` and the run queue it compiles. Code with inline assembly or device access stays out.
     - **The records** state what it found and what it cannot see (row S13-06).
 146. **Shuttle beside Loom (owner item 362). Numbered by the coordinating session on 2026-11-25; not started.** `shuttle` becomes a host-only dev-dependency once CLAUDE.md §5's review passes. Origin's sync shims map to Shuttle's types as they map to Loom's.
@@ -662,6 +664,21 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **Allocators:** model-based tests of the frame allocator, the heap and the slab table, using random sequences of allocations and frees checked against a simple model and shrunk to the smallest sequence that fails.
     - **ONBF:** pack-then-parse round trips through `onbf-pack`'s library.
     - The seeded soaks stay.
+148. **Whether the ask is needed (TASKS item 98's control C98-3). Numbered by the coordinating session on 2026-11-26; not started.** A kernel that never sends ADR-0020 Amendment 1's ask passes every proof. In the "load balancing" proof, "two alone" was taken by a kick at a tick, not through an ask, so the ask is shown only by its bound (C98-8) and its counts. This item finds which is true:
+    - **A case only the ask passes:** a proof case where only the ask makes a waiting frame lendable. C98-3 must then be caught.
+    - **No such case:** a finding that no reachable case needs the ask. It goes to the owner under ADR-0018 V1, since the ask's cost (CL62) would then buy nothing, and the ask may be withdrawn.
+149. **Verus evaluated on one small module (CLAUDE.md §73, row S73-03; owner item 366). Numbered by the coordinating session on 2026-11-26; not started; after TASKS item 143's allocator proofs land.**
+    - **The experiment:** verify one small module for all sizes, with no bounds. The first candidates are the frame allocator's bitmap operations and the heap's size planning, so the result can be set beside Kani's bounded proofs of the same code.
+    - **Where it runs:** in a crate kept apart from the shipping build. Verus and its solver are installed only on CI's runners (owner item 366). The session pushes its own branch and keeps one draft pull request open from it, so CI runs its proofs. That pull request is never merged: the work lands through the batch.
+    - **The choice it reports:** either verify a separate copy of the code and check that the copy does not drift from the real one, the approach Asterinas's published work describes; or annotate the real code, which makes the kernel's build depend on Verus's crates. That second form is a CLAUDE.md §5 exception, for the owner.
+    - **The report:**
+      - the effort it took;
+      - what it proves beyond Kani;
+      - Verus's exact Rust toolchain and solver versions;
+      - the copy-or-dependency choice;
+      - the CI cost;
+      - the next targets it suggests: the page tables, and the scheduler's `lend`.
+    - **Sources:** Verus's own documentation, and Asterinas's published papers and blog for the approach only. No other project's proofs or source are read (CLAUDE.md §3).
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
