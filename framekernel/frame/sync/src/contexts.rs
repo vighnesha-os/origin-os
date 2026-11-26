@@ -601,6 +601,33 @@ impl Contexts {
         self.leaving.store(0, Release);
     }
 
+    /// Whether a slot of this table holds `frame` as a saved frame: its context is suspended and
+    /// the frame is published, so a mover's [`Self::lend`] would find it (ADR-0020 S5; TASKS item
+    /// 98). `false` for a frame that is still the leaving record's, for the running context's, and
+    /// for one the table does not hold. Any processor may ask; it writes nothing.
+    ///
+    /// For a mover that holds the lock of this processor's run queue and has found the thread
+    /// ready and not running there: a frame it finds published stays published until it lends it.
+    /// Only this processor's switch to the thread, another mover, or a withdrawal takes a frame,
+    /// and each of those needs that lock or a thread that was never queued. A frame not yet
+    /// published may become so at any moment, by this processor's next call into the table.
+    ///
+    /// The leaving record is read before the slots, as [`Self::lend`] reads them: a publication
+    /// stores the slot and only then clears the record, so between its two stores the frame is
+    /// in both, and `lend` would still answer `Leaving`. Read in this order, "published" means the
+    /// record did not hold the frame, and then `lend` finds it, but for one case: this processor
+    /// recorded the frame as leaving after that read and is between the two stores of its
+    /// publication when `lend` reads. `lend` then answers `Leaving`, and the mover tries later
+    /// (the reviews of TASKS item 98, R98-6 and D98-12).
+    pub fn published(&self, frame: u64) -> bool {
+        frame > BOOT_FLOW
+            && self.leaving.load(Acquire) != frame
+            && self
+                .slots
+                .iter()
+                .any(|slot| slot.frame.load(Acquire) == frame)
+    }
+
     /// Whether any context's home or saved frame lies in `[low, top)`: a stack a context of this
     /// processor may still use. Any processor may ask. It never waits.
     ///
@@ -2106,6 +2133,67 @@ mod tests {
         assert_eq!((lent.frame(), lent.home()), (leaves, first_frame(1)));
         assert!(lent.restore());
         drop(moving);
+    }
+
+    /// ADR-0020 S5 and S7 (TASKS item 98): with exactly two contexts that alternate at every
+    /// switch, as two threads that never yield do at every tick, the waiting one's frame is the
+    /// leaving record's between two switches, in no slot: not published, and a mover is refused
+    /// `Leaving` at every moment it can look. A call into the table that switches nothing (what a
+    /// reschedule interrupt makes) publishes it, and it is then lent. So an idle processor cannot
+    /// take the second of two such threads by waiting for a tick.
+    #[test]
+    fn of_two_alternating_contexts_the_waiting_one_is_never_lendable_between_switches() {
+        let (source, destination, moves) = (Contexts::new(), Contexts::new(), Moves::<Off>::new());
+        let (boot_s, _) = two_processors(&source, &destination, 1);
+        assert!(source.publish(first_frame(2)));
+        assert!(
+            source.published(first_frame(2)),
+            "a new context's first frame"
+        );
+        // The boot flow gives way to context 1.
+        assert_eq!(
+            switch_to(&source, boot_s - 0x100, first_frame(1), false, not_on_it),
+            Ok(first_frame(1))
+        );
+        assert!(!source.published(first_frame(1)), "the running context's");
+        let mut running = 1;
+        let mut waiting_frame = first_frame(2);
+        let mut refused = 0;
+        for tick in 0..64u64 {
+            // The tick: the running context is interrupted at a new frame on its own stack, and
+            // the scheduler answers the waiting one's frame.
+            let here = first_frame(running) - 0x200 - 8 * tick;
+            assert_eq!(
+                switch_to(&source, here, waiting_frame, false, not_on_it),
+                Ok(waiting_frame)
+            );
+            running = 3 - running;
+            waiting_frame = here;
+            // Until the next tick, nothing calls into the table. A mover looks now.
+            assert!(!source.published(waiting_frame), "tick {tick}");
+            let moving = moves.begin(());
+            match source.lend(&moving, waiting_frame, one_stack) {
+                Err(LendRefused::Leaving) => refused += 1,
+                other => panic!("tick {tick}: {:?}", other.map(|l| l.frame())),
+            }
+            drop(moving);
+        }
+        assert_eq!(refused, 64, "the waiting context was never lendable");
+        // A call into the table that switches nothing publishes it.
+        let here = first_frame(running) - 0x1000;
+        assert_eq!(switch_to(&source, here, here, false, not_on_it), Ok(here));
+        assert!(source.published(waiting_frame));
+        let moving = moves.begin(());
+        let lent = source.lend(&moving, waiting_frame, one_stack).unwrap();
+        assert!(
+            !source.published(waiting_frame),
+            "lent: taken from its slot"
+        );
+        assert!(lent.restore());
+        assert!(source.published(waiting_frame), "restored");
+        drop(moving);
+        // Neither the boot flow's marker nor nothing is ever a published frame.
+        assert!(!source.published(BOOT_FLOW) && !source.published(0));
     }
 
     /// N13: a full destination refuses the adoption, and the frame goes back to its source,

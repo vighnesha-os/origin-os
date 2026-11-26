@@ -707,6 +707,11 @@ pub struct Domains {
     /// Each processor's capacity, from 0 to [`crate::capacity::FULL`], in the order of
     /// `tree.cpus()`.
     pub capacity: Vec<u16>,
+    /// Whether any processor reports a cache: one of its own cache leaves, or a usable PPTT's
+    /// caches. Where none does, the tree has no cache level because nothing is known, not
+    /// because each processor has a cache of its own, and the balancer reads the two apart
+    /// (TASKS item 98; ADR-0020 S10).
+    pub caches_reported: bool,
 }
 
 /// The domains, set once at boot (ruling Q13: no per-processor table, so the count of per-CPU

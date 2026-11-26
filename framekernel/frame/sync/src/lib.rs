@@ -37,6 +37,7 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::Ordering;
 
 pub mod backlog;
+pub mod balance;
 pub mod contexts;
 pub mod exits;
 pub mod floor;

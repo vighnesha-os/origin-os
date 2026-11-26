@@ -195,6 +195,13 @@ const MOVE_GATE: &[&str] = &[
     "a holder of the move gate missed the one before it",
 ];
 
+/// What the balance models report (`models.rs`; TASKS item 98, ADR-0020 S7): a processor that
+/// became crowded and one that went idle each missed the other, and a hint left set by a processor
+/// that has since started a thread was taken for an idle one.
+const BALANCE_BOTH_MISSED: &[&str] =
+    &["a crowded processor and an idling one both missed each other"];
+const BALANCE_STALE_HINT: &[&str] = &["a stale hint was taken for an idle processor"];
+
 /// What `threads_a_stale_name_wakes_nobody` reports (TASKS item 92): a wake-up by a stale name
 /// reached the record's next thread.
 const STALE_WOKE: &[&str] = &["a stale name woke the record's next thread"];
@@ -251,6 +258,7 @@ const SLOTS: &str = "framekernel/frame/sync/src/slots.rs";
 const PORTS: &str = "framekernel/frame/sync/src/ports.rs";
 const CONTEXTS: &str = "framekernel/frame/sync/src/contexts.rs";
 const BACKLOG: &str = "framekernel/frame/sync/src/backlog.rs";
+const BALANCE: &str = "framekernel/frame/sync/src/balance.rs";
 const EXITS: &str = "framekernel/frame/sync/src/exits.rs";
 const THREADS: &str = "framekernel/frame/sync/src/threads.rs";
 
@@ -2430,6 +2438,89 @@ const CONTROLS: &[Control] = &[
         models: &[(
             "moves::mv9_the_gate_admits_one_holder_at_a_time_and_a_scans_last_pass_is_one",
             MOVE_GATE,
+        )],
+    },
+    Control {
+        // BX1a (BL1's control; TASKS item 98): the idle flow makes no fence between publishing
+        // that it is idle and looking for a crowded processor. Its look is then ordered after
+        // nothing the crowded side wrote, and the crowded side's look after nothing of its own.
+        name: "balance_idle_side_without_its_fence",
+        file: BALANCE,
+        from: "    masks.idle.set(me as usize);
+    prim::fence(SeqCst);
+",
+        to: "    masks.idle.set(me as usize);
+",
+        models: &[
+            (
+                "balance_a_crowded_and_an_idling_processor_never_both_miss",
+                BALANCE_BOTH_MISSED,
+            ),
+            (
+                "balance_neither_misses_the_other_with_stale_hints",
+                BALANCE_BOTH_MISSED,
+            ),
+        ],
+    },
+    Control {
+        // BX1b: the crowded side makes no fence between publishing its census and looking for an
+        // idle processor: the same, from the other side.
+        name: "balance_crowded_side_without_its_fence",
+        file: BALANCE,
+        from: "    own.publish(me as usize, load, &masks.crowded);
+    prim::fence(SeqCst);
+",
+        to: "    own.publish(me as usize, load, &masks.crowded);
+",
+        models: &[
+            (
+                "balance_a_crowded_and_an_idling_processor_never_both_miss",
+                BALANCE_BOTH_MISSED,
+            ),
+            (
+                "balance_neither_misses_the_other_with_stale_hints",
+                BALANCE_BOTH_MISSED,
+            ),
+        ],
+    },
+    Control {
+        // BX1c: the idle flow looks for a crowded processor before it publishes that it is idle:
+        // a processor that becomes crowded between the two finds nobody idle, and is not found.
+        name: "balance_idle_looks_before_it_publishes",
+        file: BALANCE,
+        from: "    own.idle.store(true, Release);
+    masks.idle.set(me as usize);
+    prim::fence(SeqCst);
+    choose(me, &masks.crowded, levels, element, allowed)
+",
+        to: "    let chosen = choose(me, &masks.crowded, levels, element, allowed);
+    own.idle.store(true, Release);
+    masks.idle.set(me as usize);
+    prim::fence(SeqCst);
+    chosen
+",
+        models: &[
+            (
+                "balance_a_crowded_and_an_idling_processor_never_both_miss",
+                BALANCE_BOTH_MISSED,
+            ),
+            (
+                "balance_neither_misses_the_other_with_stale_hints",
+                BALANCE_BOTH_MISSED,
+            ),
+        ],
+    },
+    Control {
+        // BX2 (BL2's control): the search for an idle processor believes the hint, and does not
+        // confirm it in the element.
+        name: "balance_a_stale_idle_hint_is_believed",
+        file: BALANCE,
+        from: "                && element(cpu).is_some_and(Element::is_idle)
+",
+        to: "",
+        models: &[(
+            "balance_a_stale_idle_hint_is_not_taken_for_an_idle_processor",
+            BALANCE_STALE_HINT,
         )],
     },
 ];

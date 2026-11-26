@@ -1769,10 +1769,14 @@ fn prove_domains(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -
             ": scheduling domains failed"
         }
     );
+    // Whether anything names a cache: a processor's own leaf, or a PPTT whose caches are used.
+    let caches_reported =
+        claims.is_some() || recorded.iter().any(|t| t.caches.leaf() != CacheLeaf::None);
     let _ = domains::DOMAINS.set(Domains {
         tree,
         node_order: order,
         capacity,
+        caches_reported,
     });
     consistent
 }

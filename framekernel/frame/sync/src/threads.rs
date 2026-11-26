@@ -43,6 +43,12 @@
 //! thread was before TASKS item 96. An affinity (ADR-0020 S11, TASKS item 100) will replace the
 //! flag.
 //!
+//! A movable thread is moved only by a directed move (`sched::migrate`) unless its spawner also
+//! declared it one that **balancing may take** ([`Record::set_balanced`]; ADR-0020 S7, TASKS item
+//! 98, the coordinating session's ruling Q10): then an idle processor may pull it. The run queue
+//! that holds the thread keeps the same declaration as a bit of its own, which a move carries; the
+//! record's copy is what a reader without that queue's lock can ask.
+//!
 //! # Locks
 //!
 //! In this order, and never the other way: a processor's run queue (two, in index order, for a
@@ -137,6 +143,9 @@ pub struct Record<S> {
     /// Whether the thread may move ([`Record::set_movable`]; the module documentation,
     /// "Movable"). One byte, in room the record had: its size does not change.
     movable: prim::AtomicBool,
+    /// Whether balancing may take the thread ([`Record::set_balanced`]; the module documentation,
+    /// "Movable"). One more byte in the same room.
+    balanced: prim::AtomicBool,
 }
 
 impl<S> core::fmt::Debug for Record<S> {
@@ -155,6 +164,7 @@ impl<S: Empty> Record<S> {
             location: prim::AtomicU64::new(CLEAR),
             state: SpinLock::new(S::EMPTY),
             movable: prim::AtomicBool::new(false),
+            balanced: prim::AtomicBool::new(false),
         }
     }
 
@@ -167,6 +177,7 @@ impl<S: Empty> Record<S> {
             location: prim::AtomicU64::new(CLEAR),
             state: SpinLock::new(S::EMPTY),
             movable: prim::AtomicBool::new(false),
+            balanced: prim::AtomicBool::new(false),
         }
     }
 }
@@ -278,6 +289,21 @@ impl<S> Record<S> {
     pub fn movable(&self) -> bool {
         self.movable.load(Acquire)
     }
+
+    /// Declares the thread one that balancing may take, and so movable (the module documentation,
+    /// "Movable"). Its spawner only, as [`Record::set_movable`].
+    pub fn set_balanced(&self) {
+        self.movable.store(true, Relaxed);
+        self.balanced.store(true, Relaxed);
+    }
+
+    /// Whether the thread was declared one that balancing may take. A fact about the thread that
+    /// does not change while it lives; a reader with a stale name may read the record's next
+    /// thread's, so nothing is decided by it without the lock of the queue that holds the thread
+    /// (the kernel's kick reads it as a hint, and then the queue's own bit under that lock).
+    pub fn balanced(&self) -> bool {
+        self.balanced.load(Acquire)
+    }
 }
 
 /// `N` records (at most 64), and which of them are held.
@@ -370,6 +396,8 @@ impl<S, const N: usize> Block<S, N> {
         // Release, after the new generation: a reader whose Acquire load finds this value also
         // finds the generation that goes with it (`Record::movable`; R96-5).
         record.movable.store(false, Release);
+        // And not one balancing may take, unless its spawner says so (TASKS item 98).
+        record.balanced.store(false, Release);
         Some((index, generation))
     }
 
@@ -1011,6 +1039,24 @@ mod tests {
         assert!(record.movable(), "given back as its thread left it");
         let _ = block.take().expect("the record again");
         assert!(!record.movable());
+    }
+
+    /// A thread balancing may take is movable too; a movable one is not thereby one balancing may
+    /// take; and the record's next thread starts as neither (TASKS item 98, ruling Q10).
+    #[test]
+    fn a_balanced_thread_is_movable_and_its_record_s_next_thread_is_neither() {
+        let block = Block::<u32, 1>::new();
+        let (index, _) = block.take().expect("a free record");
+        let record = block.get(index).expect("the record taken");
+        record.set_movable();
+        assert!(record.movable() && !record.balanced());
+        record.set_balanced();
+        assert!(record.movable() && record.balanced());
+        assert!(block.give_back(index));
+        let _ = block.take().expect("the record again");
+        assert!(!record.movable() && !record.balanced());
+        record.set_balanced();
+        assert!(record.movable() && record.balanced());
     }
 
     /// The pin count takes the room after the generation (TASKS item 93, ruling Q9): the record's

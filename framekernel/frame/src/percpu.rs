@@ -312,6 +312,7 @@ pub(crate) fn size_per_cpu(sizing: &mut Sizing) {
     sizing.table(&crate::speculation::RECORDS);
     sizing.table(&crate::speculation::LEDGERS);
     sizing.table(&crate::timer::X2APIC_READY);
+    sizing.table(&crate::timer::BALANCE_SENT);
     sizing.table(&crate::tlb::RECORDS);
     sizing.table(&crate::tlb::ASKED);
     sizing.table(&crate::tlb::GLOBAL_PAGES);

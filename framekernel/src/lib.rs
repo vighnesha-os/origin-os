@@ -125,6 +125,7 @@ macro_rules! crumb {
 pub mod acpi_census;
 pub mod acpi_text;
 pub mod aml_proof;
+pub mod balance;
 pub mod base64;
 pub mod blockcache;
 pub mod bootproof;
@@ -189,6 +190,8 @@ pub mod virtqueue;
 // framework's typed interfaces.
 #[cfg(target_os = "none")]
 mod aspace;
+#[cfg(target_os = "none")]
+mod balance_proof;
 #[cfg(target_os = "none")]
 mod block;
 #[cfg(target_os = "none")]
