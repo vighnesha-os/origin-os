@@ -208,9 +208,13 @@ impl<'a> FrameAllocator<'a> {
     /// Takes over every region of `kind` (in practice `LoaderReclaimable`, once nothing the
     /// loader or the firmware left there is in use): its frames become free, except frame 0
     /// and the reserved ranges. Returns how many frames were added.
+    ///
+    /// Once only for each kind: a kind already taken over returns 0 and changes nothing. Its
+    /// frames are this allocator's from the first call on, so a frame of it that is in use
+    /// at a second call has been handed out, and must stay so (TASKS item 143, F-1).
     pub fn reclaim(&mut self, kind: RegionKind) -> u64 {
         let raw = kind as u32;
-        if raw == RegionKind::Usable as u32 || raw >= 32 {
+        if raw == RegionKind::Usable as u32 || raw >= 32 || self.reclaimed & (1 << raw) != 0 {
             return 0;
         }
         self.reclaimed |= 1 << raw;
@@ -502,6 +506,35 @@ mod tests {
             a.free(0x20_0000),
             Err(FrameError::NotAllocatable(0x20_0000))
         );
+    }
+
+    /// A second reclaim of a kind must not take back what was handed out after the first
+    /// (TASKS item 143, F-1): every frame of the region is in use here, and stays so.
+    #[test]
+    fn a_second_reclaim_leaves_handed_out_frames_alone() {
+        let regions = [
+            region(0x1000, 1, RegionKind::Usable),
+            region(0x2000, 4, RegionKind::LoaderReclaimable),
+        ];
+        let mut bitmap = vec![0u64; words_for(covered_end(&regions)) as usize];
+        let mut a = FrameAllocator::new(&mut bitmap, &regions, &[]).unwrap();
+        assert_eq!(a.reclaim(RegionKind::LoaderReclaimable), 4);
+        let mut handed = HashSet::new();
+        while let Some(f) = a.allocate() {
+            assert!(handed.insert(f), "{f:#x} handed out twice");
+        }
+        assert_eq!(handed.len(), 5);
+        assert_eq!(a.free_frames(), 0);
+        assert_eq!(a.reclaim(RegionKind::LoaderReclaimable), 0);
+        assert_eq!(a.free_frames(), 0, "nothing handed out became free");
+        assert_eq!(a.allocate(), None);
+        for f in [0x2000, 0x5000] {
+            assert_eq!(
+                a.free(f),
+                Ok(()),
+                "{f:#x} is still its holder's to give back"
+            );
+        }
     }
 
     #[test]
