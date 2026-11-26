@@ -1430,6 +1430,11 @@ impl<R: Copy> RunQueue<R> {
 #[path = "runqueue/capacity_model.rs"]
 mod capacity_model;
 
+// TASKS item 152: integrity's pulled phase's helpers modelled on this queue, as above.
+#[cfg(all(test, not(loom)))]
+#[path = "runqueue/puller_model.rs"]
+mod puller_model;
+
 #[cfg(test)]
 mod tests {
     use super::*;
