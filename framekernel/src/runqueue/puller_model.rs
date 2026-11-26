@@ -11,7 +11,8 @@
 //! only if it is ready, not running, and not the context this processor last switched out. That
 //! context becomes movable at the processor's next switch, or at a tick that switches nothing (the
 //! kick's publication). Whether one of the phase's threads can be moved is read after every event,
-//! and judged over every three consecutive switches.
+//! and judged over every three consecutive switches, from the point every context has been
+//! switched out once: before that, a thread that has not yet run is movable as spawned.
 //!
 //! - **With two helpers** ([`two_helpers_leave_a_thread_movable_within_two_switches`]), for one or
 //!   two of the phase's threads, sleeping or not: wherever one of them stays awake from a switch to
@@ -93,6 +94,9 @@ fn run(order: &[Role], phases: [u64; 2], sleeps: bool, seed: u64) -> Seen {
         .filter(|&s| matches!(role[s], Some(Role::Thread(_))))
         .collect();
     let mut leaving: Option<usize> = None;
+    // Switches before the queue is as the phase leaves it: every context has run and been
+    // switched out once.
+    let warm = order.len() + 1;
     // Per switch count: the threads awake at every event after it (a mask by slot), and whether
     // one of them could be moved after any of those events.
     let (mut awake_all, mut movable_any): (Vec<u32>, Vec<bool>) =
@@ -164,7 +168,9 @@ fn run(order: &[Role], phases: [u64; 2], sleeps: bool, seed: u64) -> Seen {
         let movable = slots
             .iter()
             .any(|&s| q.state[s] == State::Ready && s != q.current && leaving != Some(s));
-        seen.movable += u64::from(movable);
+        if awake_all.len() > warm {
+            seen.movable += u64::from(movable);
+        }
         if let (Some(a), Some(m)) = (awake_all.last_mut(), movable_any.last_mut()) {
             *a &= awake;
             *m |= movable;
@@ -172,7 +178,7 @@ fn run(order: &[Role], phases: [u64; 2], sleeps: bool, seed: u64) -> Seen {
     }
     // Every complete window of three consecutive switch counts (the last is still open).
     let complete = awake_all.len().saturating_sub(1);
-    for n in 0..complete.saturating_sub(2) {
+    for n in warm..complete.saturating_sub(2) {
         if awake_all[n] & awake_all[n + 1] & awake_all[n + 2] != 0 {
             seen.windows += 1;
             seen.missed += u64::from(!(movable_any[n] || movable_any[n + 1] || movable_any[n + 2]));
