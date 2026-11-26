@@ -14,6 +14,7 @@ mod costs;
 mod disk;
 mod documents;
 mod expected_warning;
+mod fuzz;
 mod host_tools;
 mod image;
 mod image_inputs;
@@ -155,6 +156,11 @@ commands:
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
+  fuzz <target> [--seconds N] | replay <target> <file> | list
+              coverage-guided fuzzing with cargo-fuzz 0.13.2 on the pinned stable compiler
+              (TASKS item 144): the control, then one target for a fixed time (default 60 s,
+              at most 300 s unless CI is set; the long runs are CI's), or one input replayed.
+              Not part of check, which replays kept crashes as host tests instead
   unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction, on the
               `preserves_flags` option of assembly blocks, and on RDRAND and RDSEED, which
               only the kernel's generator and the loader's may run (part of check; quick)
@@ -4826,6 +4832,7 @@ fn main() -> ExitCode {
         ["boot-identity"] => in_turn_with_settings("boot-identity", boot_identity),
         ["run"] => in_turn_with_settings("run", run),
         ["loom"] => in_turn("loom", loom::run),
+        ["fuzz", rest @ ..] => in_turn("fuzz", || fuzz::run(rest)),
         ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
         ["exclusive", "--", command @ ..] => {
             let command: Vec<String> = command.iter().map(|s| (*s).to_string()).collect();
@@ -6126,6 +6133,7 @@ fn check() -> Result {
     for step in steps {
         run_step(cargo().args(*step))?;
     }
+    fuzz::type_check()?;
     // Libraries that run inside the boot loader and the Framekernel: clippy on the host
     // (with tests) and on both freestanding targets, then their tests. Their no-panic lints
     // are active in every non-test build.
