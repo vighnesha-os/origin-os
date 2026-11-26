@@ -523,7 +523,17 @@ fn cargo_kani(
     harnesses: &[&str],
     log: &Path,
 ) -> Result<String> {
-    let mut command = Command::new("cargo");
+    // Each run's peak memory is measured by the system's `time` (`-v` on Linux, where CI runs,
+    // `-l` on macOS), which writes it to the run's errors; [`peak_memory`] reads it there. Without
+    // one, the run goes ahead and its line says the memory was not measured.
+    let mut command = match time_option(std::env::consts::OS) {
+        Some(option) if Path::new(TIME).is_file() => {
+            let mut timed = Command::new(TIME);
+            timed.args([option, "cargo"]);
+            timed
+        }
+        _ => Command::new("cargo"),
+    };
     // `-Z stubbing`: the heap's harnesses stub core's slice rotation (`heap/proofs.rs`). Kani
     // 0.68.0 calls the feature unstable; the version is pinned.
     command
@@ -589,6 +599,42 @@ fn cargo_kani(
     }
     fs::write(log, &output).map_err(|e| format!("{}: {e}", log.display()))?;
     Ok(output)
+}
+
+/// The system's `time`, which measures a run's peak memory.
+const TIME: &str = "/usr/bin/time";
+
+/// `time`'s option that reports the peak resident memory on `os` (`std::env::consts::OS`).
+fn time_option(os: &str) -> Option<&'static str> {
+    match os {
+        "linux" => Some("-v"),
+        "macos" => Some("-l"),
+        _ => None,
+    }
+}
+
+/// The peak resident memory `time` reported in `output`, in bytes: GNU `time -v`'s
+/// "Maximum resident set size (kbytes): N", or BSD `time -l`'s "N  maximum resident set size".
+fn peak_memory(output: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        if let Some(kbytes) = line.strip_prefix("Maximum resident set size (kbytes):") {
+            return kbytes.trim().parse::<u64>().ok()?.checked_mul(1024);
+        }
+        line.strip_suffix("maximum resident set size")?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    })
+}
+
+/// `output`'s peak memory, as a run's line shows it.
+fn memory_shown(output: &str) -> String {
+    match peak_memory(output) {
+        // GB of 10^9 bytes, as the records give it.
+        Some(bytes) => format!("peak memory {:.2} GB", bytes as f64 / 1e9),
+        None => "peak memory not measured".into(),
+    }
 }
 
 /// Refuses any Kani but [`VERSION`] with its bundle's compiler.
@@ -702,39 +748,47 @@ pub(crate) fn run(only: Option<&str>) -> Result {
         .collect();
     let packages: BTreeSet<&str> = chosen.iter().map(|(p, _)| *p).collect();
     let mut problems = Vec::new();
+    // One `cargo kani` for each harness, so that each run's peak memory is that harness's (CI
+    // records it; the coordinating session's ruling of 2026-11-27 on Q4's 8 GB).
+    let mut runs = 0;
     for package in packages {
         let names: Vec<&str> = chosen
             .iter()
             .filter(|(p, _)| *p == package)
             .map(|(_, n)| n.as_str())
             .collect();
-        let filter: Vec<&str> = if only.is_some() {
-            names.clone()
-        } else {
-            Vec::new()
-        };
-        let output = cargo_kani(
-            &root,
-            None,
-            package,
-            &filter,
-            &logs.join(format!("{package}.log")),
-        )?;
-        problems.extend(proof_warnings(&output));
-        let report = parse_report(&output);
         for name in &names {
+            let output = cargo_kani(
+                &root,
+                None,
+                package,
+                &[name],
+                &logs.join(format!("{name}.log")),
+            )?;
+            runs += 1;
+            problems.extend(proof_warnings(&output));
+            let report = parse_report(&output);
             match report.iter().find(|(n, _)| n == name) {
-                Some((_, outcome)) => problems.extend(proof_problem(name, outcome)),
+                Some((_, outcome)) => {
+                    problems.extend(proof_problem(name, outcome));
+                    println!("xtask: kani: {name}: {}", memory_shown(&output));
+                }
                 None => problems.push(format!("{name}: Kani did not report it")),
             }
-        }
-        for (name, _) in &report {
-            if !names.contains(&name.as_str()) {
-                problems.push(format!(
-                    "{name}: reported, but not a harness of {PROOF_FILES_NAMES}"
-                ));
+            for (reported, _) in &report {
+                if reported != name {
+                    problems.push(format!(
+                        "{reported}: reported in {name}'s run, which asked for {name} alone"
+                    ));
+                }
             }
         }
+    }
+    if runs != chosen.len() {
+        problems.push(format!(
+            "{runs} runs for {} harnesses: each harness runs once",
+            chosen.len()
+        ));
     }
     if !problems.is_empty() {
         return Err(format!(
@@ -748,9 +802,6 @@ pub(crate) fn run(only: Option<&str>) -> Result {
     );
     controls(&root, only)
 }
-
-/// How the proof files are named in messages.
-const PROOF_FILES_NAMES: &str = "the proof files (`kani.rs`, PROOF_FILES)";
 
 /// Runs each control that names a harness chosen (every control, or those naming `only`).
 fn controls(root: &Path, only: Option<&str>) -> Result {
@@ -791,9 +842,10 @@ fn controls(root: &Path, only: Option<&str>) -> Result {
             ));
         }
         println!(
-            "xtask: kani: control {} caught by {}",
+            "xtask: kani: control {} caught by {}; {}",
             control.name,
-            harnesses.join(", ")
+            harnesses.join(", "),
+            memory_shown(&output)
         );
         ran += 1;
     }
@@ -996,6 +1048,20 @@ fn names_kani(code: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn peak_memory_reads_gnu_and_bsd_time() {
+        let gnu = "\tCommand being timed: \"cargo kani\"\n\tMaximum resident set size (kbytes): 6281920\n";
+        assert_eq!(super::peak_memory(gnu), Some(6_281_920 * 1024));
+        let bsd = "        97.07 real        95.12 user         1.90 sys\n          6431686656  maximum resident set size\n";
+        assert_eq!(super::peak_memory(bsd), Some(6_431_686_656));
+        assert_eq!(super::peak_memory("VERIFICATION:- SUCCESSFUL\n"), None);
+        assert_eq!(super::memory_shown(bsd), "peak memory 6.43 GB");
+        assert_eq!(super::memory_shown(""), "peak memory not measured");
+        assert_eq!(super::time_option("linux"), Some("-v"));
+        assert_eq!(super::time_option("macos"), Some("-l"));
+        assert_eq!(super::time_option("windows"), None);
+    }
+
     use super::*;
 
     const SAMPLE: &str = "\

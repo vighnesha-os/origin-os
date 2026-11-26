@@ -168,6 +168,9 @@ jobs:
         run: bash .github/ci/install-rust.sh
       - name: Install Kani
         run: bash .github/ci/install-kani.sh
+      # `cargo xtask kani` measures each run's peak memory with the system's `time -v`.
+      - name: Check that the system's time is there
+        run: test -x /usr/bin/time || { sudo apt-get update && sudo apt-get install -y time; }
       - run: cargo --locked xtask kani
       # Each run's full output, harness by harness and control by control. Kept when the job
       # fails too; this step never decides whether the job passes.
