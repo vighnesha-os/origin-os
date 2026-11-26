@@ -1142,6 +1142,13 @@ pub(crate) struct Row {
     decided: Vec<u32>,
 }
 
+impl Row {
+    /// What the row stands for, as its "Requirement" cell quotes it.
+    pub(crate) fn requirement(&self) -> &str {
+        &self.requirement
+    }
+}
+
 /// A cell's entries: `-` for none, or entries separated by `, `.
 fn entries(cell: &str) -> Vec<&str> {
     if cell == "-" {
@@ -2147,7 +2154,11 @@ pub(crate) fn read() -> Result<Read> {
         adrs: markdown(ADRS, &|name| name.starts_with("ADR-"))?,
         sheet: text(root.join(SHEET))?,
         readme: text(root.join(MATRIX).join("README.md"))?,
-        files: markdown(MATRIX, &|name| name != "README.md")?,
+        // The list of specifications sits beside the matrix and is not a file of rows: the
+        // progress page reads it (`specifications.rs`; owner item 374, TASKS item 151).
+        files: markdown(MATRIX, &|name| {
+            name != "README.md" && name != crate::specifications::FILE_NAME
+        })?,
     })
 }
 

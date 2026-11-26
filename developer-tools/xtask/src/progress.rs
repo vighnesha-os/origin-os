@@ -38,6 +38,7 @@ use std::fs;
 
 use crate::requirements::{self, Env, Kind, Row, State};
 use crate::roadmap;
+use crate::specifications::{self, Spec};
 use crate::{Result, repo_root};
 
 /// The page this module writes and its gate reads.
@@ -253,6 +254,9 @@ struct Inputs<'a> {
     /// Each ADR's title, and whether it is accepted.
     adrs: &'a BTreeMap<u16, (String, bool)>,
     roadmap: &'a str,
+    /// The specifications the project relies on, already checked against the matrix
+    /// ([`specifications::read`]).
+    specs: &'a [Spec],
 }
 
 /// The page, or everything that keeps it from being written.
@@ -470,7 +474,30 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
         }
     );
 
-    // 7. Details, each closed until a reader opens it, so the page opens short.
+    // 7. By specification (owner item 374; TASKS item 151).
+    let _ = writeln!(w);
+    let _ = writeln!(w, "## By specification");
+    let _ = writeln!(w);
+    let _ = writeln!(
+        w,
+        "Each specification, standard and protocol the project relies on, with the requirements that rest on it. The list is [`docs/requirements/specifications.md`](docs/requirements/specifications.md). The figures count Origin's requirements, not how much of a specification is implemented: a specification has many parts that no requirement asks for. No figure claims conformance, which needs the specification's own tests (CLAUDE.md §46). A specification with no requirement yet shows \"-\"."
+    );
+    let _ = writeln!(w);
+    let mut by_spec: Vec<(String, Tally)> = Vec::new();
+    if inputs.specs.is_empty() {
+        let _ = writeln!(w, "No specification is listed.");
+    } else {
+        let _ = writeln!(w, "| Specification | {STATES} |");
+        let _ = writeln!(w, "|---|{STATES_RULE}|");
+        for spec in inputs.specs {
+            let tally = Tally::of(specifications::rows_of(spec, rows));
+            let title = format!("{} {}", spec.name, spec.revision);
+            let _ = writeln!(w, "| {title} | {} |", tally.share_cells());
+            by_spec.push((title, tally));
+        }
+    }
+
+    // 8. Details, each closed until a reader opens it, so the page opens short.
     let _ = writeln!(w);
     let _ = writeln!(w, "## Details");
     let _ = writeln!(w);
@@ -549,13 +576,80 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
     let _ = writeln!(w);
     let _ = writeln!(w, "</details>");
 
+    // Each specification's requirements, one block each, so a reader opens only the one wanted.
+    for spec in inputs.specs {
+        let resting = specifications::rows_of(spec, rows);
+        let counted_rows: Vec<&Row> = resting
+            .iter()
+            .copied()
+            .filter(|r| counted(r).is_some())
+            .collect();
+        {
+            let _ = writeln!(w);
+            let _ = writeln!(w, "<details>");
+            let _ = writeln!(
+                w,
+                "<summary>{}. {} {}: {}</summary>",
+                spec.id,
+                spec.name,
+                spec.revision,
+                requirements_of(counted_rows.len())
+            );
+            let _ = writeln!(w);
+            let baseline = if spec.baseline.is_empty() {
+                "none".to_string()
+            } else {
+                spec.baseline.join(", ")
+            };
+            let crates = if spec.crates.is_empty() {
+                "none yet".to_string()
+            } else {
+                spec.crates
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let _ = writeln!(
+                w,
+                "Named in {}. §17 baseline: {baseline}. Implemented in: {crates}.",
+                spec.named_in
+            );
+            let _ = writeln!(w);
+            if counted_rows.is_empty() {
+                let _ = writeln!(w, "No requirement rests on it yet.");
+                let _ = writeln!(w);
+                let _ = writeln!(w, "</details>");
+                continue;
+            }
+            let _ = writeln!(w, "| Requirement | State |");
+            let _ = writeln!(w, "|---|---|");
+            for row in counted_rows {
+                let state = match counted(row) {
+                    Some(State::Done) => "done",
+                    Some(State::Built) => "built",
+                    Some(State::Partial | State::NotVerified) => "in progress",
+                    _ => "not started",
+                };
+                let _ = writeln!(
+                    w,
+                    "| {}: {} | {state} |",
+                    row.id,
+                    row.requirement().replace('|', "\\|")
+                );
+            }
+            let _ = writeln!(w);
+            let _ = writeln!(w, "</details>");
+        }
+    }
+
     let _ = writeln!(w);
     let _ = writeln!(w, "<details>");
     let _ = writeln!(w, "<summary>Exact counts</summary>");
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "The milestone and feature-area tables, with the number of requirements in each state in place of its share."
+        "The milestone, feature-area and specification tables, with the number of requirements in each state in place of its share."
     );
     let _ = writeln!(w);
     let _ = writeln!(w, "| Milestone | {STATES} |");
@@ -569,10 +663,18 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
     for (name, tally) in &areas {
         let _ = writeln!(w, "| {name} | {} |", tally.count_cells());
     }
+    if !by_spec.is_empty() {
+        let _ = writeln!(w);
+        let _ = writeln!(w, "| Specification | {STATES} |");
+        let _ = writeln!(w, "|---|{STATES_RULE}|");
+        for (name, tally) in &by_spec {
+            let _ = writeln!(w, "| {name} | {} |", tally.count_cells());
+        }
+    }
     let _ = writeln!(w);
     let _ = writeln!(w, "</details>");
 
-    // 8. How this page is made.
+    // 9. How this page is made.
     let information = rows.iter().filter(|r| r.state.is_none()).count();
     let removed = rows
         .iter()
@@ -583,7 +685,7 @@ fn page(inputs: &Inputs<'_>) -> std::result::Result<String, Vec<String>> {
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "- **From the records.** `{COMMAND}` writes it from three of them. They are the requirements matrix ([`docs/requirements/`](docs/requirements/README.md)), the headings of `CLAUDE.md` and of the ADRs, and `docs/ROADMAP.md`. Every figure is a count of requirements or a share of one, and each requirement counts as one."
+        "- **From the records.** `{COMMAND}` writes it from four of them. They are the requirements matrix ([`docs/requirements/`](docs/requirements/README.md)), the headings of `CLAUDE.md` and of the ADRs, `docs/ROADMAP.md`, and the list of specifications beside the matrix. Every figure is a count of requirements or a share of one, and each requirement counts as one."
     );
     let _ = writeln!(
         w,
@@ -610,11 +712,13 @@ fn generate() -> Result<String> {
     let titles = requirements::section_titles(&read.directive);
     let adrs = requirements::adr_titles(&read.adrs);
     let roadmap = roadmap::read()?;
+    let specs = specifications::read(&rows)?;
     page(&Inputs {
         rows: &rows,
         titles: &titles,
         adrs: &adrs,
         roadmap: &roadmap,
+        specs: &specs,
     })
     .map_err(|problems| format!("{PAGE} cannot be generated:\n  {}", problems.join("\n  ")))
 }
@@ -762,6 +866,7 @@ mod tests {
             titles,
             adrs: &adrs(),
             roadmap,
+            specs: &[],
         })
     }
 
@@ -982,8 +1087,13 @@ mod tests {
             generated(ROADMAP, &titles()).expect("the fixture's page"),
             generate().expect("the page of this tree"),
         ] {
+            // Each specification's block of details is checked below, with the others.
+            let sections: Vec<&str> = outline(&page)
+                .into_iter()
+                .filter(|l| !l.starts_with("<summary>SP-"))
+                .collect();
             assert_eq!(
-                outline(&page),
+                sections,
                 [
                     "# Origin OS progress",
                     "## Overall",
@@ -991,6 +1101,7 @@ mod tests {
                     "## Where the evidence ran",
                     "## By milestone",
                     "## By feature area",
+                    "## By specification",
                     "## Details",
                     "<summary>Each feature area, section by section</summary>",
                     "<summary>ADR decisions</summary>",
@@ -1030,7 +1141,12 @@ mod tests {
                 }
             }
             assert!(!open);
-            assert_eq!(blocks, 4);
+            // The four fixed blocks, and one for each specification (TASKS item 151).
+            let specifications = lines
+                .iter()
+                .filter(|l| l.starts_with("<summary>SP-"))
+                .count();
+            assert_eq!(blocks, 4 + specifications);
             // Nothing after the last block but how the page is made: three bullets.
             let made = lines
                 .iter()
@@ -1126,7 +1242,21 @@ mod tests {
         };
         let page = generate().expect("the page of this tree");
         let mut thousands = 0;
+        // A specification's block quotes the list and the matrix, whose names, revisions and
+        // requirements are titles, not counts (TASKS item 151); only its summary's count is the
+        // generator's.
+        let mut quoting = false;
         for line in page.lines() {
+            if let Some(summary) = line.strip_prefix("<summary>SP-") {
+                quoting = true;
+                let count = summary.rsplit_once(": ").map_or("", |(_, count)| count);
+                assert!(!four_digits(count), "a count without its comma: {line}");
+                continue;
+            }
+            if quoting {
+                quoting = line != "</details>";
+                continue;
+            }
             let written = match line.strip_prefix('|') {
                 Some(cells) => cells.split_once('|').map_or("", |(_, rest)| rest),
                 None => line,
@@ -1292,6 +1422,7 @@ mod tests {
                 titles: &titles(),
                 adrs: &adrs,
                 roadmap: ROADMAP,
+                specs: &[],
             })
             .expect_err("no accepted ADR-0017 with a title");
             assert!(
@@ -1318,6 +1449,7 @@ mod tests {
             titles: &titles(),
             adrs: &adrs(),
             roadmap: ROADMAP,
+            specs: &[],
         })
         .expect_err("no rows");
         assert!(
