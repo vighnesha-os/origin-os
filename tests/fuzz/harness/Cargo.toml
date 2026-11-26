@@ -1,0 +1,21 @@
+# The fuzz harnesses' library (TASKS item 144): input writers, the AML host and the oracle.
+# Host-only, in the fuzz workspace (`tests/fuzz/Cargo.toml`); nothing that ships depends on it.
+[package]
+name = "origin-fuzz-harness"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# Without its `derive` feature: the harnesses read an `Unstructured` directly, so no
+# procedural-macro crate is taken (the coordinating session's ruling Q3).
+arbitrary = { version = "=1.5.0", default-features = false }
+onbf-format = { path = "../../../runtime/onbf/format" }
+onbf-merkle = { path = "../../../runtime/onbf/merkle" }
+onbf-verify = { path = "../../../runtime/onbf/verify" }
+origin-aml = { path = "../../../firmware/acpi/aml" }
+origin-boot-info = { path = "../../../boot/info" }
+# The loader's library, with the test kernel key in its trust store, so the signature path
+# runs against a key a fuzzed block can name (`boot/uefi/src/trust.rs`).
+origin-boot-uefi = { path = "../../../boot/uefi", features = ["test-trust-store"] }
+origin-crypto = { path = "../../../security/crypto" }
