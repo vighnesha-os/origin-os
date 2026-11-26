@@ -733,6 +733,13 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 158. **`verify.sh` stops naming the development Mac's account in its record (CLAUDE.md §6; the repository is public). Numbered by the coordinating session on 2026-11-26; not started.**
     - **What:** `docs/toolchain/VERIFICATION.md` prints the rustup override's path under the account's home folder and the per-user temporary paths (`/var/folders/...`). `verify.sh` prints the path relative to the repository and a temporary file's name alone, as TASKS item 143 did for Kani's bundle (`~/.kani/...`), and the record is regenerated from a clean tree.
     - **Not in it:** the old copies in the repository's history. Rewriting published history is the owner's decision.
+159. **ONBF §13 item 5 for the whole image (CLAUDE.md §73; ONBF §13; rows S73-08 and S73-12). Numbered by the coordinating session on 2026-11-27; not started; after TASKS item 143's ONBF step.**
+    - **Why:** TASKS item 143's probe found that Kani 0.68.0 cannot prove `Image::parse`, its accessors or `KrnManifest::check_against` within 5 minutes and 8 GB on the development Mac in any form tried. Every image the parser can accept is at least 4 KiB (§4.1), and at that size a length Kani chooses, a write into the buffer, or the padding walk (up to 4,095 bytes from a position Kani chooses) each runs past the budget. Item 143 names them not proved: their freedom from panics rests on the proofs of their parts, the crate's denied lints and TASKS item 144's fuzzing, which samples and proves nothing. So ONBF §13 item 5 is met for the parser's parts, not for the whole image, and ONBF v1.0 is not put to the owner as final on that item's account until this is done.
+    - **The contract weighs, with figures:**
+      - restructuring the parser for verification (for example the padding checked a word at a time), its behaviour kept, shown by host tests of the old form against the new and by replaying the fuzz corpus, with the loader's and kernel's images compared;
+      - longer runs on CI only, measured first, under a limit the owner accepts;
+      - a deductive verifier (TASKS item 149, Verus).
+    - **Also in its scope:** whatever of OCBOR-1, the signature block and the manifest item 143 cannot prove within its budget.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
