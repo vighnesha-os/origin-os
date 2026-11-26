@@ -703,6 +703,14 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **The fix:** two pinned helper threads of the phase's own on each processor left to pull, woken while it holds a thread of the phase and only yielding, so that three or more contexts are ready there. They are not declared for balancing and hold no word.
     - **Controls:** a plant whose integrity threads never sleep fails on the unfixed kernel and passes on the fixed one; C98-1, 9b, 11, 12, 14 and 15b are caught again; a host model on the real run queue shows no thread movable with two threads and no helper, or one of each.
     - **Not shown:** hardware, and KVM until PR 67's CI. The entry, "### 152.", lands with the batch.
+153. **Fuzzing beyond TASKS item 144's nine targets (CLAUDE.md §72; rows S72-05 and S73-12). Numbered by the coordinating session on 2026-11-26; not started; after TASKS item 144 lands and its CI job has run.**
+    - **The targets:**
+      - the ACPI table parsers (`origin-acpi-tables`) and the SPCR's parser (`origin-spcr`), each fed directly, not only through AML's `Load` and `LoadTable`;
+      - the kernel's parsers of what a device hands it: PCIe capability lists, NVMe's Identify data and completions, and the virtio network device's descriptors;
+      - the ML-DSA-65 verifier with a real test key, in place of a stand-in key's bytes.
+    - **The first question,** for the coordinating session before any code: whether the kernel's parsers are fuzzed through the kernel library's host build, or first moved into crates of their own. Either way, nothing in the kernel gains a dependency, and every fuzzed crate keeps forbidding `unsafe`.
+    - **As in item 144:** stable Rust 1.100.0 with `--sanitizer none`, seeds generated from fixed bytes, a planted control per target, one CI job per target, and any crash reported to the coordinating session as a security finding before its fix.
+    - **Not in it:** IMAGE_FS, which is not built yet; it gets its target when it is.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
