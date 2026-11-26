@@ -1,0 +1,26 @@
+name: Specification or design question
+description: Something in an ADR, a specification under docs/spec/ or a requirement in the matrix is unclear, wrong or contradicts the code.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: For a general question, use [Discussions](https://github.com/vighnesha-os/origin-os/discussions). This form is for a document that needs a change or an answer.
+  - type: input
+    id: document
+    attributes:
+      label: Document and section
+      description: For example `docs/spec/ONBF.md` §4.2, `docs/adr/ADR-0020-scheduling.md` S7, or requirement S73-02.
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: The question
+      description: What is unclear, and what you would expect it to say.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: The code, the test or the external specification that disagrees with the document, with its revision.
