@@ -6169,5 +6169,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - The harness's 6 tests pass. Their figures, of 300 inputs each, are in TASKS item 144's entry.
   - `fuzz.rs`'s tests and `host_tools`' tests pass, among them the planted controls of item 365's rule: a `run` outside the listed functions, and a lone `run`.
   - Each target ran 60 s in a turn on 2026-11-26 and found nothing, and the control was found in every run. The table is in TASKS item 144's entry, with the measurement of the AML targets' memory.
+  - `developer-tools/toolchain/verify.sh` on `02db26b0`: 22 passed and none failed, cargo-fuzz's check among them (`docs/toolchain/VERIFICATION.md`, committed at `bd70d2ab`).
+  - `cargo xtask check` on `bd70d2ab`, with its type-check of the fuzz workspace: "check passed" (2,827 host tests, `xtask`'s 447 and 125 among them; 93 Loom models; 144 negative controls).
 - **Review:** **No person and no second agent has reviewed it.** The coordinating session ruled on the contract (Q1 to Q17) and read the step 1 report.
 - **Known limits:** in TASKS item 144's entry. No crash was found, so no regression test exists yet. Without a sanitizer, memory errors in `std` and `alloc` go unseen, and only libFuzzer's polled RSS limit bounds memory. The fuzz jobs have not run in CI.
