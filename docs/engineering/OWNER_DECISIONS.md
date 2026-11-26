@@ -1737,9 +1737,9 @@ On 2026-11-26 you wrote that `PROGRESS.md` should show the specifications, such 
 Item 372 waited for a contact address for conduct reports. The coordinating session advised an address used only for the project, for example an alias that forwards to your inbox, because an address in a public repository stays in its history and is harvested for spam. On 2026-11-26 you chose your own address, and gave it to be published.
 
 - **How it was added:** through GitHub's code-of-conduct template, in your browser at your word ("use google chrome and do if need or use gh tool"). It was committed to the branch `docs/code-of-conduct` and lands by pull request. `CODE_OF_CONDUCT.md` holds the address; this sheet does not repeat it.
-- **One difference from the item:** item 372 named the Contributor Covenant 2.1, but GitHub's template is version 2.0, and the file says so in its attribution.
-  - That commit's message says "2.1" by mistake. The file's own text is the record.
-  - The two versions differ mainly in wording and attribution, not in the rules. The coordinating session did not rewrite the text.
-  - Version 2.1 can replace it later, if you want it.
+- **The version:** GitHub's template turned out to be the Contributor Covenant 2.0, and you then asked for 2.1 ("Change to 2.1"). So `CODE_OF_CONDUCT.md` is version 2.1, exactly as the Contributor Covenant's own site publishes it. The Markdown, 5,480 bytes, SHA-256 `977d781349351fd7c1f076e4c7dc7de2a05b40e12c773542c3815dd4ce7f37ba`, came from `https://www.contributor-covenant.org/version/2/1/code_of_conduct/code_of_conduct.md` on 2026-11-26.
+  - Only two things differ from that file: its leading blank line is gone, and your address fills the contact placeholder.
+  - It is licensed CC BY 4.0, and its own attribution section credits it.
+  - The branch's first commit, from GitHub's template, says "2.1" in its message although it added 2.0; the commit after it replaces the text with 2.1.
 - **The identifier scans:** sessions scan their commits for personal data before they push. Your address in `CODE_OF_CONDUCT.md` is there by your choice, and a scan that finds it there is not a finding.
 - **Also:** `CONTRIBUTING.md` and `README.md` link the code of conduct.
