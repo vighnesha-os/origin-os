@@ -1672,3 +1672,41 @@ On 2026-11-26 you asked whether Verus could be used. CLAUDE.md §73 already asks
   - this sheet;
   - TASKS item 149's line;
   - the "Decided by" column of matrix row S73-03.
+
+### GitHub as a view of the records: tickets, board, templates, code of conduct, milestones and Discussions (items 367 to 373): Accepted 2026-11-26
+
+On 2026-11-26 you asked for tickets in GitHub, a board like Kanban or JIRA, a pull request template, issue templates, a code of conduct, and a roadmap plan. The coordinating session checked the repository:
+- issues and Projects were on, with no issues, no milestones, no templates and no code of conduct;
+- the labels were GitHub's defaults;
+- Discussions were off;
+- the session's GitHub login has no permission to create a Projects board.
+
+It put seven items, with a recommendation for each. You answered "Accept all".
+
+| # | Question | Answer |
+|---|---|---|
+| 367, answered | Is GitHub a view of the records, with `TASKS.md`, the requirements matrix and `docs/ROADMAP.md` staying authoritative (CLAUDE.md §79)? | **Accept** |
+| 368, answered | Are tickets generated from `TASKS.md` by a CI job on each push to `main`, one issue per open backlog item, never typed by hand? | **Accept** |
+| 369, answered | GitHub milestones M0 to M13 and "Server edition", with no due dates, each linking to its exit tests in `docs/ROADMAP.md`? | **Accept** |
+| 370, answered | One Kanban board, "Origin OS" (Backlog, In progress, In the batch, Done), created by you in GitHub's web interface, or after you grant the `project` permission yourself? | **Accept** |
+| 371, answered | Issue forms (bug report, feature request, specification question; blank issues off; security reports pointed to `SECURITY.md`), a pull request template taken from `CONTRIBUTING.md`, and labels by type and area? | **Accept** |
+| 372, answered | A code of conduct, the Contributor Covenant 2.1, credited as its CC BY 4.0 licence requires, with reports to a contact address you choose and publish? | **Accept**, once you name the address |
+| 373, answered | GitHub Discussions switched on, for questions? | **Accept** |
+
+- **Why a view and not a second backlog:** hand-made tickets would drift from `TASKS.md` and the matrix, which `cargo xtask check` holds to the tree.
+- **What acceptance covers:** publishing these on the public repository: the template files, the labels, the milestones, and the generated issues once TASKS item 150 lands. It also covers switching on Discussions in the repository's settings.
+- **The order:**
+  1. This pull request: the records, the issue forms and the pull request template.
+  2. After it merges: the labels, the milestones and Discussions, created by the coordinating session.
+  3. The board: created by you.
+  4. The generated issues: when TASKS item 150 lands.
+- **What stays yours:**
+  - creating the board, or granting the permission that lets it be created;
+  - the contact address for conduct reports. Your personal email stays private, and no account or mailbox is created for you. `CODE_OF_CONDUCT.md` waits until you name the address.
+- **Performance cost** (ADR-0018 V3): none, by construction: repository settings, documents and a CI job.
+- **Where it is written:**
+  - this sheet;
+  - matrix rows S79-01 and S79-09;
+  - the requirements README's table of items without rows (369 to 373);
+  - TASKS item 150's line;
+  - `.github/ISSUE_TEMPLATE/` and `.github/pull_request_template.md`.
