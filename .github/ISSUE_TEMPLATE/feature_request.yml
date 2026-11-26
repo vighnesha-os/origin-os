@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose something Origin OS should do.
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Larger changes are discussed before any code is written ([CONTRIBUTING.md](https://github.com/vighnesha-os/origin-os/blob/main/CONTRIBUTING.md), section 3).
+
+        Decisions on binary interfaces and formats, on the product's scope and on runtime dependencies are the owner's.
+  - type: textarea
+    id: what
+    attributes:
+      label: What Origin OS should do
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: The requirement, use or problem it serves. A requirement in `docs/requirements/` can be named by its ID.
+    validations:
+      required: true
+  - type: textarea
+    id: specification
+    attributes:
+      label: Specification
+      description: The specification or standard it follows, with its revision and date (CLAUDE.md §16).
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

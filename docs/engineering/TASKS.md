@@ -628,6 +628,96 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 135. **`xtask`'s I/O APIC marker takes the count the kernel's proof takes (ADR-0013 R1(b)). Numbered by the coordinating session on 2026-11-22; built on 2026-11-23 on `claude/bold-robinson-85f8ec` (its entry, "134 and 135", below); not landed.** The kernel's proof passes when 20 or more PIT interrupts arrive through the I/O APIC (`framekernel/src/irq.rs`, `taken >= PROOF_TICKS`), and prints the count it took. `xtask`'s marker demands the literal text "20 PIT interrupts", in two places in `developer-tools/xtask/src/main.rs`. When one more interrupt lands before the entry is masked, the kernel prints 21 and passes, and `xtask` fails the boot as "first missing marker". Seen once, on the 65-processor Intel machine under host load: TASKS item 96's turn 30, base 65-1, on `0ebef78b`'s code. This item makes `xtask`'s check take any count the kernel's own condition takes, with a planted control for a count below 20.
 136. **The IPC ping-pong's crossing condition made independent of timing (ADR-0013 R1(b)). Numbered by the coordinating session on 2026-11-23, from TASKS item 134's contract (Q2); not started.** The ping-pong of `ipc_proof` passes only if its two processes blocked at least once between them and, on two processors, at least one wake-up crossed (`blocked.0 + blocked.1 > 0 && (far == bsp || wakes > 0)`). Both rest on the schedule: a run in which neither process ever found the other's message missing would block 0 times and cross nothing, with every one of its 1,000 round trips right. That is remote, and no boot has shown it. Its count of blocks also counts a block that returned at once on a kept wake-up. It has no single order to force, as TASKS item 134's two cases had, so its fix is its own. The independent review of items 134 and 135 lists it first among its follow-ups.
 137. **The progress page at the repository root, clean and clear (owner items 356 and 357). Numbered by the coordinating session on 2026-11-23; built on 2026-11-23 and 2026-11-25 on `claude/t137-progress-page` (its entry, below); not landed.** `docs/PROGRESS.md` moves to `PROGRESS.md` at the root. `cargo xtask progress` writes it there, and the gate in `cargo xtask check` reads it there (`developer-tools/xtask/src/progress.rs`, its help text and its tests). The README's link follows, and so does every reference that names the page's place. Records that describe the page as it was built stay as they are. The generator also gives the page a new layout: each table shows done, built, in progress and not started as percentages that add up to 100%, nothing adds two states together, the states are explained in plain words, and the long tables sit in sections a reader opens. Items 193 and 221 stand. It lands with the next code batch, since it changes `xtask`. Item 136's line comes with the records of TASKS items 134 and 135.
+138. **Other proofs' waits and counts, and a crossing count each case can call its own (TASKS items 134 and 135's review). Numbered by the coordinating session on 2026-11-23; not started.** The review left seven notes, none of them in that change:
+    1. `byte_quota`'s wait for the writer to reach its wait, whose result is not required (`ipc_proof.rs`);
+    2. `memory_goes_with_the_last_thread`'s reap, which may find no zombie;
+    3. waits of 5 s where a wait on another processor's thread is given 10 s elsewhere (`ipc_proof.rs`, `events_ports.rs`, `kernel_bound.rs`, `core_pin.rs`);
+    4. `virtionet.rs`'s `blocked > 0 && wakes > 0`, which rests on a 10 ms settle;
+    5. a refused start of the second process leaves the waiter blocked for good, as it did before that change;
+    6. `runqueue.rs`'s stranded doc comments (`has_room`'s above `describe`, `Departed`'s above `SlotState`);
+    7. `process.rs`'s doc of `waiting`, which counts a port's waiters too.
+    - **Also:** `CROSS_CPU_WAKES` is one counter for the whole kernel, so a background service that woke threads across processors would make another case's `wakes > 0` true. Each case gets a count of its own. Each change is judged against ADR-0013 R1(b).
+139. **A standing gate for the blocked-first order (TASKS items 134 and 135's review, R134-3). Numbered by the coordinating session on 2026-11-23; not started.** `exit_closes` and `process_terminated` start the second process only once the waiter is seen blocked (ADR-0013 R1(b)). A check in `cargo xtask check` holds that order, so a later edit cannot start the second process first.
+140. **`boot-matrix`'s usage line and `Cargo.toml`'s `default-members` (TASKS item 137's review, follow-ups 1 and 2). Numbered by the coordinating session on 2026-11-25; not started.** The usage line leaves out machines it runs: `boot-reserved`, `boot-acpi`, `boot-listed`, `boot-sparse` and `boot-domains`. `default-members` leaves out `sdk/directory` and `services/directory`, which `check` lints and tests on the host.
+141. **A placement control for B1 under emulation (TASKS item 98's turn T1). Numbered by the coordinating session on 2026-11-25; not started.** Under QEMU's software processor, B1 moved by 7 to 9 % between builds whose switch-path code is the same: a commit that added only counters off the switch path took the tip's mean on the 65-processor machine from 2,033 to 1,885 cycles. That is more than the changes TASKS item 92's rule is meant to judge. The control pins the switch path's code placement in the base's and the tip's comparison builds (for example with lld's `--symbol-ordering-file`). It shows the variation that is left, and is recorded as part of ADR-0018 V7's method. Until it lands, a scheduling item's B1 comparison still runs: a rise of more than 10 % above the base's range stops the item, and a smaller difference is judged on static counts.
+142. **Each per-processor table on a line of its own (TASKS item 98's static listing). Numbered by the coordinating session on 2026-11-25; not started.** The boot processor's run queue starts 24 bytes into a 64-byte line. The other processors' queues are consecutive elements whose stride is not a multiple of 64 (1,080 bytes at the base, 1,432 with TASKS item 98), so each queue's lock shares a line with the next queue's first fields. Each processor's element of a `PerCpu` table starts on a line of its own. First check that no assembly or fixed offset depends on today's layout. QEMU models no cache, so the figure it is judged by comes from hardware (ADR-0018 V9).
+143. **Kani's first proofs (owner item 358; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-25; not started.** `kani-verifier` is installed at a version read on the day, and it and its bundled compiler are recorded in `docs/toolchain/VERIFICATION.md`. The bundle verifies, and builds nothing that ships.
+    - **First harnesses:** the frame allocator's and the heap's invariants (rows S73-02 and S73-04);
+    - **then** the ONBF parsers' bounds (ONBF §13 item 5; row S73-08);
+    - **then** capability validation (row S73-07).
+    - Each harness states what it proves and within which bounds (row S73-12). It runs as `cargo xtask kani` and as a CI job on standard runners.
+144. **Coverage-guided fuzzing on stable Rust (owner item 359). Numbered by the coordinating session on 2026-11-25; not started.**
+    - **First, a smoke harness** shows whether `cargo fuzz` with `--sanitizer none` builds and runs with Rust 1.100.0. cargo-fuzz 0.13.2's source skips its toolchain check and adds no `-Z` flag in that case, but that is not shown on this host yet. If it needs nightly, it falls under item 360.
+    - **Then, structure-aware harnesses** (`arbitrary`): the ONBF parsers and loader (ONBF §13 item 3) and the AML interpreter; later the ACPI table parsers and OCBOR-1.
+    - **What is kept:** the corpus, and every crash, minimized, as a regression test. CI runs each target for a fixed time. The seeded mutation soaks stay.
+    - `libfuzzer-sys` and `arbitrary` are host-only dependencies, reviewed under CLAUDE.md §5 first.
+    - **Running the targets (owner item 365):** `cargo xtask fuzz` may give `run`, `tmin` and `cmin` to cargo-fuzz, in `developer-tools/xtask/src/fuzz.rs` only, named in `host-tools-gate`, with a planted control showing that `run` anywhere else is still refused (ADR-0011 Amendment 4, T1's note of 2026-11-26).
+145. **Miri, on a pinned nightly used only by test tools (owner items 360 and 361). Numbered by the coordinating session on 2026-11-25; not started.**
+    - **The nightly:** a toolchain file of its own pins one nightly by date and commit (row S12-08). Only `cargo xtask miri` uses it, and a gate holds every build, check and release on 1.100.0 (row S12-09).
+    - **In CI only (owner item 364):** the nightly is installed only on CI's runners, never on the development Mac. Every Miri run, while it is built as well as after, runs in a CI job of its own. How its branch reaches CI before it lands, through the batch's pull request or a draft pull request of its own, is settled in its contract, and any push waits for the owner's word.
+    - **What Miri runs:** the host tests of crates that hold `unsafe`, starting with `origin-sync` and the run queue it compiles. Code with inline assembly or device access stays out.
+    - **The records** state what it found and what it cannot see (row S13-06).
+146. **Shuttle beside Loom (owner item 362). Numbered by the coordinating session on 2026-11-25; not started.** `shuttle` becomes a host-only dev-dependency once CLAUDE.md §5's review passes. Origin's sync shims map to Shuttle's types as they map to Loom's.
+    - **First models:** ADR-0020's balancing (asks, pulls and kicks) across many processors, which Loom's bounded search cannot reach;
+    - **then** IPC.
+    - Every Shuttle result is recorded as tested, not proved. The Loom models stay the proofs within their bounds.
+147. **Proptest for the allocators and the ONBF packer (owner item 363). Numbered by the coordinating session on 2026-11-25; not started.** `proptest` becomes a host-only dev-dependency once CLAUDE.md §5's review passes.
+    - **Allocators:** model-based tests of the frame allocator, the heap and the slab table, using random sequences of allocations and frees checked against a simple model and shrunk to the smallest sequence that fails.
+    - **ONBF:** pack-then-parse round trips through `onbf-pack`'s library.
+    - The seeded soaks stay.
+148. **Whether the ask is needed (TASKS item 98's control C98-3). Numbered by the coordinating session on 2026-11-26; not started.** A kernel that never sends ADR-0020 Amendment 1's ask passes every proof. In the "load balancing" proof, "two alone" was taken by a kick at a tick, not through an ask, so the ask is shown only by its bound (C98-8) and its counts. This item finds which is true:
+    - **A case only the ask passes:** a proof case where only the ask makes a waiting frame lendable. C98-3 must then be caught.
+    - **No such case:** a finding that no reachable case needs the ask. It goes to the owner under ADR-0018 V1, since the ask's cost (CL62) would then buy nothing, and the ask may be withdrawn.
+149. **Verus evaluated on one small module (CLAUDE.md §73, row S73-03; owner item 366). Numbered by the coordinating session on 2026-11-26; not started; after TASKS item 143's allocator proofs land.**
+    - **The experiment:** verify one small module for all sizes, with no bounds. The first candidates are the frame allocator's bitmap operations and the heap's size planning, so the result can be set beside Kani's bounded proofs of the same code.
+    - **Where it runs:** in a crate kept apart from the shipping build. Verus and its solver are installed only on CI's runners (owner item 366). The session pushes its own branch and keeps one draft pull request open from it, so CI runs its proofs. That pull request is never merged: the work lands through the batch.
+    - **The choice it reports:** either verify a separate copy of the code and check that the copy does not drift from the real one, the approach Asterinas's published work describes; or annotate the real code, which makes the kernel's build depend on Verus's crates. That second form is a CLAUDE.md §5 exception, for the owner.
+    - **The report:**
+      - the effort it took;
+      - what it proves beyond Kani;
+      - Verus's exact Rust toolchain and solver versions;
+      - the copy-or-dependency choice;
+      - the CI cost;
+      - the next targets it suggests: the page tables, and the scheduler's `lend`.
+    - **Sources:** Verus's own documentation, and Asterinas's published papers and blog for the approach only. No other project's proofs or source are read (CLAUDE.md §3).
+150. **GitHub issues generated from `TASKS.md` (owner items 367 and 368). Numbered by the coordinating session on 2026-11-26; not started.**
+    - **The rule:** `TASKS.md`, the requirements matrix and `docs/ROADMAP.md` stay authoritative (CLAUDE.md §79). GitHub's issues are a view of them, and nobody edits a generated issue's title or body by hand.
+    - **What it builds:**
+      - a library first, with a thin command (ADR-0011 Amendment 4, T1), that reads `TASKS.md` and computes, for each backlog item, the issue it should have: title "TASKS n: …", the item's text, a link to its line, labels, and open or closed (closed once the item says it has landed or is done);
+      - a CI job, on each push to `main` only, that applies that plan through GitHub's API with the workflow's own token, given permission to write issues and nothing more;
+      - a dry run that prints the plan, host-tested, and never touches GitHub.
+    - **Its properties:** idempotent, so running it twice changes nothing the second time. It creates or updates only issues it made, marked as generated, and never edits or closes an issue a person opened. It never writes `TASKS.md`.
+    - **Outside reports** arrive through the issue forms (item 371). The coordinating session sorts them into `TASKS.md`, and the generated issue then links back to the report.
+    - **Not in it:** the board's own automation (item 370), which the owner sets in the board's settings.
+151. **Specifications and standards on the progress page (owner item 374). Numbered by the coordinating session on 2026-11-26; not started.**
+    - **The list:** a new file, `docs/requirements/specifications.md`, with one row per specification, standard or protocol the project relies on. It starts from CLAUDE.md §17's baseline, the ADRs and the provenance table's "Applicable specifications": vendor documents such as Intel's SDM and AMD's APM; external standards such as ACPI 6.6, UEFI 2.11, NVMe Base 2.4 and FIPS 204; and Origin's own specifications, ONBF and OIDL.
+    - **Each row gives:**
+      - the name, the revision and the date it was confirmed;
+      - where the project names it;
+      - the matrix rows whose acceptance rests on it;
+      - the crates that implement parts of it, by the provenance table.
+    - **The gate:** every standard of §17 is listed, and every row ID named exists. A specification with no rows yet is still listed, and says so.
+    - **The page:** `cargo xtask progress` adds a section with, for each specification, its rows by state (done, built, in progress, not started) as counts and as percentages that add up to 100%. Each specification's rows can be opened, each with its state.
+    - **What the figures mean,** stated on the page: they count Origin's requirements that rest on each specification. They do not measure how much of the specification is implemented, since a specification has many parts that no requirement asks for. No figure claims conformance.
+152. **Integrity's pulled phase made structural on two processors (ADR-0013 R1(b); ADR-0020 S5). Numbered by the coordinating session on 2026-11-26; built by the TASKS item 98 session and cleared for `land/batch-11` the same day.**
+    - **Why:** PR 67's CI failed the phase on its 2-processor machines with no ask and no move back. With two contexts alternating on a processor, the waiting one is always the context just switched out, which the boot flow may not take (R98-1), so a move back waited for that processor to idle: a run order, and a proof that a correct kernel can fail.
+    - **The fix:** two pinned helper threads of the phase's own on each processor left to pull, woken while it holds a thread of the phase and only yielding, so that three or more contexts are ready there. They are not declared for balancing and hold no word.
+    - **Controls:** a plant whose integrity threads never sleep fails on the unfixed kernel and passes on the fixed one; C98-1, 9b, 11, 12, 14 and 15b are caught again; a host model on the real run queue shows no thread movable with two threads and no helper, or one of each.
+    - **Not shown:** hardware, and KVM until PR 67's CI. The entry, "### 152.", lands with the batch.
+153. **Fuzzing beyond TASKS item 144's nine targets (CLAUDE.md §72; rows S72-05 and S73-12). Numbered by the coordinating session on 2026-11-26; not started; after TASKS item 144 lands and its CI job has run.**
+    - **The targets:**
+      - the ACPI table parsers (`origin-acpi-tables`) and the SPCR's parser (`origin-spcr`), each fed directly, not only through AML's `Load` and `LoadTable`;
+      - the kernel's parsers of what a device hands it: PCIe capability lists, NVMe's Identify data and completions, and the virtio network device's descriptors;
+      - the ML-DSA-65 verifier with a real test key, in place of a stand-in key's bytes.
+    - **The first question,** for the coordinating session before any code: whether the kernel's parsers are fuzzed through the kernel library's host build, or first moved into crates of their own. Either way, nothing in the kernel gains a dependency, and every fuzzed crate keeps forbidding `unsafe`.
+    - **As in item 144:** stable Rust 1.100.0 with `--sanitizer none`, seeds generated from fixed bytes, a planted control per target, one CI job per target, and any crash reported to the coordinating session as a security finding before its fix.
+    - **Not in it:** IMAGE_FS, which is not built yet; it gets its target when it is.
+154. **A Kani proof of the frame allocator's `reclaim` (CLAUDE.md §73; rows S73-02 and S73-04). Numbered by the coordinating session on 2026-11-26; not started; after TASKS item 143 lands.**
+    - **Why:** TASKS item 143 leaves `reclaim` out of Kani's claim. It calls `allocatable`, which walks all 8 reserved-range slots, so any proof that reaches it needs an unwind bound of at least 9. At 9 its symbolic execution had not finished after 600 s on the development Mac, with 3 regions or 2; at 8 it took 267 s and 7.5 GB and failed the unwinding check. Its host tests stay.
+    - **The contract weighs, with figures:**
+      - a model with concrete region kinds, stating exactly what it narrows from "any kind";
+      - or a change to `reclaim`'s or `allocatable`'s loops that keeps their behaviour, shown by host tests of the old form against the new, and makes the walks countable. A change to the allocator's code is reviewed as one.
+    - **Within item 143's rules:** each local run under 5 minutes and 8 GB; on CI's standard runner, 15 minutes and 8 GB per harness, or the bound comes down and the records state it.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
@@ -636,7 +726,6 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 |---|---|---|
 | — | The owner cannot buy machines for now. The steps that need the owner (sign-ups and small rentals) are in `docs/research/2026-11-09-testing-without-buying-hardware.md`; ADR-0009's choices (#2, then #5 once its serial option is confirmed, H5) stand for when that changes | The first physical boot (§74) |
 | 77 | A trademark search for the product name (vivo has shipped "OriginOS" worldwide since 2025-10-15) | The first public release (§76) |
-| 79 | Turn on GitHub's private vulnerability reporting (Settings → Security) | `SECURITY.md` being useful (§60) |
 | 78 | An organisation that can hold an EV certificate and pass Microsoft's annual audit | The Microsoft-signed first stage (ADR-0002 Amendment 1) |
 | 106 | Read revision 7.4's wording, and say whether the records pull request may merge | CLAUDE.md 7.4, ADR-0014, ADR-0015 and items 71–123 reaching `main` |
 | 122 | Confirm ADR-0009's text, which was delegated and not reviewed, and ADR-0007's two additions marked "for the owner's review" | Their acceptance being the owner's own (§18) |

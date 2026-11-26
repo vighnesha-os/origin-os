@@ -1,0 +1,62 @@
+name: Bug report
+description: Origin OS does something its specification or documentation says it should not.
+title: "Bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting it.
+
+        - **A security vulnerability?** Do not report it here. [SECURITY.md](https://github.com/vighnesha-os/origin-os/blob/main/SECURITY.md) says how to report it privately.
+        - **Leave out** personal data, keys, tokens, serial numbers and network addresses, from the logs too.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce it
+      description: The exact commands, from a clean checkout.
+      placeholder: |
+        1. git checkout <commit>
+        2. cargo xtask boot-test
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Source revision
+      description: The commit you ran, from `git rev-parse HEAD`.
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Where it ran
+      options:
+        - Host tests (cargo xtask check)
+        - QEMU, software processor (TCG)
+        - QEMU under KVM
+        - A physical machine
+    validations:
+      required: true
+  - type: textarea
+    id: environment-details
+    attributes:
+      label: Environment details
+      description: |
+        - the host's operating system;
+        - `rustc -vV`;
+        - the QEMU version;
+        - on a physical machine, its processor and firmware version.
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The serial log or the command's output.
+      render: text

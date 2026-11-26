@@ -1548,3 +1548,198 @@ On 2026-11-23 you wrote: "Can you make PROGRESS.MD clean and clear". That is ite
 - **If you want the layout changed** once you see it, say so, and the generator is changed: nothing in it is a decision of yours except that it be clean and clear.
 - **Performance cost** (ADR-0018 V3): none, by construction: a generated document and a host tool.
 - **Where it is written:** this sheet; the requirements README's table of items without rows; TASKS item 137's line.
+
+### Verification tools: Kani, fuzzing, Miri, Shuttle and Proptest (items 358 to 363): Accepted 2026-11-25
+
+On 2026-11-25 you asked whether five tools could be added:
+- Miri (`cargo miri test`);
+- Kani;
+- Shuttle, randomized concurrency testing for state spaces too large for Loom's exhaustive search;
+- Proptest, for the memory allocators and binary packers;
+- cargo-fuzz harnesses for the ONBF loader and the AML interpreter.
+
+The coordinating session checked them against CLAUDE.md and the records, and put six items, with a recommendation for each. You answered "Accept all".
+
+| # | Question | Answer |
+|---|---|---|
+| 358, answered | Start Kani now, as CLAUDE.md §73 requires: the allocator's invariants first, then the ONBF parsers' bounds, then capability checks? | **Accept** |
+| 359, answered | Try cargo-fuzz on stable Rust first, with `--sanitizer none`, on the ONBF parsers and loader and the AML interpreter? | **Accept** |
+| 360, answered | Allow one pinned nightly toolchain, used only by test tools, under CLAUDE.md §12? | **Accept** |
+| 361, answered | Run Miri on the host-tested crates that hold `unsafe`, starting with `origin-sync`? | **Accept** |
+| 362, answered | Add Shuttle beside Loom, as a test-only dependency? | **Accept** |
+| 363, answered | Add Proptest, as a test-only dependency, for the allocators and the ONBF packer? | **Accept** |
+
+- **What was found first:**
+  - **Kani:** §73 already requires it, and the matrix rows S73-02 and S73-04 name it. Nothing has been written for it yet.
+  - **Fuzzing:** the records say coverage-guided fuzzing was not done because cargo-fuzz needs nightly (§12). The source of cargo-fuzz 0.13.2, read on docs.rs on 2026-11-25, skips its toolchain check and adds no `-Z` flag when it runs with `--sanitizer none`. That it builds with Rust 1.100.0 is not shown yet. ONBF §13 item 3 already asks for structure-aware fuzzing.
+  - **Miri:** it ships only with nightly Rust. §12 allows a nightly path that is pinned, kept apart and documented.
+  - **Shuttle** (awslabs, Apache-2.0): it samples schedules for many threads. It finds bugs with a probability per run and proves nothing.
+  - **Proptest:** the project's own seeded soaks have no shrinking (row S72-03's limitation).
+- **What each item decides:**
+  - **358:** Kani's first proofs, recorded with its version and its bundled compiler, which verifies and builds nothing that ships (TASKS item 143).
+  - **359:** a smoke check of cargo-fuzz on 1.100.0 first, then harnesses. If it needs nightly after all, it comes under item 360 (TASKS item 144).
+  - **360:** one nightly, pinned by date and commit, used only by test tools. A gate holds every build, check and release on 1.100.0 (TASKS item 145).
+  - **361:** Miri on the host tests of crates that hold `unsafe`. The kernel's assembly and device access stay out of reach (TASKS item 145).
+  - **362:** Shuttle beside Loom, first for ADR-0020's balancing across many processors. Its results are recorded as tested, not proved (TASKS item 146).
+  - **363:** Proptest for allocator model tests and ONBF pack-then-parse round trips (TASKS item 147).
+- **Downloads:** accepting covers each of these once, at a version read on the day:
+  - `kani-verifier` and its compiler bundle;
+  - cargo-fuzz, `libfuzzer-sys` and `arbitrary`;
+  - `shuttle` and `proptest`;
+  - one pinned nightly toolchain with Miri.
+  The two dependencies go through §5's review before they are added.
+- **Order:**
+  1. TASKS item 144's smoke check, then TASKS items 143 and 147;
+  2. TASKS item 146;
+  3. TASKS item 145.
+  Most runs are in CI, on standard runners, so the Mac stays free for timing turns.
+- **What does not change:**
+  - Every build, check and release stays on Rust 1.100.0 (§8, §12).
+  - Nothing these tools bring ships (§5).
+  - The seeded soaks and the Loom models stay.
+  - Kani proves only bounded properties. Fuzzing, Shuttle and Proptest find bugs and prove nothing, and the records say which is which (row S73-12).
+- **Performance cost** (ADR-0018 V3): none, by construction. These are host-only tools, and nothing is on the kernel's paths.
+- **Also recorded:** GitHub's private vulnerability reporting is on (checked through GitHub's API on 2026-11-25). Item 79's last step is done, so TASKS' table of what waits on you no longer lists it.
+- **Where it is written:**
+  - this sheet;
+  - the "Decided by" column of matrix rows S12-07 to S12-09, S13-06, S72-03 to S72-06, S73-02, S73-04, S73-07 and S73-08;
+  - TASKS items 143 to 147.
+
+### Miri's nightly in CI only (item 364): 2026-11-26
+
+Item 360 allowed one pinned nightly toolchain, used only by test tools, and TASKS item 145 builds Miri on it. On 2026-11-26 the coordinating session asked where that nightly may be installed. It recommended the development Mac as well as CI: installed under its exact date name, never the default and never an override, called only by `cargo xtask miri`, so that a Miri finding can be reproduced and debugged in minutes. You answered "CI only".
+
+| # | Question | Answer |
+|---|---|---|
+| 364, answered | May Miri's pinned nightly be installed on the development Mac, or only on CI's runners? | **CI only** |
+
+- **What it decides:**
+  - no nightly toolchain is installed on the development Mac;
+  - every Miri run happens in a CI job of its own, on GitHub's standard runners, both while TASKS item 145 is built and afterwards;
+  - item 360's other terms stand: one nightly, pinned by date and commit, used only by test tools, with every build, check and release on Rust 1.100.0.
+- **What it costs:**
+  - debugging a Miri finding waits for a CI run each time;
+  - CI runs only for pull requests and for pushes to `main`. So how TASKS item 145's branch reaches CI while it is built, through the batch's pull request or a draft pull request of its own, is settled in its contract, and any push waits for your word.
+- **What it does not change:** Kani's compiler bundle is installed on the Mac under item 358. It is Kani's own pinned toolchain, used only by Kani, not a nightly of the project's, and this item does not cover it.
+- **Performance cost** (ADR-0018 V3): none, by construction: a test tool's place.
+- **Where it is written:**
+  - this sheet;
+  - the "Decided by" column of matrix row S12-09;
+  - TASKS item 145's line.
+
+### Fuzz targets started by `cargo xtask fuzz` (item 365): Accepted 2026-11-26
+
+TASKS item 144 builds coverage-guided fuzzing (item 359). It found that `host-tools-gate`'s rule G1 refuses `run` given to an outside program, and `cargo fuzz run` is exactly that: `xtask` starts cargo-fuzz, an outside program, and cargo-fuzz starts the fuzz target, which is built from first-party libraries. cargo-fuzz's `tmin` and `cmin` start the target too. The session would not get round the rule by its letter, and the coordinating session put the question to you. You answered "Accept 365".
+
+| # | Question | Answer |
+|---|---|---|
+| 365, answered | Is a fuzz target a test program, started to test first-party libraries, as item 310 has `cargo test` start test binaries, so that `cargo xtask fuzz` may give `run`, `tmin` and `cmin` to cargo-fuzz in `developer-tools/xtask/src/fuzz.rs` only, named in the gate, with a planted control showing that `run` anywhere else is still refused? | **Accept** |
+
+- **The alternative put** was that `cargo xtask fuzz` only prepares a run and prints the command, which a person runs on the Mac and CI runs as a step of its job file. No new allowance would be needed. But the planted-fault check, the time limits and crash minimizing would then live in untested shell and job-file text, and minimizing a crash would be a manual step.
+- **What does not change:** `xtask` still calls the host tools' libraries and starts no first-party program to do their work. `run` given to an outside program stays refused everywhere else, and so does Cargo's own `run`.
+- **Performance cost** (ADR-0018 V3): none, by construction: a host tool's test step.
+- **Where it is written:**
+  - ADR-0011 Amendment 4, T1's note of 2026-11-26;
+  - row A11-T1's "Decided by";
+  - TASKS item 144's line.
+
+### Verus in CI only, and its evaluation (item 366): delegated 2026-11-26
+
+On 2026-11-26 you asked whether Verus could be used. CLAUDE.md §73 already asks to evaluate it for selected high-assurance modules, as row S73-03, not started. You asked how the Asterinas project set it up, and whether Verus could run only in CI. The coordinating session's answer was that it could, but that a proof is written by trial and error: CI-only work needs the evaluation's own draft pull request, and your permission for that branch's pushes. You then delegated the decisions: "You are the chief architect and ...etc roles clearly defined, you can take decisions on your own for these". The coordinating session decided them as follows.
+
+| # | Question | Answer |
+|---|---|---|
+| 366, answered | Where does Verus run, how does its evaluation reach CI, and when does it start? | **Delegated to Claude**, and decided by the coordinating session: CI only, through the evaluation's own branch and draft pull request, after TASKS item 143's allocator proofs |
+
+- **What was found first:**
+  - **Verus's toolchain:** Verus is built against a Rust toolchain of its own. Its standard library's recent builds show a nightly compiler, and the exact pin is to be read on the day.
+  - **Verified code:** it is written inside `verus!` blocks that use Verus's crates. So annotating the kernel's real code would make the kernel's build depend on them.
+  - **Asterinas's published work** (its blog and its USENIX ATC 2025 paper, not its source) verifies a separate copy of its framework library with Verus, and reports real bugs found in concurrent page-table code.
+- **What it decides:**
+  - **Where Verus runs:** Verus and its solver are installed only on CI's runners, never on the development Mac, as item 364 decided for Miri. Each is pinned to a release and a checksum read on the day.
+  - **The evaluation** is TASKS item 149, started after TASKS item 143's allocator proofs land.
+  - **The branch permission:** for TASKS item 149 only, its session may push its own branch and keep one draft pull request open from it, so CI runs its proofs.
+    - That pull request is never merged: the work lands through the batch, as every task's does.
+    - Each push is scanned for identifiers first.
+    - No other branch is pushed under this permission.
+    - The draft pull request is closed when the task is cleared.
+- **What stays yours:**
+  - adopting Verus beyond the evaluation;
+  - any shipping build's dependency on Verus's crates, a CLAUDE.md §5 exception.
+- **What is not done:** Asterinas's source and its verification project's proofs are not read. Asterinas is not among the projects item 94 allows, and CLAUDE.md §3 forbids copying from another operating system.
+- **Performance cost** (ADR-0018 V3): none, by construction: a test tool in CI.
+- **Where it is written:**
+  - this sheet;
+  - TASKS item 149's line;
+  - the "Decided by" column of matrix row S73-03.
+
+### GitHub as a view of the records: tickets, board, templates, code of conduct, milestones and Discussions (items 367 to 373): Accepted 2026-11-26
+
+On 2026-11-26 you asked for tickets in GitHub, a board like Kanban or JIRA, a pull request template, issue templates, a code of conduct, and a roadmap plan. The coordinating session checked the repository:
+- issues and Projects were on, with no issues, no milestones, no templates and no code of conduct;
+- the labels were GitHub's defaults;
+- Discussions were off;
+- the session's GitHub login has no permission to create a Projects board.
+
+It put seven items, with a recommendation for each. You answered "Accept all".
+
+| # | Question | Answer |
+|---|---|---|
+| 367, answered | Is GitHub a view of the records, with `TASKS.md`, the requirements matrix and `docs/ROADMAP.md` staying authoritative (CLAUDE.md §79)? | **Accept** |
+| 368, answered | Are tickets generated from `TASKS.md` by a CI job on each push to `main`, one issue per open backlog item, never typed by hand? | **Accept** |
+| 369, answered | GitHub milestones M0 to M13 and "Server edition", with no due dates, each linking to its exit tests in `docs/ROADMAP.md`? | **Accept** |
+| 370, answered | One Kanban board, "Origin OS" (Backlog, In progress, In the batch, Done), created by you in GitHub's web interface, or after you grant the `project` permission yourself? | **Accept** |
+| 371, answered | Issue forms (bug report, feature request, specification question; blank issues off; security reports pointed to `SECURITY.md`), a pull request template taken from `CONTRIBUTING.md`, and labels by type and area? | **Accept** |
+| 372, answered | A code of conduct, the Contributor Covenant 2.1, credited as its CC BY 4.0 licence requires, with reports to a contact address you choose and publish? | **Accept**, once you name the address |
+| 373, answered | GitHub Discussions switched on, for questions? | **Accept** |
+
+- **Why a view and not a second backlog:** hand-made tickets would drift from `TASKS.md` and the matrix, which `cargo xtask check` holds to the tree.
+- **What acceptance covers:** publishing these on the public repository: the template files, the labels, the milestones, and the generated issues once TASKS item 150 lands. It also covers switching on Discussions in the repository's settings.
+- **The order:**
+  1. This pull request: the records, the issue forms and the pull request template.
+  2. After it merges: the labels, the milestones and Discussions, created by the coordinating session.
+  3. The board: created by you.
+  4. The generated issues: when TASKS item 150 lands.
+- **What stays yours:**
+  - creating the board, or granting the permission that lets it be created;
+  - the contact address for conduct reports. Your personal email stays private, and no account or mailbox is created for you. `CODE_OF_CONDUCT.md` waits until you name the address.
+- **Performance cost** (ADR-0018 V3): none, by construction: repository settings, documents and a CI job.
+- **Where it is written:**
+  - this sheet;
+  - matrix rows S79-01 and S79-09;
+  - the requirements README's table of items without rows (369 to 373);
+  - TASKS item 150's line;
+  - `.github/ISSUE_TEMPLATE/` and `.github/pull_request_template.md`.
+
+### Specifications and standards on the progress page (item 374): 2026-11-26
+
+On 2026-11-26 you wrote that `PROGRESS.md` should show the specifications, such as ACPI 6.6 and NVMe 2.4 ("these are just references, add other not mentioned if any about all specifications/standards/protocols"), with what is implemented and percentages, and keep them current. That is item 374: your instruction, not an answer to a question.
+
+| # | Question | Answer |
+|---|---|---|
+| 374, answered | Does the progress page show every specification, standard and protocol the project relies on, with what is implemented and percentages? | **Yes: your instruction of 2026-11-26** |
+
+- **The design, decided by the coordinating session:**
+  - **The list:** a list of every specification the project relies on, kept in the requirements matrix as `docs/requirements/specifications.md` and held by a gate. It starts from CLAUDE.md §17's baseline, the ADRs and the provenance table, and includes Origin's own specifications, ONBF and OIDL.
+  - **For each specification,** the page shows the requirement rows that rest on it by state, as counts and as percentages adding up to 100%, which crates implement parts of it, and its rows with their states.
+- **What the percentages mean,** stated on the page:
+  - they count Origin's requirements that rest on each specification, not how much of the specification is implemented, because a specification has many parts no requirement asks for;
+  - no figure claims conformance, which needs the specification's own conformance tests (CLAUDE.md §46).
+- **What does not change:** the page is still generated and held by `cargo xtask check`. Items 193 and 221 stand, so only done counts as complete.
+- **Performance cost** (ADR-0018 V3): none, by construction: a generated document and a host tool.
+- **Where it is written:**
+  - this sheet;
+  - the requirements README's table of items without rows;
+  - TASKS item 151's line.
+
+### The code of conduct's contact address and version (item 372): a note of 2026-11-26
+
+Item 372 waited for a contact address for conduct reports. The coordinating session advised an address used only for the project, for example an alias that forwards to your inbox, because an address in a public repository stays in its history and is harvested for spam. On 2026-11-26 you chose your own address, and gave it to be published.
+
+- **How it was added:** through GitHub's code-of-conduct template, in your browser at your word ("use google chrome and do if need or use gh tool"). It was committed to the branch `docs/code-of-conduct` and lands by pull request. `CODE_OF_CONDUCT.md` holds the address; this sheet does not repeat it.
+- **The version:** GitHub's template turned out to be the Contributor Covenant 2.0, and you then asked for 2.1 ("Change to 2.1"). So `CODE_OF_CONDUCT.md` is version 2.1, exactly as the Contributor Covenant's own site publishes it. The Markdown, 5,480 bytes, SHA-256 `977d781349351fd7c1f076e4c7dc7de2a05b40e12c773542c3815dd4ce7f37ba`, came from `https://www.contributor-covenant.org/version/2/1/code_of_conduct/code_of_conduct.md` on 2026-11-26.
+  - Only two things differ from that file: its leading blank line is gone, and your address fills the contact placeholder.
+  - It is licensed CC BY 4.0, and its own attribution section credits it.
+  - The branch's first commit, from GitHub's template, says "2.1" in its message although it added 2.0; the commit after it replaces the text with 2.1.
+- **The identifier scans:** sessions scan their commits for personal data before they push. Your address in `CODE_OF_CONDUCT.md` is there by your choice, and a scan that finds it there is not a finding.
+- **Also:** `CONTRIBUTING.md` and `README.md` link the code of conduct.
