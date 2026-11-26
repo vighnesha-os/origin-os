@@ -1710,3 +1710,24 @@ It put seven items, with a recommendation for each. You answered "Accept all".
   - the requirements README's table of items without rows (369 to 373);
   - TASKS item 150's line;
   - `.github/ISSUE_TEMPLATE/` and `.github/pull_request_template.md`.
+
+### Specifications and standards on the progress page (item 374): 2026-11-26
+
+On 2026-11-26 you wrote that `PROGRESS.md` should show the specifications, such as ACPI 6.6 and NVMe 2.4 ("these are just references, add other not mentioned if any about all specifications/standards/protocols"), with what is implemented and percentages, and keep them current. That is item 374: your instruction, not an answer to a question.
+
+| # | Question | Answer |
+|---|---|---|
+| 374, answered | Does the progress page show every specification, standard and protocol the project relies on, with what is implemented and percentages? | **Yes: your instruction of 2026-11-26** |
+
+- **The design, decided by the coordinating session:**
+  - **The list:** a list of every specification the project relies on, kept in the requirements matrix as `docs/requirements/specifications.md` and held by a gate. It starts from CLAUDE.md §17's baseline, the ADRs and the provenance table, and includes Origin's own specifications, ONBF and OIDL.
+  - **For each specification,** the page shows the requirement rows that rest on it by state, as counts and as percentages adding up to 100%, which crates implement parts of it, and its rows with their states.
+- **What the percentages mean,** stated on the page:
+  - they count Origin's requirements that rest on each specification, not how much of the specification is implemented, because a specification has many parts no requirement asks for;
+  - no figure claims conformance, which needs the specification's own conformance tests (CLAUDE.md §46).
+- **What does not change:** the page is still generated and held by `cargo xtask check`. Items 193 and 221 stand, so only done counts as complete.
+- **Performance cost** (ADR-0018 V3): none, by construction: a generated document and a host tool.
+- **Where it is written:**
+  - this sheet;
+  - the requirements README's table of items without rows;
+  - TASKS item 151's line.

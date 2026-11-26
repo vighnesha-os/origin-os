@@ -688,6 +688,16 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **Its properties:** idempotent, so running it twice changes nothing the second time. It creates or updates only issues it made, marked as generated, and never edits or closes an issue a person opened. It never writes `TASKS.md`.
     - **Outside reports** arrive through the issue forms (item 371). The coordinating session sorts them into `TASKS.md`, and the generated issue then links back to the report.
     - **Not in it:** the board's own automation (item 370), which the owner sets in the board's settings.
+151. **Specifications and standards on the progress page (owner item 374). Numbered by the coordinating session on 2026-11-26; not started.**
+    - **The list:** a new file, `docs/requirements/specifications.md`, with one row per specification, standard or protocol the project relies on. It starts from CLAUDE.md §17's baseline, the ADRs and the provenance table's "Applicable specifications": vendor documents such as Intel's SDM and AMD's APM; external standards such as ACPI 6.6, UEFI 2.11, NVMe Base 2.4 and FIPS 204; and Origin's own specifications, ONBF and OIDL.
+    - **Each row gives:**
+      - the name, the revision and the date it was confirmed;
+      - where the project names it;
+      - the matrix rows whose acceptance rests on it;
+      - the crates that implement parts of it, by the provenance table.
+    - **The gate:** every standard of §17 is listed, and every row ID named exists. A specification with no rows yet is still listed, and says so.
+    - **The page:** `cargo xtask progress` adds a section with, for each specification, its rows by state (done, built, in progress, not started) as counts and as percentages that add up to 100%. Each specification's rows can be opened, each with its state.
+    - **What the figures mean,** stated on the page: they count Origin's requirements that rest on each specification. They do not measure how much of the specification is implemented, since a specification has many parts that no requirement asks for. No figure claims conformance.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
