@@ -6451,6 +6451,8 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   | C2 | The kernel boot fails on the loader's "kernel verified" line | `ORIGIN_BOOT_TEST_ONLY='kernel boot' cargo xtask boot-test` | 1, 3 s | `02-kernel-boot/`: `boot.txt`, `serial.log`, and no `screen.ppm` though C1 left one |
   | C3 | The SPCR scenario waits for a marker no boot prints | `ORIGIN_BOOT_TEST_ONLY='console: UART named by the SPCR' cargo xtask boot-console` | 1, 121 s | `03-console--UART-named-by-the-SPCR/`: `boot.txt`, `spcr-uart.log`, `com1.log` |
 
+  Without plants, on `40e46ef0` (the code as at `796c7f69`): `cargo xtask check` passed (1,139 s), `cargo xtask boot-test` passed 11 of 11 scenarios (68 s), and `cargo xtask boot-matrix` passed (2,066 s). Each started with no `failed-boots` folder and left none.
+
   No kept file names the clone's path, the scratch directory, `$HOME` or the account. The earlier two runs of the same plants found `monitor.log` empty (fixed in `1cf28b1c`), then 226,127 bytes of redrawn command line with partial host paths in it (fixed in `796c7f69`).
 - **Known limits:**
   - CI's upload of a failed boot is not yet shown (TASKS item 165).

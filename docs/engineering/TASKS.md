@@ -786,6 +786,10 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
       - **C3:** the SPCR scenario waits for a marker no boot prints. It left `boot.txt`, `spcr-uart.log` and `com1.log`.
 
       The directories were numbered 01 to 03, and no kept file names a host path. The 3,072,016-byte dump is 51,246 bytes under gzip -6.
+    - **Gates on `40e46ef0` (the code as at `796c7f69`), in one turn of the machine, the tree clean before and after; each run started with no `failed-boots` folder and left none:**
+      - `cargo xtask check`: passed in 1,139 s, with 2,911 tests passed, 0 failed and 32 ignored, 96 Loom models passed and 148 controls caught, and every gate passed;
+      - `cargo xtask boot-test`: 11 of 11 scenarios passed in 68 s;
+      - `cargo xtask boot-matrix`: passed in 2,066 s.
     - **What the controls found, fixed in the same branch:**
       - `monitor.log` was empty: nothing read QEMU's stdout while the screen was watched (`1cf28b1c`).
       - Then it was 226,127 bytes of QEMU's redrawn command line, whose partial host paths no replacement could catch (`796c7f69`).
