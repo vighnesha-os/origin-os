@@ -559,7 +559,10 @@ const CONTROLS: &[Control] = &[
             "handles::proofs::remove_keeps_the_table_whole_at_1",
             "handles::proofs::remove_keeps_the_table_whole_at_2",
         ],
-        expect: &["H3: a stale handle never names the slot's next object"],
+        expect: &[
+            "remove moves the slot to the next generation, free",
+            "E1: a generation never comes down",
+        ],
     },
     Control {
         name: "last-generation-reused",
@@ -653,7 +656,7 @@ const CONTROLS: &[Control] = &[
         from: "    if held & allow.needs() != allow.needs() {\n",
         to: "    if held & allow.needs() == 0 {\n",
         harnesses: &["mapping::proofs::check_every_request"],
-        expect: &["the handle holds every right needed"],
+        expect: &["check is exactly what C6 to C8 and D2 allow, in the module's order"],
     },
     Control {
         name: "within-loosened",
@@ -662,6 +665,133 @@ const CONTROLS: &[Control] = &[
         to: "            (Self::Read, _) | (Self::ReadWrite, _)\n",
         harnesses: &["mapping::proofs::within_is_allows_nothing_more"],
         expect: &["within: allows nothing more"],
+    },
+    // From the review of step 4 (R143-S4-1 to S4-6): what each step keeps, memory, and the map's ranges.
+    Control {
+        name: "generation-wraps-at-2-32",
+        file: HANDLES,
+        from: "            slot.generation += 1;\n",
+        to: "            slot.generation = if slot.generation == 0xFFFF_FFFF { 1 } else { slot.generation + 1 };\n",
+        harnesses: &[
+            "handles::proofs::remove_keeps_the_table_whole_at_1",
+            "handles::proofs::remove_keeps_the_table_whole_at_2",
+        ],
+        expect: &[
+            "E1: a generation never comes down",
+            "remove moves the slot to the next generation, free",
+        ],
+    },
+    Control {
+        name: "duplicate-widens-the-original",
+        file: HANDLES,
+        from: "        let copy = object.clone();\n",
+        to: "        let copy = object.clone();\n        if let Some((i, _)) = split(handle) {\n            if let Some(Slot { entry: Some((_, r)), .. }) = self.slots.get_mut(i) {\n                *r = u32::MAX;\n            }\n        }\n",
+        harnesses: &[
+            "handles::proofs::duplicate_only_shrinks_rights_at_1",
+            "handles::proofs::duplicate_only_shrinks_rights_at_2",
+        ],
+        expect: &["P2: a slot the operation does not name is unchanged"],
+    },
+    Control {
+        name: "batch-reversed",
+        file: HANDLES,
+        from: "        for &handle in list {\n            taken.push(self.remove(handle, need)?);\n",
+        to: "        for &handle in list.iter().rev() {\n            taken.push(self.remove(handle, need)?);\n",
+        harnesses: &["handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_2"],
+        expect: &["P2: each moved entry is the one named, in the list's order"],
+    },
+    Control {
+        name: "batch-widens-what-it-moves",
+        file: HANDLES,
+        from: "            taken.push(self.remove(handle, need)?);\n",
+        to: "            taken.push(self.remove(handle, need).map(|(o, _)| (o, u32::MAX))?);\n",
+        harnesses: &[
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_1_of_1",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_1",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_2",
+        ],
+        expect: &["P2: each moved entry is the one named, in the list's order"],
+    },
+    Control {
+        name: "insert-leaves-remove-no-room",
+        file: HANDLES,
+        from: "                if self.slots.try_reserve(1).is_err() || self.ensure_free_room(1).is_err() {\n",
+        to: "                if self.slots.try_reserve(1).is_err() {\n",
+        harnesses: &[
+            "handles::proofs::insert_keeps_the_table_whole_at_0",
+            "handles::proofs::insert_keeps_the_table_whole_at_1",
+            "handles::proofs::insert_keeps_the_table_whole_at_2",
+        ],
+        expect: &["the free list has room for every slot, so remove never allocates"],
+    },
+    Control {
+        name: "reserve-takes-no-memory",
+        file: HANDLES,
+        from: "        self.slots.try_reserve(fresh).map_err(|_| Error::NoMemory)?;\n        self.ensure_free_room(fresh)\n",
+        to: "        let _ = fresh;\n        Ok(())\n",
+        harnesses: &[
+            "handles::proofs::reserve_makes_room_at_0_for_1",
+            "handles::proofs::reserve_makes_room_at_0_for_2",
+            "handles::proofs::reserve_makes_room_at_1_for_1",
+            "handles::proofs::reserve_makes_room_at_1_for_2",
+            "handles::proofs::reserve_makes_room_at_2_for_1",
+            "handles::proofs::reserve_makes_room_at_2_for_2",
+        ],
+        expect: &["the memory for every reserved insert is taken now"],
+    },
+    Control {
+        name: "reserve-at-the-quota-refused",
+        file: HANDLES,
+        from: "        if count > self.free_slots() {\n",
+        to: "        if count >= self.free_slots() {\n",
+        harnesses: &[
+            "handles::proofs::reserve_makes_room_at_0_for_0",
+            "handles::proofs::reserve_makes_room_at_0_for_1",
+            "handles::proofs::reserve_makes_room_at_0_for_2",
+            "handles::proofs::reserve_makes_room_at_1_for_0",
+            "handles::proofs::reserve_makes_room_at_1_for_1",
+            "handles::proofs::reserve_makes_room_at_1_for_2",
+            "handles::proofs::reserve_makes_room_at_2_for_0",
+            "handles::proofs::reserve_makes_room_at_2_for_1",
+            "handles::proofs::reserve_makes_room_at_2_for_2",
+        ],
+        expect: &["H6: Ok exactly when the quota has room"],
+    },
+    Control {
+        name: "get-type-after-rights",
+        file: HANDLES,
+        from: "                if need.object != 0 && object.object_type() != need.object {\n                    Err(Error::WrongType)\n                } else if r & need.rights == need.rights {\n                    Ok((object, *r))\n                } else {\n                    Err(Error::AccessDenied)\n                }\n",
+        to: "                if r & need.rights != need.rights {\n                    Err(Error::AccessDenied)\n                } else if need.object != 0 && object.object_type() != need.object {\n                    Err(Error::WrongType)\n                } else {\n                    Ok((object, *r))\n                }\n",
+        harnesses: &[
+            "handles::proofs::get_is_exactly_p1_at_1",
+            "handles::proofs::get_is_exactly_p1_at_2",
+        ],
+        expect: &["get is exactly P1's answer"],
+    },
+    Control {
+        name: "user-start-unchecked",
+        file: MAPPING,
+        from: "    if !base.is_multiple_of(PAGE) || base < USER_START {\n",
+        to: "    if !base.is_multiple_of(PAGE) {\n",
+        harnesses: &["mapping::proofs::check_every_request"],
+        expect: &["check is exactly what C6 to C8 and D2 allow, in the module's order"],
+    },
+    Control {
+        name: "fixed-address-alignment-unchecked",
+        file: MAPPING,
+        from: "    if !base.is_multiple_of(PAGE) || base < USER_START {\n",
+        to: "    if base < USER_START {\n",
+        harnesses: &["mapping::proofs::check_every_request"],
+        expect: &["check is exactly what C6 to C8 and D2 allow, in the module's order"],
+    },
+    // Both of the range's checks loosened together: the second (nospec's clamps) refuses on the kept path too.
+    Control {
+        name: "object-range-unchecked",
+        file: MAPPING,
+        from: "    if pages == 0\n        || first\n            .checked_add(pages)\n            .is_none_or(|end| end > object_pages)\n    {\n        return Err(Error::InvalidArgs);\n    }\n    // The offset and the length are a program's and pick the object's frames\n    // (`MemoryObject::run`). `nospec` keeps them inside the object on a wrongly guessed path\n    // too; the check above has refused whatever these would.\n    let pages = at_most(pages, object_pages).ok_or(Error::InvalidArgs)?;\n    let first = at_most(first, object_pages - pages).ok_or(Error::InvalidArgs)?;\n",
+        to: "    if pages == 0 {\n        return Err(Error::InvalidArgs);\n    }\n",
+        harnesses: &["mapping::proofs::check_every_request"],
+        expect: &["check is exactly what C6 to C8 and D2 allow, in the module's order"],
     },
 ];
 
@@ -1189,6 +1319,34 @@ fn package_of(file: &str) -> Result<&'static str> {
         .ok_or_else(|| format!("kani: no proof file's package holds {file}"))
 }
 
+/// Texts that must each stand once, as they are, in a file: the privacy the handle table's
+/// proofs rest on. Its entries and their rights are reached only through its methods
+/// (`framekernel/src/handles/proofs.rs`), and the doctests in `handles.rs` show it only at the
+/// crate's edge; a `pub(crate)` on a field or on `Slot` would pass them and void the proofs'
+/// premise inside the kernel (TASKS item 143, step 4, R143-S4-7).
+const PRIVATE_PINS: &[(&str, &str)] = &[
+    (
+        HANDLES,
+        "pub struct HandleTable<T> {\n    slots: Vec<Slot<T>>,\n    free: Vec<u32>,\n    limit: usize,\n    live: usize,\n}\n",
+    ),
+    (HANDLES, "\nstruct Slot<T> {\n"),
+];
+
+/// Each [`PRIVATE_PINS`] text that does not stand once in its file, as `read` gives it.
+fn private_pin_problems(read: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    PRIVATE_PINS
+        .iter()
+        .filter_map(|(file, text)| {
+            let found = read(file).map_or(0, |source| source.matches(text).count());
+            (found != 1).then(|| {
+                format!(
+                    "{file}: the handle table's fields and `Slot` must stay private to their module, as the proofs assume: expected once, found {found} times: {text:?}"
+                )
+            })
+        })
+        .collect()
+}
+
 /// `cargo xtask kani-gate`: what can be checked without Kani.
 pub(crate) fn gate() -> Result {
     let root = repo_root();
@@ -1236,6 +1394,9 @@ pub(crate) fn gate() -> Result {
             allowed,
         ));
     }
+    problems.extend(private_pin_problems(&|file| {
+        fs::read_to_string(root.join(file)).ok()
+    }));
     // The CI job installs this version and runs the proofs.
     let script = fs::read_to_string(root.join(INSTALL_SCRIPT)).unwrap_or_default();
     if !script.contains(&format!("KANI_VERSION={VERSION}\n")) {
@@ -1388,6 +1549,25 @@ fn names_kani(code: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_handle_tables_privacy_is_pinned() {
+        let real = |file: &str| std::fs::read_to_string(crate::repo_root().join(file)).ok();
+        assert!(super::private_pin_problems(&real).is_empty());
+        let widened = |file: &str| {
+            real(file).map(|s| {
+                s.replace(
+                    "    slots: Vec<Slot<T>>,",
+                    "    pub(crate) slots: Vec<Slot<T>>,",
+                )
+            })
+        };
+        assert_eq!(super::private_pin_problems(&widened).len(), 1);
+        let slot_public = |file: &str| {
+            real(file).map(|s| s.replace("\nstruct Slot<T> {", "\npub(crate) struct Slot<T> {"))
+        };
+        assert_eq!(super::private_pin_problems(&slot_public).len(), 1);
+    }
+
     #[test]
     fn no_log_name_holds_a_character_the_artifact_upload_refuses() {
         let defined = super::defined(&crate::repo_root()).expect("the proof files read");

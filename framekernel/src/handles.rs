@@ -96,10 +96,12 @@ struct Slot<T> {
 /// let _ = core::mem::size_of::<framekernel::handles::Slot<u32>>();
 /// ```
 ///
-/// Each is refused twice over: the fields are private, and so is the entry type they hold.
+/// The first two are refused twice over: the fields are private, and so is the entry type
+/// they hold. Inside the crate the same privacy is pinned by `cargo xtask kani-gate`.
 /// (Rustdoc on stable does not check the error codes given; they say which refusal is meant.)
 /// A handle itself is a plain `u64`, the ABI's value (E1), so anyone can write one; the table
-/// answers only for the ones it issued and has not taken back (Kani's `handles::proofs`).
+/// answers only for the ones it issued and has not taken back (Kani's `handles::proofs`, for
+/// tables within the bounds that module states).
 pub struct HandleTable<T> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,

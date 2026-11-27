@@ -8,18 +8,27 @@
 //! - **M1:** `Allow::from_bits` refuses a bit past the three defined, write with execute and
 //!   no read as `invalid_args`, and execute as `access_denied`, and otherwise gives `Read` or
 //!   `ReadWrite` as the bits say.
-//! - **M2:** `check` is `Ok` only when the handle holds every right the mapping allows, the
-//!   pages are whole and inside the object, and a fixed address's run is inside the user half,
-//!   page-aligned; it refuses in the order the module states: what is allowed, the rights, the
-//!   range, the placement.
-//! - **M3:** `within` is "allows nothing more", and `needs` is monotone in it.
+//! - **M2:** `check` is exactly [`expected_check`], written from C6 to C8, D2 and the module's
+//!   stated order: what is allowed, then the handle's rights for it (read for any mapping, and
+//!   write too for a writable one, as M3 pins `needs` to), then whole pages inside the object,
+//!   then the placement (anywhere, or a fixed run of whole pages inside the user half). So it
+//!   accepts every request those rules allow and refuses every other, with the error they give.
+//! - **M3:** `within` is "allows nothing more", and `needs` is monotone in it, with `READ` for
+//!   any mapping and `WRITE` exactly for a writable one: the link between M2's rights and the
+//!   ABI's.
 //!
-//! **Not proved here:** `memory_object.rs`'s `protect`, which calls `within`, and the rest of
-//! a mapping's work. They build only for the kernel's target, so Kani cannot compile them on
-//! the host; the boot proofs show them.
+//! **Not proved here:**
+//! - `mapping.rs`'s other host-built logic: `frames`, `place`, `place_at_random`, `price`,
+//!   `Budget` (T15, T16) and `Mappings` (C7's whole mappings, D5's `should_wait`). Their host
+//!   tests cover them; a proof of them is later work.
+//! - `memory_object.rs`'s `protect`, which calls `within`, and the rest of a mapping's work.
+//!   They build only for the kernel's target, so Kani cannot compile them on the host; the
+//!   boot proofs show them.
+//! - `nospec`'s Mask form and the kernel's assembly for it: every lookup here takes the Fence
+//!   form, whose host stand-in is the identity. The kept path's result is the same.
 #![forbid(unsafe_code)]
 
-use super::{Allow, PAGE, Place, Request, check};
+use super::{Allow, Asked, PAGE, Place, Request, check};
 use origin_abi::rights::{READ, WRITE};
 use origin_abi::{Error, map_access, map_flags};
 use origin_frame::usercopy::{USER_END, USER_START};
@@ -28,11 +37,14 @@ use origin_frame::usercopy::{USER_END, USER_START};
 #[kani::proof]
 fn allow_from_every_bits() {
     let bits: u32 = kani::any();
-    let (read, write, execute) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+    let read = bits & map_access::READ != 0;
+    let write = bits & map_access::WRITE != 0;
+    let execute = bits & map_access::EXECUTE != 0;
+    let unknown = bits & !map_access::ALL != 0;
     match Allow::from_bits(bits) {
         Ok(allow) => {
             kani::assert(
-                bits & !7 == 0 && read && !execute,
+                !unknown && read && !execute,
                 "only defined bits, with read, no execute",
             );
             kani::assert(
@@ -42,11 +54,11 @@ fn allow_from_every_bits() {
             kani::cover(allow == Allow::ReadWrite, "read and write allowed");
         }
         Err(Error::InvalidArgs) => kani::assert(
-            bits & !7 != 0 || !read || (write && execute),
+            unknown || !read || (write && execute),
             "invalid_args only for an unknown bit, no read, or write with execute",
         ),
         Err(Error::AccessDenied) => kani::assert(
-            bits & !7 == 0 && read && execute && !write,
+            !unknown && read && execute && !write,
             "access_denied only for execute",
         ),
         Err(_) => kani::assert(false, "no other error"),
@@ -71,7 +83,55 @@ fn within_is_allows_nothing_more() {
     kani::cover(a.within(b) && a != b, "read within read and write");
 }
 
-/// `check` for every request, object size and rights: P1 and M2.
+/// What `check` must return, written from C6 to C8, D2 and the module's order, not through
+/// `check`'s helpers: what is allowed (M1 proves `from_bits` against the bits), the rights for
+/// it, the pages, the placement.
+fn expected_check(request: &Request, object_pages: u64, held: u32) -> Result<Asked, Error> {
+    let allow = Allow::from_bits(request.access)?;
+    let needs = match allow {
+        Allow::Read => READ,
+        Allow::ReadWrite => READ | WRITE,
+    };
+    if held & needs != needs {
+        return Err(Error::AccessDenied);
+    }
+    if request.offset % PAGE != 0 || request.length % PAGE != 0 {
+        return Err(Error::InvalidArgs);
+    }
+    let (first, pages) = (request.offset / PAGE, request.length / PAGE);
+    if pages == 0
+        || first
+            .checked_add(pages)
+            .is_none_or(|end| end > object_pages)
+    {
+        return Err(Error::InvalidArgs);
+    }
+    let place = match request.flags {
+        0 if request.address == 0 => Place::Anywhere,
+        flags if flags == map_flags::FIXED => {
+            let base = request.address;
+            let inside = base % PAGE == 0
+                && base >= USER_START
+                && pages
+                    .checked_mul(PAGE)
+                    .and_then(|bytes| base.checked_add(bytes))
+                    .is_some_and(|end| end <= USER_END);
+            if !inside {
+                return Err(Error::InvalidArgs);
+            }
+            Place::At(base)
+        }
+        _ => return Err(Error::InvalidArgs),
+    };
+    Ok(Asked {
+        allow,
+        first,
+        pages,
+        place,
+    })
+}
+
+/// `check` for every request, object size and rights: P1 and M2, exactly.
 #[kani::proof]
 fn check_every_request() {
     let request = Request {
@@ -83,69 +143,33 @@ fn check_every_request() {
     };
     let object_pages: u64 = kani::any();
     let held: u32 = kani::any();
-    let allowed = Allow::from_bits(request.access);
-    match check(&request, object_pages, held) {
-        Ok(asked) => {
-            let Ok(allow) = allowed else {
-                kani::assert(false, "Ok only for an access from_bits accepts");
-                return;
-            };
-            kani::assert(asked.allow == allow, "the access asked for");
-            kani::assert(
-                held & allow.needs() == allow.needs(),
-                "the handle holds every right needed",
-            );
-            kani::assert(
-                request.offset % PAGE == 0 && request.length % PAGE == 0,
-                "whole pages",
-            );
-            let (first, pages) = (request.offset / PAGE, request.length / PAGE);
-            kani::assert(
-                asked.first == first && asked.pages == pages,
-                "the pages asked for",
-            );
-            kani::assert(
-                pages > 0 && first.checked_add(pages).is_some_and(|e| e <= object_pages),
-                "the pages lie inside the object",
-            );
-            match asked.place {
-                Place::Anywhere => kani::assert(
-                    request.flags == 0 && request.address == 0,
-                    "anywhere only when asked so",
-                ),
-                Place::At(base) => {
-                    kani::assert(
-                        request.flags == map_flags::FIXED && base == request.address,
-                        "a fixed place where asked",
-                    );
-                    kani::assert(
-                        base % PAGE == 0
-                            && base >= USER_START
-                            && pages
-                                .checked_mul(PAGE)
-                                .and_then(|b| base.checked_add(b))
-                                .is_some_and(|e| e <= USER_END),
-                        "a fixed run lies in the user half",
-                    );
-                }
-            }
-            kani::cover(
-                matches!(asked.place, Place::At(_)),
-                "a fixed mapping is accepted",
-            );
-        }
-        // The order: what is allowed is judged first, so its refusal is from_bits's own.
-        Err(e) => {
-            if let Err(first) = allowed {
-                kani::assert(e == first, "what is allowed is checked first");
-            } else if let Ok(allow) = allowed {
-                if held & allow.needs() != allow.needs() {
-                    kani::assert(e == Error::AccessDenied, "then the rights");
-                } else {
-                    kani::assert(e == Error::InvalidArgs, "then the range and the placement");
-                }
-            }
-            let _ = map_access::ALL;
-        }
-    }
+    let got = check(&request, object_pages, held);
+    kani::assert(
+        got == expected_check(&request, object_pages, held),
+        "check is exactly what C6 to C8 and D2 allow, in the module's order",
+    );
+    kani::cover(
+        matches!(
+            got,
+            Ok(Asked {
+                place: Place::At(_),
+                ..
+            })
+        ),
+        "a fixed mapping is accepted",
+    );
+    kani::cover(
+        matches!(
+            got,
+            Ok(Asked {
+                place: Place::Anywhere,
+                ..
+            })
+        ),
+        "a mapping placed anywhere is accepted",
+    );
+    kani::cover(
+        got == Err(Error::AccessDenied),
+        "a request past the rights is refused",
+    );
 }
