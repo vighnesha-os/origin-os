@@ -6092,3 +6092,15 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Test evidence:** host tests of the decoding, the acknowledgement's value, the protocol against a model of the hardware (no update lost, no row read after the acknowledgement), hostile tables, `choose_into` against TASKS item 97's algorithm and the `_CPC` adapter through `origin-aml`; the Report proof under QEMU; controls C1 to C6; `dispatch`, `resume` and `on_yield` compared with the base's image, statically and path by path, against `0ebef78b` and again against `1701f176` after TASKS item 96's landing; Clippy, `check`, `boot-test` and three runs of `boot-matrix` on the merged tree at `7ffb014d`. All under QEMU only, recorded in TASKS item 106's entry.
 - **Review:** one independent AI reviewer, recorded in `docs/engineering/REVIEW_T106_2026-11-22.md`. It found 1 High, 3 Medium, 9 Low and 4 Info, each answered in a commit naming it. **No person has reviewed it.**
 - **Known limits:** in TASKS item 106's entry. QEMU shows only the sources' absence; every present path needs ADR-0009 H4's machines. AMD heat is not supported at M3, and an AMD machine without the HFI whose firmware did not enable CPPC has equal capacity.
+
+## The Windows firmware-table script (`developer-tools/bench/windows/collect-firmware.ps1`; TASKS item 169; 2026-11-27)
+
+- **What:** a bench tool, not part of any image: a Windows PowerShell 5.1 script that reads a machine's raw ACPI tables and SMBIOS through `EnumSystemFirmwareTables` and `GetSystemFirmwareTable`, its firmware type through `GetFirmwareType`, Secure Boot's state from the registry, and a hardware summary through CIM with no serial numbers or names, and writes them with a manifest of SHA-256 digests and each ACPI table's checksum into one zip. It writes nothing else and changes no setting. A CI job, `windows-firmware-script`, runs it on GitHub's Windows runner with `-Strict`.
+- **Authoring agent:** the coordinating session (Claude Opus 5.5), at the owner's "Accept all" on items 381 to 383.
+- **Specifications:** Microsoft's documentation of `EnumSystemFirmwareTables`, `GetSystemFirmwareTable` (its provider signatures and the `RawSMBIOSData` layout) and `GetFirmwareType`; ACPI 6.6 §5.2.6 for a table's header and checksum.
+- **Open-source references consulted (§3, §6):** none.
+- **`unsafe`:** none; the C# it compiles uses `DllImport` only.
+- **Dependencies:** none; Windows PowerShell 5.1 and the .NET Framework it runs on, as Windows ships them.
+- **Licensing:** MIT OR Apache-2.0 (the workspace's `license`).
+- **Code review:** none, AI or person. Its CI job is its test; it has not run on a physical machine.
+- **Known limits:** Windows returns one ACPI table for each signature, so SSDTs past the first are missing (TASKS item 170 reads every table the XSDT names). Its results hold the machine's identifiers and stay outside the public repository (owner item 381).
