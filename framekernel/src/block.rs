@@ -137,7 +137,8 @@ impl Block {
 }
 
 /// Proves the block cache against the NVMe test disk, and on no other: every step reads its
-/// pattern, and the last one writes to it (CLAUDE.md P0; `storage` says when it is skipped):
+/// pattern, and the last one writes, in the partition marked for Origin's tests alone and only
+/// where there is one (CLAUDE.md P0; TASKS item 171; `storage` says when it is skipped):
 /// - cold reads miss and fetch from the disk; re-reads of resident pages hit without I/O;
 /// - reads return the pattern the boot test wrote;
 /// - more pages than slots force LRU eviction;
@@ -148,7 +149,7 @@ pub(crate) fn prove(com1: &mut Console) -> bool {
         let _ = writeln!(com1, "origin-kernel: block cache: no block device");
         return true;
     }
-    if !crate::storage::on_test_disk() {
+    if !crate::storage::on_pattern_disk() {
         return true;
     }
     const SLOTS: usize = 4;
@@ -208,8 +209,21 @@ pub(crate) fn prove(com1: &mut Console) -> bool {
     b.read_block((first_page + SLOTS as u64) * ppb, &mut buf);
     let evict_ok = b.reads == before.0 + 1 && b.writes == before.1;
 
-    // Write a block in the data partition, flush, evict it, and read it back.
-    let scratch = 10_240; // first block of "Origin data"
+    // Without the mark of Origin's tests, nothing is written.
+    let Some(span) = crate::storage::writable() else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: {evict_ok}); write-back not run: no mark of Origin's tests, so nothing is written{}",
+            if evict_ok {
+                alloc::string::String::new()
+            } else {
+                alloc::format!("{}: block cache failed", crate::storage::failure_note())
+            }
+        );
+        return reads_ok && evict_ok;
+    };
+    // Write a block of the marked partition's first page, flush, evict it, and read it back.
+    let scratch = crate::blockcache::test_disk::plan::cache(span);
     crate::storage::pattern(scratch ^ 0x3C3C, &mut expected);
     let wrote = b.write_block(scratch, &expected);
     let writes_before_flush = b.writes;

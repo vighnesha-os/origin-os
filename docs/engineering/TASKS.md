@@ -6686,3 +6686,74 @@ Every harness has a negative control and states its bounds and what it leaves un
 **Not shown:** a person's review of any step, and the machine code built for the kernel's target (above).
 
 **Where it stands:** TASKS item 143's planned steps are done, and their proofs and controls pass in CI on `land/batch-11`. The task reaches `main` with the batch.
+
+### 171. The boot proofs write only inside the partition marked for Origin's tests, and print no disk's identifiers (CLAUDE.md §2 P0, §61; owner items 381 and 384)
+
+Built on `claude/t171-marked-disk-7a0be1`, cut from `land/batch-11` at `34fdf164`, with `land/batch-11` at `6e859bd5` (TASKS item 165, `main` at `54df83d0`) merged in.
+
+**The contract and its rulings.** They are in the coordination notes (`t171-contract.md`, 2026-11-27): Q1 to Q12 ruled as recommended, Q7 with the condition that every opcode the driver builds is listed and none allowed is refused, and Q8 an owner item. The owner accepted item 384 the same day.
+
+**What was there before.** Since `2045824e` (2026-11-09) the proofs wrote only to the boot test's own disk, named by its geometry, the GPT's fixed disk GUID and xtask's pattern: a real disk got no write and no flush. What was missing is in this line's "Why": the identifiers printed, a disk GUID used as permission, no write held inside a partition, and no control of a disk's bytes.
+
+**What was built.**
+- **The guard (`nvme::permitted`, called first in `storage::submit_on`, the only function that writes a submission entry).**
+  - The admin queue takes Identify, Create I/O Completion Queue, Create I/O Submission Queue and Set Features of Number of Queues with Save clear (Base 2.4 Figure 464), nothing else.
+  - An I/O queue takes Read always; Write and Flush only with a span (`nvme::Writable`), naming its namespace, and a Write only with every block it names inside the span. Nothing else.
+  - A refused command is named (`Fault::Refused`), is never live, and leaves its queue as it was.
+  - Every opcode the driver builds, by file and function, is in the hand-over (`t171-handover.md`).
+- **The mark (`blockcache::test_disk::mark`).** Looked for only on the boot test's disk, still named by its geometry (ruling Q2) and pattern. The proofs may write only when:
+  - LBA 0 is a protective MBR (`gpt::is_protective_mbr`; UEFI 2.11 §5.2.3);
+  - both GPT copies are valid and agree, entry for entry, and the backup is at the last block (§5.3.1, §5.3.2);
+  - exactly one used entry has the type `8d4070b7-7072-4d27-9689-81467d6a5735` (owner item 384: provisional, test disks only, to be fixed with M9's partition-layout decision);
+  - that entry's Required Partition attribute is clear (Table 5.8).
+
+  The span is the entry's own bounds; the disk GUID no longer counts (ruling Q3). One valid copy is read-only: the kernel repairs nothing during boot.
+- **Where each proof writes (`test_disk::plan`).** The block cache's page and the reserved-memory proof's 8 blocks at the partition's start, each processor's block from 64 blocks in, one page apart (room for 1,780 processors on the test disk), and the polled proof's at its last block. A write that does not fit is the guard's to refuse, so a partition too small fails a proof and nothing is written outside it.
+- **Without the mark** nothing is written or flushed, and each write proof says it did not run. After the last proof through the controller, one line says how many writes and flushes the guard let through, to which blocks, or why none, and how many commands it refused.
+- **Nothing that identifies a disk is printed:** the controller's serial number never (Base 2.4 Figure 338, §4.7.1), and on a disk without the mark neither the GPT's disk GUID, its partitions' unique GUIDs nor their names, only their types and blocks (ruling Q6).
+- **xtask.**
+  - The test disk gains the marked partition, "Origin boot-proof scratch", blocks 18432–32734; "Origin data" shrinks to 10240–18431 (ruling Q4).
+  - After every boot, whatever it booted and whatever its markers said, `check_storage_evidence` judges the NVMe test disk's bytes against the image staged: nothing changed outside the marked partition, and nothing at all on a disk without one; something changed inside it where the scenario's markers require the polled write. It also holds that no kernel line has the serial QEMU's controller is given.
+  - `cargo xtask boot-disk`, run by `boot-matrix` after `boot-reserved` (ruling Q11), boots the Intel VT-d machine with 2 processors twice, each time with another disk staged by the scenario's own hook: controls D1 and D2 below.
+
+**Controls** (ADR-0013's "Controls of TASKS item 171").
+
+| # | What | Result |
+|---|---|---|
+| D1, standing (`boot-disk`, "unmarked disk") | The third partition typed as Origin data, all else the same | Passed: the GPT lines withhold the disk GUID, the unique GUIDs and the names; `no mark of Origin's tests (no partition carries it)`; each write proof `not run`; `0 writes and 0 flushes … 0 commands refused`; the image unchanged, byte for byte |
+| D2, standing (`boot-disk`, "marked partition too small") | The marked partition 18432–18503 (72 blocks), the rest of the disk free | Passed: processor 1's write `refused: a write to blocks 18504-18504 lies outside the marked partition (blocks 18432-18503)`, the per-CPU proof failed as aimed, `boot verdict: degraded: … failed: speculation controls, NVMe (no storage)`, `2 writes and 2 flushes … 1 command refused`; the image changed inside the 72 blocks alone |
+| D1-before | `34fdf164`'s kernel and xtask, D1's disk staged, the byte check printed by a plant | Failed where aimed: the old identification took D1's disk for the test disk and wrote blocks 10240, 20000, 20008 and 32704 |
+| D4-before | `34fdf164`'s kernel boot, the serial search printed by a plant | Failed where aimed: `controller ready: model "QEMU NVMe Ctrl", serial "ORIGIN0001", …` |
+| D3 | The merged tip with the guard's range check removed, on D2's disk | Caught twice: processor 1's write landed ("read back true"), so D2's marker was missing, `and the NVMe test disk changed outside the marked partition (blocks 18432-18503): blocks 18504` |
+| D1-lie | The merged tip, the polled proof on a disk without the mark writing one block past the guard, uncounted and unsaid | Caught by the bytes alone: every line as D1's, `the NVMe test disk changed outside any marked partition, for it has none: blocks 32704` |
+| D5 | The merged tip, the polled proof aimed one block before the marked partition | Caught: `the polled proof's write to LBA 18431: refused: a write to blocks 18431-18431 lies outside the marked partition (blocks 18432-32734): NVMe failed`, `and the NVMe test disk is unchanged after a boot whose write proofs say they wrote to it` |
+
+**Gates.**
+
+Development Mac, Rust 1.100.0, QEMU 11.1.3 TCG with OVMF, on AC power, each inside `cargo xtask exclusive`:
+
+| Tree | Gate | Return code | Time |
+|---|---|---|---|
+| `755f7091` | `check` | 0 | 1,064 s |
+| `755f7091` | `boot-test` (11 of 11) | 0 | 68 s |
+| `755f7091` | `boot-matrix` (D1 and D2 among it) | 0 | 2,113 s |
+| `755f7091` and the review's fixes | the two crates' host tests (622 and 479), Clippy, `boot-test`, `boot-disk` | 0 each | 30 s, 7 s, 3 s, 66 s, 49 s |
+| `ac087949` (merged) | `check` | 0 | 918 s |
+| `ac087949` | `boot-test` (11 of 11) | 0 | 67 s |
+| `ac087949` | `boot-matrix` (D1 and D2 among it) | 0 | 2,109 s |
+| `ac087949` | `target/xtask/failed-boots` after the passing runs | none | |
+| exports | D3, D1-lie, D5, D1-before (each must fail) | 1 each | 152 s, 57 s, 54 s, 121 s |
+| export of `34fdf164` | D4-before (the old boot passes; the plant prints the serial line) | 0 | 56 s |
+
+**What a failed boot's evidence holds** (TASKS item 165's `failed-boots`, read with `grep` after D3, D1-lie and D5):
+- the disk without the mark (D1-lie): none of its GPT identifiers, in `boot.txt` or a log;
+- the marked disk (D3, D5): its disk GUID, unique GUIDs and names, xtask's fixed test values, which the kernel prints on that disk alone (ruling Q6);
+- `ORIGIN0001`, xtask's test serial: in `boot.txt`'s QEMU command line (`nvme,serial=ORIGIN0001`), and in `serial.log`'s first line, OVMF's own `BdsDxe: failed to load Boot0001 "UEFI QEMU NVMe Ctrl ORIGIN0001 1"`. No kernel line holds it. On a real machine the firmware's own console may name a disk the same way; that is the firmware's, not Origin's.
+
+**Limits.**
+- Shown under QEMU alone (the development Mac's software processor; CI's KVM jobs run `boot-matrix`, `boot-disk` among it, once this lands). No physical disk.
+- The geometry condition stays until a ruling drops it when a physical test disk exists (Q2): no disk but QEMU's 16 MiB one can be written.
+- The mark's GUID is provisional (owner item 384).
+- A boot followed by a power-off makes a real SSD count an unexpected power loss (Base 2.4's SMART field, formerly "Unsafe Shutdowns"): the kernel resets the controller at bind and sends no normal shutdown, which is row S33-12, not built (ruling Q12). No user data changes, but the count does.
+- Only block devices were audited. CMOS and what AML methods write were not; neither the loader nor the kernel calls `SetVariable`.
+- One AI reviewer read the change (`docs/engineering/REVIEW_T171_2026-11-27.md`); no person has.

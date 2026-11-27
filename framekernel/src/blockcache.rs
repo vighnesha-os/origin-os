@@ -419,20 +419,27 @@ impl QueueGate {
     }
 }
 
-/// The disk the boot test builds (`developer-tools/xtask/src/disk.rs`): the only disk the
-/// boot proofs may write to (CLAUDE.md P0). It is named positively, so that anything else,
-/// a real disk first of all, is left alone. Here because this is the block layer's library
+/// The disk the boot test builds (`developer-tools/xtask/src/disk.rs`), and the mark that lets
+/// the boot proofs write to part of it (CLAUDE.md P0; TASKS item 171). The disk is named
+/// positively, by its geometry and its pattern, so that anything else, a real disk first of
+/// all, is only read; and on it the proofs write only inside the one partition that carries the
+/// mark, whose bounds the GPT gives ([`mark`]). Here because this is the block layer's library
 /// half and the logic is tested on the host against the image xtask really builds.
 pub mod test_disk {
-    use crate::gpt;
+    use crate::gpt::{self, GptError, Header, Partition};
+    use crate::nvme::Writable;
 
     /// Its blocks, and their size.
     pub const BLOCKS: u64 = 32768;
     pub const BLOCK_SIZE: u32 = 512;
-    /// Its GPT disk GUID, 28a71590-fa80-422c-a428-8dff96984d99, as stored on disk.
-    pub const DISK_GUID: gpt::Guid = gpt::Guid([
-        0x90, 0x15, 0xA7, 0x28, 0x80, 0xFA, 0x2C, 0x42, 0xA4, 0x28, 0x8D, 0xFF, 0x96, 0x98, 0x4D,
-        0x99,
+    /// The type GUID of the partition the boot proofs may overwrite, the mark of Origin's tests,
+    /// 8d4070b7-7072-4d27-9689-81467d6a5735, as stored on disk. PROVISIONAL: generated (UUID
+    /// version 4) on 2026-11-27 and accepted the same day by the owner, owner item 384, on test
+    /// disks only, to be fixed with M9's partition-layout decision. xtask's `disk.rs` holds its
+    /// text.
+    pub const MARK: gpt::Guid = gpt::Guid([
+        0xB7, 0x70, 0x40, 0x8D, 0x72, 0x70, 0x27, 0x4D, 0x96, 0x89, 0x81, 0x46, 0x7D, 0x6A, 0x57,
+        0x35,
     ]);
     /// The first block of its pattern, and how many blocks carry one.
     pub const PATTERN_FIRST: u64 = 2048;
@@ -461,29 +468,179 @@ pub mod test_disk {
         blocks == BLOCKS && block_size == BLOCK_SIZE
     }
 
-    /// Whether the namespace is the boot test's disk: its geometry, a valid primary GPT
-    /// header in `header` (one block, read from LBA 1) naming [`DISK_GUID`], and every
-    /// pattern block in `area` ([`PATTERN_BYTES`] from [`PATTERN_FIRST`]). Anything less
-    /// says no.
-    pub fn identifies(blocks: u64, block_size: u32, header: &[u8], area: &[u8]) -> bool {
+    /// Whether the namespace is the boot test's disk: its geometry, and every pattern block in
+    /// `area` ([`PATTERN_BYTES`] from [`PATTERN_FIRST`]). Anything less says no. The proofs that
+    /// read run only on it, since they check what they read against the pattern; the proofs
+    /// that write need the mark as well ([`mark`]).
+    pub fn holds_pattern(blocks: u64, block_size: u32, area: &[u8]) -> bool {
         const BLOCK: usize = BLOCK_SIZE as usize;
-        if !geometry_matches(blocks, block_size)
-            || header.len() != BLOCK
-            || area.len() != PATTERN_BYTES
-        {
+        if !geometry_matches(blocks, block_size) || area.len() != PATTERN_BYTES {
             return false;
         }
         let mut expected = [0u8; BLOCK];
-        gpt::parse_header(header, 1, blocks).is_ok_and(|h| h.disk == DISK_GUID)
-            && area
-                .as_chunks::<BLOCK>()
-                .0
-                .iter()
-                .zip(PATTERN_FIRST..)
-                .all(|(block, lba)| {
-                    pattern(lba, &mut expected);
-                    *block == expected
-                })
+        area.as_chunks::<BLOCK>()
+            .0
+            .iter()
+            .zip(PATTERN_FIRST..)
+            .all(|(block, lba)| {
+                pattern(lba, &mut expected);
+                *block == expected
+            })
+    }
+
+    /// One GPT copy as the kernel read it: its validated header and its used entries, or why it
+    /// is not valid.
+    pub type Copy<'a> = Result<(Header, &'a [Partition]), GptError>;
+
+    /// Why the boot proofs only read a namespace: the first condition of [`mark`] it fails.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum NoMark {
+        /// Not the boot test's geometry and pattern ([`holds_pattern`]): any real disk.
+        NotTheTestDisk,
+        /// LBA 0 is not a protective MBR (`gpt::is_protective_mbr`).
+        NoProtectiveMbr,
+        /// Neither GPT copy is valid.
+        NoGpt,
+        /// Only one copy is valid (the primary if `primary`). UEFI 2.11 §5.3.2 (pp. 118–119)
+        /// asks software to restore the other, asking the user first; the boot proofs are not
+        /// that software, and a restore is a write.
+        OneCopy { primary: bool },
+        /// Both copies are valid but describe different disks or partitions.
+        Disagree,
+        /// Both copies are valid and agree, but the backup is at this LBA, not the disk's last
+        /// block, where UEFI 2.11 §5.3.1 (p. 115) puts it.
+        BackupNotLast(u64),
+        /// No used entry has the mark's type.
+        Unmarked,
+        /// This many used entries have it: no single span to trust.
+        Marks(usize),
+        /// The marked partition, numbered from 1, has attribute bit 0, Required Partition, set
+        /// (UEFI 2.11 Table 5.8, p. 120).
+        Required(u32),
+    }
+
+    impl core::fmt::Display for NoMark {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match *self {
+                Self::NotTheTestDisk => f.write_str("this is not the boot test's disk"),
+                Self::NoProtectiveMbr => f.write_str("LBA 0 is not a protective MBR"),
+                Self::NoGpt => f.write_str("no valid GPT"),
+                Self::OneCopy { primary } => write!(
+                    f,
+                    "only the {} copy of the GPT is valid, and the kernel repairs nothing during boot",
+                    if primary { "primary" } else { "backup" }
+                ),
+                Self::Disagree => f.write_str("the GPT's two copies disagree"),
+                Self::BackupNotLast(at) => write!(
+                    f,
+                    "the GPT's backup copy is at LBA {at}, not the disk's last block"
+                ),
+                Self::Unmarked => f.write_str("no partition carries it"),
+                Self::Marks(n) => write!(f, "{n} partitions carry it"),
+                Self::Required(i) => {
+                    write!(f, "partition {i}, which carries it, is marked required")
+                }
+            }
+        }
+    }
+
+    /// The marked partition, and the blocks of namespace `span.nsid` it lets the proofs write.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Mark {
+        pub partition: Partition,
+        pub span: Writable,
+    }
+
+    /// The partition of namespace `nsid`, of `blocks` blocks, the boot proofs may write to, or why
+    /// there is none, from what the kernel read of a disk that [`holds_pattern`]: `mbr` (LBA 0),
+    /// and both GPT copies, `primary` from LBA 1 and `backup` from where the primary says (or the
+    /// last block). Every condition must hold:
+    /// - LBA 0 is a protective MBR, since behind a legacy MBR a GPT may be stale (UEFI 2.11
+    ///   §5.3.2, p. 118);
+    /// - both copies are valid and agree, entry for entry, and the backup is at the last block
+    ///   (UEFI 2.11 §5.3.1, p. 115);
+    /// - exactly one used entry has the type [`MARK`];
+    /// - its Required Partition attribute is clear.
+    ///
+    /// The span is the entry's own bounds, which `gpt::parse_entries` has already found inside
+    /// the usable range: never the MBR, a GPT header or an entry array.
+    pub fn mark(
+        nsid: u32,
+        blocks: u64,
+        mbr: &[u8],
+        primary: Copy<'_>,
+        backup: Copy<'_>,
+    ) -> Result<Mark, NoMark> {
+        if !gpt::is_protective_mbr(mbr) {
+            return Err(NoMark::NoProtectiveMbr);
+        }
+        let parts = match (primary, backup) {
+            (Ok((p, mine)), Ok((b, theirs))) => {
+                if !(p.agrees_with(&b) && mine == theirs) {
+                    return Err(NoMark::Disagree);
+                }
+                if Some(b.my_lba) != blocks.checked_sub(1) {
+                    return Err(NoMark::BackupNotLast(b.my_lba));
+                }
+                mine
+            }
+            (Ok(_), Err(_)) => return Err(NoMark::OneCopy { primary: true }),
+            (Err(_), Ok(_)) => return Err(NoMark::OneCopy { primary: false }),
+            (Err(_), Err(_)) => return Err(NoMark::NoGpt),
+        };
+        let mut marked = parts.iter().filter(|p| p.kind == MARK);
+        let Some(partition) = marked.next().copied() else {
+            return Err(NoMark::Unmarked);
+        };
+        let more = marked.count();
+        if more > 0 {
+            return Err(NoMark::Marks(1 + more));
+        }
+        if partition.attributes & 1 != 0 {
+            return Err(NoMark::Required(partition.index + 1));
+        }
+        Ok(Mark {
+            partition,
+            span: Writable {
+                nsid,
+                first: partition.first,
+                last: partition.last,
+            },
+        })
+    }
+
+    /// Device blocks in a 4 KiB page of the test disk.
+    pub const PAGE_BLOCKS: u64 = 4096 / BLOCK_SIZE as u64;
+
+    /// Where in the marked partition each proof writes (TASKS item 171). Computed from the span
+    /// alone, and never checked here: a write that does not fit is refused by the driver's guard
+    /// (`nvme::permitted`), so a partition too small fails a proof and nothing is written outside
+    /// it. Every write is on the test disk, whose blocks are 512 bytes.
+    pub mod plan {
+        use super::PAGE_BLOCKS;
+        use crate::nvme::Writable;
+
+        /// The block cache's page: the first whole page of the partition.
+        pub const fn cache(span: Writable) -> u64 {
+            span.first.next_multiple_of(PAGE_BLOCKS)
+        }
+
+        /// The reserved-memory proof's page of 8 blocks, the next one.
+        pub const fn reserved(span: Writable) -> u64 {
+            cache(span).saturating_add(PAGE_BLOCKS)
+        }
+
+        /// Processor `k`'s block (in queue order): one a page apart, from 64 blocks in.
+        pub const fn cpu(span: Writable, k: u64) -> u64 {
+            cache(span)
+                .saturating_add(64)
+                .saturating_add(k.saturating_mul(PAGE_BLOCKS))
+        }
+
+        /// The polled proof's block: the partition's last, so the guard's inclusive end is used.
+        pub const fn polled(span: Writable) -> u64 {
+            span.last
+        }
     }
 }
 
@@ -1103,31 +1260,84 @@ mod tests {
 
     mod test_disk_identification {
         use super::super::boot_test_disk as xtask;
-        use super::super::test_disk::{self, identifies};
+        use super::super::test_disk::{self, Mark, NoMark, holds_pattern, mark, plan};
+        use crate::gpt::{self, GptError, Header, Partition};
+        use crate::nvme::Writable;
+        use std::vec::Vec;
 
-        /// The header and pattern blocks of the disk the boot test really builds.
-        fn parts(image: &[u8]) -> (&[u8], &[u8]) {
-            (&image[512..1024], &image[(2048 * 512)..((2048 + 64) * 512)])
+        const BS: u32 = test_disk::BLOCK_SIZE;
+        const B: usize = 512;
+        const LAST: u64 = xtask::BLOCKS - 1;
+
+        /// The pattern blocks of an image.
+        fn area(image: &[u8]) -> &[u8] {
+            &image[(2048 * B)..((2048 + 64) * B)]
+        }
+
+        /// One GPT copy of `image`, from block `lba`, as the kernel reads it.
+        fn copy(image: &[u8], lba: u64) -> Result<(Header, Vec<Partition>), GptError> {
+            let at = lba as usize * B;
+            let h = gpt::parse_header(&image[at..at + B], lba, xtask::BLOCKS)?;
+            let from = h.entries_lba as usize * B;
+            let array = &image[from..from + h.array_len() as usize];
+            let mut out = [Partition {
+                index: 0,
+                kind: gpt::Guid::default(),
+                unique: gpt::Guid::default(),
+                first: 0,
+                last: 0,
+                attributes: 0,
+                name: [0; 36],
+            }; 16];
+            let n = gpt::parse_entries(array, &h, &mut out)?;
+            Ok((h, out[..n].to_vec()))
+        }
+
+        /// A copy as `mark` takes it.
+        fn view(c: &Result<(Header, Vec<Partition>), GptError>) -> test_disk::Copy<'_> {
+            match c {
+                Ok((h, v)) => Ok((*h, v.as_slice())),
+                Err(e) => Err(*e),
+            }
+        }
+
+        /// The kernel's decision on `image`, from LBA 0 and both copies.
+        fn decide(image: &[u8]) -> Result<Mark, NoMark> {
+            let (p, b) = (copy(image, 1), copy(image, LAST));
+            mark(1, xtask::BLOCKS, &image[..B], view(&p), view(&b))
+        }
+
+        /// Edits entry `index` of both entry arrays with `f`, then seals both copies again:
+        /// a GPT another tool might have written.
+        fn edit_entry(image: &mut [u8], index: usize, f: impl Fn(&mut [u8])) {
+            for (header, array) in [(1usize, 2usize), (LAST as usize, LAST as usize - 32)] {
+                let at = array * B + index * 128;
+                f(&mut image[at..at + 128]);
+                let crc = gpt::crc32(&image[array * B..array * B + 128 * 128]);
+                let h = header * B;
+                image[h + 88..h + 92].copy_from_slice(&crc.to_le_bytes());
+                seal(&mut image[h..h + B]);
+            }
         }
 
         fn seal(header: &mut [u8]) {
             header[16..20].fill(0);
-            let crc = crate::gpt::crc32(&header[..92]);
+            let crc = gpt::crc32(&header[..92]);
             header[16..20].copy_from_slice(&crc.to_le_bytes());
         }
 
-        const BS: u32 = test_disk::BLOCK_SIZE;
-
         #[test]
-        fn the_disk_the_boot_test_builds_is_identified() {
+        fn the_disk_the_boot_test_builds_holds_the_pattern_and_the_mark() {
             // The same disk xtask writes, so the two halves cannot drift apart unnoticed.
             let image = xtask::image();
-            let (header, area) = parts(&image);
-            assert!(identifies(xtask::BLOCKS, BS, header, area));
+            assert!(holds_pattern(xtask::BLOCKS, BS, area(&image)));
             assert_eq!(test_disk::BLOCKS, xtask::BLOCKS);
             assert_eq!(u64::from(BS), xtask::BLOCK);
-            assert_eq!(test_disk::DISK_GUID.0, xtask::guid(xtask::DISK_GUID));
-            assert_eq!(std::format!("{}", test_disk::DISK_GUID), xtask::DISK_GUID);
+            assert_eq!(test_disk::MARK.0, xtask::guid(xtask::ORIGIN_PROOF_SCRATCH));
+            assert_eq!(
+                std::format!("{}", test_disk::MARK),
+                xtask::ORIGIN_PROOF_SCRATCH
+            );
             assert_eq!(test_disk::PATTERN_FIRST, xtask::PARTITIONS[0].2);
             assert_eq!(test_disk::PATTERN_BLOCKS, xtask::PATTERN_BLOCKS);
             for lba in [2048, 2049, 2111] {
@@ -1135,59 +1345,216 @@ mod tests {
                 test_disk::pattern(lba, &mut block);
                 assert_eq!(block.as_slice(), xtask::pattern(lba));
             }
+            let m = decide(&image).expect("the boot test's disk carries the mark");
+            assert_eq!(
+                m.span,
+                Writable {
+                    nsid: 1,
+                    first: xtask::MARKED.0,
+                    last: xtask::MARKED.1
+                }
+            );
+            assert_eq!(m.partition.index, 2);
+            assert_eq!(
+                std::format!("{}", m.partition.name()),
+                xtask::PARTITIONS[2].0
+            );
+            // The write plan, as xtask's markers and byte check expect it.
+            assert_eq!(plan::cache(m.span), xtask::CACHE_LBA);
+            assert_eq!(plan::reserved(m.span), xtask::RESERVED_LBA);
+            assert_eq!(plan::polled(m.span), xtask::POLLED_LBA);
+            for k in [0, 1, 61, 1777] {
+                assert_eq!(plan::cpu(m.span, k), xtask::cpu_lba(k));
+            }
+        }
+
+        /// ADR-0013's controls D1 and D2: the disks xtask builds for them.
+        #[test]
+        fn the_control_disks_decide_as_their_controls_need() {
+            let unmarked = xtask::image_with(xtask::Variant::Unmarked);
+            assert!(holds_pattern(xtask::BLOCKS, BS, area(&unmarked)));
+            assert_eq!(decide(&unmarked), Err(NoMark::Unmarked));
+            let small = xtask::image_with(xtask::Variant::Small);
+            let m = decide(&small).expect("the small partition carries the mark");
+            assert_eq!(
+                (m.span.first, m.span.last),
+                (xtask::MARKED.0, xtask::SMALL_LAST)
+            );
+            // Every fixed write fits and processor 0's; processor 1's does not, so the guard
+            // refuses it.
+            for lba in [
+                plan::cache(m.span),
+                plan::reserved(m.span) + 7,
+                plan::polled(m.span),
+                plan::cpu(m.span, 0),
+            ] {
+                assert!(m.span.contains(lba, 1), "{lba}");
+            }
+            assert!(!m.span.contains(plan::cpu(m.span, 1), 1));
         }
 
         #[test]
-        fn a_real_disk_is_not_the_test_disk() {
+        fn every_gpt_state_decides() {
+            let good = xtask::image();
+            // Only one copy valid: the backup's header damaged, or the primary's.
+            let mut d = good.clone();
+            d[LAST as usize * B + 20] ^= 1;
+            assert_eq!(decide(&d), Err(NoMark::OneCopy { primary: true }));
+            let mut d = good.clone();
+            d[B + 20] ^= 1;
+            assert_eq!(decide(&d), Err(NoMark::OneCopy { primary: false }));
+            // A damaged entry array is a damaged copy too.
+            let mut d = good.clone();
+            d[(LAST as usize - 32) * B] ^= 1;
+            assert_eq!(decide(&d), Err(NoMark::OneCopy { primary: true }));
+            // Neither, and no GPT at all.
+            let mut d = good.clone();
+            d[B + 20] ^= 1;
+            d[LAST as usize * B + 20] ^= 1;
+            assert_eq!(decide(&d), Err(NoMark::NoGpt));
+            let mut blank = std::vec![0u8; good.len()];
+            blank[..B].copy_from_slice(&good[..B]);
+            assert_eq!(decide(&blank), Err(NoMark::NoGpt));
+            // Both valid, describing different partitions: the small disk's backup array and
+            // header behind the marked disk's primary.
+            let small = xtask::image_with(xtask::Variant::Small);
+            let mut d = good.clone();
+            let back = (LAST as usize - 32) * B;
+            d[back..].copy_from_slice(&small[back..]);
+            assert!(copy(&d, 1).is_ok() && copy(&d, LAST).is_ok());
+            assert_eq!(decide(&d), Err(NoMark::Disagree));
+            // No protective MBR: blank, or a legacy partition beside it.
+            let mut d = good.clone();
+            d[..B].fill(0);
+            assert_eq!(decide(&d), Err(NoMark::NoProtectiveMbr));
+            let mut d = good.clone();
+            d[446 + 16 + 4] = 0x07;
+            assert_eq!(decide(&d), Err(NoMark::NoProtectiveMbr));
+            // Two marked partitions: Origin data given the mark too.
+            let mut d = good.clone();
+            edit_entry(&mut d, 1, |e| e[0..16].copy_from_slice(&test_disk::MARK.0));
+            assert_eq!(decide(&d), Err(NoMark::Marks(2)));
+            // The marked partition flagged required; another attribute bit is no matter.
+            let mut d = good.clone();
+            edit_entry(&mut d, 2, |e| e[48] |= 1);
+            assert_eq!(decide(&d), Err(NoMark::Required(3)));
+            let mut d = good.clone();
+            edit_entry(&mut d, 2, |e| e[55] |= 0x80);
+            assert!(decide(&d).is_ok());
+            // The mark moved to the data partition: that partition is the span.
+            let mut d = good.clone();
+            edit_entry(&mut d, 2, |e| {
+                e[0..16].copy_from_slice(&xtask::guid(xtask::ORIGIN_DATA))
+            });
+            edit_entry(&mut d, 1, |e| e[0..16].copy_from_slice(&test_disk::MARK.0));
+            let m = decide(&d).unwrap();
+            assert_eq!((m.span.first, m.span.last), (10240, 18431));
+        }
+
+        /// R171-11: two valid, agreeing copies whose backup is not at the last block, as a disk
+        /// crafted with its usable range ending past where UEFI puts the backup's entry array.
+        #[test]
+        fn a_backup_not_at_the_last_block_is_no_mark() {
             let image = xtask::image();
-            let (header, area) = parts(&image);
+            let (primary, parts) = copy(&image, 1).unwrap();
+            let moved = 20_000;
+            let mine = Header {
+                alternate_lba: moved,
+                ..primary
+            };
+            let theirs = Header {
+                my_lba: moved,
+                alternate_lba: 1,
+                entries_lba: moved - 32,
+                ..primary
+            };
+            assert!(mine.agrees_with(&theirs));
+            let copies = (Ok((mine, parts.as_slice())), Ok((theirs, parts.as_slice())));
+            assert_eq!(
+                mark(1, xtask::BLOCKS, &image[..B], copies.0, copies.1),
+                Err(NoMark::BackupNotLast(moved))
+            );
+            // At the last block it is the mark, as on the real disk.
+            let last = Header {
+                my_lba: LAST,
+                ..theirs
+            };
+            let at_end = Header {
+                alternate_lba: LAST,
+                ..primary
+            };
+            assert!(
+                mark(
+                    1,
+                    xtask::BLOCKS,
+                    &image[..B],
+                    Ok((at_end, parts.as_slice())),
+                    Ok((last, parts.as_slice()))
+                )
+                .is_ok()
+            );
+        }
+
+        #[test]
+        fn a_no_mark_names_itself() {
+            for (why, text) in [
+                (NoMark::NotTheTestDisk, "this is not the boot test's disk"),
+                (NoMark::NoProtectiveMbr, "LBA 0 is not a protective MBR"),
+                (NoMark::NoGpt, "no valid GPT"),
+                (
+                    NoMark::OneCopy { primary: true },
+                    "only the primary copy of the GPT is valid, and the kernel repairs nothing during boot",
+                ),
+                (
+                    NoMark::OneCopy { primary: false },
+                    "only the backup copy of the GPT is valid, and the kernel repairs nothing during boot",
+                ),
+                (NoMark::Disagree, "the GPT's two copies disagree"),
+                (
+                    NoMark::BackupNotLast(20_000),
+                    "the GPT's backup copy is at LBA 20000, not the disk's last block",
+                ),
+                (NoMark::Unmarked, "no partition carries it"),
+                (NoMark::Marks(2), "2 partitions carry it"),
+                (
+                    NoMark::Required(3),
+                    "partition 3, which carries it, is marked required",
+                ),
+            ] {
+                assert_eq!(std::format!("{why}"), text);
+            }
+        }
+
+        #[test]
+        fn a_real_disk_does_not_hold_the_pattern() {
+            let image = xtask::image();
+            let area = area(&image);
             // Any other size or block format: not even read.
             assert!(!test_disk::geometry_matches(xtask::BLOCKS + 1, BS));
-            assert!(!identifies(xtask::BLOCKS + 1, BS, header, area));
-            assert!(!identifies(xtask::BLOCKS, 4096, header, area));
+            assert!(!holds_pattern(xtask::BLOCKS + 1, BS, area));
+            assert!(!holds_pattern(xtask::BLOCKS, 4096, area));
             // A blank disk, an all-ones disk.
-            let blank = [0u8; 512];
             let zeros = std::vec![0u8; test_disk::PATTERN_BYTES];
-            assert!(!identifies(xtask::BLOCKS, BS, &blank, &zeros));
+            assert!(!holds_pattern(xtask::BLOCKS, BS, &zeros));
             let ones = std::vec![0xFFu8; test_disk::PATTERN_BYTES];
-            assert!(!identifies(xtask::BLOCKS, BS, &[0xFF; 512], &ones));
-            // The right GUID but no pattern; the right pattern but no GPT.
-            assert!(!identifies(xtask::BLOCKS, BS, header, &zeros));
-            assert!(!identifies(xtask::BLOCKS, BS, &blank, area));
-            // A valid GPT of another disk, the pattern present: the GUID alone says no.
-            let mut other = header.to_vec();
-            other[56] ^= 1;
-            assert!(!identifies(xtask::BLOCKS, BS, &other, area), "a bad CRC");
-            seal(&mut other);
-            assert!(!identifies(xtask::BLOCKS, BS, &other, area), "another GUID");
-            // A header or an area of the wrong length.
-            assert!(!identifies(xtask::BLOCKS, BS, &header[..100], area));
-            assert!(!identifies(xtask::BLOCKS, BS, header, &area[..512]));
+            assert!(!holds_pattern(xtask::BLOCKS, BS, &ones));
+            // An area of the wrong length.
+            assert!(!holds_pattern(xtask::BLOCKS, BS, &area[..512]));
             let longer = [area, &[0u8; 512]].concat();
-            assert!(!identifies(xtask::BLOCKS, BS, header, &longer));
+            assert!(!holds_pattern(xtask::BLOCKS, BS, &longer));
         }
 
-        /// A change of any byte the identification looks at, in the header (which its CRC
-        /// covers) or in the pattern, says no.
+        /// A change of any byte of the pattern says no.
         #[test]
-        fn a_change_of_any_byte_it_looks_at_says_no() {
+        fn a_change_of_any_pattern_byte_says_no() {
             let image = xtask::image();
-            let (header, area) = parts(&image);
-            let (mut h, mut a) = (header.to_vec(), area.to_vec());
-            for at in (0..92).step_by(7) {
-                h[at] ^= 0x40;
-                assert!(!identifies(xtask::BLOCKS, BS, &h, area), "header byte {at}");
-                h[at] ^= 0x40;
-            }
+            let mut a = area(&image).to_vec();
             for at in (0..test_disk::PATTERN_BYTES).step_by(251) {
                 a[at] ^= 0x40;
-                assert!(
-                    !identifies(xtask::BLOCKS, BS, header, &a),
-                    "pattern byte {at}"
-                );
+                assert!(!holds_pattern(xtask::BLOCKS, BS, &a), "pattern byte {at}");
                 a[at] ^= 0x40;
             }
-            assert!(identifies(xtask::BLOCKS, BS, &h, &a), "restored");
+            assert!(holds_pattern(xtask::BLOCKS, BS, &a), "restored");
         }
     }
 }
