@@ -1579,6 +1579,74 @@ fn capacity_markers(machine: &Machine, settings: &Settings) -> Vec<String> {
 }
 
 /// The kernel boot on the machine `settings` describe, with its markers for that machine.
+/// The start of the line in which the kernel says what the guard let the boot proofs write
+/// (TASKS item 171).
+const WRITES_LINE: &str = "origin-kernel: NVMe: the boot proofs sent ";
+
+/// The rest of [`WRITES_LINE`]: which blocks of namespace 1 the guard let the writes reach,
+/// `marked`, or that none could be, and that it refused nothing.
+fn writes_reach(marked: Option<(u64, u64)>) -> String {
+    match marked {
+        Some((first, last)) => format!(
+            " flushes, which the guard let reach blocks {first}-{last} of namespace 1 alone; commands refused: 0"
+        ),
+        None => " flushes, as no partition of namespace 1 carries the mark of Origin's tests; commands refused: 0".into(),
+    }
+}
+
+/// The polled proof's write at `lba`, the marked partition's last block, read back, and the read
+/// past the end refused (TASKS item 171).
+fn polled_write_marker(lba: u64) -> String {
+    format!(
+        "origin-kernel: NVMe: wrote LBA {lba} (the marked partition's last block), flushed and read it back: match true; a read at LBA {} (past the end) failed with status type 0 code 0x80 (LBA out of range: true)",
+        disk::BLOCKS
+    )
+}
+
+/// What the kernel says of `variant`'s GPT (TASKS item 171): both copies valid and agreeing, the
+/// disk and its three partitions, and the mark, or why there is none. Without the mark the disk
+/// GUID, the partitions' unique GUIDs and their names are not printed.
+fn gpt_markers(variant: disk::Variant) -> Vec<String> {
+    let parts = variant.partitions();
+    let marked = variant.marked();
+    let mut markers = vec![
+        format!(
+            "origin-kernel: GPT: primary copy valid, backup copy at LBA {} valid, the two agree true",
+            disk::BLOCKS - 1
+        ),
+        format!(
+            "origin-kernel: GPT: disk {}, usable blocks 34-{}, 128 entries of 128 B, 3 in use",
+            if marked.is_some() {
+                disk::DISK_GUID
+            } else {
+                "not shown (no mark of Origin's tests)"
+            },
+            disk::LAST_USABLE
+        ),
+    ];
+    for (i, (name, kind, first, last)) in parts.iter().enumerate() {
+        markers.push(if marked.is_some() {
+            format!(
+                "origin-kernel: GPT: partition {}: \"{name}\", type {kind}, blocks {first}-{last} (",
+                i + 1
+            )
+        } else {
+            format!(
+                "origin-kernel: GPT: partition {}: type {kind}, blocks {first}-{last} (",
+                i + 1
+            )
+        });
+    }
+    markers.push(match marked {
+        Some((first, last)) => format!(
+            "origin-kernel: NVMe: the mark of Origin's tests: partition 3 \"{}\", blocks {first}-{last} of namespace 1: the boot proofs write there and nowhere else",
+            parts[2].0
+        ),
+        None => "origin-kernel: NVMe: no mark of Origin's tests (no partition carries it): the boot proofs only read namespace 1".into(),
+    });
+    markers
+}
+
 fn boot_scenario(settings: &Settings) -> Scenario {
     let machine = machine(settings);
     let mut scenario = boot_scenario_markers(&machine, settings);
@@ -2241,7 +2309,7 @@ fn check_reserved_boot(done: &Completed, settings: &Settings) -> Result {
         proofs
             .iter()
             .filter(|l| {
-                l.contains(&format!("({access}, as the firmware's bits give: true) in the NVMe controller's domain maps to itself: true; the controller's write of LBA 2048 into it {write}: true; its read of it to LBA 24576 carried what the page holds: true; {fill}; other domains: {others}; consistent true"))
+                l.contains(&format!("({access}, as the firmware's bits give: true) in the NVMe controller's domain maps to itself: true; the controller's write of LBA 2048 into it {write}: true; its read of it to LBA {} carried what the page holds: true; {fill}; other domains: {others}; consistent true", disk::RESERVED_LBA))
             })
             .count()
     };
@@ -2919,7 +2987,10 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             "origin-kernel: NVMe: 00:02.0 1b36:0010, NVMe 1.".into(),
             // T4: only after the controller has a domain and has been reset.
             "origin-kernel: NVMe: bus mastering on after the controller was attached and reset: command register 0x0007".into(),
-            "origin-kernel: NVMe: controller ready: model \"QEMU NVMe Ctrl\", serial \"ORIGIN0001\"".into(),
+            // TASKS item 171: no serial number; `check_storage_evidence` holds that no kernel line
+            // has QEMU's.
+            "origin-kernel: NVMe: controller ready: model \"QEMU NVMe Ctrl\", firmware \"".into(),
+            "; its serial number is not printed".into(),
             format!(
                 "origin-kernel: NVMe: namespace 1: {} blocks of {} B ({} MiB)",
                 disk::BLOCKS,
@@ -2930,36 +3001,14 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
                 "origin-kernel: NVMe: asked for {} I/O queue pairs, allocated ",
                 2 + cpus
             ),
+        ])
+        // The disk's GPT, both copies checked, its partitions as `disk` wrote them, and the mark
+        // of Origin's tests on the third (TASKS item 171); then the polled proofs, which write
+        // in that partition alone.
+        .chain(gpt_markers(disk::Variant::Marked))
+        .chain([
             "origin-kernel: NVMe: through I/O queue 1: LBA 0 has the MBR signature true, LBA 1 the GPT signature true, and 8 of 8 blocks from LBA 2048 match the boot test's pattern".into(),
-            format!(
-                "origin-kernel: NVMe: wrote LBA {}, flushed and read it back: match true; a read at LBA {} (past the end) failed with status type 0 code 0x80 (LBA out of range: true)",
-                disk::BLOCKS - 64,
-                disk::BLOCKS
-            ),
-            // The disk's GPT, both copies checked, and its partitions as `disk` wrote them.
-            format!(
-                "origin-kernel: GPT: primary copy valid, backup copy at LBA {} valid, the two agree true",
-                disk::BLOCKS - 1
-            ),
-            format!(
-                "origin-kernel: GPT: disk {}, usable blocks 34-{}, 128 entries of 128 B, 2 in use",
-                disk::DISK_GUID,
-                disk::BLOCKS - 34
-            ),
-            format!(
-                "origin-kernel: GPT: partition 1: \"{}\", type {}, blocks {}-{} (",
-                disk::PARTITIONS[0].0,
-                disk::PARTITIONS[0].1,
-                disk::PARTITIONS[0].2,
-                disk::PARTITIONS[0].3
-            ),
-            format!(
-                "origin-kernel: GPT: partition 2: \"{}\", type {}, blocks {}-{} (",
-                disk::PARTITIONS[1].0,
-                disk::PARTITIONS[1].1,
-                disk::PARTITIONS[1].2,
-                disk::PARTITIONS[1].3
-            ),
+            polled_write_marker(disk::POLLED_LBA),
             // Interrupt-driven completions: MSI-X vector 1 to another CPU (q35's NVMe has
             // 65 vectors, the table in BAR 0), a thread there blocking for each one.
             format!(
@@ -2982,7 +3031,10 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             // The block cache over NVMe: cold misses fetch, re-reads hit, eviction and
             // write-back work (CLAUDE.md §39).
             "origin-kernel: block cache: 4 pages (512 B blocks, 8 per page): 32 of 32 blocks matched the pattern; 4 device reads cold, re-reading 4 resident pages did 0 more (32 hits, 4 misses)".into(),
-            "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); wrote LBA 10240, flushed (1 device writes), evicted and read back changed: true".into(),
+            format!(
+                "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); wrote LBA {}, flushed (1 device writes), evicted and read back changed: true",
+                disk::CACHE_LBA
+            ),
             // The virtio-net NIC brought up (features, MAC, DRIVER_OK, MSI-X); a receive thread
             // woken only by the NIC's interrupt resolves the gateway by ARP and takes a DHCP
             // lease (CLAUDE.md §31, §54).
@@ -3032,6 +3084,10 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             // Firmware-reserved memory (ADR-0007 questions 4 and 8): QEMU's tables name none,
             // so nothing is proved here; the boot-reserved machine plants some.
             NO_RESERVED_LINE.into(),
+            // TASKS item 171: what the guard let the proofs write, and that it refused nothing
+            // the driver sends (the coordinating session's ruling Q7).
+            WRITES_LINE.into(),
+            writes_reach(Some(disk::MARKED)),
             // The PIT's IRQ0 again, now through interrupt remapping (CLAUDE.md §24, §32;
             // ADR-0007 I8): the I/O APIC's entry in remappable format names an IRTE that
             // sends vector 0x41 to the target CPU (another than the boot processor when there
@@ -3235,6 +3291,48 @@ fn aml_markers(acpi: bool) -> Vec<String> {
 }
 
 /// The kernel boot's whole-log checks: every line whole, and the screen.
+/// Where a boot's NVMe test disk is staged under the work directory `work`.
+fn nvme_image(work: &Path) -> PathBuf {
+    work.join("nvme.img")
+}
+
+/// The serial number xtask gives QEMU's NVMe controller (`qemu_command`), which no kernel line may
+/// hold (TASKS item 171).
+const NVME_SERIAL: &str = "ORIGIN0001";
+
+/// After every boot, whatever it booted (TASKS item 171; the coordinating session's rulings of
+/// 2026-11-27):
+/// - no line of the kernel's, on any port this boot read, holds the NVMe controller's serial
+///   number;
+/// - the NVMe test disk changed nowhere outside its marked partition, and nowhere at all on a disk
+///   without one, judged from its bytes against the image staged for the boot;
+/// - where the scenario's markers require the polled proof's write, something inside it changed.
+///
+/// Every scenario's disk is [`disk::Variant::Marked`].
+fn check_storage_evidence(done: &Completed, scenario: &Scenario, work: &Path) -> Result {
+    for text in [Some(done.serial.as_str()), done.com1.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(line) = text
+            .lines()
+            .find(|l| l.contains("origin-kernel:") && l.contains(NVME_SERIAL))
+        {
+            return Err(format!(
+                "a kernel line holds the NVMe controller's serial number, which none may print (TASKS item 171): {line:?}"
+            ));
+        }
+    }
+    let variant = disk::Variant::Marked;
+    let wrote = scenario
+        .markers
+        .iter()
+        .any(|m| m.contains("(the marked partition's last block), flushed and read it back"));
+    let path = nvme_image(work);
+    let after = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    disk::check_writes(variant, &after, wrote)
+}
+
 fn check_kernel_boot(done: &Completed, settings: &Settings) -> Result {
     console_lines_intact(&done.serial, machine(settings).cpus() as usize)?;
     long_lines_whole(&done.serial)?;
@@ -7727,7 +7825,7 @@ fn stage(kernel: &[u8], loader: Loader, settings: &Settings) -> Result<Staged> {
     fs::copy(&firmware.vars_template, &vars)
         .map_err(|e| format!("copy {}: {e}", firmware.vars_template.display()))?;
     // A fresh NVMe test disk for every boot, too.
-    let nvme = work.join("nvme.img");
+    let nvme = nvme_image(&work);
     disk::write_image(&nvme)?;
     Ok(Staged {
         firmware,
@@ -8327,6 +8425,8 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
                 .check
                 .map_or(Ok(()), |check| check(&done, settings))
         })
+        // TASKS item 171: the NVMe test disk's bytes, and the controller's serial number.
+        .and_then(|()| check_storage_evidence(&done, scenario, &work))
         .and_then(
             |()| match scenario.stderr.iter().find(|m| !qemu_stderr.contains(**m)) {
                 Some(m) => Err(format!("QEMU's stderr lacks {m:?}")),

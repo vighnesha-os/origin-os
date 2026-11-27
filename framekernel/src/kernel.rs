@@ -491,6 +491,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry, #[cfg(origin_bench)] crumbs: u6
             // blocked and recorded DMA, remapped and blocked interrupts.
             let devices = storage::prove_iommu(flow, &mut com1, online.cpus(), tsc_hz);
             proofs.record(Proof::IommuDevices, devices);
+            // The last proof through the controller is done: what the guard let the proofs
+            // write, and what it refused (TASKS item 171).
+            storage::report_writes(&mut com1);
             // Legacy interrupts under interrupt remapping: the PIT's IRQ0 through the I/O
             // APIC in remappable format and an IRTE that checks the I/O APIC's source ID,
             // with the IRTE made not present and given a wrong source ID (CLAUDE.md §24,

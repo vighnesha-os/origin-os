@@ -45,9 +45,16 @@
 //! Every failure the driver detects is named (`nvme::Fault`), and a proof thread still waiting
 //! when the boot flow judges it is named with the command it waits for.
 //!
-//! The boot proofs write only to the disk the boot test builds, named positively by
-//! `framekernel::blockcache::test_disk` (CLAUDE.md P0). Any other disk gets no write and no
-//! flush during boot: the proofs say so once, and that is not a failure.
+//! The boot proofs write only inside the one partition that carries the mark of Origin's tests,
+//! on the disk the boot test builds (CLAUDE.md P0; TASKS item 171): the disk is named positively
+//! by its geometry and pattern, and the partition by the mark and both GPT copies
+//! (`framekernel::blockcache::test_disk`). Every command passes one guard before it reaches a
+//! submission queue (`nvme::permitted`, in [`submit_on`]): only the commands the driver is known
+//! to send, and no write or flush outside that partition. Any other disk, or that disk without
+//! the mark, gets no write and no flush during boot: the proofs say so once, and that is not a
+//! failure. The controller's serial number is not printed, and on a disk without the mark
+//! neither are its GPT's disk GUID, its partitions' unique GUIDs or their names, which identify
+//! the disk as the serial does.
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
@@ -90,6 +97,9 @@ struct QueuePair {
     next_cid: u16,
     /// Whether it can take a command: one at a time, and a dead queue never again.
     gate: QueueGate,
+    /// The blocks its writes and flushes may reach, the marked partition's, or `None`: the admin
+    /// queue, the interrupt queue (it only reads) and every queue of a disk without the mark.
+    writes: Option<nvme::Writable>,
 }
 
 /// Why a command did not succeed: `nvme::Fault`, which names itself.
@@ -304,6 +314,15 @@ fn submit_on(
     make: impl FnOnce(u16) -> Command,
 ) -> Result<(u16, u64), Fault> {
     {
+        // The guard first (TASKS item 171), before the queue is claimed or a slot taken, so a
+        // refused command leaves the queue as it was.
+        let cid = qp.next_cid;
+        let command = make(cid);
+        let admin = qp.qid == 0;
+        if let Err(why) = nvme::permitted(&command, admin, qp.writes) {
+            REFUSED.fetch_add(1, Ordering::Relaxed);
+            return Err(Fault::Refused(why));
+        }
         qp.gate.claim().map_err(|gate| {
             if gate.is_dead() {
                 Fault::Dead
@@ -311,14 +330,12 @@ fn submit_on(
                 Fault::Busy
             }
         })?;
-        let cid = qp.next_cid;
         qp.next_cid = nvme::next_cid(qp.next_cid);
         let Some(slot) = qp.state.submit() else {
             qp.gate.release();
             return Err(Fault::Full);
         };
-        let command = make(cid);
-        let ms = nvme::deadline_ms(qp.qid == 0, command.opcode);
+        let ms = nvme::deadline_ms(admin, command.opcode);
         for (i, word) in command.to_words().iter().enumerate() {
             qp.sq
                 .write32(usize::from(slot) * nvme::SQ_ENTRY + 4 * i, *word);
@@ -329,8 +346,52 @@ fn submit_on(
             nvme::doorbell(qp.qid, false, stride) as usize,
             u32::from(qp.state.sq_tail()),
         );
+        if !admin {
+            match command.opcode {
+                nvme::opcode::WRITE => WRITES.fetch_add(1, Ordering::Relaxed),
+                nvme::opcode::FLUSH => FLUSHES.fetch_add(1, Ordering::Relaxed),
+                _ => 0,
+            };
+        }
         Ok((cid, ms))
     }
+}
+
+/// Writes and flushes the guard let through to a submission queue, and the commands it refused,
+/// since the driver bound (TASKS item 171): for [`report_writes`].
+static WRITES: AtomicU64 = AtomicU64::new(0);
+static FLUSHES: AtomicU64 = AtomicU64::new(0);
+static REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// After the last proof that uses the controller: how many writes and flushes the boot proofs
+/// sent, which blocks the guard let them reach, and how many commands it refused (TASKS item
+/// 171). A disk without the mark shows none sent; `boot-test` holds both lines.
+pub(crate) fn report_writes(com1: &mut Console) {
+    let Some((nsid, writes)) =
+        crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().map(|d| (d.nvme.nsid, d.writes)))
+    else {
+        return;
+    };
+    let (w, f, r) = (
+        WRITES.load(Ordering::Relaxed),
+        FLUSHES.load(Ordering::Relaxed),
+        REFUSED.load(Ordering::Relaxed),
+    );
+    let reach = match writes {
+        Some(span) => alloc::format!(
+            "which the guard let reach blocks {}-{} of namespace {} alone",
+            span.first,
+            span.last,
+            span.nsid
+        ),
+        None => {
+            alloc::format!("as no partition of namespace {nsid} carries the mark of Origin's tests")
+        }
+    };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: NVMe: the boot proofs sent {w} writes and {f} flushes, {reach}; commands refused: {r}"
+    );
 }
 
 /// Takes `qp`'s next completion if it is there: the result for command `cid`, or `None`
@@ -395,6 +456,7 @@ fn new_queue(dma: DeviceDma, qid: u16, entries: u16) -> Option<QueuePair> {
         state: Queues::new(entries),
         next_cid: 0,
         gate: QueueGate::Idle,
+        writes: None,
     })
 }
 
@@ -409,8 +471,11 @@ struct Driver {
     page: DmaPage,
     /// The namespace bound (its ID is `nvme.nsid`).
     namespace: NamespaceInfo,
-    /// The namespace bound is the boot test's disk: the only one the boot proofs may write to.
-    test_disk: bool,
+    /// The namespace bound is the boot test's disk, by its geometry and pattern: the proofs that
+    /// read and check what they read run only on it.
+    pattern: bool,
+    /// The blocks of it the boot proofs may write, the marked partition's, or `None`.
+    writes: Option<nvme::Writable>,
     /// Why the proofs through interrupts cannot be shown, when the controller's own numbers
     /// say so (ruling (a) of 2026-11-14): it is bound for polled I/O alone.
     no_interrupts: Option<nvme::NoInterrupts>,
@@ -486,7 +551,8 @@ fn count_blocks(me: crate::cpu::ThisCpu<'_>, blocks: u64) {
 /// Binds the first NVMe controller and proves block I/O on namespace 1, polled and then
 /// interrupt-driven. Returns whether every step and check passed (no controller at all is
 /// reported, and passes, and so does a disk that is not the boot test's, on which only the
-/// read-only proofs that do not need its contents run).
+/// read-only proofs that do not need its contents run; on the boot test's disk without the
+/// mark, every proof runs but its writes, which each say so).
 pub(crate) fn init(
     flow: origin_frame::trap::Pinned<'_>,
     com1: &mut Console,
@@ -504,8 +570,8 @@ pub(crate) fn init(
         );
         return false;
     }
-    let (polled, on_test_disk) = match bind(com1, &dev, cpus.len()) {
-        Ok((nvme, ok, namespace, test_disk)) => {
+    let (polled, known) = match bind(com1, &dev, cpus.len()) {
+        Ok((nvme, ok, namespace, (known, writes))) => {
             let Some(page) = nvme.dma.page() else {
                 // Nothing will drive the controller: it must not keep bus mastering (I12).
                 let _ = crate::pcie::clear_bus_master(dev.function.at);
@@ -517,13 +583,14 @@ pub(crate) fn init(
                     dev,
                     page,
                     namespace,
-                    test_disk,
+                    pattern: known,
+                    writes,
                     no_interrupts: None,
                     msix: None,
                     entries: Vec::new(),
                 });
             });
-            (ok, test_disk)
+            (ok, known)
         }
         Err(why) => {
             // Failed after bus mastering went on, or before: either way nobody drives it (I12).
@@ -532,8 +599,9 @@ pub(crate) fn init(
             return false;
         }
     };
-    // Every proof below reads the boot test's pattern, and two of them write.
-    if !on_test_disk {
+    // Every proof below reads the boot test's pattern, and two of them write where the mark lets
+    // them.
+    if !known {
         return polled;
     }
     let interrupts = polled && prove_interrupts(flow, com1, cpus, tsc_hz);
@@ -572,10 +640,16 @@ pub(crate) fn geometry() -> Option<(u32, u64)> {
     })
 }
 
-/// Whether the namespace bound is the boot test's disk, the only one the boot proofs may write
-/// to.
-pub(crate) fn on_test_disk() -> bool {
-    crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().is_some_and(|d| d.test_disk))
+/// Whether the namespace bound is the boot test's disk, by its geometry and pattern, the only one
+/// whose proofs check what they read.
+pub(crate) fn on_pattern_disk() -> bool {
+    crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().is_some_and(|d| d.pattern))
+}
+
+/// The blocks of the namespace bound the boot proofs may write, the marked partition's, or
+/// `None` (TASKS item 171).
+pub(crate) fn writable() -> Option<nvme::Writable> {
+    crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().and_then(|d| d.writes))
 }
 
 /// Allocates a zeroed 4 KiB DMA page for the block layer, mapped for the bound controller.
@@ -752,11 +826,15 @@ fn msix_enabled(at: pci::Address) -> bool {
         .is_some_and(|dword| (dword >> 16) & pci::MSIX_ENABLE != 0)
 }
 
+/// What `bind` found of the namespace: whether it is the boot test's disk by its geometry and
+/// pattern, and the blocks the boot proofs may write.
+type ProofDisk = (bool, Option<nvme::Writable>);
+
 fn bind(
     com1: &mut Console,
     dev: &crate::pcie::Device,
     cpus: usize,
-) -> Result<(Nvme, bool, NamespaceInfo, bool), &'static str> {
+) -> Result<(Nvme, bool, NamespaceInfo, ProofDisk), &'static str> {
     let f = dev.function;
     let bar = dev.bars[0].ok_or("no BAR 0")?;
     if bar.kind == BarKind::Io || bar.size < 0x2000 {
@@ -916,11 +994,13 @@ fn bind(
     let mut page = [0u8; 4096];
     page.copy_from_slice(&data.to_bytes());
     let info = nvme::identify_controller(&page);
+    // Not the serial number: with the vendor and the model it identifies the controller's NVM
+    // subsystem, and so its owner's machine (Base 2.4 Figure 338, bytes 23:04, p. 340; §4.7.1,
+    // pp. 173-174; TASKS item 171).
     let _ = writeln!(
         com1,
-        "origin-kernel: NVMe: controller ready: model \"{}\", serial \"{}\", firmware \"{}\", {} namespaces, MDTS {}, controller type {:#x} ({})",
+        "origin-kernel: NVMe: controller ready: model \"{}\", firmware \"{}\", {} namespaces, MDTS {}, controller type {:#x} ({}); its serial number is not printed",
         nvme::text(&info.model),
-        nvme::text(&info.serial),
         nvme::text(&info.firmware),
         info.namespaces,
         info.mdts,
@@ -995,13 +1075,46 @@ fn bind(
         ));
     }
     c.io = Some(io);
-    let on_test_disk = is_test_disk(&mut c, &data, namespace)
+    let known = holds_pattern(&mut c, &data, namespace)
         .map_err(|fault| failed_at(com1, "a read of the namespace", fault))?;
-    let ok = prove_io(com1, &mut c, &data, namespace, on_test_disk)
-        .map_err(|fault| failed_at(com1, "a command of the polled proofs", fault))?;
-    let gpt = prove_gpt(com1, &mut c, &data, namespace, on_test_disk)
+    let disk = read_gpt(&mut c, &data, namespace)
         .map_err(|fault| failed_at(com1, "a read of the GPT", fault))?;
-    Ok((c, ok && gpt, namespace, on_test_disk))
+    // The mark is looked for only on the boot test's disk (TASKS item 171): the proofs write only
+    // inside the partition that carries it, and only through the polled queue and the
+    // processors' own, which take its span; queue 2 only reads.
+    let mark = if known {
+        test_disk::mark(c.nsid, &disk.mbr, disk.primary(), disk.backup())
+    } else {
+        Err(test_disk::NoMark::NotTheTestDisk)
+    };
+    let gpt = prove_gpt(com1, &disk, namespace, known, mark.is_ok());
+    let writes = mark.ok().map(|m| m.span);
+    match mark {
+        Ok(m) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: NVMe: the mark of Origin's tests: partition {} \"{}\", blocks {}-{} of namespace {}: the boot proofs write there and nowhere else",
+                m.partition.index + 1,
+                m.partition.name(),
+                m.span.first,
+                m.span.last,
+                m.span.nsid
+            );
+        }
+        Err(why) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: NVMe: no mark of Origin's tests ({why}): the boot proofs only read namespace {}",
+                c.nsid
+            );
+        }
+    }
+    if let Some(io) = c.io.as_mut() {
+        io.writes = writes;
+    }
+    let ok = prove_io(com1, &mut c, &data, namespace, known, writes)
+        .map_err(|fault| failed_at(com1, "a command of the polled proofs", fault))?;
+    Ok((c, ok && gpt, namespace, (known, writes)))
 }
 
 /// The first of the controller's active NVM namespaces the driver can use (M3; the
@@ -1084,17 +1197,17 @@ fn choose_namespace(
     Err("no usable NVM namespace")
 }
 
-/// Whether the namespace bound is the disk the boot test builds, the only one the boot proofs
-/// may write to (CLAUDE.md P0). Reads only, and nothing at all on a disk of any other geometry.
-fn is_test_disk(c: &mut Nvme, data: &DmaPage, ns: NamespaceInfo) -> Result<bool, Fault> {
+/// Whether the namespace bound is the disk the boot test builds, by its geometry and pattern
+/// (CLAUDE.md P0). Reads only, and nothing at all on a disk of any other geometry.
+fn holds_pattern(c: &mut Nvme, data: &DmaPage, ns: NamespaceInfo) -> Result<bool, Fault> {
     if !test_disk::geometry_matches(ns.blocks, ns.block_size) {
         return Ok(false);
     }
-    let mut header = [0u8; test_disk::BLOCK_SIZE as usize];
     let mut area = alloc::vec![0u8; test_disk::PATTERN_BYTES];
-    Ok(read_blocks(c, data, ns, 1, &mut header)?
-        && read_blocks(c, data, ns, test_disk::PATTERN_FIRST, &mut area)?
-        && test_disk::identifies(ns.blocks, ns.block_size, &header, &area))
+    Ok(
+        read_blocks(c, data, ns, test_disk::PATTERN_FIRST, &mut area)?
+            && test_disk::holds_pattern(ns.blocks, ns.block_size, &area),
+    )
 }
 
 /// What a proof thread's commands did, for its line (finding P1 of TASKS item 59; the
@@ -1521,16 +1634,38 @@ impl core::fmt::Display for State<'_> {
     }
 }
 
-/// Reads and checks both GPT copies (UEFI 2.11 §5.3.2) and lists the partitions. Both must
-/// be valid and agree; with only one, the disk is reported from it, and the proof fails. On
-/// a disk that is not the boot test's, which need not have a GPT at all, this only reports.
-fn prove_gpt(
-    com1: &mut Console,
-    c: &mut Nvme,
-    data: &DmaPage,
-    ns: NamespaceInfo,
-    on_test_disk: bool,
-) -> Result<bool, Fault> {
+/// What the kernel read of a disk's partitioning: LBA 0 and both GPT copies, each with its used
+/// entries (UEFI 2.11 §5.2.3, §5.3.2). Read once at bind, for the GPT proof and the mark.
+struct DiskGpt {
+    mbr: alloc::vec::Vec<u8>,
+    primary: GptCopy,
+    backup: GptCopy,
+    backup_lba: u64,
+    parts: [gpt::Partition; 16],
+    backup_parts: [gpt::Partition; 16],
+}
+
+impl DiskGpt {
+    /// A copy with the entries it lists.
+    fn view<'a>(copy: &GptCopy, parts: &'a [gpt::Partition; 16]) -> test_disk::Copy<'a> {
+        match *copy {
+            Ok((h, n)) => Ok((h, parts.get(..n).unwrap_or(&[]))),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn primary(&self) -> test_disk::Copy<'_> {
+        Self::view(&self.primary, &self.parts)
+    }
+
+    fn backup(&self) -> test_disk::Copy<'_> {
+        Self::view(&self.backup, &self.backup_parts)
+    }
+}
+
+/// Reads LBA 0 and both GPT copies: the backup from where the primary says, or from the last
+/// block when the primary is not valid.
+fn read_gpt(c: &mut Nvme, data: &DmaPage, ns: NamespaceInfo) -> Result<DiskGpt, Fault> {
     let empty = gpt::Partition {
         index: 0,
         kind: gpt::Guid::default(),
@@ -1540,67 +1675,110 @@ fn prove_gpt(
         attributes: 0,
         name: [0; 36],
     };
-    let mut parts = [empty; 16];
-    let mut backup_parts = [empty; 16];
-    let primary = read_gpt_copy(c, data, ns, 1, &mut parts)?;
-    let backup_lba = match primary {
-        Ok((h, _)) => h.alternate_lba,
-        Err(_) => ns.blocks - 1,
+    let mut disk = DiskGpt {
+        mbr: alloc::vec![0u8; ns.block_size as usize],
+        primary: Err(gpt::GptError::Signature),
+        backup: Err(gpt::GptError::Signature),
+        backup_lba: ns.blocks - 1,
+        parts: [empty; 16],
+        backup_parts: [empty; 16],
     };
-    let backup = read_gpt_copy(c, data, ns, backup_lba, &mut backup_parts)?;
-    let agree = match (&primary, &backup) {
-        (Ok((p, n)), Ok((b, m))) => p.agrees_with(b) && parts.get(..*n) == backup_parts.get(..*m),
+    if !read_blocks(c, data, ns, 0, &mut disk.mbr)? {
+        disk.mbr.fill(0);
+    }
+    disk.primary = read_gpt_copy(c, data, ns, 1, &mut disk.parts)?;
+    if let Ok((h, _)) = disk.primary {
+        disk.backup_lba = h.alternate_lba;
+    }
+    disk.backup = read_gpt_copy(c, data, ns, disk.backup_lba, &mut disk.backup_parts)?;
+    Ok(disk)
+}
+
+/// Checks both GPT copies (UEFI 2.11 §5.3.2) and lists the partitions. Both must be valid and
+/// agree; with only one, the disk is reported from it, and the proof fails. On a disk that is
+/// not the boot test's (`known` false), which need not have a GPT at all, this only reports.
+/// Without the mark (`marked` false) the disk GUID, the partitions' unique GUIDs and their names
+/// are not printed, since they identify the disk as its serial number does (TASKS item 171):
+/// their types and blocks are.
+fn prove_gpt(
+    com1: &mut Console,
+    disk: &DiskGpt,
+    ns: NamespaceInfo,
+    known: bool,
+    marked: bool,
+) -> bool {
+    let (primary, backup) = (&disk.primary, &disk.backup);
+    let agree = match (primary, backup) {
+        (Ok((p, n)), Ok((b, m))) => {
+            p.agrees_with(b) && disk.parts.get(..*n) == disk.backup_parts.get(..*m)
+        }
         _ => false,
     };
-    let passed = agree || !on_test_disk;
+    let passed = agree || !known;
     let _ = writeln!(
         com1,
-        "origin-kernel: GPT: primary copy {}, backup copy at LBA {backup_lba} {}, the two agree {agree}{}",
-        State(&primary),
-        State(&backup),
+        "origin-kernel: GPT: primary copy {}, backup copy at LBA {} {}, the two agree {agree}{}",
+        State(primary),
+        disk.backup_lba,
+        State(backup),
         if passed { "" } else { ": GPT failed" }
     );
-    let (list, (h, n)) = match (&primary, &backup) {
-        (Ok(p), _) => (&parts, p),
-        (Err(_), Ok(b)) => (&backup_parts, b),
-        _ => return Ok(passed),
+    let (list, (h, n)) = match (primary, backup) {
+        (Ok(p), _) => (&disk.parts, p),
+        (Err(_), Ok(b)) => (&disk.backup_parts, b),
+        _ => return passed,
+    };
+    let shown = if marked {
+        alloc::format!("{}", h.disk)
+    } else {
+        alloc::string::String::from("not shown (no mark of Origin's tests)")
     };
     let _ = writeln!(
         com1,
-        "origin-kernel: GPT: disk {}, usable blocks {}-{}, {} entries of {} B, {n} in use",
-        h.disk, h.first_usable, h.last_usable, h.entry_count, h.entry_size
+        "origin-kernel: GPT: disk {shown}, usable blocks {}-{}, {} entries of {} B, {n} in use",
+        h.first_usable, h.last_usable, h.entry_count, h.entry_size
     );
     for p in list.iter().take(*n) {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: GPT: partition {}: \"{}\", type {}, blocks {}-{} ({} MiB), unique {}",
-            p.index + 1,
-            p.name(),
-            p.kind,
-            p.first,
-            p.last,
-            (p.blocks() * u64::from(ns.block_size)) >> 20,
-            p.unique
-        );
+        let mib = (p.blocks() * u64::from(ns.block_size)) >> 20;
+        if marked {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: GPT: partition {}: \"{}\", type {}, blocks {}-{} ({mib} MiB), unique {}",
+                p.index + 1,
+                p.name(),
+                p.kind,
+                p.first,
+                p.last,
+                p.unique
+            );
+        } else {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: GPT: partition {}: type {}, blocks {}-{} ({mib} MiB)",
+                p.index + 1,
+                p.kind,
+                p.first,
+                p.last
+            );
+        }
     }
-    Ok(passed)
+    passed
 }
 
 /// Reads blocks the boot test wrote, writes and reads back one, and checks that a read past
-/// the end fails. Only on the boot test's disk: on any other this says so, once, and passes
-/// having issued no write and no flush (CLAUDE.md P0).
+/// the end fails. Only on the boot test's disk (`known`; on any other `bind` has said why the
+/// proofs only read, and this passes having issued nothing), and the write only inside the
+/// marked partition, `writes`, at its last block: without the mark this says so, and passes
+/// having issued no write and no flush (CLAUDE.md P0; TASKS item 171).
 fn prove_io(
     com1: &mut Console,
     c: &mut Nvme,
     data: &DmaPage,
     ns: NamespaceInfo,
-    on_test_disk: bool,
+    known: bool,
+    writes: Option<nvme::Writable>,
 ) -> Result<bool, Fault> {
-    if !on_test_disk {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: NVMe: write proofs skipped: this is not the boot test's disk, so nothing is written to it or flushed during boot"
-        );
+    if !known {
         return Ok(true);
     }
     let bs = u64::from(ns.block_size);
@@ -1636,8 +1814,33 @@ fn prove_io(
         "origin-kernel: NVMe: through I/O queue 1: LBA 0 has the MBR signature {signature}, LBA 1 the GPT signature {efi}, and {matching} of {blocks} blocks from LBA {first} match the boot test's pattern{}",
         if reads_ok { "" } else { ": NVMe failed" }
     );
-    // A write, a flush, and the block read back into the same (cleared) page.
-    let scratch = ns.blocks.saturating_sub(64);
+    // A read past the end must fail with "LBA out of range", not succeed or hang. DNR is not
+    // asked for: no status requires it (L5).
+    let past_end = |c: &mut Nvme| -> Result<(bool, alloc::string::String), Fault> {
+        let past = read(c, ns.blocks, 1)?;
+        let refused = past.status.is(&nvme::LBA_OUT_OF_RANGE);
+        Ok((
+            refused,
+            alloc::format!(
+                "a read at LBA {} (past the end) failed with status type {} code {:#x} (LBA out of range: {refused})",
+                ns.blocks,
+                past.status.kind,
+                past.status.code
+            ),
+        ))
+    };
+    let Some(span) = writes else {
+        let (refused, words) = past_end(c)?;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: NVMe: write proofs: not run: no mark of Origin's tests, so nothing is written to this namespace or flushed; {words}{}",
+            if refused { "" } else { ": NVMe failed" }
+        );
+        return Ok(reads_ok && refused);
+    };
+    // A write, a flush, and the block read back into the same (cleared) page, at the marked
+    // partition's last block.
+    let scratch = test_disk::plan::polled(span);
     let mut block = [0u8; 512];
     pattern(scratch ^ 0xA5A5, &mut block);
     data.fill(&block);
@@ -1668,17 +1871,11 @@ fn prove_io(
         )
     })
     .unwrap_or_default();
-    // A read past the end must fail with "LBA out of range", not succeed or hang. DNR is not
-    // asked for: no status requires it (L5).
-    let past = read(c, ns.blocks, 1)?;
-    let refused = past.status.is(&nvme::LBA_OUT_OF_RANGE);
+    let (refused, words) = past_end(c)?;
     let ok = round_trip && refused;
     let _ = writeln!(
         com1,
-        "origin-kernel: NVMe: wrote LBA {scratch}, flushed and read it back: match {round_trip}{failed_step}; a read at LBA {} (past the end) failed with status type {} code {:#x} (LBA out of range: {refused}){}",
-        ns.blocks,
-        past.status.kind,
-        past.status.code,
+        "origin-kernel: NVMe: wrote LBA {scratch} (the marked partition's last block), flushed and read it back: match {round_trip}{failed_step}; {words}{}",
         if ok { "" } else { ": NVMe failed" }
     );
     Ok(reads_ok && ok)
@@ -1706,8 +1903,8 @@ pub(crate) static CPU_QUEUES: PerCpu<SpinLock<Option<CpuQueue>>> = PerCpu::new(
 
 /// Reads each processor's thread makes, of 8 blocks each.
 const CPU_READS: u64 = 32;
-/// Per processor: reads done, blocks matched, and whether its write read back (each plus
-/// one once set).
+/// Per processor: reads done, blocks matched, and what its write did ([`WRITE_BACK`] and the
+/// others), each plus one once set.
 pub(crate) static CPU_RESULT: PerCpu<[AtomicU64; 3]> = PerCpu::new(
     "framekernel::storage::CPU_RESULT",
     [const { AtomicU64::new(0) }; 3],
@@ -1770,8 +1967,10 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[CpuIndex]) -> Result<usize, &'static
         entry(3, 0);
         d.entries.push(cpu);
         let entries = d.nvme.io_entries;
-        let queue =
+        let mut queue =
             new_queue(d.nvme.dma, qid, entries).ok_or("no memory for a per-processor queue")?;
+        // Its writes reach the marked partition alone, as queue 1's do (TASKS item 171).
+        queue.writes = d.writes;
         let page = d
             .nvme
             .dma
@@ -1946,11 +2145,18 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
         reads += 1;
         publish(reads, matched);
     }
-    // A block of its own, on the boot test's disk and no other, and on a queue that is alive
-    // (the review's F11): written from this processor's page, flushed, cleared, read back.
-    let scratch = 20_000 + 8 * index;
+    // A block of its own, in the marked partition and nowhere else, and on a queue that is alive
+    // (the review's F11): written from this processor's page, flushed, cleared, read back. Its
+    // place comes from the queue's span alone; one that does not fit is the guard's to refuse
+    // (TASKS item 171). Without the mark nothing is written, and the third slot says so.
+    let span = crate::cpu::without_interrupts(|| {
+        CPU_QUEUES
+            .this(me)
+            .and_then(|s| s.lock().as_ref().and_then(|q| q.qp.writes))
+    });
+    let scratch = span.map_or(0, |span| test_disk::plan::cpu(span, index));
     pattern(scratch ^ 0x5A5A, &mut expected);
-    let filled = on_test_disk()
+    let filled = span.is_some()
         && crate::cpu::without_interrupts(|| {
             let Some(s) = CPU_QUEUES.this(me) else {
                 return false;
@@ -1996,14 +2202,25 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
             &mut page,
         )
         && page.get(..512) == Some(&expected[..]);
+    let write = match (span, back) {
+        (None, _) => WRITE_NOT_RUN,
+        (Some(_), true) => WRITE_BACK,
+        (Some(_), false) => WRITE_FAILED,
+    };
     crate::sched::finish(|| {
         if let Some(r) = result {
-            for (slot, v) in r.iter().zip([reads, matched, u64::from(back)]) {
+            for (slot, v) in r.iter().zip([reads, matched, write]) {
                 slot.store(v + 1, Ordering::Release);
             }
         }
     })
 }
+
+/// What a processor's own write did, in its [`CPU_RESULT`]'s third slot (plus one): it failed or
+/// did not read back, it read back, or it was not run, as no partition carries the mark.
+const WRITE_FAILED: u64 = 0;
+const WRITE_BACK: u64 = 1;
+const WRITE_NOT_RUN: u64 = 2;
 
 /// Every processor given a queue pair and vector of its own reads and writes through them at the
 /// same time: every read must match, every write read back, and each processor's interrupts
@@ -2125,8 +2342,13 @@ fn prove_per_cpu(
             .get(c)
             .map_or(0, |n| n.load(Ordering::Relaxed))
             - before.get(c).copied().unwrap_or(0);
-        let (r, m, back) = (get(0), get(1), get(2) == 1);
-        let mine = r == CPU_READS && m == 8 * CPU_READS && back && interrupts >= CPU_READS + 3;
+        let (r, m, write) = (get(0), get(1), get(2));
+        let (back, not_run) = (write == WRITE_BACK, write == WRITE_NOT_RUN);
+        // The reads, and the write, flush and read back where there is a mark: one interrupt each.
+        let mine = r == CPU_READS
+            && m == 8 * CPU_READS
+            && (back || not_run)
+            && interrupts >= CPU_READS + if not_run { 0 } else { 3 };
         ok &= mine;
         reads += r;
         matched += m;
@@ -2142,14 +2364,21 @@ fn prove_per_cpu(
         let failure = match record.and_then(|r| r.note(crate::time::monotonic_nanos())) {
             Some(note) => alloc::format!("; {note}"),
             None if !ended => alloc::string::String::from("; its thread had not ended"),
-            None if !back => alloc::string::String::from("; its read back did not match"),
+            None if !back && !not_run => {
+                alloc::string::String::from("; its read back did not match")
+            }
             None => alloc::string::String::new(),
         };
         let _ = writeln!(
             com1,
-            "origin-kernel: NVMe: {}: {r} reads through its own queue pair, {m} of {} blocks match, its write read back {back}, {interrupts} interrupts on CPU {cpu}, the longest command {longest} us{}{}",
+            "origin-kernel: NVMe: {}: {r} reads through its own queue pair, {m} of {} blocks match, its write {}, {interrupts} interrupts on CPU {cpu}, the longest command {longest} us{}{}",
             cpu.named(),
             8 * CPU_READS,
+            if not_run {
+                alloc::string::String::from("not run (no mark of Origin's tests)")
+            } else {
+                alloc::format!("read back {back}")
+            },
             if mine { "" } else { &failure },
             if mine { "" } else { ": NVMe failed" }
         );
@@ -2341,7 +2570,7 @@ pub(crate) fn prove_iommu(
                 d.dev.function.at,
                 d.msix,
                 d.page.bus().raw(),
-                d.test_disk,
+                d.pattern,
                 d.entries.clone(),
                 (d.nvme.nsid, d.namespace.block_size),
                 d.no_interrupts,
@@ -2349,8 +2578,7 @@ pub(crate) fn prove_iommu(
         })
     });
     let on = crate::iommu::translating();
-    let Some((dma, at, msix, irq_page, on_test_disk, entries, namespace, no_interrupts)) = driver
-    else {
+    let Some((dma, at, msix, irq_page, known, entries, namespace, no_interrupts)) = driver else {
         let _ = writeln!(
             com1,
             "origin-kernel: IOMMU: no NVMe controller is bound, so the proofs through one did not run"
@@ -2366,7 +2594,7 @@ pub(crate) fn prove_iommu(
         return !on;
     };
     // They read the boot test's pattern and use the queues only its disk gets (`init`).
-    if !on_test_disk {
+    if !known {
         let _ = writeln!(
             com1,
             "origin-kernel: IOMMU: the proofs through the NVMe controller skipped: this is not the boot test's disk"
@@ -2644,10 +2872,6 @@ fn prove_blocked_interrupt(
     }
 }
 
-/// The page of scratch blocks the reserved-memory proof writes: in the data partition, apart
-/// from every other proof's.
-const RESERVED_LBA: u64 = 24_576;
-
 /// A copy of the firmware memory page at `phys`, read with volatile reads (a device may write
 /// it), or `None` if the memory map does not call it the firmware's.
 fn firmware_page(phys: u64) -> Option<[u8; PAGE as usize]> {
@@ -2729,6 +2953,9 @@ fn prove_reserved(com1: &mut Console, domain: crate::iommu::Domain, at: pci::Add
     for (k, block) in expected.chunks_mut(512).enumerate() {
         pattern(PROBE_LBA + k as u64, block);
     }
+    // The page of 8 blocks its disk legs write: in the marked partition, apart from every other
+    // proof's, or none without the mark (TASKS item 171).
+    let disk_lba = writable().map(test_disk::plan::reserved);
     let _ = crate::iommu::take_faults();
     let mut all = true;
     let pages = spans.iter().flat_map(|&(span, access)| {
@@ -2784,25 +3011,44 @@ fn prove_reserved(com1: &mut Console, domain: crate::iommu::Domain, at: pci::Add
             )
         };
         // The controller reads the page: written to the scratch blocks (zeroed first through
-        // an ordinary DMA page), then read back through that page.
-        plain.fill(&[0u8; PAGE as usize]);
-        let zeroed = transfer_status(true, RESERVED_LBA, plain.bus().raw(), 8)
-            .ok()
-            .is_some_and(|s| s.ok());
-        let sent = transfer_status(true, RESERVED_LBA, page, 8).ok();
-        let read_fault = faults_at(sid, page);
-        plain.fill(&[CANARY; PAGE as usize]);
-        let back = transfer_status(false, RESERVED_LBA, plain.bus().raw(), 8)
-            .ok()
-            .is_some_and(|s| s.ok());
-        let disk = plain.to_bytes();
-        let read_ok = zeroed
-            && back
-            && if access.read {
-                sent.is_some_and(|s| s.ok()) && Some(disk) == after && read_fault.is_none()
-            } else {
-                disk == [0u8; PAGE as usize] && read_fault.is_some()
-            };
+        // an ordinary DMA page), then read back through that page. Only with the mark.
+        let (read_words, read_ok) = match disk_lba {
+            Some(lba) => {
+                plain.fill(&[0u8; PAGE as usize]);
+                let zeroed = transfer_status(true, lba, plain.bus().raw(), 8)
+                    .ok()
+                    .is_some_and(|s| s.ok());
+                let sent = transfer_status(true, lba, page, 8).ok();
+                let read_fault = faults_at(sid, page);
+                plain.fill(&[CANARY; PAGE as usize]);
+                let back = transfer_status(false, lba, plain.bus().raw(), 8)
+                    .ok()
+                    .is_some_and(|s| s.ok());
+                let disk = plain.to_bytes();
+                let ok = zeroed
+                    && back
+                    && if access.read {
+                        sent.is_some_and(|s| s.ok()) && Some(disk) == after && read_fault.is_none()
+                    } else {
+                        disk == [0u8; PAGE as usize] && read_fault.is_some()
+                    };
+                let words = alloc::format!(
+                    "to LBA {lba} {}",
+                    if access.read {
+                        "carried what the page holds"
+                    } else {
+                        "was blocked and recorded"
+                    }
+                );
+                (words, ok)
+            }
+            None => (
+                alloc::string::String::from(
+                    "to the disk was not run, as no partition carries the mark of Origin's tests",
+                ),
+                true,
+            ),
+        };
         // A page without the fill is as it was: the proof wrote nothing into it.
         let untouched = filled || (before.is_some() && firmware_page(page) == before);
         // No other domain reaches the page, at any address, unless the firmware names it for
@@ -2838,13 +3084,8 @@ fn prove_reserved(com1: &mut Console, domain: crate::iommu::Domain, at: pci::Add
         all &= ok;
         let _ = writeln!(
             com1,
-            "origin-kernel: IOMMU: reserved memory proof: page {page:#x} ({}, as the firmware's bits give: {as_flagged}) in the NVMe controller's domain maps to itself: {identity}; the controller's write of LBA {PROBE_LBA} into it {write_words}: {write_ok}; its read of it to LBA {RESERVED_LBA} {}: {read_ok}; {}; other domains: {}; consistent {ok}{}",
+            "origin-kernel: IOMMU: reserved memory proof: page {page:#x} ({}, as the firmware's bits give: {as_flagged}) in the NVMe controller's domain maps to itself: {identity}; the controller's write of LBA {PROBE_LBA} into it {write_words}: {write_ok}; its read of it {read_words}: {read_ok}; {}; other domains: {}; consistent {ok}{}",
             crate::iommu::access_words(access),
-            if access.read {
-                "carried what the page holds"
-            } else {
-                "was blocked and recorded"
-            },
             if filled {
                 alloc::string::String::from("the page held the test step's fill")
             } else {
