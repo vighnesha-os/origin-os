@@ -82,6 +82,19 @@ const PROOF_FILES: &[ProofFile] = &[
         module: "image::proofs",
         parent: "runtime/onbf/format/src/image.rs",
     },
+    // TASKS item 143, step 4: capability validation, the kernel's two host-built checks.
+    ProofFile {
+        package: "framekernel",
+        file: "framekernel/src/handles/proofs.rs",
+        module: "handles::proofs",
+        parent: "framekernel/src/handles.rs",
+    },
+    ProofFile {
+        package: "framekernel",
+        file: "framekernel/src/mapping/proofs.rs",
+        module: "mapping::proofs",
+        parent: "framekernel/src/mapping.rs",
+    },
 ];
 
 /// The line a parent declares its proof module with, after `#[cfg(kani)]`.
@@ -110,6 +123,8 @@ const OCBOR: &str = "runtime/onbf/format/src/ocbor.rs";
 const SIGNATURE: &str = "runtime/onbf/format/src/signature.rs";
 const IMAGE: &str = "runtime/onbf/format/src/image.rs";
 const ONBF_PROOFS: &str = "runtime/onbf/format/src/proofs.rs";
+const HANDLES: &str = "framekernel/src/handles.rs";
+const MAPPING: &str = "framekernel/src/mapping.rs";
 
 /// The controls. Each harness of [`PROOF_FILES`] is named by at least one.
 const CONTROLS: &[Control] = &[
@@ -481,6 +496,172 @@ const CONTROLS: &[Control] = &[
             "Ok only when every byte is zero",
             "the byte named is not zero",
         ],
+    },
+    // TASKS item 143, step 4: the handle table and the map request.
+    Control {
+        name: "new-quota-uncapped",
+        file: HANDLES,
+        from: "            limit: limit.min(MAX_HANDLES),\n",
+        to: "            limit,\n",
+        harnesses: &["handles::proofs::new_is_whole"],
+        expect: &["P11: live within the quota"],
+    },
+    Control {
+        name: "join-without-the-one",
+        file: HANDLES,
+        from: "    ((index as u64 + 1) << GENERATION_BITS) | (generation & LAST_GENERATION)\n",
+        to: "    ((index as u64) << GENERATION_BITS) | (generation & LAST_GENERATION)\n",
+        harnesses: &["handles::proofs::the_encoding_is_e1s"],
+        expect: &["the handle E1 describes"],
+    },
+    Control {
+        name: "missing-slot-as-denied",
+        file: HANDLES,
+        from: "too (ADR-0017 Z9).\n        let index = nospec::index(index, self.slots.len()).ok_or(Error::BadHandle)?;\n",
+        to: "too (ADR-0017 Z9).\n        let index = nospec::index(index, self.slots.len()).ok_or(Error::AccessDenied)?;\n",
+        harnesses: &[
+            "handles::proofs::get_is_exactly_p1_at_0",
+            "handles::proofs::get_is_exactly_p1_at_1",
+            "handles::proofs::get_is_exactly_p1_at_2",
+            "handles::proofs::remove_keeps_the_table_whole_at_0",
+        ],
+        expect: &["get is exactly P1's answer", "remove refuses as get does"],
+    },
+    Control {
+        name: "rights-loosened",
+        file: HANDLES,
+        from: "                } else if r & need.rights == need.rights {\n",
+        to: "                } else if r & need.rights != 0 || need.rights == 0 {\n",
+        harnesses: &[
+            "handles::proofs::get_is_exactly_p1_at_1",
+            "handles::proofs::get_is_exactly_p1_at_2",
+        ],
+        expect: &["get is exactly P1's answer"],
+    },
+    Control {
+        name: "live-not-counted",
+        file: HANDLES,
+        from: "        self.live += 1;\n",
+        to: "",
+        harnesses: &[
+            "handles::proofs::insert_keeps_the_table_whole_at_0",
+            "handles::proofs::insert_keeps_the_table_whole_at_1",
+            "handles::proofs::insert_keeps_the_table_whole_at_2",
+        ],
+        expect: &["live counts the full slots", "one more handle"],
+    },
+    Control {
+        name: "generation-not-bumped",
+        file: HANDLES,
+        from: "            slot.generation += 1;\n",
+        to: "",
+        harnesses: &[
+            "handles::proofs::remove_keeps_the_table_whole_at_1",
+            "handles::proofs::remove_keeps_the_table_whole_at_2",
+        ],
+        expect: &["H3: a stale handle never names the slot's next object"],
+    },
+    Control {
+        name: "last-generation-reused",
+        file: HANDLES,
+        from: "        if slot.generation < LAST_GENERATION {\n",
+        to: "        if true {\n",
+        harnesses: &[
+            "handles::proofs::remove_keeps_the_table_whole_at_1",
+            "handles::proofs::remove_keeps_the_table_whole_at_2",
+        ],
+        expect: &[
+            "E1: a generation from 1 to the last",
+            "H7: a slot used at its last generation is retired",
+        ],
+    },
+    Control {
+        name: "duplicate-of-anything",
+        file: HANDLES,
+        from: "        let (object, old) = self.get(handle, need)?;\n",
+        to: "        let Ok((object, old)) = self.get(handle, need) else {\n            return Ok(handle);\n        };\n",
+        harnesses: &[
+            "handles::proofs::duplicate_only_shrinks_rights_at_0",
+            "handles::proofs::duplicate_only_shrinks_rights_at_1",
+            "handles::proofs::duplicate_only_shrinks_rights_at_2",
+        ],
+        expect: &["a duplicate only of a handle that meets the need"],
+    },
+    Control {
+        name: "duplicate-widens",
+        file: HANDLES,
+        from: "        if new_rights & !old != 0 {\n            return Err(Error::InvalidArgs);\n        }\n",
+        to: "",
+        harnesses: &[
+            "handles::proofs::duplicate_only_shrinks_rights_at_1",
+            "handles::proofs::duplicate_only_shrinks_rights_at_2",
+        ],
+        expect: &["P2: rights only shrink"],
+    },
+    Control {
+        name: "batch-refusal-as-success",
+        file: HANDLES,
+        from: "        self.check_all(list, need)?;\n",
+        to: "        if self.check_all(list, need).is_err() {\n            return Ok(Vec::new());\n        }\n",
+        harnesses: &[
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_0_of_1",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_0_of_2",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_1_of_1",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_1_of_2",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_1",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_2",
+        ],
+        expect: &["take_all moves only what check_all accepts"],
+    },
+    Control {
+        name: "batch-partial",
+        file: HANDLES,
+        from: "        self.check_all(list, need)?;\n",
+        to: "",
+        harnesses: &[
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_1_of_2",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_2",
+        ],
+        expect: &["a refused batch changes nothing"],
+    },
+    Control {
+        name: "reserve-past-the-quota",
+        file: HANDLES,
+        from: "        if count > self.free_slots() {\n",
+        to: "        if count > self.free_slots() + 1 {\n",
+        harnesses: &[
+            "handles::proofs::reserve_makes_room_at_0_for_1",
+            "handles::proofs::reserve_makes_room_at_0_for_2",
+            "handles::proofs::reserve_makes_room_at_1_for_1",
+            "handles::proofs::reserve_makes_room_at_1_for_2",
+            "handles::proofs::reserve_makes_room_at_2_for_1",
+            "handles::proofs::reserve_makes_room_at_2_for_2",
+        ],
+        expect: &["H6: Ok exactly when the quota has room"],
+    },
+    Control {
+        name: "write-with-execute-denied-not-invalid",
+        file: MAPPING,
+        from: "        if bits & !map_access::ALL != 0 || bits & map_access::READ == 0 || (write && execute) {\n",
+        to: "        if bits & !map_access::ALL != 0 || bits & map_access::READ == 0 {\n",
+        harnesses: &["mapping::proofs::allow_from_every_bits"],
+        expect: &["access_denied only for execute"],
+    },
+    Control {
+        name: "map-rights-loosened",
+        file: MAPPING,
+        from: "    if held & allow.needs() != allow.needs() {\n",
+        to: "    if held & allow.needs() == 0 {\n",
+        harnesses: &["mapping::proofs::check_every_request"],
+        expect: &["the handle holds every right needed"],
+    },
+    Control {
+        name: "within-loosened",
+        file: MAPPING,
+        from: "            (Self::Read, _) | (Self::ReadWrite, Self::ReadWrite)\n",
+        to: "            (Self::Read, _) | (Self::ReadWrite, _)\n",
+        harnesses: &["mapping::proofs::within_is_allows_nothing_more"],
+        expect: &["within: allows nothing more"],
     },
 ];
 

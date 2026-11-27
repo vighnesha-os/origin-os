@@ -67,6 +67,39 @@ struct Slot<T> {
 }
 
 /// One process's handles.
+///
+/// Its entries, and each entry's rights, are reached only through its methods: `insert` gives a
+/// new object its rights, `duplicate` can only take rights away (ADR-0005 P2), and nothing
+/// changes an entry's rights in place. Code outside this module cannot reach an entry through
+/// the table's fields:
+///
+/// ```compile_fail,E0616
+/// fn widen(table: &mut framekernel::handles::HandleTable<u32>) {
+///     table.slots.clear();
+/// }
+/// ```
+///
+/// nor build a table with entries of its choosing:
+///
+/// ```compile_fail,E0451
+/// let _table: framekernel::handles::HandleTable<u32> = framekernel::handles::HandleTable {
+///     slots: Vec::new(),
+///     free: Vec::new(),
+///     limit: 1,
+///     live: 0,
+/// };
+/// ```
+///
+/// nor name an entry's type:
+///
+/// ```compile_fail,E0603
+/// let _ = core::mem::size_of::<framekernel::handles::Slot<u32>>();
+/// ```
+///
+/// Each is refused twice over: the fields are private, and so is the entry type they hold.
+/// (Rustdoc on stable does not check the error codes given; they say which refusal is meant.)
+/// A handle itself is a plain `u64`, the ABI's value (E1), so anyone can write one; the table
+/// answers only for the ones it issued and has not taken back (Kani's `handles::proofs`).
 pub struct HandleTable<T> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
@@ -686,3 +719,7 @@ mod tests {
         }
     }
 }
+
+/// Kani's proofs of the handle table (TASKS item 143, step 4): `cargo xtask kani`.
+#[cfg(kani)]
+mod proofs;
