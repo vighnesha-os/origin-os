@@ -364,11 +364,12 @@ static FLUSHES: AtomicU64 = AtomicU64::new(0);
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// After the last proof that uses the controller: how many writes and flushes the boot proofs
-/// sent, which blocks the guard let them reach, and how many commands it refused (TASKS item
-/// 171). A disk without the mark shows none sent; `boot-test` holds both lines.
+/// sent, which blocks the guard let them reach, or why it let none through, and how many commands
+/// it refused (TASKS item 171). A disk without the mark shows none sent; `boot-test` holds the
+/// line. The counts are followed by fixed words, so that a marker holds each count exactly.
 pub(crate) fn report_writes(com1: &mut Console) {
-    let Some((nsid, writes)) =
-        crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().map(|d| (d.nvme.nsid, d.writes)))
+    let Some((nsid, mark)) =
+        crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().map(|d| (d.nvme.nsid, d.mark)))
     else {
         return;
     };
@@ -377,20 +378,21 @@ pub(crate) fn report_writes(com1: &mut Console) {
         FLUSHES.load(Ordering::Relaxed),
         REFUSED.load(Ordering::Relaxed),
     );
-    let reach = match writes {
-        Some(span) => alloc::format!(
+    let reach = match mark {
+        Ok(span) => alloc::format!(
             "which the guard let reach blocks {}-{} of namespace {} alone",
             span.first,
             span.last,
             span.nsid
         ),
-        None => {
-            alloc::format!("as no partition of namespace {nsid} carries the mark of Origin's tests")
+        Err(why) => {
+            alloc::format!("as namespace {nsid} carries no mark of Origin's tests ({why})")
         }
     };
     let _ = writeln!(
         com1,
-        "origin-kernel: NVMe: the boot proofs sent {w} writes and {f} flushes, {reach}; commands refused: {r}"
+        "origin-kernel: NVMe: the boot proofs sent {w} writes and {f} flushes, {reach}; {r} {} refused",
+        if r == 1 { "command" } else { "commands" }
     );
 }
 
@@ -474,8 +476,8 @@ struct Driver {
     /// The namespace bound is the boot test's disk, by its geometry and pattern: the proofs that
     /// read and check what they read run only on it.
     pattern: bool,
-    /// The blocks of it the boot proofs may write, the marked partition's, or `None`.
-    writes: Option<nvme::Writable>,
+    /// The blocks of it the boot proofs may write, the marked partition's, or why there are none.
+    mark: Result<nvme::Writable, test_disk::NoMark>,
     /// Why the proofs through interrupts cannot be shown, when the controller's own numbers
     /// say so (ruling (a) of 2026-11-14): it is bound for polled I/O alone.
     no_interrupts: Option<nvme::NoInterrupts>,
@@ -571,7 +573,7 @@ pub(crate) fn init(
         return false;
     }
     let (polled, known) = match bind(com1, &dev, cpus.len()) {
-        Ok((nvme, ok, namespace, (known, writes))) => {
+        Ok((nvme, ok, namespace, (known, mark))) => {
             let Some(page) = nvme.dma.page() else {
                 // Nothing will drive the controller: it must not keep bus mastering (I12).
                 let _ = crate::pcie::clear_bus_master(dev.function.at);
@@ -584,7 +586,7 @@ pub(crate) fn init(
                     page,
                     namespace,
                     pattern: known,
-                    writes,
+                    mark,
                     no_interrupts: None,
                     msix: None,
                     entries: Vec::new(),
@@ -649,7 +651,7 @@ pub(crate) fn on_pattern_disk() -> bool {
 /// The blocks of the namespace bound the boot proofs may write, the marked partition's, or
 /// `None` (TASKS item 171).
 pub(crate) fn writable() -> Option<nvme::Writable> {
-    crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().and_then(|d| d.writes))
+    crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().and_then(|d| d.mark.ok()))
 }
 
 /// Allocates a zeroed 4 KiB DMA page for the block layer, mapped for the bound controller.
@@ -827,8 +829,8 @@ fn msix_enabled(at: pci::Address) -> bool {
 }
 
 /// What `bind` found of the namespace: whether it is the boot test's disk by its geometry and
-/// pattern, and the blocks the boot proofs may write.
-type ProofDisk = (bool, Option<nvme::Writable>);
+/// pattern, and the blocks the boot proofs may write, or why there are none.
+type ProofDisk = (bool, Result<nvme::Writable, test_disk::NoMark>);
 
 fn bind(
     com1: &mut Console,
@@ -1083,13 +1085,19 @@ fn bind(
     // inside the partition that carries it, and only through the polled queue and the
     // processors' own, which take its span; queue 2 only reads.
     let mark = if known {
-        test_disk::mark(c.nsid, &disk.mbr, disk.primary(), disk.backup())
+        test_disk::mark(
+            c.nsid,
+            namespace.blocks,
+            &disk.mbr,
+            disk.primary(),
+            disk.backup(),
+        )
     } else {
         Err(test_disk::NoMark::NotTheTestDisk)
     };
     let gpt = prove_gpt(com1, &disk, namespace, known, mark.is_ok());
     let writes = mark.ok().map(|m| m.span);
-    match mark {
+    match &mark {
         Ok(m) => {
             let _ = writeln!(
                 com1,
@@ -1114,7 +1122,7 @@ fn bind(
     }
     let ok = prove_io(com1, &mut c, &data, namespace, known, writes)
         .map_err(|fault| failed_at(com1, "a command of the polled proofs", fault))?;
-    Ok((c, ok && gpt, namespace, (known, writes)))
+    Ok((c, ok && gpt, namespace, (known, mark.map(|m| m.span))))
 }
 
 /// The first of the controller's active NVM namespaces the driver can use (M3; the
@@ -1845,9 +1853,21 @@ fn prove_io(
     pattern(scratch ^ 0xA5A5, &mut block);
     data.fill(&block);
     let prps = nvme::prps(data.bus().raw(), bs, PAGE).ok_or(Fault::NeedsPrpList)?;
-    let wrote = c.run(Q::Polled, |cid| {
+    // A write the guard refuses fails this proof by name, and the driver stays bound, so the
+    // proofs after it and the summary of what the guard let through still run (the review's
+    // R171-3).
+    let wrote = match c.run(Q::Polled, |cid| {
         Command::transfer(true, cid, nsid, scratch, 1, prps)
-    })?;
+    }) {
+        Err(fault @ Fault::Refused(_)) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: NVMe: the polled proof's write to LBA {scratch}: {fault}: NVMe failed"
+            );
+            return Ok(false);
+        }
+        sent => sent?,
+    };
     let flushed = c.run(Q::Polled, |cid| Command::flush(cid, nsid))?;
     data.fill(&[0u8; 512]);
     let back = read(c, scratch, 1)?;
@@ -1970,7 +1990,7 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[CpuIndex]) -> Result<usize, &'static
         let mut queue =
             new_queue(d.nvme.dma, qid, entries).ok_or("no memory for a per-processor queue")?;
         // Its writes reach the marked partition alone, as queue 1's do (TASKS item 171).
-        queue.writes = d.writes;
+        queue.writes = d.mark.ok();
         let page = d
             .nvme
             .dma
@@ -2330,6 +2350,7 @@ fn prove_per_cpu(
     );
     let micros = crate::cpu::rdtsc().wrapping_sub(start) / (tsc_hz / 1_000_000).max(1);
     let mut ok = finished();
+    let no_span = writable().is_none();
     let (mut reads, mut matched) = (0, 0);
     for &cpu in cpus {
         let c = cpu.get();
@@ -2344,10 +2365,13 @@ fn prove_per_cpu(
             - before.get(c).copied().unwrap_or(0);
         let (r, m, write) = (get(0), get(1), get(2));
         let (back, not_run) = (write == WRITE_BACK, write == WRITE_NOT_RUN);
+        // A write not run passes only where the namespace has no span at all (the review's
+        // R171-4): a queue that lost its span on a marked disk fails.
+        let skipped = not_run && !no_span;
         // The reads, and the write, flush and read back where there is a mark: one interrupt each.
         let mine = r == CPU_READS
             && m == 8 * CPU_READS
-            && (back || not_run)
+            && (back || (not_run && no_span))
             && interrupts >= CPU_READS + if not_run { 0 } else { 3 };
         ok &= mine;
         reads += r;
@@ -2364,6 +2388,9 @@ fn prove_per_cpu(
         let failure = match record.and_then(|r| r.note(crate::time::monotonic_nanos())) {
             Some(note) => alloc::format!("; {note}"),
             None if !ended => alloc::string::String::from("; its thread had not ended"),
+            None if skipped => alloc::string::String::from(
+                "; its write was not run, although the namespace carries the mark",
+            ),
             None if !back && !not_run => {
                 alloc::string::String::from("; its read back did not match")
             }
@@ -2374,8 +2401,10 @@ fn prove_per_cpu(
             "origin-kernel: NVMe: {}: {r} reads through its own queue pair, {m} of {} blocks match, its write {}, {interrupts} interrupts on CPU {cpu}, the longest command {longest} us{}{}",
             cpu.named(),
             8 * CPU_READS,
-            if not_run {
+            if not_run && no_span {
                 alloc::string::String::from("not run (no mark of Origin's tests)")
+            } else if not_run {
+                alloc::string::String::from("not run")
             } else {
                 alloc::format!("read back {back}")
             },

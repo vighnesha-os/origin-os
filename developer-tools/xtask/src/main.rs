@@ -1582,27 +1582,36 @@ fn capacity_markers(machine: &Machine, settings: &Settings) -> Vec<String> {
     ]
 }
 
-/// The kernel boot on the machine `settings` describe, with its markers for that machine.
 /// The start of the line in which the kernel says what the guard let the boot proofs write
 /// (TASKS item 171).
 const WRITES_LINE: &str = "origin-kernel: NVMe: the boot proofs sent ";
 
-/// The rest of [`WRITES_LINE`]: which blocks of namespace 1 the guard let the writes reach,
-/// `marked`, or that none could be, and that it refused nothing.
-fn writes_reach(marked: Option<(u64, u64)>) -> String {
+/// The rest of [`WRITES_LINE`] after the flushes' count: which blocks of namespace 1 the guard
+/// let the writes reach, `marked`, or why none could be, and that it refused `refused` commands.
+fn writes_reach(marked: Option<(u64, u64)>, refused: u64) -> String {
+    let refused = format!(
+        "; {refused} {} refused",
+        if refused == 1 { "command" } else { "commands" }
+    );
     match marked {
         Some((first, last)) => format!(
-            " flushes, which the guard let reach blocks {first}-{last} of namespace 1 alone; commands refused: 0"
+            " flushes, which the guard let reach blocks {first}-{last} of namespace 1 alone{refused}"
         ),
-        None => " flushes, as no partition of namespace 1 carries the mark of Origin's tests; commands refused: 0".into(),
+        None => format!(
+            " flushes, as namespace 1 carries no mark of Origin's tests (no partition carries it){refused}"
+        ),
     }
 }
+
+/// The words of the polled proof's line that say it wrote: a scenario whose markers hold them
+/// requires the disk to have changed ([`requires_writes`]).
+const POLLED_WRITE_WORDS: &str = "(the marked partition's last block), flushed and read it back";
 
 /// The polled proof's write at `lba`, the marked partition's last block, read back, and the read
 /// past the end refused (TASKS item 171).
 fn polled_write_marker(lba: u64) -> String {
     format!(
-        "origin-kernel: NVMe: wrote LBA {lba} (the marked partition's last block), flushed and read it back: match true; a read at LBA {} (past the end) failed with status type 0 code 0x80 (LBA out of range: true)",
+        "origin-kernel: NVMe: wrote LBA {lba} {POLLED_WRITE_WORDS}: match true; a read at LBA {} (past the end) failed with status type 0 code 0x80 (LBA out of range: true)",
         disk::BLOCKS
     )
 }
@@ -1651,6 +1660,7 @@ fn gpt_markers(variant: disk::Variant) -> Vec<String> {
     markers
 }
 
+/// The kernel boot on the machine `settings` describe, with its markers for that machine.
 fn boot_scenario(settings: &Settings) -> Scenario {
     let machine = machine(settings);
     let mut scenario = boot_scenario_markers(&machine, settings);
@@ -3091,7 +3101,7 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             // TASKS item 171: what the guard let the proofs write, and that it refused nothing
             // the driver sends (the coordinating session's ruling Q7).
             WRITES_LINE.into(),
-            writes_reach(Some(disk::MARKED)),
+            writes_reach(Some(disk::MARKED), 0),
             // The PIT's IRQ0 again, now through interrupt remapping (CLAUDE.md §24, §32;
             // ADR-0007 I8): the I/O APIC's entry in remappable format names an IRTE that
             // sends vector 0x41 to the target CPU (another than the boot processor when there
@@ -3294,7 +3304,6 @@ fn aml_markers(acpi: bool) -> Vec<String> {
     markers
 }
 
-/// The kernel boot's whole-log checks: every line whole, and the screen.
 /// Where a boot's NVMe test disk is staged under the work directory `work`.
 fn nvme_image(work: &Path) -> PathBuf {
     work.join("nvme.img")
@@ -3319,25 +3328,37 @@ fn check_storage_evidence(done: &Completed, scenario: &Scenario, work: &Path) ->
         .into_iter()
         .flatten()
     {
-        if let Some(line) = text
-            .lines()
-            .find(|l| l.contains("origin-kernel:") && l.contains(NVME_SERIAL))
-        {
+        if let Some(line) = serial_line(text) {
             return Err(format!(
                 "a kernel line holds the NVMe controller's serial number, which none may print (TASKS item 171): {line:?}"
             ));
         }
     }
-    let variant = disk_variant(scenario.label);
-    let wrote = scenario
-        .markers
-        .iter()
-        .any(|m| m.contains("(the marked partition's last block), flushed and read it back"));
     let path = nvme_image(work);
     let after = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    disk::check_writes(variant, &after, wrote)
+    disk::check_writes(
+        disk_variant(scenario.label),
+        &after,
+        requires_writes(scenario),
+    )
 }
 
+/// The first kernel line of `text` that holds the NVMe controller's serial number.
+fn serial_line(text: &str) -> Option<&str> {
+    text.lines()
+        .find(|l| l.contains("origin-kernel:") && l.contains(NVME_SERIAL))
+}
+
+/// Whether `scenario`'s markers require the polled proof's write, so that its disk must have
+/// changed.
+fn requires_writes(scenario: &Scenario) -> bool {
+    scenario
+        .markers
+        .iter()
+        .any(|m| m.contains(POLLED_WRITE_WORDS))
+}
+
+/// The kernel boot's whole-log checks: every line whole, and the screen.
 fn check_kernel_boot(done: &Completed, settings: &Settings) -> Result {
     console_lines_intact(&done.serial, machine(settings).cpus() as usize)?;
     long_lines_whole(&done.serial)?;
@@ -5759,12 +5780,7 @@ fn boot_console(settings: &Settings) -> Result {
 ///   proof fails as aimed (the x2APIC and block-cache proofs after it do not run), and the image
 ///   changed inside those 72 blocks alone.
 fn boot_disk(base: &Settings) -> Result {
-    let settings = Settings {
-        iommu: Iommu::Intel,
-        topology: Topology::Plain(2),
-        timeout: Some(timeout_for(base, 2)),
-        ..base.clone()
-    };
+    let settings = disk_settings(base);
     let krn_path = pack_kernel(&build_kernel()?)?;
     let (trusted, _) = test_keys()?;
     let signed = sign_kernel(&krn_path, &trusted, "KERNEL.signed.ONBF")?;
@@ -5785,6 +5801,16 @@ fn boot_disk(base: &Settings) -> Result {
         scenarios.len()
     );
     Ok(())
+}
+
+/// `boot-disk`'s machine: Intel VT-d and 2 processors, the rest the person's (`base`).
+fn disk_settings(base: &Settings) -> Settings {
+    Settings {
+        iommu: Iommu::Intel,
+        topology: Topology::Plain(2),
+        timeout: Some(timeout_for(base, 2)),
+        ..base.clone()
+    }
 }
 
 /// The labels of `boot-disk`'s scenarios, and the disks they stage.
@@ -5861,8 +5887,11 @@ fn unmarked_disk_scenario(settings: &Settings) -> Scenario {
     );
     swap_markers(
         &mut scenario,
-        &[WRITES_LINE.into(), writes_reach(Some(disk::MARKED))],
-        vec![format!("{WRITES_LINE}0 writes and 0"), writes_reach(None)],
+        &[WRITES_LINE.into(), writes_reach(Some(disk::MARKED), 0)],
+        vec![format!(
+            "{WRITES_LINE}0 writes and 0{}",
+            writes_reach(None, 0)
+        )],
     );
     scenario.qemu_args = Some(|work| {
         disk::write_image_with(&nvme_image(work), disk::Variant::Unmarked)?;
@@ -5939,12 +5968,15 @@ fn small_partition_scenario(settings: &Settings) -> Scenario {
             ],
         );
     }
-    if let Some(i) = scenario.markers.iter().position(|m| {
+    match scenario.markers.iter().position(|m| {
         m.starts_with("origin-kernel: NVMe: per-CPU queues: ") && m.contains(" threads at once, ")
     }) {
-        scenario
+        Some(i) => scenario
             .markers
-            .insert(i + 1, " MiB/s): NVMe failed".into());
+            .insert(i + 1, " MiB/s): NVMe failed".into()),
+        None => scenario
+            .markers
+            .push("xtask: the per-CPU queues' summary marker is missing".into()),
     }
     // The proofs after it in `storage::init` do not run.
     for marker in x2apic_markers(&machine, settings) {
@@ -5957,16 +5989,34 @@ fn small_partition_scenario(settings: &Settings) -> Scenario {
         .retain(|m| !m.starts_with("origin-kernel: block cache: "));
     swap_markers(
         &mut scenario,
-        &[WRITES_LINE.into(), writes_reach(Some(disk::MARKED))],
-        vec![
-            // The polled proof's write and processor 0's, each flushed; processor 1's refused.
-            format!("{WRITES_LINE}2 writes and 2"),
-            format!(
-                " flushes, which the guard let reach blocks {}-{} of namespace 1 alone; commands refused: 1",
-                small.0, small.1
-            ),
-        ],
+        &[WRITES_LINE.into(), writes_reach(Some(disk::MARKED), 0)],
+        // The polled proof's write and processor 0's, each flushed; processor 1's refused.
+        vec![format!(
+            "{WRITES_LINE}2 writes and 2{}",
+            writes_reach(Some(small), 1)
+        )],
     );
+    // The verdict names the NVMe proof among those that failed (the review's R171-2).
+    swap_markers(
+        &mut scenario,
+        &["origin-kernel: boot verdict: ".into()],
+        vec!["origin-kernel: boot verdict: ".into(), "degraded: ".into()],
+    );
+    match scenario
+        .markers
+        .iter()
+        .position(|m| m.starts_with(" of ") && m.ends_with(" proofs passed"))
+    {
+        Some(i) => {
+            scenario.markers.splice(
+                i + 1..i + 1,
+                ["; failed: ".into(), "NVMe (no storage)".into()],
+            );
+        }
+        None => scenario
+            .markers
+            .push("xtask: the boot verdict's count marker is missing".into()),
+    }
     scenario.failures.retain(|f| *f != ": NVMe failed");
     scenario.qemu_args = Some(|work| {
         disk::write_image_with(&nvme_image(work), disk::Variant::Small)?;
@@ -8661,10 +8711,17 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
             scenario
                 .check
                 .map_or(Ok(()), |check| check(&done, settings))
-        })
-        // TASKS item 171: the NVMe test disk's bytes, and the controller's serial number.
-        .and_then(|()| check_storage_evidence(&done, scenario, &work))
-        .and_then(
+        });
+    // TASKS item 171: the NVMe test disk's bytes, and the controller's serial number, judged on
+    // every boot whatever its markers said, so that a write outside the marked partition is named
+    // beside a marker that failed (the review's R171-1).
+    let verdict = match (verdict, check_storage_evidence(&done, scenario, &work)) {
+        (verdict, Ok(())) => verdict,
+        (Ok(()), Err(storage)) => Err(storage),
+        (Err(e), Err(storage)) => Err(format!("{e}; and {storage}")),
+    };
+    let verdict =
+        verdict.and_then(
             |()| match scenario.stderr.iter().find(|m| !qemu_stderr.contains(**m)) {
                 Some(m) => Err(format!("QEMU's stderr lacks {m:?}")),
                 None => Ok(()),
@@ -8785,6 +8842,110 @@ fn run(settings: &Settings) -> Result {
         Ok(())
     } else {
         Err(format!("{QEMU} exited with {status}"))
+    }
+}
+
+/// TASKS item 171's scenarios and checks, without a boot (the review's R171-7).
+#[cfg(test)]
+mod disk_scenario_tests {
+    use super::*;
+
+    fn missing(scenario: &Scenario) -> Vec<&String> {
+        scenario
+            .markers
+            .iter()
+            .filter(|m| m.starts_with("xtask: "))
+            .collect()
+    }
+
+    #[test]
+    fn the_disk_controls_hold_their_markers() {
+        let settings = disk_settings(&Settings::default());
+        let machine = machine(&settings);
+        let main = boot_scenario(&settings);
+        let d1 = unmarked_disk_scenario(&settings);
+        let d2 = small_partition_scenario(&settings);
+        for s in [&main, &d1, &d2] {
+            assert!(missing(s).is_empty(), "{}: {:?}", s.label, missing(s));
+        }
+        assert_eq!(
+            [main.label, d1.label, d2.label].map(disk_variant),
+            [
+                disk::Variant::Marked,
+                disk::Variant::Unmarked,
+                disk::Variant::Small
+            ]
+        );
+        // Where the disk must have changed: the boots whose markers need the polled write.
+        assert!(requires_writes(&main) && requires_writes(&d2) && !requires_writes(&d1));
+        let has = |s: &Scenario, m: &str| s.markers.iter().any(|x| x == m);
+        // D1: no write anywhere, and nothing that identifies the disk.
+        assert!(has(
+            &d1,
+            "origin-kernel: GPT: disk not shown (no mark of Origin's tests), usable blocks 34-32734, 128 entries of 128 B, 3 in use"
+        ));
+        assert!(has(
+            &d1,
+            "origin-kernel: NVMe: no mark of Origin's tests (no partition carries it): the boot proofs only read namespace 1"
+        ));
+        assert!(has(
+            &d1,
+            "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); write-back not run: no mark of Origin's tests, so nothing is written"
+        ));
+        assert!(has(
+            &d1,
+            "origin-kernel: NVMe: the boot proofs sent 0 writes and 0 flushes, as namespace 1 carries no mark of Origin's tests (no partition carries it); 0 commands refused"
+        ));
+        for index in queue_order(&machine) {
+            assert!(has(
+                &d1,
+                &format!(
+                    "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write not run (no mark of Origin's tests), ",
+                    machine.named(index)
+                )
+            ));
+        }
+        assert!(!d1.markers.iter().any(|m| m.contains(disk::DISK_GUID)));
+        // D2: processor 1's write refused by name, the NVMe proof failed in the verdict, and
+        // the proofs after it gone from the markers.
+        assert!(has(
+            &d2,
+            "; its write: refused: a write to blocks 18504-18504 lies outside the marked partition (blocks 18432-18503): NVMe failed"
+        ));
+        assert!(has(
+            &d2,
+            "origin-kernel: NVMe: the boot proofs sent 2 writes and 2 flushes, which the guard let reach blocks 18432-18503 of namespace 1 alone; 1 command refused"
+        ));
+        let verdict = d2
+            .markers
+            .iter()
+            .position(|m| m == "origin-kernel: boot verdict: ")
+            .unwrap();
+        assert_eq!(d2.markers[verdict + 1], "degraded: ");
+        assert_eq!(d2.markers[verdict + 3], "; failed: ");
+        assert_eq!(d2.markers[verdict + 4], "NVMe (no storage)");
+        assert!(
+            !d2.markers
+                .iter()
+                .any(|m| m.starts_with("origin-kernel: block cache: "))
+        );
+        assert!(!d2.failures.contains(&": NVMe failed"));
+        assert!(main.failures.contains(&": NVMe failed") && d1.failures.contains(&": NVMe failed"));
+        // The main boot's summary: the marked partition, nothing refused.
+        assert!(has(&main, &writes_reach(Some(disk::MARKED), 0)));
+        assert!(writes_reach(Some(disk::MARKED), 0).ends_with("; 0 commands refused"));
+    }
+
+    #[test]
+    fn the_serial_is_looked_for_in_the_kernel_s_lines() {
+        let printed = "origin-kernel: NVMe: controller ready: model \"QEMU NVMe Ctrl\", serial \"ORIGIN0001\", firmware \"11.1.3\"";
+        let firmware = "BdsDxe: loading Boot0002 \"UEFI QEMU NVMe Ctrl ORIGIN0001 1\"";
+        let now = "origin-kernel: NVMe: controller ready: model \"QEMU NVMe Ctrl\", firmware \"11.1.3\", 256 namespaces, MDTS 7, controller type 0x1 (an I/O controller); its serial number is not printed";
+        assert_eq!(
+            serial_line(&format!("{firmware}\n{now}\n{printed}\n")),
+            Some(printed)
+        );
+        assert_eq!(serial_line(&format!("{firmware}\n{now}\n")), None);
     }
 }
 

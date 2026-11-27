@@ -507,6 +507,9 @@ pub mod test_disk {
         OneCopy { primary: bool },
         /// Both copies are valid but describe different disks or partitions.
         Disagree,
+        /// Both copies are valid and agree, but the backup is at this LBA, not the disk's last
+        /// block, where UEFI 2.11 §5.3.1 (p. 115) puts it.
+        BackupNotLast(u64),
         /// No used entry has the mark's type.
         Unmarked,
         /// This many used entries have it: no single span to trust.
@@ -528,6 +531,10 @@ pub mod test_disk {
                     if primary { "primary" } else { "backup" }
                 ),
                 Self::Disagree => f.write_str("the GPT's two copies disagree"),
+                Self::BackupNotLast(at) => write!(
+                    f,
+                    "the GPT's backup copy is at LBA {at}, not the disk's last block"
+                ),
                 Self::Unmarked => f.write_str("no partition carries it"),
                 Self::Marks(n) => write!(f, "{n} partitions carry it"),
                 Self::Required(i) => {
@@ -544,13 +551,14 @@ pub mod test_disk {
         pub span: Writable,
     }
 
-    /// The partition of namespace `nsid` the boot proofs may write to, or why there is none,
-    /// from what the kernel read of a disk that [`holds_pattern`]: `mbr` (LBA 0), and both GPT
-    /// copies, `primary` from LBA 1 and `backup` from where the primary says (or the last block).
-    /// Every condition must hold:
+    /// The partition of namespace `nsid`, of `blocks` blocks, the boot proofs may write to, or why
+    /// there is none, from what the kernel read of a disk that [`holds_pattern`]: `mbr` (LBA 0),
+    /// and both GPT copies, `primary` from LBA 1 and `backup` from where the primary says (or the
+    /// last block). Every condition must hold:
     /// - LBA 0 is a protective MBR, since behind a legacy MBR a GPT may be stale (UEFI 2.11
     ///   §5.3.2, p. 118);
-    /// - both copies are valid and agree, entry for entry;
+    /// - both copies are valid and agree, entry for entry, and the backup is at the last block
+    ///   (UEFI 2.11 §5.3.1, p. 115);
     /// - exactly one used entry has the type [`MARK`];
     /// - its Required Partition attribute is clear.
     ///
@@ -558,6 +566,7 @@ pub mod test_disk {
     /// the usable range: never the MBR, a GPT header or an entry array.
     pub fn mark(
         nsid: u32,
+        blocks: u64,
         mbr: &[u8],
         primary: Copy<'_>,
         backup: Copy<'_>,
@@ -569,6 +578,9 @@ pub mod test_disk {
             (Ok((p, mine)), Ok((b, theirs))) => {
                 if !(p.agrees_with(&b) && mine == theirs) {
                     return Err(NoMark::Disagree);
+                }
+                if Some(b.my_lba) != blocks.checked_sub(1) {
+                    return Err(NoMark::BackupNotLast(b.my_lba));
                 }
                 mine
             }
@@ -1292,7 +1304,7 @@ mod tests {
         /// The kernel's decision on `image`, from LBA 0 and both copies.
         fn decide(image: &[u8]) -> Result<Mark, NoMark> {
             let (p, b) = (copy(image, 1), copy(image, LAST));
-            mark(1, &image[..B], view(&p), view(&b))
+            mark(1, xtask::BLOCKS, &image[..B], view(&p), view(&b))
         }
 
         /// Edits entry `index` of both entry arrays with `f`, then seals both copies again:
@@ -1439,6 +1451,50 @@ mod tests {
             assert_eq!((m.span.first, m.span.last), (10240, 18431));
         }
 
+        /// R171-11: two valid, agreeing copies whose backup is not at the last block, as a disk
+        /// crafted with its usable range ending past where UEFI puts the backup's entry array.
+        #[test]
+        fn a_backup_not_at_the_last_block_is_no_mark() {
+            let image = xtask::image();
+            let (primary, parts) = copy(&image, 1).unwrap();
+            let moved = 20_000;
+            let mine = Header {
+                alternate_lba: moved,
+                ..primary
+            };
+            let theirs = Header {
+                my_lba: moved,
+                alternate_lba: 1,
+                entries_lba: moved - 32,
+                ..primary
+            };
+            assert!(mine.agrees_with(&theirs));
+            let copies = (Ok((mine, parts.as_slice())), Ok((theirs, parts.as_slice())));
+            assert_eq!(
+                mark(1, xtask::BLOCKS, &image[..B], copies.0, copies.1),
+                Err(NoMark::BackupNotLast(moved))
+            );
+            // At the last block it is the mark, as on the real disk.
+            let last = Header {
+                my_lba: LAST,
+                ..theirs
+            };
+            let at_end = Header {
+                alternate_lba: LAST,
+                ..primary
+            };
+            assert!(
+                mark(
+                    1,
+                    xtask::BLOCKS,
+                    &image[..B],
+                    Ok((at_end, parts.as_slice())),
+                    Ok((last, parts.as_slice()))
+                )
+                .is_ok()
+            );
+        }
+
         #[test]
         fn a_no_mark_names_itself() {
             for (why, text) in [
@@ -1454,6 +1510,10 @@ mod tests {
                     "only the backup copy of the GPT is valid, and the kernel repairs nothing during boot",
                 ),
                 (NoMark::Disagree, "the GPT's two copies disagree"),
+                (
+                    NoMark::BackupNotLast(20_000),
+                    "the GPT's backup copy is at LBA 20000, not the disk's last block",
+                ),
                 (NoMark::Unmarked, "no partition carries it"),
                 (NoMark::Marks(2), "2 partitions carry it"),
                 (

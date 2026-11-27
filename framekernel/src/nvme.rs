@@ -699,7 +699,7 @@ impl core::fmt::Display for Refusal {
             ),
             Self::OtherNamespace { nsid, span } => write!(
                 f,
-                "a write or flush names namespace {nsid:#x}, not namespace {}, which holds the marked partition",
+                "a write or flush names namespace {nsid:#x}, not namespace {:#x}, which holds the marked partition",
                 span.nsid
             ),
             Self::Opcode { admin, opcode } => write!(
@@ -2487,7 +2487,7 @@ mod tests {
                     nsid: 0xFFFF_FFFF,
                     span,
                 },
-                "refused: a write or flush names namespace 0xffffffff, not namespace 1, which holds the marked partition",
+                "refused: a write or flush names namespace 0xffffffff, not namespace 0x1, which holds the marked partition",
             ),
             (
                 Refusal::Opcode {
