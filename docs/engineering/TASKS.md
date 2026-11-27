@@ -781,9 +781,18 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 170. **A read-only survey from a USB stick (owner items 381 and 383). Numbered by the coordinating session on 2026-11-27; not started; after item 169's results.**
     - **What:** a UEFI program of Origin's own that, before `ExitBootServices`, writes to the stick it booted from: every CPUID leaf, the firmware's memory map, every table the XSDT names, SMBIOS, each PCIe function's configuration space read through ECAM, the display modes, and Secure Boot's state. Then the bench loader (ADR-0002 Amendments 3 to 7) tries the firmware's exit, and its result is shown on the screen.
     - **It writes nothing** but its report on the stick: no NVMe or other disk, no firmware variable, no boot entry. The kernel is not on the stick.
-171. **Storage proofs write only to a disk marked for Origin's tests (CLAUDE.md §2 P0; owner item 381's finding). Numbered by the coordinating session on 2026-11-27; not started.**
-    - **Why:** the kernel's storage proofs write to any NVMe namespace they find, so a boot on a machine with a real disk would overwrite its owner's data, and they print the controller's serial number.
-    - **What:** the proofs write only to a namespace that carries a mark of Origin's tests (for example a GPT partition with a type GUID of the project's own), and otherwise read only and say so; the serial number is not printed. QEMU's test disks carry the mark, so CI's proofs still write. A control boots a disk without the mark and shows that nothing is written.
+171. **Storage proofs write only inside a partition marked for Origin's tests, and print no disk's identifiers (CLAUDE.md §2 P0, §61; owner items 381 and 384). Numbered by the coordinating session on 2026-11-27; contract ruled the same day; being built.**
+    - **Why:**
+      - **What a boot prints:** the NVMe controller's serial number, and on any disk the GPT's disk GUID, its partitions' unique GUIDs and their names. Each of these identifies the owner's hardware.
+      - **What permits a write:** the boot proofs write only to the boot test's own disk, as they have since `2045824e` (2026-11-09): its geometry, the GPT's fixed disk GUID and xtask's pattern. But the disk GUID that permits it is meant to be unique to one disk.
+      - **Confinement:** nothing holds a write inside a partition, and no control has compared a disk's bytes.
+      - *Corrected 2026-11-27:* this line first said the proofs write to any NVMe namespace they find. That was wrong (item 384's entry).
+    - **What:**
+      - **Where writes go:** the proofs write and flush only inside the one partition whose type is item 384's mark. The disk must also have the boot test's geometry and pattern, a protective MBR and two agreeing GPT copies. Every other disk is only read, and the proofs say so.
+      - **The guard:** one guard that every command passes refuses any write outside the partition and any opcode the driver does not send.
+      - **What is printed:** not the serial number, and on a disk without the mark, not the GPT's identifiers.
+      - **CI:** QEMU's test disks carry the mark, so CI's proofs still write.
+      - **Controls:** standing controls boot a disk without the mark and one whose marked partition is too small, and compare the disk's bytes before and after. Every kernel boot also checks its disk's bytes.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
