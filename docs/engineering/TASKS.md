@@ -801,7 +801,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
         - `failed-boots-ubuntu-26.04`, 53,850 bytes (job 140460719849);
         - `failed-boots-ubuntu-24.04`, 53,858 bytes (job 140460719873).
       - **After it:** on both real-CPU jobs the host boot, "The processor as it is, nothing masked", passed (`boot-test passed (1 of 11 scenarios)`).
-      - **What stays:** the artifacts expire after 7 days, and the run's logs stay. The branch `ci-control/t165` stays on GitHub until the owner says to delete it.
+      - **What stays:** the artifacts expire after 7 days, and the run's logs stay. At the owner's word ("Yes, delete it"), the branch `ci-control/t165` was deleted on GitHub and locally on 2026-11-27, at `35f466ef`; the run and its logs remain.
       - **The passing side** shows on a green run of the real workflow: its upload steps are skipped, and it lists no `failed-boots-*` artifact.
 166. **The `compile_fail` doctests' controls run by `cargo xtask` (TASKS item 143, step 4). Numbered by the coordinating session on 2026-11-27; not started.**
     - **What:** each doctest that must fail to compile has a control, the same code made to compile, which must then fail the doctest. Step 4 ran them by hand; `cargo xtask` runs them, as `kani.rs` runs Kani's controls, in a scratch copy, and fails if one is not caught.

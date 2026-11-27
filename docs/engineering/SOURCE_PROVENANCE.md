@@ -6462,7 +6462,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
     - `failed-boots-ubuntu-26.04`, 53,850 bytes;
     - `failed-boots-ubuntu-24.04`, 53,858 bytes.
   - **After it:** on both real-CPU jobs the host boot passed (1 of 11 scenarios).
-  - **What stays:** the artifacts expire after 7 days, and the run's logs stay. The branch stays on GitHub until the owner says to delete it.
+  - **What stays:** the artifacts expire after 7 days, and the run's logs stay. At the owner's word, the branch was deleted on GitHub and locally on 2026-11-27, at `35f466ef`; the run and its logs remain.
 - **Known limits:**
   - A boot that fails before QEMU starts keeps nothing; its message is the job's last line.
   - A job that times out is cancelled, and `if: failure()` does not run. The boot's own timeout ends a hung boot long before the job's.
