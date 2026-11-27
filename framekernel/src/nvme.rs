@@ -478,7 +478,7 @@ impl Command {
             nsid: 0,
             prp1: 0,
             prp2: 0,
-            cdw10: 0x07,
+            cdw10: FEATURE_NUMBER_OF_QUEUES,
             cdw11: (((completion - 1) as u32) << 16) | (submission - 1) as u32,
             cdw12: 0,
         }
@@ -599,6 +599,8 @@ pub enum Fault {
     NeedsPrpList,
     /// Refused: no controller or queue for it.
     NoQueue,
+    /// Refused before it reached the device by the guard every command passes ([`permitted`]).
+    Refused(Refusal),
 }
 
 impl Fault {
@@ -633,9 +635,144 @@ impl core::fmt::Display for Fault {
             Self::Full => f.write_str("refused: its queue was full"),
             Self::NeedsPrpList => f.write_str("refused: its buffer would need a PRP list"),
             Self::NoQueue => f.write_str("refused: no queue for it"),
+            Self::Refused(why) => write!(f, "refused: {why}"),
         }
     }
 }
+
+/// The blocks of one namespace the boot proofs may change: those of the one partition that
+/// carries the mark of Origin's tests (TASKS item 171; `blockcache::test_disk::mark`). Inclusive
+/// at both ends, as a GPT entry's StartingLBA and EndingLBA are (UEFI 2.11 §5.3.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Writable {
+    pub nsid: u32,
+    pub first: u64,
+    pub last: u64,
+}
+
+impl Writable {
+    /// Whether all of the `blocks` blocks from `lba` lie inside, `blocks` at least one.
+    pub const fn contains(&self, lba: u64, blocks: u64) -> bool {
+        match lba.checked_add(blocks) {
+            Some(end) => blocks > 0 && lba >= self.first && end - 1 <= self.last,
+            None => false,
+        }
+    }
+}
+
+/// Why the guard every command passes refused one ([`permitted`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// A Write or a Flush, on a namespace no marked partition lets the boot proofs change.
+    NotMarked { opcode: u8 },
+    /// A Write to blocks `first` to `last`, not all inside the marked partition.
+    Outside {
+        first: u64,
+        last: u64,
+        span: Writable,
+    },
+    /// A Write or a Flush naming namespace `nsid`, not the one the marked partition is on.
+    OtherNamespace { nsid: u32, span: Writable },
+    /// An opcode the driver does not send on that kind of queue.
+    Opcode { admin: bool, opcode: u8 },
+    /// Set Features of a feature other than Number of Queues, or asking for it to be saved:
+    /// its Command Dword 10.
+    Feature { cdw10: u32 },
+}
+
+impl core::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::NotMarked { opcode: op } => write!(
+                f,
+                "{} to a namespace no partition marked for Origin's tests lets the boot proofs change",
+                if op == opcode::FLUSH {
+                    "a flush"
+                } else {
+                    "a write"
+                }
+            ),
+            Self::Outside { first, last, span } => write!(
+                f,
+                "a write to blocks {first}-{last} lies outside the marked partition (blocks {}-{})",
+                span.first, span.last
+            ),
+            Self::OtherNamespace { nsid, span } => write!(
+                f,
+                "a write or flush names namespace {nsid:#x}, not namespace {}, which holds the marked partition",
+                span.nsid
+            ),
+            Self::Opcode { admin, opcode } => write!(
+                f,
+                "opcode {opcode:#04x} is not one the driver sends on {} queue",
+                if admin { "the admin" } else { "an I/O" }
+            ),
+            Self::Feature { cdw10 } => write!(
+                f,
+                "Set Features with Command Dword 10 {cdw10:#010x}: only Number of Queues, not saved, is sent"
+            ),
+        }
+    }
+}
+
+/// The guard every command passes before it reaches a submission queue (TASKS item 171): the
+/// driver sends only what it is known to send, and nothing that changes a namespace's contents
+/// outside `writes`, the marked partition.
+///
+/// On the admin queue (`admin`): Identify, Create I/O Completion Queue, Create I/O Submission
+/// Queue, and Set Features of Number of Queues (FID 07h) with Save clear and the reserved bits
+/// clear (Base 2.4 Figure 464, p. 457). Nothing else: no Format NVM, Sanitize, Namespace
+/// Management, firmware command or saved feature.
+///
+/// On an I/O queue: a Read always; a Write only with `writes`, naming its namespace, and with
+/// every block it names (SLBA in Command Dwords 10 and 11, NLB zero-based in bits 15:0 of 12;
+/// NVM Command Set 1.3 §3.3.6) inside it; a Flush only with `writes` and naming its namespace,
+/// so never the broadcast NSID FFFFFFFFh. Nothing else.
+pub const fn permitted(c: &Command, admin: bool, writes: Option<Writable>) -> Result<(), Refusal> {
+    if admin {
+        return match c.opcode {
+            opcode::IDENTIFY | opcode::CREATE_IO_CQ | opcode::CREATE_IO_SQ => Ok(()),
+            opcode::SET_FEATURES if c.cdw10 == FEATURE_NUMBER_OF_QUEUES => Ok(()),
+            opcode::SET_FEATURES => Err(Refusal::Feature { cdw10: c.cdw10 }),
+            op => Err(Refusal::Opcode {
+                admin: true,
+                opcode: op,
+            }),
+        };
+    }
+    match c.opcode {
+        opcode::READ => Ok(()),
+        op @ (opcode::WRITE | opcode::FLUSH) => {
+            let Some(span) = writes else {
+                return Err(Refusal::NotMarked { opcode: op });
+            };
+            if c.nsid != span.nsid {
+                return Err(Refusal::OtherNamespace { nsid: c.nsid, span });
+            }
+            if op == opcode::FLUSH {
+                return Ok(());
+            }
+            let lba = c.cdw10 as u64 | ((c.cdw11 as u64) << 32);
+            let blocks = (c.cdw12 & 0xFFFF) as u64 + 1;
+            if span.contains(lba, blocks) {
+                Ok(())
+            } else {
+                Err(Refusal::Outside {
+                    first: lba,
+                    last: lba.saturating_add(blocks - 1),
+                    span,
+                })
+            }
+        }
+        op => Err(Refusal::Opcode {
+            admin: false,
+            opcode: op,
+        }),
+    }
+}
+
+/// Set Features' Command Dword 10 for Number of Queues, not saved: FID 07h, every other bit 0.
+pub const FEATURE_NUMBER_OF_QUEUES: u32 = 0x07;
 
 /// A command's step in a proof and why it did not succeed: printed as "`step`: `fault`".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2136,5 +2273,257 @@ mod tests {
             Err(NamespaceRefusal::Inactive),
             "inactive"
         );
+    }
+
+    /// TASKS item 171: the guard lets through every command the driver builds where it may
+    /// send it, and nothing else.
+    #[test]
+    fn the_guard_passes_what_the_driver_builds() {
+        let span = Writable {
+            nsid: 1,
+            first: 18432,
+            last: 32734,
+        };
+        let page = (0x5000, 0);
+        // Every admin command the driver builds.
+        for c in [
+            Command::identify(1, cns::CONTROLLER, 0, 0x5000),
+            Command::identify(1, cns::NAMESPACE, 1, 0x5000),
+            Command::identify(1, cns::ACTIVE_NAMESPACES, 0, 0x5000),
+            Command::identify(1, cns::ACTIVE_NAMESPACES_OF_SET, 0, 0x5000),
+            Command::create_io_cq(1, 1, 64, 0x6000),
+            Command::create_io_cq_with_interrupts(1, 2, 64, 1, 0x6000),
+            Command::create_io_sq(1, 1, 64, 1, 0x7000),
+            Command::set_number_of_queues(1, 66, 66),
+        ] {
+            assert_eq!(permitted(&c, true, None), Ok(()), "{c:?}");
+            assert_eq!(permitted(&c, true, Some(span)), Ok(()), "{c:?}");
+        }
+        // Reads, anywhere, with or without the mark.
+        for lba in [0, 1, 2048, 32767, 32768, u64::MAX] {
+            let c = Command::transfer(false, 1, 1, lba, 8, page);
+            assert_eq!(permitted(&c, false, None), Ok(()));
+            assert_eq!(permitted(&c, false, Some(span)), Ok(()));
+        }
+        // Writes inside the span, its first and last blocks included, and its flush.
+        for (lba, blocks) in [(18432, 8), (18440, 8), (18496, 1), (32734, 1), (32727, 8)] {
+            let c = Command::transfer(true, 1, 1, lba, blocks, page);
+            assert_eq!(permitted(&c, false, Some(span)), Ok(()), "{lba}+{blocks}");
+        }
+        assert_eq!(permitted(&Command::flush(1, 1), false, Some(span)), Ok(()));
+    }
+
+    #[test]
+    fn the_guard_refuses_writes_outside_the_marked_partition() {
+        let span = Writable {
+            nsid: 1,
+            first: 18432,
+            last: 32734,
+        };
+        let page = (0x5000, 0);
+        let write = |lba, blocks| Command::transfer(true, 1, 1, lba, blocks, page);
+        // No mark: no write and no flush at all.
+        for c in [write(18432, 1), write(0, 1)] {
+            assert_eq!(
+                permitted(&c, false, None),
+                Err(Refusal::NotMarked {
+                    opcode: opcode::WRITE
+                })
+            );
+        }
+        assert_eq!(
+            permitted(&Command::flush(1, 1), false, None),
+            Err(Refusal::NotMarked {
+                opcode: opcode::FLUSH
+            })
+        );
+        // One block past either end, straddling either end, and the GPT's structures.
+        for (lba, blocks) in [
+            (18431, 1),
+            (32735, 1),
+            (18428, 8),
+            (32730, 8),
+            (0, 1),
+            (1, 1),
+            (2, 32),
+            (32767, 1),
+            (10240, 8),
+        ] {
+            assert_eq!(
+                permitted(&write(lba, blocks), false, Some(span)),
+                Err(Refusal::Outside {
+                    first: lba,
+                    last: lba + u64::from(blocks) - 1,
+                    span
+                }),
+                "{lba}+{blocks}"
+            );
+        }
+        // The largest count NLB holds.
+        let big = write(18432, 65536);
+        assert_eq!(big.cdw12, 0xFFFF);
+        assert!(permitted(&big, false, Some(span)).is_err());
+        // NLB 3 from the second-last LBA would wrap past the top of the LBAs.
+        let mut wrap = write(u64::MAX - 1, 4);
+        assert!(permitted(&wrap, false, Some(span)).is_err());
+        wrap.cdw12 = 0;
+        let all = Writable {
+            nsid: 1,
+            first: 0,
+            last: u64::MAX,
+        };
+        assert_eq!(permitted(&wrap, false, Some(all)), Ok(()));
+        wrap.cdw12 = 1;
+        assert!(
+            matches!(
+                permitted(&wrap, false, Some(all)),
+                Err(Refusal::Outside { .. })
+            ),
+            "the last two LBAs, whose end does not fit in 64 bits: refused, as no namespace reaches them"
+        );
+        // Another namespace, and the broadcast one.
+        for nsid in [2, 0xFFFF_FFFF] {
+            let c = Command::transfer(true, 1, nsid, 18432, 1, page);
+            assert_eq!(
+                permitted(&c, false, Some(span)),
+                Err(Refusal::OtherNamespace { nsid, span })
+            );
+            assert_eq!(
+                permitted(&Command::flush(1, nsid), false, Some(span)),
+                Err(Refusal::OtherNamespace { nsid, span })
+            );
+        }
+    }
+
+    #[test]
+    fn the_guard_refuses_every_other_opcode() {
+        let span = Writable {
+            nsid: 1,
+            first: 18432,
+            last: 32734,
+        };
+        // Admin: everything but Identify, the two creates and Set Features (Delete I/O SQ 00h,
+        // Get Log Page 02h, Delete I/O CQ 04h, Abort 08h, Get Features 0Ah, Firmware Commit 10h,
+        // Firmware Image Download 11h, Namespace Management 0Dh, Format NVM 80h, Sanitize 84h).
+        for op in 0..=u8::MAX {
+            let c = Command {
+                opcode: op,
+                ..Command::default()
+            };
+            let allowed = matches!(op, 0x01 | 0x05 | 0x06);
+            assert_eq!(
+                permitted(&c, true, Some(span)).is_ok(),
+                allowed,
+                "admin {op:#04x}"
+            );
+            if !allowed && op != opcode::SET_FEATURES {
+                assert_eq!(
+                    permitted(&c, true, Some(span)),
+                    Err(Refusal::Opcode {
+                        admin: true,
+                        opcode: op
+                    })
+                );
+            }
+        }
+        // Set Features: Number of Queues alone, never saved, no reserved bit.
+        let mut set = Command::set_number_of_queues(1, 4, 4);
+        assert_eq!(set.cdw10, FEATURE_NUMBER_OF_QUEUES);
+        for cdw10 in [0x8000_0007, 0x06, 0x0C, 0x0107, 0x8000_0000] {
+            set.cdw10 = cdw10;
+            assert_eq!(
+                permitted(&set, true, Some(span)),
+                Err(Refusal::Feature { cdw10 })
+            );
+        }
+        // I/O: Flush 00h, Write 01h and Read 02h alone (not Write Uncorrectable 04h, Compare 05h,
+        // Write Zeroes 08h, Dataset Management 09h, Verify 0Ch or Copy 19h).
+        for op in 0..=u8::MAX {
+            let c = Command {
+                opcode: op,
+                nsid: 1,
+                cdw10: 18432,
+                ..Command::default()
+            };
+            let allowed = matches!(op, 0x00..=0x02);
+            assert_eq!(
+                permitted(&c, false, Some(span)).is_ok(),
+                allowed,
+                "I/O {op:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_names_itself() {
+        let span = Writable {
+            nsid: 1,
+            first: 18432,
+            last: 18503,
+        };
+        for (why, text) in [
+            (
+                Refusal::Outside {
+                    first: 18504,
+                    last: 18504,
+                    span,
+                },
+                "refused: a write to blocks 18504-18504 lies outside the marked partition (blocks 18432-18503)",
+            ),
+            (
+                Refusal::NotMarked {
+                    opcode: opcode::WRITE,
+                },
+                "refused: a write to a namespace no partition marked for Origin's tests lets the boot proofs change",
+            ),
+            (
+                Refusal::NotMarked {
+                    opcode: opcode::FLUSH,
+                },
+                "refused: a flush to a namespace no partition marked for Origin's tests lets the boot proofs change",
+            ),
+            (
+                Refusal::OtherNamespace {
+                    nsid: 0xFFFF_FFFF,
+                    span,
+                },
+                "refused: a write or flush names namespace 0xffffffff, not namespace 1, which holds the marked partition",
+            ),
+            (
+                Refusal::Opcode {
+                    admin: true,
+                    opcode: 0x80,
+                },
+                "refused: opcode 0x80 is not one the driver sends on the admin queue",
+            ),
+            (
+                Refusal::Opcode {
+                    admin: false,
+                    opcode: 0x08,
+                },
+                "refused: opcode 0x08 is not one the driver sends on an I/O queue",
+            ),
+            (
+                Refusal::Feature { cdw10: 0x8000_0007 },
+                "refused: Set Features with Command Dword 10 0x80000007: only Number of Queues, not saved, is sent",
+            ),
+        ] {
+            let fault = Fault::Refused(why);
+            assert_eq!(alloc::format!("{fault}"), text);
+            assert!(!fault.may_be_live());
+        }
+    }
+
+    #[test]
+    fn writable_contains() {
+        let w = Writable {
+            nsid: 1,
+            first: 10,
+            last: 19,
+        };
+        assert!(w.contains(10, 1) && w.contains(19, 1) && w.contains(10, 10));
+        assert!(!w.contains(9, 1) && !w.contains(20, 1) && !w.contains(10, 11));
+        assert!(!w.contains(10, 0), "no blocks is not a write");
+        assert!(!w.contains(u64::MAX, 2));
     }
 }
