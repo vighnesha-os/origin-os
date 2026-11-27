@@ -655,6 +655,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **The nightly:** a toolchain file of its own pins one nightly by date and commit (row S12-08). Only `cargo xtask miri` uses it, and a gate holds every build, check and release on 1.100.0 (row S12-09).
     - **In CI only (owner item 364):** the nightly is installed only on CI's runners, never on the development Mac. Every Miri run, while it is built as well as after, runs in a CI job of its own. How its branch reaches CI before it lands, through the batch's pull request or a draft pull request of its own, is settled in its contract, and any push waits for the owner's word.
     - **What Miri runs:** the host tests of crates that hold `unsafe`, starting with `origin-sync` and the run queue it compiles. Code with inline assembly or device access stays out.
+    - **Two aliasing models:** each Miri job runs the tests under Stacked Borrows, Miri's default, and again under Tree Borrows (`-Zmiri-tree-borrows`, which Miri calls experimental); a finding under either is reported (owner item 380's review).
     - **The records** state what it found and what it cannot see (row S13-06).
 146. **Shuttle beside Loom (owner item 362). Numbered by the coordinating session on 2026-11-25; not started.** `shuttle` becomes a host-only dev-dependency once CLAUDE.md §5's review passes. Origin's sync shims map to Shuttle's types as they map to Loom's.
     - **First models:** ADR-0020's balancing (asks, pulls and kicks) across many processors, which Loom's bounded search cannot reach;
@@ -731,6 +732,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **Why:** the page-table entries and the address-space builder are shared by the UEFI loader and the Framekernel, and decide what every address may do. TASKS item 143's ruling Q13 gave them an item of their own.
     - **The contract weighs:** for every input up to a bound, no panic and no read out of bounds; an entry's fields read back as written; the builder maps each page once, to the frame and permissions asked, and never makes a page writable and executable unless asked; a walk returns `None` for any address `TableMemory` does not hold.
     - **Within item 143's rules:** a planted control per harness, each local run under 5 minutes and 8 GB, CI's 15 minutes and 8 GB per harness, a `kani::cover!` of an accepted path in each harness, one independent AI review, and no change to the crate's code unless a proof finds a defect, which is reported first.
+    - **Also a reference model:** a walk written from the Intel SDM's and the AMD APM's paging chapters, as a host test, compared with `origin-paging`'s walk over generated tables (owner item 380's review).
 157. **`FrameError`'s documentation of frame 0 (TASKS item 143's review, R143-10). Numbered by the coordinating session on 2026-11-26; not started.**
     - **What:** `FrameError::NotAllocatable`'s documentation lists frame 0, but `free` and `free_run` return `OutOfRange` for it, and the host tests and item 143's harness follow the code. Reword the two variants' documentation, or move frame 0 to the `NotAllocatable` check with the host tests and the harness's expected result changed and its Kani proof run again. Nothing else in the allocator changes.
 158. **`verify.sh` stops naming the development Mac's account in its record (CLAUDE.md §6; the repository is public). Numbered by the coordinating session on 2026-11-26; not started.**
@@ -743,6 +745,24 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
       - longer runs on CI only, measured first, under a limit the owner accepts;
       - a deductive verifier (TASKS item 149, Verus).
     - **Also in its scope:** whatever of OCBOR-1, the signature block and the manifest item 143 cannot prove within its budget.
+160. **Panic lints for the kernel and the loader (owner item 376; CLAUDE.md §13; row S13-12). Numbered by the coordinating session on 2026-11-27; not started.**
+    - **Why:** the parser crates deny `unwrap`, `expect`, indexing and unchecked arithmetic, but `origin-frame`, `framekernel`, `origin-paging` and the UEFI loader do not, and a panic there stops the machine.
+    - **First, the counts:** each lint's findings in each of the four crates, outside their tests, reported before any change.
+    - **Then, in stages:** `clippy::unwrap_used`, `expect_used` and `panic` first, then `indexing_slicing` where the count allows; each stage with the crate's host tests and the boot proofs passing, and any change on a hot path measured under ADR-0018. `arithmetic_side_effects` comes with TASKS item 22's overflow checks (CLAUDE.md §14).
+161. **Test coverage of the host-tested crates (owner item 377; row S72-01). Numbered by the coordinating session on 2026-11-27; not started.**
+    - **How:** stable `-C instrument-coverage` and the pinned toolchain's own `llvm-tools` (`llvm-profdata`, `llvm-cov`), driven by `cargo xtask coverage`; no new tool.
+    - **Where:** a CI job of its own that reports line and branch coverage per crate and fails nothing; no threshold gates a merge.
+    - **Not in it:** the kernel's and the loader's code as they run under QEMU, which the profiler's runtime cannot reach; the records say so.
+162. **ACPICA's `acpiexec` as an oracle for the AML interpreter (owner item 378; ADR-0019; row A19-A3). Numbered by the coordinating session on 2026-11-27; not started.**
+    - **The oracle:** ACPICA's release 20260930 (BSD-3-Clause), downloaded once and built on CI's runners only; never on the development Mac, never in any image.
+    - **The comparison:** the project's AML test inputs (the original encoder's definition blocks and QEMU's tables) loaded and evaluated by both, the namespaces and results compared.
+    - **The rule:** a disagreement is resolved from ACPI 6.6 and recorded, never by matching ACPICA; the session that writes the interpreter does not read ACPICA's source (CLAUDE.md §3, decision items 91 to 97).
+163. **A kernel stack overflowed on purpose (owner item 379; row S72-11). Numbered by the coordinating session on 2026-11-27; not started.**
+    - **What:** a boot of its own, like the boots that must refuse an image, in which a kernel thread runs past the end of its stack into its guard page. It passes only if the double-fault handler runs on its own interrupt stack and prints its report.
+    - **On stable Rust,** in the existing boot-proof framework; no `custom_test_frameworks` (owner item 380).
+164. **ONBF's second parser, written independently (ONBF §13 item 6; CLAUDE.md §73 and §1). Numbered by the coordinating session on 2026-11-27; not started.**
+    - **What:** a second parser of ONBF images, written from `docs/spec/ONBF.md` and its errata by a different session that does not read `onbf-format`, host-only, which must agree with the first on the whole corpus (the fuzz seeds, the malicious corpus and the images the build makes). A disagreement is a specification bug, settled in the errata.
+    - **Why now:** ONBF v1.0 becomes final only after §13's tests pass, and item 6 had no TASKS item.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:

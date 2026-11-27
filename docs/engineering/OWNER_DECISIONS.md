@@ -1773,3 +1773,37 @@ Item 363 added Proptest for the allocators' model tests and ONBF's pack-then-par
   - this sheet;
   - the "Decided by" column of matrix rows S72-03 and S72-04;
   - TASKS item 147's line.
+
+### A review of thirteen proposed test tools (items 376 to 380): Accepted 2026-11-27
+
+On 2026-11-27 you brought a list of thirteen test tools and practices in four tiers and asked for a deep comparison before anything was included. The coordinating session checked each against the repository (`land/batch-11` at `ae4319a0`), each tool's release of that day and CLAUDE.md. Four were already approved or decided: Miri (items 361 and 364, TASKS item 145), Shuttle (item 362, TASKS item 146), bolero (item 375, for TASKS item 147 only) and a reference model of the page-table walker (TASKS item 156). It put five items, with a recommendation for each. You answered "Accept all".
+
+| # | Question | Answer |
+|---|---|---|
+| 376, answered | Deny `unwrap`, `expect`, `panic` and indexing in the kernel and the loader (`origin-frame`, `framekernel`, `origin-paging` and the UEFI loader), as the parser crates already do, counted first and turned on in stages? | **Accept** |
+| 377, answered | Measure what the host tests cover, with the pinned toolchain's own LLVM tools and stable `-C instrument-coverage`, driven by `cargo xtask` and reported by a CI job that fails nothing? | **Accept** |
+| 378, answered | Build ACPICA's `acpiexec` (release 20260930, BSD-3-Clause) on CI only, and compare the AML interpreter's results with it on the project's AML test inputs? | **Accept** |
+| 379, answered | Add a boot that overflows a kernel stack on purpose and must end in the double-fault handler's report from its own interrupt stack? | **Accept** |
+| 380, answered | Decline cargo-nextest, static_assertions, trybuild, rstest, mockall, insta, Criterion, cargo-mutants for now, the unstable `custom_test_frameworks`, and bolero beyond item 375? | **Accept** |
+
+- **What was found first:**
+  - `cargo xtask check` takes about 1,000 s; its 60 test binaries take 174 s of it, the longest 90 s.
+  - The parser crates (`onbf-format`, the AML interpreter, the ACPI tables, `origin-crypto`, `origin-random`, the SDK's generated code) deny `unwrap`, `expect`, indexing and unchecked arithmetic. The kernel framework, the kernel, `origin-paging` and the loader do not, and `origin-frame` has about 241 calls of `.unwrap()`, its tests included.
+  - The `unsafe` gate already allows `unsafe` only in listed files, and 133 files forbid it.
+  - 32 compile-time assertions of sizes and 11 `compile_fail` doctests exist already, in core Rust with no dependency.
+  - Row S72-01 says that nothing measures what the tests cover.
+  - No boot proof overflows a kernel stack on purpose.
+  - ONBF §13 item 6, a second parser written independently, has no TASKS item.
+- **What each item decides:**
+  - **376 (TASKS item 160):** the lints are counted crate by crate first; `unwrap_used`, `expect_used` and `panic` come first, then `indexing_slicing` where the count allows, each change shown by the crate's host tests and the boot proofs. `arithmetic_side_effects` comes with TASKS item 22's overflow checks in release builds (CLAUDE.md §14).
+  - **377 (TASKS item 161):** coverage of the host-tested crates only; the kernel's code under QEMU is out of reach of the profiler's runtime, and the records say so. No threshold gates a merge.
+  - **378 (TASKS item 162):** `acpiexec` is a test oracle, built from ACPICA's release on CI's runners only. A disagreement is resolved from ACPI 6.6, never by matching ACPICA, and the session that writes the interpreter does not read ACPICA's source (CLAUDE.md §3, decision items 91 to 97). The download is covered once, at the release read on the day.
+  - **379 (TASKS item 163):** a boot of its own, in the existing boot-proof framework on stable Rust, whose expected result is the double-fault report.
+  - **380:** the reasons, in short: nextest would save at most about a minute and a half and runs no doctests; core Rust does what static_assertions (last released 2019) and trybuild do; rstest and insta add nothing the tests and gates lack; mocking the hardware would test the mocks, not the real entry points; Criterion on the Mac's processor measures nothing about the x86-64 kernel (CLAUDE.md §1, qualify the declared environment); `custom_test_frameworks` needs a nightly compiler for the kernel (§8, §12); cargo-mutants comes back after coverage exists; bolero stays as item 375 decides.
+- **Also, decided by the coordinating session:** TASKS item 164 for ONBF §13 item 6's second parser; a second Miri run under Tree Borrows in TASKS item 145's contract; `compile_fail` doctests of the handle-rights types in TASKS item 143's capability step; the reference model of the page-table walker in TASKS item 156.
+- **What does not change:** every build, check and release stays on Rust 1.100.0; nothing these items bring ships (§5); the seeded soaks, the Loom models, the Kani proofs and the fuzz targets stay.
+- **Performance cost** (ADR-0018 V3): none for 377 to 380, by construction. 376 may move panics into error paths in the kernel; any change on a hot path is measured under ADR-0018 in TASKS item 160.
+- **Where it is written:**
+  - this sheet;
+  - the "Decided by" column of rows S13-12 (376), S72-01 (377), A19-A3 (378) and S72-11 (379), and the requirements README's table of items without rows (380);
+  - TASKS items 160 to 164, and the lines of items 145 and 156.
