@@ -793,7 +793,16 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **What the controls found, fixed in the same branch:**
       - `monitor.log` was empty: nothing read QEMU's stdout while the screen was watched (`1cf28b1c`).
       - Then it was 226,127 bytes of QEMU's redrawn command line, whose partial host paths no replacement could catch (`796c7f69`).
-    - **CI's failing side is not yet shown.** A local branch `ci-control/t165` holds one commit: `ci.yml` trimmed to the three boot jobs, starting only on a push to that branch, with C1 planted. It is not pushed. The coordinating session puts it to the owner (ruling Q7). If the owner declines, the first boot that fails in CI on its own shows it. A green run shows the passing side: its upload steps are skipped, and it lists no `failed-boots-*` artifact.
+    - **CI's failing side, shown in run 45985725312** ("TASKS 165 CI control", finished at about 11:09 UTC on 2026-11-27).
+      - **The run:** the owner said "Yes, push it", and the coordinating session pushed `ci-control/t165` at `35f466ef` (ruling Q7). It is one commit on `7d5d320c`: `ci.yml` trimmed to the three boot jobs, starting only on a push to that branch, with C1 planted. The coordinating session read the job logs and the artifact list, and downloaded nothing.
+      - **The failure:** all three jobs failed at the planted boot with `the screen shows "origin-kernel: sysfs: built /sys"; it showed:` and the screen's rows. Each job's log named `target/xtask/failed-boots/01-console--no-UART-at-all`.
+      - **The uploads:** each job's "Keep the failed boot's evidence" step succeeded and uploaded 4 files:
+        - `failed-boots-software-cpu`, 54,939 bytes (job 140460719288);
+        - `failed-boots-ubuntu-26.04`, 53,850 bytes (job 140460719849);
+        - `failed-boots-ubuntu-24.04`, 53,858 bytes (job 140460719873).
+      - **After it:** on both real-CPU jobs the host boot, "The processor as it is, nothing masked", passed (`boot-test passed (1 of 11 scenarios)`).
+      - **What stays:** the artifacts expire after 7 days, and the run's logs stay. The branch `ci-control/t165` stays on GitHub until the owner says to delete it.
+      - **The passing side** shows on a green run of the real workflow: its upload steps are skipped, and it lists no `failed-boots-*` artifact.
 166. **The `compile_fail` doctests' controls run by `cargo xtask` (TASKS item 143, step 4). Numbered by the coordinating session on 2026-11-27; not started.**
     - **What:** each doctest that must fail to compile has a control, the same code made to compile, which must then fail the doctest. Step 4 ran them by hand; `cargo xtask` runs them, as `kani.rs` runs Kani's controls, in a scratch copy, and fails if one is not caught.
 167. **The kernel's transfer of handles and its grant, reachable by Kani (ADR-0005 P2; TASKS item 143's ruling on step 4). Numbered by the coordinating session on 2026-11-27; not started.**
