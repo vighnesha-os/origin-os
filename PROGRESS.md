@@ -10,8 +10,8 @@ A requirement is one statement of [`CLAUDE.md`](CLAUDE.md), or one decision of a
 |---|--:|--:|
 | Done | 58 | 3.4% |
 | Built | 374 | 22.2% |
-| In progress | 254 | 15.1% |
-| Not started | 1,000 | 59.3% |
+| In progress | 255 | 15.1% |
+| Not started | 999 | 59.3% |
 | **Total** | **1,686** | **100.0%** |
 
 ## What the states mean
@@ -28,10 +28,10 @@ A requirement is one statement of [`CLAUDE.md`](CLAUDE.md), or one decision of a
 | Environment | Requirements |
 |---|--:|
 | The development host | 235 |
-| An emulator (QEMU) | 126 |
+| An emulator (QEMU) | 127 |
 | A virtual machine on a real processor | 285 |
 | Physical hardware | 0 |
-| No evidence yet | 1,040 |
+| No evidence yet | 1,039 |
 
 ## By milestone
 
@@ -52,7 +52,7 @@ Each milestone counts the requirements that [`docs/ROADMAP.md`](docs/ROADMAP.md)
 | M10. Connectivity and laptop support | partial | 131 | 0.8% | 0.0% | 8.4% | 90.8% |
 | M11. Graphics acceleration and compute | not started | 28 | 0.0% | 0.0% | 0.0% | 100.0% |
 | M12. System updates and recovery | not started | 75 | 0.0% | 8.0% | 1.3% | 90.7% |
-| M13. Production qualification | not started | 113 | 1.8% | 4.4% | 9.7% | 84.1% |
+| M13. Production qualification | not started | 113 | 1.8% | 4.4% | 10.6% | 83.2% |
 
 In no milestone: 68 requirements that the roadmap lists as in none, with its reasons, and 327 standing rules, which belong to no milestone (decision item 256).
 
@@ -71,12 +71,12 @@ The requirements of `CLAUDE.md` that ask for something to be built, by the secti
 | SDK and the SDK-only rule | §48 to §49 | 48 | 0.0% | 0.0% | 2.1% | 97.9% |
 | GUI | §50 to §53 | 67 | 0.0% | 0.0% | 4.5% | 95.5% |
 | Networking, audio and peripherals | §54 to §56 | 42 | 0.0% | 0.0% | 23.8% | 76.2% |
-| Accounts, security, cryptography and privacy | §57 to §61 | 60 | 5.0% | 13.3% | 15.0% | 66.7% |
+| Accounts, security, cryptography and privacy | §57 to §61 | 60 | 5.0% | 13.3% | 16.7% | 65.0% |
 | Versions, updates and recovery | §62 to §65 | 48 | 4.2% | 12.5% | 0.0% | 83.3% |
 | Performance, power, time and reliability | §66 to §69 | 45 | 0.0% | 8.9% | 6.7% | 84.4% |
 | Developer platform | §70 to §71 | 27 | 0.0% | 3.7% | 7.4% | 88.9% |
 | Testing, hardware qualification and release | §72 to §76 | 69 | 1.4% | 14.5% | 11.6% | 72.5% |
-| **All fourteen areas** | | 834 | 2.0% | 15.4% | 10.3% | 72.3% |
+| **All fourteen areas** | | 834 | 2.0% | 15.4% | 10.4% | 72.2% |
 
 Outside these areas: 154 more of `CLAUDE.md` that ask for something to be built, in the header (7), §1 (69), §6 (17), §18 (17), §79 (12), §82 (17), §84 (14), the final rules (1). They are counted in "Overall", and in a milestone where the roadmap places them.
 
@@ -253,7 +253,7 @@ Each specification, standard and protocol the project relies on, with the requir
 | §58. Security architecture | 18 | 0.0% | 27.8% | 16.7% | 55.5% |
 | §59. Cryptographic implementation | 11 | 9.1% | 18.2% | 45.4% | 27.3% |
 | §60. Software supply-chain security | 11 | 18.2% | 9.1% | 9.1% | 63.6% |
-| §61. Privacy | 8 | 0.0% | 0.0% | 0.0% | 100.0% |
+| §61. Privacy | 8 | 0.0% | 0.0% | 12.5% | 87.5% |
 
 **Versions, updates and recovery (§62 to §65)**
 
@@ -1716,7 +1716,7 @@ The milestone, feature-area and specification tables, with the number of require
 | M10. Connectivity and laptop support | 131 | 1 | 0 | 11 | 119 |
 | M11. Graphics acceleration and compute | 28 | 0 | 0 | 0 | 28 |
 | M12. System updates and recovery | 75 | 0 | 6 | 1 | 68 |
-| M13. Production qualification | 113 | 2 | 5 | 11 | 95 |
+| M13. Production qualification | 113 | 2 | 5 | 12 | 94 |
 
 | Feature area | Sections | Requirements | Done | Built | In progress | Not started |
 |---|---|--:|--:|--:|--:|--:|
@@ -1729,12 +1729,12 @@ The milestone, feature-area and specification tables, with the number of require
 | SDK and the SDK-only rule | §48 to §49 | 48 | 0 | 0 | 1 | 47 |
 | GUI | §50 to §53 | 67 | 0 | 0 | 3 | 64 |
 | Networking, audio and peripherals | §54 to §56 | 42 | 0 | 0 | 10 | 32 |
-| Accounts, security, cryptography and privacy | §57 to §61 | 60 | 3 | 8 | 9 | 40 |
+| Accounts, security, cryptography and privacy | §57 to §61 | 60 | 3 | 8 | 10 | 39 |
 | Versions, updates and recovery | §62 to §65 | 48 | 2 | 6 | 0 | 40 |
 | Performance, power, time and reliability | §66 to §69 | 45 | 0 | 4 | 3 | 38 |
 | Developer platform | §70 to §71 | 27 | 0 | 1 | 2 | 24 |
 | Testing, hardware qualification and release | §72 to §76 | 69 | 1 | 10 | 8 | 50 |
-| **All fourteen areas** | | 834 | 17 | 128 | 86 | 603 |
+| **All fourteen areas** | | 834 | 17 | 128 | 87 | 602 |
 
 | Specification | Requirements | Done | Built | In progress | Not started |
 |---|--:|--:|--:|--:|--:|

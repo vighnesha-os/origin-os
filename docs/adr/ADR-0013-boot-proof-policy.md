@@ -1148,6 +1148,18 @@ The host model's control, `the_unfixed_phase_can_miss_its_thread_at_every_try`, 
 
 Not shown by these: orders B and C without a plant (no unplanted boot is expected to reach the old stop again, which is the point of the change); a plant on more than 2 processors, on 1, or under AMD-Vi; an observer that took any blocked slot of the processor, which would pass every one of these but C134-I only because the far processor holds no other blocked thread in the window; anything under KVM or on hardware.
 
+**Controls of TASKS item 171 (2026-11-27, QEMU 11.1.3 TCG with OVMF, Intel VT-d, 2 processors; the boot proofs write only inside the partition marked for Origin's tests).** D1 and D2 are standing, in `cargo xtask boot-disk`, which `boot-matrix` runs; the others are plants, run once. D1-before and D4-before ran on an export of `34fdf164`, the code before the task; D3, D1-lie and D5 on exports of the merged tip, `ac087949`. Every boot's NVMe test disk is judged from its bytes after the boot, whatever its markers said (`check_storage_evidence`).
+
+| # | Edit or disk | Result |
+|---|---|---|
+| D1 | The test disk with the marked partition typed as Origin data | Passed: no write, no flush, no GPT identifier printed, the image unchanged byte for byte |
+| D2 | The marked partition 72 blocks long | Passed: processor 1's write refused by name, the per-CPU proof failed as aimed, the verdict degraded with NVMe failed, the image changed inside the partition alone |
+| D1-before | The old code on D1's disk | Failed where aimed: blocks 10240, 20000, 20008 and 32704 written |
+| D4-before | The old code's kernel boot | Failed where aimed: its controller line holds the serial |
+| D3 | The guard's range check removed, D2's disk | Caught: D2's marker missing, and block 18504 changed outside the partition |
+| D1-lie | A write past the guard on D1's disk, uncounted and unsaid | Caught by the bytes alone: block 32704 changed |
+| D5 | The polled proof aimed one block before the partition | Caught: refused by name, NVMe failed, the disk unchanged |
+
 ## Alternatives
 
 | Alternative | For | Against |
