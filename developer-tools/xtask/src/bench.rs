@@ -2859,7 +2859,7 @@ pub(crate) fn boot(settings: &Settings) -> Result {
     // `ORIGIN_BOOT_TEST_ONLY` picks scenarios by label, as for `boot-console`.
     let chosen = crate::select_scenarios(&all, &settings.only)?;
     for (scenario, kernel) in &chosen {
-        run_scenario(scenario, kernel, settings)?;
+        run_scenario(scenario, kernel, settings, None)?;
     }
     println!(
         "xtask: boot-bench passed ({} of {} scenarios: the firmware's key, a stale key once, twice, the bench kernel under the normal loader, the reset through ResetSystem, through the FADT's register, a disturbed UART written back, and the FCH's nine: the control, 0xCF9 after the call, the triple fault, the fall-through, no record, 0xCF9 only after the retry succeeds, the normal path after both calls fail, a contradicting layout, and a control that does not reset; and the minimal mode's six: the control, a returning call, no record, the retry, both calls failing with the FADT's write to 0xCF9 skipped, and the triple fault with the shutdown bits clear; and the bisection mode's nine: the control, a returning call through the copy, no record, the retry, both calls failing with the FADT's write to 0xCF9 skipped, the shutdown bits clear, no BENCH-FCH, the control withheld, and BENCH-AFTER kernel ignored; and the kernel-entry mode's five: the bench kernel entered with no switch, after the retry, with BENCH-AFTER fadt ignored and with BENCH-FCH's first ignored, and the halt after both calls fail) in {} s",
