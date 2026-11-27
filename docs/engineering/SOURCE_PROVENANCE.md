@@ -6454,7 +6454,15 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   Without plants, on `40e46ef0` (the code as at `796c7f69`): `cargo xtask check` passed (1,139 s), `cargo xtask boot-test` passed 11 of 11 scenarios (68 s), and `cargo xtask boot-matrix` passed (2,066 s). Each started with no `failed-boots` folder and left none.
 
   No kept file names the clone's path, the scratch directory, `$HOME` or the account. The earlier two runs of the same plants found `monitor.log` empty (fixed in `1cf28b1c`), then 226,127 bytes of redrawn command line with partial host paths in it (fixed in `796c7f69`).
+
+  **In CI: run 45985725312** ("TASKS 165 CI control", 2026-11-27).
+  - **The run:** at the owner's "Yes, push it", the coordinating session pushed the control branch `ci-control/t165` at `35f466ef`: `ci.yml` trimmed to the three boot jobs, with C1 planted. It read the job logs and the artifact list, downloading nothing.
+  - **The uploads:** each job failed at the planted boot with the screen's rows in its log, and its upload step uploaded 4 files:
+    - `failed-boots-software-cpu`, 54,939 bytes;
+    - `failed-boots-ubuntu-26.04`, 53,850 bytes;
+    - `failed-boots-ubuntu-24.04`, 53,858 bytes.
+  - **After it:** on both real-CPU jobs the host boot passed (1 of 11 scenarios).
+  - **What stays:** the artifacts expire after 7 days, and the run's logs stay. The branch stays on GitHub until the owner says to delete it.
 - **Known limits:**
-  - CI's upload of a failed boot is not yet shown (TASKS item 165).
   - A boot that fails before QEMU starts keeps nothing; its message is the job's last line.
   - A job that times out is cancelled, and `if: failure()` does not run. The boot's own timeout ends a hung boot long before the job's.
