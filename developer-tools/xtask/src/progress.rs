@@ -1270,8 +1270,11 @@ mod tests {
                 })
                 .count();
         }
-        // The first line's total, the overall table's two, and the evidence table's.
-        assert!(thousands >= 4, "{thousands}");
+        // Two counts stay above a thousand: the first line's total and the overall table's total,
+        // since requirements are only ever added. Every category's count, "Not started" and "No
+        // evidence yet" among them, falls as work starts (TASKS item 171 took "Not started" below
+        // 1,000).
+        assert!(thousands >= 2, "{thousands}");
     }
 
     /// The four cells after a line's count, if the line is one of a table of percentages.
