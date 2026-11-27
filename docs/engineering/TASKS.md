@@ -763,6 +763,16 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 164. **ONBF's second parser, written independently (ONBF §13 item 6; CLAUDE.md §73 and §1). Numbered by the coordinating session on 2026-11-27; not started.**
     - **What:** a second parser of ONBF images, written from `docs/spec/ONBF.md` and its errata by a different session that does not read `onbf-format`, host-only, which must agree with the first on the whole corpus (the fuzz seeds, the malicious corpus and the images the build makes). A disagreement is a specification bug, settled in the errata.
     - **Why now:** ONBF v1.0 becomes final only after §13's tests pass, and item 6 had no TASKS item.
+165. **A failed boot in CI leaves its evidence (CLAUDE.md §1, role 26; §69). Numbered by the coordinating session on 2026-11-27; not started.**
+    - **Why:** on 2026-11-27 PR 79's real-CPU job failed one boot, "console: no UART at all", with "origin-kernel: boot refused" on the screen (run 45927890180). That boot has no serial port, and the job kept neither the screen nor the logs, so its cause cannot be read. Its rerun passed.
+    - **What:** every boot job keeps, when a boot fails, that boot's serial log and the last screen capture `boot-test` read, as an artifact of the job.
+166. **The `compile_fail` doctests' controls run by `cargo xtask` (TASKS item 143, step 4). Numbered by the coordinating session on 2026-11-27; not started.**
+    - **What:** each doctest that must fail to compile has a control, the same code made to compile, which must then fail the doctest. Step 4 ran them by hand; `cargo xtask` runs them, as `kani.rs` runs Kani's controls, in a scratch copy, and fails if one is not caught.
+167. **The kernel's transfer of handles and its grant, reachable by Kani (ADR-0005 P2; TASKS item 143's ruling on step 4). Numbered by the coordinating session on 2026-11-27; not started.**
+    - **Why:** `ipc.rs`'s transfer of handles, where P2's "a handle sent keeps at most the rights it had" lives, and `process.rs`'s grant of a program's first authority build only for the kernel's target, so no host test or Kani proof reaches them.
+    - **The contract weighs:** moving their checking logic into host-built modules, as `handles.rs` and `mapping.rs` are, with behaviour kept (host tests of the old form against the new, the boot proofs passing, the kernel's images compared), then Kani proofs within item 143's rules.
+168. **Kani proofs of `mapping.rs`'s other host-built logic (CLAUDE.md §73; row S73-07). Numbered by the coordinating session on 2026-11-27; not started.**
+    - **What:** `frames`, `place`, `place_at_random`, `price`, `Budget` and `Mappings`, which build on the host and are covered by host tests but no proof. Within item 143's rules.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
