@@ -212,6 +212,40 @@ jobs:
   # page, with a notice on the pull request, and how long each job's boot-matrix step took beside
   # its processor (TASKS item 53): the time follows the processor far more than any change. A
   # record only: it never fails the run, and no time is held to anything.
+  # The bench script for a Windows machine's firmware tables (TASKS item 169; owner items 381
+  # and 382), run on GitHub's Windows runner, a Hyper-V guest: it must read a FADT, a DSDT and
+  # SMBIOS, and write nothing into the checkout. Its output is not kept: the runner's SMBIOS
+  # names the virtual machine.
+  windows-firmware-script:
+    name: the Windows firmware-table script
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run it, as a bench machine's owner would, without administrator rights
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File developer-tools/bench/windows/collect-firmware.ps1 -OutputDirectory "$env:RUNNER_TEMP" -Strict
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Its zip holds the tables and a manifest
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -LiteralPath "$env:RUNNER_TEMP" -Filter 'OriginFirmware-*.zip' | Select-Object -First 1
+          if ($null -eq $zip) { throw 'no zip was written' }
+          $out = Join-Path "$env:RUNNER_TEMP" 'unzipped'
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $out
+          foreach ($f in @('acpi/FACP.bin', 'acpi/DSDT.bin', 'smbios.bin', 'summary.json', 'manifest.txt')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $out $f))) { throw "missing $f" }
+          }
+          $manifest = Get-Content -LiteralPath (Join-Path $out 'manifest.txt')
+          if (-not ($manifest -match 'acpi/DSDT.bin .* checksum ok ')) { throw 'the DSDT checksum line is missing or bad' }
+          ($manifest | Select-String -Pattern '^  acpi/').Count
+      - name: The job left the checkout as committed
+        shell: bash
+        run: bash .github/ci/checkout-unchanged.sh
+
   processors:
     name: processors tested on
     needs: boot-real-cpu

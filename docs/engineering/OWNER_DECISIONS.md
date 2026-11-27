@@ -1807,3 +1807,28 @@ On 2026-11-27 you brought a list of thirteen test tools and practices in four ti
   - this sheet;
   - the "Decided by" column of rows S13-12 (376), S72-01 (377), A19-A3 (378) and S72-11 (379), and the requirements README's table of items without rows (380);
   - TASKS items 160 to 164, and the lines of items 145 and 156.
+
+### A friend's Zen 5 desktop as bench equipment (items 381 to 383): Accepted 2026-11-27
+
+On 2026-11-27 you said a friend has a desktop that could help: an MSI MAG X870E TOMAHAWK WIFI board (AMD X870E chipset, socket AM5), an AMD Ryzen 9 9950X, 96 GB of DDR5-6600 and a Samsung 990 Pro 1 TB NVMe disk, with Windows on it. You asked whether Origin should boot there, or whether a script should collect the machine's configuration, perhaps a USB stick that boots, writes a file and is read back on Windows. Item 354 left open "a machine in the declared scope, or one you provide". The coordinating session recommended three items, and you answered "Accept all".
+
+| # | Question | Answer |
+|---|---|---|
+| 381, answered | Use the friend's desktop as bench equipment, with the friend's consent, paying nothing, and writing nothing to its disks, its firmware settings or its firmware variables except what the friend chooses? | **Accept** |
+| 382, answered | First, without booting anything: a PowerShell script of the project's own that reads only Windows' firmware-table interface and a summary of the hardware, writes one zip file, and whose results stay outside the public repository? | **Accept** |
+| 383, answered | Later: a USB stick holding a read-only survey program and the bench loader, never the kernel, which writes its report to the stick before `ExitBootServices`? | **Accept** |
+
+- **What was found first:**
+  - **Scope:** the Ryzen 9 9950X is a Zen 5 processor (family 1Ah), but the X870E platform came out in 2024. Under ADR-0009 Amendment 1 the machine is bench equipment only: no support or qualification claim rests on it.
+  - **The kernel must not boot there.** Its storage proofs write to any NVMe namespace they find (`framekernel/src/storage.rs`: one block 64 from the end, and blocks from 20,000 on), and they print the controller's serial number. On the friend's disk those blocks belong to Windows. TASKS item 171 makes the proofs write only to a disk marked for Origin's tests.
+  - **Why the machine helps:** it is the first physical machine since the rentals stopped (item 354). Stage 2 can show whether ADR-0002 Amendment 7 (TASKS item 133), checked so far under QEMU only, lets the firmware's exit return on real firmware.
+- **What each item decides:**
+  - **381:** the friend's consent comes first, through you. No session needs or records the friend's personal details. The machine's identifiers, in SMBIOS above all, stay off the public repository. Tables join the project's test data only with identifiers removed and with the friend's agreement.
+  - **382 (TASKS item 169):** the script runs on Windows PowerShell 5.1, needs no administrator rights for its tables and no download, and changes nothing on the machine. It collects the raw ACPI tables and SMBIOS through `GetSystemFirmwareTable`, a hardware summary without serial numbers, and a manifest of SHA-256 digests. Windows returns one table for each signature, so SSDTs past the first may be missing; stage 2 reads every table the XSDT names. A CI job runs it on GitHub's Windows runner first.
+  - **383 (TASKS item 170):** built after stage 1's results. The friend turns Secure Boot off for the boot and back on after, has the BitLocker recovery key in hand first (changing Secure Boot can make Windows ask for it), and boots the stick once from the board's boot menu, the boot order unchanged. What happens after the firmware's exit can only be shown on the screen, and the friend photographs it.
+- **What does not change:** item 354 stands: nothing is rented. The declared scope is unchanged. No image the release builds changes for this.
+- **Performance cost** (ADR-0018 V3): none, by construction: bench tools only.
+- **Where it is written:**
+  - this sheet;
+  - the "Decided by" column of rows A09-H6 and S72-09;
+  - TASKS items 169, 170 and 171.
