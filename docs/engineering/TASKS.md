@@ -6595,7 +6595,7 @@ Written on 2026-11-27 on `claude/t143-closing-note`, cut from `land/batch-11` at
 
 Every harness has a negative control and states its bounds and what it leaves unproved (rows S73-02 and S73-12). The 60 harnesses and 65 controls run in `cargo xtask kani` and in CI's three jobs, and `kani-gate`, in `check`, holds the controls and the matrix to the proof files. Kani's results are about the source as Kani compiles it for the host, not about the machine code rustc 1.100.0 makes for the kernel's target. Each step had one independent AI review (`docs/engineering/REVIEW_T143_2026-11-26.md`, `REVIEW_T143_STEP3_2026-11-27.md` and `REVIEW_T143_STEP4_2026-11-27.md`), each finding answered. **No person has reviewed any step.**
 
-**Carried forward.** None of these items is started. Lines 165 to 168 are on `main` (PR 81) and are not yet in this batch.
+**Carried forward.** None of these items is started. Lines 165 to 168 are on `main` (PR 81).
 - **TASKS item 154:** a Kani proof of the frame allocator's `reclaim`, which needs an unwind bound past the local budget, and the overcount found in review (R143-11).
 - **TASKS item 156:** Kani proofs of `origin-paging`, with a reference walk written from the Intel SDM and the AMD APM.
 - **TASKS item 157**, from step 2's review (R143-10): `FrameError`'s documentation of frame 0.
