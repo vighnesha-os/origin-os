@@ -6408,3 +6408,15 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - CI's `framekernel` job ran them at `c2680f71` (run 45948073598): all 32 verified and all 26 controls caught, in 68 checks. The three split jobs passed; their figures are in TASKS item 143's closing note.
 - **Review:** one independent AI review, recorded in `docs/engineering/REVIEW_T143_STEP4_2026-11-27.md`: 0 High, 3 Medium, 6 Low and 5 Info, each answered there in `1dd5856b`. **No person has reviewed it.**
 - **Known limits:** in TASKS item 143's step-4 entry.
+
+## The Windows firmware-table script (`developer-tools/bench/windows/collect-firmware.ps1`; TASKS item 169; 2026-11-27)
+
+- **What:** a bench tool, not part of any image: a Windows PowerShell 5.1 script that reads a machine's raw ACPI tables and SMBIOS through `EnumSystemFirmwareTables` and `GetSystemFirmwareTable`, its firmware type through `GetFirmwareType`, Secure Boot's state from the registry, and a hardware summary through CIM with no serial numbers or names, and writes them with a manifest of SHA-256 digests and each ACPI table's checksum into one zip. It writes nothing else and changes no setting. A CI job, `windows-firmware-script`, runs it on GitHub's Windows runner with `-Strict`.
+- **Authoring agent:** the coordinating session (Claude Opus 5.5), at the owner's "Accept all" on items 381 to 383.
+- **Specifications:** Microsoft's documentation of `EnumSystemFirmwareTables`, `GetSystemFirmwareTable` (its provider signatures and the `RawSMBIOSData` layout) and `GetFirmwareType`; ACPI 6.6 §5.2.6 for a table's header and checksum.
+- **Open-source references consulted (§3, §6):** none.
+- **`unsafe`:** none; the C# it compiles uses `DllImport` only.
+- **Dependencies:** none; Windows PowerShell 5.1 and the .NET Framework it runs on, as Windows ships them.
+- **Licensing:** MIT OR Apache-2.0 (the workspace's `license`).
+- **Code review:** none, AI or person. Its CI job is its test; it has not run on a physical machine.
+- **Known limits:** Windows returns one ACPI table for each signature, so SSDTs past the first are missing (TASKS item 170 reads every table the XSDT names). Its results hold the machine's identifiers and stay outside the public repository (owner item 381).
