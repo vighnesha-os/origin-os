@@ -660,9 +660,12 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
     - **First models:** ADR-0020's balancing (asks, pulls and kicks) across many processors, which Loom's bounded search cannot reach;
     - **then** IPC.
     - Every Shuttle result is recorded as tested, not proved. The Loom models stay the proofs within their bounds.
-147. **Proptest for the allocators and the ONBF packer (owner item 363). Numbered by the coordinating session on 2026-11-25; not started.** `proptest` becomes a host-only dev-dependency once CLAUDE.md §5's review passes.
-    - **Allocators:** model-based tests of the frame allocator, the heap and the slab table, using random sequences of allocations and frees checked against a simple model and shrunk to the smallest sequence that fails.
+147. **Bolero for the allocators and the ONBF packer (owner item 375, in place of item 363's Proptest). Numbered by the coordinating session on 2026-11-25; not started.** `bolero` becomes a host-only dev-dependency once CLAUDE.md §5's review passes.
+    - **First, a smoke check,** as item 359's was for cargo-fuzz: bolero builds and runs on Rust 1.100.0 with `--sanitizer NONE`, with no `-Z` flag on any compiler command line, and finds a planted defect. If it does not, Proptest stays, under item 363.
+    - **Allocators:** model-based tests of the frame allocator, the heap and the slab table, using sequences of allocations and frees checked against a simple model and shrunk to the smallest sequence that fails.
     - **ONBF:** pack-then-parse round trips through `onbf-pack`'s library.
+    - **Under `cargo test` only,** until the owner decides the fuzz mode: `cargo bolero test` starts the test binary and needs an allowance like item 365's, put after the smoke check.
+    - **Not in it:** bolero's Kani engine. TASKS item 143's Kani proofs and item 144's cargo-fuzz targets stay as they are.
     - The seeded soaks stay.
 148. **Whether the ask is needed (TASKS item 98's control C98-3). Numbered by the coordinating session on 2026-11-26; not started.** A kernel that never sends ADR-0020 Amendment 1's ask passes every proof. In the "load balancing" proof, "two alone" was taken by a kick at a tick, not through an ask, so the ask is shown only by its bound (C98-8) and its counts. This item finds which is true:
     - **A case only the ask passes:** a proof case where only the ask makes a waiting frame lendable. C98-3 must then be caught.

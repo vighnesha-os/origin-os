@@ -1743,3 +1743,33 @@ Item 372 waited for a contact address for conduct reports. The coordinating sess
   - The branch's first commit, from GitHub's template, says "2.1" in its message although it added 2.0; the commit after it replaces the text with 2.1.
 - **The identifier scans:** sessions scan their commits for personal data before they push. Your address in `CODE_OF_CONDUCT.md` is there by your choice, and a scan that finds it there is not a finding.
 - **Also:** `CONTRIBUTING.md` and `README.md` link the code of conduct.
+
+### Bolero in place of Proptest for TASKS item 147 (item 375): Accepted 2026-11-27
+
+Item 363 added Proptest for the allocators' model tests and ONBF's pack-then-parse round trips (TASKS item 147, not started). On 2026-11-27 you asked about bolero, which lets one test harness run under several engines: as a property test, as a fuzz target and under Kani. The coordinating session compared bolero 0.13.7 with Proptest 1.12.0, both read that day, and recommended bolero for item 147, under conditions. You answered "Use bolero".
+
+| # | Question | Answer |
+|---|---|---|
+| 375, answered | Use bolero instead of Proptest for TASKS item 147, under the conditions below? | **Use bolero** |
+
+- **Why bolero, for this item:**
+  - a bolero test runs under `cargo test` with random inputs, as a Proptest test does, and shrinks a failure to a small input;
+  - the same test, unchanged, also runs as a coverage-guided fuzz target on stable Rust (`--sanitizer NONE`). Coverage guidance finds rare allocator states that random sequences miss, such as the two latent allocator defects TASKS item 143's proofs found (F-1 and F-2).
+- **What was weighed against it:**
+  - bolero is pre-1.0 (0.13.7, 2026-10-03), MIT, maintained mostly by one person, and used by AWS's s2n-quic for its tests;
+  - Proptest is 1.x, maintained by an organisation with 97 contributors, and far more widely used.
+  - It is a host-only test tool, nothing it brings ships (CLAUDE.md §5), and the tests could be moved to another framework later.
+- **The conditions:**
+  - **Scope:** bolero replaces Proptest in TASKS item 147 only. Item 143's Kani proofs and item 144's nine cargo-fuzz targets stay as they are.
+  - **No Kani engine.** Item 143's proofs fit the local budget only because each harness is shaped by hand: fixed lengths, stand-ins and covers. Bolero's generic generators are the form item 143's probes found too costly, and its `#[cfg_attr(kani, kani::proof)]` on test functions conflicts with `kani-gate`'s rule.
+  - **A smoke check first,** as item 359's was for cargo-fuzz: bolero builds and runs on Rust 1.100.0 with `--sanitizer NONE`, with no `-Z` flag on any compiler command line, and finds a planted defect. If it does not, Proptest stays, under item 363.
+  - **CLAUDE.md §5's review** of `bolero` and the crates it brings, before it is added as a host-only dev-dependency.
+  - **The fuzz mode is a decision of its own.** `cargo bolero test` starts the test binary, as cargo-fuzz does, so running item 147's tests as fuzz targets needs an allowance like item 365's. The coordinating session puts that question after the smoke check. Until then, bolero tests run only under `cargo test`, which item 310 already covers.
+  - Any sanitizer needs nightly, and stays under items 360 and 364.
+- **Downloads:** accepting covers `bolero` and its crates once, at the version read on the day. `cargo-bolero` waits for the fuzz-mode decision.
+- **What does not change:** every build, check and release stays on Rust 1.100.0 (§8, §12). The seeded soaks and the Loom models stay. Bolero, like Proptest, finds defects and proves nothing (row S73-12).
+- **Performance cost** (ADR-0018 V3): none, by construction: a host-only test tool.
+- **Where it is written:**
+  - this sheet;
+  - the "Decided by" column of matrix rows S72-03 and S72-04;
+  - TASKS item 147's line.
