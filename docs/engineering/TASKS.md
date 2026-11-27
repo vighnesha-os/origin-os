@@ -764,9 +764,32 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 164. **ONBF's second parser, written independently (ONBF §13 item 6; CLAUDE.md §73 and §1). Numbered by the coordinating session on 2026-11-27; not started.**
     - **What:** a second parser of ONBF images, written from `docs/spec/ONBF.md` and its errata by a different session that does not read `onbf-format`, host-only, which must agree with the first on the whole corpus (the fuzz seeds, the malicious corpus and the images the build makes). A disagreement is a specification bug, settled in the errata.
     - **Why now:** ONBF v1.0 becomes final only after §13's tests pass, and item 6 had no TASKS item.
-165. **A failed boot in CI leaves its evidence (CLAUDE.md §1, role 26; §69). Numbered by the coordinating session on 2026-11-27; not started.**
+165. **A failed boot in CI leaves its evidence (CLAUDE.md §1, role 26; §69). Numbered by the coordinating session on 2026-11-27; built the same day on `claude/t165-boot-evidence-d5f6cc`, to the contract the coordinating session ruled on (Q1 to Q8); not landed.**
     - **Why:** on 2026-11-27 PR 79's real-CPU job failed one boot, "console: no UART at all", with "origin-kernel: boot refused" on the screen (run 45927890180). That boot has no serial port, and the job kept neither the screen nor the logs, so its cause cannot be read. Its rerun passed.
     - **What:** every boot job keeps, when a boot fails, that boot's serial log and the last screen capture `boot-test` read, as an artifact of the job.
+    - **Why that run kept nothing:** two things lost it.
+      - The next step's kernel boot wrote over `target/xtask/screen.ppm`.
+      - `wait_for_screen`'s error named the failure message but none of the screen's rows.
+    - **Built (`580e15ea`, `53bbb8e0`, `1cf28b1c`, `796c7f69`): a failed boot keeps its evidence.** Every boot goes through `run_scenario`. When one fails, `evidence.rs` writes `target/xtask/failed-boots/NN-<label>/`, numbered after the directories already there, with at most 16 kept. It holds:
+      - `boot.txt`: the scenario, the command, `boot-matrix`'s machine line, the start in UTC, the revision with the tree only "clean" or "not clean", the verdict, the first missing marker, the settings, the QEMU command line and QEMU's stderr;
+      - the log the markers were judged in: `serial.log`, or `spcr-uart.log` with `com1.log`, or for a boot with no UART `monitor.log`, drawn as a terminal shows it;
+      - the last screen dump `boot-test` read in that boot, as `screen.ppm`, and its rows as `screen.txt`.
+    - **The limits and the host paths:**
+      - Host paths become `<target>`, `<repo>` and `~` in every file.
+      - A text over 8 MiB keeps its first 1 MiB and its last 7 MiB.
+      - A dump over 16 MiB is left out.
+      - A screen failure's error now names the screen's rows, so the job's log holds them too.
+    - **Built (`1ebcbaba`, `c62fb26f`): the CI side.** `ci.yml`'s three boot jobs and `processor-sweep.yml`'s sweep upload the folder only when a step failed (`if: failure()`), for 7 days, with the pinned `upload-artifact`.
+    - **Shown on the development Mac (QEMU 11.1.3, TCG):** three planted failing boots in a scratch clone of `796c7f69`, run in order in one turn:
+      - **C1:** the boot with no UART fails on a line its screen shows. It left `boot.txt`, `monitor.log`, `screen.ppm` and `screen.txt`.
+      - **C2:** the kernel boot fails on an early loader line. It left `boot.txt` and `serial.log`, and no dump, though C1 had left one.
+      - **C3:** the SPCR scenario waits for a marker no boot prints. It left `boot.txt`, `spcr-uart.log` and `com1.log`.
+
+      The directories were numbered 01 to 03, and no kept file names a host path. The 3,072,016-byte dump is 51,246 bytes under gzip -6.
+    - **What the controls found, fixed in the same branch:**
+      - `monitor.log` was empty: nothing read QEMU's stdout while the screen was watched (`1cf28b1c`).
+      - Then it was 226,127 bytes of QEMU's redrawn command line, whose partial host paths no replacement could catch (`796c7f69`).
+    - **CI's failing side is not yet shown.** A local branch `ci-control/t165` holds one commit: `ci.yml` trimmed to the three boot jobs, starting only on a push to that branch, with C1 planted. It is not pushed. The coordinating session puts it to the owner (ruling Q7). If the owner declines, the first boot that fails in CI on its own shows it. A green run shows the passing side: its upload steps are skipped, and it lists no `failed-boots-*` artifact.
 166. **The `compile_fail` doctests' controls run by `cargo xtask` (TASKS item 143, step 4). Numbered by the coordinating session on 2026-11-27; not started.**
     - **What:** each doctest that must fail to compile has a control, the same code made to compile, which must then fail the doctest. Step 4 ran them by hand; `cargo xtask` runs them, as `kani.rs` runs Kani's controls, in a scratch copy, and fails if one is not caught.
 167. **The kernel's transfer of handles and its grant, reachable by Kani (ADR-0005 P2; TASKS item 143's ruling on step 4). Numbered by the coordinating session on 2026-11-27; not started.**
