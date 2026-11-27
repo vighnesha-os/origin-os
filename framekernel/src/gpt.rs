@@ -227,6 +227,28 @@ pub fn parse_header(block: &[u8], lba: u64, disk_blocks: u64) -> Result<Header, 
     Ok(h)
 }
 
+/// Whether `block`, LBA 0, is a protective MBR (UEFI 2.11 §5.2.3, Tables 5.3 and 5.4, p. 114):
+/// the signature 55h AAh at bytes 510 and 511, one partition record of OS type EEh starting at
+/// LBA 1, and the other three records all zero. A legacy MBR with partitions of its own is not
+/// one, and the GPT behind it may be stale (UEFI 2.11 §5.3.2, p. 118).
+pub fn is_protective_mbr(block: &[u8]) -> bool {
+    if block.len() < 512 || block.get(510..512) != Some(&[0x55, 0xAA][..]) {
+        return false;
+    }
+    let mut protective = 0;
+    for i in 0..4 {
+        let Some(record) = block.get(446 + 16 * i..462 + 16 * i) else {
+            return false;
+        };
+        if record.get(4) == Some(&0xEE) && u32_at(record, 8) == 1 {
+            protective += 1;
+        } else if record.iter().any(|&b| b != 0) {
+            return false;
+        }
+    }
+    protective == 1
+}
+
 /// One used partition entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Partition {
@@ -763,5 +785,48 @@ mod tests {
             Err(GptError::Entries),
             "short"
         );
+    }
+
+    /// UEFI 2.11 §5.2.3: one EEh record from LBA 1, the other three zero, and the signature.
+    #[test]
+    fn a_protective_mbr_and_what_is_not_one() {
+        let mut mbr = [0u8; 512];
+        mbr[446 + 1..446 + 4].copy_from_slice(&[0x00, 0x02, 0x00]);
+        mbr[446 + 4] = 0xEE;
+        mbr[446 + 5..446 + 8].copy_from_slice(&[0xFF, 0xFF, 0xFF]);
+        mbr[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+        mbr[446 + 12..446 + 16].copy_from_slice(&(DISK as u32 - 1).to_le_bytes());
+        mbr[510..512].copy_from_slice(&[0x55, 0xAA]);
+        assert!(is_protective_mbr(&mbr));
+        // A 4 KiB block 0 holds the same at the same offsets.
+        let mut big = vec![0u8; 4096];
+        big[..512].copy_from_slice(&mbr);
+        assert!(is_protective_mbr(&big));
+        // No signature; a short block.
+        let mut m = mbr;
+        m[511] = 0;
+        assert!(!is_protective_mbr(&m));
+        assert!(!is_protective_mbr(&mbr[..511]));
+        // The EEh record moved to another slot is still one.
+        let mut m = [0u8; 512];
+        m[446 + 48..446 + 64].copy_from_slice(&mbr[446..462]);
+        m[510..512].copy_from_slice(&[0x55, 0xAA]);
+        assert!(is_protective_mbr(&m));
+        // Another record beside it: a hybrid or legacy MBR, whose GPT may be stale.
+        let mut m = mbr;
+        m[446 + 16 + 4] = 0x07;
+        assert!(!is_protective_mbr(&m));
+        // Two protective records; one that does not start at LBA 1; another OS type.
+        let mut m = mbr;
+        m[446 + 16..446 + 32].copy_from_slice(&mbr[446..462]);
+        assert!(!is_protective_mbr(&m));
+        let mut m = mbr;
+        m[446 + 8] = 2;
+        assert!(!is_protective_mbr(&m));
+        let mut m = mbr;
+        m[446 + 4] = 0xEF;
+        assert!(!is_protective_mbr(&m));
+        // A blank block.
+        assert!(!is_protective_mbr(&[0u8; 512]));
     }
 }
