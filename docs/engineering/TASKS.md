@@ -641,11 +641,11 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 140. **`boot-matrix`'s usage line and `Cargo.toml`'s `default-members` (TASKS item 137's review, follow-ups 1 and 2). Numbered by the coordinating session on 2026-11-25; not started.** The usage line leaves out machines it runs: `boot-reserved`, `boot-acpi`, `boot-listed`, `boot-sparse` and `boot-domains`. `default-members` leaves out `sdk/directory` and `services/directory`, which `check` lints and tests on the host.
 141. **A placement control for B1 under emulation (TASKS item 98's turn T1). Numbered by the coordinating session on 2026-11-25; not started.** Under QEMU's software processor, B1 moved by 7 to 9 % between builds whose switch-path code is the same: a commit that added only counters off the switch path took the tip's mean on the 65-processor machine from 2,033 to 1,885 cycles. That is more than the changes TASKS item 92's rule is meant to judge. The control pins the switch path's code placement in the base's and the tip's comparison builds (for example with lld's `--symbol-ordering-file`). It shows the variation that is left, and is recorded as part of ADR-0018 V7's method. Until it lands, a scheduling item's B1 comparison still runs: a rise of more than 10 % above the base's range stops the item, and a smaller difference is judged on static counts.
 142. **Each per-processor table on a line of its own (TASKS item 98's static listing). Numbered by the coordinating session on 2026-11-25; not started.** The boot processor's run queue starts 24 bytes into a 64-byte line. The other processors' queues are consecutive elements whose stride is not a multiple of 64 (1,080 bytes at the base, 1,432 with TASKS item 98), so each queue's lock shares a line with the next queue's first fields. Each processor's element of a `PerCpu` table starts on a line of its own. First check that no assembly or fixed offset depends on today's layout. QEMU models no cache, so the figure it is judged by comes from hardware (ADR-0018 V9).
-143. **Kani's first proofs (owner item 358; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-25. Step 2, the frame allocator's and the heap's harnesses, built on 2026-11-26 and merged into `land/batch-11` at `1030c989`. Step 3, parts of `onbf-format`, built on 2026-11-26 and 2026-11-27 and merged into `land/batch-11` at `f435870e`. Step 4, capability validation, built on 2026-11-27 on `claude/t143-caps-kani` (its entries, below). Not landed on `main`.** `kani-verifier` is installed at a version read on the day, and it and its bundled compiler are recorded in `docs/toolchain/VERIFICATION.md`. The bundle verifies, and builds nothing that ships.
+143. **Kani's first proofs (owner item 358; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-25. Step 2, the frame allocator's and the heap's harnesses, built on 2026-11-26 and merged into `land/batch-11` at `1030c989`. Step 3, parts of `onbf-format`, built on 2026-11-26 and 2026-11-27 and merged into `land/batch-11` at `f435870e`. Step 4, capability validation, built on 2026-11-27 on `claude/t143-caps-kani` and merged into `land/batch-11` at `05acd5cb`. CI's three Kani jobs, one for each package, passed every harness and caught every control at `c2680f71` (run 45948073598; the closing note, below). Not landed on `main`.** `kani-verifier` is installed at a version read on the day, and it and its bundled compiler are recorded in `docs/toolchain/VERIFICATION.md`. The bundle verifies, and builds nothing that ships.
     - **First harnesses:** the frame allocator's and the heap's invariants (rows S73-02 and S73-04);
     - **then** the ONBF parsers' bounds (ONBF §13 item 5; row S73-08);
     - **then** capability validation (row S73-07).
-    - Each harness states what it proves and within which bounds (row S73-12). It runs as `cargo xtask kani` and as a CI job on standard runners.
+    - Each harness states what it proves and within which bounds (row S73-12). It runs as `cargo xtask kani` and as three CI jobs on standard runners, one for each package.
 144. **Coverage-guided fuzzing on stable Rust (owner item 359). Numbered by the coordinating session on 2026-11-25; built on 2026-11-26 on `claude/t144-fuzzing-4d7ce0` (its entry, below); not landed.**
     - **First, a smoke harness** shows whether `cargo fuzz` with `--sanitizer none` builds and runs with Rust 1.100.0. cargo-fuzz 0.13.2's source skips its toolchain check and adds no `-Z` flag in that case, but that is not shown on this host yet. If it needs nightly, it falls under item 360.
     - **Then, structure-aware harnesses** (`arbitrary`): the ONBF parsers and loader (ONBF §13 item 3) and the AML interpreter; later the ACPI table parsers and OCBOR-1.
@@ -6271,7 +6271,7 @@ Assigned by the coordinating session on 2026-11-26. Built on `claude/t143-kani-a
 Every run is inside the local budget of 5 minutes and 8 GB. `two_hand_outs_never_overlap` is inside it by 2 s: at `6201e1b8` it took 186 s and its control 206 s. The rise is not explained: `56e8d38c` changed the specifications it calls (R143-4) and the steps' bodies (R143-1), and this run was on battery; none of the three was measured apart. The run had a processor to itself (555 s of user time in 558 s). If a later local run passes 5 minutes, its bound (8 frames) comes down and the records say so. The times on CI's standard runner are not known yet.
 
 **Not shown:**
-- CI's job `kani` on a standard runner: not yet run on a pull request, so Q4's 15-minute and 8 GB rule is not yet checked there.
+- CI's job `kani` on a standard runner: not yet run on a pull request, so Q4's 15-minute and 8 GB rule is not yet checked there. Shown since: TASKS item 143's closing note, below.
 - `reclaim` (TASKS item 154), with R143-11's overcount for its contract.
 - `FrameError`'s documentation of frame 0 against the code (R143-10): a follow-up.
 - No person has reviewed it.
@@ -6386,7 +6386,7 @@ Every harness verified with every cover satisfied, and each of the 12 controls w
 **`format_minor` (corrected 2026-11-27):** the proof asserts no fixed minor, as the owner's errata C5 decides (2026-11-07): writers emit 0, and a v1 reader accepts any minor under major 1. This paragraph first raised it as an open reading of §4.2, whose table cell still said "`0`". C5 had settled it, and the coordinating session aligned the cell with C5 in PR 78.
 
 **Not shown:**
-- CI's job on these harnesses, and the first CI memory figures.
+- CI's job on these harnesses, and the first CI memory figures. Shown since: TASKS item 143's closing note, below.
 - The artifact upload with the new log names.
 - No person has reviewed it.
 
@@ -6548,9 +6548,75 @@ The one job would have been about 140 minutes on the EPYC. If `origin-frame`'s j
 **The review.** One independent AI review of `bb0b0941`, recorded in `docs/engineering/REVIEW_T143_STEP4_2026-11-27.md`, was given the code and the properties but not the author's argument. It found no High, 3 Medium, 6 Low and 5 Info, none a defect of the kernel. Each finding is answered, in `1dd5856b` and these records. **No person has reviewed it.**
 
 **Not shown:**
-- CI's run of this step's harnesses and of the split jobs, and their times and memory figures.
+- CI's run of this step's harnesses and of the split jobs, and their times and memory figures. Shown since: the closing note, below.
 - The doctests' controls run by `xtask`: they were run by hand. That is TASKS item 166.
 - `ipc.rs`'s transfer of handles and `process.rs`'s grant (P2's other half), which build only for the kernel's target. Making them host-buildable so that Kani can reach them is TASKS item 167.
 - `mapping.rs`'s other host-built logic: `frames`, `place`, `place_at_random`, `price`, `Budget` and `Mappings`. Their host tests cover it; Kani's proofs of it are TASKS item 168.
 - The split by package came after the independent review, which did not read it; its host tests and the local run of `framekernel`'s job are its evidence.
 - No person has reviewed it.
+
+### 143, closing note. CI's three Kani jobs, and what later items carry forward
+
+Written on 2026-11-27 on `claude/t143-closing-note`, cut from `land/batch-11` at `c2680f71`. It changes records only.
+
+**The run.** CI's run 45948073598 on `land/batch-11` (PR 67) at `c2680f71`, which holds step 4 (`09b0a248`, merged at `05acd5cb`) with `main` at `294d2a77` merged after it. Every job of the run passed, the three Kani jobs among them.
+- Each Kani job installed `kani-verifier` 0.68.0 with `cargo install --locked` (`.github/ci/install-kani.sh`). The bundle's SHA-256 checked OK, and it ran CBMC 6.11.0.
+- Each runner had 4 processors, by the job log's processor line.
+- Who checked the figures below: the keeper read the logs, the coordinating session checked the keeper's counts against them, and this session checked every figure against the three job logs again.
+
+| Job | Runner | Time | Proofs | Controls | Highest peak |
+|---|---|---|---|---|---|
+| `origin-frame` | AMD EPYC 9V45 | 69 min (05:49:54 to 06:58:55 UTC) | 18 verified, every cover satisfied, in 1,298 s of verification. Slowest: `two_hand_outs_never_overlap` 310 s, `allocate_keeps_the_heap_whole` 147 s, `free_takes_back_only_a_live_block` 141 s | 27 of 27 caught, in 31 checks and 2,682 s. Longest: 404 s, `two_hand_outs_never_overlap` under `allocate-does-not-mark` | 4.31 GB for a proof (`two_hand_outs_never_overlap`), 4.89 GB for a control (`too-many-reserved-accepted`) |
+| `onbf-format` | AMD EPYC 9V45 | 25 min (05:49:27 to 06:14:42) | 10 verified, every cover satisfied, in 707 s. Slowest: `check_padding_is_exact` 306 s | 12 of 12 caught, in 12 checks and 733 s. Longest: 230 s | 6.08 GB for a proof (`ocbor_validate_then_cursor_read`), 6.07 GB for a control (`ocbor-trailing-data-accepted`) |
+| `framekernel` | Intel Xeon 6975P-C | 15.5 min (05:49:27 to 06:04:57) | 32 verified, every cover satisfied, in 180 s. Slowest: `a_batch_moves_entirely_or_not_at_all_at_2_of_2` 40 s | 26 of 26 caught, in 68 checks and 498 s, every verdict FAILED. Longest: 43 s | 1.67 GB, against 2.04 GB on the development Mac |
+
+- **In all:** 60 harnesses verified and 65 controls caught, in 111 control checks. No check took more than 404 s and no run more than 6.08 GB. So Q4's rule, 15 minutes and 8 GB for each harness on CI's standard runner, now holds for all 60 harnesses.
+- **Two of `onbf-format`'s controls,** `ocbor-argument-indexed` and `le32-indexed`, were caught on the check they name: Kani's placeholder for an assertion message formatted at run time (step 3's entry).
+- **The artifacts:**
+  - `kani-reports-origin-frame`: 45 files, 1,197,289 bytes;
+  - `kani-reports-onbf-format`: 22 files, 248,933 bytes;
+  - `kani-reports-framekernel`: 58 files, 1,742,045 bytes.
+
+  Each holds one log for each harness and each control of its package.
+
+**Against step 4's estimates.**
+- **`framekernel`:** 15.5 minutes on the Xeon 6975P-C. Step 4 estimated about 15 there, from the development Mac's 734 s.
+- **The two AMD jobs** ran on an EPYC 9V45, not the EPYC 7763 the estimates assumed. On the same checks, the 9V45 was the fastest of the three runners seen so far:
+  - `origin-frame`'s 49 verification runs (18 proofs and 31 control checks) took 3,980 s here, 4,475 s on the Xeon 6975P-C (run 45865797476) and 5,317 s on the EPYC 7763 (run 45920792549). The 7763 took 1.34 times as long as the 9V45.
+  - `onbf-format`'s 22 took 1,440 s here and 1,753 s on the 7763, 1.22 times as long.
+  - The checks run the same code at the three commits. Nothing under `framekernel/frame/` changed between them, and `onbf-format`'s proofs changed by one documentation line (C5, in step 4's records).
+- **Inferred, not measured:** the keeper infers that `origin-frame`'s job would take about 90 minutes on an EPYC 7763, still under 120, since `ae4319a0` took about 1.2 to 1.3 times as long there. The verification times above give 1.34 for that package's checks, which puts the job nearer 92 minutes; building and setup need not scale the same way. No job at this tip has run on a 7763.
+- **The next split:** if `origin-frame`'s job ever passes 120 minutes, the job is split by proof file, on the coordinating session's ruling first.
+
+**What TASKS item 143 proved**, each within the bounds stated beside its proofs:
+- the frame allocator's and the kernel heap's invariants, except `reclaim` (step 2; row S73-04);
+- parts of `onbf-format`, not the whole image (step 3; row S73-08);
+- the kernel's handle table and its map request's check (step 4; row S73-07).
+
+Every harness has a negative control and states its bounds and what it leaves unproved (rows S73-02 and S73-12). The 60 harnesses and 65 controls run in `cargo xtask kani` and in CI's three jobs, and `kani-gate`, in `check`, holds the controls and the matrix to the proof files. Kani's results are about the source as Kani compiles it for the host, not about the machine code rustc 1.100.0 makes for the kernel's target. Each step had one independent AI review (`docs/engineering/REVIEW_T143_2026-11-26.md`, `REVIEW_T143_STEP3_2026-11-27.md` and `REVIEW_T143_STEP4_2026-11-27.md`), each finding answered. **No person has reviewed any step.**
+
+**Carried forward.** None of these items is started. Lines 165 to 168 are on `main` (PR 81).
+- **TASKS item 154:** a Kani proof of the frame allocator's `reclaim`, which needs an unwind bound past the local budget, and the overcount found in review (R143-11).
+- **TASKS item 156:** Kani proofs of `origin-paging`, with a reference walk written from the Intel SDM and the AMD APM.
+- **TASKS item 157**, from step 2's review (R143-10): `FrameError`'s documentation of frame 0.
+- **TASKS item 159:** ONBF §13 item 5 for the whole image:
+  - `Image::parse`, its accessors and `KrnManifest::check_against`;
+  - `KrnManifest::decode`;
+  - the signature block past its header, and so its 8-entry limit;
+  - `check_padding` past 128 bytes.
+
+  Until it is done, ONBF v1.0 is not put to the owner as final on that item's account.
+- **TASKS item 165** is not Kani's work. It gives each boot job what each Kani job already keeps: when a boot fails in CI, its serial log and the last screen capture `boot-test` read are kept as an artifact.
+- **TASKS item 166:** the `compile_fail` doctests' controls run by `cargo xtask`. Step 4 ran them by hand.
+- **TASKS item 167:** `ipc.rs`'s transfer of handles and `process.rs`'s grant made host-buildable, and then proved. That is ADR-0005 P2's other half.
+- **TASKS item 168:** Kani proofs of `mapping.rs`'s other host-built logic: `frames`, `place`, `place_at_random`, `price`, `Budget` and `Mappings`.
+- **Named in row S73-07's limitation and in no TASKS item yet:**
+  - `syscall.rs`'s use of the decoder's `Need` and `memory_object.rs`'s `protect`, which build only for the kernel's target;
+  - tables of more than 2 slots and batches of 3 or more handles;
+  - a failed allocation;
+  - `nospec`'s Mask form;
+  - the SDK's generated `holds`.
+
+**Not shown:** a person's review of any step, and the machine code built for the kernel's target (above).
+
+**Where it stands:** TASKS item 143's planned steps are done, and their proofs and controls pass in CI on `land/batch-11`. The task reaches `main` with the batch.

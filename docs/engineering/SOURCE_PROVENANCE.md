@@ -6305,7 +6305,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Licensing:** MIT OR Apache-2.0 (the workspace's `license`).
 - **Firmware and data:** none.
 - **What is proved, and what is not (S73-12):** each proof module's documentation states its invariant, its method, a table of every `&mut self` method with the harness covering it, its bounds and what it does not prove. In short: within the stated bounds, the frame allocator's invariant is established by `new` and kept by every mutating method but `reclaim`, so it holds after any sequence of them on an allocator `new` built over at most 5 frames, 3 regions and 2 reserved ranges; the heap's is kept by `allocate` and `free` from any heap of up to 2 slabs, given the page source's contract and `GlobalAlloc`'s, which are assumed. Not proved: sizes past the bounds, `reclaim`, `memory.rs` and `early.rs`' use of the two, concurrency, and the machine code rustc 1.100.0 makes (Kani compiles with its own nightly for the host it runs on).
-- **Test evidence:** each harness verified with every cover satisfied, and each of the 27 controls caught, run one harness at a time on the development Mac (Kani 0.68.0, CaDiCaL), with times in TASKS item 143's entry; `xtask`'s host tests for the report's parsing, the gate and the control texts against the tree; F-1's and F-2's host tests. CI's job `kani` has not yet run on a pull request.
+- **Test evidence:** each harness verified with every cover satisfied, and each of the 27 controls caught, run one harness at a time on the development Mac (Kani 0.68.0, CaDiCaL), with times in TASKS item 143's entry; `xtask`'s host tests for the report's parsing, the gate and the control texts against the tree; F-1's and F-2's host tests. CI's `origin-frame` job ran them at `c2680f71` (run 45948073598): every harness verified and all 27 controls caught (TASKS item 143's closing note).
 - **Review:** one independent AI review, recorded in `docs/engineering/REVIEW_T143_2026-11-26.md`: 0 High, 1 Medium, 6 Low and 6 Info, each answered there. **No person has reviewed it.**
 - **Known limits:** in TASKS item 143's entry: `reclaim` (TASKS item 154), `FrameError`'s documentation of frame 0 (R143-10), and the bounds above.
 
@@ -6343,7 +6343,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - `check_padding` stops at 128 bytes, while a real image's gaps run to 4,095.
   - The image's P1 rests on the component proofs, the crate's denied lints and the `onbf_image` fuzz targets, which sample and prove nothing.
   - Release builds of the loader check no overflow today, so an overflow in these functions would wrap silently. P1 shows that none occurs within the bounds.
-- **Test evidence:** every harness verified with every cover satisfied, and each of the 12 controls was caught on the check it names. The harnesses ran one at a time on the development Mac (Kani 0.68.0), with times and memory in TASKS item 143's step-3 entry. `xtask`'s host tests cover the memory figures, the log names and the controls' texts against the tree. CI's job has not yet run these harnesses.
+- **Test evidence:** every harness verified with every cover satisfied, and each of the 12 controls was caught on the check it names. The harnesses ran one at a time on the development Mac (Kani 0.68.0), with times and memory in TASKS item 143's step-3 entry. `xtask`'s host tests cover the memory figures, the log names and the controls' texts against the tree. CI's `onbf-format` job ran them at `c2680f71` (run 45948073598): every harness verified and all 12 controls caught (TASKS item 143's closing note).
 - **Review:** one independent AI review, recorded in `docs/engineering/REVIEW_T143_STEP3_2026-11-27.md`: 0 High, 3 Medium, 6 Low and 6 Info, each answered there in `4d9c3f05`. **No person has reviewed it.**
 - **Known limits:** in TASKS item 143's step-3 entry, and TASKS item 159.
 
@@ -6405,6 +6405,6 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - Every harness verified with every cover satisfied, and each of the 26 controls was caught, run one harness at a time on the development Mac. The times and memory are in TASKS item 143's step-4 entry.
   - The doctests pass, and each of their three controls, run by hand in a scratch copy, makes its doctest fail. Running those controls through `xtask` is TASKS item 166.
   - `xtask`'s host tests cover `PRIVATE_PINS`, the controls' texts, the package filter and the workflow's matrix.
-  - CI has not yet run these harnesses or the split jobs.
+  - CI's `framekernel` job ran them at `c2680f71` (run 45948073598): all 32 verified and all 26 controls caught, in 68 checks. The three split jobs passed; their figures are in TASKS item 143's closing note.
 - **Review:** one independent AI review, recorded in `docs/engineering/REVIEW_T143_STEP4_2026-11-27.md`: 0 High, 3 Medium, 6 Low and 5 Info, each answered there in `1dd5856b`. **No person has reviewed it.**
 - **Known limits:** in TASKS item 143's step-4 entry.
