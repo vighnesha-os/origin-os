@@ -75,7 +75,7 @@ commands:
               off must refuse an unsigned image, a wrong key, a tampered statement, a bad
               signature and tampered content, each with its own message
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
-              one after another, then boot-x2apic, boot-bridge, boot-legacy-free,
+              one after another, then boot-x2apic, boot-bridge, boot-disk, boot-legacy-free,
               boot-random, boot-identity, boot-console, boot-large, boot-rented and
               boot-bench
   boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
@@ -83,6 +83,10 @@ commands:
   boot-reserved  the kernel boot with firmware-reserved memory (RMRRs, IVMDs) a TEST ONLY UEFI
               application plants in QEMU's tables (both IOMMUs): the NVMe controller's domain
               identity-maps what the kernel may trust, and the rest is refused by name
+  boot-disk   the kernel boot with NVMe test disks other than the marked one (Intel VT-d, 2
+              processors; TASKS item 171): one without the mark, left untouched byte for byte,
+              and one whose marked partition is too small for processor 1's write, which the
+              guard refuses while nothing outside the partition changes
   boot-large  the kernel boot on a machine with more than 4 GiB of RAM (both IOMMUs; 8 GiB in
               CI): the frame allocator holds all but 1% of it (TASKS item 83)
   boot-rented the kernel boot on rental B's board's shapes (both IOMMUs, the large machine's
@@ -3308,7 +3312,8 @@ const NVME_SERIAL: &str = "ORIGIN0001";
 ///   without one, judged from its bytes against the image staged for the boot;
 /// - where the scenario's markers require the polled proof's write, something inside it changed.
 ///
-/// Every scenario's disk is [`disk::Variant::Marked`].
+/// A scenario's disk is [`disk::Variant::Marked`] unless `boot-disk` staged another
+/// ([`disk_variant`]).
 fn check_storage_evidence(done: &Completed, scenario: &Scenario, work: &Path) -> Result {
     for text in [Some(done.serial.as_str()), done.com1.as_deref()]
         .into_iter()
@@ -3323,7 +3328,7 @@ fn check_storage_evidence(done: &Completed, scenario: &Scenario, work: &Path) ->
             ));
         }
     }
-    let variant = disk::Variant::Marked;
+    let variant = disk_variant(scenario.label);
     let wrote = scenario
         .markers
         .iter()
@@ -4975,6 +4980,7 @@ fn main() -> ExitCode {
         ["stack-depth"] => in_turn_with_settings("stack-depth", stack_depth::run),
         ["boot-bridge"] => in_turn_with_settings("boot-bridge", boot_bridge),
         ["boot-reserved"] => in_turn_with_settings("boot-reserved", boot_reserved),
+        ["boot-disk"] => in_turn_with_settings("boot-disk", boot_disk),
         ["boot-large"] => in_turn_with_settings("boot-large", boot_large),
         ["boot-rented"] => in_turn_with_settings("boot-rented", boot_rented),
         ["boot-legacy-free"] => in_turn_with_settings("boot-legacy-free", boot_legacy_free),
@@ -5035,16 +5041,17 @@ fn entry_settings(command: &str, settings: Settings) -> Result<Settings> {
     Ok(settings)
 }
 
-/// `boot-matrix` and its thirteen scenario commands: each sets every machine's topology, bridge,
+/// `boot-matrix` and its fourteen scenario commands: each sets every machine's topology, bridge,
 /// reserved memory, ACPI tables, RAM and table shapes itself (the coordinating session's ruling R5
 /// of 2026-11-19; TASKS item 83). The list is of names, so a new scenario command of
 /// `boot-matrix`'s belongs here, by hand; the host test
-/// `each_kind_of_command_takes_or_refuses_the_person_s_machine_at_entry` holds these fourteen.
-const SETS_ITS_MACHINES: [&str; 14] = [
+/// `each_kind_of_command_takes_or_refuses_the_person_s_machine_at_entry` holds these fifteen.
+const SETS_ITS_MACHINES: [&str; 15] = [
     "boot-matrix",
     "boot-x2apic",
     "boot-bridge",
     "boot-reserved",
+    "boot-disk",
     "boot-legacy-free",
     "boot-acpi",
     "boot-random",
@@ -5126,6 +5133,8 @@ fn boot_matrix(base: &Settings) -> Result {
     boot_x2apic(base)?;
     boot_bridge(base)?;
     boot_reserved(base)?;
+    // TASKS item 171: ADR-0013's controls D1 and D2, disks other than the marked one.
+    boot_disk(base)?;
     boot_legacy_free(base)?;
     boot_acpi(base)?;
     boot_random(base)?;
@@ -5736,6 +5745,234 @@ fn boot_console(settings: &Settings) -> Result {
         scenarios.len()
     );
     Ok(())
+}
+
+/// `boot-disk` (TASKS item 171; ADR-0013's controls D1 and D2): the kernel boot on the Intel
+/// VT-d machine with 2 processors, each time with another NVMe test disk staged in place of the
+/// marked one, and its bytes judged after the boot by `check_storage_evidence`:
+/// - **unmarked disk**: the third partition's type is Origin data's, all else the same. Every
+///   proof that reads runs and passes; every write proof says it did not run; the guard sent no
+///   write and no flush; no kernel line names the disk's GUID, a partition's unique GUID or its
+///   name; and the image is byte for byte the one staged;
+/// - **marked partition too small**: the marked partition is 72 blocks. Every fixed write and
+///   processor 0's block fit, processor 1's does not: the guard refuses it by name, the per-CPU
+///   proof fails as aimed (the x2APIC and block-cache proofs after it do not run), and the image
+///   changed inside those 72 blocks alone.
+fn boot_disk(base: &Settings) -> Result {
+    let settings = Settings {
+        iommu: Iommu::Intel,
+        topology: Topology::Plain(2),
+        timeout: Some(timeout_for(base, 2)),
+        ..base.clone()
+    };
+    let krn_path = pack_kernel(&build_kernel()?)?;
+    let (trusted, _) = test_keys()?;
+    let signed = sign_kernel(&krn_path, &trusted, "KERNEL.signed.ONBF")?;
+    let scenarios: Vec<(Scenario, Vec<u8>)> = [
+        unmarked_disk_scenario(&settings),
+        small_partition_scenario(&settings),
+    ]
+    .into_iter()
+    .map(|scenario| (scenario, signed.clone()))
+    .collect();
+    let chosen = select_scenarios(&scenarios, &settings.only)?;
+    for (scenario, kernel) in &chosen {
+        run_scenario(scenario, kernel, &settings)?;
+    }
+    println!(
+        "xtask: boot-disk passed ({} of {} scenarios on the Intel VT-d machine with 2 processors: a disk without the mark, untouched byte for byte; a marked partition too small for processor 1's write, which the guard refused and nothing outside it changed)",
+        chosen.len(),
+        scenarios.len()
+    );
+    Ok(())
+}
+
+/// The labels of `boot-disk`'s scenarios, and the disks they stage.
+const UNMARKED_DISK: &str = "unmarked disk";
+const SMALL_PARTITION: &str = "marked partition too small";
+
+/// The NVMe test disk a scenario boots with: the marked one unless `boot-disk` staged another.
+fn disk_variant(label: &str) -> disk::Variant {
+    match label {
+        UNMARKED_DISK => disk::Variant::Unmarked,
+        SMALL_PARTITION => disk::Variant::Small,
+        _ => disk::Variant::Marked,
+    }
+}
+
+/// Replaces the run of required markers `old` with `new`, or records that it was not found,
+/// which fails the boot.
+fn swap_markers(scenario: &mut Scenario, old: &[String], new: Vec<String>) {
+    match scenario
+        .markers
+        .windows(old.len().max(1))
+        .position(|w| w == old)
+    {
+        Some(i) => {
+            scenario.markers.splice(i..i + old.len(), new);
+        }
+        None => scenario
+            .markers
+            .push(format!("xtask: the markers {old:?} are missing")),
+    }
+}
+
+/// `boot-disk`'s first scenario, control D1: a disk without the mark.
+fn unmarked_disk_scenario(settings: &Settings) -> Scenario {
+    let machine = machine(settings);
+    let mut scenario = boot_scenario(settings);
+    scenario.label = UNMARKED_DISK;
+    swap_markers(
+        &mut scenario,
+        &gpt_markers(disk::Variant::Marked),
+        gpt_markers(disk::Variant::Unmarked),
+    );
+    swap_marker(
+        &mut scenario,
+        &polled_write_marker(disk::POLLED_LBA),
+        format!(
+            "origin-kernel: NVMe: write proofs: not run: no mark of Origin's tests, so nothing is written to this namespace or flushed; a read at LBA {} (past the end) failed with status type 0 code 0x80 (LBA out of range: true)",
+            disk::BLOCKS
+        ),
+    );
+    for index in queue_order(&machine) {
+        let old = format!(
+            "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, ",
+            machine.named(index)
+        );
+        if scenario.markers.contains(&old) {
+            swap_marker(
+                &mut scenario,
+                &old,
+                format!(
+                    "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write not run (no mark of Origin's tests), ",
+                    machine.named(index)
+                ),
+            );
+        }
+    }
+    swap_marker(
+        &mut scenario,
+        &format!(
+            "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); wrote LBA {}, flushed (1 device writes), evicted and read back changed: true",
+            disk::CACHE_LBA
+        ),
+        "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); write-back not run: no mark of Origin's tests, so nothing is written".into(),
+    );
+    swap_markers(
+        &mut scenario,
+        &[WRITES_LINE.into(), writes_reach(Some(disk::MARKED))],
+        vec![format!("{WRITES_LINE}0 writes and 0"), writes_reach(None)],
+    );
+    scenario.qemu_args = Some(|work| {
+        disk::write_image_with(&nvme_image(work), disk::Variant::Unmarked)?;
+        Ok(Vec::new())
+    });
+    scenario.check = Some(check_unmarked_boot);
+    scenario
+}
+
+/// Control D1's check: the kernel boot's, and no kernel line names what identifies the disk: its
+/// GUID, a partition's unique GUID, or a partition's name (the coordinating session's ruling Q6).
+/// Its bytes are `check_storage_evidence`'s.
+fn check_unmarked_boot(done: &Completed, settings: &Settings) -> Result {
+    check_kernel_boot(done, settings)?;
+    let names: Vec<String> = disk::PARTITIONS
+        .iter()
+        .map(|(name, ..)| format!("\"{name}\""))
+        .collect();
+    let identifiers = [disk::DISK_GUID]
+        .into_iter()
+        .chain(disk::PARTITION_GUIDS)
+        .chain(names.iter().map(String::as_str));
+    for id in identifiers {
+        if let Some(line) = done
+            .serial
+            .lines()
+            .find(|l| l.contains("origin-kernel:") && l.contains(id))
+        {
+            return Err(format!(
+                "a kernel line names {id}, which identifies a disk without the mark: {line:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `boot-disk`'s second scenario, control D2: a marked partition too small for processor 1's
+/// block.
+fn small_partition_scenario(settings: &Settings) -> Scenario {
+    let machine = machine(settings);
+    let mut scenario = boot_scenario(settings);
+    scenario.label = SMALL_PARTITION;
+    let small = (disk::MARKED.0, disk::SMALL_LAST);
+    swap_markers(
+        &mut scenario,
+        &gpt_markers(disk::Variant::Marked),
+        gpt_markers(disk::Variant::Small),
+    );
+    swap_marker(
+        &mut scenario,
+        &polled_write_marker(disk::POLLED_LBA),
+        polled_write_marker(disk::SMALL_LAST),
+    );
+    // Processor 1 in queue order: its write refused, by name, and the per-CPU proof failed.
+    let order = queue_order(&machine);
+    if let Some(&second) = order.get(1) {
+        let old = format!(
+            "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, ",
+            machine.named(second)
+        );
+        let refused = disk::cpu_lba(1);
+        swap_markers(
+            &mut scenario,
+            &[old],
+            vec![
+                format!(
+                    "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back false, ",
+                    machine.named(second)
+                ),
+                format!(
+                    "; its write: refused: a write to blocks {refused}-{refused} lies outside the marked partition (blocks {}-{}): NVMe failed",
+                    small.0, small.1
+                ),
+            ],
+        );
+    }
+    if let Some(i) = scenario.markers.iter().position(|m| {
+        m.starts_with("origin-kernel: NVMe: per-CPU queues: ") && m.contains(" threads at once, ")
+    }) {
+        scenario
+            .markers
+            .insert(i + 1, " MiB/s): NVMe failed".into());
+    }
+    // The proofs after it in `storage::init` do not run.
+    for marker in x2apic_markers(&machine, settings) {
+        if let Some(i) = scenario.markers.iter().position(|m| *m == marker) {
+            scenario.markers.remove(i);
+        }
+    }
+    scenario
+        .markers
+        .retain(|m| !m.starts_with("origin-kernel: block cache: "));
+    swap_markers(
+        &mut scenario,
+        &[WRITES_LINE.into(), writes_reach(Some(disk::MARKED))],
+        vec![
+            // The polled proof's write and processor 0's, each flushed; processor 1's refused.
+            format!("{WRITES_LINE}2 writes and 2"),
+            format!(
+                " flushes, which the guard let reach blocks {}-{} of namespace 1 alone; commands refused: 1",
+                small.0, small.1
+            ),
+        ],
+    );
+    scenario.failures.retain(|f| *f != ": NVMe failed");
+    scenario.qemu_args = Some(|work| {
+        disk::write_image_with(&nvme_image(work), disk::Variant::Small)?;
+        Ok(Vec::new())
+    });
+    scenario
 }
 
 /// Runs `boot-test`'s kernel boot in this process under each IOMMU with firmware-reserved
