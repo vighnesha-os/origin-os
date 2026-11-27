@@ -6472,7 +6472,51 @@ Making a field public alone is not enough: the field's type, `Slot`, is private 
 | `mapping::proofs::check_every_request` | 1.4 s | 1.1 s, 1.3 s, 1.4 s, 0.78 s | 0.34 GB |
 
 - **Longest proof:** 32.5 s. **Highest peak:** 2.04 GB.
-- **Added time on the Mac:** about 14 minutes for these runs, compiling included. Steps 3 and 4 together add about 35 minutes to CI's 77-minute job, by the Mac's figures, at step 2's ratio of the Mac to CI. That would bring the job to about 112 minutes, under ruling 4's 120. CI's first run of step 3 will show the real figure.
+- **Added time on the Mac:** 838 s (14.0 minutes) for these 32 runs, compiling included, with each control run once for each harness it names (68 runs).
+
+**CI's first run with step 3, and the job split by package.** CI's run 45920792549, at `ae4319a0` (steps 2 and 3, before this step), took 122 minutes in its one `kani` job, over ruling 4's 120. Its runner was an AMD EPYC 7763 with 4 processors (the job log's processor line). The figures from it, from the coordinating session and the keeper, checked against the log here:
+- 28 harnesses verified and 39 controls caught.
+- The slowest proofs: `check_padding_is_exact` at 375 s and `two_hand_outs_never_overlap` at 369 s. The slowest check of all: `two_hand_outs_never_overlap` under the control `allocate-does-not-mark`, at 479 s. Each is inside CI's 15 minutes.
+- The highest peak: 6.07 GB, from `ocbor_validate_then_cursor_read` and its control, inside CI's 8 GB. So Q4's memory half is now measured, and it holds for steps 2 and 3.
+- The `kani-reports` artifact took all 67 log files, which confirms R143-S3-3.
+
+The coordinating session's ruling (2026-11-27): split the job by package in this step, before its hand-over. Built:
+- **`cargo xtask kani --package <name>`** runs one package's harnesses and each control on them. A control runs once, on every harness it names, as in the whole run.
+- **`--list`**, alone or after `--package <name>`, prints what that run would run, with counts, and runs nothing.
+- **CI's `kani` job** is a matrix over `origin-frame`, `onbf-format` and `framekernel`, with `fail-fast: false`. Each job runs `cargo --locked xtask kani --package ${{ matrix.package }}` and uploads its own artifact, `kani-reports-<package>`. The jobs are named `Kani's proofs and controls (<package>)`. `main` has no required status checks, so the new names change no rule.
+- **`kani-gate`** checks three things:
+  - the matrix lists exactly the packages `PROOF_FILES` names, in its order;
+  - one step runs `xtask kani`, one package for each job;
+  - each control's harnesses are all in the package of its file, so that no job runs a control on another package's harness.
+- **Host tests:**
+  - `the_package_jobs_run_everything_once`: over the three packages, the jobs' harnesses are every harness exactly once, and their controls are every control exactly once, each on all its harnesses. The whole run's selection is the same.
+  - `a_choice_takes_what_it_names`: one harness takes the controls that name it, on it alone; an unknown harness or package is refused.
+  - `the_matrix_is_proof_files_packages`: the tree's workflow passes. A matrix missing a package fails, and so do a whole run in place of the package run, a second run step, and a control on another package's harness.
+
+The lists, from `cargo xtask kani --package <name> --list` at this step's tip:
+
+| Package | Harnesses | Controls | Control runs of a harness |
+|---|---|---|---|
+| `origin-frame` | 18 | 27 | 31 |
+| `onbf-format` | 10 | 12 | 12 |
+| `framekernel` | 32 | 26 | 68 |
+| **The three jobs** | **60** | **65** | **111** |
+| `--list` with no package | 60 | 65 | 111 |
+
+**Each job's CI time.** Each package's own figures from run 45920792549's log on the AMD EPYC 7763, harness by harness and control by control, attributed to the packages of these lists. Kani's verification time is in parentheses; the rest of each figure is building:
+
+| Package | Proofs | Controls | Runs | Job, with 0.6 minutes of setup |
+|---|---|---|---|---|
+| `origin-frame` | 29.6 min (1,723 s) | 61.8 min (3,594 s) | 91.4 min | about 92 minutes |
+| `onbf-format` | 15.0 min (862 s), Kani's first build of 0.9 minutes included | 15.2 min (890 s) | 30.1 min | about 31 minutes |
+| `framekernel` | no CI figure yet | | | about 18 minutes, estimated below |
+
+**The runners differ.** Step 2's run 45865797476, at `2c9ade28`, ran on an Intel Xeon 6975P-C with 4 processors. `origin-frame`'s proofs and controls are the same at both commits: nothing under `framekernel/frame/` changed, and nor did its controls. Its 49 verification runs (18 proofs and 31 control runs) took 4,475 s on the Xeon and 5,317 s on the EPYC, 1.19 times as long. The jobs' times are not comparable, since `xtask kani` has run one `cargo kani` for each harness only since step 3. So:
+- the same jobs on a Xeon 6975P-C would take about 78 minutes (`origin-frame`) and 26 (`onbf-format`);
+- `framekernel`'s job has no CI figure. On the development Mac (Apple M1 Max), `cargo xtask kani --package framekernel` at this step's code took 734 s, 2026-11-27 04:55:05 to 05:07:19 UTC, on AC power, in one turn. It verified 32 harnesses with every cover satisfied and caught 26 controls, in 58 runs of `cargo kani`, at a peak of 2.03 GB. The EPYC took 1.43 times the Mac's time for `onbf-format`'s runs: 30.1 minutes against the Mac's 21, with the same harness-by-harness runs. At that ratio, `framekernel`'s job would be about 18 minutes on the EPYC, setup included, and about 15 on the Xeon. Nothing measures it on CI yet, so it is an estimate;
+- a runner slower than either is possible. The EPYC's `origin-frame` job has 28 minutes in hand, so it stays under 120 minutes on a runner up to about 30% slower than the EPYC.
+
+The one job would have been about 140 minutes on the EPYC. If `origin-frame`'s job ever passes 120, the next split is by proof file. On the EPYC's figures, `frames` would take 53.5 minutes and `heap` 37.9. That needs a ruling first: `kani-gate` holds the matrix to packages.
 
 **Owed from step 3, in this step's records commit:** `onbf-format`'s proof table now cites §4.2 together with errata C5 for the header, and the step-3 entry's paragraph on `format_minor` is corrected to cite C5.
 
@@ -6481,6 +6525,9 @@ Making a field public alone is not enough: the field's type, `Slot`, is private 
 **The review.** One independent AI review of `bb0b0941`, recorded in `docs/engineering/REVIEW_T143_STEP4_2026-11-27.md`, was given the code and the properties but not the author's argument. It found no High, 3 Medium, 6 Low and 5 Info, none a defect of the kernel. Each finding is answered, in `1dd5856b` and these records. **No person has reviewed it.**
 
 **Not shown:**
-- CI's run of these harnesses, and its memory figures.
-- The doctests' controls run by `xtask`: they were run by hand.
+- CI's run of this step's harnesses and of the split jobs, and their times and memory figures.
+- The doctests' controls run by `xtask`: they were run by hand. That is TASKS item 166.
+- `ipc.rs`'s transfer of handles and `process.rs`'s grant (P2's other half), which build only for the kernel's target. Making them host-buildable so that Kani can reach them is TASKS item 167.
+- `mapping.rs`'s other host-built logic: `frames`, `place`, `place_at_random`, `price`, `Budget` and `Mappings`. Their host tests cover it; Kani's proofs of it are TASKS item 168.
+- The split by package came after the independent review, which did not read it; its host tests and the local run of `framekernel`'s job are its evidence.
 - No person has reviewed it.
