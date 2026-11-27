@@ -666,9 +666,11 @@ fn cargo_kani(
     // `-Z stubbing`: the heap's harnesses stub core's slice rotation (`heap/proofs.rs`), and
     // `onbf-format`'s stub core's UTF-8 check (`proofs.rs`). Kani 0.68.0 calls the feature
     // unstable; the version is pinned.
+    // `--lib`: every proof is in a library, and `framekernel`'s package also holds the kernel
+    // image's binary, which builds only for `x86_64-unknown-none`.
     command
         .current_dir(dir)
-        .args(["kani", "-Z", "stubbing", "-p", package]);
+        .args(["kani", "-Z", "stubbing", "-p", package, "--lib"]);
     for harness in harnesses {
         command.args(["--harness", harness, "--exact"]);
     }

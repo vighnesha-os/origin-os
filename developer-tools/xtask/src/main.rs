@@ -6294,6 +6294,10 @@ fn check() -> Result {
         None,
     )?)?;
     run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--lib"]))?;
+    // The kernel library's doctests, which `--lib` skips: the `compile_fail` ones that show a
+    // handle table's entries and rights cannot be reached around its methods (TASKS item 143,
+    // step 4). `--doc` builds the library alone, not the kernel image's binary.
+    run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--doc"]))?;
     // The AML interpreter's boot proof on a 32 KiB stack: release only, the stack's proxy (TASKS
     // item 63, step B3, ruling Q3 (a)).
     run_step(cargo().args([
