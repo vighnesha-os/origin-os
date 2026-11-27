@@ -10,8 +10,8 @@ A requirement is one statement of [`CLAUDE.md`](CLAUDE.md), or one decision of a
 |---|--:|--:|
 | Done | 58 | 3.4% |
 | Built | 374 | 22.2% |
-| In progress | 252 | 15.0% |
-| Not started | 1,002 | 59.4% |
+| In progress | 253 | 15.0% |
+| Not started | 1,001 | 59.4% |
 | **Total** | **1,686** | **100.0%** |
 
 ## What the states mean
@@ -27,11 +27,11 @@ A requirement is one statement of [`CLAUDE.md`](CLAUDE.md), or one decision of a
 
 | Environment | Requirements |
 |---|--:|
-| The development host | 233 |
+| The development host | 234 |
 | An emulator (QEMU) | 126 |
 | A virtual machine on a real processor | 285 |
 | Physical hardware | 0 |
-| No evidence yet | 1,042 |
+| No evidence yet | 1,041 |
 
 ## By milestone
 
@@ -45,7 +45,7 @@ Each milestone counts the requirements that [`docs/ROADMAP.md`](docs/ROADMAP.md)
 | M3. SMP and scheduler | partial | 107 | 0.9% | 43.0% | 10.3% | 45.8% |
 | M4. Processes and IPC | partial | 140 | 0.7% | 69.3% | 16.4% | 13.6% |
 | M5. Storage | partial | 115 | 0.0% | 42.6% | 17.4% | 40.0% |
-| M6. Native runtime | not started | 125 | 0.0% | 11.2% | 28.0% | 60.8% |
+| M6. Native runtime | not started | 125 | 0.0% | 11.2% | 28.8% | 60.0% |
 | M7. Native packaging | not started | 77 | 2.6% | 3.9% | 14.3% | 79.2% |
 | M8. Native graphics | not started | 89 | 0.0% | 0.0% | 2.2% | 97.8% |
 | M9. Installable operating system | not started | 85 | 0.0% | 0.0% | 1.2% | 98.8% |
@@ -75,8 +75,8 @@ The requirements of `CLAUDE.md` that ask for something to be built, by the secti
 | Versions, updates and recovery | §62 to §65 | 48 | 4.2% | 12.5% | 0.0% | 83.3% |
 | Performance, power, time and reliability | §66 to §69 | 45 | 0.0% | 8.9% | 6.7% | 84.4% |
 | Developer platform | §70 to §71 | 27 | 0.0% | 3.7% | 7.4% | 88.9% |
-| Testing, hardware qualification and release | §72 to §76 | 69 | 1.4% | 14.5% | 8.7% | 75.4% |
-| **All fourteen areas** | | 834 | 2.0% | 15.4% | 10.1% | 72.5% |
+| Testing, hardware qualification and release | §72 to §76 | 69 | 1.4% | 14.5% | 10.2% | 73.9% |
+| **All fourteen areas** | | 834 | 2.0% | 15.4% | 10.2% | 72.4% |
 
 Outside these areas: 154 more of `CLAUDE.md` that ask for something to be built, in the header (7), §1 (69), §6 (17), §18 (17), §79 (12), §82 (17), §84 (14), the final rules (1). They are counted in "Overall", and in a milestone where the roadmap places them.
 
@@ -285,7 +285,7 @@ Each specification, standard and protocol the project relies on, with the requir
 | Section | Requirements | Done | Built | In progress | Not started |
 |---|--:|--:|--:|--:|--:|
 | §72. Required testing methods | 16 | 6.3% | 25.0% | 25.0% | 43.7% |
-| §73. Formal methods | 11 | 0.0% | 36.4% | 9.1% | 54.5% |
+| §73. Formal methods | 11 | 0.0% | 36.4% | 18.2% | 45.4% |
 | §74. Hardware test matrix | 17 | 0.0% | 0.0% | 0.0% | 100.0% |
 | §75. Reproducibility | 9 | 0.0% | 22.2% | 11.1% | 66.7% |
 | §76. Release qualification | 16 | 0.0% | 0.0% | 0.0% | 100.0% |
@@ -1709,7 +1709,7 @@ The milestone, feature-area and specification tables, with the number of require
 | M3. SMP and scheduler | 107 | 1 | 46 | 11 | 49 |
 | M4. Processes and IPC | 140 | 1 | 97 | 23 | 19 |
 | M5. Storage | 115 | 0 | 49 | 20 | 46 |
-| M6. Native runtime | 125 | 0 | 14 | 35 | 76 |
+| M6. Native runtime | 125 | 0 | 14 | 36 | 75 |
 | M7. Native packaging | 77 | 2 | 3 | 11 | 61 |
 | M8. Native graphics | 89 | 0 | 0 | 2 | 87 |
 | M9. Installable operating system | 85 | 0 | 0 | 1 | 84 |
@@ -1733,8 +1733,8 @@ The milestone, feature-area and specification tables, with the number of require
 | Versions, updates and recovery | §62 to §65 | 48 | 2 | 6 | 0 | 40 |
 | Performance, power, time and reliability | §66 to §69 | 45 | 0 | 4 | 3 | 38 |
 | Developer platform | §70 to §71 | 27 | 0 | 1 | 2 | 24 |
-| Testing, hardware qualification and release | §72 to §76 | 69 | 1 | 10 | 6 | 52 |
-| **All fourteen areas** | | 834 | 17 | 128 | 84 | 605 |
+| Testing, hardware qualification and release | §72 to §76 | 69 | 1 | 10 | 7 | 51 |
+| **All fourteen areas** | | 834 | 17 | 128 | 85 | 604 |
 
 | Specification | Requirements | Done | Built | In progress | Not started |
 |---|--:|--:|--:|--:|--:|

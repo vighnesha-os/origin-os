@@ -68,6 +68,20 @@ const PROOF_FILES: &[ProofFile] = &[
         module: "heap::proofs",
         parent: "framekernel/frame/src/heap.rs",
     },
+    // TASKS item 143, step 3: one entry per parent module (the coordinating session's ruling of
+    // 2026-11-26), since `check_padding` is private to `image.rs`.
+    ProofFile {
+        package: "onbf-format",
+        file: "runtime/onbf/format/src/proofs.rs",
+        module: "proofs",
+        parent: "runtime/onbf/format/src/lib.rs",
+    },
+    ProofFile {
+        package: "onbf-format",
+        file: "runtime/onbf/format/src/image/proofs.rs",
+        module: "image::proofs",
+        parent: "runtime/onbf/format/src/image.rs",
+    },
 ];
 
 /// The line a parent declares its proof module with, after `#[cfg(kani)]`.
@@ -89,6 +103,13 @@ struct Control {
 
 const FRAMES: &str = "framekernel/frame/src/frames.rs";
 const HEAP: &str = "framekernel/frame/src/heap.rs";
+const HEADER: &str = "runtime/onbf/format/src/header.rs";
+const SECTION: &str = "runtime/onbf/format/src/section.rs";
+const READ: &str = "runtime/onbf/format/src/read.rs";
+const OCBOR: &str = "runtime/onbf/format/src/ocbor.rs";
+const SIGNATURE: &str = "runtime/onbf/format/src/signature.rs";
+const IMAGE: &str = "runtime/onbf/format/src/image.rs";
+const ONBF_PROOFS: &str = "runtime/onbf/format/src/proofs.rs";
 
 /// The controls. Each harness of [`PROOF_FILES`] is named by at least one.
 const CONTROLS: &[Control] = &[
@@ -358,7 +379,115 @@ const CONTROLS: &[Control] = &[
         harnesses: &["heap::proofs::free_takes_back_only_a_live_block"],
         expect: &["a large free names a frame that is no slab"],
     },
+    // TASKS item 143, step 3: `onbf-format`.
+    Control {
+        name: "section-count-zero",
+        file: HEADER,
+        from: "        if !(1..=MAX_SECTIONS).contains(&section_count) {\n",
+        to: "        if section_count > MAX_SECTIONS {\n",
+        harnesses: &["proofs::header_parse_any_bytes"],
+        expect: &["§4.2: 1 to 256 sections"],
+    },
+    Control {
+        name: "header-arch-unchecked",
+        file: HEADER,
+        from: "        if arch != ARCH_X86_64 {\n",
+        to: "        if false {\n",
+        harnesses: &["proofs::header_parse_any_bytes"],
+        expect: &["§4.2: arch 1, x86-64"],
+    },
+    Control {
+        name: "stored-size-unlimited",
+        file: SECTION,
+        from: "        if stored_size > MAX_SECTION_CONTENT || content_size > MAX_SECTION_CONTENT {\n",
+        to: "        if content_size > MAX_SECTION_CONTENT {\n",
+        harnesses: &["proofs::section_entry_parse_any_entry"],
+        expect: &["Appendix A: a section's content is at most 1 TiB"],
+    },
+    Control {
+        name: "merkle-loop-runs-on",
+        file: SECTION,
+        from: "    while hashes > 1 {\n",
+        to: "    while hashes > 0 {\n",
+        harnesses: &["proofs::merkle_hash_blocks_any_size"],
+        // Kani names an unwinding check by the loop's place in its function: the only loop.
+        expect: &["unwinding assertion loop 0"],
+    },
+    Control {
+        name: "align-up-wraps",
+        file: READ,
+        from: "    Some(x.checked_add(mask)? & !mask)\n",
+        to: "    Some(x.wrapping_add(mask) & !mask)\n",
+        harnesses: &["proofs::align_up_any_value"],
+        expect: &["the next multiple"],
+    },
+    Control {
+        name: "slice-end-clamped",
+        file: READ,
+        from: "    bytes.get(start..end)\n",
+        to: "    bytes.get(start..end.min(bytes.len()))\n",
+        harnesses: &["proofs::slice_any_range"],
+        expect: &["Some only for a range inside the input"],
+    },
+    Control {
+        name: "ocbor-argument-indexed",
+        file: OCBOR,
+        from: "            let raw = bytes.get(next..end).ok_or(err(K::Truncated))?;\n",
+        to: "            let raw = &bytes[next..end];\n",
+        harnesses: &["proofs::ocbor_any_document"],
+        expect: &[SLICE_PANIC],
+    },
+    Control {
+        name: "ocbor-trailing-data-accepted",
+        file: OCBOR,
+        from: "    if pos != bytes.len() {\n        return Err(OcborError::at(pos, K::TrailingData));\n    }\n",
+        to: "",
+        harnesses: &["proofs::ocbor_validate_then_cursor_read"],
+        expect: &["P3: the cursor ends at the document's end"],
+    },
+    // The specification the stand-in rests on, made wrong: a 4-byte character past U+10FFFF.
+    Control {
+        name: "utf8-walk-past-u10ffff",
+        file: ONBF_PROOFS,
+        from: "            0xF4 => (4, 0x80, 0x8F),\n",
+        to: "            0xF4 => (4, 0x80, 0xBF),\n",
+        harnesses: &["proofs::utf8_walk_equals_core"],
+        expect: &["the walk refuses where core does, at the same offset"],
+    },
+    // The walk made to refuse what core accepts: 0xBF as the second byte after 0xF1 to 0xF3.
+    Control {
+        name: "utf8-walk-refuses-what-core-accepts",
+        file: ONBF_PROOFS,
+        from: "            0xF1..=0xF3 => (4, 0x80, 0xBF),\n",
+        to: "            0xF1..=0xF3 => (4, 0x80, 0xBE),\n",
+        harnesses: &["proofs::utf8_walk_equals_core"],
+        expect: &["the walk accepts what core accepts"],
+    },
+    Control {
+        name: "le32-indexed",
+        file: SIGNATURE,
+        from: "    let s = b.get(at..at.checked_add(4)?)?;\n",
+        to: "    let s = &b[at..at + 4];\n",
+        harnesses: &["proofs::signature_block_any_input"],
+        expect: &[SLICE_PANIC],
+    },
+    Control {
+        name: "padding-first-byte-unchecked",
+        file: IMAGE,
+        from: "    match pad.iter().position(|&b| b != 0) {\n",
+        to: "    match pad.iter().skip(1).position(|&b| b != 0) {\n",
+        harnesses: &["image::proofs::check_padding_is_exact"],
+        expect: &[
+            "Ok only when every byte is zero",
+            "the byte named is not zero",
+        ],
+    },
 ];
+
+/// The check Kani 0.68.0 reports for a panic whose message core formats at run time, as a
+/// slice index past the end's is (seen on the first run of `le32-indexed`).
+const SLICE_PANIC: &str =
+    "This is a placeholder message; Kani doesn't support message formatted at runtime";
 
 /// What one harness reported.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -523,9 +652,20 @@ fn cargo_kani(
     harnesses: &[&str],
     log: &Path,
 ) -> Result<String> {
-    let mut command = Command::new("cargo");
-    // `-Z stubbing`: the heap's harnesses stub core's slice rotation (`heap/proofs.rs`). Kani
-    // 0.68.0 calls the feature unstable; the version is pinned.
+    // Each run's peak memory is measured by the system's `time` (`-v` on Linux, where CI runs,
+    // `-l` on macOS), which writes it to the run's errors; [`peak_memory`] reads it there. Without
+    // one, the run goes ahead and its line says the memory was not measured.
+    let mut command = match time_option(std::env::consts::OS) {
+        Some(option) if Path::new(TIME).is_file() => {
+            let mut timed = Command::new(TIME);
+            timed.args([option, "cargo"]);
+            timed
+        }
+        _ => Command::new("cargo"),
+    };
+    // `-Z stubbing`: the heap's harnesses stub core's slice rotation (`heap/proofs.rs`), and
+    // `onbf-format`'s stub core's UTF-8 check (`proofs.rs`). Kani 0.68.0 calls the feature
+    // unstable; the version is pinned.
     command
         .current_dir(dir)
         .args(["kani", "-Z", "stubbing", "-p", package]);
@@ -589,6 +729,48 @@ fn cargo_kani(
     }
     fs::write(log, &output).map_err(|e| format!("{}: {e}", log.display()))?;
     Ok(output)
+}
+
+/// The system's `time`, which measures a run's peak memory.
+const TIME: &str = "/usr/bin/time";
+
+/// `time`'s option that reports the peak resident memory on `os` (`std::env::consts::OS`).
+fn time_option(os: &str) -> Option<&'static str> {
+    match os {
+        "linux" => Some("-v"),
+        "macos" => Some("-l"),
+        _ => None,
+    }
+}
+
+/// The peak resident memory `time` reported in `output`, in bytes: GNU `time -v`'s
+/// "Maximum resident set size (kbytes): N", or BSD `time -l`'s "N  maximum resident set size".
+fn peak_memory(output: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        if let Some(kbytes) = line.strip_prefix("Maximum resident set size (kbytes):") {
+            return kbytes.trim().parse::<u64>().ok()?.checked_mul(1024);
+        }
+        line.strip_suffix("maximum resident set size")?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    })
+}
+
+/// The file a harness's run is logged to: its name with `::` made `/`, since CI's artifact
+/// upload refuses a path holding `"`, `:`, `<`, `>`, `|`, `*`, `?`, CR or LF.
+fn log_name(harness: &str) -> String {
+    format!("{}.log", harness.replace("::", "/"))
+}
+
+/// `output`'s peak memory, as a run's line shows it.
+fn memory_shown(output: &str) -> String {
+    match peak_memory(output) {
+        // GB of 10^9 bytes, as the records give it.
+        Some(bytes) => format!("peak memory {:.2} GB", bytes as f64 / 1e9),
+        None => "peak memory not measured".into(),
+    }
 }
 
 /// Refuses any Kani but [`VERSION`] with its bundle's compiler.
@@ -702,39 +884,47 @@ pub(crate) fn run(only: Option<&str>) -> Result {
         .collect();
     let packages: BTreeSet<&str> = chosen.iter().map(|(p, _)| *p).collect();
     let mut problems = Vec::new();
+    // One `cargo kani` for each harness, so that each run's peak memory is that harness's (CI
+    // records it; the coordinating session's ruling of 2026-11-27 on Q4's 8 GB).
+    let mut reported = Vec::new();
     for package in packages {
         let names: Vec<&str> = chosen
             .iter()
             .filter(|(p, _)| *p == package)
             .map(|(_, n)| n.as_str())
             .collect();
-        let filter: Vec<&str> = if only.is_some() {
-            names.clone()
-        } else {
-            Vec::new()
-        };
-        let output = cargo_kani(
-            &root,
-            None,
-            package,
-            &filter,
-            &logs.join(format!("{package}.log")),
-        )?;
-        problems.extend(proof_warnings(&output));
-        let report = parse_report(&output);
         for name in &names {
+            let output = cargo_kani(&root, None, package, &[name], &logs.join(log_name(name)))?;
+            problems.extend(proof_warnings(&output));
+            let report = parse_report(&output);
             match report.iter().find(|(n, _)| n == name) {
-                Some((_, outcome)) => problems.extend(proof_problem(name, outcome)),
+                Some((_, outcome)) => {
+                    problems.extend(proof_problem(name, outcome));
+                    println!("xtask: kani: {name}: {}", memory_shown(&output));
+                }
                 None => problems.push(format!("{name}: Kani did not report it")),
             }
-        }
-        for (name, _) in &report {
-            if !names.contains(&name.as_str()) {
-                problems.push(format!(
-                    "{name}: reported, but not a harness of {PROOF_FILES_NAMES}"
-                ));
+            for (other, _) in &report {
+                if other != name {
+                    problems.push(format!(
+                        "{other}: reported in {name}'s run, which asked for {name} alone"
+                    ));
+                }
             }
+            reported.extend(report.into_iter().map(|(n, _)| n));
         }
+    }
+    // Each harness once: what Kani reported, across all the runs, is the harnesses chosen.
+    let mut once: Vec<&str> = reported.iter().map(String::as_str).collect();
+    once.sort_unstable();
+    let mut wanted: Vec<&str> = chosen.iter().map(|(_, n)| n.as_str()).collect();
+    wanted.sort_unstable();
+    if once != wanted {
+        problems.push(format!(
+            "Kani reported {} harness results for {} harnesses: each harness runs once",
+            once.len(),
+            wanted.len()
+        ));
     }
     if !problems.is_empty() {
         return Err(format!(
@@ -748,9 +938,6 @@ pub(crate) fn run(only: Option<&str>) -> Result {
     );
     controls(&root, only)
 }
-
-/// How the proof files are named in messages.
-const PROOF_FILES_NAMES: &str = "the proof files (`kani.rs`, PROOF_FILES)";
 
 /// Runs each control that names a harness chosen (every control, or those naming `only`).
 fn controls(root: &Path, only: Option<&str>) -> Result {
@@ -768,9 +955,9 @@ fn controls(root: &Path, only: Option<&str>) -> Result {
         if harnesses.is_empty() {
             continue;
         }
+        let package = package_of(control.file)?;
         populate(root, &scratch)?;
         apply(control, &scratch)?;
-        let package = package_of(control.file)?;
         let output = cargo_kani(
             &scratch,
             Some(&target),
@@ -791,9 +978,10 @@ fn controls(root: &Path, only: Option<&str>) -> Result {
             ));
         }
         println!(
-            "xtask: kani: control {} caught by {}",
+            "xtask: kani: control {} caught by {}; {}",
             control.name,
-            harnesses.join(", ")
+            harnesses.join(", "),
+            memory_shown(&output)
         );
         ran += 1;
     }
@@ -803,9 +991,17 @@ fn controls(root: &Path, only: Option<&str>) -> Result {
 
 /// The package a control's file belongs to.
 fn package_of(file: &str) -> Result<&'static str> {
+    // A control may plant its bug in any file of a proof file's crate: under the directory that
+    // holds the proof module's parent (`onbf-format`'s parsers sit beside `lib.rs`).
     PROOF_FILES
         .iter()
-        .find(|p| p.parent == file || p.file == file)
+        .find(|p| {
+            p.parent == file
+                || p.file == file
+                || Path::new(p.parent)
+                    .parent()
+                    .is_some_and(|dir| Path::new(file).starts_with(dir))
+        })
         .map(|p| p.package)
         .ok_or_else(|| format!("kani: no proof file's package holds {file}"))
 }
@@ -937,6 +1133,19 @@ fn control_list_problems(
                 control.name
             ));
         }
+        // A control's file is a path inside the tree, so that applying it to the scratch copy
+        // can never write outside that copy.
+        let path = Path::new(control.file);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            problems.push(format!(
+                "control {}: {} is not a plain path inside the tree",
+                control.name, control.file
+            ));
+        }
         match read(control.file) {
             None => problems.push(format!(
                 "control {}: cannot read {}",
@@ -996,6 +1205,37 @@ fn names_kani(code: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_log_name_holds_a_character_the_artifact_upload_refuses() {
+        let defined = super::defined(&crate::repo_root()).expect("the proof files read");
+        assert!(!defined.is_empty());
+        for (_, name) in &defined {
+            let log = super::log_name(name);
+            assert!(
+                !log.contains(['"', ':', '<', '>', '|', '*', '?', '\r', '\n']),
+                "{log}"
+            );
+        }
+        assert_eq!(
+            super::log_name("image::proofs::check_padding_is_exact"),
+            "image/proofs/check_padding_is_exact.log"
+        );
+    }
+
+    #[test]
+    fn peak_memory_reads_gnu_and_bsd_time() {
+        let gnu = "\tCommand being timed: \"cargo kani\"\n\tMaximum resident set size (kbytes): 6281920\n";
+        assert_eq!(super::peak_memory(gnu), Some(6_281_920 * 1024));
+        let bsd = "        97.07 real        95.12 user         1.90 sys\n          6431686656  maximum resident set size\n";
+        assert_eq!(super::peak_memory(bsd), Some(6_431_686_656));
+        assert_eq!(super::peak_memory("VERIFICATION:- SUCCESSFUL\n"), None);
+        assert_eq!(super::memory_shown(bsd), "peak memory 6.43 GB");
+        assert_eq!(super::memory_shown(""), "peak memory not measured");
+        assert_eq!(super::time_option("linux"), Some("-v"));
+        assert_eq!(super::time_option("macos"), Some("-l"));
+        assert_eq!(super::time_option("windows"), None);
+    }
+
     use super::*;
 
     const SAMPLE: &str = "\

@@ -66,6 +66,10 @@ pub use section::{
     MAX_SEGMENTS_EXE_LIB, NO_MERKLE, PAGE_SIZE, SMALL_ALIGN, SectionEntry, merkle_hash_blocks,
 };
 
+/// Kani's proofs of some of the parsers' parts (ONBF §13 item 5; TASKS item 143): `cargo xtask
+/// kani`. The module says what is proved and what is not.
+#[cfg(kani)]
+mod proofs;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]

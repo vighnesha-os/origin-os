@@ -641,7 +641,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 140. **`boot-matrix`'s usage line and `Cargo.toml`'s `default-members` (TASKS item 137's review, follow-ups 1 and 2). Numbered by the coordinating session on 2026-11-25; not started.** The usage line leaves out machines it runs: `boot-reserved`, `boot-acpi`, `boot-listed`, `boot-sparse` and `boot-domains`. `default-members` leaves out `sdk/directory` and `services/directory`, which `check` lints and tests on the host.
 141. **A placement control for B1 under emulation (TASKS item 98's turn T1). Numbered by the coordinating session on 2026-11-25; not started.** Under QEMU's software processor, B1 moved by 7 to 9 % between builds whose switch-path code is the same: a commit that added only counters off the switch path took the tip's mean on the 65-processor machine from 2,033 to 1,885 cycles. That is more than the changes TASKS item 92's rule is meant to judge. The control pins the switch path's code placement in the base's and the tip's comparison builds (for example with lld's `--symbol-ordering-file`). It shows the variation that is left, and is recorded as part of ADR-0018 V7's method. Until it lands, a scheduling item's B1 comparison still runs: a rise of more than 10 % above the base's range stops the item, and a smaller difference is judged on static counts.
 142. **Each per-processor table on a line of its own (TASKS item 98's static listing). Numbered by the coordinating session on 2026-11-25; not started.** The boot processor's run queue starts 24 bytes into a 64-byte line. The other processors' queues are consecutive elements whose stride is not a multiple of 64 (1,080 bytes at the base, 1,432 with TASKS item 98), so each queue's lock shares a line with the next queue's first fields. Each processor's element of a `PerCpu` table starts on a line of its own. First check that no assembly or fixed offset depends on today's layout. QEMU models no cache, so the figure it is judged by comes from hardware (ADR-0018 V9).
-143. **Kani's first proofs (owner item 358; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-25; its first harnesses, the frame allocator's and the heap's, built on 2026-11-26 on `claude/t143-kani-a0310d` (its entry, below); not landed.** `kani-verifier` is installed at a version read on the day, and it and its bundled compiler are recorded in `docs/toolchain/VERIFICATION.md`. The bundle verifies, and builds nothing that ships.
+143. **Kani's first proofs (owner item 358; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-25. Step 2, the frame allocator's and the heap's harnesses, built on 2026-11-26 and merged into `land/batch-11` at `1030c989`. Step 3, parts of `onbf-format`, built on 2026-11-26 and 2026-11-27 on `claude/t143-onbf-kani` (its entries, below). Not landed on `main`.** `kani-verifier` is installed at a version read on the day, and it and its bundled compiler are recorded in `docs/toolchain/VERIFICATION.md`. The bundle verifies, and builds nothing that ships.
     - **First harnesses:** the frame allocator's and the heap's invariants (rows S73-02 and S73-04);
     - **then** the ONBF parsers' bounds (ONBF §13 item 5; row S73-08);
     - **then** capability validation (row S73-07).
@@ -6228,4 +6228,118 @@ Every run is inside the local budget of 5 minutes and 8 GB. `two_hand_outs_never
 - CI's job `kani` on a standard runner: not yet run on a pull request, so Q4's 15-minute and 8 GB rule is not yet checked there.
 - `reclaim` (TASKS item 154), with R143-11's overcount for its contract.
 - `FrameError`'s documentation of frame 0 against the code (R143-10): a follow-up.
+- No person has reviewed it.
+
+### 143, step 3. Kani's proofs of `onbf-format`'s parts (ONBF §13 item 5; row S73-08)
+
+Built on `claude/t143-onbf-kani`, cut from `land/batch-11` at `2c9ade28`, which holds step 2.
+
+**The contract and its rulings.** The contract is in the coordination notes (`t143-onbf-contract.md`) and the probe in `t143-onbf-probe.md`.
+- **Scope:** `onbf-format` only. Its parts get P1 (no panic, no read out of bounds, no overflow, every loop within its bound); the header and section entry get the specification's rules for an accepted input (P2); OCBOR-1 gets "an accepted document reads whole" (P3).
+- **Every harness covers an accepted input** within its bound, or says it reaches only refusals and covers one.
+- **Placement:** one proof file per parent module, since `check_padding` is private to `image.rs`.
+- **The loader's and the kernel's images** must be shown the same at the base and at the tip.
+- **Each run's peak memory** is recorded where CI runs it. Above 7.5 GB on the Mac, a harness drops one step in its bound.
+- **Ruling (A) on the probe:** `Image::parse`, its accessors and `check_against` are named not proved by Kani. **(B)** CI-only runs: refused. **(C)** becomes TASKS item 159, the whole image. **(D)** a UTF-8 stand-in and fixed lengths; whatever (D) cannot bring under budget is named not proved and joins TASKS item 159.
+- **Corrected on 2026-11-27:** the ruling's clause "the loader builds `onbf-format` with overflow checks on in release (CLAUDE.md §14)". Today's loader builds without them. §14's rule lands with TASKS item 22's second half, not started. So an overflow in these functions would wrap silently, which makes Kani's overflow checks worth more. The rest of that ruling stands.
+
+**What was built.**
+- **`runtime/onbf/format/src/proofs.rs`:** 9 harnesses.
+- **`runtime/onbf/format/src/image/proofs.rs`:** `check_padding`.
+- **`lib.rs`, `image.rs`:** one `#[cfg(kani)] mod proofs;` each. No parser line changes.
+- **`kani.rs`:**
+  - one `cargo kani` for each harness under `/usr/bin/time` (`-v` on Linux, `-l` on macOS), with each run's peak memory on its line;
+  - the harnesses Kani reported, across all the runs, must be the harnesses chosen;
+  - logs named without `::`;
+  - two proof-file entries and 12 controls, 39 in all;
+  - `package_of` for any file of a proof file's crate;
+  - control paths refused unless they are plain paths inside the tree.
+- **CI** installs `time` if the runner lacks it.
+
+**What is proved, and within which bounds.** Each module's documentation says it in full.
+
+| Function | Harness | Bound | Also |
+|---|---|---|---|
+| `Header::parse` | `proofs::header_parse_any_bytes` | every input of up to 128 bytes | §4.2's rules from the raw bytes; the returned fields are the bytes' |
+| `SectionEntry::parse` | `proofs::section_entry_parse_any_entry` | every entry × profile × nested or not | §4.3's flags and reserved fields, Appendix A's 1 TiB |
+| `merkle_hash_blocks` | `proofs::merkle_hash_blocks_any_size` | every `u64` | |
+| `align_up` | `proofs::align_up_any_value` | every value and alignment | the next multiple |
+| `slice` | `proofs::slice_any_range` | every range, inputs up to 16 bytes | `Some` exactly for a range inside, starting at `start` |
+| `check_padding` | `image::proofs::check_padding_is_exact` | every input and range up to 128 bytes | `Ok` exactly when inside and zero; the first nonzero byte named |
+| OCBOR-1's `validate`, then `next_item` and `skip_contents` | `proofs::ocbor_any_document` | every input up to 6 bytes | |
+| the same | `proofs::ocbor_validate_then_cursor_read` | every input up to 4 bytes | P3 |
+| the UTF-8 walk = core's `from_utf8` | `proofs::utf8_walk_equals_core` | every text up to 8 bytes at offsets 0 to 4 | |
+| `SignatureBlock::parse` | `proofs::signature_block_any_input` | every input up to 19 bytes: refusals only | |
+
+**ONBF §13 item 5** is met for the functions above, within their bounds, and not met for the whole image.
+
+**Not proved by Kani** (TASKS item 159):
+- `Image::parse`, its accessors and `KrnManifest::check_against`, with the image's layout (P2). The image's P1 rests on the component proofs, the crate's denied lints and the `onbf_image` and `onbf_image_built` fuzz targets, which sample and prove nothing.
+- `check_padding`'s bound stops at 128 bytes, while a real image's gaps run to 4,095.
+- `SignatureBlock::parse` past its header, and so its 8-entry limit.
+- `KrnManifest::decode`.
+- OCBOR-1 past 6 bytes (P1) and 4 (P3), and the cursor beyond one item.
+- `SectionEntry::parse`'s rules past those listed: P1 only.
+
+**The forms tried** (development Mac, Kani 0.68.0, each run stopped at its cap, 2026-11-26 and 2026-11-27):
+
+| Function | Form | Result |
+|---|---|---|
+| `Image::parse` | whole, any input under 4 KiB (refusals only) | past 300 s; at 512 bytes, past 150 s |
+| | whole, one section, an input of exactly 4,160 bytes | past 300 s (938 of ~3,840 padding steps) |
+| | `check_padding` stubbed, two sections, 4,608 bytes | past 300 s |
+| | header, entry and padding all stubbed (layout logic only), 8,192 bytes | past 300 s |
+| `check_padding` | every byte symbolic, 64 / 128 / 256 bytes | 26 s and 0.9 GB / 182 s and 3.3 GB / past 240 s |
+| | 4,608 bytes, gaps to 4,095: two symbolic bytes; all-zero content | past 240 s; past 300 s |
+| | 4,608 bytes, every byte symbolic, gaps to 64 | symbolic execution 2.8 s, then the solver past 140 s |
+| core's `from_utf8` | inside the parsers' harnesses | every one past 300 s |
+| | equal to the walk: exactly 8 / exactly 16 / exactly 40 bytes | 24 s / past 300 s / past 300 s |
+| OCBOR-1, P1 | core's check: 16 / 8 bytes | past 300 s / past 300 s |
+| | the walk: 16 / 8 bytes | past 300 s / past 300 s |
+| | any result: 16 / 8 / 7 / 6 bytes | past 300 s / 162 s and 9.5 GB / 122 s and 7.9 GB / 97 s and 6.4 GB |
+| `SignatureBlock::parse` | any input, core's check: 64 / 32 bytes | past 300 s |
+| | any input, any result: 32 / 24 / 20 bytes | past 300 s |
+| | one entry or nine, fixed shape, fields Kani's: written into a symbolic buffer, with core's check and with any result; then into a zeroed buffer | past 300 s each |
+| `KrnManifest::decode` | any input, core's check: 32 / 16 bytes; any result: 16 / 8 / 6 / 5 / 3 bytes | past 300 s each |
+| | fixed shape, fields Kani's: the same three forms | past 300 s each |
+
+**The runs** (development Mac, Apple M1 Max, 64 GB, Kani 0.68.0, CBMC 6.11.0; one harness at a time through `cargo xtask kani --harness <name>`, each in a turn of its own, 2026-11-26 21:11 to 2026-11-27 00:19 UTC; times are Kani's verification time; memory is the largest process of the run).
+
+Every harness verified with every cover satisfied, and each of the 12 controls was caught on the check it names. The section entry, `merkle_hash_blocks`, `align_up` and `check_padding` ran at `abe5690f`, whose code `4d9c3f05` leaves unchanged. The rest ran on `4d9c3f05`'s code; its last edit, after those runs, changed a comment and P3's harness, and P3 ran again after it.
+
+| Harness | Proof | Controls | Peak memory |
+|---|---|---|---|
+| `proofs::header_parse_any_bytes` | 22 s | 23 s, 23 s | 1.1 GB |
+| `proofs::section_entry_parse_any_entry` | 13 s | 13 s | 0.7 GB |
+| `proofs::merkle_hash_blocks_any_size` | 0.08 s | 0.08 s | 0.2 GB |
+| `proofs::align_up_any_value` | 0.7 s | 0.2 s | 0.2 GB |
+| `proofs::slice_any_range` | 0.24 s | 0.24 s | 0.3 GB |
+| `proofs::signature_block_any_input` | 2.8 s | 2.1 s | 0.4 GB |
+| `proofs::utf8_walk_equals_core` | 74 s | 71 s, 71 s | 3.5 GB |
+| `proofs::ocbor_any_document` | 96 s | 95 s | 6.5 GB |
+| `proofs::ocbor_validate_then_cursor_read` | 110 s | 114 s | 7.10 GB; its control 7.14 GB |
+| `image::proofs::check_padding_is_exact` | 264 s | 210 s | 3.5 GB |
+
+- **P3's memory:** before its "an accepted text" cover moved into the branch that already holds the item, the harness peaked at 7.18 GB and its control at 7.66 GB (`4d9c3f05`'s tree before its last edit). The harness was under ruling 2's 7.5 GB margin and the control above it; a control is not a harness under that ruling (the coordinating session, 2026-11-27). With the cover moved, both are under: 7.10 GB and 7.14 GB.
+- **The controls caught on Kani's placeholder text:** `ocbor-argument-indexed` and `le32-indexed` are caught on "This is a placeholder message; Kani doesn't support message formatted at runtime". That is the panic of a slice index past the end (core formats its message at run time), raised by the indexing each control plants. Without the plant, the harness verifies.
+- **Added time on the Mac:** about 21 minutes for these runs, compiling included.
+- **CI:** at step 2's Mac-to-CI ratio (298 s against 281 s), CI's job would go from 77 to about 100 minutes, under ruling 4's 120. CI's run will show the figure, and the 8 GB figures, for the first time.
+
+**Controls that cannot be caught**, as the contract predicted:
+- removing the W+X check (`section.rs:239`): the checks after it refuse the same input, `SegmentNotMappable` or `SegmentPermissions` for a SEGMENT and `PermissionsOnNonSegment` for any other kind;
+- OCBOR-1's depth check off by one: `get_mut` skips the frame and the document is refused as `Truncated`, so P1 and P3 hold;
+- the signature block's entry limit loosened: no harness past the block's header came under budget, so the limit is unproved.
+
+**The images** (ruling 5):
+- `cargo xtask reproducible-gate` built the loader each way and the kernel, twice from nothing each, at the tip `abe5690f` and in an export of the base `2c9ade28`. It passed on both.
+- `cargo xtask reproducible-compare` found all 40 files the same bytes, the loader's three builds and the kernel's image among them.
+- `4d9c3f05` changes only the proofs, their two declarations' comments and `xtask`.
+
+**The review.** One independent AI review of `abe5690f`, recorded in `docs/engineering/REVIEW_T143_STEP3_2026-11-27.md`. It was given the code and the properties, not the author's argument. It found no High, 3 Medium, 6 Low and 6 Info findings. All are answered in `4d9c3f05`; the records answer R143-S3-9. **No person has reviewed it.**
+
+**A reading of the specification, noted while writing the header's proof:** §4.2 gives `format_minor` as "`0`", and also "Higher minors only add non-REQUIRED sections or manifest keys ≥ 1000". `Header::parse` accepts any minor. The proof does not assert minor 0, which is the reading the second sentence supports.
+
+**Not shown:**
+- CI's job on these harnesses, and the first CI memory figures.
+- The artifact upload with the new log names.
 - No person has reviewed it.
