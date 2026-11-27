@@ -641,7 +641,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 140. **`boot-matrix`'s usage line and `Cargo.toml`'s `default-members` (TASKS item 137's review, follow-ups 1 and 2). Numbered by the coordinating session on 2026-11-25; not started.** The usage line leaves out machines it runs: `boot-reserved`, `boot-acpi`, `boot-listed`, `boot-sparse` and `boot-domains`. `default-members` leaves out `sdk/directory` and `services/directory`, which `check` lints and tests on the host.
 141. **A placement control for B1 under emulation (TASKS item 98's turn T1). Numbered by the coordinating session on 2026-11-25; not started.** Under QEMU's software processor, B1 moved by 7 to 9 % between builds whose switch-path code is the same: a commit that added only counters off the switch path took the tip's mean on the 65-processor machine from 2,033 to 1,885 cycles. That is more than the changes TASKS item 92's rule is meant to judge. The control pins the switch path's code placement in the base's and the tip's comparison builds (for example with lld's `--symbol-ordering-file`). It shows the variation that is left, and is recorded as part of ADR-0018 V7's method. Until it lands, a scheduling item's B1 comparison still runs: a rise of more than 10 % above the base's range stops the item, and a smaller difference is judged on static counts.
 142. **Each per-processor table on a line of its own (TASKS item 98's static listing). Numbered by the coordinating session on 2026-11-25; not started.** The boot processor's run queue starts 24 bytes into a 64-byte line. The other processors' queues are consecutive elements whose stride is not a multiple of 64 (1,080 bytes at the base, 1,432 with TASKS item 98), so each queue's lock shares a line with the next queue's first fields. Each processor's element of a `PerCpu` table starts on a line of its own. First check that no assembly or fixed offset depends on today's layout. QEMU models no cache, so the figure it is judged by comes from hardware (ADR-0018 V9).
-143. **Kani's first proofs (owner item 358; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-25. Step 2, the frame allocator's and the heap's harnesses, built on 2026-11-26 and merged into `land/batch-11` at `1030c989`. Step 3, parts of `onbf-format`, built on 2026-11-26 and 2026-11-27 on `claude/t143-onbf-kani` (its entries, below). Not landed on `main`.** `kani-verifier` is installed at a version read on the day, and it and its bundled compiler are recorded in `docs/toolchain/VERIFICATION.md`. The bundle verifies, and builds nothing that ships.
+143. **Kani's first proofs (owner item 358; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-25. Step 2, the frame allocator's and the heap's harnesses, built on 2026-11-26 and merged into `land/batch-11` at `1030c989`. Step 3, parts of `onbf-format`, built on 2026-11-26 and 2026-11-27 and merged into `land/batch-11` at `f435870e`. Step 4, capability validation, built on 2026-11-27 on `claude/t143-caps-kani` (its entries, below). Not landed on `main`.** `kani-verifier` is installed at a version read on the day, and it and its bundled compiler are recorded in `docs/toolchain/VERIFICATION.md`. The bundle verifies, and builds nothing that ships.
     - **First harnesses:** the frame allocator's and the heap's invariants (rows S73-02 and S73-04);
     - **then** the ONBF parsers' bounds (ONBF §13 item 5; row S73-08);
     - **then** capability validation (row S73-07).
@@ -6360,9 +6360,127 @@ Every harness verified with every cover satisfied, and each of the 12 controls w
 
 **The review.** One independent AI review of `abe5690f`, recorded in `docs/engineering/REVIEW_T143_STEP3_2026-11-27.md`. It was given the code and the properties, not the author's argument. It found no High, 3 Medium, 6 Low and 6 Info findings. All are answered in `4d9c3f05`; the records answer R143-S3-9. **No person has reviewed it.**
 
-**A reading of the specification, noted while writing the header's proof:** §4.2 gives `format_minor` as "`0`", and also "Higher minors only add non-REQUIRED sections or manifest keys ≥ 1000". `Header::parse` accepts any minor. The proof does not assert minor 0, which is the reading the second sentence supports.
+**`format_minor` (corrected 2026-11-27):** the proof asserts no fixed minor, as the owner's errata C5 decides (2026-11-07): writers emit 0, and a v1 reader accepts any minor under major 1. This paragraph first raised it as an open reading of §4.2, whose table cell still said "`0`". C5 had settled it, and the coordinating session aligned the cell with C5 in PR 78.
 
 **Not shown:**
 - CI's job on these harnesses, and the first CI memory figures.
 - The artifact upload with the new log names.
+- No person has reviewed it.
+
+### 143, step 4. Kani's proofs of capability validation (row S73-07)
+
+Built on `claude/t143-caps-kani`, cut from `land/batch-11` at `ae4319a0`, which holds steps 2 and 3.
+
+**The contract and its rulings.** They are in the coordination notes (`t143-caps-contract.md`, 2026-11-27).
+- **Scope:** the kernel's two checks that build on the host: `handles.rs` (the handle table) and `mapping.rs` (the map request).
+- **Out of scope, named in S73-07's limitation:**
+  - the SDK's generated dispatch check, deny by default where a library declares capabilities, which the generator's tests cover;
+  - the kernel's target-only code, the bigger gap: `ipc.rs`'s transfer of handles, `process.rs`'s grant, `syscall.rs`'s use of `Need` and `memory_object.rs`'s `protect`.
+- **Properties H1 to H7 and M1 to M3**, plus three additions:
+  - `get` changes nothing;
+  - H6 counts `duplicate`;
+  - every handle `take_all` moves is then gone.
+- **Method:** induction, with `new` proved at the same bound (step 2's R143-1), and the invariant written from E1 and P11.
+- **ADR-0005's rows** are left as they are.
+- **Items 376 to 380 (owner, 2026-11-27):** `compile_fail` doctests for the handle-rights types, each with a control, and `check` runs `framekernel`'s doctests.
+
+**Kani and the kernel's package.** Kani builds every target of a package, and the kernel's image binary (`frame/entry/main.rs`, a `sysv64` `_start`) builds only for `x86_64-unknown-none`. So `cargo xtask kani` passes `--lib`; every proof is in a library. The library itself built for the host with no change.
+
+**The forms tried** (development Mac, Kani 0.68.0, each run stopped at its cap):
+
+| Form | Result |
+|---|---|
+| Any table of up to 2 slots, the slot count Kani's | `get` failed an unwinding check in `memcmp` after 34 s and 4.6 GB, and every other step ran past 300 s |
+| The same, at unwind 10 for that `memcmp` | `get` verified in 104 s, but at 19 GB |
+| `Picture` compared field by field, so no `memcmp` | `get` 5.9 s and 0.64 GB; `insert` with the invariant 82 s and 14.9 GB |
+| The invariant checked by index, not through iterator chains | `insert` with the invariant 45 s and 10 GB; the full `insert` harness 250 s and 46 GB |
+| **A table of exactly `N` slots** | `insert` with the invariant 2 s and 0.38 GB |
+| Batches with the list's length Kani's | 172 s and 16 GB, and 230 s and 20 GB |
+| `reserve` with the count Kani's, or with its inserts run after it | past 300 s, or 15 to 19 GB |
+| Lists with room to spare (`S + 3`) | worse, at 15 to 19 GB |
+| **Fixed batch lengths and reservation counts; `reserve` proved by its own contract** | every case in budget |
+
+**The invariant's first form was my error, caught by the proof.** It said that a slot at its last generation is never free again, and it failed in `remove` and the batches. ADR-0005 E1 ("A slot is retired when its generations run out") lets a slot be used once at its last generation; it is retired when that use is freed. The invariant was corrected, and E1's text is cited beside it. The kernel's code was right; this is not a kernel finding.
+
+**What was built.**
+- **`framekernel/src/handles/proofs.rs`:** 29 harnesses.
+  - The encoding, and `new` as the base.
+  - `get`, `insert`, `remove` and `duplicate`, each at 0, 1 and 2 slots.
+  - `take_all` at each size with lists of 1 and 2.
+  - `reserve` at each size for 0, 1 and 2.
+  - Every step proves what it keeps, through `step_keeps`:
+    - the slots it does not name are unchanged;
+    - generations never come down;
+    - a retired slot stays retired;
+    - `remove` moves its slot to exactly the next generation.
+
+    With these, H3 holds for any sequence within the bound.
+  - Each list starts with the least room the invariant allows.
+- **`framekernel/src/mapping/proofs.rs`:** 3 harnesses: `from_bits` for every value, `within` and `needs`, and `check` equal to `expected_check` for every request.
+- **`framekernel/src/handles.rs`:** three `compile_fail` doctests (E0616, E0451, E0603). The kernel library had no doctests before this step: the first `--doc` run found 0 tests and passed, so nothing that had never been checked was found failing.
+- **`kani.rs`:**
+  - two proof-file entries;
+  - 26 controls, 65 in all;
+  - `PRIVATE_PINS`, which keeps `HandleTable`'s fields and `Slot` private to their module. A `pub(crate)` there would pass the doctests, which see only the crate's edge, and void the proofs' premise.
+- **`check`:** runs `cargo test --package framekernel --doc`. The step took about 1 s once the library was built; the full `check`'s figure is in the hand-over.
+
+**The doctests' controls** were run by hand in a scratch copy of the tree, each with `cargo test -p framekernel --doc`:
+
+| Control | Result |
+|---|---|
+| `slots` and `Slot` public | the E0616 doctest fails |
+| all four fields and `Slot` public | the E0451 doctest fails |
+| `Slot` public | the E0603 doctest fails |
+
+Making a field public alone is not enough: the field's type, `Slot`, is private too, so the code still fails to compile, for that other reason. The first two doctests are refused twice over. Rustdoc on stable 1.100.0 does not check a `compile_fail` block's error code (the first control showed it), so the codes say which refusal is meant without enforcing it.
+
+**The runs** (development Mac, Kani 0.68.0, one harness at a time through `cargo xtask kani --harness <name>`, each in a turn of its own, 2026-11-27, at `1dd5856b`'s code). Every harness verified with every cover satisfied. Each control was caught by every harness it names, on the check it names: 68 harness-control pairs.
+
+| Harness | Proof | Controls | Peak memory |
+|---|---|---|---|
+| `handles::proofs::the_encoding_is_e1s` | 0.14 s | 0.09 s | 0.33 GB |
+| `handles::proofs::new_is_whole` | 0.12 s | 0.11 s | 0.34 GB |
+| `handles::proofs::get_is_exactly_p1_at_0` | 0.42 s | 0.43 s | 0.39 GB |
+| `handles::proofs::get_is_exactly_p1_at_1` | 1.9 s | 2.1 s, 1.9 s, 1.9 s | 0.39 GB |
+| `handles::proofs::get_is_exactly_p1_at_2` | 3.0 s | 3.0 s, 3.2 s, 2.9 s | 0.39 GB |
+| `handles::proofs::insert_keeps_the_table_whole_at_0` | 2.3 s | 1.6 s, 1.1 s | 0.40 GB |
+| `handles::proofs::insert_keeps_the_table_whole_at_1` | 8.1 s | 5.2 s, 5.1 s | 0.45 GB |
+| `handles::proofs::insert_keeps_the_table_whole_at_2` | 10.8 s | 7.2 s, 10.6 s | 0.69 GB |
+| `handles::proofs::remove_keeps_the_table_whole_at_0` | 0.49 s | 0.50 s | 0.41 GB |
+| `handles::proofs::remove_keeps_the_table_whole_at_1` | 6.6 s | 6.6 s, 6.7 s, 6.8 s | 0.41 GB |
+| `handles::proofs::remove_keeps_the_table_whole_at_2` | 12.0 s | 11.4 s, 12.2 s, 12.0 s | 0.67 GB |
+| `handles::proofs::duplicate_only_shrinks_rights_at_0` | 0.50 s | 0.37 s | 0.41 GB |
+| `handles::proofs::duplicate_only_shrinks_rights_at_1` | 8.8 s | 8.5 s, 8.7 s, 9.2 s | 0.51 GB |
+| `handles::proofs::duplicate_only_shrinks_rights_at_2` | 13.7 s | 12.2 s, 13.3 s, 12.8 s | 0.70 GB |
+| `handles::proofs::a_batch_moves_entirely_or_not_at_all_at_0_of_1` | 1.1 s | 1.2 s | 0.43 GB |
+| `handles::proofs::a_batch_moves_entirely_or_not_at_all_at_0_of_2` | 1.2 s | 1.2 s | 0.43 GB |
+| `handles::proofs::a_batch_moves_entirely_or_not_at_all_at_1_of_1` | 12.7 s | 12.8 s, 13.1 s | 0.80 GB |
+| `handles::proofs::a_batch_moves_entirely_or_not_at_all_at_1_of_2` | 9.8 s | 9.3 s, 9.4 s | 0.94 GB |
+| `handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_1` | 20.7 s | 21.0 s, 21.1 s | 1.19 GB |
+| `handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_2` | 32.5 s | 30.9 s, 27.7 s, 31.9 s, 31.9 s | 2.04 GB |
+| `handles::proofs::reserve_makes_room_at_0_for_0` | 0.40 s | 0.43 s | 0.38 GB |
+| `handles::proofs::reserve_makes_room_at_0_for_1` | 0.84 s | 0.90 s, 0.37 s, 0.85 s | 0.38 GB |
+| `handles::proofs::reserve_makes_room_at_0_for_2` | 0.82 s | 0.88 s, 0.38 s, 0.86 s | 0.38 GB |
+| `handles::proofs::reserve_makes_room_at_1_for_0` | 2.9 s | 3.0 s | 0.38 GB |
+| `handles::proofs::reserve_makes_room_at_1_for_1` | 4.1 s | 4.1 s, 1.8 s, 3.8 s | 0.38 GB |
+| `handles::proofs::reserve_makes_room_at_1_for_2` | 3.5 s | 3.8 s, 1.7 s, 3.8 s | 0.38 GB |
+| `handles::proofs::reserve_makes_room_at_2_for_0` | 4.4 s | 4.6 s | 0.39 GB |
+| `handles::proofs::reserve_makes_room_at_2_for_1` | 5.1 s | 5.5 s, 3.0 s, 5.2 s | 0.40 GB |
+| `handles::proofs::reserve_makes_room_at_2_for_2` | 5.2 s | 6.0 s, 3.3 s, 5.5 s | 0.39 GB |
+| `mapping::proofs::allow_from_every_bits` | 0.03 s | 0.04 s | 0.33 GB |
+| `mapping::proofs::within_is_allows_nothing_more` | 0.05 s | 0.05 s | 0.33 GB |
+| `mapping::proofs::check_every_request` | 1.4 s | 1.1 s, 1.3 s, 1.4 s, 0.78 s | 0.34 GB |
+
+- **Longest proof:** 32.5 s. **Highest peak:** 2.04 GB.
+- **Added time on the Mac:** about 14 minutes for these runs, compiling included. Steps 3 and 4 together add about 35 minutes to CI's 77-minute job, by the Mac's figures, at step 2's ratio of the Mac to CI. That would bring the job to about 112 minutes, under ruling 4's 120. CI's first run of step 3 will show the real figure.
+
+**Owed from step 3, in this step's records commit:** `onbf-format`'s proof table now cites §4.2 together with errata C5 for the header, and the step-3 entry's paragraph on `format_minor` is corrected to cite C5.
+
+**The images:** at the tip `bb0b0941` and in an export of the base `ae4319a0`, `cargo xtask reproducible-gate` passed, and `cargo xtask reproducible-compare` found all 40 files the same bytes. Those include the kernel's ELF (SHA-256 `0580e203…`) and its image (`e5c9b0c0…`). Later commits change only proofs, comments and `xtask`.
+
+**The review.** One independent AI review of `bb0b0941`, recorded in `docs/engineering/REVIEW_T143_STEP4_2026-11-27.md`, was given the code and the properties but not the author's argument. It found no High, 3 Medium, 6 Low and 5 Info, none a defect of the kernel. Each finding is answered, in `1dd5856b` and these records. **No person has reviewed it.**
+
+**Not shown:**
+- CI's run of these harnesses, and its memory figures.
+- The doctests' controls run by `xtask`: they were run by hand.
 - No person has reviewed it.

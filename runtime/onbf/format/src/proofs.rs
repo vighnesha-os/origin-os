@@ -16,7 +16,7 @@
 //!
 //! | Function | Harness | Bound | Also proved |
 //! |---|---|---|---|
-//! | `Header::parse` | [`header_parse_any_bytes`] | every input of up to 128 bytes | P2: §4.2's rules, read from the raw bytes, and the fields it returns are those bytes |
+//! | `Header::parse` | [`header_parse_any_bytes`] | every input of up to 128 bytes | P2: §4.2's rules with errata C5 (any minor), read from the raw bytes, and the fields it returns are those bytes |
 //! | `SectionEntry::parse` | [`section_entry_parse_any_entry`] | every 128-byte entry, every profile, nested or not | P2: §4.3's flags and reserved fields, Appendix A's 1 TiB |
 //! | `merkle_hash_blocks` | [`merkle_hash_blocks_any_size`] | every `u64` | |
 //! | `align_up` | [`align_up_any_value`] | every value, every alignment | the next multiple, for every power of two |
