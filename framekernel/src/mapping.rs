@@ -1067,3 +1067,7 @@ mod tests {
         assert_eq!(none.room(), Err(Error::InvalidArgs));
     }
 }
+
+/// Kani's proofs of a map request's checks (TASKS item 143, step 4): `cargo xtask kani`.
+#[cfg(kani)]
+mod proofs;

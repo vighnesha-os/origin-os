@@ -155,9 +155,16 @@ jobs:
   # The full run is here only, not in `check` (the coordinating session's ruling of 2026-11-26):
   # the development Mac runs one harness at a time while it is written. The script installs the
   # pinned Kani and checks its bundle against the digest GitHub publishes. A standard runner,
-  # free for a public repository (CLAUDE.md §80).
+  # free for a public repository (CLAUDE.md §80). One job for each package of the proof files, so
+  # that none passes 120 minutes (the coordinating session's ruling of 2026-11-27, after the one
+  # job took 122): `cargo xtask kani-gate` holds this list to the packages `PROOF_FILES` names,
+  # and its host tests show that the jobs together run every harness and every control once.
   kani:
-    name: Kani's proofs and controls
+    name: Kani's proofs and controls (${{ matrix.package }})
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [origin-frame, onbf-format, framekernel]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
@@ -171,15 +178,15 @@ jobs:
       # `cargo xtask kani` measures each run's peak memory with the system's `time -v`.
       - name: Check that the system's time is there
         run: test -x /usr/bin/time || { sudo apt-get update && sudo apt-get install -y time; }
-      - run: cargo --locked xtask kani
-      # Each run's full output, harness by harness and control by control. Kept when the job
-      # fails too; this step never decides whether the job passes.
+      - run: cargo --locked xtask kani --package ${{ matrix.package }}
+      # Each run's full output, harness by harness and control by control, one artifact for each
+      # job. Kept when the job fails too; this step never decides whether the job passes.
       - name: Keep Kani's reports
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: kani-reports
+          name: kani-reports-${{ matrix.package }}
           path: target/xtask/kani
           if-no-files-found: warn
           retention-days: 14

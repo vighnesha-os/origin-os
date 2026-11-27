@@ -163,12 +163,14 @@ commands:
               (TASKS item 144): the control, then one target for a fixed time (default 60 s,
               at most 300 s unless CI is set; the long runs are CI's), or one input replayed.
               Not part of check, which replays kept crashes as host tests instead
-  kani [--harness <name>]
-              Kani's proofs of the frame allocator and the heap, then their negative controls,
-              each applied to a scratch copy of the tree (CLAUDE.md §73; owner item 358). Needs
-              Kani 0.68.0 (.github/ci/install-kani.sh); CI's job `kani` runs it all, and not
+  kani [--harness <name> | --package <name>] | [--package <name>] --list
+              Kani's proofs (the frame allocator, the heap, the ONBF parsers and capability
+              validation), then their negative controls, each applied to a scratch copy of the
+              tree (CLAUDE.md §73; owner item 358). Needs Kani 0.68.0 (.github/ci/install-kani.sh).
+              CI's job `kani` runs it, one job for each package of the proof files, and not
               check. With --harness, one harness and the controls that name it, while it is
-              being written
+              being written; with --package, one package's harnesses and the controls on them;
+              with --list, what such a run would run, running nothing
   kani-gate   only what can be checked of the proofs without Kani: each harness has a
               control whose text is in its file once, and cfg(kani) is only on the proof
               modules' lines (part of check; quick)
@@ -4814,8 +4816,15 @@ fn main() -> ExitCode {
         ["unsafe-gate"] => unsafety::gate(),
         ["names-gate"] => listed_names::gate(),
         ["kani-gate"] => kani::gate(),
-        ["kani"] => in_turn("kani", || kani::run(None)),
-        ["kani", "--harness", name] => in_turn("kani --harness", || kani::run(Some(name))),
+        ["kani"] => in_turn("kani", || kani::run(kani::Choice::All)),
+        ["kani", "--harness", name] => {
+            in_turn("kani --harness", || kani::run(kani::Choice::Harness(name)))
+        }
+        ["kani", "--package", name] => {
+            in_turn("kani --package", || kani::run(kani::Choice::Package(name)))
+        }
+        ["kani", "--list"] => kani::list(kani::Choice::All),
+        ["kani", "--package", name, "--list"] => kani::list(kani::Choice::Package(name)),
         ["aml-alloc-gate"] => amlalloc::gate(),
         ["percpu-gate"] => per_cpu::gate(),
         ["settle-gate"] => settle::gate(),
@@ -6294,6 +6303,10 @@ fn check() -> Result {
         None,
     )?)?;
     run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--lib"]))?;
+    // The kernel library's doctests, which `--lib` skips: the `compile_fail` ones that show a
+    // handle table's entries and rights cannot be reached around its methods (TASKS item 143,
+    // step 4). `--doc` builds the library alone, not the kernel image's binary.
+    run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--doc"]))?;
     // The AML interpreter's boot proof on a 32 KiB stack: release only, the stack's proxy (TASKS
     // item 63, step B3, ruling Q3 (a)).
     run_step(cargo().args([

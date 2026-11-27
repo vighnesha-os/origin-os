@@ -13,8 +13,15 @@
 //!   no assumption made it vacuous. A compiler warning in a proof file fails the run. The full
 //!   run is the CI job `kani`'s (the coordinating session's ruling of 2026-11-26): it is not part
 //!   of `cargo xtask check`.
+//! - **`cargo xtask kani --package <name>`** runs one package's harnesses and each control on
+//!   them: CI's jobs, one for each package of [`PROOF_FILES`] (the coordinating session's ruling
+//!   of 2026-11-27, after the one job took 122 minutes against a rule of 120). Together they run
+//!   every harness and every control once, each control on all its harnesses, as the whole run
+//!   does: a control's harnesses are all in its file's package, which the gate checks.
 //! - **`cargo xtask kani --harness <name>`** runs one harness and the controls that name it: what
 //!   writing a harness needs on the development machine, in a turn.
+//! - **`--list`**, after nothing or `--package <name>`, prints what that run would run and the
+//!   counts, and runs nothing.
 //! - **Each control** applies one deliberate bug to a scratch copy of the tree under the target
 //!   directory (the working tree is never touched), and requires each harness it names to fail
 //!   with one of the checks it names. A harness that cannot fail proves nothing. A control whose
@@ -22,8 +29,9 @@
 //! - **`cargo xtask kani-gate`**, part of `check`, needs no Kani: the harnesses the proof files
 //!   define and the controls name agree, each harness has a control, each control's text is in
 //!   its file exactly once, the word `kani` appears outside xtask and the proof files only in
-//!   the parents' `#[cfg(kani)]` before `mod proofs;`, each proof file forbids `unsafe`, and the
-//!   CI job installs this version.
+//!   the parents' `#[cfg(kani)]` before `mod proofs;`, each proof file forbids `unsafe`, the CI
+//!   job installs this version, its matrix lists exactly the packages of [`PROOF_FILES`] and one
+//!   step runs one package for each job, and each control's harnesses are in its own package.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -82,6 +90,19 @@ const PROOF_FILES: &[ProofFile] = &[
         module: "image::proofs",
         parent: "runtime/onbf/format/src/image.rs",
     },
+    // TASKS item 143, step 4: capability validation, the kernel's two host-built checks.
+    ProofFile {
+        package: "framekernel",
+        file: "framekernel/src/handles/proofs.rs",
+        module: "handles::proofs",
+        parent: "framekernel/src/handles.rs",
+    },
+    ProofFile {
+        package: "framekernel",
+        file: "framekernel/src/mapping/proofs.rs",
+        module: "mapping::proofs",
+        parent: "framekernel/src/mapping.rs",
+    },
 ];
 
 /// The line a parent declares its proof module with, after `#[cfg(kani)]`.
@@ -110,6 +131,8 @@ const OCBOR: &str = "runtime/onbf/format/src/ocbor.rs";
 const SIGNATURE: &str = "runtime/onbf/format/src/signature.rs";
 const IMAGE: &str = "runtime/onbf/format/src/image.rs";
 const ONBF_PROOFS: &str = "runtime/onbf/format/src/proofs.rs";
+const HANDLES: &str = "framekernel/src/handles.rs";
+const MAPPING: &str = "framekernel/src/mapping.rs";
 
 /// The controls. Each harness of [`PROOF_FILES`] is named by at least one.
 const CONTROLS: &[Control] = &[
@@ -482,6 +505,302 @@ const CONTROLS: &[Control] = &[
             "the byte named is not zero",
         ],
     },
+    // TASKS item 143, step 4: the handle table and the map request.
+    Control {
+        name: "new-quota-uncapped",
+        file: HANDLES,
+        from: "            limit: limit.min(MAX_HANDLES),\n",
+        to: "            limit,\n",
+        harnesses: &["handles::proofs::new_is_whole"],
+        expect: &["P11: live within the quota"],
+    },
+    Control {
+        name: "join-without-the-one",
+        file: HANDLES,
+        from: "    ((index as u64 + 1) << GENERATION_BITS) | (generation & LAST_GENERATION)\n",
+        to: "    ((index as u64) << GENERATION_BITS) | (generation & LAST_GENERATION)\n",
+        harnesses: &["handles::proofs::the_encoding_is_e1s"],
+        expect: &["the handle E1 describes"],
+    },
+    Control {
+        name: "missing-slot-as-denied",
+        file: HANDLES,
+        from: "too (ADR-0017 Z9).\n        let index = nospec::index(index, self.slots.len()).ok_or(Error::BadHandle)?;\n",
+        to: "too (ADR-0017 Z9).\n        let index = nospec::index(index, self.slots.len()).ok_or(Error::AccessDenied)?;\n",
+        harnesses: &[
+            "handles::proofs::get_is_exactly_p1_at_0",
+            "handles::proofs::get_is_exactly_p1_at_1",
+            "handles::proofs::get_is_exactly_p1_at_2",
+            "handles::proofs::remove_keeps_the_table_whole_at_0",
+        ],
+        expect: &["get is exactly P1's answer", "remove refuses as get does"],
+    },
+    Control {
+        name: "rights-loosened",
+        file: HANDLES,
+        from: "                } else if r & need.rights == need.rights {\n",
+        to: "                } else if r & need.rights != 0 || need.rights == 0 {\n",
+        harnesses: &[
+            "handles::proofs::get_is_exactly_p1_at_1",
+            "handles::proofs::get_is_exactly_p1_at_2",
+        ],
+        expect: &["get is exactly P1's answer"],
+    },
+    Control {
+        name: "live-not-counted",
+        file: HANDLES,
+        from: "        self.live += 1;\n",
+        to: "",
+        harnesses: &[
+            "handles::proofs::insert_keeps_the_table_whole_at_0",
+            "handles::proofs::insert_keeps_the_table_whole_at_1",
+            "handles::proofs::insert_keeps_the_table_whole_at_2",
+        ],
+        expect: &["live counts the full slots", "one more handle"],
+    },
+    Control {
+        name: "generation-not-bumped",
+        file: HANDLES,
+        from: "            slot.generation += 1;\n",
+        to: "",
+        harnesses: &[
+            "handles::proofs::remove_keeps_the_table_whole_at_1",
+            "handles::proofs::remove_keeps_the_table_whole_at_2",
+        ],
+        expect: &[
+            "remove moves the slot to the next generation, free",
+            "E1: a generation never comes down",
+        ],
+    },
+    Control {
+        name: "last-generation-reused",
+        file: HANDLES,
+        from: "        if slot.generation < LAST_GENERATION {\n",
+        to: "        if true {\n",
+        harnesses: &[
+            "handles::proofs::remove_keeps_the_table_whole_at_1",
+            "handles::proofs::remove_keeps_the_table_whole_at_2",
+        ],
+        expect: &[
+            "E1: a generation from 1 to the last",
+            "H7: a slot used at its last generation is retired",
+        ],
+    },
+    Control {
+        name: "duplicate-of-anything",
+        file: HANDLES,
+        from: "        let (object, old) = self.get(handle, need)?;\n",
+        to: "        let Ok((object, old)) = self.get(handle, need) else {\n            return Ok(handle);\n        };\n",
+        harnesses: &[
+            "handles::proofs::duplicate_only_shrinks_rights_at_0",
+            "handles::proofs::duplicate_only_shrinks_rights_at_1",
+            "handles::proofs::duplicate_only_shrinks_rights_at_2",
+        ],
+        expect: &["a duplicate only of a handle that meets the need"],
+    },
+    Control {
+        name: "duplicate-widens",
+        file: HANDLES,
+        from: "        if new_rights & !old != 0 {\n            return Err(Error::InvalidArgs);\n        }\n",
+        to: "",
+        harnesses: &[
+            "handles::proofs::duplicate_only_shrinks_rights_at_1",
+            "handles::proofs::duplicate_only_shrinks_rights_at_2",
+        ],
+        expect: &["P2: rights only shrink"],
+    },
+    Control {
+        name: "batch-refusal-as-success",
+        file: HANDLES,
+        from: "        self.check_all(list, need)?;\n",
+        to: "        if self.check_all(list, need).is_err() {\n            return Ok(Vec::new());\n        }\n",
+        harnesses: &[
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_0_of_1",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_0_of_2",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_1_of_1",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_1_of_2",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_1",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_2",
+        ],
+        expect: &["take_all moves only what check_all accepts"],
+    },
+    Control {
+        name: "batch-partial",
+        file: HANDLES,
+        from: "        self.check_all(list, need)?;\n",
+        to: "",
+        harnesses: &[
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_1_of_2",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_2",
+        ],
+        expect: &["a refused batch changes nothing"],
+    },
+    Control {
+        name: "reserve-past-the-quota",
+        file: HANDLES,
+        from: "        if count > self.free_slots() {\n",
+        to: "        if count > self.free_slots() + 1 {\n",
+        harnesses: &[
+            "handles::proofs::reserve_makes_room_at_0_for_1",
+            "handles::proofs::reserve_makes_room_at_0_for_2",
+            "handles::proofs::reserve_makes_room_at_1_for_1",
+            "handles::proofs::reserve_makes_room_at_1_for_2",
+            "handles::proofs::reserve_makes_room_at_2_for_1",
+            "handles::proofs::reserve_makes_room_at_2_for_2",
+        ],
+        expect: &["H6: Ok exactly when the quota has room"],
+    },
+    Control {
+        name: "write-with-execute-denied-not-invalid",
+        file: MAPPING,
+        from: "        if bits & !map_access::ALL != 0 || bits & map_access::READ == 0 || (write && execute) {\n",
+        to: "        if bits & !map_access::ALL != 0 || bits & map_access::READ == 0 {\n",
+        harnesses: &["mapping::proofs::allow_from_every_bits"],
+        expect: &["access_denied only for execute"],
+    },
+    Control {
+        name: "map-rights-loosened",
+        file: MAPPING,
+        from: "    if held & allow.needs() != allow.needs() {\n",
+        to: "    if held & allow.needs() == 0 {\n",
+        harnesses: &["mapping::proofs::check_every_request"],
+        expect: &["check is exactly what C6 to C8 and D2 allow, in the module's order"],
+    },
+    Control {
+        name: "within-loosened",
+        file: MAPPING,
+        from: "            (Self::Read, _) | (Self::ReadWrite, Self::ReadWrite)\n",
+        to: "            (Self::Read, _) | (Self::ReadWrite, _)\n",
+        harnesses: &["mapping::proofs::within_is_allows_nothing_more"],
+        expect: &["within: allows nothing more"],
+    },
+    // From the review of step 4 (R143-S4-1 to S4-6): what each step keeps, memory, and the map's ranges.
+    Control {
+        name: "generation-wraps-at-2-32",
+        file: HANDLES,
+        from: "            slot.generation += 1;\n",
+        to: "            slot.generation = if slot.generation == 0xFFFF_FFFF { 1 } else { slot.generation + 1 };\n",
+        harnesses: &[
+            "handles::proofs::remove_keeps_the_table_whole_at_1",
+            "handles::proofs::remove_keeps_the_table_whole_at_2",
+        ],
+        expect: &[
+            "E1: a generation never comes down",
+            "remove moves the slot to the next generation, free",
+        ],
+    },
+    Control {
+        name: "duplicate-widens-the-original",
+        file: HANDLES,
+        from: "        let copy = object.clone();\n",
+        to: "        let copy = object.clone();\n        if let Some((i, _)) = split(handle) {\n            if let Some(Slot { entry: Some((_, r)), .. }) = self.slots.get_mut(i) {\n                *r = u32::MAX;\n            }\n        }\n",
+        harnesses: &[
+            "handles::proofs::duplicate_only_shrinks_rights_at_1",
+            "handles::proofs::duplicate_only_shrinks_rights_at_2",
+        ],
+        expect: &["P2: a slot the operation does not name is unchanged"],
+    },
+    Control {
+        name: "batch-reversed",
+        file: HANDLES,
+        from: "        for &handle in list {\n            taken.push(self.remove(handle, need)?);\n",
+        to: "        for &handle in list.iter().rev() {\n            taken.push(self.remove(handle, need)?);\n",
+        harnesses: &["handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_2"],
+        expect: &["P2: each moved entry is the one named, in the list's order"],
+    },
+    Control {
+        name: "batch-widens-what-it-moves",
+        file: HANDLES,
+        from: "            taken.push(self.remove(handle, need)?);\n",
+        to: "            taken.push(self.remove(handle, need).map(|(o, _)| (o, u32::MAX))?);\n",
+        harnesses: &[
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_1_of_1",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_1",
+            "handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_2",
+        ],
+        expect: &["P2: each moved entry is the one named, in the list's order"],
+    },
+    Control {
+        name: "insert-leaves-remove-no-room",
+        file: HANDLES,
+        from: "                if self.slots.try_reserve(1).is_err() || self.ensure_free_room(1).is_err() {\n",
+        to: "                if self.slots.try_reserve(1).is_err() {\n",
+        harnesses: &[
+            "handles::proofs::insert_keeps_the_table_whole_at_0",
+            "handles::proofs::insert_keeps_the_table_whole_at_1",
+            "handles::proofs::insert_keeps_the_table_whole_at_2",
+        ],
+        expect: &["the free list has room for every slot, so remove never allocates"],
+    },
+    Control {
+        name: "reserve-takes-no-memory",
+        file: HANDLES,
+        from: "        self.slots.try_reserve(fresh).map_err(|_| Error::NoMemory)?;\n        self.ensure_free_room(fresh)\n",
+        to: "        let _ = fresh;\n        Ok(())\n",
+        harnesses: &[
+            "handles::proofs::reserve_makes_room_at_0_for_1",
+            "handles::proofs::reserve_makes_room_at_0_for_2",
+            "handles::proofs::reserve_makes_room_at_1_for_1",
+            "handles::proofs::reserve_makes_room_at_1_for_2",
+            "handles::proofs::reserve_makes_room_at_2_for_1",
+            "handles::proofs::reserve_makes_room_at_2_for_2",
+        ],
+        expect: &["the memory for every reserved insert is taken now"],
+    },
+    Control {
+        name: "reserve-at-the-quota-refused",
+        file: HANDLES,
+        from: "        if count > self.free_slots() {\n",
+        to: "        if count >= self.free_slots() {\n",
+        harnesses: &[
+            "handles::proofs::reserve_makes_room_at_0_for_0",
+            "handles::proofs::reserve_makes_room_at_0_for_1",
+            "handles::proofs::reserve_makes_room_at_0_for_2",
+            "handles::proofs::reserve_makes_room_at_1_for_0",
+            "handles::proofs::reserve_makes_room_at_1_for_1",
+            "handles::proofs::reserve_makes_room_at_1_for_2",
+            "handles::proofs::reserve_makes_room_at_2_for_0",
+            "handles::proofs::reserve_makes_room_at_2_for_1",
+            "handles::proofs::reserve_makes_room_at_2_for_2",
+        ],
+        expect: &["H6: Ok exactly when the quota has room"],
+    },
+    Control {
+        name: "get-type-after-rights",
+        file: HANDLES,
+        from: "                if need.object != 0 && object.object_type() != need.object {\n                    Err(Error::WrongType)\n                } else if r & need.rights == need.rights {\n                    Ok((object, *r))\n                } else {\n                    Err(Error::AccessDenied)\n                }\n",
+        to: "                if r & need.rights != need.rights {\n                    Err(Error::AccessDenied)\n                } else if need.object != 0 && object.object_type() != need.object {\n                    Err(Error::WrongType)\n                } else {\n                    Ok((object, *r))\n                }\n",
+        harnesses: &[
+            "handles::proofs::get_is_exactly_p1_at_1",
+            "handles::proofs::get_is_exactly_p1_at_2",
+        ],
+        expect: &["get is exactly P1's answer"],
+    },
+    Control {
+        name: "user-start-unchecked",
+        file: MAPPING,
+        from: "    if !base.is_multiple_of(PAGE) || base < USER_START {\n",
+        to: "    if !base.is_multiple_of(PAGE) {\n",
+        harnesses: &["mapping::proofs::check_every_request"],
+        expect: &["check is exactly what C6 to C8 and D2 allow, in the module's order"],
+    },
+    Control {
+        name: "fixed-address-alignment-unchecked",
+        file: MAPPING,
+        from: "    if !base.is_multiple_of(PAGE) || base < USER_START {\n",
+        to: "    if base < USER_START {\n",
+        harnesses: &["mapping::proofs::check_every_request"],
+        expect: &["check is exactly what C6 to C8 and D2 allow, in the module's order"],
+    },
+    // Both of the range's checks loosened together: the second (nospec's clamps) refuses on the kept path too.
+    Control {
+        name: "object-range-unchecked",
+        file: MAPPING,
+        from: "    if pages == 0\n        || first\n            .checked_add(pages)\n            .is_none_or(|end| end > object_pages)\n    {\n        return Err(Error::InvalidArgs);\n    }\n    // The offset and the length are a program's and pick the object's frames\n    // (`MemoryObject::run`). `nospec` keeps them inside the object on a wrongly guessed path\n    // too; the check above has refused whatever these would.\n    let pages = at_most(pages, object_pages).ok_or(Error::InvalidArgs)?;\n    let first = at_most(first, object_pages - pages).ok_or(Error::InvalidArgs)?;\n",
+        to: "    if pages == 0 {\n        return Err(Error::InvalidArgs);\n    }\n",
+        harnesses: &["mapping::proofs::check_every_request"],
+        expect: &["check is exactly what C6 to C8 and D2 allow, in the module's order"],
+    },
 ];
 
 /// The check Kani 0.68.0 reports for a panic whose message core formats at run time, as a
@@ -666,9 +985,11 @@ fn cargo_kani(
     // `-Z stubbing`: the heap's harnesses stub core's slice rotation (`heap/proofs.rs`), and
     // `onbf-format`'s stub core's UTF-8 check (`proofs.rs`). Kani 0.68.0 calls the feature
     // unstable; the version is pinned.
+    // `--lib`: every proof is in a library, and `framekernel`'s package also holds the kernel
+    // image's binary, which builds only for `x86_64-unknown-none`.
     command
         .current_dir(dir)
-        .args(["kani", "-Z", "stubbing", "-p", package]);
+        .args(["kani", "-Z", "stubbing", "-p", package, "--lib"]);
     for harness in harnesses {
         command.args(["--harness", harness, "--exact"]);
     }
@@ -866,22 +1187,98 @@ fn apply(control: &Control, dir: &Path) -> Result {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// `cargo xtask kani [--harness <name>]`: the proofs, then their controls.
-pub(crate) fn run(only: Option<&str>) -> Result {
+/// Which proofs a run takes: all of them, one harness, or one package's (CI's jobs, one for each
+/// package of [`PROOF_FILES`]: the coordinating session's ruling of 2026-11-27, after the one
+/// job passed 120 minutes).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Choice<'a> {
+    All,
+    Harness(&'a str),
+    Package(&'a str),
+}
+
+impl Choice<'_> {
+    /// Whether the choice takes the harness `name` of `package`.
+    fn takes(self, package: &str, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Harness(only) => only == name,
+            Self::Package(only) => only == package,
+        }
+    }
+}
+
+/// The harnesses a run takes, each with its package.
+type Harnesses<'a> = Vec<&'a (&'static str, String)>;
+/// The controls a run takes, each with the harnesses it runs on.
+type Controls = Vec<(&'static Control, Vec<&'static str>)>;
+
+/// The harnesses `choice` takes from `all`, and each control it runs with the harnesses it runs
+/// it on: a control runs when it names a harness the choice takes, on those of its harnesses.
+fn selection<'a>(
+    all: &'a [(&'static str, String)],
+    choice: Choice<'_>,
+) -> (Harnesses<'a>, Controls) {
+    let harnesses: Vec<_> = all.iter().filter(|(p, n)| choice.takes(p, n)).collect();
+    let package_of_harness = |name: &str| all.iter().find(|(_, n)| n == name).map(|(p, _)| *p);
+    let controls = CONTROLS
+        .iter()
+        .filter_map(|control| {
+            let on: Vec<&'static str> = control
+                .harnesses
+                .iter()
+                .copied()
+                .filter(|h| package_of_harness(h).is_some_and(|p| choice.takes(p, h)))
+                .collect();
+            (!on.is_empty()).then_some((control, on))
+        })
+        .collect();
+    (harnesses, controls)
+}
+
+/// Refuses a choice that names no harness or no package of [`PROOF_FILES`].
+fn check_choice(all: &[(&'static str, String)], choice: Choice<'_>) -> Result {
+    match choice {
+        Choice::All => Ok(()),
+        Choice::Harness(name) if all.iter().any(|(_, n)| n == name) => Ok(()),
+        Choice::Harness(name) => Err(format!("kani: no harness {name}")),
+        Choice::Package(package) if PROOF_FILES.iter().any(|p| p.package == package) => Ok(()),
+        Choice::Package(package) => Err(format!(
+            "kani: no proof file is in package {package} (PROOF_FILES)"
+        )),
+    }
+}
+
+/// `cargo xtask kani [--package <name>] --list`: what such a run would run, and how much, with
+/// no Kani and no turn: so that the jobs' union can be counted against the whole.
+pub(crate) fn list(choice: Choice<'_>) -> Result {
+    let all = defined(&repo_root())?;
+    check_choice(&all, choice)?;
+    let (harnesses, controls) = selection(&all, choice);
+    for (package, name) in &harnesses {
+        println!("xtask: kani: harness {name} ({package})");
+    }
+    for (control, on) in &controls {
+        println!("xtask: kani: control {} on {}", control.name, on.join(", "));
+    }
+    println!(
+        "xtask: kani: {} harnesses and {} controls ({} control runs of a harness) for {choice:?}",
+        harnesses.len(),
+        controls.len(),
+        controls.iter().map(|(_, on)| on.len()).sum::<usize>()
+    );
+    Ok(())
+}
+
+/// `cargo xtask kani [--harness <name> | --package <name>]`: the proofs, then their controls.
+pub(crate) fn run(choice: Choice<'_>) -> Result {
     gate()?;
     check_version()?;
     let root = repo_root();
     let logs = target_dir().join("xtask/kani");
     let all = defined(&root)?;
-    if let Some(name) = only
-        && !all.iter().any(|(_, n)| n == name)
-    {
-        return Err(format!("kani: no harness {name}"));
-    }
-    let chosen: Vec<&(&str, String)> = all
-        .iter()
-        .filter(|(_, n)| only.is_none_or(|o| o == n))
-        .collect();
+    check_choice(&all, choice)?;
+    let (chosen, chosen_controls) = selection(&all, choice);
     let packages: BTreeSet<&str> = chosen.iter().map(|(p, _)| *p).collect();
     let mut problems = Vec::new();
     // One `cargo kani` for each harness, so that each run's peak memory is that harness's (CI
@@ -936,25 +1333,17 @@ pub(crate) fn run(only: Option<&str>) -> Result {
         "xtask: kani: {} harnesses verified, every cover property satisfied",
         chosen.len()
     );
-    controls(&root, only)
+    controls(&root, &chosen_controls)
 }
 
-/// Runs each control that names a harness chosen (every control, or those naming `only`).
-fn controls(root: &Path, only: Option<&str>) -> Result {
+/// Runs each control `selection` chose, on the harnesses it chose for it.
+fn controls(root: &Path, chosen: &Controls) -> Result {
     let scratch = target_dir().join("kani-scratch/tree");
     let target = target_dir().join("kani-scratch/target");
     let logs = target_dir().join("xtask/kani/controls");
     let mut ran = 0;
-    for control in CONTROLS {
-        let harnesses: Vec<&str> = control
-            .harnesses
-            .iter()
-            .copied()
-            .filter(|h| only.is_none_or(|o| o == *h))
-            .collect();
-        if harnesses.is_empty() {
-            continue;
-        }
+    for (control, harnesses) in chosen {
+        let control = *control;
         let package = package_of(control.file)?;
         populate(root, &scratch)?;
         apply(control, &scratch)?;
@@ -962,12 +1351,12 @@ fn controls(root: &Path, only: Option<&str>) -> Result {
             &scratch,
             Some(&target),
             package,
-            &harnesses,
+            harnesses,
             &logs.join(format!("{}.log", control.name)),
         )?;
         let report = parse_report(&output);
         let mut problems = Vec::new();
-        for name in &harnesses {
+        for name in harnesses {
             let outcome = report.iter().find(|(n, _)| n == name).map(|(_, o)| o);
             problems.extend(control_problem(control, name, outcome));
         }
@@ -1004,6 +1393,34 @@ fn package_of(file: &str) -> Result<&'static str> {
         })
         .map(|p| p.package)
         .ok_or_else(|| format!("kani: no proof file's package holds {file}"))
+}
+
+/// Texts that must each stand once, as they are, in a file: the privacy the handle table's
+/// proofs rest on. Its entries and their rights are reached only through its methods
+/// (`framekernel/src/handles/proofs.rs`), and the doctests in `handles.rs` show it only at the
+/// crate's edge; a `pub(crate)` on a field or on `Slot` would pass them and void the proofs'
+/// premise inside the kernel (TASKS item 143, step 4, R143-S4-7).
+const PRIVATE_PINS: &[(&str, &str)] = &[
+    (
+        HANDLES,
+        "pub struct HandleTable<T> {\n    slots: Vec<Slot<T>>,\n    free: Vec<u32>,\n    limit: usize,\n    live: usize,\n}\n",
+    ),
+    (HANDLES, "\nstruct Slot<T> {\n"),
+];
+
+/// Each [`PRIVATE_PINS`] text that does not stand once in its file, as `read` gives it.
+fn private_pin_problems(read: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    PRIVATE_PINS
+        .iter()
+        .filter_map(|(file, text)| {
+            let found = read(file).map_or(0, |source| source.matches(text).count());
+            (found != 1).then(|| {
+                format!(
+                    "{file}: the handle table's fields and `Slot` must stay private to their module, as the proofs assume: expected once, found {found} times: {text:?}"
+                )
+            })
+        })
+        .collect()
 }
 
 /// `cargo xtask kani-gate`: what can be checked without Kani.
@@ -1053,6 +1470,9 @@ pub(crate) fn gate() -> Result {
             allowed,
         ));
     }
+    problems.extend(private_pin_problems(&|file| {
+        fs::read_to_string(root.join(file)).ok()
+    }));
     // The CI job installs this version and runs the proofs.
     let script = fs::read_to_string(root.join(INSTALL_SCRIPT)).unwrap_or_default();
     if !script.contains(&format!("KANI_VERSION={VERSION}\n")) {
@@ -1061,21 +1481,90 @@ pub(crate) fn gate() -> Result {
         ));
     }
     let workflow = fs::read_to_string(root.join(WORKFLOW)).unwrap_or_default();
-    if !workflow.contains("run: cargo --locked xtask kani\n") || !workflow.contains(INSTALL_SCRIPT)
-    {
-        problems.push(format!("{WORKFLOW} has no job that installs Kani with {INSTALL_SCRIPT} and runs `cargo --locked xtask kani`"));
-    }
+    problems.extend(workflow_problems(&workflow));
+    problems.extend(control_package_problems(&defined));
     if problems.is_empty() {
         println!(
-            "xtask: kani-gate: {} harnesses in {} proof files, {} controls, each harness controlled; `kani` only on the proof modules' declarations",
+            "xtask: kani-gate: {} harnesses in {} proof files, {} controls, each harness controlled and each control in its own package; CI's matrix lists the {} packages; `kani` only on the proof modules' declarations",
             names.len(),
             PROOF_FILES.len(),
-            CONTROLS.len()
+            CONTROLS.len(),
+            proof_packages().len()
         );
         Ok(())
     } else {
         Err(format!("kani-gate:\n  {}", problems.join("\n  ")))
     }
+}
+
+/// The packages of [`PROOF_FILES`], each once, in the order the list first names them: CI's
+/// jobs, one for each.
+fn proof_packages() -> Vec<&'static str> {
+    let mut packages = Vec::new();
+    for proof in PROOF_FILES {
+        if !packages.contains(&proof.package) {
+            packages.push(proof.package);
+        }
+    }
+    packages
+}
+
+/// What the CI job `kani` must hold, each once: Kani installed by [`INSTALL_SCRIPT`], a matrix
+/// that lists exactly [`proof_packages`], in that order, and the run of one package for each.
+fn workflow_problems(workflow: &str) -> Vec<String> {
+    let lines = [
+        format!("        run: bash {INSTALL_SCRIPT}\n"),
+        format!("        package: [{}]\n", proof_packages().join(", ")),
+        "      - run: cargo --locked xtask kani --package ${{ matrix.package }}\n".to_owned(),
+    ];
+    let mut problems = Vec::new();
+    for line in &lines {
+        let found = workflow.matches(line.as_str()).count();
+        if found != 1 {
+            problems.push(format!(
+                "{WORKFLOW}: the job `kani` must hold `{}` once, as PROOF_FILES gives it; found it {found} times",
+                line.trim()
+            ));
+        }
+    }
+    let runs = workflow
+        .lines()
+        .filter(|l| {
+            let l = l.trim_start().trim_start_matches("- ");
+            l.starts_with("run:") && l.contains("xtask kani")
+        })
+        .count();
+    if runs != 1 {
+        problems.push(format!(
+            "{WORKFLOW}: one step runs `xtask kani`, one package for each job; found {runs}"
+        ));
+    }
+    problems
+}
+
+/// Each control's harnesses must all be in the package of its file: a package's job runs the
+/// control on that package alone, so one that named another's harness would run it nowhere.
+fn control_package_problems(defined: &[(&'static str, String)]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for control in CONTROLS {
+        let Ok(package) = package_of(control.file) else {
+            problems.push(format!(
+                "control {}: no proof file's package holds {}",
+                control.name, control.file
+            ));
+            continue;
+        };
+        for harness in control.harnesses {
+            let of = defined.iter().find(|(_, n)| n == harness).map(|(p, _)| *p);
+            if of.is_some_and(|p| p != package) {
+                problems.push(format!(
+                    "control {}: harness {harness} is not in {package}, the package of {}",
+                    control.name, control.file
+                ));
+            }
+        }
+    }
+    problems
 }
 
 /// Problems with the proof files and their parents' declarations.
@@ -1205,6 +1694,25 @@ fn names_kani(code: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_handle_tables_privacy_is_pinned() {
+        let real = |file: &str| std::fs::read_to_string(crate::repo_root().join(file)).ok();
+        assert!(super::private_pin_problems(&real).is_empty());
+        let widened = |file: &str| {
+            real(file).map(|s| {
+                s.replace(
+                    "    slots: Vec<Slot<T>>,",
+                    "    pub(crate) slots: Vec<Slot<T>>,",
+                )
+            })
+        };
+        assert_eq!(super::private_pin_problems(&widened).len(), 1);
+        let slot_public = |file: &str| {
+            real(file).map(|s| s.replace("\nstruct Slot<T> {", "\npub(crate) struct Slot<T> {"))
+        };
+        assert_eq!(super::private_pin_problems(&slot_public).len(), 1);
+    }
+
     #[test]
     fn no_log_name_holds_a_character_the_artifact_upload_refuses() {
         let defined = super::defined(&crate::repo_root()).expect("the proof files read");
@@ -1470,5 +1978,103 @@ warning: trailing semicolon in macro used in expression position
             control_list_problems(&names, CONTROLS, &read),
             Vec::<String>::new()
         );
+    }
+
+    /// CI's jobs, one for each package, run together every harness and every control exactly
+    /// once, each control on all of its harnesses, and the whole run runs the same (the
+    /// coordinating session's ruling of 2026-11-27).
+    #[test]
+    fn the_package_jobs_run_everything_once() {
+        let all = defined(&repo_root()).unwrap();
+        let mut harnesses: Vec<&str> = Vec::new();
+        let mut controls: Vec<(&str, Vec<&str>)> = Vec::new();
+        for package in proof_packages() {
+            check_choice(&all, Choice::Package(package)).unwrap();
+            let (h, c) = selection(&all, Choice::Package(package));
+            assert!(!h.is_empty(), "{package}'s job runs a harness");
+            assert!(h.iter().all(|(p, _)| *p == package));
+            harnesses.extend(h.iter().map(|(_, n)| n.as_str()));
+            controls.extend(c.iter().map(|(control, on)| (control.name, on.clone())));
+        }
+        let mut every: Vec<&str> = all.iter().map(|(_, n)| n.as_str()).collect();
+        every.sort_unstable();
+        harnesses.sort_unstable();
+        assert_eq!(harnesses, every, "each harness in exactly one job");
+        controls.sort_unstable();
+        let mut wanted: Vec<(&str, Vec<&str>)> = CONTROLS
+            .iter()
+            .map(|c| (c.name, c.harnesses.to_vec()))
+            .collect();
+        wanted.sort_unstable();
+        assert_eq!(
+            controls, wanted,
+            "each control in exactly one job, on all its harnesses"
+        );
+        let (h, c) = selection(&all, Choice::All);
+        assert_eq!(h.len(), all.len());
+        assert_eq!(c.len(), CONTROLS.len());
+        assert!(
+            c.iter()
+                .all(|(control, on)| on.as_slice() == control.harnesses)
+        );
+    }
+
+    /// One harness takes the controls that name it, on it alone; a name or a package that is
+    /// not there is refused.
+    #[test]
+    fn a_choice_takes_what_it_names() {
+        let all = defined(&repo_root()).unwrap();
+        let name = "handles::proofs::new_is_whole";
+        let (h, c) = selection(&all, Choice::Harness(name));
+        assert_eq!(h.len(), 1);
+        assert!(!c.is_empty());
+        for (control, on) in &c {
+            assert!(control.harnesses.contains(&name));
+            assert_eq!(on.as_slice(), [name]);
+        }
+        let naming = CONTROLS
+            .iter()
+            .filter(|c| c.harnesses.contains(&name))
+            .count();
+        assert_eq!(c.len(), naming);
+        assert!(check_choice(&all, Choice::Harness("handles::proofs::nothing")).is_err());
+        assert!(check_choice(&all, Choice::Package("origin-abi")).is_err());
+        assert!(check_choice(&all, Choice::Package("framekernel")).is_ok());
+    }
+
+    /// The tree's workflow and controls pass; a matrix that leaves a package out, a second run
+    /// of the proofs, or a control on another package's harness does not.
+    #[test]
+    fn the_matrix_is_proof_files_packages() {
+        let workflow = fs::read_to_string(repo_root().join(WORKFLOW)).unwrap();
+        assert_eq!(workflow_problems(&workflow), Vec::<String>::new());
+        assert_eq!(
+            proof_packages(),
+            ["origin-frame", "onbf-format", "framekernel"]
+        );
+        let line = "        package: [origin-frame, onbf-format, framekernel]\n";
+        let short = workflow.replace(line, "        package: [origin-frame, onbf-format]\n");
+        assert_eq!(workflow_problems(&short).len(), 1);
+        let whole = workflow.replace(
+            "      - run: cargo --locked xtask kani --package ${{ matrix.package }}\n",
+            "      - run: cargo --locked xtask kani\n",
+        );
+        assert_eq!(workflow_problems(&whole).len(), 1);
+        let twice = format!("{workflow}      - run: cargo --locked xtask kani\n");
+        assert_eq!(workflow_problems(&twice).len(), 1);
+        let all = defined(&repo_root()).unwrap();
+        assert_eq!(control_package_problems(&all), Vec::<String>::new());
+        let moved: Vec<(&'static str, String)> = all
+            .iter()
+            .map(|(p, n)| {
+                let p = if n == "handles::proofs::new_is_whole" {
+                    "onbf-format"
+                } else {
+                    p
+                };
+                (p, n.clone())
+            })
+            .collect();
+        assert!(!control_package_problems(&moved).is_empty());
     }
 }
