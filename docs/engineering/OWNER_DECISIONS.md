@@ -1821,6 +1821,7 @@ On 2026-11-27 you said a friend has a desktop that could help: an MSI MAG X870E 
 - **What was found first:**
   - **Scope:** the Ryzen 9 9950X is a Zen 5 processor (family 1Ah), but the X870E platform came out in 2024. Under ADR-0009 Amendment 1 the machine is bench equipment only: no support or qualification claim rests on it.
   - **The kernel must not boot there.** Its storage proofs write to any NVMe namespace they find (`framekernel/src/storage.rs`: one block 64 from the end, and blocks from 20,000 on), and they print the controller's serial number. On the friend's disk those blocks belong to Windows. TASKS item 171 makes the proofs write only to a disk marked for Origin's tests.
+    - **Corrected 2026-11-27:** the first sentence above was wrong. TASKS item 171's session found it when it read the code, and the coordinating session confirmed it in `storage.rs` and `blockcache.rs` at `34fdf164`. Since `2045824e` (2026-11-09) the kernel writes only to the boot test's own disk. It requires exactly 32,768 blocks of 512 B, checked before it reads anything, a valid GPT naming the test disk's fixed GUID, and the test pattern. A 1 TB disk is never written. What a boot there would expose is the controller's serial number and the GPT's identifiers, and with no normal shutdown sent, an unsafe-shutdown count on the disk. Items 381 to 383 stand as answered. Item 384's entry below has the rest.
   - **Why the machine helps:** it is the first physical machine since the rentals stopped (item 354). Stage 2 can show whether ADR-0002 Amendment 7 (TASKS item 133), checked so far under QEMU only, lets the firmware's exit return on real firmware.
 - **What each item decides:**
   - **381:** the friend's consent comes first, through you. No session needs or records the friend's personal details. The machine's identifiers, in SMBIOS above all, stay off the public repository. Tables join the project's test data only with identifiers removed and with the friend's agreement.
@@ -1832,3 +1833,36 @@ On 2026-11-27 you said a friend has a desktop that could help: an MSI MAG X870E 
   - this sheet;
   - the "Decided by" column of rows A09-H6 and S72-09;
   - TASKS items 169, 170 and 171.
+
+### The mark of the partition the boot proofs may overwrite (item 384): Accepted 2026-11-27
+
+TASKS item 171 was numbered after items 381 to 383, on a finding that the kernel's storage proofs write to any NVMe disk. Its session read the code at `34fdf164` and found that wrong (see the correction under items 381 to 383). Since `2045824e` (2026-11-09) every write the boot proofs make has waited on a check that the disk is the boot test's own. That check takes its geometry, the GPT's fixed disk GUID and xtask's pattern. Three things are still missing:
+- **What a boot prints:** the controller's serial number, and on any disk the GPT's disk GUID, its partitions' unique GUIDs and their names.
+- **What permits a write:** the disk GUID, which UEFI 2.11 means to be unique to one disk.
+- **Confinement:** nothing holds a write inside a partition, and no control has compared a disk's bytes.
+
+TASKS item 171 keeps the geometry and the pattern, makes the permission a partition type, holds every write to that partition through one guard that every command passes, and stops printing those identifiers. A partition type is a new on-disk identifier that the kernel acts on, so the coordinating session put its value to you, and you answered "Accept 384".
+
+| # | Question | Answer |
+|---|---|---|
+| 384, answered | Accept `8d4070b7-7072-4d27-9689-81467d6a5735` as the provisional type GUID of the partition the boot proofs may overwrite, on test disks only, to be fixed with M9's partition-layout decision? | **Accept** |
+
+- **What it decides:**
+  - **The value.** A version-4 GUID, generated on 2026-11-27. When TASKS item 171 lands, it is recorded in xtask's `disk.rs` as `ORIGIN_PROOF_SCRATCH` and in the kernel's test-disk check, with a host test that ties the two together.
+  - **What it means.** The kernel's boot proofs may write and flush only inside a namespace's one partition of this type, and only when all of these hold:
+    - the disk has the boot test's geometry and pattern;
+    - LBA 0 is a protective MBR;
+    - both GPT copies are valid and agree;
+    - exactly one partition has this type;
+    - that partition's Required Partition attribute is clear (UEFI 2.11 §5.2.3 and §5.3, Tables 5.7 and 5.8).
+
+    Every other disk is only read.
+  - **Provisional,** like `disk.rs`'s `ORIGIN_SYSTEM` and `ORIGIN_DATA`. M9's decision on the installer's partition layout fixes the real values. No disk a release writes carries it.
+- **What does not change:**
+  - Items 381 to 383 stand.
+  - Item 383 still keeps the kernel off the friend's machine. Until TASKS item 171 lands, the identifiers a boot prints are reason enough. The kernel also sends the controller no normal shutdown (row S33-12, not started), so powering off after a boot adds one to a real SSD's unsafe-shutdown count.
+- **Performance cost** (ADR-0018 V3): one bounds check on each command the NVMe driver submits. TASKS item 171 states it with its results.
+- **Where it is written:**
+  - this sheet;
+  - the "Decided by" column of row S39-04;
+  - TASKS item 171.
