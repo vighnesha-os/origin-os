@@ -8506,7 +8506,7 @@ fn wait_for_screen(
         rows = screen::screen_text(&image).unwrap_or_default();
         let text = rows.join("\n");
         if let Some(m) = failures.iter().find(|m| text.contains(**m)) {
-            return Err(format!("the screen shows {m:?}"));
+            return Err(screen_failure(m, &rows));
         }
         if serial::contains_in_order(&text, markers) {
             return Ok(());
@@ -8516,6 +8516,16 @@ fn wait_for_screen(
         "the screen never showed the markers; it showed:\n{}",
         rows.join("\n")
     ))
+}
+
+/// [`wait_for_screen`]'s error for a failure message on the screen: the message, and every row
+/// the screen showed, so the job's log holds the screen's text even without the kept dump (TASKS
+/// item 165).
+fn screen_failure(message: &str, rows: &[String]) -> String {
+    format!(
+        "the screen shows {message:?}; it showed:\n{}",
+        rows.join("\n")
+    )
 }
 
 /// `run`: the kernel under QEMU with the developer-mode loader, interactively, on the machine
@@ -8801,7 +8811,21 @@ mod memory_figure_tests {
 
 #[cfg(test)]
 mod com1_report_tests {
-    use super::com1_last_kernel_line;
+    use super::{com1_last_kernel_line, screen_failure};
+
+    /// TASKS item 165: a failure message seen on the screen names every row the screen showed,
+    /// so the job's log holds the screen's text.
+    #[test]
+    fn a_screen_failure_names_the_screen_s_rows() {
+        let rows = [
+            "origin-kernel: page tables: failed".to_string(),
+            "origin-kernel: boot refused: kernel page tables failed".to_string(),
+        ];
+        assert_eq!(
+            screen_failure("origin-kernel: boot refused", &rows),
+            "the screen shows \"origin-kernel: boot refused\"; it showed:\norigin-kernel: page tables: failed\norigin-kernel: boot refused: kernel page tables failed"
+        );
+    }
 
     /// TASKS item 83: a failed boot names COM1's last kernel line, and why its console stayed
     /// there, when COM1 is kept in a file.
