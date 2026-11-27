@@ -6317,9 +6317,11 @@ Every harness verified with every cover satisfied, and each of the 12 controls w
 | `proofs::signature_block_any_input` | 2.8 s | 2.1 s | 0.4 GB |
 | `proofs::utf8_walk_equals_core` | 74 s | 71 s, 71 s | 3.5 GB |
 | `proofs::ocbor_any_document` | 96 s | 95 s | 6.5 GB |
-| `proofs::ocbor_validate_then_cursor_read` | 110 s | 114 s | 7.1 GB |
+| `proofs::ocbor_validate_then_cursor_read` | 110 s | 114 s | 7.10 GB; its control 7.14 GB |
 | `image::proofs::check_padding_is_exact` | 264 s | 210 s | 3.5 GB |
 
+- **P3's memory:** before its "an accepted text" cover moved into the branch that already holds the item, the harness peaked at 7.18 GB and its control at 7.66 GB (`4d9c3f05`'s tree before its last edit). The harness was under ruling 2's 7.5 GB margin and the control above it; a control is not a harness under that ruling (the coordinating session, 2026-11-27). With the cover moved, both are under: 7.10 GB and 7.14 GB.
+- **The controls caught on Kani's placeholder text:** `ocbor-argument-indexed` and `le32-indexed` are caught on "This is a placeholder message; Kani doesn't support message formatted at runtime". That is the panic of a slice index past the end (core formats its message at run time), raised by the indexing each control plants. Without the plant, the harness verifies.
 - **Added time on the Mac:** about 21 minutes for these runs, compiling included.
 - **CI:** at step 2's Mac-to-CI ratio (298 s against 281 s), CI's job would go from 77 to about 100 minutes, under ruling 4's 120. CI's run will show the figure, and the 8 GB figures, for the first time.
 
