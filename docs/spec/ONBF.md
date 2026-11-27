@@ -94,7 +94,7 @@ offset 128    Section table: section_count × 128 B
 |---|---|---|---|
 | 0 | 8 | `magic` | `89 4F 4E 42 46 0D 0A 1A` ("\x89ONBF\r\n\x1a"). Detects 7-bit stripping, CR/LF rewriting and text-mode truncation. |
 | 8 | 2 | `format_major` | `1`. Any other value: reject. |
-| 10 | 2 | `format_minor` | `0`. Higher minors only add non-REQUIRED sections or manifest keys ≥ 1000. |
+| 10 | 2 | `format_minor` | Written as `0`. A v1 reader accepts any minor under major 1 (errata C5). Because every unknown section kind is rejected (C13), a higher minor stays readable by v1 readers only if it adds nothing but manifest keys ≥ 1000. |
 | 12 | 2 | `profile` | IDs from §1 |
 | 14 | 2 | `header_size` | `128` |
 | 16 | 4 | `header_flags` | `0` (all bits reserved) |
