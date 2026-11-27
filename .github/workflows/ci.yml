@@ -208,6 +208,21 @@ jobs:
       - name: Build QEMU
         run: bash .github/ci/install-qemu.sh
       - run: cargo --locked xtask boot-matrix
+      # A failed boot's evidence (TASKS item 165): its serial log, the last screen boot-test read,
+      # the QEMU command line and the line it failed on, under target/xtask/failed-boots, one
+      # directory a boot. Only when a step failed: a job whose boots all pass uploads nothing. The
+      # job's log already shows the serial output of a failed boot; the screen and COM1's file
+      # hold the kernel's own lines. Kept 7 days; this step never decides whether the job passes.
+      - name: Keep the failed boot's evidence
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failed-boots-software-cpu
+          path: target/xtask/failed-boots
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
 
   # The same boots on a real processor through KVM. Two runner images, because that is the only
   # say a job has in which processor it gets. xtask holds every proof to its markers, except the
@@ -251,6 +266,21 @@ jobs:
           ORIGIN_QEMU_SMP: 4
           ORIGIN_BOOT_TEST_ONLY: kernel boot
         run: cargo --locked xtask boot-test
+      # A failed boot's evidence (TASKS item 165): its serial log, the last screen boot-test read,
+      # the QEMU command line and the line it failed on, under target/xtask/failed-boots, one
+      # directory a boot. Only when a step failed: a job whose boots all pass uploads nothing. The
+      # job's log already shows the serial output of a failed boot; the screen and COM1's file
+      # hold the kernel's own lines. Kept 7 days; this step never decides whether the job passes.
+      - name: Keep the failed boot's evidence
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failed-boots-${{ matrix.runner }}
+          path: target/xtask/failed-boots
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
 
   # Which vendors and models this run's real-CPU boots ran on, in one table on the run's summary
   # page, with a notice on the pull request, and how long each job's boot-matrix step took beside

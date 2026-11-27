@@ -147,7 +147,7 @@ impl Holder {
 }
 
 /// `seconds` since the Unix epoch as a UTC date and time, `YYYY-MM-DD HH:MM:SS UTC`.
-fn utc(seconds: u64) -> String {
+pub(crate) fn utc(seconds: u64) -> String {
     let (mut days, rest) = (seconds / 86_400, seconds % 86_400);
     let leap = |year: u64| {
         (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
@@ -181,7 +181,7 @@ fn utc(seconds: u64) -> String {
 }
 
 /// Seconds since the Unix epoch, now.
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

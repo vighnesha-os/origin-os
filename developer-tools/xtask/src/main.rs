@@ -13,6 +13,7 @@ mod corestubs;
 mod costs;
 mod disk;
 mod documents;
+mod evidence;
 mod expected_warning;
 mod fuzz;
 mod host_tools;
@@ -4978,7 +4979,7 @@ fn main() -> ExitCode {
                 Ok(())
             })
         }),
-        ["boot-test"] => in_turn_with_settings("boot-test", boot_test),
+        ["boot-test"] => in_turn_with_settings("boot-test", |s| boot_test(s, None)),
         ["boot-matrix"] => in_turn_with_settings("boot-matrix", boot_matrix),
         ["boot-x2apic"] => in_turn_with_settings("boot-x2apic", boot_x2apic),
         ["boot-sparse"] => in_turn_with_settings("boot-sparse", boot_sparse),
@@ -5109,7 +5110,7 @@ fn boot_machines(runs: Vec<MachineRun>) -> Result {
 /// [`boot_machines`] for one machine.
 fn boot_machine(run: &MachineRun) -> Result {
     println!("{}", run.said);
-    boot_test(&run.settings).map_err(|e| format!("{} failed: {e}", run.failed))
+    boot_test(&run.settings, Some(&run.said)).map_err(|e| format!("{} failed: {e}", run.failed))
 }
 
 /// The two IOMMUs the machines boot under, with the names `boot-matrix` prints for them.
@@ -5758,7 +5759,7 @@ fn boot_console(settings: &Settings) -> Result {
         .collect();
     let chosen = select_scenarios(&scenarios, &settings.only)?;
     for (scenario, kernel) in &chosen {
-        run_scenario(scenario, kernel, settings)?;
+        run_scenario(scenario, kernel, settings, None)?;
     }
     println!(
         "xtask: boot-console passed ({} of {} scenarios: the UART the SPCR names, one moved to with a replay, COM1 named, refused tables, a UART that takes no bytes, one that stops taking them, no display, no UART)",
@@ -5793,7 +5794,7 @@ fn boot_disk(base: &Settings) -> Result {
     .collect();
     let chosen = select_scenarios(&scenarios, &settings.only)?;
     for (scenario, kernel) in &chosen {
-        run_scenario(scenario, kernel, &settings)?;
+        run_scenario(scenario, kernel, &settings, None)?;
     }
     println!(
         "xtask: boot-disk passed ({} of {} scenarios on the Intel VT-d machine with 2 processors: a disk without the mark, untouched byte for byte; a marked partition too small for processor 1's write, which the guard refused and nothing outside it changed)",
@@ -8356,13 +8357,14 @@ fn boot_test_scenarios(unsigned: &Path, settings: &Settings) -> Result<Vec<(Scen
 
 /// `boot-test` on the machine `settings` describe: every scenario, or those its filter names.
 /// `boot-matrix` and its scenario commands call it in process for each of their machines (TASKS
-/// item 61).
-fn boot_test(settings: &Settings) -> Result {
+/// item 61), with the line they said before the machine (`machine_line`), which a failed boot's
+/// evidence names (TASKS item 165).
+fn boot_test(settings: &Settings, machine_line: Option<&str>) -> Result {
     let krn_path = pack_kernel(&build_kernel()?)?;
     let scenarios = boot_test_scenarios(&krn_path, settings)?;
     let chosen = select_scenarios(&scenarios, &settings.only)?;
     for (scenario, kernel) in &chosen {
-        run_scenario(scenario, kernel, settings)?;
+        run_scenario(scenario, kernel, settings, machine_line)?;
     }
     println!(
         "xtask: boot-test passed ({} of {} scenarios)",
@@ -8441,8 +8443,14 @@ fn scenario_log(scenario: &Scenario) -> PathBuf {
 }
 
 /// Boots `kernel` once on the machine `settings` describe and checks its output against
-/// `scenario`.
-fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Result {
+/// `scenario`. A boot that fails keeps its evidence ([`keep_failed_boot`]); `machine_line` is
+/// the line said before the machine, if one was.
+fn run_scenario(
+    scenario: &Scenario,
+    kernel: &[u8],
+    settings: &Settings,
+    machine_line: Option<&str>,
+) -> Result {
     let staged = stage(kernel, scenario.loader, settings)?;
     let timeout = settings.boot_timeout();
     let accel = settings.accel;
@@ -8453,6 +8461,9 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
     }
     let com1_log = work.join("com1.log");
     let _ = fs::remove_file(&com1_log);
+    // A dump an earlier boot left is never taken for this one's (TASKS item 165).
+    let screen_path = work.join("screen.ppm");
+    let _ = fs::remove_file(&screen_path);
     match scenario.capture {
         Capture::Com1 => {
             cmd.args(["-serial", "stdio", "-monitor", "none"]);
@@ -8486,6 +8497,12 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
         scenario.label,
         timeout.as_secs()
     );
+    // What a failed boot's evidence names (TASKS item 165).
+    let command_line: Vec<String> = std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let started_utc = turns::utc(turns::now());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start {QEMU}: {e}"))?;
@@ -8512,7 +8529,6 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
     let started = Instant::now();
     let deadline = started + timeout;
     let mut raw = Vec::new();
-    let screen_path = work.join("screen.ppm");
     // Whether QEMU closed its output: it exited by itself (TASKS item 116).
     let mut closed = false;
     // When the last byte came, and when QEMU's output closed (TASKS item 121): a scenario tells
@@ -8749,6 +8765,45 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
         }
         Err(e) => {
             eprintln!("--- serial output ---\n{text}\n--- {QEMU} stderr ---\n{qemu_stderr}");
+            // What QEMU wrote to its stdout and nobody read: for a boot with no UART, all the
+            // monitor said. QEMU has been stopped, so the reader ends once it has passed it on.
+            let mut unread = Vec::new();
+            while scenario.capture == Capture::Screen
+                && let Ok(chunk) = rx.recv_timeout(Duration::from_millis(500))
+            {
+                unread.extend_from_slice(&chunk);
+            }
+            keep_failed_boot(evidence::FailedBoot {
+                label: scenario.label,
+                command: env::args()
+                    .skip(1)
+                    .fold("cargo xtask".to_string(), |s, arg| s + " " + &arg),
+                machine: machine_line,
+                settings: format!("{settings:#?}"),
+                loader: format!("{:?}", scenario.loader),
+                capture: format!("{:?}", scenario.capture),
+                judged_on_screen: scenario.capture == Capture::Screen,
+                dumps_screen: monitored,
+                started: started_utc,
+                took: elapsed,
+                timeout,
+                qemu_exit: format!("{exit:?}"),
+                exited,
+                verdict: &e,
+                markers: &scenario.markers,
+                failures: &scenario.failures,
+                revision: evidence::Revision::of(&repo_root()),
+                qemu_command: command_line,
+                qemu_stderr: &qemu_stderr,
+                logs: failed_boot_logs(
+                    scenario.capture,
+                    &text,
+                    &unread,
+                    done.com1.as_deref(),
+                    settings,
+                ),
+                screen: fs::read(&screen_path).ok(),
+            });
             Err(format!(
                 "boot-test ({}) failed: {e} (QEMU: {exit:?}){}; serial log: {}{}",
                 scenario.label,
@@ -8762,6 +8817,51 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
             ))
         }
     }
+}
+
+/// Keeps a failed boot's evidence under `target/xtask/failed-boots` ([`evidence::keep`]) and says
+/// where, or why it was not kept. Nothing here changes the boot's verdict.
+fn keep_failed_boot(boot: evidence::FailedBoot) {
+    let folder = target_dir().join("xtask").join(evidence::FOLDER);
+    match evidence::keep(&folder, &boot, &evidence::Prefixes::here()) {
+        Ok(dir) => eprintln!(
+            "xtask: {}: this failed boot's evidence is in {}",
+            boot.label,
+            dir.display()
+        ),
+        Err(e) => eprintln!("xtask: {}: its evidence was not kept: {e}", boot.label),
+    }
+}
+
+/// A failed boot's logs, by what its capture wrote, the one its markers were judged in first:
+/// the serial log as judged (`text`), the SPCR UART's with COM1's file, or, for a boot with no
+/// UART, the monitor's output, which nothing reads while the screen is watched (`unread`); and
+/// QEMU's own log where the person asked for it ([`Settings::debug`]).
+fn failed_boot_logs(
+    capture: Capture,
+    text: &str,
+    unread: &[u8],
+    com1: Option<&str>,
+    settings: &Settings,
+) -> Vec<(&'static str, String)> {
+    let mut logs = vec![match capture {
+        Capture::Com1 | Capture::Com1AndScreen => ("serial.log", text.to_string()),
+        Capture::SpcrUart => ("spcr-uart.log", text.to_string()),
+        // `text` is empty: nothing reads stdout while the screen is watched.
+        Capture::Screen => ("monitor.log", evidence::as_a_terminal_shows(unread)),
+    }];
+    if let Some(com1) = com1 {
+        logs.push(("com1.log", com1.to_string()));
+    }
+    if settings.debug
+        && let Ok(bytes) = fs::read(target_dir().join("xtask").join("qemu-debug.log"))
+    {
+        logs.push((
+            "qemu-debug.log",
+            String::from_utf8_lossy(&bytes).into_owned(),
+        ));
+    }
+    logs
 }
 
 /// Asks QEMU's monitor for a screen dump and reads it. `switch`: the monitor shares stdio
@@ -8814,7 +8914,7 @@ fn wait_for_screen(
         rows = screen::screen_text(&image).unwrap_or_default();
         let text = rows.join("\n");
         if let Some(m) = failures.iter().find(|m| text.contains(**m)) {
-            return Err(format!("the screen shows {m:?}"));
+            return Err(screen_failure(m, &rows));
         }
         if serial::contains_in_order(&text, markers) {
             return Ok(());
@@ -8824,6 +8924,16 @@ fn wait_for_screen(
         "the screen never showed the markers; it showed:\n{}",
         rows.join("\n")
     ))
+}
+
+/// [`wait_for_screen`]'s error for a failure message on the screen: the message, and every row
+/// the screen showed, so the job's log holds the screen's text even without the kept dump (TASKS
+/// item 165).
+fn screen_failure(message: &str, rows: &[String]) -> String {
+    format!(
+        "the screen shows {message:?}; it showed:\n{}",
+        rows.join("\n")
+    )
 }
 
 /// `run`: the kernel under QEMU with the developer-mode loader, interactively, on the machine
@@ -9213,7 +9323,53 @@ mod memory_figure_tests {
 
 #[cfg(test)]
 mod com1_report_tests {
-    use super::com1_last_kernel_line;
+    use super::{Capture, Settings, com1_last_kernel_line, failed_boot_logs, screen_failure};
+
+    /// TASKS item 165: a boot with no UART keeps what its monitor said, which nothing read while
+    /// the screen was watched; a serial capture keeps the log as judged.
+    #[test]
+    fn a_failed_boot_keeps_the_log_its_capture_wrote() {
+        let settings = Settings::default();
+        let unread = b"(qemu) sc\x1b[K\x1b[D\x1b[Dscreendump \"/x/screen.ppm\"\x1b[K\r\n";
+        assert_eq!(
+            failed_boot_logs(Capture::Screen, "", unread, None, &settings),
+            [(
+                "monitor.log",
+                "(qemu) screendump \"/x/screen.ppm\"\n".to_string()
+            )]
+        );
+        assert_eq!(
+            failed_boot_logs(
+                Capture::Com1AndScreen,
+                "origin-kernel: a\n",
+                unread,
+                None,
+                &settings
+            ),
+            [("serial.log", "origin-kernel: a\n".to_string())]
+        );
+        assert_eq!(
+            failed_boot_logs(Capture::SpcrUart, "u\n", b"", Some("c\n"), &settings),
+            [
+                ("spcr-uart.log", "u\n".to_string()),
+                ("com1.log", "c\n".to_string())
+            ]
+        );
+    }
+
+    /// TASKS item 165: a failure message seen on the screen names every row the screen showed,
+    /// so the job's log holds the screen's text.
+    #[test]
+    fn a_screen_failure_names_the_screen_s_rows() {
+        let rows = [
+            "origin-kernel: page tables: failed".to_string(),
+            "origin-kernel: boot refused: kernel page tables failed".to_string(),
+        ];
+        assert_eq!(
+            screen_failure("origin-kernel: boot refused", &rows),
+            "the screen shows \"origin-kernel: boot refused\"; it showed:\norigin-kernel: page tables: failed\norigin-kernel: boot refused: kernel page tables failed"
+        );
+    }
 
     /// TASKS item 83: a failed boot names COM1's last kernel line, and why its console stayed
     /// there, when COM1 is kept in a file.

@@ -291,7 +291,7 @@ pub(crate) fn check_frame(image: &Image, text: &str) -> Result {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use framekernel::fbconsole::{self, Cursor, PixelSink, Screen};
     use origin_boot_info::Framebuffer;
@@ -362,6 +362,12 @@ mod tests {
 
     fn from_text(text: &str) -> Image {
         image(W, H, text)
+    }
+
+    /// The dump QEMU would write of a 1280 by 800 display after the console has drawn `text`,
+    /// for the evidence's tests (TASKS item 165).
+    pub(crate) fn console_ppm(text: &str) -> Vec<u8> {
+        ppm(W, H, &drawn(W, H, text))
     }
 
     /// Whatever the kernel draws and what the model says must be the same picture, on a

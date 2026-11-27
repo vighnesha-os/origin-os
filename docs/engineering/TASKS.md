@@ -764,9 +764,45 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 164. **ONBF's second parser, written independently (ONBF §13 item 6; CLAUDE.md §73 and §1). Numbered by the coordinating session on 2026-11-27; not started.**
     - **What:** a second parser of ONBF images, written from `docs/spec/ONBF.md` and its errata by a different session that does not read `onbf-format`, host-only, which must agree with the first on the whole corpus (the fuzz seeds, the malicious corpus and the images the build makes). A disagreement is a specification bug, settled in the errata.
     - **Why now:** ONBF v1.0 becomes final only after §13's tests pass, and item 6 had no TASKS item.
-165. **A failed boot in CI leaves its evidence (CLAUDE.md §1, role 26; §69). Numbered by the coordinating session on 2026-11-27; not started.**
+165. **A failed boot in CI leaves its evidence (CLAUDE.md §1, role 26; §69). Numbered by the coordinating session on 2026-11-27; built the same day on `claude/t165-boot-evidence-d5f6cc`, to the contract the coordinating session ruled on (Q1 to Q8); not landed.**
     - **Why:** on 2026-11-27 PR 79's real-CPU job failed one boot, "console: no UART at all", with "origin-kernel: boot refused" on the screen (run 45927890180). That boot has no serial port, and the job kept neither the screen nor the logs, so its cause cannot be read. Its rerun passed.
     - **What:** every boot job keeps, when a boot fails, that boot's serial log and the last screen capture `boot-test` read, as an artifact of the job.
+    - **Why that run kept nothing:** two things lost it.
+      - The next step's kernel boot wrote over `target/xtask/screen.ppm`.
+      - `wait_for_screen`'s error named the failure message but none of the screen's rows.
+    - **Built (`580e15ea`, `53bbb8e0`, `1cf28b1c`, `796c7f69`): a failed boot keeps its evidence.** Every boot goes through `run_scenario`. When one fails, `evidence.rs` writes `target/xtask/failed-boots/NN-<label>/`, numbered after the directories already there, with at most 16 kept. It holds:
+      - `boot.txt`: the scenario, the command, `boot-matrix`'s machine line, the start in UTC, the revision with the tree only "clean" or "not clean", the verdict, the first missing marker, the settings, the QEMU command line and QEMU's stderr;
+      - the log the markers were judged in: `serial.log`, or `spcr-uart.log` with `com1.log`, or for a boot with no UART `monitor.log`, drawn as a terminal shows it;
+      - the last screen dump `boot-test` read in that boot, as `screen.ppm`, and its rows as `screen.txt`.
+    - **The limits and the host paths:**
+      - Host paths become `<target>`, `<repo>` and `~` in every file.
+      - A text over 8 MiB keeps its first 1 MiB and its last 7 MiB.
+      - A dump over 16 MiB is left out.
+      - A screen failure's error now names the screen's rows, so the job's log holds them too.
+    - **Built (`1ebcbaba`, `c62fb26f`): the CI side.** `ci.yml`'s three boot jobs and `processor-sweep.yml`'s sweep upload the folder only when a step failed (`if: failure()`), for 7 days, with the pinned `upload-artifact`.
+    - **Shown on the development Mac (QEMU 11.1.3, TCG):** three planted failing boots in a scratch clone of `796c7f69`, run in order in one turn:
+      - **C1:** the boot with no UART fails on a line its screen shows. It left `boot.txt`, `monitor.log`, `screen.ppm` and `screen.txt`.
+      - **C2:** the kernel boot fails on an early loader line. It left `boot.txt` and `serial.log`, and no dump, though C1 had left one.
+      - **C3:** the SPCR scenario waits for a marker no boot prints. It left `boot.txt`, `spcr-uart.log` and `com1.log`.
+
+      The directories were numbered 01 to 03, and no kept file names a host path. The 3,072,016-byte dump is 51,246 bytes under gzip -6.
+    - **Gates on `40e46ef0` (the code as at `796c7f69`), in one turn of the machine, the tree clean before and after; each run started with no `failed-boots` folder and left none:**
+      - `cargo xtask check`: passed in 1,139 s, with 2,911 tests passed, 0 failed and 32 ignored, 96 Loom models passed and 148 controls caught, and every gate passed;
+      - `cargo xtask boot-test`: 11 of 11 scenarios passed in 68 s;
+      - `cargo xtask boot-matrix`: passed in 2,066 s.
+    - **What the controls found, fixed in the same branch:**
+      - `monitor.log` was empty: nothing read QEMU's stdout while the screen was watched (`1cf28b1c`).
+      - Then it was 226,127 bytes of QEMU's redrawn command line, whose partial host paths no replacement could catch (`796c7f69`).
+    - **CI's failing side, shown in run 45985725312** ("TASKS 165 CI control", finished at about 11:09 UTC on 2026-11-27).
+      - **The run:** the owner said "Yes, push it", and the coordinating session pushed `ci-control/t165` at `35f466ef` (ruling Q7). It is one commit on `7d5d320c`: `ci.yml` trimmed to the three boot jobs, starting only on a push to that branch, with C1 planted. The coordinating session read the job logs and the artifact list, and downloaded nothing.
+      - **The failure:** all three jobs failed at the planted boot with `the screen shows "origin-kernel: sysfs: built /sys"; it showed:` and the screen's rows. Each job's log named `target/xtask/failed-boots/01-console--no-UART-at-all`.
+      - **The uploads:** each job's "Keep the failed boot's evidence" step succeeded and uploaded 4 files:
+        - `failed-boots-software-cpu`, 54,939 bytes (job 140460719288);
+        - `failed-boots-ubuntu-26.04`, 53,850 bytes (job 140460719849);
+        - `failed-boots-ubuntu-24.04`, 53,858 bytes (job 140460719873).
+      - **After it:** on both real-CPU jobs the host boot, "The processor as it is, nothing masked", passed (`boot-test passed (1 of 11 scenarios)`).
+      - **What stays:** the artifacts expire after 7 days, and the run's logs stay. At the owner's word ("Yes, delete it"), the branch `ci-control/t165` was deleted on GitHub and locally on 2026-11-27, at `35f466ef`; the run and its logs remain.
+      - **The passing side** shows on a green run of the real workflow: its upload steps are skipped, and it lists no `failed-boots-*` artifact.
 166. **The `compile_fail` doctests' controls run by `cargo xtask` (TASKS item 143, step 4). Numbered by the coordinating session on 2026-11-27; not started.**
     - **What:** each doctest that must fail to compile has a control, the same code made to compile, which must then fail the doctest. Step 4 ran them by hand; `cargo xtask` runs them, as `kani.rs` runs Kani's controls, in a scratch copy, and fails if one is not caught.
 167. **The kernel's transfer of handles and its grant, reachable by Kani (ADR-0005 P2; TASKS item 143's ruling on step 4). Numbered by the coordinating session on 2026-11-27; not started.**
@@ -782,9 +818,18 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 170. **A read-only survey from a USB stick (owner items 381 and 383). Numbered by the coordinating session on 2026-11-27; not started; after item 169's results.**
     - **What:** a UEFI program of Origin's own that, before `ExitBootServices`, writes to the stick it booted from: every CPUID leaf, the firmware's memory map, every table the XSDT names, SMBIOS, each PCIe function's configuration space read through ECAM, the display modes, and Secure Boot's state. Then the bench loader (ADR-0002 Amendments 3 to 7) tries the firmware's exit, and its result is shown on the screen.
     - **It writes nothing** but its report on the stick: no NVMe or other disk, no firmware variable, no boot entry. The kernel is not on the stick.
-171. **Storage proofs write only to a disk marked for Origin's tests (CLAUDE.md §2 P0; owner item 381's finding). Numbered by the coordinating session on 2026-11-27; not started.**
-    - **Why:** the kernel's storage proofs write to any NVMe namespace they find, so a boot on a machine with a real disk would overwrite its owner's data, and they print the controller's serial number.
-    - **What:** the proofs write only to a namespace that carries a mark of Origin's tests (for example a GPT partition with a type GUID of the project's own), and otherwise read only and say so; the serial number is not printed. QEMU's test disks carry the mark, so CI's proofs still write. A control boots a disk without the mark and shows that nothing is written.
+171. **Storage proofs write only inside a partition marked for Origin's tests, and print no disk's identifiers (CLAUDE.md §2 P0, §61; owner items 381 and 384). Numbered by the coordinating session on 2026-11-27; contract ruled the same day; being built.**
+    - **Why:**
+      - **What a boot prints:** the NVMe controller's serial number, and on any disk the GPT's disk GUID, its partitions' unique GUIDs and their names. Each of these identifies the owner's hardware.
+      - **What permits a write:** the boot proofs write only to the boot test's own disk, as they have since `2045824e` (2026-11-09): its geometry, the GPT's fixed disk GUID and xtask's pattern. But the disk GUID that permits it is meant to be unique to one disk.
+      - **Confinement:** nothing holds a write inside a partition, and no control has compared a disk's bytes.
+      - *Corrected 2026-11-27:* this line first said the proofs write to any NVMe namespace they find. That was wrong (item 384's entry).
+    - **What:**
+      - **Where writes go:** the proofs write and flush only inside the one partition whose type is item 384's mark. The disk must also have the boot test's geometry and pattern, a protective MBR and two agreeing GPT copies. Every other disk is only read, and the proofs say so.
+      - **The guard:** one guard that every command passes refuses any write outside the partition and any opcode the driver does not send.
+      - **What is printed:** not the serial number, and on a disk without the mark, not the GPT's identifiers.
+      - **CI:** QEMU's test disks carry the mark, so CI's proofs still write.
+      - **Controls:** standing controls boot a disk without the mark and one whose marked partition is too small, and compare the disk's bytes before and after. Every kernel boot also checks its disk's bytes.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:

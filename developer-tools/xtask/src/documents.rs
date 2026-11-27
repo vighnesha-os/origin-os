@@ -273,7 +273,7 @@ fn head_of(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 /// `git` in `root`, with `args`: its output if it ran and succeeded.
-fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+pub(crate) fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
     Command::new("git")
         .arg("-C")
         .arg(root)
