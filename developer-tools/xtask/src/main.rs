@@ -8371,6 +8371,14 @@ fn run_scenario(
         }
         Err(e) => {
             eprintln!("--- serial output ---\n{text}\n--- {QEMU} stderr ---\n{qemu_stderr}");
+            // What QEMU wrote to its stdout and nobody read: for a boot with no UART, all the
+            // monitor said. QEMU has been stopped, so the reader ends once it has passed it on.
+            let mut unread = Vec::new();
+            while scenario.capture == Capture::Screen
+                && let Ok(chunk) = rx.recv_timeout(Duration::from_millis(500))
+            {
+                unread.extend_from_slice(&chunk);
+            }
             keep_failed_boot(evidence::FailedBoot {
                 label: scenario.label,
                 command: env::args()
@@ -8393,7 +8401,13 @@ fn run_scenario(
                 revision: evidence::Revision::of(&repo_root()),
                 qemu_command: command_line,
                 qemu_stderr: &qemu_stderr,
-                logs: failed_boot_logs(scenario.capture, &text, done.com1.as_deref(), settings),
+                logs: failed_boot_logs(
+                    scenario.capture,
+                    &text,
+                    &unread,
+                    done.com1.as_deref(),
+                    settings,
+                ),
                 screen: fs::read(&screen_path).ok(),
             });
             Err(format!(
@@ -8426,22 +8440,21 @@ fn keep_failed_boot(boot: evidence::FailedBoot) {
 }
 
 /// A failed boot's logs, by what its capture wrote, the one its markers were judged in first:
-/// the serial log, the SPCR UART's with COM1's file, or the monitor's output for a boot with no
-/// UART; and QEMU's own log where the person asked for it ([`Settings::debug`]).
+/// the serial log as judged (`text`), the SPCR UART's with COM1's file, or, for a boot with no
+/// UART, the monitor's output, which nothing reads while the screen is watched (`unread`); and
+/// QEMU's own log where the person asked for it ([`Settings::debug`]).
 fn failed_boot_logs(
     capture: Capture,
     text: &str,
+    unread: &[u8],
     com1: Option<&str>,
     settings: &Settings,
 ) -> Vec<(&'static str, String)> {
-    let mut logs = vec![(
-        match capture {
-            Capture::Com1 | Capture::Com1AndScreen => "serial.log",
-            Capture::SpcrUart => "spcr-uart.log",
-            Capture::Screen => "monitor.log",
-        },
-        text.to_string(),
-    )];
+    let mut logs = vec![match capture {
+        Capture::Com1 | Capture::Com1AndScreen => ("serial.log", text.to_string()),
+        Capture::SpcrUart => ("spcr-uart.log", text.to_string()),
+        Capture::Screen => ("monitor.log", text.to_string() + &serial::clean(unread)),
+    }];
     if let Some(com1) = com1 {
         logs.push(("com1.log", com1.to_string()));
     }
@@ -8811,7 +8824,39 @@ mod memory_figure_tests {
 
 #[cfg(test)]
 mod com1_report_tests {
-    use super::{com1_last_kernel_line, screen_failure};
+    use super::{Capture, Settings, com1_last_kernel_line, failed_boot_logs, screen_failure};
+
+    /// TASKS item 165: a boot with no UART keeps what its monitor said, which nothing read while
+    /// the screen was watched; a serial capture keeps the log as judged.
+    #[test]
+    fn a_failed_boot_keeps_the_log_its_capture_wrote() {
+        let settings = Settings::default();
+        let unread = b"(qemu) \x1b[Kscreendump \"/x/screen.ppm\"\r\n";
+        assert_eq!(
+            failed_boot_logs(Capture::Screen, "", unread, None, &settings),
+            [(
+                "monitor.log",
+                "(qemu) screendump \"/x/screen.ppm\"\n".to_string()
+            )]
+        );
+        assert_eq!(
+            failed_boot_logs(
+                Capture::Com1AndScreen,
+                "origin-kernel: a\n",
+                unread,
+                None,
+                &settings
+            ),
+            [("serial.log", "origin-kernel: a\n".to_string())]
+        );
+        assert_eq!(
+            failed_boot_logs(Capture::SpcrUart, "u\n", b"", Some("c\n"), &settings),
+            [
+                ("spcr-uart.log", "u\n".to_string()),
+                ("com1.log", "c\n".to_string())
+            ]
+        );
+    }
 
     /// TASKS item 165: a failure message seen on the screen names every row the screen showed,
     /// so the job's log holds the screen's text.
