@@ -389,6 +389,14 @@ const CONTROLS: &[Control] = &[
         expect: &["§4.2: 1 to 256 sections"],
     },
     Control {
+        name: "header-arch-unchecked",
+        file: HEADER,
+        from: "        if arch != ARCH_X86_64 {\n",
+        to: "        if false {\n",
+        harnesses: &["proofs::header_parse_any_bytes"],
+        expect: &["§4.2: arch 1, x86-64"],
+    },
+    Control {
         name: "stored-size-unlimited",
         file: SECTION,
         from: "        if stored_size > MAX_SECTION_CONTENT || content_size > MAX_SECTION_CONTENT {\n",
@@ -445,6 +453,15 @@ const CONTROLS: &[Control] = &[
         to: "            0xF4 => (4, 0x80, 0xBF),\n",
         harnesses: &["proofs::utf8_walk_equals_core"],
         expect: &["the walk refuses where core does, at the same offset"],
+    },
+    // The walk made to refuse what core accepts: 0xBF as the second byte after 0xF1 to 0xF3.
+    Control {
+        name: "utf8-walk-refuses-what-core-accepts",
+        file: ONBF_PROOFS,
+        from: "            0xF1..=0xF3 => (4, 0x80, 0xBF),\n",
+        to: "            0xF1..=0xF3 => (4, 0x80, 0xBE),\n",
+        harnesses: &["proofs::utf8_walk_equals_core"],
+        expect: &["the walk accepts what core accepts"],
     },
     Control {
         name: "le32-indexed",
@@ -741,6 +758,12 @@ fn peak_memory(output: &str) -> Option<u64> {
     })
 }
 
+/// The file a harness's run is logged to: its name with `::` made `/`, since CI's artifact
+/// upload refuses a path holding `"`, `:`, `<`, `>`, `|`, `*`, `?`, CR or LF.
+fn log_name(harness: &str) -> String {
+    format!("{}.log", harness.replace("::", "/"))
+}
+
 /// `output`'s peak memory, as a run's line shows it.
 fn memory_shown(output: &str) -> String {
     match peak_memory(output) {
@@ -863,7 +886,7 @@ pub(crate) fn run(only: Option<&str>) -> Result {
     let mut problems = Vec::new();
     // One `cargo kani` for each harness, so that each run's peak memory is that harness's (CI
     // records it; the coordinating session's ruling of 2026-11-27 on Q4's 8 GB).
-    let mut runs = 0;
+    let mut reported = Vec::new();
     for package in packages {
         let names: Vec<&str> = chosen
             .iter()
@@ -871,14 +894,7 @@ pub(crate) fn run(only: Option<&str>) -> Result {
             .map(|(_, n)| n.as_str())
             .collect();
         for name in &names {
-            let output = cargo_kani(
-                &root,
-                None,
-                package,
-                &[name],
-                &logs.join(format!("{name}.log")),
-            )?;
-            runs += 1;
+            let output = cargo_kani(&root, None, package, &[name], &logs.join(log_name(name)))?;
             problems.extend(proof_warnings(&output));
             let report = parse_report(&output);
             match report.iter().find(|(n, _)| n == name) {
@@ -888,19 +904,26 @@ pub(crate) fn run(only: Option<&str>) -> Result {
                 }
                 None => problems.push(format!("{name}: Kani did not report it")),
             }
-            for (reported, _) in &report {
-                if reported != name {
+            for (other, _) in &report {
+                if other != name {
                     problems.push(format!(
-                        "{reported}: reported in {name}'s run, which asked for {name} alone"
+                        "{other}: reported in {name}'s run, which asked for {name} alone"
                     ));
                 }
             }
+            reported.extend(report.into_iter().map(|(n, _)| n));
         }
     }
-    if runs != chosen.len() {
+    // Each harness once: what Kani reported, across all the runs, is the harnesses chosen.
+    let mut once: Vec<&str> = reported.iter().map(String::as_str).collect();
+    once.sort_unstable();
+    let mut wanted: Vec<&str> = chosen.iter().map(|(_, n)| n.as_str()).collect();
+    wanted.sort_unstable();
+    if once != wanted {
         problems.push(format!(
-            "{runs} runs for {} harnesses: each harness runs once",
-            chosen.len()
+            "Kani reported {} harness results for {} harnesses: each harness runs once",
+            once.len(),
+            wanted.len()
         ));
     }
     if !problems.is_empty() {
@@ -932,9 +955,9 @@ fn controls(root: &Path, only: Option<&str>) -> Result {
         if harnesses.is_empty() {
             continue;
         }
+        let package = package_of(control.file)?;
         populate(root, &scratch)?;
         apply(control, &scratch)?;
-        let package = package_of(control.file)?;
         let output = cargo_kani(
             &scratch,
             Some(&target),
@@ -1110,6 +1133,19 @@ fn control_list_problems(
                 control.name
             ));
         }
+        // A control's file is a path inside the tree, so that applying it to the scratch copy
+        // can never write outside that copy.
+        let path = Path::new(control.file);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            problems.push(format!(
+                "control {}: {} is not a plain path inside the tree",
+                control.name, control.file
+            ));
+        }
         match read(control.file) {
             None => problems.push(format!(
                 "control {}: cannot read {}",
@@ -1169,6 +1205,23 @@ fn names_kani(code: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_log_name_holds_a_character_the_artifact_upload_refuses() {
+        let defined = super::defined(&crate::repo_root()).expect("the proof files read");
+        assert!(!defined.is_empty());
+        for (_, name) in &defined {
+            let log = super::log_name(name);
+            assert!(
+                !log.contains(['"', ':', '<', '>', '|', '*', '?', '\r', '\n']),
+                "{log}"
+            );
+        }
+        assert_eq!(
+            super::log_name("image::proofs::check_padding_is_exact"),
+            "image/proofs/check_padding_is_exact.log"
+        );
+    }
+
     #[test]
     fn peak_memory_reads_gnu_and_bsd_time() {
         let gnu = "\tCommand being timed: \"cargo kani\"\n\tMaximum resident set size (kbytes): 6281920\n";

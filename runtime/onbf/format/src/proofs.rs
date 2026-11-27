@@ -8,34 +8,40 @@
 //! finds no panic, no index, slice or `get` out of bounds, no arithmetic overflow, no division
 //! by zero, and no loop past its unwinding bound (the unwinding assertions are on). The crate
 //! is safe Rust under `forbid(unsafe_code)`, so a read out of bounds would be a panic: P1
-//! covers "never reads out of bounds" (ONBF §13 item 5). The loader builds this crate with
-//! overflow checks on in release (CLAUDE.md §14), so an overflow P1 rules out would be a
-//! loader panic.
+//! covers "never reads out of bounds" (ONBF §13 item 5). Release builds of the loader do not
+//! check overflow today: `[profile.release]` sets no `overflow-checks`, and CLAUDE.md §14's
+//! rule that they do lands with TASKS item 22's second half, not started. So an overflow in
+//! these functions would wrap silently in today's loader, not stop it, and P1's absence of
+//! overflow within the bounds is worth more for it: none would wrap either.
 //!
 //! | Function | Harness | Bound | Also proved |
 //! |---|---|---|---|
-//! | `Header::parse` | [`header_parse_any_bytes`] | every input of up to 128 bytes | P2: §4.2's rules, read from the raw bytes |
+//! | `Header::parse` | [`header_parse_any_bytes`] | every input of up to 128 bytes | P2: §4.2's rules, read from the raw bytes, and the fields it returns are those bytes |
 //! | `SectionEntry::parse` | [`section_entry_parse_any_entry`] | every 128-byte entry, every profile, nested or not | P2: §4.3's flags and reserved fields, Appendix A's 1 TiB |
 //! | `merkle_hash_blocks` | [`merkle_hash_blocks_any_size`] | every `u64` | |
 //! | `align_up` | [`align_up_any_value`] | every value, every alignment | the next multiple, for every power of two |
 //! | `slice` | [`slice_any_range`] | every input of up to 16 bytes, every range | `Some` exactly for a range inside |
-//! | `ocbor::validate`, `Cursor::next_item`, `Cursor::skip_contents` | [`ocbor_any_document`] | every input of up to 6 bytes | |
+//! | `ocbor::validate`, then `Cursor::next_item` and `skip_contents` of that item | [`ocbor_any_document`] | every input of up to 6 bytes | |
 //! | the same | [`ocbor_validate_then_cursor_read`] | every input of up to 4 bytes | P3: an accepted document reads as one item that ends at its end |
-//! | `SignatureBlock::parse` | [`signature_block_any_input`] | every input of up to 19 bytes: its 16-byte header and the first entry's size; every input is refused | |
+//! | `SignatureBlock::parse` | [`signature_block_any_input`] | every input of up to 19 bytes: its 16-byte header and fewer than the first entry's 4 size bytes, so every input is refused | |
 //!
 //! **Core's UTF-8 check, stood in for.** `core::str::from_utf8` checks with a word-at-a-time
-//! walk whose shape depends on the text's address, and every harness that reached it ran past
-//! 300 s. Its private `run_utf8_validation` is stubbed; `from_utf8` itself still turns `Ok`
-//! into the `&str`, so no harness needs `unsafe`.
+//! walk whose shape depends on the text's address, and every parser harness that reached it
+//! ran past 300 s. Its private `run_utf8_validation` is stubbed; `from_utf8` itself still
+//! turns `Ok` into the `&str`, so no harness needs `unsafe`.
 //! - [`any_utf8_result`] (P1's harnesses) returns `Ok` or an error freely, for any text. It
 //!   can only add behaviours, so P1 under it holds of core's check too. That rests on one
 //!   fact of the code: the crate's only UTF-8 call, `ocbor.rs:164`,
 //!   `core::str::from_utf8(body).map_err(|_| err(K::InvalidUtf8))`, reads nothing of the error.
+//!   The harnesses cover a text that reads and a text that is refused, so both of its results
+//!   are explored.
 //! - [`validation_by_walk`] (P3's harness, which needs the same answer for the same bytes
 //!   twice) is [`utf8_walk`], written from RFC 3629 §4's grammar, which
 //!   [`utf8_walk_equals_core`] proves equal to core's `from_utf8` on every text of up to 8
-//!   bytes (the same texts accepted, and an error's `valid_up_to` the walk's offset). The
-//!   stand-in asserts that each text it is given is within that bound.
+//!   bytes, at each offset from 0 to 4 into its array (core's walk depends on the address):
+//!   the same texts accepted, and an error's `valid_up_to` the walk's offset. The stand-in
+//!   asserts that each text it is given is within that length; P3's texts lie at offsets 1 to
+//!   3 of its 4-byte input.
 //!
 //! **Not proved by Kani** (the coordinating session's rulings (A) and (D), 2026-11-27; the
 //! forms tried and their figures are in TASKS item 143's entry; the work is TASKS item 159):
@@ -47,8 +53,12 @@
 //!   nine, came under 300 s. So the 8-entry limit (Appendix A) is not proved.
 //! - `KrnManifest::decode`: neither any input of 3 bytes nor a manifest of fixed shape came
 //!   under 300 s.
-//! - OCBOR-1 past 6 bytes (P1) and 4 bytes (P3); the machine code rustc 1.100.0 makes (Kani
-//!   compiles with its own nightly, on the host's 64-bit `usize`, the width of x86-64's).
+//! - `SectionEntry::parse`'s other rules of §4.3 and §4.4 (the sizes against compression and
+//!   memory, compression on a MAPPABLE entry, the integrity modes, `merkle_index`, the memory
+//!   layout, a kind against its profile): P1 only.
+//! - OCBOR-1 past 6 bytes (P1) and 4 bytes (P3), and the cursor beyond one `next_item` and its
+//!   `skip_contents`; the machine code rustc 1.100.0 makes (Kani compiles with its own nightly,
+//!   on the host's 64-bit `usize`, the width of x86-64's).
 //!
 //! **Covers:** each harness covers an accepted input within its bound, or, where its bound
 //! reaches only refusals, the deepest refusal it reaches.
@@ -123,7 +133,16 @@ fn header_parse_any_bytes() {
                 "the count is the field's",
             );
             kani::assert(le(bytes, 24, 8) == 128, "§4.2: the table at 128");
+            let profile = le(bytes, 12, 2);
+            kani::assert(
+                (1..=8).contains(&profile) && h.profile as u64 == profile,
+                "§4.2: a profile of §1, the field's",
+            );
             let (offset, size) = (le(bytes, 32, 8), le(bytes, 40, 8));
+            kani::assert(
+                h.signature_block_offset == offset && h.signature_block_size == size,
+                "the signature block's fields are the bytes'",
+            );
             kani::assert(size <= 1 << 20, "§4.2: a signature block of at most 1 MiB");
             kani::assert(offset != 0 || size == 0, "no signature block when unsigned");
             kani::assert(le(bytes, 112, 2) == 1, "§4.2: arch 1, x86-64");
@@ -218,7 +237,11 @@ fn slice_any_range() {
     match slice(bytes, start, end) {
         Some(s) => {
             kani::assert(inside, "Some only for a range inside the input");
-            kani::assert(s.len() as u64 == end - start, "the range asked for");
+            kani::assert(
+                s.len() as u64 == end - start
+                    && core::ptr::eq(s.as_ptr(), bytes.as_ptr().wrapping_add(start as usize)),
+                "the range asked for",
+            );
             kani::cover(!s.is_empty(), "a non-empty range");
         }
         None => kani::assert(!inside, "None only for a range outside the input"),
@@ -316,15 +339,16 @@ fn validation_by_walk(text: &[u8]) -> Result<(), Utf8Error> {
     }
 }
 
-/// Core's `from_utf8` and [`utf8_walk`] agree on every text of up to [`UTF8_MAX`] bytes: the
-/// same texts are accepted, `Ok`'s `&str` is the text itself, and an error's `valid_up_to` is
-/// the walk's offset.
+/// Core's `from_utf8` and [`utf8_walk`] agree on every text of up to [`UTF8_MAX`] bytes, at
+/// each offset from 0 to 4 into its array: the same texts are accepted, `Ok`'s `&str` is the
+/// text itself, and an error's `valid_up_to` is the walk's offset.
 #[kani::proof]
 #[kani::unwind(10)]
 fn utf8_walk_equals_core() {
-    let buf: [u8; UTF8_MAX] = kani::any();
+    let buf: [u8; UTF8_MAX + 4] = kani::any();
+    let offset: usize = kani::any_where(|&o| o <= 4);
     let len: usize = kani::any_where(|&l| l <= UTF8_MAX);
-    let text = &buf[..len];
+    let text = &buf[offset..offset + len];
     match core::str::from_utf8(text) {
         Ok(s) => {
             kani::assert(
@@ -360,12 +384,23 @@ fn ocbor_any_document() {
     let buf: [u8; 6] = kani::any();
     let len: usize = kani::any_where(|&l| l <= 6);
     let doc = &buf[..len];
-    let accepted = ocbor::validate(doc).is_ok();
+    let validated = ocbor::validate(doc);
+    kani::cover(
+        validated.is_ok() && len == 6,
+        "a document of 6 bytes is accepted",
+    );
+    kani::cover(
+        matches!(validated, Err(e) if e.kind == ocbor::OcborErrorKind::InvalidUtf8),
+        "a text is refused as UTF-8",
+    );
     let mut c = Cursor::new(doc);
     if let Ok(item) = c.next_item() {
+        kani::cover(
+            matches!(item, ocbor::Item::Text(t) if !t.is_empty()),
+            "a text is read",
+        );
         let _ = c.skip_contents(item);
     }
-    kani::cover(accepted && len == 6, "a document of 6 bytes is accepted");
 }
 
 /// P3 on every input of up to 4 bytes: when `ocbor::validate` accepts it, a [`Cursor`] reads
@@ -382,6 +417,10 @@ fn ocbor_validate_then_cursor_read() {
         let mut c = Cursor::new(doc);
         match c.next_item() {
             Ok(item) => {
+                kani::cover(
+                    matches!(item, ocbor::Item::Text(t) if !t.is_empty()),
+                    "an accepted text",
+                );
                 kani::assert(c.skip_contents(item).is_ok(), "P3: its contents read");
                 kani::assert(
                     c.position() == len,
@@ -401,7 +440,6 @@ fn ocbor_validate_then_cursor_read() {
 /// past the header.
 #[kani::proof]
 #[kani::unwind(21)]
-#[kani::stub(core::str::validations::run_utf8_validation, any_utf8_result)]
 fn signature_block_any_input() {
     let buf: [u8; 19] = kani::any();
     let len: usize = kani::any_where(|&l| l <= 19);
