@@ -8453,7 +8453,8 @@ fn failed_boot_logs(
     let mut logs = vec![match capture {
         Capture::Com1 | Capture::Com1AndScreen => ("serial.log", text.to_string()),
         Capture::SpcrUart => ("spcr-uart.log", text.to_string()),
-        Capture::Screen => ("monitor.log", text.to_string() + &serial::clean(unread)),
+        // `text` is empty: nothing reads stdout while the screen is watched.
+        Capture::Screen => ("monitor.log", evidence::as_a_terminal_shows(unread)),
     }];
     if let Some(com1) = com1 {
         logs.push(("com1.log", com1.to_string()));
@@ -8831,7 +8832,7 @@ mod com1_report_tests {
     #[test]
     fn a_failed_boot_keeps_the_log_its_capture_wrote() {
         let settings = Settings::default();
-        let unread = b"(qemu) \x1b[Kscreendump \"/x/screen.ppm\"\r\n";
+        let unread = b"(qemu) sc\x1b[K\x1b[D\x1b[Dscreendump \"/x/screen.ppm\"\x1b[K\r\n";
         assert_eq!(
             failed_boot_logs(Capture::Screen, "", unread, None, &settings),
             [(

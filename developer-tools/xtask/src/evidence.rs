@@ -208,6 +208,66 @@ pub(crate) fn keep(folder: &Path, boot: &FailedBoot, prefixes: &Prefixes) -> Res
     Ok(dir)
 }
 
+/// `raw` as a terminal would show it, line by line. QEMU's monitor redraws its command line for
+/// each character it reads: it prints the line so far, erases to the end of the line (`ESC [ K`)
+/// and moves the cursor back over it (`ESC [ D`), once a character. Cleaned of those sequences
+/// alone ([`serial::clean`]), each command xtask typed reads as a run of its own prefixes, in
+/// which a host path is never whole and so is never replaced ([`Prefixes`]). Drawn as a terminal
+/// draws it, each command is one line, whole, and QEMU's replies are lines of their own.
+///
+/// It handles carriage return, line feed, cursor left and right (`ESC [ n D`, `ESC [ n C`) and
+/// erase to the end of the line (`ESC [ K`). Any other control sequence is dropped, as
+/// [`serial::clean`] drops it. The text is read byte by byte, which is right for the monitor's
+/// ASCII, and decoded as lossy UTF-8.
+pub(crate) fn as_a_terminal_shows(raw: &[u8]) -> String {
+    let mut out = Vec::with_capacity(raw.len().min(1 << 20));
+    let mut line: Vec<u8> = Vec::new();
+    let mut cursor: usize = 0;
+    let mut i = 0;
+    while let Some(&b) = raw.get(i) {
+        i += 1;
+        match b {
+            0x1B if raw.get(i) == Some(&b'[') => {
+                i += 1;
+                let start = i;
+                while raw.get(i).is_some_and(|&c| (0x20..=0x3F).contains(&c)) {
+                    i += 1;
+                }
+                let count = std::str::from_utf8(&raw[start..i])
+                    .ok()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .unwrap_or(1);
+                match raw.get(i) {
+                    Some(b'D') => cursor = cursor.saturating_sub(count),
+                    Some(b'C') => cursor = (cursor + count).min(line.len()),
+                    Some(b'K') => line.truncate(cursor),
+                    _ => {}
+                }
+                if raw.get(i).is_some_and(|&c| (0x40..=0x7E).contains(&c)) {
+                    i += 1;
+                }
+            }
+            // `ESC` and one more byte, as `serial::clean` reads it.
+            0x1B => i += usize::from(raw.get(i).is_some()),
+            b'\r' => cursor = 0,
+            b'\n' => {
+                out.append(&mut line);
+                out.push(b'\n');
+                cursor = 0;
+            }
+            _ => {
+                match line.get_mut(cursor) {
+                    Some(cell) => *cell = b,
+                    None => line.push(b),
+                }
+                cursor += 1;
+            }
+        }
+    }
+    out.append(&mut line);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The number an entry of the folder starts with, if it is `NN-…`.
 fn number(name: &str) -> Option<usize> {
     let (digits, _) = name.split_once('-')?;
@@ -696,6 +756,39 @@ mod tests {
             "the last dump read was {} bytes, over the 16 MiB limit, so screen.ppm was not written",
             SCREEN_LIMIT + 1
         )));
+    }
+
+    /// The monitor's redrawn command line reads as the command, whole, so its host path is
+    /// replaced; QEMU's reply keeps a line of its own. The bytes are those QEMU 11.1.3's monitor
+    /// sent for `screendump "/tmp/ab.ppm"` (2026-11-27), cut to the first three characters and
+    /// the reply.
+    #[test]
+    fn the_monitor_reads_as_a_terminal_shows_it() {
+        let raw = b"QEMU 11.1.3 monitor - type 'help' for more information\r\n(qemu) s\x1b[K\x1b[Dsc\x1b[K\x1b[D\x1b[Dscr\x1b[K\x1b[D\x1b[D\x1b[D\r\nError: There is no console to take a screendump from\r\n(qemu) ";
+        assert_eq!(
+            as_a_terminal_shows(raw),
+            "QEMU 11.1.3 monitor - type 'help' for more information\n(qemu) scr\nError: There is no console to take a screendump from\n(qemu) "
+        );
+        // A count, a move right and a sequence it does not draw.
+        assert_eq!(
+            as_a_terminal_shows(b"abcd\x1b[3Dx\x1b[1Cy\x1b[2Jz\n"),
+            "axcyz\n"
+        );
+        // What `serial::clean` made of it: the path's prefixes, which no replacement catches.
+        let path = "/home/someone/origin-os/target/xtask/screen.ppm";
+        let mut typed = b"(qemu) ".to_vec();
+        for n in 1..=path.len() {
+            typed.extend_from_slice(&path.as_bytes()[..n]);
+            typed.extend_from_slice(b"\x1b[K");
+            typed.extend(std::iter::repeat_n(*b"\x1b[D", n).flatten());
+        }
+        typed.extend_from_slice(b"\r\n");
+        let p = prefixes("/home/someone/origin-os");
+        assert!(p.apply(&serial::clean(&typed)).contains("/home/someon~"));
+        assert_eq!(
+            p.apply(&as_a_terminal_shows(&typed)),
+            "(qemu) <target>/xtask/screen.ppm\n"
+        );
     }
 
     /// The target directory is replaced before the repository's root it lies in, and the home
