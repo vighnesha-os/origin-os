@@ -8,6 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/vighnesha-os/origin-os/actions/workflows/ci.yml"><img src="https://github.com/vighnesha-os/origin-os/actions/workflows/ci.yml/badge.svg?branch=main&amp;event=push" alt="Test x86-64"></a>
+  <a href="https://octocounts.com/github/vighnesha-os/origin-os/tree/main"><img src="https://api.octocounts.com/badge/vighnesha-os/origin-os/branch/main" alt="OctoCounts: lines of code on main"></a>
 </p>
 
 [Browse the public source and documentation index](https://vighnesha-os.github.io/origin-os/).
