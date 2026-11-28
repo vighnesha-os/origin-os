@@ -830,6 +830,34 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
       - **What is printed:** not the serial number, and on a disk without the mark, not the GPT's identifiers.
       - **CI:** QEMU's test disks carry the mark, so CI's proofs still write.
       - **Controls:** standing controls boot a disk without the mark and one whose marked partition is too small, and compare the disk's bytes before and after. Every kernel boot also checks its disk's bytes.
+172. **NVMe's normal shutdown before a reset and before power-off (CLAUDE.md §33; NVMe Base 2.4; row S33-12; TASKS item 171's limits). Numbered by the coordinating session on 2026-11-28; not started; batch 13.**
+    - **Why:** NVMe Base 2.4's health log counts an unexpected power loss whenever main power goes while the controller does not report a completed shutdown. The driver resets the controller when it binds, which takes back any shutdown the firmware reported, and it never asks for one itself. So a real SSD counts every kernel boot followed by a power-off. A reset that keeps main power is not counted, and QEMU's model shows none of it.
+    - **What:**
+      - **The shutdown:** row S33-12's procedure. Before the machine powers off or restarts, and before the kernel resets a controller it has enabled, the driver deletes the I/O queues, asks for a normal shutdown (CC.SHN) and waits for the controller to report it complete (CSTS.SHST), bounded by the time the controller's Identify data gives.
+      - **A controller that does not finish in time** is reported by name, not hidden.
+      - **The tests:** a boot proof that reads the shutdown's completion under QEMU, with a control in which the shutdown is skipped.
+    - **For item 170's survey:** a program that writes none of the controller's registers leaves the shutdown status as the firmware left it, so it cannot raise the count itself. The survey writes none.
+173. **An audit of what a kernel boot writes besides disks (CLAUDE.md §2 P0; owner items 381 and 383; TASKS item 171's limits). Numbered by the coordinating session on 2026-11-28; not started; batch 13; before any kernel boot on a machine Origin does not own.**
+    - **Why:** TASKS item 171 audited the writes to block devices alone. A boot also writes elsewhere:
+      - the CMOS and the real-time clock's registers;
+      - whatever the AML methods it runs write to their operation regions (system I/O, system memory, PCI configuration, the embedded controller);
+      - the PCI configuration of devices the kernel does not drive.
+    - **What:**
+      - **The list:** every such write path, each with its purpose, from the code and from the AML interpreter's trace of a boot under QEMU.
+      - **Firmware variables:** the list says whether any is written, after `ExitBootServices` or before it.
+      - **What holds it:** a gate or a proof keeps each path to what the list names.
+      - **A write that is not needed** is removed in an item of its own.
+    - **Not in it:** the registers of the devices the kernel drives, which their drivers' contracts cover.
+174. **A boot prints nothing that identifies the machine (CLAUDE.md §61; row S61-07; TASKS item 171's limits). Numbered by the coordinating session on 2026-11-28; not started; batch 13.**
+    - **Why:** row S61-07 is partial. TASKS item 171 stopped the kernel printing the NVMe controller's serial number and an unmarked disk's GPT identifiers. These were not audited:
+      - SMBIOS's serial numbers and UUIDs;
+      - network adapters' MAC addresses;
+      - the firmware's own lines that reach the serial log.
+    - **What:**
+      - **The audit:** every line a kernel boot prints, checked for anything that identifies a machine or a person.
+      - **What is printed instead:** each identifier is withheld, or shown only where it is a fixed test value under QEMU, as item 171 did.
+      - **The check:** xtask gives QEMU's machines known test values (SMBIOS serials, the network adapter's address) and fails any boot whose log holds one, as it does today for the NVMe test serial.
+    - **The firmware's lines before the loader:** Origin cannot change them. The records say so, and logs from machines Origin does not own stay outside the public repository (owner item 381).
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
