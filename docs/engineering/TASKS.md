@@ -858,6 +858,45 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
       - **What is printed instead:** each identifier is withheld, or shown only where it is a fixed test value under QEMU, as item 171 did.
       - **The check:** xtask gives QEMU's machines known test values (SMBIOS serials, the network adapter's address) and fails any boot whose log holds one, as it does today for the NVMe test serial.
     - **The firmware's lines before the loader:** Origin cannot change them. The records say so, and logs from machines Origin does not own stay outside the public repository (owner item 381).
+175. **`verify.sh`'s toolchain check reads `rust-toolchain.toml`, not `RUSTUP_TOOLCHAIN` (TASKS item 158's finding; CLAUDE.md §8, §9). Numbered by the coordinating session on 2026-11-28; batch 12, lane C.**
+    - **Why:** the check "rust-toolchain.toml selects Rust 1.100.0" also passes when the `RUSTUP_TOOLCHAIN` variable picks the toolchain, as Cargo sets it for the commands that `cargo xtask exclusive` runs. Its evidence then names the variable, not the file.
+    - **What:** the check judges what `rust-toolchain.toml` says, and reports or fails when the variable overrides it. The record is regenerated.
+176. **`FrameAllocator::new` walks its regions plainly, to raise its Kani bound (TASKS item 154's limit; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-28; batch 13.**
+    - **Why:** `new`'s filtered walk over the regions holds its Kani proof to 5 frames. TASKS item 154 made `reclaim`'s walk plain, and its proof then fit at 8.
+    - **What:** the same change to `new`, measured first, with its behaviour kept (host tests of the old form against the new). The bound is raised as far as TASKS item 143's budget allows.
+177. **TASKS item 143's harnesses assert the frame conditions the composed induction rests on (TASKS item 154's review, R154-B2; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-28; batch 12, lane B.**
+    - **Why:** the module's composed claim, that the invariant holds after any sequence of the allocator's operations, rests on each harness leaving the fields that only `new` sets unchanged. TASKS item 154's harness asserts that for `reclaim`. Item 143's harnesses do not, so the premise holds only by a reading of `frames.rs`.
+    - **What:** each of item 143's `origin-frame` harnesses asserts those conditions, each with a control.
+178. **`FrameAllocator::new` refuses a memory map whose regions overlap (TASKS item 154's review, R154-A4). Numbered by the coordinating session on 2026-11-28; batch 13.**
+    - **Why:** `new` assumes a map that `summarize` accepts, and given overlapping regions it would not refuse them. The kernel checks the map before `new` today, so the boot path cannot reach the gap.
+    - **What:** `new` refuses overlapping regions itself, with a host test and a Kani harness or control. It is a change of behaviour, and is reviewed as one.
+179. **Really signed fuzz seeds, and an acceptance oracle, for the `signature`, `loader_place` and `onbf_image` targets (TASKS item 164's triage; CLAUDE.md §72). Numbered by the coordinating session on 2026-11-28; batch 13; after TASKS item 164 is on `main`.**
+    - **Why:** every committed signature seed holds at least one entry with a non-empty chain. None is a one-entry, kernel-role block with an empty chain, the only form errata V1 lets past, and no seed carries a signature by a trusted key. So no fuzz target reaches the accepted path of a signed block, or the loader's signed path.
+    - **What:**
+      - seeds signed with the test kernel key, deterministically, by the project's host-only signer when the seeds are written;
+      - an oracle that treats any acceptance outside the committed seeds as a finding;
+      - a control, for example the verifier's Ed25519 result ignored.
+    - **The writers stay as they are** until TASKS item 164 is on `main`, so that its corpus does not change under it.
+180. **The loader's placement refuses the RELOCS the packer's verify refuses (TASKS item 164's triage; ONBF §6.1; errata P5, P7; CLAUDE.md §2 P0). Numbered by the coordinating session on 2026-11-28; batch 13.**
+    - **Why:** the UEFI loader's placement accepts:
+      - RELOCS whose slots do not ascend, or that name a slot twice, which gets the base added twice;
+      - an encoding that is not greedy;
+      - a second RELOCS section.
+
+      Only the packer's verify refuses them, on the build host. A signed image needs a trusted key to reach the loader, and an unsigned one needs developer mode, but the loader should not depend on the packer for these.
+    - **What:** the placement refuses each, with host tests and a planted control for each rule. Whether the loader also checks `build_id` follows the owner's ruling on reading A5.
+181. **The signature block's entry and statement maps follow the signature encodings' extension rule (TASKS item 164's triage, D164-6). Numbered by the coordinating session on 2026-11-28; after the owner's ruling.**
+    - **Why:** the signature encodings say that keys of 1000 and above are extensions, which readers skip. `onbf-format` refuses any key outside 1–7 in an entry, and outside 0–6 in a statement.
+    - **What:** either the parser skips extension keys, still validating them as OCBOR-1, or the owner amends the encodings to strict. The owner's ruling decides which.
+182. **EXE and LIB images hold 1 to 16 SEGMENT sections (TASKS item 164's triage, D164-8; ONBF §6.1). Numbered by the coordinating session on 2026-11-28; batch 13.**
+    - **Why:** §6.1 says an EXE or LIB holds 1–16 SEGMENT sections. `onbf-format` sets no minimum, and accepts one with none. Nothing reads EXE or LIB images yet.
+    - **What:** the parser refuses an EXE or LIB with no SEGMENT. With it come a host test, a malicious-corpus case, and the removal of the N-version comparison's D164-8 entry.
+183. **A requirements-done badge in the README (the owner's request, 2026-11-28; CLAUDE.md §1, §7). Numbered by the coordinating session on 2026-11-28; batch 12, lane C.**
+    - **What:**
+      - `cargo xtask progress` also writes an SVG badge into the repository, carrying the progress page's first figure: the share of requirements done, and their count.
+      - The README shows it beside the CI and OctoCounts badges.
+      - The progress gate refuses a badge that is not the one the tree generates, as it does a stale page.
+      - No outside service is involved.
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
