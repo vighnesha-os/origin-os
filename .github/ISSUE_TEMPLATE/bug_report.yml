@@ -8,7 +8,7 @@ body:
       value: |
         Thank you for reporting it.
 
-        - **A security vulnerability?** Do not report it here. [SECURITY.md](https://github.com/vighnesha-os/origin-os/blob/main/SECURITY.md) says how to report it privately.
+        - **A security vulnerability?** Do not report it here. [SECURITY.md](https://github.com/vighnesha-os/origins/blob/main/SECURITY.md) says how to report it privately.
         - **Leave out** personal data, keys, tokens, serial numbers and network addresses, from the logs too.
   - type: textarea
     id: what

@@ -9,7 +9,7 @@ Origin OS is in early development. No version has been released, so there is no 
 1. Open the repository's **Security** tab.
 2. Choose **Report a vulnerability**.
 
-The direct address is <https://github.com/vighnesha-os/origin-os/security/advisories/new>. Only you and the repository's maintainers can read the report.
+The direct address is <https://github.com/vighnesha-os/origins/security/advisories/new>. Only you and the repository's maintainers can read the report.
 
 **Do not put the details of a vulnerability in a public issue, pull request or discussion.**
 
