@@ -281,6 +281,10 @@ fn take_free_bit(bitmap: &mut [u64; WORDS], limit: u64) -> Option<u64> {
     None
 }
 
+/// Kani's proofs of the heap's invariant (TASKS item 143): `cargo xtask kani`.
+#[cfg(kani)]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;

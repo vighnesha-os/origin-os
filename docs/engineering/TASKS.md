@@ -558,9 +558,9 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
 97. **Scheduling domains, equal capacity and the SMT and two-package machines (ADR-0020 S8, S9, S23). Plan P6, batch 9. Numbered by the coordinating session on 2026-11-20; built on `claude/t97-domains-21554f` (2026-11-21), its contract, controls, comparison and review in its entry under "Task contracts"; lands after TASKS items 94 and 95.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`.
 
-98. **The idle pull and the idle kick (ADR-0020 S7, S10). Plan P7, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 96 and 97.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
+98. **The idle pull and the idle kick (ADR-0020 S7, S10), with Amendment 1's ask. Plan P7. Numbered by the coordinating session on 2026-11-20; built 2026-11-23 to 2026-11-25 on `claude/charming-gould-7063b9`; gates passed 2026-11-26 at `b3a6bb6b`; awaiting the keeper.** Its contract, rulings, round and evidence are in its entry below ("### 98.").
 
-99. **The periodic pull and the NUMA rule (ADR-0020 S7, S10). Plan P8, batch 10. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 98.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
+99. **The periodic pull and the NUMA rule (ADR-0020 S7, S10). Plan P8, batch 10. Numbered by the coordinating session on 2026-11-20; not started; after TASKS item 98.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first. From TASKS item 98 (2026-11-25): busy processors evening out once each holds one ("each held two", item 98's round: 4, 8, 78 and 80 threads on 2, 4, 65 and 67 processors spread to one each, the rest staying where they started) is this item's, as is R98-1's limit (two alternating threads of equal stride are not taken across a last-level cache), by the coordinating session's rulings R2 and on the contract.
 
 100. **Affinity, and user threads made movable (ADR-0020 S11, S2). Plan P9, batch 9. Numbered by the coordinating session on 2026-11-20; not started; after TASKS items 96 and 97.** Its files, invariants, tests and acceptance are in the build plan `docs/engineering/M3_SCHEDULING_PLAN.md`. Its large-machine round comes first.
 
@@ -619,14 +619,15 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 126. **Statics read by `#[inline]` origin-frame functions, reached through the GOT (TASKS item 96's audit). Numbered by the coordinating session on 2026-11-22; not started.** A public generic or `#[inline]` function in origin-frame that names a static is compiled into the calling crate, so the static becomes an exported symbol, and in the position-independent kernel every access to it, in every crate, loads its address from the GOT first. TASKS item 96 found this when `cpu::move_context` put `cpu::CONTEXTS` behind the GOT in `resume` and `dispatch`, and fixed it there. Its audit found three older such functions: `cpu::count` (`COUNT`), `monotonic::monotonic_reading` (`ENTRY_TSC`, `SCALE`, `FLOOR`) and `nospec::form` (`FORM`). None of them adds a GOT load to `resume` or `dispatch` at `0ebef78b`. This item lists where their GOT loads land, by the per-function list of GOT loads that TASKS item 96 added to its count tool. Where one lands on a hot path (the tick, the clock's reads, a trap's entry), it removes the load: a non-inline accessor, or a different form that keeps the static internal. It records the static counts before and after, and adds a gate if one can hold the rule.
 127. **The loader's stack depth before `ExitBootServices`, measured under QEMU (rental F's findings, rank 1). Numbered by the coordinating session on 2026-11-22; built and measured the same day on `claude/t127-stack-depth`; not landed.** A measurement build of its own (`--cfg origin_stack_measure`, `cargo xtask stack-depth`, never signed or rented) paints the 128 KiB UEFI promises below `efi_main`'s stack pointer and reads, at six points before the call, how deep the stack has reached. Under QEMU with OVMF, the rented runs' unsigned path reached at most 10.1 KiB (7.9%), and the signed path, the shipping loader's, about 23 KiB (17.7% to 18.2% over the runs, the higher in the keeper's run at landing), with a static cross-check of the longest chain of Origin's own frames. So the stack drops to the bottom of rental F's ranking. Its entry, findings and hand-over come with its landing.
 128. **A bench build's minimal-program mode and two further reads before the call (ADR-0002 Amendment 5 and Amendment 4's addition; owner items 347 and 348). Numbered by the coordinating session on 2026-11-22; not started.** It builds the minimal-program mode, chosen by `cargo xtask bench-build --minimal`, as Amendment 5 lists it, with `xtask`'s stand-in ACPI table for QEMU. It also builds the full bench mode's two new reads, the live boot services table compared with the copy and `SMIxC0`'s route, and the reworded `PMxD2` line. It extends `boot-bench`'s machine-code check to the minimal mode, so that only the status compare and branches stand between the call and the triple fault. It adds QEMU scenarios for the control, a returning call, no record and the retry, with planted controls. It prepares rental G's images and dry run, for about six boots in the paid hour with the per-boot wait shortened for the minimal image (owner item 350), and rental G goes to the owner only through the coordinating session.
-129. **TASKS item 96's single stop of its move proofs, explained if it recurs (TASKS item 96's gates). Numbered by the coordinating session on 2026-11-22; open.** Twice in `boot-matrix`, on a different two- and four-processor machine each time, a thread of TASKS item 96's integrity proof stayed blocked for the capacity phase's whole wait. The state lines that proof now prints point at a lost wake-up. TASKS item 96 is finding the interleaving with an event ring on planted exports and a Loom model, before any fix. This item stays open until the cause is named and fixed with a model that fails without the fix, or until it is shown to be the host's.
+129. **TASKS item 96's single stop of its move proofs: integrity's capacity phase made structural (TASKS item 96's gates). Numbered by the coordinating session on 2026-11-22; explained 2026-11-25; widened to the fix and fixed 2026-11-26 on `claude/t129-capacity-phase`; awaiting the keeper.** Twice in `boot-matrix`, on a different two- and four-processor machine each time, a thread of TASKS item 96's integrity proof stayed blocked for the capacity phase's whole wait. The state lines that proof now prints pointed at a lost wake-up. **Explained by TASKS item 98's turn T2 (2026-11-25): not a lost wake-up, but the capacity phase's own order under stride's round-robin ties.** The boot flow tries the move only while it runs on the same processor; in some slot orders and iteration phases, at the one moment the movable thread is ready and not running, another thread a stride behind runs first and its tie-break hands the processor back to the movable thread before the boot flow, which then always finds it blocked. A host model of the real run queue (base `27699a39` and the tip alike) traps in 1,307 of 30,720 cases (38 of 120 slot orders); a plant that set the failure's slot order failed the phase in 3 of 4 boots on base and on the tip (TASKS item 98's entry; `t98-t2-capacity-order.md` in the coordinating session's notes). ADR-0013's integrity row carries the dated note. **The fix** is TASKS item 98's session's, after item 98 is cleared, on a branch of its own: the phase must wait on progress, not on a run order (the coordinating session's ruling T2-1). **A recurrence (TASKS item 98's gates, `boot-matrix` run 2 at `b3a6bb6b`, 2026-11-25, 23:18 to 23:32 UTC, wholly on AC power):** the reserved-memory machine with the Intel IOMMU, 2 processors. CPU 0 held thread 2 in slot 1, thread 1 in slot 2, thread 3 in slot 3 and thread 0 in slot 4, with the boot flow in slot 0; thread 0 was blocked at generation 80 with its partner, thread 1, ready, and CPU 1 was idle. The proof printed "no move into the full queue was answered", then "the move out of the full queue was not made". The coordinating session ruled it an answered stop of this item, not a pass (its ruling (a), 2026-11-25, 23:33 UTC). **Fixed (2026-11-26; the entry "### 129."):** the phase moves a thread of its own, spawned on the boot flow's processor, which never blocks: it only yields. The boot flow runs there only while that thread does not, so each move is answered at its first try, and the phase waits only on counts that must grow. Claim (ii), that a refused move loses no thread, is now read from the source queue's slot (`sched::held_on`). The host model of the real run queue: 0 of 30,720 cases miss the phase's thread, against 1,691 that miss thread 0 without the fix. T2's slot-order plant: 4 of 4 boots pass with the fix, and 2 of 4 fail without it.
 130. **The rental tool's reading of a minimal-program boot (rental G's findings). Numbered by the coordinating session on 2026-11-22; built the same day on `claude/t130-minimal-reading`; not landed.** Rental G's per-boot summaries counted loader runs, not firmware starts, and ended each boot before the firmware's start delay on revision 2.4a had passed, so they read a reset after each call as none. The tool now judges each run by the firmware's next byte, measures each machine's own delays, never reports "no reset" while a restart of its own is in flight, and has a replay test on rental G's real console. It also stages the full bench image.
 131. **A bench build's bisection mode (ADR-0002 Amendment 6; owner item 352). Numbered by the coordinating session on 2026-11-22; built and gated the same day on `claude/t131-bisect-mode`, and run on rental H the same day; not landed.** It builds the mode, chosen by `cargo xtask bench-build --bisect`, as Amendment 6 lists it: the full bench loader's work with the kernel stack and boot info as `EfiLoaderData`, a line that the loader's map holds no OS-defined region, Amendment 5's resets, and the live table's compare. It extends the machine-code checks and the rental tool's image kinds to it, adds QEMU scenarios and planted controls, and prepares rental H's images and dry run. Rental H goes to the owner only through the coordinating session.
 132. **A boot that prints nothing at all (TASKS item 96's turn 25). Numbered by the coordinating session on 2026-11-22; not started.** Twice, a boot of the Intel IOMMU 4-processor machine's signature scenarios gave an empty serial log and an empty QEMU stderr, with not even the loader's banner, while the same scenario passed on the 1- to 3-processor machines of the same run: TASKS item 92's run 3 and TASKS item 96's turn 25. No Origin code had run. This item finds whether it is QEMU, OVMF or `xtask`'s staging, and makes such a boot say what it saw.
 133. **The boot info and the kernel stack allocated as loader data (ADR-0002 Amendment 7; owner item 353). Numbered by the coordinating session on 2026-11-22; built and gated the same day on `claude/t133-loader-data`; its rental (rental I) cancelled by the owner before it ran; not landed.** Every loader allocates the boot info and the kernel stack as `EfiLoaderData`, and the translated map names them by address as boot info and kernel stack, so the kernel sees the same region kinds. It shows under QEMU that the kernel boots unchanged and that the normal images change only by this, and it prepares rental I: a bench build of the normal loader with the change, entering the bench kernel with TASKS item 112's breadcrumbs. Rental I goes to the owner only through the coordinating session.
-134. **The IPC proof's `exit_closes` check made independent of timing (ADR-0013 R1(b)). Numbered by the coordinating session on 2026-11-22; not started.** In its "faults" case the proof requires at least one wake-up that crosses processors when the peer waits on another processor. If the ending process's close lands before the peer has blocked, the peer keeps the wake-up and no interrupt crosses, so the check fails with nothing wrong: no lost wake-up, the peer saw `PEER_CLOSED`, no handles left. Seen once, on the AMD 4-processor machine, in TASKS item 96's planted pass-check run of 2026-11-22. This item makes the pass condition the same on every schedule: the ender starts only once the peer is blocked, or a kept wake-up counts, with a planted control for each order.
-135. **`xtask`'s I/O APIC marker takes the count the kernel's proof takes (ADR-0013 R1(b)). Numbered by the coordinating session on 2026-11-22; not started.** The kernel's proof passes when 20 or more PIT interrupts arrive through the I/O APIC (`framekernel/src/irq.rs`, `taken >= PROOF_TICKS`), and prints the count it took. `xtask`'s marker demands the literal text "20 PIT interrupts", in two places in `developer-tools/xtask/src/main.rs`. When one more interrupt lands before the entry is masked, the kernel prints 21 and passes, and `xtask` fails the boot as "first missing marker". Seen once, on the 65-processor Intel machine under host load: TASKS item 96's turn 30, base 65-1, on `0ebef78b`'s code. This item makes `xtask`'s check take any count the kernel's own condition takes, with a planted control for a count below 20.
-137. **The progress page at the repository root, clean and clear (owner items 356 and 357). Numbered by the coordinating session on 2026-11-23; not started.** `docs/PROGRESS.md` moves to `PROGRESS.md` at the root. `cargo xtask progress` writes it there, and the gate in `cargo xtask check` reads it there (`developer-tools/xtask/src/progress.rs`, its help text and its tests). The README's link follows, and so does every reference that names the page's place. Records that describe the page as it was built stay as they are. The generator also gives the page a new layout: each table shows done, built, in progress and not started as percentages that add up to 100%, nothing adds two states together, the states are explained in plain words, and the long tables sit in sections a reader opens. Items 193 and 221 stand. It lands with the next code batch, since it changes `xtask`. Item 136's line comes with the records of TASKS items 134 and 135.
+134. **The IPC proof's `exit_closes` check made independent of timing (ADR-0013 R1(b)). Numbered by the coordinating session on 2026-11-22; built on 2026-11-23 on `claude/bold-robinson-85f8ec`, with `process_terminated`, which had the same check (its entry, "134 and 135", below); not landed.** In its "faults" case the proof requires at least one wake-up that crosses processors when the peer waits on another processor. If the ending process's close lands before the peer has blocked, the peer keeps the wake-up and no interrupt crosses, so the check fails with nothing wrong: no lost wake-up, the peer saw `PEER_CLOSED`, no handles left. Seen once, on the AMD 4-processor machine, in TASKS item 96's planted pass-check run of 2026-11-22. This item makes the pass condition the same on every schedule: the ender starts only once the peer is blocked, or a kept wake-up counts, with a planted control for each order.
+135. **`xtask`'s I/O APIC marker takes the count the kernel's proof takes (ADR-0013 R1(b)). Numbered by the coordinating session on 2026-11-22; built on 2026-11-23 on `claude/bold-robinson-85f8ec` (its entry, "134 and 135", below); not landed.** The kernel's proof passes when 20 or more PIT interrupts arrive through the I/O APIC (`framekernel/src/irq.rs`, `taken >= PROOF_TICKS`), and prints the count it took. `xtask`'s marker demands the literal text "20 PIT interrupts", in two places in `developer-tools/xtask/src/main.rs`. When one more interrupt lands before the entry is masked, the kernel prints 21 and passes, and `xtask` fails the boot as "first missing marker". Seen once, on the 65-processor Intel machine under host load: TASKS item 96's turn 30, base 65-1, on `0ebef78b`'s code. This item makes `xtask`'s check take any count the kernel's own condition takes, with a planted control for a count below 20.
+136. **The IPC ping-pong's crossing condition made independent of timing (ADR-0013 R1(b)). Numbered by the coordinating session on 2026-11-23, from TASKS item 134's contract (Q2); not started.** The ping-pong of `ipc_proof` passes only if its two processes blocked at least once between them and, on two processors, at least one wake-up crossed (`blocked.0 + blocked.1 > 0 && (far == bsp || wakes > 0)`). Both rest on the schedule: a run in which neither process ever found the other's message missing would block 0 times and cross nothing, with every one of its 1,000 round trips right. That is remote, and no boot has shown it. Its count of blocks also counts a block that returned at once on a kept wake-up. It has no single order to force, as TASKS item 134's two cases had, so its fix is its own. The independent review of items 134 and 135 lists it first among its follow-ups.
+137. **The progress page at the repository root, clean and clear (owner items 356 and 357). Numbered by the coordinating session on 2026-11-23; built on 2026-11-23 and 2026-11-25 on `claude/t137-progress-page` (its entry, below); not landed.** `docs/PROGRESS.md` moves to `PROGRESS.md` at the root. `cargo xtask progress` writes it there, and the gate in `cargo xtask check` reads it there (`developer-tools/xtask/src/progress.rs`, its help text and its tests). The README's link follows, and so does every reference that names the page's place. Records that describe the page as it was built stay as they are. The generator also gives the page a new layout: each table shows done, built, in progress and not started as percentages that add up to 100%, nothing adds two states together, the states are explained in plain words, and the long tables sit in sections a reader opens. Items 193 and 221 stand. It lands with the next code batch, since it changes `xtask`. Item 136's line comes with the records of TASKS items 134 and 135.
 138. **Other proofs' waits and counts, and a crossing count each case can call its own (TASKS items 134 and 135's review). Numbered by the coordinating session on 2026-11-23; not started.** The review left seven notes, none of them in that change:
     1. `byte_quota`'s wait for the writer to reach its wait, whose result is not required (`ipc_proof.rs`);
     2. `memory_goes_with_the_last_thread`'s reap, which may find no zombie;
@@ -640,12 +641,12 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 140. **`boot-matrix`'s usage line and `Cargo.toml`'s `default-members` (TASKS item 137's review, follow-ups 1 and 2). Numbered by the coordinating session on 2026-11-25; not started.** The usage line leaves out machines it runs: `boot-reserved`, `boot-acpi`, `boot-listed`, `boot-sparse` and `boot-domains`. `default-members` leaves out `sdk/directory` and `services/directory`, which `check` lints and tests on the host.
 141. **A placement control for B1 under emulation (TASKS item 98's turn T1). Numbered by the coordinating session on 2026-11-25; not started.** Under QEMU's software processor, B1 moved by 7 to 9 % between builds whose switch-path code is the same: a commit that added only counters off the switch path took the tip's mean on the 65-processor machine from 2,033 to 1,885 cycles. That is more than the changes TASKS item 92's rule is meant to judge. The control pins the switch path's code placement in the base's and the tip's comparison builds (for example with lld's `--symbol-ordering-file`). It shows the variation that is left, and is recorded as part of ADR-0018 V7's method. Until it lands, a scheduling item's B1 comparison still runs: a rise of more than 10 % above the base's range stops the item, and a smaller difference is judged on static counts.
 142. **Each per-processor table on a line of its own (TASKS item 98's static listing). Numbered by the coordinating session on 2026-11-25; not started.** The boot processor's run queue starts 24 bytes into a 64-byte line. The other processors' queues are consecutive elements whose stride is not a multiple of 64 (1,080 bytes at the base, 1,432 with TASKS item 98), so each queue's lock shares a line with the next queue's first fields. Each processor's element of a `PerCpu` table starts on a line of its own. First check that no assembly or fixed offset depends on today's layout. QEMU models no cache, so the figure it is judged by comes from hardware (ADR-0018 V9).
-143. **Kani's first proofs (owner item 358; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-25; not started.** `kani-verifier` is installed at a version read on the day, and it and its bundled compiler are recorded in `docs/toolchain/VERIFICATION.md`. The bundle verifies, and builds nothing that ships.
+143. **Kani's first proofs (owner item 358; CLAUDE.md §73). Numbered by the coordinating session on 2026-11-25. Step 2, the frame allocator's and the heap's harnesses, built on 2026-11-26 and merged into `land/batch-11` at `1030c989`. Step 3, parts of `onbf-format`, built on 2026-11-26 and 2026-11-27 and merged into `land/batch-11` at `f435870e`. Step 4, capability validation, built on 2026-11-27 on `claude/t143-caps-kani` and merged into `land/batch-11` at `05acd5cb`. CI's three Kani jobs, one for each package, passed every harness and caught every control at `c2680f71` (run 45948073598; the closing note, below). Not landed on `main`.** `kani-verifier` is installed at a version read on the day, and it and its bundled compiler are recorded in `docs/toolchain/VERIFICATION.md`. The bundle verifies, and builds nothing that ships.
     - **First harnesses:** the frame allocator's and the heap's invariants (rows S73-02 and S73-04);
     - **then** the ONBF parsers' bounds (ONBF §13 item 5; row S73-08);
     - **then** capability validation (row S73-07).
-    - Each harness states what it proves and within which bounds (row S73-12). It runs as `cargo xtask kani` and as a CI job on standard runners.
-144. **Coverage-guided fuzzing on stable Rust (owner item 359). Numbered by the coordinating session on 2026-11-25; not started.**
+    - Each harness states what it proves and within which bounds (row S73-12). It runs as `cargo xtask kani` and as three CI jobs on standard runners, one for each package.
+144. **Coverage-guided fuzzing on stable Rust (owner item 359). Numbered by the coordinating session on 2026-11-25; built on 2026-11-26 on `claude/t144-fuzzing-4d7ce0` (its entry, below); not landed.**
     - **First, a smoke harness** shows whether `cargo fuzz` with `--sanitizer none` builds and runs with Rust 1.100.0. cargo-fuzz 0.13.2's source skips its toolchain check and adds no `-Z` flag in that case, but that is not shown on this host yet. If it needs nightly, it falls under item 360.
     - **Then, structure-aware harnesses** (`arbitrary`): the ONBF parsers and loader (ONBF §13 item 3) and the AML interpreter; later the ACPI table parsers and OCBOR-1.
     - **What is kept:** the corpus, and every crash, minimized, as a regression test. CI runs each target for a fixed time. The seeded mutation soaks stay.
@@ -763,9 +764,45 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 164. **ONBF's second parser, written independently (ONBF §13 item 6; CLAUDE.md §73 and §1). Numbered by the coordinating session on 2026-11-27; not started.**
     - **What:** a second parser of ONBF images, written from `docs/spec/ONBF.md` and its errata by a different session that does not read `onbf-format`, host-only, which must agree with the first on the whole corpus (the fuzz seeds, the malicious corpus and the images the build makes). A disagreement is a specification bug, settled in the errata.
     - **Why now:** ONBF v1.0 becomes final only after §13's tests pass, and item 6 had no TASKS item.
-165. **A failed boot in CI leaves its evidence (CLAUDE.md §1, role 26; §69). Numbered by the coordinating session on 2026-11-27; not started.**
+165. **A failed boot in CI leaves its evidence (CLAUDE.md §1, role 26; §69). Numbered by the coordinating session on 2026-11-27; built the same day on `claude/t165-boot-evidence-d5f6cc`, to the contract the coordinating session ruled on (Q1 to Q8); not landed.**
     - **Why:** on 2026-11-27 PR 79's real-CPU job failed one boot, "console: no UART at all", with "origin-kernel: boot refused" on the screen (run 45927890180). That boot has no serial port, and the job kept neither the screen nor the logs, so its cause cannot be read. Its rerun passed.
     - **What:** every boot job keeps, when a boot fails, that boot's serial log and the last screen capture `boot-test` read, as an artifact of the job.
+    - **Why that run kept nothing:** two things lost it.
+      - The next step's kernel boot wrote over `target/xtask/screen.ppm`.
+      - `wait_for_screen`'s error named the failure message but none of the screen's rows.
+    - **Built (`580e15ea`, `53bbb8e0`, `1cf28b1c`, `796c7f69`): a failed boot keeps its evidence.** Every boot goes through `run_scenario`. When one fails, `evidence.rs` writes `target/xtask/failed-boots/NN-<label>/`, numbered after the directories already there, with at most 16 kept. It holds:
+      - `boot.txt`: the scenario, the command, `boot-matrix`'s machine line, the start in UTC, the revision with the tree only "clean" or "not clean", the verdict, the first missing marker, the settings, the QEMU command line and QEMU's stderr;
+      - the log the markers were judged in: `serial.log`, or `spcr-uart.log` with `com1.log`, or for a boot with no UART `monitor.log`, drawn as a terminal shows it;
+      - the last screen dump `boot-test` read in that boot, as `screen.ppm`, and its rows as `screen.txt`.
+    - **The limits and the host paths:**
+      - Host paths become `<target>`, `<repo>` and `~` in every file.
+      - A text over 8 MiB keeps its first 1 MiB and its last 7 MiB.
+      - A dump over 16 MiB is left out.
+      - A screen failure's error now names the screen's rows, so the job's log holds them too.
+    - **Built (`1ebcbaba`, `c62fb26f`): the CI side.** `ci.yml`'s three boot jobs and `processor-sweep.yml`'s sweep upload the folder only when a step failed (`if: failure()`), for 7 days, with the pinned `upload-artifact`.
+    - **Shown on the development Mac (QEMU 11.1.3, TCG):** three planted failing boots in a scratch clone of `796c7f69`, run in order in one turn:
+      - **C1:** the boot with no UART fails on a line its screen shows. It left `boot.txt`, `monitor.log`, `screen.ppm` and `screen.txt`.
+      - **C2:** the kernel boot fails on an early loader line. It left `boot.txt` and `serial.log`, and no dump, though C1 had left one.
+      - **C3:** the SPCR scenario waits for a marker no boot prints. It left `boot.txt`, `spcr-uart.log` and `com1.log`.
+
+      The directories were numbered 01 to 03, and no kept file names a host path. The 3,072,016-byte dump is 51,246 bytes under gzip -6.
+    - **Gates on `40e46ef0` (the code as at `796c7f69`), in one turn of the machine, the tree clean before and after; each run started with no `failed-boots` folder and left none:**
+      - `cargo xtask check`: passed in 1,139 s, with 2,911 tests passed, 0 failed and 32 ignored, 96 Loom models passed and 148 controls caught, and every gate passed;
+      - `cargo xtask boot-test`: 11 of 11 scenarios passed in 68 s;
+      - `cargo xtask boot-matrix`: passed in 2,066 s.
+    - **What the controls found, fixed in the same branch:**
+      - `monitor.log` was empty: nothing read QEMU's stdout while the screen was watched (`1cf28b1c`).
+      - Then it was 226,127 bytes of QEMU's redrawn command line, whose partial host paths no replacement could catch (`796c7f69`).
+    - **CI's failing side, shown in run 45985725312** ("TASKS 165 CI control", finished at about 11:09 UTC on 2026-11-27).
+      - **The run:** the owner said "Yes, push it", and the coordinating session pushed `ci-control/t165` at `35f466ef` (ruling Q7). It is one commit on `7d5d320c`: `ci.yml` trimmed to the three boot jobs, starting only on a push to that branch, with C1 planted. The coordinating session read the job logs and the artifact list, and downloaded nothing.
+      - **The failure:** all three jobs failed at the planted boot with `the screen shows "origin-kernel: sysfs: built /sys"; it showed:` and the screen's rows. Each job's log named `target/xtask/failed-boots/01-console--no-UART-at-all`.
+      - **The uploads:** each job's "Keep the failed boot's evidence" step succeeded and uploaded 4 files:
+        - `failed-boots-software-cpu`, 54,939 bytes (job 140460719288);
+        - `failed-boots-ubuntu-26.04`, 53,850 bytes (job 140460719849);
+        - `failed-boots-ubuntu-24.04`, 53,858 bytes (job 140460719873).
+      - **After it:** on both real-CPU jobs the host boot, "The processor as it is, nothing masked", passed (`boot-test passed (1 of 11 scenarios)`).
+      - **What stays:** the artifacts expire after 7 days, and the run's logs stay. At the owner's word ("Yes, delete it"), the branch `ci-control/t165` was deleted on GitHub and locally on 2026-11-27, at `35f466ef`; the run and its logs remain.
+      - **The passing side** shows on a green run of the real workflow: its upload steps are skipped, and it lists no `failed-boots-*` artifact.
 166. **The `compile_fail` doctests' controls run by `cargo xtask` (TASKS item 143, step 4). Numbered by the coordinating session on 2026-11-27; not started.**
     - **What:** each doctest that must fail to compile has a control, the same code made to compile, which must then fail the doctest. Step 4 ran them by hand; `cargo xtask` runs them, as `kani.rs` runs Kani's controls, in a scratch copy, and fails if one is not caught.
 167. **The kernel's transfer of handles and its grant, reachable by Kani (ADR-0005 P2; TASKS item 143's ruling on step 4). Numbered by the coordinating session on 2026-11-27; not started.**
@@ -5607,3 +5644,1116 @@ Built on `claude/t106-capacity-heat-44f35a`, pointed at `land/batch-9`'s `0ebef7
 **Review:** one independent AI reviewer, `docs/engineering/REVIEW_T106_2026-11-22.md`: 1 High, 3 Medium, 9 Low and 4 Info. R106-1 is answered by the code change above; R106-2 by the start-reads, round-takes split; R106-3 by ten seconds; R106-4 by the ruling; R106-5 by reporting other enables and counting quiet interrupts; R106-6 by comparing the RIP before reading CPU-local data; R106-7 by acknowledging a stale bit and reading a zero timestamp as unwritten; R106-8 by every online processor and the wait; R106-9 by the lock order documented; R106-10 by the vector sent and the LVT taken being `hfi`'s alone; R106-11 by force idle across every capability; R106-12 by M1 and M2 measured first and the records; R106-13 by C1 planted where QEMU faults; R106-14 by `Package`'s hand-written `Debug`; R106-15 by the SAFETY note; R106-16 by `capacity::current`'s documentation; R106-17 by the narrower register reads, any refused region counted as a `_CPC` refusal, and "reading a row" counted only where the table is used. **No person has reviewed it.**
 
 **Not shown, and why:** every present path (the HFI's enable, its updates, "avoid", forced idle, efficiency 255, which processor takes a package's interrupt, thermal transitions, HWP's and CPPC's reads where firmware enabled them, `_CPC`'s values on real firmware) needs ADR-0009 H4's in-scope machines, which this project does not have; this is a limitation, not a claim. Nothing under KVM until CI runs it. AMD heat is not supported at M3, and an AMD machine without the HFI whose firmware did not enable CPPC, Gorgon Point's Zen 5 and Zen 5c cores among them, has equal capacity at M3 (Q1). Placement by these values is TASKS items 98, 99, 100 and 107's.
+
+### 134 and 135. Two checks whose result depended on timing: the IPC proof's crossing, and `xtask`'s I/O APIC count (ADR-0013 R1(b))
+
+Assigned by the coordinating session on 2026-11-23, both found in TASKS item 96's runs. Built on `claude/bold-robinson-85f8ec`, cut from `main` at `27699a39`. The contract and its questions are in the coordination notes (`t134-135-contract.md`). The coordinating session ruled:
+- **The choice for item 134 stands:** the ender starts only once the peer is seen blocked, and the crossing stays required where the peer waits on another processor.
+- **Q1 (a):** `process_terminated`, which had the same check and the same window, is fixed with the same helper, in a commit of its own, with its own controls.
+- **Q2 (a):** the IPC ping-pong's crossing condition is not this item's. It is TASKS item 136.
+- **Q3 (a):** a host test holds `xtask`'s bound to the kernel's by reading `PROOF_TICKS` from `irq.rs`'s source.
+- **The two additions to `sched.rs` and `runqueue.rs`** are accepted as read-only additions, with `resume`, `on_yield`, `dispatch` and the wake-up shown unchanged against `27699a39` by static counts.
+- **Each control must reach its own line:** a plant is scoped to its case by a flag the case sets for its own window.
+- **The review's R134-2:** the base and the tip are booted three times each, alternating, and B1 and the wait queues' ping-pong judged by TASKS item 92's final rule; the IPC round trip is recorded and not judged.
+
+**Item 134: what was wrong.** `exit_closes` and `process_terminated` start a waiter on another processor, then a process whose end must wake it, and require at least one wake-up that crossed processors. They started the second process as soon as the waiter's process counted a thread in `wait_one`. That count rises before the thread registers on the wait queue and before it blocks, so the wake-up could find the waiter in three places:
+
+| Order | The waiter when the wake-up runs | What `sched::wake` does | Crossings | "blocked N times" |
+|---|---|---|---|---|
+| A | blocked in its processor's run queue | makes it ready and sends that processor an IPI | 1 | 1 |
+| B | registered on the wait queue, not yet blocked | the run queue keeps the wake-up; no IPI | 0 | 1 (its block returns at once) |
+| C | counted in `wait_one`, not yet registered | nothing: no one is on the queue, and the waiter's first look sees the signal | 0 | 0 |
+
+In B and C the waiter wakes, sees what it must and nothing is lost, and the case failed on "0 wake-ups crossed processors".
+
+**Item 134: what was built** (`framekernel/src/ipc_proof.rs`, `sched.rs`, `runqueue.rs`; `xtask`'s two markers).
+- **The second process starts only once the waiter is seen blocked in `wait_one`** (`ipc_proof::blocked_in_wait`): the process's count of threads in `wait_one` is above 0, and `sched::user_thread_blocked` finds a blocked slot of the waiter's processor's run queue holding that thread. It waits at most `sched::OTHERS_PATIENCE` (10 s), a budget of seconds as R1(b) allows.
+- **`sched::user_thread_blocked(cpu, &thread)`** reads, under the queue's lock, whether a slot is blocked (`RunQueue::is_blocked`) and holds the user thread (the `ObjectRef<ThreadObject>` that `Process::start_thread` returns, compared with `ObjectRef::same`). That is the one state in which `RunQueue::wake` makes the thread ready and `sched::wake` sends the IPI. The record's state is locked under the queue's lock, the order a spawn takes them in. Both are read only, and no switch, wake-up or block calls them.
+- **The pass condition is the same on every schedule:** what each case required before, and the waiter seen blocked first. A waiter that never blocks fails the case for that reason, on its line; the second process is started all the same, so both end and nothing of them stays.
+- **Each line says what was seen** ("seen blocked in wait_one before the process started: true"), and `xtask`'s markers require `true`.
+
+**Why this form, and not "a kept wake-up counts".**
+- With the waiter blocked first, the wake-up always crosses, so the crossing stays required. It is the one thing these cases show of the IPI path: without the IPI the waiter would still wake at its processor's next tick, and every report would be right.
+- A kept wake-up is known only inside `RunQueue::wake` or where `block_for` consumes it. Counting it needs a new answer from `sched::wake` or a counter on the block path, the paths TASKS item 96 counted instruction by instruction (ADR-0018 V1). From what the proof can read, order B and a kernel that sent no IPI look the same: 0 crossings, blocked once.
+- Order C has neither an IPI nor a kept wake-up, so the condition would have needed a third arm, and on B and C the case would have shown no crossing at all.
+
+**Why the order then holds.** The waiter's wait has no deadline, so no tick readies it. Its name is on one wait queue, and nothing changes that object's signals before the second process ends. A blocked thread never moves, and neither thread is declared movable. The channel's close runs in the ending thread's own context, and `TERMINATED` is raised where the process's last thread is reaped: both on the boot processor, where the second process runs.
+
+**Item 135: what was wrong.** The kernel's I/O APIC proof passes on 20 PIT interrupts or more (`taken >= PROOF_TICKS`, `framekernel/src/irq.rs`) and prints the count it took. `xtask`'s marker held the literal "20 PIT interrupts", in the kernel boot's list and in the swap for the machine with no 8254. On TASKS item 96's turn 30 the 65-processor machine printed 21 under host load, its proof passed, and `xtask` failed the boot as "first missing marker". The proof's loop reads the count before each interrupt window (`sti`, `nop`, `cli`), and a handler returns with interrupts on, before the `cli`, so one window could take two interrupts and carry the count from 19 to 21. That is read from the code, not shown by a run, and which path gave that boot its 21st is not shown; control C135-21 makes one by waiting for it.
+
+**Item 135: what was built** (`developer-tools/xtask/src/main.rs`; the kernel is unchanged).
+- **The marker is the line after its count** (`PIT_ROUTED`), at both places, so the line is still required in its order.
+- **`pit_routed` reads the count** from the kernel's whole line (`origin-kernel: I/O APIC: <digits> PIT interrupts routed through the I/O APIC in <digits> ms`, and nothing after). It takes any count of 20 or more, with no upper bound, and refuses a lower one whatever else the line says. A line that is not the kernel's whole line is refused.
+- **`counts_hold` runs it wherever the markers are judged complete** (the serial judge and the screen's), for a scenario whose markers hold `PIT_ROUTED`. The machine with no 8254 has its marker swapped, and is held to no count.
+- **`xtask` keeps a bound of its own** (`PIT_PROOF_TICKS`), as the old literal did: a kernel whose bound fell and whose line said nothing of a failure is still refused. A host test holds it to `PROOF_TICKS` by reading the kernel's source line, with the proof's condition and its line's format.
+- **A scenario read from the screen may not hold the counted marker** (`screen_can_hold`; the review's R135-3): the count is read from a whole line, and the screen gives rows.
+- **The judge's verdict is a function** (`verdict_so_far`; the review's R135-1), so a host test holds what `run_scenario` judges a boot by.
+
+**The commits,** on `27699a39`:
+- `818b4e30`: item 135, the count-free marker, `pit_routed`, `counts_hold` and their host tests;
+- `aba432fd`: `RunQueue::is_blocked` and its host test;
+- `438073dc`: `exit_closes` starts the ender once its peer is seen blocked (`sched::user_thread_blocked`, `blocked_in_wait`), and its marker;
+- `07f35f84`: `process_terminated` the same (ruling Q1);
+- `b7654252`: the review's R134-1, R135-1, R135-2 and R135-3 (xtask and one doc paragraph; no kernel code);
+- `38f9f55d`: one doc comment in `xtask` (how the 21st interrupt arose is read from the code, not shown);
+- `87b9ed36`: the records.
+
+**The static counts** (the ruling; `llvm-objdump`, by TASKS item 96's method, from `git archive` exports of `27699a39` and the tip, each built with `cargo xtask build`; taken at `07f35f84` on seven functions, and at `b7654252` and `87b9ed36` on these thirteen, with the same result each time). 13 functions are the same, instruction for instruction once addresses, targets and RIP displacements are dropped, with the same call targets: `resume` (777 instructions), `on_yield` (239), `dispatch` (442), `sched::wake` (262), `wake_inconsistent` (413), `on_tick` (308), `on_block` (286), `on_reschedule` (664), `on_exit` (604), `follow_thread` (116), `reap` (66), `RunQueue::floor` (150) and `RunQueue::switch` (602). `RunQueue::wake`, `wake_slot`, `block_for`, `with_queue`, `block` and `block_until` have no symbol in either image: they are inlined into those. `user_thread_blocked` is one new symbol, and `is_blocked` is inlined into it. A count cannot see where code sits (the review's R134-2); the figures are what was measured of that.
+
+**The figures** (the coordinating session's ruling on R134-2: measured, and judged by TASKS item 92's final rule, the tip's mean against the base's range, a stop above the base's worst). Six boots of the kernel boot alone on the default machine (2 processors, Intel VT-d, QEMU 11.1.3's software processor), the base `27699a39` and the tip `87b9ed36` from the static counts' exports, alternating, 2026-11-23 04:12:17 to 04:14:11 UTC, on AC power. The load is the host's 1-, 5- and 15-minute average before each boot:
+
+| Boot | Image | Load before | B1, a context switch (TSC cycles) | Wait queues' ping-pong (µs) | IPC round trip (ns) |
+|---|---|---|---|---|---|
+| 1 | base | 4.77 4.41 4.67 | 1,889 | 27 | 125,891 |
+| 2 | tip | 4.19 4.30 4.63 | 1,731 | 30 | 124,327 |
+| 3 | tip | 3.57 4.15 4.57 | 1,711 | 27 | 121,683 |
+| 4 | base | 3.65 4.12 4.55 | 1,840 | 28 | 123,180 |
+| 5 | base | 4.30 4.25 4.58 | 1,720 | 29 | 118,133 |
+| 6 | tip | 4.29 4.25 4.58 | 1,733 | 29 | 120,175 |
+
+- **B1:** the tip's mean is 1,725 against the base's 1,720 to 1,889. Inside.
+- **The ping-pong:** the tip's mean is 28.7 µs against the base's 27 to 29. Inside, and close to its worst: one tip boot read 30, above any single base boot.
+- **The IPC round trip** is recorded and not judged (the ruling: the change alters what the IPC proof waits for before it, so the line is not comparable). Base mean 122,401 ns, tip mean 122,062.
+- **The power source** was read at the turn's start (04:11:09) and after the sixth boot (04:14:11), AC both times, not at each boot: the ruling arrived after the script had started. `pmset -g log` shows no change of source in between.
+- The figures' environment is `emu`. A hardware figure (§74) would say whether anything here costs on silicon.
+
+**The controls** are in ADR-0013 ("The controls of TASKS items 134 and 135"), 25 of them at `b7654252`, each planted, linted, run once and put back, each kernel plant scoped to its case's own window:
+- **an unplanted boot** beside them: all four lines "true, blocked 1 times … 1 wake-ups crossed processors";
+- **order A,** the waiter blocked first and the window's wake-up sending no IPI: caught on each case's own line, 0 crossings (C134-A, C134-TA). The crossing is still held;
+- **orders B and C with the old order:** caught, 0 crossings with nothing wrong, which is item 134's stop reproduced; B "blocked 1 times", C "blocked 0 times" (C134-B, C134-C, C134-TB, C134-TC). In the "faults" iteration alone, where turn 25b stopped, the "exits" line passed and the "faults" line was the first to fail (C134-BF, C134-CF);
+- **the same holds with the tree's order:** passed, 1 crossing, each hold counted on the line (C134-B2, C134-C2, C134-TB2, C134-TC2);
+- **the waiter never seen blocked:** caught on the case's own line with every report right and the crossing counted, `false` (C134-N); with neither case requiring it, caught by `xtask`'s marker, which requires `true` (C134-N2); and the look given another thread object, `false` (C134-I);
+- **item 135:** a 21st interrupt passes (C135-21); the same against the old marker fails as turn 30 did (C135-21-old); the kernel's bound at 10 is refused by `xtask`'s own bound (C135-10);
+- **six host controls,** one for each thing a host test holds: `is_blocked`'s state, the refusal, the two bounds held together, the line's shape, the judge reading the count, and the screen's refusal.
+
+Three faults of the first controls script are recorded there and in the review (an unused planted function that did not pass Clippy, a judge that asked for a line after the boot was stopped, and a control that did not reach its line), and two wrong expectations of the final run (a waiter that waits twice is held twice; both cases share the look). None was a fault of the tree.
+
+**The gates,** on `87b9ed36`, in one `cargo xtask exclusive` turn, 2026-11-23 04:11:09 to 06:00:21 UTC, the tree clean before and after. Each gate's own line was read:
+- **the static counts** against `27699a39`: 13 functions the same, 0 differences;
+- **fmt, progress,** and the document, provenance, cost, requirements, roadmap, progress, names and settle gates: passed;
+- **the build, and Clippy with `-D warnings`:** `xtask` with all targets, the kernel's library on the host with its tests, and the kernel on its target: clean;
+- **host tests:** `xtask` 426 passed, 0 failed, 2 ignored; the kernel's library 582 passed, 0 failed, 1 ignored;
+- **`cargo xtask check`,** 972 s: "check passed"; 2,806 host tests passed, 0 failed, 32 ignored; all 93 Loom models passed and all 144 negative controls were caught;
+- **`cargo xtask boot-test`:** passed, 11 of 11 scenarios;
+- **`cargo xtask boot-matrix` three times in a row:** passed each time (1,806 s, 1,755 s and 1,746 s). In each run's output:
+  - 188 lines of the two cases, every one "seen blocked in wait_one before the process started: true" and "blocked 1 times", none "ipc failed";
+  - 176 of them with 1 crossing;
+  - 12 with 0 crossings, all 12 on one-processor machines, where the peer is on the boot processor and no crossing is owed;
+  - the I/O APIC proof's line 45 times, with 20 each time. No boot of this turn took a 21st interrupt, so that path is shown by control C135-21 alone.
+- **The power source** (CLAUDE.md §1, "Measure reproducibly"; from the turn's own readings and `pmset -g log`): AC at 04:11:09 and 04:14:11; on battery at 04:17:07 and at 04:31:54; AC again at 04:38:25, 05:02:00, 05:31:15 and 06:00:21. So `check` for most of its run, `boot-test`, and the first minutes of the first `boot-matrix` ran on battery; the second and third `boot-matrix` ran on AC. No sleep or wake is logged in the turn. These gates are pass or fail, and none failed; the judged figures above were taken on AC.
+
+The short turns before it, as each commit was built (2026-11-23, 03:13 to 03:17 UTC): the build, the kernel library's and `xtask`'s host tests, both Clippy runs and `boot-test` 11 of 11, at `818b4e30` with `aba432fd` and `438073dc`'s changes in the tree, and at `438073dc` with `07f35f84`'s.
+
+**The review.** One independent AI reviewer, on `27699a39..07f35f84`, recorded in `docs/engineering/REVIEW_T134_135_2026-11-23.md` with every finding answered. It found no false failure and no false pass in the kernel change or in `xtask`'s count check: 0 High, 4 Medium, 5 Low and 4 Info. All four Medium findings were in the controls script. **No person has reviewed it.**
+
+**Rulings that bind later work** (the coordinating session's, 2026-11-23):
+- **The check rests on where the two threads run.** The waiter stays on its processor and the second process's thread on the boot processor, which holds because neither is declared movable (ADR-0020 S2). If the second thread ran on the waiter's processor, the close or the `TERMINATED` raise would run there and no IPI would cross.
+- **TASKS item 98** (run-time movers, idle pull) must not pull these proofs' threads.
+- **TASKS item 100,** which makes user threads movable, must pin both threads of each case, or restate the check.
+- **`blocked_in_wait` is for a process with one thread whose first call is the wait** (the review's R134-1). A proof that reuses it for a process with a second thread must change it first.
+
+**Follow-ups, none in this change:**
+- **TASKS item 136:** the IPC ping-pong's crossing condition.
+- **From the review, for the coordinating session to number:**
+  - `byte_quota`'s wait for the writer to reach its wait, whose result is not required: if it ran out, "the third is over the quota" could fail with nothing wrong;
+  - `memory_goes_with_the_last_thread`'s reap, which may find no zombie, so that "0 spaces freed while a thread ran" can be true without having tested anything;
+  - waits of 5 s where the rule for what another processor's thread must do is 10 (`ipc_proof.rs`, `events_ports.rs`, `kernel_bound.rs`, `core_pin.rs`);
+  - `virtionet.rs`'s `blocked > 0 && wakes > 0`, which rests on a 10 ms settle and not on seeing the thread blocked;
+  - a refused start of the second process leaves the waiter blocked for good, as before this change;
+  - `runqueue.rs`'s stranded doc comments (`has_room`'s above `describe`, `Departed`'s above `SlotState`);
+  - `process.rs`'s doc of `waiting`, which counts a port's waiters too.
+- **A standing gate for the order** (the review's R134-3): none exists, and the controls must be run by hand when this code changes.
+- **`CROSS_CPU_WAKES` is one counter for the whole kernel.** In these cases' windows nothing else moves it today (the review checked). A background service that woke threads across processors would make `wakes > 0` true for another's wake-up.
+
+**Not shown:**
+- **orders B and C without a plant,** on any machine;
+- **the change under KVM,** until CI runs it, **or on hardware;**
+- **a plant on more than 2 processors or under AMD-Vi:** the gates boot those machines unplanted;
+- **no person has reviewed it.**
+
+### 137. The progress page at the repository root, clean and clear (owner items 356 and 357)
+
+Assigned by the coordinating session on 2026-11-23, after the owner's "Link and move to root" (item 356) and "Can you make PROGRESS.MD clean and clear" (item 357). Built on `claude/t137-progress-page`, cut from `main` at `5be0030a`, against the coordinating session's contract (`t137-contract.md` in the coordination notes), which gives the move, the layout section by section, the host tests, the review and the gates. No boot was needed: a host tool and documents change.
+
+**What does not change.** The page is generated by `cargo xtask progress`, and `cargo xtask check`'s gate refuses a tree whose page is not the one it generates. Every figure is a count of matrix rows, from the same inputs. Decision items 193 and 221 stand: only done counts as complete.
+
+**The move (item 356).**
+- `docs/PROGRESS.md` is `PROGRESS.md` at the root, by `git mv` in a commit that changes none of its bytes, so its history follows.
+- `progress.rs`'s `PAGE` and the help text of `progress` and `progress-gate` name it there.
+- `README.md`'s two links follow, and its third mention of the page is a link now. `docs/requirements/README.md`'s line on regenerating the page follows, and so do row S1-52's two mentions of the path, which the requirements gate checks.
+- `CONTRIBUTING.md` names the command and no path, so it is unchanged.
+- Records that describe the page as it was built keep the old path: reviews, the provenance narrative, old TASKS entries and the decision sheet.
+
+**The layout (item 357),** in `developer-tools/xtask/src/progress.rs`:
+- **Four percentages on every line, which add up to exactly 100.0.** Plain rounding of each share gave lines of 99.9% and 100.1%.
+- **Done is rounded on its own** (the review's R137-1; the coordinating session's ruling (a)): to the nearest tenth from done and the total alone, exactly as the requirements gate rounds it, in every line and in the title. So done never moves because another state moved, and the page never disagrees with what `cargo xtask check` prints. The other three share the rest by largest remainder: each rounded down, the tenths still owed to the largest remainders, a tie to the less complete state.
+- **The cost the ruling accepts:** on a line of more than 500 requirements, done and a state one requirement away can be shown a tenth out of order, either way. Below that one requirement is two tenths, and the order of all four is held by a host test.
+- **Nothing adds two states together.** The "% done or built" column and the "Done or built" sentence are gone. The page opens: "**3.4% of 1,686 requirements are done.** Done is the only state that counts as complete." The next sentence says what a requirement is.
+- **The order:** the title and those two lines; overall, with counts and a total; what the states mean, one plain sentence each; where the evidence ran, one environment a line; by milestone, with the roadmap's own state words and how they are judged; by feature area; the details, in four closed blocks (each area's sections, the ADR decisions, the standing rules, the exact counts); how the page is made, in three bullets with decision items 193 and 221.
+- **Built's sentence** (the review's R137-2; ruling (a)): "It is written and tested, but not all of its acceptance tests pass yet, or they pass only in a weaker environment than it asks for, such as a virtual machine where it asks for a real one." The contract's first sentence named one of the two reasons. On the tree of 2026-11-23, 88 of the 372 built requirements had evidence from the environment they ask for and were built because their acceptance tests did not all pass. Of the other 284, 173 ran in a virtual machine on a real processor and 105 in an emulator. These counts are the reviewer's, from the matrix, and are here, not on the page.
+- **A reader's words:** "requirements" and "feature areas". A line with no requirement shows "-" in each state's cell. A thousand or more has a comma. The directive's unnumbered parts are named "the header" and "the final rules", in its own order.
+- **The gate refuses a copy left at `docs/PROGRESS.md`** (the review's R137-4), with a host test. A branch cut before the move regenerates the page there, and a merge that kept it would leave a second page that nothing regenerates.
+- **`check`'s help text and `Cargo.toml`'s header** (the contract's addition) say what the commands do now, from what `fn check` runs.
+
+**Choices where the contract left room,** accepted by the coordinating session on 2026-11-23:
+- **A tie in the rounding goes to the less complete state.** Since the ruling on R137-1 it applies among built, in progress and not started.
+- **"No sentence longer than two lines" is held as 200 characters,** by a host test over the page the tree generates.
+- **The directive's unnumbered parts are named in words,** where the page gave ID prefixes.
+- **The fourteen areas' section tables are one closed block,** not fourteen.
+
+**The public file index** (owner's, added to `main` after the contract; the coordinating session's message of 2026-11-25) follows the move, and nothing else in it changes: `developer-tools/public-index/files.json`'s one entry `docs/PROGRESS.md` is now `PROGRESS.md`, kept in the list's sorted order (between `LICENSE-MIT` and `README.md`; 763 unique paths, as before), and `build.py`'s "Start here" list names `PROGRESS.md`. Its 11 tests pass; none named the old path.
+
+**The commits,** on `5be0030a`:
+- `5717b3b8`: the move, by `git mv` in a commit that changes none of the page's bytes, with every reference that names its place;
+- `fb7f061a`: the layout, and its host tests;
+- `ef3caed8`: `check`'s help text and `Cargo.toml`'s header;
+- `0386b624`: the review's R137-3 to R137-9;
+- `1c8fd95b`: the rulings on R137-1, R137-2, (c) and (d);
+- `a0ad2dbc`: `main` merged at `ebd3552d` (the public index, the README's logo and badge, a CI label, PR 66's note; no kernel code). No conflict: the README's header is `main`'s byte for byte;
+- `3fcf14ba`: the public index follows the move.
+
+The page's history follows the move commit by commit (`git log --follow PROGRESS.md`). Across the whole branch Git sees a deletion and a creation, since the layout rewrote the page, so the history holds as long as the batch lands with a merge commit, not a squash.
+
+**The review.** One independent AI reviewer, on `5be0030a..ef3caed8`, recorded in `docs/engineering/REVIEW_T137_2026-11-23.md`, every finding answered: High 0, Medium 2, Low 5, Info 3. It re-derived every figure on the page from the matrix and the roadmap, found them right, and found no count changed from the old page. Both Medium findings were against the contract's own rule and wording, and the coordinating session ruled on them. **No person has reviewed it.**
+
+**The gates,** on `3fcf14ba`, in one `cargo xtask exclusive` turn, 2026-11-25 16:07:15 to 16:22:44 UTC, the tree clean before and after; each gate's own line was read:
+- fmt; Clippy for `xtask` with all targets and `-D warnings`: clean;
+- `xtask`'s host tests: 431 passed, 0 failed, 2 ignored; the public index's tests: 11, OK;
+- `cargo xtask check`, 923 s: "check passed"; 2,810 host tests passed, 0 failed, 32 ignored; the progress gate: "PROGRESS.md is the page this tree generates (313 lines)"; all 93 Loom models passed and all 144 negative controls were caught.
+- **The power source:** on battery at the turn's start (16:07:15, 100%), on AC from 16:08:23 (`pmset -g log`) to the end (16:22:44). Pass-or-fail gates; none failed.
+- No boot was run: only a host tool and documents change (the contract).
+
+**Follow-ups, none in this change** (from the review, for the coordinating session):
+- `boot-matrix`'s usage line does not name `boot-reserved`, `boot-acpi`, `boot-listed`, `boot-sparse` or `boot-domains`, which it runs;
+- `Cargo.toml`'s `default-members` leaves out `sdk/directory` and `services/directory`, which `check` lints and tests on the host;
+- the page shows `partial` and `not-verified` as one state, as it always has, where the requirements gate prints them apart.
+
+**Not shown:** the page rendered on GitHub (its structure was read against GitHub's Markdown rules by the reviewer, and its links checked by a host test); the public index built and published (its tests ran; its workflow runs on `main`). No person has reviewed it.
+
+### 98. The idle pull, the idle kick and the ask (ADR-0020 S7.1, S7.2, S10 and Amendment 1; plan P7)
+
+Sent by the coordinating session on 2026-11-23 as a side session's task; its contract (`t98-contract.md` in that session's notes), the rulings on its questions and on every turn since, and the evidence named below are in that folder. Built on `claude/charming-gould-7063b9`, cut from `origin/main` at `27699a39`, with `origin/main` at `ebd3552d` merged before these records. Nothing is pushed: the keeper lands it.
+
+| Field | |
+|---|---|
+| Task ID | TASKS item 98 (plan P7) |
+| Objective | An application processor with nothing to run takes a ready thread from the nearest processor that has one waiting; a processor that has one waiting tells the nearest idle one, at most once a tick; and, by Amendment 1, an idle processor asks a busy one to publish a waiting thread's frame. A Report proof shows it at boot. **Not in it:** the periodic pull and the NUMA rule (item 99); affinity and movable user threads (100); classes (102); placement (107); any hardware figure. |
+| Source ownership | `framekernel/src/sched.rs`, `sched/pull.rs`, `runqueue.rs`, `balance_proof.rs`, `migration_proof.rs`; `origin_sync::balance` and its Loom module; narrow edits in `timer.rs`, `cpu.rs`, `contexts.rs`, `bootproof.rs` and `xtask`. |
+| Architecture contract | ADR-0020 S5, S7.1, S7.2, S10, S23 and Amendment 1; ADR-0013 R1 (b); ADR-0018 V1, V5, V7, V9. No ABI or format change. |
+| Security invariants | I1 a balancing move is made only by its destination's idle flow; I2 queue locks in index order, then the gate; I3 no shootdown under a queue lock; I4 at most one balancing interrupt a tick from each processor; I5 a cache-hot thread stays in its last-level cache; I6 a thread is pulled only if balanced, ready, not running, published, unpinned and settled, to a destination that takes part and has room and capacity; I8 a processor going idle and one becoming crowded never both miss each other (Loom BL1); I9 pinned mode stops every pull; I11 nothing prints an address. |
+| Performance constraints | `resume` and `dispatch` held equal to the base, `on_yield` equal but for field offsets, each traced path of `wake` within 3 instructions with no new call or locked instruction (all met, P1 to P3's traces); the rest counted in the ledger (CL50, CL52, CL62). |
+| Acceptance | The round sent and read; "load balancing" passing on the machines of 2 to 8 processors in three `boot-matrix` runs in a row; Clippy, `cargo xtask check`, `boot-test`; each control caught as recorded. Rows A20-S7 and A20-S10 partial, A20-Am1 built, S26-07 partial. |
+
+**What was built** (29 commits of the branch's own on `27699a39`, records among them, with `main` merged once at `ebd3552d`; the main ones):
+- `ec753b5b`, `081d1d02`, `1bf87235`, `6bde6cea`: the run queue's balancing state, what each processor publishes (`origin_sync::balance`, Loom BL1 and BL2 and their controls), the published-frame check and the declaration that balancing may take a thread, and the framework's rate and interrupt.
+- `043afab4`: the idle pull and the idle kick; `a909ef26`: the ask (owner item 355).
+- `e95c6bbf`, `1d6b5b82`: the two independent reviews' answers (a frame is published when `lend` would find it, the reviews' R98-6 and D98-12); `65bb5cb9`: the review record, `REVIEW_T98_2026-11-23.md`.
+- `83c8ec21`, `4938a2a6`: the migration proofs' pulled phases, their start processor kept crowded by occupants, at most four processors left to pull.
+- `53c24d4f`, `d630b8f3`, `1d2631e7`, `bbdaa95e`, `240d9dd0`, `8ead8e66`, `cbfb8fd2`: before and after the round, by the coordinating session's rulings: an arrival's sentinel; the pass's time by what it did; **each victim its own interrupts-off section**, interrupts on between, and the last section publishing, reading and halting in one stretch; the balancing state in a struct of its own; a queue lock taken with **one try** and left if held; the ask's interrupt claimed in the section and **sent after it**.
+- `523e15e8`: each section line gives how many sections it measured; `e52c3761`: the pulled phases' not-exercised conditions and the pullers' condition, and an xtask test that none is forgiven; `3a9731bd`: the "load balancing" Report proof.
+
+**Where the build differs from the contract, and the rulings that settled it:**
+- **The idle pass:** the contract's §2 asked for each victim's look to be its own section; the first build made the pass one section. The coordinating session ruled the split (2026-11-25), made before the B1 pairs 4 to 6 were measured.
+- **The pulled phases' occupancy:** at most four processors are left to pull (`PULLERS_MOST`), the others occupied by pinned threads that halt, so the start processor stays crowded (the review's D98-4); now a condition of both phases (R1).
+- **R98-1, a limit accepted for item 98:** two alternating threads of equal stride are not taken across a last-level cache. Recorded in ADR-0020 S7's note and handed to TASKS item 99 with "each held two".
+- **The balancing state's layout** (`bbdaa95e`): put in a struct of its own, declared first, after six B1 pairs on the default machine read above the base's range. **Corrected (the ruling T1-1):** that export's B1 inside the base's range is within the 7 to 9 % that B1 moves between builds with identical switch-path code under TCG, so it is not shown to be a layout effect. The layout is kept for its own reason (the tip's `kept_floor` through the lock share one line).
+- **Delivery's crossing** is no longer a condition of the phase: it says "not exercised" at its 30 s limit and withdraws nothing, and `xtask` requires the crossing on every QEMU machine (the ruling T1-5).
+- **"load balancing"'s kick case:** the ruling R2 asked for 8 of 8 kicks sent. A diagnostic of four boots showed why not all eight are local: a wakee pins itself only when it first runs, so a spawn's own kick can let an idle processor take it first, and its wake-up is then remote (an interrupt, no kick); every local wake-up sent its kick (5 of 5, 4 of 4, 5 of 5, 5 of 5). The condition is therefore every wake-up made on the waker's processor, counted from where each wakee blocked, at least one made, and at least one of their threads run elsewhere. Sent to the coordinating session with these records.
+
+**The diagnostic round** (2026-11-25, 17:11 to 18:32 UTC, AC power, `cbfb8fd2` against `27699a39`; `t98-round1-figures.md`): 62 boots of six kernels (base; on; on without the pulled phases; on with no pull or kick; and the round's workload with and without the ask) on the 65- and 67-processor machines, idle and beside three spinning shells, and the workload on 2, 4, 8, 65 and 67. Every boot that ran the pulled phases held every bound. **A finding about the condition, not item 98's (the ruling R3):** 19 of 62 boots, all beside the spinning shells, refused in calibration or start-up before the scheduler ran a thread (APIC timer 10, AP start-up 5, clock 4), base as often as the tip (4 of 6 against 5, 4 and 4). Refusing is right on a host that cannot give the guest time; no retry. Item 98's loaded evidence is the seven part-one boots that finished.
+
+**Turn T1** (18:54 to 19:22 UTC; `t98-turn-t1-figures.md`, `t98-static-listing.md`):
+- **B1:** under TCG it moved 7 to 9 % between builds with identical switch-path code (`cbfb8fd2` to `523e15e8` read 2033 to 1885 on 65 processors, from a commit off the switch path; the timestamp export 9 % above on, with tight runs; the same base binary 1871 and 1895). **No rise attributable to item 98 is measurable under emulation; the hardware figure is owed (V9).** Item 98's switch-path cost is judged on the static evidence (T1-1): the yield's and switch's path is the base's instructions but for field offsets, a yield writes no balancing field, and the path touches 16 lines as the base's does. Ping-pong and IPC were inside the base's range or faster. D98-7's costs are accepted (CL50). Pinning the switch path's placement so that B1 can judge switch-path changes again is TASKS item 141; until then a rise over 10 % above the base's range is still a stop.
+- **A finding, not item 98's change (T1-1):** neighbouring processors' run queues share a 64-byte line (their stride is not a multiple of 64; the boot processor's queue starts 24 bytes into a line). It predates item 98: in the base, a queue's lock shares a line with the next queue's `watch`. Item 98 adds at most two writes a tick onto that line (`sent_counted_at`, and an asker's `asked_at`). Each per-processor table on a line of its own is TASKS item 142.
+
+**Turns T2 and T3** (19:59 to 20:18 UTC; `t98-turn-t2-figures.md`, `t98-t2-capacity-order.md`):
+- **TASKS item 129, explained:** see its line above. Base and tip fail the capacity phase alike under a planted slot order (3 of 4 each); ADR-0013's integrity row carries the dated note; the fix is this session's after item 98 is cleared (T2-1).
+- **Senders' wake-up sections over 1 ms on an idle Mac:** base has them too (1.40 and 1.20 ms on 8 processors, the main delivery phase). Of the tip's 13, 9 were work with at most 1 µs of lock wait and 4 mostly lock wait; none retried, none overlapped a move. Recorded; nothing to change (T2-2).
+- **The idle pass's sections** (T1-2, T2-3): no section length is a pass condition (ADR-0013 R1 (b)); each line reports its sections with their count, and the longest is in B18's measured column. With first-run flags on every branch inside a look and a move, the later sections over B18 came at 0.06 to 0.39 per 1000 on 4 and 8 processors against null's 2.4 to 34; on 2, at 1.8 per 1000 (13 of 7163, 50 to 164 µs each) against base's own lock-taking section, the senders' wake-up, at 1.65 per 1000 in the same boots. **Lock-taking sections are compared with base's lock-taking sections, not with null, which takes no lock.** Settled on 2, 4 and 8. V1 is met: a look takes the two queue locks only after the lock-free hints name a victim.
+- **B1, a trend under the 10 % stop:** the timestamp export 8.7 % above base on 4 processors, 7.0 % on 8 (T2-4).
+
+**Static counts** (against `27699a39`, llvm-objdump of the release kernels): `resume` and `dispatch` equal; `on_yield` equal but for field offsets; `wake`'s traced paths, at `1e77a932`, P1 140 to 143, P2 111 to 112, P3 148 to 146 instructions (their b variants 150 to 153, 121 to 122, 158 to 156), the same calls, one locked instruction. The one instruction the cache-hot fix added is the store into `mark_pass`.
+
+**The gates' stops (2026-11-25).**
+- `cargo xtask check` found two things the earlier check turns, which ran `xtask`'s tests and the boots, did not: the boot-proof table's host tests still counted 76 proofs (`6be05006`), and `origin-sync`'s release object referenced the allocator, which the no-panic check (ONBF §12) does not allow a freestanding library: `Hints::new` and `Masks::new`, its first non-generic code that allocates, are now `#[inline]`, compiled in the kernel (`55998c5a`).
+- **`boot-matrix` found a defect in the cache-hot rule.** On the x2APIC machine under `-cpu max,vendor=GenuineIntel`, 3 processors with CPU 0 alone in its last-level cache (domains `[0|1-2]` from CPUID leaf 04H), "load balancing"'s kick case sent no kick for 7 wake-ups made on CPU 0 ("13 with nobody idle"), and no woken thread ran elsewhere. The rule counted a thread off the processor only if it was ready at the mark, and read a wake-up's admission as a charge, so a thread woken after any block was hot for a whole window more, and across a cache neither kicked nor pulled. ADR-0020 S10 says hot is "ran on its processor less than H ago". **Why the round could not show it:** its machine with more than one cache was the 8-processor two-package one, where the waker's cache group held idle processors, so a kick never had to cross a cache; the x2APIC machines were not in the round. The coordinating session ruled the fix the same day (`1e77a932`): the mark records blocked and sleeping slots too, a wake-up's admission carries the mark forward, a spawn starts unmarked, and `cold()` still names only ready threads. Host tests (a) to (e) of the ruling, and the randomized model's count of threads named cold before any mark since their wake-up; control C98-14 (the old rule) caught at boot and on the host, and C98-6 and C98-2b run again (ADR-0013).
+
+**The gates (2026-11-25 to 2026-11-26),** at `b3a6bb6b`, with Rust 1.100.0 and QEMU 11.1.3 TCG on the development Mac. Power was read from `pmset` before and after each step, and its log shows no sleep from the last wake-up (09:56 UTC on 2026-11-25) to the end.
+- `cargo xtask check` passed in 923 s, with 96 Loom models and 148 negative controls caught; `cargo xtask loom` passed in 730 s; `boot-test` passed 11 of 11 in 67 s. All three ran wholly on AC power.
+- `boot-matrix` passed three times. The coordinating session's ruling (a) of 2026-11-25 counts three passing runs, and records each stop with item 129's signature, in place of the contract's three in a row:
+  - **Run 1**, 22:43 to 23:18 UTC, passed in 2,061 s. It ran across a switch to battery: AC at its start, battery at 23:00:59, AC again at 23:04:29. A pass across the switch stands, with its power named.
+  - **Run 2**, 23:18 to 23:32 UTC, wholly on AC, stopped on TASKS item 129's signature (that item's line above). It is an answered stop, not a pass.
+  - **Runs 3 and 4**, 23:33 to 00:07 and 00:07 to 00:40 UTC, wholly on AC, passed.
+- In each of the three passing runs:
+  - "load balancing" passed on all 44 machines with two or more processors (spread, and kick; two alone on the 11 with three or more processors taking part).
+  - Delivery's pulled phase was exercised on all 44. Its first crossing came 9 to 3,172 ms in, with medians of 360, 387 and 340 ms in runs 1, 3 and 4.
+  - Every boot's verdict was one the matrix expects. On the 42 or 41 default machines it was "degraded" for the speculation controls alone (ADR-0017). The others are the scenarios' own expected verdicts, among them fairness on the 65- and 67-processor machines, which ADR-0013 names as oversubscribed.
+
+**Review:** two AI reviewers, independent of the author, given the code and ADR-0020's properties (`REVIEW_T98_2026-11-23.md`): 23 findings, each answered in a commit naming it. The later changes (the pass's split, the struct, one try, the ask after its section, the not-exercised conditions and the Report proof) were made to the coordinating session's rulings and were not reviewed again. No person has reviewed the code.
+
+**Controls** (also in ADR-0013). 2026-11-25, 20:39 to 20:56 UTC, Rust 1.100.0, QEMU 11.1.3 TCG on the development Mac, on AC power, at the tree of `3a9731bd`. A script (the session's `plants98b.py`) applied each edit to an export of that tree, never to the tree, built it and booted it once, through `boot-test`'s `kernel boot` scenario (`boot-domains` for the 8-processor two-package machine). Each is judged on the line that judges its bound (the coordinating session's rulings R1, R2 and T1-5).
+
+| Control | Planted | Machine | Result |
+|---|---|---|---|
+| C98-1 | The idle pass pulls nothing | 2 | Caught: integrity's pulled line, 0 pulls, "a pull of a thread moved before: no, in 30 s", "threads moved while they held their word 0 (not exercised)", scheduler failed |
+| C98-2 | The kick returns before anything, its publication of the census included | 2 | Caught, but not as a kick: with nothing published the idle processor never pulled, and integrity's pulled phase failed as not exercised (0 pulls) before "load balancing" ran. Replaced by C98-2b |
+| C98-2b | The kick's interrupt never sent; the census still published | 2 | Caught by "load balancing"'s kick case: of the 8 wake-ups made on CPU 0, kicks sent 0 (5 of their threads still ran elsewhere, taken at the idle processor's own tick), scheduler failed. Both pulled phases passed |
+| C98-4 | The balancing interrupt's rate flag never set (`Rate::take`) | 2 | Caught: integrity's pulled line, "of 31 balancing interrupts the most one processor sent in one tick 4", held false |
+| C98-5 | The move's period not asked of a candidate | 2 | Caught: delivery's pulled line, "pulls sooner than the move's period 13", held false |
+| C98-6 | The cache-hot test removed, and the pick told every level shares a cache | 8, two packages | Caught: integrity's pulled line, "of a cache-hot thread across caches 13", held false |
+| C98-8 | The source's ask mark ignored (`RunQueue::take_ask`) | 4 | Caught: integrity's pulled line, "of 40 asks the most one took in one tick 2" |
+| C98-9 | A pull hands its thread the puller's idle FPU area, at the first pull | 2 | Not caught: the first pull took a thread that had not yet run, which then loaded its own canaries. Replaced by C98-9b |
+| C98-9b | The same, at the first pull of a thread moved before | 2 | Caught: integrity's pulled line, "canaries changed 192 times" |
+| C98-10 | A pulled thread's record withheld from its new slot until its puller next idles | 2 | Caught by pinned mode, S20's trigger 3: "a wake-up's location named the wrong slot on CPU 0". A wake-up met the missing record before any switch to the slot, so the count of threads run before their state existed was not reached; TASKS item 96's C96-4b reaches it on the shared path |
+| C98-11 | No processor occupied in a pulled phase | 8 | Caught: integrity's pulled line, "0 of them occupied, 6 left to pull (at most 4)", scheduler failed |
+| C98-12 | No move while a thread held its word counted | 2 | Caught: integrity's pulled line, "threads moved while they held their word 0 (not exercised)", after its 30 s budget |
+| C98-13 | No crossing counted | 2 | Caught by `xtask`: delivery's pulled line read "untaken 0: not exercised in 30 s", the phase passed and withdrew nothing, the verdict was 76 of 77; the boot failed on the missing marker ": exercised, after " |
+| C98-14 | The cache-hot rule as it was before the gates' stop (the mark records only ready slots), at `1e77a932` | The x2APIC machine under `-cpu max,vendor=GenuineIntel`; and the host | Caught at boot by "load balancing"'s kick case (kicks sent 0 of 8 wake-ups made on CPU 0); on the host by the ruling's case (a), case (d) and the randomized model's new count. C98-6 and C98-2b run again at `1e77a932`: caught (hot across caches 10; kicks sent 0). The tip there: kicks sent 8 of 8, all 8 ran elsewhere |
+| C98-3 | The contract's: no ask is sent (the pass returns before it). Left out of the first runs, run 2026-11-26 at `74fe8e93` (ADR-0013's note) | 4 | **Not caught.** Asks sent 0, and every proof passed, 76 of 77. "Two alone" was taken after 0 ms by a kick at a tick ("pulls 1", "kicks 1 at ticks"), so no proof needs the ask ("Not shown", below) |
+| C98-7 | The contract's: a kick counts the thread its step just switched out, whose frame is not yet published. Left out of the first runs, run 2026-11-26 at `74fe8e93` | 4 | Recorded, as the contract expected. Every proof passed. Against the unplanted boot of the same turn, asks sent in the two "counts since boot" lines rose from 26 and 72 to 44 and 98, and kicks at ticks from 30 and 45 to 44 and 181 (one boot each) |
+| C98-15 | The coordinating session's: the pull's published-frame check (`cpu::frame_published`) taken as always true | 2, and 4 | **Not caught, and no bound passed.** On both machines, integrity's pulled line read "second processor in a context 0 times", "canaries changed 0 times" and "run before their state existed 0", held true; "not published 0", asks sent 0. A pull that names a frame not yet published meets `lend`'s own refusal (`Leaving`, or `NotYet` for the running context's) and tries later. The check spares that refusal and triggers the ask; it is not the P0 guard |
+| C98-15b | C98-15, and `lend`'s check of the leaving record removed (`contexts.rs`) | 2 | Caught by pinned mode, S20's trigger 2: "a move's lend found no published frame on CPU 0; the thread stays where it is". `lend` takes a frame only from a slot, by compare-and-swap, so a frame still in the leaving record is in no slot: moves are withdrawn before any processor resumes the context |
+
+**Not shown, and why:**
+- Anything on a physical machine, and any cost figure there (V9); anything under KVM until CI runs it.
+- R98-1's limit across a real last-level cache: QEMU reports no cache. The cross-cache path of the cache-hot rule is shown only by control C98-6 on the two-package machine.
+- A second processor in a context through a pull alone. A pull reaches a frame only through `RunQueue::frame` and `lend`, the path the boot flow's moves share, which TASKS item 96's controls C96-1b and C96-1c test. With the pull's own published check planted away, no bound was passed (C98-15); with `lend`'s check gone too, pinned mode withdrew the moves (C98-15b).
+- **The ask's necessity** (2026-11-26): a kernel that never asks passes every proof (C98-3). "Two alone" was taken by a kick at a tick, not through an ask. Open, with the coordinating session.
+- Only the proofs' threads are declared for balancing until TASKS item 100.
+
+**Follow-ups:** TASKS item 99 (the periodic pull, "each held two", R98-1); TASKS item 129's fix (this session, after item 98 is cleared); TASKS item 141 (the switch path's placement pinned); TASKS item 142 (each per-processor table on a line of its own); the hardware figures of CL50, CL52, CL62 and B21 (V9).
+
+### 151. Specifications and standards on the progress page (owner item 374)
+
+Built by the coordinating session on 2026-11-26, at the owner's "Do it here", on `claude/t151-specifications` from `land/batch-11` at `947a504c`. The owner asked for the progress page to show every specification, standard and protocol, with what is implemented and percentages, and kept current.
+
+**What was built.**
+- **The list, `docs/requirements/specifications.md`:** 62 specifications.
+  - **CLAUDE.md §17's baseline:** all 22 statements are named, some split, such as FIPS 180-4, 202, 204 and 205 and SP 800-208.
+  - **What the records cite beside it:** PCI Firmware 3.3, VT-d 5.20, AMD IOMMU 48882 3.11, SPCR and DBG2, virtio 1.1, the ELF gABI and SemVer 2.0.0.
+  - **What the directive's sections require by name:** USB 2.0, 3.2 and xHCI, USB device classes, DisplayPort and HDMI, HD Audio, OpenType, the network protocols, NTP and the time zone database. These are marked "not pinned yet" where no revision is recorded.
+  - **The legacy PC devices the boot proofs drive:** the 16550, the 8254, the MC146818 and the 8042.
+  - **Origin's own specifications:** ONBF and OIDL.
+- **The rows:** each specification names the requirements that rest on it, by ID or by a section's or ADR's prefix, so a requirement added later there is counted with no edit to the list.
+- **The page:**
+  - a section "By specification", one line each, with the four states' shares adding up to 100.0;
+  - one closed block each, with where the specification is named, its §17 baseline, its crates and each requirement with its state;
+  - the specifications' counts under "Exact counts".
+- **What the page says the figures mean:** they count Origin's requirements, not how much of a specification is implemented, and claim no conformance (CLAUDE.md §46).
+- **The checks:** `cargo xtask progress` refuses a list that names a row the matrix lacks, or a prefix that matches none. It also refuses one that leaves one of §17's baseline statements unnamed, or names a crate with no provenance row.
+
+**Evidence,** on the Mac, at low priority beside another session's exclusive turn:
+- `xtask`'s tests of the list (10) and the page (21), and the requirements and roadmap tests (46), each passing;
+- Clippy with `-D warnings` and rustfmt, clean;
+- the requirements, roadmap, document, provenance, progress, names, host-tools and cost gates, each 0.
+- The whole `cargo xtask check` is the keeper's, at landing.
+
+**Limits:**
+- which requirements rest on a specification is the coordinating session's judgement, read in review, not by the gate;
+- no independent review yet;
+- the network protocols' RFC numbers are not yet in the project's research ledger.
+
+### 129. Integrity's capacity phase made structural: a thread of its own that only yields (ADR-0013 R1 (b); TASKS item 96's R96-13)
+
+Numbered by the coordinating session on 2026-11-22 as "explained if it recurs". TASKS item 98's turn T2 explained it on 2026-11-25. The coordinating session's contract of 2026-11-26 (`t129-contract.md` in its notes) widened it to the fix, and TASKS item 98's session built it the same day, on `claude/t129-capacity-phase` cut from `land/batch-11` at `947a504c`. Nothing is pushed: the keeper lands it.
+
+**The rulings** (2026-11-26; the design and its evidence are `t129-design.md` and `t129-evidence/` in the coordinating session's notes):
+- **Design (c):** a thread of the phase's own that only yields, against (a), the pair thread yielding while the move is wanted, and (b), the boot flow holding the pair's turn.
+- **Q2:** the host model lives in a file of its own under `runqueue.rs`, named by `path` and left out of `origin-sync`'s Loom build, which compiles `runqueue.rs` by `path` too.
+- **Q3:** boot plants, one per claim, each reaching the phase's path and caught on the line it judges. The model's unfixed control counts too.
+- **Q4:** T2's slot-order plant is hooked at the phase's new start.
+- **(a) on claim (ii):** a read-only `sched::held_on` for the phase's "stayed", with a control of its own.
+
+| Field | |
+|---|---|
+| Task ID | TASKS item 129 |
+| Objective | Integrity's capacity phase waits on progress, never on a run order, and proves what TASKS item 96 stated: a full queue refuses a move into it; a refused move loses no thread; a full source can move one out. |
+| Source ownership | `framekernel/src/migration_proof.rs`; `framekernel/src/sched.rs` (`held_on`, read only); `framekernel/src/runqueue.rs` (one `mod` line) and `framekernel/src/runqueue/capacity_model.rs` (a host test). |
+| Architecture contract | ADR-0013 R1 (b) and its integrity row; ADR-0020 N13 and S20; TASKS item 96's R96-13. No scheduler path changed; no ABI or format change. |
+| Security invariants | None changed. `held_on` writes nothing and takes one queue lock, so no lock order is involved (I2). No `unsafe`, no `asm!`. |
+| Performance constraints | ADR-0018 V3: none on any scheduler path. `held_on` is called only by the capacity phase's "stayed", and the phase's thread lives only in the proof. |
+| Acceptance | The contract's six points: the host model, the plant, the claims' controls, the gates, the records and the clearance. |
+
+**What was built** (3 commits on `947a504c`, with the records after them):
+- **`1470b24c`, the phase's own thread.** `capacity_thread` holds integrity's canaries, with an index of its own past the pairs', and a "running on" word of its own. It runs its loop with interrupts off and never blocks: it only yields. It ends with the proof, counted with integrity's threads. The phase spawns it movable on the boot flow's processor (the source), with the next processor that takes part as the destination. The placement move of integrity's thread 0 is gone. Every move is answered at its first try, and the waits left are on counts: the thread started, the fillers started, the fillers ended. The line adds the thread's start and the tries each move took (reported, not conditions), and the stuck-state lines name the phase's thread.
+- **`d9aed40c`, the host model.** T1-4's model of the phase, kept as a host test (`runqueue/capacity_model.rs`).
+- **`7ad63f98`, claim (ii) read from the queue's slot.** `sched::held_on` reads, under the queue's lock in one interrupts-off section, that the slot the thread's location names holds its record at its generation, as `migrate`'s check (a) reads the source's slot. Only "stayed" calls it. `queued_on` and its other callers (`balance_proof`, the pulled phases) are unchanged.
+
+**Why "stayed" changed.** The first run of control P129-2 (a refused move dropping its thread from its queue, its location left behind) was caught by pinned mode's trigger 3 and by the move out. Run on past `xtask`'s first stop, the capacity line still read "the thread stayed on CPU 0 true". `queued_on` reads the location alone, and the location still named the source. The claim is that the queue still holds the thread, so the check now reads the slot.
+
+**Where each of TASKS item 96's three claims is shown now** (the coordinating session's ruling):
+- **(i) A full queue refuses a move into it:** the capacity line's "8 moves into it refused as full, 0 made", each answered at its first try. Control P129-1 removes `migrate`'s room check. It is caught by the kernel's own guard before the line: the arrival panics ("a thread could not arrive at a queue checked to have room"), because a full queue has no slot to take the thread.
+- **(ii) A refused move loses no thread:** "the thread stayed on CPU 0 true", read by `sched::held_on` from the source queue's slot. Control P129-2 is caught on "stayed false", and also by pinned mode's trigger 3 and the move out. `held_on`'s own control, P129-2H, makes it read the location only, as `queued_on` does, and with P129-2 the line then reads "stayed true".
+- **(iii) A full source can move one out:** "the move out of it made true", at its first try. Control P129-3 refuses a move out of a full source as full, and is caught on "the move out of it made false".
+
+**The host model** (acceptance 1; `capacity_model.rs`, 600 scheduling events a case, run in `check`'s host tests in about 27 s, debug):
+- **The fix:** in all 30,720 cases (120 slot orders of the five threads, 256 iteration phases), every one of the boot flow's tries found the phase's thread ready (`the_phases_own_thread_is_ready_at_every_try`).
+- **The control, without the fix:** 1,691 of 30,720 cases never found thread 0 ready, in 46 of 120 slot orders (`the_unfixed_phase_can_miss_its_thread_at_every_try`, which requires at least one).
+- **The design check:** at 4,000 events a case, on an export of `164253fa`, the unfixed model trapped 1,307 of 30,720, as T2 found. With the phase's thread in each of six places among the five threads, 0 of 184,320 cases missed it, and 8,742 missed thread 0.
+
+**The plant** (acceptance 2): T2's slot-order plant, on 4 processors. It sends integrity's threads off the source, then brings 6, 1, 7, 3 and 0 back into its free slots 1 to 5, and the layout lines show it reached the path in every boot.
+- **On the fix,** hooked at the phase's new start: 4 of 4 passed at `d9aed40c`, and 4 of 4 again at `7ad63f98`. In every boot, 8 moves were tried into the full queue and 1 to move the thread out.
+- **On the unfixed phase** (`947a504c`), the negative control, alternated with the first four: 2 of 4 failed, "no move into the full queue was answered".
+
+**Controls** (also in ADR-0013): 2026-11-26, 02:15 to 02:46 UTC, Rust 1.100.0, QEMU 11.1.3 TCG on the development Mac, on AC power. Each is one edit to an export, never to the tree (the session's `plants129.py`), built and booted once through `boot-test`'s `kernel boot`, on 2 processors unless named. "Run on" means `xtask`'s stops at ": scheduler failed" and at pinned mode are taken out of the export's `xtask`, so the boot goes on past its first failing line and the capacity line prints.
+
+| Control | Planted | Result |
+|---|---|---|
+| Plant | T2's slot-order plant at the fixed phase's start (4 processors) | Passed 4 of 4 at `d9aed40c` and 4 of 4 at `7ad63f98` |
+| Its negative control | The same plant on the unfixed phase, at `947a504c` (4 processors) | Failed 2 of 4: "no move into the full queue was answered" |
+| P129-1 | Claim (i): `migrate`'s room check (e) removed | Caught: the arrival's panic, "a thread could not arrive at a queue checked to have room", during integrity. At `d9aed40c` and at `7ad63f98` |
+| P129-2 | Claim (ii): at the room check's refusal, the thread departs its source queue and is not put back | At `d9aed40c`: caught by pinned mode's trigger 3, but run on, "stayed true" (the reason for `held_on`). At `7ad63f98`, run on: caught on "the thread stayed on CPU 0 false", and by pinned mode and the move out |
+| P129-2H | `held_on` reading the location only, as `queued_on` does, with P129-2 (run on) | As designed: "stayed true", the line failing only on the move out, and pinned mode's trigger 3 |
+| P129-3 | Claim (iii): a move out of a full source refused as full (run on) | Caught: "the move out of it made false". At `d9aed40c` and at `7ad63f98` |
+
+**The gates** (acceptance 4): at `7ad63f98`, in one `cargo xtask exclusive` turn, 2026-11-26, 03:44 to 05:44 UTC. The toolchain was Rust 1.100.0, with QEMU 11.1.3 TCG on the development Mac. The Mac was on AC power at every step and did not sleep: its last wake, 2026-11-25 05:50 UTC, was unchanged after the turn. The tree was clean at the end.
+
+| Gate | Result |
+|---|---|
+| `cargo xtask check` | Passed in 999 s. The host tests passed 605, with 1 ignored, the model's two tests among them. Loom: all 96 models passed and all 148 negative controls were caught. |
+| `cargo xtask boot-test` | Passed in 68 s: 11 of 11 scenarios. |
+| `cargo xtask boot-matrix`, three runs | Each passed, in 2,054 s, 2,025 s and 2,029 s. Each run had 16 of 16 capacity lines passing. |
+
+**Review:** none. Neither an AI reviewer nor a person has reviewed the change; the contract asked for none.
+
+**Not shown:**
+- Anything on a physical machine or under KVM until CI runs it.
+- The phase on more than its two processors. The others' threads are left as they are, as before.
+- The fix against an order the model does not cover. The model holds the five threads of T2's dump and one processor; the phase's argument, that the boot flow runs only while the phase's thread does not, holds for any order.
+
+**Follow-ups:** none new. TASKS item 148 (whether the ask is needed) is the coordinating session's.
+
+### 152. Integrity's pulled phase made structural on two processors: two helpers on each puller (ADR-0013 R1 (b); PR 67's CI at `947a504c`)
+
+Numbered by the coordinating session on 2026-11-26, as a follow-up to TASKS item 98. Its line is in the coordinating session's records pull request. TASKS item 98's session diagnosed it (`d98-findings.md` in the coordinating session's notes) and built it the same day, on `claude/t152-pulled-helper` cut from TASKS item 129's tip, `bfd4ec11`. Nothing is pushed: the keeper lands it, after TASKS item 129.
+
+**What failed.** PR 67's CI at `947a504c` (run 45739294613) failed integrity's pulled phase on every 2-processor machine of its three boot jobs: the software-CPU job's machine with reserved memory, and both KVM jobs' Intel IOMMU machine. Each line read "1 pull by idle processors, 0 of a thread moved before; 0 moves back by the boot flow", with 4.79M, 58.8M and 45.3M moves back refused, and "a pull of a thread moved before: no, in 30 s". The 4-processor machines passed in the same jobs.
+
+**Why: (b), the proof, not the kernel** (the coordinating session's ruling, 2026-11-26, 06:12 UTC).
+- **What the boot flow can move.** It can move only a thread that is ready, not running, and not the context its processor last switched out (ADR-0020 S5; `Contexts::lend` refuses `Leaving`).
+- **Two contexts give it nothing.** With two contexts on a processor, every yield and every tick switches between them, so the waiting one is always the one just switched out. A report-only diagnostic counted 0 ticks or yields, on either processor, that kept the running thread while another waited.
+- **Why two processors only.** There the source is the boot processor, and the one processor left to pull is CPU 1. Once CPU 1 held two of the phase's threads alternating, a move back waited for CPU 1 to idle, which needs their two-tick sleeps to overlap: a run order.
+- **What CI showed.** On CI's runners CPU 1 never idled again after its first pull. On the Mac it idled 44 to 95 times a phase, and the failure did not reproduce under 10 or 20 busy processes.
+- **Not a kernel defect.** The dump showed CPU 1 running thread 2, with thread 1 ready and waiting, holding no word: exactly the frame S5 does not promise movable (R98-1, TASKS item 99's).
+
+**The ruling: A, two helpers on each puller** (terms 1 to 8, 06:12 UTC; two helpers, not one, at 06:53 UTC on the session's question).
+- **One helper is not enough.** One helper with one of the phase's threads is two contexts alternating again. So under the control, which keeps a puller holding one thread, one helper could not pass. And after every move back that leaves a puller one thread, one helper never sees another move back counted.
+- **Two cover every case.** Two helpers give the puller three or more contexts ready whenever one of the phase's threads there is awake.
+
+| Field | |
+|---|---|
+| Task ID | TASKS item 152 |
+| Objective | Integrity's pulled phase moves a thread back by progress, never by a run order, on every machine, two processors included, with R1's bounds and counts unchanged. |
+| Source ownership | `framekernel/src/migration_proof.rs` (the helpers and the boot flow's use of them); `framekernel/src/runqueue.rs` (one `mod` line) and `framekernel/src/runqueue/puller_model.rs` (a host test). |
+| Architecture contract | ADR-0013 R1 (b) and its integrity row; ADR-0020 S5 and R98-1. No scheduler path changed; no ABI or format change. Existing interfaces only: `sched::spawn`, `WaitQueue`, `sched::yield_now`, `sched::queued_on`. |
+| Security invariants | None changed. The helpers are kernel threads of the proof, pinned, holding no lock across a yield. No `unsafe`, no `asm!`. |
+| Performance constraints | ADR-0018 V3: none on any scheduler path; the helpers exist only in integrity's pulled phase. |
+| Acceptance | The ruling's eight terms: the helpers, R1 unchanged, the never-sleep control, C98-1, 9b, 11, 12, 14 and 15b again, the host model, the branch, the gates, and CI after landing. |
+
+**What was built** (3 commits on `bfd4ec11`, with the records after them):
+- **`c766b1b4`, the helpers.**
+  - **What they are.** Each processor left to pull (`pulling`, the processors `pullers` counts) gets `HELPERS_EACH` = 2 threads of the phase's own, spawned pinned (`sched::spawn`) before the phase's threads. They are not declared for balancing, and hold no word and no canary.
+  - **How they wait.** Each waits on its processor's `WaitQueue` until that processor's `wanted` is raised or the proof stops, then only yields while `wanted` stays raised.
+  - **What the boot flow does with them.** Before each round of moves back, for each such processor it raises `wanted` and wakes the helpers, once, while the processor holds a thread of the phase (`queued_on`), and lowers it while the processor holds none. It also lowers it when it counts a move back from there. So the helpers wait again, and are woken at the next round if the processor still holds one.
+  - **How they end.** They end with the phase: the stop wakes them, and the phase waits for them with its threads, inside `sched::OTHERS_PATIENCE`.
+  - **What the line says.** It now says "with N helpers of the phase's own pinned to them, woken M times". `xtask`'s marker is the line's prefix, unchanged.
+  - **The bounds.** They are as before. A puller holds at most 15 of its 16 slots: at most `PULLED_MOST` (12) of the phase's threads, the 2 helpers and its idle context. The helpers are not pullers: `PULLERS_MOST` counts processors. Delivery's pulled phase has none.
+- **`0e6fe0c0`, the host model:** `runqueue/puller_model.rs`, under one `mod` line in `runqueue.rs`, beside TASKS item 129's.
+- **`da6fc211`, the model judged once every context has run.** In the first turn its three tests failed, on the model's start-up: a thread that has not yet run is movable as spawned, and the first switch count held no event. The model now counts from the point every context has been switched out once.
+
+**Why a move back is now progress** (term 5).
+- **What a move back needs.** It needs a thread that is ready, not running, and not the context just switched out.
+- **What the helpers give it.** While its helpers yield, a puller holding one of the phase's threads awake has at least three contexts ready, and every yield and tick switches. So the context switched out two switches ago is published again at the next switch, while a third runs. Within two switches, one of the phase's threads there is ready, not running and not leaving. Whether it is awake depends on the thread's own iterations, not on another processor's timing.
+- **The host model checks it on the real run queue,** with the context table's frame rule: a thread is movable if it is ready, not running and not the context last switched out, which a switch, or a tick that switches nothing, publishes.
+  - **Two helpers, with one or two of the phase's threads** (`two_helpers_leave_a_thread_movable_within_two_switches`): sleeping every fourth iteration or never, every slot order, every iteration phase, eight seeds of the ticks' draw. That is 6,528 cases and 3,359,104 windows of three consecutive switches over which a thread stayed awake. In none was no thread movable.
+  - **The controls:**
+    - Two threads that never sleep and no helper (`without_helpers_two_alternating_threads_are_never_movable`): a thread was movable in none of 152,320 windows.
+    - One thread and one helper (`one_helper_leaves_one_thread_never_movable`): none of 38,080.
+
+**Controls** (also in ADR-0013): the first turn, 2026-11-26, 06:46 to 07:02 UTC, at `0e6fe0c0`, whose kernel code is the tip's (`da6fc211` changes the model alone).
+- **The setup.** Rust 1.100.0, with QEMU 11.1.3 TCG on the development Mac, on AC power, with no sleep. Each control is one edit to an export, never to the tree (the session's `plants152.py` and `plants98b.py`). Each was built and booted once through `boot-test`'s `kernel boot`, on the machine named.
+- **The unplanted fix**, booted twice there on 2 processors, passed both:
+  - 16 and 10 pulls; 13 and 7 of a thread moved before; 16 and 10 moves back;
+  - threads moved while they held their word: 8 and 8;
+  - after 690 and 841 ms; the helpers woken 17 and 10 times.
+
+| Control | Planted | Machine | Result |
+|---|---|---|---|
+| Never-sleep (term 3), unfixed | Integrity's pulled threads yield where they slept, at `bfd4ec11` (TASKS item 129's tip) | 2 | Failed 2 of 2 in the first turn, as CI did: 0 pulls by idle processors, 0 of a thread moved before, 0 moves back (3,000 and 2,999 refused), "a pull of a thread moved before: no, in 30 s", scheduler failed |
+| Never-sleep, fixed | The same plant on the fix | 2 | Passed 2 of 2 in the first turn: 6 and 5 pulls, 3 and 3 of a thread moved before, 6 and 4 moves back, threads moved while they held their word 10 and 4, after 1,811 and 1,281 ms; the helpers woken 7 and 5 times |
+| C98-1 | The idle pass pulls nothing | 2 | Caught: integrity's pulled line, 0 pulls, "no, in 30 s", scheduler failed (the helpers woken 0 times) |
+| C98-9b | A pull of a thread moved before hands it the puller's idle FPU area, once | 2 | Caught: integrity's pulled line, "canaries changed 194 times" |
+| C98-11 | No processor occupied in a pulled phase | 8 (`boot-domains`) | Caught: integrity's pulled line, "6 left to pull (at most 4)", scheduler failed (with 12 helpers) |
+| C98-12 | No move while a thread held its word counted | 2 | Caught: integrity's pulled line, "threads moved while they held their word 0 (not exercised)", after its 30 s budget |
+| C98-14 | The cache-hot rule as before the gates' stop of item 98 | The x2APIC machine, `-cpu max,vendor=GenuineIntel`; and the host | Caught at boot by "load balancing"'s kick case: of the 8 wake-ups made on CPU 0, kicks sent 0, scheduler failed; on the host by the run queue's cache-hot tests (`a_spawn_into_a_freed_slot_inherits_no_mark`, `a_thread_woken_after_a_long_block_is_cold_at_once`, among others) |
+| C98-15b | The pull's frame-published check taken as always true, and `lend`'s check of the leaving record removed | 2 | Caught by pinned mode: "a move's lend found no published frame on CPU 0; the thread stays where it is" |
+
+**The gates** (term 7): at `da6fc211`, in one `cargo xtask exclusive` turn, 2026-11-26, 07:21 to 09:24 UTC. Rust 1.100.0, QEMU 11.1.3 TCG on the development Mac. On AC power at every step, with no sleep: the last wake, 2026-11-25 05:50 UTC, was unchanged. The tree was clean at the end.
+
+| Gate | Result |
+|---|---|
+| `cargo xtask check` | Passed in 1,028 s: 2,858 host tests by its unfiltered `test result` lines, none failed, the model's three among them; Loom: all 96 models passed and all 148 negative controls were caught |
+| `cargo xtask boot-test` | Passed 11 of 11 in 70 s. Its 2-processor integrity pulled line: 21 pulls, 18 of a thread moved before, 21 moves back, 21 threads moved while they held their word, after 220 ms |
+| `cargo xtask boot-matrix`, three runs | Each passed, in 2,065, 2,035 and 2,015 s. Each run had 47 integrity pulled lines, none failing. On the 33 two-processor machines of each run: 8 to 34 pulls, 5 to 31 of a thread moved before, 8 to 33 moves back, 2 to 30 moved holding, after 61 to 1,211 ms. The helpers ran as built: 2 on the 2- and 3-processor machines' one puller, 4 on the 4-processor machine's two, 8 on the 8-, 65- and 67-processor machines' four. The capacity lines did not fail |
+| The never-sleep control, unfixed (`bfd4ec11`) | Failed, as CI did: 0 pulls, 0 of a thread moved before, 0 moves back (2,985 refused), "no, in 30 s", scheduler failed |
+| The never-sleep control, fixed (`da6fc211`) | Passed: 4 pulls, 1 of a thread moved before, 4 moves back, 7 moved holding, after 1,835 ms; the helpers woken 5 times |
+
+**Review:** none. Neither an AI reviewer nor a person has reviewed the change.
+
+**Not shown:**
+- Anything on a physical machine, or under KVM until PR 67's CI runs it after the keeper lands it (term 8). If CI still fails there, it goes back to the coordinating session.
+- Whether CI's runners idled CPU 1 as the diagnosis infers. The diagnostic never ran there, and the Mac never reproduced the failure without the never-sleep plant.
+- How a move back that the boot flow tries lands among a puller's switches. The model shows a thread movable within two switches. The boot flow's try is taken under that puller's queue lock, so a puller that keeps switching gives it one window in every two or three switches; the model does not run the boot flow.
+
+**Follow-ups:** none new. R98-1, two alternating threads not movable without an ask or a kick, is TASKS item 99's.
+
+### 144. Coverage-guided fuzzing on stable Rust (owner item 359)
+
+Assigned by the coordinating session on 2026-11-25, after the owner's "Accept all" to items 358 to 363. Built on `claude/t144-fuzzing-4d7ce0`, cut from `land/batch-11` at `98e28bf7`, with `main` merged at `d611032f` (PR 72's records). The step 1 report, the step 2 contract and the coordinating session's rulings are the coordination notes' `t144-smoke.md`.
+
+**Step 1: cargo-fuzz on Rust 1.100.0 stable** (2026-11-26).
+- **Versions read on crates.io on the day,** each the newest and none yanked: cargo-fuzz 0.13.2, `libfuzzer-sys` 0.4.13, `arbitrary` 1.5.0. cargo-fuzz was installed with `cargo install --locked cargo-fuzz --version 0.13.2`, built by 1.100.0.
+- **Shown on the development Mac:** `cargo fuzz build --sanitizer none` builds with the pinned compiler, and none of its compiler command lines carries a `-Z` flag; `cargo fuzz run --sanitizer none` runs a target for a fixed time; the control `smoke_finds`, a crash behind four bytes compared one at a time, is found in under a second (coverage rising one step per byte matched) and its input kept. With the default sanitizer the build fails on stable ("the option `Z` is only accepted on the nightly compiler"): `--sanitizer none` is what makes stable work, and only AddressSanitizer would need item 360's nightly.
+- **Recorded** by a check in `developer-tools/toolchain/verify.sh` (INFO without cargo-fuzz, as QEMU is), whose result `docs/toolchain/VERIFICATION.md` shows.
+
+**The rulings** (2026-11-26). Q1 to Q15 accepted as recommended, with these additions: the root workspace excludes `tests/fuzz` (Q1); every build crate recorded by version and checksum (Q2); an input over the time limit is a finding, like a crash (Q7); the seeds at most 1 MiB per target and 4 MiB in all, with the document gate passing (Q9); a crash or timeout in CI fails the job and goes to the coordinating session, and the pull request waits for its reading (Q10); `host-tools-gate` passes (Q11). Then:
+- **Where fuzzing runs:** the runs are CI's, each target for a fixed time in a job of its own; locally only the smoke check, short trials and replays, minutes each, in a turn; minimized crashes become host tests that `check` replays. So the CI job is a matrix, four jobs at a time, 180 s each; a local run defaults to 60 s, and one over 300 s is refused unless `CI` is set.
+- **Q16:** `check` type-checks the fuzz workspace with `--cfg fuzzing`, unless that costs more than 30 s on a warm target. It costs 4.07 s cold, libFuzzer's C++ included, and 0.02 s warm, so it stays.
+- **Q17, decision item 365** (the owner's "Accept 365", option A): a fuzz target is a test program, started to test first-party libraries, as item 310 has `cargo test` start test binaries. `host-tools-gate`'s G1 allows cargo-fuzz's `run`, `tmin` and `cmin`, as one list after `fuzz`, only in the functions `FUZZ_RUNS` lists (`fuzz.rs`'s `libfuzzer` and `minimize`).
+
+**What was built.**
+- **`tests/fuzz`** (`origin-fuzz`): a workspace of its own with its own `Cargo.lock`, as Loom's scratch workspace is (decision item 20). Nine targets and the two smoke targets, each a few lines.
+- **`tests/fuzz/harness`** (`origin-fuzz-harness`), the library the targets call; it does not depend on libFuzzer, so its tests run under plain `cargo test`:
+  - **ONBF** (`onbf.rs`): a writer of images laid out as §4.1 requires with every digest sealed, mostly KRN images the loader verifies in developer mode, now and then with a signature block, flipped bytes, and the digests sealed again or not; a sealer that recomputes the section digests, Merkle trees and content digest of any bytes; an exerciser that parses under each option set, judges what is accepted against §4.1 to §4.4 and errata G4 and G5, and runs every reader of the parts; and the loader's `kernel::verify`, segment table and placement.
+  - **OCBOR-1** (`ocbor.rs`): a writer of items in the forms OCBOR-1 accepts and those it refuses, and of KRN manifests with chosen fields; an exerciser that judges a validated document (every item reads; it is exactly one item).
+  - **Signature blocks** (`signature.rs`): a writer whose entries name the test kernel key and the image's digest; an exerciser that judges what the parser accepts against §7.1 and runs `verify_entry`, `verify_krn_block`, and the Ed25519 and ML-DSA verifiers directly on each signature (a fuzzed signature never verifies, so `verify_entry` alone would never hand an ML-DSA signature to its verifier).
+  - **AML** (`aml.rs`): a host whose every answer comes from the input and whose clock is a counter, so a run can be replayed; a writer of term lists in ACPI 6.6 §20.2's encodings; an exerciser that loads under `Limits::BOOT_PROOF`, walks the namespace, evaluates two objects, and runs the initialization walk and `_REG`.
+  - Each target checks at start-up that overflow panics in its build. The writers' own tests show what reaches acceptance, of 300 inputs each: ONBF images 193 parsed and 61 verified by the loader; the sealer restored all 51 images it flipped; OCBOR-1 126 items validated and 164 manifests decoded; signature blocks 170 parsed; AML blocks 185 loaded.
+- **`tests/fuzz/seeds`**: eight seeds per target, written by the harness's writers from a fixed generator (`examples/seeds.rs`, run by hand): 681,855 bytes in all, the largest set `loader_place`'s 190,942 bytes, within the caps of 1 MiB per target and 4 MiB in all; the document gate passes with them.
+- **`cargo xtask fuzz`** (`developer-tools/xtask/src/fuzz.rs`, one dispatch line in `main.rs`): checks that the root lock names no fuzzing crate, the seeds' caps and cargo-fuzz's version; fetches the fuzz lock with `--locked`; runs the harness's tests; runs the control, which must find its crash; then the target, from a scratch corpus seeded from the committed seeds, with libFuzzer's 10 s and 2,048 MB limits. A crash or timeout is minimized, printed as hex, and fails the run. `replay` and `list` too.
+- **CI** (`.github/workflows/ci.yml`, job `fuzz`): one job per target, four at a time, each `cargo xtask fuzz <target> --seconds 180` after cargo-fuzz is installed `--locked`; the minimized findings kept 14 days. CI runs on pull requests and on `main`, so the job is first seen when the batch's pull request runs.
+
+**The trials** (2026-11-26, 02:46 to 02:57 UTC, in one turn on the development Mac; aarch64, Rust 1.100.0, cargo-fuzz 0.13.2, `--sanitizer none`): each target 60 s through `cargo xtask fuzz`, after the harness's tests and the control. Every run ended with nothing found, and the control was found in every run (at execution 20,286, the same seed each time). Coverage is libFuzzer's count of instrumented edges, from the seeds to the end of the run:
+
+| Target | Seeds' coverage | After 60 s | Corpus | Executions | Peak RSS |
+|---|---|---|---|---|---|
+| `onbf_image` | 340 | 571 | 314 | 964,548 | 38 MB |
+| `onbf_image_built` | 632 | 1,602 | 914 | 73,107 | 34 MB |
+| `loader_place` | 322 | 508 | 251 | 670,250 | 37 MB |
+| `ocbor` | 84 | 248 | 424 | 7,799,445 | 28 MB |
+| `ocbor_built` | 181 | 569 | 790 | 3,753,616 | 30 MB |
+| `signature` | 182 | 391 | 284 | 2,511,177 | 31 MB |
+| `signature_built` | 339 | 948 | 715 | 737,707 | 39 MB |
+| `aml` | 599 | 1,693 | 1,515 | 442,665 | 774 MB |
+| `aml_built` | 1,049 | 2,099 | 815 | 17,224 | 1,028 MB |
+
+**Memory in the AML targets.** The two AML targets' peak RSS reached 774 MB and 1,028 MB, where the others stayed under 40 MB. With libFuzzer's RSS limit set to 256 MB, `aml_built` stopped on an input after about 6 s. This is neither a leak nor memory beyond the interpreter's limit. It was measured on 2026-11-26 with a counting allocator around the targets' own functions, in a program not kept, and with macOS's `time -l`:
+- **Per input:** over the trials' corpora, the interpreter's peak live heap was at most 52,431,338 bytes. It went over the 32 MiB limit on 26 of the 839 `aml_built` inputs and 1 of the 1,525 `aml` inputs, and never over 64 MiB. A vector that moves when it grows holds its old and new copies for a moment, and `Limits::BOOT_PROOF`'s documentation allows for that ("up to about twice its limit"). On the input that stopped, the interpreter's own count (`memory_used`, 19,399,881 bytes) agrees with the heap actually live (19,404,066 bytes).
+- **Across runs:** five passes were made over each corpus. The heap still live after passes 2 to 5 is the same, so no run leaves memory behind.
+- **The process's resident memory grows anyway.** The fuzz binary replayed the stopped input 1, 50, 200 and 600 times, peaking at 39, 505, 647 and 648 MB. The curve levels off, so this is macOS's allocator keeping freed pages, not a leak. Linux's allocator returns memory differently, so a CI job may or may not reach the 2,048 MB limit in 180 s. If one stops with an `oom-` input, it is most likely this, and it is still a finding for the coordinating session to read (ruling Q10).
+
+**What is not shown.**
+- The CI jobs have not run: nothing was pushed. Locally, only the development Mac (aarch64-apple-darwin); the CI jobs will be the first x86-64 Linux runs.
+- Fuzzing finds bugs and proves nothing (row S73-12): a run that finds nothing says only that the inputs it reached did not fail. Sixty seconds per target is a trial, not a campaign.
+- No crash was found, so no regression test exists yet, and `check` has nothing to replay. The first finding brings its minimized input and its host test.
+- Without a sanitizer, memory errors inside `std` and `alloc` go unseen; every fuzzed crate forbids `unsafe`. A crash prints the panic but no stack trace, and only libFuzzer's polled RSS limit bounds memory.
+- Not fuzzed: the ACPI table parsers (`origin-acpi-tables`, reached here only through `Load` and `LoadTable`), IMAGE_FS (not built), the kernel's device parsers, and the ML-DSA verifier with a real key for ML-DSA-65 (a stand-in key's bytes are used).
+- The new files are not in the public file index (`developer-tools/public-index/files.json`), which is the owner's allowlist.
+- No person and no second agent has reviewed the harnesses, `fuzz.rs` or item 365's rule.
+
+### 155. Integrity's helper makes the moves back, at its own turns (ADR-0013 R1 (b); PR 67's CI at `1754fa08`)
+
+Numbered by the coordinating session on 2026-11-26, as a follow-up to TASKS item 152. Its line is in the coordinating session's records pull request. TASKS item 152's session diagnosed it (`ci1754-findings.md` in the coordinating session's notes) and built it the same day, on `claude/t155-helpers-move-back` cut from `land/batch-11` at `1754fa08`, which holds TASKS items 152 and 144; its `framekernel` is `6bd821b0`'s. Nothing is pushed: the keeper lands it.
+
+**What failed.** PR 67's CI at `1754fa08` (run 45801013688): TASKS item 152 held under KVM, but QEMU's software-CPU job failed integrity's pulled phase on one 2-processor machine, the NIC behind a bridge with the Intel IOMMU. Its line read: the helpers woken 2 times; 3 pulls by idle processors, 0 of a thread moved before; 1 move back by the boot flow (3,448 refused); threads moved while they held their word 0 (not exercised); "a pull of a thread moved before: no, in 30 s". Two other 2-processor lines in that job passed, after 2,696 and 17,341 ms.
+
+**Why: (b), the proof, not the kernel** (the coordinating session's ruling of 2026-11-26).
+- **No processor idled with work queued.** The dump's "CPU 1: 3 ready, current slot 1, idle true" is CPU 1 running a helper, with the other helper ready and thread 0 in its two-tick sleep. `idle` there is the queue's fixed flag that slot 0 is its idle flow.
+- **The boot flow tried about once a tick.** On two processors the start processor is the boot processor, so the boot flow shares it with the phase's threads there. They spin a tick and a half under their words, and every turn is charged one stride however long it lasts. So while one spins, the boot flow gets about one turn a tick, with one try in it: 3,448 tries in 30 s is 115 a second. The KVM jobs' slowest 2-processor lines tried at the same rate and reached after 9.9 to 27.2 s of the 30 s budget, so KVM passed without a margin. On three or more processors the start processor is an application processor, and the boot flow tries tens of thousands of times a second.
+- **A try had to land in a window.** It succeeds only while the thread on the puller is ready, not running and not the context just switched out (ADR-0020 S5): with two helpers, the second helper's turn after the thread's switch-out, microseconds long. TASKS item 152's model showed that window recurs within two switches, judged at the puller's events, not at another processor's tries. Whether the boot flow's tries met the windows was a run order. That the two processors' timers' phase decided it is inferred, not measured.
+- **The Mac.** The natural failure did not reproduce: six boots of the bridge machine, quiet and under 10 and 20 busy processes, passed after 377 to 878 ms, the boot flow trying 16,000 to 45,000 times a second. A plant giving the boot flow CI's ratio of tries to windows reproduced CI's shape once in two: 1 move back, held 0, "no, in 30 s".
+
+**The rulings.**
+- **The fix** (2026-11-26, about 12:00 UTC): the helpers make the moves back at their own turns on the puller, at most one move per tick of that processor; the boot flow keeps waking them and judging, and makes no moves back where helpers are; delivery is unchanged. `#[derive(Clone)]` on `origin_frame::smp::Online` is accepted on three conditions: a copy is documented as a snapshot of this boot's processors that CPU offlining (CLAUDE.md §24) must revisit; the only copy is the pulled phase's, dropped with it; and the change is a commit of its own, with `migrate`'s documentation naming the helpers and their pace.
+- **One helper, not two** (about 12:25 UTC, on the session's report). The proposal said the second helper's turn found the thread movable, judging a helper's try by the rule for a mover on another processor (S5's `Leaving`). The first controls, at the two-helper form, showed otherwise: the fix's every helper try was a move (122 of 122 and 121 of 121), and one helper per puller, planted as the control that was to fail, passed too (102 of 102 and 105 of 105, reached after 28 and 75 ms). A mover on the thread's own processor publishes that processor's leaving frame before it lends (`cpu::move_context`; the contract's §1.1, step 6), so the helper's first turn after the switch-out takes the thread. TASKS item 152's second helper existed to keep three contexts ready for the boot flow's tries from another processor, and the boot flow no longer moves threads where helpers are. So this item **supersedes TASKS item 152's two helpers with one** (`HELPERS_EACH` = 1), freeing a slot (§7). The one-helper control is replaced by the helpers trying nothing, which must fail; the model judges a helper's try by the same-processor rule, with a helper that never tries as its control, and item 152's controls, for a mover on another processor, stay. The session's three local commits were rewritten so that none says a second helper is needed.
+- **The rare plant** (about 13:05 UTC, on the session's report that at one round per 25 ticks the unfixed phase passed 3 of 3). The ruled condition that the unfixed phase fail at least once under it is replaced: CI's run 45801013688 is the unfixed failure, and the deterministic controls carry the causal claim. One sparser ratio, one round per 100 ticks, was run once, 3 boots unfixed and 3 fixed after the gates, and reported however they fell, with no further tuning. The fix had to pass 3 of 3 there, with figures showing that its time is set by the boot flow's round period, which sets `wanted`, and not by hitting a window.
+
+| Field | |
+|---|---|
+| Task ID | TASKS item 155 |
+| Objective | Integrity's pulled phase moves a thread back where the window is, on the puller, so that no pass condition rests on the boot flow's rate or a timer's phase; one helper per puller where TASKS item 152 had two. |
+| Source ownership | `framekernel/frame/src/smp.rs` (`Online` derives `Clone`); `framekernel/src/migration_proof.rs` (the helpers' moves back, the thread's spin state, the boot flow's skip and the line); `framekernel/src/sched.rs` (`migrate`'s documentation); `framekernel/src/runqueue/puller_model.rs` (the host model). |
+| Architecture contract | ADR-0013 R1 (b) and its integrity row; ADR-0020 S5 and S6; `sched::migrate`'s pacing (B18). No scheduler path changed; no ABI or format change. |
+| Security invariants | None changed. The helper is a kernel thread of the proof, pinned, calling `sched::migrate` from thread context with no lock held. No `unsafe`, no `asm!`. |
+| Performance constraints | ADR-0018 V3: none on any scheduler path. `Online`'s copy exists only in integrity's pulled phase. |
+| Acceptance | The rulings: the fix with one helper; `Clone` on `Online` under its three conditions; the branch; `check`, `boot-test` and `boot-matrix` three times in one turn on AC; the controls, on the final form; the figures; the records. |
+
+**What was built** (3 commits on `1754fa08`, with the records after them):
+- **`ddfac6dd`, `Online` can be copied.** `origin_frame::smp::Online` derives `Clone`, in a commit of its own (condition 3). Its documentation says a copy is a snapshot of this boot's processors, true only while none goes offline, that CPU offlining (CLAUDE.md §24) must revisit every copy, and where the one copy is (conditions 1 and 2).
+- **`669bcb91`, the helper makes the moves back.**
+  - **One helper** on each processor left to pull (`HELPERS_EACH` = 1), where TASKS item 152 had two.
+  - **Its try.** While its processor is wanted, the helper, at every return from its yield (`move_back`), tries to move back to the start processor a thread of the phase that is on its processor and was switched out in its spin, under its word, unless a move back was already made from that processor in its current tick (`Helpers::moved_at`; `migrate`'s pacing). It runs on the thread's own processor, so `migrate` publishes the frame that processor last switched out before it lends it: a thread just switched out is taken at once.
+  - **The spin state.** Each thread records whether it is in its spin (`Movable::spin`: `SPIN_IN` from just before the spin to just after it). The helper marks the thread `SPIN_MOVED` before its `migrate` and takes the mark back if the move is refused. The thread cannot run meanwhile: it is on the helper's processor, where the helper runs, unless a pull takes it, which is itself a move while it holds its word. When its spin ends, a thread counts a move while it held its word if it is on another processor, as before, or if the helper marked it: so a pull that brought it back before it ran again does not hide the move.
+  - **After a move.** A move made clears the processor's `wanted`, so the helper waits again, as in TASKS item 152; the boot flow wakes it again when the processor next holds a thread of the phase.
+  - **The boot flow** keeps waking the helpers and judging the phase, and moves back no thread on a processor with a helper; integrity's pulled phase has no other. Delivery's pulled phase is unchanged.
+  - **`Online`'s copy.** `Shared::for_pulled` keeps a copy of `Online` for the helpers' `migrate` only where the phase has helpers (`InPulled::online`); it goes with the phase's shared state when the last of its threads and helpers drops it.
+  - **The slots.** A puller holds at most 14 of its 16: at most `PULLED_MOST` (12) of the phase's threads, its helper and its idle context. Helpers are not pullers: `PULLERS_MOST` counts processors.
+  - **The line.** Integrity's pulled line now says "N moves back by the helpers in T tries, B by the boot flow (R refused)". `xtask`'s marker is the line's prefix, unchanged.
+  - **`migrate`'s documentation** names the helper and its pace beside the boot flow's (condition 3).
+- **`2f0a66e2`, the host model with the helper's own moves** (`runqueue/puller_model.rs`).
+
+**Why a move back is now progress.**
+- **Where the try is.** When a tick switches out a spinning thread, the helper's pass is at or below the thread's. The thread was the lowest when picked and was just charged one stride, and the helper's pass is at most the thread's old pass plus one stride: it stops being the lowest once its pass passes the thread's, whether the thread was rotating with it, admitted at the floor after its sleep, or arrived by a pull with its lag. Ties go round-robin forward from the current slot, which from the thread's slot reaches the helper before coming back to the thread. So with one thread of the phase there, the helper runs before the thread does, and its move, on the thread's own processor, takes the frame just switched out. With two threads there, the other may run between; that the helper still runs before the first returns is measured in the model, not argued.
+- **What the boot flow's rate still decides.** Only how soon `wanted` is raised. That is a state the helper keeps until a move is made, not a window.
+- **The pass conditions.** Every move back by a helper is a move while the thread held its word, which the thread counts. "A pull of a thread moved before" follows by the pigeonhole: after each move back the helper waits, the puller idles and pulls, and with four threads the fifth pull is of a thread moved before.
+- **The host model** (`runqueue/puller_model.rs`, on the real run queue, with one helper; one or two of the phase's threads, sleeping or not, every slot order, every iteration phase, eight seeds of the ticks' draw):
+  - **One thread** (`the_helper_finds_each_switch_out_in_a_spin_at_its_next_turn`): 128 cases, 28,802 helper's turns, 11,325 switch-outs of the thread in its spin; each found movable at the helper's next turn before the thread ran again, by the queue's order.
+  - **Two threads:** 1,536 cases, 272,220 helper's turns, 206,190 switch-outs in a spin; none missed, measured over these cases, which the test holds.
+  - **No spin went unswitched**, with one thread or two.
+  - **The control** (`a_helper_that_never_tries_finds_nothing`): a helper that never tries finds no thread, though the threads are switched out in their spins as before (3,825 switch-outs).
+  - **TASKS item 152's tests, for a mover on another processor,** still pass: two helpers, 3,359,104 windows of three switches, none missed; no helper with two threads that never sleep, no thread movable in 152,320 windows; one helper with one thread, none in 38,080.
+
+**Controls** (also in ADR-0013): 2026-11-26, from 12:38 UTC, with the rare plant at one round per 100 ticks from 15:06 UTC, at `2f0a66e2` and, unfixed, at `1754fa08` (TASKS item 152's kernel) and `bfd4ec11` (before the helpers).
+- **The setup.** Rust 1.100.0, with QEMU 11.1.3 TCG on the development Mac, on AC power, with no sleep. Each control is one edit to an export, never to the tree (the session's `plants1754.py`, `plants152.py` and `plants98b.py`), built once and booted through `boot-test`'s `kernel boot` on the machine named.
+- **The rare-round plant** is the ruling's "one round per 25 ticks", and the third ruling's one per 100: the boot flow's whole round, its waking of the helpers and its tries, at most once every 25 (or 100) ticks of its processor, in the phase with helpers, from the phase's start. On the Mac that gives the boot flow CI's ratio of tries to windows. The diagnosis's first version throttled the tries alone, and on the fix the boot flow makes none.
+- **A first controls turn** (12:16 UTC) ran at the two-helper form and was stopped once the one-helper ruling came; its rare-round boots had not run (the turn's script read `$UNFIXED:r` as a zsh modifier). Its results are the ruling's evidence above, not this table's.
+
+| Control | Planted | Machine | Result |
+|---|---|---|---|
+| The fix, unplanted | Nothing | 2 | Passed 2 of 2: 99 and 96 pulls, 96 and 93 of a thread moved before; the helper moved 99 of 99 and 95 of 95 tries; threads moved while they held their word 130 and 119; after 69 and 25 ms |
+| Rare-round at one round per 25 ticks, unfixed | The boot flow's whole round once per 25 ticks, at `1754fa08` (TASKS item 152's kernel) | 2 | **Passed 3 of 3, where the first ruling expected at least one failure**: after 2,970, 11,038 and 6,513 ms, with 3, 1 and 1 moves back by the boot flow from 14, 42 and 25 tries; and once more at the end of the gates' turn, after 19,817 ms, 1 move back from 75 tries. So at this ratio the Mac's plant did not reliably reproduce CI's failure (the coordinating session's ruling of about 13:05 UTC) |
+| Rare-round at one round per 25 ticks, fixed | The same plant on the fix | 2 | Passed 3 of 3: 10 pulls, 7 of a thread moved before, the helper's 8 moves in 8 tries, each run; after 329, 315 and 328 ms; and after 253 ms at the end of the gates' turn, 8 moves in 8 tries |
+| Rare-round at one round per 100 ticks, unfixed | The boot flow's whole round once per 100 ticks, at `1754fa08` | 2 | **Failed 2 of 3**: "a pull of a thread moved before: no, in 30 s", scheduler failed, with 0 pulls, 0 moves back and 30 tries refused, one a round, the helpers woken once; the third passed after 25,126 ms, 1 move back from 26 tries. CI's failure had 3 pulls and 1 move back; these had none |
+| Rare-round at one round per 100 ticks, fixed | The same plant on the fix | 2 | Passed 3 of 3: after 1,050, 1,058 and 1,285 ms; the helper woken twice and its 2 moves in 2 tries, each run; 4 pulls, 1 of a thread moved before |
+| Rare-round at one round per 25 ticks, fixed, the bridge machine | The same plant | 2, the NIC behind a bridge, the Intel IOMMU (the CI failure's machine) | Passed 3 of 3: the helper's 8 moves in 8 tries each run, after 394, 375 and 556 ms |
+| The helpers try nothing | `move_back`'s call never made | 2 | Failed 2 of 2: 0 moves back by the helpers and 0 by the boot flow, "a pull of a thread moved before: no, in 30 s", scheduler failed |
+| Never-sleep (TASKS item 152's), before the helpers | Integrity's pulled threads yield where they slept, at `bfd4ec11` | 2 | Failed 2 of 2: 0 pulls, 0 moves back (2,998 and 2,999 refused), "no, in 30 s" |
+| Never-sleep, fixed | The same plant on the fix | 2 | Passed 2 of 2: 141 and 146 pulls, the helper's 141 and 146 moves in as many tries, after 29 and 24 ms |
+| C98-1 | The idle pass pulls nothing | 2 | Caught: 0 pulls, "no, in 30 s", scheduler failed |
+| C98-9b | A pull of a thread moved before hands it the puller's idle FPU area, once | 2 | Caught: "canaries changed 193 times" |
+| C98-11 | No processor occupied in a pulled phase | 8 (`boot-domains`) | Caught: "6 left to pull (at most 4)", scheduler failed (6 helpers) |
+| C98-12 | No move while a thread held its word counted | 2 | Caught: "threads moved while they held their word 0 (not exercised)" after its 30 s budget, with 1,438 moves back by the helper |
+| C98-14 | The cache-hot rule as before the gates' stop of item 98 | The x2APIC machine, `-cpu max,vendor=GenuineIntel`; and the host | Caught at boot by "load balancing"'s kick case (of the 8 wake-ups made on CPU 0, kicks sent 0), and on the host by the run queue's cache-hot tests (`a_spawn_into_a_freed_slot_inherits_no_mark`, `a_thread_woken_after_a_long_block_is_cold_at_once`, among others) |
+| C98-15b | The pull's frame-published check taken as always true, and `lend`'s check of the leaving record removed | 2 | Caught by pinned mode: "a move's lend found no published frame on CPU 0; the thread stays where it is" |
+
+**The rare plant's two ratios** (the coordinating session's ruling of about 13:05 UTC). CI's own run 45801013688, on `1754fa08`, is the unfixed phase's failure. The Mac's plant did not reliably reproduce it at one round per 25 ticks: the unfixed phase passed all 4 runs there, 3 in the controls' turn at 9 to 34 times the fix's time and 1 in the gates' turn at 78 times. At one round per 100 ticks, the last ratio tried, it failed 2 of 3. The causal claim rests on the deterministic controls: the helpers trying nothing fail, and the never-sleep control fails unfixed and passes fixed.
+
+**The fix's time is set by the boot flow's round, not by a window.** The plant makes the boot flow's rounds at the phase's start and then every 25 or 100 ticks of its processor, nominally 250 ms or 1 s at `HZ` 100. Each round that finds the puller holding a thread of the phase wakes its helper (`wanted`). In every fixed run the helper made exactly as many moves as it was woken, each at its first try: 8 in 8 over the phase's 2 s at one round per 25 ticks, 2 in 2 at one per 100. The plain machine reached just after the second round: after 253 to 329 ms at a period of 250 ms (1.01 to 1.32 periods), and after 1,050 to 1,285 ms at a period of 1 s (1.05 to 1.29 periods). The bridge machine reached after 375 to 556 ms (1.50 to 2.22 periods). Quadrupling the period took the plain machine's mean from 306 ms to 1,131 ms, 3.7 times. The unfixed phase under the same plant reached after 2,970 to 25,126 ms, or not in its 30 s, with 1 to 3 moves back from 14 to 75 tries.
+
+**Gates** (2026-11-26, from 13:00 to 15:00 UTC, in one exclusive turn, on AC power, with no sleep: the last wake was the same before and after). At `2f0a66e2`, Rust 1.100.0, QEMU 11.1.3 TCG on the development Mac.
+
+| Gate | Result |
+|---|---|
+| `cargo xtask check` | Passed, in 976 s. Loom: 96 models passed and 148 negative controls caught |
+| `cargo xtask boot-test` | Passed, 11 of 11 scenarios, in 67 s. Integrity's pulled line, 2 processors: 85 pulls, 82 of a thread moved before; the helper's 85 moves in 85 tries; threads moved while they held their word 121; reached after 24 ms |
+| `cargo xtask boot-matrix`, run 1 | Passed, in 2,027 s. 47 integrity pulled lines: 44 ran and 3 had fewer than two processors, none failing. Slowest "reached": 190 ms, on 2 processors |
+| `cargo xtask boot-matrix`, run 2 | Passed, in 2,010 s, as run 1. Slowest "reached": 180 ms, on 2 processors |
+| `cargo xtask boot-matrix`, run 3 | Passed, in 2,002 s, as run 1. Slowest "reached": 209 ms, on 2 processors |
+
+- **The 33 two-processor lines of each run:**
+  - 38 to 111 pulls, 35 to 108 of a thread moved before;
+  - the helper's 39 to 111 moves, every try a move;
+  - threads moved while they held their word 56 to 150;
+  - reached after 23 to 209 ms.
+- **The boot flow** moved no thread and was refused none in any of the 132 boot-matrix lines that ran, or in boot-test's, since each of them has helpers.
+- **Every helper's try was a move** in every line but one: an 8-processor line of run 3 made 252 moves in 254 tries. A refused try takes its mark back and is tried again, so no pass condition rests on it. The line does not print why `migrate` refused those two, and that was not investigated.
+- **The rare-round pair, again,** made in the same turn after the gates: unfixed, at `1754fa08`, it passed after 19,817 ms, with 1 move back by the boot flow and 74 tries refused. Fixed, it passed after 253 ms, with the helper's 8 moves in 8 tries.
+
+**Review:** none beyond the coordinating session's of the diff before clearance, as the ruling allows. No AI reviewer and no person has reviewed the change.
+
+**Not shown:**
+- Anything on a physical machine, or under KVM until PR 67's CI runs it after the keeper lands it.
+- That the two processors' timers' phase held CI's tries off the windows. It is inferred, not measured.
+- With two of the phase's threads on a puller, that the helper's next turn comes before the first thread runs again is measured over the model's cases, not argued.
+- Why `migrate` refused two of the helper's 254 tries on one 8-processor line of the third `boot-matrix` run. The line does not print the reasons.
+
+**Follow-ups:** none new. R98-1 is TASKS item 99's.
+
+### 143. Kani's first proofs: the frame allocator and the heap (owner item 358; CLAUDE.md §73)
+
+Assigned by the coordinating session on 2026-11-26. Built on `claude/t143-kani-a0310d`, cut from `land/batch-11` at `98e28bf7`, with `main` (`68e961fd`) merged at `7b37f794` (ruling Q10). The contract and its rulings are in the coordination notes (`t143-contract.md`):
+- **Q1 (a):** F-1 fixed in a commit of its own before any proof of `reclaim`.
+- **Q2:** F-2 fixed now: reserve every frame a range touches, not refuse it; the proofs take reserved ranges of any alignment.
+- **Q3:** the heap's proofs assume the page source's contract and `GlobalAlloc`'s, named as unproved.
+- **Q4:** over 15 minutes or 8 GB for a harness on CI's standard runner, its bound comes down, and the records state the bound that ran.
+- **Q5:** "any sequence of operations" covers only the methods listed with their harnesses; a method left unproved is named and excluded.
+- **Q6:** `cargo xtask kani` stays out of `check`; the static `kani-gate` is in it; the CI job runs the proofs.
+- **Q7 to Q9:** Kani's bundle under item 358, reached only through `cargo kani`; Kani's section in `verify.sh`; the controls in a scratch copy under `target/`.
+- **Q11:** S73-04 `built`, S73-02 `partial`, S73-12's limitation naming Kani beside Loom.
+- **Q12:** one independent AI review, committed, every finding answered before clearance.
+- **Q13:** the ONBF parsers (S73-08) next, then capability validation (S73-07), each with a short contract; `origin-paging` gets an item of its own.
+- **FA-7:** `reclaim` left out of Kani's claim (TASKS item 154). **The local budget:** each local run, harness or control, under 5 minutes and 8 GB; CI's Q4 rule binds the claim.
+
+**What was built.**
+- **Two fixes to `frames.rs`, each with a host test that fails without it:**
+  - **F-1** (`9570ca05`): a second `reclaim` of a kind freed every frame of it in use, frames already handed out; a kind already taken over now returns 0 and changes nothing (`a_second_reclaim_leaves_handed_out_frames_alone`).
+  - **F-2** (`c24fd771`): `new` reserved an unaligned range from the frame holding its base for `pages` frames, so the last frame it touched stayed free and was handed out; `new` and `allocatable` now share `reserved_frames`, every frame the range touches (`an_unaligned_reserved_range_reserves_every_frame_it_touches`).
+  - The kernel passes aligned ranges and reclaims once, so no kernel run changes.
+- **`frames::proofs`** (`framekernel/frame/src/frames/proofs.rs`), 12 harnesses. The invariant: accounting, ownership (checked at a frame Kani chooses freely) and cover, with `owned`, `map_end` and `words_needed` written from the documentation, not the code. `new` establishes it; `allocate`, `free` and `claim` (each over two words and over one), `allocate_run` and `free_run` keep it from any valid state; `two_hand_outs_never_overlap`.
+- **`heap::proofs`** (`framekernel/frame/src/heap/proofs.rs`), 6 harnesses: `allocate` and `free` keep the heap's invariant from any heap of up to 2 slabs; `plan` and `take_free_bit` for every input; `two_allocations_never_overlap`; the rotation stubs equal core's rotation.
+- **`cargo xtask kani [--harness <name>]`** (`developer-tools/xtask/src/kani.rs`): every harness verified with every cover satisfied, then 27 controls in a scratch copy, each required to fail with a check it names; **`kani-gate`** in `check`; **CI's job `kani`** with `.github/ci/install-kani.sh` (the pinned driver, the bundle checked against GitHub's SHA-256); `cfg(kani)` in `check-cfg`; Kani's section in `verify.sh`.
+
+**What is proved, and within which bounds.** Each module's documentation says it in full (row S73-12):
+- **The frame allocator:** a memory map of 3 regions of any kinds that `boot::summarize` accepts, and 2 reserved ranges of any base and size (the kernel passes two). Each step from any valid state of its size: `new` over 5 frames (2 for the nine ranges), `allocate`, `free` and `claim` over 128 and over 64, `allocate_run` over 8 with runs of at most 4, `free_run` over 16, two hand-outs over 8. Composed: the invariant holds after any sequence of those methods on an allocator `new` built over at most 5 frames. No sequence past 5 frames is proved.
+- **The heap:** a table of 2 slabs, each slab's bitmap whole; the page source's contract and `GlobalAlloc`'s caller's are assumed.
+- **Not proved:** `reclaim` (TASKS item 154); sizes past the bounds; `memory.rs` and `early.rs`' use of the two; concurrency; the machine code rustc 1.100.0 makes (Kani compiles with `nightly-2026-08-21`).
+
+**The commits,** on `98e28bf7`:
+- `9570ca05` F-1, a second `reclaim` of a kind; `c24fd771` F-2, an unaligned reserved range; each with its host test.
+- `1233878e` `cfg(kani)` in the workspace's `check-cfg`.
+- `e60f35c3` the heap's proofs; `94d44ec3` the frame allocator's proofs.
+- `723e52d3` `cargo xtask kani`, `kani-gate` in `check`, and CI's job.
+- `6201e1b8` Kani's section of `verify.sh`.
+- `56e8d38c` the answers to the review.
+- `7b37f794` `main` (`68e961fd`) merged (ruling Q10).
+- `baf67a7c` `verify.sh` names Kani's bundle under `~`, so the committed record does not name the account.
+- The records' commit, with this entry, then `docs/toolchain/VERIFICATION.md` regenerated by `verify.sh` from a clean tree.
+
+**The review.** One independent AI review of `6201e1b8` (`docs/engineering/REVIEW_T143_2026-11-26.md`), given the code and the properties but not the author's argument. It found no unsound proof, no false pass in the runner and no control passing for the wrong reason. Its findings: no High; one Medium (R143-1, the induction's base and three steps on different bitmaps); six Low; six Info. All are answered at `56e8d38c`, but R143-10, which is a follow-up.
+
+**The runs.** At `56e8d38c`, on the development Mac (Apple M1 Max, 64 GB; on AC power until 15:37:52 UTC and on battery after, its power mode set to high, with no sleep in `pmset -g log`), one harness at a time, each in a turn of its own, by `cargo xtask kani --harness <name>` with Kani 0.68.0 and CBMC 6.11.0 at Kani's default solver, on 2026-11-26 from 13:44 to 16:22 UTC: each of the 18 harnesses verified with every cover satisfied, and each of the 27 controls was caught, on the check it names, by every harness it names (31 pairs). The times are Kani's verification time for the harness, then for each of its controls; the memory is the largest process of the run (`/usr/bin/time -l`), in GB of 10⁹ bytes.
+
+| Harness | Proof | Controls | Memory |
+|---|---|---|---|
+| `frames::proofs::new_frees_exactly_the_owned_frames` | 70 s | 69, 73, 73 s | 5.7 GB |
+| `frames::proofs::new_refuses_a_bitmap_too_small` | 39 s | 29 s | 3.0 GB |
+| `frames::proofs::new_refuses_more_than_eight_ranges` | 2 s | 154 s | 6.1 GB |
+| `frames::proofs::allocate_hands_out_a_free_frame` | 52 s | 16, 18 s | 1.0 GB |
+| `frames::proofs::allocate_hands_out_a_free_frame_one_word` | 19 s | 16 s | 0.9 GB |
+| `frames::proofs::free_takes_back_only_what_was_handed_out` | 51 s | 39, 36 s | 1.0 GB |
+| `frames::proofs::free_takes_back_only_what_was_handed_out_one_word` | 27 s | 27 s | 1.0 GB |
+| `frames::proofs::claim_takes_only_a_free_frame` | 47 s | 41 s | 1.1 GB |
+| `frames::proofs::claim_takes_only_a_free_frame_one_word` | 29 s | 25 s | 1.1 GB |
+| `frames::proofs::allocate_run_hands_out_a_free_aligned_run` | 99 s | 40, 123 s | 2.6 GB |
+| `frames::proofs::free_run_is_all_or_nothing` | 110 s | 24, 108, 97 s | 2.5 GB |
+| `frames::proofs::two_hand_outs_never_overlap` | 298 s | 255 s | 5.0 GB |
+| `heap::proofs::plan_fits_every_layout` | 0.5 s | 0.4 s | 0.3 GB |
+| `heap::proofs::take_free_bit_takes_the_lowest_free_bit` | 3.3 s | 2.9 s | 0.4 GB |
+| `heap::proofs::the_rotation_stubs_equal_core_s` | 11 s | 11 s | 0.5 GB |
+| `heap::proofs::allocate_keeps_the_heap_whole` | 128 s | 129, 118, 115, 119 s | 4.0 GB |
+| `heap::proofs::free_takes_back_only_a_live_block` | 135 s | 179, 119, 100, 120 s | 3.3 GB |
+| `heap::proofs::two_allocations_never_overlap` | 87 s | 57 s | 6.4 GB |
+
+Every run is inside the local budget of 5 minutes and 8 GB. `two_hand_outs_never_overlap` is inside it by 2 s: at `6201e1b8` it took 186 s and its control 206 s. The rise is not explained: `56e8d38c` changed the specifications it calls (R143-4) and the steps' bodies (R143-1), and this run was on battery; none of the three was measured apart. The run had a processor to itself (555 s of user time in 558 s). If a later local run passes 5 minutes, its bound (8 frames) comes down and the records say so. The times on CI's standard runner are not known yet.
+
+**Not shown:**
+- CI's job `kani` on a standard runner: not yet run on a pull request, so Q4's 15-minute and 8 GB rule is not yet checked there. Shown since: TASKS item 143's closing note, below.
+- `reclaim` (TASKS item 154), with R143-11's overcount for its contract.
+- `FrameError`'s documentation of frame 0 against the code (R143-10): a follow-up.
+- No person has reviewed it.
+
+### 143, step 3. Kani's proofs of `onbf-format`'s parts (ONBF §13 item 5; row S73-08)
+
+Built on `claude/t143-onbf-kani`, cut from `land/batch-11` at `2c9ade28`, which holds step 2.
+
+**The contract and its rulings.** The contract is in the coordination notes (`t143-onbf-contract.md`) and the probe in `t143-onbf-probe.md`.
+- **Scope:** `onbf-format` only. Its parts get P1 (no panic, no read out of bounds, no overflow, every loop within its bound); the header and section entry get the specification's rules for an accepted input (P2); OCBOR-1 gets "an accepted document reads whole" (P3).
+- **Every harness covers an accepted input** within its bound, or says it reaches only refusals and covers one.
+- **Placement:** one proof file per parent module, since `check_padding` is private to `image.rs`.
+- **The loader's and the kernel's images** must be shown the same at the base and at the tip.
+- **Each run's peak memory** is recorded where CI runs it. Above 7.5 GB on the Mac, a harness drops one step in its bound.
+- **Ruling (A) on the probe:** `Image::parse`, its accessors and `check_against` are named not proved by Kani. **(B)** CI-only runs: refused. **(C)** becomes TASKS item 159, the whole image. **(D)** a UTF-8 stand-in and fixed lengths; whatever (D) cannot bring under budget is named not proved and joins TASKS item 159.
+- **Corrected on 2026-11-27:** the ruling's clause "the loader builds `onbf-format` with overflow checks on in release (CLAUDE.md §14)". Today's loader builds without them. §14's rule lands with TASKS item 22's second half, not started. So an overflow in these functions would wrap silently, which makes Kani's overflow checks worth more. The rest of that ruling stands.
+
+**What was built.**
+- **`runtime/onbf/format/src/proofs.rs`:** 9 harnesses.
+- **`runtime/onbf/format/src/image/proofs.rs`:** `check_padding`.
+- **`lib.rs`, `image.rs`:** one `#[cfg(kani)] mod proofs;` each. No parser line changes.
+- **`kani.rs`:**
+  - one `cargo kani` for each harness under `/usr/bin/time` (`-v` on Linux, `-l` on macOS), with each run's peak memory on its line;
+  - the harnesses Kani reported, across all the runs, must be the harnesses chosen;
+  - logs named without `::`;
+  - two proof-file entries and 12 controls, 39 in all;
+  - `package_of` for any file of a proof file's crate;
+  - control paths refused unless they are plain paths inside the tree.
+- **CI** installs `time` if the runner lacks it.
+
+**What is proved, and within which bounds.** Each module's documentation says it in full.
+
+| Function | Harness | Bound | Also |
+|---|---|---|---|
+| `Header::parse` | `proofs::header_parse_any_bytes` | every input of up to 128 bytes | §4.2's rules from the raw bytes; the returned fields are the bytes' |
+| `SectionEntry::parse` | `proofs::section_entry_parse_any_entry` | every entry × profile × nested or not | §4.3's flags and reserved fields, Appendix A's 1 TiB |
+| `merkle_hash_blocks` | `proofs::merkle_hash_blocks_any_size` | every `u64` | |
+| `align_up` | `proofs::align_up_any_value` | every value and alignment | the next multiple |
+| `slice` | `proofs::slice_any_range` | every range, inputs up to 16 bytes | `Some` exactly for a range inside, starting at `start` |
+| `check_padding` | `image::proofs::check_padding_is_exact` | every input and range up to 128 bytes | `Ok` exactly when inside and zero; the first nonzero byte named |
+| OCBOR-1's `validate`, then `next_item` and `skip_contents` | `proofs::ocbor_any_document` | every input up to 6 bytes | |
+| the same | `proofs::ocbor_validate_then_cursor_read` | every input up to 4 bytes | P3 |
+| the UTF-8 walk = core's `from_utf8` | `proofs::utf8_walk_equals_core` | every text up to 8 bytes at offsets 0 to 4 | |
+| `SignatureBlock::parse` | `proofs::signature_block_any_input` | every input up to 19 bytes: refusals only | |
+
+**ONBF §13 item 5** is met for the functions above, within their bounds, and not met for the whole image.
+
+**Not proved by Kani** (TASKS item 159):
+- `Image::parse`, its accessors and `KrnManifest::check_against`, with the image's layout (P2). The image's P1 rests on the component proofs, the crate's denied lints and the `onbf_image` and `onbf_image_built` fuzz targets, which sample and prove nothing.
+- `check_padding`'s bound stops at 128 bytes, while a real image's gaps run to 4,095.
+- `SignatureBlock::parse` past its header, and so its 8-entry limit.
+- `KrnManifest::decode`.
+- OCBOR-1 past 6 bytes (P1) and 4 (P3), and the cursor beyond one item.
+- `SectionEntry::parse`'s rules past those listed: P1 only.
+
+**The forms tried** (development Mac, Kani 0.68.0, each run stopped at its cap, 2026-11-26 and 2026-11-27):
+
+| Function | Form | Result |
+|---|---|---|
+| `Image::parse` | whole, any input under 4 KiB (refusals only) | past 300 s; at 512 bytes, past 150 s |
+| | whole, one section, an input of exactly 4,160 bytes | past 300 s (938 of ~3,840 padding steps) |
+| | `check_padding` stubbed, two sections, 4,608 bytes | past 300 s |
+| | header, entry and padding all stubbed (layout logic only), 8,192 bytes | past 300 s |
+| `check_padding` | every byte symbolic, 64 / 128 / 256 bytes | 26 s and 0.9 GB / 182 s and 3.3 GB / past 240 s |
+| | 4,608 bytes, gaps to 4,095: two symbolic bytes; all-zero content | past 240 s; past 300 s |
+| | 4,608 bytes, every byte symbolic, gaps to 64 | symbolic execution 2.8 s, then the solver past 140 s |
+| core's `from_utf8` | inside the parsers' harnesses | every one past 300 s |
+| | equal to the walk: exactly 8 / exactly 16 / exactly 40 bytes | 24 s / past 300 s / past 300 s |
+| OCBOR-1, P1 | core's check: 16 / 8 bytes | past 300 s / past 300 s |
+| | the walk: 16 / 8 bytes | past 300 s / past 300 s |
+| | any result: 16 / 8 / 7 / 6 bytes | past 300 s / 162 s and 9.5 GB / 122 s and 7.9 GB / 97 s and 6.4 GB |
+| `SignatureBlock::parse` | any input, core's check: 64 / 32 bytes | past 300 s |
+| | any input, any result: 32 / 24 / 20 bytes | past 300 s |
+| | one entry or nine, fixed shape, fields Kani's: written into a symbolic buffer, with core's check and with any result; then into a zeroed buffer | past 300 s each |
+| `KrnManifest::decode` | any input, core's check: 32 / 16 bytes; any result: 16 / 8 / 6 / 5 / 3 bytes | past 300 s each |
+| | fixed shape, fields Kani's: the same three forms | past 300 s each |
+
+**The runs** (development Mac, Apple M1 Max, 64 GB, Kani 0.68.0, CBMC 6.11.0; one harness at a time through `cargo xtask kani --harness <name>`, each in a turn of its own, 2026-11-26 21:11 to 2026-11-27 00:19 UTC; times are Kani's verification time; memory is the largest process of the run).
+
+Every harness verified with every cover satisfied, and each of the 12 controls was caught on the check it names. The section entry, `merkle_hash_blocks`, `align_up` and `check_padding` ran at `abe5690f`, whose code `4d9c3f05` leaves unchanged. The rest ran on `4d9c3f05`'s code; its last edit, after those runs, changed a comment and P3's harness, and P3 ran again after it.
+
+| Harness | Proof | Controls | Peak memory |
+|---|---|---|---|
+| `proofs::header_parse_any_bytes` | 22 s | 23 s, 23 s | 1.1 GB |
+| `proofs::section_entry_parse_any_entry` | 13 s | 13 s | 0.7 GB |
+| `proofs::merkle_hash_blocks_any_size` | 0.08 s | 0.08 s | 0.2 GB |
+| `proofs::align_up_any_value` | 0.7 s | 0.2 s | 0.2 GB |
+| `proofs::slice_any_range` | 0.24 s | 0.24 s | 0.3 GB |
+| `proofs::signature_block_any_input` | 2.8 s | 2.1 s | 0.4 GB |
+| `proofs::utf8_walk_equals_core` | 74 s | 71 s, 71 s | 3.5 GB |
+| `proofs::ocbor_any_document` | 96 s | 95 s | 6.5 GB |
+| `proofs::ocbor_validate_then_cursor_read` | 110 s | 114 s | 7.10 GB; its control 7.14 GB |
+| `image::proofs::check_padding_is_exact` | 264 s | 210 s | 3.5 GB |
+
+- **P3's memory:** before its "an accepted text" cover moved into the branch that already holds the item, the harness peaked at 7.18 GB and its control at 7.66 GB (`4d9c3f05`'s tree before its last edit). The harness was under ruling 2's 7.5 GB margin and the control above it; a control is not a harness under that ruling (the coordinating session, 2026-11-27). With the cover moved, both are under: 7.10 GB and 7.14 GB.
+- **The controls caught on Kani's placeholder text:** `ocbor-argument-indexed` and `le32-indexed` are caught on "This is a placeholder message; Kani doesn't support message formatted at runtime". That is the panic of a slice index past the end (core formats its message at run time), raised by the indexing each control plants. Without the plant, the harness verifies.
+- **Added time on the Mac:** about 21 minutes for these runs, compiling included.
+- **CI:** at step 2's Mac-to-CI ratio (298 s against 281 s), CI's job would go from 77 to about 100 minutes, under ruling 4's 120. CI's run will show the figure, and the 8 GB figures, for the first time.
+
+**Controls that cannot be caught**, as the contract predicted:
+- removing the W+X check (`section.rs:239`): the checks after it refuse the same input, `SegmentNotMappable` or `SegmentPermissions` for a SEGMENT and `PermissionsOnNonSegment` for any other kind;
+- OCBOR-1's depth check off by one: `get_mut` skips the frame and the document is refused as `Truncated`, so P1 and P3 hold;
+- the signature block's entry limit loosened: no harness past the block's header came under budget, so the limit is unproved.
+
+**The images** (ruling 5):
+- `cargo xtask reproducible-gate` built the loader each way and the kernel, twice from nothing each, at the tip `abe5690f` and in an export of the base `2c9ade28`. It passed on both.
+- `cargo xtask reproducible-compare` found all 40 files the same bytes, the loader's three builds and the kernel's image among them.
+- `4d9c3f05` changes only the proofs, their two declarations' comments and `xtask`.
+
+**The review.** One independent AI review of `abe5690f`, recorded in `docs/engineering/REVIEW_T143_STEP3_2026-11-27.md`. It was given the code and the properties, not the author's argument. It found no High, 3 Medium, 6 Low and 6 Info findings. All are answered in `4d9c3f05`; the records answer R143-S3-9. **No person has reviewed it.**
+
+**`format_minor` (corrected 2026-11-27):** the proof asserts no fixed minor, as the owner's errata C5 decides (2026-11-07): writers emit 0, and a v1 reader accepts any minor under major 1. This paragraph first raised it as an open reading of §4.2, whose table cell still said "`0`". C5 had settled it, and the coordinating session aligned the cell with C5 in PR 78.
+
+**Not shown:**
+- CI's job on these harnesses, and the first CI memory figures. Shown since: TASKS item 143's closing note, below.
+- The artifact upload with the new log names.
+- No person has reviewed it.
+
+### 143, step 4. Kani's proofs of capability validation (row S73-07)
+
+Built on `claude/t143-caps-kani`, cut from `land/batch-11` at `ae4319a0`, which holds steps 2 and 3.
+
+**The contract and its rulings.** They are in the coordination notes (`t143-caps-contract.md`, 2026-11-27).
+- **Scope:** the kernel's two checks that build on the host: `handles.rs` (the handle table) and `mapping.rs` (the map request).
+- **Out of scope, named in S73-07's limitation:**
+  - the SDK's generated dispatch check, deny by default where a library declares capabilities, which the generator's tests cover;
+  - the kernel's target-only code, the bigger gap: `ipc.rs`'s transfer of handles, `process.rs`'s grant, `syscall.rs`'s use of `Need` and `memory_object.rs`'s `protect`.
+- **Properties H1 to H7 and M1 to M3**, plus three additions:
+  - `get` changes nothing;
+  - H6 counts `duplicate`;
+  - every handle `take_all` moves is then gone.
+- **Method:** induction, with `new` proved at the same bound (step 2's R143-1), and the invariant written from E1 and P11.
+- **ADR-0005's rows** are left as they are.
+- **Items 376 to 380 (owner, 2026-11-27):** `compile_fail` doctests for the handle-rights types, each with a control, and `check` runs `framekernel`'s doctests.
+
+**Kani and the kernel's package.** Kani builds every target of a package, and the kernel's image binary (`frame/entry/main.rs`, a `sysv64` `_start`) builds only for `x86_64-unknown-none`. So `cargo xtask kani` passes `--lib`; every proof is in a library. The library itself built for the host with no change.
+
+**The forms tried** (development Mac, Kani 0.68.0, each run stopped at its cap):
+
+| Form | Result |
+|---|---|
+| Any table of up to 2 slots, the slot count Kani's | `get` failed an unwinding check in `memcmp` after 34 s and 4.6 GB, and every other step ran past 300 s |
+| The same, at unwind 10 for that `memcmp` | `get` verified in 104 s, but at 19 GB |
+| `Picture` compared field by field, so no `memcmp` | `get` 5.9 s and 0.64 GB; `insert` with the invariant 82 s and 14.9 GB |
+| The invariant checked by index, not through iterator chains | `insert` with the invariant 45 s and 10 GB; the full `insert` harness 250 s and 46 GB |
+| **A table of exactly `N` slots** | `insert` with the invariant 2 s and 0.38 GB |
+| Batches with the list's length Kani's | 172 s and 16 GB, and 230 s and 20 GB |
+| `reserve` with the count Kani's, or with its inserts run after it | past 300 s, or 15 to 19 GB |
+| Lists with room to spare (`S + 3`) | worse, at 15 to 19 GB |
+| **Fixed batch lengths and reservation counts; `reserve` proved by its own contract** | every case in budget |
+
+**The invariant's first form was my error, caught by the proof.** It said that a slot at its last generation is never free again, and it failed in `remove` and the batches. ADR-0005 E1 ("A slot is retired when its generations run out") lets a slot be used once at its last generation; it is retired when that use is freed. The invariant was corrected, and E1's text is cited beside it. The kernel's code was right; this is not a kernel finding.
+
+**What was built.**
+- **`framekernel/src/handles/proofs.rs`:** 29 harnesses.
+  - The encoding, and `new` as the base.
+  - `get`, `insert`, `remove` and `duplicate`, each at 0, 1 and 2 slots.
+  - `take_all` at each size with lists of 1 and 2.
+  - `reserve` at each size for 0, 1 and 2.
+  - Every step proves what it keeps, through `step_keeps`:
+    - the slots it does not name are unchanged;
+    - generations never come down;
+    - a retired slot stays retired;
+    - `remove` moves its slot to exactly the next generation.
+
+    With these, H3 holds for any sequence within the bound.
+  - Each list starts with the least room the invariant allows.
+- **`framekernel/src/mapping/proofs.rs`:** 3 harnesses: `from_bits` for every value, `within` and `needs`, and `check` equal to `expected_check` for every request.
+- **`framekernel/src/handles.rs`:** three `compile_fail` doctests (E0616, E0451, E0603). The kernel library had no doctests before this step: the first `--doc` run found 0 tests and passed, so nothing that had never been checked was found failing.
+- **`kani.rs`:**
+  - two proof-file entries;
+  - 26 controls, 65 in all;
+  - `PRIVATE_PINS`, which keeps `HandleTable`'s fields and `Slot` private to their module. A `pub(crate)` there would pass the doctests, which see only the crate's edge, and void the proofs' premise.
+- **`check`:** runs `cargo test --package framekernel --doc`. The step took about 1 s once the library was built; the full `check`'s figure is in the hand-over.
+
+**The doctests' controls** were run by hand in a scratch copy of the tree, each with `cargo test -p framekernel --doc`:
+
+| Control | Result |
+|---|---|
+| `slots` and `Slot` public | the E0616 doctest fails |
+| all four fields and `Slot` public | the E0451 doctest fails |
+| `Slot` public | the E0603 doctest fails |
+
+Making a field public alone is not enough: the field's type, `Slot`, is private too, so the code still fails to compile, for that other reason. The first two doctests are refused twice over. Rustdoc on stable 1.100.0 does not check a `compile_fail` block's error code (the first control showed it), so the codes say which refusal is meant without enforcing it.
+
+**The runs** (development Mac, Kani 0.68.0, one harness at a time through `cargo xtask kani --harness <name>`, each in a turn of its own, 2026-11-27, at `1dd5856b`'s code). Every harness verified with every cover satisfied. Each control was caught by every harness it names, on the check it names: 68 harness-control pairs.
+
+| Harness | Proof | Controls | Peak memory |
+|---|---|---|---|
+| `handles::proofs::the_encoding_is_e1s` | 0.14 s | 0.09 s | 0.33 GB |
+| `handles::proofs::new_is_whole` | 0.12 s | 0.11 s | 0.34 GB |
+| `handles::proofs::get_is_exactly_p1_at_0` | 0.42 s | 0.43 s | 0.39 GB |
+| `handles::proofs::get_is_exactly_p1_at_1` | 1.9 s | 2.1 s, 1.9 s, 1.9 s | 0.39 GB |
+| `handles::proofs::get_is_exactly_p1_at_2` | 3.0 s | 3.0 s, 3.2 s, 2.9 s | 0.39 GB |
+| `handles::proofs::insert_keeps_the_table_whole_at_0` | 2.3 s | 1.6 s, 1.1 s | 0.40 GB |
+| `handles::proofs::insert_keeps_the_table_whole_at_1` | 8.1 s | 5.2 s, 5.1 s | 0.45 GB |
+| `handles::proofs::insert_keeps_the_table_whole_at_2` | 10.8 s | 7.2 s, 10.6 s | 0.69 GB |
+| `handles::proofs::remove_keeps_the_table_whole_at_0` | 0.49 s | 0.50 s | 0.41 GB |
+| `handles::proofs::remove_keeps_the_table_whole_at_1` | 6.6 s | 6.6 s, 6.7 s, 6.8 s | 0.41 GB |
+| `handles::proofs::remove_keeps_the_table_whole_at_2` | 12.0 s | 11.4 s, 12.2 s, 12.0 s | 0.67 GB |
+| `handles::proofs::duplicate_only_shrinks_rights_at_0` | 0.50 s | 0.37 s | 0.41 GB |
+| `handles::proofs::duplicate_only_shrinks_rights_at_1` | 8.8 s | 8.5 s, 8.7 s, 9.2 s | 0.51 GB |
+| `handles::proofs::duplicate_only_shrinks_rights_at_2` | 13.7 s | 12.2 s, 13.3 s, 12.8 s | 0.70 GB |
+| `handles::proofs::a_batch_moves_entirely_or_not_at_all_at_0_of_1` | 1.1 s | 1.2 s | 0.43 GB |
+| `handles::proofs::a_batch_moves_entirely_or_not_at_all_at_0_of_2` | 1.2 s | 1.2 s | 0.43 GB |
+| `handles::proofs::a_batch_moves_entirely_or_not_at_all_at_1_of_1` | 12.7 s | 12.8 s, 13.1 s | 0.80 GB |
+| `handles::proofs::a_batch_moves_entirely_or_not_at_all_at_1_of_2` | 9.8 s | 9.3 s, 9.4 s | 0.94 GB |
+| `handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_1` | 20.7 s | 21.0 s, 21.1 s | 1.19 GB |
+| `handles::proofs::a_batch_moves_entirely_or_not_at_all_at_2_of_2` | 32.5 s | 30.9 s, 27.7 s, 31.9 s, 31.9 s | 2.04 GB |
+| `handles::proofs::reserve_makes_room_at_0_for_0` | 0.40 s | 0.43 s | 0.38 GB |
+| `handles::proofs::reserve_makes_room_at_0_for_1` | 0.84 s | 0.90 s, 0.37 s, 0.85 s | 0.38 GB |
+| `handles::proofs::reserve_makes_room_at_0_for_2` | 0.82 s | 0.88 s, 0.38 s, 0.86 s | 0.38 GB |
+| `handles::proofs::reserve_makes_room_at_1_for_0` | 2.9 s | 3.0 s | 0.38 GB |
+| `handles::proofs::reserve_makes_room_at_1_for_1` | 4.1 s | 4.1 s, 1.8 s, 3.8 s | 0.38 GB |
+| `handles::proofs::reserve_makes_room_at_1_for_2` | 3.5 s | 3.8 s, 1.7 s, 3.8 s | 0.38 GB |
+| `handles::proofs::reserve_makes_room_at_2_for_0` | 4.4 s | 4.6 s | 0.39 GB |
+| `handles::proofs::reserve_makes_room_at_2_for_1` | 5.1 s | 5.5 s, 3.0 s, 5.2 s | 0.40 GB |
+| `handles::proofs::reserve_makes_room_at_2_for_2` | 5.2 s | 6.0 s, 3.3 s, 5.5 s | 0.39 GB |
+| `mapping::proofs::allow_from_every_bits` | 0.03 s | 0.04 s | 0.33 GB |
+| `mapping::proofs::within_is_allows_nothing_more` | 0.05 s | 0.05 s | 0.33 GB |
+| `mapping::proofs::check_every_request` | 1.4 s | 1.1 s, 1.3 s, 1.4 s, 0.78 s | 0.34 GB |
+
+- **Longest proof:** 32.5 s. **Highest peak:** 2.04 GB.
+- **Added time on the Mac:** 838 s (14.0 minutes) for these 32 runs, compiling included, with each control run once for each harness it names (68 runs).
+
+**CI's first run with step 3, and the job split by package.** CI's run 45920792549, at `ae4319a0` (steps 2 and 3, before this step), took 122 minutes in its one `kani` job, over ruling 4's 120. Its runner was an AMD EPYC 7763 with 4 processors (the job log's processor line). The figures from it, from the coordinating session and the keeper, checked against the log here:
+- 28 harnesses verified and 39 controls caught.
+- The slowest proofs: `check_padding_is_exact` at 375 s and `two_hand_outs_never_overlap` at 369 s. The slowest check of all: `two_hand_outs_never_overlap` under the control `allocate-does-not-mark`, at 479 s. Each is inside CI's 15 minutes.
+- The highest peak: 6.07 GB, from `ocbor_validate_then_cursor_read` and its control, inside CI's 8 GB. So Q4's memory half is now measured, and it holds for steps 2 and 3.
+- The `kani-reports` artifact took all 67 log files, which confirms R143-S3-3.
+
+The coordinating session's ruling (2026-11-27): split the job by package in this step, before its hand-over. Built:
+- **`cargo xtask kani --package <name>`** runs one package's harnesses and each control on them. A control runs once, on every harness it names, as in the whole run.
+- **`--list`**, alone or after `--package <name>`, prints what that run would run, with counts, and runs nothing.
+- **CI's `kani` job** is a matrix over `origin-frame`, `onbf-format` and `framekernel`, with `fail-fast: false`. Each job runs `cargo --locked xtask kani --package ${{ matrix.package }}` and uploads its own artifact, `kani-reports-<package>`. The jobs are named `Kani's proofs and controls (<package>)`. `main` has no required status checks, so the new names change no rule.
+- **`kani-gate`** checks three things:
+  - the matrix lists exactly the packages `PROOF_FILES` names, in its order;
+  - one step runs `xtask kani`, one package for each job;
+  - each control's harnesses are all in the package of its file, so that no job runs a control on another package's harness.
+- **Host tests:**
+  - `the_package_jobs_run_everything_once`: over the three packages, the jobs' harnesses are every harness exactly once, and their controls are every control exactly once, each on all its harnesses. The whole run's selection is the same.
+  - `a_choice_takes_what_it_names`: one harness takes the controls that name it, on it alone; an unknown harness or package is refused.
+  - `the_matrix_is_proof_files_packages`: the tree's workflow passes. A matrix missing a package fails, and so do a whole run in place of the package run, a second run step, and a control on another package's harness.
+
+The lists, from `cargo xtask kani --package <name> --list` at this step's tip:
+
+| Package | Harnesses | Controls | Control runs of a harness |
+|---|---|---|---|
+| `origin-frame` | 18 | 27 | 31 |
+| `onbf-format` | 10 | 12 | 12 |
+| `framekernel` | 32 | 26 | 68 |
+| **The three jobs** | **60** | **65** | **111** |
+| `--list` with no package | 60 | 65 | 111 |
+
+**Each job's CI time.** Each package's own figures from run 45920792549's log on the AMD EPYC 7763, harness by harness and control by control, attributed to the packages of these lists. Kani's verification time is in parentheses; the rest of each figure is building:
+
+| Package | Proofs | Controls | Runs | Job, with 0.6 minutes of setup |
+|---|---|---|---|---|
+| `origin-frame` | 29.6 min (1,723 s) | 61.8 min (3,594 s) | 91.4 min | about 92 minutes |
+| `onbf-format` | 15.0 min (862 s), Kani's first build of 0.9 minutes included | 15.2 min (890 s) | 30.1 min | about 31 minutes |
+| `framekernel` | no CI figure yet | | | about 18 minutes, estimated below |
+
+**The runners differ.** Step 2's run 45865797476, at `2c9ade28`, ran on an Intel Xeon 6975P-C with 4 processors. `origin-frame`'s proofs and controls are the same at both commits: nothing under `framekernel/frame/` changed, and nor did its controls. Its 49 verification runs (18 proofs and 31 control runs) took 4,475 s on the Xeon and 5,317 s on the EPYC, 1.19 times as long. The jobs' times are not comparable, since `xtask kani` has run one `cargo kani` for each harness only since step 3. So:
+- the same jobs on a Xeon 6975P-C would take about 78 minutes (`origin-frame`) and 26 (`onbf-format`);
+- `framekernel`'s job has no CI figure. On the development Mac (Apple M1 Max), `cargo xtask kani --package framekernel` at this step's code took 734 s, 2026-11-27 04:55:05 to 05:07:19 UTC, on AC power, in one turn. It verified 32 harnesses with every cover satisfied and caught 26 controls, in 58 runs of `cargo kani`, at a peak of 2.03 GB. The EPYC took 1.43 times the Mac's time for `onbf-format`'s runs: 30.1 minutes against the Mac's 21, with the same harness-by-harness runs. At that ratio, `framekernel`'s job would be about 18 minutes on the EPYC, setup included, and about 15 on the Xeon. Nothing measures it on CI yet, so it is an estimate;
+- a runner slower than either is possible. The EPYC's `origin-frame` job has 28 minutes in hand, so it stays under 120 minutes on a runner up to about 30% slower than the EPYC.
+
+The one job would have been about 140 minutes on the EPYC. If `origin-frame`'s job ever passes 120, the next split is by proof file. On the EPYC's figures, `frames` would take 53.5 minutes and `heap` 37.9. That needs a ruling first: `kani-gate` holds the matrix to packages.
+
+**Owed from step 3, in this step's records commit:** `onbf-format`'s proof table now cites §4.2 together with errata C5 for the header, and the step-3 entry's paragraph on `format_minor` is corrected to cite C5.
+
+**The images:** at the tip `bb0b0941` and in an export of the base `ae4319a0`, `cargo xtask reproducible-gate` passed, and `cargo xtask reproducible-compare` found all 40 files the same bytes. Those include the kernel's ELF (SHA-256 `0580e203…`) and its image (`e5c9b0c0…`). Later commits change only proofs, comments and `xtask`.
+
+**The review.** One independent AI review of `bb0b0941`, recorded in `docs/engineering/REVIEW_T143_STEP4_2026-11-27.md`, was given the code and the properties but not the author's argument. It found no High, 3 Medium, 6 Low and 5 Info, none a defect of the kernel. Each finding is answered, in `1dd5856b` and these records. **No person has reviewed it.**
+
+**Not shown:**
+- CI's run of this step's harnesses and of the split jobs, and their times and memory figures. Shown since: the closing note, below.
+- The doctests' controls run by `xtask`: they were run by hand. That is TASKS item 166.
+- `ipc.rs`'s transfer of handles and `process.rs`'s grant (P2's other half), which build only for the kernel's target. Making them host-buildable so that Kani can reach them is TASKS item 167.
+- `mapping.rs`'s other host-built logic: `frames`, `place`, `place_at_random`, `price`, `Budget` and `Mappings`. Their host tests cover it; Kani's proofs of it are TASKS item 168.
+- The split by package came after the independent review, which did not read it; its host tests and the local run of `framekernel`'s job are its evidence.
+- No person has reviewed it.
+
+### 143, closing note. CI's three Kani jobs, and what later items carry forward
+
+Written on 2026-11-27 on `claude/t143-closing-note`, cut from `land/batch-11` at `c2680f71`. It changes records only.
+
+**The run.** CI's run 45948073598 on `land/batch-11` (PR 67) at `c2680f71`, which holds step 4 (`09b0a248`, merged at `05acd5cb`) with `main` at `294d2a77` merged after it. Every job of the run passed, the three Kani jobs among them.
+- Each Kani job installed `kani-verifier` 0.68.0 with `cargo install --locked` (`.github/ci/install-kani.sh`). The bundle's SHA-256 checked OK, and it ran CBMC 6.11.0.
+- Each runner had 4 processors, by the job log's processor line.
+- Who checked the figures below: the keeper read the logs, the coordinating session checked the keeper's counts against them, and this session checked every figure against the three job logs again.
+
+| Job | Runner | Time | Proofs | Controls | Highest peak |
+|---|---|---|---|---|---|
+| `origin-frame` | AMD EPYC 9V45 | 69 min (05:49:54 to 06:58:55 UTC) | 18 verified, every cover satisfied, in 1,298 s of verification. Slowest: `two_hand_outs_never_overlap` 310 s, `allocate_keeps_the_heap_whole` 147 s, `free_takes_back_only_a_live_block` 141 s | 27 of 27 caught, in 31 checks and 2,682 s. Longest: 404 s, `two_hand_outs_never_overlap` under `allocate-does-not-mark` | 4.31 GB for a proof (`two_hand_outs_never_overlap`), 4.89 GB for a control (`too-many-reserved-accepted`) |
+| `onbf-format` | AMD EPYC 9V45 | 25 min (05:49:27 to 06:14:42) | 10 verified, every cover satisfied, in 707 s. Slowest: `check_padding_is_exact` 306 s | 12 of 12 caught, in 12 checks and 733 s. Longest: 230 s | 6.08 GB for a proof (`ocbor_validate_then_cursor_read`), 6.07 GB for a control (`ocbor-trailing-data-accepted`) |
+| `framekernel` | Intel Xeon 6975P-C | 15.5 min (05:49:27 to 06:04:57) | 32 verified, every cover satisfied, in 180 s. Slowest: `a_batch_moves_entirely_or_not_at_all_at_2_of_2` 40 s | 26 of 26 caught, in 68 checks and 498 s, every verdict FAILED. Longest: 43 s | 1.67 GB, against 2.04 GB on the development Mac |
+
+- **In all:** 60 harnesses verified and 65 controls caught, in 111 control checks. No check took more than 404 s and no run more than 6.08 GB. So Q4's rule, 15 minutes and 8 GB for each harness on CI's standard runner, now holds for all 60 harnesses.
+- **Two of `onbf-format`'s controls,** `ocbor-argument-indexed` and `le32-indexed`, were caught on the check they name: Kani's placeholder for an assertion message formatted at run time (step 3's entry).
+- **The artifacts:**
+  - `kani-reports-origin-frame`: 45 files, 1,197,289 bytes;
+  - `kani-reports-onbf-format`: 22 files, 248,933 bytes;
+  - `kani-reports-framekernel`: 58 files, 1,742,045 bytes.
+
+  Each holds one log for each harness and each control of its package.
+
+**Against step 4's estimates.**
+- **`framekernel`:** 15.5 minutes on the Xeon 6975P-C. Step 4 estimated about 15 there, from the development Mac's 734 s.
+- **The two AMD jobs** ran on an EPYC 9V45, not the EPYC 7763 the estimates assumed. On the same checks, the 9V45 was the fastest of the three runners seen so far:
+  - `origin-frame`'s 49 verification runs (18 proofs and 31 control checks) took 3,980 s here, 4,475 s on the Xeon 6975P-C (run 45865797476) and 5,317 s on the EPYC 7763 (run 45920792549). The 7763 took 1.34 times as long as the 9V45.
+  - `onbf-format`'s 22 took 1,440 s here and 1,753 s on the 7763, 1.22 times as long.
+  - The checks run the same code at the three commits. Nothing under `framekernel/frame/` changed between them, and `onbf-format`'s proofs changed by one documentation line (C5, in step 4's records).
+- **Inferred, not measured:** the keeper infers that `origin-frame`'s job would take about 90 minutes on an EPYC 7763, still under 120, since `ae4319a0` took about 1.2 to 1.3 times as long there. The verification times above give 1.34 for that package's checks, which puts the job nearer 92 minutes; building and setup need not scale the same way. No job at this tip has run on a 7763.
+- **The next split:** if `origin-frame`'s job ever passes 120 minutes, the job is split by proof file, on the coordinating session's ruling first.
+
+**What TASKS item 143 proved**, each within the bounds stated beside its proofs:
+- the frame allocator's and the kernel heap's invariants, except `reclaim` (step 2; row S73-04);
+- parts of `onbf-format`, not the whole image (step 3; row S73-08);
+- the kernel's handle table and its map request's check (step 4; row S73-07).
+
+Every harness has a negative control and states its bounds and what it leaves unproved (rows S73-02 and S73-12). The 60 harnesses and 65 controls run in `cargo xtask kani` and in CI's three jobs, and `kani-gate`, in `check`, holds the controls and the matrix to the proof files. Kani's results are about the source as Kani compiles it for the host, not about the machine code rustc 1.100.0 makes for the kernel's target. Each step had one independent AI review (`docs/engineering/REVIEW_T143_2026-11-26.md`, `REVIEW_T143_STEP3_2026-11-27.md` and `REVIEW_T143_STEP4_2026-11-27.md`), each finding answered. **No person has reviewed any step.**
+
+**Carried forward.** None of these items is started. Lines 165 to 168 are on `main` (PR 81).
+- **TASKS item 154:** a Kani proof of the frame allocator's `reclaim`, which needs an unwind bound past the local budget, and the overcount found in review (R143-11).
+- **TASKS item 156:** Kani proofs of `origin-paging`, with a reference walk written from the Intel SDM and the AMD APM.
+- **TASKS item 157**, from step 2's review (R143-10): `FrameError`'s documentation of frame 0.
+- **TASKS item 159:** ONBF §13 item 5 for the whole image:
+  - `Image::parse`, its accessors and `KrnManifest::check_against`;
+  - `KrnManifest::decode`;
+  - the signature block past its header, and so its 8-entry limit;
+  - `check_padding` past 128 bytes.
+
+  Until it is done, ONBF v1.0 is not put to the owner as final on that item's account.
+- **TASKS item 165** is not Kani's work. It gives each boot job what each Kani job already keeps: when a boot fails in CI, its serial log and the last screen capture `boot-test` read are kept as an artifact.
+- **TASKS item 166:** the `compile_fail` doctests' controls run by `cargo xtask`. Step 4 ran them by hand.
+- **TASKS item 167:** `ipc.rs`'s transfer of handles and `process.rs`'s grant made host-buildable, and then proved. That is ADR-0005 P2's other half.
+- **TASKS item 168:** Kani proofs of `mapping.rs`'s other host-built logic: `frames`, `place`, `place_at_random`, `price`, `Budget` and `Mappings`.
+- **Named in row S73-07's limitation and in no TASKS item yet:**
+  - `syscall.rs`'s use of the decoder's `Need` and `memory_object.rs`'s `protect`, which build only for the kernel's target;
+  - tables of more than 2 slots and batches of 3 or more handles;
+  - a failed allocation;
+  - `nospec`'s Mask form;
+  - the SDK's generated `holds`.
+
+**Not shown:** a person's review of any step, and the machine code built for the kernel's target (above).
+
+**Where it stands:** TASKS item 143's planned steps are done, and their proofs and controls pass in CI on `land/batch-11`. The task reaches `main` with the batch.
+
+### 171. The boot proofs write only inside the partition marked for Origin's tests, and print no disk's identifiers (CLAUDE.md §2 P0, §61; owner items 381 and 384)
+
+Built on `claude/t171-marked-disk-7a0be1`, cut from `land/batch-11` at `34fdf164`, with `land/batch-11` at `6e859bd5` (TASKS item 165, `main` at `54df83d0`) merged in.
+
+**The contract and its rulings.** They are in the coordination notes (`t171-contract.md`, 2026-11-27): Q1 to Q12 ruled as recommended, Q7 with the condition that every opcode the driver builds is listed and none allowed is refused, and Q8 an owner item. The owner accepted item 384 the same day.
+
+**What was there before.** Since `2045824e` (2026-11-09) the proofs wrote only to the boot test's own disk, named by its geometry, the GPT's fixed disk GUID and xtask's pattern: a real disk got no write and no flush. What was missing is in this line's "Why": the identifiers printed, a disk GUID used as permission, no write held inside a partition, and no control of a disk's bytes.
+
+**What was built.**
+- **The guard (`nvme::permitted`, called first in `storage::submit_on`, the only function that writes a submission entry).**
+  - The admin queue takes Identify, Create I/O Completion Queue, Create I/O Submission Queue and Set Features of Number of Queues with Save clear (Base 2.4 Figure 464), nothing else.
+  - An I/O queue takes Read always; Write and Flush only with a span (`nvme::Writable`), naming its namespace, and a Write only with every block it names inside the span. Nothing else.
+  - A refused command is named (`Fault::Refused`), is never live, and leaves its queue as it was.
+  - Every opcode the driver builds, by file and function, is in the hand-over (`t171-handover.md`).
+- **The mark (`blockcache::test_disk::mark`).** Looked for only on the boot test's disk, still named by its geometry (ruling Q2) and pattern. The proofs may write only when:
+  - LBA 0 is a protective MBR (`gpt::is_protective_mbr`; UEFI 2.11 §5.2.3);
+  - both GPT copies are valid and agree, entry for entry, and the backup is at the last block (§5.3.1, §5.3.2);
+  - exactly one used entry has the type `8d4070b7-7072-4d27-9689-81467d6a5735` (owner item 384: provisional, test disks only, to be fixed with M9's partition-layout decision);
+  - that entry's Required Partition attribute is clear (Table 5.8).
+
+  The span is the entry's own bounds; the disk GUID no longer counts (ruling Q3). One valid copy is read-only: the kernel repairs nothing during boot.
+- **Where each proof writes (`test_disk::plan`).** The block cache's page and the reserved-memory proof's 8 blocks at the partition's start, each processor's block from 64 blocks in, one page apart (room for 1,780 processors on the test disk), and the polled proof's at its last block. A write that does not fit is the guard's to refuse, so a partition too small fails a proof and nothing is written outside it.
+- **Without the mark** nothing is written or flushed, and each write proof says it did not run. After the last proof through the controller, one line says how many writes and flushes the guard let through, to which blocks, or why none, and how many commands it refused.
+- **Nothing that identifies a disk is printed:** the controller's serial number never (Base 2.4 Figure 338, §4.7.1), and on a disk without the mark neither the GPT's disk GUID, its partitions' unique GUIDs nor their names, only their types and blocks (ruling Q6).
+- **xtask.**
+  - The test disk gains the marked partition, "Origin boot-proof scratch", blocks 18432–32734; "Origin data" shrinks to 10240–18431 (ruling Q4).
+  - After every boot, whatever it booted and whatever its markers said, `check_storage_evidence` judges the NVMe test disk's bytes against the image staged: nothing changed outside the marked partition, and nothing at all on a disk without one; something changed inside it where the scenario's markers require the polled write. It also holds that no kernel line has the serial QEMU's controller is given.
+  - `cargo xtask boot-disk`, run by `boot-matrix` after `boot-reserved` (ruling Q11), boots the Intel VT-d machine with 2 processors twice, each time with another disk staged by the scenario's own hook: controls D1 and D2 below.
+
+**Controls** (ADR-0013's "Controls of TASKS item 171").
+
+| # | What | Result |
+|---|---|---|
+| D1, standing (`boot-disk`, "unmarked disk") | The third partition typed as Origin data, all else the same | Passed: the GPT lines withhold the disk GUID, the unique GUIDs and the names; `no mark of Origin's tests (no partition carries it)`; each write proof `not run`; `0 writes and 0 flushes … 0 commands refused`; the image unchanged, byte for byte |
+| D2, standing (`boot-disk`, "marked partition too small") | The marked partition 18432–18503 (72 blocks), the rest of the disk free | Passed: processor 1's write `refused: a write to blocks 18504-18504 lies outside the marked partition (blocks 18432-18503)`, the per-CPU proof failed as aimed, `boot verdict: degraded: … failed: speculation controls, NVMe (no storage)`, `2 writes and 2 flushes … 1 command refused`; the image changed inside the 72 blocks alone |
+| D1-before | `34fdf164`'s kernel and xtask, D1's disk staged, the byte check printed by a plant | Failed where aimed: the old identification took D1's disk for the test disk and wrote blocks 10240, 20000, 20008 and 32704 |
+| D4-before | `34fdf164`'s kernel boot, the serial search printed by a plant | Failed where aimed: `controller ready: model "QEMU NVMe Ctrl", serial "ORIGIN0001", …` |
+| D3 | The merged tip with the guard's range check removed, on D2's disk | Caught twice: processor 1's write landed ("read back true"), so D2's marker was missing, `and the NVMe test disk changed outside the marked partition (blocks 18432-18503): blocks 18504` |
+| D1-lie | The merged tip, the polled proof on a disk without the mark writing one block past the guard, uncounted and unsaid | Caught by the bytes alone: every line as D1's, `the NVMe test disk changed outside any marked partition, for it has none: blocks 32704` |
+| D5 | The merged tip, the polled proof aimed one block before the marked partition | Caught: `the polled proof's write to LBA 18431: refused: a write to blocks 18431-18431 lies outside the marked partition (blocks 18432-32734): NVMe failed`, `and the NVMe test disk is unchanged after a boot whose write proofs say they wrote to it` |
+
+**Gates.**
+
+Development Mac, Rust 1.100.0, QEMU 11.1.3 TCG with OVMF, on AC power, each inside `cargo xtask exclusive`:
+
+| Tree | Gate | Return code | Time |
+|---|---|---|---|
+| `755f7091` | `check` | 0 | 1,064 s |
+| `755f7091` | `boot-test` (11 of 11) | 0 | 68 s |
+| `755f7091` | `boot-matrix` (D1 and D2 among it) | 0 | 2,113 s |
+| `755f7091` and the review's fixes | the two crates' host tests (622 and 479), Clippy, `boot-test`, `boot-disk` | 0 each | 30 s, 7 s, 3 s, 66 s, 49 s |
+| `ac087949` (merged) | `check` | 0 | 918 s |
+| `ac087949` | `boot-test` (11 of 11) | 0 | 67 s |
+| `ac087949` | `boot-matrix` (D1 and D2 among it) | 0 | 2,109 s |
+| `ac087949` | `target/xtask/failed-boots` after the passing runs | none | |
+| exports | D3, D1-lie, D5, D1-before (each must fail) | 1 each | 152 s, 57 s, 54 s, 121 s |
+| export of `34fdf164` | D4-before (the old boot passes; the plant prints the serial line) | 0 | 56 s |
+
+**What a failed boot's evidence holds** (TASKS item 165's `failed-boots`, read with `grep` after D3, D1-lie and D5):
+- the disk without the mark (D1-lie): none of its GPT identifiers, in `boot.txt` or a log;
+- the marked disk (D3, D5): its disk GUID, unique GUIDs and names, xtask's fixed test values, which the kernel prints on that disk alone (ruling Q6);
+- `ORIGIN0001`, xtask's test serial: in `boot.txt`'s QEMU command line (`nvme,serial=ORIGIN0001`), and in `serial.log`'s first line, OVMF's own `BdsDxe: failed to load Boot0001 "UEFI QEMU NVMe Ctrl ORIGIN0001 1"`. No kernel line holds it. On a real machine the firmware's own console may name a disk the same way; that is the firmware's, not Origin's.
+
+**Limits.**
+- Shown under QEMU alone (the development Mac's software processor; CI's KVM jobs run `boot-matrix`, `boot-disk` among it, once this lands). No physical disk.
+- The geometry condition stays until a ruling drops it when a physical test disk exists (Q2): no disk but QEMU's 16 MiB one can be written.
+- The mark's GUID is provisional (owner item 384).
+- A boot followed by a power-off makes a real SSD count an unexpected power loss (Base 2.4's SMART field, formerly "Unsafe Shutdowns"): the kernel resets the controller at bind and sends no normal shutdown, which is row S33-12, not built (ruling Q12). No user data changes, but the count does.
+- Only block devices were audited. CMOS and what AML methods write were not; neither the loader nor the kernel calls `SetVariable`.
+- One AI reviewer read the change (`docs/engineering/REVIEW_T171_2026-11-27.md`); no person has.

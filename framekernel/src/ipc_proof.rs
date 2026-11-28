@@ -46,7 +46,9 @@ use crate::cpu::{self, CpuIndex};
 use crate::handles::{GENERATION_BITS, Need};
 use crate::ipc::{self, Object};
 use crate::launch::{self, Given};
-use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, ObjectLimits, Process};
+use crate::process::{
+    BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, ObjectLimits, Process, ThreadObject,
+};
 use crate::runqueue::QueueError;
 use crate::{memory, sched, syscall, time};
 
@@ -501,6 +503,38 @@ const LIMITS: Limits = Limits {
 fn await_end(process: &Process, tsc_hz: u64, seconds: u64) -> bool {
     sched::yield_until(|| process.ending().is_some(), tsc_hz, seconds);
     process.ending().is_some()
+}
+
+/// Waits until `thread`, the thread of `process` started on `cpu`, is blocked in `wait_one`, at
+/// most [`sched::OTHERS_PATIENCE`] seconds, and returns whether it is.
+///
+/// A case that requires a wake-up to cross processors starts its waker only after this (TASKS
+/// item 134; ADR-0013 R1(b)). `Process::waiting` alone does not order the two: it rises as the
+/// thread enters `wait_one`, before the thread registers on the wait queue and before it blocks.
+/// A wake-up that comes while it is registered and not yet blocked is kept by its run queue, and
+/// one that comes before it registers is not needed at all, since its first look sees the signal.
+/// In both the thread wakes and nothing is lost, and no IPI crosses processors, so a count of
+/// crossings would be 0 with nothing wrong. Once the thread is blocked on `cpu`, a wake-up from
+/// another processor makes it ready and sends the IPI on every schedule
+/// (`sched::user_thread_blocked`): nothing else wakes a thread whose wait has no deadline and
+/// whose object no one else signals, and a thread not declared movable stays on its processor.
+///
+/// **For a process with one thread, whose first call is the wait** (the review of TASKS item
+/// 134, R134-1). The two reads are of different things: the count is the process's, of its
+/// threads in `wait_one` or in a port's wait, and the look is at this thread, blocked anywhere.
+/// With one thread and one wait they name the same wait. In a process with a second thread, one
+/// could be counted and not yet blocked while the other, the one named, is blocked elsewhere,
+/// and this would answer true in the very stretch it exists to close.
+fn blocked_in_wait(
+    process: &Process,
+    thread: &ObjectRef<ThreadObject>,
+    cpu: CpuIndex,
+    tsc_hz: u64,
+) -> bool {
+    let blocked =
+        || process.waiting.load(Ordering::Acquire) > 0 && sched::user_thread_blocked(cpu, thread);
+    sched::yield_until(blocked, tsc_hz, sched::OTHERS_PATIENCE);
+    blocked()
 }
 
 /// Whether `reports` are what `steps` must produce, printing each group on its own line.
@@ -1598,12 +1632,14 @@ fn exit_closes(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64
             return false;
         };
         let wakes_before = ipc::cross_cpu_wakes();
-        if Process::start_thread(&waiter, far, CODE, STACK + PAGE, SCRIPT).is_err() {
+        let Ok(peer) = Process::start_thread(&waiter, far, CODE, STACK + PAGE, SCRIPT) else {
             return false;
-        }
-        // The peer must be in `wait_one` before the other process ends. It is then blocked,
-        // or about to be, and the close wakes it either way (no lost wake-up, `wait`).
-        sched::yield_until(|| waiter.waiting.load(Ordering::Acquire) > 0, tsc_hz, 5);
+        };
+        // The peer must be blocked in `wait_one` before the other process starts (TASKS item
+        // 134): the close then finds it blocked and its wake-up crosses processors, on every
+        // schedule. If it never blocks, that is the case's failure, said on its line; the other
+        // process is started all the same, so that both end and nothing of them stays.
+        let peer_blocked = blocked_in_wait(&waiter, &peer, far, tsc_hz);
         if Process::start_thread(&ender, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
             return false;
         }
@@ -1619,12 +1655,18 @@ fn exit_closes(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64
             (false, Some(Ending::Exited(0))) | (true, Some(Ending::Faulted { vector: 6, .. }))
         );
         let handles_left = ender.handle_count();
-        let right =
-            ended && right_reports && ender_ok && handles_left == 0 && (far == bsp || wakes > 0);
+        // The same on every schedule: the peer was blocked first, so where it waits on another
+        // processor the close's wake-up is owed an IPI, and one must have been counted.
+        let right = ended
+            && right_reports
+            && ender_ok
+            && handles_left == 0
+            && peer_blocked
+            && (far == bsp || wakes > 0);
         ok &= right;
         let _ = writeln!(
             com1,
-            "origin-kernel: ipc: when a process {label}: its handles close ({handles_left} left), and its peer on {}, blocked {} times, woke and saw PEER_CLOSED; {} wake-ups crossed processors{}",
+            "origin-kernel: ipc: when a process {label}: its handles close ({handles_left} left), and its peer on {}, seen blocked in wait_one before the process started: {peer_blocked}, blocked {} times, woke and saw PEER_CLOSED; {} wake-ups crossed processors{}",
             far.named(),
             waiter.blocked(),
             wakes,
@@ -2387,10 +2429,13 @@ fn process_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_
             return false;
         };
         let wakes_before = ipc::cross_cpu_wakes();
-        if Process::start_thread(&waiter, far, CODE, STACK + PAGE, SCRIPT).is_err() {
+        let Ok(waiting) = Process::start_thread(&waiter, far, CODE, STACK + PAGE, SCRIPT) else {
             return false;
-        }
-        sched::yield_until(|| waiter.waiting.load(Ordering::Acquire) > 0, tsc_hz, 5);
+        };
+        // As `exit_closes` (TASKS item 134): the waiter must be blocked in `wait_one` before the
+        // process it waits on starts, so that `TERMINATED`'s wake-up, raised where that process's
+        // last thread is reaped, on the boot processor, crosses processors on every schedule.
+        let waiter_blocked = blocked_in_wait(&waiter, &waiting, far, tsc_hz);
         if Process::start_thread(&ender, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
             return false;
         }
@@ -2405,11 +2450,12 @@ fn process_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_
             (exit_step.is_some(), ender.ending()),
             (false, Some(Ending::Exited(0))) | (true, Some(Ending::Faulted { vector: 6, .. }))
         );
-        let right = done && right_reports && ender_ok && (far == bsp || wakes > 0);
+        let right =
+            done && right_reports && ender_ok && waiter_blocked && (far == bsp || wakes > 0);
         ok &= right;
         let _ = writeln!(
             com1,
-            "origin-kernel: ipc: when a process {label}: TERMINATED reached the thread waiting on it on {}, blocked {} times; {} wake-ups crossed processors{}",
+            "origin-kernel: ipc: when a process {label}: TERMINATED reached the thread waiting on it on {}, seen blocked in wait_one before the process started: {waiter_blocked}, blocked {} times; {} wake-ups crossed processors{}",
             far.named(),
             waiter.blocked(),
             wakes,

@@ -253,6 +253,67 @@ pub fn send_reschedule_ipi(me: crate::cpu::ThisCpu<'_>, apic_id: u32) {
     }
 }
 
+/// Each processor's rate of balancing interrupts (ADR-0020 S7.2; TASKS item 98): what
+/// [`send_balance_ipi`] asks before it sends, and [`balance_tick`] renews.
+pub(crate) static BALANCE_SENT: crate::percpu::PerCpu<crate::sync::balance::Rate> =
+    crate::percpu::PerCpu::new(
+        "origin_frame::timer::BALANCE_SENT",
+        crate::sync::balance::Rate::new(),
+        crate::sync::balance::Rate::new,
+    );
+
+/// Sends the processor with APIC ID `apic_id` one balancing interrupt (ADR-0020 S7.2's idle
+/// kick): the reschedule vector, as [`send_reschedule_ipi`] sends it, but **at most one in each
+/// tick of the sending processor**. `false`, and nothing sent, if this processor has sent one
+/// since its last tick ([`balance_tick`]).
+///
+/// The kernel's balancing sends every interrupt it sends through here, so the bound is the
+/// framework's and not each caller's: a program that makes threads ready in a loop causes at most
+/// one kick per tick per processor (ADR-0020's threat model, "kick storms"). `me` is this
+/// processor, read with interrupts off: the flag is its own, written with plain stores.
+pub fn send_balance_ipi(me: crate::cpu::ThisCpu<'_>, apic_id: u32) -> bool {
+    let Some(rate) = BALANCE_SENT.this(me) else {
+        return false;
+    };
+    if !rate.take() {
+        return false;
+    }
+    send_reschedule_ipi(me, apic_id);
+    true
+}
+
+/// Claims this processor's one balancing interrupt for this tick without sending it, as
+/// [`send_balance_ipi`] would: `true` if it was free, and the caller then sends it with
+/// [`send_reschedule_ipi`] from this processor once its interrupts-off section has ended (ADR-0020
+/// Amendment 1's ask; the coordinating session's ruling of 2026-11-25). `false`, and nothing
+/// claimed, if this processor has sent or claimed one since its last tick. `me` is this processor,
+/// read with interrupts off.
+pub fn claim_balance_ipi(me: crate::cpu::ThisCpu<'_>) -> bool {
+    BALANCE_SENT
+        .this(me)
+        .is_some_and(crate::sync::balance::Rate::take)
+}
+
+/// Whether this processor has sent its one balancing interrupt for this tick, so that
+/// [`send_balance_ipi`] would refuse: for a caller that must mark something as asked before it
+/// sends (ADR-0020 Amendment 1), and must not mark it and then find it cannot send. `me` is this
+/// processor, read with interrupts off, which stay off until the send.
+pub fn balance_spent(me: crate::cpu::ThisCpu<'_>) -> bool {
+    BALANCE_SENT
+        .this(me)
+        .is_none_or(crate::sync::balance::Rate::spent)
+}
+
+/// This processor's tick, for [`send_balance_ipi`]'s rate: it may send one balancing interrupt
+/// again. The scheduler's tick upcall calls it. With none sent since the last tick it costs two
+/// plain loads.
+#[inline]
+pub fn balance_tick(me: crate::cpu::ThisCpu<'_>) {
+    if let Some(rate) = BALANCE_SENT.this(me) {
+        rate.tick();
+    }
+}
+
 /// The ICR's low half for an NMI, to a destination and without a shorthand: Intel's table of
 /// valid ICR combinations marks the Self shorthand with NMI delivery invalid (ADR-0013 F1).
 const ICR_NMI: u64 = 0x4400;

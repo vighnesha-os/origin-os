@@ -13,11 +13,14 @@ mod corestubs;
 mod costs;
 mod disk;
 mod documents;
+mod evidence;
 mod expected_warning;
+mod fuzz;
 mod host_tools;
 mod image;
 mod image_inputs;
 mod interfaces;
+mod kani;
 mod lex;
 mod listed_names;
 mod loom;
@@ -33,6 +36,7 @@ mod screen;
 mod serial;
 mod settings;
 mod settle;
+mod specifications;
 mod stack_depth;
 mod targetcfg;
 mod toolchain;
@@ -55,15 +59,24 @@ const USAGE: &str = "\
 usage: cargo xtask <command>
 
 commands:
-  check       rustfmt, clippy and unit tests, each crate on its own target(s);
-              the UEFI release build; the CLAUDE.md §11 cfg lint
+  check       everything a change must pass without a boot: the pinned compiler, by its
+              commit; rustfmt; Clippy with -D warnings and the host tests of every crate,
+              each on its own target(s), and the AML interpreter's two stack tests again
+              in release mode; the developer-mode and the verifying loader and the kernel
+              image, with the image's checks; the no-panic, dependency and CLAUDE.md §11
+              cfg lints, the manifests' versions and the two checks on the signing code;
+              every gate below that says it is part of check (documents, requirements,
+              provenance, roadmap, progress page, costs, unsafe code, names, interfaces,
+              host tools, versions and the rest); the images built twice and compared
+              byte for byte; and the Loom models with their negative controls. It boots
+              nothing: the boots are boot-test and boot-matrix
   build       build the loader (developer mode) and the KRN kernel image; print their paths
   boot-test   boot under QEMU + OVMF: a signed kernel must start and report with developer
               mode off, an unsigned one in developer mode, and a loader with developer mode
               off must refuse an unsigned image, a wrong key, a tampered statement, a bad
               signature and tampered content, each with its own message
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
-              one after another, then boot-x2apic, boot-bridge, boot-legacy-free,
+              one after another, then boot-x2apic, boot-bridge, boot-disk, boot-legacy-free,
               boot-random, boot-identity, boot-console, boot-large, boot-rented and
               boot-bench
   boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
@@ -71,6 +84,10 @@ commands:
   boot-reserved  the kernel boot with firmware-reserved memory (RMRRs, IVMDs) a TEST ONLY UEFI
               application plants in QEMU's tables (both IOMMUs): the NVMe controller's domain
               identity-maps what the kernel may trust, and the rest is refused by name
+  boot-disk   the kernel boot with NVMe test disks other than the marked one (Intel VT-d, 2
+              processors; TASKS item 171): one without the mark, left untouched byte for byte,
+              and one whose marked partition is too small for processor 1's write, which the
+              guard refuses while nothing outside the partition changes
   boot-large  the kernel boot on a machine with more than 4 GiB of RAM (both IOMMUs; 8 GiB in
               CI): the frame allocator holds all but 1% of it (TASKS item 83)
   boot-rented the kernel boot on rental B's board's shapes (both IOMMUs, the large machine's
@@ -146,6 +163,22 @@ commands:
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
+  fuzz <target> [--seconds N] | replay <target> <file> | list
+              coverage-guided fuzzing with cargo-fuzz 0.13.2 on the pinned stable compiler
+              (TASKS item 144): the control, then one target for a fixed time (default 60 s,
+              at most 300 s unless CI is set; the long runs are CI's), or one input replayed.
+              Not part of check, which replays kept crashes as host tests instead
+  kani [--harness <name> | --package <name>] | [--package <name>] --list
+              Kani's proofs (the frame allocator, the heap, the ONBF parsers and capability
+              validation), then their negative controls, each applied to a scratch copy of the
+              tree (CLAUDE.md §73; owner item 358). Needs Kani 0.68.0 (.github/ci/install-kani.sh).
+              CI's job `kani` runs it, one job for each package of the proof files, and not
+              check. With --harness, one harness and the controls that name it, while it is
+              being written; with --package, one package's harnesses and the controls on them;
+              with --list, what such a run would run, running nothing
+  kani-gate   only what can be checked of the proofs without Kani: each harness has a
+              control whose text is in its file once, and cfg(kani) is only on the proof
+              modules' lines (part of check; quick)
   unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction, on the
               `preserves_flags` option of assembly blocks, and on RDRAND and RDSEED, which
               only the kernel's generator and the loader's may run (part of check; quick)
@@ -186,11 +219,12 @@ commands:
   roadmap-gate only the gate on docs/ROADMAP.md: every counted build row of the
               requirements matrix placed in one milestone or listed as in none, and
               every row it names in the matrix (part of check; CLAUDE.md §82; quick)
-  progress    writes docs/PROGRESS.md from the requirements matrix, CLAUDE.md's and the
-              ADRs' headings and docs/ROADMAP.md: counts of rows by state, overall, by
-              milestone, by feature group, by ADR and for the standing rules. Run it when
-              a row's state changes (TASKS item 43; quick)
-  progress-gate only the gate on docs/PROGRESS.md: the committed page is the one the
+  progress    writes PROGRESS.md, at the root, from the requirements matrix, CLAUDE.md's and
+              the ADRs' headings and docs/ROADMAP.md: the share of requirements in each of
+              the four states, overall, by milestone and by feature area, with the sections,
+              the ADRs, the standing rules and the exact counts as details. Run it when a
+              row's state changes (TASKS items 43 and 137; quick)
+  progress-gate only the gate on PROGRESS.md: the committed page is the one the
               tree generates, byte for byte (part of check; quick)
   cost-gate   only the gate on the cost ledger in docs/engineering/PERFORMANCE_BUDGETS.md:
               each row's decision and figure, the list of ADR-0001 to ADR-0017, and a
@@ -765,7 +799,7 @@ fn nvme_queued_for(cpus: u32, pairs: u32) -> u32 {
 
 /// The per-CPU tables the kernel sizes at discovery, the framework's and the kernel crate's
 /// (ADR-0008 Amendment 1, D1; `per_cpu` checks that each is sized).
-const PER_CPU_TABLES: u32 = 28;
+const PER_CPU_TABLES: u32 = 30;
 
 /// The cores of each package of the 288-processor run (`ORIGIN_QEMU_TOPOLOGY=many`, outside the
 /// gate since decision item 294).
@@ -1549,6 +1583,84 @@ fn capacity_markers(machine: &Machine, settings: &Settings) -> Vec<String> {
     ]
 }
 
+/// The start of the line in which the kernel says what the guard let the boot proofs write
+/// (TASKS item 171).
+const WRITES_LINE: &str = "origin-kernel: NVMe: the boot proofs sent ";
+
+/// The rest of [`WRITES_LINE`] after the flushes' count: which blocks of namespace 1 the guard
+/// let the writes reach, `marked`, or why none could be, and that it refused `refused` commands.
+fn writes_reach(marked: Option<(u64, u64)>, refused: u64) -> String {
+    let refused = format!(
+        "; {refused} {} refused",
+        if refused == 1 { "command" } else { "commands" }
+    );
+    match marked {
+        Some((first, last)) => format!(
+            " flushes, which the guard let reach blocks {first}-{last} of namespace 1 alone{refused}"
+        ),
+        None => format!(
+            " flushes, as namespace 1 carries no mark of Origin's tests (no partition carries it){refused}"
+        ),
+    }
+}
+
+/// The words of the polled proof's line that say it wrote: a scenario whose markers hold them
+/// requires the disk to have changed ([`requires_writes`]).
+const POLLED_WRITE_WORDS: &str = "(the marked partition's last block), flushed and read it back";
+
+/// The polled proof's write at `lba`, the marked partition's last block, read back, and the read
+/// past the end refused (TASKS item 171).
+fn polled_write_marker(lba: u64) -> String {
+    format!(
+        "origin-kernel: NVMe: wrote LBA {lba} {POLLED_WRITE_WORDS}: match true; a read at LBA {} (past the end) failed with status type 0 code 0x80 (LBA out of range: true)",
+        disk::BLOCKS
+    )
+}
+
+/// What the kernel says of `variant`'s GPT (TASKS item 171): both copies valid and agreeing, the
+/// disk and its three partitions, and the mark, or why there is none. Without the mark the disk
+/// GUID, the partitions' unique GUIDs and their names are not printed.
+fn gpt_markers(variant: disk::Variant) -> Vec<String> {
+    let parts = variant.partitions();
+    let marked = variant.marked();
+    let mut markers = vec![
+        format!(
+            "origin-kernel: GPT: primary copy valid, backup copy at LBA {} valid, the two agree true",
+            disk::BLOCKS - 1
+        ),
+        format!(
+            "origin-kernel: GPT: disk {}, usable blocks 34-{}, 128 entries of 128 B, 3 in use",
+            if marked.is_some() {
+                disk::DISK_GUID
+            } else {
+                "not shown (no mark of Origin's tests)"
+            },
+            disk::LAST_USABLE
+        ),
+    ];
+    for (i, (name, kind, first, last)) in parts.iter().enumerate() {
+        markers.push(if marked.is_some() {
+            format!(
+                "origin-kernel: GPT: partition {}: \"{name}\", type {kind}, blocks {first}-{last} (",
+                i + 1
+            )
+        } else {
+            format!(
+                "origin-kernel: GPT: partition {}: type {kind}, blocks {first}-{last} (",
+                i + 1
+            )
+        });
+    }
+    markers.push(match marked {
+        Some((first, last)) => format!(
+            "origin-kernel: NVMe: the mark of Origin's tests: partition 3 \"{}\", blocks {first}-{last} of namespace 1: the boot proofs write there and nowhere else",
+            parts[2].0
+        ),
+        None => "origin-kernel: NVMe: no mark of Origin's tests (no partition carries it): the boot proofs only read namespace 1".into(),
+    });
+    markers
+}
+
 /// The kernel boot on the machine `settings` describe, with its markers for that machine.
 fn boot_scenario(settings: &Settings) -> Scenario {
     let machine = machine(settings);
@@ -1722,9 +1834,10 @@ fn no_pit_markers(scenario: &mut Scenario) {
         "origin-kernel: APIC timer calibrated against the PIT: ",
         "origin-kernel: APIC timer calibrated against the ACPI PM timer: ".into(),
     );
+    // With its marker goes the count's check ([`counts_hold`]): this machine routes none.
     swap_marker(
         scenario,
-        "origin-kernel: I/O APIC: 20 PIT interrupts routed through the I/O APIC in ",
+        PIT_ROUTED,
         "origin-kernel: I/O APIC: routing not proven: the 8254 is not counting".into(),
     );
     let first = "origin-kernel: I/O APIC: remapped: the PIT's IRQ0 (GSI 2, edge-triggered, active-high) through IRTE ";
@@ -2211,7 +2324,7 @@ fn check_reserved_boot(done: &Completed, settings: &Settings) -> Result {
         proofs
             .iter()
             .filter(|l| {
-                l.contains(&format!("({access}, as the firmware's bits give: true) in the NVMe controller's domain maps to itself: true; the controller's write of LBA 2048 into it {write}: true; its read of it to LBA 24576 carried what the page holds: true; {fill}; other domains: {others}; consistent true"))
+                l.contains(&format!("({access}, as the firmware's bits give: true) in the NVMe controller's domain maps to itself: true; the controller's write of LBA 2048 into it {write}: true; its read of it to LBA {} carried what the page holds: true; {fill}; other domains: {others}; consistent true", disk::RESERVED_LBA))
             })
             .count()
     };
@@ -2605,7 +2718,8 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             "origin-kernel: PM timer: 24-bit at port 0x608, 3.579545 MHz;".into(),
             // I/O APIC: the PIT's IRQ0 routed through it (IRQ0 -> GSI 2 via an override).
             "origin-kernel: I/O APIC: id 0, 24 entries at 0xfec00000 (GSI base 0); routing the PIT's IRQ0 via GSI 2 to vector 0x41 on CPU 0".into(),
-            "origin-kernel: I/O APIC: 20 PIT interrupts routed through the I/O APIC in ".into(),
+            // The line's count is left out, and read by `pit_routed` (TASKS item 135).
+            PIT_ROUTED.into(),
             // Intel VT-d (CLAUDE.md §32, §58; ADR-0007): before the application processors
             // start (T4), the DMAR QEMU builds for q35 with `intremap=on` (one unit at 0xfed90000
             // whose scope lists every PCI function and the I/O APIC), the unit's capabilities,
@@ -2730,6 +2844,11 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             "origin-kernel: kernel bound: the root holds ".into(),
             " KiB of free frames less a reserve of ".into(),
             " KiB kept for the kernel's own use; a second sizing is refused and changes nothing: true".into(),
+            // ADR-0020 S7 (TASKS item 98): balancing was set up, on every machine, before the
+            // scheduler's first proof. Without this line no processor pulls, and with two or more
+            // processors the migration proofs' pulled phases fail (the review of TASKS item 98,
+            // R98-3).
+            "origin-kernel: balancing: idle pull and idle kick set up: ".into(),
             // The guard is in the kernel stacks' region, whose addresses the boot never prints
             // (ADR-0004 Amendment 2, A6.3).
             "origin-kernel: page protection: the first thread's stack guard page faulted (#PF error 0x0)".into(),
@@ -2829,10 +2948,35 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
         .chain([
             // ADR-0020 S6, S20 and S23 (TASKS item 96): the two migration proofs, on every
             // machine; on one with fewer than two processors taking part, each says so and passes.
-            // A failure ends its line ": scheduler failed", a boot failure below.
+            // A failure ends its line ": scheduler failed", a boot failure below. Each has a second
+            // phase, in which the idle processors pull its threads (TASKS item 98), with a line of
+            // its own after the first phase's.
             "origin-kernel: scheduler: thread migration: integrity: ".into(),
+            "origin-kernel: scheduler: thread migration: integrity, pulled: ".into(),
             "origin-kernel: scheduler: thread migration: delivery: ".into(),
+            "origin-kernel: scheduler: thread migration: delivery, pulled: ".into(),
         ])
+        .chain(if cpus >= 2 {
+            // Delivery's pulled phase saw a wake-up cross a pull with its token untaken. The
+            // kernel cannot promise that race, so its line says "not exercised" without one and
+            // the phase passes; on QEMU, where every machine with two or more processors has
+            // shown it, it is required here, on every one, 65 and 67 included, and nothing
+            // forgives its absence (the coordinating session's ruling T1-5 on TASKS item 98, as
+            // the ACPI census's precedent).
+            vec![
+                " with their token untaken ".into(),
+                ": exercised, after ".into(),
+                // "load balancing" (Report; TASKS item 98, the ruling R2): its three cases, and its
+                // verdict, every condition held. Two alone needs three processors taking part and
+                // says so otherwise.
+                "origin-kernel: scheduler: load balancing: spread: ".into(),
+                "origin-kernel: scheduler: load balancing: two alone: ".into(),
+                "origin-kernel: scheduler: load balancing: kick: ".into(),
+                "origin-kernel: scheduler: load balancing: spread true, two alone true, kick true; heap, frames and stacks back true; settled true and true".into(),
+            ]
+        } else {
+            vec!["origin-kernel: scheduler: load balancing: ".into(), ": not run".into()]
+        })
         .chain([
             // ADR-0017 Z3: the scheduler noted each change of process, with one barrier for
             // each where the processor has IBPB and none where it has not.
@@ -2858,7 +3002,10 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             "origin-kernel: NVMe: 00:02.0 1b36:0010, NVMe 1.".into(),
             // T4: only after the controller has a domain and has been reset.
             "origin-kernel: NVMe: bus mastering on after the controller was attached and reset: command register 0x0007".into(),
-            "origin-kernel: NVMe: controller ready: model \"QEMU NVMe Ctrl\", serial \"ORIGIN0001\"".into(),
+            // TASKS item 171: no serial number; `check_storage_evidence` holds that no kernel line
+            // has QEMU's.
+            "origin-kernel: NVMe: controller ready: model \"QEMU NVMe Ctrl\", firmware \"".into(),
+            "; its serial number is not printed".into(),
             format!(
                 "origin-kernel: NVMe: namespace 1: {} blocks of {} B ({} MiB)",
                 disk::BLOCKS,
@@ -2869,36 +3016,14 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
                 "origin-kernel: NVMe: asked for {} I/O queue pairs, allocated ",
                 2 + cpus
             ),
+        ])
+        // The disk's GPT, both copies checked, its partitions as `disk` wrote them, and the mark
+        // of Origin's tests on the third (TASKS item 171); then the polled proofs, which write
+        // in that partition alone.
+        .chain(gpt_markers(disk::Variant::Marked))
+        .chain([
             "origin-kernel: NVMe: through I/O queue 1: LBA 0 has the MBR signature true, LBA 1 the GPT signature true, and 8 of 8 blocks from LBA 2048 match the boot test's pattern".into(),
-            format!(
-                "origin-kernel: NVMe: wrote LBA {}, flushed and read it back: match true; a read at LBA {} (past the end) failed with status type 0 code 0x80 (LBA out of range: true)",
-                disk::BLOCKS - 64,
-                disk::BLOCKS
-            ),
-            // The disk's GPT, both copies checked, and its partitions as `disk` wrote them.
-            format!(
-                "origin-kernel: GPT: primary copy valid, backup copy at LBA {} valid, the two agree true",
-                disk::BLOCKS - 1
-            ),
-            format!(
-                "origin-kernel: GPT: disk {}, usable blocks 34-{}, 128 entries of 128 B, 2 in use",
-                disk::DISK_GUID,
-                disk::BLOCKS - 34
-            ),
-            format!(
-                "origin-kernel: GPT: partition 1: \"{}\", type {}, blocks {}-{} (",
-                disk::PARTITIONS[0].0,
-                disk::PARTITIONS[0].1,
-                disk::PARTITIONS[0].2,
-                disk::PARTITIONS[0].3
-            ),
-            format!(
-                "origin-kernel: GPT: partition 2: \"{}\", type {}, blocks {}-{} (",
-                disk::PARTITIONS[1].0,
-                disk::PARTITIONS[1].1,
-                disk::PARTITIONS[1].2,
-                disk::PARTITIONS[1].3
-            ),
+            polled_write_marker(disk::POLLED_LBA),
             // Interrupt-driven completions: MSI-X vector 1 to another CPU (q35's NVMe has
             // 65 vectors, the table in BAR 0), a thread there blocking for each one.
             format!(
@@ -2921,7 +3046,10 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             // The block cache over NVMe: cold misses fetch, re-reads hit, eviction and
             // write-back work (CLAUDE.md §39).
             "origin-kernel: block cache: 4 pages (512 B blocks, 8 per page): 32 of 32 blocks matched the pattern; 4 device reads cold, re-reading 4 resident pages did 0 more (32 hits, 4 misses)".into(),
-            "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); wrote LBA 10240, flushed (1 device writes), evicted and read back changed: true".into(),
+            format!(
+                "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); wrote LBA {}, flushed (1 device writes), evicted and read back changed: true",
+                disk::CACHE_LBA
+            ),
             // The virtio-net NIC brought up (features, MAC, DRIVER_OK, MSI-X); a receive thread
             // woken only by the NIC's interrupt resolves the gateway by ARP and takes a DHCP
             // lease (CLAUDE.md §31, §54).
@@ -2971,6 +3099,10 @@ fn boot_scenario_markers(machine: &Machine, settings: &Settings) -> Scenario {
             // Firmware-reserved memory (ADR-0007 questions 4 and 8): QEMU's tables name none,
             // so nothing is proved here; the boot-reserved machine plants some.
             NO_RESERVED_LINE.into(),
+            // TASKS item 171: what the guard let the proofs write, and that it refused nothing
+            // the driver sends (the coordinating session's ruling Q7).
+            WRITES_LINE.into(),
+            writes_reach(Some(disk::MARKED), 0),
             // The PIT's IRQ0 again, now through interrupt remapping (CLAUDE.md §24, §32;
             // ADR-0007 I8): the I/O APIC's entry in remappable format names an IRTE that
             // sends vector 0x41 to the target CPU (another than the boot processor when there
@@ -3171,6 +3303,60 @@ fn aml_markers(acpi: bool) -> Vec<String> {
         .map(String::from),
     );
     markers
+}
+
+/// Where a boot's NVMe test disk is staged under the work directory `work`.
+fn nvme_image(work: &Path) -> PathBuf {
+    work.join("nvme.img")
+}
+
+/// The serial number xtask gives QEMU's NVMe controller (`qemu_command`), which no kernel line may
+/// hold (TASKS item 171).
+const NVME_SERIAL: &str = "ORIGIN0001";
+
+/// After every boot, whatever it booted (TASKS item 171; the coordinating session's rulings of
+/// 2026-11-27):
+/// - no line of the kernel's, on any port this boot read, holds the NVMe controller's serial
+///   number;
+/// - the NVMe test disk changed nowhere outside its marked partition, and nowhere at all on a disk
+///   without one, judged from its bytes against the image staged for the boot;
+/// - where the scenario's markers require the polled proof's write, something inside it changed.
+///
+/// A scenario's disk is [`disk::Variant::Marked`] unless `boot-disk` staged another
+/// ([`disk_variant`]).
+fn check_storage_evidence(done: &Completed, scenario: &Scenario, work: &Path) -> Result {
+    for text in [Some(done.serial.as_str()), done.com1.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(line) = serial_line(text) {
+            return Err(format!(
+                "a kernel line holds the NVMe controller's serial number, which none may print (TASKS item 171): {line:?}"
+            ));
+        }
+    }
+    let path = nvme_image(work);
+    let after = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    disk::check_writes(
+        disk_variant(scenario.label),
+        &after,
+        requires_writes(scenario),
+    )
+}
+
+/// The first kernel line of `text` that holds the NVMe controller's serial number.
+fn serial_line(text: &str) -> Option<&str> {
+    text.lines()
+        .find(|l| l.contains("origin-kernel:") && l.contains(NVME_SERIAL))
+}
+
+/// Whether `scenario`'s markers require the polled proof's write, so that its disk must have
+/// changed.
+fn requires_writes(scenario: &Scenario) -> bool {
+    scenario
+        .markers
+        .iter()
+        .any(|m| m.contains(POLLED_WRITE_WORDS))
 }
 
 /// The kernel boot's whole-log checks: every line whole, and the screen.
@@ -3892,6 +4078,96 @@ const STACKS_AS_BEFORE: &str = " }, as before: true";
 
 /// How every I/O APIC proof ends a line that failed.
 const IOAPIC_FAILED: &str = ": I/O APIC failed";
+
+/// The fewest PIT interrupts the kernel's I/O APIC proof passes on: `PROOF_TICKS` in
+/// `framekernel/src/irq.rs`, which a host test holds this to. Kept here as well, so that a kernel
+/// whose own bound fell would still be held to this one ([`pit_routed`]).
+const PIT_PROOF_TICKS: u64 = 20;
+/// How the I/O APIC proof's line starts, before the count it took.
+const PIT_ROUTED_HEAD: &str = "origin-kernel: I/O APIC: ";
+/// The I/O APIC proof's line after its count, which is that line's marker (TASKS item 135;
+/// ADR-0013 R1(b)). The kernel's proof passes on [`PIT_PROOF_TICKS`] interrupts or more
+/// (`taken >= PROOF_TICKS`) and prints the count it took, which can pass the bound: the
+/// 65-processor machine under host load printed 21, its proof passed, and the marker, which then
+/// held "20", failed the boot. (The proof's loop reads the count before each interrupt window; a
+/// window that took two interrupts would give 21. Which path that boot took is not shown.) So the
+/// count is no part of the marker, and [`pit_routed`] reads it.
+const PIT_ROUTED: &str = " PIT interrupts routed through the I/O APIC in ";
+
+/// The count on the I/O APIC proof's line in `text`, a boot's output: how many PIT interrupts the
+/// kernel took through the I/O APIC (TASKS item 135).
+///
+/// Any count the kernel's own condition takes is taken here, [`PIT_PROOF_TICKS`] or more with no
+/// upper bound, and a lower count is refused whatever else the line says. The line must be the
+/// kernel's whole line and nothing else: its head, a decimal count, [`PIT_ROUTED`], the
+/// milliseconds, and no more (a failed proof's line goes on with [`IOAPIC_FAILED`]).
+fn pit_routed(text: &str) -> Result<u64> {
+    let line = text
+        .lines()
+        .find(|line| line.contains(PIT_ROUTED))
+        .ok_or_else(|| format!("no line holds {PIT_ROUTED:?}"))?;
+    let malformed =
+        || format!("the I/O APIC proof's line is not as the kernel prints it: {line:?}");
+    // Digits alone: `parse` would also take a sign.
+    let decimal = |digits: &str| -> Option<u64> {
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
+    };
+    let (count, took) = line
+        .strip_prefix(PIT_ROUTED_HEAD)
+        .and_then(|rest| rest.split_once(PIT_ROUTED))
+        .ok_or_else(malformed)?;
+    let count = decimal(count).ok_or_else(malformed)?;
+    took.strip_suffix(" ms")
+        .and_then(decimal)
+        .ok_or_else(malformed)?;
+    if count < PIT_PROOF_TICKS {
+        return Err(format!(
+            "the I/O APIC proof's line gives {count} PIT interrupts, below the {PIT_PROOF_TICKS} the kernel's proof passes on: {line:?}"
+        ));
+    }
+    Ok(count)
+}
+
+/// What the markers do not hold of a boot whose every marker has appeared in `text`: the count
+/// on a line whose marker leaves its count out ([`PIT_ROUTED`]). A scenario without that marker,
+/// the machine with no 8254 among them ([`no_pit_markers`]), is held to no count.
+fn counts_hold(text: &str, markers: &[&str]) -> Result {
+    if markers.contains(&PIT_ROUTED) {
+        pit_routed(text)?;
+    }
+    Ok(())
+}
+
+/// The verdict on a boot's serial output so far, or `None` while there is none (TASKS item 135;
+/// its review, R135-1: a function, so that a host test holds what `run_scenario` judges by):
+///
+/// - a failure message in `judged`, the output's complete lines less what the checker forgives,
+///   fails the boot;
+/// - otherwise, with every marker in `text` in order, the boot passes if the counts its markers
+///   leave out hold ([`counts_hold`]), and fails on the count if not.
+fn verdict_so_far(judged: &str, text: &str, failures: &[&str], markers: &[&str]) -> Option<Result> {
+    if let Some(m) = failures.iter().find(|m| judged.contains(**m)) {
+        return Some(Err(format!("the serial output contains {m:?}")));
+    }
+    serial::contains_in_order(text, markers).then(|| counts_hold(text, markers))
+}
+
+/// Whether a scenario read from the screen may hold `markers`: not one whose count is read from
+/// its line ([`PIT_ROUTED`]). [`pit_routed`] wants the kernel's whole line, and the screen gives
+/// rows, which wrap a line longer than the console is wide: a correct boot's line could be
+/// refused as malformed there. So such a scenario is refused before it boots, rather than its
+/// count left unread or misread (the review of TASKS item 135, R135-3). None holds one today.
+fn screen_can_hold(markers: &[&str]) -> Result {
+    if markers.contains(&PIT_ROUTED) {
+        return Err(format!(
+            "a scenario read from the screen holds the marker {PIT_ROUTED:?}, whose count is read from a whole line; the screen gives rows"
+        ));
+    }
+    Ok(())
+}
 /// How every clock proof ends a line that failed.
 const CLOCK_FAILED: &str = ": clock failed";
 
@@ -4323,7 +4599,9 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
     for how in ["exits", "faults"] {
         markers.extend([
             "origin-kernel: ipc: the peer of a process that: woken -> OK, observed -> 0x4, write -> PEER_CLOSED, read -> PEER_CLOSED".to_string(),
-            format!("origin-kernel: ipc: when a process {how}: its handles close (0 left), and its peer on {far}, blocked "),
+            // TASKS item 134: the process starts only once its peer is seen blocked, so the
+            // wake-up crosses processors on every schedule.
+            format!("origin-kernel: ipc: when a process {how}: its handles close (0 left), and its peer on {far}, seen blocked in wait_one before the process started: true, blocked "),
             "woke and saw PEER_CLOSED".into(),
         ]);
     }
@@ -4360,7 +4638,8 @@ fn object_markers(far: &str) -> Vec<String> {
     for how in ["exits", "faults"] {
         markers.extend([
             "origin-kernel: ipc: the waiter on a process that: woken -> OK, observed -> 0x10, and it stays raised -> OK".to_string(),
-            format!("origin-kernel: ipc: when a process {how}: TERMINATED reached the thread waiting on it on {far}, blocked "),
+            // TASKS item 134, as the channel's case: the waiter is seen blocked first.
+            format!("origin-kernel: ipc: when a process {how}: TERMINATED reached the thread waiting on it on {far}, seen blocked in wait_one before the process started: true, blocked "),
         ]);
     }
     markers.extend([
@@ -4661,6 +4940,16 @@ fn main() -> ExitCode {
         ["check"] => in_turn("check", check),
         ["unsafe-gate"] => unsafety::gate(),
         ["names-gate"] => listed_names::gate(),
+        ["kani-gate"] => kani::gate(),
+        ["kani"] => in_turn("kani", || kani::run(kani::Choice::All)),
+        ["kani", "--harness", name] => {
+            in_turn("kani --harness", || kani::run(kani::Choice::Harness(name)))
+        }
+        ["kani", "--package", name] => {
+            in_turn("kani --package", || kani::run(kani::Choice::Package(name)))
+        }
+        ["kani", "--list"] => kani::list(kani::Choice::All),
+        ["kani", "--package", name, "--list"] => kani::list(kani::Choice::Package(name)),
         ["aml-alloc-gate"] => amlalloc::gate(),
         ["percpu-gate"] => per_cpu::gate(),
         ["settle-gate"] => settle::gate(),
@@ -4690,7 +4979,7 @@ fn main() -> ExitCode {
                 Ok(())
             })
         }),
-        ["boot-test"] => in_turn_with_settings("boot-test", boot_test),
+        ["boot-test"] => in_turn_with_settings("boot-test", |s| boot_test(s, None)),
         ["boot-matrix"] => in_turn_with_settings("boot-matrix", boot_matrix),
         ["boot-x2apic"] => in_turn_with_settings("boot-x2apic", boot_x2apic),
         ["boot-sparse"] => in_turn_with_settings("boot-sparse", boot_sparse),
@@ -4713,6 +5002,7 @@ fn main() -> ExitCode {
         ["stack-depth"] => in_turn_with_settings("stack-depth", stack_depth::run),
         ["boot-bridge"] => in_turn_with_settings("boot-bridge", boot_bridge),
         ["boot-reserved"] => in_turn_with_settings("boot-reserved", boot_reserved),
+        ["boot-disk"] => in_turn_with_settings("boot-disk", boot_disk),
         ["boot-large"] => in_turn_with_settings("boot-large", boot_large),
         ["boot-rented"] => in_turn_with_settings("boot-rented", boot_rented),
         ["boot-legacy-free"] => in_turn_with_settings("boot-legacy-free", boot_legacy_free),
@@ -4721,6 +5011,7 @@ fn main() -> ExitCode {
         ["boot-identity"] => in_turn_with_settings("boot-identity", boot_identity),
         ["run"] => in_turn_with_settings("run", run),
         ["loom"] => in_turn("loom", loom::run),
+        ["fuzz", rest @ ..] => in_turn("fuzz", || fuzz::run(rest)),
         ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
         ["exclusive", "--", command @ ..] => {
             let command: Vec<String> = command.iter().map(|s| (*s).to_string()).collect();
@@ -4772,16 +5063,17 @@ fn entry_settings(command: &str, settings: Settings) -> Result<Settings> {
     Ok(settings)
 }
 
-/// `boot-matrix` and its thirteen scenario commands: each sets every machine's topology, bridge,
+/// `boot-matrix` and its fourteen scenario commands: each sets every machine's topology, bridge,
 /// reserved memory, ACPI tables, RAM and table shapes itself (the coordinating session's ruling R5
 /// of 2026-11-19; TASKS item 83). The list is of names, so a new scenario command of
 /// `boot-matrix`'s belongs here, by hand; the host test
-/// `each_kind_of_command_takes_or_refuses_the_person_s_machine_at_entry` holds these fourteen.
-const SETS_ITS_MACHINES: [&str; 14] = [
+/// `each_kind_of_command_takes_or_refuses_the_person_s_machine_at_entry` holds these fifteen.
+const SETS_ITS_MACHINES: [&str; 15] = [
     "boot-matrix",
     "boot-x2apic",
     "boot-bridge",
     "boot-reserved",
+    "boot-disk",
     "boot-legacy-free",
     "boot-acpi",
     "boot-random",
@@ -4818,7 +5110,7 @@ fn boot_machines(runs: Vec<MachineRun>) -> Result {
 /// [`boot_machines`] for one machine.
 fn boot_machine(run: &MachineRun) -> Result {
     println!("{}", run.said);
-    boot_test(&run.settings).map_err(|e| format!("{} failed: {e}", run.failed))
+    boot_test(&run.settings, Some(&run.said)).map_err(|e| format!("{} failed: {e}", run.failed))
 }
 
 /// The two IOMMUs the machines boot under, with the names `boot-matrix` prints for them.
@@ -4863,6 +5155,8 @@ fn boot_matrix(base: &Settings) -> Result {
     boot_x2apic(base)?;
     boot_bridge(base)?;
     boot_reserved(base)?;
+    // TASKS item 171: ADR-0013's controls D1 and D2, disks other than the marked one.
+    boot_disk(base)?;
     boot_legacy_free(base)?;
     boot_acpi(base)?;
     boot_random(base)?;
@@ -5465,7 +5759,7 @@ fn boot_console(settings: &Settings) -> Result {
         .collect();
     let chosen = select_scenarios(&scenarios, &settings.only)?;
     for (scenario, kernel) in &chosen {
-        run_scenario(scenario, kernel, settings)?;
+        run_scenario(scenario, kernel, settings, None)?;
     }
     println!(
         "xtask: boot-console passed ({} of {} scenarios: the UART the SPCR names, one moved to with a replay, COM1 named, refused tables, a UART that takes no bytes, one that stops taking them, no display, no UART)",
@@ -5473,6 +5767,263 @@ fn boot_console(settings: &Settings) -> Result {
         scenarios.len()
     );
     Ok(())
+}
+
+/// `boot-disk` (TASKS item 171; ADR-0013's controls D1 and D2): the kernel boot on the Intel
+/// VT-d machine with 2 processors, each time with another NVMe test disk staged in place of the
+/// marked one, and its bytes judged after the boot by `check_storage_evidence`:
+/// - **unmarked disk**: the third partition's type is Origin data's, all else the same. Every
+///   proof that reads runs and passes; every write proof says it did not run; the guard sent no
+///   write and no flush; no kernel line names the disk's GUID, a partition's unique GUID or its
+///   name; and the image is byte for byte the one staged;
+/// - **marked partition too small**: the marked partition is 72 blocks. Every fixed write and
+///   processor 0's block fit, processor 1's does not: the guard refuses it by name, the per-CPU
+///   proof fails as aimed (the x2APIC and block-cache proofs after it do not run), and the image
+///   changed inside those 72 blocks alone.
+fn boot_disk(base: &Settings) -> Result {
+    let settings = disk_settings(base);
+    let krn_path = pack_kernel(&build_kernel()?)?;
+    let (trusted, _) = test_keys()?;
+    let signed = sign_kernel(&krn_path, &trusted, "KERNEL.signed.ONBF")?;
+    let scenarios: Vec<(Scenario, Vec<u8>)> = [
+        unmarked_disk_scenario(&settings),
+        small_partition_scenario(&settings),
+    ]
+    .into_iter()
+    .map(|scenario| (scenario, signed.clone()))
+    .collect();
+    let chosen = select_scenarios(&scenarios, &settings.only)?;
+    for (scenario, kernel) in &chosen {
+        run_scenario(scenario, kernel, &settings, None)?;
+    }
+    println!(
+        "xtask: boot-disk passed ({} of {} scenarios on the Intel VT-d machine with 2 processors: a disk without the mark, untouched byte for byte; a marked partition too small for processor 1's write, which the guard refused and nothing outside it changed)",
+        chosen.len(),
+        scenarios.len()
+    );
+    Ok(())
+}
+
+/// `boot-disk`'s machine: Intel VT-d and 2 processors, the rest the person's (`base`).
+fn disk_settings(base: &Settings) -> Settings {
+    Settings {
+        iommu: Iommu::Intel,
+        topology: Topology::Plain(2),
+        timeout: Some(timeout_for(base, 2)),
+        ..base.clone()
+    }
+}
+
+/// The labels of `boot-disk`'s scenarios, and the disks they stage.
+const UNMARKED_DISK: &str = "unmarked disk";
+const SMALL_PARTITION: &str = "marked partition too small";
+
+/// The NVMe test disk a scenario boots with: the marked one unless `boot-disk` staged another.
+fn disk_variant(label: &str) -> disk::Variant {
+    match label {
+        UNMARKED_DISK => disk::Variant::Unmarked,
+        SMALL_PARTITION => disk::Variant::Small,
+        _ => disk::Variant::Marked,
+    }
+}
+
+/// Replaces the run of required markers `old` with `new`, or records that it was not found,
+/// which fails the boot.
+fn swap_markers(scenario: &mut Scenario, old: &[String], new: Vec<String>) {
+    match scenario
+        .markers
+        .windows(old.len().max(1))
+        .position(|w| w == old)
+    {
+        Some(i) => {
+            scenario.markers.splice(i..i + old.len(), new);
+        }
+        None => scenario
+            .markers
+            .push(format!("xtask: the markers {old:?} are missing")),
+    }
+}
+
+/// `boot-disk`'s first scenario, control D1: a disk without the mark.
+fn unmarked_disk_scenario(settings: &Settings) -> Scenario {
+    let machine = machine(settings);
+    let mut scenario = boot_scenario(settings);
+    scenario.label = UNMARKED_DISK;
+    swap_markers(
+        &mut scenario,
+        &gpt_markers(disk::Variant::Marked),
+        gpt_markers(disk::Variant::Unmarked),
+    );
+    swap_marker(
+        &mut scenario,
+        &polled_write_marker(disk::POLLED_LBA),
+        format!(
+            "origin-kernel: NVMe: write proofs: not run: no mark of Origin's tests, so nothing is written to this namespace or flushed; a read at LBA {} (past the end) failed with status type 0 code 0x80 (LBA out of range: true)",
+            disk::BLOCKS
+        ),
+    );
+    for index in queue_order(&machine) {
+        let old = format!(
+            "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, ",
+            machine.named(index)
+        );
+        if scenario.markers.contains(&old) {
+            swap_marker(
+                &mut scenario,
+                &old,
+                format!(
+                    "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write not run (no mark of Origin's tests), ",
+                    machine.named(index)
+                ),
+            );
+        }
+    }
+    swap_marker(
+        &mut scenario,
+        &format!(
+            "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); wrote LBA {}, flushed (1 device writes), evicted and read back changed: true",
+            disk::CACHE_LBA
+        ),
+        "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); write-back not run: no mark of Origin's tests, so nothing is written".into(),
+    );
+    swap_markers(
+        &mut scenario,
+        &[WRITES_LINE.into(), writes_reach(Some(disk::MARKED), 0)],
+        vec![format!(
+            "{WRITES_LINE}0 writes and 0{}",
+            writes_reach(None, 0)
+        )],
+    );
+    scenario.qemu_args = Some(|work| {
+        disk::write_image_with(&nvme_image(work), disk::Variant::Unmarked)?;
+        Ok(Vec::new())
+    });
+    scenario.check = Some(check_unmarked_boot);
+    scenario
+}
+
+/// Control D1's check: the kernel boot's, and no kernel line names what identifies the disk: its
+/// GUID, a partition's unique GUID, or a partition's name (the coordinating session's ruling Q6).
+/// Its bytes are `check_storage_evidence`'s.
+fn check_unmarked_boot(done: &Completed, settings: &Settings) -> Result {
+    check_kernel_boot(done, settings)?;
+    let names: Vec<String> = disk::PARTITIONS
+        .iter()
+        .map(|(name, ..)| format!("\"{name}\""))
+        .collect();
+    let identifiers = [disk::DISK_GUID]
+        .into_iter()
+        .chain(disk::PARTITION_GUIDS)
+        .chain(names.iter().map(String::as_str));
+    for id in identifiers {
+        if let Some(line) = done
+            .serial
+            .lines()
+            .find(|l| l.contains("origin-kernel:") && l.contains(id))
+        {
+            return Err(format!(
+                "a kernel line names {id}, which identifies a disk without the mark: {line:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `boot-disk`'s second scenario, control D2: a marked partition too small for processor 1's
+/// block.
+fn small_partition_scenario(settings: &Settings) -> Scenario {
+    let machine = machine(settings);
+    let mut scenario = boot_scenario(settings);
+    scenario.label = SMALL_PARTITION;
+    let small = (disk::MARKED.0, disk::SMALL_LAST);
+    swap_markers(
+        &mut scenario,
+        &gpt_markers(disk::Variant::Marked),
+        gpt_markers(disk::Variant::Small),
+    );
+    swap_marker(
+        &mut scenario,
+        &polled_write_marker(disk::POLLED_LBA),
+        polled_write_marker(disk::SMALL_LAST),
+    );
+    // Processor 1 in queue order: its write refused, by name, and the per-CPU proof failed.
+    let order = queue_order(&machine);
+    if let Some(&second) = order.get(1) {
+        let old = format!(
+            "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, ",
+            machine.named(second)
+        );
+        let refused = disk::cpu_lba(1);
+        swap_markers(
+            &mut scenario,
+            &[old],
+            vec![
+                format!(
+                    "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back false, ",
+                    machine.named(second)
+                ),
+                format!(
+                    "; its write: refused: a write to blocks {refused}-{refused} lies outside the marked partition (blocks {}-{}): NVMe failed",
+                    small.0, small.1
+                ),
+            ],
+        );
+    }
+    match scenario.markers.iter().position(|m| {
+        m.starts_with("origin-kernel: NVMe: per-CPU queues: ") && m.contains(" threads at once, ")
+    }) {
+        Some(i) => scenario
+            .markers
+            .insert(i + 1, " MiB/s): NVMe failed".into()),
+        None => scenario
+            .markers
+            .push("xtask: the per-CPU queues' summary marker is missing".into()),
+    }
+    // The proofs after it in `storage::init` do not run.
+    for marker in x2apic_markers(&machine, settings) {
+        if let Some(i) = scenario.markers.iter().position(|m| *m == marker) {
+            scenario.markers.remove(i);
+        }
+    }
+    scenario
+        .markers
+        .retain(|m| !m.starts_with("origin-kernel: block cache: "));
+    swap_markers(
+        &mut scenario,
+        &[WRITES_LINE.into(), writes_reach(Some(disk::MARKED), 0)],
+        // The polled proof's write and processor 0's, each flushed; processor 1's refused.
+        vec![format!(
+            "{WRITES_LINE}2 writes and 2{}",
+            writes_reach(Some(small), 1)
+        )],
+    );
+    // The verdict names the NVMe proof among those that failed (the review's R171-2).
+    swap_markers(
+        &mut scenario,
+        &["origin-kernel: boot verdict: ".into()],
+        vec!["origin-kernel: boot verdict: ".into(), "degraded: ".into()],
+    );
+    match scenario
+        .markers
+        .iter()
+        .position(|m| m.starts_with(" of ") && m.ends_with(" proofs passed"))
+    {
+        Some(i) => {
+            scenario.markers.splice(
+                i + 1..i + 1,
+                ["; failed: ".into(), "NVMe (no storage)".into()],
+            );
+        }
+        None => scenario
+            .markers
+            .push("xtask: the boot verdict's count marker is missing".into()),
+    }
+    scenario.failures.retain(|f| *f != ": NVMe failed");
+    scenario.qemu_args = Some(|work| {
+        disk::write_image_with(&nvme_image(work), disk::Variant::Small)?;
+        Ok(Vec::new())
+    });
+    scenario
 }
 
 /// Runs `boot-test`'s kernel boot in this process under each IOMMU with firmware-reserved
@@ -6021,6 +6572,7 @@ fn check() -> Result {
     for step in steps {
         run_step(cargo().args(*step))?;
     }
+    fuzz::type_check()?;
     // Libraries that run inside the boot loader and the Framekernel: clippy on the host
     // (with tests) and on both freestanding targets, then their tests. Their no-panic lints
     // are active in every non-test build.
@@ -6137,6 +6689,10 @@ fn check() -> Result {
         None,
     )?)?;
     run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--lib"]))?;
+    // The kernel library's doctests, which `--lib` skips: the `compile_fail` ones that show a
+    // handle table's entries and rights cannot be reached around its methods (TASKS item 143,
+    // step 4). `--doc` builds the library alone, not the kernel image's binary.
+    run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--doc"]))?;
     // The AML interpreter's boot proof on a 32 KiB stack: release only, the stack's proxy (TASKS
     // item 63, step B3, ruling Q3 (a)).
     run_step(cargo().args([
@@ -6191,6 +6747,9 @@ fn check() -> Result {
     bench::gate()?;
     // Who may make a proof process, and which ring-3 files may name the call numbers.
     listed_names::gate()?;
+    // Each Kani harness has a control that applies; `cfg(kani)` only on the proof modules
+    // (TASKS item 143). The proofs themselves run in CI's job `kani`, not here.
+    kani::gate()?;
     // Only the AML interpreter's `mem.rs` may allocate (TASKS item 63).
     amlalloc::gate()?;
     // Every per-processor table sized at discovery; no processor count compiled in.
@@ -7554,7 +8113,7 @@ fn stage(kernel: &[u8], loader: Loader, settings: &Settings) -> Result<Staged> {
     fs::copy(&firmware.vars_template, &vars)
         .map_err(|e| format!("copy {}: {e}", firmware.vars_template.display()))?;
     // A fresh NVMe test disk for every boot, too.
-    let nvme = work.join("nvme.img");
+    let nvme = nvme_image(&work);
     disk::write_image(&nvme)?;
     Ok(Staged {
         firmware,
@@ -7798,13 +8357,14 @@ fn boot_test_scenarios(unsigned: &Path, settings: &Settings) -> Result<Vec<(Scen
 
 /// `boot-test` on the machine `settings` describe: every scenario, or those its filter names.
 /// `boot-matrix` and its scenario commands call it in process for each of their machines (TASKS
-/// item 61).
-fn boot_test(settings: &Settings) -> Result {
+/// item 61), with the line they said before the machine (`machine_line`), which a failed boot's
+/// evidence names (TASKS item 165).
+fn boot_test(settings: &Settings, machine_line: Option<&str>) -> Result {
     let krn_path = pack_kernel(&build_kernel()?)?;
     let scenarios = boot_test_scenarios(&krn_path, settings)?;
     let chosen = select_scenarios(&scenarios, &settings.only)?;
     for (scenario, kernel) in &chosen {
-        run_scenario(scenario, kernel, settings)?;
+        run_scenario(scenario, kernel, settings, machine_line)?;
     }
     println!(
         "xtask: boot-test passed ({} of {} scenarios)",
@@ -7883,8 +8443,14 @@ fn scenario_log(scenario: &Scenario) -> PathBuf {
 }
 
 /// Boots `kernel` once on the machine `settings` describe and checks its output against
-/// `scenario`.
-fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Result {
+/// `scenario`. A boot that fails keeps its evidence ([`keep_failed_boot`]); `machine_line` is
+/// the line said before the machine, if one was.
+fn run_scenario(
+    scenario: &Scenario,
+    kernel: &[u8],
+    settings: &Settings,
+    machine_line: Option<&str>,
+) -> Result {
     let staged = stage(kernel, scenario.loader, settings)?;
     let timeout = settings.boot_timeout();
     let accel = settings.accel;
@@ -7895,6 +8461,9 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
     }
     let com1_log = work.join("com1.log");
     let _ = fs::remove_file(&com1_log);
+    // A dump an earlier boot left is never taken for this one's (TASKS item 165).
+    let screen_path = work.join("screen.ppm");
+    let _ = fs::remove_file(&screen_path);
     match scenario.capture {
         Capture::Com1 => {
             cmd.args(["-serial", "stdio", "-monitor", "none"]);
@@ -7928,6 +8497,12 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
         scenario.label,
         timeout.as_secs()
     );
+    // What a failed boot's evidence names (TASKS item 165).
+    let command_line: Vec<String> = std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let started_utc = turns::utc(turns::now());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start {QEMU}: {e}"))?;
@@ -7954,7 +8529,6 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
     let started = Instant::now();
     let deadline = started + timeout;
     let mut raw = Vec::new();
-    let screen_path = work.join("screen.ppm");
     // Whether QEMU closed its output: it exited by itself (TASKS item 116).
     let mut closed = false;
     // When the last byte came, and when QEMU's output closed (TASKS item 121): a scenario tells
@@ -7992,10 +8566,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
             } else {
                 accel.judged(complete)
             };
-            if let Some(m) = scenario.failures.iter().find(|m| judged.contains(**m)) {
-                return Some(Err(format!("the serial output contains {m:?}")));
-            }
-            serial::contains_in_order(&text, &markers).then_some(Ok(()))
+            verdict_so_far(&judged, &text, &scenario.failures, &markers)
         };
         loop {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -8156,8 +8727,17 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
             scenario
                 .check
                 .map_or(Ok(()), |check| check(&done, settings))
-        })
-        .and_then(
+        });
+    // TASKS item 171: the NVMe test disk's bytes, and the controller's serial number, judged on
+    // every boot whatever its markers said, so that a write outside the marked partition is named
+    // beside a marker that failed (the review's R171-1).
+    let verdict = match (verdict, check_storage_evidence(&done, scenario, &work)) {
+        (verdict, Ok(())) => verdict,
+        (Ok(()), Err(storage)) => Err(storage),
+        (Err(e), Err(storage)) => Err(format!("{e}; and {storage}")),
+    };
+    let verdict =
+        verdict.and_then(
             |()| match scenario.stderr.iter().find(|m| !qemu_stderr.contains(**m)) {
                 Some(m) => Err(format!("QEMU's stderr lacks {m:?}")),
                 None => Ok(()),
@@ -8185,6 +8765,45 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
         }
         Err(e) => {
             eprintln!("--- serial output ---\n{text}\n--- {QEMU} stderr ---\n{qemu_stderr}");
+            // What QEMU wrote to its stdout and nobody read: for a boot with no UART, all the
+            // monitor said. QEMU has been stopped, so the reader ends once it has passed it on.
+            let mut unread = Vec::new();
+            while scenario.capture == Capture::Screen
+                && let Ok(chunk) = rx.recv_timeout(Duration::from_millis(500))
+            {
+                unread.extend_from_slice(&chunk);
+            }
+            keep_failed_boot(evidence::FailedBoot {
+                label: scenario.label,
+                command: env::args()
+                    .skip(1)
+                    .fold("cargo xtask".to_string(), |s, arg| s + " " + &arg),
+                machine: machine_line,
+                settings: format!("{settings:#?}"),
+                loader: format!("{:?}", scenario.loader),
+                capture: format!("{:?}", scenario.capture),
+                judged_on_screen: scenario.capture == Capture::Screen,
+                dumps_screen: monitored,
+                started: started_utc,
+                took: elapsed,
+                timeout,
+                qemu_exit: format!("{exit:?}"),
+                exited,
+                verdict: &e,
+                markers: &scenario.markers,
+                failures: &scenario.failures,
+                revision: evidence::Revision::of(&repo_root()),
+                qemu_command: command_line,
+                qemu_stderr: &qemu_stderr,
+                logs: failed_boot_logs(
+                    scenario.capture,
+                    &text,
+                    &unread,
+                    done.com1.as_deref(),
+                    settings,
+                ),
+                screen: fs::read(&screen_path).ok(),
+            });
             Err(format!(
                 "boot-test ({}) failed: {e} (QEMU: {exit:?}){}; serial log: {}{}",
                 scenario.label,
@@ -8198,6 +8817,51 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8], settings: &Settings) -> Resu
             ))
         }
     }
+}
+
+/// Keeps a failed boot's evidence under `target/xtask/failed-boots` ([`evidence::keep`]) and says
+/// where, or why it was not kept. Nothing here changes the boot's verdict.
+fn keep_failed_boot(boot: evidence::FailedBoot) {
+    let folder = target_dir().join("xtask").join(evidence::FOLDER);
+    match evidence::keep(&folder, &boot, &evidence::Prefixes::here()) {
+        Ok(dir) => eprintln!(
+            "xtask: {}: this failed boot's evidence is in {}",
+            boot.label,
+            dir.display()
+        ),
+        Err(e) => eprintln!("xtask: {}: its evidence was not kept: {e}", boot.label),
+    }
+}
+
+/// A failed boot's logs, by what its capture wrote, the one its markers were judged in first:
+/// the serial log as judged (`text`), the SPCR UART's with COM1's file, or, for a boot with no
+/// UART, the monitor's output, which nothing reads while the screen is watched (`unread`); and
+/// QEMU's own log where the person asked for it ([`Settings::debug`]).
+fn failed_boot_logs(
+    capture: Capture,
+    text: &str,
+    unread: &[u8],
+    com1: Option<&str>,
+    settings: &Settings,
+) -> Vec<(&'static str, String)> {
+    let mut logs = vec![match capture {
+        Capture::Com1 | Capture::Com1AndScreen => ("serial.log", text.to_string()),
+        Capture::SpcrUart => ("spcr-uart.log", text.to_string()),
+        // `text` is empty: nothing reads stdout while the screen is watched.
+        Capture::Screen => ("monitor.log", evidence::as_a_terminal_shows(unread)),
+    }];
+    if let Some(com1) = com1 {
+        logs.push(("com1.log", com1.to_string()));
+    }
+    if settings.debug
+        && let Ok(bytes) = fs::read(target_dir().join("xtask").join("qemu-debug.log"))
+    {
+        logs.push((
+            "qemu-debug.log",
+            String::from_utf8_lossy(&bytes).into_owned(),
+        ));
+    }
+    logs
 }
 
 /// Asks QEMU's monitor for a screen dump and reads it. `switch`: the monitor shares stdio
@@ -8241,6 +8905,7 @@ fn wait_for_screen(
     failures: &[&'static str],
     deadline: Instant,
 ) -> Result {
+    screen_can_hold(markers)?;
     let mut rows = Vec::new();
     while Instant::now() < deadline {
         thread::sleep(Duration::from_millis(1500));
@@ -8249,7 +8914,7 @@ fn wait_for_screen(
         rows = screen::screen_text(&image).unwrap_or_default();
         let text = rows.join("\n");
         if let Some(m) = failures.iter().find(|m| text.contains(**m)) {
-            return Err(format!("the screen shows {m:?}"));
+            return Err(screen_failure(m, &rows));
         }
         if serial::contains_in_order(&text, markers) {
             return Ok(());
@@ -8261,8 +8926,18 @@ fn wait_for_screen(
     ))
 }
 
-/// `run`: the developer-mode kernel under QEMU, interactively, on the machine `settings`
-/// describe.
+/// [`wait_for_screen`]'s error for a failure message on the screen: the message, and every row
+/// the screen showed, so the job's log holds the screen's text even without the kept dump (TASKS
+/// item 165).
+fn screen_failure(message: &str, rows: &[String]) -> String {
+    format!(
+        "the screen shows {message:?}; it showed:\n{}",
+        rows.join("\n")
+    )
+}
+
+/// `run`: the kernel under QEMU with the developer-mode loader, interactively, on the machine
+/// `settings` describe.
 fn run(settings: &Settings) -> Result {
     let krn_path = pack_kernel(&build_kernel()?)?;
     let krn = fs::read(&krn_path).map_err(|e| format!("{}: {e}", krn_path.display()))?;
@@ -8277,6 +8952,110 @@ fn run(settings: &Settings) -> Result {
         Ok(())
     } else {
         Err(format!("{QEMU} exited with {status}"))
+    }
+}
+
+/// TASKS item 171's scenarios and checks, without a boot (the review's R171-7).
+#[cfg(test)]
+mod disk_scenario_tests {
+    use super::*;
+
+    fn missing(scenario: &Scenario) -> Vec<&String> {
+        scenario
+            .markers
+            .iter()
+            .filter(|m| m.starts_with("xtask: "))
+            .collect()
+    }
+
+    #[test]
+    fn the_disk_controls_hold_their_markers() {
+        let settings = disk_settings(&Settings::default());
+        let machine = machine(&settings);
+        let main = boot_scenario(&settings);
+        let d1 = unmarked_disk_scenario(&settings);
+        let d2 = small_partition_scenario(&settings);
+        for s in [&main, &d1, &d2] {
+            assert!(missing(s).is_empty(), "{}: {:?}", s.label, missing(s));
+        }
+        assert_eq!(
+            [main.label, d1.label, d2.label].map(disk_variant),
+            [
+                disk::Variant::Marked,
+                disk::Variant::Unmarked,
+                disk::Variant::Small
+            ]
+        );
+        // Where the disk must have changed: the boots whose markers need the polled write.
+        assert!(requires_writes(&main) && requires_writes(&d2) && !requires_writes(&d1));
+        let has = |s: &Scenario, m: &str| s.markers.iter().any(|x| x == m);
+        // D1: no write anywhere, and nothing that identifies the disk.
+        assert!(has(
+            &d1,
+            "origin-kernel: GPT: disk not shown (no mark of Origin's tests), usable blocks 34-32734, 128 entries of 128 B, 3 in use"
+        ));
+        assert!(has(
+            &d1,
+            "origin-kernel: NVMe: no mark of Origin's tests (no partition carries it): the boot proofs only read namespace 1"
+        ));
+        assert!(has(
+            &d1,
+            "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); write-back not run: no mark of Origin's tests, so nothing is written"
+        ));
+        assert!(has(
+            &d1,
+            "origin-kernel: NVMe: the boot proofs sent 0 writes and 0 flushes, as namespace 1 carries no mark of Origin's tests (no partition carries it); 0 commands refused"
+        ));
+        for index in queue_order(&machine) {
+            assert!(has(
+                &d1,
+                &format!(
+                    "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write not run (no mark of Origin's tests), ",
+                    machine.named(index)
+                )
+            ));
+        }
+        assert!(!d1.markers.iter().any(|m| m.contains(disk::DISK_GUID)));
+        // D2: processor 1's write refused by name, the NVMe proof failed in the verdict, and
+        // the proofs after it gone from the markers.
+        assert!(has(
+            &d2,
+            "; its write: refused: a write to blocks 18504-18504 lies outside the marked partition (blocks 18432-18503): NVMe failed"
+        ));
+        assert!(has(
+            &d2,
+            "origin-kernel: NVMe: the boot proofs sent 2 writes and 2 flushes, which the guard let reach blocks 18432-18503 of namespace 1 alone; 1 command refused"
+        ));
+        let verdict = d2
+            .markers
+            .iter()
+            .position(|m| m == "origin-kernel: boot verdict: ")
+            .unwrap();
+        assert_eq!(d2.markers[verdict + 1], "degraded: ");
+        assert_eq!(d2.markers[verdict + 3], "; failed: ");
+        assert_eq!(d2.markers[verdict + 4], "NVMe (no storage)");
+        assert!(
+            !d2.markers
+                .iter()
+                .any(|m| m.starts_with("origin-kernel: block cache: "))
+        );
+        assert!(!d2.failures.contains(&": NVMe failed"));
+        assert!(main.failures.contains(&": NVMe failed") && d1.failures.contains(&": NVMe failed"));
+        // The main boot's summary: the marked partition, nothing refused.
+        assert!(has(&main, &writes_reach(Some(disk::MARKED), 0)));
+        assert!(writes_reach(Some(disk::MARKED), 0).ends_with("; 0 commands refused"));
+    }
+
+    #[test]
+    fn the_serial_is_looked_for_in_the_kernel_s_lines() {
+        let printed = "origin-kernel: NVMe: controller ready: model \"QEMU NVMe Ctrl\", serial \"ORIGIN0001\", firmware \"11.1.3\"";
+        let firmware = "BdsDxe: loading Boot0002 \"UEFI QEMU NVMe Ctrl ORIGIN0001 1\"";
+        let now = "origin-kernel: NVMe: controller ready: model \"QEMU NVMe Ctrl\", firmware \"11.1.3\", 256 namespaces, MDTS 7, controller type 0x1 (an I/O controller); its serial number is not printed";
+        assert_eq!(
+            serial_line(&format!("{firmware}\n{now}\n{printed}\n")),
+            Some(printed)
+        );
+        assert_eq!(serial_line(&format!("{firmware}\n{now}\n")), None);
     }
 }
 
@@ -8544,7 +9323,53 @@ mod memory_figure_tests {
 
 #[cfg(test)]
 mod com1_report_tests {
-    use super::com1_last_kernel_line;
+    use super::{Capture, Settings, com1_last_kernel_line, failed_boot_logs, screen_failure};
+
+    /// TASKS item 165: a boot with no UART keeps what its monitor said, which nothing read while
+    /// the screen was watched; a serial capture keeps the log as judged.
+    #[test]
+    fn a_failed_boot_keeps_the_log_its_capture_wrote() {
+        let settings = Settings::default();
+        let unread = b"(qemu) sc\x1b[K\x1b[D\x1b[Dscreendump \"/x/screen.ppm\"\x1b[K\r\n";
+        assert_eq!(
+            failed_boot_logs(Capture::Screen, "", unread, None, &settings),
+            [(
+                "monitor.log",
+                "(qemu) screendump \"/x/screen.ppm\"\n".to_string()
+            )]
+        );
+        assert_eq!(
+            failed_boot_logs(
+                Capture::Com1AndScreen,
+                "origin-kernel: a\n",
+                unread,
+                None,
+                &settings
+            ),
+            [("serial.log", "origin-kernel: a\n".to_string())]
+        );
+        assert_eq!(
+            failed_boot_logs(Capture::SpcrUart, "u\n", b"", Some("c\n"), &settings),
+            [
+                ("spcr-uart.log", "u\n".to_string()),
+                ("com1.log", "c\n".to_string())
+            ]
+        );
+    }
+
+    /// TASKS item 165: a failure message seen on the screen names every row the screen showed,
+    /// so the job's log holds the screen's text.
+    #[test]
+    fn a_screen_failure_names_the_screen_s_rows() {
+        let rows = [
+            "origin-kernel: page tables: failed".to_string(),
+            "origin-kernel: boot refused: kernel page tables failed".to_string(),
+        ];
+        assert_eq!(
+            screen_failure("origin-kernel: boot refused", &rows),
+            "the screen shows \"origin-kernel: boot refused\"; it showed:\norigin-kernel: page tables: failed\norigin-kernel: boot refused: kernel page tables failed"
+        );
+    }
 
     /// TASKS item 83: a failed boot names COM1's last kernel line, and why its console stayed
     /// there, when COM1 is kept in a file.
@@ -9026,6 +9851,245 @@ mod nvme_marker_tests {
                 .first()
                 .is_some_and(|l| l.contains("1 of 2 processors"))
         );
+    }
+}
+
+#[cfg(test)]
+mod pit_routed_tests {
+    use super::{
+        Capture, PIT_PROOF_TICKS, PIT_ROUTED, Settings, boot_scenario_markers, console_scenarios,
+        counts_hold, machine, no_pit_markers, pit_routed, repo_root, screen_can_hold, serial,
+        verdict_so_far,
+    };
+
+    /// The I/O APIC proof's line as the kernel prints it for `count` interrupts.
+    fn line(count: &str) -> String {
+        format!(
+            "origin-kernel: I/O APIC: {count} PIT interrupts routed through the I/O APIC in 207 ms"
+        )
+    }
+
+    /// TASKS item 135: the count the kernel's proof takes is taken, whatever it is, and a lower one
+    /// is refused even on a line that says nothing of a failure. 21 is what the 65-processor
+    /// machine printed under host load, on a boot whose proof passed (TASKS item 96, turn 30).
+    #[test]
+    fn a_count_the_kernel_takes_is_taken_and_a_lower_one_refused() {
+        assert_eq!(pit_routed(&line("20")), Ok(20));
+        assert_eq!(pit_routed(&line("21")), Ok(21));
+        assert_eq!(pit_routed(&line("4000")), Ok(4000));
+        for low in ["19", "1", "0"] {
+            let refused = pit_routed(&line(low)).unwrap_err();
+            assert!(
+                refused.contains(&format!("gives {low} PIT interrupts, below the 20 ")),
+                "{refused}"
+            );
+        }
+        // Among a boot's other lines, the remapped proof's own count beside it.
+        let boot = format!(
+            "origin-kernel: I/O APIC: id 0, 24 entries at 0xfec00000 (GSI base 0); routing the PIT's IRQ0 via GSI 2 to vector 0x41 on CPU 0\n{}\norigin-kernel: I/O APIC: remapped: 3 PIT interrupts arrived on CPU 1 (APIC ID 1) through IRTE 5 in 200 ms\n",
+            line("21")
+        );
+        assert_eq!(pit_routed(&boot), Ok(21));
+    }
+
+    /// A line that is not the kernel's whole line is refused, whatever number it holds: no count,
+    /// a count that is not decimal digits alone, one that does not fit, text before the count or
+    /// after the milliseconds, no milliseconds, and the kernel's own failure ending.
+    #[test]
+    fn a_malformed_line_is_refused() {
+        let malformed = [
+            line(""),
+            line("twenty"),
+            line("2O"),
+            line("+20"),
+            line("-20"),
+            line("20.5"),
+            line("0x14"),
+            line(" 20"),
+            line("20 "),
+            line("about 20"),
+            line("99999999999999999999999"),
+            format!("{}: I/O APIC failed", line("20")),
+            format!("{} and more", line("20")),
+            format!("x{}", line("20")),
+            "origin-kernel: I/O APIC: 20 PIT interrupts routed through the I/O APIC in "
+                .to_string(),
+            "origin-kernel: I/O APIC: 20 PIT interrupts routed through the I/O APIC in  ms"
+                .to_string(),
+            "origin-kernel: I/O APIC: 20 PIT interrupts routed through the I/O APIC in 207ms"
+                .to_string(),
+            "origin-kernel: I/O APIC: 20 PIT interrupts routed through the I/O APIC in soon ms"
+                .to_string(),
+            "origin-kernel: another proof: 20 PIT interrupts routed through the I/O APIC in 207 ms"
+                .to_string(),
+        ];
+        for text in &malformed {
+            let refused = pit_routed(text).unwrap_err();
+            assert!(
+                refused.contains("is not as the kernel prints it"),
+                "{text:?}: {refused}"
+            );
+        }
+        // No such line at all.
+        let absent = pit_routed("origin-kernel: I/O APIC: none in the MADT\n").unwrap_err();
+        assert!(absent.starts_with("no line holds "), "{absent}");
+        assert!(pit_routed("").is_err());
+    }
+
+    /// The kernel boot's marker for the line leaves the count out, and stands where the counted
+    /// one stood: after the routing line. A boot that printed 21 has every marker, in order, and
+    /// its count holds; one that printed 19 with no failure has every marker too, and is refused
+    /// on its count.
+    #[test]
+    fn the_scenario_holds_the_line_by_its_count_free_marker() {
+        let settings = Settings::default();
+        let scenario = boot_scenario_markers(&machine(&settings), &settings);
+        let markers: Vec<&str> = scenario.markers.iter().map(String::as_str).collect();
+        assert_eq!(markers.iter().filter(|m| **m == PIT_ROUTED).count(), 1);
+        assert!(markers.iter().all(|m| !m.contains("20 PIT interrupts")));
+        let at = markers.iter().position(|m| *m == PIT_ROUTED).unwrap();
+        let routing = "origin-kernel: I/O APIC: id 0, 24 entries at 0xfec00000 (GSI base 0); routing the PIT's IRQ0 via GSI 2 to vector 0x41 on CPU 0";
+        assert_eq!(markers[at - 1], routing);
+
+        let window = &markers[at - 1..=at];
+        for (count, holds) in [("19", false), ("20", true), ("21", true)] {
+            let boot = format!("{routing}\n{}\n", line(count));
+            assert!(serial::contains_in_order(&boot, window), "{count}");
+            assert_eq!(counts_hold(&boot, window).is_ok(), holds, "{count}");
+        }
+        // Order still matters: the line before the routing line is no match.
+        let reversed = format!("{}\n{routing}\n", line("20"));
+        assert!(!serial::contains_in_order(&reversed, window));
+    }
+
+    /// The machine with no 8254 routes no PIT interrupt: its marker is swapped, and with it goes
+    /// the count's check, so its boot is held to no count and no anchor is missing.
+    #[test]
+    fn the_machine_without_an_8254_is_held_to_no_count() {
+        let settings = Settings::default();
+        let mut scenario = boot_scenario_markers(&machine(&settings), &settings);
+        no_pit_markers(&mut scenario);
+        let markers: Vec<&str> = scenario.markers.iter().map(String::as_str).collect();
+        assert!(markers.iter().all(|m| !m.starts_with("xtask: the marker")));
+        assert!(!markers.contains(&PIT_ROUTED));
+        assert!(
+            markers
+                .contains(&"origin-kernel: I/O APIC: routing not proven: the 8254 is not counting")
+        );
+        let boot = "origin-kernel: I/O APIC: routing not proven: the 8254 is not counting on this machine (absent or gated), so there are no PIT interrupts to route\n";
+        assert_eq!(counts_hold(boot, &markers), Ok(()));
+        // The same text under the plain machine's markers is refused: the line is owed there.
+        assert!(counts_hold(boot, &[PIT_ROUTED]).is_err());
+    }
+
+    /// The review's R135-1: what `run_scenario` judges a boot by. A failure message fails the
+    /// boot at once, whatever the markers; a marker still missing gives no verdict; with every
+    /// marker there, a count the kernel takes passes and a lower one fails on the count, on a
+    /// line that says nothing of a failure.
+    #[test]
+    fn the_verdict_holds_the_count_once_every_marker_is_there() {
+        let routing = "origin-kernel: I/O APIC: id 0";
+        let markers = [routing, PIT_ROUTED, "origin-kernel: IOMMU: "];
+        let failures = [": I/O APIC failed", "origin-kernel: panic:"];
+        let boot = |count: &str, tail: &str| format!("{routing}\n{}\n{tail}", line(count));
+        // The last marker has not come: no verdict yet, whatever the count.
+        for count in ["19", "20", "21"] {
+            let so_far = boot(count, "");
+            assert_eq!(verdict_so_far(&so_far, &so_far, &failures, &markers), None);
+        }
+        let whole = |count: &str| boot(count, "origin-kernel: IOMMU: DMAR\n");
+        for count in ["20", "21", "4000"] {
+            let text = whole(count);
+            assert_eq!(
+                verdict_so_far(&text, &text, &failures, &markers),
+                Some(Ok(())),
+                "{count}"
+            );
+        }
+        let text = whole("19");
+        let refused = verdict_so_far(&text, &text, &failures, &markers);
+        assert!(
+            matches!(&refused, Some(Err(e)) if e.contains("gives 19 PIT interrupts, below the 20 ")),
+            "{refused:?}"
+        );
+        // The kernel's own failure comes first, before the markers are complete and after.
+        let failed = format!("{routing}\n{}: I/O APIC failed\n", line("19"));
+        assert_eq!(
+            verdict_so_far(&failed, &failed, &failures, &markers),
+            Some(Err(
+                "the serial output contains \": I/O APIC failed\"".to_string()
+            ))
+        );
+        let failed = format!("{}origin-kernel: panic: x\n", whole("21"));
+        assert!(matches!(
+            verdict_so_far(&failed, &failed, &failures, &markers),
+            Some(Err(e)) if e.contains("origin-kernel: panic:")
+        ));
+        // A failure only in the line not yet complete is not judged: `judged` leaves it out.
+        let text = whole("21");
+        assert_eq!(
+            verdict_so_far(
+                &text,
+                &format!("{text}origin-kernel: panic:"),
+                &failures,
+                &markers
+            ),
+            Some(Ok(()))
+        );
+        // A scenario without the counted marker is held to no count.
+        let plain = [routing, "origin-kernel: IOMMU: "];
+        let text = whole("19");
+        assert_eq!(
+            verdict_so_far(&text, &text, &failures, &plain),
+            Some(Ok(()))
+        );
+    }
+
+    /// The review's R135-3: the count is read from a whole line, and the screen gives rows, so a
+    /// scenario read from the screen that held the counted marker is refused before it boots.
+    /// None of the console's scenarios holds it.
+    #[test]
+    fn a_scenario_read_from_the_screen_holds_no_counted_marker() {
+        assert!(screen_can_hold(&[PIT_ROUTED]).is_err());
+        assert!(screen_can_hold(&["origin-kernel: I/O APIC: id 0", PIT_ROUTED]).is_err());
+        assert_eq!(
+            screen_can_hold(&["origin-kernel: sysfs: built /sys with 4 facts"]),
+            Ok(())
+        );
+        assert_eq!(screen_can_hold(&[]), Ok(()));
+        let mut on_screen = 0;
+        for scenario in console_scenarios() {
+            if scenario.capture == Capture::Screen {
+                on_screen += 1;
+                let markers: Vec<&str> = scenario.markers.iter().map(String::as_str).collect();
+                assert_eq!(screen_can_hold(&markers), Ok(()), "{}", scenario.label);
+            }
+        }
+        assert!(on_screen >= 2, "{on_screen}");
+    }
+
+    /// `xtask`'s bound is the kernel's: `PROOF_TICKS` in `framekernel/src/irq.rs`, a private
+    /// constant of a module compiled only for the kernel's target, which a host test cannot name,
+    /// so its source line is read. The proof's condition and its line's format are read with it,
+    /// as text: a count of the bound or more passes, and the count printed is the count judged.
+    #[test]
+    fn the_bound_is_the_kernels_own() {
+        let path = repo_root().join("framekernel/src/irq.rs");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let declared: Vec<&str> = source
+            .lines()
+            .filter(|l| l.trim_start().starts_with("const PROOF_TICKS: u64 = "))
+            .collect();
+        assert_eq!(
+            declared,
+            [format!("const PROOF_TICKS: u64 = {PIT_PROOF_TICKS};")],
+            "{}",
+            path.display()
+        );
+        assert!(source.contains("let ok = taken >= PROOF_TICKS;"));
+        assert!(source.contains(
+            "\"origin-kernel: I/O APIC: {taken} PIT interrupts routed through the I/O APIC in {} ms{}\","
+        ));
     }
 }
 
@@ -9786,6 +10850,56 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
         assert!(guest_is_intel("max", Accel::Kvm, true));
         assert!(!guest_is_intel("max", Accel::Kvm, false));
         assert!(guest_is_intel("host", Accel::Kvm, true));
+    }
+
+    /// The migration proofs and their pulled phases (TASKS items 96 and 98) are never forgiven, on
+    /// any machine, 65 and 67 included: their failures are neither KVM's allowances nor the
+    /// oversubscribed fair share (the coordinating session's rulings R1 and T1-5). And where two
+    /// or more processors take part, a delivery line that saw no wake-up cross a pull leaves the
+    /// boot's markers unmet.
+    #[test]
+    fn the_pulled_phases_are_never_forgiven() {
+        let failing = [
+            "origin-kernel: scheduler: thread migration: integrity, pulled: 12 threads declared for balancing, run with interrupts on, started on CPU 1 of 65 processors, 59 of them occupied, 4 left to pull (at most 4); 0 pulls by idle processors, 0 of a thread moved before, 0 asks, kicks 0 at ticks, 0 at reschedule upcalls and 0 at wake-ups or spawns, 0 moves back by the boot flow (0 refused); threads moved while they held their word 0 (not exercised); a second processor in a context 0 times, canaries changed 0 times, threads run before their state existed 0; a pull of a thread moved before: no, in 30 s; bounds since boot: held true; spawned true; ended true; occupants ended true; heap, frames and stacks back true: scheduler failed",
+            "origin-kernel: scheduler: thread migration: delivery, pulled: 12 receivers declared for balancing and one pinned sender, started on CPU 1 of 67 processors, 61 of them occupied, 4 left to pull (at most 4); 264 tokens posted, 263 taken, 1 receivers short: scheduler failed",
+            "origin-kernel: scheduler: thread migration: integrity: 8 movable threads on 4 processors, 1563 moves: scheduler failed",
+            "origin-kernel: scheduler: thread migration: delivery: 8 movable receivers and 4 pinned senders: scheduler failed",
+            "origin-kernel: scheduler: thread migration: integrity, pulled: balancing is not set up: nothing to pull: scheduler failed",
+        ];
+        for line in failing {
+            for accel in [Accel::Tcg, Accel::Kvm] {
+                for oversubscribed in [false, true] {
+                    assert!(!checker_forgives(line, accel, oversubscribed), "{line}");
+                }
+            }
+        }
+        let settings = Settings::default();
+        let m = machine(&settings);
+        assert!(m.cpus() >= 2);
+        let s = boot_scenario_markers(&m, &settings);
+        let at = s
+            .markers
+            .iter()
+            .position(|x| x == "origin-kernel: scheduler: thread migration: delivery, pulled: ")
+            .unwrap();
+        let window: Vec<&str> = s.markers[at..at + 3].iter().map(String::as_str).collect();
+        assert_eq!(
+            window[1..],
+            [" with their token untaken ", ": exercised, after "]
+        );
+        let log = |said: &str| {
+            format!(
+                "origin-kernel: scheduler: thread migration: delivery, pulled: 12 receivers declared for balancing and one pinned sender; wake-ups that crossed a pull with their token untaken {said}; bounds since boot: held true\norigin-kernel: ibpb: \n"
+            )
+        };
+        assert!(serial::contains_in_order(
+            &log("1: exercised, after 200 ms"),
+            &window
+        ));
+        assert!(!serial::contains_in_order(
+            &log("0: not exercised in 30 s"),
+            &window
+        ));
     }
 
     /// As the kernel printed them on a real AMD EPYC (Actions run 42547942738).

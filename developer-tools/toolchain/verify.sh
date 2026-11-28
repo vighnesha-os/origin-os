@@ -580,4 +580,109 @@ out="$WORK/openssl.txt"
 } > "$out" 2>&1
 record INFO "OpenSSL, 3.5 or later with ML-DSA (optional: cross-checks of the signer and verifier; install separately)" "$out"
 
+# ---------------------------------------------------------------- cargo-fuzz on the pinned compiler (TASKS item 144)
+# Coverage-guided fuzzing must build and run with the pinned stable compiler (owner item 359;
+# CLAUDE.md §8, §12). cargo-fuzz asks the compiler which channel it is, and adds a `-Z` flag,
+# only for a sanitizer: with `--sanitizer none` it does neither (its `src/project.rs`, read on
+# 2026-11-26). Optional, like QEMU: without cargo-fuzz this is INFO. With it, the smoke targets
+# in tests/fuzz are built from nothing into this run's directory, verbosely, so that every
+# compiler command line is read for a `-Z` flag, and run: `smoke_clean` for a fixed time must
+# end in success, and `smoke_finds` must find its planted crash, which is behind four bytes
+# compared one at a time, so a short run finds it only through coverage guidance. Nothing is
+# downloaded: Cargo runs offline and takes the crates the lock file beside tests/fuzz names.
+FUZZ_EXPECTED="0.13.2"
+FUZZ_SECONDS_CLEAN=10
+FUZZ_SECONDS_FIND=120
+out="$WORK/fuzz.txt"
+fuzz_version=$(cargo fuzz --version 2>/dev/null)
+if [ -z "$fuzz_version" ]; then
+  echo "cargo-fuzz: not installed (cargo install --locked cargo-fuzz --version $FUZZ_EXPECTED)" > "$out"
+  record INFO "cargo-fuzz $FUZZ_EXPECTED (optional: coverage-guided fuzzing, TASKS item 144; install separately)" "$out"
+else
+  # fuzz_cargo SUBCOMMAND [ARGS...]: the fixed options go before ARGS, whose `--` hands the
+  # rest to libFuzzer.
+  fuzz_cargo() {
+    local sub="$1"; shift
+    env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u CARGO_BUILD_RUSTFLAGS -u CARGO_TARGET_DIR \
+      CARGO_NET_OFFLINE=true cargo fuzz "$sub" --fuzz-dir "$REPO/tests/fuzz" --sanitizer none \
+      --target-dir "$WORK/fuzz-target" "$@"
+  }
+  fuzz_build="$WORK/fuzz-build.txt"
+  fuzz_build_rc=0
+  fuzz_cargo build --verbose > "$fuzz_build" 2>&1 || fuzz_build_rc=$?
+  # The compiler's command lines, as Cargo prints them in verbose mode.
+  grep 'Running `.*rustc ' "$fuzz_build" > "$WORK/fuzz-rustc.txt" || true
+  fuzz_rustc=$(wc -l < "$WORK/fuzz-rustc.txt" | tr -d ' ')
+  fuzz_z=$(grep -cE '[[:space:]]-Z' "$WORK/fuzz-rustc.txt" || true)
+  fuzz_sancov=$(grep -c 'sancov-module' "$WORK/fuzz-rustc.txt" || true)
+  mkdir -p "$WORK/fuzz-clean" "$WORK/fuzz-finds"
+  clean_rc=0; finds_rc=0
+  if [ "$fuzz_build_rc" -eq 0 ]; then
+    fuzz_cargo run smoke_clean "$WORK/fuzz-clean" -- -max_total_time="$FUZZ_SECONDS_CLEAN" \
+      -seed=1 -artifact_prefix="$WORK/clean-" > "$WORK/fuzz-clean.txt" 2>&1 || clean_rc=$?
+    fuzz_cargo run smoke_finds "$WORK/fuzz-finds" -- -max_total_time="$FUZZ_SECONDS_FIND" \
+      -seed=1 -artifact_prefix="$WORK/finds-" > "$WORK/fuzz-finds.txt" 2>&1 || finds_rc=$?
+  fi
+  found=$(ls "$WORK"/finds-crash-* 2>/dev/null | head -1)
+  found_bytes=""
+  if [ -n "$found" ]; then found_bytes=$(hex "$found" 0 4); fi
+  {
+    echo "$fuzz_version"
+    (cd "$REPO/tests/fuzz" && rustc --version)
+    echo "crates, from tests/fuzz/Cargo.lock:"
+    grep -A1 '^name = ' "$REPO/tests/fuzz/Cargo.lock" | grep -v '^--' | paste - - \
+      | sed 's/name = "\(.*\)"[[:space:]]*version = "\(.*\)"/  \1 \2/'
+    echo "build, exit code $fuzz_build_rc: $fuzz_rustc compiler command lines, $fuzz_sancov with sancov-module, $fuzz_z with a -Z flag"
+    grep -m1 'smoke_finds' "$WORK/fuzz-rustc.txt" | sed 's/.*`\(.*\)`.*/\1/' \
+      | tr ' ' '\n' | grep -E '^-C[a-z]|^--cfg$|^fuzzing$' | tr '\n' ' '
+    echo
+    echo "smoke_clean, $FUZZ_SECONDS_CLEAN s, exit code $clean_rc:"
+    grep -E '^INFO: Seed|^Done [0-9]+ runs' "$WORK/fuzz-clean.txt"
+    echo "smoke_finds, at most $FUZZ_SECONDS_FIND s, exit code $finds_rc:"
+    grep -E '^INFO: Seed|planted|deadly signal|^#[0-9]+.*(NEW|REDUCE)' "$WORK/fuzz-finds.txt" | tail -6
+    echo "kept input: ${found:+$(basename "$found")}, its first four bytes ${found_bytes:-none} (4f52474e is ORGN)"
+  } > "$out" 2>&1
+  case "$fuzz_version" in
+    "cargo-fuzz $FUZZ_EXPECTED"*) fuzz_is_pinned=1 ;;
+    *) fuzz_is_pinned=0 ;;
+  esac
+  if [ "$fuzz_is_pinned" -ne 1 ]; then
+    record FAIL "cargo-fuzz is $FUZZ_EXPECTED, the version recorded for TASKS item 144" "$out"
+  elif [ "$fuzz_build_rc" -ne 0 ] || [ "$fuzz_rustc" -eq 0 ]; then
+    record FAIL "cargo fuzz build --sanitizer none builds the smoke targets with rustc ${RELEASE:-?}" "$out"
+  elif [ "$fuzz_z" -ne 0 ] || [ "$fuzz_sancov" -eq 0 ]; then
+    record FAIL "cargo fuzz build --sanitizer none: $fuzz_z of $fuzz_rustc compiler command lines carry a -Z flag, $fuzz_sancov the coverage pass" "$out"
+  elif [ "$clean_rc" -ne 0 ] || ! grep -qE '^Done [0-9]+ runs' "$WORK/fuzz-clean.txt"; then
+    record FAIL "cargo fuzz run --sanitizer none: smoke_clean runs $FUZZ_SECONDS_CLEAN s and ends in success" "$out"
+  elif [ "$finds_rc" -eq 0 ] || [ "$found_bytes" != "4f52474e" ] || ! grep -q 'planted' "$WORK/fuzz-finds.txt"; then
+    record FAIL "cargo fuzz run --sanitizer none: smoke_finds finds its planted crash within $FUZZ_SECONDS_FIND s" "$out"
+  else
+    record PASS "cargo-fuzz $FUZZ_EXPECTED with --sanitizer none builds with rustc ${RELEASE:-?} and no -Z flag, runs a target for a fixed time, and finds a planted crash behind a four-byte magic (TASKS item 144)" "$out"
+  fi
+fi
+
+# ---------------------------------------------------------------- Kani (proofs; CLAUDE.md §73)
+# Owner item 358, TASKS item 143. The version is the one .github/ci/install-kani.sh pins. Kani is
+# asked nothing unless the pinned driver is installed and its bundle set up: `cargo kani` would
+# otherwise set itself up, which downloads.
+out="$WORK/kani.txt"
+{
+  kani_version=$(sed -n 's/^KANI_VERSION=//p' .github/ci/install-kani.sh)
+  kani_dir="$HOME/.kani/kani-$kani_version"
+  echo "pinned: $kani_version (.github/ci/install-kani.sh, with the bundles' SHA-256)"
+  installed=$(cargo install --list 2>/dev/null | sed -n 's/^kani-verifier v\([^:]*\):$/\1/p')
+  echo "installed driver: ${installed:-none} (cargo install --list)"
+  if [ "$installed" = "$kani_version" ] && [ -d "$kani_dir" ]; then
+    cargo kani --version --verbose
+    # Under the home directory, named as `~`: the report is committed, and the account's name is not.
+    echo "bundle: ~/.kani/kani-$kani_version"
+    echo "bundle's compiler: $(cat "$kani_dir/rust-toolchain-version"), $(cat "$kani_dir/rustc-version")"
+    echo "used only by cargo kani, to verify; nothing it builds ships"
+    sed -n '/^kani:/,/^License/p;/^cbmc:/,/^License/p' "$kani_dir/license-notes.txt"
+  else
+    echo "cargo kani: the pinned driver and its bundle are not both installed (bash .github/ci/install-kani.sh); not run. CI's job kani runs the proofs"
+  fi
+} > "$out" 2>&1
+record INFO "Kani, for the proofs of CLAUDE.md §73 (optional: CI's job kani runs them; install separately)" "$out"
+
 finish

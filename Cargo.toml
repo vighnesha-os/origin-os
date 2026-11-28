@@ -1,12 +1,17 @@
 # Origin OS workspace (CLAUDE.md §81, task T4).
 #
 # Each artifact is built for its own target, so plain `cargo build` / `cargo test` at the
-# root only touch the host crates in `default-members`. Use the xtask for everything else:
+# root only touch the host crates in `default-members`. Use the xtask for everything else.
+# `cargo xtask` with no command prints the whole list; these four are the ones to start with:
 #
-#   cargo xtask check       fmt, clippy and unit tests, each crate on its correct target(s)
-#   cargo xtask build       build the UEFI loader (x86_64-unknown-uefi, release)
-#   cargo xtask boot-test   build, boot in QEMU + OVMF, and assert on the serial output
-#   cargo xtask run         boot in QEMU with the serial console on this terminal
+#   cargo xtask check       everything a change must pass without a boot: rustfmt, Clippy and
+#                           the host tests of every crate on its own target(s), the image
+#                           builds, every gate on the tree and its records, and the Loom models
+#   cargo xtask build       the UEFI loader (developer mode) and the kernel image
+#   cargo xtask boot-test   the boots under QEMU + OVMF, each judged on what it prints, and the
+#                           kernel boot on its screen too
+#   cargo xtask run         the kernel under QEMU with the developer-mode loader, its console on
+#                           this terminal
 
 [workspace]
 resolver = "3"
@@ -42,6 +47,9 @@ members = [
     "tests/kernel/first-program",
     "tests/kernel/pin-program",
 ]
+# The fuzz workspace (TASKS item 144) is a workspace of its own, with its own lock, so that no
+# build of this workspace resolves `libfuzzer-sys` or `arbitrary` (CLAUDE.md §5).
+exclude = ["tests/fuzz"]
 # Host-buildable crates only. The UEFI loader's and the Framekernel's binaries cannot be
 # built for the host, and the ring-3 crates (`runtime/core`, `runtime/rt`,
 # `runtime/kernel-client`, `tests/kernel/first-program` and `tests/kernel/pin-program`) are built
@@ -100,6 +108,9 @@ missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 # `cfg(loom)`: `cargo xtask loom` builds `origin-sync`'s tests against Loom (CLAUDE.md §73), in a
 # scratch workspace of its own: nothing in this workspace depends on Loom.
+# `cfg(kani)`: Kani's proofs (CLAUDE.md §73; owner item 358, TASKS item 143), which only `cargo kani`
+# sets, in its own build under `target/kani`: the `#[cfg(kani)] mod proofs;` lines and the files they
+# name (`cargo xtask kani-gate`). Nothing a normal build makes holds any of it.
 # `cfg(origin_bench)`: the bench build of the loader and the kernel, with breadcrumbs on the
 # SPCR's UART (TASKS item 112). Only `cargo xtask bench-build` and `boot-bench` set it, into
 # `target/bench`; no image a normal build makes holds any of it (`cargo xtask check`, F1 and F2).
@@ -116,7 +127,7 @@ unreachable_pub = "warn"
 # `cfg(origin_bench_kernel)`: with `origin_bench`, the bench loader's kernel-entry mode (ADR-0002
 # Amendment 7; TASKS item 133). Only `cargo xtask bench-build --kernel` and `boot-bench` set it,
 # into `target/bench-kernel`; F1 holds its name the same way, and it is never set with another mode.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(origin_bench)', 'cfg(origin_bench_minimal)', 'cfg(origin_bench_bisect)', 'cfg(origin_bench_kernel)', 'cfg(origin_stack_measure)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(origin_bench)', 'cfg(origin_bench_minimal)', 'cfg(origin_bench_bisect)', 'cfg(origin_bench_kernel)', 'cfg(origin_stack_measure)'] }
 
 [workspace.lints.clippy]
 # CLAUDE.md §13 and final rule 5: every unsafe boundary documents its invariants.

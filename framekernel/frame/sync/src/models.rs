@@ -265,6 +265,7 @@ use loom::sync::{Arc, Notify};
 use loom::thread::{self, JoinHandle};
 
 use crate::backlog::Backlog;
+use crate::balance::{self, Element, Load, Masks};
 use crate::contexts::{BOOT_FLOW, Contexts, Refused};
 use crate::exits::Exits;
 use crate::floor::MonotonicFloor;
@@ -4744,6 +4745,145 @@ fn exits_an_exit_without_a_mark_cannot_stand_for_one() {
             exits_settle_then_count(&seen, &exits, &held);
             ender.join().unwrap();
             unmarked.join().unwrap();
+        },
+    );
+}
+
+// ---------------------------------------------------------------- balance (TASKS item 98)
+
+// What the processors publish for load balancing (`balance.rs`; ADR-0020 S7): the real code,
+// compiled in unchanged. What stands in for the machine: a thread that calls
+// `publish_then_find_idle` is a processor that has just found a thread waiting in its queue, under
+// its queue's lock, which is not modelled (nothing here contends for it); a thread that calls
+// `idle_then_choose` is a processor's idle flow about to halt. Two processors, each the other's
+// only neighbour.
+//
+// **What is proved**, exhaustively, for every interleaving and every value a load may read in
+// Loom's model of the C11 memory model:
+//
+// - BL1: a processor that becomes crowded while the other goes idle: the crowded one finds the
+//   idle one, or the idle one finds the crowded one before it halts. With fresh hints, and with
+//   hints an earlier round left set, where neither side's hint is a new write.
+// - BL2: a hint left set by a processor that has since started a thread is not taken for an idle
+//   processor: the search confirms it in the element.
+//
+// **Not proved here:** that a kick sent is taken (an interrupt), that the puller then finds the
+// thread (the run queues' locks, `sched`), or anything about three or more processors, where each
+// pair is this pair.
+
+/// One execution of BL1. `stale`: both hints were left set by an earlier round.
+fn balance_neither_misses(stale: bool) {
+    const BOTH: [u32; 2] = [0, 1];
+    let elements = Arc::new([Element::new(), Element::new()]);
+    let masks = Arc::new(Masks::new(2).unwrap());
+    if stale {
+        masks.idle.set(1);
+        masks.crowded.set(0);
+    }
+    let crowded = {
+        let (elements, masks) = (Arc::clone(&elements), Arc::clone(&masks));
+        thread::spawn(move || {
+            let load = Load {
+                runnable: 2,
+                waiting: 1,
+                load: 16,
+            };
+            balance::publish_then_find_idle(
+                0,
+                &elements[0],
+                load,
+                &masks,
+                &[&BOTH],
+                |cpu| elements.get(cpu as usize),
+                |_, _| true,
+            )
+        })
+    };
+    let idle = {
+        let (elements, masks) = (Arc::clone(&elements), Arc::clone(&masks));
+        thread::spawn(move || {
+            balance::idle_then_choose(
+                1,
+                &elements[1],
+                &masks,
+                &[&BOTH],
+                |cpu| elements.get(cpu as usize),
+                |_, _| true,
+            )
+        })
+    };
+    let (kicked, chosen) = (crowded.join().unwrap(), idle.join().unwrap());
+    assert!(
+        kicked == Some(1) || chosen.is_some(),
+        "a crowded processor and an idling one both missed each other"
+    );
+}
+
+/// BL1, with fresh hints.
+#[test]
+fn balance_a_crowded_and_an_idling_processor_never_both_miss() {
+    check(
+        "balance_a_crowded_and_an_idling_processor_never_both_miss",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || balance_neither_misses(false),
+    );
+}
+
+/// BL1, with both hints left set by an earlier round.
+#[test]
+fn balance_neither_misses_the_other_with_stale_hints() {
+    check(
+        "balance_neither_misses_the_other_with_stale_hints",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || balance_neither_misses(true),
+    );
+}
+
+/// BL2: processor 1 goes idle and then starts a thread, which leaves its hint set; a search made
+/// after that finds no idle processor.
+#[test]
+fn balance_a_stale_idle_hint_is_not_taken_for_an_idle_processor() {
+    check(
+        "balance_a_stale_idle_hint_is_not_taken_for_an_idle_processor",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            const BOTH: [u32; 2] = [0, 1];
+            let elements = Arc::new([Element::new(), Element::new()]);
+            let masks = Arc::new(Masks::new(2).unwrap());
+            let idler = {
+                let (elements, masks) = (Arc::clone(&elements), Arc::clone(&masks));
+                thread::spawn(move || {
+                    let chosen = balance::idle_then_choose(
+                        1,
+                        &elements[1],
+                        &masks,
+                        &[&BOTH],
+                        |cpu| elements.get(cpu as usize),
+                        |_, _| true,
+                    );
+                    assert!(chosen.is_none(), "nothing was crowded");
+                    elements[1].leave_idle();
+                })
+            };
+            idler.join().unwrap();
+            assert!(
+                masks.idle.test(1),
+                "the hint stays until the processor's tick"
+            );
+            let found = balance::nearest_idle(
+                0,
+                &masks.idle,
+                &[&BOTH],
+                |cpu| elements.get(cpu as usize),
+                |_, _| true,
+            );
+            assert!(
+                found.is_none(),
+                "a stale hint was taken for an idle processor"
+            );
         },
     );
 }

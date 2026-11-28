@@ -70,6 +70,18 @@ pub const fn words_for(end: u64) -> u64 {
     end.div_ceil(FRAME).div_ceil(BITS)
 }
 
+/// The frames a reserved range `(base, pages)` touches: from the frame holding `base` to the
+/// frame holding its last byte. A range need not start on a frame boundary, and every frame
+/// it touches is reserved whole, so no byte of it is ever handed out (TASKS item 143, F-2).
+/// A range of no pages touches none.
+const fn reserved_frames(base: u64, pages: u64) -> core::ops::Range<u64> {
+    if pages == 0 {
+        return 0..0;
+    }
+    let end = base.saturating_add(pages.saturating_mul(FRAME));
+    base / FRAME..end.div_ceil(FRAME)
+}
+
 /// A bitmap allocator of 4 KiB physical frames.
 #[derive(Debug)]
 pub struct FrameAllocator<'a> {
@@ -86,7 +98,8 @@ pub struct FrameAllocator<'a> {
 impl<'a> FrameAllocator<'a> {
     /// Builds the allocator over `bitmap`. Frames in `Usable` regions start free, except
     /// frame 0 (so no allocation is ever the null address) and the `reserved` ranges
-    /// (`(base, pages)`, for example the bitmap's own frames).
+    /// (`(base, pages)`, for example the bitmap's own frames). A reserved range need not be
+    /// frame aligned: every frame it touches stays used.
     pub fn new(
         bitmap: &'a mut [u64],
         regions: &'a [MemoryRegion],
@@ -126,8 +139,9 @@ impl<'a> FrameAllocator<'a> {
         }
         a.set_free(0, false);
         for &(base, pages) in reserved {
-            let first = base / FRAME;
-            for frame in first..first.saturating_add(pages) {
+            let frames = reserved_frames(base, pages);
+            // Frames past the bitmap are never free, so the walk stops at its end.
+            for frame in frames.start..frames.end.min(a.frames) {
                 a.set_free(frame, false);
             }
         }
@@ -202,15 +216,19 @@ impl<'a> FrameAllocator<'a> {
             && !self
                 .reserved
                 .iter()
-                .any(|&(base, pages)| inside(base, pages))
+                .any(|&(base, pages)| reserved_frames(base, pages).contains(&frame))
     }
 
     /// Takes over every region of `kind` (in practice `LoaderReclaimable`, once nothing the
     /// loader or the firmware left there is in use): its frames become free, except frame 0
     /// and the reserved ranges. Returns how many frames were added.
+    ///
+    /// Once only for each kind: a kind already taken over returns 0 and changes nothing. Its
+    /// frames are this allocator's from the first call on, so a frame of it that is in use
+    /// at a second call has been handed out, and must stay so (TASKS item 143, F-1).
     pub fn reclaim(&mut self, kind: RegionKind) -> u64 {
         let raw = kind as u32;
-        if raw == RegionKind::Usable as u32 || raw >= 32 {
+        if raw == RegionKind::Usable as u32 || raw >= 32 || self.reclaimed & (1 << raw) != 0 {
             return 0;
         }
         self.reclaimed |= 1 << raw;
@@ -326,6 +344,10 @@ impl<'a> FrameAllocator<'a> {
         Ok(())
     }
 }
+
+/// Kani's proofs of this allocator's invariant (TASKS item 143): `cargo xtask kani`.
+#[cfg(kani)]
+mod proofs;
 
 #[cfg(test)]
 mod tests {
@@ -502,6 +524,66 @@ mod tests {
             a.free(0x20_0000),
             Err(FrameError::NotAllocatable(0x20_0000))
         );
+    }
+
+    /// A second reclaim of a kind must not take back what was handed out after the first
+    /// (TASKS item 143, F-1): every frame of the region is in use here, and stays so.
+    #[test]
+    fn a_second_reclaim_leaves_handed_out_frames_alone() {
+        let regions = [
+            region(0x1000, 1, RegionKind::Usable),
+            region(0x2000, 4, RegionKind::LoaderReclaimable),
+        ];
+        let mut bitmap = vec![0u64; words_for(covered_end(&regions)) as usize];
+        let mut a = FrameAllocator::new(&mut bitmap, &regions, &[]).unwrap();
+        assert_eq!(a.reclaim(RegionKind::LoaderReclaimable), 4);
+        let mut handed = HashSet::new();
+        while let Some(f) = a.allocate() {
+            assert!(handed.insert(f), "{f:#x} handed out twice");
+        }
+        assert_eq!(handed.len(), 5);
+        assert_eq!(a.free_frames(), 0);
+        assert_eq!(a.reclaim(RegionKind::LoaderReclaimable), 0);
+        assert_eq!(a.free_frames(), 0, "nothing handed out became free");
+        assert_eq!(a.allocate(), None);
+        for f in [0x2000, 0x5000] {
+            assert_eq!(
+                a.free(f),
+                Ok(()),
+                "{f:#x} is still its holder's to give back"
+            );
+        }
+    }
+
+    /// A reserved range that does not start on a frame boundary reserves every frame it
+    /// touches (TASKS item 143, F-2): `(0x1800, 1)` covers bytes 0x1800 to 0x27FF, so frames
+    /// 0x1000 and 0x2000 are never handed out, freed or claimed. A range of no pages reserves
+    /// nothing.
+    #[test]
+    fn an_unaligned_reserved_range_reserves_every_frame_it_touches() {
+        let regions = [region(0x1000, 8, RegionKind::Usable)];
+        let mut bitmap = vec![0u64; words_for(covered_end(&regions)) as usize];
+        let mut a =
+            FrameAllocator::new(&mut bitmap, &regions, &[(0x1800, 1), (0x5800, 0)]).unwrap();
+        assert_eq!(a.free_frames(), 6, "frames 3 to 8; 1 and 2 are reserved");
+        for f in [0x1000, 0x2000] {
+            assert!(!a.frame_is_free(f));
+            assert!(!a.claim(f));
+        }
+        let mut handed = Vec::new();
+        while let Some(f) = a.allocate() {
+            assert!(
+                f + FRAME <= 0x1800 || f >= 0x2800,
+                "{f:#x} holds a reserved byte"
+            );
+            handed.push(f);
+        }
+        assert_eq!(handed.len(), 6);
+        assert!(handed.contains(&0x5000), "an empty range reserves nothing");
+        for f in [0x1000, 0x2000] {
+            assert_eq!(a.free(f), Err(FrameError::NotAllocatable(f)));
+            assert_eq!(a.free_run(f, 1), Err(FrameError::NotAllocatable(f)));
+        }
     }
 
     #[test]

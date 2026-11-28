@@ -487,6 +487,7 @@ fn the_commands_that_set_their_machines_refuse_the_person_s() {
             "boot-x2apic",
             "boot-bridge",
             "boot-reserved",
+            "boot-disk",
             "boot-legacy-free",
             "boot-acpi",
             "boot-random",

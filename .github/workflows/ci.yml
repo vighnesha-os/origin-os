@@ -13,10 +13,11 @@
 # Cargo.lock is out of step with the manifests. Without the flag cargo rewrites the file and
 # carries on. That first command resolves the whole workspace, so the cargo commands xtask starts
 # afterwards resolve the same workspace against the same file and have nothing to change; they
-# do not repeat the flag. xtask's Loom models are the one other resolution: a scratch workspace
+# do not repeat the flag. xtask's Loom models are one other resolution: a scratch workspace
 # built from a lock of its own (developer-tools/xtask/src/loom.lock), which xtask holds with
-# `--locked` itself (loom.rs). The root Cargo.lock holds the workspace's packages alone
-# (`cargo xtask check`).
+# `--locked` itself (loom.rs). The fuzz workspace is the other: tests/fuzz, with its own
+# Cargo.lock, fetched with `--locked` by `cargo xtask fuzz` (fuzz.rs). The root Cargo.lock holds
+# the workspace's packages alone (`cargo xtask check`).
 #
 # Neither kind of boot below qualifies anything (§74, rule 30): the devices and the firmware are
 # QEMU's, and the processors are whatever GitHub's fleet holds, not the declared hardware.
@@ -150,6 +151,49 @@ jobs:
       - name: The job left the checkout as committed
         run: bash .github/ci/checkout-unchanged.sh
 
+  # Kani's proofs and their negative controls (CLAUDE.md §73; owner item 358, TASKS item 143).
+  # The full run is here only, not in `check` (the coordinating session's ruling of 2026-11-26):
+  # the development Mac runs one harness at a time while it is written. The script installs the
+  # pinned Kani and checks its bundle against the digest GitHub publishes. A standard runner,
+  # free for a public repository (CLAUDE.md §80). One job for each package of the proof files, so
+  # that none passes 120 minutes (the coordinating session's ruling of 2026-11-27, after the one
+  # job took 122): `cargo xtask kani-gate` holds this list to the packages `PROOF_FILES` names,
+  # and its host tests show that the jobs together run every harness and every control once.
+  kani:
+    name: Kani's proofs and controls (${{ matrix.package }})
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [origin-frame, onbf-format, framekernel]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: bash .github/ci/install-rust.sh
+      - name: Install Kani
+        run: bash .github/ci/install-kani.sh
+      # `cargo xtask kani` measures each run's peak memory with the system's `time -v`.
+      - name: Check that the system's time is there
+        run: test -x /usr/bin/time || { sudo apt-get update && sudo apt-get install -y time; }
+      - run: cargo --locked xtask kani --package ${{ matrix.package }}
+      # Each run's full output, harness by harness and control by control, one artifact for each
+      # job. Kept when the job fails too; this step never decides whether the job passes.
+      - name: Keep Kani's reports
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kani-reports-${{ matrix.package }}
+          path: target/xtask/kani
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
+      - name: The job left the checkout as committed
+        run: bash .github/ci/checkout-unchanged.sh
+
   # The control: every proof, on QEMU's software CPU, as on the development Mac.
   boot-software-cpu:
     name: boots on QEMU's software CPU
@@ -164,6 +208,21 @@ jobs:
       - name: Build QEMU
         run: bash .github/ci/install-qemu.sh
       - run: cargo --locked xtask boot-matrix
+      # A failed boot's evidence (TASKS item 165): its serial log, the last screen boot-test read,
+      # the QEMU command line and the line it failed on, under target/xtask/failed-boots, one
+      # directory a boot. Only when a step failed: a job whose boots all pass uploads nothing. The
+      # job's log already shows the serial output of a failed boot; the screen and COM1's file
+      # hold the kernel's own lines. Kept 7 days; this step never decides whether the job passes.
+      - name: Keep the failed boot's evidence
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failed-boots-software-cpu
+          path: target/xtask/failed-boots
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
 
   # The same boots on a real processor through KVM. Two runner images, because that is the only
   # say a job has in which processor it gets. xtask holds every proof to its markers, except the
@@ -207,6 +266,21 @@ jobs:
           ORIGIN_QEMU_SMP: 4
           ORIGIN_BOOT_TEST_ONLY: kernel boot
         run: cargo --locked xtask boot-test
+      # A failed boot's evidence (TASKS item 165): its serial log, the last screen boot-test read,
+      # the QEMU command line and the line it failed on, under target/xtask/failed-boots, one
+      # directory a boot. Only when a step failed: a job whose boots all pass uploads nothing. The
+      # job's log already shows the serial output of a failed boot; the screen and COM1's file
+      # hold the kernel's own lines. Kept 7 days; this step never decides whether the job passes.
+      - name: Keep the failed boot's evidence
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failed-boots-${{ matrix.runner }}
+          path: target/xtask/failed-boots
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
 
   # Which vendors and models this run's real-CPU boots ran on, in one table on the run's summary
   # page, with a notice on the pull request, and how long each job's boot-matrix step took beside
@@ -272,3 +346,61 @@ jobs:
         run: bash .github/ci/boot-step-durations.sh "$RUNNER_TEMP/boot-step"
       - name: Processor coverage
         run: bash .github/ci/processor-coverage.sh processor "$RUNNER_TEMP/boot-step"
+
+  # Coverage-guided fuzzing (owner item 359; TASKS item 144; CLAUDE.md §72), on the pinned
+  # stable compiler with `--sanitizer none`, which needs no nightly (docs/toolchain/
+  # VERIFICATION.md). The fuzzing runs are CI's, each target for a fixed time in a job of its
+  # own (the coordinating session's ruling of 2026-11-26); `check` replays kept crashes as host
+  # tests instead. Each job first runs the harness's own tests and the control `smoke_finds`,
+  # which must find its planted crash, or the build's coverage guidance is not working.
+  #
+  # A crash or a timeout fails the job. It is a finding for the coordinating session, and the
+  # pull request does not merge until that session has read it; the minimized input is kept for
+  # 14 days. Fuzzing finds bugs and proves nothing: a job that passes says only that the inputs
+  # it reached did not fail (matrix row S73-12).
+  #
+  # cargo-fuzz is installed at the recorded release with `--locked` in every job, with no cache
+  # action, so the workflow still uses only the two actions it pins. Four jobs at most run at
+  # once, so the boot jobs keep runners.
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        target:
+          - onbf_image
+          - onbf_image_built
+          - loader_place
+          - ocbor
+          - ocbor_built
+          - signature
+          - signature_built
+          - aml
+          - aml_built
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: bash .github/ci/install-rust.sh
+      - name: Install cargo-fuzz 0.13.2
+        run: cargo install --locked cargo-fuzz --version 0.13.2
+      - name: Fuzz for 180 s, after the harness's tests and the control
+        run: cargo --locked xtask fuzz "$TARGET" --seconds 180
+      - name: Keep the minimized findings
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-findings-${{ matrix.target }}
+          path: target/fuzz/${{ matrix.target }}/artifacts
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
+      - name: The job left the checkout as committed
+        run: bash .github/ci/checkout-unchanged.sh

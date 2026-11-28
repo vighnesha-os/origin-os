@@ -833,7 +833,7 @@ pub(crate) fn run(settings: &Settings) -> Result {
             settings
         };
         for _ in 0..BOOTS {
-            run_scenario(&scenario, kernel, settings)?;
+            run_scenario(&scenario, kernel, settings, None)?;
         }
     }
     let boots = BOOTS_SEEN
