@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Larger changes are discussed before any code is written ([CONTRIBUTING.md](https://github.com/vighnesha-os/origin-os/blob/main/CONTRIBUTING.md), section 3).
+        Larger changes are discussed before any code is written ([CONTRIBUTING.md](https://github.com/vighnesha-os/origins/blob/main/CONTRIBUTING.md), section 3).
 
         Decisions on binary interfaces and formats, on the product's scope and on runtime dependencies are the owner's.
   - type: textarea

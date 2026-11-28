@@ -2,7 +2,7 @@
 
 Task `PUBLIC-INDEX-2026-11-24`: make the public repository's appropriate files
 available as linked static HTML with an XML sitemap, at
-<https://vighnesha-os.github.io/origin-os/>. The repository owner requested this
+<https://vighnesha-os.github.io/origins/>. The repository owner requested this
 implementation and Pages/Search Console configuration on 2026-11-24.
 This host-only publishing tool changes no OS format, runtime dependency, release
 version or requirement-completion claim.
@@ -68,7 +68,7 @@ Protect the `github-pages` environment so only `main` can deploy.
 
 ## Search Console and crawling
 
-Use a URL-prefix property for <https://vighnesha-os.github.io/origin-os/>, verify
+Use a URL-prefix property for <https://vighnesha-os.github.io/origins/>, verify
 the homepage's `google-site-verification` tag, and submit `sitemap.xml` there.
 The token in `files.json` is a public verification tag, not a login credential.
 Keep it in deployed HTML to retain verification. Do not try to verify ownership
@@ -81,7 +81,7 @@ visible text and ordinary HTML links. There is no JavaScript requirement,
 ranking claims, AI-specific markup or sitemap-ping requests are generated.
 
 This project cannot set the hostname's root `/robots.txt` through a project
-subdirectory. A file at `/origin-os/robots.txt` would not control crawling, so
+subdirectory. A file at `/origins/robots.txt` would not control crawling, so
 none is generated. Check <https://vighnesha-os.github.io/robots.txt> after
 deployment. A genuine 404 there normally permits crawling; a disallow rule or
 server failure must be investigated. Submit the project sitemap directly in

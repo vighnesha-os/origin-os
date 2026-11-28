@@ -2,8 +2,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Report a security vulnerability privately
-    url: https://github.com/vighnesha-os/origin-os/security/advisories/new
+    url: https://github.com/vighnesha-os/origins/security/advisories/new
     about: Never in a public issue. SECURITY.md says what to include.
   - name: Ask a question
-    url: https://github.com/vighnesha-os/origin-os/discussions
+    url: https://github.com/vighnesha-os/origins/discussions
     about: Questions and ideas go to Discussions. Issues are for work to do.

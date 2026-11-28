@@ -1,6 +1,6 @@
 {
-  "repository": "vighnesha-os/origin-os",
-  "base_url": "https://vighnesha-os.github.io/origin-os/",
+  "repository": "vighnesha-os/origins",
+  "base_url": "https://vighnesha-os.github.io/origins/",
   "google_site_verification": "LI2zyaIgnqjC1hZTWv2XV95zyuA7vX8fZyUaPDtycVM",
   "files": [
     ".cargo/config.toml",

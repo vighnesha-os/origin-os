@@ -18,8 +18,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
-REPOSITORY = "vighnesha-os/origin-os"
-BASE_URL = "https://vighnesha-os.github.io/origin-os/"
+REPOSITORY = "vighnesha-os/origins"
+BASE_URL = "https://vighnesha-os.github.io/origins/"
 MANIFEST = "developer-tools/public-index/files.json"
 MAX_BYTES = 2 * 1024 * 1024
 EXTENSIONS = {".rs", ".md", ".toml", ".txt", ".py", ".sh", ".yml", ".yaml", ".oidl", ".in", ".lock", ".json"}

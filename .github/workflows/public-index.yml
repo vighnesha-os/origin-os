@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   build:
-    if: github.repository == 'vighnesha-os/origin-os' && github.event.repository.private == false
+    if: github.repository == 'vighnesha-os/origins' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

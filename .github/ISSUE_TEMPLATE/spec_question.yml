@@ -4,7 +4,7 @@ labels: ["question"]
 body:
   - type: markdown
     attributes:
-      value: For a general question, use [Discussions](https://github.com/vighnesha-os/origin-os/discussions). This form is for a document that needs a change or an answer.
+      value: For a general question, use [Discussions](https://github.com/vighnesha-os/origins/discussions). This form is for a document that needs a change or an answer.
   - type: input
     id: document
     attributes:
