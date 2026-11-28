@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Applies to | `docs/spec/ONBF.md` v1.0 (design), accepted 2026-11-07 |
-| Status | **C1–C14 and G2–G5 decided by the owner on 2026-11-07. G1 and the readings below were decided the same day under the owner's instruction of 2026-11-07 to finalise the design with the recommended options. O1, V1–V6 and O2–O5 were decided by the owner on 2026-11-08.** |
+| Status | **C1–C14 and G2–G5 decided by the owner on 2026-11-07. G1 and the readings below were decided the same day under the owner's instruction of 2026-11-07 to finalise the design with the recommended options. O1, V1–V6 and O2–O5 were decided by the owner on 2026-11-08. A1–A13, A21, A22, A24, A25 and A27–A32 were decided by the owner on 2026-11-28 (decision items 385 to 407).** |
 | Found by | Implementing `runtime/onbf/format` (`onbf-format`) against §4, 2026-11-07 |
 | Byte layouts | Unchanged. Every item below is a validation rule or a missing definition, not a new field. |
 
@@ -95,6 +95,47 @@ These four were open gaps blocking chain validation. **Decided by the owner on 2
 | O3 | §7.6, §7.3 | `not_before`/`not_after` need trusted time, and the boot loader has only the firmware's RTC, which an attacker can set. | **Validity is checked against a signed time carried in signed release metadata**, as §7.6 asks for trusted time; never against the firmware clock. | Chain validation at boot waits for the SYS profile (§6.5), which carries that time. A chain cannot be checked before SYS exists. |
 | O4 | §7.1, S4 key 6 | How an `id_namespaces` entry matches a statement's `id` was undefined. | **Exact IDs only:** a certificate lists every ID it covers, and an `id` matches one entry by equality. | A publisher needs a new certificate for each new ID. §6.2's "falls inside a namespace" now means membership in that list. |
 | O5 | §7.4, §8.1 | What a trust-store *root* is. | **Bare public keys,** per role, compiled into the loader; a chain ends at one of them. | Root rotation (§7.4) can be layered on with signed metadata later. |
+
+## Decided readings from the two parsers' comparison (owner, 2026-11-28)
+
+TASKS item 164 compared `onbf-format` with a second parser, `onbf-second`, written from this specification alone. Its author recorded 30 places that allow more than one reading (`tests/onbf-nversion/READINGS.md`, A1 to A30). The owner decided each open one on 2026-11-28 (decision items 385 to 407). Nine were already settled, so they have no row here:
+- A14 by §4.6 and C10;
+- A15 by C11;
+- A16 by §4.2 and V5;
+- A17 by S2 and §7.2: one required suite per role;
+- A18 by §5;
+- A19 by §4.3;
+- A20 by C7;
+- A23 by ONBF-R6, C3 and C4;
+- A26 by key 25 and G1.
+
+A31 and A32 were found by the coordinating session's review of the production code. An **addition** is a rule that no clause states.
+
+| # | Spec | Ambiguity | Decision (2026-11-28) |
+|---|---|---|---|
+| A1 | Key registry: top-level keys; profile requirements | The first table lists keys 1–5 for EXE and LIB; the second gives them only key 0. | **The profile-requirements table governs.** Until a profile's schema is assigned, an EXE, LIB, APP, PKG, DRV or SYS manifest holds key 0 and keys ≥ 1000 only, and any other key is refused. (Item 385.) |
+| A2 | Key 2 `toolchain` | Which of its four sub-keys are required. | **All four:** `rustc`, `rustc_commit`, `llvm` and `flags_digest`, in KRN, and in SYM when key 2 is present. (Item 386.) |
+| A3 | Key 4 `cet` | Which sub-keys are required, and which values `shstk` may take. | **Both are required.** `ibt` must be `false`. `shstk` may be `true` or `false`: "`true` by default" is the writer's default. (Item 387.) |
+| A4 | Key 5 `entry` | Whether "inside" a SEGMENT means its file-backed bytes or its whole memory. | **The file-backed bytes,** `[mem_offset, mem_offset + content_size)`, of a readable and executable SEGMENT, as P3 rules for `e_entry`. (Item 388.) |
+| A5 | Key 1 `build_id` | Whether a reader checks the definition or only takes the value. | **Checked.** A reader that reads every SEGMENT refuses an image whose `build_id` is not the SHA-256 of their content, concatenated in table order. For KRN that includes the loader. Where EXE and LIB images are checked is decided with their loader (M6). (Item 389.) |
+| A6 | S3 key 4 `version` | Whether the SemVer grammar is checked. | **Checked** against Semantic Versioning 2.0.0's grammar. (Item 390.) |
+| A7 | §7.1 entry key 8 `log_proof` | Whether a v1 entry may carry it. | **Absent in v1.** An entry holding key 8 is refused. (Item 391.) |
+| A8 | §7.1 entry keys 1–7; S3 statement keys 0–6 | Which keys are required. | **All are required.** `chain` is present and may be the empty array, so direct trust has one encoding. (Item 392.) |
+| A9 | §5, keys ≥ 1000 | Whether a skipped value must be valid OCBOR-1, and whether it counts toward the limits. | **Valid and counted.** A skipped value must be valid OCBOR-1: shortest forms, no floats or tags, valid UTF-8, and unsigned map keys in strictly ascending order. It counts toward the depth and item limits. NFC of its text is the writer's duty, and no v1 reader checks it. (Item 393.) |
+| A10 | §7.1 `entry_size` | Whether it counts its own four bytes, and whether the map must fill it. | **The map alone.** The map fills `entry_size` exactly, and the entries fill the block exactly. (Item 394.) |
+| A11 | §6.1, §6.5, G4 | How many SEGMENT sections a KRN image holds. | **At least one,** refused at the section-table check. The limit of 16 is EXE's and LIB's (G4). (Item 395.) |
+| A12 | §4.4, Profiles column | Whether the column lists what a profile may hold, and whether MANIFEST's place is fixed. | **A list of what is allowed.** A kind outside its profiles is refused: STRINGS in KRN, for example. MERKLE is allowed in every profile. MANIFEST may stand anywhere in the table. (Item 396.) |
+| A13 | C9; P7 | What references a MERKLE section, and whether P7's placement binds readers. | **`merkle_index` alone.** A MERKLE section is referenced by one section's `merkle_index`, under integrity 1, from anywhere in the table. P7's placement binds `onbf-pack`, not readers. (Item 397.) |
+| A21 | §4.3 MAPPABLE; §6.2; C6, C8 | Which kinds may be MAPPABLE. | **SEGMENT must be, IMAGE_FS may be, and no other kind may be.** Whether IMAGE_FS must be is decided when IMAGE_FS is built. The refusal on the other kinds is an addition. (Item 398.) |
+| A22 | §6.1, permissions | Whether "exactly one of R, RW (optionally RELRO) or RX", written under EXE and LIB, binds KRN. | **Every SEGMENT in every profile.** (Item 399.) |
+| A24 | §6.1, RELR; P5; P7 | The word format, and whether P5's ascending slots and P7's greedy encoding bind readers. | **Little-endian u64 words, as in SHT_RELR.** A word with bit 0 clear is an address. A word with bit 0 set is a bitmap whose bits 1–63 cover the 63 slots after the running base. Readers refuse:<br>- slots that do not strictly ascend (P5);<br>- an encoding that is not greedy (P7): an empty bitmap, or an address word that the previous bitmap could have reached;<br>- a slot outside an RW or RELRO SEGMENT's file-backed bytes. (Item 400.) |
+| A25 | §4.4; ONBF-R6 | How many sections of each kind a table may hold. | **At most one each** of STRINGS, RESOURCES, RELOCS, IMPORTS, EXPORTS, TLS, UNWIND, IMAGE_FS and DEBUG_LINK. Exactly one MANIFEST. SEGMENT, MERKLE, PAYLOAD, FIRMWARE and DWARF may repeat, within the other limits. For STRINGS, RESOURCES and UNWIND the limit is an addition. (Item 401.) |
+| A27 | §4.3 `compression`; C14; Appendix A | Whether a compressed section may store no bytes. | **Refused at the section table:** with compression 1, `stored_size` is at least 1. (Item 402.) |
+| A28 | V1; §7.1 | Where a non-empty `chain` is refused. | **By the signature-block parser,** in every profile and mode, until OKC validation exists (V1). A verifier's own refusal may stay as a second line. (Item 403.) |
+| A29 | §7.1 `entry_count`; V2 | Whether one block may hold two entries with the same role and key ID. | **Refused.** No two entries of a block share both role and key ID. An addition. (Item 404.) |
+| A30 | S3 key 1 `profile` | Whether a value outside §1's profile IDs is refused where the block is parsed, or only by equality with the header where it is bound. | **By the signature-block parser:** a statement `profile` outside 1–8 is refused in every mode. Equality with the header's profile is still required where the block is bound to its image. (Item 405.) |
+| A31 | The signature encodings' "Follows" row (K1–K4) | Whether keys ≥ 1000 in an entry or a statement are skipped as extensions. | **Strict in v1.** An entry or statement holding a key outside its listed keys is refused, 1000 and above included. An extension of either comes with a format minor version. (Item 406.) |
+| A32 | Key 24 `boot_info_abi` | The range of `major` and `minor`. | **Each is a u16,** 0 to 65,535. A larger value is refused. (Item 407.) |
 
 ## Open gaps
 

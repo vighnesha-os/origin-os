@@ -877,6 +877,7 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
       - an oracle that treats any acceptance outside the committed seeds as a finding;
       - a control, for example the verifier's Ed25519 result ignored.
     - **The writers stay as they are** until TASKS item 164 is on `main`, so that its corpus does not change under it.
+    - **Also, from TASKS item 164's hand-over:** seeds holding a block that V1 accepts, one entry in the kernel role with an empty chain, so that the accepted path is reached at all.
 180. **The loader's placement refuses the RELOCS the packer's verify refuses (TASKS item 164's triage; ONBF §6.1; errata P5, P7; CLAUDE.md §2 P0). Numbered by the coordinating session on 2026-11-28; batch 13.**
     - **Why:** the UEFI loader's placement accepts:
       - RELOCS whose slots do not ascend, or that name a slot twice, which gets the base added twice;
@@ -885,9 +886,15 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
 
       Only the packer's verify refuses them, on the build host. A signed image needs a trusted key to reach the loader, and an unsigned one needs developer mode, but the loader should not depend on the packer for these.
     - **What:** the placement refuses each, with host tests and a planted control for each rule. Whether the loader also checks `build_id` follows the owner's ruling on reading A5.
+    - **Decided 2026-11-28** (owner items 389 and 400; errata A5 and A24):
+      - the loader checks `build_id`;
+      - RELR's word format, ascending slots, the greedy encoding, and slots in an RW or RELRO SEGMENT's file-backed bytes are the readers' rules.
+
+      When it lands, D164-1, D164-2 and D164-3 leave `tests/onbf-nversion/known-disagreements`.
 181. **The signature block's entry and statement maps follow the signature encodings' extension rule (TASKS item 164's triage, D164-6). Numbered by the coordinating session on 2026-11-28; after the owner's ruling.**
     - **Why:** the signature encodings say that keys of 1000 and above are extensions, which readers skip. `onbf-format` refuses any key outside 1–7 in an entry, and outside 0–6 in a statement.
     - **What:** either the parser skips extension keys, still validating them as OCBOR-1, or the owner amends the encodings to strict. The owner's ruling decides which.
+    - **Closed 2026-11-28 by owner item 406 (errata A31, strict):** in v1, entries and statements hold no keys outside their listed ones. `onbf-format` already refuses them, so production does not change. The second parser's change is TASKS item 191.
 182. **EXE and LIB images hold 1 to 16 SEGMENT sections (TASKS item 164's triage, D164-8; ONBF §6.1). Numbered by the coordinating session on 2026-11-28; batch 13.**
     - **Why:** §6.1 says an EXE or LIB holds 1–16 SEGMENT sections. `onbf-format` sets no minimum, and accepts one with none. Nothing reads EXE or LIB images yet.
     - **What:** the parser refuses an EXE or LIB with no SEGMENT. With it come a host test, a malicious-corpus case, and the removal of the N-version comparison's D164-8 entry.
@@ -897,6 +904,40 @@ Nothing else is forgiven or run again, and nothing in the kernel changes. Host t
       - The README shows it beside the CI and OctoCounts badges.
       - The progress gate refuses a badge that is not the one the tree generates, as it does a stale page.
       - No outside service is involved.
+184. **Why base's IPC ping-pong falls into its slow mode (beside TASKS item 136; ADR-0013 R1(b)). Numbered by the coordinating session on 2026-11-28, from TASKS item 100's hand-over; not started.**
+    - **Why:** base `d866e9a9` measured the IPC round trip at 70,971 ns once, then 128,073 and 121,169 ns, the slow runs at about 1.45 crossings a message. TASKS item 100's tip stayed in the fast mode every time. A figure with two modes makes the trend hard to read.
+    - **What:** find which wake-then-block path the slow mode takes, and whether placement or timing chooses it. It is recorded; a fix comes only if it is a defect.
+185. **The single-step case judges the debug stack of the processor that took the #DB (ADR-0017; TASKS item 100's limits). Numbered by the coordinating session on 2026-11-28; not started.**
+    - **Why:** the case judges the boot processor's debug stack, whichever processor took the exception. With user threads movable (TASKS item 100), that can be another processor.
+    - **What:** the case reads the interrupt stack of the processor that took the #DB, with a control that plants the exception on another processor.
+186. **An independent review of TASKS item 96's floor fix, `f38c92a7` (CLAUDE.md §1: independent review of shared kernel contracts). Numbered by the coordinating session on 2026-11-28, from TASKS item 101's review; not started.**
+    - **Why:** no review record covers `f38c92a7`, though it changed the scheduler's floor on the switch path.
+    - **What:** one independent review against ADR-0020 S10 and the switch path's contract, its findings answered. The kernel crates' provenance rows then name it.
+187. **virtio-net's receive checks as a pure function, so that they can be fuzzed (TASKS item 153's report; CLAUDE.md §72). Numbered by the coordinating session on 2026-11-28; the scheduling lane's area; not started.**
+    - **Why:** `framekernel::virtionet` is target-only. Its checks of posted buffers against the device's used elements cannot run on the host, so no fuzz target reaches them.
+    - **What:** the checks move into a host-built function in `virtqueue`, which the receive loop calls, with host tests and then a fuzz target.
+188. **Fuzz targets for the kernel's `net`, `gpt`, `ustar`, `tftp` and `json` parsers (TASKS item 153's report; CLAUDE.md §72). Numbered by the coordinating session on 2026-11-28; a later batch.**
+    - **Why:** each parses untrusted bytes and builds on the host, and none has a fuzz target. `gpt` reads what a disk hands the kernel.
+    - **What:** a target for each, with seeds, a planted control, and a line in CI's fuzz matrix.
+189. **The section-table rules of readings A11, A21, A25 and A27 in `onbf-format` (owner items 395, 398, 401 and 402; ONBF errata). Numbered by the coordinating session on 2026-11-28; batch 13, beside TASKS item 182.**
+    - **What:** the section-table check refuses:
+      - a KRN image with no SEGMENT;
+      - MAPPABLE on any kind but SEGMENT and IMAGE_FS;
+      - a second section of any of A25's nine kinds;
+      - a compressed section that stores no bytes.
+
+      Each comes with a host test, a malicious-corpus case and a control. When it lands, D164-9, D164-10 and D164-11 leave `known-disagreements`.
+190. **The signature-block parser's rules of readings A28 and A30 (owner items 403 and 405; ONBF errata). Numbered by the coordinating session on 2026-11-28; batch 13.**
+    - **What:** `SignatureBlock::parse` refuses a non-empty `chain` and a statement `profile` outside 1–8, in every mode. Each comes with a host test and a control. When it lands, D164-5 and D164-12 leave `known-disagreements`.
+191. **The second parser follows owner items 400, 404, 406 and 407 (TASKS item 164; ONBF errata A24, A29, A31 and A32). Numbered by the coordinating session on 2026-11-28; for the session that wrote `onbf-second`, after batch 12 is on `main`.**
+    - **What:** `onbf-second`:
+      - narrows R6 to the file-backed bytes;
+      - refuses two entries with the same role and key ID;
+      - refuses keys outside an entry's and a statement's listed ones;
+      - limits `boot_info_abi` to u16.
+
+      `READINGS.md` and `VERDICT.md` record the decisions. D164-4, D164-6 and D164-7 leave `known-disagreements`.
+
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:

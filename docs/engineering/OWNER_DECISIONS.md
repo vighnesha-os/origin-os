@@ -1866,3 +1866,73 @@ TASKS item 171 keeps the geometry and the pattern, makes the permission a partit
   - this sheet;
   - the "Decided by" column of row S39-04;
   - TASKS item 171.
+
+### ONBF v1.0's readings from the two parsers' comparison (items 385 to 407): Accepted 2026-11-28
+
+TASKS item 164 built a second ONBF parser from the specification alone and compared it with the production parser on 2.8 million inputs. Its author recorded 30 places where the specification leaves room for more than one reading (`tests/onbf-nversion/READINGS.md`, A1 to A30). ONBF-R6 asks for exactly one. The coordinating session checked each against `ONBF.md`, the errata, the key registry, the signature encodings, this sheet and the production code, then put one item for each open reading, two more found on the way, and a recommendation for each. You answered "Accept all 23".
+
+| # | Question | Answer |
+|---|---|---|
+| 385, answered | A1: does an EXE or LIB manifest hold only key 0 and keys of 1000 and above until its schema is assigned, the registry's "Profile requirements" table governing its first table? | **Accept** |
+| 386, answered | A2: does `toolchain` (key 2) need all four of its sub-keys? | **Accept** |
+| 387, answered | A3: does `cet` (key 4) need both sub-keys, with `ibt` false and `shstk` either value? | **Accept** |
+| 388, answered | A4: does `entry` (key 5) lie in an RX SEGMENT's file-backed bytes, not its zero-filled tail? | **Accept** |
+| 389, answered | A5: do readers refuse a KRN image whose `build_id` is not the SHA-256 of its SEGMENTs' content in table order, the loader adding that check? | **Accept** |
+| 390, answered | A6: is a statement's `version` checked against Semantic Versioning 2.0.0's grammar? | **Accept** |
+| 391, answered | A7: is entry key 8 (`log_proof`) absent in v1, so an entry holding it is refused? | **Accept** |
+| 392, answered | A8: are every entry key and every statement key required, `chain` present and possibly empty? | **Accept** |
+| 393, answered | A9: is a skipped extension value still checked as OCBOR-1 and counted toward the limits, with NFC left to the writer? | **Accept** |
+| 394, answered | A10: does `entry_size` count the map alone, the map filling it and the entries filling the block exactly? | **Accept** |
+| 395, answered | A11: does the section-table check refuse a KRN image with no SEGMENT? | **Accept** |
+| 396, answered | A12: does §4.4's Profiles column list what each profile may hold, MANIFEST standing anywhere in the table? | **Accept** |
+| 397, answered | A13: is a MERKLE section referenced by `merkle_index` from anywhere in the table, P7's placement binding the writer only? | **Accept** |
+| 398, answered | A21: must SEGMENT be MAPPABLE, may IMAGE_FS be, and may no other kind be? | **Accept** |
+| 399, answered | A22: does §6.1's permission rule (R, RW optionally RELRO, or RX) bind every SEGMENT in every profile? | **Accept** |
+| 400, answered | A24: do the errata state RELR's word format, readers refusing slots that do not ascend and encodings that are not greedy, every slot in a writable SEGMENT's file-backed bytes? | **Accept** |
+| 401, answered | A25: may an image hold at most one each of STRINGS, RESOURCES, RELOCS, IMPORTS, EXPORTS, TLS, UNWIND, IMAGE_FS and DEBUG_LINK? | **Accept** |
+| 402, answered | A27: under compression 1, must `stored_size` be at least 1, refused at the section table? | **Accept** |
+| 403, answered | A28: does the signature-block parser refuse a non-empty `chain`, in every profile and mode? | **Accept** |
+| 404, answered | A29: is a block with two entries of the same role and key ID refused? | **Accept** |
+| 405, answered | A30: does the signature-block parser refuse a statement `profile` outside 1–8? | **Accept** |
+| 406, answered | D164-6: in v1, do signature entries and statements hold no keys of 1000 and above (strict), in place of the key policy's "skipped by readers"? | **Accept** |
+| 407, answered | Is each of `boot_info_abi`'s `major` and `minor` (key 24) a u16, as the loader reads them? | **Accept** |
+
+- **What was found first:**
+  - **Nine readings were already settled** by the specification's own words or the errata, so no item was put for them:
+    - A14 (§4.6, C10);
+    - A15 (C11);
+    - A16 (§4.2, V5);
+    - A17 (S2 and §7.2: one required suite per role);
+    - A18 (§5);
+    - A19 (§4.3);
+    - A20 (C7);
+    - A23 (ONBF-R6, C3, C4);
+    - A26 (key 25, G1).
+  - **Where the parsers already differed:** ten of the comparison's twelve causes are readings (A5, A11, A21, A24 ×3, A25, A28, A29, A30). The other two, D164-6 and D164-8, are production defects (TASKS items 181 and 182).
+  - **Two more were found by checking the production code:**
+    - production refuses a `boot_info_abi` value above 65,535, where the registry says only "unsigned integers" (407);
+    - production would accept a compressed section that stores no bytes (A27).
+- **What the items decide:** the readings in `ONBF-errata.md`'s new section, "Decided readings from the two parsers' comparison", A1 to A13, A21, A22, A24, A25 and A27 to A32. Each is normative, as the errata's preamble says. A31 is item 406 and A32 item 407.
+- **What changes, and where:**
+  - **The production parser:**
+    - TASKS item 180 takes A5 (`build_id` in the loader) and A24;
+    - TASKS item 189 takes the section-table rules (A11, A21, A25, A27);
+    - TASKS item 190 takes the signature-block parser's (A28, A30).
+
+    TASKS item 181 closes under 406: production already refuses those keys.
+  - **The second parser** (TASKS item 191, after batch 12 is on `main`):
+    - A24's tail rule (R6 narrowed to the file-backed bytes);
+    - A29;
+    - 406;
+    - 407.
+  - **The comparison:** each cause in `tests/onbf-nversion/known-disagreements` goes when its fix lands. ONBF §13 item 6 is met, within the comparison's limits U1 to U3, once that file is empty.
+- **What does not change:**
+  - ONBF's byte layouts: every item is a validation rule.
+  - The format's version (C5).
+  - What `onbf-pack` writes: every recommendation matches it.
+- **Performance cost** (ADR-0018 V3): one SHA-256 pass over the kernel's segments at boot (389), and comparisons at parse time for the rest. TASKS items 180, 189 and 190 state theirs with their results.
+- **Where it is written:**
+  - this sheet;
+  - `docs/spec/ONBF-errata.md`;
+  - the "Decided by" column of rows A01-D1 (the container's rules: 385 to 389, 393, 395 to 402 and 407) and A01-D3 (the signature block's: 390 to 392, 394 and 403 to 406);
+  - TASKS items 179 to 181 and 189 to 191.
